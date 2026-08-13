@@ -729,6 +729,26 @@ core::Result<void> ManagedKernelAdmissionGate::reserve_batch(
   return table.reserve_batch(owners);
 }
 
+std::vector<core::ResourceId>
+ManagedKernelAdmissionGate::current_fenced_resources(
+    const std::vector<core::ResourceId> &resources) const {
+  std::lock_guard lock(*admission_mutex_);
+  std::vector<core::ResourceId> result;
+  result.reserve(resources.size());
+  for (const auto &resource : resources) {
+    if (std::any_of(
+            held_fences_.begin(), held_fences_.end(), [&](const auto &held) {
+              return std::binary_search(held.scope.resources.begin(),
+                                        held.scope.resources.end(), resource);
+            })) {
+      result.push_back(resource);
+    }
+  }
+  std::sort(result.begin(), result.end());
+  result.erase(std::unique(result.begin(), result.end()), result.end());
+  return result;
+}
+
 ManagedKernelAdmissionObservation ManagedKernelAdmissionGate::Observe(
     const core::ConfigurationFenceScopeDTO &scope) const {
   Require(scope.valid(), "admission observation scope is invalid");

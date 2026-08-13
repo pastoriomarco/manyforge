@@ -160,6 +160,11 @@ public:
   core::ResetResultDTO reset(std::optional<std::uint64_t>) override {
     return {false, Unavailable()};
   }
+  core::ResetResultDTO
+  reset_after_certified_containment(std::uint64_t,
+                                    std::optional<std::uint64_t>) override {
+    return {false, Unavailable()};
+  }
   core::AcknowledgeCompletedResultDTO
   acknowledge_completed(std::uint64_t, std::optional<std::uint64_t>) override {
     return {false, Unavailable()};
@@ -547,6 +552,10 @@ TEST(ManagedKernelAdmissionGate,
                            {TwoActiveConfigurations().back()},
                            [&] { second_committed = true; });
   EXPECT_TRUE(second_committed);
+  EXPECT_EQ(gate.current_fenced_resources(
+                {core::ResourceId("joint.1"), core::ResourceId("joint.3")}),
+            (std::vector<core::ResourceId>{core::ResourceId("joint.1"),
+                                           core::ResourceId("joint.3")}));
 
   bool overlapping_commit = false;
   EXPECT_THROW(gate.AcquireFenceDurably(

@@ -387,9 +387,9 @@ require_fixture_one(const Range &values, Predicate predicate,
     const auto &planner = require_fixture_one(
         bundle.value().capability_provider_bindings,
         [&](const auto &candidate) {
-          const auto *target = std::get_if<
-              core::TargetBindingCapabilityProviderTargetDTO>(
-              &candidate.target);
+          const auto *target =
+              std::get_if<core::TargetBindingCapabilityProviderTargetDTO>(
+                  &candidate.target);
           return candidate.capability_id ==
                      core::CapabilityId("planning.motion.joint_goal") &&
                  target != nullptr &&
@@ -406,8 +406,7 @@ require_fixture_one(const Range &values, Predicate predicate,
       const auto *runtime_unit =
           std::get_if<core::RuntimeUnitId>(&endpoint.source_id);
       if (runtime_unit == nullptr) {
-        throw std::logic_error(
-            "planner endpoint source kind and value differ");
+        throw std::logic_error("planner endpoint source kind and value differ");
       }
       planner_runtime_units.insert(*runtime_unit);
     }
@@ -471,8 +470,7 @@ require_fixture_one(const Range &values, Predicate predicate,
           control_binding.provider_manifest_revision,
           control_binding.provider_runtime_unit_id,
           provider_runtime_epoch.value_or(core::RuntimeEpoch(
-              "epoch." +
-              control_binding.provider_runtime_unit_id.value())),
+              "epoch." + control_binding.provider_runtime_unit_id.value())),
           control_binding.state_authority_id,
           state_authority_override.value_or(
               control_binding.state_authority_class),
@@ -591,8 +589,8 @@ require_fixture_one(const Range &values, Predicate predicate,
           planner.capability_provider_binding_id,
           planner.capability_provider_binding_revision,
           planner.provider_instance_id, planner.provider_manifest_id,
-          planner.provider_manifest_revision,
-          planner.provider_runtime_unit_id, planner.provider_runtime_epoch},
+          planner.provider_manifest_revision, planner.provider_runtime_unit_id,
+          planner.provider_runtime_epoch},
       std::move(models),
       core::PlannerModelGroupBindingDTO{
           group.model_group_role_id, group.model_instance_id,
@@ -2290,10 +2288,10 @@ TEST(RetainedProductCrossConsumer,
       SimpleSchedulerConfig{},
       10'000'000,
       {0.0, 0.0, 1.57, 0.0, 0.0, 0.0},
-      core::StopDeadlineBudgetDTO{1'000'000'000, 100'000'000, {}}};
+      core::StopDeadlineBudgetDTO{1'000'000'000, 100'000'000, {}},
+      kMaintainedNativeStopSurveillancePolicy};
   ManagedKernelAdmissionGate admission_gate;
-  deployment::FilesystemCatalogArtifactStore runtime_policy_store(
-      package_root);
+  deployment::FilesystemCatalogArtifactStore runtime_policy_store(package_root);
   const auto runtime_policy = deployment::resolve_retained_runtime_policy(
       *materialized.bundle, runtime_policy_store);
   ASSERT_TRUE(runtime_policy.has_value());
@@ -3173,10 +3171,12 @@ TEST(RetainedProductCrossConsumer,
   ASSERT_TRUE(repeated_private_candidate.ok())
       << repeated_private_candidate.error().message;
   ASSERT_NE(repeated_private_candidate.value().bundle.world, nullptr);
-  EXPECT_GT(repeated_private_candidate.value().bundle.world->revision.revision_id,
-            private_candidate.value().bundle.world->revision.revision_id);
-  EXPECT_EQ(repeated_private_candidate.value().bundle.world->revision.content_hash,
-            private_candidate.value().bundle.world->revision.content_hash);
+  EXPECT_GT(
+      repeated_private_candidate.value().bundle.world->revision.revision_id,
+      private_candidate.value().bundle.world->revision.revision_id);
+  EXPECT_EQ(
+      repeated_private_candidate.value().bundle.world->revision.content_hash,
+      private_candidate.value().bundle.world->revision.content_hash);
 
   const auto committed = projection->ApplyTransaction(transaction);
   ASSERT_TRUE(committed.presence_valid());
@@ -3188,8 +3188,9 @@ TEST(RetainedProductCrossConsumer,
   const auto current_world = projection->snapshot();
   ASSERT_NE(current_world, nullptr);
   EXPECT_NE(current_world, predecessor_world);
-  EXPECT_GT(current_world->revision.revision_id,
-            repeated_private_candidate.value().bundle.world->revision.revision_id);
+  EXPECT_GT(
+      current_world->revision.revision_id,
+      repeated_private_candidate.value().bundle.world->revision.revision_id);
   EXPECT_EQ(retained_predecessor.value().bundle.world, predecessor_world);
 
   const auto replay = projection->ApplyTransaction(transaction);
@@ -3595,9 +3596,9 @@ TEST(RetainedProductCrossConsumer,
         *program_binding);
     const auto &value = physical.value();
     ASSERT_EQ(value.model_bindings.size(), 1U);
-    EXPECT_TRUE(
-        model_instance_ids.insert(value.model_bindings.front().model_instance_id)
-            .second);
+    EXPECT_TRUE(model_instance_ids
+                    .insert(value.model_bindings.front().model_instance_id)
+                    .second);
     ASSERT_EQ(value.runtime_unit_epochs.size(), 1U);
     EXPECT_TRUE(runtime_unit_ids
                     .insert(value.runtime_unit_epochs.front().runtime_unit_id)
@@ -3608,9 +3609,8 @@ TEST(RetainedProductCrossConsumer,
       ASSERT_TRUE(resource.source_joint_name.has_value());
       source_joint_order.push_back(*resource.source_joint_name);
       EXPECT_TRUE(all_resources.insert(resource.resource_id).second);
-      EXPECT_TRUE(
-          all_compiled_resources.insert(resource.compiled_resource_name)
-              .second);
+      EXPECT_TRUE(all_compiled_resources.insert(resource.compiled_resource_name)
+                      .second);
     }
     source_joint_orders.push_back(std::move(source_joint_order));
     physical_bindings.push_back(std::move(physical));
@@ -3626,14 +3626,14 @@ TEST(RetainedProductCrossConsumer,
 
   ProductBackedRuntimeParticipantResolver resolver(
       package_root, materialized.bundle,
-      load_lite6_model_map(
-          package_root,
-          {bundle.retained_bundle_id(),
-           bundle.value().compiled_products.symbol_role_maps.front()
-               .product_id}),
+      load_lite6_model_map(package_root,
+                           {bundle.retained_bundle_id(),
+                            bundle.value()
+                                .compiled_products.symbol_role_maps.front()
+                                .product_id}),
       physical_bindings);
-  const auto scene =
-      make_projection_runtime_shadow_snapshot(core::CellId(std::string(cell_id)));
+  const auto scene = make_projection_runtime_shadow_snapshot(
+      core::CellId(std::string(cell_id)));
   for (std::size_t index = 0U; index < physical_bindings.size(); ++index) {
     auto operation = make_motion_operation(
         physical_bindings[index], core::RequestOwnerEpoch("kernel.epoch.two"),

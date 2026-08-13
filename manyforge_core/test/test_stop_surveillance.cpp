@@ -327,13 +327,21 @@ TEST(StopSurveillanceTest, FailedObservationIsMonotonicAndExactReplayIsNoOp) {
   EXPECT_EQ(rejected.error().code, "stop_surveillance_observation_conflict");
 }
 
-TEST(StopSurveillanceTest, CompleteFreshSatisfiedSetProducesOneQuiescenceDigest) {
+TEST(StopSurveillanceTest, CompleteFreshSatisfiedSetHonorsContinuousDwell) {
   auto state = Seed();
   auto query = MakeStopSurveillanceObservationQuery(state, 0U, 100'000'000);
   ASSERT_TRUE(query.ok());
   auto reduced = ReduceStopSurveillanceObservation(
       std::move(state), query.value(),
       Sample(query.value(), StopEvidenceItemStateDTO::kSatisfied, 1U));
+  ASSERT_TRUE(reduced.ok()) << reduced.error().message;
+  EXPECT_EQ(reduced.value().projection.state, StopPostTerminalSurveillanceStateDTO::kMonitoring);
+
+  auto dwell_query = MakeStopSurveillanceObservationQuery(reduced.value(), 0U, 200'000'000);
+  ASSERT_TRUE(dwell_query.ok());
+  reduced = ReduceStopSurveillanceObservation(
+      std::move(reduced.value()), dwell_query.value(),
+      Sample(dwell_query.value(), StopEvidenceItemStateDTO::kSatisfied, 2U));
   ASSERT_TRUE(reduced.ok()) << reduced.error().message;
   EXPECT_EQ(reduced.value().projection.state,
             StopPostTerminalSurveillanceStateDTO::kQuiescenceObserved);
@@ -342,7 +350,47 @@ TEST(StopSurveillanceTest, CompleteFreshSatisfiedSetProducesOneQuiescenceDigest)
   auto checkpoint = MakeStopSurveillanceCheckpoint(reduced.value());
   ASSERT_TRUE(checkpoint.ok()) << checkpoint.error().message;
   EXPECT_EQ(checkpoint.value(), reduced.value().projection);
-  EXPECT_FALSE(MakeStopSurveillanceObservationQuery(reduced.value(), 0U, 110'000'000).ok());
+  EXPECT_FALSE(MakeStopSurveillanceObservationQuery(reduced.value(), 0U, 210'000'000).ok());
+}
+
+TEST(StopSurveillanceTest, ReplayDoesNotAdvanceDwellAndUnavailableBreaksContinuity) {
+  auto state = Seed();
+  auto first_query = MakeStopSurveillanceObservationQuery(state, 0U, 100'000'000);
+  ASSERT_TRUE(first_query.ok());
+  auto first = ReduceStopSurveillanceObservation(
+      std::move(state), first_query.value(),
+      Sample(first_query.value(), StopEvidenceItemStateDTO::kSatisfied, 1U));
+  ASSERT_TRUE(first.ok()) << first.error().message;
+
+  auto replay_query = MakeStopSurveillanceObservationQuery(first.value(), 0U, 200'000'000);
+  ASSERT_TRUE(replay_query.ok());
+  auto replay = ReduceStopSurveillanceObservation(
+      first.value(), replay_query.value(),
+      Sample(replay_query.value(), StopEvidenceItemStateDTO::kSatisfied, 1U));
+  ASSERT_TRUE(replay.ok()) << replay.error().message;
+  EXPECT_EQ(replay.value(), first.value());
+
+  const StopSurveillanceObservationSampleDTO unavailable{
+      replay_query.value().stop_certificate,
+      replay_query.value().scope_key,
+      replay_query.value().evidence_requirement.evidence_item_id,
+      replay_query.value().resolved_source,
+      StopSurveillanceSourceAvailabilityDTO::kUnavailable,
+      std::nullopt,
+      ErrorDTO{"stop_surveillance_source_unavailable", "unavailable", {}}};
+  auto gap = ReduceStopSurveillanceObservation(std::move(replay.value()), replay_query.value(),
+                                               unavailable);
+  ASSERT_TRUE(gap.ok()) << gap.error().message;
+  EXPECT_TRUE(gap.value().latest_evidence.front().has_value());
+  EXPECT_FALSE(gap.value().satisfied_since_evaluation_time_ns.front().has_value());
+
+  auto resumed_query = MakeStopSurveillanceObservationQuery(gap.value(), 0U, 210'000'000);
+  ASSERT_TRUE(resumed_query.ok());
+  auto resumed = ReduceStopSurveillanceObservation(
+      std::move(gap.value()), resumed_query.value(),
+      Sample(resumed_query.value(), StopEvidenceItemStateDTO::kSatisfied, 2U));
+  ASSERT_TRUE(resumed.ok()) << resumed.error().message;
+  EXPECT_EQ(resumed.value().projection.state, StopPostTerminalSurveillanceStateDTO::kMonitoring);
 }
 
 TEST(StopSurveillanceTest, UnavailableAndStaleObservationsCannotProveQuiescence) {
@@ -373,7 +421,8 @@ TEST(StopSurveillanceTest, UnavailableAndStaleObservationsCannotProveQuiescence)
   ASSERT_TRUE(unavailable_result.ok()) << unavailable_result.error().message;
   EXPECT_EQ(unavailable_result.value().projection.state,
             StopPostTerminalSurveillanceStateDTO::kMonitoring);
-  EXPECT_FALSE(unavailable_result.value().latest_evidence.front().has_value());
+  EXPECT_TRUE(unavailable_result.value().latest_evidence.front().has_value());
+  EXPECT_FALSE(unavailable_result.value().satisfied_since_evaluation_time_ns.front().has_value());
 }
 
 TEST(StopSurveillanceTest, RestartAdoptionPreservesCheckpointAndRejectsOldSequence) {

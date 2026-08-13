@@ -14,6 +14,7 @@
 #include <manyforge_roboplan/retained_collision_world_publisher.hpp>
 #include <manyforge_roboplan/retained_focused_adapters.hpp>
 #include <manyforge_roboplan/retained_gripper_command_backend.hpp>
+#include <manyforge_roboplan/retained_stop_surveillance_owner.hpp>
 #include <manyforge_roboplan/roboplan_execution_backend.hpp>
 #include <manyforge_roboplan/roboplan_planner_backend.hpp>
 #include <memory>
@@ -43,7 +44,13 @@ struct RetainedNativeRuntimeConfig final {
   /// no verified participant readiness is installed yet. It is never
   /// inferred from a not-stoppable retained policy or a test constant.
   std::optional<core::StopDeadlineBudgetDTO> cell_stop_deadline_budget;
+  /// Process-owned monitoring policy. Public operation/caller payloads never
+  /// select or override these cadences.
+  std::optional<core::StopSurveillancePolicyDTO> stop_surveillance_policy;
 };
+
+inline constexpr core::StopSurveillancePolicyDTO
+    kMaintainedNativeStopSurveillancePolicy{10'000'000, 100'000'000, 64U};
 
 struct RetainedNativeAddressedOwnerConfig final {
   core::RequestOwnerEpoch request_owner_epoch;
@@ -130,6 +137,7 @@ struct RetainedNativeRuntime final
   std::vector<core::RuntimeParticipantBinding> motion_binding_aliases;
   std::vector<core::RuntimeParticipantBinding> gripper_binding_aliases;
   std::optional<core::StopDeadlineBudgetDTO> cell_stop_deadline_budget;
+  std::optional<core::StopSurveillancePolicyDTO> stop_surveillance_policy;
   std::shared_ptr<roboplan::Scene> scene;
   std::shared_ptr<std::mutex> scene_mutex;
   std::shared_ptr<RetainedKinematicStateProjector> state_projector;
@@ -163,6 +171,7 @@ struct RetainedNativeRuntime final
       participant_registrations;
   core::RuntimeParticipantAdmissionResolver participant_resolver;
   RetainedRuntimeParticipantResolverFactory participant_resolver_factory;
+  std::unique_ptr<RetainedStopSurveillanceOwner> stop_surveillance_owner;
   std::unique_ptr<core::SqliteOperationJournal> operation_journal;
   std::unique_ptr<core::ResourceAddressedExecutionKernel> addressed_kernel;
 

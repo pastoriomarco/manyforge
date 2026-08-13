@@ -1287,6 +1287,11 @@ class FakeResourceAdmissionGate final : public IResourceOperationAdmissionGate {
     return table.reserve_batch(owners);
   }
 
+  [[nodiscard]] std::vector<ResourceId> current_fenced_resources(
+      const std::vector<ResourceId>& resources) const override {
+    return reject_reservation ? resources : std::vector<ResourceId>{};
+  }
+
   bool reject_reservation{true};
   int reserve_calls{};
 
@@ -5593,7 +5598,19 @@ TEST(ResourceAddressedExecutionKernelTest,
   scheduler.advance_to(120);
   ASSERT_TRUE(wait_until([&] {
     const auto status = kernel.get_stop_status(stopped.value().stop_id);
-    return journal.stop_surveillance_calls.load() == 2 && status.ok() &&
+    return journal.stop_surveillance_calls.load() >= 2 && status.ok() &&
+           status.value().surveillance.has_value() &&
+           status.value().surveillance->state ==
+               StopPostTerminalSurveillanceStateDTO::kMonitoring &&
+           status.value().surveillance_projection.state == StopDurableProjectionStateDTO::kRecorded;
+  }));
+  // The retained evidence contract requires 100 ms of continuous rest. A
+  // first satisfied sample cannot collapse that dwell into one observation.
+  clock.set(100'000'120);
+  scheduler.advance_to(100'000'120);
+  ASSERT_TRUE(wait_until([&] {
+    const auto status = kernel.get_stop_status(stopped.value().stop_id);
+    return journal.stop_surveillance_calls.load() >= 3 && status.ok() &&
            status.value().surveillance.has_value() &&
            status.value().surveillance->state ==
                StopPostTerminalSurveillanceStateDTO::kQuiescenceObserved &&
@@ -5602,7 +5619,7 @@ TEST(ResourceAddressedExecutionKernelTest,
   {
     std::lock_guard lock(journal.mutex);
     ASSERT_TRUE(journal.last_stop_surveillance_projected_at_ns.has_value());
-    EXPECT_EQ(*journal.last_stop_surveillance_projected_at_ns, 120);
+    EXPECT_EQ(*journal.last_stop_surveillance_projected_at_ns, 100'000'120);
   }
 
   auto blocked_intent = motion_operation("request.surveillance.blocked");

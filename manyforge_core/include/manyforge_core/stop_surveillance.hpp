@@ -59,6 +59,10 @@ struct StopSurveillanceReducerState final {
   std::vector<StopSurveillanceSourcePlanDTO> source_plans;
   std::vector<std::optional<StopEvidenceItemDTO>> latest_evidence;
   std::vector<std::optional<std::int64_t>> latest_evaluation_time_ns;
+  /// Start of the currently proven continuous satisfied interval. It is
+  /// owner-private and deliberately resets across restart adoption because a
+  /// durable checkpoint does not retain the intervening sample stream.
+  std::vector<std::optional<std::int64_t>> satisfied_since_evaluation_time_ns;
 
   friend bool operator==(const StopSurveillanceReducerState&,
                          const StopSurveillanceReducerState&) = default;

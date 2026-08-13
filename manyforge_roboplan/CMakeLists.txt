@@ -241,7 +241,8 @@ target_link_libraries(manyforge_roboplan_planner_backend PUBLIC
   manyforge_roboplan_native_candidate)
 
 add_library(manyforge_roboplan_native_runtime
-  src/retained_native_runtime.cpp)
+  src/retained_native_runtime.cpp
+  src/retained_stop_surveillance_owner.cpp)
 target_include_directories(manyforge_roboplan_native_runtime PUBLIC
   $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
   $<INSTALL_INTERFACE:include>)
@@ -256,7 +257,8 @@ target_link_libraries(manyforge_roboplan_native_runtime PUBLIC
   manyforge_collision
   manyforge_core
   manyforge_core_sqlite_operation_journal
-  manyforge::deployment_resolved_stop_base_plan_resolver)
+  manyforge::deployment_resolved_stop_base_plan_resolver
+  PRIVATE manyforge::content_identity)
 
 if(NOT TARGET manyforge_deployment_cclc_runtime_composition)
   message(FATAL_ERROR
@@ -492,6 +494,13 @@ if(BUILD_TESTING)
       manyforge_roboplan_native_execution
       manyforge_roboplan_native_gripper
       GTest::gtest_main)
+
+    add_executable(test_retained_stop_surveillance_owner
+      test/test_retained_stop_surveillance_owner.cpp)
+    target_include_directories(test_retained_stop_surveillance_owner PRIVATE
+      "${CMAKE_CURRENT_SOURCE_DIR}/test")
+    target_link_libraries(test_retained_stop_surveillance_owner PRIVATE
+      manyforge_roboplan_native_runtime GTest::gtest_main)
 
     add_executable(test_retained_native_controller_lifecycle_port
       test/test_retained_native_controller_lifecycle_port.cpp)
@@ -1099,6 +1108,10 @@ if(BUILD_TESTING)
         ENVIRONMENT "LD_LIBRARY_PATH=${_LIB_PATHS}"
         TIMEOUT ${MANYFORGE_GTEST_TIMEOUT_SECONDS})
     gtest_discover_tests(test_retained_native_backends
+      PROPERTIES
+        ENVIRONMENT "LD_LIBRARY_PATH=${_LIB_PATHS}"
+        TIMEOUT ${MANYFORGE_GTEST_TIMEOUT_SECONDS})
+    gtest_discover_tests(test_retained_stop_surveillance_owner
       PROPERTIES
         ENVIRONMENT "LD_LIBRARY_PATH=${_LIB_PATHS}"
         TIMEOUT ${MANYFORGE_GTEST_TIMEOUT_SECONDS})

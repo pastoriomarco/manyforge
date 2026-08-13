@@ -261,6 +261,11 @@ class IResourceOperationAdmissionGate {
                                              const std::vector<ResourceId>& resources) = 0;
   [[nodiscard]] virtual Result<void> reserve_batch(
       ResourceSlotTable& table, const std::vector<ResourceSlotReservationOwnerDTO>& owners) = 0;
+  /// Read-only exact overlap with process-local durable configuration fences.
+  /// This is private recovery evidence, not a caller-visible lease or an
+  /// alternative resource-state owner.
+  [[nodiscard]] virtual std::vector<ResourceId> current_fenced_resources(
+      const std::vector<ResourceId>& resources) const = 0;
 };
 
 }  // namespace manyforge::core

@@ -299,6 +299,7 @@ Result<StopSurveillanceReducerState> MakeStopSurveillanceReducerState(
   return Result<StopSurveillanceReducerState>::Ok(
       StopSurveillanceReducerState{std::move(projection), std::move(source_plans),
                                    std::vector<std::optional<StopEvidenceItemDTO>>(source_count),
+                                   std::vector<std::optional<std::int64_t>>(source_count),
                                    std::vector<std::optional<std::int64_t>>(source_count)});
 }
 
@@ -342,6 +343,7 @@ Result<StopSurveillanceReducerState> AdoptStopSurveillanceReducerState(
   return Result<StopSurveillanceReducerState>::Ok(
       StopSurveillanceReducerState{std::move(recovered_projection), std::move(source_plans),
                                    std::vector<std::optional<StopEvidenceItemDTO>>(source_count),
+                                   std::vector<std::optional<std::int64_t>>(source_count),
                                    std::vector<std::optional<std::int64_t>>(source_count)});
 }
 
@@ -377,6 +379,7 @@ Result<StopSurveillanceReducerState> ReduceStopSurveillanceObservation(
   auto& prior_status = state.projection.source_statuses[*index];
   auto& prior_evidence = state.latest_evidence[*index];
   auto& prior_evaluation_time_ns = state.latest_evaluation_time_ns[*index];
+  auto& satisfied_since_evaluation_time_ns = state.satisfied_since_evaluation_time_ns[*index];
   if (sample.availability == StopSurveillanceSourceAvailabilityDTO::kAvailable &&
       !prior_evidence.has_value() && prior_status.source_epoch.has_value() &&
       prior_status.source_sequence.has_value() &&
@@ -389,8 +392,7 @@ Result<StopSurveillanceReducerState> ReduceStopSurveillanceObservation(
       prior_evidence.has_value() &&
       prior_evidence->source_epoch == sample.evaluated_evidence->source_epoch &&
       prior_evidence->source_sequence == sample.evaluated_evidence->source_sequence) {
-    if (*prior_evidence == *sample.evaluated_evidence && prior_evaluation_time_ns.has_value() &&
-        *prior_evaluation_time_ns == query.evaluation_time_ns) {
+    if (*prior_evidence == *sample.evaluated_evidence) {
       return Result<StopSurveillanceReducerState>::Ok(std::move(state));
     }
     return invalid<StopSurveillanceReducerState>("stop_surveillance_observation_conflict",
@@ -420,6 +422,16 @@ Result<StopSurveillanceReducerState> ReduceStopSurveillanceObservation(
 
   if (sample.availability == StopSurveillanceSourceAvailabilityDTO::kAvailable) {
     const auto& item = *sample.evaluated_evidence;
+    const bool extends_satisfied_interval =
+        item.state == StopEvidenceItemStateDTO::kSatisfied && prior_evidence.has_value() &&
+        prior_evidence->state == StopEvidenceItemStateDTO::kSatisfied &&
+        prior_status.availability == StopSurveillanceSourceAvailabilityDTO::kAvailable &&
+        prior_evaluation_time_ns.has_value() && satisfied_since_evaluation_time_ns.has_value() &&
+        query.evaluation_time_ns >= *prior_evaluation_time_ns &&
+        prior_evidence->source_age_at_evaluation_ns.has_value() &&
+        *prior_evidence->source_age_at_evaluation_ns <=
+            query.evidence_requirement.source_requirement.freshness_budget_ns -
+                (query.evaluation_time_ns - *prior_evaluation_time_ns);
     prior_status =
         StopSurveillanceSourceStatusDTO{query.scope_key,
                                         item.evidence_item_id,
@@ -431,6 +443,13 @@ Result<StopSurveillanceReducerState> ReduceStopSurveillanceObservation(
                                         std::nullopt};
     prior_evidence = item;
     prior_evaluation_time_ns = query.evaluation_time_ns;
+    if (item.state == StopEvidenceItemStateDTO::kSatisfied) {
+      if (!extends_satisfied_interval) {
+        satisfied_since_evaluation_time_ns = query.evaluation_time_ns;
+      }
+    } else {
+      satisfied_since_evaluation_time_ns.reset();
+    }
     if (item.state == StopEvidenceItemStateDTO::kFailed) {
       if (state.projection.continued_motion_count == std::numeric_limits<std::uint64_t>::max()) {
         return invalid<StopSurveillanceReducerState>(
@@ -449,8 +468,9 @@ Result<StopSurveillanceReducerState> ReduceStopSurveillanceObservation(
         query.resolved_source, sample.availability,
         std::nullopt,          std::nullopt,
         std::nullopt,          sample.error};
-    prior_evidence.reset();
-    prior_evaluation_time_ns.reset();
+    // Preserve the last linked evidence for stale/conflict fencing and audit,
+    // but an observation gap breaks continuous dwell proof immediately.
+    satisfied_since_evaluation_time_ns.reset();
   }
 
   bool quiescent = true;
@@ -458,14 +478,23 @@ Result<StopSurveillanceReducerState> ReduceStopSurveillanceObservation(
     const auto& item = state.latest_evidence[candidate];
     const auto& evaluated_at_ns = state.latest_evaluation_time_ns[candidate];
     const auto& status = state.projection.source_statuses[candidate];
-    const auto freshness_budget_ns =
-        state.source_plans[candidate].evidence_requirement.source_requirement.freshness_budget_ns;
+    const auto& requirement = state.source_plans[candidate].evidence_requirement;
+    const auto freshness_budget_ns = requirement.source_requirement.freshness_budget_ns;
+    const auto& satisfied_since = state.satisfied_since_evaluation_time_ns[candidate];
+    const auto dwell_satisfied = requirement.observation_semantics.observation_kind !=
+                                     StopEvidenceObservationKind::kPostCommandDwell ||
+                                 (satisfied_since.has_value() &&
+                                  requirement.observation_semantics.minimum_dwell_ns.has_value() &&
+                                  query.evaluation_time_ns >= *satisfied_since &&
+                                  query.evaluation_time_ns - *satisfied_since >=
+                                      *requirement.observation_semantics.minimum_dwell_ns);
     if (!item.has_value() || !evaluated_at_ns.has_value() ||
         item->state != StopEvidenceItemStateDTO::kSatisfied ||
         status.availability != StopSurveillanceSourceAvailabilityDTO::kAvailable ||
         query.evaluation_time_ns < *evaluated_at_ns ||
         *item->source_age_at_evaluation_ns >
-            freshness_budget_ns - (query.evaluation_time_ns - *evaluated_at_ns)) {
+            freshness_budget_ns - (query.evaluation_time_ns - *evaluated_at_ns) ||
+        !dwell_satisfied) {
       quiescent = false;
       break;
     }

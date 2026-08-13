@@ -50,6 +50,9 @@ public:
       manyforge::core::ResourceSlotTable &table,
       const std::vector<manyforge::core::ResourceSlotReservationOwnerDTO>
           &owners) override;
+  [[nodiscard]] std::vector<manyforge::core::ResourceId>
+  current_fenced_resources(
+      const std::vector<manyforge::core::ResourceId> &resources) const override;
 
   /// Attach the exact table owned by the currently composed addressed Kernel.
   /// The gate keeps only a weak reference and owns no duplicate operation or

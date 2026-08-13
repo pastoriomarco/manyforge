@@ -3912,7 +3912,8 @@ BuildProductComposition(CompositionBuildInput input) {
       SimpleSchedulerConfig::from_environment(),
       execution_tick_period_ns,
       retained_runtime_configuration.initial_joint_positions_rad,
-      std::nullopt};
+      std::nullopt,
+      kMaintainedNativeStopSurveillancePolicy};
   auto runtime = input.attach_addressed_owner
                      ? create_retained_native_runtime(std::move(runtime_input),
                                                       std::move(runtime_config))
