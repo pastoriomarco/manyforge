@@ -6701,7 +6701,8 @@ void ResourceAddressedExecutionKernel::ProjectStop(const StopControlWorkToken to
         return;
       }
       const auto projected = journal_.RecordStopSurveillanceCheckpoint(
-          config_.request_owner_epoch, *job.surveillance_checkpoint, *job.surveillance_fault_latch);
+          config_.request_owner_epoch, *job.surveillance_checkpoint, *job.surveillance_fault_latch,
+          clock_.now());
       std::lock_guard state_lock(state_mutex_);
       const auto record = std::find_if(
           stop_terminal_history_.begin(), stop_terminal_history_.end(), [&](const auto& candidate) {

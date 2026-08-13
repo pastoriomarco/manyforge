@@ -139,7 +139,7 @@ class IOperationJournal {
   /// sequence; conflict fails without changing durable truth.
   [[nodiscard]] virtual StopForensicProjectionResultDTO RecordStopSurveillanceCheckpoint(
       const RequestOwnerEpoch& owner_epoch, const StopPostTerminalSurveillanceDTO& checkpoint,
-      const StopFaultLatchDTO& fault_latch) noexcept = 0;
+      const StopFaultLatchDTO& fault_latch, std::int64_t projected_at_ns) noexcept = 0;
 
   /// Atomically records the public recovery result, cleared latch, and exact
   /// resulting terminal status before Kernel may publish clear.

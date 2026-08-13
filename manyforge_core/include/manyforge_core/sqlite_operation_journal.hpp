@@ -82,7 +82,7 @@ class SqliteOperationJournal final : public IOperationJournal {
 
   [[nodiscard]] StopForensicProjectionResultDTO RecordStopSurveillanceCheckpoint(
       const RequestOwnerEpoch& owner_epoch, const StopPostTerminalSurveillanceDTO& checkpoint,
-      const StopFaultLatchDTO& fault_latch) noexcept override;
+      const StopFaultLatchDTO& fault_latch, std::int64_t projected_at_ns) noexcept override;
 
   [[nodiscard]] Result<std::uint64_t> RecordStopFaultCleared(
       const RequestOwnerEpoch& owner_epoch, const StopFaultRecoveryIntentDTO& recovery_intent,

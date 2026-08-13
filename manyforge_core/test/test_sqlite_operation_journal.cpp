@@ -263,33 +263,122 @@ class ScopedTemporaryDirectory final {
       accepted.accepted_at_ns + 1,
       std::nullopt};
   const StopCertificateRefDTO reference{certificate.stop_certificate_id,
-                                        certificate.stop_certificate_revision,
-                                        certificate.stop_id,
+                                        certificate.stop_certificate_revision, certificate.stop_id,
                                         certificate.stop_generation};
-  StopStatusDTO status{
-      accepted,
-      StopStatusStateDTO::kSucceeded,
-      {},
-      {},
-      {},
-      {},
-      {},
-      {},
-      StopDurableProjectionStatusDTO{StopDurableProjectionStateDTO::kRecorded, std::nullopt,
-                                     std::nullopt},
-      StopDurableProjectionStatusDTO{StopDurableProjectionStateDTO::kPending, std::nullopt,
-                                     std::nullopt},
-      StopDurableProjectionStatusDTO{StopDurableProjectionStateDTO::kNotApplicable, std::nullopt,
-                                     std::nullopt},
-      reference,
-      std::nullopt,
-      std::nullopt};
+  StopStatusDTO status{accepted,
+                       StopStatusStateDTO::kSucceeded,
+                       {},
+                       {},
+                       {},
+                       {},
+                       {},
+                       {},
+                       StopDurableProjectionStatusDTO{StopDurableProjectionStateDTO::kRecorded,
+                                                      std::nullopt, std::nullopt},
+                       StopDurableProjectionStatusDTO{StopDurableProjectionStateDTO::kPending,
+                                                      std::nullopt, std::nullopt},
+                       StopDurableProjectionStatusDTO{StopDurableProjectionStateDTO::kNotApplicable,
+                                                      std::nullopt, std::nullopt},
+                       reference,
+                       std::nullopt,
+                       std::nullopt};
   EXPECT_FALSE(stop_terminal_projection_field_error(status, certificate, std::nullopt).has_value());
   return StopJournalTerminalProjectionDTO{std::move(status), std::move(certificate), std::nullopt};
 }
 
-TEST(SqliteOperationJournalTest,
-     StopTerminalProjectionIsAtomicReplaySafeAndRecoveredAfterRestart) {
+[[nodiscard]] StopJournalTerminalProjectionDTO MonitoringTerminalProjection(
+    const StopAcceptedDTO& accepted, const ResourceId& resource) {
+  auto projection = EmptyTerminalProjection(accepted);
+  const StopCertificateRefDTO reference{
+      projection.certificate.stop_certificate_id, projection.certificate.stop_certificate_revision,
+      projection.certificate.stop_id, projection.certificate.stop_generation};
+  StopFaultLatchDTO latch{
+      CellId("cell.1"),
+      accepted.stop_id,
+      accepted.stop_generation,
+      reference,
+      StopFaultLatchId("latch." + accepted.stop_id.value()),
+      StopFaultLatchGeneration(1U),
+      StopFaultTriggerDTO::kScopePromotion,
+      false,
+      {},
+      {resource},
+      RetainedBundleId("retained-bundle"),
+      GraphRevision("graph-revision"),
+      StopDurableProjectionStatusDTO{StopDurableProjectionStateDTO::kPending, std::nullopt,
+                                     std::nullopt},
+      StopDurableProjectionStatusDTO{StopDurableProjectionStateDTO::kNotApplicable, std::nullopt,
+                                     std::nullopt},
+      StopFaultLatchStateDTO::kLatched,
+      1U,
+      StopFaultRecoveryStatusDTO::kWaitingForObservation,
+      "stop_fault_latched",
+      {}};
+  projection.stop_status.fault_latch = latch;
+  projection.fault_latch = std::move(latch);
+  EXPECT_FALSE(stop_terminal_projection_field_error(projection.stop_status, projection.certificate,
+                                                    projection.fault_latch)
+                   .has_value());
+  return projection;
+}
+
+[[nodiscard]] StopPostTerminalSurveillanceDTO MonitoringCheckpoint(
+    const StopJournalTerminalProjectionDTO& terminal, const StopFaultLatchDTO& latch,
+    const ResourceId& resource, const std::uint64_t generation,
+    const std::size_t retained_checkpoint_limit) {
+  ResolvedStopRuntimeTargetDTO runtime_target{
+      ProviderInstanceId("provider.1"),
+      ProviderManifestId("provider-manifest.1"),
+      ProviderManifestRevision(Digest('d').value()),
+      RuntimeUnitId("runtime.1"),
+      ProductId("product.1"),
+      ProductContractId("product-contract.1"),
+      ProductContractRevision("product-contract-revision.1"),
+      Digest('e'),
+      RuntimeEpoch("provider-epoch.1"),
+      RuntimeEpoch("runtime-epoch.1"),
+      std::nullopt,
+      std::nullopt,
+      std::nullopt,
+      std::nullopt,
+      std::nullopt,
+      std::nullopt,
+      std::nullopt,
+      std::nullopt};
+  const ResolvedStopEvidenceSourceDTO source{
+      StopEvidenceSourceKind::kBindingStateAuthority, std::move(runtime_target),
+      StateAuthorityId("state-authority.1"), StateAuthorityClass::kMeasured, std::nullopt};
+  StopPostTerminalSurveillanceDTO checkpoint{
+      terminal.certificate.stop_id,
+      terminal.certificate.stop_generation,
+      *latch.stop_certificate,
+      latch.latch_id,
+      latch.latch_generation,
+      RequestOwnerEpoch("execution-host.epoch.stop-surveillance"),
+      generation,
+      {resource},
+      {StopSurveillanceSourceStatusDTO{
+          StopScopeEntryKeyDTO{terminal.certificate.stop_id, terminal.certificate.stop_generation,
+                               resource},
+          StopEvidenceItemId("evidence.rest"), source,
+          StopSurveillanceSourceAvailabilityDTO::kUnavailable, std::nullopt, std::nullopt,
+          std::nullopt,
+          ErrorDTO{"stop_surveillance_source_unavailable", "source unavailable", {}}}},
+      StopSurveillancePolicyDTO{10, 20, retained_checkpoint_limit},
+      0U,
+      std::nullopt,
+      std::nullopt,
+      std::nullopt,
+      std::nullopt,
+      StopPostTerminalSurveillanceStateDTO::kMonitoring,
+      generation,
+      StopDurableProjectionStatusDTO{StopDurableProjectionStateDTO::kPending, std::nullopt,
+                                     std::nullopt}};
+  EXPECT_FALSE(stop_post_terminal_surveillance_field_error(checkpoint).has_value());
+  return checkpoint;
+}
+
+TEST(SqliteOperationJournalTest, StopTerminalProjectionIsAtomicReplaySafeAndRecoveredAfterRestart) {
   ScopedTemporaryDirectory temporary;
   const auto database = temporary.path() / std::string(kOperationJournalFilename);
   const CellId cell_id("cell.1");
@@ -299,18 +388,17 @@ TEST(SqliteOperationJournalTest,
   {
     SqliteOperationJournal journal(database, cell_id, 8U);
     ASSERT_TRUE(journal.BeginOwnerEpoch(epoch, 1, 8U, inventory).ok());
-    const FullStopIntentDTO intent{
-        PublicRequestContextDTO{RequestId("request.stop.terminal"), epoch, "journal-test",
-                                std::nullopt},
-        StopGeneration(0U), RequestAttributionDTO{}};
+    const FullStopIntentDTO intent{PublicRequestContextDTO{RequestId("request.stop.terminal"),
+                                                           epoch, "journal-test", std::nullopt},
+                                   StopGeneration(0U), RequestAttributionDTO{}};
     auto acceptance = StopAcceptanceRecord(epoch, intent.request_context.request_id.value(),
                                            "stop.terminal", 1U, 10);
     acceptance.normalized_request_digest = ComputeNormalizedStopIntentDigest(intent).value();
     const EmergencyStopProjectedIntentDTO projected_intent(intent);
     const auto affected = StopAffectedState({}, inventory);
     const auto accepted = StopAcceptedProjection(acceptance, projected_intent, affected);
-    const auto acceptance_result = journal.RecordStopAccepted(epoch, acceptance, projected_intent,
-                                                              accepted, affected);
+    const auto acceptance_result =
+        journal.RecordStopAccepted(epoch, acceptance, projected_intent, accepted, affected);
     ASSERT_EQ(acceptance_result.projection_state, EmergencyStopProjectionStateDTO::kRecorded)
         << (acceptance_result.error.has_value() ? acceptance_result.error->code : std::string{})
         << ": "
@@ -327,8 +415,8 @@ TEST(SqliteOperationJournalTest,
 
     auto conflict = *terminal;
     conflict.certificate.completed_at_ns += 1;
-    const auto conflicting = journal.RecordStopTerminal(
-        epoch, conflict.stop_status, conflict.certificate, conflict.fault_latch);
+    const auto conflicting = journal.RecordStopTerminal(epoch, conflict.stop_status,
+                                                        conflict.certificate, conflict.fault_latch);
     EXPECT_EQ(conflicting.state, StopForensicProjectionStateDTO::kFailed);
     EXPECT_FALSE(conflicting.journal_sequence.has_value());
     journal.Close();
@@ -348,10 +436,84 @@ TEST(SqliteOperationJournalTest,
   EXPECT_FALSE(recovered_stop.surveillance.has_value());
   ASSERT_TRUE(recovered.value().replaced_unclosed_owner_epoch.has_value());
   EXPECT_EQ(*recovered.value().replaced_unclosed_owner_epoch, epoch);
+  EXPECT_EQ(recovered.value().unreconciled_resources, inventory);
 }
 
 TEST(SqliteOperationJournalTest,
-     ReusedFixedFullStopIdentityRetainsDistinctTerminalGenerations) {
+     MonitoringCheckpointsUseExplicitProjectionTimeAndRetainABoundedRestartableTail) {
+  ScopedTemporaryDirectory temporary;
+  const auto database = temporary.path() / std::string(kOperationJournalFilename);
+  const CellId cell_id("cell.1");
+  const RequestOwnerEpoch epoch("execution-host.epoch.stop-surveillance");
+  const ResourceId resource("robot.gripper");
+  const std::vector<ResourceId> inventory{resource};
+  std::optional<StopPostTerminalSurveillanceDTO> latest;
+  {
+    SqliteOperationJournal journal(database, cell_id, 8U);
+    ASSERT_TRUE(journal.BeginOwnerEpoch(epoch, 1, 8U, inventory).ok());
+    const FullStopIntentDTO intent{PublicRequestContextDTO{RequestId("request.stop.surveillance"),
+                                                           epoch, "journal-test", std::nullopt},
+                                   StopGeneration(0U), RequestAttributionDTO{}};
+    auto acceptance = StopAcceptanceRecord(epoch, intent.request_context.request_id.value(),
+                                           "stop.surveillance", 1U, 10);
+    acceptance.normalized_request_digest = ComputeNormalizedStopIntentDigest(intent).value();
+    const EmergencyStopProjectedIntentDTO projected_intent(intent);
+    const auto affected = StopAffectedState({}, inventory);
+    const auto accepted = StopAcceptedProjection(acceptance, projected_intent, affected);
+    ASSERT_EQ(journal.RecordStopAccepted(epoch, acceptance, projected_intent, accepted, affected)
+                  .projection_state,
+              EmergencyStopProjectionStateDTO::kRecorded);
+    auto terminal = MonitoringTerminalProjection(accepted, resource);
+    ASSERT_EQ(journal
+                  .RecordStopTerminal(epoch, terminal.stop_status, terminal.certificate,
+                                      terminal.fault_latch)
+                  .state,
+              StopForensicProjectionStateDTO::kRecorded);
+    ASSERT_TRUE(terminal.fault_latch.has_value());
+    auto durable_latch = *terminal.fault_latch;
+    durable_latch.terminal_projection = StopDurableProjectionStatusDTO{
+        StopDurableProjectionStateDTO::kRecorded, std::nullopt, std::nullopt};
+
+    const auto invalid_time = journal.RecordStopSurveillanceCheckpoint(
+        epoch, MonitoringCheckpoint(terminal, durable_latch, resource, 1U, 2U), durable_latch, -1);
+    EXPECT_EQ(invalid_time.state, StopForensicProjectionStateDTO::kFailed);
+
+    for (std::uint64_t generation = 1U; generation <= 4U; ++generation) {
+      latest = MonitoringCheckpoint(terminal, durable_latch, resource, generation, 2U);
+      const auto projected = journal.RecordStopSurveillanceCheckpoint(
+          epoch, *latest, durable_latch, static_cast<std::int64_t>(100U + generation));
+      ASSERT_EQ(projected.state, StopForensicProjectionStateDTO::kRecorded)
+          << (projected.error.has_value() ? projected.error->message : std::string{});
+    }
+
+    const auto events = journal.ReadEvents(epoch, 0U, kMaximumOperationJournalEventPage);
+    ASSERT_TRUE(events.ok()) << events.error().message;
+    std::vector<std::int64_t> checkpoint_times;
+    for (const auto& event : events.value().events) {
+      if (event.record_kind == "stop_surveillance_checkpoint") {
+        checkpoint_times.push_back(event.occurred_at_ns);
+      }
+    }
+    EXPECT_EQ(checkpoint_times, (std::vector<std::int64_t>{103, 104}));
+    EXPECT_FALSE(journal.CloseOwnerEpoch(epoch, 200).ok());
+    journal.Close();
+  }
+
+  SqliteOperationJournal replacement(database, cell_id, 8U);
+  const auto recovered = replacement.BeginOwnerEpoch(
+      RequestOwnerEpoch("execution-host.epoch.stop-surveillance.replacement"), 300, 8U, inventory);
+  ASSERT_TRUE(recovered.ok()) << recovered.error().message;
+  ASSERT_EQ(recovered.value().recovered_stops.size(), 1U);
+  ASSERT_TRUE(recovered.value().recovered_stops.front().surveillance.has_value());
+  ASSERT_TRUE(latest.has_value());
+  auto expected = *latest;
+  expected.checkpoint_projection = StopDurableProjectionStatusDTO{
+      StopDurableProjectionStateDTO::kRecorded, std::nullopt, std::nullopt};
+  EXPECT_EQ(*recovered.value().recovered_stops.front().surveillance, expected);
+  EXPECT_EQ(recovered.value().unreconciled_resources, inventory);
+}
+
+TEST(SqliteOperationJournalTest, ReusedFixedFullStopIdentityRetainsDistinctTerminalGenerations) {
   ScopedTemporaryDirectory temporary;
   const auto database = temporary.path() / std::string(kOperationJournalFilename);
   const CellId cell_id("cell.1");
@@ -363,26 +525,25 @@ TEST(SqliteOperationJournalTest,
     ASSERT_TRUE(journal.BeginOwnerEpoch(epoch, 1, 8U, inventory).ok());
     for (std::uint64_t generation = 1U; generation <= 2U; ++generation) {
       const FullStopIntentDTO intent{
-          PublicRequestContextDTO{RequestId("request.stop.reused." +
-                                            std::to_string(generation)),
+          PublicRequestContextDTO{RequestId("request.stop.reused." + std::to_string(generation)),
                                   epoch, "journal-test", std::nullopt},
           StopGeneration(generation - 1U), RequestAttributionDTO{}};
-      auto acceptance = StopAcceptanceRecord(
-          epoch, intent.request_context.request_id.value(), "stop.fixed-full", generation,
-          static_cast<std::int64_t>(generation * 10U));
+      auto acceptance =
+          StopAcceptanceRecord(epoch, intent.request_context.request_id.value(), "stop.fixed-full",
+                               generation, static_cast<std::int64_t>(generation * 10U));
       acceptance.normalized_request_digest = ComputeNormalizedStopIntentDigest(intent).value();
       const EmergencyStopProjectedIntentDTO projected_intent(intent);
       const auto affected = StopAffectedState({}, inventory);
       const auto accepted = StopAcceptedProjection(acceptance, projected_intent, affected);
-      const auto acceptance_result = journal.RecordStopAccepted(
-          epoch, acceptance, projected_intent, accepted, affected);
+      const auto acceptance_result =
+          journal.RecordStopAccepted(epoch, acceptance, projected_intent, accepted, affected);
       ASSERT_EQ(acceptance_result.projection_state, EmergencyStopProjectionStateDTO::kRecorded)
           << (acceptance_result.error.has_value() ? acceptance_result.error->message
-                                                 : std::string{});
+                                                  : std::string{});
       terminals.push_back(EmptyTerminalProjection(accepted));
-      const auto terminal = journal.RecordStopTerminal(
-          epoch, terminals.back().stop_status, terminals.back().certificate,
-          terminals.back().fault_latch);
+      const auto terminal =
+          journal.RecordStopTerminal(epoch, terminals.back().stop_status,
+                                     terminals.back().certificate, terminals.back().fault_latch);
       ASSERT_EQ(terminal.state, StopForensicProjectionStateDTO::kRecorded)
           << (terminal.error.has_value() ? terminal.error->message : std::string{});
     }
@@ -391,8 +552,7 @@ TEST(SqliteOperationJournalTest,
 
   SqliteOperationJournal replacement(database, cell_id, 8U);
   const auto recovered = replacement.BeginOwnerEpoch(
-      RequestOwnerEpoch("execution-host.epoch.reused-full-stop.replacement"), 30, 8U,
-      inventory);
+      RequestOwnerEpoch("execution-host.epoch.reused-full-stop.replacement"), 30, 8U, inventory);
   ASSERT_TRUE(recovered.ok()) << recovered.error().message;
   ASSERT_EQ(recovered.value().recovered_stops.size(), terminals.size());
   for (std::size_t index = 0U; index < terminals.size(); ++index) {
@@ -449,7 +609,8 @@ TEST(SqliteOperationJournalTest,
   EXPECT_EQ(recovered_again.value().unreconciled_resources, inventory);
 }
 
-TEST(SqliteOperationJournalTest, TerminalHistoryDoesNotFenceResourcesAndOwnerEpochsCannotBeReused) {
+TEST(SqliteOperationJournalTest,
+     CleanlyClosedTerminalHistoryDoesNotFenceResourcesAndOwnerEpochsCannotBeReused) {
   ScopedTemporaryDirectory temporary;
   const auto database = temporary.path() / std::string(kOperationJournalFilename);
   const CellId cell_id("cell.1");
@@ -470,6 +631,7 @@ TEST(SqliteOperationJournalTest, TerminalHistoryDoesNotFenceResourcesAndOwnerEpo
     state.updated_at_ns = 15;
     ASSERT_TRUE(
         journal.RecordOperationState(first_epoch, state, nullptr, "subordinate_completed").ok());
+    ASSERT_TRUE(journal.CloseOwnerEpoch(first_epoch, 16).ok());
     journal.Close();
   }
 
@@ -611,7 +773,7 @@ TEST(SqliteOperationJournalTest, TypedControlScaleAndStopRecordsRoundTripAsTermi
   ASSERT_TRUE(recovered.ok()) << recovered.error().message;
   ASSERT_EQ(recovered.value().historical_operations.size(), 1U);
   EXPECT_EQ(recovered.value().historical_operations.front(), state);
-  EXPECT_TRUE(recovered.value().unreconciled_resources.empty());
+  EXPECT_EQ(recovered.value().unreconciled_resources, inventory);
 }
 
 TEST(SqliteOperationJournalTest,
@@ -884,14 +1046,14 @@ TEST(SqliteOperationJournalTest,
   ASSERT_TRUE(recovered.ok()) << recovered.error().message;
   ASSERT_EQ(recovered.value().historical_operations.size(), 1U);
   EXPECT_EQ(recovered.value().historical_operations.front(), state);
-  EXPECT_TRUE(recovered.value().unreconciled_resources.empty());
+  EXPECT_EQ(recovered.value().unreconciled_resources, inventory);
 }
 
 TEST(SqliteOperationJournalTest, UnresolvedOrphanFenceSurvivesBoundedHistoryCompaction) {
   ScopedTemporaryDirectory temporary;
   const auto database = temporary.path() / std::string(kOperationJournalFilename);
   const CellId cell_id("cell.1");
-  const std::vector<ResourceId> inventory{ResourceId("robot.gripper"), ResourceId("robot.arm")};
+  const std::vector<ResourceId> inventory{ResourceId("robot.arm"), ResourceId("robot.gripper")};
   const RequestOwnerEpoch first_epoch("execution-host.epoch.1");
   const auto orphan_intent = CommandIntent("request.command.1", first_epoch.value());
   const auto orphan_state =
@@ -911,8 +1073,7 @@ TEST(SqliteOperationJournalTest, UnresolvedOrphanFenceSurvivesBoundedHistoryComp
     SqliteOperationJournal replacement(database, cell_id, 1U);
     const auto recovered = replacement.BeginOwnerEpoch(second_epoch, 20, 4U, inventory);
     ASSERT_TRUE(recovered.ok()) << recovered.error().message;
-    EXPECT_EQ(recovered.value().unreconciled_resources,
-              std::vector<ResourceId>{ResourceId("robot.gripper")});
+    EXPECT_EQ(recovered.value().unreconciled_resources, inventory);
 
     const auto terminal_intent = CommandIntent("request.command.2", second_epoch.value());
     auto terminal_state =
@@ -942,8 +1103,7 @@ TEST(SqliteOperationJournalTest, UnresolvedOrphanFenceSurvivesBoundedHistoryComp
     ASSERT_EQ(recovered.value().historical_operations.size(), 1U);
     EXPECT_EQ(recovered.value().historical_operations.front().operation_id,
               orphan_state.operation_id);
-    EXPECT_EQ(recovered.value().unreconciled_resources,
-              std::vector<ResourceId>{ResourceId("robot.gripper")});
+    EXPECT_EQ(recovered.value().unreconciled_resources, inventory);
     replacement.Close();
   }
 
@@ -951,8 +1111,7 @@ TEST(SqliteOperationJournalTest, UnresolvedOrphanFenceSurvivesBoundedHistoryComp
   const auto recovered =
       replacement.BeginOwnerEpoch(RequestOwnerEpoch("execution-host.epoch.4"), 40, 4U, inventory);
   ASSERT_TRUE(recovered.ok()) << recovered.error().message;
-  EXPECT_EQ(recovered.value().unreconciled_resources,
-            std::vector<ResourceId>{ResourceId("robot.gripper")});
+  EXPECT_EQ(recovered.value().unreconciled_resources, inventory);
 }
 
 TEST(SqliteOperationJournalTest, BoundedEventPagesRetainStableWallTimeAndFenceOwnerEpoch) {

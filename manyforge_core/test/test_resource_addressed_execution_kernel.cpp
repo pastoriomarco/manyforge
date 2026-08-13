@@ -1099,11 +1099,12 @@ class FakeOperationJournal final : public IOperationJournal {
 
   StopForensicProjectionResultDTO RecordStopSurveillanceCheckpoint(
       const RequestOwnerEpoch&, const StopPostTerminalSurveillanceDTO& checkpoint,
-      const StopFaultLatchDTO& fault_latch) noexcept override {
+      const StopFaultLatchDTO& fault_latch, const std::int64_t projected_at_ns) noexcept override {
     std::lock_guard lock(mutex);
     calls.push_back("stop_surveillance_checkpoint");
     last_stop_surveillance = checkpoint;
     last_stop_fault_latch = fault_latch;
+    last_stop_surveillance_projected_at_ns = projected_at_ns;
     ++stop_surveillance_calls;
     if (fail_next_kind == "stop_surveillance_checkpoint") {
       fail_next_kind.reset();
@@ -1194,6 +1195,7 @@ class FakeOperationJournal final : public IOperationJournal {
   std::optional<StopCertificateDTO> last_stop_certificate;
   std::optional<StopFaultLatchDTO> last_stop_fault_latch;
   std::optional<StopPostTerminalSurveillanceDTO> last_stop_surveillance;
+  std::optional<std::int64_t> last_stop_surveillance_projected_at_ns;
   std::optional<StopFaultRecoveryIntentDTO> last_stop_recovery_intent;
   std::optional<StopFaultRecoveryResultDTO> last_stop_recovery_result;
   std::function<void()> operation_acceptance_hook;
@@ -5576,6 +5578,11 @@ TEST(ResourceAddressedExecutionKernelTest,
     return journal.stop_surveillance_calls.load() == 1 && status.ok() &&
            status.value().surveillance_projection.state == StopDurableProjectionStateDTO::kFailed;
   }));
+  {
+    std::lock_guard lock(journal.mutex);
+    ASSERT_TRUE(journal.last_stop_surveillance_projected_at_ns.has_value());
+    EXPECT_EQ(*journal.last_stop_surveillance_projected_at_ns, 110);
+  }
   auto latch = kernel.get_stop_fault_latch();
   ASSERT_TRUE(latch.has_value());
   EXPECT_TRUE(latch->persistence_degraded);
@@ -5592,6 +5599,11 @@ TEST(ResourceAddressedExecutionKernelTest,
                StopPostTerminalSurveillanceStateDTO::kQuiescenceObserved &&
            status.value().surveillance_projection.state == StopDurableProjectionStateDTO::kRecorded;
   }));
+  {
+    std::lock_guard lock(journal.mutex);
+    ASSERT_TRUE(journal.last_stop_surveillance_projected_at_ns.has_value());
+    EXPECT_EQ(*journal.last_stop_surveillance_projected_at_ns, 120);
+  }
 
   auto blocked_intent = motion_operation("request.surveillance.blocked");
   blocked_intent.program_binding_id = unaffected_binding.value().program_binding_id;

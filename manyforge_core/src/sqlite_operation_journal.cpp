@@ -2147,7 +2147,8 @@ class SqliteOperationJournal::Impl final {
 
   std::uint64_t RecordStopSurveillanceCheckpoint(const RequestOwnerEpoch& owner_epoch,
                                                  const StopPostTerminalSurveillanceDTO& checkpoint,
-                                                 const StopFaultLatchDTO& fault_latch);
+                                                 const StopFaultLatchDTO& fault_latch,
+                                                 std::int64_t projected_at_ns);
 
   std::uint64_t RecordStopFaultCleared(const RequestOwnerEpoch& owner_epoch,
                                        const StopFaultRecoveryIntentDTO& recovery_intent,
@@ -2263,7 +2264,7 @@ class SqliteOperationJournal::Impl final {
 
   std::uint64_t AppendStopSurveillanceCheckpoint(
       const RequestOwnerEpoch& owner_epoch, const StopJournalSurveillanceProjectionDTO& projection,
-      const std::string& payload_json);
+      const std::string& payload_json, std::int64_t projected_at_ns);
 
   std::filesystem::path database_path_;
   CellId cell_id_;
@@ -2472,7 +2473,10 @@ std::uint64_t SqliteOperationJournal::Impl::AppendStopAcceptance(
 
 std::uint64_t SqliteOperationJournal::Impl::AppendStopSurveillanceCheckpoint(
     const RequestOwnerEpoch& owner_epoch, const StopJournalSurveillanceProjectionDTO& projection,
-    const std::string& payload_json) {
+    const std::string& payload_json, const std::int64_t projected_at_ns) {
+  Require(
+      projected_at_ns >= 0 && static_cast<std::uint64_t>(projected_at_ns) <= kMaximumSafeInteger,
+      "operation_journal_record_invalid", "Stop surveillance projection time is invalid");
   Require(payload_json.size() <= kMaximumRecordJsonBytes, "operation_journal_record_too_large",
           "Stop surveillance projection exceeds the fixed payload bound");
   const auto payload_digest = content_identity::sha256_digest(payload_json);
@@ -2536,7 +2540,7 @@ std::uint64_t SqliteOperationJournal::Impl::AppendStopSurveillanceCheckpoint(
   insert.Bind(1, owner_epoch.value());
   insert.Bind(2, projection.checkpoint.stop_id.value());
   insert.Bind(3, static_cast<std::int64_t>(projection.checkpoint.stop_generation.value()));
-  insert.Bind(4, *projection.checkpoint.late_quiescence_observed_at_ns);
+  insert.Bind(4, projected_at_ns);
   insert.Bind(5, occurred_at_wall);
   insert.Bind(6, static_cast<std::int64_t>(0));
   insert.Bind(7, payload_json);
@@ -2555,6 +2559,18 @@ std::uint64_t SqliteOperationJournal::Impl::AppendStopSurveillanceCheckpoint(
   update.Bind(5, static_cast<std::int64_t>(projection.checkpoint.stop_generation.value()));
   Require(!update.Step() && sqlite3_changes(database_) == 1, "operation_journal_corrupt",
           "Stop surveillance durable projection update did not affect exactly one row");
+  Statement prune_checkpoints(
+      database_,
+      "DELETE FROM journal_records WHERE sequence IN ("
+      "SELECT sequence FROM journal_records WHERE record_kind='stop_surveillance_checkpoint' "
+      "AND stop_id=? AND stop_generation=? ORDER BY sequence DESC LIMIT -1 OFFSET ?)");
+  prune_checkpoints.Bind(1, projection.checkpoint.stop_id.value());
+  prune_checkpoints.Bind(2,
+                         static_cast<std::int64_t>(projection.checkpoint.stop_generation.value()));
+  prune_checkpoints.Bind(
+      3, static_cast<std::int64_t>(projection.checkpoint.policy.retained_checkpoint_limit));
+  Require(!prune_checkpoints.Step(), "operation_journal_corrupt",
+          "Stop surveillance checkpoint retention returned an unexpected row");
   transaction.Commit();
   return sequence;
 }
@@ -2788,6 +2804,13 @@ OperationJournalRecoveryDTO SqliteOperationJournal::Impl::BeginOwnerEpoch(
           "operation request tombstone compaction returned an unexpected row");
 
   std::set<ResourceId> unreconciled;
+  if (replaced_unclosed_owner_epoch.has_value()) {
+    // An emergency Stop may have linearized after the predecessor's last
+    // durable byte.  No stored row can narrow that unknown scope, so owner
+    // replacement without the explicit clean-close marker fences the complete
+    // caller-supplied current inventory.
+    unreconciled.insert(inventory.begin(), inventory.end());
+  }
   for (auto& prior_snapshot : prior_states) {
     auto& state = prior_snapshot.state;
     if (prior_snapshot.disposition == "orphaned_by_host_replacement") {
@@ -2908,6 +2931,10 @@ OperationJournalRecoveryDTO SqliteOperationJournal::Impl::BeginOwnerEpoch(
   Statement prune_records(database_,
                           "DELETE FROM journal_records WHERE owner_epoch<>? AND sequence NOT IN ("
                           "SELECT snapshot_sequence FROM operation_snapshots) "
+                          "AND sequence NOT IN (SELECT surveillance_sequence FROM stop_projections "
+                          "WHERE surveillance_sequence IS NOT NULL) "
+                          "AND sequence NOT IN (SELECT clear_sequence FROM stop_projections "
+                          "WHERE clear_sequence IS NOT NULL) "
                           "AND record_kind NOT IN "
                           "('stop_acceptance_projected','stop_terminal_projected')");
   prune_records.Bind(1, owner_epoch.value());
@@ -3089,7 +3116,7 @@ std::uint64_t SqliteOperationJournal::Impl::RecordStopTerminal(
 
 std::uint64_t SqliteOperationJournal::Impl::RecordStopSurveillanceCheckpoint(
     const RequestOwnerEpoch& owner_epoch, const StopPostTerminalSurveillanceDTO& checkpoint,
-    const StopFaultLatchDTO& fault_latch) {
+    const StopFaultLatchDTO& fault_latch, const std::int64_t projected_at_ns) {
   Require(!owner_epoch.empty() && checkpoint.owner_epoch == owner_epoch &&
               checkpoint.checkpoint_projection.state == StopDurableProjectionStateDTO::kPending &&
               fault_latch.state != StopFaultLatchStateDTO::kCleared,
@@ -3103,7 +3130,7 @@ std::uint64_t SqliteOperationJournal::Impl::RecordStopSurveillanceCheckpoint(
           "Stop surveillance checkpoint projection is invalid");
   return AppendStopSurveillanceCheckpoint(
       owner_epoch, StopJournalSurveillanceProjectionDTO{std::move(recorded), fault_latch},
-      encoded.value());
+      encoded.value(), projected_at_ns);
 }
 
 std::uint64_t SqliteOperationJournal::Impl::RecordStopFaultCleared(
@@ -3403,9 +3430,10 @@ StopForensicProjectionResultDTO SqliteOperationJournal::RecordStopTerminal(
 
 StopForensicProjectionResultDTO SqliteOperationJournal::RecordStopSurveillanceCheckpoint(
     const RequestOwnerEpoch& owner_epoch, const StopPostTerminalSurveillanceDTO& checkpoint,
-    const StopFaultLatchDTO& fault_latch) noexcept {
+    const StopFaultLatchDTO& fault_latch, const std::int64_t projected_at_ns) noexcept {
   return AsStopForensicProjectionResult([&] {
-    return impl_->RecordStopSurveillanceCheckpoint(owner_epoch, checkpoint, fault_latch);
+    return impl_->RecordStopSurveillanceCheckpoint(owner_epoch, checkpoint, fault_latch,
+                                                   projected_at_ns);
   });
 }
 
