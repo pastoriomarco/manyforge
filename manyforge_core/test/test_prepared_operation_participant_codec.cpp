@@ -8,6 +8,7 @@
 #include <manyforge_core/prepared_operation_participant_codec.hpp>
 #include <manyforge_core/prepared_participant_stop_plan_codec.hpp>
 #include <manyforge_core/resolved_stop_base_plan_codec.hpp>
+#include <manyforge_core/types/prepared_execution.hpp>
 
 namespace manyforge::core {
 namespace {
@@ -467,6 +468,29 @@ TEST(PreparedOperationParticipantCodecTest, RejectsSelfAttestedClaimsAndDigestFo
   EXPECT_FALSE(VerifyPreparedOperationParticipant(forged, inputs.binding, inputs.readiness, {},
                                                   MotionInterruptNodeCategory::kGeneric)
                    .ok());
+}
+
+TEST(PreparedOperationParticipantCodecTest, BackendBindingRejectsCrossedParticipant) {
+  const auto base = BasePlan();
+  auto inputs = Inputs(base, false);
+  auto made = MakePreparedOperationParticipant(
+      Candidate(inputs.binding, inputs.readiness, MotionPayload(inputs)), inputs.binding,
+      inputs.readiness, {}, MotionInterruptNodeCategory::kGeneric);
+  ASSERT_TRUE(made.ok());
+  EXPECT_FALSE(
+      prepared_participant_backend_binding_field_error(
+          made.value(), inputs.binding, PreparedParticipantPayloadKindDTO::kMotionExecution)
+          .has_value());
+  EXPECT_EQ(
+      prepared_participant_backend_binding_field_error(
+          made.value(), inputs.binding, PreparedParticipantPayloadKindDTO::kCapabilityCommand),
+      "prepared_participant_backend_shape_invalid");
+
+  auto crossed = made.value();
+  crossed.control_route_id = ControlRouteId("route.other");
+  EXPECT_EQ(prepared_participant_backend_binding_field_error(
+                crossed, inputs.binding, PreparedParticipantPayloadKindDTO::kMotionExecution),
+            "prepared_participant_backend_binding_mismatch");
 }
 
 }  // namespace

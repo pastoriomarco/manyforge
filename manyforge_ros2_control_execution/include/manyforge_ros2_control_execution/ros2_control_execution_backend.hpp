@@ -5,6 +5,7 @@
 #include <condition_variable>
 #include <cstddef>
 #include <cstdint>
+#include <map>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -171,6 +172,17 @@ public:
       std::string group_name, core::IClock &clock, core::IScheduler &scheduler,
       Ros2ControlExecutionBackendConfig config);
   ~Ros2ControlExecutionBackend() override;
+
+  core::PrepareParticipantResultDTO
+  Prepare(const core::PreparedOperationParticipantDTO &participant) override;
+  core::ExecutionHandle
+  Dispatch(const core::PreparedOperationParticipantDTO &participant,
+           const core::ControllerGoalId &controller_goal_id,
+           core::ControllerGoalGeneration controller_goal_generation) override;
+  core::ExecutionHandle DispatchResume(
+      const core::PreparedOperationParticipantDTO &participant,
+      const core::ControllerGoalId &controller_goal_id,
+      core::ControllerGoalGeneration controller_goal_generation) override;
 
   // Deployment-owned ROS entities, including gripper transports, must be
   // installed before this one-way transition. Mutating the ROS graph while the
@@ -695,6 +707,11 @@ private:
   };
 
   void validate_config() const;
+  core::ExecutionHandle
+  dispatch_prepared(const core::PreparedOperationParticipantDTO &participant,
+                    const core::ControllerGoalId &controller_goal_id,
+                    core::ControllerGoalGeneration controller_goal_generation,
+                    bool resume_dispatch);
   void initialize_observed_state_publication();
   void initialize_execution_progress_publication();
   void initialize_scene_projection_worker();
@@ -964,6 +981,18 @@ private:
   core::IClock &clock_;
   core::IScheduler &scheduler_;
   Ros2ControlExecutionBackendConfig config_;
+
+  struct PreparedGoalRecord final {
+    core::ControllerGoalGeneration generation;
+    core::ContentDigest prepared_contract_digest;
+    core::ExecutionHandle handle;
+  };
+  static constexpr std::size_t kPreparedReplayCapacity = 4096U;
+  mutable std::mutex prepared_execution_mutex_;
+  std::map<std::pair<core::OperationId, core::OperationParticipantId>,
+           core::ContentDigest>
+      prepared_participants_;
+  std::map<core::ControllerGoalId, PreparedGoalRecord> prepared_goals_;
   const std::string execution_backend_component_epoch_;
   std::unique_ptr<core::ObservedRobotStatePublication>
       observed_state_publication_;

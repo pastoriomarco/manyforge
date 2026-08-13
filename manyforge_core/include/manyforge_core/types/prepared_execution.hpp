@@ -9,6 +9,8 @@
 
 namespace manyforge::core {
 
+class RuntimeParticipantBinding;
+
 enum class PreparedParticipantPayloadKindDTO : std::uint8_t {
   kMotionExecution = 0,
   kCapabilityCommand,
@@ -136,6 +138,15 @@ struct ExecutionBackendStatusDTO final {
 
 [[nodiscard]] PreparedParticipantPayloadKindDTO prepared_participant_payload_kind(
     const PreparedOperationParticipantDTO& participant) noexcept;
+
+/// Validate the complete backend-owned binding projection without repeating
+/// readiness or repository work. The caller still supplies only a participant
+/// produced by the sealed Make/Verify boundary; this check prevents an adapter
+/// instance from accepting a participant for another binding or payload kind.
+[[nodiscard]] std::optional<std::string_view> prepared_participant_backend_binding_field_error(
+    const PreparedOperationParticipantDTO& participant,
+    const RuntimeParticipantBinding& backend_binding,
+    PreparedParticipantPayloadKindDTO expected_payload_kind) noexcept;
 
 /// Validate one backend result against the exact already-verified prepared
 /// participant that was supplied to the backend.

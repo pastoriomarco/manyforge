@@ -1,6 +1,7 @@
 #include <algorithm>
 #include <cmath>
 #include <manyforge_content_identity/content_identity.hpp>
+#include <manyforge_core/runtime_participant_binding.hpp>
 #include <manyforge_core/types/operation_runtime.hpp>
 #include <manyforge_core/types/prepared_execution.hpp>
 
@@ -82,6 +83,32 @@ template <typename Counter>
          canonical_resources(participant.resources);
 }
 
+[[nodiscard]] std::vector<ResourceId> binding_resources(
+    const RuntimeParticipantBindingDTO& binding) {
+  std::vector<ResourceId> resources;
+  resources.reserve(binding.resources.size());
+  for (const auto& resource : binding.resources) {
+    resources.push_back(resource.resource_id);
+  }
+  std::sort(resources.begin(), resources.end());
+  return resources;
+}
+
+[[nodiscard]] PreparedProviderRuntimeOccurrenceDTO provider(const RuntimeControlPathDTO& path) {
+  return PreparedProviderRuntimeOccurrenceDTO{
+      path.provider_instance_id, path.provider_manifest_id, path.provider_manifest_revision,
+      path.provider_runtime_unit_id, path.provider_runtime_epoch};
+}
+
+[[nodiscard]] PreparedCapabilityProviderRuntimeOccurrenceDTO provider(
+    const RuntimeCapabilityProviderPathDTO& path) {
+  return PreparedCapabilityProviderRuntimeOccurrenceDTO{
+      path.capability_provider_binding_id, path.capability_provider_binding_revision,
+      PreparedProviderRuntimeOccurrenceDTO{
+          path.provider_instance_id, path.provider_manifest_id, path.provider_manifest_revision,
+          path.provider_runtime_unit_id, path.provider_runtime_epoch}};
+}
+
 [[nodiscard]] bool prepare_identity_matches(
     const PrepareParticipantResultDTO& result,
     const PreparedOperationParticipantDTO& participant) noexcept {
@@ -154,6 +181,69 @@ PreparedParticipantPayloadKindDTO prepared_participant_payload_kind(
   return std::holds_alternative<PreparedMotionExecutionDTO>(participant.payload)
              ? PreparedParticipantPayloadKindDTO::kMotionExecution
              : PreparedParticipantPayloadKindDTO::kCapabilityCommand;
+}
+
+std::optional<std::string_view> prepared_participant_backend_binding_field_error(
+    const PreparedOperationParticipantDTO& participant,
+    const RuntimeParticipantBinding& backend_binding,
+    PreparedParticipantPayloadKindDTO expected_payload_kind) noexcept {
+  const auto& binding = backend_binding.value();
+  if (!participant_identity_shape(participant) || !binding.control_path.has_value() ||
+      prepared_participant_payload_kind(participant) != expected_payload_kind) {
+    return "prepared_participant_backend_shape_invalid";
+  }
+  const auto& path = *binding.control_path;
+  const auto expected_capability_provider =
+      binding.capability_provider_path ? std::optional(provider(*binding.capability_provider_path))
+                                       : std::nullopt;
+  if (participant.program_id != binding.program_id ||
+      participant.program_revision != binding.program_revision ||
+      participant.program_binding_id != binding.program_binding_id ||
+      participant.retained_bundle_id != binding.retained_bundle_id ||
+      participant.graph_revision != binding.graph_revision ||
+      participant.controllable_component_id != binding.controllable_component_id ||
+      participant.component_type_id != binding.component_type_id ||
+      participant.component_type_revision != binding.component_type_revision ||
+      participant.command_target_id != binding.command_target_id ||
+      participant.capability_id != binding.capability_id ||
+      participant.capability_definition_revision != binding.capability_definition_revision ||
+      participant.model_bindings != binding.model_bindings ||
+      participant.frame_bindings != binding.frame_bindings ||
+      participant.control_domain_id != path.control_domain_id ||
+      participant.control_domain_revision != path.control_domain_revision ||
+      participant.control_binding_id != path.control_binding_id ||
+      participant.control_binding_revision != path.control_binding_revision ||
+      participant.control_interface_contract_id != path.control_interface_contract_id ||
+      participant.control_interface_revision != path.control_interface_revision ||
+      participant.controller_topology_id != path.controller_topology_id ||
+      participant.topology_revision != path.topology_revision ||
+      participant.control_route_id != path.control_route_id ||
+      participant.activation_set_id != path.activation_set_id ||
+      participant.control_provider != provider(path) ||
+      participant.capability_provider != expected_capability_provider ||
+      participant.resources != binding_resources(binding) ||
+      participant.active_control_configuration_id != path.active_control_configuration_id ||
+      participant.active_control_configuration_generation !=
+          path.active_control_configuration_generation ||
+      participant.runtime_unit_epochs != binding.runtime_unit_epochs ||
+      participant.stop_evidence_policy_id != path.stop_evidence_policy_id ||
+      participant.stop_evidence_policy_revision != path.stop_evidence_policy_revision) {
+    return "prepared_participant_backend_binding_mismatch";
+  }
+  const auto& stop_plan = participant.ordinary_stop_plan;
+  if (stop_plan.operation_id != participant.operation_id ||
+      stop_plan.operation_revision != participant.operation_revision ||
+      stop_plan.participant_id != participant.participant_id ||
+      stop_plan.program_id != participant.program_id ||
+      stop_plan.program_revision != participant.program_revision ||
+      stop_plan.program_binding_id != participant.program_binding_id ||
+      stop_plan.program_run_id != participant.program_run_id ||
+      stop_plan.participant_stop_profile_purpose != ParticipantStopProfilePurposeDTO::kOrdinary ||
+      stop_plan.participant_stop_profile.has_value() ||
+      stop_plan.motion_interrupt_scope_id.has_value()) {
+    return "prepared_participant_backend_stop_plan_mismatch";
+  }
+  return std::nullopt;
 }
 
 std::optional<std::string_view> prepare_participant_result_field_error(

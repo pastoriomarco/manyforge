@@ -921,6 +921,41 @@ class MockExecution : public IExecutionBackend {
   /// the explicit acknowledgement paths.
   std::optional<ExecutionState> next_terminal_state;
 
+  PrepareParticipantResultDTO Prepare(const PreparedOperationParticipantDTO& participant) override {
+    const auto result = MakePrepareParticipantResult(
+        participant,
+        std::holds_alternative<PreparedMotionExecutionDTO>(participant.payload)
+            ? PrepareParticipantResultStateDTO::kPrepared
+            : PrepareParticipantResultStateDTO::kRejected,
+        std::holds_alternative<PreparedMotionExecutionDTO>(participant.payload)
+            ? std::nullopt
+            : std::optional(ErrorDTO{std::string(kErrorInvalidRequest),
+                                     "prepared payload tag mismatch",
+                                     {{"reason", "prepared_payload_tag_mismatch"}}}));
+    return result.value();
+  }
+
+  ExecutionHandle Dispatch(const PreparedOperationParticipantDTO& participant,
+                           const ControllerGoalId& controller_goal_id,
+                           ControllerGoalGeneration controller_goal_generation) override {
+    auto handle =
+        execute_trajectory(std::get<PreparedMotionExecutionDTO>(participant.payload).trajectory);
+    handle.controller_goal_id = controller_goal_id;
+    handle.controller_goal_generation = controller_goal_generation;
+    handle.prepared_contract_digest = participant.prepared_contract_digest;
+    return handle;
+  }
+
+  ExecutionHandle DispatchResume(const PreparedOperationParticipantDTO& participant,
+                                 const ControllerGoalId& controller_goal_id,
+                                 ControllerGoalGeneration controller_goal_generation) override {
+    auto handle = resume(std::get<PreparedMotionExecutionDTO>(participant.payload).trajectory);
+    handle.controller_goal_id = controller_goal_id;
+    handle.controller_goal_generation = controller_goal_generation;
+    handle.prepared_contract_digest = participant.prepared_contract_digest;
+    return handle;
+  }
+
   ExecutionHandle execute_trajectory(const TrajectoryDTO& trajectory) override {
     ++execute_count;
     last_trajectory = trajectory;
@@ -1112,6 +1147,41 @@ class ControlledExecution : public IExecutionBackend {
   int sync_observed_state_count = 0;
   bool block_sync_observed_state = false;
   bool release_blocked_sync_observed_state = false;
+
+  PrepareParticipantResultDTO Prepare(const PreparedOperationParticipantDTO& participant) override {
+    const auto result = MakePrepareParticipantResult(
+        participant,
+        std::holds_alternative<PreparedMotionExecutionDTO>(participant.payload)
+            ? PrepareParticipantResultStateDTO::kPrepared
+            : PrepareParticipantResultStateDTO::kRejected,
+        std::holds_alternative<PreparedMotionExecutionDTO>(participant.payload)
+            ? std::nullopt
+            : std::optional(ErrorDTO{std::string(kErrorInvalidRequest),
+                                     "prepared payload tag mismatch",
+                                     {{"reason", "prepared_payload_tag_mismatch"}}}));
+    return result.value();
+  }
+
+  ExecutionHandle Dispatch(const PreparedOperationParticipantDTO& participant,
+                           const ControllerGoalId& controller_goal_id,
+                           ControllerGoalGeneration controller_goal_generation) override {
+    auto handle =
+        execute_trajectory(std::get<PreparedMotionExecutionDTO>(participant.payload).trajectory);
+    handle.controller_goal_id = controller_goal_id;
+    handle.controller_goal_generation = controller_goal_generation;
+    handle.prepared_contract_digest = participant.prepared_contract_digest;
+    return handle;
+  }
+
+  ExecutionHandle DispatchResume(const PreparedOperationParticipantDTO& participant,
+                                 const ControllerGoalId& controller_goal_id,
+                                 ControllerGoalGeneration controller_goal_generation) override {
+    auto handle = resume(std::get<PreparedMotionExecutionDTO>(participant.payload).trajectory);
+    handle.controller_goal_id = controller_goal_id;
+    handle.controller_goal_generation = controller_goal_generation;
+    handle.prepared_contract_digest = participant.prepared_contract_digest;
+    return handle;
+  }
 
   ExecutionHandle execute_trajectory(const TrajectoryDTO& trajectory) override {
     if (on_execute) {

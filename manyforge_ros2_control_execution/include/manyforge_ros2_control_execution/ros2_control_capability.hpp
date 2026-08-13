@@ -8,6 +8,7 @@
 #include <vector>
 
 #include <manyforge_core/motion_interrupt/soft_on_path_stop_planner.hpp>
+#include <manyforge_core/runtime_participant_binding.hpp>
 #include <manyforge_core/types/error_code.hpp>
 #include <manyforge_core/types/motion_interrupt.hpp>
 #include <manyforge_ros2_control_execution/controller_binding.hpp>
@@ -119,6 +120,11 @@ struct Ros2ControlExecutionBackendConfig {
   // with an `_experimental` capability id and physically executes
   // spring_back_hold through explicit fallback gating.
   bool enable_soft_on_path_experimental = false;
+
+  /// Exact sealed participant binding for the I8 Prepare/Dispatch boundary.
+  /// Absence keeps the legacy backend observable but makes direct prepared
+  /// admission fail closed until product composition supplies the referent.
+  std::optional<core::RuntimeParticipantBinding> prepared_participant_binding;
 };
 
 /// Pure capability evaluation for ros2_control deployments. This helper

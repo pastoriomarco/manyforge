@@ -466,6 +466,26 @@ void Ros2ControlExecutionBackend::validate_config() const {
     throw std::invalid_argument(
         "ros2_control required_joints must not be empty");
   }
+  if (config_.prepared_participant_binding.has_value()) {
+    const auto &binding = config_.prepared_participant_binding->value();
+    if (!binding.control_path.has_value()) {
+      throw std::invalid_argument(
+          "prepared participant binding requires one control path");
+    }
+    std::vector<std::string> binding_joints;
+    binding_joints.reserve(binding.resources.size());
+    for (const auto &resource : binding.resources) {
+      if (!resource.source_joint_name.has_value()) {
+        throw std::invalid_argument(
+            "prepared ros2_control binding requires source joint names");
+      }
+      binding_joints.push_back(*resource.source_joint_name);
+    }
+    if (binding_joints != config_.required_joints) {
+      throw std::invalid_argument(
+          "prepared ros2_control binding does not match required_joints");
+    }
+  }
   if (config_.observed_state_source_precedence.empty()) {
     throw std::invalid_argument(
         "observed_state_source_precedence must not be empty");
@@ -622,6 +642,143 @@ void Ros2ControlExecutionBackend::validate_config() const {
           "controller binding disagrees with execution endpoint/joint config");
     }
   }
+}
+
+core::PrepareParticipantResultDTO Ros2ControlExecutionBackend::Prepare(
+    const core::PreparedOperationParticipantDTO &participant) {
+  const auto reject = [&](std::string reason) {
+    auto result = core::MakePrepareParticipantResult(
+        participant, core::PrepareParticipantResultStateDTO::kRejected,
+        core::ErrorDTO{core::kErrorExecutionRejected,
+                       "ros2_control backend rejected prepared participant",
+                       {{"reason", std::move(reason)}}});
+    if (!result.ok()) {
+      throw std::invalid_argument(result.error().message);
+    }
+    return std::move(result.value());
+  };
+  if (!config_.prepared_participant_binding.has_value()) {
+    return reject("prepared_backend_binding_unavailable");
+  }
+  if (const auto field_error =
+          core::prepared_participant_backend_binding_field_error(
+              participant, *config_.prepared_participant_binding,
+              core::PreparedParticipantPayloadKindDTO::kMotionExecution)) {
+    return reject(std::string(*field_error));
+  }
+  const auto &motion =
+      std::get<core::PreparedMotionExecutionDTO>(participant.payload);
+  if (motion.trajectory.resources != participant.resources ||
+      motion.trajectory.joint_names != config_.required_joints) {
+    return reject("prepared_trajectory_scope_mismatch");
+  }
+
+  std::lock_guard<std::mutex> lock(prepared_execution_mutex_);
+  const auto key =
+      std::make_pair(participant.operation_id, participant.participant_id);
+  const auto found = prepared_participants_.find(key);
+  if (found != prepared_participants_.end()) {
+    if (found->second != participant.prepared_contract_digest) {
+      return reject("prepared_contract_conflict");
+    }
+  } else {
+    if (prepared_participants_.size() >= kPreparedReplayCapacity) {
+      return reject("prepared_replay_capacity_exhausted");
+    }
+    prepared_participants_.emplace(key, participant.prepared_contract_digest);
+  }
+  auto result = core::MakePrepareParticipantResult(
+      participant, core::PrepareParticipantResultStateDTO::kPrepared);
+  if (!result.ok()) {
+    throw std::invalid_argument(result.error().message);
+  }
+  return std::move(result.value());
+}
+
+core::ExecutionHandle Ros2ControlExecutionBackend::dispatch_prepared(
+    const core::PreparedOperationParticipantDTO &participant,
+    const core::ControllerGoalId &controller_goal_id,
+    core::ControllerGoalGeneration controller_goal_generation,
+    bool resume_dispatch) {
+  const auto rejected = [&](std::string reason) {
+    core::ExecutionSnapshot snapshot;
+    snapshot.timestamp_ns = clock_.now();
+    snapshot.state = core::ExecutionState::kFailed;
+    snapshot.error =
+        core::ErrorDTO{core::kErrorExecutionRejected,
+                       "ros2_control backend rejected prepared dispatch",
+                       {{"reason", std::move(reason)}}};
+    core::ExecutionHandle handle{
+        [](std::int64_t) { return true; },
+        [snapshot = std::move(snapshot)]() { return snapshot; }, 0U};
+    handle.controller_goal_id = controller_goal_id;
+    handle.controller_goal_generation = controller_goal_generation;
+    handle.prepared_contract_digest = participant.prepared_contract_digest;
+    return handle;
+  };
+
+  std::lock_guard<std::mutex> lock(prepared_execution_mutex_);
+  if (controller_goal_id.empty() || !controller_goal_generation.nonzero()) {
+    return rejected("controller_goal_identity_invalid");
+  }
+  if (!config_.prepared_participant_binding.has_value()) {
+    return rejected("prepared_backend_binding_unavailable");
+  }
+  if (const auto field_error =
+          core::prepared_participant_backend_binding_field_error(
+              participant, *config_.prepared_participant_binding,
+              core::PreparedParticipantPayloadKindDTO::kMotionExecution)) {
+    return rejected(std::string(*field_error));
+  }
+  const auto prepared_key =
+      std::make_pair(participant.operation_id, participant.participant_id);
+  const auto prepared = prepared_participants_.find(prepared_key);
+  if (prepared == prepared_participants_.end() ||
+      prepared->second != participant.prepared_contract_digest) {
+    return rejected("prepared_participant_not_admitted");
+  }
+  const auto replay = prepared_goals_.find(controller_goal_id);
+  if (replay != prepared_goals_.end()) {
+    if (replay->second.generation == controller_goal_generation &&
+        replay->second.prepared_contract_digest ==
+            participant.prepared_contract_digest) {
+      return replay->second.handle;
+    }
+    return rejected("controller_goal_identity_conflict");
+  }
+  if (prepared_goals_.size() >= kPreparedReplayCapacity) {
+    return rejected("controller_goal_replay_capacity_exhausted");
+  }
+
+  const auto &trajectory =
+      std::get<core::PreparedMotionExecutionDTO>(participant.payload)
+          .trajectory;
+  auto handle =
+      resume_dispatch ? resume(trajectory) : execute_trajectory(trajectory);
+  handle.controller_goal_id = controller_goal_id;
+  handle.controller_goal_generation = controller_goal_generation;
+  handle.prepared_contract_digest = participant.prepared_contract_digest;
+  prepared_goals_.emplace(
+      controller_goal_id,
+      PreparedGoalRecord{controller_goal_generation,
+                         participant.prepared_contract_digest, handle});
+  return handle;
+}
+
+core::ExecutionHandle Ros2ControlExecutionBackend::Dispatch(
+    const core::PreparedOperationParticipantDTO &participant,
+    const core::ControllerGoalId &controller_goal_id,
+    core::ControllerGoalGeneration controller_goal_generation) {
+  return dispatch_prepared(participant, controller_goal_id,
+                           controller_goal_generation, false);
+}
+
+core::ExecutionHandle Ros2ControlExecutionBackend::DispatchResume(
+    const core::PreparedOperationParticipantDTO &participant,
+    const core::ControllerGoalId &controller_goal_id,
+    core::ControllerGoalGeneration controller_goal_generation) {
+  return dispatch_prepared(participant, controller_goal_id,
+                           controller_goal_generation, true);
 }
 
 void Ros2ControlExecutionBackend::initialize_observed_state_publication() {

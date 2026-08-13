@@ -64,6 +64,17 @@ public:
       core::IClock &clock, RoboPlanExecutionBackendConfig config = {});
   ~RoboPlanExecutionBackend() override;
 
+  core::PrepareParticipantResultDTO
+  Prepare(const core::PreparedOperationParticipantDTO &participant) override;
+  core::ExecutionHandle
+  Dispatch(const core::PreparedOperationParticipantDTO &participant,
+           const core::ControllerGoalId &controller_goal_id,
+           core::ControllerGoalGeneration controller_goal_generation) override;
+  core::ExecutionHandle DispatchResume(
+      const core::PreparedOperationParticipantDTO &participant,
+      const core::ControllerGoalId &controller_goal_id,
+      core::ControllerGoalGeneration controller_goal_generation) override;
+
   core::ExecutionHandle
   execute_trajectory(const core::TrajectoryDTO &trajectory) override;
   core::Result<void> sync_observed_state_before_planning() override;
@@ -182,6 +193,11 @@ private:
                                            std::int64_t source_timestamp_ns);
   void terminal_scene_projection_retry_worker(std::stop_token stop_token);
   void stop_terminal_scene_projection_retry_worker() noexcept;
+  core::ExecutionHandle
+  dispatch_prepared(const core::PreparedOperationParticipantDTO &participant,
+                    const core::ControllerGoalId &controller_goal_id,
+                    core::ControllerGoalGeneration controller_goal_generation,
+                    bool resume_dispatch);
 
   struct PendingTerminalSceneProjection {
     std::vector<double> joint_positions;
@@ -233,6 +249,18 @@ private:
   std::condition_variable_any terminal_scene_projection_retry_cv_;
   std::optional<PendingTerminalSceneProjection>
       pending_terminal_scene_projection_;
+
+  struct PreparedGoalRecord final {
+    core::ControllerGoalGeneration generation;
+    core::ContentDigest prepared_contract_digest;
+    core::ExecutionHandle handle;
+  };
+  static constexpr std::size_t kPreparedReplayCapacity = 4096U;
+  mutable std::mutex prepared_execution_mutex_;
+  std::map<std::pair<core::OperationId, core::OperationParticipantId>,
+           core::ContentDigest>
+      prepared_participants_;
+  std::map<core::ControllerGoalId, PreparedGoalRecord> prepared_goals_;
   std::jthread terminal_scene_projection_retry_thread_;
 
   friend class detail::NativeStopQualificationAccess;

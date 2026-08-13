@@ -1,13 +1,14 @@
 #pragma once
 
 #include <functional>
-#include <optional>
-#include <string>
-#include <vector>
-
+#include <manyforge_core/types/action_span.hpp>
 #include <manyforge_core/types/error_code.hpp>
 #include <manyforge_core/types/execution_status.hpp>
-#include <manyforge_core/types/action_span.hpp>
+#include <manyforge_core/types/strong_id.hpp>
+#include <optional>
+#include <string>
+#include <utility>
+#include <vector>
 
 namespace manyforge::core {
 
@@ -35,12 +36,31 @@ struct ExecutionSnapshot {
 /// Execution handle for tracking trajectory execution (spec 220 §4.2)
 /// Provides phase-event feedback; exact delivery mechanism is implementation-defined.
 struct ExecutionHandle {
+  ExecutionHandle() = default;
+  ExecutionHandle(std::function<bool(int64_t)> wait, std::function<ExecutionSnapshot()> snapshot,
+                  std::uint64_t generation = 0,
+                  std::optional<ControllerGoalId> goal_id = std::nullopt,
+                  std::optional<ControllerGoalGeneration> goal_generation = std::nullopt,
+                  std::optional<ContentDigest> contract_digest = std::nullopt)
+      : wait_for_completion(std::move(wait)),
+        get_snapshot(std::move(snapshot)),
+        execution_generation(generation),
+        controller_goal_id(std::move(goal_id)),
+        controller_goal_generation(std::move(goal_generation)),
+        prepared_contract_digest(std::move(contract_digest)) {}
+
   std::function<bool(int64_t timeout_ns)> wait_for_completion;
   std::function<ExecutionSnapshot()> get_snapshot;
   /// Backend generation opened by this exact dispatch. Zero means the backend
   /// cannot support generation-fenced runtime lookahead and admission must
   /// fail closed when lookahead is enabled.
   std::uint64_t execution_generation = 0;
+  /// Exact Kernel goal/prepared membership for the direct I8 dispatch path.
+  /// All three fields are jointly present there and jointly absent on the
+  /// historical trajectory-only path while that path is being removed.
+  std::optional<ControllerGoalId> controller_goal_id;
+  std::optional<ControllerGoalGeneration> controller_goal_generation;
+  std::optional<ContentDigest> prepared_contract_digest;
 };
 
 /// Stop result (spec 220 §4.2)

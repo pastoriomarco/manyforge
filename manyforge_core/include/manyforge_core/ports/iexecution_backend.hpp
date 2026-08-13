@@ -6,6 +6,7 @@
 #include <manyforge_core/types/error_code.hpp>
 #include <manyforge_core/types/execution_result.hpp>
 #include <manyforge_core/types/motion_interrupt.hpp>
+#include <manyforge_core/types/prepared_execution.hpp>
 #include <manyforge_core/types/runtime_scale.hpp>
 #include <manyforge_core/types/trajectory_dto.hpp>
 #include <stop_token>
@@ -28,6 +29,25 @@ namespace manyforge::core {
 class IExecutionBackend : public IControlDomainExecutionPort {
  public:
   virtual ~IExecutionBackend() = default;
+
+  /// Side-effect-free exact participant preparation. Implementations accept
+  /// only the motion_execution payload and retain bounded digest replay
+  /// membership; preparation never sends a transport command.
+  virtual PrepareParticipantResultDTO Prepare(
+      const PreparedOperationParticipantDTO& participant) = 0;
+
+  /// Dispatch one already-prepared participant under the Kernel-minted goal.
+  /// Exact repetition returns the same goal-bound handle and never sends a
+  /// second transport command.
+  virtual ExecutionHandle Dispatch(const PreparedOperationParticipantDTO& participant,
+                                   const ControllerGoalId& controller_goal_id,
+                                   ControllerGoalGeneration controller_goal_generation) = 0;
+
+  /// Resume remains a fresh goal-bound dispatch of a newly prepared immutable
+  /// participant; it cannot inherit a stale binding or controller generation.
+  virtual ExecutionHandle DispatchResume(const PreparedOperationParticipantDTO& participant,
+                                         const ControllerGoalId& controller_goal_id,
+                                         ControllerGoalGeneration controller_goal_generation) = 0;
 
   /// Execute a trajectory (spec 220 §4)
   ///
