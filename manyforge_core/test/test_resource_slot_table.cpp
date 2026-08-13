@@ -569,6 +569,56 @@ TEST(ResourceSlotTableTest, RevisesExactOwnerWithoutChangingSlotState) {
           .ok());
 }
 
+TEST(ResourceSlotTableTest, BatchRevisionAdvancesEveryParticipantOwnerExactlyOnce) {
+  ResourceSlotTable table({ResourceId("arm.j1"), ResourceId("gripper.j1")});
+  const std::vector<ResourceSlotReservationOwnerDTO> owners{
+      reservation_owner(owner("operation.1", "participant.1"), {ResourceId("arm.j1")}),
+      reservation_owner(owner("operation.1", "participant.2"), {ResourceId("gripper.j1")})};
+  ASSERT_TRUE(table.reserve_batch(owners).ok());
+  const auto generation_before = table.coherent_snapshot().operation_resource_generation;
+
+  const auto revised = table.revise_owner_batch(owners, OperationRevision(2U));
+  ASSERT_TRUE(revised.ok()) << revised.error().message;
+  ASSERT_EQ(revised.value().size(), 2U);
+  EXPECT_TRUE(std::all_of(revised.value().begin(), revised.value().end(), [](const auto& row) {
+    return row.operation_revision == OperationRevision(2U);
+  }));
+  const auto snapshot = table.coherent_snapshot();
+  EXPECT_EQ(snapshot.operation_resource_generation, generation_before + 1U);
+  EXPECT_TRUE(std::all_of(snapshot.slots.begin(), snapshot.slots.end(), [](const auto& slot) {
+    return slot.state == ResourceSlotState::kReserved && slot.owner.has_value() &&
+           slot.owner->operation_revision == OperationRevision(2U);
+  }));
+}
+
+TEST(ResourceSlotTableTest, BatchTransitionRevisionPrevalidatesWithoutPartialMutation) {
+  ResourceSlotTable table({ResourceId("arm.j1"), ResourceId("gripper.j1")});
+  const std::vector<ResourceSlotReservationOwnerDTO> owners{
+      reservation_owner(owner("operation.1", "participant.1"), {ResourceId("arm.j1")}),
+      reservation_owner(owner("operation.1", "participant.2"), {ResourceId("gripper.j1")})};
+  ASSERT_TRUE(table.reserve_batch(owners).ok());
+  auto invalid = owners;
+  invalid.back().owner.operation_id = OperationId("operation.2");
+  const auto rejected = table.transition_and_revise_owner_batch(
+      invalid, ResourceSlotState::kTerminal, OperationRevision(2U));
+  ASSERT_FALSE(rejected.ok());
+  EXPECT_EQ(rejected.error().details.at("reason"), "resource_revision_batch_row_invalid");
+  const auto unchanged = table.snapshot();
+  EXPECT_TRUE(std::all_of(unchanged.begin(), unchanged.end(), [](const auto& slot) {
+    return slot.state == ResourceSlotState::kReserved && slot.owner.has_value() &&
+           slot.owner->operation_revision == OperationRevision(1U);
+  }));
+
+  const auto revised = table.transition_and_revise_owner_batch(owners, ResourceSlotState::kTerminal,
+                                                               OperationRevision(2U));
+  ASSERT_TRUE(revised.ok()) << revised.error().message;
+  const auto terminal = table.snapshot();
+  EXPECT_TRUE(std::all_of(terminal.begin(), terminal.end(), [](const auto& slot) {
+    return slot.state == ResourceSlotState::kTerminal && slot.owner.has_value() &&
+           slot.owner->operation_revision == OperationRevision(2U);
+  }));
+}
+
 TEST(ResourceSlotTableTest, OrphanRecoveryMarksOnlyFreeUnownedResourcesAndBlocksAdmission) {
   ResourceSlotTable table(arm_resources());
   ASSERT_TRUE(table.mark_unreconciled_external_or_orphan_goal({ResourceId("joint.1")}).ok());

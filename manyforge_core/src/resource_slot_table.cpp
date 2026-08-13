@@ -364,6 +364,94 @@ Result<ResourceSlotOwnerDTO> ResourceSlotTable::revise_owner(
   return Result<ResourceSlotOwnerDTO>::Ok(std::move(revised));
 }
 
+Result<std::vector<ResourceSlotOwnerDTO>> ResourceSlotTable::revise_owner_batch(
+    const std::vector<ResourceSlotReservationOwnerDTO>& owners,
+    OperationRevision next_operation_revision) {
+  std::lock_guard lock(*admission_mutex_);
+  return revise_owner_batch_locked(owners, std::nullopt, next_operation_revision);
+}
+
+Result<std::vector<ResourceSlotOwnerDTO>> ResourceSlotTable::revise_owner_batch_locked(
+    const std::vector<ResourceSlotReservationOwnerDTO>& owners,
+    std::optional<ResourceSlotState> next_state, OperationRevision next_operation_revision) {
+  if (owners.empty() || owners.size() > slots_.size() || !next_operation_revision.nonzero() ||
+      !std::is_sorted(owners.begin(), owners.end(),
+                      [](const auto& left, const auto& right) {
+                        return reservation_owner_key(left) < reservation_owner_key(right);
+                      }) ||
+      std::adjacent_find(owners.begin(), owners.end(), [](const auto& left, const auto& right) {
+        return reservation_owner_key(left) == reservation_owner_key(right);
+      }) != owners.end()) {
+    return reject_value<std::vector<ResourceSlotOwnerDTO>>(
+        "coordinated resource revision owners are not canonical",
+        "resource_revision_batch_not_canonical", ErrorCode::kInvalidRequest);
+  }
+  const auto& first_owner = owners.front().owner;
+  if (!first_owner.valid() || next_operation_revision <= first_owner.operation_revision) {
+    return reject_value<std::vector<ResourceSlotOwnerDTO>>(
+        "coordinated resource revision does not advance one valid operation",
+        "resource_revision_batch_operation_invalid", ErrorCode::kInvalidRequest);
+  }
+
+  std::vector<std::vector<std::size_t>> assignments;
+  assignments.reserve(owners.size());
+  std::vector<ResourceSlotOwnerDTO> revised_owners;
+  revised_owners.reserve(owners.size());
+  std::set<ResourceId> complete_resources;
+  std::vector<std::size_t> indices;
+  for (const auto& row : owners) {
+    if (!row.owner.valid() || row.owner.operation_id != first_owner.operation_id ||
+        row.owner.operation_revision != first_owner.operation_revision ||
+        next_operation_revision <= row.owner.operation_revision || row.resources.empty() ||
+        !std::is_sorted(row.resources.begin(), row.resources.end()) ||
+        std::adjacent_find(row.resources.begin(), row.resources.end()) != row.resources.end()) {
+      return reject_value<std::vector<ResourceSlotOwnerDTO>>(
+          "coordinated resource revision row is invalid or names another operation revision",
+          "resource_revision_batch_row_invalid", ErrorCode::kInvalidRequest);
+    }
+    auto validation = validate_resource_set_locked(row.resources, indices);
+    if (!validation.ok()) {
+      return Result<std::vector<ResourceSlotOwnerDTO>>::Err(validation.error());
+    }
+    for (std::size_t offset = 0U; offset < row.resources.size(); ++offset) {
+      if (!complete_resources.insert(row.resources[offset]).second) {
+        return reject_value<std::vector<ResourceSlotOwnerDTO>>(
+            "coordinated resource revision scopes overlap", "resource_revision_batch_scope_overlap",
+            ErrorCode::kInvalidRequest);
+      }
+      const auto& slot = slots_[indices[offset]];
+      if (!slot.owner.has_value() || *slot.owner != row.owner) {
+        return reject_value<std::vector<ResourceSlotOwnerDTO>>(
+            "coordinated resource revision owner does not match the slot",
+            "resource_owner_mismatch");
+      }
+      if (next_state.has_value() && !legal_transition(slot.state, *next_state)) {
+        return reject_value<std::vector<ResourceSlotOwnerDTO>>(
+            "coordinated resource revision transition is illegal", "resource_transition_illegal",
+            ErrorCode::kInvalidStateTransition);
+      }
+    }
+    assignments.push_back(indices);
+    auto revised = row.owner;
+    revised.operation_revision = next_operation_revision;
+    revised_owners.push_back(std::move(revised));
+  }
+  auto generation = require_generation_available_locked();
+  if (!generation.ok()) {
+    return Result<std::vector<ResourceSlotOwnerDTO>>::Err(generation.error());
+  }
+  for (std::size_t owner_index = 0U; owner_index < assignments.size(); ++owner_index) {
+    for (const auto slot_index : assignments[owner_index]) {
+      slots_[slot_index].owner = revised_owners[owner_index];
+      if (next_state.has_value()) {
+        slots_[slot_index].state = *next_state;
+      }
+    }
+  }
+  advance_generation_locked();
+  return Result<std::vector<ResourceSlotOwnerDTO>>::Ok(std::move(revised_owners));
+}
+
 Result<ResourceSlotOwnerDTO> ResourceSlotTable::transition_and_revise_owner(
     const ResourceSlotOwnerDTO& owner, const std::vector<ResourceId>& resources,
     ResourceSlotState next_state, OperationRevision next_operation_revision) {
@@ -407,6 +495,13 @@ Result<ResourceSlotOwnerDTO> ResourceSlotTable::transition_and_revise_owner(
   }
   advance_generation_locked();
   return Result<ResourceSlotOwnerDTO>::Ok(std::move(revised));
+}
+
+Result<std::vector<ResourceSlotOwnerDTO>> ResourceSlotTable::transition_and_revise_owner_batch(
+    const std::vector<ResourceSlotReservationOwnerDTO>& owners, ResourceSlotState next_state,
+    OperationRevision next_operation_revision) {
+  std::lock_guard lock(*admission_mutex_);
+  return revise_owner_batch_locked(owners, next_state, next_operation_revision);
 }
 
 Result<ResourceSlotStopFenceResultDTO> ResourceSlotTable::stop_fence_batch(

@@ -168,12 +168,25 @@ class ResourceSlotTable final {
       const ResourceSlotOwnerDTO& owner, const std::vector<ResourceId>& resources,
       OperationRevision next_operation_revision);
 
+  /// Atomically advance every participant owner of one coordinated operation
+  /// to the same next revision without changing slot state.
+  [[nodiscard]] Result<std::vector<ResourceSlotOwnerDTO>> revise_owner_batch(
+      const std::vector<ResourceSlotReservationOwnerDTO>& owners,
+      OperationRevision next_operation_revision);
+
   /// Atomically advance slot state and owning operation revision. This is the
   /// acceptance primitive for controls such as scoped Stop whose state and
   /// CAS fence must never be observably split.
   [[nodiscard]] Result<ResourceSlotOwnerDTO> transition_and_revise_owner(
       const ResourceSlotOwnerDTO& owner, const std::vector<ResourceId>& resources,
       ResourceSlotState next_state, OperationRevision next_operation_revision);
+
+  /// Atomically transition and revise every participant owner of one
+  /// coordinated operation. No participant observes a different operation
+  /// revision or slot phase after acceptance.
+  [[nodiscard]] Result<std::vector<ResourceSlotOwnerDTO>> transition_and_revise_owner_batch(
+      const std::vector<ResourceSlotReservationOwnerDTO>& owners, ResourceSlotState next_state,
+      OperationRevision next_operation_revision);
 
   /// Atomically fence a canonical set of distinct operation-participant owners
   /// plus any retained orphan/effect-uncertain resources. Every precondition is
@@ -222,6 +235,9 @@ class ResourceSlotTable final {
   [[nodiscard]] Result<void> validate_resource_set_locked(const std::vector<ResourceId>& resources,
                                                           std::vector<std::size_t>& indices) const;
   [[nodiscard]] Result<void> require_generation_available_locked() const;
+  [[nodiscard]] Result<std::vector<ResourceSlotOwnerDTO>> revise_owner_batch_locked(
+      const std::vector<ResourceSlotReservationOwnerDTO>& owners,
+      std::optional<ResourceSlotState> next_state, OperationRevision next_operation_revision);
   void advance_generation_locked() noexcept;
 
   std::shared_ptr<std::recursive_mutex> admission_mutex_;
