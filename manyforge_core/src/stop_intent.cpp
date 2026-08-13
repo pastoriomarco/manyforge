@@ -122,4 +122,23 @@ std::optional<std::string_view> full_stop_intent_field_error(
   return std::nullopt;
 }
 
+std::optional<std::string_view> operation_control_request_field_error(
+    const OperationControlRequestDTO& request) noexcept {
+  if (!context_valid(request.request_context)) {
+    return "operation_control_request_context_invalid";
+  }
+  if (!bounded_identity(request.operation_id) || !request.expected_operation_revision.nonzero() ||
+      request.expected_operation_revision.value() >
+          static_cast<std::uint64_t>(kMaximumStopDurationNs)) {
+    return "operation_control_target_invalid";
+  }
+  if (request.reason.has_value() && !bounded_utf8(*request.reason, kMaximumStopReasonBytes)) {
+    return "operation_control_reason_invalid";
+  }
+  if (!attribution_valid(request.attribution)) {
+    return "operation_control_attribution_invalid";
+  }
+  return std::nullopt;
+}
+
 }  // namespace manyforge::core

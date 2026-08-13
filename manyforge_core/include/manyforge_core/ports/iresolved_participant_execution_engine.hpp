@@ -25,6 +25,15 @@ class IResolvedParticipantExecutionEngine {
   virtual PauseResultDTO pause() = 0;
   virtual ResumeResultDTO resume(std::optional<std::uint64_t> expected_epoch = std::nullopt) = 0;
   virtual ResetResultDTO reset(std::optional<std::uint64_t> expected_epoch = std::nullopt) = 0;
+  /// Retires one exact subordinate execution after the addressed Kernel has
+  /// already committed an immutable containment certificate. This bounded
+  /// process-local/backend-reset seam MUST NOT issue another Stop command.
+  virtual ResetResultDTO reset_after_certified_containment(
+      std::uint64_t execution_id,
+      std::optional<std::uint64_t> expected_epoch = std::nullopt) = 0;
+  /// Retires one exact Completed subordinate execution in process-local state.
+  /// This method MUST NOT call a controller, vendor transport, execution
+  /// backend, or any other physical-effect boundary.
   virtual AcknowledgeCompletedResultDTO acknowledge_completed(
       std::uint64_t execution_id, std::optional<std::uint64_t> expected_epoch = std::nullopt) = 0;
 

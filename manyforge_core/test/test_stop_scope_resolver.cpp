@@ -619,13 +619,22 @@ TEST(StopScopeResolverTest, AggregatesPredecessorsWithoutRebasingOrWideningTheir
   EXPECT_EQ(predecessor_only.value().remaining_outer_duration_ns, 500);
 }
 
-TEST(StopScopeResolverTest, RejectsMismatchedPreparedPlanOrBudget) {
+TEST(StopScopeResolverTest, RetainsDispatchPlanAcrossControlRevisionsAndRejectsMismatch) {
   const auto intent = operation_stop();
   const auto resolution = resolve_stop_scope(intent, independent_snapshot());
   ASSERT_TRUE(resolution.ok());
-  auto wrong_revision = prepared_plan();
-  wrong_revision.operation_revision = OperationRevision(2U);
+  auto control_advanced_plan = prepared_plan();
+  control_advanced_plan.operation_revision = OperationRevision(2U);
   auto accepted =
+      MakeStopAccepted(intent, StopId("stop.8"), StopGeneration(8U), resolution.value(),
+                       {{OperationId("operation.a"), OperationRevision(4U)}}, fixed_budget(), 800,
+                       100,
+                       std::span<const PreparedParticipantStopPlanDTO>(&control_advanced_plan, 1U));
+  ASSERT_TRUE(accepted.ok()) << accepted.error().message;
+
+  auto wrong_revision = prepared_plan();
+  wrong_revision.operation_revision = OperationRevision(4U);
+  accepted =
       MakeStopAccepted(intent, StopId("stop.8"), StopGeneration(8U), resolution.value(),
                        {{OperationId("operation.a"), OperationRevision(4U)}}, fixed_budget(), 800,
                        100, std::span<const PreparedParticipantStopPlanDTO>(&wrong_revision, 1U));

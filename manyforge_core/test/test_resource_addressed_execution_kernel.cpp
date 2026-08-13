@@ -384,6 +384,20 @@ class FakeParticipantEngine final : public IResolvedParticipantExecutionEngine,
     }
     return next_reset_result;
   }
+  ResetResultDTO reset_after_certified_containment(std::uint64_t execution_id,
+                                                   std::optional<std::uint64_t>) override {
+    ++certified_reset_calls;
+    Trace("engine:reset_after_certified_containment");
+    if (execution_id == 0U || execution_id != next_execution_id) {
+      return ResetResultDTO{false, ErrorDTO{"certified_containment_execution_mismatch",
+                                            "fake certified reset execution is stale",
+                                            {}}};
+    }
+    if (next_reset_result.accepted) {
+      emit_transition(status.state, ExecutionState::kIdle);
+    }
+    return next_reset_result;
+  }
   AcknowledgeCompletedResultDTO acknowledge_completed(std::uint64_t,
                                                       std::optional<std::uint64_t>) override {
     ++acknowledge_calls;
@@ -585,18 +599,19 @@ class FakeParticipantEngine final : public IResolvedParticipantExecutionEngine,
   int prepare_command_calls{};
   mutable int observe_prepared_command_calls{};
   int dispatch_prepared_command_calls{};
-  int cancel_prepared_command_calls{};
+  std::atomic<int> cancel_prepared_command_calls{};
   int preview_calls{};
   int command_calls{};
   mutable int validate_command_calls{};
   int stop_gripper_calls{};
-  int reset_gripper_calls{};
+  std::atomic<int> reset_gripper_calls{};
   std::atomic<int> stop_calls{};
   std::atomic<int> translate_stop_stage_calls{};
-  int pause_calls{};
-  int resume_calls{};
-  int reset_calls{};
-  int acknowledge_calls{};
+  std::atomic<int> pause_calls{};
+  std::atomic<int> resume_calls{};
+  std::atomic<int> reset_calls{};
+  std::atomic<int> certified_reset_calls{};
+  std::atomic<int> acknowledge_calls{};
   int runtime_scale_calls{};
   std::uint64_t next_execution_id{41U};
   Result<std::uint64_t> next_execute_result = Result<std::uint64_t>::Ok(41U);
@@ -628,6 +643,7 @@ class FakeParticipantEngine final : public IResolvedParticipantExecutionEngine,
   std::optional<GripperCommandRequestDTO> last_command;
   std::optional<ResolvedParticipantStopStageDTO> last_stop_stage;
   std::vector<std::string>* timeline{};
+  std::mutex* timeline_mutex{};
 
  private:
   static std::string Digest(char digit) { return "sha256:" + std::string(64U, digit); }
@@ -897,10 +913,12 @@ class FakeParticipantEngine final : public IResolvedParticipantExecutionEngine,
 
   void Trace(std::string value) {
     if (timeline != nullptr) {
+      std::unique_lock lock(timeline_mutex != nullptr ? *timeline_mutex : fallback_timeline_mutex_);
       timeline->push_back(std::move(value));
     }
   }
 
+  std::mutex fallback_timeline_mutex_;
   std::uint64_t next_subscription_id{1U};
   std::map<std::uint64_t, EventCallback> callbacks;
 };
@@ -941,6 +959,8 @@ class FakeOperationJournal final : public IOperationJournal {
     std::lock_guard lock(mutex);
     calls.push_back("stop_accepted");
     if (timeline != nullptr) {
+      std::unique_lock timeline_lock(timeline_mutex != nullptr ? *timeline_mutex
+                                                               : fallback_timeline_mutex_);
       timeline->push_back("journal:stop_accepted");
     }
     last_stop_acceptance = acceptance;
@@ -1048,6 +1068,8 @@ class FakeOperationJournal final : public IOperationJournal {
     std::lock_guard lock(mutex);
     calls.push_back(kind);
     if (timeline != nullptr) {
+      std::unique_lock timeline_lock(timeline_mutex != nullptr ? *timeline_mutex
+                                                               : fallback_timeline_mutex_);
       timeline->push_back("journal:" + kind);
     }
     if (fail_next_kind == kind) {
@@ -1084,6 +1106,8 @@ class FakeOperationJournal final : public IOperationJournal {
   std::vector<StopId> projected_stop_terminals;
   std::uint64_t next_sequence{1U};
   std::vector<std::string>* timeline{};
+  std::mutex* timeline_mutex{};
+  std::mutex fallback_timeline_mutex_;
   std::mutex mutex;
 };
 
@@ -2234,8 +2258,8 @@ TEST(ResourceAddressedExecutionKernelTest,
   const auto accepted =
       kernel.execute(coordinated_command_operation("request.command.coordinated.failure"));
   ASSERT_TRUE(accepted.ok()) << accepted.error().message;
-  EXPECT_EQ(first_engine.cancel_prepared_command_calls, 1);
-  EXPECT_EQ(second_engine.cancel_prepared_command_calls, 0);
+  EXPECT_EQ(first_engine.cancel_prepared_command_calls.load(), 1);
+  EXPECT_EQ(second_engine.cancel_prepared_command_calls.load(), 0);
   EXPECT_EQ(first_engine.dispatch_prepared_command_calls, 0);
   EXPECT_EQ(second_engine.dispatch_prepared_command_calls, 0);
   const auto slots = kernel.resource_snapshot();
@@ -2340,8 +2364,8 @@ TEST(ResourceAddressedExecutionKernelTest,
   const auto accepted = executing.get();
   ASSERT_TRUE(accepted.ok()) << accepted.error().message;
   ASSERT_TRUE(wait_until([&] {
-    return first_engine.cancel_prepared_command_calls == 1 &&
-           second_engine.cancel_prepared_command_calls == 1;
+    return first_engine.cancel_prepared_command_calls.load() == 1 &&
+           second_engine.cancel_prepared_command_calls.load() == 1;
   }));
   EXPECT_EQ(first_engine.dispatch_prepared_command_calls, 0);
   EXPECT_EQ(second_engine.dispatch_prepared_command_calls, 0);
@@ -2396,7 +2420,7 @@ TEST(ResourceAddressedExecutionKernelTest,
   EXPECT_EQ(first_engine.dispatch_prepared_command_calls, 1);
   EXPECT_EQ(second_engine.dispatch_prepared_command_calls, 1);
   EXPECT_EQ(third_engine.dispatch_prepared_command_calls, 0);
-  EXPECT_EQ(third_engine.cancel_prepared_command_calls, 1);
+  EXPECT_EQ(third_engine.cancel_prepared_command_calls.load(), 1);
   ASSERT_TRUE(wait_until([&] {
     return first_engine.translate_stop_stage_calls.load() == 1 &&
            second_engine.translate_stop_stage_calls.load() == 1;
@@ -2602,6 +2626,14 @@ TEST(ResourceAddressedExecutionKernelTest,
   const auto acknowledged =
       kernel.acknowledge_completed(control_request("request.robot.1.ack", first.value(), 1U));
   ASSERT_TRUE(acknowledged.ok()) << acknowledged.error().message;
+  ASSERT_TRUE(wait_until([&] {
+    const auto slots = kernel.resource_snapshot();
+    const auto first_slot = std::find_if(slots.begin(), slots.end(), [](const auto& slot) {
+      return slot.resource_id == ResourceId("robot.joint_1");
+    });
+    return first_engine.acknowledge_calls.load() == 1 && first_slot != slots.end() &&
+           first_slot->state == ResourceSlotState::kFree;
+  }));
   const auto first_historical = kernel.get_operation_state(first.value().operation_id);
   ASSERT_TRUE(first_historical.ok()) << first_historical.error().message;
   EXPECT_EQ(first_historical.value().state, OperationStateKind::kCompleted);
@@ -2705,6 +2737,10 @@ TEST(ResourceAddressedExecutionKernelTest,
   const auto acknowledged = kernel.acknowledge_completed(
       control_request("request.late-event.first.ack", first.value(), 1U));
   ASSERT_TRUE(acknowledged.ok()) << acknowledged.error().message;
+  ASSERT_TRUE(wait_until([&] {
+    const auto slots = kernel.resource_snapshot();
+    return !slots.empty() && slots.front().state == ResourceSlotState::kFree;
+  }));
 
   engine.next_execution_id = 42U;
   engine.next_execute_result = Result<std::uint64_t>::Ok(42U);
@@ -2747,8 +2783,8 @@ TEST(ResourceAddressedExecutionKernelTest,
   const auto paused =
       kernel.pause(control_request("request.scoped.pause.first", first.value(), 1U));
   ASSERT_TRUE(paused.ok()) << paused.error().message;
-  EXPECT_EQ(first_engine.pause_calls, 1);
-  EXPECT_EQ(second_engine.pause_calls, 0);
+  ASSERT_TRUE(wait_until([&] { return first_engine.pause_calls.load() == 1; }));
+  EXPECT_EQ(second_engine.pause_calls.load(), 0);
   const auto second_after_pause = kernel.get_operation_state(second.value().operation_id);
   ASSERT_TRUE(second_after_pause.ok()) << second_after_pause.error().message;
   EXPECT_EQ(second_after_pause.value().state, OperationStateKind::kExecuting);
@@ -3452,7 +3488,8 @@ TEST(ResourceAddressedExecutionKernelTest,
   release_prepare.set_value();
   const auto accepted = executing.get();
   ASSERT_TRUE(accepted.ok()) << accepted.error().message;
-  ASSERT_TRUE(wait_until([&] { return engine.cancel_prepared_command_calls == 1; }));
+  ASSERT_TRUE(wait_until([&] { return engine.cancel_prepared_command_calls.load() > 0; }));
+  EXPECT_EQ(engine.cancel_prepared_command_calls.load(), 1);
   EXPECT_EQ(engine.dispatch_prepared_command_calls, 0);
   EXPECT_EQ(engine.command_calls, 0);
   EXPECT_EQ(engine.translate_stop_stage_calls.load(), 0);
@@ -3578,9 +3615,11 @@ TEST(ResourceAddressedExecutionKernelTest,
   const auto reset = kernel.reset(control_request(
       "request.command.reset", accepted.value(), stopped_state.value().operation_revision.value()));
   ASSERT_TRUE(reset.ok()) << reset.error().message;
-  EXPECT_EQ(engine.reset_gripper_calls, 1);
-  EXPECT_EQ(engine.reset_calls, 0);
-  EXPECT_EQ(kernel.resource_snapshot().front().state, ResourceSlotState::kFree);
+  ASSERT_TRUE(wait_until([&] {
+    return engine.reset_gripper_calls.load() == 1 &&
+           kernel.resource_snapshot().front().state == ResourceSlotState::kFree;
+  }));
+  EXPECT_EQ(engine.reset_calls.load(), 0);
 }
 
 TEST(ResourceAddressedExecutionKernelTest,
@@ -3600,27 +3639,51 @@ TEST(ResourceAddressedExecutionKernelTest,
   ASSERT_TRUE(paused.ok()) << paused.error().message;
   EXPECT_EQ(paused.value().operation_revision_after_acceptance, OperationRevision(2U));
   EXPECT_EQ(kernel.resource_snapshot().front().state, ResourceSlotState::kDispatched);
+  ASSERT_TRUE(wait_until([&] {
+    const auto state = kernel.get_operation_state(executed.value().operation_id);
+    return engine.pause_calls.load() == 1 && state.ok() &&
+           state.value().state == OperationStateKind::kStopping;
+  }));
   engine.emit_transition(ExecutionState::kStopping, ExecutionState::kPaused);
   auto paused_state = kernel.get_operation_state(executed.value().operation_id);
   ASSERT_TRUE(paused_state.ok());
   EXPECT_EQ(paused_state.value().state, OperationStateKind::kPaused);
   EXPECT_EQ(paused_state.value().operation_revision, OperationRevision(2U));
 
-  const auto resumed = kernel.resume(control_request("request.resume.1", executed.value(), 2U));
-  ASSERT_TRUE(resumed.ok()) << resumed.error().message;
-  EXPECT_EQ(resumed.value().operation_revision_after_acceptance, OperationRevision(3U));
+  std::optional<OperationControlAcceptedDTO> resumed;
+  ASSERT_TRUE(wait_until([&] {
+    auto candidate = kernel.resume(control_request("request.resume.1", executed.value(), 2U));
+    if (!candidate.ok()) {
+      return false;
+    }
+    resumed = std::move(candidate.value());
+    return true;
+  }));
+  ASSERT_TRUE(resumed.has_value());
+  EXPECT_EQ(resumed->operation_revision_after_acceptance, OperationRevision(3U));
+  ASSERT_TRUE(wait_until([&] { return engine.resume_calls.load() == 1; }));
   engine.emit_transition(ExecutionState::kValidating, ExecutionState::kExecuting);
   EXPECT_EQ(kernel.resource_snapshot().front().state, ResourceSlotState::kDispatched);
   engine.emit_transition(ExecutionState::kExecuting, ExecutionState::kCompleted);
 
-  const auto acknowledged =
-      kernel.acknowledge_completed(control_request("request.ack.1", executed.value(), 3U));
-  ASSERT_TRUE(acknowledged.ok()) << acknowledged.error().message;
-  EXPECT_EQ(acknowledged.value().operation_revision_after_acceptance, OperationRevision(4U));
-  EXPECT_EQ(engine.pause_calls, 1);
-  EXPECT_EQ(engine.resume_calls, 1);
-  EXPECT_EQ(engine.acknowledge_calls, 1);
-  EXPECT_EQ(kernel.resource_snapshot().front().state, ResourceSlotState::kFree);
+  std::optional<OperationControlAcceptedDTO> acknowledged;
+  ASSERT_TRUE(wait_until([&] {
+    auto candidate =
+        kernel.acknowledge_completed(control_request("request.ack.1", executed.value(), 3U));
+    if (!candidate.ok()) {
+      return false;
+    }
+    acknowledged = std::move(candidate.value());
+    return true;
+  }));
+  ASSERT_TRUE(acknowledged.has_value());
+  EXPECT_EQ(acknowledged->operation_revision_after_acceptance, OperationRevision(4U));
+  ASSERT_TRUE(wait_until([&] {
+    return engine.acknowledge_calls.load() == 1 &&
+           kernel.resource_snapshot().front().state == ResourceSlotState::kFree;
+  }));
+  EXPECT_EQ(engine.pause_calls.load(), 1);
+  EXPECT_EQ(engine.resume_calls.load(), 1);
   const auto retained = kernel.get_operation_state(executed.value().operation_id);
   ASSERT_TRUE(retained.ok()) << retained.error().message;
   EXPECT_EQ(retained.value().state, OperationStateKind::kCompleted);
@@ -3630,7 +3693,7 @@ TEST(ResourceAddressedExecutionKernelTest,
       kernel.acknowledge_completed(control_request("request.ack.1", executed.value(), 3U));
   ASSERT_TRUE(replay.ok()) << replay.error().message;
   EXPECT_EQ(replay.value().replay_status, RequestReplayStatusDTO::kReplayedExact);
-  EXPECT_EQ(engine.acknowledge_calls, 1);
+  EXPECT_EQ(engine.acknowledge_calls.load(), 1);
 }
 
 TEST(ResourceAddressedExecutionKernelTest,
@@ -3650,12 +3713,46 @@ TEST(ResourceAddressedExecutionKernelTest,
   const auto stale = kernel.reset(control_request("request.reset.stale", executed.value(), 2U));
   ASSERT_FALSE(stale.ok());
   EXPECT_EQ(stale.error().details.at("reason"), "operation_revision_stale");
-  EXPECT_EQ(engine.reset_calls, 0);
+  EXPECT_EQ(engine.reset_calls.load(), 0);
 
   const auto reset = kernel.reset(control_request("request.reset.1", executed.value(), 1U));
   ASSERT_TRUE(reset.ok()) << reset.error().message;
-  EXPECT_EQ(engine.reset_calls, 1);
-  EXPECT_EQ(kernel.resource_snapshot().front().state, ResourceSlotState::kFree);
+  ASSERT_TRUE(wait_until([&] {
+    return engine.certified_reset_calls.load() == 1 &&
+           kernel.resource_snapshot().front().state == ResourceSlotState::kFree;
+  }));
+  EXPECT_EQ(engine.reset_calls.load(), 0);
+}
+
+TEST(ResourceAddressedExecutionKernelTest,
+     ResetOfExecutingMotionUsesOneScopedStopThenCertifiedLocalRetirement) {
+  FakeClock clock;
+  FakeParticipantEngine engine;
+  ResourceAddressedExecutionKernel kernel(
+      {registration(
+          make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular),
+          engine)},
+      clock, default_journal, {RequestOwnerEpoch("kernel.epoch.1"), CellId("cell.test"), 16U});
+  const auto executed = kernel.execute(motion_operation("request.reset.executing"));
+  ASSERT_TRUE(executed.ok()) << executed.error().message;
+  engine.emit_transition(ExecutionState::kValidating, ExecutionState::kExecuting);
+
+  const auto reset =
+      kernel.reset(control_request("request.reset.executing.control", executed.value(), 1U));
+  ASSERT_TRUE(reset.ok()) << reset.error().message;
+  EXPECT_EQ(reset.value().operation_revision_after_acceptance, OperationRevision(2U));
+  ASSERT_TRUE(wait_until([&] {
+    return engine.translate_stop_stage_calls.load() == 1 &&
+           engine.certified_reset_calls.load() == 1 &&
+           kernel.resource_snapshot().front().state == ResourceSlotState::kFree;
+  }));
+  EXPECT_EQ(engine.stop_calls.load(), 1);
+  EXPECT_EQ(engine.reset_calls.load(), 0);
+
+  const auto retained = kernel.get_operation_state(executed.value().operation_id);
+  ASSERT_TRUE(retained.ok()) << retained.error().message;
+  EXPECT_EQ(retained.value().state, OperationStateKind::kStopped);
+  EXPECT_EQ(retained.value().operation_revision, OperationRevision(3U));
 }
 
 TEST(ResourceAddressedExecutionKernelTest,
@@ -5063,14 +5160,20 @@ TEST(ResourceAddressedExecutionKernelTest,
   FakeParticipantEngine engine;
   FakeOperationJournal journal;
   std::vector<std::string> timeline;
+  std::mutex timeline_mutex;
   engine.timeline = &timeline;
+  engine.timeline_mutex = &timeline_mutex;
   journal.timeline = &timeline;
+  journal.timeline_mutex = &timeline_mutex;
   ResourceAddressedExecutionKernel kernel(
       {registration(
           make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular),
           engine)},
       clock, journal, {RequestOwnerEpoch("kernel.epoch.1"), CellId("cell.test"), 16U});
-  timeline.clear();
+  {
+    std::lock_guard lock(timeline_mutex);
+    timeline.clear();
+  }
 
   const auto accepted = kernel.execute(motion_operation());
   ASSERT_TRUE(accepted.ok()) << accepted.error().message;
@@ -5108,8 +5211,11 @@ TEST(ResourceAddressedExecutionKernelTest,
   FakeParticipantEngine engine;
   FakeOperationJournal journal;
   std::vector<std::string> timeline;
+  std::mutex timeline_mutex;
   engine.timeline = &timeline;
+  engine.timeline_mutex = &timeline_mutex;
   journal.timeline = &timeline;
+  journal.timeline_mutex = &timeline_mutex;
   ResourceAddressedExecutionKernel kernel(
       {registration(
           make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular),
@@ -5119,36 +5225,67 @@ TEST(ResourceAddressedExecutionKernelTest,
   ASSERT_TRUE(executed.ok()) << executed.error().message;
   engine.emit_transition(ExecutionState::kValidating, ExecutionState::kExecuting);
 
-  timeline.clear();
+  {
+    std::lock_guard lock(timeline_mutex);
+    timeline.clear();
+  }
   const auto scaled = kernel.set_runtime_scale(
       runtime_scale_request("request.scale.ordered", executed.value(), 1U, 0U, 0.5));
   ASSERT_TRUE(scaled.ok()) << scaled.error().message;
-  ASSERT_GE(timeline.size(), 2U);
-  EXPECT_EQ(timeline.front(), "journal:runtime_scale_accepted");
-  EXPECT_EQ(timeline[1], "engine:set_runtime_scale");
+  {
+    std::lock_guard lock(timeline_mutex);
+    ASSERT_GE(timeline.size(), 2U);
+    EXPECT_EQ(timeline.front(), "journal:runtime_scale_accepted");
+    EXPECT_EQ(timeline[1], "engine:set_runtime_scale");
+  }
 
   journal.fail_next_kind = "control_accepted";
-  timeline.clear();
+  {
+    std::lock_guard lock(timeline_mutex);
+    timeline.clear();
+  }
   const auto unpersisted_pause =
       kernel.pause(control_request("request.pause.unpersisted", executed.value(), 1U));
   ASSERT_FALSE(unpersisted_pause.ok());
-  EXPECT_TRUE(timeline.empty() || timeline.front() == "journal:control_accepted");
-  EXPECT_EQ(engine.pause_calls, 0);
+  {
+    std::lock_guard lock(timeline_mutex);
+    EXPECT_TRUE(timeline.empty() || timeline.front() == "journal:control_accepted");
+  }
+  EXPECT_EQ(engine.pause_calls.load(), 0);
 
   engine.next_pause_result =
       PauseResultDTO{false, ErrorDTO{"pause_failed",
                                      "controller rejected pause",
                                      {{"reason", "controller_pause_rejected"}}}};
-  timeline.clear();
+  {
+    std::lock_guard lock(timeline_mutex);
+    timeline.clear();
+  }
   const auto rejected_pause =
       kernel.pause(control_request("request.pause.rejected", executed.value(), 1U));
   ASSERT_TRUE(rejected_pause.ok()) << rejected_pause.error().message;
-  ASSERT_GE(timeline.size(), 2U);
-  EXPECT_EQ(timeline.front(), "journal:control_accepted");
-  EXPECT_EQ(timeline[1], "engine:pause");
-  const auto intervention = kernel.get_operation_state(executed.value().operation_id);
-  ASSERT_TRUE(intervention.ok()) << intervention.error().message;
-  EXPECT_EQ(intervention.value().state, OperationStateKind::kInterventionRequired);
+  ASSERT_TRUE(wait_until([&] {
+    std::lock_guard lock(timeline_mutex);
+    return timeline.size() >= 2U;
+  }));
+  EXPECT_EQ(engine.pause_calls.load(), 1);
+  {
+    std::lock_guard lock(timeline_mutex);
+    ASSERT_GE(timeline.size(), 2U);
+    EXPECT_EQ(timeline.front(), "journal:control_accepted");
+    EXPECT_EQ(timeline[1], "engine:pause");
+  }
+  std::optional<OperationStateDTO> intervention;
+  ASSERT_TRUE(wait_until([&] {
+    auto candidate = kernel.get_operation_state(executed.value().operation_id);
+    if (!candidate.ok() || candidate.value().state != OperationStateKind::kInterventionRequired) {
+      return false;
+    }
+    intervention = std::move(candidate.value());
+    return true;
+  }));
+  ASSERT_TRUE(intervention.has_value());
+  EXPECT_EQ(intervention->state, OperationStateKind::kInterventionRequired);
 
   FakeParticipantEngine stop_engine;
   FakeOperationJournal stop_journal;
@@ -5279,7 +5416,7 @@ TEST(ResourceAddressedExecutionKernelTest,
   const auto acknowledged = kernel.acknowledge_completed(
       control_request("request.ack.predecessor", predecessor.value(), 1U));
   ASSERT_TRUE(acknowledged.ok()) << acknowledged.error().message;
-  EXPECT_FALSE(kernel.participant_engine_in_use(&predecessor_engine));
+  ASSERT_TRUE(wait_until([&] { return !kernel.participant_engine_in_use(&predecessor_engine); }));
   const auto released = kernel.release_retired_engine(&predecessor_engine);
   ASSERT_TRUE(released.ok()) << released.error().message;
   EXPECT_EQ(predecessor_engine.subscription_count(), 0U);
@@ -5337,6 +5474,10 @@ TEST(ResourceAddressedExecutionKernelTest,
   const auto acknowledged = kernel.acknowledge_completed(
       control_request("request.ack.route-publication", admitted.value(), 1U));
   ASSERT_TRUE(acknowledged.ok()) << acknowledged.error().message;
+  ASSERT_TRUE(wait_until([&] {
+    const auto slots = kernel.resource_snapshot();
+    return !slots.empty() && slots.front().state == ResourceSlotState::kFree;
+  }));
   const auto rejected =
       kernel.execute(candidate_motion_operation("request.motion.candidate.rejected"));
   ASSERT_FALSE(rejected.ok());

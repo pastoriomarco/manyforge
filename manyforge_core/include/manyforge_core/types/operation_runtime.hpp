@@ -363,6 +363,9 @@ struct OperationControlRequestDTO final {
                          const OperationControlRequestDTO&) = default;
 };
 
+[[nodiscard]] std::optional<std::string_view> operation_control_request_field_error(
+    const OperationControlRequestDTO& request) noexcept;
+
 struct OperationControlAcceptedDTO final {
   RequestId request_id;
   RequestReplayStatusDTO replay_status;

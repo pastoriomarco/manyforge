@@ -54,6 +54,7 @@ add_library(manyforge_core
   src/terminal_committer.cpp
   src/error_code_mapping.cpp
   src/emergency_stop_acceptance_reserve.cpp
+  src/bounded_operation_control_executor.cpp
   src/bounded_stop_control_executor.cpp
   src/bounded_stop_stage_attempt_executor.cpp
   src/execution_admission_support.cpp
@@ -395,6 +396,13 @@ if(BUILD_TESTING)
   target_link_libraries(test_emergency_stop_acceptance_reserve PRIVATE
     manyforge_core GTest::gtest_main)
   gtest_discover_tests(test_emergency_stop_acceptance_reserve
+    PROPERTIES TIMEOUT ${MANYFORGE_GTEST_TIMEOUT_SECONDS})
+
+  add_executable(test_bounded_operation_control_executor
+    test/test_bounded_operation_control_executor.cpp)
+  target_link_libraries(test_bounded_operation_control_executor PRIVATE
+    manyforge_core GTest::gtest_main)
+  gtest_discover_tests(test_bounded_operation_control_executor
     PROPERTIES TIMEOUT ${MANYFORGE_GTEST_TIMEOUT_SECONDS})
 
   add_executable(test_bounded_stop_control_executor

@@ -1005,8 +1005,7 @@ template <typename Intent>
         plan.deadline_budget.phases.size() > kMaximumStopAcceptedPhases ||
         affected == affected_operation_revisions.end() ||
         affected->operation_id != plan.operation_id ||
-        affected->operation_revision_after_acceptance.value() !=
-            plan.operation_revision.value() + 1U) {
+        affected->operation_revision_after_acceptance <= plan.operation_revision) {
       return Result<StopAcceptedDTO>::Err(
           stop_acceptance_input_error("stop_acceptance_participant_plan_mismatch"));
     }

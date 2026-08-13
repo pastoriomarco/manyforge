@@ -347,6 +347,9 @@ class ExecutionKernel : public IResolvedParticipantExecutionEngine,
 
   /// Non-blocking reset. Valid from any state except Idle.
   ResetResultDTO reset(std::optional<std::uint64_t> expected_epoch = std::nullopt) override;
+  ResetResultDTO reset_after_certified_containment(
+      std::uint64_t execution_id,
+      std::optional<std::uint64_t> expected_epoch = std::nullopt) override;
 
   /// Backend-neutral gripper command surface. The injected adapter owns all
   /// progression and publishes immutable observer status.

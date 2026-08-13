@@ -4,6 +4,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <functional>
+#include <manyforge_core/bounded_operation_control_executor.hpp>
 #include <manyforge_core/bounded_stop_control_executor.hpp>
 #include <manyforge_core/bounded_stop_stage_attempt_executor.hpp>
 #include <manyforge_core/emergency_stop_acceptance_reserve.hpp>
@@ -30,6 +31,7 @@
 #include <mutex>
 #include <optional>
 #include <set>
+#include <string_view>
 #include <utility>
 #include <vector>
 
@@ -191,7 +193,8 @@ struct CapabilityCommandPreviewResultDTO final {
 class ResourceAddressedExecutionKernel final : public IAddressedOperationOwner,
                                                public IAddressedMotionPreviewOwner,
                                                private IStopControlWorkReceiver,
-                                               private IStopStageAttemptCompletionReceiver {
+                                               private IStopStageAttemptCompletionReceiver,
+                                               private IOperationControlEffectCompletionReceiver {
  public:
   ResourceAddressedExecutionKernel(
       std::vector<RuntimeParticipantExecutionRegistration> registrations, IClock& clock,
@@ -348,11 +351,18 @@ class ResourceAddressedExecutionKernel final : public IAddressedOperationOwner,
       ErrorDTO failure);
   [[nodiscard]] Result<OperationControlAcceptedDTO> apply_control(
       const OperationControlRequestDTO& request, OperationControlKind control);
+  void CompleteOperationControlEffect(OperationControlEffectResult result) noexcept;
+  [[nodiscard]] Result<void> settle_control_operation_locked(const OperationId& operation_id,
+                                                             OperationControlKind control);
+  [[nodiscard]] StopIntentDTO internal_control_stop_intent_locked(
+      const ActiveOperation& operation, const OperationControlAcceptedDTO& accepted,
+      std::string_view reason) const;
   [[nodiscard]] Result<void> apply_runtime_scale_status(
       IResolvedParticipantExecutionEngine* engine,
       const ResolvedRuntimeScaleStatusDTO& resolved_status);
   void ProgressStop(StopControlWorkToken token) noexcept override;
   void StageAttemptCompleted(StopStageAttemptHandle handle) noexcept override;
+  void OperationControlEffectCompleted(OperationControlEffectHandle handle) noexcept override;
   void ProjectStop(StopControlWorkToken token) noexcept;
   void RunStopSurveillance(StopCertificateId certificate_id,
                            std::uint64_t schedule_generation) noexcept;
@@ -415,6 +425,8 @@ class ResourceAddressedExecutionKernel final : public IAddressedOperationOwner,
   std::unique_ptr<StopProjectionWorker> stop_projection_worker_;
   std::unique_ptr<BoundedStopControlExecutor> stop_control_executor_;
   std::unique_ptr<BoundedStopStageAttemptExecutor> stop_stage_attempt_executor_;
+  std::unique_ptr<BoundedOperationControlExecutor> operation_control_executor_;
+  bool operation_control_reconfiguration_in_progress_{};
   std::size_t prequalified_max_live_stop_participants_{};
   std::condition_variable stop_surveillance_schedule_cv_;
   std::size_t stop_surveillance_schedule_publications_{};

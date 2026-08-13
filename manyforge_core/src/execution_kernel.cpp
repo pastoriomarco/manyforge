@@ -9295,6 +9295,89 @@ ResetResultDTO ExecutionKernel::reset(std::optional<std::uint64_t> expected_epoc
   return reset_backend_and_state(reset_from_state, /*emit_transition=*/true);
 }
 
+ResetResultDTO ExecutionKernel::reset_after_certified_containment(
+    const std::uint64_t execution_id, std::optional<std::uint64_t> expected_epoch) {
+  EventDeferralScope event_scope(*this);
+  std::unique_lock<std::mutex> lifecycle_lock(lifecycle_mutex_);
+  if (!control_command_epoch_matches(expected_epoch)) {
+    return ResetResultDTO{false, stale_control_command_error()};
+  }
+  const auto before = sm_.status();
+  if (execution_id == 0U || before.execution_id != execution_id ||
+      before.state == ExecutionState::kIdle) {
+    return ResetResultDTO{
+        false,
+        ErrorDTO{kErrorInvalidRequest,
+                 "Certified-containment reset names a stale subordinate execution",
+                 {{"reason_code", "certified_containment_execution_mismatch"},
+                  {"current_execution_id", std::to_string(before.execution_id)},
+                  {"requested_execution_id", std::to_string(execution_id)}}}};
+  }
+  if (lifecycle_worker_retirement_in_progress_.load(std::memory_order_acquire)) {
+    return ResetResultDTO{
+        false, ErrorDTO{kErrorInvalidRequest,
+                        "Execution worker retirement is already in progress",
+                        {{"reason_code", "worker_retirement_in_progress"}}}};
+  }
+
+  // The addressed owner has already certified containment. This path only
+  // retires local execution machinery and resets the backend; it must never
+  // issue another Stop command or wait for another Stop policy decision.
+  revoke_runtime_collision_lookahead_clear_permits();
+  invalidate_gripper_authority(GripperInvalidationReason::kReset);
+  planning_reset_requested_.store(true, std::memory_order_release);
+  request_active_planning_cancel();
+  request_active_validation_cancel("certified_containment_reset");
+  stop_policy_.cancel_pending_callbacks();
+  request_fault_preempt_controlled_stop();
+  fault_preempt_worker_.stop_and_join();
+  operator_stop_worker_.stop_and_join();
+  stop_collision_monitoring(RuntimeCollisionMonitorRelease::kResetOrTeardown);
+  if (!retire_execute_worker(lifecycle_lock)) {
+    return ResetResultDTO{
+        false, ErrorDTO{kErrorInvalidRequest,
+                        "Execution worker cannot retire from its own callback",
+                        {{"reason_code", "worker_retirement_self_thread"}}}};
+  }
+  if (!control_command_epoch_matches(expected_epoch)) {
+    return ResetResultDTO{false, stale_control_command_error()};
+  }
+  auto backend_reset = execution_backend_.reset();
+  if (!backend_reset.accepted) {
+    return backend_reset;
+  }
+  if (sm_.status().state != ExecutionState::kIdle) {
+    auto reset_state = stop_policy_.request_reset();
+    if (!reset_state.ok()) {
+      return ResetResultDTO{false, reset_state.error()};
+    }
+  }
+  sm_.set_execution_id(0U);
+  clear_active_request_correlation();
+  auto snapshot = execution_backend_.get_execution_snapshot();
+  snapshot.timestamp_ns = clock_.now();
+  snapshot.execution_id = 0U;
+  snapshot.move_id.clear();
+  snapshot.state = ExecutionState::kIdle;
+  snapshot.progress = 0.0;
+  snapshot.error.reset();
+  publish_execution_snapshot(std::move(snapshot));
+  emit_event({KernelEventType::kStateTransition,
+              execution_id,
+              clock_.now(),
+              before.state,
+              ExecutionState::kIdle,
+              std::nullopt,
+              {{"reason", "reset_after_certified_containment"}}});
+  planning_reset_requested_.store(false, std::memory_order_release);
+  lifecycle_stop_requested_while_busy_.store(false, std::memory_order_seq_cst);
+  lifecycle_stop_requested_event_emitted_.store(false, std::memory_order_seq_cst);
+  lifecycle_reset_requested_while_busy_.store(false, std::memory_order_release);
+  operator_stop_worker_.clear_errors();
+  authorize_gripper_authority();
+  return ResetResultDTO{true, std::nullopt};
+}
+
 AcknowledgeCompletedResultDTO ExecutionKernel::acknowledge_completed(
     uint64_t execution_id, std::optional<std::uint64_t> expected_epoch) {
   EventDeferralScope event_scope(*this);
