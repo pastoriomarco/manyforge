@@ -8716,6 +8716,7 @@ Result<void> ResourceAddressedExecutionKernel::release_prepared_dispatch_barrier
     std::vector<CancellationTarget> cancellations;
     std::vector<ResourceSlotReservationOwnerDTO> undispatched_rows;
     OperationRevision current_revision(0U);
+    std::optional<OperationStateDTO> partial_state;
     {
       std::lock_guard state_lock(state_mutex_);
       auto* operation = find_active_operation_locked(operation_id);
@@ -8754,29 +8755,44 @@ Result<void> ResourceAddressedExecutionKernel::release_prepared_dispatch_barrier
       }
       operation->state.state = OperationStateKind::kDispatching;
       operation->state.updated_at_ns = clock_.now();
-      auto durable = journal_.RecordOperationState(config_.request_owner_epoch, operation->state,
-                                                   nullptr, "operation_partial_dispatch");
-      if (!durable.ok()) {
+      partial_state = operation->state;
+    }
+    std::sort(attempted_participants.begin(), attempted_participants.end());
+    const PartialDispatchStopScope partial_scope{operation_id, current_revision,
+                                                 attempted_participants};
+    StopIntentDTO containment{
+        PublicRequestContextDTO{RequestId("stop.partial-dispatch." + operation_id.value()),
+                                config_.request_owner_epoch, "kernel.partial_dispatch",
+                                std::nullopt},
+        std::vector<StopOperationTargetDTO>{
+            StopOperationTargetDTO{operation_id, current_revision, StopGeneration(0U)}},
+        std::string("operation_partial_dispatch")};
+    auto stopped =
+        accept_stop(EmergencyStopProjectedIntentDTO{std::move(containment)}, &partial_scope);
+    if (!stopped.ok()) {
+      std::lock_guard state_lock(state_mutex_);
+      motion_admission_closed_ = true;
+    }
+
+    std::sort(undispatched_rows.begin(), undispatched_rows.end(),
+              [](const auto& left, const auto& right) {
+                return std::tie(left.owner.operation_id, left.owner.participant_id) <
+                       std::tie(right.owner.operation_id, right.owner.participant_id);
+              });
+    if (!undispatched_rows.empty()) {
+      auto terminalized =
+          resource_slots_->transition_batch(undispatched_rows, ResourceSlotState::kTerminal);
+      auto released = terminalized.ok() ? resource_slots_->release_batch(undispatched_rows)
+                                        : Result<void>::Err(terminalized.error());
+      std::lock_guard state_lock(state_mutex_);
+      if (!released.ok()) {
         motion_admission_closed_ = true;
-      }
-      std::sort(undispatched_rows.begin(), undispatched_rows.end(),
-                [](const auto& left, const auto& right) {
-                  return std::tie(left.owner.operation_id, left.owner.participant_id) <
-                         std::tie(right.owner.operation_id, right.owner.participant_id);
-                });
-      if (!undispatched_rows.empty()) {
-        auto terminalized =
-            resource_slots_->transition_batch(undispatched_rows, ResourceSlotState::kTerminal);
-        auto released = terminalized.ok() ? resource_slots_->release_batch(undispatched_rows)
-                                          : Result<void>::Err(terminalized.error());
-        if (!released.ok()) {
-          motion_admission_closed_ = true;
-        } else {
-          for (auto& candidate : operation->participants) {
-            if (std::find(attempted_participants.begin(), attempted_participants.end(),
-                          candidate.slot_owner.participant_id) == attempted_participants.end()) {
-              candidate.slot_state = ResourceSlotState::kTerminal;
-            }
+      } else if (auto* operation = find_active_operation_locked(operation_id);
+                 operation != nullptr) {
+        for (auto& candidate : operation->participants) {
+          if (std::find(attempted_participants.begin(), attempted_participants.end(),
+                        candidate.slot_owner.participant_id) == attempted_participants.end()) {
+            candidate.slot_state = ResourceSlotState::kTerminal;
           }
         }
       }
@@ -8794,19 +8810,21 @@ Result<void> ResourceAddressedExecutionKernel::release_prepared_dispatch_barrier
         motion_admission_closed_ = true;
       }
     }
-    std::sort(attempted_participants.begin(), attempted_participants.end());
-    const PartialDispatchStopScope partial_scope{operation_id, current_revision,
-                                                 attempted_participants};
-    StopIntentDTO containment{
-        PublicRequestContextDTO{RequestId("stop.partial-dispatch." + operation_id.value()),
-                                config_.request_owner_epoch, "kernel.partial_dispatch",
-                                std::nullopt},
-        std::vector<StopOperationTargetDTO>{
-            StopOperationTargetDTO{operation_id, current_revision, StopGeneration(0U)}},
-        std::string("operation_partial_dispatch")};
-    auto stopped =
-        accept_stop(EmergencyStopProjectedIntentDTO{std::move(containment)}, &partial_scope);
-    if (!stopped.ok()) {
+    {
+      std::lock_guard state_lock(state_mutex_);
+      if (const auto* operation = find_active_operation_locked(operation_id);
+          operation != nullptr) {
+        partial_state = operation->state;
+      }
+    }
+    if (!partial_state.has_value()) {
+      std::lock_guard state_lock(state_mutex_);
+      motion_admission_closed_ = true;
+      return Result<void>::Ok();
+    }
+    auto durable = journal_.RecordOperationState(config_.request_owner_epoch, *partial_state,
+                                                 nullptr, "operation_partial_dispatch");
+    if (!durable.ok()) {
       std::lock_guard state_lock(state_mutex_);
       motion_admission_closed_ = true;
     }
