@@ -37,6 +37,16 @@ namespace {
           bounded_utf8(*attribution.principal_id, kMaximumStopRequestLabelBytes));
 }
 
+[[nodiscard]] bool portable_token(std::string_view value, std::size_t maximum) noexcept {
+  return !value.empty() && value.size() <= maximum &&
+         std::all_of(value.begin(), value.end(), [](const char character) {
+           return (character >= 'A' && character <= 'Z') ||
+                  (character >= 'a' && character <= 'z') ||
+                  (character >= '0' && character <= '9') || character == '_' || character == '.' ||
+                  character == ':' || character == '-';
+         });
+}
+
 template <typename StrongId>
 [[nodiscard]] bool bounded_identity(const StrongId& identity) noexcept {
   return !identity.empty() && identity.value().size() <= kMaximumStopIdentityBytes &&
@@ -118,6 +128,26 @@ std::optional<std::string_view> full_stop_intent_field_error(
   }
   if (!attribution_valid(intent.attribution)) {
     return "full_stop_request_attribution_invalid";
+  }
+  return std::nullopt;
+}
+
+std::optional<std::string_view> malformed_stop_ingress_field_error(
+    const MalformedStopIngressDTO& ingress) noexcept {
+  if (!portable_token(ingress.request_id.value(), kMaximumStopIdentityBytes) ||
+      !portable_token(ingress.receiver_owner_epoch.value(), kMaximumStopIdentityBytes)) {
+    return "malformed_stop_ingress_identity_invalid";
+  }
+  if (!attribution_valid(ingress.attribution)) {
+    return "malformed_stop_ingress_attribution_invalid";
+  }
+  if (!bounded_utf8(ingress.recognized_route, kMaximumStopRequestLabelBytes)) {
+    return "malformed_stop_ingress_route_invalid";
+  }
+  if (!bounded_utf8(ingress.reason, kMaximumStopMalformedReasonBytes) ||
+      (ingress.reason != "recognized_stop_payload_invalid" &&
+       ingress.reason != "recognized_stop_body_oversized")) {
+    return "malformed_stop_ingress_reason_invalid";
   }
   return std::nullopt;
 }

@@ -17,8 +17,8 @@ inline constexpr char kDigestB[] =
     "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
 
 [[nodiscard]] ResolvedStopBasePlanDTO BasePlan() {
-  const auto path = std::filesystem::path(__FILE__).parent_path() / "golden" /
-                    "resolved_stop_base_plan.v1.json";
+  const auto path =
+      std::filesystem::path(__FILE__).parent_path() / "golden" / "resolved_stop_base_plan.v1.json";
   std::ifstream stream(path, std::ios::binary);
   std::ostringstream bytes;
   bytes << stream.rdbuf();
@@ -97,49 +97,54 @@ inline constexpr char kDigestB[] =
           OperationId("operation.1"), OperationRevision(4U),
           OperationParticipantId("participant.1"), binding.value().program_id,
           binding.value().program_revision, binding.value().program_binding_id,
-          ProgramRunId("program-run.1"), std::nullopt,
-          ParticipantStopProfilePurposeDTO::kOrdinary, std::nullopt,
-          MotionInterruptNodeCategory::kGeneric},
+          ProgramRunId("program-run.1"), std::nullopt, ParticipantStopProfilePurposeDTO::kOrdinary,
+          std::nullopt, MotionInterruptNodeCategory::kGeneric},
       binding.value().resources, {});
   EXPECT_TRUE(plan.ok());
   const auto& selected = plan.value().stage_commands.front().resolved_stage;
   const auto provider_runtime_epoch = selected.command_target.provider_runtime_epoch;
   const auto evidence_requirements = selected.evidence_requirements;
-  ResolvedParticipantStopStageDTO stage{
-      StopId("stop.1"),
-      StopGeneration(7U),
-      plan.value().operation_id,
-      plan.value().operation_revision,
-      plan.value().participant_id,
-      ControllerGoalId("goal.1"),
-      ControllerGoalGeneration(3U),
-      binding.value().controllable_component_id,
-      binding.value().command_target_id,
-      binding.value().capability_id,
-      base.control_domain_id,
-      base.control_domain_revision,
-      base.control_binding_id,
-      base.control_binding_revision,
-      base.active_control_configuration_id,
-      base.active_control_configuration_generation,
-      base.controller_topology_id,
-      base.topology_revision,
-      base.control_route_id,
-      std::nullopt,
-      std::nullopt,
-      provider_runtime_epoch,
-      {ResourceId("joint.1"), ResourceId("joint.2")},
-      selected.containment_granularity,
-      base.stop_evidence_policy_id,
-      base.stop_evidence_policy_revision,
-      std::move(plan.value()),
-      0U,
-      ContentDigest(kDigestA)};
-  ParticipantStopStageResultDTO result{
-      std::move(stage), StopStageAttemptDispositionDTO::kDispatched,
-      ParticipantStopStageOutcomeDTO::kSucceeded, MotionControlledStopMode::kSoftOnPath,
-      std::nullopt, std::nullopt, 3U, provider_runtime_epoch, 9U,
-      10'000'000, {}, std::nullopt};
+  ResolvedParticipantStopStageDTO stage{StopId("stop.1"),
+                                        StopGeneration(7U),
+                                        plan.value().operation_id,
+                                        plan.value().operation_revision,
+                                        plan.value().participant_id,
+                                        ControllerGoalId("goal.1"),
+                                        ControllerGoalGeneration(3U),
+                                        binding.value().controllable_component_id,
+                                        binding.value().command_target_id,
+                                        binding.value().capability_id,
+                                        base.control_domain_id,
+                                        base.control_domain_revision,
+                                        base.control_binding_id,
+                                        base.control_binding_revision,
+                                        base.active_control_configuration_id,
+                                        base.active_control_configuration_generation,
+                                        base.controller_topology_id,
+                                        base.topology_revision,
+                                        base.control_route_id,
+                                        std::nullopt,
+                                        std::nullopt,
+                                        provider_runtime_epoch,
+                                        {ResourceId("joint.1"), ResourceId("joint.2")},
+                                        selected.containment_granularity,
+                                        base.stop_evidence_policy_id,
+                                        base.stop_evidence_policy_revision,
+                                        std::move(plan.value()),
+                                        0U,
+                                        ContentDigest(kDigestA)};
+  ParticipantStopStageResultDTO result{std::move(stage),
+                                       StopStageAttemptDispositionDTO::kDispatched,
+                                       ParticipantStopStageOutcomeDTO::kSucceeded,
+                                       MotionControlledStopMode::kSoftOnPath,
+                                       std::nullopt,
+                                       std::nullopt,
+                                       3U,
+                                       provider_runtime_epoch,
+                                       9U,
+                                       10'000'000,
+                                       {},
+                                       std::nullopt};
   for (const auto& requirement : evidence_requirements) {
     result.evidence_items.push_back(StopEvidenceItemDTO{
         requirement.requirement.evidence_item_id, requirement.requirement.evidence_kind,
@@ -200,8 +205,7 @@ inline constexpr char kDigestB[] =
           stage.resources}},
       {},
       {scope},
-      {StopAttemptedStageResultDTO{key, 1U, 20,
-                                   StopStageResultAuthorityDTO::kAuthoritative,
+      {StopAttemptedStageResultDTO{key, 1U, 20, StopStageResultAuthorityDTO::kAuthoritative,
                                    std::move(stage_result)}},
       std::nullopt,
       std::nullopt,
@@ -233,28 +237,26 @@ inline constexpr char kDigestB[] =
   const auto accepted_error = stop_accepted_field_error(accepted);
   EXPECT_FALSE(accepted_error.has_value())
       << (accepted_error.has_value() ? std::string(*accepted_error) : std::string{});
-  const StopCertificateRefDTO reference{certificate.value().stop_certificate_id,
-                                        certificate.value().stop_certificate_revision,
-                                        certificate.value().stop_id,
-                                        certificate.value().stop_generation};
-  StopStatusDTO status{
-      accepted,
-      StopStatusStateDTO::kSucceeded,
-      certificate.value().scope_entries,
-      {},
-      certificate.value().attempted_stage_results,
-      certificate.value().evidence_items,
-      certificate.value().unsettled,
-      certificate.value().failed,
-      StopDurableProjectionStatusDTO{StopDurableProjectionStateDTO::kRecorded, std::nullopt,
-                                     std::nullopt},
-      StopDurableProjectionStatusDTO{StopDurableProjectionStateDTO::kPending, std::nullopt,
-                                     std::nullopt},
-      StopDurableProjectionStatusDTO{StopDurableProjectionStateDTO::kNotApplicable, std::nullopt,
-                                     std::nullopt},
-      reference,
-      std::nullopt,
-      std::nullopt};
+  const StopCertificateRefDTO reference{
+      certificate.value().stop_certificate_id, certificate.value().stop_certificate_revision,
+      certificate.value().stop_id, certificate.value().stop_generation};
+  StopStatusDTO status{accepted,
+                       StopStatusStateDTO::kSucceeded,
+                       certificate.value().scope_entries,
+                       {},
+                       certificate.value().attempted_stage_results,
+                       certificate.value().evidence_items,
+                       certificate.value().unsettled,
+                       certificate.value().failed,
+                       StopDurableProjectionStatusDTO{StopDurableProjectionStateDTO::kRecorded,
+                                                      std::nullopt, std::nullopt},
+                       StopDurableProjectionStatusDTO{StopDurableProjectionStateDTO::kPending,
+                                                      std::nullopt, std::nullopt},
+                       StopDurableProjectionStatusDTO{StopDurableProjectionStateDTO::kNotApplicable,
+                                                      std::nullopt, std::nullopt},
+                       reference,
+                       std::nullopt,
+                       std::nullopt};
   const auto terminal_error =
       stop_terminal_projection_field_error(status, certificate.value(), std::nullopt);
   EXPECT_FALSE(terminal_error.has_value())
@@ -263,13 +265,72 @@ inline constexpr char kDigestB[] =
                                           std::nullopt};
 }
 
+[[nodiscard]] StopJournalFaultClearProjectionDTO FaultClearProjection() {
+  auto terminal = TerminalProjection();
+  const StopCertificateRefDTO certificate_ref{
+      terminal.certificate.stop_certificate_id, terminal.certificate.stop_certificate_revision,
+      terminal.certificate.stop_id, terminal.certificate.stop_generation};
+  StopFaultLatchDTO cleared_latch{
+      CellId("cell.1"),
+      terminal.certificate.stop_id,
+      terminal.certificate.stop_generation,
+      certificate_ref,
+      StopFaultLatchId("stop-fault-latch.1"),
+      StopFaultLatchGeneration(1U),
+      StopFaultTriggerDTO::kScopePromotion,
+      false,
+      {OperationId("operation.1")},
+      {ResourceId("joint.1"), ResourceId("joint.2")},
+      RetainedBundleId("retained-bundle.1"),
+      GraphRevision(kDigestA),
+      StopDurableProjectionStatusDTO{StopDurableProjectionStateDTO::kRecorded, std::nullopt,
+                                     std::nullopt},
+      StopDurableProjectionStatusDTO{StopDurableProjectionStateDTO::kRecorded, std::nullopt,
+                                     std::nullopt},
+      StopFaultLatchStateDTO::kCleared,
+      3U,
+      StopFaultRecoveryStatusDTO::kCleared,
+      "stop_fault_recovery_cleared",
+      {StopFaultRecoveryEvidenceRefDTO{StopFaultRecoveryEvidenceKindDTO::kSettlement,
+                                       ContentDigest(kDigestB)}}};
+  terminal.stop_status.terminal_projection = StopDurableProjectionStatusDTO{
+      StopDurableProjectionStateDTO::kRecorded, std::nullopt, std::nullopt};
+  terminal.stop_status.fault_latch = cleared_latch;
+  const StopFaultRecoveryIntentDTO intent{
+      PublicRequestContextDTO{RequestId("recovery.1"), RequestOwnerEpoch("owner.1"), "test",
+                              std::nullopt},
+      cleared_latch.latch_id,
+      cleared_latch.latch_generation,
+      2U,
+      terminal.certificate.stop_certificate_id,
+      terminal.certificate.stop_certificate_revision,
+      cleared_latch.cell_id,
+      cleared_latch.retained_bundle_id,
+      cleared_latch.graph_revision,
+      {StopFaultRecoveryConfigurationExpectationDTO{ControlDomainId("domain.1"),
+                                                    ActiveControlConfigurationId("configuration.1"),
+                                                    ActiveControlConfigurationGeneration(1U)}},
+      std::string("operator verified cell")};
+  const StopFaultRecoveryResultDTO result{intent.request_context.request_id,
+                                          RequestReplayStatusDTO::kAcceptedNew, true, cleared_latch,
+                                          std::nullopt};
+  return StopJournalFaultClearProjectionDTO{intent, result, terminal.stop_status,
+                                            terminal.certificate};
+}
+
 TEST(StopJournalProjectionCodecTest, RoundTripsAcceptanceAndAffectedStateCanonically) {
   auto terminal = TerminalProjection();
-  OperationStateDTO operation{OperationId("operation.1"), OperationRevision(5U),
-                              ProgramBindingId(kDigestB), ProgramRunId("program-run.1"),
+  OperationStateDTO operation{OperationId("operation.1"),
+                              OperationRevision(5U),
+                              ProgramBindingId(kDigestB),
+                              ProgramRunId("program-run.1"),
                               OperationCoordinationPolicy::kIndependent,
-                              OperationStateKind::kStopped, {}, 30, terminal.certificate.stop_id,
-                              terminal.certificate.stop_generation, std::nullopt};
+                              OperationStateKind::kStopped,
+                              {},
+                              30,
+                              terminal.certificate.stop_id,
+                              terminal.certificate.stop_generation,
+                              std::nullopt};
   StopJournalAcceptanceProjectionDTO projection{
       terminal.stop_status.accepted,
       EmergencyStopAffectedStateSnapshotDTO{{std::move(operation)},
@@ -310,6 +371,20 @@ TEST(StopJournalProjectionCodecTest, RejectsUnknownVersionAndNoncanonicalBytes) 
   wrong_version.replace(position, kStopJournalTerminalProjectionApiVersion.size(),
                         "manyforge.internal.stop-journal-terminal-projection.v0");
   EXPECT_FALSE(DecodeStopJournalTerminalProjection(wrong_version).ok());
+}
+
+TEST(StopJournalProjectionCodecTest, RoundTripsExactFaultClearAuthorityCanonically) {
+  const auto projection = FaultClearProjection();
+  const auto encoded = EncodeStopJournalFaultClearProjection(projection);
+  ASSERT_TRUE(encoded.ok()) << encoded.error().message;
+  const auto decoded = DecodeStopJournalFaultClearProjection(encoded.value());
+  ASSERT_TRUE(decoded.ok()) << decoded.error().message;
+  EXPECT_EQ(decoded.value(), projection);
+  EXPECT_FALSE(DecodeStopJournalFaultClearProjection(encoded.value() + "\n").ok());
+
+  auto conflict = projection;
+  conflict.recovery_result.request_id = RequestId("recovery.conflict");
+  EXPECT_FALSE(EncodeStopJournalFaultClearProjection(conflict).ok());
 }
 
 }  // namespace

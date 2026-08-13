@@ -9,7 +9,11 @@ import uuid
 from pathlib import Path
 
 from fastapi import FastAPI, HTTPException, Request, Response, WebSocket
-from fastapi.exception_handlers import http_exception_handler
+from fastapi.exception_handlers import (
+    http_exception_handler,
+    request_validation_exception_handler,
+)
+from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
@@ -54,44 +58,85 @@ class ComposerRequestBodyLimitMiddleware:
         *,
         maximum_bytes: int,
         path_prefix: str,
+        recognized_stop: bool = False,
     ) -> None:
         self.app = app
         self.maximum_bytes = maximum_bytes
         self.path_prefix = path_prefix
+        self.recognized_stop = recognized_stop
 
     async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
-        if scope["type"] != "http" or not scope.get("path", "").startswith(
-            self.path_prefix
-        ):
+        path = str(scope.get("path", ""))
+        path_matches = (
+            path == self.path_prefix
+            if self.recognized_stop
+            else path.startswith(self.path_prefix)
+        )
+        if scope["type"] != "http" or not path_matches:
             await self.app(scope, receive, send)
             return
+
+        def mark_malformed(*, close_connection: bool) -> None:
+            state = scope.setdefault("state", {})
+            state["recognized_stop_malformed"] = True
+            if close_connection:
+                state["recognized_stop_close_connection"] = True
+
         headers = dict(scope.get("headers", ()))
         raw_length = headers.get(b"content-length")
+        declared_oversized = False
         if raw_length is not None:
             try:
                 declared = int(raw_length)
             except ValueError:
                 await self._reject(scope, receive, send)
                 return
-            if declared < 0 or declared > self.maximum_bytes:
+            if declared < 0:
                 await self._reject(scope, receive, send)
                 return
+            if declared > self.maximum_bytes:
+                if not self.recognized_stop:
+                    await self._reject(scope, receive, send)
+                    return
+                mark_malformed(close_connection=True)
+                declared_oversized = True
 
         body = bytearray()
         disconnected = False
-        while True:
-            message = await receive()
-            if message["type"] == "http.disconnect":
-                disconnected = True
-                break
-            if message["type"] != "http.request":
-                continue
-            body.extend(message.get("body", b""))
-            if len(body) > self.maximum_bytes:
-                await self._reject(scope, receive, send)
-                return
-            if not message.get("more_body", False):
-                break
+        if declared_oversized:
+            body.extend(b"{}")
+        else:
+            while True:
+                message = await receive()
+                if message["type"] == "http.disconnect":
+                    disconnected = True
+                    break
+                if message["type"] != "http.request":
+                    continue
+                body.extend(message.get("body", b""))
+                if len(body) > self.maximum_bytes:
+                    if not self.recognized_stop:
+                        await self._reject(scope, receive, send)
+                        return
+                    mark_malformed(close_connection=True)
+                    body.clear()
+                    body.extend(b"{}")
+                    break
+                if not message.get("more_body", False):
+                    break
+
+        if self.recognized_stop and not declared_oversized and not disconnected:
+            try:
+                from manyforge_headless_api.native import strict_json_object
+
+                strict_json_object(
+                    bytes(body).decode("utf-8"),
+                    label="Composer recognized Stop request",
+                )
+            except (RuntimeError, UnicodeError):
+                mark_malformed(close_connection=False)
+                body.clear()
+                body.extend(b"{}")
 
         delivered = False
 
@@ -171,6 +216,17 @@ def create_app(
         allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
         allow_headers=["Content-Type", "X-Request-ID"],
     )
+    if state.headless_client is not None:
+        for recognized_stop_path in (
+            "/api/execution/stops",
+            "/api/execution/full-stop",
+        ):
+            app.add_middleware(
+                ComposerRequestBodyLimitMiddleware,
+                maximum_bytes=_MAXIMUM_REQUEST_BODY_BYTES,
+                path_prefix=recognized_stop_path,
+                recognized_stop=True,
+            )
 
     # Request correlation and bounded access logging are shell infrastructure,
     # not runtime ownership. Keep HTTPException rendering inside this
@@ -371,6 +427,39 @@ def create_app(
             create_headless_router(state.headless_client, state),
             tags=["headless-runtime-client"],
         )
+
+        @app.exception_handler(RequestValidationError)
+        async def recognized_stop_validation_handler(
+            request: Request,
+            error: RequestValidationError,
+        ) -> Response:
+            if request.method == "POST" and request.url.path in {
+                "/api/execution/stops",
+                "/api/execution/full-stop",
+            }:
+                from manyforge_headless_api.client import HeadlessClientError
+
+                try:
+                    payload = state.headless_client.recognized_malformed_stop(
+                        request.url.path
+                    )
+                    response: Response = JSONResponse(content=payload)
+                except HeadlessClientError as client_error:
+                    response = JSONResponse(
+                        status_code=client_error.status_code or 503,
+                        content={
+                            "detail": {
+                                "code": client_error.code,
+                                "message": str(client_error),
+                            }
+                        },
+                    )
+                if getattr(
+                    request.state, "recognized_stop_close_connection", False
+                ):
+                    response.headers["Connection"] = "close"
+                return response
+            return await request_validation_exception_handler(request, error)
 
         @app.websocket("/ws/state")
         async def headless_state_websocket(websocket: WebSocket) -> None:

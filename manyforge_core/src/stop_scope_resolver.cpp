@@ -866,6 +866,23 @@ Result<ContentDigest> ComputeRequestedStopSelectorDigest(const FullStopIntentDTO
   }
 }
 
+Result<ContentDigest> ComputeRequestedStopSelectorDigest(const MalformedStopIngressDTO& ingress) {
+  if (malformed_stop_ingress_field_error(ingress).has_value()) {
+    return Result<ContentDigest>::Err(
+        digest_input_error("requested_malformed_stop_selector_invalid", "ingress"));
+  }
+  try {
+    const CanonicalValue payload(
+        CanonicalValue::Object{{"recognized_route", CanonicalValue(ingress.recognized_route)},
+                               {"selector_kind", CanonicalValue("malformed_ingress")}});
+    return Result<ContentDigest>::Ok(ContentDigest(content_identity::framed_sha256(
+        kRequestedSelectorIdentityDomain, kRequestedSelectorApiVersion, payload)));
+  } catch (const std::exception&) {
+    return Result<ContentDigest>::Err(
+        digest_input_error("requested_malformed_stop_selector_not_canonical", "ingress"));
+  }
+}
+
 Result<ContentDigest> ComputeNormalizedStopIntentDigest(const StopIntentDTO& intent) {
   const auto field = stop_intent_field_error(intent);
   if ((field.has_value() && *field != "stop_reason_invalid") ||

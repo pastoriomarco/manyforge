@@ -12,7 +12,12 @@ from manyforge_headless_api.execution import (
     ExecutionCommandClient,
     ExecutionEventPump,
 )
-from manyforge_headless_api.models import OperationIntentRequest
+from manyforge_headless_api.models import (
+    FullStopIntentRequest,
+    OperationIntentRequest,
+    StopFaultRecoveryIntentRequest,
+    StopIntentRequest,
+)
 from manyforge_headless_api.native import HeadlessApiError
 
 
@@ -148,6 +153,176 @@ def test_execution_client_accepts_only_paired_null_stop_projection_identity(
     with pytest.raises(HeadlessApiError) as unattributed:
         client.events(owner_epoch, 0)
     assert unattributed.value.code == "execution_command_response_invalid"
+
+
+def test_execution_client_projects_scoped_full_and_fault_recovery_commands(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    client = ExecutionCommandClient(tmp_path)
+    context = {
+        "request_id": "request.stop.1",
+        "request_owner_epoch": "execution.epoch.1",
+        "source_label": "operator_ui",
+        "correlation_id": None,
+    }
+    stop = StopIntentRequest.model_validate(
+        {
+            "request_context": context,
+            "components": [
+                {
+                    "controllable_component_id": "robot.1",
+                    "expected_graph_revision": "sha256:" + "1" * 64,
+                    "expected_component_lifecycle_generation": 2,
+                }
+            ],
+            "reason": None,
+        }
+    )
+    full = FullStopIntentRequest.model_validate(
+        {"request_context": context, "expected_stop_generation": 0}
+    )
+    control_commands: list[dict[str, Any]] = []
+
+    def control_exchange(command: dict[str, Any]) -> dict[str, Any]:
+        control_commands.append(command)
+        malformed = command["command"] == "malformed_stop"
+        return {
+            "api_version": "manyforge.execution_command_response.v1",
+            "accepted": {
+                "request_id": (
+                    command["request_id"] if malformed else context["request_id"]
+                ),
+                "resolution_disposition": (
+                    "promoted_to_full" if malformed else "exact"
+                ),
+                "resolution_reason": (
+                    "explicit_full_stop"
+                    if command["command"] == "full_stop"
+                    else (
+                        "malformed_ordinary_intent"
+                        if malformed
+                        else "exact_current_scope"
+                    )
+                ),
+            },
+            "command": "stop" if malformed else command["command"],
+            "ok": True,
+        }
+
+    monkeypatch.setattr(client, "_exchange_control", control_exchange)
+    assert client.stop(stop, trusted_principal_id=None)["ok"] is True
+    assert client.full_stop(full, trusted_principal_id=None)["ok"] is True
+    assert client.recognized_malformed_stop(
+        request_id="malformed-stop.http.1",
+        recognized_route="/api/execution/stops",
+        reason="recognized_stop_payload_invalid",
+        trusted_principal_id=None,
+    )["ok"] is True
+    assert set(control_commands[0]["request"]) == {
+        "components",
+        "request_context",
+    }
+    assert control_commands[2]["command"] == "malformed_stop"
+
+    latch = {
+        "captured_operation_ids": ["operation.1"],
+        "captured_resources": ["joint.1"],
+        "cell_id": "cell.1",
+        "clear_projection": {
+            "error": None,
+            "retry_generation": None,
+            "state": "not_applicable",
+        },
+        "evidence_refs": [],
+        "graph_revision": "sha256:" + "2" * 64,
+        "latch_generation": 1,
+        "latch_id": "stop-fault.1",
+        "persistence_degraded": False,
+        "reason_code": "stop_fault_recovery_ready",
+        "recovery_assessment_revision": 2,
+        "recovery_status": "ready",
+        "retained_bundle_id": "sha256:" + "3" * 64,
+        "state": "latched",
+        "stop_certificate": {
+            "stop_certificate_id": "stop-certificate.1",
+            "stop_certificate_revision": 1,
+            "stop_generation": 1,
+            "stop_id": "stop.1",
+        },
+        "stop_generation": 1,
+        "stop_id": "stop.1",
+        "terminal_projection": {
+            "error": None,
+            "retry_generation": None,
+            "state": "recorded",
+        },
+        "trigger": "scope_promotion",
+    }
+    expectation = {
+        "active_control_configuration_generation": 4,
+        "active_control_configuration_id": "configuration.1",
+        "control_domain_id": "domain.1",
+    }
+    normal_commands: list[dict[str, Any]] = []
+
+    def exchange(command: dict[str, Any]) -> dict[str, Any]:
+        normal_commands.append(command)
+        if command["command"] == "get_stop_fault":
+            return {
+                "api_version": "manyforge.execution_command_response.v1",
+                "command": "get_stop_fault",
+                "ok": True,
+                "stop_fault": {
+                    "configuration_expectations": [expectation],
+                    "latch": latch,
+                },
+            }
+        return {
+            "api_version": "manyforge.execution_command_response.v1",
+            "command": "recover_stop_fault",
+            "ok": True,
+            "result": {
+                "accepted": True,
+                "error": None,
+                "latch": {**latch, "state": "cleared"},
+                "replay_status": "accepted_new",
+                "request_id": "request.recover.1",
+            },
+        }
+
+    monkeypatch.setattr(client, "_exchange", exchange)
+    offer = client.stop_fault()["stop_fault"]
+    recovery = StopFaultRecoveryIntentRequest.model_validate(
+        {
+            "request_context": {
+                **context,
+                "request_id": "request.recover.1",
+            },
+            "expected_latch_id": latch["latch_id"],
+            "expected_latch_generation": latch["latch_generation"],
+            "expected_recovery_assessment_revision": latch[
+                "recovery_assessment_revision"
+            ],
+            "expected_stop_certificate_id": latch["stop_certificate"][
+                "stop_certificate_id"
+            ],
+            "expected_stop_certificate_revision": latch[
+                "stop_certificate"
+            ]["stop_certificate_revision"],
+            "expected_cell_id": latch["cell_id"],
+            "expected_retained_bundle_id": latch["retained_bundle_id"],
+            "expected_graph_revision": latch["graph_revision"],
+            "configuration_expectations": offer[
+                "configuration_expectations"
+            ],
+            "reason": "operator confirmed non-moving clear",
+        }
+    )
+    assert client.recover_stop_fault(recovery)["result"]["accepted"] is True
+    assert [command["command"] for command in normal_commands] == [
+        "get_stop_fault",
+        "recover_stop_fault",
+    ]
 
 
 def _direct_motion_request() -> OperationIntentRequest:

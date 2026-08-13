@@ -515,12 +515,31 @@ def test_operation_mutations_are_strict_bounded_and_generation_fenced() -> None:
             "reason": None,
         }
     ).operations[0].expected_stop_generation == 0
+    multi_stop = StopIntentRequest.model_validate(
+        {
+            "request_context": context,
+            "operations": [
+                stop_target,
+                {**stop_target, "operation_id": "operation-2"},
+            ],
+            "reason": "r" * 1025,
+        }
+    )
+    assert len(multi_stop.operations or []) == 2
+    assert multi_stop.reason is None
     with pytest.raises(ValidationError):
         StopIntentRequest.model_validate(
             {
                 "request_context": context,
-                "operations": [stop_target, {**stop_target, "operation_id": "operation-2"}],
-                "reason": None,
+                "operations": [stop_target],
+                "resources": [
+                    {
+                        "resource_id": "resource-1",
+                        "expected_graph_revision": "graph.1",
+                        "expected_operation_resource_generation": 1,
+                        "expected_stop_generation": 0,
+                    }
+                ],
             }
         )
 

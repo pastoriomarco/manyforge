@@ -366,9 +366,12 @@ def headless_client() -> (
                 },
                 request=request,
             )
-        elif path == "/api/execution/stops" or path.startswith(
-            "/api/execution/operations/"
-        ):
+        elif path in {
+            "/api/execution/stops",
+            "/api/execution/full-stop",
+            "/api/execution/stop-fault",
+            "/api/execution/stop-fault/recover",
+        } or path.startswith("/api/execution/operations/"):
             payload = {
                 "api_version": "manyforge.execution_command_response.v1",
                 "ok": True,
@@ -666,6 +669,35 @@ def test_composer_operation_controls_are_strict_stateless_forwarders(
         "expected_runtime_scale_generation": 0,
         "scale": 0.5,
     }
+    full_stop = {
+        "request_context": {
+            **context,
+            "request_id": "request.full-stop.1",
+        },
+        "expected_stop_generation": 0,
+    }
+    recovery = {
+        "request_context": {
+            **context,
+            "request_id": "request.stop-recovery.1",
+        },
+        "expected_latch_id": "stop-fault.1",
+        "expected_latch_generation": 1,
+        "expected_recovery_assessment_revision": 1,
+        "expected_stop_certificate_id": "stop-certificate.1",
+        "expected_stop_certificate_revision": 1,
+        "expected_cell_id": "cell.1",
+        "expected_retained_bundle_id": "sha256:" + "1" * 64,
+        "expected_graph_revision": "sha256:" + "2" * 64,
+        "configuration_expectations": [
+            {
+                "control_domain_id": "domain.1",
+                "active_control_configuration_id": "configuration.1",
+                "active_control_configuration_generation": 1,
+            }
+        ],
+        "reason": None,
+    }
 
     with _composer(client) as composer:
         for endpoint in ("pause", "resume", "reset", "acknowledge-completed"):
@@ -675,6 +707,17 @@ def test_composer_operation_controls_are_strict_stateless_forwarders(
             )
             assert response.status_code == 200, response.text
         assert composer.post("/api/execution/stops", json=stop).status_code == 200
+        assert (
+            composer.post("/api/execution/full-stop", json=full_stop).status_code
+            == 200
+        )
+        assert composer.get("/api/execution/stop-fault").status_code == 200
+        assert (
+            composer.post(
+                "/api/execution/stop-fault/recover", json=recovery
+            ).status_code
+            == 200
+        )
         assert (
             composer.post(
                 "/api/execution/operations/operation-1/runtime-scale", json=scale
@@ -696,6 +739,8 @@ def test_composer_operation_controls_are_strict_stateless_forwarders(
         item
         for item in requests
         if item["path"] == "/api/execution/stops"
+        or item["path"] == "/api/execution/full-stop"
+        or item["path"].startswith("/api/execution/stop-fault")
         or item["path"].startswith("/api/execution/operations/")
     ]
     assert [item["path"].rsplit("/", 1)[-1] for item in forwarded] == [
@@ -704,13 +749,78 @@ def test_composer_operation_controls_are_strict_stateless_forwarders(
         "reset",
         "acknowledge-completed",
         "stops",
+        "full-stop",
+        "stop-fault",
+        "recover",
         "runtime-scale",
         "runtime-scale",
     ]
     assert forwarded[0]["body"] == control
     assert forwarded[4]["body"] == stop
-    assert forwarded[5]["body"] == scale
+    assert forwarded[5]["body"] == full_stop
     assert forwarded[6]["method"] == "GET"
+    assert forwarded[7]["body"] == recovery
+    assert forwarded[8]["body"] == scale
+    assert forwarded[9]["method"] == "GET"
+
+
+def test_composer_preserves_recognized_malformed_stop_semantics(
+    headless_client,
+) -> None:
+    client, requests, _node_environment = headless_client
+    mixed = {
+        "request_context": {
+            "request_id": "request.mixed-stop.1",
+            "request_owner_epoch": "execution.epoch.1",
+            "source_label": "composer_ui",
+            "correlation_id": None,
+        },
+        "operations": [
+            {
+                "operation_id": "operation-1",
+                "expected_operation_revision": 3,
+                "expected_stop_generation": 0,
+            }
+        ],
+        "resources": [
+            {
+                "resource_id": "joint.1",
+                "expected_graph_revision": "sha256:" + "1" * 64,
+                "expected_operation_resource_generation": 4,
+                "expected_stop_generation": 0,
+            }
+        ],
+    }
+
+    with _composer(client) as composer:
+        malformed = composer.post(
+            "/api/execution/stops",
+            content=b'{"request_context":',
+            headers={"content-type": "application/json"},
+        )
+        mixed_response = composer.post("/api/execution/stops", json=mixed)
+        oversized = composer.post(
+            "/api/execution/full-stop",
+            content=b"x" * (1024 * 1024 + 1),
+            headers={"content-type": "application/json"},
+        )
+
+    assert malformed.status_code == 200, malformed.text
+    assert mixed_response.status_code == 200, mixed_response.text
+    assert oversized.status_code == 200, oversized.text
+    assert oversized.headers["connection"] == "close"
+    forwarded = [
+        item
+        for item in requests
+        if item["path"]
+        in {"/api/execution/stops", "/api/execution/full-stop"}
+    ]
+    assert [item["path"] for item in forwarded] == [
+        "/api/execution/stops",
+        "/api/execution/stops",
+        "/api/execution/full-stop",
+    ]
+    assert all(item["body"] == {} for item in forwarded)
 
 
 def test_composer_preview_routes_are_strict_stateless_forwarders(

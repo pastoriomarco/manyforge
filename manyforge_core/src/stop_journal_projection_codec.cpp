@@ -1670,6 +1670,74 @@ template <typename T, typename Decode>
           "fault recovery evidence refs")};
 }
 
+[[nodiscard]] V public_request_context_value(const PublicRequestContextDTO& v) {
+  return arr({enc(v.request_id), enc(v.request_owner_epoch), V(v.source_label),
+              opt(v.correlation_id, [](const std::string& item) { return V(item); })});
+}
+
+[[nodiscard]] PublicRequestContextDTO public_request_context_from(const V& v) {
+  const auto& f = exact(v, 4U, "public request context");
+  return PublicRequestContextDTO{
+      did<RequestId>(f[0], "request ID"), did<RequestOwnerEpoch>(f[1], "request owner epoch"),
+      str(f[2], "request source label"),
+      dopt<std::string>(f[3], [](const V& item) { return str(item, "correlation ID"); })};
+}
+
+[[nodiscard]] V recovery_configuration_value(
+    const StopFaultRecoveryConfigurationExpectationDTO& v) {
+  return arr({enc(v.control_domain_id), enc(v.active_control_configuration_id),
+              enc(v.active_control_configuration_generation)});
+}
+
+[[nodiscard]] StopFaultRecoveryConfigurationExpectationDTO recovery_configuration_from(const V& v) {
+  const auto& f = exact(v, 3U, "fault recovery configuration expectation");
+  return StopFaultRecoveryConfigurationExpectationDTO{
+      did<ControlDomainId>(f[0], "control domain ID"),
+      did<ActiveControlConfigurationId>(f[1], "active configuration ID"),
+      did<ActiveControlConfigurationGeneration>(f[2], "active configuration generation")};
+}
+
+[[nodiscard]] V recovery_intent_value(const StopFaultRecoveryIntentDTO& v) {
+  return arr({public_request_context_value(v.request_context), enc(v.expected_latch_id),
+              enc(v.expected_latch_generation),
+              V(static_cast<double>(v.expected_recovery_assessment_revision)),
+              enc(v.expected_stop_certificate_id), enc(v.expected_stop_certificate_revision),
+              enc(v.expected_cell_id), enc(v.expected_retained_bundle_id),
+              enc(v.expected_graph_revision),
+              vec(v.configuration_expectations, recovery_configuration_value),
+              opt(v.reason, [](const std::string& item) { return V(item); })});
+}
+
+[[nodiscard]] StopFaultRecoveryIntentDTO recovery_intent_from(const V& v) {
+  const auto& f = exact(v, 11U, "fault recovery intent");
+  return StopFaultRecoveryIntentDTO{
+      public_request_context_from(f[0]),
+      did<StopFaultLatchId>(f[1], "expected latch ID"),
+      did<StopFaultLatchGeneration>(f[2], "expected latch generation"),
+      u64(f[3], "expected recovery assessment revision"),
+      did<StopCertificateId>(f[4], "expected certificate ID"),
+      did<StopCertificateRevision>(f[5], "expected certificate revision"),
+      did<CellId>(f[6], "expected cell ID"),
+      did<RetainedBundleId>(f[7], "expected retained bundle ID"),
+      did<GraphRevision>(f[8], "expected graph revision"),
+      dvec<StopFaultRecoveryConfigurationExpectationDTO>(
+          f[9], recovery_configuration_from, "fault recovery configuration expectations"),
+      dopt<std::string>(f[10], [](const V& item) { return str(item, "recovery reason"); })};
+}
+
+[[nodiscard]] V recovery_result_value(const StopFaultRecoveryResultDTO& v) {
+  return arr({enc(v.request_id), enc(v.replay_status), V(v.accepted), fault_latch_value(v.latch),
+              opt(v.error, error_value)});
+}
+
+[[nodiscard]] StopFaultRecoveryResultDTO recovery_result_from(const V& v) {
+  const auto& f = exact(v, 5U, "fault recovery result");
+  return StopFaultRecoveryResultDTO{did<RequestId>(f[0], "recovery result request ID"),
+                                    den<RequestReplayStatusDTO>(f[1], 5U, "recovery replay status"),
+                                    boolean(f[2], "recovery accepted"), fault_latch_from(f[3]),
+                                    dopt<ErrorDTO>(f[4], error_from)};
+}
+
 [[nodiscard]] V surveillance_source_value(const StopSurveillanceSourceStatusDTO& v) {
   return arr(
       {scope_key_value(v.scope_key), enc(v.evidence_item_id),
@@ -1820,6 +1888,23 @@ template <typename T, typename Decode>
                                               fault_latch_from(fields[2])};
 }
 
+[[nodiscard]] V fault_clear_root(const StopJournalFaultClearProjectionDTO& value) {
+  return arr({V(std::string(kStopJournalFaultClearProjectionApiVersion)),
+              recovery_intent_value(value.recovery_intent),
+              recovery_result_value(value.recovery_result),
+              status_value(value.resulting_stop_status), certificate_value(value.certificate)});
+}
+
+[[nodiscard]] StopJournalFaultClearProjectionDTO fault_clear_root_from(const V& value) {
+  const auto& fields = exact(value, 5U, "Stop journal fault-clear projection");
+  if (str(fields[0], "fault-clear API version") != kStopJournalFaultClearProjectionApiVersion) {
+    bad("Stop journal fault-clear projection API version is unsupported");
+  }
+  return StopJournalFaultClearProjectionDTO{recovery_intent_from(fields[1]),
+                                            recovery_result_from(fields[2]), status_from(fields[3]),
+                                            certificate_from(fields[4])};
+}
+
 template <typename T, typename Root>
 [[nodiscard]] Result<std::string> encode_projection(const T& value, Root root) {
   try {
@@ -1927,6 +2012,37 @@ Result<StopJournalSurveillanceProjectionDTO> DecodeStopJournalSurveillanceProjec
   const auto encoded = EncodeStopJournalSurveillanceProjection(decoded.value());
   if (!encoded.ok() || encoded.value() != canonical_bytes) {
     return reject<StopJournalSurveillanceProjectionDTO>("surveillance projection is not canonical");
+  }
+  return decoded;
+}
+
+Result<std::string> EncodeStopJournalFaultClearProjection(
+    const StopJournalFaultClearProjectionDTO& projection) {
+  const auto& intent = projection.recovery_intent;
+  const auto& result = projection.recovery_result;
+  const std::optional<StopFaultLatchDTO> latch(result.latch);
+  if (stop_fault_recovery_intent_field_error(intent).has_value() ||
+      result.request_id != intent.request_context.request_id ||
+      result.replay_status != RequestReplayStatusDTO::kAcceptedNew || !result.accepted ||
+      result.error.has_value() || result.latch.state != StopFaultLatchStateDTO::kCleared ||
+      !projection.resulting_stop_status.fault_latch.has_value() ||
+      *projection.resulting_stop_status.fault_latch != result.latch ||
+      stop_terminal_projection_field_error(projection.resulting_stop_status, projection.certificate,
+                                           latch)
+          .has_value()) {
+    return reject<std::string>("fault-clear projection is invalid");
+  }
+  return encode_projection(projection, fault_clear_root);
+}
+
+Result<StopJournalFaultClearProjectionDTO> DecodeStopJournalFaultClearProjection(
+    const std::string_view canonical_bytes) {
+  auto decoded =
+      decode_projection<StopJournalFaultClearProjectionDTO>(canonical_bytes, fault_clear_root_from);
+  if (!decoded.ok()) return decoded;
+  const auto encoded = EncodeStopJournalFaultClearProjection(decoded.value());
+  if (!encoded.ok() || encoded.value() != canonical_bytes) {
+    return reject<StopJournalFaultClearProjectionDTO>("fault-clear projection is not canonical");
   }
   return decoded;
 }

@@ -12,6 +12,8 @@ inline constexpr std::string_view kStopJournalTerminalProjectionApiVersion =
     "manyforge.internal.stop-journal-terminal-projection.v1";
 inline constexpr std::string_view kStopJournalSurveillanceProjectionApiVersion =
     "manyforge.internal.stop-journal-surveillance-projection.v1";
+inline constexpr std::string_view kStopJournalFaultClearProjectionApiVersion =
+    "manyforge.internal.stop-journal-fault-clear-projection.v1";
 
 /// Closed structural payload retained beside a Stop-acceptance journal row.
 /// It is deliberately independent of live repositories and process memory so
@@ -47,6 +49,20 @@ struct StopJournalSurveillanceProjectionDTO final {
                          const StopJournalSurveillanceProjectionDTO&) = default;
 };
 
+/// Self-contained durable fault-clear record. The journal stores the exact
+/// revision-fenced public intent and owner-issued result beside the resulting
+/// terminal truth; restart adoption never reconstructs a clear from a request
+/// ID or from the latest in-memory assessment.
+struct StopJournalFaultClearProjectionDTO final {
+  StopFaultRecoveryIntentDTO recovery_intent;
+  StopFaultRecoveryResultDTO recovery_result;
+  StopStatusDTO resulting_stop_status;
+  StopCertificateDTO certificate;
+
+  friend bool operator==(const StopJournalFaultClearProjectionDTO&,
+                         const StopJournalFaultClearProjectionDTO&) = default;
+};
+
 [[nodiscard]] Result<std::string> EncodeStopJournalAcceptanceProjection(
     const StopJournalAcceptanceProjectionDTO& projection);
 [[nodiscard]] Result<StopJournalAcceptanceProjectionDTO> DecodeStopJournalAcceptanceProjection(
@@ -60,6 +76,11 @@ struct StopJournalSurveillanceProjectionDTO final {
 [[nodiscard]] Result<std::string> EncodeStopJournalSurveillanceProjection(
     const StopJournalSurveillanceProjectionDTO& projection);
 [[nodiscard]] Result<StopJournalSurveillanceProjectionDTO> DecodeStopJournalSurveillanceProjection(
+    std::string_view canonical_bytes);
+
+[[nodiscard]] Result<std::string> EncodeStopJournalFaultClearProjection(
+    const StopJournalFaultClearProjectionDTO& projection);
+[[nodiscard]] Result<StopJournalFaultClearProjectionDTO> DecodeStopJournalFaultClearProjection(
     std::string_view canonical_bytes);
 
 }  // namespace manyforge::core

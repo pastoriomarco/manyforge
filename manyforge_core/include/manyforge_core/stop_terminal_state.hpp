@@ -123,6 +123,17 @@ struct StopFaultRecoveryConfigurationExpectationDTO final {
                          const StopFaultRecoveryConfigurationExpectationDTO&) = default;
 };
 
+/// Atomic read-only projection needed to construct one exact recovery intent.
+/// The configuration table is derived from the same resident terminal status
+/// as the latch and is never supplied by a caller or assembled across reads.
+struct StopFaultRecoveryOfferDTO final {
+  StopFaultLatchDTO latch;
+  std::vector<StopFaultRecoveryConfigurationExpectationDTO> configuration_expectations;
+
+  friend bool operator==(const StopFaultRecoveryOfferDTO&,
+                         const StopFaultRecoveryOfferDTO&) = default;
+};
+
 struct StopFaultRecoveryIntentDTO final {
   PublicRequestContextDTO request_context;
   StopFaultLatchId expected_latch_id;
@@ -233,6 +244,8 @@ struct StopStatusDTO final {
     const StopForensicProjectionResultDTO& result) noexcept;
 [[nodiscard]] std::optional<std::string_view> stop_fault_latch_field_error(
     const StopFaultLatchDTO& latch) noexcept;
+[[nodiscard]] std::optional<std::string_view> stop_fault_recovery_offer_field_error(
+    const StopFaultRecoveryOfferDTO& offer) noexcept;
 [[nodiscard]] std::optional<std::string_view> stop_post_terminal_surveillance_field_error(
     const StopPostTerminalSurveillanceDTO& surveillance) noexcept;
 [[nodiscard]] std::optional<std::string_view> stop_status_field_error(

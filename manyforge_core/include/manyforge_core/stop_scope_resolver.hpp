@@ -113,6 +113,8 @@ struct StopAcceptedPredecessorInput final {
 [[nodiscard]] Result<ContentDigest> ComputeRequestedStopSelectorDigest(const StopIntentDTO& intent);
 [[nodiscard]] Result<ContentDigest> ComputeRequestedStopSelectorDigest(
     const FullStopIntentDTO& intent);
+[[nodiscard]] Result<ContentDigest> ComputeRequestedStopSelectorDigest(
+    const MalformedStopIngressDTO& ingress);
 
 /// Canonical identity of the complete normalized caller-owned Stop intent.
 /// Receiving-adapter attribution is compared separately by the emergency

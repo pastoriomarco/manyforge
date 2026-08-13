@@ -1485,6 +1485,7 @@ struct ResourceAddressedExecutionKernel::StopTransaction final {
   std::vector<StopParticipantWork> participants;
   std::optional<StopCertificateDTO> certificate;
   std::optional<StopControlWorkToken> terminal_projection_token;
+  std::optional<std::string> malformed_ingress_reason;
 };
 
 struct ResourceAddressedExecutionKernel::StopTerminalRecord final {
@@ -1650,7 +1651,8 @@ constexpr std::size_t kMaximumResidentStopTerminalRecords = 64U;
 }
 
 [[nodiscard]] StopRequestedSelectorSnapshotDTO requested_selector_snapshot(
-    const EmergencyStopProjectedIntentDTO& intent, const ContentDigest& digest) {
+    const EmergencyStopProjectedIntentDTO& intent, const ContentDigest& digest,
+    const std::optional<std::string>& malformed_reason) {
   if (const auto* ordinary = std::get_if<StopIntentDTO>(&intent)) {
     const auto kind = std::visit(
         [](const auto& rows) {
@@ -1671,7 +1673,7 @@ constexpr std::size_t kMaximumResidentStopTerminalRecords = 64U;
                                             std::nullopt, std::nullopt};
   }
   return StopRequestedSelectorSnapshotDTO{StopRequestedSelectorKindDTO::kMalformedIngress, digest,
-                                          std::nullopt, "malformed_stop_ingress"};
+                                          std::nullopt, malformed_reason};
 }
 
 [[nodiscard]] StopEscalationStageKind stage_kind(const PreparedParticipantStopPlanDTO& plan,
@@ -5149,6 +5151,11 @@ Result<StopAcceptedDTO> ResourceAddressedExecutionKernel::full_stop(
   return accept_stop(EmergencyStopProjectedIntentDTO{intent});
 }
 
+Result<StopAcceptedDTO> ResourceAddressedExecutionKernel::recognized_malformed_stop(
+    const MalformedStopIngressDTO& ingress) {
+  return accept_stop(EmergencyStopProjectedIntentDTO{std::monostate{}}, nullptr, &ingress);
+}
+
 void ResourceAddressedExecutionKernel::ScheduleStopSurveillance(
     StopCertificateId certificate_id, const std::int64_t deadline_ns) noexcept {
   if (!config_.stop_surveillance.has_value()) {
@@ -5658,6 +5665,58 @@ std::optional<StopFaultLatchDTO> ResourceAddressedExecutionKernel::get_stop_faul
   return active_stop_fault_latch_;
 }
 
+Result<std::optional<StopFaultRecoveryOfferDTO>>
+ResourceAddressedExecutionKernel::get_stop_fault_recovery_offer() const {
+  std::lock_guard state_lock(state_mutex_);
+  if (!active_stop_fault_latch_.has_value() ||
+      active_stop_fault_latch_->state == StopFaultLatchStateDTO::kCleared) {
+    return Result<std::optional<StopFaultRecoveryOfferDTO>>::Ok(std::nullopt);
+  }
+  const auto terminal = std::find_if(
+      stop_terminal_history_.begin(), stop_terminal_history_.end(), [&](const auto& record) {
+        return record != nullptr &&
+               record->certificate.stop_id == active_stop_fault_latch_->stop_id &&
+               record->certificate.stop_generation == active_stop_fault_latch_->stop_generation &&
+               record->status.fault_latch.has_value() &&
+               *record->status.fault_latch == *active_stop_fault_latch_;
+      });
+  if (terminal == stop_terminal_history_.end()) {
+    return reject<std::optional<StopFaultRecoveryOfferDTO>>(
+        "active Stop fault latch has no exact resident terminal status",
+        "stop_fault_recovery_offer_terminal_missing", ErrorCode::kInvariantViolation);
+  }
+
+  std::map<ControlDomainId, StopFaultRecoveryConfigurationExpectationDTO> by_domain;
+  for (const auto& scope : (*terminal)->status.scope_entries) {
+    const auto* participant = std::get_if<StopParticipantScopeFactsDTO>(&scope.facts);
+    if (participant == nullptr) {
+      continue;
+    }
+    const StopFaultRecoveryConfigurationExpectationDTO row{
+        participant->control_domain_id, participant->active_control_configuration_id,
+        participant->active_control_configuration_generation};
+    const auto [found, inserted] = by_domain.emplace(row.control_domain_id, row);
+    if (!inserted && found->second != row) {
+      return reject<std::optional<StopFaultRecoveryOfferDTO>>(
+          "Stop terminal status contains conflicting control-domain configuration truth",
+          "stop_fault_recovery_offer_configuration_conflict", ErrorCode::kInvariantViolation);
+    }
+  }
+
+  StopFaultRecoveryOfferDTO offer{*active_stop_fault_latch_, {}};
+  offer.configuration_expectations.reserve(by_domain.size());
+  for (const auto& [domain_id, row] : by_domain) {
+    static_cast<void>(domain_id);
+    offer.configuration_expectations.push_back(row);
+  }
+  if (stop_fault_recovery_offer_field_error(offer).has_value()) {
+    return reject<std::optional<StopFaultRecoveryOfferDTO>>(
+        "Stop fault-recovery offer is not a complete canonical owner projection",
+        "stop_fault_recovery_offer_invalid", ErrorCode::kInvariantViolation);
+  }
+  return Result<std::optional<StopFaultRecoveryOfferDTO>>::Ok(std::move(offer));
+}
+
 Result<StopFaultRecoveryResultDTO> ResourceAddressedExecutionKernel::recover_stop_fault(
     const StopFaultRecoveryIntentDTO& intent) {
   if (stop_fault_recovery_intent_field_error(intent).has_value()) {
@@ -5815,7 +5874,8 @@ Result<StopFaultRecoveryResultDTO> ResourceAddressedExecutionKernel::recover_sto
 
 Result<StopAcceptedDTO> ResourceAddressedExecutionKernel::accept_stop(
     EmergencyStopProjectedIntentDTO projected_intent,
-    const PartialDispatchStopScope* partial_dispatch_scope) {
+    const PartialDispatchStopScope* partial_dispatch_scope,
+    const MalformedStopIngressDTO* malformed_ingress) {
   struct PostReserveInvariantGuard final {
     bool armed{};
     ~PostReserveInvariantGuard() {
@@ -5830,9 +5890,29 @@ Result<StopAcceptedDTO> ResourceAddressedExecutionKernel::accept_stop(
   } post_reserve_guard;
   const auto* ordinary = std::get_if<StopIntentDTO>(&projected_intent);
   const auto* full = std::get_if<FullStopIntentDTO>(&projected_intent);
-  if (ordinary == nullptr && full == nullptr) {
+  const auto normalized_alternatives = static_cast<unsigned>(ordinary != nullptr) +
+                                       static_cast<unsigned>(full != nullptr) +
+                                       static_cast<unsigned>(malformed_ingress != nullptr);
+  if (normalized_alternatives != 1U ||
+      (malformed_ingress != nullptr && !std::holds_alternative<std::monostate>(projected_intent))) {
     return reject<StopAcceptedDTO>("Stop ingress has no normalized request identity",
                                    "stop_ingress_not_normalized", ErrorCode::kInvalidRequest);
+  }
+  std::optional<FullStopIntentDTO> malformed_full;
+  if (malformed_ingress != nullptr) {
+    if (malformed_stop_ingress_field_error(*malformed_ingress).has_value()) {
+      return reject<StopAcceptedDTO>("recognized malformed Stop ingress is invalid",
+                                     "malformed_stop_ingress_invalid", ErrorCode::kInvalidRequest);
+    }
+    if (malformed_ingress->receiver_owner_epoch != config_.request_owner_epoch) {
+      return reject<StopAcceptedDTO>("recognized malformed Stop ingress names a stale owner",
+                                     "stale_request_owner_epoch", ErrorCode::kInvalidRequest);
+    }
+    malformed_full.emplace(PublicRequestContextDTO{malformed_ingress->request_id,
+                                                   malformed_ingress->receiver_owner_epoch,
+                                                   "recognized_stop_ingress", std::nullopt},
+                           StopGeneration(0U), malformed_ingress->attribution);
+    full = &*malformed_full;
   }
   const auto& context = ordinary != nullptr ? ordinary->request_context : full->request_context;
   const auto& attribution = ordinary != nullptr ? ordinary->attribution : full->attribution;
@@ -5840,14 +5920,20 @@ Result<StopAcceptedDTO> ResourceAddressedExecutionKernel::accept_stop(
     return reject<StopAcceptedDTO>("Stop ingress attribution is invalid",
                                    "stop_request_attribution_invalid", ErrorCode::kInvalidRequest);
   }
-  const auto normalized_digest = ordinary != nullptr ? ComputeNormalizedStopIntentDigest(*ordinary)
-                                                     : ComputeNormalizedStopIntentDigest(*full);
-  if (!normalized_digest.ok()) {
-    return Result<StopAcceptedDTO>::Err(normalized_digest.error());
+  std::optional<ContentDigest> normalized_digest;
+  if (malformed_ingress == nullptr) {
+    const auto computed = ordinary != nullptr ? ComputeNormalizedStopIntentDigest(*ordinary)
+                                              : ComputeNormalizedStopIntentDigest(*full);
+    if (!computed.ok()) {
+      return Result<StopAcceptedDTO>::Err(computed.error());
+    }
+    normalized_digest = computed.value();
   }
-  const auto requested_selector_digest = ordinary != nullptr
-                                             ? ComputeRequestedStopSelectorDigest(*ordinary)
-                                             : ComputeRequestedStopSelectorDigest(*full);
+  const auto requested_selector_digest =
+      malformed_ingress != nullptr
+          ? ComputeRequestedStopSelectorDigest(*malformed_ingress)
+          : (ordinary != nullptr ? ComputeRequestedStopSelectorDigest(*ordinary)
+                                 : ComputeRequestedStopSelectorDigest(*full));
   if (!requested_selector_digest.ok()) {
     return Result<StopAcceptedDTO>::Err(requested_selector_digest.error());
   }
@@ -5889,6 +5975,12 @@ Result<StopAcceptedDTO> ResourceAddressedExecutionKernel::accept_stop(
                                           : resolve_full_stop_scope(*full, resolver_snapshot);
     if (!resolution.ok()) {
       return Result<StopAcceptedDTO>::Err(resolution.error());
+    }
+    if (malformed_ingress != nullptr) {
+      resolution.value().disposition = StopResolutionDispositionDTO::kPromotedToFull;
+      resolution.value().reason = StopScopeResolutionReasonDTO::kMalformedOrdinaryIntent;
+      resolution.value().full_stop = true;
+      resolution.value().stale_diagnostics.clear();
     }
     if (partial_dispatch_scope != nullptr) {
       if (ordinary == nullptr || partial_dispatch_scope->operation_id.empty() ||
@@ -6149,13 +6241,15 @@ Result<StopAcceptedDTO> ResourceAddressedExecutionKernel::accept_stop(
 
     const EmergencyStopAcceptanceCandidate candidate{
         context.request_id.value(),
-        normalized_digest.value().value(),
+        normalized_digest.has_value() ? std::optional<std::string_view>(normalized_digest->value())
+                                      : std::nullopt,
         attribution.transport,
         attribution.assurance,
         attribution.principal_id.has_value()
             ? std::optional<std::string_view>(*attribution.principal_id)
             : std::nullopt,
-        std::nullopt,
+        malformed_ingress != nullptr ? std::optional<std::string_view>(malformed_ingress->reason)
+                                     : std::nullopt,
         proposed_stop_id.value(),
         proposed_generation,
         accepted_at_ns,
@@ -6200,7 +6294,11 @@ Result<StopAcceptedDTO> ResourceAddressedExecutionKernel::accept_stop(
       accepted->request_id = context.request_id;
       accepted->replay_status = RequestReplayStatusDTO::kAcceptedNew;
       accepted->requested_selector_digest = requested_selector_digest.value();
-      if (!transaction.full_stop) {
+      if (malformed_ingress != nullptr) {
+        accepted->resolution_disposition = StopResolutionDispositionDTO::kPromotedToFull;
+        accepted->resolution_reason = resolution.value().reason;
+        accepted->stale_diagnostics.clear();
+      } else if (!transaction.full_stop) {
         if (resolution.value().disposition ==
             StopResolutionDispositionDTO::kAlreadyTerminalNoEffect) {
           accepted->resolution_disposition =
@@ -6412,6 +6510,9 @@ Result<StopAcceptedDTO> ResourceAddressedExecutionKernel::accept_stop(
         return Result<StopAcceptedDTO>::Err(made.error());
       }
       accepted = std::move(made.value());
+      if (malformed_ingress != nullptr) {
+        accepted->requested_selector_digest = requested_selector_digest.value();
+      }
       auto fenced =
           owner_rows.empty() && orphan_resources.empty()
               ? Result<ResourceSlotStopFenceResultDTO>::Ok(ResourceSlotStopFenceResultDTO{
@@ -6512,7 +6613,9 @@ Result<StopAcceptedDTO> ResourceAddressedExecutionKernel::accept_stop(
           false,
           {},
           std::nullopt,
-          std::nullopt};
+          std::nullopt,
+          malformed_ingress != nullptr ? std::optional<std::string>(malformed_ingress->reason)
+                                       : std::nullopt};
       if (outcome.correlation_retained) {
         stop_correlations_[outcome.correlation_slot] = *accepted;
       }
@@ -6548,22 +6651,23 @@ Result<StopAcceptedDTO> ResourceAddressedExecutionKernel::accept_stop(
         auto& projection = *stop_projection_jobs_[projection_token->slot];
         projection.intent = projected_intent;
         projection.affected_state = std::move(*projection_state);
-        projection.acceptance =
-            EmergencyStopAcceptanceRecordDTO{config_.request_owner_epoch,
-                                             context.request_id,
-                                             normalized_digest.value(),
-                                             std::nullopt,
-                                             attribution,
-                                             accepted->replay_status,
-                                             accepted->stop_id,
-                                             accepted->stop_generation,
-                                             accepted_at_ns,
-                                             outcome.outer_deadline_ns,
-                                             accepted->resolution_disposition,
-                                             accepted->captured_scope_digest,
-                                             EmergencyStopEntryStateDTO::kActive,
-                                             outcome.acceptance_path,
-                                             EmergencyStopProjectionStateDTO::kPending};
+        projection.acceptance = EmergencyStopAcceptanceRecordDTO{
+            config_.request_owner_epoch,
+            context.request_id,
+            normalized_digest,
+            malformed_ingress != nullptr ? std::optional<std::string>(malformed_ingress->reason)
+                                         : std::nullopt,
+            attribution,
+            accepted->replay_status,
+            accepted->stop_id,
+            accepted->stop_generation,
+            accepted_at_ns,
+            outcome.outer_deadline_ns,
+            accepted->resolution_disposition,
+            accepted->captured_scope_digest,
+            EmergencyStopEntryStateDTO::kActive,
+            outcome.acceptance_path,
+            EmergencyStopProjectionStateDTO::kPending};
         projection.accepted = *accepted;
       }
     }
@@ -7137,7 +7241,8 @@ bool ResourceAddressedExecutionKernel::commit_stop_terminal_locked(
         *transaction.stop_id,
         transaction.stop_generation,
         requested_selector_snapshot(transaction.projected_intent,
-                                    transaction.accepted->requested_selector_digest),
+                                    transaction.accepted->requested_selector_digest,
+                                    transaction.malformed_ingress_reason),
         transaction.accepted->resolution_disposition,
         transaction.accepted->resolution_reason,
         transaction.accepted->stale_diagnostics,

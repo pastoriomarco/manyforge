@@ -603,6 +603,55 @@ class FakeExecution:
         self.principals.append(("stop", trusted_principal_id))
         return {"ok": True, "command": "stop", "accepted": {}}
 
+    def full_stop(
+        self, request: object, *, trusted_principal_id: str | None
+    ) -> dict[str, Any]:
+        self.requests.append(("full_stop", request))
+        self.principals.append(("full_stop", trusted_principal_id))
+        return {"ok": True, "command": "full_stop", "accepted": {}}
+
+    def recognized_malformed_stop(
+        self,
+        *,
+        request_id: str,
+        recognized_route: str,
+        reason: str,
+        trusted_principal_id: str | None,
+    ) -> dict[str, Any]:
+        self.requests.append(
+            (
+                "recognized_malformed_stop",
+                {
+                    "request_id": request_id,
+                    "recognized_route": recognized_route,
+                    "reason": reason,
+                },
+            )
+        )
+        self.principals.append(
+            ("recognized_malformed_stop", trusted_principal_id)
+        )
+        return {
+            "ok": True,
+            "command": "stop",
+            "accepted": {
+                "request_id": request_id,
+                "resolution_disposition": "promoted_to_full",
+            },
+        }
+
+    def stop_fault(self) -> dict[str, Any]:
+        self.requests.append(("stop_fault", None))
+        return {"ok": True, "command": "get_stop_fault", "stop_fault": None}
+
+    def recover_stop_fault(self, request: object) -> dict[str, Any]:
+        self.requests.append(("recover_stop_fault", request))
+        return {
+            "ok": True,
+            "command": "recover_stop_fault",
+            "result": {"accepted": True},
+        }
+
     def set_runtime_scale(
         self, request: object, *, trusted_principal_id: str | None
     ) -> dict[str, Any]:
@@ -1404,6 +1453,60 @@ def test_streamed_request_body_bound_is_enforced_without_content_length() -> Non
     assert response.json()["detail"]["code"] == "headless_request_body_oversized"
 
 
+def test_recognized_malformed_stop_promotes_instead_of_returning_validation_error() -> None:
+    execution = FakeExecution()
+    app = create_app(
+        service=HeadlessService(FakeCore(), FakeManager(), execution)
+    )
+    with TestClient(app) as client:
+        response = client.post(
+            "/api/execution/stops",
+            content=b'{"request_context":',
+            headers={"content-type": "application/json", "x-request-id": "http.stop.1"},
+        )
+        oversized = client.post(
+            "/api/execution/stops",
+            content=b"x" * (1024 * 1024 + 1),
+            headers={"content-type": "application/json", "x-request-id": "http.stop.2"},
+        )
+        malformed_full = client.post(
+            "/api/execution/full-stop",
+            json={},
+            headers={"x-request-id": "http.stop.3"},
+        )
+
+    assert response.status_code == 200, response.text
+    assert oversized.status_code == 200, oversized.text
+    assert malformed_full.status_code == 200, malformed_full.text
+    assert oversized.headers["connection"] == "close"
+    assert execution.requests == [
+        (
+            "recognized_malformed_stop",
+            {
+                "request_id": "malformed-stop.http.stop.1",
+                "recognized_route": "/api/execution/stops",
+                "reason": "recognized_stop_payload_invalid",
+            },
+        ),
+        (
+            "recognized_malformed_stop",
+            {
+                "request_id": "malformed-stop.http.stop.2",
+                "recognized_route": "/api/execution/stops",
+                "reason": "recognized_stop_body_oversized",
+            },
+        ),
+        (
+            "recognized_malformed_stop",
+            {
+                "request_id": "malformed-stop.http.stop.3",
+                "recognized_route": "/api/execution/full-stop",
+                "reason": "recognized_stop_payload_invalid",
+            },
+        ),
+    ]
+
+
 def test_query_cardinality_and_safe_integer_bounds_precede_native_conversion() -> None:
     client, _core, _manager = _client()
     with client:
@@ -1455,6 +1558,9 @@ def test_openapi_contains_no_condition_mutation_route() -> None:
         "/api/execution/motion-previews",
         "/api/execution/capability-command-previews",
         "/api/execution/stops",
+        "/api/execution/full-stop",
+        "/api/execution/stop-fault",
+        "/api/execution/stop-fault/recover",
         "/api/execution/pick-place/plans/pick",
         "/api/execution/pick-place/plans/place",
         "/api/execution/pick-place/sequences/pick",
@@ -1716,6 +1822,63 @@ def test_operation_controls_and_scale_are_thin_revision_fenced_routes() -> None:
     ]
 
 
+def test_full_stop_and_stop_fault_recovery_are_thin_owner_routes() -> None:
+    execution = FakeExecution()
+    app = create_app(
+        service=HeadlessService(FakeCore(), FakeManager(), execution)
+    )
+    context = {
+        "request_id": "request.full-stop.1",
+        "request_owner_epoch": "execution.epoch.1",
+        "source_label": "operator_ui",
+        "correlation_id": None,
+    }
+    recovery_context = {**context, "request_id": "request.recover-stop.1"}
+    recovery = {
+        "request_context": recovery_context,
+        "expected_latch_id": "stop-fault.1",
+        "expected_latch_generation": 1,
+        "expected_recovery_assessment_revision": 2,
+        "expected_stop_certificate_id": "stop-certificate.1",
+        "expected_stop_certificate_revision": 1,
+        "expected_cell_id": "cell.1",
+        "expected_retained_bundle_id": "sha256:" + "1" * 64,
+        "expected_graph_revision": "sha256:" + "2" * 64,
+        "configuration_expectations": [
+            {
+                "control_domain_id": "domain.1",
+                "active_control_configuration_id": "configuration.1",
+                "active_control_configuration_generation": 3,
+            }
+        ],
+        "reason": "fresh settlement verified",
+    }
+
+    with TestClient(app) as client:
+        full = client.post(
+            "/api/execution/full-stop",
+            json={
+                "request_context": context,
+                "expected_stop_generation": 0,
+            },
+        )
+        fault = client.get("/api/execution/stop-fault")
+        recovered = client.post(
+            "/api/execution/stop-fault/recover", json=recovery
+        )
+
+    assert full.status_code == 200
+    assert fault.status_code == 200
+    assert fault.json()["stop_fault"] is None
+    assert recovered.status_code == 200
+    assert [kind for kind, _request in execution.requests] == [
+        "full_stop",
+        "stop_fault",
+        "recover_stop_fault",
+    ]
+    assert execution.principals == [("full_stop", None)]
+
+
 def test_execution_mutation_principal_can_only_come_from_trusted_adapter() -> None:
     execution = FakeExecution()
     app = create_app(
@@ -1758,7 +1921,7 @@ def test_execution_mutation_principal_can_only_come_from_trusted_adapter() -> No
     assert execution.principals == [("pause", "operator.7")]
 
 
-def test_operation_control_paths_reject_ambiguous_or_unbounded_scope() -> None:
+def test_operation_control_paths_accept_bounded_stop_and_promote_mixed_scope() -> None:
     execution = FakeExecution()
     app = create_app(
         service=HeadlessService(FakeCore(), FakeManager(), execution)
@@ -1794,6 +1957,27 @@ def test_operation_control_paths_reject_ambiguous_or_unbounded_scope() -> None:
                 "reason": None,
             },
         )
+        mixed_stop = client.post(
+            "/api/execution/stops",
+            json={
+                "request_context": context,
+                "operations": [
+                    {
+                        "operation_id": "operation-1",
+                        "expected_operation_revision": 1,
+                        "expected_stop_generation": 0,
+                    }
+                ],
+                "components": [
+                    {
+                        "controllable_component_id": "robot-1",
+                        "expected_graph_revision": "sha256:" + "1" * 64,
+                        "expected_component_lifecycle_generation": 1,
+                    }
+                ],
+                "reason": None,
+            },
+        )
         invalid_scale = client.post(
             "/api/execution/operations/operation-1/runtime-scale",
             json={
@@ -1809,9 +1993,13 @@ def test_operation_control_paths_reject_ambiguous_or_unbounded_scope() -> None:
     assert mismatch.json()["detail"]["code"] == (
         "execution_operation_path_invalid"
     )
-    assert broad_stop.status_code == 422
+    assert broad_stop.status_code == 200
+    assert mixed_stop.status_code == 200
     assert invalid_scale.status_code == 422
-    assert execution.requests == []
+    assert [kind for kind, _request in execution.requests] == [
+        "stop",
+        "recognized_malformed_stop",
+    ]
 
 
 @pytest.mark.parametrize(

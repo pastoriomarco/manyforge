@@ -227,6 +227,8 @@ class ResourceAddressedExecutionKernel final : public IAddressedOperationOwner,
 
   [[nodiscard]] Result<StopAcceptedDTO> stop(const StopIntentDTO& intent);
   [[nodiscard]] Result<StopAcceptedDTO> full_stop(const FullStopIntentDTO& intent);
+  [[nodiscard]] Result<StopAcceptedDTO> recognized_malformed_stop(
+      const MalformedStopIngressDTO& ingress);
 
   /// Atomically derives the current exact component scope or conservative
   /// Full-Stop promotion from the registered physical truth and slot table.
@@ -245,6 +247,8 @@ class ResourceAddressedExecutionKernel final : public IAddressedOperationOwner,
   [[nodiscard]] Result<StopCertificateDTO> get_stop_certificate(
       const StopCertificateId& certificate_id) const;
   [[nodiscard]] std::optional<StopFaultLatchDTO> get_stop_fault_latch() const;
+  [[nodiscard]] Result<std::optional<StopFaultRecoveryOfferDTO>> get_stop_fault_recovery_offer()
+      const;
   [[nodiscard]] Result<StopFaultRecoveryResultDTO> recover_stop_fault(
       const StopFaultRecoveryIntentDTO& intent);
   [[nodiscard]] Result<RuntimeScaleAcceptedDTO> set_runtime_scale(
@@ -375,7 +379,8 @@ class ResourceAddressedExecutionKernel final : public IAddressedOperationOwner,
                                                  std::int64_t completed_at_ns) noexcept;
   [[nodiscard]] Result<StopAcceptedDTO> accept_stop(
       EmergencyStopProjectedIntentDTO intent,
-      const PartialDispatchStopScope* partial_dispatch_scope = nullptr);
+      const PartialDispatchStopScope* partial_dispatch_scope = nullptr,
+      const MalformedStopIngressDTO* malformed_ingress = nullptr);
   [[nodiscard]] Result<KernelDisableHandoffRuntimeSnapshotDTO>
   capture_disable_handoff_runtime_snapshot_impl(const DisableRuntimeExpectation& expectation) const;
 

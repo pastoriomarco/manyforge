@@ -12,6 +12,7 @@ from manyforge_headless_api.models import (
     AcknowledgeAlarmRequest,
     AcknowledgeAllAlarmsRequest,
     ComponentLifecycleRequest,
+    FullStopIntentRequest,
     HistorianReconcileRequest,
     ManagerApplyRequest,
     OperationControlRequest,
@@ -22,6 +23,7 @@ from manyforge_headless_api.models import (
     RouteSelectionRequest,
     SceneTransactionRequest,
     StopIntentRequest,
+    StopFaultRecoveryIntentRequest,
     ProgramRunStartRequest,
     ProgramRunStopRequest,
 )
@@ -370,7 +372,29 @@ def create_headless_router(
 
     @router.post("/api/execution/stops")
     def execution_stop(body: StopIntentRequest) -> dict[str, Any]:
-        return _call(lambda: client.stop_operations(body.model_dump()))
+        return _call(
+            lambda: client.stop_operations(
+                body.model_dump(mode="json", exclude_unset=True)
+            )
+        )
+
+    @router.post("/api/execution/full-stop")
+    def execution_full_stop(body: FullStopIntentRequest) -> dict[str, Any]:
+        return _call(lambda: client.full_stop(body.model_dump()))
+
+    @router.get("/api/execution/stop-fault")
+    def execution_stop_fault() -> dict[str, Any]:
+        return _call(client.stop_fault)
+
+    @router.post("/api/execution/stop-fault/recover")
+    def execution_recover_stop_fault(
+        body: StopFaultRecoveryIntentRequest,
+    ) -> dict[str, Any]:
+        return _call(
+            lambda: client.recover_stop_fault(
+                body.model_dump(mode="json", exclude_unset=True)
+            )
+        )
 
     @router.post("/api/execution/operations/{operation_id}/runtime-scale")
     def execution_set_runtime_scale(

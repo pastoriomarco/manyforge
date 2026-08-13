@@ -27,6 +27,7 @@ from .models import (
     ProgramModelAttemptRequest,
     ProgramRunStartRequest,
     ProgramRunStopRequest,
+    FullStopIntentRequest,
     OperationControlRequest,
     OperationIntentRequest,
     PickSequencePlanningRequest,
@@ -35,6 +36,7 @@ from .models import (
     SceneResourcePoseQuery,
     SceneTransactionRequest,
     StopIntentRequest,
+    StopFaultRecoveryIntentRequest,
 )
 from .native import HeadlessApiError, HeadlessCorePort, ViewerModelAsset
 from .program_runner_client import ProgramRunnerClientError, ProgramRunnerPort
@@ -238,6 +240,39 @@ class HeadlessService:
         return self._execution().stop(
             request, trusted_principal_id=attribution.principal_id
         )
+
+    def execution_full_stop(
+        self,
+        request: FullStopIntentRequest,
+        attribution: TrustedAttribution,
+    ) -> dict[str, Any]:
+        return self._execution().full_stop(
+            request, trusted_principal_id=attribution.principal_id
+        )
+
+    def execution_recognized_malformed_stop(
+        self,
+        *,
+        request_id: str,
+        recognized_route: str,
+        reason: str,
+        attribution: TrustedAttribution,
+    ) -> dict[str, Any]:
+        return self._execution().recognized_malformed_stop(
+            request_id=request_id,
+            recognized_route=recognized_route,
+            reason=reason,
+            trusted_principal_id=attribution.principal_id,
+        )
+
+    def execution_stop_fault(self) -> dict[str, Any]:
+        return self._execution().stop_fault()
+
+    def execution_recover_stop_fault(
+        self,
+        request: StopFaultRecoveryIntentRequest,
+    ) -> dict[str, Any]:
+        return self._execution().recover_stop_fault(request)
 
     def execution_set_runtime_scale(
         self,

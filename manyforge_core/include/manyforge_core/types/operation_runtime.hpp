@@ -18,6 +18,7 @@ inline constexpr std::size_t kMaximumStopSelectorTargets = 4096U;
 inline constexpr std::size_t kMaximumStopIdentityBytes = 128U;
 inline constexpr std::size_t kMaximumStopRequestLabelBytes = 256U;
 inline constexpr std::size_t kMaximumStopReasonBytes = 1024U;
+inline constexpr std::size_t kMaximumStopMalformedReasonBytes = 256U;
 inline constexpr std::size_t kMaximumStopStaleDiagnostics = 1U + (3U * kMaximumStopSelectorTargets);
 inline constexpr std::size_t kMaximumStopAcceptedPhases = 64U;
 inline constexpr std::size_t kMaximumStopAcceptedParticipants = 4096U;
@@ -258,6 +259,20 @@ struct FullStopIntentDTO final {
   friend bool operator==(const FullStopIntentDTO&, const FullStopIntentDTO&) = default;
 };
 
+/// Internal-only value minted after a transport has recognized the exact Stop
+/// method, route, and receiving Kernel but cannot normalize the bounded public
+/// payload. It deliberately carries no caller-selected scope: the Kernel must
+/// conservatively promote it to Full Stop.
+struct MalformedStopIngressDTO final {
+  RequestId request_id;
+  RequestOwnerEpoch receiver_owner_epoch;
+  RequestAttributionDTO attribution{};
+  std::string recognized_route;
+  std::string reason;
+
+  friend bool operator==(const MalformedStopIngressDTO&, const MalformedStopIngressDTO&) = default;
+};
+
 /// Closed local-shape validation for normalized internal Stop values. This
 /// verifies bounds, exact selector alternative, canonical ordering, and typed
 /// expectation presence. Live target resolution and stale/promote semantics
@@ -266,6 +281,8 @@ struct FullStopIntentDTO final {
     const StopIntentDTO& intent) noexcept;
 [[nodiscard]] std::optional<std::string_view> full_stop_intent_field_error(
     const FullStopIntentDTO& intent) noexcept;
+[[nodiscard]] std::optional<std::string_view> malformed_stop_ingress_field_error(
+    const MalformedStopIngressDTO& ingress) noexcept;
 
 struct StopAffectedOperationRevisionDTO final {
   OperationId operation_id;

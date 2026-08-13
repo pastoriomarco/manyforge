@@ -4808,6 +4808,52 @@ TEST(ResourceAddressedExecutionKernelTest,
 }
 
 TEST(ResourceAddressedExecutionKernelTest,
+     RecognizedMalformedIngressPromotesToFullAndProjectsExactAdapterTruth) {
+  FakeClock clock;
+  clock.set(100);
+  FakeParticipantEngine engine;
+  FakeOperationJournal journal;
+  ResourceAddressedExecutionKernel kernel(
+      {registration(
+          make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular),
+          engine)},
+      clock, journal, {RequestOwnerEpoch("kernel.epoch.1"), CellId("cell.test"), 16U});
+  const auto operation = kernel.execute(motion_operation("request.malformed-stop.execute"));
+  ASSERT_TRUE(operation.ok()) << operation.error().message;
+
+  const MalformedStopIngressDTO ingress{
+      RequestId("malformed-stop.http.1"), RequestOwnerEpoch("kernel.epoch.1"),
+      RequestAttributionDTO{RequestTransportDTO::kHttp, RequestAssuranceDTO::kUnverified,
+                            std::nullopt},
+      "/api/execution/stops", "recognized_stop_payload_invalid"};
+  const auto stopped = kernel.recognized_malformed_stop(ingress);
+  ASSERT_TRUE(stopped.ok()) << stopped.error().message;
+  EXPECT_EQ(stopped.value().resolution_disposition, StopResolutionDispositionDTO::kPromotedToFull);
+  EXPECT_EQ(stopped.value().resolution_reason,
+            StopScopeResolutionReasonDTO::kMalformedOrdinaryIntent);
+  const auto selector_digest = ComputeRequestedStopSelectorDigest(ingress);
+  ASSERT_TRUE(selector_digest.ok()) << selector_digest.error().message;
+  EXPECT_EQ(stopped.value().requested_selector_digest, selector_digest.value());
+
+  ASSERT_TRUE(wait_until([&] { return journal.stop_acceptance_calls.load() == 1; }));
+  {
+    std::lock_guard lock(journal.mutex);
+    ASSERT_TRUE(journal.last_stop_acceptance.has_value());
+    EXPECT_FALSE(journal.last_stop_acceptance->normalized_request_digest.has_value());
+    EXPECT_EQ(journal.last_stop_acceptance->malformed_ingress_reason, ingress.reason);
+    ASSERT_TRUE(journal.last_stop_intent.has_value());
+    EXPECT_TRUE(std::holds_alternative<std::monostate>(*journal.last_stop_intent));
+  }
+  ASSERT_TRUE(wait_until([&] {
+    const auto status = kernel.get_stop_status(stopped.value().stop_id);
+    return status.ok() && status.value().stop_certificate.has_value();
+  }));
+  const auto latch = kernel.get_stop_fault_latch();
+  ASSERT_TRUE(latch.has_value());
+  EXPECT_EQ(latch->trigger, StopFaultTriggerDTO::kScopePromotion);
+}
+
+TEST(ResourceAddressedExecutionKernelTest,
      ExplicitFullAggregatesOneResidentStopAndFreshScopeWithoutRefenceOrRedispatch) {
   FakeClock clock;
   clock.set(100);
@@ -5630,6 +5676,12 @@ TEST(ResourceAddressedExecutionKernelTest,
 
   latch = kernel.get_stop_fault_latch();
   ASSERT_TRUE(latch.has_value());
+  const auto offer = kernel.get_stop_fault_recovery_offer();
+  ASSERT_TRUE(offer.ok()) << offer.error().message;
+  ASSERT_TRUE(offer.value().has_value());
+  EXPECT_EQ(offer.value()->latch, *latch);
+  EXPECT_EQ(offer.value()->configuration_expectations,
+            std::vector<StopFaultRecoveryConfigurationExpectationDTO>{expected_configuration});
   const auto make_recovery = [&](std::string request_id, const StopFaultLatchDTO& current) {
     return StopFaultRecoveryIntentDTO{
         PublicRequestContextDTO{RequestId(std::move(request_id)),
@@ -5676,6 +5728,9 @@ TEST(ResourceAddressedExecutionKernelTest,
   ASSERT_TRUE(clear_replay.ok()) << clear_replay.error().message;
   EXPECT_EQ(clear_replay.value().replay_status, RequestReplayStatusDTO::kReplayedExact);
   EXPECT_EQ(journal.stop_fault_clear_calls.load(), 2);
+  const auto cleared_offer = kernel.get_stop_fault_recovery_offer();
+  ASSERT_TRUE(cleared_offer.ok()) << cleared_offer.error().message;
+  EXPECT_FALSE(cleared_offer.value().has_value());
 
   auto admitted_intent = motion_operation("request.surveillance.admitted");
   admitted_intent.program_binding_id = unaffected_binding.value().program_binding_id;

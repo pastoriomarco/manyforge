@@ -689,6 +689,44 @@ export const api = {
         }),
       },
     ),
+    fullStop: (
+      ownerEpoch: string,
+      expectedStopGeneration: number,
+      requestId: string,
+      signal?: AbortSignal,
+    ): Promise<Record<string, unknown>> => requestJson(
+      '/api/execution/full-stop',
+      parseObjectResponse,
+      signal,
+      {
+        method: 'POST',
+        body: JSON.stringify({
+          request_context: {
+            request_id: requestId,
+            request_owner_epoch: ownerEpoch,
+            source_label: 'composer_ui',
+            correlation_id: null,
+          },
+          expected_stop_generation: expectedStopGeneration,
+        }),
+      },
+    ),
+    stopFault: (
+      signal?: AbortSignal,
+    ): Promise<Record<string, unknown>> => requestJson(
+      '/api/execution/stop-fault',
+      parseObjectResponse,
+      signal,
+    ),
+    recoverStopFault: (
+      intent: Record<string, JsonValue>,
+      signal?: AbortSignal,
+    ): Promise<Record<string, unknown>> => requestJson(
+      '/api/execution/stop-fault/recover',
+      parseObjectResponse,
+      signal,
+      { method: 'POST', body: JSON.stringify(intent) },
+    ),
   },
   alarms: {
     list: (signal?: AbortSignal): Promise<OperatorAlarmSnapshot> =>

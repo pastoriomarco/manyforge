@@ -614,6 +614,27 @@ class HeadlessHttpClient:
     def stop_operations(self, body: Mapping[str, Any]) -> dict[str, Any]:
         return self.request("POST", "/api/execution/stops", body=body)
 
+    def recognized_malformed_stop(self, path: str) -> dict[str, Any]:
+        if path not in {"/api/execution/stops", "/api/execution/full-stop"}:
+            raise ValueError("recognized malformed Stop path is invalid")
+        # The Headless adapter is the semantic Stop ingress. Forward one
+        # deliberately non-normalizable bounded body through the exact route
+        # so it mints the internal malformed-ingress identity and performs the
+        # conservative Full-Stop promotion; Composer must not invent that
+        # identity or duplicate Kernel admission semantics.
+        return self.request("POST", path, body={})
+
+    def full_stop(self, body: Mapping[str, Any]) -> dict[str, Any]:
+        return self.request("POST", "/api/execution/full-stop", body=body)
+
+    def stop_fault(self) -> dict[str, Any]:
+        return self.request("GET", "/api/execution/stop-fault")
+
+    def recover_stop_fault(self, body: Mapping[str, Any]) -> dict[str, Any]:
+        return self.request(
+            "POST", "/api/execution/stop-fault/recover", body=body
+        )
+
     def set_operation_runtime_scale(
         self, operation_id: str, body: Mapping[str, Any]
     ) -> dict[str, Any]:

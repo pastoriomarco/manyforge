@@ -259,6 +259,27 @@ std::optional<std::string_view> stop_fault_latch_field_error(
   return std::nullopt;
 }
 
+std::optional<std::string_view> stop_fault_recovery_offer_field_error(
+    const StopFaultRecoveryOfferDTO& offer) noexcept {
+  if (stop_fault_latch_field_error(offer.latch).has_value() ||
+      offer.latch.state == StopFaultLatchStateDTO::kCleared ||
+      !offer.latch.stop_certificate.has_value() || offer.configuration_expectations.empty() ||
+      offer.configuration_expectations.size() > kMaximumStopTerminalScopeEntries ||
+      !canonical(offer.configuration_expectations,
+                 [](const auto& left, const auto& right) {
+                   return left.control_domain_id < right.control_domain_id;
+                 }) ||
+      !std::all_of(offer.configuration_expectations.begin(), offer.configuration_expectations.end(),
+                   [](const auto& row) {
+                     return identity(row.control_domain_id) &&
+                            identity(row.active_control_configuration_id) &&
+                            row.active_control_configuration_generation.nonzero();
+                   })) {
+    return "stop_fault_recovery_offer_shape_invalid";
+  }
+  return std::nullopt;
+}
+
 std::optional<std::string_view> stop_post_terminal_surveillance_field_error(
     const StopPostTerminalSurveillanceDTO& surveillance) noexcept {
   if (!identity(surveillance.stop_id) || !surveillance.stop_generation.nonzero() ||

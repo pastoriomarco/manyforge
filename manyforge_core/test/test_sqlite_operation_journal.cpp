@@ -513,6 +513,124 @@ TEST(SqliteOperationJournalTest,
   EXPECT_EQ(recovered.value().unreconciled_resources, inventory);
 }
 
+TEST(SqliteOperationJournalTest,
+     FaultClearAtomicallyBridgesOwnerAssessmentAndRestartsWithExactAuthority) {
+  ScopedTemporaryDirectory temporary;
+  const auto database = temporary.path() / std::string(kOperationJournalFilename);
+  const CellId cell_id("cell.1");
+  const RequestOwnerEpoch epoch("execution-host.epoch.stop-fault-clear");
+  const ResourceId resource("robot.gripper");
+  const std::vector<ResourceId> inventory{resource};
+  std::optional<StopStatusDTO> expected_status;
+  std::optional<StopCertificateDTO> expected_certificate;
+  std::optional<StopFaultLatchDTO> expected_latch;
+  {
+    SqliteOperationJournal journal(database, cell_id, 8U);
+    ASSERT_TRUE(journal.BeginOwnerEpoch(epoch, 1, 8U, inventory).ok());
+    const FullStopIntentDTO stop_intent{
+        PublicRequestContextDTO{RequestId("request.stop.fault-clear"), epoch, "journal-test",
+                                std::nullopt},
+        StopGeneration(0U), RequestAttributionDTO{}};
+    auto acceptance = StopAcceptanceRecord(epoch, stop_intent.request_context.request_id.value(),
+                                           "stop.fault-clear", 1U, 10);
+    acceptance.normalized_request_digest = ComputeNormalizedStopIntentDigest(stop_intent).value();
+    const EmergencyStopProjectedIntentDTO projected_intent(stop_intent);
+    const auto affected = StopAffectedState({}, inventory);
+    const auto accepted = StopAcceptedProjection(acceptance, projected_intent, affected);
+    ASSERT_EQ(journal.RecordStopAccepted(epoch, acceptance, projected_intent, accepted, affected)
+                  .projection_state,
+              EmergencyStopProjectionStateDTO::kRecorded);
+
+    auto terminal = MonitoringTerminalProjection(accepted, resource);
+    ASSERT_EQ(journal
+                  .RecordStopTerminal(epoch, terminal.stop_status, terminal.certificate,
+                                      terminal.fault_latch)
+                  .state,
+              StopForensicProjectionStateDTO::kRecorded);
+    ASSERT_TRUE(terminal.fault_latch.has_value());
+
+    auto cleared_latch = *terminal.fault_latch;
+    cleared_latch.terminal_projection = StopDurableProjectionStatusDTO{
+        StopDurableProjectionStateDTO::kRecorded, std::nullopt, std::nullopt};
+    cleared_latch.clear_projection = StopDurableProjectionStatusDTO{
+        StopDurableProjectionStateDTO::kRecorded, std::nullopt, std::nullopt};
+    cleared_latch.state = StopFaultLatchStateDTO::kCleared;
+    cleared_latch.recovery_assessment_revision = 3U;
+    cleared_latch.recovery_status = StopFaultRecoveryStatusDTO::kCleared;
+    cleared_latch.reason_code = "stop_fault_recovery_cleared";
+    cleared_latch.evidence_refs = {
+        StopFaultRecoveryEvidenceRefDTO{StopFaultRecoveryEvidenceKindDTO::kSettlement, Digest('e')},
+        StopFaultRecoveryEvidenceRefDTO{StopFaultRecoveryEvidenceKindDTO::kConfiguration,
+                                        Digest('f')}};
+
+    const StopFaultRecoveryIntentDTO recovery_intent{
+        PublicRequestContextDTO{RequestId("request.stop-fault-clear.1"), epoch, "journal-test",
+                                std::nullopt},
+        cleared_latch.latch_id,
+        cleared_latch.latch_generation,
+        2U,
+        terminal.certificate.stop_certificate_id,
+        terminal.certificate.stop_certificate_revision,
+        cleared_latch.cell_id,
+        cleared_latch.retained_bundle_id,
+        cleared_latch.graph_revision,
+        {StopFaultRecoveryConfigurationExpectationDTO{
+            ControlDomainId("domain.1"), ActiveControlConfigurationId("configuration.1"),
+            ActiveControlConfigurationGeneration(1U)}},
+        std::string("operator verified cell")};
+    auto resulting_status = terminal.stop_status;
+    resulting_status.terminal_projection = StopDurableProjectionStatusDTO{
+        StopDurableProjectionStateDTO::kRecorded, std::nullopt, std::nullopt};
+    resulting_status.fault_latch = cleared_latch;
+    const StopFaultRecoveryResultDTO recovery_result{recovery_intent.request_context.request_id,
+                                                     RequestReplayStatusDTO::kAcceptedNew, true,
+                                                     cleared_latch, std::nullopt};
+
+    const auto first = journal.RecordStopFaultCleared(epoch, recovery_intent, recovery_result,
+                                                      cleared_latch, resulting_status);
+    ASSERT_TRUE(first.ok()) << first.error().message;
+    const auto replay = journal.RecordStopFaultCleared(epoch, recovery_intent, recovery_result,
+                                                       cleared_latch, resulting_status);
+    ASSERT_TRUE(replay.ok()) << replay.error().message;
+    EXPECT_EQ(replay.value(), first.value());
+
+    auto conflicting_intent = recovery_intent;
+    conflicting_intent.reason = "different recovery authority";
+    const auto conflict = journal.RecordStopFaultCleared(epoch, conflicting_intent, recovery_result,
+                                                         cleared_latch, resulting_status);
+    EXPECT_FALSE(conflict.ok());
+    EXPECT_EQ(conflict.error().code, "operation_journal_stop_projection_conflict");
+
+    const auto events = journal.ReadEvents(epoch, 0U, kMaximumOperationJournalEventPage);
+    ASSERT_TRUE(events.ok()) << events.error().message;
+    EXPECT_EQ(
+        std::count_if(events.value().events.begin(), events.value().events.end(),
+                      [](const auto& event) { return event.record_kind == "stop_fault_cleared"; }),
+        1);
+    ASSERT_TRUE(journal.CloseOwnerEpoch(epoch, 100).ok());
+    expected_status = resulting_status;
+    expected_certificate = terminal.certificate;
+    expected_latch = cleared_latch;
+    journal.Close();
+  }
+
+  SqliteOperationJournal replacement(database, cell_id, 8U);
+  const auto recovered = replacement.BeginOwnerEpoch(
+      RequestOwnerEpoch("execution-host.epoch.stop-fault-clear.replacement"), 200, 8U, inventory);
+  ASSERT_TRUE(recovered.ok()) << recovered.error().message;
+  ASSERT_EQ(recovered.value().recovered_stops.size(), 1U);
+  ASSERT_TRUE(expected_status.has_value());
+  ASSERT_TRUE(expected_certificate.has_value());
+  ASSERT_TRUE(expected_latch.has_value());
+  const auto& recovered_stop = recovered.value().recovered_stops.front();
+  EXPECT_EQ(recovered_stop.accepted, expected_status->accepted);
+  EXPECT_EQ(recovered_stop.terminal_certificate, expected_certificate);
+  EXPECT_EQ(recovered_stop.fault_latch, expected_latch);
+  EXPECT_FALSE(recovered_stop.surveillance.has_value());
+  EXPECT_FALSE(recovered.value().replaced_unclosed_owner_epoch.has_value());
+  EXPECT_TRUE(recovered.value().unreconciled_resources.empty());
+}
+
 TEST(SqliteOperationJournalTest, ReusedFixedFullStopIdentityRetainsDistinctTerminalGenerations) {
   ScopedTemporaryDirectory temporary;
   const auto database = temporary.path() / std::string(kOperationJournalFilename);

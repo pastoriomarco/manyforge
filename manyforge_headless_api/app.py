@@ -9,6 +9,8 @@ import re
 import uuid
 
 from fastapi import FastAPI, Path, Query, Request
+from fastapi.exception_handlers import request_validation_exception_handler
+from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse, Response
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
@@ -19,6 +21,7 @@ from .models import (
     AcknowledgeAlarmRequest,
     AcknowledgeAllAlarmsRequest,
     ComponentLifecycleRequest,
+    FullStopIntentRequest,
     HistorianReconcileRequest,
     ManagerApplyRequest,
     ProgramApplyRequest,
@@ -33,6 +36,7 @@ from .models import (
     RouteSelectionRequest,
     SceneResourcePoseQuery,
     SceneTransactionRequest,
+    StopFaultRecoveryIntentRequest,
     StopIntentRequest,
 )
 from .native import (
@@ -42,6 +46,7 @@ from .native import (
     MAX_PROGRAM_MODEL_ATTEMPT_BYTES,
     NativeHeadlessCore,
     ViewerModelAsset,
+    strict_json_object,
 )
 from .service import HeadlessService, TrustedAttribution
 from .program_runner_client import ProgramRunnerHttpClient
@@ -76,12 +81,14 @@ class RequestBodyLimitMiddleware:
         path_maximum_bytes: dict[str, int] | None = None,
         error_code: str = "headless_request_body_oversized",
         error_message: str = "request body exceeds the configured byte bound",
+        recognized_stop_paths: frozenset[str] = frozenset(),
     ) -> None:
         self.app = app
         self.maximum_bytes = maximum_bytes
         self.path_maximum_bytes = path_maximum_bytes or {}
         self.error_code = error_code
         self.error_message = error_message
+        self.recognized_stop_paths = recognized_stop_paths
 
     async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
         if scope["type"] != "http":
@@ -90,33 +97,75 @@ class RequestBodyLimitMiddleware:
         maximum_bytes = self.path_maximum_bytes.get(
             str(scope.get("path", "")), self.maximum_bytes
         )
+        recognized_stop = (
+            scope.get("method") == "POST"
+            and scope.get("path") in self.recognized_stop_paths
+        )
+
+        def mark_malformed(reason: str, *, close_connection: bool) -> None:
+            state = scope.setdefault("state", {})
+            state["recognized_stop_malformed_reason"] = reason
+            if close_connection:
+                state["recognized_stop_close_connection"] = True
+
         headers = dict(scope.get("headers", ()))
         raw_length = headers.get(b"content-length")
+        declared_oversized = False
         if raw_length is not None:
             try:
                 declared = int(raw_length)
             except ValueError:
                 await self._reject(scope, receive, send)
                 return
-            if declared < 0 or declared > maximum_bytes:
+            if declared < 0:
                 await self._reject(scope, receive, send)
                 return
+            if declared > maximum_bytes:
+                if not recognized_stop:
+                    await self._reject(scope, receive, send)
+                    return
+                mark_malformed(
+                    "recognized_stop_body_oversized", close_connection=True
+                )
+                declared_oversized = True
 
         body = bytearray()
         disconnected = False
-        while True:
-            message = await receive()
-            if message["type"] == "http.disconnect":
-                disconnected = True
-                break
-            if message["type"] != "http.request":
-                continue
-            body.extend(message.get("body", b""))
-            if len(body) > maximum_bytes:
-                await self._reject(scope, receive, send)
-                return
-            if not message.get("more_body", False):
-                break
+        if declared_oversized:
+            body.extend(b"{}")
+        else:
+            while True:
+                message = await receive()
+                if message["type"] == "http.disconnect":
+                    disconnected = True
+                    break
+                if message["type"] != "http.request":
+                    continue
+                body.extend(message.get("body", b""))
+                if len(body) > maximum_bytes:
+                    if not recognized_stop:
+                        await self._reject(scope, receive, send)
+                        return
+                    mark_malformed(
+                        "recognized_stop_body_oversized", close_connection=True
+                    )
+                    body.clear()
+                    body.extend(b"{}")
+                    break
+                if not message.get("more_body", False):
+                    break
+
+        if recognized_stop and not declared_oversized and not disconnected:
+            try:
+                strict_json_object(
+                    bytes(body).decode("utf-8"), label="recognized Stop request"
+                )
+            except (HeadlessApiError, UnicodeError):
+                mark_malformed(
+                    "recognized_stop_payload_invalid", close_connection=False
+                )
+                body.clear()
+                body.extend(b"{}")
 
         delivered = False
 
@@ -340,6 +389,9 @@ def create_app(
             "/api/program/apply": MAX_PROGRAM_APPLY_REQUEST_BYTES,
             "/api/program/model-attempts": MAX_PROGRAM_MODEL_ATTEMPT_BYTES,
         },
+        recognized_stop_paths=frozenset(
+            {"/api/execution/stops", "/api/execution/full-stop"}
+        ),
     )
 
     @app.middleware("http")
@@ -366,6 +418,38 @@ def create_app(
                 }
             },
         )
+
+    @app.exception_handler(RequestValidationError)
+    async def request_validation_handler(
+        request: Request,
+        error: RequestValidationError,
+    ) -> Response:
+        if request.method == "POST" and request.url.path in {
+            "/api/execution/stops",
+            "/api/execution/full-stop",
+        }:
+            reason = getattr(
+                request.state,
+                "recognized_stop_malformed_reason",
+                "recognized_stop_payload_invalid",
+            )
+            adapter_request_id = (
+                "malformed-stop." + getattr(request.state, "request_id", uuid.uuid4().hex[:16])
+            )
+            response = execution_response(
+                service.execution_recognized_malformed_stop(
+                    request_id=adapter_request_id,
+                    recognized_route=request.url.path,
+                    reason=reason,
+                    attribution=_trusted_attribution(
+                        request, trusted_principal_adapter
+                    ),
+                )
+            )
+            if getattr(request.state, "recognized_stop_close_connection", False):
+                response.headers["Connection"] = "close"
+            return response
+        return await request_validation_exception_handler(request, error)
 
     @app.get("/api/health")
     def health() -> dict[str, Any]:
@@ -771,6 +855,27 @@ def create_app(
                 body, _trusted_attribution(request, trusted_principal_adapter)
             )
         )
+
+    @app.post("/api/execution/full-stop")
+    def execution_full_stop(
+        body: FullStopIntentRequest,
+        request: Request,
+    ) -> JSONResponse:
+        return execution_response(
+            service.execution_full_stop(
+                body, _trusted_attribution(request, trusted_principal_adapter)
+            )
+        )
+
+    @app.get("/api/execution/stop-fault")
+    def execution_stop_fault() -> JSONResponse:
+        return execution_response(service.execution_stop_fault())
+
+    @app.post("/api/execution/stop-fault/recover")
+    def execution_recover_stop_fault(
+        body: StopFaultRecoveryIntentRequest,
+    ) -> JSONResponse:
+        return execution_response(service.execution_recover_stop_fault(body))
 
     @app.post("/api/execution/operations/{operation_id}/runtime-scale")
     def execution_set_runtime_scale(

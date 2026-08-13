@@ -1567,21 +1567,126 @@ DecodeOperationControlRequest(const CanonicalValue &value,
 [[nodiscard]] core::StopIntentDTO
 DecodeStopIntent(const CanonicalValue &value,
                  const core::RequestAttributionDTO &attribution) {
-  RequireExactObjectSize(value, 3U, "Stop intent");
-  const auto &operations = Array(value, "operations");
-  Require(operations.size() == 1U,
-          "N4 admits exactly one operation in ordinary Stop intent");
-  const auto &target = operations.front();
-  RequireExactObjectSize(target, 3U, "Stop operation target");
-  return core::StopIntentDTO{
-      DecodeRequestContext(Member(value, "request_context")),
-      std::vector<core::StopOperationTargetDTO>{core::StopOperationTargetDTO{
+  Require(value.is_object() && (value.as_object().size() == 2U ||
+                                value.as_object().size() == 3U),
+          "Stop intent has an unknown or missing field");
+  const auto selector_count =
+      static_cast<std::size_t>(value.find_object_member("operations") !=
+                               nullptr) +
+      static_cast<std::size_t>(value.find_object_member("components") !=
+                               nullptr) +
+      static_cast<std::size_t>(value.find_object_member("resources") !=
+                               nullptr);
+  Require(selector_count == 1U,
+          "Stop intent must contain exactly one selector kind");
+  core::StopSelectorDTO selector;
+  if (value.find_object_member("operations") != nullptr) {
+    std::vector<core::StopOperationTargetDTO> targets;
+    const auto &rows = Array(value, "operations");
+    Require(!rows.empty() && rows.size() <= core::kMaximumStopSelectorTargets,
+            "Stop operation selector exceeds its row bound");
+    targets.reserve(rows.size());
+    for (const auto &target : rows) {
+      RequireExactObjectSize(target, 3U, "Stop operation target");
+      targets.push_back(core::StopOperationTargetDTO{
           core::OperationId(Text(target, "operation_id")),
           core::OperationRevision(
               Counter(target, "expected_operation_revision", 1U)),
           core::StopGeneration(
-              Counter(target, "expected_stop_generation", 0U))}},
-      OptionalBoundedText(value, "reason", kMaximumReasonBytes), attribution};
+              Counter(target, "expected_stop_generation", 0U))});
+    }
+    selector = std::move(targets);
+  } else if (value.find_object_member("components") != nullptr) {
+    std::vector<core::StopComponentTargetDTO> targets;
+    const auto &rows = Array(value, "components");
+    Require(!rows.empty() && rows.size() <= core::kMaximumStopSelectorTargets,
+            "Stop component selector exceeds its row bound");
+    targets.reserve(rows.size());
+    for (const auto &target : rows) {
+      RequireExactObjectSize(target, 3U, "Stop component target");
+      targets.push_back(core::StopComponentTargetDTO{
+          core::ControllableComponentId(
+              Text(target, "controllable_component_id")),
+          core::GraphRevision(Text(target, "expected_graph_revision")),
+          core::ComponentLifecycleGeneration(
+              Counter(target, "expected_component_lifecycle_generation", 1U))});
+    }
+    selector = std::move(targets);
+  } else {
+    std::vector<core::StopResourceTargetDTO> targets;
+    const auto &rows = Array(value, "resources");
+    Require(!rows.empty() && rows.size() <= core::kMaximumStopSelectorTargets,
+            "Stop resource selector exceeds its row bound");
+    targets.reserve(rows.size());
+    for (const auto &target : rows) {
+      RequireExactObjectSize(target, 4U, "Stop resource target");
+      targets.push_back(core::StopResourceTargetDTO{
+          core::ResourceId(Text(target, "resource_id")),
+          core::GraphRevision(Text(target, "expected_graph_revision")),
+          Counter(target, "expected_operation_resource_generation", 0U),
+          core::StopGeneration(
+              Counter(target, "expected_stop_generation", 0U))});
+    }
+    selector = std::move(targets);
+  }
+  std::optional<std::string> reason;
+  if (value.find_object_member("reason") != nullptr) {
+    reason = OptionalBoundedText(value, "reason", kMaximumReasonBytes);
+  }
+  return core::StopIntentDTO{
+      DecodeRequestContext(Member(value, "request_context")),
+      std::move(selector), std::move(reason), attribution};
+}
+
+[[nodiscard]] core::FullStopIntentDTO
+DecodeFullStopIntent(const CanonicalValue &value,
+                     const core::RequestAttributionDTO &attribution) {
+  RequireExactObjectSize(value, 2U, "Full Stop intent");
+  return core::FullStopIntentDTO{
+      DecodeRequestContext(Member(value, "request_context")),
+      core::StopGeneration(Counter(value, "expected_stop_generation", 0U)),
+      attribution};
+}
+
+[[nodiscard]] core::StopFaultRecoveryIntentDTO
+DecodeStopFaultRecoveryIntent(const CanonicalValue &value) {
+  Require(value.is_object() && (value.as_object().size() == 10U ||
+                                value.as_object().size() == 11U),
+          "Stop fault-recovery intent has an unknown or missing field");
+  std::vector<core::StopFaultRecoveryConfigurationExpectationDTO> expectations;
+  const auto &rows = Array(value, "configuration_expectations");
+  Require(!rows.empty() &&
+              rows.size() <= core::kMaximumStopFaultRecoveryEvidenceRefs,
+          "Stop fault-recovery configuration table exceeds its row bound");
+  expectations.reserve(rows.size());
+  for (const auto &row : rows) {
+    RequireExactObjectSize(row, 3U,
+                           "Stop fault-recovery configuration expectation");
+    expectations.push_back(core::StopFaultRecoveryConfigurationExpectationDTO{
+        core::ControlDomainId(Text(row, "control_domain_id")),
+        core::ActiveControlConfigurationId(
+            Text(row, "active_control_configuration_id")),
+        core::ActiveControlConfigurationGeneration(
+            Counter(row, "active_control_configuration_generation", 1U))});
+  }
+  std::optional<std::string> reason;
+  if (value.find_object_member("reason") != nullptr) {
+    reason = OptionalBoundedText(value, "reason", kMaximumReasonBytes);
+  }
+  return core::StopFaultRecoveryIntentDTO{
+      DecodeRequestContext(Member(value, "request_context")),
+      core::StopFaultLatchId(Text(value, "expected_latch_id")),
+      core::StopFaultLatchGeneration(
+          Counter(value, "expected_latch_generation", 1U)),
+      Counter(value, "expected_recovery_assessment_revision", 1U),
+      core::StopCertificateId(Text(value, "expected_stop_certificate_id")),
+      core::StopCertificateRevision(
+          Counter(value, "expected_stop_certificate_revision", 1U)),
+      core::CellId(Text(value, "expected_cell_id")),
+      core::RetainedBundleId(Text(value, "expected_retained_bundle_id")),
+      core::GraphRevision(Text(value, "expected_graph_revision")),
+      std::move(expectations),
+      std::move(reason)};
 }
 
 [[nodiscard]] core::RuntimeScaleRequestDTO
@@ -1614,6 +1719,10 @@ enum class CommandKind {
   kReset,
   kAcknowledgeCompleted,
   kStop,
+  kFullStop,
+  kMalformedStop,
+  kGetStopFault,
+  kRecoverStopFault,
   kSetRuntimeScale,
   kGetRuntimeScale,
   kPlanPick,
@@ -1621,6 +1730,13 @@ enum class CommandKind {
   kStartPick,
   kStartPlace,
   kReadPickPlaceSequence,
+};
+
+struct MalformedStopCommand final {
+  core::RequestId request_id;
+  core::RequestAttributionDTO attribution;
+  std::string recognized_route;
+  std::string reason;
 };
 
 struct Command final {
@@ -1632,6 +1748,9 @@ struct Command final {
   std::optional<core::OperationId> operation_id;
   std::optional<core::OperationControlRequestDTO> control;
   std::optional<core::StopIntentDTO> stop;
+  std::optional<core::FullStopIntentDTO> full_stop;
+  std::optional<MalformedStopCommand> malformed_stop;
+  std::optional<core::StopFaultRecoveryIntentDTO> stop_fault_recovery;
   std::optional<core::RuntimeScaleRequestDTO> runtime_scale;
   std::optional<core::RequestOwnerEpoch> event_owner_epoch{};
   std::uint64_t after_sequence{};
@@ -1764,6 +1883,39 @@ struct Command final {
         DecodeRequestAttribution(Member(root, "attribution"));
     Command decoded{CommandKind::kStop};
     decoded.stop = DecodeStopIntent(Member(root, "request"), attribution);
+    return decoded;
+  }
+  if (command == "full_stop") {
+    RequireExactObjectSize(root, 4U, "Full Stop command");
+    const auto attribution =
+        DecodeRequestAttribution(Member(root, "attribution"));
+    Command decoded{CommandKind::kFullStop};
+    decoded.full_stop =
+        DecodeFullStopIntent(Member(root, "request"), attribution);
+    return decoded;
+  }
+  if (command == "malformed_stop") {
+    RequireExactObjectSize(root, 6U, "recognized malformed Stop command");
+    const auto route = Text(root, "recognized_route");
+    Require(route == "/api/execution/stops" ||
+                route == "/api/execution/full-stop",
+            "recognized malformed Stop command names an unknown route");
+    Command decoded{CommandKind::kMalformedStop};
+    decoded.malformed_stop = MalformedStopCommand{
+        core::RequestId(Text(root, "request_id")),
+        DecodeRequestAttribution(Member(root, "attribution")), route,
+        Text(root, "reason")};
+    return decoded;
+  }
+  if (command == "get_stop_fault") {
+    RequireExactObjectSize(root, 2U, "Stop-fault query command");
+    return Command{CommandKind::kGetStopFault};
+  }
+  if (command == "recover_stop_fault") {
+    RequireExactObjectSize(root, 3U, "Stop-fault recovery command");
+    Command decoded{CommandKind::kRecoverStopFault};
+    decoded.stop_fault_recovery =
+        DecodeStopFaultRecoveryIntent(Member(root, "request"));
     return decoded;
   }
   if (command == "set_runtime_scale") {
@@ -2484,6 +2636,213 @@ StopAcceptedValue(const core::StopAcceptedDTO &value) {
       {"stop_generation",
        CanonicalValue(static_cast<double>(value.stop_generation.value()))},
       {"stop_id", CanonicalValue(value.stop_id.value())},
+  });
+}
+
+[[nodiscard]] std::string_view StopProjectionStateName(
+    const core::StopDurableProjectionStateDTO state) noexcept {
+  switch (state) {
+  case core::StopDurableProjectionStateDTO::kNotApplicable:
+    return "not_applicable";
+  case core::StopDurableProjectionStateDTO::kPending:
+    return "pending";
+  case core::StopDurableProjectionStateDTO::kRecorded:
+    return "recorded";
+  case core::StopDurableProjectionStateDTO::kFailed:
+    return "failed";
+  }
+  return "unknown";
+}
+
+[[nodiscard]] std::string_view
+StopFaultTriggerName(const core::StopFaultTriggerDTO trigger) noexcept {
+  switch (trigger) {
+  case core::StopFaultTriggerDTO::kScopePromotion:
+    return "scope_promotion";
+  case core::StopFaultTriggerDTO::kEscalated:
+    return "escalated";
+  case core::StopFaultTriggerDTO::kPartial:
+    return "partial";
+  case core::StopFaultTriggerDTO::kFailedUncontained:
+    return "failed_uncontained";
+  case core::StopFaultTriggerDTO::kPhysicalRestUnproven:
+    return "physical_rest_unproven";
+  case core::StopFaultTriggerDTO::kPersistenceDegraded:
+    return "persistence_degraded";
+  }
+  return "unknown";
+}
+
+[[nodiscard]] std::string_view
+StopFaultLatchStateName(const core::StopFaultLatchStateDTO state) noexcept {
+  switch (state) {
+  case core::StopFaultLatchStateDTO::kLatched:
+    return "latched";
+  case core::StopFaultLatchStateDTO::kRecoveryPending:
+    return "recovery_pending";
+  case core::StopFaultLatchStateDTO::kCleared:
+    return "cleared";
+  }
+  return "unknown";
+}
+
+[[nodiscard]] std::string_view StopFaultRecoveryStatusName(
+    const core::StopFaultRecoveryStatusDTO status) noexcept {
+  switch (status) {
+  case core::StopFaultRecoveryStatusDTO::kWaitingForObservation:
+    return "waiting_for_observation";
+  case core::StopFaultRecoveryStatusDTO::kWaitingForQuiescence:
+    return "waiting_for_quiescence";
+  case core::StopFaultRecoveryStatusDTO::kWaitingForConfiguration:
+    return "waiting_for_configuration";
+  case core::StopFaultRecoveryStatusDTO::kWaitingForExternalReconciliation:
+    return "waiting_for_external_reconciliation";
+  case core::StopFaultRecoveryStatusDTO::kWaitingForDurableRecord:
+    return "waiting_for_durable_record";
+  case core::StopFaultRecoveryStatusDTO::kReady:
+    return "ready";
+  case core::StopFaultRecoveryStatusDTO::kRecoveryPending:
+    return "recovery_pending";
+  case core::StopFaultRecoveryStatusDTO::kCleared:
+    return "cleared";
+  }
+  return "unknown";
+}
+
+[[nodiscard]] std::string_view StopFaultRecoveryEvidenceKindName(
+    const core::StopFaultRecoveryEvidenceKindDTO kind) noexcept {
+  switch (kind) {
+  case core::StopFaultRecoveryEvidenceKindDTO::kSettlement:
+    return "settlement";
+  case core::StopFaultRecoveryEvidenceKindDTO::kLateQuiescence:
+    return "late_quiescence";
+  case core::StopFaultRecoveryEvidenceKindDTO::kConfiguration:
+    return "configuration";
+  case core::StopFaultRecoveryEvidenceKindDTO::kExternalReconciliation:
+    return "external_reconciliation";
+  case core::StopFaultRecoveryEvidenceKindDTO::kBackendOrLifecycleReset:
+    return "backend_or_lifecycle_reset";
+  }
+  return "unknown";
+}
+
+[[nodiscard]] CanonicalValue
+StopCertificateRefValue(const core::StopCertificateRefDTO &value) {
+  return CanonicalValue(CanonicalValue::Object{
+      {"stop_certificate_id",
+       CanonicalValue(value.stop_certificate_id.value())},
+      {"stop_certificate_revision",
+       CanonicalValue(
+           static_cast<double>(value.stop_certificate_revision.value()))},
+      {"stop_generation",
+       CanonicalValue(static_cast<double>(value.stop_generation.value()))},
+      {"stop_id", CanonicalValue(value.stop_id.value())},
+  });
+}
+
+[[nodiscard]] CanonicalValue
+StopProjectionStatusValue(const core::StopDurableProjectionStatusDTO &value) {
+  return CanonicalValue(CanonicalValue::Object{
+      {"error", value.error.has_value() ? ErrorValue(*value.error)
+                                        : CanonicalValue(nullptr)},
+      {"retry_generation",
+       value.retry_generation.has_value()
+           ? CanonicalValue(static_cast<double>(*value.retry_generation))
+           : CanonicalValue(nullptr)},
+      {"state",
+       CanonicalValue(std::string(StopProjectionStateName(value.state)))},
+  });
+}
+
+[[nodiscard]] CanonicalValue
+StopFaultLatchValue(const core::StopFaultLatchDTO &value) {
+  CanonicalValue::Array captured_operations;
+  captured_operations.reserve(value.captured_operation_ids.size());
+  for (const auto &operation : value.captured_operation_ids) {
+    captured_operations.emplace_back(operation.value());
+  }
+  CanonicalValue::Array captured_resources;
+  captured_resources.reserve(value.captured_resources.size());
+  for (const auto &resource : value.captured_resources) {
+    captured_resources.emplace_back(resource.value());
+  }
+  CanonicalValue::Array evidence_refs;
+  evidence_refs.reserve(value.evidence_refs.size());
+  for (const auto &evidence : value.evidence_refs) {
+    evidence_refs.emplace_back(CanonicalValue::Object{
+        {"evidence_digest", CanonicalValue(evidence.evidence_digest.value())},
+        {"kind", CanonicalValue(std::string(
+                     StopFaultRecoveryEvidenceKindName(evidence.kind)))},
+    });
+  }
+  return CanonicalValue(CanonicalValue::Object{
+      {"captured_operation_ids",
+       CanonicalValue(std::move(captured_operations))},
+      {"captured_resources", CanonicalValue(std::move(captured_resources))},
+      {"cell_id", CanonicalValue(value.cell_id.value())},
+      {"clear_projection", StopProjectionStatusValue(value.clear_projection)},
+      {"evidence_refs", CanonicalValue(std::move(evidence_refs))},
+      {"graph_revision", CanonicalValue(value.graph_revision.value())},
+      {"latch_generation",
+       CanonicalValue(static_cast<double>(value.latch_generation.value()))},
+      {"latch_id", CanonicalValue(value.latch_id.value())},
+      {"persistence_degraded", CanonicalValue(value.persistence_degraded)},
+      {"reason_code", CanonicalValue(value.reason_code)},
+      {"recovery_assessment_revision",
+       CanonicalValue(static_cast<double>(value.recovery_assessment_revision))},
+      {"recovery_status",
+       CanonicalValue(
+           std::string(StopFaultRecoveryStatusName(value.recovery_status)))},
+      {"retained_bundle_id", CanonicalValue(value.retained_bundle_id.value())},
+      {"state",
+       CanonicalValue(std::string(StopFaultLatchStateName(value.state)))},
+      {"stop_certificate",
+       value.stop_certificate.has_value()
+           ? StopCertificateRefValue(*value.stop_certificate)
+           : CanonicalValue(nullptr)},
+      {"stop_generation",
+       CanonicalValue(static_cast<double>(value.stop_generation.value()))},
+      {"stop_id", CanonicalValue(value.stop_id.value())},
+      {"terminal_projection",
+       StopProjectionStatusValue(value.terminal_projection)},
+      {"trigger",
+       CanonicalValue(std::string(StopFaultTriggerName(value.trigger)))},
+  });
+}
+
+[[nodiscard]] CanonicalValue
+StopFaultOfferValue(const core::StopFaultRecoveryOfferDTO &offer) {
+  Require(!core::stop_fault_recovery_offer_field_error(offer).has_value(),
+          "Stop-fault offer is not a valid atomic owner projection");
+  CanonicalValue::Array rows;
+  rows.reserve(offer.configuration_expectations.size());
+  for (const auto &expectation : offer.configuration_expectations) {
+    rows.emplace_back(CanonicalValue::Object{
+        {"active_control_configuration_generation",
+         CanonicalValue(static_cast<double>(
+             expectation.active_control_configuration_generation.value()))},
+        {"active_control_configuration_id",
+         CanonicalValue(expectation.active_control_configuration_id.value())},
+        {"control_domain_id",
+         CanonicalValue(expectation.control_domain_id.value())},
+    });
+  }
+  return CanonicalValue(CanonicalValue::Object{
+      {"configuration_expectations", CanonicalValue(std::move(rows))},
+      {"latch", StopFaultLatchValue(offer.latch)},
+  });
+}
+
+[[nodiscard]] CanonicalValue
+StopFaultRecoveryResultValue(const core::StopFaultRecoveryResultDTO &value) {
+  return CanonicalValue(CanonicalValue::Object{
+      {"accepted", CanonicalValue(value.accepted)},
+      {"error", value.error.has_value() ? ErrorValue(*value.error)
+                                        : CanonicalValue(nullptr)},
+      {"latch", StopFaultLatchValue(value.latch)},
+      {"replay_status",
+       CanonicalValue(std::string(core::to_string(value.replay_status)))},
+      {"request_id", CanonicalValue(value.request_id.value())},
   });
 }
 
@@ -5406,10 +5765,31 @@ private:
 
   [[nodiscard]] CanonicalValue ExecuteStop(const Command &command,
                                            Composition &composition) {
-    Require(command.kind == CommandKind::kStop && command.stop.has_value(),
-            "execution Stop control lane accepts only a complete Stop command");
-    const auto result =
-        composition.runtime->addressed_kernel->stop(*command.stop);
+    const bool ordinary =
+        command.kind == CommandKind::kStop && command.stop.has_value();
+    const bool full =
+        command.kind == CommandKind::kFullStop && command.full_stop.has_value();
+    const bool malformed = command.kind == CommandKind::kMalformedStop &&
+                           command.malformed_stop.has_value();
+    Require(static_cast<unsigned>(ordinary) + static_cast<unsigned>(full) +
+                    static_cast<unsigned>(malformed) ==
+                1U,
+            "execution Stop control lane accepts one complete Stop command");
+    const auto result = [&] {
+      if (ordinary) {
+        return composition.runtime->addressed_kernel->stop(*command.stop);
+      }
+      if (full) {
+        return composition.runtime->addressed_kernel->full_stop(
+            *command.full_stop);
+      }
+      return composition.runtime->addressed_kernel->recognized_malformed_stop(
+          core::MalformedStopIngressDTO{
+              command.malformed_stop->request_id, owner_epoch_,
+              command.malformed_stop->attribution,
+              command.malformed_stop->recognized_route,
+              command.malformed_stop->reason});
+    }();
     if (!result.ok()) {
       return CanonicalValue(CanonicalValue::Object{
           {"api_version", CanonicalValue(std::string(kResponseApiVersion))},
@@ -5420,7 +5800,7 @@ private:
     return CanonicalValue(CanonicalValue::Object{
         {"accepted", StopAcceptedValue(result.value())},
         {"api_version", CanonicalValue(std::string(kResponseApiVersion))},
-        {"command", CanonicalValue("stop")},
+        {"command", CanonicalValue(full ? "full_stop" : "stop")},
         {"ok", CanonicalValue(true)},
     });
   }
@@ -5448,8 +5828,55 @@ private:
           {"ok", CanonicalValue(true)},
       });
     }
-    if (command.kind == CommandKind::kStop) {
+    if (command.kind == CommandKind::kStop ||
+        command.kind == CommandKind::kFullStop ||
+        command.kind == CommandKind::kMalformedStop) {
       return ExecuteStop(command, composition);
+    }
+    if (command.kind == CommandKind::kGetStopFault) {
+      const auto offer = composition.runtime->addressed_kernel
+                             ->get_stop_fault_recovery_offer();
+      if (!offer.ok()) {
+        return CanonicalValue(CanonicalValue::Object{
+            {"api_version", CanonicalValue(std::string(kResponseApiVersion))},
+            {"error", ErrorValue(offer.error())},
+            {"ok", CanonicalValue(false)},
+        });
+      }
+      if (!offer.value().has_value()) {
+        return CanonicalValue(CanonicalValue::Object{
+            {"api_version", CanonicalValue(std::string(kResponseApiVersion))},
+            {"command", CanonicalValue("get_stop_fault")},
+            {"ok", CanonicalValue(true)},
+            {"stop_fault", CanonicalValue(nullptr)},
+        });
+      }
+      return CanonicalValue(CanonicalValue::Object{
+          {"api_version", CanonicalValue(std::string(kResponseApiVersion))},
+          {"command", CanonicalValue("get_stop_fault")},
+          {"ok", CanonicalValue(true)},
+          {"stop_fault", StopFaultOfferValue(*offer.value())},
+      });
+    }
+    if (command.kind == CommandKind::kRecoverStopFault) {
+      Require(command.stop_fault_recovery.has_value(),
+              "Stop-fault recovery command has no complete intent");
+      const auto result =
+          composition.runtime->addressed_kernel->recover_stop_fault(
+              *command.stop_fault_recovery);
+      if (!result.ok()) {
+        return CanonicalValue(CanonicalValue::Object{
+            {"api_version", CanonicalValue(std::string(kResponseApiVersion))},
+            {"error", ErrorValue(result.error())},
+            {"ok", CanonicalValue(false)},
+        });
+      }
+      return CanonicalValue(CanonicalValue::Object{
+          {"api_version", CanonicalValue(std::string(kResponseApiVersion))},
+          {"command", CanonicalValue("recover_stop_fault")},
+          {"ok", CanonicalValue(true)},
+          {"result", StopFaultRecoveryResultValue(result.value())},
+      });
     }
     if (last_reconcile_error_.has_value()) {
       return CanonicalValue(CanonicalValue::Object{
@@ -5730,6 +6157,10 @@ private:
       case CommandKind::kSubmit:
       case CommandKind::kRead:
       case CommandKind::kStop:
+      case CommandKind::kFullStop:
+      case CommandKind::kMalformedStop:
+      case CommandKind::kGetStopFault:
+      case CommandKind::kRecoverStopFault:
       case CommandKind::kSetRuntimeScale:
       case CommandKind::kGetRuntimeScale:
       case CommandKind::kPlanPick:

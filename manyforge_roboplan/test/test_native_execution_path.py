@@ -1506,6 +1506,130 @@ def test_first_complete_addressed_native_motion_path(tmp_path: Path) -> None:
         assert durable_stop_event["operation_revision"] is None
         assert durable_stop_event["payload"] == durable_stop_payload
 
+        # Exercise the complete recognized-malformed ingress and durable
+        # recovery boundary through the production HTTP/native/SQLite path.
+        # The first Stop above is released before starting new work so the
+        # malformed request must contain a genuinely live operation rather
+        # than an idle snapshot.
+        runner.reset_operation(
+            request_id="reset-controlled-operation",
+            operation_id=controlled_id,
+            expected_operation_revision=stopped["operation_revision"],
+            reason="release first stopped operation",
+            correlation_id="n4-public-control-test",
+        )
+        malformed_operation = _runner_submission(
+            runner,
+            request_id="native-malformed-stop-operation",
+            joint_names=("joint1",),
+            positions=(-0.55,),
+        )
+        malformed_operation_id = malformed_operation["accepted"]["operation_id"]
+        _wait_state(runner, malformed_operation_id, {"executing"})
+        malformed_response = raw_api.post(
+            "/api/execution/stops",
+            content=b'{"operations":[',
+            headers={
+                "Content-Type": "application/json",
+                "X-Request-ID": "native-malformed-stop",
+            },
+        )
+        assert malformed_response.status_code == 200, malformed_response.text
+        malformed_acceptance = malformed_response.json()["accepted"]
+        assert malformed_acceptance["request_id"] == (
+            "malformed-stop.native-malformed-stop"
+        )
+        assert malformed_acceptance["resolution_disposition"] == (
+            "promoted_to_full"
+        )
+        assert malformed_acceptance["resolution_reason"] == (
+            "malformed_or_unknown_selector"
+        )
+        malformed_terminal = _wait_terminal(
+            runner, malformed_operation_id
+        )["operation"]
+        assert malformed_terminal["state"] == "stopped"
+        assert malformed_terminal["active_stop_id"] == malformed_acceptance[
+            "stop_id"
+        ]
+
+        with sqlite3.connect(
+            execution_root / "operation-journal.sqlite3"
+        ) as database:
+            malformed_row = database.execute(
+                "SELECT payload_json FROM journal_records WHERE request_id=? "
+                "AND record_kind='stop_acceptance_projected'",
+                ("malformed-stop.native-malformed-stop",),
+            ).fetchone()
+        assert malformed_row is not None
+        malformed_payload = json.loads(malformed_row[0])
+        assert malformed_payload["acceptance"]["malformed_ingress_reason"] == (
+            "recognized_stop_payload_invalid"
+        )
+        assert malformed_payload["acceptance"]["normalized_request_digest"] is None
+        assert malformed_payload["intent"] is None
+
+        recovery_deadline = time.monotonic() + 10.0
+        recovered_result: dict[str, Any] | None = None
+        recovery_attempt = 0
+        while time.monotonic() < recovery_deadline:
+            offer = headless.stop_fault()["stop_fault"]
+            if offer is None:
+                break
+            latch = offer["latch"]
+            certificate = latch["stop_certificate"]
+            recovery_attempt += 1
+            recovery_body = {
+                "request_context": {
+                    "request_id": f"recover-native-malformed-{recovery_attempt}",
+                    "request_owner_epoch": first_status["owner_epoch"],
+                    "source_label": "headless_process_test",
+                    "correlation_id": "native-malformed-stop-recovery",
+                },
+                "expected_latch_id": latch["latch_id"],
+                "expected_latch_generation": latch["latch_generation"],
+                "expected_recovery_assessment_revision": latch[
+                    "recovery_assessment_revision"
+                ],
+                "expected_stop_certificate_id": certificate[
+                    "stop_certificate_id"
+                ],
+                "expected_stop_certificate_revision": certificate[
+                    "stop_certificate_revision"
+                ],
+                "expected_cell_id": latch["cell_id"],
+                "expected_retained_bundle_id": latch["retained_bundle_id"],
+                "expected_graph_revision": latch["graph_revision"],
+                "configuration_expectations": offer[
+                    "configuration_expectations"
+                ],
+                "reason": "operator verified post-Stop cell truth",
+            }
+            recovered_result = headless.recover_stop_fault(recovery_body)[
+                "result"
+            ]
+            if recovered_result["accepted"]:
+                break
+            time.sleep(0.05)
+        assert recovered_result is not None
+        assert recovered_result["accepted"] is True, recovered_result
+        assert recovered_result["latch"]["state"] == "cleared"
+        assert headless.stop_fault()["stop_fault"] is None
+        with sqlite3.connect(
+            execution_root / "operation-journal.sqlite3"
+        ) as database:
+            clear_rows = database.execute(
+                "SELECT payload_json FROM journal_records "
+                "WHERE record_kind='stop_fault_cleared' AND stop_id=?",
+                (malformed_acceptance["stop_id"],),
+            ).fetchall()
+        assert len(clear_rows) == 1
+        durable_clear = json.loads(clear_rows[0][0])
+        assert durable_clear[0] == (
+            "manyforge.internal.stop-journal-fault-clear-projection.v1"
+        )
+        assert durable_clear[2][0] == recovered_result["request_id"]
+
         # N7-b exercises the largest maintained page through the real
         # SOCK_SEQPACKET boundary. The preceding maintained workflow has
         # produced more than one page; this is not a synthetic event source.

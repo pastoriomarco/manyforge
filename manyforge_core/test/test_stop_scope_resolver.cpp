@@ -140,6 +140,31 @@ TEST(StopScopeResolverTest, ResolvesExactOperationWithoutWideningToIndependentWo
   EXPECT_TRUE(result.value().stale_diagnostics.empty());
 }
 
+TEST(StopScopeResolverTest, MalformedIngressSelectorIdentityIsStableAndRouteBound) {
+  const MalformedStopIngressDTO ingress{
+      RequestId("malformed-stop.http.1"), RequestOwnerEpoch("kernel.epoch.current"),
+      RequestAttributionDTO{RequestTransportDTO::kHttp, RequestAssuranceDTO::kUnverified,
+                            std::nullopt},
+      "/api/execution/stops", "recognized_stop_payload_invalid"};
+  EXPECT_EQ(malformed_stop_ingress_field_error(ingress), std::nullopt);
+  const auto first = ComputeRequestedStopSelectorDigest(ingress);
+  const auto second = ComputeRequestedStopSelectorDigest(ingress);
+  ASSERT_TRUE(first.ok()) << first.error().message;
+  ASSERT_TRUE(second.ok()) << second.error().message;
+  EXPECT_EQ(first.value(), second.value());
+
+  auto other_route = ingress;
+  other_route.recognized_route = "/api/execution/full-stop";
+  const auto changed = ComputeRequestedStopSelectorDigest(other_route);
+  ASSERT_TRUE(changed.ok()) << changed.error().message;
+  EXPECT_NE(changed.value(), first.value());
+
+  auto unknown_reason = ingress;
+  unknown_reason.reason = "caller_supplied_reason";
+  EXPECT_EQ(malformed_stop_ingress_field_error(unknown_reason),
+            "malformed_stop_ingress_reason_invalid");
+}
+
 TEST(StopScopeResolverTest, ComponentAndResourceSelectorsExpandCoordinatedOperation) {
   auto snapshot = independent_snapshot();
   snapshot.operations = {StopScopeOperationSnapshotDTO{
@@ -625,11 +650,10 @@ TEST(StopScopeResolverTest, RetainsDispatchPlanAcrossControlRevisionsAndRejectsM
   ASSERT_TRUE(resolution.ok());
   auto control_advanced_plan = prepared_plan();
   control_advanced_plan.operation_revision = OperationRevision(2U);
-  auto accepted =
-      MakeStopAccepted(intent, StopId("stop.8"), StopGeneration(8U), resolution.value(),
-                       {{OperationId("operation.a"), OperationRevision(4U)}}, fixed_budget(), 800,
-                       100,
-                       std::span<const PreparedParticipantStopPlanDTO>(&control_advanced_plan, 1U));
+  auto accepted = MakeStopAccepted(
+      intent, StopId("stop.8"), StopGeneration(8U), resolution.value(),
+      {{OperationId("operation.a"), OperationRevision(4U)}}, fixed_budget(), 800, 100,
+      std::span<const PreparedParticipantStopPlanDTO>(&control_advanced_plan, 1U));
   ASSERT_TRUE(accepted.ok()) << accepted.error().message;
 
   auto wrong_revision = prepared_plan();

@@ -14,6 +14,9 @@ MAX_REASON_BYTES = 4096
 MAX_BULK_MEMBERS = 256
 MAX_SCENE_POSE_QUERY_RESOURCES = 128
 MAX_PROGRAM_RUN_REASON_BYTES = 4096
+MAX_STOP_IDENTITY_BYTES = 128
+MAX_STOP_REASON_BYTES = 1024
+MAX_STOP_SELECTOR_TARGETS = 4096
 SHA256_PATTERN = r"^sha256:[0-9a-f]{64}$"
 
 
@@ -1729,23 +1732,214 @@ class StopOperationTargetRequest(StrictRequest):
         return _bounded_nfc(
             value,
             label="operation_id",
-            maximum_bytes=MAX_IDENTITY_BYTES,
+            maximum_bytes=MAX_STOP_IDENTITY_BYTES,
+        )
+
+
+class StopComponentTargetRequest(StrictRequest):
+    controllable_component_id: str
+    expected_graph_revision: str
+    expected_component_lifecycle_generation: Annotated[
+        int, Field(ge=1, le=9_007_199_254_740_991)
+    ]
+
+    @field_validator("controllable_component_id", "expected_graph_revision")
+    @classmethod
+    def validate_identity(cls, value: str, info) -> str:
+        return _bounded_nfc(
+            value,
+            label=info.field_name,
+            maximum_bytes=MAX_STOP_IDENTITY_BYTES,
+        )
+
+
+class StopResourceTargetRequest(StrictRequest):
+    resource_id: str
+    expected_graph_revision: str
+    expected_operation_resource_generation: Annotated[
+        int, Field(ge=0, le=9_007_199_254_740_991)
+    ]
+    expected_stop_generation: Annotated[
+        int, Field(ge=0, le=9_007_199_254_740_991)
+    ]
+
+    @field_validator("resource_id", "expected_graph_revision")
+    @classmethod
+    def validate_identity(cls, value: str, info) -> str:
+        return _bounded_nfc(
+            value,
+            label=info.field_name,
+            maximum_bytes=MAX_STOP_IDENTITY_BYTES,
         )
 
 
 class StopIntentRequest(StrictRequest):
     request_context: CallerAttributionRequest
     operations: Annotated[
-        list[StopOperationTargetRequest], Field(min_length=1, max_length=1)
+        list[StopOperationTargetRequest],
+        Field(min_length=1, max_length=MAX_STOP_SELECTOR_TARGETS),
+    ] | None = None
+    components: Annotated[
+        list[StopComponentTargetRequest],
+        Field(min_length=1, max_length=MAX_STOP_SELECTOR_TARGETS),
+    ] | None = None
+    resources: Annotated[
+        list[StopResourceTargetRequest],
+        Field(min_length=1, max_length=MAX_STOP_SELECTOR_TARGETS),
+    ] | None = None
+    reason: str | None = None
+
+    @field_validator("reason", mode="before")
+    @classmethod
+    def normalize_reason(cls, value: object) -> str | None:
+        if value is None:
+            return None
+        if (
+            not isinstance(value, str)
+            or not value
+            or unicodedata.normalize("NFC", value) != value
+            or len(value.encode("utf-8")) > MAX_STOP_REASON_BYTES
+        ):
+            return None
+        return value
+
+    @model_validator(mode="after")
+    def validate_selector(self) -> StopIntentRequest:
+        selected = [
+            rows
+            for rows in (self.operations, self.components, self.resources)
+            if rows is not None
+        ]
+        if len(selected) != 1:
+            raise ValueError("Stop request must contain exactly one selector kind")
+        rows = selected[0]
+        identities = [
+            getattr(row, "operation_id", None)
+            or getattr(row, "controllable_component_id", None)
+            or getattr(row, "resource_id", None)
+            for row in rows
+        ]
+        if identities != sorted(identities) or len(set(identities)) != len(identities):
+            raise ValueError("Stop selector rows must be sorted and unique")
+        context = self.request_context
+        for label, value, maximum in (
+            ("request_id", context.request_id, MAX_STOP_IDENTITY_BYTES),
+            ("request_owner_epoch", context.request_owner_epoch, MAX_STOP_IDENTITY_BYTES),
+            ("source_label", context.source_label, MAX_IDENTITY_BYTES),
+        ):
+            _bounded_nfc(value, label=label, maximum_bytes=maximum)
+        if context.correlation_id is not None:
+            _bounded_nfc(
+                context.correlation_id,
+                label="correlation_id",
+                maximum_bytes=MAX_IDENTITY_BYTES,
+            )
+        return self
+
+
+class FullStopIntentRequest(StrictRequest):
+    request_context: CallerAttributionRequest
+    expected_stop_generation: Annotated[
+        int, Field(ge=0, le=9_007_199_254_740_991)
+    ]
+
+    @model_validator(mode="after")
+    def validate_context(self) -> FullStopIntentRequest:
+        context = self.request_context
+        _bounded_nfc(
+            context.request_id,
+            label="request_id",
+            maximum_bytes=MAX_STOP_IDENTITY_BYTES,
+        )
+        _bounded_nfc(
+            context.request_owner_epoch,
+            label="request_owner_epoch",
+            maximum_bytes=MAX_STOP_IDENTITY_BYTES,
+        )
+        return self
+
+
+class StopFaultRecoveryConfigurationExpectationRequest(StrictRequest):
+    control_domain_id: str
+    active_control_configuration_id: str
+    active_control_configuration_generation: Annotated[
+        int, Field(ge=1, le=9_007_199_254_740_991)
+    ]
+
+    @field_validator("control_domain_id", "active_control_configuration_id")
+    @classmethod
+    def validate_identity(cls, value: str, info) -> str:
+        return _bounded_nfc(
+            value,
+            label=info.field_name,
+            maximum_bytes=MAX_STOP_IDENTITY_BYTES,
+        )
+
+
+class StopFaultRecoveryIntentRequest(StrictRequest):
+    request_context: CallerAttributionRequest
+    expected_latch_id: str
+    expected_latch_generation: Annotated[
+        int, Field(ge=1, le=9_007_199_254_740_991)
+    ]
+    expected_recovery_assessment_revision: Annotated[
+        int, Field(ge=1, le=9_007_199_254_740_991)
+    ]
+    expected_stop_certificate_id: str
+    expected_stop_certificate_revision: Annotated[
+        int, Field(ge=1, le=9_007_199_254_740_991)
+    ]
+    expected_cell_id: str
+    expected_retained_bundle_id: str
+    expected_graph_revision: str
+    configuration_expectations: Annotated[
+        list[StopFaultRecoveryConfigurationExpectationRequest],
+        Field(min_length=1, max_length=MAX_STOP_SELECTOR_TARGETS),
     ]
     reason: str | None = None
+
+    @field_validator(
+        "expected_latch_id",
+        "expected_stop_certificate_id",
+        "expected_cell_id",
+        "expected_retained_bundle_id",
+        "expected_graph_revision",
+    )
+    @classmethod
+    def validate_identity(cls, value: str, info) -> str:
+        return _bounded_nfc(
+            value,
+            label=info.field_name,
+            maximum_bytes=MAX_STOP_IDENTITY_BYTES,
+        )
 
     @field_validator("reason")
     @classmethod
     def validate_reason(cls, value: str | None) -> str | None:
         if value is None:
             return None
-        return _bounded_nfc(value, label="reason", maximum_bytes=MAX_REASON_BYTES)
+        return _bounded_nfc(
+            value, label="reason", maximum_bytes=MAX_STOP_REASON_BYTES
+        )
+
+    @model_validator(mode="after")
+    def validate_expectations(self) -> StopFaultRecoveryIntentRequest:
+        domains = [row.control_domain_id for row in self.configuration_expectations]
+        if domains != sorted(domains) or len(set(domains)) != len(domains):
+            raise ValueError(
+                "Stop fault-recovery configuration expectations must be sorted and unique"
+            )
+        _bounded_nfc(
+            self.request_context.request_id,
+            label="request_id",
+            maximum_bytes=MAX_STOP_IDENTITY_BYTES,
+        )
+        _bounded_nfc(
+            self.request_context.request_owner_epoch,
+            label="request_owner_epoch",
+            maximum_bytes=MAX_STOP_IDENTITY_BYTES,
+        )
+        return self
 
 
 class RuntimeScaleRequest(StrictRequest):

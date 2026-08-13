@@ -3017,15 +3017,15 @@ OperationJournalRecoveryDTO SqliteOperationJournal::Impl::BeginOwnerEpoch(
       Require(content_identity::sha256_digest(payload) == retained_stops.Text(7),
               "operation_journal_corrupt",
               "Stop fault-clear recovery projection digest does not match its bytes");
-      auto cleared = DecodeStopJournalTerminalProjection(payload);
-      Require(cleared.ok() && cleared.value().stop_status.accepted == recovered.accepted &&
-                  cleared.value().fault_latch.has_value() &&
-                  cleared.value().fault_latch->state == StopFaultLatchStateDTO::kCleared,
+      auto cleared = DecodeStopJournalFaultClearProjection(payload);
+      Require(cleared.ok() &&
+                  cleared.value().resulting_stop_status.accepted == recovered.accepted &&
+                  cleared.value().recovery_result.latch.state == StopFaultLatchStateDTO::kCleared,
               "operation_journal_corrupt",
               "Stop fault-clear recovery projection cannot be decoded or joined");
       recovered.terminal_certificate = std::move(cleared.value().certificate);
-      recovered.fault_latch = std::move(cleared.value().fault_latch);
-      recovered.surveillance = std::move(cleared.value().stop_status.surveillance);
+      recovered.fault_latch = std::move(cleared.value().recovery_result.latch);
+      recovered.surveillance = std::move(cleared.value().resulting_stop_status.surveillance);
     }
     recovery.recovered_stops.push_back(std::move(recovered));
   }
@@ -3184,32 +3184,36 @@ std::uint64_t SqliteOperationJournal::Impl::RecordStopFaultCleared(
             "Stop fault clear does not join latest durable surveillance truth");
     prior_latch = surveillance.value().fault_latch;
     expected_status.surveillance = surveillance.value().checkpoint;
+    expected_status.surveillance_projection = surveillance.value().checkpoint.checkpoint_projection;
   }
   Require(recovery_intent.expected_latch_id == prior_latch.latch_id &&
               recovery_intent.expected_latch_generation == prior_latch.latch_generation &&
-              recovery_intent.expected_recovery_assessment_revision ==
+              recovery_intent.expected_recovery_assessment_revision >=
                   prior_latch.recovery_assessment_revision &&
               recovery_intent.expected_cell_id == prior_latch.cell_id &&
               recovery_intent.expected_retained_bundle_id == prior_latch.retained_bundle_id &&
               recovery_intent.expected_graph_revision == prior_latch.graph_revision &&
-              prior_latch.recovery_status == StopFaultRecoveryStatusDTO::kReady &&
-              prior_latch.recovery_assessment_revision < std::numeric_limits<std::uint64_t>::max(),
+              prior_latch.state != StopFaultLatchStateDTO::kCleared &&
+              recovery_intent.expected_recovery_assessment_revision <
+                  std::numeric_limits<std::uint64_t>::max(),
           "operation_journal_stop_projection_conflict",
           "Stop fault clear expectations do not match latest durable latch truth");
   auto expected_cleared_latch = prior_latch;
-  ++expected_cleared_latch.recovery_assessment_revision;
+  expected_cleared_latch.recovery_assessment_revision =
+      recovery_intent.expected_recovery_assessment_revision + 1U;
   expected_cleared_latch.state = StopFaultLatchStateDTO::kCleared;
   expected_cleared_latch.recovery_status = StopFaultRecoveryStatusDTO::kCleared;
   expected_cleared_latch.reason_code = "stop_fault_recovery_cleared";
+  expected_cleared_latch.evidence_refs = cleared_latch.evidence_refs;
   expected_cleared_latch.clear_projection = StopDurableProjectionStatusDTO{
       StopDurableProjectionStateDTO::kRecorded, std::nullopt, std::nullopt};
   expected_status.fault_latch = expected_cleared_latch;
   Require(cleared_latch == expected_cleared_latch && resulting_stop_status == expected_status,
           "operation_journal_stop_projection_conflict",
           "Stop fault clear does not equal the exact durable successor state");
-  const StopJournalTerminalProjectionDTO clear_projection{
-      resulting_stop_status, terminal.value().certificate, cleared_latch};
-  auto encoded = EncodeStopJournalTerminalProjection(clear_projection);
+  const StopJournalFaultClearProjectionDTO clear_projection{
+      recovery_intent, recovery_result, resulting_stop_status, terminal.value().certificate};
+  auto encoded = EncodeStopJournalFaultClearProjection(clear_projection);
   Require(encoded.ok(), "operation_journal_record_invalid",
           "Stop fault-clear durable payload is invalid");
   if (!current.IsNull(2)) {

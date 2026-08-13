@@ -15,12 +15,14 @@ import unicodedata
 import rfc8785
 
 from .models import (
+    FullStopIntentRequest,
     OperationControlRequest,
     OperationIntentRequest,
     Pose3Request,
     PickSequencePlanningRequest,
     PlaceSequencePlanningRequest,
     RuntimeScaleRequest,
+    StopFaultRecoveryIntentRequest,
     StopIntentRequest,
 )
 from .native import HeadlessApiError, HeadlessCorePort, strict_json_object
@@ -217,6 +219,29 @@ class ExecutionPort(Protocol):
         request: StopIntentRequest,
         *,
         trusted_principal_id: str | None,
+    ) -> dict[str, Any]: ...
+
+    def full_stop(
+        self,
+        request: FullStopIntentRequest,
+        *,
+        trusted_principal_id: str | None,
+    ) -> dict[str, Any]: ...
+
+    def recognized_malformed_stop(
+        self,
+        *,
+        request_id: str,
+        recognized_route: str,
+        reason: str,
+        trusted_principal_id: str | None,
+    ) -> dict[str, Any]: ...
+
+    def stop_fault(self) -> dict[str, Any]: ...
+
+    def recover_stop_fault(
+        self,
+        request: StopFaultRecoveryIntentRequest,
     ) -> dict[str, Any]: ...
 
     def set_runtime_scale(
@@ -1079,21 +1104,274 @@ class ExecutionCommandClient:
                 "api_version": EXECUTION_COMMAND_VERSION,
                 "attribution": self._http_attribution(trusted_principal_id),
                 "command": "stop",
-                "request": request.model_dump(mode="json"),
+                "request": request.model_dump(mode="json", exclude_none=True),
             }
         )
         accepted = response.get("accepted")
-        requested_operations = [item.operation_id for item in request.operations]
         if response.get("ok") is True and (
             response.get("command") != "stop"
             or not isinstance(accepted, dict)
             or accepted.get("request_id")
             != request.request_context.request_id
-            or accepted.get("operations") != requested_operations
         ):
             raise HeadlessApiError(
                 "execution_command_response_identity_mismatch",
                 "execution Stop acceptance does not match its request",
+            )
+        return response
+
+    def full_stop(
+        self,
+        request: FullStopIntentRequest,
+        *,
+        trusted_principal_id: str | None,
+    ) -> dict[str, Any]:
+        response = self._exchange_control(
+            {
+                "api_version": EXECUTION_COMMAND_VERSION,
+                "attribution": self._http_attribution(trusted_principal_id),
+                "command": "full_stop",
+                "request": request.model_dump(mode="json"),
+            }
+        )
+        accepted = response.get("accepted")
+        if response.get("ok") is True and (
+            response.get("command") != "full_stop"
+            or not isinstance(accepted, dict)
+            or accepted.get("request_id")
+            != request.request_context.request_id
+            or accepted.get("resolution_reason") != "explicit_full_stop"
+        ):
+            raise HeadlessApiError(
+                "execution_command_response_identity_mismatch",
+                "Full Stop acceptance does not match its request",
+            )
+        return response
+
+    def recognized_malformed_stop(
+        self,
+        *,
+        request_id: str,
+        recognized_route: str,
+        reason: str,
+        trusted_principal_id: str | None,
+    ) -> dict[str, Any]:
+        response = self._exchange_control(
+            {
+                "api_version": EXECUTION_COMMAND_VERSION,
+                "attribution": self._http_attribution(trusted_principal_id),
+                "command": "malformed_stop",
+                "reason": reason,
+                "recognized_route": recognized_route,
+                "request_id": request_id,
+            }
+        )
+        accepted = response.get("accepted")
+        if response.get("ok") is True and (
+            response.get("command") != "stop"
+            or not isinstance(accepted, dict)
+            or accepted.get("request_id") != request_id
+            or accepted.get("resolution_disposition") != "promoted_to_full"
+        ):
+            raise HeadlessApiError(
+                "execution_command_response_identity_mismatch",
+                "recognized malformed Stop acceptance does not match its adapter identity",
+            )
+        return response
+
+    @staticmethod
+    def _valid_stop_fault_offer(offer: object) -> bool:
+        if offer is None:
+            return True
+        if not isinstance(offer, dict) or set(offer) != {
+            "configuration_expectations",
+            "latch",
+        }:
+            return False
+        latch = offer.get("latch")
+        expectations = offer.get("configuration_expectations")
+        if not isinstance(latch, dict) or not isinstance(expectations, list):
+            return False
+        if set(latch) != {
+            "captured_operation_ids",
+            "captured_resources",
+            "cell_id",
+            "clear_projection",
+            "evidence_refs",
+            "graph_revision",
+            "latch_generation",
+            "latch_id",
+            "persistence_degraded",
+            "reason_code",
+            "recovery_assessment_revision",
+            "recovery_status",
+            "retained_bundle_id",
+            "state",
+            "stop_certificate",
+            "stop_generation",
+            "stop_id",
+            "terminal_projection",
+            "trigger",
+        }:
+            return False
+        required_text = (
+            "cell_id",
+            "graph_revision",
+            "latch_id",
+            "reason_code",
+            "retained_bundle_id",
+            "stop_id",
+        )
+        if any(not isinstance(latch.get(key), str) or not latch[key] for key in required_text):
+            return False
+        if any(
+            type(latch.get(key)) is not int
+            or not 1 <= latch[key] <= MAXIMUM_SAFE_INTEGER
+            for key in (
+                "latch_generation",
+                "recovery_assessment_revision",
+                "stop_generation",
+            )
+        ):
+            return False
+        if (
+            type(latch.get("persistence_degraded")) is not bool
+            or not isinstance(latch.get("captured_operation_ids"), list)
+            or not isinstance(latch.get("captured_resources"), list)
+            or not isinstance(latch.get("evidence_refs"), list)
+            or not isinstance(latch.get("terminal_projection"), dict)
+            or not isinstance(latch.get("clear_projection"), dict)
+            or latch.get("state") not in {"latched", "recovery_pending"}
+            or latch.get("recovery_status")
+            not in {
+                "waiting_for_observation",
+                "waiting_for_quiescence",
+                "waiting_for_configuration",
+                "waiting_for_external_reconciliation",
+                "waiting_for_durable_record",
+                "ready",
+                "recovery_pending",
+            }
+        ):
+            return False
+        for key in ("captured_operation_ids", "captured_resources"):
+            rows = latch[key]
+            if (
+                any(not isinstance(item, str) or not item for item in rows)
+                or rows != sorted(rows)
+                or len(rows) != len(set(rows))
+            ):
+                return False
+        certificate = latch.get("stop_certificate")
+        if (
+            not isinstance(certificate, dict)
+            or set(certificate)
+            != {
+                "stop_certificate_id",
+                "stop_certificate_revision",
+                "stop_generation",
+                "stop_id",
+            }
+            or any(
+                not isinstance(certificate.get(key), str)
+                or not certificate[key]
+                for key in ("stop_certificate_id", "stop_id")
+            )
+            or any(
+                type(certificate.get(key)) is not int
+                or not 1 <= certificate[key] <= MAXIMUM_SAFE_INTEGER
+                for key in ("stop_certificate_revision", "stop_generation")
+            )
+        ):
+            return False
+        for key in ("terminal_projection", "clear_projection"):
+            projection = latch[key]
+            if (
+                not isinstance(projection, dict)
+                or set(projection) != {"error", "retry_generation", "state"}
+                or projection.get("state")
+                not in {"not_applicable", "pending", "recorded", "failed"}
+            ):
+                return False
+        for evidence in latch["evidence_refs"]:
+            if (
+                not isinstance(evidence, dict)
+                or set(evidence) != {"evidence_digest", "kind"}
+                or not isinstance(evidence.get("evidence_digest"), str)
+                or not evidence["evidence_digest"].startswith("sha256:")
+                or evidence.get("kind")
+                not in {
+                    "settlement",
+                    "late_quiescence",
+                    "configuration",
+                    "external_reconciliation",
+                    "backend_or_lifecycle_reset",
+                }
+            ):
+                return False
+        prior = ""
+        for row in expectations:
+            if (
+                not isinstance(row, dict)
+                or set(row)
+                != {
+                    "active_control_configuration_generation",
+                    "active_control_configuration_id",
+                    "control_domain_id",
+                }
+                or not isinstance(row.get("control_domain_id"), str)
+                or not row["control_domain_id"]
+                or row["control_domain_id"] <= prior
+                or not isinstance(row.get("active_control_configuration_id"), str)
+                or not row["active_control_configuration_id"]
+                or type(row.get("active_control_configuration_generation")) is not int
+                or not 1
+                <= row["active_control_configuration_generation"]
+                <= MAXIMUM_SAFE_INTEGER
+            ):
+                return False
+            prior = row["control_domain_id"]
+        return bool(expectations)
+
+    def stop_fault(self) -> dict[str, Any]:
+        response = self._exchange(
+            {
+                "api_version": EXECUTION_COMMAND_VERSION,
+                "command": "get_stop_fault",
+            }
+        )
+        if response.get("ok") is True and (
+            response.get("command") != "get_stop_fault"
+            or not self._valid_stop_fault_offer(response.get("stop_fault"))
+        ):
+            raise HeadlessApiError(
+                "execution_command_response_invalid",
+                "Stop-fault response is invalid",
+            )
+        return response
+
+    def recover_stop_fault(
+        self,
+        request: StopFaultRecoveryIntentRequest,
+    ) -> dict[str, Any]:
+        response = self._exchange(
+            {
+                "api_version": EXECUTION_COMMAND_VERSION,
+                "command": "recover_stop_fault",
+                "request": request.model_dump(mode="json", exclude_none=True),
+            }
+        )
+        result = response.get("result")
+        if response.get("ok") is True and (
+            response.get("command") != "recover_stop_fault"
+            or not isinstance(result, dict)
+            or result.get("request_id") != request.request_context.request_id
+            or type(result.get("accepted")) is not bool
+            or not isinstance(result.get("latch"), dict)
+        ):
+            raise HeadlessApiError(
+                "execution_command_response_identity_mismatch",
+                "Stop-fault recovery result does not match its request",
             )
         return response
 
