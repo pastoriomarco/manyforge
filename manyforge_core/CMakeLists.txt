@@ -91,6 +91,7 @@ add_library(manyforge_core
   src/prepared_planning_codec.cpp
   src/prepared_motion_evidence_codec.cpp
   src/prepared_operation_participant_codec.cpp
+  src/prepared_execution.cpp
   src/route_selection.cpp
   src/route_selection_owner.cpp
   src/resource_slot_table.cpp
@@ -491,6 +492,13 @@ if(BUILD_TESTING)
   target_link_libraries(test_prepared_operation_participant_codec PRIVATE
     manyforge_core manyforge::content_identity GTest::gtest_main)
   gtest_discover_tests(test_prepared_operation_participant_codec
+    PROPERTIES TIMEOUT ${MANYFORGE_GTEST_TIMEOUT_SECONDS})
+
+  add_executable(test_prepared_execution
+    test/test_prepared_execution.cpp)
+  target_link_libraries(test_prepared_execution PRIVATE
+    manyforge_core GTest::gtest_main)
+  gtest_discover_tests(test_prepared_execution
     PROPERTIES TIMEOUT ${MANYFORGE_GTEST_TIMEOUT_SECONDS})
 
   if(MANYFORGE_CORE_BUILD_FILESYSTEM_RESOLVED_STOP_BASE_PLAN_REPOSITORY)

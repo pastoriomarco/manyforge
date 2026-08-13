@@ -1,0 +1,180 @@
+#include <gtest/gtest.h>
+
+#include <manyforge_core/types/prepared_execution.hpp>
+
+namespace manyforge::core {
+namespace {
+
+[[nodiscard]] std::string Digest(char value) {
+  return "sha256:" + std::string(64U, value);
+}
+
+[[nodiscard]] PreparedOperationParticipantDTO PreparedParticipant() {
+  const OperationId operation_id("operation.1");
+  const OperationRevision operation_revision(3U);
+  const OperationParticipantId participant_id("participant.1");
+  const ProgramId program_id("program.1");
+  const ProgramRevision program_revision(Digest('1'));
+  const ProgramBindingId program_binding_id(Digest('2'));
+  const ProgramRunId program_run_id("run.1");
+  PreparedParticipantStopPlanDTO stop_plan{
+      ContentDigest(Digest('3')),
+      ResolvedStopBasePlanId(Digest('4')),
+      operation_id,
+      operation_revision,
+      participant_id,
+      program_id,
+      program_revision,
+      program_binding_id,
+      program_run_id,
+      std::nullopt,
+      ParticipantStopProfilePurposeDTO::kOrdinary,
+      std::nullopt,
+      StopDeadlineBudgetDTO{
+          1'000'000'000LL, 100'000'000LL, {{StopBudgetPhaseId("completion"), 900'000'000LL}}},
+      {}};
+  PreparedCapabilityCommandDTO payload{
+      CommandSchemaId("command.schema"),
+      CommandSchemaRevision(Digest('5')),
+      GripperPositionCommandValueDTO{AngularPositionDTO{0.2}, std::nullopt},
+      {},
+      {},
+      {},
+      2.0,
+      CommandCompletionRule::kGoalFencedTargetReached,
+      CommandConfirmationRule::kBindingFeedbackRequired,
+      {CommandStopEvidenceRequirement::kCommandTerminal}};
+  return PreparedOperationParticipantDTO{
+      ContentDigest(Digest('a')),
+      operation_id,
+      operation_revision,
+      participant_id,
+      program_id,
+      program_revision,
+      program_binding_id,
+      program_run_id,
+      RetainedBundleId(Digest('6')),
+      GraphRevision(Digest('7')),
+      ControllableComponentId("robot.1"),
+      ComponentLifecycleGeneration(9U),
+      ComponentTypeId("robot.type"),
+      ComponentTypeRevision("robot.type.revision"),
+      CommandTargetId("gripper"),
+      CapabilityId("gripper.position"),
+      CapabilityDefinitionRevision(Digest('8')),
+      {},
+      {},
+      ControlDomainId("domain.1"),
+      ControlDomainRevision(Digest('9')),
+      ControlBindingId("binding.1"),
+      ControlBindingRevision(Digest('b')),
+      ControlInterfaceContractId("control.interface"),
+      ControlInterfaceRevision(Digest('c')),
+      ControllerTopologyId("topology.1"),
+      TopologyRevision(Digest('d')),
+      ControlRouteId("route.1"),
+      ActivationSetId("activation.1"),
+      PreparedProviderRuntimeOccurrenceDTO{ProviderInstanceId("provider.1"),
+                                           ProviderManifestId(Digest('e')),
+                                           ProviderManifestRevision(Digest('f')),
+                                           RuntimeUnitId("runtime.1"), RuntimeEpoch("epoch.1")},
+      std::nullopt,
+      {ResourceId("resource.1"), ResourceId("resource.2")},
+      PreparedParticipantFocusedPortDTO{RuntimeUnitId("runtime.1")},
+      {{ResourceId("resource.1"), "position"}, {ResourceId("resource.2"), "position"}},
+      {{ResourceId("resource.1"), "position"}, {ResourceId("resource.2"), "position"}},
+      ActiveControlConfigurationId(Digest('0')),
+      ActiveControlConfigurationGeneration(11U),
+      {{RuntimeUnitId("runtime.1"), RuntimeEpoch("epoch.1")}},
+      StopEvidencePolicyId("stop.evidence"),
+      StopEvidencePolicyRevision(Digest('1')),
+      std::move(stop_plan),
+      std::move(payload)};
+}
+
+TEST(PreparedExecutionTest, PrepareResultPreservesExactParticipantIdentity) {
+  const auto participant = PreparedParticipant();
+  const auto result =
+      MakePrepareParticipantResult(participant, PrepareParticipantResultStateDTO::kPrepared);
+  ASSERT_TRUE(result.ok()) << result.error().message;
+  EXPECT_FALSE(prepare_participant_result_field_error(result.value(), participant).has_value());
+  EXPECT_EQ(result.value().prepared_contract_digest,
+            std::optional(participant.prepared_contract_digest));
+  EXPECT_EQ(result.value().payload_kind, PreparedParticipantPayloadKindDTO::kCapabilityCommand);
+
+  auto forged = result.value();
+  forged.control_route_id = ControlRouteId("route.other");
+  EXPECT_EQ(prepare_participant_result_field_error(forged, participant),
+            "prepare_participant_result_identity_invalid");
+  forged = result.value();
+  forged.error = ErrorDTO{std::string(kErrorExecutionRejected), "unexpected", {}};
+  EXPECT_EQ(prepare_participant_result_field_error(forged, participant),
+            "prepare_participant_result_presence_invalid");
+}
+
+TEST(PreparedExecutionTest, RejectedPrepareRequiresStableErrorAndNoDigest) {
+  const auto participant = PreparedParticipant();
+  const auto error = ErrorDTO{std::string(kErrorExecutionRejected),
+                              "prepared participant rejected",
+                              {{"reason", "prepared_contract_conflict"}}};
+  const auto result =
+      MakePrepareParticipantResult(participant, PrepareParticipantResultStateDTO::kRejected, error);
+  ASSERT_TRUE(result.ok()) << result.error().message;
+  EXPECT_FALSE(result.value().prepared_contract_digest.has_value());
+  EXPECT_EQ(result.value().error, std::optional(error));
+
+  EXPECT_FALSE(
+      MakePrepareParticipantResult(participant, PrepareParticipantResultStateDTO::kRejected).ok());
+  EXPECT_FALSE(
+      MakePrepareParticipantResult(participant, PrepareParticipantResultStateDTO::kPrepared, error)
+          .ok());
+}
+
+TEST(PreparedExecutionTest, BackendStatusIsGoalAndBindingFenced) {
+  const auto participant = PreparedParticipant();
+  const ControllerGoalId goal_id("goal.1");
+  const ControllerGoalGeneration goal_generation(7U);
+  const auto result = MakeExecutionBackendStatus(participant, goal_id, goal_generation,
+                                                 ExecutionBackendStateDTO::kExecuting, 0.25, 0.4,
+                                                 12U, 50'000'000LL);
+  ASSERT_TRUE(result.ok()) << result.error().message;
+  EXPECT_FALSE(
+      execution_backend_status_field_error(result.value(), participant, goal_id, goal_generation)
+          .has_value());
+
+  auto forged = result.value();
+  forged.controller_goal_generation = ControllerGoalGeneration(8U);
+  EXPECT_EQ(execution_backend_status_field_error(forged, participant, goal_id, goal_generation),
+            "execution_backend_status_identity_invalid");
+  forged = result.value();
+  forged.resources = {ResourceId("resource.1")};
+  EXPECT_EQ(execution_backend_status_field_error(forged, participant, goal_id, goal_generation),
+            "execution_backend_status_identity_invalid");
+}
+
+TEST(PreparedExecutionTest, BackendStatusEnforcesStateAndEvidencePresence) {
+  const auto participant = PreparedParticipant();
+  const ControllerGoalId goal_id("goal.1");
+  const ControllerGoalGeneration goal_generation(7U);
+  const auto error =
+      ErrorDTO{std::string(kErrorExecutionAborted), "controller execution failed", {}};
+  EXPECT_TRUE(MakeExecutionBackendStatus(participant, goal_id, goal_generation,
+                                         ExecutionBackendStateDTO::kFailed, 0.5, 0.5, 13U,
+                                         60'000'000LL, error)
+                  .ok());
+  EXPECT_FALSE(MakeExecutionBackendStatus(participant, goal_id, goal_generation,
+                                          ExecutionBackendStateDTO::kFailed, 0.5, 0.5, 13U,
+                                          60'000'000LL)
+                   .ok());
+  EXPECT_FALSE(MakeExecutionBackendStatus(participant, goal_id, goal_generation,
+                                          ExecutionBackendStateDTO::kCompleted, 0.5, 1.0, 14U,
+                                          70'000'000LL, error)
+                   .ok());
+  EXPECT_FALSE(MakeExecutionBackendStatus(participant, goal_id, goal_generation,
+                                          ExecutionBackendStateDTO::kExecuting, 0.5, 1.1, 15U,
+                                          80'000'000LL)
+                   .ok());
+}
+
+}  // namespace
+}  // namespace manyforge::core
