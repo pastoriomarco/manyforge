@@ -39,6 +39,7 @@ const char* kernel_event_type_name(KernelEventType type) {
     case kValidationStarted: return "validation_started";
     case kValidationPassed: return "validation_passed";
     case kValidationFailed: return "validation_failed";
+    case kParticipantPrepared: return "participant_prepared";
     case kExecuteStarted: return "execute_started";
     case kExecuteCompleted: return "execute_completed";
     case kStopRequested: return "stop_requested";

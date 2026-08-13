@@ -25,6 +25,7 @@ enum class KernelEventType {
   kValidationStarted,  // validation phase started
   kValidationPassed,   // validation passed
   kValidationFailed,   // validation failed
+  kParticipantPrepared,  // immutable participant prepared; no effect dispatched
   kExecuteStarted,     // execution phase started
   kExecuteCompleted,   // execution phase completed
   kStopRequested,      // stop requested

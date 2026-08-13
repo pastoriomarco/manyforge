@@ -59,6 +59,10 @@ template <typename T>
       throw std::invalid_argument(
           "runtime participant registration policy selection crosses its binding");
     }
+    if (registration.runtime_policy.has_value() && registration.prepared_motion_engine == nullptr) {
+      throw std::invalid_argument(
+          "motion runtime participant registration has no prepared execution engine");
+    }
     bindings.push_back(registration.binding);
   }
   return bindings;
@@ -235,7 +239,8 @@ derive_route_readiness_projection(
   return left.binding.value() == right.binding.value() && readiness_equal && runtime_policy_equal &&
          left.retained_default_stop_limits == right.retained_default_stop_limits &&
          left.stop_node_category == right.stop_node_category && left.engine == right.engine &&
-         left.stop_execution_port == right.stop_execution_port;
+         left.stop_execution_port == right.stop_execution_port &&
+         left.prepared_motion_engine == right.prepared_motion_engine;
 }
 
 [[nodiscard]] std::set<ControlDomainId> changed_registration_domains(
@@ -1050,6 +1055,7 @@ struct ResourceAddressedExecutionKernel::ActiveOperation final {
   std::shared_ptr<const PreparedParticipantStopPlanDTO> ordinary_stop_plan;
   std::optional<PreparedOperationParticipantDTO> prepared_participant;
   IResolvedParticipantExecutionEngine* engine{};
+  IResolvedPreparedParticipantExecutionEngine* prepared_motion_engine{};
   IControlDomainExecutionPort* stop_execution_port{};
   ResourceSlotOwnerDTO slot_owner;
   std::vector<ResourceId> resources;
@@ -1064,6 +1070,9 @@ struct ResourceAddressedExecutionKernel::ActiveOperation final {
   bool stop_effect_in_flight{};
   bool ordinary_acceptance_pending{};
   bool ordinary_acceptance_durable{};
+  bool prepare_in_flight{};
+  bool prepared_advance_in_flight{};
+  bool prepared_dispatch_released{};
   bool dispatch_effect_in_flight{};
   std::optional<ErrorDTO> last_subordinate_error;
   std::optional<RuntimeScaleStatusDTO> runtime_scale_status;
@@ -1091,7 +1100,11 @@ struct StopParticipantWork final {
   PreparedParticipantStopPlanDTO plan;
   std::vector<ResourceId> resources;
   IControlDomainExecutionPort* port{};
+  IResolvedPreparedParticipantExecutionEngine* prepared_motion_engine{};
+  std::uint64_t prepared_execution_id{};
   bool cancelled_pre_dispatch{};
+  bool prepared_cancel_requested{};
+  bool prepared_cancel_complete{};
   bool terminal{};
   bool contained{};
   std::size_t current_stage_index{};
@@ -2857,6 +2870,12 @@ Result<OperationAcceptedDTO> ResourceAddressedExecutionKernel::execute(
                                         "runtime_participant_policy_missing",
                                         ErrorCode::kMissingReference);
   }
+  if (payload_kind == OperationParticipantPayloadKind::kMotion &&
+      resolved.value().prepared_motion_engine == nullptr) {
+    return reject<OperationAcceptedDTO>(
+        "resolved motion participant has no prepared execution engine",
+        "runtime_participant_prepared_engine_missing", ErrorCode::kMissingReference);
+  }
   ResourceSlotOwnerDTO slot_owner{operation_id,
                                   operation_revision,
                                   participant_id,
@@ -3015,6 +3034,7 @@ Result<OperationAcceptedDTO> ResourceAddressedExecutionKernel::execute(
                                                       retained_stop_plan,
                                                       std::nullopt,
                                                       engine,
+                                                      resolved.value().prepared_motion_engine,
                                                       resolved.value().stop_execution_port,
                                                       slot_owner,
                                                       resources,
@@ -3028,6 +3048,9 @@ Result<OperationAcceptedDTO> ResourceAddressedExecutionKernel::execute(
                                                       false,
                                                       false,
                                                       true,
+                                                      false,
+                                                      false,
+                                                      false,
                                                       false,
                                                       false,
                                                       std::nullopt,
@@ -3151,7 +3174,13 @@ Result<OperationAcceptedDTO> ResourceAddressedExecutionKernel::execute(
     replay_ledger_.push_back(std::move(prepared_replay));
     dispatch_allowed = !active_operation->state.active_stop_id.has_value() &&
                        active_operation->slot_state == ResourceSlotState::kReserved;
-    active_operation->dispatch_effect_in_flight = dispatch_allowed;
+    if (dispatch_allowed) {
+      if (payload_kind == OperationParticipantPayloadKind::kMotion) {
+        active_operation->prepare_in_flight = true;
+      } else {
+        active_operation->dispatch_effect_in_flight = true;
+      }
+    }
   }
   if (!dispatch_allowed) {
     return Result<OperationAcceptedDTO>::Ok(accepted);
@@ -3159,9 +3188,19 @@ Result<OperationAcceptedDTO> ResourceAddressedExecutionKernel::execute(
 
   Result<void> dispatch_result = Result<void>::Ok();
   if (payload_kind == OperationParticipantPayloadKind::kMotion) {
-    auto dispatch = engine->execute(*motion_request);
-    if (!dispatch.ok()) {
-      dispatch_result = Result<void>::Err(dispatch.error());
+    ResolvedPreparedMotionExecutionRequestDTO prepare_request{
+        *motion_request,
+        operation_revision,
+        resolved.value().binding,
+        *resolved.value().stop_readiness,
+        *resolved.value().runtime_policy,
+        resolved.value().retained_default_stop_limits,
+        resolved.value().stop_node_category,
+        retained_stop_plan};
+    auto prepared_execution =
+        resolved.value().prepared_motion_engine->PrepareMotion(std::move(prepare_request));
+    if (!prepared_execution.ok()) {
+      dispatch_result = Result<void>::Err(prepared_execution.error());
     } else {
       std::lock_guard state_lock(state_mutex_);
       auto* active_operation = find_active_operation_locked(operation_id);
@@ -3170,16 +3209,16 @@ Result<OperationAcceptedDTO> ResourceAddressedExecutionKernel::execute(
             std::string(to_string(ErrorCode::kInvariantViolation)),
             "active operation disappeared during subordinate admission", "active_operation_lost"));
       } else {
-        active_operation->dispatch_effect_in_flight = false;
+        active_operation->prepare_in_flight = false;
       }
       if (active_operation != nullptr && active_operation->subordinate_id != 0U &&
-          active_operation->subordinate_id != dispatch.value()) {
+          active_operation->subordinate_id != prepared_execution.value()) {
         dispatch_result =
             Result<void>::Err(error(std::string(to_string(ErrorCode::kInvariantViolation)),
                                     "subordinate event and execute result identities disagree",
                                     "subordinate_execution_id_mismatch"));
       } else if (active_operation != nullptr) {
-        active_operation->subordinate_id = dispatch.value();
+        active_operation->subordinate_id = prepared_execution.value();
         if (active_operation->state.state == OperationStateKind::kResolving) {
           auto planning_state = active_operation->state;
           planning_state.state = OperationStateKind::kPlanning;
@@ -3198,6 +3237,9 @@ Result<OperationAcceptedDTO> ResourceAddressedExecutionKernel::execute(
           }
         }
       }
+    }
+    if (dispatch_result.ok()) {
+      dispatch_result = advance_prepared_motion(operation_id);
     }
   } else {
     const auto dispatch = engine->command_gripper(*command_request);
@@ -3248,6 +3290,7 @@ Result<OperationAcceptedDTO> ResourceAddressedExecutionKernel::execute(
     std::lock_guard state_lock(state_mutex_);
     auto* active_operation = find_active_operation_locked(operation_id);
     if (active_operation != nullptr) {
+      active_operation->prepare_in_flight = false;
       active_operation->dispatch_effect_in_flight = false;
       if (active_operation->state.active_stop_id.has_value()) {
         active_operation->last_subordinate_error = dispatch_result.error();
@@ -4755,9 +4798,12 @@ Result<StopAcceptedDTO> ResourceAddressedExecutionKernel::accept_stop(
           continue;
         }
         operation->state.operation_revision = affected.operation_revision_after_acceptance;
-        operation->state.state = operation->ordinary_acceptance_pending
-                                     ? OperationStateKind::kCancelledPreDispatch
-                                     : OperationStateKind::kStopping;
+        const bool cancelled_pre_dispatch =
+            operation->ordinary_acceptance_pending ||
+            (operation->payload_kind == OperationParticipantPayloadKind::kMotion &&
+             !operation->prepared_dispatch_released);
+        operation->state.state = cancelled_pre_dispatch ? OperationStateKind::kCancelledPreDispatch
+                                                        : OperationStateKind::kStopping;
         operation->state.active_stop_id = StopId(std::string(outcome.stop_id()));
         operation->state.active_stop_generation = outcome.stop_generation;
         operation->state.updated_at_ns = accepted_at_ns;
@@ -5690,8 +5736,14 @@ bool ResourceAddressedExecutionKernel::commit_stop_terminal_locked(
 
 void ResourceAddressedExecutionKernel::ProgressStop(const StopControlWorkToken token) noexcept {
   try {
+    struct PreparedCancellation final {
+      OperationId operation_id;
+      IResolvedPreparedParticipantExecutionEngine* engine{};
+      std::uint64_t execution_id{};
+    };
     std::optional<std::int64_t> next_deadline;
     std::vector<StopControlWorkToken> dependents;
+    std::vector<PreparedCancellation> prepared_cancellations;
     std::optional<StopControlWorkToken> terminal_projection;
     std::optional<std::pair<StopCertificateId, std::int64_t>> surveillance_schedule;
     bool terminal = false;
@@ -5733,7 +5785,11 @@ void ResourceAddressedExecutionKernel::ProgressStop(const StopControlWorkToken t
               *operation->ordinary_stop_plan,
               operation->resources,
               operation->stop_execution_port,
+              operation->prepared_motion_engine,
+              operation->subordinate_id,
               operation->state.state == OperationStateKind::kCancelledPreDispatch,
+              false,
+              false,
               false,
               false,
               0U,
@@ -5757,6 +5813,15 @@ void ResourceAddressedExecutionKernel::ProgressStop(const StopControlWorkToken t
           continue;
         }
         if (item.cancelled_pre_dispatch) {
+          if (item.prepared_motion_engine != nullptr && item.prepared_execution_id != 0U &&
+              !item.prepared_cancel_complete) {
+            if (!item.prepared_cancel_requested) {
+              item.prepared_cancel_requested = true;
+              prepared_cancellations.push_back(
+                  {item.operation_id, item.prepared_motion_engine, item.prepared_execution_id});
+            }
+            continue;
+          }
           item.contained = true;
           item.terminal = true;
         }
@@ -6003,6 +6068,56 @@ void ResourceAddressedExecutionKernel::ProgressStop(const StopControlWorkToken t
       } else if (next_deadline.has_value()) {
         stop_control_executor_->ArmDeadline(token, *next_deadline);
       }
+    }
+    for (const auto& cancellation : prepared_cancellations) {
+      Result<void> cancelled = Result<void>::Err(error(
+          std::string(to_string(ErrorCode::kInternalError)),
+          "prepared motion cancellation did not return a result", "prepared_motion_cancel_failed"));
+      try {
+        cancelled = cancellation.engine->CancelPreparedMotion(cancellation.execution_id);
+      } catch (const std::exception& exception) {
+        cancelled = Result<void>::Err(
+            error(std::string(to_string(ErrorCode::kInvariantViolation)),
+                  std::string("prepared motion cancellation threw: ") + exception.what(),
+                  "prepared_motion_cancel_threw"));
+      } catch (...) {
+        cancelled = Result<void>::Err(error(std::string(to_string(ErrorCode::kInvariantViolation)),
+                                            "prepared motion cancellation threw",
+                                            "prepared_motion_cancel_threw"));
+      }
+      {
+        std::lock_guard state_lock(state_mutex_);
+        if (token.slot >= stop_transactions_.size()) {
+          motion_admission_closed_ = true;
+          continue;
+        }
+        auto& transaction = *stop_transactions_[token.slot];
+        if (!transaction.active || transaction.token != token) {
+          continue;
+        }
+        const auto item = std::find_if(transaction.participants.begin(),
+                                       transaction.participants.end(), [&](const auto& candidate) {
+                                         return candidate.operation_id == cancellation.operation_id;
+                                       });
+        if (item == transaction.participants.end() ||
+            item->prepared_execution_id != cancellation.execution_id) {
+          motion_admission_closed_ = true;
+          continue;
+        }
+        item->prepared_cancel_complete = true;
+        if (!cancelled.ok()) {
+          item->terminal_error = cancelled.error();
+          motion_admission_closed_ = true;
+        }
+      }
+    }
+    if (!prepared_cancellations.empty()) {
+      // The executor coalesces identical token publications. Finish the
+      // bounded, effect-free cancellation pass directly after releasing the
+      // state lock so this same callback can commit terminal no-effect truth
+      // without waiting for an artificial watchdog generation.
+      ProgressStop(token);
+      return;
     }
     if (terminal) {
       if (terminal_projection.has_value()) {
@@ -6464,6 +6579,174 @@ Result<OperationStateDTO> ResourceAddressedExecutionKernel::get_operation_state(
                                    "operation_not_resident", ErrorCode::kMissingReference);
 }
 
+Result<void> ResourceAddressedExecutionKernel::advance_prepared_motion(
+    const OperationId& operation_id) {
+  struct Target final {
+    IResolvedPreparedParticipantExecutionEngine* prepared_engine{};
+    IResolvedParticipantExecutionEngine* engine{};
+    std::uint64_t subordinate_id{};
+    RuntimeParticipantBinding binding;
+    RuntimeParticipantStopReadiness readiness;
+    std::optional<RuntimeParticipantPolicySelection> runtime_policy;
+    std::vector<HardStopResourceLimitDTO> retained_default_stop_limits;
+    MotionInterruptNodeCategory stop_node_category{MotionInterruptNodeCategory::kGeneric};
+    std::shared_ptr<const PreparedParticipantStopPlanDTO> ordinary_stop_plan;
+  };
+
+  std::optional<Target> target;
+  {
+    std::lock_guard state_lock(state_mutex_);
+    auto* operation = find_active_operation_locked(operation_id);
+    if (operation == nullptr ||
+        operation->payload_kind != OperationParticipantPayloadKind::kMotion ||
+        operation->prepared_motion_engine == nullptr || operation->subordinate_id == 0U ||
+        operation->prepared_dispatch_released || operation->prepared_advance_in_flight) {
+      return Result<void>::Ok();
+    }
+    operation->prepared_advance_in_flight = true;
+    target.emplace(Target{operation->prepared_motion_engine, operation->engine,
+                          operation->subordinate_id, operation->binding, operation->stop_readiness,
+                          operation->runtime_policy, operation->retained_default_stop_limits,
+                          operation->stop_node_category, operation->ordinary_stop_plan});
+  }
+
+  const auto release_claim = [&]() {
+    std::lock_guard state_lock(state_mutex_);
+    auto* operation = find_active_operation_locked(operation_id);
+    if (operation != nullptr && operation->subordinate_id == target->subordinate_id) {
+      operation->prepared_advance_in_flight = false;
+    }
+  };
+
+  auto snapshot = target->prepared_engine->ObservePreparedMotion(target->subordinate_id);
+  if (!snapshot.ok()) {
+    release_claim();
+    return Result<void>::Err(snapshot.error());
+  }
+  if (snapshot.value().execution_id != target->subordinate_id) {
+    release_claim();
+    return reject<void>("prepared execution observation changed identity",
+                        "prepared_motion_observation_identity_mismatch",
+                        ErrorCode::kInvariantViolation);
+  }
+  if (snapshot.value().state == ResolvedPreparedMotionExecutionStateDTO::kPreparing) {
+    release_claim();
+    return Result<void>::Ok();
+  }
+
+  if (snapshot.value().state == ResolvedPreparedMotionExecutionStateDTO::kPreparationFailed ||
+      snapshot.value().state == ResolvedPreparedMotionExecutionStateDTO::kCancelledPreDispatch) {
+    const bool cancelled =
+        snapshot.value().state == ResolvedPreparedMotionExecutionStateDTO::kCancelledPreDispatch;
+    const auto failure = snapshot.value().error.value_or(error(
+        std::string(to_string(cancelled ? ErrorCode::kInvalidStateTransition
+                                        : ErrorCode::kExecutionRejected)),
+        cancelled ? "prepared execution was cancelled before dispatch"
+                  : "prepared execution failed before dispatch",
+        cancelled ? "prepared_motion_cancelled_pre_dispatch" : "prepared_motion_prepare_failed"));
+    bool stop_owns_terminal = false;
+    {
+      std::lock_guard state_lock(state_mutex_);
+      auto* operation = find_active_operation_locked(operation_id);
+      if (operation != nullptr) {
+        operation->prepared_advance_in_flight = false;
+        operation->last_subordinate_error = failure;
+        stop_owns_terminal = operation->state.active_stop_id.has_value();
+      }
+    }
+    if (stop_owns_terminal) {
+      return Result<void>::Ok();
+    }
+    return apply_subordinate_state(
+        operation_id, target->engine, target->subordinate_id,
+        cancelled ? OperationStateKind::kStopped : OperationStateKind::kInterventionRequired, 0.0,
+        cancelled ? std::optional<ErrorDTO>{} : std::optional(failure));
+  }
+
+  if (!snapshot.value().participant || !snapshot.value().backend_prepare_result ||
+      snapshot.value().state != ResolvedPreparedMotionExecutionStateDTO::kPrepared) {
+    release_claim();
+    return reject<void>("prepared execution observation has an invalid state shape",
+                        "prepared_motion_observation_invalid", ErrorCode::kInvariantViolation);
+  }
+  const auto verified = VerifyPreparedOperationParticipant(
+      *snapshot.value().participant, target->binding, target->readiness,
+      target->runtime_policy ? &*target->runtime_policy : nullptr,
+      target->retained_default_stop_limits, target->stop_node_category);
+  if (!verified.ok() ||
+      snapshot.value().participant->ordinary_stop_plan != *target->ordinary_stop_plan ||
+      prepare_participant_result_field_error(*snapshot.value().backend_prepare_result,
+                                             *snapshot.value().participant)
+          .has_value()) {
+    release_claim();
+    return verified.ok()
+               ? reject<void>("prepared participant differs from owner authority",
+                              "prepared_motion_product_mismatch", ErrorCode::kInvariantViolation)
+               : Result<void>::Err(verified.error());
+  }
+
+  bool cancel_instead = false;
+  ContentDigest contract_digest = snapshot.value().participant->prepared_contract_digest;
+  {
+    std::lock_guard state_lock(state_mutex_);
+    auto* operation = find_active_operation_locked(operation_id);
+    if (operation == nullptr || operation->subordinate_id != target->subordinate_id) {
+      return Result<void>::Ok();
+    }
+    operation->prepared_advance_in_flight = false;
+    if (operation->state.active_stop_id.has_value() ||
+        operation->slot_state != ResourceSlotState::kReserved) {
+      cancel_instead = true;
+    } else {
+      auto prepared_state = operation->state;
+      prepared_state.state = OperationStateKind::kPrepared;
+      prepared_state.participants.front().state = OperationStateKind::kPrepared;
+      prepared_state.updated_at_ns = clock_.now();
+      auto durable = journal_.RecordOperationState(
+          config_.request_owner_epoch, prepared_state,
+          operation->runtime_scale_status.has_value() ? &*operation->runtime_scale_status : nullptr,
+          "subordinate_motion_prepared");
+      if (!durable.ok()) {
+        return Result<void>::Err(durable.error());
+      }
+      auto transitioned = resource_slots_->transition(operation->slot_owner, operation->resources,
+                                                      ResourceSlotState::kDispatched);
+      if (!transitioned.ok()) {
+        return transitioned;
+      }
+      operation->slot_state = ResourceSlotState::kDispatched;
+      operation->state = std::move(prepared_state);
+      operation->prepared_participant = *snapshot.value().participant;
+      operation->prepared_dispatch_released = true;
+      operation->dispatch_effect_in_flight = true;
+    }
+  }
+
+  if (cancel_instead) {
+    auto cancelled = target->prepared_engine->CancelPreparedMotion(target->subordinate_id);
+    return cancelled.ok() ? Result<void>::Ok() : Result<void>::Err(cancelled.error());
+  }
+
+  auto dispatched =
+      target->prepared_engine->DispatchPreparedMotion(target->subordinate_id, contract_digest);
+  {
+    std::lock_guard state_lock(state_mutex_);
+    auto* operation = find_active_operation_locked(operation_id);
+    if (operation != nullptr && operation->subordinate_id == target->subordinate_id) {
+      operation->dispatch_effect_in_flight = false;
+      if (!dispatched.ok()) {
+        operation->last_subordinate_error = dispatched.error();
+      }
+    }
+  }
+  if (!dispatched.ok()) {
+    return apply_subordinate_state(operation_id, target->engine, target->subordinate_id,
+                                   OperationStateKind::kInterventionRequired, 0.0,
+                                   dispatched.error());
+  }
+  return Result<void>::Ok();
+}
+
 Result<void> ResourceAddressedExecutionKernel::apply_subordinate_state(
     const OperationId& operation_id, IResolvedParticipantExecutionEngine* engine,
     std::uint64_t subordinate_id, OperationStateKind state, double progress,
@@ -6591,6 +6874,17 @@ Result<void> ResourceAddressedExecutionKernel::apply_subordinate_state(
 
 void ResourceAddressedExecutionKernel::on_engine_event(IResolvedParticipantExecutionEngine* engine,
                                                        const KernelEvent& event) {
+  if (event.type == KernelEventType::kParticipantPrepared) {
+    std::optional<OperationId> operation_id;
+    {
+      std::lock_guard state_lock(state_mutex_);
+      operation_id = find_event_operation_locked(engine, event.execution_id);
+    }
+    if (operation_id.has_value()) {
+      (void)advance_prepared_motion(*operation_id);
+    }
+    return;
+  }
   if (event.type == KernelEventType::kErrorRaised) {
     if (!event.error.has_value()) {
       return;
@@ -6637,11 +6931,13 @@ Result<void> ResourceAddressedExecutionKernel::reconcile_subordinate_state() {
   struct ReconcileTarget final {
     OperationId operation_id;
     IResolvedParticipantExecutionEngine* engine{};
+    IResolvedPreparedParticipantExecutionEngine* prepared_motion_engine{};
     OperationParticipantPayloadKind payload_kind{OperationParticipantPayloadKind::kMotion};
     std::uint64_t subordinate_id{};
     std::uint64_t subordinate_generation{};
     std::string command_target;
     OperationStateKind public_state{OperationStateKind::kPrepared};
+    bool prepared_dispatch_released{};
     std::optional<ControlBindingId> runtime_scale_control_binding_id;
   };
   std::vector<ReconcileTarget> targets;
@@ -6658,6 +6954,10 @@ Result<void> ResourceAddressedExecutionKernel::reconcile_subordinate_state() {
           operation->runtime_scale_effect_in_flight || operation->stop_effect_in_flight) {
         continue;
       }
+      if (operation->payload_kind == OperationParticipantPayloadKind::kMotion &&
+          (operation->prepare_in_flight || operation->subordinate_id == 0U)) {
+        continue;
+      }
       operation->reconciliation_in_flight = true;
       std::optional<ControlBindingId> runtime_scale_control_binding_id;
       if (operation->runtime_scale_status.has_value()) {
@@ -6665,9 +6965,10 @@ Result<void> ResourceAddressedExecutionKernel::reconcile_subordinate_state() {
             operation->binding.value().control_path->control_binding_id;
       }
       targets.push_back(ReconcileTarget{
-          operation_id, operation->engine, operation->payload_kind, operation->subordinate_id,
-          operation->subordinate_generation, operation->binding.value().command_target_id.value(),
-          operation->state.state, std::move(runtime_scale_control_binding_id)});
+          operation_id, operation->engine, operation->prepared_motion_engine,
+          operation->payload_kind, operation->subordinate_id, operation->subordinate_generation,
+          operation->binding.value().command_target_id.value(), operation->state.state,
+          operation->prepared_dispatch_released, std::move(runtime_scale_control_binding_id)});
     }
   }
 
@@ -6675,38 +6976,51 @@ Result<void> ResourceAddressedExecutionKernel::reconcile_subordinate_state() {
   for (const auto& target : targets) {
     Result<void> applied = Result<void>::Ok();
     if (target.payload_kind == OperationParticipantPayloadKind::kMotion) {
-      const auto status = target.engine->get_status();
-      std::optional<ErrorDTO> terminal_error;
-      const auto state = operation_state(status.state);
-      if (state == OperationStateKind::kFailed || state == OperationStateKind::kStopped ||
-          state == OperationStateKind::kInterventionRequired) {
-        terminal_error = status_error(status.last_error);
+      bool dispatch_released = target.prepared_dispatch_released;
+      if (target.prepared_motion_engine != nullptr && !dispatch_released) {
+        applied = advance_prepared_motion(target.operation_id);
+        std::lock_guard state_lock(state_mutex_);
+        const auto* operation = find_active_operation_locked(target.operation_id);
+        dispatch_released = operation != nullptr && operation->prepared_dispatch_released;
       }
-      applied = apply_subordinate_state(target.operation_id, target.engine, target.subordinate_id,
-                                        state, status.progress, std::move(terminal_error));
-      if (applied.ok() && target.runtime_scale_control_binding_id.has_value()) {
-        const auto scale_status = target.engine->runtime_scale_status(
-            target.operation_id, *target.runtime_scale_control_binding_id);
-        if (scale_status.ok()) {
-          applied = apply_runtime_scale_status(target.engine, scale_status.value());
-        } else {
-          std::lock_guard state_lock(state_mutex_);
-          auto* active_operation = find_active_operation_locked(target.operation_id);
-          if (active_operation != nullptr && active_operation->runtime_scale_status.has_value()) {
-            auto public_status = *active_operation->runtime_scale_status;
-            public_status.state = RuntimeScaleApplicationState::kFailed;
-            public_status.updated_at_ns = clock_.now();
-            public_status.participants.front().state = RuntimeScaleApplicationState::kFailed;
-            public_status.participants.front().error = scale_status.error();
-            auto operation_state = active_operation->state;
-            auto durable = journal_.RecordOperationState(config_.request_owner_epoch,
-                                                         operation_state, &public_status,
-                                                         "runtime_scale_reconcile_unavailable");
-            if (!durable.ok()) {
-              applied = Result<void>::Err(durable.error());
-            } else {
-              active_operation->state = std::move(operation_state);
-              active_operation->runtime_scale_status = std::move(public_status);
+      if (!applied.ok() || !dispatch_released) {
+        // Preparation is effect-free. Do not reinterpret the subordinate's
+        // private Planning/Validating state as public execution progress while
+        // the owner still holds the coordinated dispatch barrier.
+      } else {
+        const auto status = target.engine->get_status();
+        std::optional<ErrorDTO> terminal_error;
+        const auto state = operation_state(status.state);
+        if (state == OperationStateKind::kFailed || state == OperationStateKind::kStopped ||
+            state == OperationStateKind::kInterventionRequired) {
+          terminal_error = status_error(status.last_error);
+        }
+        applied = apply_subordinate_state(target.operation_id, target.engine, target.subordinate_id,
+                                          state, status.progress, std::move(terminal_error));
+        if (applied.ok() && target.runtime_scale_control_binding_id.has_value()) {
+          const auto scale_status = target.engine->runtime_scale_status(
+              target.operation_id, *target.runtime_scale_control_binding_id);
+          if (scale_status.ok()) {
+            applied = apply_runtime_scale_status(target.engine, scale_status.value());
+          } else {
+            std::lock_guard state_lock(state_mutex_);
+            auto* active_operation = find_active_operation_locked(target.operation_id);
+            if (active_operation != nullptr && active_operation->runtime_scale_status.has_value()) {
+              auto public_status = *active_operation->runtime_scale_status;
+              public_status.state = RuntimeScaleApplicationState::kFailed;
+              public_status.updated_at_ns = clock_.now();
+              public_status.participants.front().state = RuntimeScaleApplicationState::kFailed;
+              public_status.participants.front().error = scale_status.error();
+              auto operation_state = active_operation->state;
+              auto durable = journal_.RecordOperationState(config_.request_owner_epoch,
+                                                           operation_state, &public_status,
+                                                           "runtime_scale_reconcile_unavailable");
+              if (!durable.ok()) {
+                applied = Result<void>::Err(durable.error());
+              } else {
+                active_operation->state = std::move(operation_state);
+                active_operation->runtime_scale_status = std::move(public_status);
+              }
             }
           }
         }

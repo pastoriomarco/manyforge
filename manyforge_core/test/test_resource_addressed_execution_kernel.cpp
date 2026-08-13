@@ -11,6 +11,8 @@
 #include <future>
 #include <iterator>
 #include <manyforge_core/ports/imotion_preview.hpp>
+#include <manyforge_core/prepared_operation_participant_codec.hpp>
+#include <manyforge_core/prepared_participant_stop_plan_codec.hpp>
 #include <manyforge_core/resolved_stop_base_plan_codec.hpp>
 #include <manyforge_core/resource_addressed_execution_kernel.hpp>
 #include <manyforge_core/time/fake_clock.hpp>
@@ -43,6 +45,7 @@ bool wait_until(Predicate&& predicate,
 }
 
 class FakeParticipantEngine final : public IResolvedParticipantExecutionEngine,
+                                    public IResolvedPreparedParticipantExecutionEngine,
                                     public IMotionPreview,
                                     public IControlDomainExecutionPort {
  public:
@@ -76,6 +79,78 @@ class FakeParticipantEngine final : public IResolvedParticipantExecutionEngine,
       event_during_execute.reset();
     }
     return next_execute_result;
+  }
+
+  Result<std::uint64_t> PrepareMotion(ResolvedPreparedMotionExecutionRequestDTO request) override {
+    ++prepare_motion_calls;
+    Trace("engine:prepare_motion");
+    last_prepared_request = request;
+    if (defer_prepare_completion) {
+      prepared_snapshot = ResolvedPreparedMotionExecutionSnapshotDTO{
+          next_execution_id,
+          ResolvedPreparedMotionExecutionStateDTO::kPreparing,
+          {},
+          std::nullopt,
+          std::nullopt};
+      return Result<std::uint64_t>::Ok(next_execution_id);
+    }
+    auto completed = CompletePreparation();
+    if (!completed.ok()) {
+      return Result<std::uint64_t>::Err(completed.error());
+    }
+    return Result<std::uint64_t>::Ok(next_execution_id);
+  }
+
+  Result<void> complete_preparation() {
+    defer_prepare_completion = false;
+    return CompletePreparation();
+  }
+
+  Result<ResolvedPreparedMotionExecutionSnapshotDTO> ObservePreparedMotion(
+      std::uint64_t execution_id) const override {
+    ++observe_prepared_motion_calls;
+    if (!prepared_snapshot || prepared_snapshot->execution_id != execution_id) {
+      return Result<ResolvedPreparedMotionExecutionSnapshotDTO>::Err(
+          ErrorDTO{std::string(to_string(ErrorCode::kMissingReference)),
+                   "fake prepared execution is unavailable",
+                   {{"reason", "prepared_motion_missing"}}});
+    }
+    return Result<ResolvedPreparedMotionExecutionSnapshotDTO>::Ok(*prepared_snapshot);
+  }
+
+  Result<void> DispatchPreparedMotion(std::uint64_t execution_id,
+                                      const ContentDigest& prepared_contract_digest) override {
+    ++dispatch_prepared_motion_calls;
+    Trace("engine:dispatch_prepared_motion");
+    if (!prepared_snapshot || !prepared_snapshot->participant ||
+        prepared_snapshot->execution_id != execution_id ||
+        prepared_snapshot->participant->prepared_contract_digest != prepared_contract_digest ||
+        !last_prepared_request) {
+      return Result<void>::Err(ErrorDTO{std::string(to_string(ErrorCode::kInvalidRequest)),
+                                        "fake prepared dispatch identity mismatch",
+                                        {{"reason", "prepared_dispatch_mismatch"}}});
+    }
+    prepared_snapshot->state = ResolvedPreparedMotionExecutionStateDTO::kDispatched;
+    auto dispatched = execute(last_prepared_request->execution_request);
+    return dispatched.ok() ? Result<void>::Ok() : Result<void>::Err(dispatched.error());
+  }
+
+  Result<void> CancelPreparedMotion(std::uint64_t execution_id) override {
+    ++cancel_prepared_motion_calls;
+    Trace("engine:cancel_prepared_motion");
+    if (!prepared_snapshot || prepared_snapshot->execution_id != execution_id) {
+      return Result<void>::Err(ErrorDTO{std::string(to_string(ErrorCode::kMissingReference)),
+                                        "fake prepared execution is unavailable",
+                                        {{"reason", "prepared_motion_missing"}}});
+    }
+    if (prepared_snapshot->state == ResolvedPreparedMotionExecutionStateDTO::kDispatched) {
+      return Result<void>::Err(ErrorDTO{std::string(to_string(ErrorCode::kInvalidStateTransition)),
+                                        "fake prepared execution already dispatched",
+                                        {{"reason", "prepared_motion_already_dispatched"}}});
+    }
+    prepared_snapshot->state = ResolvedPreparedMotionExecutionStateDTO::kCancelledPreDispatch;
+    status.state = ExecutionState::kStopped;
+    return Result<void>::Ok();
   }
 
   Result<RobotStateDTO> current_preview_state(std::int64_t) const override {
@@ -393,6 +468,10 @@ class FakeParticipantEngine final : public IResolvedParticipantExecutionEngine,
   }
 
   int execute_calls{};
+  int prepare_motion_calls{};
+  mutable int observe_prepared_motion_calls{};
+  int dispatch_prepared_motion_calls{};
+  int cancel_prepared_motion_calls{};
   int preview_calls{};
   int command_calls{};
   mutable int validate_command_calls{};
@@ -418,10 +497,14 @@ class FakeParticipantEngine final : public IResolvedParticipantExecutionEngine,
   RuntimeScaleMechanismStatusDTO runtime_scale{true, false, 1.0, 1.0, 0.0, 1U, 1, std::nullopt};
   ExecutionStatus status{};
   std::optional<KernelEvent> event_during_execute;
+  bool defer_prepare_completion{};
+  std::optional<ErrorDTO> prepare_failure;
   std::function<void()> pause_effect_hook;
   std::function<void()> translate_stop_stage_hook;
   GripperCommandStatusDTO gripper_status{};
   std::optional<ExecuteRequestDTO> last_execute;
+  std::optional<ResolvedPreparedMotionExecutionRequestDTO> last_prepared_request;
+  mutable std::optional<ResolvedPreparedMotionExecutionSnapshotDTO> prepared_snapshot;
   std::optional<ExecuteRequestDTO> last_preview;
   std::optional<ResolvedRuntimeScaleCommandDTO> last_runtime_scale_command;
   std::optional<GripperCommandRequestDTO> last_command;
@@ -429,6 +512,271 @@ class FakeParticipantEngine final : public IResolvedParticipantExecutionEngine,
   std::vector<std::string>* timeline{};
 
  private:
+  static std::string Digest(char digit) { return "sha256:" + std::string(64U, digit); }
+
+  static Result<PreparedOperationParticipantDTO> MakePreparedMotionParticipant(
+      const ResolvedPreparedMotionExecutionRequestDTO& authority) {
+    const auto& request = authority.execution_request;
+    const auto& binding = authority.binding.value();
+    const auto& control = *binding.control_path;
+    std::vector<CoordinatePositionDTO> positions;
+    positions.reserve(binding.resources.size());
+    for (const auto& resource : binding.resources) {
+      positions.emplace_back(resource.coordinate_kind == CoordinateKind::kAngular
+                                 ? CoordinatePositionDTO{AngularPositionDTO{0.0}}
+                                 : CoordinatePositionDTO{LinearPositionDTO{0.0}});
+    }
+    ControlledStateDTO start{binding.controllable_component_id,
+                             binding.command_target_id,
+                             control.control_domain_id,
+                             control.control_domain_revision,
+                             control.control_binding_id,
+                             control.control_binding_revision,
+                             control.controller_topology_id,
+                             control.topology_revision,
+                             control.control_route_id,
+                             control.active_control_configuration_id,
+                             control.active_control_configuration_generation,
+                             request.binding.resources,
+                             request.binding.model_group_binding.compiled_joint_names,
+                             std::move(positions),
+                             std::nullopt};
+    ProjectionRevisionDTO projection{
+        binding.retained_bundle_id, binding.graph_revision,
+        SceneRevision{SceneId(Digest('a')), 1U, ContentDigest(Digest('b'))}};
+    PlanRequestDTO plan_request{
+        request.binding.operation_id,
+        request.binding.participant_id,
+        request.binding.program_id,
+        request.binding.program_revision,
+        request.binding.program_binding_id,
+        request.binding.program_run_id,
+        MoveId(request.move_id),
+        request.binding.controllable_component_id,
+        request.binding.component_type_id,
+        request.binding.component_type_revision,
+        request.binding.command_target_id,
+        request.binding.capability_id,
+        request.binding.capability_definition_revision,
+        request.binding.planner_capability_binding,
+        request.binding.model_bindings,
+        request.binding.model_group_binding,
+        request.binding.control_domain_id,
+        request.binding.control_domain_revision,
+        request.binding.control_binding_id,
+        request.binding.control_binding_revision,
+        request.binding.control_interface_contract_id,
+        request.binding.control_interface_revision,
+        request.binding.controller_topology_id,
+        request.binding.topology_revision,
+        request.binding.control_route_id,
+        request.binding.activation_set_id,
+        request.binding.active_control_configuration_id,
+        request.binding.active_control_configuration_generation,
+        request.binding.provider_instance_id,
+        request.binding.provider_manifest_id,
+        request.binding.provider_manifest_revision,
+        request.binding.provider_runtime_epoch,
+        request.binding.runtime_unit_bindings,
+        request.binding.resources,
+        request.action_span,
+        request.binding.base_frame,
+        request.binding.tcp_frame,
+        start,
+        request.motion,
+        request.tolerances,
+        request.speed_profile,
+        request.planning_profile,
+        request.contact_policy_id.empty() ? std::nullopt
+                                          : std::optional<std::string>{request.contact_policy_id},
+        request.per_resource_dynamics_limits,
+        request.timeouts.planning_timeout_s,
+        0U,
+        ProjectionLeaseBindingDTO{projection, ProjectionLeaseId("lease.test")},
+        request.binding.component_attachment_revisions,
+        request.binding.carried_object_attachment_revisions,
+        {},
+        {}};
+    std::vector<double> zeros(request.binding.resources.size(), 0.0);
+    TrajectoryDTO trajectory{request.binding.resources,
+                             request.binding.model_group_binding.compiled_joint_names,
+                             {{0.0, zeros, {}, {}}, {1.0, zeros, {}, {}}}};
+    PlanResultDTO planning_result{trajectory, std::nullopt, projection};
+    CollisionWorldRevision world{1U, Digest('c')};
+    CollisionDecision decision;
+    decision.accepted = true;
+    decision.severity = CollisionDecisionSeverity::kNone;
+    decision.action = CollisionDecisionAction::kDispatch;
+    decision.collision_world_revision = world;
+
+    std::vector<PreparedMotionInterruptScopeDTO> scopes;
+    for (const auto& scope : request.motion_interrupt_scopes) {
+      if (!scope.stop_profile) {
+        return Result<PreparedOperationParticipantDTO>::Err(
+            ErrorDTO{std::string(to_string(ErrorCode::kInvalidRequest)),
+                     "fake prepared scope has no Stop profile",
+                     {{"reason", "stop_profile_missing"}}});
+      }
+      PreparedParticipantStopPlanContextDTO context{
+          request.binding.operation_id,
+          authority.operation_revision,
+          request.binding.participant_id,
+          request.binding.program_id,
+          request.binding.program_revision,
+          request.binding.program_binding_id,
+          request.binding.program_run_id,
+          scope.stop_profile,
+          ParticipantStopProfilePurposeDTO::kMotionInterruptScope,
+          scope.scope_id,
+          scope.node_category};
+      auto stop = MakePreparedParticipantStopPlan(
+          authority.stop_readiness.value().resolved_stop_base_plan, std::move(context),
+          binding.resources, authority.retained_default_stop_limits);
+      if (!stop.ok()) {
+        return Result<PreparedOperationParticipantDTO>::Err(stop.error());
+      }
+      scopes.push_back({MotionInterruptScopeId(scope.scope_id), InterruptPolicyId(scope.policy_id),
+                        scope.activation_mode, scope.arm_timeout_ns, scope.result_binding_key,
+                        scope.required, *scope.stop_profile, scope.node_category, scope.metadata,
+                        std::move(stop.value())});
+    }
+    std::sort(scopes.begin(), scopes.end(),
+              [](const auto& left, const auto& right) { return left.scope_id < right.scope_id; });
+
+    std::optional<PreparedContactPolicyRefDTO> contact_policy;
+    if (request.resolved_contact_grasp) {
+      contact_policy =
+          PreparedContactPolicyRefDTO{request.resolved_contact_grasp->contact_policy_id,
+                                      request.resolved_contact_grasp->contact_policy_revision};
+    }
+    PreparedMotionExecutionDTO payload{
+        MoveId(request.move_id),
+        plan_request,
+        trajectory,
+        start,
+        {std::move(planning_result), 0U, request.binding.planner_capability_binding},
+        {ValidationRevision("validation.test"), ValidationResultDTO{true, std::nullopt}, world,
+         CollisionPolicyRevision{1U, Digest('d')}, decision},
+        std::move(contact_policy),
+        {authority.runtime_policy.value().policy.runtime_policy_id,
+         authority.runtime_policy.value().policy.runtime_policy_revision},
+        std::move(scopes),
+        request.timeouts.execution_timeout_s};
+
+    std::vector<ResourceId> resources = request.binding.resources;
+    std::sort(resources.begin(), resources.end());
+    std::optional<PreparedCapabilityProviderRuntimeOccurrenceDTO> capability_provider;
+    if (binding.capability_provider_path) {
+      const auto& provider = *binding.capability_provider_path;
+      capability_provider = PreparedCapabilityProviderRuntimeOccurrenceDTO{
+          provider.capability_provider_binding_id,
+          provider.capability_provider_binding_revision,
+          {provider.provider_instance_id, provider.provider_manifest_id,
+           provider.provider_manifest_revision, provider.provider_runtime_unit_id,
+           provider.provider_runtime_epoch}};
+    }
+    PreparedOperationParticipantDTO candidate{
+        ContentDigest("pending"),
+        request.binding.operation_id,
+        authority.operation_revision,
+        request.binding.participant_id,
+        binding.program_id,
+        binding.program_revision,
+        binding.program_binding_id,
+        request.binding.program_run_id,
+        binding.retained_bundle_id,
+        binding.graph_revision,
+        binding.controllable_component_id,
+        authority.stop_readiness.value().component_lifecycle_generation,
+        binding.component_type_id,
+        binding.component_type_revision,
+        binding.command_target_id,
+        binding.capability_id,
+        binding.capability_definition_revision,
+        binding.model_bindings,
+        binding.frame_bindings,
+        control.control_domain_id,
+        control.control_domain_revision,
+        control.control_binding_id,
+        control.control_binding_revision,
+        control.control_interface_contract_id,
+        control.control_interface_revision,
+        control.controller_topology_id,
+        control.topology_revision,
+        control.control_route_id,
+        control.activation_set_id,
+        {control.provider_instance_id, control.provider_manifest_id,
+         control.provider_manifest_revision, control.provider_runtime_unit_id,
+         control.provider_runtime_epoch},
+        std::move(capability_provider),
+        std::move(resources),
+        PreparedParticipantFocusedPortDTO{control.provider_runtime_unit_id},
+        {},
+        {},
+        control.active_control_configuration_id,
+        control.active_control_configuration_generation,
+        binding.runtime_unit_epochs,
+        control.stop_evidence_policy_id,
+        control.stop_evidence_policy_revision,
+        *authority.ordinary_stop_plan,
+        std::move(payload)};
+    return MakePreparedOperationParticipant(std::move(candidate), authority.binding,
+                                            authority.stop_readiness, &authority.runtime_policy,
+                                            authority.retained_default_stop_limits,
+                                            authority.stop_node_category);
+  }
+
+  Result<void> CompletePreparation() {
+    if (!last_prepared_request.has_value()) {
+      return Result<void>::Err(ErrorDTO{std::string(to_string(ErrorCode::kInvalidStateTransition)),
+                                        "fake preparation has no retained request",
+                                        {{"reason", "prepared_motion_request_missing"}}});
+    }
+    if (prepare_failure.has_value()) {
+      prepared_snapshot = ResolvedPreparedMotionExecutionSnapshotDTO{
+          next_execution_id,
+          ResolvedPreparedMotionExecutionStateDTO::kPreparationFailed,
+          {},
+          std::nullopt,
+          prepare_failure};
+      return Result<void>::Ok();
+    }
+    auto participant = MakePreparedMotionParticipant(*last_prepared_request);
+    if (!participant.ok()) {
+      prepared_snapshot = ResolvedPreparedMotionExecutionSnapshotDTO{
+          next_execution_id,
+          ResolvedPreparedMotionExecutionStateDTO::kPreparationFailed,
+          {},
+          std::nullopt,
+          participant.error()};
+      return Result<void>::Err(participant.error());
+    }
+    auto retained =
+        std::make_shared<const PreparedOperationParticipantDTO>(std::move(participant.value()));
+    auto backend_prepare =
+        MakePrepareParticipantResult(*retained, PrepareParticipantResultStateDTO::kPrepared);
+    if (!backend_prepare.ok()) {
+      return Result<void>::Err(backend_prepare.error());
+    }
+    prepared_snapshot = ResolvedPreparedMotionExecutionSnapshotDTO{
+        next_execution_id, ResolvedPreparedMotionExecutionStateDTO::kPrepared, retained,
+        std::move(backend_prepare.value()), std::nullopt};
+    const KernelEvent event{
+        KernelEventType::kParticipantPrepared,
+        next_execution_id,
+        0,
+        {},
+        {},
+        std::nullopt,
+        {{"prepared_contract_digest", retained->prepared_contract_digest.value()}}};
+    const auto snapshot = callbacks;
+    for (const auto& [id, callback] : snapshot) {
+      (void)id;
+      callback(event);
+    }
+    return Result<void>::Ok();
+  }
+
   void Trace(std::string value) {
     if (timeline != nullptr) {
       timeline->push_back(std::move(value));
@@ -876,7 +1224,8 @@ FakeOperationJournal default_journal;
       MotionInterruptNodeCategory::kGeneric,
       &engine,
       dynamic_cast<IControlDomainExecutionPort*>(&engine),
-      std::move(runtime_policy.value())};
+      std::move(runtime_policy.value()),
+      dynamic_cast<IResolvedPreparedParticipantExecutionEngine*>(&engine)};
 }
 
 [[nodiscard]] RuntimeParticipantExecutionRegistration unqualified_registration(
@@ -1236,6 +1585,8 @@ TEST(ResourceAddressedExecutionKernelTest, ResolvesPortableMotionAndReservesExac
                                    ? result.error().details.at("reason")
                                    : "");
   EXPECT_EQ(result.value().accepted_at_ns, 1234);
+  EXPECT_EQ(engine.prepare_motion_calls, 1);
+  EXPECT_EQ(engine.dispatch_prepared_motion_calls, 1);
   EXPECT_EQ(engine.execute_calls, 1);
   ASSERT_TRUE(engine.last_execute.has_value());
   EXPECT_EQ(engine.last_execute->binding.controllable_component_id.value(), "robot.1");
@@ -1253,12 +1604,118 @@ TEST(ResourceAddressedExecutionKernelTest, ResolvesPortableMotionAndReservesExac
   const auto slots = kernel.resource_snapshot();
   ASSERT_EQ(slots.size(), 1U);
   EXPECT_EQ(slots.front().resource_id.value(), "robot.joint_1");
-  EXPECT_EQ(slots.front().state, ResourceSlotState::kReserved);
+  EXPECT_EQ(slots.front().state, ResourceSlotState::kDispatched);
 
   const auto state = kernel.get_operation_state(result.value().operation_id);
   ASSERT_TRUE(state.ok()) << state.error().message;
-  EXPECT_EQ(state.value().state, OperationStateKind::kPlanning);
+  EXPECT_EQ(state.value().state, OperationStateKind::kPrepared);
   EXPECT_EQ(state.value().participants.front().command_target_id.value(), "arm");
+}
+
+TEST(ResourceAddressedExecutionKernelTest,
+     PreparedMotionDoesNotDispatchUntilTheExactPreparationCompletes) {
+  FakeClock clock;
+  FakeParticipantEngine engine;
+  engine.defer_prepare_completion = true;
+  ResourceAddressedExecutionKernel kernel(
+      {registration(
+          make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular),
+          engine)},
+      clock, default_journal,
+      ResourceAddressedExecutionKernelConfig{RequestOwnerEpoch("kernel.epoch.1"),
+                                             CellId("cell.test"), 8U});
+
+  const auto accepted = kernel.execute(motion_operation("request.motion.held-prepare"));
+  ASSERT_TRUE(accepted.ok()) << accepted.error().message;
+  EXPECT_EQ(engine.prepare_motion_calls, 1);
+  EXPECT_EQ(engine.dispatch_prepared_motion_calls, 0);
+  EXPECT_EQ(engine.execute_calls, 0);
+  const auto preparing = kernel.get_operation_state(accepted.value().operation_id);
+  ASSERT_TRUE(preparing.ok()) << preparing.error().message;
+  EXPECT_EQ(preparing.value().state, OperationStateKind::kPlanning);
+  ASSERT_EQ(kernel.resource_snapshot().size(), 1U);
+  EXPECT_EQ(kernel.resource_snapshot().front().state, ResourceSlotState::kReserved);
+
+  const auto completed = engine.complete_preparation();
+  ASSERT_TRUE(completed.ok()) << completed.error().message;
+  ASSERT_TRUE(wait_until([&] { return engine.dispatch_prepared_motion_calls == 1; }));
+  EXPECT_EQ(engine.execute_calls, 1);
+  const auto prepared = kernel.get_operation_state(accepted.value().operation_id);
+  ASSERT_TRUE(prepared.ok()) << prepared.error().message;
+  EXPECT_EQ(prepared.value().state, OperationStateKind::kPrepared);
+  EXPECT_EQ(kernel.resource_snapshot().front().state, ResourceSlotState::kDispatched);
+}
+
+TEST(ResourceAddressedExecutionKernelTest,
+     PreparationFailureIsDurableAndCannotDispatchPhysicalMotion) {
+  FakeClock clock;
+  FakeParticipantEngine engine;
+  engine.prepare_failure = ErrorDTO{std::string(to_string(ErrorCode::kExecutionRejected)),
+                                    "injected preparation failure",
+                                    {{"reason", "injected_preparation_failure"}}};
+  ResourceAddressedExecutionKernel kernel(
+      {registration(
+          make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular),
+          engine)},
+      clock, default_journal,
+      ResourceAddressedExecutionKernelConfig{RequestOwnerEpoch("kernel.epoch.1"),
+                                             CellId("cell.test"), 8U});
+
+  const auto accepted = kernel.execute(motion_operation("request.motion.rejected-prepare"));
+  ASSERT_TRUE(accepted.ok()) << accepted.error().message;
+  EXPECT_EQ(engine.prepare_motion_calls, 1);
+  EXPECT_EQ(engine.dispatch_prepared_motion_calls, 0);
+  EXPECT_EQ(engine.execute_calls, 0);
+  const auto failed = kernel.get_operation_state(accepted.value().operation_id);
+  ASSERT_TRUE(failed.ok()) << failed.error().message;
+  EXPECT_EQ(failed.value().state, OperationStateKind::kInterventionRequired);
+  ASSERT_TRUE(failed.value().participants.front().terminal_error.has_value());
+  EXPECT_EQ(failed.value().participants.front().terminal_error->details.at("reason"),
+            "injected_preparation_failure");
+  ASSERT_EQ(kernel.resource_snapshot().size(), 1U);
+  EXPECT_EQ(kernel.resource_snapshot().front().state, ResourceSlotState::kTerminal);
+}
+
+TEST(ResourceAddressedExecutionKernelTest,
+     StopCancelsHeldPreparationWithoutDispatchingAStopStageOrMotion) {
+  FakeClock clock;
+  FakeParticipantEngine engine;
+  engine.defer_prepare_completion = true;
+  ResourceAddressedExecutionKernel kernel(
+      {registration(
+          make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular),
+          engine)},
+      clock, default_journal,
+      ResourceAddressedExecutionKernelConfig{RequestOwnerEpoch("kernel.epoch.1"),
+                                             CellId("cell.test"), 8U});
+
+  const auto accepted = kernel.execute(motion_operation("request.motion.cancel-prepare"));
+  ASSERT_TRUE(accepted.ok()) << accepted.error().message;
+  const auto stopped =
+      kernel.stop(stop_request("request.stop.cancel-prepare", accepted.value(), 1U));
+  ASSERT_TRUE(stopped.ok()) << stopped.error().message;
+  ASSERT_TRUE(wait_until([&] { return engine.cancel_prepared_motion_calls == 1; }));
+  EXPECT_EQ(engine.dispatch_prepared_motion_calls, 0);
+  EXPECT_EQ(engine.execute_calls, 0);
+  EXPECT_EQ(engine.translate_stop_stage_calls.load(), 0);
+  ASSERT_TRUE(wait_until([&] {
+    const auto status = kernel.get_stop_status(stopped.value().stop_id);
+    return status.ok() && status.value().state == StopStatusStateDTO::kSucceeded;
+  }));
+
+  const auto status = kernel.get_stop_status(stopped.value().stop_id);
+  ASSERT_TRUE(status.ok()) << status.error().message;
+  ASSERT_TRUE(status.value().stop_certificate.has_value());
+  const auto certificate =
+      kernel.get_stop_certificate(status.value().stop_certificate->stop_certificate_id);
+  ASSERT_TRUE(certificate.ok()) << certificate.error().message;
+  ASSERT_EQ(certificate.value().scope_entries.size(), 1U);
+  EXPECT_EQ(certificate.value().scope_entries.front().dispatch_state,
+            StopScopeDispatchStateDTO::kNeverDispatchedCancelled);
+  EXPECT_TRUE(certificate.value().attempted_stage_results.empty());
+  const auto operation = kernel.get_operation_state(accepted.value().operation_id);
+  ASSERT_TRUE(operation.ok()) << operation.error().message;
+  EXPECT_EQ(operation.value().state, OperationStateKind::kStopped);
 }
 
 TEST(ResourceAddressedExecutionKernelTest,
@@ -1432,11 +1889,11 @@ TEST(ResourceAddressedExecutionKernelTest,
   EXPECT_EQ(resolved_goal.joint_names, (std::vector<std::string>{"mf2_robot_2_joint_1"}));
 
   second_engine.emit_transition(ExecutionState::kPlanning, ExecutionState::kExecuting);
-  const auto first_still_planning = kernel.get_operation_state(first.value().operation_id);
+  const auto first_still_prepared = kernel.get_operation_state(first.value().operation_id);
   const auto second_executing = kernel.get_operation_state(second.value().operation_id);
-  ASSERT_TRUE(first_still_planning.ok()) << first_still_planning.error().message;
+  ASSERT_TRUE(first_still_prepared.ok()) << first_still_prepared.error().message;
   ASSERT_TRUE(second_executing.ok()) << second_executing.error().message;
-  EXPECT_EQ(first_still_planning.value().state, OperationStateKind::kPlanning);
+  EXPECT_EQ(first_still_prepared.value().state, OperationStateKind::kPrepared);
   EXPECT_EQ(second_executing.value().state, OperationStateKind::kExecuting);
 
   first_engine.emit_transition(ExecutionState::kPlanning, ExecutionState::kCompleted);
@@ -1489,7 +1946,7 @@ TEST(ResourceAddressedExecutionKernelTest,
 
   const auto first_state = kernel.get_operation_state(first.value().operation_id);
   ASSERT_TRUE(first_state.ok()) << first_state.error().message;
-  EXPECT_EQ(first_state.value().state, OperationStateKind::kPlanning);
+  EXPECT_EQ(first_state.value().state, OperationStateKind::kPrepared);
   const auto slots = kernel.resource_snapshot();
   ASSERT_EQ(slots.size(), 1U);
   ASSERT_TRUE(slots.front().owner.has_value());
@@ -1526,7 +1983,7 @@ TEST(ResourceAddressedExecutionKernelTest,
   });
   ASSERT_NE(first_slot, slots.end());
   ASSERT_NE(second_slot, slots.end());
-  EXPECT_EQ(first_slot->state, ResourceSlotState::kReserved);
+  EXPECT_EQ(first_slot->state, ResourceSlotState::kDispatched);
   EXPECT_EQ(second_slot->state, ResourceSlotState::kFree);
 }
 
@@ -1556,7 +2013,7 @@ TEST(ResourceAddressedExecutionKernelTest,
   ASSERT_TRUE(second.ok()) << second.error().message;
   const auto after_late_event = kernel.get_operation_state(second.value().operation_id);
   ASSERT_TRUE(after_late_event.ok()) << after_late_event.error().message;
-  EXPECT_EQ(after_late_event.value().state, OperationStateKind::kPlanning);
+  EXPECT_EQ(after_late_event.value().state, OperationStateKind::kPrepared);
 
   engine.emit_transition(ExecutionState::kPlanning, ExecutionState::kExecuting);
   const auto after_exact_event = kernel.get_operation_state(second.value().operation_id);
@@ -1755,9 +2212,9 @@ TEST(ResourceAddressedExecutionKernelTest, UsesOneInjectedGateForTheActualSlotTa
   EXPECT_EQ(engine.execute_calls, 1);
   const auto admitted =
       kernel.resource_admission_table()->admission_snapshot({ResourceId("robot.joint_1")});
-  EXPECT_EQ(admitted.operation_resource_generation, 1U);
-  EXPECT_EQ(admitted.affected_queued_operation_count, 1U);
-  EXPECT_EQ(admitted.affected_active_operation_count, 0U);
+  EXPECT_EQ(admitted.operation_resource_generation, 2U);
+  EXPECT_EQ(admitted.affected_queued_operation_count, 0U);
+  EXPECT_EQ(admitted.affected_active_operation_count, 1U);
 }
 
 TEST(ResourceAddressedExecutionKernelTest,
@@ -3847,9 +4304,15 @@ TEST(ResourceAddressedExecutionKernelTest,
 
   const auto accepted = kernel.execute(motion_operation());
   ASSERT_TRUE(accepted.ok()) << accepted.error().message;
-  ASSERT_GE(timeline.size(), 2U);
-  EXPECT_EQ(timeline.front(), "journal:operation_accepted");
-  EXPECT_EQ(timeline[1], "engine:execute");
+  EXPECT_EQ(timeline, (std::vector<std::string>{
+                          "journal:operation_accepted",
+                          "engine:prepare_motion",
+                          "journal:state:subordinate_motion_admitted",
+                          "journal:state:subordinate_motion_prepared",
+                          "engine:dispatch_prepared_motion",
+                          "engine:execute",
+                          "engine:set_runtime_scale",
+                      }));
 
   FakeParticipantEngine rejected_engine;
   FakeOperationJournal failing_journal;
@@ -4038,7 +4501,7 @@ TEST(ResourceAddressedExecutionKernelTest,
   EXPECT_EQ(candidate_engine.subscription_count(), 1U);
   const auto occupied = kernel.resource_snapshot();
   ASSERT_EQ(occupied.size(), 1U);
-  EXPECT_EQ(occupied.front().state, ResourceSlotState::kReserved);
+  EXPECT_EQ(occupied.front().state, ResourceSlotState::kDispatched);
   ASSERT_TRUE(occupied.front().owner.has_value());
   EXPECT_EQ(occupied.front().owner->operation_id, predecessor.value().operation_id);
 

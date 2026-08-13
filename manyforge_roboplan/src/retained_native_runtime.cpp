@@ -289,7 +289,9 @@ runtime_registration(
   return core::RuntimeParticipantExecutionRegistration{
       std::move(binding), readiness, std::move(defaults),
       core::MotionInterruptNodeCategory::kGeneric, engine,
-      stop_execution_port, runtime_policy};
+      stop_execution_port, runtime_policy,
+      dynamic_cast<core::IResolvedPreparedParticipantExecutionEngine *>(
+          engine)};
 }
 
 [[nodiscard]] bool same_supporting_provider_runtime(

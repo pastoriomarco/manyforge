@@ -28,6 +28,7 @@
 #include <manyforge_core/ports/iplanner_backend.hpp>
 #include <manyforge_core/ports/ireference_pose_resolver.hpp>
 #include <manyforge_core/ports/iresolved_participant_execution_engine.hpp>
+#include <manyforge_core/ports/iresolved_prepared_participant_execution_engine.hpp>
 #include <manyforge_core/ports/irobot_kinematics.hpp>
 #include <manyforge_core/ports/itrajectory_validator.hpp>
 #include <manyforge_core/runtime_collision_lookahead_session.hpp>
@@ -58,6 +59,9 @@
 #include <vector>
 
 namespace manyforge::core {
+
+inline constexpr std::string_view kExecutionKernelValidationRevision =
+    "manyforge.core.trajectory-validation.v1";
 
 struct ExecutionKernelConfig {
   Duration collision_monitor_period_ns = 50'000'000;  // 50 ms / 20 Hz
@@ -235,6 +239,11 @@ struct ExecutionKernelConfig {
   // stop is "I am taking back control, decelerate cleanly along the
   // current path" (default soft-on-path).
   std::shared_ptr<MotionInterruptStopProfileDTO> operator_stop_profile;
+
+  /// Exact implementation revision of the Kernel-owned validation pipeline
+  /// recorded in every prepared motion participant. A changed pipeline
+  /// contract rotates this value; operation callers never supply it.
+  ValidationRevision validation_revision{std::string(kExecutionKernelValidationRevision)};
 };
 
 enum class RuntimeCollisionMonitorRelease {
@@ -272,6 +281,7 @@ struct ExecutionKernelPorts {
 /// Spec 230: all operations are ROS-free. This is an async v0.1
 /// implementation with event subscription.
 class ExecutionKernel : public IResolvedParticipantExecutionEngine,
+                        public IResolvedPreparedParticipantExecutionEngine,
                         public IMotionPreview {
  public:
   ExecutionKernel(IPlannerBackend& planner, ExecutionKernelPorts ports,
@@ -284,6 +294,13 @@ class ExecutionKernel : public IResolvedParticipantExecutionEngine,
   /// Returns execution_id immediately; plan → validate → dispatch runs
   /// on a worker thread. Callers observe progress via get_status() and events.
   Result<uint64_t> execute(const ExecuteRequestDTO& request) override;
+
+  Result<std::uint64_t> PrepareMotion(ResolvedPreparedMotionExecutionRequestDTO request) override;
+  Result<ResolvedPreparedMotionExecutionSnapshotDTO> ObservePreparedMotion(
+      std::uint64_t execution_id) const override;
+  Result<void> DispatchPreparedMotion(std::uint64_t execution_id,
+                                      const ContentDigest& prepared_contract_digest) override;
+  Result<void> CancelPreparedMotion(std::uint64_t execution_id) override;
 
   /// Plan and authoritatively validate one already-resolved motion without
   /// dispatching, journaling, caching, publishing execution state, or
@@ -501,6 +518,21 @@ class ExecutionKernel : public IResolvedParticipantExecutionEngine,
   std::string dump_flight_record(const char* reason) noexcept;
 
  private:
+  struct PreparedMotionSession;
+  struct PlanningSuccess;
+  struct ExecuteWorkerPlanPhaseResult;
+  struct ExecuteWorkerValidationPhaseResult;
+
+  Result<std::uint64_t> execute_impl(const ExecuteRequestDTO& request,
+                                     std::shared_ptr<PreparedMotionSession> prepared_session);
+  Result<PlanRequestDTO> make_plan_request(const ExecuteRequestDTO& request,
+                                           const CollisionWorldLeaseInventory& projection_inventory,
+                                           std::uint32_t planning_attempt_index,
+                                           const RobotStateDTO* start_state_override = nullptr);
+  Result<PlanningSuccess> plan_trajectory_with_evidence(
+      const ExecuteRequestDTO& request, const CollisionWorldLeaseInventory& projection_inventory,
+      std::uint32_t planning_attempt_index = 0,
+      const RobotStateDTO* start_state_override = nullptr);
   Result<TrajectoryDTO> plan_trajectory(const ExecuteRequestDTO& request,
                                         const CollisionWorldLeaseInventory& projection_inventory,
                                         std::uint32_t planning_attempt_index = 0,
@@ -538,6 +570,9 @@ class ExecutionKernel : public IResolvedParticipantExecutionEngine,
 
   struct CollisionValidationSuccess {
     CollisionWorldRevision collision_world_revision;
+    CollisionPolicyRevision collision_policy_revision;
+    ValidationResultDTO noncollision_result;
+    CollisionDecision collision_decision;
     TrajectoryDTO collision_trajectory;
     std::optional<SceneSnapshotLease> scene_snapshot_lease;
     ParallelValidationTelemetry telemetry;
@@ -556,7 +591,14 @@ class ExecutionKernel : public IResolvedParticipantExecutionEngine,
                             std::optional<TrajectoryDTO> cached_trajectory,
                             bool cache_revalidation_candidate,
                             RetainedSceneSnapshotLease retained_scene,
-                            std::optional<SceneSnapshotLease> scene_snapshot_lease);
+                            std::optional<SceneSnapshotLease> scene_snapshot_lease,
+                            std::shared_ptr<PreparedMotionSession> prepared_session = {});
+
+  Result<std::shared_ptr<const PreparedOperationParticipantDTO>>
+  make_and_prepare_motion_participant(
+      const ExecuteRequestDTO& request, const ExecuteWorkerPlanPhaseResult& plan_phase,
+      const ExecuteWorkerValidationPhaseResult& validation_phase,
+      const std::shared_ptr<PreparedMotionSession>& prepared_session);
 
   /// Emit an event to all subscribers.
   void emit_event(KernelEvent event);
@@ -740,6 +782,8 @@ class ExecutionKernel : public IResolvedParticipantExecutionEngine,
   struct ExecuteWorkerPlanPhaseResult {
     ExecuteWorkerPhaseStatus status = ExecuteWorkerPhaseStatus::kContinue;
     TrajectoryDTO trajectory;
+    std::optional<PlanRequestDTO> plan_request;
+    std::optional<PlanResultDTO> planning_result;
     bool active_trajectory_from_cache = false;
     bool cache_revalidation_candidate = false;
   };
@@ -749,6 +793,7 @@ class ExecutionKernel : public IResolvedParticipantExecutionEngine,
     CollisionWorldRevision collision_world_revision;
     std::optional<SceneSnapshotLease> scene_snapshot_lease;
     std::shared_ptr<const TrajectoryDTO> collision_trajectory;
+    std::optional<PreparedMotionValidationEvidenceDTO> validation_evidence;
   };
 
   struct ExecuteWorkerDispatchPhaseResult {
@@ -785,7 +830,8 @@ class ExecutionKernel : public IResolvedParticipantExecutionEngine,
 
   ExecuteWorkerValidationPhaseResult execute_worker_validate_replan_phase(
       std::stop_token st, const ExecuteRequestDTO& request, std::uint64_t exec_id,
-      TrajectoryDTO& trajectory, bool& active_trajectory_from_cache,
+      TrajectoryDTO& trajectory, std::optional<PlanRequestDTO>& plan_request,
+      std::optional<PlanResultDTO>& planning_result, bool& active_trajectory_from_cache,
       bool& cache_revalidation_candidate,
       CollisionWorldLeaseInventory& scene_snapshot_lease_inventory,
       const std::optional<SceneSnapshotLease>& scene_snapshot_lease,
@@ -799,6 +845,7 @@ class ExecutionKernel : public IResolvedParticipantExecutionEngine,
       const CollisionWorldRevision& validation_world_revision,
       const std::optional<SceneSnapshotLease>& scene_snapshot_lease,
       std::shared_ptr<const TrajectoryDTO> collision_trajectory,
+      std::shared_ptr<const PreparedOperationParticipantDTO> prepared_participant,
       ActiveMotionExecution& motion_state);
 
   void execute_worker_finalize_phase(const ExecuteRequestDTO& request, std::uint64_t exec_id,
@@ -1033,6 +1080,9 @@ class ExecutionKernel : public IResolvedParticipantExecutionEngine,
   mutable std::mutex motion_outcomes_mutex_;
   std::map<std::uint64_t, MotionExecutionOutcomeDTO> motion_execution_outcomes_;
   std::vector<std::uint64_t> motion_outcome_order_;
+
+  mutable std::mutex prepared_motion_session_mutex_;
+  std::shared_ptr<PreparedMotionSession> active_prepared_motion_session_;
 
   // Declared last so its destructor runs first after the kernel destructor body.
   // The destructor body already stops/drains it explicitly; this member order is

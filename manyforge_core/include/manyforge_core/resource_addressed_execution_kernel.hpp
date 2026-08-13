@@ -12,6 +12,7 @@
 #include <manyforge_core/ports/icontrol_domain_execution_port.hpp>
 #include <manyforge_core/ports/ioperation_journal.hpp>
 #include <manyforge_core/ports/iresolved_participant_execution_engine.hpp>
+#include <manyforge_core/ports/iresolved_prepared_participant_execution_engine.hpp>
 #include <manyforge_core/ports/istop_surveillance_observation_port.hpp>
 #include <manyforge_core/resource_slot_table.hpp>
 #include <manyforge_core/route_selection_owner.hpp>
@@ -62,6 +63,10 @@ struct RuntimeParticipantExecutionRegistration final {
   /// Exact retained runtime policy sealed against this participant binding.
   /// Absence remains observable but motion admission fails closed.
   std::optional<RuntimeParticipantPolicySelection> runtime_policy{};
+
+  /// Exact two-phase motion preparation boundary. Motion registrations must
+  /// provide it; capability-command registrations leave it absent.
+  IResolvedPreparedParticipantExecutionEngine* prepared_motion_engine{};
 };
 
 using RuntimeParticipantAdmissionResolver =
@@ -328,6 +333,7 @@ class ResourceAddressedExecutionKernel final : public IAddressedOperationOwner,
                                                      std::uint64_t subordinate_id,
                                                      OperationStateKind state, double progress,
                                                      std::optional<ErrorDTO> terminal_error);
+  [[nodiscard]] Result<void> advance_prepared_motion(const OperationId& operation_id);
   [[nodiscard]] Result<OperationControlAcceptedDTO> apply_control(
       const OperationControlRequestDTO& request, OperationControlKind control);
   [[nodiscard]] Result<void> apply_runtime_scale_status(
