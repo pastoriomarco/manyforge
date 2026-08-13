@@ -84,6 +84,9 @@ class BoundedOperationControlExecutor::Impl final {
          request.control != OperationControlKind::kResume &&
          request.control != OperationControlKind::kReset &&
          request.control != OperationControlKind::kAcknowledgeCompleted) ||
+        (request.control == OperationControlKind::kResume &&
+         (request.prepared_engine == nullptr || !request.prepared_resume ||
+          !request.cancellation_requested)) ||
         ((request.control == OperationControlKind::kReset ||
           request.control == OperationControlKind::kAcknowledgeCompleted) &&
          request.subordinate_id == 0U) ||
@@ -267,9 +270,39 @@ class BoundedOperationControlExecutor::Impl final {
             break;
           }
           case OperationControlKind::kResume: {
-            auto value = request->engine->resume(std::nullopt);
-            result.accepted = value.accepted;
-            result.error = std::move(value.error);
+            if (request->cancellation_requested->load(std::memory_order_acquire)) {
+              result.error =
+                  ErrorDTO{std::string(to_string(ErrorCode::kInvalidStateTransition)),
+                           "Prepared Resume was superseded before subordinate preparation",
+                           {{"reason", "prepared_resume_superseded_before_prepare"}}};
+              result.prepared_resume_cleanup_complete = true;
+              break;
+            }
+            auto value = request->prepared_engine->PrepareResumeMotion(request->subordinate_id,
+                                                                       *request->prepared_resume);
+            result.prepared_resume_created = value.ok();
+            if (!value.ok()) {
+              // The exact preparation API must not retain a dispatchable
+              // product when it reports failure.
+              result.prepared_resume_cleanup_complete = true;
+            }
+            if (value.ok() && request->cancellation_requested->load(std::memory_order_acquire)) {
+              auto cancelled =
+                  request->prepared_engine->CancelPreparedResumeMotion(request->subordinate_id);
+              if (!cancelled.ok()) {
+                value = Result<void>::Err(cancelled.error());
+              } else {
+                result.prepared_resume_cleanup_complete = true;
+                value = Result<void>::Err(
+                    ErrorDTO{std::string(to_string(ErrorCode::kInvalidStateTransition)),
+                             "Prepared Resume was superseded during subordinate preparation",
+                             {{"reason", "prepared_resume_superseded_during_prepare"}}});
+              }
+            }
+            result.accepted = value.ok();
+            if (!value.ok()) {
+              result.error = value.error();
+            }
             break;
           }
           case OperationControlKind::kAcknowledgeCompleted: {
@@ -281,9 +314,9 @@ class BoundedOperationControlExecutor::Impl final {
           }
           case OperationControlKind::kReset: {
             if (request->payload_kind == OperationParticipantPayloadKind::kCapabilityCommand) {
-              auto value = request->engine->reset_gripper(
-                  request->command_target, request->subordinate_id,
-                  request->subordinate_generation);
+              auto value =
+                  request->engine->reset_gripper(request->command_target, request->subordinate_id,
+                                                 request->subordinate_generation);
               result.accepted = value.ok();
               if (!value.ok()) {
                 result.error = value.error();

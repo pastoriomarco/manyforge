@@ -1,9 +1,11 @@
 #pragma once
 
+#include <atomic>
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <manyforge_core/ports/iresolved_participant_execution_engine.hpp>
+#include <manyforge_core/ports/iresolved_prepared_participant_execution_engine.hpp>
 #include <manyforge_core/types/operation_runtime.hpp>
 #include <memory>
 #include <optional>
@@ -36,6 +38,9 @@ struct OperationControlEffectRequest final {
   OperationParticipantPayloadKind payload_kind{OperationParticipantPayloadKind::kMotion};
   std::string command_target;
   std::uint64_t subordinate_generation{};
+  IResolvedPreparedParticipantExecutionEngine* prepared_engine{};
+  std::shared_ptr<const ResolvedPreparedMotionResumeRequestDTO> prepared_resume;
+  std::shared_ptr<std::atomic_bool> cancellation_requested;
 };
 
 struct OperationControlEffectResult final {
@@ -45,6 +50,11 @@ struct OperationControlEffectResult final {
   OperationControlKind control{OperationControlKind::kPause};
   bool accepted{};
   std::optional<ErrorDTO> error;
+  // Resume-only cleanup facts. A created preparation that is not yet cleaned
+  // up must remain owned until either dispatch is linearized or exact
+  // pre-dispatch cancellation completes.
+  bool prepared_resume_created{};
+  bool prepared_resume_cleanup_complete{};
 };
 
 enum class OperationControlEffectStartStatus : std::uint8_t {

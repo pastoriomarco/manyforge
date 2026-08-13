@@ -14,6 +14,7 @@
 #include <stop_token>
 #include <string>
 #include <thread>
+#include <tuple>
 #include <unordered_map>
 #include <utility>
 #include <vector>
@@ -989,7 +990,8 @@ private:
   };
   static constexpr std::size_t kPreparedReplayCapacity = 4096U;
   mutable std::mutex prepared_execution_mutex_;
-  std::map<std::pair<core::OperationId, core::OperationParticipantId>,
+  std::map<std::tuple<core::OperationId, core::OperationRevision,
+                      core::OperationParticipantId>,
            core::ContentDigest>
       prepared_participants_;
   std::map<core::ControllerGoalId, PreparedGoalRecord> prepared_goals_;

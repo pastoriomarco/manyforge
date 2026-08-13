@@ -243,7 +243,8 @@ core::PrepareParticipantResultDTO RoboPlanExecutionBackend::Prepare(
 
   std::lock_guard<std::mutex> lock(prepared_execution_mutex_);
   const auto key =
-      std::make_pair(participant.operation_id, participant.participant_id);
+      std::make_tuple(participant.operation_id, participant.operation_revision,
+                      participant.participant_id);
   const auto found = prepared_participants_.find(key);
   if (found != prepared_participants_.end()) {
     if (found->second != participant.prepared_contract_digest) {
@@ -295,7 +296,8 @@ core::ExecutionHandle RoboPlanExecutionBackend::dispatch_prepared(
     return rejected(std::string(*field_error));
   }
   const auto prepared_key =
-      std::make_pair(participant.operation_id, participant.participant_id);
+      std::make_tuple(participant.operation_id, participant.operation_revision,
+                      participant.participant_id);
   const auto prepared = prepared_participants_.find(prepared_key);
   if (prepared == prepared_participants_.end() ||
       prepared->second != participant.prepared_contract_digest) {

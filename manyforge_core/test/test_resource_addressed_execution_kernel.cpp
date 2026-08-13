@@ -133,7 +133,66 @@ class FakeParticipantEngine final : public IResolvedParticipantExecutionEngine,
     }
     prepared_snapshot->state = ResolvedPreparedMotionExecutionStateDTO::kDispatched;
     auto dispatched = execute(last_prepared_request->execution_request);
+    if (prepared_dispatch_event_error.has_value()) {
+      emit_error(*prepared_dispatch_event_error);
+    }
     return dispatched.ok() ? Result<void>::Ok() : Result<void>::Err(dispatched.error());
+  }
+
+  Result<void> PrepareResumeMotion(const std::uint64_t execution_id,
+                                   ResolvedPreparedMotionResumeRequestDTO request) override {
+    ++prepare_resume_motion_calls;
+    Trace("engine:prepare_resume_motion");
+    if (!last_prepared_request || !prepared_snapshot ||
+        prepared_snapshot->execution_id != execution_id ||
+        prepared_snapshot->state != ResolvedPreparedMotionExecutionStateDTO::kDispatched ||
+        request.operation_id != last_prepared_request->execution_request.binding.operation_id ||
+        request.participant_id != last_prepared_request->execution_request.binding.participant_id ||
+        !request.operation_revision.nonzero() || request.controller_goal_id.empty() ||
+        !request.controller_goal_generation.nonzero() || !request.ordinary_stop_plan) {
+      return Result<void>::Err(ErrorDTO{std::string(to_string(ErrorCode::kInvalidRequest)),
+                                        "fake prepared Resume identity mismatch",
+                                        {{"reason", "prepared_resume_mismatch"}}});
+    }
+    last_prepared_request->operation_revision = request.operation_revision;
+    last_prepared_request->execution_request.binding.controller_goal_id =
+        request.controller_goal_id;
+    last_prepared_request->execution_request.binding.controller_goal_generation =
+        request.controller_goal_generation;
+    last_prepared_request->ordinary_stop_plan = std::move(request.ordinary_stop_plan);
+    prepared_snapshot = ResolvedPreparedMotionExecutionSnapshotDTO{
+        execution_id,
+        ResolvedPreparedMotionExecutionStateDTO::kPreparing,
+        {},
+        std::nullopt,
+        std::nullopt};
+    if (defer_resume_prepare_completion) {
+      return Result<void>::Ok();
+    }
+    return CompletePreparation();
+  }
+
+  Result<void> DispatchPreparedResumeMotion(
+      const std::uint64_t execution_id, const ContentDigest& prepared_contract_digest) override {
+    ++dispatch_prepared_resume_motion_calls;
+    Trace("engine:dispatch_prepared_resume_motion");
+    auto dispatched = DispatchPreparedMotion(execution_id, prepared_contract_digest);
+    if (resume_return_hook) {
+      resume_return_hook();
+    }
+    return dispatched;
+  }
+
+  Result<void> CancelPreparedResumeMotion(const std::uint64_t execution_id) override {
+    ++cancel_prepared_resume_motion_calls;
+    Trace("engine:cancel_prepared_resume_motion");
+    if (!prepared_snapshot || prepared_snapshot->execution_id != execution_id) {
+      return Result<void>::Err(ErrorDTO{std::string(to_string(ErrorCode::kMissingReference)),
+                                        "fake prepared Resume is unavailable",
+                                        {{"reason", "prepared_resume_missing"}}});
+    }
+    prepared_snapshot->state = ResolvedPreparedMotionExecutionStateDTO::kCancelledPreDispatch;
+    return Result<void>::Ok();
   }
 
   Result<void> CancelPreparedMotion(std::uint64_t execution_id) override {
@@ -600,9 +659,12 @@ class FakeParticipantEngine final : public IResolvedParticipantExecutionEngine,
 
   int execute_calls{};
   int prepare_motion_calls{};
+  int prepare_resume_motion_calls{};
   mutable int observe_prepared_motion_calls{};
   int dispatch_prepared_motion_calls{};
+  int dispatch_prepared_resume_motion_calls{};
   int cancel_prepared_motion_calls{};
+  int cancel_prepared_resume_motion_calls{};
   int prepare_command_calls{};
   mutable int observe_prepared_command_calls{};
   int dispatch_prepared_command_calls{};
@@ -634,8 +696,10 @@ class FakeParticipantEngine final : public IResolvedParticipantExecutionEngine,
   ExecutionStatus status{};
   std::optional<KernelEvent> event_during_execute;
   bool defer_prepare_completion{};
+  bool defer_resume_prepare_completion{};
   std::optional<ErrorDTO> prepare_failure;
   std::optional<ErrorDTO> prepare_command_failure;
+  std::optional<ErrorDTO> prepared_dispatch_event_error;
   std::function<void()> pause_effect_hook;
   std::function<void()> pause_return_hook;
   std::function<void()> resume_return_hook;
@@ -875,6 +939,11 @@ class FakeParticipantEngine final : public IResolvedParticipantExecutionEngine,
                                         "fake preparation has no retained request",
                                         {{"reason", "prepared_motion_request_missing"}}});
     }
+    if (prepared_snapshot.has_value() &&
+        prepared_snapshot->state ==
+            ResolvedPreparedMotionExecutionStateDTO::kCancelledPreDispatch) {
+      return Result<void>::Ok();
+    }
     if (prepare_failure.has_value()) {
       prepared_snapshot = ResolvedPreparedMotionExecutionSnapshotDTO{
           next_execution_id,
@@ -882,6 +951,18 @@ class FakeParticipantEngine final : public IResolvedParticipantExecutionEngine,
           {},
           std::nullopt,
           prepare_failure};
+      const KernelEvent event{KernelEventType::kErrorRaised,
+                              next_execution_id,
+                              0,
+                              status.state,
+                              status.state,
+                              prepare_failure,
+                              {{"reason", "prepared_motion_prepare_failed"}}};
+      const auto snapshot = callbacks;
+      for (const auto& [id, callback] : snapshot) {
+        (void)id;
+        callback(event);
+      }
       return Result<void>::Ok();
     }
     auto participant = MakePreparedMotionParticipant(*last_prepared_request);
@@ -3744,7 +3825,7 @@ TEST(ResourceAddressedExecutionKernelTest,
   }));
   ASSERT_TRUE(resumed.has_value());
   EXPECT_EQ(resumed->operation_revision_after_acceptance, OperationRevision(3U));
-  ASSERT_TRUE(wait_until([&] { return engine.resume_calls.load() == 1; }));
+  ASSERT_TRUE(wait_until([&] { return engine.dispatch_prepared_resume_motion_calls == 1; }));
   engine.emit_transition(ExecutionState::kValidating, ExecutionState::kExecuting);
   EXPECT_EQ(kernel.resource_snapshot().front().state, ResourceSlotState::kDispatched);
   engine.emit_transition(ExecutionState::kExecuting, ExecutionState::kCompleted);
@@ -3766,7 +3847,9 @@ TEST(ResourceAddressedExecutionKernelTest,
            kernel.resource_snapshot().front().state == ResourceSlotState::kFree;
   }));
   EXPECT_EQ(engine.pause_calls.load(), 1);
-  EXPECT_EQ(engine.resume_calls.load(), 1);
+  EXPECT_EQ(engine.resume_calls.load(), 0);
+  EXPECT_EQ(engine.prepare_resume_motion_calls, 1);
+  EXPECT_EQ(engine.dispatch_prepared_resume_motion_calls, 1);
   const auto retained = kernel.get_operation_state(executed.value().operation_id);
   ASSERT_TRUE(retained.ok()) << retained.error().message;
   EXPECT_EQ(retained.value().state, OperationStateKind::kCompleted);
@@ -3808,6 +3891,90 @@ TEST(ResourceAddressedExecutionKernelTest,
 }
 
 TEST(ResourceAddressedExecutionKernelTest,
+     StopDuringPreparedResumeCancelsTheNewGoalAndContainsThePriorPausedGoal) {
+  FakeClock clock;
+  FakeParticipantEngine engine;
+  ResourceAddressedExecutionKernel kernel(
+      {registration(
+          make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular),
+          engine)},
+      clock, default_journal, {RequestOwnerEpoch("kernel.epoch.1"), CellId("cell.test"), 16U});
+  const auto executed = kernel.execute(motion_operation("request.resume.stop.execute"));
+  ASSERT_TRUE(executed.ok()) << executed.error().message;
+  engine.emit_transition(ExecutionState::kValidating, ExecutionState::kExecuting);
+
+  const auto paused =
+      kernel.pause(control_request("request.resume.stop.pause", executed.value(), 1U));
+  ASSERT_TRUE(paused.ok()) << paused.error().message;
+  ASSERT_TRUE(wait_until([&] {
+    const auto state = kernel.get_operation_state(executed.value().operation_id);
+    return engine.pause_calls.load() == 1 && state.ok() &&
+           state.value().state == OperationStateKind::kStopping;
+  }));
+  engine.emit_transition(ExecutionState::kStopping, ExecutionState::kPaused);
+  ASSERT_TRUE(wait_until([&] {
+    const auto state = kernel.get_operation_state(executed.value().operation_id);
+    return state.ok() && state.value().state == OperationStateKind::kPaused;
+  }));
+  const auto paused_state = kernel.get_operation_state(executed.value().operation_id);
+  ASSERT_TRUE(paused_state.ok()) << paused_state.error().message;
+  ASSERT_EQ(paused_state.value().participants.size(), 1U);
+  const auto prior_goal_id = paused_state.value().participants.front().controller_goal_id;
+  const auto prior_goal_generation =
+      paused_state.value().participants.front().controller_goal_generation;
+
+  engine.defer_resume_prepare_completion = true;
+  std::optional<OperationControlAcceptedDTO> resumed;
+  ASSERT_TRUE(wait_until([&] {
+    auto candidate =
+        kernel.resume(control_request("request.resume.stop.resume", executed.value(), 2U));
+    if (!candidate.ok()) {
+      return false;
+    }
+    resumed = std::move(candidate.value());
+    return true;
+  }));
+  ASSERT_TRUE(resumed.has_value());
+  ASSERT_TRUE(wait_until([&] { return engine.prepare_resume_motion_calls == 1; }));
+  const auto resume_state = kernel.get_operation_state(executed.value().operation_id);
+  ASSERT_TRUE(resume_state.ok()) << resume_state.error().message;
+  ASSERT_EQ(resume_state.value().participants.size(), 1U);
+  EXPECT_NE(resume_state.value().participants.front().controller_goal_id, prior_goal_id);
+  EXPECT_EQ(resume_state.value().participants.front().controller_goal_generation.value(),
+            prior_goal_generation.value() + 1U);
+
+  std::promise<void> stop_stage_entered;
+  std::promise<void> release_stop_stage;
+  auto release_stop_stage_future = release_stop_stage.get_future().share();
+  engine.translate_stop_stage_hook = [&] {
+    stop_stage_entered.set_value();
+    release_stop_stage_future.wait();
+  };
+  const auto stopped = kernel.stop(stop_request("request.resume.stop.stop", executed.value(), 3U));
+  ASSERT_TRUE(stopped.ok()) << stopped.error().message;
+  ASSERT_EQ(stop_stage_entered.get_future().wait_for(std::chrono::seconds(1)),
+            std::future_status::ready);
+  release_stop_stage.set_value();
+  ASSERT_TRUE(wait_until([&] {
+    const auto status = kernel.get_stop_status(stopped.value().stop_id);
+    return status.ok() && status.value().state == StopStatusStateDTO::kSucceeded;
+  }));
+  // Complete the already-accepted preparation only after the physical Stop
+  // terminal handoff. Its retained pre-dispatch authority must still be
+  // cancelled and must never become a dispatchable new goal.
+  ASSERT_TRUE(engine.complete_preparation().ok());
+  const bool resume_cancelled =
+      wait_until([&] { return engine.cancel_prepared_resume_motion_calls >= 1; });
+  ASSERT_TRUE(resume_cancelled);
+  EXPECT_EQ(engine.dispatch_prepared_resume_motion_calls, 0);
+  ASSERT_TRUE(engine.last_stop_stage.has_value());
+  EXPECT_EQ(engine.last_stop_stage->controller_goal_id, prior_goal_id);
+  EXPECT_EQ(engine.last_stop_stage->controller_goal_generation, prior_goal_generation);
+  EXPECT_EQ(engine.last_stop_stage->participant_stop_plan.operation_revision,
+            OperationRevision(1U));
+}
+
+TEST(ResourceAddressedExecutionKernelTest,
      ResetOfExecutingMotionUsesOneScopedStopThenCertifiedLocalRetirement) {
   FakeClock clock;
   FakeParticipantEngine engine;
@@ -3836,6 +4003,183 @@ TEST(ResourceAddressedExecutionKernelTest,
   ASSERT_TRUE(retained.ok()) << retained.error().message;
   EXPECT_EQ(retained.value().state, OperationStateKind::kStopped);
   EXPECT_EQ(retained.value().operation_revision, OperationRevision(3U));
+}
+
+TEST(ResourceAddressedExecutionKernelTest,
+     PreparedResumeFailureTriggersOneScopedContainmentWithoutLegacyResume) {
+  FakeClock clock;
+  FakeParticipantEngine engine;
+  ResourceAddressedExecutionKernel kernel(
+      {registration(
+          make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular),
+          engine)},
+      clock, default_journal, {RequestOwnerEpoch("kernel.epoch.1"), CellId("cell.test"), 16U});
+  const auto executed = kernel.execute(motion_operation("request.resume.failure.execute"));
+  ASSERT_TRUE(executed.ok()) << executed.error().message;
+  engine.emit_transition(ExecutionState::kValidating, ExecutionState::kExecuting);
+  const auto paused =
+      kernel.pause(control_request("request.resume.failure.pause", executed.value(), 1U));
+  ASSERT_TRUE(paused.ok()) << paused.error().message;
+  ASSERT_TRUE(wait_until([&] {
+    const auto state = kernel.get_operation_state(executed.value().operation_id);
+    return engine.pause_calls.load() == 1 && state.ok() &&
+           state.value().state == OperationStateKind::kStopping;
+  }));
+  engine.emit_transition(ExecutionState::kStopping, ExecutionState::kPaused);
+  ASSERT_TRUE(wait_until([&] {
+    const auto state = kernel.get_operation_state(executed.value().operation_id);
+    return state.ok() && state.value().state == OperationStateKind::kPaused;
+  }));
+
+  engine.prepare_failure = ErrorDTO{std::string(to_string(ErrorCode::kExecutionRejected)),
+                                    "injected prepared Resume failure",
+                                    {{"reason", "injected_prepared_resume_failure"}}};
+  std::optional<OperationControlAcceptedDTO> resumed;
+  ASSERT_TRUE(wait_until([&] {
+    auto candidate =
+        kernel.resume(control_request("request.resume.failure.resume", executed.value(), 2U));
+    if (!candidate.ok()) {
+      return false;
+    }
+    resumed = std::move(candidate.value());
+    return true;
+  }));
+  ASSERT_TRUE(resumed.has_value());
+  ASSERT_TRUE(wait_until([&] {
+    return engine.translate_stop_stage_calls.load() == 1 &&
+           engine.cancel_prepared_resume_motion_calls >= 1;
+  }));
+  EXPECT_EQ(engine.resume_calls.load(), 0);
+  EXPECT_EQ(engine.dispatch_prepared_resume_motion_calls, 0);
+  ASSERT_TRUE(wait_until([&] {
+    const auto state = kernel.get_operation_state(executed.value().operation_id);
+    return state.ok() && state.value().state == OperationStateKind::kInterventionRequired;
+  }));
+}
+
+TEST(ResourceAddressedExecutionKernelTest,
+     PartialPreparedResumeDispatchContainsReleasedGoalsAndCancelsTheRemainder) {
+  FakeClock clock;
+  FakeParticipantEngine first_engine;
+  FakeParticipantEngine second_engine;
+  FakeParticipantEngine third_engine;
+  std::atomic<int> pause_returns{};
+  first_engine.pause_return_hook = [&] { ++pause_returns; };
+  second_engine.pause_return_hook = [&] { ++pause_returns; };
+  third_engine.pause_return_hook = [&] { ++pause_returns; };
+  const auto first =
+      make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular);
+  const auto second = coordinated_occurrence(first, "2");
+  const auto third = coordinated_occurrence(first, "3");
+  ResourceAddressedExecutionKernel kernel(
+      {registration(first, first_engine), registration(second, second_engine),
+       registration(third, third_engine)},
+      clock, default_journal, {RequestOwnerEpoch("kernel.epoch.1"), CellId("cell.test"), 24U});
+  const auto executed =
+      kernel.execute(coordinated_motion_operation("request.resume.partial.execute", 3U));
+  ASSERT_TRUE(executed.ok()) << executed.error().message;
+  first_engine.emit_transition(ExecutionState::kValidating, ExecutionState::kExecuting);
+  second_engine.emit_transition(ExecutionState::kValidating, ExecutionState::kExecuting);
+  third_engine.emit_transition(ExecutionState::kValidating, ExecutionState::kExecuting);
+  const auto paused =
+      kernel.pause(control_request("request.resume.partial.pause", executed.value(), 1U));
+  ASSERT_TRUE(paused.ok()) << paused.error().message;
+  ASSERT_TRUE(wait_until([&] {
+    return first_engine.pause_calls.load() == 1 && second_engine.pause_calls.load() == 1 &&
+           third_engine.pause_calls.load() == 1 && pause_returns.load() == 3 &&
+           kernel.get_operation_state(executed.value().operation_id).ok() &&
+           kernel.get_operation_state(executed.value().operation_id).value().state ==
+               OperationStateKind::kStopping;
+  }));
+  first_engine.emit_transition(ExecutionState::kStopping, ExecutionState::kPaused);
+  second_engine.emit_transition(ExecutionState::kStopping, ExecutionState::kPaused);
+  third_engine.emit_transition(ExecutionState::kStopping, ExecutionState::kPaused);
+  ASSERT_TRUE(wait_until([&] {
+    const auto state = kernel.get_operation_state(executed.value().operation_id);
+    return state.ok() && state.value().state == OperationStateKind::kPaused;
+  }));
+
+  second_engine.next_execute_result = Result<std::uint64_t>::Err(
+      ErrorDTO{std::string(to_string(ErrorCode::kExecutionRejected)),
+               "injected prepared Resume dispatch failure",
+               {{"reason", "injected_prepared_resume_dispatch_failure"}}});
+  std::optional<OperationControlAcceptedDTO> resumed;
+  ASSERT_TRUE(wait_until([&] {
+    auto candidate =
+        kernel.resume(control_request("request.resume.partial.resume", executed.value(), 2U));
+    if (!candidate.ok()) {
+      return false;
+    }
+    resumed = std::move(candidate.value());
+    return true;
+  }));
+  ASSERT_TRUE(resumed.has_value());
+  ASSERT_TRUE(wait_until([&] {
+    return first_engine.dispatch_prepared_resume_motion_calls == 1 &&
+           second_engine.dispatch_prepared_resume_motion_calls == 1 &&
+           third_engine.cancel_prepared_resume_motion_calls >= 1;
+  }));
+  EXPECT_EQ(third_engine.dispatch_prepared_resume_motion_calls, 0);
+  EXPECT_EQ(first_engine.resume_calls.load(), 0);
+  EXPECT_EQ(second_engine.resume_calls.load(), 0);
+  EXPECT_EQ(third_engine.resume_calls.load(), 0);
+  ASSERT_TRUE(wait_until([&] {
+    return first_engine.translate_stop_stage_calls.load() == 1 &&
+           second_engine.translate_stop_stage_calls.load() == 1 &&
+           third_engine.translate_stop_stage_calls.load() == 1;
+  }));
+}
+
+TEST(ResourceAddressedExecutionKernelTest,
+     PreparedResumeInvalidDispatchHandleEventTriggersScopedContainment) {
+  FakeClock clock;
+  FakeParticipantEngine engine;
+  ResourceAddressedExecutionKernel kernel(
+      {registration(
+          make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular),
+          engine)},
+      clock, default_journal, {RequestOwnerEpoch("kernel.epoch.1"), CellId("cell.test"), 16U});
+  const auto executed = kernel.execute(motion_operation("request.resume.handle.execute"));
+  ASSERT_TRUE(executed.ok()) << executed.error().message;
+  engine.emit_transition(ExecutionState::kValidating, ExecutionState::kExecuting);
+  const auto paused =
+      kernel.pause(control_request("request.resume.handle.pause", executed.value(), 1U));
+  ASSERT_TRUE(paused.ok()) << paused.error().message;
+  ASSERT_TRUE(wait_until([&] {
+    const auto state = kernel.get_operation_state(executed.value().operation_id);
+    return engine.pause_calls.load() == 1 && state.ok() &&
+           state.value().state == OperationStateKind::kStopping;
+  }));
+  engine.emit_transition(ExecutionState::kStopping, ExecutionState::kPaused);
+  ASSERT_TRUE(wait_until([&] {
+    const auto state = kernel.get_operation_state(executed.value().operation_id);
+    return state.ok() && state.value().state == OperationStateKind::kPaused;
+  }));
+
+  engine.prepared_dispatch_event_error =
+      ErrorDTO{std::string(to_string(ErrorCode::kInvariantViolation)),
+               "injected invalid prepared Resume handle",
+               {{"reason", "prepared_execution_handle_membership_mismatch"}}};
+  std::optional<OperationControlAcceptedDTO> resumed;
+  ASSERT_TRUE(wait_until([&] {
+    auto candidate =
+        kernel.resume(control_request("request.resume.handle.resume", executed.value(), 2U));
+    if (!candidate.ok()) {
+      return false;
+    }
+    resumed = std::move(candidate.value());
+    return true;
+  }));
+  ASSERT_TRUE(resumed.has_value());
+  ASSERT_TRUE(wait_until([&] {
+    return engine.dispatch_prepared_resume_motion_calls == 1 &&
+           engine.translate_stop_stage_calls.load() == 1;
+  }));
+  EXPECT_EQ(engine.resume_calls.load(), 0);
+  ASSERT_TRUE(wait_until([&] {
+    const auto state = kernel.get_operation_state(executed.value().operation_id);
+    return state.ok() && state.value().state == OperationStateKind::kInterventionRequired;
+  }));
 }
 
 TEST(ResourceAddressedExecutionKernelTest,
@@ -3872,6 +4216,7 @@ TEST(ResourceAddressedExecutionKernelTest,
   }));
   first_engine.emit_transition(ExecutionState::kStopping, ExecutionState::kPaused);
   second_engine.emit_transition(ExecutionState::kStopping, ExecutionState::kPaused);
+  second_engine.defer_resume_prepare_completion = true;
 
   std::optional<OperationControlAcceptedDTO> resumed;
   ASSERT_TRUE(wait_until([&] {
@@ -3886,8 +4231,15 @@ TEST(ResourceAddressedExecutionKernelTest,
   ASSERT_TRUE(resumed.has_value());
   EXPECT_EQ(resumed->operation_revision_after_acceptance, OperationRevision(3U));
   ASSERT_TRUE(wait_until([&] {
-    return first_engine.resume_calls.load() == 1 && second_engine.resume_calls.load() == 1 &&
-           resume_returns.load() == 2;
+    return first_engine.prepare_resume_motion_calls == 1 &&
+           second_engine.prepare_resume_motion_calls == 1;
+  }));
+  EXPECT_EQ(first_engine.dispatch_prepared_resume_motion_calls, 0);
+  EXPECT_EQ(second_engine.dispatch_prepared_resume_motion_calls, 0);
+  ASSERT_TRUE(second_engine.complete_preparation().ok());
+  ASSERT_TRUE(wait_until([&] {
+    return first_engine.dispatch_prepared_resume_motion_calls == 1 &&
+           second_engine.dispatch_prepared_resume_motion_calls == 1 && resume_returns.load() == 2;
   }));
   first_engine.emit_transition(ExecutionState::kValidating, ExecutionState::kExecuting);
   second_engine.emit_transition(ExecutionState::kValidating, ExecutionState::kExecuting);

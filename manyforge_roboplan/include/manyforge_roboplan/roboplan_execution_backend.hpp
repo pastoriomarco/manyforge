@@ -11,6 +11,7 @@
 #include <stop_token>
 #include <string_view>
 #include <thread>
+#include <tuple>
 #include <vector>
 
 #include <manyforge_core/ports/iexecution_backend.hpp>
@@ -257,7 +258,8 @@ private:
   };
   static constexpr std::size_t kPreparedReplayCapacity = 4096U;
   mutable std::mutex prepared_execution_mutex_;
-  std::map<std::pair<core::OperationId, core::OperationParticipantId>,
+  std::map<std::tuple<core::OperationId, core::OperationRevision,
+                      core::OperationParticipantId>,
            core::ContentDigest>
       prepared_participants_;
   std::map<core::ControllerGoalId, PreparedGoalRecord> prepared_goals_;

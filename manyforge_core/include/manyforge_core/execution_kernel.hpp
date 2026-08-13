@@ -300,6 +300,11 @@ class ExecutionKernel : public IResolvedParticipantExecutionEngine,
       std::uint64_t execution_id) const override;
   Result<void> DispatchPreparedMotion(std::uint64_t execution_id,
                                       const ContentDigest& prepared_contract_digest) override;
+  Result<void> PrepareResumeMotion(std::uint64_t execution_id,
+                                   ResolvedPreparedMotionResumeRequestDTO request) override;
+  Result<void> DispatchPreparedResumeMotion(std::uint64_t execution_id,
+                                            const ContentDigest& prepared_contract_digest) override;
+  Result<void> CancelPreparedResumeMotion(std::uint64_t execution_id) override;
   Result<void> CancelPreparedMotion(std::uint64_t execution_id) override;
   Result<std::uint64_t> PrepareCapabilityCommand(
       ResolvedPreparedCapabilityCommandExecutionRequestDTO request) override;
@@ -551,6 +556,8 @@ class ExecutionKernel : public IResolvedParticipantExecutionEngine,
                                         std::uint32_t planning_attempt_index = 0,
                                         const RobotStateDTO* start_state_override = nullptr);
   Result<TrajectoryDTO> plan_resume_trajectory(
+      const ExecuteRequestDTO& request, const CollisionWorldLeaseInventory& projection_inventory);
+  Result<PlanningSuccess> plan_resume_trajectory_with_evidence(
       const ExecuteRequestDTO& request, const CollisionWorldLeaseInventory& projection_inventory);
   Result<std::size_t> discover_dynamic_carried_start_contacts(
       CollisionWorldLeaseInventory& projection_inventory, const RobotStateDTO& observed_start,

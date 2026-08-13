@@ -769,6 +769,7 @@ struct ExecutionKernel::PreparedMotionSession final {
   std::optional<ErrorDTO> error;
   bool dispatch_requested{};
   bool cancel_requested{};
+  bool resume_cycle{};
 };
 
 struct ExecutionKernel::PreparedCapabilityCommandSession final {
@@ -5836,6 +5837,49 @@ ExecutionKernel::ExecuteWorkerDispatchPhaseResult ExecutionKernel::execute_worke
           ? execution_backend_.Dispatch(*prepared_participant, request.binding.controller_goal_id,
                                         request.binding.controller_goal_generation)
           : execution_backend_.execute_trajectory(trajectory);
+  if (prepared_participant) {
+    if (const auto invalid = prepared_execution_handle_field_error(
+            phase_result.execution_handle, *prepared_participant,
+            request.binding.controller_goal_id, request.binding.controller_goal_generation)) {
+      ErrorDTO dispatch_error{std::string(to_string(ErrorCode::kInvariantViolation)),
+                              "Backend returned a handle outside the prepared dispatch authority",
+                              {{"reason", std::string(*invalid)}}};
+      stop_collision_monitoring(RuntimeCollisionMonitorRelease::kFailClosedTerminal,
+                                motion_state.runtime_collision_protection_generation);
+      sm_.set_last_error(ErrorCode::kInvariantViolation);
+      emit_event(
+          {KernelEventType::kErrorRaised, exec_id, clock_.now(), {}, {}, dispatch_error, {}});
+      const auto previous_state = sm_.status().state;
+      auto terminal_commit =
+          commit_terminal(ExecutionState::kInterventionRequired, "terminal_commit");
+      if (terminal_commit.committed != ExecutionState::kInterventionRequired &&
+          finalize_overridden_terminal_authority(
+              request, exec_id, motion_state, terminal_commit.committed,
+              "prepared_dispatch_membership_overridden_by_terminal_authority", dispatch_error)) {
+        phase_result.status = ExecuteWorkerPhaseStatus::kTerminal;
+        return phase_result;
+      }
+      auto failed_snapshot = get_execution_snapshot();
+      failed_snapshot.timestamp_ns = clock_.now();
+      failed_snapshot.execution_id = exec_id;
+      failed_snapshot.move_id = request.move_id;
+      failed_snapshot.state = terminal_commit.committed;
+      failed_snapshot.error = dispatch_error;
+      publish_execution_snapshot(std::move(failed_snapshot));
+      emit_event({KernelEventType::kStateTransition,
+                  exec_id,
+                  clock_.now(),
+                  previous_state,
+                  terminal_commit.committed,
+                  dispatch_error,
+                  {{"reason", "prepared_dispatch_membership_invalid"}}});
+      finalize_motion_execution_outcome(motion_state, MotionExecutionTerminalCause::kFailed,
+                                        dispatch_error, std::nullopt,
+                                        "prepared_dispatch_membership_invalid");
+      phase_result.status = ExecuteWorkerPhaseStatus::kTerminal;
+      return phase_result;
+    }
+  }
   arm_runtime_collision_lookahead(exec_id, phase_result.execution_handle.execution_generation,
                                   std::move(collision_trajectory), request.contact_policy_id,
                                   scene_snapshot_lease_inventory);
@@ -6946,6 +6990,15 @@ void ExecutionKernel::async_execute_worker(
       if (latest_backend_snapshot.state == ExecutionState::kPaused ||
           loop_state == ExecutionState::kPaused) {
         if (worker_signals_.consume_resume_request()) {
+          bool prepared_resume = false;
+          ExecuteRequestDTO resume_request = request;
+          if (prepared_session) {
+            std::lock_guard session_lock(prepared_session->mutex);
+            prepared_resume = prepared_session->resume_cycle;
+            if (prepared_resume) {
+              resume_request = prepared_session->authority.execution_request;
+            }
+          }
           auto finish_resume_interrupted = [&](ExecutionState terminal_state, ErrorDTO error,
                                                const char* reap_reason) {
             sm_.set_last_error(error_code_from_dto(error));
@@ -6997,6 +7050,38 @@ void ExecutionKernel::async_execute_worker(
               }
             }
             sm_.set_last_error(error_code_from_dto(error));
+            if (prepared_resume) {
+              if (prepared_session) {
+                {
+                  std::lock_guard session_lock(prepared_session->mutex);
+                  prepared_session->error = error;
+                  prepared_session->state =
+                      ResolvedPreparedMotionExecutionStateDTO::kPreparationFailed;
+                  prepared_session->resume_cycle = false;
+                }
+                prepared_session->changed.notify_all();
+              }
+              auto prev_state = sm_.status().state;
+              auto terminal_commit =
+                  commit_terminal(ExecutionState::kInterventionRequired, "terminal_commit");
+              auto failed_snapshot = latest_backend_snapshot;
+              failed_snapshot.timestamp_ns = clock_.now();
+              failed_snapshot.execution_id = exec_id;
+              failed_snapshot.move_id = request.move_id;
+              failed_snapshot.state = terminal_commit.committed;
+              failed_snapshot.error = error;
+              publish_execution_snapshot(std::move(failed_snapshot));
+              emit_event({KernelEventType::kStateTransition,
+                          exec_id,
+                          clock_.now(),
+                          prev_state,
+                          terminal_commit.committed,
+                          error,
+                          {{"reason", outcome_reap_reason}}});
+              finalize_motion_execution_outcome(motion_state, MotionExecutionTerminalCause::kFailed,
+                                                error, std::nullopt, outcome_reap_reason);
+              return;
+            }
             (void)execution_backend_.stop();
             const bool stop_completed = drain_execution_handle_bounded(execution_handle);
             auto prev_state = sm_.status().state;
@@ -7059,15 +7144,16 @@ void ExecutionKernel::async_execute_worker(
           }
           auto resume_scene = std::move(resume_scene_result.value());
           auto resume_scene_snapshot_lease =
-              build_scene_snapshot_lease(resume_scene.inventory(), request, exec_id);
-          auto resume_plan = plan_resume_trajectory(request, resume_scene.inventory());
+              build_scene_snapshot_lease(resume_scene.inventory(), resume_request, exec_id);
+          auto resume_plan =
+              plan_resume_trajectory_with_evidence(resume_request, resume_scene.inventory());
           if (!resume_plan.ok()) {
             fail_resume_closed(resume_plan.error(), "resume planning failed",
                                "resume_planning_failed", true, false);
             return;
           }
 
-          auto resumed_trajectory = std::move(resume_plan.value());
+          auto resumed_trajectory = *resume_plan.value().result.trajectory;
           emit_event({KernelEventType::kPlanCompleted,
                       exec_id,
                       clock_.now(),
@@ -7106,8 +7192,8 @@ void ExecutionKernel::async_execute_worker(
                       {{"reason", "resume_replan"}, {"resume_phase", "validation"}}});
 
           Result<CollisionValidationSuccess> resume_validation =
-              validate_trajectory(resumed_trajectory, request, resume_scene.mutable_inventory(),
-                                  resume_scene_snapshot_lease);
+              validate_trajectory(resumed_trajectory, resume_request,
+                                  resume_scene.mutable_inventory(), resume_scene_snapshot_lease);
           if (!resume_validation.ok()) {
             if (validation_cancelled_by_interrupt(resume_validation.error()) &&
                 sm_.status().state == ExecutionState::kInterrupted) {
@@ -7202,6 +7288,110 @@ void ExecutionKernel::async_execute_worker(
             return;
           }
 
+          std::shared_ptr<const PreparedOperationParticipantDTO> resume_participant;
+          if (prepared_resume) {
+            ExecuteWorkerPlanPhaseResult resume_plan_phase;
+            resume_plan_phase.trajectory = resumed_trajectory;
+            resume_plan_phase.plan_request = resume_plan.value().request;
+            resume_plan_phase.planning_result = resume_plan.value().result;
+            ExecuteWorkerValidationPhaseResult resume_validation_phase;
+            resume_validation_phase.collision_world_revision =
+                resume_validation.value().collision_world_revision;
+            resume_validation_phase.validation_evidence = PreparedMotionValidationEvidenceDTO{
+                config_.validation_revision, resume_validation.value().noncollision_result,
+                resume_validation.value().collision_world_revision,
+                resume_validation.value().collision_policy_revision,
+                resume_validation.value().collision_decision};
+            auto prepared = make_and_prepare_motion_participant(
+                resume_request, resume_plan_phase, resume_validation_phase, prepared_session);
+            if (!prepared.ok()) {
+              fail_resume_closed(prepared.error(), "resume backend preparation failed",
+                                 "resume_backend_preparation_failed", false, false);
+              return;
+            }
+            bool cancelled = false;
+            {
+              std::lock_guard session_lock(prepared_session->mutex);
+              cancelled = prepared_session->cancel_requested;
+              if (!cancelled) {
+                prepared_session->participant = prepared.value();
+                prepared_session->state = ResolvedPreparedMotionExecutionStateDTO::kPrepared;
+                resume_participant = std::move(prepared.value());
+              }
+            }
+            prepared_session->changed.notify_all();
+            if (cancelled) {
+              finish_resume_interrupted(
+                  ExecutionState::kStopped,
+                  ErrorDTO{kErrorInvalidRequest,
+                           "Prepared Resume was cancelled before dispatch",
+                           {{"reason", "prepared_resume_cancelled_pre_dispatch"}}},
+                  "prepared_resume_cancelled_pre_dispatch");
+              return;
+            }
+            emit_event({KernelEventType::kParticipantPrepared,
+                        exec_id,
+                        clock_.now(),
+                        {},
+                        {},
+                        std::nullopt,
+                        {{"prepared_contract_digest",
+                          resume_participant->prepared_contract_digest.value()},
+                         {"reason", "resume_reprepare"}}});
+            {
+              std::unique_lock session_lock(prepared_session->mutex);
+              while (!prepared_session->dispatch_requested && !prepared_session->cancel_requested &&
+                     !st.stop_requested() && !stop_policy_.stop_requested()) {
+                prepared_session->changed.wait_for(session_lock, std::chrono::milliseconds(10));
+              }
+              cancelled = prepared_session->cancel_requested || st.stop_requested() ||
+                          stop_policy_.stop_requested();
+              if (cancelled) {
+                prepared_session->cancel_requested = true;
+                prepared_session->state =
+                    ResolvedPreparedMotionExecutionStateDTO::kCancelledPreDispatch;
+              }
+            }
+            if (cancelled) {
+              finish_resume_interrupted(
+                  ExecutionState::kStopped,
+                  ErrorDTO{kErrorInvalidRequest,
+                           "Prepared Resume was cancelled at the dispatch barrier",
+                           {{"reason", "prepared_resume_cancelled_at_dispatch_barrier"}}},
+                  "prepared_resume_cancelled_at_dispatch_barrier");
+              return;
+            }
+          }
+
+          motion_state.runtime_collision_protection_generation = start_collision_monitoring(
+              "resume_dispatch", RuntimeCollisionProtectionPurpose::kMotion,
+              &resume_scene.inventory());
+          execution_handle =
+              prepared_resume ? execution_backend_.DispatchResume(
+                                    *resume_participant, resume_request.binding.controller_goal_id,
+                                    resume_request.binding.controller_goal_generation)
+                              : execution_backend_.resume(resumed_trajectory);
+          if (prepared_resume) {
+            if (const auto invalid = prepared_execution_handle_field_error(
+                    execution_handle, *resume_participant,
+                    resume_request.binding.controller_goal_id,
+                    resume_request.binding.controller_goal_generation)) {
+              fail_resume_closed(
+                  ErrorDTO{kErrorInvariantViolation,
+                           "Resume backend returned a handle outside the prepared goal",
+                           {{"reason", std::string(*invalid)}}},
+                  "prepared Resume dispatch membership failed",
+                  "prepared_resume_dispatch_membership_failed", false, false);
+              return;
+            }
+            {
+              std::lock_guard session_lock(prepared_session->mutex);
+              prepared_session->state = ResolvedPreparedMotionExecutionStateDTO::kDispatched;
+              prepared_session->resume_cycle = false;
+            }
+            prepared_session->changed.notify_all();
+          }
+
           auto prev_state = sm_.status().state;
           auto resume_transition = sm_.try_transition(ExecutionState::kExecuting);
           if (!resume_transition.ok()) {
@@ -7255,14 +7445,11 @@ void ExecutionKernel::async_execute_worker(
           resumed_snapshot.error.reset();
           publish_execution_snapshot(std::move(resumed_snapshot));
 
-          motion_state.runtime_collision_protection_generation = start_collision_monitoring(
-              "resume_dispatch", RuntimeCollisionProtectionPurpose::kMotion,
-              &resume_scene.inventory());
-          execution_handle = execution_backend_.resume(resumed_trajectory);
           motion_state.execution_progress_generation = execution_handle.execution_generation;
           arm_runtime_collision_lookahead(exec_id, execution_handle.execution_generation,
                                           std::move(resume_collision_trajectory),
-                                          request.contact_policy_id, resume_scene.inventory());
+                                          resume_request.contact_policy_id,
+                                          resume_scene.inventory());
         }
 
         if (completed) {
@@ -7683,6 +7870,152 @@ Result<void> ExecutionKernel::DispatchPreparedMotion(
     session->state = ResolvedPreparedMotionExecutionStateDTO::kDispatchRequested;
   }
   session->changed.notify_all();
+  return Result<void>::Ok();
+}
+
+Result<void> ExecutionKernel::PrepareResumeMotion(const std::uint64_t execution_id,
+                                                  ResolvedPreparedMotionResumeRequestDTO request) {
+  std::shared_ptr<PreparedMotionSession> session;
+  {
+    std::lock_guard lock(prepared_motion_session_mutex_);
+    session = active_prepared_motion_session_;
+  }
+  if (!session) {
+    return Result<void>::Err(ErrorDTO{kErrorMissingReference,
+                                      "Prepared motion session is not resident",
+                                      {{"reason", "prepared_motion_session_missing"}}});
+  }
+  if (!request.operation_revision.nonzero() || request.operation_id.empty() ||
+      request.participant_id.empty() || request.controller_goal_id.empty() ||
+      !request.controller_goal_generation.nonzero() || !request.ordinary_stop_plan) {
+    return Result<void>::Err(ErrorDTO{kErrorInvalidRequest,
+                                      "Prepared Resume authority is incomplete",
+                                      {{"reason", "prepared_resume_authority_invalid"}}});
+  }
+
+  std::lock_guard lifecycle_lock(lifecycle_mutex_);
+  std::lock_guard session_lock(session->mutex);
+  if (session->execution_id != execution_id) {
+    return Result<void>::Err(ErrorDTO{kErrorMissingReference,
+                                      "Prepared Resume execution identity is stale",
+                                      {{"reason", "prepared_resume_execution_id_mismatch"}}});
+  }
+  const auto& prior = session->authority;
+  const auto& prior_binding = prior.execution_request.binding;
+  if (session->state != ResolvedPreparedMotionExecutionStateDTO::kDispatched ||
+      session->resume_cycle || request.operation_id != prior_binding.operation_id ||
+      request.participant_id != prior_binding.participant_id ||
+      request.operation_revision.value() <= prior.operation_revision.value() ||
+      request.controller_goal_generation.value() <=
+          prior_binding.controller_goal_generation.value() ||
+      request.controller_goal_id == prior_binding.controller_goal_id ||
+      request.ordinary_stop_plan->operation_id != request.operation_id ||
+      request.ordinary_stop_plan->operation_revision != request.operation_revision ||
+      request.ordinary_stop_plan->participant_id != request.participant_id ||
+      request.ordinary_stop_plan->program_run_id != prior_binding.program_run_id) {
+    return Result<void>::Err(
+        ErrorDTO{kErrorInvalidRequest,
+                 "Prepared Resume does not advance the resident participant authority",
+                 {{"reason", "prepared_resume_authority_mismatch"}}});
+  }
+  const auto verified_stop = VerifyPreparedParticipantStopPlan(
+      prior.stop_readiness.value().resolved_stop_base_plan, *request.ordinary_stop_plan,
+      prior.binding.value().resources, prior.retained_default_stop_limits,
+      prior.stop_node_category);
+  if (!verified_stop.ok()) {
+    return Result<void>::Err(verified_stop.error());
+  }
+
+  ResolvedPreparedMotionExecutionRequestDTO updated = prior;
+  updated.operation_revision = request.operation_revision;
+  updated.execution_request.binding.controller_goal_id = std::move(request.controller_goal_id);
+  updated.execution_request.binding.controller_goal_generation = request.controller_goal_generation;
+  updated.ordinary_stop_plan = std::move(request.ordinary_stop_plan);
+  auto transition = stop_policy_.request_resume();
+  if (!transition.ok()) {
+    return Result<void>::Err(transition.error());
+  }
+  session->authority = std::move(updated);
+  session->participant.reset();
+  session->backend_prepare_result.reset();
+  session->error.reset();
+  session->dispatch_requested = false;
+  session->cancel_requested = false;
+  session->resume_cycle = true;
+  session->state = ResolvedPreparedMotionExecutionStateDTO::kPreparing;
+  worker_signals_.request_resume();
+  return Result<void>::Ok();
+}
+
+Result<void> ExecutionKernel::DispatchPreparedResumeMotion(
+    const std::uint64_t execution_id, const ContentDigest& prepared_contract_digest) {
+  std::shared_ptr<PreparedMotionSession> session;
+  {
+    std::lock_guard lock(prepared_motion_session_mutex_);
+    session = active_prepared_motion_session_;
+  }
+  if (!session) {
+    return Result<void>::Err(ErrorDTO{kErrorMissingReference,
+                                      "Prepared motion session is not resident",
+                                      {{"reason", "prepared_motion_session_missing"}}});
+  }
+  {
+    std::lock_guard lock(session->mutex);
+    if (session->execution_id != execution_id) {
+      return Result<void>::Err(ErrorDTO{kErrorMissingReference,
+                                        "Prepared Resume execution identity is stale",
+                                        {{"reason", "prepared_resume_execution_id_mismatch"}}});
+    }
+    if (!session->resume_cycle ||
+        session->state != ResolvedPreparedMotionExecutionStateDTO::kPrepared ||
+        !session->participant ||
+        session->participant->prepared_contract_digest != prepared_contract_digest) {
+      return Result<void>::Err(
+          ErrorDTO{kErrorInvalidRequest,
+                   "Prepared Resume dispatch does not name the exact ready contract",
+                   {{"reason", "prepared_resume_dispatch_mismatch"}}});
+    }
+    session->dispatch_requested = true;
+    session->state = ResolvedPreparedMotionExecutionStateDTO::kDispatchRequested;
+  }
+  session->changed.notify_all();
+  return Result<void>::Ok();
+}
+
+Result<void> ExecutionKernel::CancelPreparedResumeMotion(const std::uint64_t execution_id) {
+  std::shared_ptr<PreparedMotionSession> session;
+  {
+    std::lock_guard lock(prepared_motion_session_mutex_);
+    session = active_prepared_motion_session_;
+  }
+  if (!session) {
+    return Result<void>::Err(ErrorDTO{kErrorMissingReference,
+                                      "Prepared motion session is not resident",
+                                      {{"reason", "prepared_motion_session_missing"}}});
+  }
+  {
+    std::lock_guard lock(session->mutex);
+    if (session->execution_id != execution_id) {
+      return Result<void>::Err(ErrorDTO{kErrorMissingReference,
+                                        "Prepared Resume execution identity is stale",
+                                        {{"reason", "prepared_resume_execution_id_mismatch"}}});
+    }
+    if (!session->resume_cycle ||
+        session->state == ResolvedPreparedMotionExecutionStateDTO::kDispatched) {
+      return Result<void>::Err(ErrorDTO{std::string(to_string(ErrorCode::kInvalidStateTransition)),
+                                        "No cancellable prepared Resume is resident",
+                                        {{"reason", "prepared_resume_not_cancellable"}}});
+    }
+    if (session->state == ResolvedPreparedMotionExecutionStateDTO::kPreparationFailed ||
+        session->state == ResolvedPreparedMotionExecutionStateDTO::kCancelledPreDispatch) {
+      return Result<void>::Ok();
+    }
+    session->cancel_requested = true;
+    session->state = ResolvedPreparedMotionExecutionStateDTO::kCancelledPreDispatch;
+  }
+  session->changed.notify_all();
+  request_active_planning_cancel();
+  request_active_validation_cancel("prepared_resume_cancelled_pre_dispatch");
   return Result<void>::Ok();
 }
 
@@ -9306,18 +9639,16 @@ ResetResultDTO ExecutionKernel::reset_after_certified_containment(
   if (execution_id == 0U || before.execution_id != execution_id ||
       before.state == ExecutionState::kIdle) {
     return ResetResultDTO{
-        false,
-        ErrorDTO{kErrorInvalidRequest,
-                 "Certified-containment reset names a stale subordinate execution",
-                 {{"reason_code", "certified_containment_execution_mismatch"},
-                  {"current_execution_id", std::to_string(before.execution_id)},
-                  {"requested_execution_id", std::to_string(execution_id)}}}};
+        false, ErrorDTO{kErrorInvalidRequest,
+                        "Certified-containment reset names a stale subordinate execution",
+                        {{"reason_code", "certified_containment_execution_mismatch"},
+                         {"current_execution_id", std::to_string(before.execution_id)},
+                         {"requested_execution_id", std::to_string(execution_id)}}}};
   }
   if (lifecycle_worker_retirement_in_progress_.load(std::memory_order_acquire)) {
-    return ResetResultDTO{
-        false, ErrorDTO{kErrorInvalidRequest,
-                        "Execution worker retirement is already in progress",
-                        {{"reason_code", "worker_retirement_in_progress"}}}};
+    return ResetResultDTO{false, ErrorDTO{kErrorInvalidRequest,
+                                          "Execution worker retirement is already in progress",
+                                          {{"reason_code", "worker_retirement_in_progress"}}}};
   }
 
   // The addressed owner has already certified containment. This path only
@@ -9334,10 +9665,9 @@ ResetResultDTO ExecutionKernel::reset_after_certified_containment(
   operator_stop_worker_.stop_and_join();
   stop_collision_monitoring(RuntimeCollisionMonitorRelease::kResetOrTeardown);
   if (!retire_execute_worker(lifecycle_lock)) {
-    return ResetResultDTO{
-        false, ErrorDTO{kErrorInvalidRequest,
-                        "Execution worker cannot retire from its own callback",
-                        {{"reason_code", "worker_retirement_self_thread"}}}};
+    return ResetResultDTO{false, ErrorDTO{kErrorInvalidRequest,
+                                          "Execution worker cannot retire from its own callback",
+                                          {{"reason_code", "worker_retirement_self_thread"}}}};
   }
   if (!control_command_epoch_matches(expected_epoch)) {
     return ResetResultDTO{false, stale_control_command_error()};
@@ -11112,30 +11442,39 @@ Result<TrajectoryDTO> ExecutionKernel::plan_trajectory(
 
 Result<TrajectoryDTO> ExecutionKernel::plan_resume_trajectory(
     const ExecuteRequestDTO& request, const CollisionWorldLeaseInventory& projection_inventory) {
+  auto planned = plan_resume_trajectory_with_evidence(request, projection_inventory);
+  if (!planned.ok()) {
+    return Result<TrajectoryDTO>::Err(planned.error());
+  }
+  return Result<TrajectoryDTO>::Ok(std::move(*planned.value().result.trajectory));
+}
+
+Result<ExecutionKernel::PlanningSuccess> ExecutionKernel::plan_resume_trajectory_with_evidence(
+    const ExecuteRequestDTO& request, const CollisionWorldLeaseInventory& projection_inventory) {
   auto sync_result = execution_backend_.sync_observed_state_before_planning();
   if (!sync_result.ok()) {
     auto error = sync_result.error();
     error.details["resume_phase"] = "state_sync";
-    return Result<TrajectoryDTO>::Err(std::move(error));
+    return Result<PlanningSuccess>::Err(std::move(error));
   }
 
   try {
-    auto planned = plan_trajectory(request, projection_inventory);
+    auto planned = plan_trajectory_with_evidence(request, projection_inventory);
     if (!planned.ok()) {
       auto error = planned.error();
       error.details["resume_phase"] = "planning";
-      return Result<TrajectoryDTO>::Err(std::move(error));
+      return Result<PlanningSuccess>::Err(std::move(error));
     }
-    return Result<TrajectoryDTO>::Ok(std::move(planned.value()));
+    return planned;
   } catch (const std::exception& e) {
-    return Result<TrajectoryDTO>::Err(
+    return Result<PlanningSuccess>::Err(
         ErrorDTO{kErrorPlanningFailed,
                  "Resume planning could not read the fresh current state",
                  {{"reason", "resume_current_state_unavailable"},
                   {"resume_phase", "current_state"},
                   {"exception", e.what()}}});
   } catch (...) {
-    return Result<TrajectoryDTO>::Err(
+    return Result<PlanningSuccess>::Err(
         ErrorDTO{kErrorPlanningFailed,
                  "Resume planning could not read the fresh current state",
                  {{"reason", "resume_current_state_unavailable"},
