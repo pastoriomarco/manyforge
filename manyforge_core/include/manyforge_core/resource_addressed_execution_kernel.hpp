@@ -310,6 +310,7 @@ class ResourceAddressedExecutionKernel final : public IAddressedOperationOwner,
   struct StopTransaction;
   struct StopTerminalRecord;
   struct StopProjectionJob;
+  struct PartialDispatchStopScope;
   struct DisableRuntimeExpectation;
   class StopProjectionWorker;
   struct EngineSubscription;
@@ -335,6 +336,11 @@ class ResourceAddressedExecutionKernel final : public IAddressedOperationOwner,
                                                      std::optional<ErrorDTO> terminal_error);
   [[nodiscard]] Result<void> advance_prepared_motion(const OperationId& operation_id,
                                                      IResolvedParticipantExecutionEngine* engine);
+  [[nodiscard]] Result<OperationAcceptedDTO> execute_coordinated_motion_after_preflight(
+      const OperationIntentDTO& intent);
+  [[nodiscard]] Result<void> fail_coordinated_pre_dispatch(
+      const OperationId& operation_id, IResolvedParticipantExecutionEngine* failing_engine,
+      ErrorDTO failure);
   [[nodiscard]] Result<OperationControlAcceptedDTO> apply_control(
       const OperationControlRequestDTO& request, OperationControlKind control);
   [[nodiscard]] Result<void> apply_runtime_scale_status(
@@ -350,7 +356,9 @@ class ResourceAddressedExecutionKernel final : public IAddressedOperationOwner,
   [[nodiscard]] std::optional<StopControlWorkToken> allocate_stop_projection_job_locked() noexcept;
   [[nodiscard]] bool commit_stop_terminal_locked(StopTransaction& transaction,
                                                  std::int64_t completed_at_ns) noexcept;
-  [[nodiscard]] Result<StopAcceptedDTO> accept_stop(EmergencyStopProjectedIntentDTO intent);
+  [[nodiscard]] Result<StopAcceptedDTO> accept_stop(
+      EmergencyStopProjectedIntentDTO intent,
+      const PartialDispatchStopScope* partial_dispatch_scope = nullptr);
   [[nodiscard]] Result<KernelDisableHandoffRuntimeSnapshotDTO>
   capture_disable_handoff_runtime_snapshot_impl(const DisableRuntimeExpectation& expectation) const;
 

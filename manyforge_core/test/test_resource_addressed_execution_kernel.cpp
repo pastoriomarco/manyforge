@@ -1452,6 +1452,49 @@ FakeOperationJournal default_journal;
   return std::move(sealed.value());
 }
 
+[[nodiscard]] RuntimeParticipantBinding coordinated_occurrence(
+    const RuntimeParticipantBinding& source, const std::string& suffix) {
+  auto value = source.value();
+  value.component_role_id = ComponentRoleId("robot_" + suffix);
+  value.target_role_id = TargetRoleId("arm_" + suffix);
+  value.controllable_component_id = ControllableComponentId("robot." + suffix);
+  for (auto& model : value.model_bindings) {
+    model.model_instance_id = ModelInstanceId("robot.model." + suffix);
+  }
+  for (auto& group : value.model_groups) {
+    group.model_instance_id = ModelInstanceId("robot.model." + suffix);
+    group.compiled_group_name = "mf2_robot_" + suffix + "_arm_group";
+    for (auto& joint : group.expanded_compiled_joint_names) {
+      joint = "mf2_robot_" + suffix + "_joint_1";
+    }
+  }
+  for (auto& frame : value.frame_bindings) {
+    frame.model_instance_id = ModelInstanceId("robot.model." + suffix);
+    frame.compiled_frame_name = "mf2_robot_" + suffix + "_" + frame.compiled_frame_name;
+  }
+  for (auto& resource : value.resources) {
+    resource.resource_id = ResourceId("robot." + suffix + ".joint_1");
+    resource.compiled_resource_name = "mf2_robot_" + suffix + "_joint_1";
+  }
+  auto& control = *value.control_path;
+  control.control_domain_id = ControlDomainId("domain.arm." + suffix);
+  control.control_binding_id = ControlBindingId("binding.arm." + suffix);
+  control.active_control_configuration_id = ActiveControlConfigurationId("active.native." + suffix);
+  control.provider_instance_id = ProviderInstanceId("provider.native." + suffix);
+  control.state_authority_id = StateAuthorityId("state.native." + suffix);
+  for (auto& path : value.supporting_capability_provider_paths) {
+    path.capability_provider_binding_id = CapabilityProviderBindingId("planner-binding." + suffix);
+    path.capability_provider_binding_revision =
+        CapabilityProviderBindingRevision("planner-binding-revision." + suffix);
+    path.provider_instance_id = ProviderInstanceId("planner-provider." + suffix);
+  }
+  auto sealed = verify_runtime_participant_binding(std::move(value));
+  if (!sealed.ok()) {
+    throw std::logic_error(sealed.error().message);
+  }
+  return std::move(sealed.value());
+}
+
 [[nodiscard]] RuntimeParticipantBinding second_occurrence_sharing_first_resource(
     const RuntimeParticipantBinding& source) {
   auto value = second_same_type_occurrence(source).value();
@@ -1526,6 +1569,22 @@ FakeOperationJournal default_journal;
   operation.program_binding_id = ProgramBindingId(test_digest('3'));
   operation.expected_retained_bundle_id = RetainedBundleId(test_digest('e'));
   operation.expected_graph_revision = GraphRevision(test_digest('f'));
+  return operation;
+}
+
+[[nodiscard]] OperationIntentDTO coordinated_motion_operation(
+    std::string request_id, const std::size_t participant_count = 2U) {
+  auto operation = motion_operation(std::move(request_id));
+  operation.coordination_policy = OperationCoordinationPolicy::kCoordinatedAll;
+  operation.participants.reserve(participant_count);
+  for (std::size_t index = 1U; index < participant_count; ++index) {
+    auto participant = operation.participants.front();
+    const auto suffix = std::to_string(index + 1U);
+    participant.component_role_id = ComponentRoleId("robot_" + suffix);
+    participant.target_role_id = TargetRoleId("arm_" + suffix);
+    std::get<MotionParticipantIntentDTO>(participant.payload).move_id = MoveId("move." + suffix);
+    operation.participants.push_back(std::move(participant));
+  }
   return operation;
 }
 
@@ -1729,6 +1788,237 @@ TEST(ResourceAddressedExecutionKernelTest,
   const auto operation = kernel.get_operation_state(accepted.value().operation_id);
   ASSERT_TRUE(operation.ok()) << operation.error().message;
   EXPECT_EQ(operation.value().state, OperationStateKind::kStopped);
+}
+
+TEST(ResourceAddressedExecutionKernelTest,
+     CoordinatedMotionPreparesEveryParticipantBeforeDeterministicDispatch) {
+  FakeClock clock;
+  FakeParticipantEngine first_engine;
+  FakeParticipantEngine second_engine;
+  std::vector<std::string> timeline;
+  first_engine.timeline = &timeline;
+  second_engine.timeline = &timeline;
+  const auto first =
+      make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular);
+  const auto second = coordinated_occurrence(first, "2");
+  ResourceAddressedExecutionKernel kernel(
+      {registration(first, first_engine), registration(second, second_engine)}, clock,
+      default_journal, {RequestOwnerEpoch("kernel.epoch.1"), CellId("cell.test"), 16U});
+
+  const auto accepted =
+      kernel.execute(coordinated_motion_operation("request.motion.coordinated.success"));
+  ASSERT_TRUE(accepted.ok()) << accepted.error().message;
+  ASSERT_EQ(accepted.value().participant_assignments.size(), 2U);
+  EXPECT_EQ(first_engine.prepare_motion_calls, 1);
+  EXPECT_EQ(second_engine.prepare_motion_calls, 1);
+  EXPECT_EQ(first_engine.dispatch_prepared_motion_calls, 1);
+  EXPECT_EQ(second_engine.dispatch_prepared_motion_calls, 1);
+  EXPECT_EQ(timeline,
+            (std::vector<std::string>{"engine:prepare_motion", "engine:prepare_motion",
+                                      "engine:dispatch_prepared_motion", "engine:execute",
+                                      "engine:set_runtime_scale", "engine:dispatch_prepared_motion",
+                                      "engine:execute", "engine:set_runtime_scale"}));
+  const auto state = kernel.get_operation_state(accepted.value().operation_id);
+  ASSERT_TRUE(state.ok()) << state.error().message;
+  EXPECT_EQ(state.value().state, OperationStateKind::kPrepared);
+  ASSERT_EQ(state.value().participants.size(), 2U);
+  const auto slots = kernel.resource_snapshot();
+  EXPECT_TRUE(std::all_of(slots.begin(), slots.end(), [](const auto& slot) {
+    return slot.state == ResourceSlotState::kDispatched;
+  }));
+}
+
+TEST(ResourceAddressedExecutionKernelTest,
+     CoordinatedMotionHoldsEveryDispatchUntilTheLastPreparationCompletes) {
+  FakeClock clock;
+  FakeParticipantEngine first_engine;
+  FakeParticipantEngine second_engine;
+  second_engine.defer_prepare_completion = true;
+  const auto first =
+      make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular);
+  const auto second = coordinated_occurrence(first, "2");
+  ResourceAddressedExecutionKernel kernel(
+      {registration(first, first_engine), registration(second, second_engine)}, clock,
+      default_journal, {RequestOwnerEpoch("kernel.epoch.1"), CellId("cell.test"), 16U});
+
+  const auto accepted =
+      kernel.execute(coordinated_motion_operation("request.motion.coordinated.held"));
+  ASSERT_TRUE(accepted.ok()) << accepted.error().message;
+  EXPECT_EQ(first_engine.dispatch_prepared_motion_calls, 0);
+  EXPECT_EQ(second_engine.dispatch_prepared_motion_calls, 0);
+  const auto reserved_slots = kernel.resource_snapshot();
+  EXPECT_TRUE(std::all_of(reserved_slots.begin(), reserved_slots.end(), [](const auto& slot) {
+    return slot.state == ResourceSlotState::kReserved;
+  }));
+
+  ASSERT_TRUE(second_engine.complete_preparation().ok());
+  ASSERT_TRUE(wait_until([&] {
+    return first_engine.dispatch_prepared_motion_calls == 1 &&
+           second_engine.dispatch_prepared_motion_calls == 1;
+  }));
+  const auto state = kernel.get_operation_state(accepted.value().operation_id);
+  ASSERT_TRUE(state.ok()) << state.error().message;
+  EXPECT_EQ(state.value().state, OperationStateKind::kPrepared);
+}
+
+TEST(ResourceAddressedExecutionKernelTest,
+     CoordinatedPreparationFailureCancelsPeersAndAtomicallyReleasesEveryReservation) {
+  FakeClock clock;
+  FakeParticipantEngine first_engine;
+  FakeParticipantEngine second_engine;
+  second_engine.prepare_failure = ErrorDTO{std::string(to_string(ErrorCode::kExecutionRejected)),
+                                           "injected coordinated preparation failure",
+                                           {{"reason", "injected_coordinated_prepare_failure"}}};
+  const auto first =
+      make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular);
+  const auto second = coordinated_occurrence(first, "2");
+  ResourceAddressedExecutionKernel kernel(
+      {registration(first, first_engine), registration(second, second_engine)}, clock,
+      default_journal, {RequestOwnerEpoch("kernel.epoch.1"), CellId("cell.test"), 16U});
+
+  const auto accepted =
+      kernel.execute(coordinated_motion_operation("request.motion.coordinated.failure"));
+  ASSERT_TRUE(accepted.ok()) << accepted.error().message;
+  EXPECT_EQ(first_engine.dispatch_prepared_motion_calls, 0);
+  EXPECT_EQ(second_engine.dispatch_prepared_motion_calls, 0);
+  EXPECT_EQ(first_engine.cancel_prepared_motion_calls, 1);
+  EXPECT_EQ(second_engine.cancel_prepared_motion_calls, 1);
+  const auto released_slots = kernel.resource_snapshot();
+  EXPECT_TRUE(std::all_of(released_slots.begin(), released_slots.end(),
+                          [](const auto& slot) { return slot.state == ResourceSlotState::kFree; }));
+  const auto state = kernel.get_operation_state(accepted.value().operation_id);
+  ASSERT_TRUE(state.ok()) << state.error().message;
+  EXPECT_EQ(state.value().state, OperationStateKind::kInterventionRequired);
+  ASSERT_EQ(state.value().participants.size(), 2U);
+  EXPECT_EQ(state.value().participants[0].state, OperationStateKind::kCancelledPreDispatch);
+  EXPECT_EQ(state.value().participants[1].state, OperationStateKind::kInterventionRequired);
+}
+
+TEST(ResourceAddressedExecutionKernelTest,
+     StopDuringCoordinatedPrepareBarrierCancelsAllParticipantsWithoutPhysicalDispatch) {
+  FakeClock clock;
+  FakeParticipantEngine first_engine;
+  FakeParticipantEngine second_engine;
+  second_engine.defer_prepare_completion = true;
+  const auto first =
+      make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular);
+  const auto second = coordinated_occurrence(first, "2");
+  ResourceAddressedExecutionKernel kernel(
+      {registration(first, first_engine), registration(second, second_engine)}, clock,
+      default_journal, {RequestOwnerEpoch("kernel.epoch.1"), CellId("cell.test"), 16U});
+
+  const auto accepted =
+      kernel.execute(coordinated_motion_operation("request.motion.coordinated.stop"));
+  ASSERT_TRUE(accepted.ok()) << accepted.error().message;
+  const auto stopped =
+      kernel.stop(stop_request("request.stop.coordinated.prepare", accepted.value(), 1U));
+  ASSERT_TRUE(stopped.ok()) << stopped.error().message;
+  ASSERT_TRUE(wait_until([&] {
+    return first_engine.cancel_prepared_motion_calls == 1 &&
+           second_engine.cancel_prepared_motion_calls == 1;
+  }));
+  EXPECT_EQ(first_engine.dispatch_prepared_motion_calls, 0);
+  EXPECT_EQ(second_engine.dispatch_prepared_motion_calls, 0);
+  EXPECT_EQ(first_engine.translate_stop_stage_calls.load(), 0);
+  EXPECT_EQ(second_engine.translate_stop_stage_calls.load(), 0);
+  ASSERT_TRUE(wait_until([&] {
+    const auto status = kernel.get_stop_status(stopped.value().stop_id);
+    return status.ok() && status.value().state == StopStatusStateDTO::kSucceeded;
+  }));
+  const auto status = kernel.get_stop_status(stopped.value().stop_id);
+  ASSERT_TRUE(status.ok());
+  ASSERT_TRUE(status.value().stop_certificate.has_value());
+  const auto certificate =
+      kernel.get_stop_certificate(status.value().stop_certificate->stop_certificate_id);
+  ASSERT_TRUE(certificate.ok()) << certificate.error().message;
+  ASSERT_EQ(certificate.value().scope_entries.size(), 2U);
+  EXPECT_TRUE(std::all_of(certificate.value().scope_entries.begin(),
+                          certificate.value().scope_entries.end(), [](const auto& entry) {
+                            return entry.dispatch_state ==
+                                   StopScopeDispatchStateDTO::kNeverDispatchedCancelled;
+                          }));
+}
+
+TEST(ResourceAddressedExecutionKernelTest,
+     CoordinatedOverlapRejectsBeforePrepareAndLeavesTheResourceTableUnchanged) {
+  FakeClock clock;
+  FakeParticipantEngine first_engine;
+  FakeParticipantEngine second_engine;
+  const auto first =
+      make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular);
+  auto overlapping_value = coordinated_occurrence(first, "2").value();
+  overlapping_value.controllable_component_id = first.value().controllable_component_id;
+  overlapping_value.resources.front().resource_id = first.value().resources.front().resource_id;
+  auto overlapping = verify_runtime_participant_binding(std::move(overlapping_value));
+  ASSERT_TRUE(overlapping.ok()) << overlapping.error().message;
+  ResourceAddressedExecutionKernel kernel(
+      {registration(first, first_engine), registration(overlapping.value(), second_engine)}, clock,
+      default_journal, {RequestOwnerEpoch("kernel.epoch.1"), CellId("cell.test"), 16U});
+
+  const auto rejected =
+      kernel.execute(coordinated_motion_operation("request.motion.coordinated.overlap"));
+  ASSERT_FALSE(rejected.ok());
+  EXPECT_EQ(rejected.error().details.at("reason"), "coordinated_participant_resource_overlap");
+  EXPECT_EQ(first_engine.prepare_motion_calls, 0);
+  EXPECT_EQ(second_engine.prepare_motion_calls, 0);
+  ASSERT_EQ(kernel.resource_snapshot().size(), 1U);
+  EXPECT_EQ(kernel.resource_snapshot().front().state, ResourceSlotState::kFree);
+}
+
+TEST(ResourceAddressedExecutionKernelTest,
+     PartialDispatchStopsOnlyReleasedParticipantsAndCancelsTheUnreleasedRemainder) {
+  FakeClock clock;
+  FakeParticipantEngine first_engine;
+  FakeParticipantEngine second_engine;
+  FakeParticipantEngine third_engine;
+  second_engine.next_execute_result =
+      Result<std::uint64_t>::Err(ErrorDTO{std::string(to_string(ErrorCode::kExecutionRejected)),
+                                          "injected second dispatch failure",
+                                          {{"reason", "injected_dispatch_failure"}}});
+  const auto first =
+      make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular);
+  const auto second = coordinated_occurrence(first, "2");
+  const auto third = coordinated_occurrence(first, "3");
+  FakeOperationJournal journal;
+  ResourceAddressedExecutionKernel kernel(
+      {registration(first, first_engine), registration(second, second_engine),
+       registration(third, third_engine)},
+      clock, journal, {RequestOwnerEpoch("kernel.epoch.1"), CellId("cell.test"), 16U});
+
+  const auto accepted =
+      kernel.execute(coordinated_motion_operation("request.motion.coordinated.partial", 3U));
+  ASSERT_TRUE(accepted.ok()) << accepted.error().message;
+  EXPECT_EQ(first_engine.dispatch_prepared_motion_calls, 1);
+  EXPECT_EQ(second_engine.dispatch_prepared_motion_calls, 1);
+  EXPECT_EQ(third_engine.dispatch_prepared_motion_calls, 0);
+  EXPECT_EQ(third_engine.cancel_prepared_motion_calls, 1);
+  ASSERT_TRUE(wait_until([&] {
+    return first_engine.translate_stop_stage_calls.load() == 1 &&
+           second_engine.translate_stop_stage_calls.load() == 1;
+  }));
+  EXPECT_EQ(third_engine.translate_stop_stage_calls.load(), 0);
+  const StopId stop_id("stop.kernel.epoch.1.1");
+  ASSERT_TRUE(wait_until([&] {
+    const auto status = kernel.get_stop_status(stop_id);
+    return status.ok() && status.value().state == StopStatusStateDTO::kSucceeded;
+  }));
+  const auto status = kernel.get_stop_status(stop_id);
+  ASSERT_TRUE(status.ok()) << status.error().message;
+  ASSERT_TRUE(status.value().stop_certificate.has_value());
+  const auto certificate =
+      kernel.get_stop_certificate(status.value().stop_certificate->stop_certificate_id);
+  ASSERT_TRUE(certificate.ok()) << certificate.error().message;
+  ASSERT_EQ(certificate.value().scope_entries.size(), 2U);
+  {
+    std::lock_guard lock(journal.mutex);
+    EXPECT_TRUE(std::any_of(journal.calls.begin(), journal.calls.end(), [](const auto& call) {
+      return call == "state:operation_partial_dispatch";
+    }));
+  }
+  const auto state = kernel.get_operation_state(accepted.value().operation_id);
+  ASSERT_TRUE(state.ok()) << state.error().message;
+  ASSERT_EQ(state.value().participants.size(), 3U);
+  EXPECT_EQ(state.value().participants[2].state, OperationStateKind::kCancelledPreDispatch);
 }
 
 TEST(ResourceAddressedExecutionKernelTest,
