@@ -439,6 +439,7 @@ struct QualifiedIndexes final {
     result.required_runtime_profiles.insert(
         pair_key(runtime.runtime_profile_id, runtime.runtime_profile_revision));
   }
+  std::size_t selected_runtime_policy_count = 0U;
   for (const auto &retained_policy :
        deployment_inputs.value().retained_policy_records) {
     std::visit(
@@ -449,6 +450,11 @@ struct QualifiedIndexes final {
           if constexpr (std::is_same_v<
                             Reference,
                             core::RuntimePolicyCatalogRecordRefDTO>) {
+            ++selected_runtime_policy_count;
+            if (selected_runtime_policy_count > 1U) {
+              fail("v1 retained applicability selects more than one runtime "
+                   "policy without a closed selector");
+            }
             const auto selected = result.runtime_policies.find(key);
             if (selected == result.runtime_policies.end() ||
                 selected->second->reference() != typed_reference) {

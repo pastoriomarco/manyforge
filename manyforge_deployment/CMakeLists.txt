@@ -601,6 +601,7 @@ add_library(manyforge_deployment_verification_core
   src/verified_retained_projection.cpp
   src/runtime_profile_codec.cpp
   src/runtime_policy_codec.cpp
+  src/retained_runtime_policy.cpp
   src/scenario_apply_candidate_source.cpp
   src/stop_evidence_policy_codec.cpp
   src/stop_qualification_evidence.cpp

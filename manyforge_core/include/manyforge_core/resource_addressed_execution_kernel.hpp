@@ -15,6 +15,7 @@
 #include <manyforge_core/ports/istop_surveillance_observation_port.hpp>
 #include <manyforge_core/resource_slot_table.hpp>
 #include <manyforge_core/route_selection_owner.hpp>
+#include <manyforge_core/runtime_participant_policy.hpp>
 #include <manyforge_core/runtime_participant_registry.hpp>
 #include <manyforge_core/runtime_participant_stop_readiness.hpp>
 #include <manyforge_core/stop_fault_recovery.hpp>
@@ -57,6 +58,10 @@ struct RuntimeParticipantExecutionRegistration final {
   /// separate from the historical subordinate engine: StopControl never
   /// calls that engine's deployment-wide Stop surface.
   IControlDomainExecutionPort* stop_execution_port{};
+
+  /// Exact retained runtime policy sealed against this participant binding.
+  /// Absence remains observable but motion admission fails closed.
+  std::optional<RuntimeParticipantPolicySelection> runtime_policy{};
 };
 
 using RuntimeParticipantAdmissionResolver =

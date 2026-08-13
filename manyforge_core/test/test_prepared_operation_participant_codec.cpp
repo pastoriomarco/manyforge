@@ -193,6 +193,7 @@ struct SealedInputs final {
   RuntimeParticipantBinding binding;
   ControllerLifecycleExpectedDomain expected_domain;
   RuntimeParticipantStopReadiness readiness;
+  std::optional<RuntimeParticipantPolicySelection> runtime_policy;
 };
 
 [[nodiscard]] SealedInputs Inputs(const ResolvedStopBasePlanDTO& base, bool command) {
@@ -203,7 +204,21 @@ struct SealedInputs final {
        base},
       binding, domain);
   if (!readiness.ok()) throw std::logic_error(readiness.error().message);
-  return {std::move(binding), std::move(domain), std::move(readiness.value())};
+  std::optional<RuntimeParticipantPolicySelection> runtime_policy;
+  if (!command) {
+    auto selected = verify_runtime_participant_policy_selection(
+        RuntimePolicyDTO{RuntimePolicyId("runtime.policy"),
+                         RuntimePolicyRevision(Digest('2')),
+                         std::nullopt,
+                         {},
+                         {RuntimeMotionSpeedLimitDTO{RuntimePolicyCellScopeDTO{}, 0.5}},
+                         {}},
+        binding);
+    if (!selected.ok()) throw std::logic_error(selected.error().message);
+    runtime_policy = std::move(selected.value());
+  }
+  return {std::move(binding), std::move(domain), std::move(readiness.value()),
+          std::move(runtime_policy)};
 }
 
 [[nodiscard]] PreparedCapabilityCommandDTO CommandPayload() {
@@ -382,7 +397,7 @@ struct SealedInputs final {
       state,
       ResolvedJointGoalDTO{resources, joints, {0.5, -0.5}},
       TolerancesDTO{0.01, 0.01, 0.01},
-      SpeedProfileDTO{0.5, 0.5, std::nullopt},
+      SpeedProfileDTO{0.5, 0.5, 0.5},
       PlanningProfileDTO::kFirstFeasible,
       std::nullopt,
       {},
@@ -417,21 +432,22 @@ TEST(PreparedOperationParticipantCodecTest, SealsAndRoundTripsBothPayloadTags) {
   auto command_inputs = Inputs(base, true);
   auto command = MakePreparedOperationParticipant(
       Candidate(command_inputs.binding, command_inputs.readiness, CommandPayload()),
-      command_inputs.binding, command_inputs.readiness, {}, MotionInterruptNodeCategory::kGeneric);
+      command_inputs.binding, command_inputs.readiness, nullptr, {},
+      MotionInterruptNodeCategory::kGeneric);
   ASSERT_TRUE(command.ok()) << command.error().details.at("reason");
   const auto command_bytes = EncodePreparedOperationParticipant(
-      command.value(), command_inputs.binding, command_inputs.readiness, {},
+      command.value(), command_inputs.binding, command_inputs.readiness, nullptr, {},
       MotionInterruptNodeCategory::kGeneric);
   ASSERT_TRUE(command_bytes.ok()) << command_bytes.error().message;
   const auto golden = ParticipantGolden();
   EXPECT_EQ(content_identity::sha256_digest(command_bytes.value()), golden.first);
   EXPECT_EQ(command.value().prepared_contract_digest.value(), golden.second);
   const auto command_decoded = DecodePreparedOperationParticipant(
-      command_bytes.value(), command_inputs.binding, command_inputs.readiness, {},
+      command_bytes.value(), command_inputs.binding, command_inputs.readiness, nullptr, {},
       MotionInterruptNodeCategory::kGeneric);
   ASSERT_TRUE(command_decoded.ok()) << command_decoded.error().message;
   EXPECT_EQ(EncodePreparedOperationParticipant(command_decoded.value(), command_inputs.binding,
-                                               command_inputs.readiness, {},
+                                               command_inputs.readiness, nullptr, {},
                                                MotionInterruptNodeCategory::kGeneric)
                 .value(),
             command_bytes.value());
@@ -439,15 +455,16 @@ TEST(PreparedOperationParticipantCodecTest, SealsAndRoundTripsBothPayloadTags) {
   auto motion_inputs = Inputs(base, false);
   auto motion = MakePreparedOperationParticipant(
       Candidate(motion_inputs.binding, motion_inputs.readiness, MotionPayload(motion_inputs)),
-      motion_inputs.binding, motion_inputs.readiness, {}, MotionInterruptNodeCategory::kGeneric);
+      motion_inputs.binding, motion_inputs.readiness, &*motion_inputs.runtime_policy, {},
+      MotionInterruptNodeCategory::kGeneric);
   ASSERT_TRUE(motion.ok()) << motion.error().details.at("reason");
   const auto motion_bytes = EncodePreparedOperationParticipant(
-      motion.value(), motion_inputs.binding, motion_inputs.readiness, {},
-      MotionInterruptNodeCategory::kGeneric);
+      motion.value(), motion_inputs.binding, motion_inputs.readiness,
+      &*motion_inputs.runtime_policy, {}, MotionInterruptNodeCategory::kGeneric);
   ASSERT_TRUE(motion_bytes.ok()) << motion_bytes.error().message;
-  EXPECT_TRUE(DecodePreparedOperationParticipant(motion_bytes.value(), motion_inputs.binding,
-                                                 motion_inputs.readiness, {},
-                                                 MotionInterruptNodeCategory::kGeneric)
+  EXPECT_TRUE(DecodePreparedOperationParticipant(
+                  motion_bytes.value(), motion_inputs.binding, motion_inputs.readiness,
+                  &*motion_inputs.runtime_policy, {}, MotionInterruptNodeCategory::kGeneric)
                   .ok());
 }
 
@@ -456,17 +473,17 @@ TEST(PreparedOperationParticipantCodecTest, RejectsSelfAttestedClaimsAndDigestFo
   auto inputs = Inputs(base, true);
   auto made = MakePreparedOperationParticipant(
       Candidate(inputs.binding, inputs.readiness, CommandPayload()), inputs.binding,
-      inputs.readiness, {}, MotionInterruptNodeCategory::kGeneric);
+      inputs.readiness, nullptr, {}, MotionInterruptNodeCategory::kGeneric);
   ASSERT_TRUE(made.ok());
   auto forged = made.value();
   forged.claimed_command_interfaces.front().interface_name = "velocity";
-  EXPECT_FALSE(VerifyPreparedOperationParticipant(forged, inputs.binding, inputs.readiness, {},
-                                                  MotionInterruptNodeCategory::kGeneric)
+  EXPECT_FALSE(VerifyPreparedOperationParticipant(forged, inputs.binding, inputs.readiness, nullptr,
+                                                  {}, MotionInterruptNodeCategory::kGeneric)
                    .ok());
   forged = made.value();
   forged.prepared_contract_digest = ContentDigest(Digest('0'));
-  EXPECT_FALSE(VerifyPreparedOperationParticipant(forged, inputs.binding, inputs.readiness, {},
-                                                  MotionInterruptNodeCategory::kGeneric)
+  EXPECT_FALSE(VerifyPreparedOperationParticipant(forged, inputs.binding, inputs.readiness, nullptr,
+                                                  {}, MotionInterruptNodeCategory::kGeneric)
                    .ok());
 }
 
@@ -475,7 +492,7 @@ TEST(PreparedOperationParticipantCodecTest, BackendBindingRejectsCrossedParticip
   auto inputs = Inputs(base, false);
   auto made = MakePreparedOperationParticipant(
       Candidate(inputs.binding, inputs.readiness, MotionPayload(inputs)), inputs.binding,
-      inputs.readiness, {}, MotionInterruptNodeCategory::kGeneric);
+      inputs.readiness, &*inputs.runtime_policy, {}, MotionInterruptNodeCategory::kGeneric);
   ASSERT_TRUE(made.ok());
   EXPECT_FALSE(
       prepared_participant_backend_binding_field_error(
@@ -491,6 +508,37 @@ TEST(PreparedOperationParticipantCodecTest, BackendBindingRejectsCrossedParticip
   EXPECT_EQ(prepared_participant_backend_binding_field_error(
                 crossed, inputs.binding, PreparedParticipantPayloadKindDTO::kMotionExecution),
             "prepared_participant_backend_binding_mismatch");
+}
+
+TEST(PreparedOperationParticipantCodecTest,
+     MotionRequiresExactSealedRuntimePolicyReferentAndEffectiveCeiling) {
+  const auto base = BasePlan();
+  auto inputs = Inputs(base, false);
+  const auto candidate = Candidate(inputs.binding, inputs.readiness, MotionPayload(inputs));
+
+  auto missing =
+      MakePreparedOperationParticipant(candidate, inputs.binding, inputs.readiness, nullptr, {},
+                                       MotionInterruptNodeCategory::kGeneric);
+  ASSERT_FALSE(missing.ok());
+  EXPECT_EQ(missing.error().details.at("reason"), "runtime_policy_selection_required");
+
+  auto foreign = candidate;
+  std::get<PreparedMotionExecutionDTO>(foreign.payload).runtime_policy.runtime_policy_revision =
+      RuntimePolicyRevision(Digest('0'));
+  auto foreign_result = MakePreparedOperationParticipant(std::move(foreign), inputs.binding,
+                                                         inputs.readiness, &*inputs.runtime_policy,
+                                                         {}, MotionInterruptNodeCategory::kGeneric);
+  ASSERT_FALSE(foreign_result.ok());
+  EXPECT_EQ(foreign_result.error().details.at("reason"), "motion_payload_join_invalid");
+
+  auto weaker = candidate;
+  std::get<PreparedMotionExecutionDTO>(weaker.payload)
+      .plan_request.speed_profile.max_tcp_linear_speed_mps = 0.75;
+  auto weaker_result = MakePreparedOperationParticipant(std::move(weaker), inputs.binding,
+                                                        inputs.readiness, &*inputs.runtime_policy,
+                                                        {}, MotionInterruptNodeCategory::kGeneric);
+  ASSERT_FALSE(weaker_result.ok());
+  EXPECT_EQ(weaker_result.error().details.at("reason"), "motion_payload_join_invalid");
 }
 
 }  // namespace

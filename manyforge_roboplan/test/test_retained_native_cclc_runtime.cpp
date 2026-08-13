@@ -13,6 +13,8 @@
 #include <manyforge_core/sqlite_operation_journal.hpp>
 #include <manyforge_core/time/fake_clock.hpp>
 #include <manyforge_core/time/manual_scheduler.hpp>
+#include <manyforge_deployment/retained_bundle.hpp>
+#include <manyforge_deployment/retained_runtime_policy.hpp>
 #include <manyforge_deployment/verified_retained_bundle.hpp>
 #include <manyforge_roboplan/retained_native_cclc_runtime.hpp>
 #include <map>
@@ -694,9 +696,11 @@ class PublicationOwner final
 public:
   PublicationOwner(core::RuntimeParticipantBinding binding,
                    std::filesystem::path journal_path, core::CellId cell_id,
-                   core::FakeClock &clock)
+                   core::FakeClock &clock,
+                   core::RuntimePolicyDTO runtime_policy)
       : binding_(std::move(binding)), journal_path_(std::move(journal_path)),
-        cell_id_(std::move(cell_id)), clock_(clock) {}
+        cell_id_(std::move(cell_id)), clock_(clock),
+        runtime_policy_(std::move(runtime_policy)) {}
 
   [[nodiscard]] core::Result<std::vector<core::RuntimeParticipantBinding>>
   ReadCurrentPhysicalParticipants(
@@ -729,13 +733,20 @@ public:
              core::CoordinateVelocityDTO{core::LinearVelocityDTO{0.02}}});
       }
     }
+    auto runtime_policy = core::verify_runtime_participant_policy_selection(
+        runtime_policy_, participants.front().participant_binding);
+    if (!runtime_policy.ok()) {
+      return core::Result<core::RuntimeRouteConfigurationReadbackDTO>::Err(
+          runtime_policy.error());
+    }
     core::RuntimeParticipantExecutionRegistration registration{
         participants.front().participant_binding,
         participants.front().stop_readiness,
         std::move(hard_limits),
         core::MotionInterruptNodeCategory::kGeneric,
         &engine_,
-        &engine_};
+        &engine_,
+        std::move(runtime_policy.value())};
     if (kernel_ == nullptr) {
       journal_ = std::make_unique<core::SqliteOperationJournal>(journal_path_,
                                                                 cell_id_);
@@ -796,6 +807,7 @@ private:
   std::filesystem::path journal_path_;
   core::CellId cell_id_;
   core::FakeClock &clock_;
+  core::RuntimePolicyDTO runtime_policy_;
   mutable std::mutex mutex_;
   std::vector<deployment::VerifiedRouteReadinessParticipant> participants_;
   AdmissionEngine engine_;
@@ -933,11 +945,17 @@ TEST(RetainedNativeCCLCRuntime,
                           bundle->value().cell_graph.graph_revision);
   const deployment::FilesystemVerifiedRetainedProductArtifactSource artifacts(
       fixture_root / "retained-package");
+  const deployment::FilesystemCatalogArtifactStore policy_artifacts(
+      fixture_root / "retained-package");
+  const auto runtime_policy =
+      deployment::resolve_retained_runtime_policy(*bundle, policy_artifacts);
+  ASSERT_TRUE(runtime_policy.has_value());
   core::FakeClock clock;
   clock.set(1'000);
   PublicationOwner publication_owner(runtime.binding,
                                      state.path() / "operation-journal.sqlite3",
-                                     bundle->value().cell_graph.cell_id, clock);
+                                     bundle->value().cell_graph.cell_id, clock,
+                                     runtime_policy->value());
   core::ManualScheduler scheduler;
 
   auto composition = CreateRetainedNativeCCLCRuntime(

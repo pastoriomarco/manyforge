@@ -857,10 +857,26 @@ FakeOperationJournal default_journal;
                                   ? CoordinateVelocityDTO{AngularVelocityDTO{0.02}}
                                   : CoordinateVelocityDTO{LinearVelocityDTO{0.02}}});
   }
+  auto runtime_policy = verify_runtime_participant_policy_selection(
+      RuntimePolicyDTO{RuntimePolicyId("runtime.test"),
+                       RuntimePolicyRevision(test_digest('d')),
+                       std::nullopt,
+                       {},
+                       {RuntimeMotionSpeedLimitDTO{RuntimePolicyCellScopeDTO{}, 0.5}},
+                       {}},
+      participant);
+  if (!runtime_policy.ok()) {
+    throw std::logic_error(runtime_policy.error().message + ": " +
+                           runtime_policy.error().details.at("reason"));
+  }
   return RuntimeParticipantExecutionRegistration{
-      participant,       std::move(readiness.value()),
-      std::move(limits), MotionInterruptNodeCategory::kGeneric,
-      &engine,           dynamic_cast<IControlDomainExecutionPort*>(&engine)};
+      participant,
+      std::move(readiness.value()),
+      std::move(limits),
+      MotionInterruptNodeCategory::kGeneric,
+      &engine,
+      dynamic_cast<IControlDomainExecutionPort*>(&engine),
+      std::move(runtime_policy.value())};
 }
 
 [[nodiscard]] RuntimeParticipantExecutionRegistration unqualified_registration(
@@ -1355,6 +1371,28 @@ TEST(ResourceAddressedExecutionKernelTest,
   const auto result = kernel.execute(motion_operation());
   ASSERT_FALSE(result.ok());
   EXPECT_EQ(result.error().details.at("reason"), "runtime_route_publication_required");
+  EXPECT_EQ(engine.execute_calls, 0);
+  ASSERT_EQ(kernel.resource_snapshot().size(), 1U);
+  EXPECT_EQ(kernel.resource_snapshot().front().state, ResourceSlotState::kFree);
+}
+
+TEST(ResourceAddressedExecutionKernelTest,
+     RefusesMotionWhenStopReadinessExistsButRuntimePolicyIsUnqualified) {
+  FakeClock clock;
+  FakeParticipantEngine engine;
+  const auto binding =
+      make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular);
+  auto unqualified = registration(binding, engine);
+  unqualified.runtime_policy.reset();
+
+  ResourceAddressedExecutionKernel kernel(
+      {std::move(unqualified)}, clock, default_journal,
+      ResourceAddressedExecutionKernelConfig{RequestOwnerEpoch("kernel.epoch.1"),
+                                             CellId("cell.test"), 8U});
+
+  const auto result = kernel.execute(motion_operation());
+  ASSERT_FALSE(result.ok());
+  EXPECT_EQ(result.error().details.at("reason"), "runtime_participant_policy_missing");
   EXPECT_EQ(engine.execute_calls, 0);
   ASSERT_EQ(kernel.resource_snapshot().size(), 1U);
   EXPECT_EQ(kernel.resource_snapshot().front().state, ResourceSlotState::kFree);

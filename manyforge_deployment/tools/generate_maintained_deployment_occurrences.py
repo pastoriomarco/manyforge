@@ -353,6 +353,7 @@ SCHEMA_SOURCES: Final = {
     "model_asset": "manyforge_deployment/resources/closed_schema/catalog/manyforge.model_asset.v1.yaml",
     "provider_manifest": "manyforge_deployment/resources/closed_schema/catalog/manyforge.provider_manifest.v1.yaml",
     "runtime_profile": "manyforge_deployment/resources/closed_schema/catalog/manyforge.runtime_profile.v1.yaml",
+    "runtime_policy": "manyforge_deployment/resources/closed_schema/catalog/manyforge.runtime_policy.v1.yaml",
     "stop_evidence_policy": "manyforge_deployment/resources/closed_schema/catalog/manyforge.stop_evidence_policy.v2.yaml",
 }
 
@@ -1236,6 +1237,28 @@ def native_runtime_profile() -> dict[str, Any]:
     )
 
 
+def native_runtime_policy() -> dict[str, Any]:
+    value = {
+        "api_version": "manyforge.runtime_policy.v1",
+        "runtime_policy_id": "manyforge.native_motion",
+        "description": "Maintained native motion safety policy",
+        "interrupt_policy_ids": [],
+        "motion_speed_limits": [
+            {
+                "scope_kind": "cell",
+                "maximum_tcp_linear_speed_mps": 0.5,
+            }
+        ],
+        "open_loop_grasp_acknowledgements": [],
+    }
+    return revisioned_document(
+        value,
+        domain="catalog-record-revision/runtime_policy",
+        api_version="manyforge.runtime_policy.v1",
+        revision_field="runtime_policy_revision",
+    )
+
+
 def catalog_sources(
     root: Path,
     description: dict[str, Any],
@@ -1382,6 +1405,22 @@ def catalog_sources(
         schema_id="manyforge.runtime_profile.v1",
         schema_revision=schemas["runtime_profile"],
         value=runtime,
+        canonical_output=True,
+    )
+
+    runtime_policy = native_runtime_policy()
+    sources["runtime_policy"] = generated_catalog_document(
+        root=root,
+        relative_path=(
+            "manyforge_deployment/resources/maintained/catalog/"
+            f"runtime_policy/{runtime_policy['runtime_policy_id']}.json"
+        ),
+        kind="runtime_policy",
+        record_id=runtime_policy["runtime_policy_id"],
+        record_revision=runtime_policy["runtime_policy_revision"],
+        schema_id="manyforge.runtime_policy.v1",
+        schema_revision=schemas["runtime_policy"],
+        value=runtime_policy,
         canonical_output=True,
     )
 
@@ -1703,7 +1742,9 @@ def graph_and_applicability(
     return graph, desired, provider_bindings
 
 
-def stop_policy_projection(graph: dict[str, Any]) -> dict[str, Any]:
+def stop_policy_projection(
+    graph: dict[str, Any], runtime_policy_ref: dict[str, str]
+) -> dict[str, Any]:
     domains = {
         row["control_domain_id"]: row for row in graph["control_domains"]
     }
@@ -1740,7 +1781,7 @@ def stop_policy_projection(graph: dict[str, Any]) -> dict[str, Any]:
         )
     )
     return {
-        "retained_policy_records": [],
+        "retained_policy_records": [copy.deepcopy(runtime_policy_ref)],
         "stop_stage_parameters": stop_stage_parameters,
         "commissioned_stop_interfaces": [],
         "interrupt_sources": [],
@@ -1913,6 +1954,7 @@ def deployment_candidate(
         "provider:logical_scene",
         "provider:planning",
         "runtime",
+        "runtime_policy",
         "stop",
         "topology:arm",
         "topology:gripper",
@@ -1953,7 +1995,7 @@ def deployment_candidate(
         "graph": graph,
         "desired_control_configurations": desired,
         "capability_provider_bindings": provider_bindings,
-        "policies": stop_policy_projection(graph),
+        "policies": stop_policy_projection(graph, refs["runtime_policy"]),
         "compatibility": copy.deepcopy(deployment["compatibility"]),
     }
     if profile_id is not None:

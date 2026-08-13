@@ -1193,6 +1193,15 @@
         "schema_revision": "sha256:b242431032bf183f81718ae1b7b8501ee5f705e52d455732e0052215565bf4cc"
       },
       {
+        "content_addressed_store_key": "catalog/maintained/runtime_policy/manyforge.native_motion/a3b44a208246c054a711b3e4828418565ad53e988562ae24c2f2e1a0a960afcc",
+        "content_digest": "sha256:1c7600511fee0341ef2341907dd2bcd3e193f692997202bee7dd3ebc4f12bce6",
+        "record_id": "manyforge.native_motion",
+        "record_kind": "runtime_policy",
+        "record_revision": "sha256:a3b44a208246c054a711b3e4828418565ad53e988562ae24c2f2e1a0a960afcc",
+        "schema_id": "manyforge.runtime_policy.v1",
+        "schema_revision": "sha256:330a7505c585d69b231a1322bffbcd71775a1070c3a519a1ef7eb013ed5b5e9f"
+      },
+      {
         "content_addressed_store_key": "catalog/maintained/runtime_profile/manyforge.native_execution_runtime/084f58063ad1f86f694607a8df5ffeb4be05012dd15c6a723528d8224c1eac76",
         "content_digest": "sha256:fa458ad895aae1d79b4d2e16813c0f017969d2569023bde3ec3bdd5797270c2c",
         "record_id": "manyforge.native_execution_runtime",
@@ -1224,7 +1233,7 @@
     ]
   },
   "deployment_artifact_id": "ur5_roboplan_local_semantic_shape_pick",
-  "deployment_revision": "sha256:4eb7bea790a23ce4171f14de9c76d5abf400268920900b7aced64a9412e52588",
+  "deployment_revision": "sha256:2e82570d32991c6ac1cee265a17e1b5257daee733da3e49c11df936e14ab07bc",
   "description": "Local deployment for the semantic object-selection demo. A model selects one backend-authoritative scene object from a deterministic manifest plus an auxiliary viewer snapshot, and the backend computes the actual pick sequence deterministically from backend scene state.",
   "desired_control_configurations": [
     {
@@ -2137,7 +2146,17 @@
     },
     "interrupt_policies": [],
     "interrupt_sources": [],
-    "retained_policy_records": [],
+    "retained_policy_records": [
+      {
+        "content_addressed_store_key": "catalog/maintained/runtime_policy/manyforge.native_motion/a3b44a208246c054a711b3e4828418565ad53e988562ae24c2f2e1a0a960afcc",
+        "content_digest": "sha256:1c7600511fee0341ef2341907dd2bcd3e193f692997202bee7dd3ebc4f12bce6",
+        "record_id": "manyforge.native_motion",
+        "record_kind": "runtime_policy",
+        "record_revision": "sha256:a3b44a208246c054a711b3e4828418565ad53e988562ae24c2f2e1a0a960afcc",
+        "schema_id": "manyforge.runtime_policy.v1",
+        "schema_revision": "sha256:330a7505c585d69b231a1322bffbcd71775a1070c3a519a1ef7eb013ed5b5e9f"
+      }
+    ],
     "stop_stage_parameters": [
       {
         "control_binding_id": "ur5_robot.arm.execution-contact-geometric",

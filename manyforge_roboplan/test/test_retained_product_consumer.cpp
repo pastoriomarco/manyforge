@@ -19,6 +19,7 @@
 #include <manyforge_deployment/canonical_empty_admission.hpp>
 #include <manyforge_deployment/program_binding_compiler.hpp>
 #include <manyforge_deployment/retained_bundle.hpp>
+#include <manyforge_deployment/retained_runtime_policy.hpp>
 #include <manyforge_deployment/verified_retained_bundle.hpp>
 #include <manyforge_roboplan/process_contained_candidate_client.hpp>
 #include <manyforge_roboplan/retained_collision_world_projector.hpp>
@@ -2168,7 +2169,7 @@ TEST(
 }
 
 TEST(RetainedProductCrossConsumer,
-     PredictedLite6AggregateComposesAndExecutesAddressedGripperCommand) {
+     PredictedLite6AggregateComposesButUnqualifiedParticipantsStayClosed) {
   ScopedTemporaryRoot temporary;
   const std::filesystem::path package_root =
       temporary.path() / "retained-package";
@@ -2291,6 +2292,11 @@ TEST(RetainedProductCrossConsumer,
       {0.0, 0.0, 1.57, 0.0, 0.0, 0.0},
       core::StopDeadlineBudgetDTO{1'000'000'000, 100'000'000, {}}};
   ManagedKernelAdmissionGate admission_gate;
+  deployment::FilesystemCatalogArtifactStore runtime_policy_store(
+      package_root);
+  const auto runtime_policy = deployment::resolve_retained_runtime_policy(
+      *materialized.bundle, runtime_policy_store);
+  ASSERT_TRUE(runtime_policy.has_value());
   auto runtime = create_retained_native_runtime(
       RetainedNativeRuntimeInput{
           arm_binding,
@@ -2325,13 +2331,28 @@ TEST(RetainedProductCrossConsumer,
           },
           {},
           {},
-          &admission_gate},
+          &admission_gate,
+          runtime_policy->value()},
       std::move(runtime_config));
 
   ASSERT_NE(runtime, nullptr);
   ASSERT_NE(runtime->addressed_kernel, nullptr);
   ASSERT_NE(runtime->participant_engine, nullptr);
   ASSERT_TRUE(runtime->gripper_binding.has_value());
+  const auto motion_registration = std::find_if(
+      runtime->participant_registrations.begin(),
+      runtime->participant_registrations.end(), [](const auto &registration) {
+        return registration.binding.value().command_target_id ==
+               core::CommandTargetId(
+                   std::string(deployment::test::kLite6ArmTargetId));
+      });
+  ASSERT_NE(motion_registration, runtime->participant_registrations.end());
+  ASSERT_TRUE(motion_registration->runtime_policy.has_value());
+  EXPECT_EQ(motion_registration->runtime_policy->value().policy,
+            runtime_policy->value());
+  EXPECT_DOUBLE_EQ(motion_registration->runtime_policy->value()
+                       .effective_maximum_tcp_linear_speed_mps,
+                   0.5);
   ASSERT_NE(runtime->motion_state_channel, nullptr);
   ASSERT_NE(runtime->gripper_state_channel, nullptr);
   const auto initial_motion_state =
@@ -2440,153 +2461,21 @@ TEST(RetainedProductCrossConsumer,
       runtime->addressed_kernel->execute(make_motion_operation(
           arm_binding, owner_epoch,
           inventory->projection_binding.projection_revision.scene_revision));
-  ASSERT_TRUE(motion_accepted.ok()) << motion_accepted.error().message;
-  const auto operation_first = admission_gate.Observe(physical_scope);
-  EXPECT_EQ(operation_first.affected_queued_operation_count +
-                operation_first.affected_active_operation_count,
-            1U);
-  bool rejected_fence_commit_called = false;
-  EXPECT_THROW(admission_gate.AcquireFenceDurably(
-                   core::ConfigurationFenceId("fence.native.operation-first"),
-                   physical_scope,
-                   operation_first.operation_resource_generation,
-                   operation_first.active_control_configurations,
-                   [&] { rejected_fence_commit_called = true; }),
-               std::runtime_error);
-  EXPECT_FALSE(rejected_fence_commit_called);
-  core::OperationStateKind motion_terminal =
-      core::OperationStateKind::kExecuting;
-  const auto motion_deadline =
-      std::chrono::steady_clock::now() + std::chrono::seconds(10);
-  std::optional<core::OperationStateDTO> motion_state;
-  while (std::chrono::steady_clock::now() < motion_deadline) {
-    const auto reconciled =
-        runtime->addressed_kernel->reconcile_subordinate_state();
-    ASSERT_TRUE(reconciled.ok()) << reconciled.error().message;
-    const auto state = runtime->addressed_kernel->get_operation_state(
-        motion_accepted.value().operation_id);
-    ASSERT_TRUE(state.ok()) << state.error().message;
-    motion_state = state.value();
-    motion_terminal = motion_state->state;
-    if (motion_terminal == core::OperationStateKind::kCompleted ||
-        motion_terminal == core::OperationStateKind::kFailed ||
-        motion_terminal == core::OperationStateKind::kInterrupted ||
-        motion_terminal == core::OperationStateKind::kInterventionRequired) {
-      break;
-    }
-    std::this_thread::sleep_for(std::chrono::milliseconds(1));
-  }
-  ASSERT_EQ(motion_terminal, core::OperationStateKind::kCompleted)
-      << (!motion_state.has_value() || motion_state->participants.empty() ||
-                  !motion_state->participants.front().terminal_error.has_value()
-              ? "motion did not complete"
-              : motion_state->participants.front().terminal_error->message);
-  ASSERT_TRUE(motion_state.has_value());
-  const auto motion_metrics = runtime->participant_engine->get_metrics();
-  EXPECT_EQ(motion_metrics.plans_succeeded, 1U);
-  EXPECT_EQ(motion_metrics.validations_passed, 1U);
-  EXPECT_EQ(motion_metrics.executions_completed, 1U);
-  EXPECT_EQ(runtime->cache->size(), 1U);
-  EXPECT_EQ(projection->scene_snapshot_lease_retention_stats().retained_count,
-            0U);
-  const auto moved_state =
-      runtime->motion_state_channel->current_controlled_state();
-  ASSERT_TRUE(moved_state.ok()) << moved_state.error().message;
-  ASSERT_FALSE(moved_state.value().positions.empty());
-  const auto *first_joint = std::get_if<core::AngularPositionDTO>(
-      &moved_state.value().positions.front());
-  ASSERT_NE(first_joint, nullptr);
-  EXPECT_NEAR(first_joint->value_rad, 0.05, 1.0e-6);
+  ASSERT_FALSE(motion_accepted.ok());
+  EXPECT_EQ(motion_accepted.error().details.at("reason"),
+            "runtime_route_publication_required");
 
-  const core::ProjectionLeaseId frame_lease_id(
-      "native-runtime-direct-frame-resolver");
-  auto retained_frame_projection = projection->RetainProjection(
-      inventory->projection_binding.projection_revision, frame_lease_id);
-  ASSERT_TRUE(retained_frame_projection.ok())
-      << retained_frame_projection.error().message;
-  projection_clock = std::chrono::duration_cast<std::chrono::nanoseconds>(
-                         std::chrono::steady_clock::now().time_since_epoch())
-                         .count();
-  const auto resolved_moved_tcp =
-      projection->ResolveSceneFrame(core::SceneFrameResolutionQueryDTO{
-          core::TargetCarrierSceneFrameRefDTO{component_id, arm_target_id,
-                                              core::FrameRoleId("tcp")},
-          {inventory->projection_binding.projection_revision, frame_lease_id}});
-  ASSERT_TRUE(resolved_moved_tcp.ok()) << resolved_moved_tcp.error().message;
-  const auto &moved_pose = resolved_moved_tcp.value().frame_pose_in_cell;
-  const auto &zero_pose = tcp_pose.value();
-  const double moved_pose_delta =
-      std::abs(moved_pose.position_m.x_m - zero_pose.position_m.x_m) +
-      std::abs(moved_pose.position_m.y_m - zero_pose.position_m.y_m) +
-      std::abs(moved_pose.position_m.z_m - zero_pose.position_m.z_m) +
-      std::abs(moved_pose.orientation.x - zero_pose.orientation.x) +
-      std::abs(moved_pose.orientation.y - zero_pose.orientation.y) +
-      std::abs(moved_pose.orientation.z - zero_pose.orientation.z) +
-      std::abs(moved_pose.orientation.w - zero_pose.orientation.w);
-  EXPECT_GT(moved_pose_delta, 1.0e-8);
-  projection->ReleaseProjection(frame_lease_id);
-
-  const auto motion_acknowledged =
-      runtime->addressed_kernel->acknowledge_completed(
-          core::OperationControlRequestDTO{
-              core::PublicRequestContextDTO{
-                  core::RequestId("request.native.motion.ack.1"), owner_epoch,
-                  "retained_product_consumer", std::nullopt},
-              motion_accepted.value().operation_id,
-              motion_state->operation_revision,
-              "release completed motion resources"});
-  ASSERT_TRUE(motion_acknowledged.ok()) << motion_acknowledged.error().message;
+  const auto gripper_accepted = runtime->addressed_kernel->execute(
+      make_gripper_operation(gripper_binding, owner_epoch));
+  ASSERT_FALSE(gripper_accepted.ok());
+  EXPECT_EQ(gripper_accepted.error().details.at("reason"),
+            "runtime_route_publication_required");
 
   const auto idle = admission_gate.Observe(physical_scope);
   EXPECT_EQ(idle.affected_queued_operation_count, 0U);
   EXPECT_EQ(idle.affected_active_operation_count, 0U);
-  const core::ConfigurationFenceId held_fence("fence.native.fence-first");
-  bool durable_fence_commit_called = false;
-  admission_gate.AcquireFenceDurably(
-      held_fence, physical_scope, idle.operation_resource_generation,
-      idle.active_control_configurations,
-      [&] { durable_fence_commit_called = true; });
-  EXPECT_TRUE(durable_fence_commit_called);
-  const auto gripper_intent =
-      make_gripper_operation(gripper_binding, owner_epoch);
-  const auto fenced = runtime->addressed_kernel->execute(gripper_intent);
-  ASSERT_FALSE(fenced.ok());
-  EXPECT_EQ(fenced.error().details.at("reason"), "configuration_fence_held");
-  const auto fenced_observation = admission_gate.Observe(physical_scope);
-  EXPECT_EQ(fenced_observation.operation_resource_generation,
-            idle.operation_resource_generation);
-  EXPECT_EQ(fenced_observation.affected_queued_operation_count, 0U);
-  EXPECT_EQ(fenced_observation.affected_active_operation_count, 0U);
-  admission_gate.ReleaseFence(held_fence, physical_scope);
-
-  const auto accepted = runtime->addressed_kernel->execute(gripper_intent);
-  ASSERT_TRUE(accepted.ok()) << accepted.error().message;
-  core::OperationStateKind terminal_state =
-      core::OperationStateKind::kExecuting;
-  const auto deadline =
-      std::chrono::steady_clock::now() + std::chrono::seconds(2);
-  while (std::chrono::steady_clock::now() < deadline) {
-    const auto reconciled =
-        runtime->addressed_kernel->reconcile_subordinate_state();
-    ASSERT_TRUE(reconciled.ok()) << reconciled.error().message;
-    const auto state = runtime->addressed_kernel->get_operation_state(
-        accepted.value().operation_id);
-    ASSERT_TRUE(state.ok()) << state.error().message;
-    terminal_state = state.value().state;
-    if (terminal_state == core::OperationStateKind::kCompleted) {
-      break;
-    }
-    std::this_thread::sleep_for(std::chrono::milliseconds(1));
-  }
-  EXPECT_EQ(terminal_state, core::OperationStateKind::kCompleted);
-  const auto gripper_state =
-      runtime->gripper_state_channel->current_controlled_state();
-  ASSERT_TRUE(gripper_state.ok()) << gripper_state.error().message;
-  ASSERT_EQ(gripper_state.value().positions.size(), 1U);
-  const auto *gripper_position = std::get_if<core::LinearPositionDTO>(
-      &gripper_state.value().positions.front());
-  ASSERT_NE(gripper_position, nullptr);
-  EXPECT_NEAR(gripper_position->value_m, 0.004, 1e-12);
+  EXPECT_EQ(runtime->participant_engine->get_metrics().executions_completed,
+            0U);
 }
 
 TEST(RetainedProductCrossConsumer,

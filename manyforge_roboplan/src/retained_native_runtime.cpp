@@ -274,12 +274,22 @@ runtime_registration(
     core::RuntimeParticipantBinding binding,
     const std::optional<core::RuntimeParticipantStopReadiness> &readiness,
     core::IResolvedParticipantExecutionEngine *engine,
-    core::IControlDomainExecutionPort *stop_execution_port) {
+    core::IControlDomainExecutionPort *stop_execution_port,
+    const std::optional<core::RuntimeParticipantPolicySelection>
+        &runtime_policy) {
+  if (runtime_policy.has_value() &&
+      (runtime_policy->value().controllable_component_id !=
+           binding.value().controllable_component_id ||
+       runtime_policy->value().command_target_id !=
+           binding.value().command_target_id)) {
+    throw std::invalid_argument(
+        "runtime policy selection crosses its participant binding");
+  }
   auto defaults = retained_default_stop_limits(binding, readiness);
   return core::RuntimeParticipantExecutionRegistration{
       std::move(binding), readiness, std::move(defaults),
       core::MotionInterruptNodeCategory::kGeneric, engine,
-      stop_execution_port};
+      stop_execution_port, runtime_policy};
 }
 
 [[nodiscard]] bool same_supporting_provider_runtime(
@@ -411,7 +421,8 @@ make_kernel_participant_resolver(
       return core::Result<core::RuntimeParticipantExecutionRegistration>::Ok(
           runtime_registration(std::move(binding.value()),
                                physical->stop_readiness, physical->engine,
-                               physical->stop_execution_port));
+                               physical->stop_execution_port,
+                               physical->runtime_policy));
     } catch (const std::exception &exception) {
       return route_publication_error<
           core::RuntimeParticipantExecutionRegistration>(
@@ -502,6 +513,19 @@ create_retained_native_runtime_participants(
   }
   require_planner_binding(input.motion_binding, *input.planner,
                           projection_revision);
+
+  std::optional<core::RuntimeParticipantPolicySelection> motion_runtime_policy;
+  if (input.runtime_policy.has_value()) {
+    auto sealed = core::verify_runtime_participant_policy_selection(
+        *input.runtime_policy, input.motion_binding);
+    if (!sealed.ok()) {
+      throw std::invalid_argument(
+          "native runtime policy does not seal against the exact motion "
+          "binding: " +
+          sealed.error().message);
+    }
+    motion_runtime_policy = std::move(sealed.value());
+  }
 
   auto runtime = std::make_shared<RetainedNativeRuntime>(input.motion_binding,
                                                          input.gripper_binding);
@@ -656,31 +680,34 @@ create_retained_native_runtime_participants(
   std::vector<core::RuntimeParticipantExecutionRegistration> registrations;
   registrations.push_back(runtime_registration(
       runtime->motion_binding, input.motion_stop_readiness,
-      runtime->participant_engine.get(), runtime->execution.get()));
+      runtime->participant_engine.get(), runtime->execution.get(),
+      motion_runtime_policy));
   for (const auto &alias : runtime->motion_binding_aliases) {
     registrations.push_back(runtime_registration(
         alias, input.motion_stop_readiness,
-        runtime->participant_engine.get(), runtime->execution.get()));
+        runtime->participant_engine.get(), runtime->execution.get(),
+        motion_runtime_policy));
   }
   if (runtime->gripper_binding.has_value()) {
     registrations.push_back(runtime_registration(
         *runtime->gripper_binding, input.gripper_stop_readiness,
-        runtime->participant_engine.get(), nullptr));
+        runtime->participant_engine.get(), nullptr, std::nullopt));
   }
   for (const auto &alias : runtime->gripper_binding_aliases) {
     registrations.push_back(runtime_registration(
         alias, input.gripper_stop_readiness,
-        runtime->participant_engine.get(), nullptr));
+        runtime->participant_engine.get(), nullptr, std::nullopt));
   }
   std::vector<core::RuntimeParticipantExecutionRegistration>
       physical_registrations;
   physical_registrations.push_back(runtime_registration(
       runtime->motion_binding, input.motion_stop_readiness,
-      runtime->participant_engine.get(), runtime->execution.get()));
+      runtime->participant_engine.get(), runtime->execution.get(),
+      motion_runtime_policy));
   if (runtime->gripper_binding.has_value()) {
     physical_registrations.push_back(runtime_registration(
         *runtime->gripper_binding, input.gripper_stop_readiness,
-        runtime->participant_engine.get(), nullptr));
+        runtime->participant_engine.get(), nullptr, std::nullopt));
   }
   auto binding_resolver = std::move(input.participant_resolver);
   if (runtime->participant_resolver_factory) {
@@ -807,6 +834,7 @@ RetainedNativeRuntime::PublishAndReadBackRouteConfiguration(
     auto next_gripper = gripper_binding;
     std::optional<core::RuntimeParticipantStopReadiness> motion_readiness;
     std::optional<core::RuntimeParticipantStopReadiness> gripper_readiness;
+    std::optional<core::RuntimeParticipantPolicySelection> motion_runtime_policy;
     const auto current_registration = [&](
                                           const core::RuntimeParticipantBinding
                                               &binding)
@@ -821,6 +849,7 @@ RetainedNativeRuntime::PublishAndReadBackRouteConfiguration(
     if (const auto *current = current_registration(motion_binding);
         current != nullptr) {
       motion_readiness = current->stop_readiness;
+      motion_runtime_policy = current->runtime_policy;
     }
     if (gripper_binding.has_value()) {
       if (const auto *current = current_registration(*gripper_binding);
@@ -917,20 +946,23 @@ RetainedNativeRuntime::PublishAndReadBackRouteConfiguration(
         physical_registrations;
     physical_registrations.push_back(runtime_registration(
         next_motion, motion_readiness, participant_engine.get(),
-        execution.get()));
+        execution.get(), motion_runtime_policy));
     if (next_gripper.has_value()) {
       physical_registrations.push_back(runtime_registration(
-          *next_gripper, gripper_readiness, participant_engine.get(), nullptr));
+          *next_gripper, gripper_readiness, participant_engine.get(), nullptr,
+          std::nullopt));
     }
     std::vector<core::RuntimeParticipantExecutionRegistration> registrations =
         physical_registrations;
     for (const auto &alias : next_motion_aliases) {
       registrations.push_back(runtime_registration(
-          alias, motion_readiness, participant_engine.get(), execution.get()));
+          alias, motion_readiness, participant_engine.get(), execution.get(),
+          motion_runtime_policy));
     }
     for (const auto &alias : next_gripper_aliases) {
       registrations.push_back(runtime_registration(
-          alias, gripper_readiness, participant_engine.get(), nullptr));
+          alias, gripper_readiness, participant_engine.get(), nullptr,
+          std::nullopt));
     }
 
     RetainedRuntimeParticipantResolver binding_resolver;

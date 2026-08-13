@@ -503,6 +503,7 @@ if(BUILD_TESTING)
     target_link_libraries(test_retained_native_cclc_runtime PRIVATE
       manyforge_roboplan_native_cclc_runtime
       manyforge_component_manager
+      manyforge_deployment
       GTest::gtest_main)
 
     add_executable(test_native_stop_qualification_seams

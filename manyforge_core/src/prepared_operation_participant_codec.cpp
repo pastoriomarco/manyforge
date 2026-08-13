@@ -964,6 +964,7 @@ void validate_motion_payload(const PreparedMotionExecutionDTO& motion,
                              const PreparedOperationParticipantDTO& enclosing,
                              const RuntimeParticipantBindingDTO& binding,
                              const RuntimeParticipantStopReadinessDTO& readiness,
+                             const RuntimeParticipantPolicySelectionDTO& runtime_policy,
                              std::span<const HardStopResourceLimitDTO> defaults) {
   if (!std::isfinite(motion.execution_timeout_s) || motion.execution_timeout_s <= 0.0 ||
       motion.move_id.empty() || motion.plan_request.move_id != motion.move_id ||
@@ -1002,6 +1003,14 @@ void validate_motion_payload(const PreparedMotionExecutionDTO& motion,
       motion.plan_request.provider_runtime_epoch != enclosing.control_provider.runtime_epoch ||
       motion.plan_request.resources != enclosing.resources ||
       motion.start_state != motion.plan_request.start_state ||
+      motion.runtime_policy.runtime_policy_id != runtime_policy.policy.runtime_policy_id ||
+      motion.runtime_policy.runtime_policy_revision !=
+          runtime_policy.policy.runtime_policy_revision ||
+      !motion.plan_request.speed_profile.max_tcp_linear_speed_mps.has_value() ||
+      !std::isfinite(*motion.plan_request.speed_profile.max_tcp_linear_speed_mps) ||
+      *motion.plan_request.speed_profile.max_tcp_linear_speed_mps <= 0.0 ||
+      *motion.plan_request.speed_profile.max_tcp_linear_speed_mps >
+          runtime_policy.effective_maximum_tcp_linear_speed_mps ||
       motion.plan_request.retained_collision_world ||
       motion.plan_request.retained_collision_policy) {
     fail("motion_payload_join_invalid");
@@ -1054,6 +1063,9 @@ void validate_motion_payload(const PreparedMotionExecutionDTO& motion,
   std::set<MotionInterruptScopeId> scope_ids;
   for (const auto& scope : motion.interrupt_scopes) {
     if (!scope_ids.insert(scope.scope_id).second || !scope.required ||
+        !std::binary_search(runtime_policy.policy.interrupt_policy_ids.begin(),
+                            runtime_policy.policy.interrupt_policy_ids.end(),
+                            scope.interrupt_policy_id) ||
         scope.stop_plan.operation_id != enclosing.operation_id ||
         scope.stop_plan.participant_id != enclosing.participant_id ||
         scope.stop_plan.program_binding_id != enclosing.program_binding_id ||
@@ -1191,6 +1203,7 @@ void validate_motion_payload(const PreparedMotionExecutionDTO& motion,
 Result<PreparedOperationParticipantDTO> MakePreparedOperationParticipant(
     PreparedOperationParticipantDTO candidate, const RuntimeParticipantBinding& sealed_binding,
     const RuntimeParticipantStopReadiness& sealed_readiness,
+    const RuntimeParticipantPolicySelection* runtime_policy,
     std::span<const HardStopResourceLimitDTO> retained_default_limits,
     MotionInterruptNodeCategory node_category) {
   try {
@@ -1291,11 +1304,13 @@ Result<PreparedOperationParticipantDTO> MakePreparedOperationParticipant(
     if (!ordinary.ok()) fail("ordinary_stop_plan_make_failed");
     candidate.ordinary_stop_plan = std::move(ordinary.value());
 
-    if (auto* command = std::get_if<PreparedCapabilityCommandDTO>(&candidate.payload))
+    if (auto* command = std::get_if<PreparedCapabilityCommandDTO>(&candidate.payload)) {
       validate_command_payload(*command, binding);
-    else
+    } else {
+      if (runtime_policy == nullptr) fail("runtime_policy_selection_required");
       validate_motion_payload(std::get<PreparedMotionExecutionDTO>(candidate.payload), candidate,
-                              binding, readiness, retained_default_limits);
+                              binding, readiness, runtime_policy->value(), retained_default_limits);
+    }
     candidate.prepared_contract_digest =
         digest_for(candidate, readiness.resolved_stop_base_plan, binding_resource_span(binding),
                    retained_default_limits, node_category);
@@ -1313,9 +1328,10 @@ Result<PreparedOperationParticipantDTO> MakePreparedOperationParticipant(
 Result<void> VerifyPreparedOperationParticipant(
     const PreparedOperationParticipantDTO& value, const RuntimeParticipantBinding& binding,
     const RuntimeParticipantStopReadiness& readiness,
+    const RuntimeParticipantPolicySelection* runtime_policy,
     std::span<const HardStopResourceLimitDTO> retained_default_limits,
     MotionInterruptNodeCategory node_category) {
-  auto expected = MakePreparedOperationParticipant(value, binding, readiness,
+  auto expected = MakePreparedOperationParticipant(value, binding, readiness, runtime_policy,
                                                    retained_default_limits, node_category);
   if (!expected.ok()) return Result<void>::Err(expected.error());
   try {
@@ -1337,10 +1353,11 @@ Result<void> VerifyPreparedOperationParticipant(
 Result<std::string> EncodePreparedOperationParticipant(
     const PreparedOperationParticipantDTO& value, const RuntimeParticipantBinding& binding,
     const RuntimeParticipantStopReadiness& readiness,
+    const RuntimeParticipantPolicySelection* runtime_policy,
     std::span<const HardStopResourceLimitDTO> retained_default_limits,
     MotionInterruptNodeCategory node_category) {
-  const auto verified = VerifyPreparedOperationParticipant(value, binding, readiness,
-                                                           retained_default_limits, node_category);
+  const auto verified = VerifyPreparedOperationParticipant(
+      value, binding, readiness, runtime_policy, retained_default_limits, node_category);
   if (!verified.ok()) return Result<std::string>::Err(verified.error());
   try {
     return Result<std::string>::Ok(content_identity::canonical_json(participant_value(
@@ -1354,6 +1371,7 @@ Result<std::string> EncodePreparedOperationParticipant(
 Result<PreparedOperationParticipantDTO> DecodePreparedOperationParticipant(
     std::string_view canonical_bytes, const RuntimeParticipantBinding& binding,
     const RuntimeParticipantStopReadiness& readiness,
+    const RuntimeParticipantPolicySelection* runtime_policy,
     std::span<const HardStopResourceLimitDTO> retained_default_limits,
     MotionInterruptNodeCategory node_category) {
   try {
@@ -1362,11 +1380,13 @@ Result<PreparedOperationParticipantDTO> DecodePreparedOperationParticipant(
     auto candidate =
         parse_participant(content_identity::parse_canonical_json(canonical_bytes), binding.value(),
                           readiness.value(), retained_default_limits, node_category);
-    auto verified = MakePreparedOperationParticipant(std::move(candidate), binding, readiness,
-                                                     retained_default_limits, node_category);
+    auto verified =
+        MakePreparedOperationParticipant(std::move(candidate), binding, readiness, runtime_policy,
+                                         retained_default_limits, node_category);
     if (!verified.ok()) return verified;
-    const auto encoded = EncodePreparedOperationParticipant(verified.value(), binding, readiness,
-                                                            retained_default_limits, node_category);
+    const auto encoded =
+        EncodePreparedOperationParticipant(verified.value(), binding, readiness, runtime_policy,
+                                           retained_default_limits, node_category);
     if (!encoded.ok() || encoded.value() != canonical_bytes) fail("canonical_round_trip_mismatch");
     return verified;
   } catch (const std::exception& error) {

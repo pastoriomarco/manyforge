@@ -36,6 +36,7 @@
 #include <manyforge_deployment/program_binding.hpp>
 #include <manyforge_deployment/program_binding_compiler.hpp>
 #include <manyforge_deployment/program_contract.hpp>
+#include <manyforge_deployment/retained_runtime_policy.hpp>
 #include <manyforge_deployment/runtime_program_binding.hpp>
 #include <manyforge_deployment/verified_retained_bundle.hpp>
 #include <manyforge_roboplan/process_contained_candidate_client.hpp>
@@ -3553,6 +3554,12 @@ BuildProductComposition(CompositionBuildInput input) {
   const auto &products = input.bundle->value().compiled_products;
   const deployment::FilesystemCatalogArtifactStore catalog_store(
       input.package_root);
+  const auto qualified_runtime_policy =
+      deployment::resolve_retained_runtime_policy(*input.bundle, catalog_store);
+  std::optional<core::RuntimePolicyDTO> runtime_policy;
+  if (qualified_runtime_policy.has_value()) {
+    runtime_policy = qualified_runtime_policy->value();
+  }
   auto direct_control_inventory =
       deployment::compile_direct_control_program_binding_inventory(
           *input.bundle, input.model_map, catalog_store);
@@ -3888,7 +3895,8 @@ BuildProductComposition(CompositionBuildInput input) {
       },
       std::move(participant_resolver),
       participant_resolver_factory,
-      input.operation_admission_gate};
+      input.operation_admission_gate,
+      std::move(runtime_policy)};
   auto kernel_config = core::ExecutionKernelConfig{};
   kernel_config.collision_monitor_period_ns = collision_monitor_period_ns;
   auto execution_config = RoboPlanExecutionBackendConfig{};

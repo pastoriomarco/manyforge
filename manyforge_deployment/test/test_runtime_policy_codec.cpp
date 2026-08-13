@@ -29,7 +29,8 @@ static_assert(!std::is_default_constructible_v<QualifiedRuntimePolicy>);
 
 [[nodiscard]] CanonicalValue policy_without_revision(
     bool reverse_limits = false, bool duplicate_cell = false,
-    bool include_target = true) {
+    bool include_target = true,
+    std::string_view policy_id = "runtime.default") {
   CanonicalValue::Array limits;
   const CanonicalValue cell(CanonicalValue::Object{
       {"scope_kind", CanonicalValue("cell")},
@@ -52,7 +53,7 @@ static_assert(!std::is_default_constructible_v<QualifiedRuntimePolicy>);
   return CanonicalValue(CanonicalValue::Object{
       {"api_version",
        CanonicalValue(std::string(core::kRuntimePolicyApiVersion))},
-      {"runtime_policy_id", CanonicalValue("runtime.default")},
+      {"runtime_policy_id", CanonicalValue(std::string(policy_id))},
       {"description", CanonicalValue("Maintained native policy")},
       {"interrupt_policy_ids",
        CanonicalValue(CanonicalValue::Array{CanonicalValue("fault.stop"),
@@ -96,13 +97,29 @@ static_assert(!std::is_default_constructible_v<QualifiedRuntimePolicy>);
 
 [[nodiscard]] core::RuntimePolicyCatalogRecordRefDTO reference_for(
     std::string_view bytes,
+    std::string_view policy_id = "runtime.default",
     const core::ContentAddressedStoreKey& key =
         core::ContentAddressedStoreKey("sha256/runtime-policy")) {
-  return {core::RuntimePolicyId("runtime.default"),
+  return {core::RuntimePolicyId(std::string(policy_id)),
           core::RuntimePolicyRevision(revision(bytes)),
           core::SchemaId(std::string(core::kRuntimePolicyApiVersion)),
           core::SchemaRevision(std::string(kSchemaRevision)),
           core::ContentDigest(sha256_digest(bytes)), key};
+}
+
+[[nodiscard]] CanonicalValue reference_value(
+    const core::RuntimePolicyCatalogRecordRefDTO& reference) {
+  return CanonicalValue(CanonicalValue::Object{
+      {"record_kind", CanonicalValue("runtime_policy")},
+      {"record_id", CanonicalValue(reference.record_id.value())},
+      {"record_revision",
+       CanonicalValue(reference.record_revision.value())},
+      {"schema_id", CanonicalValue(reference.schema_id.value())},
+      {"schema_revision", CanonicalValue(reference.schema_revision.value())},
+      {"content_digest", CanonicalValue(reference.content_digest.value())},
+      {"content_addressed_store_key",
+       CanonicalValue(reference.content_addressed_store_key.value())},
+  });
 }
 
 TEST(RuntimePolicyCodec, ResolvesExactTypedPolicyAndMaterializedDefaults) {
@@ -194,17 +211,7 @@ TEST(RuntimePolicyCodec,
       graph, std::span<const SourceVerifiedModelAsset>{},
       std::span<const QualifiedComponentType>{});
 
-  const CanonicalValue policy_reference(CanonicalValue::Object{
-      {"record_kind", CanonicalValue("runtime_policy")},
-      {"record_id", CanonicalValue(reference.record_id.value())},
-      {"record_revision",
-       CanonicalValue(reference.record_revision.value())},
-      {"schema_id", CanonicalValue(reference.schema_id.value())},
-      {"schema_revision", CanonicalValue(reference.schema_revision.value())},
-      {"content_digest", CanonicalValue(reference.content_digest.value())},
-      {"content_addressed_store_key",
-       CanonicalValue(reference.content_addressed_store_key.value())},
-  });
+  const CanonicalValue policy_reference = reference_value(reference);
   const CanonicalValue applicability_root(CanonicalValue::Object{
       {"api_version", CanonicalValue("manyforge.deployment.v1")},
       {"desired_control_configurations",
@@ -249,6 +256,53 @@ TEST(RuntimePolicyCodec,
   EXPECT_THROW(
       (void)qualify_cell_applicability(composition, inputs, {}, {}, {}, {},
                                        {}, {}, {}, {}, {}, {}, overlay),
+      CellApplicabilityError);
+
+  const std::string second_bytes = document(policy_without_revision(
+      false, false, false, "runtime.secondary"));
+  const auto second_reference = reference_for(
+      second_bytes, "runtime.secondary",
+      core::ContentAddressedStoreKey("sha256/runtime-policy-secondary"));
+  const auto second_qualified = resolve_and_qualify_runtime_policy(
+      second_reference, second_reference.content_addressed_store_key,
+      second_bytes);
+  const CanonicalValue two_policy_root(CanonicalValue::Object{
+      {"api_version", CanonicalValue("manyforge.deployment.v1")},
+      {"desired_control_configurations",
+       CanonicalValue(CanonicalValue::Array{})},
+      {"capability_provider_bindings",
+       CanonicalValue(CanonicalValue::Array{})},
+      {"policies",
+       CanonicalValue(CanonicalValue::Object{
+           {"retained_policy_records",
+            CanonicalValue(CanonicalValue::Array{
+                policy_reference, reference_value(second_reference)})},
+           {"stop_stage_parameters", CanonicalValue(CanonicalValue::Array{})},
+           {"commissioned_stop_interfaces",
+            CanonicalValue(CanonicalValue::Array{})},
+           {"interrupt_sources", CanonicalValue(CanonicalValue::Array{})},
+           {"interrupt_policies", CanonicalValue(CanonicalValue::Array{})},
+           {"interrupt_config",
+            CanonicalValue(CanonicalValue::Object{
+                {"queue_depth", CanonicalValue(8.0)},
+                {"cancel_validation_timeout_ns", CanonicalValue(1000.0)},
+                {"motion_scope_arm_timeout_ns", CanonicalValue(1000.0)},
+                {"supervisory_poll_rate_hz", CanonicalValue(10.0)},
+            })},
+       })},
+  });
+  const auto two_policy_inputs =
+      compute_capability_provider_binding_revisions(
+          decode_deployment_applicability_inputs_candidate(
+              parse_strict_json_model_yaml(canonical_json(two_policy_root))));
+  const std::array two_policies{qualified, second_qualified};
+  EXPECT_THROW(
+      (void)qualify_cell_applicability(
+          composition, two_policy_inputs, {}, two_policies, {}, {}, {}, {},
+          {}, {}, {}, {}, select_site_overlay_for_deployment(
+                               two_policy_inputs.value().site_overlay_ref,
+                               two_policy_inputs.value().external_resources,
+                               nullptr)),
       CellApplicabilityError);
 }
 

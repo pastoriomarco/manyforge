@@ -51,6 +51,14 @@ template <typename T>
       throw std::invalid_argument(
           "runtime participant registration Stop readiness crosses its binding");
     }
+    if (registration.runtime_policy.has_value() &&
+        (registration.runtime_policy->value().controllable_component_id !=
+             registration.binding.value().controllable_component_id ||
+         registration.runtime_policy->value().command_target_id !=
+             registration.binding.value().command_target_id)) {
+      throw std::invalid_argument(
+          "runtime participant registration policy selection crosses its binding");
+    }
     bindings.push_back(registration.binding);
   }
   return bindings;
@@ -220,7 +228,11 @@ derive_route_readiness_projection(
       left.stop_readiness.has_value() == right.stop_readiness.has_value() &&
       (!left.stop_readiness.has_value() ||
        left.stop_readiness->value() == right.stop_readiness->value());
-  return left.binding.value() == right.binding.value() && readiness_equal &&
+  const bool runtime_policy_equal =
+      left.runtime_policy.has_value() == right.runtime_policy.has_value() &&
+      (!left.runtime_policy.has_value() ||
+       left.runtime_policy->value() == right.runtime_policy->value());
+  return left.binding.value() == right.binding.value() && readiness_equal && runtime_policy_equal &&
          left.retained_default_stop_limits == right.retained_default_stop_limits &&
          left.stop_node_category == right.stop_node_category && left.engine == right.engine &&
          left.stop_execution_port == right.stop_execution_port;
@@ -582,7 +594,8 @@ select_disable_active_configurations(
     const MotionParticipantIntentDTO& motion, const RuntimeParticipantBindingDTO& binding,
     const OperationId& operation_id, OperationRevision operation_revision,
     const OperationParticipantId& participant_id, const ControllerGoalId& controller_goal_id,
-    ControllerGoalGeneration controller_goal_generation) {
+    ControllerGoalGeneration controller_goal_generation,
+    const RuntimeParticipantPolicySelection& runtime_policy) {
   if (binding.model_groups.size() != 1U) {
     return reject<ExecuteRequestDTO>("I6 motion requires exactly one retained model group",
                                      "i6_motion_model_group_cardinality_invalid");
@@ -711,7 +724,17 @@ select_disable_active_configurations(
   ExecuteRequestDTO request(std::move(exact_binding));
   request.move_id = motion.move_id.value();
   request.tolerances = motion.tolerances;
-  request.speed_profile = motion.speed_profile;
+  auto effective_speed =
+      apply_runtime_participant_motion_speed_policy(runtime_policy, motion.speed_profile);
+  if (!effective_speed.ok()) {
+    return Result<ExecuteRequestDTO>::Err(effective_speed.error());
+  }
+  auto interrupt_selection = validate_runtime_participant_interrupt_policy_selection(
+      runtime_policy, motion.motion_interrupt_scopes);
+  if (!interrupt_selection.ok()) {
+    return Result<ExecuteRequestDTO>::Err(interrupt_selection.error());
+  }
+  request.speed_profile = std::move(effective_speed.value());
   request.timeouts = motion.timeouts;
   request.cache_mode = motion.cache_mode;
   request.planning_profile = motion.planning_profile;
@@ -1021,6 +1044,7 @@ struct ResourceAddressedExecutionKernel::ActiveOperation final {
   OperationAcceptedDTO accepted;
   RuntimeParticipantBinding binding;
   RuntimeParticipantStopReadiness stop_readiness;
+  std::optional<RuntimeParticipantPolicySelection> runtime_policy;
   std::vector<HardStopResourceLimitDTO> retained_default_stop_limits;
   MotionInterruptNodeCategory stop_node_category{MotionInterruptNodeCategory::kGeneric};
   std::shared_ptr<const PreparedParticipantStopPlanDTO> ordinary_stop_plan;
@@ -2365,10 +2389,12 @@ Result<void> ResourceAddressedExecutionKernel::release_retired_engine(
 
 struct ResourceAddressedExecutionKernel::PreviewSession final : IAddressedMotionPreviewSession {
   PreviewSession(ResourceAddressedExecutionKernel& owner, RuntimeParticipantBinding primary_binding,
+                 RuntimeParticipantPolicySelection primary_runtime_policy,
                  IResolvedParticipantExecutionEngine& primary_engine, IMotionPreview& motion,
                  std::unique_lock<std::mutex> submission_lock)
       : owner_(owner),
         primary_binding_(std::move(primary_binding)),
+        primary_runtime_policy_(std::move(primary_runtime_policy)),
         primary_engine_(primary_engine),
         motion_(motion),
         submission_lock_(std::move(submission_lock)) {}
@@ -2397,6 +2423,12 @@ struct ResourceAddressedExecutionKernel::PreviewSession final : IAddressedMotion
       return reject<RuntimeParticipantBindingDTO>(
           "linked preview motions cross their exact execution engine",
           "motion_preview_engine_changed", ErrorCode::kInvariantViolation);
+    }
+    if (!resolved.value().runtime_policy.has_value() ||
+        resolved.value().runtime_policy->value() != primary_runtime_policy_.value()) {
+      return reject<RuntimeParticipantBindingDTO>(
+          "linked preview motions cross their exact retained runtime policy",
+          "motion_preview_runtime_policy_changed", ErrorCode::kInvariantViolation);
     }
     return Result<RuntimeParticipantBindingDTO>::Ok(resolved.value().binding.value());
   }
@@ -2431,7 +2463,7 @@ struct ResourceAddressedExecutionKernel::PreviewSession final : IAddressedMotion
         intent, intent.participants.front(),
         std::get<MotionParticipantIntentDTO>(intent.participants.front().payload), resolved.value(),
         operation_id, OperationRevision(1U), participant_id, controller_goal_id,
-        ControllerGoalGeneration(1U));
+        ControllerGoalGeneration(1U), primary_runtime_policy_);
   }
 
   [[nodiscard]] Result<RobotStateDTO> current_state() const override {
@@ -2473,6 +2505,7 @@ struct ResourceAddressedExecutionKernel::PreviewSession final : IAddressedMotion
  private:
   ResourceAddressedExecutionKernel& owner_;
   RuntimeParticipantBinding primary_binding_;
+  RuntimeParticipantPolicySelection primary_runtime_policy_;
   IResolvedParticipantExecutionEngine& primary_engine_;
   IMotionPreview& motion_;
   // This is intentionally retained for the complete multi-leg candidate
@@ -2532,8 +2565,14 @@ ResourceAddressedExecutionKernel::begin_motion_preview_session(
         "resolved participant has no non-dispatching motion preview",
         "motion_preview_engine_unavailable", ErrorCode::kUnsupportedCapability);
   }
+  if (!resolved.value().runtime_policy.has_value()) {
+    return reject<std::unique_ptr<IAddressedMotionPreviewSession>>(
+        "resolved participant has no verified retained runtime policy",
+        "runtime_participant_policy_missing", ErrorCode::kMissingReference);
+  }
   std::unique_ptr<IAddressedMotionPreviewSession> session = std::make_unique<PreviewSession>(
-      *this, std::move(resolved.value().binding), *engine, *motion, std::move(submission_lock));
+      *this, std::move(resolved.value().binding), std::move(*resolved.value().runtime_policy),
+      *engine, *motion, std::move(submission_lock));
   return Result<std::unique_ptr<IAddressedMotionPreviewSession>>::Ok(std::move(session));
 }
 
@@ -2812,6 +2851,12 @@ Result<OperationAcceptedDTO> ResourceAddressedExecutionKernel::execute(
       std::holds_alternative<MotionParticipantIntentDTO>(intent.participants.front().payload)
           ? OperationParticipantPayloadKind::kMotion
           : OperationParticipantPayloadKind::kCapabilityCommand;
+  if (payload_kind == OperationParticipantPayloadKind::kMotion &&
+      !resolved.value().runtime_policy.has_value()) {
+    return reject<OperationAcceptedDTO>("resolved participant has no verified runtime policy",
+                                        "runtime_participant_policy_missing",
+                                        ErrorCode::kMissingReference);
+  }
   ResourceSlotOwnerDTO slot_owner{operation_id,
                                   operation_revision,
                                   participant_id,
@@ -2829,9 +2874,10 @@ Result<OperationAcceptedDTO> ResourceAddressedExecutionKernel::execute(
   std::optional<GripperCommandRequestDTO> command_request;
   if (payload_kind == OperationParticipantPayloadKind::kMotion) {
     const auto& motion = std::get<MotionParticipantIntentDTO>(intent.participants.front().payload);
-    auto built = build_motion_request(intent, intent.participants.front(), motion, binding,
-                                      operation_id, operation_revision, participant_id,
-                                      controller_goal_id, controller_goal_generation);
+    auto built =
+        build_motion_request(intent, intent.participants.front(), motion, binding, operation_id,
+                             operation_revision, participant_id, controller_goal_id,
+                             controller_goal_generation, *resolved.value().runtime_policy);
     if (!built.ok()) {
       return Result<OperationAcceptedDTO>::Err(built.error());
     }
@@ -2963,6 +3009,7 @@ Result<OperationAcceptedDTO> ResourceAddressedExecutionKernel::execute(
                                                       accepted,
                                                       resolved.value().binding,
                                                       *resolved.value().stop_readiness,
+                                                      resolved.value().runtime_policy,
                                                       resolved.value().retained_default_stop_limits,
                                                       resolved.value().stop_node_category,
                                                       retained_stop_plan,

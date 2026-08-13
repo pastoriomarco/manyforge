@@ -97,6 +97,7 @@ add_library(manyforge_core
   src/resource_slot_table.cpp
   src/runtime_collision_monitor.cpp
   src/runtime_participant_binding.cpp
+  src/runtime_participant_policy.cpp
   src/runtime_participant_stop_readiness.cpp
   src/runtime_participant_registry.cpp
   src/runtime_collision_query_session.cpp
@@ -564,6 +565,13 @@ if(BUILD_TESTING)
   target_link_libraries(test_runtime_participant_stop_readiness PRIVATE
     manyforge_core GTest::gtest_main)
   gtest_discover_tests(test_runtime_participant_stop_readiness
+    PROPERTIES TIMEOUT ${MANYFORGE_GTEST_TIMEOUT_SECONDS})
+
+  add_executable(test_runtime_participant_policy
+    test/test_runtime_participant_policy.cpp)
+  target_link_libraries(test_runtime_participant_policy PRIVATE
+    manyforge_core GTest::gtest_main)
+  gtest_discover_tests(test_runtime_participant_policy
     PROPERTIES TIMEOUT ${MANYFORGE_GTEST_TIMEOUT_SECONDS})
 
   add_executable(test_runtime_participant_registry

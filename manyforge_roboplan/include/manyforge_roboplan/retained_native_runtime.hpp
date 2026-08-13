@@ -107,6 +107,9 @@ struct RetainedNativeRuntimeInput final {
   /// Optional configuration-fence interlock owned by the surrounding managed
   /// execution process. It must outlive this runtime composition.
   core::IResourceOperationAdmissionGate *operation_admission_gate{};
+  /// Exact Deployment-qualified retained runtime policy. Absence is
+  /// observable and keeps motion admission closed.
+  std::optional<core::RuntimePolicyDTO> runtime_policy{};
 };
 
 /// Owning native composition root. Destruction order is deliberate: the public
