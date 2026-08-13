@@ -209,6 +209,54 @@ TEST(ResourceSlotTableTest, BatchReservationRejectsOverlapAndRevisionDisagreemen
   EXPECT_EQ(table.coherent_snapshot().operation_resource_generation, 0U);
 }
 
+TEST(ResourceSlotTableTest, BatchTransitionAndReleaseEachAdvanceTheGenerationOnce) {
+  ResourceSlotTable table({ResourceId("robot.a.joint"), ResourceId("robot.b.joint")});
+  const auto first = owner("coordinated.op", "participant.a");
+  const auto second = owner("coordinated.op", "participant.b");
+  const std::vector<ResourceSlotReservationOwnerDTO> owners{
+      reservation_owner(first, {ResourceId("robot.a.joint")}),
+      reservation_owner(second, {ResourceId("robot.b.joint")})};
+  ASSERT_TRUE(table.reserve_batch(owners).ok());
+
+  ASSERT_TRUE(table.transition_batch(owners, ResourceSlotState::kDispatched).ok());
+  auto snapshot = table.coherent_snapshot();
+  EXPECT_EQ(snapshot.operation_resource_generation, 2U);
+  EXPECT_TRUE(std::all_of(snapshot.slots.begin(), snapshot.slots.end(), [](const auto& slot) {
+    return slot.state == ResourceSlotState::kDispatched;
+  }));
+
+  ASSERT_TRUE(table.transition_batch(owners, ResourceSlotState::kTerminal).ok());
+  ASSERT_TRUE(table.release_batch(owners).ok());
+  snapshot = table.coherent_snapshot();
+  EXPECT_EQ(snapshot.operation_resource_generation, 4U);
+  EXPECT_TRUE(std::all_of(snapshot.slots.begin(), snapshot.slots.end(), [](const auto& slot) {
+    return slot.state == ResourceSlotState::kFree && !slot.owner.has_value();
+  }));
+}
+
+TEST(ResourceSlotTableTest, BatchTransitionAndReleasePrevalidateWithoutPartialMutation) {
+  ResourceSlotTable table({ResourceId("robot.a.joint"), ResourceId("robot.b.joint")});
+  const auto first = owner("coordinated.op", "participant.a");
+  const auto second = owner("coordinated.op", "participant.b");
+  const std::vector<ResourceSlotReservationOwnerDTO> owners{
+      reservation_owner(first, {ResourceId("robot.a.joint")}),
+      reservation_owner(second, {ResourceId("robot.b.joint")})};
+  ASSERT_TRUE(table.reserve_batch(owners).ok());
+  const auto before = table.coherent_snapshot();
+
+  auto stale = owners;
+  stale.back().owner.operation_revision = OperationRevision(2U);
+  const auto transition = table.transition_batch(stale, ResourceSlotState::kDispatched);
+  ASSERT_FALSE(transition.ok());
+  EXPECT_EQ(transition.error().details.at("reason"), "resource_owner_mismatch");
+  EXPECT_EQ(table.coherent_snapshot(), before);
+
+  const auto release = table.release_batch(stale);
+  ASSERT_FALSE(release.ok());
+  EXPECT_EQ(release.error().details.at("reason"), "resource_owner_mismatch");
+  EXPECT_EQ(table.coherent_snapshot(), before);
+}
+
 TEST(ResourceSlotTableTest, ProjectsExactGenerationConfigurationsAndAffectedOperationCounts) {
   ResourceSlotTable table(
       {ResourceId("joint.1"), ResourceId("joint.2"), ResourceId("gripper.1")},

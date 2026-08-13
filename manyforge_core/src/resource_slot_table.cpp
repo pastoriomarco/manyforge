@@ -268,6 +268,64 @@ Result<void> ResourceSlotTable::transition(const ResourceSlotOwnerDTO& owner,
   return Result<void>::Ok();
 }
 
+Result<void> ResourceSlotTable::transition_batch(
+    const std::vector<ResourceSlotReservationOwnerDTO>& owners, ResourceSlotState next_state) {
+  if (owners.empty() || owners.size() > slots_.size() ||
+      !std::is_sorted(owners.begin(), owners.end(),
+                      [](const auto& left, const auto& right) {
+                        return reservation_owner_key(left) < reservation_owner_key(right);
+                      }) ||
+      std::adjacent_find(owners.begin(), owners.end(), [](const auto& left, const auto& right) {
+        return reservation_owner_key(left) == reservation_owner_key(right);
+      }) != owners.end()) {
+    return reject("coordinated resource transition owners are not canonical",
+                  "resource_transition_batch_not_canonical", ErrorCode::kInvalidRequest);
+  }
+  std::lock_guard lock(*admission_mutex_);
+  std::vector<std::size_t> assignments;
+  assignments.reserve(slots_.size());
+  std::set<ResourceId> complete_resources;
+  std::vector<std::size_t> indices;
+  for (const auto& row : owners) {
+    if (!row.owner.valid() || row.resources.empty() ||
+        !std::is_sorted(row.resources.begin(), row.resources.end()) ||
+        std::adjacent_find(row.resources.begin(), row.resources.end()) != row.resources.end()) {
+      return reject("coordinated resource transition row is invalid",
+                    "resource_transition_batch_row_invalid", ErrorCode::kInvalidRequest);
+    }
+    auto validation = validate_resource_set_locked(row.resources, indices);
+    if (!validation.ok()) {
+      return validation;
+    }
+    for (std::size_t offset = 0U; offset < row.resources.size(); ++offset) {
+      if (!complete_resources.insert(row.resources[offset]).second) {
+        return reject("coordinated resource transition scopes overlap",
+                      "resource_transition_batch_scope_overlap", ErrorCode::kInvalidRequest);
+      }
+      const auto index = indices[offset];
+      const auto& slot = slots_[index];
+      if (!slot.owner.has_value() || *slot.owner != row.owner) {
+        return reject("resource transition owner does not match the slot",
+                      "resource_owner_mismatch");
+      }
+      if (!legal_transition(slot.state, next_state)) {
+        return reject("resource transition is illegal", "resource_transition_illegal",
+                      ErrorCode::kInvalidStateTransition);
+      }
+      assignments.push_back(index);
+    }
+  }
+  auto generation = require_generation_available_locked();
+  if (!generation.ok()) {
+    return generation;
+  }
+  for (const auto index : assignments) {
+    slots_[index].state = next_state;
+  }
+  advance_generation_locked();
+  return Result<void>::Ok();
+}
+
 Result<ResourceSlotOwnerDTO> ResourceSlotTable::revise_owner(
     const ResourceSlotOwnerDTO& owner, const std::vector<ResourceId>& resources,
     OperationRevision next_operation_revision) {
@@ -531,6 +589,65 @@ Result<void> ResourceSlotTable::release(const ResourceSlotOwnerDTO& owner,
     return generation;
   }
   for (const auto index : indices) {
+    slots_[index].state = ResourceSlotState::kFree;
+    slots_[index].owner.reset();
+  }
+  advance_generation_locked();
+  return Result<void>::Ok();
+}
+
+Result<void> ResourceSlotTable::release_batch(
+    const std::vector<ResourceSlotReservationOwnerDTO>& owners) {
+  if (owners.empty() || owners.size() > slots_.size() ||
+      !std::is_sorted(owners.begin(), owners.end(),
+                      [](const auto& left, const auto& right) {
+                        return reservation_owner_key(left) < reservation_owner_key(right);
+                      }) ||
+      std::adjacent_find(owners.begin(), owners.end(), [](const auto& left, const auto& right) {
+        return reservation_owner_key(left) == reservation_owner_key(right);
+      }) != owners.end()) {
+    return reject("coordinated resource release owners are not canonical",
+                  "resource_release_batch_not_canonical", ErrorCode::kInvalidRequest);
+  }
+  std::lock_guard lock(*admission_mutex_);
+  std::vector<std::size_t> assignments;
+  assignments.reserve(slots_.size());
+  std::set<ResourceId> complete_resources;
+  std::vector<std::size_t> indices;
+  for (const auto& row : owners) {
+    if (!row.owner.valid() || row.resources.empty() ||
+        !std::is_sorted(row.resources.begin(), row.resources.end()) ||
+        std::adjacent_find(row.resources.begin(), row.resources.end()) != row.resources.end()) {
+      return reject("coordinated resource release row is invalid",
+                    "resource_release_batch_row_invalid", ErrorCode::kInvalidRequest);
+    }
+    auto validation = validate_resource_set_locked(row.resources, indices);
+    if (!validation.ok()) {
+      return validation;
+    }
+    for (std::size_t offset = 0U; offset < row.resources.size(); ++offset) {
+      if (!complete_resources.insert(row.resources[offset]).second) {
+        return reject("coordinated resource release scopes overlap",
+                      "resource_release_batch_scope_overlap", ErrorCode::kInvalidRequest);
+      }
+      const auto index = indices[offset];
+      const auto& slot = slots_[index];
+      if (!slot.owner.has_value() || *slot.owner != row.owner) {
+        return reject("resource release owner does not match the slot", "resource_owner_mismatch");
+      }
+      if (slot.state != ResourceSlotState::kReserved &&
+          slot.state != ResourceSlotState::kTerminal) {
+        return reject("resource release requires reserved or terminal state",
+                      "resource_release_state_invalid", ErrorCode::kInvalidStateTransition);
+      }
+      assignments.push_back(index);
+    }
+  }
+  auto generation = require_generation_available_locked();
+  if (!generation.ok()) {
+    return generation;
+  }
+  for (const auto index : assignments) {
     slots_[index].state = ResourceSlotState::kFree;
     slots_[index].owner.reset();
   }

@@ -156,6 +156,12 @@ class ResourceSlotTable final {
                                         const std::vector<ResourceId>& resources,
                                         ResourceSlotState next_state);
 
+  /// Atomically transition every exact participant scope to one common legal
+  /// state after a coordinated barrier. Every row is prevalidated and success
+  /// advances the shared generation once.
+  [[nodiscard]] Result<void> transition_batch(
+      const std::vector<ResourceSlotReservationOwnerDTO>& owners, ResourceSlotState next_state);
+
   /// Advance the owning operation revision after an accepted operation-scoped
   /// control without changing reservation state or resolved runtime facts.
   [[nodiscard]] Result<ResourceSlotOwnerDTO> revise_owner(
@@ -179,6 +185,11 @@ class ResourceSlotTable final {
   /// Clear an exact pre-dispatch reservation or acknowledged terminal scope.
   [[nodiscard]] Result<void> release(const ResourceSlotOwnerDTO& owner,
                                      const std::vector<ResourceId>& resources);
+
+  /// Atomically release a complete pre-dispatch or acknowledged-terminal
+  /// coordinated scope. No partial release is observable.
+  [[nodiscard]] Result<void> release_batch(
+      const std::vector<ResourceSlotReservationOwnerDTO>& owners);
 
   /// Mark free resources conservatively unavailable after Kernel replacement.
   /// No prior operation owner is recreated and this performs no controller or
