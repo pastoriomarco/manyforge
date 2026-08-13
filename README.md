@@ -209,10 +209,9 @@ manyforge_program_runner/ Independent Program capture/tree/tick/status/Stop orch
 manyforge_collision/     C++ planner-neutral collision query implementation
 manyforge_roboplan/      Retained planning-model staging and bounded N3 native execution host
 manyforge_ros2_control_execution/  Retained C++ ROS execution/admission library; no current product lane
-manyforge_robot_lifecycle/  Retained ROS-independent lifecycle core; no current physical ingress
-manyforge_robot_lifecycle_msgs/  ROS IDL for same-host lifecycle admission transport
+manyforge_cclc_msgs/     ROS IDL for the bounded same-host CCLC request transport
 manyforge_xarm_adapter/  Experimental xArm model/binding/observation inputs; no live lane
-manyforge_xarm_control/  Experimental xArm lifecycle adapter; no live provider wiring
+manyforge_xarm_control/  Build-owned Lite6 catalog and restricted xarm_ros2 CCLC adapter
 manyforge_behavior/      Build-owned v2 node environment and Program orchestration/client mechanisms
 manyforge_composer/      Structural FastAPI/React shell and thin H0/N6/N7 authoring/operator clients
 manyforge_assistant_bridge/ Strict bounded direct/nemoclaw provider mediation; no runtime ownership

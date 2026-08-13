@@ -263,8 +263,8 @@ enum class ObstructionCase {
               *backend));
     }
 
-    auto profile = fixture::soft_profile(
-        binding, /*deceleration_s=*/0.30, /*max_stop_s=*/0.50);
+    auto profile =
+        fixture::soft_profile(binding, /*deceleration_s=*/0.30);
     auto nominal = std::async(std::launch::async, [&] {
       return backend->execute_controlled_stop(profile);
     });
@@ -340,9 +340,7 @@ struct SubstitutionQualification final {
     fail("substitution execution did not reach the deterministic late cursor");
   }
 
-  auto profile = fixture::soft_profile(
-      binding, /*deceleration_s=*/0.15,
-      static_cast<double>(kNominalStageBudgetNs) / 1e9);
+  auto profile = fixture::soft_profile(binding, /*deceleration_s=*/0.15);
   const auto started = std::chrono::steady_clock::now();
   auto result = backend->execute_controlled_stop(profile);
   const auto elapsed_ns =
@@ -357,9 +355,12 @@ struct SubstitutionQualification final {
   if (!result.fallback_reason.has_value() ||
       *result.fallback_reason != "soft_on_path_remaining_time_short" ||
       !result.diagnostics.contains("requested_stop_mode") ||
-      result.diagnostics.at("requested_stop_mode") != "soft_on_path" ||
+      core::interrupt_structured_scalar_text(
+          result.diagnostics.at("requested_stop_mode")) != "soft_on_path" ||
       !result.diagnostics.contains("fallback_reason") ||
-      result.diagnostics.at("fallback_reason") != *result.fallback_reason) {
+      core::interrupt_structured_scalar_text(
+          result.diagnostics.at("fallback_reason")) !=
+          *result.fallback_reason) {
     fail("real substitution did not retain requested/executed/reason truth");
   }
   const auto selection = probe.first_index(

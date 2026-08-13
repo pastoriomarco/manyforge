@@ -44,6 +44,8 @@ EMPTY_PROVIDER_CONTRACT_SCHEMA_ID: Final = (
 EMPTY_PROVIDER_CONTRACT_SCHEMA_REVISION: Final = (
     "sha256:fb466dd341076cbdb6fc97558ad28bc46032d25daaf4d4bb9d548bf642b83270"
 )
+LIFECYCLE_CATALOG_API_VERSION: Final = "manyforge.brand_lifecycle_plan_catalog.v1"
+LITE6_LIFECYCLE_PROVIDER_ID: Final = "lite6_arm_provider"
 
 CAPABILITIES: Final = {
     "assistant.bridge.request": (
@@ -54,6 +56,31 @@ CAPABILITIES: Final = {
     "assistant.model.invoke": (
         "sha256:f900f43ad7bbc61f49c09295a2a63e5fabe93eb57bc9c5f44c26e3c4eeeac158",
         "cell_global",
+        "capability_provider_binding",
+    ),
+    "component.lifecycle.disable": (
+        "sha256:578cd871bc7248d18f1ccafe2659acb9d9ad35570c17b30758312d65b37fb4d1",
+        "control_domain",
+        "capability_provider_binding",
+    ),
+    "component.lifecycle.enable": (
+        "sha256:c0d8704375f520e69f04dccbdbe1f8856bab2c0c185ea59cddc4f34f50cbc1f7",
+        "control_domain",
+        "capability_provider_binding",
+    ),
+    "component.lifecycle.observe": (
+        "sha256:deb6815e681e8879c172e1a7dcd03a55154bc599efaa35167c9d23f54d6b9104",
+        "control_domain",
+        "capability_provider_binding",
+    ),
+    "component.lifecycle.prepare": (
+        "sha256:c61d01109243632bd3a4184061863cee480a35f253aabac7719fea634e2defd3",
+        "control_domain",
+        "capability_provider_binding",
+    ),
+    "component.lifecycle.recover": (
+        "sha256:7303e9db6f3c6d94b00ed8c448bb98abe156775f562e122cb8046799a7d41e9a",
+        "control_domain",
         "capability_provider_binding",
     ),
     "execution.feedback.phase_events": (
@@ -771,6 +798,320 @@ def provider_manifest(
     )
 
 
+def lifecycle_boolean(value: bool) -> dict[str, Any]:
+    return {"kind": "boolean", "boolean_value": value}
+
+
+def lifecycle_token(value: str) -> dict[str, Any]:
+    return {"kind": "token", "token_value": value}
+
+
+def lifecycle_predicate(
+    states: list[str], facts: dict[str, dict[str, Any]]
+) -> dict[str, Any]:
+    state_order = {
+        state: index
+        for index, state in enumerate(
+            (
+                "undeclared",
+                "declared",
+                "prepared",
+                "active",
+                "degraded",
+                "faulted",
+                "disabling",
+                "disabled",
+            )
+        )
+    }
+    return {
+        "allowed_states": sorted(states, key=state_order.__getitem__),
+        "fact_predicates": [
+            {"lifecycle_fact_id": fact_id, "expected_value": facts[fact_id]}
+            for fact_id in sorted(facts)
+        ],
+    }
+
+
+def lifecycle_transition(
+    primitive_id: str, eligibility: dict[str, Any], postcondition: dict[str, Any]
+) -> dict[str, Any]:
+    return {
+        "lifecycle_primitive_id": primitive_id,
+        "eligibility_predicate": eligibility,
+        "postcondition_predicate": postcondition,
+    }
+
+
+def lite6_lifecycle_plans() -> list[dict[str, Any]]:
+    boolean = lifecycle_boolean
+    token = lifecycle_token
+    prepared = lifecycle_predicate(
+        ["prepared"],
+        {
+            "xarm.motion_enabled": boolean(True),
+            "xarm.position_valid": boolean(True),
+            "xarm.joint_servo_mode_selected": boolean(True),
+            "xarm.vendor_control_ready": boolean(False),
+            "xarm.vendor_stopped": boolean(False),
+            "xarm.fault_present": boolean(False),
+            "xarm.recovery_required": boolean(False),
+            "xarm.warning_present": boolean(False),
+            "xarm.vendor_feedback_class": token("mode_changed"),
+        },
+    )
+    enabled_stopped = lifecycle_predicate(
+        ["degraded"],
+        {
+            "xarm.motion_enabled": boolean(True),
+            "xarm.position_valid": boolean(True),
+            "xarm.vendor_stopped": boolean(True),
+            "xarm.fault_present": boolean(False),
+            "xarm.recovery_required": boolean(False),
+            "xarm.warning_present": boolean(False),
+            "xarm.vendor_feedback_class": token("stopped"),
+        },
+    )
+    active = lifecycle_predicate(
+        ["active"],
+        {
+            "xarm.motion_enabled": boolean(True),
+            "xarm.position_valid": boolean(True),
+            "xarm.joint_servo_mode_selected": boolean(True),
+            "xarm.vendor_control_ready": boolean(True),
+            "xarm.vendor_stopped": boolean(False),
+            "xarm.fault_present": boolean(False),
+            "xarm.recovery_required": boolean(False),
+            "xarm.warning_present": boolean(False),
+            "xarm.vendor_feedback_class": token("ready"),
+        },
+    )
+    disabled = lifecycle_predicate(
+        ["disabled"],
+        {
+            "xarm.motion_enabled": boolean(False),
+            "xarm.vendor_control_ready": boolean(False),
+            "xarm.vendor_stopped": boolean(True),
+            "xarm.vendor_feedback_class": token("stopped"),
+        },
+    )
+    stopped_enabled = lifecycle_predicate(
+        ["degraded", "faulted"],
+        {
+            "xarm.motion_enabled": boolean(True),
+            "xarm.vendor_control_ready": boolean(False),
+            "xarm.vendor_stopped": boolean(True),
+            "xarm.vendor_feedback_class": token("stopped"),
+        },
+    )
+    recovered = lifecycle_predicate(
+        ["disabled"],
+        {
+            "xarm.motion_enabled": boolean(False),
+            "xarm.vendor_stopped": boolean(True),
+            "xarm.fault_present": boolean(False),
+            "xarm.recovery_required": boolean(False),
+            "xarm.warning_present": boolean(False),
+            "xarm.vendor_feedback_class": token("stopped"),
+        },
+    )
+    timeout_ns = 30_000_000_000
+    return [
+        {
+            "intent": "prepare",
+            "requested_state": "prepared",
+            "requested_postcondition": prepared,
+            "timeout_duration_ns": timeout_ns,
+            "transitions": [
+                lifecycle_transition(
+                    "xarm.enable_motion",
+                    lifecycle_predicate(
+                        ["declared", "disabled"],
+                        {
+                            "xarm.motion_enabled": boolean(False),
+                            "xarm.vendor_stopped": boolean(True),
+                            "xarm.fault_present": boolean(False),
+                            "xarm.recovery_required": boolean(False),
+                            "xarm.warning_present": boolean(False),
+                            "xarm.vendor_feedback_class": token("stopped"),
+                        },
+                    ),
+                    enabled_stopped,
+                ),
+                lifecycle_transition(
+                    "xarm.select_joint_servo_mode", enabled_stopped, prepared
+                ),
+            ],
+        },
+        {
+            "intent": "enable",
+            "requested_state": "active",
+            "requested_postcondition": active,
+            "timeout_duration_ns": timeout_ns,
+            "transitions": [
+                lifecycle_transition(
+                    "xarm.set_ready_state",
+                    lifecycle_predicate(
+                        prepared["allowed_states"],
+                        {
+                            **{
+                                row["lifecycle_fact_id"]: row["expected_value"]
+                                for row in prepared["fact_predicates"]
+                            },
+                            "xarm.ready_state_request_eligible": boolean(True),
+                        },
+                    ),
+                    active,
+                )
+            ],
+        },
+        {
+            "intent": "disable",
+            "requested_state": "disabled",
+            "requested_postcondition": disabled,
+            "timeout_duration_ns": timeout_ns,
+            "transitions": [
+                lifecycle_transition(
+                    "xarm.set_stopped_state",
+                    lifecycle_predicate(
+                        ["prepared", "active", "degraded", "faulted"],
+                        {
+                            "xarm.motion_enabled": boolean(True),
+                            "xarm.vendor_stopped": boolean(False),
+                        },
+                    ),
+                    stopped_enabled,
+                ),
+                lifecycle_transition(
+                    "xarm.disable_motion", stopped_enabled, disabled
+                ),
+            ],
+        },
+        {
+            "intent": "recover",
+            "requested_state": "disabled",
+            "recover_target_eligibility": lifecycle_predicate(
+                ["disabled"],
+                {
+                    "xarm.motion_enabled": boolean(False),
+                    "xarm.vendor_stopped": boolean(True),
+                    "xarm.vendor_feedback_class": token("stopped"),
+                },
+            ),
+            "requested_postcondition": recovered,
+            "timeout_duration_ns": timeout_ns,
+            "transitions": [
+                lifecycle_transition(
+                    "xarm.clear_error",
+                    lifecycle_predicate(
+                        ["disabled"],
+                        {
+                            "xarm.motion_enabled": boolean(False),
+                            "xarm.vendor_stopped": boolean(True),
+                            "xarm.fault_present": boolean(True),
+                            "xarm.vendor_feedback_class": token("stopped"),
+                        },
+                    ),
+                    lifecycle_predicate(
+                        ["disabled"],
+                        {
+                            "xarm.motion_enabled": boolean(False),
+                            "xarm.vendor_stopped": boolean(True),
+                            "xarm.fault_present": boolean(False),
+                            "xarm.recovery_required": boolean(False),
+                            "xarm.vendor_feedback_class": token("stopped"),
+                        },
+                    ),
+                ),
+                lifecycle_transition(
+                    "xarm.clear_warning",
+                    lifecycle_predicate(
+                        ["disabled"],
+                        {
+                            "xarm.motion_enabled": boolean(False),
+                            "xarm.vendor_stopped": boolean(True),
+                            "xarm.fault_present": boolean(False),
+                            "xarm.recovery_required": boolean(False),
+                            "xarm.warning_present": boolean(True),
+                            "xarm.vendor_feedback_class": token("stopped"),
+                        },
+                    ),
+                    recovered,
+                ),
+            ],
+        },
+    ]
+
+
+def lite6_lifecycle_product() -> tuple[dict[str, Any], dict[str, Any]]:
+    plans = lite6_lifecycle_plans()
+    semantic_projection = {
+        "api_version": LIFECYCLE_CATALOG_API_VERSION,
+        "provider_manifest_id": LITE6_LIFECYCLE_PROVIDER_ID,
+        "plans": plans,
+    }
+    semantic_digest = sha256_digest(
+        CONTENT_IDENTITY_PREFIX
+        + b"brand-lifecycle-plan-catalog-semantic\0"
+        + LIFECYCLE_CATALOG_API_VERSION.encode("ascii")
+        + b"\0"
+        + canonical_bytes(semantic_projection)
+    )
+    lifecycle_capabilities = tuple(
+        f"component.lifecycle.{intent}"
+        for intent in ("disable", "enable", "observe", "prepare", "recover")
+    )
+    manifest = revisioned_document(
+        {
+            "api_version": "manyforge.provider_manifest.v1",
+            "provider_manifest_id": LITE6_LIFECYCLE_PROVIDER_ID,
+            "offered_capabilities": [
+                {
+                    **capability_selector(capability_id),
+                    "required_endpoint_role_ids": [],
+                }
+                for capability_id in lifecycle_capabilities
+            ],
+            "provider_contracts": [],
+            "lifecycle_plan_catalog": {
+                "catalog_api_version": LIFECYCLE_CATALOG_API_VERSION,
+                "semantic_digest": semantic_digest,
+            },
+        },
+        domain="catalog-record-revision/provider_manifest",
+        api_version="manyforge.provider_manifest.v1",
+        revision_field="provider_manifest_revision",
+    )
+    catalog_content = {
+        **semantic_projection,
+        "provider_manifest_revision": manifest["provider_manifest_revision"],
+    }
+    catalog_digest = sha256_digest(
+        CONTENT_IDENTITY_PREFIX
+        + b"brand-lifecycle-plan-catalog\0"
+        + LIFECYCLE_CATALOG_API_VERSION.encode("ascii")
+        + b"\0"
+        + canonical_bytes(catalog_content)
+    )
+    return manifest, {**catalog_content, "catalog_digest": catalog_digest}
+
+
+def lite6_lifecycle_identity_header(
+    manifest: dict[str, Any], catalog: dict[str, Any]
+) -> bytes:
+    semantic_digest = manifest["lifecycle_plan_catalog"]["semantic_digest"]
+    return (
+        "// Generated by generate_maintained_deployment_occurrences.py; do not edit.\n"
+        "#pragma once\n\n"
+        "#include <string_view>\n\n"
+        "namespace manyforge::xarm_control::generated {\n"
+        f'inline constexpr std::string_view kLite6LifecycleCatalogSemanticDigest = "{semantic_digest}";\n'
+        f'inline constexpr std::string_view kLite6LifecycleProviderManifestRevision = "{manifest["provider_manifest_revision"]}";\n'
+        f'inline constexpr std::string_view kLite6LifecycleCatalogDigest = "{catalog["catalog_digest"]}";\n'
+        "} // namespace manyforge::xarm_control::generated\n"
+    ).encode("utf-8")
+
+
 def stop_policy() -> dict[str, Any]:
     value = {
         "api_version": "manyforge.stop_evidence_policy.v2",
@@ -901,6 +1242,7 @@ def catalog_sources(
 ) -> tuple[
     dict[str, tuple[Path, bytes, dict[str, str]]],
     dict[str, dict[str, str]],
+    list[tuple[Path, bytes, str]],
 ]:
     schemas = schema_revisions(root)
     sources: dict[str, tuple[Path, bytes, dict[str, str]]] = {}
@@ -966,6 +1308,7 @@ def catalog_sources(
             if CAPABILITIES[capability_id][2] == "capability_provider_binding"
         )
     )
+    lifecycle_manifest, lifecycle_catalog = lite6_lifecycle_product()
     manifests = {
         "control": provider_manifest(
             "manyforge.provider.native_control",
@@ -993,6 +1336,7 @@ def catalog_sources(
             ("assistant.model.invoke",),
             ["model_inference"],
         ),
+        "lite6_lifecycle": lifecycle_manifest,
     }
     for key, document in manifests.items():
         sources[f"provider:{key}"] = generated_catalog_document(
@@ -1007,6 +1351,7 @@ def catalog_sources(
             schema_id="manyforge.provider_manifest.v1",
             schema_revision=schemas["provider_manifest"],
             value=document,
+            canonical_output=(key == "lite6_lifecycle"),
         )
 
     policy = stop_policy()
@@ -1093,7 +1438,21 @@ def catalog_sources(
                 payload=payload,
             ),
         )
-    return sources, component_references
+    lifecycle_outputs = [
+        (
+            root
+            / "manyforge_xarm_control/resources/lifecycle/lite6_arm_provider.lifecycle_plan_catalog.json",
+            canonical_bytes(lifecycle_catalog),
+            "build-owned Lite6 lifecycle plan catalog",
+        ),
+        (
+            root
+            / "manyforge_xarm_control/include/manyforge_xarm_control/generated/lite6_brand_lifecycle_product_identity.hpp",
+            lite6_lifecycle_identity_header(lifecycle_manifest, lifecycle_catalog),
+            "build-owned Lite6 lifecycle product identity",
+        ),
+    ]
+    return sources, component_references, lifecycle_outputs
 
 
 def source_joint_names(family: dict[str, Any], role: str) -> list[str]:
@@ -1390,7 +1749,7 @@ def stop_policy_projection(graph: dict[str, Any]) -> dict[str, Any]:
             "queue_depth": 8,
             "cancel_validation_timeout_ns": 1_000,
             "motion_scope_arm_timeout_ns": 1_000,
-            "supervisory_poll_rate_hz": 100,
+            "supervisory_poll_rate_hz": 10,
         },
     }
 
@@ -1776,10 +2135,13 @@ def generate(args: argparse.Namespace) -> None:
     if args.revision_tool.is_symlink() or not args.revision_tool.is_file():
         raise GenerationError("revision tool must select one plain executable")
 
-    source_rows, component_refs = catalog_sources(root, description)
+    source_rows, component_refs, lifecycle_outputs = catalog_sources(
+        root, description
+    )
     del component_refs
     refs = {key: value[2] for key, value in source_rows.items()}
     outputs: list[tuple[Path, bytes, str]] = []
+    outputs.extend(lifecycle_outputs)
     for key, (path, payload, unused_ref) in source_rows.items():
         del unused_ref
         if key.startswith("model:") or key == "command_schema":

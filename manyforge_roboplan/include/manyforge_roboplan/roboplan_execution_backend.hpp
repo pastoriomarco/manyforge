@@ -24,7 +24,7 @@ namespace detail {
 class INativeStopQualificationProbe;
 class NativeStopQualificationAccess;
 enum class NativeStopQualificationEvent : std::uint8_t;
-}  // namespace detail
+} // namespace detail
 
 struct RoboPlanExecutionBackendConfig {
   double reset_completion_timeout_s = 5.0;
@@ -115,6 +115,10 @@ public:
   // remains a ros2_control/JTC-only mode in the current scope.
   core::MotionInterruptStopCapabilityDTO
   get_motion_interrupt_stop_capability() const override;
+  [[nodiscard]] core::ParticipantStopStageResultDTO
+  TranslateStopStage(const core::ResolvedParticipantStopStageDTO &stage,
+                     const core::RemainingStopBudgetDTO &budget,
+                     std::stop_token cancellation) override;
   core::ControlledStopResultDTO execute_controlled_stop(
       const core::MotionInterruptStopProfileDTO &profile) override;
   core::ControlledStopResultDTO
@@ -165,12 +169,10 @@ private:
                         std::uint64_t execution_generation);
   core::ControlledStopResultDTO execute_controlled_stop_impl(
       const core::MotionInterruptStopProfileDTO &profile,
-      std::stop_token stop_token,
-      std::uint64_t hard_stop_request_generation);
+      std::stop_token stop_token, std::uint64_t hard_stop_request_generation);
   void request_active_controlled_stop();
-  void observe_stop_qualification(
-      detail::NativeStopQualificationEvent event,
-      std::string_view detail = {});
+  void observe_stop_qualification(detail::NativeStopQualificationEvent event,
+                                  std::string_view detail = {});
   void begin_controlled_stop_runtime_scale_freeze();
   bool end_controlled_stop_runtime_scale_freeze();
   void record_scene_projection_success(std::int64_t source_timestamp_ns);

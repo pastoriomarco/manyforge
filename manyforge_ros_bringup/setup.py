@@ -15,6 +15,7 @@ setup(
         (f"share/{package_name}/urdf", glob("urdf/*")),
     ],
     install_requires=["setuptools"],
+    tests_require=["pytest"],
     zip_safe=True,
     maintainer="Marco Pastorio",
     maintainer_email="pastoriomarco@gmail.com",
@@ -26,6 +27,7 @@ setup(
             "isaac_topic_command_gate = manyforge_ros_bringup.isaac_topic_command_gate:main",
             "isaac_demo_supervisor = manyforge_ros_bringup.isaac_demo_supervisor:main",
             "pose_source_snapshot_publisher = manyforge_ros_bringup.pose_source_snapshot_publisher:main",
+            "cclc_open_request = manyforge_ros_bringup.cclc_open_request_node:main",
         ],
     },
 )

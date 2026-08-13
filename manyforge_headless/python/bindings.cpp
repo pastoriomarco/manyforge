@@ -416,7 +416,8 @@ public:
   std::string IngestOperationEvent(
       std::string source_owner_epoch, const std::uint64_t source_sequence,
       std::string record_kind, std::optional<std::string> request_id,
-      std::string operation_id, const std::uint64_t operation_revision,
+      std::optional<std::string> operation_id,
+      const std::optional<std::uint64_t> operation_revision,
       const std::int64_t occurred_at_ns, std::string occurred_at_wall,
       const bool effect_pending, std::string payload_json,
       std::string payload_digest) {

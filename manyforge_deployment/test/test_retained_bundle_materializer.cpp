@@ -4,11 +4,13 @@
 #include <manyforge_deployment/cell_applicability.hpp>
 #include <manyforge_deployment/cell_compiler.hpp>
 #include <manyforge_deployment/cell_composition.hpp>
+#include <manyforge_deployment/contact_policy_codec.hpp>
 #include <manyforge_deployment/content_identity.hpp>
 #include <manyforge_deployment/deployment_artifact_codec.hpp>
 #include <manyforge_deployment/model_source.hpp>
 #include <manyforge_deployment/native_execution_runtime_contract.hpp>
 #include <manyforge_deployment/retention_qualified_deployment.hpp>
+#include <manyforge_deployment/runtime_policy_codec.hpp>
 #include <manyforge_deployment/site_overlay_resolution.hpp>
 
 #include <algorithm>
@@ -25,6 +27,7 @@
 #include "composed_model_symbol_role_map_internal.hpp"
 #include "content_identity_internal.hpp"
 #include "control_domain_control_internal.hpp"
+#include "deployment_catalog_codec_internal.hpp"
 #include "lite6_controllable_retention_fixture.hpp"
 #include "lite6_structural_retention_fixture.hpp"
 #include "planning_resource_map_internal.hpp"
@@ -140,10 +143,9 @@ qualify_empty(std::string_view cell_id) {
   const auto selected_overlay = select_site_overlay_for_deployment(
       deployment.applicability_inputs().value().site_overlay_ref,
       deployment.applicability_inputs().value().external_resources, nullptr);
-  const auto applicability =
-      qualify_cell_applicability(composition, deployment.applicability_inputs(),
-                                 {}, {}, {}, {}, {}, {}, {}, {}, {},
-                                 selected_overlay);
+  const auto applicability = qualify_cell_applicability(
+      composition, deployment.applicability_inputs(), {}, {}, {}, {}, {}, {},
+      {}, {}, {}, {}, selected_overlay);
   return qualify_deployment_for_retention(deployment,
                                           compile_cell_ir(applicability));
 }
@@ -157,6 +159,245 @@ materialize_empty(std::string_view cell_id, IRawArtifactStore &store) {
       qualified, detail::RetentionMaterializerTestAccess::make_context(),
       input_source, {}, catalog_store, store);
 }
+
+[[nodiscard]] CanonicalValue replace_object_member(const CanonicalValue &value,
+                                                   std::string_view member_name,
+                                                   CanonicalValue replacement);
+
+struct RuntimePolicyRetentionFixture final {
+  RetentionQualifiedDeployment qualified;
+  QualifiedRuntimePolicy policy;
+  std::string policy_bytes;
+};
+
+[[nodiscard]] RuntimePolicyRetentionFixture
+make_runtime_policy_retention_fixture() {
+  CanonicalValue policy(CanonicalValue::Object{
+      {"api_version", CanonicalValue("manyforge.runtime_policy.v1")},
+      {"runtime_policy_id", CanonicalValue("runtime.safe")},
+      {"runtime_policy_revision", CanonicalValue(std::string(kZeroDigest))},
+      {"interrupt_policy_ids", CanonicalValue(CanonicalValue::Array{})},
+      {"motion_speed_limits",
+       CanonicalValue(
+           CanonicalValue::Array{CanonicalValue(CanonicalValue::Object{
+               {"scope_kind", CanonicalValue("cell")},
+               {"maximum_tcp_linear_speed_mps", CanonicalValue(0.5)},
+           })})},
+      {"open_loop_grasp_acknowledgements",
+       CanonicalValue(CanonicalValue::Array{})},
+  });
+  policy = replace_object_member(
+      policy, "runtime_policy_revision",
+      CanonicalValue(detail::compute_content_identity(
+          policy,
+          detail::ContentIdentitySpec{
+              .identity_domain = "catalog-record-revision/runtime_policy",
+              .api_version = "manyforge.runtime_policy.v1",
+              .own_field = "runtime_policy_revision",
+          })));
+  const std::string policy_bytes = canonical_json(policy);
+  const std::string policy_digest = sha256_digest(policy_bytes);
+  const core::RuntimePolicyCatalogRecordRefDTO reference{
+      core::RuntimePolicyId("runtime.safe"),
+      core::RuntimePolicyRevision(
+          string_member(policy, "runtime_policy_revision")),
+      core::SchemaId("manyforge.runtime_policy.v1"),
+      core::SchemaRevision(
+          "sha256:"
+          "330a7505c585d69b231a1322bffbcd71775a1070c3a519a1ef7eb013ed5b5e9f"),
+      core::ContentDigest(policy_digest),
+      core::ContentAddressedStoreKey("sha256/" + policy_digest.substr(7U)),
+  };
+  QualifiedRuntimePolicy qualified_policy = resolve_and_qualify_runtime_policy(
+      reference, reference.content_addressed_store_key, policy_bytes);
+
+  const CanonicalValue catalogs = detail::encode_deployment_catalogs(
+      std::array<core::CatalogRecordRefDTO, 1U>{reference});
+  const CanonicalValue &records = member(catalogs, "records");
+  const CanonicalValue deployment_root(CanonicalValue::Object{
+      {"api_version", CanonicalValue("manyforge.deployment.v1")},
+      {"deployment_artifact_id", CanonicalValue("runtime_policy_retention")},
+      {"deployment_revision", CanonicalValue(std::string(kZeroDigest))},
+      {"cell_id", CanonicalValue("runtime_policy_cell")},
+      {"name", CanonicalValue("Runtime policy retention")},
+      {"catalogs", catalogs},
+      {"graph", parse_strict_json_model_yaml(empty_graph()).root()},
+      {"desired_control_configurations",
+       CanonicalValue(CanonicalValue::Array{})},
+      {"capability_provider_bindings", CanonicalValue(CanonicalValue::Array{})},
+      {"policies",
+       CanonicalValue(CanonicalValue::Object{
+           {"retained_policy_records", records},
+           {"stop_stage_parameters", CanonicalValue(CanonicalValue::Array{})},
+           {"commissioned_stop_interfaces",
+            CanonicalValue(CanonicalValue::Array{})},
+           {"interrupt_sources", CanonicalValue(CanonicalValue::Array{})},
+           {"interrupt_policies", CanonicalValue(CanonicalValue::Array{})},
+           {"interrupt_config",
+            CanonicalValue(CanonicalValue::Object{
+                {"queue_depth", CanonicalValue(8.0)},
+                {"cancel_validation_timeout_ns", CanonicalValue(1000.0)},
+                {"motion_scope_arm_timeout_ns", CanonicalValue(1000.0)},
+                {"supervisory_poll_rate_hz", CanonicalValue(10.0)},
+            })},
+       })},
+  });
+  const auto deployment = compute_deployment_artifact_revision(
+      parse_strict_json_model_yaml(canonical_json(deployment_root)), {});
+  const auto composition = compose_cell_occurrences(
+      deployment.graph(), std::span<const SourceVerifiedModelAsset>{},
+      std::span<const QualifiedComponentType>{});
+  const auto overlay = select_site_overlay_for_deployment(
+      deployment.applicability_inputs().value().site_overlay_ref,
+      deployment.applicability_inputs().value().external_resources, nullptr);
+  const std::array policies{qualified_policy};
+  const auto applicability = qualify_cell_applicability(
+      composition, deployment.applicability_inputs(), {}, policies, {}, {}, {},
+      {}, {}, {}, {}, {}, overlay);
+  return {qualify_deployment_for_retention(deployment,
+                                           compile_cell_ir(applicability)),
+          std::move(qualified_policy), policy_bytes};
+}
+
+struct ContactPolicyRetentionFixture final {
+  RetentionQualifiedDeployment qualified;
+  QualifiedContactPolicy policy;
+  std::string policy_bytes;
+};
+
+[[nodiscard]] ContactPolicyRetentionFixture
+make_contact_policy_retention_fixture() {
+  CanonicalValue policy(CanonicalValue::Object{
+      {"api_version", CanonicalValue("manyforge.contact_policy.v1")},
+      {"policy_id", CanonicalValue("selected_object_grasp")},
+      {"version", CanonicalValue(std::string(kZeroDigest))},
+      {"mode", CanonicalValue("contact_grasp")},
+      {"sensing_mode", CanonicalValue("geometry_only")},
+      {"default_unmatched_response", CanonicalValue("hard_stop")},
+      {"zones",
+       CanonicalValue(
+           CanonicalValue::Array{CanonicalValue(CanonicalValue::Object{
+               {"zone_id", CanonicalValue("tool_contact")},
+               {"body_pairs",
+                CanonicalValue(
+                    CanonicalValue::Array{CanonicalValue(CanonicalValue::Object{
+                        {"body_a",
+                         CanonicalValue(CanonicalValue::Object{
+                             {"kind", CanonicalValue("component_model_body")},
+                             {"component_role_id", CanonicalValue("robot")},
+                             {"model_role_id", CanonicalValue("arm_model")},
+                             {"collision_body_role_id",
+                              CanonicalValue("tool_collision")},
+                         })},
+                        {"body_b",
+                         CanonicalValue(CanonicalValue::Object{
+                             {"kind", CanonicalValue("runtime_object")},
+                             {"runtime_object_id",
+                              CanonicalValue("selected_object")},
+                         })},
+                    })})},
+               {"violation_response", CanonicalValue("hard_stop")},
+               {"max_penetration_m", CanonicalValue(0.002)},
+               {"terminal_window_start_fraction", CanonicalValue(0.8)},
+           })})},
+  });
+  policy = replace_object_member(
+      policy, "version",
+      CanonicalValue(detail::compute_content_identity(
+          policy,
+          detail::ContentIdentitySpec{
+              .identity_domain = "catalog-record-revision/contact_policy",
+              .api_version = "manyforge.contact_policy.v1",
+              .own_field = "version",
+          })));
+  const std::string policy_bytes = canonical_json(policy);
+  const std::string policy_digest = sha256_digest(policy_bytes);
+  const core::ContactPolicyCatalogRecordRefDTO reference{
+      core::ContactPolicyId("selected_object_grasp"),
+      core::ContactPolicyRevision(string_member(policy, "version")),
+      core::SchemaId("manyforge.contact_policy.v1"),
+      core::SchemaRevision(
+          "sha256:"
+          "79f101a9c8cc2acf8db6ecaffd3476b03723afd5a31cce2a503f7b8764b47912"),
+      core::ContentDigest(policy_digest),
+      core::ContentAddressedStoreKey("sha256/" + policy_digest.substr(7U)),
+  };
+  QualifiedContactPolicy qualified_policy = resolve_and_qualify_contact_policy(
+      reference, reference.content_addressed_store_key, policy_bytes);
+
+  const CanonicalValue catalogs = detail::encode_deployment_catalogs(
+      std::array<core::CatalogRecordRefDTO, 1U>{reference});
+  const CanonicalValue &records = member(catalogs, "records");
+  const CanonicalValue deployment_root(CanonicalValue::Object{
+      {"api_version", CanonicalValue("manyforge.deployment.v1")},
+      {"deployment_artifact_id", CanonicalValue("contact_policy_retention")},
+      {"deployment_revision", CanonicalValue(std::string(kZeroDigest))},
+      {"cell_id", CanonicalValue("contact_policy_cell")},
+      {"name", CanonicalValue("Contact policy retention")},
+      {"catalogs", catalogs},
+      {"graph", parse_strict_json_model_yaml(empty_graph()).root()},
+      {"desired_control_configurations",
+       CanonicalValue(CanonicalValue::Array{})},
+      {"capability_provider_bindings", CanonicalValue(CanonicalValue::Array{})},
+      {"policies",
+       CanonicalValue(CanonicalValue::Object{
+           {"retained_policy_records", records},
+           {"stop_stage_parameters", CanonicalValue(CanonicalValue::Array{})},
+           {"commissioned_stop_interfaces",
+            CanonicalValue(CanonicalValue::Array{})},
+           {"interrupt_sources", CanonicalValue(CanonicalValue::Array{})},
+           {"interrupt_policies", CanonicalValue(CanonicalValue::Array{})},
+           {"interrupt_config",
+            CanonicalValue(CanonicalValue::Object{
+                {"queue_depth", CanonicalValue(8.0)},
+                {"cancel_validation_timeout_ns", CanonicalValue(1000.0)},
+                {"motion_scope_arm_timeout_ns", CanonicalValue(1000.0)},
+                {"supervisory_poll_rate_hz", CanonicalValue(10.0)},
+            })},
+       })},
+  });
+  const auto deployment = compute_deployment_artifact_revision(
+      parse_strict_json_model_yaml(canonical_json(deployment_root)), {});
+  const auto composition = compose_cell_occurrences(
+      deployment.graph(), std::span<const SourceVerifiedModelAsset>{},
+      std::span<const QualifiedComponentType>{});
+  const auto overlay = select_site_overlay_for_deployment(
+      deployment.applicability_inputs().value().site_overlay_ref,
+      deployment.applicability_inputs().value().external_resources, nullptr);
+  const std::array policies{qualified_policy};
+  const auto applicability = qualify_cell_applicability(
+      composition, deployment.applicability_inputs(), {}, {}, {}, {}, {}, {},
+      {}, {}, {}, {}, overlay, policies);
+  return {qualify_deployment_for_retention(deployment,
+                                           compile_cell_ir(applicability)),
+          std::move(qualified_policy), policy_bytes};
+}
+
+class PolicyCompilerInputSource final
+    : public detail::ICompilerInputArtifactSource {
+public:
+  template <typename Reference>
+  PolicyCompilerInputSource(const Reference &reference, std::string bytes)
+      : key_(reference.content_addressed_store_key),
+        digest_(reference.content_digest), bytes_(std::move(bytes)) {}
+
+  [[nodiscard]] std::optional<std::string>
+  get_verified(const core::ContentAddressedStoreKey &key,
+               const core::ContentDigest &expected_digest,
+               std::optional<std::uint64_t> expected_size) const override {
+    if (key != key_ || expected_digest != digest_ ||
+        (expected_size.has_value() && *expected_size != bytes_.size()) ||
+        sha256_digest(bytes_) != expected_digest.value()) {
+      return std::nullopt;
+    }
+    return bytes_;
+  }
+
+private:
+  core::ContentAddressedStoreKey key_;
+  core::ContentDigest digest_;
+  std::string bytes_;
+};
 
 [[nodiscard]] std::string
 require_product_artifact_bytes(const core::RetainedProductDTO &product,
@@ -344,7 +585,7 @@ TEST(RetainedBundleMaterializer,
   EXPECT_EQ(store.size(), 3U);
 
   const CanonicalValue &root = bundle->normalized_root();
-  EXPECT_EQ(root.as_object().size(), 10U);
+  EXPECT_EQ(root.as_object().size(), 11U);
   EXPECT_EQ(string_member(root, "api_version"),
             core::kRetainedBundleApiVersion);
   EXPECT_EQ(string_member(root, "deployment_artifact_id"),
@@ -366,6 +607,8 @@ TEST(RetainedBundleMaterializer,
   EXPECT_TRUE(array_member(catalogs, "schema_artifacts").empty());
   EXPECT_TRUE(array_member(root, "desired_control_configurations").empty());
   EXPECT_TRUE(array_member(root, "capability_provider_bindings").empty());
+  EXPECT_TRUE(array_member(root, "retained_policy_records").empty());
+  EXPECT_TRUE(bundle->value().retained_policy_records.empty());
 
   const CanonicalValue &products = member(root, "compiled_products");
   const CanonicalValue &planning = member(products, "planning_collision_model");
@@ -415,6 +658,75 @@ TEST(RetainedBundleMaterializer,
   EXPECT_TRUE(array_member(provenance, "source_records").empty());
   EXPECT_TRUE(array_member(provenance, "generator_records").empty());
   EXPECT_EQ(array_member(provenance, "output_records").size(), 2U);
+}
+
+TEST(RetainedBundleMaterializer,
+     RuntimePolicySelectionIsRetainedAndReloadedAsOneExactCatalogReferent) {
+  auto fixture = make_runtime_policy_retention_fixture();
+  PolicyCompilerInputSource input_source(fixture.policy.reference(),
+                                         fixture.policy_bytes);
+  test::InMemoryCatalogArtifactStoreFixture catalog_store;
+  test::InMemoryRawArtifactStoreFixture raw_store;
+  const auto bundle = detail::RetainedBundleMaterializer::materialize(
+      fixture.qualified,
+      detail::RetentionMaterializerTestAccess::make_context(), input_source, {},
+      catalog_store, raw_store);
+
+  ASSERT_NE(bundle, nullptr);
+  ASSERT_EQ(bundle->value().retained_policy_records.size(), 1U);
+  EXPECT_EQ(bundle->value().retained_policy_records.front(),
+            core::CatalogRecordRefDTO(fixture.policy.reference()));
+  ASSERT_EQ(bundle->value().catalogs.records.size(), 1U);
+  EXPECT_EQ(bundle->value().catalogs.records.front(),
+            bundle->value().retained_policy_records.front());
+  ASSERT_EQ(
+      array_member(bundle->normalized_root(), "retained_policy_records").size(),
+      1U);
+  EXPECT_EQ(catalog_store.size(), 1U);
+  EXPECT_NO_THROW(
+      static_cast<void>(detail::RetainedBundleReloadAuthority::reload(
+          bundle->canonical_bytes())));
+
+  CanonicalValue changed =
+      replace_root_member(bundle->normalized_root(), "retained_policy_records",
+                          CanonicalValue(CanonicalValue::Array{}));
+  changed = reidentify_retained_bundle(std::move(changed));
+  EXPECT_THROW(static_cast<void>(detail::RetainedBundleReloadAuthority::reload(
+                   canonical_json(changed))),
+               RetainedBundleError);
+}
+
+TEST(RetainedBundleMaterializer,
+     ContactPolicySelectionIsRetainedAndReloadedAsOneExactCatalogReferent) {
+  auto fixture = make_contact_policy_retention_fixture();
+  PolicyCompilerInputSource input_source(fixture.policy.reference(),
+                                         fixture.policy_bytes);
+  test::InMemoryCatalogArtifactStoreFixture catalog_store;
+  test::InMemoryRawArtifactStoreFixture raw_store;
+  const auto bundle = detail::RetainedBundleMaterializer::materialize(
+      fixture.qualified,
+      detail::RetentionMaterializerTestAccess::make_context(), input_source, {},
+      catalog_store, raw_store);
+
+  ASSERT_NE(bundle, nullptr);
+  ASSERT_EQ(bundle->value().retained_policy_records.size(), 1U);
+  EXPECT_EQ(bundle->value().retained_policy_records.front(),
+            core::CatalogRecordRefDTO(fixture.policy.reference()));
+  ASSERT_EQ(bundle->value().catalogs.records.size(), 1U);
+  EXPECT_EQ(bundle->value().catalogs.records.front(),
+            bundle->value().retained_policy_records.front());
+  EXPECT_EQ(catalog_store.size(), 1U);
+  EXPECT_NO_THROW(
+      static_cast<void>(detail::RetainedBundleReloadAuthority::reload(
+          bundle->canonical_bytes())));
+
+  CanonicalValue changed =
+      replace_root_member(bundle->normalized_root(), "retained_policy_records",
+                          CanonicalValue(CanonicalValue::Array{}));
+  changed = reidentify_retained_bundle(std::move(changed));
+  EXPECT_THROW(static_cast<void>(detail::RetainedBundleReloadAuthority::reload(
+                   canonical_json(changed))),
+               RetainedBundleError);
 }
 
 TEST(RetainedBundleMaterializer,
@@ -852,22 +1164,20 @@ TEST(RetainedBundleMaterializer,
       opened_stop_rows.front().as_object();
   opened_not_stoppable.emplace_back("containment_command",
                                     CanonicalValue(nullptr));
-  opened_stop_rows.front() =
-      CanonicalValue(std::move(opened_not_stoppable));
-  const CanonicalValue opened_control = replace_object_member(
-      control, "stop_applicability",
-      CanonicalValue(std::move(opened_stop_rows)));
-  EXPECT_THROW(static_cast<void>(
-                   detail::parse_and_verify_control_domain_control(
-                       canonical_json(opened_control))),
-               RetainedBundleError);
+  opened_stop_rows.front() = CanonicalValue(std::move(opened_not_stoppable));
+  const CanonicalValue opened_control =
+      replace_object_member(control, "stop_applicability",
+                            CanonicalValue(std::move(opened_stop_rows)));
+  EXPECT_THROW(
+      static_cast<void>(detail::parse_and_verify_control_domain_control(
+          canonical_json(opened_control))),
+      RetainedBundleError);
   ASSERT_EQ(array_member(control, "controllers").size(), 1U);
   EXPECT_EQ(string_member(member(array_member(control, "controllers").front(),
                                  "implementation"),
                           "implementation_id"),
             "manyforge.ros2_control.joint_trajectory_controller.direct");
-  ASSERT_EQ(bundle->value().compiled_products.runtime_unit_products.size(),
-            1U);
+  ASSERT_EQ(bundle->value().compiled_products.runtime_unit_products.size(), 1U);
   EXPECT_EQ(bundle->value()
                 .compiled_products.runtime_unit_products.front()
                 .runtime_unit_id.value(),
@@ -1039,8 +1349,7 @@ TEST(RetainedBundleMaterializer,
   EXPECT_THROW(
       detail::require_native_execution_runtime_product_matches_retained_bundle(
           changed_configuration, launch_descriptor, std::nullopt,
-          bundle->value(),
-          group.runtime_unit_id),
+          bundle->value(), group.runtime_unit_id),
       RetainedBundleError);
 
   test::InMemoryCatalogArtifactStoreFixture second_catalog_store;
@@ -1246,8 +1555,7 @@ TEST(RetainedBundleMaterializer,
   EXPECT_EQ(catalog_store.size(), 8U);
   EXPECT_EQ(bundle->value().compiled_products.control_domain_products.size(),
             2U);
-  EXPECT_EQ(bundle->value().compiled_products.runtime_unit_products.size(),
-            2U);
+  EXPECT_EQ(bundle->value().compiled_products.runtime_unit_products.size(), 2U);
 
   const auto &components = bundle->value().cell_graph.controllable_components;
   EXPECT_NE(components[0].controllable_component_id,
@@ -1391,29 +1699,27 @@ TEST(ControlDomainControlVerifier,
      StoppableRowsRoundTripCloseAndRejectScopeTampering) {
   const auto fixture =
       test::make_lite6_stoppable_controllable_retention_fixture();
-  const core::ControlDomainId domain_id(
-      std::string(test::kLite6ArmDomainId));
+  const core::ControlDomainId domain_id(std::string(test::kLite6ArmDomainId));
   // Structural emitter/verifier coverage needs the exact row shape but must
   // not mint or imply production qualification. The production materializer
   // obtains the equivalent row only from sealed runner evidence.
   const std::array<core::StopImplementationQualificationDTO, 1U>
       structural_qualifications{{
           {
-              core::RegisteredStopCommandKindId(
-                  "manyforge.stop.software_hard"),
+              core::RegisteredStopCommandKindId("manyforge.stop.software_hard"),
               core::ProviderContractRefDTO{
                   core::ProviderContractRoleId("software_hard_stop"),
                   core::SchemaId(
                       "manyforge.value_schema.provider_contract.empty.v1"),
-                  core::SchemaRevision(std::string(
-                      test::lite6_controllable_fixture_detail::
-                          kEmptyProviderContractSchemaRevision)),
+                  core::SchemaRevision(
+                      std::string(test::lite6_controllable_fixture_detail::
+                                      kEmptyProviderContractSchemaRevision)),
               },
               core::ProductId(detail::native_execution_runtime_product_id(
-                  core::RuntimeUnitId(std::string(
-                      test::kLite6NativeExecutionRuntimeId)))),
-              core::ProductContractId(
-                  std::string(detail::kNativeExecutionRuntimeProductContractId)),
+                  core::RuntimeUnitId(
+                      std::string(test::kLite6NativeExecutionRuntimeId)))),
+              core::ProductContractId(std::string(
+                  detail::kNativeExecutionRuntimeProductContractId)),
               detail::native_execution_runtime_product_contract_revision(),
               std::nullopt,
               core::StopInvocationLaneId(
@@ -1421,18 +1727,18 @@ TEST(ControlDomainControlVerifier,
               core::RetainedArtifactRefDTO{
                   core::ArtifactRoleId(std::string(
                       core::kStopImplementationQualificationArtifactRole)),
-                  std::string(
-                      core::kStopImplementationQualificationMediaType),
+                  std::string(core::kStopImplementationQualificationMediaType),
                   1U,
                   core::ContentDigest(std::string(kZeroDigest)),
                   core::ContentAddressedStoreKey(
-                      "sha256/0000000000000000000000000000000000000000000000000000000000000000"),
+                      "sha256/"
+                      "00000000000000000000000000000000000000000000000000000000"
+                      "00000000"),
               },
           },
       }};
   const std::string bytes = detail::emit_control_domain_control(
-      fixture.qualified.compiler_ir(), domain_id,
-      structural_qualifications);
+      fixture.qualified.compiler_ir(), domain_id, structural_qualifications);
   const CanonicalValue control =
       detail::parse_and_verify_control_domain_control(bytes);
   EXPECT_NO_THROW(detail::require_control_domain_control_matches(
@@ -1440,10 +1746,8 @@ TEST(ControlDomainControlVerifier,
       structural_qualifications));
   const auto not_stoppable_fixture =
       test::make_lite6_controllable_retention_fixture();
-  const std::string not_stoppable_bytes =
-      detail::emit_control_domain_control(
-          not_stoppable_fixture.qualified.compiler_ir(),
-          domain_id);
+  const std::string not_stoppable_bytes = detail::emit_control_domain_control(
+      not_stoppable_fixture.qualified.compiler_ir(), domain_id);
   EXPECT_THROW(
       detail::require_control_domain_control_matches(
           not_stoppable_bytes, fixture.qualified.compiler_ir(), domain_id),
@@ -1455,11 +1759,10 @@ TEST(ControlDomainControlVerifier,
   EXPECT_EQ(string_member(stop, "disposition"), "stoppable");
   EXPECT_EQ(string_member(stop, "stop_evidence_policy_id"),
             "lite6_binding_state_stop");
-  EXPECT_DOUBLE_EQ(
-      std::get<double>(member(member(stop, "deadline_budget"),
-                              "outer_duration_ns")
-                           .storage()),
-      1'000'000'000.0);
+  EXPECT_DOUBLE_EQ(std::get<double>(member(member(stop, "deadline_budget"),
+                                           "outer_duration_ns")
+                                        .storage()),
+                   1'000'000'000.0);
 
   const auto &stages = array_member(stop, "escalation_stages");
   ASSERT_EQ(stages.size(), 2U);
@@ -1468,17 +1771,14 @@ TEST(ControlDomainControlVerifier,
   EXPECT_EQ(string_member(nominal, "stage_kind"), "nominal");
   const CanonicalValue &command = member(nominal, "containment_command");
   EXPECT_EQ(string_member(command, "command_phase_id"), "nominal_command");
-  EXPECT_EQ(string_member(command, "command_kind"),
-            "controller_goal_cancel");
+  EXPECT_EQ(string_member(command, "command_kind"), "controller_goal_cancel");
   EXPECT_TRUE(std::holds_alternative<std::nullptr_t>(
       member(command, "provider_contract_ref").storage()));
   EXPECT_TRUE(std::holds_alternative<std::nullptr_t>(
       member(command, "registered_command_kind_id").storage()));
-  const auto &evidence =
-      array_member(nominal, "all_of_evidence_requirements");
+  const auto &evidence = array_member(nominal, "all_of_evidence_requirements");
   ASSERT_EQ(evidence.size(), 1U);
-  EXPECT_EQ(string_member(evidence.front(), "evidence_kind"),
-            "motion_rest");
+  EXPECT_EQ(string_member(evidence.front(), "evidence_kind"), "motion_rest");
   EXPECT_FALSE(std::holds_alternative<std::nullptr_t>(
       member(evidence.front(), "provider_contract_ref").storage()));
   EXPECT_EQ(string_member(member(evidence.front(), "source_requirement"),
@@ -1487,8 +1787,7 @@ TEST(ControlDomainControlVerifier,
   EXPECT_EQ(string_member(member(evidence.front(), "source_requirement"),
                           "endpoint_role_id"),
             "state");
-  EXPECT_TRUE(
-      array_member(nominal, "provider_evidence_endpoints").empty());
+  EXPECT_TRUE(array_member(nominal, "provider_evidence_endpoints").empty());
   const auto &binding_sources =
       array_member(nominal, "binding_state_authority_sources");
   ASSERT_EQ(binding_sources.size(), 1U);
@@ -1522,33 +1821,32 @@ TEST(ControlDomainControlVerifier,
   open_rows.front() = CanonicalValue(std::move(open_stop));
   const CanonicalValue open_control = replace_object_member(
       control, "stop_applicability", CanonicalValue(std::move(open_rows)));
-  EXPECT_THROW(static_cast<void>(
-                   detail::parse_and_verify_control_domain_control(
-                       canonical_json(open_control))),
-               RetainedBundleError);
+  EXPECT_THROW(
+      static_cast<void>(detail::parse_and_verify_control_domain_control(
+          canonical_json(open_control))),
+      RetainedBundleError);
 
   CanonicalValue::Array tampered_rows = stops;
   CanonicalValue::Array tampered_stages = stages;
   CanonicalValue::Array tampered_scopes = scopes;
-  tampered_scopes.front() = replace_object_member(
-      tampered_scopes.front(), "resource_ids",
-      CanonicalValue(CanonicalValue::Array{
-          CanonicalValue("foreign_resource"),
-      }));
-  tampered_stages.front() = replace_object_member(
-      tampered_stages.front(), "containment_scopes",
-      CanonicalValue(std::move(tampered_scopes)));
-  tampered_rows.front() = replace_object_member(
-      tampered_rows.front(), "escalation_stages",
-      CanonicalValue(std::move(tampered_stages)));
+  tampered_scopes.front() =
+      replace_object_member(tampered_scopes.front(), "resource_ids",
+                            CanonicalValue(CanonicalValue::Array{
+                                CanonicalValue("foreign_resource"),
+                            }));
+  tampered_stages.front() =
+      replace_object_member(tampered_stages.front(), "containment_scopes",
+                            CanonicalValue(std::move(tampered_scopes)));
+  tampered_rows.front() =
+      replace_object_member(tampered_rows.front(), "escalation_stages",
+                            CanonicalValue(std::move(tampered_stages)));
   const CanonicalValue tampered_control = replace_object_member(
-      control, "stop_applicability",
-      CanonicalValue(std::move(tampered_rows)));
+      control, "stop_applicability", CanonicalValue(std::move(tampered_rows)));
   const std::string tampered_bytes = canonical_json(tampered_control);
-  EXPECT_THROW(static_cast<void>(
-                   detail::parse_and_verify_control_domain_control(
-                       tampered_bytes)),
-               RetainedBundleError);
+  EXPECT_THROW(
+      static_cast<void>(
+          detail::parse_and_verify_control_domain_control(tampered_bytes)),
+      RetainedBundleError);
 }
 
 TEST(ControlDomainControlVerifier,

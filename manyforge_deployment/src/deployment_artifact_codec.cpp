@@ -9,17 +9,16 @@
 #include <variant>
 #include <vector>
 
-#include "content_identity_internal.hpp"
 #include "closed_schema_internal.hpp"
 #include "compiler_semantic_limits_internal.hpp"
+#include "content_identity_internal.hpp"
 #include "deployment_catalog_codec_internal.hpp"
 #include "manyforge_deployment/content_identity.hpp"
 
 namespace manyforge::deployment {
 namespace {
 
-constexpr std::string_view kDeploymentApiVersion =
-    "manyforge.deployment.v1";
+constexpr std::string_view kDeploymentApiVersion = "manyforge.deployment.v1";
 constexpr std::string_view kPlaceholderDigest =
     "sha256:0000000000000000000000000000000000000000000000000000000000000000";
 const detail::ContentIdentitySpec kDeploymentIdentitySpec{
@@ -34,58 +33,58 @@ const detail::ContentIdentitySpec kDeploymentIdentitySpec{
                                      std::string(reason));
 }
 
-[[nodiscard]] const CanonicalValue::Object& require_object(
-    const CanonicalValue& value, std::string_view path) {
-  const auto* object = std::get_if<CanonicalValue::Object>(&value.storage());
+[[nodiscard]] const CanonicalValue::Object &
+require_object(const CanonicalValue &value, std::string_view path) {
+  const auto *object = std::get_if<CanonicalValue::Object>(&value.storage());
   if (object == nullptr) {
     fail(path, "expected object");
   }
   return *object;
 }
 
-[[nodiscard]] const CanonicalValue::Array& require_array(const CanonicalValue& value,
-                                                         std::string_view path) {
-  const auto* array = std::get_if<CanonicalValue::Array>(&value.storage());
+[[nodiscard]] const CanonicalValue::Array &
+require_array(const CanonicalValue &value, std::string_view path) {
+  const auto *array = std::get_if<CanonicalValue::Array>(&value.storage());
   if (array == nullptr) {
     fail(path, "expected array");
   }
   return *array;
 }
 
-[[nodiscard]] const std::string& require_string(
-    const CanonicalValue& value, std::string_view path) {
-  const auto* text = std::get_if<std::string>(&value.storage());
+[[nodiscard]] const std::string &require_string(const CanonicalValue &value,
+                                                std::string_view path) {
+  const auto *text = std::get_if<std::string>(&value.storage());
   if (text == nullptr) {
     fail(path, "expected string");
   }
   return *text;
 }
 
-[[nodiscard]] const CanonicalValue* find_member(
-    const CanonicalValue::Object& object, std::string_view name) noexcept {
-  const auto iterator = std::find_if(
-      object.begin(), object.end(),
-      [name](const auto& member) { return member.first == name; });
+[[nodiscard]] const CanonicalValue *
+find_member(const CanonicalValue::Object &object,
+            std::string_view name) noexcept {
+  const auto iterator =
+      std::find_if(object.begin(), object.end(),
+                   [name](const auto &member) { return member.first == name; });
   return iterator == object.end() ? nullptr : &iterator->second;
 }
 
-[[nodiscard]] const CanonicalValue& require_member(
-    const CanonicalValue::Object& object, std::string_view name,
-    std::string_view path) {
-  const CanonicalValue* value = find_member(object, name);
+[[nodiscard]] const CanonicalValue &
+require_member(const CanonicalValue::Object &object, std::string_view name,
+               std::string_view path) {
+  const CanonicalValue *value = find_member(object, name);
   if (value == nullptr) {
     fail(path, "missing required field '" + std::string(name) + "'");
   }
   return *value;
 }
 
-[[nodiscard]] bool contains(
-    std::initializer_list<std::string_view> values,
-    std::string_view candidate) {
+[[nodiscard]] bool contains(std::initializer_list<std::string_view> values,
+                            std::string_view candidate) {
   return std::find(values.begin(), values.end(), candidate) != values.end();
 }
 
-void require_closed_root(const CanonicalValue::Object& root) {
+void require_closed_root(const CanonicalValue::Object &root) {
   const std::initializer_list<std::string_view> kRequired{
       "api_version",
       "deployment_artifact_id",
@@ -98,11 +97,11 @@ void require_closed_root(const CanonicalValue::Object& root) {
       "capability_provider_bindings",
   };
   const std::initializer_list<std::string_view> kOptional{
-      "description",      "site_overlay_ref", "policies",
+      "description",        "site_overlay_ref", "policies",
       "external_resources", "assistant",        "compatibility",
   };
 
-  for (const auto& [name, unused] : root) {
+  for (const auto &[name, unused] : root) {
     (void)unused;
     if (!contains(kRequired, name) && !contains(kOptional, name)) {
       fail("$", "unknown field '" + name + "'");
@@ -113,16 +112,12 @@ void require_closed_root(const CanonicalValue::Object& root) {
   }
 }
 
-void require_exact_graph_fields(const CanonicalValue::Object& graph) {
+void require_exact_graph_fields(const CanonicalValue::Object &graph) {
   const std::initializer_list<std::string_view> kGraphFields{
-      "runtime_units",
-      "model_instances",
-      "controllable_components",
-      "control_domains",
-      "control_bindings",
-      "component_attachments",
+      "runtime_units",   "model_instances",  "controllable_components",
+      "control_domains", "control_bindings", "component_attachments",
   };
-  for (const auto& [name, unused] : graph) {
+  for (const auto &[name, unused] : graph) {
     (void)unused;
     if (!contains(kGraphFields, name)) {
       fail("$.graph", "unknown field '" + name + "'");
@@ -133,16 +128,14 @@ void require_exact_graph_fields(const CanonicalValue::Object& graph) {
   }
 }
 
-[[nodiscard]] constexpr bool is_ascii_alphanumeric(
-    unsigned char byte) noexcept {
-  return (byte >= 'a' && byte <= 'z') ||
-         (byte >= 'A' && byte <= 'Z') ||
+[[nodiscard]] constexpr bool
+is_ascii_alphanumeric(unsigned char byte) noexcept {
+  return (byte >= 'a' && byte <= 'z') || (byte >= 'A' && byte <= 'Z') ||
          (byte >= '0' && byte <= '9');
 }
 
 [[nodiscard]] bool is_portable_token(std::string_view value) noexcept {
-  if (value.empty() ||
-      value.size() > detail::kMaximumPortableIdentityBytes ||
+  if (value.empty() || value.size() > detail::kMaximumPortableIdentityBytes ||
       !is_ascii_alphanumeric(static_cast<unsigned char>(value.front()))) {
     return false;
   }
@@ -153,9 +146,9 @@ void require_exact_graph_fields(const CanonicalValue::Object& graph) {
 }
 
 template <typename StrongType>
-[[nodiscard]] StrongType parse_portable_id(const CanonicalValue& value,
+[[nodiscard]] StrongType parse_portable_id(const CanonicalValue &value,
                                            std::string_view path) {
-  const std::string& text = require_string(value, path);
+  const std::string &text = require_string(value, path);
   if (!is_portable_token(text)) {
     fail(path,
          "expected a 1..128 byte portable token beginning with an ASCII "
@@ -165,25 +158,27 @@ template <typename StrongType>
 }
 
 template <typename StrongType>
-[[nodiscard]] StrongType parse_digest(const CanonicalValue& value,
+[[nodiscard]] StrongType parse_digest(const CanonicalValue &value,
                                       std::string_view path) {
-  const std::string& text = require_string(value, path);
+  const std::string &text = require_string(value, path);
   if (!is_sha256_digest(text)) {
     fail(path, "expected lowercase sha256:<64 hex> digest");
   }
   return StrongType(text);
 }
 
-void validate_compatibility_set(const CanonicalValue& value, std::string_view path) {
-  const auto& items = require_array(value, path);
+void validate_compatibility_set(const CanonicalValue &value,
+                                std::string_view path) {
+  const auto &items = require_array(value, path);
   if (items.size() > detail::kMaximumCompilerContractRows) {
     fail(path, "exceeds fixed compatibility metadata bound");
   }
   std::vector<std::string> parsed;
   parsed.reserve(items.size());
   for (std::size_t index = 0U; index < items.size(); ++index) {
-    const std::string item_path = std::string(path) + "[" + std::to_string(index) + "]";
-    const std::string& item = require_string(items[index], item_path);
+    const std::string item_path =
+        std::string(path) + "[" + std::to_string(index) + "]";
+    const std::string &item = require_string(items[index], item_path);
     if (!is_portable_token(item)) {
       fail(item_path, "expected stable portable compatibility ID");
     }
@@ -195,10 +190,11 @@ void validate_compatibility_set(const CanonicalValue& value, std::string_view pa
   }
 }
 
-void validate_compatibility(const CanonicalValue& value) {
-  const auto& compatibility = require_object(value, "$.compatibility");
-  const std::initializer_list<std::string_view> kFields{"lane", "provides", "tags"};
-  for (const auto& [name, unused] : compatibility) {
+void validate_compatibility(const CanonicalValue &value) {
+  const auto &compatibility = require_object(value, "$.compatibility");
+  const std::initializer_list<std::string_view> kFields{"lane", "provides",
+                                                        "tags"};
+  for (const auto &[name, unused] : compatibility) {
     (void)unused;
     if (!contains(kFields, name)) {
       fail("$.compatibility", "unknown field '" + name + "'");
@@ -207,23 +203,25 @@ void validate_compatibility(const CanonicalValue& value) {
   for (const std::string_view field : kFields) {
     (void)require_member(compatibility, field, "$.compatibility");
   }
-  const std::string& lane = require_string(require_member(compatibility, "lane", "$.compatibility"),
-                                           "$.compatibility.lane");
+  const std::string &lane =
+      require_string(require_member(compatibility, "lane", "$.compatibility"),
+                     "$.compatibility.lane");
   if (!contains({"manyforge-only", "isaac-sim", "real-robot"}, lane)) {
     fail("$.compatibility.lane", "unsupported runtime lane");
   }
-  validate_compatibility_set(require_member(compatibility, "provides", "$.compatibility"),
-                             "$.compatibility.provides");
-  validate_compatibility_set(require_member(compatibility, "tags", "$.compatibility"),
-                             "$.compatibility.tags");
+  validate_compatibility_set(
+      require_member(compatibility, "provides", "$.compatibility"),
+      "$.compatibility.provides");
+  validate_compatibility_set(
+      require_member(compatibility, "tags", "$.compatibility"),
+      "$.compatibility.tags");
 }
 
-[[nodiscard]] CanonicalValue make_synthetic_graph_root(
-    const CanonicalValue::Object& authored_graph,
-    const core::CellId& cell_id) {
+[[nodiscard]] CanonicalValue
+make_synthetic_graph_root(const CanonicalValue::Object &authored_graph,
+                          const core::CellId &cell_id) {
   return CanonicalValue(CanonicalValue::Object{
-      {"api_version",
-       CanonicalValue(std::string(core::kCellGraphApiVersion))},
+      {"api_version", CanonicalValue(std::string(core::kCellGraphApiVersion))},
       {"graph_revision", CanonicalValue(std::string(kPlaceholderDigest))},
       {"cell_id", CanonicalValue(cell_id.value())},
       {"runtime_units",
@@ -241,18 +239,15 @@ void validate_compatibility(const CanonicalValue& value) {
   });
 }
 
-[[nodiscard]] CanonicalValue authored_graph_member(
-    const CanonicalValue& normalized_full_graph) {
-  const auto& graph = require_object(normalized_full_graph, "$.graph");
+[[nodiscard]] CanonicalValue
+authored_graph_member(const CanonicalValue &normalized_full_graph) {
+  const auto &graph = require_object(normalized_full_graph, "$.graph");
   return CanonicalValue(CanonicalValue::Object{
-      {"runtime_units",
-       require_member(graph, "runtime_units", "$.graph")},
-      {"model_instances",
-       require_member(graph, "model_instances", "$.graph")},
+      {"runtime_units", require_member(graph, "runtime_units", "$.graph")},
+      {"model_instances", require_member(graph, "model_instances", "$.graph")},
       {"controllable_components",
        require_member(graph, "controllable_components", "$.graph")},
-      {"control_domains",
-       require_member(graph, "control_domains", "$.graph")},
+      {"control_domains", require_member(graph, "control_domains", "$.graph")},
       {"control_bindings",
        require_member(graph, "control_bindings", "$.graph")},
       {"component_attachments",
@@ -274,30 +269,29 @@ struct DecodedDeployment final {
 };
 
 [[nodiscard]] DecodedDeployment decode_deployment(
-    const ParsedArtifactCandidate& parsed_deployment,
+    const ParsedArtifactCandidate &parsed_deployment,
     std::span<const QualifiedRuntimeProfile> qualified_runtime_profiles) {
-  const auto& root = require_object(parsed_deployment.root(), "$");
+  const auto &root = require_object(parsed_deployment.root(), "$");
   require_closed_root(root);
 
-  const std::string& api_version =
-      require_string(require_member(root, "api_version", "$"),
-                     "$.api_version");
+  const std::string &api_version =
+      require_string(require_member(root, "api_version", "$"), "$.api_version");
   if (api_version != kDeploymentApiVersion) {
     fail("$.api_version", "expected manyforge.deployment.v1");
   }
 
   std::optional<CanonicalValue> compatibility;
-  if (const CanonicalValue* authored = find_member(root, "compatibility"); authored != nullptr) {
+  if (const CanonicalValue *authored = find_member(root, "compatibility");
+      authored != nullptr) {
     validate_compatibility(*authored);
     compatibility = *authored;
   }
 
   std::optional<std::string> description;
-  if (const CanonicalValue* authored_description =
+  if (const CanonicalValue *authored_description =
           find_member(root, "description");
       authored_description != nullptr) {
-    description =
-        require_string(*authored_description, "$.description");
+    description = require_string(*authored_description, "$.description");
   }
 
   const core::DeploymentArtifactId deployment_artifact_id =
@@ -313,7 +307,7 @@ struct DecodedDeployment final {
   const std::string name =
       require_string(require_member(root, "name", "$"), "$.name");
 
-  const auto& authored_graph =
+  const auto &authored_graph =
       require_object(require_member(root, "graph", "$"), "$.graph");
   require_exact_graph_fields(authored_graph);
   const CanonicalValue synthetic_graph =
@@ -325,8 +319,7 @@ struct DecodedDeployment final {
   const IntrinsicallyValidatedCellGraphCandidate intrinsic_graph =
       validate_intrinsic_cell_graph_candidate(typed_graph);
   const GraphIdentityReadyCellGraphCandidate identity_ready_graph =
-      prepare_cell_graph_identity(intrinsic_graph,
-                                  qualified_runtime_profiles);
+      prepare_cell_graph_identity(intrinsic_graph, qualified_runtime_profiles);
   const CanonicalValue normalized_authored_graph =
       authored_graph_member(identity_ready_graph.normalized_root());
 
@@ -334,28 +327,23 @@ struct DecodedDeployment final {
   try {
     catalog_records = detail::decode_deployment_catalogs(
         require_member(root, "catalogs", "$"));
-  } catch (const detail::DeploymentCatalogCodecError& error) {
+  } catch (const detail::DeploymentCatalogCodecError &error) {
     fail("$.catalogs", error.what());
   }
-  for (const auto& record : catalog_records) {
+  for (const auto &record : catalog_records) {
     switch (core::catalog_record_kind(record)) {
-      case core::CatalogRecordKind::kModelAsset:
-      case core::CatalogRecordKind::kRuntimeProfile:
-      case core::CatalogRecordKind::kComponentType:
-      case core::CatalogRecordKind::kControlInterfaceContract:
-      case core::CatalogRecordKind::kControllerTopology:
-      case core::CatalogRecordKind::kProviderManifest:
-      case core::CatalogRecordKind::kCommandSchema:
-      case core::CatalogRecordKind::kCapabilityDefinition:
-      case core::CatalogRecordKind::kStopEvidencePolicy:
-        break;
-      case core::CatalogRecordKind::kContactPolicy:
-      case core::CatalogRecordKind::kRuntimePolicy:
-        fail("$.catalogs.records",
-             "catalog record kind '" +
-                 std::string(core::to_string(
-                     core::catalog_record_kind(record))) +
-                 "' is not qualified by the current compiler subset");
+    case core::CatalogRecordKind::kModelAsset:
+    case core::CatalogRecordKind::kRuntimeProfile:
+    case core::CatalogRecordKind::kComponentType:
+    case core::CatalogRecordKind::kControlInterfaceContract:
+    case core::CatalogRecordKind::kControllerTopology:
+    case core::CatalogRecordKind::kProviderManifest:
+    case core::CatalogRecordKind::kCommandSchema:
+    case core::CatalogRecordKind::kCapabilityDefinition:
+    case core::CatalogRecordKind::kContactPolicy:
+    case core::CatalogRecordKind::kStopEvidencePolicy:
+    case core::CatalogRecordKind::kRuntimePolicy:
+      break;
     }
   }
 
@@ -377,20 +365,18 @@ struct DecodedDeployment final {
 }
 
 [[nodiscard]] CanonicalValue normalized_deployment_root(
-    const DecodedDeployment& decoded,
-    const core::DeploymentRevision& deployment_revision,
-    const CanonicalValue& normalized_graph,
-    const RevisionVerifiedDeploymentApplicabilityInputs& applicability) {
+    const DecodedDeployment &decoded,
+    const core::DeploymentRevision &deployment_revision,
+    const CanonicalValue &normalized_graph,
+    const RevisionVerifiedDeploymentApplicabilityInputs &applicability) {
   CanonicalValue::Object root{
       {"api_version", CanonicalValue(std::string(kDeploymentApiVersion))},
       {"deployment_artifact_id",
        CanonicalValue(decoded.deployment_artifact_id.value())},
-      {"deployment_revision",
-       CanonicalValue(deployment_revision.value())},
+      {"deployment_revision", CanonicalValue(deployment_revision.value())},
       {"cell_id", CanonicalValue(decoded.cell_id.value())},
       {"name", CanonicalValue(decoded.name)},
-      {"catalogs",
-       detail::encode_deployment_catalogs(decoded.catalog_records)},
+      {"catalogs", detail::encode_deployment_catalogs(decoded.catalog_records)},
       {"graph", normalized_graph},
       {"desired_control_configurations",
        applicability.normalized_desired_control_configurations()},
@@ -398,22 +384,20 @@ struct DecodedDeployment final {
        applicability.normalized_capability_provider_bindings()},
   };
   if (decoded.description.has_value()) {
-    root.emplace_back("description",
-                      CanonicalValue(*decoded.description));
+    root.emplace_back("description", CanonicalValue(*decoded.description));
   }
   if (decoded.compatibility.has_value()) {
     root.emplace_back("compatibility", *decoded.compatibility);
   }
 
   switch (applicability.site_overlay_ref_presence()) {
-    case SiteOverlayRefSourcePresence::kAbsent:
-      break;
-    case SiteOverlayRefSourcePresence::kExplicitNull:
-    case SiteOverlayRefSourcePresence::kValue:
-      root.emplace_back(
-          "site_overlay_ref",
-          *applicability.normalized_site_overlay_ref());
-      break;
+  case SiteOverlayRefSourcePresence::kAbsent:
+    break;
+  case SiteOverlayRefSourcePresence::kExplicitNull:
+  case SiteOverlayRefSourcePresence::kValue:
+    root.emplace_back("site_overlay_ref",
+                      *applicability.normalized_site_overlay_ref());
+    break;
   }
   if (applicability.external_resources_was_present()) {
     root.emplace_back("external_resources",
@@ -438,7 +422,7 @@ struct VerifiedEnvelopeParts final {
 };
 
 [[nodiscard]] VerifiedEnvelopeParts compute_parts(
-    const ParsedArtifactCandidate& parsed_deployment,
+    const ParsedArtifactCandidate &parsed_deployment,
     std::span<const QualifiedRuntimeProfile> qualified_runtime_profiles) {
   DecodedDeployment decoded =
       decode_deployment(parsed_deployment, qualified_runtime_profiles);
@@ -450,16 +434,15 @@ struct VerifiedEnvelopeParts final {
       compute_capability_provider_binding_revisions(
           decoded.applicability_candidate);
 
-  core::DeploymentRevision deployment_revision{
-      std::string(kPlaceholderDigest)};
+  core::DeploymentRevision deployment_revision{std::string(kPlaceholderDigest)};
   CanonicalValue normalized_root = normalized_deployment_root(
       decoded, deployment_revision, normalized_graph, applicability);
   detail::validate_canonical_value_output_budget(normalized_root);
-  deployment_revision = core::DeploymentRevision(
-      detail::compute_content_identity(normalized_root,
-                                       kDeploymentIdentitySpec));
-  normalized_root = normalized_deployment_root(
-      decoded, deployment_revision, normalized_graph, applicability);
+  deployment_revision =
+      core::DeploymentRevision(detail::compute_content_identity(
+          normalized_root, kDeploymentIdentitySpec));
+  normalized_root = normalized_deployment_root(decoded, deployment_revision,
+                                               normalized_graph, applicability);
   detail::validate_canonical_value_output_budget(normalized_root);
 
   return {std::move(decoded), std::move(deployment_revision),
@@ -468,7 +451,7 @@ struct VerifiedEnvelopeParts final {
 }
 
 [[nodiscard]] VerifiedEnvelopeParts verify_parts(
-    const ParsedArtifactCandidate& parsed_deployment,
+    const ParsedArtifactCandidate &parsed_deployment,
     std::span<const QualifiedRuntimeProfile> qualified_runtime_profiles) {
   DecodedDeployment decoded =
       decode_deployment(parsed_deployment, qualified_runtime_profiles);
@@ -510,48 +493,46 @@ struct VerifiedEnvelopeParts final {
 }
 
 template <typename Operation>
-[[nodiscard]] auto translate_errors(Operation&& operation)
-    -> decltype(operation()) {
+[[nodiscard]] auto
+translate_errors(Operation &&operation) -> decltype(operation()) {
   try {
     return operation();
-  } catch (const DeploymentArtifactCodecError&) {
+  } catch (const DeploymentArtifactCodecError &) {
     throw;
-  } catch (const std::invalid_argument& error) {
-    throw DeploymentArtifactCodecError(
-        std::string("deployment envelope: ") + error.what());
+  } catch (const std::invalid_argument &error) {
+    throw DeploymentArtifactCodecError(std::string("deployment envelope: ") +
+                                       error.what());
   }
 }
 
-}  // namespace
+} // namespace
 
 RevisionVerifiedDeploymentArtifact compute_deployment_artifact_revision(
-    const ParsedArtifactCandidate& parsed_deployment,
+    const ParsedArtifactCandidate &parsed_deployment,
     std::span<const QualifiedRuntimeProfile> qualified_runtime_profiles) {
   VerifiedEnvelopeParts parts = translate_errors([&] {
     return compute_parts(parsed_deployment, qualified_runtime_profiles);
   });
   return RevisionVerifiedDeploymentArtifact(
       std::move(parts.decoded.deployment_artifact_id),
-      std::move(parts.deployment_revision),
-      std::move(parts.decoded.cell_id), std::move(parts.decoded.name),
-      std::move(parts.decoded.description),
+      std::move(parts.deployment_revision), std::move(parts.decoded.cell_id),
+      std::move(parts.decoded.name), std::move(parts.decoded.description),
       std::move(parts.decoded.catalog_records), parts.graph,
       parts.applicability, std::move(parts.normalized_root));
 }
 
 RevisionVerifiedDeploymentArtifact verify_deployment_artifact_revision(
-    const ParsedArtifactCandidate& parsed_deployment,
+    const ParsedArtifactCandidate &parsed_deployment,
     std::span<const QualifiedRuntimeProfile> qualified_runtime_profiles) {
   VerifiedEnvelopeParts parts = translate_errors([&] {
     return verify_parts(parsed_deployment, qualified_runtime_profiles);
   });
   return RevisionVerifiedDeploymentArtifact(
       std::move(parts.decoded.deployment_artifact_id),
-      std::move(parts.deployment_revision),
-      std::move(parts.decoded.cell_id), std::move(parts.decoded.name),
-      std::move(parts.decoded.description),
+      std::move(parts.deployment_revision), std::move(parts.decoded.cell_id),
+      std::move(parts.decoded.name), std::move(parts.decoded.description),
       std::move(parts.decoded.catalog_records), parts.graph,
       parts.applicability, std::move(parts.normalized_root));
 }
 
-}  // namespace manyforge::deployment
+} // namespace manyforge::deployment

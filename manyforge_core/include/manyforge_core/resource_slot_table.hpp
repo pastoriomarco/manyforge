@@ -48,8 +48,58 @@ struct ResourceSlotSnapshotDTO final {
   ResourceId resource_id;
   ResourceSlotState state{ResourceSlotState::kFree};
   std::optional<ResourceSlotOwnerDTO> owner;
+  /// Latest Kernel Stop generation that fenced this resource. It remains
+  /// monotonic across terminal acknowledgement/reuse so resource-addressed
+  /// Stop expectations never regain an older value accidentally.
+  StopGeneration stop_generation{0U};
 
   friend bool operator==(const ResourceSlotSnapshotDTO&, const ResourceSlotSnapshotDTO&) = default;
+};
+
+/// One coherent read of every resource slot and the generation that identifies
+/// those exact bytes. Stop resolution consumes this value rather than mixing a
+/// slot snapshot with a separately sampled admission generation.
+struct ResourceSlotTableSnapshotDTO final {
+  std::uint64_t operation_resource_generation{};
+  std::vector<ResourceSlotSnapshotDTO> slots;
+
+  friend bool operator==(const ResourceSlotTableSnapshotDTO&,
+                         const ResourceSlotTableSnapshotDTO&) = default;
+};
+
+/// One exact participant owner in an atomic multi-owner Stop fence. Rows are a
+/// canonical keyed set ordered by (operation_id, participant_id); resources are
+/// non-empty, sorted, unique, and disjoint across the complete request.
+struct ResourceSlotStopFenceOwnerDTO final {
+  ResourceSlotOwnerDTO expected_owner;
+  std::vector<ResourceId> resources;
+  OperationRevision next_operation_revision;
+
+  friend bool operator==(const ResourceSlotStopFenceOwnerDTO&,
+                         const ResourceSlotStopFenceOwnerDTO&) = default;
+};
+
+/// Canonical bounded all-or-nothing Stop fence. Orphan resources name retained
+/// external/effect-uncertain slots that are already admission-closed but must
+/// be stamped by the same Stop generation as the owned scopes.
+struct ResourceSlotStopFenceRequestDTO final {
+  std::uint64_t expected_operation_resource_generation{};
+  StopGeneration stop_generation{0U};
+  std::vector<ResourceSlotStopFenceOwnerDTO> owners;
+  std::vector<ResourceId> orphan_resources;
+
+  friend bool operator==(const ResourceSlotStopFenceRequestDTO&,
+                         const ResourceSlotStopFenceRequestDTO&) = default;
+};
+
+struct ResourceSlotStopFenceResultDTO final {
+  std::uint64_t operation_resource_generation{};
+  StopGeneration stop_generation{0U};
+  std::vector<ResourceSlotOwnerDTO> revised_owners;
+  std::vector<ResourceId> orphan_resources;
+
+  friend bool operator==(const ResourceSlotStopFenceResultDTO&,
+                         const ResourceSlotStopFenceResultDTO&) = default;
 };
 
 /// One atomic read of the operation/resource truth owned by a slot table.
@@ -63,14 +113,14 @@ struct ResourceSlotAdmissionSnapshotDTO final {
   std::uint64_t affected_active_operation_count{};
 };
 
-/// Fixed-inventory I6 Kernel reservation table.
+/// Fixed-inventory Kernel reservation table.
 ///
-/// I6 deliberately admits only one operation at a time while proving final
-/// resource identities. I8 can relax that admission rule without changing
-/// slot identity or owner evidence. Every mutation is atomic over the supplied
-/// resource set and no method performs I/O or waits. A configuration fence is
-/// not a second slot state: the injected admission gate serializes it with the
-/// real reservation while retaining the durable fence identity separately.
+/// Disjoint operation/participant owners may hold slots concurrently;
+/// overlapping scopes serialize at the exact resource slots. Every mutation
+/// is atomic over the supplied resource set and no method performs I/O or
+/// waits. A configuration fence is not a second slot state: the injected
+/// admission gate serializes it with the real reservation while retaining the
+/// durable fence identity separately.
 class ResourceSlotTable final {
  public:
   explicit ResourceSlotTable(
@@ -101,6 +151,13 @@ class ResourceSlotTable final {
       const ResourceSlotOwnerDTO& owner, const std::vector<ResourceId>& resources,
       ResourceSlotState next_state, OperationRevision next_operation_revision);
 
+  /// Atomically fence a canonical set of distinct operation-participant owners
+  /// plus any retained orphan/effect-uncertain resources. Every precondition is
+  /// checked before any slot changes; success advances the table generation
+  /// exactly once regardless of owner count.
+  [[nodiscard]] Result<ResourceSlotStopFenceResultDTO> stop_fence_batch(
+      const ResourceSlotStopFenceRequestDTO& request);
+
   /// Clear an exact pre-dispatch reservation or acknowledged terminal scope.
   [[nodiscard]] Result<void> release(const ResourceSlotOwnerDTO& owner,
                                      const std::vector<ResourceId>& resources);
@@ -123,23 +180,24 @@ class ResourceSlotTable final {
       std::vector<DomainActiveControlConfigurationDTO> active_control_configurations);
 
   [[nodiscard]] std::vector<ResourceSlotSnapshotDTO> snapshot() const;
+  [[nodiscard]] ResourceSlotTableSnapshotDTO coherent_snapshot() const;
   [[nodiscard]] ResourceSlotAdmissionSnapshotDTO admission_snapshot(
       const std::vector<ResourceId>& affected_resources) const;
-  [[nodiscard]] std::optional<OperationId> active_operation_id() const;
+  /// Canonical unique operation owners currently retained by at least one
+  /// slot. Orphan-unreconciled slots have no operation owner and are omitted.
+  [[nodiscard]] std::vector<OperationId> active_operation_ids() const;
   [[nodiscard]] bool shares_admission_mutex(
       const std::shared_ptr<std::recursive_mutex>& admission_mutex) const noexcept;
 
  private:
   [[nodiscard]] Result<void> validate_resource_set_locked(const std::vector<ResourceId>& resources,
                                                           std::vector<std::size_t>& indices) const;
-  void clear_active_operation_if_unused_locked();
   [[nodiscard]] Result<void> require_generation_available_locked() const;
   void advance_generation_locked() noexcept;
 
   std::shared_ptr<std::recursive_mutex> admission_mutex_;
   std::vector<ResourceSlotSnapshotDTO> slots_;
   std::vector<DomainActiveControlConfigurationDTO> active_control_configurations_;
-  std::optional<OperationId> active_operation_id_;
   std::uint64_t operation_resource_generation_{};
 };
 

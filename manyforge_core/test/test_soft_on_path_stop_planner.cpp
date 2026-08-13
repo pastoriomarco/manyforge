@@ -57,13 +57,13 @@ MotionInterruptStopProfileDTO soft_profile(double decel_s = 0.5) {
   profile.profile_id = "soft_profile";
   profile.stop_mode = MotionInterruptStopMode::kSoftOnPath;
   profile.deceleration_time_s = decel_s;
-  profile.max_stop_time_s = 1.0;
-  profile.per_joint_max_deceleration_rad_s2 = {
-      {"joint_1", 100.0},
-      {"joint_2", 100.0},
+  profile.per_joint_max_deceleration = {
+      {"joint_1", AngularAccelerationDTO{100.0}},
+      {"joint_2", AngularAccelerationDTO{100.0}},
   };
-  profile.allowed_fallback_modes = {
-      MotionInterruptStopMode::kSpringBackHold};
+  profile.allow_natural_completion_on_short_path = true;
+  profile.recoverable_substitution_mode =
+      MotionInterruptStopMode::kSpringBackHold;
   return profile;
 }
 
@@ -71,12 +71,14 @@ MotionInterruptStopProfileDTO spring_back_profile(double decel_s = 1.0) {
   auto profile = soft_profile(decel_s);
   profile.profile_id = "spring_back_profile";
   profile.stop_mode = MotionInterruptStopMode::kSpringBackHold;
+  profile.allow_natural_completion_on_short_path = false;
+  profile.recoverable_substitution_mode.reset();
   return profile;
 }
 
-TEST(SoftOnPathStopPlannerTest, StopProfileDefaultsAllowShortPathNaturalCompletion) {
+TEST(SoftOnPathStopPlannerTest, NormalizedStopProfileDefaultsConservatively) {
   MotionInterruptStopProfileDTO profile;
-  EXPECT_TRUE(profile.allow_natural_completion_on_short_path);
+  EXPECT_FALSE(profile.allow_natural_completion_on_short_path);
 }
 
 SoftOnPathInitialStateDTO measured_state_1d(double q, double qdot) {
@@ -133,8 +135,11 @@ TEST(SpringBackOnPathStopPlannerTest, BuildsTwoPhaseOnPathReturnToTripCursor) {
 
   ASSERT_TRUE(planned.ok()) << planned.error().message;
   const auto& plan = planned.value();
-  EXPECT_EQ(plan.diagnostics.at("spring_back_mode"), "on_path_two_phase");
-  EXPECT_EQ(plan.diagnostics.at("spring_back_return_profile"),
+  EXPECT_EQ(interrupt_structured_scalar_text(
+                plan.diagnostics.at("spring_back_mode")),
+            "on_path_two_phase");
+  EXPECT_EQ(interrupt_structured_scalar_text(
+                plan.diagnostics.at("spring_back_return_profile")),
             "quintic_rest_to_rest");
   ASSERT_GE(plan.replacement_trajectory.waypoints.size(), 4u);
   const auto& first = plan.replacement_trajectory.waypoints.front();
@@ -201,7 +206,8 @@ TEST(SpringBackOnPathStopPlannerTest, RejectsWhenForwardHalfCannotContainLeadIn)
 
 TEST(SpringBackOnPathStopPlannerTest, ForwardPhaseFailureEscalatesToHardStop) {
   auto profile = spring_back_profile(0.5);
-  profile.per_joint_max_deceleration_rad_s2 = {{"joint_1", 0.01}};
+  profile.per_joint_max_deceleration = {
+      {"joint_1", AngularAccelerationDTO{0.01}}};
   auto state = measured_state_1d(0.2, 0.5);
   SoftOnPathPlannerConfig config;
   config.stop_traj_delta_s = 0.05;
@@ -223,7 +229,8 @@ TEST(SpringBackOnPathStopPlannerTest, ForwardPhaseFailureEscalatesToHardStop) {
 
 TEST(SpringBackOnPathStopPlannerTest, RejectsReturnAccelerationLimitExceeded) {
   auto profile = spring_back_profile(1.0);
-  profile.per_joint_max_deceleration_rad_s2 = {{"joint_1", 3.0}};
+  profile.per_joint_max_deceleration = {
+      {"joint_1", AngularAccelerationDTO{3.0}}};
   auto state = measured_state_1d(0.2, 0.5);
   SoftOnPathPlannerConfig config;
   config.stop_traj_delta_s = 0.05;
@@ -270,9 +277,9 @@ TEST(SoftOnPathStopPlannerTest,
   // NOT injected into the seam (the old synthetic handoff did inject it, which is
   // what created the handoff excursion this seam removes).
   auto profile = soft_profile(0.5);
-  profile.per_joint_max_deceleration_rad_s2 = {
-      {"joint_1", 1000.0},
-      {"joint_2", 1000.0},
+  profile.per_joint_max_deceleration = {
+      {"joint_1", AngularAccelerationDTO{1000.0}},
+      {"joint_2", AngularAccelerationDTO{1000.0}},
   };
   SoftOnPathInitialStateDTO state;
   state.state.joint_names = {"joint_1", "joint_2"};
@@ -293,7 +300,8 @@ TEST(SoftOnPathStopPlannerTest,
   ASSERT_TRUE(planned.ok()) << planned.error().message;
   const auto& plan = planned.value();
   ASSERT_GE(plan.replacement_trajectory.waypoints.size(), 2u);
-  EXPECT_EQ(plan.diagnostics.at("seam"), "command_frame_lead_in");
+  EXPECT_EQ(interrupt_structured_scalar_text(plan.diagnostics.at("seam")),
+            "command_frame_lead_in");
   // Seam velocity is on-path: the off-path measured joint_2 velocity (1.0) is
   // NOT carried into the command.
   EXPECT_NEAR(
@@ -302,7 +310,9 @@ TEST(SoftOnPathStopPlannerTest,
       1e-9);
   // The measured deviation is still measured and reported (drift guard input).
   EXPECT_NEAR(plan.initial_velocity_deviation_rad_s, 1.0, 1e-9);
-  EXPECT_EQ(plan.diagnostics.at("initial_velocity_deviation_rad_s"), "1");
+  EXPECT_EQ(interrupt_structured_scalar_text(
+                plan.diagnostics.at("initial_velocity_deviation_rad_s")),
+            "1");
   // The lead-in rides the accepted path, so it adds no handoff excursion.
   EXPECT_NEAR(plan.path_deviation_max_rad, plan.initial_path_deviation_rad, 1e-9);
 }
@@ -385,7 +395,8 @@ TEST(SoftOnPathStopPlannerTest,
   ASSERT_TRUE(planned.ok()) << planned.error().message;
   const auto& plan = planned.value();
   EXPECT_TRUE(plan.used_model_velocity);
-  EXPECT_EQ(plan.diagnostics.at("seam"), "command_frame_lead_in");
+  EXPECT_EQ(interrupt_structured_scalar_text(plan.diagnostics.at("seam")),
+            "command_frame_lead_in");
   // The seam's first waypoint is the projected ON-PATH point: joint_2 snapped to
   // the path (0.0), not the measured 0.1 drift.
   const auto& anchor = plan.replacement_trajectory.waypoints.front();
@@ -446,7 +457,8 @@ TEST(SoftOnPathStopPlannerTest,
   // default quintic stop ramp for the same exact stop time. This proves the
   // planner's successful retimer wiring, not just the standalone helper.
   auto profile = soft_profile(1.0);
-  profile.per_joint_max_deceleration_rad_s2 = {{"joint_1", 3.0}};
+  profile.per_joint_max_deceleration = {
+      {"joint_1", AngularAccelerationDTO{3.0}}};
   auto state = measured_state_1d(0.0, 1.0);
   SoftOnPathPlannerConfig config;
   config.stop_traj_delta_s = 0.0;
@@ -457,9 +469,11 @@ TEST(SoftOnPathStopPlannerTest,
       plan_soft_on_path_stop(linear_trajectory_1d(), profile, state, config);
 
   ASSERT_TRUE(planned.ok()) << planned.error().message;
-  EXPECT_EQ(planned.value().diagnostics.at("soft_on_path_retimer"),
+  EXPECT_EQ(interrupt_structured_scalar_text(
+                planned.value().diagnostics.at("soft_on_path_retimer")),
             "jerk_limited");
-  EXPECT_EQ(planned.value().diagnostics.at("retimer_trigger_reason"),
+  EXPECT_EQ(interrupt_structured_scalar_text(
+                planned.value().diagnostics.at("retimer_trigger_reason")),
             "soft_on_path_jerk_limit_exceeded");
   const auto& final_wp = planned.value().replacement_trajectory.waypoints.back();
   EXPECT_NEAR(final_wp.time_from_start_s, 1.0, 2e-2);
@@ -474,7 +488,8 @@ TEST(SoftOnPathStopPlannerTest, EscalatesAccelBindWhenRetimerCannotProveDispatch
   // derivative-complete replacement, the planner escalates to hard stop rather
   // than emitting a limit-violating ramp or silently springing back.
   auto profile = soft_profile(1.15);
-  profile.per_joint_max_deceleration_rad_s2 = {{"joint_1", 0.5}};
+  profile.per_joint_max_deceleration = {
+      {"joint_1", AngularAccelerationDTO{0.5}}};
   auto state = measured_state_1d(0.2, 0.5);
   SoftOnPathPlannerConfig config;
   config.stop_traj_delta_s = 0.05;
@@ -502,9 +517,9 @@ TEST(SoftOnPathStopPlannerTest,
   // hold to the requested stop horizon, as long as the emitted trajectory still
   // passes the same acceleration/jerk validation.
   auto profile = soft_profile(1.0);
-  profile.per_joint_max_deceleration_rad_s2 = {
-      {"joint_1", 5.0},
-      {"joint_2", 5.0},
+  profile.per_joint_max_deceleration = {
+      {"joint_1", AngularAccelerationDTO{5.0}},
+      {"joint_2", AngularAccelerationDTO{5.0}},
   };
   SoftOnPathInitialStateDTO state;
   state.state.joint_names = {"joint_1", "joint_2"};
@@ -525,9 +540,15 @@ TEST(SoftOnPathStopPlannerTest,
 
   ASSERT_TRUE(planned.ok()) << planned.error().message;
   const auto& plan = planned.value();
-  EXPECT_EQ(plan.diagnostics.at("soft_on_path_retimer"), "ali_backtracking");
-  EXPECT_EQ(plan.diagnostics.at("prior_retimer"), "jerk_limited");
-  EXPECT_EQ(plan.diagnostics.at("ali_stopped_before_requested_time"), "true");
+  EXPECT_EQ(interrupt_structured_scalar_text(
+                plan.diagnostics.at("soft_on_path_retimer")),
+            "ali_backtracking");
+  EXPECT_EQ(interrupt_structured_scalar_text(
+                plan.diagnostics.at("prior_retimer")),
+            "jerk_limited");
+  EXPECT_EQ(interrupt_structured_scalar_text(
+                plan.diagnostics.at("ali_stopped_before_requested_time")),
+            "true");
   ASSERT_GE(plan.replacement_trajectory.waypoints.size(), 3u);
   const auto& final_wp = plan.replacement_trajectory.waypoints.back();
   EXPECT_NEAR(final_wp.time_from_start_s, 1.0, 1e-9);
@@ -557,7 +578,8 @@ TEST(SoftOnPathStopPlannerTest,
   ASSERT_TRUE(planned.ok()) << planned.error().message;
   EXPECT_NEAR(planned.value().initial_path_deviation_rad, 0.1, 1e-9);
   EXPECT_NEAR(planned.value().path_deviation_max_rad, 0.1, 1e-9);
-  EXPECT_EQ(planned.value().diagnostics.at("position_source"),
+  EXPECT_EQ(interrupt_structured_scalar_text(
+                planned.value().diagnostics.at("position_source")),
             "measured_feedback");
 
   config.max_initial_path_deviation_rad = 0.05;
@@ -604,7 +626,7 @@ TEST(SoftOnPathStopPlannerTest,
 TEST(SoftOnPathStopPlannerTest,
      RejectsRampThatWouldPassAcceptedTrajectoryEnd) {
   auto profile = soft_profile(0.5);
-  profile.allowed_fallback_modes.clear();
+  profile.recoverable_substitution_mode.reset();
   profile.allow_natural_completion_on_short_path = false;
   auto state = measured_state_1d(0.9, 0.8);
   SoftOnPathPlannerConfig config;
@@ -624,7 +646,7 @@ TEST(SoftOnPathStopPlannerTest,
 TEST(SoftOnPathStopPlannerTest,
      RecommendsNaturalCompletionWhenShortPathPolicyAllowsIt) {
   auto profile = soft_profile(0.5);
-  profile.allowed_fallback_modes.clear();
+  profile.recoverable_substitution_mode.reset();
   profile.allow_natural_completion_on_short_path = true;
   auto state = measured_state_1d(0.9, 0.8);
   SoftOnPathPlannerConfig config;
@@ -645,7 +667,7 @@ TEST(SoftOnPathStopPlannerTest,
 TEST(SoftOnPathStopPlannerTest,
      FeasibilityEnvelopeRejectsLateTripPointsBeforeDispatch) {
   auto profile = soft_profile(0.5);
-  profile.allowed_fallback_modes.clear();
+  profile.recoverable_substitution_mode.reset();
   profile.allow_natural_completion_on_short_path = false;
   SoftOnPathPlannerConfig config;
   config.stop_traj_delta_s = 0.05;
@@ -667,7 +689,7 @@ TEST(SoftOnPathStopPlannerTest,
 TEST(SoftOnPathStopPlannerTest,
      FeasibilityEnvelopeAllowsShortPathNaturalCompletionPolicy) {
   auto profile = soft_profile(0.5);
-  profile.allowed_fallback_modes.clear();
+  profile.recoverable_substitution_mode.reset();
   profile.allow_natural_completion_on_short_path = true;
   SoftOnPathPlannerConfig config;
   config.stop_traj_delta_s = 0.05;
@@ -679,14 +701,15 @@ TEST(SoftOnPathStopPlannerTest,
   ASSERT_TRUE(envelope.ok()) << envelope.error().message;
   EXPECT_GT(envelope.value().checked_samples, 0u);
   EXPECT_GT(envelope.value().natural_completion_samples, 0u);
-  EXPECT_EQ(envelope.value().diagnostics.at("natural_completion_samples"),
+  EXPECT_EQ(interrupt_structured_scalar_text(
+                envelope.value().diagnostics.at("natural_completion_samples")),
             std::to_string(envelope.value().natural_completion_samples));
 }
 
 TEST(SoftOnPathStopPlannerTest,
      FeasibilityEnvelopeDoesNotRecommendFallbackForMalformedProfile) {
   auto profile = soft_profile(0.5);
-  profile.per_joint_max_deceleration_rad_s2.erase("joint_2");
+  profile.per_joint_max_deceleration.erase("joint_2");
   SoftOnPathPlannerConfig config;
   config.stop_traj_delta_s = 0.05;
   config.sample_period_s = 0.05;
@@ -715,8 +738,9 @@ TEST(SoftOnPathStopPlannerTest,
 // refines, and stays bounded throughout.
 TEST(SoftOnPathStopPlannerTest, RampIsAccelerationAndJerkContinuousAtSeamAndTerminus) {
   auto profile = soft_profile(0.5);
-  profile.per_joint_max_deceleration_rad_s2 = {{"joint_1", 1000.0}};
-  profile.per_joint_max_deceleration_rad_s2["joint_2"] = 1000.0;
+  profile.per_joint_max_deceleration = {
+      {"joint_1", AngularAccelerationDTO{1000.0}},
+      {"joint_2", AngularAccelerationDTO{1000.0}}};
   SoftOnPathInitialStateDTO state = measured_state_1d(0.2, 1.0);
   SoftOnPathPlannerConfig config;
   config.stop_traj_delta_s = 0.0;   // no handoff offset: r=0 sample is the seam
@@ -893,7 +917,8 @@ TEST(SoftOnPathMinStopTimeTest, RejectsInvalidInputs) {
 // emit a limit-violating ramp.
 TEST(SoftOnPathStopPlannerTest, InfeasibleDecelerationTimeEscalatesToHardStop) {
   auto profile = soft_profile(/*decel_s=*/0.1);
-  profile.per_joint_max_deceleration_rad_s2 = {{"joint_1", 4.0}};
+  profile.per_joint_max_deceleration = {
+      {"joint_1", AngularAccelerationDTO{4.0}}};
   auto state = measured_state_1d(0.2, 1.0);  // s_trip = 1.0
   SoftOnPathPlannerConfig config;
   config.stop_traj_delta_s = 0.02;
@@ -913,7 +938,8 @@ TEST(SoftOnPathStopPlannerTest, InfeasibleDecelerationTimeEscalatesToHardStop) {
 // short-path spring-back fallback.
 TEST(SoftOnPathStopPlannerTest, CannotStopOnPathWithinBudgetEscalatesToHardStop) {
   auto profile = soft_profile(0.5);
-  profile.per_joint_max_deceleration_rad_s2 = {{"joint_1", 0.5}};
+  profile.per_joint_max_deceleration = {
+      {"joint_1", AngularAccelerationDTO{0.5}}};
   profile.allow_natural_completion_on_short_path = false;
   auto state = measured_state_1d(0.9, 0.8);
   SoftOnPathPlannerConfig config;
@@ -932,7 +958,8 @@ TEST(SoftOnPathStopPlannerTest, CannotStopOnPathButNaturalCompletionAllowed) {
   // Same unstoppable-on-path case, but the policy permits natural completion,
   // so the planner defers to letting the original motion finish (not hard stop).
   auto profile = soft_profile(0.5);
-  profile.per_joint_max_deceleration_rad_s2 = {{"joint_1", 0.5}};
+  profile.per_joint_max_deceleration = {
+      {"joint_1", AngularAccelerationDTO{0.5}}};
   profile.allow_natural_completion_on_short_path = true;
   auto state = measured_state_1d(0.9, 0.8);
   SoftOnPathPlannerConfig config;
@@ -953,7 +980,8 @@ TEST(SoftOnPathStopPlannerTest, CannotStopOnPathButNaturalCompletionAllowed) {
 TEST(SoftOnPathStopPlannerTest, HardStopDispositionHelperMatchesPlannerEscalations) {
   {
     auto profile = soft_profile(/*decel_s=*/0.1);
-    profile.per_joint_max_deceleration_rad_s2 = {{"joint_1", 4.0}};
+    profile.per_joint_max_deceleration = {
+        {"joint_1", AngularAccelerationDTO{4.0}}};
     profile.allow_natural_completion_on_short_path = false;
     SoftOnPathPlannerConfig config;
     config.stop_traj_delta_s = 0.02;
@@ -967,7 +995,8 @@ TEST(SoftOnPathStopPlannerTest, HardStopDispositionHelperMatchesPlannerEscalatio
   }
   {
     auto profile = soft_profile(0.5);
-    profile.per_joint_max_deceleration_rad_s2 = {{"joint_1", 0.5}};
+    profile.per_joint_max_deceleration = {
+        {"joint_1", AngularAccelerationDTO{0.5}}};
     profile.allow_natural_completion_on_short_path = true;
     SoftOnPathPlannerConfig config;
     config.stop_traj_delta_s = 0.05;

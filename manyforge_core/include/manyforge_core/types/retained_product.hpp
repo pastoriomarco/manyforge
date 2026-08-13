@@ -251,6 +251,7 @@ struct RetainedBundleDTO final {
   std::vector<DesiredControlConfigurationDTO>
       desired_control_configurations;
   std::vector<CapabilityProviderBindingDTO> capability_provider_bindings;
+  std::vector<CatalogRecordRefDTO> retained_policy_records;
   RetainedCompiledProductsDTO compiled_products;
   RetainedBundleProvenanceDTO provenance;
   std::optional<SiteOverlayRefDTO> selected_site_overlay_ref;

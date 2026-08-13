@@ -999,7 +999,8 @@ void register_deployment_candidate_bindings(py::module_& module) {
                const py::iterable& capability_provider_bindings,
                const py::iterable& external_resources,
                const py::iterable& stop_stage_parameters,
-               const py::iterable& commissioned_stop_interfaces) {
+               const py::iterable& commissioned_stop_interfaces,
+               const py::iterable& retained_policy_records) {
              auto bounded_configurations = bounded_values_from_python<
                  DesiredControlConfigurationDTO,
                  deployment::DeploymentApplicabilityCodecError>(
@@ -1030,20 +1031,27 @@ void register_deployment_candidate_bindings(py::module_& module) {
                  commissioned_stop_interfaces, 256U,
                  "commissioned_stop_interfaces",
                  "CommissionedStopInterfaceDTO");
+             auto bounded_policy_records = bounded_values_from_python<
+                 CatalogRecordRefDTO,
+                 deployment::DeploymentApplicabilityCodecError>(
+                 retained_policy_records, kMaxDeploymentApplicabilityRows,
+                 "retained_policy_records", "CatalogRecordRefDTO");
              return DeploymentApplicabilityInputsDTO{
                  std::move(site_overlay_ref),
                  std::move(bounded_configurations),
                  std::move(bounded_providers),
                  std::move(bounded_resources),
                  std::move(bounded_stop_parameters),
-                 std::move(bounded_commissioned)};
+                 std::move(bounded_commissioned),
+                 std::move(bounded_policy_records)};
            }),
            py::arg("site_overlay_ref"),
            py::arg("desired_control_configurations"),
            py::arg("capability_provider_bindings"),
            py::arg("external_resources"),
            py::arg("stop_stage_parameters"),
-           py::arg("commissioned_stop_interfaces"))
+           py::arg("commissioned_stop_interfaces"),
+           py::arg("retained_policy_records"))
       .def_readonly("site_overlay_ref",
                     &DeploymentApplicabilityInputsDTO::site_overlay_ref)
       .def_readonly(
@@ -1059,6 +1067,8 @@ void register_deployment_candidate_bindings(py::module_& module) {
       .def_readonly("commissioned_stop_interfaces",
                     &DeploymentApplicabilityInputsDTO::
                         commissioned_stop_interfaces)
+      .def_readonly("retained_policy_records",
+                    &DeploymentApplicabilityInputsDTO::retained_policy_records)
       .def(py::self == py::self)
       .def(py::self != py::self);
 

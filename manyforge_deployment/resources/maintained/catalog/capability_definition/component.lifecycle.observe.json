@@ -1,0 +1,7 @@
+{
+  "api_version": "manyforge.capability_definition.v1",
+  "capability_definition_revision": "sha256:deb6815e681e8879c172e1a7dcd03a55154bc599efaa35167c9d23f54d6b9104",
+  "capability_id": "component.lifecycle.observe",
+  "provider_binding_kind": "capability_provider_binding",
+  "scope": "control_domain"
+}

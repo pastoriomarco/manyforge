@@ -36,10 +36,26 @@ endif()
 # Core library
 add_library(manyforge_core
   src/addressed_observed_state_publication.cpp
+  src/build_owned_lifecycle_plan_catalog_source.cpp
+  src/component_lifecycle.cpp
+  src/component_lifecycle_snapshot.cpp
+  src/component_lifecycle_admission.cpp
+  src/component_lifecycle_coordinator.cpp
+  src/cclc_open_request.cpp
+  src/component_lifecycle_journal_codec.cpp
+  src/component_lifecycle_plan_catalog_codec.cpp
+  src/component_lifecycle_plan_evaluator.cpp
+  src/fixed_cclc_port_registry.cpp
+  src/controller_lifecycle.cpp
+  src/controller_lifecycle_evaluator.cpp
+  src/cclc_domain_reservation_table.cpp
   src/coordinate_state.cpp
   src/state_machine.cpp
   src/terminal_committer.cpp
   src/error_code_mapping.cpp
+  src/emergency_stop_acceptance_reserve.cpp
+  src/bounded_stop_control_executor.cpp
+  src/bounded_stop_stage_attempt_executor.cpp
   src/execution_admission_support.cpp
   src/execution_collision_support.cpp
   src/execution_correlation_tracker.cpp
@@ -58,6 +74,7 @@ add_library(manyforge_core
   src/motion_target_resolution.cpp
   src/operator_stop_worker.cpp
   src/operation_intent.cpp
+  src/participant_stop_stage.cpp
   src/pick_place_candidate.cpp
   src/pick_place_planning_owner.cpp
   src/pick_place_sequence.cpp
@@ -68,14 +85,30 @@ add_library(manyforge_core
   src/observed_robot_state_provider.cpp
   src/pose_math.cpp
   src/resource_addressed_execution_kernel.cpp
+  src/resolved_stop_base_plan_codec.cpp
+  src/resolved_stop_base_plan_decoder.cpp
+  src/prepared_participant_stop_plan_codec.cpp
+  src/prepared_planning_codec.cpp
+  src/prepared_motion_evidence_codec.cpp
+  src/prepared_operation_participant_codec.cpp
+  src/route_selection.cpp
+  src/route_selection_owner.cpp
   src/resource_slot_table.cpp
   src/runtime_collision_monitor.cpp
   src/runtime_participant_binding.cpp
+  src/runtime_participant_stop_readiness.cpp
   src/runtime_participant_registry.cpp
   src/runtime_collision_query_session.cpp
   src/runtime_collision_lookahead_session.cpp
   src/scene_snapshot_lease.cpp
   src/scene_frame_resolution.cpp
+  src/stop_intent.cpp
+  src/stop_scope_resolver.cpp
+  src/stop_fault_recovery.cpp
+  src/stop_surveillance.cpp
+  src/stop_terminal_reducer.cpp
+  src/stop_terminal_state.cpp
+  src/stop_journal_projection_codec.cpp
   src/stop_policy.cpp
   src/trajectory_cache.cpp
   src/trajectory_cache_intent.cpp
@@ -90,6 +123,7 @@ add_library(manyforge_core
   src/logical_scene_projection.cpp
   src/interrupt_manager.cpp
   src/soft_on_path_stop_planner.cpp
+  src/stop_profile_mapper.cpp
   src/execution_kernel.cpp
 )
 target_include_directories(manyforge_core PUBLIC
@@ -104,10 +138,10 @@ target_link_libraries(manyforge_core PRIVATE manyforge::content_identity)
 # static lib with PIC so a single .a serves both link paths.
 set_target_properties(manyforge_core PROPERTIES POSITION_INDEPENDENT_CODE ON)
 
-# The durable I6 operation journal is an optional concrete adapter. Keep it
-# outside the pure Core target so DTO/compiler consumers do not acquire a
-# persistence dependency. It is enabled for a standalone Core build and by
-# execution hosts that explicitly select this adapter.
+# The durable operation and CCLC journals are independent optional concrete
+# adapters. Keep both outside the pure Core target so DTO/compiler consumers do
+# not acquire a persistence dependency. A standalone Core build enables both;
+# composed owners explicitly select only the adapter they use.
 set(_MANYFORGE_CORE_SQLITE_JOURNAL_DEFAULT OFF)
 if(CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
   set(_MANYFORGE_CORE_SQLITE_JOURNAL_DEFAULT ON)
@@ -115,9 +149,15 @@ endif()
 option(MANYFORGE_CORE_BUILD_SQLITE_OPERATION_JOURNAL
        "Build the SQLite-backed durable operation journal"
        ${_MANYFORGE_CORE_SQLITE_JOURNAL_DEFAULT})
+option(MANYFORGE_CORE_BUILD_SQLITE_CCLC_JOURNAL
+       "Build the SQLite-backed durable CCLC journal"
+       ${_MANYFORGE_CORE_SQLITE_JOURNAL_DEFAULT})
 unset(_MANYFORGE_CORE_SQLITE_JOURNAL_DEFAULT)
-if(MANYFORGE_CORE_BUILD_SQLITE_OPERATION_JOURNAL)
+if(MANYFORGE_CORE_BUILD_SQLITE_OPERATION_JOURNAL OR
+   MANYFORGE_CORE_BUILD_SQLITE_CCLC_JOURNAL)
   find_package(SQLite3 3.37 REQUIRED)
+endif()
+if(MANYFORGE_CORE_BUILD_SQLITE_OPERATION_JOURNAL)
   add_library(manyforge_core_sqlite_operation_journal
     src/sqlite_operation_journal.cpp)
   add_library(manyforge::core_sqlite_operation_journal ALIAS
@@ -129,6 +169,50 @@ if(MANYFORGE_CORE_BUILD_SQLITE_OPERATION_JOURNAL)
     PUBLIC manyforge_core
     PRIVATE SQLite::SQLite3 manyforge::content_identity)
   set_target_properties(manyforge_core_sqlite_operation_journal PROPERTIES
+    POSITION_INDEPENDENT_CODE ON)
+endif()
+
+if(MANYFORGE_CORE_BUILD_SQLITE_CCLC_JOURNAL)
+  add_library(manyforge_core_sqlite_cclc_journal
+    src/sqlite_cclc_journal.cpp)
+  add_library(manyforge::core_sqlite_cclc_journal ALIAS
+    manyforge_core_sqlite_cclc_journal)
+  target_include_directories(manyforge_core_sqlite_cclc_journal PUBLIC
+    $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+    $<INSTALL_INTERFACE:include>)
+  target_link_libraries(manyforge_core_sqlite_cclc_journal
+    PUBLIC manyforge_core
+    PRIVATE SQLite::SQLite3 manyforge::content_identity)
+  set_target_properties(manyforge_core_sqlite_cclc_journal PROPERTIES
+    POSITION_INDEPENDENT_CODE ON)
+endif()
+
+# The resolved Stop base-plan repository is another independent optional
+# concrete adapter. Keep durable filesystem effects outside the pure Core
+# target and let each composed owner select the adapter explicitly.
+set(_MANYFORGE_CORE_STOP_PLAN_REPOSITORY_DEFAULT OFF)
+if(CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
+  set(_MANYFORGE_CORE_STOP_PLAN_REPOSITORY_DEFAULT ON)
+endif()
+option(MANYFORGE_CORE_BUILD_FILESYSTEM_RESOLVED_STOP_BASE_PLAN_REPOSITORY
+       "Build the POSIX durable resolved Stop base-plan repository"
+       ${_MANYFORGE_CORE_STOP_PLAN_REPOSITORY_DEFAULT})
+unset(_MANYFORGE_CORE_STOP_PLAN_REPOSITORY_DEFAULT)
+if(MANYFORGE_CORE_BUILD_FILESYSTEM_RESOLVED_STOP_BASE_PLAN_REPOSITORY)
+  add_library(manyforge_core_filesystem_resolved_stop_base_plan_repository
+    src/filesystem_resolved_stop_base_plan_repository.cpp)
+  add_library(manyforge::core_filesystem_resolved_stop_base_plan_repository
+    ALIAS manyforge_core_filesystem_resolved_stop_base_plan_repository)
+  target_include_directories(
+    manyforge_core_filesystem_resolved_stop_base_plan_repository PUBLIC
+    $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+    $<INSTALL_INTERFACE:include>)
+  target_link_libraries(
+    manyforge_core_filesystem_resolved_stop_base_plan_repository
+    PUBLIC manyforge_core
+    PRIVATE manyforge::content_identity)
+  set_target_properties(
+    manyforge_core_filesystem_resolved_stop_base_plan_repository PROPERTIES
     POSITION_INDEPENDENT_CODE ON)
 endif()
 
@@ -199,11 +283,81 @@ if(BUILD_TESTING)
   gtest_discover_tests(test_active_control_configuration
     PROPERTIES TIMEOUT ${MANYFORGE_GTEST_TIMEOUT_SECONDS})
 
+  add_executable(test_component_lifecycle
+    test/test_component_lifecycle.cpp)
+  target_link_libraries(test_component_lifecycle PRIVATE
+    manyforge_core GTest::gtest_main)
+  gtest_discover_tests(test_component_lifecycle
+    PROPERTIES TIMEOUT ${MANYFORGE_GTEST_TIMEOUT_SECONDS})
+
+  add_executable(test_component_lifecycle_admission
+    test/test_component_lifecycle_admission.cpp)
+  target_link_libraries(test_component_lifecycle_admission PRIVATE
+    manyforge_core GTest::gtest_main)
+  gtest_discover_tests(test_component_lifecycle_admission
+    PROPERTIES TIMEOUT ${MANYFORGE_GTEST_TIMEOUT_SECONDS})
+
+  add_executable(test_cclc_open_request
+    test/test_cclc_open_request.cpp)
+  target_link_libraries(test_cclc_open_request PRIVATE
+    manyforge_core manyforge::content_identity GTest::gtest_main)
+  gtest_discover_tests(test_cclc_open_request
+    PROPERTIES TIMEOUT ${MANYFORGE_GTEST_TIMEOUT_SECONDS})
+
+  add_executable(test_component_lifecycle_plan_evaluator
+    test/test_component_lifecycle_plan_evaluator.cpp)
+  target_link_libraries(test_component_lifecycle_plan_evaluator PRIVATE
+    manyforge_core GTest::gtest_main)
+  gtest_discover_tests(test_component_lifecycle_plan_evaluator
+    PROPERTIES TIMEOUT ${MANYFORGE_GTEST_TIMEOUT_SECONDS})
+
+  add_executable(test_controller_lifecycle_evaluator
+    test/test_controller_lifecycle_evaluator.cpp)
+  target_link_libraries(test_controller_lifecycle_evaluator PRIVATE
+    manyforge_core GTest::gtest_main)
+  gtest_discover_tests(test_controller_lifecycle_evaluator
+    PROPERTIES TIMEOUT ${MANYFORGE_GTEST_TIMEOUT_SECONDS})
+
+  add_executable(test_fixed_cclc_port_registry
+    test/test_fixed_cclc_port_registry.cpp)
+  target_link_libraries(test_fixed_cclc_port_registry PRIVATE
+    manyforge_core GTest::gtest_main)
+  gtest_discover_tests(test_fixed_cclc_port_registry
+    PROPERTIES TIMEOUT ${MANYFORGE_GTEST_TIMEOUT_SECONDS})
+
+  add_executable(test_route_selection
+    test/test_route_selection.cpp)
+  target_link_libraries(test_route_selection PRIVATE
+    manyforge_core GTest::gtest_main)
+  gtest_discover_tests(test_route_selection
+    PROPERTIES TIMEOUT ${MANYFORGE_GTEST_TIMEOUT_SECONDS})
+
+  add_executable(test_component_lifecycle_plan_catalog_codec
+    test/test_component_lifecycle_plan_catalog_codec.cpp)
+  target_link_libraries(test_component_lifecycle_plan_catalog_codec PRIVATE
+    manyforge_core GTest::gtest_main)
+  gtest_discover_tests(test_component_lifecycle_plan_catalog_codec
+    PROPERTIES TIMEOUT ${MANYFORGE_GTEST_TIMEOUT_SECONDS})
+
+  add_executable(test_cclc_domain_reservation_table
+    test/test_cclc_domain_reservation_table.cpp)
+  target_link_libraries(test_cclc_domain_reservation_table PRIVATE
+    manyforge_core GTest::gtest_main)
+  gtest_discover_tests(test_cclc_domain_reservation_table
+    PROPERTIES TIMEOUT ${MANYFORGE_GTEST_TIMEOUT_SECONDS})
+
   add_executable(test_stop_control
     test/test_stop_control.cpp)
   target_link_libraries(test_stop_control PRIVATE
     manyforge_core GTest::gtest_main)
   gtest_discover_tests(test_stop_control
+    PROPERTIES TIMEOUT ${MANYFORGE_GTEST_TIMEOUT_SECONDS})
+
+  add_executable(test_stop_profile_mapper
+    test/test_stop_profile_mapper.cpp)
+  target_link_libraries(test_stop_profile_mapper PRIVATE
+    manyforge_core GTest::gtest_main)
+  gtest_discover_tests(test_stop_profile_mapper
     PROPERTIES TIMEOUT ${MANYFORGE_GTEST_TIMEOUT_SECONDS})
 
   add_executable(test_coordinate_state
@@ -234,6 +388,122 @@ if(BUILD_TESTING)
   gtest_discover_tests(test_resource_slot_table
     PROPERTIES TIMEOUT ${MANYFORGE_GTEST_TIMEOUT_SECONDS})
 
+  add_executable(test_emergency_stop_acceptance_reserve
+    test/test_emergency_stop_acceptance_reserve.cpp)
+  target_link_libraries(test_emergency_stop_acceptance_reserve PRIVATE
+    manyforge_core GTest::gtest_main)
+  gtest_discover_tests(test_emergency_stop_acceptance_reserve
+    PROPERTIES TIMEOUT ${MANYFORGE_GTEST_TIMEOUT_SECONDS})
+
+  add_executable(test_bounded_stop_control_executor
+    test/test_bounded_stop_control_executor.cpp)
+  target_link_libraries(test_bounded_stop_control_executor PRIVATE
+    manyforge_core GTest::gtest_main)
+  gtest_discover_tests(test_bounded_stop_control_executor
+    PROPERTIES TIMEOUT ${MANYFORGE_GTEST_TIMEOUT_SECONDS})
+
+  add_executable(test_bounded_stop_stage_attempt_executor
+    test/test_bounded_stop_stage_attempt_executor.cpp)
+  target_link_libraries(test_bounded_stop_stage_attempt_executor PRIVATE
+    manyforge_core GTest::gtest_main)
+  gtest_discover_tests(test_bounded_stop_stage_attempt_executor
+    PROPERTIES TIMEOUT ${MANYFORGE_GTEST_TIMEOUT_SECONDS})
+
+  add_executable(test_stop_intent
+    test/test_stop_intent.cpp)
+  target_link_libraries(test_stop_intent PRIVATE
+    manyforge_core GTest::gtest_main)
+  gtest_discover_tests(test_stop_intent
+    PROPERTIES TIMEOUT ${MANYFORGE_GTEST_TIMEOUT_SECONDS})
+
+  add_executable(test_stop_scope_resolver
+    test/test_stop_scope_resolver.cpp)
+  target_link_libraries(test_stop_scope_resolver PRIVATE
+    manyforge_core GTest::gtest_main)
+  gtest_discover_tests(test_stop_scope_resolver
+    PROPERTIES TIMEOUT ${MANYFORGE_GTEST_TIMEOUT_SECONDS})
+
+  add_executable(test_participant_stop_stage
+    test/test_participant_stop_stage.cpp)
+  target_link_libraries(test_participant_stop_stage PRIVATE
+    manyforge_core manyforge::content_identity GTest::gtest_main)
+  gtest_discover_tests(test_participant_stop_stage
+    PROPERTIES TIMEOUT ${MANYFORGE_GTEST_TIMEOUT_SECONDS})
+
+  add_executable(test_stop_terminal_reducer
+    test/test_stop_terminal_reducer.cpp)
+  target_link_libraries(test_stop_terminal_reducer PRIVATE
+    manyforge_core manyforge::content_identity GTest::gtest_main)
+  gtest_discover_tests(test_stop_terminal_reducer
+    PROPERTIES TIMEOUT ${MANYFORGE_GTEST_TIMEOUT_SECONDS})
+
+  add_executable(test_stop_terminal_state
+    test/test_stop_terminal_state.cpp)
+  target_link_libraries(test_stop_terminal_state PRIVATE
+    manyforge_core GTest::gtest_main)
+  gtest_discover_tests(test_stop_terminal_state
+    PROPERTIES TIMEOUT ${MANYFORGE_GTEST_TIMEOUT_SECONDS})
+
+  add_executable(test_stop_surveillance
+    test/test_stop_surveillance.cpp)
+  target_link_libraries(test_stop_surveillance PRIVATE
+    manyforge_core manyforge::content_identity GTest::gtest_main)
+  gtest_discover_tests(test_stop_surveillance
+    PROPERTIES TIMEOUT ${MANYFORGE_GTEST_TIMEOUT_SECONDS})
+
+  add_executable(test_stop_fault_recovery
+    test/test_stop_fault_recovery.cpp)
+  target_link_libraries(test_stop_fault_recovery PRIVATE
+    manyforge_core manyforge::content_identity GTest::gtest_main)
+  gtest_discover_tests(test_stop_fault_recovery
+    PROPERTIES TIMEOUT ${MANYFORGE_GTEST_TIMEOUT_SECONDS})
+
+  add_executable(test_stop_journal_projection_codec
+    test/test_stop_journal_projection_codec.cpp)
+  target_link_libraries(test_stop_journal_projection_codec PRIVATE
+    manyforge_core manyforge::content_identity GTest::gtest_main)
+  gtest_discover_tests(test_stop_journal_projection_codec
+    PROPERTIES TIMEOUT ${MANYFORGE_GTEST_TIMEOUT_SECONDS})
+
+  add_executable(test_resolved_stop_base_plan_codec
+    test/test_resolved_stop_base_plan_codec.cpp)
+  target_link_libraries(test_resolved_stop_base_plan_codec PRIVATE
+    manyforge_core manyforge::content_identity GTest::gtest_main)
+  gtest_discover_tests(test_resolved_stop_base_plan_codec
+    PROPERTIES TIMEOUT ${MANYFORGE_GTEST_TIMEOUT_SECONDS})
+
+  add_executable(test_prepared_planning_codec
+    test/test_prepared_planning_codec.cpp)
+  target_link_libraries(test_prepared_planning_codec PRIVATE
+    manyforge_core manyforge::content_identity GTest::gtest_main)
+  gtest_discover_tests(test_prepared_planning_codec
+    PROPERTIES TIMEOUT ${MANYFORGE_GTEST_TIMEOUT_SECONDS})
+
+  add_executable(test_prepared_motion_evidence_codec
+    test/test_prepared_motion_evidence_codec.cpp)
+  target_link_libraries(test_prepared_motion_evidence_codec PRIVATE
+    manyforge_core manyforge::content_identity GTest::gtest_main)
+  gtest_discover_tests(test_prepared_motion_evidence_codec
+    PROPERTIES TIMEOUT ${MANYFORGE_GTEST_TIMEOUT_SECONDS})
+
+  add_executable(test_prepared_operation_participant_codec
+    test/test_prepared_operation_participant_codec.cpp)
+  target_link_libraries(test_prepared_operation_participant_codec PRIVATE
+    manyforge_core manyforge::content_identity GTest::gtest_main)
+  gtest_discover_tests(test_prepared_operation_participant_codec
+    PROPERTIES TIMEOUT ${MANYFORGE_GTEST_TIMEOUT_SECONDS})
+
+  if(MANYFORGE_CORE_BUILD_FILESYSTEM_RESOLVED_STOP_BASE_PLAN_REPOSITORY)
+    add_executable(test_filesystem_resolved_stop_base_plan_repository
+      test/test_filesystem_resolved_stop_base_plan_repository.cpp)
+    target_link_libraries(
+      test_filesystem_resolved_stop_base_plan_repository PRIVATE
+      manyforge_core_filesystem_resolved_stop_base_plan_repository
+      GTest::gtest_main)
+    gtest_discover_tests(test_filesystem_resolved_stop_base_plan_repository
+      PROPERTIES TIMEOUT ${MANYFORGE_GTEST_TIMEOUT_SECONDS})
+  endif()
+
   add_executable(test_resource_addressed_execution_kernel
     test/test_resource_addressed_execution_kernel.cpp)
   target_link_libraries(test_resource_addressed_execution_kernel PRIVATE
@@ -248,6 +518,30 @@ if(BUILD_TESTING)
       manyforge_core_sqlite_operation_journal GTest::gtest_main)
     gtest_discover_tests(test_sqlite_operation_journal
       PROPERTIES TIMEOUT ${MANYFORGE_GTEST_TIMEOUT_SECONDS})
+
+  endif()
+
+  if(MANYFORGE_CORE_BUILD_SQLITE_CCLC_JOURNAL)
+    add_executable(test_sqlite_cclc_journal
+      test/test_sqlite_cclc_journal.cpp)
+    target_link_libraries(test_sqlite_cclc_journal PRIVATE
+      manyforge_core_sqlite_cclc_journal GTest::gtest_main)
+    gtest_discover_tests(test_sqlite_cclc_journal
+      PROPERTIES TIMEOUT ${MANYFORGE_GTEST_TIMEOUT_SECONDS})
+
+    add_executable(test_component_lifecycle_coordinator
+      test/test_component_lifecycle_coordinator.cpp)
+    target_link_libraries(test_component_lifecycle_coordinator PRIVATE
+      manyforge_core_sqlite_cclc_journal GTest::gtest_main)
+    gtest_discover_tests(test_component_lifecycle_coordinator
+      PROPERTIES TIMEOUT ${MANYFORGE_GTEST_TIMEOUT_SECONDS})
+
+    add_executable(test_route_selection_coordinator
+      test/test_route_selection_coordinator.cpp)
+    target_link_libraries(test_route_selection_coordinator PRIVATE
+      manyforge_core_sqlite_cclc_journal GTest::gtest_main)
+    gtest_discover_tests(test_route_selection_coordinator
+      PROPERTIES TIMEOUT ${MANYFORGE_GTEST_TIMEOUT_SECONDS})
   endif()
 
   add_executable(test_runtime_participant_binding
@@ -255,6 +549,13 @@ if(BUILD_TESTING)
   target_link_libraries(test_runtime_participant_binding PRIVATE
     manyforge_core GTest::gtest_main)
   gtest_discover_tests(test_runtime_participant_binding
+    PROPERTIES TIMEOUT ${MANYFORGE_GTEST_TIMEOUT_SECONDS})
+
+  add_executable(test_runtime_participant_stop_readiness
+    test/test_runtime_participant_stop_readiness.cpp)
+  target_link_libraries(test_runtime_participant_stop_readiness PRIVATE
+    manyforge_core GTest::gtest_main)
+  gtest_discover_tests(test_runtime_participant_stop_readiness
     PROPERTIES TIMEOUT ${MANYFORGE_GTEST_TIMEOUT_SECONDS})
 
   add_executable(test_runtime_participant_registry

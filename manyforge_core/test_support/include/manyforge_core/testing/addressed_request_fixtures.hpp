@@ -52,7 +52,7 @@ inline ResolvedExecutionBindingDTO make_test_execution_binding(
           ProviderInstanceId("planner-provider:test"),
           ProviderManifestId("planner-provider-manifest:test"),
           ProviderManifestRevision("planner-provider-revision:test"),
-          RuntimeEpoch("planner-runtime-epoch:test")},
+          RuntimeUnitId("runtime-unit:test"), RuntimeEpoch("planner-runtime-epoch:test")},
       {PlannerModelBindingDTO{model_id, model_revision}},
       PlannerModelGroupBindingDTO{ModelGroupRoleId("model-group-role:arm"), model_id,
                                   model_revision, "compiled_arm_group", std::move(joint_names)},

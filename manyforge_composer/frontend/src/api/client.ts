@@ -27,6 +27,12 @@ import {
   parseAssistantModeIndex,
   parseAssistantProviderStatus,
 } from './assistantParsers';
+import {
+  parseCCLCAdmission,
+  parseCCLCComponentSnapshot,
+  parseCCLCRouteTemplateSet,
+  parseCCLCStatusEnvelope,
+} from './cclcParsers';
 import type {
   ArtifactKind,
   AppliedProgramSelection,
@@ -67,6 +73,14 @@ import type {
   AssistantProviderStatus,
   AssistantRequestInput,
 } from '../types/assistant';
+import type {
+  CCLCAdmission,
+  CCLCComponentSnapshot,
+  CCLCLifecycleRequestBody,
+  CCLCRouteRequestBody,
+  CCLCRouteTemplateSet,
+  CCLCTransactionStatus,
+} from '../types/cclc';
 
 const BASE_URL = import.meta.env.VITE_API_URL || '';
 
@@ -198,6 +212,100 @@ export const api = {
   sourceModel: {
     get: (signal?: AbortSignal): Promise<SourceModelProjection> =>
       requestJson('/api/source-model', parseSourceModelProjection, signal),
+  },
+  cclc: {
+    component: (
+      componentId: string,
+      signal?: AbortSignal,
+    ): Promise<CCLCComponentSnapshot> => requestJson(
+      `/api/cclc/components/${encodeURIComponent(componentId)}`,
+      (value) => {
+        const snapshot = parseCCLCComponentSnapshot(value);
+        if (snapshot.componentId !== componentId) {
+          throw new Error('component snapshot does not match its request');
+        }
+        return snapshot;
+      },
+      signal,
+    ),
+    routeTemplates: (
+      componentId: string,
+      signal?: AbortSignal,
+    ): Promise<CCLCRouteTemplateSet> => requestJson(
+      `/api/cclc/components/${encodeURIComponent(componentId)}/route-templates`,
+      (value) => {
+        const templates = parseCCLCRouteTemplateSet(value);
+        if (templates.componentId !== componentId) {
+          throw new Error('route templates do not match their request');
+        }
+        return templates;
+      },
+      signal,
+    ),
+    submitLifecycle: (
+      request: CCLCLifecycleRequestBody,
+      signal?: AbortSignal,
+    ): Promise<CCLCAdmission> => requestJson(
+      '/api/cclc/lifecycle/requests',
+      (value) => {
+        const result = parseCCLCAdmission(value, 'lifecycle');
+        if (
+          result.requestId !== null
+          && result.requestId !== request.request_context.request_id
+        ) {
+          throw new Error('lifecycle acceptance does not match its request');
+        }
+        return result;
+      },
+      signal,
+      { method: 'POST', body: JSON.stringify(request) },
+    ),
+    lifecycleStatus: (
+      transactionId: string,
+      signal?: AbortSignal,
+    ): Promise<CCLCTransactionStatus | null> => requestJson(
+      `/api/cclc/lifecycle/transactions/${encodeURIComponent(transactionId)}`,
+      (value) => {
+        const status = parseCCLCStatusEnvelope(value, 'lifecycle');
+        if (status !== null && status.transactionId !== transactionId) {
+          throw new Error('lifecycle status does not match its request');
+        }
+        return status;
+      },
+      signal,
+    ),
+    submitRoute: (
+      request: CCLCRouteRequestBody,
+      signal?: AbortSignal,
+    ): Promise<CCLCAdmission> => requestJson(
+      '/api/cclc/routes/requests',
+      (value) => {
+        const result = parseCCLCAdmission(value, 'route');
+        if (
+          result.requestId !== null
+          && result.requestId !== request.request_context.request_id
+        ) {
+          throw new Error('route acceptance does not match its request');
+        }
+        return result;
+      },
+      signal,
+      { method: 'POST', body: JSON.stringify(request) },
+    ),
+    routeStatus: (
+      transactionId: string,
+      signal?: AbortSignal,
+    ): Promise<CCLCTransactionStatus | null> => requestJson(
+      `/api/cclc/routes/transactions/${encodeURIComponent(transactionId)}`,
+      (value) => {
+        const status = parseCCLCStatusEnvelope(value, 'route');
+        if (status !== null && status.transactionId !== transactionId) {
+          throw new Error('route status does not match its request');
+        }
+        return status;
+      },
+      signal,
+    ),
   },
   programWorkspace: {
     get: (signal?: AbortSignal): Promise<ProgramWorkspaceResponse> =>

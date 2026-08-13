@@ -58,6 +58,7 @@ struct PlannerCapabilityBindingDTO final {
   ProviderInstanceId provider_instance_id;
   ProviderManifestId provider_manifest_id;
   ProviderManifestRevision provider_manifest_revision;
+  RuntimeUnitId provider_runtime_unit_id;
   RuntimeEpoch provider_runtime_epoch;
 
   friend bool operator==(const PlannerCapabilityBindingDTO&,

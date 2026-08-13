@@ -1,0 +1,9 @@
+# Canonical manyforge.cclc_open_request.v1 JSON. The ROS adapter validates the
+# exact closed Core envelope and stamps ROS transport attribution itself.
+string<=4194304 canonical_request_json
+---
+bool completed
+# Canonical manyforge.cclc_open_response.v1 JSON when completed is true.
+string<=8388608 canonical_response_json
+string<=128 error_code
+string<=512 error_message

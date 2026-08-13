@@ -244,17 +244,33 @@ core::RuntimeParticipantBindingDTO build_runtime_participant_binding_dto(
     return fact.runtime_epoch;
   };
   const auto find_provider_epoch =
-      [&](const core::ProviderInstanceId &id) -> const core::RuntimeEpoch & {
+      [&](const core::ProviderInstanceId &id,
+          const core::RuntimeUnitId &runtime_unit_id)
+      -> const core::RuntimeEpoch & {
     const auto &fact = require_one(
         active_facts.provider_epochs,
         [&](const RuntimeProviderEpochFactDTO &candidate) {
           return candidate.provider_instance_id == id;
         },
         "provider runtime epoch");
-    if (fact.runtime_epoch.empty()) {
-      fail("runtime participant has an empty provider runtime epoch");
+    if (fact.provider_runtime_unit_id != runtime_unit_id ||
+        fact.runtime_epoch.empty()) {
+      fail("runtime participant provider occurrence differs from its retained runtime unit");
     }
     return fact.runtime_epoch;
+  };
+  const auto find_provider_occurrence = [&](const core::ProviderInstanceId &id)
+      -> const RuntimeProviderEpochFactDTO & {
+    const auto &fact = require_one(
+        active_facts.provider_epochs,
+        [&](const RuntimeProviderEpochFactDTO &candidate) {
+          return candidate.provider_instance_id == id;
+        },
+        "provider runtime occurrence");
+    if (fact.provider_runtime_unit_id.empty() || fact.runtime_epoch.empty()) {
+      fail("runtime participant has an incomplete provider runtime occurrence");
+    }
+    return fact;
   };
 
   std::vector<core::RuntimeModelGroupBindingDTO> model_groups;
@@ -361,8 +377,7 @@ core::RuntimeParticipantBindingDTO build_runtime_participant_binding_dto(
         [&](const auto &candidate) {
           return candidate.control_route_id == active_facts.control_route_id;
         });
-    if (qualified_scale !=
-        binding.runtime_scale_route_qualifications.end()) {
+    if (qualified_scale != binding.runtime_scale_route_qualifications.end()) {
       runtime_scale_qualification = *qualified_scale;
     }
     control_path = core::RuntimeControlPathDTO{
@@ -381,7 +396,9 @@ core::RuntimeParticipantBindingDTO build_runtime_participant_binding_dto(
         binding.provider_instance_id,
         binding.provider_manifest_id,
         binding.provider_manifest_revision,
-        find_provider_epoch(binding.provider_instance_id),
+        binding.provider_runtime_unit_id,
+        find_provider_epoch(binding.provider_instance_id,
+                            binding.provider_runtime_unit_id),
         binding.state_authority_id,
         binding.state_authority_class,
         binding.stop_evidence_policy_id,
@@ -393,6 +410,9 @@ core::RuntimeParticipantBindingDTO build_runtime_participant_binding_dto(
   std::optional<core::RuntimeCapabilityProviderPathDTO> provider_path;
   if (target.capability_provider_binding().has_value()) {
     const auto &provider = *target.capability_provider_binding();
+    const auto &occurrence =
+        find_provider_occurrence(provider.provider_instance_id);
+    required_runtime_units.insert(occurrence.provider_runtime_unit_id);
     provider_path = core::RuntimeCapabilityProviderPathDTO{
         target.capability().capability_id,
         target.capability().capability_definition_revision,
@@ -401,7 +421,8 @@ core::RuntimeParticipantBindingDTO build_runtime_participant_binding_dto(
         provider.provider_instance_id,
         provider.provider_manifest_id,
         provider.provider_manifest_revision,
-        find_provider_epoch(provider.provider_instance_id)};
+        occurrence.provider_runtime_unit_id,
+        occurrence.runtime_epoch};
   }
 
   std::vector<core::RuntimeCapabilityProviderPathDTO> supporting_paths;
@@ -427,6 +448,9 @@ core::RuntimeParticipantBindingDTO build_runtime_participant_binding_dto(
     }
     const auto &capability = supporting.capability();
     const auto &provider = *supporting.capability_provider_binding();
+    const auto &occurrence =
+        find_provider_occurrence(provider.provider_instance_id);
+    required_runtime_units.insert(occurrence.provider_runtime_unit_id);
     const bool exact_support_scope = std::visit(
         [&](const auto &provider_target) {
           using Target = std::remove_cvref_t<decltype(provider_target)>;
@@ -439,8 +463,8 @@ core::RuntimeParticipantBindingDTO build_runtime_participant_binding_dto(
                    provider_target.control_binding_revision ==
                        target.control_binding()->control_binding_revision;
           } else if constexpr (
-              std::is_same_v<
-                  Target, core::ControlDomainCapabilityProviderTargetDTO>) {
+              std::is_same_v<Target,
+                             core::ControlDomainCapabilityProviderTargetDTO>) {
             return target.control_domain().has_value() &&
                    provider_target.control_domain_id ==
                        target.control_domain()->control_domain_id &&
@@ -461,7 +485,7 @@ core::RuntimeParticipantBindingDTO build_runtime_participant_binding_dto(
         provider.capability_provider_binding_revision,
         provider.provider_instance_id, provider.provider_manifest_id,
         provider.provider_manifest_revision,
-        find_provider_epoch(provider.provider_instance_id)});
+        occurrence.provider_runtime_unit_id, occurrence.runtime_epoch});
   }
   std::sort(
       supporting_paths.begin(), supporting_paths.end(),

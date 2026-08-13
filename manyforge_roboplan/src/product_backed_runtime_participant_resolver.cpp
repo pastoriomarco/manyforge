@@ -178,14 +178,25 @@ template <typename Available, typename Selected, typename Matches>
   return result;
 }
 
-void InsertProviderEpoch(
-    std::map<core::ProviderInstanceId, core::RuntimeEpoch>& epochs,
+struct ProviderOccurrence final {
+  core::RuntimeUnitId runtime_unit_id;
+  core::RuntimeEpoch runtime_epoch;
+
+  friend bool operator==(const ProviderOccurrence&,
+                         const ProviderOccurrence&) = default;
+};
+
+void InsertProviderOccurrence(
+    std::map<core::ProviderInstanceId, ProviderOccurrence>& occurrences,
     const core::ProviderInstanceId& provider,
+    const core::RuntimeUnitId& runtime_unit_id,
     const core::RuntimeEpoch& runtime_epoch) {
-  const auto [found, inserted] = epochs.emplace(provider, runtime_epoch);
-  if (!inserted && found->second != runtime_epoch) {
+  const auto [found, inserted] = occurrences.emplace(
+      provider, ProviderOccurrence{runtime_unit_id, runtime_epoch});
+  if (!inserted &&
+      found->second != ProviderOccurrence{runtime_unit_id, runtime_epoch}) {
     throw std::runtime_error(
-        "physical runtime advertises conflicting provider epochs");
+        "physical runtime advertises conflicting provider occurrences");
   }
 }
 
@@ -208,18 +219,25 @@ void InsertProviderEpoch(
         "Program target crosses the physical owner's active control route");
   }
 
-  std::map<core::ProviderInstanceId, core::RuntimeEpoch> available_epochs;
-  InsertProviderEpoch(available_epochs, control.provider_instance_id,
-                      control.provider_runtime_epoch);
+  std::map<core::ProviderInstanceId, ProviderOccurrence>
+      available_occurrences;
+  InsertProviderOccurrence(available_occurrences,
+                           control.provider_instance_id,
+                           control.provider_runtime_unit_id,
+                           control.provider_runtime_epoch);
   if (physical.value().capability_provider_path.has_value()) {
     const auto& path = *physical.value().capability_provider_path;
-    InsertProviderEpoch(available_epochs, path.provider_instance_id,
-                        path.provider_runtime_epoch);
+    InsertProviderOccurrence(available_occurrences,
+                             path.provider_instance_id,
+                             path.provider_runtime_unit_id,
+                             path.provider_runtime_epoch);
   }
   for (const auto& path :
        physical.value().supporting_capability_provider_paths) {
-    InsertProviderEpoch(available_epochs, path.provider_instance_id,
-                        path.provider_runtime_epoch);
+    InsertProviderOccurrence(available_occurrences,
+                             path.provider_instance_id,
+                             path.provider_runtime_unit_id,
+                             path.provider_runtime_epoch);
   }
 
   std::set<core::ProviderInstanceId> required_providers;
@@ -239,12 +257,14 @@ void InsertProviderEpoch(
   std::vector<deployment::RuntimeProviderEpochFactDTO> provider_epochs;
   provider_epochs.reserve(required_providers.size());
   for (const auto& provider : required_providers) {
-    const auto found = available_epochs.find(provider);
-    if (found == available_epochs.end()) {
+    const auto found = available_occurrences.find(provider);
+    if (found == available_occurrences.end()) {
       throw std::runtime_error(
           "Program target names a provider outside the physical owner");
     }
-    provider_epochs.push_back({provider, found->second});
+    provider_epochs.push_back(
+        {provider, found->second.runtime_unit_id,
+         found->second.runtime_epoch});
   }
   return deployment::ActiveRuntimeParticipantFactsDTO{
       control.control_route_id,

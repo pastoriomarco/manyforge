@@ -4,6 +4,9 @@ import json
 from pathlib import Path
 import xml.etree.ElementTree as ET
 
+from manyforge_xarm_adapter.controller_binding import (
+    SUPERVISED_FAKE_HARDWARE_PLUGIN,
+)
 from manyforge_xarm_adapter.model_generation import _load_source_manifest
 from manyforge_xarm_adapter.model_generation import (
     apply_manyforge_jtc_qualification,
@@ -103,8 +106,10 @@ def test_supervised_runtime_changes_only_execution_owner() -> None:
     assert model_only_urdf(qualification) == model_only_urdf(runtime)
     assert '__MANYFORGE_RUNTIME_ROBOT_IP__' in production
     assert 'expected_robot_sn' not in production
-    assert 'ALLOW_TEST_ONLY_FAKE_BACKEND' not in production
-    assert 'ALLOW_TEST_ONLY_FAKE_BACKEND' in qualification
+    assert SUPERVISED_FAKE_HARDWARE_PLUGIN not in production
+    assert SUPERVISED_FAKE_HARDWARE_PLUGIN in qualification
+    assert 'authority_profile' not in qualification
+    assert 'authority_session' not in qualification
 
 
 def test_source_manifest_rejects_non_exact_tree_identity(

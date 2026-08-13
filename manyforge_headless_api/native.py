@@ -42,6 +42,7 @@ class HeadlessApiConfig:
     manager_state_root: Path
     execution_state_root: Path
     cell_id: str
+    cclc_state_root: Path | None = None
     resource_ids: tuple[str, ...] = ()
     owner_id: str = "headless-api"
     # Deterministic override for in-process qualification only. Production
@@ -57,6 +58,7 @@ class HeadlessApiConfig:
     # ambiguous timeout after the mutation has committed.
     manager_timeout_seconds: float = DEFAULT_MANAGER_COMMAND_TIMEOUT_SECONDS
     execution_timeout_seconds: float = 10.0
+    cclc_timeout_seconds: float = 5.0
     execution_event_poll_milliseconds: int = 100
     maximum_request_body_bytes: int = MAX_STANDARD_REQUEST_BODY_BYTES
     program_runner_url: str | None = None
@@ -95,6 +97,8 @@ class HeadlessApiConfig:
             raise ValueError("manager_timeout_seconds must be in (0, 5]")
         if not 0 < self.execution_timeout_seconds <= 30:
             raise ValueError("execution_timeout_seconds must be in (0, 30]")
+        if not 0 < self.cclc_timeout_seconds <= 30:
+            raise ValueError("cclc_timeout_seconds must be in (0, 30]")
         if not 10 <= self.execution_event_poll_milliseconds <= 5_000:
             raise ValueError(
                 "execution_event_poll_milliseconds must be between 10 and 5000"

@@ -11,11 +11,13 @@ from typing import Any, Sequence
 import uvicorn
 
 from .app import create_app
+from .cclc import MAX_CCLC_REQUEST_BYTES
 from .client import HeadlessClientError, HeadlessHttpClient
 from .native import (
     DEFAULT_MANAGER_COMMAND_TIMEOUT_SECONDS,
     HeadlessApiConfig,
     HeadlessApiError,
+    strict_json_object,
 )
 
 
@@ -52,6 +54,7 @@ def _parser() -> argparse.ArgumentParser:
     serve.add_argument("--historian-database-path", type=Path, required=True)
     serve.add_argument("--manager-state-root", type=Path, required=True)
     serve.add_argument("--execution-state-root", type=Path, required=True)
+    serve.add_argument("--cclc-state-root", type=Path)
     serve.add_argument("--cell-id", required=True)
     serve.add_argument("--resource-id", action="append", default=[])
     serve.add_argument("--owner-id", default="headless-api")
@@ -61,6 +64,7 @@ def _parser() -> argparse.ArgumentParser:
         type=float,
         default=DEFAULT_MANAGER_COMMAND_TIMEOUT_SECONDS,
     )
+    serve.add_argument("--cclc-timeout-s", type=float, default=5.0)
     serve.add_argument("--program-runner-url")
     serve.add_argument("--program-runner-timeout-s", type=float, default=30.0)
 
@@ -129,6 +133,24 @@ def _parser() -> argparse.ArgumentParser:
     apply.add_argument("expected_graph_revision")
     apply.add_argument("expected_retained_bundle_id")
     _caller_fields(apply)
+
+    for name in ("cclc-component", "cclc-route-templates"):
+        cclc_component = subcommands.add_parser(name)
+        cclc_component.add_argument(
+            "--url", default="http://127.0.0.1:9010"
+        )
+        cclc_component.add_argument("component_id")
+
+    for name in ("cclc-lifecycle-submit", "cclc-route-submit"):
+        cclc_submit = subcommands.add_parser(name)
+        cclc_submit.add_argument("--url", default="http://127.0.0.1:9010")
+        cclc_submit.add_argument("request_file", type=Path)
+        cclc_submit.add_argument("--confirmed", action="store_true")
+
+    for name in ("cclc-lifecycle-status", "cclc-route-status"):
+        cclc_status = subcommands.add_parser(name)
+        cclc_status.add_argument("--url", default="http://127.0.0.1:9010")
+        cclc_status.add_argument("transaction_id")
     return parser
 
 
@@ -150,16 +172,32 @@ def _serve(args: argparse.Namespace) -> int:
         historian_database_path=args.historian_database_path,
         manager_state_root=args.manager_state_root,
         execution_state_root=args.execution_state_root,
+        cclc_state_root=args.cclc_state_root,
         cell_id=args.cell_id,
         resource_ids=tuple(sorted(set(args.resource_id))),
         owner_id=args.owner_id,
         freshness_milliseconds=args.freshness_ms,
         manager_timeout_seconds=args.manager_timeout_s,
+        cclc_timeout_seconds=args.cclc_timeout_s,
         program_runner_url=args.program_runner_url,
         program_runner_timeout_seconds=args.program_runner_timeout_s,
     )
     uvicorn.run(create_app(config), host=args.host, port=args.port)
     return 0
+
+
+def _load_cclc_request(path: Path) -> dict[str, Any]:
+    payload = path.read_bytes()
+    if not payload or len(payload) > MAX_CCLC_REQUEST_BYTES:
+        raise ValueError("CCLC request file is empty or exceeds its byte bound")
+    try:
+        text = payload.decode("utf-8", errors="strict")
+    except UnicodeDecodeError as exc:
+        raise ValueError("CCLC request file is not UTF-8") from exc
+    value = strict_json_object(text, label="CCLC request file")
+    if "confirmed" in value:
+        raise ValueError("CCLC request file must omit CLI-owned confirmation")
+    return value
 
 
 def _request(args: argparse.Namespace) -> int:
@@ -244,6 +282,28 @@ def _request(args: argparse.Namespace) -> int:
                     "reject_if_affected_busy": True,
                 }
             )
+        elif args.command == "cclc-component":
+            value = client.cclc_component(args.component_id)
+        elif args.command == "cclc-route-templates":
+            value = client.cclc_route_templates(args.component_id)
+        elif args.command == "cclc-lifecycle-submit":
+            value = client.submit_component_lifecycle(
+                {
+                    **_load_cclc_request(args.request_file),
+                    "confirmed": args.confirmed,
+                }
+            )
+        elif args.command == "cclc-lifecycle-status":
+            value = client.component_lifecycle_status(args.transaction_id)
+        elif args.command == "cclc-route-submit":
+            value = client.submit_route_selection(
+                {
+                    **_load_cclc_request(args.request_file),
+                    "confirmed": args.confirmed,
+                }
+            )
+        elif args.command == "cclc-route-status":
+            value = client.route_selection_status(args.transaction_id)
         else:
             raise AssertionError(f"unsupported command {args.command}")
     _print(value)

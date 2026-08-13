@@ -6,6 +6,7 @@
 #include <atomic>
 #include <cstdint>
 #include <filesystem>
+#include <map>
 #include <memory>
 #include <set>
 #include <stdexcept>
@@ -13,8 +14,8 @@
 #include <utility>
 #include <vector>
 
-#include <manyforge_core/types/program_contract.hpp>
 #include <manyforge_core/types/collision_world_snapshot.hpp>
+#include <manyforge_core/types/program_contract.hpp>
 #include <manyforge_deployment/program_binding_compiler.hpp>
 #include <manyforge_deployment/program_contract.hpp>
 #include <manyforge_deployment/retained_bundle.hpp>
@@ -59,8 +60,9 @@ using manyforge::deployment::test::kLite6ControllableComponentId;
 using manyforge::deployment::test::kLite6GripperTargetId;
 using manyforge::deployment::test::
     materialize_lite6_arm_gripper_aggregate_retained_consumer_fixture;
+using manyforge::deployment::test::
+    materialize_lite6_native_motion_retained_consumer_fixture;
 using manyforge::deployment::test::materialize_lite6_retained_consumer_fixture;
-using manyforge::deployment::test::materialize_lite6_native_motion_retained_consumer_fixture;
 
 constexpr std::string_view kZeroDigest =
     "sha256:0000000000000000000000000000000000000000000000000000000000000000";
@@ -250,12 +252,12 @@ make_aggregate_program_root(const RetainedBundle &bundle) {
       {"sensing_mode", CanonicalValue("geometry_only")},
       {"default_unmatched_response", CanonicalValue("hard_stop")},
       {"zones",
-       CanonicalValue(CanonicalValue::Array{CanonicalValue(
-           CanonicalValue::Object{
+       CanonicalValue(
+           CanonicalValue::Array{CanonicalValue(CanonicalValue::Object{
                {"zone_id", CanonicalValue("tool_contact")},
                {"body_pairs",
-                CanonicalValue(CanonicalValue::Array{CanonicalValue(
-                    CanonicalValue::Object{
+                CanonicalValue(
+                    CanonicalValue::Array{CanonicalValue(CanonicalValue::Object{
                         {"body_a",
                          CanonicalValue(CanonicalValue::Object{
                              {"kind", CanonicalValue("component_model_body")},
@@ -293,19 +295,17 @@ make_aggregate_program_root(const RetainedBundle &bundle) {
       "blackboard",
       CanonicalValue(CanonicalValue::Object{
           {"namespaces", CanonicalValue(CanonicalValue::Array{})},
-          {"keys",
-           CanonicalValue(CanonicalValue::Array{CanonicalValue(
-               CanonicalValue::Object{
-                   {"key", CanonicalValue("selected_object")},
-                   {"type", CanonicalValue("scene_resource")},
-                   {"access", CanonicalValue("read_write")},
-                   {"persistence", CanonicalValue("run")},
-               })})},
+          {"keys", CanonicalValue(CanonicalValue::Array{
+                       CanonicalValue(CanonicalValue::Object{
+                           {"key", CanonicalValue("selected_object")},
+                           {"type", CanonicalValue("scene_resource")},
+                           {"access", CanonicalValue("read_write")},
+                           {"persistence", CanonicalValue("run")},
+                       })})},
       }));
-  root.emplace_back(
-      "contact_policies",
-      CanonicalValue(CanonicalValue::Array{
-          CanonicalValue(std::move(policy_members))}));
+  root.emplace_back("contact_policies",
+                    CanonicalValue(CanonicalValue::Array{
+                        CanonicalValue(std::move(policy_members))}));
   return CanonicalValue(std::move(root));
 }
 
@@ -366,18 +366,37 @@ valid_assignment(bool aggregate_gripper = false) {
         {id, manyforge::core::RuntimeEpoch("epoch." + id.value())});
   }
 
-  std::set<manyforge::core::ProviderInstanceId> providers;
+  std::map<manyforge::core::ProviderInstanceId, manyforge::core::RuntimeUnitId>
+      providers;
   if (target.control_binding().has_value()) {
-    providers.insert(target.control_binding()->provider_instance_id);
+    providers.emplace(target.control_binding()->provider_instance_id,
+                      target.control_binding()->provider_runtime_unit_id);
   }
   if (target.capability_provider_binding().has_value()) {
-    providers.insert(
-        target.capability_provider_binding()->provider_instance_id);
+    const auto &provider = *target.capability_provider_binding();
+    const auto endpoint = std::find_if(
+        provider.endpoint_bindings.begin(), provider.endpoint_bindings.end(),
+        [](const auto &candidate) {
+          return candidate.source_kind ==
+                 manyforge::core::CapabilityEndpointSourceKind::kRuntimeUnit;
+        });
+    if (endpoint == provider.endpoint_bindings.end()) {
+      throw std::logic_error(
+          "test provider has no managed runtime-unit source");
+    }
+    const auto *runtime_unit =
+        std::get_if<manyforge::core::RuntimeUnitId>(&endpoint->source_id);
+    if (runtime_unit == nullptr) {
+      throw std::logic_error("test provider runtime source is ill-typed");
+    }
+    providers.emplace(provider.provider_instance_id, *runtime_unit);
+    runtime_units.insert(*runtime_unit);
   }
   std::vector<RuntimeProviderEpochFactDTO> provider_epochs;
-  for (const auto &id : providers) {
+  for (const auto &[id, runtime_unit_id] : providers) {
     provider_epochs.push_back(
-        {id, manyforge::core::RuntimeEpoch("epoch." + id.value())});
+        {id, runtime_unit_id,
+         manyforge::core::RuntimeEpoch("epoch." + runtime_unit_id.value())});
   }
   return ActiveRuntimeParticipantFactsDTO{
       *target.desired_route(),
@@ -428,7 +447,8 @@ TEST(ProgramBindingCompilerTest,
 TEST(ProgramBindingCompilerTest,
      DerivesDeterministicDirectControlMotionBindingWithoutScenarioProgram) {
   ScopedTrustedRoot root;
-  const BindingCompilerContext context = make_native_motion_context(root.path());
+  const BindingCompilerContext context =
+      make_native_motion_context(root.path());
   FilesystemCatalogArtifactStore catalog_store(root.path());
 
   const auto first = compile_direct_control_motion_program_binding(
@@ -453,31 +473,31 @@ TEST(ProgramBindingCompilerTest,
   EXPECT_EQ(first->value().retained_bundle_id,
             context.bundle->retained_bundle_id());
   ASSERT_EQ(first->value().component_role_bindings.size(), 1U);
-  EXPECT_EQ(first->value().component_role_bindings.front()
-                .component_role_id.value(),
-            manyforge::deployment::kDirectControlComponentRoleId);
+  EXPECT_EQ(
+      first->value().component_role_bindings.front().component_role_id.value(),
+      manyforge::deployment::kDirectControlComponentRoleId);
   ASSERT_EQ(first->value().target_role_bindings.size(), 1U);
   const auto &target = first->value().target_role_bindings.front();
   EXPECT_EQ(target.target_role_id.value(),
             manyforge::deployment::kDirectControlTargetRoleId);
   EXPECT_EQ(target.command_target_id.value(), kLite6ArmTargetId);
   EXPECT_FALSE(target.frame_role_bindings.empty());
-  EXPECT_NE(std::find_if(target.frame_role_bindings.begin(),
-                         target.frame_role_bindings.end(),
-                         [](const auto &frame) {
-                           return frame.frame_role_id.value() ==
-                                  manyforge::deployment::
-                                      kDirectControlBaseFrameRoleId;
-                         }),
+  EXPECT_NE(std::find_if(
+                target.frame_role_bindings.begin(),
+                target.frame_role_bindings.end(),
+                [](const auto &frame) {
+                  return frame.frame_role_id.value() ==
+                         manyforge::deployment::kDirectControlBaseFrameRoleId;
+                }),
             target.frame_role_bindings.end());
-  EXPECT_NE(std::find_if(target.frame_role_bindings.begin(),
-                         target.frame_role_bindings.end(),
-                         [](const auto &frame) {
-                           return frame.frame_role_id.value() ==
-                                  manyforge::deployment::
-                                      kDirectControlTcpFrameRoleId;
-                         }),
-            target.frame_role_bindings.end());
+  EXPECT_NE(
+      std::find_if(target.frame_role_bindings.begin(),
+                   target.frame_role_bindings.end(),
+                   [](const auto &frame) {
+                     return frame.frame_role_id.value() ==
+                            manyforge::deployment::kDirectControlTcpFrameRoleId;
+                   }),
+      target.frame_role_bindings.end());
   EXPECT_FALSE(target.resource_role_bindings.empty());
   EXPECT_FALSE(target.collision_body_role_bindings.empty());
   EXPECT_TRUE(first->value().contact_grasp_bindings.empty());
@@ -496,7 +516,8 @@ TEST(ProgramBindingCompilerTest,
 TEST(ProgramBindingCompilerTest,
      DirectControlMotionBindingRejectsUnknownComponentOrTarget) {
   ScopedTrustedRoot root;
-  const BindingCompilerContext context = make_native_motion_context(root.path());
+  const BindingCompilerContext context =
+      make_native_motion_context(root.path());
   FilesystemCatalogArtifactStore catalog_store(root.path());
 
   EXPECT_THROW(
@@ -505,13 +526,12 @@ TEST(ProgramBindingCompilerTest,
           manyforge::core::CommandTargetId(std::string(kLite6ArmTargetId)),
           *context.bundle, context.model_map, catalog_store)),
       ProgramBindingCompilerError);
-  EXPECT_THROW(
-      static_cast<void>(compile_direct_control_motion_program_binding(
-          manyforge::core::ControllableComponentId(
-              std::string(kLite6ControllableComponentId)),
-          manyforge::core::CommandTargetId("missing_target"), *context.bundle,
-          context.model_map, catalog_store)),
-      ProgramBindingCompilerError);
+  EXPECT_THROW(static_cast<void>(compile_direct_control_motion_program_binding(
+                   manyforge::core::ControllableComponentId(
+                       std::string(kLite6ControllableComponentId)),
+                   manyforge::core::CommandTargetId("missing_target"),
+                   *context.bundle, context.model_map, catalog_store)),
+               ProgramBindingCompilerError);
 }
 
 TEST(ProgramBindingCompilerTest,
@@ -540,12 +560,12 @@ TEST(ProgramBindingCompilerTest,
   EXPECT_TRUE(manyforge::deployment::is_sha256_digest(
       first->value().program_revision.value()));
   ASSERT_EQ(first->value().target_role_bindings.size(), 1U);
-  const auto& target = first->value().target_role_bindings.front();
+  const auto &target = first->value().target_role_bindings.front();
   EXPECT_EQ(target.target_role_id.value(),
             manyforge::deployment::kDirectControlTargetRoleId);
   EXPECT_EQ(target.command_target_id.value(), kLite6GripperTargetId);
   ASSERT_EQ(target.capability_bindings.size(), 1U);
-  const auto& capability = target.capability_bindings.front();
+  const auto &capability = target.capability_bindings.front();
   EXPECT_EQ(capability.capability_id.value(), "tool.gripper.command");
   ASSERT_TRUE(capability.command_schema.has_value());
   EXPECT_EQ(capability.command_schema->command_schema_id.value(),
@@ -578,14 +598,10 @@ TEST(ProgramBindingCompilerTest,
   const BindingCompilerContext motion_context =
       make_native_motion_context(motion_root.path());
   FilesystemCatalogArtifactStore motion_catalog_store(motion_root.path());
-  const auto first_motion =
-      compile_direct_control_program_binding_inventory(
-          *motion_context.bundle, motion_context.model_map,
-          motion_catalog_store);
-  const auto second_motion =
-      compile_direct_control_program_binding_inventory(
-          *motion_context.bundle, motion_context.model_map,
-          motion_catalog_store);
+  const auto first_motion = compile_direct_control_program_binding_inventory(
+      *motion_context.bundle, motion_context.model_map, motion_catalog_store);
+  const auto second_motion = compile_direct_control_program_binding_inventory(
+      *motion_context.bundle, motion_context.model_map, motion_catalog_store);
 
   ASSERT_EQ(first_motion.motion.size(), 1U);
   EXPECT_TRUE(first_motion.gripper.empty());
@@ -597,14 +613,12 @@ TEST(ProgramBindingCompilerTest,
   const BindingCompilerContext gripper_context =
       make_context(gripper_root.path(), true);
   FilesystemCatalogArtifactStore gripper_catalog_store(gripper_root.path());
-  const auto first_gripper =
-      compile_direct_control_program_binding_inventory(
-          *gripper_context.bundle, gripper_context.model_map,
-          gripper_catalog_store);
-  const auto second_gripper =
-      compile_direct_control_program_binding_inventory(
-          *gripper_context.bundle, gripper_context.model_map,
-          gripper_catalog_store);
+  const auto first_gripper = compile_direct_control_program_binding_inventory(
+      *gripper_context.bundle, gripper_context.model_map,
+      gripper_catalog_store);
+  const auto second_gripper = compile_direct_control_program_binding_inventory(
+      *gripper_context.bundle, gripper_context.model_map,
+      gripper_catalog_store);
 
   EXPECT_TRUE(first_gripper.motion.empty());
   ASSERT_EQ(first_gripper.gripper.size(), 1U);
@@ -848,8 +862,7 @@ TEST(ProgramBindingCompilerTest,
       gripper.control_path->active_control_configuration_generation.nonzero());
   EXPECT_FALSE(gripper.control_path->provider_runtime_epoch.empty());
   ASSERT_EQ(arm.contact_grasp_bindings.size(), 1U);
-  EXPECT_EQ(arm.contact_grasp_bindings,
-            gripper.contact_grasp_bindings);
+  EXPECT_EQ(arm.contact_grasp_bindings, gripper.contact_grasp_bindings);
   EXPECT_EQ(arm.contact_grasp_bindings.front().runtime_object_id.value(),
             "selected_object");
 }
@@ -872,6 +885,13 @@ TEST(ProgramBindingCompilerTest,
   missing_epoch.provider_epochs.clear();
   EXPECT_THROW(static_cast<void>(build_runtime_participant_binding_dto(
                    target, missing_epoch)),
+               RuntimeProgramBindingResolutionError);
+
+  auto mismatched_provider_runtime = active_facts_for(target);
+  mismatched_provider_runtime.provider_epochs.front().provider_runtime_unit_id =
+      manyforge::core::RuntimeUnitId("runtime.other");
+  EXPECT_THROW(static_cast<void>(build_runtime_participant_binding_dto(
+                   target, mismatched_provider_runtime)),
                RuntimeProgramBindingResolutionError);
 
   auto wrong_route = active_facts_for(target);

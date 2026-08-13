@@ -32,6 +32,10 @@ STRONG_STRING_TYPES = (
     "RuntimeEpoch",
     "RuntimePolicyId",
     "RuntimePolicyRevision",
+    "InterruptSourceId",
+    "InterruptPolicyId",
+    "InterruptLatchId",
+    "MotionInterruptScopeId",
     "ComponentTypeId",
     "ComponentTypeRevision",
     "ControllableComponentId",
@@ -107,6 +111,17 @@ STRONG_STRING_TYPES = (
     "ProgramBindingId",
     "ProgramRunId",
     "MoveId",
+    "RequestOwnerEpoch",
+    "RequestId",
+    "LifecycleTransactionId",
+    "LifecycleFactId",
+    "LifecyclePrimitiveId",
+    "LifecyclePrimitiveAttemptId",
+    "ConfigurationFenceId",
+    "OperationId",
+    "StopId",
+    "StopCertificateId",
+    "StopFaultLatchId",
 )
 
 
@@ -737,7 +752,7 @@ def test_every_core_strong_string_has_distinct_immutable_python_type():
         with pytest.raises(TypeError):
             cls()
 
-    assert len(STRONG_STRING_TYPES) == 90
+    assert len(STRONG_STRING_TYPES) == 105
     assert len({type(value) for value in values}) == len(STRONG_STRING_TYPES)
     assert len(set(values)) == len(STRONG_STRING_TYPES)
     for index, left in enumerate(values):
@@ -750,6 +765,17 @@ def test_every_core_strong_string_has_distinct_immutable_python_type():
 
         class InvalidSubclass(core.CellId):
             pass
+
+
+def test_stop_terminal_fault_generation_is_a_distinct_immutable_counter():
+    generation = core.StopFaultLatchGeneration(7)
+    assert generation.value == 7
+    assert generation.nonzero is True
+    assert generation == core.StopFaultLatchGeneration(7)
+    assert generation != core.StopGeneration(7)
+    assert generation != core.StopCertificateRevision(7)
+    with pytest.raises(AttributeError):
+        generation.value = 8
 
 
 @pytest.mark.parametrize("case", CATALOG_REF_CASES)
@@ -1798,7 +1824,7 @@ target: 0.5
         ),
     }
     assert registry.qualification_registry_digest.value == (
-        "sha256:04be79547db2bb64f9354fd2493526df785e4385264eb033b1820adbd22ca1ab"
+        "sha256:019bf635a4675e91fd319a5f8f34e7d05cd86f65983a38acea3a2d16c7a16833"
     )
     assert (
         json.loads(registry.normalized_projection_canonical_json)["catalog_schemas"][0][

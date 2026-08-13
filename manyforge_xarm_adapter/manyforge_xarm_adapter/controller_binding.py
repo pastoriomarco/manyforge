@@ -24,7 +24,7 @@ SUPERVISED_HARDWARE_PLUGIN = (
     'uf_robot_hardware/UFRobotSystemHardware'
 )
 SUPERVISED_FAKE_HARDWARE_PLUGIN = (
-    'manyforge_xarm_control/ManyForgeXArmSystemHardware'
+    'mock_components/GenericSystem'
 )
 TRAJECTORY_CONTROLLER_TYPE = (
     'joint_trajectory_controller/JointTrajectoryController'

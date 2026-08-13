@@ -87,6 +87,31 @@ def test_provider_manifest_dto_is_typed_and_read_only():
         manifest.provider_contracts = []
 
 
+def test_provider_manifest_exposes_read_only_lifecycle_catalog_anchor():
+    declaration = core.ProviderLifecyclePlanCatalogDeclarationDTO(
+        catalog_api_version=core.SchemaId(
+            "manyforge.brand_lifecycle_plan_catalog.v1"
+        ),
+        semantic_digest=core.ContentDigest("sha256:" + "4" * 64),
+    )
+    manifest = core.ProviderManifestDTO(
+        provider_manifest_id=core.ProviderManifestId("lifecycle_provider"),
+        provider_manifest_revision=core.ProviderManifestRevision(
+            "sha256:" + "5" * 64
+        ),
+        offered_capabilities=[],
+        provider_contracts=[],
+        lifecycle_plan_catalog=declaration,
+    )
+
+    assert manifest.lifecycle_plan_catalog == declaration
+    assert declaration.catalog_api_version == core.SchemaId(
+        "manyforge.brand_lifecycle_plan_catalog.v1"
+    )
+    with pytest.raises(AttributeError):
+        manifest.lifecycle_plan_catalog = None
+
+
 def test_registered_provider_stop_supports_are_typed():
     command = core.ProviderStopCommandSupportDTO(
         command_kind=core.StopContainmentCommandKind.kRegistered,

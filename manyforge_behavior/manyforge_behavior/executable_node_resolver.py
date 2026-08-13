@@ -39,7 +39,6 @@ from manyforge_behavior.orchestration_ports import (
 )
 from manyforge_behavior.orchestration_values import NodeAttemptInputResolver
 
-I7_ADAPTER_REASON: Final = "cclc_node_adapter_unavailable_until_i7"
 I8_ADAPTER_REASON: Final = "kernel_policy_node_adapter_unavailable_until_i8"
 I9_ADAPTER_REASON: Final = "simulation_node_adapter_unavailable_until_i9"
 I11_ADAPTER_REASON: Final = "semantic_io_node_adapter_unavailable_until_i11"
@@ -360,6 +359,8 @@ _TASK_OWNER_PORTS: Final[Mapping[str, str]] = MappingProxyType(
         "assistant.model_request": "assistant_requests",
         "assistant.scene_context": "assistant_requests",
         "assistant.scene_selection": "assistant_requests",
+        "cclc.control_route": "cclc_routes",
+        "cclc.lifecycle": "cclc_lifecycle",
         "kernel.operation": "kernel_operations",
         "kernel.pick_place_sequence": "pick_place",
         "planning.pick_sequence": "pick_place",
@@ -379,15 +380,10 @@ _INVOCATION_OWNER_PORTS: Final[Mapping[str, str]] = MappingProxyType(
 )
 _DEFERRED_BY_NODE: Final[Mapping[str, tuple[str, tuple[str, ...]]]] = MappingProxyType(
     {
-        "controller.select_route": (I7_ADAPTER_REASON, ("I7", "L0")),
         "io.get_input": (I11_ADAPTER_REASON, ("I11", "T")),
         "io.set_output": (I11_ADAPTER_REASON, ("I11", "T")),
         "io.wait_for_input": (I11_ADAPTER_REASON, ("I11", "T")),
         "kernel.full_stop": (I8_ADAPTER_REASON, ("I8", "P5")),
-        "lifecycle.disable_component": (I7_ADAPTER_REASON, ("I7", "L0")),
-        "lifecycle.enable_component": (I7_ADAPTER_REASON, ("I7", "L0")),
-        "lifecycle.prepare_component": (I7_ADAPTER_REASON, ("I7", "L0")),
-        "lifecycle.recover_component": (I7_ADAPTER_REASON, ("I7", "L0")),
         "motion.move_until_signal": (I8_ADAPTER_REASON, ("I8", "P5")),
         "motion.probe_search": (I8_ADAPTER_REASON, ("I8", "P5")),
         "recovery.apply_offered_action": (

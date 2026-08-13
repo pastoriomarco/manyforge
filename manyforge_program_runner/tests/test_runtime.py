@@ -30,6 +30,9 @@ class _Headless:
     _PORT_METHODS = {
         "acknowledge_completed_operation",
         "commit_scene_transaction",
+        "cclc_component",
+        "cclc_route_templates",
+        "component_lifecycle_status",
         "execute",
         "execution_status",
         "manager_graph",
@@ -41,6 +44,9 @@ class _Headless:
         "scene",
         "set_operation_runtime_scale",
         "stop_operations",
+        "submit_component_lifecycle",
+        "submit_route_selection",
+        "route_selection_status",
     }
 
     def __init__(self) -> None:

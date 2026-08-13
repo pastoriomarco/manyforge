@@ -217,7 +217,8 @@ public:
   IngestOperationEvent(
       std::string source_owner_epoch, std::uint64_t source_sequence,
       std::string record_kind, std::optional<std::string> request_id,
-      std::string operation_id, std::uint64_t operation_revision,
+      std::optional<std::string> operation_id,
+      std::optional<std::uint64_t> operation_revision,
       std::int64_t occurred_at_ns, std::string occurred_at_wall,
       bool effect_pending,
       manyforge::content_identity::CanonicalValue journal_payload,

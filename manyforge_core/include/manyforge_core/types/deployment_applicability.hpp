@@ -3,6 +3,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <manyforge_core/types/capability_definition.hpp>
+#include <manyforge_core/types/catalog.hpp>
 #include <manyforge_core/types/cell_graph.hpp>
 #include <manyforge_core/types/strong_id.hpp>
 #include <manyforge_core/types/stop_control.hpp>
@@ -248,6 +249,10 @@ struct DeploymentApplicabilityInputsDTO final {
   std::vector<ExternalResourceDTO> external_resources;
   std::vector<StopStageParametersDTO> stop_stage_parameters;
   std::vector<CommissionedStopInterfaceDTO> commissioned_stop_interfaces;
+  /// Exact deployment-selected policy referents. The closed tagged union
+  /// preserves the strong ID/revision pair; only contact, Stop-evidence, and
+  /// runtime-policy alternatives are legal at this boundary.
+  std::vector<CatalogRecordRefDTO> retained_policy_records;
 
   friend bool operator==(const DeploymentApplicabilityInputsDTO&,
                          const DeploymentApplicabilityInputsDTO&) = default;

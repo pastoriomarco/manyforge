@@ -54,6 +54,8 @@ if(NOT TARGET manyforge_core)
   cmake_policy(SET CMP0077 NEW)
   set(BUILD_TESTING OFF)
   set(MANYFORGE_CORE_BUILD_SQLITE_OPERATION_JOURNAL ON)
+  set(MANYFORGE_CORE_BUILD_SQLITE_CCLC_JOURNAL ON)
+  set(MANYFORGE_CORE_BUILD_FILESYSTEM_RESOLVED_STOP_BASE_PLAN_REPOSITORY ON)
   add_subdirectory(
     "${_MANYFORGE_REPOSITORY_SOURCE_ROOT}/manyforge_core"
     "${CMAKE_CURRENT_BINARY_DIR}/manyforge_core"
@@ -62,6 +64,8 @@ if(NOT TARGET manyforge_core)
   set(BUILD_TESTING "${_MANYFORGE_ROBOPLAN_BUILD_TESTING}")
   unset(_MANYFORGE_ROBOPLAN_BUILD_TESTING)
   unset(MANYFORGE_CORE_BUILD_SQLITE_OPERATION_JOURNAL)
+  unset(MANYFORGE_CORE_BUILD_SQLITE_CCLC_JOURNAL)
+  unset(MANYFORGE_CORE_BUILD_FILESYSTEM_RESOLVED_STOP_BASE_PLAN_REPOSITORY)
 endif()
 
 # The I6 native projection boundary consumes the ManyForge-owned collision
@@ -87,6 +91,7 @@ endif()
 # not acquire compiler or Component Manager mutation authority.
 if(NOT TARGET manyforge_component_manager)
   set(_MANYFORGE_ROBOPLAN_BUILD_TESTING "${BUILD_TESTING}")
+  set(MANYFORGE_BUILD_CCLC_RUNTIME_COMPOSITION ON)
   cmake_policy(PUSH)
   cmake_policy(SET CMP0077 NEW)
   set(BUILD_TESTING OFF)
@@ -97,6 +102,7 @@ if(NOT TARGET manyforge_component_manager)
   cmake_policy(POP)
   set(BUILD_TESTING "${_MANYFORGE_ROBOPLAN_BUILD_TESTING}")
   unset(_MANYFORGE_ROBOPLAN_BUILD_TESTING)
+  unset(MANYFORGE_BUILD_CCLC_RUNTIME_COMPOSITION)
 endif()
 if(NOT TARGET manyforge_component_manager OR
    NOT TARGET manyforge_deployment)
@@ -148,7 +154,8 @@ target_link_libraries(manyforge_roboplan_native_state_projection PUBLIC
   roboplan::roboplan)
 
 add_library(manyforge_roboplan_native_runtime_support
-  src/native_runtime_support.cpp)
+  src/native_runtime_support.cpp
+  src/retained_native_controller_lifecycle_port.cpp)
 target_include_directories(manyforge_roboplan_native_runtime_support PUBLIC
   $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
   $<INSTALL_INTERFACE:include>)
@@ -248,7 +255,22 @@ target_link_libraries(manyforge_roboplan_native_runtime PUBLIC
   manyforge_roboplan_collision_projection
   manyforge_collision
   manyforge_core
-  manyforge_core_sqlite_operation_journal)
+  manyforge_core_sqlite_operation_journal
+  manyforge::deployment_resolved_stop_base_plan_resolver)
+
+if(NOT TARGET manyforge_deployment_cclc_runtime_composition)
+  message(FATAL_ERROR
+    "retained native CCLC composition requires the Deployment runtime owner")
+endif()
+add_library(manyforge_roboplan_native_cclc_runtime
+  src/retained_native_cclc_runtime.cpp)
+target_include_directories(manyforge_roboplan_native_cclc_runtime PUBLIC
+  $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+  $<INSTALL_INTERFACE:include>)
+target_link_libraries(manyforge_roboplan_native_cclc_runtime PUBLIC
+  manyforge_roboplan_native_runtime
+  manyforge_roboplan_native_runtime_support
+  manyforge::deployment_cclc_runtime_composition)
 
 add_library(manyforge_roboplan_worker_protocol STATIC
   src/roboplan_worker_protocol.cpp)
@@ -471,6 +493,18 @@ if(BUILD_TESTING)
       manyforge_roboplan_native_gripper
       GTest::gtest_main)
 
+    add_executable(test_retained_native_controller_lifecycle_port
+      test/test_retained_native_controller_lifecycle_port.cpp)
+    target_link_libraries(test_retained_native_controller_lifecycle_port PRIVATE
+      manyforge_roboplan_native_runtime_support GTest::gtest_main)
+
+    add_executable(test_retained_native_cclc_runtime
+      test/test_retained_native_cclc_runtime.cpp)
+    target_link_libraries(test_retained_native_cclc_runtime PRIVATE
+      manyforge_roboplan_native_cclc_runtime
+      manyforge_component_manager
+      GTest::gtest_main)
+
     add_executable(test_native_stop_qualification_seams
       test/test_native_stop_qualification_seams.cpp)
     target_include_directories(test_native_stop_qualification_seams PRIVATE
@@ -612,6 +646,9 @@ if(BUILD_TESTING)
       ${CMAKE_CURRENT_SOURCE_DIR}/src)
     target_link_libraries(test_managed_kernel_admission_gate PRIVATE
       manyforge_roboplan_managed_kernel_apply_fence
+      manyforge::core_sqlite_operation_journal
+      manyforge_component_manager
+      manyforge_deployment
       GTest::gtest_main)
 
     add_executable(fake_process_candidate_worker
@@ -853,6 +890,10 @@ if(BUILD_TESTING)
       VERBATIM)
     add_custom_target(generate_lite6_native_execution_fixture ALL
       DEPENDS "${_MANYFORGE_I6_NATIVE_EXECUTION_FIXTURE_MANIFEST}")
+    add_dependencies(test_managed_kernel_admission_gate
+      generate_lite6_native_execution_fixture)
+    target_compile_definitions(test_managed_kernel_admission_gate PRIVATE
+      MANYFORGE_I6_NATIVE_FIXTURE_ROOT="${_MANYFORGE_I6_NATIVE_EXECUTION_FIXTURE_ROOT}")
 
     # L0.1 reuses the same native package generator through an uninstalled,
     # explicitly non-authoritative build-identity fixture seam. This exercises
@@ -932,6 +973,10 @@ if(BUILD_TESTING)
     add_custom_target(
       manyforge_materialize_stop_qualified_native_execution_fixture
       DEPENDS "${_MANYFORGE_I7_STOP_QUALIFIED_FIXTURE_MANIFEST}")
+    target_compile_definitions(test_retained_native_cclc_runtime PRIVATE
+      MANYFORGE_I7_STOP_QUALIFIED_FIXTURE_ROOT="${_MANYFORGE_I7_STOP_QUALIFIED_FIXTURE_ROOT}")
+    add_dependencies(test_retained_native_cclc_runtime
+      manyforge_materialize_stop_qualified_native_execution_fixture)
 
     add_executable(test_retained_product_consumer
       src/product_backed_runtime_participant_resolver.cpp
@@ -1053,6 +1098,14 @@ if(BUILD_TESTING)
         ENVIRONMENT "LD_LIBRARY_PATH=${_LIB_PATHS}"
         TIMEOUT ${MANYFORGE_GTEST_TIMEOUT_SECONDS})
     gtest_discover_tests(test_retained_native_backends
+      PROPERTIES
+        ENVIRONMENT "LD_LIBRARY_PATH=${_LIB_PATHS}"
+        TIMEOUT ${MANYFORGE_GTEST_TIMEOUT_SECONDS})
+    gtest_discover_tests(test_retained_native_controller_lifecycle_port
+      PROPERTIES
+        ENVIRONMENT "LD_LIBRARY_PATH=${_LIB_PATHS}"
+        TIMEOUT ${MANYFORGE_GTEST_TIMEOUT_SECONDS})
+    gtest_discover_tests(test_retained_native_cclc_runtime
       PROPERTIES
         ENVIRONMENT "LD_LIBRARY_PATH=${_LIB_PATHS}"
         TIMEOUT ${MANYFORGE_GTEST_TIMEOUT_SECONDS})

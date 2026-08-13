@@ -67,6 +67,7 @@ void operator delete[](void* ptr, std::size_t) noexcept {
 
 namespace {
 
+using manyforge::core::AngularAccelerationDTO;
 using manyforge::core::MotionInterruptStopMode;
 using manyforge::core::MotionInterruptStopProfileDTO;
 using manyforge::core::RobotStateDTO;
@@ -175,10 +176,11 @@ MotionInterruptStopProfileDTO make_profile(const TrajectoryDTO& trajectory) {
   profile.profile_id = "phase_4_5g_perf_soft_on_path";
   profile.stop_mode = MotionInterruptStopMode::kSoftOnPath;
   profile.deceleration_time_s = 0.25;
-  profile.max_stop_time_s = 1.0;
-  profile.allowed_fallback_modes = {MotionInterruptStopMode::kSpringBackHold};
+  profile.recoverable_substitution_mode =
+      MotionInterruptStopMode::kSpringBackHold;
   for (const auto& joint : trajectory.joint_names) {
-    profile.per_joint_max_deceleration_rad_s2[joint] = 40.0;
+    profile.per_joint_max_deceleration[joint] =
+        AngularAccelerationDTO{40.0};
   }
   return profile;
 }

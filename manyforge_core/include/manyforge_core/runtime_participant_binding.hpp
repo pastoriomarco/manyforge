@@ -63,6 +63,7 @@ struct RuntimeControlPathDTO final {
   ProviderInstanceId provider_instance_id;
   ProviderManifestId provider_manifest_id;
   ProviderManifestRevision provider_manifest_revision;
+  RuntimeUnitId provider_runtime_unit_id;
   RuntimeEpoch provider_runtime_epoch;
   StateAuthorityId state_authority_id;
   StateAuthorityClass state_authority_class{StateAuthorityClass::kMeasured};
@@ -71,8 +72,7 @@ struct RuntimeControlPathDTO final {
   ContainmentGranularity containment_granularity{ContainmentGranularity::kResource};
   /// Exact route-specific retained scaling evidence. Absence is an explicit
   /// unsupported result, never permission for adapter inference.
-  std::optional<RuntimeScaleRouteQualificationDTO>
-      runtime_scale_qualification;
+  std::optional<RuntimeScaleRouteQualificationDTO> runtime_scale_qualification;
 
   friend bool operator==(const RuntimeControlPathDTO&, const RuntimeControlPathDTO&) = default;
 };
@@ -85,6 +85,7 @@ struct RuntimeCapabilityProviderPathDTO final {
   ProviderInstanceId provider_instance_id;
   ProviderManifestId provider_manifest_id;
   ProviderManifestRevision provider_manifest_revision;
+  RuntimeUnitId provider_runtime_unit_id;
   RuntimeEpoch provider_runtime_epoch;
 
   friend bool operator==(const RuntimeCapabilityProviderPathDTO&,
@@ -159,10 +160,8 @@ class RuntimeParticipantBinding final {
 
   friend Result<RuntimeParticipantBinding> verify_runtime_participant_binding(
       RuntimeParticipantBindingDTO);
-  friend Result<RuntimeParticipantBinding>
-  bind_runtime_participant_collision_body_aliases(
-      RuntimeParticipantBinding,
-      std::span<const RuntimeCollisionBodyAliasDTO>);
+  friend Result<RuntimeParticipantBinding> bind_runtime_participant_collision_body_aliases(
+      RuntimeParticipantBinding, std::span<const RuntimeCollisionBodyAliasDTO>);
 };
 
 /// Validate ordering, uniqueness, scope agreement, and complete active facts,
@@ -174,10 +173,8 @@ class RuntimeParticipantBinding final {
 /// deduplicated physical bodies in the active retained collision projection.
 /// This is an owner-to-owner adaptation after semantic binding verification;
 /// public operation callers cannot supply the alias table.
-[[nodiscard]] Result<RuntimeParticipantBinding>
-bind_runtime_participant_collision_body_aliases(
-    RuntimeParticipantBinding binding,
-    std::span<const RuntimeCollisionBodyAliasDTO> aliases);
+[[nodiscard]] Result<RuntimeParticipantBinding> bind_runtime_participant_collision_body_aliases(
+    RuntimeParticipantBinding binding, std::span<const RuntimeCollisionBodyAliasDTO> aliases);
 
 /// Derive the exact observed-state query coordinates from one sealed runtime
 /// participant. Freshness is an active runtime policy and is supplied

@@ -1574,14 +1574,13 @@ DecodeStopIntent(const CanonicalValue &value,
   RequireExactObjectSize(target, 3U, "Stop operation target");
   return core::StopIntentDTO{
       DecodeRequestContext(Member(value, "request_context")),
-      {core::StopOperationTargetDTO{
+      std::vector<core::StopOperationTargetDTO>{core::StopOperationTargetDTO{
           core::OperationId(Text(target, "operation_id")),
           core::OperationRevision(
               Counter(target, "expected_operation_revision", 1U)),
           core::StopGeneration(
               Counter(target, "expected_stop_generation", 0U))}},
-      OptionalBoundedText(value, "reason", kMaximumReasonBytes),
-      attribution};
+      OptionalBoundedText(value, "reason", kMaximumReasonBytes), attribution};
 }
 
 [[nodiscard]] core::RuntimeScaleRequestDTO
@@ -2314,21 +2313,173 @@ ControlAcceptedValue(const core::OperationControlAcceptedDTO &value) {
 
 [[nodiscard]] CanonicalValue
 StopAcceptedValue(const core::StopAcceptedDTO &value) {
-  CanonicalValue::Array operations;
-  operations.reserve(value.operations.size());
-  for (const auto &operation : value.operations) {
-    operations.emplace_back(operation.value());
+  const auto diagnostic_target = [](const auto &target) {
+    return std::visit(
+        [](const auto &selected) -> CanonicalValue {
+          using Target = std::decay_t<decltype(selected)>;
+          if constexpr (std::is_same_v<Target, std::monostate>) {
+            return CanonicalValue(CanonicalValue::Object{
+                {"kind", CanonicalValue("cell")},
+                {"value", CanonicalValue(nullptr)},
+            });
+          } else if constexpr (std::is_same_v<Target, core::OperationId>) {
+            return CanonicalValue(CanonicalValue::Object{
+                {"kind", CanonicalValue("operation_id")},
+                {"value", CanonicalValue(selected.value())},
+            });
+          } else if constexpr (std::is_same_v<Target,
+                                              core::ControllableComponentId>) {
+            return CanonicalValue(CanonicalValue::Object{
+                {"kind", CanonicalValue("controllable_component_id")},
+                {"value", CanonicalValue(selected.value())},
+            });
+          } else {
+            return CanonicalValue(CanonicalValue::Object{
+                {"kind", CanonicalValue("resource_id")},
+                {"value", CanonicalValue(selected.value())},
+            });
+          }
+        },
+        target);
+  };
+  const auto diagnostic_value = [](const auto &candidate) {
+    return std::visit(
+        [](const auto &selected) -> CanonicalValue {
+          using Value = std::decay_t<decltype(selected)>;
+          if constexpr (std::is_same_v<Value, std::uint64_t>) {
+            return CanonicalValue(CanonicalValue::Object{
+                {"kind", CanonicalValue("unsigned_integer")},
+                {"value", CanonicalValue(static_cast<double>(selected))},
+            });
+          } else if constexpr (std::is_same_v<Value, core::RequestOwnerEpoch>) {
+            return CanonicalValue(CanonicalValue::Object{
+                {"kind", CanonicalValue("request_owner_epoch")},
+                {"value", CanonicalValue(selected.value())},
+            });
+          } else if constexpr (std::is_same_v<Value, core::GraphRevision>) {
+            return CanonicalValue(CanonicalValue::Object{
+                {"kind", CanonicalValue("graph_revision")},
+                {"value", CanonicalValue(selected.value())},
+            });
+          } else if constexpr (std::is_same_v<Value, core::OperationRevision>) {
+            return CanonicalValue(CanonicalValue::Object{
+                {"kind", CanonicalValue("operation_revision")},
+                {"value",
+                 CanonicalValue(static_cast<double>(selected.value()))},
+            });
+          } else if constexpr (std::is_same_v<
+                                   Value, core::ComponentLifecycleGeneration>) {
+            return CanonicalValue(CanonicalValue::Object{
+                {"kind", CanonicalValue("component_lifecycle_generation")},
+                {"value",
+                 CanonicalValue(static_cast<double>(selected.value()))},
+            });
+          } else {
+            return CanonicalValue(CanonicalValue::Object{
+                {"kind", CanonicalValue("stop_generation")},
+                {"value",
+                 CanonicalValue(static_cast<double>(selected.value()))},
+            });
+          }
+        },
+        candidate);
+  };
+
+  CanonicalValue::Array stale_diagnostics;
+  stale_diagnostics.reserve(value.stale_diagnostics.size());
+  for (const auto &diagnostic : value.stale_diagnostics) {
+    stale_diagnostics.emplace_back(CanonicalValue::Object{
+        {"current", diagnostic_value(diagnostic.current)},
+        {"expected", diagnostic_value(diagnostic.expected)},
+        {"field",
+         CanonicalValue(std::string(core::to_string(diagnostic.field)))},
+        {"target", diagnostic_target(diagnostic.target)},
+    });
+  }
+
+  CanonicalValue::Array affected_operations;
+  affected_operations.reserve(value.affected_operation_revisions.size());
+  for (const auto &operation : value.affected_operation_revisions) {
+    affected_operations.emplace_back(CanonicalValue::Object{
+        {"operation_id", CanonicalValue(operation.operation_id.value())},
+        {"operation_revision_after_acceptance",
+         CanonicalValue(static_cast<double>(
+             operation.operation_revision_after_acceptance.value()))},
+    });
+  }
+
+  CanonicalValue::Array predecessors;
+  predecessors.reserve(value.joined_predecessor_stops.size());
+  for (const auto &predecessor : value.joined_predecessor_stops) {
+    predecessors.emplace_back(CanonicalValue::Object{
+        {"captured_scope_digest",
+         CanonicalValue(predecessor.captured_scope_digest.value())},
+        {"predecessor_stop_generation",
+         CanonicalValue(static_cast<double>(
+             predecessor.predecessor_stop_generation.value()))},
+        {"predecessor_stop_id",
+         CanonicalValue(predecessor.predecessor_stop_id.value())},
+        {"remaining_outer_duration_ns_at_join",
+         CanonicalValue(static_cast<double>(
+             predecessor.remaining_outer_duration_ns_at_join))},
+    });
+  }
+
+  CanonicalValue::Array participant_budgets;
+  participant_budgets.reserve(value.participant_budget_allocations.size());
+  for (const auto &participant : value.participant_budget_allocations) {
+    CanonicalValue::Array phases;
+    phases.reserve(participant.phases.size());
+    for (const auto &phase : participant.phases) {
+      phases.emplace_back(CanonicalValue::Object{
+          {"fixed_deadline_offset_ns",
+           CanonicalValue(static_cast<double>(phase.fixed_deadline_offset_ns))},
+          {"phase_id", CanonicalValue(phase.phase_id.value())},
+          {"remaining_deadline_offset_ns",
+           CanonicalValue(
+               static_cast<double>(phase.remaining_deadline_offset_ns))},
+      });
+    }
+    participant_budgets.emplace_back(CanonicalValue::Object{
+        {"operation_id", CanonicalValue(participant.operation_id.value())},
+        {"origin_stop_generation",
+         CanonicalValue(
+             static_cast<double>(participant.origin_stop_generation.value()))},
+        {"origin_stop_id", CanonicalValue(participant.origin_stop_id.value())},
+        {"participant_id", CanonicalValue(participant.participant_id.value())},
+        {"participant_stop_invocation_plan_digest",
+         CanonicalValue(
+             participant.participant_stop_invocation_plan_digest.value())},
+        {"phases", CanonicalValue(std::move(phases))},
+    });
   }
   return CanonicalValue(CanonicalValue::Object{
       {"accepted_at_ns",
        CanonicalValue(static_cast<double>(value.accepted_at_ns))},
-      {"operation_revision_after_acceptance",
-       CanonicalValue(static_cast<double>(
-           value.operation_revision_after_acceptance.value()))},
-      {"operations", CanonicalValue(std::move(operations))},
+      {"affected_operation_revisions",
+       CanonicalValue(std::move(affected_operations))},
+      {"captured_scope_digest",
+       CanonicalValue(value.captured_scope_digest.value())},
+      {"fixed_kernel_completion_reserve_ns",
+       CanonicalValue(
+           static_cast<double>(value.fixed_kernel_completion_reserve_ns))},
+      {"fixed_outer_duration_ns",
+       CanonicalValue(static_cast<double>(value.fixed_outer_duration_ns))},
+      {"joined_predecessor_stops", CanonicalValue(std::move(predecessors))},
+      {"participant_budget_allocations",
+       CanonicalValue(std::move(participant_budgets))},
+      {"remaining_outer_duration_ns",
+       CanonicalValue(static_cast<double>(value.remaining_outer_duration_ns))},
       {"replay_status",
        CanonicalValue(std::string(core::to_string(value.replay_status)))},
       {"request_id", CanonicalValue(value.request_id.value())},
+      {"requested_selector_digest",
+       CanonicalValue(value.requested_selector_digest.value())},
+      {"resolution_disposition", CanonicalValue(std::string(core::to_string(
+                                     value.resolution_disposition)))},
+      {"resolution_reason",
+       CanonicalValue(std::string(core::to_string(value.resolution_reason)))},
+      {"stale_diagnostics", CanonicalValue(std::move(stale_diagnostics))},
       {"stop_generation",
        CanonicalValue(static_cast<double>(value.stop_generation.value()))},
       {"stop_id", CanonicalValue(value.stop_id.value())},
@@ -2538,9 +2689,13 @@ OperationEventPageValue(const core::OperationJournalEventPageDTO &page) {
         {"occurred_at_ns",
          CanonicalValue(static_cast<double>(event.occurred_at_ns))},
         {"occurred_at_wall", CanonicalValue(event.occurred_at_wall)},
-        {"operation_id", CanonicalValue(event.operation_id.value())},
-        {"operation_revision",
-         CanonicalValue(static_cast<double>(event.operation_revision.value()))},
+        {"operation_id", event.operation_id.has_value()
+                             ? CanonicalValue(event.operation_id->value())
+                             : CanonicalValue(nullptr)},
+        {"operation_revision", event.operation_revision.has_value()
+                                   ? CanonicalValue(static_cast<double>(
+                                         event.operation_revision->value()))
+                                   : CanonicalValue(nullptr)},
         {"owner_epoch", CanonicalValue(event.owner_epoch.value())},
         {"payload", std::move(payload)},
         {"payload_digest", CanonicalValue(event.payload_digest)},
@@ -3154,29 +3309,57 @@ ActiveFacts(const deployment::RuntimeProgramTargetBinding &primary,
     runtime_units.insert(primary.control_domain()->runtime_unit_ids.begin(),
                          primary.control_domain()->runtime_unit_ids.end());
   }
+  std::map<core::ProviderInstanceId, core::RuntimeUnitId> providers;
+  const auto insert_provider = [&](const core::ProviderInstanceId &provider,
+                                   const core::RuntimeUnitId &runtime_unit) {
+    const auto [found, inserted] = providers.emplace(provider, runtime_unit);
+    Require(inserted || found->second == runtime_unit,
+            "runtime provider is assigned to conflicting runtime units");
+    runtime_units.insert(runtime_unit);
+  };
+  const auto provider_runtime_unit =
+      [](const core::CapabilityProviderBindingDTO &binding) {
+        std::set<core::RuntimeUnitId> selected;
+        for (const auto &endpoint : binding.endpoint_bindings) {
+          if (endpoint.source_kind !=
+              core::CapabilityEndpointSourceKind::kRuntimeUnit) {
+            continue;
+          }
+          const auto *runtime_unit =
+              std::get_if<core::RuntimeUnitId>(&endpoint.source_id);
+          Require(runtime_unit != nullptr,
+                  "capability-provider endpoint source kind and value differ");
+          selected.insert(*runtime_unit);
+        }
+        Require(selected.size() == 1U,
+                "capability provider has no single exact runtime-unit owner");
+        return *selected.begin();
+      };
+  if (primary.control_binding().has_value()) {
+    insert_provider(primary.control_binding()->provider_instance_id,
+                    primary.control_binding()->provider_runtime_unit_id);
+  }
+  if (primary.capability_provider_binding().has_value()) {
+    insert_provider(
+        primary.capability_provider_binding()->provider_instance_id,
+        provider_runtime_unit(*primary.capability_provider_binding()));
+  }
+  for (const auto &support : supporting) {
+    if (support.capability_provider_binding().has_value()) {
+      insert_provider(
+          support.capability_provider_binding()->provider_instance_id,
+          provider_runtime_unit(*support.capability_provider_binding()));
+    }
+  }
   std::vector<core::RuntimeUnitEpochBindingDTO> runtime_epochs;
   runtime_epochs.reserve(runtime_units.size());
   for (const auto &runtime_unit : runtime_units) {
     runtime_epochs.push_back({runtime_unit, runtime_epoch});
   }
-  std::set<core::ProviderInstanceId> providers;
-  if (primary.control_binding().has_value()) {
-    providers.insert(primary.control_binding()->provider_instance_id);
-  }
-  if (primary.capability_provider_binding().has_value()) {
-    providers.insert(
-        primary.capability_provider_binding()->provider_instance_id);
-  }
-  for (const auto &support : supporting) {
-    if (support.capability_provider_binding().has_value()) {
-      providers.insert(
-          support.capability_provider_binding()->provider_instance_id);
-    }
-  }
   std::vector<deployment::RuntimeProviderEpochFactDTO> provider_epochs;
   provider_epochs.reserve(providers.size());
-  for (const auto &provider : providers) {
-    provider_epochs.push_back({provider, runtime_epoch});
+  for (const auto &[provider, runtime_unit] : providers) {
+    provider_epochs.push_back({provider, runtime_unit, runtime_epoch});
   }
   return deployment::ActiveRuntimeParticipantFactsDTO{
       *primary.desired_route(), std::move(active_configuration_id),
@@ -3639,18 +3822,30 @@ BuildProductComposition(CompositionBuildInput input) {
   auto planner = std::make_unique<RoboPlanPlannerBackend>(
       inventory->projection_binding, candidate_binding,
       std::move(candidate_client));
-  auto product_resolver =
-      std::make_shared<ProductBackedRuntimeParticipantResolver>(
-          input.package_root, input.bundle, input.model_map,
-          std::vector<core::RuntimeParticipantBinding>{
-              direct_control_motion_binding.value(),
-              direct_control_gripper_binding.value()});
+  const RetainedRuntimeParticipantResolverFactory participant_resolver_factory =
+      [package_root = input.package_root, bundle = input.bundle,
+       model_map = input.model_map](
+          std::vector<core::RuntimeParticipantBinding> physical_bindings) {
+        auto resolver =
+            std::make_shared<ProductBackedRuntimeParticipantResolver>(
+                package_root, bundle, model_map, std::move(physical_bindings));
+        return RetainedRuntimeParticipantResolver{
+            [resolver](const core::OperationIntentDTO &operation,
+                       const std::size_t participant_index) {
+              return resolver->Resolve(operation, participant_index);
+            }};
+      };
+  auto participant_resolver =
+      participant_resolver_factory({direct_control_motion_binding.value(),
+                                    direct_control_gripper_binding.value()});
   const auto reference_collision_model = collision_model;
   const auto reference_runtime_unit_id = *local_runtime_unit_id;
   const auto reference_runtime_epoch = input.runtime_epoch;
   RetainedNativeRuntimeInput runtime_input{
       direct_control_motion_binding.value(),
       direct_control_gripper_binding.value(),
+      {},
+      {},
       {},
       {},
       scene,
@@ -3691,10 +3886,8 @@ BuildProductComposition(CompositionBuildInput input) {
             RetainedSceneFrameLocalStateMode::kRequireDirectProviders,
             std::move(state_sources), 0);
       },
-      [product_resolver](const core::OperationIntentDTO &operation,
-                         const std::size_t participant_index) {
-        return product_resolver->Resolve(operation, participant_index);
-      },
+      std::move(participant_resolver),
+      participant_resolver_factory,
       input.operation_admission_gate};
   auto kernel_config = core::ExecutionKernelConfig{};
   kernel_config.collision_monitor_period_ns = collision_monitor_period_ns;
@@ -3710,7 +3903,8 @@ BuildProductComposition(CompositionBuildInput input) {
       std::move(execution_config),
       SimpleSchedulerConfig::from_environment(),
       execution_tick_period_ns,
-      retained_runtime_configuration.initial_joint_positions_rad};
+      retained_runtime_configuration.initial_joint_positions_rad,
+      std::nullopt};
   auto runtime = input.attach_addressed_owner
                      ? create_retained_native_runtime(std::move(runtime_input),
                                                       std::move(runtime_config))
@@ -4262,6 +4456,13 @@ RunManagedRuntimeChild(const ManagedRuntimeChildConfig &config) {
     return nullptr;
   };
 
+  const auto bind_disable_handoff_owner = [&] {
+    auto *const owner = stable_addressed_kernel();
+    if (owner != nullptr) {
+      fence_owner.BindDisableHandoffKernel(*owner);
+    }
+  };
+
   const auto try_release_retired_composition = [&] {
     std::lock_guard lock(managed_composition_mutex);
     auto *const owner = stable_addressed_kernel();
@@ -4326,11 +4527,17 @@ RunManagedRuntimeChild(const ManagedRuntimeChildConfig &config) {
           try {
             auto built = BuildProductComposition(std::move(input));
             InstallDirectSceneFrameResolver(projections, *built);
-            std::lock_guard lock(managed_composition_mutex);
-            std::unique_lock execution_lock(execution_composition.mutex);
-            active_managed_composition = std::move(built);
-            execution_composition.current = active_managed_composition.get();
-            current_composition_building = false;
+            Require(built->runtime->addressed_kernel != nullptr,
+                    "current managed composition has no addressed Kernel");
+            fence_owner.BindDisableHandoffKernel(
+                *built->runtime->addressed_kernel);
+            {
+              std::lock_guard lock(managed_composition_mutex);
+              std::unique_lock execution_lock(execution_composition.mutex);
+              active_managed_composition = std::move(built);
+              execution_composition.current = active_managed_composition.get();
+              current_composition_building = false;
+            }
           } catch (...) {
             std::lock_guard lock(managed_composition_mutex);
             managed_composition_failure = std::current_exception();
@@ -4582,7 +4789,9 @@ RunManagedRuntimeChild(const ManagedRuntimeChildConfig &config) {
                       core::CellId(config.cell_id),
                       config.staging_root /
                           std::string(core::kOperationJournalFilename),
-                      1024U, &admission_gate});
+                      1024U, &admission_gate,
+                      prepared->runtime->motion_binding.value().graph_revision,
+                      prepared->runtime->cell_stop_deadline_budget});
               admission_gate.BindResourceTable(
                   prepared->runtime->addressed_kernel
                       ->resource_admission_table());
@@ -4626,6 +4835,7 @@ RunManagedRuntimeChild(const ManagedRuntimeChildConfig &config) {
           installed_under_fence_composition_request = request;
           preparing_composition_request.reset();
         });
+    bind_disable_handoff_owner();
     require_installed_candidate_configuration();
     {
       std::lock_guard lock(managed_composition_mutex);
@@ -5178,7 +5388,7 @@ private:
              {"program_revision",
               CanonicalValue(status_program.program_revision.value())},
              {"retained_bundle_id",
-             CanonicalValue(bundle.retained_bundle_id().value())},
+              CanonicalValue(bundle.retained_bundle_id().value())},
              {"scene_revision",
               SceneRevisionValue(status_projection.scene_revision)},
          })},

@@ -325,6 +325,56 @@ class HeadlessHttpClient:
     def manager_diff(self) -> dict[str, Any]:
         return self.request("GET", "/api/manager/diff")
 
+    @staticmethod
+    def _cclc_identity_path(prefix: str, identity: str) -> str:
+        if not identity or len(identity.encode("utf-8")) > 256:
+            raise ValueError("CCLC identity must be bounded non-empty text")
+        if "/" in identity or ".." in identity:
+            raise ValueError("CCLC identity is invalid for an HTTP path")
+        return f"{prefix}/{identity}"
+
+    def cclc_component(self, component_id: str) -> dict[str, Any]:
+        return self.request(
+            "GET", self._cclc_identity_path("/api/cclc/components", component_id)
+        )
+
+    def cclc_route_templates(self, component_id: str) -> dict[str, Any]:
+        return self.request(
+            "GET",
+            self._cclc_identity_path("/api/cclc/components", component_id)
+            + "/route-templates",
+        )
+
+    def submit_component_lifecycle(
+        self, body: Mapping[str, Any]
+    ) -> dict[str, Any]:
+        return self.request(
+            "POST", "/api/cclc/lifecycle/requests", body=body
+        )
+
+    def component_lifecycle_status(
+        self, transaction_id: str
+    ) -> dict[str, Any]:
+        return self.request(
+            "GET",
+            self._cclc_identity_path(
+                "/api/cclc/lifecycle/transactions", transaction_id
+            ),
+        )
+
+    def submit_route_selection(
+        self, body: Mapping[str, Any]
+    ) -> dict[str, Any]:
+        return self.request("POST", "/api/cclc/routes/requests", body=body)
+
+    def route_selection_status(self, transaction_id: str) -> dict[str, Any]:
+        return self.request(
+            "GET",
+            self._cclc_identity_path(
+                "/api/cclc/routes/transactions", transaction_id
+            ),
+        )
+
     def node_environment(self) -> dict[str, Any]:
         return self.request("GET", "/api/node-environment")
 

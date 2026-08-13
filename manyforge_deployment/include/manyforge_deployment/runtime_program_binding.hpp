@@ -15,7 +15,7 @@ namespace manyforge::deployment {
 
 class RuntimeProgramBindingResolutionError final
     : public std::invalid_argument {
- public:
+public:
   using std::invalid_argument::invalid_argument;
 };
 
@@ -25,83 +25,83 @@ class RuntimeProgramBindingResolutionError final
 /// graph, retained model map, desired route, and optional provider binding
 /// agree. Active runtime configuration and epochs remain later owner facts.
 class RuntimeProgramTargetBinding final {
- public:
+public:
   ~RuntimeProgramTargetBinding() = default;
-  RuntimeProgramTargetBinding(const RuntimeProgramTargetBinding&) = default;
-  RuntimeProgramTargetBinding& operator=(
-      const RuntimeProgramTargetBinding&) = default;
-  RuntimeProgramTargetBinding(RuntimeProgramTargetBinding&&) noexcept =
+  RuntimeProgramTargetBinding(const RuntimeProgramTargetBinding &) = default;
+  RuntimeProgramTargetBinding &
+  operator=(const RuntimeProgramTargetBinding &) = default;
+  RuntimeProgramTargetBinding(RuntimeProgramTargetBinding &&) noexcept =
       default;
-  RuntimeProgramTargetBinding& operator=(
-      RuntimeProgramTargetBinding&&) noexcept = default;
+  RuntimeProgramTargetBinding &
+  operator=(RuntimeProgramTargetBinding &&) noexcept = default;
 
-  [[nodiscard]] const core::ProgramId& program_id() const noexcept {
+  [[nodiscard]] const core::ProgramId &program_id() const noexcept {
     return program_id_;
   }
-  [[nodiscard]] const core::ProgramRevision& program_revision() const noexcept {
+  [[nodiscard]] const core::ProgramRevision &program_revision() const noexcept {
     return program_revision_;
   }
-  [[nodiscard]] const core::ProgramBindingId& program_binding_id()
-      const noexcept {
+  [[nodiscard]] const core::ProgramBindingId &
+  program_binding_id() const noexcept {
     return program_binding_id_;
   }
-  [[nodiscard]] const core::RetainedBundleId& retained_bundle_id()
-      const noexcept {
+  [[nodiscard]] const core::RetainedBundleId &
+  retained_bundle_id() const noexcept {
     return retained_bundle_id_;
   }
-  [[nodiscard]] const core::GraphRevision& graph_revision() const noexcept {
+  [[nodiscard]] const core::GraphRevision &graph_revision() const noexcept {
     return graph_revision_;
   }
-  [[nodiscard]] const core::ProgramComponentRoleBindingDTO& component_role()
-      const noexcept {
+  [[nodiscard]] const core::ProgramComponentRoleBindingDTO &
+  component_role() const noexcept {
     return component_role_;
   }
-  [[nodiscard]] const core::ProgramTargetRoleBindingDTO& target_role()
-      const noexcept {
+  [[nodiscard]] const core::ProgramTargetRoleBindingDTO &
+  target_role() const noexcept {
     return target_role_;
   }
-  [[nodiscard]] const core::ProgramCapabilityBindingDTO& capability()
-      const noexcept {
+  [[nodiscard]] const core::ProgramCapabilityBindingDTO &
+  capability() const noexcept {
     return capability_;
   }
-  [[nodiscard]] const core::ControllableComponentDTO& component()
-      const noexcept {
+  [[nodiscard]] const core::ControllableComponentDTO &
+  component() const noexcept {
     return component_;
   }
-  [[nodiscard]] const CompositionTargetResolution& model_target()
-      const noexcept {
+  [[nodiscard]] const CompositionTargetResolution &
+  model_target() const noexcept {
     return model_target_;
   }
-  [[nodiscard]] const std::optional<core::ControlBindingDTO>& control_binding()
-      const noexcept {
+  [[nodiscard]] const std::optional<core::ControlBindingDTO> &
+  control_binding() const noexcept {
     return control_binding_;
   }
-  [[nodiscard]] const std::optional<core::ControlDomainDTO>& control_domain()
-      const noexcept {
+  [[nodiscard]] const std::optional<core::ControlDomainDTO> &
+  control_domain() const noexcept {
     return control_domain_;
   }
-  [[nodiscard]] const std::optional<core::DesiredControlConfigurationDTO>&
+  [[nodiscard]] const std::optional<core::DesiredControlConfigurationDTO> &
   desired_control_configuration() const noexcept {
     return desired_control_configuration_;
   }
-  [[nodiscard]] const std::optional<core::ControlRouteId>& desired_route()
-      const noexcept {
+  [[nodiscard]] const std::optional<core::ControlRouteId> &
+  desired_route() const noexcept {
     return desired_route_;
   }
-  [[nodiscard]] const std::optional<CompositionControlBindingCoordinateMap>&
+  [[nodiscard]] const std::optional<CompositionControlBindingCoordinateMap> &
   coordinate_map() const noexcept {
     return coordinate_map_;
   }
-  [[nodiscard]] const std::optional<core::CapabilityProviderBindingDTO>&
+  [[nodiscard]] const std::optional<core::CapabilityProviderBindingDTO> &
   capability_provider_binding() const noexcept {
     return capability_provider_binding_;
   }
-  [[nodiscard]] const std::vector<core::ProgramContactGraspBindingDTO>&
+  [[nodiscard]] const std::vector<core::ProgramContactGraspBindingDTO> &
   contact_grasp_bindings() const noexcept {
     return contact_grasp_bindings_;
   }
 
- private:
+private:
   RuntimeProgramTargetBinding(
       core::ProgramId program_id, core::ProgramRevision program_revision,
       core::ProgramBindingId program_binding_id,
@@ -120,8 +120,7 @@ class RuntimeProgramTargetBinding final {
       std::optional<CompositionControlBindingCoordinateMap> coordinate_map,
       std::optional<core::CapabilityProviderBindingDTO>
           capability_provider_binding,
-      std::vector<core::ProgramContactGraspBindingDTO>
-          contact_grasp_bindings)
+      std::vector<core::ProgramContactGraspBindingDTO> contact_grasp_bindings)
       : program_id_(std::move(program_id)),
         program_revision_(std::move(program_revision)),
         program_binding_id_(std::move(program_binding_id)),
@@ -129,8 +128,7 @@ class RuntimeProgramTargetBinding final {
         graph_revision_(std::move(graph_revision)),
         component_role_(std::move(component_role)),
         target_role_(std::move(target_role)),
-        capability_(std::move(capability)),
-        component_(std::move(component)),
+        capability_(std::move(capability)), component_(std::move(component)),
         model_target_(std::move(model_target)),
         control_binding_(std::move(control_binding)),
         control_domain_(std::move(control_domain)),
@@ -138,8 +136,7 @@ class RuntimeProgramTargetBinding final {
             std::move(desired_control_configuration)),
         desired_route_(std::move(desired_route)),
         coordinate_map_(std::move(coordinate_map)),
-        capability_provider_binding_(
-            std::move(capability_provider_binding)),
+        capability_provider_binding_(std::move(capability_provider_binding)),
         contact_grasp_bindings_(std::move(contact_grasp_bindings)) {}
 
   core::ProgramId program_id_;
@@ -163,17 +160,18 @@ class RuntimeProgramTargetBinding final {
   std::vector<core::ProgramContactGraspBindingDTO> contact_grasp_bindings_;
 
   friend RuntimeProgramTargetBinding resolve_runtime_program_target(
-      const ProgramBinding&, const core::TargetRoleId&,
-      const core::CapabilityId&, const RetainedBundle&,
-      const VerifiedRetainedModelMap&);
+      const ProgramBinding &, const core::TargetRoleId &,
+      const core::CapabilityId &, const RetainedBundle &,
+      const VerifiedRetainedModelMap &);
 };
 
 struct RuntimeProviderEpochFactDTO final {
   core::ProviderInstanceId provider_instance_id;
+  core::RuntimeUnitId provider_runtime_unit_id;
   core::RuntimeEpoch runtime_epoch;
 
-  friend bool operator==(const RuntimeProviderEpochFactDTO&,
-                         const RuntimeProviderEpochFactDTO&) = default;
+  friend bool operator==(const RuntimeProviderEpochFactDTO &,
+                         const RuntimeProviderEpochFactDTO &) = default;
 };
 
 /// Current runtime-owner facts supplied after Component Manager convergence.
@@ -191,19 +189,19 @@ struct ActiveRuntimeParticipantFactsDTO final {
 /// It performs no active-bundle lookup, route mutation, process discovery,
 /// scene access, or hardware I/O.
 [[nodiscard]] RuntimeProgramTargetBinding resolve_runtime_program_target(
-    const ProgramBinding& program_binding,
-    const core::TargetRoleId& target_role_id,
-    const core::CapabilityId& capability_id,
-    const RetainedBundle& retained_bundle,
-    const VerifiedRetainedModelMap& retained_model_map);
+    const ProgramBinding &program_binding,
+    const core::TargetRoleId &target_role_id,
+    const core::CapabilityId &capability_id,
+    const RetainedBundle &retained_bundle,
+    const VerifiedRetainedModelMap &retained_model_map);
 
 /// Combine one sealed retained target with current owner-issued runtime facts.
 /// I6 admits the retained desired route; generic route switching starts at I7.
 /// The Kernel independently verifies and seals the returned owner-to-owner DTO.
 [[nodiscard]] core::RuntimeParticipantBindingDTO
 build_runtime_participant_binding_dto(
-    const RuntimeProgramTargetBinding& target,
-    const ActiveRuntimeParticipantFactsDTO& active_facts,
+    const RuntimeProgramTargetBinding &target,
+    const ActiveRuntimeParticipantFactsDTO &active_facts,
     std::span<const RuntimeProgramTargetBinding> supporting_capabilities = {});
 
-}  // namespace manyforge::deployment
+} // namespace manyforge::deployment

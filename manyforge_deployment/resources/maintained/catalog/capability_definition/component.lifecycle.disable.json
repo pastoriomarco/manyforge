@@ -1,0 +1,7 @@
+{
+  "api_version": "manyforge.capability_definition.v1",
+  "capability_definition_revision": "sha256:578cd871bc7248d18f1ccafe2659acb9d9ad35570c17b30758312d65b37fb4d1",
+  "capability_id": "component.lifecycle.disable",
+  "provider_binding_kind": "capability_provider_binding",
+  "scope": "control_domain"
+}

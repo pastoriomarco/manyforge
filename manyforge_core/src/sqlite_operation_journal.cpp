@@ -14,6 +14,8 @@
 #include <manyforge_content_identity/content_identity.hpp>
 #include <manyforge_core/resource_slot_table.hpp>
 #include <manyforge_core/sqlite_operation_journal.hpp>
+#include <manyforge_core/stop_journal_projection_codec.hpp>
+#include <manyforge_core/stop_scope_resolver.hpp>
 #include <map>
 #include <mutex>
 #include <optional>
@@ -34,8 +36,8 @@ using content_identity::CanonicalValue;
 
 constexpr int kBusyTimeoutMilliseconds = 250;
 constexpr std::uint64_t kMaximumSafeInteger = 9007199254740991ULL;
-constexpr std::int64_t kMaximumDatabasePageImageBytes = 128LL * 1024LL * 1024LL;
-constexpr std::size_t kMaximumRecordJsonBytes = 4U * 1024U * 1024U;
+constexpr std::int64_t kMaximumDatabasePageImageBytes = 8LL * 1024LL * 1024LL * 1024LL;
+constexpr std::size_t kMaximumRecordJsonBytes = 64U * 1024U * 1024U;
 constexpr std::size_t kMaximumRequestCapacity = 4096U;
 constexpr std::size_t kMaximumWallTimeBytes = 128U;
 
@@ -52,7 +54,10 @@ CREATE TABLE owner_epochs (
   owner_epoch TEXT NOT NULL UNIQUE,
   started_at_ns INTEGER NOT NULL,
   request_capacity INTEGER NOT NULL,
-  active INTEGER NOT NULL CHECK (active IN (0, 1))
+  active INTEGER NOT NULL CHECK (active IN (0, 1)),
+  closed_at_ns INTEGER,
+  close_sequence INTEGER UNIQUE,
+  CHECK ((closed_at_ns IS NULL) = (close_sequence IS NULL))
 ) STRICT;
 CREATE UNIQUE INDEX one_active_owner_epoch
   ON owner_epochs(active) WHERE active = 1;
@@ -61,20 +66,64 @@ CREATE TABLE journal_records (
   owner_epoch TEXT NOT NULL,
   record_kind TEXT NOT NULL,
   request_id TEXT,
-  operation_id TEXT NOT NULL,
-  operation_revision INTEGER NOT NULL,
+  stop_id TEXT,
+  stop_generation INTEGER,
+  operation_id TEXT,
+  operation_revision INTEGER,
   occurred_at_ns INTEGER NOT NULL,
   occurred_at_wall TEXT NOT NULL,
   effect_pending INTEGER NOT NULL CHECK (effect_pending IN (0, 1)),
   payload_json TEXT NOT NULL,
   payload_digest TEXT NOT NULL,
+  CHECK ((operation_id IS NULL) = (operation_revision IS NULL)),
+  CHECK ((stop_id IS NULL) = (stop_generation IS NULL)),
+  CHECK ((record_kind IN ('stop_acceptance_projected','stop_terminal_projected',
+                          'stop_surveillance_checkpoint','stop_fault_cleared')) =
+         (stop_id IS NOT NULL)),
+  CHECK (record_kind <> 'stop_acceptance_projected' OR
+         (request_id IS NOT NULL AND operation_id IS NULL)),
   FOREIGN KEY(owner_epoch) REFERENCES owner_epochs(owner_epoch)
 ) STRICT;
 CREATE UNIQUE INDEX journal_request_identity
   ON journal_records(owner_epoch, request_id)
-  WHERE request_id IS NOT NULL;
+  WHERE request_id IS NOT NULL AND record_kind <> 'stop_acceptance_projected';
+CREATE UNIQUE INDEX journal_stop_acceptance_identity
+  ON journal_records(owner_epoch, request_id, stop_id, stop_generation)
+  WHERE record_kind = 'stop_acceptance_projected';
+CREATE UNIQUE INDEX journal_stop_terminal_identity
+  ON journal_records(stop_id, stop_generation)
+  WHERE record_kind = 'stop_terminal_projected';
 CREATE INDEX journal_operation_sequence
   ON journal_records(operation_id, sequence);
+CREATE TABLE stop_projections (
+  stop_id TEXT NOT NULL,
+  stop_generation INTEGER NOT NULL,
+  acceptance_sequence INTEGER NOT NULL UNIQUE,
+  acceptance_payload TEXT NOT NULL,
+  acceptance_digest TEXT NOT NULL,
+  terminal_sequence INTEGER UNIQUE,
+  terminal_payload TEXT,
+  terminal_digest TEXT,
+  surveillance_sequence INTEGER UNIQUE,
+  surveillance_payload TEXT,
+  surveillance_digest TEXT,
+  clear_sequence INTEGER UNIQUE,
+  clear_request_id TEXT,
+  clear_payload TEXT,
+  clear_digest TEXT,
+  CHECK ((terminal_sequence IS NULL) = (terminal_payload IS NULL)),
+  CHECK ((terminal_sequence IS NULL) = (terminal_digest IS NULL)),
+  CHECK ((surveillance_sequence IS NULL) = (surveillance_payload IS NULL)),
+  CHECK ((surveillance_sequence IS NULL) = (surveillance_digest IS NULL)),
+  CHECK ((clear_sequence IS NULL) = (clear_request_id IS NULL)),
+  CHECK ((clear_sequence IS NULL) = (clear_payload IS NULL)),
+  CHECK ((clear_sequence IS NULL) = (clear_digest IS NULL)),
+  PRIMARY KEY(stop_id, stop_generation),
+  FOREIGN KEY(acceptance_sequence) REFERENCES journal_records(sequence),
+  FOREIGN KEY(terminal_sequence) REFERENCES journal_records(sequence),
+  FOREIGN KEY(surveillance_sequence) REFERENCES journal_records(sequence),
+  FOREIGN KEY(clear_sequence) REFERENCES journal_records(sequence)
+) STRICT;
 CREATE TABLE request_tombstones (
   tombstone_sequence INTEGER PRIMARY KEY AUTOINCREMENT,
   owner_epoch TEXT NOT NULL,
@@ -717,10 +766,8 @@ template <typename StrongId>
   runtime_objects.reserve(motion.runtime_object_bindings.size());
   for (const auto& binding : motion.runtime_object_bindings) {
     runtime_objects.emplace_back(CanonicalValue::Object{
-        {"runtime_object_id",
-         CanonicalValue(binding.runtime_object_id.value())},
-        {"scene_resource_id",
-         CanonicalValue(binding.scene_resource_id.value())},
+        {"runtime_object_id", CanonicalValue(binding.runtime_object_id.value())},
+        {"scene_resource_id", CanonicalValue(binding.scene_resource_id.value())},
     });
   }
   return CanonicalValue(CanonicalValue::Object{
@@ -924,41 +971,338 @@ template <typename StrongId>
 }
 
 [[nodiscard]] CanonicalValue StopIntentValue(const StopIntentDTO& intent) {
-  CanonicalValue::Array operations;
-  operations.reserve(intent.operations.size());
-  for (const auto& operation : intent.operations) {
-    operations.emplace_back(CanonicalValue::Object{
-        {"expected_operation_revision",
-         Number(operation.expected_operation_revision.value(), "Stop expected operation revision")},
-        {"expected_stop_generation",
-         Number(operation.expected_stop_generation.value(), "Stop expected generation")},
-        {"operation_id", CanonicalValue(operation.operation_id.value())},
-    });
-  }
+  CanonicalValue selector = std::visit(
+      [](const auto& targets) -> CanonicalValue {
+        using Targets = std::decay_t<decltype(targets)>;
+        CanonicalValue::Array rows;
+        rows.reserve(targets.size());
+        for (const auto& target : targets) {
+          if constexpr (std::is_same_v<Targets, std::vector<StopOperationTargetDTO>>) {
+            rows.emplace_back(CanonicalValue::Object{
+                {"expected_operation_revision", Number(target.expected_operation_revision.value(),
+                                                       "Stop expected operation revision")},
+                {"expected_stop_generation",
+                 Number(target.expected_stop_generation.value(), "Stop expected generation")},
+                {"operation_id", CanonicalValue(target.operation_id.value())},
+            });
+          } else if constexpr (std::is_same_v<Targets, std::vector<StopComponentTargetDTO>>) {
+            rows.emplace_back(CanonicalValue::Object{
+                {"controllable_component_id",
+                 CanonicalValue(target.controllable_component_id.value())},
+                {"expected_component_lifecycle_generation",
+                 Number(target.expected_component_lifecycle_generation.value(),
+                        "Stop expected component lifecycle generation")},
+                {"expected_graph_revision", CanonicalValue(target.expected_graph_revision.value())},
+            });
+          } else {
+            rows.emplace_back(CanonicalValue::Object{
+                {"expected_graph_revision", CanonicalValue(target.expected_graph_revision.value())},
+                {"expected_operation_resource_generation",
+                 Number(target.expected_operation_resource_generation,
+                        "Stop expected operation-resource generation")},
+                {"expected_stop_generation",
+                 Number(target.expected_stop_generation.value(), "Stop expected generation")},
+                {"resource_id", CanonicalValue(target.resource_id.value())},
+            });
+          }
+        }
+        const char* kind = nullptr;
+        if constexpr (std::is_same_v<Targets, std::vector<StopOperationTargetDTO>>) {
+          kind = "operations";
+        } else if constexpr (std::is_same_v<Targets, std::vector<StopComponentTargetDTO>>) {
+          kind = "components";
+        } else {
+          kind = "resources";
+        }
+        return CanonicalValue(CanonicalValue::Object{
+            {kind, CanonicalValue(std::move(rows))},
+            {"selector_kind", CanonicalValue(kind)},
+        });
+      },
+      intent.selector);
   return CanonicalValue(CanonicalValue::Object{
-      {"operations", CanonicalValue(std::move(operations))},
       {"reason", OptionalText(intent.reason)},
+      {"request_attribution", RequestAttributionValue(intent.attribution)},
+      {"request_context", RequestContextValue(intent.request_context)},
+      {"selector", std::move(selector)},
+  });
+}
+
+[[nodiscard]] CanonicalValue FullStopIntentValue(const FullStopIntentDTO& intent) {
+  return CanonicalValue(CanonicalValue::Object{
+      {"expected_stop_generation",
+       Number(intent.expected_stop_generation.value(), "Full Stop expected generation")},
       {"request_attribution", RequestAttributionValue(intent.attribution)},
       {"request_context", RequestContextValue(intent.request_context)},
   });
 }
 
+[[nodiscard]] CanonicalValue ProjectedStopIntentValue(
+    const EmergencyStopProjectedIntentDTO& intent) {
+  return std::visit(
+      [](const auto& selected) -> CanonicalValue {
+        using Intent = std::decay_t<decltype(selected)>;
+        if constexpr (std::is_same_v<Intent, std::monostate>) {
+          return CanonicalValue(CanonicalValue::Object{
+              {"intent_kind", CanonicalValue("malformed_ingress")},
+              {"value", CanonicalValue(nullptr)},
+          });
+        } else if constexpr (std::is_same_v<Intent, StopIntentDTO>) {
+          return CanonicalValue(CanonicalValue::Object{
+              {"intent_kind", CanonicalValue("ordinary_stop")},
+              {"value", StopIntentValue(selected)},
+          });
+        } else {
+          return CanonicalValue(CanonicalValue::Object{
+              {"intent_kind", CanonicalValue("full_stop")},
+              {"value", FullStopIntentValue(selected)},
+          });
+        }
+      },
+      intent);
+}
+
+[[nodiscard]] CanonicalValue StopDiagnosticTargetValue(const StopScopeDiagnosticTargetDTO& target) {
+  return std::visit(
+      [](const auto& selected) -> CanonicalValue {
+        using Target = std::decay_t<decltype(selected)>;
+        if constexpr (std::is_same_v<Target, std::monostate>) {
+          return CanonicalValue(CanonicalValue::Object{
+              {"kind", CanonicalValue("cell")},
+              {"value", CanonicalValue(nullptr)},
+          });
+        } else if constexpr (std::is_same_v<Target, OperationId>) {
+          return CanonicalValue(CanonicalValue::Object{
+              {"kind", CanonicalValue("operation_id")},
+              {"value", CanonicalValue(selected.value())},
+          });
+        } else if constexpr (std::is_same_v<Target, ControllableComponentId>) {
+          return CanonicalValue(CanonicalValue::Object{
+              {"kind", CanonicalValue("controllable_component_id")},
+              {"value", CanonicalValue(selected.value())},
+          });
+        } else {
+          return CanonicalValue(CanonicalValue::Object{
+              {"kind", CanonicalValue("resource_id")},
+              {"value", CanonicalValue(selected.value())},
+          });
+        }
+      },
+      target);
+}
+
+[[nodiscard]] CanonicalValue StopDiagnosticValue(const StopScopeStaleValueDTO& value) {
+  return std::visit(
+      [](const auto& selected) -> CanonicalValue {
+        using Value = std::decay_t<decltype(selected)>;
+        if constexpr (std::is_same_v<Value, std::uint64_t>) {
+          return CanonicalValue(CanonicalValue::Object{
+              {"kind", CanonicalValue("unsigned_integer")},
+              {"value", Number(selected, "Stop diagnostic unsigned integer")},
+          });
+        } else if constexpr (std::is_same_v<Value, RequestOwnerEpoch>) {
+          return CanonicalValue(CanonicalValue::Object{
+              {"kind", CanonicalValue("request_owner_epoch")},
+              {"value", CanonicalValue(selected.value())},
+          });
+        } else if constexpr (std::is_same_v<Value, GraphRevision>) {
+          return CanonicalValue(CanonicalValue::Object{
+              {"kind", CanonicalValue("graph_revision")},
+              {"value", CanonicalValue(selected.value())},
+          });
+        } else if constexpr (std::is_same_v<Value, OperationRevision>) {
+          return CanonicalValue(CanonicalValue::Object{
+              {"kind", CanonicalValue("operation_revision")},
+              {"value", Number(selected.value(), "Stop diagnostic operation revision")},
+          });
+        } else if constexpr (std::is_same_v<Value, ComponentLifecycleGeneration>) {
+          return CanonicalValue(CanonicalValue::Object{
+              {"kind", CanonicalValue("component_lifecycle_generation")},
+              {"value", Number(selected.value(), "Stop diagnostic lifecycle generation")},
+          });
+        } else {
+          return CanonicalValue(CanonicalValue::Object{
+              {"kind", CanonicalValue("stop_generation")},
+              {"value", Number(selected.value(), "Stop diagnostic generation")},
+          });
+        }
+      },
+      value);
+}
+
 [[nodiscard]] CanonicalValue StopAcceptedValue(const StopAcceptedDTO& accepted) {
-  CanonicalValue::Array operations;
-  operations.reserve(accepted.operations.size());
-  for (const auto& operation : accepted.operations) {
-    operations.emplace_back(operation.value());
+  CanonicalValue::Array stale_diagnostics;
+  stale_diagnostics.reserve(accepted.stale_diagnostics.size());
+  for (const auto& diagnostic : accepted.stale_diagnostics) {
+    stale_diagnostics.emplace_back(CanonicalValue::Object{
+        {"current", StopDiagnosticValue(diagnostic.current)},
+        {"expected", StopDiagnosticValue(diagnostic.expected)},
+        {"field", CanonicalValue(std::string(to_string(diagnostic.field)))},
+        {"target", StopDiagnosticTargetValue(diagnostic.target)},
+    });
   }
+
+  CanonicalValue::Array predecessors;
+  predecessors.reserve(accepted.joined_predecessor_stops.size());
+  for (const auto& predecessor : accepted.joined_predecessor_stops) {
+    predecessors.emplace_back(CanonicalValue::Object{
+        {"captured_scope_digest", CanonicalValue(predecessor.captured_scope_digest.value())},
+        {"predecessor_stop_generation",
+         Number(predecessor.predecessor_stop_generation.value(), "predecessor Stop generation")},
+        {"predecessor_stop_id", CanonicalValue(predecessor.predecessor_stop_id.value())},
+        {"remaining_outer_duration_ns_at_join",
+         Timestamp(predecessor.remaining_outer_duration_ns_at_join,
+                   "predecessor remaining Stop duration")},
+    });
+  }
+
+  CanonicalValue::Array affected_operations;
+  affected_operations.reserve(accepted.affected_operation_revisions.size());
+  for (const auto& operation : accepted.affected_operation_revisions) {
+    affected_operations.emplace_back(CanonicalValue::Object{
+        {"operation_id", CanonicalValue(operation.operation_id.value())},
+        {"operation_revision_after_acceptance",
+         Number(operation.operation_revision_after_acceptance.value(),
+                "Stop affected operation revision")},
+    });
+  }
+
+  CanonicalValue::Array participant_budgets;
+  participant_budgets.reserve(accepted.participant_budget_allocations.size());
+  for (const auto& participant : accepted.participant_budget_allocations) {
+    CanonicalValue::Array phases;
+    phases.reserve(participant.phases.size());
+    for (const auto& phase : participant.phases) {
+      phases.emplace_back(CanonicalValue::Object{
+          {"fixed_deadline_offset_ns",
+           Timestamp(phase.fixed_deadline_offset_ns, "fixed Stop phase offset")},
+          {"phase_id", CanonicalValue(phase.phase_id.value())},
+          {"remaining_deadline_offset_ns",
+           Timestamp(phase.remaining_deadline_offset_ns, "remaining Stop phase offset")},
+      });
+    }
+    participant_budgets.emplace_back(CanonicalValue::Object{
+        {"operation_id", CanonicalValue(participant.operation_id.value())},
+        {"origin_stop_generation",
+         Number(participant.origin_stop_generation.value(), "participant origin Stop generation")},
+        {"origin_stop_id", CanonicalValue(participant.origin_stop_id.value())},
+        {"participant_id", CanonicalValue(participant.participant_id.value())},
+        {"participant_stop_invocation_plan_digest",
+         CanonicalValue(participant.participant_stop_invocation_plan_digest.value())},
+        {"phases", CanonicalValue(std::move(phases))},
+    });
+  }
+
   return CanonicalValue(CanonicalValue::Object{
-      {"accepted_at_ns", Timestamp(accepted.accepted_at_ns, "Stop acceptance timestamp")},
-      {"operation_revision_after_acceptance",
-       Number(accepted.operation_revision_after_acceptance.value(),
-              "operation revision after Stop")},
-      {"operations", CanonicalValue(std::move(operations))},
+      {"accepted_at_ns", Timestamp(accepted.accepted_at_ns, "Stop accepted timestamp")},
+      {"affected_operation_revisions", CanonicalValue(std::move(affected_operations))},
+      {"captured_scope_digest", CanonicalValue(accepted.captured_scope_digest.value())},
+      {"fixed_kernel_completion_reserve_ns", Timestamp(accepted.fixed_kernel_completion_reserve_ns,
+                                                       "fixed Kernel Stop completion reserve")},
+      {"fixed_outer_duration_ns",
+       Timestamp(accepted.fixed_outer_duration_ns, "fixed Stop outer duration")},
+      {"joined_predecessor_stops", CanonicalValue(std::move(predecessors))},
+      {"participant_budget_allocations", CanonicalValue(std::move(participant_budgets))},
+      {"remaining_outer_duration_ns",
+       Timestamp(accepted.remaining_outer_duration_ns, "remaining Stop outer duration")},
       {"replay_status", CanonicalValue(std::string(to_string(accepted.replay_status)))},
       {"request_id", CanonicalValue(accepted.request_id.value())},
-      {"stop_generation", Number(accepted.stop_generation.value(), "Stop generation")},
+      {"requested_selector_digest", CanonicalValue(accepted.requested_selector_digest.value())},
+      {"resolution_disposition",
+       CanonicalValue(std::string(to_string(accepted.resolution_disposition)))},
+      {"resolution_reason", CanonicalValue(std::string(to_string(accepted.resolution_reason)))},
+      {"stale_diagnostics", CanonicalValue(std::move(stale_diagnostics))},
+      {"stop_generation", Number(accepted.stop_generation.value(), "accepted Stop generation")},
       {"stop_id", CanonicalValue(accepted.stop_id.value())},
+  });
+}
+
+[[nodiscard]] std::string_view EmergencyStopEntryStateName(
+    EmergencyStopEntryStateDTO state) noexcept {
+  switch (state) {
+    case EmergencyStopEntryStateDTO::kActive:
+      return "active";
+    case EmergencyStopEntryStateDTO::kTerminal:
+      return "terminal";
+  }
+  return {};
+}
+
+[[nodiscard]] std::string_view EmergencyStopAcceptancePathName(
+    EmergencyStopAcceptancePathDTO path) noexcept {
+  switch (path) {
+    case EmergencyStopAcceptancePathDTO::kFreshReserved:
+      return "fresh_reserved";
+    case EmergencyStopAcceptancePathDTO::kJoinedResident:
+      return "joined_resident";
+    case EmergencyStopAcceptancePathDTO::kCoalescedFull:
+      return "coalesced_full";
+  }
+  return {};
+}
+
+[[nodiscard]] std::string_view EmergencyStopProjectionStateName(
+    EmergencyStopProjectionStateDTO state) noexcept {
+  switch (state) {
+    case EmergencyStopProjectionStateDTO::kPending:
+      return "pending";
+    case EmergencyStopProjectionStateDTO::kRecorded:
+      return "recorded";
+    case EmergencyStopProjectionStateDTO::kFailed:
+      return "failed";
+  }
+  return {};
+}
+
+[[nodiscard]] CanonicalValue EmergencyStopAcceptanceRecordValue(
+    const EmergencyStopAcceptanceRecordDTO& acceptance) {
+  return CanonicalValue(CanonicalValue::Object{
+      {"acceptance_path",
+       CanonicalValue(std::string(EmergencyStopAcceptancePathName(acceptance.acceptance_path)))},
+      {"accepted_at_ns", Timestamp(acceptance.accepted_at_ns, "Stop acceptance timestamp")},
+      {"captured_scope_digest", CanonicalValue(acceptance.captured_scope_digest.value())},
+      {"entry_state",
+       CanonicalValue(std::string(EmergencyStopEntryStateName(acceptance.entry_state)))},
+      {"malformed_ingress_reason", OptionalText(acceptance.malformed_ingress_reason)},
+      {"normalized_request_digest", OptionalIdentity(acceptance.normalized_request_digest)},
+      {"outer_deadline_ns", Timestamp(acceptance.outer_deadline_ns, "Stop outer deadline")},
+      {"owner_epoch", CanonicalValue(acceptance.owner_epoch.value())},
+      {"projection_state",
+       CanonicalValue(std::string(EmergencyStopProjectionStateName(acceptance.projection_state)))},
+      {"replay_status", CanonicalValue(std::string(to_string(acceptance.replay_status)))},
+      {"request_attribution", RequestAttributionValue(acceptance.attribution)},
+      {"request_id", CanonicalValue(acceptance.request_id.value())},
+      {"resolution_disposition",
+       CanonicalValue(std::string(to_string(acceptance.resolution_disposition)))},
+      {"stop_generation", Number(acceptance.stop_generation.value(), "Stop generation")},
+      {"stop_id", CanonicalValue(acceptance.stop_id.value())},
+  });
+}
+
+[[nodiscard]] CanonicalValue EmergencyStopAffectedStateValue(
+    const EmergencyStopAffectedStateSnapshotDTO& affected_state) {
+  CanonicalValue::Array operations;
+  operations.reserve(affected_state.operations.size());
+  for (const auto& operation : affected_state.operations) {
+    operations.emplace_back(OperationStateValue(operation));
+  }
+  return CanonicalValue(CanonicalValue::Object{
+      {"operations", CanonicalValue(std::move(operations))},
+      {"resources", StringArray(affected_state.resources)},
+  });
+}
+
+[[nodiscard]] CanonicalValue EmergencyStopAcceptanceProjectionValue(
+    const EmergencyStopAcceptanceRecordDTO& acceptance,
+    const EmergencyStopProjectedIntentDTO& intent, const StopAcceptedDTO& accepted,
+    const EmergencyStopAffectedStateSnapshotDTO& affected_state) {
+  return CanonicalValue(CanonicalValue::Object{
+      {"acceptance", EmergencyStopAcceptanceRecordValue(acceptance)},
+      {"accepted", StopAcceptedValue(accepted)},
+      {"affected_state", EmergencyStopAffectedStateValue(affected_state)},
+      {"api_version", CanonicalValue("manyforge.stop_acceptance_projection.v2")},
+      {"intent", ProjectedStopIntentValue(intent)},
+      {"record_kind", CanonicalValue("stop_acceptance_projected")},
   });
 }
 
@@ -1104,6 +1448,192 @@ void RequireState(const OperationStateDTO& state) {
           "operation state is invalid at the durable boundary");
 }
 
+[[nodiscard]] bool BoundedNfcText(std::string_view value, std::size_t maximum) noexcept {
+  if (value.empty() || value.size() > maximum || value.find('\0') != std::string_view::npos) {
+    return false;
+  }
+  try {
+    return content_identity::is_utf8_nfc(value);
+  } catch (...) {
+    return false;
+  }
+}
+
+[[nodiscard]] bool BoundedIdentity(std::string_view value, std::size_t maximum) noexcept {
+  return !value.empty() && value.size() <= maximum && value.find('\0') == std::string_view::npos;
+}
+
+[[nodiscard]] bool KnownEmergencyStopRecordEnums(
+    const EmergencyStopAcceptanceRecordDTO& acceptance) noexcept {
+  return !EmergencyStopEntryStateName(acceptance.entry_state).empty() &&
+         !EmergencyStopAcceptancePathName(acceptance.acceptance_path).empty() &&
+         !EmergencyStopProjectionStateName(acceptance.projection_state).empty() &&
+         !to_string(acceptance.resolution_disposition).empty() &&
+         (acceptance.replay_status == RequestReplayStatusDTO::kAcceptedNew ||
+          acceptance.replay_status == RequestReplayStatusDTO::kReplayedExact);
+}
+
+void RequireEmergencyStopProjection(const RequestOwnerEpoch& owner_epoch,
+                                    const EmergencyStopAcceptanceRecordDTO& acceptance,
+                                    const EmergencyStopProjectedIntentDTO& intent,
+                                    const StopAcceptedDTO& accepted,
+                                    const EmergencyStopAffectedStateSnapshotDTO& affected_state) {
+  Require(acceptance.owner_epoch == owner_epoch &&
+              BoundedIdentity(owner_epoch.value(), kMaximumStopIdentityBytes) &&
+              BoundedIdentity(acceptance.request_id.value(), kMaximumEmergencyStopRequestIdBytes) &&
+              BoundedIdentity(acceptance.stop_id.value(), kMaximumEmergencyStopIdentityBytes) &&
+              acceptance.stop_generation.nonzero() && acceptance.accepted_at_ns >= 0 &&
+              acceptance.outer_deadline_ns > acceptance.accepted_at_ns &&
+              static_cast<std::uint64_t>(acceptance.outer_deadline_ns) <= kMaximumSafeInteger &&
+              content_identity::is_sha256_digest(acceptance.captured_scope_digest.value()) &&
+              acceptance.projection_state == EmergencyStopProjectionStateDTO::kPending &&
+              KnownEmergencyStopRecordEnums(acceptance) && acceptance.attribution.locally_valid() &&
+              (!acceptance.attribution.principal_id.has_value() ||
+               BoundedNfcText(*acceptance.attribution.principal_id,
+                              kMaximumEmergencyStopPrincipalBytes)),
+          "operation_journal_record_invalid",
+          "emergency Stop acceptance record is invalid or is not pending projection");
+
+  const bool normalized = acceptance.normalized_request_digest.has_value();
+  const bool malformed = acceptance.malformed_ingress_reason.has_value();
+  Require(normalized != malformed &&
+              (!normalized ||
+               content_identity::is_sha256_digest(acceptance.normalized_request_digest->value())) &&
+              (!malformed || BoundedNfcText(*acceptance.malformed_ingress_reason,
+                                            kMaximumEmergencyStopMalformedReasonBytes)),
+          "operation_journal_record_invalid",
+          "emergency Stop request identity has an invalid normalized/malformed shape");
+
+  Require(!stop_accepted_field_error(accepted).has_value() &&
+              accepted.request_id == acceptance.request_id &&
+              accepted.replay_status == acceptance.replay_status &&
+              accepted.stop_id == acceptance.stop_id &&
+              accepted.stop_generation == acceptance.stop_generation &&
+              accepted.accepted_at_ns == acceptance.accepted_at_ns &&
+              accepted.remaining_outer_duration_ns ==
+                  acceptance.outer_deadline_ns - acceptance.accepted_at_ns &&
+              accepted.resolution_disposition == acceptance.resolution_disposition &&
+              accepted.captured_scope_digest == acceptance.captured_scope_digest,
+          "operation_journal_record_invalid",
+          "complete Stop acceptance does not match its linearized reserve record");
+
+  const auto require_context_join = [&](const auto& selected) {
+    Require(selected.request_context.request_owner_epoch == owner_epoch &&
+                selected.request_context.request_id == acceptance.request_id &&
+                selected.attribution == acceptance.attribution,
+            "operation_journal_record_invalid",
+            "projected Stop intent does not match its linearized acceptance record");
+  };
+  std::visit(
+      [&](const auto& selected) {
+        using Intent = std::decay_t<decltype(selected)>;
+        if constexpr (std::is_same_v<Intent, std::monostate>) {
+          Require(malformed && !normalized &&
+                      acceptance.resolution_disposition ==
+                          StopResolutionDispositionDTO::kPromotedToFull &&
+                      acceptance.acceptance_path == EmergencyStopAcceptancePathDTO::kCoalescedFull,
+                  "operation_journal_record_invalid",
+                  "malformed Stop ingress was not conservatively accepted as Full Stop");
+        } else if constexpr (std::is_same_v<Intent, StopIntentDTO>) {
+          Require(normalized && !malformed && !stop_intent_field_error(selected).has_value(),
+                  "operation_journal_record_invalid",
+                  "normalized ordinary Stop projection contains an invalid intent");
+          require_context_join(selected);
+          const auto normalized_digest = ComputeNormalizedStopIntentDigest(selected);
+          const auto selector_digest = ComputeRequestedStopSelectorDigest(selected);
+          Require(normalized_digest.ok() && selector_digest.ok() &&
+                      *acceptance.normalized_request_digest == normalized_digest.value() &&
+                      accepted.requested_selector_digest == selector_digest.value(),
+                  "operation_journal_record_invalid",
+                  "ordinary Stop projection digests do not match the exact intent");
+        } else {
+          Require(normalized && !malformed && !full_stop_intent_field_error(selected).has_value(),
+                  "operation_journal_record_invalid",
+                  "normalized Full Stop projection contains an invalid intent");
+          require_context_join(selected);
+          const auto normalized_digest = ComputeNormalizedStopIntentDigest(selected);
+          const auto selector_digest = ComputeRequestedStopSelectorDigest(selected);
+          Require(normalized_digest.ok() && selector_digest.ok() &&
+                      *acceptance.normalized_request_digest == normalized_digest.value() &&
+                      accepted.requested_selector_digest == selector_digest.value(),
+                  "operation_journal_record_invalid",
+                  "Full Stop projection digests do not match the exact intent");
+        }
+      },
+      intent);
+
+  Require(
+      affected_state.operations.size() <= kMaximumOperationJournalHistory &&
+          affected_state.resources.size() <= kMaxKernelResourceSlots &&
+          std::is_sorted(affected_state.operations.begin(), affected_state.operations.end(),
+                         [](const auto& left, const auto& right) {
+                           return left.operation_id < right.operation_id;
+                         }) &&
+          std::adjacent_find(affected_state.operations.begin(), affected_state.operations.end(),
+                             [](const auto& left, const auto& right) {
+                               return left.operation_id == right.operation_id;
+                             }) == affected_state.operations.end() &&
+          std::is_sorted(affected_state.resources.begin(), affected_state.resources.end()) &&
+          std::adjacent_find(affected_state.resources.begin(), affected_state.resources.end()) ==
+              affected_state.resources.end() &&
+          std::none_of(affected_state.resources.begin(), affected_state.resources.end(),
+                       [](const auto& resource) { return resource.empty(); }),
+      "operation_journal_record_invalid",
+      "emergency Stop affected-state snapshot is not canonical or bounded");
+
+  Require(affected_state.operations.size() == accepted.affected_operation_revisions.size(),
+          "operation_journal_record_invalid",
+          "affected-state snapshot does not cover every accepted operation exactly once");
+
+  for (std::size_t index = 0U; index < affected_state.operations.size(); ++index) {
+    const auto& state = affected_state.operations[index];
+    const auto& affected = accepted.affected_operation_revisions[index];
+    RequireState(state);
+    Require(state.operation_id == affected.operation_id &&
+                state.operation_revision == affected.operation_revision_after_acceptance,
+            "operation_journal_record_invalid",
+            "affected operation state does not match its accepted revision");
+
+    const auto first_budget =
+        std::lower_bound(accepted.participant_budget_allocations.begin(),
+                         accepted.participant_budget_allocations.end(), state.operation_id,
+                         [](const auto& budget, const OperationId& operation_id) {
+                           return budget.operation_id < operation_id;
+                         });
+    Require(first_budget != accepted.participant_budget_allocations.end() &&
+                first_budget->operation_id == state.operation_id,
+            "operation_journal_record_invalid",
+            "affected operation has no origin-tagged participant budget");
+    const auto origin_stop_id = first_budget->origin_stop_id;
+    const auto origin_stop_generation = first_budget->origin_stop_generation;
+    Require(
+        std::all_of(first_budget,
+                    std::upper_bound(first_budget, accepted.participant_budget_allocations.end(),
+                                     state.operation_id,
+                                     [](const OperationId& operation_id, const auto& budget) {
+                                       return operation_id < budget.operation_id;
+                                     }),
+                    [&](const auto& budget) {
+                      return budget.origin_stop_id == origin_stop_id &&
+                             budget.origin_stop_generation == origin_stop_generation;
+                    }) &&
+            state.active_stop_id == origin_stop_id &&
+            state.active_stop_generation == origin_stop_generation,
+        "operation_journal_record_invalid",
+        "affected operation does not retain its exact originating Stop");
+    for (const auto& participant : state.participants) {
+      Require(std::is_sorted(participant.resources.begin(), participant.resources.end()) &&
+                  std::all_of(participant.resources.begin(), participant.resources.end(),
+                              [&](const auto& resource) {
+                                return std::binary_search(affected_state.resources.begin(),
+                                                          affected_state.resources.end(), resource);
+                              }),
+              "operation_journal_record_invalid",
+              "affected operation resources are not canonical members of the captured scope");
+    }
+  }
+}
+
 [[nodiscard]] std::filesystem::path ValidatePath(std::filesystem::path path) {
   Require(!path.empty() && path.filename() != "." && path.filename() != "..",
           "operation_journal_path_invalid", "operation journal database path is invalid");
@@ -1146,6 +1676,8 @@ void RequireState(const OperationStateDTO& state) {
   static const std::set<std::string> names{
       "index:journal_operation_sequence",
       "index:journal_request_identity",
+      "index:journal_stop_acceptance_identity",
+      "index:journal_stop_terminal_identity",
       "index:one_active_owner_epoch",
       "index:operation_snapshot_epoch",
       "table:journal_metadata",
@@ -1156,6 +1688,7 @@ void RequireState(const OperationStateDTO& state) {
       "table:operation_snapshots",
       "table:owner_epochs",
       "table:request_tombstones",
+      "table:stop_projections",
   };
   return names;
 }
@@ -1170,6 +1703,50 @@ template <typename T>
     return Result<T>::Err(ErrorDTO{"operation_journal_internal_failure",
                                    error.what(),
                                    {{"reason", "operation_journal_exception"}}});
+  }
+}
+
+[[nodiscard]] EmergencyStopAcceptanceProjectionResultDTO AsStopProjectionResult(
+    auto&& function) noexcept {
+  try {
+    return EmergencyStopAcceptanceProjectionResultDTO{EmergencyStopProjectionStateDTO::kRecorded,
+                                                      function(), std::nullopt};
+  } catch (const JournalFailure& error) {
+    return EmergencyStopAcceptanceProjectionResultDTO{EmergencyStopProjectionStateDTO::kFailed,
+                                                      std::nullopt, JournalError(error)};
+  } catch (const std::exception& error) {
+    return EmergencyStopAcceptanceProjectionResultDTO{
+        EmergencyStopProjectionStateDTO::kFailed, std::nullopt,
+        ErrorDTO{"operation_journal_internal_failure",
+                 error.what(),
+                 {{"reason", "operation_journal_exception"}}}};
+  } catch (...) {
+    return EmergencyStopAcceptanceProjectionResultDTO{
+        EmergencyStopProjectionStateDTO::kFailed, std::nullopt,
+        ErrorDTO{"operation_journal_internal_failure",
+                 "unknown operation journal exception",
+                 {{"reason", "operation_journal_exception"}}}};
+  }
+}
+
+[[nodiscard]] StopForensicProjectionResultDTO AsStopForensicProjectionResult(
+    auto&& function) noexcept {
+  try {
+    return StopForensicProjectionResultDTO{StopForensicProjectionStateDTO::kRecorded, function(),
+                                           std::nullopt};
+  } catch (const JournalFailure& error) {
+    return StopForensicProjectionResultDTO{StopForensicProjectionStateDTO::kFailed, std::nullopt,
+                                           JournalError(error)};
+  } catch (const std::exception& error) {
+    return StopForensicProjectionResultDTO{StopForensicProjectionStateDTO::kFailed, std::nullopt,
+                                           ErrorDTO{"operation_journal_internal_failure",
+                                                    error.what(),
+                                                    {{"reason", "operation_journal_exception"}}}};
+  } catch (...) {
+    return StopForensicProjectionResultDTO{StopForensicProjectionStateDTO::kFailed, std::nullopt,
+                                           ErrorDTO{"operation_journal_internal_failure",
+                                                    "unknown operation journal exception",
+                                                    {{"reason", "operation_journal_exception"}}}};
   }
 }
 
@@ -1449,6 +2026,39 @@ void StoreOperationSnapshot(sqlite3* database, const RequestOwnerEpoch& owner_ep
   }
 }
 
+/// An asynchronous Stop projection may arrive after a later operation-state
+/// projection. Retain the acceptance event, but never let its captured state
+/// regress the recovery snapshot.
+void StoreOperationSnapshotMonotonic(sqlite3* database, const RequestOwnerEpoch& owner_epoch,
+                                     const OperationStateDTO& state,
+                                     std::uint64_t snapshot_sequence) {
+  Statement present(database, "SELECT COUNT(*) FROM operation_snapshots WHERE operation_id=?");
+  present.Bind(1, state.operation_id.value());
+  Require(present.Step(), "operation_journal_corrupt",
+          "operation snapshot presence query returned no row");
+  const auto count = present.Integer(0);
+  Require(!present.Step() && (count == 0 || count == 1), "operation_journal_corrupt",
+          "operation snapshot presence query is invalid");
+  if (count == 0) {
+    StoreOperationSnapshot(database, owner_epoch, state, snapshot_sequence, "current");
+    return;
+  }
+
+  const auto current = LoadOperationState(database, state.operation_id);
+  if (current.operation_revision.value() > state.operation_revision.value() ||
+      (current.operation_revision == state.operation_revision &&
+       current.updated_at_ns > state.updated_at_ns)) {
+    return;
+  }
+  if (current.operation_revision == state.operation_revision &&
+      current.updated_at_ns == state.updated_at_ns) {
+    Require(current == state, "operation_journal_corrupt",
+            "equal operation revision/timestamp names conflicting immutable state");
+    return;
+  }
+  StoreOperationSnapshot(database, owner_epoch, state, snapshot_sequence, "current");
+}
+
 }  // namespace
 
 class SqliteOperationJournal::Impl final {
@@ -1525,8 +2135,27 @@ class SqliteOperationJournal::Impl final {
                                       const OperationStateDTO& state);
 
   std::uint64_t RecordStopAccepted(const RequestOwnerEpoch& owner_epoch,
-                                   const StopIntentDTO& intent, const StopAcceptedDTO& accepted,
-                                   const OperationStateDTO& state);
+                                   const EmergencyStopAcceptanceRecordDTO& acceptance,
+                                   const EmergencyStopProjectedIntentDTO& intent,
+                                   const StopAcceptedDTO& accepted,
+                                   const EmergencyStopAffectedStateSnapshotDTO& affected_state);
+
+  std::uint64_t RecordStopTerminal(const RequestOwnerEpoch& owner_epoch,
+                                   const StopStatusDTO& stop_status,
+                                   const StopCertificateDTO& certificate,
+                                   const std::optional<StopFaultLatchDTO>& fault_latch);
+
+  std::uint64_t RecordStopSurveillanceCheckpoint(const RequestOwnerEpoch& owner_epoch,
+                                                 const StopPostTerminalSurveillanceDTO& checkpoint,
+                                                 const StopFaultLatchDTO& fault_latch);
+
+  std::uint64_t RecordStopFaultCleared(const RequestOwnerEpoch& owner_epoch,
+                                       const StopFaultRecoveryIntentDTO& recovery_intent,
+                                       const StopFaultRecoveryResultDTO& recovery_result,
+                                       const StopFaultLatchDTO& cleared_latch,
+                                       const StopStatusDTO& resulting_stop_status);
+
+  std::uint64_t CloseOwnerEpoch(const RequestOwnerEpoch& owner_epoch, std::int64_t closed_at_ns);
 
   std::uint64_t RecordRuntimeScaleAccepted(const RequestOwnerEpoch& owner_epoch,
                                            const RuntimeScaleRequestDTO& request,
@@ -1622,6 +2251,20 @@ class SqliteOperationJournal::Impl final {
                        std::int64_t occurred_at_ns, bool effect_pending,
                        std::string_view disposition);
 
+  std::uint64_t AppendStopAcceptance(const RequestOwnerEpoch& owner_epoch,
+                                     const EmergencyStopAcceptanceRecordDTO& acceptance,
+                                     const CanonicalValue& record_value,
+                                     const StopAcceptedDTO& accepted,
+                                     const EmergencyStopAffectedStateSnapshotDTO& affected_state);
+
+  std::uint64_t AppendStopTerminal(const RequestOwnerEpoch& owner_epoch,
+                                   const StopJournalTerminalProjectionDTO& projection,
+                                   const std::string& payload_json);
+
+  std::uint64_t AppendStopSurveillanceCheckpoint(
+      const RequestOwnerEpoch& owner_epoch, const StopJournalSurveillanceProjectionDTO& projection,
+      const std::string& payload_json);
+
   std::filesystem::path database_path_;
   CellId cell_id_;
   std::size_t history_capacity_;
@@ -1665,7 +2308,8 @@ std::uint64_t SqliteOperationJournal::Impl::Append(const RequestOwnerEpoch& owne
   if (request_id.has_value()) {
     Statement request_count(database_,
                             "SELECT COUNT(*) FROM journal_records "
-                            "WHERE owner_epoch=? AND request_id IS NOT NULL");
+                            "WHERE owner_epoch=? AND request_id IS NOT NULL "
+                            "AND record_kind<>'stop_acceptance_projected'");
     request_count.Bind(1, owner_epoch.value());
     Require(request_count.Step(), "operation_journal_corrupt",
             "operation journal request count returned no row");
@@ -1676,7 +2320,8 @@ std::uint64_t SqliteOperationJournal::Impl::Append(const RequestOwnerEpoch& owne
             "operation journal request ledger reached its fixed bound");
     Statement existing(database_,
                        "SELECT record_kind,payload_digest FROM journal_records "
-                       "WHERE owner_epoch=? AND request_id=?");
+                       "WHERE owner_epoch=? AND request_id=? "
+                       "AND record_kind<>'stop_acceptance_projected'");
     existing.Bind(1, owner_epoch.value());
     existing.Bind(2, request_id->value());
     Require(!existing.Step(), "request_id_conflict",
@@ -1721,6 +2366,288 @@ std::uint64_t SqliteOperationJournal::Impl::Append(const RequestOwnerEpoch& owne
   return bounded_sequence;
 }
 
+std::uint64_t SqliteOperationJournal::Impl::AppendStopAcceptance(
+    const RequestOwnerEpoch& owner_epoch, const EmergencyStopAcceptanceRecordDTO& acceptance,
+    const CanonicalValue& record_value, const StopAcceptedDTO& accepted,
+    const EmergencyStopAffectedStateSnapshotDTO& affected_state) {
+  const auto payload_json = content_identity::canonical_json(record_value);
+  Require(payload_json.size() <= kMaximumRecordJsonBytes, "operation_journal_record_too_large",
+          "Stop acceptance projection exceeds the fixed payload bound");
+  const auto payload_digest = content_identity::sha256_digest(payload_json);
+
+  std::lock_guard lock(mutex_);
+  RequireOpen();
+  const auto occurred_at_wall = wall_time_text_();
+  ValidateWallTimeText(occurred_at_wall);
+  Transaction transaction(database_);
+  Statement active(database_, "SELECT COUNT(*) FROM owner_epochs WHERE owner_epoch=? AND active=1");
+  active.Bind(1, owner_epoch.value());
+  Require(active.Step() && active.Integer(0) == 1 && !active.Step(),
+          "operation_journal_owner_epoch_stale",
+          "Stop acceptance projection names a non-active owner epoch");
+
+  // Projection retry is idempotent by exact canonical payload. Different
+  // accepted records may legitimately share a request ID after conservative
+  // conflict promotion, so request identity alone is not a uniqueness key.
+  Statement existing(database_,
+                     "SELECT sequence,payload_json FROM journal_records "
+                     "WHERE owner_epoch=? AND record_kind='stop_acceptance_projected' "
+                     "AND request_id=? AND stop_id=? AND stop_generation=?");
+  existing.Bind(1, owner_epoch.value());
+  existing.Bind(2, acceptance.request_id.value());
+  existing.Bind(3, acceptance.stop_id.value());
+  existing.Bind(4, static_cast<std::int64_t>(acceptance.stop_generation.value()));
+  if (existing.Step()) {
+    const auto sequence = PositiveIdentifier(existing.Integer(0), "operation journal sequence");
+    Require(existing.Text(1) == payload_json && !existing.Step(),
+            "operation_journal_stop_projection_conflict",
+            "Stop acceptance identity names different canonical projection bytes");
+    const auto acceptance_projection = EncodeStopJournalAcceptanceProjection(
+        StopJournalAcceptanceProjectionDTO{accepted, affected_state});
+    Require(acceptance_projection.ok(), "operation_journal_record_invalid",
+            "Stop acceptance recovery projection is invalid");
+    Statement existing_projection(
+        database_,
+        "SELECT stop_generation,acceptance_sequence,acceptance_payload FROM stop_projections "
+        "WHERE stop_id=? AND stop_generation=?");
+    existing_projection.Bind(1, accepted.stop_id.value());
+    existing_projection.Bind(2, static_cast<std::int64_t>(accepted.stop_generation.value()));
+    Require(existing_projection.Step() &&
+                PositiveIdentifier(existing_projection.Integer(0), "Stop generation") ==
+                    accepted.stop_generation.value() &&
+                PositiveIdentifier(existing_projection.Integer(1), "operation journal sequence") ==
+                    sequence &&
+                existing_projection.Text(2) == acceptance_projection.value() &&
+                !existing_projection.Step(),
+            "operation_journal_stop_projection_conflict",
+            "Stop acceptance replay conflicts with its durable recovery projection");
+    transaction.Commit();
+    return sequence;
+  }
+
+  Statement insert(database_,
+                   "INSERT INTO journal_records(owner_epoch,record_kind,request_id,stop_id,"
+                   "stop_generation,"
+                   "operation_id,operation_revision,occurred_at_ns,occurred_at_wall,"
+                   "effect_pending,payload_json,payload_digest) "
+                   "VALUES(?,'stop_acceptance_projected',?,?,?,NULL,NULL,?,?,?,?,?)");
+  insert.Bind(1, owner_epoch.value());
+  insert.Bind(2, acceptance.request_id.value());
+  insert.Bind(3, acceptance.stop_id.value());
+  insert.Bind(4, static_cast<std::int64_t>(acceptance.stop_generation.value()));
+  insert.Bind(5, acceptance.accepted_at_ns);
+  insert.Bind(6, occurred_at_wall);
+  insert.Bind(7, static_cast<std::int64_t>(
+                     acceptance.entry_state == EmergencyStopEntryStateDTO::kActive ? 1 : 0));
+  insert.Bind(8, payload_json);
+  insert.Bind(9, payload_digest);
+  Require(!insert.Step(), "operation_journal_corrupt",
+          "Stop acceptance journal insert returned an unexpected row");
+  const auto sequence =
+      PositiveIdentifier(sqlite3_last_insert_rowid(database_), "operation journal sequence");
+  for (const auto& state : affected_state.operations) {
+    StoreOperationSnapshotMonotonic(database_, owner_epoch, state, sequence);
+  }
+  const auto acceptance_projection = EncodeStopJournalAcceptanceProjection(
+      StopJournalAcceptanceProjectionDTO{accepted, affected_state});
+  Require(acceptance_projection.ok(), "operation_journal_record_invalid",
+          "Stop acceptance recovery projection is invalid");
+  Statement insert_projection(
+      database_,
+      "INSERT INTO stop_projections(stop_id,stop_generation,acceptance_sequence,"
+      "acceptance_payload,acceptance_digest,terminal_sequence,terminal_payload,terminal_digest,"
+      "surveillance_sequence,surveillance_payload,surveillance_digest,clear_sequence,"
+      "clear_request_id,clear_payload,clear_digest) "
+      "VALUES(?,?,?,?,?,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL)");
+  insert_projection.Bind(1, accepted.stop_id.value());
+  insert_projection.Bind(2, static_cast<std::int64_t>(accepted.stop_generation.value()));
+  insert_projection.Bind(3, static_cast<std::int64_t>(sequence));
+  insert_projection.Bind(4, acceptance_projection.value());
+  insert_projection.Bind(5, content_identity::sha256_digest(acceptance_projection.value()));
+  Require(!insert_projection.Step(), "operation_journal_corrupt",
+          "Stop acceptance recovery projection insert returned an unexpected row");
+  transaction.Commit();
+  return sequence;
+}
+
+std::uint64_t SqliteOperationJournal::Impl::AppendStopSurveillanceCheckpoint(
+    const RequestOwnerEpoch& owner_epoch, const StopJournalSurveillanceProjectionDTO& projection,
+    const std::string& payload_json) {
+  Require(payload_json.size() <= kMaximumRecordJsonBytes, "operation_journal_record_too_large",
+          "Stop surveillance projection exceeds the fixed payload bound");
+  const auto payload_digest = content_identity::sha256_digest(payload_json);
+  std::lock_guard lock(mutex_);
+  RequireOpen();
+  const auto occurred_at_wall = wall_time_text_();
+  ValidateWallTimeText(occurred_at_wall);
+  Transaction transaction(database_);
+  Statement active(database_, "SELECT COUNT(*) FROM owner_epochs WHERE owner_epoch=? AND active=1");
+  active.Bind(1, owner_epoch.value());
+  Require(active.Step() && active.Integer(0) == 1 && !active.Step(),
+          "operation_journal_owner_epoch_stale",
+          "Stop surveillance projection names a non-active owner epoch");
+
+  Statement current(database_,
+                    "SELECT terminal_payload,surveillance_sequence,surveillance_payload "
+                    "FROM stop_projections WHERE stop_id=? AND stop_generation=?");
+  current.Bind(1, projection.checkpoint.stop_id.value());
+  current.Bind(2, static_cast<std::int64_t>(projection.checkpoint.stop_generation.value()));
+  Require(current.Step() && !current.IsNull(0), "operation_journal_stop_terminal_missing",
+          "Stop surveillance checkpoint has no durable terminal predecessor");
+  auto terminal = DecodeStopJournalTerminalProjection(current.Text(0));
+  Require(terminal.ok() &&
+              terminal.value().certificate.stop_certificate_id ==
+                  projection.checkpoint.stop_certificate.stop_certificate_id &&
+              terminal.value().certificate.stop_certificate_revision ==
+                  projection.checkpoint.stop_certificate.stop_certificate_revision,
+          "operation_journal_stop_projection_conflict",
+          "Stop surveillance checkpoint does not join durable terminal truth");
+  if (!current.IsNull(1)) {
+    const auto prior_sequence =
+        PositiveIdentifier(current.Integer(1), "operation journal sequence");
+    auto prior = DecodeStopJournalSurveillanceProjection(current.Text(2));
+    Require(prior.ok(), "operation_journal_corrupt",
+            "Stop surveillance recovery projection cannot be decoded");
+    if (prior.value() == projection) {
+      Require(!current.Step(), "operation_journal_corrupt",
+              "Stop surveillance lookup returned duplicate rows");
+      transaction.Commit();
+      return prior_sequence;
+    }
+    Require(projection.checkpoint.checkpoint_generation >
+                    prior.value().checkpoint.checkpoint_generation &&
+                projection.checkpoint.surveillance_generation >
+                    prior.value().checkpoint.surveillance_generation &&
+                projection.checkpoint.continued_motion_count >=
+                    prior.value().checkpoint.continued_motion_count &&
+                projection.fault_latch.recovery_assessment_revision >=
+                    prior.value().fault_latch.recovery_assessment_revision,
+            "operation_journal_stop_projection_conflict",
+            "Stop surveillance checkpoint regresses durable monotonic truth");
+  }
+  Require(!current.Step(), "operation_journal_corrupt",
+          "Stop surveillance lookup returned duplicate rows");
+
+  Statement insert(database_,
+                   "INSERT INTO journal_records(owner_epoch,record_kind,request_id,stop_id,"
+                   "stop_generation,operation_id,operation_revision,occurred_at_ns,"
+                   "occurred_at_wall,effect_pending,payload_json,payload_digest) "
+                   "VALUES(?,'stop_surveillance_checkpoint',NULL,?,?,NULL,NULL,?,?,?,?,?)");
+  insert.Bind(1, owner_epoch.value());
+  insert.Bind(2, projection.checkpoint.stop_id.value());
+  insert.Bind(3, static_cast<std::int64_t>(projection.checkpoint.stop_generation.value()));
+  insert.Bind(4, *projection.checkpoint.late_quiescence_observed_at_ns);
+  insert.Bind(5, occurred_at_wall);
+  insert.Bind(6, static_cast<std::int64_t>(0));
+  insert.Bind(7, payload_json);
+  insert.Bind(8, payload_digest);
+  Require(!insert.Step(), "operation_journal_corrupt",
+          "Stop surveillance journal insert returned an unexpected row");
+  const auto sequence =
+      PositiveIdentifier(sqlite3_last_insert_rowid(database_), "operation journal sequence");
+  Statement update(database_,
+                   "UPDATE stop_projections SET surveillance_sequence=?,surveillance_payload=?,"
+                   "surveillance_digest=? WHERE stop_id=? AND stop_generation=?");
+  update.Bind(1, static_cast<std::int64_t>(sequence));
+  update.Bind(2, payload_json);
+  update.Bind(3, payload_digest);
+  update.Bind(4, projection.checkpoint.stop_id.value());
+  update.Bind(5, static_cast<std::int64_t>(projection.checkpoint.stop_generation.value()));
+  Require(!update.Step() && sqlite3_changes(database_) == 1, "operation_journal_corrupt",
+          "Stop surveillance durable projection update did not affect exactly one row");
+  transaction.Commit();
+  return sequence;
+}
+
+std::uint64_t SqliteOperationJournal::Impl::AppendStopTerminal(
+    const RequestOwnerEpoch& owner_epoch, const StopJournalTerminalProjectionDTO& projection,
+    const std::string& payload_json) {
+  Require(payload_json.size() <= kMaximumRecordJsonBytes, "operation_journal_record_too_large",
+          "Stop terminal projection exceeds the fixed payload bound");
+  const auto payload_digest = content_identity::sha256_digest(payload_json);
+
+  std::lock_guard lock(mutex_);
+  RequireOpen();
+  const auto occurred_at_wall = wall_time_text_();
+  ValidateWallTimeText(occurred_at_wall);
+  Transaction transaction(database_);
+  Statement active(database_, "SELECT COUNT(*) FROM owner_epochs WHERE owner_epoch=? AND active=1");
+  active.Bind(1, owner_epoch.value());
+  Require(active.Step() && active.Integer(0) == 1 && !active.Step(),
+          "operation_journal_owner_epoch_stale",
+          "Stop terminal projection names a non-active owner epoch");
+
+  Statement acceptance(database_,
+                       "SELECT terminal_sequence,terminal_payload FROM stop_projections "
+                       "WHERE stop_id=? AND stop_generation=?");
+  acceptance.Bind(1, projection.certificate.stop_id.value());
+  acceptance.Bind(2, static_cast<std::int64_t>(projection.certificate.stop_generation.value()));
+  Require(acceptance.Step(), "operation_journal_stop_acceptance_missing",
+          "Stop terminal projection has no durable acceptance predecessor");
+  if (!acceptance.IsNull(0)) {
+    const auto sequence = PositiveIdentifier(acceptance.Integer(0), "operation journal sequence");
+    Require(acceptance.Text(1) == payload_json && !acceptance.Step(),
+            "operation_journal_stop_projection_conflict",
+            "Stop terminal identity names different canonical projection bytes");
+    transaction.Commit();
+    return sequence;
+  }
+  Require(!acceptance.Step(), "operation_journal_corrupt",
+          "Stop terminal acceptance lookup returned duplicate rows");
+
+  for (const auto& predecessor : projection.certificate.predecessor_certificates) {
+    Statement predecessor_record(database_,
+                                 "SELECT terminal_payload FROM stop_projections "
+                                 "WHERE stop_id=? AND stop_generation=?");
+    predecessor_record.Bind(1, predecessor.stop_id.value());
+    predecessor_record.Bind(2, static_cast<std::int64_t>(predecessor.stop_generation.value()));
+    Require(predecessor_record.Step() && !predecessor_record.IsNull(0),
+            "operation_journal_stop_predecessor_unresolved",
+            "Stop terminal predecessor has no durable terminal certificate truth");
+    auto decoded_predecessor = DecodeStopJournalTerminalProjection(predecessor_record.Text(0));
+    Require(decoded_predecessor.ok() &&
+                decoded_predecessor.value().certificate.stop_certificate_id ==
+                    predecessor.stop_certificate_id &&
+                decoded_predecessor.value().certificate.stop_certificate_revision ==
+                    predecessor.stop_certificate_revision &&
+                !predecessor_record.Step(),
+            "operation_journal_stop_predecessor_unresolved",
+            "Stop terminal predecessor reference does not match durable certificate truth");
+  }
+
+  Statement insert(database_,
+                   "INSERT INTO journal_records(owner_epoch,record_kind,request_id,stop_id,"
+                   "stop_generation,"
+                   "operation_id,operation_revision,occurred_at_ns,occurred_at_wall,"
+                   "effect_pending,payload_json,payload_digest) "
+                   "VALUES(?,'stop_terminal_projected',NULL,?,?,NULL,NULL,?,?,?,?,?)");
+  insert.Bind(1, owner_epoch.value());
+  insert.Bind(2, projection.certificate.stop_id.value());
+  insert.Bind(3, static_cast<std::int64_t>(projection.certificate.stop_generation.value()));
+  insert.Bind(4, projection.certificate.completed_at_ns);
+  insert.Bind(5, occurred_at_wall);
+  insert.Bind(6, static_cast<std::int64_t>(0));
+  insert.Bind(7, payload_json);
+  insert.Bind(8, payload_digest);
+  Require(!insert.Step(), "operation_journal_corrupt",
+          "Stop terminal journal insert returned an unexpected row");
+  const auto sequence =
+      PositiveIdentifier(sqlite3_last_insert_rowid(database_), "operation journal sequence");
+  Statement update(database_,
+                   "UPDATE stop_projections SET terminal_sequence=?,terminal_payload=?,"
+                   "terminal_digest=? WHERE stop_id=? AND stop_generation=? "
+                   "AND terminal_sequence IS NULL");
+  update.Bind(1, static_cast<std::int64_t>(sequence));
+  update.Bind(2, payload_json);
+  update.Bind(3, payload_digest);
+  update.Bind(4, projection.certificate.stop_id.value());
+  update.Bind(5, static_cast<std::int64_t>(projection.certificate.stop_generation.value()));
+  Require(!update.Step() && sqlite3_changes(database_) == 1, "operation_journal_corrupt",
+          "Stop terminal durable projection update did not affect exactly one row");
+  transaction.Commit();
+  return sequence;
+}
+
 OperationJournalEventPageDTO SqliteOperationJournal::Impl::ReadEvents(
     const RequestOwnerEpoch& owner_epoch, const std::uint64_t after_sequence,
     const std::size_t limit) {
@@ -1752,16 +2679,23 @@ OperationJournalEventPageDTO SqliteOperationJournal::Impl::ReadEvents(
     const auto record_kind = query.Text(1);
     const auto request_id = query.IsNull(2) ? std::optional<RequestId>{}
                                             : std::optional<RequestId>(RequestId(query.Text(2)));
-    const auto operation_id = OperationId(query.Text(3));
+    const bool has_operation_id = !query.IsNull(3);
+    const bool has_operation_revision = !query.IsNull(4);
+    Require(has_operation_id == has_operation_revision, "operation_journal_corrupt",
+            "operation journal event has an incomplete operation identity");
+    const auto operation_id =
+        has_operation_id ? std::optional<OperationId>(OperationId(query.Text(3))) : std::nullopt;
     const auto operation_revision =
-        OperationRevision(PositiveIdentifier(query.Integer(4), "operation revision"));
+        has_operation_revision ? std::optional<OperationRevision>(OperationRevision(
+                                     PositiveIdentifier(query.Integer(4), "operation revision")))
+                               : std::nullopt;
     const auto occurred_at_ns = query.Integer(5);
     const auto occurred_at_wall = query.Text(6);
     const auto effect_pending_value = query.Integer(7);
     const auto payload_json = query.Text(8);
     const auto payload_digest = query.Text(9);
-    Require(sequence > after_sequence && !record_kind.empty() && !operation_id.empty() &&
-                occurred_at_ns >= 0 &&
+    Require(sequence > after_sequence && !record_kind.empty() &&
+                (!operation_id.has_value() || !operation_id->empty()) && occurred_at_ns >= 0 &&
                 static_cast<std::uint64_t>(occurred_at_ns) <= kMaximumSafeInteger &&
                 (effect_pending_value == 0 || effect_pending_value == 1) &&
                 payload_json.size() <= kMaximumRecordJsonBytes &&
@@ -1769,8 +2703,8 @@ OperationJournalEventPageDTO SqliteOperationJournal::Impl::ReadEvents(
             "operation_journal_corrupt", "operation journal event record is invalid or corrupt");
     ValidateWallTimeText(occurred_at_wall);
     events.push_back(OperationJournalEventDTO{
-        sequence, owner_epoch, std::move(record_kind), request_id, std::move(operation_id),
-        operation_revision, occurred_at_ns, std::move(occurred_at_wall), effect_pending_value == 1,
+        sequence, owner_epoch, std::move(record_kind), request_id, operation_id, operation_revision,
+        occurred_at_ns, std::move(occurred_at_wall), effect_pending_value == 1,
         std::move(payload_json), std::move(payload_digest)});
   }
   const bool has_more = events.size() > limit;
@@ -1822,6 +2756,16 @@ OperationJournalRecoveryDTO SqliteOperationJournal::Impl::BeginOwnerEpoch(
                                          prior_snapshots.Text(2)});
   }
 
+  Statement prior_active(database_,
+                         "SELECT owner_epoch,close_sequence FROM owner_epochs WHERE active=1");
+  std::optional<RequestOwnerEpoch> replaced_unclosed_owner_epoch;
+  if (prior_active.Step()) {
+    if (prior_active.IsNull(1)) {
+      replaced_unclosed_owner_epoch = RequestOwnerEpoch(prior_active.Text(0));
+    }
+    Require(!prior_active.Step(), "operation_journal_corrupt",
+            "operation journal contains multiple active owner epochs");
+  }
   Exec(database_, "UPDATE owner_epochs SET active=0 WHERE active=1");
   Statement insert_epoch(database_,
                          "INSERT INTO owner_epochs(owner_epoch,started_at_ns,request_capacity,"
@@ -1837,6 +2781,7 @@ OperationJournalRecoveryDTO SqliteOperationJournal::Impl::BeginOwnerEpoch(
                       "owner_epoch,request_id,record_kind,operation_id,payload_digest) "
                       "SELECT owner_epoch,request_id,record_kind,operation_id,payload_digest "
                       "FROM journal_records WHERE owner_epoch<>? AND request_id IS NOT NULL "
+                      "AND record_kind<>'stop_acceptance_projected' "
                       "ORDER BY sequence");
   tombstone.Bind(1, owner_epoch.value());
   Require(!tombstone.Step(), "operation_journal_corrupt",
@@ -1944,9 +2889,27 @@ OperationJournalRecoveryDTO SqliteOperationJournal::Impl::BeginOwnerEpoch(
   prune_tombstones.Bind(1, static_cast<std::int64_t>(history_capacity_));
   Require(!prune_tombstones.Step(), "operation_journal_corrupt",
           "operation tombstone pruning returned an unexpected row");
+  Statement prune_unanchored_stop_records(
+      database_,
+      "DELETE FROM journal_records WHERE owner_epoch<>? "
+      "AND record_kind='stop_acceptance_projected' "
+      "AND sequence NOT IN (SELECT acceptance_sequence FROM stop_projections) "
+      "AND sequence NOT IN (SELECT snapshot_sequence FROM operation_snapshots) "
+      "AND sequence IN (SELECT sequence FROM journal_records "
+      "WHERE owner_epoch<>? AND record_kind='stop_acceptance_projected' "
+      "AND sequence NOT IN (SELECT acceptance_sequence FROM stop_projections) "
+      "AND sequence NOT IN (SELECT snapshot_sequence FROM operation_snapshots) "
+      "ORDER BY sequence DESC LIMIT -1 OFFSET ?)");
+  prune_unanchored_stop_records.Bind(1, owner_epoch.value());
+  prune_unanchored_stop_records.Bind(2, owner_epoch.value());
+  prune_unanchored_stop_records.Bind(3, static_cast<std::int64_t>(history_capacity_));
+  Require(!prune_unanchored_stop_records.Step(), "operation_journal_corrupt",
+          "unanchored Stop acceptance projection pruning returned an unexpected row");
   Statement prune_records(database_,
                           "DELETE FROM journal_records WHERE owner_epoch<>? AND sequence NOT IN ("
-                          "SELECT snapshot_sequence FROM operation_snapshots)");
+                          "SELECT snapshot_sequence FROM operation_snapshots) "
+                          "AND record_kind NOT IN "
+                          "('stop_acceptance_projected','stop_terminal_projected')");
   prune_records.Bind(1, owner_epoch.value());
   Require(!prune_records.Step(), "operation_journal_corrupt",
           "operation journal record pruning returned an unexpected row");
@@ -1961,12 +2924,86 @@ OperationJournalRecoveryDTO SqliteOperationJournal::Impl::BeginOwnerEpoch(
           "operation owner epoch pruning returned an unexpected row");
 
   OperationJournalRecoveryDTO recovery;
+  recovery.replaced_unclosed_owner_epoch = std::move(replaced_unclosed_owner_epoch);
   Statement retained(database_,
                      "SELECT operation_id FROM operation_snapshots ORDER BY snapshot_sequence");
   while (retained.Step()) {
     recovery.historical_operations.push_back(
         LoadOperationState(database_, OperationId(retained.Text(0))));
   }
+  Statement retained_stops(
+      database_,
+      "SELECT acceptance_payload,acceptance_digest,terminal_payload,terminal_digest,"
+      "surveillance_payload,surveillance_digest,clear_payload,clear_digest "
+      "FROM stop_projections ORDER BY stop_id,stop_generation");
+  while (retained_stops.Step()) {
+    const auto acceptance_payload = retained_stops.Text(0);
+    Require(content_identity::sha256_digest(acceptance_payload) == retained_stops.Text(1),
+            "operation_journal_corrupt",
+            "Stop acceptance recovery projection digest does not match its bytes");
+    auto acceptance = DecodeStopJournalAcceptanceProjection(acceptance_payload);
+    Require(acceptance.ok(), "operation_journal_corrupt",
+            "Stop acceptance recovery projection cannot be decoded");
+    RecoveredStopJournalStateDTO recovered{std::move(acceptance.value().accepted),
+                                           std::move(acceptance.value().affected_state),
+                                           std::nullopt, std::nullopt, std::nullopt};
+    const bool has_terminal_payload = !retained_stops.IsNull(2);
+    Require(has_terminal_payload == !retained_stops.IsNull(3), "operation_journal_corrupt",
+            "Stop terminal recovery projection presence is inconsistent");
+    if (has_terminal_payload) {
+      const auto terminal_payload = retained_stops.Text(2);
+      Require(content_identity::sha256_digest(terminal_payload) == retained_stops.Text(3),
+              "operation_journal_corrupt",
+              "Stop terminal recovery projection digest does not match its bytes");
+      auto terminal = DecodeStopJournalTerminalProjection(terminal_payload);
+      Require(terminal.ok() && terminal.value().stop_status.accepted == recovered.accepted,
+              "operation_journal_corrupt",
+              "Stop terminal recovery projection cannot be decoded or joined to acceptance");
+      recovered.terminal_certificate = std::move(terminal.value().certificate);
+      recovered.fault_latch = std::move(terminal.value().fault_latch);
+      recovered.surveillance = std::move(terminal.value().stop_status.surveillance);
+    }
+    const bool has_surveillance_payload = !retained_stops.IsNull(4);
+    Require(has_surveillance_payload == !retained_stops.IsNull(5), "operation_journal_corrupt",
+            "Stop surveillance recovery projection presence is inconsistent");
+    if (has_surveillance_payload) {
+      const auto payload = retained_stops.Text(4);
+      Require(content_identity::sha256_digest(payload) == retained_stops.Text(5),
+              "operation_journal_corrupt",
+              "Stop surveillance recovery projection digest does not match its bytes");
+      auto surveillance = DecodeStopJournalSurveillanceProjection(payload);
+      Require(surveillance.ok() && recovered.terminal_certificate.has_value() &&
+                  surveillance.value().checkpoint.stop_certificate.stop_certificate_id ==
+                      recovered.terminal_certificate->stop_certificate_id &&
+                  surveillance.value().checkpoint.stop_certificate.stop_certificate_revision ==
+                      recovered.terminal_certificate->stop_certificate_revision,
+              "operation_journal_corrupt",
+              "Stop surveillance recovery projection cannot be decoded or joined");
+      recovered.surveillance = std::move(surveillance.value().checkpoint);
+      recovered.fault_latch = std::move(surveillance.value().fault_latch);
+    }
+    const bool has_clear_payload = !retained_stops.IsNull(6);
+    Require(has_clear_payload == !retained_stops.IsNull(7), "operation_journal_corrupt",
+            "Stop fault-clear recovery projection presence is inconsistent");
+    if (has_clear_payload) {
+      const auto payload = retained_stops.Text(6);
+      Require(content_identity::sha256_digest(payload) == retained_stops.Text(7),
+              "operation_journal_corrupt",
+              "Stop fault-clear recovery projection digest does not match its bytes");
+      auto cleared = DecodeStopJournalTerminalProjection(payload);
+      Require(cleared.ok() && cleared.value().stop_status.accepted == recovered.accepted &&
+                  cleared.value().fault_latch.has_value() &&
+                  cleared.value().fault_latch->state == StopFaultLatchStateDTO::kCleared,
+              "operation_journal_corrupt",
+              "Stop fault-clear recovery projection cannot be decoded or joined");
+      recovered.terminal_certificate = std::move(cleared.value().certificate);
+      recovered.fault_latch = std::move(cleared.value().fault_latch);
+      recovered.surveillance = std::move(cleared.value().stop_status.surveillance);
+    }
+    recovery.recovered_stops.push_back(std::move(recovered));
+  }
+  Require(recovery.recovered_stops.size() <= 64U, "operation_journal_history_full",
+          "recovered Stop truth exceeds the fixed restart bound");
   recovery.unreconciled_resources.assign(unreconciled.begin(), unreconciled.end());
   transaction.Commit();
   return recovery;
@@ -2016,26 +3053,258 @@ std::uint64_t SqliteOperationJournal::Impl::RecordControlAccepted(
                 state, accepted.accepted_at_ns, true, "current");
 }
 
-std::uint64_t SqliteOperationJournal::Impl::RecordStopAccepted(const RequestOwnerEpoch& owner_epoch,
-                                                               const StopIntentDTO& intent,
-                                                               const StopAcceptedDTO& accepted,
-                                                               const OperationStateDTO& state) {
-  Require(intent.request_context.request_owner_epoch == owner_epoch &&
-              intent.request_context.request_id == accepted.request_id &&
-              intent.operations.size() == 1U && accepted.operations.size() == 1U &&
-              intent.operations.front().operation_id == state.operation_id &&
-              accepted.operations.front() == state.operation_id &&
-              accepted.operation_revision_after_acceptance == state.operation_revision &&
-              accepted.replay_status == RequestReplayStatusDTO::kAcceptedNew &&
-              accepted.accepted_at_ns >= state.updated_at_ns &&
-              state.active_stop_id == accepted.stop_id &&
-              state.active_stop_generation == accepted.stop_generation,
-          "operation_journal_record_invalid",
-          "Stop acceptance does not match its durable intent or state");
-  return Append(owner_epoch, "stop_accepted", intent.request_context.request_id,
-                RecordValue("stop_accepted", owner_epoch, StopIntentValue(intent),
-                            StopAcceptedValue(accepted), state, nullptr, true),
-                state, accepted.accepted_at_ns, true, "current");
+std::uint64_t SqliteOperationJournal::Impl::RecordStopAccepted(
+    const RequestOwnerEpoch& owner_epoch, const EmergencyStopAcceptanceRecordDTO& acceptance,
+    const EmergencyStopProjectedIntentDTO& intent, const StopAcceptedDTO& accepted,
+    const EmergencyStopAffectedStateSnapshotDTO& affected_state) {
+  RequireEmergencyStopProjection(owner_epoch, acceptance, intent, accepted, affected_state);
+  return AppendStopAcceptance(
+      owner_epoch, acceptance,
+      EmergencyStopAcceptanceProjectionValue(acceptance, intent, accepted, affected_state),
+      accepted, affected_state);
+}
+
+std::uint64_t SqliteOperationJournal::Impl::RecordStopTerminal(
+    const RequestOwnerEpoch& owner_epoch, const StopStatusDTO& stop_status,
+    const StopCertificateDTO& certificate, const std::optional<StopFaultLatchDTO>& fault_latch) {
+  Require(!owner_epoch.empty(), "operation_journal_record_invalid",
+          "Stop terminal projection owner epoch is empty");
+  Require(!stop_terminal_projection_field_error(stop_status, certificate, fault_latch).has_value(),
+          "operation_journal_record_invalid", "Stop terminal projection is invalid");
+  auto recorded_status = stop_status;
+  auto recorded_latch = fault_latch;
+  recorded_status.terminal_projection = StopDurableProjectionStatusDTO{
+      StopDurableProjectionStateDTO::kRecorded, std::nullopt, std::nullopt};
+  if (recorded_latch.has_value()) {
+    recorded_latch->terminal_projection = StopDurableProjectionStatusDTO{
+        StopDurableProjectionStateDTO::kRecorded, std::nullopt, std::nullopt};
+  }
+  recorded_status.fault_latch = recorded_latch;
+  StopJournalTerminalProjectionDTO projection{std::move(recorded_status), certificate,
+                                              std::move(recorded_latch)};
+  auto encoded = EncodeStopJournalTerminalProjection(projection);
+  Require(encoded.ok(), "operation_journal_record_invalid", "Stop terminal projection is invalid");
+  return AppendStopTerminal(owner_epoch, projection, encoded.value());
+}
+
+std::uint64_t SqliteOperationJournal::Impl::RecordStopSurveillanceCheckpoint(
+    const RequestOwnerEpoch& owner_epoch, const StopPostTerminalSurveillanceDTO& checkpoint,
+    const StopFaultLatchDTO& fault_latch) {
+  Require(!owner_epoch.empty() && checkpoint.owner_epoch == owner_epoch &&
+              checkpoint.checkpoint_projection.state == StopDurableProjectionStateDTO::kPending &&
+              fault_latch.state != StopFaultLatchStateDTO::kCleared,
+          "operation_journal_record_invalid", "Stop surveillance checkpoint is invalid");
+  auto recorded = checkpoint;
+  recorded.checkpoint_projection = StopDurableProjectionStatusDTO{
+      StopDurableProjectionStateDTO::kRecorded, std::nullopt, std::nullopt};
+  auto encoded = EncodeStopJournalSurveillanceProjection(
+      StopJournalSurveillanceProjectionDTO{recorded, fault_latch});
+  Require(encoded.ok(), "operation_journal_record_invalid",
+          "Stop surveillance checkpoint projection is invalid");
+  return AppendStopSurveillanceCheckpoint(
+      owner_epoch, StopJournalSurveillanceProjectionDTO{std::move(recorded), fault_latch},
+      encoded.value());
+}
+
+std::uint64_t SqliteOperationJournal::Impl::RecordStopFaultCleared(
+    const RequestOwnerEpoch& owner_epoch, const StopFaultRecoveryIntentDTO& recovery_intent,
+    const StopFaultRecoveryResultDTO& recovery_result, const StopFaultLatchDTO& cleared_latch,
+    const StopStatusDTO& resulting_stop_status) {
+  Require(
+      !owner_epoch.empty() && recovery_intent.request_context.request_owner_epoch == owner_epoch &&
+          recovery_intent.request_context.request_id == recovery_result.request_id &&
+          recovery_result.accepted && !recovery_result.error.has_value() &&
+          recovery_result.latch == cleared_latch && resulting_stop_status.fault_latch.has_value() &&
+          *resulting_stop_status.fault_latch == cleared_latch &&
+          cleared_latch.state == StopFaultLatchStateDTO::kCleared &&
+          cleared_latch.clear_projection.state == StopDurableProjectionStateDTO::kRecorded &&
+          stop_status_field_error(resulting_stop_status) == std::nullopt,
+      "operation_journal_record_invalid", "Stop fault-clear projection is invalid");
+  std::lock_guard lock(mutex_);
+  RequireOpen();
+  const auto occurred_at_wall = wall_time_text_();
+  ValidateWallTimeText(occurred_at_wall);
+  Transaction transaction(database_);
+  Statement current(database_,
+                    "SELECT terminal_payload,surveillance_payload,clear_sequence,"
+                    "clear_request_id,clear_payload FROM stop_projections "
+                    "WHERE stop_id=? AND stop_generation=?");
+  current.Bind(1, cleared_latch.stop_id.value());
+  current.Bind(2, static_cast<std::int64_t>(cleared_latch.stop_generation.value()));
+  Require(current.Step() && !current.IsNull(0), "operation_journal_stop_terminal_missing",
+          "Stop fault clear has no durable terminal predecessor");
+  auto terminal = DecodeStopJournalTerminalProjection(current.Text(0));
+  Require(terminal.ok() && terminal.value().fault_latch.has_value() &&
+              terminal.value().fault_latch->state != StopFaultLatchStateDTO::kCleared &&
+              terminal.value().certificate.stop_certificate_id ==
+                  recovery_intent.expected_stop_certificate_id &&
+              terminal.value().certificate.stop_certificate_revision ==
+                  recovery_intent.expected_stop_certificate_revision,
+          "operation_journal_stop_projection_conflict",
+          "Stop fault clear does not join durable terminal truth");
+  auto prior_latch = *terminal.value().fault_latch;
+  auto expected_status = terminal.value().stop_status;
+  if (current.IsNull(1)) {
+    Require(!resulting_stop_status.surveillance.has_value(),
+            "operation_journal_stop_projection_conflict",
+            "Stop fault clear invents surveillance truth");
+  } else {
+    auto surveillance = DecodeStopJournalSurveillanceProjection(current.Text(1));
+    Require(surveillance.ok() && resulting_stop_status.surveillance.has_value() &&
+                *resulting_stop_status.surveillance == surveillance.value().checkpoint &&
+                terminal.value().fault_latch->latch_id == surveillance.value().fault_latch.latch_id,
+            "operation_journal_stop_projection_conflict",
+            "Stop fault clear does not join latest durable surveillance truth");
+    prior_latch = surveillance.value().fault_latch;
+    expected_status.surveillance = surveillance.value().checkpoint;
+  }
+  Require(recovery_intent.expected_latch_id == prior_latch.latch_id &&
+              recovery_intent.expected_latch_generation == prior_latch.latch_generation &&
+              recovery_intent.expected_recovery_assessment_revision ==
+                  prior_latch.recovery_assessment_revision &&
+              recovery_intent.expected_cell_id == prior_latch.cell_id &&
+              recovery_intent.expected_retained_bundle_id == prior_latch.retained_bundle_id &&
+              recovery_intent.expected_graph_revision == prior_latch.graph_revision &&
+              prior_latch.recovery_status == StopFaultRecoveryStatusDTO::kReady &&
+              prior_latch.recovery_assessment_revision < std::numeric_limits<std::uint64_t>::max(),
+          "operation_journal_stop_projection_conflict",
+          "Stop fault clear expectations do not match latest durable latch truth");
+  auto expected_cleared_latch = prior_latch;
+  ++expected_cleared_latch.recovery_assessment_revision;
+  expected_cleared_latch.state = StopFaultLatchStateDTO::kCleared;
+  expected_cleared_latch.recovery_status = StopFaultRecoveryStatusDTO::kCleared;
+  expected_cleared_latch.reason_code = "stop_fault_recovery_cleared";
+  expected_cleared_latch.clear_projection = StopDurableProjectionStatusDTO{
+      StopDurableProjectionStateDTO::kRecorded, std::nullopt, std::nullopt};
+  expected_status.fault_latch = expected_cleared_latch;
+  Require(cleared_latch == expected_cleared_latch && resulting_stop_status == expected_status,
+          "operation_journal_stop_projection_conflict",
+          "Stop fault clear does not equal the exact durable successor state");
+  const StopJournalTerminalProjectionDTO clear_projection{
+      resulting_stop_status, terminal.value().certificate, cleared_latch};
+  auto encoded = EncodeStopJournalTerminalProjection(clear_projection);
+  Require(encoded.ok(), "operation_journal_record_invalid",
+          "Stop fault-clear durable payload is invalid");
+  if (!current.IsNull(2)) {
+    const auto sequence = PositiveIdentifier(current.Integer(2), "operation journal sequence");
+    Require(current.Text(3) == recovery_result.request_id.value() &&
+                current.Text(4) == encoded.value() && !current.Step(),
+            "operation_journal_stop_projection_conflict",
+            "Stop fault-clear identity conflicts with durable clear truth");
+    transaction.Commit();
+    return sequence;
+  }
+  Require(!current.Step(), "operation_journal_corrupt",
+          "Stop fault-clear lookup returned duplicate rows");
+  const auto payload_digest = content_identity::sha256_digest(encoded.value());
+  Statement insert(database_,
+                   "INSERT INTO journal_records(owner_epoch,record_kind,request_id,stop_id,"
+                   "stop_generation,operation_id,operation_revision,occurred_at_ns,"
+                   "occurred_at_wall,effect_pending,payload_json,payload_digest) "
+                   "VALUES(?,'stop_fault_cleared',?,?,?,NULL,NULL,?,?,?,?,?)");
+  insert.Bind(1, owner_epoch.value());
+  insert.Bind(2, recovery_result.request_id.value());
+  insert.Bind(3, cleared_latch.stop_id.value());
+  insert.Bind(4, static_cast<std::int64_t>(cleared_latch.stop_generation.value()));
+  insert.Bind(5, resulting_stop_status.accepted.accepted_at_ns);
+  insert.Bind(6, occurred_at_wall);
+  insert.Bind(7, static_cast<std::int64_t>(0));
+  insert.Bind(8, encoded.value());
+  insert.Bind(9, payload_digest);
+  Require(!insert.Step(), "operation_journal_corrupt",
+          "Stop fault-clear journal insert returned an unexpected row");
+  const auto sequence =
+      PositiveIdentifier(sqlite3_last_insert_rowid(database_), "operation journal sequence");
+  Statement update(database_,
+                   "UPDATE stop_projections SET clear_sequence=?,clear_request_id=?,"
+                   "clear_payload=?,clear_digest=? WHERE stop_id=? AND stop_generation=? "
+                   "AND clear_sequence IS NULL");
+  update.Bind(1, static_cast<std::int64_t>(sequence));
+  update.Bind(2, recovery_result.request_id.value());
+  update.Bind(3, encoded.value());
+  update.Bind(4, payload_digest);
+  update.Bind(5, cleared_latch.stop_id.value());
+  update.Bind(6, static_cast<std::int64_t>(cleared_latch.stop_generation.value()));
+  Require(!update.Step() && sqlite3_changes(database_) == 1, "operation_journal_corrupt",
+          "Stop fault-clear projection update did not affect exactly one row");
+  transaction.Commit();
+  return sequence;
+}
+
+std::uint64_t SqliteOperationJournal::Impl::CloseOwnerEpoch(const RequestOwnerEpoch& owner_epoch,
+                                                            const std::int64_t closed_at_ns) {
+  Require(!owner_epoch.empty() && closed_at_ns >= 0 &&
+              static_cast<std::uint64_t>(closed_at_ns) <= kMaximumSafeInteger,
+          "operation_journal_owner_epoch_invalid", "owner close identity is invalid");
+  std::lock_guard lock(mutex_);
+  RequireOpen();
+  const auto occurred_at_wall = wall_time_text_();
+  ValidateWallTimeText(occurred_at_wall);
+  Transaction transaction(database_);
+  Statement owner(database_,
+                  "SELECT active,close_sequence,closed_at_ns FROM owner_epochs "
+                  "WHERE owner_epoch=?");
+  owner.Bind(1, owner_epoch.value());
+  Require(owner.Step(), "operation_journal_owner_epoch_stale",
+          "owner close names a non-active owner epoch");
+  if (!owner.IsNull(1)) {
+    const auto sequence = PositiveIdentifier(owner.Integer(1), "operation journal sequence");
+    Require(owner.Integer(2) == closed_at_ns && !owner.Step(),
+            "operation_journal_owner_close_conflict",
+            "owner close replay uses a different close time");
+    transaction.Commit();
+    return sequence;
+  }
+  Require(owner.Integer(0) == 1 && !owner.Step(), "operation_journal_owner_epoch_stale",
+          "owner close names a non-active owner epoch");
+  Statement operation_blockers(
+      database_,
+      "SELECT COUNT(*) FROM operation_snapshots WHERE disposition='orphaned_by_host_replacement' "
+      "OR state NOT IN ('completed','stopped','failed','intervention_required',"
+      "'cancelled_pre_dispatch')");
+  Require(
+      operation_blockers.Step() && operation_blockers.Integer(0) == 0 && !operation_blockers.Step(),
+      "operation_journal_owner_close_blocked", "owner close is blocked by unresolved durable work");
+  Statement stop_blockers(database_,
+                          "SELECT terminal_payload,surveillance_payload,clear_payload "
+                          "FROM stop_projections");
+  while (stop_blockers.Step()) {
+    Require(!stop_blockers.IsNull(0), "operation_journal_owner_close_blocked",
+            "owner close is blocked by a nonterminal Stop");
+    auto terminal = DecodeStopJournalTerminalProjection(stop_blockers.Text(0));
+    Require(terminal.ok(), "operation_journal_corrupt",
+            "owner close cannot decode terminal Stop truth");
+    const bool needs_clear = terminal.value().fault_latch.has_value() || !stop_blockers.IsNull(1);
+    Require(!needs_clear || !stop_blockers.IsNull(2), "operation_journal_owner_close_blocked",
+            "owner close is blocked by an active Stop fault or surveillance owner");
+  }
+  const auto payload = content_identity::canonical_json(CanonicalValue(CanonicalValue::Object{
+      {"closed_at_ns", CanonicalValue(static_cast<double>(closed_at_ns))},
+      {"owner_epoch", CanonicalValue(owner_epoch.value())},
+  }));
+  Statement insert(database_,
+                   "INSERT INTO journal_records(owner_epoch,record_kind,request_id,operation_id,"
+                   "operation_revision,occurred_at_ns,occurred_at_wall,effect_pending,payload_json,"
+                   "payload_digest) VALUES(?,'owner_epoch_closed',NULL,NULL,NULL,?,?,0,?,?)");
+  insert.Bind(1, owner_epoch.value());
+  insert.Bind(2, closed_at_ns);
+  insert.Bind(3, occurred_at_wall);
+  insert.Bind(4, payload);
+  insert.Bind(5, content_identity::sha256_digest(payload));
+  Require(!insert.Step(), "operation_journal_corrupt",
+          "owner close journal insert returned an unexpected row");
+  const auto sequence =
+      PositiveIdentifier(sqlite3_last_insert_rowid(database_), "operation journal sequence");
+  Statement update(database_,
+                   "UPDATE owner_epochs SET closed_at_ns=?,close_sequence=?,active=0 "
+                   "WHERE owner_epoch=? AND active=1 AND close_sequence IS NULL");
+  update.Bind(1, closed_at_ns);
+  update.Bind(2, static_cast<std::int64_t>(sequence));
+  update.Bind(3, owner_epoch.value());
+  Require(!update.Step() && sqlite3_changes(database_) == 1, "operation_journal_corrupt",
+          "owner close update did not affect exactly one row");
+  transaction.Commit();
+  return sequence;
 }
 
 std::uint64_t SqliteOperationJournal::Impl::RecordRuntimeScaleAccepted(
@@ -2114,11 +3383,45 @@ Result<std::uint64_t> SqliteOperationJournal::RecordControlAccepted(
       [&] { return impl_->RecordControlAccepted(owner_epoch, request, accepted, state); });
 }
 
-Result<std::uint64_t> SqliteOperationJournal::RecordStopAccepted(
-    const RequestOwnerEpoch& owner_epoch, const StopIntentDTO& intent,
-    const StopAcceptedDTO& accepted, const OperationStateDTO& state) {
-  return AsResult<std::uint64_t>(
-      [&] { return impl_->RecordStopAccepted(owner_epoch, intent, accepted, state); });
+EmergencyStopAcceptanceProjectionResultDTO SqliteOperationJournal::RecordStopAccepted(
+    const RequestOwnerEpoch& owner_epoch, const EmergencyStopAcceptanceRecordDTO& acceptance,
+    const EmergencyStopProjectedIntentDTO& intent, const StopAcceptedDTO& accepted,
+    const EmergencyStopAffectedStateSnapshotDTO& affected_state) noexcept {
+  return AsStopProjectionResult([&] {
+    return impl_->RecordStopAccepted(owner_epoch, acceptance, intent, accepted, affected_state);
+  });
+}
+
+StopForensicProjectionResultDTO SqliteOperationJournal::RecordStopTerminal(
+    const RequestOwnerEpoch& owner_epoch, const StopStatusDTO& stop_status,
+    const StopCertificateDTO& certificate,
+    const std::optional<StopFaultLatchDTO>& fault_latch) noexcept {
+  return AsStopForensicProjectionResult([&] {
+    return impl_->RecordStopTerminal(owner_epoch, stop_status, certificate, fault_latch);
+  });
+}
+
+StopForensicProjectionResultDTO SqliteOperationJournal::RecordStopSurveillanceCheckpoint(
+    const RequestOwnerEpoch& owner_epoch, const StopPostTerminalSurveillanceDTO& checkpoint,
+    const StopFaultLatchDTO& fault_latch) noexcept {
+  return AsStopForensicProjectionResult([&] {
+    return impl_->RecordStopSurveillanceCheckpoint(owner_epoch, checkpoint, fault_latch);
+  });
+}
+
+Result<std::uint64_t> SqliteOperationJournal::RecordStopFaultCleared(
+    const RequestOwnerEpoch& owner_epoch, const StopFaultRecoveryIntentDTO& recovery_intent,
+    const StopFaultRecoveryResultDTO& recovery_result, const StopFaultLatchDTO& cleared_latch,
+    const StopStatusDTO& resulting_stop_status) {
+  return AsResult<std::uint64_t>([&] {
+    return impl_->RecordStopFaultCleared(owner_epoch, recovery_intent, recovery_result,
+                                         cleared_latch, resulting_stop_status);
+  });
+}
+
+Result<std::uint64_t> SqliteOperationJournal::CloseOwnerEpoch(const RequestOwnerEpoch& owner_epoch,
+                                                              const std::int64_t closed_at_ns) {
+  return AsResult<std::uint64_t>([&] { return impl_->CloseOwnerEpoch(owner_epoch, closed_at_ns); });
 }
 
 Result<std::uint64_t> SqliteOperationJournal::RecordRuntimeScaleAccepted(

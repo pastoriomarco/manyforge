@@ -12,11 +12,9 @@ import pytest
 _PACKAGE_DIRECTORY = Path(__file__).resolve().parents[1] / "manyforge_xarm_adapter"
 _ENTRYPOINT_MODULE_NAMES = (
     "manyforge_xarm_adapter.controller_gate_evidence",
-    "manyforge_xarm_adapter.execution_admission_provider_launch",
     "manyforge_xarm_adapter.live_controller_parameter_validation",
     "manyforge_xarm_adapter.live_evidence",
     "manyforge_xarm_adapter.read_only_observer",
-    "manyforge_xarm_adapter.supervised_command_evidence",
     "manyforge_xarm_adapter.supervised_runtime_binding",
 )
 _ALLOWED_IMPORT_ROOTS = {
@@ -119,18 +117,12 @@ def test_only_effect_free_xarm_helpers_survive_the_split() -> None:
     controller_gate_evidence = _load_entrypoint_module(
         "manyforge_xarm_adapter.controller_gate_evidence"
     )
-    execution_admission_provider_launch = _load_entrypoint_module(
-        "manyforge_xarm_adapter.execution_admission_provider_launch"
-    )
     live_controller_parameter_validation = _load_entrypoint_module(
         "manyforge_xarm_adapter.live_controller_parameter_validation"
     )
     live_evidence = _load_entrypoint_module("manyforge_xarm_adapter.live_evidence")
     read_only_observer = _load_entrypoint_module(
         "manyforge_xarm_adapter.read_only_observer"
-    )
-    supervised_command_evidence = _load_entrypoint_module(
-        "manyforge_xarm_adapter.supervised_command_evidence"
     )
     supervised_runtime_binding = _load_entrypoint_module(
         "manyforge_xarm_adapter.supervised_runtime_binding"
@@ -148,12 +140,6 @@ def test_only_effect_free_xarm_helpers_survive_the_split() -> None:
     assert callable(supervised_runtime_binding.validate_robot_ipv4)
 
     assert not hasattr(
-        execution_admission_provider_launch, "admission_provider_command"
-    )
-    assert not hasattr(
         supervised_runtime_binding, "resolve_supervised_runtime_binding"
-    )
-    assert not hasattr(
-        supervised_command_evidence, "capture_supervised_command_evidence"
     )
     assert not hasattr(read_only_observer, "ReadOnlyObserver")

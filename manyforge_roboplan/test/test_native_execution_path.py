@@ -1478,16 +1478,33 @@ def test_first_complete_addressed_native_motion_path(tmp_path: Path) -> None:
             execution_root / "operation-journal.sqlite3"
         ) as database:
             durable_stop = database.execute(
-                "SELECT payload_json FROM journal_records WHERE request_id = ?",
+                "SELECT sequence,payload_json FROM journal_records "
+                "WHERE request_id = ? AND record_kind = "
+                "'stop_acceptance_projected'",
                 ("stop-controlled-operation",),
             ).fetchone()
         assert durable_stop is not None
-        durable_stop_payload = json.loads(durable_stop[0])
-        assert durable_stop_payload["intent"]["request_attribution"] == {
+        durable_stop_sequence = int(durable_stop[0])
+        durable_stop_payload = json.loads(durable_stop[1])
+        assert durable_stop_payload["intent"]["value"][
+            "request_attribution"
+        ] == {
             "assurance": "externally_authenticated",
             "principal_id": "operator.process-test",
             "transport": "http",
         }
+        durable_stop_page = native.events(
+            first_status["owner_epoch"], durable_stop_sequence - 1, limit=1
+        )
+        assert len(durable_stop_page["events"]) == 1
+        durable_stop_event = durable_stop_page["events"][0]
+        assert durable_stop_event["sequence"] == durable_stop_sequence
+        assert durable_stop_event["record_kind"] == (
+            "stop_acceptance_projected"
+        )
+        assert durable_stop_event["operation_id"] is None
+        assert durable_stop_event["operation_revision"] is None
+        assert durable_stop_event["payload"] == durable_stop_payload
 
         # N7-b exercises the largest maintained page through the real
         # SOCK_SEQPACKET boundary. The preceding maintained workflow has

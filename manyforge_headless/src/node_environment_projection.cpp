@@ -386,9 +386,7 @@ struct DeferredAdapter final {
   std::string_view gate;
 };
 
-constexpr std::array<DeferredAdapter, 16U> kDeferredAdapters{{
-    {"controller.select_route", "cclc_node_adapter_unavailable_until_i7", "I7",
-     "L0"},
+constexpr std::array<DeferredAdapter, 11U> kDeferredAdapters{{
     {"io.get_input", "semantic_io_node_adapter_unavailable_until_i11", "I11",
      "T"},
     {"io.set_output", "semantic_io_node_adapter_unavailable_until_i11", "I11",
@@ -397,14 +395,6 @@ constexpr std::array<DeferredAdapter, 16U> kDeferredAdapters{{
      "I11", "T"},
     {"kernel.full_stop", "kernel_policy_node_adapter_unavailable_until_i8",
      "I8", "P5"},
-    {"lifecycle.disable_component", "cclc_node_adapter_unavailable_until_i7",
-     "I7", "L0"},
-    {"lifecycle.enable_component", "cclc_node_adapter_unavailable_until_i7",
-     "I7", "L0"},
-    {"lifecycle.prepare_component", "cclc_node_adapter_unavailable_until_i7",
-     "I7", "L0"},
-    {"lifecycle.recover_component", "cclc_node_adapter_unavailable_until_i7",
-     "I7", "L0"},
     {"motion.move_until_signal",
      "kernel_policy_node_adapter_unavailable_until_i8", "I8", "P5"},
     {"motion.probe_search", "kernel_policy_node_adapter_unavailable_until_i8",

@@ -1,0 +1,3018 @@
+#include <gtest/gtest.h>
+#include <sqlite3.h>
+#include <unistd.h>
+
+#include <atomic>
+#include <cstdint>
+#include <filesystem>
+#include <manyforge_core/sqlite_cclc_journal.hpp>
+#include <stdexcept>
+#include <string>
+#include <system_error>
+#include <utility>
+#include <vector>
+
+#include "../src/component_lifecycle_journal_codec_internal.hpp"
+
+namespace manyforge::core {
+namespace {
+
+class ScopedTemporaryDirectory final {
+ public:
+  ScopedTemporaryDirectory() {
+    static std::atomic<std::uint64_t> next{1U};
+    path_ =
+        std::filesystem::temp_directory_path() /
+        ("manyforge-cclc-journal-test-" + std::to_string(static_cast<std::uint64_t>(::getpid())) +
+         "-" + std::to_string(next.fetch_add(1U)));
+    if (!std::filesystem::create_directory(path_)) {
+      throw std::runtime_error("failed to create CCLC journal test root");
+    }
+  }
+
+  ~ScopedTemporaryDirectory() {
+    std::error_code ignored;
+    std::filesystem::remove_all(path_, ignored);
+  }
+
+  [[nodiscard]] const std::filesystem::path& path() const noexcept { return path_; }
+
+ private:
+  std::filesystem::path path_;
+};
+
+[[nodiscard]] ExpectedControlBindingRevisionDTO Binding() {
+  return {ControlBindingId("binding.1"), ControlBindingRevision("binding-revision.1"),
+          ControlRouteId("route.1")};
+}
+
+[[nodiscard]] ExpectedControlDomainRevisionDTO ExpectedDomain() {
+  return {ControlDomainId("domain.1"),
+          ControlDomainRevision("domain-revision.1"),
+          ControllerTopologyId("topology.1"),
+          TopologyRevision("topology-revision.1"),
+          {ExpectedActiveControlConfigurationPresenceDTO::kAbsent, std::nullopt, std::nullopt},
+          {Binding()}};
+}
+
+[[nodiscard]] ResolvedLifecycleControlDomainScopeDTO CurrentScope() {
+  const auto expected = ExpectedDomain();
+  return {expected.control_domain_id,
+          expected.control_domain_revision,
+          expected.controller_topology_id,
+          expected.topology_revision,
+          std::nullopt,
+          expected.expected_control_bindings,
+          {ResourceId("resource.1")}};
+}
+
+[[nodiscard]] ExpectedControlDomainRevisionDTO ExpectedDisableDomain() {
+  auto expected = ExpectedDomain();
+  expected.expected_active_control_configuration = {
+      ExpectedActiveControlConfigurationPresenceDTO::kPresent,
+      ActiveControlConfigurationId("configuration.1"), ActiveControlConfigurationGeneration(7U)};
+  return expected;
+}
+
+[[nodiscard]] ActiveControlConfigurationDTO ActiveConfiguration(
+    const ExpectedControlDomainRevisionDTO& expected) {
+  return {ActiveControlConfigurationId("configuration.1"),
+          expected.control_domain_id,
+          expected.control_domain_revision,
+          {{expected.expected_control_bindings.front().control_binding_id,
+            expected.expected_control_bindings.front().control_binding_revision,
+            expected.expected_control_bindings.front().control_route_id}},
+          ActivationSetId("activation-set.1"),
+          expected.controller_topology_id,
+          expected.topology_revision,
+          RuntimeUnitId("runtime.1"),
+          RuntimeEpoch("runtime-epoch.1"),
+          1U,
+          {},
+          ActiveControlConfigurationGeneration(7U),
+          ActiveControlConfigurationStateDTO::kReconciled};
+}
+
+[[nodiscard]] ResolvedLifecycleControlDomainScopeDTO CurrentDisableScope() {
+  const auto expected = ExpectedDisableDomain();
+  return {expected.control_domain_id,      expected.control_domain_revision,
+          expected.controller_topology_id, expected.topology_revision,
+          ActiveConfiguration(expected),   expected.expected_control_bindings,
+          {ResourceId("resource.1")}};
+}
+
+[[nodiscard]] ResolvedLifecycleProviderOccurrenceDTO CurrentProviderOccurrence() {
+  return {ControlDomainId("domain.1"),
+          ControlDomainRevision("domain-revision.1"),
+          ProviderInstanceId("provider.1"),
+          ProviderManifestId("manifest.1"),
+          ProviderManifestRevision("manifest-revision.1"),
+          RuntimeUnitId("runtime.1"),
+          RuntimeEpoch("runtime-epoch.1"),
+          ContentDigest("catalog-digest.1")};
+}
+
+[[nodiscard]] ConfigurationFenceScopeDTO DisableFenceScope() {
+  const auto expected = ExpectedDisableDomain();
+  return {{ControllableComponentId("component.1")},
+          {{expected.control_domain_id, expected.control_domain_revision, std::nullopt}},
+          {{expected.expected_control_bindings.front().control_binding_id,
+            expected.expected_control_bindings.front().control_binding_revision, std::nullopt}},
+          {ResourceId("resource.1")}};
+}
+
+[[nodiscard]] ConfigurationFenceScopeDTO FullDisableFenceScope() {
+  auto scope = DisableFenceScope();
+  scope.controllable_component_ids.push_back(ControllableComponentId("component.2"));
+  scope.domains.push_back(
+      {ControlDomainId("domain.2"), ControlDomainRevision("domain-revision.2"), std::nullopt});
+  scope.bindings.push_back(
+      {ControlBindingId("binding.2"), ControlBindingRevision("binding-revision.2"), std::nullopt});
+  scope.resources.push_back(ResourceId("resource.2"));
+  return scope;
+}
+
+[[nodiscard]] ComponentLifecycleRequestedStateDTO RequestedPrepared() {
+  return {ComponentLifecycleRequestedStatePresenceDTO::kResolved,
+          ComponentLifecycleStateDTO::kPrepared};
+}
+
+[[nodiscard]] ComponentLifecycleIntentDTO Intent(std::string request_id,
+                                                 const RequestOwnerEpoch& owner_epoch,
+                                                 std::uint64_t expected_component_generation,
+                                                 std::string reason = "prepare") {
+  return {{RequestId(std::move(request_id)), owner_epoch, "journal-test", std::nullopt},
+          ControllableComponentId("component.1"),
+          ComponentLifecycleIntentKindDTO::kPrepare,
+          GraphRevision("graph-revision.1"),
+          ComponentLifecycleGeneration(expected_component_generation),
+          {ExpectedDomain()},
+          std::move(reason),
+          {RequestTransportDTO::kInternal, RequestAssuranceDTO::kUnverified, std::nullopt}};
+}
+
+[[nodiscard]] ComponentLifecycleIntentDTO DisableIntent(
+    std::string request_id, const RequestOwnerEpoch& owner_epoch,
+    std::uint64_t expected_component_generation) {
+  auto result =
+      Intent(std::move(request_id), owner_epoch, expected_component_generation, "disable");
+  result.intent = ComponentLifecycleIntentKindDTO::kDisable;
+  result.expected_control_domains = {ExpectedDisableDomain()};
+  return result;
+}
+
+[[nodiscard]] ComponentLifecycleAcceptedDTO Acceptance(const ComponentLifecycleIntentDTO& intent,
+                                                       std::uint64_t transaction_generation,
+                                                       std::string transaction_id) {
+  return {intent.request_context.request_id,
+          RequestReplayStatusDTO::kAcceptedNew,
+          LifecycleTransactionId(std::move(transaction_id)),
+          LifecycleTransactionGeneration(transaction_generation),
+          ComponentLifecycleGeneration(intent.expected_component_lifecycle_generation.value() + 1U),
+          100,
+          1'000'000};
+}
+
+[[nodiscard]] ComponentLifecycleDomainStatusDTO InitialDomain() {
+  const auto expected = ExpectedDomain();
+  return {expected.control_domain_id,
+          expected,
+          CurrentScope(),
+          CurrentProviderOccurrence(),
+          ComponentLifecycleStateDTO::kDeclared,
+          ComponentLifecycleStateDTO::kDeclared,
+          RequestedPrepared(),
+          ComponentLifecycleDomainActionStateDTO::kReserved,
+          ComponentLifecycleDomainEffectDTO::kNone,
+          {},
+          std::nullopt,
+          std::nullopt};
+}
+
+[[nodiscard]] ComponentLifecycleStatusDTO InitialStatus(
+    const ComponentLifecycleIntentDTO& intent, const ComponentLifecycleAcceptedDTO& acceptance) {
+  return {acceptance,
+          intent,
+          1U,
+          intent.request_context.request_owner_epoch,
+          ComponentLifecycleStateDTO::kDeclared,
+          ComponentLifecycleStateDTO::kDeclared,
+          RequestedPrepared(),
+          ComponentLifecycleTransactionPhaseDTO::kAccepted,
+          {InitialDomain()},
+          std::nullopt,
+          std::nullopt,
+          std::nullopt,
+          false,
+          std::nullopt,
+          std::nullopt,
+          acceptance.accepted_at_ns,
+          acceptance.accepted_at_ns,
+          acceptance.timeout_duration_ns};
+}
+
+[[nodiscard]] ComponentLifecycleStatusDTO InitialDisableStatus(
+    const ComponentLifecycleIntentDTO& intent, const ComponentLifecycleAcceptedDTO& acceptance) {
+  const auto& expected = intent.expected_control_domains.front();
+  const ComponentLifecycleRequestedStateDTO requested{
+      ComponentLifecycleRequestedStatePresenceDTO::kResolved,
+      ComponentLifecycleStateDTO::kDisabled};
+  return {acceptance,
+          intent,
+          1U,
+          intent.request_context.request_owner_epoch,
+          ComponentLifecycleStateDTO::kActive,
+          ComponentLifecycleStateDTO::kDisabling,
+          requested,
+          ComponentLifecycleTransactionPhaseDTO::kAccepted,
+          {{expected.control_domain_id,
+            expected,
+            CurrentDisableScope(),
+            CurrentProviderOccurrence(),
+            ComponentLifecycleStateDTO::kActive,
+            ComponentLifecycleStateDTO::kActive,
+            requested,
+            ComponentLifecycleDomainActionStateDTO::kReserved,
+            ComponentLifecycleDomainEffectDTO::kNone,
+            {},
+            std::nullopt,
+            std::nullopt}},
+          std::nullopt,
+          std::nullopt,
+          std::nullopt,
+          false,
+          std::nullopt,
+          std::nullopt,
+          acceptance.accepted_at_ns,
+          acceptance.accepted_at_ns,
+          acceptance.timeout_duration_ns};
+}
+
+[[nodiscard]] ComponentLifecycleStatusDTO InitialUnresolvedDisableStatus(
+    const ComponentLifecycleIntentDTO& intent, const ComponentLifecycleAcceptedDTO& acceptance) {
+  auto status = InitialDisableStatus(intent, acceptance);
+  status.previous_state.reset();
+  status.current_state.reset();
+  status.domains.front().current_scope.reset();
+  status.domains.front().resolved_provider_occurrence.reset();
+  status.domains.front().previous_state.reset();
+  status.domains.front().current_state.reset();
+  return status;
+}
+
+[[nodiscard]] DisableHandoffRequestDTO DisableRequest(
+    const ComponentLifecycleStatusDTO& status,
+    RequestOwnerEpoch kernel_owner_epoch = RequestOwnerEpoch("kernel-owner.1"),
+    std::string kernel_request_id = "disable-handoff.1") {
+  const auto scope = DisableFenceScope();
+  const auto& configuration = *status.domains.front().current_scope->active_control_configuration;
+  return {{RequestId(std::move(kernel_request_id)), std::move(kernel_owner_epoch),
+           "CCLC Disable handoff", status.accepted_intent.request_context.request_id.value()},
+          status.accepted_intent.request_context.request_id,
+          status.acceptance.lifecycle_transaction_id,
+          status.acceptance.lifecycle_transaction_generation,
+          status.accepted_intent.controllable_component_id,
+          DisableHandoffScopeResolutionDTO::kExact,
+          scope,
+          ContentDigest("disable-admission-snapshot.1"),
+          ActiveBundlePublicationGeneration(3U),
+          ContentDigest("public-pointer.1"),
+          status.accepted_intent.expected_graph_revision,
+          RetainedBundleId("retained-bundle.1"),
+          status.acceptance.component_lifecycle_generation,
+          9U,
+          ConfigurationFenceGeneration(11U),
+          {{configuration.control_domain_id,
+            {ExpectedActiveControlConfigurationPresenceDTO::kPresent,
+             configuration.active_control_configuration_id,
+             configuration.active_control_configuration_generation}}}};
+}
+
+[[nodiscard]] DisableHandoffComponentScopeExpectationDTO DisableComponentExpectation(
+    const DisableHandoffRequestDTO& request) {
+  return {ContentDigest("component-snapshot.1"),
+          request.expected_active_publication_generation,
+          request.expected_active_public_pointer_digest,
+          request.expected_retained_bundle_id,
+          request.expected_graph_revision,
+          request.expected_component_lifecycle_generation,
+          request.affected_scope,
+          request.expected_active_control_configurations};
+}
+
+[[nodiscard]] DisableHandoffAdmissionSnapshotDTO DisableAdmissionSnapshot(
+    const DisableHandoffRequestDTO& request,
+    const DisableHandoffComponentScopeExpectationDTO& expectation,
+    const RequestOwnerEpoch& kernel_owner_epoch) {
+  return {{request.controllable_component_id,
+           DisableHandoffScopeRequestKindDTO::kResolvedComponentScope, expectation},
+          kernel_owner_epoch,
+          request.scope_resolution,
+          request.affected_scope,
+          request.expected_active_publication_generation,
+          request.expected_active_public_pointer_digest,
+          request.expected_retained_bundle_id,
+          request.expected_graph_revision,
+          request.expected_operation_resource_generation,
+          request.expected_fence_generation,
+          request.expected_active_control_configurations,
+          ContentDigest("disable-release-admission.1")};
+}
+
+[[nodiscard]] DisableHandoffRequestDTO PromotedFullDisableRequest(
+    const ComponentLifecycleStatusDTO& status) {
+  auto request = DisableRequest(status);
+  request.scope_resolution = DisableHandoffScopeResolutionDTO::kPromotedToFull;
+  request.affected_scope = FullDisableFenceScope();
+  request.expected_active_control_configurations.push_back(
+      {ControlDomainId("domain.2"),
+       {ExpectedActiveControlConfigurationPresenceDTO::kAbsent, std::nullopt, std::nullopt}});
+  return request;
+}
+
+[[nodiscard]] DisableHandoffAcceptedDTO DisableAcceptance(const DisableHandoffRequestDTO& request) {
+  return {request.owner_request_context.request_id,
+          RequestReplayStatusDTO::kAcceptedNew,
+          request.lifecycle_transaction_id,
+          request.lifecycle_transaction_generation,
+          request.controllable_component_id,
+          request.scope_resolution,
+          ContentDigest("scope-digest.1"),
+          ConfigurationFenceId("configuration-fence.1"),
+          ConfigurationFenceGeneration(12U),
+          std::nullopt,
+          std::nullopt};
+}
+
+[[nodiscard]] ConfigurationFenceHandleDTO DisableFenceHandle(
+    const DisableHandoffRequestDTO& request, const DisableHandoffAcceptedDTO& acceptance) {
+  return {acceptance.configuration_fence_id,
+          acceptance.configuration_fence_generation,
+          request.lifecycle_transaction_id,
+          request.lifecycle_transaction_generation,
+          request.controllable_component_id,
+          request.affected_scope,
+          "disable containment",
+          ConfigurationFenceState::kHeld};
+}
+
+[[nodiscard]] DisableHandoffStatusDTO DisableReady(const DisableHandoffRequestDTO& request,
+                                                   const DisableHandoffAcceptedDTO& acceptance) {
+  return {request.lifecycle_transaction_id,
+          request.lifecycle_transaction_generation,
+          request.controllable_component_id,
+          acceptance.scope_resolution,
+          acceptance.component_scope_digest,
+          acceptance.configuration_fence_id,
+          acceptance.configuration_fence_generation,
+          DisableHandoffStateDTO::kReady,
+          request.affected_scope,
+          DisableFenceHandle(request, acceptance),
+          std::nullopt,
+          {},
+          std::nullopt};
+}
+
+[[nodiscard]] DisableHandoffStatusDTO DisableReadyWithScope(
+    const DisableHandoffRequestDTO& request, const DisableHandoffAcceptedDTO& acceptance,
+    ConfigurationFenceScopeDTO scope) {
+  auto status = DisableReady(request, acceptance);
+  status.scope = std::move(scope);
+  status.configuration_fence_handle.scope = status.scope;
+  return status;
+}
+
+[[nodiscard]] CCLCEffectAttemptDTO PreparedDisableEffect(const DisableHandoffRequestDTO& request,
+                                                         std::uint64_t effect_sequence = 1U) {
+  return {CCLCRequestKindDTO::kComponentLifecycle,
+          request.lifecycle_transaction_id,
+          request.lifecycle_transaction_generation,
+          effect_sequence,
+          CCLCEffectKindDTO::kKernelDisableHandoff,
+          CCLCEffectAttemptStateDTO::kPrepared,
+          std::nullopt,
+          std::nullopt,
+          request,
+          std::nullopt,
+          std::nullopt,
+          std::nullopt};
+}
+
+[[nodiscard]] CCLCEffectAttemptDTO CompletedDisableEffect(
+    const DisableHandoffRequestDTO& request, const DisableHandoffAcceptedDTO& acceptance,
+    std::uint64_t effect_sequence = 1U) {
+  auto attempt = PreparedDisableEffect(request, effect_sequence);
+  attempt.state = CCLCEffectAttemptStateDTO::kCompleted;
+  attempt.disable_handoff_result = DisableHandoffEffectResultDTO{
+      request, DisableHandoffEffectDispositionDTO::kAccepted, acceptance};
+  return attempt;
+}
+
+[[nodiscard]] ComponentLifecycleStatusDTO PreparedDisableStatus(
+    ComponentLifecycleStatusDTO status) {
+  status.status_sequence += 1U;
+  status.phase = ComponentLifecycleTransactionPhaseDTO::kAcquiringDomains;
+  status.latest_updated_at_ns += 10;
+  status.remaining_duration_ns -= 10;
+  return status;
+}
+
+[[nodiscard]] ComponentLifecycleStatusDTO CompletedDisableStatus(
+    ComponentLifecycleStatusDTO status, const DisableHandoffStatusDTO& handoff) {
+  status.status_sequence += 1U;
+  status.phase = ComponentLifecycleTransactionPhaseDTO::kContaining;
+  status.domains.front().action_state = ComponentLifecycleDomainActionStateDTO::kExecuting;
+  status.domains.front().effect = ComponentLifecycleDomainEffectDTO::kEffectObserved;
+  if (status.domains.front().reconciliation_evidence == std::nullopt) {
+    status.domains.front().reconciliation_evidence =
+        LifecycleReconciliationEvidenceDTO{ProviderInstanceId("provider.1"),
+                                           ProviderManifestId("manifest.1"),
+                                           ProviderManifestRevision("manifest-revision.1"),
+                                           RuntimeUnitId("runtime.1"),
+                                           RuntimeEpoch("runtime-epoch.1"),
+                                           1U,
+                                           1U,
+                                           ComponentLifecycleStateDTO::kDisabling,
+                                           LifecyclePostconditionResultDTO::kNotSatisfied,
+                                           510};
+  }
+  status.domains.front().error.reset();
+  status.configuration_fence = handoff.configuration_fence_handle;
+  status.disable_handoff = handoff;
+  status.reconciliation_required = false;
+  status.error.reset();
+  status.latest_updated_at_ns += 10;
+  return status;
+}
+
+[[nodiscard]] ComponentLifecycleStatusDTO CompletedNoSnapshotDisableStatus(
+    ComponentLifecycleStatusDTO status, const DisableHandoffStatusDTO& handoff) {
+  status.status_sequence += 1U;
+  status.phase = ComponentLifecycleTransactionPhaseDTO::kContaining;
+  status.configuration_fence = handoff.configuration_fence_handle;
+  status.disable_handoff = handoff;
+  status.latest_updated_at_ns += 10;
+  status.remaining_duration_ns -= 10;
+  return status;
+}
+
+[[nodiscard]] ResolvedLifecycleControlDomainScopeDTO SecondCurrentScope() {
+  return {ControlDomainId("domain.2"),
+          ControlDomainRevision("domain-revision.2"),
+          ControllerTopologyId("topology.2"),
+          TopologyRevision("topology-revision.2"),
+          std::nullopt,
+          {{ControlBindingId("binding.2"), ControlBindingRevision("binding-revision.2"),
+            ControlRouteId("route.2")}},
+          {ResourceId("resource.2")}};
+}
+
+[[nodiscard]] ResolvedLifecycleProviderOccurrenceDTO SecondProviderOccurrence() {
+  return {ControlDomainId("domain.2"),
+          ControlDomainRevision("domain-revision.2"),
+          ProviderInstanceId("provider.2"),
+          ProviderManifestId("manifest.2"),
+          ProviderManifestRevision("manifest-revision.2"),
+          RuntimeUnitId("runtime.2"),
+          RuntimeEpoch("runtime-epoch.2"),
+          ContentDigest("catalog-digest.2")};
+}
+
+[[nodiscard]] ComponentLifecycleStatusDTO AugmentedPromotedFullDisableStatus(
+    ComponentLifecycleStatusDTO status) {
+  const ErrorDTO outcome{"component_not_disabled_without_vendor_mutation",
+                         "containment completed but lifecycle state remains active",
+                         {}};
+  const auto requested = status.requested_state;
+  status.status_sequence += 1U;
+  status.previous_state = ComponentLifecycleStateDTO::kActive;
+  status.current_state = ComponentLifecycleStateDTO::kActive;
+  status.phase = ComponentLifecycleTransactionPhaseDTO::kVerifying;
+
+  auto& expected = status.domains.front();
+  expected.current_scope = CurrentDisableScope();
+  expected.resolved_provider_occurrence = CurrentProviderOccurrence();
+  expected.previous_state = ComponentLifecycleStateDTO::kActive;
+  expected.current_state = ComponentLifecycleStateDTO::kActive;
+  expected.action_state = ComponentLifecycleDomainActionStateDTO::kFailed;
+  expected.effect = ComponentLifecycleDomainEffectDTO::kKnownNoEffect;
+  expected.error = outcome;
+
+  status.domains.push_back({ControlDomainId("domain.2"),
+                            std::nullopt,
+                            SecondCurrentScope(),
+                            SecondProviderOccurrence(),
+                            ComponentLifecycleStateDTO::kActive,
+                            ComponentLifecycleStateDTO::kActive,
+                            requested,
+                            ComponentLifecycleDomainActionStateDTO::kFailed,
+                            ComponentLifecycleDomainEffectDTO::kKnownNoEffect,
+                            {},
+                            std::nullopt,
+                            outcome});
+  status.reconciliation_required = false;
+  status.error = outcome;
+  status.latest_updated_at_ns += 10;
+  status.remaining_duration_ns -= 10;
+  return status;
+}
+
+[[nodiscard]] ComponentLifecycleStatusDTO PersistPromotedFullNoSnapshotHandoff(
+    SqliteCCLCJournal& journal, const RequestOwnerEpoch& owner) {
+  const auto intent = DisableIntent("request.1", owner, 3U);
+  const auto acceptance = Acceptance(intent, 1U, "transaction.1");
+  auto status = InitialUnresolvedDisableStatus(intent, acceptance);
+  const auto accepted = journal.AcceptOrReplayLifecycle(owner, intent, acceptance, status);
+  if (!accepted.ok()) {
+    throw std::runtime_error(accepted.error().code + ": " + accepted.error().message);
+  }
+
+  const auto request = PromotedFullDisableRequest(status);
+  const auto handoff_acceptance = DisableAcceptance(request);
+  const auto handoff = DisableReady(request, handoff_acceptance);
+  status = PreparedDisableStatus(status);
+  const auto prepared = journal.RecordEffectPrepared(owner, PreparedDisableEffect(request), status);
+  if (!prepared.ok()) {
+    throw std::runtime_error(prepared.error().code + ": " + prepared.error().message);
+  }
+  status = CompletedNoSnapshotDisableStatus(status, handoff);
+  const auto completed = journal.RecordEffectCompleted(
+      owner, CompletedDisableEffect(request, handoff_acceptance), status);
+  if (!completed.ok()) {
+    throw std::runtime_error(completed.error().code + ": " + completed.error().message);
+  }
+  return status;
+}
+
+[[nodiscard]] DisableFenceReleaseRequestDTO DisableReleaseRequest(
+    const ComponentLifecycleStatusDTO& status,
+    RequestOwnerEpoch kernel_owner_epoch = RequestOwnerEpoch("kernel-owner.1"),
+    std::string kernel_request_id = "disable-release.1") {
+  const auto handoff_request =
+      DisableRequest(status, kernel_owner_epoch, "release-scope-reference.1");
+  const auto expectation = DisableComponentExpectation(handoff_request);
+  auto admission = DisableAdmissionSnapshot(handoff_request, expectation, kernel_owner_epoch);
+  admission.configuration_fence_generation =
+      status.configuration_fence->configuration_fence_generation;
+  return {{RequestId(std::move(kernel_request_id)), std::move(kernel_owner_epoch),
+           "CCLC Disable fence release", status.accepted_intent.request_context.request_id.value()},
+          status.accepted_intent.request_context.request_id,
+          status.acceptance.lifecycle_transaction_id,
+          status.acceptance.lifecycle_transaction_generation,
+          status.accepted_intent.controllable_component_id,
+          *status.disable_handoff,
+          status.status_sequence,
+          ContentDigest(detail::ComponentLifecycleStatusReleasePreconditionDigest(status)),
+          expectation,
+          admission};
+}
+
+[[nodiscard]] DisableFenceReleasedDTO DisableReleaseReceipt(
+    const DisableFenceReleaseRequestDTO& request) {
+  return {request,
+          RequestReplayStatusDTO::kAcceptedNew,
+          700,
+          request.ready_handoff.configuration_fence_id,
+          request.ready_handoff.configuration_fence_generation,
+          request.ready_handoff.component_scope_digest,
+          ContentDigest("disable-release-receipt.1")};
+}
+
+[[nodiscard]] CCLCEffectAttemptDTO PreparedReleaseEffect(
+    const DisableFenceReleaseRequestDTO& request, std::uint64_t effect_sequence = 2U) {
+  return {CCLCRequestKindDTO::kComponentLifecycle,
+          request.lifecycle_transaction_id,
+          request.lifecycle_transaction_generation,
+          effect_sequence,
+          CCLCEffectKindDTO::kKernelDisableFenceRelease,
+          CCLCEffectAttemptStateDTO::kPrepared,
+          std::nullopt,
+          std::nullopt,
+          std::nullopt,
+          std::nullopt,
+          request,
+          std::nullopt};
+}
+
+[[nodiscard]] CCLCEffectAttemptDTO CompletedReleaseEffect(
+    const DisableFenceReleaseRequestDTO& request,
+    DisableFenceReleaseEffectDispositionDTO disposition,
+    std::optional<DisableFenceReleasedDTO> receipt, std::uint64_t effect_sequence = 2U) {
+  auto attempt = PreparedReleaseEffect(request, effect_sequence);
+  attempt.state = CCLCEffectAttemptStateDTO::kCompleted;
+  attempt.disable_fence_release_result =
+      DisableFenceReleaseEffectResultDTO{request, disposition, std::move(receipt)};
+  return attempt;
+}
+
+[[nodiscard]] ComponentLifecycleStatusDTO PreparedReleaseStatus(
+    ComponentLifecycleStatusDTO status) {
+  status.status_sequence += 1U;
+  status.phase = ComponentLifecycleTransactionPhaseDTO::kVerifying;
+  status.latest_updated_at_ns += 10;
+  status.remaining_duration_ns -= 10;
+  return status;
+}
+
+[[nodiscard]] ComponentLifecycleStatusDTO ReleasePendingStatus(ComponentLifecycleStatusDTO status) {
+  status.status_sequence += 1U;
+  status.configuration_fence->state = ConfigurationFenceState::kReleasePending;
+  status.latest_updated_at_ns += 10;
+  status.remaining_duration_ns -= 10;
+  return status;
+}
+
+[[nodiscard]] ComponentLifecycleStatusDTO ResolvedDisableStatus(
+    ComponentLifecycleStatusDTO status) {
+  status.status_sequence += 1U;
+  status.phase = ComponentLifecycleTransactionPhaseDTO::kVerifying;
+  status.domains.front().current_state = ComponentLifecycleStateDTO::kDisabled;
+  status.domains.front().action_state = ComponentLifecycleDomainActionStateDTO::kSucceeded;
+  status.domains.front().effect = ComponentLifecycleDomainEffectDTO::kEffectObserved;
+  if (status.domains.front().reconciliation_evidence.has_value()) {
+    auto& evidence = *status.domains.front().reconciliation_evidence;
+    evidence.source_sequence += 1U;
+    evidence.observation_generation += 1U;
+    evidence.observed_state = ComponentLifecycleStateDTO::kDisabled;
+    evidence.postcondition_result = LifecyclePostconditionResultDTO::kSatisfied;
+    evidence.observed_at_ns += 10;
+  }
+  status.domains.front().error.reset();
+  status.reconciliation_required = false;
+  status.error.reset();
+  status.latest_updated_at_ns += 10;
+  status.remaining_duration_ns -= 10;
+  return status;
+}
+
+[[nodiscard]] ComponentLifecycleStatusDTO CompletedReleaseStatus(
+    ComponentLifecycleStatusDTO status, const DisableFenceReleasedDTO& receipt) {
+  status.status_sequence += 1U;
+  status.current_state = ComponentLifecycleStateDTO::kDisabled;
+  status.phase = ComponentLifecycleTransactionPhaseDTO::kSucceeded;
+  status.domains.front().current_state = ComponentLifecycleStateDTO::kDisabled;
+  status.domains.front().action_state = ComponentLifecycleDomainActionStateDTO::kSucceeded;
+  status.configuration_fence->state = ConfigurationFenceState::kReleased;
+  status.disable_fence_released = receipt;
+  status.reconciliation_required = false;
+  status.terminal_result = ComponentLifecycleTerminalResultDTO::kSucceeded;
+  status.error.reset();
+  status.latest_updated_at_ns += 10;
+  status.remaining_duration_ns = 0;
+  return status;
+}
+
+[[nodiscard]] ComponentLifecycleStatusDTO UncertainDisableStatus(
+    ComponentLifecycleStatusDTO status, const RequestOwnerEpoch& replacement_owner) {
+  const ErrorDTO error{
+      "disable_handoff_outcome_unknown", "prepared Kernel handoff requires reconciliation", {}};
+  status.status_sequence += 1U;
+  status.status_owner_epoch = replacement_owner;
+  status.phase = ComponentLifecycleTransactionPhaseDTO::kOutcomeUnknown;
+  status.domains.front().action_state = ComponentLifecycleDomainActionStateDTO::kOutcomeUnknown;
+  status.domains.front().effect = ComponentLifecycleDomainEffectDTO::kEffectUncertain;
+  status.domains.front().error = error;
+  status.reconciliation_required = true;
+  status.error = error;
+  status.latest_updated_at_ns = 500;
+  status.remaining_duration_ns = 0;
+  return status;
+}
+
+[[nodiscard]] ComponentLifecycleStatusDTO ReplacementTerminalKnownNoEffect(
+    ComponentLifecycleStatusDTO status, const RequestOwnerEpoch& replacement_owner) {
+  const ErrorDTO error{"lifecycle_owner_replaced_before_effect",
+                       "the prior owner ended before preparing an external effect",
+                       {}};
+  status.status_sequence += 1U;
+  status.status_owner_epoch = replacement_owner;
+  status.phase = ComponentLifecycleTransactionPhaseDTO::kFailed;
+  for (auto& domain : status.domains) {
+    if (domain.action_state != ComponentLifecycleDomainActionStateDTO::kSucceeded) {
+      domain.action_state = ComponentLifecycleDomainActionStateDTO::kFailed;
+      if (domain.effect == ComponentLifecycleDomainEffectDTO::kNone) {
+        domain.effect = ComponentLifecycleDomainEffectDTO::kKnownNoEffect;
+      }
+      domain.error = error;
+    }
+  }
+  status.reconciliation_required = false;
+  status.terminal_result = ComponentLifecycleTerminalResultDTO::kFailedKnownNoEffect;
+  status.error = error;
+  status.latest_updated_at_ns = 500;
+  status.remaining_duration_ns = 0;
+  return status;
+}
+
+[[nodiscard]] ComponentLifecycleStatusDTO TerminalSuccess(ComponentLifecycleStatusDTO status,
+                                                          std::uint64_t sequence) {
+  status.status_sequence = sequence;
+  status.current_state = ComponentLifecycleStateDTO::kPrepared;
+  status.phase = ComponentLifecycleTransactionPhaseDTO::kSucceeded;
+  status.domains.front().current_state = ComponentLifecycleStateDTO::kPrepared;
+  status.domains.front().action_state = ComponentLifecycleDomainActionStateDTO::kSucceeded;
+  status.domains.front().effect = status.domains.front().primitive_attempts.empty()
+                                      ? ComponentLifecycleDomainEffectDTO::kKnownNoEffect
+                                      : ComponentLifecycleDomainEffectDTO::kEffectObserved;
+  status.terminal_result = ComponentLifecycleTerminalResultDTO::kSucceeded;
+  status.error.reset();
+  status.latest_updated_at_ns += 10;
+  status.remaining_duration_ns = 0;
+  return status;
+}
+
+[[nodiscard]] BrandLifecyclePrimitiveIntentDTO PrimitiveIntent(
+    const ComponentLifecycleStatusDTO& status, std::string attempt_id = "attempt.1") {
+  const auto& expected = status.accepted_intent.expected_control_domains.front();
+  return {status.acceptance.lifecycle_transaction_id,
+          status.acceptance.lifecycle_transaction_generation,
+          status.accepted_intent.controllable_component_id,
+          expected.control_domain_id,
+          expected.control_domain_revision,
+          ProviderInstanceId("provider.1"),
+          ProviderManifestId("manifest.1"),
+          ProviderManifestRevision("manifest-revision.1"),
+          RuntimeUnitId("runtime.1"),
+          RuntimeEpoch("runtime-epoch.1"),
+          LifecyclePrimitiveId("prepare"),
+          LifecyclePrimitiveAttemptId(std::move(attempt_id)),
+          1U,
+          500'000};
+}
+
+[[nodiscard]] BrandLifecyclePrimitiveResultDTO PrimitiveSuccess(
+    const BrandLifecyclePrimitiveIntentDTO& intent) {
+  return {intent.lifecycle_transaction_id,
+          intent.lifecycle_transaction_generation,
+          intent.controllable_component_id,
+          intent.control_domain_id,
+          intent.control_domain_revision,
+          intent.provider_instance_id,
+          intent.provider_manifest_id,
+          intent.provider_manifest_revision,
+          intent.provider_runtime_unit_id,
+          intent.provider_runtime_epoch,
+          intent.lifecycle_primitive_id,
+          intent.lifecycle_primitive_attempt_id,
+          intent.expected_observation_generation,
+          LifecyclePrimitiveDispatchStateDTO::kDispatchedKnown,
+          LifecyclePrimitiveEffectDTO::kObserved,
+          LifecyclePrimitiveKnownResultDTO::kSucceeded,
+          std::nullopt};
+}
+
+[[nodiscard]] CCLCEffectAttemptDTO PreparedPrimitiveEffect(
+    const BrandLifecyclePrimitiveIntentDTO& intent, std::uint64_t effect_sequence = 1U) {
+  return {CCLCRequestKindDTO::kComponentLifecycle,
+          intent.lifecycle_transaction_id,
+          intent.lifecycle_transaction_generation,
+          effect_sequence,
+          CCLCEffectKindDTO::kBrandLifecyclePrimitive,
+          CCLCEffectAttemptStateDTO::kPrepared,
+          intent,
+          std::nullopt,
+          std::nullopt,
+          std::nullopt,
+          std::nullopt,
+          std::nullopt};
+}
+
+[[nodiscard]] CCLCEffectAttemptDTO CompletedPrimitiveEffect(
+    const BrandLifecyclePrimitiveIntentDTO& intent, const BrandLifecyclePrimitiveResultDTO& result,
+    std::uint64_t effect_sequence = 1U) {
+  auto attempt = PreparedPrimitiveEffect(intent, effect_sequence);
+  attempt.state = CCLCEffectAttemptStateDTO::kCompleted;
+  attempt.lifecycle_primitive_result = result;
+  return attempt;
+}
+
+[[nodiscard]] ComponentLifecycleStatusDTO PreparedEffectStatus(ComponentLifecycleStatusDTO status) {
+  status.status_sequence += 1U;
+  status.phase = ComponentLifecycleTransactionPhaseDTO::kExecuting;
+  status.domains.front().action_state = ComponentLifecycleDomainActionStateDTO::kExecuting;
+  status.latest_updated_at_ns = 200;
+  status.remaining_duration_ns = 999'900;
+  return status;
+}
+
+[[nodiscard]] ComponentLifecycleStatusDTO CompletedEffectStatus(
+    ComponentLifecycleStatusDTO status, const BrandLifecyclePrimitiveResultDTO& result) {
+  status.status_sequence += 1U;
+  status.phase = ComponentLifecycleTransactionPhaseDTO::kVerifying;
+  status.domains.front().action_state = ComponentLifecycleDomainActionStateDTO::kVerifying;
+  status.domains.front().effect = ComponentLifecycleDomainEffectDTO::kEffectObserved;
+  status.domains.front().primitive_attempts.push_back(result);
+  status.latest_updated_at_ns = 300;
+  status.remaining_duration_ns = 999'800;
+  return status;
+}
+
+[[nodiscard]] std::string Sha(char value) {
+  return std::string("sha256:") + std::string(64U, value);
+}
+
+[[nodiscard]] ControllerTopologyDTO RouteTopology() {
+  const ResourceInterfaceClaimDTO position{ResourceRoleId("arm_joints"), "position"};
+  return {ControllerTopologyId("topology.arm"),
+          TopologyRevision(Sha('1')),
+          {{ControllerRoleId("hardware"), {}, {position}, {}}},
+          {},
+          {{ActivationSetId("activation.direct"), {ControllerRoleId("hardware")}, {}},
+           {ActivationSetId("activation.legacy"), {ControllerRoleId("hardware")}, {}}},
+          {{ControlRouteId("route.direct"),
+            ControlInterfaceContractId("contract.position"),
+            ControlInterfaceRevision(Sha('2')),
+            {ControllerRoleId("hardware")},
+            {ActivationSetId("activation.direct")}},
+           {ControlRouteId("route.legacy"),
+            ControlInterfaceContractId("contract.position"),
+            ControlInterfaceRevision(Sha('2')),
+            {ControllerRoleId("hardware")},
+            {ActivationSetId("activation.legacy")}}}};
+}
+
+[[nodiscard]] DesiredControlConfigurationDTO RouteDesired() {
+  return {ControlDomainId("route-domain.1"),
+          ControlDomainRevision(Sha('3')),
+          ControllerTopologyId("topology.arm"),
+          TopologyRevision(Sha('1')),
+          ActivationSetId("activation.direct"),
+          {{ControlBindingId("route-binding.a"), ControlBindingRevision(Sha('4')),
+            ControlRouteId("route.direct")},
+           {ControlBindingId("route-binding.b"), ControlBindingRevision(Sha('5')),
+            ControlRouteId("route.direct")}}};
+}
+
+[[nodiscard]] ControllerLifecycleExpectedDomainDTO RouteExpectedDomain() {
+  const auto desired = RouteDesired();
+  return {desired.control_domain_id,
+          desired.control_domain_revision,
+          desired.controller_topology_id,
+          desired.topology_revision,
+          ProductId("product.control.arm"),
+          ProductContractId("manyforge.control-domain-control.v2"),
+          ProductContractRevision(Sha('6')),
+          ContentDigest(Sha('7')),
+          ContentDigest(Sha('8')),
+          RuntimeUnitId("runtime.controller-manager"),
+          RuntimeEpoch("runtime-epoch.1"),
+          RouteTopology(),
+          desired,
+          {{ControlBindingId("route-binding.a"),
+            ControlBindingRevision(Sha('4')),
+            ControlInterfaceContractId("contract.position"),
+            ControlInterfaceRevision(Sha('2')),
+            {{ResourceId("joint.a"), "position"}},
+            {{ResourceId("joint.a"), "position"}}},
+           {ControlBindingId("route-binding.b"),
+            ControlBindingRevision(Sha('5')),
+            ControlInterfaceContractId("contract.position"),
+            ControlInterfaceRevision(Sha('2')),
+            {{ResourceId("joint.b"), "position"}},
+            {{ResourceId("joint.b"), "position"}}}},
+          {{ControllerRoleId("hardware"),
+            ControllerImplementationId("implementation.hardware"),
+            ControllerImplementationRevision(Sha('9')),
+            "controller_interface::ControllerInterface",
+            ContentDigest(Sha('a')),
+            {},
+            {},
+            {},
+            {}}},
+          {{ControlBindingId("route-binding.a"), ControlBindingRevision(Sha('4')),
+            ControlRouteId("route.direct"), EndpointRoleId("endpoint.command.a"), "/cell/arm/a",
+            true, false},
+           {ControlBindingId("route-binding.b"), ControlBindingRevision(Sha('5')),
+            ControlRouteId("route.direct"), EndpointRoleId("endpoint.command.b"), "/cell/arm/b",
+            true, false}}};
+}
+
+[[nodiscard]] std::vector<RouteSelectionComponentExpectationDTO> RouteComponents() {
+  return {{ControllableComponentId("component.a"), ComponentLifecycleGeneration(4U),
+           ComponentLifecycleStateDTO::kPrepared},
+          {ControllableComponentId("component.b"), ComponentLifecycleGeneration(7U),
+           ComponentLifecycleStateDTO::kActive}};
+}
+
+[[nodiscard]] ActiveControlConfigurationDTO RouteCurrentConfiguration() {
+  const auto desired = RouteDesired();
+  return {ActiveControlConfigurationId("configuration.current"),
+          desired.control_domain_id,
+          desired.control_domain_revision,
+          {{ControlBindingId("route-binding.a"), ControlBindingRevision(Sha('4')),
+            ControlRouteId("route.legacy")},
+           {ControlBindingId("route-binding.b"), ControlBindingRevision(Sha('5')),
+            ControlRouteId("route.legacy")}},
+          ActivationSetId("activation.legacy"),
+          desired.controller_topology_id,
+          desired.topology_revision,
+          RuntimeUnitId("runtime.controller-manager"),
+          RuntimeEpoch("runtime-epoch.1"),
+          8U,
+          {},
+          ActiveControlConfigurationGeneration(5U),
+          ActiveControlConfigurationStateDTO::kReconciled};
+}
+
+[[nodiscard]] ExpectedActiveControlConfigurationDTO RouteExpectedCurrent() {
+  return {ExpectedActiveControlConfigurationPresenceDTO::kPresent,
+          ActiveControlConfigurationId("configuration.current"),
+          ActiveControlConfigurationGeneration(5U)};
+}
+
+[[nodiscard]] ConfigurationFenceScopeDTO RouteScope() {
+  const auto desired = RouteDesired();
+  return {{ControllableComponentId("component.a"), ControllableComponentId("component.b")},
+          {{desired.control_domain_id, desired.control_domain_revision,
+            desired.control_domain_revision}},
+          {{ControlBindingId("route-binding.a"), ControlBindingRevision(Sha('4')),
+            ControlBindingRevision(Sha('4'))},
+           {ControlBindingId("route-binding.b"), ControlBindingRevision(Sha('5')),
+            ControlBindingRevision(Sha('5'))}},
+          {ResourceId("joint.a"), ResourceId("joint.b")}};
+}
+
+[[nodiscard]] RouteSelectionIntentDTO RouteIntent(const RequestOwnerEpoch& owner,
+                                                  std::string request_id = "request.route.1") {
+  return {{RequestId(std::move(request_id)), owner, "journal-route-test", std::nullopt},
+          RetainedBundleId("bundle.1"),
+          GraphRevision("graph.1"),
+          RouteDesired(),
+          RouteExpectedCurrent(),
+          RouteComponents(),
+          {RequestTransportDTO::kInternal, RequestAssuranceDTO::kUnverified, std::nullopt}};
+}
+
+[[nodiscard]] RouteConfigurationFenceAdmissionSnapshotDTO RouteFenceSnapshot() {
+  const RouteConfigurationFenceAdmissionQueryDTO query{
+      RouteSelectionTransactionId("route-transaction.1"),
+      RouteSelectionTransactionGeneration(1U),
+      RouteScope(),
+      RetainedBundleId("bundle.1"),
+      GraphRevision("graph.1"),
+      RouteExpectedCurrent()};
+  return {query,
+          {RuntimeUnitId("runtime.kernel"), RuntimeEpoch("kernel-runtime-epoch.1"),
+           RequestOwnerEpoch("kernel-owner.1"), ContentDigest(Sha('b')),
+           ActiveBundlePublicationGeneration(3U)},
+          {RetainedBundleId("bundle.1"),
+           GraphRevision("graph.1"),
+           {SceneId(Sha('c')), 2U, ContentDigest(Sha('d'))}},
+          ActiveBundlePublicationGeneration(3U),
+          ContentDigest(Sha('e')),
+          11U,
+          ConfigurationFenceGeneration(4U),
+          RouteExpectedCurrent(),
+          0U,
+          0U,
+          ContentDigest(Sha('f'))};
+}
+
+[[nodiscard]] PreparedRouteSelectionAdmission PreparedRoute(const RequestOwnerEpoch& owner) {
+  const auto intent = RouteIntent(owner);
+  const RouteSelectionAdmissionCandidate candidate{
+      RouteSelectionTransactionId("route-transaction.1"),
+      RouteSelectionTransactionGeneration(1U),
+      ActiveControlConfigurationId("configuration.candidate"),
+      ActiveControlConfigurationGeneration(6U),
+      ActiveControlConfigurationGeneration(5U),
+      100,
+      10'000,
+      RetainedBundleId("bundle.1"),
+      GraphRevision("graph.1"),
+      RouteComponents(),
+      RouteCurrentConfiguration(),
+      RouteExpectedDomain(),
+      RouteScope(),
+      RouteFenceSnapshot()};
+  const auto prepared = PrepareRouteSelectionAdmission(intent, candidate);
+  if (!prepared.ok()) {
+    throw std::runtime_error(prepared.error().message);
+  }
+  return prepared.value();
+}
+
+[[nodiscard]] PreparedRouteSelectionAdmission PreparedRouteSuccessor(
+    const RequestOwnerEpoch& owner) {
+  const auto intent = RouteIntent(owner, "request.route.2");
+  auto fence_snapshot = RouteFenceSnapshot();
+  fence_snapshot.query.route_selection_transaction_id =
+      RouteSelectionTransactionId("route-transaction.2");
+  fence_snapshot.query.route_selection_transaction_generation =
+      RouteSelectionTransactionGeneration(2U);
+  const RouteSelectionAdmissionCandidate candidate{
+      RouteSelectionTransactionId("route-transaction.2"),
+      RouteSelectionTransactionGeneration(2U),
+      ActiveControlConfigurationId("configuration.candidate.2"),
+      ActiveControlConfigurationGeneration(7U),
+      ActiveControlConfigurationGeneration(6U),
+      200,
+      10'000,
+      RetainedBundleId("bundle.1"),
+      GraphRevision("graph.1"),
+      RouteComponents(),
+      RouteCurrentConfiguration(),
+      RouteExpectedDomain(),
+      RouteScope(),
+      std::move(fence_snapshot)};
+  const auto prepared = PrepareRouteSelectionAdmission(intent, candidate);
+  if (!prepared.ok()) {
+    throw std::runtime_error(prepared.error().message);
+  }
+  return prepared.value();
+}
+
+[[nodiscard]] ControllerLifecycleObservationDTO RouteDesiredObservation() {
+  const auto expected = RouteExpectedDomain();
+  std::vector<ControllerLifecycleObservedControllerDTO> controllers;
+  for (const auto& controller : expected.expected_controllers) {
+    controllers.push_back({controller, ControllerLifecycleActivityDTO::kActive});
+  }
+  std::vector<ControllerLifecycleObservedEndpointDTO> endpoints;
+  for (const auto& endpoint : expected.expected_endpoints) {
+    endpoints.push_back({endpoint, true});
+  }
+  std::vector<ActiveControlConfigurationBindingRouteDTO> active_routes;
+  for (const auto& route : expected.desired_configuration.binding_routes) {
+    active_routes.push_back(
+        {route.control_binding_id, route.control_binding_revision, route.control_route_id});
+  }
+  return {MakeControllerLifecycleObservationQuery(expected),
+          1U,
+          121,
+          122,
+          1'000,
+          ControllerLifecycleObservedConfigurationDTO{
+              expected.desired_configuration.activation_set_id, std::move(active_routes)},
+          std::move(controllers),
+          {},
+          std::move(endpoints)};
+}
+
+[[nodiscard]] ControllerLifecycleReconciliationDTO RouteDesiredReconciliation() {
+  const auto expected = RouteExpectedDomain();
+  return {MakeControllerLifecycleObservationQuery(expected),
+          1U,
+          ControllerLifecycleReconciliationDispositionDTO::kReconciled,
+          expected.desired_configuration.activation_set_id,
+          expected.desired_configuration.binding_routes,
+          {}};
+}
+
+[[nodiscard]] ActiveControlConfigurationDTO RouteCandidateConfiguration() {
+  const auto desired = RouteDesired();
+  return {ActiveControlConfigurationId("configuration.candidate"),
+          desired.control_domain_id,
+          desired.control_domain_revision,
+          {{ControlBindingId("route-binding.a"), ControlBindingRevision(Sha('4')),
+            ControlRouteId("route.direct")},
+           {ControlBindingId("route-binding.b"), ControlBindingRevision(Sha('5')),
+            ControlRouteId("route.direct")}},
+          desired.activation_set_id,
+          desired.controller_topology_id,
+          desired.topology_revision,
+          RuntimeUnitId("runtime.controller-manager"),
+          RuntimeEpoch("runtime-epoch.1"),
+          1U,
+          {},
+          ActiveControlConfigurationGeneration(6U),
+          ActiveControlConfigurationStateDTO::kReconciled};
+}
+
+[[nodiscard]] RouteConfigurationFenceIntentDTO RouteFenceIntent() {
+  const auto snapshot = RouteFenceSnapshot();
+  return {{RequestId("kernel.acquire.1"), snapshot.execution_host_epoch.request_owner_epoch,
+           "cclc-route-selection", std::nullopt},
+          RequestId("request.route.1"),
+          snapshot.query.route_selection_transaction_id,
+          snapshot.query.route_selection_transaction_generation,
+          snapshot.query.scope,
+          snapshot.snapshot_digest,
+          RouteConfigurationFenceBusyDispositionDTO::kRejectIfAffectedBusy,
+          snapshot.query.expected_retained_bundle_id,
+          snapshot.query.expected_graph_revision,
+          snapshot.operation_resource_generation,
+          snapshot.configuration_fence_generation,
+          snapshot.current_active_control_configuration,
+          ActiveControlConfigurationId("configuration.candidate"),
+          ActiveControlConfigurationGeneration(6U),
+          "complete-domain route selection"};
+}
+
+[[nodiscard]] RouteConfigurationFenceAcceptedDTO RouteAcceptedFence() {
+  const auto intent = RouteFenceIntent();
+  return {intent.owner_request_context.request_id,
+          RequestReplayStatusDTO::kAcceptedNew,
+          intent.route_selection_transaction_id,
+          intent.route_selection_transaction_generation,
+          ConfigurationFenceId("route-fence.1"),
+          ConfigurationFenceGeneration(5U),
+          intent.scope,
+          intent.candidate_active_control_configuration_id,
+          intent.candidate_active_control_configuration_generation,
+          120,
+          ContentDigest(Sha('1'))};
+}
+
+[[nodiscard]] CCLCRouteEffectAttemptDTO PreparedRouteFenceAcquire() {
+  return {RouteSelectionTransactionId("route-transaction.1"),
+          RouteSelectionTransactionGeneration(1U),
+          1U,
+          CCLCRouteEffectKindDTO::kKernelRouteConfigurationFenceAcquire,
+          CCLCRouteEffectAttemptStateDTO::kPrepared,
+          RouteFenceIntent(),
+          std::nullopt};
+}
+
+[[nodiscard]] RouteSelectionStatusDTO RouteAcquirePreparedStatus(RouteSelectionStatusDTO status) {
+  status.status_sequence += 1U;
+  status.phase = RouteSelectionTransactionPhaseDTO::kAcquiringFence;
+  status.latest_updated_at_ns = 110;
+  status.remaining_duration_ns = 9'990;
+  return status;
+}
+
+[[nodiscard]] CCLCRouteEffectAttemptDTO CompletedRouteFenceAcquire() {
+  auto attempt = PreparedRouteFenceAcquire();
+  attempt.state = CCLCRouteEffectAttemptStateDTO::kCompleted;
+  attempt.result = RouteConfigurationFenceAcquireEffectResultDTO{
+      RouteFenceIntent(), RouteConfigurationFenceAcquireEffectDispositionDTO::kAccepted,
+      RouteAcceptedFence()};
+  return attempt;
+}
+
+[[nodiscard]] RouteSelectionStatusDTO RouteAcquireCompletedStatus(RouteSelectionStatusDTO status) {
+  status.status_sequence += 1U;
+  status.phase = RouteSelectionTransactionPhaseDTO::kObserving;
+  status.accepted_fence = RouteAcceptedFence();
+  status.latest_updated_at_ns = 120;
+  status.remaining_duration_ns = 9'980;
+  return status;
+}
+
+[[nodiscard]] std::filesystem::path JournalPath(const ScopedTemporaryDirectory& temporary) {
+  return temporary.path() / std::string(kCCLCJournalFilename);
+}
+
+TEST(SqliteCCLCJournal, RouteSelectionSharesMembershipAndReplaysBeforeCurrentChecks) {
+  ScopedTemporaryDirectory temporary;
+  SqliteCCLCJournal journal(JournalPath(temporary), CellId("cell.1"), 4U);
+  const RequestOwnerEpoch owner("owner.route.1");
+  ASSERT_TRUE(journal.BeginOwnerEpoch(owner, 1, 4U).ok());
+
+  const auto intent = RouteIntent(owner);
+  const auto prepared = PreparedRoute(owner);
+  const auto accepted = journal.AcceptOrReplayRouteSelection(owner, intent, prepared.acceptance,
+                                                             prepared.initial_status);
+  ASSERT_TRUE(accepted.ok()) << accepted.error().message;
+  ASSERT_TRUE(accepted.value().locally_valid());
+  EXPECT_EQ(accepted.value().replay_status, RequestReplayStatusDTO::kAcceptedNew);
+
+  auto attributed = intent;
+  attributed.attribution = {RequestTransportDTO::kHttp,
+                            RequestAssuranceDTO::kExternallyAuthenticated, std::string("operator")};
+  const auto replay = journal.AcceptOrReplayRouteSelection(owner, attributed, prepared.acceptance,
+                                                           prepared.initial_status);
+  ASSERT_TRUE(replay.ok()) << replay.error().message;
+  EXPECT_EQ(replay.value().replay_status, RequestReplayStatusDTO::kReplayedExact);
+  EXPECT_EQ(replay.value().acceptance->route_selection_transaction_generation,
+            RouteSelectionTransactionGeneration(1U));
+
+  const auto lifecycle_collision = Intent("request.route.1", owner, 1U);
+  const auto conflict = journal.InspectLifecycleRequest(owner, lifecycle_collision);
+  ASSERT_TRUE(conflict.ok()) << conflict.error().message;
+  ASSERT_TRUE(conflict.value().has_value());
+  EXPECT_EQ(conflict.value()->replay_status, RequestReplayStatusDTO::kRequestIdConflict);
+
+  const auto recovery = journal.BeginOwnerEpoch(RequestOwnerEpoch("owner.route.2"), 2, 4U);
+  ASSERT_TRUE(recovery.ok()) << recovery.error().message;
+  ASSERT_TRUE(recovery.value().locally_valid());
+  EXPECT_EQ(recovery.value().highest_route_selection_transaction_generation, 1U);
+  ASSERT_EQ(recovery.value().active_configuration_watermarks.size(), 1U);
+  EXPECT_EQ(recovery.value().active_configuration_watermarks.front().control_domain_id,
+            RouteDesired().control_domain_id);
+  EXPECT_EQ(recovery.value()
+                .active_configuration_watermarks.front()
+                .active_control_configuration_generation,
+            ActiveControlConfigurationGeneration(6U));
+  ASSERT_EQ(recovery.value().interrupted_route_selections.size(), 1U);
+  EXPECT_EQ(recovery.value().interrupted_route_selections.front(), prepared.initial_status);
+  ASSERT_EQ(recovery.value().route_effect_sequence_watermarks.size(), 1U);
+  EXPECT_EQ(recovery.value().route_effect_sequence_watermarks.front().highest_effect_sequence, 0U);
+}
+
+TEST(SqliteCCLCJournal, RouteOwnerReplacementCanCloseKnownNoEffectWithoutAnAttempt) {
+  ScopedTemporaryDirectory temporary;
+  SqliteCCLCJournal journal(JournalPath(temporary), CellId("cell.1"), 4U);
+  const RequestOwnerEpoch owner1("owner.route.1");
+  ASSERT_TRUE(journal.BeginOwnerEpoch(owner1, 1, 4U).ok());
+  const auto prepared = PreparedRoute(owner1);
+  ASSERT_TRUE(journal
+                  .AcceptOrReplayRouteSelection(owner1, RouteIntent(owner1), prepared.acceptance,
+                                                prepared.initial_status)
+                  .ok());
+
+  const RequestOwnerEpoch owner2("owner.route.2");
+  ASSERT_TRUE(journal.BeginOwnerEpoch(owner2, 2, 4U).ok());
+  auto terminal = prepared.initial_status;
+  terminal.status_sequence = 2U;
+  terminal.status_owner_epoch = owner2;
+  terminal.phase = RouteSelectionTransactionPhaseDTO::kFailed;
+  terminal.effect = RouteSelectionEffectDTO::kKnownNoEffect;
+  terminal.terminal_result = RouteSelectionTerminalResultDTO::kFailedKnownNoEffect;
+  terminal.error = ErrorDTO{"route_owner_replaced", "owner replaced before effect", {}};
+  terminal.latest_updated_at_ns = 0;
+  terminal.remaining_duration_ns = 0;
+  ASSERT_TRUE(terminal.locally_valid());
+
+  const auto recorded = journal.RecordRouteSelectionStatus(owner2, terminal);
+  ASSERT_TRUE(recorded.ok()) << recorded.error().message;
+  const auto retained =
+      journal.LoadRetainedRouteSelectionStatus(prepared.acceptance.route_selection_transaction_id);
+  ASSERT_TRUE(retained.ok());
+  ASSERT_TRUE(retained.value().has_value());
+  EXPECT_EQ(*retained.value(), terminal);
+}
+
+TEST(SqliteCCLCJournal, FailedCandidateBurnsGenerationWithoutReplacingCurrentPublication) {
+  ScopedTemporaryDirectory temporary;
+  SqliteCCLCJournal journal(JournalPath(temporary), CellId("cell.1"), 4U);
+  const RequestOwnerEpoch owner("owner.route.1");
+  ASSERT_TRUE(journal.BeginOwnerEpoch(owner, 1, 4U).ok());
+
+  const auto first = PreparedRoute(owner);
+  ASSERT_TRUE(journal
+                  .AcceptOrReplayRouteSelection(owner, RouteIntent(owner), first.acceptance,
+                                                first.initial_status)
+                  .ok());
+  auto failed = first.initial_status;
+  failed.status_sequence = 2U;
+  failed.phase = RouteSelectionTransactionPhaseDTO::kFailed;
+  failed.effect = RouteSelectionEffectDTO::kKnownNoEffect;
+  failed.terminal_result = RouteSelectionTerminalResultDTO::kFailedKnownNoEffect;
+  failed.error = ErrorDTO{"route_fence_not_acquired", "Kernel proved no Acquire effect", {}};
+  failed.latest_updated_at_ns = 110;
+  failed.remaining_duration_ns = 0;
+  ASSERT_TRUE(failed.locally_valid());
+  ASSERT_TRUE(journal.RecordRouteSelectionStatus(owner, failed).ok());
+
+  const auto current =
+      journal.LoadCurrentActiveControlConfiguration(RouteDesired().control_domain_id);
+  ASSERT_TRUE(current.ok());
+  ASSERT_TRUE(current.value().has_value());
+  EXPECT_EQ(*current.value(), RouteCurrentConfiguration());
+
+  const auto successor = PreparedRouteSuccessor(owner);
+  const auto accepted = journal.AcceptOrReplayRouteSelection(
+      owner, RouteIntent(owner, "request.route.2"), successor.acceptance, successor.initial_status);
+  ASSERT_TRUE(accepted.ok()) << accepted.error().message;
+  EXPECT_EQ(accepted.value().acceptance->candidate_active_control_configuration_generation,
+            ActiveControlConfigurationGeneration(7U));
+}
+
+TEST(SqliteCCLCJournal, CurrentConfigurationPublicationIsAtomicAndRecoveredExactly) {
+  ScopedTemporaryDirectory temporary;
+  const auto path = JournalPath(temporary);
+  const RequestOwnerEpoch owner1("owner.route.1");
+  std::optional<RouteSelectionStatusDTO> published;
+  {
+    SqliteCCLCJournal journal(path, CellId("cell.1"), 4U);
+    ASSERT_TRUE(journal.BeginOwnerEpoch(owner1, 1, 4U).ok());
+    const auto prepared = PreparedRoute(owner1);
+    ASSERT_TRUE(journal
+                    .AcceptOrReplayRouteSelection(owner1, RouteIntent(owner1), prepared.acceptance,
+                                                  prepared.initial_status)
+                    .ok());
+
+    const auto bootstrap =
+        journal.LoadCurrentActiveControlConfiguration(RouteDesired().control_domain_id);
+    ASSERT_TRUE(bootstrap.ok());
+    ASSERT_EQ(bootstrap.value(), std::optional(RouteCurrentConfiguration()));
+
+    const auto acquiring = RouteAcquirePreparedStatus(prepared.initial_status);
+    ASSERT_TRUE(
+        journal.RecordRouteEffectPrepared(owner1, PreparedRouteFenceAcquire(), acquiring).ok());
+    auto observing = RouteAcquireCompletedStatus(acquiring);
+    ASSERT_TRUE(
+        journal.RecordRouteEffectCompleted(owner1, CompletedRouteFenceAcquire(), observing).ok());
+
+    published = observing;
+    published->status_sequence += 1U;
+    published->phase = RouteSelectionTransactionPhaseDTO::kPublishing;
+    published->effect = RouteSelectionEffectDTO::kEffectObserved;
+    published->controller_observation = RouteDesiredObservation();
+    published->controller_reconciliation = RouteDesiredReconciliation();
+    published->affected_control_binding_ids.clear();
+    published->affected_controller_role_ids.clear();
+    published->resulting_active_control_configuration = RouteCandidateConfiguration();
+    published->latest_updated_at_ns = 130;
+    published->remaining_duration_ns = 9'970;
+    ASSERT_TRUE(published->locally_valid());
+    const auto recorded = journal.RecordRouteSelectionStatus(owner1, *published);
+    ASSERT_TRUE(recorded.ok()) << recorded.error().message;
+
+    const auto current =
+        journal.LoadCurrentActiveControlConfiguration(RouteDesired().control_domain_id);
+    ASSERT_TRUE(current.ok());
+    ASSERT_EQ(current.value(), std::optional(RouteCandidateConfiguration()));
+
+    const auto coherent = journal.LoadCurrentSnapshotFacts({ControllableComponentId("component.1")},
+                                                           {RouteDesired().control_domain_id});
+    ASSERT_TRUE(coherent.ok()) << coherent.error().message;
+    ASSERT_EQ(coherent.value().components.size(), 1U);
+    EXPECT_FALSE(coherent.value().components.front().durable_generation.has_value());
+    ASSERT_EQ(coherent.value().domains.size(), 1U);
+    EXPECT_EQ(coherent.value().domains.front().current_active_control_configuration,
+              std::optional(RouteCandidateConfiguration()));
+
+    auto expanded = *published;
+    expanded.status_sequence += 1U;
+    expanded.affected_control_binding_ids = {ControlBindingId("route-binding.a"),
+                                             ControlBindingId("route-binding.b")};
+    expanded.affected_controller_role_ids = {ControllerRoleId("hardware")};
+    expanded.latest_updated_at_ns += 1;
+    expanded.remaining_duration_ns -= 1;
+    ASSERT_TRUE(expanded.locally_valid());
+    EXPECT_FALSE(journal.RecordRouteSelectionStatus(owner1, expanded).ok());
+  }
+
+  SqliteCCLCJournal reopened(path, CellId("cell.1"), 4U);
+  const auto recovery = reopened.BeginOwnerEpoch(RequestOwnerEpoch("owner.route.2"), 2, 4U);
+  ASSERT_TRUE(recovery.ok()) << recovery.error().message;
+  ASSERT_EQ(recovery.value().current_active_control_configurations.size(), 1U);
+  EXPECT_EQ(recovery.value().current_active_control_configurations.front(),
+            RouteCandidateConfiguration());
+  ASSERT_EQ(recovery.value().interrupted_route_selections.size(), 1U);
+  ASSERT_TRUE(published.has_value());
+  EXPECT_EQ(recovery.value().interrupted_route_selections.front(), *published);
+}
+
+TEST(SqliteCCLCJournal, RouteFenceEffectCompletesAtomicallyAndRecoversExactStatus) {
+  ScopedTemporaryDirectory temporary;
+  SqliteCCLCJournal journal(JournalPath(temporary), CellId("cell.1"), 4U);
+  const RequestOwnerEpoch owner1("owner.route.1");
+  ASSERT_TRUE(journal.BeginOwnerEpoch(owner1, 1, 4U).ok());
+  const auto prepared_route = PreparedRoute(owner1);
+  ASSERT_TRUE(journal
+                  .AcceptOrReplayRouteSelection(owner1, RouteIntent(owner1),
+                                                prepared_route.acceptance,
+                                                prepared_route.initial_status)
+                  .ok());
+
+  const auto acquiring = RouteAcquirePreparedStatus(prepared_route.initial_status);
+  const auto prepared_effect = PreparedRouteFenceAcquire();
+  const auto prepared_row = journal.RecordRouteEffectPrepared(owner1, prepared_effect, acquiring);
+  ASSERT_TRUE(prepared_row.ok()) << prepared_row.error().message;
+
+  const auto observing = RouteAcquireCompletedStatus(acquiring);
+  const auto completed_effect = CompletedRouteFenceAcquire();
+  const auto completed_row =
+      journal.RecordRouteEffectCompleted(owner1, completed_effect, observing);
+  ASSERT_TRUE(completed_row.ok()) << completed_row.error().message;
+  EXPECT_EQ(completed_row.value(), prepared_row.value());
+
+  const auto recovery = journal.BeginOwnerEpoch(RequestOwnerEpoch("owner.route.2"), 2, 4U);
+  ASSERT_TRUE(recovery.ok()) << recovery.error().message;
+  ASSERT_TRUE(recovery.value().locally_valid());
+  ASSERT_EQ(recovery.value().interrupted_route_selections.size(), 1U);
+  EXPECT_EQ(recovery.value().interrupted_route_selections.front(), observing);
+  ASSERT_EQ(recovery.value().route_effect_sequence_watermarks.size(), 1U);
+  EXPECT_EQ(recovery.value().route_effect_sequence_watermarks.front().highest_effect_sequence, 1U);
+  EXPECT_TRUE(recovery.value().unresolved_route_effect_attempts.empty());
+}
+
+TEST(SqliteCCLCJournal, RoutePreparedEffectSurvivesReplacementAndClosesAdmission) {
+  ScopedTemporaryDirectory temporary;
+  SqliteCCLCJournal journal(JournalPath(temporary), CellId("cell.1"), 4U);
+  const RequestOwnerEpoch owner1("owner.route.1");
+  ASSERT_TRUE(journal.BeginOwnerEpoch(owner1, 1, 4U).ok());
+  const auto prepared_route = PreparedRoute(owner1);
+  ASSERT_TRUE(journal
+                  .AcceptOrReplayRouteSelection(owner1, RouteIntent(owner1),
+                                                prepared_route.acceptance,
+                                                prepared_route.initial_status)
+                  .ok());
+  const auto acquiring = RouteAcquirePreparedStatus(prepared_route.initial_status);
+  const auto prepared_effect = PreparedRouteFenceAcquire();
+  ASSERT_TRUE(journal.RecordRouteEffectPrepared(owner1, prepared_effect, acquiring).ok());
+
+  const RequestOwnerEpoch owner2("owner.route.2");
+  const auto first_recovery = journal.BeginOwnerEpoch(owner2, 2, 4U);
+  ASSERT_TRUE(first_recovery.ok()) << first_recovery.error().message;
+  ASSERT_TRUE(first_recovery.value().locally_valid());
+  ASSERT_EQ(first_recovery.value().unresolved_route_effect_attempts.size(), 1U);
+  EXPECT_EQ(first_recovery.value().unresolved_route_effect_attempts.front(), prepared_effect);
+
+  auto reconciling = acquiring;
+  reconciling.status_sequence = 3U;
+  reconciling.status_owner_epoch = owner2;
+  reconciling.phase = RouteSelectionTransactionPhaseDTO::kOutcomeUnknown;
+  reconciling.effect = RouteSelectionEffectDTO::kEffectUncertain;
+  reconciling.reconciliation_required = true;
+  reconciling.error = ErrorDTO{"route_effect_unresolved", "route effect outcome unknown", {}};
+  reconciling.latest_updated_at_ns = 0;
+  reconciling.remaining_duration_ns = 0;
+  ASSERT_TRUE(reconciling.locally_valid());
+  const auto replaced = journal.RecordRouteSelectionStatus(owner2, reconciling);
+  ASSERT_TRUE(replaced.ok()) << replaced.error().message;
+
+  const auto second_recovery = journal.BeginOwnerEpoch(RequestOwnerEpoch("owner.route.3"), 3, 4U);
+  ASSERT_TRUE(second_recovery.ok()) << second_recovery.error().message;
+  ASSERT_TRUE(second_recovery.value().locally_valid());
+  ASSERT_EQ(second_recovery.value().interrupted_route_selections.size(), 1U);
+  EXPECT_EQ(second_recovery.value().interrupted_route_selections.front(), reconciling);
+  ASSERT_EQ(second_recovery.value().unresolved_route_effect_attempts.size(), 1U);
+  EXPECT_EQ(second_recovery.value().unresolved_route_effect_attempts.front(), prepared_effect);
+}
+
+TEST(SqliteCCLCJournal, ReplaysBeforeCapacityAndIgnoresOnlyAttribution) {
+  ScopedTemporaryDirectory temporary;
+  SqliteCCLCJournal journal(JournalPath(temporary), CellId("cell.1"), 1U);
+  const RequestOwnerEpoch owner("owner.1");
+  ASSERT_TRUE(journal.BeginOwnerEpoch(owner, 1, 1U).ok());
+
+  const auto first_intent = Intent("request.1", owner, 3U);
+  const auto first_acceptance = Acceptance(first_intent, 1U, "transaction.1");
+  const auto first_status = InitialStatus(first_intent, first_acceptance);
+  const auto accepted =
+      journal.AcceptOrReplayLifecycle(owner, first_intent, first_acceptance, first_status);
+  ASSERT_TRUE(accepted.ok()) << accepted.error().message;
+  EXPECT_EQ(accepted.value().replay_status, RequestReplayStatusDTO::kAcceptedNew);
+
+  auto attributed = first_intent;
+  attributed.attribution = {RequestTransportDTO::kHttp,
+                            RequestAssuranceDTO::kExternallyAuthenticated, std::string("operator")};
+  const auto replay_candidate = Acceptance(attributed, 2U, "discarded.2");
+  const auto replayed = journal.AcceptOrReplayLifecycle(
+      owner, attributed, replay_candidate, InitialStatus(attributed, replay_candidate));
+  ASSERT_TRUE(replayed.ok()) << replayed.error().message;
+  EXPECT_EQ(replayed.value().replay_status, RequestReplayStatusDTO::kReplayedExact);
+  ASSERT_TRUE(replayed.value().acceptance.has_value());
+  EXPECT_EQ(replayed.value().acceptance->lifecycle_transaction_id,
+            first_acceptance.lifecycle_transaction_id);
+  ASSERT_TRUE(replayed.value().status.has_value());
+  EXPECT_EQ(replayed.value().status->accepted_intent.attribution, first_intent.attribution);
+
+  auto unusable_acceptance = replay_candidate;
+  unusable_acceptance.replay_status = RequestReplayStatusDTO::kRequestIdConflict;
+  auto unusable_status = InitialStatus(attributed, replay_candidate);
+  unusable_status.acceptance = unusable_acceptance;
+  const auto replay_with_unusable_candidate =
+      journal.AcceptOrReplayLifecycle(owner, attributed, unusable_acceptance, unusable_status);
+  ASSERT_TRUE(replay_with_unusable_candidate.ok());
+  EXPECT_EQ(replay_with_unusable_candidate.value().replay_status,
+            RequestReplayStatusDTO::kReplayedExact);
+
+  auto conflict = first_intent;
+  conflict.reason = "different";
+  const auto conflict_result = journal.AcceptOrReplayLifecycle(
+      owner, conflict, replay_candidate, InitialStatus(conflict, replay_candidate));
+  ASSERT_TRUE(conflict_result.ok());
+  EXPECT_EQ(conflict_result.value().replay_status, RequestReplayStatusDTO::kRequestIdConflict);
+
+  const auto second_intent = Intent("request.2", owner, 4U);
+  const auto second_acceptance = Acceptance(second_intent, 2U, "transaction.2");
+  const auto full = journal.AcceptOrReplayLifecycle(
+      owner, second_intent, second_acceptance, InitialStatus(second_intent, second_acceptance));
+  ASSERT_TRUE(full.ok());
+  EXPECT_EQ(full.value().replay_status, RequestReplayStatusDTO::kRequestLedgerFull);
+}
+
+TEST(SqliteCCLCJournal, EnforcesDurableTransactionAndComponentWatermarks) {
+  ScopedTemporaryDirectory temporary;
+  SqliteCCLCJournal journal(JournalPath(temporary), CellId("cell.1"), 8U);
+  const RequestOwnerEpoch owner("owner.1");
+  ASSERT_TRUE(journal.BeginOwnerEpoch(owner, 1, 8U).ok());
+
+  const auto first = Intent("request.1", owner, 3U);
+  const auto first_acceptance = Acceptance(first, 1U, "transaction.1");
+  ASSERT_TRUE(journal
+                  .AcceptOrReplayLifecycle(owner, first, first_acceptance,
+                                           InitialStatus(first, first_acceptance))
+                  .ok());
+
+  const auto stale = Intent("request.2", owner, 3U);
+  const auto stale_acceptance = Acceptance(stale, 2U, "transaction.2");
+  const auto stale_result = journal.AcceptOrReplayLifecycle(owner, stale, stale_acceptance,
+                                                            InitialStatus(stale, stale_acceptance));
+  ASSERT_FALSE(stale_result.ok());
+  EXPECT_EQ(stale_result.error().code, "component_lifecycle_journal_generation_conflict");
+
+  const auto current = Intent("request.3", owner, 4U);
+  const auto skipped = Acceptance(current, 3U, "transaction.3");
+  const auto skipped_result =
+      journal.AcceptOrReplayLifecycle(owner, current, skipped, InitialStatus(current, skipped));
+  ASSERT_FALSE(skipped_result.ok());
+  EXPECT_EQ(skipped_result.error().code, "component_lifecycle_journal_generation_conflict");
+
+  const auto next = Acceptance(current, 2U, "transaction.2");
+  ASSERT_TRUE(
+      journal.AcceptOrReplayLifecycle(owner, current, next, InitialStatus(current, next)).ok());
+}
+
+TEST(SqliteCCLCJournal, CurrentComponentFactSurvivesTerminalCompactionAndReopen) {
+  ScopedTemporaryDirectory temporary;
+  const auto path = JournalPath(temporary);
+  const RequestOwnerEpoch owner("owner.1");
+  {
+    SqliteCCLCJournal journal(path, CellId("cell.1"), 1U);
+    ASSERT_TRUE(journal.BeginOwnerEpoch(owner, 1, 8U).ok());
+
+    const auto unseen =
+        journal.LoadCurrentComponentLifecycleFact(ControllableComponentId("component.1"));
+    ASSERT_TRUE(unseen.ok());
+    EXPECT_FALSE(unseen.value().durable_generation.has_value());
+    EXPECT_FALSE(unseen.value().current_state.has_value());
+
+    const auto first = Intent("request.1", owner, 3U);
+    const auto first_acceptance = Acceptance(first, 1U, "transaction.1");
+    auto first_status = InitialStatus(first, first_acceptance);
+    ASSERT_TRUE(journal.AcceptOrReplayLifecycle(owner, first, first_acceptance, first_status).ok());
+    auto current = journal.LoadCurrentComponentLifecycleFact(first.controllable_component_id);
+    ASSERT_TRUE(current.ok());
+    ASSERT_TRUE(current.value().durable_generation.has_value());
+    EXPECT_EQ(*current.value().durable_generation, ComponentLifecycleGeneration(4U));
+    EXPECT_EQ(current.value().current_state, ComponentLifecycleStateDTO::kDeclared);
+
+    first_status = TerminalSuccess(first_status, 2U);
+    ASSERT_TRUE(journal.RecordLifecycleStatus(owner, first_status).ok());
+
+    const auto second = Intent("request.2", owner, 4U);
+    const auto second_acceptance = Acceptance(second, 2U, "transaction.2");
+    auto second_status = InitialStatus(second, second_acceptance);
+    second_status.previous_state = ComponentLifecycleStateDTO::kPrepared;
+    second_status.current_state = ComponentLifecycleStateDTO::kPrepared;
+    second_status.domains.front().previous_state = ComponentLifecycleStateDTO::kPrepared;
+    second_status.domains.front().current_state = ComponentLifecycleStateDTO::kPrepared;
+    ASSERT_TRUE(second_status.locally_valid());
+    ASSERT_TRUE(
+        journal.AcceptOrReplayLifecycle(owner, second, second_acceptance, second_status).ok());
+    second_status = TerminalSuccess(second_status, 2U);
+    ASSERT_TRUE(journal.RecordLifecycleStatus(owner, second_status).ok());
+
+    const auto compacted =
+        journal.LoadRetainedLifecycleStatus(first_acceptance.lifecycle_transaction_id);
+    ASSERT_TRUE(compacted.ok());
+    EXPECT_FALSE(compacted.value().has_value());
+    current = journal.LoadCurrentComponentLifecycleFact(second.controllable_component_id);
+    ASSERT_TRUE(current.ok());
+    EXPECT_EQ(current.value().durable_generation, ComponentLifecycleGeneration(5U));
+    EXPECT_EQ(current.value().current_state, ComponentLifecycleStateDTO::kPrepared);
+    const auto coherent = journal.LoadCurrentSnapshotFacts({second.controllable_component_id},
+                                                           {ControlDomainId("domain.1")});
+    ASSERT_TRUE(coherent.ok()) << coherent.error().message;
+    ASSERT_EQ(coherent.value().components.size(), 1U);
+    EXPECT_EQ(coherent.value().components.front(), current.value());
+    ASSERT_EQ(coherent.value().domains.size(), 1U);
+    EXPECT_FALSE(coherent.value().domains.front().current_active_control_configuration.has_value());
+    journal.Close();
+  }
+
+  SqliteCCLCJournal reopened(path, CellId("cell.1"), 1U);
+  const auto current =
+      reopened.LoadCurrentComponentLifecycleFact(ControllableComponentId("component.1"));
+  ASSERT_TRUE(current.ok());
+  EXPECT_EQ(current.value().durable_generation, ComponentLifecycleGeneration(5U));
+  EXPECT_EQ(current.value().current_state, ComponentLifecycleStateDTO::kPrepared);
+}
+
+TEST(SqliteCCLCJournal, UnresolvedContainmentRetainsGenerationWithoutInventingState) {
+  ScopedTemporaryDirectory temporary;
+  SqliteCCLCJournal journal(JournalPath(temporary), CellId("cell.1"), 8U);
+  const RequestOwnerEpoch owner("owner.1");
+  ASSERT_TRUE(journal.BeginOwnerEpoch(owner, 1, 8U).ok());
+
+  const auto intent = DisableIntent("request.1", owner, 3U);
+  const auto acceptance = Acceptance(intent, 1U, "transaction.1");
+  const auto status = InitialUnresolvedDisableStatus(intent, acceptance);
+  ASSERT_TRUE(journal.AcceptOrReplayLifecycle(owner, intent, acceptance, status).ok());
+
+  const auto current = journal.LoadCurrentComponentLifecycleFact(intent.controllable_component_id);
+  ASSERT_TRUE(current.ok());
+  EXPECT_EQ(current.value().durable_generation, ComponentLifecycleGeneration(4U));
+  EXPECT_FALSE(current.value().current_state.has_value());
+}
+
+TEST(SqliteCCLCJournal, StaleDisableUsesTheImmediateDurableSuccessorAndReplaysFirst) {
+  ScopedTemporaryDirectory temporary;
+  SqliteCCLCJournal journal(JournalPath(temporary), CellId("cell.1"), 8U);
+  const RequestOwnerEpoch owner("owner.1");
+  ASSERT_TRUE(journal.BeginOwnerEpoch(owner, 1, 8U).ok());
+
+  const auto first = Intent("request.1", owner, 3U);
+  const auto first_acceptance = Acceptance(first, 1U, "transaction.1");
+  const auto first_status = InitialStatus(first, first_acceptance);
+  ASSERT_TRUE(journal.AcceptOrReplayLifecycle(owner, first, first_acceptance, first_status).ok());
+
+  const auto stale_disable = DisableIntent("request.2", owner, 3U);
+  auto stale_disable_acceptance = Acceptance(stale_disable, 2U, "transaction.2");
+  stale_disable_acceptance.component_lifecycle_generation = ComponentLifecycleGeneration(5U);
+  const auto stale_disable_status = InitialDisableStatus(stale_disable, stale_disable_acceptance);
+  ASSERT_TRUE(stale_disable_status.locally_valid());
+  const auto accepted = journal.AcceptOrReplayLifecycle(
+      owner, stale_disable, stale_disable_acceptance, stale_disable_status);
+  ASSERT_TRUE(accepted.ok()) << accepted.error().message;
+
+  const auto replay = journal.AcceptOrReplayLifecycle(owner, first, first_acceptance, first_status);
+  ASSERT_TRUE(replay.ok()) << replay.error().message;
+  EXPECT_EQ(replay.value().replay_status, RequestReplayStatusDTO::kReplayedExact);
+  ASSERT_TRUE(replay.value().acceptance.has_value());
+  EXPECT_EQ(replay.value().acceptance->component_lifecycle_generation,
+            first_acceptance.component_lifecycle_generation);
+
+  const auto stale_again = DisableIntent("request.3", owner, 3U);
+  auto regressed = Acceptance(stale_again, 3U, "transaction.3");
+  const auto regressed_result = journal.AcceptOrReplayLifecycle(
+      owner, stale_again, regressed, InitialDisableStatus(stale_again, regressed));
+  ASSERT_FALSE(regressed_result.ok());
+  EXPECT_EQ(regressed_result.error().code, "component_lifecycle_journal_generation_conflict");
+
+  regressed.component_lifecycle_generation = ComponentLifecycleGeneration(7U);
+  const auto gap_result = journal.AcceptOrReplayLifecycle(
+      owner, stale_again, regressed, InitialDisableStatus(stale_again, regressed));
+  ASSERT_FALSE(gap_result.ok());
+  EXPECT_EQ(gap_result.error().code, "component_lifecycle_journal_generation_conflict");
+
+  const auto ahead = DisableIntent("request.4", owner, 6U);
+  auto ahead_acceptance = Acceptance(ahead, 3U, "transaction.4");
+  ahead_acceptance.component_lifecycle_generation = ComponentLifecycleGeneration(7U);
+  const auto ahead_result = journal.AcceptOrReplayLifecycle(
+      owner, ahead, ahead_acceptance, InitialDisableStatus(ahead, ahead_acceptance));
+  ASSERT_FALSE(ahead_result.ok());
+  EXPECT_EQ(ahead_result.error().code, "component_lifecycle_journal_generation_conflict");
+
+  regressed.component_lifecycle_generation = ComponentLifecycleGeneration(6U);
+  ASSERT_TRUE(journal
+                  .AcceptOrReplayLifecycle(owner, stale_again, regressed,
+                                           InitialDisableStatus(stale_again, regressed))
+                  .ok());
+}
+
+TEST(SqliteCCLCJournal, ResolvedDisableSeedsAnAbsentWatermarkFromItsSelectedPredecessor) {
+  ScopedTemporaryDirectory temporary;
+  SqliteCCLCJournal journal(JournalPath(temporary), CellId("cell.1"), 8U);
+  const RequestOwnerEpoch owner("owner.1");
+  ASSERT_TRUE(journal.BeginOwnerEpoch(owner, 1, 8U).ok());
+
+  const auto stale_disable = DisableIntent("request.1", owner, 3U);
+  auto acceptance = Acceptance(stale_disable, 1U, "transaction.1");
+  acceptance.component_lifecycle_generation = ComponentLifecycleGeneration(8U);
+  const auto status = InitialDisableStatus(stale_disable, acceptance);
+  ASSERT_TRUE(status.locally_valid());
+  ASSERT_TRUE(journal.AcceptOrReplayLifecycle(owner, stale_disable, acceptance, status).ok());
+
+  const auto current = Intent("request.2", owner, 8U);
+  const auto current_acceptance = Acceptance(current, 2U, "transaction.2");
+  ASSERT_TRUE(journal
+                  .AcceptOrReplayLifecycle(owner, current, current_acceptance,
+                                           InitialStatus(current, current_acceptance))
+                  .ok());
+}
+
+TEST(SqliteCCLCJournal, UnresolvedFullStopSeedsAnAbsentWatermarkOnlyFromExpectation) {
+  ScopedTemporaryDirectory temporary;
+  SqliteCCLCJournal journal(JournalPath(temporary), CellId("cell.1"), 8U);
+  const RequestOwnerEpoch owner("owner.1");
+  ASSERT_TRUE(journal.BeginOwnerEpoch(owner, 1, 8U).ok());
+
+  const auto unresolved = DisableIntent("request.1", owner, 3U);
+  auto gap = Acceptance(unresolved, 1U, "transaction.1");
+  gap.component_lifecycle_generation = ComponentLifecycleGeneration(5U);
+  const auto gap_status = InitialUnresolvedDisableStatus(unresolved, gap);
+  ASSERT_TRUE(gap_status.locally_valid());
+  const auto gap_result = journal.AcceptOrReplayLifecycle(owner, unresolved, gap, gap_status);
+  ASSERT_FALSE(gap_result.ok());
+  EXPECT_EQ(gap_result.error().code, "component_lifecycle_journal_generation_conflict");
+
+  const auto acceptance = Acceptance(unresolved, 1U, "transaction.1");
+  const auto status = InitialUnresolvedDisableStatus(unresolved, acceptance);
+  ASSERT_TRUE(status.locally_valid());
+  ASSERT_TRUE(journal.AcceptOrReplayLifecycle(owner, unresolved, acceptance, status).ok());
+}
+
+TEST(SqliteCCLCJournal, PersistsAttemptBeforeEffectAndProjectsOnlyItsExactResult) {
+  ScopedTemporaryDirectory temporary;
+  SqliteCCLCJournal journal(JournalPath(temporary), CellId("cell.1"), 8U);
+  const RequestOwnerEpoch owner("owner.1");
+  ASSERT_TRUE(journal.BeginOwnerEpoch(owner, 1, 8U).ok());
+  const auto lifecycle_intent = Intent("request.1", owner, 3U);
+  const auto acceptance = Acceptance(lifecycle_intent, 1U, "transaction.1");
+  auto status = InitialStatus(lifecycle_intent, acceptance);
+  ASSERT_TRUE(journal.AcceptOrReplayLifecycle(owner, lifecycle_intent, acceptance, status).ok());
+
+  const auto primitive = PrimitiveIntent(status);
+  const auto prepared_attempt = PreparedPrimitiveEffect(primitive);
+  status = PreparedEffectStatus(status);
+  const auto prepared = journal.RecordEffectPrepared(owner, prepared_attempt, status);
+  ASSERT_TRUE(prepared.ok()) << prepared.error().message;
+  const auto prepared_replay = journal.RecordEffectPrepared(owner, prepared_attempt, status);
+  ASSERT_TRUE(prepared_replay.ok());
+  EXPECT_EQ(prepared_replay.value(), prepared.value());
+  auto conflicting_prepared = prepared_attempt;
+  conflicting_prepared.effect_sequence = 2U;
+  const auto prepared_conflict = journal.RecordEffectPrepared(owner, conflicting_prepared, status);
+  ASSERT_FALSE(prepared_conflict.ok());
+  EXPECT_EQ(prepared_conflict.error().code, "component_lifecycle_journal_attempt_conflict");
+
+  const auto result = PrimitiveSuccess(primitive);
+  const auto completed_attempt = CompletedPrimitiveEffect(primitive, result);
+  status = CompletedEffectStatus(status, result);
+  const auto recorded = journal.RecordEffectCompleted(owner, completed_attempt, status);
+  ASSERT_TRUE(recorded.ok()) << recorded.error().message;
+  EXPECT_EQ(recorded.value(), prepared.value());
+  EXPECT_TRUE(journal.RecordEffectCompleted(owner, completed_attempt, status).ok());
+  auto conflicting_result = result;
+  conflicting_result.known_result = LifecyclePrimitiveKnownResultDTO::kFailed;
+  conflicting_result.error = ErrorDTO{"failed", "conflict", {}};
+  auto conflicting_status = status;
+  conflicting_status.domains.front().primitive_attempts = {conflicting_result};
+  EXPECT_FALSE(journal
+                   .RecordEffectCompleted(owner,
+                                          CompletedPrimitiveEffect(primitive, conflicting_result),
+                                          conflicting_status)
+                   .ok());
+
+  auto advanced = status;
+  advanced.status_sequence += 1U;
+  advanced.latest_updated_at_ns += 10;
+  advanced.remaining_duration_ns -= 10;
+  ASSERT_TRUE(advanced.locally_valid());
+  ASSERT_TRUE(journal.RecordLifecycleStatus(owner, advanced).ok());
+  EXPECT_TRUE(journal.RecordEffectCompleted(owner, completed_attempt, status).ok());
+
+  const auto terminal = TerminalSuccess(advanced, 5U);
+  ASSERT_TRUE(terminal.locally_valid());
+  EXPECT_TRUE(journal.RecordLifecycleStatus(owner, terminal).ok());
+}
+
+TEST(SqliteCCLCJournal, ReplacementRecoversPreparedAttemptAsPossibleEffectWithoutRedispatch) {
+  ScopedTemporaryDirectory temporary;
+  const auto path = JournalPath(temporary);
+  const RequestOwnerEpoch first_owner("owner.1");
+  ComponentLifecycleStatusDTO status = [&]() {
+    SqliteCCLCJournal first(path, CellId("cell.1"), 8U);
+    EXPECT_TRUE(first.BeginOwnerEpoch(first_owner, 1, 8U).ok());
+    const auto lifecycle_intent = Intent("request.1", first_owner, 3U);
+    const auto acceptance = Acceptance(lifecycle_intent, 1U, "transaction.1");
+    auto initial = InitialStatus(lifecycle_intent, acceptance);
+    EXPECT_TRUE(
+        first.AcceptOrReplayLifecycle(first_owner, lifecycle_intent, acceptance, initial).ok());
+    initial = PreparedEffectStatus(initial);
+    EXPECT_TRUE(first
+                    .RecordEffectPrepared(
+                        first_owner, PreparedPrimitiveEffect(PrimitiveIntent(initial)), initial)
+                    .ok());
+    first.Close();
+    return initial;
+  }();
+
+  SqliteCCLCJournal replacement(path, CellId("cell.1"), 8U);
+  const RequestOwnerEpoch second_owner("owner.2");
+  const auto recovered = replacement.BeginOwnerEpoch(second_owner, 500, 8U);
+  ASSERT_TRUE(recovered.ok()) << recovered.error().message;
+  ASSERT_EQ(recovered.value().interrupted_transactions.size(), 1U);
+  ASSERT_EQ(recovered.value().effect_sequence_watermarks.size(), 1U);
+  EXPECT_EQ(recovered.value().effect_sequence_watermarks.front().highest_effect_sequence, 1U);
+  ASSERT_EQ(recovered.value().unresolved_effect_attempts.size(), 1U);
+  const auto& unresolved = recovered.value().unresolved_effect_attempts.front();
+  EXPECT_EQ(unresolved.state, CCLCEffectAttemptStateDTO::kPrepared);
+  ASSERT_TRUE(unresolved.lifecycle_primitive_intent.has_value());
+  EXPECT_EQ(unresolved.lifecycle_primitive_intent->lifecycle_primitive_attempt_id,
+            LifecyclePrimitiveAttemptId("attempt.1"));
+
+  const auto stale_replay =
+      replacement.AcceptOrReplayLifecycle(first_owner, status.accepted_intent, status.acceptance,
+                                          InitialStatus(status.accepted_intent, status.acceptance));
+  ASSERT_TRUE(stale_replay.ok());
+  EXPECT_EQ(stale_replay.value().replay_status, RequestReplayStatusDTO::kStaleRequestOwnerEpoch);
+
+  auto uncertain = PrimitiveSuccess(*unresolved.lifecycle_primitive_intent);
+  uncertain.dispatch_state = LifecyclePrimitiveDispatchStateDTO::kDispatchedUncertain;
+  uncertain.effect = LifecyclePrimitiveEffectDTO::kPossible;
+  uncertain.known_result.reset();
+  uncertain.error =
+      ErrorDTO{"owner_replaced_after_prepare", "dispatch outcome requires observation", {}};
+  status.status_sequence = 3U;
+  status.status_owner_epoch = second_owner;
+  status.phase = ComponentLifecycleTransactionPhaseDTO::kOutcomeUnknown;
+  status.domains.front().action_state = ComponentLifecycleDomainActionStateDTO::kOutcomeUnknown;
+  status.domains.front().effect = ComponentLifecycleDomainEffectDTO::kEffectUncertain;
+  status.domains.front().primitive_attempts = {uncertain};
+  status.domains.front().error = uncertain.error;
+  status.reconciliation_required = true;
+  status.error = uncertain.error;
+  status.latest_updated_at_ns = 500;
+  status.remaining_duration_ns = 0;
+  ASSERT_TRUE(status.locally_valid());
+  auto completed = unresolved;
+  completed.state = CCLCEffectAttemptStateDTO::kCompleted;
+  completed.lifecycle_primitive_result = uncertain;
+  ASSERT_TRUE(replacement.RecordEffectCompleted(second_owner, completed, status).ok());
+}
+
+TEST(SqliteCCLCJournal, DisableHandoffPreparedAndCompletedStateAdvanceAtomically) {
+  ScopedTemporaryDirectory temporary;
+  SqliteCCLCJournal journal(JournalPath(temporary), CellId("cell.1"), 8U);
+  const RequestOwnerEpoch owner("owner.1");
+  ASSERT_TRUE(journal.BeginOwnerEpoch(owner, 1, 8U).ok());
+
+  const auto lifecycle_intent = DisableIntent("request.1", owner, 3U);
+  const auto acceptance = Acceptance(lifecycle_intent, 1U, "transaction.1");
+  auto status = InitialDisableStatus(lifecycle_intent, acceptance);
+  ASSERT_TRUE(status.locally_valid());
+  ASSERT_TRUE(journal.AcceptOrReplayLifecycle(owner, lifecycle_intent, acceptance, status).ok());
+
+  const auto request = DisableRequest(status);
+  ASSERT_TRUE(request.locally_valid());
+  const auto prepared_attempt = PreparedDisableEffect(request);
+  status = PreparedDisableStatus(status);
+  ASSERT_TRUE(status.locally_valid());
+  ASSERT_TRUE(journal.RecordEffectPrepared(owner, prepared_attempt, status).ok());
+
+  const auto recovered_owner = RequestOwnerEpoch("owner.2");
+  journal.Close();
+  SqliteCCLCJournal replacement(JournalPath(temporary), CellId("cell.1"), 8U);
+  const auto recovery = replacement.BeginOwnerEpoch(recovered_owner, 500, 8U);
+  ASSERT_TRUE(recovery.ok()) << recovery.error().message;
+  ASSERT_EQ(recovery.value().unresolved_effect_attempts.size(), 1U);
+  EXPECT_EQ(recovery.value().unresolved_effect_attempts.front().effect_kind,
+            CCLCEffectKindDTO::kKernelDisableHandoff);
+  ASSERT_TRUE(
+      recovery.value().unresolved_effect_attempts.front().disable_handoff_request.has_value());
+  EXPECT_EQ(*recovery.value().unresolved_effect_attempts.front().disable_handoff_request, request);
+
+  const auto accepted = DisableAcceptance(request);
+  const auto handoff = DisableReady(request, accepted);
+  ASSERT_TRUE(accepted.locally_valid());
+  ASSERT_TRUE(handoff.locally_valid());
+  status = UncertainDisableStatus(status, recovered_owner);
+  ASSERT_TRUE(status.locally_valid());
+  ASSERT_TRUE(replacement.RecordLifecycleStatus(recovered_owner, status).ok());
+  status = CompletedDisableStatus(status, handoff);
+  ASSERT_TRUE(status.locally_valid());
+  const auto completed = replacement.RecordEffectCompleted(
+      recovered_owner, CompletedDisableEffect(request, accepted), status);
+  ASSERT_TRUE(completed.ok()) << completed.error().code << ": " << completed.error().message;
+
+  const auto retained =
+      replacement.LoadRetainedLifecycleStatus(acceptance.lifecycle_transaction_id);
+  ASSERT_TRUE(retained.ok());
+  ASSERT_TRUE(retained.value().has_value());
+  EXPECT_EQ(*retained.value(), status);
+
+  auto evidence_regression = status;
+  evidence_regression.status_sequence += 1U;
+  evidence_regression.phase = ComponentLifecycleTransactionPhaseDTO::kAccepted;
+  evidence_regression.current_state = ComponentLifecycleStateDTO::kActive;
+  evidence_regression.domains.front().current_state = ComponentLifecycleStateDTO::kActive;
+  evidence_regression.domains.front().action_state =
+      ComponentLifecycleDomainActionStateDTO::kReserved;
+  evidence_regression.domains.front().effect = ComponentLifecycleDomainEffectDTO::kNone;
+  evidence_regression.configuration_fence.reset();
+  evidence_regression.disable_handoff.reset();
+  evidence_regression.latest_updated_at_ns += 10;
+  ASSERT_TRUE(evidence_regression.locally_valid());
+  const auto regressed = replacement.RecordLifecycleStatus(recovered_owner, evidence_regression);
+  ASSERT_FALSE(regressed.ok());
+  EXPECT_EQ(regressed.error().code, "component_lifecycle_journal_status_regressed");
+
+  auto terminal_with_held_fence = status;
+  terminal_with_held_fence.status_sequence += 1U;
+  terminal_with_held_fence.current_state = ComponentLifecycleStateDTO::kDisabled;
+  terminal_with_held_fence.phase = ComponentLifecycleTransactionPhaseDTO::kSucceeded;
+  terminal_with_held_fence.domains.front().current_state = ComponentLifecycleStateDTO::kDisabled;
+  terminal_with_held_fence.domains.front().action_state =
+      ComponentLifecycleDomainActionStateDTO::kSucceeded;
+  terminal_with_held_fence.terminal_result = ComponentLifecycleTerminalResultDTO::kSucceeded;
+  terminal_with_held_fence.latest_updated_at_ns += 10;
+  terminal_with_held_fence.remaining_duration_ns = 0;
+  EXPECT_FALSE(terminal_with_held_fence.locally_valid());
+}
+
+TEST(SqliteCCLCJournal, CompletedDisableHandoffRejectsOmissionsAndAcceptsFullWidening) {
+  ScopedTemporaryDirectory temporary;
+  SqliteCCLCJournal journal(JournalPath(temporary), CellId("cell.1"), 8U);
+  const RequestOwnerEpoch owner("owner.1");
+  ASSERT_TRUE(journal.BeginOwnerEpoch(owner, 1, 8U).ok());
+
+  const auto lifecycle_intent = DisableIntent("request.1", owner, 3U);
+  const auto lifecycle_acceptance = Acceptance(lifecycle_intent, 1U, "transaction.1");
+  auto status = InitialDisableStatus(lifecycle_intent, lifecycle_acceptance);
+  ASSERT_TRUE(
+      journal.AcceptOrReplayLifecycle(owner, lifecycle_intent, lifecycle_acceptance, status).ok());
+
+  const auto request = DisableRequest(status);
+  auto handoff_acceptance = DisableAcceptance(request);
+  handoff_acceptance.scope_resolution = DisableHandoffScopeResolutionDTO::kPromotedToFull;
+  status = PreparedDisableStatus(status);
+  ASSERT_TRUE(journal.RecordEffectPrepared(owner, PreparedDisableEffect(request), status).ok());
+
+  const auto completion = CompletedDisableEffect(request, handoff_acceptance);
+  const auto expect_omission_rejected = [&](ConfigurationFenceScopeDTO narrowed_scope) {
+    const auto handoff =
+        DisableReadyWithScope(request, handoff_acceptance, std::move(narrowed_scope));
+    const auto successor = CompletedDisableStatus(status, handoff);
+    ASSERT_TRUE(handoff.locally_valid());
+    ASSERT_TRUE(successor.locally_valid());
+    const auto result = journal.RecordEffectCompleted(owner, completion, successor);
+    ASSERT_FALSE(result.ok());
+    EXPECT_EQ(result.error().code, "component_lifecycle_journal_attempt_conflict");
+  };
+
+  auto missing_domain = FullDisableFenceScope();
+  missing_domain.domains.erase(missing_domain.domains.begin());
+  expect_omission_rejected(std::move(missing_domain));
+
+  auto missing_binding = FullDisableFenceScope();
+  missing_binding.bindings.erase(missing_binding.bindings.begin());
+  expect_omission_rejected(std::move(missing_binding));
+
+  auto missing_resource = FullDisableFenceScope();
+  missing_resource.resources.erase(missing_resource.resources.begin());
+  expect_omission_rejected(std::move(missing_resource));
+
+  const auto widened = DisableReadyWithScope(request, handoff_acceptance, FullDisableFenceScope());
+  const auto widened_successor = CompletedDisableStatus(status, widened);
+  ASSERT_TRUE(widened_successor.locally_valid());
+  const auto accepted = journal.RecordEffectCompleted(owner, completion, widened_successor);
+  ASSERT_TRUE(accepted.ok()) << accepted.error().code << ": " << accepted.error().message;
+}
+
+TEST(SqliteCCLCJournal, PromotedFullDisableHandoffCannotNarrowItsPreparedScope) {
+  ScopedTemporaryDirectory temporary;
+  SqliteCCLCJournal journal(JournalPath(temporary), CellId("cell.1"), 8U);
+  const RequestOwnerEpoch owner("owner.1");
+  ASSERT_TRUE(journal.BeginOwnerEpoch(owner, 1, 8U).ok());
+
+  const auto lifecycle_intent = DisableIntent("request.1", owner, 3U);
+  const auto lifecycle_acceptance = Acceptance(lifecycle_intent, 1U, "transaction.1");
+  auto status = InitialDisableStatus(lifecycle_intent, lifecycle_acceptance);
+  ASSERT_TRUE(
+      journal.AcceptOrReplayLifecycle(owner, lifecycle_intent, lifecycle_acceptance, status).ok());
+
+  const auto request = PromotedFullDisableRequest(status);
+  const auto handoff_acceptance = DisableAcceptance(request);
+  ASSERT_TRUE(request.locally_valid());
+  status = PreparedDisableStatus(status);
+  ASSERT_TRUE(journal.RecordEffectPrepared(owner, PreparedDisableEffect(request), status).ok());
+
+  const auto completion = CompletedDisableEffect(request, handoff_acceptance);
+  const auto narrowed = DisableReadyWithScope(request, handoff_acceptance, DisableFenceScope());
+  const auto narrowed_successor = CompletedDisableStatus(status, narrowed);
+  ASSERT_TRUE(narrowed_successor.locally_valid());
+  const auto rejected = journal.RecordEffectCompleted(owner, completion, narrowed_successor);
+  ASSERT_FALSE(rejected.ok());
+  EXPECT_EQ(rejected.error().code, "component_lifecycle_journal_attempt_conflict");
+
+  const auto full = DisableReadyWithScope(request, handoff_acceptance, FullDisableFenceScope());
+  const auto full_successor = CompletedDisableStatus(status, full);
+  ASSERT_TRUE(full_successor.locally_valid());
+  const auto accepted = journal.RecordEffectCompleted(owner, completion, full_successor);
+  ASSERT_TRUE(accepted.ok()) << accepted.error().code << ": " << accepted.error().message;
+}
+
+TEST(SqliteCCLCJournal, PromotedFullNoSnapshotDisableAbsorbsOneSnapshotAndRetainsItOnRestart) {
+  ScopedTemporaryDirectory temporary;
+  const auto path = JournalPath(temporary);
+  const RequestOwnerEpoch owner("owner.1");
+  ComponentLifecycleStatusDTO augmented = [&] {
+    SqliteCCLCJournal journal(path, CellId("cell.1"), 8U);
+    const auto begun = journal.BeginOwnerEpoch(owner, 1, 8U);
+    if (!begun.ok()) {
+      throw std::runtime_error(begun.error().code + ": " + begun.error().message);
+    }
+    const auto ready = PersistPromotedFullNoSnapshotHandoff(journal, owner);
+    auto snapshot = AugmentedPromotedFullDisableStatus(ready);
+    if (!snapshot.locally_valid()) {
+      throw std::runtime_error("the promoted-Full snapshot fixture is invalid");
+    }
+    const auto recorded = journal.RecordLifecycleStatus(owner, snapshot);
+    if (!recorded.ok()) {
+      throw std::runtime_error(recorded.error().code + ": " + recorded.error().message);
+    }
+    journal.Close();
+    return snapshot;
+  }();
+
+  SqliteCCLCJournal reopened(path, CellId("cell.1"), 8U);
+  const auto retained =
+      reopened.LoadRetainedLifecycleStatus(augmented.acceptance.lifecycle_transaction_id);
+  ASSERT_TRUE(retained.ok()) << retained.error().message;
+  ASSERT_TRUE(retained.value().has_value());
+  EXPECT_EQ(*retained.value(), augmented);
+
+  const RequestOwnerEpoch replacement_owner("owner.2");
+  const auto recovery = reopened.BeginOwnerEpoch(replacement_owner, 500, 8U);
+  ASSERT_TRUE(recovery.ok()) << recovery.error().message;
+  ASSERT_EQ(recovery.value().interrupted_transactions.size(), 1U);
+  EXPECT_EQ(recovery.value().interrupted_transactions.front(), augmented);
+}
+
+TEST(SqliteCCLCJournal, PromotedFullNoSnapshotDisableRejectsMutationAndMalformedSnapshot) {
+  ScopedTemporaryDirectory temporary;
+  SqliteCCLCJournal journal(JournalPath(temporary), CellId("cell.1"), 8U);
+  const RequestOwnerEpoch owner("owner.1");
+  ASSERT_TRUE(journal.BeginOwnerEpoch(owner, 1, 8U).ok());
+  const auto ready = PersistPromotedFullNoSnapshotHandoff(journal, owner);
+
+  const auto primitive = PrimitiveIntent(ready);
+  const auto prepared_vendor_status = PreparedEffectStatus(ready);
+  ASSERT_TRUE(prepared_vendor_status.locally_valid());
+  const auto vendor = journal.RecordEffectPrepared(owner, PreparedPrimitiveEffect(primitive, 2U),
+                                                   prepared_vendor_status);
+  ASSERT_FALSE(vendor.ok());
+  EXPECT_EQ(vendor.error().code, "component_lifecycle_journal_attempt_invalid");
+
+  auto malformed = AugmentedPromotedFullDisableStatus(ready);
+  auto& current_only = malformed.domains.back();
+  current_only.current_scope->control_domain_revision =
+      ControlDomainRevision("outside-full-fence-revision");
+  current_only.resolved_provider_occurrence->control_domain_revision =
+      current_only.current_scope->control_domain_revision;
+  ASSERT_TRUE(malformed.locally_valid());
+  const auto rejected = journal.RecordLifecycleStatus(owner, malformed);
+  ASSERT_FALSE(rejected.ok());
+  EXPECT_EQ(rejected.error().code, "component_lifecycle_journal_status_regressed");
+}
+
+TEST(SqliteCCLCJournal, PromotedFullSnapshotClosureFreezesAfterFirstAugmentation) {
+  ScopedTemporaryDirectory temporary;
+  SqliteCCLCJournal journal(JournalPath(temporary), CellId("cell.1"), 8U);
+  const RequestOwnerEpoch owner("owner.1");
+  ASSERT_TRUE(journal.BeginOwnerEpoch(owner, 1, 8U).ok());
+  const auto ready = PersistPromotedFullNoSnapshotHandoff(journal, owner);
+  const auto augmented = AugmentedPromotedFullDisableStatus(ready);
+  ASSERT_TRUE(augmented.locally_valid());
+  ASSERT_TRUE(journal.RecordLifecycleStatus(owner, augmented).ok());
+
+  auto narrowed = augmented;
+  narrowed.status_sequence += 1U;
+  narrowed.domains.pop_back();
+  narrowed.latest_updated_at_ns += 10;
+  narrowed.remaining_duration_ns -= 10;
+  ASSERT_TRUE(narrowed.locally_valid());
+  const auto narrowed_result = journal.RecordLifecycleStatus(owner, narrowed);
+  ASSERT_FALSE(narrowed_result.ok());
+  EXPECT_EQ(narrowed_result.error().code, "component_lifecycle_journal_status_regressed");
+
+  auto changed_provider = augmented;
+  changed_provider.status_sequence += 1U;
+  changed_provider.domains.front().resolved_provider_occurrence->lifecycle_plan_catalog_digest =
+      ContentDigest("different-catalog-digest");
+  changed_provider.latest_updated_at_ns += 10;
+  changed_provider.remaining_duration_ns -= 10;
+  ASSERT_TRUE(changed_provider.locally_valid());
+  const auto provider_result = journal.RecordLifecycleStatus(owner, changed_provider);
+  ASSERT_FALSE(provider_result.ok());
+  EXPECT_EQ(provider_result.error().code, "component_lifecycle_journal_status_regressed");
+}
+
+TEST(SqliteCCLCJournal, DisableFenceReleaseAndTerminalStatusCommitAtomicallyAndSurviveReopen) {
+  ScopedTemporaryDirectory temporary;
+  const auto path = JournalPath(temporary);
+  const RequestOwnerEpoch owner("owner.1");
+  std::optional<ComponentLifecycleStatusDTO> terminal_status;
+  {
+    SqliteCCLCJournal journal(path, CellId("cell.1"), 8U);
+    ASSERT_TRUE(journal.BeginOwnerEpoch(owner, 1, 8U).ok());
+
+    const auto lifecycle_intent = DisableIntent("request.1", owner, 3U);
+    const auto acceptance = Acceptance(lifecycle_intent, 1U, "transaction.1");
+    auto status = InitialDisableStatus(lifecycle_intent, acceptance);
+    ASSERT_TRUE(journal.AcceptOrReplayLifecycle(owner, lifecycle_intent, acceptance, status).ok());
+
+    const auto handoff_request = DisableRequest(status);
+    const auto handoff_acceptance = DisableAcceptance(handoff_request);
+    const auto handoff_status = DisableReady(handoff_request, handoff_acceptance);
+    status = PreparedDisableStatus(status);
+    ASSERT_TRUE(
+        journal.RecordEffectPrepared(owner, PreparedDisableEffect(handoff_request), status).ok());
+    status = CompletedDisableStatus(status, handoff_status);
+    ASSERT_TRUE(journal
+                    .RecordEffectCompleted(
+                        owner, CompletedDisableEffect(handoff_request, handoff_acceptance), status)
+                    .ok());
+
+    const auto premature_release = DisableReleaseRequest(status);
+    const auto premature_status = PreparedReleaseStatus(status);
+    ASSERT_TRUE(premature_release.locally_valid());
+    ASSERT_TRUE(premature_status.locally_valid());
+    const auto premature = journal.RecordEffectPrepared(
+        owner, PreparedReleaseEffect(premature_release), premature_status);
+    ASSERT_FALSE(premature.ok());
+    EXPECT_EQ(premature.error().code, "component_lifecycle_journal_attempt_invalid");
+
+    status = ResolvedDisableStatus(status);
+    ASSERT_TRUE(status.domains.front().reconciliation_evidence->locally_valid());
+    EXPECT_EQ(status.domains.front().requested_state.presence,
+              ComponentLifecycleRequestedStatePresenceDTO::kResolved);
+    ASSERT_TRUE(status.domains.front().requested_state.state.has_value());
+    EXPECT_EQ(status.domains.front().current_state, *status.domains.front().requested_state.state);
+    EXPECT_EQ(status.domains.front().reconciliation_evidence->observed_state,
+              status.domains.front().current_state);
+    EXPECT_EQ(status.domains.front().reconciliation_evidence->postcondition_result,
+              LifecyclePostconditionResultDTO::kSatisfied);
+    ASSERT_TRUE(status.domains.front().locally_valid());
+    ASSERT_TRUE(status.disable_handoff->locally_valid());
+    ASSERT_TRUE(status.configuration_fence->locally_valid());
+    ASSERT_TRUE(status.locally_valid());
+    ASSERT_TRUE(journal.RecordLifecycleStatus(owner, status).ok());
+
+    const auto unprepared_pending = ReleasePendingStatus(status);
+    ASSERT_TRUE(unprepared_pending.locally_valid());
+    const auto unprepared_pending_result = journal.RecordLifecycleStatus(owner, unprepared_pending);
+    ASSERT_FALSE(unprepared_pending_result.ok());
+    EXPECT_EQ(unprepared_pending_result.error().code,
+              "component_lifecycle_journal_attempt_conflict");
+
+    const auto release_request = DisableReleaseRequest(status);
+    ASSERT_TRUE(release_request.locally_valid());
+    auto wrong_fence_generation = release_request;
+    wrong_fence_generation.current_admission_snapshot.configuration_fence_generation =
+        ConfigurationFenceGeneration(
+            release_request.ready_handoff.configuration_fence_generation.value() + 1U);
+    EXPECT_FALSE(wrong_fence_generation.locally_valid());
+    auto wrong_active_configuration = release_request;
+    auto& current_configuration =
+        wrong_active_configuration.current_admission_snapshot.current_active_control_configurations
+            .front()
+            .active_control_configuration;
+    current_configuration.active_control_configuration_generation =
+        ActiveControlConfigurationGeneration(
+            current_configuration.active_control_configuration_generation->value() + 1U);
+    EXPECT_FALSE(wrong_active_configuration.locally_valid());
+    auto prepared_status = PreparedReleaseStatus(status);
+    ASSERT_TRUE(prepared_status.locally_valid());
+
+    auto stale_precondition = release_request;
+    stale_precondition.release_precondition_status_digest = ContentDigest("stale-status-digest");
+    const auto stale_prepare = journal.RecordEffectPrepared(
+        owner, PreparedReleaseEffect(stale_precondition), prepared_status);
+    ASSERT_FALSE(stale_prepare.ok());
+    EXPECT_EQ(stale_prepare.error().code, "component_lifecycle_journal_attempt_invalid");
+
+    ASSERT_TRUE(
+        journal.RecordEffectPrepared(owner, PreparedReleaseEffect(release_request), prepared_status)
+            .ok());
+    prepared_status = ReleasePendingStatus(prepared_status);
+    ASSERT_TRUE(prepared_status.locally_valid());
+    ASSERT_TRUE(journal.RecordLifecycleStatus(owner, prepared_status).ok());
+    const auto missing_receipt = journal.RecordEffectCompleted(
+        owner,
+        CompletedReleaseEffect(release_request, DisableFenceReleaseEffectDispositionDTO::kReleased,
+                               std::nullopt),
+        prepared_status);
+    ASSERT_FALSE(missing_receipt.ok());
+    EXPECT_EQ(missing_receipt.error().code, "component_lifecycle_journal_attempt_invalid");
+
+    const auto receipt = DisableReleaseReceipt(release_request);
+    ASSERT_TRUE(receipt.locally_valid());
+    terminal_status = CompletedReleaseStatus(prepared_status, receipt);
+    ASSERT_TRUE(terminal_status->locally_valid());
+    const auto completed = journal.RecordEffectCompleted(
+        owner,
+        CompletedReleaseEffect(release_request, DisableFenceReleaseEffectDispositionDTO::kReleased,
+                               receipt),
+        *terminal_status);
+    ASSERT_TRUE(completed.ok()) << completed.error().code << ": " << completed.error().message;
+
+    const auto retained = journal.LoadRetainedLifecycleStatus(acceptance.lifecycle_transaction_id);
+    ASSERT_TRUE(retained.ok());
+    ASSERT_TRUE(retained.value().has_value());
+    EXPECT_EQ(*retained.value(), *terminal_status);
+    journal.Close();
+  }
+
+  SqliteCCLCJournal reopened(path, CellId("cell.1"), 8U);
+  const auto retained =
+      reopened.LoadRetainedLifecycleStatus(terminal_status->acceptance.lifecycle_transaction_id);
+  ASSERT_TRUE(retained.ok());
+  ASSERT_TRUE(retained.value().has_value());
+  EXPECT_EQ(*retained.value(), *terminal_status);
+}
+
+TEST(SqliteCCLCJournal, ReplacementRecoversPreparedFenceReleaseAndCommitsExactLateReceipt) {
+  ScopedTemporaryDirectory temporary;
+  const auto path = JournalPath(temporary);
+  const RequestOwnerEpoch first_owner("owner.1");
+  std::optional<DisableFenceReleaseRequestDTO> release_request;
+  {
+    SqliteCCLCJournal journal(path, CellId("cell.1"), 8U);
+    ASSERT_TRUE(journal.BeginOwnerEpoch(first_owner, 1, 8U).ok());
+    const auto lifecycle_intent = DisableIntent("request.1", first_owner, 3U);
+    const auto acceptance = Acceptance(lifecycle_intent, 1U, "transaction.1");
+    auto status = InitialDisableStatus(lifecycle_intent, acceptance);
+    ASSERT_TRUE(
+        journal.AcceptOrReplayLifecycle(first_owner, lifecycle_intent, acceptance, status).ok());
+    const auto handoff_request = DisableRequest(status);
+    const auto handoff_acceptance = DisableAcceptance(handoff_request);
+    status = PreparedDisableStatus(status);
+    ASSERT_TRUE(
+        journal.RecordEffectPrepared(first_owner, PreparedDisableEffect(handoff_request), status)
+            .ok());
+    status = CompletedDisableStatus(status, DisableReady(handoff_request, handoff_acceptance));
+    ASSERT_TRUE(
+        journal
+            .RecordEffectCompleted(
+                first_owner, CompletedDisableEffect(handoff_request, handoff_acceptance), status)
+            .ok());
+    status = ResolvedDisableStatus(status);
+    ASSERT_TRUE(status.locally_valid());
+    ASSERT_TRUE(journal.RecordLifecycleStatus(first_owner, status).ok());
+    release_request = DisableReleaseRequest(status);
+    status = PreparedReleaseStatus(status);
+    ASSERT_TRUE(
+        journal.RecordEffectPrepared(first_owner, PreparedReleaseEffect(*release_request), status)
+            .ok());
+    journal.Close();
+  }
+
+  ASSERT_TRUE(release_request.has_value());
+  SqliteCCLCJournal replacement(path, CellId("cell.1"), 8U);
+  const RequestOwnerEpoch replacement_owner("owner.2");
+  const auto recovery = replacement.BeginOwnerEpoch(replacement_owner, 500, 8U);
+  ASSERT_TRUE(recovery.ok()) << recovery.error().message;
+  ASSERT_EQ(recovery.value().interrupted_transactions.size(), 1U);
+  ASSERT_EQ(recovery.value().unresolved_effect_attempts.size(), 1U);
+  const auto& unresolved = recovery.value().unresolved_effect_attempts.front();
+  EXPECT_EQ(unresolved.effect_kind, CCLCEffectKindDTO::kKernelDisableFenceRelease);
+  ASSERT_TRUE(unresolved.disable_fence_release_request.has_value());
+  EXPECT_EQ(*unresolved.disable_fence_release_request, *release_request);
+  auto status = recovery.value().interrupted_transactions.front();
+  EXPECT_FALSE(status.terminal_result.has_value());
+  EXPECT_EQ(status.configuration_fence->state, ConfigurationFenceState::kHeld);
+  EXPECT_FALSE(status.disable_fence_released.has_value());
+
+  status.status_sequence += 1U;
+  status.status_owner_epoch = replacement_owner;
+  status.phase = ComponentLifecycleTransactionPhaseDTO::kOutcomeUnknown;
+  status.reconciliation_required = true;
+  status.error =
+      ErrorDTO{"disable_release_response_unknown", "reconciling the prepared release", {}};
+  status.latest_updated_at_ns = 500;
+  status.remaining_duration_ns = 0;
+  ASSERT_TRUE(status.locally_valid());
+  ASSERT_TRUE(replacement.RecordLifecycleStatus(replacement_owner, status).ok());
+
+  const auto receipt = DisableReleaseReceipt(*release_request);
+  auto terminal = CompletedReleaseStatus(status, receipt);
+  ASSERT_TRUE(terminal.locally_valid());
+  auto completed = unresolved;
+  completed.state = CCLCEffectAttemptStateDTO::kCompleted;
+  completed.disable_fence_release_result = DisableFenceReleaseEffectResultDTO{
+      *release_request, DisableFenceReleaseEffectDispositionDTO::kReleased, receipt};
+  const auto result = replacement.RecordEffectCompleted(replacement_owner, completed, terminal);
+  ASSERT_TRUE(result.ok()) << result.error().message;
+
+  const auto retained =
+      replacement.LoadRetainedLifecycleStatus(terminal.acceptance.lifecycle_transaction_id);
+  ASSERT_TRUE(retained.ok());
+  ASSERT_TRUE(retained.value().has_value());
+  EXPECT_EQ(*retained.value(), terminal);
+  const auto next_epoch = replacement.BeginOwnerEpoch(RequestOwnerEpoch("owner.3"), 900, 8U);
+  ASSERT_TRUE(next_epoch.ok());
+  EXPECT_TRUE(next_epoch.value().interrupted_transactions.empty());
+  EXPECT_TRUE(next_epoch.value().unresolved_effect_attempts.empty());
+}
+
+TEST(SqliteCCLCJournal, ProvenNoEffectHandoffUsesAFreshKernelEpochSuccessorWithoutRedispatch) {
+  ScopedTemporaryDirectory temporary;
+  SqliteCCLCJournal journal(JournalPath(temporary), CellId("cell.1"), 8U);
+  const RequestOwnerEpoch owner("owner.1");
+  ASSERT_TRUE(journal.BeginOwnerEpoch(owner, 1, 8U).ok());
+
+  const auto lifecycle_intent = DisableIntent("request.1", owner, 3U);
+  const auto acceptance = Acceptance(lifecycle_intent, 1U, "transaction.1");
+  auto status = InitialDisableStatus(lifecycle_intent, acceptance);
+  ASSERT_TRUE(journal.AcceptOrReplayLifecycle(owner, lifecycle_intent, acceptance, status).ok());
+
+  const auto first_request =
+      DisableRequest(status, RequestOwnerEpoch("kernel-owner.1"), "disable-handoff.1");
+  status = PreparedDisableStatus(status);
+  ASSERT_TRUE(
+      journal.RecordEffectPrepared(owner, PreparedDisableEffect(first_request), status).ok());
+
+  const auto overlapping_request =
+      DisableRequest(status, RequestOwnerEpoch("kernel-owner.2"), "disable-handoff.2");
+  const auto overlapping_status = PreparedDisableStatus(status);
+  const auto overlapping = journal.RecordEffectPrepared(
+      owner, PreparedDisableEffect(overlapping_request, 2U), overlapping_status);
+  ASSERT_FALSE(overlapping.ok());
+  EXPECT_EQ(overlapping.error().code, "component_lifecycle_journal_attempt_unresolved");
+
+  auto proven_not_seen_status = status;
+  proven_not_seen_status.status_sequence += 1U;
+  proven_not_seen_status.domains.front().effect = ComponentLifecycleDomainEffectDTO::kKnownNoEffect;
+  proven_not_seen_status.latest_updated_at_ns += 10;
+  proven_not_seen_status.remaining_duration_ns -= 10;
+  ASSERT_TRUE(proven_not_seen_status.locally_valid());
+  auto proven_not_seen = PreparedDisableEffect(first_request);
+  proven_not_seen.state = CCLCEffectAttemptStateDTO::kCompleted;
+  proven_not_seen.disable_handoff_result = DisableHandoffEffectResultDTO{
+      first_request, DisableHandoffEffectDispositionDTO::kProvenNotSeen, std::nullopt};
+  ASSERT_TRUE(journal.RecordEffectCompleted(owner, proven_not_seen, proven_not_seen_status).ok());
+
+  const auto successor_request = DisableRequest(
+      proven_not_seen_status, RequestOwnerEpoch("kernel-owner.2"), "disable-handoff.2");
+  EXPECT_NE(first_request.owner_request_context.request_owner_epoch,
+            successor_request.owner_request_context.request_owner_epoch);
+  EXPECT_NE(first_request.owner_request_context.request_id,
+            successor_request.owner_request_context.request_id);
+  const auto successor_status = PreparedDisableStatus(proven_not_seen_status);
+  const auto successor = journal.RecordEffectPrepared(
+      owner, PreparedDisableEffect(successor_request, 2U), successor_status);
+  ASSERT_TRUE(successor.ok()) << successor.error().message;
+}
+
+TEST(SqliteCCLCJournal, ProvenHeldFenceUsesAFreshKernelEpochSuccessorWithoutClaimingRelease) {
+  ScopedTemporaryDirectory temporary;
+  SqliteCCLCJournal journal(JournalPath(temporary), CellId("cell.1"), 8U);
+  const RequestOwnerEpoch owner("owner.1");
+  ASSERT_TRUE(journal.BeginOwnerEpoch(owner, 1, 8U).ok());
+
+  const auto lifecycle_intent = DisableIntent("request.1", owner, 3U);
+  const auto acceptance = Acceptance(lifecycle_intent, 1U, "transaction.1");
+  auto status = InitialDisableStatus(lifecycle_intent, acceptance);
+  ASSERT_TRUE(journal.AcceptOrReplayLifecycle(owner, lifecycle_intent, acceptance, status).ok());
+  const auto handoff_request = DisableRequest(status);
+  const auto handoff_acceptance = DisableAcceptance(handoff_request);
+  status = PreparedDisableStatus(status);
+  ASSERT_TRUE(
+      journal.RecordEffectPrepared(owner, PreparedDisableEffect(handoff_request), status).ok());
+  status = CompletedDisableStatus(status, DisableReady(handoff_request, handoff_acceptance));
+  ASSERT_TRUE(journal
+                  .RecordEffectCompleted(
+                      owner, CompletedDisableEffect(handoff_request, handoff_acceptance), status)
+                  .ok());
+  status = ResolvedDisableStatus(status);
+  ASSERT_TRUE(status.domains.front().reconciliation_evidence->locally_valid());
+  EXPECT_EQ(status.domains.front().requested_state.presence,
+            ComponentLifecycleRequestedStatePresenceDTO::kResolved);
+  ASSERT_TRUE(status.domains.front().requested_state.state.has_value());
+  EXPECT_EQ(status.domains.front().current_state, *status.domains.front().requested_state.state);
+  EXPECT_EQ(status.domains.front().reconciliation_evidence->observed_state,
+            status.domains.front().current_state);
+  EXPECT_EQ(status.domains.front().reconciliation_evidence->postcondition_result,
+            LifecyclePostconditionResultDTO::kSatisfied);
+  ASSERT_TRUE(status.domains.front().locally_valid());
+  ASSERT_TRUE(status.disable_handoff->locally_valid());
+  ASSERT_TRUE(status.configuration_fence->locally_valid());
+  ASSERT_TRUE(status.locally_valid());
+  ASSERT_TRUE(journal.RecordLifecycleStatus(owner, status).ok());
+
+  const auto first_release =
+      DisableReleaseRequest(status, RequestOwnerEpoch("kernel-owner.1"), "disable-release.1");
+  status = PreparedReleaseStatus(status);
+  ASSERT_TRUE(
+      journal.RecordEffectPrepared(owner, PreparedReleaseEffect(first_release), status).ok());
+  const auto overlapping_release =
+      DisableReleaseRequest(status, RequestOwnerEpoch("kernel-owner.2"), "disable-release.2");
+  const auto overlapping_status = PreparedReleaseStatus(status);
+  const auto overlapping = journal.RecordEffectPrepared(
+      owner, PreparedReleaseEffect(overlapping_release, 3U), overlapping_status);
+  ASSERT_FALSE(overlapping.ok());
+  EXPECT_EQ(overlapping.error().code, "component_lifecycle_journal_attempt_unresolved");
+  auto proven_held_status = status;
+  proven_held_status.status_sequence += 1U;
+  proven_held_status.latest_updated_at_ns += 10;
+  proven_held_status.remaining_duration_ns -= 10;
+  ASSERT_TRUE(proven_held_status.locally_valid());
+  ASSERT_TRUE(
+      journal
+          .RecordEffectCompleted(
+              owner,
+              CompletedReleaseEffect(
+                  first_release, DisableFenceReleaseEffectDispositionDTO::kProvenNotReleasedHeld,
+                  std::nullopt),
+              proven_held_status)
+          .ok());
+  EXPECT_EQ(proven_held_status.configuration_fence->state, ConfigurationFenceState::kHeld);
+  EXPECT_FALSE(proven_held_status.disable_fence_released.has_value());
+
+  const auto successor_release = DisableReleaseRequest(
+      proven_held_status, RequestOwnerEpoch("kernel-owner.2"), "disable-release.2");
+  EXPECT_NE(first_release.owner_request_context.request_owner_epoch,
+            successor_release.owner_request_context.request_owner_epoch);
+  const auto successor_status = PreparedReleaseStatus(proven_held_status);
+  const auto successor = journal.RecordEffectPrepared(
+      owner, PreparedReleaseEffect(successor_release, 3U), successor_status);
+  ASSERT_TRUE(successor.ok()) << successor.error().message;
+}
+
+TEST(SqliteCCLCJournal, RejectsDomainEffectRegressionAndDroppedReconciliationEvidence) {
+  ScopedTemporaryDirectory temporary;
+  SqliteCCLCJournal journal(JournalPath(temporary), CellId("cell.1"), 8U);
+  const RequestOwnerEpoch owner("owner.1");
+  ASSERT_TRUE(journal.BeginOwnerEpoch(owner, 1, 8U).ok());
+  const auto lifecycle_intent = Intent("request.1", owner, 3U);
+  const auto acceptance = Acceptance(lifecycle_intent, 1U, "transaction.1");
+  auto status = InitialStatus(lifecycle_intent, acceptance);
+  ASSERT_TRUE(journal.AcceptOrReplayLifecycle(owner, lifecycle_intent, acceptance, status).ok());
+
+  status.status_sequence += 1U;
+  status.phase = ComponentLifecycleTransactionPhaseDTO::kReconciling;
+  status.domains.front().action_state = ComponentLifecycleDomainActionStateDTO::kReconciling;
+  status.domains.front().effect = ComponentLifecycleDomainEffectDTO::kEffectUncertain;
+  status.domains.front().reconciliation_evidence =
+      LifecycleReconciliationEvidenceDTO{ProviderInstanceId("provider.1"),
+                                         ProviderManifestId("manifest.1"),
+                                         ProviderManifestRevision("manifest-revision.1"),
+                                         RuntimeUnitId("runtime.1"),
+                                         RuntimeEpoch("runtime-epoch.1"),
+                                         1U,
+                                         1U,
+                                         ComponentLifecycleStateDTO::kDeclared,
+                                         LifecyclePostconditionResultDTO::kNotSatisfied,
+                                         200};
+  status.reconciliation_required = true;
+  status.latest_updated_at_ns = 200;
+  status.remaining_duration_ns -= 100;
+  ASSERT_TRUE(status.locally_valid());
+  ASSERT_TRUE(journal.RecordLifecycleStatus(owner, status).ok());
+
+  auto changed_provider = status;
+  changed_provider.status_sequence += 1U;
+  changed_provider.domains.front().resolved_provider_occurrence->lifecycle_plan_catalog_digest =
+      ContentDigest("different-catalog-digest");
+  changed_provider.latest_updated_at_ns += 10;
+  changed_provider.remaining_duration_ns -= 10;
+  ASSERT_TRUE(changed_provider.locally_valid());
+  const auto changed_provider_result = journal.RecordLifecycleStatus(owner, changed_provider);
+  ASSERT_FALSE(changed_provider_result.ok());
+  EXPECT_EQ(changed_provider_result.error().code, "component_lifecycle_journal_status_regressed");
+
+  auto dropped = status;
+  dropped.status_sequence += 1U;
+  dropped.phase = ComponentLifecycleTransactionPhaseDTO::kOutcomeUnknown;
+  dropped.domains.front().action_state = ComponentLifecycleDomainActionStateDTO::kOutcomeUnknown;
+  dropped.domains.front().reconciliation_evidence.reset();
+  const ErrorDTO unresolved{"reconciliation_evidence_lost", "fresh evidence is required", {}};
+  dropped.domains.front().error = unresolved;
+  dropped.error = unresolved;
+  dropped.latest_updated_at_ns += 10;
+  ASSERT_TRUE(dropped.locally_valid());
+  const auto drop_result = journal.RecordLifecycleStatus(owner, dropped);
+  ASSERT_FALSE(drop_result.ok());
+  EXPECT_EQ(drop_result.error().code, "component_lifecycle_journal_status_regressed");
+
+  auto unresolved_without_fresh_evidence = status;
+  unresolved_without_fresh_evidence.status_sequence += 1U;
+  unresolved_without_fresh_evidence.phase = ComponentLifecycleTransactionPhaseDTO::kVerifying;
+  unresolved_without_fresh_evidence.domains.front().action_state =
+      ComponentLifecycleDomainActionStateDTO::kVerifying;
+  unresolved_without_fresh_evidence.domains.front().effect =
+      ComponentLifecycleDomainEffectDTO::kKnownNoEffect;
+  unresolved_without_fresh_evidence.reconciliation_required = false;
+  unresolved_without_fresh_evidence.latest_updated_at_ns += 10;
+  ASSERT_TRUE(unresolved_without_fresh_evidence.locally_valid());
+  const auto unresolved_result =
+      journal.RecordLifecycleStatus(owner, unresolved_without_fresh_evidence);
+  ASSERT_FALSE(unresolved_result.ok());
+  EXPECT_EQ(unresolved_result.error().code, "component_lifecycle_journal_status_regressed");
+
+  auto same_generation_mutation = unresolved_without_fresh_evidence;
+  same_generation_mutation.domains.front().reconciliation_evidence->observed_state =
+      ComponentLifecycleStateDTO::kPrepared;
+  same_generation_mutation.domains.front().reconciliation_evidence->postcondition_result =
+      LifecyclePostconditionResultDTO::kSatisfied;
+  ASSERT_TRUE(same_generation_mutation.locally_valid());
+  const auto semantic_mutation = journal.RecordLifecycleStatus(owner, same_generation_mutation);
+  ASSERT_FALSE(semantic_mutation.ok());
+  EXPECT_EQ(semantic_mutation.error().code, "component_lifecycle_journal_status_regressed");
+
+  auto timestamp_only = unresolved_without_fresh_evidence;
+  timestamp_only.domains.front().reconciliation_evidence->source_sequence += 1U;
+  timestamp_only.domains.front().reconciliation_evidence->observed_at_ns += 10;
+  ASSERT_TRUE(timestamp_only.locally_valid());
+  const auto timestamp_result = journal.RecordLifecycleStatus(owner, timestamp_only);
+  ASSERT_FALSE(timestamp_result.ok());
+  EXPECT_EQ(timestamp_result.error().code, "component_lifecycle_journal_status_regressed");
+}
+
+TEST(SqliteCCLCJournal, ExactReplayPrecedesTheBoundedActiveTransactionCapacityCheck) {
+  ScopedTemporaryDirectory temporary;
+  SqliteCCLCJournal journal(JournalPath(temporary), CellId("cell.1"), 128U);
+  const RequestOwnerEpoch owner("owner.1");
+  ASSERT_TRUE(journal.BeginOwnerEpoch(owner, 1, 128U).ok());
+
+  std::optional<ComponentLifecycleIntentDTO> first_intent;
+  std::optional<ComponentLifecycleAcceptedDTO> first_acceptance;
+  for (std::size_t index = 0U; index < kMaximumCCLCActiveTransactions; ++index) {
+    const auto lifecycle_intent =
+        Intent("request." + std::to_string(index + 1U), owner, 3U + index);
+    const auto acceptance =
+        Acceptance(lifecycle_intent, index + 1U, "transaction." + std::to_string(index + 1U));
+    const auto accepted = journal.AcceptOrReplayLifecycle(
+        owner, lifecycle_intent, acceptance, InitialStatus(lifecycle_intent, acceptance));
+    ASSERT_TRUE(accepted.ok()) << accepted.error().message;
+    ASSERT_EQ(accepted.value().replay_status, RequestReplayStatusDTO::kAcceptedNew);
+    if (index == 0U) {
+      first_intent = lifecycle_intent;
+      first_acceptance = acceptance;
+    }
+  }
+
+  const auto overflow_intent =
+      Intent("request.overflow", owner, 3U + kMaximumCCLCActiveTransactions);
+  const auto overflow_acceptance =
+      Acceptance(overflow_intent, kMaximumCCLCActiveTransactions + 1U, "transaction.overflow");
+  const auto overflow =
+      journal.AcceptOrReplayLifecycle(owner, overflow_intent, overflow_acceptance,
+                                      InitialStatus(overflow_intent, overflow_acceptance));
+  ASSERT_FALSE(overflow.ok());
+  EXPECT_EQ(overflow.error().code, "request_queue_full");
+
+  ASSERT_TRUE(first_intent.has_value());
+  ASSERT_TRUE(first_acceptance.has_value());
+  const auto replay = journal.AcceptOrReplayLifecycle(
+      owner, *first_intent, *first_acceptance, InitialStatus(*first_intent, *first_acceptance));
+  ASSERT_TRUE(replay.ok()) << replay.error().message;
+  EXPECT_EQ(replay.value().replay_status, RequestReplayStatusDTO::kReplayedExact);
+  ASSERT_TRUE(replay.value().acceptance.has_value());
+  EXPECT_EQ(replay.value().acceptance->lifecycle_transaction_id,
+            first_acceptance->lifecycle_transaction_id);
+}
+
+TEST(SqliteCCLCJournal, CompactsTerminalResultToNonExecutingMembershipTombstone) {
+  ScopedTemporaryDirectory temporary;
+  SqliteCCLCJournal journal(JournalPath(temporary), CellId("cell.1"), 1U);
+  const RequestOwnerEpoch owner("owner.1");
+  ASSERT_TRUE(journal.BeginOwnerEpoch(owner, 1, 8U).ok());
+
+  const auto first = Intent("request.1", owner, 3U);
+  const auto first_acceptance = Acceptance(first, 1U, "transaction.1");
+  auto first_status = InitialStatus(first, first_acceptance);
+  ASSERT_TRUE(journal.AcceptOrReplayLifecycle(owner, first, first_acceptance, first_status).ok());
+  first_status = TerminalSuccess(first_status, 2U);
+  ASSERT_TRUE(journal.RecordLifecycleStatus(owner, first_status).ok());
+
+  const auto second = Intent("request.2", owner, 4U);
+  const auto second_acceptance = Acceptance(second, 2U, "transaction.2");
+  auto second_status = InitialStatus(second, second_acceptance);
+  ASSERT_TRUE(
+      journal.AcceptOrReplayLifecycle(owner, second, second_acceptance, second_status).ok());
+  second_status = TerminalSuccess(second_status, 2U);
+  ASSERT_TRUE(journal.RecordLifecycleStatus(owner, second_status).ok());
+
+  const auto expired = journal.AcceptOrReplayLifecycle(
+      owner, first,
+      [&] {
+        auto unusable = first_acceptance;
+        unusable.replay_status = RequestReplayStatusDTO::kRequestIdConflict;
+        return unusable;
+      }(),
+      InitialStatus(first, first_acceptance));
+  ASSERT_TRUE(expired.ok());
+  EXPECT_EQ(expired.value().replay_status, RequestReplayStatusDTO::kRequestResultExpired);
+  const auto retained =
+      journal.LoadRetainedLifecycleStatus(second_acceptance.lifecycle_transaction_id);
+  ASSERT_TRUE(retained.ok());
+  ASSERT_TRUE(retained.value().has_value());
+  EXPECT_EQ(retained.value()->terminal_result, ComponentLifecycleTerminalResultDTO::kSucceeded);
+}
+
+TEST(SqliteCCLCJournal, ReplacementRecoversZeroAndCompletedEffectSequenceWatermarks) {
+  ScopedTemporaryDirectory temporary;
+  const auto path = JournalPath(temporary);
+  const RequestOwnerEpoch first_owner("owner.1");
+  {
+    SqliteCCLCJournal first(path, CellId("cell.1"), 8U);
+    ASSERT_TRUE(first.BeginOwnerEpoch(first_owner, 1, 8U).ok());
+
+    const auto without_effect = Intent("request.1", first_owner, 3U);
+    const auto without_effect_acceptance = Acceptance(without_effect, 1U, "transaction.1");
+    ASSERT_TRUE(
+        first
+            .AcceptOrReplayLifecycle(first_owner, without_effect, without_effect_acceptance,
+                                     InitialStatus(without_effect, without_effect_acceptance))
+            .ok());
+
+    const auto with_effect = Intent("request.2", first_owner, 4U);
+    const auto with_effect_acceptance = Acceptance(with_effect, 2U, "transaction.2");
+    auto status = InitialStatus(with_effect, with_effect_acceptance);
+    ASSERT_TRUE(
+        first.AcceptOrReplayLifecycle(first_owner, with_effect, with_effect_acceptance, status)
+            .ok());
+    const auto primitive = PrimitiveIntent(status);
+    status = PreparedEffectStatus(status);
+    ASSERT_TRUE(
+        first.RecordEffectPrepared(first_owner, PreparedPrimitiveEffect(primitive), status).ok());
+    const auto result = PrimitiveSuccess(primitive);
+    status = CompletedEffectStatus(status, result);
+    ASSERT_TRUE(
+        first
+            .RecordEffectCompleted(first_owner, CompletedPrimitiveEffect(primitive, result), status)
+            .ok());
+  }
+
+  SqliteCCLCJournal replacement(path, CellId("cell.1"), 8U);
+  const auto recovery = replacement.BeginOwnerEpoch(RequestOwnerEpoch("owner.2"), 500, 8U);
+  ASSERT_TRUE(recovery.ok()) << recovery.error().message;
+  ASSERT_EQ(recovery.value().interrupted_transactions.size(), 2U);
+  ASSERT_EQ(recovery.value().effect_sequence_watermarks.size(), 2U);
+  EXPECT_EQ(recovery.value().effect_sequence_watermarks[0].highest_effect_sequence, 0U);
+  EXPECT_EQ(recovery.value().effect_sequence_watermarks[1].highest_effect_sequence, 1U);
+  EXPECT_TRUE(recovery.value().unresolved_effect_attempts.empty());
+}
+
+TEST(SqliteCCLCJournal, ReplacementTerminalizesNoPreparedEffectAsKnownNoEffect) {
+  ScopedTemporaryDirectory temporary;
+  const auto path = JournalPath(temporary);
+  const RequestOwnerEpoch first_owner("owner.1");
+  const auto intent = Intent("request.1", first_owner, 3U);
+  const auto acceptance = Acceptance(intent, 1U, "transaction.1");
+  {
+    SqliteCCLCJournal first(path, CellId("cell.1"), 8U);
+    ASSERT_TRUE(first.BeginOwnerEpoch(first_owner, 1, 8U).ok());
+    ASSERT_TRUE(first
+                    .AcceptOrReplayLifecycle(first_owner, intent, acceptance,
+                                             InitialStatus(intent, acceptance))
+                    .ok());
+  }
+
+  SqliteCCLCJournal replacement(path, CellId("cell.1"), 8U);
+  const RequestOwnerEpoch replacement_owner("owner.2");
+  const auto recovery = replacement.BeginOwnerEpoch(replacement_owner, 500, 8U);
+  ASSERT_TRUE(recovery.ok()) << recovery.error().message;
+  ASSERT_EQ(recovery.value().interrupted_transactions.size(), 1U);
+  ASSERT_TRUE(recovery.value().unresolved_effect_attempts.empty());
+
+  auto manufactured_success =
+      TerminalSuccess(recovery.value().interrupted_transactions.front(),
+                      recovery.value().interrupted_transactions.front().status_sequence + 1U);
+  manufactured_success.status_owner_epoch = replacement_owner;
+  manufactured_success.latest_updated_at_ns = 500;
+  ASSERT_TRUE(manufactured_success.locally_valid());
+  const auto unsupported =
+      replacement.RecordLifecycleStatus(replacement_owner, manufactured_success);
+  ASSERT_FALSE(unsupported.ok());
+  EXPECT_EQ(unsupported.error().code, "component_lifecycle_journal_status_regressed");
+
+  const auto terminal = ReplacementTerminalKnownNoEffect(
+      recovery.value().interrupted_transactions.front(), replacement_owner);
+  ASSERT_TRUE(terminal.locally_valid());
+  const auto recorded = replacement.RecordLifecycleStatus(replacement_owner, terminal);
+  ASSERT_TRUE(recorded.ok()) << recorded.error().code << ": " << recorded.error().message;
+
+  const auto retained =
+      replacement.LoadRetainedLifecycleStatus(acceptance.lifecycle_transaction_id);
+  ASSERT_TRUE(retained.ok());
+  ASSERT_TRUE(retained.value().has_value());
+  EXPECT_EQ(*retained.value(), terminal);
+}
+
+TEST(SqliteCCLCJournal, ReplacementCannotTerminalizeUnresolvedPreparedEffect) {
+  ScopedTemporaryDirectory temporary;
+  const auto path = JournalPath(temporary);
+  const RequestOwnerEpoch first_owner("owner.1");
+  const auto intent = Intent("request.1", first_owner, 3U);
+  const auto acceptance = Acceptance(intent, 1U, "transaction.1");
+  {
+    SqliteCCLCJournal first(path, CellId("cell.1"), 8U);
+    ASSERT_TRUE(first.BeginOwnerEpoch(first_owner, 1, 8U).ok());
+    auto status = InitialStatus(intent, acceptance);
+    ASSERT_TRUE(first.AcceptOrReplayLifecycle(first_owner, intent, acceptance, status).ok());
+    const auto primitive = PrimitiveIntent(status);
+    status = PreparedEffectStatus(status);
+    ASSERT_TRUE(
+        first.RecordEffectPrepared(first_owner, PreparedPrimitiveEffect(primitive), status).ok());
+  }
+
+  SqliteCCLCJournal replacement(path, CellId("cell.1"), 8U);
+  const RequestOwnerEpoch replacement_owner("owner.2");
+  const auto recovery = replacement.BeginOwnerEpoch(replacement_owner, 500, 8U);
+  ASSERT_TRUE(recovery.ok()) << recovery.error().message;
+  ASSERT_EQ(recovery.value().interrupted_transactions.size(), 1U);
+  ASSERT_EQ(recovery.value().unresolved_effect_attempts.size(), 1U);
+
+  const auto false_terminal = ReplacementTerminalKnownNoEffect(
+      recovery.value().interrupted_transactions.front(), replacement_owner);
+  ASSERT_TRUE(false_terminal.locally_valid());
+  const auto rejected = replacement.RecordLifecycleStatus(replacement_owner, false_terminal);
+  ASSERT_FALSE(rejected.ok());
+  EXPECT_EQ(rejected.error().code, "component_lifecycle_journal_status_regressed");
+}
+
+TEST(SqliteCCLCJournal, EffectIdentityIsScopedByTransactionAcrossOwnerEpochs) {
+  ScopedTemporaryDirectory temporary;
+  SqliteCCLCJournal journal(JournalPath(temporary), CellId("cell.1"), 8U);
+  const RequestOwnerEpoch first_owner("owner.1");
+  ASSERT_TRUE(journal.BeginOwnerEpoch(first_owner, 1, 8U).ok());
+
+  const auto first = Intent("request.shared", first_owner, 3U);
+  const auto first_acceptance = Acceptance(first, 1U, "transaction.1");
+  auto first_status = InitialStatus(first, first_acceptance);
+  ASSERT_TRUE(
+      journal.AcceptOrReplayLifecycle(first_owner, first, first_acceptance, first_status).ok());
+  const auto first_primitive = PrimitiveIntent(first_status, "attempt.shared");
+  first_status = PreparedEffectStatus(first_status);
+  ASSERT_TRUE(
+      journal
+          .RecordEffectPrepared(first_owner, PreparedPrimitiveEffect(first_primitive), first_status)
+          .ok());
+  const auto first_result = PrimitiveSuccess(first_primitive);
+  first_status = CompletedEffectStatus(first_status, first_result);
+  ASSERT_TRUE(journal
+                  .RecordEffectCompleted(first_owner,
+                                         CompletedPrimitiveEffect(first_primitive, first_result),
+                                         first_status)
+                  .ok());
+  ASSERT_TRUE(journal.RecordLifecycleStatus(first_owner, TerminalSuccess(first_status, 4U)).ok());
+
+  const auto keeps_namespace = Intent("request.pending", first_owner, 4U);
+  const auto keeps_namespace_acceptance = Acceptance(keeps_namespace, 2U, "transaction.pending");
+  ASSERT_TRUE(
+      journal
+          .AcceptOrReplayLifecycle(first_owner, keeps_namespace, keeps_namespace_acceptance,
+                                   InitialStatus(keeps_namespace, keeps_namespace_acceptance))
+          .ok());
+
+  const RequestOwnerEpoch second_owner("owner.2");
+  ASSERT_TRUE(journal.BeginOwnerEpoch(second_owner, 500, 8U).ok());
+  const auto second = Intent("request.shared", second_owner, 5U);
+  const auto second_acceptance = Acceptance(second, 3U, "transaction.2");
+  auto second_status = InitialStatus(second, second_acceptance);
+  ASSERT_TRUE(
+      journal.AcceptOrReplayLifecycle(second_owner, second, second_acceptance, second_status).ok());
+  const auto second_primitive = PrimitiveIntent(second_status, "attempt.shared");
+  second_status = PreparedEffectStatus(second_status);
+  const auto prepared = journal.RecordEffectPrepared(
+      second_owner, PreparedPrimitiveEffect(second_primitive), second_status);
+  ASSERT_TRUE(prepared.ok()) << prepared.error().message;
+}
+
+TEST(SqliteCCLCJournal, CompactsByDurableTerminalOrderNotAcceptanceOrder) {
+  ScopedTemporaryDirectory temporary;
+  SqliteCCLCJournal journal(JournalPath(temporary), CellId("cell.1"), 1U);
+  const RequestOwnerEpoch owner("owner.1");
+  ASSERT_TRUE(journal.BeginOwnerEpoch(owner, 1, 8U).ok());
+
+  const auto first = Intent("request.1", owner, 3U);
+  const auto first_acceptance = Acceptance(first, 1U, "transaction.1");
+  auto first_status = InitialStatus(first, first_acceptance);
+  ASSERT_TRUE(journal.AcceptOrReplayLifecycle(owner, first, first_acceptance, first_status).ok());
+  const auto second = Intent("request.2", owner, 4U);
+  const auto second_acceptance = Acceptance(second, 2U, "transaction.2");
+  auto second_status = InitialStatus(second, second_acceptance);
+  ASSERT_TRUE(
+      journal.AcceptOrReplayLifecycle(owner, second, second_acceptance, second_status).ok());
+
+  ASSERT_TRUE(journal.RecordLifecycleStatus(owner, TerminalSuccess(second_status, 2U)).ok());
+  ASSERT_TRUE(journal.RecordLifecycleStatus(owner, TerminalSuccess(first_status, 2U)).ok());
+
+  const auto first_retained =
+      journal.LoadRetainedLifecycleStatus(first_acceptance.lifecycle_transaction_id);
+  const auto second_retained =
+      journal.LoadRetainedLifecycleStatus(second_acceptance.lifecycle_transaction_id);
+  ASSERT_TRUE(first_retained.ok());
+  ASSERT_TRUE(second_retained.ok());
+  EXPECT_TRUE(first_retained.value().has_value());
+  EXPECT_FALSE(second_retained.value().has_value());
+}
+
+TEST(SqliteCCLCJournal, CompactsTerminalResultAtConfiguredBytePressure) {
+  ScopedTemporaryDirectory temporary;
+  SqliteCCLCJournal journal(JournalPath(temporary), CellId("cell.1"), 8U, 1U);
+  const RequestOwnerEpoch owner("owner.1");
+  ASSERT_TRUE(journal.BeginOwnerEpoch(owner, 1, 8U).ok());
+  const auto intent = Intent("request.1", owner, 3U);
+  const auto acceptance = Acceptance(intent, 1U, "transaction.1");
+  auto status = InitialStatus(intent, acceptance);
+  ASSERT_TRUE(journal.AcceptOrReplayLifecycle(owner, intent, acceptance, status).ok());
+  ASSERT_TRUE(journal.RecordLifecycleStatus(owner, TerminalSuccess(status, 2U)).ok());
+  const auto retained = journal.LoadRetainedLifecycleStatus(acceptance.lifecycle_transaction_id);
+  ASSERT_TRUE(retained.ok());
+  EXPECT_FALSE(retained.value().has_value());
+  const auto replay =
+      journal.AcceptOrReplayLifecycle(owner, intent, acceptance, InitialStatus(intent, acceptance));
+  ASSERT_TRUE(replay.ok());
+  EXPECT_EQ(replay.value().replay_status, RequestReplayStatusDTO::kRequestResultExpired);
+}
+
+TEST(SqliteCCLCJournal, RejectsSemanticColumnCorruptionOnReopen) {
+  ScopedTemporaryDirectory temporary;
+  const auto path = JournalPath(temporary);
+  {
+    SqliteCCLCJournal journal(path, CellId("cell.1"), 8U);
+    const RequestOwnerEpoch owner("owner.1");
+    ASSERT_TRUE(journal.BeginOwnerEpoch(owner, 1, 8U).ok());
+    const auto intent = Intent("request.1", owner, 3U);
+    const auto acceptance = Acceptance(intent, 1U, "transaction.1");
+    ASSERT_TRUE(
+        journal
+            .AcceptOrReplayLifecycle(owner, intent, acceptance, InitialStatus(intent, acceptance))
+            .ok());
+    journal.Close();
+  }
+
+  sqlite3* database = nullptr;
+  ASSERT_EQ(sqlite3_open_v2(path.string().c_str(), &database, SQLITE_OPEN_READWRITE, nullptr),
+            SQLITE_OK);
+  ASSERT_NE(database, nullptr);
+  ASSERT_EQ(sqlite3_exec(database,
+                         "UPDATE lifecycle_transactions SET terminal=1,"
+                         "terminal_sequence=1",
+                         nullptr, nullptr, nullptr),
+            SQLITE_OK);
+  ASSERT_EQ(sqlite3_close(database), SQLITE_OK);
+  EXPECT_THROW((SqliteCCLCJournal(path, CellId("cell.1"), 8U)), std::runtime_error);
+}
+
+TEST(SqliteCCLCJournal, RejectsStaleCurrentComponentFactOnReopen) {
+  ScopedTemporaryDirectory temporary;
+  const auto path = JournalPath(temporary);
+  {
+    SqliteCCLCJournal journal(path, CellId("cell.1"), 8U);
+    const RequestOwnerEpoch owner("owner.1");
+    ASSERT_TRUE(journal.BeginOwnerEpoch(owner, 1, 8U).ok());
+    const auto intent = Intent("request.1", owner, 3U);
+    const auto acceptance = Acceptance(intent, 1U, "transaction.1");
+    ASSERT_TRUE(
+        journal
+            .AcceptOrReplayLifecycle(owner, intent, acceptance, InitialStatus(intent, acceptance))
+            .ok());
+    journal.Close();
+  }
+
+  sqlite3* database = nullptr;
+  ASSERT_EQ(sqlite3_open_v2(path.string().c_str(), &database, SQLITE_OPEN_READWRITE, nullptr),
+            SQLITE_OK);
+  ASSERT_NE(database, nullptr);
+  ASSERT_EQ(sqlite3_exec(database,
+                         "UPDATE lifecycle_component_current_facts SET "
+                         "component_lifecycle_generation=3",
+                         nullptr, nullptr, nullptr),
+            SQLITE_OK);
+  ASSERT_EQ(sqlite3_close(database), SQLITE_OK);
+  EXPECT_THROW((SqliteCCLCJournal(path, CellId("cell.1"), 8U)), std::runtime_error);
+}
+
+TEST(SqliteCCLCJournal, RejectsStatusThatDropsCompletedEffectEvidence) {
+  ScopedTemporaryDirectory temporary;
+  const auto path = JournalPath(temporary);
+  std::optional<ComponentLifecycleStatusDTO> prepared_status;
+  {
+    SqliteCCLCJournal journal(path, CellId("cell.1"), 8U);
+    const RequestOwnerEpoch owner("owner.1");
+    ASSERT_TRUE(journal.BeginOwnerEpoch(owner, 1, 8U).ok());
+    const auto intent = Intent("request.1", owner, 3U);
+    const auto acceptance = Acceptance(intent, 1U, "transaction.1");
+    auto status = InitialStatus(intent, acceptance);
+    ASSERT_TRUE(journal.AcceptOrReplayLifecycle(owner, intent, acceptance, status).ok());
+    const auto primitive = PrimitiveIntent(status);
+    prepared_status = PreparedEffectStatus(status);
+    ASSERT_TRUE(
+        journal.RecordEffectPrepared(owner, PreparedPrimitiveEffect(primitive), *prepared_status)
+            .ok());
+    const auto result = PrimitiveSuccess(primitive);
+    status = CompletedEffectStatus(*prepared_status, result);
+    ASSERT_TRUE(
+        journal.RecordEffectCompleted(owner, CompletedPrimitiveEffect(primitive, result), status)
+            .ok());
+    journal.Close();
+  }
+
+  ASSERT_TRUE(prepared_status.has_value());
+  const auto prepared_blob = detail::EncodeComponentLifecycleStatus(*prepared_status);
+  sqlite3* database = nullptr;
+  ASSERT_EQ(sqlite3_open_v2(path.string().c_str(), &database, SQLITE_OPEN_READWRITE, nullptr),
+            SQLITE_OK);
+  sqlite3_stmt* statement = nullptr;
+  ASSERT_EQ(sqlite3_prepare_v2(database,
+                               "UPDATE lifecycle_transactions SET status_sequence=?,"
+                               "latest_updated_at_ns=?,status_blob=?",
+                               -1, &statement, nullptr),
+            SQLITE_OK);
+  ASSERT_EQ(sqlite3_bind_int64(statement, 1,
+                               static_cast<sqlite3_int64>(prepared_status->status_sequence)),
+            SQLITE_OK);
+  ASSERT_EQ(sqlite3_bind_int64(statement, 2, prepared_status->latest_updated_at_ns), SQLITE_OK);
+  ASSERT_EQ(sqlite3_bind_blob64(statement, 3, prepared_blob.data(), prepared_blob.size(),
+                                SQLITE_TRANSIENT),
+            SQLITE_OK);
+  ASSERT_EQ(sqlite3_step(statement), SQLITE_DONE);
+  ASSERT_EQ(sqlite3_finalize(statement), SQLITE_OK);
+  ASSERT_EQ(sqlite3_close(database), SQLITE_OK);
+
+  EXPECT_THROW((SqliteCCLCJournal(path, CellId("cell.1"), 8U)), std::runtime_error);
+}
+
+TEST(SqliteCCLCJournal, RejectsASymlinkedDatabaseAncestor) {
+  ScopedTemporaryDirectory temporary;
+  const auto real_parent = temporary.path() / "real" / "nested";
+  ASSERT_TRUE(std::filesystem::create_directories(real_parent));
+  const auto linked_parent = temporary.path() / "linked";
+  ASSERT_NO_THROW(
+      std::filesystem::create_directory_symlink(temporary.path() / "real", linked_parent));
+  EXPECT_THROW((SqliteCCLCJournal(linked_parent / "nested" / std::string(kCCLCJournalFilename),
+                                  CellId("cell.1"), 8U)),
+               std::runtime_error);
+}
+
+TEST(SqliteCCLCJournal, RejectsIncoherentOwnerAndResultCapacities) {
+  ScopedTemporaryDirectory temporary;
+  SqliteCCLCJournal journal(JournalPath(temporary), CellId("cell.1"), 8U);
+  const auto result = journal.BeginOwnerEpoch(RequestOwnerEpoch("owner.1"), 1, 7U);
+  ASSERT_FALSE(result.ok());
+  EXPECT_EQ(result.error().code, "component_lifecycle_journal_owner_epoch_invalid");
+}
+
+TEST(SqliteCCLCJournal, QuiescentRotationRetiresMembershipButKeepsEpochReuseGuard) {
+  ScopedTemporaryDirectory temporary;
+  const auto path = JournalPath(temporary);
+  const RequestOwnerEpoch first_owner("owner.1");
+  {
+    SqliteCCLCJournal journal(path, CellId("cell.1"), 8U);
+    ASSERT_TRUE(journal.BeginOwnerEpoch(first_owner, 1, 8U).ok());
+    const auto first = Intent("request.shared", first_owner, 3U);
+    const auto first_acceptance = Acceptance(first, 1U, "transaction.1");
+    auto first_status = InitialStatus(first, first_acceptance);
+    ASSERT_TRUE(
+        journal.AcceptOrReplayLifecycle(first_owner, first, first_acceptance, first_status).ok());
+    ASSERT_TRUE(journal.RecordLifecycleStatus(first_owner, TerminalSuccess(first_status, 2U)).ok());
+
+    const RequestOwnerEpoch second_owner("owner.2");
+    const auto recovery = journal.BeginOwnerEpoch(second_owner, 500, 8U);
+    ASSERT_TRUE(recovery.ok());
+    EXPECT_TRUE(recovery.value().interrupted_transactions.empty());
+    const auto second = Intent("request.shared", second_owner, 4U);
+    const auto reused_identity = Acceptance(second, 2U, "transaction.1");
+    const auto rejected = journal.AcceptOrReplayLifecycle(second_owner, second, reused_identity,
+                                                          InitialStatus(second, reused_identity));
+    ASSERT_FALSE(rejected.ok());
+    EXPECT_EQ(rejected.error().code, "component_lifecycle_journal_transaction_identity_reused");
+    const auto second_acceptance = Acceptance(second, 2U, "transaction.2");
+    ASSERT_TRUE(journal
+                    .AcceptOrReplayLifecycle(second_owner, second, second_acceptance,
+                                             InitialStatus(second, second_acceptance))
+                    .ok());
+    journal.Close();
+  }
+
+  sqlite3* database = nullptr;
+  ASSERT_EQ(sqlite3_open_v2(path.string().c_str(), &database, SQLITE_OPEN_READONLY, nullptr),
+            SQLITE_OK);
+  sqlite3_stmt* statement = nullptr;
+  ASSERT_EQ(sqlite3_prepare_v2(database,
+                               "SELECT (SELECT count(*) FROM cclc_request_memberships "
+                               "WHERE owner_epoch='owner.1'),"
+                               "(SELECT count(*) FROM cclc_owner_epochs "
+                               "WHERE owner_epoch='owner.1')",
+                               -1, &statement, nullptr),
+            SQLITE_OK);
+  ASSERT_EQ(sqlite3_step(statement), SQLITE_ROW);
+  EXPECT_EQ(sqlite3_column_int64(statement, 0), 0);
+  EXPECT_EQ(sqlite3_column_int64(statement, 1), 1);
+  EXPECT_EQ(sqlite3_step(statement), SQLITE_DONE);
+  ASSERT_EQ(sqlite3_finalize(statement), SQLITE_OK);
+  ASSERT_EQ(sqlite3_close(database), SQLITE_OK);
+
+  SqliteCCLCJournal reopened(path, CellId("cell.1"), 8U);
+  const auto reused = reopened.BeginOwnerEpoch(first_owner, 1'000, 8U);
+  ASSERT_FALSE(reused.ok());
+  EXPECT_EQ(reused.error().code, "component_lifecycle_journal_owner_epoch_reused");
+}
+
+TEST(SqliteCCLCJournal, BoundsTheDurableComponentWatermarkSet) {
+  ScopedTemporaryDirectory temporary;
+  SqliteCCLCJournal journal(JournalPath(temporary), CellId("cell.1"), 128U);
+  const RequestOwnerEpoch owner("owner.1");
+  ASSERT_TRUE(journal.BeginOwnerEpoch(owner, 1, 128U).ok());
+  for (std::size_t index = 0U; index < kMaximumCCLCComponentWatermarks; ++index) {
+    auto intent = Intent("request." + std::to_string(index + 1U), owner, 3U);
+    intent.controllable_component_id =
+        ControllableComponentId("component." + std::to_string(index + 1U));
+    const auto acceptance =
+        Acceptance(intent, index + 1U, "transaction." + std::to_string(index + 1U));
+    auto status = InitialStatus(intent, acceptance);
+    ASSERT_TRUE(journal.AcceptOrReplayLifecycle(owner, intent, acceptance, status).ok());
+    ASSERT_TRUE(journal.RecordLifecycleStatus(owner, TerminalSuccess(status, 2U)).ok());
+  }
+
+  auto overflow = Intent("request.overflow", owner, 3U);
+  overflow.controllable_component_id = ControllableComponentId("component.overflow");
+  const auto overflow_acceptance =
+      Acceptance(overflow, kMaximumCCLCComponentWatermarks + 1U, "transaction.overflow");
+  const auto result = journal.AcceptOrReplayLifecycle(owner, overflow, overflow_acceptance,
+                                                      InitialStatus(overflow, overflow_acceptance));
+  ASSERT_FALSE(result.ok());
+  EXPECT_EQ(result.error().code, "component_lifecycle_journal_capacity_exhausted");
+}
+
+TEST(SqliteCCLCJournal, NeverReusesOwnerEpochOrChangesJournalIdentity) {
+  ScopedTemporaryDirectory temporary;
+  const auto path = JournalPath(temporary);
+  const RequestOwnerEpoch owner("owner.1");
+  {
+    SqliteCCLCJournal journal(path, CellId("cell.1"), 8U);
+    ASSERT_TRUE(journal.BeginOwnerEpoch(owner, 1, 8U).ok());
+    const auto reused = journal.BeginOwnerEpoch(owner, 2, 8U);
+    ASSERT_FALSE(reused.ok());
+    EXPECT_EQ(reused.error().code, "component_lifecycle_journal_owner_epoch_reused");
+  }
+  EXPECT_THROW((SqliteCCLCJournal(path, CellId("other-cell"), 8U)), std::runtime_error);
+  EXPECT_THROW((SqliteCCLCJournal(path, CellId("cell.1"), 9U)), std::runtime_error);
+}
+
+}  // namespace
+}  // namespace manyforge::core

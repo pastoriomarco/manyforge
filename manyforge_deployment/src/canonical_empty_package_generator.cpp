@@ -112,6 +112,7 @@ compile_fixed_deployment(const RevisionVerifiedDeploymentArtifact &deployment) {
   const ApplicabilityQualifiedCellIr applicability = qualify_cell_applicability(
       composition, deployment.applicability_inputs(),
       std::span<const QualifiedRuntimeProfile>{},
+      std::span<const QualifiedRuntimePolicy>{},
       std::span<const QualifiedCommandSchema>{},
       std::span<const QualifiedCapabilityDefinition>{},
       std::span<const QualifiedControlInterfaceContract>{},

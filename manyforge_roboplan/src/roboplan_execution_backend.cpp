@@ -9,6 +9,8 @@
 #include <chrono>
 #include <cmath>
 #include <iostream>
+#include <limits>
+#include <map>
 #include <stdexcept>
 #include <string_view>
 #include <thread>
@@ -24,11 +26,17 @@ constexpr auto kTerminalSceneProjectionRetryDelay =
 double controlled_stop_wait_timeout_s(
     const core::MotionInterruptStopProfileDTO &profile,
     double stop_completion_tolerance_s) {
-  if (profile.max_stop_time_s.has_value()) {
-    return *profile.max_stop_time_s;
-  }
   return core::motion_interrupt_deceleration_time_or_default(profile) +
          std::max(0.0, stop_completion_tolerance_s);
+}
+
+core::InterruptStructuredValue
+structured_text_details(const std::map<std::string, std::string> &details) {
+  core::InterruptStructuredValue structured;
+  for (const auto &[key, value] : details) {
+    structured.emplace(key, core::interrupt_structured_string(value));
+  }
+  return structured;
 }
 
 double clamp_progress(double progress) {
@@ -46,6 +54,70 @@ void atomic_max(std::atomic<std::uint64_t> &target, std::uint64_t value) {
 template <typename Rep, typename Period>
 std::string seconds_string(std::chrono::duration<Rep, Period> duration) {
   return std::to_string(std::chrono::duration<double>(duration).count());
+}
+
+core::ParticipantStopStageResultDTO
+terminal_stop_stage_failure(const core::ResolvedParticipantStopStageDTO &stage,
+                            std::string reason, std::string message,
+                            std::int64_t elapsed_ns = 0) {
+  const core::ErrorDTO error{core::kErrorMotionInterruptBackendStopFailed,
+                             std::move(message),
+                             {{"reason", std::move(reason)}}};
+  core::ParticipantStopStageResultDTO result{
+      stage,
+      core::StopStageAttemptDispositionDTO::kNotDispatched,
+      core::ParticipantStopStageOutcomeDTO::kFailed,
+      std::nullopt,
+      std::nullopt,
+      std::nullopt,
+      std::nullopt,
+      std::nullopt,
+      std::nullopt,
+      std::max<std::int64_t>(0, elapsed_ns),
+      {},
+      error};
+  if (stage.stage_index < stage.participant_stop_plan.stage_commands.size()) {
+    const auto &requirements =
+        stage.participant_stop_plan.stage_commands[stage.stage_index]
+            .resolved_stage.evidence_requirements;
+    result.evidence_items.reserve(requirements.size());
+    for (const auto &requirement : requirements) {
+      result.evidence_items.push_back(core::StopEvidenceItemDTO{
+          requirement.requirement.evidence_item_id,
+          requirement.requirement.evidence_kind,
+          core::StopEvidenceItemStateDTO::kMissing, requirement.resolved_source,
+          std::nullopt, std::nullopt, std::nullopt, std::nullopt, error});
+    }
+  }
+  return result;
+}
+
+core::ParticipantStopStageResultDTO
+superseded_stop_stage(const core::ResolvedParticipantStopStageDTO &stage) {
+  const core::ErrorDTO error{"stop_stage_superseded_before_dispatch",
+                             "Stop stage was cancelled before dispatch",
+                             {}};
+  auto result = terminal_stop_stage_failure(
+      stage, "stop_stage_superseded_before_dispatch",
+      "Stop stage was cancelled before dispatch");
+  result.outcome = core::ParticipantStopStageOutcomeDTO::kSupersededNoEffect;
+  result.error = error;
+  for (auto &item : result.evidence_items) {
+    item.state = core::StopEvidenceItemStateDTO::kInapplicable;
+    item.error = error;
+  }
+  return result;
+}
+
+std::optional<std::int64_t>
+remaining_phase(const core::RemainingStopBudgetDTO &budget,
+                const core::StopBudgetPhaseId &phase_id) {
+  const auto found = std::find_if(
+      budget.phases.begin(), budget.phases.end(),
+      [&](const auto &phase) { return phase.phase_id == phase_id; });
+  return found == budget.phases.end()
+             ? std::nullopt
+             : std::optional(found->remaining_deadline_offset_ns);
 }
 
 } // namespace
@@ -400,12 +472,11 @@ void RoboPlanExecutionBackend::execution_worker(
   bool completed_normally = false;
 
   if (st.stop_requested()) {
-    observe_stop_qualification(
-        detail::NativeStopQualificationEvent::
-            kWorkerStopObservedBeforeTerminal);
-    const auto stopped_snapshot_ns = publish_snapshot(
-        core::ExecutionState::kStopped, get_execution_snapshot().progress,
-        latest_positions);
+    observe_stop_qualification(detail::NativeStopQualificationEvent::
+                                   kWorkerStopObservedBeforeTerminal);
+    const auto stopped_snapshot_ns =
+        publish_snapshot(core::ExecutionState::kStopped,
+                         get_execution_snapshot().progress, latest_positions);
     if (!update_scene_positions(latest_positions, SceneUpdateMode::kBestEffort,
                                 stopped_snapshot_ns)) {
       schedule_terminal_scene_projection_retry(latest_positions,
@@ -444,9 +515,8 @@ void RoboPlanExecutionBackend::execution_worker(
     const bool pause_requested = state_.pause_requested.load();
 
     if (st.stop_requested()) {
-      observe_stop_qualification(
-          detail::NativeStopQualificationEvent::
-              kWorkerStopObservedBeforeTerminal);
+      observe_stop_qualification(detail::NativeStopQualificationEvent::
+                                     kWorkerStopObservedBeforeTerminal);
       const auto stopped_snapshot_ns =
           publish_snapshot(core::ExecutionState::kStopped,
                            get_execution_snapshot().progress, latest_positions);
@@ -770,6 +840,235 @@ RoboPlanExecutionBackend::get_motion_interrupt_stop_capability() const {
   return cap;
 }
 
+core::ParticipantStopStageResultDTO
+RoboPlanExecutionBackend::TranslateStopStage(
+    const core::ResolvedParticipantStopStageDTO &stage,
+    const core::RemainingStopBudgetDTO &budget,
+    const std::stop_token cancellation) {
+  const auto started_at = clock_.now();
+  if (cancellation.stop_requested()) {
+    return superseded_stop_stage(stage);
+  }
+  if (stage.stage_index >= stage.participant_stop_plan.stage_commands.size() ||
+      budget.stop_id != stage.stop_id ||
+      budget.stop_generation != stage.stop_generation ||
+      budget.remaining_outer_duration_ns <= 0) {
+    return terminal_stop_stage_failure(
+        stage, "resolved_stop_stage_budget_invalid",
+        "native Stop stage has no valid remaining Kernel budget");
+  }
+  const auto &binding = binding_.value();
+  const auto &path = *binding.control_path;
+  std::vector<core::ResourceId> exact_resources;
+  exact_resources.reserve(binding.resources.size());
+  for (const auto &resource : binding.resources) {
+    exact_resources.push_back(resource.resource_id);
+  }
+  std::sort(exact_resources.begin(), exact_resources.end());
+  const auto &command =
+      stage.participant_stop_plan.stage_commands[stage.stage_index]
+          .resolved_stage;
+  const auto command_remaining =
+      remaining_phase(budget, command.containment_command.command_phase_id);
+  if (stage.resources != exact_resources ||
+      stage.control_domain_id != path.control_domain_id ||
+      stage.control_domain_revision != path.control_domain_revision ||
+      stage.control_binding_id != path.control_binding_id ||
+      stage.control_binding_revision != path.control_binding_revision ||
+      stage.control_route_id != path.control_route_id ||
+      stage.active_control_configuration_id !=
+          path.active_control_configuration_id ||
+      stage.active_control_configuration_generation !=
+          path.active_control_configuration_generation ||
+      command.command_target.provider_instance_id !=
+          path.provider_instance_id ||
+      command.command_target.provider_manifest_id !=
+          path.provider_manifest_id ||
+      command.command_target.provider_manifest_revision !=
+          path.provider_manifest_revision ||
+      command.command_target.runtime_unit_id != path.provider_runtime_unit_id ||
+      command.command_target.provider_runtime_epoch !=
+          path.provider_runtime_epoch ||
+      !command_remaining.has_value() || *command_remaining <= 0) {
+    return terminal_stop_stage_failure(stage,
+                                       "resolved_stop_stage_binding_mismatch",
+                                       "native Stop stage does not match this "
+                                       "exact retained execution binding",
+                                       clock_.now() - started_at);
+  }
+
+  // Until exact prepared Dispatch binds ControllerGoalId/generation to the
+  // active native execution, goal-cancel evidence cannot be attributed
+  // truthfully. Fail before effect instead of echoing the caller's goal.
+  if (command.containment_command.command_kind ==
+      core::StopContainmentCommandKind::kControllerGoalCancel) {
+    return terminal_stop_stage_failure(
+        stage, "controller_goal_dispatch_membership_unavailable",
+        "native execution has no exact goal-bound dispatch membership",
+        clock_.now() - started_at);
+  }
+  if (command.containment_command.command_kind !=
+          core::StopContainmentCommandKind::kRegistered ||
+      !command.containment_command.registered_command_kind_id.has_value() ||
+      command.containment_command.registered_command_kind_id->value() !=
+          "manyforge.stop.software_hard") {
+    return terminal_stop_stage_failure(stage,
+                                       "resolved_stop_command_not_supported",
+                                       "native exact Stop port supports only "
+                                       "its retained software-hard command",
+                                       clock_.now() - started_at);
+  }
+
+  if (cancellation.stop_requested()) {
+    return superseded_stop_stage(stage);
+  }
+  const auto stopped = stop();
+  if (!stopped.accepted) {
+    return terminal_stop_stage_failure(
+        stage, "software_hard_stop_not_dispatched",
+        stopped.error.has_value()
+            ? stopped.error->message
+            : "native software-hard Stop was not accepted",
+        clock_.now() - started_at);
+  }
+
+  core::ParticipantStopStageResultDTO result{
+      stage,
+      core::StopStageAttemptDispositionDTO::kDispatched,
+      core::ParticipantStopStageOutcomeDTO::kFailed,
+      std::nullopt,
+      std::nullopt,
+      std::nullopt,
+      std::nullopt,
+      std::nullopt,
+      std::nullopt,
+      0,
+      {},
+      std::nullopt};
+  const auto fail_after_dispatch = [&](std::string reason,
+                                       std::string message) {
+    result.receiver_elapsed_duration_ns =
+        std::max<std::int64_t>(0, clock_.now() - started_at);
+    result.error = core::ErrorDTO{core::kErrorMotionInterruptBackendStopFailed,
+                                  std::move(message),
+                                  {{"reason", std::move(reason)}}};
+    result.evidence_items.clear();
+    result.evidence_items.reserve(command.evidence_requirements.size());
+    for (const auto &requirement : command.evidence_requirements) {
+      result.evidence_items.push_back(core::StopEvidenceItemDTO{
+          requirement.requirement.evidence_item_id,
+          requirement.requirement.evidence_kind,
+          core::StopEvidenceItemStateDTO::kMissing, requirement.resolved_source,
+          std::nullopt, std::nullopt, std::nullopt, std::nullopt,
+          result.error});
+    }
+    return result;
+  };
+
+  const auto terminal_phase = std::min_element(
+      command.evidence_requirements.begin(),
+      command.evidence_requirements.end(),
+      [&](const auto &left, const auto &right) {
+        return remaining_phase(budget, left.requirement.phase_id).value_or(-1) <
+               remaining_phase(budget, right.requirement.phase_id).value_or(-1);
+      });
+  if (terminal_phase == command.evidence_requirements.end()) {
+    return fail_after_dispatch(
+        "stop_evidence_requirements_missing",
+        "native software-hard stage has no evidence contract");
+  }
+  const auto evidence_remaining =
+      remaining_phase(budget, terminal_phase->requirement.phase_id);
+  if (!evidence_remaining.has_value() || *evidence_remaining <= 0 ||
+      started_at >
+          std::numeric_limits<std::int64_t>::max() - *evidence_remaining) {
+    return fail_after_dispatch(
+        "stop_evidence_phase_expired",
+        "native software-hard evidence phase is already expired");
+  }
+  const auto evidence_deadline = started_at + *evidence_remaining;
+  while (state_.running.load(std::memory_order_acquire) &&
+         !cancellation.stop_requested() && clock_.now() < evidence_deadline) {
+    std::unique_lock lock(execution_mutex_);
+    execution_cv_.wait_for(
+        lock, std::chrono::nanoseconds(config_.execution_tick_period_ns));
+  }
+  if (cancellation.stop_requested()) {
+    return fail_after_dispatch(
+        "stop_stage_cancelled_after_dispatch",
+        "native software-hard evidence wait was superseded");
+  }
+  if (state_.running.load(std::memory_order_acquire)) {
+    return fail_after_dispatch(
+        "stop_evidence_phase_expired",
+        "native software-hard execution did not settle in budget");
+  }
+
+  const auto observed = state_channel_->current_state(clock_.now());
+  if (!observed.ok()) {
+    return fail_after_dispatch("stop_evidence_source_unavailable",
+                               observed.error().message);
+  }
+  const auto &snapshot = observed.value();
+  if (!snapshot.velocities.has_value() ||
+      snapshot.resources != stage.resources ||
+      snapshot.source_epoch != path.provider_runtime_epoch ||
+      snapshot.sequence == 0U ||
+      snapshot.received_timestamp_ns > clock_.now() ||
+      std::any_of(snapshot.velocities->begin(), snapshot.velocities->end(),
+                  [](const auto &value) {
+                    return std::visit(
+                        [](const auto &velocity) {
+                          if constexpr (requires { velocity.value_rad_s; }) {
+                            return std::abs(velocity.value_rad_s) > 0.0;
+                          } else {
+                            return std::abs(velocity.value_m_s) > 0.0;
+                          }
+                        },
+                        value);
+                  })) {
+    return fail_after_dispatch(
+        "stop_evidence_not_at_rest",
+        "native addressed state does not prove exact rest");
+  }
+
+  result.evidence_items.reserve(command.evidence_requirements.size());
+  for (const auto &requirement : command.evidence_requirements) {
+    if (requirement.requirement.evidence_kind !=
+            core::StopEvidenceRequirementKind::kMotionRest ||
+        requirement.resolved_source.source_kind !=
+            core::StopEvidenceSourceKind::kBindingStateAuthority ||
+        requirement.resolved_source.runtime_target.provider_runtime_epoch !=
+            snapshot.source_epoch ||
+        requirement.resolved_source.state_authority_id !=
+            std::optional(snapshot.state_authority_id) ||
+        requirement.resolved_source.state_authority_class !=
+            std::optional(snapshot.state_authority_class)) {
+      return fail_after_dispatch(
+          "stop_evidence_source_mismatch",
+          "native stage requires an unsupported evidence authority");
+    }
+    const auto age = std::max<std::int64_t>(
+        0, clock_.now() - snapshot.received_timestamp_ns);
+    if (age > requirement.requirement.source_requirement.freshness_budget_ns) {
+      return fail_after_dispatch("stop_evidence_source_stale",
+                                 "native addressed rest evidence is stale");
+    }
+    result.evidence_items.push_back(core::StopEvidenceItemDTO{
+        requirement.requirement.evidence_item_id,
+        requirement.requirement.evidence_kind,
+        core::StopEvidenceItemStateDTO::kSatisfied, requirement.resolved_source,
+        snapshot.source_epoch, snapshot.sequence, age, core::JsonValueDTO{true},
+        std::nullopt});
+  }
+  result.outcome = core::ParticipantStopStageOutcomeDTO::kSucceeded;
+  result.source_epoch = snapshot.source_epoch;
+  result.source_sequence = snapshot.sequence;
+  result.receiver_elapsed_duration_ns =
+      std::max<std::int64_t>(0, clock_.now() - started_at);
+  return result;
+}
+
 core::ControlledStopResultDTO RoboPlanExecutionBackend::execute_controlled_stop(
     const core::MotionInterruptStopProfileDTO &profile) {
   return execute_controlled_stop(profile, std::stop_token{});
@@ -787,12 +1086,11 @@ core::ControlledStopResultDTO RoboPlanExecutionBackend::execute_controlled_stop(
 core::ControlledStopResultDTO
 RoboPlanExecutionBackend::execute_controlled_stop_impl(
     const core::MotionInterruptStopProfileDTO &profile,
-    std::stop_token stop_token,
-    std::uint64_t hard_stop_request_generation) {
+    std::stop_token stop_token, std::uint64_t hard_stop_request_generation) {
   controlled_stop_activity_count_.fetch_add(1U, std::memory_order_acq_rel);
   begin_controlled_stop_runtime_scale_freeze();
-  const auto runtime_scale_freeze_scope = std::shared_ptr<void>(
-      nullptr, [this](void *) {
+  const auto runtime_scale_freeze_scope =
+      std::shared_ptr<void>(nullptr, [this](void *) {
         end_controlled_stop_runtime_scale_freeze();
         controlled_stop_activity_count_.fetch_sub(1U,
                                                   std::memory_order_acq_rel);
@@ -819,8 +1117,8 @@ RoboPlanExecutionBackend::execute_controlled_stop_impl(
     // synchronous replacement replay this caller is the command lane, so its
     // return is the actual cessation edge and may publish the terminal state.
     if (replay_lane_has_ceased) {
-      state_.natural_completion_stop_requested.store(
-          false, std::memory_order_release);
+      state_.natural_completion_stop_requested.store(false,
+                                                     std::memory_order_release);
       const auto latest = get_execution_snapshot();
       const auto stopped_snapshot_ns =
           publish_snapshot(core::ExecutionState::kStopped, latest.progress,
@@ -946,16 +1244,19 @@ RoboPlanExecutionBackend::execute_controlled_stop_impl(
         const auto call_end_ns = clock_.now();
         result.confirmation_latency_ns =
             std::max<std::int64_t>(0, call_end_ns - call_start_ns);
-        result.diagnostics = planned.error().details;
+        result.diagnostics = structured_text_details(planned.error().details);
         result.diagnostics["command_source"] =
-            "native_simulated_natural_completion";
-        result.diagnostics["soft_on_path_phase"] = "4.5G_natural_completion";
-        result.diagnostics["requested_stop_mode"] = "soft_on_path";
-        result.diagnostics["wait_s"] = std::to_string(wait_deadline_s);
-        if (!profile.max_stop_time_s.has_value()) {
-          result.diagnostics["wait_s_default_source"] =
-              "deceleration_time_s_plus_soft_on_path_sample_period_s";
-        }
+            core::interrupt_structured_string(
+                "native_simulated_natural_completion");
+        result.diagnostics["soft_on_path_phase"] =
+            core::interrupt_structured_string("4.5G_natural_completion");
+        result.diagnostics["requested_stop_mode"] =
+            core::interrupt_structured_string("soft_on_path");
+        result.diagnostics["wait_s"] =
+            core::interrupt_structured_number(wait_deadline_s);
+        result.diagnostics["wait_s_default_source"] =
+            core::interrupt_structured_string(
+                "deceleration_time_s_plus_soft_on_path_sample_period_s");
         result.stop_command_source =
             core::MotionInterruptStopCommandSource::kDiagnosticOther;
         if (!completed || get_execution_snapshot().state !=
@@ -991,11 +1292,8 @@ RoboPlanExecutionBackend::execute_controlled_stop_impl(
         result.error = planned.error();
         return result;
       }
-      const bool may_fallback =
-          std::find(profile.allowed_fallback_modes.begin(),
-                    profile.allowed_fallback_modes.end(),
-                    core::MotionInterruptStopMode::kSpringBackHold) !=
-          profile.allowed_fallback_modes.end();
+      const bool may_fallback = profile.recoverable_substitution_mode ==
+                                core::MotionInterruptStopMode::kSpringBackHold;
       const auto recommended_fallback_it =
           planned.error().details.find("recommended_fallback");
       const bool planner_recommends_spring_back =
@@ -1005,6 +1303,8 @@ RoboPlanExecutionBackend::execute_controlled_stop_impl(
         core::MotionInterruptStopProfileDTO fallback_profile = profile;
         fallback_profile.stop_mode =
             core::MotionInterruptStopMode::kSpringBackHold;
+        fallback_profile.allow_natural_completion_on_short_path = false;
+        fallback_profile.recoverable_substitution_mode.reset();
         observe_stop_qualification(
             detail::NativeStopQualificationEvent::kSubstitutionSelected,
             planned.error().details.count("reason") > 0
@@ -1017,10 +1317,12 @@ RoboPlanExecutionBackend::execute_controlled_stop_impl(
         fallback.fallback_reason = planned.error().details.count("reason") > 0
                                        ? planned.error().details.at("reason")
                                        : "soft_on_path_planner_rejected";
-        fallback.diagnostics["requested_stop_mode"] = "soft_on_path";
-        fallback.diagnostics["fallback_reason"] = *fallback.fallback_reason;
+        fallback.diagnostics["requested_stop_mode"] =
+            core::interrupt_structured_string("soft_on_path");
+        fallback.diagnostics["fallback_reason"] =
+            core::interrupt_structured_string(*fallback.fallback_reason);
         fallback.diagnostics["soft_on_path_planner_error"] =
-            planned.error().message;
+            core::interrupt_structured_string(planned.error().message);
         return fallback;
       }
       result.accepted = false;
@@ -1167,12 +1469,16 @@ RoboPlanExecutionBackend::execute_controlled_stop_impl(
       result.stop_distance_rad = std::sqrt(sum);
     }
     result.diagnostics = planned.value().diagnostics;
-    result.diagnostics["command_source"] = "native_simulated_path_ramp";
-    result.diagnostics["runtime_scale_isolated"] = "true";
+    result.diagnostics["command_source"] =
+        core::interrupt_structured_string("native_simulated_path_ramp");
+    result.diagnostics["runtime_scale_isolated"] =
+        core::interrupt_structured_bool(true);
     result.diagnostics["runtime_scale_isolation"] =
-        "owned_scale_frozen_during_stop";
-    result.diagnostics["timeline_authority_tier"] = "owned_scale_asserted";
-    result.diagnostics["soft_on_path_phase"] = "4.5G_native";
+        core::interrupt_structured_string("owned_scale_frozen_during_stop");
+    result.diagnostics["timeline_authority_tier"] =
+        core::interrupt_structured_string("owned_scale_asserted");
+    result.diagnostics["soft_on_path_phase"] =
+        core::interrupt_structured_string("4.5G_native");
     return result;
   }
 
@@ -1225,8 +1531,9 @@ RoboPlanExecutionBackend::execute_controlled_stop_impl(
         core::MotionInterruptStopCommandSource::kNativeSimulatedStop;
     result.confirmation_latency_ns = 0;
     result.diagnostics["runtime_scale_isolation"] =
-        "owned_scale_frozen_during_stop";
-    result.diagnostics["timeline_authority_tier"] = "owned_scale_asserted";
+        core::interrupt_structured_string("owned_scale_frozen_during_stop");
+    result.diagnostics["timeline_authority_tier"] =
+        core::interrupt_structured_string("owned_scale_asserted");
     return result;
   }
 
@@ -1424,11 +1731,12 @@ RoboPlanExecutionBackend::execute_controlled_stop_impl(
     result.stop_distance_rad = std::sqrt(sum);
   }
   result.diagnostics = planned.value().diagnostics;
-  result.diagnostics["command_source"] =
-      "native_simulated_spring_back_path_ramp";
+  result.diagnostics["command_source"] = core::interrupt_structured_string(
+      "native_simulated_spring_back_path_ramp");
   result.diagnostics["runtime_scale_isolation"] =
-      "owned_scale_frozen_during_stop";
-  result.diagnostics["timeline_authority_tier"] = "owned_scale_asserted";
+      core::interrupt_structured_string("owned_scale_frozen_during_stop");
+  result.diagnostics["timeline_authority_tier"] =
+      core::interrupt_structured_string("owned_scale_asserted");
   return result;
 }
 

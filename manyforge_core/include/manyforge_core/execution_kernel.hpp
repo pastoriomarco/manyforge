@@ -200,9 +200,9 @@ struct ExecutionKernelConfig {
   // should raise this and pair with an audit archive subscriber.
   std::size_t motion_execution_outcome_retention = 256;
 
-  // Deployment stop-confirmation tolerance. When a controlled-stop profile
-  // leaves `max_stop_time_s` unset, the effective stop deadline is the
-  // requested/default deceleration time plus this tolerance.
+  // Transitional deployment stop-confirmation tolerance. Until the complete
+  // retained participant Stop plan supplies the one outer deadline, the
+  // effective envelope is requested/default deceleration plus this tolerance.
   Duration complete_move_on_signal_timeout_ns = 500'000'000;  // 500 ms
 
   // Deployment-default fault-stop profile. Used by

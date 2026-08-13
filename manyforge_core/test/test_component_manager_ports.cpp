@@ -305,6 +305,7 @@ static_assert(!ExposesGenericStop<IManagerKernelApplyFencePort>);
       },
       {},
       {},
+      {},
       RetainedCompiledProductsDTO{
           RetainedProductDTO{
               ProductId{"planning-collision-model"},

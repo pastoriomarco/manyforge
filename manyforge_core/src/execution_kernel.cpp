@@ -38,6 +38,23 @@ ErrorDTO stale_control_command_error() {
                   {{"reason_code", "stale_control_command"}}};
 }
 
+void fail_closed_invalid_controlled_stop_result(
+    const MotionInterruptStopProfileDTO &profile,
+    ControlledStopResultDTO &result) {
+  const auto validation = controlled_stop_result_field_error(profile, result);
+  if (!validation.has_value()) {
+    return;
+  }
+  result.accepted = false;
+  result.backend_stop_confirmed = false;
+  result.completed_by_natural_completion = false;
+  result.error = ErrorDTO{
+      std::string(kErrorMotionInterruptBackendStopFailed),
+      "Execution backend returned an invalid controlled-stop result",
+      {{"reason", "controlled_stop_result_invalid"},
+       {"validation_reason", *validation}}};
+}
+
 // Per-attempt state: keeps terminal acknowledgement behind the complete
 // normal-completion event/outcome batch without holding a lock across event
 // subscriber callbacks.
@@ -1321,6 +1338,7 @@ void ExecutionKernel::run_operator_stop_worker(
           : stop_wall_start;
   auto controlled_result = execution_backend_.execute_controlled_stop(
       profile, controlled_stop_source->get_token());
+  fail_closed_invalid_controlled_stop_result(profile, controlled_result);
   stop_session_complete->store(true, std::memory_order_release);
   if (stop_deadline_handle != 0) {
     scheduler_.cancel(stop_deadline_handle);
@@ -1342,8 +1360,7 @@ void ExecutionKernel::run_operator_stop_worker(
   std::map<std::string, std::string> settle_details;
 
   if (controlled_ok && !stop_path_collision_details.has_value()) {
-    const double threshold = profile.settle_velocity_threshold_rad_s.value_or(
-        kDefaultSettleVelocityThresholdRadS);
+    const double threshold = kDefaultSettleVelocityThresholdRadS;
     const auto settle_result = wait_for_measured_rest_after_confirmed_stop(
         execution_backend_, threshold, stop_wall_deadline, stop_token,
         [this]() {
@@ -1460,7 +1477,8 @@ void ExecutionKernel::run_operator_stop_worker(
       if (diag_key.rfind("soft_on_path", 0) == 0 ||
           diag_key.rfind("fallback", 0) == 0 ||
           diag_key.rfind("hard_stop", 0) == 0) {
-        escalation_details[diag_key] = diag_value;
+        escalation_details[diag_key] =
+            interrupt_structured_scalar_text(diag_value);
       }
     }
     emit_event({KernelEventType::kErrorRaised,
@@ -1639,7 +1657,8 @@ void ExecutionKernel::run_operator_stop_worker(
       if (diag_key.rfind("soft_on_path", 0) == 0 ||
           diag_key.rfind("fallback", 0) == 0 ||
           diag_key.rfind("hard_stop", 0) == 0) {
-        total_failure.details[diag_key] = diag_value;
+        total_failure.details[diag_key] =
+            interrupt_structured_scalar_text(diag_value);
       }
     }
     if (fallback_legacy_result && fallback_legacy_result->error.has_value()) {
@@ -2420,8 +2439,10 @@ ExecutionKernel::publish_runtime_collision_fault_interrupt(
   signal.timestamp_ns = clock_.now();
   signal.freshness_ns = 0;
   signal.value = true;
-  signal.metadata["surface"] = "observed_runtime_monitor";
-  signal.metadata["in_collision"] = check.in_collision ? "true" : "false";
+  signal.metadata["surface"] =
+      interrupt_structured_string("observed_runtime_monitor");
+  signal.metadata["in_collision"] =
+      interrupt_structured_bool(check.in_collision);
   if (check.contact_body_a) {
     signal.metadata["contact_a"] = *check.contact_body_a;
   }
@@ -2642,6 +2663,8 @@ void ExecutionKernel::apply_latched_interrupt_preemption(
     }
     controlled_stop = execution_backend_.execute_controlled_stop(
         *fault_stop_profile, fault_stop_source->get_token());
+    fail_closed_invalid_controlled_stop_result(*fault_stop_profile,
+                                               *controlled_stop);
     stop_session_complete->store(true, std::memory_order_release);
     if (stop_deadline_handle != 0) {
       scheduler_.cancel(stop_deadline_handle);
@@ -2933,7 +2956,7 @@ void ExecutionKernel::emit_interrupt_events(
                 {},
                 {},
                 std::nullopt,
-                event.details});
+                project_interrupt_structured_value_to_text(event.details)});
   }
 }
 
@@ -2951,7 +2974,7 @@ void ExecutionKernel::emit_interrupt_manager_events(
                 {},
                 {},
                 std::nullopt,
-                event.details});
+                project_interrupt_structured_value_to_text(event.details)});
   }
 }
 
@@ -2996,10 +3019,9 @@ Result<void> ExecutionKernel::arm_motion_scopes_for_dispatch(
   // pre-dispatch backend-capability check. The InterruptManager
   // validates policy-level constraints (allowed_stop_modes,
   // node-category fallback rules, stop_profile presence). The
-  // backend's controlled-stop capability is the second independent
-  // gate: every requested stop_mode and every element of
-  // allowed_fallback_modes MUST also be in the backend's
-  // supported_stop_modes set. Trip-time validation catches
+  // backend's controlled-stop capability is the second independent gate: the
+  // requested stop_mode and sole qualified recoverable substitution MUST be
+  // in the backend's supported_stop_modes set. Trip-time validation catches
   // live-controller divergence; this gate stops the request
   // before arming if the backend has not declared support.
   const auto capability =
@@ -3025,24 +3047,25 @@ Result<void> ExecutionKernel::arm_motion_scopes_for_dispatch(
                       "supported_stop_modes",
                       std::move(details)};
     }
-    for (const auto &fallback : profile.allowed_fallback_modes) {
-      if (!capability.supported_stop_modes.contains(fallback)) {
-        std::map<std::string, std::string> details{
-            {"reason", "fallback_mode_not_supported_by_backend"},
-            {"profile_slot", profile_slot},
-            {"requested_stop_mode", stop_mode_string(profile.stop_mode)},
-            {"fallback_stop_mode", stop_mode_string(fallback)}};
-        if (!scope_id.empty()) {
-          details["scope_id"] = scope_id;
-        }
-        if (!policy_id.empty()) {
-          details["policy_id"] = policy_id;
-        }
-        return ErrorDTO{kErrorMotionInterruptArmFailed,
-                        "configured stop_profile fallback is not in backend "
-                        "supported_stop_modes",
-                        std::move(details)};
+    if (profile.recoverable_substitution_mode.has_value() &&
+        !capability.supported_stop_modes.contains(
+            *profile.recoverable_substitution_mode)) {
+      std::map<std::string, std::string> details{
+          {"reason", "substitution_mode_not_supported_by_backend"},
+          {"profile_slot", profile_slot},
+          {"requested_stop_mode", stop_mode_string(profile.stop_mode)},
+          {"substitution_stop_mode",
+           stop_mode_string(*profile.recoverable_substitution_mode)}};
+      if (!scope_id.empty()) {
+        details["scope_id"] = scope_id;
       }
+      if (!policy_id.empty()) {
+        details["policy_id"] = policy_id;
+      }
+      return ErrorDTO{kErrorMotionInterruptArmFailed,
+                      "configured stop_profile substitution is not in backend "
+                      "supported_stop_modes",
+                      std::move(details)};
     }
     return std::nullopt;
   };
@@ -3384,9 +3407,9 @@ void ExecutionKernel::handle_motion_trip_latch(
 
   // Issue the controlled stop. The backend performs the stop and
   // reports what it actually did. Timing is captured around the call
-  // so the kernel can validate against the effective stop deadline:
-  // explicit `max_stop_time_s`, or `deceleration_time_s` (defaulted)
-  // plus the deployment stop-confirmation tolerance when unset. Embed
+  // so the kernel can validate against the effective Kernel Stop envelope.
+  // This transitional path derives it from `deceleration_time_s` (defaulted)
+  // plus the deployment stop-confirmation tolerance. Embed
   // latch->call and call->confirm latencies in the trip outcome.
   // Keep the runtime collision monitor running over the decelerating robot for
   // the duration of the stop. A collision on the stop path signals the trip
@@ -3482,6 +3505,7 @@ void ExecutionKernel::handle_motion_trip_latch(
           : stop_wall_start;
   auto stop_result = execution_backend_.execute_controlled_stop(
       profile, trip_stop_source.get_token());
+  fail_closed_invalid_controlled_stop_result(profile, stop_result);
   const auto call_end_ns = clock_.now();
   stop_session_complete->store(true, std::memory_order_release);
   const bool deadline_watchdog_expired =
@@ -3609,7 +3633,7 @@ void ExecutionKernel::handle_motion_trip_latch(
     for (const auto &[k, v] : stop_result.diagnostics) {
       if (k.rfind("soft_on_path", 0) == 0 || k.rfind("fallback", 0) == 0 ||
           k.rfind("hard_stop", 0) == 0) {
-        details[k] = v;
+        details[k] = interrupt_structured_scalar_text(v);
       }
     }
     return details;
@@ -3691,7 +3715,7 @@ void ExecutionKernel::handle_motion_trip_latch(
     }
     if (effective_deadline_ns > 0 &&
         stop_result.confirmation_latency_ns > effective_deadline_ns) {
-      downgrade_to_intervention("natural_completion_exceeded_max_stop_time_s",
+      downgrade_to_intervention("natural_completion_exceeded_stop_deadline",
                                 "soft_on_path natural completion exceeded the "
                                 "effective stop deadline");
       return;
@@ -3743,6 +3767,13 @@ void ExecutionKernel::handle_motion_trip_latch(
     auto floor_evidence =
         emergency_stop_floor("scoped_trip_controlled_stop_refused",
                              "motion_trip_controlled_stop_refused");
+    if (stop_result.error) {
+      const auto validation =
+          stop_result.error->details.find("validation_reason");
+      if (validation != stop_result.error->details.end()) {
+        floor_evidence["validation_reason"] = validation->second;
+      }
+    }
     downgrade_to_intervention(
         std::move(reason), std::move(msg),
         std::string(kErrorMotionInterruptBackendStopFailed),
@@ -3754,7 +3785,7 @@ void ExecutionKernel::handle_motion_trip_latch(
   //     emergency hard-stop floor before downgrading.
   if (!stop_result.backend_stop_confirmed) {
     // In-stop completion timeout: the controlled stop did not reach confirmed
-    // rest within max_stop_time_s. First-class escalation to the hard-stop
+    // rest within the Kernel Stop envelope. First-class escalation to the hard-stop
     // floor (the robot may still be moving), then intervention.
     auto floor_evidence =
         emergency_stop_floor("in_stop_completion_timeout",
@@ -3770,13 +3801,12 @@ void ExecutionKernel::handle_motion_trip_latch(
   if (effective_deadline_ns > 0 &&
       stop_result.confirmation_latency_ns > effective_deadline_ns) {
     downgrade_to_intervention(
-        "backend_stop_confirmation_exceeded_max_stop_time_s",
+        "backend_stop_confirmation_exceeded_stop_deadline",
         "controlled-stop confirmation exceeded the effective stop deadline");
     return;
   }
   const double settle_velocity_threshold_rad_s =
-      profile.settle_velocity_threshold_rad_s.value_or(
-          kDefaultSettleVelocityThresholdRadS);
+      kDefaultSettleVelocityThresholdRadS;
   const auto settle_result = wait_for_measured_rest_after_confirmed_stop(
       execution_backend_, settle_velocity_threshold_rad_s, stop_wall_deadline,
       trip_stop_source.get_token());
@@ -3842,14 +3872,14 @@ void ExecutionKernel::handle_motion_trip_latch(
           "deceleration (operator intervention required)");
       return;
     }
-    const auto &allowed = profile.allowed_fallback_modes;
     const bool fallback_allowed =
-        std::find(allowed.begin(), allowed.end(),
-                  stop_result.executed_stop_mode) != allowed.end();
+        profile.recoverable_substitution_mode.has_value() &&
+        *profile.recoverable_substitution_mode ==
+            stop_result.executed_stop_mode;
     if (!fallback_allowed) {
-      downgrade_to_intervention("executed_mode_not_in_allowed_fallback_modes",
+      downgrade_to_intervention("executed_mode_not_authorized_substitution",
                                 "backend executed a stop_mode not in "
-                                "stop_profile.allowed_fallback_modes");
+                                "stop_profile.recoverable_substitution_mode");
       return;
     }
     if (node_category == MotionInterruptNodeCategory::kPrecisionContact) {

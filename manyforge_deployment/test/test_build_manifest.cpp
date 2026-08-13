@@ -460,7 +460,7 @@ make_test_stop_evidence_candidate(std::string_view build_variant,
       deployment.applicability_inputs().value().external_resources, nullptr);
   const auto applicability = qualify_cell_applicability(
       composition, deployment.applicability_inputs(), {}, {}, {}, {}, {},
-      {}, {}, {}, {}, selected_overlay);
+      {}, {}, {}, {}, {}, selected_overlay);
   return qualify_deployment_for_retention(
       deployment, compile_cell_ir(applicability));
 }

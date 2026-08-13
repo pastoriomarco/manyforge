@@ -1774,3 +1774,249 @@ class HistorianReconcileRequest(CallerAttributionRequest):
         int,
         Field(ge=1, le=9_007_199_254_740_991),
     ]
+
+
+class CCLCExpectedActiveConfigurationRequest(StrictRequest):
+    presence: Literal["absent", "present"]
+    active_control_configuration_id: str | None = None
+    active_control_configuration_generation: Annotated[
+        int | None, Field(ge=1, le=9_007_199_254_740_991)
+    ] = None
+
+    @field_validator("active_control_configuration_id")
+    @classmethod
+    def validate_identifier(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        return _bounded_nfc(
+            value,
+            label="active_control_configuration_id",
+            maximum_bytes=128,
+        )
+
+    @model_validator(mode="after")
+    def validate_presence(self) -> "CCLCExpectedActiveConfigurationRequest":
+        present = self.active_control_configuration_id is not None
+        if present != (self.active_control_configuration_generation is not None):
+            raise ValueError(
+                "active control configuration identity and generation must be paired"
+            )
+        if present != (self.presence == "present"):
+            raise ValueError(
+                "active control configuration fields do not match presence"
+            )
+        return self
+
+
+class CCLCControlBindingRequest(StrictRequest):
+    control_binding_id: str
+    control_binding_revision: str
+    control_route_id: str
+
+    @field_validator(
+        "control_binding_id", "control_binding_revision", "control_route_id"
+    )
+    @classmethod
+    def validate_identity(cls, value: str, info) -> str:
+        return _bounded_nfc(
+            value,
+            label=info.field_name,
+            maximum_bytes=128,
+        )
+
+
+class CCLCExpectedControlDomainRequest(StrictRequest):
+    control_domain_id: str
+    control_domain_revision: str
+    controller_topology_id: str
+    topology_revision: str
+    expected_active_control_configuration: CCLCExpectedActiveConfigurationRequest
+    expected_control_bindings: Annotated[
+        list[CCLCControlBindingRequest], Field(min_length=1, max_length=4_096)
+    ]
+
+    @field_validator(
+        "control_domain_id",
+        "control_domain_revision",
+        "controller_topology_id",
+        "topology_revision",
+    )
+    @classmethod
+    def validate_identity(cls, value: str, info) -> str:
+        return _bounded_nfc(
+            value,
+            label=info.field_name,
+            maximum_bytes=128,
+        )
+
+    @model_validator(mode="after")
+    def validate_binding_order(self) -> "CCLCExpectedControlDomainRequest":
+        identifiers = [item.control_binding_id for item in self.expected_control_bindings]
+        if identifiers != sorted(identifiers) or len(identifiers) != len(
+            set(identifiers)
+        ):
+            raise ValueError(
+                "expected_control_bindings must be strictly ordered by binding ID"
+            )
+        return self
+
+
+class ComponentLifecycleRequest(StrictRequest):
+    request_context: CallerAttributionRequest
+    controllable_component_id: str
+    intent: Literal["prepare", "enable", "disable", "recover"]
+    expected_graph_revision: str
+    expected_component_lifecycle_generation: Annotated[
+        int, Field(ge=1, le=9_007_199_254_740_991)
+    ]
+    expected_control_domains: Annotated[
+        list[CCLCExpectedControlDomainRequest],
+        Field(min_length=1, max_length=256),
+    ]
+    reason: str | None = None
+    confirmed: bool
+
+    @field_validator("controllable_component_id", "expected_graph_revision")
+    @classmethod
+    def validate_identity(cls, value: str, info) -> str:
+        return _bounded_nfc(
+            value,
+            label=info.field_name,
+            maximum_bytes=128,
+        )
+
+    @field_validator("reason")
+    @classmethod
+    def validate_reason(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        return _bounded_nfc(value, label="reason", maximum_bytes=1_024)
+
+    @model_validator(mode="after")
+    def validate_domain_order(self) -> "ComponentLifecycleRequest":
+        identifiers = [item.control_domain_id for item in self.expected_control_domains]
+        if identifiers != sorted(identifiers) or len(identifiers) != len(
+            set(identifiers)
+        ):
+            raise ValueError(
+                "expected_control_domains must be strictly ordered by domain ID"
+            )
+        if (
+            sum(len(item.expected_control_bindings) for item in self.expected_control_domains)
+            > 4_096
+        ):
+            raise ValueError("expected control bindings exceed the aggregate bound")
+        return self
+
+
+class CCLCDesiredControlBindingRequest(StrictRequest):
+    control_binding_id: str
+    control_binding_revision: str
+    control_route_id: str
+
+    @field_validator(
+        "control_binding_id", "control_binding_revision", "control_route_id"
+    )
+    @classmethod
+    def validate_identity(cls, value: str, info) -> str:
+        return _bounded_nfc(
+            value,
+            label=info.field_name,
+            maximum_bytes=256,
+        )
+
+
+class CCLCDesiredControlConfigurationRequest(StrictRequest):
+    control_domain_id: str
+    control_domain_revision: str
+    controller_topology_id: str
+    topology_revision: str
+    activation_set_id: str
+    binding_routes: Annotated[
+        list[CCLCDesiredControlBindingRequest],
+        Field(min_length=1, max_length=4_096),
+    ]
+
+    @field_validator(
+        "control_domain_id",
+        "control_domain_revision",
+        "controller_topology_id",
+        "topology_revision",
+        "activation_set_id",
+    )
+    @classmethod
+    def validate_identity(cls, value: str, info) -> str:
+        return _bounded_nfc(
+            value,
+            label=info.field_name,
+            maximum_bytes=256,
+        )
+
+    @model_validator(mode="after")
+    def validate_binding_order(self) -> "CCLCDesiredControlConfigurationRequest":
+        keys = [
+            (
+                item.control_binding_id,
+                item.control_binding_revision,
+                item.control_route_id,
+            )
+            for item in self.binding_routes
+        ]
+        binding_ids = [item.control_binding_id for item in self.binding_routes]
+        if keys != sorted(keys) or len(binding_ids) != len(set(binding_ids)):
+            raise ValueError(
+                "binding_routes must be canonical with unique binding IDs"
+            )
+        return self
+
+
+class CCLCRouteComponentExpectationRequest(StrictRequest):
+    controllable_component_id: str
+    expected_component_lifecycle_generation: Annotated[
+        int, Field(ge=1, le=9_007_199_254_740_991)
+    ]
+    expected_component_lifecycle_state: Literal["prepared", "active"]
+
+    @field_validator("controllable_component_id")
+    @classmethod
+    def validate_component_id(cls, value: str) -> str:
+        return _bounded_nfc(
+            value,
+            label="controllable_component_id",
+            maximum_bytes=256,
+        )
+
+
+class RouteSelectionRequest(StrictRequest):
+    request_context: CallerAttributionRequest
+    expected_retained_bundle_id: str
+    expected_graph_revision: str
+    desired_configuration: CCLCDesiredControlConfigurationRequest
+    expected_active_control_configuration: CCLCExpectedActiveConfigurationRequest
+    component_expectations: Annotated[
+        list[CCLCRouteComponentExpectationRequest],
+        Field(min_length=1, max_length=4_096),
+    ]
+    confirmed: bool
+
+    @field_validator("expected_retained_bundle_id", "expected_graph_revision")
+    @classmethod
+    def validate_identity(cls, value: str, info) -> str:
+        return _bounded_nfc(
+            value,
+            label=info.field_name,
+            maximum_bytes=256,
+        )
+
+    @model_validator(mode="after")
+    def validate_component_order(self) -> "RouteSelectionRequest":
+        identifiers = [
+            item.controllable_component_id for item in self.component_expectations
+        ]
+        if identifiers != sorted(identifiers) or len(identifiers) != len(
+            set(identifiers)
+        ):
+            raise ValueError(
+                "component_expectations must be strictly ordered by component ID"
+            )
+        return self

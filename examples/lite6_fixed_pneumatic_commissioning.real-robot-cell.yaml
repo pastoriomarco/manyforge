@@ -5,7 +5,6 @@ adapter:
   config:
     robot_instance_id: lite6-a
     transport_owner_id: lite6-a:sole-owner
-    authority_profile: local_operator
     robot_address_source_env: MANYFORGE_LITE6_ROBOT_IP
     xarm_package_root: /opt/manyforge/xarm/install/share
 scenario:

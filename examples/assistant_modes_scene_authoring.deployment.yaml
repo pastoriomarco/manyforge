@@ -1123,7 +1123,7 @@
         "record_kind": "provider_manifest",
         "record_revision": "sha256:62f7c3239954e34cc9ea7ded4bdd87f68d99525e77f3603e0f439d0c2a12a027",
         "schema_id": "manyforge.provider_manifest.v1",
-        "schema_revision": "sha256:700b1978d531041e68d0dfb922f77352353daf0c473ffb13be8f1b791962eab3"
+        "schema_revision": "sha256:b242431032bf183f81718ae1b7b8501ee5f705e52d455732e0052215565bf4cc"
       },
       {
         "content_addressed_store_key": "catalog/maintained/provider_manifest/manyforge.provider.logical_scene/352903171f0341c0f5c018fd2a363eb7b3a69ecdb3180dbc41772ad86908ec60",
@@ -1132,7 +1132,7 @@
         "record_kind": "provider_manifest",
         "record_revision": "sha256:352903171f0341c0f5c018fd2a363eb7b3a69ecdb3180dbc41772ad86908ec60",
         "schema_id": "manyforge.provider_manifest.v1",
-        "schema_revision": "sha256:700b1978d531041e68d0dfb922f77352353daf0c473ffb13be8f1b791962eab3"
+        "schema_revision": "sha256:b242431032bf183f81718ae1b7b8501ee5f705e52d455732e0052215565bf4cc"
       },
       {
         "content_addressed_store_key": "catalog/maintained/provider_manifest/manyforge.provider.model_endpoint/77a7fcfc389eb55a271b30f99013ee4ad8a01e1e713a54944a28b939e88a99d2",
@@ -1141,7 +1141,7 @@
         "record_kind": "provider_manifest",
         "record_revision": "sha256:77a7fcfc389eb55a271b30f99013ee4ad8a01e1e713a54944a28b939e88a99d2",
         "schema_id": "manyforge.provider_manifest.v1",
-        "schema_revision": "sha256:700b1978d531041e68d0dfb922f77352353daf0c473ffb13be8f1b791962eab3"
+        "schema_revision": "sha256:b242431032bf183f81718ae1b7b8501ee5f705e52d455732e0052215565bf4cc"
       },
       {
         "content_addressed_store_key": "catalog/maintained/provider_manifest/manyforge.provider.native_control/d1c03f762af34a90ac3d3d5071432c9a4a27ee26dc2a9e7b06c422089c49018d",
@@ -1150,7 +1150,7 @@
         "record_kind": "provider_manifest",
         "record_revision": "sha256:d1c03f762af34a90ac3d3d5071432c9a4a27ee26dc2a9e7b06c422089c49018d",
         "schema_id": "manyforge.provider_manifest.v1",
-        "schema_revision": "sha256:700b1978d531041e68d0dfb922f77352353daf0c473ffb13be8f1b791962eab3"
+        "schema_revision": "sha256:b242431032bf183f81718ae1b7b8501ee5f705e52d455732e0052215565bf4cc"
       },
       {
         "content_addressed_store_key": "catalog/maintained/provider_manifest/manyforge.provider.native_planning/89d1a1c0bedbb9db33d2eb43d62f767115b0e16011e4bb8682b04812a52788c6",
@@ -1159,7 +1159,7 @@
         "record_kind": "provider_manifest",
         "record_revision": "sha256:89d1a1c0bedbb9db33d2eb43d62f767115b0e16011e4bb8682b04812a52788c6",
         "schema_id": "manyforge.provider_manifest.v1",
-        "schema_revision": "sha256:700b1978d531041e68d0dfb922f77352353daf0c473ffb13be8f1b791962eab3"
+        "schema_revision": "sha256:b242431032bf183f81718ae1b7b8501ee5f705e52d455732e0052215565bf4cc"
       },
       {
         "content_addressed_store_key": "catalog/maintained/runtime_profile/manyforge.native_execution_runtime/084f58063ad1f86f694607a8df5ffeb4be05012dd15c6a723528d8224c1eac76",
@@ -1195,7 +1195,7 @@
     ]
   },
   "deployment_artifact_id": "ur10e_robotiq_assistant_modes_scene_authoring",
-  "deployment_revision": "sha256:177bb332e87f60d7d1fcaea01c0d88d4aa3c37528575e96369eaa1d897f68c73",
+  "deployment_revision": "sha256:e5f2bb749112388f13a6a2f4072489ccff19aca772bd4cfc0b960b8c377598fe",
   "description": "Local deployment fixture for assistant-mode catalog plumbing on the UR10e + Robotiq 2F-140 preview stack. It keeps the deterministic scene-authoring provider enabled while declaring the finite tools visible to query and composer-assistant requests.",
   "desired_control_configurations": [
     {
@@ -2095,7 +2095,7 @@
       "cancel_validation_timeout_ns": 1000,
       "motion_scope_arm_timeout_ns": 1000,
       "queue_depth": 8,
-      "supervisory_poll_rate_hz": 100
+      "supervisory_poll_rate_hz": 10
     },
     "interrupt_policies": [],
     "interrupt_sources": [],

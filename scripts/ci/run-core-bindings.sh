@@ -220,12 +220,15 @@ cd "${REPO_ROOT}"
   manyforge_core/python/tests/test_bindings_smoke.py \
   manyforge_core/python/tests/test_collision_bindings.py \
   manyforge_core/python/tests/test_command_schema_bindings.py \
+  manyforge_core/python/tests/test_component_lifecycle_bindings.py \
   manyforge_core/python/tests/test_component_type_bindings.py \
   manyforge_core/python/tests/test_composable_cell_bindings.py \
   manyforge_core/python/tests/test_coordinate_state_bindings.py \
   manyforge_core/python/tests/test_controller_topology_bindings.py \
+  manyforge_core/python/tests/test_interrupt_bindings.py \
   manyforge_core/python/tests/test_model_asset_bindings.py \
   manyforge_core/python/tests/test_model_compiler_bindings.py \
+  manyforge_core/python/tests/test_operation_runtime_bindings.py \
   manyforge_core/python/tests/test_provider_manifest_bindings.py \
   manyforge_core/python/tests/test_runtime_profile_bindings.py \
   verification/composable_cell_i2/binding_contract_tests.py

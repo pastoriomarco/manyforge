@@ -1,11 +1,13 @@
 #pragma once
 
+#include <cstddef>
 #include <cstdint>
 #include <map>
 #include <memory>
 #include <optional>
 #include <set>
 #include <string>
+#include <string_view>
 #include <variant>
 #include <vector>
 
@@ -180,7 +182,66 @@ enum class InterruptDispositionAction {
   kDelegateToRecovery,
 };
 
-using InterruptStructuredValue = std::map<std::string, std::string>;
+inline constexpr std::size_t kMaxInterruptStructuredValueEntries = 64U;
+inline constexpr std::size_t kMaxInterruptStructuredValueKeyBytes = 64U;
+inline constexpr std::size_t kMaxInterruptStructuredValueStringBytes = 256U;
+
+/// One value in the closed, flat interrupt diagnostic/adapter object.
+///
+/// Callers MUST use the named factories below for string literals. Assigning a
+/// `const char*` directly to `std::variant<bool, double, std::string>` selects
+/// the boolean alternative under C++ overload resolution.
+using InterruptStructuredScalar = std::variant<bool, double, std::string>;
+using InterruptStructuredValue =
+    std::map<std::string, InterruptStructuredScalar>;
+
+[[nodiscard]] inline InterruptStructuredScalar interrupt_structured_bool(
+    bool value) {
+  return InterruptStructuredScalar(std::in_place_type<bool>, value);
+}
+
+[[nodiscard]] inline InterruptStructuredScalar interrupt_structured_number(
+    double value) {
+  return InterruptStructuredScalar(std::in_place_type<double>, value);
+}
+
+[[nodiscard]] inline InterruptStructuredScalar interrupt_structured_string(
+    std::string_view value) {
+  return InterruptStructuredScalar(std::in_place_type<std::string>, value);
+}
+
+/// Explicit projection into legacy string-only event/error detail surfaces.
+/// This is presentation/audit conversion only; it MUST NOT be used to recover
+/// policy, identity, timing, or command semantics from structured values.
+[[nodiscard]] inline std::string interrupt_structured_scalar_text(
+    const InterruptStructuredScalar& value) {
+  if (const auto* boolean = std::get_if<bool>(&value)) {
+    return *boolean ? "true" : "false";
+  }
+  if (const auto* number = std::get_if<double>(&value)) {
+    return std::to_string(*number);
+  }
+  return std::get<std::string>(value);
+}
+
+[[nodiscard]] inline std::map<std::string, std::string>
+project_interrupt_structured_value_to_text(
+    const InterruptStructuredValue& value) {
+  std::map<std::string, std::string> projected;
+  for (const auto& [key, scalar] : value) {
+    projected.emplace(key, interrupt_structured_scalar_text(scalar));
+  }
+  return projected;
+}
+
+/// Returns a stable reason token when a closed structured value violates its
+/// portable key, scalar, or collection bounds. `require_nonempty` is used only
+/// by fields whose contract assigns meaning to the presence of an object (for
+/// example structured level-source hysteresis).
+[[nodiscard]] std::optional<std::string>
+interrupt_structured_value_error(const InterruptStructuredValue& value,
+                                 bool require_nonempty = false);
+
 using InterruptSignalValue =
     std::variant<bool, double, InterruptStructuredValue>;
 
@@ -235,8 +296,8 @@ struct InterruptPolicyDefinition {
   /// when `preemption_action == kCompleteMoveOnSignal`; rejected at
   /// registration otherwise. Distinct from the backend's
   /// `MotionInterruptStopCapabilityDTO.supported_stop_modes`:
-  /// arm-time validation enforces both (the requested mode and every
-  /// element of `allowed_fallback_modes` MUST be in BOTH sets).
+  /// arm-time validation enforces both the requested mode and the sole
+  /// recoverable substitution, when present, against both sets.
   std::set<MotionInterruptStopMode> allowed_stop_modes;
   /// Fault-stop profile policy (spec/260 §2.2). Applies only when
   /// `preemption_action == kPreemptTrajectory`; the policy

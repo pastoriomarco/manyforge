@@ -8,8 +8,7 @@
 
 namespace manyforge::core {
 
-inline constexpr std::string_view kProviderManifestApiVersion =
-    "manyforge.provider_manifest.v1";
+inline constexpr std::string_view kProviderManifestApiVersion = "manyforge.provider_manifest.v1";
 inline constexpr std::size_t kMaxProviderManifestCapabilities = 256U;
 inline constexpr std::size_t kMaxProviderManifestContracts = 256U;
 inline constexpr std::size_t kMaxProviderManifestEndpointRoles = 256U;
@@ -71,6 +70,20 @@ struct ProviderContractDeclarationDTO {
                          const ProviderContractDeclarationDTO&) = default;
 };
 
+/// Build-owned semantic anchor for one manifest-scoped lifecycle-plan catalog.
+///
+/// The semantic digest excludes the provider-manifest revision and the final
+/// catalog digest.  Including this declaration in the provider-manifest
+/// content therefore rotates the manifest revision when lifecycle plans
+/// change without creating a manifest/catalog identity cycle.
+struct ProviderLifecyclePlanCatalogDeclarationDTO {
+  SchemaId catalog_api_version;
+  ContentDigest semantic_digest;
+
+  friend bool operator==(const ProviderLifecyclePlanCatalogDeclarationDTO&,
+                         const ProviderLifecyclePlanCatalogDeclarationDTO&) = default;
+};
+
 /// Exact normalized payload for `manyforge.provider_manifest.v1`.
 ///
 /// The API version is fixed by this type and `kProviderManifestApiVersion`.
@@ -84,9 +97,9 @@ struct ProviderManifestDTO {
   ProviderManifestRevision provider_manifest_revision;
   std::vector<ProviderCapabilityOfferDTO> offered_capabilities;
   std::vector<ProviderContractDeclarationDTO> provider_contracts;
+  std::optional<ProviderLifecyclePlanCatalogDeclarationDTO> lifecycle_plan_catalog;
 
-  friend bool operator==(const ProviderManifestDTO&,
-                         const ProviderManifestDTO&) = default;
+  friend bool operator==(const ProviderManifestDTO&, const ProviderManifestDTO&) = default;
 };
 
 }  // namespace manyforge::core

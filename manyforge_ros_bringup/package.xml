@@ -14,6 +14,7 @@
   <exec_depend>joint_trajectory_controller</exec_depend>
   <exec_depend>launch</exec_depend>
   <exec_depend>launch_ros</exec_depend>
+  <exec_depend>manyforge_cclc_msgs</exec_depend>
   <exec_depend>rclpy</exec_depend>
   <exec_depend>robot_state_publisher</exec_depend>
   <exec_depend>ros2_control</exec_depend>
@@ -21,6 +22,8 @@
   <exec_depend>simulation_interfaces</exec_depend>
   <exec_depend>tf2_ros</exec_depend>
   <exec_depend>topic_based_ros2_control</exec_depend>
+
+  <test_depend>python3-pytest</test_depend>
 
   <export>
     <build_type>ament_python</build_type>

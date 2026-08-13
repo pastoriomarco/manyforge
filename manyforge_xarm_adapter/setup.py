@@ -57,21 +57,12 @@ setup(
                 'manyforge_xarm_adapter.supervised_runtime_binding:main'
             ),
             (
-                'manyforge-xarm-run-execution-admission-provider = '
-                'manyforge_xarm_adapter.'
-                'execution_admission_provider_launch:main'
-            ),
-            (
                 'manyforge-xarm-resolve-real-robot-deployment = '
                 'manyforge_xarm_adapter.real_robot_deployment:main'
             ),
             (
                 'manyforge-xarm-capture-live-evidence = '
                 'manyforge_xarm_adapter.live_evidence:main'
-            ),
-            (
-                'manyforge-xarm-capture-supervised-command = '
-                'manyforge_xarm_adapter.supervised_command_evidence:main'
             ),
             (
                 'manyforge-xarm-capture-controller-gate = '

@@ -3,19 +3,15 @@
 <package format="3">
   <name>manyforge_xarm_control</name>
   <version>0.1.0</version>
-  <description>ManyForge-owned xArm lifecycle and ros2_control ownership boundary.</description>
+  <description>Build-owned Lite6 lifecycle catalog and restricted xarm_ros2 CCLC adapter.</description>
   <maintainer email="pastoriomarco@gmail.com">Marco Pastorio</maintainer>
   <license>Apache-2.0</license>
 
   <buildtool_depend>ament_cmake</buildtool_depend>
 
-  <depend>hardware_interface</depend>
   <depend>controller_manager_msgs</depend>
   <depend>lifecycle_msgs</depend>
-  <depend>manyforge_robot_lifecycle</depend>
-  <depend>pluginlib</depend>
   <depend>rclcpp</depend>
-  <depend>rclcpp_lifecycle</depend>
   <depend>xarm_msgs</depend>
 
   <test_depend>ament_cmake_gtest</test_depend>
@@ -23,9 +19,6 @@
   <test_depend>ament_cpplint</test_depend>
   <test_depend>ament_lint_auto</test_depend>
   <test_depend>ament_uncrustify</test_depend>
-  <test_depend>controller_manager</test_depend>
-  <test_depend>joint_trajectory_controller</test_depend>
-  <test_depend>trajectory_msgs</test_depend>
 
   <export>
     <build_type>ament_cmake</build_type>

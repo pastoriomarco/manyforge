@@ -18,11 +18,15 @@ namespace manyforge::deployment {
 namespace {
 
 constexpr std::string_view kProviderManifestSchemaRevision =
-    "sha256:700b1978d531041e68d0dfb922f77352353daf0c473ffb13be8f1b791962eab3";
+    "sha256:b242431032bf183f81718ae1b7b8501ee5f705e52d455732e0052215565bf4cc";
 constexpr std::string_view kEmptyProviderContractSchemaRevision =
     "sha256:fb466dd341076cbdb6fc97558ad28bc46032d25daaf4d4bb9d548bf642b83270";
 constexpr std::string_view kExecutionCapabilityRevision =
     "sha256:7e5958db0906b84cb4e5c68ab0ef896f74dc0ba49a9ceb4d918b386abaf9f28c";
+constexpr std::string_view kLifecycleObserveCapabilityRevision =
+    "sha256:deb6815e681e8879c172e1a7dcd03a55154bc599efaa35167c9d23f54d6b9104";
+constexpr std::string_view kLifecycleSemanticDigest =
+    "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 
 static_assert(!std::is_aggregate_v<QualifiedProviderManifest>);
 static_assert(!std::is_default_constructible_v<QualifiedProviderManifest>);
@@ -34,7 +38,7 @@ static_assert(core::kMaxProviderManifestEndpointRoles == 256U);
   std::sort(values.begin(), values.end());
   CanonicalValue::Array result;
   result.reserve(values.size());
-  for (auto& value : values) {
+  for (auto &value : values) {
     result.emplace_back(std::move(value));
   }
   return CanonicalValue(std::move(result));
@@ -42,22 +46,20 @@ static_assert(core::kMaxProviderManifestEndpointRoles == 256U);
 
 [[nodiscard]] CanonicalValue provider_contract_ref(
     std::string role_id = "motion_stop",
-    std::string schema_id =
-        "manyforge.value_schema.provider_contract.empty.v1",
+    std::string schema_id = "manyforge.value_schema.provider_contract.empty.v1",
     std::string schema_revision =
         std::string(kEmptyProviderContractSchemaRevision)) {
   return CanonicalValue(CanonicalValue::Object{
       {"provider_contract_role_id", CanonicalValue(std::move(role_id))},
       {"contract_schema_id", CanonicalValue(std::move(schema_id))},
-      {"contract_schema_revision",
-       CanonicalValue(std::move(schema_revision))},
+      {"contract_schema_revision", CanonicalValue(std::move(schema_revision))},
   });
 }
 
-[[nodiscard]] CanonicalValue command_support(
-    std::string kind = "motion_controlled_stop",
-    std::vector<std::string> roles = {"stop_command"},
-    std::optional<std::string> registered_id = std::nullopt) {
+[[nodiscard]] CanonicalValue
+command_support(std::string kind = "motion_controlled_stop",
+                std::vector<std::string> roles = {"stop_command"},
+                std::optional<std::string> registered_id = std::nullopt) {
   CanonicalValue::Object fields{
       {"command_kind", CanonicalValue(std::move(kind))},
       {"command_endpoint_role_ids", string_set(std::move(roles))},
@@ -69,10 +71,10 @@ static_assert(core::kMaxProviderManifestEndpointRoles == 256U);
   return CanonicalValue(std::move(fields));
 }
 
-[[nodiscard]] CanonicalValue evidence_support(
-    std::string kind = "motion_rest",
-    std::vector<std::string> roles = {"joint_state"},
-    std::optional<std::string> registered_id = std::nullopt) {
+[[nodiscard]] CanonicalValue
+evidence_support(std::string kind = "motion_rest",
+                 std::vector<std::string> roles = {"joint_state"},
+                 std::optional<std::string> registered_id = std::nullopt) {
   CanonicalValue::Object fields{
       {"evidence_kind", CanonicalValue(std::move(kind))},
       {"evidence_endpoint_role_ids", string_set(std::move(roles))},
@@ -100,17 +102,17 @@ static_assert(core::kMaxProviderManifestEndpointRoles == 256U);
   return CanonicalValue(std::move(fields));
 }
 
-[[nodiscard]] CanonicalValue manifest_identity_value(
-    std::vector<std::string> capability_roles = {"execute"},
-    CanonicalValue::Array contracts =
-        CanonicalValue::Array{contract_declaration()}) {
+[[nodiscard]] CanonicalValue
+manifest_identity_value(std::vector<std::string> capability_roles = {"execute"},
+                        CanonicalValue::Array contracts = CanonicalValue::Array{
+                            contract_declaration()}) {
   return CanonicalValue(CanonicalValue::Object{
       {"api_version",
        CanonicalValue(std::string(core::kProviderManifestApiVersion))},
       {"provider_manifest_id", CanonicalValue("xarm_trajectory_provider")},
       {"offered_capabilities",
-       CanonicalValue(CanonicalValue::Array{CanonicalValue(
-           CanonicalValue::Object{
+       CanonicalValue(
+           CanonicalValue::Array{CanonicalValue(CanonicalValue::Object{
                {"capability_id",
                 CanonicalValue("execution.trajectory.execute")},
                {"capability_definition_revision",
@@ -138,20 +140,20 @@ static_assert(core::kMaxProviderManifestEndpointRoles == 256U);
 
 [[nodiscard]] std::string revision_from_document(std::string_view document) {
   const auto parsed = parse_strict_json_model_yaml(document);
-  const auto* revision =
+  const auto *revision =
       parsed.root().find_object_member("provider_manifest_revision");
   EXPECT_NE(revision, nullptr);
   if (revision == nullptr) {
     return {};
   }
-  const auto* text = std::get_if<std::string>(&revision->storage());
+  const auto *text = std::get_if<std::string>(&revision->storage());
   EXPECT_NE(text, nullptr);
   return text == nullptr ? std::string{} : *text;
 }
 
-[[nodiscard]] core::ProviderManifestCatalogRecordRefDTO reference_for(
-    std::string_view manifest_id, std::string_view document,
-    const core::ContentAddressedStoreKey& store_key) {
+[[nodiscard]] core::ProviderManifestCatalogRecordRefDTO
+reference_for(std::string_view manifest_id, std::string_view document,
+              const core::ContentAddressedStoreKey &store_key) {
   return {
       core::ProviderManifestId(std::string(manifest_id)),
       core::ProviderManifestRevision(revision_from_document(document)),
@@ -162,14 +164,14 @@ static_assert(core::kMaxProviderManifestEndpointRoles == 256U);
   };
 }
 
-[[nodiscard]] QualifiedProviderManifest qualify(
-    CanonicalValue identity,
-    const core::ContentAddressedStoreKey& store_key =
-        core::ContentAddressedStoreKey("sha256/provider-manifest")) {
+[[nodiscard]] QualifiedProviderManifest
+qualify(CanonicalValue identity,
+        const core::ContentAddressedStoreKey &store_key =
+            core::ContentAddressedStoreKey("sha256/provider-manifest")) {
   const auto document = document_from_identity(std::move(identity));
   return resolve_and_qualify_provider_manifest(
-      reference_for("xarm_trajectory_provider", document, store_key),
-      store_key, document);
+      reference_for("xarm_trajectory_provider", document, store_key), store_key,
+      document);
 }
 
 TEST(ProviderManifestCodec,
@@ -177,47 +179,44 @@ TEST(ProviderManifestCodec,
   auto identity = manifest_identity_value(
       {"execute_feedback", "execute"},
       CanonicalValue::Array{contract_declaration(
-          provider_contract_ref(), command_support(
-                                       "motion_controlled_stop",
-                                       {"stop_result", "stop_command"}),
+          provider_contract_ref(),
+          command_support("motion_controlled_stop",
+                          {"stop_result", "stop_command"}),
           evidence_support("motion_rest",
                            {"joint_state_secondary", "joint_state"}))});
   const auto document = document_from_identity(identity);
   const auto qualified = qualify(std::move(identity));
-  const auto& manifest = qualified.value();
-  EXPECT_EQ(
-      qualified.reference(),
-      reference_for(
-          "xarm_trajectory_provider", document,
-          core::ContentAddressedStoreKey("sha256/provider-manifest")));
+  const auto &manifest = qualified.value();
+  EXPECT_EQ(qualified.reference(),
+            reference_for(
+                "xarm_trajectory_provider", document,
+                core::ContentAddressedStoreKey("sha256/provider-manifest")));
 
   EXPECT_EQ(manifest.provider_manifest_id,
             core::ProviderManifestId("xarm_trajectory_provider"));
   ASSERT_EQ(manifest.offered_capabilities.size(), 1U);
-  EXPECT_EQ(
-      manifest.offered_capabilities.front().required_endpoint_role_ids,
-      (std::vector<core::EndpointRoleId>{
-          core::EndpointRoleId("execute"),
-          core::EndpointRoleId("execute_feedback")}));
+  EXPECT_EQ(manifest.offered_capabilities.front().required_endpoint_role_ids,
+            (std::vector<core::EndpointRoleId>{
+                core::EndpointRoleId("execute"),
+                core::EndpointRoleId("execute_feedback")}));
   ASSERT_EQ(manifest.provider_contracts.size(), 1U);
   ASSERT_TRUE(
       manifest.provider_contracts.front().stop_command_support.has_value());
   EXPECT_EQ(
       manifest.provider_contracts.front()
           .stop_command_support->command_endpoint_role_ids,
-      (std::vector<core::EndpointRoleId>{
-          core::EndpointRoleId("stop_command"),
-          core::EndpointRoleId("stop_result")}));
+      (std::vector<core::EndpointRoleId>{core::EndpointRoleId("stop_command"),
+                                         core::EndpointRoleId("stop_result")}));
   EXPECT_EQ(canonical_json(qualified.normalized_root()), document);
 }
 
 TEST(ProviderManifestCodec,
      AllowsFocusedDirectPortsAndAnEmptyContractCollection) {
   const auto direct = qualify(manifest_identity_value(
-      {}, CanonicalValue::Array{contract_declaration(
-              provider_contract_ref(), command_support("logical_cancel", {}),
-              evidence_support(
-                  "logical_cancellation_no_continuing_effect", {}))}));
+      {},
+      CanonicalValue::Array{contract_declaration(
+          provider_contract_ref(), command_support("logical_cancel", {}),
+          evidence_support("logical_cancellation_no_continuing_effect", {}))}));
   EXPECT_TRUE(direct.value()
                   .offered_capabilities.front()
                   .required_endpoint_role_ids.empty());
@@ -231,23 +230,80 @@ TEST(ProviderManifestCodec,
 }
 
 TEST(ProviderManifestCodec,
-     RequiresExactBuiltinCapabilityDefinitions) {
-  auto unknown = manifest_identity_value();
-  auto root = unknown.as_object();
-  auto offered = std::find_if(root.begin(), root.end(), [](const auto& member) {
+     LifecycleCapabilitiesRequireOneExactSemanticCatalogAnchor) {
+  auto anchored = manifest_identity_value({"execute"}, CanonicalValue::Array{});
+  auto root = anchored.as_object();
+  auto offered = std::find_if(root.begin(), root.end(), [](const auto &member) {
     return member.first == "offered_capabilities";
   });
   ASSERT_NE(offered, root.end());
-  auto rows =
-      std::get<CanonicalValue::Array>(offered->second.storage());
+  auto rows = std::get<CanonicalValue::Array>(offered->second.storage());
+  rows.insert(
+      rows.begin(),
+      CanonicalValue(CanonicalValue::Object{
+          {"capability_id", CanonicalValue("component.lifecycle.observe")},
+          {"capability_definition_revision",
+           CanonicalValue(std::string(kLifecycleObserveCapabilityRevision))},
+          {"required_endpoint_role_ids", string_set({})},
+      }));
+  offered->second = CanonicalValue(std::move(rows));
+  root.emplace_back(
+      "lifecycle_plan_catalog",
+      CanonicalValue(CanonicalValue::Object{
+          {"catalog_api_version",
+           CanonicalValue("manyforge.brand_lifecycle_plan_catalog.v1")},
+          {"semantic_digest",
+           CanonicalValue(std::string(kLifecycleSemanticDigest))},
+      }));
+
+  const auto qualified = qualify(CanonicalValue(root));
+  ASSERT_TRUE(qualified.value().lifecycle_plan_catalog.has_value());
+  EXPECT_EQ(
+      qualified.value().lifecycle_plan_catalog->catalog_api_version.value(),
+      "manyforge.brand_lifecycle_plan_catalog.v1");
+  EXPECT_EQ(qualified.value().lifecycle_plan_catalog->semantic_digest.value(),
+            kLifecycleSemanticDigest);
+
+  auto missing_anchor = root;
+  missing_anchor.erase(
+      std::remove_if(missing_anchor.begin(), missing_anchor.end(),
+                     [](const auto &member) {
+                       return member.first == "lifecycle_plan_catalog";
+                     }),
+      missing_anchor.end());
+  EXPECT_THROW(qualify(CanonicalValue(std::move(missing_anchor))),
+               ProviderManifestCodecError);
+
+  auto declaration_without_capability =
+      manifest_identity_value({"execute"}, CanonicalValue::Array{}).as_object();
+  declaration_without_capability.emplace_back(
+      "lifecycle_plan_catalog",
+      CanonicalValue(CanonicalValue::Object{
+          {"catalog_api_version",
+           CanonicalValue("manyforge.brand_lifecycle_plan_catalog.v1")},
+          {"semantic_digest",
+           CanonicalValue(std::string(kLifecycleSemanticDigest))},
+      }));
+  EXPECT_THROW(
+      qualify(CanonicalValue(std::move(declaration_without_capability))),
+      ProviderManifestCodecError);
+}
+
+TEST(ProviderManifestCodec, RequiresExactBuiltinCapabilityDefinitions) {
+  auto unknown = manifest_identity_value();
+  auto root = unknown.as_object();
+  auto offered = std::find_if(root.begin(), root.end(), [](const auto &member) {
+    return member.first == "offered_capabilities";
+  });
+  ASSERT_NE(offered, root.end());
+  auto rows = std::get<CanonicalValue::Array>(offered->second.storage());
   auto row = rows.front().as_object();
   auto capability_id =
-      std::find_if(row.begin(), row.end(), [](const auto& member) {
+      std::find_if(row.begin(), row.end(), [](const auto &member) {
         return member.first == "capability_id";
       });
   ASSERT_NE(capability_id, row.end());
-  capability_id->second =
-      CanonicalValue("execution.trajectory.unknown");
+  capability_id->second = CanonicalValue("execution.trajectory.unknown");
   rows.front() = CanonicalValue(std::move(row));
   offered->second = CanonicalValue(std::move(rows));
   EXPECT_THROW(qualify(CanonicalValue(std::move(root))),
@@ -255,18 +311,18 @@ TEST(ProviderManifestCodec,
 
   auto stale = manifest_identity_value();
   root = stale.as_object();
-  offered = std::find_if(root.begin(), root.end(), [](const auto& member) {
+  offered = std::find_if(root.begin(), root.end(), [](const auto &member) {
     return member.first == "offered_capabilities";
   });
   rows = std::get<CanonicalValue::Array>(offered->second.storage());
   row = rows.front().as_object();
-  auto revision =
-      std::find_if(row.begin(), row.end(), [](const auto& member) {
-        return member.first == "capability_definition_revision";
-      });
+  auto revision = std::find_if(row.begin(), row.end(), [](const auto &member) {
+    return member.first == "capability_definition_revision";
+  });
   ASSERT_NE(revision, row.end());
   revision->second = CanonicalValue(
-      "sha256:0000000000000000000000000000000000000000000000000000000000000000");
+      "sha256:"
+      "0000000000000000000000000000000000000000000000000000000000000000");
   rows.front() = CanonicalValue(std::move(row));
   offered->second = CanonicalValue(std::move(rows));
   EXPECT_THROW(qualify(CanonicalValue(std::move(root))),
@@ -283,39 +339,37 @@ TEST(ProviderManifestCodec,
   EXPECT_THROW(qualify(unknown_schema), ProviderManifestCodecError);
 
   const auto stale_schema = manifest_identity_value(
-      {"execute"}, CanonicalValue::Array{contract_declaration(
-                       provider_contract_ref(
-                           "motion_stop",
-                           "manyforge.value_schema.provider_contract.empty.v1",
-                           "sha256:0000000000000000000000000000000000000000000000000000000000000000"))});
+      {"execute"},
+      CanonicalValue::Array{contract_declaration(provider_contract_ref(
+          "motion_stop", "manyforge.value_schema.provider_contract.empty.v1",
+          "sha256:"
+          "000000000000000000000000000000000000000000000000000000000000000"
+          "0"))});
   EXPECT_THROW(qualify(stale_schema), ProviderManifestCodecError);
 }
 
 TEST(ProviderManifestCodec,
      EnforcesSupportPresenceAndRegisteredKindConditionals) {
-  EXPECT_THROW(
-      qualify(manifest_identity_value(
-          {"execute"},
-          CanonicalValue::Array{contract_declaration(
-              provider_contract_ref(), std::nullopt, std::nullopt)})),
-      ProviderManifestCodecError);
+  EXPECT_THROW(qualify(manifest_identity_value(
+                   {"execute"},
+                   CanonicalValue::Array{contract_declaration(
+                       provider_contract_ref(), std::nullopt, std::nullopt)})),
+               ProviderManifestCodecError);
 
   EXPECT_THROW(
       qualify(manifest_identity_value(
-          {"execute"},
-          CanonicalValue::Array{contract_declaration(
-              provider_contract_ref(), command_support("registered"),
-              std::nullopt)})),
+          {"execute"}, CanonicalValue::Array{contract_declaration(
+                           provider_contract_ref(),
+                           command_support("registered"), std::nullopt)})),
       ProviderManifestCodecError);
-  EXPECT_THROW(
-      qualify(manifest_identity_value(
-          {"execute"},
-          CanonicalValue::Array{contract_declaration(
-              provider_contract_ref(),
-              command_support("safe_output_command", {},
-                              std::string("unexpected_registered_id")),
-              std::nullopt)})),
-      ProviderManifestCodecError);
+  EXPECT_THROW(qualify(manifest_identity_value(
+                   {"execute"},
+                   CanonicalValue::Array{contract_declaration(
+                       provider_contract_ref(),
+                       command_support("safe_output_command", {},
+                                       std::string("unexpected_registered_id")),
+                       std::nullopt)})),
+               ProviderManifestCodecError);
 
   const auto registered = qualify(manifest_identity_value(
       {"execute"},
@@ -331,16 +385,15 @@ TEST(ProviderManifestCodec,
             core::RegisteredStopCommandKindId("vendor_controlled_stop"));
 }
 
-TEST(ProviderManifestCodec,
-     BoundsTheComputedManifestWideEndpointRoleUnion) {
+TEST(ProviderManifestCodec, BoundsTheComputedManifestWideEndpointRoleUnion) {
   std::vector<std::string> roles;
   roles.reserve(core::kMaxProviderManifestEndpointRoles);
-  for (std::size_t index = 0U;
-       index < core::kMaxProviderManifestEndpointRoles; ++index) {
+  for (std::size_t index = 0U; index < core::kMaxProviderManifestEndpointRoles;
+       ++index) {
     roles.push_back("role_" + std::to_string(index));
   }
-  EXPECT_NO_THROW(qualify(manifest_identity_value(
-      roles, CanonicalValue::Array{})));
+  EXPECT_NO_THROW(
+      qualify(manifest_identity_value(roles, CanonicalValue::Array{})));
 
   EXPECT_THROW(
       qualify(manifest_identity_value(
@@ -352,8 +405,7 @@ TEST(ProviderManifestCodec,
       ProviderManifestCodecError);
 }
 
-TEST(ProviderManifestCodec,
-     RejectsLegacyFieldsAndIntrinsicStopKinds) {
+TEST(ProviderManifestCodec, RejectsLegacyFieldsAndIntrinsicStopKinds) {
   auto legacy = manifest_identity_value();
   auto root = legacy.as_object();
   root.emplace_back("runtime_dependencies", CanonicalValue::Array{});
@@ -375,11 +427,10 @@ TEST(ProviderManifestCodec,
   const core::ContentAddressedStoreKey intrinsic_key{
       "sha256/intrinsic-provider"};
   EXPECT_THROW(resolve_and_qualify_provider_manifest(
-                   reference_for("xarm_trajectory_provider",
-                                 intrinsic_document, intrinsic_key),
+                   reference_for("xarm_trajectory_provider", intrinsic_document,
+                                 intrinsic_key),
                    intrinsic_key, intrinsic_document),
                ClosedSchemaError);
-
 }
 
 TEST(ProviderManifestCodec, RejectsEveryOuterReferentMismatch) {
@@ -389,44 +440,45 @@ TEST(ProviderManifestCodec, RejectsEveryOuterReferentMismatch) {
   const auto reference =
       reference_for("xarm_trajectory_provider", document, store_key);
 
-  EXPECT_THROW(resolve_and_qualify_provider_manifest(
-                   reference,
-                   core::ContentAddressedStoreKey("sha256/other"), document),
-               ProviderManifestCodecError);
+  EXPECT_THROW(
+      resolve_and_qualify_provider_manifest(
+          reference, core::ContentAddressedStoreKey("sha256/other"), document),
+      ProviderManifestCodecError);
 
   auto wrong_digest = reference;
   wrong_digest.content_digest = core::ContentDigest(
-      "sha256:0000000000000000000000000000000000000000000000000000000000000000");
-  EXPECT_THROW(resolve_and_qualify_provider_manifest(
-                   wrong_digest, store_key, document),
-               ProviderManifestCodecError);
+      "sha256:"
+      "0000000000000000000000000000000000000000000000000000000000000000");
+  EXPECT_THROW(
+      resolve_and_qualify_provider_manifest(wrong_digest, store_key, document),
+      ProviderManifestCodecError);
 
   auto wrong_id = reference;
-  wrong_id.record_id =
-      core::ProviderManifestId("different_manifest");
-  EXPECT_THROW(resolve_and_qualify_provider_manifest(
-                   wrong_id, store_key, document),
-               ProviderManifestCodecError);
+  wrong_id.record_id = core::ProviderManifestId("different_manifest");
+  EXPECT_THROW(
+      resolve_and_qualify_provider_manifest(wrong_id, store_key, document),
+      ProviderManifestCodecError);
 
   auto wrong_revision = reference;
   wrong_revision.record_revision = core::ProviderManifestRevision(
-      "sha256:0000000000000000000000000000000000000000000000000000000000000000");
-  EXPECT_THROW(resolve_and_qualify_provider_manifest(
-                   wrong_revision, store_key, document),
+      "sha256:"
+      "0000000000000000000000000000000000000000000000000000000000000000");
+  EXPECT_THROW(resolve_and_qualify_provider_manifest(wrong_revision, store_key,
+                                                     document),
                ProviderManifestCodecError);
 
   auto wrong_schema_id = reference;
-  wrong_schema_id.schema_id =
-      core::SchemaId("manyforge.component_type.v1");
-  EXPECT_THROW(resolve_and_qualify_provider_manifest(
-                   wrong_schema_id, store_key, document),
+  wrong_schema_id.schema_id = core::SchemaId("manyforge.component_type.v1");
+  EXPECT_THROW(resolve_and_qualify_provider_manifest(wrong_schema_id, store_key,
+                                                     document),
                ProviderManifestCodecError);
 
   auto wrong_schema_revision = reference;
   wrong_schema_revision.schema_revision = core::SchemaRevision(
-      "sha256:0000000000000000000000000000000000000000000000000000000000000000");
-  EXPECT_THROW(resolve_and_qualify_provider_manifest(
-                   wrong_schema_revision, store_key, document),
+      "sha256:"
+      "0000000000000000000000000000000000000000000000000000000000000000");
+  EXPECT_THROW(resolve_and_qualify_provider_manifest(wrong_schema_revision,
+                                                     store_key, document),
                ProviderManifestCodecError);
 
   auto stale_semantic_document = document;
@@ -442,5 +494,5 @@ TEST(ProviderManifestCodec, RejectsEveryOuterReferentMismatch) {
                ProviderManifestCodecError);
 }
 
-}  // namespace
-}  // namespace manyforge::deployment
+} // namespace
+} // namespace manyforge::deployment

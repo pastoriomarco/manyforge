@@ -86,9 +86,8 @@ extract_rospkg_version() {
         | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' || true
 }
 for pkg in \
+    manyforge_cclc_msgs \
     manyforge_ros_bringup \
-    manyforge_robot_lifecycle \
-    manyforge_robot_lifecycle_msgs \
     manyforge_xarm_control \
     manyforge_xarm_adapter; do
     check "${pkg} package.xml" "$(extract_rospkg_version "${REPO_ROOT}/${pkg}/package.xml")"

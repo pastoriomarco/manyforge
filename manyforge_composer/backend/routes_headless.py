@@ -11,6 +11,7 @@ from manyforge_headless_api.client import HeadlessClientError, HeadlessHttpClien
 from manyforge_headless_api.models import (
     AcknowledgeAlarmRequest,
     AcknowledgeAllAlarmsRequest,
+    ComponentLifecycleRequest,
     HistorianReconcileRequest,
     ManagerApplyRequest,
     OperationControlRequest,
@@ -18,6 +19,7 @@ from manyforge_headless_api.models import (
     PickSequencePlanningRequest,
     PlaceSequencePlanningRequest,
     RuntimeScaleRequest,
+    RouteSelectionRequest,
     SceneTransactionRequest,
     StopIntentRequest,
     ProgramRunStartRequest,
@@ -112,6 +114,46 @@ def create_headless_router(
     @router.get("/api/manager/diff")
     def manager_diff() -> dict[str, Any]:
         return _call(client.manager_diff)
+
+    @router.get("/api/cclc/components/{component_id}")
+    def cclc_component(
+        component_id: Annotated[str, Path(min_length=1, max_length=256)],
+    ) -> dict[str, Any]:
+        return _call(lambda: client.cclc_component(component_id))
+
+    @router.get("/api/cclc/components/{component_id}/route-templates")
+    def cclc_route_templates(
+        component_id: Annotated[str, Path(min_length=1, max_length=256)],
+    ) -> dict[str, Any]:
+        return _call(lambda: client.cclc_route_templates(component_id))
+
+    @router.post("/api/cclc/lifecycle/requests")
+    def cclc_lifecycle_submit(
+        body: ComponentLifecycleRequest,
+    ) -> dict[str, Any]:
+        return _call(
+            lambda: client.submit_component_lifecycle(
+                body.model_dump(mode="json")
+            )
+        )
+
+    @router.get("/api/cclc/lifecycle/transactions/{transaction_id}")
+    def cclc_lifecycle_status(
+        transaction_id: Annotated[str, Path(min_length=1, max_length=256)],
+    ) -> dict[str, Any]:
+        return _call(lambda: client.component_lifecycle_status(transaction_id))
+
+    @router.post("/api/cclc/routes/requests")
+    def cclc_route_submit(body: RouteSelectionRequest) -> dict[str, Any]:
+        return _call(
+            lambda: client.submit_route_selection(body.model_dump(mode="json"))
+        )
+
+    @router.get("/api/cclc/routes/transactions/{transaction_id}")
+    def cclc_route_status(
+        transaction_id: Annotated[str, Path(min_length=1, max_length=256)],
+    ) -> dict[str, Any]:
+        return _call(lambda: client.route_selection_status(transaction_id))
 
     @router.get("/api/node-environment")
     def node_environment() -> dict[str, Any]:

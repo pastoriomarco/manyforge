@@ -6,6 +6,7 @@
 #include <fstream>
 #include <iostream>
 #include <iterator>
+#include <manyforge_core/component_lifecycle_plan_catalog_codec.hpp>
 #include <manyforge_core/types/catalog.hpp>
 #include <manyforge_deployment/artifact_codec.hpp>
 #include <manyforge_deployment/build_manifest.hpp>
@@ -618,8 +619,8 @@ materialize_scenarios(const std::filesystem::path &root,
       const auto *schema = schema_registry.find_qualified_value_schema(
           contract.contract_schema_id, contract.contract_schema_revision);
       if (schema == nullptr) {
-        throw std::logic_error(
-            "maintained scenario has no exact build-qualified Stop value schema");
+        throw std::logic_error("maintained scenario has no exact "
+                               "build-qualified Stop value schema");
       }
       selected_value_schema_map.emplace(
           std::pair{contract.contract_schema_id.value(),
@@ -643,15 +644,16 @@ materialize_scenarios(const std::filesystem::path &root,
           artifact.content_addressed_store_key, artifact.content_digest,
           artifact.byte_size);
       if (!bytes.has_value()) {
-        throw std::logic_error(
-            "maintained scenario cannot resolve exact Stop commissioning evidence");
+        throw std::logic_error("maintained scenario cannot resolve exact Stop "
+                               "commissioning evidence");
       }
       selected_commissioning_evidence.push_back(
           deployment::resolve_and_verify_commissioning_evidence_ref(
               row, artifact.content_addressed_store_key, *bytes));
     }
     const auto applicability = deployment::qualify_cell_applicability(
-        composition, verified.applicability_inputs(), profiles, command_schemas,
+        composition, verified.applicability_inputs(), profiles,
+        std::span<const deployment::QualifiedRuntimePolicy>{}, command_schemas,
         capabilities, contracts, topologies, manifests, stop_policies,
         selected_value_schemas, selected_commissioning_evidence,
         selected_overlay);
@@ -679,9 +681,9 @@ materialize_scenarios(const std::filesystem::path &root,
                 selected_preparation, catalog_store, raw_store,
                 bundle_repository);
       } catch (const deployment::RetainedBundleError &error) {
-        if (std::string_view(error.what()).find(
-                "software-hard stage has no exact current build qualification") ==
-            std::string_view::npos) {
+        if (std::string_view(error.what())
+                .find("software-hard stage has no exact current build "
+                      "qualification") == std::string_view::npos) {
           throw;
         }
         continue;
@@ -721,6 +723,7 @@ materialize_scenarios(const std::filesystem::path &root,
         nullptr);
     const auto empty_applicability = deployment::qualify_cell_applicability(
         empty_composition, empty_deployment.applicability_inputs(), profiles,
+        std::span<const deployment::QualifiedRuntimePolicy>{},
         std::span<const deployment::QualifiedCommandSchema>{},
         std::span<const deployment::QualifiedCapabilityDefinition>{},
         std::span<const deployment::QualifiedControlInterfaceContract>{},
@@ -1373,7 +1376,7 @@ qualify_catalog(const std::filesystem::path &root,
   QualifiedCatalogClosure result;
 
   for (const auto &path :
-       source_files(catalog_root / "capability_definition", 38U)) {
+       source_files(catalog_root / "capability_definition", 43U)) {
     const std::string bytes = read_file(path);
     const auto reference =
         make_reference<core::CapabilityDefinitionCatalogRecordRefDTO>(bytes);
@@ -1451,17 +1454,34 @@ qualify_catalog(const std::filesystem::path &root,
     insert_reference(result, reference);
   }
 
+  bool found_lite6_lifecycle_manifest = false;
   for (const auto &path :
-       source_files(catalog_root / "provider_manifest", 5U)) {
+       source_files(catalog_root / "provider_manifest", 6U)) {
     const std::string bytes = read_file(path);
     const auto reference =
         make_reference<core::ProviderManifestCatalogRecordRefDTO>(bytes);
-    result.provider_manifests.push_back(
-        deployment::resolve_and_qualify_provider_manifest(
-            reference, reference.content_addressed_store_key, bytes));
+    auto manifest = deployment::resolve_and_qualify_provider_manifest(
+        reference, reference.content_addressed_store_key, bytes);
+    if (manifest.value().provider_manifest_id.value() == "lite6_arm_provider") {
+      if (found_lite6_lifecycle_manifest ||
+          !manifest.value().lifecycle_plan_catalog.has_value() ||
+          manifest.value()
+                  .lifecycle_plan_catalog->catalog_api_version.value() !=
+              core::kBrandLifecyclePlanCatalogApiVersion ||
+          manifest.value().offered_capabilities.size() != 5U) {
+        throw std::logic_error(
+            "maintained Lite6 lifecycle provider manifest is not exact");
+      }
+      found_lite6_lifecycle_manifest = true;
+    }
+    result.provider_manifests.push_back(std::move(manifest));
     input_source.add(reference.content_addressed_store_key,
                      reference.content_digest, bytes);
     insert_reference(result, reference);
+  }
+  if (!found_lite6_lifecycle_manifest) {
+    throw std::logic_error(
+        "maintained Lite6 lifecycle provider manifest is missing");
   }
 
   for (const auto &path : source_files(catalog_root / "runtime_profile", 1U)) {
@@ -1595,7 +1615,7 @@ qualify_catalog(const std::filesystem::path &root,
     result.model_assets.push_back(std::move(verified));
     result.structural_preparations.push_back(std::move(preparation));
   }
-  if (result.records.size() != 56U || result.runtime_profiles.size() != 1U) {
+  if (result.records.size() != 62U || result.runtime_profiles.size() != 1U) {
     throw std::logic_error("maintained exact catalog closure is incomplete");
   }
   return result;
@@ -1793,7 +1813,7 @@ int main(int argc, char **argv) {
     publish_and_verify_scenario_catalog(root, products, bindings,
                                         package.path());
     std::cout << "7 deployments, 3 shared families, 36 historical facilities, "
-                 "56 exact catalog referents, 8 durable Program Bindings, "
+                 "62 exact catalog referents, 8 durable Program Bindings, "
                  "and 8 scenario closures qualified\n";
     return 0;
   } catch (const std::exception &error) {

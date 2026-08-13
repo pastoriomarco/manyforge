@@ -1,0 +1,256 @@
+#include <gtest/gtest.h>
+
+#include <manyforge_core/types/runtime_policy.hpp>
+#include <manyforge_deployment/artifact_codec.hpp>
+#include <manyforge_deployment/canonical_value.hpp>
+#include <manyforge_deployment/cell_applicability.hpp>
+#include <manyforge_deployment/cell_compiler.hpp>
+#include <manyforge_deployment/cell_composition.hpp>
+#include <manyforge_deployment/cell_graph_codec.hpp>
+#include <manyforge_deployment/content_identity.hpp>
+#include <manyforge_deployment/deployment_applicability_codec.hpp>
+#include <manyforge_deployment/runtime_policy_codec.hpp>
+#include <manyforge_deployment/site_overlay_resolution.hpp>
+#include <array>
+#include <span>
+#include <string>
+#include <string_view>
+#include <type_traits>
+#include <variant>
+
+namespace manyforge::deployment {
+namespace {
+
+constexpr std::string_view kSchemaRevision =
+    "sha256:330a7505c585d69b231a1322bffbcd71775a1070c3a519a1ef7eb013ed5b5e9f";
+
+static_assert(!std::is_aggregate_v<QualifiedRuntimePolicy>);
+static_assert(!std::is_default_constructible_v<QualifiedRuntimePolicy>);
+
+[[nodiscard]] CanonicalValue policy_without_revision(
+    bool reverse_limits = false, bool duplicate_cell = false,
+    bool include_target = true) {
+  CanonicalValue::Array limits;
+  const CanonicalValue cell(CanonicalValue::Object{
+      {"scope_kind", CanonicalValue("cell")},
+      {"maximum_tcp_linear_speed_mps", CanonicalValue(0.5)}});
+  const CanonicalValue target(CanonicalValue::Object{
+      {"scope_kind", CanonicalValue("command_target")},
+      {"controllable_component_id", CanonicalValue("robot_a")},
+      {"command_target_id", CanonicalValue("arm")},
+      {"maximum_tcp_linear_speed_mps", CanonicalValue(0.25)}});
+  if (!include_target) {
+    limits = {cell};
+  } else if (reverse_limits) {
+    limits = {target, cell};
+  } else {
+    limits = {cell, target};
+  }
+  if (duplicate_cell) {
+    limits.push_back(cell);
+  }
+  return CanonicalValue(CanonicalValue::Object{
+      {"api_version",
+       CanonicalValue(std::string(core::kRuntimePolicyApiVersion))},
+      {"runtime_policy_id", CanonicalValue("runtime.default")},
+      {"description", CanonicalValue("Maintained native policy")},
+      {"interrupt_policy_ids",
+       CanonicalValue(CanonicalValue::Array{CanonicalValue("fault.stop"),
+                                            CanonicalValue("probe.trip")})},
+      {"motion_speed_limits", CanonicalValue(std::move(limits))},
+      {"open_loop_grasp_acknowledgements",
+       CanonicalValue(include_target
+                          ? CanonicalValue::Array{CanonicalValue(
+                                CanonicalValue::Object{
+                                    {"controllable_component_id",
+                                     CanonicalValue("robot_a")},
+                                    {"command_target_id",
+                                     CanonicalValue("gripper")},
+                                    {"environment",
+                                     CanonicalValue("simulation")},
+                                    {"allowed", CanonicalValue(true)}})}
+                          : CanonicalValue::Array{})}});
+}
+
+[[nodiscard]] std::string document(CanonicalValue value) {
+  std::string preimage{"manyforge.content-identity.v1"};
+  preimage.push_back('\0');
+  preimage.append("catalog-record-revision/runtime_policy");
+  preimage.push_back('\0');
+  preimage.append(core::kRuntimePolicyApiVersion);
+  preimage.push_back('\0');
+  preimage.append(canonical_json(value));
+  auto object = value.as_object();
+  object.emplace_back("runtime_policy_revision",
+                      CanonicalValue(sha256_digest(preimage)));
+  return canonical_json(CanonicalValue(std::move(object)));
+}
+
+[[nodiscard]] std::string revision(std::string_view bytes) {
+  const auto parsed = parse_strict_json_model_yaml(bytes);
+  const auto* value =
+      parsed.root().find_object_member("runtime_policy_revision");
+  EXPECT_NE(value, nullptr);
+  return value == nullptr ? std::string{} : value->as_string();
+}
+
+[[nodiscard]] core::RuntimePolicyCatalogRecordRefDTO reference_for(
+    std::string_view bytes,
+    const core::ContentAddressedStoreKey& key =
+        core::ContentAddressedStoreKey("sha256/runtime-policy")) {
+  return {core::RuntimePolicyId("runtime.default"),
+          core::RuntimePolicyRevision(revision(bytes)),
+          core::SchemaId(std::string(core::kRuntimePolicyApiVersion)),
+          core::SchemaRevision(std::string(kSchemaRevision)),
+          core::ContentDigest(sha256_digest(bytes)), key};
+}
+
+TEST(RuntimePolicyCodec, ResolvesExactTypedPolicyAndMaterializedDefaults) {
+  const std::string bytes = document(policy_without_revision());
+  const auto reference = reference_for(bytes);
+  const auto qualified = resolve_and_qualify_runtime_policy(
+      reference, reference.content_addressed_store_key, bytes);
+
+  EXPECT_EQ(qualified.reference(), reference);
+  EXPECT_EQ(qualified.value().runtime_policy_id.value(), "runtime.default");
+  ASSERT_EQ(qualified.value().motion_speed_limits.size(), 2U);
+  EXPECT_TRUE(std::holds_alternative<core::RuntimePolicyCellScopeDTO>(
+      qualified.value().motion_speed_limits[0].scope));
+  EXPECT_TRUE(
+      std::holds_alternative<core::RuntimePolicyCommandTargetScopeDTO>(
+          qualified.value().motion_speed_limits[1].scope));
+  ASSERT_EQ(qualified.value().interrupt_policy_ids.size(), 2U);
+  EXPECT_EQ(qualified.value().interrupt_policy_ids[0].value(), "fault.stop");
+  ASSERT_EQ(qualified.value().open_loop_grasp_acknowledgements.size(), 1U);
+  EXPECT_TRUE(
+      qualified.value().open_loop_grasp_acknowledgements[0].allowed);
+}
+
+TEST(RuntimePolicyCodec, RejectsNoncanonicalAndDuplicateMotionScopes) {
+  for (const auto& candidate :
+       {policy_without_revision(true, false),
+        policy_without_revision(false, true)}) {
+    const std::string bytes = document(candidate);
+    const auto reference = reference_for(bytes);
+    EXPECT_THROW(resolve_and_qualify_runtime_policy(
+                     reference, reference.content_addressed_store_key, bytes),
+                 RuntimePolicyCodecError);
+  }
+}
+
+TEST(RuntimePolicyCodec, RejectsSchemaIdentityAndReferentMismatch) {
+  const std::string bytes = document(policy_without_revision());
+  const auto reference = reference_for(bytes);
+
+  auto wrong_id = reference;
+  wrong_id.record_id = core::RuntimePolicyId("runtime.other");
+  EXPECT_THROW(resolve_and_qualify_runtime_policy(
+                   wrong_id, wrong_id.content_addressed_store_key, bytes),
+               RuntimePolicyCodecError);
+
+  auto wrong_schema = reference;
+  wrong_schema.schema_revision = core::SchemaRevision(
+      "sha256:0000000000000000000000000000000000000000000000000000000000000000");
+  EXPECT_THROW(resolve_and_qualify_runtime_policy(
+                   wrong_schema, wrong_schema.content_addressed_store_key,
+                   bytes),
+               RuntimePolicyCodecError);
+
+  std::string malformed = bytes;
+  const auto offset = malformed.find("\"allowed\":true");
+  ASSERT_NE(offset, std::string::npos);
+  malformed.replace(offset, std::string("\"allowed\":true").size(),
+                    "\"allowed\":true,\"unknown\":false");
+  auto malformed_reference = reference;
+  malformed_reference.content_digest =
+      core::ContentDigest(sha256_digest(malformed));
+  EXPECT_THROW(resolve_and_qualify_runtime_policy(
+                   malformed_reference,
+                   malformed_reference.content_addressed_store_key,
+                   malformed),
+               RuntimePolicyCodecError);
+}
+
+TEST(RuntimePolicyCodec,
+     ApplicabilitySelectsExactPolicyAndCompilerRetainsItsFullReference) {
+  const std::string bytes = document(policy_without_revision(false, false,
+                                                              false));
+  const auto reference = reference_for(bytes);
+  const auto qualified = resolve_and_qualify_runtime_policy(
+      reference, reference.content_addressed_store_key, bytes);
+
+  const auto graph = compute_graph_revision(prepare_cell_graph_identity(
+      validate_intrinsic_cell_graph_candidate(decode_cell_graph_candidate(
+          parse_strict_json_model_yaml(
+              "{\"api_version\":\"manyforge.cell_graph.v1\","
+              "\"graph_revision\":\"sha256:00000000000000000000000000000000"
+              "00000000000000000000000000000000\",\"cell_id\":"
+              "\"runtime_policy_cell\",\"runtime_units\":[],"
+              "\"model_instances\":[],\"controllable_components\":[],"
+              "\"control_domains\":[],\"control_bindings\":[],"
+              "\"component_attachments\":[]}"))),
+      {}));
+  const auto composition = compose_cell_occurrences(
+      graph, std::span<const SourceVerifiedModelAsset>{},
+      std::span<const QualifiedComponentType>{});
+
+  const CanonicalValue policy_reference(CanonicalValue::Object{
+      {"record_kind", CanonicalValue("runtime_policy")},
+      {"record_id", CanonicalValue(reference.record_id.value())},
+      {"record_revision",
+       CanonicalValue(reference.record_revision.value())},
+      {"schema_id", CanonicalValue(reference.schema_id.value())},
+      {"schema_revision", CanonicalValue(reference.schema_revision.value())},
+      {"content_digest", CanonicalValue(reference.content_digest.value())},
+      {"content_addressed_store_key",
+       CanonicalValue(reference.content_addressed_store_key.value())},
+  });
+  const CanonicalValue applicability_root(CanonicalValue::Object{
+      {"api_version", CanonicalValue("manyforge.deployment.v1")},
+      {"desired_control_configurations",
+       CanonicalValue(CanonicalValue::Array{})},
+      {"capability_provider_bindings",
+       CanonicalValue(CanonicalValue::Array{})},
+      {"policies",
+       CanonicalValue(CanonicalValue::Object{
+           {"retained_policy_records",
+            CanonicalValue(CanonicalValue::Array{policy_reference})},
+           {"stop_stage_parameters", CanonicalValue(CanonicalValue::Array{})},
+           {"commissioned_stop_interfaces",
+            CanonicalValue(CanonicalValue::Array{})},
+           {"interrupt_sources", CanonicalValue(CanonicalValue::Array{})},
+           {"interrupt_policies", CanonicalValue(CanonicalValue::Array{})},
+           {"interrupt_config",
+            CanonicalValue(CanonicalValue::Object{
+                {"queue_depth", CanonicalValue(8.0)},
+                {"cancel_validation_timeout_ns", CanonicalValue(1000.0)},
+                {"motion_scope_arm_timeout_ns", CanonicalValue(1000.0)},
+                {"supervisory_poll_rate_hz", CanonicalValue(10.0)},
+            })},
+       })},
+  });
+  const auto inputs = compute_capability_provider_binding_revisions(
+      decode_deployment_applicability_inputs_candidate(
+          parse_strict_json_model_yaml(canonical_json(applicability_root))));
+  const auto overlay = select_site_overlay_for_deployment(
+      inputs.value().site_overlay_ref, inputs.value().external_resources,
+      nullptr);
+  const std::array policies{qualified};
+  const auto applicability = qualify_cell_applicability(
+      composition, inputs, {}, policies, {}, {}, {}, {}, {}, {}, {}, {},
+      overlay);
+  ASSERT_EQ(applicability.runtime_policies().size(), 1U);
+  EXPECT_EQ(applicability.runtime_policies().front().reference(), reference);
+  const auto compiled = compile_cell_ir(applicability);
+  ASSERT_EQ(compiled.catalog_record_refs().size(), 1U);
+  EXPECT_EQ(compiled.catalog_record_refs().front(),
+            core::CatalogRecordRefDTO(reference));
+
+  EXPECT_THROW(
+      (void)qualify_cell_applicability(composition, inputs, {}, {}, {}, {},
+                                       {}, {}, {}, {}, {}, {}, overlay),
+      CellApplicabilityError);
+}
+
+}  // namespace
+}  // namespace manyforge::deployment

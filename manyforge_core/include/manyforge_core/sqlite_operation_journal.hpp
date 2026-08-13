@@ -14,8 +14,8 @@
 namespace manyforge::core {
 
 inline constexpr std::string_view kOperationJournalSchemaId =
-    "manyforge.internal.execution.operation-journal.n4.v2";
-inline constexpr std::int64_t kOperationJournalSchemaVersion = 2;
+    "manyforge.internal.execution.operation-journal.i8.v5";
+inline constexpr std::int64_t kOperationJournalSchemaVersion = 5;
 inline constexpr std::int64_t kOperationJournalSqliteApplicationId = 0x4D46454A;
 inline constexpr std::string_view kOperationJournalFilename = "operation-journal.sqlite3";
 inline constexpr std::size_t kMaximumOperationJournalHistory = 4096U;
@@ -29,8 +29,8 @@ struct OperationJournalEventDTO final {
   RequestOwnerEpoch owner_epoch;
   std::string record_kind;
   std::optional<RequestId> request_id;
-  OperationId operation_id;
-  OperationRevision operation_revision;
+  std::optional<OperationId> operation_id;
+  std::optional<OperationRevision> operation_revision;
   std::int64_t occurred_at_ns;
   std::string occurred_at_wall;
   bool effect_pending;
@@ -70,10 +70,27 @@ class SqliteOperationJournal final : public IOperationJournal {
       const RequestOwnerEpoch& owner_epoch, const OperationControlRequestDTO& request,
       const OperationControlAcceptedDTO& accepted, const OperationStateDTO& state) override;
 
-  [[nodiscard]] Result<std::uint64_t> RecordStopAccepted(const RequestOwnerEpoch& owner_epoch,
-                                                         const StopIntentDTO& intent,
-                                                         const StopAcceptedDTO& accepted,
-                                                         const OperationStateDTO& state) override;
+  [[nodiscard]] EmergencyStopAcceptanceProjectionResultDTO RecordStopAccepted(
+      const RequestOwnerEpoch& owner_epoch, const EmergencyStopAcceptanceRecordDTO& acceptance,
+      const EmergencyStopProjectedIntentDTO& intent, const StopAcceptedDTO& accepted,
+      const EmergencyStopAffectedStateSnapshotDTO& affected_state) noexcept override;
+
+  [[nodiscard]] StopForensicProjectionResultDTO RecordStopTerminal(
+      const RequestOwnerEpoch& owner_epoch, const StopStatusDTO& stop_status,
+      const StopCertificateDTO& certificate,
+      const std::optional<StopFaultLatchDTO>& fault_latch) noexcept override;
+
+  [[nodiscard]] StopForensicProjectionResultDTO RecordStopSurveillanceCheckpoint(
+      const RequestOwnerEpoch& owner_epoch, const StopPostTerminalSurveillanceDTO& checkpoint,
+      const StopFaultLatchDTO& fault_latch) noexcept override;
+
+  [[nodiscard]] Result<std::uint64_t> RecordStopFaultCleared(
+      const RequestOwnerEpoch& owner_epoch, const StopFaultRecoveryIntentDTO& recovery_intent,
+      const StopFaultRecoveryResultDTO& recovery_result, const StopFaultLatchDTO& cleared_latch,
+      const StopStatusDTO& resulting_stop_status) override;
+
+  [[nodiscard]] Result<std::uint64_t> CloseOwnerEpoch(const RequestOwnerEpoch& owner_epoch,
+                                                      std::int64_t closed_at_ns) override;
 
   [[nodiscard]] Result<std::uint64_t> RecordRuntimeScaleAccepted(
       const RequestOwnerEpoch& owner_epoch, const RuntimeScaleRequestDTO& request,

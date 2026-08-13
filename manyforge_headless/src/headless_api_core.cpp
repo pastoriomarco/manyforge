@@ -212,8 +212,8 @@ std::string OperationHistoryEventType(const std::string_view record_kind,
   if (record_kind == "operation_accepted") {
     return "operation_accepted";
   }
-  if (record_kind == "stop_accepted") {
-    return "operation_stop_accepted";
+  if (record_kind == "stop_acceptance_projected") {
+    return "stop_acceptance_projected";
   }
   if (record_kind == "runtime_scale_accepted") {
     return "runtime_scale_requested";
@@ -1047,51 +1047,82 @@ HeadlessApiCore::CommitProgramModelAttempt(CanonicalValue record) {
 CanonicalValue HeadlessApiCore::IngestOperationEvent(
     std::string source_owner_epoch, const std::uint64_t source_sequence,
     std::string record_kind, std::optional<std::string> request_id,
-    std::string operation_id, const std::uint64_t operation_revision,
+    std::optional<std::string> operation_id,
+    const std::optional<std::uint64_t> operation_revision,
     const std::int64_t occurred_at_ns, std::string occurred_at_wall,
     const bool effect_pending, CanonicalValue journal_payload,
     std::string payload_digest) {
-  Require(
-      !source_owner_epoch.empty() && source_sequence != 0U &&
-          source_sequence <= kMaximumSafeInteger && !record_kind.empty() &&
-          !operation_id.empty() && operation_revision != 0U &&
-          operation_revision <= kMaximumSafeInteger && occurred_at_ns >= 0 &&
-          static_cast<std::uint64_t>(occurred_at_ns) <= kMaximumSafeInteger &&
-          !occurred_at_wall.empty() && occurred_at_wall.size() <= 128U &&
-          content_identity::is_utf8_nfc(occurred_at_wall) &&
-          (!request_id.has_value() || !request_id->empty()) &&
-          content_identity::is_sha256_digest(payload_digest) &&
-          journal_payload.is_object(),
-      "headless_operation_event_invalid",
-      "operation event envelope is malformed");
+  const bool has_operation_id = operation_id.has_value();
+  const bool has_operation_revision = operation_revision.has_value();
+  const bool stop_acceptance_projection =
+      record_kind == "stop_acceptance_projected";
+  Require(!source_owner_epoch.empty() && source_sequence != 0U &&
+              source_sequence <= kMaximumSafeInteger && !record_kind.empty() &&
+              has_operation_id == has_operation_revision &&
+              (stop_acceptance_projection != has_operation_id) &&
+              (!has_operation_id ||
+               (!operation_id->empty() && *operation_revision != 0U &&
+                *operation_revision <= kMaximumSafeInteger)) &&
+              occurred_at_ns >= 0 &&
+              static_cast<std::uint64_t>(occurred_at_ns) <=
+                  kMaximumSafeInteger &&
+              !occurred_at_wall.empty() && occurred_at_wall.size() <= 128U &&
+              content_identity::is_utf8_nfc(occurred_at_wall) &&
+              (!request_id.has_value() || !request_id->empty()) &&
+              content_identity::is_sha256_digest(payload_digest) &&
+              journal_payload.is_object(),
+          "headless_operation_event_invalid",
+          "operation event envelope is malformed");
   const std::set<std::string_view> supported_kinds{
-      "operation_accepted",     "control_accepted", "stop_accepted",
+      "operation_accepted",     "control_accepted", "stop_acceptance_projected",
       "runtime_scale_accepted", "state_observed",   "host_replaced"};
   Require(supported_kinds.contains(record_kind),
           "headless_operation_event_invalid",
           "operation event record kind is unsupported");
   const auto payload_json = content_identity::canonical_json(journal_payload);
   Require(content_identity::sha256_digest(payload_json) == payload_digest &&
-              RequiredString(journal_payload, "api_version") ==
-                  "manyforge.operation_journal_record.v1" &&
-              RequiredString(journal_payload, "owner_epoch") ==
-                  source_owner_epoch &&
-              RequiredString(journal_payload, "record_kind") == record_kind &&
-              RequiredBool(journal_payload, "effect_pending") == effect_pending,
+              RequiredString(journal_payload, "record_kind") == record_kind,
           "headless_operation_event_invalid",
           "operation event payload does not match its durable envelope");
-  const auto &operation_state =
-      RequiredMember(journal_payload, "operation_state");
-  Require(operation_state.is_object() &&
-              RequiredString(operation_state, "operation_id") == operation_id &&
-              RequiredCounter(operation_state, "operation_revision", 1U) ==
-                  operation_revision,
-          "headless_operation_event_invalid",
-          "operation event state does not match its durable envelope");
+  const CanonicalValue *operation_state = nullptr;
+  if (stop_acceptance_projection) {
+    const auto &acceptance = RequiredMember(journal_payload, "acceptance");
+    const auto entry_state = RequiredString(acceptance, "entry_state");
+    Require(RequiredString(journal_payload, "api_version") ==
+                    "manyforge.stop_acceptance_projection.v1" &&
+                request_id.has_value() &&
+                RequiredString(acceptance, "owner_epoch") ==
+                    source_owner_epoch &&
+                RequiredString(acceptance, "request_id") == *request_id &&
+                (entry_state == "active" || entry_state == "terminal") &&
+                effect_pending == (entry_state == "active"),
+            "headless_operation_event_invalid",
+            "Stop acceptance projection does not match its durable envelope");
+  } else {
+    Require(RequiredString(journal_payload, "api_version") ==
+                    "manyforge.operation_journal_record.v1" &&
+                RequiredString(journal_payload, "owner_epoch") ==
+                    source_owner_epoch &&
+                RequiredBool(journal_payload, "effect_pending") ==
+                    effect_pending,
+            "headless_operation_event_invalid",
+            "operation event payload does not match its durable envelope");
+    operation_state = &RequiredMember(journal_payload, "operation_state");
+    Require(operation_state->is_object() &&
+                RequiredString(*operation_state, "operation_id") ==
+                    *operation_id &&
+                RequiredCounter(*operation_state, "operation_revision", 1U) ==
+                    *operation_revision,
+            "headless_operation_event_invalid",
+            "operation event state does not match its durable envelope");
+  }
   const auto event_type =
       OperationHistoryEventType(record_kind, journal_payload);
-  const auto state_name = RequiredString(operation_state, "state");
-  const auto severity = IsOperationFaultState(state_name) ? "ERROR" : "INFO";
+  const auto severity =
+      operation_state != nullptr &&
+              IsOperationFaultState(RequiredString(*operation_state, "state"))
+          ? "ERROR"
+          : "INFO";
   const auto native_record_digest = content_identity::framed_sha256(
       "manyforge-operation-journal-event", "v1",
       CanonicalValue(CanonicalValue::Object{
@@ -1099,9 +1130,11 @@ CanonicalValue HeadlessApiCore::IngestOperationEvent(
           {"occurred_at_ns", Number(static_cast<std::uint64_t>(occurred_at_ns),
                                     "occurred_at_ns")},
           {"occurred_at_wall", CanonicalValue(occurred_at_wall)},
-          {"operation_id", CanonicalValue(operation_id)},
+          {"operation_id", OptionalStringValue(operation_id)},
           {"operation_revision",
-           Number(operation_revision, "operation_revision")},
+           operation_revision.has_value()
+               ? Number(*operation_revision, "operation_revision")
+               : CanonicalValue(nullptr)},
           {"payload_digest", CanonicalValue(payload_digest)},
           {"record_kind", CanonicalValue(record_kind)},
           {"request_id", OptionalStringValue(request_id)},
@@ -1135,8 +1168,11 @@ CanonicalValue HeadlessApiCore::IngestOperationEvent(
       {"journal_payload", journal_payload},
       {"native_sequence", Number(source_sequence, "native_sequence")},
       {"native_sequence_gap", CanonicalValue(native_sequence_gap)},
-      {"operation_id", CanonicalValue(operation_id)},
-      {"operation_revision", Number(operation_revision, "operation_revision")},
+      {"operation_id", OptionalStringValue(operation_id)},
+      {"operation_revision",
+       operation_revision.has_value()
+           ? Number(*operation_revision, "operation_revision")
+           : CanonicalValue(nullptr)},
       {"payload_digest", CanonicalValue(payload_digest)},
       {"record_kind", CanonicalValue(record_kind)},
       {"request_id", OptionalStringValue(request_id)},
@@ -1166,9 +1202,12 @@ CanonicalValue HeadlessApiCore::IngestOperationEvent(
         "operation historian delivery raised an unknown failure");
   }
 
-  ReconcileOperationFaultLocked(
-      journal_payload, record_kind, request_id.value_or(""), source_sequence,
-      payload_digest, occurred_at_ns, occurred_at_wall, event_id.value_or(""));
+  if (operation_state != nullptr) {
+    ReconcileOperationFaultLocked(journal_payload, record_kind,
+                                  request_id.value_or(""), source_sequence,
+                                  payload_digest, occurred_at_ns,
+                                  occurred_at_wall, event_id.value_or(""));
+  }
   operation_native_sequence_ = source_sequence;
   operation_native_record_digest_ = native_record_digest;
   SynchronizeHistorianHealthLocked();

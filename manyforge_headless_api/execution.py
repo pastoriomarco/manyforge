@@ -35,12 +35,33 @@ OPERATION_EVENT_KINDS = frozenset(
     {
         "operation_accepted",
         "control_accepted",
-        "stop_accepted",
+        "stop_acceptance_projected",
         "runtime_scale_accepted",
         "state_observed",
         "host_replaced",
     }
 )
+
+
+def _valid_operation_event_identity(event: dict[str, Any]) -> bool:
+    operation_id = event.get("operation_id")
+    operation_revision = event.get("operation_revision")
+    if event.get("record_kind") == "stop_acceptance_projected":
+        request_id = event.get("request_id")
+        return (
+            operation_id is None
+            and operation_revision is None
+            and isinstance(request_id, str)
+            and bool(request_id)
+        )
+    return (
+        isinstance(operation_id, str)
+        and bool(operation_id)
+        and type(operation_revision) is int
+        and 1 <= operation_revision <= MAXIMUM_SAFE_INTEGER
+    )
+
+
 MAX_EXECUTION_PACKET_BYTES = 1024 * 1024
 MAX_EXECUTION_RESPONSE_BYTES = 4 * 1024 * 1024
 MOTION_PREVIEW_RESPONSE_KEYS = frozenset(
@@ -446,12 +467,7 @@ class ExecutionCommandClient:
                         or len(event["request_id"].encode("utf-8")) > 2_048
                     )
                 )
-                or not isinstance(event.get("operation_id"), str)
-                or not event["operation_id"]
-                or type(event.get("operation_revision")) is not int
-                or not 1
-                <= event["operation_revision"]
-                <= MAXIMUM_SAFE_INTEGER
+                or not _valid_operation_event_identity(event)
                 or type(event.get("occurred_at_ns")) is not int
                 or not 0 <= event["occurred_at_ns"] <= MAXIMUM_SAFE_INTEGER
                 or not isinstance(event.get("occurred_at_wall"), str)

@@ -35,13 +35,35 @@
 #include <xarm_msgs/srv/set_supervised_command_gate.hpp>
 #include <xarm_msgs/srv/shutdown_supervised_controller.hpp>
 
-#include <manyforge_xarm_control/real_hardware_backend.hpp>
+#include <manyforge_xarm_control/contract.hpp>
 
-namespace manyforge::xarm_control
-{
+namespace manyforge::xarm_control {
 
-struct XArmRosTransportSessionConfig
-{
+/// Narrow NRT client seam for the restricted ROS boundary owned by xarm_ros2.
+/// It exposes the low-level renewable command gate only for its I10 replacement
+/// gate; no I7 caller/session authority is attached to it.
+class IXArmSupervisedRosSession {
+public:
+  virtual ~IXArmSupervisedRosSession() = default;
+
+  IXArmSupervisedRosSession(const IXArmSupervisedRosSession &) = delete;
+  IXArmSupervisedRosSession &
+  operator=(const IXArmSupervisedRosSession &) = delete;
+
+  [[nodiscard]] virtual std::string_view owner_id() const noexcept = 0;
+  [[nodiscard]] virtual XArmObservedState
+  observe_vendor(std::int64_t now_ns) const = 0;
+  virtual XArmLifecycleCommandResult
+  execute_primitive(XArmLifecycleCommand command, std::string_view request_id,
+                    std::uint64_t expected_generation) = 0;
+  virtual bool set_command_gate(bool open, std::int64_t valid_until_ns,
+                                std::uint64_t expected_generation) = 0;
+
+protected:
+  IXArmSupervisedRosSession() = default;
+};
+
+struct XArmRosTransportSessionConfig {
   std::string owner_id;
   std::string state_topic;
   std::string execute_service;
@@ -68,61 +90,51 @@ struct XArmRosTransportSessionConfig
 /// A source session-id change is terminal for this object. Reconstructing the
 /// client makes process replacement explicit and prevents generation reset
 /// from being mistaken for continuity.
-class XArmRosTransportSession final : public IXArmSupervisedRosSession
-{
+class XArmRosTransportSession final : public IXArmSupervisedRosSession {
 public:
   explicit XArmRosTransportSession(XArmRosTransportSessionConfig config);
   ~XArmRosTransportSession() override;
 
   [[nodiscard]] std::string_view owner_id() const noexcept override;
-  [[nodiscard]] XArmObservedState observe_vendor(
-    std::int64_t now_ns) const override;
-  XArmLifecycleCommandResult execute_primitive(
-    XArmLifecycleCommand command,
-    std::string_view request_id,
-    std::uint64_t expected_generation) override;
-  bool set_command_gate(
-    bool open,
-    std::int64_t valid_until_ns,
-    std::uint64_t expected_generation) override;
+  [[nodiscard]] XArmObservedState
+  observe_vendor(std::int64_t now_ns) const override;
+  XArmLifecycleCommandResult
+  execute_primitive(XArmLifecycleCommand command, std::string_view request_id,
+                    std::uint64_t expected_generation) override;
+  bool set_command_gate(bool open, std::int64_t valid_until_ns,
+                        std::uint64_t expected_generation) override;
 
 private:
   static std::int64_t steady_now_ns();
   static std::uint8_t command_value(XArmLifecycleCommand command);
   static FactState fact(bool value);
-  XArmLifecycleCommandResult set_hardware_component_state(
-    bool active,
-    std::uint64_t expected_generation);
-  XArmLifecycleCommandResult switch_trajectory_controllers(
-    bool active,
-    std::uint64_t expected_generation);
-  void handle_state(
-    const xarm_msgs::msg::SupervisedLifecycleState & state);
+  XArmLifecycleCommandResult
+  set_hardware_component_state(bool active, std::uint64_t expected_generation);
+  XArmLifecycleCommandResult
+  switch_trajectory_controllers(bool active, std::uint64_t expected_generation);
+  void handle_state(const xarm_msgs::msg::SupervisedLifecycleState &state);
   void handle_controller_activity(
-    const controller_manager_msgs::msg::ControllerManagerActivity & activity);
+      const controller_manager_msgs::msg::ControllerManagerActivity &activity);
   void validate_config() const;
 
   XArmRosTransportSessionConfig config_;
   rclcpp::Node::SharedPtr node_;
   std::shared_ptr<rclcpp::executors::SingleThreadedExecutor> executor_;
+  rclcpp::Subscription<xarm_msgs::msg::SupervisedLifecycleState>::SharedPtr
+      state_subscription_;
   rclcpp::Subscription<
-    xarm_msgs::msg::SupervisedLifecycleState>::SharedPtr state_subscription_;
-  rclcpp::Subscription<
-    controller_manager_msgs::msg::ControllerManagerActivity>::SharedPtr
-    controller_activity_subscription_;
-  rclcpp::Client<
-    xarm_msgs::srv::ExecuteSupervisedLifecycleCommand>::SharedPtr
-    execute_client_;
+      controller_manager_msgs::msg::ControllerManagerActivity>::SharedPtr
+      controller_activity_subscription_;
+  rclcpp::Client<xarm_msgs::srv::ExecuteSupervisedLifecycleCommand>::SharedPtr
+      execute_client_;
   rclcpp::Client<xarm_msgs::srv::SetSupervisedCommandGate>::SharedPtr
-    command_gate_client_;
+      command_gate_client_;
   rclcpp::Client<xarm_msgs::srv::ShutdownSupervisedController>::SharedPtr
-    shutdown_controller_client_;
-  rclcpp::Client<
-    controller_manager_msgs::srv::SetHardwareComponentState>::SharedPtr
-    hardware_state_client_;
-  rclcpp::Client<
-    controller_manager_msgs::srv::SwitchController>::SharedPtr
-    switch_controller_client_;
+      shutdown_controller_client_;
+  rclcpp::Client<controller_manager_msgs::srv::SetHardwareComponentState>::
+      SharedPtr hardware_state_client_;
+  rclcpp::Client<controller_manager_msgs::srv::SwitchController>::SharedPtr
+      switch_controller_client_;
   std::thread executor_thread_;
   mutable std::mutex state_mutex_;
   xarm_msgs::msg::SupervisedLifecycleState latest_state_;
@@ -135,4 +147,4 @@ private:
   bool trajectory_controller_active_ = false;
 };
 
-}  // namespace manyforge::xarm_control
+} // namespace manyforge::xarm_control

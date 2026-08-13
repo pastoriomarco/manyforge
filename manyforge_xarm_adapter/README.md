@@ -416,9 +416,8 @@ resources, and Program Binding at I6/N; caller-neutral lifecycle at I7/L0;
 Kernel admission and Stop at I8/P5; and the selected xArm measured-state,
 ROS-translation, real-hardware, commissioning, and evidence adapter at I10/R.
 
-At I10/R, the selected vendor adapter must again prove that exactly one owner
-holds the SDK session and production ros2_control data path. The historical
-`xarm_ros2` and `manyforge_xarm_control` division is acceptance input for that
-gate, not a current ownership claim. This package must not recreate a second
-observer, lifecycle provider, command gate, or transport path while the lane
-is unavailable.
+At I10/R, the selected vendor adapter must prove that exactly one `xarm_ros2`
+owner holds the SDK session and production ros2_control data path. The current
+`manyforge_xarm_control` CCLC adapter reaches that owner only through its
+restricted ROS boundary; this authoring package must not recreate a second
+observer, lifecycle owner, command gate, or transport path.

@@ -57,6 +57,94 @@ static_assert(
   return document;
 }
 
+[[nodiscard]] std::string with_policies(std::string document,
+                                        std::string policies) {
+  EXPECT_FALSE(document.empty());
+  EXPECT_EQ(document.back(), '}');
+  document.pop_back();
+  document += ",\"policies\":" + std::move(policies) + "}";
+  return document;
+}
+
+[[nodiscard]] std::string interrupt_config(
+    std::string_view queue_depth = "64",
+    std::string_view cancel_validation_timeout_ns = "1000000",
+    std::string_view motion_scope_arm_timeout_ns = "2000000",
+    std::string_view supervisory_poll_rate_hz = "10") {
+  return "{\"queue_depth\":" + std::string(queue_depth) +
+         ",\"cancel_validation_timeout_ns\":" +
+         std::string(cancel_validation_timeout_ns) +
+         ",\"motion_scope_arm_timeout_ns\":" +
+         std::string(motion_scope_arm_timeout_ns) +
+         ",\"supervisory_poll_rate_hz\":" +
+         std::string(supervisory_poll_rate_hz) + "}";
+}
+
+[[nodiscard]] std::string interrupt_source(
+    std::string_view source_id, std::string_view provider_binding_id,
+    std::string_view source_class = "fast_execution_relevant",
+    std::string_view kind = "level", std::string_view priority = "100",
+    std::string_view optional_fields = "") {
+  return "{\"source_id\":\"" + std::string(source_id) +
+         "\",\"capability_provider_binding_id\":\"" +
+         std::string(provider_binding_id) +
+         "\",\"adapter_capability_id\":\"interrupt.signal\","
+         "\"signal\":\"halt\",\"source_class\":\"" +
+         std::string(source_class) + "\",\"kind\":\"" + std::string(kind) +
+         "\",\"priority\":" + std::string(priority) +
+         std::string(optional_fields) + "}";
+}
+
+[[nodiscard]] std::string interrupt_policy(
+    std::string_view policy_id, std::string_view source_id,
+    std::string_view affected_phases = "[\"executing\"]",
+    std::string_view action = "preempt_trajectory",
+    std::string_view disposition = "await_recovery_action",
+    std::string_view scope_kind = "static",
+    std::string_view control_domain_ids = "[\"arm_domain\"]",
+    std::string_view resource_ids = "[]",
+    std::string_view optional_fields = "") {
+  return "{\"policy_id\":\"" + std::string(policy_id) + "\",\"source_id\":\"" +
+         std::string(source_id) +
+         "\",\"controllable_component_ids\":[],\"command_target_ids\":[],"
+         "\"control_domain_ids\":" +
+         std::string(control_domain_ids) +
+         ",\"control_binding_ids\":[],\"resource_ids\":" +
+         std::string(resource_ids) +
+         ",\"affected_phases\":" + std::string(affected_phases) +
+         ",\"preemption_action\":\"" + std::string(action) +
+         "\",\"post_latch_disposition\":\"" + std::string(disposition) +
+         "\",\"scope_kind\":\"" + std::string(scope_kind) + "\"" +
+         std::string(optional_fields) + "}";
+}
+
+[[nodiscard]] std::string interrupt_policy_envelope(
+    std::string sources, std::string policies,
+    std::string config = interrupt_config(),
+    std::string retained_policy_records = "[]") {
+  return "{\"retained_policy_records\":" +
+         std::move(retained_policy_records) +
+         ",\"stop_stage_parameters\":[],"
+         "\"commissioned_stop_interfaces\":[],\"interrupt_sources\":[" +
+         std::move(sources) + "],\"interrupt_policies\":[" +
+         std::move(policies) + "],\"interrupt_config\":" + std::move(config) +
+         "}";
+}
+
+[[nodiscard]] std::string catalog_record(
+    std::string_view kind, std::string_view id, std::string_view schema_id,
+    std::string_view revision = kZeroDigest,
+    std::string_view schema_revision = kOneDigest) {
+  return "{\"record_kind\":\"" + std::string(kind) +
+         "\",\"record_id\":\"" + std::string(id) +
+         "\",\"record_revision\":\"" + std::string(revision) +
+         "\",\"schema_id\":\"" + std::string(schema_id) +
+         "\",\"schema_revision\":\"" + std::string(schema_revision) +
+         "\",\"content_digest\":\"" + std::string(kZeroDigest) +
+         "\",\"content_addressed_store_key\":\"sha256/" +
+         std::string(64U, '0') + "\"}";
+}
+
 [[nodiscard]] std::string site_overlay_ref(
     std::string_view id = "plant_a",
     std::string_view revision = kZeroDigest,
@@ -638,15 +726,295 @@ TEST(DeploymentApplicabilityCodec,
 }
 
 TEST(DeploymentApplicabilityCodec,
+     RetainsAndCanonicallyOrdersClosedInterruptDeclarations) {
+  const std::string providers = "[" + provider_binding("signal_z") + "," +
+                                provider_binding("signal_a") + "]";
+  const std::string sources = interrupt_source("source_z", "signal_z") + "," +
+                              interrupt_source("source_a", "signal_a");
+  const std::string policies =
+      interrupt_policy("policy_z", "source_z", "[\"paused\",\"executing\"]",
+                       "latch_faulted", "fault_terminal", "static",
+                       "[\"domain_z\",\"domain_a\"]",
+                       "[\"resource_z\",\"resource_a\"]") +
+      "," +
+      interrupt_policy(
+          "policy_a", "source_a", "[\"stopping\",\"executing\"]",
+          "complete_move_on_signal", "auto_clear_after_motion_outcome",
+          "operation", "[\"domain_a\"]", "[\"resource_a\"]",
+          ",\"allowed_activation_modes\":[\"trip_if_already_active\","
+          "\"fresh_edge_after_arm\"],\"allowed_stop_modes\":["
+          "\"hard_deceleration\",\"soft_on_path\"],"
+          "\"scope_expiry\":\"operation_terminal\"");
+
+  const auto candidate =
+      decode(with_policies(minimal_document("[]", providers),
+                           interrupt_policy_envelope(sources, policies)));
+  ASSERT_TRUE(candidate.normalized_policies().has_value());
+  const std::string normalized =
+      canonical_json(*candidate.normalized_policies());
+  EXPECT_LT(normalized.find("\"source_a\""), normalized.find("\"source_z\""));
+  EXPECT_LT(normalized.find("\"policy_a\""), normalized.find("\"policy_z\""));
+  EXPECT_NE(normalized.find("\"affected_phases\":[\"executing\",\"stopping\"]"),
+            std::string::npos);
+  EXPECT_NE(normalized.find("\"allowed_stop_modes\":[\"soft_on_path\","
+                            "\"hard_deceleration\"]"),
+            std::string::npos);
+  EXPECT_NE(normalized.find("\"resource_ids\":[\"resource_a\",\"resource_z\"]"),
+            std::string::npos);
+
+  const auto revisioned =
+      compute_capability_provider_binding_revisions(candidate);
+  ASSERT_TRUE(revisioned.normalized_policies().has_value());
+  EXPECT_EQ(canonical_json(*revisioned.normalized_policies()), normalized);
+}
+
+TEST(DeploymentApplicabilityCodec,
+     RetainsOnlyCanonicalClosedPolicyCatalogReferences) {
+  const std::string retained =
+      "[" +
+      catalog_record("stop_evidence_policy", "stop.alpha",
+                     "manyforge.stop_evidence_policy.v2") +
+      "," +
+      catalog_record("runtime_policy", "runtime.alpha",
+                     "manyforge.runtime_policy.v1") +
+      "," +
+      catalog_record("contact_policy", "contact.alpha",
+                     "manyforge.contact_policy.v1") +
+      "]";
+
+  const auto candidate = decode(with_policies(
+      minimal_document(), interrupt_policy_envelope("", "", interrupt_config(),
+                                                    retained)));
+  const auto& references = candidate.value().retained_policy_records;
+  ASSERT_EQ(references.size(), 3U);
+  EXPECT_TRUE(std::holds_alternative<core::ContactPolicyCatalogRecordRefDTO>(
+      references[0]));
+  EXPECT_TRUE(std::holds_alternative<core::RuntimePolicyCatalogRecordRefDTO>(
+      references[1]));
+  EXPECT_TRUE(
+      std::holds_alternative<core::StopEvidencePolicyCatalogRecordRefDTO>(
+          references[2]));
+
+  ASSERT_TRUE(candidate.normalized_policies().has_value());
+  const std::string normalized =
+      canonical_json(*candidate.normalized_policies());
+  EXPECT_LT(normalized.find("\"contact_policy\""),
+            normalized.find("\"runtime_policy\""));
+  EXPECT_LT(normalized.find("\"runtime_policy\""),
+            normalized.find("\"stop_evidence_policy\""));
+
+  const auto revisioned =
+      compute_capability_provider_binding_revisions(candidate);
+  EXPECT_EQ(revisioned.value().retained_policy_records, references);
+  ASSERT_TRUE(revisioned.normalized_policies().has_value());
+  EXPECT_EQ(canonical_json(*revisioned.normalized_policies()), normalized);
+}
+
+TEST(DeploymentApplicabilityCodec,
+     RejectsNonPolicyAndDuplicateRetainedPolicyReferences) {
+  const auto document_for = [](std::string records) {
+    return with_policies(
+        minimal_document(),
+        interrupt_policy_envelope("", "", interrupt_config(),
+                                  "[" + std::move(records) + "]"));
+  };
+  expect_decode_error_containing(
+      document_for(catalog_record("component_type", "arm",
+                                  "manyforge.component_type.v1")),
+      "outside the closed policy-family set");
+
+  const std::string duplicate =
+      catalog_record("runtime_policy", "runtime.alpha",
+                     "manyforge.runtime_policy.v1");
+  expect_decode_error_containing(document_for(duplicate + "," + duplicate),
+                                 "duplicate complete catalog-record identity");
+}
+
+TEST(DeploymentApplicabilityCodec,
+     InterruptDeclarationsRejectBrokenIdentityAndPolicyJoins) {
+  const std::string provider = "[" + provider_binding("signal") + "]";
+  const auto document_for = [&](std::string sources, std::string policies) {
+    return with_policies(
+        minimal_document("[]", provider),
+        interrupt_policy_envelope(std::move(sources), std::move(policies)));
+  };
+  expect_decode_error_containing(
+      document_for(interrupt_source("source", "missing"),
+                   interrupt_policy("policy", "source")),
+      "references an unknown capability-provider binding");
+  expect_decode_error_containing(
+      document_for(interrupt_source("source", "signal") + "," +
+                       interrupt_source("source", "signal"),
+                   interrupt_policy("policy", "source")),
+      "duplicate source_id");
+  expect_decode_error_containing(
+      document_for(interrupt_source("source", "signal"),
+                   interrupt_policy("policy", "missing")),
+      "references an unknown interrupt source");
+  expect_decode_error_containing(
+      document_for(
+          interrupt_source("source", "signal"),
+          interrupt_policy("policy", "source", "[\"executing\"]",
+                           "preempt_trajectory", "await_recovery_action",
+                           "static", "[]", "[]")),
+      "requires at least one control domain or resource");
+  expect_decode_error_containing(
+      document_for(interrupt_source("source", "signal"),
+                   interrupt_policy("policy", "source", "[\"planning\"]",
+                                    "preempt_trajectory",
+                                    "await_recovery_action", "operation")),
+      "operation policy must include executing");
+  expect_decode_error_containing(
+      document_for(
+          interrupt_source("source", "signal"),
+          interrupt_policy("policy_a", "source", "[\"executing\"]",
+                           "preempt_trajectory", "await_recovery_action") +
+              "," +
+              interrupt_policy("policy_b", "source", "[\"executing\"]",
+                               "latch_faulted", "fault_terminal")),
+      "same-source equal-priority overlapping phases");
+  expect_decode_error_containing(
+      document_for(
+          interrupt_source("source", "signal"),
+          interrupt_policy("policy", "source", "[\"executing\"]",
+                           "preempt_trajectory", "await_recovery_action",
+                           "static", "[\"arm_domain\"]", "[]",
+                           ",\"maskable_by\":[\"missing\"]")),
+      "references an unknown interrupt policy");
+}
+
+TEST(DeploymentApplicabilityCodec,
+     InterruptConfigurationUsesExactQualifiedNumericBounds) {
+  const std::string provider = "[" + provider_binding("signal") + "]";
+  const std::string source = interrupt_source("source", "signal");
+  const std::string policy = interrupt_policy("policy", "source");
+  const auto document_for = [&](std::string config) {
+    return with_policies(
+        minimal_document("[]", provider),
+        interrupt_policy_envelope(source, policy, std::move(config)));
+  };
+  expect_decode_error_containing(
+      document_for(interrupt_config("1.5")),
+      "queue_depth: expected a non-negative I-JSON-safe integer");
+  expect_decode_error_containing(
+      document_for(interrupt_config("64", "0")),
+      "cancel_validation_timeout_ns: integer is outside");
+  expect_decode_error_containing(
+      document_for(interrupt_config("64", "100", "200", "10.1")),
+      "supervisory_poll_rate_hz: must be within");
+  expect_decode_error_containing(
+      document_for(replace_first(interrupt_config(), "\"queue_depth\"",
+                                 "\"unknown_depth\"")),
+      "unknown field 'unknown_depth'");
+}
+
+TEST(DeploymentApplicabilityCodec,
+     RetainsClosedStructuredHysteresisAndTypedStopProfile) {
+  const std::string provider = "[" + provider_binding("signal") + "]";
+  const std::string profile =
+      "{\"profile_id\":\"guard.soft\",\"stop_mode\":\"soft_on_path\","
+      "\"deceleration_time_s\":1.25,\"per_joint_max_deceleration\":{"
+      "\"z_slide\":{\"coordinate_kind\":\"linear_m_s2\",\"value_m_s2\":2.5},"
+      "\"a_joint\":{\"coordinate_kind\":\"angular_rad_s2\","
+      "\"value_rad_s2\":3.5}},\"recoverable_substitution_mode\":"
+      "\"spring_back_hold\",\"per_joint_settle_velocity_threshold\":{"
+      "\"z_slide\":{\"coordinate_kind\":\"linear_m_s\",\"value_m_s\":0.01}},"
+      "\"diagnostics\":{\"qualified\":true,\"revision\":\"v2\","
+      "\"tolerance\":0.5}}";
+  const auto candidate = decode(with_policies(
+      minimal_document("[]", provider),
+      interrupt_policy_envelope(
+          interrupt_source(
+              "source", "signal", "fast_execution_relevant", "level", "100",
+              ",\"hysteresis_value\":{\"high\":2,\"latched\":false}"),
+          interrupt_policy("policy", "source", "[\"executing\"]",
+                           "preempt_trajectory", "await_recovery_action",
+                           "static", "[\"arm_domain\"]", "[]",
+                           ",\"stop_profile\":" + profile))));
+  ASSERT_TRUE(candidate.normalized_policies().has_value());
+  const std::string normalized =
+      canonical_json(*candidate.normalized_policies());
+  EXPECT_NE(normalized.find("\"allow_natural_completion_on_short_path\":true"),
+            std::string::npos);
+  EXPECT_NE(normalized.find("\"require_backend_confirmation\":true"),
+            std::string::npos);
+  EXPECT_LT(normalized.find("\"a_joint\""), normalized.find("\"z_slide\""));
+  EXPECT_NE(normalized.find("\"hysteresis_value\":{\"high\":2,"
+                            "\"latched\":false}"),
+            std::string::npos);
+}
+
+TEST(DeploymentApplicabilityCodec,
+     TypedInterruptValuesRejectOpenShapesAndRetiredProfileFields) {
+  const std::string provider = "[" + provider_binding("signal") + "]";
+  const auto document_for_source = [&](std::string optional_fields) {
+    return with_policies(
+        minimal_document("[]", provider),
+        interrupt_policy_envelope(
+            interrupt_source("source", "signal", "fast_execution_relevant",
+                             "level", "100", optional_fields),
+            interrupt_policy("policy", "source")));
+  };
+  const auto document_for_profile = [&](std::string profile) {
+    return with_policies(
+        minimal_document("[]", provider),
+        interrupt_policy_envelope(
+            interrupt_source("source", "signal"),
+            interrupt_policy("policy", "source", "[\"executing\"]",
+                             "preempt_trajectory", "await_recovery_action",
+                             "static", "[\"arm_domain\"]", "[]",
+                             ",\"stop_profile\":" + profile)));
+  };
+
+  expect_decode_error_containing(
+      document_for_source(",\"hysteresis_value\":{}"),
+      "must contain 1..64 entries");
+  expect_decode_error_containing(
+      document_for_source(",\"hysteresis_value\":{\"nested\":{\"x\":1}}"),
+      "must be exactly boolean, finite number, or NFC string");
+  expect_decode_error_containing(
+      document_for_profile(
+          "{\"profile_id\":\"soft\",\"stop_mode\":\"soft_on_path\","
+          "\"deceleration_time_s\":1.0}"),
+      "requires its exact duration/limit presence matrix");
+  expect_decode_error_containing(
+      document_for_profile(
+          "{\"profile_id\":\"hard\",\"stop_mode\":\"hard_deceleration\","
+          "\"per_joint_max_deceleration\":{\"joint\":{"
+          "\"coordinate_kind\":\"angular_rad_s2\",\"value_rad_s2\":1}}}"),
+      "hard_deceleration forbids");
+  expect_decode_error_containing(
+      document_for_profile(
+          "{\"profile_id\":\"spring\",\"stop_mode\":\"spring_back_hold\","
+          "\"per_joint_max_deceleration\":{\"joint\":{"
+          "\"coordinate_kind\":\"angular_rad_s2\",\"value_m_s2\":1}}}"),
+      "unknown field 'value_m_s2'");
+  expect_decode_error_containing(
+      document_for_profile(
+          "{\"profile_id\":\"spring\",\"stop_mode\":\"spring_back_hold\","
+          "\"per_joint_max_deceleration\":{\"joint\":{"
+          "\"coordinate_kind\":\"angular_rad_s2\",\"value_rad_s2\":1}},"
+          "\"allow_natural_completion_on_short_path\":false}"),
+      "explicit presence is legal only for soft_on_path");
+  expect_decode_error_containing(
+      document_for_profile(
+          "{\"profile_id\":\"soft\",\"stop_mode\":\"soft_on_path\","
+          "\"deceleration_time_s\":1,\"per_joint_max_deceleration\":{"
+          "\"joint\":{\"coordinate_kind\":\"angular_rad_s2\","
+          "\"value_rad_s2\":1}},\"allowed_fallback_modes\":[]}"),
+      "unknown field 'allowed_fallback_modes'");
+}
+
+TEST(DeploymentApplicabilityCodec,
      DuplicateKeysRejectAtEveryOwnedCollectionBoundary) {
   const std::string route = desired_route();
-  EXPECT_THROW(
-      (void)decode(minimal_document(
-          "[" + desired_configuration("domain", kZeroDigest,
-                                       route + "," + route) +
-              "]",
-          "[]")),
-      DeploymentApplicabilityCodecError);
+  EXPECT_THROW((void)decode(minimal_document(
+                   "[" +
+                       desired_configuration("domain", kZeroDigest,
+                                             route + "," + route) +
+                       "]",
+                   "[]")),
+               DeploymentApplicabilityCodecError);
 
   const std::string endpoint = endpoint_binding();
   EXPECT_THROW(

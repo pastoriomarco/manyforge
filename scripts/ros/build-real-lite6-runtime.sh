@@ -58,16 +58,14 @@ esac
 
 colcon --log-base "${BUILD_ROOT}/log" build \
     --base-paths \
-        "${WORKSPACE}/manyforge_robot_lifecycle_msgs" \
-        "${WORKSPACE}/manyforge_robot_lifecycle" \
+        "${WORKSPACE}/manyforge_cclc_msgs" \
         "${WORKSPACE}/manyforge_xarm_control" \
         "${WORKSPACE}/manyforge_xarm_adapter" \
     --build-base "${BUILD_ROOT}/build" \
     --install-base "${BUILD_ROOT}/install" \
     --symlink-install \
     --packages-select \
-        manyforge_robot_lifecycle_msgs \
-        manyforge_robot_lifecycle \
+        manyforge_cclc_msgs \
         manyforge_xarm_control \
         manyforge_xarm_adapter \
     --cmake-args "${MANYFORGE_REAL_LITE6_CMAKE_ARGS[@]}"

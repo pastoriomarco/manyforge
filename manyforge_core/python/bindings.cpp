@@ -37,6 +37,7 @@ PYBIND11_MODULE(manyforge_core_py, m) {
   manyforge::core::python::register_cell_graph_bindings(m);
   manyforge::core::python::register_component_type_bindings(m);
   manyforge::core::python::register_coordinate_state_bindings(m);
+  manyforge::core::python::register_interrupt_bindings(m);
   manyforge::core::python::register_command_schema_bindings(m);
   manyforge::core::python::register_deployment_candidate_bindings(m);
   manyforge::core::python::register_model_compiler_bindings(m);
@@ -1127,6 +1128,9 @@ PYBIND11_MODULE(manyforge_core_py, m) {
       .def("__repr__", [](const manyforge::core::CollisionFailureArchiveEntry& e) {
         return py::str("CollisionFailureArchiveEntry(entry_id='{}')").format(e.entry_id);
       });
+
+  manyforge::core::python::register_component_lifecycle_bindings(m);
+  manyforge::core::python::register_operation_runtime_bindings(m);
 
   // ========================================================================
   // Cache Config

@@ -12,11 +12,13 @@ from fastapi import FastAPI, Path, Query, Request
 from fastapi.responses import JSONResponse, Response
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
+from .cclc import CCLCOpenPort, CCLCOpenRequestClient
 from .execution import ExecutionCommandClient, ExecutionEventPump
 from .manager import ManagerCommandClient
 from .models import (
     AcknowledgeAlarmRequest,
     AcknowledgeAllAlarmsRequest,
+    ComponentLifecycleRequest,
     HistorianReconcileRequest,
     ManagerApplyRequest,
     ProgramApplyRequest,
@@ -28,6 +30,7 @@ from .models import (
     PickSequencePlanningRequest,
     PlaceSequencePlanningRequest,
     RuntimeScaleRequest,
+    RouteSelectionRequest,
     SceneResourcePoseQuery,
     SceneTransactionRequest,
     StopIntentRequest,
@@ -155,6 +158,8 @@ def _error_status(code: str) -> int:
         "manager_command_response_identity_mismatch",
         "execution_command_response_invalid",
         "execution_command_response_identity_mismatch",
+        "cclc_open_response_invalid",
+        "cclc_open_response_identity_mismatch",
         "node_environment_projection_invalid",
         "program_apply_active_selection_invalid",
         "program_apply_baseline_binding_invalid",
@@ -211,6 +216,7 @@ def _error_status(code: str) -> int:
     ):
         return 400
     if code in {
+        "cclc_confirmation_required",
         "operator_alarm_acknowledgement_confirmation_required",
         "operator_alarm_acknowledgement_reason_required",
         "operator_alarm_acknowledge_all_confirmation_required",
@@ -245,6 +251,7 @@ def create_app(
     config: HeadlessApiConfig | None = None,
     *,
     service: HeadlessService | None = None,
+    cclc: CCLCOpenPort | None = None,
     trusted_principal_adapter: TrustedPrincipalAdapter | None = None,
 ) -> FastAPI:
     """Create the headless API without importing or starting Composer."""
@@ -265,6 +272,11 @@ def create_app(
             config.execution_state_root,
             timeout_seconds=config.execution_timeout_seconds,
         )
+        if cclc is None:
+            cclc = CCLCOpenRequestClient(
+                config.cclc_state_root or config.execution_state_root,
+                timeout_seconds=config.cclc_timeout_seconds,
+            )
         if config.program_runner_url is not None:
             program_runner_client = ProgramRunnerHttpClient(
                 config.program_runner_url,
@@ -286,6 +298,14 @@ def create_app(
             poll_seconds=config.execution_event_poll_milliseconds / 1_000.0,
         )
     assert service is not None
+
+    def cclc_port() -> CCLCOpenPort:
+        if cclc is None:
+            raise HeadlessApiError(
+                "cclc_owner_unavailable",
+                "CCLC owner is not configured",
+            )
+        return cclc
 
     @asynccontextmanager
     async def lifespan(_app: FastAPI):
@@ -366,6 +386,58 @@ def create_app(
     @app.get("/api/manager/diff")
     def manager_diff() -> dict[str, Any]:
         return service.manager_diff()
+
+    @app.get("/api/cclc/components/{component_id}")
+    def cclc_component_snapshot(
+        component_id: Annotated[str, Path(min_length=1, max_length=256)],
+    ) -> dict[str, Any]:
+        return cclc_port().component_snapshot(component_id)
+
+    @app.get("/api/cclc/components/{component_id}/route-templates")
+    def cclc_route_templates(
+        component_id: Annotated[str, Path(min_length=1, max_length=256)],
+    ) -> dict[str, Any]:
+        return cclc_port().route_templates(component_id)
+
+    @app.post("/api/cclc/lifecycle/requests")
+    def cclc_lifecycle_submit(
+        body: ComponentLifecycleRequest,
+    ) -> dict[str, Any]:
+        if not body.confirmed:
+            raise HeadlessApiError(
+                "cclc_confirmation_required",
+                "component lifecycle request requires explicit confirmation",
+            )
+        return cclc_port().submit_lifecycle(
+            body.model_dump(
+                mode="json", exclude={"confirmed"}, exclude_none=True
+            )
+        )
+
+    @app.get("/api/cclc/lifecycle/transactions/{transaction_id}")
+    def cclc_lifecycle_status(
+        transaction_id: Annotated[str, Path(min_length=1, max_length=256)],
+    ) -> dict[str, Any]:
+        return {"status": cclc_port().lifecycle_status(transaction_id)}
+
+    @app.post("/api/cclc/routes/requests")
+    def cclc_route_submit(body: RouteSelectionRequest) -> dict[str, Any]:
+        if not body.confirmed:
+            raise HeadlessApiError(
+                "cclc_confirmation_required",
+                "route-selection request requires explicit confirmation",
+            )
+        return cclc_port().submit_route(
+            body.model_dump(
+                mode="json", exclude={"confirmed"}, exclude_none=True
+            )
+        )
+
+    @app.get("/api/cclc/routes/transactions/{transaction_id}")
+    def cclc_route_status(
+        transaction_id: Annotated[str, Path(min_length=1, max_length=256)],
+    ) -> dict[str, Any]:
+        return {"status": cclc_port().route_status(transaction_id)}
 
     @app.get("/api/node-environment")
     def node_environment() -> dict[str, Any]:

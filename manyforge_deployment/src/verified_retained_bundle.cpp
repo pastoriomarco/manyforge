@@ -626,6 +626,7 @@ void require_structural_catalog_closure(
     const core::CellGraphDTO& graph,
     std::span<const core::CapabilityProviderBindingDTO> provider_bindings,
     std::span<const core::ExternalResourceDTO> external_resources,
+    std::span<const core::CatalogRecordRefDTO> retained_policy_records,
     std::span<const core::CatalogRecordRefDTO> records) {
   std::set<CatalogIdentity> graph_records;
   for (const auto& instance : graph.model_instances) {
@@ -690,6 +691,16 @@ void require_structural_catalog_closure(
     graph_records.emplace(core::CatalogRecordKind::kProviderManifest,
                           resource.provider_manifest_id.value(),
                           resource.provider_manifest_revision.value());
+  }
+  for (const auto& policy : retained_policy_records) {
+    graph_records.emplace(core::catalog_record_kind(policy),
+                          core::catalog_record_id_value(policy),
+                          core::catalog_record_revision_value(policy));
+    if (std::find(records.begin(), records.end(), policy) == records.end()) {
+      detail::fail_retained_bundle(
+          "retained policy selector differs from or is absent in the exact "
+          "catalog closure");
+    }
   }
 
   std::set<CatalogIdentity> catalog_records;
@@ -990,6 +1001,7 @@ void verify_node_environment_projection(const CanonicalValue& value) {
 [[nodiscard]] RevisionVerifiedDeploymentApplicabilityInputs
 verify_structural_applicability_projection(
     const CanonicalValue &desired_value, const CanonicalValue &provider_value,
+    const CanonicalValue &retained_policy_records_value,
     const CanonicalValue *site_overlay_ref_value,
     const CanonicalValue *external_resources_value,
     const core::CellGraphDTO &graph,
@@ -998,6 +1010,22 @@ verify_structural_applicability_projection(
       {"api_version", CanonicalValue("manyforge.deployment.v1")},
       {"desired_control_configurations", desired_value},
       {"capability_provider_bindings", provider_value},
+      {"policies",
+       CanonicalValue(CanonicalValue::Object{
+           {"retained_policy_records", retained_policy_records_value},
+           {"stop_stage_parameters", CanonicalValue(CanonicalValue::Array{})},
+           {"commissioned_stop_interfaces",
+            CanonicalValue(CanonicalValue::Array{})},
+           {"interrupt_sources", CanonicalValue(CanonicalValue::Array{})},
+           {"interrupt_policies", CanonicalValue(CanonicalValue::Array{})},
+           {"interrupt_config",
+            CanonicalValue(CanonicalValue::Object{
+                {"queue_depth", CanonicalValue(8.0)},
+                {"cancel_validation_timeout_ns", CanonicalValue(1000.0)},
+                {"motion_scope_arm_timeout_ns", CanonicalValue(1000.0)},
+                {"supervisory_poll_rate_hz", CanonicalValue(10.0)},
+            })},
+       })},
   };
   if (site_overlay_ref_value != nullptr) {
     root_members.emplace_back("site_overlay_ref", *site_overlay_ref_value);
@@ -1038,7 +1066,11 @@ verify_structural_applicability_projection(
        verified.normalized_site_overlay_ref() !=
            std::optional<CanonicalValue>(*site_overlay_ref_value)) ||
       (site_overlay_ref_value == nullptr &&
-       verified.value().site_overlay_ref.has_value())) {
+       verified.value().site_overlay_ref.has_value()) ||
+      verified.value().retained_policy_records !=
+          detail::decode_deployment_catalogs(CanonicalValue(
+              CanonicalValue::Object{{"records",
+                                      retained_policy_records_value}}))) {
     detail::fail_retained_bundle(
         "retained applicability differs from its exact revision-verified "
         "projection");
@@ -1221,6 +1253,7 @@ verify_current_retained_bundle_projection(const CanonicalValue& root) {
       {"api_version", "retained_bundle_id", "deployment_artifact_id",
        "deployment_revision", "cell_graph", "catalogs",
        "desired_control_configurations", "capability_provider_bindings",
+       "retained_policy_records",
        "compiled_products", "provenance"},
       {"site_overlay_ref", "external_resources", "assistant"},
       "retained_bundle");
@@ -1318,13 +1351,15 @@ verify_current_retained_bundle_projection(const CanonicalValue& root) {
   const auto applicability = verify_structural_applicability_projection(
       require_member(object, "desired_control_configurations", "retained_bundle"),
       require_member(object, "capability_provider_bindings", "retained_bundle"),
+      require_member(object, "retained_policy_records", "retained_bundle"),
       root.find_object_member("site_overlay_ref"),
       root.find_object_member("external_resources"), verified_graph.graph(),
       runtime_profiles);
   require_structural_catalog_closure(
       verified_graph.graph(),
       applicability.value().capability_provider_bindings,
-      applicability.value().external_resources, catalog_records);
+      applicability.value().external_resources,
+      applicability.value().retained_policy_records, catalog_records);
   const auto schema_artifacts = parse_structural_schema_artifacts(
       require_member(catalogs, "schema_artifacts",
                      "retained_bundle.catalogs"),
@@ -1666,6 +1701,7 @@ verify_current_retained_bundle_projection(const CanonicalValue& root) {
       },
       applicability.value().desired_control_configurations,
       applicability.value().capability_provider_bindings,
+      applicability.value().retained_policy_records,
       core::RetainedCompiledProductsDTO{
           planning,
           viewer,

@@ -46,9 +46,9 @@ namespace manyforge::roboplan_backend::qualification_fixture {
       {core::ProgramModelRoleBindingDTO{core::ModelRoleId("body"),
                                         core::ModelInstanceId("robot.model"),
                                         core::ModelRevision("model-revision")}},
-      {core::RuntimeModelGroupBindingDTO{
-          core::ModelGroupRoleId("arm_group"),
-          core::ModelInstanceId("robot.model"), "arm", joints}},
+      {core::RuntimeModelGroupBindingDTO{core::ModelGroupRoleId("arm_group"),
+                                         core::ModelInstanceId("robot.model"),
+                                         "arm", joints}},
       {core::ProgramFrameRoleBindingDTO{
            core::FrameRoleId("base"), core::ModelInstanceId("robot.model"),
            core::ModelRevision("model-revision"), "base"},
@@ -73,7 +73,8 @@ namespace manyforge::roboplan_backend::qualification_fixture {
           core::ProviderInstanceId("provider.native"),
           core::ProviderManifestId("provider-manifest.native"),
           core::ProviderManifestRevision("provider-manifest-revision"),
-          core::RuntimeEpoch("provider-epoch.1"),
+          core::RuntimeUnitId("runtime.native"),
+          core::RuntimeEpoch("runtime-epoch.1"),
           core::StateAuthorityId("state.native"),
           core::StateAuthorityClass::kPredicted,
           core::StopEvidencePolicyId("stop.native"),
@@ -89,15 +90,16 @@ namespace manyforge::roboplan_backend::qualification_fixture {
       std::nullopt,
       {core::RuntimeCapabilityProviderPathDTO{
           core::CapabilityId("planning.motion.joint_goal"),
-          core::CapabilityDefinitionRevision(
-              "sha256:"
-              "0f6cb2fda7e1d05f20a5867203b84c0e0427440f4b11657941a907c2e2a23dce"),
+          core::CapabilityDefinitionRevision("sha256:"
+                                             "0f6cb2fda7e1d05f20a5867203b84c0e0"
+                                             "427440f4b11657941a907c2e2a23dce"),
           core::CapabilityProviderBindingId("planner-binding"),
           core::CapabilityProviderBindingRevision("planner-binding-revision"),
           core::ProviderInstanceId("planner-provider"),
           core::ProviderManifestId("planner-provider-manifest"),
           core::ProviderManifestRevision("planner-provider-revision"),
-          core::RuntimeEpoch("planner-provider-epoch")}},
+          core::RuntimeUnitId("runtime.native"),
+          core::RuntimeEpoch("runtime-epoch.1")}},
       {core::RuntimeUnitEpochBindingDTO{
           core::RuntimeUnitId("runtime.native"),
           core::RuntimeEpoch("runtime-epoch.1")}}};
@@ -108,23 +110,23 @@ namespace manyforge::roboplan_backend::qualification_fixture {
   return std::move(sealed.value());
 }
 
-[[nodiscard]] inline core::CoordinatePositionDTO tagged_position(
-    core::CoordinateKind kind, double value) {
+[[nodiscard]] inline core::CoordinatePositionDTO
+tagged_position(core::CoordinateKind kind, double value) {
   return kind == core::CoordinateKind::kAngular
              ? core::CoordinatePositionDTO{core::AngularPositionDTO{value}}
              : core::CoordinatePositionDTO{core::LinearPositionDTO{value}};
 }
 
-[[nodiscard]] inline core::CoordinateVelocityDTO tagged_velocity(
-    core::CoordinateKind kind, double value) {
+[[nodiscard]] inline core::CoordinateVelocityDTO
+tagged_velocity(core::CoordinateKind kind, double value) {
   return kind == core::CoordinateKind::kAngular
              ? core::CoordinateVelocityDTO{core::AngularVelocityDTO{value}}
              : core::CoordinateVelocityDTO{core::LinearVelocityDTO{value}};
 }
 
 class StateChannel final : public IRetainedObservedStateChannel {
- public:
-  explicit StateChannel(const core::RuntimeParticipantBinding& binding)
+public:
+  explicit StateChannel(const core::RuntimeParticipantBinding &binding)
       : context_([&] {
           auto context = core::make_observed_state_query_context(binding, 0);
           if (!context.ok() || context.value().resources.size() != 2U) {
@@ -149,10 +151,11 @@ class StateChannel final : public IRetainedObservedStateChannel {
                 tagged_position(core::CoordinateKind::kAngular, 0.0)},
                std::nullopt} {}
 
-  RetainedStateProjectionResult publish_state(
-      std::span<const double> positions, std::span<const double> velocities,
-      std::int64_t source_timestamp_ns,
-      std::int64_t received_timestamp_ns) override {
+  RetainedStateProjectionResult
+  publish_state(std::span<const double> positions,
+                std::span<const double> velocities,
+                std::int64_t source_timestamp_ns,
+                std::int64_t received_timestamp_ns) override {
     std::lock_guard lock(mutex_);
     if (positions.size() != context_.resources.size() ||
         (!velocities.empty() &&
@@ -179,8 +182,8 @@ class StateChannel final : public IRetainedObservedStateChannel {
     return {RetainedStateProjectionStatus::kApplied, std::nullopt};
   }
 
-  RetainedStateProjectionResult project_latest(
-      std::int64_t, RetainedStateProjectionMode) override {
+  RetainedStateProjectionResult
+  project_latest(std::int64_t, RetainedStateProjectionMode) override {
     return {RetainedStateProjectionStatus::kApplied, std::nullopt};
   }
 
@@ -194,8 +197,8 @@ class StateChannel final : public IRetainedObservedStateChannel {
                             : result;
   }
 
-  core::Result<core::ObservedStateSnapshotDTO> current_state(
-      std::int64_t) const override {
+  core::Result<core::ObservedStateSnapshotDTO>
+  current_state(std::int64_t) const override {
     std::lock_guard lock(mutex_);
     return core::Result<core::ObservedStateSnapshotDTO>::Ok(
         core::ObservedStateSnapshotDTO{
@@ -230,25 +233,25 @@ class StateChannel final : public IRetainedObservedStateChannel {
             true});
   }
 
-  core::Result<core::ControlledStateDTO> current_controlled_state()
-      const override {
+  core::Result<core::ControlledStateDTO>
+  current_controlled_state() const override {
     std::lock_guard lock(mutex_);
     return core::Result<core::ControlledStateDTO>::Ok(state_);
   }
 
-  const core::ObservedStateQueryContextDTO& query_context()
-      const noexcept override {
+  const core::ObservedStateQueryContextDTO &
+  query_context() const noexcept override {
     return context_;
   }
 
-  const core::AddressedObservedStatePublication* addressed_publication()
-      const noexcept override {
+  const core::AddressedObservedStatePublication *
+  addressed_publication() const noexcept override {
     return nullptr;
   }
 
- private:
-  [[nodiscard]] static RetainedStateProjectionResult failure(
-      std::string reason) {
+private:
+  [[nodiscard]] static RetainedStateProjectionResult
+  failure(std::string reason) {
     return {RetainedStateProjectionStatus::kRejected,
             core::ErrorDTO{
                 std::string(core::to_string(core::ErrorCode::kInvalidRequest)),
@@ -264,12 +267,12 @@ class StateChannel final : public IRetainedObservedStateChannel {
   std::int64_t received_timestamp_ns_{};
 };
 
-[[nodiscard]] inline core::TrajectoryDTO trajectory(
-    const core::RuntimeParticipantBinding& binding, double duration_s) {
-  const auto& value = binding.value();
+[[nodiscard]] inline core::TrajectoryDTO
+trajectory(const core::RuntimeParticipantBinding &binding, double duration_s) {
+  const auto &value = binding.value();
   std::vector<core::ResourceId> resources;
   std::vector<std::string> joint_names;
-  for (const auto& resource : value.resources) {
+  for (const auto &resource : value.resources) {
     resources.push_back(resource.resource_id);
     joint_names.push_back(resource.compiled_resource_name);
   }
@@ -277,26 +280,30 @@ class StateChannel final : public IRetainedObservedStateChannel {
       std::move(resources),
       std::move(joint_names),
       {core::TrajectoryWaypointDTO{0.0, {0.0, 0.0}, {0.0, 0.0}, {0.0, 0.0}},
-       core::TrajectoryWaypointDTO{duration_s, {0.2, -0.3},
-                                   {0.0, 0.0}, {0.0, 0.0}}}};
+       core::TrajectoryWaypointDTO{
+           duration_s, {0.2, -0.3}, {0.0, 0.0}, {0.0, 0.0}}}};
 }
 
-[[nodiscard]] inline core::MotionInterruptStopProfileDTO soft_profile(
-    const core::RuntimeParticipantBinding& binding, double deceleration_s,
-    double max_stop_s) {
+[[nodiscard]] inline core::MotionInterruptStopProfileDTO
+soft_profile(const core::RuntimeParticipantBinding &binding,
+             double deceleration_s) {
   core::MotionInterruptStopProfileDTO profile;
   profile.profile_id = "native_stop_qualification_soft";
   profile.stop_mode = core::MotionInterruptStopMode::kSoftOnPath;
   profile.deceleration_time_s = deceleration_s;
-  profile.max_stop_time_s = max_stop_s;
   profile.allow_natural_completion_on_short_path = false;
-  profile.allowed_fallback_modes = {
-      core::MotionInterruptStopMode::kSpringBackHold};
-  for (const auto& resource : binding.value().resources) {
-    profile.per_joint_max_deceleration_rad_s2[
-        resource.compiled_resource_name] = 100.0;
+  profile.recoverable_substitution_mode =
+      core::MotionInterruptStopMode::kSpringBackHold;
+  for (const auto &resource : binding.value().resources) {
+    if (!resource.source_joint_name.has_value() ||
+        resource.coordinate_kind != core::CoordinateKind::kAngular) {
+      throw std::invalid_argument(
+          "native Stop qualification fixture requires angular source joints");
+    }
+    profile.per_joint_max_deceleration.emplace(
+        *resource.source_joint_name, core::AngularAccelerationDTO{100.0});
   }
   return profile;
 }
 
-}  // namespace manyforge::roboplan_backend::qualification_fixture
+} // namespace manyforge::roboplan_backend::qualification_fixture

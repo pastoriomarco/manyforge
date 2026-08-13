@@ -1,5 +1,7 @@
 #include <manyforge_core/interrupt/interrupt_manager.hpp>
 
+#include <manyforge_content_identity/canonical_value.hpp>
+
 #include <algorithm>
 #include <cmath>
 #include <limits>
@@ -7,6 +9,45 @@
 
 namespace manyforge::core {
 namespace {
+
+[[nodiscard]] constexpr bool ascii_alphanumeric(
+    unsigned char value) noexcept {
+  return (value >= static_cast<unsigned char>('a') &&
+          value <= static_cast<unsigned char>('z')) ||
+         (value >= static_cast<unsigned char>('A') &&
+          value <= static_cast<unsigned char>('Z')) ||
+         (value >= static_cast<unsigned char>('0') &&
+          value <= static_cast<unsigned char>('9'));
+}
+
+[[nodiscard]] bool portable_interrupt_structured_key(
+    std::string_view value) noexcept {
+  if (value.empty() ||
+      value.size() > kMaxInterruptStructuredValueKeyBytes ||
+      !ascii_alphanumeric(static_cast<unsigned char>(value.front()))) {
+    return false;
+  }
+  return std::all_of(value.begin() + 1, value.end(), [](char character) {
+    const auto byte = static_cast<unsigned char>(character);
+    return ascii_alphanumeric(byte) || character == '.' || character == '_' ||
+           character == '-';
+  });
+}
+
+[[nodiscard]] std::optional<std::string> interrupt_signal_value_error(
+    const InterruptSignalValue& value) {
+  if (const auto* number = std::get_if<double>(&value)) {
+    return std::isfinite(*number)
+               ? std::nullopt
+               : std::optional<std::string>{
+                     "interrupt_signal_value_non_finite"};
+  }
+  if (const auto* structured =
+          std::get_if<InterruptStructuredValue>(&value)) {
+    return interrupt_structured_value_error(*structured);
+  }
+  return std::nullopt;
+}
 
 ErrorDTO interrupt_error(std::string reason, std::string message) {
   return ErrorDTO{kErrorInvalidRequest, std::move(message), {{"reason", std::move(reason)}}};
@@ -98,7 +139,7 @@ std::optional<std::string> validate_stop_profile_shape(
   // 1. profile_id is non-empty. The audit trail uses this string;
   //    an empty id breaks correlation between the outcome record and
   //    the originating deployment / motion-node profile.
-  if (profile.profile_id.empty()) {
+  if (!motion_interrupt_stop_profile_id_valid(profile.profile_id)) {
     return "stop_profile_id_required";
   }
   // 2. Production profiles MUST require backend confirmation (spec/210
@@ -116,52 +157,14 @@ std::optional<std::string> validate_stop_profile_shape(
       !profile.deceleration_time_s) {
     return "soft_on_path_requires_deceleration_time_s";
   }
-  if (profile.stop_mode == MotionInterruptStopMode::kSoftOnPath &&
-      profile.per_joint_max_deceleration_rad_s2.empty()) {
-    return "soft_on_path_requires_per_joint_deceleration_limits";
+  if (const auto field_error =
+          motion_interrupt_stop_profile_field_error(profile);
+      !field_error.empty()) {
+    return field_error;
   }
-  // 4. Optional timing fields, when present, MUST be finite and strictly
-  //    positive. deceleration_time_s is capped to the controlled-stop wall-time
-  //    envelope so an operator/fault stop cannot silently become a long
-  //    coast-down profile.
-  //    Zero or negative values are configuration errors: a zero ramp
-  //    is degenerate, a negative ramp is meaningless, and the
-  //    arithmetic in 4.5D-2's ramp generation would silently misbehave.
-  if (profile.deceleration_time_s &&
-      (!std::isfinite(*profile.deceleration_time_s) ||
-       *profile.deceleration_time_s <= 0.0)) {
-    return "stop_profile_deceleration_time_s_must_be_positive";
-  }
-  if (profile.deceleration_time_s &&
-      *profile.deceleration_time_s >
-          kMaxControlledStopDecelerationTimeS) {
-    return "stop_profile_deceleration_time_s_must_not_exceed_max";
-  }
-  if (profile.max_stop_time_s &&
-      (!std::isfinite(*profile.max_stop_time_s) ||
-       *profile.max_stop_time_s <= 0.0)) {
-    return "stop_profile_max_stop_time_s_must_be_positive";
-  }
-  // settle_velocity_threshold_rad_s, when present, MUST be finite and strictly
-  // positive — it is the at-rest verdict threshold; a zero/negative threshold
-  // would make no joint ever read as settled (or the inverse), defeating the
-  // measured-stop confirmation.
-  if (profile.settle_velocity_threshold_rad_s &&
-      (!std::isfinite(*profile.settle_velocity_threshold_rad_s) ||
-       *profile.settle_velocity_threshold_rad_s <= 0.0)) {
-    return "stop_profile_settle_velocity_threshold_rad_s_must_be_positive";
-  }
-  // 5. Per-joint deceleration limits, when provided inline, MUST all
-  //    be strictly positive. Negative or zero per-axis limits would
-  //    let the backend produce an unbounded stop.
-  for (const auto& [joint_name, limit] :
-       profile.per_joint_max_deceleration_rad_s2) {
-    if (!std::isfinite(limit) || limit <= 0.0) {
-      return "stop_profile_per_joint_max_deceleration_must_be_positive";
-    }
-    if (joint_name.empty()) {
-      return "stop_profile_per_joint_max_deceleration_joint_name_required";
-    }
+  if (const auto diagnostics_error =
+          interrupt_structured_value_error(profile.diagnostics)) {
+    return *diagnostics_error;
   }
   return std::nullopt;
 }
@@ -227,6 +230,35 @@ std::string disposition_action_string(InterruptDispositionAction action) {
 
 }  // namespace
 
+std::optional<std::string> interrupt_structured_value_error(
+    const InterruptStructuredValue& value, bool require_nonempty) {
+  if (require_nonempty && value.empty()) {
+    return "interrupt_structured_value_empty";
+  }
+  if (value.size() > kMaxInterruptStructuredValueEntries) {
+    return "interrupt_structured_value_too_many_entries";
+  }
+  for (const auto& [key, scalar] : value) {
+    if (!portable_interrupt_structured_key(key)) {
+      return "interrupt_structured_value_key_invalid";
+    }
+    if (const auto* number = std::get_if<double>(&scalar);
+        number != nullptr && !std::isfinite(*number)) {
+      return "interrupt_structured_value_number_non_finite";
+    }
+    if (const auto* text = std::get_if<std::string>(&scalar);
+        text != nullptr) {
+      if (text->size() > kMaxInterruptStructuredValueStringBytes) {
+        return "interrupt_structured_value_string_too_long";
+      }
+      if (!content_identity::is_utf8_nfc(*text)) {
+        return "interrupt_structured_value_string_not_nfc";
+      }
+    }
+  }
+  return std::nullopt;
+}
+
 InterruptManager::InterruptManager(InterruptManagerConfig config)
     : config_(config) {
   if (config_.queue_depth == 0) {
@@ -255,6 +287,20 @@ Result<void> InterruptManager::register_source(
   if (source.freshness_budget_ns && *source.freshness_budget_ns < 0) {
     return Result<void>::Err(interrupt_error("invalid_freshness_budget",
                                              "interrupt freshness_budget_ns cannot be negative"));
+  }
+  if (source.hysteresis_value.has_value()) {
+    if (const auto* structured =
+            std::get_if<InterruptStructuredValue>(&*source.hysteresis_value)) {
+      if (auto error =
+              interrupt_structured_value_error(*structured, true)) {
+        return Result<void>::Err(interrupt_error(
+            *error, "interrupt structured hysteresis value is invalid"));
+      }
+    } else if (auto error =
+                   interrupt_signal_value_error(*source.hysteresis_value)) {
+      return Result<void>::Err(interrupt_error(
+          *error, "interrupt hysteresis value is invalid"));
+    }
   }
 
   std::lock_guard<std::mutex> lock(mutex_);
@@ -525,7 +571,8 @@ InterruptIngestResult InterruptManager::sweep_stale_sources(
     stale.freshness_ns = 0;
     stale.value = true;
     stale.fault_kind = InterruptFaultKind::kStale;
-    stale.metadata["reason"] = "source_freshness_budget_exceeded";
+    stale.metadata["reason"] =
+        interrupt_structured_string("source_freshness_budget_exceeded");
     stale.metadata["last_sequence_id"] =
         std::to_string(sample_it->second.sequence_id);
     stale.metadata["age_ns"] = std::to_string(age_ns);
@@ -1134,6 +1181,27 @@ Result<void> InterruptManager::validate_source_sample_locked(
     InterruptSourceClass attempted_lane,
     const InterruptSourceDefinition& source,
     std::int64_t kernel_now_ns) const {
+  if (auto error = interrupt_signal_value_error(update.value)) {
+    return Result<void>::Err(
+        interrupt_error(*error, "interrupt signal value is invalid"));
+  }
+  if (auto error = interrupt_structured_value_error(update.metadata)) {
+    return Result<void>::Err(
+        interrupt_error(*error, "interrupt signal metadata is invalid"));
+  }
+  if (update.covariance.has_value()) {
+    if (auto error = interrupt_structured_value_error(*update.covariance)) {
+      return Result<void>::Err(
+          interrupt_error(*error, "interrupt signal covariance is invalid"));
+    }
+  }
+  if (update.confidence.has_value() &&
+      (!std::isfinite(*update.confidence) || *update.confidence < 0.0 ||
+       *update.confidence > 1.0)) {
+    return Result<void>::Err(interrupt_error(
+        "interrupt_signal_confidence_invalid",
+        "interrupt signal confidence must be finite and within [0,1]"));
+  }
   if (attempted_lane != source.source_class) {
     return Result<void>::Err(interrupt_error(
         "source_class_violation",
@@ -1450,7 +1518,7 @@ void InterruptManager::append_latched_events_locked(
       {"preemption_result", preemption_result_string(latch.preemption_result)},
       {"signal_value", signal_value_to_string(latch.signal_snapshot.value)}};
   if (latch.tie_break) {
-    details.emplace("tie_break", "lexicographic");
+    details.emplace("tie_break", interrupt_structured_string("lexicographic"));
   }
   if (latch.signal_snapshot.fault_kind) {
     details.emplace("fault_kind",
@@ -1672,10 +1740,8 @@ InterruptManager::build_scope_binding_locked(
   // backend-capability check on top. Three independent gates here:
   //   1. complete_move_on_signal MUST carry a MotionInterruptStopProfileDTO.
   //   2. The requested stop_mode MUST be in policy.allowed_stop_modes.
-  //   3. Every element of allowed_fallback_modes MUST be in
-  //      policy.allowed_stop_modes; precision-contact node families
-  //      MUST keep allowed_fallback_modes empty unless an explicit
-  //      qualification fixture has marked the node generic.
+  //   3. The sole recoverable substitution, when present, MUST be in
+  //      policy.allowed_stop_modes and is forbidden for precision contact.
   if (policy.preemption_action ==
       InterruptPreemptionAction::kCompleteMoveOnSignal) {
     if (!scope.stop_profile) {
@@ -1700,19 +1766,19 @@ InterruptManager::build_scope_binding_locked(
           "stop_mode_not_allowed_by_policy",
           "stop_profile.stop_mode is not in policy.allowed_stop_modes"));
     }
-    for (const auto& fallback : profile.allowed_fallback_modes) {
-      if (!policy.allowed_stop_modes.contains(fallback)) {
-        return Result<ActiveScopeBinding>::Err(interrupt_error(
-            "fallback_mode_not_allowed_by_policy",
-            "a stop_profile.allowed_fallback_modes entry is not in policy.allowed_stop_modes"));
-      }
+    if (profile.recoverable_substitution_mode.has_value() &&
+        !policy.allowed_stop_modes.contains(
+            *profile.recoverable_substitution_mode)) {
+      return Result<ActiveScopeBinding>::Err(interrupt_error(
+          "recoverable_substitution_not_allowed_by_policy",
+          "the stop-profile substitution is not in policy allowed modes"));
     }
     if (scope.node_category ==
             MotionInterruptNodeCategory::kPrecisionContact &&
-        !profile.allowed_fallback_modes.empty()) {
+        profile.recoverable_substitution_mode.has_value()) {
       return Result<ActiveScopeBinding>::Err(interrupt_error(
-          "fallback_not_allowed_for_node_category",
-          "precision-contact node categories default to no fallback; scope must clear allowed_fallback_modes"));
+          "recoverable_substitution_not_allowed_for_node_category",
+          "precision-contact node categories forbid stop substitution"));
     }
   } else if (scope.stop_profile) {
     // Defense in depth: stop_profile only makes sense for
@@ -1872,7 +1938,8 @@ Result<InterruptIngestResult> InterruptManager::arm_motion_interrupt_scopes(
       arm_trip.sequence_id = sample_it->second.sequence_id;
       arm_trip.timestamp_ns = sample_it->second.timestamp_ns;
       arm_trip.value = sample_it->second.active;
-      arm_trip.metadata["reason"] = "trip_if_already_active_at_arm";
+      arm_trip.metadata["reason"] =
+          interrupt_structured_string("trip_if_already_active_at_arm");
       InterruptRuntimeContext context;
       context.phase = InterruptExecutionPhase::kTrajectoryExecution;
       context.execution_id = committed_binding.execution_id;

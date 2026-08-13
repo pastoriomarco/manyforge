@@ -212,7 +212,7 @@ produce_runtime_only_deployment(
   const auto applicability = qualify_cell_applicability(
       composition, deployment.applicability_inputs(),
       std::span<const QualifiedRuntimeProfile>(&profile, 1U), {}, {}, {}, {},
-      {}, {}, {}, {}, selected_overlay);
+      {}, {}, {}, {}, {}, selected_overlay);
   return compile_cell_ir(applicability);
 }
 

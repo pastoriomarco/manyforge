@@ -92,7 +92,6 @@ def test_removed_runtime_routes_fail_with_one_typed_unavailable_reason() -> None
         ("delete", "/api/scene/state"),
         ("get", "/api/nodes"),
         ("get", "/api/execution/history"),
-        ("get", "/api/robot-lifecycle/status"),
         ("get", "/api/scene/viewer/status"),
         ("get", "/api/scene/snapshot/status"),
         ("get", "/api/scene/pointcloud/status"),

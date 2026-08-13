@@ -26,9 +26,9 @@ namespace {
 using namespace manyforge::core;
 using namespace std::chrono_literals;
 
-[[nodiscard]] RuntimeParticipantBinding make_binding(
-    CoordinateKind kind, std::string target = "gripper.target",
-    bool component_local = false) {
+[[nodiscard]] RuntimeParticipantBinding
+make_binding(CoordinateKind kind, std::string target = "gripper.target",
+             bool component_local = false) {
   const bool angular = kind == CoordinateKind::kAngular;
   const std::vector<std::string> joints =
       angular ? std::vector<std::string>{"joint_1", "joint_2"}
@@ -56,7 +56,7 @@ using namespace std::chrono_literals;
         ProviderInstanceId("planner-provider"),
         ProviderManifestId("planner-provider-manifest"),
         ProviderManifestRevision("planner-provider-revision"),
-        RuntimeEpoch("planner-provider-epoch")});
+        RuntimeUnitId("runtime.native"), RuntimeEpoch("runtime-epoch.1")});
   }
   RuntimeParticipantBindingDTO value{
       ProgramId("program.native"),
@@ -79,12 +79,11 @@ using namespace std::chrono_literals;
                                   ModelRevision("model-revision")}},
       component_local
           ? std::vector<RuntimeModelGroupBindingDTO>{}
-          : std::vector<RuntimeModelGroupBindingDTO>{
-                RuntimeModelGroupBindingDTO{
-                    ModelGroupRoleId(angular ? "arm_group"
-                                             : "gripper_group"),
-                    ModelInstanceId("robot.model"),
-                    angular ? "arm" : "gripper", joints}},
+          : std::vector<
+                RuntimeModelGroupBindingDTO>{RuntimeModelGroupBindingDTO{
+                ModelGroupRoleId(angular ? "arm_group" : "gripper_group"),
+                ModelInstanceId("robot.model"), angular ? "arm" : "gripper",
+                joints}},
       {ProgramFrameRoleBindingDTO{FrameRoleId("base"),
                                   ModelInstanceId("robot.model"),
                                   ModelRevision("model-revision"), "base"},
@@ -110,7 +109,8 @@ using namespace std::chrono_literals;
           ProviderInstanceId("provider.native"),
           ProviderManifestId("provider-manifest.native"),
           ProviderManifestRevision("provider-manifest-revision"),
-          RuntimeEpoch("provider-epoch.1"),
+          RuntimeUnitId("runtime.native"),
+          RuntimeEpoch("runtime-epoch.1"),
           StateAuthorityId("state.native"),
           StateAuthorityClass::kPredicted,
           StopEvidencePolicyId("stop.native"),
@@ -150,8 +150,8 @@ using namespace std::chrono_literals;
 }
 
 class FakeRetainedStateChannel final : public IRetainedObservedStateChannel {
- public:
-  explicit FakeRetainedStateChannel(const RuntimeParticipantBinding& binding,
+public:
+  explicit FakeRetainedStateChannel(const RuntimeParticipantBinding &binding,
                                     std::vector<double> initial)
       : context_([&] {
           auto context = make_observed_state_query_context(binding, 0);
@@ -182,10 +182,11 @@ class FakeRetainedStateChannel final : public IRetainedObservedStateChannel {
     }
   }
 
-  RetainedStateProjectionResult publish_state(
-      std::span<const double> positions_si,
-      std::span<const double> velocities_si, std::int64_t source_timestamp_ns,
-      std::int64_t received_timestamp_ns) override {
+  RetainedStateProjectionResult
+  publish_state(std::span<const double> positions_si,
+                std::span<const double> velocities_si,
+                std::int64_t source_timestamp_ns,
+                std::int64_t received_timestamp_ns) override {
     std::unique_lock lock(mutex_);
     ++publish_calls_;
     if (block_publish_) {
@@ -219,8 +220,8 @@ class FakeRetainedStateChannel final : public IRetainedObservedStateChannel {
     return {RetainedStateProjectionStatus::kApplied, std::nullopt};
   }
 
-  RetainedStateProjectionResult project_latest(
-      std::int64_t, RetainedStateProjectionMode) override {
+  RetainedStateProjectionResult
+  project_latest(std::int64_t, RetainedStateProjectionMode) override {
     std::lock_guard lock(mutex_);
     ++project_calls_;
     if (projection_fail_) {
@@ -236,11 +237,12 @@ class FakeRetainedStateChannel final : public IRetainedObservedStateChannel {
     return {RetainedStateProjectionStatus::kApplied, std::nullopt};
   }
 
-  RetainedStateProjectionResult publish_and_project(
-      std::span<const double> positions_si,
-      std::span<const double> velocities_si, std::int64_t source_timestamp_ns,
-      std::int64_t received_timestamp_ns,
-      RetainedStateProjectionMode mode) override {
+  RetainedStateProjectionResult
+  publish_and_project(std::span<const double> positions_si,
+                      std::span<const double> velocities_si,
+                      std::int64_t source_timestamp_ns,
+                      std::int64_t received_timestamp_ns,
+                      RetainedStateProjectionMode mode) override {
     auto published = publish_state(positions_si, velocities_si,
                                    source_timestamp_ns, received_timestamp_ns);
     return published.applied() ? project_latest(received_timestamp_ns, mode)
@@ -291,12 +293,12 @@ class FakeRetainedStateChannel final : public IRetainedObservedStateChannel {
     return Result<ControlledStateDTO>::Ok(state_);
   }
 
-  const ObservedStateQueryContextDTO& query_context() const noexcept override {
+  const ObservedStateQueryContextDTO &query_context() const noexcept override {
     return context_;
   }
 
-  const AddressedObservedStatePublication* addressed_publication()
-      const noexcept override {
+  const AddressedObservedStatePublication *
+  addressed_publication() const noexcept override {
     return nullptr;
   }
 
@@ -362,9 +364,9 @@ class FakeRetainedStateChannel final : public IRetainedObservedStateChannel {
     return project_applied_calls_;
   }
 
- private:
-  [[nodiscard]] static RetainedStateProjectionResult failure(
-      RetainedStateProjectionStatus status, std::string reason) {
+private:
+  [[nodiscard]] static RetainedStateProjectionResult
+  failure(RetainedStateProjectionStatus status, std::string reason) {
     return {status, ErrorDTO{std::string(to_string(ErrorCode::kInvalidRequest)),
                              "injected retained-state result",
                              {{"reason", std::move(reason)}}}};
@@ -392,7 +394,7 @@ class FakeRetainedStateChannel final : public IRetainedObservedStateChannel {
 };
 
 class RejectingScheduler final : public IScheduler {
- public:
+public:
   ScheduleHandle schedule(TimePoint, std::function<void()>,
                           SchedulerPriority) override {
     throw std::runtime_error("injected schedule failure");
@@ -401,7 +403,7 @@ class RejectingScheduler final : public IScheduler {
 };
 
 class InlineScheduler final : public IScheduler {
- public:
+public:
   ScheduleHandle schedule(TimePoint, std::function<void()> callback,
                           SchedulerPriority) override {
     const auto handle = next_++;
@@ -410,12 +412,12 @@ class InlineScheduler final : public IScheduler {
   }
   void cancel(ScheduleHandle) override {}
 
- private:
+private:
   ScheduleHandle next_{1U};
 };
 
 class InlineThenThrowScheduler final : public IScheduler {
- public:
+public:
   ScheduleHandle schedule(TimePoint, std::function<void()> callback,
                           SchedulerPriority) override {
     callback();
@@ -425,19 +427,19 @@ class InlineThenThrowScheduler final : public IScheduler {
 };
 
 class AutoAdvanceClock final : public IClock {
- public:
+public:
   TimePoint now() const override {
     return current_.fetch_add(10'000'000, std::memory_order_acq_rel);
   }
 
- private:
+private:
   mutable std::atomic<TimePoint> current_{1};
 };
 
-[[nodiscard]] GripperCommandRequestDTO gripper_request(
-    const RuntimeParticipantBinding& binding, double target,
-    double duration_s) {
-  const auto& value = binding.value();
+[[nodiscard]] GripperCommandRequestDTO
+gripper_request(const RuntimeParticipantBinding &binding, double target,
+                double duration_s) {
+  const auto &value = binding.value();
   return GripperCommandRequestDTO{
       value.command_target_id.value(),
       value.model_groups.empty()
@@ -459,18 +461,18 @@ class AutoAdvanceClock final : public IClock {
       "commanded"};
 }
 
-[[nodiscard]] RetainedGripperPositionLimits gripper_limits(
-    const RuntimeParticipantBinding& binding) {
+[[nodiscard]] RetainedGripperPositionLimits
+gripper_limits(const RuntimeParticipantBinding &binding) {
   return RetainedGripperPositionLimits{
       binding.value().resources.front().coordinate_kind, -1.0, 1.0};
 }
 
-[[nodiscard]] TrajectoryDTO trajectory(const RuntimeParticipantBinding& binding,
+[[nodiscard]] TrajectoryDTO trajectory(const RuntimeParticipantBinding &binding,
                                        double duration_s = 0.02) {
-  const auto& value = binding.value();
+  const auto &value = binding.value();
   std::vector<ResourceId> resources;
   std::vector<std::string> joint_names;
-  for (const auto& resource : value.resources) {
+  for (const auto &resource : value.resources) {
     resources.push_back(resource.resource_id);
     joint_names.push_back(resource.compiled_resource_name);
   }
@@ -518,10 +520,10 @@ TEST(RetainedGripperCommandBackendTest,
       std::get<LinearPositionDTO>(state.value().positions[0]).value_m, 0.02);
 }
 
-TEST(RetainedGripperCommandBackendTest,
-     ComponentLocalZeroDurationCommandEstablishesAddressedStateWithoutModelProjection) {
-  auto binding =
-      make_binding(CoordinateKind::kLinear, "gripper.target", true);
+TEST(
+    RetainedGripperCommandBackendTest,
+    ComponentLocalZeroDurationCommandEstablishesAddressedStateWithoutModelProjection) {
+  auto binding = make_binding(CoordinateKind::kLinear, "gripper.target", true);
   auto channel = std::make_shared<RetainedObservedStateChannel>(
       binding, nullptr,
       RetainedObservedStateChannelConfig{
@@ -544,16 +546,16 @@ TEST(RetainedGripperCommandBackendTest,
   EXPECT_DOUBLE_EQ(
       std::get<LinearPositionDTO>(state.value().positions.front()).value_m,
       0.01);
-  EXPECT_EQ(channel->project_latest(clock.now(),
-                                    RetainedStateProjectionMode::kBlocking)
-                .status,
-            RetainedStateProjectionStatus::kApplied);
+  EXPECT_EQ(
+      channel
+          ->project_latest(clock.now(), RetainedStateProjectionMode::kBlocking)
+          .status,
+      RetainedStateProjectionStatus::kApplied);
 }
 
 TEST(RetainedGripperCommandBackendTest,
      ComponentLocalTimedCommandRequiresPreviouslyPublishedState) {
-  auto binding =
-      make_binding(CoordinateKind::kLinear, "gripper.target", true);
+  auto binding = make_binding(CoordinateKind::kLinear, "gripper.target", true);
   auto channel = std::make_shared<RetainedObservedStateChannel>(
       binding, nullptr,
       RetainedObservedStateChannelConfig{
@@ -568,8 +570,7 @@ TEST(RetainedGripperCommandBackendTest,
 
   ASSERT_FALSE(result.accepted);
   ASSERT_TRUE(result.error.has_value());
-  EXPECT_EQ(result.error->details.at("reason"),
-            "observed_state_not_published");
+  EXPECT_EQ(result.error->details.at("reason"), "observed_state_not_published");
 }
 
 TEST(RetainedGripperCommandBackendTest,
@@ -649,8 +650,7 @@ TEST(RetainedGripperCommandBackendTest,
   const auto fenced_preflight =
       backend.validate_gripper_command(gripper_request(binding, 0.01, 0.0));
   ASSERT_FALSE(fenced_preflight.ok());
-  EXPECT_EQ(fenced_preflight.error().code,
-            "gripper_command_not_authorized");
+  EXPECT_EQ(fenced_preflight.error().code, "gripper_command_not_authorized");
   EXPECT_FALSE(
       backend.command_gripper(gripper_request(binding, 0.01, 0.0)).accepted);
 
@@ -923,5 +923,5 @@ TEST(RoboPlanExecutionBackendTest,
   EXPECT_GT(backend.scene_projection_metrics().misses_total, 0U);
 }
 
-}  // namespace
-}  // namespace manyforge::roboplan_backend
+} // namespace
+} // namespace manyforge::roboplan_backend

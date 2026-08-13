@@ -365,12 +365,7 @@ require_fixture_one(const Range &values, Predicate predicate,
       component.runtime_unit_ids.begin(), component.runtime_unit_ids.end());
   runtime_unit_ids.insert(control_domain.runtime_unit_ids.begin(),
                           control_domain.runtime_unit_ids.end());
-  std::vector<core::RuntimeUnitEpochBindingDTO> runtime_epochs;
-  for (const auto &runtime_unit_id : runtime_unit_ids) {
-    runtime_epochs.push_back(
-        {runtime_unit_id,
-         core::RuntimeEpoch("epoch." + runtime_unit_id.value())});
-  }
+  runtime_unit_ids.insert(control_binding.provider_runtime_unit_id);
 
   std::optional<core::RuntimeScaleRouteQualificationDTO>
       runtime_scale_qualification;
@@ -401,13 +396,40 @@ require_fixture_one(const Range &values, Predicate predicate,
                  target->command_target_id == target_id;
         },
         "joint-planner capability provider");
+    std::set<core::RuntimeUnitId> planner_runtime_units;
+    for (const auto &endpoint : planner.endpoint_bindings) {
+      if (endpoint.source_kind !=
+          core::CapabilityEndpointSourceKind::kRuntimeUnit) {
+        continue;
+      }
+      const auto *runtime_unit =
+          std::get_if<core::RuntimeUnitId>(&endpoint.source_id);
+      if (runtime_unit == nullptr) {
+        throw std::logic_error(
+            "planner endpoint source kind and value differ");
+      }
+      planner_runtime_units.insert(*runtime_unit);
+    }
+    if (planner_runtime_units.size() != 1U) {
+      throw std::logic_error(
+          "planner capability provider has no exact runtime-unit owner");
+    }
+    const auto planner_runtime_unit = *planner_runtime_units.begin();
+    runtime_unit_ids.insert(planner_runtime_unit);
     supporting_providers.push_back(
         {planner.capability_id, planner.capability_definition_revision,
          planner.capability_provider_binding_id,
          planner.capability_provider_binding_revision,
          planner.provider_instance_id, planner.provider_manifest_id,
-         planner.provider_manifest_revision,
-         core::RuntimeEpoch("epoch." + planner.provider_instance_id.value())});
+         planner.provider_manifest_revision, planner_runtime_unit,
+         core::RuntimeEpoch("epoch." + planner_runtime_unit.value())});
+  }
+
+  std::vector<core::RuntimeUnitEpochBindingDTO> runtime_epochs;
+  for (const auto &runtime_unit_id : runtime_unit_ids) {
+    runtime_epochs.push_back(
+        {runtime_unit_id,
+         core::RuntimeEpoch("epoch." + runtime_unit_id.value())});
   }
 
   core::RuntimeParticipantBindingDTO value{
@@ -446,8 +468,10 @@ require_fixture_one(const Range &values, Predicate predicate,
           control_binding.provider_instance_id,
           control_binding.provider_manifest_id,
           control_binding.provider_manifest_revision,
+          control_binding.provider_runtime_unit_id,
           provider_runtime_epoch.value_or(core::RuntimeEpoch(
-              "epoch." + control_binding.provider_instance_id.value())),
+              "epoch." +
+              control_binding.provider_runtime_unit_id.value())),
           control_binding.state_authority_id,
           state_authority_override.value_or(
               control_binding.state_authority_class),
@@ -566,7 +590,8 @@ require_fixture_one(const Range &values, Predicate predicate,
           planner.capability_provider_binding_id,
           planner.capability_provider_binding_revision,
           planner.provider_instance_id, planner.provider_manifest_id,
-          planner.provider_manifest_revision, planner.provider_runtime_epoch},
+          planner.provider_manifest_revision,
+          planner.provider_runtime_unit_id, planner.provider_runtime_epoch},
       std::move(models),
       core::PlannerModelGroupBindingDTO{
           group.model_group_role_id, group.model_instance_id,
@@ -2263,12 +2288,15 @@ TEST(RetainedProductCrossConsumer,
       RoboPlanExecutionBackendConfig{},
       SimpleSchedulerConfig{},
       10'000'000,
-      {0.0, 0.0, 1.57, 0.0, 0.0, 0.0}};
+      {0.0, 0.0, 1.57, 0.0, 0.0, 0.0},
+      core::StopDeadlineBudgetDTO{1'000'000'000, 100'000'000, {}}};
   ManagedKernelAdmissionGate admission_gate;
   auto runtime = create_retained_native_runtime(
       RetainedNativeRuntimeInput{
           arm_binding,
           gripper_binding,
+          {},
+          {},
           {},
           {},
           scene,
@@ -2295,6 +2323,7 @@ TEST(RetainedProductCrossConsumer,
                 RetainedSceneFrameLocalStateMode::kRequireDirectProviders,
                 std::move(state_sources), 0);
           },
+          {},
           {},
           &admission_gate},
       std::move(runtime_config));

@@ -50,6 +50,34 @@ def _event(owner_epoch: str, sequence: int) -> dict[str, Any]:
     }
 
 
+def _stop_projection_event(
+    owner_epoch: str, sequence: int
+) -> dict[str, Any]:
+    payload = {
+        "acceptance": {
+            "entry_state": "active",
+            "owner_epoch": owner_epoch,
+            "request_id": "stop-request.1",
+        },
+        "affected_state": {"operations": [], "resources": []},
+        "api_version": "manyforge.stop_acceptance_projection.v1",
+        "intent": {"intent_kind": "full_stop", "value": {}},
+        "record_kind": "stop_acceptance_projected",
+    }
+    canonical = rfc8785.dumps(payload)
+    return {
+        "effect_pending": True,
+        "occurred_at_ns": 100 + sequence,
+        "occurred_at_wall": f"2026-08-07T10:00:00.00000000{sequence}Z",
+        "operation_id": None,
+        "operation_revision": None,
+        "owner_epoch": owner_epoch,
+        "payload": payload,
+        "payload_digest": f"sha256:{hashlib.sha256(canonical).hexdigest()}",
+        "record_kind": "stop_acceptance_projected",
+        "request_id": "stop-request.1",
+        "sequence": sequence,
+    }
 def _page(owner_epoch: str, events: list[dict[str, Any]]) -> dict[str, Any]:
     return {
         "api_version": "manyforge.execution_command_response.v1",
@@ -85,6 +113,41 @@ def test_execution_client_validates_event_cursor_and_owner(
     with pytest.raises(HeadlessApiError) as stalled:
         client.events(owner_epoch, 0)
     assert stalled.value.code == "execution_command_response_invalid"
+
+
+def test_execution_client_accepts_only_paired_null_stop_projection_identity(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    client = ExecutionCommandClient(tmp_path)
+    owner_epoch = "execution-host.epoch.stop"
+    stop_event = _stop_projection_event(owner_epoch, 1)
+    monkeypatch.setattr(
+        client, "_exchange", lambda _command: _page(owner_epoch, [stop_event])
+    )
+    page = client.events(owner_epoch, 0)
+    assert page["events"][0]["operation_id"] is None
+    assert page["events"][0]["operation_revision"] is None
+
+    stop_event["operation_revision"] = 1
+    with pytest.raises(HeadlessApiError) as mixed:
+        client.events(owner_epoch, 0)
+    assert mixed.value.code == "execution_command_response_invalid"
+
+    stop_event["operation_revision"] = None
+    stop_event["request_id"] = None
+    with pytest.raises(HeadlessApiError) as uncorrelated:
+        client.events(owner_epoch, 0)
+    assert uncorrelated.value.code == "execution_command_response_invalid"
+
+    ordinary = _event(owner_epoch, 1)
+    ordinary["operation_id"] = None
+    ordinary["operation_revision"] = None
+    monkeypatch.setattr(
+        client, "_exchange", lambda _command: _page(owner_epoch, [ordinary])
+    )
+    with pytest.raises(HeadlessApiError) as unattributed:
+        client.events(owner_epoch, 0)
+    assert unattributed.value.code == "execution_command_response_invalid"
 
 
 def _direct_motion_request() -> OperationIntentRequest:
@@ -422,6 +485,7 @@ class _PagedExecution:
     def __init__(self) -> None:
         self.owner_epoch = "execution-host.epoch.pump"
         self.fail = False
+        self.event = _event(self.owner_epoch, 1)
 
     def status(self) -> dict[str, Any]:
         return {
@@ -438,7 +502,7 @@ class _PagedExecution:
             raise HeadlessApiError("execution_command_unavailable", "host lost")
         assert owner_epoch == self.owner_epoch
         assert limit == 1
-        events = [] if after_sequence else [_event(owner_epoch, 1)]
+        events = [] if after_sequence else [self.event]
         return {
             "events": events,
             "has_more": False,
@@ -465,6 +529,23 @@ def test_event_pump_delivers_without_frontend_polling_and_stops_cleanly() -> Non
     assert core.ingested[0]["payload_json"] == rfc8785.dumps(
         _event(execution.owner_epoch, 1)["payload"]
     ).decode("utf-8")
+
+
+def test_event_pump_preserves_global_stop_projection_null_identity() -> None:
+    core = _RecordingCore()
+    execution = _PagedExecution()
+    execution.event = _stop_projection_event(execution.owner_epoch, 1)
+    pump = ExecutionEventPump(  # type: ignore[arg-type]
+        core, execution, poll_seconds=0.01, page_limit=1
+    )
+    pump.start()
+    assert core.completed.wait(timeout=1.0)
+    pump.shutdown()
+
+    assert len(core.ingested) == 1
+    assert core.ingested[0]["record_kind"] == "stop_acceptance_projected"
+    assert core.ingested[0]["operation_id"] is None
+    assert core.ingested[0]["operation_revision"] is None
 
 
 def test_event_pump_marks_a_lost_current_source_unknown() -> None:

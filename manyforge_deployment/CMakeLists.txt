@@ -512,10 +512,20 @@ manyforge_embed_closed_schema(
   resources/closed_schema/catalog/manyforge.command_schema.v1.yaml
   mf_cmd_schema)
 manyforge_embed_closed_schema(
+  kEmbeddedContactPolicySchema
+  contact_policy
+  resources/closed_schema/catalog/manyforge.contact_policy.v1.yaml
+  mf_contact)
+manyforge_embed_closed_schema(
   kEmbeddedRuntimeProfileSchema
   runtime_profile
   resources/closed_schema/catalog/manyforge.runtime_profile.v1.yaml
   mf_rt_profile)
+manyforge_embed_closed_schema(
+  kEmbeddedRuntimePolicySchema
+  runtime_policy
+  resources/closed_schema/catalog/manyforge.runtime_policy.v1.yaml
+  mf_rt_policy)
 manyforge_embed_closed_schema(
   kEmbeddedStopEvidencePolicySchema
   stop_evidence_policy
@@ -571,6 +581,7 @@ add_library(manyforge_deployment_verification_core
   src/control_domain_control_verifier.cpp
   src/control_interface_contract_codec.cpp
   src/controller_topology_codec.cpp
+  src/contact_policy_codec.cpp
   src/cell_graph_codec.cpp
   src/closed_schema.cpp
   src/content_identity.cpp
@@ -588,7 +599,9 @@ add_library(manyforge_deployment_verification_core
   src/runtime_program_binding.cpp
   src/reference_runtime_unit_verifier.cpp
   src/verified_retained_projection.cpp
+  src/verified_controller_lifecycle_expected_domain.cpp
   src/runtime_profile_codec.cpp
+  src/runtime_policy_codec.cpp
   src/scenario_apply_candidate_source.cpp
   src/stop_evidence_policy_codec.cpp
   src/stop_qualification_evidence.cpp
@@ -609,6 +622,125 @@ target_link_libraries(manyforge_deployment_verification_core PUBLIC
 set_target_properties(
   manyforge_deployment_verification_core
   PROPERTIES POSITION_INDEPENDENT_CODE ON)
+
+# Active-control Stop-plan composition is a cross-owner NRT adapter. Keep it
+# outside the standalone Deployment verifier: it calls Core's independently
+# qualified content-addressed plan/readiness boundary and therefore exists
+# only in a composition that already owns the concrete manyforge_core target.
+set(_MANYFORGE_STOP_PLAN_RESOLVER_DEFAULT OFF)
+if(TARGET manyforge_core)
+  set(_MANYFORGE_STOP_PLAN_RESOLVER_DEFAULT ON)
+endif()
+option(
+  MANYFORGE_BUILD_RESOLVED_STOP_BASE_PLAN_RESOLVER
+  "Build the Deployment-to-Core resolved Stop base-plan composition adapter"
+  ${_MANYFORGE_STOP_PLAN_RESOLVER_DEFAULT})
+if(MANYFORGE_BUILD_RESOLVED_STOP_BASE_PLAN_RESOLVER)
+  if(NOT TARGET manyforge_core)
+    message(FATAL_ERROR
+      "resolved Stop base-plan composition requires an existing "
+      "manyforge_core target")
+  endif()
+  add_library(manyforge_deployment_resolved_stop_base_plan_resolver
+    src/resolved_stop_base_plan_resolver.cpp
+    src/route_configuration_publication.cpp)
+  add_library(
+    manyforge::deployment_resolved_stop_base_plan_resolver ALIAS
+    manyforge_deployment_resolved_stop_base_plan_resolver)
+  target_include_directories(
+    manyforge_deployment_resolved_stop_base_plan_resolver PUBLIC
+    ${MANYFORGE_DEPLOYMENT_PUBLIC_INCLUDE_DIRECTORIES})
+  target_include_directories(
+    manyforge_deployment_resolved_stop_base_plan_resolver PRIVATE
+    "${CMAKE_CURRENT_SOURCE_DIR}/src")
+  target_link_libraries(
+    manyforge_deployment_resolved_stop_base_plan_resolver PUBLIC
+    manyforge_deployment_verification_core
+    manyforge_core)
+  set_target_properties(
+    manyforge_deployment_resolved_stop_base_plan_resolver
+    PROPERTIES POSITION_INDEPENDENT_CODE ON)
+endif()
+
+# Verified lifecycle/route-current snapshot composition is independently
+# read-only and has no dependency on the Stop-plan repository adapter. Keep
+# the target separate so minimal Manager compositions do not inherit
+# unrelated storage or mutation surfaces.
+set(_MANYFORGE_LIFECYCLE_CURRENT_SNAPSHOT_SOURCE_DEFAULT OFF)
+if(TARGET manyforge_core)
+  set(_MANYFORGE_LIFECYCLE_CURRENT_SNAPSHOT_SOURCE_DEFAULT ON)
+endif()
+option(
+  MANYFORGE_BUILD_COMPONENT_LIFECYCLE_CURRENT_SNAPSHOT_SOURCE
+  "Build the verified Deployment-to-Core lifecycle current-snapshot source"
+  ${_MANYFORGE_LIFECYCLE_CURRENT_SNAPSHOT_SOURCE_DEFAULT})
+if(MANYFORGE_BUILD_COMPONENT_LIFECYCLE_CURRENT_SNAPSHOT_SOURCE)
+  if(NOT TARGET manyforge_core)
+    message(FATAL_ERROR
+      "component lifecycle current-snapshot composition requires an existing "
+      "manyforge_core target")
+  endif()
+  add_library(manyforge_deployment_component_lifecycle_current_snapshot_source
+    src/component_lifecycle_current_snapshot_source.cpp
+    src/route_selection_current_snapshot_source.cpp)
+  add_library(
+    manyforge::deployment_component_lifecycle_current_snapshot_source ALIAS
+    manyforge_deployment_component_lifecycle_current_snapshot_source)
+  target_include_directories(
+    manyforge_deployment_component_lifecycle_current_snapshot_source PUBLIC
+    ${MANYFORGE_DEPLOYMENT_PUBLIC_INCLUDE_DIRECTORIES})
+  target_link_libraries(
+    manyforge_deployment_component_lifecycle_current_snapshot_source PUBLIC
+    manyforge_deployment_verification_core
+    manyforge_core)
+  set_target_properties(
+    manyforge_deployment_component_lifecycle_current_snapshot_source
+    PROPERTIES POSITION_INDEPENDENT_CODE ON)
+endif()
+
+# Complete CCLC runtime ownership is an effectful production composition. Keep
+# it outside the compiler/verifier and require every independently qualified
+# Core/Deployment dependency explicitly; standalone compiler builds remain
+# free of runtime journals and mutable repositories.
+set(_MANYFORGE_CCLC_RUNTIME_COMPOSITION_DEFAULT OFF)
+if(TARGET manyforge_core_sqlite_cclc_journal AND
+   TARGET manyforge_core_filesystem_resolved_stop_base_plan_repository AND
+   TARGET manyforge_deployment_resolved_stop_base_plan_resolver AND
+   TARGET manyforge_deployment_component_lifecycle_current_snapshot_source)
+  set(_MANYFORGE_CCLC_RUNTIME_COMPOSITION_DEFAULT ON)
+endif()
+option(
+  MANYFORGE_BUILD_CCLC_RUNTIME_COMPOSITION
+  "Build the complete Deployment-owned CCLC runtime composition"
+  ${_MANYFORGE_CCLC_RUNTIME_COMPOSITION_DEFAULT})
+if(MANYFORGE_BUILD_CCLC_RUNTIME_COMPOSITION)
+  if(NOT TARGET manyforge_core_sqlite_cclc_journal OR
+     NOT TARGET manyforge_core_filesystem_resolved_stop_base_plan_repository OR
+     NOT TARGET manyforge_deployment_resolved_stop_base_plan_resolver OR
+     NOT TARGET manyforge_deployment_component_lifecycle_current_snapshot_source)
+    message(FATAL_ERROR
+      "CCLC runtime composition requires the Core journals/repository and "
+      "Deployment current-source/Stop-plan targets")
+  endif()
+  add_library(manyforge_deployment_cclc_runtime_composition
+    src/cclc_runtime_composition.cpp
+    src/cclc_open_request_server.cpp)
+  add_library(
+    manyforge::deployment_cclc_runtime_composition ALIAS
+    manyforge_deployment_cclc_runtime_composition)
+  target_include_directories(
+    manyforge_deployment_cclc_runtime_composition PUBLIC
+    ${MANYFORGE_DEPLOYMENT_PUBLIC_INCLUDE_DIRECTORIES})
+  target_link_libraries(
+    manyforge_deployment_cclc_runtime_composition PUBLIC
+    manyforge_deployment_component_lifecycle_current_snapshot_source
+    manyforge_deployment_resolved_stop_base_plan_resolver
+    manyforge_core_sqlite_cclc_journal
+    manyforge_core_filesystem_resolved_stop_base_plan_repository)
+  set_target_properties(
+    manyforge_deployment_cclc_runtime_composition
+    PROPERTIES POSITION_INDEPENDENT_CODE ON)
+endif()
 
 # Full offline compiler and writer surface. Admission is intentionally not a
 # dependency: the build-profile emitter must be able to link this target
@@ -1129,6 +1261,13 @@ if(BUILD_TESTING)
   gtest_discover_tests(test_control_interface_contract_codec
     PROPERTIES TIMEOUT ${MANYFORGE_GTEST_TIMEOUT_SECONDS})
 
+  add_executable(test_contact_policy_codec
+    test/test_contact_policy_codec.cpp)
+  target_link_libraries(test_contact_policy_codec PRIVATE
+    manyforge_deployment GTest::gtest_main)
+  gtest_discover_tests(test_contact_policy_codec
+    PROPERTIES TIMEOUT ${MANYFORGE_GTEST_TIMEOUT_SECONDS})
+
   add_executable(test_controller_topology_codec
     test/test_controller_topology_codec.cpp)
   target_link_libraries(test_controller_topology_codec PRIVATE
@@ -1463,6 +1602,80 @@ if(BUILD_TESTING)
   gtest_discover_tests(test_retained_bundle_store
     PROPERTIES TIMEOUT ${MANYFORGE_GTEST_TIMEOUT_SECONDS})
 
+  add_executable(test_verified_controller_lifecycle_expected_domain
+    test/test_verified_controller_lifecycle_expected_domain.cpp)
+  target_compile_definitions(
+    test_verified_controller_lifecycle_expected_domain PRIVATE
+    MANYFORGE_LITE6_STRUCTURAL_FIXTURE_ROOT="${MANYFORGE_LITE6_STRUCTURAL_FIXTURE_ROOT}"
+    MANYFORGE_LITE6_STRUCTURAL_SOURCE_ROOT="${MANYFORGE_LITE6_STRUCTURAL_SOURCE_ROOT}")
+  target_include_directories(
+    test_verified_controller_lifecycle_expected_domain PRIVATE
+    "${CMAKE_CURRENT_SOURCE_DIR}/src")
+  target_link_libraries(test_verified_controller_lifecycle_expected_domain PRIVATE
+    manyforge_deployment GTest::gtest_main)
+  gtest_discover_tests(test_verified_controller_lifecycle_expected_domain
+    PROPERTIES TIMEOUT ${MANYFORGE_GTEST_TIMEOUT_SECONDS})
+
+  if(TARGET manyforge_deployment_resolved_stop_base_plan_resolver)
+    add_executable(test_resolved_stop_base_plan_resolver
+      test/test_resolved_stop_base_plan_resolver.cpp)
+    target_compile_definitions(
+      test_resolved_stop_base_plan_resolver PRIVATE
+      MANYFORGE_LITE6_STRUCTURAL_FIXTURE_ROOT="${MANYFORGE_LITE6_STRUCTURAL_FIXTURE_ROOT}"
+      MANYFORGE_LITE6_STRUCTURAL_SOURCE_ROOT="${MANYFORGE_LITE6_STRUCTURAL_SOURCE_ROOT}")
+    target_include_directories(test_resolved_stop_base_plan_resolver PRIVATE
+      "${CMAKE_CURRENT_SOURCE_DIR}/src")
+    target_link_libraries(test_resolved_stop_base_plan_resolver PRIVATE
+      manyforge_deployment
+      manyforge_deployment_resolved_stop_base_plan_resolver
+      GTest::gtest_main)
+    gtest_discover_tests(test_resolved_stop_base_plan_resolver
+      PROPERTIES TIMEOUT ${MANYFORGE_GTEST_TIMEOUT_SECONDS})
+  endif()
+
+  if(TARGET manyforge_deployment_component_lifecycle_current_snapshot_source)
+    add_executable(test_component_lifecycle_current_snapshot_source
+      test/test_component_lifecycle_current_snapshot_source.cpp)
+    target_compile_definitions(
+      test_component_lifecycle_current_snapshot_source PRIVATE
+      MANYFORGE_LITE6_STRUCTURAL_FIXTURE_ROOT="${MANYFORGE_LITE6_STRUCTURAL_FIXTURE_ROOT}"
+      MANYFORGE_LITE6_STRUCTURAL_SOURCE_ROOT="${MANYFORGE_LITE6_STRUCTURAL_SOURCE_ROOT}")
+    target_include_directories(
+      test_component_lifecycle_current_snapshot_source PRIVATE
+      "${CMAKE_CURRENT_SOURCE_DIR}/src")
+    target_link_libraries(test_component_lifecycle_current_snapshot_source PRIVATE
+      manyforge_deployment
+      manyforge_deployment_component_lifecycle_current_snapshot_source
+      GTest::gtest_main)
+    gtest_discover_tests(test_component_lifecycle_current_snapshot_source
+      PROPERTIES TIMEOUT ${MANYFORGE_GTEST_TIMEOUT_SECONDS})
+  endif()
+
+  if(TARGET manyforge_deployment_cclc_runtime_composition)
+    add_executable(test_cclc_open_request_server
+      test/test_cclc_open_request_server.cpp)
+    target_link_libraries(test_cclc_open_request_server PRIVATE
+      manyforge_deployment_cclc_runtime_composition
+      GTest::gtest_main)
+    gtest_discover_tests(test_cclc_open_request_server
+      PROPERTIES TIMEOUT ${MANYFORGE_GTEST_TIMEOUT_SECONDS})
+
+    add_executable(test_cclc_runtime_composition
+      test/test_cclc_runtime_composition.cpp)
+    target_compile_definitions(
+      test_cclc_runtime_composition PRIVATE
+      MANYFORGE_LITE6_STRUCTURAL_FIXTURE_ROOT="${MANYFORGE_LITE6_STRUCTURAL_FIXTURE_ROOT}"
+      MANYFORGE_LITE6_STRUCTURAL_SOURCE_ROOT="${MANYFORGE_LITE6_STRUCTURAL_SOURCE_ROOT}")
+    target_include_directories(test_cclc_runtime_composition PRIVATE
+      "${CMAKE_CURRENT_SOURCE_DIR}/src")
+    target_link_libraries(test_cclc_runtime_composition PRIVATE
+      manyforge_deployment
+      manyforge_deployment_cclc_runtime_composition
+      GTest::gtest_main)
+    gtest_discover_tests(test_cclc_runtime_composition
+      PROPERTIES TIMEOUT ${MANYFORGE_GTEST_TIMEOUT_SECONDS})
+  endif()
+
   add_executable(test_catalog_artifact_store
     test/test_catalog_artifact_store.cpp)
   target_include_directories(test_catalog_artifact_store PRIVATE
@@ -1566,6 +1779,13 @@ if(BUILD_TESTING)
       "-DMANYFORGE_TEST_ROOT=${CMAKE_CURRENT_BINARY_DIR}/profile_determinism"
       -P
       "${CMAKE_CURRENT_SOURCE_DIR}/test/build_qualified_admission_profile_determinism.cmake")
+
+  add_executable(test_runtime_policy_codec
+    test/test_runtime_policy_codec.cpp)
+  target_link_libraries(test_runtime_policy_codec PRIVATE
+    manyforge_deployment GTest::gtest_main)
+  gtest_discover_tests(test_runtime_policy_codec
+    PROPERTIES TIMEOUT ${MANYFORGE_GTEST_TIMEOUT_SECONDS})
 
   add_executable(test_stop_evidence_policy_codec
     test/test_stop_evidence_policy_codec.cpp)

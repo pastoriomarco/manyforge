@@ -1,0 +1,7 @@
+{
+  "api_version": "manyforge.capability_definition.v1",
+  "capability_definition_revision": "sha256:c61d01109243632bd3a4184061863cee480a35f253aabac7719fea634e2defd3",
+  "capability_id": "component.lifecycle.prepare",
+  "provider_binding_kind": "capability_provider_binding",
+  "scope": "control_domain"
+}

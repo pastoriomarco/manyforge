@@ -177,23 +177,8 @@ def supervised_runtime_urdf(
     )
     if test_only_fake:
         parameters = {
-            'backend': 'fake',
-            'robot_id': 'lite6-production-binding-fixture',
-            'transport_owner_id': (
-                'lite6-production-binding-fixture:sole-owner'
-            ),
-            'authority_profile': 'local_operator',
-            'trajectory_controller_name': (
-                binding.trajectory_controller.rsplit('/', 1)[-1]
-            ),
-            'controller_manager_activity_topic': (
-                f'{binding.controller_manager}/activity'
-            ),
-            'observation_lease_ms': '250',
-            'observation_refresh_ms': '50',
-            'fake_backend_confirmation': (
-                'ALLOW_TEST_ONLY_FAKE_BACKEND'
-            ),
+            'mock_sensor_commands': 'false',
+            'calculate_dynamics': 'false',
         }
     else:
         parameters = {

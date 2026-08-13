@@ -3,13 +3,13 @@
   Regenerate with:
     cd <repository-root>
     python3 scripts/regen-public-contracts.py structural-rest
-  Last regenerated: 2026-08-10 09:38:39 UTC
+  Last regenerated: 2026-08-13 07:12:49 UTC
   Generator source: scripts/regen-public-contracts.py:gen_rest_api
 -->
 
 # Composer REST API
 
-This is the structural, authoring, and thin runtime-client Composer surface retained during the composable-cell runtime cutover. Catalog reads, sandboxed artifact browsing, structural URDF assets, health, and the strict revision-fenced Program Draft/Saved workflow remain available. When Headless and the independent Program runner are configured, Composer also forwards scenario, Applied, Program Run, status, and explicit Program Stop requests without owning their state. Complete product launch and later lifecycle/scene/backend capabilities remain unavailable. The catch-all `/api/{unavailable_path}` operations return the typed runtime-unavailable response for former product routes.
+This is the structural, authoring, and thin runtime-client Composer surface retained during the composable-cell runtime cutover. Catalog reads, sandboxed artifact browsing, structural URDF assets, health, and the strict revision-fenced Program Draft/Saved workflow remain available. When Headless and the independent Program runner are configured, Composer also forwards scenario, Applied, Program Run, status, explicit Program Stop, and confirmed CCLC lifecycle/route requests without owning their state. Complete product launch and remaining scene/backend capabilities remain unavailable. The catch-all `/api/{unavailable_path}` operations return the typed runtime-unavailable response for former product routes.
 
 The live schema is available at `/openapi.json` and `/docs` while the API process is running.
 
@@ -24,6 +24,12 @@ OpenAPI version: `3.1.0`. Title: `ManyForge Composer (replaceable client)`.
 | `GET` | `/api/assistant/modes/{mode_id}` | headless-runtime-client | Assistant Mode |
 | `GET` | `/api/catalog` | catalog | Get Catalog |
 | `GET` | `/api/catalog/{entry_id}` | catalog | Get Catalog Entry |
+| `GET` | `/api/cclc/components/{component_id}` | headless-runtime-client | Cclc Component |
+| `GET` | `/api/cclc/components/{component_id}/route-templates` | headless-runtime-client | Cclc Route Templates |
+| `POST` | `/api/cclc/lifecycle/requests` | headless-runtime-client | Cclc Lifecycle Submit |
+| `GET` | `/api/cclc/lifecycle/transactions/{transaction_id}` | headless-runtime-client | Cclc Lifecycle Status |
+| `POST` | `/api/cclc/routes/requests` | headless-runtime-client | Cclc Route Submit |
+| `GET` | `/api/cclc/routes/transactions/{transaction_id}` | headless-runtime-client | Cclc Route Status |
 | `GET` | `/api/execution/alarms` | headless-runtime-client | Alarms |
 | `POST` | `/api/execution/alarms/acknowledge-all` | headless-runtime-client | Acknowledge All |
 | `GET` | `/api/execution/alarms/metrics` | headless-runtime-client | Alarm Metrics |

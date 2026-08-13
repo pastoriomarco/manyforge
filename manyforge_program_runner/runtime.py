@@ -15,6 +15,7 @@ from manyforge_behavior.assistant_program_port import (
     ProgramAssistantPort,
     ProgramModelTransport,
 )
+from manyforge_behavior.cclc_program_port import CCLCProgramTaskPort
 from manyforge_behavior.executable_node_resolver import (
     build_executable_node_resolver,
 )
@@ -144,6 +145,11 @@ class ProgramRuntime:
         self._environment = build_node_environment()
         self._native = NativeKernelProgramPort(KernelClient(self._headless))
         self._scene = HeadlessSceneProgramPort(self._headless)
+        self._cclc = CCLCProgramTaskPort(
+            self._headless,
+            request_owner_epoch=self.owner_epoch,
+            maximum_retained_tasks=config.maximum_retained_runs,
+        )
         self._assistant = (
             None
             if model_transport is None
@@ -153,7 +159,7 @@ class ProgramRuntime:
                 audit_sink=HeadlessProgramModelAuditSink(self._headless),
             )
         )
-        context_members = [self._native, self._scene]
+        context_members = [self._native, self._scene, self._cclc]
         if self._assistant is not None:
             context_members.append(self._assistant)
         self._interventions = ProgramInterventionRegistry(
@@ -164,6 +170,8 @@ class ProgramRuntime:
             scene_transactions=self._scene,
             assistant_requests=self._assistant,
             pick_place=self._native.pick_place,
+            cclc_lifecycle=self._cclc,
+            cclc_routes=self._cclc,
             program_run_scope=self._native.scope,
             program_run_context=CompositeProgramRunContextPort(*context_members),
             program_run_initialization=self._scene,

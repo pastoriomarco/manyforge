@@ -53,7 +53,8 @@ using namespace manyforge::core;
                             ProviderInstanceId("provider.native"),
                             ProviderManifestId("provider-manifest.native"),
                             ProviderManifestRevision("provider-manifest-revision"),
-                            RuntimeEpoch("provider-epoch.1"),
+                            RuntimeUnitId("runtime.native"),
+                            RuntimeEpoch("runtime-epoch.1"),
                             StateAuthorityId("state.native"),
                             StateAuthorityClass::kPredicted,
                             StopEvidencePolicyId("stop.native"),
@@ -62,15 +63,18 @@ using namespace manyforge::core;
                             std::nullopt},
       std::nullopt,
       {},
-      {}};
+      {RuntimeUnitEpochBindingDTO{RuntimeUnitId("runtime.native"),
+                                  RuntimeEpoch("runtime-epoch.1")}}};
 }
 
-TEST(RuntimeParticipantBindingTest, SealsExactControlPathWithoutInventingRuntimeUnits) {
+TEST(RuntimeParticipantBindingTest, SealsExactControlPathRuntimeUnitEpochJoin) {
   auto result = verify_runtime_participant_binding(valid_binding());
   ASSERT_TRUE(result.ok()) << result.error().message;
   EXPECT_EQ(result.value().value().resources.size(), 2U);
-  EXPECT_TRUE(result.value().value().runtime_unit_epochs.empty());
+  ASSERT_EQ(result.value().value().runtime_unit_epochs.size(), 1U);
   ASSERT_TRUE(result.value().value().control_path.has_value());
+  EXPECT_EQ(result.value().value().control_path->provider_runtime_unit_id,
+            result.value().value().runtime_unit_epochs.front().runtime_unit_id);
   EXPECT_EQ(result.value().value().control_path->active_control_configuration_generation.value(),
             1U);
 }
@@ -105,17 +109,15 @@ TEST(RuntimeParticipantBindingTest,
   value.capability_id = CapabilityId("tool.gripper.command");
   value.model_groups.clear();
   value.resources = {RuntimeResourceBindingDTO{
-      ResourceRoleId("fingers"), ResourceId("robot.gripper.logical_position"),
-      std::nullopt, "robot.gripper.logical_position",
-      CoordinateKind::kLinear}};
+      ResourceRoleId("fingers"), ResourceId("robot.gripper.logical_position"), std::nullopt,
+      "robot.gripper.logical_position", CoordinateKind::kLinear}};
 
   auto result = verify_runtime_participant_binding(std::move(value));
 
   ASSERT_TRUE(result.ok()) << result.error().message;
   EXPECT_TRUE(result.value().value().model_groups.empty());
   ASSERT_EQ(result.value().value().resources.size(), 1U);
-  EXPECT_FALSE(
-      result.value().value().resources.front().source_joint_name.has_value());
+  EXPECT_FALSE(result.value().value().resources.front().source_joint_name.has_value());
   const auto context = make_observed_state_query_context(result.value(), 0);
   ASSERT_TRUE(context.ok()) << context.error().message;
   EXPECT_EQ(context.value().joint_names,
@@ -157,6 +159,14 @@ TEST(RuntimeParticipantBindingTest, RejectsMissingActiveOrProviderEpoch) {
   EXPECT_EQ(provider_result.error().details.at("reason"), "runtime_control_path_invalid");
 }
 
+TEST(RuntimeParticipantBindingTest, RejectsMissingProviderRuntimeUnitJoin) {
+  auto mismatched_unit = valid_binding();
+  mismatched_unit.runtime_unit_epochs.front().runtime_unit_id = RuntimeUnitId("runtime.other");
+  auto unit_result = verify_runtime_participant_binding(std::move(mismatched_unit));
+  ASSERT_FALSE(unit_result.ok());
+  EXPECT_EQ(unit_result.error().details.at("reason"), "runtime_provider_epoch_join_invalid");
+}
+
 TEST(RuntimeParticipantBindingTest, RequiresAtLeastOneRuntimePath) {
   auto value = valid_binding();
   value.control_path.reset();
@@ -166,29 +176,34 @@ TEST(RuntimeParticipantBindingTest, RequiresAtLeastOneRuntimePath) {
   EXPECT_EQ(result.error().details.at("reason"), "runtime_participant_path_missing");
 }
 
-TEST(RuntimeParticipantBindingTest,
-     ResolvesOverlappingSemanticBodyRolesToOnePhysicalProjection) {
+TEST(RuntimeParticipantBindingTest, ResolvesOverlappingSemanticBodyRolesToOnePhysicalProjection) {
   auto value = valid_binding();
-  const auto semantic = make_component_collision_body_id(
-      value.controllable_component_id, ModelInstanceId("robot.model"),
-      CollisionBodyRoleId("tool_collision"), 0U);
+  const auto semantic = make_component_collision_body_id(value.controllable_component_id,
+                                                         ModelInstanceId("robot.model"),
+                                                         CollisionBodyRoleId("tool_collision"), 0U);
   const auto physical = make_component_collision_body_id(
       value.controllable_component_id, ModelInstanceId("robot.model"),
       CollisionBodyRoleId("gripper_collision"), 0U);
-  value.collision_body_bindings = {ProgramCollisionBodyRoleBindingDTO{
-      CollisionBodyRoleId("tool_collision"),
-      ModelInstanceId("robot.model"), ModelRevision("model-revision"),
-      {"mf2_robot_tool"}}};
+  value.collision_body_bindings = {
+      ProgramCollisionBodyRoleBindingDTO{CollisionBodyRoleId("tool_collision"),
+                                         ModelInstanceId("robot.model"),
+                                         ModelRevision("model-revision"),
+                                         {"mf2_robot_tool"}}};
   value.contact_grasp_bindings = {ProgramContactGraspBindingDTO{
-      ContactPolicyId("grasp.tool"), ContactPolicyRevision("grasp-revision"),
+      ContactPolicyId("grasp.tool"),
+      ContactPolicyRevision("grasp-revision"),
       RuntimeObjectId("selected_object"),
-      {ProgramContactGraspBodyBindingDTO{
-          value.component_role_id, value.target_role_id,
-          value.controllable_component_id, value.command_target_id,
-          ModelRoleId("body"), CollisionBodyRoleId("tool_collision"),
-          ModelInstanceId("robot.model"), ModelRevision("model-revision"),
-          {semantic}}},
-      0.002, 0.8}};
+      {ProgramContactGraspBodyBindingDTO{value.component_role_id,
+                                         value.target_role_id,
+                                         value.controllable_component_id,
+                                         value.command_target_id,
+                                         ModelRoleId("body"),
+                                         CollisionBodyRoleId("tool_collision"),
+                                         ModelInstanceId("robot.model"),
+                                         ModelRevision("model-revision"),
+                                         {semantic}}},
+      0.002,
+      0.8}};
   auto sealed = verify_runtime_participant_binding(std::move(value));
   ASSERT_TRUE(sealed.ok()) << sealed.error().message;
 
@@ -196,32 +211,27 @@ TEST(RuntimeParticipantBindingTest,
       {physical, physical},
       {semantic, physical},
   };
-  auto resolved = bind_runtime_participant_collision_body_aliases(
-      std::move(sealed.value()), aliases);
+  auto resolved =
+      bind_runtime_participant_collision_body_aliases(std::move(sealed.value()), aliases);
 
   ASSERT_TRUE(resolved.ok()) << resolved.error().message;
-  const auto& body = resolved.value()
-                         .value()
-                         .contact_grasp_bindings.front()
-                         .allowed_body_bindings.front();
+  const auto& body =
+      resolved.value().value().contact_grasp_bindings.front().allowed_body_bindings.front();
   EXPECT_EQ(body.collision_body_role_id.value(), "tool_collision");
-  EXPECT_EQ(body.collision_body_ids,
-            (std::vector<std::string>{physical}));
+  EXPECT_EQ(body.collision_body_ids, (std::vector<std::string>{physical}));
 }
 
-TEST(RuntimeParticipantBindingTest,
-     RejectsCollisionBodyAliasWithoutPhysicalFixedPoint) {
+TEST(RuntimeParticipantBindingTest, RejectsCollisionBodyAliasWithoutPhysicalFixedPoint) {
   auto sealed = verify_runtime_participant_binding(valid_binding());
   ASSERT_TRUE(sealed.ok());
   const std::vector<RuntimeCollisionBodyAliasDTO> aliases{
       {CollisionBodyId("semantic"), CollisionBodyId("physical")}};
 
-  auto resolved = bind_runtime_participant_collision_body_aliases(
-      std::move(sealed.value()), aliases);
+  auto resolved =
+      bind_runtime_participant_collision_body_aliases(std::move(sealed.value()), aliases);
 
   ASSERT_FALSE(resolved.ok());
-  EXPECT_EQ(resolved.error().details.at("reason"),
-            "runtime_collision_body_alias_table_invalid");
+  EXPECT_EQ(resolved.error().details.at("reason"), "runtime_collision_body_alias_table_invalid");
 }
 
 }  // namespace

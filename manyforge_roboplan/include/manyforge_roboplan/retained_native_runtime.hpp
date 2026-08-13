@@ -9,6 +9,7 @@
 #include <manyforge_core/ports/ireference_pose_resolver.hpp>
 #include <manyforge_core/resource_addressed_execution_kernel.hpp>
 #include <manyforge_core/sqlite_operation_journal.hpp>
+#include <manyforge_deployment/route_configuration_publication.hpp>
 #include <manyforge_roboplan/native_runtime_support.hpp>
 #include <manyforge_roboplan/retained_collision_world_publisher.hpp>
 #include <manyforge_roboplan/retained_focused_adapters.hpp>
@@ -38,6 +39,10 @@ struct RetainedNativeRuntimeConfig final {
   /// Empty remains available only to lower-level fixtures that intentionally
   /// bootstrap from the scene's already-established state.
   std::vector<double> initial_motion_positions_rad;
+  /// Cell-wide Stop envelope supplied by the current configuration owner when
+  /// no verified participant readiness is installed yet. It is never
+  /// inferred from a not-stoppable retained policy or a test constant.
+  std::optional<core::StopDeadlineBudgetDTO> cell_stop_deadline_budget;
 };
 
 struct RetainedNativeAddressedOwnerConfig final {
@@ -46,6 +51,8 @@ struct RetainedNativeAddressedOwnerConfig final {
   std::filesystem::path operation_journal_path;
   std::size_t request_replay_capacity{1024U};
   core::IResourceOperationAdmissionGate *operation_admission_gate{};
+  core::GraphRevision graph_revision;
+  std::optional<core::StopDeadlineBudgetDTO> cell_stop_deadline_budget;
 };
 
 using RetainedReferenceResolverFactory =
@@ -55,6 +62,10 @@ using RetainedReferenceResolverFactory =
 using RetainedRuntimeParticipantResolver =
     std::function<core::Result<core::RuntimeParticipantBinding>(
         const core::OperationIntentDTO &, std::size_t)>;
+
+using RetainedRuntimeParticipantResolverFactory =
+    std::function<RetainedRuntimeParticipantResolver(
+        std::vector<core::RuntimeParticipantBinding>)>;
 
 /// Already-verified inputs to one native runtime composition.
 ///
@@ -66,6 +77,12 @@ using RetainedRuntimeParticipantResolver =
 struct RetainedNativeRuntimeInput final {
   core::RuntimeParticipantBinding motion_binding;
   std::optional<core::RuntimeParticipantBinding> gripper_binding;
+  /// CCLC-issued, repository-read-back Stop readiness for the exact physical
+  /// motion binding. Runtime composition never fabricates lifecycle or active
+  /// configuration generations from retained desired state.
+  std::optional<core::RuntimeParticipantStopReadiness> motion_stop_readiness;
+  /// Equivalent readiness for the optional physical gripper binding.
+  std::optional<core::RuntimeParticipantStopReadiness> gripper_stop_readiness;
   /// Additional Program contexts for the same exact physical motion target.
   /// This is used by build-owned direct-control Programs; aliases may differ
   /// only in Program/role identity and cannot widen the physical runtime.
@@ -83,6 +100,10 @@ struct RetainedNativeRuntimeInput final {
   /// supplies only sealed bindings for this physical runtime; Core rechecks
   /// the request address, resource inventory, and pinned engine before use.
   RetainedRuntimeParticipantResolver participant_resolver;
+  /// Rebuild the exact Program resolver after a route publication replaces
+  /// physical participant bindings. Required by production compositions that
+  /// admit route changes; omitted only by fixed/focused runtimes.
+  RetainedRuntimeParticipantResolverFactory participant_resolver_factory;
   /// Optional configuration-fence interlock owned by the surrounding managed
   /// execution process. It must outlive this runtime composition.
   core::IResourceOperationAdmissionGate *operation_admission_gate{};
@@ -91,7 +112,8 @@ struct RetainedNativeRuntimeInput final {
 /// Owning native composition root. Destruction order is deliberate: the public
 /// addressed owner unsubscribes first, then the subordinate Kernel quiesces,
 /// then backends/scheduler/state/model resources retire.
-struct RetainedNativeRuntime final {
+struct RetainedNativeRuntime final
+    : public deployment::IRouteConfigurationKernelPublicationOwner {
   RetainedNativeRuntime(core::RuntimeParticipantBinding motion,
                         std::optional<core::RuntimeParticipantBinding> gripper)
       : motion_binding(std::move(motion)), gripper_binding(std::move(gripper)) {
@@ -102,6 +124,9 @@ struct RetainedNativeRuntime final {
 
   core::RuntimeParticipantBinding motion_binding;
   std::optional<core::RuntimeParticipantBinding> gripper_binding;
+  std::vector<core::RuntimeParticipantBinding> motion_binding_aliases;
+  std::vector<core::RuntimeParticipantBinding> gripper_binding_aliases;
+  std::optional<core::StopDeadlineBudgetDTO> cell_stop_deadline_budget;
   std::shared_ptr<roboplan::Scene> scene;
   std::shared_ptr<std::mutex> scene_mutex;
   std::shared_ptr<RetainedKinematicStateProjector> state_projector;
@@ -134,8 +159,22 @@ struct RetainedNativeRuntime final {
   std::vector<core::RuntimeParticipantExecutionRegistration>
       participant_registrations;
   core::RuntimeParticipantAdmissionResolver participant_resolver;
+  RetainedRuntimeParticipantResolverFactory participant_resolver_factory;
   std::unique_ptr<core::SqliteOperationJournal> operation_journal;
   std::unique_ptr<core::ResourceAddressedExecutionKernel> addressed_kernel;
+
+  [[nodiscard]] core::Result<std::vector<core::RuntimeParticipantBinding>>
+  ReadCurrentPhysicalParticipants(
+      const core::ActiveControlConfigurationDTO &configuration) const override;
+
+  [[nodiscard]] core::Result<core::RuntimeRouteConfigurationReadbackDTO>
+  PublishAndReadBackRouteConfiguration(
+      const core::ActiveControlConfigurationDTO &configuration,
+      std::vector<deployment::VerifiedRouteReadinessParticipant> participants)
+      override;
+
+private:
+  mutable std::mutex route_publication_mutex_;
 };
 
 /// Assemble only the product-specific subordinate participant runtime. This

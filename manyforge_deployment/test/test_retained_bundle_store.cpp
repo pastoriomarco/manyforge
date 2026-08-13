@@ -317,7 +317,7 @@ class ScopedTrustedRoot final {
       nullptr);
   const auto applicability = qualify_cell_applicability(
       composition, deployment.applicability_inputs(), {}, {}, {}, {}, {},
-      {}, {}, {}, {}, selected_overlay);
+      {}, {}, {}, {}, {}, selected_overlay);
   return qualify_deployment_for_retention(
       deployment, compile_cell_ir(applicability));
 }

@@ -57,10 +57,11 @@ void merge_controlled_stop_diagnostics(
     std::map<std::string, std::string>& details,
     const InterruptStructuredValue& diagnostics) {
   for (const auto& [key, value] : diagnostics) {
+    const std::string projected = interrupt_structured_scalar_text(value);
     if (details.contains(key)) {
-      details["controlled_stop_detail_" + key] = value;
+      details["controlled_stop_detail_" + key] = projected;
     } else {
-      details[key] = value;
+      details[key] = projected;
     }
   }
 }
@@ -166,9 +167,6 @@ std::map<std::string, std::string> controlled_stop_success_event_details(
        std::to_string(motion_interrupt_deceleration_time_or_default(profile))},
       {"emergency_fallback", "none"},
       {"hard_stop_transitioned", "false"}};
-  if (profile.max_stop_time_s.has_value()) {
-    details["max_stop_time_s"] = std::to_string(*profile.max_stop_time_s);
-  }
   if (result.fallback_reason.has_value()) {
     details["fallback_reason"] = *result.fallback_reason;
   }
@@ -186,9 +184,6 @@ std::map<std::string, std::string> controlled_stop_success_event_details(
 std::int64_t effective_controlled_stop_deadline_ns(
     const MotionInterruptStopProfileDTO& profile,
     Duration stop_completion_tolerance_ns) {
-  if (profile.max_stop_time_s.has_value()) {
-    return static_cast<std::int64_t>(*profile.max_stop_time_s * 1e9);
-  }
   const auto deceleration_ns = static_cast<std::int64_t>(
       motion_interrupt_deceleration_time_or_default(profile) * 1e9);
   return deceleration_ns + std::max<Duration>(0, stop_completion_tolerance_ns);

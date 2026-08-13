@@ -1,9 +1,0 @@
-string action_id
-string label
-bool supported
-bool available
-string availability_reason
-string confirmation_class
-string side_effect_summary
-string expected_postcondition
-int64 timeout_ns

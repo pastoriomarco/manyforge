@@ -1,6 +1,6 @@
 api_version: manyforge.closed_schema.v1
 schema_id: manyforge.provider_manifest.v1
-schema_revision: sha256:700b1978d531041e68d0dfb922f77352353daf0c473ffb13be8f1b791962eab3
+schema_revision: sha256:b242431032bf183f81718ae1b7b8501ee5f705e52d455732e0052215565bf4cc
 schema_purpose: artifact_document
 root_definition_id: provider_manifest
 definitions:
@@ -72,6 +72,13 @@ definitions:
             item_schema:
               kind: local_ref
               definition_id: provider_contract_declaration
+        - field_id: lifecycle_plan_catalog
+          presence: optional
+          default:
+            kind: absent
+          value_schema:
+            kind: local_ref
+            definition_id: lifecycle_plan_catalog_declaration
   - definition_id: capability_offer
     value_schema:
       kind: object
@@ -153,6 +160,33 @@ definitions:
               - kind: string_format
                 value: api_version
         - field_id: contract_schema_revision
+          presence: required
+          default:
+            kind: absent
+          value_schema:
+            kind: scalar
+            scalar_type: string
+            constraints:
+              - kind: string_format
+                value: sha256_digest
+  - definition_id: lifecycle_plan_catalog_declaration
+    value_schema:
+      kind: object
+      fields:
+        - field_id: catalog_api_version
+          presence: required
+          default:
+            kind: absent
+          value_schema:
+            kind: scalar
+            scalar_type: string
+            constraints:
+              - kind: enum
+                values:
+                  - manyforge.brand_lifecycle_plan_catalog.v1
+              - kind: string_format
+                value: api_version
+        - field_id: semantic_digest
           presence: required
           default:
             kind: absent

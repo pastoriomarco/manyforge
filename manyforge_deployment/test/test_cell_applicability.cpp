@@ -47,7 +47,7 @@ constexpr std::string_view kControlInterfaceSchemaRevision =
 constexpr std::string_view kControllerTopologySchemaRevision =
     "sha256:7415c5e2df17491366755b401337e3ad96dd96703357b20c9e0d08bf3f46a9f6";
 constexpr std::string_view kProviderManifestSchemaRevision =
-    "sha256:700b1978d531041e68d0dfb922f77352353daf0c473ffb13be8f1b791962eab3";
+    "sha256:b242431032bf183f81718ae1b7b8501ee5f705e52d455732e0052215565bf4cc";
 constexpr std::string_view kRuntimeProfileSchemaRevision =
     "sha256:c254afa8c2bfcc803f12a7af63b1f09a8ee804b1ffa2a65b7361ad9309b87ae7";
 constexpr std::string_view kStopEvidencePolicySchemaRevision =
@@ -2371,7 +2371,7 @@ struct InputOptions final {
                  {"queue_depth", CanonicalValue(8.0)},
                  {"cancel_validation_timeout_ns", CanonicalValue(1000.0)},
                  {"motion_scope_arm_timeout_ns", CanonicalValue(1000.0)},
-                 {"supervisory_poll_rate_hz", CanonicalValue(100.0)},
+                 {"supervisory_poll_rate_hz", CanonicalValue(10.0)},
              })},
         }));
   }
@@ -2402,7 +2402,7 @@ enum class ProviderCapabilityScopeCase : std::uint8_t {
     case ProviderCapabilityScopeCase::kCellGlobal:
       return "scene.reference.resolve";
     case ProviderCapabilityScopeCase::kControlDomain:
-      return "component.lifecycle.observe";
+      return "control_domain.controller.observe";
   }
   throw std::runtime_error("unknown provider capability scope fixture");
 }
@@ -2762,7 +2762,7 @@ struct ApplicabilityFixture final {
     const ApplicabilityFixture& fixture) {
   return qualify_cell_applicability(
       fixture.composition, fixture.inputs, fixture.runtime_profiles,
-      {}, fixture.capabilities, fixture.contracts, fixture.topologies,
+      {}, {}, fixture.capabilities, fixture.contracts, fixture.topologies,
       fixture.manifests, fixture.stop_policies,
       fixture.value_schemas, fixture.commissioning_evidence_refs,
       fixture.selected_overlay);
@@ -2818,7 +2818,7 @@ TEST(CellApplicability,
       inputs.value().site_overlay_ref, inputs.value().external_resources,
       nullptr);
   const auto result = qualify_cell_applicability(
-      composition, inputs, {}, {}, {}, {}, {}, {}, {}, {}, {}, overlay);
+      composition, inputs, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, overlay);
 
   EXPECT_EQ(result.composition().graph().cell_id,
             core::CellId("empty_cell"));
@@ -3413,7 +3413,7 @@ TEST(CellApplicability,
   EXPECT_THROW(
       (void)qualify_cell_applicability(
           fixture.composition, fixture.inputs, fixture.runtime_profiles,
-          {}, fixture.capabilities,
+          {}, {}, fixture.capabilities,
           std::span<const QualifiedControlInterfaceContract>{},
           fixture.topologies, fixture.manifests, fixture.stop_policies,
           {}, {},
@@ -3425,7 +3425,8 @@ TEST(CellApplicability,
   EXPECT_THROW(
       (void)qualify_cell_applicability(
           fixture.composition, fixture.inputs, fixture.runtime_profiles,
-          {}, fixture.capabilities, duplicate_contracts, fixture.topologies,
+          {}, {}, fixture.capabilities, duplicate_contracts,
+          fixture.topologies,
           fixture.manifests, fixture.stop_policies,
           {}, {},
           fixture.selected_overlay),
@@ -3436,7 +3437,7 @@ TEST(CellApplicability,
   EXPECT_THROW(
       (void)qualify_cell_applicability(
           fixture.composition, fixture.inputs, fixture.runtime_profiles,
-          {}, fixture.capabilities, extra_contracts, fixture.topologies,
+          {}, {}, fixture.capabilities, extra_contracts, fixture.topologies,
           fixture.manifests, fixture.stop_policies,
           {}, {},
           fixture.selected_overlay),
@@ -3456,7 +3457,7 @@ TEST(CellApplicability,
         EXPECT_THROW(
             (void)qualify_cell_applicability(
                 fixture.composition, fixture.inputs, runtime_profiles,
-                {}, capabilities, contracts, topologies, manifests,
+                {}, {}, capabilities, contracts, topologies, manifests,
                 stop_policies, {}, {}, fixture.selected_overlay),
             CellApplicabilityError);
       };
@@ -3636,7 +3637,7 @@ TEST(CellApplicability,
   EXPECT_THROW(
       (void)qualify_cell_applicability(
           fixture.composition, fixture.inputs, fixture.runtime_profiles,
-          {}, fixture.capabilities, stale_contract, fixture.topologies,
+          {}, {}, fixture.capabilities, stale_contract, fixture.topologies,
           fixture.manifests, fixture.stop_policies,
           {}, {},
           fixture.selected_overlay),
@@ -3648,7 +3649,7 @@ TEST(CellApplicability,
       (void)qualify_cell_applicability(
           runtime_fixture.composition, runtime_fixture.inputs,
           std::span<const QualifiedRuntimeProfile>{},
-          {}, runtime_fixture.capabilities, runtime_fixture.contracts,
+          {}, {}, runtime_fixture.capabilities, runtime_fixture.contracts,
           runtime_fixture.topologies, runtime_fixture.manifests,
           runtime_fixture.stop_policies,
           {}, {},

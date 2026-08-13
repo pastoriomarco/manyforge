@@ -95,11 +95,14 @@ pybind11_add_module(manyforge_core_py NO_EXTRAS
   bindings.cpp
   bindings_catalog.cpp
   bindings_cell_graph.cpp
+  bindings_component_lifecycle.cpp
   bindings_command_schema.cpp
   bindings_component_type.cpp
   bindings_coordinate_state.cpp
   bindings_deployment.cpp
+  bindings_interrupt.cpp
   bindings_model_compiler.cpp
+  bindings_operation_runtime.cpp
   bindings_scenario_catalog.cpp
   bindings_strong_identity.cpp
 )

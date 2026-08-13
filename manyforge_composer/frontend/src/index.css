@@ -648,59 +648,6 @@ button:disabled {
   background: #312710;
 }
 
-.robot-lifecycle-card {
-  padding: 0.75rem;
-  border: 1px solid #344b57;
-  border-radius: 0.55rem;
-  color: #cbd8de;
-  background: #0b1821;
-  font-size: 0.75rem;
-}
-
-.robot-lifecycle-card > header,
-.robot-lifecycle-facts > div {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 0.75rem;
-}
-
-.robot-lifecycle-card > header {
-  padding-bottom: 0.45rem;
-  border-bottom: 1px solid #263c48;
-  font-weight: 720;
-  text-transform: uppercase;
-}
-
-.robot-lifecycle-facts {
-  display: grid;
-  grid-template-columns: repeat(2, minmax(0, 1fr));
-  gap: 0.3rem 1rem;
-  padding: 0.55rem 0;
-}
-
-.robot-lifecycle-facts code::before {
-  display: inline-block;
-  width: 0.45rem;
-  height: 0.45rem;
-  margin-right: 0.35rem;
-  border-radius: 999px;
-  background: #b88a45;
-  content: "";
-}
-
-.robot-lifecycle-facts code.fact-true::before {
-  background: #5fc39f;
-}
-
-.robot-lifecycle-facts code.fact-false::before {
-  background: #6d828c;
-}
-
-.robot-lifecycle-card p {
-  margin: 0.45rem 0 0;
-}
-
 input,
 select,
 textarea {

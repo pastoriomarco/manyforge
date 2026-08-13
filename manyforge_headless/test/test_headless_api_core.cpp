@@ -302,6 +302,30 @@ CanonicalValue OperationJournalPayload(
   });
 }
 
+CanonicalValue
+StopAcceptanceProjectionPayload(const std::string &owner_epoch,
+                                const std::string &entry_state = "active") {
+  return CanonicalValue(CanonicalValue::Object{
+      {"acceptance", CanonicalValue(CanonicalValue::Object{
+                         {"entry_state", CanonicalValue(entry_state)},
+                         {"owner_epoch", CanonicalValue(owner_epoch)},
+                         {"request_id", CanonicalValue("stop-request.1")},
+                     })},
+      {"affected_state",
+       CanonicalValue(CanonicalValue::Object{
+           {"operations", CanonicalValue(CanonicalValue::Array{})},
+           {"resources", CanonicalValue(CanonicalValue::Array{})},
+       })},
+      {"api_version",
+       CanonicalValue("manyforge.stop_acceptance_projection.v1")},
+      {"intent", CanonicalValue(CanonicalValue::Object{
+                     {"intent_kind", CanonicalValue("full_stop")},
+                     {"value", CanonicalValue(CanonicalValue::Object{})},
+                 })},
+      {"record_kind", CanonicalValue("stop_acceptance_projected")},
+  });
+}
+
 void PublishHealthySources(const TemporaryDirectory &directory,
                            const std::string &scene_state,
                            const std::uint64_t scene_generation = 1U) {
@@ -893,6 +917,54 @@ TEST(HeadlessApiCore,
     std::this_thread::yield();
   }
   EXPECT_EQ(HistoryCount(core), 3U);
+}
+
+TEST(HeadlessApiCore,
+     GlobalStopAcceptanceProjectionKeepsPairedNullOperationIdentity) {
+  TemporaryDirectory directory;
+  HeadlessApiCore core(Config(directory, "api.epoch.1"), Clocks());
+  const std::string source_epoch = "execution-host.epoch.stop";
+  const auto projection = StopAcceptanceProjectionPayload(source_epoch);
+  const auto projection_json = content_identity::canonical_json(projection);
+  const auto projection_digest =
+      content_identity::sha256_digest(projection_json);
+
+  const auto ingested = core.IngestOperationEvent(
+      source_epoch, 1U, "stop_acceptance_projected", "stop-request.1",
+      std::nullopt, std::nullopt, 100U, "2026-08-07T10:00:00.000000001Z", true,
+      projection, projection_digest);
+  EXPECT_EQ(Text(ingested, "status"), "ingested");
+
+  HistorianQuery query;
+  query.components.insert("manyforge.runtime");
+  query.event_types.insert("stop_acceptance_projected");
+  const auto deadline = std::chrono::steady_clock::now() + 2s;
+  while (Array(core.HistoryPage(query), "events").empty() &&
+         std::chrono::steady_clock::now() < deadline) {
+    std::this_thread::yield();
+  }
+  const auto page = core.HistoryPage(query);
+  ASSERT_EQ(Array(page, "events").size(), 1U);
+  const auto &history_payload = Member(Array(page, "events").front(), "event");
+  const auto &envelope = Member(history_payload, "payload");
+  EXPECT_TRUE(std::holds_alternative<std::nullptr_t>(
+      Member(envelope, "operation_id").storage()));
+  EXPECT_TRUE(std::holds_alternative<std::nullptr_t>(
+      Member(envelope, "operation_revision").storage()));
+  EXPECT_EQ(Member(envelope, "journal_payload"), projection);
+
+  EXPECT_THROW(static_cast<void>(core.IngestOperationEvent(
+                   source_epoch, 2U, "stop_acceptance_projected",
+                   "stop-request.1", "operation.test.1", std::nullopt, 101U,
+                   "2026-08-07T10:00:00.000000002Z", true, projection,
+                   projection_digest)),
+               OperatorAlarmError);
+  EXPECT_THROW(
+      static_cast<void>(core.IngestOperationEvent(
+          source_epoch, 2U, "state_observed", std::nullopt, std::nullopt,
+          std::nullopt, 101U, "2026-08-07T10:00:00.000000002Z", false,
+          projection, projection_digest)),
+      OperatorAlarmError);
 }
 
 TEST(HeadlessApiCore,

@@ -2,23 +2,109 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <manyforge_core/emergency_stop_acceptance_reserve.hpp>
+#include <manyforge_core/stop_fault_recovery.hpp>
+#include <manyforge_core/stop_terminal_state.hpp>
 #include <manyforge_core/types/error_code.hpp>
 #include <manyforge_core/types/operation_runtime.hpp>
+#include <optional>
+#include <string>
+#include <variant>
 #include <vector>
 
 namespace manyforge::core {
 
+enum class EmergencyStopEntryStateDTO {
+  kActive,
+  kTerminal,
+};
+
+/// Exact internal record already linearized by the Kernel emergency reserve.
+/// The journal is only a forensic projection of this fact. A normalized
+/// request has a digest and no malformed reason; adapter-recognized malformed
+/// ingress has the inverse shape and is conservatively represented by the
+/// monostate intent alternative below.
+struct EmergencyStopAcceptanceRecordDTO final {
+  RequestOwnerEpoch owner_epoch;
+  RequestId request_id;
+  std::optional<ContentDigest> normalized_request_digest;
+  std::optional<std::string> malformed_ingress_reason;
+  RequestAttributionDTO attribution;
+  RequestReplayStatusDTO replay_status{RequestReplayStatusDTO::kAcceptedNew};
+  StopId stop_id;
+  StopGeneration stop_generation{0U};
+  std::int64_t accepted_at_ns{};
+  std::int64_t outer_deadline_ns{};
+  StopResolutionDispositionDTO resolution_disposition{
+      StopResolutionDispositionDTO::kPromotedToFull};
+  ContentDigest captured_scope_digest;
+  EmergencyStopEntryStateDTO entry_state{EmergencyStopEntryStateDTO::kActive};
+  EmergencyStopAcceptancePathDTO acceptance_path{EmergencyStopAcceptancePathDTO::kFreshReserved};
+  EmergencyStopProjectionStateDTO projection_state{EmergencyStopProjectionStateDTO::kPending};
+
+  friend bool operator==(const EmergencyStopAcceptanceRecordDTO&,
+                         const EmergencyStopAcceptanceRecordDTO&) = default;
+};
+
+/// The empty alternative is legal only for recognized malformed ingress. The
+/// record retains its adapter-minted identity, attribution, and stable reason.
+using EmergencyStopProjectedIntentDTO =
+    std::variant<std::monostate, StopIntentDTO, FullStopIntentDTO>;
+
+/// One immutable canonical capture taken at the Stop linearization boundary.
+/// Resources include affected externally uncertain resources even when no
+/// resident operation can represent them. Operations and resources are sorted
+/// and unique; every operation is complete and byte-for-byte owner state.
+struct EmergencyStopAffectedStateSnapshotDTO final {
+  std::vector<OperationStateDTO> operations;
+  std::vector<ResourceId> resources;
+
+  friend bool operator==(const EmergencyStopAffectedStateSnapshotDTO&,
+                         const EmergencyStopAffectedStateSnapshotDTO&) = default;
+};
+
+/// Asynchronous forensic projection result. `failed` is not a rejected Stop:
+/// containment continues and the Kernel closes admission through its
+/// persistence-degraded fault path.
+struct EmergencyStopAcceptanceProjectionResultDTO final {
+  EmergencyStopProjectionStateDTO projection_state{EmergencyStopProjectionStateDTO::kFailed};
+  std::optional<std::uint64_t> journal_sequence;
+  std::optional<ErrorDTO> error;
+
+  friend bool operator==(const EmergencyStopAcceptanceProjectionResultDTO&,
+                         const EmergencyStopAcceptanceProjectionResultDTO&) = default;
+};
+
+/// Complete durable Stop truth recovered at one owner-epoch boundary. The
+/// acceptance and affected-state capture are always present. Terminal,
+/// fault-latch, and surveillance truth is present only after its corresponding
+/// atomic projection committed.
+struct RecoveredStopJournalStateDTO final {
+  StopAcceptedDTO accepted;
+  EmergencyStopAffectedStateSnapshotDTO affected_state;
+  std::optional<StopCertificateDTO> terminal_certificate;
+  std::optional<StopFaultLatchDTO> fault_latch;
+  std::optional<StopPostTerminalSurveillanceDTO> surveillance;
+
+  friend bool operator==(const RecoveredStopJournalStateDTO&,
+                         const RecoveredStopJournalStateDTO&) = default;
+};
+
 struct OperationJournalRecoveryDTO final {
   std::vector<OperationStateDTO> historical_operations;
+  std::vector<RecoveredStopJournalStateDTO> recovered_stops;
+  std::optional<RequestOwnerEpoch> replaced_unclosed_owner_epoch;
   std::vector<ResourceId> unreconciled_resources;
 };
 
 /// Durable boundary owned by the resource-addressed Execution Kernel.
 ///
-/// Every acceptance method commits the complete public intent, owner-produced
-/// result, and resulting immutable state in one transaction. The Kernel calls
-/// it before the corresponding subordinate effect. State observations are
-/// committed before they become visible through owner projections.
+/// Ordinary acceptance methods commit the complete public intent,
+/// owner-produced result, and resulting immutable state before their
+/// subordinate effect. Stop acceptance is deliberately different: the Kernel
+/// has already linearized/fenced it, and this port only attempts its forensic
+/// projection. State observations are committed before they become visible
+/// through owner projections.
 class IOperationJournal {
  public:
   virtual ~IOperationJournal() = default;
@@ -35,9 +121,38 @@ class IOperationJournal {
       const RequestOwnerEpoch& owner_epoch, const OperationControlRequestDTO& request,
       const OperationControlAcceptedDTO& accepted, const OperationStateDTO& state) = 0;
 
-  [[nodiscard]] virtual Result<std::uint64_t> RecordStopAccepted(
-      const RequestOwnerEpoch& owner_epoch, const StopIntentDTO& intent,
-      const StopAcceptedDTO& accepted, const OperationStateDTO& state) = 0;
+  [[nodiscard]] virtual EmergencyStopAcceptanceProjectionResultDTO RecordStopAccepted(
+      const RequestOwnerEpoch& owner_epoch, const EmergencyStopAcceptanceRecordDTO& acceptance,
+      const EmergencyStopProjectedIntentDTO& intent, const StopAcceptedDTO& accepted,
+      const EmergencyStopAffectedStateSnapshotDTO& affected_state) noexcept = 0;
+
+  /// Atomically projects one complete terminal Stop status, immutable
+  /// certificate, and optional fault latch. Exact replay returns the original
+  /// sequence; conflicting replay fails without modifying durable truth.
+  [[nodiscard]] virtual StopForensicProjectionResultDTO RecordStopTerminal(
+      const RequestOwnerEpoch& owner_epoch, const StopStatusDTO& stop_status,
+      const StopCertificateDTO& certificate,
+      const std::optional<StopFaultLatchDTO>& fault_latch) noexcept = 0;
+
+  /// Coalesces one complete bounded post-terminal surveillance checkpoint and
+  /// its exact current non-cleared latch. Exact replay returns the first
+  /// sequence; conflict fails without changing durable truth.
+  [[nodiscard]] virtual StopForensicProjectionResultDTO RecordStopSurveillanceCheckpoint(
+      const RequestOwnerEpoch& owner_epoch, const StopPostTerminalSurveillanceDTO& checkpoint,
+      const StopFaultLatchDTO& fault_latch) noexcept = 0;
+
+  /// Atomically records the public recovery result, cleared latch, and exact
+  /// resulting terminal status before Kernel may publish clear.
+  [[nodiscard]] virtual Result<std::uint64_t> RecordStopFaultCleared(
+      const RequestOwnerEpoch& owner_epoch, const StopFaultRecoveryIntentDTO& recovery_intent,
+      const StopFaultRecoveryResultDTO& recovery_result, const StopFaultLatchDTO& cleared_latch,
+      const StopStatusDTO& resulting_stop_status) = 0;
+
+  /// The sole durable clean-owner marker. It succeeds only when no journaled
+  /// operation, Stop projection, active latch/surveillance owner, or orphan
+  /// remains unresolved.
+  [[nodiscard]] virtual Result<std::uint64_t> CloseOwnerEpoch(const RequestOwnerEpoch& owner_epoch,
+                                                              std::int64_t closed_at_ns) = 0;
 
   [[nodiscard]] virtual Result<std::uint64_t> RecordRuntimeScaleAccepted(
       const RequestOwnerEpoch& owner_epoch, const RuntimeScaleRequestDTO& request,

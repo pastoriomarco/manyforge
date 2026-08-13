@@ -36,18 +36,25 @@ using namespace manyforge::core;
       ControlDomainId("domain.arm"), ActiveControlConfigurationId(std::move(id)), generation}};
 }
 
+[[nodiscard]] ResourceSlotStopFenceOwnerDTO stop_fence_owner(
+    ResourceSlotOwnerDTO expected_owner, std::vector<ResourceId> resources,
+    OperationRevision next_revision = OperationRevision(2U)) {
+  return ResourceSlotStopFenceOwnerDTO{std::move(expected_owner), std::move(resources),
+                                       next_revision};
+}
+
 TEST(ResourceSlotTableTest, RunsOneExactScopeThroughTerminalAndRelease) {
   ResourceSlotTable table({ResourceId("joint.2"), ResourceId("gripper.1"), ResourceId("joint.1")});
   const auto operation = owner();
   const auto resources = arm_resources();
 
   ASSERT_TRUE(table.reserve(operation, resources).ok());
-  ASSERT_EQ(table.active_operation_id(), operation.operation_id);
+  ASSERT_EQ(table.active_operation_ids(), std::vector<OperationId>{operation.operation_id});
   ASSERT_TRUE(table.transition(operation, resources, ResourceSlotState::kDispatched).ok());
   ASSERT_TRUE(table.transition(operation, resources, ResourceSlotState::kStopping).ok());
   ASSERT_TRUE(table.transition(operation, resources, ResourceSlotState::kTerminal).ok());
   ASSERT_TRUE(table.release(operation, resources).ok());
-  EXPECT_FALSE(table.active_operation_id().has_value());
+  EXPECT_TRUE(table.active_operation_ids().empty());
 
   const auto snapshot = table.snapshot();
   EXPECT_EQ(snapshot.size(), 3U);
@@ -65,7 +72,7 @@ TEST(ResourceSlotTableTest, RejectsOverlapWithoutPartialMutation) {
   const auto second = owner("op.2", "part.2");
   const auto rejected = table.reserve(second, {ResourceId("joint.2"), ResourceId("gripper.1")});
   ASSERT_FALSE(rejected.ok());
-  EXPECT_EQ(rejected.error().details.at("reason"), "i6_single_operation_busy");
+  EXPECT_EQ(rejected.error().details.at("reason"), "resource_scope_busy");
 
   const auto snapshot = table.snapshot();
   const auto gripper = std::find_if(snapshot.begin(), snapshot.end(), [](const auto& slot) {
@@ -76,18 +83,63 @@ TEST(ResourceSlotTableTest, RejectsOverlapWithoutPartialMutation) {
   EXPECT_FALSE(gripper->owner.has_value());
 }
 
-TEST(ResourceSlotTableTest, KeepsI6SingleOperationRuleForDisjointResources) {
+TEST(ResourceSlotTableTest, AdmitsDisjointOperationsAndProgressesThemIndependently) {
   ResourceSlotTable table({ResourceId("robot.a.joint"), ResourceId("robot.b.joint")});
   const auto first = owner("op.a", "part.a");
   ASSERT_TRUE(table.reserve(first, {ResourceId("robot.a.joint")}).ok());
 
   const auto second = owner("op.b", "part.b");
-  const auto rejected = table.reserve(second, {ResourceId("robot.b.joint")});
-  ASSERT_FALSE(rejected.ok());
-  EXPECT_EQ(rejected.error().details.at("reason"), "i6_single_operation_busy");
-
-  ASSERT_TRUE(table.release(first, {ResourceId("robot.a.joint")}).ok());
   ASSERT_TRUE(table.reserve(second, {ResourceId("robot.b.joint")}).ok());
+  EXPECT_EQ(table.active_operation_ids(),
+            (std::vector<OperationId>{OperationId("op.a"), OperationId("op.b")}));
+
+  ASSERT_TRUE(
+      table.transition(first, {ResourceId("robot.a.joint")}, ResourceSlotState::kDispatched).ok());
+  const auto snapshot = table.snapshot();
+  ASSERT_EQ(snapshot.size(), 2U);
+  EXPECT_EQ(snapshot.front().state, ResourceSlotState::kDispatched);
+  EXPECT_EQ(snapshot.back().state, ResourceSlotState::kReserved);
+
+  ASSERT_TRUE(
+      table.transition(first, {ResourceId("robot.a.joint")}, ResourceSlotState::kTerminal).ok());
+  ASSERT_TRUE(table.release(first, {ResourceId("robot.a.joint")}).ok());
+  EXPECT_EQ(table.active_operation_ids(), std::vector<OperationId>{OperationId("op.b")});
+  ASSERT_TRUE(table.release(second, {ResourceId("robot.b.joint")}).ok());
+  EXPECT_TRUE(table.active_operation_ids().empty());
+}
+
+TEST(ResourceSlotTableTest, CountsDisjointOperationOwnersWithinTheSelectedScope) {
+  ResourceSlotTable table({ResourceId("robot.a.joint"), ResourceId("robot.b.joint")});
+  const auto first = owner("op.a", "part.a");
+  const auto second = owner("op.b", "part.b");
+  ASSERT_TRUE(table.reserve(first, {ResourceId("robot.a.joint")}).ok());
+  ASSERT_TRUE(table.reserve(second, {ResourceId("robot.b.joint")}).ok());
+
+  const auto queued =
+      table.admission_snapshot({ResourceId("robot.a.joint"), ResourceId("robot.b.joint")});
+  EXPECT_EQ(queued.affected_queued_operation_count, 2U);
+  EXPECT_EQ(queued.affected_active_operation_count, 0U);
+
+  ASSERT_TRUE(
+      table.transition(first, {ResourceId("robot.a.joint")}, ResourceSlotState::kDispatched).ok());
+  const auto mixed =
+      table.admission_snapshot({ResourceId("robot.a.joint"), ResourceId("robot.b.joint")});
+  EXPECT_EQ(mixed.affected_queued_operation_count, 1U);
+  EXPECT_EQ(mixed.affected_active_operation_count, 1U);
+}
+
+TEST(ResourceSlotTableTest, DeduplicatesOneOperationAcrossDisjointParticipantOwners) {
+  ResourceSlotTable table({ResourceId("robot.a.joint"), ResourceId("robot.b.joint")});
+  const auto first = owner("coordinated.op", "participant.a");
+  const auto second = owner("coordinated.op", "participant.b");
+  ASSERT_TRUE(table.reserve(first, {ResourceId("robot.a.joint")}).ok());
+  ASSERT_TRUE(table.reserve(second, {ResourceId("robot.b.joint")}).ok());
+
+  EXPECT_EQ(table.active_operation_ids(), std::vector<OperationId>{OperationId("coordinated.op")});
+  const auto admission =
+      table.admission_snapshot({ResourceId("robot.a.joint"), ResourceId("robot.b.joint")});
+  EXPECT_EQ(admission.affected_queued_operation_count, 1U);
+  EXPECT_EQ(admission.affected_active_operation_count, 0U);
 }
 
 TEST(ResourceSlotTableTest, ProjectsExactGenerationConfigurationsAndAffectedOperationCounts) {
@@ -136,6 +188,206 @@ TEST(ResourceSlotTableTest, ProjectsExactGenerationConfigurationsAndAffectedOper
   const auto orphan = table.admission_snapshot(arm_resources());
   EXPECT_EQ(orphan.operation_resource_generation, 5U);
   EXPECT_EQ(orphan.affected_active_operation_count, 1U);
+}
+
+TEST(ResourceSlotTableTest, CoherentSnapshotReturnsSlotsAndTheirExactGenerationTogether) {
+  ResourceSlotTable table({ResourceId("robot.a.joint"), ResourceId("robot.b.joint")});
+  const auto initial = table.coherent_snapshot();
+  EXPECT_EQ(initial.operation_resource_generation, 0U);
+  ASSERT_EQ(initial.slots.size(), 2U);
+
+  const auto first = owner("op.a", "part.a");
+  ASSERT_TRUE(table.reserve(first, {ResourceId("robot.a.joint")}).ok());
+  const auto reserved = table.coherent_snapshot();
+  EXPECT_EQ(reserved.operation_resource_generation, 1U);
+  ASSERT_EQ(reserved.slots.size(), 2U);
+  EXPECT_EQ(reserved.slots.front().state, ResourceSlotState::kReserved);
+  EXPECT_EQ(reserved.slots.front().owner, std::optional(first));
+  EXPECT_EQ(reserved.slots.front().stop_generation, StopGeneration(0U));
+  EXPECT_EQ(reserved.slots.back().state, ResourceSlotState::kFree);
+}
+
+TEST(ResourceSlotTableTest,
+     AtomicallyFencesMultipleOwnersAndOrphanWithOneResourceGenerationAdvance) {
+  ResourceSlotTable table(
+      {ResourceId("orphan.joint"), ResourceId("robot.a.joint"), ResourceId("robot.b.joint")});
+  const auto first = owner("op.a", "part.a");
+  const auto second = owner("op.b", "part.b");
+  ASSERT_TRUE(table.reserve(first, {ResourceId("robot.a.joint")}).ok());
+  ASSERT_TRUE(table.reserve(second, {ResourceId("robot.b.joint")}).ok());
+  ASSERT_TRUE(
+      table.transition(second, {ResourceId("robot.b.joint")}, ResourceSlotState::kDispatched).ok());
+  ASSERT_TRUE(table.mark_unreconciled_external_or_orphan_goal({ResourceId("orphan.joint")}).ok());
+  const auto captured = table.coherent_snapshot();
+  ASSERT_EQ(captured.operation_resource_generation, 4U);
+
+  const ResourceSlotStopFenceRequestDTO request{
+      captured.operation_resource_generation,
+      StopGeneration(9U),
+      {stop_fence_owner(first, {ResourceId("robot.a.joint")}),
+       stop_fence_owner(second, {ResourceId("robot.b.joint")})},
+      {ResourceId("orphan.joint")}};
+  const auto fenced = table.stop_fence_batch(request);
+  ASSERT_TRUE(fenced.ok()) << fenced.error().message;
+  EXPECT_EQ(fenced.value().operation_resource_generation, 5U);
+  EXPECT_EQ(fenced.value().stop_generation, StopGeneration(9U));
+  ASSERT_EQ(fenced.value().revised_owners.size(), 2U);
+  EXPECT_EQ(fenced.value().revised_owners[0].operation_revision, OperationRevision(2U));
+  EXPECT_EQ(fenced.value().revised_owners[1].operation_revision, OperationRevision(2U));
+  EXPECT_EQ(fenced.value().orphan_resources, std::vector<ResourceId>{ResourceId("orphan.joint")});
+
+  const auto after = table.coherent_snapshot();
+  EXPECT_EQ(after.operation_resource_generation, 5U);
+  for (const auto& slot : after.slots) {
+    EXPECT_EQ(slot.stop_generation, StopGeneration(9U));
+    if (slot.resource_id == ResourceId("orphan.joint")) {
+      EXPECT_EQ(slot.state, ResourceSlotState::kUnreconciledExternalOrOrphanGoal);
+      EXPECT_FALSE(slot.owner.has_value());
+    } else {
+      EXPECT_EQ(slot.state, ResourceSlotState::kStopping);
+      ASSERT_TRUE(slot.owner.has_value());
+      EXPECT_EQ(slot.owner->operation_revision, OperationRevision(2U));
+    }
+  }
+}
+
+TEST(ResourceSlotTableTest, BatchFencePrevalidatesEveryOwnerBeforeMutatingAnySlot) {
+  ResourceSlotTable table({ResourceId("robot.a.joint"), ResourceId("robot.b.joint")});
+  const auto first = owner("op.a", "part.a");
+  const auto second = owner("op.b", "part.b");
+  ASSERT_TRUE(table.reserve(first, {ResourceId("robot.a.joint")}).ok());
+  ASSERT_TRUE(table.reserve(second, {ResourceId("robot.b.joint")}).ok());
+  const auto before = table.coherent_snapshot();
+
+  auto stale_second = second;
+  stale_second.operation_revision = OperationRevision(7U);
+  const auto rejected = table.stop_fence_batch(ResourceSlotStopFenceRequestDTO{
+      before.operation_resource_generation,
+      StopGeneration(1U),
+      {stop_fence_owner(first, {ResourceId("robot.a.joint")}),
+       stop_fence_owner(stale_second, {ResourceId("robot.b.joint")}, OperationRevision(8U))},
+      {}});
+  ASSERT_FALSE(rejected.ok());
+  EXPECT_EQ(rejected.error().details.at("reason"), "resource_owner_mismatch");
+  EXPECT_EQ(table.coherent_snapshot(), before);
+}
+
+TEST(ResourceSlotTableTest, BatchFenceRejectsStaleCaptureAndInvalidOrphanWithoutPartialMutation) {
+  ResourceSlotTable table({ResourceId("free.joint"), ResourceId("robot.a.joint")});
+  const auto operation = owner("op.a", "part.a");
+  ASSERT_TRUE(table.reserve(operation, {ResourceId("robot.a.joint")}).ok());
+  const auto before = table.coherent_snapshot();
+
+  const auto stale = table.stop_fence_batch(
+      ResourceSlotStopFenceRequestDTO{before.operation_resource_generation - 1U,
+                                      StopGeneration(1U),
+                                      {stop_fence_owner(operation, {ResourceId("robot.a.joint")})},
+                                      {}});
+  ASSERT_FALSE(stale.ok());
+  EXPECT_EQ(stale.error().details.at("reason"), "operation_resource_generation_stale");
+  EXPECT_EQ(table.coherent_snapshot(), before);
+
+  const auto invalid_orphan = table.stop_fence_batch(
+      ResourceSlotStopFenceRequestDTO{before.operation_resource_generation,
+                                      StopGeneration(1U),
+                                      {stop_fence_owner(operation, {ResourceId("robot.a.joint")})},
+                                      {ResourceId("free.joint")}});
+  ASSERT_FALSE(invalid_orphan.ok());
+  EXPECT_EQ(invalid_orphan.error().details.at("reason"),
+            "resource_stop_fence_orphan_state_invalid");
+  EXPECT_EQ(table.coherent_snapshot(), before);
+}
+
+TEST(ResourceSlotTableTest, BatchFenceRequiresCanonicalDisjointOwnerScopesAndRevisions) {
+  ResourceSlotTable table({ResourceId("robot.a.joint"), ResourceId("robot.b.joint")});
+  const auto first = owner("op.a", "part.a");
+  const auto second = owner("op.b", "part.b");
+  ASSERT_TRUE(table.reserve(first, {ResourceId("robot.a.joint")}).ok());
+  ASSERT_TRUE(table.reserve(second, {ResourceId("robot.b.joint")}).ok());
+  const auto before = table.coherent_snapshot();
+
+  const auto noncanonical = table.stop_fence_batch(
+      ResourceSlotStopFenceRequestDTO{before.operation_resource_generation,
+                                      StopGeneration(1U),
+                                      {stop_fence_owner(second, {ResourceId("robot.b.joint")}),
+                                       stop_fence_owner(first, {ResourceId("robot.a.joint")})},
+                                      {}});
+  ASSERT_FALSE(noncanonical.ok());
+  EXPECT_EQ(noncanonical.error().details.at("reason"), "resource_stop_fence_not_canonical");
+
+  const auto overlap = table.stop_fence_batch(
+      ResourceSlotStopFenceRequestDTO{before.operation_resource_generation,
+                                      StopGeneration(1U),
+                                      {stop_fence_owner(first, {ResourceId("robot.a.joint")}),
+                                       stop_fence_owner(second, {ResourceId("robot.a.joint")})},
+                                      {}});
+  ASSERT_FALSE(overlap.ok());
+  EXPECT_EQ(overlap.error().details.at("reason"), "resource_stop_fence_scope_overlap");
+  EXPECT_EQ(table.coherent_snapshot(), before);
+}
+
+TEST(ResourceSlotTableTest, BatchFenceAdvancesEveryParticipantOwnerOfOneOperationConsistently) {
+  ResourceSlotTable table({ResourceId("robot.a.joint"), ResourceId("robot.b.joint")});
+  const auto first = owner("coordinated.op", "participant.a");
+  const auto second = owner("coordinated.op", "participant.b");
+  ASSERT_TRUE(table.reserve(first, {ResourceId("robot.a.joint")}).ok());
+  ASSERT_TRUE(table.reserve(second, {ResourceId("robot.b.joint")}).ok());
+  const auto before = table.coherent_snapshot();
+
+  const auto inconsistent = table.stop_fence_batch(ResourceSlotStopFenceRequestDTO{
+      before.operation_resource_generation,
+      StopGeneration(2U),
+      {stop_fence_owner(first, {ResourceId("robot.a.joint")}, OperationRevision(2U)),
+       stop_fence_owner(second, {ResourceId("robot.b.joint")}, OperationRevision(3U))},
+      {}});
+  ASSERT_FALSE(inconsistent.ok());
+  EXPECT_EQ(inconsistent.error().details.at("reason"),
+            "resource_stop_fence_operation_revision_inconsistent");
+  EXPECT_EQ(table.coherent_snapshot(), before);
+
+  const auto fenced = table.stop_fence_batch(ResourceSlotStopFenceRequestDTO{
+      before.operation_resource_generation,
+      StopGeneration(2U),
+      {stop_fence_owner(first, {ResourceId("robot.a.joint")}, OperationRevision(3U)),
+       stop_fence_owner(second, {ResourceId("robot.b.joint")}, OperationRevision(3U))},
+      {}});
+  ASSERT_TRUE(fenced.ok()) << fenced.error().message;
+  EXPECT_EQ(fenced.value().operation_resource_generation,
+            before.operation_resource_generation + 1U);
+  ASSERT_EQ(fenced.value().revised_owners.size(), 2U);
+  EXPECT_EQ(fenced.value().revised_owners[0].operation_id, OperationId("coordinated.op"));
+  EXPECT_EQ(fenced.value().revised_owners[0].operation_revision, OperationRevision(3U));
+  EXPECT_EQ(fenced.value().revised_owners[1].operation_id, OperationId("coordinated.op"));
+  EXPECT_EQ(fenced.value().revised_owners[1].operation_revision, OperationRevision(3U));
+}
+
+TEST(ResourceSlotTableTest, ResourceStopGenerationSurvivesTerminalReleaseAndReuse) {
+  ResourceSlotTable table({ResourceId("arm.joint")});
+  const auto first = owner("op.a", "part.a");
+  ASSERT_TRUE(table.reserve(first, {ResourceId("arm.joint")}).ok());
+  auto fenced = table.stop_fence_batch(ResourceSlotStopFenceRequestDTO{
+      1U, StopGeneration(4U), {stop_fence_owner(first, {ResourceId("arm.joint")})}, {}});
+  ASSERT_TRUE(fenced.ok()) << fenced.error().message;
+  const auto revised = fenced.value().revised_owners.front();
+  ASSERT_TRUE(
+      table.transition(revised, {ResourceId("arm.joint")}, ResourceSlotState::kTerminal).ok());
+  ASSERT_TRUE(table.release(revised, {ResourceId("arm.joint")}).ok());
+  ASSERT_TRUE(table.reserve(owner("op.b", "part.b"), {ResourceId("arm.joint")}).ok());
+
+  const auto snapshot = table.coherent_snapshot();
+  ASSERT_EQ(snapshot.slots.size(), 1U);
+  EXPECT_EQ(snapshot.slots.front().state, ResourceSlotState::kReserved);
+  EXPECT_EQ(snapshot.slots.front().stop_generation, StopGeneration(4U));
+  ASSERT_TRUE(snapshot.slots.front().owner.has_value());
+
+  const auto stale = table.stop_fence_batch(ResourceSlotStopFenceRequestDTO{
+      snapshot.operation_resource_generation,
+      StopGeneration(4U),
+      {stop_fence_owner(*snapshot.slots.front().owner, {ResourceId("arm.joint")})},
+      {}});
+  ASSERT_FALSE(stale.ok());
+  EXPECT_EQ(stale.error().details.at("reason"), "resource_stop_generation_stale");
+  EXPECT_EQ(table.coherent_snapshot(), snapshot);
 }
 
 TEST(ResourceSlotTableTest, RejectsStaleOwnerAndIllegalTransition) {

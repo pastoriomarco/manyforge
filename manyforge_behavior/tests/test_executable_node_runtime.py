@@ -297,8 +297,8 @@ def test_closed_resolver_exactly_disposes_all_fifty_rows() -> None:
     dispositions = resolver.dispositions
 
     assert len(dispositions) == len(environment.registry.rows) == 50
-    assert sum(item.adapter_build_qualified for item in dispositions) == 34
-    assert sum(not item.adapter_build_qualified for item in dispositions) == 16
+    assert sum(item.adapter_build_qualified for item in dispositions) == 39
+    assert sum(not item.adapter_build_qualified for item in dispositions) == 11
     assert all(
         (
             (item.unavailable_reason_code is None and not item.restoration_gates)

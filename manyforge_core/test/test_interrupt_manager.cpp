@@ -88,6 +88,131 @@ std::optional<std::size_t> event_index(const InterruptIngestResult& result,
   return std::nullopt;
 }
 
+std::string detail_text(const InterruptStructuredValue& details,
+                        const std::string& key) {
+  return interrupt_structured_scalar_text(details.at(key));
+}
+
+TEST(InterruptStructuredValue, FactoriesPreserveClosedScalarAlternatives) {
+  const auto text = interrupt_structured_string("operator_stop");
+  ASSERT_TRUE(std::holds_alternative<std::string>(text));
+  EXPECT_EQ(std::get<std::string>(text), "operator_stop");
+  EXPECT_EQ(interrupt_structured_scalar_text(text), "operator_stop");
+
+  const auto boolean = interrupt_structured_bool(true);
+  ASSERT_TRUE(std::holds_alternative<bool>(boolean));
+  EXPECT_TRUE(std::get<bool>(boolean));
+  EXPECT_EQ(interrupt_structured_scalar_text(boolean), "true");
+
+  const auto number = interrupt_structured_number(1.25);
+  ASSERT_TRUE(std::holds_alternative<double>(number));
+  EXPECT_DOUBLE_EQ(std::get<double>(number), 1.25);
+}
+
+TEST(InterruptStructuredValue, ValidatesPortableClosedBounds) {
+  InterruptStructuredValue valid{
+      {"active", interrupt_structured_bool(true)},
+      {"distance", interrupt_structured_number(0.125)},
+      {"source.id", interrupt_structured_string("camera")},
+  };
+  EXPECT_FALSE(interrupt_structured_value_error(valid).has_value());
+  EXPECT_FALSE(
+      interrupt_structured_value_error(InterruptStructuredValue{}).has_value());
+  EXPECT_EQ(interrupt_structured_value_error(InterruptStructuredValue{}, true),
+            "interrupt_structured_value_empty");
+
+  InterruptStructuredValue too_many;
+  for (std::size_t index = 0;
+       index < kMaxInterruptStructuredValueEntries + 1U; ++index) {
+    auto key = std::to_string(index);
+    key.insert(key.begin(), 'k');
+    too_many.emplace(std::move(key), interrupt_structured_bool(false));
+  }
+  EXPECT_EQ(interrupt_structured_value_error(too_many),
+            "interrupt_structured_value_too_many_entries");
+
+  InterruptStructuredValue invalid_key{
+      {"_private", interrupt_structured_bool(false)}};
+  EXPECT_EQ(interrupt_structured_value_error(invalid_key),
+            "interrupt_structured_value_key_invalid");
+  InterruptStructuredValue long_key{
+      {std::string(kMaxInterruptStructuredValueKeyBytes + 1U, 'k'),
+       interrupt_structured_bool(false)}};
+  EXPECT_EQ(interrupt_structured_value_error(long_key),
+            "interrupt_structured_value_key_invalid");
+
+  InterruptStructuredValue non_finite{
+      {"distance", interrupt_structured_number(
+                       std::numeric_limits<double>::infinity())}};
+  EXPECT_EQ(interrupt_structured_value_error(non_finite),
+            "interrupt_structured_value_number_non_finite");
+  InterruptStructuredValue long_text{
+      {"description",
+       interrupt_structured_string(std::string(
+           kMaxInterruptStructuredValueStringBytes + 1U, 'x'))}};
+  EXPECT_EQ(interrupt_structured_value_error(long_text),
+            "interrupt_structured_value_string_too_long");
+  InterruptStructuredValue decomposed_text{
+      {"description",
+       interrupt_structured_string(std::string("e\xCC\x81", 3))}};
+  EXPECT_EQ(interrupt_structured_value_error(decomposed_text),
+            "interrupt_structured_value_string_not_nfc");
+  InterruptStructuredValue invalid_utf8{
+      {"description",
+       interrupt_structured_string(std::string("\xC3\x28", 2))}};
+  EXPECT_EQ(interrupt_structured_value_error(invalid_utf8),
+            "interrupt_structured_value_string_not_nfc");
+}
+
+TEST(InterruptManager, RejectsInvalidSignalScalarsBeforeLatching) {
+  InterruptManager manager;
+  ASSERT_TRUE(manager.register_source(source("probe")).ok());
+  ASSERT_TRUE(manager.register_policy(policy("probe_policy", "probe")).ok());
+
+  auto invalid_value = analog_update(
+      "probe", 1, std::numeric_limits<double>::quiet_NaN());
+  auto result = manager.ingest(invalid_value,
+                               InterruptSourceClass::kFastExecutionRelevant,
+                               validation_context(), 2'000);
+  EXPECT_TRUE(result.rejected);
+  EXPECT_FALSE(result.latched);
+  EXPECT_EQ(result.reason, "interrupt_signal_value_non_finite");
+
+  std::int64_t sequence_id = 2;
+  for (const double invalid_confidence_value :
+       {-0.01, 1.01, std::numeric_limits<double>::quiet_NaN()}) {
+    auto invalid_confidence = update("probe", sequence_id++);
+    invalid_confidence.confidence = invalid_confidence_value;
+    result = manager.ingest(invalid_confidence,
+                            InterruptSourceClass::kFastExecutionRelevant,
+                            validation_context(), 2'000);
+    EXPECT_TRUE(result.rejected);
+    EXPECT_FALSE(result.latched);
+    EXPECT_EQ(result.reason, "interrupt_signal_confidence_invalid");
+  }
+
+  auto invalid_metadata = update("probe", sequence_id++);
+  invalid_metadata.metadata.emplace(
+      "bad/key", interrupt_structured_string("not-portable"));
+  result = manager.ingest(invalid_metadata,
+                          InterruptSourceClass::kFastExecutionRelevant,
+                          validation_context(), 2'000);
+  EXPECT_TRUE(result.rejected);
+  EXPECT_FALSE(result.latched);
+  EXPECT_EQ(result.reason, "interrupt_structured_value_key_invalid");
+
+  auto invalid_covariance = update("probe", sequence_id);
+  invalid_covariance.covariance = InterruptStructuredValue{
+      {"c00", interrupt_structured_number(
+                  std::numeric_limits<double>::infinity())}};
+  result = manager.ingest(invalid_covariance,
+                          InterruptSourceClass::kFastExecutionRelevant,
+                          validation_context(), 2'000);
+  EXPECT_TRUE(result.rejected);
+  EXPECT_FALSE(result.latched);
+  EXPECT_EQ(result.reason, "interrupt_structured_value_number_non_finite");
+}
+
 TEST(InterruptManager, RegistersSourcesAndPoliciesThenLatches) {
   InterruptManager manager;
   ASSERT_TRUE(manager.register_source(source("controller_fault")).ok());
@@ -319,7 +444,7 @@ TEST(InterruptManager, LevelSignalHysteresisAutoClearsOnSignalRelease) {
   bool saw_auto_release = false;
   for (const auto& event : release.events) {
     if (event.type == "interrupt_cleared" &&
-        event.details.at("clear_reason") == "auto_signal_release") {
+        detail_text(event.details, "clear_reason") == "auto_signal_release") {
       saw_auto_release = true;
     }
   }
@@ -424,7 +549,7 @@ TEST(InterruptManager, FaultTerminalDispositionClearsLatchWithTerminalReason) {
   bool saw_terminal_clear = false;
   for (const auto& event : result.value().events) {
     if (event.type == "interrupt_cleared" &&
-        event.details.at("clear_reason") == "fault_terminal") {
+        detail_text(event.details, "clear_reason") == "fault_terminal") {
       saw_terminal_clear = true;
     }
   }
@@ -567,7 +692,7 @@ TEST(InterruptManager, QueuedReplayRevalidatesFreshnessAtClearTime) {
   bool saw_stale_drop = false;
   for (const auto& event : result.value().events) {
     if (event.type == "motion_interrupt_queued_update_dropped" &&
-        event.details.at("reason") == "stale") {
+        detail_text(event.details, "reason") == "stale") {
       saw_stale_drop = true;
     }
   }
@@ -736,6 +861,10 @@ MotionInterruptStopProfileDTO trip_stop_profile(
   MotionInterruptStopProfileDTO p;
   p.profile_id = "test_spring_back_hold";
   p.stop_mode = mode;
+  if (mode != MotionInterruptStopMode::kHardDeceleration) {
+    p.per_joint_max_deceleration = {
+        {"j1", AngularAccelerationDTO{2.0}}};
+  }
   return p;
 }
 
@@ -1116,9 +1245,9 @@ TEST(InterruptManagerMotionScopedTest,
   // Loser is the other source.
   for (const auto& ev : result.events) {
     if (ev.type == "motion_trip_secondary_signal") {
-      EXPECT_EQ(ev.details.at("losing_source_id"), "probe_b");
-      EXPECT_EQ(ev.details.at("losing_policy_id"), "trip_b");
-      EXPECT_EQ(ev.details.at("winning_latch_id"),
+      EXPECT_EQ(detail_text(ev.details, "losing_source_id"), "probe_b");
+      EXPECT_EQ(detail_text(ev.details, "losing_policy_id"), "trip_b");
+      EXPECT_EQ(detail_text(ev.details, "winning_latch_id"),
                 manager.active_latch()->latch_id);
     }
   }
@@ -1156,7 +1285,7 @@ TEST(InterruptManagerMotionScopedTest,
       continue;
     }
     ASSERT_TRUE(ev.details.contains("arm_baseline_age_ns"));
-    EXPECT_EQ(ev.details.at("arm_baseline_age_ns"), "500");
+    EXPECT_EQ(detail_text(ev.details, "arm_baseline_age_ns"), "500");
     EXPECT_FALSE(ev.details.contains("baseline_sequence_id"));
   }
 }
@@ -1469,13 +1598,13 @@ TEST(InterruptManagerMotionScopedTest,
 }
 
 TEST(InterruptManagerMotionScopedTest,
-     ArmRejectsFallbackModeNotInPolicyAllowedSet) {
-  // Every element of stop_profile.allowed_fallback_modes
-  // MUST be in policy.allowed_stop_modes.
+     ArmRejectsRecoverableSubstitutionNotInPolicyAllowedSet) {
+  // The sole recoverable substitution MUST also be in
+  // policy.allowed_stop_modes.
   InterruptManager manager;
   ASSERT_TRUE(manager.register_source(source("probe")).ok());
   auto policy = trip_policy("probe_trip", "probe");
-  policy.allowed_stop_modes = {MotionInterruptStopMode::kSpringBackHold};
+  policy.allowed_stop_modes = {MotionInterruptStopMode::kSoftOnPath};
   ASSERT_TRUE(manager.register_policy(policy).ok());
   ASSERT_FALSE(manager
                    .ingest(probe_baseline("probe", 1, 1'000, false),
@@ -1487,27 +1616,28 @@ TEST(InterruptManagerMotionScopedTest,
   MotionInterruptScopeDTO scope;
   scope.scope_id = "scope_a";
   scope.policy_id = "probe_trip";
-  scope.stop_profile = trip_stop_profile();
-  scope.stop_profile->allowed_fallback_modes = {
-      MotionInterruptStopMode::kHardDeceleration};
+  scope.stop_profile =
+      trip_stop_profile(MotionInterruptStopMode::kSoftOnPath);
+  scope.stop_profile->deceleration_time_s = 0.25;
+  scope.stop_profile->recoverable_substitution_mode =
+      MotionInterruptStopMode::kSpringBackHold;
   auto arm = manager.arm_motion_interrupt_scopes(100, "probe_move",
                                                    {scope}, 1'020);
   EXPECT_FALSE(arm.ok());
   EXPECT_EQ(arm.error().details.at("reason"),
-            "fallback_mode_not_allowed_by_policy");
+            "recoverable_substitution_not_allowed_by_policy");
 }
 
 TEST(InterruptManagerMotionScopedTest,
-     ArmRejectsFallbackOnPrecisionContactNodeCategory) {
-  // Spec/210 §3.11 node-category fallback defaults: precision-contact
-  // node families (ProbeSearchMove) MUST keep allowed_fallback_modes
-  // empty. Arming a precision-contact scope with any fallback list
-  // fails closed.
+     ArmRejectsRecoverableSubstitutionOnPrecisionContactNodeCategory) {
+  // Precision-contact node families (ProbeSearchMove) MUST keep the
+  // recoverable substitution absent. Arming a precision-contact scope with
+  // soft_on_path -> spring_back_hold substitution fails closed.
   InterruptManager manager;
   ASSERT_TRUE(manager.register_source(source("probe")).ok());
   auto policy = trip_policy("probe_trip", "probe");
-  policy.allowed_stop_modes = {MotionInterruptStopMode::kSpringBackHold,
-                                 MotionInterruptStopMode::kHardDeceleration};
+  policy.allowed_stop_modes = {MotionInterruptStopMode::kSoftOnPath,
+                               MotionInterruptStopMode::kSpringBackHold};
   ASSERT_TRUE(manager.register_policy(policy).ok());
   ASSERT_FALSE(manager
                    .ingest(probe_baseline("probe", 1, 1'000, false),
@@ -1519,22 +1649,24 @@ TEST(InterruptManagerMotionScopedTest,
   MotionInterruptScopeDTO scope;
   scope.scope_id = "scope_a";
   scope.policy_id = "probe_trip";
-  scope.stop_profile = trip_stop_profile();
-  scope.stop_profile->allowed_fallback_modes = {
-      MotionInterruptStopMode::kHardDeceleration};
+  scope.stop_profile =
+      trip_stop_profile(MotionInterruptStopMode::kSoftOnPath);
+  scope.stop_profile->deceleration_time_s = 0.25;
+  scope.stop_profile->recoverable_substitution_mode =
+      MotionInterruptStopMode::kSpringBackHold;
   scope.node_category = MotionInterruptNodeCategory::kPrecisionContact;
   auto arm = manager.arm_motion_interrupt_scopes(100, "probe_move",
                                                    {scope}, 1'020);
   EXPECT_FALSE(arm.ok());
   EXPECT_EQ(arm.error().details.at("reason"),
-            "fallback_not_allowed_for_node_category");
+            "recoverable_substitution_not_allowed_for_node_category");
 }
 
 TEST(InterruptManagerMotionScopedTest,
-     ArmAcceptsPrecisionContactNodeWithEmptyFallback) {
+     ArmAcceptsPrecisionContactNodeWithoutSubstitution) {
   // Confirm the precision-contact gate doesn't block the legitimate
-  // case: empty allowed_fallback_modes is the precision-contact
-  // default and MUST arm cleanly.
+  // case: no recoverable substitution is the precision-contact default and
+  // MUST arm cleanly.
   InterruptManager manager;
   ASSERT_TRUE(manager.register_source(source("probe")).ok());
   ASSERT_TRUE(manager.register_policy(trip_policy("probe_trip", "probe")).ok());
@@ -1677,7 +1809,8 @@ TEST(InterruptManagerMotionScopedTest,
                                                    {scope}, 1'020);
   EXPECT_FALSE(arm.ok());
   EXPECT_EQ(arm.error().details.at("reason"),
-            "soft_on_path_requires_per_joint_deceleration_limits");
+            "soft_on_path/spring_back_hold requires a non-empty "
+            "per_joint_max_deceleration");
 }
 
 TEST(InterruptManagerMotionScopedTest,
@@ -1690,7 +1823,8 @@ TEST(InterruptManagerMotionScopedTest,
   auto result = arm_with_profile(manager, p);
   EXPECT_TRUE(result.rejected);
   EXPECT_EQ(result.reason,
-            "stop_profile_deceleration_time_s_must_be_positive");
+            "soft_on_path/spring_back_hold requires a finite positive "
+            "deceleration_time_s");
 
   // Zero must also fail.
   InterruptManager m2;
@@ -1701,7 +1835,8 @@ TEST(InterruptManagerMotionScopedTest,
   auto r2 = arm_with_profile(m2, p2);
   EXPECT_TRUE(r2.rejected);
   EXPECT_EQ(r2.reason,
-            "stop_profile_deceleration_time_s_must_be_positive");
+            "soft_on_path/spring_back_hold requires a finite positive "
+            "deceleration_time_s");
 }
 
 TEST(InterruptManagerMotionScopedTest,
@@ -1713,8 +1848,7 @@ TEST(InterruptManagerMotionScopedTest,
   p.deceleration_time_s = kMaxControlledStopDecelerationTimeS + 0.001;
   auto result = arm_with_profile(manager, p);
   EXPECT_TRUE(result.rejected);
-  EXPECT_EQ(result.reason,
-            "stop_profile_deceleration_time_s_must_not_exceed_max");
+  EXPECT_EQ(result.reason, motion_interrupt_deceleration_time_max_error());
 }
 
 TEST(InterruptManagerMotionScopedTest,
@@ -1724,6 +1858,8 @@ TEST(InterruptManagerMotionScopedTest,
   p.profile_id = "max_decel";
   p.stop_mode = MotionInterruptStopMode::kSpringBackHold;
   p.deceleration_time_s = kMaxControlledStopDecelerationTimeS;
+  p.per_joint_max_deceleration = {
+      {"j1", AngularAccelerationDTO{2.0}}};
   auto result = arm_with_profile(manager, p);
   EXPECT_FALSE(result.rejected);
 }
@@ -1738,7 +1874,8 @@ TEST(InterruptManagerMotionScopedTest,
   auto result = arm_with_profile(manager, p);
   EXPECT_TRUE(result.rejected);
   EXPECT_EQ(result.reason,
-            "stop_profile_deceleration_time_s_must_be_positive");
+            "soft_on_path/spring_back_hold requires a finite positive "
+            "deceleration_time_s");
 }
 
 TEST(InterruptManagerMotionScopedTest,
@@ -1755,29 +1892,18 @@ TEST(InterruptManagerMotionScopedTest,
 }
 
 TEST(InterruptManagerMotionScopedTest,
-     ArmRejectsStopProfileNonPositiveMaxStopTime) {
-  InterruptManager manager;
-  MotionInterruptStopProfileDTO p;
-  p.profile_id = "neg_max_stop";
-  p.stop_mode = MotionInterruptStopMode::kSpringBackHold;
-  p.max_stop_time_s = 0.0;
-  auto result = arm_with_profile(manager, p);
-  EXPECT_TRUE(result.rejected);
-  EXPECT_EQ(result.reason,
-            "stop_profile_max_stop_time_s_must_be_positive");
-}
-
-TEST(InterruptManagerMotionScopedTest,
      ArmRejectsStopProfileNonPositivePerJointDeceleration) {
   InterruptManager manager;
   MotionInterruptStopProfileDTO p;
   p.profile_id = "bad_per_joint";
   p.stop_mode = MotionInterruptStopMode::kSpringBackHold;
-  p.per_joint_max_deceleration_rad_s2["j1"] = -2.0;
+  p.per_joint_max_deceleration["j1"] = AngularAccelerationDTO{-2.0};
   auto result = arm_with_profile(manager, p);
   EXPECT_TRUE(result.rejected);
   EXPECT_EQ(result.reason,
-            "stop_profile_per_joint_max_deceleration_must_be_positive");
+            "soft_on_path/spring_back_hold per_joint_max_deceleration "
+            "entries must have non-empty joint names and finite positive "
+            "values");
 }
 
 TEST(InterruptManagerMotionScopedTest,
@@ -1786,12 +1912,14 @@ TEST(InterruptManagerMotionScopedTest,
   MotionInterruptStopProfileDTO p;
   p.profile_id = "nan_per_joint";
   p.stop_mode = MotionInterruptStopMode::kSpringBackHold;
-  p.per_joint_max_deceleration_rad_s2["j1"] =
-      std::numeric_limits<double>::quiet_NaN();
+  p.per_joint_max_deceleration["j1"] = AngularAccelerationDTO{
+      std::numeric_limits<double>::quiet_NaN()};
   auto result = arm_with_profile(manager, p);
   EXPECT_TRUE(result.rejected);
   EXPECT_EQ(result.reason,
-            "stop_profile_per_joint_max_deceleration_must_be_positive");
+            "soft_on_path/spring_back_hold per_joint_max_deceleration "
+            "entries must have non-empty joint names and finite positive "
+            "values");
 }
 
 TEST(InterruptManagerMotionScopedTest,
@@ -1800,17 +1928,19 @@ TEST(InterruptManagerMotionScopedTest,
   MotionInterruptStopProfileDTO p;
   p.profile_id = "empty_joint";
   p.stop_mode = MotionInterruptStopMode::kSpringBackHold;
-  p.per_joint_max_deceleration_rad_s2[""] = 1.5;
+  p.per_joint_max_deceleration[""] = AngularAccelerationDTO{1.5};
   auto result = arm_with_profile(manager, p);
   EXPECT_TRUE(result.rejected);
   EXPECT_EQ(result.reason,
-            "stop_profile_per_joint_max_deceleration_joint_name_required");
+            "soft_on_path/spring_back_hold per_joint_max_deceleration "
+            "entries must have non-empty joint names and finite positive "
+            "values");
 }
 
 TEST(InterruptManagerMotionScopedTest,
      ArmAcceptsWellFormedSoftOnPathProfile) {
-  // Sanity: a soft_on_path profile with positive ramp + max_stop_time
-  // + positive per-joint limits arms cleanly.
+  // Sanity: a soft_on_path profile with positive ramp and typed per-joint
+  // limits arms cleanly.
   InterruptManager manager;
   auto policy = trip_policy("probe_trip", "probe");
   policy.allowed_stop_modes = {MotionInterruptStopMode::kSoftOnPath};
@@ -1830,9 +1960,9 @@ TEST(InterruptManagerMotionScopedTest,
   scope.stop_profile->profile_id = "good_soft";
   scope.stop_profile->stop_mode = MotionInterruptStopMode::kSoftOnPath;
   scope.stop_profile->deceleration_time_s = 0.05;
-  scope.stop_profile->max_stop_time_s = 0.5;
-  scope.stop_profile->per_joint_max_deceleration_rad_s2 = {{"j1", 2.0},
-                                                              {"j2", 2.0}};
+  scope.stop_profile->per_joint_max_deceleration = {
+      {"j1", AngularAccelerationDTO{2.0}},
+      {"j2", AngularAccelerationDTO{2.0}}};
   auto arm = manager.arm_motion_interrupt_scopes(100, "probe_move",
                                                    {scope}, 1'020);
   ASSERT_TRUE(arm.ok());

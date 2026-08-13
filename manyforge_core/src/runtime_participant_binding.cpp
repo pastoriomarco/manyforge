@@ -44,33 +44,27 @@ template <typename Range, typename Projection>
 
 [[nodiscard]] bool valid_control_path(const RuntimeControlPathDTO& path) noexcept {
   const bool base_valid =
-         !path.control_domain_id.empty() && !path.control_domain_revision.empty() &&
-         !path.control_binding_id.empty() && !path.control_binding_revision.empty() &&
-         !path.control_interface_contract_id.empty() && !path.control_interface_revision.empty() &&
-         !path.controller_topology_id.empty() && !path.topology_revision.empty() &&
-         !path.control_route_id.empty() && !path.activation_set_id.empty() &&
-         !path.active_control_configuration_id.empty() &&
-         path.active_control_configuration_generation.nonzero() &&
-         !path.provider_instance_id.empty() && !path.provider_manifest_id.empty() &&
-         !path.provider_manifest_revision.empty() && !path.provider_runtime_epoch.empty() &&
-         !path.state_authority_id.empty() && !path.stop_evidence_policy_id.empty() &&
-         !path.stop_evidence_policy_revision.empty();
+      !path.control_domain_id.empty() && !path.control_domain_revision.empty() &&
+      !path.control_binding_id.empty() && !path.control_binding_revision.empty() &&
+      !path.control_interface_contract_id.empty() && !path.control_interface_revision.empty() &&
+      !path.controller_topology_id.empty() && !path.topology_revision.empty() &&
+      !path.control_route_id.empty() && !path.activation_set_id.empty() &&
+      !path.active_control_configuration_id.empty() &&
+      path.active_control_configuration_generation.nonzero() &&
+      !path.provider_instance_id.empty() && !path.provider_manifest_id.empty() &&
+      !path.provider_manifest_revision.empty() && !path.provider_runtime_unit_id.empty() &&
+      !path.provider_runtime_epoch.empty() && !path.state_authority_id.empty() &&
+      !path.stop_evidence_policy_id.empty() && !path.stop_evidence_policy_revision.empty();
   if (!base_valid || !path.runtime_scale_qualification.has_value()) {
     return base_valid;
   }
   const auto& scale = *path.runtime_scale_qualification;
-  return scale.control_route_id == path.control_route_id &&
-         !scale.scaling_domain_id.empty() &&
-         !scale.command_endpoint_role_id.empty() &&
-         !scale.applied_state_endpoint_role_id.empty() &&
-         (!scale.coordinated_barrier_id.has_value() ||
-          !scale.coordinated_barrier_id->empty()) &&
-         std::isfinite(scale.maximum_slew_per_second) &&
-         scale.maximum_slew_per_second > 0.0 &&
-         scale.freshness_budget_ns > 0 &&
-         scale.freshness_budget_ns <= 9007199254740991LL &&
-         scale.acknowledgement_kind ==
-             RuntimeScaleAcknowledgementKind::kAppliedState;
+  return scale.control_route_id == path.control_route_id && !scale.scaling_domain_id.empty() &&
+         !scale.command_endpoint_role_id.empty() && !scale.applied_state_endpoint_role_id.empty() &&
+         (!scale.coordinated_barrier_id.has_value() || !scale.coordinated_barrier_id->empty()) &&
+         std::isfinite(scale.maximum_slew_per_second) && scale.maximum_slew_per_second > 0.0 &&
+         scale.freshness_budget_ns > 0 && scale.freshness_budget_ns <= 9007199254740991LL &&
+         scale.acknowledgement_kind == RuntimeScaleAcknowledgementKind::kAppliedState;
 }
 
 [[nodiscard]] bool valid_provider_path(const RuntimeCapabilityProviderPathDTO& path) noexcept {
@@ -78,7 +72,7 @@ template <typename Range, typename Projection>
          !path.capability_provider_binding_id.empty() &&
          !path.capability_provider_binding_revision.empty() && !path.provider_instance_id.empty() &&
          !path.provider_manifest_id.empty() && !path.provider_manifest_revision.empty() &&
-         !path.provider_runtime_epoch.empty();
+         !path.provider_runtime_unit_id.empty() && !path.provider_runtime_epoch.empty();
 }
 
 }  // namespace
@@ -103,12 +97,11 @@ Result<RuntimeParticipantBinding> verify_runtime_participant_binding(
     return invalid("runtime participant model bindings are incomplete or duplicate",
                    "runtime_model_binding_invalid");
   }
-  if ((!value.model_groups.empty() &&
-       !unique_nonempty(value.model_groups,
-                        [](const auto& item) {
-                          return std::pair(item.model_group_role_id,
-                                           item.model_instance_id);
-                        })) ||
+  if ((!value.model_groups.empty() && !unique_nonempty(value.model_groups,
+                                                       [](const auto& item) {
+                                                         return std::pair(item.model_group_role_id,
+                                                                          item.model_instance_id);
+                                                       })) ||
       std::any_of(value.model_groups.begin(), value.model_groups.end(), [&](const auto& item) {
         return item.model_group_role_id.empty() || item.model_instance_id.empty() ||
                item.compiled_group_name.empty() ||
@@ -194,87 +187,83 @@ Result<RuntimeParticipantBinding> verify_runtime_participant_binding(
     return invalid("runtime participant epochs are incomplete, unsorted, or duplicate",
                    "runtime_epoch_binding_invalid");
   }
+  const auto has_exact_provider_runtime = [&](const auto& provider) {
+    return std::count_if(value.runtime_unit_epochs.begin(), value.runtime_unit_epochs.end(),
+                         [&](const auto& occurrence) {
+                           return occurrence.runtime_unit_id == provider.provider_runtime_unit_id;
+                         }) == 1;
+  };
+  if ((value.control_path.has_value() && !has_exact_provider_runtime(*value.control_path)) ||
+      (value.capability_provider_path.has_value() &&
+       !has_exact_provider_runtime(*value.capability_provider_path)) ||
+      !std::all_of(value.supporting_capability_provider_paths.begin(),
+                   value.supporting_capability_provider_paths.end(), has_exact_provider_runtime)) {
+    return invalid("runtime capability provider does not join one exact runtime-unit epoch",
+                   "runtime_provider_epoch_join_invalid");
+  }
   if (value.command_schema.has_value() && (value.command_schema->command_schema_id.empty() ||
                                            value.command_schema->command_schema_revision.empty())) {
     return invalid("runtime participant command schema is incomplete",
                    "runtime_command_schema_invalid");
   }
   if (!sorted_unique(value.contact_grasp_bindings,
-                     [](const auto& policy) {
-                       return policy.contact_policy_id;
-                     }) ||
+                     [](const auto& policy) { return policy.contact_policy_id; }) ||
       std::any_of(
-          value.contact_grasp_bindings.begin(),
-          value.contact_grasp_bindings.end(), [&](const auto& policy) {
-            if (policy.contact_policy_id.empty() ||
-                policy.contact_policy_revision.empty() ||
-                policy.runtime_object_id.empty() ||
-                policy.allowed_body_bindings.empty() ||
-                !std::isfinite(policy.max_penetration_m) ||
-                policy.max_penetration_m <= 0.0 ||
+          value.contact_grasp_bindings.begin(), value.contact_grasp_bindings.end(),
+          [&](const auto& policy) {
+            if (policy.contact_policy_id.empty() || policy.contact_policy_revision.empty() ||
+                policy.runtime_object_id.empty() || policy.allowed_body_bindings.empty() ||
+                !std::isfinite(policy.max_penetration_m) || policy.max_penetration_m <= 0.0 ||
                 !std::isfinite(policy.terminal_window_start_fraction) ||
                 policy.terminal_window_start_fraction < 0.0 ||
                 policy.terminal_window_start_fraction > 1.0 ||
-                !sorted_unique(policy.allowed_body_bindings,
-                               [](const auto& body) {
-                                 return std::tie(
-                                     body.component_role_id,
-                                     body.target_role_id,
-                                     body.model_role_id,
-                                     body.collision_body_role_id);
-                               })) {
+                !sorted_unique(policy.allowed_body_bindings, [](const auto& body) {
+                  return std::tie(body.component_role_id, body.target_role_id, body.model_role_id,
+                                  body.collision_body_role_id);
+                })) {
               return true;
             }
             return std::any_of(
-                policy.allowed_body_bindings.begin(),
-                policy.allowed_body_bindings.end(), [&](const auto& body) {
-                  if (body.component_role_id.empty() ||
-                      body.target_role_id.empty() ||
-                      body.controllable_component_id.empty() ||
-                      body.command_target_id.empty() ||
-                      (body.model_role_id.has_value() &&
-                       body.model_role_id->empty()) ||
-                      body.collision_body_role_id.empty() ||
-                      body.model_instance_id.empty() ||
-                      body.model_revision.empty() ||
-                      body.collision_body_ids.empty()) {
+                policy.allowed_body_bindings.begin(), policy.allowed_body_bindings.end(),
+                [&](const auto& body) {
+                  if (body.component_role_id.empty() || body.target_role_id.empty() ||
+                      body.controllable_component_id.empty() || body.command_target_id.empty() ||
+                      (body.model_role_id.has_value() && body.model_role_id->empty()) ||
+                      body.collision_body_role_id.empty() || body.model_instance_id.empty() ||
+                      body.model_revision.empty() || body.collision_body_ids.empty()) {
                     return true;
                   }
-                  for (std::size_t index = 0U;
-                       index < body.collision_body_ids.size(); ++index) {
+                  for (std::size_t index = 0U; index < body.collision_body_ids.size(); ++index) {
                     if (body.collision_body_ids[index] !=
-                        make_component_collision_body_id(
-                            body.controllable_component_id,
-                            body.model_instance_id,
-                            body.collision_body_role_id, index)) {
+                        make_component_collision_body_id(body.controllable_component_id,
+                                                         body.model_instance_id,
+                                                         body.collision_body_role_id, index)) {
                       return true;
                     }
                   }
                   return false;
                 });
           })) {
-    return invalid("runtime contact-grasp bindings are incomplete, unsorted, "
-                   "or inconsistent",
-                   "runtime_contact_grasp_binding_invalid");
+    return invalid(
+        "runtime contact-grasp bindings are incomplete, unsorted, "
+        "or inconsistent",
+        "runtime_contact_grasp_binding_invalid");
   }
   return Result<RuntimeParticipantBinding>::Ok(RuntimeParticipantBinding(std::move(value)));
 }
 
-Result<RuntimeParticipantBinding>
-bind_runtime_participant_collision_body_aliases(
+Result<RuntimeParticipantBinding> bind_runtime_participant_collision_body_aliases(
     RuntimeParticipantBinding binding,
     const std::span<const RuntimeCollisionBodyAliasDTO> aliases) {
   if (aliases.empty() ||
-      !sorted_unique(aliases, [](const auto& alias) {
-        return alias.semantic_body_id;
-      }) ||
+      !sorted_unique(aliases, [](const auto& alias) { return alias.semantic_body_id; }) ||
       std::any_of(aliases.begin(), aliases.end(), [](const auto& alias) {
-        return alias.semantic_body_id.empty() ||
-               alias.projected_body_id.empty();
+        return alias.semantic_body_id.empty() || alias.projected_body_id.empty();
       })) {
-    return invalid("runtime collision-body alias table is incomplete or "
-                   "ambiguous",
-                   "runtime_collision_body_alias_table_invalid");
+    return invalid(
+        "runtime collision-body alias table is incomplete or "
+        "ambiguous",
+        "runtime_collision_body_alias_table_invalid");
   }
 
   std::map<CollisionBodyId, CollisionBodyId> by_semantic;
@@ -283,12 +272,12 @@ bind_runtime_participant_collision_body_aliases(
   }
   if (std::any_of(aliases.begin(), aliases.end(), [&](const auto& alias) {
         const auto physical = by_semantic.find(alias.projected_body_id);
-        return physical == by_semantic.end() ||
-               physical->second != alias.projected_body_id;
+        return physical == by_semantic.end() || physical->second != alias.projected_body_id;
       })) {
-    return invalid("runtime collision-body alias table has no exact physical "
-                   "fixed point",
-                   "runtime_collision_body_alias_table_invalid");
+    return invalid(
+        "runtime collision-body alias table has no exact physical "
+        "fixed point",
+        "runtime_collision_body_alias_table_invalid");
   }
 
   auto value = binding.value();
@@ -297,18 +286,17 @@ bind_runtime_participant_collision_body_aliases(
       std::set<std::string, std::less<>> projected_ids;
       for (auto& body_id : body.collision_body_ids) {
         const auto alias = by_semantic.find(CollisionBodyId(body_id));
-        if (alias == by_semantic.end() ||
-            !projected_ids.insert(alias->second).second) {
-          return invalid("runtime contact-grasp body has no unique exact "
-                         "physical projection",
-                         "runtime_collision_body_alias_unresolved");
+        if (alias == by_semantic.end() || !projected_ids.insert(alias->second).second) {
+          return invalid(
+              "runtime contact-grasp body has no unique exact "
+              "physical projection",
+              "runtime_collision_body_alias_unresolved");
         }
         body_id = alias->second;
       }
     }
   }
-  return Result<RuntimeParticipantBinding>::Ok(
-      RuntimeParticipantBinding(std::move(value)));
+  return Result<RuntimeParticipantBinding>::Ok(RuntimeParticipantBinding(std::move(value)));
 }
 
 Result<ObservedStateQueryContextDTO> make_observed_state_query_context(

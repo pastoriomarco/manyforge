@@ -41,19 +41,16 @@ void bind_strong_counter(py::module_& module, const char* python_name) {
       .def(py::init<std::uint64_t>(), py::arg("value"))
       .def_property_readonly("value", &StrongType::value)
       .def_property_readonly("nonzero", &StrongType::nonzero)
-      .def("__repr__", [type_name](const StrongType& value) {
-        return py::str("{}({})").format(type_name, value.value());
-      })
-      .def("__eq__",
-           [](const StrongType& lhs, const StrongType& rhs) {
-             return lhs == rhs;
-           },
-           py::is_operator())
-      .def("__ne__",
-           [](const StrongType& lhs, const StrongType& rhs) {
-             return lhs != rhs;
-           },
-           py::is_operator())
+      .def("__repr__",
+           [type_name](const StrongType& value) {
+             return py::str("{}({})").format(type_name, value.value());
+           })
+      .def(
+          "__eq__", [](const StrongType& lhs, const StrongType& rhs) { return lhs == rhs; },
+          py::is_operator())
+      .def(
+          "__ne__", [](const StrongType& lhs, const StrongType& rhs) { return lhs != rhs; },
+          py::is_operator())
       .def("__hash__", [type_name](const StrongType& value) {
         return py::hash(py::make_tuple(type_name, value.value()));
       });
@@ -78,6 +75,10 @@ void register_strong_identity_bindings(py::module_& module) {
   MANYFORGE_BIND_STRONG_STRING(RuntimeEpoch);
   MANYFORGE_BIND_STRONG_STRING(RuntimePolicyId);
   MANYFORGE_BIND_STRONG_STRING(RuntimePolicyRevision);
+  MANYFORGE_BIND_STRONG_STRING(InterruptSourceId);
+  MANYFORGE_BIND_STRONG_STRING(InterruptPolicyId);
+  MANYFORGE_BIND_STRONG_STRING(InterruptLatchId);
+  MANYFORGE_BIND_STRONG_STRING(MotionInterruptScopeId);
 
   MANYFORGE_BIND_STRONG_STRING(ComponentTypeId);
   MANYFORGE_BIND_STRONG_STRING(ComponentTypeRevision);
@@ -152,6 +153,8 @@ void register_strong_identity_bindings(py::module_& module) {
   MANYFORGE_BIND_STRONG_STRING(RetainedBundleId);
   MANYFORGE_BIND_STRONG_STRING(SceneId);
   MANYFORGE_BIND_STRONG_STRING(ProjectionLeaseId);
+  MANYFORGE_BIND_STRONG_STRING(BootstrapId);
+  MANYFORGE_BIND_STRONG_STRING(ApplyId);
 
   MANYFORGE_BIND_STRONG_STRING(CommandSchemaId);
   MANYFORGE_BIND_STRONG_STRING(CommandSchemaRevision);
@@ -163,10 +166,35 @@ void register_strong_identity_bindings(py::module_& module) {
   MANYFORGE_BIND_STRONG_STRING(ProgramRunId);
   MANYFORGE_BIND_STRONG_STRING(MoveId);
 
+  MANYFORGE_BIND_STRONG_STRING(RequestOwnerEpoch);
+  MANYFORGE_BIND_STRONG_STRING(RequestId);
+  MANYFORGE_BIND_STRONG_STRING(LifecycleTransactionId);
+  MANYFORGE_BIND_STRONG_STRING(LifecycleFactId);
+  MANYFORGE_BIND_STRONG_STRING(LifecyclePrimitiveId);
+  MANYFORGE_BIND_STRONG_STRING(LifecyclePrimitiveAttemptId);
+  MANYFORGE_BIND_STRONG_STRING(ConfigurationFenceId);
+  MANYFORGE_BIND_STRONG_STRING(OperationId);
+  MANYFORGE_BIND_STRONG_STRING(OperationParticipantId);
+  MANYFORGE_BIND_STRONG_STRING(StopId);
+  MANYFORGE_BIND_STRONG_STRING(StopCertificateId);
+  MANYFORGE_BIND_STRONG_STRING(StopFaultLatchId);
+
 #undef MANYFORGE_BIND_STRONG_STRING
 
-  bind_strong_counter<ActiveControlConfigurationGeneration>(
-      module, "ActiveControlConfigurationGeneration");
+  bind_strong_counter<ActiveControlConfigurationGeneration>(module,
+                                                            "ActiveControlConfigurationGeneration");
+  bind_strong_counter<ProjectionStageGeneration>(module, "ProjectionStageGeneration");
+  bind_strong_counter<ActiveBundlePublicationGeneration>(module,
+                                                         "ActiveBundlePublicationGeneration");
+  bind_strong_counter<BootstrapGeneration>(module, "BootstrapGeneration");
+  bind_strong_counter<ApplyGeneration>(module, "ApplyGeneration");
+  bind_strong_counter<LifecycleTransactionGeneration>(module, "LifecycleTransactionGeneration");
+  bind_strong_counter<ComponentLifecycleGeneration>(module, "ComponentLifecycleGeneration");
+  bind_strong_counter<OperationRevision>(module, "OperationRevision");
+  bind_strong_counter<ConfigurationFenceGeneration>(module, "ConfigurationFenceGeneration");
+  bind_strong_counter<StopGeneration>(module, "StopGeneration");
+  bind_strong_counter<StopCertificateRevision>(module, "StopCertificateRevision");
+  bind_strong_counter<StopFaultLatchGeneration>(module, "StopFaultLatchGeneration");
 }
 
 }  // namespace manyforge::core::python

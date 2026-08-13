@@ -61,7 +61,8 @@ using namespace manyforge::core;
           ProviderInstanceId("provider.native"),
           ProviderManifestId("provider-manifest.native"),
           ProviderManifestRevision("provider-manifest-revision"),
-          RuntimeEpoch("provider-epoch.1"),
+          RuntimeUnitId("runtime.native"),
+          RuntimeEpoch("runtime-epoch.1"),
           StateAuthorityId("state.native"),
           StateAuthorityClass::kPredicted,
           StopEvidencePolicyId("stop.native"),
@@ -70,7 +71,8 @@ using namespace manyforge::core;
           std::nullopt},
       std::nullopt,
       {},
-      {}};
+      {RuntimeUnitEpochBindingDTO{RuntimeUnitId("runtime.native"),
+                                  RuntimeEpoch("runtime-epoch.1")}}};
   auto sealed = verify_runtime_participant_binding(std::move(value));
   if (!sealed.ok()) {
     throw std::logic_error(sealed.error().message);

@@ -2123,7 +2123,7 @@ make_applicability_inputs(
                  {"queue_depth", CanonicalValue(8.0)},
                  {"cancel_validation_timeout_ns", CanonicalValue(1000.0)},
                  {"motion_scope_arm_timeout_ns", CanonicalValue(1000.0)},
-                 {"supervisory_poll_rate_hz", CanonicalValue(100.0)},
+                 {"supervisory_poll_rate_hz", CanonicalValue(10.0)},
              })},
         }));
   }
@@ -2362,7 +2362,8 @@ make_lite6_controllable_retention_fixture(bool chained = false,
   }
   const auto applicability = qualify_cell_applicability(
       composition, deployment.applicability_inputs(), runtime_profiles,
-      command_schemas, capabilities, contracts, topologies, providers,
+      std::span<const QualifiedRuntimePolicy>{}, command_schemas, capabilities,
+      contracts, topologies, providers,
       stop_policies, selected_value_schemas,
       std::span<const QualifiedCommissioningEvidenceRef>{}, overlay);
   auto qualified = qualify_deployment_for_retention(

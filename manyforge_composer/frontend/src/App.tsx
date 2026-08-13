@@ -4,6 +4,7 @@ import { ApiError, api } from './api/client';
 import { ArtifactBrowser } from './components/ArtifactBrowser';
 import { AssistantOverlay } from './components/AssistantOverlay';
 import { CatalogPanel } from './components/CatalogPanel';
+import { CCLCPanel } from './components/CCLCPanel';
 import { ProgramWorkspace } from './components/ProgramWorkspace';
 import { ProgramRuntimePanel } from './components/ProgramRuntimePanel';
 import { SceneAuthoringWorkspace } from './components/SceneAuthoringWorkspace';
@@ -78,6 +79,8 @@ export default function App() {
         enabled={headlessEnabled}
         controller={robotControl}
       />
+
+      <CCLCPanel enabled={headlessEnabled} />
 
       <ProgramWorkspace
         controller={programController}
