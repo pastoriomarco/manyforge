@@ -160,6 +160,15 @@ struct ExecutionBackendStatusDTO final {
     const PreparedOperationParticipantDTO& participant, PrepareParticipantResultStateDTO state,
     std::optional<ErrorDTO> error = std::nullopt);
 
+/// Validate the immediate handle returned by Dispatch/DispatchResume.  A
+/// prepared dispatch is not admitted into runtime observation unless the
+/// backend echoes the exact Kernel goal generation and prepared-contract
+/// digest and supplies both bounded observation callbacks.
+[[nodiscard]] std::optional<std::string_view> prepared_execution_handle_field_error(
+    const ExecutionHandle& handle, const PreparedOperationParticipantDTO& participant,
+    const ControllerGoalId& controller_goal_id,
+    ControllerGoalGeneration controller_goal_generation) noexcept;
+
 /// Validate one status publication against the exact prepared participant and
 /// Kernel-minted goal identity for that dispatch.
 [[nodiscard]] std::optional<std::string_view> execution_backend_status_field_error(

@@ -130,6 +130,42 @@ TEST(PreparedExecutionTest, RejectedPrepareRequiresStableErrorAndNoDigest) {
           .ok());
 }
 
+TEST(PreparedExecutionTest, DispatchHandleRequiresExactPreparedGoalMembership) {
+  const auto participant = PreparedParticipant();
+  const ControllerGoalId goal_id("goal.1");
+  const ControllerGoalGeneration goal_generation(7U);
+  const auto wait = [](std::int64_t) { return true; };
+  const auto snapshot = [] { return ExecutionSnapshot{}; };
+  ExecutionHandle handle{wait,    snapshot,        0U,
+                         goal_id, goal_generation, participant.prepared_contract_digest};
+  EXPECT_FALSE(prepared_execution_handle_field_error(handle, participant, goal_id, goal_generation)
+                   .has_value());
+
+  auto wrong_goal = handle;
+  wrong_goal.controller_goal_id = ControllerGoalId("goal.other");
+  EXPECT_EQ(
+      prepared_execution_handle_field_error(wrong_goal, participant, goal_id, goal_generation),
+      "prepared_execution_handle_membership_mismatch");
+
+  auto wrong_generation = handle;
+  wrong_generation.controller_goal_generation = ControllerGoalGeneration(8U);
+  EXPECT_EQ(prepared_execution_handle_field_error(wrong_generation, participant, goal_id,
+                                                  goal_generation),
+            "prepared_execution_handle_membership_mismatch");
+
+  auto wrong_digest = handle;
+  wrong_digest.prepared_contract_digest = ContentDigest(Digest('f'));
+  EXPECT_EQ(
+      prepared_execution_handle_field_error(wrong_digest, participant, goal_id, goal_generation),
+      "prepared_execution_handle_membership_mismatch");
+
+  auto missing_observer = handle;
+  missing_observer.get_snapshot = {};
+  EXPECT_EQ(prepared_execution_handle_field_error(missing_observer, participant, goal_id,
+                                                  goal_generation),
+            "prepared_execution_handle_observer_missing");
+}
+
 TEST(PreparedExecutionTest, BackendStatusIsGoalAndBindingFenced) {
   const auto participant = PreparedParticipant();
   const ControllerGoalId goal_id("goal.1");

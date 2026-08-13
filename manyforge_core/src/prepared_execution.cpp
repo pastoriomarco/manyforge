@@ -313,6 +313,27 @@ Result<PrepareParticipantResultDTO> MakePrepareParticipantResult(
   return Result<PrepareParticipantResultDTO>::Ok(std::move(result));
 }
 
+std::optional<std::string_view> prepared_execution_handle_field_error(
+    const ExecutionHandle& handle, const PreparedOperationParticipantDTO& participant,
+    const ControllerGoalId& controller_goal_id,
+    const ControllerGoalGeneration controller_goal_generation) noexcept {
+  if (!participant_identity_shape(participant) || !identity(controller_goal_id) ||
+      !counter(controller_goal_generation)) {
+    return "prepared_execution_handle_request_identity_invalid";
+  }
+  if (!handle.wait_for_completion || !handle.get_snapshot) {
+    return "prepared_execution_handle_observer_missing";
+  }
+  if (!handle.controller_goal_id.has_value() || *handle.controller_goal_id != controller_goal_id ||
+      !handle.controller_goal_generation.has_value() ||
+      *handle.controller_goal_generation != controller_goal_generation ||
+      !handle.prepared_contract_digest.has_value() ||
+      *handle.prepared_contract_digest != participant.prepared_contract_digest) {
+    return "prepared_execution_handle_membership_mismatch";
+  }
+  return std::nullopt;
+}
+
 std::optional<std::string_view> execution_backend_status_field_error(
     const ExecutionBackendStatusDTO& status, const PreparedOperationParticipantDTO& participant,
     const ControllerGoalId& controller_goal_id,
