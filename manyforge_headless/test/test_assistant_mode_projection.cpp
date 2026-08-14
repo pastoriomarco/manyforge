@@ -44,7 +44,18 @@ TEST(AssistantModeProjection,
             std::string::npos);
   EXPECT_EQ(bytes.find("runtime_mutating"), std::string::npos);
   EXPECT_EQ(bytes.find("availability_granted"), std::string::npos);
-  EXPECT_EQ(bytes.find("inspect_isaac_scene"), std::string::npos);
+}
+
+TEST(AssistantModeProjection,
+     RetainedQueryModePublishesTheOwnerRoutedIsaacInspector) {
+  const auto bundle = test::LoadAssistantAuthoringBundle();
+
+  const auto projection = ProjectAssistantMode(*bundle, "query");
+  const auto bytes = content_identity::canonical_json(projection);
+
+  EXPECT_NE(bytes.find("\"tool_id\":\"inspect_isaac_scene\""),
+            std::string::npos);
+  EXPECT_NE(bytes.find("\"effect\":\"read_only\""), std::string::npos);
 }
 
 TEST(AssistantModeProjection, IndexPublishesOnlyEnabledDiscoverableModes) {

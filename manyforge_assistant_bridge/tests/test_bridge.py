@@ -105,10 +105,57 @@ def _projection() -> dict[str, Any]:
     return semantic
 
 
+def _scene_projection() -> dict[str, Any]:
+    def simulation_source(entity: str, sequence: int) -> dict[str, Any]:
+        return {
+            "payload": {
+                "api_version": "manyforge.ros_pose_observation.v1",
+                "kind": "simulation_entity_pose",
+                "pose": {},
+                "source": {"entity": entity},
+            },
+            "source_sequence": sequence,
+        }
+
+    sources = [
+        {
+            "payload": {
+                "api_version": "manyforge.ros_pose_observation.v1",
+                "joint_names": ["joint-1"],
+                "kind": "joint_state",
+                "positions": [0.1],
+                "source_stamp_s": 1.0,
+                "topic": "/isaac_joint_states",
+            },
+            "source_sequence": 1,
+        },
+        simulation_source("/World/keep/item", 2),
+        simulation_source("/World/keep/drop/item", 3),
+        simulation_source("/World/other/item", 4),
+        simulation_source("/World/probe", 5),
+    ]
+    return {
+        "schema_version": "manyforge.scene_projection.v1",
+        "projection_generation": 7,
+        "logical_scene": {
+            "available": True,
+            "payload": {"api_version": "manyforge.logical_scene_source.v1"},
+        },
+        "scene_runtime": {
+            "available": True,
+            "payload": {
+                "api_version": "manyforge.scene_runtime_source.v1",
+                "state": {"pose_sources": sources},
+            },
+        },
+    }
+
+
 class _Headless(HeadlessHttpClient):
     def __init__(self, projection: dict[str, Any]) -> None:
         self.projection = projection
         self.assistant_mode_reads = 0
+        self.scene_reads = 0
 
     def assistant_mode(self, mode: str) -> dict[str, Any]:
         assert mode == "composer-assistant"
@@ -128,6 +175,10 @@ class _Headless(HeadlessHttpClient):
                 "known_gaps": [],
             },
         }
+
+    def scene(self) -> dict[str, Any]:
+        self.scene_reads += 1
+        return deepcopy(_scene_projection())
 
     def close(self) -> None:
         pass
@@ -161,6 +212,29 @@ def _request(projection: dict[str, Any]) -> dict[str, Any]:
             "sourceModelProjectionDigest": "sha256:" + "7" * 64,
         },
     }
+
+
+def _append_projection_tool(
+    projection: dict[str, Any],
+    tool: dict[str, Any],
+) -> None:
+    projection["tools"].append(tool)
+    projection["tools"].sort(key=lambda row: row["tool_id"])
+    catalog = {
+        "grant_policy": projection["grant_policy"],
+        "mode": projection["mode"],
+        "nodes": projection["nodes"],
+        "skills": projection["skills"],
+        "tools": projection["tools"],
+    }
+    projection["catalog_hash"] = framed_digest(
+        "assistant-mode-catalog", "manyforge.assistant_mode_catalog.v1", catalog
+    )
+    projection["source"]["source_content_digest"] = framed_digest(
+        "manyforge-assistant-mode-projection-semantic",
+        "manyforge.assistant_mode_projection.v1",
+        {key: value for key, value in projection.items() if key != "source"},
+    )
 
 
 def _service(
@@ -270,6 +344,134 @@ def test_bridge_verifies_projection_and_runs_only_draft_callback(tmp_path: Path)
     assert all(type(row["timestampNs"]) is int for row in audit)
     assert all(row["timestampNs"] > 9_007_199_254_740_991 for row in audit)
     assert "message" not in audit[-1]
+
+
+def test_inspect_isaac_scene_uses_only_filtered_headless_scene_truth(
+    tmp_path: Path,
+) -> None:
+    projection = _projection()
+    string_array = {
+        "items": {"maxLength": 4096, "minLength": 1, "type": "string"},
+        "maxItems": 4096,
+        "type": "array",
+        "uniqueItems": True,
+    }
+    schema = {
+        "additionalProperties": False,
+        "properties": {
+            "exclude_subtrees": string_array,
+            "include_subtrees": string_array,
+            "mesh_export_dir": {
+                "maxLength": 4096,
+                "minLength": 1,
+                "type": "string",
+            },
+            "mesh_source_preference": {
+                "enum": ["auto", "original", "collider", "primitive"],
+                "type": "string",
+            },
+            "output_profile": {
+                "enum": ["llm_scene_authoring", "raw_inventory"],
+                "type": "string",
+            },
+            "probe_prims": string_array,
+        },
+        "type": "object",
+    }
+    _append_projection_tool(
+        projection,
+        {
+            "description": "Read a normalized Isaac scene-inspection report.",
+            "effect": "read_only",
+            "input_schema": schema,
+            "input_schema_hash": raw_digest(schema),
+            "tool_id": "inspect_isaac_scene",
+        },
+    )
+    upstream_bodies: list[dict[str, Any]] = []
+    arguments = {
+        "exclude_subtrees": ["/World/keep/drop"],
+        "include_subtrees": ["/World/keep"],
+        "mesh_export_dir": "/must/not/be/written",
+        "mesh_source_preference": "collider",
+        "output_profile": "llm_scene_authoring",
+        "probe_prims": ["/World/probe"],
+    }
+
+    async def upstream(request: httpx.Request) -> httpx.Response:
+        upstream_bodies.append(json.loads(request.content))
+        if len(upstream_bodies) == 1:
+            message = {
+                "content": "",
+                "tool_calls": [
+                    {
+                        "id": "call.inspect",
+                        "type": "function",
+                        "function": {
+                            "name": "inspect_isaac_scene",
+                            "arguments": json.dumps(arguments),
+                        },
+                    }
+                ],
+            }
+        else:
+            message = {"content": "The owner scene has been inspected."}
+        return httpx.Response(
+            200,
+            json={"choices": [{"message": message}]},
+            request=request,
+        )
+
+    async def composer_must_not_run(
+        request: httpx.Request,
+    ) -> httpx.Response:
+        raise AssertionError(
+            "Isaac inspection must not use a Composer or simulator RPC"
+        )
+
+    service = _service(
+        tmp_path,
+        projection,
+        upstream_handler=upstream,
+        composer_handler=composer_must_not_run,
+    )
+    with TestClient(create_app(service.config, service=service)) as client:
+        assert client.post(
+            "/v1/manyforge/assistant", json=_request(projection)
+        ).status_code == 202
+        status = _terminal(client, "request.1")
+
+    assert status["state"] == "completed"
+    assert service._headless.scene_reads == 1
+    tool_message = next(
+        row for row in upstream_bodies[1]["messages"] if row["role"] == "tool"
+    )
+    details = json.loads(tool_message["content"])["result"]["details"]
+    assert details["schema_version"] == (
+        "manyforge.assistant.isaac_scene_inspection.v1"
+    )
+    assert details["presentation"] == {
+        "exclude_subtrees": ["/World/keep/drop"],
+        "include_subtrees": ["/World/keep"],
+        "mesh_export": {
+            "performed": False,
+            "requested_directory": "/must/not/be/written",
+            "reason": (
+                "Headless inspection is read-only and performs no simulator or "
+                "filesystem RPC"
+            ),
+        },
+        "mesh_source_preference": "collider",
+        "output_profile": "llm_scene_authoring",
+        "pose_source_count": 5,
+        "probe_prims": ["/World/probe"],
+        "selected_pose_source_count": 3,
+        "selected_simulation_entity_count": 2,
+    }
+    selected = details["scene"]["scene_runtime"]["payload"]["state"][
+        "pose_sources"
+    ]
+    assert [row["source_sequence"] for row in selected] == [1, 2, 5]
 
 
 def test_bridge_rejects_a_self_consistent_but_nonactive_projection_before_model(

@@ -84,6 +84,123 @@ class BridgeRunError(RuntimeError):
         self.audit_detail = deepcopy(audit_detail)
 
 
+def _prim_path_matches(path: str, root: str) -> bool:
+    normalized = root.rstrip("/") or "/"
+    return path == normalized or (
+        normalized == "/" and path.startswith("/")
+    ) or path.startswith(normalized + "/")
+
+
+def _simulation_entity_path(source: dict[str, Any]) -> str | None:
+    payload = source.get("payload")
+    if type(payload) is not dict or payload.get("kind") != "simulation_entity_pose":
+        return None
+    descriptor = payload.get("source")
+    if type(descriptor) is dict and type(descriptor.get("entity")) is str:
+        return descriptor["entity"]
+    source_error = payload.get("source_error")
+    if type(source_error) is dict and type(source_error.get("source_key")) is str:
+        return source_error["source_key"]
+    raise BridgeRunError(
+        "assistant_owner_response_invalid",
+        "scene runtime contains a malformed simulation-entity observation",
+    )
+
+
+def _inspect_isaac_scene_report(
+    scene: dict[str, Any],
+    arguments: dict[str, Any],
+) -> dict[str, Any]:
+    """Build a read-only presentation over Headless-owned scene truth."""
+
+    if scene.get("schema_version") != "manyforge.scene_projection.v1":
+        raise BridgeRunError(
+            "assistant_owner_response_invalid",
+            "Headless returned an unsupported scene projection",
+        )
+    projected = deepcopy(scene)
+    runtime_section = projected.get("scene_runtime")
+    logical_section = projected.get("logical_scene")
+    if type(runtime_section) is not dict or type(logical_section) is not dict:
+        raise BridgeRunError(
+            "assistant_owner_response_invalid",
+            "Headless scene projection is missing its owner sections",
+        )
+
+    include = tuple(arguments.get("include_subtrees", ()))
+    exclude = tuple(arguments.get("exclude_subtrees", ()))
+    probes = tuple(arguments.get("probe_prims", ()))
+    source_count: int | None = None
+    selected_count: int | None = None
+    selected_entity_count: int | None = None
+    runtime_payload = runtime_section.get("payload")
+    if runtime_payload is not None:
+        if (
+            type(runtime_payload) is not dict
+            or type(runtime_payload.get("state")) is not dict
+        ):
+            raise BridgeRunError(
+                "assistant_owner_response_invalid",
+                "Headless scene-runtime payload is malformed",
+            )
+        sources = runtime_payload["state"].get("pose_sources")
+        if type(sources) is not list or any(
+            type(row) is not dict for row in sources
+        ):
+            raise BridgeRunError(
+                "assistant_owner_response_invalid",
+                "Headless scene-runtime pose sources are malformed",
+            )
+        source_count = len(sources)
+        filtered: list[dict[str, Any]] = []
+        selected_entity_count = 0
+        for source in sources:
+            entity = _simulation_entity_path(source)
+            if entity is None:
+                filtered.append(source)
+                continue
+            admitted = (
+                not include
+                or any(_prim_path_matches(entity, root) for root in include)
+                or entity in probes
+            ) and not any(_prim_path_matches(entity, root) for root in exclude)
+            if admitted:
+                filtered.append(source)
+                selected_entity_count += 1
+        runtime_payload["state"]["pose_sources"] = filtered
+        selected_count = len(filtered)
+
+    requested_export = arguments.get("mesh_export_dir")
+    return {
+        "schema_version": "manyforge.assistant.isaac_scene_inspection.v1",
+        "source_kind": "headless_scene_projection",
+        "projection_generation": scene.get("projection_generation"),
+        "presentation": {
+            "exclude_subtrees": list(exclude),
+            "include_subtrees": list(include),
+            "mesh_export": {
+                "performed": False,
+                "requested_directory": requested_export,
+                "reason": (
+                    "Headless inspection is read-only and performs no simulator "
+                    "or filesystem RPC"
+                ),
+            },
+            "mesh_source_preference": arguments.get(
+                "mesh_source_preference", "auto"
+            ),
+            "output_profile": arguments.get(
+                "output_profile", "llm_scene_authoring"
+            ),
+            "pose_source_count": source_count,
+            "probe_prims": list(probes),
+            "selected_pose_source_count": selected_count,
+            "selected_simulation_entity_count": selected_entity_count,
+        },
+        "scene": projected,
+    }
+
+
 @dataclass(frozen=True, slots=True)
 class BridgeConfig:
     upstream_base_url: str
@@ -1131,10 +1248,10 @@ class BridgeService:
                     "skills": deepcopy(rows),
                 }
             elif call.tool_id == "inspect_isaac_scene":
-                raise BridgeRunError(
-                    "assistant_tool_unavailable_until_i9",
-                    "Isaac scene inspection is restored at I9",
+                scene = await asyncio.to_thread(
+                    self._reads.invoke, "scene", {}
                 )
+                value = _inspect_isaac_scene_report(scene, call.arguments)
             else:
                 raise BridgeRunError(
                     "assistant_tool_owner_unavailable",

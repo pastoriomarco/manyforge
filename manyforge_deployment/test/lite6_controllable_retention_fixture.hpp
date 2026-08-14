@@ -362,7 +362,8 @@ assistant_source(const bool composer_draft_enabled = false) {
             CanonicalValue(CanonicalValue::Object{
                 {"nodes", CanonicalValue(CanonicalValue::Array{})},
                 {"skills", CanonicalValue(CanonicalValue::Array{})},
-                {"tools", text_array({"scene_inspect", "status_read"})},
+                {"tools", text_array({"inspect_isaac_scene", "scene_inspect",
+                                      "status_read"})},
             })},
            {"description", CanonicalValue("Read-only H0 query")},
            {"enabled", CanonicalValue(true)},

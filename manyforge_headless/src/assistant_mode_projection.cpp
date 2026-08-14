@@ -84,14 +84,6 @@ CanonicalValue InputSchema(const core::AssistantToolDescriptorDTO& tool) {
   }
 }
 
-bool ToolOwnerAvailable(const std::string_view tool_id) noexcept {
-  // Isaac inspection is restored by I9. Keeping its build-qualified
-  // descriptor in the retained registry preserves the future contract, while
-  // excluding it from the active projection prevents the current bridge from
-  // advertising a callback route that does not exist.
-  return tool_id != "inspect_isaac_scene";
-}
-
 deployment::QualifiedAssistantSettings VerifyAssistantSettings(
     const deployment::RetainedBundle& active_bundle) {
   const auto& bundle = active_bundle.value();
@@ -147,9 +139,6 @@ CanonicalValue ProjectAssistantMode(const deployment::RetainedBundle& active_bun
                             [](const auto& row) -> const std::string& { return row.tool_id; });
     if (tool == nullptr) {
       Fail("assistant_mode_projection_invalid", "verified mode names an absent tool");
-    }
-    if (!ToolOwnerAvailable(tool_id)) {
-      continue;
     }
     visible_tool_ids.insert(tool_id);
     tools.emplace_back(CanonicalValue::Object{
