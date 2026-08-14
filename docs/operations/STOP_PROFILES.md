@@ -1,12 +1,14 @@
 # Controlled Stop Profiles
 
-> **Cutover status:** retained as a restoration and behavior reference. The
-> command recipes below are not qualified on the current `dev` branch and
-> must not be executed until I8/P5 and the selected execution lane gate pass.
-> Present-tense Composer and runtime descriptions below refer to the captured
-> baseline; retained stop math alone is not a live Stop owner.
+> **Current boundary:** I8/P5 is implemented for the maintained ManyForge-only
+> native product. The addressed Kernel is the sole product Stop owner and the
+> Headless surface is a thin scoped-Stop/Full-Stop/recovery client. Isaac,
+> ros2_control product launch, and real-robot use remain I9/I10 qualification
+> work; this page does not authorize operating those lanes or treat a software
+> Stop as a safety function.
 
-This runbook records the former operator-facing controlled-stop behavior in Composer.
+This runbook records the current Stop-profile contract and the behavior that
+later transport lanes must preserve.
 Implementation details live in
 [`../reference/STOP_PROFILES_INTERNALS.md`](../reference/STOP_PROFILES_INTERNALS.md).
 
@@ -24,82 +26,65 @@ are not a certified E-stop or protective-stop channel.
 | Immediate hard-stop floor | ros2_control plain cancel/hold or native immediate hold.                                                      | Mandatory final floor when a controlled replacement is refused, times out, or cannot be trusted. Not a normal operator profile. |
 | Natural completion        | Keeps the accepted trajectory running when it will reach rest before a useful injected stop can be generated. | Short remaining path. Composer stays in `Stopping` until terminal evidence arrives.                                             |
 
-`spring_back_hold` is not the default fallback for `soft_on_path`. It is often
-harder to generate because the forward deceleration gets only part of the total
-time and then the robot must return to the trip cursor. Infeasible, refused,
-timed-out, or unconfirmed stops use the hard-stop floor instead.
+`spring_back_hold` is not a general fallback. A profile may explicitly qualify
+the sole recoverable nominal substitution from `soft_on_path` to
+`spring_back_hold`; it is forbidden for precision-contact profiles. Any other
+failure advances only through the immutable, deployment-qualified Stop-stage
+cascade. Neither a backend nor a client chooses a fallback dynamically.
 
-## Editable Fields
+## Authoring Fields
 
-The Deployment tab exposes the controlled-stop parameters while the runtime is
-idle or stopped. They are frozen during an active stop.
+The retained policy compiler accepts one closed `MotionInterruptStopProfileDTO`.
+It is resolved during Prepare and frozen in the participant Stop plan before
+physical dispatch; no field is looked up or merged at Stop time.
 
-| Field                   | Default                  | Rule                                                                                                                      |
-| ----------------------- | ------------------------ | ------------------------------------------------------------------------------------------------------------------------- |
-| Mode                    | Deployment-specific      | Must be one of the backend-supported modes. `Not configured` is only a disabled placeholder.                              |
-| Deceleration Time       | `1.0 s`                  | Requested wall-time stop duration. Must be `> 0` and `<= 2.0 s`.                                                          |
-| Max Stop Time           | Auto                     | Optional confirmation deadline. If unset, ManyForge derives it from the requested stop time plus lane tolerance.          |
-| Settle Velocity         | `0.01 rad/s`             | Optional measured-rest threshold where measured velocity exists.                                                          |
-| Max Deceleration        | `10 rad/s^2` in examples | Per-joint operational limit used by the planner.                                                                          |
-| Lead-In                 | `0.1 s`                  | Command-frame lead-in budget for seam-preserving replacement trajectories. Must be less than the requested stop duration. |
-| Sample Period           | `0.01 s` in examples     | Stop trajectory sampling period.                                                                                          |
-| Max Jerk                | Derived unless set       | Per-joint operational jerk limit.                                                                                         |
-| Path Ramp Enabled       | Enabled                  | If disabled, `soft_on_path` may not be advertised.                                                                        |
-| Stop Completion Timeout | Lane-specific            | Extra ros2_control confirmation margin stored as `stop_completion_timeout_s`.                                             |
+| Field | Rule |
+| ----- | ---- |
+| `profile_id` | Portable audit token, not a runtime catalog selector. |
+| `stop_mode` | `soft_on_path`, `spring_back_hold`, or `hard_deceleration`. |
+| `deceleration_time_s` | Required for `soft_on_path`, optional for `spring_back_hold`, forbidden for `hard_deceleration`; finite and in `(0, 2.0]`. |
+| `per_joint_max_deceleration` | Complete source-joint map of typed angular or linear acceleration values; required for the two path modes and forbidden for `hard_deceleration`. |
+| `allow_natural_completion_on_short_path` | Legal only for `soft_on_path`; omission normalizes to `true`. |
+| `recoverable_substitution_mode` | Optional and solely `soft_on_path` to `spring_back_hold`; never a list of fallbacks. |
+| `require_backend_confirmation` | Defaults to `true`; production profiles require it. |
+| `per_joint_settle_velocity_threshold` | Optional non-empty typed source-joint velocity map. Prepare may only tighten retained deployment thresholds. |
+| `diagnostics` | Bounded closed structured scalar metadata. |
 
-Executable deployments must configure both:
+The public profile has no `max_stop_time_s`, `allowed_fallback_modes`,
+`joint_deceleration_profile_id`, or unit-implying global joint map. The outer
+deadline, escalation order, hard floor, and optional commissioned safety-system
+request belong to the verified base plan and participant contract, not to an
+operator-editable timeout or backend-selected fallback list.
 
-- `operator_stop_profile`;
-- `default_fault_stop_profile`.
+## Retained Policy Example
 
-The backend must also report a valid hard-stop floor:
-
-- `hard_deceleration` when JTC `decelerate_on_cancel` is proven;
-- `jtc_cancel_unprofiled_hold` for ros2_control plain cancel/hold;
-- `native_immediate_hold` for the native lane.
-
-If either profile or the hard-stop floor is missing, Composer degrades readiness
-and blocks Run.
-
-## Deployment Configuration Checklist
-
-A stop profile is a request. The backend advertises it only when the deployment
-also declares the lane-specific capability evidence needed to execute it.
-
-For ros2_control / Isaac lanes that use `operator_stop_profile.stop_mode: soft_on_path`, configure all of the following under `adapters.execution.config`:
+The current authoring boundary is the typed policy value retained by the
+deployment compiler. Legacy adapter-local `*_rad_s2` profile maps are not the
+I8 contract. A mixed angular/linear example is:
 
 ```yaml
-enable_soft_on_path_path_ramp: true
-soft_on_path_sample_period_s: 0.01
-soft_on_path_stop_traj_delta_s: 0.1
-soft_on_path_max_jerk_rad_s3:
-  shoulder_pan_joint: 50.0
-  shoulder_lift_joint: 50.0
-  elbow_joint: 50.0
-  wrist_1_joint: 50.0
-  wrist_2_joint: 50.0
-  wrist_3_joint: 50.0
-operator_stop_profile:
-  profile_id: operator_soft_on_path
-  stop_mode: soft_on_path
-  deceleration_time_s: 1.0
-  per_joint_max_deceleration_rad_s2:
-    shoulder_pan_joint: 10.0
-    shoulder_lift_joint: 10.0
-    elbow_joint: 10.0
-    wrist_1_joint: 10.0
-    wrist_2_joint: 10.0
-    wrist_3_joint: 10.0
+profile_id: guard.soft
+stop_mode: soft_on_path
+deceleration_time_s: 1.0
+per_joint_max_deceleration:
+  shoulder_joint:
+    coordinate_kind: angular_rad_s2
+    value_rad_s2: 10.0
+  slide_axis:
+    coordinate_kind: linear_m_s2
+    value_m_s2: 2.5
+allow_natural_completion_on_short_path: true
+recoverable_substitution_mode: spring_back_hold
+require_backend_confirmation: true
+per_joint_settle_velocity_threshold:
+  shoulder_joint:
+    coordinate_kind: angular_rad_s
+    value_rad_s: 0.01
 ```
 
-Use the robot's actual joint names. If `soft_on_path` is selected but the path
-ramp is not enabled, jerk limits are incomplete, or the backend cannot construct
-the replacement trajectory, capability readiness reports `soft_on_path_not_enabled`
-and Composer blocks Run instead of silently falling back.
-
-The fault profile is intentionally separate. Runtime collision/fault paths should
-normally use `default_fault_stop_profile` with `hard_deceleration` or the backend's
-hard-stop floor. Do not use operator `soft_on_path` as the only fault-stop plan.
+Names are source-URDF/SRDF joints. Prepare must resolve every row to exactly one
+affected resource with the same coordinate kind and complete coverage. Unknown,
+duplicate, wrong-unit, incomplete, or looser settle rows fail before dispatch.
 
 ## Velocity Scaling
 
@@ -114,27 +99,23 @@ claiming timed behavior under external scaling.
 
 ## Stop History And Incidents
 
-Successful controlled stops publish compact success summaries. Faults, warnings,
-and fallback transitions publish incident snapshots containing:
+Every accepted Stop publishes immutable scope, revision, deadline, and
+participant-budget truth. Terminalization publishes one immutable certificate;
+faults and stronger-than-nominal stages also retain a fault latch. History
+contains:
 
 - all recent events in order;
 - events grouped by channel;
 - requested and executed stop modes;
 - hard-stop floor level;
 - timing and settle evidence;
-- fallback/escalation reasons.
+- exact qualified substitution or escalation reasons;
+- participant stage results and evidence-source freshness;
+- persistence and post-terminal surveillance state.
 
-In Composer, inspect the error panel and the execution history after any stop
-that reports a warning or fault. Important fields include:
-
-- `requested_stop_mode`;
-- `executed_stop_mode`;
-- `fallback_reason`;
-- `hard_stop_transitioned`;
-- `hard_stop_level`;
-- `backend_stop_confirmed`;
-- `stop_snapshot_at_rest`;
-- `stop_snapshot_max_abs_velocity_rad_s`.
+Inspect the exact Stop status, certificate, and recovery offer after any warning
+or fault. Alarm acknowledgement records operator awareness only; it never clears
+the Stop latch or reopens admission.
 
 ## Offline Qualification
 
@@ -184,17 +165,15 @@ scene and deployment, then repeat the same stop matrix on the physical robot.
 ## Intervention Recovery Choices
 
 Stop/fault `INTERVENTION_REQUIRED` is a recovery boundary. Pressing Run while it
-is latched does not silently acknowledge the fault. Composer presents:
+is latched does not silently acknowledge the fault. The current owner presents:
 
-- **Acknowledge fault** (`acknowledge_and_continue`): the kernel verifies the backend state is readable,
-  the backend is not still stopping, the pose is finite, the hard-stop floor is
-  reportable, and measured velocity is settled when a settle signal exists. It
-  then clears the stop/fault latch without calling backend reset. The cycle
-  remains stopped; the now-visible Resume command replans from the current
-  robot pose only after a second operator press.
-- **Reset cycle**: Composer explicitly uses the reset path. In
-  commanded-sim lanes this can command the declared initial pose and must be
-  treated as a reset action, not a resume.
+- **Recover Stop fault**: a revision-fenced request over the exact current offer.
+  The Kernel joins fresh quiescence, configuration, reset, external
+  reconciliation, and orphan-fence facts, persists the cleared latch and
+  resulting status, and only then may reopen admission. It never resumes work.
+- **Reset operation**: an independent operation control. If containment is
+  required, it joins the one addressed Stop certificate before process-local
+  retirement; it cannot create a competing backend Stop chain.
 - **Cancel**: leave the intervention latched.
 
 The floating alarm stack exposes **Acknowledge alarm** for the exact current

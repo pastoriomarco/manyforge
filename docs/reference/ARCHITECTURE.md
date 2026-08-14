@@ -1,40 +1,19 @@
 # ManyForge Architecture
 
-> **Current `dev` status:** this document still describes the last complete
-> three-lane runtime baseline. The composable-cell destructive cutover has
-> removed the legacy scene owner and RoboPlan native/ROS factories. The
-> maintained ManyForge-only native path is now restored through the new Core,
-> retained-product, canonical-empty scene-owner, and Manager foundations now
-> include the I5/H0 Manager daemon, independent headless runtime/scene/alarm/
-> historian owners, public API/CLI, and thin Composer/assistant read clients.
-> I6/N3 additionally proves one exact retained Program/Program-Binding absolute
-> joint-goal path through a restartable C++ native owner and thin headless,
-> Behavior, and Composer clients. N6-c1 and N6-c2 reconnect one bounded,
-> source-local four-mode Robot Control preview/approval/progress/operation-Stop
-> workflow over that same owner: joint goals, pose goals, Cartesian paths, and
-> gripper commands. These bounded slices are not a complete product lane. Robot
-> readiness, complete lifecycle/controls, dynamic live scene/viewer behavior,
-> and unjoined provider effects remain unavailable until their later
-> gates. N6-c3 separately restores Composer-owned strict Program Draft/Saved
-> authoring and bounded artifact persistence. N6-c4 adds source-local
-> scene/viewer authoring and one exact owner-routed current-pose Commit without
-> dynamic viewer truth. N6-c5 adds strict bounded direct/`nemoclaw` mediation,
-> Draft-only callbacks, and operator conversation/reconciliation without model
-> or runtime authority. N7-a5.1-a5.5 add exact Program admission and Applied
-> identity, the captured native motion/gripper/scene/model join, fixed-pool
-> ticking, an independent Program-runner process, and strict Headless/Composer
-> scenario, Run/status, and explicit Program Stop clients. All seven maintained
-> deployment inputs and eight Program Bindings now traverse that production
-> path; two identical Lite6 occurrences also compile and resolve without
-> cross-instance aliasing. The currently admitted native product remains
-> limited to the joined nodes and one active Program. I6 cumulative
-> qualification is complete; packaged product launch, public MCP, and external
-> agent loops remain open,
-> while lifecycle, final Stop, Isaac, real robot, and generalized tools remain
-> at I7-I11.
-> Unless a section explicitly identifies a retained foundation or target
-> design, present-tense ownership and flow descriptions below refer to the
-> captured three-lane baseline.
+> **Current `dev` status:** the composable-cell cutover has one maintained
+> ManyForge-only native product through explicit Manager, CCLC, Headless,
+> Program-runner, and native execution owners. I7/L0 supplies declarative
+> lifecycle catalogs, deterministic lifecycle/recovery, complete-domain
+> controller-route transactions, verified readiness, and thin confirmed
+> clients. I8 supplies addressed multi-participant Prepare/Dispatch/Resume,
+> asynchronous coordinated controls, scoped Stop and Full Stop, collision
+> consequence routing, immutable certificates/fault latches, durable
+> surveillance/recovery, and command-free orphan reconciliation. The governance
+> contracts are ROS-free; the current product realization is native. Packaged
+> aggregate launch, public MCP/external-agent loops, dynamic live viewer truth,
+> Isaac/ROS product launch, real hardware, and generalized tools remain later
+> I9-I11 work. Sections describing those three-lane transports remain target or
+> historical reference unless they explicitly name the current native owner.
 
 A coherent, mid-depth map of how ManyForge is put together: the components, how
 a program flows through them, and — most importantly — which layer owns which
@@ -263,10 +242,17 @@ functions; external plant safety remains independent.
   lands mid-decision cannot be laundered into a normal completion — the fault
   outranks the normal terminal. Nothing in the behavior layer, Composer, or an
   LLM can fabricate a terminal state.
-- **The kernel owns stop semantics.** Stop is a first-class operation with an
-  explicit result. A controlled stop that the backend refuses does **not**
-  report a stopped-looking state — it escalates to an intervention-required
-  condition. Stop ownership never lives in the planner or the UI.
+- **The addressed kernel owns product Stop semantics.** Scoped Stop and Full
+  Stop are first-class cell operations. The owner resolves and captures scope,
+  reserves a fixed emergency transaction, atomically fences affected resource
+  slots, and hands bounded participant stages to `StopControl`; it then reduces
+  immutable results into one certificate and optional fault latch. Journal,
+  historian, and client latency cannot delay recognition or containment. A
+  controlled stop that a backend refuses does **not** report a stopped-looking
+  state—it advances only through the prepared cascade and otherwise remains
+  failed/intervention-required. Runtime collision enters this same addressed
+  owner; the subordinate engine cannot issue a competing product Stop. Stop
+  ownership never lives in a planner, backend, behavior tree, or UI.
 - **ManyForge owns collision validation.** Collision decisions come from
   ManyForge's own authoritative collision engine, evaluated per checked
   waypoint — a swapped-in motion planner does not get to self-certify its

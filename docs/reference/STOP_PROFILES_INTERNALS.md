@@ -1,41 +1,48 @@
 # Controlled Stop — Internals Reference
 
-> **Current `dev` status:** the runtime adapters described here are
-> intentionally unavailable during the composable-cell destructive cutover.
-> This remains the last qualified baseline and must not be read as evidence
-> that native, Isaac, or real-robot Stop paths are currently runnable.
-> Retained stop math and generic adapter sources are library-level inputs only;
-> present-tense call chains below are historical until I8/P5 and the selected
-> execution lane gate pass.
+> **Current `dev` status:** I8/P5 is implemented in the maintained native
+> product. The addressed `ResourceAddressedExecutionKernel` is its sole Stop
+> owner. The ROS-free contracts and ros2_control adapter build surface are
+> current, but Isaac, ros2_control product launch, and real-robot operation
+> still require their I9/I10 gates. Historical adapter details below are kept
+> only where they remain algorithm or transport qualification input.
 
 Reference companion to [`operations/STOP_PROFILES.md`](../operations/STOP_PROFILES.md).
-This document describes the captured stop architecture and its historical
+This document describes the current I8 owner and the retained transport
 qualification surface. It is intentionally code-facing: future maintainers should
 be able to verify the stop behavior from the files and symbols named here without
 reconstructing the design history.
 
-This is a maintained restoration reference, not a current implementation map.
-Retained source and future generated contracts win if it drifts; absent native
-adapter symbols remain pinned by the historical Composer/source reference.
+Current source and generated contracts win if this reference drifts.
 
 ## 1. Architecture
 
-ManyForge uses the modified Option A architecture:
+ManyForge uses one addressed owner and prepared participant-local realization:
 
-1. The backend owns the stop profile.
-1. The backend computes a concrete replacement trajectory in non-real-time code.
-1. Stock `joint_trajectory_controller` executes that trajectory through
-   `FollowJointTrajectory` preemption on ros2_control lanes.
-1. The native lane replays the same core trajectory directly, because it has no
-   ROS controller.
-1. Stop success is claimed only after a terminal hold and measured/post-stop
-   evidence, not merely because a command was sent.
+1. Deployment/CCLC verifies the base Stop plan and exact runtime readiness.
+1. Kernel Prepare maps the typed source-joint profile into one immutable
+   participant Stop invocation plan before physical dispatch.
+1. Public Stop/Full Stop is resolved and captured by
+   `ResourceAddressedExecutionKernel`; the emergency reserve and resource-slot
+   fence commit recognition without waiting for storage or backend I/O.
+1. A fixed `BoundedStopControlExecutor` progresses the transaction. Independent
+   `BoundedStopStageAttemptExecutor` lanes invoke the exact
+   `IControlDomainExecutionPort::TranslateStopStage` contract with the remaining
+   phase budget, so one bounded provider lane cannot block another participant
+   or the watchdog.
+1. The pure terminal reducer consumes immutable stage/evidence history and
+   emits one certificate plus any fault latch. Journal projection and
+   post-terminal surveillance occur after containment and cannot rewrite that
+   certificate.
+1. Stock `joint_trajectory_controller` may execute a prepared replacement
+   trajectory in a later ros2_control product; the maintained native backend
+   realizes the same selected contract directly.
 
-The stop math remains in `manyforge_core/src/soft_on_path_stop_planner.cpp`, and
-generic ros2_control dispatch remains in
-`manyforge_ros2_control_execution/src/ros2_control_execution_backend.cpp` as
-unwired library input. The captured native replay lived in the now-removed
-`manyforge_roboplan/src/roboplan_execution_backend.cpp`.
+The stop math remains in `manyforge_core/src/soft_on_path_stop_planner.cpp`.
+Native realization is in `manyforge_roboplan/src/roboplan_execution_backend.cpp`;
+the generic ros2_control implementation is in
+`manyforge_ros2_control_execution/src/ros2_control_execution_backend.cpp` but is
+not yet a qualified product lane.
 
 The retired controller-native JTC plugin is not the target architecture. It is
 preserved historically on the `jtc_plugin` branch, but `main` uses stock JTC plus
@@ -67,14 +74,12 @@ guaranteed feasibility fallback for acceleration/jerk-limited soft stops. If
 either phase violates the configured limits, the planner fails closed and the
 kernel/backend hard-stop floor handles the event.
 
-Operator and fault stop profiles do not expose `allowed_fallback_modes` in the
-Deployment panel. `spring_back_hold` is selected explicitly when the operator
-wants that behavior; it is not the default fallback for `soft_on_path`. The
-kernel `allowed_fallback_modes` field remains for motion-scoped interrupts whose
-node policy explicitly permits a recoverable substitution. Executable
-deployments must configure both operator and fault profiles and must report a
-valid hard-stop floor (`hard_deceleration`, `jtc_cancel_unprofiled_hold`, or
-`native_immediate_hold`) before motion can arm.
+No current profile contains `allowed_fallback_modes`. `spring_back_hold` is
+selected explicitly, or is the sole profile-authorized recoverable
+`soft_on_path` substitution when the retained qualification permits it. That
+substitution is part of one nominal provider contract, not Kernel escalation.
+The 1-8-stage cascade, software-hard floor, and optional commissioned
+safety-system request come only from the verified base plan.
 
 Hard-stop floors are only issued while ManyForge has reason to believe a
 controller goal may still be active or untrusted: refused controlled stop,
@@ -86,23 +91,14 @@ to cancel; the condition means the robot/controller is not following the
 confirmed command, so ManyForge records `stop_not_settled_measured_velocity` and
 holds `INTERVENTION_REQUIRED` for operator/robot-safety recovery.
 
-Stop/fault intervention recovery has two distinct paths:
-
-- `ExecutionKernel::apply_recovery_action(...)` with
-  `acknowledge_and_continue` is the no-backend-reset path. It is valid only for
-  the exact current assessment after fresh certificate, stop-owner, latch,
-  observed-state, and lifecycle admission checks. It records
-  `backend_reset_performed=false` and returns the kernel to its ready state
-  without dispatching motion. The cycle remains STOPPED/held until a separate
-  Run/Resume command starts fresh planning and validation.
-- The normal `Reset` lifecycle command is the reset/resync path. It may call
-  `execution_backend.reset()` and, on commanded-sim lanes, may restore the
-  deployment's initial simulator state.
-
-`CycleManager.run()` must not choose either path implicitly from
-`STOPPED + INTERVENTION_REQUIRED`. Composer renders the exact current cycle
-recovery offer with **Acknowledge fault**, **Reset cycle**, or no enabled
-action while evidence remains incomplete.
+Stop-fault recovery is revision-fenced against the exact owner-issued
+`StopFaultRecoveryOfferDTO`. Fresh settlement, configuration, external
+reconciliation, reset, and orphan facts are evaluated privately by the Kernel.
+The cleared latch and resulting `StopStatusDTO` are persisted before admission
+can reopen. Recovery never resumes work and alarm acknowledgement never clears
+the latch. Reset is a separate asynchronous operation control; it joins an
+addressed containment certificate when needed and uses only the no-Stop local
+retirement seam afterward.
 
 ## 2.1 Lane Matrix
 
@@ -125,56 +121,65 @@ Shared constants are in
 - `kMaxControlledStopDecelerationTimeS = 2.0`.
 - `motion_interrupt_deceleration_time_or_default(profile)` is the only supported
   way for backends to resolve an unset stop deceleration time.
-- `allow_natural_completion_on_short_path` defaults to `true` on all lanes. The
-  short-path case is the least disruptive stop: the already accepted trajectory is
-  allowed to finish while snapshots report `Stopping`, then the backend reports
-  stopped/completed after fresh terminal evidence.
-- `max_stop_time_s` is optional. When set, it is the hard stop-confirmation
-  deadline. When unset, each backend derives the deadline from the requested stop
-  time plus its stop-confirmation tolerance: ros2_control uses
-  `deceleration_time_s + stop_completion_timeout_s`; the native backend uses
-  `deceleration_time_s + soft_on_path_sample_period_s`.
+- `allow_natural_completion_on_short_path` normalizes to `true` only for
+  `soft_on_path`; it is false and forbidden as an authored field for other
+  modes. The short-path case still remains under the immutable outer Stop
+  deadline and terminal-evidence requirement.
+- The profile has no `max_stop_time_s`. The verified base plan owns one outer
+  deadline and fixed phase allocation; Stop acceptance publishes only the
+  shortened remaining budget and never extends it.
+- `per_joint_max_deceleration` and optional
+  `per_joint_settle_velocity_threshold` are typed source-joint maps. Prepare
+  resolves them to exact resource kinds and rejects incomplete, unknown,
+  wrong-unit, or looser threshold rows.
 
-Profile shape is validated in three layers:
+Profile shape is validated at retained policy decode, Core profile validation,
+and Prepare-time mapping:
 
 - C++ kernel/interrupt layer: `manyforge_core/src/interrupt_manager.cpp`.
-- Python behavior client DTOs: `manyforge_behavior/manyforge_behavior/kernel_client.py`.
-- Native/ROS Python bindings: `manyforge_roboplan/python/bindings.cpp`.
+- retained policy decode: `manyforge_deployment/src/deployment_applicability_codec.cpp`;
+- exact resource mapping: `manyforge_core/src/stop_profile_mapper.cpp`.
 
 The cap is uniform across stop modes when a profile carries
 `deceleration_time_s`. Longer operational stops require an explicit future policy
 change; they should not slip through as ordinary soft stops.
 
-Composer exposes the loaded operator stop mode and `deceleration_time_s` in the
-transport controls. Edits are allowed only while idle/stopped, update the loaded
-deployment session through `/api/deployment`, and are frozen while a stop is in
-flight.
+Clients may display retained profile and certificate facts, but they cannot
+edit a prepared participant or select a fallback while a Stop is in flight.
 
 ## 4. Operator And Fault Call Chains
 
-Operator Stop:
+Public addressed Stop:
 
 ```text
-UI Stop
-  -> POST /api/cycle/stop
-  -> manyforge_behavior/cycle_manager.py: CycleManager.stop()
-  -> kernel.stop()
-  -> ExecutionKernel::stop()
-  -> IExecutionBackend::execute_controlled_stop(operator_stop_profile)
+Headless / Program / Robot Control client
+  -> POST /api/execution/stops or /api/execution/full-stop
+  -> ResourceAddressedExecutionKernel::stop()/full_stop()
+  -> StopScopeResolver + EmergencyStopAcceptanceReserve
+  -> ResourceSlotTable::stop_fence_batch()
+  -> BoundedStopControlExecutor
+  -> BoundedStopStageAttemptExecutor
+  -> IControlDomainExecutionPort::TranslateStopStage()
+  -> ReduceStopTerminal()
+  -> terminal/checkpoint journal projection + surveillance/recovery
 ```
 
-Fault preemption:
+Runtime collision:
 
 ```text
-latched interrupt / fault
-  -> ExecutionKernel::apply_latched_interrupt_preemption(...)
-  -> IExecutionBackend::execute_controlled_stop(scope/default fault profile)
+subordinate ExecutionKernel collision observation
+  -> addressed Kernel event sink
+  -> deterministic internal operation-scoped Stop
+  -> declared coordination-policy expansion
+  -> same sole Stop transaction path above
 ```
 
-The important behavioral invariant is that Stop is a physical stop but a
-software-resumable hold. Run from STOPPED must clear the hold and replan/re-dispatch
-from the fresh measured state; it must not require Reset and must not resume stale
-controller trajectory state.
+The important behavioral invariant is that product Stop has one authority.
+Subordinate engines may publish collision/interrupt facts but cannot issue a
+competing backend Stop in addressed mode. Resume always creates new prepared
+participant/goal identity from fresh state; it never resumes stale controller
+trajectory state. A standalone `ExecutionKernel::stop()` remains only for
+legacy/non-addressed continuity until later transport lanes migrate.
 
 ## 5. soft_on_path Planner
 

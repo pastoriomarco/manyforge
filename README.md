@@ -3,8 +3,10 @@
 Repository for a modular robot-execution framework built around headless C++
 semantic owners and thin authoring/operator clients. The maintained
 ManyForge-only native path is current on `dev` through explicit owner
-entrypoints. Packaged installation, the historical aggregate launcher, and the
-Isaac, ROS, external-agent, and real-robot product lanes are not yet available.
+entrypoints, including generic component lifecycle/controller routes and
+addressed multi-participant execution, Stop, surveillance, and recovery.
+Packaged installation, the historical aggregate launcher, and the Isaac, ROS,
+external-agent, and real-robot product lanes are not yet available.
 
 > **`dev` migration status:** the composable-cell destructive implementation
 > window is active. I2's pure ROS-free compiler and `manyforge_core_py`
@@ -39,12 +41,16 @@ Isaac, ROS, external-agent, and real-robot product lanes are not yet available.
 > host, an independently restartable Program-runner process, and strict
 > Headless/Composer scenario, Applied, Run/status, and one-click Stop clients.
 > Composer remains observational, and closing any client never implies Stop.
-> N7 now closes the maintained seven-input/eight-Program native path and
+> N7 closes the maintained seven-input/eight-Program native path and
 > unchanged-source repeated-instance isolation through the Component Manager,
-> Headless API, Program runner, and thin Composer clients. Isaac and real
-> operation remain I9/I10 work, and the historical aggregate launcher and
-> packaged installation are not restored by I6. The launch recipes below
-> describe the last qualified baseline; they are not valid bring-up
+> Headless API, Program runner, and thin Composer clients. I7/L0 adds the sole
+> generic lifecycle/controller-route owner and verified readiness publication.
+> I8 adds prepared multi-participant dispatch and Resume, asynchronous
+> Pause/Reset/Acknowledge, public scoped Stop and Full Stop, collision
+> containment, immutable terminal/fault truth, durable surveillance/recovery,
+> and scoped orphan reconciliation. Isaac and real operation remain I9/I10
+> work, and the historical aggregate launcher and packaged installation remain
+> unavailable. The historical launch recipes below are not valid bring-up
 > instructions for the current `dev` branch.
 
 > **For LLMs** (Claude, ChatGPT, agentic IDEs): read
@@ -58,7 +64,7 @@ Isaac, ROS, external-agent, and real-robot product lanes are not yet available.
 
 | You want to…                                        | Start here                                                                                                                                 |
 | --------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------ |
-| Start the retained structural Composer shell        | `./scripts/compose-dev.sh`; runtime operations remain unavailable                                                                          |
+| Start the retained structural Composer shell        | `./scripts/compose-dev.sh`; supply the independent current owners for runtime operations                                                    |
 | Study historical operator workflows                 | [`docs/INDEX.md`](docs/INDEX.md) → runbooks, each marked as restoration input                                                              |
 | Understand architecture and authority boundaries    | [`docs/reference/ARCHITECTURE.md`](docs/reference/ARCHITECTURE.md)                                                                         |
 | Inspect current REST or historical client contracts | [`docs/INDEX.md`](docs/INDEX.md) → structural REST and historical interaction references                                                   |
@@ -69,7 +75,7 @@ The public structural-shell and historical operator documentation is
 self-contained in this repository. Private maintainer specifications are not
 needed to inspect those surfaces. The maintained native path is available
 through explicit owner entrypoints; packaged installation, historical aggregate
-bring-up, and the remaining product lanes are still unavailable.
+bring-up, and the I9-I11 product lanes are still unavailable.
 
 ## Disclaimer
 
@@ -141,7 +147,7 @@ All commands run inside the container (`docker compose run --rm dev bash`).
 ./scripts/test-all.sh roboplan     # retained-model RoboPlan qualification only
 ./scripts/test-all.sh bindings     # ROS-free I2 compiler bindings and API contract
 ./scripts/test-all.sh python       # manyforge_behavior
-./scripts/test-all.sh integration  # unavailable until native restoration
+./scripts/test-all.sh integration  # historical aggregate selector; still unavailable
 ./scripts/test-all.sh composer     # structural Composer tests + frontend build
 ```
 
@@ -150,8 +156,10 @@ The historical no-argument and `all` forms intentionally return
 product matrix and must not silently succeed after that matrix was narrowed.
 Use the named retained or focused selectors above.
 
-The current destructive `dev` checkpoint is not a runtime product-suite
-qualification. The `bindings` selector builds and tests the qualified ROS-free
+The generic `all`/`integration` script selectors are not current product-suite
+qualification entrypoints. Current I7/I8 qualification uses the bounded CMake
+targets and maintained-native process workflows owned by those milestones.
+The `bindings` selector builds and tests the qualified ROS-free
 `manyforge_core_py` compiler surface and generated API contract. I2 closed on
 the exact executable commit `0ee506a0d1c05006d2d0f5356cc93db17dca0b98`,
 tree `22de99ef24350e533616d899534914478cb53cee`, after its complete cumulative
@@ -159,9 +167,11 @@ offline matrix and independent closure review. I3 subsequently closed on
 implementation freeze `62df57ca76b55991c8ac01d3a316dfc8a3b450aa`, tree
 `968422a59dd1216a0db07ec398c9f49b1a9ff7cc`, after cumulative Release,
 sanitizer, deterministic-regeneration, static-boundary, and adversarial
-qualification. I3's retained products are offline inputs to I4; they do not
-start processes or restore a runtime. Runtime-dependent Python, Composer, ROS,
-and product-lane suites remain unavailable.
+qualification. I3's retained products are offline inputs to later owners; they
+do not by themselves start processes or restore a runtime. The explicit
+maintained native owners and their focused process suites are current. The
+historical aggregate, ROS/Isaac, and physical product-lane suites remain
+unavailable.
 
 The separate ROS Jazzy image remains a development toolchain for focused
 internal contracts. Such checks do not restore or qualify a ROS product:
@@ -234,8 +244,9 @@ Program YAML --> Program Runner --> ExecutionKernel (C++) --> Planner / executio
                                      Composer / viewer
 ```
 
-This diagram and the ownership statements below describe the target runtime,
-not a complete supported product lane. The kernel owns terminal and Stop
+This diagram and the ownership statements below describe both the current
+maintained native boundary and the later transport lanes. The kernel owns
+terminal and Stop
 authority; ManyForge's collision layer owns collision admission; the
 independent Program runner hosts Behavior orchestration and run identity;
 Headless owners publish runtime, scene, alarm, and history facts. Composer owns
@@ -246,8 +257,9 @@ initialization, recovery, and observability model, see
 
 - **manyforge_core** is ROS-free, pure C++20. All robot-framework-specific code lives in adapter packages.
 - **manyforge_roboplan** provides retained planning-model staging and the
-  selected native motion/gripper/pick-place execution and preview host and
-  adapter. Complete product-lane operation remains unavailable.
+  current native motion/gripper/pick-place execution, CCLC composition, and
+  addressed Stop/recovery host. ROS/Isaac and physical product lanes remain
+  unavailable.
 - Python code calls C++ through pybind11 bindings -- no duplicate state machines.
 - The Docker container includes all dependencies (Pinocchio, RoboPlan, pybind11).
 
@@ -278,10 +290,11 @@ historical design inputs:
   `http://127.0.0.1:9010` when
   started with `python -m manyforge_headless_api serve`. Contract:
   [`docs/reference/HEADLESS_REST_API.md`](docs/reference/HEADLESS_REST_API.md).
-  It still reports robot readiness and operational Apply as unavailable; the
-  execution endpoints expose only the selected bounded native slice. Robot
-  Control preview never moves a resource, and approval uses the ordinary
-  operation endpoint.
+  It exposes the selected bounded native execution owner, confirmed CCLC
+  lifecycle/route requests, scoped Stop, Full Stop, and Stop-fault recovery.
+  Robot Control preview never moves a resource, and approval uses the ordinary
+  operation endpoint. An absent owner is reported as unavailable rather than
+  inferred from client state.
 - **MCP Server (historical)** — former Model Context Protocol interface.
   Reference-only tool contract:
   [`docs/reference/MCP_RUNTIME_CONTRACT.md`](docs/reference/MCP_RUNTIME_CONTRACT.md).

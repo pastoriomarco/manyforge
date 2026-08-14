@@ -56,12 +56,19 @@
 > prepares a later run; deployment-changing Apply remains subject to the
 > Manager's affected-busy fence. Browser, Composer, or runner loss never sends
 > an implicit Stop, and runner replacement mints a new observable owner epoch.
-> N7 now closes the maintained seven-input/eight-Program native product path,
+> N7 closes the maintained seven-input/eight-Program native product path,
 > including unchanged-source repeated-instance isolation, through the Component
 > Manager, Headless API, independent Program runner, and thin Composer clients.
-> The historical aggregate launcher, packaged product installation, lifecycle,
-> dynamic scene/viewer behavior, public MCP, external OpenClaw/Hermes loops,
-> Isaac/ROS launch, and real-robot operation remain explicitly unavailable. Do
+> I7/L0 adds the sole generic CCLC owner, declarative lifecycle catalogs,
+> complete-domain controller-route transactions, verified readiness publication,
+> and thin confirmed Headless/CLI/ROS request clients. I8 adds addressed
+> multi-participant Prepare/Dispatch/Resume, asynchronous coordinated controls,
+> scoped Stop and Full Stop, collision-to-Stop routing, immutable terminal
+> certificates and fault latches, durable surveillance/recovery, and
+> command-free orphan reconciliation to that maintained native product. The
+> historical aggregate launcher, packaged product installation, dynamic
+> scene/viewer behavior, public MCP, external OpenClaw/Hermes loops, Isaac/ROS
+> product launch, and real-robot operation remain explicitly unavailable. Do
 > not run the historical recipes below or
 > recreate their superseded Python semantic owners. Retain or port same-role
 > Python/TypeScript
@@ -77,10 +84,12 @@ ______________________________________________________________________
 
 ManyForge is the deployment-side repository for the target robot-execution
 framework. During the active destructive cutover it ships one maintained
-ManyForge-only native product path through explicit Component Manager,
-Headless, Program-runner, native-owner, and thin Composer entrypoints. Packaged
-installation, the historical aggregate launcher, and the I7-I11 product lanes
-remain unavailable until their named restoration gates.
+ManyForge-only native product path through explicit Component Manager, CCLC,
+Headless, Program-runner, native-owner, and thin Composer entrypoints. Its I7
+lifecycle/controller-route and I8 multi-domain execution/Stop contracts are
+current for that product. Packaged installation, the historical aggregate
+launcher, and the I9-I11 simulator/physical/tool product lanes remain
+unavailable until their named restoration gates.
 
 Three sibling repositories form the full stack; the cross-repo
 authority map is:
@@ -107,7 +116,7 @@ repo is missing locally, inspect or clone the matching repository under
 **This file covers the runtime/operator boundary completely.** On the current
 cutover branch, that coverage includes both the explicit maintained native path
 and the remaining product outages. It is not a promise that the historical
-aggregate recipes, packaged installation, or I7-I11 lanes can be started. A
+aggregate recipes, packaged installation, or I9-I11 lanes can be started. A
 brief section at the bottom points dev maintainers at `manyforge_specs` for
 spec-level work; that's the only reason an operator/LLM should ever follow that
 link.
@@ -180,8 +189,13 @@ browser state observational and retaining one active Program run as the
 current product gate. N7-a5.5 and the cumulative N7 qualification close all
 seven maintained deployment inputs, eight Program Bindings, six successful
 native workflows, two truthful I9 gates, and unchanged-source two-Lite6
-isolation. This is the maintained native product path, not restoration of the
-historical aggregate launcher or any I7-I11 lane.
+isolation. I7/L0 extends this maintained native path with the generic CCLC
+lifecycle/route/readiness owner, and I8 extends it with prepared
+multi-participant execution, asynchronous controls, scoped/Full Stop,
+collision containment, terminal evidence, post-terminal surveillance, durable
+recovery, and orphan reconciliation. Those additions do not restore the
+historical aggregate launcher, packaged installation, Isaac, ROS product
+launch, real hardware, or generalized tool lanes.
 
 For the captured deterministic/direct/full-assistant operator baseline, see
 [`docs/operations/STACK_SETUP.md`](docs/operations/STACK_SETUP.md).
@@ -372,7 +386,7 @@ What lives where in this repo, and what it's for:
 | [`manyforge_persistence/`](manyforge_persistence/)                       | Shared ROS-free mechanical durable-storage safety primitives; no semantic state ownership                                                  |
 | [`manyforge_scene/`](manyforge_scene/)                                   | ROS-free canonical-empty and bounded runtime-only Apply logical-scene owner; no live scene surface                                         |
 | [`manyforge_deployment/`](manyforge_deployment/)                         | Qualified ROS-free composable-cell compiler and immutable offline retained-product boundary                                                |
-| [`manyforge_component_manager/`](manyforge_component_manager/)           | ROS-free C++ I4 Apply/runtime-convergence owner hosted by the sole-process I5 Manager daemon; product execution unavailable                |
+| [`manyforge_component_manager/`](manyforge_component_manager/)           | ROS-free Apply/runtime-convergence owner hosted by the sole-process Manager daemon; current retained product composition also hosts the generic CCLC root |
 | [`manyforge_headless/`](manyforge_headless/)                             | C++ H0 runtime/scene aggregation, scene lifetime, alarm owner, historian, NodeEnvironment projection, and Manager daemon                   |
 | [`manyforge_headless_api/`](manyforge_headless_api/)                     | Bounded FastAPI/CLI over owners plus thin addressed execution/preview and Program-run transport; no robot-readiness or execution authority |
 | [`manyforge_program_runner/`](manyforge_program_runner/)                 | Independently restartable Program orchestration owner over focused Headless clients; no Kernel, scene, or planner authority                |
@@ -383,7 +397,7 @@ What lives where in this repo, and what it's for:
 | [`manyforge_cclc_msgs/`](manyforge_cclc_msgs/)                           | Current ROS IDL for the bounded same-host CCLC request transport                                                                            |
 | [`manyforge_xarm_adapter/`](manyforge_xarm_adapter/)                     | Experimental xArm model/binding/observation inputs; no current real-robot lane                                                             |
 | [`manyforge_xarm_control/`](manyforge_xarm_control/)                     | Build-owned Lite6 lifecycle catalog and restricted `xarm_ros2` CCLC adapter; physical qualification remains at I10/R                       |
-| [`manyforge_composer/`](manyforge_composer/)                             | Structural FastAPI/React shell plus thin H0/N6/N7 control, authoring, Program Run, scene, and assistant clients; no runtime authority      |
+| [`manyforge_composer/`](manyforge_composer/)                             | Structural FastAPI/React shell plus thin control, lifecycle/route, Stop/recovery, authoring, Program Run, scene, and assistant clients; no runtime authority |
 | [`manyforge_assistant_bridge/`](manyforge_assistant_bridge/)             | Strict bounded direct/`nemoclaw` provider mediation over owner facts and Draft callbacks; no runtime ownership                             |
 | [`manyforge_ros/`](manyforge_ros/)                                       | Retained pure mappings/contracts plus explicit unavailable runtime entry points                                                            |
 | [`agent-skills/manyforge-composer/`](agent-skills/manyforge-composer/)   | Non-activatable historical assistant interaction references                                                                                |
