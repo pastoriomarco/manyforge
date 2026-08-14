@@ -50,6 +50,15 @@ _OBSERVATION_DISPOSITIONS = {
     "observed_only",
     "duplicate",
 }
+_SCENE_APPLICATION_STATUSES = {
+    "already_applied",
+    "buffered",
+    "committed",
+    "deferred_before_planning",
+    "not_requested",
+    "skipped_attached",
+}
+_SCENE_UPDATE_STATUSES = {"freshness_only", "geometry_changed", "no_op"}
 
 
 class SceneRuntimeManagerError(RuntimeError):
@@ -115,6 +124,46 @@ class SceneRuntimeIdentity:
             "retained_bundle_id": self.retained_bundle_id,
             "runtime_generation": self.runtime_generation,
         }
+
+
+@dataclass(frozen=True)
+class SceneProjectionRevision:
+    retained_bundle_id: str
+    graph_revision: str
+    scene_id: str
+    revision_id: int
+    content_hash: str
+
+    @classmethod
+    def from_value(cls, value: object) -> SceneProjectionRevision:
+        record = _exact_object(
+            value,
+            {"graph_revision", "retained_bundle_id", "scene_revision"},
+            label="scene projection revision",
+        )
+        scene = _exact_object(
+            record["scene_revision"],
+            {"content_hash", "revision_id", "scene_id"},
+            label="scene revision",
+        )
+        try:
+            return cls(
+                retained_bundle_id=_sha256(
+                    record["retained_bundle_id"], label="retained_bundle_id"
+                ),
+                graph_revision=_sha256(
+                    record["graph_revision"], label="graph_revision"
+                ),
+                scene_id=_sha256(scene["scene_id"], label="scene_id"),
+                revision_id=_safe_integer(
+                    scene["revision_id"], label="scene revision_id"
+                ),
+                content_hash=_sha256(
+                    scene["content_hash"], label="scene content_hash"
+                ),
+            )
+        except (TypeError, ValueError) as exc:
+            raise _response_invalid("scene projection revision is invalid") from exc
 
 
 @dataclass(frozen=True)
@@ -198,6 +247,10 @@ class PoseObservationResult:
     scene_runtime_source_generation: int
     source_epoch_order: int
     source_sequence: int
+    scene_application_status: str
+    scene_projection_revision: SceneProjectionRevision | None
+    scene_request_id: str | None
+    scene_update_status: str | None
 
 
 class ManagerSceneRuntimeClient:
@@ -387,7 +440,11 @@ class ManagerSceneRuntimeClient:
                 "object_id",
                 "ok",
                 "policy_id",
+                "scene_application_status",
+                "scene_projection_revision",
+                "scene_request_id",
                 "scene_runtime_source_generation",
+                "scene_update_status",
                 "source_epoch",
                 "source_epoch_order",
                 "source_id",
@@ -416,6 +473,76 @@ class ManagerSceneRuntimeClient:
             response_sequence = _safe_integer(
                 record["source_sequence"], label="source_sequence"
             )
+            application_status = record["scene_application_status"]
+            if application_status not in _SCENE_APPLICATION_STATUSES:
+                raise ValueError("scene application status is invalid")
+            projection = (
+                None
+                if record["scene_projection_revision"] is None
+                else SceneProjectionRevision.from_value(
+                    record["scene_projection_revision"]
+                )
+            )
+            request_id = (
+                None
+                if record["scene_request_id"] is None
+                else _bounded_text(
+                    record["scene_request_id"], label="scene_request_id"
+                )
+            )
+            update_status = record["scene_update_status"]
+            if (
+                update_status is not None
+                and update_status not in _SCENE_UPDATE_STATUSES
+            ):
+                raise ValueError("scene update status is invalid")
+            if application_status in {
+                "buffered",
+                "deferred_before_planning",
+                "not_requested",
+            }:
+                if (
+                    projection is not None
+                    or request_id is not None
+                    or update_status is not None
+                ):
+                    raise ValueError("non-applied observation has scene result data")
+            elif application_status == "committed":
+                if (
+                    projection is None
+                    or request_id is None
+                    or update_status is None
+                ):
+                    raise ValueError("committed observation lacks scene result data")
+            elif (
+                projection is None
+                or request_id is None
+                or update_status is not None
+            ):
+                raise ValueError("idempotent or skipped observation result is invalid")
+            if projection is not None and (
+                projection.retained_bundle_id
+                != session.runtime_identity.retained_bundle_id
+                or projection.graph_revision
+                != session.runtime_identity.graph_revision
+            ):
+                raise ValueError("scene projection crossed the retained runtime")
+            if not intent.eligible or intent.quality != "good" or not record["fresh"]:
+                if application_status != "not_requested":
+                    raise ValueError("ineligible observation reports scene application")
+            elif intent.policy_id == "before_planning":
+                if application_status != "deferred_before_planning":
+                    raise ValueError("before-planning observation was not deferred")
+            elif disposition in {"buffered", "replaced_buffered"}:
+                if application_status != "buffered":
+                    raise ValueError("buffered observation reports another application")
+            elif (
+                intent.policy_id != "continuous_unattached"
+                or disposition not in {"apply_now", "duplicate"}
+                or application_status
+                not in {"already_applied", "committed", "skipped_attached"}
+            ):
+                raise ValueError("observation application contradicts its policy")
         except (TypeError, ValueError) as exc:
             raise _response_invalid("observation response is invalid") from exc
         if (
@@ -437,6 +564,10 @@ class ManagerSceneRuntimeClient:
             scene_runtime_source_generation=publication_generation,
             source_epoch_order=epoch_order,
             source_sequence=response_sequence,
+            scene_application_status=application_status,
+            scene_projection_revision=projection,
+            scene_request_id=request_id,
+            scene_update_status=update_status,
         )
 
     def _validate_root(self) -> os.stat_result:
@@ -650,6 +781,17 @@ def _bounded_text(
     ):
         raise ValueError(f"{label} must be bounded non-empty NFC text")
     return value
+
+
+def _sha256(value: object, *, label: str) -> str:
+    text = _bounded_text(value, label=label)
+    if (
+        len(text) != 71
+        or not text.startswith("sha256:")
+        or any(character not in "0123456789abcdef" for character in text[7:])
+    ):
+        raise ValueError(f"{label} must be one lowercase SHA-256 digest")
+    return text
 
 
 def _safe_integer(

@@ -74,11 +74,27 @@ def _observe_response() -> dict[str, object]:
         "object_id": "ur10e",
         "ok": True,
         "policy_id": "viewer.measured_robot",
+        "scene_application_status": "not_requested",
+        "scene_projection_revision": None,
+        "scene_request_id": None,
         "scene_runtime_source_generation": 3,
+        "scene_update_status": None,
         "source_epoch": "orin-observer.1",
         "source_epoch_order": 1,
         "source_id": "isaac.observer",
         "source_sequence": 1,
+    }
+
+
+def _projection_revision() -> dict[str, object]:
+    return {
+        "graph_revision": "sha256:" + "b" * 64,
+        "retained_bundle_id": "sha256:" + "a" * 64,
+        "scene_revision": {
+            "content_hash": "sha256:" + "c" * 64,
+            "revision_id": 4,
+            "scene_id": "sha256:" + "d" * 64,
+        },
     }
 
 
@@ -148,6 +164,8 @@ def test_client_exchanges_exact_canonical_owner_open_and_observe_packets(
     assert result.disposition == "observed_only"
     assert result.fresh is True
     assert result.scene_runtime_source_generation == 3
+    assert result.scene_application_status == "not_requested"
+    assert result.scene_projection_revision is None
     assert len(received) == 3
     decoded = [json.loads(packet) for packet in received]
     assert all(
@@ -214,6 +232,78 @@ def test_client_surfaces_exact_owner_rejection_code(tmp_path: Path) -> None:
         worker.join(timeout=1.0)
     assert raised.value.code == "scene_runtime_identity_changed"
     assert str(raised.value) == "runtime advanced"
+
+
+def test_client_parses_and_cross_checks_committed_scene_application(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client = ManagerSceneRuntimeClient(tmp_path)
+    binding = PoseObserverBinding(
+        object_id="ur10e",
+        policy_id="continuous_unattached",
+        eligible=True,
+    )
+    opened = _open_response()
+    opened["bindings"] = [binding.to_value()]
+    responses = [_owner_response(), opened]
+    committed = _observe_response()
+    committed.update(
+        {
+            "disposition": "apply_now",
+            "policy_id": "continuous_unattached",
+            "scene_application_status": "committed",
+            "scene_projection_revision": _projection_revision(),
+            "scene_request_id": "scene-runtime-pose-" + "e" * 71,
+            "scene_update_status": "geometry_changed",
+        }
+    )
+    responses.append(committed)
+    monkeypatch.setattr(client, "_exchange", lambda _command: responses.pop(0))
+
+    owner = client.read_owner()
+    session = client.open_observer(
+        owner,
+        bindings=(binding,),
+        source_id="isaac.observer",
+        source_epoch="orin-observer.1",
+    )
+    result = client.observe(
+        session,
+        source_sequence=1,
+        intent=PoseObservationIntent(
+            object_id="ur10e",
+            policy_id="continuous_unattached",
+            lifetime_ns=1_000_000_000,
+            quality="good",
+            eligible=True,
+            payload={"kind": "simulation_entity_pose"},
+        ),
+    )
+
+    assert result.scene_application_status == "committed"
+    assert result.scene_request_id == "scene-runtime-pose-" + "e" * 71
+    assert result.scene_update_status == "geometry_changed"
+    assert result.scene_projection_revision is not None
+    assert result.scene_projection_revision.revision_id == 4
+
+    invalid = dict(committed)
+    invalid["scene_update_status"] = None
+    monkeypatch.setattr(client, "_exchange", lambda _command: invalid)
+    with pytest.raises(SceneRuntimeManagerError) as rejected:
+        client.observe(
+            session,
+            source_sequence=1,
+            intent=PoseObservationIntent(
+                object_id="ur10e",
+                policy_id="continuous_unattached",
+                lifetime_ns=1_000_000_000,
+                quality="good",
+                eligible=True,
+                payload={"kind": "simulation_entity_pose"},
+            ),
+        )
+    assert rejected.value.code == "manager_scene_runtime_response_invalid"
 
 
 def test_client_rejects_noncanonical_and_duplicate_responses(tmp_path: Path) -> None:

@@ -849,6 +849,16 @@ TEST(ManagerDaemonProcess,
               std::string::npos)
         << accepted;
     EXPECT_NE(accepted.find("\"fresh\":true"), std::string::npos) << accepted;
+    EXPECT_NE(accepted.find("\"scene_application_status\":\"not_requested\""),
+              std::string::npos)
+        << accepted;
+    EXPECT_NE(accepted.find("\"scene_projection_revision\":null"),
+              std::string::npos)
+        << accepted;
+    EXPECT_NE(accepted.find("\"scene_request_id\":null"), std::string::npos)
+        << accepted;
+    EXPECT_NE(accepted.find("\"scene_update_status\":null"), std::string::npos)
+        << accepted;
     const auto duplicate = SendCommand(
         directory.socket_path(),
         SceneRuntimeObserveRequest(*initial, "observer-epoch-1", 1U));
@@ -894,6 +904,27 @@ TEST(ManagerDaemonProcess,
         undeclared_observation.find("scene_runtime_observation_not_declared"),
         std::string::npos)
         << undeclared_observation;
+
+    const auto before_planning_open =
+        SendCommand(directory.socket_path(),
+                    SceneRuntimeObserverOpenRequest(
+                        *initial, "planner-epoch-1", "isaac.planning-writer",
+                        "planning_object", "before_planning", true));
+    EXPECT_NE(before_planning_open.find("\"ok\":true"), std::string::npos)
+        << before_planning_open;
+    const auto before_planning =
+        SendCommand(directory.socket_path(),
+                    SceneRuntimeObserveRequest(
+                        *initial, "planner-epoch-1", 1U, 1000000000ULL, 0.25,
+                        nullptr, "isaac.planning-writer", "planning_object",
+                        "before_planning", true));
+    EXPECT_NE(before_planning.find(
+                  "\"scene_application_status\":\"deferred_before_planning\""),
+              std::string::npos)
+        << before_planning;
+    EXPECT_NE(before_planning.find("\"scene_projection_revision\":null"),
+              std::string::npos)
+        << before_planning;
 
     const auto observed = scene_runtime_source.Read();
     ASSERT_TRUE(observed.has_value());

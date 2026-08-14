@@ -175,7 +175,8 @@ if(NOT TARGET manyforge::component_manager OR NOT TARGET manyforge::scene)
 endif()
 
 add_library(manyforge_headless_owner_publication
-  src/owner_publication.cpp)
+  src/owner_publication.cpp
+  src/scene_runtime_pose_projector.cpp)
 add_library(manyforge::headless_owner_publication ALIAS
   manyforge_headless_owner_publication)
 target_include_directories(manyforge_headless_owner_publication PUBLIC
@@ -224,6 +225,13 @@ if(BUILD_TESTING)
   target_link_libraries(test_scene_runtime_state_owner PRIVATE
     manyforge_headless GTest::gtest_main)
   gtest_discover_tests(test_scene_runtime_state_owner
+    PROPERTIES TIMEOUT ${MANYFORGE_HEADLESS_GTEST_TIMEOUT_SECONDS})
+
+  add_executable(test_scene_runtime_pose_projector
+    test/test_scene_runtime_pose_projector.cpp)
+  target_link_libraries(test_scene_runtime_pose_projector PRIVATE
+    manyforge_headless_owner_publication GTest::gtest_main)
+  gtest_discover_tests(test_scene_runtime_pose_projector
     PROPERTIES TIMEOUT ${MANYFORGE_HEADLESS_GTEST_TIMEOUT_SECONDS})
 
   add_executable(test_operator_alarm_catalog

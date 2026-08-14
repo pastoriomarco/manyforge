@@ -458,6 +458,12 @@ class PoseSourceSnapshotPublisher(Node):
                 "pending": snapshot.pending,
                 "policy_id": event.policy_id,
                 "retries": snapshot.retries,
+                "scene_application_status": event.scene_application_status,
+                "scene_request_id": event.scene_request_id,
+                "scene_runtime_source_generation": (
+                    event.scene_runtime_source_generation
+                ),
+                "scene_update_status": event.scene_update_status,
                 "source_sequence": event.source_sequence,
                 "superseded": snapshot.superseded,
             },

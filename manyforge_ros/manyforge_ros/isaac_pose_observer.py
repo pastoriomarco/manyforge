@@ -150,6 +150,10 @@ class ObservationDispatchEvent:
     source_sequence: int | None
     code: str
     detail: str
+    scene_application_status: str | None
+    scene_request_id: str | None
+    scene_runtime_source_generation: int | None
+    scene_update_status: str | None
 
 
 @dataclass(frozen=True)
@@ -730,6 +734,7 @@ class ObservationDispatcher:
                 pending,
                 code=result.disposition,
                 detail=("fresh" if result.fresh else "not_fresh"),
+                result=result,
             )
             retry_delay = self._retry_initial_s
 
@@ -743,6 +748,7 @@ class ObservationDispatcher:
         *,
         code: str,
         detail: str,
+        result: PoseObservationResult | None = None,
     ) -> None:
         if self._event_callback is None:
             return
@@ -755,6 +761,20 @@ class ObservationDispatcher:
                     source_sequence=pending.source_sequence,
                     code=code,
                     detail=detail[:_MAX_DETAIL_BYTES],
+                    scene_application_status=(
+                        None if result is None else result.scene_application_status
+                    ),
+                    scene_request_id=(
+                        None if result is None else result.scene_request_id
+                    ),
+                    scene_runtime_source_generation=(
+                        None
+                        if result is None
+                        else result.scene_runtime_source_generation
+                    ),
+                    scene_update_status=(
+                        None if result is None else result.scene_update_status
+                    ),
                 )
             )
         except Exception:

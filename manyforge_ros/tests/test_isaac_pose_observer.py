@@ -320,6 +320,10 @@ class _FakeSceneRuntimeClient:
             scene_runtime_source_generation=len(self.observations),
             source_epoch_order=session.source_epoch_order,
             source_sequence=source_sequence,
+            scene_application_status="not_requested",
+            scene_projection_revision=None,
+            scene_request_id=None,
+            scene_update_status=None,
         )
 
 
@@ -384,6 +388,9 @@ def test_dispatcher_is_latest_per_key_and_rejoins_with_exact_retry() -> None:
     assert client.observations[0][1] == client.observations[1][1]
     assert client.observations[1][1].payload_value()["position"] == 0.2
     assert [event.kind for event in events] == ["retry", "delivered"]
+    assert events[0].scene_application_status is None
+    assert events[1].scene_application_status == "not_requested"
+    assert events[1].scene_runtime_source_generation == 2
 
 
 def test_dispatcher_registers_its_exact_bindings_before_any_sample() -> None:
