@@ -24,6 +24,7 @@ setup(
     entry_points={
         "console_scripts": [
             "isaac_gripper_action_bridge = manyforge_ros_bringup.isaac_gripper_action_bridge:main",
+            "isaac_scene_load_barrier = manyforge_ros_bringup.isaac_scene_load_barrier:main",
             "isaac_topic_command_gate = manyforge_ros_bringup.isaac_topic_command_gate:main",
             "isaac_demo_supervisor = manyforge_ros_bringup.isaac_demo_supervisor:main",
             "pose_source_snapshot_publisher = manyforge_ros_bringup.pose_source_snapshot_publisher:main",

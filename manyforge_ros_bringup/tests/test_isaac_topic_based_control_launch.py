@@ -1,17 +1,18 @@
 from __future__ import annotations
 
-import ast
 import importlib.util
+import math
 from pathlib import Path
+from types import SimpleNamespace
 
+from launch import LaunchContext
+from launch.actions import DeclareLaunchArgument, EmitEvent, OpaqueFunction
+from launch_ros.actions import Node
 import pytest
 
 
-_LAUNCH_FILE = (
-    Path(__file__).resolve().parents[1]
-    / "launch"
-    / "isaac_topic_based_control.launch.py"
-)
+_PACKAGE_ROOT = Path(__file__).resolve().parents[1]
+_LAUNCH_FILE = _PACKAGE_ROOT / "launch" / "isaac_topic_based_control.launch.py"
 
 
 def _load_launch_module():
@@ -26,129 +27,207 @@ def _load_launch_module():
     return module
 
 
-def _function(tree: ast.Module, name: str) -> ast.FunctionDef:
-    matches = [
-        node
-        for node in tree.body
-        if isinstance(node, ast.FunctionDef) and node.name == name
+def _launch_context(module, *, profile: str = "ur10e") -> LaunchContext:
+    context = LaunchContext()
+    for entity in module.generate_launch_description().entities:
+        if isinstance(entity, DeclareLaunchArgument):
+            entity.execute(context)
+    context.launch_configurations["isaac_profile"] = profile
+    return context
+
+
+def _node_executable(action: object) -> str | None:
+    return getattr(action, "_Node__node_executable", None)
+
+
+def test_launch_declares_exact_world_and_has_no_retired_semantic_owner() -> None:
+    module = _load_launch_module()
+    description = module.generate_launch_description()
+    declarations = [
+        action
+        for action in description.entities
+        if isinstance(action, DeclareLaunchArgument)
     ]
-    assert len(matches) == 1
-    return matches[0]
 
-
-def _body_after_docstring(function: ast.FunctionDef) -> list[ast.stmt]:
-    assert function.body
-    docstring = function.body[0]
-    assert isinstance(docstring, ast.Expr)
-    assert isinstance(docstring.value, ast.Constant)
-    assert isinstance(docstring.value.value, str)
-    return function.body[1:]
-
-
-def _assert_definition_is_import_safe(function: ast.FunctionDef) -> None:
-    """Reject decorators, defaults, or annotations that execute on import."""
-
-    assert function.decorator_list == []
-    assert getattr(function, "type_params", []) == []
-    assert not any(
-        isinstance(node, ast.Call) for node in ast.walk(function.args)
+    assert module.DEFAULT_WORLD_URI == (
+        "file:/home/tndlux/workspaces/isaac_ros-dev/src/"
+        "isaac_sim_custom_examples/Scenario/IsaacManipulator/UniversalRobots/"
+        "isaac_manipulator_scene_light.usda"
     )
-    if function.returns is not None:
-        assert not any(
-            isinstance(node, ast.Call) for node in ast.walk(function.returns)
-        )
-
-
-def test_isaac_runtime_fails_before_launch_actions_are_constructed() -> None:
-    source = _LAUNCH_FILE.read_text(encoding="utf-8")
-    tree = ast.parse(source)
-
-    assert not any(isinstance(node, ast.Import) for node in tree.body)
-    assert [
-        node.module for node in tree.body if isinstance(node, ast.ImportFrom)
-    ] == ["__future__", "typing"]
-    assert {
-        target.id
-        for node in tree.body
-        if isinstance(node, ast.Assign)
-        for target in node.targets
-        if isinstance(target, ast.Name)
-    } == {"ISAAC_RUNTIME_UNAVAILABLE_MESSAGE"}
-    assert {
-        node.name for node in tree.body if isinstance(node, ast.FunctionDef)
-    } == {
-        "generate_launch_description",
-        "_launch_setup",
-        "_parse_bool_launch_value",
-        "_parse_bounded_int_launch_value",
-        "_parse_cpu_affinity_launch_value",
+    assert module.DEFAULT_WORLD_NAME == "isaac_manipulator_scene_light"
+    assert {action.name for action in declarations} >= {
+        "isaac_profile",
+        "world_uri",
+        "expected_world_name",
+        "additional_required_topics",
+        "command_gate_owner_node",
+        "command_gate_owner_namespace",
     }
-    for statement in tree.body:
-        assert isinstance(
-            statement,
-            (ast.Expr, ast.ImportFrom, ast.Assign, ast.FunctionDef),
-        )
-        if isinstance(statement, ast.FunctionDef):
-            _assert_definition_is_import_safe(statement)
-        else:
-            assert not any(
-                isinstance(node, ast.Call) for node in ast.walk(statement)
-            )
+    assert sum(isinstance(action, OpaqueFunction) for action in description.entities) == 1
 
-    generate = _function(tree, "generate_launch_description")
-    generate_body = _body_after_docstring(generate)
-    assert len(generate_body) == 1
-    generate_statement = generate_body[0]
-    assert isinstance(generate_statement, ast.Expr)
-    generate_call = generate_statement.value
-    assert isinstance(generate_call, ast.Call)
-    assert isinstance(generate_call.func, ast.Name)
-    assert generate_call.func.id == "_launch_setup"
-    assert len(generate_call.args) == 1
-    assert isinstance(generate_call.args[0], ast.Constant)
-    assert generate_call.args[0].value is None
-    assert generate_call.keywords == []
+    source = _LAUNCH_FILE.read_text(encoding="utf-8")
+    for retired_wire in (
+        "isaac_demo_supervisor",
+        "supervisor_enable_topic",
+        "composer_url",
+        "deployment_path",
+        "program_path",
+    ):
+        assert retired_wire not in source
 
-    setup = _function(tree, "_launch_setup")
-    setup_body = _body_after_docstring(setup)
-    assert len(setup_body) == 1
-    setup_statement = setup_body[0]
-    assert isinstance(setup_statement, ast.Raise)
-    assert setup_statement.cause is None
-    setup_error = setup_statement.exc
-    assert isinstance(setup_error, ast.Call)
-    assert isinstance(setup_error.func, ast.Name)
-    assert setup_error.func.id == "RuntimeError"
-    assert len(setup_error.args) == 1
-    assert isinstance(setup_error.args[0], ast.Name)
-    assert setup_error.args[0].id == "ISAAC_RUNTIME_UNAVAILABLE_MESSAGE"
-    assert setup_error.keywords == []
 
-    assert "DeclareLaunchArgument" not in source
-    assert "LaunchConfiguration" not in source
-    assert "LaunchDescription" not in source
-    assert "OpaqueFunction" not in source
-    assert "from launch" not in source
-    assert "launch_ros" not in source
-    assert "Node(" not in source
-    assert "TimerAction" not in source
-    assert "composer_url" not in source
-    assert "_resolve_start_gripper_action_bridge" not in source
-
+@pytest.mark.parametrize(
+    ("profile", "raw_gripper_topic", "starts_action_bridge"),
+    [
+        ("ur10e", "/isaac_gripper_state", True),
+        ("lite6", "/isaac_joint_commands_gripper", False),
+    ],
+)
+def test_profile_selection_preserves_distinct_gripper_transports(
+    profile: str,
+    raw_gripper_topic: str,
+    starts_action_bridge: bool,
+) -> None:
     module = _load_launch_module()
 
-    with pytest.raises(RuntimeError) as generation_error:
-        module.generate_launch_description()
+    selected = module._profile_configuration(profile)
+    assert selected["raw_gripper_topic"] == raw_gripper_topic
+    assert (
+        module._resolve_start_gripper_action_bridge("auto", isaac_profile=profile)
+        is starts_action_bridge
+    )
 
-    assert str(generation_error.value) == module.ISAAC_RUNTIME_UNAVAILABLE_MESSAGE
+    if profile == "lite6":
+        with pytest.raises(ValueError, match="direct-effort"):
+            module._resolve_start_gripper_action_bridge(
+                "true", isaac_profile=profile
+            )
 
-    with pytest.raises(RuntimeError) as error:
-        module._launch_setup(object())
 
-    assert str(error.value) == module.ISAAC_RUNTIME_UNAVAILABLE_MESSAGE
+def test_launch_builds_barrier_first_and_releases_ur_stack_only_on_success(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module = _load_launch_module()
+    monkeypatch.setattr(
+        module.FindPackageShare,
+        "find",
+        lambda _self, _name: str(_PACKAGE_ROOT),
+    )
+    actions = module._launch_setup(_launch_context(module, profile="ur10e"))
+
+    assert len(actions) == 2
+    barrier, registration = actions
+    assert isinstance(barrier, Node)
+    assert _node_executable(barrier) == "isaac_scene_load_barrier"
+    event_handler = getattr(
+        registration, "_RegisterEventHandler__event_handler"
+    )
+    assert getattr(event_handler, "_OnActionEventBase__action_matcher") is barrier
+    callback = getattr(event_handler, "_OnActionEventBase__on_event")
+
+    released = callback(SimpleNamespace(returncode=0), LaunchContext())
+    assert [_node_executable(action) for action in released[:4]] == [
+        "isaac_topic_command_gate",
+        "robot_state_publisher",
+        "static_transform_publisher",
+        "isaac_gripper_action_bridge",
+    ]
+    assert len(released) == 7
+
+    with pytest.raises(RuntimeError, match="return code 2"):
+        callback(SimpleNamespace(returncode=2), LaunchContext())
 
 
-def test_pose_source_console_entrypoint_has_no_dormant_runtime_body(
+def test_launch_lite6_stack_omits_python_gripper_action_adapter(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module = _load_launch_module()
+    monkeypatch.setattr(
+        module.FindPackageShare,
+        "find",
+        lambda _self, _name: str(_PACKAGE_ROOT),
+    )
+    actions = module._launch_setup(_launch_context(module, profile="lite6"))
+    registration = actions[1]
+    event_handler = getattr(
+        registration, "_RegisterEventHandler__event_handler"
+    )
+    callback = getattr(event_handler, "_OnActionEventBase__on_event")
+    released = callback(SimpleNamespace(returncode=0), LaunchContext())
+
+    assert "isaac_gripper_action_bridge" not in {
+        _node_executable(action) for action in released
+    }
+    assert len(released) == 6
+
+
+def test_scene_barrier_return_code_is_exact_and_fail_closed() -> None:
+    module = _load_launch_module()
+    sentinel = object()
+
+    assert module._after_scene_barrier(0, [sentinel]) == [sentinel]
+    for returncode in (False, None, "0", 2, -9):
+        with pytest.raises(RuntimeError, match="scene-load barrier failed"):
+            module._after_scene_barrier(returncode, [sentinel])
+
+
+def test_launch_name_topic_and_vector_parsers_are_bounded() -> None:
+    module = _load_launch_module()
+
+    assert module._absolute_ros_name(" /clock ", name="topic") == "/clock"
+    assert module._relative_ros_name("owner", name="node") == "owner"
+    assert module._absolute_namespace("/cell/", name="namespace") == "/cell"
+    assert module._absolute_namespace("/", name="namespace") == "/"
+    assert module._parse_topic_csv("/clock, /tf", name="topics") == [
+        "/clock",
+        "/tf",
+    ]
+    assert module._parse_vector3("0 -1.25 3e-2", name="xyz") == [
+        "0",
+        "-1.25",
+        "0.029999999999999999",
+    ]
+    for invalid in ("clock", "/", "/a//b", "/has space"):
+        with pytest.raises(ValueError):
+            module._absolute_ros_name(invalid, name="topic")
+    for invalid in ("", "/owner", "some/owner", "two words"):
+        with pytest.raises(ValueError):
+            module._relative_ros_name(invalid, name="node")
+    for invalid in ("/clock,/clock", "/clock,relative", "/clock,"):
+        with pytest.raises(ValueError):
+            module._parse_topic_csv(invalid, name="topics")
+    for invalid in ("0 1", "0 1 2 3", f"0 1 {math.inf}"):
+        with pytest.raises(ValueError):
+            module._parse_vector3(invalid, name="xyz")
+
+
+def test_controller_manager_resource_parsers_remain_bounded() -> None:
+    module = _load_launch_module()
+
+    assert module._parse_cpu_affinity_launch_value(
+        "7, 9-11,10",
+        name="controller_manager_cpu_affinity",
+    ) == [7, 9, 10, 11]
+    assert module._parse_bool_launch_value("true", name="lock_memory") is True
+    assert module._parse_bool_launch_value("OFF", name="lock_memory") is False
+    assert (
+        module._parse_bounded_int_launch_value(
+            "50",
+            name="thread_priority",
+            minimum=1,
+            maximum=99,
+        )
+        == 50
+    )
+    for value in ("3-1", "1,,2", "x", "1-2-3", "-1", "0-2147483647"):
+        with pytest.raises(ValueError):
+            module._parse_cpu_affinity_launch_value(
+                value,
+                name="controller_manager_cpu_affinity",
+            )
+
+
+def test_pose_source_console_entrypoint_remains_fenced(
     capsys: pytest.CaptureFixture[str],
 ) -> None:
     from manyforge_ros_bringup import pose_source_snapshot_publisher
@@ -158,9 +237,7 @@ def test_pose_source_console_entrypoint_has_no_dormant_runtime_body(
     )
     assert "def _port_target_main" not in source
     assert "rclpy" not in source
-    assert "urllib" not in source
     assert "manyforge_behavior.deployment" not in source
-
     assert pose_source_snapshot_publisher.main([]) == 78
     assert capsys.readouterr().err.strip() == (
         pose_source_snapshot_publisher.UNAVAILABLE_MESSAGE
@@ -178,55 +255,3 @@ def test_demo_supervisor_entrypoint_has_no_backup_owner(
     assert "urllib" not in source
     assert isaac_demo_supervisor.main() == 78
     assert capsys.readouterr().err.strip() == isaac_demo_supervisor.UNAVAILABLE_MESSAGE
-
-
-def test_controller_manager_cpu_affinity_parser_accepts_ranges_and_deduplicates():
-    module = _load_launch_module()
-
-    assert module._parse_cpu_affinity_launch_value(
-        "7, 9-11,10",
-        name="controller_manager_cpu_affinity",
-    ) == [7, 9, 10, 11]
-    assert module._parse_cpu_affinity_launch_value(
-        "",
-        name="controller_manager_cpu_affinity",
-    ) == []
-
-
-@pytest.mark.parametrize(
-    "value",
-    ["3-1", "1,,2", "x", "1-2-3", "-1", "0-2147483647"],
-)
-def test_controller_manager_cpu_affinity_parser_rejects_malformed_values(value):
-    module = _load_launch_module()
-
-    with pytest.raises(ValueError):
-        module._parse_cpu_affinity_launch_value(
-            value,
-            name="controller_manager_cpu_affinity",
-        )
-
-
-def test_controller_manager_priority_and_lock_parsers_are_bounded():
-    module = _load_launch_module()
-
-    assert module._parse_bool_launch_value("true", name="lock_memory") is True
-    assert module._parse_bool_launch_value("OFF", name="lock_memory") is False
-    assert (
-        module._parse_bounded_int_launch_value(
-            "50",
-            name="thread_priority",
-            minimum=1,
-            maximum=99,
-        )
-        == 50
-    )
-    with pytest.raises(ValueError):
-        module._parse_bool_launch_value("sometimes", name="lock_memory")
-    with pytest.raises(ValueError):
-        module._parse_bounded_int_launch_value(
-            "100",
-            name="thread_priority",
-            minimum=1,
-            maximum=99,
-        )

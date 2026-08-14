@@ -1,0 +1,226 @@
+from __future__ import annotations
+
+import threading
+from types import SimpleNamespace
+
+import pytest
+import rclpy
+from rosgraph_msgs.msg import Clock
+from rclpy.executors import SingleThreadedExecutor
+from rclpy.node import Node
+from rclpy.parameter import Parameter
+from sensor_msgs.msg import JointState
+from simulation_interfaces.msg import SimulationState, SimulatorFeatures
+from simulation_interfaces.srv import (
+    GetCurrentWorld,
+    GetSimulationState,
+    GetSimulatorFeatures,
+    LoadWorld,
+    SetSimulationState,
+)
+
+from manyforge_ros_bringup.isaac_scene_load_barrier import (
+    IsaacSceneLoadBarrier,
+    normalize_file_world_uri,
+    select_service_name,
+    world_readback_matches,
+)
+
+
+WORLD_PATH = "/opt/isaac/worlds/retained scene.usda"
+WORLD_URI = "file:/opt/isaac/worlds/retained%20scene.usda"
+
+
+def test_world_uri_normalization_is_exact_and_host_neutral() -> None:
+    assert normalize_file_world_uri(WORLD_PATH) == (
+        "file:/opt/isaac/worlds/retained scene.usda"
+    )
+    assert normalize_file_world_uri(WORLD_URI) == (
+        "file:/opt/isaac/worlds/retained scene.usda"
+    )
+    assert normalize_file_world_uri("file://localhost" + WORLD_PATH) == (
+        "file:/opt/isaac/worlds/retained scene.usda"
+    )
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        "",
+        "relative.usda",
+        "https://example.invalid/world.usda",
+        "file://remote/world.usda",
+        "file:/world.usda?query=true",
+        "file:/world.usda#fragment",
+        "file:/world.txt",
+        "file:/",
+        "file:/opt/../world.usda",
+        "file:/world\x00.usda",
+    ],
+)
+def test_world_uri_normalization_rejects_ambiguous_inputs(value: str) -> None:
+    with pytest.raises(ValueError):
+        normalize_file_world_uri(value)
+
+
+def test_world_readback_requires_both_uri_and_name() -> None:
+    exact = SimpleNamespace(
+        name="retained_world",
+        world_resource=SimpleNamespace(uri=WORLD_PATH),
+    )
+
+    assert world_readback_matches(
+        exact,
+        expected_uri=WORLD_URI,
+        expected_name="retained_world",
+    )
+    assert not world_readback_matches(
+        exact,
+        expected_uri="file:/opt/isaac/worlds/other.usda",
+        expected_name="retained_world",
+    )
+    assert not world_readback_matches(
+        exact,
+        expected_uri=WORLD_URI,
+        expected_name="another_world",
+    )
+    assert not world_readback_matches(
+        object(),
+        expected_uri=WORLD_URI,
+        expected_name="retained_world",
+    )
+
+
+def test_typed_service_selection_is_deterministic_and_bounded() -> None:
+    service_type = "simulation_interfaces/srv/GetCurrentWorld"
+    graph = [
+        ("/z/current_world", [service_type]),
+        ("/get_current_world", (service_type,)),
+        ("/unrelated", ["example_interfaces/srv/Trigger"]),
+    ]
+
+    assert (
+        select_service_name(graph, service_type=service_type)
+        == "/get_current_world"
+    )
+    assert select_service_name([], service_type=service_type) is None
+    assert select_service_name(None, service_type=service_type) is None
+    assert select_service_name(
+        [("/malformed", "not-a-type-list")], service_type=service_type
+    ) is None
+
+
+def test_result_validation_accepts_only_result_ok() -> None:
+    ok = SimpleNamespace(result=1, RESULT_OK=1, error_message="")
+    failed = SimpleNamespace(result=4, RESULT_OK=1, error_message="failed")
+
+    IsaacSceneLoadBarrier._require_ok(ok, operation="test")
+    with pytest.raises(RuntimeError, match="test failed: 4: failed"):
+        IsaacSceneLoadBarrier._require_ok(failed, operation="test")
+
+
+def test_scene_barrier_runs_against_typed_fake_simulator() -> None:
+    rclpy.init()
+    simulator: Node | None = None
+    barrier: IsaacSceneLoadBarrier | None = None
+    executor = SingleThreadedExecutor()
+    worker: threading.Thread | None = None
+    try:
+        simulator = Node("manyforge_fake_simulation_interfaces_owner")
+        _install_fake_simulator(simulator)
+        for topic, message_type in (
+            ("/clock", Clock),
+            ("/isaac_joint_states", JointState),
+            ("/isaac_joint_commands", JointState),
+            ("/isaac_gripper_state", JointState),
+        ):
+            simulator.create_publisher(message_type, topic, 1)
+        executor.add_node(simulator)
+        worker = threading.Thread(target=executor.spin, daemon=True)
+        worker.start()
+
+        barrier = IsaacSceneLoadBarrier(
+            parameter_overrides=[
+                Parameter("world_uri", value=WORLD_URI),
+                Parameter("expected_world_name", value="retained_world"),
+                Parameter("startup_timeout_s", value=2.0),
+                Parameter("service_timeout_s", value=1.0),
+                Parameter(
+                    "required_topics",
+                    value=[
+                        "/clock",
+                        "/isaac_joint_states",
+                        "/isaac_joint_commands",
+                        "/isaac_gripper_state",
+                    ],
+                ),
+            ]
+        )
+        result = barrier.run()
+
+        assert result["world_name"] == "retained_world"
+        assert result["world_uri"] == (
+            "file:/opt/isaac/worlds/retained scene.usda"
+        )
+        assert result["simulation_state"] == "stopped"
+        assert set(result["services"]) == {
+            "features",
+            "load_world",
+            "current_world",
+            "get_state",
+            "set_state",
+        }
+    finally:
+        if barrier is not None:
+            barrier.destroy_node()
+        executor.shutdown()
+        if worker is not None:
+            worker.join(timeout=2.0)
+        if simulator is not None:
+            simulator.destroy_node()
+        if rclpy.ok():
+            rclpy.shutdown()
+
+
+def _install_fake_simulator(node: Node) -> None:
+    feature_values = [
+        int(SimulatorFeatures.WORLD_LOADING),
+        int(SimulatorFeatures.WORLD_INFO_GETTING),
+        int(SimulatorFeatures.SIMULATION_STATE_GETTING),
+        int(SimulatorFeatures.SIMULATION_STATE_SETTING),
+    ]
+
+    def features(_request, response):
+        response.features.features = feature_values
+        return response
+
+    def populate_world(response):
+        response.result.result = response.result.RESULT_OK
+        response.world.name = "retained_world"
+        response.world.world_resource.uri = (
+            "file:/opt/isaac/worlds/retained scene.usda"
+        )
+        return response
+
+    def state(_request, response):
+        response.result.result = response.result.RESULT_OK
+        response.state.state = int(SimulationState.STATE_STOPPED)
+        return response
+
+    def set_state(_request, response):
+        response.result.result = response.result.RESULT_OK
+        return response
+
+    node.create_service(
+        GetSimulatorFeatures,
+        "/get_simulator_features",
+        features,
+    )
+    node.create_service(LoadWorld, "/load_world", lambda _r, value: populate_world(value))
+    node.create_service(
+        GetCurrentWorld,
+        "/get_current_world",
+        lambda _r, value: populate_world(value),
+    )
+    node.create_service(GetSimulationState, "/get_simulation_state", state)
+    node.create_service(SetSimulationState, "/set_simulation_state", set_state)
