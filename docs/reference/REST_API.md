@@ -3,7 +3,7 @@
   Regenerate with:
     cd <repository-root>
     python3 scripts/regen-public-contracts.py structural-rest
-  Last regenerated: 2026-08-13 07:12:49 UTC
+  Last regenerated: 2026-08-14 03:00:51 UTC
   Generator source: scripts/regen-public-contracts.py:gen_rest_api
 -->
 
@@ -35,6 +35,7 @@ OpenAPI version: `3.1.0`. Title: `ManyForge Composer (replaceable client)`.
 | `GET` | `/api/execution/alarms/metrics` | headless-runtime-client | Alarm Metrics |
 | `POST` | `/api/execution/alarms/{condition_id}/acknowledge` | headless-runtime-client | Acknowledge Alarm |
 | `POST` | `/api/execution/capability-command-previews` | headless-runtime-client | Execution Preview Capability Command |
+| `POST` | `/api/execution/full-stop` | headless-runtime-client | Execution Full Stop |
 | `GET` | `/api/execution/history` | headless-runtime-client | History |
 | `GET` | `/api/execution/history/health` | headless-runtime-client | Historian Health |
 | `POST` | `/api/execution/history/reconcile` | headless-runtime-client | Historian Reconcile |
@@ -53,6 +54,8 @@ OpenAPI version: `3.1.0`. Title: `ManyForge Composer (replaceable client)`.
 | `POST` | `/api/execution/pick-place/sequences/place` | headless-runtime-client | Execution Start Place |
 | `GET` | `/api/execution/pick-place/sequences/{sequence_id}` | headless-runtime-client | Execution Pick Place Sequence |
 | `GET` | `/api/execution/status` | headless-runtime-client | Execution Status |
+| `GET` | `/api/execution/stop-fault` | headless-runtime-client | Execution Stop Fault |
+| `POST` | `/api/execution/stop-fault/recover` | headless-runtime-client | Execution Recover Stop Fault |
 | `POST` | `/api/execution/stops` | headless-runtime-client | Execution Stop |
 | `GET` | `/api/files/browse` | files | Browse Filesystem |
 | `GET` | `/api/health` |  | Health |

@@ -3,7 +3,7 @@
   Regenerate with:
     cd <repository-root>
     python3 scripts/regen-public-contracts.py headless-rest
-  Last regenerated: 2026-08-13 07:12:48 UTC
+  Last regenerated: 2026-08-14 03:00:49 UTC
   Generator source: scripts/regen-public-contracts.py:gen_headless_rest_api
 -->
 
@@ -32,6 +32,7 @@ OpenAPI version: `3.1.0`. Title: `ManyForge Headless Runtime API`.
 | `GET` | `/api/execution/alarms/metrics` |  | Alarm Metrics |
 | `POST` | `/api/execution/alarms/{condition_id}/acknowledge` |  | Acknowledge Alarm |
 | `POST` | `/api/execution/capability-command-previews` |  | Execution Preview Capability Command |
+| `POST` | `/api/execution/full-stop` |  | Execution Full Stop |
 | `GET` | `/api/execution/history` |  | History |
 | `GET` | `/api/execution/history/health` |  | Historian Health |
 | `POST` | `/api/execution/history/reconcile` |  | Historian Reconcile |
@@ -50,6 +51,8 @@ OpenAPI version: `3.1.0`. Title: `ManyForge Headless Runtime API`.
 | `POST` | `/api/execution/pick-place/sequences/place` |  | Execution Start Place |
 | `GET` | `/api/execution/pick-place/sequences/{sequence_id}` |  | Execution Pick Place Sequence |
 | `GET` | `/api/execution/status` |  | Execution Status |
+| `GET` | `/api/execution/stop-fault` |  | Execution Stop Fault |
+| `POST` | `/api/execution/stop-fault/recover` |  | Execution Recover Stop Fault |
 | `POST` | `/api/execution/stops` |  | Execution Stop |
 | `GET` | `/api/health` |  | Health |
 | `POST` | `/api/manager/apply` |  | Manager Apply |
