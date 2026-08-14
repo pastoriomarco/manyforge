@@ -40,6 +40,18 @@ void* operator new(const std::size_t size) {
 void* operator new[](const std::size_t size) {
   return Allocate(size);
 }
+void* operator new(const std::size_t size, const std::nothrow_t&) noexcept {
+  if (track_allocations) {
+    ++tracked_allocations;
+  }
+  return std::malloc(size == 0U ? 1U : size);
+}
+void* operator new[](const std::size_t size, const std::nothrow_t&) noexcept {
+  if (track_allocations) {
+    ++tracked_allocations;
+  }
+  return std::malloc(size == 0U ? 1U : size);
+}
 void operator delete(void* memory) noexcept {
   std::free(memory);
 }
@@ -50,6 +62,12 @@ void operator delete(void* memory, std::size_t) noexcept {
   std::free(memory);
 }
 void operator delete[](void* memory, std::size_t) noexcept {
+  std::free(memory);
+}
+void operator delete(void* memory, const std::nothrow_t&) noexcept {
+  std::free(memory);
+}
+void operator delete[](void* memory, const std::nothrow_t&) noexcept {
   std::free(memory);
 }
 
