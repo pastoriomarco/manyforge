@@ -211,6 +211,13 @@ class ResourceSlotTable final {
   [[nodiscard]] Result<void> mark_unreconciled_external_or_orphan_goal(
       const std::vector<ResourceId>& resources);
 
+  /// Atomically release only the exact canonical orphan-resource subset named
+  /// by a fresh owner-issued reconciliation snapshot. A stale table generation
+  /// or any non-orphan row rejects before mutation.
+  [[nodiscard]] Result<std::uint64_t> reconcile_unreconciled_external_or_orphan_goal(
+      std::uint64_t expected_operation_resource_generation,
+      const std::vector<ResourceId>& resources);
+
   /// Replace the selected runtime inventory while preserving every unchanged
   /// occupied slot. An empty candidate is the valid no-commandable-component
   /// product. Removed resources must already be free, and any retained

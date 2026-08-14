@@ -633,6 +633,47 @@ TEST(ResourceSlotTableTest, OrphanRecoveryMarksOnlyFreeUnownedResourcesAndBlocks
   EXPECT_FALSE(table.mark_unreconciled_external_or_orphan_goal({ResourceId("joint.1")}).ok());
 }
 
+TEST(ResourceSlotTableTest, ReconcilesOnlyAnExactFreshOrphanSubsetAtomically) {
+  ResourceSlotTable table(arm_resources());
+  ASSERT_TRUE(
+      table
+          .mark_unreconciled_external_or_orphan_goal({ResourceId("joint.1"), ResourceId("joint.2")})
+          .ok());
+  const auto marked = table.coherent_snapshot();
+  ASSERT_EQ(marked.operation_resource_generation, 1U);
+
+  const auto first = table.reconcile_unreconciled_external_or_orphan_goal(
+      marked.operation_resource_generation, {ResourceId("joint.1")});
+  ASSERT_TRUE(first.ok()) << first.error().message;
+  EXPECT_EQ(first.value(), 2U);
+  const auto partial = table.snapshot();
+  ASSERT_EQ(partial.size(), 2U);
+  EXPECT_EQ(partial[0].state, ResourceSlotState::kFree);
+  EXPECT_EQ(partial[1].state, ResourceSlotState::kUnreconciledExternalOrOrphanGoal);
+
+  const auto stale = table.reconcile_unreconciled_external_or_orphan_goal(
+      marked.operation_resource_generation, {ResourceId("joint.2")});
+  ASSERT_FALSE(stale.ok());
+  EXPECT_EQ(stale.error().details.at("reason"), "resource_orphan_reconciliation_generation_stale");
+  EXPECT_EQ(table.snapshot(), partial);
+
+  const auto noncanonical = table.reconcile_unreconciled_external_or_orphan_goal(
+      first.value(), {ResourceId("joint.2"), ResourceId("joint.1")});
+  ASSERT_FALSE(noncanonical.ok());
+  EXPECT_EQ(noncanonical.error().details.at("reason"),
+            "resource_orphan_reconciliation_scope_noncanonical");
+  EXPECT_EQ(table.snapshot(), partial);
+
+  const auto second =
+      table.reconcile_unreconciled_external_or_orphan_goal(first.value(), {ResourceId("joint.2")});
+  ASSERT_TRUE(second.ok()) << second.error().message;
+  EXPECT_EQ(second.value(), 3U);
+  const auto complete = table.snapshot();
+  EXPECT_TRUE(std::all_of(complete.begin(), complete.end(), [](const auto& slot) {
+    return slot.state == ResourceSlotState::kFree && !slot.owner.has_value();
+  }));
+}
+
 TEST(ResourceSlotTableTest, ReconfiguresFreeInventoryWhilePreservingOneUnchangedOperation) {
   ResourceSlotTable table(
       {ResourceId("joint.1"), ResourceId("joint.2"), ResourceId("removed.free")},

@@ -171,8 +171,6 @@ def _expected_active_configuration(
 def _qualify_native_cclc_product(
     execution_root: Path,
     owner_epoch: str,
-    *,
-    deferred_route_domains: frozenset[str] = frozenset(),
 ) -> None:
     client = CCLCOpenRequestClient(execution_root, timeout_seconds=5.0)
 
@@ -243,12 +241,6 @@ def _qualify_native_cclc_product(
             f"native CCLC product has an unexpected route set: {domain_ids}"
         )
     for domain_id in domain_ids:
-        # A replaced host adopts every durable route as a closed predecessor.
-        # An orphaned operation intentionally prevents republishing its own
-        # domain until reconciliation, while disjoint domains remain eligible
-        # for fresh readiness publication.
-        if domain_id in deferred_route_domains:
-            continue
         template_set = client.route_templates("lite6_arm")
         template = next(
             row
@@ -304,7 +296,6 @@ def _start_host(
     candidate_worker: Path | None = None,
     fake_worker_marker: Path | None = None,
     host_environment: str = "MANYFORGE_NATIVE_EXECUTION_HOST",
-    deferred_route_domains: frozenset[str] = frozenset(),
 ) -> subprocess.Popen[bytes]:
     environment = os.environ.copy()
     if fake_worker_marker is not None:
@@ -357,7 +348,6 @@ def _start_host(
                         _qualify_native_cclc_product(
                             execution_root,
                             response["status"]["owner_epoch"],
-                            deferred_route_domains=deferred_route_domains,
                         )
                     except Exception as error:
                         _stop_host(process)
@@ -2231,9 +2221,6 @@ def test_planning_stop_and_active_host_replacement_are_bounded(
             manifest,
             candidate_worker=fake_worker,
             fake_worker_marker=marker,
-            deferred_route_domains=frozenset(
-                {"lite6_arm_domain", "lite6_gripper_domain"}
-            ),
         )
         restarted = headless.execution_status()["status"]
         assert restarted["owner_epoch"] != first_epoch
@@ -2256,34 +2243,56 @@ def test_planning_stop_and_active_host_replacement_are_bounded(
             native.events(first_epoch, 0)
         assert stale_events.value.code == "operation_journal_owner_epoch_stale"
 
-        with pytest.raises(HeadlessClientError) as fenced:
-            _runner_submission(
-                runner,
-                request_id="reject-fenced-resource",
-                joint_names=("joint1",),
-                positions=(0.05,),
-            )
-        assert fenced.value.code == "invalid_state_transition"
-        assert fenced.value.status_code == 409
+        # The new owner adopted the exact durable route, proved current
+        # quiescence/no-live-goal without a command, released only those
+        # orphan-resource slots, and then republished normal readiness.
+        gripper_after_restart = _gripper_submission(
+            runner,
+            request_id="gripper-after-arm-host-loss",
+            position_kind="linear_m",
+            position=0.003,
+        )
+        gripper_after_restart_id = gripper_after_restart["accepted"][
+            "operation_id"
+        ]
+        gripper_terminal = _wait_terminal(
+            runner, gripper_after_restart_id
+        )["operation"]
+        assert gripper_terminal["state"] == "completed"
+        runner.acknowledge_completed_operation(
+            request_id="ack-gripper-after-arm-host-loss",
+            operation_id=gripper_after_restart_id,
+            expected_operation_revision=gripper_terminal[
+                "operation_revision"
+            ],
+            reason="release restarted gripper operation",
+            correlation_id="n4d-process-test",
+        )
 
-        # An unclean owner replacement fences the complete current inventory:
-        # absent journal bytes cannot prove that a process-local Full Stop did
-        # not linearize immediately before the loss.
-        with pytest.raises(HeadlessClientError) as globally_fenced:
-            _gripper_submission(
-                runner,
-                request_id="gripper-after-arm-host-loss",
-                position_kind="linear_m",
-                position=0.003,
-            )
-        assert globally_fenced.value.code == "invalid_state_transition"
-        assert globally_fenced.value.status_code == 409
+        arm_after_restart = _runner_submission(
+            runner,
+            request_id="arm-after-arm-host-loss",
+            joint_names=("joint1",),
+            positions=(0.05,),
+        )
+        arm_after_restart_id = arm_after_restart["accepted"]["operation_id"]
+        arm_terminal = _wait_terminal(runner, arm_after_restart_id)[
+            "operation"
+        ]
+        assert arm_terminal["state"] == "completed"
+        runner.acknowledge_completed_operation(
+            request_id="ack-arm-after-arm-host-loss",
+            operation_id=arm_after_restart_id,
+            expected_operation_revision=arm_terminal["operation_revision"],
+            reason="release restarted arm operation",
+            correlation_id="n4d-process-test",
+        )
     finally:
         _stop_host(process)
         raw_api.close()
 
 
-def test_active_gripper_host_replacement_fences_complete_inventory(
+def test_active_gripper_host_replacement_reconciles_and_reopens_inventory(
     tmp_path: Path,
 ) -> None:
     built_fixture = _required_path("MANYFORGE_I6_NATIVE_FIXTURE_ROOT")
@@ -2333,9 +2342,6 @@ def test_active_gripper_host_replacement_fences_complete_inventory(
             execution_root,
             staging_root,
             manifest,
-            deferred_route_domains=frozenset(
-                {"lite6_arm_domain", "lite6_gripper_domain"}
-            ),
         )
         restarted = headless.execution_status()["status"]
         assert restarted["owner_epoch"] != first_epoch
@@ -2347,25 +2353,47 @@ def test_active_gripper_host_replacement_fences_complete_inventory(
             "unreconciled_external_or_orphan_goal"
         )
 
-        with pytest.raises(HeadlessClientError) as fenced:
-            _gripper_submission(
-                runner,
-                request_id="reject-fenced-gripper-resource",
-                position_kind="linear_m",
-                position=0.002,
-            )
-        assert fenced.value.code == "invalid_state_transition"
-        assert fenced.value.status_code == 409
+        arm_after_restart = _runner_submission(
+            runner,
+            request_id="arm-after-gripper-host-loss",
+            joint_names=("joint1",),
+            positions=(0.05,),
+        )
+        arm_after_restart_id = arm_after_restart["accepted"]["operation_id"]
+        arm_terminal = _wait_terminal(runner, arm_after_restart_id)[
+            "operation"
+        ]
+        assert arm_terminal["state"] == "completed"
+        runner.acknowledge_completed_operation(
+            request_id="ack-arm-after-gripper-host-loss",
+            operation_id=arm_after_restart_id,
+            expected_operation_revision=arm_terminal["operation_revision"],
+            reason="release restarted arm operation",
+            correlation_id="n4d-process-test",
+        )
 
-        with pytest.raises(HeadlessClientError) as globally_fenced:
-            _runner_submission(
-                runner,
-                request_id="arm-after-gripper-host-loss",
-                joint_names=("joint1",),
-                positions=(0.05,),
-            )
-        assert globally_fenced.value.code == "invalid_state_transition"
-        assert globally_fenced.value.status_code == 409
+        gripper_after_restart = _gripper_submission(
+            runner,
+            request_id="gripper-after-gripper-host-loss",
+            position_kind="linear_m",
+            position=0.002,
+        )
+        gripper_after_restart_id = gripper_after_restart["accepted"][
+            "operation_id"
+        ]
+        gripper_terminal = _wait_terminal(
+            runner, gripper_after_restart_id
+        )["operation"]
+        assert gripper_terminal["state"] == "completed"
+        runner.acknowledge_completed_operation(
+            request_id="ack-gripper-after-gripper-host-loss",
+            operation_id=gripper_after_restart_id,
+            expected_operation_revision=gripper_terminal[
+                "operation_revision"
+            ],
+            reason="release restarted gripper operation",
+            correlation_id="n4d-process-test",
+        )
     finally:
         _stop_host(process)
         raw_api.close()

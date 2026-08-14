@@ -1521,6 +1521,49 @@ FakeOperationJournal default_journal;
   return result;
 }
 
+[[nodiscard]] OrphanResourceReconciliationFactsDTO orphan_reconciliation_facts(
+    const RequestOwnerEpoch& owner_epoch, const CellId& cell_id,
+    const std::uint64_t operation_resource_generation,
+    const std::vector<RuntimeParticipantBinding>& bindings, std::vector<ResourceId> resources,
+    const std::int64_t assessed_at_ns = 0) {
+  std::sort(resources.begin(), resources.end());
+  std::vector<OrphanResourceReconciliationFactDTO> facts;
+  facts.reserve(resources.size());
+  for (const auto& resource : resources) {
+    const RuntimeParticipantBinding* selected = nullptr;
+    for (const auto& binding : bindings) {
+      const bool contains =
+          std::any_of(binding.value().resources.begin(), binding.value().resources.end(),
+                      [&](const auto& row) { return row.resource_id == resource; });
+      if (contains) {
+        if (selected != nullptr) throw std::logic_error("ambiguous orphan test resource");
+        selected = &binding;
+      }
+    }
+    if (selected == nullptr || !selected->value().control_path.has_value()) {
+      throw std::logic_error("missing orphan test resource");
+    }
+    const auto& value = selected->value();
+    const auto& path = *value.control_path;
+    facts.push_back(OrphanResourceReconciliationFactDTO{
+        resource, value.controllable_component_id, value.command_target_id, path.control_domain_id,
+        path.control_binding_id, path.control_binding_revision,
+        path.active_control_configuration_id, path.active_control_configuration_generation,
+        path.provider_runtime_unit_id, path.provider_runtime_epoch,
+        StopFaultRecoveryResourceFactDTO{resource, StopFaultRecoveryResourceStateDTO::kSettled,
+                                         path.provider_runtime_epoch, 1U, 0, 100,
+                                         ContentDigest(test_digest('4')), std::nullopt},
+        ContentDigest(test_digest('5')), ContentDigest(test_digest('6'))});
+  }
+  return OrphanResourceReconciliationFactsDTO{owner_epoch,
+                                              cell_id,
+                                              bindings.front().value().retained_bundle_id,
+                                              bindings.front().value().graph_revision,
+                                              operation_resource_generation,
+                                              assessed_at_ns,
+                                              std::move(facts)};
+}
+
 [[nodiscard]] RuntimeParticipantBinding make_binding(
     std::string target_role, std::string command_target, std::string capability,
     CoordinateKind kind, std::optional<ProgramCommandSchemaRefDTO> command_schema = std::nullopt,
@@ -6173,9 +6216,90 @@ TEST(ResourceAddressedExecutionKernelTest,
   intent.request_context.request_owner_epoch = RequestOwnerEpoch("kernel.epoch.new");
   const auto blocked = kernel.execute(intent);
   ASSERT_FALSE(blocked.ok());
-  EXPECT_EQ(blocked.error().details.at("reason"), "motion_admission_closed");
+  EXPECT_EQ(blocked.error().details.at("reason"), "resource_scope_busy");
   EXPECT_EQ(engine.execute_calls, 0);
   EXPECT_EQ(engine.stop_calls, 0);
+
+  const auto snapshot = kernel.resource_table_snapshot();
+  auto facts =
+      orphan_reconciliation_facts(RequestOwnerEpoch("kernel.epoch.new"), CellId("cell.test"),
+                                  snapshot.operation_resource_generation, {binding},
+                                  {ResourceId("robot.joint_1")}, clock.now());
+
+  auto mismatched = facts;
+  mismatched.resources.front().provider_runtime_epoch = RuntimeEpoch("runtime.epoch.foreign");
+  const auto rejected_mismatch = kernel.reconcile_orphaned_resources(mismatched);
+  ASSERT_FALSE(rejected_mismatch.ok());
+  EXPECT_EQ(rejected_mismatch.error().details.at("reason"),
+            "orphan_resource_reconciliation_binding_mismatch");
+  EXPECT_EQ(kernel.resource_table_snapshot(), snapshot);
+
+  clock.advance(101);
+  const auto rejected_stale = kernel.reconcile_orphaned_resources(facts);
+  ASSERT_FALSE(rejected_stale.ok());
+  EXPECT_EQ(rejected_stale.error().details.at("reason"),
+            "orphan_resource_reconciliation_scope_or_freshness_changed");
+  EXPECT_EQ(kernel.resource_table_snapshot(), snapshot);
+
+  facts = orphan_reconciliation_facts(RequestOwnerEpoch("kernel.epoch.new"), CellId("cell.test"),
+                                      snapshot.operation_resource_generation, {binding},
+                                      {ResourceId("robot.joint_1")}, clock.now());
+  const auto reconciled = kernel.reconcile_orphaned_resources(facts);
+  ASSERT_TRUE(reconciled.ok()) << reconciled.error().message;
+  EXPECT_TRUE(reconciled.value().remaining_unreconciled_resources.empty());
+  auto admitted_intent = intent;
+  admitted_intent.request_context.request_id = RequestId("request.motion.after-reconciliation");
+  const auto admitted = kernel.execute(admitted_intent);
+  ASSERT_TRUE(admitted.ok()) << admitted.error().message;
+  EXPECT_EQ(engine.execute_calls, 1);
+}
+
+TEST(ResourceAddressedExecutionKernelTest,
+     ReplacementRecoveryReopensOnlyAReconciledResourceSubsetAndSkipsCleanClose) {
+  FakeClock clock;
+  FakeParticipantEngine motion_engine;
+  FakeParticipantEngine gripper_engine;
+  FakeOperationJournal journal;
+  const ProgramCommandSchemaRefDTO command_schema{
+      CommandSchemaId(std::string(kGripperPositionCommandSchemaId)),
+      CommandSchemaRevision(std::string(kGripperPositionCommandSchemaRevision))};
+  const auto motion =
+      make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular);
+  const auto gripper = make_binding("gripper", "gripper.target", "tool.gripper.command",
+                                    CoordinateKind::kLinear, command_schema);
+  journal.recovery =
+      OperationJournalRecoveryDTO{{},
+                                  {},
+                                  RequestOwnerEpoch("kernel.epoch.old"),
+                                  {ResourceId("robot.finger"), ResourceId("robot.joint_1")}};
+
+  {
+    ResourceAddressedExecutionKernel kernel(
+        {registration(motion, motion_engine), registration(gripper, gripper_engine)}, clock,
+        journal, {RequestOwnerEpoch("kernel.epoch.1"), CellId("cell.test"), 16U});
+    const auto snapshot = kernel.resource_table_snapshot();
+    auto facts =
+        orphan_reconciliation_facts(RequestOwnerEpoch("kernel.epoch.1"), CellId("cell.test"),
+                                    snapshot.operation_resource_generation, {motion},
+                                    {ResourceId("robot.joint_1")}, clock.now());
+    const auto reconciled = kernel.reconcile_orphaned_resources(facts);
+    ASSERT_TRUE(reconciled.ok()) << reconciled.error().message;
+    ASSERT_EQ(reconciled.value().remaining_unreconciled_resources,
+              std::vector<ResourceId>({ResourceId("robot.finger")}));
+
+    const auto motion_accepted =
+        kernel.execute(motion_operation("request.motion.reconciled-subset"));
+    ASSERT_TRUE(motion_accepted.ok()) << motion_accepted.error().message;
+    EXPECT_EQ(motion_engine.execute_calls, 1);
+
+    const auto gripper_rejected =
+        kernel.execute(command_operation("request.command.orphan-subset"));
+    ASSERT_FALSE(gripper_rejected.ok());
+    EXPECT_EQ(gripper_rejected.error().details.at("reason"), "resource_scope_busy");
+    EXPECT_EQ(gripper_engine.prepare_command_calls, 0);
+  }
+
+  EXPECT_EQ(std::count(journal.calls.begin(), journal.calls.end(), "owner_closed"), 0);
 }
 
 TEST(ResourceAddressedExecutionKernelTest,

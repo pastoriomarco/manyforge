@@ -1,5 +1,7 @@
 #include <algorithm>
 #include <cmath>
+#include <manyforge_content_identity/canonical_value.hpp>
+#include <manyforge_content_identity/content_identity.hpp>
 #include <manyforge_roboplan/retained_native_runtime.hpp>
 #include <map>
 #include <set>
@@ -10,6 +12,13 @@
 
 namespace manyforge::roboplan_backend {
 namespace {
+
+using manyforge::content_identity::CanonicalValue;
+
+inline constexpr std::string_view kNoActiveGoalEvidenceDomain =
+    "native-no-active-goal-evidence-digest";
+inline constexpr std::string_view kNoActiveGoalEvidenceApiVersion =
+    "manyforge.native-no-active-goal-evidence.v1";
 
 [[nodiscard]] RetainedObservedStateChannelConfig
 native_state_config(const core::RuntimeParticipantBinding &binding) {
@@ -314,32 +323,42 @@ stop_observation_resources(const core::RuntimeParticipantBinding &binding,
   return resources;
 }
 
+[[nodiscard]] RetainedNoActiveGoalEvidenceSource
+motion_goal_observer(core::IResolvedParticipantExecutionEngine *engine,
+                     core::RuntimeParticipantBinding binding);
+
+[[nodiscard]] RetainedNoActiveGoalEvidenceSource
+gripper_goal_observer(core::IResolvedParticipantExecutionEngine *engine,
+                      core::RuntimeParticipantBinding binding);
+
 [[nodiscard]] std::optional<RetainedStopSurveillanceSourceInput>
 stop_surveillance_source(
     const core::RuntimeParticipantBinding &binding,
     const std::optional<core::RuntimeParticipantStopReadiness> &readiness,
-    const std::shared_ptr<RetainedObservedStateChannel> &channel) {
-  if (!readiness.has_value() || channel == nullptr) {
+    const std::shared_ptr<RetainedObservedStateChannel> &channel,
+    RetainedNoActiveGoalEvidenceSource no_active_goal_evidence_source) {
+  if (channel == nullptr || !no_active_goal_evidence_source) {
     return std::nullopt;
   }
-  RetainedStopSurveillanceSourceInput result{binding, channel, {}};
-  const auto &plan = readiness->value().resolved_stop_base_plan;
-  for (const auto &stage : plan.escalation_stages) {
-    const auto resources = stop_observation_resources(binding, stage);
-    for (const auto &requirement : stage.evidence_requirements) {
-      if (requirement.requirement.evidence_kind !=
-              core::StopEvidenceRequirementKind::kMotionRest ||
-          requirement.resolved_source.source_kind !=
-              core::StopEvidenceSourceKind::kBindingStateAuthority) {
-        continue;
+  RetainedStopSurveillanceSourceInput result{
+      binding, channel, {}, std::move(no_active_goal_evidence_source)};
+  if (readiness.has_value()) {
+    const auto &plan = readiness->value().resolved_stop_base_plan;
+    for (const auto &stage : plan.escalation_stages) {
+      const auto resources = stop_observation_resources(binding, stage);
+      for (const auto &requirement : stage.evidence_requirements) {
+        if (requirement.requirement.evidence_kind !=
+                core::StopEvidenceRequirementKind::kMotionRest ||
+            requirement.resolved_source.source_kind !=
+                core::StopEvidenceSourceKind::kBindingStateAuthority) {
+          continue;
+        }
+        result.observation_sources.push_back(
+            RetainedStopSurveillanceObservationSource{
+                requirement.requirement, requirement.resolved_source,
+                resources});
       }
-      result.observation_sources.push_back(
-          RetainedStopSurveillanceObservationSource{
-              requirement.requirement, requirement.resolved_source, resources});
     }
-  }
-  if (result.observation_sources.empty()) {
-    return std::nullopt;
   }
   return result;
 }
@@ -353,16 +372,19 @@ stop_surveillance_sources(
     const std::optional<core::RuntimeParticipantBinding> &gripper_binding,
     const std::optional<core::RuntimeParticipantStopReadiness>
         &gripper_readiness,
-    const std::shared_ptr<RetainedObservedStateChannel> &gripper_channel) {
+    const std::shared_ptr<RetainedObservedStateChannel> &gripper_channel,
+    core::IResolvedParticipantExecutionEngine *engine) {
   std::vector<RetainedStopSurveillanceSourceInput> result;
-  if (auto motion = stop_surveillance_source(motion_binding, motion_readiness,
-                                             motion_channel);
+  if (auto motion = stop_surveillance_source(
+          motion_binding, motion_readiness, motion_channel,
+          motion_goal_observer(engine, motion_binding));
       motion.has_value()) {
     result.push_back(std::move(*motion));
   }
   if (gripper_binding.has_value()) {
     if (auto gripper = stop_surveillance_source(
-            *gripper_binding, gripper_readiness, gripper_channel);
+            *gripper_binding, gripper_readiness, gripper_channel,
+            gripper_goal_observer(engine, *gripper_binding));
         gripper.has_value()) {
       result.push_back(std::move(*gripper));
     }
@@ -441,6 +463,87 @@ template <typename Value>
       core::ErrorDTO{std::string(core::to_string(code)),
                      std::move(message),
                      {{"reason", std::move(reason)}}});
+}
+
+[[nodiscard]] core::ContentDigest no_active_goal_evidence_digest(
+    const core::RuntimeParticipantBinding &binding,
+    const std::string_view target_kind, const std::string_view state,
+    const std::uint64_t goal_id, const std::uint64_t goal_generation,
+    const std::string_view correlation, const std::int64_t observed_at_ns) {
+  const auto &value = binding.value();
+  const auto &path = *value.control_path;
+  const CanonicalValue evidence(CanonicalValue::Object{
+      {"command_target_id", CanonicalValue(value.command_target_id.value())},
+      {"controllable_component_id",
+       CanonicalValue(value.controllable_component_id.value())},
+      {"correlation", CanonicalValue(std::string(correlation))},
+      {"goal_generation", CanonicalValue(std::to_string(goal_generation))},
+      {"goal_id", CanonicalValue(std::to_string(goal_id))},
+      {"observed_at_ns", CanonicalValue(std::to_string(observed_at_ns))},
+      {"provider_runtime_epoch",
+       CanonicalValue(path.provider_runtime_epoch.value())},
+      {"provider_runtime_unit_id",
+       CanonicalValue(path.provider_runtime_unit_id.value())},
+      {"state", CanonicalValue(std::string(state))},
+      {"target_kind", CanonicalValue(std::string(target_kind))},
+  });
+  return core::ContentDigest(content_identity::framed_sha256(
+      kNoActiveGoalEvidenceDomain, kNoActiveGoalEvidenceApiVersion, evidence));
+}
+
+[[nodiscard]] RetainedNoActiveGoalEvidenceSource
+motion_goal_observer(core::IResolvedParticipantExecutionEngine *engine,
+                     core::RuntimeParticipantBinding binding) {
+  if (engine == nullptr || !binding.value().control_path.has_value())
+    return {};
+  return [engine,
+          binding = std::move(binding)](const std::int64_t observed_at_ns)
+             -> core::Result<core::ContentDigest> {
+    const auto status = engine->get_status();
+    const bool no_active_goal =
+        status.state == core::ExecutionState::kIdle ||
+        status.state == core::ExecutionState::kStopped ||
+        status.state == core::ExecutionState::kCompleted ||
+        status.state == core::ExecutionState::kFailed ||
+        status.state == core::ExecutionState::kInterventionRequired;
+    if (!no_active_goal) {
+      return route_publication_error<core::ContentDigest>(
+          "native_motion_goal_still_active",
+          "native motion target still has a nonterminal goal",
+          core::ErrorCode::kInvalidStateTransition);
+    }
+    return core::Result<core::ContentDigest>::Ok(no_active_goal_evidence_digest(
+        binding, "motion", core::to_string(status.state), status.execution_id,
+        0U, status.active_move_id, observed_at_ns));
+  };
+}
+
+[[nodiscard]] RetainedNoActiveGoalEvidenceSource
+gripper_goal_observer(core::IResolvedParticipantExecutionEngine *engine,
+                      core::RuntimeParticipantBinding binding) {
+  if (engine == nullptr || !binding.value().control_path.has_value())
+    return {};
+  return [engine,
+          binding = std::move(binding)](const std::int64_t observed_at_ns)
+             -> core::Result<core::ContentDigest> {
+    const auto target = binding.value().command_target_id.value();
+    const auto status = engine->get_gripper_status(target);
+    const bool no_active_goal =
+        status.gripper_id == target &&
+        (status.state == core::GripperCommandState::kIdle ||
+         status.state == core::GripperCommandState::kCompleted ||
+         status.state == core::GripperCommandState::kFailed);
+    if (!no_active_goal) {
+      return route_publication_error<core::ContentDigest>(
+          "native_gripper_goal_still_active",
+          "native gripper target still has a nonterminal goal",
+          core::ErrorCode::kInvalidStateTransition);
+    }
+    return core::Result<core::ContentDigest>::Ok(no_active_goal_evidence_digest(
+        binding, "gripper", core::gripper_command_state_name(status.state),
+        status.command_id, status.generation, status.gripper_id,
+        observed_at_ns));
+  };
 }
 
 [[nodiscard]] core::Result<core::RuntimeParticipantBinding>
@@ -1229,7 +1332,7 @@ RetainedNativeRuntime::PublishAndReadBackRouteConfiguration(
     }
     auto next_surveillance_sources = stop_surveillance_sources(
         next_motion, motion_readiness, motion_state_channel, next_gripper,
-        gripper_readiness, gripper_state_channel);
+        gripper_readiness, gripper_state_channel, participant_engine.get());
     if (stop_surveillance_owner != nullptr) {
       auto valid = RetainedStopSurveillanceOwner::ValidateSources(
           next_surveillance_sources);
@@ -1539,7 +1642,7 @@ RetainedNativeRuntime::AdoptAndReadBackRouteConfigurationPredecessor(
     if (stop_surveillance_owner != nullptr) {
       auto next_sources = stop_surveillance_sources(
           next_motion, motion_readiness, motion_state_channel, next_gripper,
-          gripper_readiness, gripper_state_channel);
+          gripper_readiness, gripper_state_channel, participant_engine.get());
       auto valid = RetainedStopSurveillanceOwner::ValidateSources(next_sources);
       if (!valid.ok()) {
         throw std::logic_error(
@@ -1559,6 +1662,68 @@ RetainedNativeRuntime::AdoptAndReadBackRouteConfigurationPredecessor(
     gripper_binding_aliases = std::move(next_gripper_aliases);
     participant_registrations = std::move(registrations);
     participant_resolver = std::move(kernel_resolver);
+
+    const auto slot_snapshot = addressed_kernel->resource_table_snapshot();
+    std::vector<core::ResourceId> orphan_resources;
+    const auto collect_domain_orphans =
+        [&](const core::RuntimeParticipantBinding &binding) {
+          const auto &value = binding.value();
+          if (!value.control_path.has_value() ||
+              value.control_path->control_domain_id !=
+                  configuration.control_domain_id) {
+            return;
+          }
+          for (const auto &resource : value.resources) {
+            const auto slot = std::lower_bound(
+                slot_snapshot.slots.begin(), slot_snapshot.slots.end(),
+                resource.resource_id,
+                [](const auto &row, const core::ResourceId &id) {
+                  return row.resource_id < id;
+                });
+            if (slot != slot_snapshot.slots.end() &&
+                slot->resource_id == resource.resource_id &&
+                slot->state == core::ResourceSlotState::
+                                   kUnreconciledExternalOrOrphanGoal) {
+              orphan_resources.push_back(resource.resource_id);
+            }
+          }
+        };
+    collect_domain_orphans(motion_binding);
+    if (gripper_binding.has_value()) {
+      collect_domain_orphans(*gripper_binding);
+    }
+    std::sort(orphan_resources.begin(), orphan_resources.end());
+    orphan_resources.erase(
+        std::unique(orphan_resources.begin(), orphan_resources.end()),
+        orphan_resources.end());
+    if (!orphan_resources.empty()) {
+      if (stop_surveillance_owner == nullptr ||
+          !addressed_request_owner_epoch.has_value() ||
+          !addressed_cell_id.has_value()) {
+        return route_publication_error<
+            core::RuntimeRouteConfigurationReadbackDTO>(
+            "route_predecessor_orphan_reconciliation_owner_missing",
+            "native predecessor has no command-free orphan reconciliation "
+            "owner",
+            core::ErrorCode::kMissingReference);
+      }
+      const auto assessed_at_ns = clock->now();
+      auto facts =
+          stop_surveillance_owner->BuildOrphanResourceReconciliationFacts(
+              *addressed_request_owner_epoch, *addressed_cell_id,
+              slot_snapshot.operation_resource_generation, orphan_resources,
+              assessed_at_ns);
+      if (!facts.ok()) {
+        return core::Result<core::RuntimeRouteConfigurationReadbackDTO>::Err(
+            facts.error());
+      }
+      auto reconciled =
+          addressed_kernel->reconcile_orphaned_resources(facts.value());
+      if (!reconciled.ok()) {
+        return core::Result<core::RuntimeRouteConfigurationReadbackDTO>::Err(
+            reconciled.error());
+      }
+    }
     return readback;
   } catch (const std::exception &exception) {
     return route_publication_error<core::RuntimeRouteConfigurationReadbackDTO>(
@@ -1585,93 +1750,93 @@ void attach_retained_native_addressed_owner(
     throw std::invalid_argument(
         "native addressed-owner attachment is incomplete or duplicated");
   }
+  const core::RequestOwnerEpoch kernel_request_owner_epoch =
+      config.request_owner_epoch;
   const core::CellId kernel_cell_id = config.cell_id;
   runtime->operation_journal = std::make_unique<core::SqliteOperationJournal>(
       std::move(config.operation_journal_path), std::move(config.cell_id));
   try {
     std::optional<core::StopSurveillanceExecutionConfig>
         stop_surveillance_config;
-    core::StopFaultRecoveryFactsResolver recovery_facts_resolver;
+    runtime->stop_surveillance_owner =
+        std::make_unique<RetainedStopSurveillanceOwner>(
+            stop_surveillance_sources(
+                runtime->motion_binding,
+                readiness_for(runtime->participant_registrations,
+                              runtime->motion_binding),
+                runtime->motion_state_channel, runtime->gripper_binding,
+                runtime->gripper_binding.has_value()
+                    ? readiness_for(runtime->participant_registrations,
+                                    *runtime->gripper_binding)
+                    : std::nullopt,
+                runtime->gripper_state_channel,
+                runtime->participant_engine.get()));
     if (runtime->stop_surveillance_policy.has_value()) {
-      runtime->stop_surveillance_owner =
-          std::make_unique<RetainedStopSurveillanceOwner>(
-              stop_surveillance_sources(
-                  runtime->motion_binding,
-                  readiness_for(runtime->participant_registrations,
-                                runtime->motion_binding),
-                  runtime->motion_state_channel, runtime->gripper_binding,
-                  runtime->gripper_binding.has_value()
-                      ? readiness_for(runtime->participant_registrations,
-                                      *runtime->gripper_binding)
-                      : std::nullopt,
-                  runtime->gripper_state_channel));
       stop_surveillance_config = core::StopSurveillanceExecutionConfig{
           runtime->scheduler.get(), runtime->stop_surveillance_owner.get(),
           *runtime->stop_surveillance_policy};
-      auto *const runtime_owner = runtime.get();
-      auto *const admission_gate = config.operation_admission_gate;
-      recovery_facts_resolver =
-          [runtime_owner, admission_gate](const core::StopStatusDTO &status,
-                                          const std::int64_t assessed_at_ns)
-          -> core::Result<core::StopFaultRecoveryFactsDTO> {
-        if (runtime_owner->stop_surveillance_owner == nullptr ||
-            runtime_owner->addressed_kernel == nullptr ||
-            !status.fault_latch.has_value()) {
-          return core::Result<core::StopFaultRecoveryFactsDTO>::Err(
-              core::ErrorDTO{
-                  std::string(
-                      core::to_string(core::ErrorCode::kMissingReference)),
-                  "native Stop recovery owner is unavailable",
-                  {{"reason", "native_stop_recovery_owner_unavailable"}}});
-        }
-        auto facts = runtime_owner->stop_surveillance_owner->BuildRecoveryFacts(
-            status, assessed_at_ns);
-        if (!facts.ok())
-          return facts;
-        const auto &latch = *status.fault_latch;
-        for (const auto &slot :
-             runtime_owner->addressed_kernel->resource_snapshot()) {
-          if (!std::binary_search(latch.captured_resources.begin(),
-                                  latch.captured_resources.end(),
-                                  slot.resource_id)) {
-            continue;
-          }
-          const bool unresolved =
-              slot.state ==
-                  core::ResourceSlotState::kUnreconciledExternalOrOrphanGoal ||
-              slot.state == core::ResourceSlotState::kReserved ||
-              slot.state == core::ResourceSlotState::kDispatched ||
-              slot.state == core::ResourceSlotState::kStopping ||
-              (slot.state == core::ResourceSlotState::kTerminal &&
-               slot.stop_generation > latch.stop_generation);
-          if (unresolved) {
-            facts.value().fenced_or_orphan_resources.push_back(
-                slot.resource_id);
-          }
-        }
-        if (admission_gate != nullptr) {
-          auto fenced = admission_gate->current_fenced_resources(
-              latch.captured_resources);
-          facts.value().fenced_or_orphan_resources.insert(
-              facts.value().fenced_or_orphan_resources.end(), fenced.begin(),
-              fenced.end());
-        }
-        auto &blocked = facts.value().fenced_or_orphan_resources;
-        std::sort(blocked.begin(), blocked.end());
-        blocked.erase(std::unique(blocked.begin(), blocked.end()),
-                      blocked.end());
-        if (core::stop_fault_recovery_facts_field_error(facts.value())
-                .has_value()) {
-          return core::Result<core::StopFaultRecoveryFactsDTO>::Err(
-              core::ErrorDTO{
-                  std::string(
-                      core::to_string(core::ErrorCode::kInvariantViolation)),
-                  "native Stop recovery facts failed Kernel blocker join",
-                  {{"reason", "native_stop_recovery_blocker_join_invalid"}}});
-        }
-        return facts;
-      };
     }
+    auto *const runtime_owner = runtime.get();
+    auto *const admission_gate = config.operation_admission_gate;
+    core::StopFaultRecoveryFactsResolver recovery_facts_resolver =
+        [runtime_owner, admission_gate](const core::StopStatusDTO &status,
+                                        const std::int64_t assessed_at_ns)
+        -> core::Result<core::StopFaultRecoveryFactsDTO> {
+      if (runtime_owner->stop_surveillance_owner == nullptr ||
+          runtime_owner->addressed_kernel == nullptr ||
+          !status.fault_latch.has_value()) {
+        return core::Result<core::StopFaultRecoveryFactsDTO>::Err(
+            core::ErrorDTO{
+                std::string(
+                    core::to_string(core::ErrorCode::kMissingReference)),
+                "native Stop recovery owner is unavailable",
+                {{"reason", "native_stop_recovery_owner_unavailable"}}});
+      }
+      auto facts = runtime_owner->stop_surveillance_owner->BuildRecoveryFacts(
+          status, assessed_at_ns);
+      if (!facts.ok())
+        return facts;
+      const auto &latch = *status.fault_latch;
+      for (const auto &slot :
+           runtime_owner->addressed_kernel->resource_snapshot()) {
+        if (!std::binary_search(latch.captured_resources.begin(),
+                                latch.captured_resources.end(),
+                                slot.resource_id)) {
+          continue;
+        }
+        const bool unresolved =
+            slot.state ==
+                core::ResourceSlotState::kUnreconciledExternalOrOrphanGoal ||
+            slot.state == core::ResourceSlotState::kReserved ||
+            slot.state == core::ResourceSlotState::kDispatched ||
+            slot.state == core::ResourceSlotState::kStopping ||
+            (slot.state == core::ResourceSlotState::kTerminal &&
+             slot.stop_generation > latch.stop_generation);
+        if (unresolved) {
+          facts.value().fenced_or_orphan_resources.push_back(slot.resource_id);
+        }
+      }
+      if (admission_gate != nullptr) {
+        auto fenced =
+            admission_gate->current_fenced_resources(latch.captured_resources);
+        facts.value().fenced_or_orphan_resources.insert(
+            facts.value().fenced_or_orphan_resources.end(), fenced.begin(),
+            fenced.end());
+      }
+      auto &blocked = facts.value().fenced_or_orphan_resources;
+      std::sort(blocked.begin(), blocked.end());
+      blocked.erase(std::unique(blocked.begin(), blocked.end()), blocked.end());
+      if (core::stop_fault_recovery_facts_field_error(facts.value())
+              .has_value()) {
+        return core::Result<core::StopFaultRecoveryFactsDTO>::Err(
+            core::ErrorDTO{
+                std::string(
+                    core::to_string(core::ErrorCode::kInvariantViolation)),
+                "native Stop recovery facts failed Kernel blocker join",
+                {{"reason", "native_stop_recovery_blocker_join_invalid"}}});
+      }
+      return facts;
+    };
     runtime->addressed_kernel =
         std::make_unique<core::ResourceAddressedExecutionKernel>(
             runtime->participant_registrations, *runtime->clock,
@@ -1686,6 +1851,8 @@ void attach_retained_native_addressed_owner(
                 core::kMaximumEmergencyStopCorrelationEntries, 0U, 0U,
                 std::move(stop_surveillance_config),
                 std::move(recovery_facts_resolver)});
+    runtime->addressed_request_owner_epoch = kernel_request_owner_epoch;
+    runtime->addressed_cell_id = kernel_cell_id;
   } catch (...) {
     runtime->stop_surveillance_owner.reset();
     runtime->operation_journal.reset();

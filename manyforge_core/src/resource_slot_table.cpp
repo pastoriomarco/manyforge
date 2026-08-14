@@ -775,6 +775,47 @@ Result<void> ResourceSlotTable::mark_unreconciled_external_or_orphan_goal(
   return Result<void>::Ok();
 }
 
+Result<std::uint64_t> ResourceSlotTable::reconcile_unreconciled_external_or_orphan_goal(
+    const std::uint64_t expected_operation_resource_generation,
+    const std::vector<ResourceId>& resources) {
+  std::lock_guard lock(*admission_mutex_);
+  if (expected_operation_resource_generation != operation_resource_generation_) {
+    return Result<std::uint64_t>::Err(
+        ErrorDTO{std::string(to_string(ErrorCode::kInvalidStateTransition)),
+                 "orphan-resource reconciliation names a stale slot-table generation",
+                 {{"reason", "resource_orphan_reconciliation_generation_stale"}}});
+  }
+  if (!std::is_sorted(resources.begin(), resources.end())) {
+    return Result<std::uint64_t>::Err(
+        ErrorDTO{std::string(to_string(ErrorCode::kInvalidRequest)),
+                 "orphan-resource reconciliation scope is not canonical",
+                 {{"reason", "resource_orphan_reconciliation_scope_noncanonical"}}});
+  }
+  std::vector<std::size_t> indices;
+  auto validation = validate_resource_set_locked(resources, indices);
+  if (!validation.ok()) {
+    return Result<std::uint64_t>::Err(validation.error());
+  }
+  for (const auto index : indices) {
+    if (slots_[index].state != ResourceSlotState::kUnreconciledExternalOrOrphanGoal ||
+        slots_[index].owner.has_value()) {
+      return Result<std::uint64_t>::Err(
+          ErrorDTO{std::string(to_string(ErrorCode::kInvalidStateTransition)),
+                   "orphan-resource reconciliation requires an exact unowned orphan row",
+                   {{"reason", "resource_orphan_reconciliation_state_invalid"}}});
+    }
+  }
+  auto generation = require_generation_available_locked();
+  if (!generation.ok()) {
+    return Result<std::uint64_t>::Err(generation.error());
+  }
+  for (const auto index : indices) {
+    slots_[index].state = ResourceSlotState::kFree;
+  }
+  advance_generation_locked();
+  return Result<std::uint64_t>::Ok(operation_resource_generation_);
+}
+
 Result<void> ResourceSlotTable::reconfigure_runtime_inventory(
     std::vector<ResourceId> resources,
     std::vector<DomainActiveControlConfigurationDTO> active_control_configurations) {

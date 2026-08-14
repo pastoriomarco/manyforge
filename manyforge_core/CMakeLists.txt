@@ -108,6 +108,7 @@ add_library(manyforge_core
   src/stop_intent.cpp
   src/stop_scope_resolver.cpp
   src/stop_fault_recovery.cpp
+  src/orphan_resource_reconciliation.cpp
   src/stop_surveillance.cpp
   src/stop_terminal_reducer.cpp
   src/stop_terminal_state.cpp

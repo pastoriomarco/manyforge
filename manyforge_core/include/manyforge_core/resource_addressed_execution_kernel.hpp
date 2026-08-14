@@ -8,6 +8,7 @@
 #include <manyforge_core/bounded_stop_control_executor.hpp>
 #include <manyforge_core/bounded_stop_stage_attempt_executor.hpp>
 #include <manyforge_core/emergency_stop_acceptance_reserve.hpp>
+#include <manyforge_core/orphan_resource_reconciliation.hpp>
 #include <manyforge_core/ports/iaddressed_motion_preview.hpp>
 #include <manyforge_core/ports/iaddressed_operation_owner.hpp>
 #include <manyforge_core/ports/icontrol_domain_execution_port.hpp>
@@ -267,6 +268,18 @@ class ResourceAddressedExecutionKernel final : public IAddressedOperationOwner,
   [[nodiscard]] Result<void> reconcile_subordinate_state() override;
 
   [[nodiscard]] std::vector<ResourceSlotSnapshotDTO> resource_snapshot() const;
+
+  /// One coherent generation-stamped read used by the private runtime
+  /// reconciliation owner. Public callers cannot mutate or release slots from
+  /// this projection.
+  [[nodiscard]] ResourceSlotTableSnapshotDTO resource_table_snapshot() const;
+
+  /// Command-free, process-local release of an exact subset of durable
+  /// orphan-resource fences. Facts come only from the installed runtime owner;
+  /// the Kernel independently joins them to its current binding, route, and
+  /// slot generation before one atomic release.
+  [[nodiscard]] Result<OrphanResourceReconciliationResultDTO> reconcile_orphaned_resources(
+      const OrphanResourceReconciliationFactsDTO& facts);
 
   /// Atomically select a verified candidate participant set while preserving
   /// the stable addressed owner, operation journal, replay ledgers, and any

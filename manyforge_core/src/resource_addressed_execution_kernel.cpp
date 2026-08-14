@@ -2270,7 +2270,6 @@ ResourceAddressedExecutionKernel::ResourceAddressedExecutionKernel(
       // reconstructed or redispatched. BeginOwnerEpoch supplies the complete
       // current inventory fence for an unclosed predecessor; keep motion
       // admission closed until the separate reconciliation owner clears it.
-      motion_admission_closed_ = true;
       motion_admission_unreconciled_ = true;
       continue;
     }
@@ -2364,11 +2363,9 @@ ResourceAddressedExecutionKernel::ResourceAddressedExecutionKernel(
     }
   }
   if (recovery.value().replaced_unclosed_owner_epoch.has_value()) {
-    motion_admission_closed_ = true;
     motion_admission_unreconciled_ = true;
   }
   if (!recovery.value().unreconciled_resources.empty()) {
-    motion_admission_closed_ = true;
     motion_admission_unreconciled_ = true;
     auto marked = resource_slots_->mark_unreconciled_external_or_orphan_goal(
         recovery.value().unreconciled_resources);
@@ -2470,9 +2467,16 @@ ResourceAddressedExecutionKernel::~ResourceAddressedExecutionKernel() {
   // atomically prove that all operations and Stop projections are terminal.
   // A rejection or storage failure deliberately leaves the epoch unclosed;
   // the next owner then performs conservative complete-inventory recovery.
-  try {
-    static_cast<void>(journal_.CloseOwnerEpoch(config_.request_owner_epoch, clock_.now()));
-  } catch (...) {
+  bool orphan_reconciliation_complete = false;
+  {
+    std::lock_guard state_lock(state_mutex_);
+    orphan_reconciliation_complete = !motion_admission_unreconciled_;
+  }
+  if (orphan_reconciliation_complete) {
+    try {
+      static_cast<void>(journal_.CloseOwnerEpoch(config_.request_owner_epoch, clock_.now()));
+    } catch (...) {
+    }
   }
   for (const auto& subscription : engine_subscriptions_) {
     subscription.engine->unsubscribe_events(subscription.handle);
@@ -6013,7 +6017,10 @@ Result<StopFaultRecoveryResultDTO> ResourceAddressedExecutionKernel::recover_sto
   active_stop_fault_latch_ = evaluated.value().result.latch;
   stop_fault_recovery_replay_ledger_.push_back(
       StopFaultRecoveryReplayEntry{intent, evaluated.value().result});
-  motion_admission_closed_ = motion_admission_unreconciled_;
+  // Orphan fences are resource-scoped and enforced by the slot table. A
+  // successful durable fault clear removes the cell-wide Stop latch without
+  // weakening any remaining orphan resource.
+  motion_admission_closed_ = false;
   return Result<StopFaultRecoveryResultDTO>::Ok(std::move(evaluated.value().result));
 }
 
@@ -10428,6 +10435,133 @@ Result<void> ResourceAddressedExecutionKernel::reconcile_subordinate_state() {
 
 std::vector<ResourceSlotSnapshotDTO> ResourceAddressedExecutionKernel::resource_snapshot() const {
   return resource_slots_->snapshot();
+}
+
+ResourceSlotTableSnapshotDTO ResourceAddressedExecutionKernel::resource_table_snapshot() const {
+  return resource_slots_->coherent_snapshot();
+}
+
+Result<OrphanResourceReconciliationResultDTO>
+ResourceAddressedExecutionKernel::reconcile_orphaned_resources(
+    const OrphanResourceReconciliationFactsDTO& facts) {
+  if (orphan_resource_reconciliation_facts_field_error(facts).has_value()) {
+    return reject<OrphanResourceReconciliationResultDTO>(
+        "orphan-resource reconciliation facts are invalid",
+        "orphan_resource_reconciliation_facts_invalid", ErrorCode::kInvalidRequest);
+  }
+
+  std::lock_guard submit_lock(submission_mutex_);
+  std::lock_guard state_lock(state_mutex_);
+  if (facts.request_owner_epoch != config_.request_owner_epoch ||
+      facts.cell_id != config_.cell_id || !stop_retained_bundle_id_.has_value() ||
+      !stop_graph_revision_.has_value() || facts.retained_bundle_id != *stop_retained_bundle_id_ ||
+      facts.graph_revision != *stop_graph_revision_) {
+    return reject<OrphanResourceReconciliationResultDTO>(
+        "orphan-resource reconciliation crosses current Kernel identity",
+        "orphan_resource_reconciliation_identity_mismatch", ErrorCode::kInvalidStateTransition);
+  }
+
+  const auto snapshot = resource_slots_->coherent_snapshot();
+  if (snapshot.operation_resource_generation != facts.expected_operation_resource_generation) {
+    return reject<OrphanResourceReconciliationResultDTO>(
+        "orphan-resource reconciliation names a stale slot generation",
+        "orphan_resource_reconciliation_generation_stale", ErrorCode::kInvalidStateTransition);
+  }
+  const auto configurations = resource_slots_->admission_snapshot({}).active_control_configurations;
+  const auto now_ns = clock_.now();
+  if (now_ns < facts.assessed_at_ns) {
+    return reject<OrphanResourceReconciliationResultDTO>(
+        "orphan-resource reconciliation was assessed in the future",
+        "orphan_resource_reconciliation_time_invalid", ErrorCode::kInvalidRequest);
+  }
+  const auto elapsed_ns = now_ns - facts.assessed_at_ns;
+  std::vector<ResourceId> resources;
+  resources.reserve(facts.resources.size());
+  for (const auto& fact : facts.resources) {
+    const auto slot = std::lower_bound(
+        snapshot.slots.begin(), snapshot.slots.end(), fact.resource_id,
+        [](const auto& row, const ResourceId& resource) { return row.resource_id < resource; });
+    if (slot == snapshot.slots.end() || slot->resource_id != fact.resource_id ||
+        slot->state != ResourceSlotState::kUnreconciledExternalOrOrphanGoal ||
+        slot->owner.has_value() || !fact.settlement.source_age_ns.has_value() ||
+        !fact.settlement.freshness_budget_ns.has_value() ||
+        elapsed_ns > *fact.settlement.freshness_budget_ns - *fact.settlement.source_age_ns) {
+      return reject<OrphanResourceReconciliationResultDTO>(
+          "orphan-resource reconciliation is stale or does not name a current orphan row",
+          "orphan_resource_reconciliation_scope_or_freshness_changed",
+          ErrorCode::kInvalidStateTransition);
+    }
+
+    bool matched = false;
+    for (const auto& registration : registrations_) {
+      const auto& binding = registration.binding.value();
+      const bool contains = std::any_of(
+          binding.resources.begin(), binding.resources.end(),
+          [&](const auto& resource) { return resource.resource_id == fact.resource_id; });
+      if (!contains) {
+        continue;
+      }
+      if (!binding.control_path.has_value()) {
+        return reject<OrphanResourceReconciliationResultDTO>(
+            "orphan resource has no exact current control path",
+            "orphan_resource_reconciliation_binding_missing", ErrorCode::kInvariantViolation);
+      }
+      const auto& path = *binding.control_path;
+      const bool exact =
+          binding.controllable_component_id == fact.controllable_component_id &&
+          binding.command_target_id == fact.command_target_id &&
+          path.control_domain_id == fact.control_domain_id &&
+          path.control_binding_id == fact.control_binding_id &&
+          path.control_binding_revision == fact.control_binding_revision &&
+          path.active_control_configuration_id == fact.active_control_configuration_id &&
+          path.active_control_configuration_generation ==
+              fact.active_control_configuration_generation &&
+          path.provider_runtime_unit_id == fact.provider_runtime_unit_id &&
+          path.provider_runtime_epoch == fact.provider_runtime_epoch &&
+          fact.settlement.source_epoch == std::optional<RuntimeEpoch>(path.provider_runtime_epoch);
+      if (!exact) {
+        return reject<OrphanResourceReconciliationResultDTO>(
+            "orphan-resource reconciliation differs from a current binding",
+            "orphan_resource_reconciliation_binding_mismatch", ErrorCode::kInvalidStateTransition);
+      }
+      matched = true;
+    }
+    const auto configuration =
+        std::lower_bound(configurations.begin(), configurations.end(), fact.control_domain_id,
+                         [](const auto& row, const ControlDomainId& domain) {
+                           return row.control_domain_id < domain;
+                         });
+    if (!matched || configuration == configurations.end() ||
+        configuration->control_domain_id != fact.control_domain_id ||
+        configuration->active_control_configuration_id != fact.active_control_configuration_id ||
+        configuration->active_control_configuration_generation !=
+            fact.active_control_configuration_generation) {
+      return reject<OrphanResourceReconciliationResultDTO>(
+          "orphan-resource reconciliation differs from current route truth",
+          "orphan_resource_reconciliation_configuration_mismatch",
+          ErrorCode::kInvalidStateTransition);
+    }
+    resources.push_back(fact.resource_id);
+  }
+
+  auto reconciled = resource_slots_->reconcile_unreconciled_external_or_orphan_goal(
+      facts.expected_operation_resource_generation, resources);
+  if (!reconciled.ok()) {
+    return Result<OrphanResourceReconciliationResultDTO>::Err(reconciled.error());
+  }
+  std::vector<ResourceId> remaining;
+  for (const auto& slot : resource_slots_->snapshot()) {
+    if (slot.state == ResourceSlotState::kUnreconciledExternalOrOrphanGoal) {
+      remaining.push_back(slot.resource_id);
+    }
+  }
+  motion_admission_unreconciled_ = !remaining.empty();
+  OrphanResourceReconciliationResultDTO result{std::move(resources), std::move(remaining),
+                                               reconciled.value()};
+  if (orphan_resource_reconciliation_result_field_error(result).has_value()) {
+    std::terminate();
+  }
+  return Result<OrphanResourceReconciliationResultDTO>::Ok(std::move(result));
 }
 
 }  // namespace manyforge::core

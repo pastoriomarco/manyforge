@@ -23,6 +23,14 @@ inline constexpr std::string_view kConfigurationEvidenceDomain =
     "stop-fault-recovery-configuration-evidence-digest";
 inline constexpr std::string_view kConfigurationEvidenceApiVersion =
     "manyforge.stop-fault-recovery-configuration-evidence.v1";
+inline constexpr std::string_view kCurrentResourceEvidenceDomain =
+    "native-current-resource-evidence-digest";
+inline constexpr std::string_view kCurrentResourceEvidenceApiVersion =
+    "manyforge.native-current-resource-evidence.v1";
+inline constexpr std::string_view kExternalReconciliationEvidenceDomain =
+    "stop-fault-external-reconciliation-evidence-digest";
+inline constexpr std::string_view kExternalReconciliationEvidenceApiVersion =
+    "manyforge.stop-fault-external-reconciliation-evidence.v1";
 
 [[nodiscard]] core::ErrorDTO error(std::string code, std::string message) {
   return core::ErrorDTO{std::move(code), std::move(message), {}};
@@ -76,7 +84,10 @@ binding_resources(const core::RuntimeParticipantBinding &binding) {
 
 [[nodiscard]] bool
 source_input_valid(const RetainedStopSurveillanceSourceInput &source) {
-  if (!source.state_channel || source.observation_sources.empty())
+  if (!source.state_channel ||
+      !source.binding.value().control_path.has_value() ||
+      (source.observation_sources.empty() &&
+       !source.no_active_goal_evidence_source))
     return false;
   const auto &context = source.state_channel->query_context();
   auto expected = core::make_observed_state_query_context(
@@ -207,6 +218,64 @@ resource_evidence_digest(const core::StopSurveillanceObservationQueryDTO &query,
       kConfigurationEvidenceDomain, kConfigurationEvidenceApiVersion, value));
 }
 
+[[nodiscard]] core::ContentDigest current_resource_evidence_digest(
+    const core::OrphanResourceReconciliationFactDTO &fact,
+    const core::ObservedStateSnapshotDTO &snapshot,
+    const core::ContentDigest &no_active_goal_evidence_digest,
+    const core::ContentDigest &configuration_digest,
+    const std::int64_t assessed_at_ns) {
+  const CanonicalValue value(CanonicalValue::Object{
+      {"active_control_configuration_generation",
+       CanonicalValue(std::to_string(
+           fact.active_control_configuration_generation.value()))},
+      {"active_control_configuration_id",
+       CanonicalValue(fact.active_control_configuration_id.value())},
+      {"assessed_at_ns", CanonicalValue(std::to_string(assessed_at_ns))},
+      {"configuration_evidence_digest",
+       CanonicalValue(configuration_digest.value())},
+      {"control_binding_id", CanonicalValue(fact.control_binding_id.value())},
+      {"control_binding_revision",
+       CanonicalValue(fact.control_binding_revision.value())},
+      {"control_domain_id", CanonicalValue(fact.control_domain_id.value())},
+      {"no_active_goal_evidence_digest",
+       CanonicalValue(no_active_goal_evidence_digest.value())},
+      {"provider_runtime_epoch",
+       CanonicalValue(fact.provider_runtime_epoch.value())},
+      {"provider_runtime_unit_id",
+       CanonicalValue(fact.provider_runtime_unit_id.value())},
+      {"resource_id", CanonicalValue(fact.resource_id.value())},
+      {"source_epoch", CanonicalValue(snapshot.source_epoch.value())},
+      {"source_sequence", CanonicalValue(std::to_string(snapshot.sequence))},
+  });
+  return core::ContentDigest(content_identity::framed_sha256(
+      kCurrentResourceEvidenceDomain, kCurrentResourceEvidenceApiVersion,
+      value));
+}
+
+[[nodiscard]] core::ContentDigest external_reconciliation_evidence_digest(
+    const core::StopFaultLatchDTO &latch, const core::ResourceId &resource,
+    const core::ContentDigest &settlement_digest,
+    const core::ContentDigest &no_active_goal_digest,
+    const core::ContentDigest &configuration_digest) {
+  const CanonicalValue value(CanonicalValue::Object{
+      {"configuration_evidence_digest",
+       CanonicalValue(configuration_digest.value())},
+      {"latch_generation",
+       CanonicalValue(std::to_string(latch.latch_generation.value()))},
+      {"latch_id", CanonicalValue(latch.latch_id.value())},
+      {"no_active_goal_evidence_digest",
+       CanonicalValue(no_active_goal_digest.value())},
+      {"resource_id", CanonicalValue(resource.value())},
+      {"settlement_evidence_digest", CanonicalValue(settlement_digest.value())},
+      {"stop_generation",
+       CanonicalValue(std::to_string(latch.stop_generation.value()))},
+      {"stop_id", CanonicalValue(latch.stop_id.value())},
+  });
+  return core::ContentDigest(content_identity::framed_sha256(
+      kExternalReconciliationEvidenceDomain,
+      kExternalReconciliationEvidenceApiVersion, value));
+}
+
 struct SelectedSource final {
   std::shared_ptr<IRetainedObservedStateChannel> channel;
   RetainedStopSurveillanceObservationSource observation;
@@ -253,6 +322,79 @@ struct SelectedSource final {
     }
   }
   return true;
+}
+
+struct CurrentQuiescenceObservation final {
+  core::ObservedStateSnapshotDTO snapshot;
+  std::int64_t source_age_ns{};
+  core::ContentDigest no_active_goal_evidence_digest;
+  core::ContentDigest configuration_evidence_digest;
+};
+
+[[nodiscard]] core::Result<CurrentQuiescenceObservation>
+observe_current_quiescence(const RetainedStopSurveillanceSourceInput &source,
+                           const std::vector<core::ResourceId> &resources,
+                           const std::int64_t assessed_at_ns) {
+  if (!source.no_active_goal_evidence_source || resources.empty()) {
+    return invalid<CurrentQuiescenceObservation>(
+        "native_no_active_goal_source_missing",
+        "native current-resource proof has no goal-activity source");
+  }
+  auto observed = source.state_channel->current_state(assessed_at_ns);
+  if (!observed.ok()) {
+    return core::Result<CurrentQuiescenceObservation>::Err(observed.error());
+  }
+  const auto &snapshot = observed.value();
+  const auto &context = source.state_channel->query_context();
+  if (!core::validate_observed_state_snapshot(snapshot, assessed_at_ns).ok() ||
+      !snapshot_matches_context(snapshot, context) ||
+      assessed_at_ns < snapshot.received_timestamp_ns) {
+    return invalid<CurrentQuiescenceObservation>(
+        "native_current_resource_identity_mismatch",
+        "native current-resource state differs from its retained source");
+  }
+  const auto age_ns = assessed_at_ns - snapshot.received_timestamp_ns;
+  if (age_ns > kRetainedNativeReconciliationFreshnessBudgetNs) {
+    return invalid<CurrentQuiescenceObservation>(
+        "native_current_resource_state_stale",
+        "native current-resource state is too old for reconciliation");
+  }
+  for (const auto &resource : resources) {
+    const auto found = std::find(snapshot.resources.begin(),
+                                 snapshot.resources.end(), resource);
+    if (found == snapshot.resources.end() || !snapshot.velocities.has_value()) {
+      return invalid<CurrentQuiescenceObservation>(
+          "native_current_resource_state_incomplete",
+          "native current-resource state omits a requested velocity");
+    }
+    const auto index =
+        static_cast<std::size_t>(found - snapshot.resources.begin());
+    if (std::abs(velocity_value((*snapshot.velocities)[index])) > 0.0) {
+      return invalid<CurrentQuiescenceObservation>(
+          "native_current_resource_not_quiescent",
+          "native current-resource state still reports motion");
+    }
+  }
+  auto no_active_goal = source.no_active_goal_evidence_source(assessed_at_ns);
+  if (!no_active_goal.ok()) {
+    return core::Result<CurrentQuiescenceObservation>::Err(
+        no_active_goal.error());
+  }
+  if (!content_identity::is_sha256_digest(no_active_goal.value().value())) {
+    return invalid<CurrentQuiescenceObservation>(
+        "native_no_active_goal_evidence_invalid",
+        "native goal-activity source returned an invalid digest");
+  }
+  const auto &value = source.binding.value();
+  const auto &path = *value.control_path;
+  const core::StopFaultRecoveryConfigurationExpectationDTO configuration{
+      path.control_domain_id, path.active_control_configuration_id,
+      path.active_control_configuration_generation};
+  return core::Result<CurrentQuiescenceObservation>::Ok(
+      CurrentQuiescenceObservation{
+          snapshot, age_ns, std::move(no_active_goal.value()),
+          configuration_evidence_digest(configuration, value.retained_bundle_id,
+                                        value.graph_revision)});
 }
 
 [[nodiscard]] std::optional<SelectedSource>
@@ -393,7 +535,14 @@ RetainedStopSurveillanceOwner::RetainedStopSurveillanceOwner(
 
 core::Result<void> RetainedStopSurveillanceOwner::ValidateSources(
     const std::vector<RetainedStopSurveillanceSourceInput> &sources) {
+  if (sources.empty() ||
+      sources.size() > core::kMaximumOrphanResourceReconciliationFacts) {
+    return invalid<void>("native_stop_surveillance_sources_empty_or_oversized",
+                         "native Stop source table is empty or oversized");
+  }
   std::size_t source_count = 0U;
+  std::set<core::ResourceId> physical_resources;
+  const auto &first = sources.front().binding.value();
   for (const auto &source : sources) {
     if (source.observation_sources.size() >
         core::kMaximumStopSurveillanceSources - source_count) {
@@ -402,6 +551,20 @@ core::Result<void> RetainedStopSurveillanceOwner::ValidateSources(
           "native Stop surveillance source table is oversized");
     }
     source_count += source.observation_sources.size();
+    const auto &value = source.binding.value();
+    if (value.retained_bundle_id != first.retained_bundle_id ||
+        value.graph_revision != first.graph_revision) {
+      return invalid<void>(
+          "native_stop_surveillance_source_graph_mismatch",
+          "native Stop sources cross a retained bundle or graph");
+    }
+    for (const auto &resource : value.resources) {
+      if (!physical_resources.insert(resource.resource_id).second) {
+        return invalid<void>(
+            "native_stop_surveillance_resource_ambiguous",
+            "native Stop sources overlap one physical resource");
+      }
+    }
   }
   if (!std::all_of(sources.begin(), sources.end(), source_input_valid)) {
     return invalid<void>("native_stop_surveillance_sources_invalid",
@@ -640,6 +803,49 @@ RetainedStopSurveillanceOwner::BuildRecoveryFacts(
                      : std::nullopt});
     }
 
+    std::vector<core::StopFaultRecoveryResourceFactDTO> external_facts;
+    if (latch.trigger == core::StopFaultTriggerDTO::kFailedUncontained) {
+      for (const auto &source : sources) {
+        std::vector<core::ResourceId> selected_resources;
+        for (const auto &resource : binding_resources(source.binding)) {
+          if (std::binary_search(latch.captured_resources.begin(),
+                                 latch.captured_resources.end(), resource)) {
+            selected_resources.push_back(resource);
+          }
+        }
+        if (selected_resources.empty())
+          continue;
+        auto quiescence = observe_current_quiescence(source, selected_resources,
+                                                     assessed_at_ns);
+        if (!quiescence.ok())
+          continue;
+        for (const auto &resource : selected_resources) {
+          const auto settlement = resource_facts.find(resource);
+          if (settlement == resource_facts.end() ||
+              settlement->second.state !=
+                  core::StopFaultRecoveryResourceStateDTO::kSettled ||
+              !settlement->second.evidence_digest.has_value()) {
+            continue;
+          }
+          const auto &observed = quiescence.value();
+          external_facts.push_back(core::StopFaultRecoveryResourceFactDTO{
+              resource, core::StopFaultRecoveryResourceStateDTO::kSettled,
+              observed.snapshot.source_epoch, observed.snapshot.sequence,
+              observed.source_age_ns,
+              kRetainedNativeReconciliationFreshnessBudgetNs,
+              external_reconciliation_evidence_digest(
+                  latch, resource, *settlement->second.evidence_digest,
+                  observed.no_active_goal_evidence_digest,
+                  observed.configuration_evidence_digest),
+              std::nullopt});
+        }
+      }
+      std::sort(external_facts.begin(), external_facts.end(),
+                [](const auto &left, const auto &right) {
+                  return left.resource_id < right.resource_id;
+                });
+    }
+
     std::vector<core::StopFaultRecoveryResourceFactDTO> resources;
     resources.reserve(resource_facts.size());
     for (auto &[resource, fact] : resource_facts) {
@@ -660,7 +866,7 @@ RetainedStopSurveillanceOwner::BuildRecoveryFacts(
                                           std::move(resources),
                                           std::move(configuration_facts),
                                           {},
-                                          {},
+                                          std::move(external_facts),
                                           {},
                                           {},
                                           {}};
@@ -677,6 +883,121 @@ RetainedStopSurveillanceOwner::BuildRecoveryFacts(
     return invalid<core::StopFaultRecoveryFactsDTO>(
         "native_stop_recovery_facts_failed",
         "native Stop recovery facts construction failed");
+  }
+}
+
+core::Result<core::OrphanResourceReconciliationFactsDTO>
+RetainedStopSurveillanceOwner::BuildOrphanResourceReconciliationFacts(
+    const core::RequestOwnerEpoch &request_owner_epoch,
+    const core::CellId &cell_id,
+    const std::uint64_t expected_operation_resource_generation,
+    const std::vector<core::ResourceId> &resources,
+    const std::int64_t assessed_at_ns) noexcept {
+  try {
+    if (request_owner_epoch.empty() || cell_id.empty() || assessed_at_ns < 0 ||
+        resources.empty() ||
+        resources.size() > core::kMaximumOrphanResourceReconciliationFacts ||
+        !std::is_sorted(resources.begin(), resources.end()) ||
+        std::adjacent_find(resources.begin(), resources.end()) !=
+            resources.end()) {
+      return invalid<core::OrphanResourceReconciliationFactsDTO>(
+          "native_orphan_reconciliation_request_invalid",
+          "native orphan reconciliation request is invalid");
+    }
+    std::vector<RetainedStopSurveillanceSourceInput> sources;
+    {
+      std::lock_guard lock(mutex_);
+      sources = sources_;
+    }
+    std::map<core::ResourceId, std::size_t> source_by_resource;
+    for (std::size_t index = 0U; index < sources.size(); ++index) {
+      for (const auto &resource : binding_resources(sources[index].binding)) {
+        if (!source_by_resource.emplace(resource, index).second) {
+          return invalid<core::OrphanResourceReconciliationFactsDTO>(
+              "native_orphan_reconciliation_source_ambiguous",
+              "native orphan reconciliation resource has multiple sources");
+        }
+      }
+    }
+    std::map<std::size_t, std::vector<core::ResourceId>> resources_by_source;
+    for (const auto &resource : resources) {
+      const auto found = source_by_resource.find(resource);
+      if (found == source_by_resource.end()) {
+        return invalid<core::OrphanResourceReconciliationFactsDTO>(
+            "native_orphan_reconciliation_source_missing",
+            "native orphan reconciliation resource has no retained source");
+      }
+      resources_by_source[found->second].push_back(resource);
+    }
+
+    std::vector<core::OrphanResourceReconciliationFactDTO> facts;
+    facts.reserve(resources.size());
+    for (const auto &[source_index, selected_resources] : resources_by_source) {
+      const auto &source = sources[source_index];
+      auto observed = observe_current_quiescence(source, selected_resources,
+                                                 assessed_at_ns);
+      if (!observed.ok()) {
+        return core::Result<core::OrphanResourceReconciliationFactsDTO>::Err(
+            observed.error());
+      }
+      const auto &binding = source.binding.value();
+      const auto &path = *binding.control_path;
+      for (const auto &resource : selected_resources) {
+        core::OrphanResourceReconciliationFactDTO fact{
+            resource,
+            binding.controllable_component_id,
+            binding.command_target_id,
+            path.control_domain_id,
+            path.control_binding_id,
+            path.control_binding_revision,
+            path.active_control_configuration_id,
+            path.active_control_configuration_generation,
+            path.provider_runtime_unit_id,
+            path.provider_runtime_epoch,
+            core::StopFaultRecoveryResourceFactDTO{
+                resource, core::StopFaultRecoveryResourceStateDTO::kSettled,
+                observed.value().snapshot.source_epoch,
+                observed.value().snapshot.sequence,
+                observed.value().source_age_ns,
+                kRetainedNativeReconciliationFreshnessBudgetNs, std::nullopt,
+                std::nullopt},
+            observed.value().no_active_goal_evidence_digest,
+            observed.value().configuration_evidence_digest};
+        fact.settlement.evidence_digest = current_resource_evidence_digest(
+            fact, observed.value().snapshot,
+            observed.value().no_active_goal_evidence_digest,
+            observed.value().configuration_evidence_digest, assessed_at_ns);
+        facts.push_back(std::move(fact));
+      }
+    }
+    std::sort(facts.begin(), facts.end(),
+              [](const auto &left, const auto &right) {
+                return left.resource_id < right.resource_id;
+              });
+    const auto &value = sources.front().binding.value();
+    core::OrphanResourceReconciliationFactsDTO result{
+        request_owner_epoch,
+        cell_id,
+        value.retained_bundle_id,
+        value.graph_revision,
+        expected_operation_resource_generation,
+        assessed_at_ns,
+        std::move(facts)};
+    if (core::orphan_resource_reconciliation_facts_field_error(result)
+            .has_value()) {
+      return invalid<core::OrphanResourceReconciliationFactsDTO>(
+          "native_orphan_reconciliation_facts_invalid",
+          "native orphan reconciliation facts are inconsistent");
+    }
+    return core::Result<core::OrphanResourceReconciliationFactsDTO>::Ok(
+        std::move(result));
+  } catch (const std::exception &exception) {
+    return invalid<core::OrphanResourceReconciliationFactsDTO>(
+        "native_orphan_reconciliation_failed", exception.what());
+  } catch (...) {
+    return invalid<core::OrphanResourceReconciliationFactsDTO>(
+        "native_orphan_reconciliation_failed",
+        "native orphan reconciliation facts construction failed");
   }
 }
 

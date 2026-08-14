@@ -138,6 +138,8 @@ struct RetainedNativeRuntime final
   std::vector<core::RuntimeParticipantBinding> gripper_binding_aliases;
   std::optional<core::StopDeadlineBudgetDTO> cell_stop_deadline_budget;
   std::optional<core::StopSurveillancePolicyDTO> stop_surveillance_policy;
+  std::optional<core::RequestOwnerEpoch> addressed_request_owner_epoch;
+  std::optional<core::CellId> addressed_cell_id;
   std::shared_ptr<roboplan::Scene> scene;
   std::shared_ptr<std::mutex> scene_mutex;
   std::shared_ptr<RetainedKinematicStateProjector> state_projector;

@@ -4,6 +4,7 @@
 #include <array>
 #include <cstddef>
 #include <functional>
+#include <manyforge_core/component_lifecycle_plan_catalog_codec.hpp>
 #include <manyforge_deployment/capability_definition_codec.hpp>
 #include <manyforge_deployment/cell_graph_codec.hpp>
 #include <manyforge_deployment/command_schema_codec.hpp>

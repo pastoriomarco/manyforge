@@ -80,7 +80,7 @@ TEST(RetainedStopSurveillanceOwnerTest,
   auto channel = std::make_shared<StateChannel>(binding);
   const auto source = ObservationSource(binding);
   RetainedStopSurveillanceOwner owner(
-      {RetainedStopSurveillanceSourceInput{binding, channel, {source}}});
+      {RetainedStopSurveillanceSourceInput{binding, channel, {source}, {}}});
 
   ASSERT_TRUE(channel
                   ->publish_state({std::array<double, 2U>{0.0, 0.0}},
@@ -132,11 +132,11 @@ TEST(RetainedStopSurveillanceOwnerTest,
   const auto source = ObservationSource(binding);
   EXPECT_TRUE(
       RetainedStopSurveillanceOwner::ValidateSources(
-          {RetainedStopSurveillanceSourceInput{binding, channel, {source}}})
+          {RetainedStopSurveillanceSourceInput{binding, channel, {source}, {}}})
           .ok());
   EXPECT_FALSE(RetainedStopSurveillanceOwner::ValidateSources(
                    {RetainedStopSurveillanceSourceInput{
-                       binding, channel, {source, source}}})
+                       binding, channel, {source, source}, {}}})
                    .ok());
 
   auto wrong = source;
@@ -144,8 +144,52 @@ TEST(RetainedStopSurveillanceOwnerTest,
       core::RuntimeEpoch("foreign.epoch");
   EXPECT_FALSE(
       RetainedStopSurveillanceOwner::ValidateSources(
-          {RetainedStopSurveillanceSourceInput{binding, channel, {wrong}}})
+          {RetainedStopSurveillanceSourceInput{binding, channel, {wrong}, {}}})
           .ok());
+}
+
+TEST(RetainedStopSurveillanceOwnerTest,
+     BuildsCommandFreeFreshOrphanFactsWithoutAStopPlan) {
+  const auto binding = make_binding();
+  auto channel = std::make_shared<StateChannel>(binding);
+  bool active_goal = false;
+  RetainedNoActiveGoalEvidenceSource goal_source =
+      [&](const std::int64_t) -> core::Result<core::ContentDigest> {
+    if (active_goal) {
+      return core::Result<core::ContentDigest>::Err(
+          core::ErrorDTO{"invalid_state_transition",
+                         "test goal is active",
+                         {{"reason", "test_goal_active"}}});
+    }
+    return core::Result<core::ContentDigest>::Ok(
+        core::ContentDigest("sha256:" + std::string(64U, 'a')));
+  };
+  RetainedStopSurveillanceOwner owner(
+      {RetainedStopSurveillanceSourceInput{binding, channel, {}, goal_source}});
+  ASSERT_TRUE(channel
+                  ->publish_state({std::array<double, 2U>{0.0, 0.0}},
+                                  {std::array<double, 2U>{0.0, 0.0}}, 100, 100)
+                  .applied());
+  std::vector<core::ResourceId> resources;
+  for (const auto &resource : binding.value().resources)
+    resources.push_back(resource.resource_id);
+  std::sort(resources.begin(), resources.end());
+
+  const auto facts = owner.BuildOrphanResourceReconciliationFacts(
+      core::RequestOwnerEpoch("owner.2"), core::CellId("cell.test"), 7U,
+      resources, 105);
+  ASSERT_TRUE(facts.ok()) << facts.error().message;
+  EXPECT_EQ(facts.value().expected_operation_resource_generation, 7U);
+  EXPECT_EQ(facts.value().resources.size(), resources.size());
+  EXPECT_TRUE(core::orphan_resource_reconciliation_facts_field_error(
+                  facts.value()) == std::nullopt);
+
+  active_goal = true;
+  const auto rejected = owner.BuildOrphanResourceReconciliationFacts(
+      core::RequestOwnerEpoch("owner.2"), core::CellId("cell.test"), 7U,
+      resources, 105);
+  ASSERT_FALSE(rejected.ok());
+  EXPECT_EQ(rejected.error().details.at("reason"), "test_goal_active");
 }
 
 } // namespace

@@ -619,6 +619,11 @@ public:
   reset(std::optional<std::uint64_t>) override {
     return {true, std::nullopt};
   }
+  [[nodiscard]] core::ResetResultDTO
+  reset_after_certified_containment(std::uint64_t,
+                                    std::optional<std::uint64_t>) override {
+    return {true, std::nullopt};
+  }
   [[nodiscard]] core::AcknowledgeCompletedResultDTO
   acknowledge_completed(std::uint64_t, std::optional<std::uint64_t>) override {
     return {true, std::nullopt};
@@ -952,10 +957,9 @@ TEST(RetainedNativeCCLCRuntime,
   ASSERT_TRUE(runtime_policy.has_value());
   core::FakeClock clock;
   clock.set(1'000);
-  PublicationOwner publication_owner(runtime.binding,
-                                     state.path() / "operation-journal.sqlite3",
-                                     bundle->value().cell_graph.cell_id, clock,
-                                     runtime_policy->value());
+  PublicationOwner publication_owner(
+      runtime.binding, state.path() / "operation-journal.sqlite3",
+      bundle->value().cell_graph.cell_id, clock, runtime_policy->value());
   core::ManualScheduler scheduler;
 
   auto composition = CreateRetainedNativeCCLCRuntime(
