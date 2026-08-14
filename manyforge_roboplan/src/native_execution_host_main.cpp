@@ -33,6 +33,9 @@
 #include <manyforge_core/types/native_projection_capability.hpp>
 #include <manyforge_deployment/artifact_codec.hpp>
 #include <manyforge_deployment/native_execution_runtime_contract.hpp>
+#if defined(MANYFORGE_ROS2_CONTROL_EXECUTION_HOST)
+#include <manyforge_deployment/ros2_control_execution_runtime_contract.hpp>
+#endif
 #include <manyforge_deployment/program_binding.hpp>
 #include <manyforge_deployment/program_binding_compiler.hpp>
 #include <manyforge_deployment/program_contract.hpp>
@@ -46,6 +49,12 @@
 #include <manyforge_roboplan/retained_native_cclc_runtime.hpp>
 #include <manyforge_roboplan/retained_native_lifecycle_product.hpp>
 #include <manyforge_roboplan/retained_native_runtime.hpp>
+#if defined(MANYFORGE_ROS2_CONTROL_EXECUTION_HOST)
+#include <manyforge_roboplan/retained_isaac_ros2_control_profile.hpp>
+#include <manyforge_roboplan/retained_ros2_control_admission_owner.hpp>
+#include <manyforge_roboplan/retained_ros2_control_lifecycle_product.hpp>
+#include <manyforge_roboplan/retained_ros2_control_runtime_handle.hpp>
+#endif
 #include <manyforge_roboplan/retained_planner_scene_projection.hpp>
 #include <manyforge_roboplan/retained_planning_model_stage.hpp>
 #include <manyforge_roboplan/retained_scene_frame_resolver.hpp>
@@ -116,6 +125,24 @@ constexpr int kSocketBacklog = 16;
 constexpr int kReconcilePeriodMilliseconds = 5;
 constexpr int kClientPacketDeadlineMilliseconds = 100;
 constexpr int kManagerSceneDeadlineMilliseconds = 5000;
+
+[[nodiscard]] std::string SelectedExecutionImplementationRevision() {
+#if defined(MANYFORGE_ROS2_CONTROL_EXECUTION_HOST)
+  return deployment::ros2_control_execution_runtime_contract::
+      implementation_revision();
+#else
+  return deployment::native_execution_runtime_contract::
+      implementation_revision();
+#endif
+}
+
+[[nodiscard]] constexpr std::string_view SelectedExecutionRuntimeRole() {
+#if defined(MANYFORGE_ROS2_CONTROL_EXECUTION_HOST)
+  return deployment::ros2_control_execution_runtime_contract::kRuntimeRoleId;
+#else
+  return deployment::native_execution_runtime_contract::kRuntimeRoleId;
+#endif
+}
 
 volatile sig_atomic_t g_stop_requested = 0;
 
@@ -3763,8 +3790,19 @@ struct Composition final {
       cclc_artifact_source;
   std::unique_ptr<deployment::FilesystemVerifiedRetainedProviderManifestSource>
       cclc_provider_manifest_source;
+#if defined(MANYFORGE_ROS2_CONTROL_EXECUTION_HOST)
+  std::shared_ptr<RetainedRos2ControlRuntimeHandle> ros2_control_runtime_handle;
+  std::string ros2_control_binding_contract_generation_id;
+  std::unique_ptr<RetainedRos2ControlLifecycleProduct>
+      cclc_lifecycle_product;
+#else
   std::unique_ptr<RetainedNativeLifecycleProduct> cclc_lifecycle_product;
+#endif
   std::unique_ptr<deployment::CCLCRuntimeComposition> cclc_runtime;
+#if defined(MANYFORGE_ROS2_CONTROL_EXECUTION_HOST)
+  std::unique_ptr<RetainedRos2ControlAdmissionOwner>
+      ros2_control_admission_owner;
+#endif
 
   Composition(
       std::shared_ptr<const deployment::RetainedBundle> selected_bundle,
@@ -4093,9 +4131,15 @@ BuildProductComposition(CompositionBuildInput input) {
               contains_local_runtime(direct_control_gripper_binding.value()),
           "native execution local runtime is absent from its exact "
           "participant bindings");
+#if defined(MANYFORGE_ROS2_CONTROL_EXECUTION_HOST)
+  const auto retained_runtime_configuration = deployment::
+      ros2_control_execution_runtime_contract::require_configuration(
+          *input.bundle, *local_runtime_unit_id);
+#else
   const auto retained_runtime_configuration =
       deployment::native_execution_runtime_contract::require_configuration(
           *input.bundle, *local_runtime_unit_id);
+#endif
   Require(retained_runtime_configuration.initial_joint_positions_rad.size() ==
               direct_control_motion_binding.value().value().resources.size(),
           "native execution initial state differs from the exact motion "
@@ -4271,6 +4315,28 @@ BuildProductComposition(CompositionBuildInput input) {
       {},
       {},
       {}};
+#if defined(MANYFORGE_ROS2_CONTROL_EXECUTION_HOST)
+  auto ros2_control_runtime_handle =
+      std::make_shared<RetainedRos2ControlRuntimeHandle>();
+  auto ros2_control_backend_config =
+      make_retained_isaac_ros2_control_backend_config(
+          retained_runtime_configuration,
+          direct_control_motion_binding.value(),
+          std::optional<core::RuntimeParticipantBinding>{
+              direct_control_gripper_binding.value()});
+  Require(ros2_control_backend_config.execution.controller_binding.has_value(),
+          "retained Isaac ROS profile has no controller binding contract");
+  const std::string ros2_control_binding_contract_generation_id =
+      ros2_control_backend_config.execution.controller_binding->generation_id;
+  runtime_input.motion_state_channel_config =
+      retained_ros2_control_motion_state_config(
+          ros2_control_backend_config.execution);
+  runtime_input.gripper_state_channel_config =
+      retained_ros2_control_gripper_state_config(
+          direct_control_gripper_binding.value());
+  runtime_input.backend_factory = make_retained_ros2_control_backend_factory(
+      std::move(ros2_control_backend_config), ros2_control_runtime_handle);
+#endif
   auto kernel_config = core::ExecutionKernelConfig{};
   kernel_config.collision_monitor_period_ns = collision_monitor_period_ns;
   auto execution_config = RoboPlanExecutionBackendConfig{};
@@ -4329,6 +4395,12 @@ BuildProductComposition(CompositionBuildInput input) {
       input.publication_generation,
       std::move(input.status_motion_target_role_id),
       std::move(input.status_gripper_target_role_id));
+#if defined(MANYFORGE_ROS2_CONTROL_EXECUTION_HOST)
+  composition->ros2_control_runtime_handle =
+      std::move(ros2_control_runtime_handle);
+  composition->ros2_control_binding_contract_generation_id =
+      ros2_control_binding_contract_generation_id;
+#endif
   composition->planner_scene_projection =
       std::move(input.planner_scene_projection);
   composition->scene_frame_resolver = std::move(direct_scene_frame_resolver);
@@ -4519,6 +4591,45 @@ BuildComposition(const HostConfig &config,
   });
 }
 
+#if defined(MANYFORGE_ROS2_CONTROL_EXECUTION_HOST)
+[[nodiscard]] std::string
+Ros2ControlProviderComponentEpoch(const Composition &composition) {
+  std::vector<std::string> occurrences;
+  for (const auto *binding : {&composition.direct_control_motion_binding,
+                              &composition.direct_control_gripper_binding}) {
+    Require(binding->value().control_path.has_value(),
+            "retained Isaac ROS participant has no control path");
+    const auto &path = *binding->value().control_path;
+    occurrences.push_back(
+        path.control_domain_id.value() + "\n" +
+        path.provider_instance_id.value() + "\n" +
+        path.provider_manifest_id.value() + "\n" +
+        path.provider_manifest_revision.value() + "\n" +
+        path.provider_runtime_unit_id.value() + "\n" +
+        path.provider_runtime_epoch.value());
+  }
+  std::sort(occurrences.begin(), occurrences.end());
+  std::string preimage("manyforge.ros2-control-provider-component-epoch.v1");
+  for (const auto &occurrence : occurrences) {
+    preimage.push_back('\0');
+    preimage.append(occurrence);
+  }
+  return content_identity::sha256_digest(preimage);
+}
+
+[[nodiscard]] std::string
+Ros2ControlCellSupervisorEpoch(const Composition &composition) {
+  std::string preimage("manyforge.cell-supervisor-component-epoch.v1");
+  preimage.push_back('\0');
+  preimage.append(composition.bundle->retained_bundle_id().value());
+  preimage.push_back('\0');
+  preimage.append(composition.bundle->value().cell_graph.graph_revision.value());
+  preimage.push_back('\0');
+  preimage.append(std::to_string(composition.publication_generation.value()));
+  return content_identity::sha256_digest(preimage);
+}
+#endif
+
 void AttachRetainedNativeCCLC(Composition &composition,
                               const HostConfig &config,
                               const core::RequestOwnerEpoch &owner_epoch,
@@ -4561,9 +4672,19 @@ void AttachRetainedNativeCCLC(Composition &composition,
   if (composition.runtime->gripper_binding.has_value()) {
     physical_bindings.push_back(*composition.runtime->gripper_binding);
   }
+#if defined(MANYFORGE_ROS2_CONTROL_EXECUTION_HOST)
+  Require(composition.ros2_control_runtime_handle != nullptr &&
+              !composition.ros2_control_binding_contract_generation_id.empty(),
+          "retained Isaac ROS lifecycle has no bound execution adapter");
+  auto lifecycle_product = RetainedRos2ControlLifecycleProduct::Create(
+      composition.bundle, *provider_manifest_source, physical_bindings,
+      composition.ros2_control_runtime_handle, *composition.runtime->clock,
+      1'000'000'000LL);
+#else
   auto lifecycle_product = RetainedNativeLifecycleProduct::Create(
       composition.bundle, *provider_manifest_source, physical_bindings,
       *composition.runtime->clock, 1'000'000'000LL);
+#endif
   if (!lifecycle_product.ok()) {
     Fail("native lifecycle product cannot be composed: " +
          lifecycle_product.error().message);
@@ -4581,7 +4702,11 @@ void AttachRetainedNativeCCLC(Composition &composition,
       std::move(active_publication.value()), *artifact_source,
       lifecycle_product.value()->catalog_source(),
       lifecycle_product.value()->brand_ports(), *composition.runtime,
-      fence_owner, fence_owner);
+      fence_owner, fence_owner
+#if defined(MANYFORGE_ROS2_CONTROL_EXECUTION_HOST)
+      , composition.ros2_control_runtime_handle->lifecycle_snapshot_source()
+#endif
+  );
   if (!cclc.ok()) {
     Fail("native CCLC composition failed: " + cclc.error().message);
   }
@@ -4593,7 +4718,76 @@ void AttachRetainedNativeCCLC(Composition &composition,
       std::move(provider_manifest_source);
   composition.cclc_lifecycle_product = std::move(lifecycle_product.value());
   composition.cclc_runtime = std::move(cclc.value());
+#if defined(MANYFORGE_ROS2_CONTROL_EXECUTION_HOST)
+  const auto component_id = composition.direct_control_motion_binding.value()
+                                .controllable_component_id;
+  const auto runtime_epochs = composition.direct_control_motion_binding.value()
+                                  .runtime_unit_epochs;
+  Require(runtime_epochs.size() == 1U,
+          "retained Isaac ROS admission has no sole runtime epoch");
+  auto admission = RetainedRos2ControlAdmissionOwner::Create(
+      RetainedRos2ControlAdmissionOwnerConfig{
+          component_id,
+          runtime_epochs.front().runtime_epoch,
+          composition.ros2_control_binding_contract_generation_id,
+          Ros2ControlProviderComponentEpoch(composition),
+          Ros2ControlCellSupervisorEpoch(composition),
+          50'000'000LL,
+          250'000'000LL},
+      composition.ros2_control_runtime_handle, *composition.runtime->clock,
+      [&composition]() {
+        return composition.cclc_runtime->ReadCurrentComponentSnapshot(
+            composition.direct_control_motion_binding.value()
+                .controllable_component_id);
+      });
+  if (!admission.ok()) {
+    Fail("ROS execution admission owner cannot be composed: " +
+         admission.error().message);
+  }
+  composition.ros2_control_admission_owner =
+      std::move(admission.value());
+#endif
 }
+
+#if defined(MANYFORGE_ROS2_CONTROL_EXECUTION_HOST)
+void DetachRetainedRos2ControlCCLC(Composition &composition) {
+  composition.ros2_control_admission_owner.reset();
+  composition.cclc_runtime.reset();
+  composition.cclc_lifecycle_product.reset();
+  composition.cclc_provider_manifest_source.reset();
+  composition.cclc_artifact_source.reset();
+  composition.cclc_active_publication_reader.reset();
+}
+
+void TryAttachManagedRos2ControlCCLC(
+    Composition &composition, const ManagedRuntimeChildConfig &config,
+    ManagedKernelApplyFenceOwner &fence_owner) {
+  if (composition.cclc_runtime != nullptr) {
+    return;
+  }
+  component_manager::SqliteActiveBundlePublicationStore publication_store(
+      config.manager_state_root /
+          std::string(
+              component_manager::kActiveBundlePublicationStoreFilename),
+      core::CellId(config.cell_id));
+  const auto integrity = publication_store.VerifyIntegrity();
+  publication_store.Close();
+  if (integrity.current_generation != composition.publication_generation) {
+    return;
+  }
+  HostConfig attachment_config;
+  attachment_config.package_root = config.package_root;
+  attachment_config.manager_state_root = config.manager_state_root;
+  attachment_config.execution_state_root = config.staging_root;
+  attachment_config.staging_root = config.staging_root;
+  attachment_config.candidate_worker = config.candidate_worker;
+  attachment_config.cell_id = config.cell_id;
+  AttachRetainedNativeCCLC(
+      composition, attachment_config,
+      core::RequestOwnerEpoch("kernel-owner-" + config.runtime_epoch),
+      fence_owner);
+}
+#endif
 
 [[nodiscard]] std::optional<CompositionBuildInput>
 TryBuildCurrentManagedCompositionInput(
@@ -4920,8 +5114,7 @@ LoadExactManagedCandidateBundle(
 
 [[nodiscard]] int
 RunManagedRuntimeChild(const ManagedRuntimeChildConfig &config) {
-  const auto implementation_revision =
-      deployment::native_execution_runtime_contract::implementation_revision();
+  const auto implementation_revision = SelectedExecutionImplementationRevision();
   const std::string ready_packet =
       "manyforge.native-execution-ready.v1 " + config.runtime_unit_id + " " +
       config.runtime_epoch + " " + implementation_revision + " " +
@@ -5293,6 +5486,9 @@ RunManagedRuntimeChild(const ManagedRuntimeChildConfig &config) {
             Require(prepared == nullptr,
                     "empty selected product has a physical composition");
             if (active_managed_composition != nullptr) {
+#if defined(MANYFORGE_ROS2_CONTROL_EXECUTION_HOST)
+              DetachRetainedRos2ControlCCLC(*active_managed_composition);
+#endif
               Require(detached_addressed_kernel == nullptr &&
                           detached_operation_journal == nullptr &&
                           detached_owner_clock == nullptr,
@@ -5350,6 +5546,9 @@ RunManagedRuntimeChild(const ManagedRuntimeChildConfig &config) {
                      reconfigured.error().message);
               }
               if (active_managed_composition != nullptr) {
+#if defined(MANYFORGE_ROS2_CONTROL_EXECUTION_HOST)
+                DetachRetainedRos2ControlCCLC(*active_managed_composition);
+#endif
                 auto &stable_runtime = *active_managed_composition->runtime;
                 prepared->runtime->operation_journal =
                     std::move(stable_runtime.operation_journal);
@@ -5400,6 +5599,15 @@ RunManagedRuntimeChild(const ManagedRuntimeChildConfig &config) {
     rethrow_composition_failure();
     try_start_current_composition();
     try_release_retired_composition();
+#if defined(MANYFORGE_ROS2_CONTROL_EXECUTION_HOST)
+    {
+      std::lock_guard lock(managed_composition_mutex);
+      if (active_managed_composition != nullptr) {
+        TryAttachManagedRos2ControlCCLC(*active_managed_composition, config,
+                                        fence_owner);
+      }
+    }
+#endif
     pollfd descriptor{config.manager_channel_fd, POLLIN | POLLHUP, 0};
     int ready = -1;
     do {
@@ -5441,7 +5649,8 @@ RunManagedRuntimeChild(const ManagedRuntimeChildConfig &config) {
               std::to_string(source_report_sequence) + " 1 serving healthy " +
               implementation_revision + " " + config.product_identity + " " +
               config.configuration_identity +
-              " native_execution closed_no_active_effect");
+              " " + std::string(SelectedExecutionRuntimeRole()) +
+              " closed_no_active_effect");
       continue;
     }
     if (request == "shutdown") {

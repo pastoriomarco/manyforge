@@ -2,6 +2,7 @@
 
 #include <manyforge_core/fixed_cclc_port_registry.hpp>
 #include <manyforge_deployment/cclc_runtime_composition.hpp>
+#include <manyforge_roboplan/retained_externally_managed_lifecycle_ports.hpp>
 #include <manyforge_roboplan/retained_native_runtime.hpp>
 #include <functional>
 #include <memory>
@@ -45,7 +46,9 @@ CreateRetainedNativeCCLCRuntime(
     std::function<core::Result<
         std::optional<core::ActiveControlConfigurationDTO>>(
         const core::ControlDomainId &)>
-        kernel_current_configuration_source = {});
+        kernel_current_configuration_source = {},
+    RetainedExternallyManagedDomainSnapshotSource
+        externally_managed_controller_snapshot_source = {});
 
 /// Convenience overload for the production retained-native owner. Only the
 /// physical representatives are consumed; Program aliases cannot widen CCLC
@@ -61,6 +64,8 @@ CreateRetainedNativeCCLCRuntime(
     std::vector<core::BrandLifecyclePortRegistrationDTO> brand_ports,
     RetainedNativeRuntime &runtime,
     core::ICCLCKernelDisableHandoffPort &kernel_disable_handoff_port,
-    core::ICCLCKernelRouteConfigurationFencePort &kernel_route_fence_port);
+    core::ICCLCKernelRouteConfigurationFencePort &kernel_route_fence_port,
+    RetainedExternallyManagedDomainSnapshotSource
+        externally_managed_controller_snapshot_source = {});
 
 } // namespace manyforge::roboplan_backend

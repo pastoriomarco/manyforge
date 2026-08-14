@@ -22,8 +22,8 @@
 #include "native_execution_runtime_unit_internal.hpp"
 #include "planning_resource_map_internal.hpp"
 #include "retained_bundle_internal.hpp"
-#include "planning_resource_map_internal.hpp"
 #include "retention_store_fixtures.hpp"
+#include "ros2_control_execution_runtime_unit_internal.hpp"
 
 namespace manyforge::deployment {
 namespace {
@@ -213,7 +213,7 @@ TEST(ProductContractRegistryTest,
      QualifiesExactFlattenedViewerControlRuntimeAndSymbolMapContracts) {
   const auto &registry = build_qualified_product_contract_registry();
   const auto contracts = registry.contracts();
-  ASSERT_EQ(contracts.size(), 6U);
+  ASSERT_EQ(contracts.size(), 7U);
   const auto &contract = flattened_contract();
 
   EXPECT_EQ(contract.product_contract_id().value(),
@@ -402,6 +402,30 @@ TEST(ProductContractRegistryTest,
   EXPECT_EQ(registry.find(native_runtime->product_contract_id(),
                           native_runtime->product_contract_revision()),
             &*native_runtime);
+
+  const auto ros2_control_runtime = std::find_if(
+      contracts.begin(), contracts.end(), [](const auto &candidate) {
+        return candidate.product_contract_id().value() ==
+               detail::kRos2ControlExecutionRuntimeProductContractId;
+      });
+  ASSERT_NE(ros2_control_runtime, contracts.end());
+  EXPECT_EQ(ros2_control_runtime->product_kind(),
+            core::RetainedProductKind::kRuntimeUnitConfiguration);
+  EXPECT_EQ(ros2_control_runtime->placement(), ProductPlacement::kRuntimeUnit);
+  ASSERT_EQ(ros2_control_runtime->artifact_roles().size(), 3U);
+  EXPECT_EQ(ros2_control_runtime->artifact_roles()[0].artifact_role_id.value(),
+            detail::kRos2ControlExecutionRuntimeBuildIdentityArtifactRole);
+  EXPECT_EQ(ros2_control_runtime->artifact_roles()[0].media_type,
+            detail::kRos2ControlExecutionRuntimeBuildIdentityMediaType);
+  EXPECT_EQ(ros2_control_runtime->artifact_roles()[0].cardinality,
+            ProductArtifactCardinality::kOptionalAtMostOne);
+  EXPECT_EQ(ros2_control_runtime->artifact_roles()[1].artifact_role_id.value(),
+            detail::kRos2ControlExecutionRuntimeLaunchDescriptorArtifactRole);
+  EXPECT_EQ(ros2_control_runtime->artifact_roles()[2].artifact_role_id.value(),
+            detail::kRos2ControlExecutionRuntimeManifestArtifactRole);
+  EXPECT_EQ(registry.find(ros2_control_runtime->product_contract_id(),
+                          ros2_control_runtime->product_contract_revision()),
+            &*ros2_control_runtime);
 }
 
 TEST(RawArtifactStoreTest, UsesImmutableDigestKeysAndReverifiesReads) {

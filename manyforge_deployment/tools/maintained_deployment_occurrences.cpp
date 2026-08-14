@@ -30,6 +30,7 @@
 #include <manyforge_deployment/provider_manifest_codec.hpp>
 #include <manyforge_deployment/retained_bundle.hpp>
 #include <manyforge_deployment/retention_qualified_deployment.hpp>
+#include <manyforge_deployment/runtime_policy_codec.hpp>
 #include <manyforge_deployment/runtime_profile_codec.hpp>
 #include <manyforge_deployment/runtime_program_binding.hpp>
 #include <manyforge_deployment/scenario_apply_candidate_source.hpp>
@@ -418,6 +419,7 @@ struct QualifiedCatalogClosure final {
   std::vector<deployment::QualifiedControlInterfaceContract> contracts;
   std::vector<deployment::QualifiedControllerTopology> topologies;
   std::vector<deployment::QualifiedProviderManifest> provider_manifests;
+  std::vector<deployment::QualifiedRuntimePolicy> runtime_policies;
   std::vector<deployment::QualifiedRuntimeProfile> runtime_profiles;
   std::vector<deployment::QualifiedStopEvidencePolicy> stop_policies;
   std::vector<deployment::SourceVerifiedModelAsset> model_assets;
@@ -581,6 +583,14 @@ materialize_scenarios(const std::filesystem::path &root,
                             value.value().runtime_profile_id.value(),
                             value.value().runtime_profile_revision.value()};
         });
+    const auto runtime_policies = select_catalog_values(
+        catalog.runtime_policies, selected_records, [](const auto &value) {
+          return CatalogKey{
+              static_cast<std::uint8_t>(
+                  core::CatalogRecordKind::kRuntimePolicy),
+              value.value().runtime_policy_id.value(),
+              value.value().runtime_policy_revision.value()};
+        });
     const auto stop_policies = select_catalog_values(
         catalog.stop_policies, selected_records, [](const auto &value) {
           return CatalogKey{
@@ -653,7 +663,7 @@ materialize_scenarios(const std::filesystem::path &root,
     }
     const auto applicability = deployment::qualify_cell_applicability(
         composition, verified.applicability_inputs(), profiles,
-        std::span<const deployment::QualifiedRuntimePolicy>{}, command_schemas,
+        runtime_policies, command_schemas,
         capabilities, contracts, topologies, manifests, stop_policies,
         selected_value_schemas, selected_commissioning_evidence,
         selected_overlay);
@@ -1496,6 +1506,18 @@ qualify_catalog(const std::filesystem::path &root,
     insert_reference(result, reference);
   }
 
+  for (const auto &path : source_files(catalog_root / "runtime_policy", 1U)) {
+    const std::string bytes = read_file(path);
+    const auto reference =
+        make_reference<core::RuntimePolicyCatalogRecordRefDTO>(bytes);
+    result.runtime_policies.push_back(
+        deployment::resolve_and_qualify_runtime_policy(
+            reference, reference.content_addressed_store_key, bytes));
+    input_source.add(reference.content_addressed_store_key,
+                     reference.content_digest, bytes);
+    insert_reference(result, reference);
+  }
+
   for (const auto &path :
        source_files(catalog_root / "stop_evidence_policy", 1U)) {
     const std::string bytes = read_file(path);
@@ -1615,7 +1637,8 @@ qualify_catalog(const std::filesystem::path &root,
     result.model_assets.push_back(std::move(verified));
     result.structural_preparations.push_back(std::move(preparation));
   }
-  if (result.records.size() != 62U || result.runtime_profiles.size() != 1U) {
+  if (result.records.size() != 63U || result.runtime_profiles.size() != 1U ||
+      result.runtime_policies.size() != 1U) {
     throw std::logic_error("maintained exact catalog closure is incomplete");
   }
   return result;
@@ -1669,18 +1692,25 @@ void verify_scenarios(const std::filesystem::path &root,
       external_manifest_ids.insert(resource.provider_manifest_id);
     }
     const std::size_t expected_catalog_count =
-        48U + 2U * external_manifest_ids.size();
+        49U + 2U * external_manifest_ids.size();
     if (verified.catalog_records().size() != expected_catalog_count) {
       throw std::invalid_argument(
           "maintained scenario has the wrong exact catalog closure: " +
-          std::string(scenario.source));
+          std::string(scenario.source) + " (expected " +
+          std::to_string(expected_catalog_count) + ", observed " +
+          std::to_string(verified.catalog_records().size()) + ")");
     }
     for (const auto &reference : verified.catalog_records()) {
       const auto expected = catalog.records.find(catalog_key(reference));
       if (expected == catalog.records.end() || expected->second != reference) {
         throw std::invalid_argument(
             "maintained scenario selects an unqualified catalog referent: " +
-            std::string(scenario.source));
+            std::string(scenario.source) + " (kind " +
+            std::to_string(static_cast<std::uint8_t>(
+                core::catalog_record_kind(reference))) +
+            ", id " + core::catalog_record_id_value(reference) +
+            ", revision " + core::catalog_record_revision_value(reference) +
+            ")");
       }
     }
 
@@ -1813,7 +1843,7 @@ int main(int argc, char **argv) {
     publish_and_verify_scenario_catalog(root, products, bindings,
                                         package.path());
     std::cout << "7 deployments, 3 shared families, 36 historical facilities, "
-                 "62 exact catalog referents, 8 durable Program Bindings, "
+                 "63 exact catalog referents, 8 durable Program Bindings, "
                  "and 8 scenario closures qualified\n";
     return 0;
   } catch (const std::exception &error) {

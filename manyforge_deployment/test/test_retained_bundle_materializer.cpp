@@ -10,6 +10,7 @@
 #include <manyforge_deployment/model_source.hpp>
 #include <manyforge_deployment/native_execution_runtime_contract.hpp>
 #include <manyforge_deployment/retention_qualified_deployment.hpp>
+#include <manyforge_deployment/ros2_control_execution_runtime_contract.hpp>
 #include <manyforge_deployment/runtime_policy_codec.hpp>
 #include <manyforge_deployment/site_overlay_resolution.hpp>
 
@@ -1250,8 +1251,8 @@ TEST(RetainedBundleMaterializer,
 
   ASSERT_NE(bundle, nullptr);
   EXPECT_TRUE(verify_retained_bundle_identity(*bundle));
-  EXPECT_EQ(bundle->value().catalogs.records.size(), 12U);
-  EXPECT_EQ(catalog_store.size(), 12U);
+  EXPECT_EQ(bundle->value().catalogs.records.size(), 13U);
+  EXPECT_EQ(catalog_store.size(), 13U);
   ASSERT_EQ(bundle->value().cell_graph.runtime_units.size(), 1U);
   ASSERT_EQ(bundle->value().capability_provider_bindings.size(), 3U);
   const std::vector<std::string> capability_ids = [&] {
@@ -1362,6 +1363,107 @@ TEST(RetainedBundleMaterializer,
   ASSERT_NE(regenerated, nullptr);
   EXPECT_EQ(regenerated->retained_bundle_id(), bundle->retained_bundle_id());
   EXPECT_EQ(regenerated->canonical_bytes(), bundle->canonical_bytes());
+}
+
+TEST(RetainedBundleMaterializer,
+     Ros2ControlMotionLite6RetainsDistinctExactRuntimeProduct) {
+  const auto fixture =
+      test::make_lite6_ros2_control_motion_retention_fixture();
+  const test::Lite6ControllableCompilerInputArtifactSource input_source(
+      fixture);
+  test::InMemoryCatalogArtifactStoreFixture catalog_store;
+  test::InMemoryRawArtifactStoreFixture raw_store;
+
+  const auto bundle = detail::RetainedBundleMaterializer::materialize(
+      fixture.qualified,
+      detail::RetentionMaterializerTestAccess::make_context(), input_source,
+      fixture.structural_preparations(), catalog_store, raw_store);
+
+  ASSERT_NE(bundle, nullptr);
+  EXPECT_TRUE(verify_retained_bundle_identity(*bundle));
+  EXPECT_EQ(bundle->value().catalogs.records.size(), 13U);
+  EXPECT_EQ(catalog_store.size(), 13U);
+  ASSERT_EQ(bundle->value().cell_graph.runtime_units.size(), 1U);
+  const auto &runtime_unit = bundle->value().cell_graph.runtime_units.front();
+  EXPECT_EQ(runtime_unit.runtime_unit_id.value(),
+            test::kLite6Ros2ControlExecutionRuntimeId);
+  EXPECT_EQ(runtime_unit.runtime_profile_id.value(),
+            detail::kRos2ControlExecutionRuntimeProfileId);
+  EXPECT_EQ(runtime_unit.runtime_profile_revision.value(),
+            detail::ros2_control_execution_runtime_profile_revision());
+  ASSERT_EQ(bundle->value().cell_graph.control_bindings.size(), 1U);
+  EXPECT_EQ(bundle->value().cell_graph.control_bindings.front()
+                .state_authority_class,
+            core::StateAuthorityClass::kCommanded);
+
+  ASSERT_EQ(bundle->value().compiled_products.runtime_unit_products.size(),
+            1U);
+  const auto &group =
+      bundle->value().compiled_products.runtime_unit_products.front();
+  ASSERT_EQ(group.products.size(), 1U);
+  const auto &product = group.products.front();
+  EXPECT_EQ(product.product_kind,
+            core::RetainedProductKind::kRuntimeUnitConfiguration);
+  EXPECT_EQ(product.product_id.value(),
+            detail::ros2_control_execution_runtime_product_id(
+                group.runtime_unit_id));
+  EXPECT_EQ(product.product_contract_id.value(),
+            detail::kRos2ControlExecutionRuntimeProductContractId);
+  EXPECT_EQ(
+      product.product_contract_revision,
+      detail::ros2_control_execution_runtime_product_contract_revision());
+  ASSERT_EQ(product.artifact_refs.size(), 2U);
+  EXPECT_EQ(std::count_if(
+                product.artifact_refs.begin(), product.artifact_refs.end(),
+                [](const auto &artifact) {
+                  return artifact.artifact_role_id.value() ==
+                         detail::
+                             kRos2ControlExecutionRuntimeBuildIdentityArtifactRole;
+                }),
+            0);
+
+  const std::string manifest = require_product_artifact_bytes(
+      product, detail::kRos2ControlExecutionRuntimeManifestArtifactRole,
+      raw_store);
+  const std::string launch_descriptor = require_product_artifact_bytes(
+      product, detail::kRos2ControlExecutionRuntimeLaunchDescriptorArtifactRole,
+      raw_store);
+  EXPECT_EQ(launch_descriptor,
+            detail::ros2_control_execution_runtime_launch_descriptor());
+  const CanonicalValue parsed_manifest =
+      detail::parse_and_verify_ros2_control_execution_runtime_manifest(
+          manifest);
+  EXPECT_EQ(
+      canonical_json(member(parsed_manifest, "configuration")),
+      R"({"collision_monitor_period_ms":50,"execution_tick_hz":100,"initial_joint_positions_rad":[0,0,1.57,0,0,0],"isaac_profile":"lite6","mode":"commanded_sim","planner_rng_seed":12345})");
+  EXPECT_NO_THROW(
+      detail::require_ros2_control_execution_runtime_product_matches_retained_bundle(
+          manifest, launch_descriptor, std::nullopt, bundle->value(),
+          group.runtime_unit_id));
+
+  const auto runtime_configuration =
+      ros2_control_execution_runtime_contract::require_configuration(
+          *bundle, group.runtime_unit_id);
+  EXPECT_EQ(runtime_configuration.isaac_profile, "lite6");
+  EXPECT_EQ(runtime_configuration.planner_rng_seed, 12345U);
+  EXPECT_EQ(runtime_configuration.initial_joint_positions_rad,
+            (std::vector<double>{0.0, 0.0, 1.57, 0.0, 0.0, 0.0}));
+  EXPECT_EQ(runtime_configuration.execution_tick_hz, 100U);
+  EXPECT_DOUBLE_EQ(runtime_configuration.collision_monitor_period_ms, 50.0);
+
+  const std::string changed_configuration =
+      replace_once(manifest, "\"isaac_profile\":\"lite6\"",
+                   "\"isaac_profile\":\"ur10e\"");
+  EXPECT_NO_THROW(static_cast<void>(
+      detail::parse_and_verify_ros2_control_execution_runtime_manifest(
+          changed_configuration)));
+  EXPECT_THROW(
+      detail::require_ros2_control_execution_runtime_product_matches_retained_bundle(
+          changed_configuration, launch_descriptor, std::nullopt,
+          bundle->value(), group.runtime_unit_id),
+      RetainedBundleError);
+  EXPECT_NO_THROW(static_cast<void>(
+      detail::RetainedBundleReloadAuthority::reload(bundle->canonical_bytes())));
 }
 
 TEST(RetainedBundleMaterializer,
@@ -1846,6 +1948,83 @@ TEST(ControlDomainControlVerifier,
   EXPECT_THROW(
       static_cast<void>(
           detail::parse_and_verify_control_domain_control(tampered_bytes)),
+      RetainedBundleError);
+}
+
+TEST(ControlDomainControlVerifier,
+     Ros2ControlStopQualificationClosesToItsRuntimeUnitAndContract) {
+  const auto fixture =
+      test::make_lite6_ros2_control_motion_retention_fixture(true);
+  const core::ControlDomainId domain_id(std::string(test::kLite6ArmDomainId));
+  const core::RetainedArtifactRefDTO structural_artifact{
+      core::ArtifactRoleId(std::string(
+          core::kStopImplementationQualificationArtifactRole)),
+      std::string(core::kStopImplementationQualificationMediaType),
+      1U,
+      core::ContentDigest(std::string(kZeroDigest)),
+      core::ContentAddressedStoreKey(
+          "sha256/"
+          "0000000000000000000000000000000000000000000000000000000000000000"),
+  };
+  const std::array<core::StopImplementationQualificationDTO, 1U>
+      qualifications{{
+          {
+              core::RegisteredStopCommandKindId(
+                  "manyforge.stop.software_hard"),
+              core::ProviderContractRefDTO{
+                  core::ProviderContractRoleId("software_hard_stop"),
+                  core::SchemaId(
+                      "manyforge.value_schema.provider_contract.empty.v1"),
+                  core::SchemaRevision(std::string(
+                      test::lite6_controllable_fixture_detail::
+                          kEmptyProviderContractSchemaRevision)),
+              },
+              core::ProductId(
+                  detail::ros2_control_execution_runtime_product_id(
+                      core::RuntimeUnitId(std::string(
+                          test::kLite6Ros2ControlExecutionRuntimeId)))),
+              core::ProductContractId(std::string(
+                  detail::kRos2ControlExecutionRuntimeProductContractId)),
+              detail::
+                  ros2_control_execution_runtime_product_contract_revision(),
+              std::nullopt,
+              core::StopInvocationLaneId(
+                  "manyforge.ros2_control_execution_host."
+                  "focused_software_hard.v1"),
+              structural_artifact,
+          },
+      }};
+
+  const std::string bytes = detail::emit_control_domain_control(
+      fixture.qualified.compiler_ir(), domain_id, qualifications);
+  const CanonicalValue control =
+      detail::parse_and_verify_control_domain_control(bytes);
+  EXPECT_NO_THROW(detail::require_control_domain_control_matches(
+      bytes, fixture.qualified.compiler_ir(), domain_id, qualifications));
+  const auto &retained_qualifications =
+      array_member(control, "stop_implementation_qualifications");
+  ASSERT_EQ(retained_qualifications.size(), 1U);
+  EXPECT_EQ(string_member(retained_qualifications.front(), "product_id"),
+            detail::ros2_control_execution_runtime_product_id(
+                core::RuntimeUnitId(std::string(
+                    test::kLite6Ros2ControlExecutionRuntimeId))));
+  EXPECT_EQ(string_member(retained_qualifications.front(),
+                          "product_contract_id"),
+            detail::kRos2ControlExecutionRuntimeProductContractId);
+
+  auto wrong_kind = qualifications;
+  wrong_kind.front().product_id = core::ProductId(
+      detail::native_execution_runtime_product_id(core::RuntimeUnitId(
+          std::string(test::kLite6Ros2ControlExecutionRuntimeId))));
+  wrong_kind.front().product_contract_id = core::ProductContractId(
+      std::string(detail::kNativeExecutionRuntimeProductContractId));
+  wrong_kind.front().product_contract_revision =
+      detail::native_execution_runtime_product_contract_revision();
+  wrong_kind.front().invocation_lane_id = core::StopInvocationLaneId(
+      "manyforge.native_execution_host.focused_software_hard.v1");
+  EXPECT_THROW(
+      static_cast<void>(detail::emit_control_domain_control(
+          fixture.qualified.compiler_ir(), domain_id, wrong_kind)),
       RetainedBundleError);
 }
 

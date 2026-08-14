@@ -15,6 +15,7 @@
 #include "manyforge_deployment/cell_composition.hpp"
 #include "manyforge_deployment/native_execution_runtime_contract.hpp"
 #include "manyforge_deployment/retention_qualified_deployment.hpp"
+#include "manyforge_deployment/ros2_control_execution_runtime_contract.hpp"
 #include "manyforge_deployment/site_overlay_resolution.hpp"
 #include "posix_durability_internal.hpp"
 #include "retained_bundle_internal.hpp"
@@ -131,12 +132,16 @@ derive_cell_scoped_canonical_empty_deployment_impl(
     const RevisionVerifiedDeploymentArtifact &first_deployment,
     const std::span<const QualifiedRuntimeProfile> qualified_runtime_profiles) {
   const auto &graph = first_deployment.graph().graph();
-  if (graph.runtime_units.size() != 1U ||
-      !graph.runtime_units.front().dependency_runtime_unit_ids.empty() ||
-      graph.runtime_units.front().runtime_profile_id.value() !=
-          native_execution_runtime_contract::kRuntimeProfileId) {
+  const bool execution_profile =
+      graph.runtime_units.size() == 1U &&
+      (graph.runtime_units.front().runtime_profile_id.value() ==
+           native_execution_runtime_contract::kRuntimeProfileId ||
+       graph.runtime_units.front().runtime_profile_id.value() ==
+           ros2_control_execution_runtime_contract::kRuntimeProfileId);
+  if (!execution_profile ||
+      !graph.runtime_units.front().dependency_runtime_unit_ids.empty()) {
     fail("cell-scoped canonical-empty derivation requires one independent "
-         "native execution host runtime");
+         "execution host runtime");
   }
   const auto &runtime = graph.runtime_units.front();
   const auto profile = std::find_if(

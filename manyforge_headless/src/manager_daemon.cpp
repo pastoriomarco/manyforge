@@ -14,6 +14,7 @@
 #include <manyforge_deployment/artifact_codec.hpp>
 #include <manyforge_deployment/canonical_empty_admission.hpp>
 #include <manyforge_deployment/native_execution_runtime_contract.hpp>
+#include <manyforge_deployment/ros2_control_execution_runtime_contract.hpp>
 #include <manyforge_deployment/scenario_apply_candidate_source.hpp>
 #include <manyforge_deployment/verified_retained_bundle.hpp>
 #include <manyforge_scene/canonical_empty_scene_owner.hpp>
@@ -877,6 +878,8 @@ BuildBootstrapRuntimePlan(
   auto rows = component_manager::BuildVerifiedRuntimeConvergencePlan(
       admission.retained_bundle(), artifacts, "linux",
       {std::string(deployment::native_execution_runtime_contract::
+                       kLaunchEnvironmentContract),
+       std::string(deployment::ros2_control_execution_runtime_contract::
                        kLaunchEnvironmentContract)});
   if (rows.empty()) {
     return std::nullopt;
@@ -920,8 +923,12 @@ public:
             InstalledTargetRoot(), config_.package_root,
             config_.manager_state_root, config_.runtime_state_root,
             bundle_source_, artifact_source_, "linux",
-            std::string(deployment::native_execution_runtime_contract::
-                            kLaunchEnvironmentContract)),
+            std::vector<std::string>{
+                std::string(deployment::native_execution_runtime_contract::
+                                kLaunchEnvironmentContract),
+                std::string(
+                    deployment::ros2_control_execution_runtime_contract::
+                        kLaunchEnvironmentContract)}),
         stores_(config_.manager_state_root, admission_),
         scene_owner_(config_.logical_scene_database, admission_,
                      stores_.active_bundle_publication_store(), bundle_source_,
@@ -949,7 +956,10 @@ public:
             native_runtime_adapter_, runtime_adapter_router_,
             runtime_adapter_router_, manager_runtime_epoch_, "linux",
             {std::string(deployment::native_execution_runtime_contract::
-                             kLaunchEnvironmentContract)},
+                             kLaunchEnvironmentContract),
+             std::string(
+                 deployment::ros2_control_execution_runtime_contract::
+                     kLaunchEnvironmentContract)},
             [this] { return ElapsedNs(); },
             [] { return core::ApplyId(RandomToken("apply-")); }),
         scene_runtime_owner_(

@@ -92,6 +92,9 @@ public:
   open_request_socket_path() const noexcept;
   [[nodiscard]] const std::filesystem::path &
   ros_open_request_socket_path() const noexcept;
+  [[nodiscard]] core::Result<core::ComponentLifecycleCurrentSnapshotDTO>
+  ReadCurrentComponentSnapshot(
+      const core::ControllableComponentId &controllable_component_id) const;
 
 private:
   CCLCRuntimeComposition(

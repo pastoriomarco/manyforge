@@ -39,6 +39,7 @@
 #include "planning_resource_map_internal.hpp"
 #include "reference_runtime_unit_internal.hpp"
 #include "retained_bundle_internal.hpp"
+#include "ros2_control_execution_runtime_unit_internal.hpp"
 #include "verified_retained_bundle_internal.hpp"
 
 namespace manyforge::deployment {
@@ -143,6 +144,23 @@ require_native_execution_runtime_contract() {
     throw std::logic_error(
         "build-qualified native execution runtime product contract is absent "
         "or incoherent");
+  }
+  return *contract;
+}
+
+[[nodiscard]] const BuildQualifiedProductContract &
+require_ros2_control_execution_runtime_contract() {
+  const auto *contract = build_qualified_product_contract_registry().find(
+      core::ProductContractId(std::string(
+          detail::ros2_control_execution_runtime_product_contract_id())),
+      detail::ros2_control_execution_runtime_product_contract_revision());
+  if (contract == nullptr ||
+      contract->product_kind() !=
+          core::RetainedProductKind::kRuntimeUnitConfiguration ||
+      contract->placement() != ProductPlacement::kRuntimeUnit) {
+    throw std::logic_error(
+        "build-qualified ros2_control execution runtime product contract is "
+        "absent or incoherent");
   }
   return *contract;
 }
@@ -561,6 +579,8 @@ struct PreparedPlanningCollisionProduct final {
 
 inline constexpr std::string_view kNativeSoftwareHardInvocationLaneId =
     "manyforge.native_execution_host.focused_software_hard.v1";
+inline constexpr std::string_view kRos2ControlSoftwareHardInvocationLaneId =
+    "manyforge.ros2_control_execution_host.focused_software_hard.v1";
 
 struct PreparedControlQualification final {
   std::vector<detail::RetainedArtifactInput> conditional_artifacts;
@@ -601,9 +621,9 @@ require_control_binding(const core::CellGraphDTO &graph,
 }
 
 [[nodiscard]] const core::RuntimeUnitDTO &
-require_native_runtime_for_binding(const core::CellGraphDTO &graph,
-                                   const core::ControlDomainDTO &domain,
-                                   const core::ControlBindingDTO &binding) {
+require_execution_runtime_for_binding(const core::CellGraphDTO &graph,
+                                      const core::ControlDomainDTO &domain,
+                                      const core::ControlBindingDTO &binding) {
   const auto component = std::find_if(
       graph.controllable_components.begin(),
       graph.controllable_components.end(), [&](const auto &candidate) {
@@ -619,11 +639,23 @@ require_native_runtime_for_binding(const core::CellGraphDTO &graph,
       [&](const auto &runtime_unit) {
         return runtime_unit.runtime_unit_id == binding.provider_runtime_unit_id;
       });
-  if (match == graph.runtime_units.end() ||
-      match->runtime_profile_id.value() !=
-          detail::kNativeExecutionRuntimeProfileId ||
-      match->runtime_profile_revision.value() !=
-          detail::native_execution_runtime_profile_revision() ||
+  const bool native_execution =
+      match != graph.runtime_units.end() &&
+      match->runtime_profile_id.value() ==
+          detail::kNativeExecutionRuntimeProfileId &&
+      match->runtime_profile_revision.value() ==
+          detail::native_execution_runtime_profile_revision() &&
+      detail::native_execution_runtime_configuration_is_qualified(
+          match->configuration);
+  const bool ros2_control_execution =
+      match != graph.runtime_units.end() &&
+      match->runtime_profile_id.value() ==
+          detail::kRos2ControlExecutionRuntimeProfileId &&
+      match->runtime_profile_revision.value() ==
+          detail::ros2_control_execution_runtime_profile_revision() &&
+      detail::ros2_control_execution_runtime_configuration_is_qualified(
+          match->configuration);
+  if ((!native_execution && !ros2_control_execution) ||
       std::find(domain.runtime_unit_ids.begin(), domain.runtime_unit_ids.end(),
                 binding.provider_runtime_unit_id) ==
           domain.runtime_unit_ids.end() ||
@@ -633,7 +665,7 @@ require_native_runtime_for_binding(const core::CellGraphDTO &graph,
           component->runtime_unit_ids.end()) {
     detail::fail_retained_bundle(
         "Stop qualification binding's explicit provider runtime does not "
-        "resolve one exact native runtime product");
+        "resolve one exact execution runtime product");
   }
   return *match;
 }
@@ -681,11 +713,6 @@ normalized_parameter_text(const core::JsonObjectDTO &parameters,
   const auto &stops =
       qualified.compiler_ir().applicability().stop_applicability();
   const auto &sealed = context.stop_evidence();
-  const core::ProductContractId native_contract_id(
-      std::string(detail::kNativeExecutionRuntimeProductContractId));
-  const core::ProductContractRevision native_contract_revision(
-      detail::native_execution_runtime_product_contract_revision());
-
   std::vector<detail::BuildQualifiedStopImplementationEvidenceEntry>
       selected_implementation_entries;
   std::vector<detail::BuildQualifiedControlledStopSubstitutionEvidenceEntry>
@@ -713,9 +740,31 @@ normalized_parameter_text(const core::JsonObjectDTO &parameters,
     const auto &binding =
         require_control_binding(graph, stop->control_binding_id);
     const auto &runtime =
-        require_native_runtime_for_binding(graph, domain, binding);
+        require_execution_runtime_for_binding(graph, domain, binding);
+    const bool ros2_control_execution =
+        runtime.runtime_profile_id.value() ==
+        detail::kRos2ControlExecutionRuntimeProfileId;
+    const std::string_view implementation_id =
+        ros2_control_execution
+            ? detail::kRos2ControlExecutionRuntimeImplementationId
+            : detail::kNativeExecutionRuntimeImplementationId;
+    const core::ProductContractId runtime_contract_id(std::string(
+        ros2_control_execution
+            ? detail::kRos2ControlExecutionRuntimeProductContractId
+            : detail::kNativeExecutionRuntimeProductContractId));
+    const core::ProductContractRevision runtime_contract_revision =
+        ros2_control_execution
+            ? detail::ros2_control_execution_runtime_product_contract_revision()
+            : detail::native_execution_runtime_product_contract_revision();
+    const std::string_view invocation_lane_id =
+        ros2_control_execution ? kRos2ControlSoftwareHardInvocationLaneId
+                               : kNativeSoftwareHardInvocationLaneId;
     const core::ProductId runtime_product_id(
-        detail::native_execution_runtime_product_id(runtime.runtime_unit_id));
+        ros2_control_execution
+            ? detail::ros2_control_execution_runtime_product_id(
+                  runtime.runtime_unit_id)
+            : detail::native_execution_runtime_product_id(
+                  runtime.runtime_unit_id));
 
     for (const auto &stage : stop->escalation_stages) {
       if (stage.stage_kind == core::StopEscalationStageKind::kSoftwareHard) {
@@ -734,17 +783,16 @@ normalized_parameter_text(const core::JsonObjectDTO &parameters,
         const detail::BuildQualifiedStopImplementationEvidenceEntry *match =
             nullptr;
         for (const auto &candidate : sealed.implementation_entries()) {
-          if (candidate.implementation_id !=
-                  detail::kNativeExecutionRuntimeImplementationId ||
+          if (candidate.implementation_id != implementation_id ||
               candidate.provider_contract_ref !=
                   *stage.containment_command.provider_contract_ref ||
-              candidate.product_contract_id != native_contract_id ||
-              candidate.product_contract_revision != native_contract_revision ||
+              candidate.product_contract_id != runtime_contract_id ||
+              candidate.product_contract_revision !=
+                  runtime_contract_revision ||
               candidate.registered_command_kind_id !=
                   *stage.containment_command.registered_command_kind_id ||
               candidate.endpoint_role_id != endpoint ||
-              candidate.invocation_lane_id.value() !=
-                  kNativeSoftwareHardInvocationLaneId ||
+              candidate.invocation_lane_id.value() != invocation_lane_id ||
               candidate.qualified_issue_time_bound_ns > issue_budget) {
             continue;
           }
@@ -788,12 +836,12 @@ normalized_parameter_text(const core::JsonObjectDTO &parameters,
         const detail::BuildQualifiedControlledStopSubstitutionEvidenceEntry
             *match = nullptr;
         for (const auto &candidate : sealed.controlled_substitution_entries()) {
-          if (candidate.implementation_id !=
-                  detail::kNativeExecutionRuntimeImplementationId ||
+          if (candidate.implementation_id != implementation_id ||
               candidate.provider_contract_ref !=
                   *stage.containment_command.provider_contract_ref ||
-              candidate.product_contract_id != native_contract_id ||
-              candidate.product_contract_revision != native_contract_revision ||
+              candidate.product_contract_id != runtime_contract_id ||
+              candidate.product_contract_revision !=
+                  runtime_contract_revision ||
               candidate.requested_stop_mode !=
                   core::MotionControlledStopMode::kSoftOnPath ||
               candidate.executed_stop_mode !=
@@ -1132,7 +1180,7 @@ void require_qualified_structural_subset_before_store(
       graph.runtime_units.empty() && graph.controllable_components.empty() &&
       graph.control_domains.empty() && graph.control_bindings.empty() &&
       inputs.desired_control_configurations.empty();
-  const bool native_control_subset =
+  const bool controllable_subset =
       !graph.model_instances.empty() &&
       !graph.controllable_components.empty() &&
       !graph.control_domains.empty() && !graph.control_bindings.empty() &&
@@ -1143,10 +1191,10 @@ void require_qualified_structural_subset_before_store(
       graph.controllable_components.empty() && graph.control_domains.empty() &&
       graph.control_bindings.empty() &&
       inputs.desired_control_configurations.empty();
-  if (!passive_subset && !native_control_subset &&
+  if (!passive_subset && !controllable_subset &&
       !infrastructure_runtime_subset) {
     detail::fail_retained_bundle(
-        "retention accepts passive models, a bounded native controllable "
+        "retention accepts passive models, a bounded controllable "
         "cell, or one exact infrastructure runtime unit");
   }
 
@@ -1172,20 +1220,29 @@ void require_qualified_structural_subset_before_store(
           "passive structural retention contains component/control "
           "semantics or an unplaced model");
     }
-  } else if (native_control_subset) {
+  } else if (controllable_subset) {
     const bool has_runtime_units = !graph.runtime_units.empty();
-    const bool exact_native_runtime_units = std::all_of(
+    const bool exact_execution_runtime_units = std::all_of(
         graph.runtime_units.begin(), graph.runtime_units.end(),
         [](const core::RuntimeUnitDTO &unit) {
-          return unit.runtime_profile_id.value() ==
-                     detail::kNativeExecutionRuntimeProfileId &&
-                 unit.runtime_profile_revision.value() ==
-                     detail::native_execution_runtime_profile_revision() &&
-                 unit.dependency_runtime_unit_ids.empty() &&
-                 detail::native_execution_runtime_configuration_is_qualified(
-                     unit.configuration);
+          const bool native_execution =
+              unit.runtime_profile_id.value() ==
+                  detail::kNativeExecutionRuntimeProfileId &&
+              unit.runtime_profile_revision.value() ==
+                  detail::native_execution_runtime_profile_revision() &&
+              detail::native_execution_runtime_configuration_is_qualified(
+                  unit.configuration);
+          const bool ros2_control_execution =
+              unit.runtime_profile_id.value() ==
+                  detail::kRos2ControlExecutionRuntimeProfileId &&
+              unit.runtime_profile_revision.value() ==
+                  detail::ros2_control_execution_runtime_profile_revision() &&
+              detail::ros2_control_execution_runtime_configuration_is_qualified(
+                  unit.configuration);
+          return (native_execution || ros2_control_execution) &&
+                 unit.dependency_runtime_unit_ids.empty();
         });
-    if (!has_runtime_units || !exact_native_runtime_units ||
+    if (!has_runtime_units || !exact_execution_runtime_units ||
         composition.component_types().empty() ||
         composition.control_binding_coordinate_maps().size() !=
             graph.control_bindings.size() ||
@@ -1197,7 +1254,7 @@ void require_qualified_structural_subset_before_store(
         applicability.stop_applicability().size() !=
             applicability.routes().size()) {
       detail::fail_retained_bundle(
-          "native controllable retention is outside its bounded qualified "
+          "controllable retention is outside its bounded qualified "
           "component/target/domain subset");
     }
 
@@ -1288,7 +1345,15 @@ void require_qualified_structural_subset_before_store(
             detail::native_execution_runtime_profile_revision() &&
         detail::native_execution_runtime_configuration_is_qualified(
             unit.configuration);
-    if ((!exact_reference && !exact_native_host) ||
+    const bool exact_ros2_control_host =
+        unit.runtime_profile_id.value() ==
+            detail::kRos2ControlExecutionRuntimeProfileId &&
+        unit.runtime_profile_revision.value() ==
+            detail::ros2_control_execution_runtime_profile_revision() &&
+        detail::ros2_control_execution_runtime_configuration_is_qualified(
+            unit.configuration);
+    if ((!exact_reference && !exact_native_host &&
+         !exact_ros2_control_host) ||
         !unit.dependency_runtime_unit_ids.empty() ||
         applicability.runtime_profiles().size() != 1U ||
         !composition.component_types().empty() ||
@@ -1310,8 +1375,11 @@ void require_qualified_structural_subset_before_store(
     if (exact_reference) {
       static_cast<void>(detail::emit_reference_runtime_manifest(
           qualified.compiler_ir(), unit.runtime_unit_id));
-    } else {
+    } else if (exact_native_host) {
       static_cast<void>(detail::emit_native_execution_runtime_manifest(
+          qualified.compiler_ir(), unit.runtime_unit_id));
+    } else {
+      static_cast<void>(detail::emit_ros2_control_execution_runtime_manifest(
           qualified.compiler_ir(), unit.runtime_unit_id));
     }
   }
@@ -1785,38 +1853,35 @@ prepare_planning_collision_product_before_store(
   }
   std::vector<detail::PreparedRuntimeUnitArtifact> runtime_unit_artifacts;
   runtime_unit_artifacts.reserve(composition.graph().runtime_units.size());
-  std::set<std::string, std::less<>> qualified_native_runtime_product_ids;
+  std::set<std::string, std::less<>> qualified_runtime_product_ids;
   for (const auto &artifact : control_domain_artifacts) {
     for (const auto &qualification :
          artifact.stop_implementation_qualifications) {
-      qualified_native_runtime_product_ids.insert(
+      qualified_runtime_product_ids.insert(
           qualification.product_id.value());
     }
     for (const auto &qualification :
          artifact.controlled_stop_substitution_qualifications) {
-      qualified_native_runtime_product_ids.insert(
+      qualified_runtime_product_ids.insert(
           qualification.product_id.value());
     }
   }
-  const detail::StopImplementationBuildIdentity *native_stop_build_identity =
-      nullptr;
+  std::map<std::string, const detail::StopImplementationBuildIdentity *,
+           std::less<>> stop_build_identities;
   for (const auto &identity :
        retention_context.stop_evidence().implementation_build_identities()) {
     if (identity.implementation_id !=
-        detail::kNativeExecutionRuntimeImplementationId) {
+            detail::kNativeExecutionRuntimeImplementationId &&
+        identity.implementation_id !=
+            detail::kRos2ControlExecutionRuntimeImplementationId) {
       continue;
     }
-    if (native_stop_build_identity != nullptr) {
+    if (!stop_build_identities.emplace(identity.implementation_id, &identity)
+             .second) {
       throw std::logic_error(
-          "sealed Stop evidence repeats the native implementation build "
+          "sealed Stop evidence repeats an execution implementation build "
           "identity");
     }
-    native_stop_build_identity = &identity;
-  }
-  if (!qualified_native_runtime_product_ids.empty() &&
-      native_stop_build_identity == nullptr) {
-    detail::fail_retained_bundle(
-        "native Stop qualification lost its exact build identity");
   }
   std::set<std::string, std::less<>> materialized_build_identity_product_ids;
   for (const auto &unit : composition.graph().runtime_units) {
@@ -1828,6 +1893,8 @@ prepare_planning_collision_product_before_store(
     std::string_view manifest_media_type;
     std::string_view launchable_role;
     std::string_view launchable_media_type;
+    std::string_view build_identity_role;
+    std::string_view build_identity_media_type;
     std::optional<std::string> implementation_build_identity;
     core::ProductId product_id(std::string{});
     if (unit.runtime_profile_id.value() == detail::kReferenceRuntimeProfileId &&
@@ -1877,10 +1944,60 @@ prepare_planning_collision_product_before_store(
           detail::kNativeExecutionRuntimeLaunchDescriptorMediaType;
       product_id = core::ProductId(
           detail::native_execution_runtime_product_id(unit.runtime_unit_id));
-      if (native_stop_build_identity != nullptr) {
+      build_identity_role =
+          detail::kNativeExecutionRuntimeBuildIdentityArtifactRole;
+      build_identity_media_type =
+          detail::kNativeExecutionRuntimeBuildIdentityMediaType;
+      const auto identity = stop_build_identities.find(
+          std::string(detail::kNativeExecutionRuntimeImplementationId));
+      if (identity != stop_build_identities.end()) {
         implementation_build_identity =
-            native_stop_build_identity->canonical_build_closure_bytes;
-        if (qualified_native_runtime_product_ids.contains(product_id.value())) {
+            identity->second->canonical_build_closure_bytes;
+        if (qualified_runtime_product_ids.contains(product_id.value())) {
+          materialized_build_identity_product_ids.insert(product_id.value());
+        }
+      }
+    } else if (unit.runtime_profile_id.value() ==
+                   detail::kRos2ControlExecutionRuntimeProfileId &&
+               unit.runtime_profile_revision.value() ==
+                   detail::ros2_control_execution_runtime_profile_revision()) {
+      kind = detail::PreparedRuntimeUnitKind::kRos2ControlExecution;
+      qualified_runtime_contract =
+          &require_ros2_control_execution_runtime_contract();
+      manifest = detail::emit_ros2_control_execution_runtime_manifest(
+          qualified.compiler_ir(), unit.runtime_unit_id);
+      detail::require_ros2_control_execution_runtime_manifest_matches(
+          manifest, qualified.compiler_ir(), unit.runtime_unit_id);
+      launchable =
+          detail::ros2_control_execution_runtime_launch_descriptor();
+      if (launchable.empty() ||
+          launchable.size() >
+              detail::kMaxRos2ControlExecutionLaunchDescriptorBytes) {
+        throw std::logic_error(
+            "build-owned ros2_control execution launch descriptor exceeds "
+            "its bound");
+      }
+      manifest_role =
+          detail::kRos2ControlExecutionRuntimeManifestArtifactRole;
+      manifest_media_type =
+          detail::kRos2ControlExecutionRuntimeManifestMediaType;
+      launchable_role =
+          detail::kRos2ControlExecutionRuntimeLaunchDescriptorArtifactRole;
+      launchable_media_type =
+          detail::kRos2ControlExecutionRuntimeLaunchDescriptorMediaType;
+      build_identity_role =
+          detail::kRos2ControlExecutionRuntimeBuildIdentityArtifactRole;
+      build_identity_media_type =
+          detail::kRos2ControlExecutionRuntimeBuildIdentityMediaType;
+      product_id = core::ProductId(
+          detail::ros2_control_execution_runtime_product_id(
+              unit.runtime_unit_id));
+      const auto identity = stop_build_identities.find(
+          std::string(detail::kRos2ControlExecutionRuntimeImplementationId));
+      if (identity != stop_build_identities.end()) {
+        implementation_build_identity =
+            identity->second->canonical_build_closure_bytes;
+        if (qualified_runtime_product_ids.contains(product_id.value())) {
           materialized_build_identity_product_ids.insert(product_id.value());
         }
       }
@@ -1896,9 +2013,8 @@ prepare_planning_collision_product_before_store(
     };
     if (implementation_build_identity.has_value()) {
       runtime_inputs.push_back(detail::RetainedArtifactInput{
-          core::ArtifactRoleId(std::string(
-              detail::kNativeExecutionRuntimeBuildIdentityArtifactRole)),
-          std::string(detail::kNativeExecutionRuntimeBuildIdentityMediaType),
+          core::ArtifactRoleId(std::string(build_identity_role)),
+          std::string(build_identity_media_type),
           *implementation_build_identity});
     }
     std::sort(runtime_inputs.begin(), runtime_inputs.end(),
@@ -1917,7 +2033,7 @@ prepare_planning_collision_product_before_store(
         qualified_runtime_contract});
   }
   if (materialized_build_identity_product_ids !=
-      qualified_native_runtime_product_ids) {
+      qualified_runtime_product_ids) {
     detail::fail_retained_bundle(
         "Stop qualification names a runtime product outside the exact "
         "retained runtime-unit set");
@@ -2249,11 +2365,19 @@ void require_verified_current_bundle_artifacts(
     const std::string_view manifest_role =
         expected.kind == detail::PreparedRuntimeUnitKind::kReference
             ? detail::kReferenceRuntimeManifestArtifactRole
-            : detail::kNativeExecutionRuntimeManifestArtifactRole;
+        : expected.kind == detail::PreparedRuntimeUnitKind::kNativeExecution
+            ? detail::kNativeExecutionRuntimeManifestArtifactRole
+            : detail::kRos2ControlExecutionRuntimeManifestArtifactRole;
     const std::string_view launchable_role =
         expected.kind == detail::PreparedRuntimeUnitKind::kReference
             ? detail::kReferenceRuntimeLaunchableArtifactRole
-            : detail::kNativeExecutionRuntimeLaunchDescriptorArtifactRole;
+        : expected.kind == detail::PreparedRuntimeUnitKind::kNativeExecution
+            ? detail::kNativeExecutionRuntimeLaunchDescriptorArtifactRole
+            : detail::kRos2ControlExecutionRuntimeLaunchDescriptorArtifactRole;
+    const std::string_view build_identity_role =
+        expected.kind == detail::PreparedRuntimeUnitKind::kRos2ControlExecution
+            ? detail::kRos2ControlExecutionRuntimeBuildIdentityArtifactRole
+            : detail::kNativeExecutionRuntimeBuildIdentityArtifactRole;
     std::optional<std::string> manifest;
     std::optional<std::string> launchable;
     std::optional<std::string> implementation_build_identity;
@@ -2269,8 +2393,7 @@ void require_verified_current_bundle_artifacts(
         manifest = *bytes;
       } else if (artifact.artifact_role_id.value() == launchable_role) {
         launchable = *bytes;
-      } else if (artifact.artifact_role_id.value() ==
-                 detail::kNativeExecutionRuntimeBuildIdentityArtifactRole) {
+      } else if (artifact.artifact_role_id.value() == build_identity_role) {
         implementation_build_identity = *bytes;
       }
     }
@@ -2285,8 +2408,16 @@ void require_verified_current_bundle_artifacts(
     if (expected.kind == detail::PreparedRuntimeUnitKind::kReference) {
       detail::require_reference_runtime_product_matches_retained_bundle(
           *manifest, *launchable, value, group.runtime_unit_id);
-    } else {
+    } else if (expected.kind ==
+               detail::PreparedRuntimeUnitKind::kNativeExecution) {
       detail::require_native_execution_runtime_product_matches_retained_bundle(
+          *manifest, *launchable,
+          implementation_build_identity.has_value()
+              ? std::optional<std::string_view>(*implementation_build_identity)
+              : std::nullopt,
+          value, group.runtime_unit_id);
+    } else {
+      detail::require_ros2_control_execution_runtime_product_matches_retained_bundle(
           *manifest, *launchable,
           implementation_build_identity.has_value()
               ? std::optional<std::string_view>(*implementation_build_identity)
@@ -2525,6 +2656,8 @@ detail::RetainedBundleMaterializer::materialize_prepared(
     std::string_view manifest_media_type;
     std::string_view launchable_role;
     std::string_view launchable_media_type;
+    std::string_view build_identity_role;
+    std::string_view build_identity_media_type;
     core::ProductId product_id(std::string{});
     switch (input.kind) {
     case detail::PreparedRuntimeUnitKind::kReference:
@@ -2559,6 +2692,35 @@ detail::RetainedBundleMaterializer::materialize_prepared(
           detail::kNativeExecutionRuntimeLaunchDescriptorMediaType;
       product_id = core::ProductId(
           detail::native_execution_runtime_product_id(input.runtime_unit_id));
+      build_identity_role =
+          detail::kNativeExecutionRuntimeBuildIdentityArtifactRole;
+      build_identity_media_type =
+          detail::kNativeExecutionRuntimeBuildIdentityMediaType;
+      break;
+    case detail::PreparedRuntimeUnitKind::kRos2ControlExecution:
+      detail::require_ros2_control_execution_runtime_manifest_matches(
+          input.manifest_bytes, qualified.compiler_ir(), input.runtime_unit_id);
+      if (input.launchable_bytes !=
+          detail::ros2_control_execution_runtime_launch_descriptor()) {
+        throw std::logic_error(
+            "prepared ros2_control execution launch descriptor changed before "
+            "retention");
+      }
+      manifest_role =
+          detail::kRos2ControlExecutionRuntimeManifestArtifactRole;
+      manifest_media_type =
+          detail::kRos2ControlExecutionRuntimeManifestMediaType;
+      launchable_role =
+          detail::kRos2ControlExecutionRuntimeLaunchDescriptorArtifactRole;
+      launchable_media_type =
+          detail::kRos2ControlExecutionRuntimeLaunchDescriptorMediaType;
+      product_id = core::ProductId(
+          detail::ros2_control_execution_runtime_product_id(
+              input.runtime_unit_id));
+      build_identity_role =
+          detail::kRos2ControlExecutionRuntimeBuildIdentityArtifactRole;
+      build_identity_media_type =
+          detail::kRos2ControlExecutionRuntimeBuildIdentityMediaType;
       break;
     }
     std::vector<detail::RetainedArtifactInput> runtime_artifacts{
@@ -2569,9 +2731,8 @@ detail::RetainedBundleMaterializer::materialize_prepared(
     };
     if (input.implementation_build_identity_bytes.has_value()) {
       runtime_artifacts.push_back(detail::RetainedArtifactInput{
-          core::ArtifactRoleId(std::string(
-              detail::kNativeExecutionRuntimeBuildIdentityArtifactRole)),
-          std::string(detail::kNativeExecutionRuntimeBuildIdentityMediaType),
+          core::ArtifactRoleId(std::string(build_identity_role)),
+          std::string(build_identity_media_type),
           *input.implementation_build_identity_bytes});
     }
     std::sort(runtime_artifacts.begin(), runtime_artifacts.end(),
@@ -2598,8 +2759,7 @@ detail::RetainedBundleMaterializer::materialize_prepared(
         retained_manifest = *readback;
       } else if (artifact.artifact_role_id.value() == launchable_role) {
         retained_launchable = *readback;
-      } else if (artifact.artifact_role_id.value() ==
-                 detail::kNativeExecutionRuntimeBuildIdentityArtifactRole) {
+      } else if (artifact.artifact_role_id.value() == build_identity_role) {
         retained_build_identity = *readback;
       }
     }

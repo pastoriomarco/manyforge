@@ -508,7 +508,7 @@ TEST(ClosedSchema, BuildRegistryQualifiesOnlyTheCompleteAdmittedFamilies) {
   const auto &registry = build_qualified_closed_schema_registry();
   ASSERT_EQ(registry.catalog_schemas().size(),
             core::kCatalogRecordTypeRegistry.size());
-  ASSERT_EQ(registry.value_schemas().size(), 4U);
+  ASSERT_EQ(registry.value_schemas().size(), 5U);
   for (const auto &value_schema : registry.value_schemas()) {
     const auto expected_shape = value_schema.schema_id().value() ==
                                         "manyforge.value_schema.provider_"
@@ -676,7 +676,7 @@ TEST(ClosedSchema, BuildRegistryQualifiesOnlyTheCompleteAdmittedFamilies) {
   EXPECT_EQ(qualified_count, 11U);
   EXPECT_EQ(registry.qualification_registry_digest().value(),
             "sha256:"
-            "019bf635a4675e91fd319a5f8f34e7d05cd86f65983a38acea3a2d16c7a16833");
+            "65ee605872372888db7677aa168be992961e04b05c924ebe05f4283e3b0f8c74");
   EXPECT_NE(
       registry.find_qualified_value_schema(
           core::SchemaId("manyforge.value_schema.provider_contract.empty.v1"),
@@ -1008,7 +1008,7 @@ TEST(ClosedSchema, EveryPackagedYamlResourcePassesStrictUniqueKeyIngress) {
         << relative_path;
     ++parsed_count;
   }
-  EXPECT_EQ(parsed_count, 19U);
+  EXPECT_EQ(parsed_count, 20U);
 }
 
 TEST(ClosedSchema,
@@ -1290,6 +1290,7 @@ TEST(ClosedSchema,
       "manyforge.value_schema.provider_contract.motion_controlled_stop.v1.yaml",
       "value/manyforge.value_schema.runtime.empty.v1.yaml",
       "value/manyforge.value_schema.runtime.native_execution.v1.yaml",
+      "value/manyforge.value_schema.runtime.ros2_control_execution.v1.yaml",
   };
   EXPECT_EQ(source_tree_yaml, expected_source_tree_yaml);
 }

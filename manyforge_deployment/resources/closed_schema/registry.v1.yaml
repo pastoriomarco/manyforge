@@ -83,3 +83,7 @@ value_schemas:
     schema_revision: sha256:c20bf40303bddd213d8db77b7075c0fe224e00928f4e6bda3cbfd7ebba880d6e
     relative_path: value/manyforge.value_schema.runtime.native_execution.v1.yaml
     qualification: qualified
+  - schema_id: manyforge.value_schema.runtime.ros2_control_execution.v1
+    schema_revision: sha256:2404a4d3156048f5969c651c550e7f785d5b23e4ccc07df9004f3ba2d98e6bc6
+    relative_path: value/manyforge.value_schema.runtime.ros2_control_execution.v1.yaml
+    qualification: qualified

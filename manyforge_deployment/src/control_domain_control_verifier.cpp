@@ -23,6 +23,7 @@
 #include "manyforge_deployment/provider_manifest_codec.hpp"
 #include "manyforge_deployment/stop_evidence_policy_codec.hpp"
 #include "native_execution_runtime_unit_internal.hpp"
+#include "ros2_control_execution_runtime_unit_internal.hpp"
 #include "stop_qualification_evidence_internal.hpp"
 #include "verified_retained_bundle_internal.hpp"
 
@@ -35,6 +36,70 @@ constexpr std::string_view kImplementationProfileId = "manyforge.reference_ros2_
 constexpr std::string_view kImplementationApiVersion =
     "manyforge.control_controller_implementation.v1";
 constexpr std::string_view kSourceConformanceApiVersion = "manyforge.control_source_conformance.v1";
+
+enum class ExecutionRuntimeProductKind {
+  kNative,
+  kRos2Control,
+};
+
+[[nodiscard]] std::optional<ExecutionRuntimeProductKind>
+execution_runtime_product_kind(std::string_view contract_id,
+                               std::string_view contract_revision) {
+  if (contract_id == kNativeExecutionRuntimeProductContractId &&
+      contract_revision ==
+          native_execution_runtime_product_contract_revision().value()) {
+    return ExecutionRuntimeProductKind::kNative;
+  }
+  if (contract_id == kRos2ControlExecutionRuntimeProductContractId &&
+      contract_revision ==
+          ros2_control_execution_runtime_product_contract_revision().value()) {
+    return ExecutionRuntimeProductKind::kRos2Control;
+  }
+  return std::nullopt;
+}
+
+[[nodiscard]] std::string_view execution_runtime_implementation_id(
+    ExecutionRuntimeProductKind kind) noexcept {
+  return kind == ExecutionRuntimeProductKind::kNative
+             ? kNativeExecutionRuntimeImplementationId
+             : kRos2ControlExecutionRuntimeImplementationId;
+}
+
+[[nodiscard]] std::string_view execution_runtime_installed_target_id(
+    ExecutionRuntimeProductKind kind) noexcept {
+  return kind == ExecutionRuntimeProductKind::kNative
+             ? kNativeExecutionRuntimeInstalledTargetId
+             : kRos2ControlExecutionRuntimeInstalledTargetId;
+}
+
+[[nodiscard]] std::string_view execution_runtime_build_identity_role(
+    ExecutionRuntimeProductKind kind) noexcept {
+  return kind == ExecutionRuntimeProductKind::kNative
+             ? kNativeExecutionRuntimeBuildIdentityArtifactRole
+             : kRos2ControlExecutionRuntimeBuildIdentityArtifactRole;
+}
+
+[[nodiscard]] std::string_view execution_runtime_build_identity_media_type(
+    ExecutionRuntimeProductKind kind) noexcept {
+  return kind == ExecutionRuntimeProductKind::kNative
+             ? kNativeExecutionRuntimeBuildIdentityMediaType
+             : kRos2ControlExecutionRuntimeBuildIdentityMediaType;
+}
+
+[[nodiscard]] std::string_view execution_runtime_invocation_lane_id(
+    ExecutionRuntimeProductKind kind) noexcept {
+  return kind == ExecutionRuntimeProductKind::kNative
+             ? "manyforge.native_execution_host.focused_software_hard.v1"
+             : "manyforge.ros2_control_execution_host.focused_software_hard.v1";
+}
+
+[[nodiscard]] std::string execution_runtime_product_id(
+    ExecutionRuntimeProductKind kind,
+    const core::RuntimeUnitId& runtime_unit_id) {
+  return kind == ExecutionRuntimeProductKind::kNative
+             ? native_execution_runtime_product_id(runtime_unit_id)
+             : ros2_control_execution_runtime_product_id(runtime_unit_id);
+}
 
 struct ImplementationDescriptor final {
   std::string_view implementation_id;
@@ -1754,6 +1819,39 @@ verify_stop_qualification_tables(
     return text == nullptr ? std::nullopt
                            : std::optional<std::string_view>(*text);
   };
+  const auto runtime_subject_for_product =
+      [&](const std::set<std::string, std::less<>>& subjects,
+          std::string_view subject_prefix, std::string_view product_id,
+          ExecutionRuntimeProductKind runtime_kind,
+          std::string_view qualification_label) {
+        std::optional<std::string> matched_subject;
+        for (const auto& [binding_id, binding] : bindings) {
+          static_cast<void>(binding_id);
+          const core::RuntimeUnitId runtime_unit_id(
+              binding.provider_runtime_unit_id);
+          if (execution_runtime_product_id(runtime_kind, runtime_unit_id) !=
+              product_id) {
+            continue;
+          }
+          std::string candidate(subject_prefix);
+          candidate.push_back('\x1f');
+          candidate.append(runtime_unit_id.value());
+          if (!subjects.contains(candidate)) {
+            continue;
+          }
+          if (matched_subject.has_value() && *matched_subject != candidate) {
+            fail_retained_bundle(std::string(qualification_label) +
+                                 " resolves multiple runtime-unit subjects");
+          }
+          matched_subject = std::move(candidate);
+        }
+        if (!matched_subject.has_value()) {
+          fail_retained_bundle(std::string(qualification_label) +
+                               " names a product outside its exact "
+                               "runtime-unit subject");
+        }
+        return *matched_subject;
+      };
 
   for (const auto& stop_value : require_array(
            require_member(control, "stop_applicability", "control"),
@@ -1772,12 +1870,8 @@ verify_stop_qualification_tables(
       fail_retained_bundle(
           "Stop qualification subject has no exact control binding");
     }
-    const std::string runtime_product_id = native_execution_runtime_product_id(
-        core::RuntimeUnitId(binding->second.provider_runtime_unit_id));
-    const std::string runtime_product_key =
-        runtime_product_id + "\x1f" +
-        std::string(kNativeExecutionRuntimeProductContractId) + "\x1f" +
-        native_execution_runtime_product_contract_revision().value();
+    const std::string& runtime_unit_id =
+        binding->second.provider_runtime_unit_id;
     for (const auto& stage_value : require_array(
              require_member(stop, "escalation_stages",
                             "control.stop_applicability"),
@@ -1808,11 +1902,12 @@ verify_stop_qualification_tables(
               "endpoint_role_id",
               "control.stop_applicability.provider_command_endpoint");
         }
-        hard_subjects.insert(contract_key(
-                                 contract_value,
-                                 "control.stop_applicability.provider_contract_ref") +
-                             "\x1f" + command_id + "\x1f" + endpoint +
-                             "\x1f" + runtime_product_key);
+        hard_subjects.insert(
+            contract_key(
+                contract_value,
+                "control.stop_applicability.provider_contract_ref") +
+            "\x1f" + command_id + "\x1f" + endpoint + "\x1f" +
+            runtime_unit_id);
       }
       const CanonicalValue& parameters = require_member(
           stage, "default_contract_parameters", "control.stop_applicability");
@@ -1824,10 +1919,11 @@ verify_stop_qualification_tables(
                 std::optional<std::string_view>("soft_on_path") &&
             optional_text(object, "recoverable_substitution_mode") ==
                 std::optional<std::string_view>("spring_back_hold")) {
-          substitution_subjects.insert(contract_key(
-              contract_value,
-              "control.stop_applicability.provider_contract_ref") +
-              "\x1f" + runtime_product_key);
+          substitution_subjects.insert(
+              contract_key(
+                  contract_value,
+                  "control.stop_applicability.provider_contract_ref") +
+              "\x1f" + runtime_unit_id);
         }
       }
       const CanonicalValue& commissioned = require_member(
@@ -1872,21 +1968,24 @@ verify_stop_qualification_tables(
         "control.stop_implementation_qualifications.endpoint_role_id");
     const std::string product_id = require_identity_member(
         row, "product_id", "control.stop_implementation_qualifications");
+    const std::string product_contract_id = require_identity_member(
+        row, "product_contract_id",
+        "control.stop_implementation_qualifications");
+    const std::string product_contract_revision = require_digest_member(
+        row, "product_contract_revision",
+        "control.stop_implementation_qualifications");
+    const auto runtime_kind = execution_runtime_product_kind(
+        product_contract_id, product_contract_revision);
     if (definition == nullptr ||
         definition->stop_action_class !=
             core::StopActionClass::kSoftwareHard ||
-        require_identity_member(row, "product_contract_id",
-                                "control.stop_implementation_qualifications") !=
-            kNativeExecutionRuntimeProductContractId ||
-        require_digest_member(
-            row, "product_contract_revision",
-            "control.stop_implementation_qualifications") !=
-            native_execution_runtime_product_contract_revision().value() ||
+        !runtime_kind.has_value() ||
         require_identity_member(row, "invocation_lane_id",
                                 "control.stop_implementation_qualifications") !=
-            "manyforge.native_execution_host.focused_software_hard.v1") {
+            execution_runtime_invocation_lane_id(*runtime_kind)) {
       fail_retained_bundle(
-          "Stop implementation qualification is not the exact native hard lane");
+          "Stop implementation qualification is not an exact qualified "
+          "execution hard lane");
     }
     const RetainedArtifactFacts artifact = verify_retained_artifact_ref(
         require_member(row, "qualification_artifact_ref",
@@ -1901,14 +2000,16 @@ verify_stop_qualification_tables(
           "Stop implementation qualifications do not share one exact evidence artifact");
     }
     implementation_artifact = artifact;
-    qualified_hard_subjects.insert(
-        contract_key(require_member(row, "provider_contract_ref",
-                                    "control.stop_implementation_qualifications"),
-                     "control.stop_implementation_qualifications.provider_contract_ref") +
-        "\x1f" + command_id + "\x1f" + endpoint.value_or("") + "\x1f" +
-        product_id + "\x1f" +
-        std::string(kNativeExecutionRuntimeProductContractId) + "\x1f" +
-        native_execution_runtime_product_contract_revision().value());
+    const std::string subject_prefix =
+        contract_key(
+            require_member(row, "provider_contract_ref",
+                           "control.stop_implementation_qualifications"),
+            "control.stop_implementation_qualifications."
+            "provider_contract_ref") +
+        "\x1f" + command_id + "\x1f" + endpoint.value_or("");
+    qualified_hard_subjects.insert(runtime_subject_for_product(
+        hard_subjects, subject_prefix, product_id, *runtime_kind,
+        "Stop implementation qualification"));
   }
   if (qualified_hard_subjects != hard_subjects) {
     fail_retained_bundle(
@@ -1940,14 +2041,15 @@ verify_stop_qualification_tables(
     const std::string product_id = require_identity_member(
         row, "product_id",
         "control.controlled_stop_substitution_qualifications");
-    if (require_identity_member(
-            row, "product_contract_id",
-            "control.controlled_stop_substitution_qualifications") !=
-            kNativeExecutionRuntimeProductContractId ||
-        require_digest_member(
-            row, "product_contract_revision",
-            "control.controlled_stop_substitution_qualifications") !=
-            native_execution_runtime_product_contract_revision().value() ||
+    const std::string product_contract_id = require_identity_member(
+        row, "product_contract_id",
+        "control.controlled_stop_substitution_qualifications");
+    const std::string product_contract_revision = require_digest_member(
+        row, "product_contract_revision",
+        "control.controlled_stop_substitution_qualifications");
+    const auto runtime_kind = execution_runtime_product_kind(
+        product_contract_id, product_contract_revision);
+    if (!runtime_kind.has_value() ||
         require_string(require_member(row, "requested_stop_mode", "control"),
                        "control.requested_stop_mode") != "soft_on_path" ||
         require_string(require_member(row, "executed_stop_mode", "control"),
@@ -1968,12 +2070,13 @@ verify_stop_qualification_tables(
           "controlled Stop substitution qualifications do not share one exact evidence artifact");
     }
     substitution_artifact = artifact;
-    qualified_substitution_subjects.insert(contract_key(
+    const std::string subject_prefix = contract_key(
         require_member(row, "provider_contract_ref", "control"),
-        "control.controlled_stop_substitution_qualifications.provider_contract_ref") +
-        "\x1f" + product_id + "\x1f" +
-        std::string(kNativeExecutionRuntimeProductContractId) + "\x1f" +
-        native_execution_runtime_product_contract_revision().value());
+        "control.controlled_stop_substitution_qualifications."
+        "provider_contract_ref");
+    qualified_substitution_subjects.insert(runtime_subject_for_product(
+        substitution_subjects, subject_prefix, product_id, *runtime_kind,
+        "controlled Stop substitution qualification"));
   }
   if (qualified_substitution_subjects != substitution_subjects) {
     fail_retained_bundle(
@@ -2691,7 +2794,8 @@ void require_control_domain_control_matches_retained_bundle(
       require_digest_member(object, "topology_revision", "control"),
       source_bindings, source_controllers, source_activations, source_routes,
       stop_policies, controller_topologies, provider_manifests);
-  std::set<std::string, std::less<>> qualified_runtime_product_ids;
+  std::map<std::string, std::pair<std::string, std::string>, std::less<>>
+      qualified_runtime_products;
   for (const auto field : {"stop_implementation_qualifications",
                            "controlled_stop_substitution_qualifications"}) {
     for (const auto& qualification : require_array(
@@ -2699,8 +2803,26 @@ void require_control_domain_control_matches_retained_bundle(
              std::string("control.") + field)) {
       const auto& row = require_object(
           qualification, std::string("control.") + field);
-      qualified_runtime_product_ids.insert(require_identity_member(
-          row, "product_id", std::string("control.") + field));
+      const std::string product_id = require_identity_member(
+          row, "product_id", std::string("control.") + field);
+      const std::string contract_id = require_identity_member(
+          row, "product_contract_id", std::string("control.") + field);
+      const std::string contract_revision = require_digest_member(
+          row, "product_contract_revision", std::string("control.") + field);
+      if (!execution_runtime_product_kind(contract_id, contract_revision)
+               .has_value()) {
+        fail_retained_bundle(
+            "Stop qualification names an unqualified runtime product "
+            "contract");
+      }
+      const auto [found, inserted] = qualified_runtime_products.emplace(
+          product_id, std::pair{contract_id, contract_revision});
+      if (!inserted &&
+          found->second != std::pair{contract_id, contract_revision}) {
+        fail_retained_bundle(
+            "Stop qualification assigns conflicting contracts to one runtime "
+            "product");
+      }
     }
   }
   std::set<std::string, std::less<>> matched_runtime_product_ids;
@@ -2710,34 +2832,52 @@ void require_control_domain_control_matches_retained_bundle(
     const auto& binding = require_object(binding_value, "control.bindings");
     const core::RuntimeUnitId runtime_unit_id(require_identity_member(
         binding, "provider_runtime_unit_id", "control.bindings"));
-    const std::string expected_product_id =
-        native_execution_runtime_product_id(runtime_unit_id);
-    if (!qualified_runtime_product_ids.contains(expected_product_id)) {
-      continue;
+    for (const auto runtime_kind : {ExecutionRuntimeProductKind::kNative,
+                                    ExecutionRuntimeProductKind::kRos2Control}) {
+      const std::string expected_product_id =
+          execution_runtime_product_id(runtime_kind, runtime_unit_id);
+      const auto qualified =
+          qualified_runtime_products.find(expected_product_id);
+      if (qualified == qualified_runtime_products.end()) {
+        continue;
+      }
+      if (execution_runtime_product_kind(qualified->second.first,
+                                         qualified->second.second) !=
+          runtime_kind) {
+        fail_retained_bundle(
+            "Stop qualification product identity differs from its exact "
+            "execution runtime contract");
+      }
+      const auto group = std::find_if(
+          retained_bundle.compiled_products.runtime_unit_products.begin(),
+          retained_bundle.compiled_products.runtime_unit_products.end(),
+          [&](const auto& candidate) {
+            return candidate.runtime_unit_id == runtime_unit_id;
+          });
+      if (group ==
+              retained_bundle.compiled_products.runtime_unit_products.end() ||
+          group->products.size() != 1U ||
+          group->products.front().product_id.value() != expected_product_id ||
+          group->products.front().product_kind !=
+              core::RetainedProductKind::kRuntimeUnitConfiguration ||
+          group->products.front().product_contract_id.value() !=
+              qualified->second.first ||
+          group->products.front().product_contract_revision.value() !=
+              qualified->second.second) {
+        fail_retained_bundle(
+            "Stop qualification does not name one exact retained execution "
+            "provider runtime product");
+      }
+      matched_runtime_product_ids.insert(expected_product_id);
     }
-    const auto group = std::find_if(
-        retained_bundle.compiled_products.runtime_unit_products.begin(),
-        retained_bundle.compiled_products.runtime_unit_products.end(),
-        [&](const auto& candidate) {
-          return candidate.runtime_unit_id == runtime_unit_id;
-        });
-    if (group ==
-            retained_bundle.compiled_products.runtime_unit_products.end() ||
-        group->products.size() != 1U ||
-        group->products.front().product_id.value() != expected_product_id ||
-        group->products.front().product_kind !=
-            core::RetainedProductKind::kRuntimeUnitConfiguration ||
-        group->products.front().product_contract_id.value() !=
-            kNativeExecutionRuntimeProductContractId ||
-        group->products.front().product_contract_revision.value() !=
-            native_execution_runtime_product_contract_revision().value()) {
-      fail_retained_bundle(
-          "Stop qualification does not name one exact retained native "
-          "provider runtime product");
-    }
-    matched_runtime_product_ids.insert(expected_product_id);
   }
-  if (matched_runtime_product_ids != qualified_runtime_product_ids) {
+  if (matched_runtime_product_ids.size() !=
+          qualified_runtime_products.size() ||
+      !std::all_of(matched_runtime_product_ids.begin(),
+                   matched_runtime_product_ids.end(),
+                   [&](const auto &product_id) {
+                     return qualified_runtime_products.contains(product_id);
+                   })) {
     fail_retained_bundle(
         "Stop qualification names a runtime product outside its exact "
         "control-binding owners");
@@ -3003,55 +3143,57 @@ void require_control_domain_control_matches_retained_bundle(
   std::map<std::string, StopImplementationBuildIdentity, std::less<>>
       build_identities_by_product;
   for (const auto& retained_identity :
-       artifacts.native_runtime_build_identities) {
+       artifacts.execution_runtime_build_identities) {
     const auto identity = parse_stop_implementation_build_identity(
         retained_identity.canonical_bytes);
-    if (identity.implementation_id !=
-            kNativeExecutionRuntimeImplementationId ||
-        identity.installed_target_id !=
-            kNativeExecutionRuntimeInstalledTargetId) {
-      fail_retained_bundle(
-          "retained native runtime build identity names a different "
-          "implementation target");
-    }
     const core::RetainedProductDTO* matched_product = nullptr;
+    std::optional<ExecutionRuntimeProductKind> runtime_kind;
     for (const auto& group :
          retained_bundle.compiled_products.runtime_unit_products) {
       for (const auto& product : group.products) {
         if (product.product_id != retained_identity.product_id) {
           continue;
         }
-        if (matched_product != nullptr ||
-            product.product_contract_id.value() !=
-                kNativeExecutionRuntimeProductContractId ||
-            product.product_contract_revision !=
-                native_execution_runtime_product_contract_revision()) {
+        const auto candidate_kind = execution_runtime_product_kind(
+            product.product_contract_id.value(),
+            product.product_contract_revision.value());
+        if (matched_product != nullptr || !candidate_kind.has_value()) {
           fail_retained_bundle(
-              "native build identity does not name one exact retained "
+              "execution build identity does not name one exact retained "
               "runtime product");
         }
         matched_product = &product;
+        runtime_kind = candidate_kind;
       }
     }
-    if (matched_product == nullptr) {
+    if (matched_product == nullptr || !runtime_kind.has_value()) {
       fail_retained_bundle(
-          "native build identity has no retained runtime product");
+          "execution build identity has no retained runtime product");
     }
+    if (identity.implementation_id !=
+            execution_runtime_implementation_id(*runtime_kind) ||
+        identity.installed_target_id !=
+            execution_runtime_installed_target_id(*runtime_kind)) {
+      fail_retained_bundle(
+          "retained execution runtime build identity names a different "
+          "implementation target");
+    }
+    const std::string_view identity_role =
+        execution_runtime_build_identity_role(*runtime_kind);
+    const std::string_view identity_media =
+        execution_runtime_build_identity_media_type(*runtime_kind);
     const core::RetainedArtifactRefDTO* matched_ref = nullptr;
     for (const auto& artifact : matched_product->artifact_refs) {
-      if (artifact.artifact_role_id.value() !=
-          kNativeExecutionRuntimeBuildIdentityArtifactRole) {
+      if (artifact.artifact_role_id.value() != identity_role) {
         continue;
       }
       if (matched_ref != nullptr) {
         fail_retained_bundle(
-            "native runtime product repeats its build identity artifact");
+            "execution runtime product repeats its build identity artifact");
       }
       matched_ref = &artifact;
     }
-    if (matched_ref == nullptr ||
-        matched_ref->media_type !=
-            kNativeExecutionRuntimeBuildIdentityMediaType ||
+    if (matched_ref == nullptr || matched_ref->media_type != identity_media ||
         matched_ref->byte_size != retained_identity.canonical_bytes.size() ||
         matched_ref->content_digest.value() !=
             sha256_digest(retained_identity.canonical_bytes) ||
@@ -3059,7 +3201,8 @@ void require_control_domain_control_matches_retained_bundle(
              .emplace(retained_identity.product_id.value(), identity)
              .second) {
       fail_retained_bundle(
-          "native runtime product has an incoherent build identity artifact");
+          "execution runtime product has an incoherent build identity "
+          "artifact");
     }
   }
 
@@ -3102,13 +3245,20 @@ void require_control_domain_control_matches_retained_bundle(
       const std::string contract_revision = require_digest_member(
           row, "product_contract_revision",
           "control.stop_implementation_qualifications");
+      const auto runtime_kind =
+          execution_runtime_product_kind(contract_id, contract_revision);
+      if (!runtime_kind.has_value()) {
+        fail_retained_bundle(
+            "Stop implementation qualification has no qualified execution "
+            "runtime contract");
+      }
       const std::string product_id = require_identity_member(
           row, "product_id", "control.stop_implementation_qualifications");
       std::optional<std::size_t> match;
       for (std::size_t index = 0U; index < entries.size(); ++index) {
         const auto& entry = entries[index];
         if (entry.implementation_id !=
-                kNativeExecutionRuntimeImplementationId ||
+                execution_runtime_implementation_id(*runtime_kind) ||
             entry.registered_command_kind_id.value() != command_id ||
             entry.endpoint_role_id.has_value() != endpoint.has_value() ||
             (endpoint.has_value() &&
@@ -3160,8 +3310,11 @@ void require_control_domain_control_matches_retained_bundle(
         const auto stop_binding = bindings.find(require_identity_member(
             stop, "control_binding_id", "control.stop_applicability"));
         if (stop_binding == bindings.end() ||
-            native_execution_runtime_product_id(core::RuntimeUnitId(
-                stop_binding->second.provider_runtime_unit_id)) != product_id) {
+            execution_runtime_product_id(
+                *runtime_kind,
+                core::RuntimeUnitId(
+                    stop_binding->second.provider_runtime_unit_id)) !=
+                product_id) {
           continue;
         }
         const auto& phases = require_array(
@@ -3265,6 +3418,13 @@ void require_control_domain_control_matches_retained_bundle(
       const std::string contract_revision = require_digest_member(
           row, "product_contract_revision",
           "control.controlled_stop_substitution_qualifications");
+      const auto runtime_kind =
+          execution_runtime_product_kind(contract_id, contract_revision);
+      if (!runtime_kind.has_value()) {
+        fail_retained_bundle(
+            "controlled Stop substitution qualification has no qualified "
+            "execution runtime contract");
+      }
       const std::string product_id = require_identity_member(
           row, "product_id",
           "control.controlled_stop_substitution_qualifications");
@@ -3272,7 +3432,7 @@ void require_control_domain_control_matches_retained_bundle(
       for (std::size_t index = 0U; index < entries.size(); ++index) {
         const auto& entry = entries[index];
         if (entry.implementation_id !=
-                kNativeExecutionRuntimeImplementationId ||
+                execution_runtime_implementation_id(*runtime_kind) ||
             entry.product_contract_id.value() != contract_id ||
             entry.product_contract_revision.value() != contract_revision ||
             entry.requested_stop_mode !=

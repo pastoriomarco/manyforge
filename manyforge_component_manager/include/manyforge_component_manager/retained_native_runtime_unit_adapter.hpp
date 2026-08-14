@@ -8,6 +8,7 @@
 #include <memory>
 #include <stdexcept>
 #include <string>
+#include <vector>
 
 namespace manyforge::deployment {
 class IVerifiedRetainedBundleSource;
@@ -45,6 +46,16 @@ public:
       const manyforge::deployment::IVerifiedRetainedProductArtifactSource
           &artifact_source,
       std::string operating_system, std::string launch_environment_contract);
+  RetainedNativeRuntimeUnitAdapter(
+      std::filesystem::path trusted_installed_target_root,
+      std::filesystem::path trusted_package_root,
+      std::filesystem::path manager_state_root,
+      std::filesystem::path private_staging_root,
+      const manyforge::deployment::IVerifiedRetainedBundleSource &bundle_source,
+      const manyforge::deployment::IVerifiedRetainedProductArtifactSource
+          &artifact_source,
+      std::string operating_system,
+      std::vector<std::string> launch_environment_contracts);
   ~RetainedNativeRuntimeUnitAdapter() override;
 
   RetainedNativeRuntimeUnitAdapter(const RetainedNativeRuntimeUnitAdapter &) =

@@ -297,14 +297,18 @@ if(MANYFORGE_BUILD_ROS2_CONTROL_RUNTIME)
     unset(_MANYFORGE_ROBOPLAN_BUILD_TESTING)
   endif()
   add_library(manyforge_roboplan_ros2_control_runtime
+    src/retained_isaac_ros2_control_profile.cpp
+    src/retained_ros2_control_admission_owner.cpp
     src/retained_ros2_control_backend_factory.cpp
+    src/retained_ros2_control_lifecycle_product.cpp
     src/retained_ros2_control_runtime_handle.cpp)
   target_include_directories(manyforge_roboplan_ros2_control_runtime PUBLIC
     $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
     $<INSTALL_INTERFACE:include>)
   target_link_libraries(manyforge_roboplan_ros2_control_runtime PUBLIC
     manyforge_roboplan_native_runtime
-    manyforge_ros2_control_execution)
+    manyforge_ros2_control_execution
+    manyforge::content_identity)
 endif()
 
 if(NOT TARGET manyforge_deployment_cclc_runtime_composition)
@@ -402,10 +406,35 @@ install(TARGETS
   RUNTIME DESTINATION bin)
 
 if(MANYFORGE_BUILD_ROS2_CONTROL_RUNTIME)
+  # I9 keeps the native and ros2_control implementations as separate runtime
+  # products.  They share the retained host protocol and CCLC composition but
+  # never select an execution backend through an in-process runtime switch.
+  add_executable(manyforge_ros2_control_execution_host
+    src/product_backed_runtime_participant_resolver.cpp
+    src/native_execution_host_main.cpp)
+  target_include_directories(manyforge_ros2_control_execution_host PRIVATE
+    "${_MANYFORGE_REPOSITORY_SOURCE_ROOT}/manyforge_component_manager/src")
+  target_compile_definitions(manyforge_ros2_control_execution_host PRIVATE
+    COAL_DISABLE_HPP_FCL_WARNINGS
+    MANYFORGE_ROS2_CONTROL_EXECUTION_HOST=1)
+  target_link_libraries(manyforge_ros2_control_execution_host PRIVATE
+    manyforge_roboplan_managed_kernel_apply_fence
+    manyforge_roboplan_native_cclc_runtime
+    manyforge_roboplan_ros2_control_runtime
+    manyforge_roboplan_process_candidate_client
+    manyforge_roboplan_retained_consumer
+    manyforge_component_manager
+    manyforge::content_identity
+    manyforge::scene_value_codec
+    manyforge_deployment
+    manyforge::persistence
+    SQLite::SQLite3
+    Threads::Threads)
+  install(TARGETS manyforge_ros2_control_execution_host
+    RUNTIME DESTINATION bin)
   message(STATUS
     "manyforge_roboplan retained runtime: native execution remains available "
-    "and the I9 ros2_control adapter seam is built; its separate installed "
-    "runtime product and host remain gated")
+    "and the I9 ros2_control adapter is a separate installed runtime product")
 else()
   message(STATUS
     "manyforge_roboplan retained runtime: native execution is built; the I9 "

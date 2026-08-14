@@ -53,7 +53,7 @@ inline constexpr std::size_t kMaxControlDomainControlBytes = 16U * 1024U * 1024U
 /// Complete byte closure of one retained v2 control-domain product.
 /// Conditional members are present exactly when the control artifact retains
 /// the corresponding trusted rows.
-struct NativeRuntimeBuildIdentityArtifact final {
+struct ExecutionRuntimeBuildIdentityArtifact final {
   core::ProductId product_id;
   std::string_view canonical_bytes;
 };
@@ -64,8 +64,8 @@ struct ControlDomainControlArtifactClosure final {
   std::optional<std::string_view>
       stop_controlled_substitution_qualification_evidence;
   std::optional<std::string_view> stop_interface_commissioning_evidence;
-  std::span<const NativeRuntimeBuildIdentityArtifact>
-      native_runtime_build_identities;
+  std::span<const ExecutionRuntimeBuildIdentityArtifact>
+      execution_runtime_build_identities;
 };
 
 /// Require byte-for-byte semantic equality with the projection independently

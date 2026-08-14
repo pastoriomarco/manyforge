@@ -1,13 +1,21 @@
 #include <manyforge_core/time/fake_clock.hpp>
 #include <manyforge_core/time/manual_scheduler.hpp>
+#include <manyforge_core/component_lifecycle_plan_catalog_codec.hpp>
+#include <manyforge_core/types/capability_definition.hpp>
 #define MANYFORGE_ROS2_CONTROL_EXECUTION_TESTING
+#include <manyforge_roboplan/retained_isaac_ros2_control_profile.hpp>
+#include <manyforge_roboplan/retained_ros2_control_admission_owner.hpp>
 #include <manyforge_roboplan/retained_ros2_control_backend_factory.hpp>
+#include <manyforge_roboplan/retained_ros2_control_lifecycle_product.hpp>
 #undef MANYFORGE_ROS2_CONTROL_EXECUTION_TESTING
 
 #include <gtest/gtest.h>
 
+#include <algorithm>
+#include <chrono>
 #include <stdexcept>
 #include <string>
+#include <thread>
 #include <utility>
 
 namespace manyforge::roboplan_backend {
@@ -100,6 +108,108 @@ public:
   return std::move(sealed.value());
 }
 
+[[nodiscard]] core::RuntimeParticipantBinding commanded_gripper_binding() {
+  core::RuntimeParticipantBindingDTO value{
+      core::ProgramId("program.physical"),
+      core::ProgramRevision("program-revision"),
+      core::ProgramBindingId("program-binding"),
+      core::RetainedBundleId("bundle"),
+      core::GraphRevision("graph"),
+      core::ComponentRoleId("robot"),
+      core::TargetRoleId("gripper"),
+      core::ControllableComponentId("robot.1"),
+      core::ComponentTypeId("robot.type"),
+      core::ComponentTypeRevision("robot-type-revision"),
+      core::CommandTargetId("gripper.target"),
+      core::CapabilityId("tool.gripper.command"),
+      core::CapabilityDefinitionRevision("capability-revision"),
+      std::nullopt,
+      {core::ProgramModelRoleBindingDTO{core::ModelRoleId("body"),
+                                        core::ModelInstanceId("robot.model"),
+                                        core::ModelRevision("model-revision")}},
+      {core::RuntimeModelGroupBindingDTO{
+          core::ModelGroupRoleId("gripper_group"),
+          core::ModelInstanceId("robot.model"), "gripper",
+          {"gripper_joint"}}},
+      {core::ProgramFrameRoleBindingDTO{
+          core::FrameRoleId("tcp"), core::ModelInstanceId("robot.model"),
+          core::ModelRevision("model-revision"), "tcp"}},
+      {core::RuntimeResourceBindingDTO{
+          core::ResourceRoleId("fingers"),
+          core::ResourceId("robot.gripper.1"), "source_gripper_joint",
+          "gripper_joint", core::CoordinateKind::kLinear}},
+      {},
+      core::RuntimeControlPathDTO{
+          core::ControlDomainId("domain.gripper"),
+          core::ControlDomainRevision("domain-revision"),
+          core::ControlBindingId("binding.gripper"),
+          core::ControlBindingRevision("binding-revision"),
+          core::ControlInterfaceContractId("interface.gripper"),
+          core::ControlInterfaceRevision("interface-revision"),
+          core::ControllerTopologyId("topology.ros2_control"),
+          core::TopologyRevision("topology-revision"),
+          core::ControlRouteId("route.ros2_control"),
+          core::ActivationSetId("activation.ros2_control"),
+          core::ActiveControlConfigurationId("active.ros2_control"),
+          core::ActiveControlConfigurationGeneration(1U),
+          core::ProviderInstanceId("provider.ros2_control"),
+          core::ProviderManifestId("provider-manifest.ros2_control"),
+          core::ProviderManifestRevision("provider-manifest-revision"),
+          core::RuntimeUnitId("runtime.ros2_control"),
+          core::RuntimeEpoch("runtime-epoch.1"),
+          core::StateAuthorityId("state.commanded"),
+          core::StateAuthorityClass::kCommanded,
+          core::StopEvidencePolicyId("stop.ros2_control"),
+          core::StopEvidencePolicyRevision("stop-revision"),
+          core::ContainmentGranularity::kResource,
+          std::nullopt},
+      std::nullopt,
+      {},
+      {core::RuntimeUnitEpochBindingDTO{
+          core::RuntimeUnitId("runtime.ros2_control"),
+          core::RuntimeEpoch("runtime-epoch.1")}}};
+  auto sealed = core::verify_runtime_participant_binding(std::move(value));
+  if (!sealed.ok()) {
+    throw std::logic_error(sealed.error().message);
+  }
+  return std::move(sealed.value());
+}
+
+[[nodiscard]] core::ProviderManifestDTO ros_lifecycle_manifest() {
+  const auto plans = retained_ros2_control_lifecycle_plans();
+  const core::ProviderManifestId manifest_id{
+      std::string(kRos2ControlLifecycleProviderManifestId)};
+  const auto semantic = core::ComputeBrandLifecyclePlanCatalogSemanticDigest(
+      manifest_id, plans);
+  if (!semantic.ok()) {
+    throw std::logic_error(semantic.error().message);
+  }
+  std::vector<core::ProviderCapabilityOfferDTO> offers;
+  for (const char *intent : {"disable", "enable", "observe", "prepare",
+                             "recover"}) {
+    const core::CapabilityId capability(std::string("component.lifecycle.") +
+                                        intent);
+    const auto *definition = core::find_builtin_capability_definition(capability);
+    if (definition == nullptr) {
+      throw std::logic_error("missing built-in lifecycle capability");
+    }
+    offers.push_back(
+        {capability,
+         core::CapabilityDefinitionRevision(
+             std::string(definition->capability_definition_revision)),
+         {}});
+  }
+  return {manifest_id,
+          core::ProviderManifestRevision(
+              "sha256:0000000000000000000000000000000000000000000000000000000000000000"),
+          std::move(offers),
+          {},
+          core::ProviderLifecyclePlanCatalogDeclarationDTO{
+              core::SchemaId(
+                  std::string(core::kBrandLifecyclePlanCatalogApiVersion)),
+              semantic.value()}};
+}
+
 TEST(RetainedRos2ControlBackendFactoryTest,
      CommandedSimulationSelectsOneNonExpiringAddressedAuthority) {
   ros2_control_execution::Ros2ControlExecutionBackendConfig config;
@@ -113,6 +223,72 @@ TEST(RetainedRos2ControlBackendFactoryTest,
   ASSERT_EQ(state.source_precedence.size(), 1U);
   EXPECT_EQ(state.source_precedence.front().authority_profile,
             core::ObservedRobotStateAuthorityProfile::kCommandedSimulation);
+}
+
+TEST(RetainedRos2ControlBackendFactoryTest,
+     RetainedIsaacProfileExpandsToExactControllerAndGripperContract) {
+  deployment::ros2_control_execution_runtime_contract::Configuration runtime{
+      "lite6", 12345U, {0.0}, 100U, 50.0};
+
+  const auto selected = make_retained_isaac_ros2_control_backend_config(
+      runtime, commanded_binding(), commanded_gripper_binding());
+
+  EXPECT_EQ(selected.execution.required_joints,
+            (std::vector<std::string>{"joint_1"}));
+  EXPECT_EQ(selected.execution.transport_joint_names,
+            (std::vector<std::string>{"source_joint_1"}));
+  EXPECT_EQ(selected.execution.execution_state_source_mode, "commanded_sim");
+  EXPECT_FALSE(selected.execution.enable_jtc_speed_scaling_input);
+  EXPECT_TRUE(selected.execution.enable_soft_on_path_path_ramp);
+  EXPECT_TRUE(selected.execution.require_execution_admission_snapshot);
+  ASSERT_TRUE(selected.execution.controller_binding.has_value());
+  EXPECT_EQ(selected.execution.controller_binding->hardware_component_name,
+            "IsaacLite6TopicBasedSystem");
+  EXPECT_EQ(selected.execution.controller_binding->required_joints,
+            (std::vector<std::string>{"source_joint_1"}));
+  EXPECT_EQ(selected.execution.controller_binding->claimed_command_interfaces,
+            (std::vector<std::string>{"source_joint_1/position"}));
+  EXPECT_EQ(selected.execution.controller_binding->required_state_interfaces,
+            (std::vector<std::string>{"source_joint_1/position",
+                                      "source_joint_1/velocity"}));
+  ASSERT_TRUE(selected.gripper.has_value());
+  EXPECT_EQ(selected.gripper->transport_kind, "isaac_joint_state_effort");
+  EXPECT_EQ(selected.gripper->command_joint_names,
+            (std::vector<std::string>{"source_gripper_joint"}));
+  EXPECT_EQ(selected.gripper->group_id, "gripper");
+  EXPECT_EQ(selected.gripper->joint_name, "gripper_joint");
+  EXPECT_EQ(selected.gripper->completion_policy, "dwell_elapsed");
+}
+
+TEST(RetainedRos2ControlBackendFactoryTest,
+     ExternalLifecycleCatalogIsAnchoredAndHasNoMutationPrimitives) {
+  const auto plans = retained_ros2_control_lifecycle_plans();
+  ASSERT_EQ(plans.size(), 4U);
+  EXPECT_TRUE(std::all_of(plans.begin(), plans.end(), [](const auto &plan) {
+    return plan.transitions.empty();
+  }));
+  EXPECT_EQ(plans.front().intent,
+            core::ComponentLifecycleIntentKindDTO::kPrepare);
+  EXPECT_EQ(plans.front().requested_state,
+            core::ComponentLifecycleStateDTO::kPrepared);
+  EXPECT_EQ(plans.front().requested_postcondition.allowed_states,
+            (std::vector<core::ComponentLifecycleStateDTO>{
+                core::ComponentLifecycleStateDTO::kPrepared,
+                core::ComponentLifecycleStateDTO::kActive}));
+
+  auto catalog =
+      make_retained_ros2_control_lifecycle_catalog(ros_lifecycle_manifest());
+  ASSERT_TRUE(catalog.ok()) << catalog.error().message;
+  EXPECT_EQ(catalog.value().provider_manifest_id.value(),
+            kRos2ControlLifecycleProviderManifestId);
+  EXPECT_TRUE(core::VerifyBrandLifecyclePlanCatalog(catalog.value()).ok());
+
+  auto wrong = ros_lifecycle_manifest();
+  wrong.provider_manifest_id = core::ProviderManifestId("another.provider");
+  const auto rejected = make_retained_ros2_control_lifecycle_catalog(wrong);
+  ASSERT_FALSE(rejected.ok());
+  EXPECT_EQ(rejected.error().details.at("reason"),
+            "provider_manifest_id_unsupported");
 }
 
 TEST(RetainedRos2ControlBackendFactoryTest,
@@ -198,6 +374,84 @@ TEST(RetainedRos2ControlBackendFactoryTest,
   ASSERT_FALSE(rebound.ok());
   EXPECT_EQ(rebound.error().details.at("reason"),
             "ros2_control_handle_already_bound");
+}
+
+TEST(RetainedRos2ControlBackendFactoryTest,
+     AdmissionOwnerFailsClosedWhenLifecycleReadbackIsUnavailable) {
+  deployment::ros2_control_execution_runtime_contract::Configuration runtime{
+      "lite6", 12345U, {0.0}, 100U, 50.0};
+  auto selected = make_retained_isaac_ros2_control_backend_config(
+      runtime, commanded_binding(), commanded_gripper_binding());
+  ASSERT_TRUE(selected.execution.controller_binding.has_value());
+  const auto binding_generation =
+      selected.execution.controller_binding->generation_id;
+
+  core::FakeClock clock;
+  clock.set(1'000);
+  core::ManualScheduler scheduler;
+  auto sink = std::make_shared<NullExecutionStateSink>();
+  auto backend =
+      std::make_shared<ros2_control_execution::Ros2ControlExecutionBackend>(
+          ros2_control_execution::Ros2ControlExecutionBackend::
+              TestingNoRosStartupTag{},
+          sink, "arm", clock, scheduler, std::move(selected.execution));
+  auto handle = std::make_shared<RetainedRos2ControlRuntimeHandle>();
+  const auto binding = commanded_binding();
+  ASSERT_TRUE(handle->BindBackend(backend, binding, std::nullopt).ok());
+
+  ros2_control_execution::ControllerBindingSnapshot ready;
+  ready.activity_generation = 1U;
+  ready.contract_generation_id = binding_generation;
+  ready.observed_timestamp_ns = clock.now();
+  ready.received_timestamp_ns = clock.now();
+  ready.fresh_until_ns = clock.now() + 100'000'000;
+  ready.controller_active = true;
+  ready.hardware_active = true;
+  ready.controller_type_matches = true;
+  ready.claimed_interfaces_match = true;
+  ready.state_interfaces_available = true;
+  ready.conflicting_claims_absent = true;
+  ready.valid = true;
+  backend->testing_publish_controller_binding_snapshot(std::move(ready));
+
+  RetainedRos2ControlAdmissionOwnerConfig owner_config{
+      core::ControllableComponentId("robot.1"),
+      core::RuntimeEpoch("runtime-epoch.1"),
+      binding_generation,
+      "provider-epoch.1",
+      "cell-supervisor-epoch.1",
+      1'000'000,
+      10'000'000};
+  auto owner = RetainedRos2ControlAdmissionOwner::Create(
+      std::move(owner_config), handle, clock, [] {
+        return core::Result<core::ComponentLifecycleCurrentSnapshotDTO>::Err(
+            core::ErrorDTO{
+                std::string(core::to_string(
+                    core::ErrorCode::kInvariantViolation)),
+                "component snapshot intentionally unavailable", {}});
+      });
+  ASSERT_TRUE(owner.ok()) << owner.error().message;
+
+  for (int attempt = 0;
+       attempt < 100 &&
+       owner.value()->status().publication_generation == 0U;
+       ++attempt) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+  }
+  const auto status = owner.value()->status();
+  ASSERT_TRUE(status.running);
+  ASSERT_TRUE(status.healthy) << status.reason_code;
+  ASSERT_GT(status.publication_generation, 0U);
+
+  const auto admission = backend->execution_admission_snapshot();
+  ASSERT_TRUE(admission.has_value());
+  EXPECT_TRUE(admission->controller_ready);
+  EXPECT_FALSE(admission->motion_admitted);
+  EXPECT_TRUE(std::binary_search(
+      admission->reason_codes.begin(), admission->reason_codes.end(),
+      "component_lifecycle_snapshot_unavailable"));
+  EXPECT_TRUE(admission->transport_owner_component_epoch.empty());
+  EXPECT_TRUE(admission->authority_component_epoch.empty());
 }
 
 } // namespace

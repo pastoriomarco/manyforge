@@ -33,6 +33,7 @@
 #include "embedded_motion_controlled_stop_provider_contract_schema.hpp"
 #include "embedded_native_execution_runtime_configuration_schema.hpp"
 #include "embedded_provider_manifest_schema.hpp"
+#include "embedded_ros2_control_execution_runtime_configuration_schema.hpp"
 #include "embedded_runtime_policy_schema.hpp"
 #include "embedded_runtime_profile_schema.hpp"
 #include "embedded_stop_evidence_policy_schema.hpp"
@@ -1942,7 +1943,7 @@ BuildQualifiedClosedSchemaRegistry::BuildQualifiedClosedSchemaRegistry() {
        "catalog/manyforge.stop_evidence_policy.v2.yaml",
        detail::kEmbeddedStopEvidencePolicySchema},
   }};
-  const std::array<QualifiedValueSchemaSource, 4U> qualified_value_sources{{
+  const std::array<QualifiedValueSchemaSource, 5U> qualified_value_sources{{
       {"value/manyforge.value_schema.provider_contract.empty.v1.yaml",
        detail::kEmbeddedEmptyProviderContractSchema},
       {"value/"
@@ -1953,6 +1954,9 @@ BuildQualifiedClosedSchemaRegistry::BuildQualifiedClosedSchemaRegistry() {
        detail::kEmbeddedEmptyRuntimeConfigurationSchema},
       {"value/manyforge.value_schema.runtime.native_execution.v1.yaml",
        detail::kEmbeddedNativeExecutionRuntimeConfigurationSchema},
+      {"value/"
+       "manyforge.value_schema.runtime.ros2_control_execution.v1.yaml",
+       detail::kEmbeddedRos2ControlExecutionRuntimeConfigurationSchema},
   }};
 
   auto storage = std::make_shared<Storage>();

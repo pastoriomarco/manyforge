@@ -13,6 +13,7 @@
 #include <manyforge_core/sqlite_cclc_journal.hpp>
 #include <manyforge_deployment/resolved_stop_base_plan_resolver.hpp>
 #include <manyforge_deployment/verified_controller_lifecycle_expected_domain.hpp>
+#include <manyforge_roboplan/retained_externally_managed_lifecycle_ports.hpp>
 #include <manyforge_roboplan/retained_native_controller_lifecycle_port.hpp>
 
 namespace manyforge::roboplan_backend {
@@ -326,7 +327,9 @@ struct DerivedRuntimeClosure final {
     const core::ICCLCLifecyclePlanCatalogSource &catalog_source,
     std::vector<core::BrandLifecyclePortRegistrationDTO> brand_ports,
     const std::vector<core::RuntimeParticipantBinding> &physical_bindings,
-    core::IClock &clock) {
+    core::IClock &clock,
+    const RetainedExternallyManagedDomainSnapshotSource
+        &externally_managed_controller_snapshot_source) {
   const auto &value = bundle.value();
   const auto &graph = value.cell_graph;
   if (!config.locally_valid() ||
@@ -417,9 +420,39 @@ struct DerivedRuntimeClosure final {
           deployment::load_verified_controller_lifecycle_expected_domain(
               bundle, artifact_source, desired, *source_runtime_unit,
               *source_runtime_epoch);
-      auto port = RetainedNativeControllerLifecyclePort::Create(
-          expected.sealed(), std::move(domain_bindings), clock,
-          config.controller_observation_freshness_ns);
+      core::Result<std::shared_ptr<core::IControllerLifecyclePort>> port =
+          core::Result<std::shared_ptr<core::IControllerLifecyclePort>>::Err(
+              {"controller_lifecycle_port_unselected",
+               "no controller lifecycle product was selected", {}});
+      if (externally_managed_controller_snapshot_source) {
+        auto external =
+            RetainedExternallyManagedControllerLifecyclePort::Create(
+                expected.sealed(), std::move(domain_bindings),
+                externally_managed_controller_snapshot_source, clock,
+                config.controller_observation_freshness_ns);
+        if (external.ok()) {
+          port = core::Result<
+              std::shared_ptr<core::IControllerLifecyclePort>>::Ok(
+              std::move(external.value()));
+        } else {
+          port = core::Result<
+              std::shared_ptr<core::IControllerLifecyclePort>>::Err(
+              external.error());
+        }
+      } else {
+        auto native = RetainedNativeControllerLifecyclePort::Create(
+            expected.sealed(), std::move(domain_bindings), clock,
+            config.controller_observation_freshness_ns);
+        if (native.ok()) {
+          port = core::Result<
+              std::shared_ptr<core::IControllerLifecyclePort>>::Ok(
+              std::move(native.value()));
+        } else {
+          port = core::Result<
+              std::shared_ptr<core::IControllerLifecyclePort>>::Err(
+              native.error());
+        }
+      }
       if (!port.ok()) {
         return core::Result<DerivedRuntimeClosure>::Err(port.error());
       }
@@ -594,7 +627,9 @@ CreateRetainedNativeCCLCRuntime(
     std::function<
         core::Result<std::optional<core::ActiveControlConfigurationDTO>>(
             const core::ControlDomainId &)>
-        kernel_current_configuration_source) {
+        kernel_current_configuration_source,
+    RetainedExternallyManagedDomainSnapshotSource
+        externally_managed_controller_snapshot_source) {
   if (retained_bundle == nullptr) {
     return reject<std::unique_ptr<deployment::CCLCRuntimeComposition>>(
         "native_cclc_retained_bundle_missing",
@@ -602,7 +637,8 @@ CreateRetainedNativeCCLCRuntime(
   }
   auto closure = derive_runtime_closure(
       config, *retained_bundle, artifact_source, lifecycle_catalog_source,
-      std::move(brand_ports), physical_bindings, clock);
+      std::move(brand_ports), physical_bindings, clock,
+      externally_managed_controller_snapshot_source);
   if (!closure.ok()) {
     return core::Result<std::unique_ptr<deployment::CCLCRuntimeComposition>>::
         Err(closure.error());
@@ -631,7 +667,9 @@ CreateRetainedNativeCCLCRuntime(
     std::vector<core::BrandLifecyclePortRegistrationDTO> brand_ports,
     RetainedNativeRuntime &runtime,
     core::ICCLCKernelDisableHandoffPort &kernel_disable_handoff_port,
-    core::ICCLCKernelRouteConfigurationFencePort &kernel_route_fence_port) {
+    core::ICCLCKernelRouteConfigurationFencePort &kernel_route_fence_port,
+    RetainedExternallyManagedDomainSnapshotSource
+        externally_managed_controller_snapshot_source) {
   if (retained_bundle == nullptr || runtime.clock == nullptr ||
       runtime.scheduler == nullptr || runtime.addressed_kernel == nullptr) {
     return reject<std::unique_ptr<deployment::CCLCRuntimeComposition>>(
@@ -658,7 +696,8 @@ CreateRetainedNativeCCLCRuntime(
       kernel_route_fence_port, runtime, *runtime.clock, *runtime.scheduler,
       [&runtime](const core::ControlDomainId &domain_id) {
         return runtime.ReadCurrentPublishedRouteConfiguration(domain_id);
-      });
+      },
+      std::move(externally_managed_controller_snapshot_source));
 }
 
 } // namespace manyforge::roboplan_backend

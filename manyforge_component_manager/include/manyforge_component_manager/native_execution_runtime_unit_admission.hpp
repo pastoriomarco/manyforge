@@ -4,6 +4,7 @@
 #include <manyforge_core/types/strong_id.hpp>
 #include <manyforge_deployment/verified_retained_bundle.hpp>
 #include <optional>
+#include <span>
 #include <stdexcept>
 #include <string>
 #include <string_view>
@@ -18,7 +19,7 @@ public:
   using std::invalid_argument::invalid_argument;
 };
 
-/// Effect-free admission for one exact retained native execution product.
+/// Effect-free admission for one exact retained execution product.
 ///
 /// The value exposes only the build-owned installed target identity and fixed
 /// child arguments. It never exposes a caller-selected executable, argument
@@ -47,6 +48,10 @@ public:
   [[nodiscard]] const std::string &installed_target_id() const noexcept {
     return installed_target_id_;
   }
+  [[nodiscard]] const std::string &
+  candidate_worker_installed_target_id() const noexcept {
+    return candidate_worker_installed_target_id_;
+  }
 
   [[nodiscard]] std::vector<std::string>
   launch_arguments(int inherited_channel_fd,
@@ -60,14 +65,18 @@ public:
 private:
   NativeExecutionRuntimeUnitAdmission(
       manyforge::deployment::VerifiedRetainedRuntimeUnitProduct product,
-      std::string implementation_revision, std::string installed_target_id)
+      std::string implementation_revision, std::string installed_target_id,
+      std::string candidate_worker_installed_target_id)
       : product_(std::move(product)),
         implementation_revision_(std::move(implementation_revision)),
-        installed_target_id_(std::move(installed_target_id)) {}
+        installed_target_id_(std::move(installed_target_id)),
+        candidate_worker_installed_target_id_(
+            std::move(candidate_worker_installed_target_id)) {}
 
   manyforge::deployment::VerifiedRetainedRuntimeUnitProduct product_;
   std::string implementation_revision_;
   std::string installed_target_id_;
+  std::string candidate_worker_installed_target_id_;
 
   friend std::optional<NativeExecutionRuntimeUnitAdmission>
   VerifyNativeExecutionRuntimeUnitForHost(
@@ -75,6 +84,12 @@ private:
       const manyforge::core::RuntimeUnitId &,
       const manyforge::deployment::IVerifiedRetainedProductArtifactSource &,
       std::string_view, std::string_view);
+  friend std::optional<NativeExecutionRuntimeUnitAdmission>
+  VerifyNativeExecutionRuntimeUnitForHost(
+      const manyforge::deployment::RetainedBundle &,
+      const manyforge::core::RuntimeUnitId &,
+      const manyforge::deployment::IVerifiedRetainedProductArtifactSource &,
+      std::string_view, std::span<const std::string>);
 };
 
 /// Admit one exact native runtime product for the selected host platform.
@@ -90,5 +105,14 @@ VerifyNativeExecutionRuntimeUnitForHost(
         &artifact_source,
     std::string_view operating_system,
     std::string_view launch_environment_contract);
+
+[[nodiscard]] std::optional<NativeExecutionRuntimeUnitAdmission>
+VerifyNativeExecutionRuntimeUnitForHost(
+    const manyforge::deployment::RetainedBundle &bundle,
+    const manyforge::core::RuntimeUnitId &runtime_unit_id,
+    const manyforge::deployment::IVerifiedRetainedProductArtifactSource
+        &artifact_source,
+    std::string_view operating_system,
+    std::span<const std::string> launch_environment_contracts);
 
 } // namespace manyforge::component_manager

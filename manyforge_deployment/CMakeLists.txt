@@ -542,6 +542,11 @@ manyforge_embed_closed_schema(
   resources/closed_schema/value/manyforge.value_schema.runtime.native_execution.v1.yaml
   mf_native_cfg)
 manyforge_embed_closed_schema(
+  kEmbeddedRos2ControlExecutionRuntimeConfigurationSchema
+  ros2_control_execution_runtime_configuration
+  resources/closed_schema/value/manyforge.value_schema.runtime.ros2_control_execution.v1.yaml
+  mf_ros2_cfg)
+manyforge_embed_closed_schema(
   kEmbeddedEmptyProviderContractSchema
   empty_provider_contract
   resources/closed_schema/value/manyforge.value_schema.provider_contract.empty.v1.yaml
@@ -591,6 +596,7 @@ add_library(manyforge_deployment_verification_core
   src/model_asset_codec.cpp
   src/model_source.cpp
   src/native_execution_runtime_unit_internal.cpp
+  src/ros2_control_execution_runtime_unit_internal.cpp
   src/planning_resource_map_internal.cpp
   src/posix_read_only_internal.cpp
   src/program_contract.cpp
@@ -786,6 +792,7 @@ add_library(manyforge_deployment
   src/composed_model_symbol_role_map_internal.cpp
   src/mf2_joint_name_internal.cpp
   src/native_execution_runtime_unit_emitter.cpp
+  src/ros2_control_execution_runtime_unit_emitter.cpp
   src/posix_durability_internal.cpp
   src/program_binding_compiler.cpp
   src/reference_runtime_unit_internal.cpp

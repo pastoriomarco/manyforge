@@ -65,6 +65,15 @@ native_execution_runtime_product_artifact_roles() noexcept;
 native_execution_runtime_product_contract_descriptor();
 
 [[nodiscard]] std::string_view
+ros2_control_execution_runtime_product_contract_id() noexcept;
+[[nodiscard]] const core::ProductContractRevision &
+ros2_control_execution_runtime_product_contract_revision();
+[[nodiscard]] std::span<const QualifiedRetainedProductArtifactRole>
+ros2_control_execution_runtime_product_artifact_roles() noexcept;
+[[nodiscard]] const CanonicalValue &
+ros2_control_execution_runtime_product_contract_descriptor();
+
+[[nodiscard]] std::string_view
 composed_model_symbol_role_map_product_contract_id() noexcept;
 [[nodiscard]] const core::ProductContractRevision&
 composed_model_symbol_role_map_product_contract_revision();

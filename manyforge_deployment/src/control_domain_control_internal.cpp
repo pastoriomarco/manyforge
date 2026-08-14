@@ -17,6 +17,8 @@
 #include "content_identity_internal.hpp"
 #include "manyforge_deployment/cell_compiler.hpp"
 #include "manyforge_deployment/content_identity.hpp"
+#include "native_execution_runtime_unit_internal.hpp"
+#include "ros2_control_execution_runtime_unit_internal.hpp"
 #include "verified_retained_bundle_internal.hpp"
 
 namespace manyforge::deployment::detail {
@@ -984,6 +986,48 @@ template <typename Stop>
   const auto& desired = require_desired_configuration(compiler_ir, control_domain_id);
   const auto& topology = require_topology(compiler_ir, domain).value();
   const auto& graph = compiler_ir.applicability().composition().graph();
+  const auto selects_domain_execution_runtime =
+      [&](const core::ProductId& product_id,
+          const core::ProductContractId& product_contract_id,
+          const core::ProductContractRevision& product_contract_revision) {
+        for (const auto& runtime_unit_id : domain.runtime_unit_ids) {
+          const auto runtime_unit = std::find_if(
+              graph.runtime_units.begin(), graph.runtime_units.end(),
+              [&](const auto& candidate) {
+                return candidate.runtime_unit_id == runtime_unit_id;
+              });
+          if (runtime_unit == graph.runtime_units.end()) {
+            fail_retained_bundle(
+                "control-domain product has no exact execution runtime unit");
+          }
+          const bool native_execution =
+              runtime_unit->runtime_profile_id.value() ==
+                  kNativeExecutionRuntimeProfileId &&
+              runtime_unit->runtime_profile_revision.value() ==
+                  native_execution_runtime_profile_revision() &&
+              product_id.value() ==
+                  native_execution_runtime_product_id(runtime_unit_id) &&
+              product_contract_id.value() ==
+                  kNativeExecutionRuntimeProductContractId &&
+              product_contract_revision ==
+                  native_execution_runtime_product_contract_revision();
+          const bool ros2_control_execution =
+              runtime_unit->runtime_profile_id.value() ==
+                  kRos2ControlExecutionRuntimeProfileId &&
+              runtime_unit->runtime_profile_revision.value() ==
+                  ros2_control_execution_runtime_profile_revision() &&
+              product_id.value() ==
+                  ros2_control_execution_runtime_product_id(runtime_unit_id) &&
+              product_contract_id.value() ==
+                  kRos2ControlExecutionRuntimeProductContractId &&
+              product_contract_revision ==
+                  ros2_control_execution_runtime_product_contract_revision();
+          if (native_execution || ros2_control_execution) {
+            return true;
+          }
+        }
+        return false;
+      };
 
   CanonicalValue::Array bindings;
   for (const auto& binding : graph.control_bindings) {
@@ -1097,6 +1141,13 @@ template <typename Stop>
   implementation_qualifications.reserve(
       stop_implementation_qualifications.size());
   for (const auto& qualification : stop_implementation_qualifications) {
+    if (!selects_domain_execution_runtime(
+            qualification.product_id, qualification.product_contract_id,
+            qualification.product_contract_revision)) {
+      fail_retained_bundle(
+          "Stop implementation qualification does not select an exact "
+          "control-domain execution runtime product");
+    }
     implementation_qualifications.push_back(
         stop_implementation_qualification_projection(qualification));
   }
@@ -1118,6 +1169,13 @@ template <typename Stop>
       controlled_stop_substitution_qualifications.size());
   for (const auto& qualification :
        controlled_stop_substitution_qualifications) {
+    if (!selects_domain_execution_runtime(
+            qualification.product_id, qualification.product_contract_id,
+            qualification.product_contract_revision)) {
+      fail_retained_bundle(
+          "controlled Stop substitution qualification does not select an "
+          "exact control-domain execution runtime product");
+    }
     substitution_qualifications.push_back(
         controlled_stop_substitution_qualification_projection(qualification));
   }

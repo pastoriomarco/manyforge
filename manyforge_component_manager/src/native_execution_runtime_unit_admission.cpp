@@ -3,13 +3,17 @@
 #include <algorithm>
 #include <manyforge_deployment/artifact_codec.hpp>
 #include <manyforge_deployment/native_execution_runtime_contract.hpp>
+#include <manyforge_deployment/ros2_control_execution_runtime_contract.hpp>
 #include <string>
 #include <utility>
 
 namespace manyforge::component_manager {
 namespace {
 
-namespace contract = manyforge::deployment::native_execution_runtime_contract;
+namespace native_contract =
+    manyforge::deployment::native_execution_runtime_contract;
+namespace ros2_control_contract =
+    manyforge::deployment::ros2_control_execution_runtime_contract;
 
 constexpr std::string_view kLaunchApiVersion =
     "manyforge.installed_target_launch.v1";
@@ -56,30 +60,73 @@ struct LaunchDescriptor final {
   std::string installed_target_id;
 };
 
+struct RuntimeContractFacts final {
+  std::string_view product_contract_id;
+  std::string_view implementation_id;
+  std::string implementation_revision;
+  std::string_view installed_target_id;
+  std::string_view candidate_worker_installed_target_id;
+  std::string_view runtime_role_id;
+  std::string_view status_endpoint_role_id;
+  std::string_view status_endpoint_contract_id;
+  std::string_view process_adapter_contract_id;
+  std::string_view retrieval_contract_id;
+};
+
+[[nodiscard]] RuntimeContractFacts
+RequireRuntimeContract(const std::string_view product_contract_id) {
+  if (product_contract_id == native_contract::kProductContractId) {
+    return {native_contract::kProductContractId,
+            native_contract::kImplementationId,
+            native_contract::implementation_revision(),
+            native_contract::kInstalledTargetId,
+            native_contract::kCandidateWorkerInstalledTargetId,
+            native_contract::kRuntimeRoleId,
+            native_contract::kStatusEndpointRoleId,
+            native_contract::kStatusEndpointContractId,
+            native_contract::kProcessAdapterContractId,
+            native_contract::kRetrievalContractId};
+  }
+  if (product_contract_id == ros2_control_contract::kProductContractId) {
+    return {ros2_control_contract::kProductContractId,
+            ros2_control_contract::kImplementationId,
+            ros2_control_contract::implementation_revision(),
+            ros2_control_contract::kInstalledTargetId,
+            ros2_control_contract::kCandidateWorkerInstalledTargetId,
+            ros2_control_contract::kRuntimeRoleId,
+            ros2_control_contract::kStatusEndpointRoleId,
+            ros2_control_contract::kStatusEndpointContractId,
+            ros2_control_contract::kProcessAdapterContractId,
+            ros2_control_contract::kRetrievalContractId};
+  }
+  Fail("execution admission received an unsupported runtime product");
+}
+
 [[nodiscard]] LaunchDescriptor
-ParseLaunchDescriptor(const std::string_view bytes) {
+ParseLaunchDescriptor(const std::string_view bytes,
+                      const RuntimeContractFacts &contract) {
   manyforge::deployment::CanonicalValue root;
   try {
     root = manyforge::deployment::parse_strict_json_model_yaml(bytes).root();
   } catch (const std::exception &error) {
-    Fail("native execution launch descriptor is invalid: " +
+    Fail("execution launch descriptor is invalid: " +
          std::string(error.what()));
   }
   if (manyforge::deployment::canonical_json(root) != bytes) {
-    Fail("native execution launch descriptor is not canonical JSON");
+    Fail("execution launch descriptor is not canonical JSON");
   }
   const auto &object =
       RequireObject(root, "native execution launch descriptor");
   if (object.size() != 4U ||
       RequireText(object, "api_version") != kLaunchApiVersion ||
-      RequireText(object, "implementation_id") != contract::kImplementationId ||
-      RequireText(object, "target_id") != contract::kInstalledTargetId) {
-    Fail("native execution launch descriptor differs from its closed shape");
+      RequireText(object, "implementation_id") != contract.implementation_id ||
+      RequireText(object, "target_id") != contract.installed_target_id) {
+    Fail("execution launch descriptor differs from its closed shape");
   }
   const auto implementation_revision =
       RequireText(object, "implementation_revision");
-  if (implementation_revision != contract::implementation_revision()) {
-    Fail("native execution launch descriptor selects another implementation "
+  if (implementation_revision != contract.implementation_revision) {
+    Fail("execution launch descriptor selects another implementation "
          "revision");
   }
   return {implementation_revision, RequireText(object, "target_id")};
@@ -131,7 +178,8 @@ std::string NativeExecutionRuntimeUnitAdmission::expected_status_packet(
          " " + std::to_string(source_report_sequence) + " 1 serving healthy " +
          implementation_revision_ + " " + product_.product_identity().value() +
          " " + product_.configuration_identity().value() + " " +
-         std::string(contract::kRuntimeRoleId) + " closed_no_active_effect";
+         std::string(product_.runtime_role_id()) +
+         " closed_no_active_effect";
 }
 
 std::optional<NativeExecutionRuntimeUnitAdmission>
@@ -142,34 +190,53 @@ VerifyNativeExecutionRuntimeUnitForHost(
         &artifact_source,
     const std::string_view operating_system,
     const std::string_view launch_environment_contract) {
+  const std::vector<std::string> launch_environment_contracts{
+      std::string(launch_environment_contract)};
+  return VerifyNativeExecutionRuntimeUnitForHost(
+      bundle, runtime_unit_id, artifact_source, operating_system,
+      launch_environment_contracts);
+}
+
+std::optional<NativeExecutionRuntimeUnitAdmission>
+VerifyNativeExecutionRuntimeUnitForHost(
+    const manyforge::deployment::RetainedBundle &bundle,
+    const manyforge::core::RuntimeUnitId &runtime_unit_id,
+    const manyforge::deployment::IVerifiedRetainedProductArtifactSource
+        &artifact_source,
+    const std::string_view operating_system,
+    const std::span<const std::string> launch_environment_contracts) {
   auto product = manyforge::deployment::verify_runtime_unit_product(
       bundle, runtime_unit_id, artifact_source);
   if (!product.has_value()) {
     return std::nullopt;
   }
-  if (product->product_contract_id().value() != contract::kProductContractId) {
-    Fail("native execution admission received another runtime product");
-  }
+  const RuntimeContractFacts contract =
+      RequireRuntimeContract(product->product_contract_id().value());
+  const bool launch_environment_matches = std::find(
+      launch_environment_contracts.begin(), launch_environment_contracts.end(),
+      product->launch_environment_contract()) !=
+                                          launch_environment_contracts.end();
   if (operating_system != product->operating_system() ||
-      launch_environment_contract != product->launch_environment_contract()) {
-    Fail("native execution runtime product is incompatible with the selected "
+      !launch_environment_matches) {
+    Fail("execution runtime product is incompatible with the selected "
          "host");
   }
-  if (product->runtime_role_id() != contract::kRuntimeRoleId ||
-      product->status_endpoint_role_id() != contract::kStatusEndpointRoleId ||
+  if (product->runtime_role_id() != contract.runtime_role_id ||
+      product->status_endpoint_role_id() != contract.status_endpoint_role_id ||
       product->status_endpoint_contract_id() !=
-          contract::kStatusEndpointContractId ||
+          contract.status_endpoint_contract_id ||
       product->status_transport() != "adapter_private" ||
       product->process_adapter_contract_id() !=
-          contract::kProcessAdapterContractId ||
-      product->retrieval_contract_id() != contract::kRetrievalContractId) {
-    Fail("native execution runtime product does not select the closed Manager "
+          contract.process_adapter_contract_id ||
+      product->retrieval_contract_id() != contract.retrieval_contract_id) {
+    Fail("execution runtime product does not select the closed Manager "
          "adapter");
   }
-  auto descriptor = ParseLaunchDescriptor(product->launchable_bytes());
+  auto descriptor = ParseLaunchDescriptor(product->launchable_bytes(), contract);
   return NativeExecutionRuntimeUnitAdmission(
       std::move(*product), std::move(descriptor.implementation_revision),
-      std::move(descriptor.installed_target_id));
+      std::move(descriptor.installed_target_id),
+      std::string(contract.candidate_worker_installed_target_id));
 }
 
 } // namespace manyforge::component_manager

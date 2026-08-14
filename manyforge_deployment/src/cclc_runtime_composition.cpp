@@ -198,4 +198,11 @@ CCLCRuntimeComposition::ros_open_request_socket_path() const noexcept {
   return ros_open_request_server_->socket_path();
 }
 
+core::Result<core::ComponentLifecycleCurrentSnapshotDTO>
+CCLCRuntimeComposition::ReadCurrentComponentSnapshot(
+    const core::ControllableComponentId &controllable_component_id) const {
+  return lifecycle_snapshot_source_.ReadCurrentComponentSnapshot(
+      controllable_component_id);
+}
+
 } // namespace manyforge::deployment

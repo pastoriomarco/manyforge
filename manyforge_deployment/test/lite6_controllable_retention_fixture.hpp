@@ -27,6 +27,7 @@
 
 #include "lite6_structural_retention_fixture.hpp"
 #include "native_execution_runtime_unit_internal.hpp"
+#include "ros2_control_execution_runtime_unit_internal.hpp"
 
 namespace manyforge::deployment::test {
 
@@ -43,6 +44,8 @@ inline constexpr std::string_view kLite6GripperDomainId =
     "lite6_gripper_domain";
 inline constexpr std::string_view kLite6NativeExecutionRuntimeId =
     "lite6_native_execution";
+inline constexpr std::string_view kLite6Ros2ControlExecutionRuntimeId =
+    "lite6_ros2_control_execution";
 
 struct Lite6ControllableRetentionFixture final {
   Lite6StructuralRetentionFixture structural;
@@ -62,6 +65,8 @@ struct Lite6ControllableRetentionFixture final {
   std::vector<QualifiedCapabilityDefinition> planner_capabilities;
   std::optional<QualifiedProviderManifest> planner_provider_manifest;
   std::optional<QualifiedRuntimeProfile> native_execution_runtime_profile;
+  std::optional<QualifiedRuntimeProfile>
+      ros2_control_execution_runtime_profile;
   std::optional<QualifiedRuntimePolicy> native_runtime_policy;
 
   [[nodiscard]] std::span<const BuildQualifiedStructuralModelPreparation>
@@ -159,6 +164,21 @@ provider_contract_role_id(const CanonicalValue &declaration) {
                                           CanonicalValue(0.0),
                                           CanonicalValue(0.0),
                                       })},
+      {"execution_tick_hz", CanonicalValue(100.0)},
+      {"collision_monitor_period_ms", CanonicalValue(50.0)},
+  });
+}
+
+[[nodiscard]] inline CanonicalValue ros2_control_execution_configuration() {
+  return CanonicalValue(CanonicalValue::Object{
+      {"mode", CanonicalValue("commanded_sim")},
+      {"isaac_profile", CanonicalValue("lite6")},
+      {"planner_rng_seed", CanonicalValue(12345.0)},
+      {"initial_joint_positions_rad",
+       CanonicalValue(CanonicalValue::Array{
+           CanonicalValue(0.0), CanonicalValue(0.0), CanonicalValue(1.57),
+           CanonicalValue(0.0), CanonicalValue(0.0), CanonicalValue(0.0),
+       })},
       {"execution_tick_hz", CanonicalValue(100.0)},
       {"collision_monitor_period_ms", CanonicalValue(50.0)},
   });
@@ -265,6 +285,8 @@ struct QualifiedControlCatalog final {
   std::vector<QualifiedCapabilityDefinition> lifecycle_capabilities;
   std::optional<QualifiedProviderManifest> planner_provider;
   std::optional<QualifiedRuntimeProfile> native_execution_runtime_profile;
+  std::optional<QualifiedRuntimeProfile>
+      ros2_control_execution_runtime_profile;
   std::optional<QualifiedRuntimePolicy> native_runtime_policy;
 };
 
@@ -418,7 +440,8 @@ qualify_control_catalog(bool chained, bool native_motion = false,
                         bool stoppable = false,
                         std::string_view containment_granularity = "resource",
                         bool qualified_soft_to_spring_substitution = false,
-                        std::string_view lifecycle_semantic_digest = {}) {
+                        std::string_view lifecycle_semantic_digest = {},
+                        bool ros2_control_execution = false) {
   const std::string_view primary_capability_id =
       native_motion ? "execution.trajectory.execute" : "state.observed.current";
   const auto *descriptor =
@@ -554,24 +577,47 @@ qualify_control_catalog(bool chained, bool native_motion = false,
 
   std::optional<QualifiedRuntimeProfile> native_execution_runtime_profile;
   std::optional<std::string> native_execution_runtime_profile_bytes;
-  native_execution_runtime_profile_bytes =
-      detail::native_execution_runtime_profile_document();
+  std::optional<QualifiedRuntimeProfile>
+      ros2_control_execution_runtime_profile;
+  std::optional<std::string> ros2_control_execution_runtime_profile_bytes;
+  if (ros2_control_execution) {
+    ros2_control_execution_runtime_profile_bytes =
+        detail::ros2_control_execution_runtime_profile_document();
+  } else {
+    native_execution_runtime_profile_bytes =
+        detail::native_execution_runtime_profile_document();
+  }
+  const std::string &execution_runtime_profile_bytes =
+      ros2_control_execution ? *ros2_control_execution_runtime_profile_bytes
+                             : *native_execution_runtime_profile_bytes;
   const core::ContentDigest profile_digest(
-      sha256_digest(*native_execution_runtime_profile_bytes));
+      sha256_digest(execution_runtime_profile_bytes));
   const core::ContentAddressedStoreKey profile_key(
       catalog_key("runtime_profile", profile_digest.value()));
   const core::RuntimeProfileCatalogRecordRefDTO profile_ref{
-      core::RuntimeProfileId(
-          std::string(detail::kNativeExecutionRuntimeProfileId)),
+      core::RuntimeProfileId(std::string(
+          ros2_control_execution
+              ? detail::kRos2ControlExecutionRuntimeProfileId
+              : detail::kNativeExecutionRuntimeProfileId)),
       core::RuntimeProfileRevision(
-          detail::native_execution_runtime_profile_revision()),
+          ros2_control_execution
+              ? detail::ros2_control_execution_runtime_profile_revision()
+              : detail::native_execution_runtime_profile_revision()),
       core::SchemaId(std::string(core::kRuntimeProfileApiVersion)),
       schema_revision_for(core::CatalogRecordKind::kRuntimeProfile),
       profile_digest,
       profile_key,
   };
-  native_execution_runtime_profile = resolve_and_qualify_runtime_profile(
-      profile_ref, profile_key, *native_execution_runtime_profile_bytes);
+  auto qualified_execution_runtime_profile =
+      resolve_and_qualify_runtime_profile(
+          profile_ref, profile_key, execution_runtime_profile_bytes);
+  if (ros2_control_execution) {
+    ros2_control_execution_runtime_profile =
+        std::move(qualified_execution_runtime_profile);
+  } else {
+    native_execution_runtime_profile =
+        std::move(qualified_execution_runtime_profile);
+  }
 
   std::optional<QualifiedRuntimePolicy> native_runtime_policy;
   std::optional<std::string> native_runtime_policy_bytes;
@@ -999,6 +1045,13 @@ qualify_control_catalog(bool chained, bool native_motion = false,
   std::optional<QualifiedProviderManifest> planner_provider;
   std::optional<std::string> planner_provider_bytes;
   if (!planner_capabilities.empty()) {
+    const std::string_view planner_provider_id =
+        ros2_control_execution ? "lite6_ros2_control_joint_planner"
+                               : "lite6_native_joint_planner";
+    const std::string_view projection_endpoint_role =
+        ros2_control_execution
+            ? detail::kRos2ControlExecutionRuntimeProjectionEndpointRoleId
+            : detail::kNativeExecutionRuntimeProjectionEndpointRoleId;
     CanonicalValue::Array offered_capabilities;
     offered_capabilities.reserve(planner_capabilities.size());
     for (const auto &planner_capability : planner_capabilities) {
@@ -1009,8 +1062,7 @@ qualify_control_catalog(bool chained, bool native_motion = false,
            CanonicalValue(planner_capability.value()
                               .capability_definition_revision.value())},
           {"required_endpoint_role_ids",
-           text_array(
-               {detail::kNativeExecutionRuntimeProjectionEndpointRoleId})},
+           text_array({projection_endpoint_role})},
       });
     }
     planner_provider_bytes = revisioned_document(
@@ -1018,7 +1070,7 @@ qualify_control_catalog(bool chained, bool native_motion = false,
             {"api_version",
              CanonicalValue(std::string(core::kProviderManifestApiVersion))},
             {"provider_manifest_id",
-             CanonicalValue("lite6_native_joint_planner")},
+             CanonicalValue(std::string(planner_provider_id))},
             {"offered_capabilities",
              CanonicalValue(std::move(offered_capabilities))},
             {"provider_contracts", CanonicalValue(CanonicalValue::Array{})},
@@ -1030,7 +1082,7 @@ qualify_control_catalog(bool chained, bool native_motion = false,
     const core::ContentAddressedStoreKey planner_provider_key(
         catalog_key("provider", planner_provider_digest.value()));
     const core::ProviderManifestCatalogRecordRefDTO planner_provider_ref{
-        core::ProviderManifestId("lite6_native_joint_planner"),
+        core::ProviderManifestId(std::string(planner_provider_id)),
         core::ProviderManifestRevision(revision_from_document(
             *planner_provider_bytes, "provider_manifest_revision")),
         core::SchemaId(std::string(core::kProviderManifestApiVersion)),
@@ -1248,7 +1300,8 @@ qualify_control_catalog(bool chained, bool native_motion = false,
           planner_capability_bytes[index], planner_capabilities[index]));
     }
     artifacts.push_back(catalog_artifact(
-        "catalog://provider_manifest/lite6_native_joint_planner",
+        "catalog://provider_manifest/" +
+            planner_provider->value().provider_manifest_id.value(),
         *planner_provider_bytes, *planner_provider));
   }
   if (native_execution_runtime_profile.has_value() &&
@@ -1257,6 +1310,14 @@ qualify_control_catalog(bool chained, bool native_motion = false,
         "catalog://runtime_profile/manyforge.native_execution_runtime",
         *native_execution_runtime_profile_bytes,
         *native_execution_runtime_profile));
+  }
+  if (ros2_control_execution_runtime_profile.has_value() &&
+      ros2_control_execution_runtime_profile_bytes.has_value()) {
+    artifacts.push_back(catalog_artifact(
+        "catalog://runtime_profile/"
+        "manyforge.ros2_control_execution_runtime_unit",
+        *ros2_control_execution_runtime_profile_bytes,
+        *ros2_control_execution_runtime_profile));
   }
   if (native_runtime_policy.has_value() &&
       native_runtime_policy_bytes.has_value()) {
@@ -1284,6 +1345,7 @@ qualify_control_catalog(bool chained, bool native_motion = false,
       std::move(lifecycle_capabilities),
       std::move(planner_provider),
       std::move(native_execution_runtime_profile),
+      std::move(ros2_control_execution_runtime_profile),
       std::move(native_runtime_policy),
   };
 }
@@ -1787,6 +1849,13 @@ make_graph(const Lite6StructuralRetentionFixture &structural,
            std::string_view containment_granularity = "resource") {
   const bool aggregate = catalog.gripper_capability.has_value();
   const bool native_motion = !catalog.planner_capabilities.empty();
+  const bool ros2_control_execution =
+      catalog.ros2_control_execution_runtime_profile.has_value();
+  if (catalog.native_execution_runtime_profile.has_value() ==
+      ros2_control_execution) {
+    throw std::logic_error(
+        "Lite6 control fixture requires exactly one execution profile");
+  }
   if (instance_count == 0U || instance_count > 32U) {
     throw std::logic_error(
         "Lite6 control fixture instance count is outside its test bound");
@@ -1818,8 +1887,10 @@ make_graph(const Lite6StructuralRetentionFixture &structural,
         indexed_id(kLite6ControllableComponentId, instance);
     const std::string domain_id = indexed_id(kLite6ArmDomainId, instance);
     const std::string binding_id = indexed_id(kLite6ArmBindingId, instance);
-    const std::string runtime_unit_id =
-        indexed_id(kLite6NativeExecutionRuntimeId, instance);
+    const std::string runtime_unit_id = indexed_id(
+        ros2_control_execution ? kLite6Ros2ControlExecutionRuntimeId
+                               : kLite6NativeExecutionRuntimeId,
+        instance);
     const std::string resource_prefix =
         instance == 0U ? "lite6" : "lite6_" + std::to_string(instance + 1U);
 
@@ -1842,12 +1913,20 @@ make_graph(const Lite6StructuralRetentionFixture &structural,
     runtime_units.emplace_back(CanonicalValue::Object{
         {"runtime_unit_id", CanonicalValue(runtime_unit_id)},
         {"runtime_profile_id",
-         CanonicalValue(std::string(detail::kNativeExecutionRuntimeProfileId))},
+         CanonicalValue(std::string(
+             ros2_control_execution
+                 ? detail::kRos2ControlExecutionRuntimeProfileId
+                 : detail::kNativeExecutionRuntimeProfileId))},
         {"runtime_profile_revision",
-         CanonicalValue(detail::native_execution_runtime_profile_revision())},
+         CanonicalValue(
+             ros2_control_execution
+                 ? detail::ros2_control_execution_runtime_profile_revision()
+                 : detail::native_execution_runtime_profile_revision())},
         {"dependency_runtime_unit_ids",
          CanonicalValue(CanonicalValue::Array{})},
-        {"configuration", native_execution_configuration()},
+        {"configuration",
+         ros2_control_execution ? ros2_control_execution_configuration()
+                                : native_execution_configuration()},
     });
     components.emplace_back(CanonicalValue::Object{
         {"controllable_component_id", CanonicalValue(component_id)},
@@ -1920,11 +1999,15 @@ make_graph(const Lite6StructuralRetentionFixture &structural,
          CanonicalValue(
              catalog.provider.value().provider_manifest_revision.value())},
         {"state_authority_id",
-         CanonicalValue(indexed_id(native_motion ? "lite6_predicted_state"
-                                                 : "lite6_measured_state",
+         CanonicalValue(indexed_id(ros2_control_execution
+                                       ? "lite6_commanded_sim_state"
+                                   : native_motion ? "lite6_predicted_state"
+                                                   : "lite6_measured_state",
                                    instance))},
         {"state_authority_class",
-         CanonicalValue(native_motion ? "predicted" : "measured")},
+         CanonicalValue(ros2_control_execution
+                            ? "commanded"
+                            : native_motion ? "predicted" : "measured")},
         {"stop_evidence_policy_id",
          CanonicalValue(catalog.stop.value().stop_evidence_policy_id.value())},
         {"stop_evidence_policy_revision",
@@ -2053,11 +2136,12 @@ make_graph(const Lite6StructuralRetentionFixture &structural,
   const auto intrinsic =
       validate_intrinsic_cell_graph_candidate(decode_cell_graph_candidate(
           parse_strict_json_model_yaml(canonical_json(graph))));
-  const std::span<const QualifiedRuntimeProfile> runtime_profiles =
-      catalog.native_execution_runtime_profile.has_value()
-          ? std::span<const QualifiedRuntimeProfile>(
-                &*catalog.native_execution_runtime_profile, 1U)
-          : std::span<const QualifiedRuntimeProfile>{};
+  const QualifiedRuntimeProfile &execution_runtime_profile =
+      ros2_control_execution
+          ? *catalog.ros2_control_execution_runtime_profile
+          : *catalog.native_execution_runtime_profile;
+  const std::span<const QualifiedRuntimeProfile> runtime_profiles(
+      &execution_runtime_profile, 1U);
   return compute_graph_revision(
       prepare_cell_graph_identity(intrinsic, runtime_profiles));
 }
@@ -2153,6 +2237,21 @@ make_applicability_inputs(
             "Lite6 native-motion planner requires one exact execution "
             "runtime owner");
       }
+      const auto execution_runtime = std::find_if(
+          graph.graph().runtime_units.begin(),
+          graph.graph().runtime_units.end(), [&](const auto &candidate) {
+            return candidate.runtime_unit_id ==
+                   component->runtime_unit_ids.front();
+          });
+      if (execution_runtime == graph.graph().runtime_units.end()) {
+        throw std::logic_error(
+            "Lite6 motion planner has no exact execution runtime");
+      }
+      const std::string_view projection_endpoint_role =
+          execution_runtime->runtime_profile_id.value() ==
+                  detail::kRos2ControlExecutionRuntimeProfileId
+              ? detail::kRos2ControlExecutionRuntimeProjectionEndpointRoleId
+              : detail::kNativeExecutionRuntimeProjectionEndpointRoleId;
       capability_provider_bindings.emplace_back(CanonicalValue::Object{
           {"capability_provider_binding_id",
            CanonicalValue(indexed_id(binding_id, index))},
@@ -2176,9 +2275,11 @@ make_applicability_inputs(
                 CanonicalValue(binding.control_binding_id.value())},
                {"control_binding_revision",
                 CanonicalValue(binding.control_binding_revision.value())},
-           })},
+          })},
           {"provider_instance_id",
-           CanonicalValue(indexed_id("lite6_native_joint_planner", index))},
+           CanonicalValue(indexed_id(
+               planner_provider->value().provider_manifest_id.value(),
+               index))},
           {"provider_manifest_id",
            CanonicalValue(
                planner_provider->value().provider_manifest_id.value())},
@@ -2189,17 +2290,13 @@ make_applicability_inputs(
            CanonicalValue(CanonicalValue::Array{
                CanonicalValue(CanonicalValue::Object{
                    {"endpoint_role_id",
-                    CanonicalValue(std::string(
-                        detail::
-                            kNativeExecutionRuntimeProjectionEndpointRoleId))},
+                    CanonicalValue(std::string(projection_endpoint_role))},
                    {"source_kind", CanonicalValue("runtime_unit")},
                    {"source_id",
                     CanonicalValue(
                         component->runtime_unit_ids.front().value())},
                    {"source_endpoint_role_id",
-                    CanonicalValue(std::string(
-                        detail::
-                            kNativeExecutionRuntimeProjectionEndpointRoleId))},
+                    CanonicalValue(std::string(projection_endpoint_role))},
                }),
            })},
       });
@@ -2392,7 +2489,8 @@ make_lite6_controllable_retention_fixture(
     std::string_view containment_granularity = "resource",
     bool qualified_soft_to_spring_substitution = false,
     std::string_view arm_lifecycle_semantic_digest = {},
-    std::string_view gripper_lifecycle_semantic_digest = {}) {
+    std::string_view gripper_lifecycle_semantic_digest = {},
+    bool ros2_control_execution = false) {
   namespace fixture_detail = lite6_controllable_fixture_detail;
   if (aggregate_gripper &&
       (chained || assistant_enabled || instance_count != 1U)) {
@@ -2404,6 +2502,11 @@ make_lite6_controllable_retention_fixture(
     throw std::logic_error(
         "Composer Draft fixture requires assistant settings");
   }
+  if (ros2_control_execution &&
+      (!native_motion || chained || aggregate_gripper || instance_count != 1U)) {
+    throw std::logic_error(
+        "ros2_control execution fixture requires one direct addressed arm");
+  }
   if (qualified_soft_to_spring_substitution &&
       (!stoppable || !native_motion || chained || aggregate_gripper ||
        instance_count != 1U)) {
@@ -2414,7 +2517,8 @@ make_lite6_controllable_retention_fixture(
   auto structural = make_lite6_structural_retention_fixture();
   auto catalog = fixture_detail::qualify_control_catalog(
       chained, native_motion, stoppable, containment_granularity,
-      qualified_soft_to_spring_substitution, arm_lifecycle_semantic_digest);
+      qualified_soft_to_spring_substitution, arm_lifecycle_semantic_digest,
+      ros2_control_execution);
   if (aggregate_gripper) {
     catalog = fixture_detail::add_aggregate_gripper_catalog(
         std::move(catalog), stoppable, gripper_lifecycle_semantic_digest);
@@ -2462,6 +2566,10 @@ make_lite6_controllable_retention_fixture(
   if (catalog.native_execution_runtime_profile.has_value()) {
     catalog_records.push_back(
         catalog.native_execution_runtime_profile->reference());
+  }
+  if (catalog.ros2_control_execution_runtime_profile.has_value()) {
+    catalog_records.push_back(
+        catalog.ros2_control_execution_runtime_profile->reference());
   }
   if (catalog.native_runtime_policy.has_value()) {
     catalog_records.push_back(catalog.native_runtime_policy->reference());
@@ -2518,6 +2626,10 @@ make_lite6_controllable_retention_fixture(
   std::vector<QualifiedRuntimeProfile> runtime_profiles;
   if (catalog.native_execution_runtime_profile.has_value()) {
     runtime_profiles.push_back(*catalog.native_execution_runtime_profile);
+  }
+  if (catalog.ros2_control_execution_runtime_profile.has_value()) {
+    runtime_profiles.push_back(
+        *catalog.ros2_control_execution_runtime_profile);
   }
   const auto deployment = compute_deployment_artifact_revision(
       parse_strict_json_model_yaml(canonical_json(deployment_value)),
@@ -2618,6 +2730,7 @@ make_lite6_controllable_retention_fixture(
       std::move(catalog.planner_capabilities),
       std::move(catalog.planner_provider),
       std::move(catalog.native_execution_runtime_profile),
+      std::move(catalog.ros2_control_execution_runtime_profile),
       std::move(catalog.native_runtime_policy),
   };
 }
@@ -2659,6 +2772,13 @@ make_lite6_arm_gripper_aggregate_retention_fixture() {
 make_lite6_native_motion_retention_fixture() {
   return make_lite6_controllable_retention_fixture(false, false, 1U, false,
                                                    true);
+}
+
+[[nodiscard]] inline Lite6ControllableRetentionFixture
+make_lite6_ros2_control_motion_retention_fixture(bool stoppable = false) {
+  return make_lite6_controllable_retention_fixture(
+      false, false, 1U, false, true, {}, false, stoppable, "resource", false,
+      {}, {}, true);
 }
 
 [[nodiscard]] inline Lite6ControllableRetentionFixture

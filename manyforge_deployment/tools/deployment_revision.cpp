@@ -17,6 +17,7 @@
 #include <vector>
 
 #include "native_execution_runtime_unit_internal.hpp"
+#include "ros2_control_execution_runtime_unit_internal.hpp"
 
 namespace {
 
@@ -90,9 +91,8 @@ require_string_member(const deployment::CanonicalValue &root,
 }
 
 [[nodiscard]] deployment::QualifiedRuntimeProfile
-qualified_native_runtime_profile() {
-  const std::string bytes =
-      deployment::detail::native_execution_runtime_profile_document();
+qualified_runtime_profile(std::string bytes, std::string_view profile_id,
+                          std::string_view label) {
   const deployment::ParsedArtifactCandidate parsed =
       deployment::parse_strict_json_model_yaml(bytes);
   const std::string &revision =
@@ -105,7 +105,7 @@ qualified_native_runtime_profile() {
           deployment::CatalogSchemaQualification::kQualified ||
       schema->compiled_schema() == nullptr) {
     throw std::logic_error(
-        "native runtime profile schema is not build-qualified");
+        std::string(label) + " runtime profile schema is not build-qualified");
   }
 
   const core::ContentDigest digest(deployment::sha256_digest(bytes));
@@ -113,7 +113,7 @@ qualified_native_runtime_profile() {
       "sha256/" + digest.value().substr(std::string_view("sha256:").size()));
   const core::RuntimeProfileCatalogRecordRefDTO reference{
       core::RuntimeProfileId(
-          std::string(deployment::detail::kNativeExecutionRuntimeProfileId)),
+          std::string(profile_id)),
       core::RuntimeProfileRevision(revision),
       core::SchemaId(std::string(core::kRuntimeProfileApiVersion)),
       schema->compiled_schema()->schema_revision(),
@@ -124,7 +124,8 @@ qualified_native_runtime_profile() {
 }
 
 [[nodiscard]] bool
-selects_native_runtime_profile(const deployment::CanonicalValue &root) {
+selects_runtime_profile(const deployment::CanonicalValue &root,
+                        std::string_view selected_profile_id) {
   const auto *graph = root.find_object_member("graph");
   const auto *graph_object =
       graph == nullptr
@@ -150,7 +151,7 @@ selects_native_runtime_profile(const deployment::CanonicalValue &root) {
         profile == nullptr ? nullptr
                            : std::get_if<std::string>(&profile->storage());
     if (profile_id != nullptr &&
-        *profile_id == deployment::detail::kNativeExecutionRuntimeProfileId) {
+        *profile_id == selected_profile_id) {
       return true;
     }
   }
@@ -266,8 +267,20 @@ int main(int argc, char **argv) {
     const deployment::ParsedArtifactCandidate parsed =
         deployment::parse_strict_json_model_yaml(bytes);
     std::vector<deployment::QualifiedRuntimeProfile> profile_storage;
-    if (selects_native_runtime_profile(parsed.root())) {
-      profile_storage.push_back(qualified_native_runtime_profile());
+    if (selects_runtime_profile(
+            parsed.root(),
+            deployment::detail::kNativeExecutionRuntimeProfileId)) {
+      profile_storage.push_back(qualified_runtime_profile(
+          deployment::detail::native_execution_runtime_profile_document(),
+          deployment::detail::kNativeExecutionRuntimeProfileId, "native"));
+    }
+    if (selects_runtime_profile(
+            parsed.root(),
+            deployment::detail::kRos2ControlExecutionRuntimeProfileId)) {
+      profile_storage.push_back(qualified_runtime_profile(
+          deployment::detail::ros2_control_execution_runtime_profile_document(),
+          deployment::detail::kRos2ControlExecutionRuntimeProfileId,
+          "ros2_control execution"));
     }
     const std::span<const deployment::QualifiedRuntimeProfile> profiles(
         profile_storage);

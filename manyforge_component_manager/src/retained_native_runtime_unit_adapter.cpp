@@ -47,8 +47,6 @@ extern char **environ;
 namespace manyforge::component_manager {
 namespace {
 
-namespace contract = manyforge::deployment::native_execution_runtime_contract;
-
 using manyforge::core::RuntimeEpoch;
 using manyforge::deployment::RetainedBundle;
 
@@ -417,9 +415,8 @@ void VerifyAdmissionMatchesQuery(
       product.launchable_artifact_ref().byte_size !=
           plan.launchable_byte_size ||
       product.operating_system() != plan.operating_system ||
-      product.launch_environment_contract() != plan.shell_contract ||
-      admission.installed_target_id() != contract::kInstalledTargetId) {
-    Fail("verified native runtime admission differs from the exact "
+      product.launch_environment_contract() != plan.shell_contract) {
+    Fail("verified execution runtime admission differs from the exact "
          "convergence query");
   }
 }
@@ -603,7 +600,7 @@ struct RetainedNativeRuntimeUnitAdapter::Impl final
        const manyforge::deployment::IVerifiedRetainedProductArtifactSource
            &selected_artifact_source,
        std::string selected_operating_system,
-       std::string selected_launch_environment_contract)
+       std::vector<std::string> selected_launch_environment_contracts)
       : target_root_path(
             NormalizedPlainDirectory(std::move(trusted_installed_target_root),
                                      "trusted installed-target root")),
@@ -616,12 +613,20 @@ struct RetainedNativeRuntimeUnitAdapter::Impl final
         bundle_source(selected_bundle_source),
         artifact_source(selected_artifact_source),
         operating_system(std::move(selected_operating_system)),
-        launch_environment_contract(
-            std::move(selected_launch_environment_contract)),
+        launch_environment_contracts(
+            std::move(selected_launch_environment_contracts)),
         observer_instance_id("native-observer-" + RandomHex()) {
-    if (operating_system.empty() || launch_environment_contract.empty()) {
+    std::sort(launch_environment_contracts.begin(),
+              launch_environment_contracts.end());
+    if (operating_system.empty() || launch_environment_contracts.empty() ||
+        std::any_of(launch_environment_contracts.begin(),
+                    launch_environment_contracts.end(),
+                    [](const auto &value) { return value.empty(); }) ||
+        std::adjacent_find(launch_environment_contracts.begin(),
+                           launch_environment_contracts.end()) !=
+            launch_environment_contracts.end()) {
       throw std::invalid_argument(
-          "retained native adapter construction input is invalid");
+          "retained execution adapter construction input is invalid");
     }
     const int fd = ::open(target_root_path.c_str(),
                           O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW);
@@ -657,7 +662,7 @@ struct RetainedNativeRuntimeUnitAdapter::Impl final
     }
     auto admission = VerifyNativeExecutionRuntimeUnitForHost(
         *bundle, query.plan.runtime_unit_id, artifact_source, operating_system,
-        launch_environment_contract);
+        launch_environment_contracts);
     if (!admission.has_value()) {
       Fail("retained native adapter query has no qualified native product");
     }
@@ -668,7 +673,7 @@ struct RetainedNativeRuntimeUnitAdapter::Impl final
   [[nodiscard]] UniqueFd OpenInstalledTarget(
       const NativeExecutionRuntimeUnitAdmission& admission) const {
     const int fd = ::openat(target_root_fd.get(),
-                            std::string(contract::kInstalledTargetId).c_str(),
+                            admission.installed_target_id().c_str(),
                             O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
     if (fd < 0) {
       Fail(ErrnoDetail("could not open fixed native execution target", errno));
@@ -1029,7 +1034,7 @@ struct RetainedNativeRuntimeUnitAdapter::Impl final
         admission.launch_arguments(kChildChannelFd, runtime_epoch);
     std::vector<std::string> arguments;
     arguments.reserve(launch_arguments.size() + 11U);
-    arguments.emplace_back(contract::kInstalledTargetId);
+    arguments.push_back(admission.installed_target_id());
     arguments.insert(arguments.end(), launch_arguments.begin(),
                      launch_arguments.end());
     arguments.emplace_back("--manyforge-managed-package-root");
@@ -1041,8 +1046,7 @@ struct RetainedNativeRuntimeUnitAdapter::Impl final
     arguments.emplace_back("--manyforge-managed-candidate-worker");
     arguments.push_back(
         (target_root_path /
-         std::string(contract::kCandidateWorkerInstalledTargetId))
-            .string());
+         admission.candidate_worker_installed_target_id()).string());
     arguments.emplace_back("--manyforge-managed-cell-id");
     arguments.push_back(bundle.value().cell_graph.cell_id.value());
     std::vector<char *> argv;
@@ -1223,7 +1227,8 @@ struct RetainedNativeRuntimeUnitAdapter::Impl final
         RuntimeSourcePhase::kServing, RuntimeSourceHealth::kHealthy,
         query.plan.product_identity.value(),
         query.plan.configuration_identity.value(),
-        {std::string(contract::kRuntimeRoleId)},
+        std::vector<std::string>{
+            std::string(admission.product().runtime_role_id())},
         ManagedCommandSurfaceState::kClosedNoActiveEffect);
   }
 
@@ -1240,7 +1245,7 @@ struct RetainedNativeRuntimeUnitAdapter::Impl final
   const manyforge::deployment::IVerifiedRetainedProductArtifactSource
       &artifact_source;
   std::string operating_system;
-  std::string launch_environment_contract;
+  std::vector<std::string> launch_environment_contracts;
   std::string observer_instance_id;
   UniqueFd target_root_fd;
   std::mutex mutex;
@@ -1441,12 +1446,29 @@ RetainedNativeRuntimeUnitAdapter::RetainedNativeRuntimeUnitAdapter(
     const manyforge::deployment::IVerifiedRetainedProductArtifactSource
         &artifact_source,
     std::string operating_system, std::string launch_environment_contract)
+    : RetainedNativeRuntimeUnitAdapter(
+          std::move(trusted_installed_target_root),
+          std::move(trusted_package_root), std::move(manager_state_root),
+          std::move(private_staging_root), bundle_source, artifact_source,
+          std::move(operating_system),
+          std::vector<std::string>{std::move(launch_environment_contract)}) {}
+
+RetainedNativeRuntimeUnitAdapter::RetainedNativeRuntimeUnitAdapter(
+    std::filesystem::path trusted_installed_target_root,
+    std::filesystem::path trusted_package_root,
+    std::filesystem::path manager_state_root,
+    std::filesystem::path private_staging_root,
+    const manyforge::deployment::IVerifiedRetainedBundleSource &bundle_source,
+    const manyforge::deployment::IVerifiedRetainedProductArtifactSource
+        &artifact_source,
+    std::string operating_system,
+    std::vector<std::string> launch_environment_contracts)
     : impl_(std::make_shared<Impl>(
           std::move(trusted_installed_target_root),
           std::move(trusted_package_root), std::move(manager_state_root),
           std::move(private_staging_root), bundle_source, artifact_source,
           std::move(operating_system),
-          std::move(launch_environment_contract))) {}
+          std::move(launch_environment_contracts))) {}
 
 RetainedNativeRuntimeUnitAdapter::~RetainedNativeRuntimeUnitAdapter() = default;
 
