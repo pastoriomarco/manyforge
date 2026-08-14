@@ -1,0 +1,23 @@
+{
+  "api_version": "manyforge.isaac_pose_observer_site.v1",
+  "cell_id": "isaac_lite6_pick_place_cell",
+  "detection3d_sources": [],
+  "joint_state": {
+    "eligible": false,
+    "lifetime_ns": 1000000000,
+    "object_id": "isaac_lite6_robot",
+    "policy_id": "viewer.measured_robot",
+    "required_joint_names": [
+      "joint1",
+      "joint2",
+      "joint3",
+      "joint4",
+      "joint5",
+      "joint6"
+    ],
+    "topic": "/isaac_joint_states"
+  },
+  "simulation_entities": [],
+  "simulation_poll_period_ms": 250,
+  "source_id": "isaac_lite6_observer"
+}

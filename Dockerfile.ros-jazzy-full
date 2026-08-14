@@ -235,7 +235,13 @@ RUN ln -sf /usr/local/lib/node_modules/npm/bin/npm-cli.js /usr/local/bin/npm \
 COPY --from=frontend-builder --chown=1000:1000 /build/dist/ /opt/manyforge-frontend/dist/
 
 COPY docker-entrypoint.ros-jazzy-full.sh /usr/local/bin/
-RUN chmod +x /usr/local/bin/docker-entrypoint.ros-jazzy-full.sh
+# ament_python console scripts use the ROS system interpreter even though
+# interactive commands select the application venv. Keep the exact
+# canonical-JSON dependency available on both interpreter paths.
+RUN chmod +x /usr/local/bin/docker-entrypoint.ros-jazzy-full.sh \
+    && /usr/bin/python3 -m pip install --break-system-packages --no-cache-dir \
+        --no-deps rfc8785==0.1.4 \
+    && /usr/bin/python3 -c "import rfc8785"
 
 USER 1000:1000
 

@@ -62,8 +62,13 @@ def test_launch_declares_exact_world_and_has_no_retired_semantic_owner() -> None
         "additional_required_topics",
         "command_gate_owner_node",
         "command_gate_owner_namespace",
+        "manager_state_root",
+        "pose_observer_site_config",
     }
-    assert sum(isinstance(action, OpaqueFunction) for action in description.entities) == 1
+    assert (
+        sum(isinstance(action, OpaqueFunction) for action in description.entities)
+        == 1
+    )
 
     source = _LAUNCH_FILE.read_text(encoding="utf-8")
     for retired_wire in (
@@ -161,6 +166,45 @@ def test_launch_lite6_stack_omits_python_gripper_action_adapter(
     assert len(released) == 6
 
 
+def test_launch_releases_exact_pose_observer_only_after_scene_barrier(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module = _load_launch_module()
+    monkeypatch.setattr(
+        module.FindPackageShare,
+        "find",
+        lambda _self, _name: str(_PACKAGE_ROOT),
+    )
+    context = _launch_context(module, profile="ur10e")
+    context.launch_configurations["pose_observer_site_config"] = (
+        "/opt/manyforge/isaac-ur10e-light.pose-observer.json"
+    )
+    context.launch_configurations["manager_state_root"] = "/run/manyforge"
+    actions = module._launch_setup(context)
+    registration = actions[1]
+    event_handler = getattr(
+        registration, "_RegisterEventHandler__event_handler"
+    )
+    callback = getattr(event_handler, "_OnActionEventBase__on_event")
+    released = callback(SimpleNamespace(returncode=0), LaunchContext())
+
+    assert [_node_executable(action) for action in released].count(
+        "pose_source_snapshot_publisher"
+    ) == 1
+    observer = next(
+        action
+        for action in released
+        if _node_executable(action) == "pose_source_snapshot_publisher"
+    )
+    assert getattr(observer, "_ExecuteLocal__on_exit") is not None
+
+    for missing_name in ("pose_observer_site_config", "manager_state_root"):
+        invalid = _launch_context(module, profile="ur10e")
+        invalid.launch_configurations[missing_name] = "/configured/value"
+        with pytest.raises(ValueError, match="configured together"):
+            module._launch_setup(invalid)
+
+
 def test_scene_barrier_return_code_is_exact_and_fail_closed() -> None:
     module = _load_launch_module()
     sentinel = object()
@@ -196,6 +240,13 @@ def test_launch_name_topic_and_vector_parsers_are_bounded() -> None:
     for invalid in ("/clock,/clock", "/clock,relative", "/clock,"):
         with pytest.raises(ValueError):
             module._parse_topic_csv(invalid, name="topics")
+    assert module._optional_absolute_path("", name="path") == ""
+    assert module._optional_absolute_path(" /run/manyforge ", name="path") == (
+        "/run/manyforge"
+    )
+    for invalid in ("relative", "/" + ("x" * 4096), "/bad\x00path"):
+        with pytest.raises(ValueError):
+            module._optional_absolute_path(invalid, name="path")
     for invalid in ("0 1", "0 1 2 3", f"0 1 {math.inf}"):
         with pytest.raises(ValueError):
             module._parse_vector3(invalid, name="xyz")
@@ -227,7 +278,7 @@ def test_controller_manager_resource_parsers_remain_bounded() -> None:
             )
 
 
-def test_pose_source_console_entrypoint_remains_fenced(
+def test_pose_source_console_entrypoint_fails_closed_without_exact_site_inputs(
     capsys: pytest.CaptureFixture[str],
 ) -> None:
     from manyforge_ros_bringup import pose_source_snapshot_publisher
@@ -236,12 +287,10 @@ def test_pose_source_console_entrypoint_remains_fenced(
         encoding="utf-8"
     )
     assert "def _port_target_main" not in source
-    assert "rclpy" not in source
     assert "manyforge_behavior.deployment" not in source
+    assert "composer_url" not in source
     assert pose_source_snapshot_publisher.main([]) == 78
-    assert capsys.readouterr().err.strip() == (
-        pose_source_snapshot_publisher.UNAVAILABLE_MESSAGE
-    )
+    assert "site_config_path is required" in capsys.readouterr().err
 
 
 def test_demo_supervisor_entrypoint_has_no_backup_owner(

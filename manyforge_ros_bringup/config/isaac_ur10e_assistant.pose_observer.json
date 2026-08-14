@@ -1,0 +1,44 @@
+{
+  "api_version": "manyforge.isaac_pose_observer_site.v1",
+  "cell_id": "isaac_ur10e_assistant_cell",
+  "detection3d_sources": [],
+  "joint_state": {
+    "eligible": false,
+    "lifetime_ns": 1000000000,
+    "object_id": "isaac_ur10e_assistant_robot",
+    "policy_id": "viewer.measured_robot",
+    "required_joint_names": [
+      "shoulder_pan_joint",
+      "shoulder_lift_joint",
+      "elbow_joint",
+      "wrist_1_joint",
+      "wrist_2_joint",
+      "wrist_3_joint"
+    ],
+    "topic": "/isaac_joint_states"
+  },
+  "simulation_entities": [
+    {
+      "eligible": false,
+      "entity": "/World/ur10e_robotiq2f_140_ROS/ur10e_robotiq2f_140/ee_link",
+      "lifetime_ns": 1000000000,
+      "local_orientation_xyzw": [0, 0, 0, 1],
+      "local_position_xyz": [0, 0, 0],
+      "object_id": "isaac_ur10e_assistant_robot",
+      "policy_id": "viewer.measured_tcp",
+      "target_frame_id": "universe"
+    },
+    {
+      "eligible": true,
+      "entity": "/mac_n_cheese_centered",
+      "lifetime_ns": 1000000000,
+      "local_orientation_xyzw": [0, 0, 0, 1],
+      "local_position_xyz": [0, 0, 0],
+      "object_id": "isaac_cheese_box",
+      "policy_id": "continuous_unattached",
+      "target_frame_id": "universe"
+    }
+  ],
+  "simulation_poll_period_ms": 250,
+  "source_id": "isaac_scene_objects"
+}

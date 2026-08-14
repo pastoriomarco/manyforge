@@ -55,6 +55,32 @@ def generate_launch_description() -> LaunchDescription:
             DeclareLaunchArgument("scene_startup_timeout_s", default_value="180.0"),
             DeclareLaunchArgument("scene_service_timeout_s", default_value="30.0"),
             DeclareLaunchArgument(
+                "pose_observer_site_config",
+                default_value="",
+                description=(
+                    "Absolute path to the exact retained-cell pose-observer "
+                    "site config. Empty disables observation."
+                ),
+            ),
+            DeclareLaunchArgument(
+                "manager_state_root",
+                default_value="",
+                description=(
+                    "Absolute Manager state root. Required exactly when the "
+                    "pose observer is enabled."
+                ),
+            ),
+            DeclareLaunchArgument(
+                "pose_observer_manager_timeout_s", default_value="2.0"
+            ),
+            DeclareLaunchArgument(
+                "pose_observer_simulation_service_timeout_s",
+                default_value="2.0",
+            ),
+            DeclareLaunchArgument(
+                "pose_observer_retry_log_period_s", default_value="5.0"
+            ),
+            DeclareLaunchArgument(
                 "additional_required_topics",
                 default_value="",
                 description=(
@@ -168,6 +194,19 @@ def _launch_setup(context, *_, **__) -> list[object]:
         LaunchConfiguration("additional_required_topics").perform(context),
         name="additional_required_topics",
     )
+    pose_observer_site_config = _optional_absolute_path(
+        LaunchConfiguration("pose_observer_site_config").perform(context),
+        name="pose_observer_site_config",
+    )
+    manager_state_root = _optional_absolute_path(
+        LaunchConfiguration("manager_state_root").perform(context),
+        name="manager_state_root",
+    )
+    if bool(pose_observer_site_config) != bool(manager_state_root):
+        raise ValueError(
+            "pose_observer_site_config and manager_state_root must be "
+            "configured together"
+        )
     required_topics = sorted(
         {
             "/clock",
@@ -471,6 +510,46 @@ def _launch_setup(context, *_, **__) -> list[object]:
                 on_exit=_shutdown("Isaac gripper transport adapter exited"),
             )
         )
+    if pose_observer_site_config:
+        control_actions.append(
+            Node(
+                package="manyforge_ros_bringup",
+                executable="pose_source_snapshot_publisher",
+                name="manyforge_isaac_pose_observer",
+                output="screen",
+                parameters=[
+                    {
+                        "site_config_path": pose_observer_site_config,
+                        "manager_state_root": manager_state_root,
+                        "manager_timeout_s": _bounded_float(
+                            LaunchConfiguration(
+                                "pose_observer_manager_timeout_s"
+                            ).perform(context),
+                            name="pose_observer_manager_timeout_s",
+                            minimum=0.05,
+                            maximum=5.0,
+                        ),
+                        "simulation_service_timeout_s": _bounded_float(
+                            LaunchConfiguration(
+                                "pose_observer_simulation_service_timeout_s"
+                            ).perform(context),
+                            name="pose_observer_simulation_service_timeout_s",
+                            minimum=0.05,
+                            maximum=30.0,
+                        ),
+                        "retry_log_period_s": _bounded_float(
+                            LaunchConfiguration(
+                                "pose_observer_retry_log_period_s"
+                            ).perform(context),
+                            name="pose_observer_retry_log_period_s",
+                            minimum=0.1,
+                            maximum=300.0,
+                        ),
+                    }
+                ],
+                on_exit=_shutdown("Isaac pose-observer adapter exited"),
+            )
+        )
 
     # The gate publishes its fail-closed state before hardware activation. The
     # repeated transient-local Stop sample then reaches the topic-based system
@@ -589,6 +668,19 @@ def _parse_topic_csv(value: str, *, name: str) -> list[str]:
     if len(set(topics)) != len(topics):
         raise ValueError(f"{name} contains duplicate topics")
     return topics
+
+
+def _optional_absolute_path(value: str, *, name: str) -> str:
+    normalized = value.strip()
+    if not normalized:
+        return ""
+    if (
+        not normalized.startswith("/")
+        or "\x00" in normalized
+        or len(normalized.encode("utf-8")) > 4096
+    ):
+        raise ValueError(f"{name} must be one bounded absolute path")
+    return normalized
 
 
 def _parse_vector3(value: str, *, name: str) -> list[str]:

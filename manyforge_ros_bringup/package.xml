@@ -23,6 +23,7 @@
   <exec_depend>std_msgs</exec_depend>
   <exec_depend>tf2_ros</exec_depend>
   <exec_depend>topic_based_ros2_control</exec_depend>
+  <exec_depend>vision_msgs</exec_depend>
 
   <test_depend>python3-pytest</test_depend>
   <test_depend>rosgraph_msgs</test_depend>

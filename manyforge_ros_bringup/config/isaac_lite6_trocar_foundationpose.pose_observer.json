@@ -1,0 +1,40 @@
+{
+  "api_version": "manyforge.isaac_pose_observer_site.v1",
+  "cell_id": "isaac_lite6_trocar_cell",
+  "detection3d_sources": [
+    {
+      "eligible": true,
+      "fallback_frame_id": "link_base",
+      "lifetime_ns": 5000000000,
+      "object_id": "graspable",
+      "policy_id": "before_planning",
+      "selector": {
+        "class_id": "",
+        "confidence_min": 0,
+        "detection_id": "",
+        "max_position_variance_m2": 0.0025,
+        "selection": "first"
+      },
+      "target_frame_id": "link_base",
+      "topic": "/output"
+    }
+  ],
+  "joint_state": {
+    "eligible": false,
+    "lifetime_ns": 1000000000,
+    "object_id": "isaac_lite6_trocar_robot",
+    "policy_id": "viewer.measured_robot",
+    "required_joint_names": [
+      "joint1",
+      "joint2",
+      "joint3",
+      "joint4",
+      "joint5",
+      "joint6"
+    ],
+    "topic": "/isaac_joint_states"
+  },
+  "simulation_entities": [],
+  "simulation_poll_period_ms": 100,
+  "source_id": "foundationpose_trocar"
+}
