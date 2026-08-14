@@ -5,6 +5,7 @@
 #include <manyforge_core/pick_place_sequence.hpp>
 #include <manyforge_core/ports/iaddressed_motion_preview.hpp>
 #include <manyforge_core/ports/iplanner_scene_projection.hpp>
+#include <manyforge_core/ports/iplanning_scene_synchronizer.hpp>
 #include <manyforge_core/ports/iscene_authority.hpp>
 #include <manyforge_core/ports/iscene_candidate_preview.hpp>
 #include <optional>
@@ -91,15 +92,15 @@ struct PickPlacePlanningResultDTO final {
 /// scene transition, or publishes runtime state.
 class AddressedPickPlacePlanningOwner final {
  public:
-  AddressedPickPlacePlanningOwner(
-      IAddressedMotionPreviewOwner& motion,
-      ISceneAuthority& scene,
-      ISceneCandidatePreview& scene_candidates,
-      IPlannerSceneProjection& projection)
+  AddressedPickPlacePlanningOwner(IAddressedMotionPreviewOwner& motion, ISceneAuthority& scene,
+                                  ISceneCandidatePreview& scene_candidates,
+                                  IPlannerSceneProjection& projection,
+                                  IPlanningSceneSynchronizer* planning_scene_synchronizer = nullptr)
       : motion_(motion),
         scene_(scene),
         scene_candidates_(scene_candidates),
-        projection_(projection) {}
+        projection_(projection),
+        planning_scene_synchronizer_(planning_scene_synchronizer) {}
 
   [[nodiscard]] Result<PickPlacePlanningResultDTO> PlanPick(
       PickSequencePlanningIntentDTO intent,
@@ -110,10 +111,15 @@ class AddressedPickPlacePlanningOwner final {
       std::stop_token stop_token = {});
 
  private:
+  [[nodiscard]] Result<ProjectionRevisionDTO> SynchronizePlanningProjection(
+      OperationIntentDTO& approach, OperationIntentDTO& descend, OperationIntentDTO& tool,
+      OperationIntentDTO& retreat, const ProjectionRevisionDTO& predecessor);
+
   IAddressedMotionPreviewOwner& motion_;
   ISceneAuthority& scene_;
   ISceneCandidatePreview& scene_candidates_;
   IPlannerSceneProjection& projection_;
+  IPlanningSceneSynchronizer* planning_scene_synchronizer_{};
 };
 
 /// Public admission result for one addressed pick/place execution request.

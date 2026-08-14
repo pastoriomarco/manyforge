@@ -289,6 +289,14 @@ class ResourceAddressedExecutionKernel final : public IAddressedOperationOwner,
       std::vector<RuntimeParticipantExecutionRegistration> registrations,
       RuntimeParticipantAdmissionResolver participant_resolver = {});
 
+  /// Publish the candidate-side active-configuration identities already
+  /// declared by the installed registrations while the exact durable Apply
+  /// fence still closes every affected resource. This does not publish Stop
+  /// readiness or open route admission; CCLC must replace these staged facts
+  /// with independently verified readiness before the fence is released.
+  [[nodiscard]] Result<void> stage_current_runtime_configuration_facts_under_apply_fence(
+      const ConfigurationFenceScopeDTO& scope);
+
   /// Rehydrate one exact durable route predecessor after execution-host
   /// replacement without claiming that the new provider incarnation is
   /// Stop-ready. The supplied registrations must name the predecessor's

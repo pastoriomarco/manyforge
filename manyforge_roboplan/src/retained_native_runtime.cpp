@@ -982,7 +982,10 @@ create_retained_native_runtime_participants(
                                    *runtime->trajectory_validator,
                                    *runtime->collision_trajectory_projector,
                                    nullptr,
-                                   runtime->gripper.get()};
+                                   runtime->gripper.get(),
+                                   input.planning_scene_synchronizer.get()};
+  runtime->planning_scene_synchronizer =
+      std::move(input.planning_scene_synchronizer);
   runtime->participant_engine = std::make_shared<core::ExecutionKernel>(
       *runtime->planner, ports, *runtime->execution, *runtime->clock,
       *runtime->scheduler, *runtime->cache, std::move(config.kernel));

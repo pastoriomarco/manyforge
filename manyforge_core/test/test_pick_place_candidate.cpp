@@ -61,6 +61,22 @@ constexpr char kDigest5[] =
           {}};
 }
 
+[[nodiscard]] CollisionWorldLeaseInventory successor_projection(
+    CollisionWorldLeaseInventory predecessor) {
+  auto revision = predecessor.projection_binding.projection_revision;
+  ++revision.scene_revision.revision_id;
+  revision.scene_revision.content_hash = ContentDigest(kDigest5);
+  predecessor.projection_binding.projection_revision = revision;
+  auto logical_scene = *predecessor.logical_scene;
+  logical_scene.revision = revision.scene_revision;
+  predecessor.logical_scene =
+      std::make_shared<const LogicalSceneSnapshotDTO>(std::move(logical_scene));
+  auto world = std::make_shared<CollisionWorldSnapshot>(*predecessor.bundle.world);
+  world->revision = {2U, kDigest5};
+  predecessor.bundle.world = std::move(world);
+  return predecessor;
+}
+
 [[nodiscard]] CollisionWorldLeaseInventory carried_predecessor_projection() {
   auto predecessor = predecessor_projection();
   auto logical_scene = *predecessor.logical_scene;
@@ -462,6 +478,10 @@ class FakeSceneCandidatePreview final : public ISceneCandidatePreview,
     return Result<Pose3DTO>::Ok(Pose3DTO{});
   }
 
+  void SetPredecessor(CollisionWorldLeaseInventory predecessor) {
+    predecessor_ = std::move(predecessor);
+  }
+
   mutable std::size_t call_count{};
   std::size_t commit_count{};
   mutable std::optional<ResolvedSceneCandidatePreviewRequestDTO> last_request;
@@ -606,6 +626,10 @@ class FakeSceneCandidateProjection final : public IPlannerSceneProjection {
     return Result<CollisionWorldLeaseInventory>::Ok(std::move(projected));
   }
 
+  void SetPredecessor(CollisionWorldLeaseInventory predecessor) {
+    predecessor_ = std::move(predecessor);
+  }
+
   mutable std::size_t frame_call_count{};
   mutable std::size_t current_frame_call_count{};
   mutable std::size_t projection_call_count{};
@@ -618,6 +642,28 @@ class FakeSceneCandidateProjection final : public IPlannerSceneProjection {
 
  private:
   CollisionWorldLeaseInventory predecessor_;
+};
+
+class ReplacingPlanningSceneSynchronizer final : public IPlanningSceneSynchronizer {
+ public:
+  ReplacingPlanningSceneSynchronizer(FakeSceneCandidatePreview& scene,
+                                     FakeSceneCandidateProjection& projection,
+                                     CollisionWorldLeaseInventory successor)
+      : scene_(scene), projection_(projection), successor_(std::move(successor)) {}
+
+  Result<ProjectionRevisionDTO> SynchronizeBeforePlanning() override {
+    ++call_count;
+    scene_.SetPredecessor(successor_);
+    projection_.SetPredecessor(successor_);
+    return Result<ProjectionRevisionDTO>::Ok(successor_.projection_binding.projection_revision);
+  }
+
+  std::size_t call_count{};
+
+ private:
+  FakeSceneCandidatePreview& scene_;
+  FakeSceneCandidateProjection& projection_;
+  CollisionWorldLeaseInventory successor_;
 };
 
 [[nodiscard]] PickCandidatePlanningRequestDTO pick_request(
@@ -1032,6 +1078,53 @@ TEST(AddressedPickPlacePlanningOwner,
       result.value().sequence_request->plan.descend_motion));
   EXPECT_TRUE(std::holds_alternative<CartesianPathDTO>(
       result.value().sequence_request->plan.retreat_motion));
+}
+
+TEST(AddressedPickPlacePlanningOwner, RebindsValidatedPublicIntentToOwnerSynchronizedScene) {
+  auto predecessor = predecessor_projection();
+  auto successor = successor_projection(predecessor);
+  FakeMotionPreviewOwner motion;
+  FakeSceneCandidatePreview scene(predecessor);
+  FakeSceneCandidateProjection projection(predecessor);
+  ReplacingPlanningSceneSynchronizer synchronizer(scene, projection, successor);
+  AddressedPickPlacePlanningOwner owner(motion, scene, scene, projection, &synchronizer);
+  auto synthesis = PickCandidateSynthesisIntentDTO{};
+  synthesis.approach_offset_envelope.position_min_m = {0.0, 0.0, 0.05};
+  synthesis.approach_offset_envelope.position_max_m = {0.0, 0.0, 0.05};
+  auto approach =
+      motion_operation("synchronized.pick.approach", "approach", PoseGoalDTO{Pose3DTO{}});
+  auto descend = motion_operation(
+      "synchronized.pick.descend", "descend", CartesianPathDTO{}, ContactPolicyId("pick.contact"),
+      {RuntimeObjectReferenceBindingDTO{RuntimeObjectId("selected_object"),
+                                        SceneResourceId("workpiece")}});
+  auto tool = tool_operation("synchronized.pick.tool", 0.0);
+  auto retreat = motion_operation("synchronized.pick.retreat", "retreat", CartesianPathDTO{});
+  const PickSequencePlanningIntentDTO request{"synchronized-pick-1",
+                                              SceneResourceId("workpiece"),
+                                              RuntimeObjectId("selected_object"),
+                                              FrameRoleId("frame-role:tcp"),
+                                              synthesis,
+                                              std::move(approach),
+                                              std::move(descend),
+                                              std::move(tool),
+                                              std::move(retreat)};
+
+  const auto result = owner.PlanPick(request);
+
+  ASSERT_TRUE(result.ok()) << result.error().message;
+  ASSERT_TRUE(result.value().sequence_request.has_value());
+  EXPECT_EQ(synchronizer.call_count, 1U);
+  const auto& planned = *result.value().sequence_request;
+  EXPECT_EQ(planned.plan.predecessor_projection_revision,
+            successor.projection_binding.projection_revision);
+  EXPECT_EQ(planned.approach_operation.expected_scene_revision,
+            successor.projection_binding.projection_revision.scene_revision);
+  EXPECT_EQ(planned.descend_operation.expected_scene_revision,
+            successor.projection_binding.projection_revision.scene_revision);
+  EXPECT_EQ(planned.tool_operation.expected_scene_revision,
+            successor.projection_binding.projection_revision.scene_revision);
+  EXPECT_EQ(planned.retreat_operation.expected_scene_revision,
+            successor.projection_binding.projection_revision.scene_revision);
 }
 
 TEST(AddressedPickPlacePlanningOwner, PreservesPortableAndCandidateTcpOffsetReferenceSemantics) {

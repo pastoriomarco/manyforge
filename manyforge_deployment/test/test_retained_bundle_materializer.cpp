@@ -2008,6 +2008,11 @@ TEST(ControlDomainControlVerifier,
             detail::ros2_control_execution_runtime_product_id(
                 core::RuntimeUnitId(std::string(
                     test::kLite6Ros2ControlExecutionRuntimeId))));
+  EXPECT_EQ(
+      detail::ros2_control_execution_runtime_product_id(core::RuntimeUnitId(
+          std::string(test::kLite6Ros2ControlExecutionRuntimeId))),
+      detail::native_execution_runtime_product_id(core::RuntimeUnitId(
+          std::string(test::kLite6Ros2ControlExecutionRuntimeId))));
   EXPECT_EQ(string_member(retained_qualifications.front(),
                           "product_contract_id"),
             detail::kRos2ControlExecutionRuntimeProductContractId);

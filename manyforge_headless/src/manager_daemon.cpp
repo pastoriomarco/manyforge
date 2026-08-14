@@ -310,6 +310,7 @@ enum class CommandKind {
   kSceneRuntimeOwnerRead,
   kSceneRuntimeObserverOpen,
   kSceneRuntimeObserve,
+  kSceneRuntimeLatchBeforePlanning,
   kReconcile,
   kShutdownRuntime,
 };
@@ -654,6 +655,17 @@ ManagerCommand DecodeCommand(const std::string_view bytes) {
     result.pose_payload = payload;
     return result;
   }
+  if (command == "scene_runtime_latch_before_planning") {
+    RequireExactObjectSize(root, 4U,
+                           "scene-runtime before-planning latch command");
+    ManagerCommand result{.kind =
+                              CommandKind::kSceneRuntimeLatchBeforePlanning};
+    result.expected_scene_runtime_identity = RequiredSceneRuntimeIdentity(
+        RequiredMember(root, "expected_runtime_identity"));
+    result.expected_scene_projection = RequiredProjectionRevision(
+        RequiredMember(root, "expected_projection_revision"));
+    return result;
+  }
   Require(command == "apply", "command kind is unsupported");
   RequireExactObjectSize(root, 10U, "Apply command");
   const auto request_id = RequiredString(root, "request_id");
@@ -858,6 +870,53 @@ CanonicalValue SceneRuntimeObserveResponse(
       {"source_id", CanonicalValue(observation.key.source_id)},
       {"source_sequence",
        Unsigned(observation.source_sequence, "source sequence")},
+  });
+}
+
+struct BeforePlanningLatchResult final {
+  core::ProjectionRevisionDTO initial_projection_revision;
+  core::ProjectionRevisionDTO projection_revision;
+  std::uint64_t latched_observation_count{};
+  std::uint64_t committed_observation_count{};
+  std::uint64_t already_applied_observation_count{};
+  std::uint64_t skipped_attached_observation_count{};
+  std::uint64_t scene_runtime_source_generation{};
+};
+
+CanonicalValue SceneRuntimeBeforePlanningLatchResponse(
+    const SceneRuntimeIdentity &runtime_identity,
+    const BeforePlanningLatchResult &result) {
+  Require(runtime_identity.valid() &&
+              result.initial_projection_revision.valid() &&
+              result.projection_revision.valid() &&
+              result.latched_observation_count ==
+                  result.committed_observation_count +
+                      result.already_applied_observation_count +
+                      result.skipped_attached_observation_count &&
+              result.scene_runtime_source_generation != 0U,
+          "scene-runtime before-planning latch result is invalid");
+  return CanonicalValue(CanonicalValue::Object{
+      {"already_applied_observation_count",
+       Unsigned(result.already_applied_observation_count,
+                "already applied observation count")},
+      {"api_version",
+       CanonicalValue(std::string(kManagerCommandResponseApiVersion))},
+      {"committed_observation_count",
+       Unsigned(result.committed_observation_count,
+                "committed observation count")},
+      {"initial_projection_revision",
+       ProjectionRevision(result.initial_projection_revision)},
+      {"latched_observation_count",
+       Unsigned(result.latched_observation_count, "latched observation count")},
+      {"ok", CanonicalValue(true)},
+      {"projection_revision", ProjectionRevision(result.projection_revision)},
+      {"runtime_identity", SceneRuntimeIdentityResponseValue(runtime_identity)},
+      {"scene_runtime_source_generation",
+       Unsigned(result.scene_runtime_source_generation,
+                "scene runtime source generation")},
+      {"skipped_attached_observation_count",
+       Unsigned(result.skipped_attached_observation_count,
+                "skipped attached observation count")},
   });
 }
 
@@ -1212,7 +1271,7 @@ public:
             [this] { return ElapsedNs(); },
             [] { return core::ApplyId(RandomToken("apply-")); }),
         scene_runtime_owner_(
-            [this] { return static_cast<std::int64_t>(ElapsedNs()); },
+            [] { return HostMonotonicNs(); },
             [] { return RandomToken("scene-init-"); }),
         manager_channel_(config_.publication_root,
                          std::string(kManagerSourceFileName)),
@@ -1309,6 +1368,18 @@ private:
                              .count();
     Require(elapsed >= 0, "monotonic clock moved backwards");
     return static_cast<std::uint64_t>(elapsed);
+  }
+
+  /// Scene observation freshness crosses the Manager/native process boundary
+  /// on one Linux host. Both receivers therefore use that host's shared
+  /// CLOCK_MONOTONIC boot epoch; raw ROS/simulation stamps remain diagnostic
+  /// evidence and are never compared with this value.
+  static std::int64_t HostMonotonicNs() {
+    const auto now = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                         std::chrono::steady_clock::now().time_since_epoch())
+                         .count();
+    Require(now >= 0, "host monotonic clock returned a negative timestamp");
+    return now;
   }
 
   void EnsureBootstrap() {
@@ -1623,6 +1694,169 @@ private:
         bundle->value().capability_provider_bindings,
         bundle->retained_bundle_id(), bundle->value().cell_graph.graph_revision,
         observation);
+  }
+
+  core::Result<BeforePlanningLatchResult> LatchBeforePlanningObservations(
+      const SceneRuntimeIdentity &runtime_identity,
+      const core::ProjectionRevisionDTO &expected_projection) {
+    const auto failure = [](std::string code, std::string message,
+                            std::map<std::string, std::string> details = {}) {
+      return core::Result<BeforePlanningLatchResult>::Err(core::ErrorDTO{
+          std::move(code), std::move(message), std::move(details)});
+    };
+    const auto owner = scene_runtime_owner_.Snapshot();
+    if (owner.state != SceneInitializationState::kOpen ||
+        !owner.runtime_identity.has_value() ||
+        *owner.runtime_identity != runtime_identity) {
+      return failure(
+          "scene_runtime_pose_owner_not_open",
+          "scene-runtime owner is not open for before-planning pose latching",
+          {{"initialization_state", std::string(ToString(owner.state))}});
+    }
+    const auto initial_projection = scene_owner_.CurrentProjectionRevision();
+    if (initial_projection != expected_projection ||
+        initial_projection.retained_bundle_id.value() !=
+            runtime_identity.retained_bundle_id ||
+        initial_projection.graph_revision.value() !=
+            runtime_identity.graph_revision) {
+      return failure("scene_runtime_pose_projection_changed",
+                     "logical-scene projection changed before pose latching");
+    }
+
+    std::shared_ptr<const deployment::RetainedBundle> bundle;
+    try {
+      bundle = bundle_source_.get_verified(
+          core::RetainedBundleId(runtime_identity.retained_bundle_id));
+    } catch (const std::exception &error) {
+      return failure("scene_runtime_pose_bundle_unavailable", error.what());
+    }
+    if (bundle == nullptr ||
+        bundle->retained_bundle_id().value() !=
+            runtime_identity.retained_bundle_id ||
+        bundle->value().cell_graph.graph_revision.value() !=
+            runtime_identity.graph_revision ||
+        bundle->value().cell_graph.cell_id != admission_.cell_id()) {
+      return failure(
+          "scene_runtime_pose_bundle_unavailable",
+          "scene-runtime identity has no exact verified active bundle");
+    }
+
+    struct LatchCandidate final {
+      PoseObservationReplay *replay{};
+      PoseSourceObservation observation;
+    };
+    std::vector<LatchCandidate> candidates;
+    for (const auto &[source_id, session] : pose_observer_sessions_) {
+      if (session.runtime_identity != runtime_identity) {
+        continue;
+      }
+      for (const auto &binding : session.bindings) {
+        if (!binding.eligible || binding.policy_id != "before_planning") {
+          continue;
+        }
+        const PoseObservationKey key{source_id, binding.object_id,
+                                     binding.policy_id};
+        const auto observed =
+            std::find_if(owner.pose_sources.begin(), owner.pose_sources.end(),
+                         [&](const PoseSourceLifetimeSnapshot &candidate) {
+                           return candidate.observation.key == key;
+                         });
+        if (observed == owner.pose_sources.end() ||
+            observed->observation.source_epoch != session.source_epoch ||
+            observed->observation.source_epoch_order !=
+                session.source_epoch_order) {
+          return failure(
+              "scene_runtime_pose_observation_missing",
+              "before-planning pose source has no observation for its active "
+              "epoch",
+              {{"object_id", binding.object_id}, {"source_id", source_id}});
+        }
+        if (!observed->fresh || observed->buffered ||
+            !observed->observation.eligible ||
+            observed->observation.quality != PoseSourceQuality::kGood) {
+          return failure(
+              "scene_runtime_pose_observation_stale",
+              "before-planning pose source has no fresh eligible observation",
+              {{"object_id", binding.object_id}, {"source_id", source_id}});
+        }
+        const auto replay = pose_observation_replays_.find(key);
+        if (replay == pose_observation_replays_.end() ||
+            replay->second.runtime_identity != runtime_identity ||
+            replay->second.observation != observed->observation) {
+          return failure(
+              "scene_runtime_pose_observation_unretained",
+              "before-planning pose observation has no exact replay record",
+              {{"object_id", binding.object_id}, {"source_id", source_id}});
+        }
+        candidates.push_back(
+            LatchCandidate{&replay->second, observed->observation});
+      }
+    }
+
+    BeforePlanningLatchResult result{
+        initial_projection, initial_projection, 0U, 0U, 0U, 0U, 0U};
+    std::vector<PoseObservationReplay *> applied_records;
+    const auto publish_results = [&] {
+      if (result.committed_observation_count != 0U) {
+        TryPublishLogicalScene();
+      }
+      const auto generation =
+          PublishSceneRuntime(static_cast<std::int64_t>(ElapsedNs()));
+      result.scene_runtime_source_generation = generation;
+      for (auto *const record : applied_records) {
+        record->publication_generation = generation;
+      }
+    };
+    for (auto &candidate : candidates) {
+      auto application = scene_runtime_pose_projector_.Apply(
+          bundle->value().capability_provider_bindings,
+          bundle->retained_bundle_id(),
+          bundle->value().cell_graph.graph_revision, candidate.observation);
+      if (!application.ok()) {
+        try {
+          publish_results();
+        } catch (...) {
+          // The durable logical-scene result remains authoritative. Periodic
+          // publication recovery is independent of the latch rejection.
+        }
+        return failure(application.error().code, application.error().message,
+                       application.error().details);
+      }
+      switch (application.value().status) {
+      case SceneRuntimePoseApplicationStatus::kCommitted:
+        ++result.committed_observation_count;
+        break;
+      case SceneRuntimePoseApplicationStatus::kAlreadyApplied:
+        ++result.already_applied_observation_count;
+        break;
+      case SceneRuntimePoseApplicationStatus::kSkippedAttached:
+        ++result.skipped_attached_observation_count;
+        break;
+      case SceneRuntimePoseApplicationStatus::kNotRequested:
+      case SceneRuntimePoseApplicationStatus::kDeferredBeforePlanning:
+      case SceneRuntimePoseApplicationStatus::kBuffered:
+        try {
+          publish_results();
+        } catch (...) {
+        }
+        return failure(
+            "scene_runtime_pose_latch_result_invalid",
+            "before-planning pose projector returned a non-latched status");
+      }
+      candidate.replay->application = application.value();
+      candidate.replay->publication_generation.reset();
+      applied_records.push_back(candidate.replay);
+      ++result.latched_observation_count;
+      result.projection_revision = *application.value().projection_revision;
+    }
+    publish_results();
+    const auto final_projection = scene_owner_.CurrentProjectionRevision();
+    if (final_projection != result.projection_revision) {
+      return failure(
+          "scene_runtime_pose_projection_changed",
+          "logical-scene projection changed while pose latching completed");
+    }
+    return core::Result<BeforePlanningLatchResult>::Ok(std::move(result));
   }
 
   bool HandleOneClient(const CommandSocket &socket) {
@@ -1986,7 +2220,7 @@ private:
             return false;
           }
         } else {
-          const auto observed_at = static_cast<std::int64_t>(ElapsedNs());
+          const auto observed_at = HostMonotonicNs();
           constexpr auto kMaximumSafeInteger = 9007199254740991ULL;
           const auto observed_unsigned =
               static_cast<std::uint64_t>(observed_at);
@@ -2048,6 +2282,35 @@ private:
             SceneRuntimeObserveResponse(record->observation, record->acceptance,
                                         *record->application,
                                         *record->publication_generation));
+        return false;
+      }
+      case CommandKind::kSceneRuntimeLatchBeforePlanning: {
+        Require(command.expected_scene_runtime_identity.has_value() &&
+                    command.expected_scene_projection.has_value(),
+                "decoded scene-runtime before-planning latch is incomplete");
+        const auto owner = scene_runtime_owner_.Snapshot();
+        if (!owner.runtime_identity.has_value() ||
+            *owner.runtime_identity !=
+                *command.expected_scene_runtime_identity) {
+          TrySendResponse(
+              client.get(),
+              ErrorResponse(
+                  "scene_runtime_identity_changed",
+                  "before-planning pose latch targets an inactive runtime"));
+          return false;
+        }
+        const auto result = LatchBeforePlanningObservations(
+            *command.expected_scene_runtime_identity,
+            *command.expected_scene_projection);
+        if (!result.ok()) {
+          TrySendResponse(client.get(), ErrorResponse(result.error().code,
+                                                      result.error().message));
+          return false;
+        }
+        TrySendResponse(
+            client.get(),
+            SceneRuntimeBeforePlanningLatchResponse(
+                *command.expected_scene_runtime_identity, result.value()));
         return false;
       }
       case CommandKind::kReconcile: {

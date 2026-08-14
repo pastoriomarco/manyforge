@@ -801,6 +801,7 @@ ExecutionKernel::ExecutionKernel(IPlannerBackend& planner, ExecutionKernelPorts 
       collision_projector_(ports.collision_projector),
       collision_diagnostic_comparator_(ports.collision_diagnostic_comparator),
       gripper_command_backend_(ports.gripper_command_backend),
+      planning_scene_synchronizer_(ports.planning_scene_synchronizer),
       execution_backend_(execution_backend),
       clock_(clock),
       scheduler_(scheduler),
@@ -1955,6 +1956,41 @@ void ExecutionKernel::RetainedSceneSnapshotLease::release() noexcept {
 
 ProjectionLeaseBindingDTO ExecutionKernel::RetainedSceneSnapshotLease::binding() const {
   return inventory_.projection_binding;
+}
+
+Result<std::optional<ProjectionRevisionDTO>>
+ExecutionKernel::synchronize_scene_before_planning() {
+  if (planning_scene_synchronizer_ == nullptr) {
+    return Result<std::optional<ProjectionRevisionDTO>>::Ok(std::nullopt);
+  }
+  try {
+    auto synchronized =
+        planning_scene_synchronizer_->SynchronizeBeforePlanning();
+    if (!synchronized.ok()) {
+      return Result<std::optional<ProjectionRevisionDTO>>::Err(
+          synchronized.error());
+    }
+    if (!synchronized.value().valid()) {
+      return Result<std::optional<ProjectionRevisionDTO>>::Err(
+          ErrorDTO{kErrorExecutionRejected,
+                   "Planning-scene synchronization returned an invalid projection",
+                   {{"reason", "planning_scene_synchronization_invalid"}}});
+    }
+    return Result<std::optional<ProjectionRevisionDTO>>::Ok(
+        std::move(synchronized.value()));
+  } catch (const std::exception& error) {
+    return Result<std::optional<ProjectionRevisionDTO>>::Err(ErrorDTO{
+        kErrorExecutionRejected,
+        "Planning-scene synchronization raised an exception",
+        {{"reason", "planning_scene_synchronization_exception"},
+         {"exception", error.what()}}});
+  } catch (...) {
+    return Result<std::optional<ProjectionRevisionDTO>>::Err(
+        ErrorDTO{kErrorExecutionRejected,
+                 "Planning-scene synchronization raised a non-standard exception",
+                 {{"reason", "planning_scene_synchronization_exception"},
+                  {"exception", reason_codes::kUnknownNonStdException}}});
+  }
 }
 
 Result<ExecutionKernel::RetainedSceneSnapshotLease>
@@ -7159,6 +7195,12 @@ void ExecutionKernel::async_execute_worker(
                       {},
                       std::nullopt,
                       {{"reason", "resume_replan"}, {"resume_phase", "planning"}}});
+          auto synchronized_scene = synchronize_scene_before_planning();
+          if (!synchronized_scene.ok()) {
+            fail_resume_closed(synchronized_scene.error(), "resume scene synchronization failed",
+                               "resume_scene_synchronization_failed", true, false);
+            return;
+          }
           auto resume_scene_result = retain_current_scene_snapshot_lease_inventory(
               exec_id, request.move_id + "_resume_" + std::to_string(clock_.now()));
           if (!resume_scene_result.ok()) {
@@ -7167,6 +7209,16 @@ void ExecutionKernel::async_execute_worker(
             return;
           }
           auto resume_scene = std::move(resume_scene_result.value());
+          if (synchronized_scene.value().has_value() &&
+              resume_scene.binding().projection_revision != *synchronized_scene.value()) {
+            fail_resume_closed(ErrorDTO{kErrorExecutionRejected,
+                                        "Retained Resume projection differs from the "
+                                        "synchronized scene",
+                                        {{"reason", "planning_scene_synchronization_raced"}}},
+                               "resume scene synchronization raced",
+                               "resume_scene_synchronization_raced", true, false);
+            return;
+          }
           auto resume_scene_snapshot_lease =
               build_scene_snapshot_lease(resume_scene.inventory(), resume_request, exec_id);
           auto resume_plan =
@@ -8528,6 +8580,11 @@ Result<uint64_t> ExecutionKernel::execute_impl(
     return reject_admission(sync_result.error());
   }
 
+  auto synchronized_scene = synchronize_scene_before_planning();
+  if (!synchronized_scene.ok()) {
+    return reject_admission(synchronized_scene.error());
+  }
+
   auto retained_scene_result =
       retain_current_scene_snapshot_lease_inventory(exec_id, request.move_id);
   if (!retained_scene_result.ok()) {
@@ -8539,6 +8596,13 @@ Result<uint64_t> ExecutionKernel::execute_impl(
     return reject_admission(ErrorDTO{kErrorExecutionRejected,
                                      "Retained planner projection binding is invalid",
                                      {{"reason", "planner_projection_binding_invalid"}}});
+  }
+  if (synchronized_scene.value().has_value() &&
+      projection_binding.projection_revision != *synchronized_scene.value()) {
+    return reject_admission(
+        ErrorDTO{kErrorExecutionRejected,
+                 "Retained planner projection differs from the synchronized scene",
+                 {{"reason", "planning_scene_synchronization_raced"}}});
   }
   ExecuteRequestDTO resolved_request(request);
   auto contact_grasp_binding =

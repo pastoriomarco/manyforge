@@ -3285,6 +3285,48 @@ TEST(ResourceAddressedExecutionKernelTest, UsesOneInjectedGateForTheActualSlotTa
 }
 
 TEST(ResourceAddressedExecutionKernelTest,
+     StagesUnreadyCandidateConfigurationFactsOnlyUnderTheInjectedApplyFence) {
+  FakeClock clock;
+  FakeParticipantEngine engine;
+  FakeResourceAdmissionGate gate;
+  const auto binding =
+      make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular);
+  ResourceAddressedExecutionKernel kernel(
+      {unqualified_registration(binding, engine)}, clock, default_journal,
+      ResourceAddressedExecutionKernelConfig{
+          RequestOwnerEpoch("kernel.epoch.1"), CellId("cell.test"), 8U, {}, &gate});
+  const auto& path = *binding.value().control_path;
+  const ConfigurationFenceScopeDTO scope{
+      {binding.value().controllable_component_id},
+      {{path.control_domain_id, std::nullopt, path.control_domain_revision}},
+      {{path.control_binding_id, std::nullopt, path.control_binding_revision}},
+      {binding.value().resources.front().resource_id}};
+  ASSERT_TRUE(scope.valid());
+  EXPECT_TRUE(kernel.resource_admission_table()
+                  ->admission_snapshot(scope.resources)
+                  .active_control_configurations.empty());
+
+  const auto staged = kernel.stage_current_runtime_configuration_facts_under_apply_fence(scope);
+  ASSERT_TRUE(staged.ok()) << staged.error().message;
+  const auto admission = kernel.resource_admission_table()->admission_snapshot(scope.resources);
+  ASSERT_EQ(admission.active_control_configurations.size(), 1U);
+  EXPECT_EQ(admission.active_control_configurations.front().control_domain_id,
+            path.control_domain_id);
+  EXPECT_EQ(admission.active_control_configurations.front().active_control_configuration_id,
+            path.active_control_configuration_id);
+  EXPECT_EQ(admission.active_control_configurations.front().active_control_configuration_generation,
+            path.active_control_configuration_generation);
+  const auto blocked = kernel.execute(motion_operation());
+  ASSERT_FALSE(blocked.ok());
+  EXPECT_EQ(blocked.error().details.at("reason"), "runtime_route_publication_required");
+
+  gate.reject_reservation = false;
+  const auto unfenced = kernel.stage_current_runtime_configuration_facts_under_apply_fence(scope);
+  ASSERT_FALSE(unfenced.ok());
+  EXPECT_EQ(unfenced.error().details.at("reason"), "runtime_configuration_staging_fence_missing");
+}
+
+TEST(ResourceAddressedExecutionKernelTest,
      ProductBackedResolverAdmitsAnExactProgramBindingOnPinnedPhysicalEngine) {
   FakeClock clock;
   clock.set(1234);

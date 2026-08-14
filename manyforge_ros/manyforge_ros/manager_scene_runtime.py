@@ -531,8 +531,15 @@ class ManagerSceneRuntimeClient:
                 if application_status != "not_requested":
                     raise ValueError("ineligible observation reports scene application")
             elif intent.policy_id == "before_planning":
-                if application_status != "deferred_before_planning":
-                    raise ValueError("before-planning observation was not deferred")
+                if application_status not in {
+                    "already_applied",
+                    "committed",
+                    "deferred_before_planning",
+                    "skipped_attached",
+                }:
+                    raise ValueError(
+                        "before-planning observation has an invalid latch status"
+                    )
             elif disposition in {"buffered", "replaced_buffered"}:
                 if application_status != "buffered":
                     raise ValueError("buffered observation reports another application")

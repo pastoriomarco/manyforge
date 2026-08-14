@@ -104,11 +104,12 @@ make_projection_runtime_shadow_snapshot(const core::CellId &cell_id) {
   return core::LogicalSceneSnapshotRoot(std::move(snapshot));
 }
 
-[[nodiscard]] core::LogicalSceneSnapshotDTO
-make_collision_scene_snapshot(const core::CellId &cell_id,
-                              const std::uint64_t scene_revision_id,
-                              const core::SceneResourceId &scene_resource_id,
-                              const double x_m, const double extent_m) {
+[[nodiscard]] core::LogicalSceneSnapshotDTO make_collision_scene_snapshot(
+    const core::CellId &cell_id, const std::uint64_t scene_revision_id,
+    const core::SceneResourceId &scene_resource_id, const double x_m,
+    const double extent_m,
+    std::optional<core::SceneObjectProviderEvidenceDTO> provider_evidence =
+        std::nullopt) {
   auto base = make_projection_runtime_shadow_snapshot(cell_id);
   core::LogicalSceneSnapshotDTO snapshot = *base.shared();
   snapshot.revision.revision_id = scene_revision_id;
@@ -121,7 +122,7 @@ make_collision_scene_snapshot(const core::CellId &cell_id,
           cell_id,
           {{x_m, 0.0, 0.0}, {0.0, 0.0, 0.0, 1.0}},
       },
-      std::nullopt,
+      std::move(provider_evidence),
   });
   snapshot.revision.content_hash =
       core::logical_scene_identity::ComputeLogicalSceneContentHash(snapshot);
@@ -2333,6 +2334,7 @@ TEST(RetainedProductCrossConsumer,
           runtime_policy->value(),
           {},
           {},
+          {},
           {}},
       std::move(runtime_config));
 
@@ -3032,9 +3034,20 @@ TEST(RetainedProductCrossConsumer,
       RetainedCollisionWorldProjector::create_verified(
           shared_collision_model, *materialized.bundle, model_map, retained);
 
+  constexpr std::int64_t kReceiverTimestampNs = 4'000'000'000;
+  constexpr std::int64_t kRawSourceTimestampNs = 1'250'000'000;
   const auto initial_scene = make_collision_scene_snapshot(
       materialized.bundle->value().cell_graph.cell_id, 2U,
-      core::SceneResourceId("first-object"), 10.0, 0.1);
+      core::SceneResourceId("first-object"), 10.0, 0.1,
+      core::SceneObjectProviderEvidenceDTO{
+          core::ProviderInstanceId("isaac.pose.observer"),
+          core::ProviderManifestId("manyforge.provider.logical_scene"),
+          core::ProviderManifestRevision(
+              "sha256:"
+              "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"),
+          "sha256:"
+          "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          7U, kReceiverTimestampNs, kRawSourceTimestampNs, 10'000'000'000});
   const core::ProjectionRevisionDTO initial_revision{
       materialized.bundle->retained_bundle_id(),
       materialized.bundle->value().cell_graph.graph_revision,
@@ -3044,7 +3057,7 @@ TEST(RetainedProductCrossConsumer,
       core::CapabilityProviderBindingRevision("planner-binding-revision"),
       core::RuntimeUnitId("native-execution-host"),
       core::RuntimeEpoch("native-execution-host-epoch-1")};
-  std::int64_t clock_value = 10;
+  std::int64_t clock_value = kReceiverTimestampNs + 10;
   bool fail_clock = false;
   auto projection_result = RetainedPlannerSceneProjection::CreateInitialized(
       collision_projector, products.planning_collision_model, native_binding,
@@ -3064,7 +3077,17 @@ TEST(RetainedProductCrossConsumer,
   const auto publication_inventory =
       projection->current_scene_snapshot_lease_inventory();
   ASSERT_TRUE(publication_inventory.has_value());
-  EXPECT_EQ(publication_inventory->captured_at_ns, 10);
+  EXPECT_EQ(publication_inventory->captured_at_ns,
+            kReceiverTimestampNs + 10);
+  ASSERT_EQ(publication_inventory->bundle.body_freshness.size(), 1U);
+  EXPECT_EQ(publication_inventory->bundle.body_freshness.front()
+                .source_timestamp_ns,
+            kReceiverTimestampNs);
+  ASSERT_EQ(publication_inventory->live_objects.size(), 1U);
+  EXPECT_EQ(publication_inventory->live_objects.front().source_timestamp_ns,
+            kReceiverTimestampNs);
+  EXPECT_NE(publication_inventory->live_objects.front().source_timestamp_ns,
+            kRawSourceTimestampNs);
 
   const core::ProjectionLeaseId predecessor_lease(
       "z.operation.predecessor.oldest");

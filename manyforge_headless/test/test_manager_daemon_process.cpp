@@ -467,9 +467,10 @@ std::string ApplyRequest(
          "\",\"source_label\":\"manager-process-test\"}";
 }
 
-std::string SceneAddRequest(const SourceSnapshot &scene_source,
-                            const std::string_view request_id,
-                            const double box_x = 0.1) {
+std::string SceneAddRequest(
+    const SourceSnapshot &scene_source, const std::string_view request_id,
+    const double box_x = 0.1,
+    const std::string_view scene_resource_id = "scene-process-box") {
   using content_identity::CanonicalValue;
   const auto &projection = RequiredMember(
       RequiredMember(scene_source.payload, "access"), "active_projection");
@@ -507,7 +508,8 @@ std::string SceneAddRequest(const SourceSnapshot &scene_source,
                                         {"z_m", CanonicalValue(0.15)},
                                     })},
                  })},
-                {"scene_resource_id", CanonicalValue("scene-process-box")},
+                {"scene_resource_id",
+                 CanonicalValue(std::string(scene_resource_id))},
                 {"shape",
                  CanonicalValue(CanonicalValue::Object{
                      {"box_dimensions_m", CanonicalValue(CanonicalValue::Object{
@@ -646,6 +648,65 @@ std::string SceneRuntimeObserveRequest(
       {"source_epoch", CanonicalValue(std::string(source_epoch))},
       {"source_id", CanonicalValue(std::string(source_id))},
       {"source_sequence", CanonicalValue(static_cast<double>(source_sequence))},
+  }));
+}
+
+std::string SceneRuntimePoseObserveRequest(
+    const SourceSnapshot &scene_runtime_source,
+    const std::string_view source_epoch, const std::uint64_t source_sequence,
+    const std::uint64_t lifetime_ns = 1000000000ULL,
+    const double position = 0.25,
+    const std::string_view source_id = "isaac.planning-writer",
+    const std::string_view object_id = "scene-process-box") {
+  using content_identity::CanonicalValue;
+  return content_identity::canonical_json(CanonicalValue(CanonicalValue::Object{
+      {"api_version", CanonicalValue("manyforge.manager_command.v1")},
+      {"command", CanonicalValue("scene_runtime_observe")},
+      {"eligible", CanonicalValue(true)},
+      {"expected_runtime_identity",
+       SceneRuntimeIdentityValue(scene_runtime_source)},
+      {"lifetime_ns", CanonicalValue(static_cast<double>(lifetime_ns))},
+      {"object_id", CanonicalValue(std::string(object_id))},
+      {"payload",
+       CanonicalValue(CanonicalValue::Object{
+           {"api_version", CanonicalValue("manyforge.ros_pose_observation.v1")},
+           {"kind", CanonicalValue("simulation_entity_pose")},
+           {"pose", CanonicalValue(CanonicalValue::Object{
+                        {"frame_id", CanonicalValue("universe")},
+                        {"frame_kind", CanonicalValue("cell_frame")},
+                        {"orientation_xyzw",
+                         CanonicalValue(CanonicalValue::Array{
+                             CanonicalValue(0.0), CanonicalValue(0.0),
+                             CanonicalValue(0.0), CanonicalValue(1.0)})},
+                        {"position_m",
+                         CanonicalValue(CanonicalValue::Array{
+                             CanonicalValue(position), CanonicalValue(-0.5),
+                             CanonicalValue(0.75)})},
+                        {"source_stamp_s", CanonicalValue(1.25)},
+                    })},
+           {"source", CanonicalValue(CanonicalValue::Object{
+                          {"entity", CanonicalValue("/box")}})},
+       })},
+      {"policy_id", CanonicalValue("before_planning")},
+      {"quality", CanonicalValue("good")},
+      {"source_epoch", CanonicalValue(std::string(source_epoch))},
+      {"source_id", CanonicalValue(std::string(source_id))},
+      {"source_sequence", CanonicalValue(static_cast<double>(source_sequence))},
+  }));
+}
+
+std::string SceneRuntimeBeforePlanningLatchRequest(
+    const SourceSnapshot &scene_runtime_source,
+    const SourceSnapshot &scene_source) {
+  using content_identity::CanonicalValue;
+  const auto &projection = RequiredMember(
+      RequiredMember(scene_source.payload, "access"), "active_projection");
+  return content_identity::canonical_json(CanonicalValue(CanonicalValue::Object{
+      {"api_version", CanonicalValue("manyforge.manager_command.v1")},
+      {"command", CanonicalValue("scene_runtime_latch_before_planning")},
+      {"expected_projection_revision", projection},
+      {"expected_runtime_identity",
+       SceneRuntimeIdentityValue(scene_runtime_source)},
   }));
 }
 
@@ -814,8 +875,12 @@ TEST(ManagerDaemonProcess,
     manager.WaitReady(directory);
     AtomicSourceSnapshotChannel scene_runtime_source(
         directory.publication_root(), "scene-runtime-source.json");
+    AtomicSourceSnapshotChannel scene_source(directory.publication_root(),
+                                             "logical-scene-source.json");
     const auto initial = scene_runtime_source.Read();
+    const auto initial_scene = scene_source.Read();
     ASSERT_TRUE(initial.has_value());
+    ASSERT_TRUE(initial_scene.has_value());
 
     const auto owner_read = SendCommand(
         directory.socket_path(),
@@ -842,9 +907,17 @@ TEST(ManagerDaemonProcess,
         changed_registration.find("scene_runtime_observer_request_conflict"),
         std::string::npos)
         << changed_registration;
+    const auto monotonic_before_observation =
+        std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::steady_clock::now().time_since_epoch())
+            .count();
     const auto accepted = SendCommand(
         directory.socket_path(),
         SceneRuntimeObserveRequest(*initial, "observer-epoch-1", 1U));
+    const auto monotonic_after_observation =
+        std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::steady_clock::now().time_since_epoch())
+            .count();
     EXPECT_NE(accepted.find("\"disposition\":\"observed_only\""),
               std::string::npos)
         << accepted;
@@ -859,6 +932,20 @@ TEST(ManagerDaemonProcess,
         << accepted;
     EXPECT_NE(accepted.find("\"scene_update_status\":null"), std::string::npos)
         << accepted;
+    const auto accepted_snapshot = scene_runtime_source.Read();
+    ASSERT_TRUE(accepted_snapshot.has_value());
+    const auto &accepted_pose_sources =
+        RequiredMember(RequiredMember(accepted_snapshot->payload, "state"),
+                       "pose_sources")
+            .as_array();
+    ASSERT_EQ(accepted_pose_sources.size(), 1U);
+    const auto observed_at_ns =
+        RequiredMember(accepted_pose_sources.front(), "observed_at_ns")
+            .as_number();
+    EXPECT_GE(observed_at_ns,
+              static_cast<double>(monotonic_before_observation));
+    EXPECT_LE(observed_at_ns,
+              static_cast<double>(monotonic_after_observation));
     const auto duplicate = SendCommand(
         directory.socket_path(),
         SceneRuntimeObserveRequest(*initial, "observer-epoch-1", 1U));
@@ -909,15 +996,19 @@ TEST(ManagerDaemonProcess,
         SendCommand(directory.socket_path(),
                     SceneRuntimeObserverOpenRequest(
                         *initial, "planner-epoch-1", "isaac.planning-writer",
-                        "planning_object", "before_planning", true));
+                        "scene-process-box", "before_planning", true));
     EXPECT_NE(before_planning_open.find("\"ok\":true"), std::string::npos)
         << before_planning_open;
-    const auto before_planning =
-        SendCommand(directory.socket_path(),
-                    SceneRuntimeObserveRequest(
-                        *initial, "planner-epoch-1", 1U, 1000000000ULL, 0.25,
-                        nullptr, "isaac.planning-writer", "planning_object",
-                        "before_planning", true));
+    const auto added_object = SendCommand(
+        directory.socket_path(),
+        SceneAddRequest(*initial_scene, "scene-runtime-planning-object.1"));
+    EXPECT_NE(added_object.find("\"ok\":true"), std::string::npos)
+        << added_object;
+    const auto scene_before_latch = scene_source.Read();
+    ASSERT_TRUE(scene_before_latch.has_value());
+    const auto before_planning = SendCommand(
+        directory.socket_path(),
+        SceneRuntimePoseObserveRequest(*initial, "planner-epoch-1", 1U));
     EXPECT_NE(before_planning.find(
                   "\"scene_application_status\":\"deferred_before_planning\""),
               std::string::npos)
@@ -925,6 +1016,54 @@ TEST(ManagerDaemonProcess,
     EXPECT_NE(before_planning.find("\"scene_projection_revision\":null"),
               std::string::npos)
         << before_planning;
+    const auto latched = SendCommand(
+        directory.socket_path(),
+        SceneRuntimeBeforePlanningLatchRequest(*initial, *scene_before_latch));
+    EXPECT_NE(latched.find("scene_runtime_pose_provider_invalid"),
+              std::string::npos)
+        << latched;
+    const auto scene_after_latch = scene_source.Read();
+    ASSERT_TRUE(scene_after_latch.has_value());
+    const auto observed_pose =
+        SendCommand(directory.socket_path(),
+                    ScenePoseRequest(*scene_after_latch, "scene-process-box"));
+    EXPECT_NE(observed_pose.find("\"x\":0"), std::string::npos)
+        << observed_pose;
+    const auto repeated_latch = SendCommand(
+        directory.socket_path(),
+        SceneRuntimeBeforePlanningLatchRequest(*initial, *scene_after_latch));
+    EXPECT_NE(repeated_latch.find("scene_runtime_pose_provider_invalid"),
+              std::string::npos)
+        << repeated_latch;
+    const auto advanced_scene =
+        SendCommand(directory.socket_path(),
+                    SceneAddRequest(*scene_after_latch, "scene-runtime-fence.1",
+                                    0.2, "scene-process-fence-box"));
+    EXPECT_NE(advanced_scene.find("\"ok\":true"), std::string::npos)
+        << advanced_scene;
+    const auto scene_after_advance = scene_source.Read();
+    ASSERT_TRUE(scene_after_advance.has_value());
+    const auto stale_projection_latch = SendCommand(
+        directory.socket_path(),
+        SceneRuntimeBeforePlanningLatchRequest(*initial, *scene_before_latch));
+    EXPECT_NE(
+        stale_projection_latch.find("scene_runtime_pose_projection_changed"),
+        std::string::npos)
+        << stale_projection_latch;
+    const auto expiring = SendCommand(
+        directory.socket_path(),
+        SceneRuntimePoseObserveRequest(*initial, "planner-epoch-1", 2U, 1U));
+    EXPECT_NE(expiring.find("\"scene_application_status\":\"not_requested\""),
+              std::string::npos)
+        << expiring;
+    std::this_thread::sleep_for(std::chrono::milliseconds(2));
+    const auto stale_observation_latch = SendCommand(
+        directory.socket_path(),
+        SceneRuntimeBeforePlanningLatchRequest(*initial, *scene_after_advance));
+    EXPECT_NE(
+        stale_observation_latch.find("scene_runtime_pose_observation_stale"),
+        std::string::npos)
+        << stale_observation_latch;
 
     const auto observed = scene_runtime_source.Read();
     ASSERT_TRUE(observed.has_value());

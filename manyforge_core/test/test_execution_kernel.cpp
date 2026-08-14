@@ -483,6 +483,18 @@ class MockFocusedPorts final : public IObservedRobotStateProvider,
   }
 };
 
+class MockPlanningSceneSynchronizer final : public IPlanningSceneSynchronizer {
+ public:
+  Result<ProjectionRevisionDTO> SynchronizeBeforePlanning() override {
+    ++call_count;
+    return next_result;
+  }
+
+  int call_count{};
+  Result<ProjectionRevisionDTO> next_result =
+      Result<ProjectionRevisionDTO>::Ok(test_projection_revision());
+};
+
 class MockCollisionWorldPublisher final : public ICollisionWorldSnapshotPublisher {
  public:
   CollisionWorldSnapshotPtr current_snapshot = std::make_shared<const CollisionWorldSnapshot>();
@@ -3802,6 +3814,62 @@ TEST_F(ExecutionKernelTest, Execute_SyncObservedStateBeforePlanningFailure_Block
   EXPECT_EQ(context.validate_count, 0);
   EXPECT_EQ(execution.execute_count, 0);
   EXPECT_EQ(kernel.get_status().state, ExecutionState::kIdle);
+}
+
+TEST_F(ExecutionKernelTest, Execute_SynchronizesExternalSceneBeforeRetainingPlanningProjection) {
+  MockPlanningSceneSynchronizer scene_synchronizer;
+  auto ports = static_cast<ExecutionKernelPorts>(context);
+  ports.planning_scene_synchronizer = &scene_synchronizer;
+  ExecutionKernel synchronized_kernel{planner, ports, execution, clock, scheduler, cache};
+  configure_authoritative_collision_validation(synchronized_kernel, collision_world_publisher,
+                                               collision_engine);
+
+  const auto result = synchronized_kernel.execute(make_test_request("move_after_scene_sync"));
+  ASSERT_TRUE(result.ok()) << result.error().message;
+  EXPECT_TRUE(synchronized_kernel.wait_for_completion(2'000'000'000));
+  EXPECT_EQ(scene_synchronizer.call_count, 1);
+  EXPECT_EQ(planner.plan_count, 1);
+  EXPECT_EQ(planner.last_request.projection_binding.projection_revision,
+            test_projection_revision());
+}
+
+TEST_F(ExecutionKernelTest, Execute_SceneSynchronizationFailureBlocksPlanningAndDispatch) {
+  MockPlanningSceneSynchronizer scene_synchronizer;
+  scene_synchronizer.next_result = Result<ProjectionRevisionDTO>::Err(ErrorDTO{
+      "scene_runtime_pose_observation_stale", "before-planning pose observation is stale", {}});
+  auto ports = static_cast<ExecutionKernelPorts>(context);
+  ports.planning_scene_synchronizer = &scene_synchronizer;
+  ExecutionKernel synchronized_kernel{planner, ports, execution, clock, scheduler, cache};
+  configure_authoritative_collision_validation(synchronized_kernel, collision_world_publisher,
+                                               collision_engine);
+
+  const auto result = synchronized_kernel.execute(make_test_request("move_scene_sync_failed"));
+
+  ASSERT_FALSE(result.ok());
+  EXPECT_EQ(result.error().code, "scene_runtime_pose_observation_stale");
+  EXPECT_EQ(scene_synchronizer.call_count, 1);
+  EXPECT_EQ(planner.plan_count, 0);
+  EXPECT_EQ(execution.execute_count, 0);
+}
+
+TEST_F(ExecutionKernelTest, Execute_RejectsProjectionChangeAfterSceneSynchronization) {
+  MockPlanningSceneSynchronizer scene_synchronizer;
+  auto successor = test_projection_revision();
+  successor.scene_revision.revision_id = 2U;
+  scene_synchronizer.next_result = Result<ProjectionRevisionDTO>::Ok(successor);
+  auto ports = static_cast<ExecutionKernelPorts>(context);
+  ports.planning_scene_synchronizer = &scene_synchronizer;
+  ExecutionKernel synchronized_kernel{planner, ports, execution, clock, scheduler, cache};
+  configure_authoritative_collision_validation(synchronized_kernel, collision_world_publisher,
+                                               collision_engine);
+
+  const auto result = synchronized_kernel.execute(make_test_request("move_scene_sync_raced"));
+
+  ASSERT_FALSE(result.ok());
+  EXPECT_EQ(result.error().details.at("reason"), "planning_scene_synchronization_raced");
+  EXPECT_EQ(scene_synchronizer.call_count, 1);
+  EXPECT_EQ(planner.plan_count, 0);
+  EXPECT_EQ(execution.execute_count, 0);
 }
 
 TEST_F(ExecutionKernelTest, Execute_CacheHitWithStaleStart_InvalidatesAndReplans) {

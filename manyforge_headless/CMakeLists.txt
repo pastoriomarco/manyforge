@@ -412,6 +412,39 @@ if(BUILD_TESTING)
         "process test does not exist: "
         "${MANYFORGE_HEADLESS_TEST_NATIVE_EXECUTION_WORKER}")
     endif()
+    set(
+      _MANYFORGE_HEADLESS_TEST_NATIVE_STOP_IMPLEMENTATION_BUILD
+      "${_MANYFORGE_HEADLESS_TEST_NATIVE_EXECUTION_TARGET_ROOT}/qualification/native_stop/implementation-build.json")
+    set(
+      _MANYFORGE_HEADLESS_TEST_NATIVE_STOP_RUNNER_CONTRACT
+      "${_MANYFORGE_HEADLESS_TEST_NATIVE_EXECUTION_TARGET_ROOT}/qualification/native_stop/runner-contract.json")
+    set(
+      _MANYFORGE_HEADLESS_TEST_NATIVE_STOP_IMPLEMENTATION_EVIDENCE
+      "${_MANYFORGE_HEADLESS_TEST_NATIVE_EXECUTION_TARGET_ROOT}/qualification/native_stop/implementation-evidence.json")
+    set(
+      _MANYFORGE_HEADLESS_TEST_NATIVE_STOP_SUBSTITUTION_EVIDENCE
+      "${_MANYFORGE_HEADLESS_TEST_NATIVE_EXECUTION_TARGET_ROOT}/qualification/native_stop/substitution-evidence.json")
+    set(
+      _MANYFORGE_HEADLESS_TEST_NATIVE_STOP_RUNNER
+      "${_MANYFORGE_HEADLESS_TEST_NATIVE_EXECUTION_TARGET_ROOT}/manyforge_native_stop_qualification_runner")
+    foreach(_native_stop_input IN ITEMS
+        "${_MANYFORGE_HEADLESS_TEST_NATIVE_STOP_IMPLEMENTATION_BUILD}"
+        "${_MANYFORGE_HEADLESS_TEST_NATIVE_STOP_RUNNER_CONTRACT}"
+        "${_MANYFORGE_HEADLESS_TEST_NATIVE_STOP_IMPLEMENTATION_EVIDENCE}"
+        "${_MANYFORGE_HEADLESS_TEST_NATIVE_STOP_SUBSTITUTION_EVIDENCE}"
+        "${_MANYFORGE_HEADLESS_TEST_NATIVE_STOP_RUNNER}")
+      if(NOT EXISTS "${_native_stop_input}")
+        message(FATAL_ERROR
+          "the source-matched native Stop qualification input for the "
+          "Manager Apply process test does not exist: ${_native_stop_input}")
+      endif()
+    endforeach()
+    if(NOT TARGET manyforge_lite6_product)
+      add_subdirectory(
+        "${CMAKE_CURRENT_SOURCE_DIR}/../manyforge_lite6_product"
+        "${CMAKE_CURRENT_BINARY_DIR}/manyforge_lite6_product"
+        EXCLUDE_FROM_ALL)
+    endif()
     add_executable(manyforge_generate_headless_manager_apply_test_package
       test/generate_manager_apply_package.cpp)
     target_compile_definitions(
@@ -426,7 +459,8 @@ if(BUILD_TESTING)
       manyforge_generate_headless_manager_apply_test_package PRIVATE
       manyforge::deployment
       manyforge::deployment_admission
-      manyforge_deployment_canonical_package_generator)
+      manyforge_deployment_canonical_package_generator
+      manyforge_lite6_product)
 
     set(
       MANYFORGE_HEADLESS_TEST_MANAGER_APPLY_FIXTURE_ROOT
@@ -451,8 +485,26 @@ if(BUILD_TESTING)
         "${MANYFORGE_HEADLESS_TEST_MANAGER_APPLY_PACKAGE_ROOT}"
         --metadata
         "${MANYFORGE_HEADLESS_TEST_MANAGER_APPLY_METADATA}"
+        --stop-implementation-build
+        "${_MANYFORGE_HEADLESS_TEST_NATIVE_STOP_IMPLEMENTATION_BUILD}"
+        --stop-installed-target
+        "${MANYFORGE_HEADLESS_TEST_NATIVE_EXECUTION_HOST}"
+        --stop-runner-contract
+        "${_MANYFORGE_HEADLESS_TEST_NATIVE_STOP_RUNNER_CONTRACT}"
+        --stop-runner-executable
+        "${_MANYFORGE_HEADLESS_TEST_NATIVE_STOP_RUNNER}"
+        --stop-implementation-evidence
+        "${_MANYFORGE_HEADLESS_TEST_NATIVE_STOP_IMPLEMENTATION_EVIDENCE}"
+        --stop-substitution-evidence
+        "${_MANYFORGE_HEADLESS_TEST_NATIVE_STOP_SUBSTITUTION_EVIDENCE}"
       DEPENDS
         manyforge_generate_headless_manager_apply_test_package
+        "${MANYFORGE_HEADLESS_TEST_NATIVE_EXECUTION_HOST}"
+        "${_MANYFORGE_HEADLESS_TEST_NATIVE_STOP_IMPLEMENTATION_BUILD}"
+        "${_MANYFORGE_HEADLESS_TEST_NATIVE_STOP_RUNNER_CONTRACT}"
+        "${_MANYFORGE_HEADLESS_TEST_NATIVE_STOP_IMPLEMENTATION_EVIDENCE}"
+        "${_MANYFORGE_HEADLESS_TEST_NATIVE_STOP_SUBSTITUTION_EVIDENCE}"
+        "${_MANYFORGE_HEADLESS_TEST_NATIVE_STOP_RUNNER}"
         "${MANYFORGE_HEADLESS_TEST_LITE6_FIXTURE_ROOT}/model.urdf"
         "${MANYFORGE_HEADLESS_TEST_LITE6_FIXTURE_ROOT}/model.srdf"
         ${MANYFORGE_HEADLESS_TEST_LITE6_RESOURCE_INPUTS}

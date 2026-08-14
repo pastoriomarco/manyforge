@@ -2516,6 +2516,79 @@ Result<void> ResourceAddressedExecutionKernel::reconfigure_runtime_participants(
                                                std::move(participant_resolver), false);
 }
 
+Result<void>
+ResourceAddressedExecutionKernel::stage_current_runtime_configuration_facts_under_apply_fence(
+    const ConfigurationFenceScopeDTO& scope) {
+  if (!scope.valid() || scope.resources.empty()) {
+    return reject<void>("candidate configuration staging scope is invalid",
+                        "runtime_configuration_staging_scope_invalid", ErrorCode::kInvalidRequest);
+  }
+  if (config_.operation_admission_gate == nullptr) {
+    return reject<void>("candidate configuration staging has no durable admission gate",
+                        "runtime_configuration_staging_gate_missing", ErrorCode::kMissingReference);
+  }
+
+  try {
+    std::lock_guard submit_lock(submission_mutex_);
+    std::lock_guard state_lock(state_mutex_);
+    std::lock_guard admission_lock(*admission_mutex_);
+    if (config_.operation_admission_gate->current_fenced_resources(scope.resources) !=
+        scope.resources) {
+      return reject<void>("candidate configuration staging is not covered by its Apply fence",
+                          "runtime_configuration_staging_fence_missing",
+                          ErrorCode::kExecutionRejected);
+    }
+
+    const auto declared = extract_active_control_configurations(registrations_);
+    auto staged = resource_slots_->admission_snapshot({}).active_control_configurations;
+    for (const auto& domain : scope.domains) {
+      const auto existing = std::lower_bound(
+          staged.begin(), staged.end(), domain.control_domain_id,
+          [](const auto& row, const auto& domain_id) { return row.control_domain_id < domain_id; });
+      if (existing != staged.end() && existing->control_domain_id == domain.control_domain_id) {
+        staged.erase(existing);
+      }
+      if (!domain.candidate_control_domain_revision.has_value()) {
+        continue;
+      }
+      const auto candidate = std::lower_bound(
+          declared.begin(), declared.end(), domain.control_domain_id,
+          [](const auto& row, const auto& domain_id) { return row.control_domain_id < domain_id; });
+      if (candidate == declared.end() || candidate->control_domain_id != domain.control_domain_id) {
+        return reject<void>("candidate configuration staging has no installed domain fact",
+                            "runtime_configuration_staging_domain_missing",
+                            ErrorCode::kMissingReference);
+      }
+      const bool revision_matches =
+          std::any_of(registrations_.begin(), registrations_.end(), [&](const auto& registration) {
+            const auto& binding = registration.binding.value();
+            return binding.control_path.has_value() &&
+                   binding.control_path->control_domain_id == domain.control_domain_id &&
+                   binding.control_path->control_domain_revision ==
+                       *domain.candidate_control_domain_revision;
+          });
+      if (!revision_matches) {
+        return reject<void>("candidate configuration staging crossed its retained domain revision",
+                            "runtime_configuration_staging_domain_revision_mismatch",
+                            ErrorCode::kInvalidRequest);
+      }
+      staged.insert(std::lower_bound(staged.begin(), staged.end(), candidate->control_domain_id,
+                                     [](const auto& row, const auto& domain_id) {
+                                       return row.control_domain_id < domain_id;
+                                     }),
+                    *candidate);
+    }
+    return resource_slots_->reconfigure_runtime_inventory(registry_.resource_inventory(),
+                                                          std::move(staged));
+  } catch (const std::exception& exception) {
+    return reject<void>(std::string("candidate configuration staging failed: ") + exception.what(),
+                        "runtime_configuration_staging_failed", ErrorCode::kInvariantViolation);
+  } catch (...) {
+    return reject<void>("candidate configuration staging failed",
+                        "runtime_configuration_staging_failed", ErrorCode::kInvariantViolation);
+  }
+}
+
 Result<void> ResourceAddressedExecutionKernel::reconfigure_runtime_participants_impl(
     std::vector<RuntimeParticipantExecutionRegistration> registrations,
     RuntimeParticipantAdmissionResolver participant_resolver,

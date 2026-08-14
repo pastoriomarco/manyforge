@@ -3684,6 +3684,145 @@ private:
   std::filesystem::path manager_state_root_;
 };
 
+/// Process-local, non-authoritative join from fresh planning admission to the
+/// Manager-owned observation policy. It retains no pose or scene truth: every
+/// call fences the local predecessor, asks Manager to latch, and requires the
+/// native projection to expose the exact returned successor before planning.
+class ManagerPlanningSceneSynchronizer final
+    : public core::IPlanningSceneSynchronizer {
+public:
+  ManagerPlanningSceneSynchronizer(
+      std::filesystem::path manager_state_root,
+      core::RetainedBundleId retained_bundle_id,
+      core::GraphRevision graph_revision,
+      const core::ActiveBundlePublicationGeneration publication_generation,
+      std::shared_ptr<core::ICollisionWorldSnapshotPublisher>
+          collision_publisher)
+      : manager_state_root_(std::move(manager_state_root)),
+        retained_bundle_id_(std::move(retained_bundle_id)),
+        graph_revision_(std::move(graph_revision)),
+        publication_generation_(publication_generation),
+        collision_publisher_(std::move(collision_publisher)) {
+    Require(
+        !manager_state_root_.empty() &&
+            core::IsExactLowercaseSha256Digest(retained_bundle_id_.value()) &&
+            core::IsExactLowercaseSha256Digest(graph_revision_.value()) &&
+            publication_generation_.nonzero() &&
+            collision_publisher_ != nullptr,
+        "Manager planning-scene synchronizer identity is invalid");
+  }
+
+  [[nodiscard]] core::Result<core::ProjectionRevisionDTO>
+  SynchronizeBeforePlanning() override {
+    try {
+      const auto current =
+          collision_publisher_->current_scene_snapshot_lease_inventory();
+      if (!current.has_value() ||
+          !current->projection_binding.projection_revision.valid() ||
+          current->projection_binding.projection_revision.retained_bundle_id !=
+              retained_bundle_id_ ||
+          current->projection_binding.projection_revision.graph_revision !=
+              graph_revision_) {
+        return Failure(
+            "planning_scene_projection_unavailable",
+            "local native predecessor projection is unavailable or stale");
+      }
+      const auto predecessor = current->projection_binding.projection_revision;
+      const auto response = ExchangeManagerCommand(
+          manager_state_root_,
+          CanonicalValue(CanonicalValue::Object{
+              {"api_version",
+               CanonicalValue(std::string(kManagerCommandApiVersion))},
+              {"command",
+               CanonicalValue("scene_runtime_latch_before_planning")},
+              {"expected_projection_revision",
+               ProjectionRevisionValue(predecessor)},
+              {"expected_runtime_identity", RuntimeIdentityValue()},
+          }));
+      if (!Boolean(response, "ok")) {
+        return core::Result<core::ProjectionRevisionDTO>::Err(
+            DecodeManagerError(Member(response, "error")));
+      }
+      RequireExactObjectSize(response, 10U,
+                             "Manager before-planning latch response");
+      RequireRuntimeIdentity(Member(response, "runtime_identity"));
+      const auto initial = DecodeProjectionRevision(
+          Member(response, "initial_projection_revision"));
+      const auto projection =
+          DecodeProjectionRevision(Member(response, "projection_revision"));
+      const auto latched = Counter(response, "latched_observation_count", 0U);
+      const auto committed =
+          Counter(response, "committed_observation_count", 0U);
+      const auto already_applied =
+          Counter(response, "already_applied_observation_count", 0U);
+      const auto skipped_attached =
+          Counter(response, "skipped_attached_observation_count", 0U);
+      static_cast<void>(
+          Counter(response, "scene_runtime_source_generation", 1U));
+      Require(initial == predecessor && projection.valid() &&
+                  projection.retained_bundle_id == retained_bundle_id_ &&
+                  projection.graph_revision == graph_revision_ &&
+                  projection.scene_revision.scene_id ==
+                      predecessor.scene_revision.scene_id &&
+                  latched == committed + already_applied + skipped_attached,
+              "Manager before-planning latch response crossed its request");
+      const auto converged =
+          collision_publisher_->current_scene_snapshot_lease_inventory();
+      if (!converged.has_value() ||
+          converged->projection_binding.projection_revision != projection) {
+        return Failure(
+            "planning_scene_projection_not_converged",
+            "local native projection did not converge to the Manager latch");
+      }
+      return core::Result<core::ProjectionRevisionDTO>::Ok(projection);
+    } catch (const std::exception &error) {
+      return Failure("planning_scene_synchronization_failed", error.what());
+    } catch (...) {
+      return Failure("planning_scene_synchronization_failed",
+                     "unknown Manager planning-scene synchronization failure");
+    }
+  }
+
+private:
+  [[nodiscard]] core::Result<core::ProjectionRevisionDTO>
+  Failure(std::string code, std::string message) const {
+    return core::Result<core::ProjectionRevisionDTO>::Err(
+        core::ErrorDTO{std::move(code),
+                       std::move(message),
+                       {{"reason", "before_planning_scene_latch_failed"}}});
+  }
+
+  [[nodiscard]] CanonicalValue RuntimeIdentityValue() const {
+    const auto generation =
+        static_cast<double>(publication_generation_.value());
+    return CanonicalValue(CanonicalValue::Object{
+        {"deployment_generation", CanonicalValue(generation)},
+        {"graph_revision", CanonicalValue(graph_revision_.value())},
+        {"program_generation", CanonicalValue(0.0)},
+        {"retained_bundle_id", CanonicalValue(retained_bundle_id_.value())},
+        {"runtime_generation", CanonicalValue(generation)},
+    });
+  }
+
+  void RequireRuntimeIdentity(const CanonicalValue &value) const {
+    RequireExactObjectSize(value, 5U, "Manager scene-runtime latch identity");
+    Require(Text(value, "retained_bundle_id") == retained_bundle_id_.value() &&
+                Text(value, "graph_revision") == graph_revision_.value() &&
+                Counter(value, "deployment_generation", 1U) ==
+                    publication_generation_.value() &&
+                Counter(value, "program_generation", 0U) == 0U &&
+                Counter(value, "runtime_generation", 1U) ==
+                    publication_generation_.value(),
+            "Manager scene-runtime latch identity changed");
+  }
+
+  std::filesystem::path manager_state_root_;
+  core::RetainedBundleId retained_bundle_id_;
+  core::GraphRevision graph_revision_;
+  core::ActiveBundlePublicationGeneration publication_generation_;
+  std::shared_ptr<core::ICollisionWorldSnapshotPublisher> collision_publisher_;
+};
+
 [[nodiscard]] deployment::ActiveRuntimeParticipantFactsDTO
 ActiveFacts(const deployment::RuntimeProgramTargetBinding &primary,
             std::span<const deployment::RuntimeProgramTargetBinding> supporting,
@@ -3862,7 +4001,8 @@ struct Composition final {
           *composition.runtime->addressed_kernel,
           *composition.scene_authority_proxy,
           *composition.scene_authority_proxy,
-          *composition.planner_scene_projection);
+          *composition.planner_scene_projection,
+          composition.runtime->planning_scene_synchronizer.get());
   composition.pick_place_sequence_coordinator =
       std::make_unique<core::PickPlaceSequenceCoordinator>(
           *composition.runtime->addressed_kernel,
@@ -4314,7 +4454,15 @@ BuildProductComposition(CompositionBuildInput input) {
       std::move(runtime_policy),
       {},
       {},
+      {},
       {}};
+  if (input.planner_scene_projection != nullptr) {
+    runtime_input.planning_scene_synchronizer =
+        std::make_shared<ManagerPlanningSceneSynchronizer>(
+            input.manager_state_root, input.bundle->retained_bundle_id(),
+            input.bundle->value().cell_graph.graph_revision,
+            input.publication_generation, publisher);
+  }
 #if defined(MANYFORGE_ROS2_CONTROL_EXECUTION_HOST)
   auto ros2_control_runtime_handle =
       std::make_shared<RetainedRos2ControlRuntimeHandle>();
@@ -4749,9 +4897,10 @@ void AttachRetainedNativeCCLC(Composition &composition,
 #endif
 }
 
+void DetachRetainedCCLC(Composition &composition) {
 #if defined(MANYFORGE_ROS2_CONTROL_EXECUTION_HOST)
-void DetachRetainedRos2ControlCCLC(Composition &composition) {
   composition.ros2_control_admission_owner.reset();
+#endif
   composition.cclc_runtime.reset();
   composition.cclc_lifecycle_product.reset();
   composition.cclc_provider_manifest_source.reset();
@@ -4759,9 +4908,9 @@ void DetachRetainedRos2ControlCCLC(Composition &composition) {
   composition.cclc_active_publication_reader.reset();
 }
 
-void TryAttachManagedRos2ControlCCLC(
-    Composition &composition, const ManagedRuntimeChildConfig &config,
-    ManagedKernelApplyFenceOwner &fence_owner) {
+void TryAttachManagedCCLC(Composition &composition,
+                          const ManagedRuntimeChildConfig &config,
+                          ManagedKernelApplyFenceOwner &fence_owner) {
   if (composition.cclc_runtime != nullptr) {
     return;
   }
@@ -4787,7 +4936,6 @@ void TryAttachManagedRos2ControlCCLC(
       core::RequestOwnerEpoch("kernel-owner-" + config.runtime_epoch),
       fence_owner);
 }
-#endif
 
 [[nodiscard]] std::optional<CompositionBuildInput>
 TryBuildCurrentManagedCompositionInput(
@@ -5486,9 +5634,7 @@ RunManagedRuntimeChild(const ManagedRuntimeChildConfig &config) {
             Require(prepared == nullptr,
                     "empty selected product has a physical composition");
             if (active_managed_composition != nullptr) {
-#if defined(MANYFORGE_ROS2_CONTROL_EXECUTION_HOST)
-              DetachRetainedRos2ControlCCLC(*active_managed_composition);
-#endif
+              DetachRetainedCCLC(*active_managed_composition);
               Require(detached_addressed_kernel == nullptr &&
                           detached_operation_journal == nullptr &&
                           detached_owner_clock == nullptr,
@@ -5536,6 +5682,9 @@ RunManagedRuntimeChild(const ManagedRuntimeChildConfig &config) {
                   prepared->runtime->addressed_kernel
                       ->resource_admission_table());
             } else {
+              if (active_managed_composition != nullptr) {
+                DetachRetainedCCLC(*active_managed_composition);
+              }
               auto reconfigured =
                   stable_owner->reconfigure_runtime_participants(
                       prepared->runtime->participant_registrations,
@@ -5546,9 +5695,6 @@ RunManagedRuntimeChild(const ManagedRuntimeChildConfig &config) {
                      reconfigured.error().message);
               }
               if (active_managed_composition != nullptr) {
-#if defined(MANYFORGE_ROS2_CONTROL_EXECUTION_HOST)
-                DetachRetainedRos2ControlCCLC(*active_managed_composition);
-#endif
                 auto &stable_runtime = *active_managed_composition->runtime;
                 prepared->runtime->operation_journal =
                     std::move(stable_runtime.operation_journal);
@@ -5567,6 +5713,14 @@ RunManagedRuntimeChild(const ManagedRuntimeChildConfig &config) {
                     std::move(detached_addressed_kernel);
                 detached_owner_clock.reset();
               }
+            }
+            auto staged =
+                prepared->runtime->addressed_kernel
+                    ->stage_current_runtime_configuration_facts_under_apply_fence(
+                        request.configuration_fence_scope);
+            if (!staged.ok()) {
+              Fail("stable Kernel rejected candidate configuration staging: " +
+                   staged.error().message);
             }
             InstallDirectSceneFrameResolver(projections, *prepared);
 #if !defined(MANYFORGE_ENABLE_FOCUSED_PICK_PLACE_PLANNING_FIXTURE)
@@ -5599,15 +5753,12 @@ RunManagedRuntimeChild(const ManagedRuntimeChildConfig &config) {
     rethrow_composition_failure();
     try_start_current_composition();
     try_release_retired_composition();
-#if defined(MANYFORGE_ROS2_CONTROL_EXECUTION_HOST)
     {
       std::lock_guard lock(managed_composition_mutex);
       if (active_managed_composition != nullptr) {
-        TryAttachManagedRos2ControlCCLC(*active_managed_composition, config,
-                                        fence_owner);
+        TryAttachManagedCCLC(*active_managed_composition, config, fence_owner);
       }
     }
-#endif
     pollfd descriptor{config.manager_channel_fd, POLLIN | POLLHUP, 0};
     int ready = -1;
     do {
@@ -6292,6 +6443,31 @@ private:
       });
     }
     if (command.kind == CommandKind::kPreviewMotion) {
+      auto preview_intent = *command.operation;
+      const auto predecessor = composition.runtime->collision_publisher
+                                   ->current_scene_snapshot_lease_inventory();
+      if (!predecessor.has_value() ||
+          !preview_intent.expected_scene_revision.has_value() ||
+          *preview_intent.expected_scene_revision !=
+              predecessor->projection_binding.projection_revision
+                  .scene_revision) {
+        return ErrorResponse(
+            "motion_preview_scene_revision_mismatch",
+            "motion preview does not name the pre-latch scene revision");
+      }
+      if (composition.runtime->planning_scene_synchronizer != nullptr) {
+        auto synchronized = composition.runtime->planning_scene_synchronizer
+                                ->SynchronizeBeforePlanning();
+        if (!synchronized.ok()) {
+          return CanonicalValue(CanonicalValue::Object{
+              {"api_version", CanonicalValue(std::string(kResponseApiVersion))},
+              {"error", ErrorValue(synchronized.error())},
+              {"ok", CanonicalValue(false)},
+          });
+        }
+        preview_intent.expected_scene_revision =
+            synchronized.value().scene_revision;
+      }
       auto inventory = composition.runtime->collision_publisher
                            ->retain_scene_snapshot_lease_inventory();
       if (!inventory.has_value()) {
@@ -6304,7 +6480,7 @@ private:
           inventory->projection_binding.projection_lease_id);
       auto session =
           composition.runtime->addressed_kernel->begin_motion_preview_session(
-              *command.operation);
+              preview_intent);
       if (!session.ok()) {
         return CanonicalValue(CanonicalValue::Object{
             {"api_version", CanonicalValue(std::string(kResponseApiVersion))},
@@ -6320,9 +6496,9 @@ private:
             {"ok", CanonicalValue(false)},
         });
       }
-      auto preview = session.value()->preview_motion(
-          *command.operation, std::move(*inventory),
-          std::move(start_state.value()));
+      auto preview =
+          session.value()->preview_motion(preview_intent, std::move(*inventory),
+                                          std::move(start_state.value()));
       if (!preview.ok()) {
         return CanonicalValue(CanonicalValue::Object{
             {"api_version", CanonicalValue(std::string(kResponseApiVersion))},

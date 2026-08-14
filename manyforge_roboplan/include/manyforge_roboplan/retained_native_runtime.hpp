@@ -156,6 +156,9 @@ struct RetainedNativeRuntimeInput final {
   /// Optional retained-product execution adapter factory. Empty preserves the
   /// existing native execution and gripper implementations.
   RetainedRuntimeBackendFactory backend_factory;
+  /// Optional owner-coordinated scene observation latch retained for every
+  /// fresh planning admission.
+  std::shared_ptr<core::IPlanningSceneSynchronizer> planning_scene_synchronizer;
 };
 
 /// Owning native composition root. Destruction order is deliberate: the public
@@ -198,6 +201,7 @@ struct RetainedNativeRuntime final
       collision_trajectory_projector;
   std::shared_ptr<core::IExecutionBackend> execution;
   std::shared_ptr<core::IGripperCommandBackend> gripper;
+  std::shared_ptr<core::IPlanningSceneSynchronizer> planning_scene_synchronizer;
   core::IControlDomainExecutionPort *gripper_stop_execution_port{};
   RetainedMotionBackendRouteRebinder rebind_motion_route;
   RetainedGripperBackendRouteRebinder rebind_gripper_route;

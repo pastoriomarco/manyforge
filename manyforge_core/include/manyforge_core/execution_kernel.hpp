@@ -26,6 +26,7 @@
 #include <manyforge_core/ports/imotion_preview.hpp>
 #include <manyforge_core/ports/iobserved_robot_state_provider.hpp>
 #include <manyforge_core/ports/iplanner_backend.hpp>
+#include <manyforge_core/ports/iplanning_scene_synchronizer.hpp>
 #include <manyforge_core/ports/ireference_pose_resolver.hpp>
 #include <manyforge_core/ports/iresolved_participant_execution_engine.hpp>
 #include <manyforge_core/ports/iresolved_prepared_participant_execution_engine.hpp>
@@ -280,6 +281,7 @@ struct ExecutionKernelPorts {
   ICollisionTrajectoryProjector& collision_projector;
   const ICollisionDiagnosticComparator* collision_diagnostic_comparator = nullptr;
   IGripperCommandBackend* gripper_command_backend = nullptr;
+  IPlanningSceneSynchronizer* planning_scene_synchronizer = nullptr;
 };
 
 /// Execution Kernel — single authority for motion execution governance.
@@ -687,6 +689,7 @@ class ExecutionKernel : public IResolvedParticipantExecutionEngine,
   CollisionWorldRevision current_authoritative_collision_world_revision() const;
   Result<RetainedSceneSnapshotLease> retain_current_scene_snapshot_lease_inventory(
       std::uint64_t exec_id, const std::string& move_id);
+  Result<std::optional<ProjectionRevisionDTO>> synchronize_scene_before_planning();
   std::optional<SceneSnapshotLease> build_scene_snapshot_lease(
       const CollisionWorldLeaseInventory& inventory, const ExecuteRequestDTO& request,
       std::uint64_t exec_id) const;
@@ -931,6 +934,7 @@ class ExecutionKernel : public IResolvedParticipantExecutionEngine,
   ICollisionTrajectoryProjector& collision_projector_;
   const ICollisionDiagnosticComparator* collision_diagnostic_comparator_;
   IGripperCommandBackend* gripper_command_backend_;
+  IPlanningSceneSynchronizer* planning_scene_synchronizer_;
   IExecutionBackend& execution_backend_;
   IClock& clock_;
   IScheduler& scheduler_;

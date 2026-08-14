@@ -287,6 +287,29 @@ def test_client_parses_and_cross_checks_committed_scene_application(
     assert result.scene_projection_revision is not None
     assert result.scene_projection_revision.revision_id == 4
 
+    latched = dict(committed)
+    latched.update(
+        {
+            "disposition": "observed_only",
+            "policy_id": "before_planning",
+        }
+    )
+    monkeypatch.setattr(client, "_exchange", lambda _command: latched)
+    latched_result = client.observe(
+        session,
+        source_sequence=1,
+        intent=PoseObservationIntent(
+            object_id="ur10e",
+            policy_id="before_planning",
+            lifetime_ns=1_000_000_000,
+            quality="good",
+            eligible=True,
+            payload={"kind": "simulation_entity_pose"},
+        ),
+    )
+    assert latched_result.scene_application_status == "committed"
+    assert latched_result.scene_projection_revision is not None
+
     invalid = dict(committed)
     invalid["scene_update_status"] = None
     monkeypatch.setattr(client, "_exchange", lambda _command: invalid)

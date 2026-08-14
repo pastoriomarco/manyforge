@@ -2841,12 +2841,13 @@ void require_control_domain_control_matches_retained_bundle(
       if (qualified == qualified_runtime_products.end()) {
         continue;
       }
+      // Runtime product IDs are scoped by runtime-unit identity rather than
+      // implementation kind. The retained contract is the exact native vs.
+      // ros2_control discriminator when those IDs intentionally coincide.
       if (execution_runtime_product_kind(qualified->second.first,
                                          qualified->second.second) !=
-          runtime_kind) {
-        fail_retained_bundle(
-            "Stop qualification product identity differs from its exact "
-            "execution runtime contract");
+          std::optional(runtime_kind)) {
+        continue;
       }
       const auto group = std::find_if(
           retained_bundle.compiled_products.runtime_unit_products.begin(),

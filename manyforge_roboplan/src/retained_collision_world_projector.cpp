@@ -719,7 +719,11 @@ RetainedCollisionWorldProjector::project_live_objects(
       const auto& evidence = *object.provider_evidence;
       live.source_id = evidence.provider_instance_id.value() + "@" +
                        evidence.provider_source_epoch;
-      live.source_timestamp_ns = evidence.source_timestamp_ns;
+      // Freshness is evaluated in the native receiver's monotonic clock
+      // domain. The raw provider stamp remains retained in logical-scene
+      // evidence for trace correlation, but may be ROS simulation time or a
+      // synchronized remote-wall domain and is not a safe age origin here.
+      live.source_timestamp_ns = evidence.received_at_ns;
       live.source_freshness_budget_ns =
           evidence.source_freshness_budget_ns;
       // The operation may identify this exact object as its observed target;
