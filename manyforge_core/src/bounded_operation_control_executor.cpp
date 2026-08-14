@@ -182,17 +182,19 @@ class BoundedOperationControlExecutor::Impl final {
     if (slot == nullptr) {
       return OperationControlEffectReleaseStatus::kStaleHandle;
     }
-    std::lock_guard lock(slot->mutex);
-    if (slot->generation != handle.generation || slot->state == State::kFree) {
-      return OperationControlEffectReleaseStatus::kStaleHandle;
+    {
+      std::lock_guard lock(slot->mutex);
+      if (slot->generation != handle.generation || slot->state == State::kFree) {
+        return OperationControlEffectReleaseStatus::kStaleHandle;
+      }
+      if (slot->state != State::kTaken) {
+        return OperationControlEffectReleaseStatus::kNotTaken;
+      }
+      slot->request.reset();
+      slot->result.reset();
+      slot->infrastructure_failure = false;
+      slot->state = State::kFree;
     }
-    if (slot->state != State::kTaken) {
-      return OperationControlEffectReleaseStatus::kNotTaken;
-    }
-    slot->request.reset();
-    slot->result.reset();
-    slot->infrastructure_failure = false;
-    slot->state = State::kFree;
     SignalStateChange();
     return OperationControlEffectReleaseStatus::kReleased;
   }
@@ -200,7 +202,12 @@ class BoundedOperationControlExecutor::Impl final {
   void CloseIngress() noexcept {
     accepting_.store(false, std::memory_order_release);
     for (auto& slot : slots_) {
-      slot->changed.notify_all();
+      // Handshake with the mutex protecting the worker wait predicate so a
+      // close cannot land between the predicate check and sleeping.
+      {
+        std::lock_guard lock(slot->mutex);
+        slot->changed.notify_all();
+      }
     }
     SignalStateChange();
   }
@@ -254,7 +261,10 @@ class BoundedOperationControlExecutor::Impl final {
     return true;
   }
 
-  void SignalStateChange() noexcept { state_changed_.notify_all(); }
+  void SignalStateChange() noexcept {
+    std::lock_guard lock(state_mutex_);
+    state_changed_.notify_all();
+  }
 
   void Run(Slot& slot, const std::uint32_t index, const std::stop_token worker_stop) noexcept {
     ready_workers_.fetch_add(1U, std::memory_order_acq_rel);

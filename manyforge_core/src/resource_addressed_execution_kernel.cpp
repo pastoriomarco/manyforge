@@ -1943,43 +1943,51 @@ class ResourceAddressedExecutionKernel::StopProjectionWorker final {
 
   ~StopProjectionWorker() {
     Close();
-    // Serialize the stop-state transition with the mutex used by Run's wait
-    // predicate. Otherwise request_stop()/notify_all() can land after the
-    // predicate observes false but before the worker actually blocks, losing
-    // the only wakeup and hanging teardown.
-    {
-      std::lock_guard lock(mutex_);
-      worker_.request_stop();
-    }
-    changed_.notify_all();
+    worker_.request_stop();
+    Wake();
     if (worker_.joinable()) {
       worker_.join();
     }
   }
 
   void Publish(const StopControlWorkToken token) noexcept {
+    api_calls_in_flight_.fetch_add(1U, std::memory_order_acq_rel);
     if (!accepting_.load(std::memory_order_acquire) || token.slot >= capacity_ ||
         !token.locally_valid()) {
+      api_calls_in_flight_.fetch_sub(1U, std::memory_order_acq_rel);
+      NotifyDrainState();
       return;
     }
     auto retained = requested_[token.slot].load(std::memory_order_relaxed);
-    while (token.generation > retained &&
-           !requested_[token.slot].compare_exchange_weak(
-               retained, token.generation, std::memory_order_release, std::memory_order_relaxed)) {
+    bool published = false;
+    while (token.generation > retained) {
+      if (requested_[token.slot].compare_exchange_weak(
+              retained, token.generation, std::memory_order_release, std::memory_order_relaxed)) {
+        published = true;
+        break;
+      }
     }
-    changed_.notify_all();
+    if (published) {
+      Wake();
+    }
+    api_calls_in_flight_.fetch_sub(1U, std::memory_order_acq_rel);
+    NotifyDrainState();
   }
 
   void Close() noexcept {
     accepting_.store(false, std::memory_order_release);
-    changed_.notify_all();
+    Wake();
+    NotifyDrainState();
   }
 
   [[nodiscard]] bool DrainFor(const std::chrono::nanoseconds timeout) noexcept {
     try {
-      std::unique_lock lock(mutex_);
-      return changed_.wait_for(lock, timeout, [this] {
+      std::unique_lock lock(drain_mutex_);
+      return drain_changed_.wait_for(lock, timeout, [this] {
         if (callback_in_flight_.load(std::memory_order_acquire)) {
+          return false;
+        }
+        if (api_calls_in_flight_.load(std::memory_order_acquire) != 0U) {
           return false;
         }
         for (std::size_t index = 0U; index < capacity_; ++index) {
@@ -1996,10 +2004,20 @@ class ResourceAddressedExecutionKernel::StopProjectionWorker final {
   }
 
  private:
+  void Wake() noexcept {
+    wake_sequence_.fetch_add(1U, std::memory_order_release);
+    wake_sequence_.notify_one();
+  }
+
+  void NotifyDrainState() noexcept {
+    std::lock_guard lock(drain_mutex_);
+    drain_changed_.notify_all();
+  }
+
   void Run(const std::stop_token stop_token) noexcept {
     ready_.store(true, std::memory_order_release);
     ready_.notify_all();
-    changed_.notify_all();
+    auto observed_wake = wake_sequence_.load(std::memory_order_acquire);
     while (!stop_token.stop_requested()) {
       bool progressed = false;
       for (std::size_t index = 0U; index < capacity_; ++index) {
@@ -2013,25 +2031,22 @@ class ResourceAddressedExecutionKernel::StopProjectionWorker final {
         callback_in_flight_.store(false, std::memory_order_release);
         delivered_[index].store(requested, std::memory_order_release);
         progressed = true;
-        changed_.notify_all();
+        if (!accepting_.load(std::memory_order_acquire)) {
+          NotifyDrainState();
+        }
       }
       if (progressed) {
         continue;
       }
-      std::unique_lock lock(mutex_);
-      changed_.wait(lock, [&] {
-        if (stop_token.stop_requested()) {
-          return true;
-        }
-        for (std::size_t index = 0U; index < capacity_; ++index) {
-          if (requested_[index].load(std::memory_order_acquire) >
-              delivered_[index].load(std::memory_order_acquire)) {
-            return true;
-          }
-        }
-        return false;
-      });
+      const auto current_wake = wake_sequence_.load(std::memory_order_acquire);
+      if (current_wake != observed_wake) {
+        observed_wake = current_wake;
+        continue;
+      }
+      wake_sequence_.wait(observed_wake, std::memory_order_acquire);
+      observed_wake = wake_sequence_.load(std::memory_order_acquire);
     }
+    NotifyDrainState();
   }
 
   std::size_t capacity_{};
@@ -2041,8 +2056,10 @@ class ResourceAddressedExecutionKernel::StopProjectionWorker final {
   std::atomic_bool accepting_{true};
   std::atomic_bool ready_{};
   std::atomic_bool callback_in_flight_{};
-  std::mutex mutex_;
-  std::condition_variable changed_;
+  std::atomic_size_t api_calls_in_flight_{};
+  std::atomic_uint64_t wake_sequence_{};
+  std::mutex drain_mutex_;
+  std::condition_variable drain_changed_;
   std::jthread worker_;
 };
 

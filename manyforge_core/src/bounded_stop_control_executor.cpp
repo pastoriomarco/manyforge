@@ -6,6 +6,7 @@
 #include <manyforge_core/bounded_stop_control_executor.hpp>
 #include <mutex>
 #include <optional>
+#include <semaphore>
 #include <stdexcept>
 #include <stop_token>
 #include <thread>
@@ -44,7 +45,7 @@ class BoundedStopControlExecutor::Impl final {
   ~Impl() {
     CloseIngress();
     worker_.request_stop();
-    Signal();
+    WakeWorker();
     if (worker_.joinable()) {
       worker_.join();
     }
@@ -60,20 +61,27 @@ class BoundedStopControlExecutor::Impl final {
 
   void Publish(const StopControlWorkToken token) noexcept {
     EnterApi();
+    bool published = false;
     if (accepting_.load(std::memory_order_acquire) && Valid(token)) {
       auto& slot = slots_[token.slot];
       auto retained = slot.requested_generation.load(std::memory_order_relaxed);
-      while (token.generation > retained &&
-             !slot.requested_generation.compare_exchange_weak(retained, token.generation,
-                                                              std::memory_order_release,
-                                                              std::memory_order_relaxed)) {
+      while (token.generation > retained) {
+        if (slot.requested_generation.compare_exchange_weak(
+                retained, token.generation, std::memory_order_release, std::memory_order_relaxed)) {
+          published = true;
+          break;
+        }
       }
+    }
+    if (published) {
+      WakeWorker();
     }
     LeaveApi();
   }
 
   void ArmDeadline(const StopControlWorkToken token, const TimePoint deadline) noexcept {
     EnterApi();
+    bool armed = false;
     if (accepting_.load(std::memory_order_acquire) && Valid(token) && deadline >= 0) {
       auto& slot = slots_[token.slot];
       const auto retained = slot.deadline_generation.load(std::memory_order_acquire);
@@ -85,25 +93,34 @@ class BoundedStopControlExecutor::Impl final {
         slot.deadline_ns.store(deadline, std::memory_order_relaxed);
         slot.deadline_generation.store(token.generation, std::memory_order_relaxed);
         slot.deadline_armed.store(true, std::memory_order_release);
+        armed = true;
       }
+    }
+    if (armed) {
+      WakeWorker();
     }
     LeaveApi();
   }
 
   void CancelDeadline(const StopControlWorkToken token) noexcept {
     EnterApi();
+    bool cancelled = false;
     if (Valid(token)) {
       auto& slot = slots_[token.slot];
       if (slot.deadline_generation.load(std::memory_order_acquire) == token.generation) {
-        slot.deadline_armed.store(false, std::memory_order_release);
+        cancelled = slot.deadline_armed.exchange(false, std::memory_order_acq_rel);
       }
+    }
+    if (cancelled) {
+      WakeWorker();
     }
     LeaveApi();
   }
 
   void CloseIngress() noexcept {
     accepting_.store(false, std::memory_order_release);
-    Signal();
+    WakeWorker();
+    NotifyDrainState();
   }
 
   [[nodiscard]] bool DrainFor(const std::chrono::nanoseconds timeout) noexcept {
@@ -111,8 +128,19 @@ class BoundedStopControlExecutor::Impl final {
       return false;
     }
     try {
-      std::unique_lock lock(wait_mutex_);
-      return state_changed_.wait_for(lock, timeout, [this]() noexcept { return Drained(); });
+      std::unique_lock lock(drain_mutex_);
+      const auto started = std::chrono::steady_clock::now();
+      constexpr auto maximum_poll =
+          std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::milliseconds(1));
+      while (!Drained()) {
+        const auto elapsed = std::chrono::steady_clock::now() - started;
+        if (elapsed >= timeout) {
+          return false;
+        }
+        const auto remaining = timeout - elapsed;
+        static_cast<void>(drain_changed_.wait_for(lock, std::min(remaining, maximum_poll)));
+      }
+      return true;
     } catch (...) {
       return false;
     }
@@ -135,13 +163,16 @@ class BoundedStopControlExecutor::Impl final {
 
   void LeaveApi() noexcept {
     api_calls_inflight_.fetch_sub(1U, std::memory_order_acq_rel);
-    Signal();
+    NotifyDrainState();
   }
 
-  void Signal() noexcept {
-    wake_sequence_.fetch_add(1U, std::memory_order_release);
-    state_changed_.notify_all();
+  void WakeWorker() noexcept {
+    if (!wake_posted_.exchange(true, std::memory_order_acq_rel)) {
+      wake_.release();
+    }
   }
+
+  void NotifyDrainState() noexcept { drain_changed_.notify_all(); }
 
   [[nodiscard]] bool Drained() const noexcept {
     if (api_calls_inflight_.load(std::memory_order_acquire) != 0U ||
@@ -164,7 +195,7 @@ class BoundedStopControlExecutor::Impl final {
     callback_inflight_.fetch_add(1U, std::memory_order_acq_rel);
     receiver_.ProgressStop(token);
     callback_inflight_.fetch_sub(1U, std::memory_order_acq_rel);
-    Signal();
+    NotifyDrainState();
   }
 
   [[nodiscard]] std::optional<TimePoint> Scan() noexcept {
@@ -219,39 +250,36 @@ class BoundedStopControlExecutor::Impl final {
     worker_running_.store(true, std::memory_order_release);
     worker_ready_.store(true, std::memory_order_release);
     worker_ready_.notify_all();
-    Signal();
-    auto observed_wake = wake_sequence_.load(std::memory_order_acquire);
 
     while (!stop_token.stop_requested()) {
       worker_scanning_.store(true, std::memory_order_release);
       const auto nearest_deadline = Scan();
       worker_scanning_.store(false, std::memory_order_release);
-      state_changed_.notify_all();
-
-      std::unique_lock lock(wait_mutex_);
-      const auto current_wake = wake_sequence_.load(std::memory_order_acquire);
-      if (current_wake != observed_wake) {
-        observed_wake = current_wake;
-        continue;
+      NotifyDrainState();
+      if (stop_token.stop_requested()) {
+        break;
       }
-      const auto awakened = [this, stop_token, observed_wake]() noexcept {
-        return stop_token.stop_requested() ||
-               wake_sequence_.load(std::memory_order_acquire) != observed_wake;
-      };
+
+      bool awakened = false;
       if (nearest_deadline.has_value()) {
         const auto wait = remaining_wait(clock_.now(), *nearest_deadline);
         if (wait > std::chrono::nanoseconds::zero()) {
-          static_cast<void>(state_changed_.wait_for(lock, wait, awakened));
+          awakened = wake_.try_acquire_for(wait);
         }
       } else {
-        state_changed_.wait(lock, awakened);
+        wake_.acquire();
+        awakened = true;
       }
-      observed_wake = wake_sequence_.load(std::memory_order_acquire);
+      if (awakened) {
+        // A producer that races this store either left all of its state visible
+        // to the next scan or observes false and posts the next semaphore wake.
+        wake_posted_.store(false, std::memory_order_release);
+      }
     }
 
     worker_scanning_.store(false, std::memory_order_release);
     worker_running_.store(false, std::memory_order_release);
-    state_changed_.notify_all();
+    NotifyDrainState();
   }
 
   const std::size_t capacity_;
@@ -264,9 +292,10 @@ class BoundedStopControlExecutor::Impl final {
   std::atomic<bool> worker_scanning_{false};
   std::atomic<std::size_t> api_calls_inflight_{0U};
   std::atomic<std::size_t> callback_inflight_{0U};
-  std::atomic<std::uint64_t> wake_sequence_{0U};
-  std::mutex wait_mutex_;
-  std::condition_variable state_changed_;
+  std::binary_semaphore wake_{0};
+  std::atomic<bool> wake_posted_{false};
+  std::mutex drain_mutex_;
+  std::condition_variable drain_changed_;
   std::jthread worker_;
 };
 
