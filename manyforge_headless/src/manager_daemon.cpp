@@ -40,6 +40,7 @@
 #include <filesystem>
 #include <iostream>
 #include <limits>
+#include <map>
 #include <optional>
 #include <stdexcept>
 #include <string>
@@ -77,6 +78,10 @@ constexpr std::size_t kMaximumResponseBytes =
     3U * scene::kMaximumLogicalSceneTransactionBytes + 16U * 1024U;
 constexpr std::size_t kMaximumCommandIdentityBytes = 256U;
 constexpr std::size_t kMaximumScenePoseQueryResources = 128U;
+constexpr std::uint64_t kMaximumPoseObservationLifetimeNs =
+    60ULL * 1000ULL * 1000ULL * 1000ULL;
+constexpr std::size_t kMaximumPoseObserverSessions =
+    kDefaultMaximumPoseObservationKeys;
 constexpr std::size_t kOwnerEpochRandomBytes = 16U;
 constexpr std::size_t kSocketBacklog = 16U;
 constexpr int kClientReadTimeoutMilliseconds = 250;
@@ -300,6 +305,9 @@ enum class CommandKind {
   kSceneOwnerRead,
   kSceneCandidatePreview,
   kScenePoseQuery,
+  kSceneRuntimeOwnerRead,
+  kSceneRuntimeObserverOpen,
+  kSceneRuntimeObserve,
   kReconcile,
   kShutdownRuntime,
 };
@@ -319,6 +327,16 @@ struct ManagerCommand final {
   std::vector<core::SceneResourceId> scene_resource_ids{};
   std::optional<core::ResolvedSceneCandidatePreviewRequestDTO>
       scene_candidate_preview{};
+  std::optional<SceneRuntimeIdentity> expected_scene_runtime_identity{};
+  std::optional<std::string> pose_source_id{};
+  std::optional<std::string> pose_source_epoch{};
+  std::optional<std::uint64_t> pose_source_sequence{};
+  std::optional<std::string> pose_object_id{};
+  std::optional<std::string> pose_policy_id{};
+  std::optional<std::uint64_t> pose_lifetime_ns{};
+  std::optional<PoseSourceQuality> pose_quality{};
+  std::optional<bool> pose_eligible{};
+  std::optional<CanonicalValue> pose_payload{};
 };
 
 const CanonicalValue &RequiredMember(const CanonicalValue &root,
@@ -376,6 +394,36 @@ std::uint64_t RequiredUnsigned(const CanonicalValue &value,
   const auto result = static_cast<std::uint64_t>(*number);
   Require(static_cast<double>(result) == *number,
           std::string(label) + " must be integral");
+  return result;
+}
+
+std::uint64_t RequiredNonnegativeUnsigned(const CanonicalValue &value,
+                                          const std::string_view label) {
+  constexpr auto kMaximumSafeInteger = 9007199254740991ULL;
+  const auto *number = std::get_if<double>(&value.storage());
+  Require(number != nullptr && *number >= 0.0 &&
+              *number <= static_cast<double>(kMaximumSafeInteger),
+          std::string(label) + " must be one nonnegative safe integer");
+  const auto result = static_cast<std::uint64_t>(*number);
+  Require(static_cast<double>(result) == *number,
+          std::string(label) + " must be integral");
+  return result;
+}
+
+SceneRuntimeIdentity RequiredSceneRuntimeIdentity(const CanonicalValue &value) {
+  RequireExactObjectSize(value, 5U, "scene-runtime identity");
+  SceneRuntimeIdentity result{
+      RequiredString(value, "retained_bundle_id"),
+      RequiredString(value, "graph_revision"),
+      RequiredNonnegativeUnsigned(
+          RequiredMember(value, "deployment_generation"),
+          "deployment_generation"),
+      RequiredNonnegativeUnsigned(RequiredMember(value, "program_generation"),
+                                  "program_generation"),
+      RequiredUnsigned(RequiredMember(value, "runtime_generation"),
+                       "runtime_generation"),
+  };
+  Require(result.valid(), "scene-runtime identity is invalid");
   return result;
 }
 
@@ -517,6 +565,45 @@ ManagerCommand DecodeCommand(const std::string_view bytes) {
         RequiredMember(root, "scene_resource_ids"));
     return result;
   }
+  if (command == "scene_runtime_owner_read") {
+    RequireExactObjectSize(root, 2U, "scene-runtime owner read command");
+    return ManagerCommand{.kind = CommandKind::kSceneRuntimeOwnerRead};
+  }
+  if (command == "scene_runtime_observer_open") {
+    RequireExactObjectSize(root, 5U, "scene-runtime observer open command");
+    ManagerCommand result{.kind = CommandKind::kSceneRuntimeObserverOpen};
+    result.expected_scene_runtime_identity = RequiredSceneRuntimeIdentity(
+        RequiredMember(root, "expected_runtime_identity"));
+    result.pose_source_epoch = RequiredString(root, "source_epoch");
+    result.pose_source_id = RequiredString(root, "source_id");
+    return result;
+  }
+  if (command == "scene_runtime_observe") {
+    RequireExactObjectSize(root, 12U, "scene-runtime observe command");
+    ManagerCommand result{.kind = CommandKind::kSceneRuntimeObserve};
+    result.expected_scene_runtime_identity = RequiredSceneRuntimeIdentity(
+        RequiredMember(root, "expected_runtime_identity"));
+    result.pose_source_id = RequiredString(root, "source_id");
+    result.pose_source_epoch = RequiredString(root, "source_epoch");
+    result.pose_source_sequence = RequiredUnsigned(
+        RequiredMember(root, "source_sequence"), "source_sequence");
+    result.pose_object_id = RequiredString(root, "object_id");
+    result.pose_policy_id = RequiredString(root, "policy_id");
+    result.pose_lifetime_ns =
+        RequiredUnsigned(RequiredMember(root, "lifetime_ns"), "lifetime_ns");
+    Require(*result.pose_lifetime_ns <= kMaximumPoseObservationLifetimeNs,
+            "lifetime_ns exceeds the scene-runtime observation bound");
+    const auto quality = RequiredString(root, "quality");
+    Require(quality == "good" || quality == "unknown",
+            "quality must be good or unknown");
+    result.pose_quality = quality == "good" ? PoseSourceQuality::kGood
+                                            : PoseSourceQuality::kUnknown;
+    result.pose_eligible = RequiredBool(root, "eligible");
+    const auto &payload = RequiredMember(root, "payload");
+    Require(payload.is_object(), "pose observation payload must be an object");
+    result.pose_payload = payload;
+    return result;
+  }
   Require(command == "apply", "command kind is unsupported");
   RequireExactObjectSize(root, 10U, "Apply command");
   const auto request_id = RequiredString(root, "request_id");
@@ -610,6 +697,83 @@ CanonicalValue ScenePoseResponse(
       {"ok", CanonicalValue(true)},
       {"poses", CanonicalValue(std::move(rows))},
       {"projection_revision", ProjectionRevision(projection_revision)},
+  });
+}
+
+CanonicalValue
+SceneRuntimeIdentityResponseValue(const SceneRuntimeIdentity &identity) {
+  Require(identity.valid(), "scene-runtime response identity is invalid");
+  return CanonicalValue(CanonicalValue::Object{
+      {"deployment_generation",
+       Unsigned(identity.deployment_generation, "deployment generation")},
+      {"graph_revision", CanonicalValue(identity.graph_revision)},
+      {"program_generation",
+       Unsigned(identity.program_generation, "program generation")},
+      {"retained_bundle_id", CanonicalValue(identity.retained_bundle_id)},
+      {"runtime_generation",
+       Unsigned(identity.runtime_generation, "runtime generation")},
+  });
+}
+
+CanonicalValue
+SceneRuntimeOwnerReadResponse(const std::string_view cell_id,
+                              const std::string_view owner_epoch,
+                              const SceneRuntimeStateSnapshot &snapshot) {
+  Require(!cell_id.empty() && !owner_epoch.empty() &&
+              snapshot.runtime_identity.has_value(),
+          "scene-runtime owner read is internally incomplete");
+  return CanonicalValue(CanonicalValue::Object{
+      {"api_version",
+       CanonicalValue(std::string(kManagerCommandResponseApiVersion))},
+      {"cell_id", CanonicalValue(std::string(cell_id))},
+      {"ok", CanonicalValue(true)},
+      {"scene_runtime_owner_epoch", CanonicalValue(std::string(owner_epoch))},
+      {"state", SceneRuntimeStateValue(snapshot)},
+  });
+}
+
+CanonicalValue SceneRuntimeObserverOpenResponse(
+    const std::string_view cell_id, const SceneRuntimeIdentity &identity,
+    const std::string_view source_id, const std::string_view source_epoch,
+    const std::uint64_t source_epoch_order) {
+  return CanonicalValue(CanonicalValue::Object{
+      {"api_version",
+       CanonicalValue(std::string(kManagerCommandResponseApiVersion))},
+      {"cell_id", CanonicalValue(std::string(cell_id))},
+      {"ok", CanonicalValue(true)},
+      {"runtime_identity", SceneRuntimeIdentityResponseValue(identity)},
+      {"source_epoch", CanonicalValue(std::string(source_epoch))},
+      {"source_epoch_order",
+       Unsigned(source_epoch_order, "source epoch order")},
+      {"source_id", CanonicalValue(std::string(source_id))},
+  });
+}
+
+CanonicalValue SceneRuntimeObserveResponse(
+    const PoseSourceObservation &observation,
+    const PoseObservationAcceptance &acceptance,
+    const std::uint64_t scene_runtime_source_generation) {
+  return CanonicalValue(CanonicalValue::Object{
+      {"api_version",
+       CanonicalValue(std::string(kManagerCommandResponseApiVersion))},
+      {"disposition",
+       CanonicalValue(std::string(ToString(acceptance.disposition)))},
+      {"fresh", CanonicalValue(acceptance.fresh)},
+      {"initialization_generation",
+       Unsigned(acceptance.initialization_generation,
+                "initialization generation")},
+      {"object_id", CanonicalValue(observation.key.object_id)},
+      {"ok", CanonicalValue(true)},
+      {"policy_id", CanonicalValue(observation.key.policy_id)},
+      {"scene_runtime_source_generation",
+       Unsigned(scene_runtime_source_generation,
+                "scene runtime source generation")},
+      {"source_epoch", CanonicalValue(observation.source_epoch)},
+      {"source_epoch_order",
+       Unsigned(observation.source_epoch_order, "source epoch order")},
+      {"source_id", CanonicalValue(observation.key.source_id)},
+      {"source_sequence",
+       Unsigned(observation.source_sequence, "source sequence")},
   });
 }
 
@@ -1021,6 +1185,20 @@ private:
     std::uint64_t scene_runtime;
   };
 
+  struct PoseObserverSession final {
+    SceneRuntimeIdentity runtime_identity;
+    std::string source_epoch;
+    std::uint64_t source_epoch_order{};
+  };
+
+  struct PoseObservationReplay final {
+    SceneRuntimeIdentity runtime_identity;
+    std::uint64_t requested_lifetime_ns{};
+    PoseSourceObservation observation;
+    PoseObservationAcceptance acceptance;
+    std::optional<std::uint64_t> publication_generation;
+  };
+
   static DaemonConfig ValidateConfig(DaemonConfig config) {
     config.package_root =
         ExistingDirectory(std::move(config.package_root), "package root");
@@ -1203,9 +1381,13 @@ private:
           desired_scene_runtime, publication_generation,
           "durable_finalized_active_projection");
     } else {
-      static_cast<void>(scene_runtime_owner_.AdoptFinalizedOpenRuntime(
+      const auto changed = scene_runtime_owner_.AdoptFinalizedOpenRuntime(
           desired_scene_runtime, publication_generation,
-          "durable_finalized_active_projection"));
+          "durable_finalized_active_projection");
+      if (changed) {
+        pose_observer_sessions_.clear();
+        pose_observation_replays_.clear();
+      }
     }
     const auto manager = manager_channel_.Publish(
         "component_manager", manager_owner_id_, manager_owner_epoch_,
@@ -1217,13 +1399,9 @@ private:
                 : ManagerApplyMutationAvailability::kKernelOwnerUnavailable));
 
     const auto scene_generation = PublishLogicalScene(observed_at);
-    const auto scene_runtime_publication = scene_runtime_channel_.Publish(
-        "scene_runtime", scene_runtime_owner_id_, scene_runtime_owner_epoch_,
-        observed_at,
-        BuildSceneRuntimeSourcePayload(admission_.cell_id().value(),
-                                       scene_runtime_owner_.Snapshot()));
+    const auto scene_runtime_generation = PublishSceneRuntime(observed_at);
     return {manager.source_generation, scene_generation,
-            scene_runtime_publication.source_generation};
+            scene_runtime_generation};
   }
 
   std::uint64_t PublishLogicalScene(const std::int64_t observed_at) {
@@ -1250,6 +1428,16 @@ private:
       std::cerr << "Manager daemon scene publication failed after durable "
                    "commit with an unknown error\n";
     }
+  }
+
+  std::uint64_t PublishSceneRuntime(const std::int64_t observed_at) {
+    return scene_runtime_channel_
+        .Publish(
+            "scene_runtime", scene_runtime_owner_id_,
+            scene_runtime_owner_epoch_, observed_at,
+            BuildSceneRuntimeSourcePayload(admission_.cell_id().value(),
+                                           scene_runtime_owner_.Snapshot()))
+        .source_generation;
   }
 
   void TryPeriodicReconcile() noexcept {
@@ -1445,6 +1633,183 @@ private:
         TrySendResponse(client.get(), ScenePoseResponse(current, poses));
         return false;
       }
+      case CommandKind::kSceneRuntimeOwnerRead: {
+        const auto snapshot = scene_runtime_owner_.Snapshot();
+        if (!snapshot.runtime_identity.has_value()) {
+          TrySendResponse(
+              client.get(),
+              ErrorResponse("scene_runtime_owner_unavailable",
+                            "scene-runtime owner has no active identity"));
+          return false;
+        }
+        TrySendResponse(client.get(),
+                        SceneRuntimeOwnerReadResponse(
+                            admission_.cell_id().value(),
+                            scene_runtime_owner_epoch_, snapshot));
+        return false;
+      }
+      case CommandKind::kSceneRuntimeObserverOpen: {
+        Require(command.expected_scene_runtime_identity.has_value() &&
+                    command.pose_source_id.has_value() &&
+                    command.pose_source_epoch.has_value(),
+                "decoded scene-runtime observer open lacks identity");
+        const auto snapshot = scene_runtime_owner_.Snapshot();
+        if (!snapshot.runtime_identity.has_value() ||
+            *snapshot.runtime_identity !=
+                *command.expected_scene_runtime_identity) {
+          TrySendResponse(
+              client.get(),
+              ErrorResponse(
+                  "scene_runtime_identity_changed",
+                  "scene-runtime observer targets an inactive runtime"));
+          return false;
+        }
+        auto found = pose_observer_sessions_.find(*command.pose_source_id);
+        if (found == pose_observer_sessions_.end() &&
+            pose_observer_sessions_.size() >= kMaximumPoseObserverSessions) {
+          TrySendResponse(
+              client.get(),
+              ErrorResponse("scene_runtime_observer_capacity_exhausted",
+                            "pose observer session capacity is exhausted"));
+          return false;
+        }
+        std::uint64_t source_epoch_order = 1U;
+        if (found != pose_observer_sessions_.end()) {
+          if (found->second.runtime_identity == *snapshot.runtime_identity &&
+              found->second.source_epoch == *command.pose_source_epoch) {
+            source_epoch_order = found->second.source_epoch_order;
+          } else {
+            if (found->second.source_epoch_order >= 9007199254740991ULL) {
+              TrySendResponse(
+                  client.get(),
+                  ErrorResponse("scene_runtime_observer_epoch_exhausted",
+                                "pose observer epoch order is exhausted"));
+              return false;
+            }
+            source_epoch_order = found->second.source_epoch_order + 1U;
+          }
+        }
+        pose_observer_sessions_.insert_or_assign(
+            *command.pose_source_id,
+            PoseObserverSession{*snapshot.runtime_identity,
+                                *command.pose_source_epoch,
+                                source_epoch_order});
+        TrySendResponse(client.get(),
+                        SceneRuntimeObserverOpenResponse(
+                            admission_.cell_id().value(),
+                            *snapshot.runtime_identity, *command.pose_source_id,
+                            *command.pose_source_epoch, source_epoch_order));
+        return false;
+      }
+      case CommandKind::kSceneRuntimeObserve: {
+        Require(command.expected_scene_runtime_identity.has_value() &&
+                    command.pose_source_id.has_value() &&
+                    command.pose_source_epoch.has_value() &&
+                    command.pose_source_sequence.has_value() &&
+                    command.pose_object_id.has_value() &&
+                    command.pose_policy_id.has_value() &&
+                    command.pose_lifetime_ns.has_value() &&
+                    command.pose_quality.has_value() &&
+                    command.pose_eligible.has_value() &&
+                    command.pose_payload.has_value(),
+                "decoded scene-runtime observation is incomplete");
+        const auto snapshot = scene_runtime_owner_.Snapshot();
+        if (!snapshot.runtime_identity.has_value() ||
+            *snapshot.runtime_identity !=
+                *command.expected_scene_runtime_identity) {
+          TrySendResponse(
+              client.get(),
+              ErrorResponse(
+                  "scene_runtime_identity_changed",
+                  "pose observation targets an inactive scene runtime"));
+          return false;
+        }
+        const auto session =
+            pose_observer_sessions_.find(*command.pose_source_id);
+        if (session == pose_observer_sessions_.end() ||
+            session->second.runtime_identity != *snapshot.runtime_identity ||
+            session->second.source_epoch != *command.pose_source_epoch) {
+          TrySendResponse(client.get(),
+                          ErrorResponse("scene_runtime_observer_session_stale",
+                                        "pose observation does not match the "
+                                        "active observer session"));
+          return false;
+        }
+        const PoseObservationKey observation_key{*command.pose_source_id,
+                                                 *command.pose_object_id,
+                                                 *command.pose_policy_id};
+        auto replay = pose_observation_replays_.find(observation_key);
+        if (replay != pose_observation_replays_.end() &&
+            replay->second.observation.source_epoch_order ==
+                session->second.source_epoch_order &&
+            replay->second.observation.source_sequence ==
+                *command.pose_source_sequence) {
+          const auto &record = replay->second;
+          const bool exact =
+              record.runtime_identity == *snapshot.runtime_identity &&
+              record.requested_lifetime_ns == *command.pose_lifetime_ns &&
+              record.observation.source_epoch == *command.pose_source_epoch &&
+              record.observation.quality == *command.pose_quality &&
+              record.observation.eligible == *command.pose_eligible &&
+              record.observation.payload == *command.pose_payload;
+          if (!exact) {
+            TrySendResponse(
+                client.get(),
+                ErrorResponse("scene_runtime_observation_request_conflict",
+                              "pose observation identity was reused with "
+                              "changed intent"));
+            return false;
+          }
+          if (!replay->second.publication_generation.has_value()) {
+            replay->second.publication_generation =
+                PublishSceneRuntime(static_cast<std::int64_t>(ElapsedNs()));
+          }
+          TrySendResponse(client.get(),
+                          SceneRuntimeObserveResponse(
+                              replay->second.observation,
+                              replay->second.acceptance,
+                              *replay->second.publication_generation));
+          return false;
+        }
+        const auto observed_at = static_cast<std::int64_t>(ElapsedNs());
+        constexpr auto kMaximumSafeInteger = 9007199254740991ULL;
+        const auto observed_unsigned = static_cast<std::uint64_t>(observed_at);
+        if (*command.pose_lifetime_ns >
+            kMaximumSafeInteger - observed_unsigned) {
+          TrySendResponse(
+              client.get(),
+              ErrorResponse("scene_runtime_observation_expiry_invalid",
+                            "pose observation expiry exceeds the safe range"));
+          return false;
+        }
+        PoseSourceObservation observation{
+            observation_key,
+            *command.pose_source_epoch,
+            session->second.source_epoch_order,
+            *command.pose_source_sequence,
+            observed_at,
+            static_cast<std::int64_t>(observed_unsigned +
+                                      *command.pose_lifetime_ns),
+            *command.pose_quality,
+            *command.pose_eligible,
+            *command.pose_payload,
+        };
+        const auto acceptance = scene_runtime_owner_.ObservePose(observation);
+        auto [stored, inserted] = pose_observation_replays_.insert_or_assign(
+            observation_key,
+            PoseObservationReplay{*snapshot.runtime_identity,
+                                  *command.pose_lifetime_ns, observation,
+                                  acceptance, std::nullopt});
+        static_cast<void>(inserted);
+        stored->second.publication_generation =
+            PublishSceneRuntime(observed_at);
+        TrySendResponse(client.get(),
+                        SceneRuntimeObserveResponse(
+                            stored->second.observation,
+                            stored->second.acceptance,
+                            *stored->second.publication_generation));
+        return false;
+      }
       case CommandKind::kReconcile: {
         const auto generations = ReconcileAndPublish();
         TrySendResponse(client.get(),
@@ -1497,6 +1862,8 @@ private:
   std::string manager_owner_id_;
   std::string scene_owner_id_;
   std::string scene_runtime_owner_id_;
+  std::map<std::string, PoseObserverSession> pose_observer_sessions_;
+  std::map<PoseObservationKey, PoseObservationReplay> pose_observation_replays_;
   std::optional<std::vector<core::ProjectionNativeRuntimeBindingDTO>>
       last_reconciled_native_runtime_bindings_;
 };

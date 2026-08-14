@@ -564,6 +564,75 @@ std::string ScenePreviewRequest(const SourceSnapshot &scene_source,
   }));
 }
 
+const content_identity::CanonicalValue &
+SceneRuntimeIdentityValue(const SourceSnapshot &scene_runtime_source) {
+  return RequiredMember(RequiredMember(scene_runtime_source.payload, "state"),
+                        "runtime_identity");
+}
+
+content_identity::CanonicalValue
+DifferentSceneRuntimeIdentityValue(const SourceSnapshot &scene_runtime_source) {
+  using content_identity::CanonicalValue;
+  const auto &identity = SceneRuntimeIdentityValue(scene_runtime_source);
+  return CanonicalValue(CanonicalValue::Object{
+      {"deployment_generation",
+       RequiredMember(identity, "deployment_generation")},
+      {"graph_revision", RequiredMember(identity, "graph_revision")},
+      {"program_generation", RequiredMember(identity, "program_generation")},
+      {"retained_bundle_id", RequiredMember(identity, "retained_bundle_id")},
+      {"runtime_generation",
+       CanonicalValue(
+           RequiredMember(identity, "runtime_generation").as_number() + 1.0)},
+  });
+}
+
+std::string
+SceneRuntimeObserverOpenRequest(const SourceSnapshot &scene_runtime_source,
+                                const std::string_view source_epoch) {
+  using content_identity::CanonicalValue;
+  return content_identity::canonical_json(CanonicalValue(CanonicalValue::Object{
+      {"api_version", CanonicalValue("manyforge.manager_command.v1")},
+      {"command", CanonicalValue("scene_runtime_observer_open")},
+      {"expected_runtime_identity",
+       SceneRuntimeIdentityValue(scene_runtime_source)},
+      {"source_epoch", CanonicalValue(std::string(source_epoch))},
+      {"source_id", CanonicalValue("isaac.observer")},
+  }));
+}
+
+std::string SceneRuntimeObserveRequest(
+    const SourceSnapshot &scene_runtime_source,
+    const std::string_view source_epoch, const std::uint64_t source_sequence,
+    const std::uint64_t lifetime_ns = 1000000000ULL,
+    const double position = 0.25,
+    const content_identity::CanonicalValue *expected_identity = nullptr) {
+  using content_identity::CanonicalValue;
+  return content_identity::canonical_json(CanonicalValue(CanonicalValue::Object{
+      {"api_version", CanonicalValue("manyforge.manager_command.v1")},
+      {"command", CanonicalValue("scene_runtime_observe")},
+      {"eligible", CanonicalValue(false)},
+      {"expected_runtime_identity",
+       expected_identity == nullptr
+           ? SceneRuntimeIdentityValue(scene_runtime_source)
+           : *expected_identity},
+      {"lifetime_ns", CanonicalValue(static_cast<double>(lifetime_ns))},
+      {"object_id", CanonicalValue("robot")},
+      {"payload",
+       CanonicalValue(CanonicalValue::Object{
+           {"api_version", CanonicalValue("manyforge.ros_pose_observation.v1")},
+           {"kind", CanonicalValue("joint_state")},
+           {"positions", CanonicalValue(CanonicalValue::Array{
+                             CanonicalValue(position),
+                         })},
+       })},
+      {"policy_id", CanonicalValue("viewer.measured_robot")},
+      {"quality", CanonicalValue("good")},
+      {"source_epoch", CanonicalValue(std::string(source_epoch))},
+      {"source_id", CanonicalValue("isaac.observer")},
+      {"source_sequence", CanonicalValue(static_cast<double>(source_sequence))},
+  }));
+}
+
 TEST(ManagerDaemonProcess,
      PublishesWithoutComposerAndSurvivesManagerReplacement) {
   DaemonDirectory directory;
@@ -719,6 +788,126 @@ TEST(ManagerDaemonProcess,
     EXPECT_TRUE(WIFEXITED(status));
     EXPECT_EQ(WEXITSTATUS(status), 0);
   }
+}
+
+TEST(ManagerDaemonProcess,
+     SceneRuntimeObservationIngressFencesIdentityReplacementAndFreshness) {
+  DaemonDirectory directory;
+  {
+    ManagerProcess manager(directory);
+    manager.WaitReady(directory);
+    AtomicSourceSnapshotChannel scene_runtime_source(
+        directory.publication_root(), "scene-runtime-source.json");
+    const auto initial = scene_runtime_source.Read();
+    ASSERT_TRUE(initial.has_value());
+
+    const auto owner_read = SendCommand(
+        directory.socket_path(),
+        R"({"api_version":"manyforge.manager_command.v1","command":"scene_runtime_owner_read"})");
+    EXPECT_NE(owner_read.find("\"ok\":true"), std::string::npos);
+    EXPECT_NE(owner_read.find("\"scene_runtime_owner_epoch\":"),
+              std::string::npos);
+
+    const auto opened_first = SendCommand(
+        directory.socket_path(),
+        SceneRuntimeObserverOpenRequest(*initial, "observer-epoch-1"));
+    EXPECT_NE(opened_first.find("\"source_epoch_order\":1"), std::string::npos)
+        << opened_first;
+    const auto accepted = SendCommand(
+        directory.socket_path(),
+        SceneRuntimeObserveRequest(*initial, "observer-epoch-1", 1U));
+    EXPECT_NE(accepted.find("\"disposition\":\"observed_only\""),
+              std::string::npos)
+        << accepted;
+    EXPECT_NE(accepted.find("\"fresh\":true"), std::string::npos) << accepted;
+    const auto duplicate = SendCommand(
+        directory.socket_path(),
+        SceneRuntimeObserveRequest(*initial, "observer-epoch-1", 1U));
+    EXPECT_EQ(duplicate, accepted);
+    const auto changed_intent =
+        SendCommand(directory.socket_path(),
+                    SceneRuntimeObserveRequest(*initial, "observer-epoch-1", 1U,
+                                               1000000000ULL, 0.5));
+    EXPECT_NE(changed_intent.find("scene_runtime_observation_request_conflict"),
+              std::string::npos)
+        << changed_intent;
+    const auto wrong_identity = DifferentSceneRuntimeIdentityValue(*initial);
+    const auto crossed_runtime = SendCommand(
+        directory.socket_path(),
+        SceneRuntimeObserveRequest(*initial, "observer-epoch-1", 2U,
+                                   1000000000ULL, 0.25, &wrong_identity));
+    EXPECT_NE(crossed_runtime.find("scene_runtime_identity_changed"),
+              std::string::npos)
+        << crossed_runtime;
+
+    const auto observed = scene_runtime_source.Read();
+    ASSERT_TRUE(observed.has_value());
+    const auto observed_bytes =
+        content_identity::canonical_json(observed->payload);
+    EXPECT_NE(observed_bytes.find("\"source_id\":\"isaac.observer\""),
+              std::string::npos);
+    EXPECT_NE(observed_bytes.find("\"kind\":\"joint_state\""),
+              std::string::npos);
+
+    const auto opened_replacement = SendCommand(
+        directory.socket_path(),
+        SceneRuntimeObserverOpenRequest(*initial, "observer-epoch-2"));
+    EXPECT_NE(opened_replacement.find("\"source_epoch_order\":2"),
+              std::string::npos)
+        << opened_replacement;
+    const auto stale = SendCommand(
+        directory.socket_path(),
+        SceneRuntimeObserveRequest(*initial, "observer-epoch-1", 2U));
+    EXPECT_NE(stale.find("scene_runtime_observer_session_stale"),
+              std::string::npos)
+        << stale;
+    const auto replacement_accepted = SendCommand(
+        directory.socket_path(),
+        SceneRuntimeObserveRequest(*initial, "observer-epoch-2", 1U, 1U));
+    EXPECT_NE(replacement_accepted.find("\"source_epoch_order\":2"),
+              std::string::npos)
+        << replacement_accepted;
+
+    const auto freshness_deadline =
+        std::chrono::steady_clock::now() + std::chrono::seconds(2);
+    bool observed_stale = false;
+    while (std::chrono::steady_clock::now() < freshness_deadline) {
+      const auto snapshot = scene_runtime_source.Read();
+      if (snapshot.has_value() &&
+          content_identity::canonical_json(snapshot->payload)
+                  .find("\"fresh\":false") != std::string::npos) {
+        observed_stale = true;
+        break;
+      }
+      std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    }
+    EXPECT_TRUE(observed_stale);
+    const auto status = manager.Stop(SIGKILL);
+    EXPECT_TRUE(WIFSIGNALED(status));
+  }
+
+  ManagerProcess replacement(directory);
+  replacement.WaitReady(directory);
+  AtomicSourceSnapshotChannel scene_runtime_source(directory.publication_root(),
+                                                   "scene-runtime-source.json");
+  const auto replacement_snapshot = scene_runtime_source.Read();
+  ASSERT_TRUE(replacement_snapshot.has_value());
+  EXPECT_EQ(content_identity::canonical_json(replacement_snapshot->payload)
+                .find("\"source_id\":\"isaac.observer\""),
+            std::string::npos);
+  const auto stale_after_owner_loss =
+      SendCommand(directory.socket_path(),
+                  SceneRuntimeObserveRequest(*replacement_snapshot,
+                                             "observer-epoch-2", 2U));
+  EXPECT_NE(stale_after_owner_loss.find("scene_runtime_observer_session_stale"),
+            std::string::npos)
+      << stale_after_owner_loss;
+  const auto reopened = SendCommand(
+      directory.socket_path(), SceneRuntimeObserverOpenRequest(
+                                   *replacement_snapshot, "observer-epoch-3"));
+  EXPECT_NE(reopened.find("\"source_epoch_order\":1"), std::string::npos)
+      << reopened;
+  EXPECT_TRUE(WIFEXITED(replacement.Stop(SIGTERM)));
 }
 
 TEST(ManagerDaemonProcess, EnforcesOneProcessOwnerPerManagerStateRoot) {

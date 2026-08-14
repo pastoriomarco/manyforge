@@ -104,6 +104,8 @@ TEST(SceneRuntimeStateOwner,
   std::int64_t now = 10;
   SceneRuntimeStateOwner owner([&] { return now; }, [] { return "token-1"; });
   owner.EstablishOpenRuntime(RuntimeIdentity(4U), 4U, "durable_bootstrap");
+  static_cast<void>(owner.ObservePose(Observation(1U, 10, 100)));
+  ASSERT_EQ(owner.Snapshot().pose_sources.size(), 1U);
 
   EXPECT_FALSE(owner.AdoptFinalizedOpenRuntime(RuntimeIdentity(4U), 4U,
                                                "durable_apply_finalized"));
@@ -116,6 +118,7 @@ TEST(SceneRuntimeStateOwner,
   EXPECT_EQ(adopted.initialization_generation, 6U);
   EXPECT_EQ(adopted.state, SceneInitializationState::kOpen);
   EXPECT_FALSE(adopted.initialization_token.has_value());
+  EXPECT_TRUE(adopted.pose_sources.empty());
   EXPECT_EQ(adopted.counters.closed, 0U);
   EXPECT_EQ(adopted.counters.opened, 0U);
 

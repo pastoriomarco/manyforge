@@ -357,6 +357,12 @@ bool SceneRuntimeStateOwner::AdoptFinalizedOpenRuntime(
   }
   initialization_generation_ = initialization_generation;
   runtime_identity_ = std::move(identity);
+  // Observations are scoped to the exact retained runtime identity.  An
+  // externally finalized Apply may advance straight from one open runtime to
+  // another without entering the reset/replay states, so retaining the old
+  // rows here would make a still-unexpired pose visible under the successor
+  // bundle.  Producers must reopen against the new identity and republish.
+  pose_records_.clear();
   reason_ = std::move(reason);
   error_.reset();
   started_at_ns_ = now;
