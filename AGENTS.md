@@ -31,6 +31,10 @@ as product surfaces. Packaged installation, historical aggregate launchers,
 and any simulator, physical, or tool lane still behind a named gate remain
 unavailable.
 
+This repository ships one maintained ManyForge-only native product path. Its
+exact qualified source, supported inputs, and current residual gates remain
+owned by the plan index and linked evidence rather than by this landing file.
+
 Three sibling repositories form the full stack; the cross-repo
 authority map is:
 
