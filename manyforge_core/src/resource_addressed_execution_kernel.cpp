@@ -5095,9 +5095,9 @@ Result<void> ResourceAddressedExecutionKernel::settle_control_operation_locked(
 }
 
 void ResourceAddressedExecutionKernel::OperationControlEffectCompleted(
-    const OperationControlEffectHandle handle) noexcept {
+    BoundedOperationControlExecutor& executor, const OperationControlEffectHandle handle) noexcept {
   try {
-    auto taken = operation_control_executor_->TryTake(handle);
+    auto taken = executor.TryTake(handle);
     if ((taken.status == OperationControlEffectTakeStatus::kCompleted ||
          taken.status == OperationControlEffectTakeStatus::kInfrastructureFailure) &&
         taken.result.has_value()) {
@@ -5107,7 +5107,7 @@ void ResourceAddressedExecutionKernel::OperationControlEffectCompleted(
       motion_admission_closed_ = true;
     }
     if (taken.status != OperationControlEffectTakeStatus::kPending) {
-      static_cast<void>(operation_control_executor_->Release(handle));
+      static_cast<void>(executor.Release(handle));
     }
   } catch (...) {
     std::lock_guard state_lock(state_mutex_);

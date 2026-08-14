@@ -48,6 +48,11 @@ class BoundedStopStageAttemptExecutor::Impl final {
         }
         slot->changed.notify_all();
       }
+      for (auto& slot : slots_) {
+        if (slot->worker.joinable()) {
+          slot->worker.join();
+        }
+      }
       throw;
     }
     std::unique_lock lock(state_mutex_);
@@ -66,6 +71,11 @@ class BoundedStopStageAttemptExecutor::Impl final {
         slot->worker.request_stop();
       }
       slot->changed.notify_all();
+    }
+    for (auto& slot : slots_) {
+      if (slot->worker.joinable()) {
+        slot->worker.join();
+      }
     }
   }
 

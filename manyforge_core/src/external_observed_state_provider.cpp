@@ -3,6 +3,7 @@
 #include <manyforge_content_identity/content_identity.hpp>
 #include <manyforge_core/external_observed_state_provider.hpp>
 #include <set>
+#include <shared_mutex>
 #include <stdexcept>
 #include <string>
 #include <string_view>
@@ -281,8 +282,8 @@ Result<ExternalObservedStateIngestDisposition> ExternalObservedStateProvider::in
     return Result<ExternalObservedStateIngestDisposition>::Err(valid.error());
   }
 
-  const std::lock_guard lock(ingress_mutex_);
-  const auto previous = latest_.load(std::memory_order_acquire);
+  const std::unique_lock lock(publication_mutex_);
+  const auto previous = latest_;
   if (previous) {
     const auto& current = previous->publication;
     if (candidate.publication_sequence < current.publication_sequence ||
@@ -304,8 +305,7 @@ Result<ExternalObservedStateIngestDisposition> ExternalObservedStateProvider::in
     }
   }
 
-  latest_.store(std::make_shared<const LatestPublication>(LatestPublication{std::move(candidate)}),
-                std::memory_order_release);
+  latest_ = std::make_shared<const LatestPublication>(LatestPublication{std::move(candidate)});
   return Result<ExternalObservedStateIngestDisposition>::Ok(
       ExternalObservedStateIngestDisposition::kAccepted);
 }
@@ -317,7 +317,11 @@ Result<ObservedStateSnapshotDTO> ExternalObservedStateProvider::current_state(
         source_error("external_source_query_context_mismatch",
                      "external observed-state query differs from its exact instance contract"));
   }
-  const auto latest = latest_.load(std::memory_order_acquire);
+  std::shared_ptr<const LatestPublication> latest;
+  {
+    const std::shared_lock lock(publication_mutex_);
+    latest = latest_;
+  }
   if (!latest) {
     return Result<ObservedStateSnapshotDTO>::Err(
         source_unavailable("external_source_not_published"));
@@ -339,7 +343,11 @@ Result<ObservedStatePublicationDTO> ExternalObservedStateProvider::publication(
         source_error("external_source_binding_mismatch",
                      "external observed-state binding differs from its exact source contract"));
   }
-  const auto latest = latest_.load(std::memory_order_acquire);
+  std::shared_ptr<const LatestPublication> latest;
+  {
+    const std::shared_lock lock(publication_mutex_);
+    latest = latest_;
+  }
   if (!latest) {
     return Result<ObservedStatePublicationDTO>::Err(
         source_unavailable("external_source_not_published"));

@@ -20,9 +20,10 @@ namespace {
 
 class BoundedOperationControlExecutor::Impl final {
  public:
-  Impl(std::vector<IResolvedParticipantExecutionEngine*> engines,
+  Impl(BoundedOperationControlExecutor& owner,
+       std::vector<IResolvedParticipantExecutionEngine*> engines,
        IOperationControlEffectCompletionReceiver& receiver)
-      : receiver_(receiver) {
+      : owner_(owner), receiver_(receiver) {
     if (engines.empty() || engines.size() > kMaximumOperationControlLanes) {
       throw std::invalid_argument("operation-control executor engine bound is invalid");
     }
@@ -56,6 +57,11 @@ class BoundedOperationControlExecutor::Impl final {
         }
         slot->changed.notify_all();
       }
+      for (auto& slot : slots_) {
+        if (slot->worker.joinable()) {
+          slot->worker.join();
+        }
+      }
       throw;
     }
     std::unique_lock lock(state_mutex_);
@@ -74,6 +80,11 @@ class BoundedOperationControlExecutor::Impl final {
         slot->worker.request_stop();
       }
       slot->changed.notify_all();
+    }
+    for (auto& slot : slots_) {
+      if (slot->worker.joinable()) {
+        slot->worker.join();
+      }
     }
   }
 
@@ -351,7 +362,7 @@ class BoundedOperationControlExecutor::Impl final {
         handle = OperationControlEffectHandle{index, slot.generation};
       }
       SignalStateChange();
-      receiver_.OperationControlEffectCompleted(handle);
+      receiver_.OperationControlEffectCompleted(owner_, handle);
       active_calls_.fetch_sub(1U, std::memory_order_acq_rel);
       SignalStateChange();
     }
@@ -359,6 +370,7 @@ class BoundedOperationControlExecutor::Impl final {
     SignalStateChange();
   }
 
+  BoundedOperationControlExecutor& owner_;
   IOperationControlEffectCompletionReceiver& receiver_;
   std::vector<std::unique_ptr<Slot>> slots_;
   std::atomic<bool> accepting_{true};
@@ -372,7 +384,7 @@ class BoundedOperationControlExecutor::Impl final {
 BoundedOperationControlExecutor::BoundedOperationControlExecutor(
     std::vector<IResolvedParticipantExecutionEngine*> engines,
     IOperationControlEffectCompletionReceiver& receiver)
-    : impl_(std::make_unique<Impl>(std::move(engines), receiver)) {}
+    : impl_(std::make_unique<Impl>(*this, std::move(engines), receiver)) {}
 
 BoundedOperationControlExecutor::~BoundedOperationControlExecutor() = default;
 

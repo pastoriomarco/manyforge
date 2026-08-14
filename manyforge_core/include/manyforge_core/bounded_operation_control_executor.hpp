@@ -89,10 +89,13 @@ enum class OperationControlEffectReleaseStatus : std::uint8_t {
   kStaleHandle,
 };
 
+class BoundedOperationControlExecutor;
+
 class IOperationControlEffectCompletionReceiver {
  public:
   virtual ~IOperationControlEffectCompletionReceiver() = default;
-  virtual void OperationControlEffectCompleted(OperationControlEffectHandle handle) noexcept = 0;
+  virtual void OperationControlEffectCompleted(BoundedOperationControlExecutor& executor,
+                                               OperationControlEffectHandle handle) noexcept = 0;
 };
 
 /// Fixed process-local isolation for participant Pause/Resume and completed-

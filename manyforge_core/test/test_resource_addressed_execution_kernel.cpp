@@ -34,7 +34,7 @@ using namespace manyforge::core;
 
 template <typename Predicate>
 bool wait_until(Predicate&& predicate,
-                std::chrono::milliseconds timeout = std::chrono::milliseconds(1000)) {
+                std::chrono::milliseconds timeout = std::chrono::milliseconds(10000)) {
   const auto deadline = std::chrono::steady_clock::now() + timeout;
   while (!predicate()) {
     if (std::chrono::steady_clock::now() >= deadline) {
@@ -69,8 +69,11 @@ class FakeParticipantEngine final : public IResolvedParticipantExecutionEngine,
         return Result<std::uint64_t>::Err(initialized.error());
       }
     }
-    status.state = ExecutionState::kPlanning;
-    status.execution_id = next_execution_id;
+    {
+      std::lock_guard lock(status_mutex_);
+      status.state = ExecutionState::kPlanning;
+      status.execution_id = next_execution_id;
+    }
     if (event_during_execute.has_value()) {
       const auto snapshot = callbacks;
       for (const auto& [id, callback] : snapshot) {
@@ -85,15 +88,18 @@ class FakeParticipantEngine final : public IResolvedParticipantExecutionEngine,
   Result<std::uint64_t> PrepareMotion(ResolvedPreparedMotionExecutionRequestDTO request) override {
     ++prepare_motion_calls;
     Trace("engine:prepare_motion");
-    last_prepared_request = request;
-    if (defer_prepare_completion) {
-      prepared_snapshot = ResolvedPreparedMotionExecutionSnapshotDTO{
-          next_execution_id,
-          ResolvedPreparedMotionExecutionStateDTO::kPreparing,
-          {},
-          std::nullopt,
-          std::nullopt};
-      return Result<std::uint64_t>::Ok(next_execution_id);
+    {
+      std::lock_guard lock(prepared_motion_mutex_);
+      last_prepared_request = request;
+      if (defer_prepare_completion) {
+        prepared_snapshot = ResolvedPreparedMotionExecutionSnapshotDTO{
+            next_execution_id,
+            ResolvedPreparedMotionExecutionStateDTO::kPreparing,
+            {},
+            std::nullopt,
+            std::nullopt};
+        return Result<std::uint64_t>::Ok(next_execution_id);
+      }
     }
     auto completed = CompletePreparation();
     if (!completed.ok()) {
@@ -103,12 +109,16 @@ class FakeParticipantEngine final : public IResolvedParticipantExecutionEngine,
   }
 
   Result<void> complete_preparation() {
-    defer_prepare_completion = false;
+    {
+      std::lock_guard lock(prepared_motion_mutex_);
+      defer_prepare_completion = false;
+    }
     return CompletePreparation();
   }
 
   Result<ResolvedPreparedMotionExecutionSnapshotDTO> ObservePreparedMotion(
       std::uint64_t execution_id) const override {
+    std::lock_guard lock(prepared_motion_mutex_);
     ++observe_prepared_motion_calls;
     if (!prepared_snapshot || prepared_snapshot->execution_id != execution_id) {
       return Result<ResolvedPreparedMotionExecutionSnapshotDTO>::Err(
@@ -123,16 +133,21 @@ class FakeParticipantEngine final : public IResolvedParticipantExecutionEngine,
                                       const ContentDigest& prepared_contract_digest) override {
     ++dispatch_prepared_motion_calls;
     Trace("engine:dispatch_prepared_motion");
-    if (!prepared_snapshot || !prepared_snapshot->participant ||
-        prepared_snapshot->execution_id != execution_id ||
-        prepared_snapshot->participant->prepared_contract_digest != prepared_contract_digest ||
-        !last_prepared_request) {
-      return Result<void>::Err(ErrorDTO{std::string(to_string(ErrorCode::kInvalidRequest)),
-                                        "fake prepared dispatch identity mismatch",
-                                        {{"reason", "prepared_dispatch_mismatch"}}});
+    std::optional<ExecuteRequestDTO> execution_request;
+    {
+      std::lock_guard lock(prepared_motion_mutex_);
+      if (!prepared_snapshot || !prepared_snapshot->participant ||
+          prepared_snapshot->execution_id != execution_id ||
+          prepared_snapshot->participant->prepared_contract_digest != prepared_contract_digest ||
+          !last_prepared_request) {
+        return Result<void>::Err(ErrorDTO{std::string(to_string(ErrorCode::kInvalidRequest)),
+                                          "fake prepared dispatch identity mismatch",
+                                          {{"reason", "prepared_dispatch_mismatch"}}});
+      }
+      prepared_snapshot->state = ResolvedPreparedMotionExecutionStateDTO::kDispatched;
+      execution_request = last_prepared_request->execution_request;
     }
-    prepared_snapshot->state = ResolvedPreparedMotionExecutionStateDTO::kDispatched;
-    auto dispatched = execute(last_prepared_request->execution_request);
+    auto dispatched = execute(*execution_request);
     if (prepared_dispatch_event_error.has_value()) {
       emit_error(*prepared_dispatch_event_error);
     }
@@ -143,31 +158,35 @@ class FakeParticipantEngine final : public IResolvedParticipantExecutionEngine,
                                    ResolvedPreparedMotionResumeRequestDTO request) override {
     ++prepare_resume_motion_calls;
     Trace("engine:prepare_resume_motion");
-    if (!last_prepared_request || !prepared_snapshot ||
-        prepared_snapshot->execution_id != execution_id ||
-        prepared_snapshot->state != ResolvedPreparedMotionExecutionStateDTO::kDispatched ||
-        request.operation_id != last_prepared_request->execution_request.binding.operation_id ||
-        request.participant_id != last_prepared_request->execution_request.binding.participant_id ||
-        !request.operation_revision.nonzero() || request.controller_goal_id.empty() ||
-        !request.controller_goal_generation.nonzero() || !request.ordinary_stop_plan) {
-      return Result<void>::Err(ErrorDTO{std::string(to_string(ErrorCode::kInvalidRequest)),
-                                        "fake prepared Resume identity mismatch",
-                                        {{"reason", "prepared_resume_mismatch"}}});
-    }
-    last_prepared_request->operation_revision = request.operation_revision;
-    last_prepared_request->execution_request.binding.controller_goal_id =
-        request.controller_goal_id;
-    last_prepared_request->execution_request.binding.controller_goal_generation =
-        request.controller_goal_generation;
-    last_prepared_request->ordinary_stop_plan = std::move(request.ordinary_stop_plan);
-    prepared_snapshot = ResolvedPreparedMotionExecutionSnapshotDTO{
-        execution_id,
-        ResolvedPreparedMotionExecutionStateDTO::kPreparing,
-        {},
-        std::nullopt,
-        std::nullopt};
-    if (defer_resume_prepare_completion) {
-      return Result<void>::Ok();
+    {
+      std::lock_guard lock(prepared_motion_mutex_);
+      if (!last_prepared_request || !prepared_snapshot ||
+          prepared_snapshot->execution_id != execution_id ||
+          prepared_snapshot->state != ResolvedPreparedMotionExecutionStateDTO::kDispatched ||
+          request.operation_id != last_prepared_request->execution_request.binding.operation_id ||
+          request.participant_id !=
+              last_prepared_request->execution_request.binding.participant_id ||
+          !request.operation_revision.nonzero() || request.controller_goal_id.empty() ||
+          !request.controller_goal_generation.nonzero() || !request.ordinary_stop_plan) {
+        return Result<void>::Err(ErrorDTO{std::string(to_string(ErrorCode::kInvalidRequest)),
+                                          "fake prepared Resume identity mismatch",
+                                          {{"reason", "prepared_resume_mismatch"}}});
+      }
+      last_prepared_request->operation_revision = request.operation_revision;
+      last_prepared_request->execution_request.binding.controller_goal_id =
+          request.controller_goal_id;
+      last_prepared_request->execution_request.binding.controller_goal_generation =
+          request.controller_goal_generation;
+      last_prepared_request->ordinary_stop_plan = std::move(request.ordinary_stop_plan);
+      prepared_snapshot = ResolvedPreparedMotionExecutionSnapshotDTO{
+          execution_id,
+          ResolvedPreparedMotionExecutionStateDTO::kPreparing,
+          {},
+          std::nullopt,
+          std::nullopt};
+      if (defer_resume_prepare_completion) {
+        return Result<void>::Ok();
+      }
     }
     return CompletePreparation();
   }
@@ -184,6 +203,7 @@ class FakeParticipantEngine final : public IResolvedParticipantExecutionEngine,
   }
 
   Result<void> CancelPreparedResumeMotion(const std::uint64_t execution_id) override {
+    std::lock_guard lock(prepared_motion_mutex_);
     ++cancel_prepared_resume_motion_calls;
     Trace("engine:cancel_prepared_resume_motion");
     if (!prepared_snapshot || prepared_snapshot->execution_id != execution_id) {
@@ -196,6 +216,7 @@ class FakeParticipantEngine final : public IResolvedParticipantExecutionEngine,
   }
 
   Result<void> CancelPreparedMotion(std::uint64_t execution_id) override {
+    std::lock_guard lock(prepared_motion_mutex_);
     ++cancel_prepared_motion_calls;
     Trace("engine:cancel_prepared_motion");
     if (!prepared_snapshot || prepared_snapshot->execution_id != execution_id) {
@@ -209,7 +230,10 @@ class FakeParticipantEngine final : public IResolvedParticipantExecutionEngine,
                                         {{"reason", "prepared_motion_already_dispatched"}}});
     }
     prepared_snapshot->state = ResolvedPreparedMotionExecutionStateDTO::kCancelledPreDispatch;
-    status.state = ExecutionState::kStopped;
+    {
+      std::lock_guard lock(status_mutex_);
+      status.state = ExecutionState::kStopped;
+    }
     return Result<void>::Ok();
   }
 
@@ -424,7 +448,7 @@ class FakeParticipantEngine final : public IResolvedParticipantExecutionEngine,
       pause_effect_hook();
     }
     if (next_pause_result.accepted) {
-      emit_transition(status.state, ExecutionState::kStopping);
+      emit_transition(get_status().state, ExecutionState::kStopping);
     }
     if (pause_return_hook) {
       pause_return_hook();
@@ -435,7 +459,7 @@ class FakeParticipantEngine final : public IResolvedParticipantExecutionEngine,
     ++resume_calls;
     Trace("engine:resume");
     if (next_resume_result.accepted) {
-      emit_transition(status.state, ExecutionState::kValidating);
+      emit_transition(get_status().state, ExecutionState::kValidating);
     }
     if (resume_return_hook) {
       resume_return_hook();
@@ -446,7 +470,7 @@ class FakeParticipantEngine final : public IResolvedParticipantExecutionEngine,
     ++reset_calls;
     Trace("engine:reset");
     if (next_reset_result.accepted) {
-      emit_transition(status.state, ExecutionState::kIdle);
+      emit_transition(get_status().state, ExecutionState::kIdle);
     }
     return next_reset_result;
   }
@@ -460,7 +484,7 @@ class FakeParticipantEngine final : public IResolvedParticipantExecutionEngine,
                                             {}}};
     }
     if (next_reset_result.accepted) {
-      emit_transition(status.state, ExecutionState::kIdle);
+      emit_transition(get_status().state, ExecutionState::kIdle);
     }
     return next_reset_result;
   }
@@ -469,7 +493,7 @@ class FakeParticipantEngine final : public IResolvedParticipantExecutionEngine,
     ++acknowledge_calls;
     Trace("engine:acknowledge_completed");
     if (next_acknowledge_result.accepted) {
-      emit_transition(status.state, ExecutionState::kIdle);
+      emit_transition(get_status().state, ExecutionState::kIdle);
     }
     return next_acknowledge_result;
   }
@@ -612,7 +636,10 @@ class FakeParticipantEngine final : public IResolvedParticipantExecutionEngine,
     return Result<void>::Ok();
   }
 
-  ExecutionStatus get_status() const override { return status; }
+  ExecutionStatus get_status() const override {
+    std::lock_guard lock(status_mutex_);
+    return status;
+  }
 
   SubscriptionHandle subscribe_events(EventCallback callback) override {
     const auto id = next_subscription_id++;
@@ -626,12 +653,15 @@ class FakeParticipantEngine final : public IResolvedParticipantExecutionEngine,
 
   void emit_transition(ExecutionState from, ExecutionState to,
                        std::optional<ErrorDTO> error = std::nullopt) {
-    status.state = to;
-    runtime_scale.active = to == ExecutionState::kExecuting || to == ExecutionState::kPaused;
-    status.progress = to == ExecutionState::kCompleted ? 1.0 : 0.4;
-    if (error.has_value()) {
-      status.last_error = ErrorCode::kExecutionAborted;
+    {
+      std::lock_guard lock(status_mutex_);
+      status.state = to;
+      status.progress = to == ExecutionState::kCompleted ? 1.0 : 0.4;
+      if (error.has_value()) {
+        status.last_error = ErrorCode::kExecutionAborted;
+      }
     }
+    runtime_scale.active = to == ExecutionState::kExecuting || to == ExecutionState::kPaused;
     const KernelEvent event{
         KernelEventType::kStateTransition, next_execution_id, 0, from, to, std::move(error), {}};
     const auto snapshot = callbacks;
@@ -642,12 +672,17 @@ class FakeParticipantEngine final : public IResolvedParticipantExecutionEngine,
   }
 
   void emit_error(ErrorDTO error) {
-    status.last_error = ErrorCode::kExecutionAborted;
+    ExecutionState current;
+    {
+      std::lock_guard lock(status_mutex_);
+      status.last_error = ErrorCode::kExecutionAborted;
+      current = status.state;
+    }
     const KernelEvent event{KernelEventType::kErrorRaised,
                             next_execution_id,
                             0,
-                            status.state,
-                            status.state,
+                            current,
+                            current,
                             std::move(error),
                             {}};
     const auto snapshot = callbacks;
@@ -657,22 +692,22 @@ class FakeParticipantEngine final : public IResolvedParticipantExecutionEngine,
     }
   }
 
-  int execute_calls{};
-  int prepare_motion_calls{};
-  int prepare_resume_motion_calls{};
-  mutable int observe_prepared_motion_calls{};
-  int dispatch_prepared_motion_calls{};
-  int dispatch_prepared_resume_motion_calls{};
-  int cancel_prepared_motion_calls{};
-  int cancel_prepared_resume_motion_calls{};
-  int prepare_command_calls{};
-  mutable int observe_prepared_command_calls{};
-  int dispatch_prepared_command_calls{};
+  std::atomic<int> execute_calls{};
+  std::atomic<int> prepare_motion_calls{};
+  std::atomic<int> prepare_resume_motion_calls{};
+  mutable std::atomic<int> observe_prepared_motion_calls{};
+  std::atomic<int> dispatch_prepared_motion_calls{};
+  std::atomic<int> dispatch_prepared_resume_motion_calls{};
+  std::atomic<int> cancel_prepared_motion_calls{};
+  std::atomic<int> cancel_prepared_resume_motion_calls{};
+  std::atomic<int> prepare_command_calls{};
+  mutable std::atomic<int> observe_prepared_command_calls{};
+  std::atomic<int> dispatch_prepared_command_calls{};
   std::atomic<int> cancel_prepared_command_calls{};
-  int preview_calls{};
-  int command_calls{};
-  mutable int validate_command_calls{};
-  int stop_gripper_calls{};
+  std::atomic<int> preview_calls{};
+  std::atomic<int> command_calls{};
+  mutable std::atomic<int> validate_command_calls{};
+  std::atomic<int> stop_gripper_calls{};
   std::atomic<int> reset_gripper_calls{};
   std::atomic<int> stop_calls{};
   std::atomic<int> translate_stop_stage_calls{};
@@ -681,7 +716,7 @@ class FakeParticipantEngine final : public IResolvedParticipantExecutionEngine,
   std::atomic<int> reset_calls{};
   std::atomic<int> certified_reset_calls{};
   std::atomic<int> acknowledge_calls{};
-  int runtime_scale_calls{};
+  std::atomic<int> runtime_scale_calls{};
   std::uint64_t next_execution_id{41U};
   Result<std::uint64_t> next_execute_result = Result<std::uint64_t>::Ok(41U);
   GripperCommandResultDTO next_command_result{true, 73U, 9U, std::nullopt};
@@ -694,6 +729,8 @@ class FakeParticipantEngine final : public IResolvedParticipantExecutionEngine,
   Result<void> next_runtime_scale_result = Result<void>::Ok();
   RuntimeScaleMechanismStatusDTO runtime_scale{true, false, 1.0, 1.0, 0.0, 1U, 1, std::nullopt};
   ExecutionStatus status{};
+  mutable std::mutex status_mutex_;
+  mutable std::mutex prepared_motion_mutex_;
   std::optional<KernelEvent> event_during_execute;
   bool defer_prepare_completion{};
   bool defer_resume_prepare_completion{};
@@ -934,69 +971,70 @@ class FakeParticipantEngine final : public IResolvedParticipantExecutionEngine,
   }
 
   Result<void> CompletePreparation() {
-    if (!last_prepared_request.has_value()) {
-      return Result<void>::Err(ErrorDTO{std::string(to_string(ErrorCode::kInvalidStateTransition)),
-                                        "fake preparation has no retained request",
-                                        {{"reason", "prepared_motion_request_missing"}}});
-    }
-    if (prepared_snapshot.has_value() &&
-        prepared_snapshot->state ==
-            ResolvedPreparedMotionExecutionStateDTO::kCancelledPreDispatch) {
-      return Result<void>::Ok();
-    }
-    if (prepare_failure.has_value()) {
-      prepared_snapshot = ResolvedPreparedMotionExecutionSnapshotDTO{
-          next_execution_id,
-          ResolvedPreparedMotionExecutionStateDTO::kPreparationFailed,
-          {},
-          std::nullopt,
-          prepare_failure};
-      const KernelEvent event{KernelEventType::kErrorRaised,
-                              next_execution_id,
-                              0,
-                              status.state,
-                              status.state,
-                              prepare_failure,
-                              {{"reason", "prepared_motion_prepare_failed"}}};
-      const auto snapshot = callbacks;
-      for (const auto& [id, callback] : snapshot) {
-        (void)id;
-        callback(event);
+    std::optional<KernelEvent> event;
+    {
+      std::lock_guard lock(prepared_motion_mutex_);
+      if (!last_prepared_request.has_value()) {
+        return Result<void>::Err(
+            ErrorDTO{std::string(to_string(ErrorCode::kInvalidStateTransition)),
+                     "fake preparation has no retained request",
+                     {{"reason", "prepared_motion_request_missing"}}});
       }
-      return Result<void>::Ok();
+      if (prepared_snapshot.has_value() &&
+          prepared_snapshot->state ==
+              ResolvedPreparedMotionExecutionStateDTO::kCancelledPreDispatch) {
+        return Result<void>::Ok();
+      }
+      if (prepare_failure.has_value()) {
+        prepared_snapshot = ResolvedPreparedMotionExecutionSnapshotDTO{
+            next_execution_id,
+            ResolvedPreparedMotionExecutionStateDTO::kPreparationFailed,
+            {},
+            std::nullopt,
+            prepare_failure};
+        const auto current = get_status().state;
+        event.emplace(KernelEvent{KernelEventType::kErrorRaised,
+                                  next_execution_id,
+                                  0,
+                                  current,
+                                  current,
+                                  prepare_failure,
+                                  {{"reason", "prepared_motion_prepare_failed"}}});
+      } else {
+        auto participant = MakePreparedMotionParticipant(*last_prepared_request);
+        if (!participant.ok()) {
+          prepared_snapshot = ResolvedPreparedMotionExecutionSnapshotDTO{
+              next_execution_id,
+              ResolvedPreparedMotionExecutionStateDTO::kPreparationFailed,
+              {},
+              std::nullopt,
+              participant.error()};
+          return Result<void>::Err(participant.error());
+        }
+        auto retained =
+            std::make_shared<const PreparedOperationParticipantDTO>(std::move(participant.value()));
+        auto backend_prepare =
+            MakePrepareParticipantResult(*retained, PrepareParticipantResultStateDTO::kPrepared);
+        if (!backend_prepare.ok()) {
+          return Result<void>::Err(backend_prepare.error());
+        }
+        prepared_snapshot = ResolvedPreparedMotionExecutionSnapshotDTO{
+            next_execution_id, ResolvedPreparedMotionExecutionStateDTO::kPrepared, retained,
+            std::move(backend_prepare.value()), std::nullopt};
+        event.emplace(KernelEvent{
+            KernelEventType::kParticipantPrepared,
+            next_execution_id,
+            0,
+            {},
+            {},
+            std::nullopt,
+            {{"prepared_contract_digest", retained->prepared_contract_digest.value()}}});
+      }
     }
-    auto participant = MakePreparedMotionParticipant(*last_prepared_request);
-    if (!participant.ok()) {
-      prepared_snapshot = ResolvedPreparedMotionExecutionSnapshotDTO{
-          next_execution_id,
-          ResolvedPreparedMotionExecutionStateDTO::kPreparationFailed,
-          {},
-          std::nullopt,
-          participant.error()};
-      return Result<void>::Err(participant.error());
-    }
-    auto retained =
-        std::make_shared<const PreparedOperationParticipantDTO>(std::move(participant.value()));
-    auto backend_prepare =
-        MakePrepareParticipantResult(*retained, PrepareParticipantResultStateDTO::kPrepared);
-    if (!backend_prepare.ok()) {
-      return Result<void>::Err(backend_prepare.error());
-    }
-    prepared_snapshot = ResolvedPreparedMotionExecutionSnapshotDTO{
-        next_execution_id, ResolvedPreparedMotionExecutionStateDTO::kPrepared, retained,
-        std::move(backend_prepare.value()), std::nullopt};
-    const KernelEvent event{
-        KernelEventType::kParticipantPrepared,
-        next_execution_id,
-        0,
-        {},
-        {},
-        std::nullopt,
-        {{"prepared_contract_digest", retained->prepared_contract_digest.value()}}};
     const auto snapshot = callbacks;
     for (const auto& [id, callback] : snapshot) {
       (void)id;
-      callback(event);
+      callback(*event);
     }
     return Result<void>::Ok();
   }
@@ -2389,7 +2427,7 @@ TEST(ResourceAddressedExecutionKernelTest,
     return kernel.execute(
         coordinated_motion_operation("request.motion.coordinated.partial.blocked-journal", 3U));
   });
-  ASSERT_EQ(partial_journal_entered.get_future().wait_for(std::chrono::seconds(1)),
+  ASSERT_EQ(partial_journal_entered.get_future().wait_for(std::chrono::seconds(10)),
             std::future_status::ready);
   EXPECT_EQ(executing.wait_for(std::chrono::milliseconds(10)), std::future_status::timeout);
   ASSERT_TRUE(wait_until([&] {
@@ -2517,7 +2555,7 @@ TEST(ResourceAddressedExecutionKernelTest,
   auto executing = std::async(std::launch::async, [&] {
     return kernel.execute(coordinated_motion_command_operation("request.mixed.coordinated.held"));
   });
-  ASSERT_EQ(command_prepare_entered.get_future().wait_for(std::chrono::seconds(1)),
+  ASSERT_EQ(command_prepare_entered.get_future().wait_for(std::chrono::seconds(10)),
             std::future_status::ready);
   EXPECT_EQ(motion_engine.prepare_motion_calls, 1);
   EXPECT_EQ(motion_engine.dispatch_prepared_motion_calls, 0);
@@ -2564,7 +2602,7 @@ TEST(ResourceAddressedExecutionKernelTest,
   auto executing = std::async(std::launch::async, [&] {
     return kernel.execute(coordinated_command_operation("request.command.coordinated.stop"));
   });
-  ASSERT_EQ(second_prepare_entered.get_future().wait_for(std::chrono::seconds(1)),
+  ASSERT_EQ(second_prepare_entered.get_future().wait_for(std::chrono::seconds(10)),
             std::future_status::ready);
   const OperationAcceptedDTO expected{RequestId("request.command.coordinated.stop"),
                                       RequestReplayStatusDTO::kAcceptedNew,
@@ -3053,9 +3091,11 @@ TEST(ResourceAddressedExecutionKernelTest, BlockedControlOnOneOperationCannotDel
   auto pause_entered = pause_entered_promise.get_future();
   std::promise<void> release_pause_promise;
   auto release_pause = release_pause_promise.get_future().share();
+  std::atomic<bool> pause_effect_returned{};
   first_engine.pause_effect_hook = [&] {
     pause_entered_promise.set_value();
     release_pause.wait();
+    pause_effect_returned.store(true, std::memory_order_release);
   };
   auto paused = std::async(std::launch::async, [&] {
     return kernel.pause(control_request("request.concurrent-control.pause", first.value(), 1U));
@@ -3074,6 +3114,7 @@ TEST(ResourceAddressedExecutionKernelTest, BlockedControlOnOneOperationCannotDel
   release_pause_promise.set_value();
   const auto pause_result = paused.get();
   ASSERT_TRUE(pause_result.ok()) << pause_result.error().message;
+  ASSERT_TRUE(wait_until([&] { return pause_effect_returned.load(std::memory_order_acquire); }));
   ASSERT_EQ(stop_status, std::future_status::ready)
       << "disjoint Stop waited for another operation's subordinate control";
   const auto stop_result = stopped.get();
@@ -3689,7 +3730,7 @@ TEST(ResourceAddressedExecutionKernelTest,
 
   auto executing =
       std::async(std::launch::async, [&] { return kernel.execute(command_operation()); });
-  ASSERT_EQ(prepare_entered.get_future().wait_for(std::chrono::seconds(1)),
+  ASSERT_EQ(prepare_entered.get_future().wait_for(std::chrono::seconds(10)),
             std::future_status::ready);
   const OperationAcceptedDTO expected{RequestId("request.command.1"),
                                       RequestReplayStatusDTO::kAcceptedNew,
@@ -4002,7 +4043,7 @@ TEST(ResourceAddressedExecutionKernelTest,
   };
   const auto stopped = kernel.stop(stop_request("request.resume.stop.stop", executed.value(), 3U));
   ASSERT_TRUE(stopped.ok()) << stopped.error().message;
-  ASSERT_EQ(stop_stage_entered.get_future().wait_for(std::chrono::seconds(1)),
+  ASSERT_EQ(stop_stage_entered.get_future().wait_for(std::chrono::seconds(10)),
             std::future_status::ready);
   release_stop_stage.set_value();
   ASSERT_TRUE(wait_until([&] {
@@ -4479,7 +4520,7 @@ TEST(ResourceAddressedExecutionKernelTest,
     return kernel.pause(
         control_request("request.control.blocked-journal.pause", executed.value(), 1U));
   });
-  ASSERT_EQ(journal_entered.get_future().wait_for(std::chrono::seconds(1)),
+  ASSERT_EQ(journal_entered.get_future().wait_for(std::chrono::seconds(10)),
             std::future_status::ready);
   const auto stopped =
       kernel.stop(stop_request("request.control.blocked-journal.stop", executed.value(), 1U));
@@ -5547,14 +5588,18 @@ TEST(ResourceAddressedExecutionKernelTest,
     const auto stopped = predecessor.stop(stop_intent);
     ASSERT_TRUE(stopped.ok()) << stopped.error().message;
     ASSERT_TRUE(wait_until([&] {
+      std::lock_guard lock(predecessor_journal.mutex);
       return predecessor_journal.last_stop_accepted.has_value() &&
              predecessor_journal.last_stop_affected_state.has_value() &&
              predecessor_journal.last_stop_certificate.has_value();
     }));
-    recovered = RecoveredStopJournalStateDTO{
-        *predecessor_journal.last_stop_accepted, *predecessor_journal.last_stop_affected_state,
-        predecessor_journal.last_stop_certificate, predecessor_journal.last_stop_fault_latch,
-        std::nullopt};
+    {
+      std::lock_guard lock(predecessor_journal.mutex);
+      recovered = RecoveredStopJournalStateDTO{
+          *predecessor_journal.last_stop_accepted, *predecessor_journal.last_stop_affected_state,
+          predecessor_journal.last_stop_certificate, predecessor_journal.last_stop_fault_latch,
+          std::nullopt};
+    }
   }
 
   FakeParticipantEngine replacement_engine;

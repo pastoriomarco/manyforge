@@ -1,10 +1,10 @@
 #pragma once
 
-#include <atomic>
 #include <manyforge_core/ports/iexternal_observed_state_receiver.hpp>
 #include <manyforge_core/ports/iobserved_state_provider.hpp>
 #include <memory>
 #include <mutex>
+#include <shared_mutex>
 
 namespace manyforge::core {
 
@@ -44,8 +44,8 @@ class ExternalObservedStateProvider final : public IExternalObservedStateReceive
 
   ExternalObservedStateSourceContractDTO contract_;
   ContentDigest contract_digest_;
-  std::mutex ingress_mutex_;
-  std::atomic<std::shared_ptr<const LatestPublication>> latest_;
+  mutable std::shared_mutex publication_mutex_;
+  std::shared_ptr<const LatestPublication> latest_;
 };
 
 }  // namespace manyforge::core

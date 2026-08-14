@@ -403,7 +403,8 @@ class ResourceAddressedExecutionKernel final : public IAddressedOperationOwner,
       const ResolvedRuntimeScaleStatusDTO& resolved_status);
   void ProgressStop(StopControlWorkToken token) noexcept override;
   void StageAttemptCompleted(StopStageAttemptHandle handle) noexcept override;
-  void OperationControlEffectCompleted(OperationControlEffectHandle handle) noexcept override;
+  void OperationControlEffectCompleted(BoundedOperationControlExecutor& executor,
+                                       OperationControlEffectHandle handle) noexcept override;
   void ProjectStop(StopControlWorkToken token) noexcept;
   void RunStopSurveillance(StopCertificateId certificate_id,
                            std::uint64_t schedule_generation) noexcept;

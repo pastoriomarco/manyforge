@@ -240,23 +240,27 @@ class FakeEngine final : public IResolvedParticipantExecutionEngine,
 class Receiver final : public IOperationControlEffectCompletionReceiver {
  public:
   void OperationControlEffectCompleted(
+      BoundedOperationControlExecutor& executor,
       const OperationControlEffectHandle handle) noexcept override {
     std::lock_guard lock(mutex_);
-    handles_.push_back(handle);
+    completions_.emplace_back(&executor, handle);
     changed_.notify_all();
   }
 
-  [[nodiscard]] bool Wait(const OperationControlEffectHandle handle) {
+  [[nodiscard]] bool Wait(BoundedOperationControlExecutor& executor,
+                          const OperationControlEffectHandle handle) {
     std::unique_lock lock(mutex_);
     return changed_.wait_for(lock, 1s, [&] {
-      return std::find(handles_.begin(), handles_.end(), handle) != handles_.end();
+      return std::find(completions_.begin(), completions_.end(), std::pair{&executor, handle}) !=
+             completions_.end();
     });
   }
 
  private:
   std::mutex mutex_;
   std::condition_variable changed_;
-  std::vector<OperationControlEffectHandle> handles_;
+  std::vector<std::pair<BoundedOperationControlExecutor*, OperationControlEffectHandle>>
+      completions_;
 };
 
 [[nodiscard]] OperationControlEffectRequest request(
@@ -338,7 +342,7 @@ TEST(BoundedOperationControlExecutorTest, BlockedEngineDoesNotStarveDisjointEngi
   const auto fast = executor.TryStart(request(fast_engine, "operation.b", "participant.b"));
   ASSERT_EQ(fast.status, OperationControlEffectStartStatus::kStarted);
   ASSERT_TRUE(fast.handle.has_value());
-  ASSERT_TRUE(receiver.Wait(*fast.handle));
+  ASSERT_TRUE(receiver.Wait(executor, *fast.handle));
   auto fast_result = WaitForResult(executor, *fast.handle);
   ASSERT_EQ(fast_result.status, OperationControlEffectTakeStatus::kCompleted);
   ASSERT_TRUE(fast_result.result.has_value());
@@ -348,7 +352,7 @@ TEST(BoundedOperationControlExecutorTest, BlockedEngineDoesNotStarveDisjointEngi
   executor.CloseIngress();
   EXPECT_FALSE(executor.DrainFor(10ms));
   blocked_engine.ReleasePause();
-  ASSERT_TRUE(receiver.Wait(*blocked.handle));
+  ASSERT_TRUE(receiver.Wait(executor, *blocked.handle));
   EXPECT_EQ(WaitForResult(executor, *blocked.handle).status,
             OperationControlEffectTakeStatus::kCompleted);
   EXPECT_EQ(executor.Release(*blocked.handle), OperationControlEffectReleaseStatus::kReleased);
@@ -366,7 +370,7 @@ TEST(BoundedOperationControlExecutorTest, OneEngineLaneIsBusyUntilResultIsTakenA
   EXPECT_EQ(executor.TryStart(request(engine, "operation.b", "participant.b")).status,
             OperationControlEffectStartStatus::kLaneBusy);
   engine.ReleasePause();
-  ASSERT_TRUE(receiver.Wait(*first.handle));
+  ASSERT_TRUE(receiver.Wait(executor, *first.handle));
   EXPECT_EQ(WaitForResult(executor, *first.handle).status,
             OperationControlEffectTakeStatus::kCompleted);
   EXPECT_EQ(executor.Release(*first.handle), OperationControlEffectReleaseStatus::kReleased);
@@ -393,7 +397,7 @@ TEST(BoundedOperationControlExecutorTest, ThrowingEffectRetainsExactFailureIdent
   BoundedOperationControlExecutor executor({&engine}, receiver);
   const auto started = executor.TryStart(request(engine, "operation.throw", "participant.throw"));
   ASSERT_TRUE(started.handle.has_value());
-  ASSERT_TRUE(receiver.Wait(*started.handle));
+  ASSERT_TRUE(receiver.Wait(executor, *started.handle));
   auto result = WaitForResult(executor, *started.handle);
   ASSERT_EQ(result.status, OperationControlEffectTakeStatus::kInfrastructureFailure);
   ASSERT_TRUE(result.result.has_value());
@@ -419,7 +423,7 @@ TEST(BoundedOperationControlExecutorTest,
   ASSERT_TRUE(engine.WaitForPrepareResume());
   cancellation_requested->store(true, std::memory_order_release);
   engine.ReleasePrepareResume();
-  ASSERT_TRUE(receiver.Wait(*started.handle));
+  ASSERT_TRUE(receiver.Wait(executor, *started.handle));
   const auto result = WaitForResult(executor, *started.handle);
   ASSERT_EQ(result.status, OperationControlEffectTakeStatus::kCompleted);
   ASSERT_TRUE(result.result.has_value());
@@ -446,7 +450,7 @@ TEST(BoundedOperationControlExecutorTest,
   const auto motion = executor.TryStart(
       request(engine, "operation.motion", "participant.motion", OperationControlKind::kReset, 77U));
   ASSERT_TRUE(motion.handle.has_value());
-  ASSERT_TRUE(receiver.Wait(*motion.handle));
+  ASSERT_TRUE(receiver.Wait(executor, *motion.handle));
   const auto motion_result = WaitForResult(executor, *motion.handle);
   ASSERT_EQ(motion_result.status, OperationControlEffectTakeStatus::kCompleted);
   ASSERT_TRUE(motion_result.result.has_value());
@@ -468,7 +472,7 @@ TEST(BoundedOperationControlExecutorTest,
                                     {},
                                     {}});
   ASSERT_TRUE(command.handle.has_value());
-  ASSERT_TRUE(receiver.Wait(*command.handle));
+  ASSERT_TRUE(receiver.Wait(executor, *command.handle));
   const auto command_result = WaitForResult(executor, *command.handle);
   ASSERT_EQ(command_result.status, OperationControlEffectTakeStatus::kCompleted);
   ASSERT_TRUE(command_result.result.has_value());
