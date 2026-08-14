@@ -156,7 +156,6 @@ class FakeParticipantEngine final : public IResolvedParticipantExecutionEngine,
 
   Result<void> PrepareResumeMotion(const std::uint64_t execution_id,
                                    ResolvedPreparedMotionResumeRequestDTO request) override {
-    ++prepare_resume_motion_calls;
     Trace("engine:prepare_resume_motion");
     {
       std::lock_guard lock(prepared_motion_mutex_);
@@ -184,6 +183,10 @@ class FakeParticipantEngine final : public IResolvedParticipantExecutionEngine,
           {},
           std::nullopt,
           std::nullopt};
+      // Publish call admission only after the retained preparation state is
+      // complete. Tests that release a deferred preparation use this counter
+      // as the cross-thread ownership handoff.
+      ++prepare_resume_motion_calls;
       if (defer_resume_prepare_completion) {
         return Result<void>::Ok();
       }
