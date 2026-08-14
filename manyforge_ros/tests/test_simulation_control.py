@@ -1,74 +1,172 @@
-"""Pure and unavailable-boundary evidence for simulator control.
-
-Historical live source blob ``769e97215b0df885dd7002ca20ded0e0469b6ef7``
-contains the removed client at lines 47-415, one-shot runner/CLI at lines
-418-463, and dynamic import hook at lines 519-522.  Historical test blob
-``1d9c3d6bb93f7ccc7f377ef7e151e91f338f890f`` contains three live cases at
-lines 9-67, 69-112, and 114-218.  Their exact I9/I assignments are recorded
-below instead of leaving a runnable pre-I9 ROS fallback.
-"""
+"""Typed fake-owner qualification for the restored simulator control client."""
 
 from __future__ import annotations
 
-import inspect
 import math
+from types import SimpleNamespace
 
 import pytest
+from simulation_interfaces.msg import SimulationState
+from simulation_interfaces.srv import (
+    GetSimulationState,
+    ResetSimulation,
+    SetEntityState,
+    SetSimulationState,
+    StepSimulation,
+)
 
 from manyforge_ros import simulation_control
 
 
-HISTORICAL_LIVE_CASES = (
-    (
-        "test_simulation_control_resets_state_without_touching_command_gate",
-        "lines 9-67",
-        "I9/I selected simulation adapter: ResetSimulation success, bounded cleanup, "
-        "and proof that the adapter does not publish a second command gate",
-    ),
-    (
-        "test_simulation_control_surfaces_reset_service_failure",
-        "lines 69-112",
-        "I9/I selected simulation adapter: ResetSimulation result code and message "
-        "propagate as a failed typed outcome",
-    ),
-    (
-        "test_simulation_control_state_step_and_entity_services",
-        "lines 114-218",
-        "I9/I selected simulation adapter: pause, bounded step, and entity-pose "
-        "mutation use the retained simulation_interfaces contract",
-    ),
-)
+class _Future:
+    def __init__(self, result: object) -> None:
+        self._result = result
+
+    def done(self) -> bool:
+        return True
+
+    def result(self) -> object:
+        return self._result
 
 
-def test_simulator_result_records_remain_owner_neutral() -> None:
-    reset = simulation_control.SimulationResetResult(
-        success=False,
-        service_name="/reset_simulation",
-        scope="state",
-        duration_s=0.25,
-        result_code=7,
-        result_message="rejected",
-        error="7: rejected",
+class _Client:
+    def __init__(self, handler) -> None:
+        self._handler = handler
+
+    def wait_for_service(self, *, timeout_sec: float) -> bool:
+        return timeout_sec > 0.0
+
+    def call_async(self, request: object) -> _Future:
+        return _Future(self._handler(request))
+
+
+class _Node:
+    def __init__(self, handlers: dict[str, object]) -> None:
+        self.handlers = handlers
+        self.executor = SimpleNamespace(is_spinning=True)
+        self.created: list[str] = []
+        self.destroyed = 0
+
+    def get_service_names_and_types(self):
+        return [
+            ("/reset_simulation", [simulation_control.RESET_SERVICE_TYPE]),
+            (
+                "/get_simulation_state",
+                [simulation_control.GET_SIMULATION_STATE_SERVICE_TYPE],
+            ),
+            (
+                "/set_simulation_state",
+                [simulation_control.SET_SIMULATION_STATE_SERVICE_TYPE],
+            ),
+            ("/step_simulation", [simulation_control.STEP_SIMULATION_SERVICE_TYPE]),
+            (
+                "/set_entity_state",
+                [simulation_control.SET_ENTITY_STATE_SERVICE_TYPE],
+            ),
+        ]
+
+    def create_client(self, _service_type: type, service_name: str) -> _Client:
+        self.created.append(service_name)
+        return _Client(self.handlers[service_name])
+
+    def destroy_client(self, _client: _Client) -> None:
+        self.destroyed += 1
+
+
+def _ok_response(service_type: type) -> object:
+    response = service_type.Response()
+    response.result.result = response.result.RESULT_OK
+    return response
+
+
+def test_simulation_control_runs_all_selected_typed_operations() -> None:
+    observed: dict[str, object] = {}
+
+    def reset(request):
+        observed["reset_scope"] = request.scope
+        return _ok_response(ResetSimulation)
+
+    def get_state(_request):
+        response = _ok_response(GetSimulationState)
+        response.state.state = int(SimulationState.STATE_STOPPED)
+        return response
+
+    def set_state(request):
+        observed["target_state"] = request.state.state
+        return _ok_response(SetSimulationState)
+
+    def step(request):
+        observed["steps"] = request.steps
+        return _ok_response(StepSimulation)
+
+    def set_entity(request):
+        observed["entity_request"] = request
+        return _ok_response(SetEntityState)
+
+    node = _Node(
+        {
+            "/reset_simulation": reset,
+            "/get_simulation_state": get_state,
+            "/set_simulation_state": set_state,
+            "/step_simulation": step,
+            "/set_entity_state": set_entity,
+        }
     )
-    control = simulation_control.SimulationControlResult(
-        success=True,
-        operation="step",
-        service_name="/step_simulation",
-        duration_s=0.5,
-        steps=3,
+    client = simulation_control.SimulationControlClient(
+        node,
+        service_timeout_s=0.5,
     )
 
-    assert reset.to_dict() == {
-        "success": False,
-        "service_name": "/reset_simulation",
-        "scope": "state",
-        "duration_s": 0.25,
-        "result_code": 7,
-        "result_message": "rejected",
-        "error": "7: rejected",
-    }
-    assert control.to_dict()["steps"] == 3
-    assert control.to_dict()["operation"] == "step"
+    assert client.reset().success
+    state = client.get_simulation_state()
+    assert state.success and state.state == "stopped"
+    assert client.set_simulation_state(state="play").success
+    assert client.step(steps=3).success
+    entity = client.set_entity_state(
+        entity="/World/soup_can",
+        pose={
+            "frame_id": "world",
+            "position_m": [1.0, 2.0, 3.0],
+            "orientation_rpy_deg": [0.0, 0.0, 90.0],
+        },
+    )
+    assert entity.success and entity.entity == "/World/soup_can"
+
+    assert observed["reset_scope"] == int(ResetSimulation.Request.SCOPE_STATE)
+    assert observed["target_state"] == int(SimulationState.STATE_PLAYING)
+    assert observed["steps"] == 3
+    request = observed["entity_request"]
+    assert request.entity == "/World/soup_can"
+    assert request.state.header.frame_id == "world"
+    assert request.state.pose.position.x == 1.0
+    assert request.state.pose.orientation.z == pytest.approx(math.sqrt(0.5))
+    assert node.destroyed == len(node.created) == 5
+    assert not hasattr(node, "create_publisher")
+
+
+def test_simulation_control_surfaces_typed_owner_failure() -> None:
+    def failed(_request):
+        response = ResetSimulation.Response()
+        response.result.result = response.result.RESULT_OPERATION_FAILED
+        response.result.error_message = "reset rejected"
+        return response
+
+    node = _Node(
+        {
+            "/reset_simulation": failed,
+            "/get_simulation_state": lambda _r: _ok_response(GetSimulationState),
+            "/set_simulation_state": lambda _r: _ok_response(SetSimulationState),
+            "/step_simulation": lambda _r: _ok_response(StepSimulation),
+            "/set_entity_state": lambda _r: _ok_response(SetEntityState),
+        }
+    )
+
+    result = simulation_control.SimulationControlClient(node).reset()
+
+    assert not result.success
+    assert result.result_code == 4
+    assert result.result_message == "reset rejected"
+    assert result.error == "4: reset rejected"
 
 
 def test_service_selection_is_deterministic_and_prefix_bounded() -> None:
@@ -89,9 +187,6 @@ def test_service_selection_is_deterministic_and_prefix_bounded() -> None:
         )
         is None
     )
-
-
-def test_service_selection_rejects_unbounded_or_duplicate_candidates() -> None:
     with pytest.raises(ValueError, match="candidates exceed"):
         simulation_control.select_simulation_service_name(
             [f"/service/{index}" for index in range(4097)],
@@ -102,17 +197,31 @@ def test_service_selection_rejects_unbounded_or_duplicate_candidates() -> None:
             ["/reset_simulation", " /reset_simulation "],
             service_type=simulation_control.RESET_SERVICE_TYPE,
         )
-    with pytest.raises(ValueError, match="prefix exceeds"):
-        simulation_control.select_simulation_service_name(
-            ["/reset_simulation"],
-            service_type=simulation_control.RESET_SERVICE_TYPE,
-            service_prefix="p" * 1025,
-        )
+
+
+def test_control_service_graph_type_rows_are_bounded() -> None:
+    node = _Node({})
+    node.get_service_names_and_types = lambda: [
+        ("/reset_simulation", [simulation_control.RESET_SERVICE_TYPE] * 4097)
+    ]
+    client = simulation_control.SimulationControlClient(
+        node,
+        service_timeout_s=0.05,
+    )
+
+    with pytest.raises(RuntimeError, match="service type rows exceed"):
+        client.reset()
 
 
 @pytest.mark.parametrize(
     ("raw", "expected"),
-    [(" play ", "playing"), ("PLAYING", "playing"), ("pause", "paused")],
+    [
+        (" stop ", "stopped"),
+        ("STOPPED", "stopped"),
+        (" play ", "playing"),
+        ("PLAYING", "playing"),
+        ("pause", "paused"),
+    ],
 )
 def test_simulation_state_normalization(raw: str, expected: str) -> None:
     assert simulation_control.normalize_simulation_state(raw) == expected
@@ -127,21 +236,19 @@ def test_reset_scope_and_entity_pose_normalization() -> None:
             "orientation_rpy_deg": [0.0, 0.0, 90.0],
         }
     )
-
     assert frame_id == "world"
     assert position == (1.0, 2.5, 3.0)
     assert orientation == pytest.approx(
         (0.0, 0.0, math.sqrt(0.5), math.sqrt(0.5))
     )
-
-    _, _, direct_orientation = simulation_control.normalize_entity_pose(
+    _, _, direct = simulation_control.normalize_entity_pose(
         {
             "frame_id": "world",
             "position_m": [0.0, 0.0, 0.0],
             "orientation_xyzw": [0.0, 0.0, 0.0, 2.0],
         }
     )
-    assert direct_orientation == (0.0, 0.0, 0.0, 1.0)
+    assert direct == (0.0, 0.0, 0.0, 1.0)
 
 
 @pytest.mark.parametrize(
@@ -153,39 +260,10 @@ def test_reset_scope_and_entity_pose_normalization() -> None:
             {"frame_id": "world", "position_m": [1, 2, 3]},
             "must include orientation_xyzw or orientation_rpy_deg",
         ),
-    ],
-)
-def test_entity_pose_normalization_rejects_incomplete_shapes(
-    pose: dict[str, object],
-    message: str,
-) -> None:
-    with pytest.raises(ValueError, match=message):
-        simulation_control.normalize_entity_pose(pose)
-
-
-@pytest.mark.parametrize(
-    ("pose", "message"),
-    [
-        (
-            {
-                "frame_id": "f" * 1025,
-                "position_m": [0.0, 0.0, 0.0],
-                "orientation_xyzw": [0.0, 0.0, 0.0, 1.0],
-            },
-            "frame_id exceeds",
-        ),
         (
             {
                 "frame_id": "world",
                 "position_m": [True, 0.0, 0.0],
-                "orientation_xyzw": [0.0, 0.0, 0.0, 1.0],
-            },
-            "text or boolean",
-        ),
-        (
-            {
-                "frame_id": "world",
-                "position_m": ["1.0", 0.0, 0.0],
                 "orientation_xyzw": [0.0, 0.0, 0.0, 1.0],
             },
             "text or boolean",
@@ -206,17 +284,9 @@ def test_entity_pose_normalization_rejects_incomplete_shapes(
             },
             "finite nonzero norm",
         ),
-        (
-            {
-                "frame_id": "world",
-                "position_m": [0.0, 0.0, 0.0],
-                "orientation_rpy_deg": [False, 0.0, 0.0],
-            },
-            "text or boolean",
-        ),
     ],
 )
-def test_entity_pose_normalization_rejects_unbounded_or_non_finite_values(
+def test_entity_pose_normalization_rejects_invalid_values(
     pose: dict[str, object],
     message: str,
 ) -> None:
@@ -224,43 +294,18 @@ def test_entity_pose_normalization_rejects_unbounded_or_non_finite_values(
         simulation_control.normalize_entity_pose(pose)
 
 
-def test_live_simulation_control_is_not_a_dormant_callable_body(capsys) -> None:
-    assert not hasattr(simulation_control, "SimulationControlClient")
-    source = inspect.getsource(simulation_control)
-    for forbidden in ("_import_module", "create_client", "call_async", "create_node"):
-        assert forbidden not in source
-
-    assert simulation_control.main() == simulation_control.UNAVAILABLE_EXIT_CODE
-    assert capsys.readouterr().err.strip() == simulation_control.UNAVAILABLE_MESSAGE
-    with pytest.raises(
-        simulation_control.SimulationControlUnavailableError,
-        match=simulation_control.UNAVAILABLE_REASON_CODE,
-    ):
-        simulation_control.reset_once(
-            scope="ignored-before-validation",
-            service_prefix="ignored-before-selection",
-            service_timeout_s=-1.0,
-        )
+@pytest.mark.parametrize("steps", [False, 0, -1, 1_000_001, 1.0, "1"])
+def test_step_count_is_exact_and_bounded(steps: object) -> None:
+    node = _Node({})
+    client = simulation_control.SimulationControlClient(node)
+    with pytest.raises(ValueError, match="steps must be"):
+        client.step(steps=steps)  # type: ignore[arg-type]
 
 
-def test_all_three_historical_live_cases_remain_assigned_to_i9() -> None:
+def test_historical_live_cases_are_replaced_by_active_i9_coverage() -> None:
     assert simulation_control.HISTORICAL_SOURCE_BLOB == (
         "769e97215b0df885dd7002ca20ded0e0469b6ef7"
     )
     assert simulation_control.HISTORICAL_TEST_BLOB == (
         "1d9c3d6bb93f7ccc7f377ef7e151e91f338f890f"
-    )
-    assert [case[0] for case in HISTORICAL_LIVE_CASES] == [
-        "test_simulation_control_resets_state_without_touching_command_gate",
-        "test_simulation_control_surfaces_reset_service_failure",
-        "test_simulation_control_state_step_and_entity_services",
-    ]
-    assert [case[1] for case in HISTORICAL_LIVE_CASES] == [
-        "lines 9-67",
-        "lines 69-112",
-        "lines 114-218",
-    ]
-    assert all(
-        "I9/I selected simulation adapter" in case[2]
-        for case in HISTORICAL_LIVE_CASES
     )

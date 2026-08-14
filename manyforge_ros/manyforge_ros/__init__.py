@@ -1,7 +1,7 @@
-"""Retained ROS translations and unavailable runtime boundaries.
+"""Focused ROS translations and selected-owner adapters.
 
-This package currently exposes dependency-independent mappings, DTOs, and
-focused adapter mechanics. Product execution, simulation mutation, live scene
-inspection, and mesh transfer are unavailable until their addressed C++
-owners and selected ROS adapters pass the I6/I8/I9 restoration gates.
+The I9 simulator control and read-only scene clients use standard typed
+``simulation_interfaces`` services without owning simulator or command state.
+Private Isaac inspection/mesh transport and the complete Isaac product lane
+remain unavailable until their separate I9 gates pass.
 """

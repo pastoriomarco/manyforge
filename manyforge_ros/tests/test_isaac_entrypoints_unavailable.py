@@ -1,4 +1,4 @@
-"""Source-level acceptance for pre-I9 Isaac entrypoint fences."""
+"""Keep retired private Isaac wires fenced while selected clients are active."""
 
 from __future__ import annotations
 
@@ -17,42 +17,27 @@ from manyforge_ros import simulation_control
     [
         (inspect_isaac_scene, "InspectIsaacSceneClient"),
         (isaac_mesh_transfer, "IsaacMeshTransferClient"),
-        (scene_mirror_probe, "SimulationSceneMirrorClient"),
-        (simulation_control, "SimulationControlClient"),
     ],
 )
-def test_live_isaac_entrypoints_fail_before_ros_effects(
+def test_retired_private_isaac_entrypoints_stay_fenced(
     module: object,
     removed_client: str,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    assert module.main() == 78
+    assert module.main([]) == 78
     assert capsys.readouterr().err.strip() == module.UNAVAILABLE_MESSAGE
-
-    source = inspect.getsource(module.main)
-    for forbidden in (
-        "parse_args",
-        "rclpy",
-        "create_node",
-        "publish",
-        "transfer",
-        "capture",
-    ):
-        assert forbidden not in source
-
     whole_module = inspect.getsource(module)
     assert f"class {removed_client}" not in whole_module
-    assert "def _import_module" not in whole_module
+    assert "create_client" not in whole_module
 
 
-def test_one_shot_simulator_reset_is_unavailable_without_a_live_import_hook() -> None:
-    assert not hasattr(simulation_control, "_import_module")
-    source = inspect.getsource(simulation_control.reset_once)
-    for forbidden in ("import", "rclpy", "create_node", "SimulationControlClient"):
-        assert forbidden not in source
-
-    with pytest.raises(
-        simulation_control.SimulationControlUnavailableError,
-        match=simulation_control.UNAVAILABLE_REASON_CODE,
-    ):
-        simulation_control.reset_once()
+def test_selected_standard_simulation_clients_are_active_and_owner_neutral() -> None:
+    assert hasattr(simulation_control, "SimulationControlClient")
+    assert hasattr(scene_mirror_probe, "SimulationSceneMirrorClient")
+    for module in (simulation_control, scene_mirror_probe):
+        source = inspect.getsource(module)
+        assert "simulation_interfaces" in source
+        assert "create_client" in source
+        assert "create_publisher" not in source
+        assert "isaac_arm_command_enable" not in source
+        assert "isaac_demo_supervisor" not in source
