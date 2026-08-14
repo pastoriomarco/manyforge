@@ -838,6 +838,8 @@ private:
       std::chrono::steady_clock::time_point not_before,
       std::chrono::steady_clock::time_point deadline,
       std::stop_token stop_token = {});
+  [[nodiscard]] const std::vector<std::string> &
+  transport_joint_names() const noexcept;
   std::vector<double>
   velocities_for_joints(const JointSample &sample,
                         const std::vector<std::string> &joints) const;

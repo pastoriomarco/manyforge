@@ -10,6 +10,7 @@
 #include <limits>
 #include <map>
 #include <random>
+#include <set>
 #include <sstream>
 #include <stdexcept>
 #include <string_view>
@@ -499,6 +500,17 @@ void Ros2ControlExecutionBackend::validate_config() const {
     throw std::invalid_argument(
         "ros2_control required_joints must not be empty");
   }
+  const auto &transport_joints = transport_joint_names();
+  const std::set<std::string> unique_transport_joints(transport_joints.begin(),
+                                                       transport_joints.end());
+  if (transport_joints.size() != config_.required_joints.size() ||
+      unique_transport_joints.size() != transport_joints.size() ||
+      std::any_of(transport_joints.begin(), transport_joints.end(),
+                  [](const auto &joint) { return joint.empty(); })) {
+    throw std::invalid_argument(
+        "ros2_control transport_joint_names must be unique, non-empty, and "
+        "match required_joints cardinality");
+  }
   if (config_.prepared_participant_binding.has_value()) {
     const auto &binding = config_.prepared_participant_binding->value();
     if (!binding.control_path.has_value()) {
@@ -506,7 +518,9 @@ void Ros2ControlExecutionBackend::validate_config() const {
           "prepared participant binding requires one control path");
     }
     std::vector<std::string> binding_joints;
+    std::vector<std::string> binding_transport_joints;
     binding_joints.reserve(binding.resources.size());
+    binding_transport_joints.reserve(binding.resources.size());
     for (const auto &resource : binding.resources) {
       if (!resource.source_joint_name.has_value() ||
           resource.compiled_resource_name.empty()) {
@@ -515,10 +529,13 @@ void Ros2ControlExecutionBackend::validate_config() const {
             "joint names");
       }
       binding_joints.push_back(resource.compiled_resource_name);
+      binding_transport_joints.push_back(*resource.source_joint_name);
     }
-    if (binding_joints != config_.required_joints) {
+    if (binding_joints != config_.required_joints ||
+        binding_transport_joints != transport_joints) {
       throw std::invalid_argument(
-          "prepared ros2_control binding does not match required_joints");
+          "prepared ros2_control binding does not match its compiled and "
+          "transport joint names");
     }
   }
   if (config_.observed_state_source_precedence.empty()) {
@@ -669,7 +686,7 @@ void Ros2ControlExecutionBackend::validate_config() const {
       throw std::invalid_argument(
           "controller binding contract contains duplicate names");
     }
-    if (binding.required_joints != config_.required_joints ||
+    if (binding.required_joints != transport_joints ||
         binding.follow_joint_trajectory_action != config_.action_name ||
         binding.controller_state_topic != config_.controller_state_topic ||
         binding.joint_state_topic != config_.joint_state_topic) {
@@ -857,7 +874,9 @@ core::Result<void> Ros2ControlExecutionBackend::RebindRoute(
   };
   const auto &value = binding.value();
   std::vector<std::string> binding_joints;
+  std::vector<std::string> binding_transport_joints;
   binding_joints.reserve(value.resources.size());
+  binding_transport_joints.reserve(value.resources.size());
   if (!value.control_path.has_value() || value.resources.empty() ||
       std::any_of(value.resources.begin(), value.resources.end(),
                   [&](const auto &resource) {
@@ -868,9 +887,12 @@ core::Result<void> Ros2ControlExecutionBackend::RebindRoute(
                       return true;
                     }
                     binding_joints.push_back(resource.compiled_resource_name);
+                    binding_transport_joints.push_back(
+                        *resource.source_joint_name);
                     return false;
                   }) ||
-      binding_joints != config_.required_joints) {
+      binding_joints != config_.required_joints ||
+      binding_transport_joints != transport_joint_names()) {
     return error(core::ErrorCode::kInvalidRequest,
                  "ros2_control_motion_route_rebind_mismatch",
                  "ros2_control route publication crosses its configured "
@@ -1023,7 +1045,40 @@ void Ros2ControlExecutionBackend::publish_observed_robot_state(
       source != core::ObservedRobotStateSourceKind::kPredictedState) {
     publication = diagnostic_observed_state_publication_.get();
   }
-  (void)publication->publish(source, joint_names, positions, velocities,
+  if (joint_names.size() != positions.size() ||
+      (!velocities.empty() && velocities.size() != joint_names.size())) {
+    return;
+  }
+  const auto &transport_joints = transport_joint_names();
+  std::vector<double> remapped_positions;
+  std::vector<double> remapped_velocities;
+  const std::vector<double> *ordered_positions = &positions;
+  const std::vector<double> *ordered_velocities = &velocities;
+  if (joint_names != transport_joints) {
+    remapped_positions.reserve(transport_joints.size());
+    if (!velocities.empty()) {
+      remapped_velocities.reserve(transport_joints.size());
+    }
+    for (const auto &transport_joint : transport_joints) {
+      const auto found =
+          std::find(joint_names.begin(), joint_names.end(), transport_joint);
+      if (found == joint_names.end() ||
+          std::find(std::next(found), joint_names.end(), transport_joint) !=
+              joint_names.end()) {
+        return;
+      }
+      const auto index = static_cast<std::size_t>(
+          std::distance(joint_names.begin(), found));
+      remapped_positions.push_back(positions[index]);
+      if (!velocities.empty()) {
+        remapped_velocities.push_back(velocities[index]);
+      }
+    }
+    ordered_positions = &remapped_positions;
+    ordered_velocities = &remapped_velocities;
+  }
+  (void)publication->publish(source, config_.required_joints,
+                             *ordered_positions, *ordered_velocities,
                              source_timestamp_ns, received_timestamp_ns);
 }
 
@@ -1635,7 +1690,8 @@ bool Ros2ControlExecutionBackend::publish_jtc_cancel_reference(
   std::vector<double> remapped_velocities;
   std::span<const double> ordered_positions = positions;
   std::span<const double> ordered_velocities = velocities;
-  if (joint_names == config_.required_joints) {
+  const auto &transport_joints = transport_joint_names();
+  if (joint_names == transport_joints) {
     if (!std::all_of(positions.begin(), positions.end(),
                      [](double value) { return std::isfinite(value); }) ||
         !std::all_of(velocities.begin(), velocities.end(),
@@ -1646,11 +1702,11 @@ bool Ros2ControlExecutionBackend::publish_jtc_cancel_reference(
     // JTC normally publishes canonical order, so the steady stop path above
     // adds no allocations. Keep a correct bounded remap for adapters whose
     // controller order differs from the deployment order.
-    remapped_positions.reserve(config_.required_joints.size());
+    remapped_positions.reserve(transport_joints.size());
     if (!velocities.empty()) {
-      remapped_velocities.reserve(config_.required_joints.size());
+      remapped_velocities.reserve(transport_joints.size());
     }
-    for (const auto &required_joint : config_.required_joints) {
+    for (const auto &required_joint : transport_joints) {
       const auto first =
           std::find(joint_names.begin(), joint_names.end(), required_joint);
       if (first == joint_names.end() ||
@@ -2048,7 +2104,7 @@ bool Ros2ControlExecutionBackend::joint_sample_is_complete_and_finite(
       return false;
     }
   }
-  for (const auto &required_joint : config_.required_joints) {
+  for (const auto &required_joint : transport_joint_names()) {
     if (std::count(sample.joint_names.begin(), sample.joint_names.end(),
                    required_joint) != 1) {
       return false;
@@ -2121,8 +2177,8 @@ void Ros2ControlExecutionBackend::sync_idle_scene_from_latest_sample() {
     last_idle_scene_sample_received_at_ = sample->received_at;
     last_idle_scene_projection_at_ = now;
     try {
-      positions = positions_for_joints(*sample, config_.required_joints);
-      velocities = velocities_for_joints(*sample, config_.required_joints);
+      positions = positions_for_joints(*sample, transport_joint_names());
+      velocities = velocities_for_joints(*sample, transport_joint_names());
       source_timestamp_ns = sample->received_timestamp_ns;
     } catch (const std::exception &) {
       return;
@@ -2281,8 +2337,8 @@ Ros2ControlExecutionBackend::command_sim_initial_state(std::string phase) {
   }
 
   FollowJointTrajectory::Goal goal;
-  goal.trajectory.joint_names = config_.required_joints;
-  disable_fjt_controller_tolerances(goal, config_.required_joints);
+  goal.trajectory.joint_names = transport_joint_names();
+  disable_fjt_controller_tolerances(goal, transport_joint_names());
   trajectory_msgs::msg::JointTrajectoryPoint home_point;
   home_point.positions = config_.initial_joint_positions_rad;
   home_point.time_from_start =
@@ -2414,8 +2470,8 @@ Ros2ControlExecutionBackend::sync_observed_state_before_planning() {
   std::vector<double> positions;
   std::vector<double> velocities;
   try {
-    positions = positions_for_joints(*sample, config_.required_joints);
-    velocities = velocities_for_joints(*sample, config_.required_joints);
+    positions = positions_for_joints(*sample, transport_joint_names());
+    velocities = velocities_for_joints(*sample, transport_joint_names());
   } catch (const std::exception &exc) {
     return core::Result<void>::Err(core::ErrorDTO{
         core::kErrorStartStateMismatch,
@@ -2507,6 +2563,12 @@ Ros2ControlExecutionBackend::wait_for_fresh_passive_sample_after(
           .has_value();
     });
   }
+}
+
+const std::vector<std::string> &
+Ros2ControlExecutionBackend::transport_joint_names() const noexcept {
+  return config_.transport_joint_names.empty() ? config_.required_joints
+                                                : config_.transport_joint_names;
 }
 
 std::vector<double> Ros2ControlExecutionBackend::positions_for_joints(
@@ -3009,7 +3071,7 @@ Ros2ControlExecutionBackend::capture_planning_environment_authority() {
                                              : nullptr,
       binding.get(), admission.get(),
       config_.require_execution_admission_snapshot, clock_.now(),
-      config_.action_name, config_.required_joints);
+      config_.action_name, transport_joint_names());
   if (!decision.admitted || !decision.pin.has_value()) {
     return core::Result<void>::Err(core::ErrorDTO{
         core::kErrorExecutionRejected,
@@ -3572,8 +3634,8 @@ bool Ros2ControlExecutionBackend::publish_observed_cancel_stop_snapshot(
       return false;
     }
     try {
-      positions = positions_for_joints(*sample, joint_names);
-      velocities = velocities_for_joints(*sample, joint_names);
+      positions = positions_for_joints(*sample, transport_joint_names());
+      velocities = velocities_for_joints(*sample, transport_joint_names());
       source_timestamp_ns = sample->received_timestamp_ns;
     } catch (const std::exception &) {
       return false;
@@ -3631,8 +3693,10 @@ Ros2ControlExecutionBackend::wait_for_post_stop_observation(
     if (sample != nullptr) {
       PostStopObservation observation;
       try {
-        observation.positions = positions_for_joints(*sample, joint_names);
-        observation.velocities = velocities_for_joints(*sample, joint_names);
+        observation.positions =
+            positions_for_joints(*sample, transport_joint_names());
+        observation.velocities =
+            velocities_for_joints(*sample, transport_joint_names());
       } catch (const std::exception &) {
         sample = nullptr;
       }
@@ -3821,8 +3885,8 @@ Ros2ControlExecutionBackend::resync_after_intervention_if_needed(
   std::vector<double> positions;
   std::vector<double> velocities;
   try {
-    positions = positions_for_joints(*sample, config_.required_joints);
-    velocities = velocities_for_joints(*sample, config_.required_joints);
+    positions = positions_for_joints(*sample, transport_joint_names());
+    velocities = velocities_for_joints(*sample, transport_joint_names());
   } catch (const std::exception &exc) {
     const auto snapshot = get_execution_snapshot();
     return core::Result<void>::Err(operator_intervention_error(
@@ -4428,9 +4492,9 @@ void Ros2ControlExecutionBackend::commit_completion_gate_terminal(
 
     if (newest != nullptr) {
       try {
-        auto positions = positions_for_joints(*newest, config_.required_joints);
+        auto positions = positions_for_joints(*newest, transport_joint_names());
         auto velocities =
-            velocities_for_joints(*newest, config_.required_joints);
+            velocities_for_joints(*newest, transport_joint_names());
         const bool measurement_gate_failure =
             failure.has_value() && failure->details.contains("phase") &&
             failure->details.at("phase") == "terminal_result_state_gate";
@@ -4552,9 +4616,9 @@ void Ros2ControlExecutionBackend::complete_execution(
   if (!uses_authored_backend_state() && verified_observed_sample != nullptr) {
     try {
       final_positions = positions_for_joints(*verified_observed_sample,
-                                             config_.required_joints);
+                                             transport_joint_names());
       final_velocities = velocities_for_joints(*verified_observed_sample,
-                                               config_.required_joints);
+                                               transport_joint_names());
       terminal_scene_source_ns =
           verified_observed_sample->received_timestamp_ns;
     } catch (const std::exception &) {
@@ -4590,7 +4654,7 @@ bool Ros2ControlExecutionBackend::start_state_matches(
   }
   std::vector<double> observed;
   try {
-    observed = positions_for_joints(sample, trajectory.joint_names);
+    observed = positions_for_joints(sample, transport_joint_names());
   } catch (const std::exception &e) {
     error = e.what();
     return false;
@@ -4636,7 +4700,7 @@ bool Ros2ControlExecutionBackend::final_state_matches(
   }
   std::vector<double> observed;
   try {
-    observed = positions_for_joints(sample, trajectory.joint_names);
+    observed = positions_for_joints(sample, transport_joint_names());
   } catch (const std::exception &e) {
     error = e.what();
     return false;
@@ -4783,9 +4847,9 @@ core::ExecutionHandle Ros2ControlExecutionBackend::execute_trajectory(
           [this]() { return get_execution_snapshot(); }};
     }
     start_positions =
-        positions_for_joints(*start_sample, config_.required_joints);
+        positions_for_joints(*start_sample, transport_joint_names());
     start_velocities =
-        velocities_for_joints(*start_sample, config_.required_joints);
+        velocities_for_joints(*start_sample, transport_joint_names());
     start_source_timestamp_ns = start_sample->received_timestamp_ns;
     progress_source_timestamp_ns =
         std::chrono::duration_cast<std::chrono::nanoseconds>(
@@ -4824,9 +4888,9 @@ core::ExecutionHandle Ros2ControlExecutionBackend::execute_trajectory(
   }
 
   FollowJointTrajectory::Goal goal;
-  goal.trajectory.joint_names = trajectory.joint_names;
+  goal.trajectory.joint_names = transport_joint_names();
   if (config_.disable_controller_path_tolerances) {
-    disable_fjt_controller_tolerances(goal, trajectory.joint_names);
+    disable_fjt_controller_tolerances(goal, transport_joint_names());
   }
   publish_runtime_velocity_scale(
       runtime_velocity_scale_.load(std::memory_order_acquire));
@@ -4899,7 +4963,7 @@ core::ExecutionHandle Ros2ControlExecutionBackend::execute_trajectory(
                                                : nullptr,
         binding.get(), admission.get(),
         config_.require_execution_admission_snapshot, clock_.now(),
-        config_.action_name, trajectory.joint_names);
+        config_.action_name, transport_joint_names());
     if (!decision.admitted || !decision.pin.has_value()) {
       const bool binding_rejection =
           decision.reason_code.rfind("controller_", 0) == 0;
@@ -5244,9 +5308,9 @@ void Ros2ControlExecutionBackend::monitor_worker(
         if (sample.has_value()) {
           try {
             snapshot_positions =
-                positions_for_joints(*sample, trajectory.joint_names);
+                positions_for_joints(*sample, transport_joint_names());
             snapshot_velocities =
-                velocities_for_joints(*sample, trajectory.joint_names);
+                velocities_for_joints(*sample, transport_joint_names());
             snapshot_source_timestamp_ns = sample->received_timestamp_ns;
             measured_snapshot_available = true;
           } catch (const std::exception &) {
@@ -5381,7 +5445,8 @@ void Ros2ControlExecutionBackend::monitor_worker(
     }
     if (sample.has_value()) {
       try {
-        auto observed = positions_for_joints(*sample, trajectory.joint_names);
+        auto observed =
+            positions_for_joints(*sample, transport_joint_names());
         if (!uses_authored_backend_state() &&
             (last_progress_projection_at ==
                  std::chrono::steady_clock::time_point::min() ||
@@ -5422,7 +5487,7 @@ void Ros2ControlExecutionBackend::monitor_worker(
         if (!uses_authored_backend_state()) {
           snapshot_positions = observed;
           snapshot_velocities =
-              velocities_for_joints(*sample, trajectory.joint_names);
+              velocities_for_joints(*sample, transport_joint_names());
           snapshot_source_timestamp_ns = sample->received_timestamp_ns;
           measured_snapshot_available = true;
         }
@@ -5831,10 +5896,11 @@ Ros2ControlExecutionBackend::execute_controlled_stop(
            {"freshest_sample_age_s", std::to_string(freshest_age_s)}}};
       return result;
     }
-    observed_positions = positions_for_joints(*sample, joint_names);
+    observed_positions =
+        positions_for_joints(*sample, transport_joint_names());
     if (sample->velocities.size() == sample->joint_names.size()) {
       observed_velocities.reserve(joint_names.size());
-      for (const auto &joint : joint_names) {
+      for (const auto &joint : transport_joint_names()) {
         const auto it = std::find(sample->joint_names.begin(),
                                   sample->joint_names.end(), joint);
         if (it == sample->joint_names.end()) {
@@ -6383,9 +6449,9 @@ Ros2ControlExecutionBackend::execute_controlled_stop(
     std::int64_t post_stop_source_timestamp_ns = 0;
     if (post_stop_sample.has_value()) {
       post_stop_positions =
-          positions_for_joints(*post_stop_sample, joint_names);
+          positions_for_joints(*post_stop_sample, transport_joint_names());
       post_stop_velocities =
-          velocities_for_joints(*post_stop_sample, joint_names);
+          velocities_for_joints(*post_stop_sample, transport_joint_names());
       post_stop_source = post_stop_sample->source;
       post_stop_source_timestamp_ns = post_stop_sample->received_timestamp_ns;
     }
@@ -6826,9 +6892,9 @@ Ros2ControlExecutionBackend::execute_controlled_stop(
     std::int64_t post_stop_source_timestamp_ns = 0;
     if (post_stop_sample.has_value()) {
       post_stop_positions =
-          positions_for_joints(*post_stop_sample, joint_names);
+          positions_for_joints(*post_stop_sample, transport_joint_names());
       post_stop_velocities =
-          velocities_for_joints(*post_stop_sample, joint_names);
+          velocities_for_joints(*post_stop_sample, transport_joint_names());
       post_stop_source = post_stop_sample->source;
       post_stop_source_timestamp_ns = post_stop_sample->received_timestamp_ns;
     }
@@ -8961,9 +9027,9 @@ bool Ros2ControlExecutionBackend::send_fjt_replacement_trajectory(
   };
 
   FollowJointTrajectory::Goal goal;
-  goal.trajectory.joint_names = trajectory.joint_names;
+  goal.trajectory.joint_names = transport_joint_names();
   if (config_.disable_controller_path_tolerances) {
-    disable_fjt_controller_tolerances(goal, trajectory.joint_names);
+    disable_fjt_controller_tolerances(goal, transport_joint_names());
   }
   for (const auto &waypoint : trajectory.waypoints) {
     trajectory_msgs::msg::JointTrajectoryPoint point;

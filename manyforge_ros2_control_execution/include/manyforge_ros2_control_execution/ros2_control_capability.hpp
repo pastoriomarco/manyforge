@@ -21,7 +21,15 @@ struct Ros2ControlExecutionBackendConfig {
   std::string action_name;
   std::string joint_state_topic = "/joint_states";
   std::string controller_state_topic;
+  /// Exact runtime/addressed joint identity in retained compiled-model order.
+  /// Trajectories, Stop profiles, state publications, and the Kernel use this
+  /// namespace.
   std::vector<std::string> required_joints;
+  /// Exact ROS controller/topic joint identity in the same coordinate order.
+  /// Empty preserves the historical one-namespace contract by selecting
+  /// `required_joints`. Retained MF2 products populate source URDF names here
+  /// so transport never leaks into addressed state identity.
+  std::vector<std::string> transport_joint_names;
   /// Highest-to-lowest authority order for the RT-8C observed-state channel.
   /// Every configured source is retained independently; stale higher-priority
   /// sources fall through to the next fresh complete source.

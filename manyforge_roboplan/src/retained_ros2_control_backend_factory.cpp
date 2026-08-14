@@ -64,6 +64,21 @@ private:
   return result;
 }
 
+[[nodiscard]] std::vector<std::string> source_resources(
+    const core::RuntimeParticipantBinding &binding) {
+  std::vector<std::string> result;
+  result.reserve(binding.value().resources.size());
+  for (const auto &resource : binding.value().resources) {
+    if (!resource.source_joint_name.has_value() ||
+        resource.source_joint_name->empty()) {
+      throw std::invalid_argument(
+          "ros2_control motion binding contains a non-model resource");
+    }
+    result.push_back(*resource.source_joint_name);
+  }
+  return result;
+}
+
 [[nodiscard]] std::string sole_compiled_group(
     const core::RuntimeParticipantBinding &binding,
     const char *description) {
@@ -163,6 +178,14 @@ RetainedRuntimeBackendFactory make_retained_ros2_control_backend_factory(
     if (selected.execution.required_joints != joints) {
       throw std::invalid_argument(
           "ros2_control required joints differ from retained resources");
+    }
+    const auto transport_joints = source_resources(motion_binding);
+    if (selected.execution.transport_joint_names.empty()) {
+      selected.execution.transport_joint_names = transport_joints;
+    } else if (selected.execution.transport_joint_names != transport_joints) {
+      throw std::invalid_argument(
+          "ros2_control transport joints differ from retained source "
+          "resources");
     }
     const auto motion_group =
         sole_compiled_group(motion_binding, "ros2_control motion binding");

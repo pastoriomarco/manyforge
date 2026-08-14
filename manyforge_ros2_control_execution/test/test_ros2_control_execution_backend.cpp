@@ -1025,10 +1025,48 @@ TEST(Ros2ControlExecutionBackendTest,
 }
 
 TEST(Ros2ControlExecutionBackendTest,
+     TransportJointNamesMapIntoCompiledAddressedStateIdentity) {
+  auto config = base_config();
+  config.required_joints = {"joint_1"};
+  config.transport_joint_names = {"source_joint_1"};
+  config.prepared_participant_binding = motion_binding("program.physical");
+  core::ObservedRobotStatePublication publication(
+      config.required_joints, ros2_control_addressed_state_sources(config));
+  auto sink = std::make_shared<RecordingExecutionStateSink>();
+  core::FakeClock clock;
+  clock.set(123'000'000);
+  core::ManualScheduler scheduler;
+  Ros2ControlExecutionBackend backend(
+      Ros2ControlExecutionBackend::TestingNoRosStartupTag{}, publication, sink,
+      "arm", clock, scheduler, config);
+
+  backend.testing_store_latest_joint_sample(
+      {"source_joint_1"}, {0.75},
+      std::chrono::steady_clock::time_point(std::chrono::milliseconds(123)));
+
+  const auto snapshot = publication.snapshot(clock.now());
+  ASSERT_TRUE(snapshot.has_value());
+  const auto canonical_names = publication.canonical_joint_names();
+  ASSERT_EQ(canonical_names.size(), 1U);
+  EXPECT_EQ(canonical_names.front(), "joint_1");
+  ASSERT_EQ(snapshot->positions_rad.size(), 1U);
+  EXPECT_DOUBLE_EQ(snapshot->positions_rad.front(), 0.75);
+
+  auto crossed = config;
+  crossed.transport_joint_names = {"different_source_joint"};
+  EXPECT_THROW(Ros2ControlExecutionBackend(
+                   Ros2ControlExecutionBackend::TestingNoRosStartupTag{},
+                   publication, sink, "arm", clock, scheduler,
+                   std::move(crossed)),
+               std::invalid_argument);
+}
+
+TEST(Ros2ControlExecutionBackendTest,
      RouteRebindAcceptsContainedAliasesAndRejectsCrossedRuntimeFacts) {
   auto binding = motion_binding("program.physical");
   auto config = base_config();
   config.prepared_participant_binding = binding;
+  config.transport_joint_names = {"source_joint_1"};
   auto sink = std::make_shared<RecordingExecutionStateSink>();
   core::FakeClock clock;
   core::ManualScheduler scheduler;
