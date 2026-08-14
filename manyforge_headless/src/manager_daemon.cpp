@@ -726,9 +726,15 @@ SceneRuntimeOwnerReadResponse(const std::string_view cell_id,
       {"api_version",
        CanonicalValue(std::string(kManagerCommandResponseApiVersion))},
       {"cell_id", CanonicalValue(std::string(cell_id))},
+      {"initialization_generation",
+       Unsigned(snapshot.initialization_generation,
+                "initialization generation")},
+      {"initialization_state",
+       CanonicalValue(std::string(ToString(snapshot.state)))},
       {"ok", CanonicalValue(true)},
+      {"runtime_identity",
+       SceneRuntimeIdentityResponseValue(*snapshot.runtime_identity)},
       {"scene_runtime_owner_epoch", CanonicalValue(std::string(owner_epoch))},
-      {"state", SceneRuntimeStateValue(snapshot)},
   });
 }
 

@@ -807,6 +807,10 @@ TEST(ManagerDaemonProcess,
     EXPECT_NE(owner_read.find("\"ok\":true"), std::string::npos);
     EXPECT_NE(owner_read.find("\"scene_runtime_owner_epoch\":"),
               std::string::npos);
+    EXPECT_NE(owner_read.find("\"initialization_state\":\"open\""),
+              std::string::npos);
+    EXPECT_NE(owner_read.find("\"runtime_identity\":"), std::string::npos);
+    EXPECT_EQ(owner_read.find("\"pose_sources\":"), std::string::npos);
 
     const auto opened_first = SendCommand(
         directory.socket_path(),

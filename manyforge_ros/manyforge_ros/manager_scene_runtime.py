@@ -1,0 +1,614 @@
+"""Strict same-user client for Manager-owned scene-runtime observations.
+
+The client is deliberately mechanical.  Manager assigns receive time,
+freshness, epoch order, acceptance, retention, and publication generation;
+ROS producers provide only source identity, sequence, lifetime intent, quality,
+eligibility, and a bounded canonical observation payload.
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+import json
+import math
+import os
+from pathlib import Path
+import socket
+import stat
+import struct
+from typing import Any, Mapping
+import unicodedata
+
+import rfc8785
+
+
+MANAGER_SOCKET_FILE = "manager-command.sock"
+MANAGER_COMMAND_VERSION = "manyforge.manager_command.v1"
+MANAGER_RESPONSE_VERSION = "manyforge.manager_command_response.v1"
+MAX_MANAGER_REQUEST_BYTES = 128 * 1024 + 4 * 1024
+MAX_MANAGER_RESPONSE_BYTES = 64 * 1024
+MAX_OBSERVATION_PAYLOAD_BYTES = 64 * 1024
+MAX_OBSERVATION_LIFETIME_NS = 60_000_000_000
+MAXIMUM_SAFE_INTEGER = 9_007_199_254_740_991
+DEFAULT_TIMEOUT_S = 2.0
+
+_MAX_IDENTITY_BYTES = 256
+_MAX_ERROR_MESSAGE_BYTES = 4096
+_RUNTIME_STATES = {
+    "open",
+    "closed",
+    "resetting",
+    "seeding",
+    "replaying",
+    "failed",
+    "retired",
+}
+_OBSERVATION_DISPOSITIONS = {
+    "apply_now",
+    "buffered",
+    "replaced_buffered",
+    "observed_only",
+    "duplicate",
+}
+
+
+class SceneRuntimeManagerError(RuntimeError):
+    """One stable fail-closed transport, protocol, or owner rejection."""
+
+    def __init__(self, code: str, message: str) -> None:
+        super().__init__(message)
+        self.code = code
+
+
+@dataclass(frozen=True)
+class SceneRuntimeIdentity:
+    retained_bundle_id: str
+    graph_revision: str
+    deployment_generation: int
+    program_generation: int
+    runtime_generation: int
+
+    def __post_init__(self) -> None:
+        _bounded_text(self.retained_bundle_id, label="retained_bundle_id")
+        _bounded_text(self.graph_revision, label="graph_revision")
+        _safe_integer(
+            self.deployment_generation,
+            label="deployment_generation",
+            allow_zero=True,
+        )
+        _safe_integer(
+            self.program_generation,
+            label="program_generation",
+            allow_zero=True,
+        )
+        _safe_integer(self.runtime_generation, label="runtime_generation")
+
+    @classmethod
+    def from_value(cls, value: object) -> SceneRuntimeIdentity:
+        record = _exact_object(
+            value,
+            {
+                "deployment_generation",
+                "graph_revision",
+                "program_generation",
+                "retained_bundle_id",
+                "runtime_generation",
+            },
+            label="scene-runtime identity",
+        )
+        try:
+            return cls(
+                retained_bundle_id=record["retained_bundle_id"],
+                graph_revision=record["graph_revision"],
+                deployment_generation=record["deployment_generation"],
+                program_generation=record["program_generation"],
+                runtime_generation=record["runtime_generation"],
+            )
+        except (TypeError, ValueError) as exc:
+            raise _response_invalid("scene-runtime identity is invalid") from exc
+
+    def to_value(self) -> dict[str, object]:
+        return {
+            "deployment_generation": self.deployment_generation,
+            "graph_revision": self.graph_revision,
+            "program_generation": self.program_generation,
+            "retained_bundle_id": self.retained_bundle_id,
+            "runtime_generation": self.runtime_generation,
+        }
+
+
+@dataclass(frozen=True)
+class SceneRuntimeOwnerSnapshot:
+    cell_id: str
+    owner_epoch: str
+    runtime_identity: SceneRuntimeIdentity
+    initialization_generation: int
+    initialization_state: str
+
+
+@dataclass(frozen=True)
+class PoseObserverSession:
+    cell_id: str
+    runtime_identity: SceneRuntimeIdentity
+    source_id: str
+    source_epoch: str
+    source_epoch_order: int
+
+
+@dataclass(frozen=True)
+class PoseObservationIntent:
+    object_id: str
+    policy_id: str
+    lifetime_ns: int
+    quality: str
+    eligible: bool
+    payload: Mapping[str, Any]
+    _canonical_payload: bytes = field(init=False, repr=False, compare=True)
+
+    def __post_init__(self) -> None:
+        _bounded_text(self.object_id, label="object_id")
+        _bounded_text(self.policy_id, label="policy_id")
+        _safe_integer(self.lifetime_ns, label="lifetime_ns")
+        if self.lifetime_ns > MAX_OBSERVATION_LIFETIME_NS:
+            raise ValueError("lifetime_ns exceeds the Manager observation bound")
+        if self.quality not in {"good", "unknown"}:
+            raise ValueError("quality must be good or unknown")
+        if type(self.eligible) is not bool:
+            raise TypeError("eligible must be an exact bool")
+        if not isinstance(self.payload, Mapping):
+            raise TypeError("payload must be an object mapping")
+        try:
+            encoded = rfc8785.dumps(dict(self.payload))
+        except (rfc8785.CanonicalizationError, UnicodeError, ValueError) as exc:
+            raise ValueError("payload is not canonically encodable") from exc
+        if len(encoded) > MAX_OBSERVATION_PAYLOAD_BYTES:
+            raise ValueError("payload exceeds the Manager observation byte bound")
+        object.__setattr__(self, "_canonical_payload", encoded)
+
+    def payload_value(self) -> dict[str, Any]:
+        value = _strict_json_object(self._canonical_payload)
+        return value
+
+
+@dataclass(frozen=True)
+class PoseObservationResult:
+    disposition: str
+    fresh: bool
+    initialization_generation: int
+    scene_runtime_source_generation: int
+    source_epoch_order: int
+    source_sequence: int
+
+
+class ManagerSceneRuntimeClient:
+    """Exchange one bounded canonical packet at a time with Manager."""
+
+    def __init__(
+        self,
+        state_root: Path,
+        *,
+        timeout_s: float = DEFAULT_TIMEOUT_S,
+    ) -> None:
+        if (
+            isinstance(timeout_s, bool)
+            or not isinstance(timeout_s, (int, float))
+            or not math.isfinite(float(timeout_s))
+            or timeout_s <= 0.0
+            or timeout_s > 5.0
+        ):
+            raise ValueError("timeout_s must be finite and in (0, 5]")
+        self._state_root = Path(state_root)
+        self._socket_path = self._state_root / MANAGER_SOCKET_FILE
+        root = self._validate_root()
+        self._root_identity = (root.st_dev, root.st_ino)
+        if len(os.fsencode(self._socket_path)) >= 104:
+            raise SceneRuntimeManagerError(
+                "manager_scene_runtime_transport_invalid",
+                "Manager command socket path exceeds the AF_UNIX bound",
+            )
+        self._timeout_s = float(timeout_s)
+
+    def read_owner(self) -> SceneRuntimeOwnerSnapshot:
+        response = self._exchange(
+            {
+                "api_version": MANAGER_COMMAND_VERSION,
+                "command": "scene_runtime_owner_read",
+            }
+        )
+        record = _exact_object(
+            response,
+            {
+                "api_version",
+                "cell_id",
+                "initialization_generation",
+                "initialization_state",
+                "ok",
+                "runtime_identity",
+                "scene_runtime_owner_epoch",
+            },
+            label="scene-runtime owner response",
+        )
+        try:
+            cell_id = _bounded_text(record["cell_id"], label="cell_id")
+            owner_epoch = _bounded_text(
+                record["scene_runtime_owner_epoch"],
+                label="scene_runtime_owner_epoch",
+            )
+            generation = _safe_integer(
+                record["initialization_generation"],
+                label="initialization_generation",
+                allow_zero=True,
+            )
+            state = record["initialization_state"]
+            if state not in _RUNTIME_STATES:
+                raise ValueError("initialization_state is invalid")
+            identity = SceneRuntimeIdentity.from_value(record["runtime_identity"])
+        except (TypeError, ValueError) as exc:
+            raise _response_invalid("scene-runtime owner response is invalid") from exc
+        return SceneRuntimeOwnerSnapshot(
+            cell_id=cell_id,
+            owner_epoch=owner_epoch,
+            runtime_identity=identity,
+            initialization_generation=generation,
+            initialization_state=state,
+        )
+
+    def open_observer(
+        self,
+        owner: SceneRuntimeOwnerSnapshot,
+        *,
+        source_id: str,
+        source_epoch: str,
+    ) -> PoseObserverSession:
+        if not isinstance(owner, SceneRuntimeOwnerSnapshot):
+            raise TypeError("owner must be a SceneRuntimeOwnerSnapshot")
+        source_id = _bounded_text(source_id, label="source_id")
+        source_epoch = _bounded_text(source_epoch, label="source_epoch")
+        response = self._exchange(
+            {
+                "api_version": MANAGER_COMMAND_VERSION,
+                "command": "scene_runtime_observer_open",
+                "expected_runtime_identity": owner.runtime_identity.to_value(),
+                "source_epoch": source_epoch,
+                "source_id": source_id,
+            }
+        )
+        record = _exact_object(
+            response,
+            {
+                "api_version",
+                "cell_id",
+                "ok",
+                "runtime_identity",
+                "source_epoch",
+                "source_epoch_order",
+                "source_id",
+            },
+            label="scene-runtime observer-open response",
+        )
+        try:
+            response_identity = SceneRuntimeIdentity.from_value(
+                record["runtime_identity"]
+            )
+            epoch_order = _safe_integer(
+                record["source_epoch_order"], label="source_epoch_order"
+            )
+        except (TypeError, ValueError) as exc:
+            raise _response_invalid("observer-open response is invalid") from exc
+        if (
+            record["cell_id"] != owner.cell_id
+            or response_identity != owner.runtime_identity
+            or record["source_id"] != source_id
+            or record["source_epoch"] != source_epoch
+        ):
+            raise SceneRuntimeManagerError(
+                "manager_scene_runtime_response_identity_mismatch",
+                "observer-open response crossed its requested identity",
+            )
+        return PoseObserverSession(
+            cell_id=owner.cell_id,
+            runtime_identity=response_identity,
+            source_id=source_id,
+            source_epoch=source_epoch,
+            source_epoch_order=epoch_order,
+        )
+
+    def observe(
+        self,
+        session: PoseObserverSession,
+        *,
+        source_sequence: int,
+        intent: PoseObservationIntent,
+    ) -> PoseObservationResult:
+        if not isinstance(session, PoseObserverSession):
+            raise TypeError("session must be a PoseObserverSession")
+        if not isinstance(intent, PoseObservationIntent):
+            raise TypeError("intent must be a PoseObservationIntent")
+        source_sequence = _safe_integer(
+            source_sequence, label="source_sequence"
+        )
+        response = self._exchange(
+            {
+                "api_version": MANAGER_COMMAND_VERSION,
+                "command": "scene_runtime_observe",
+                "eligible": intent.eligible,
+                "expected_runtime_identity": session.runtime_identity.to_value(),
+                "lifetime_ns": intent.lifetime_ns,
+                "object_id": intent.object_id,
+                "payload": intent.payload_value(),
+                "policy_id": intent.policy_id,
+                "quality": intent.quality,
+                "source_epoch": session.source_epoch,
+                "source_id": session.source_id,
+                "source_sequence": source_sequence,
+            }
+        )
+        record = _exact_object(
+            response,
+            {
+                "api_version",
+                "disposition",
+                "fresh",
+                "initialization_generation",
+                "object_id",
+                "ok",
+                "policy_id",
+                "scene_runtime_source_generation",
+                "source_epoch",
+                "source_epoch_order",
+                "source_id",
+                "source_sequence",
+            },
+            label="scene-runtime observation response",
+        )
+        try:
+            disposition = record["disposition"]
+            if disposition not in _OBSERVATION_DISPOSITIONS:
+                raise ValueError("observation disposition is invalid")
+            if type(record["fresh"]) is not bool:
+                raise TypeError("fresh must be an exact bool")
+            initialization_generation = _safe_integer(
+                record["initialization_generation"],
+                label="initialization_generation",
+                allow_zero=True,
+            )
+            publication_generation = _safe_integer(
+                record["scene_runtime_source_generation"],
+                label="scene_runtime_source_generation",
+            )
+            epoch_order = _safe_integer(
+                record["source_epoch_order"], label="source_epoch_order"
+            )
+            response_sequence = _safe_integer(
+                record["source_sequence"], label="source_sequence"
+            )
+        except (TypeError, ValueError) as exc:
+            raise _response_invalid("observation response is invalid") from exc
+        if (
+            record["object_id"] != intent.object_id
+            or record["policy_id"] != intent.policy_id
+            or record["source_id"] != session.source_id
+            or record["source_epoch"] != session.source_epoch
+            or epoch_order != session.source_epoch_order
+            or response_sequence != source_sequence
+        ):
+            raise SceneRuntimeManagerError(
+                "manager_scene_runtime_response_identity_mismatch",
+                "observation response crossed its requested identity",
+            )
+        return PoseObservationResult(
+            disposition=disposition,
+            fresh=record["fresh"],
+            initialization_generation=initialization_generation,
+            scene_runtime_source_generation=publication_generation,
+            source_epoch_order=epoch_order,
+            source_sequence=response_sequence,
+        )
+
+    def _validate_root(self) -> os.stat_result:
+        try:
+            metadata = self._state_root.lstat()
+        except OSError as exc:
+            raise SceneRuntimeManagerError(
+                "manager_scene_runtime_transport_invalid",
+                "Manager state root is unavailable",
+            ) from exc
+        if (
+            not stat.S_ISDIR(metadata.st_mode)
+            or stat.S_ISLNK(metadata.st_mode)
+            or metadata.st_uid != os.geteuid()
+        ):
+            raise SceneRuntimeManagerError(
+                "manager_scene_runtime_transport_invalid",
+                "Manager state root is not one real same-user directory",
+            )
+        return metadata
+
+    def _validate_endpoint(self) -> None:
+        root = self._validate_root()
+        if (root.st_dev, root.st_ino) != self._root_identity:
+            raise SceneRuntimeManagerError(
+                "manager_scene_runtime_transport_invalid",
+                "Manager state root identity changed",
+            )
+        try:
+            metadata = self._socket_path.lstat()
+        except OSError as exc:
+            raise SceneRuntimeManagerError(
+                "manager_scene_runtime_unavailable",
+                "Manager command socket is unavailable",
+            ) from exc
+        if (
+            not stat.S_ISSOCK(metadata.st_mode)
+            or stat.S_ISLNK(metadata.st_mode)
+            or metadata.st_uid != os.geteuid()
+            or stat.S_IMODE(metadata.st_mode) != 0o600
+        ):
+            raise SceneRuntimeManagerError(
+                "manager_scene_runtime_transport_invalid",
+                "Manager command endpoint is not the exact same-user socket",
+            )
+
+    def _exchange(self, command: dict[str, Any]) -> dict[str, Any]:
+        try:
+            request = rfc8785.dumps(command)
+        except (rfc8785.CanonicalizationError, UnicodeError, ValueError) as exc:
+            raise SceneRuntimeManagerError(
+                "manager_scene_runtime_request_invalid",
+                "Manager scene-runtime request is not canonically encodable",
+            ) from exc
+        if not request or len(request) > MAX_MANAGER_REQUEST_BYTES:
+            raise SceneRuntimeManagerError(
+                "manager_scene_runtime_request_invalid",
+                "Manager scene-runtime request exceeds its byte bound",
+            )
+        self._validate_endpoint()
+        try:
+            with socket.socket(socket.AF_UNIX, socket.SOCK_SEQPACKET) as channel:
+                channel.settimeout(self._timeout_s)
+                channel.connect(str(self._socket_path))
+                credentials = channel.getsockopt(
+                    socket.SOL_SOCKET,
+                    socket.SO_PEERCRED,
+                    struct.calcsize("3i"),
+                )
+                _pid, peer_uid, _gid = struct.unpack("3i", credentials)
+                if peer_uid != os.geteuid():
+                    raise SceneRuntimeManagerError(
+                        "manager_scene_runtime_transport_invalid",
+                        "Manager command peer is not same-user",
+                    )
+                sent = channel.send(request)
+                if sent != len(request):
+                    raise OSError("short Manager scene-runtime request send")
+                payload, _ancillary, flags, _address = channel.recvmsg(
+                    MAX_MANAGER_RESPONSE_BYTES + 1
+                )
+        except SceneRuntimeManagerError:
+            raise
+        except (OSError, TimeoutError) as exc:
+            raise SceneRuntimeManagerError(
+                "manager_scene_runtime_unavailable",
+                "Manager scene-runtime exchange failed",
+            ) from exc
+        if (
+            not payload
+            or len(payload) > MAX_MANAGER_RESPONSE_BYTES
+            or flags & socket.MSG_TRUNC
+        ):
+            raise _response_invalid(
+                "Manager scene-runtime response is empty, truncated, or oversized"
+            )
+        response = _strict_json_object(payload)
+        try:
+            canonical = rfc8785.dumps(response)
+        except (rfc8785.CanonicalizationError, UnicodeError, ValueError) as exc:
+            raise _response_invalid(
+                "Manager scene-runtime response cannot be canonicalized"
+            ) from exc
+        if canonical != payload:
+            raise _response_invalid(
+                "Manager scene-runtime response is not exact canonical JSON"
+            )
+        if response.get("api_version") != MANAGER_RESPONSE_VERSION:
+            raise _response_invalid(
+                "Manager scene-runtime response version is unsupported"
+            )
+        if type(response.get("ok")) is not bool:
+            raise _response_invalid(
+                "Manager scene-runtime response has no exact boolean result"
+            )
+        if response["ok"]:
+            return response
+        failure = _exact_object(
+            response,
+            {"api_version", "error", "ok"},
+            label="Manager scene-runtime failure response",
+        )
+        error = _exact_object(
+            failure["error"], {"code", "message"}, label="Manager owner error"
+        )
+        try:
+            code = _bounded_text(error["code"], label="owner error code")
+            message = _bounded_text(
+                error["message"],
+                label="owner error message",
+                maximum_bytes=_MAX_ERROR_MESSAGE_BYTES,
+            )
+        except (TypeError, ValueError) as exc:
+            raise _response_invalid("Manager owner error is invalid") from exc
+        raise SceneRuntimeManagerError(code, message)
+
+
+def _strict_json_object(payload: bytes) -> dict[str, Any]:
+    def unique_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+        result: dict[str, Any] = {}
+        for key, value in pairs:
+            if key in result:
+                raise ValueError(f"duplicate object member {key!r}")
+            result[key] = value
+        return result
+
+    def reject_constant(value: str) -> None:
+        raise ValueError(f"unsupported JSON constant {value}")
+
+    try:
+        text = payload.decode("utf-8", errors="strict")
+        value = json.loads(
+            text,
+            object_pairs_hook=unique_object,
+            parse_constant=reject_constant,
+        )
+    except (UnicodeDecodeError, json.JSONDecodeError, ValueError) as exc:
+        raise _response_invalid(
+            "Manager scene-runtime response is not strict UTF-8 JSON"
+        ) from exc
+    if not isinstance(value, dict):
+        raise _response_invalid("Manager scene-runtime response is not an object")
+    return value
+
+
+def _exact_object(
+    value: object,
+    fields: set[str],
+    *,
+    label: str,
+) -> dict[str, Any]:
+    if not isinstance(value, dict) or set(value) != fields:
+        raise _response_invalid(f"{label} has an unknown or missing field")
+    return value
+
+
+def _bounded_text(
+    value: object,
+    *,
+    label: str,
+    maximum_bytes: int = _MAX_IDENTITY_BYTES,
+) -> str:
+    if (
+        not isinstance(value, str)
+        or not value
+        or unicodedata.normalize("NFC", value) != value
+        or len(value.encode("utf-8")) > maximum_bytes
+    ):
+        raise ValueError(f"{label} must be bounded non-empty NFC text")
+    return value
+
+
+def _safe_integer(
+    value: object,
+    *,
+    label: str,
+    allow_zero: bool = False,
+) -> int:
+    minimum = 0 if allow_zero else 1
+    if type(value) is not int or value < minimum or value > MAXIMUM_SAFE_INTEGER:
+        raise ValueError(f"{label} is not an exact safe integer")
+    return value
+
+
+def _response_invalid(message: str) -> SceneRuntimeManagerError:
+    return SceneRuntimeManagerError(
+        "manager_scene_runtime_response_invalid",
+        message,
+    )
