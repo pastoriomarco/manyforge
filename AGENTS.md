@@ -6,97 +6,37 @@
 > where to find the canonical reference docs. Read referenced docs
 > before editing code or running scripts.
 
-> **Current `dev` cutover status:** I2's pure ROS-free compiler and
-> `manyforge_core_py` compiler/DTO projection are qualified at executable
-> commit `0ee506a0d1c05006d2d0f5356cc93db17dca0b98`. I3's ROS-free retained
-> deployment compiler is qualified at implementation freeze
-> `62df57ca76b55991c8ac01d3a316dfc8a3b450aa`: its immutable
-> planning/collision, viewer, control-domain, reference runtime-unit, and
-> projection-input products are deterministic, reloadable, and testable
-> offline. I4 now owns the bounded canonical-empty-to-reference-runtime M0
-> path: durable Apply recovery, active publication, retained-process
-> convergence across Manager replacement, active-plan reconciliation, and
-> explicit shutdown are qualified without a robot port. I5/H0 now hosts that
-> owner in a sole-process Manager daemon and adds independent runtime/scene
-> aggregation, scene-initialization lifetime, alarm lifecycle, historian,
-> retained-NodeEnvironment verification, bounded API/CLI, and thin Composer,
-> assistant, and MCP read clients. Composer's structural catalog/files/URDF
-> shell remains available. H0 is an observation and attributed-intent surface,
-> not a restored execution product lane. I6/N3 adds one development-qualified
-> native absolute joint-goal path: an exact retained Program/Program Binding,
-> independently restartable C++ execution host, headless submit/read API, and
-> thin Behavior/Composer callers. It preserves source-local joint names and
-> valid subsets without restoring a singleton robot/group lookup. N6-c1
-> additionally reconnects bounded addressed joint Robot Control: no-motion
-> preview, explicit approval through the ordinary operation path, owner-issued
-> progress, and operation Stop. N6-c2 extends that same thin client to the
-> historically required four manual-control forms: joint goals, pose goals,
-> Cartesian paths, and gripper commands. Preview remains effect-free; approval
-> submits through the ordinary Kernel operation path. These are bounded
-> vertical slices, not the restored native lane or an operator recipe. N6-c3
-> now restores the strict Program Draft/Saved authoring workspace: exact
-> environment-aware palette/tree/property/declaration editing plus bounded
-> Open-as-Draft, Save, and Save-As. Applied identity remains explicitly
-> unavailable until N7; authoring never implies Apply or execution. N6-c4 adds
-> source-local scene/viewer authoring and one exact owner-routed current-pose
-> Commit without restoring dynamic viewer truth. N6-c5 adds strict bounded
-> direct/`nemoclaw` provider mediation, Draft-only callbacks, and the operator
-> conversation/reconciliation surface. N7-a5.1 adds exact scenario/Program-run
-> admission, and N7-a5.2 adds authoritative immutable Program Apply/Load with a
-> durable Applied projection. N7-a5.3a-d now bind that captured Applied
-> Program/Binding to thin native motion/gripper/Stop and scene ports, apply the
-> authored initial scene, restore deterministic selection and bounded Program
-> model requests, join native pick/place, and supply the fixed-pool Program tick
-> host, atomic context rollback, durable per-attempt model audit, and exact
-> per-run cleanup. Prepared planning/execution evidence remains private to its
-> C++ owner. N7-a5.4 now adds the independently restartable
-> `manyforge_program_runner` process and bounded Headless/Composer scenario,
-> Applied, Program Run/status, and one-click Program Stop surfaces. A run keeps
-> its immutable captured Program/Binding while authoring or Program-only Apply
-> prepares a later run; deployment-changing Apply remains subject to the
-> Manager's affected-busy fence. Browser, Composer, or runner loss never sends
-> an implicit Stop, and runner replacement mints a new observable owner epoch.
-> N7 closes the maintained seven-input/eight-Program native product path,
-> including unchanged-source repeated-instance isolation, through the Component
-> Manager, Headless API, independent Program runner, and thin Composer clients.
-> I7/L0 adds the sole generic CCLC owner, declarative lifecycle catalogs,
-> complete-domain controller-route transactions, verified readiness publication,
-> and thin confirmed Headless/CLI/ROS request clients. I8 adds addressed
-> multi-participant Prepare/Dispatch/Resume, asynchronous coordinated controls,
-> scoped Stop and Full Stop, collision-to-Stop routing, immutable terminal
-> certificates and fault latches, durable surveillance/recovery, and
-> command-free orphan reconciliation to that maintained native product. The
-> historical aggregate launcher, packaged product installation, dynamic
-> scene/viewer behavior, public MCP, external OpenClaw/Hermes loops, Isaac/ROS
-> product launch, and real-robot operation remain explicitly unavailable. Do
-> not run the historical recipes below or
-> recreate their superseded Python semantic owners. Retain or port same-role
-> Python/TypeScript
-> clients, authoring, presentation, safety, and evidence surfaces at their
-> responsible gates. The last full Composer interaction tree is
-> `manyforge@08222188293df8e12f90dc72e204c21f22f92ea1`; use
-> [`docs/reference/HISTORICAL_COMPOSER_INTERACTION_REFERENCE.md`](docs/reference/HISTORICAL_COMPOSER_INTERACTION_REFERENCE.md)
-> only as reimplementation input.
+> **Current status is intentionally not maintained in this file.** For
+> implementation work, read the sibling `manyforge_specs` repository in this
+> order: `docs/plans/PLANS_INDEX.md`, the active owning plan linked there, and
+> the dated qualification evidence linked by that plan. Those records alone
+> own exact phase state, source identities, test counts, residuals, and closure
+> claims. For runtime/operator work, use this repository's generated reference
+> docs and typed unavailable-entrypoint results; do not infer availability from
+> historical recipes or an old agent handoff.
+>
+> Preserve same-role clients, authoring, presentation, safety, and evidence
+> surfaces when their owning plan requires them. Never recreate a superseded
+> semantic owner merely to make a historical command run. The historical
+> Composer interaction reference below is reimplementation input only.
 
 ______________________________________________________________________
 
 ## What this repo is
 
 ManyForge is the deployment-side repository for the target robot-execution
-framework. During the active destructive cutover it ships one maintained
-ManyForge-only native product path through explicit Component Manager, CCLC,
-Headless, Program-runner, native-owner, and thin Composer entrypoints. Its I7
-lifecycle/controller-route and I8 multi-domain execution/Stop contracts are
-current for that product. Packaged installation, the historical aggregate
-launcher, and the I9-I11 simulator/physical/tool product lanes remain
-unavailable until their named restoration gates.
+framework. During an active cutover, only entrypoints explicitly named as
+available by the current plan and generated operator contracts may be treated
+as product surfaces. Packaged installation, historical aggregate launchers,
+and any simulator, physical, or tool lane still behind a named gate remain
+unavailable.
 
 Three sibling repositories form the full stack; the cross-repo
 authority map is:
 
 | Question                                                          | Authoritative repo          | Notes                                                                                                                                |
 | ----------------------------------------------------------------- | --------------------------- | ------------------------------------------------------------------------------------------------------------------------------------ |
-| **How do I install / deploy / run ManyForge?**                    | this repo (`manyforge`)     | deployment-side authority; current `dev` exposes the explicit maintained native path, but not packaged or historical aggregate bring-up |
+| **How do I install / deploy / run ManyForge?**                    | this repo (`manyforge`)     | deployment-side authority; use only generated/current operator entrypoints, never a historical aggregate recipe                        |
 | **How do I run the LLM assistant on Jetson Thor?**                | `NemoClaw-Thor`             | platform glue: vLLM serving, sandbox provisioner, OpenClaw bridge launcher. Required only when using the `openclaw` lane on Thor.    |
 | **What is the spec / contract / ADR — what should this code do?** | `manyforge_specs` (private) | dev-only; **not required at runtime**. Specs/ADRs/plans live there for maintainer use.                                               |
 
@@ -145,57 +85,15 @@ docker compose run --rm dev bash # enter the dev container
 ```
 
 Hard requirements: Docker (with BuildKit), git, and ~10 GB disk for the Docker
-image. Host Python or build commands are not qualification evidence, and
-effectful product scripts must remain behind their typed cutover gates.
+image. Host Python or build commands are inspection only, not qualification
+evidence, and effectful product scripts must remain behind their typed gates.
 
-The exact I2 compiler boundary closed on ManyForge commit
-`0ee506a0d1c05006d2d0f5356cc93db17dca0b98`, tree
-`22de99ef24350e533616d899534914478cb53cee`, through its complete 30-lane
-AMD64 qualification and result-bound independent review. The `bindings`
-selector is therefore a qualified compiler-only surface; it does not make any
-runtime or product lane available.
-
-The exact I3 implementation/identity freeze is ManyForge commit
-`62df57ca76b55991c8ac01d3a316dfc8a3b450aa`, tree
-`968422a59dd1216a0db07ec398c9f49b1a9ff7cc`. Its cumulative AMD64 Release,
-sanitizer, deterministic-regeneration, static-boundary, and adversarial checks
-passed. Later qualification-runner and documentation-only descendants do not
-change the retained products. I4 now owns operational Apply, active
-publication, and process convergence for the bounded M0 reference fixture.
-Its external-process proof covers Manager loss/replacement, runtime
-crash/restart, and explicit shutdown without a robot, controller, motion, or
-Stop port. I5/H0 now exposes the bounded public Manager/headless read and
-attributed-intent surfaces while keeping robot readiness and operational Apply
-explicitly unavailable. I6/N3 adds one selected native absolute joint-goal
-development/qualification path through an independently restartable C++ host
-and thin public clients. N6-c1 and N6-c2 add the addressed four-mode Robot
-Control preview/approval/progress/Stop client over that owner: joint goals,
-pose goals, Cartesian paths, and gripper commands. It remains a thin client of
-the ordinary operation path, not a restored runtime product lane. N6-c3 adds
-the independently revision-fenced Program Draft/Saved owner and thin authoring
-UI without restoring Program Apply or execution.
-N6-c4 adds source-local scene/viewer authoring and N6-c5 adds the strict
-direct/`nemoclaw` assistant client/bridge; neither restores product launch,
-Applied identity, external agent loops, or runtime ownership.
-N7-a5.1 and a5.2 add exact Program-run admission plus authoritative Program
-Apply/Load and durable Applied identity. N7-a5.3a-d close the internal
-production runner join: captured native motion/gripper/Stop, retained-frame
-resolution, authored scene and scene leaves, deterministic selection, bounded
-model requests with a concrete site transport and durable audit, native
-pick/place, fixed-pool scheduling, atomic context rollback, and per-run
-cleanup. N7-a5.4 exposes that runner as a separate process through strict
-Headless and Composer scenario/Applied/Run/status/Stop clients while keeping
-browser state observational and retaining one active Program run as the
-current product gate. N7-a5.5 and the cumulative N7 qualification close all
-seven maintained deployment inputs, eight Program Bindings, six successful
-native workflows, two truthful I9 gates, and unchanged-source two-Lite6
-isolation. I7/L0 extends this maintained native path with the generic CCLC
-lifecycle/route/readiness owner, and I8 extends it with prepared
-multi-participant execution, asynchronous controls, scoped/Full Stop,
-collision containment, terminal evidence, post-terminal surveillance, durable
-recovery, and orphan reconciliation. Those additions do not restore the
-historical aggregate launcher, packaged installation, Isaac, ROS product
-launch, real hardware, or generalized tool lanes.
+Do not copy qualification status into this file. The current source anchor,
+test matrix, platform applicability, residuals, and closure evidence belong in
+`manyforge_specs/docs/plans/PLANS_INDEX.md`, its active owning plan, and the
+linked dated records under `manyforge_specs/docs/implementation/`. A
+documentation-only descendant does not invalidate already recorded executable
+evidence unless it changes a named qualification input.
 
 For the captured deterministic/direct/full-assistant operator baseline, see
 [`docs/operations/STACK_SETUP.md`](docs/operations/STACK_SETUP.md).
