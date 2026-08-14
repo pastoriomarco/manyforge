@@ -126,9 +126,10 @@ struct RuntimeContext final {
 [[nodiscard]] RuntimeContext
 make_runtime_context(const deployment::RetainedBundle &bundle) {
   const auto &graph = bundle.value().cell_graph;
+  const core::CapabilityId trajectory_execute_capability_id(
+      "execution.trajectory.execute");
   const auto &binding = require_one(
-      graph.control_bindings,
-      core::CapabilityId("execution.trajectory.execute"),
+      graph.control_bindings, trajectory_execute_capability_id,
       [](const auto &value) { return value.capability_id; },
       "trajectory control binding");
   const auto &component = require_one(
@@ -195,9 +196,10 @@ make_runtime_context(const deployment::RetainedBundle &bundle) {
   const core::RuntimeEpoch runtime_epoch(
       "epoch." + binding.provider_runtime_unit_id.value());
   const core::RuntimeEpoch provider_epoch("provider.epoch.native-cclc.1");
+  const core::CapabilityId joint_planning_capability_id(
+      "planning.motion.joint_goal");
   const auto &planner = require_one(
-      bundle.value().capability_provider_bindings,
-      core::CapabilityId("planning.motion.joint_goal"),
+      bundle.value().capability_provider_bindings, joint_planning_capability_id,
       [](const auto &value) { return value.capability_id; },
       "joint planner provider");
   std::set<core::RuntimeUnitId> planner_runtime_units;
@@ -1212,6 +1214,29 @@ motion_operation(const core::RuntimeParticipantBinding &binding) {
     dynamics.emplace(*resource.source_joint_name,
                      core::JointDynamicsLimitDTO{1.0, 2.0, std::nullopt});
   }
+  const core::JointGoalDTO joint_goal{std::move(source_joint_names),
+                                      std::move(positions)};
+  const core::MotionParticipantIntentDTO motion{
+      core::MoveId("move.native.readiness.1"),
+      core::FrameRoleId("base"),
+      core::FrameRoleId("tcp"),
+      core::TolerancesDTO{0.01, 0.001, 0.01},
+      core::SpeedProfileDTO{},
+      core::TimeoutsDTO{},
+      core::CacheMode::kDefault,
+      core::PlanningProfileDTO::kBalanced,
+      core::MotionTargetModeDTO::kAbsolute,
+      std::nullopt,
+      std::nullopt,
+      joint_goal,
+      std::nullopt,
+      std::move(dynamics),
+      {},
+      {}};
+  const core::OperationParticipantIntentDTO participant{
+      value.component_role_id, value.target_role_id, value.capability_id,
+      std::nullopt, motion};
+  std::vector<core::OperationParticipantIntentDTO> participants{participant};
   return {{core::RequestId("execute.native.readiness"),
            core::RequestOwnerEpoch("kernel.native.readiness.1"), "test",
            std::nullopt},
@@ -1222,25 +1247,7 @@ motion_operation(const core::RuntimeParticipantBinding &binding) {
           value.graph_revision,
           value.retained_bundle_id,
           std::nullopt,
-          {{value.component_role_id, value.target_role_id, value.capability_id,
-            std::nullopt,
-            core::MotionParticipantIntentDTO{
-                core::MoveId("move.native.readiness.1"),
-                core::FrameRoleId("base"),
-                core::FrameRoleId("tcp"),
-                core::TolerancesDTO{0.01, 0.001, 0.01},
-                core::SpeedProfileDTO{},
-                core::TimeoutsDTO{},
-                core::CacheMode::kDefault,
-                core::PlanningProfileDTO::kBalanced,
-                core::MotionTargetModeDTO::kAbsolute,
-                std::nullopt,
-                std::nullopt,
-                core::JointGoalDTO{std::move(source_joint_names),
-                                   std::move(positions)},
-                std::nullopt,
-                std::move(dynamics),
-                {}}}},
+          std::move(participants),
           core::OperationCoordinationPolicy::kIndependent};
 }
 
