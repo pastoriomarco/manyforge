@@ -78,6 +78,7 @@ class JointStateBinding:
 @dataclass(frozen=True)
 class SimulationEntityBinding:
     request: SimulationEntityPoseRequest
+    frame_kind: str
     object_id: str
     policy_id: str
     lifetime_ns: int
@@ -91,6 +92,7 @@ class SimulationEntityBinding:
 @dataclass(frozen=True)
 class Detection3dBinding:
     topic: str
+    frame_kind: str
     object_id: str
     policy_id: str
     lifetime_ns: int
@@ -678,6 +680,16 @@ def _pose_intent(
     pose: PoseSnapshot,
     source: dict[str, Any],
 ) -> PoseObservationIntent:
+    target_frame_id = (
+        binding.request.target_frame_id
+        if isinstance(binding, SimulationEntityBinding)
+        else binding.target_frame_id
+    )
+    if pose.frame_id != target_frame_id:
+        raise ObservationNormalizationError(
+            "pose_frame_mismatch",
+            "normalized pose does not use the configured cell frame",
+        )
     return PoseObservationIntent(
         object_id=binding.object_id,
         policy_id=binding.policy_id,
@@ -688,6 +700,7 @@ def _pose_intent(
             "api_version": OBSERVATION_PAYLOAD_VERSION,
             "kind": kind,
             "pose": {
+                "frame_kind": binding.frame_kind,
                 "frame_id": pose.frame_id,
                 "orientation_xyzw": list(pose.orientation_xyzw),
                 "position_m": list(pose.position_xyz),
@@ -741,6 +754,7 @@ def _simulation_binding(value: object) -> SimulationEntityBinding:
         {
             "eligible",
             "entity",
+            "frame_kind",
             "lifetime_ns",
             "local_orientation_xyzw",
             "local_position_xyz",
@@ -750,10 +764,13 @@ def _simulation_binding(value: object) -> SimulationEntityBinding:
         },
         label="simulation entity",
     )
+    target_frame_id = _text(
+        record["target_frame_id"], label="simulation target_frame_id"
+    )
     try:
         request = SimulationEntityPoseRequest(
             entity=record["entity"],
-            target_frame_id=record["target_frame_id"],
+            target_frame_id=target_frame_id,
             local_position_xyz=tuple(record["local_position_xyz"]),
             local_orientation_xyzw=tuple(record["local_orientation_xyzw"]),
         )
@@ -763,6 +780,7 @@ def _simulation_binding(value: object) -> SimulationEntityBinding:
         ) from exc
     return SimulationEntityBinding(
         request=request,
+        frame_kind=_frame_kind(record["frame_kind"]),
         object_id=_text(record["object_id"], label="simulation object_id"),
         policy_id=_text(record["policy_id"], label="simulation policy_id"),
         lifetime_ns=_lifetime(record["lifetime_ns"]),
@@ -777,6 +795,7 @@ def _detection_binding(value: object) -> Detection3dBinding:
         {
             "eligible",
             "fallback_frame_id",
+            "frame_kind",
             "lifetime_ns",
             "object_id",
             "policy_id",
@@ -810,8 +829,12 @@ def _detection_binding(value: object) -> Detection3dBinding:
         raise IsaacPoseObserverConfigError(
             f"Detection3D selector is invalid: {exc}"
         ) from exc
+    target_frame_id = _text(
+        record["target_frame_id"], label="Detection3D target_frame_id"
+    )
     return Detection3dBinding(
         topic=_ros_topic(record["topic"], label="Detection3D topic"),
+        frame_kind=_frame_kind(record["frame_kind"]),
         object_id=_text(record["object_id"], label="Detection3D object_id"),
         policy_id=_text(record["policy_id"], label="Detection3D policy_id"),
         lifetime_ns=_lifetime(record["lifetime_ns"]),
@@ -819,9 +842,7 @@ def _detection_binding(value: object) -> Detection3dBinding:
         fallback_frame_id=_optional_text(
             record["fallback_frame_id"], label="fallback_frame_id"
         ),
-        target_frame_id=_optional_text(
-            record["target_frame_id"], label="target_frame_id"
-        ),
+        target_frame_id=target_frame_id,
         selector=normalized_selector,
     )
 
@@ -903,6 +924,14 @@ def _optional_text(value: object, *, label: str) -> str:
     if value == "":
         return ""
     return _text(value, label=label)
+
+
+def _frame_kind(value: object) -> str:
+    if value != "cell_frame":
+        raise IsaacPoseObserverConfigError(
+            "pose frame_kind must be the exact cell_frame semantic"
+        )
+    return "cell_frame"
 
 
 def _ros_topic(value: object, *, label: str) -> str:

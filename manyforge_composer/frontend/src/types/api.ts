@@ -551,6 +551,79 @@ export interface LogicalSceneProjection {
   } | null;
 }
 
+export interface SceneRuntimeObservationPose {
+  frame_id: string;
+  frame_kind: 'cell_frame';
+  orientation_xyzw: QuaternionXyzwTuple;
+  position_m: Vector3Tuple;
+  source_stamp_s: number | null;
+}
+
+export type SceneRuntimeGoodObservationPayload =
+  | {
+      api_version: 'manyforge.ros_pose_observation.v1';
+      joint_names: string[];
+      kind: 'joint_state';
+      positions: number[];
+      source_stamp_s: number | null;
+      topic: string;
+    }
+  | {
+      api_version: 'manyforge.ros_pose_observation.v1';
+      kind: 'simulation_entity_pose';
+      pose: SceneRuntimeObservationPose;
+      source: { entity: string };
+    }
+  | {
+      api_version: 'manyforge.ros_pose_observation.v1';
+      kind: 'detection3d_pose';
+      pose: SceneRuntimeObservationPose;
+      source: {
+        class_id: string;
+        confidence: number;
+        detection_id: string;
+        max_position_variance_m2: number;
+        topic: string;
+      };
+    };
+
+export interface SceneRuntimeUnknownObservationPayload {
+  api_version: 'manyforge.ros_pose_observation.v1';
+  kind: 'joint_state' | 'simulation_entity_pose' | 'detection3d_pose';
+  source_error: {
+    code: string;
+    detail: string;
+    source_key: string;
+  };
+}
+
+interface SceneRuntimePoseSourceBase {
+  buffered: boolean;
+  expires_at_ns: number;
+  object_id: string;
+  observed_at_ns: number;
+  policy_id: string;
+  source_epoch: string;
+  source_epoch_order: number;
+  source_id: string;
+  source_sequence: number;
+}
+
+export type SceneRuntimePoseSource =
+  | (SceneRuntimePoseSourceBase & {
+      eligible: boolean;
+      fresh: boolean;
+      payload: SceneRuntimeGoodObservationPayload;
+      quality: 'good';
+    })
+  | (SceneRuntimePoseSourceBase & {
+      buffered: false;
+      eligible: false;
+      fresh: false;
+      payload: SceneRuntimeUnknownObservationPayload;
+      quality: 'unknown';
+    });
+
 export interface SceneRuntimeProjection {
   api_version: 'manyforge.scene_runtime_source.v1';
   cell_id: string;
@@ -562,7 +635,7 @@ export interface SceneRuntimeProjection {
     error: string | null;
     initialization_generation: number;
     initialization_token: string | null;
-    pose_sources: Array<Record<string, JsonValue>>;
+    pose_sources: SceneRuntimePoseSource[];
     reason: string;
     runtime_identity: {
       deployment_generation: number;

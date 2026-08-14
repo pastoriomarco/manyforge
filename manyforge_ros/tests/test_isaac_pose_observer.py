@@ -41,6 +41,7 @@ def _config_value() -> dict[str, object]:
             {
                 "eligible": True,
                 "fallback_frame_id": "link_base",
+                "frame_kind": "cell_frame",
                 "lifetime_ns": 5_000_000_000,
                 "object_id": "graspable",
                 "policy_id": "before_planning",
@@ -67,6 +68,7 @@ def _config_value() -> dict[str, object]:
             {
                 "eligible": True,
                 "entity": "/mac_n_cheese_centered",
+                "frame_kind": "cell_frame",
                 "lifetime_ns": 1_000_000_000,
                 "local_orientation_xyzw": [0.0, 0.0, 0.0, 1.0],
                 "local_position_xyz": [0.0, 0.0, 0.0],
@@ -143,6 +145,14 @@ def test_site_config_rejects_symlink_duplicates_unknown_fields_and_key_aliases(
     with pytest.raises(IsaacPoseObserverConfigError, match="must be unique"):
         load_isaac_pose_observer_site_config(path)
 
+    invalid_frame = _config_value()
+    simulations = invalid_frame["simulation_entities"]
+    assert isinstance(simulations, list)
+    simulations[0]["frame_kind"] = "world_frame"
+    _write_config(path, invalid_frame)
+    with pytest.raises(IsaacPoseObserverConfigError, match="cell_frame"):
+        load_isaac_pose_observer_site_config(path)
+
 
 def test_normalized_observations_map_to_stable_manager_payloads(
     tmp_path: Path,
@@ -180,7 +190,21 @@ def test_normalized_observations_map_to_stable_manager_payloads(
         ),
     )
     assert simulation.payload_value()["kind"] == "simulation_entity_pose"
+    assert simulation.payload_value()["pose"]["frame_kind"] == "cell_frame"
     assert simulation.payload_value()["pose"]["position_m"] == [0.4, -0.2, 0.1]
+    with pytest.raises(ObservationNormalizationError, match="configured cell frame"):
+        simulation_entity_observation_intent(
+            config.simulation_entities[0],
+            SimulationEntityPoseObservation(
+                entity="/mac_n_cheese_centered",
+                pose=PoseSnapshot(
+                    frame_id="world",
+                    stamp_sec=13.0,
+                    position_xyz=(0.4, -0.2, 0.1),
+                    orientation_xyzw=(0.0, 0.0, 0.0, 1.0),
+                ),
+            ),
+        )
 
     detection = detection3d_observation_intent(
         config.detection3d_sources[0],
@@ -189,7 +213,12 @@ def test_normalized_observations_map_to_stable_manager_payloads(
             class_id="trocar",
             confidence=0.9,
             max_position_variance_m2=0.001,
-            pose=pose,
+            pose=PoseSnapshot(
+                frame_id="link_base",
+                stamp_sec=13.0,
+                position_xyz=pose.position_xyz,
+                orientation_xyzw=pose.orientation_xyzw,
+            ),
         ),
     )
     assert detection.payload_value()["source"]["confidence"] == 0.9

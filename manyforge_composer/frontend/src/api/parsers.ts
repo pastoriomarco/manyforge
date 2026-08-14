@@ -36,6 +36,10 @@ import type {
   ProjectionRevision,
   QuaternionXyzwTuple,
   SceneRuntimeProjection,
+  SceneRuntimeGoodObservationPayload,
+  SceneRuntimeObservationPose,
+  SceneRuntimePoseSource,
+  SceneRuntimeUnknownObservationPayload,
   SceneTransactionResponse,
   SceneUrdfCollision,
   SceneUrdfJoint,
@@ -2442,14 +2446,286 @@ export function parseSceneRuntimeProjection(value: unknown): SceneRuntimeProject
         state.initialization_token,
         'sceneRuntime.state.initialization_token',
       ),
-      pose_sources: boundedArrayAt(state.pose_sources, 'sceneRuntime.state.pose_sources', 4096)
-        .map((item, index) => jsonRecordAt(item, `sceneRuntime.state.pose_sources[${index}]`)),
+      pose_sources: boundedArrayAt(
+        state.pose_sources,
+        'sceneRuntime.state.pose_sources',
+        4096,
+      ).map((item, index) => parseSceneRuntimePoseSource(
+        item,
+        `sceneRuntime.state.pose_sources[${index}]`,
+      )),
       reason: stringAt(state.reason, 'sceneRuntime.state.reason'),
       runtime_identity: runtimeIdentity,
       started_at_ns: integerAt(state.started_at_ns, 'sceneRuntime.state.started_at_ns'),
       state: stateName as SceneRuntimeProjection['state']['state'],
       updated_at_ns: integerAt(state.updated_at_ns, 'sceneRuntime.state.updated_at_ns'),
     },
+  };
+}
+
+function nonEmptyStringAt(value: unknown, path: string): string {
+  const parsed = stringAt(value, path);
+  if (parsed.length === 0) return fail(path, 'a non-empty string');
+  return parsed;
+}
+
+function parseSceneRuntimeObservationPose(
+  value: unknown,
+  path: string,
+): SceneRuntimeObservationPose {
+  const record = objectAt(value, path);
+  exactKeysAt(
+    record,
+    [
+      'frame_id',
+      'frame_kind',
+      'orientation_xyzw',
+      'position_m',
+      'source_stamp_s',
+    ],
+    path,
+  );
+  if (record.frame_kind !== 'cell_frame') {
+    return fail(`${path}.frame_kind`, 'the literal "cell_frame"');
+  }
+  const orientation = quaternionAt(
+    record.orientation_xyzw,
+    `${path}.orientation_xyzw`,
+  );
+  if (Math.abs(Math.hypot(...orientation) - 1) > 1e-6) {
+    return fail(`${path}.orientation_xyzw`, 'a normalized xyzw quaternion');
+  }
+  return {
+    frame_id: nonEmptyStringAt(record.frame_id, `${path}.frame_id`),
+    frame_kind: 'cell_frame',
+    orientation_xyzw: orientation,
+    position_m: vector3At(record.position_m, `${path}.position_m`),
+    source_stamp_s: nullableNumberAt(
+      record.source_stamp_s,
+      `${path}.source_stamp_s`,
+    ),
+  };
+}
+
+function parseSceneRuntimeGoodPayload(
+  value: unknown,
+  path: string,
+): SceneRuntimeGoodObservationPayload {
+  const record = objectAt(value, path);
+  if (record.api_version !== 'manyforge.ros_pose_observation.v1') {
+    return fail(`${path}.api_version`, 'manyforge.ros_pose_observation.v1');
+  }
+  const kind = stringAt(record.kind, `${path}.kind`);
+  if (kind === 'joint_state') {
+    exactKeysAt(
+      record,
+      [
+        'api_version',
+        'joint_names',
+        'kind',
+        'positions',
+        'source_stamp_s',
+        'topic',
+      ],
+      path,
+    );
+    const names = boundedArrayAt(record.joint_names, `${path}.joint_names`, 4096)
+      .map((item, index) => nonEmptyStringAt(item, `${path}.joint_names[${index}]`));
+    const positions = boundedArrayAt(record.positions, `${path}.positions`, 4096)
+      .map((item, index) => numberAt(item, `${path}.positions[${index}]`));
+    if (
+      names.length === 0
+      || names.length !== positions.length
+      || new Set(names).size !== names.length
+    ) {
+      return fail(
+        path,
+        'equal non-empty unique joint_names and finite positions arrays',
+      );
+    }
+    const topic = nonEmptyStringAt(record.topic, `${path}.topic`);
+    if (!topic.startsWith('/') || topic.includes('//') || /\s/u.test(topic)) {
+      return fail(`${path}.topic`, 'one absolute ROS topic');
+    }
+    return {
+      api_version: 'manyforge.ros_pose_observation.v1',
+      joint_names: names,
+      kind,
+      positions,
+      source_stamp_s: nullableNumberAt(
+        record.source_stamp_s,
+        `${path}.source_stamp_s`,
+      ),
+      topic,
+    };
+  }
+  if (kind !== 'simulation_entity_pose' && kind !== 'detection3d_pose') {
+    return fail(`${path}.kind`, 'a supported ROS pose-observation kind');
+  }
+  exactKeysAt(record, ['api_version', 'kind', 'pose', 'source'], path);
+  const pose = parseSceneRuntimeObservationPose(record.pose, `${path}.pose`);
+  const source = objectAt(record.source, `${path}.source`);
+  if (kind === 'simulation_entity_pose') {
+    exactKeysAt(source, ['entity'], `${path}.source`);
+    return {
+      api_version: 'manyforge.ros_pose_observation.v1',
+      kind,
+      pose,
+      source: {
+        entity: nonEmptyStringAt(source.entity, `${path}.source.entity`),
+      },
+    };
+  }
+  exactKeysAt(
+    source,
+    [
+      'class_id',
+      'confidence',
+      'detection_id',
+      'max_position_variance_m2',
+      'topic',
+    ],
+    `${path}.source`,
+  );
+  const confidence = numberAt(source.confidence, `${path}.source.confidence`);
+  const variance = numberAt(
+    source.max_position_variance_m2,
+    `${path}.source.max_position_variance_m2`,
+  );
+  if (variance < 0) {
+    return fail(`${path}.source`, 'non-negative position covariance');
+  }
+  return {
+    api_version: 'manyforge.ros_pose_observation.v1',
+    kind,
+    pose,
+    source: {
+      class_id: stringAt(source.class_id, `${path}.source.class_id`),
+      confidence,
+      detection_id: stringAt(
+        source.detection_id,
+        `${path}.source.detection_id`,
+      ),
+      max_position_variance_m2: variance,
+      topic: nonEmptyStringAt(source.topic, `${path}.source.topic`),
+    },
+  };
+}
+
+function parseSceneRuntimeUnknownPayload(
+  value: unknown,
+  path: string,
+): SceneRuntimeUnknownObservationPayload {
+  const record = objectAt(value, path);
+  exactKeysAt(record, ['api_version', 'kind', 'source_error'], path);
+  if (record.api_version !== 'manyforge.ros_pose_observation.v1') {
+    return fail(`${path}.api_version`, 'manyforge.ros_pose_observation.v1');
+  }
+  const kind = stringAt(record.kind, `${path}.kind`);
+  if (![
+    'joint_state',
+    'simulation_entity_pose',
+    'detection3d_pose',
+  ].includes(kind)) {
+    return fail(`${path}.kind`, 'a supported ROS pose-observation kind');
+  }
+  const sourceError = objectAt(record.source_error, `${path}.source_error`);
+  exactKeysAt(
+    sourceError,
+    ['code', 'detail', 'source_key'],
+    `${path}.source_error`,
+  );
+  return {
+    api_version: 'manyforge.ros_pose_observation.v1',
+    kind: kind as SceneRuntimeUnknownObservationPayload['kind'],
+    source_error: {
+      code: nonEmptyStringAt(sourceError.code, `${path}.source_error.code`),
+      detail: nonEmptyStringAt(
+        sourceError.detail,
+        `${path}.source_error.detail`,
+      ),
+      source_key: nonEmptyStringAt(
+        sourceError.source_key,
+        `${path}.source_error.source_key`,
+      ),
+    },
+  };
+}
+
+function parseSceneRuntimePoseSource(
+  value: unknown,
+  path: string,
+): SceneRuntimePoseSource {
+  const record = objectAt(value, path);
+  exactKeysAt(
+    record,
+    [
+      'buffered',
+      'eligible',
+      'expires_at_ns',
+      'fresh',
+      'object_id',
+      'observed_at_ns',
+      'payload',
+      'policy_id',
+      'quality',
+      'source_epoch',
+      'source_epoch_order',
+      'source_id',
+      'source_sequence',
+    ],
+    path,
+  );
+  const observedAt = integerAt(record.observed_at_ns, `${path}.observed_at_ns`);
+  const expiresAt = integerAt(record.expires_at_ns, `${path}.expires_at_ns`);
+  if (expiresAt < observedAt) {
+    return fail(`${path}.expires_at_ns`, 'at least observed_at_ns');
+  }
+  const base = {
+    buffered: booleanAt(record.buffered, `${path}.buffered`),
+    expires_at_ns: expiresAt,
+    object_id: nonEmptyStringAt(record.object_id, `${path}.object_id`),
+    observed_at_ns: observedAt,
+    policy_id: nonEmptyStringAt(record.policy_id, `${path}.policy_id`),
+    source_epoch: nonEmptyStringAt(record.source_epoch, `${path}.source_epoch`),
+    source_epoch_order: positiveIntegerAt(
+      record.source_epoch_order,
+      `${path}.source_epoch_order`,
+    ),
+    source_id: nonEmptyStringAt(record.source_id, `${path}.source_id`),
+    source_sequence: positiveIntegerAt(
+      record.source_sequence,
+      `${path}.source_sequence`,
+    ),
+  };
+  const quality = stringAt(record.quality, `${path}.quality`);
+  const eligible = booleanAt(record.eligible, `${path}.eligible`);
+  const fresh = booleanAt(record.fresh, `${path}.fresh`);
+  if (quality === 'unknown') {
+    if (base.buffered || eligible || fresh) {
+      return fail(path, 'unknown quality to be unbuffered, ineligible, and stale');
+    }
+    return {
+      ...base,
+      buffered: false,
+      eligible: false,
+      fresh: false,
+      payload: parseSceneRuntimeUnknownPayload(record.payload, `${path}.payload`),
+      quality,
+    };
+  }
+  if (quality !== 'good') {
+    return fail(`${path}.quality`, '"good" or "unknown"');
+  }
+  if (base.buffered && (!eligible || !fresh)) {
+    return fail(path, 'a buffered observation to be eligible and fresh');
+  }
+  return {
+    ...base,
+    eligible,
+    fresh,
+    payload: parseSceneRuntimeGoodPayload(record.payload, `${path}.payload`),
+    quality,
   };
 }
 

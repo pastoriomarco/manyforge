@@ -11,6 +11,7 @@ import {
   sceneOwnerFacts,
   scenePoseTransaction,
 } from '../state/sceneAuthoring';
+import { runtimeScenePresentation } from '../state/runtimeScenePresentation';
 import type { StructuralResourceState } from '../state/structuralResource';
 import { useStructuralResource } from '../state/structuralResource';
 import {
@@ -578,6 +579,15 @@ export function SceneAuthoringWorkspace({
     () => facts?.logicalScene.snapshot?.objects ?? [],
     [facts],
   );
+  const runtimePresentation = useMemo(
+    () => runtimeScenePresentation(
+      facts?.sceneRuntime ?? null,
+      facts?.logicalScene ?? null,
+      sourceValue,
+      manifest.status === 'ready' ? manifest.data : null,
+    ),
+    [facts, manifest, sourceValue],
+  );
   const [selectedOccurrenceId, setSelectedOccurrenceId] = useState<string | null>(null);
   const [selectedObjectId, setSelectedObjectId] = useState<string | null>(null);
   const [livePose, setLivePose] = useState<LogicalScenePose | null>(null);
@@ -791,7 +801,22 @@ export function SceneAuthoringWorkspace({
                 <span>scene source <code>{facts.sourceOwnerEpoch}</code> / {facts.sourceGeneration}</span>
                 <span>runtime source <code>{facts.runtimeSourceOwnerEpoch}</code> / {facts.runtimeSourceGeneration}</span>
                 <span>revision <code>{facts.logicalScene.snapshot?.revision.revision_id}</code></span>
+                <span>
+                  observations <strong>{runtimePresentation.status.freshGood}</strong> fresh / {runtimePresentation.status.total}
+                </span>
+                <span>{runtimePresentation.status.staleGood} stale</span>
+                <span>{runtimePresentation.status.unknown} unknown</span>
+                <span>{runtimePresentation.status.buffered} buffered</span>
               </div>
+              {runtimePresentation.status.warnings.map((warning) => (
+                <p
+                  className="scene-contract-note warning-state"
+                  key={warning}
+                  role="status"
+                >
+                  Measured overlay: {warning}
+                </p>
+              ))}
               <select
                 aria-label="Current scene object"
                 value={selectedObjectId ?? ''}
@@ -926,6 +951,7 @@ export function SceneAuthoringWorkspace({
         }}
         candidateTcpPose={ghost}
         candidateStale={robotControl.state.ghostStale}
+        runtimePresentation={runtimePresentation}
         viewer={viewer}
       />
     </>

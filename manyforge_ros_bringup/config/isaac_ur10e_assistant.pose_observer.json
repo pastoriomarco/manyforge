@@ -21,6 +21,7 @@
     {
       "eligible": false,
       "entity": "/World/ur10e_robotiq2f_140_ROS/ur10e_robotiq2f_140/ee_link",
+      "frame_kind": "cell_frame",
       "lifetime_ns": 1000000000,
       "local_orientation_xyzw": [0, 0, 0, 1],
       "local_position_xyz": [0, 0, 0],
@@ -31,6 +32,7 @@
     {
       "eligible": true,
       "entity": "/mac_n_cheese_centered",
+      "frame_kind": "cell_frame",
       "lifetime_ns": 1000000000,
       "local_orientation_xyzw": [0, 0, 0, 1],
       "local_position_xyz": [0, 0, 0],

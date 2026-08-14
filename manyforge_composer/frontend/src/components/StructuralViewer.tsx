@@ -11,6 +11,7 @@ import {
 import * as THREE from 'three';
 import { resolveStructuralAssetUrl } from '../api/client';
 import type { StructuralResourceState } from '../state/structuralResource';
+import type { RuntimeScenePresentation } from '../state/runtimeScenePresentation';
 import type {
   LogicalSceneObject,
   LogicalSceneShape,
@@ -45,6 +46,7 @@ interface StructuralViewerProps {
   onSelectSceneResource?: (sceneResourceId: string | null) => void;
   candidateTcpPose?: Pose3Value | null;
   candidateStale?: boolean;
+  runtimePresentation?: RuntimeScenePresentation;
   viewer?: ProgramViewerMetadata;
 }
 
@@ -147,6 +149,33 @@ function CollisionMesh({ url }: { url: string }) {
   return <primitive object={clone} />;
 }
 
+function MeasuredVisualMesh({ url }: { url: string }) {
+  const gltf = useGLTF(resolveStructuralAssetUrl(url));
+  const clone = useMemo(() => {
+    const root = gltf.scene.clone(true);
+    root.traverse((object) => {
+      const mesh = object as THREE.Mesh;
+      if (!mesh.isMesh) return;
+      const sourceMaterials = Array.isArray(mesh.material)
+        ? mesh.material
+        : [mesh.material];
+      const materials = sourceMaterials.map(() => new THREE.MeshStandardMaterial({
+        color: '#43d7ec',
+        emissive: '#0c5060',
+        transparent: true,
+        opacity: 0.34,
+        wireframe: true,
+        depthWrite: false,
+        side: THREE.DoubleSide,
+      }));
+      mesh.material = Array.isArray(mesh.material) ? materials : materials[0];
+      mesh.renderOrder = 14;
+    });
+    return root;
+  }, [gltf.scene]);
+  return <primitive object={clone} />;
+}
+
 function PrimitiveGeometry({ primitive }: { primitive: SceneUrdfPrimitive }) {
   if (primitive.type === 'box') {
     return <boxGeometry args={primitive.size_m} />;
@@ -192,6 +221,27 @@ function PrimitiveCollision({ primitive }: { primitive: SceneUrdfPrimitive }) {
         emissive="#6f2a12"
         transparent
         opacity={0.42}
+        wireframe
+        depthWrite={false}
+        side={THREE.DoubleSide}
+      />
+    </mesh>
+  );
+}
+
+function PrimitiveMeasured({ primitive }: { primitive: SceneUrdfPrimitive }) {
+  const cylinderRotation: [number, number, number] | undefined =
+    primitive.type === 'cylinder'
+    ? [Math.PI / 2, 0, 0]
+    : undefined;
+  return (
+    <mesh rotation={cylinderRotation} renderOrder={14}>
+      <PrimitiveGeometry primitive={primitive} />
+      <meshStandardMaterial
+        color="#43d7ec"
+        emissive="#0c5060"
+        transparent
+        opacity={0.34}
         wireframe
         depthWrite={false}
         side={THREE.DoubleSide}
@@ -262,6 +312,49 @@ function RetainedNeutralModel({
           ))}
         </group>
       ))}
+    </group>
+  );
+}
+
+function MeasuredRuntimeModel({
+  manifest,
+  presentation,
+}: {
+  manifest: SceneUrdfManifest;
+  presentation: NonNullable<RuntimeScenePresentation['measuredRobot']>;
+}) {
+  return (
+    <group name={`owner-measured-robot:${presentation.objectId}`}>
+      {manifest.links.map((link) => {
+        const transform = presentation.linkTransforms[link.name];
+        if (transform === undefined) return null;
+        return (
+          <group
+            key={`measured:${manifest.model_key}:${link.name}`}
+            name={`measured:${link.name}`}
+            position={transform.position_m}
+            quaternion={normalizeQuaternion(transform.orientation_xyzw)}
+          >
+            {link.visuals.map((visual) => {
+              const origin = visual.visual_origin;
+              return (
+                <group
+                  key={`measured-visual:${link.name}:${visual.index}`}
+                  position={origin.position_m}
+                  quaternion={normalizeQuaternion(origin.orientation_xyzw)}
+                >
+                  {visual.mesh_url !== null && (
+                    <MeasuredVisualMesh url={visual.mesh_url} />
+                  )}
+                  {visual.mesh_url === null && visual.primitive !== null && (
+                    <PrimitiveMeasured primitive={visual.primitive} />
+                  )}
+                </group>
+              );
+            })}
+          </group>
+        );
+      })}
     </group>
   );
 }
@@ -339,6 +432,60 @@ function LogicalSceneObjects({
   );
 }
 
+function MeasuredLogicalSceneObjects({
+  objects,
+  presentation,
+  onSelect,
+}: {
+  objects: LogicalSceneObject[];
+  presentation: RuntimeScenePresentation;
+  onSelect: (sceneResourceId: string) => void;
+}) {
+  const objectById = new Map(
+    objects.map((object) => [object.scene_resource_id, object]),
+  );
+  return (
+    <group name="owner-measured-scene">
+      {presentation.measuredObjects.map((measurement) => {
+        const object = objectById.get(measurement.objectId);
+        if (object === undefined) return null;
+        return (
+          <group
+            key={`measured-scene:${measurement.objectId}:${measurement.sourceSequence}`}
+            name={`measured-scene:${measurement.objectId}`}
+            position={measurement.pose.position_m}
+            quaternion={normalizeQuaternion(measurement.pose.orientation_xyzw)}
+            onClick={(event) => {
+              event.stopPropagation();
+              onSelect(measurement.objectId);
+            }}
+          >
+            {object.collision_shapes.map((shape, index) => shape.type === 'mesh'
+              ? null
+              : (
+                  <mesh
+                    key={`measured-scene:${measurement.objectId}:${index}`}
+                    rotation={shape.type === 'cylinder' ? [Math.PI / 2, 0, 0] : undefined}
+                    renderOrder={16}
+                  >
+                    <LogicalShapeGeometry shape={shape} />
+                    <meshStandardMaterial
+                      color="#43d7ec"
+                      emissive="#0c5060"
+                      transparent
+                      opacity={0.4}
+                      wireframe
+                      depthWrite={false}
+                    />
+                  </mesh>
+                ))}
+          </group>
+        );
+      })}
+    </group>
+  );
+}
+
 function CandidateTcpGhost({
   pose,
   stale,
@@ -374,6 +521,34 @@ function CandidateTcpGhost({
   );
 }
 
+function MeasuredTcpMarker({
+  presentation,
+  axesSizeM,
+}: {
+  presentation: NonNullable<RuntimeScenePresentation['measuredTcp']>;
+  axesSizeM: number;
+}) {
+  return (
+    <group
+      name={`owner-measured-tcp:${presentation.objectId}`}
+      position={presentation.pose.position_m}
+      quaternion={normalizeQuaternion(presentation.pose.orientation_xyzw)}
+    >
+      <mesh renderOrder={18}>
+        <octahedronGeometry args={[Math.max(axesSizeM * 0.1, 0.008), 0]} />
+        <meshStandardMaterial
+          color="#43d7ec"
+          emissive="#0c5060"
+          transparent
+          opacity={0.88}
+          depthWrite={false}
+        />
+      </mesh>
+      <axesHelper args={[axesSizeM]} />
+    </group>
+  );
+}
+
 function ViewerCanvas({
   manifest,
   collisionsVisible,
@@ -384,6 +559,7 @@ function ViewerCanvas({
   onSelectSceneResource,
   candidateTcpPose,
   candidateStale,
+  runtimePresentation,
   viewer,
 }: {
   manifest: SceneUrdfManifest | null;
@@ -395,6 +571,7 @@ function ViewerCanvas({
   onSelectSceneResource: (sceneResourceId: string | null) => void;
   candidateTcpPose: Pose3Value | null;
   candidateStale: boolean;
+  runtimePresentation: RuntimeScenePresentation | undefined;
   viewer: ProgramViewerMetadata | undefined;
 }) {
   const devicePixelRatio = typeof window === 'undefined'
@@ -481,6 +658,13 @@ function ViewerCanvas({
                 manifest={manifest}
                 collisionsVisible={collisionsVisible}
               />
+              {runtimePresentation?.measuredRobot !== null
+                && runtimePresentation?.measuredRobot !== undefined && (
+                <MeasuredRuntimeModel
+                  manifest={manifest}
+                  presentation={runtimePresentation.measuredRobot}
+                />
+              )}
             </Bounds>
           </Suspense>
         </AssetErrorBoundary>
@@ -491,6 +675,20 @@ function ViewerCanvas({
         onSelect={(sceneResourceId) => onSelectSceneResource(sceneResourceId)}
         axesSizeM={viewer?.object_axes_gizmo_size_m ?? 0.1}
       />
+      {runtimePresentation !== undefined && (
+        <MeasuredLogicalSceneObjects
+          objects={sceneObjects}
+          presentation={runtimePresentation}
+          onSelect={(sceneResourceId) => onSelectSceneResource(sceneResourceId)}
+        />
+      )}
+      {runtimePresentation?.measuredTcp !== null
+        && runtimePresentation?.measuredTcp !== undefined && (
+        <MeasuredTcpMarker
+          presentation={runtimePresentation.measuredTcp}
+          axesSizeM={viewer?.frame_gizmo_size_m ?? 0.1}
+        />
+      )}
       {candidateTcpPose !== null && (
         <CandidateTcpGhost
           pose={candidateTcpPose}
@@ -510,6 +708,7 @@ function StructuralViewerContent({
   onSelectSceneResource = () => undefined,
   candidateTcpPose = null,
   candidateStale = false,
+  runtimePresentation,
   viewer,
 }: StructuralViewerProps) {
   const [collisionsVisible, setCollisionsVisible] = useState(false);
@@ -538,7 +737,23 @@ function StructuralViewerContent({
       ).length,
       0,
     )
-    + (candidateTcpPose === null ? 0 : 1);
+    + (candidateTcpPose === null ? 0 : 1)
+    + (runtimePresentation?.measuredRobot === null
+      || runtimePresentation?.measuredRobot === undefined
+      ? 0
+      : visualCount)
+    + (runtimePresentation?.measuredObjects.reduce(
+      (total, measurement) => {
+        const object = sceneObjects.find(
+          (candidate) => candidate.scene_resource_id === measurement.objectId,
+        );
+        return total + (object?.collision_shapes.filter(
+          (shape) => shape.type !== 'mesh',
+        ).length ?? 0);
+      }, 0,
+    ) ?? 0)
+    + (runtimePresentation?.measuredTcp === null
+      || runtimePresentation?.measuredTcp === undefined ? 0 : 1);
 
   const retry = () => {
     if (manifest.status === 'ready') {
@@ -596,6 +811,7 @@ function StructuralViewerContent({
             onSelectSceneResource={onSelectSceneResource}
             candidateTcpPose={candidateTcpPose}
             candidateStale={candidateStale}
+            runtimePresentation={runtimePresentation}
             viewer={viewer}
           />
         )}
@@ -655,6 +871,14 @@ function StructuralViewerContent({
             <span>neutral coordinates</span>
             <span>{sceneObjects.length} owner scene objects</span>
             {candidateTcpPose !== null && <span>validated TCP candidate</span>}
+            {runtimePresentation?.measuredRobot !== null
+              && runtimePresentation?.measuredRobot !== undefined
+              && <span>measured robot</span>}
+            {(runtimePresentation?.measuredObjects.length ?? 0) > 0
+              && <span>{runtimePresentation?.measuredObjects.length} measured objects</span>}
+            {runtimePresentation?.measuredTcp !== null
+              && runtimePresentation?.measuredTcp !== undefined
+              && <span>measured TCP</span>}
           </div>
         )}
       </div>
@@ -664,7 +888,14 @@ function StructuralViewerContent({
           <span>Root: <code>{manifest.data.projection.root_frame}</code></span>
           <span>Model key: <code>{manifest.data.model_key}</code></span>
           <span>Bundle: <code>{manifest.data.retained_bundle_id}</code></span>
-          <span>Runtime state used: <strong>no</strong></span>
+          <span>Retained model: <strong>neutral coordinates</strong></span>
+          <span>
+            Measured overlay: <strong>
+              {runtimePresentation === undefined
+                ? 'unavailable'
+                : `${runtimePresentation.status.freshGood} fresh / ${runtimePresentation.status.total} sources`}
+            </strong>
+          </span>
           <span>Scene overlay: <strong>owner-issued</strong></span>
           <span>Operational validity: <strong>not asserted</strong></span>
         </footer>

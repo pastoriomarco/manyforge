@@ -318,6 +318,28 @@ function sceneRuntimeFixture(): Record<string, unknown> {
   };
 }
 
+function poseSourceFixture(
+  payload: Record<string, unknown>,
+  overrides: Record<string, unknown> = {},
+): Record<string, unknown> {
+  return {
+    buffered: false,
+    eligible: false,
+    expires_at_ns: 2_000_000_000,
+    fresh: true,
+    object_id: 'robot-1',
+    observed_at_ns: 1_000_000_000,
+    payload,
+    policy_id: 'viewer.measured_robot',
+    quality: 'good',
+    source_epoch: 'observer-epoch-1',
+    source_epoch_order: 1,
+    source_id: 'isaac-observer',
+    source_sequence: 7,
+    ...overrides,
+  };
+}
+
 describe('parseSceneUrdfManifest', () => {
   it('accepts a complete authored-neutral projection', () => {
     const parsed = parseSceneUrdfManifest(structuralManifestFixture());
@@ -658,6 +680,110 @@ describe('headless projection parsers', () => {
     expect(parseLogicalSceneProjection(logicalSceneFixture()).snapshot?.objects[0]
       ?.scene_resource_id).toBe('part');
     expect(parseSceneRuntimeProjection(sceneRuntimeFixture()).state.state).toBe('open');
+  });
+
+  it('parses exact good and unknown ROS observation payloads', () => {
+    const fixture = sceneRuntimeFixture();
+    const state = fixture.state as Record<string, unknown>;
+    state.pose_sources = [
+      poseSourceFixture({
+        api_version: 'manyforge.ros_pose_observation.v1',
+        joint_names: ['joint_1', 'joint_2'],
+        kind: 'joint_state',
+        positions: [0.1, -0.2],
+        source_stamp_s: 12.5,
+        topic: '/isaac_joint_states',
+      }),
+      poseSourceFixture({
+        api_version: 'manyforge.ros_pose_observation.v1',
+        kind: 'simulation_entity_pose',
+        pose: {
+          frame_id: 'universe',
+          frame_kind: 'cell_frame',
+          orientation_xyzw: [0, 0, 0, 1],
+          position_m: [0.4, -0.2, 0.1],
+          source_stamp_s: 13,
+        },
+        source: { entity: '/mac_n_cheese_centered' },
+      }, {
+        eligible: true,
+        object_id: 'isaac_cheese_box',
+        policy_id: 'continuous_unattached',
+        source_sequence: 8,
+      }),
+      poseSourceFixture({
+        api_version: 'manyforge.ros_pose_observation.v1',
+        kind: 'detection3d_pose',
+        source_error: {
+          code: 'detection_not_found',
+          detail: 'no detection matched',
+          source_key: '/output',
+        },
+      }, {
+        fresh: false,
+        object_id: 'graspable',
+        policy_id: 'before_planning',
+        quality: 'unknown',
+        source_sequence: 9,
+      }),
+    ];
+
+    const parsed = parseSceneRuntimeProjection(fixture).state.pose_sources;
+    expect(parsed[0]?.payload.kind).toBe('joint_state');
+    expect(parsed[1]?.payload.kind).toBe('simulation_entity_pose');
+    expect(parsed[2]?.quality).toBe('unknown');
+  });
+
+  it('rejects ambiguous or dishonest ROS observation shapes', () => {
+    const invalidFrame = sceneRuntimeFixture();
+    (invalidFrame.state as Record<string, unknown>).pose_sources = [
+      poseSourceFixture({
+        api_version: 'manyforge.ros_pose_observation.v1',
+        kind: 'simulation_entity_pose',
+        pose: {
+          frame_id: 'world',
+          frame_kind: 'unmapped_frame',
+          orientation_xyzw: [0, 0, 0, 1],
+          position_m: [0, 0, 0],
+          source_stamp_s: null,
+        },
+        source: { entity: '/part' },
+      }),
+    ];
+    expect(() => parseSceneRuntimeProjection(invalidFrame)).toThrow(
+      'frame_kind must be the literal "cell_frame"',
+    );
+
+    const duplicateJoint = sceneRuntimeFixture();
+    (duplicateJoint.state as Record<string, unknown>).pose_sources = [
+      poseSourceFixture({
+        api_version: 'manyforge.ros_pose_observation.v1',
+        joint_names: ['joint_1', 'joint_1'],
+        kind: 'joint_state',
+        positions: [0.1, 0.2],
+        source_stamp_s: null,
+        topic: '/isaac_joint_states',
+      }),
+    ];
+    expect(() => parseSceneRuntimeProjection(duplicateJoint)).toThrow(
+      'equal non-empty unique joint_names',
+    );
+
+    const dishonestUnknown = sceneRuntimeFixture();
+    (dishonestUnknown.state as Record<string, unknown>).pose_sources = [
+      poseSourceFixture({
+        api_version: 'manyforge.ros_pose_observation.v1',
+        kind: 'joint_state',
+        source_error: {
+          code: 'source_error',
+          detail: 'offline',
+          source_key: '/isaac_joint_states',
+        },
+      }, { quality: 'unknown' }),
+    ];
+    expect(() => parseSceneRuntimeProjection(dishonestUnknown)).toThrow(
+      'unknown quality to be unbuffered, ineligible, and stale',
+    );
   });
 
   it('rejects stale shapes and cross-owner scene revisions', () => {
