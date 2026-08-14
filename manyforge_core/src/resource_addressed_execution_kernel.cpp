@@ -1942,7 +1942,14 @@ class ResourceAddressedExecutionKernel::StopProjectionWorker final {
 
   ~StopProjectionWorker() {
     Close();
-    worker_.request_stop();
+    // Serialize the stop-state transition with the mutex used by Run's wait
+    // predicate. Otherwise request_stop()/notify_all() can land after the
+    // predicate observes false but before the worker actually blocks, losing
+    // the only wakeup and hanging teardown.
+    {
+      std::lock_guard lock(mutex_);
+      worker_.request_stop();
+    }
     changed_.notify_all();
     if (worker_.joinable()) {
       worker_.join();
@@ -5246,10 +5253,16 @@ void ResourceAddressedExecutionKernel::CompleteOperationControlEffect(
       }
       if (result.control == OperationControlKind::kPause ||
           result.control == OperationControlKind::kResume) {
-        containment = internal_control_stop_intent_locked(
-            *operation, pending.accepted,
-            result.control == OperationControlKind::kPause ? "operation_pause_failed"
-                                                           : "operation_resume_failed");
+        // The first failed participant owns the one internal containment
+        // request. Later completions may preserve failure truth and finish
+        // prepared-Resume cleanup, but must join through the already resident
+        // Stop state rather than reserving the same internal request again.
+        if (!superseded_by_stop) {
+          containment = internal_control_stop_intent_locked(
+              *operation, pending.accepted,
+              result.control == OperationControlKind::kPause ? "operation_pause_failed"
+                                                             : "operation_resume_failed");
+        }
       } else {
         motion_admission_closed_ = true;
         operation->pending_control.reset();

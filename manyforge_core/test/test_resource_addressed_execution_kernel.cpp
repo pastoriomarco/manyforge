@@ -4178,6 +4178,13 @@ TEST(ResourceAddressedExecutionKernelTest,
            second_engine.translate_stop_stage_calls.load() == 1 &&
            third_engine.translate_stop_stage_calls.load() == 1;
   }));
+  ASSERT_TRUE(wait_until([&] {
+    const auto state = kernel.get_operation_state(executed.value().operation_id);
+    return state.ok() && state.value().state == OperationStateKind::kInterventionRequired;
+  }));
+  EXPECT_EQ(first_engine.translate_stop_stage_calls.load(), 1);
+  EXPECT_EQ(second_engine.translate_stop_stage_calls.load(), 1);
+  EXPECT_EQ(third_engine.translate_stop_stage_calls.load(), 1);
 }
 
 TEST(ResourceAddressedExecutionKernelTest,

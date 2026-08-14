@@ -50,7 +50,10 @@ class BoundedOperationControlExecutor::Impl final {
     } catch (...) {
       accepting_.store(false, std::memory_order_release);
       for (auto& slot : slots_) {
-        slot->worker.request_stop();
+        {
+          std::lock_guard lock(slot->mutex);
+          slot->worker.request_stop();
+        }
         slot->changed.notify_all();
       }
       throw;
@@ -64,7 +67,12 @@ class BoundedOperationControlExecutor::Impl final {
       std::terminate();
     }
     for (auto& slot : slots_) {
-      slot->worker.request_stop();
+      // Synchronize stop publication with the mutex protecting the wait
+      // predicate so shutdown cannot lose its only notification.
+      {
+        std::lock_guard lock(slot->mutex);
+        slot->worker.request_stop();
+      }
       slot->changed.notify_all();
     }
   }
