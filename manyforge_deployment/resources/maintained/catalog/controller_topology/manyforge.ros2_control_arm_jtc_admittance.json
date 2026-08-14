@@ -1,0 +1,85 @@
+{
+  "activation_sets": [
+    {
+      "activation_set_id": "arm_chain",
+      "active_chain_edges": [
+        {
+          "downstream_controller_role_id": "admittance",
+          "upstream_controller_role_id": "trajectory"
+        }
+      ],
+      "active_controller_role_ids": [
+        "admittance",
+        "trajectory"
+      ]
+    }
+  ],
+  "api_version": "manyforge.controller_topology.v1",
+  "chain_edges": [
+    {
+      "downstream_controller_role_id": "admittance",
+      "reference_interfaces": [
+        {
+          "interface_name": "position",
+          "resource_role_id": "arm_joints"
+        }
+      ],
+      "state_interfaces": [
+        {
+          "interface_name": "position",
+          "resource_role_id": "arm_joints"
+        }
+      ],
+      "upstream_controller_role_id": "trajectory"
+    }
+  ],
+  "controller_topology_id": "manyforge.ros2_control_arm_jtc_admittance",
+  "controllers": [
+    {
+      "control_interface_claims": [
+        {
+          "claimed_directions": [
+            "command",
+            "state"
+          ],
+          "control_interface_contract_id": "manyforge.ros2_control_arm_position",
+          "control_interface_revision": "sha256:d951ffd368654ba9998355a4b12844014469753c3c21e05df3b61f6f669cbb4b"
+        }
+      ],
+      "controller_role_id": "admittance",
+      "exported_reference_interfaces": [
+        {
+          "interface_name": "position",
+          "resource_role_id": "arm_joints"
+        }
+      ],
+      "exported_state_interfaces": [
+        {
+          "interface_name": "position",
+          "resource_role_id": "arm_joints"
+        }
+      ]
+    },
+    {
+      "control_interface_claims": [],
+      "controller_role_id": "trajectory",
+      "exported_reference_interfaces": [],
+      "exported_state_interfaces": []
+    }
+  ],
+  "legal_routes": [
+    {
+      "compatible_activation_set_ids": [
+        "arm_chain"
+      ],
+      "control_interface_contract_id": "manyforge.ros2_control_arm_position",
+      "control_interface_revision": "sha256:d951ffd368654ba9998355a4b12844014469753c3c21e05df3b61f6f669cbb4b",
+      "control_route_id": "arm_position",
+      "ordered_controller_role_ids": [
+        "trajectory",
+        "admittance"
+      ]
+    }
+  ],
+  "topology_revision": "sha256:68752de412f50bab13ff2ddbda4de1547b988b838c68fa73dff98a8433716f7e"
+}

@@ -71,19 +71,36 @@ struct Scenario final {
   std::string_view source;
   std::string_view family_id;
   bool assistant_enabled;
+  bool ros2_control_execution;
+  std::string_view isaac_profile;
 };
 
-constexpr std::array<Scenario, 7U> kScenarios{{
+constexpr std::array<Scenario, 12U> kScenarios{{
     {"examples/assistant_modes_scene_authoring.deployment.yaml",
-     "ur10e_robotiq_2f_140", true},
+     "ur10e_robotiq_2f_140", true, false, ""},
+    {"examples/isaac_lite6_lite_gripper_pick_and_place.deployment.yaml",
+     "lite6_lite_gripper", false, true, "lite6"},
+    {"examples/isaac_manipulator_scene_light_assistant.deployment.yaml",
+     "ur10e_robotiq_2f_140", true, true, "ur10e"},
+    {"examples/isaac_manipulator_scene_light_ros2_control.deployment.yaml",
+     "ur10e_robotiq_2f_140", false, true, "ur10e"},
+    {"examples/"
+     "isaac_manipulator_scene_light_ros2_control_collision.deployment.yaml",
+     "ur10e_robotiq_2f_140", false, true, "ur10e"},
     {"examples/lite6_lite_gripper_pick_and_place.deployment.yaml",
-     "lite6_lite_gripper", false},
-    {"examples/pick_and_place.deployment.yaml", "ur5_roboplan", false},
+     "lite6_lite_gripper", false, false, ""},
+    {"examples/pick_and_place.deployment.yaml", "ur5_roboplan", false, false,
+     ""},
     {"examples/pick_and_place_ur10e_robotiq.deployment.yaml",
-     "ur10e_robotiq_2f_140", false},
-    {"examples/semantic_shape_pick.deployment.yaml", "ur5_roboplan", true},
-    {"examples/vision_guided_bin_pick.deployment.yaml", "ur5_roboplan", true},
-    {"examples/vision_guided_pose_pick.deployment.yaml", "ur5_roboplan", true},
+     "ur10e_robotiq_2f_140", false, false, ""},
+    {"examples/semantic_shape_pick.deployment.yaml", "ur5_roboplan", true,
+     false, ""},
+    {"examples/trocar_lite6_foundationpose_pick.deployment.yaml",
+     "lite6_lite_gripper", false, true, "lite6"},
+    {"examples/vision_guided_bin_pick.deployment.yaml", "ur5_roboplan", true,
+     false, ""},
+    {"examples/vision_guided_pose_pick.deployment.yaml", "ur5_roboplan", true,
+     false, ""},
 }};
 
 [[nodiscard]] Options parse_options(int argc, char **argv) {
@@ -516,10 +533,25 @@ materialize_scenarios(const std::filesystem::path &root,
   std::map<std::string, ScenarioProduct, std::less<>> result;
 
   for (const auto &scenario : kScenarios) {
+    const std::string expected_runtime_profile_id =
+        scenario.ros2_control_execution
+            ? "manyforge.ros2_control_execution_runtime"
+            : "manyforge.native_execution_runtime";
+    std::vector<deployment::QualifiedRuntimeProfile> envelope_profiles;
+    std::copy_if(
+        catalog.runtime_profiles.begin(), catalog.runtime_profiles.end(),
+        std::back_inserter(envelope_profiles), [&](const auto &profile) {
+          return profile.value().runtime_profile_id.value() ==
+                 expected_runtime_profile_id;
+        });
+    if (envelope_profiles.size() != 1U) {
+      throw std::logic_error(
+          "scenario cannot select its exact deployment runtime profile");
+    }
     const auto verified = deployment::verify_deployment_artifact_revision(
         deployment::parse_strict_json_model_yaml(
             read_file(root / scenario.source)),
-        catalog.runtime_profiles);
+        envelope_profiles);
     std::set<CatalogKey> selected_records;
     for (const auto &reference : verified.catalog_records()) {
       selected_records.insert(catalog_key(reference));
@@ -935,7 +967,7 @@ void verify_resolved_program_binding(
       require_array(require_member(parsed.root(), "assignments",
                                    "maintained role assignments"),
                     "maintained role assignments.assignments");
-  if (rows.size() != 8U || products.size() != 7U) {
+  if (rows.size() != 13U || products.size() != 12U) {
     throw std::invalid_argument(
         "maintained Program/deployment assignment set has the wrong size");
   }
@@ -1054,7 +1086,7 @@ void verify_resolved_program_binding(
           program_source.generic_string(), binding->program_binding_id(),
           binding->value().program_id, binding->value().program_revision});
     }
-    if (repository.size() != 8U) {
+    if (repository.size() != 13U) {
       throw std::logic_error(
           "durable maintained Program-Binding repository has the wrong size");
     }
@@ -1095,12 +1127,17 @@ void verify_resolved_program_binding(
   const auto reused_program = program_bundles.find(
       "sha256:"
       "385569e5d9b2c2628abf67fc4633583e97cd9cfb0fc881d3cf3bae0750d2951a");
-  if (binding_ids.size() != 8U || program_revisions.size() != 7U ||
-      reopened.size() != 8U || program_reopened.size() != 7U ||
+  const auto reused_lite6_program = program_bundles.find(
+      "sha256:"
+      "3569bdaa98278af447084b31f2e2f920e4b760e8c60ce803de1a18aac78ee7f2");
+  if (binding_ids.size() != 13U || program_revisions.size() != 7U ||
+      reopened.size() != 13U || program_reopened.size() != 7U ||
       reused_program == program_bundles.end() ||
-      reused_program->second.size() != 2U) {
+      reused_program->second.size() != 5U ||
+      reused_lite6_program == program_bundles.end() ||
+      reused_lite6_program->second.size() != 3U) {
     throw std::logic_error(
-        "maintained Program-Binding set loses its seven-to-eight closure");
+        "maintained Program-Binding set loses its seven-to-thirteen closure");
   }
   return stored;
 }
@@ -1150,9 +1187,9 @@ void publish_and_verify_scenario_catalog(
     const std::map<std::string, ScenarioProduct, std::less<>> &products,
     const std::vector<StoredProgramBinding> &bindings,
     const std::filesystem::path &package_root) {
-  if (bindings.size() != 8U) {
+  if (bindings.size() != 13U) {
     throw std::logic_error(
-        "maintained scenario catalog requires eight Program Bindings");
+        "maintained scenario catalog requires thirteen Program Bindings");
   }
   std::map<std::string, std::filesystem::path, std::less<>> staged;
   std::vector<deployment::ScenarioCatalogRowDTO> rows;
@@ -1286,7 +1323,7 @@ void publish_and_verify_scenario_catalog(
         .typed_parameter_overrides_json = "{}",
     };
     const auto verified = deployment::verify_scenario_artifact_closure(query);
-    if (verified.lane != "manyforge-only" ||
+    if (verified.lane != product->second.deployment_compatibility.lane ||
         verified.assistant_enabled !=
             product->second.bundle->value().assistant.has_value()) {
       throw std::logic_error(
@@ -1423,7 +1460,7 @@ qualify_catalog(const std::filesystem::path &root,
 
   std::vector<deployment::QualifiedControlInterfaceContract> contracts;
   for (const auto &path :
-       source_files(catalog_root / "control_interface_contract", 2U)) {
+       source_files(catalog_root / "control_interface_contract", 4U)) {
     const std::string bytes = read_file(path);
     const auto reference =
         make_reference<core::ControlInterfaceContractCatalogRecordRefDTO>(
@@ -1437,14 +1474,18 @@ qualify_catalog(const std::filesystem::path &root,
   }
 
   for (const auto &path :
-       source_files(catalog_root / "controller_topology", 2U)) {
+       source_files(catalog_root / "controller_topology", 5U)) {
     const std::string bytes = read_file(path);
     const auto reference =
         make_reference<core::ControllerTopologyCatalogRecordRefDTO>(bytes);
+    const bool ros2_control =
+        reference.record_id.value().starts_with("manyforge.ros2_control_");
+    const bool arm =
+        reference.record_id.value().find("_arm_") != std::string::npos;
     const std::string expected_contract_id =
-        reference.record_id.value().find("_arm_") != std::string::npos
-            ? "manyforge.native_arm_position"
-            : "manyforge.native_gripper_position";
+        std::string("manyforge.") +
+        (ros2_control ? "ros2_control_" : "native_") +
+        (arm ? "arm_position" : "gripper_position");
     std::vector<deployment::QualifiedControlInterfaceContract> selected;
     std::copy_if(
         contracts.begin(), contracts.end(), std::back_inserter(selected),
@@ -1465,8 +1506,9 @@ qualify_catalog(const std::filesystem::path &root,
   }
 
   bool found_lite6_lifecycle_manifest = false;
+  bool found_ros2_control_lifecycle_manifest = false;
   for (const auto &path :
-       source_files(catalog_root / "provider_manifest", 6U)) {
+       source_files(catalog_root / "provider_manifest", 7U)) {
     const std::string bytes = read_file(path);
     const auto reference =
         make_reference<core::ProviderManifestCatalogRecordRefDTO>(bytes);
@@ -1483,18 +1525,32 @@ qualify_catalog(const std::filesystem::path &root,
             "maintained Lite6 lifecycle provider manifest is not exact");
       }
       found_lite6_lifecycle_manifest = true;
+    } else if (manifest.value().provider_manifest_id.value() ==
+               "manyforge.provider.ros2_control") {
+      if (found_ros2_control_lifecycle_manifest ||
+          !manifest.value().lifecycle_plan_catalog.has_value() ||
+          manifest.value()
+                  .lifecycle_plan_catalog->catalog_api_version.value() !=
+              core::kBrandLifecyclePlanCatalogApiVersion ||
+          manifest.value().offered_capabilities.size() != 27U ||
+          manifest.value().provider_contracts.size() != 1U) {
+        throw std::logic_error(
+            "maintained ROS control lifecycle provider manifest is not exact");
+      }
+      found_ros2_control_lifecycle_manifest = true;
     }
     result.provider_manifests.push_back(std::move(manifest));
     input_source.add(reference.content_addressed_store_key,
                      reference.content_digest, bytes);
     insert_reference(result, reference);
   }
-  if (!found_lite6_lifecycle_manifest) {
+  if (!found_lite6_lifecycle_manifest ||
+      !found_ros2_control_lifecycle_manifest) {
     throw std::logic_error(
-        "maintained Lite6 lifecycle provider manifest is missing");
+        "maintained lifecycle provider manifest closure is missing");
   }
 
-  for (const auto &path : source_files(catalog_root / "runtime_profile", 1U)) {
+  for (const auto &path : source_files(catalog_root / "runtime_profile", 2U)) {
     const std::string bytes = read_file(path);
     const auto reference =
         make_reference<core::RuntimeProfileCatalogRecordRefDTO>(bytes);
@@ -1506,7 +1562,7 @@ qualify_catalog(const std::filesystem::path &root,
     insert_reference(result, reference);
   }
 
-  for (const auto &path : source_files(catalog_root / "runtime_policy", 1U)) {
+  for (const auto &path : source_files(catalog_root / "runtime_policy", 2U)) {
     const std::string bytes = read_file(path);
     const auto reference =
         make_reference<core::RuntimePolicyCatalogRecordRefDTO>(bytes);
@@ -1637,8 +1693,8 @@ qualify_catalog(const std::filesystem::path &root,
     result.model_assets.push_back(std::move(verified));
     result.structural_preparations.push_back(std::move(preparation));
   }
-  if (result.records.size() != 63U || result.runtime_profiles.size() != 1U ||
-      result.runtime_policies.size() != 1U) {
+  if (result.records.size() != 71U || result.runtime_profiles.size() != 2U ||
+      result.runtime_policies.size() != 2U) {
     throw std::logic_error("maintained exact catalog closure is incomplete");
   }
   return result;
@@ -1653,9 +1709,23 @@ void verify_scenarios(const std::filesystem::path &root,
       family_identities;
   for (const auto &scenario : kScenarios) {
     const std::string bytes = read_file(root / scenario.source);
+    const std::string expected_runtime_profile_id =
+        scenario.ros2_control_execution
+            ? "manyforge.ros2_control_execution_runtime"
+            : "manyforge.native_execution_runtime";
+    std::vector<deployment::QualifiedRuntimeProfile> envelope_profiles;
+    std::copy_if(
+        catalog.runtime_profiles.begin(), catalog.runtime_profiles.end(),
+        std::back_inserter(envelope_profiles), [&](const auto &profile) {
+          return profile.value().runtime_profile_id.value() ==
+                 expected_runtime_profile_id;
+        });
+    if (envelope_profiles.size() != 1U) {
+      throw std::logic_error(
+          "scenario cannot select its exact deployment runtime profile");
+    }
     const auto verified = deployment::verify_deployment_artifact_revision(
-        deployment::parse_strict_json_model_yaml(bytes),
-        catalog.runtime_profiles);
+        deployment::parse_strict_json_model_yaml(bytes), envelope_profiles);
     if (verified.assistant_settings().enabled() != scenario.assistant_enabled) {
       throw std::invalid_argument(
           "maintained scenario has the wrong assistant disposition: " +
@@ -1692,7 +1762,8 @@ void verify_scenarios(const std::filesystem::path &root,
       external_manifest_ids.insert(resource.provider_manifest_id);
     }
     const std::size_t expected_catalog_count =
-        49U + 2U * external_manifest_ids.size();
+        (scenario.ros2_control_execution ? 53U : 49U) +
+        2U * external_manifest_ids.size();
     if (verified.catalog_records().size() != expected_catalog_count) {
       throw std::invalid_argument(
           "maintained scenario has the wrong exact catalog closure: " +
@@ -1725,8 +1796,19 @@ void verify_scenarios(const std::filesystem::path &root,
                                   std::string(scenario.source));
     }
     const auto &runtime = graph.runtime_units.front();
+    if (runtime.runtime_profile_id.value() != expected_runtime_profile_id) {
+      throw std::invalid_argument(
+          "maintained scenario selects the wrong exact runtime product: " +
+          std::string(scenario.source));
+    }
     core::JsonValueDTO::Array initial_positions;
-    if (scenario.family_id == std::string_view("lite6_lite_gripper")) {
+    if (scenario.ros2_control_execution &&
+        scenario.isaac_profile == std::string_view("ur10e")) {
+      initial_positions = {
+          core::JsonValueDTO{2.63422544},   core::JsonValueDTO{-0.875980752},
+          core::JsonValueDTO{1.551074106},  core::JsonValueDTO{-2.29231544},
+          core::JsonValueDTO{-1.560498884}, core::JsonValueDTO{-2.038544566}};
+    } else if (scenario.family_id == std::string_view("lite6_lite_gripper")) {
       initial_positions = {core::JsonValueDTO{0.0},  core::JsonValueDTO{0.0},
                            core::JsonValueDTO{1.57}, core::JsonValueDTO{0.0},
                            core::JsonValueDTO{0.0},  core::JsonValueDTO{0.0}};
@@ -1735,14 +1817,21 @@ void verify_scenarios(const std::filesystem::path &root,
                            core::JsonValueDTO{1.57},  core::JsonValueDTO{-1.57},
                            core::JsonValueDTO{-1.57}, core::JsonValueDTO{0.0}};
     }
-    const core::JsonObjectDTO expected_runtime_configuration{
+    core::JsonObjectDTO expected_runtime_configuration{
         {"collision_monitor_period_ms", core::JsonValueDTO{50.0}},
         {"execution_tick_hz", core::JsonValueDTO{100.0}},
         {"initial_joint_positions_rad",
          core::JsonValueDTO{std::move(initial_positions)}},
-        {"mode", core::JsonValueDTO{std::string("simulated")}},
+        {"mode",
+         core::JsonValueDTO{std::string(
+             scenario.ros2_control_execution ? "commanded_sim" : "simulated")}},
         {"planner_rng_seed", core::JsonValueDTO{12345.0}},
     };
+    if (scenario.ros2_control_execution) {
+      expected_runtime_configuration.emplace(
+          "isaac_profile",
+          core::JsonValueDTO{std::string(scenario.isaac_profile)});
+    }
     if (runtime.configuration != expected_runtime_configuration) {
       throw std::invalid_argument(
           "maintained scenario loses its exact historical runtime inputs: " +
@@ -1750,8 +1839,27 @@ void verify_scenarios(const std::filesystem::path &root,
     }
 
     std::set<std::string> historical_capabilities;
+    std::optional<core::ProviderInstanceId> ros2_control_provider_instance;
     for (const auto &binding : graph.control_bindings) {
       historical_capabilities.insert(binding.capability_id.value());
+      if (scenario.ros2_control_execution) {
+        if (binding.state_authority_class !=
+                core::StateAuthorityClass::kCommanded ||
+            binding.provider_manifest_id.value() !=
+                "manyforge.provider.ros2_control" ||
+            binding.provider_runtime_unit_id != runtime.runtime_unit_id) {
+          throw std::invalid_argument(
+              "Isaac scenario loses its commanded ROS control binding: " +
+              std::string(scenario.source));
+        }
+        if (!ros2_control_provider_instance.has_value()) {
+          ros2_control_provider_instance = binding.provider_instance_id;
+        } else if (*ros2_control_provider_instance !=
+                   binding.provider_instance_id) {
+          throw std::invalid_argument(
+              "Isaac scenario splits one physical ROS provider occurrence");
+        }
+      }
     }
     for (const auto &binding : applicability.capability_provider_bindings) {
       if (!binding.capability_id.value().starts_with("assistant.")) {
@@ -1776,6 +1884,15 @@ void verify_scenarios(const std::filesystem::path &root,
                                       "the logical-scene boundary: " +
                                       binding.capability_id.value());
         }
+      } else if (scenario.ros2_control_execution &&
+                 binding.provider_manifest_id.value() ==
+                     "manyforge.provider.ros2_control" &&
+                 (!ros2_control_provider_instance.has_value() ||
+                  binding.provider_instance_id !=
+                      *ros2_control_provider_instance)) {
+        throw std::invalid_argument(
+            "Isaac planning capability does not join its physical ROS "
+            "provider occurrence");
       }
     }
     if (historical_capabilities.size() != 36U) {
@@ -1833,7 +1950,7 @@ int main(int argc, char **argv) {
             "externally unqualified maintained Stop deployments produced "
             "retained products");
       }
-      std::cout << "7 maintained deployments compile exactly and all require "
+      std::cout << "12 maintained deployments compile exactly and all require "
                    "external software-hard build qualification before "
                    "retention\n";
       return 0;
@@ -1842,9 +1959,9 @@ int main(int argc, char **argv) {
         verify_program_bindings(root, products, package.path());
     publish_and_verify_scenario_catalog(root, products, bindings,
                                         package.path());
-    std::cout << "7 deployments, 3 shared families, 36 historical facilities, "
-                 "63 exact catalog referents, 8 durable Program Bindings, "
-                 "and 8 scenario closures qualified\n";
+    std::cout << "12 deployments, 3 shared families, 36 historical facilities, "
+                 "71 exact catalog referents, 13 durable Program Bindings, "
+                 "and 13 scenario closures qualified\n";
     return 0;
   } catch (const std::exception &error) {
     std::cerr << "manyforge_maintained_deployment_occurrences: " << error.what()

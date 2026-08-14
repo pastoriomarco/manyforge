@@ -30,6 +30,106 @@
     },
     {
       "component_roles": {
+        "robot": "isaac_lite6_robot",
+        "tool": "isaac_lite6_robot"
+      },
+      "deployment_artifact_id": "isaac_lite6_lite_gripper_pick_and_place",
+      "deployment_revision": "sha256:6514f1022c6862f2ddfc68a15060de3c0cea74de767e6cbc0b656d9346e16dac",
+      "deployment_source": "examples/isaac_lite6_lite_gripper_pick_and_place.deployment.yaml",
+      "program_id": "lite6_lite_gripper_pick_and_place",
+      "program_revision": "sha256:3569bdaa98278af447084b31f2e2f920e4b760e8c60ce803de1a18aac78ee7f2",
+      "program_source": "examples/lite6_lite_gripper_pick_and_place.program.yaml",
+      "scenario_aliases": [],
+      "scenario_id": "isaac-lite6-pick-place",
+      "target_roles": {
+        "arm": {
+          "command_target_id": "arm",
+          "component_role": "robot"
+        },
+        "gripper": {
+          "command_target_id": "gripper",
+          "component_role": "tool"
+        }
+      }
+    },
+    {
+      "component_roles": {
+        "robot": "isaac_ur10e_assistant_robot",
+        "tool": "isaac_ur10e_assistant_robot"
+      },
+      "deployment_artifact_id": "isaac_manipulator_scene_light_assistant",
+      "deployment_revision": "sha256:db4288e04a673730643cabd8e25266cd967f588255b8acce03429e29b7e3b65f",
+      "deployment_source": "examples/isaac_manipulator_scene_light_assistant.deployment.yaml",
+      "program_id": "pick_and_place_ur10e_robotiq_demo",
+      "program_revision": "sha256:385569e5d9b2c2628abf67fc4633583e97cd9cfb0fc881d3cf3bae0750d2951a",
+      "program_source": "examples/pick_and_place_ur10e_robotiq.program.yaml",
+      "scenario_aliases": [
+        "isaac-assistant"
+      ],
+      "scenario_id": "isaac-ur10e-light-scene-assistant",
+      "target_roles": {
+        "arm": {
+          "command_target_id": "arm",
+          "component_role": "robot"
+        },
+        "gripper": {
+          "command_target_id": "gripper",
+          "component_role": "tool"
+        }
+      }
+    },
+    {
+      "component_roles": {
+        "robot": "isaac_ur10e_light_robot",
+        "tool": "isaac_ur10e_light_robot"
+      },
+      "deployment_artifact_id": "isaac_manipulator_scene_light_ros2_control",
+      "deployment_revision": "sha256:5117145b90ca04fc458c0ad39a5ef6d87ee8feff30e1ccf6a3cdb06a761e143f",
+      "deployment_source": "examples/isaac_manipulator_scene_light_ros2_control.deployment.yaml",
+      "program_id": "pick_and_place_ur10e_robotiq_demo",
+      "program_revision": "sha256:385569e5d9b2c2628abf67fc4633583e97cd9cfb0fc881d3cf3bae0750d2951a",
+      "program_source": "examples/pick_and_place_ur10e_robotiq.program.yaml",
+      "scenario_aliases": [
+        "isaac-light"
+      ],
+      "scenario_id": "isaac-ur10e-light-scene",
+      "target_roles": {
+        "arm": {
+          "command_target_id": "arm",
+          "component_role": "robot"
+        },
+        "gripper": {
+          "command_target_id": "gripper",
+          "component_role": "tool"
+        }
+      }
+    },
+    {
+      "component_roles": {
+        "robot": "isaac_ur10e_collision_robot",
+        "tool": "isaac_ur10e_collision_robot"
+      },
+      "deployment_artifact_id": "isaac_manipulator_scene_light_ros2_control_collision",
+      "deployment_revision": "sha256:3e78b462bed1bfac4e41f07e92c5df21cb52726310e22d92ac3aae798768bfd1",
+      "deployment_source": "examples/isaac_manipulator_scene_light_ros2_control_collision.deployment.yaml",
+      "program_id": "pick_and_place_ur10e_robotiq_demo",
+      "program_revision": "sha256:385569e5d9b2c2628abf67fc4633583e97cd9cfb0fc881d3cf3bae0750d2951a",
+      "program_source": "examples/pick_and_place_ur10e_robotiq.program.yaml",
+      "scenario_aliases": [],
+      "scenario_id": "isaac-ur10e-light-scene-collision",
+      "target_roles": {
+        "arm": {
+          "command_target_id": "arm",
+          "component_role": "robot"
+        },
+        "gripper": {
+          "command_target_id": "gripper",
+          "component_role": "tool"
+        }
+      }
+    },
+    {
+      "component_roles": {
         "robot": "lite6_robot",
         "tool": "lite6_robot"
       },
@@ -140,6 +240,30 @@
         "ur5-semantic-shape-pick"
       ],
       "scenario_id": "ur5_semantic_shape_pick",
+      "target_roles": {
+        "arm": {
+          "command_target_id": "arm",
+          "component_role": "robot"
+        },
+        "gripper": {
+          "command_target_id": "gripper",
+          "component_role": "tool"
+        }
+      }
+    },
+    {
+      "component_roles": {
+        "robot": "isaac_lite6_trocar_robot",
+        "tool": "isaac_lite6_trocar_robot"
+      },
+      "deployment_artifact_id": "trocar_lite6_foundationpose_pick",
+      "deployment_revision": "sha256:2ec0c46ccf8f1ae8a96991eff654a3fe56323b383887c8eacd06b941ca01d171",
+      "deployment_source": "examples/trocar_lite6_foundationpose_pick.deployment.yaml",
+      "program_id": "lite6_lite_gripper_pick_and_place",
+      "program_revision": "sha256:3569bdaa98278af447084b31f2e2f920e4b760e8c60ce803de1a18aac78ee7f2",
+      "program_source": "examples/lite6_lite_gripper_pick_and_place.program.yaml",
+      "scenario_aliases": [],
+      "scenario_id": "isaac-lite6-trocar-foundationpose",
       "target_roles": {
         "arm": {
           "command_target_id": "arm",

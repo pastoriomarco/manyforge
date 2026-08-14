@@ -1,0 +1,20 @@
+{
+  "api_version": "manyforge.control_interface_contract.v1",
+  "command_interfaces": [
+    {
+      "interface_name": "position",
+      "resource_role_id": "fingers"
+    }
+  ],
+  "control_interface_contract_id": "manyforge.ros2_control_gripper_position",
+  "control_interface_revision": "sha256:c2842924f7caea9978d19db8cd6a3d9eb45700cc77008e36e7edf7b1fae79d6e",
+  "ordering": [
+    "fingers"
+  ],
+  "state_interfaces": [
+    {
+      "interface_name": "position",
+      "resource_role_id": "fingers"
+    }
+  ]
+}

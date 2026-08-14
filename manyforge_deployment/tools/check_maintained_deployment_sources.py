@@ -19,7 +19,7 @@ PROGRAM_API_VERSION: Final = "manyforge.program.v1"
 _EXPECTED_HISTORICAL_SOURCE_COMMIT: Final = "c4b075fa6dfb69e463c61f3efa8cfce8de681e8a"
 _ID = re.compile(r"^[a-z][a-z0-9_.-]{0,127}$")
 _HEX40 = re.compile(r"^[0-9a-f]{40}$")
-_EXPECTED_DEPLOYMENT_SOURCES: Final = frozenset(
+_NATIVE_DEPLOYMENT_SOURCES: Final = frozenset(
     {
         "examples/assistant_modes_scene_authoring.deployment.yaml",
         "examples/lite6_lite_gripper_pick_and_place.deployment.yaml",
@@ -29,6 +29,18 @@ _EXPECTED_DEPLOYMENT_SOURCES: Final = frozenset(
         "examples/vision_guided_bin_pick.deployment.yaml",
         "examples/vision_guided_pose_pick.deployment.yaml",
     }
+)
+_I9_DEPLOYMENT_SOURCES: Final = frozenset(
+    {
+        "examples/isaac_lite6_lite_gripper_pick_and_place.deployment.yaml",
+        "examples/isaac_manipulator_scene_light_assistant.deployment.yaml",
+        "examples/isaac_manipulator_scene_light_ros2_control.deployment.yaml",
+        "examples/isaac_manipulator_scene_light_ros2_control_collision.deployment.yaml",
+        "examples/trocar_lite6_foundationpose_pick.deployment.yaml",
+    }
+)
+_EXPECTED_DEPLOYMENT_SOURCES: Final = (
+    _NATIVE_DEPLOYMENT_SOURCES | _I9_DEPLOYMENT_SOURCES
 )
 _EXPECTED_HISTORICAL_BLOBS: Final = {
     "examples/assistant_modes_scene_authoring.deployment.yaml": (
@@ -44,6 +56,43 @@ _EXPECTED_HISTORICAL_BLOBS: Final = {
     "examples/semantic_shape_pick.deployment.yaml": "115ab078116696847a9c037f0b20d5b3e39b1741",
     "examples/vision_guided_bin_pick.deployment.yaml": "332b8b6daa93cf4b0533e93a42736fd67b8654c5",
     "examples/vision_guided_pose_pick.deployment.yaml": "a65a0011ee0247cb3bb0281360fa4c46073bbf9d",
+    "examples/isaac_lite6_lite_gripper_pick_and_place.deployment.yaml": (
+        "cb66876a3af94a41836fa4b20bae9cd4d38d405b"
+    ),
+    "examples/isaac_manipulator_scene_light_assistant.deployment.yaml": (
+        "fbf2ec5572e3aec68fef1644515396950cbd6a9f"
+    ),
+    "examples/isaac_manipulator_scene_light_ros2_control.deployment.yaml": (
+        "0178a5f9d2d1ee603cf63feddafa68d14e707c43"
+    ),
+    "examples/isaac_manipulator_scene_light_ros2_control_collision.deployment.yaml": (
+        "aa9b85224e9590e26ebf59fd753ed17ba972e393"
+    ),
+    "examples/trocar_lite6_foundationpose_pick.deployment.yaml": (
+        "df371a183e2f8340071a34ec41e646814f99995f"
+    ),
+}
+_EXPECTED_I9_HISTORICAL_PROGRAMS: Final = {
+    "examples/isaac_lite6_lite_gripper_pick_and_place.deployment.yaml": {
+        "source": "examples/isaac_lite6_lite_gripper_pick_and_place.program.yaml",
+        "blob": "f9df086c34a89a4bab38da348fa01702bbe3e67c",
+    },
+    "examples/isaac_manipulator_scene_light_assistant.deployment.yaml": {
+        "source": "examples/isaac_manipulator_scene_light.program.yaml",
+        "blob": "a6bde14809eb17a2ac812e089b75495c823e4ec3",
+    },
+    "examples/isaac_manipulator_scene_light_ros2_control.deployment.yaml": {
+        "source": "examples/isaac_manipulator_scene_light.program.yaml",
+        "blob": "a6bde14809eb17a2ac812e089b75495c823e4ec3",
+    },
+    "examples/isaac_manipulator_scene_light_ros2_control_collision.deployment.yaml": {
+        "source": "examples/isaac_manipulator_scene_light_collision.program.yaml",
+        "blob": "e10e0575e8365034b99ade64dc1157a0e0ed7a74",
+    },
+    "examples/trocar_lite6_foundationpose_pick.deployment.yaml": {
+        "source": "examples/trocar_lite6_foundationpose_pick.program.yaml",
+        "blob": "f492ed998341143e8733bf193dc29b2492904615",
+    },
 }
 _EXPECTED_HISTORICAL_PROGRAM_BLOBS: Final = {
     "examples/lite6_lite_gripper_pick_and_place.program.yaml": (
@@ -98,7 +147,50 @@ _RUNTIME_RESTORATION_ACCEPTANCE: Final = [
         "acceptance_steps": ["N6-a3", "N7", "I8/P5"],
     },
 ]
+_ROS2_CONTROL_RUNTIME_RESTORATION_SOURCE_FIELDS: Final = {
+    "collision_monitor_period_ms": "orchestrator.config.collision_monitor_period_ms",
+    "default_fault_stop_profile": (
+        "adapters.execution.config.default_fault_stop_profile"
+    ),
+    "execution_tick_hz": "retained_runtime_defaults.execution_tick_hz",
+    "initial_joint_positions_rad": (
+        "adapters.execution.config.initial_joint_positions_rad"
+    ),
+    "isaac_profile": "robot_config.robot_id",
+    "mode": "adapters.execution.config.execution_state_source_mode",
+    "operator_stop_profile": "adapters.execution.config.operator_stop_profile",
+    "planner_rng_seed": "adapters.planning.config.rng_seed",
+}
+_ROS2_CONTROL_RUNTIME_RESTORATION_ACCEPTANCE: Final = [
+    {
+        "obligation_id": "retained_isaac_initial_state_and_execution_cadence",
+        "acceptance_steps": ["I9/I"],
+    },
+    {
+        "obligation_id": "retained_isaac_planner_seed",
+        "acceptance_steps": ["I9/I"],
+    },
+    {
+        "obligation_id": "retained_ros2_control_stop_profiles",
+        "acceptance_steps": ["I8/P5", "I9/I"],
+    },
+    {
+        "obligation_id": "retained_runtime_collision_monitor_period",
+        "acceptance_steps": ["I9/I"],
+    },
+    {
+        "obligation_id": "commanded_simulation_state_authority",
+        "acceptance_steps": ["I9/I"],
+    },
+    {
+        "obligation_id": "exact_isaac_ros2_control_profile_and_transport",
+        "acceptance_steps": ["I9/I"],
+    },
+]
 _EXPECTED_RUNTIME_RESTORATION_PROFILE_DIGESTS: Final = {
+    "lite6_isaac_commanded_v0": (
+        "47e2fd5805bc000d307375cd5cca204f1365437cd0610d2b5afae0328d64f2c0"
+    ),
     "lite6_native_simulated_v0": (
         "35e27129b5cf16c680c8722c93524d9d83d8b9ec0b8a9baf5735df5449e1a611"
     ),
@@ -108,14 +200,19 @@ _EXPECTED_RUNTIME_RESTORATION_PROFILE_DIGESTS: Final = {
     "ur10e_robotiq_native_simulated_v0": (
         "acdbd2176ce72be69ab0d995aab56eb0b43a23f105d65920e5463d3bc42ab43b"
     ),
+    "ur10e_robotiq_isaac_commanded_v0": (
+        "15c70dac72fd4b559d77a9e08c644a04dede5eab1c3f441e02d1e91bdfdc6ffd"
+    ),
     "ur5_native_simulated_v0": (
         "5fa7f58a5abc5f9bc22a1f48dae3e8c8006b44c24140ab9954321a50b9b73f55"
     ),
 }
 _EXPECTED_RUNTIME_RESTORATION_PROFILE_FAMILIES: Final = {
+    "lite6_isaac_commanded_v0": "lite6_lite_gripper",
     "lite6_native_simulated_v0": "lite6_lite_gripper",
     "ur10e_robotiq_assistant_native_simulated_v0": "ur10e_robotiq_2f_140",
     "ur10e_robotiq_native_simulated_v0": "ur10e_robotiq_2f_140",
+    "ur10e_robotiq_isaac_commanded_v0": "ur10e_robotiq_2f_140",
     "ur5_native_simulated_v0": "ur5_roboplan",
 }
 _EXPECTED_DEPLOYMENT_RUNTIME_PROFILE_IDS: Final = {
@@ -132,6 +229,21 @@ _EXPECTED_DEPLOYMENT_RUNTIME_PROFILE_IDS: Final = {
     "examples/semantic_shape_pick.deployment.yaml": "ur5_native_simulated_v0",
     "examples/vision_guided_bin_pick.deployment.yaml": "ur5_native_simulated_v0",
     "examples/vision_guided_pose_pick.deployment.yaml": "ur5_native_simulated_v0",
+    "examples/isaac_lite6_lite_gripper_pick_and_place.deployment.yaml": (
+        "lite6_isaac_commanded_v0"
+    ),
+    "examples/isaac_manipulator_scene_light_assistant.deployment.yaml": (
+        "ur10e_robotiq_isaac_commanded_v0"
+    ),
+    "examples/isaac_manipulator_scene_light_ros2_control.deployment.yaml": (
+        "ur10e_robotiq_isaac_commanded_v0"
+    ),
+    "examples/isaac_manipulator_scene_light_ros2_control_collision.deployment.yaml": (
+        "ur10e_robotiq_isaac_commanded_v0"
+    ),
+    "examples/trocar_lite6_foundationpose_pick.deployment.yaml": (
+        "lite6_isaac_commanded_v0"
+    ),
 }
 _EXPECTED_SPEED_MPS: Final = {
     source: 0.15 if "lite6_" in source else 0.25
@@ -142,6 +254,7 @@ _EXPECTED_OPEN_LOOP_SOURCES: Final = frozenset(
         "examples/assistant_modes_scene_authoring.deployment.yaml",
         "examples/lite6_lite_gripper_pick_and_place.deployment.yaml",
         "examples/pick_and_place_ur10e_robotiq.deployment.yaml",
+        *_I9_DEPLOYMENT_SOURCES,
     }
 )
 _EXPECTED_ASSISTANT_PROFILES_SOURCE: Final = (
@@ -157,6 +270,13 @@ _EXPECTED_ASSISTANT_PROFILE_IDS: Final = {
     "examples/semantic_shape_pick.deployment.yaml": "semantic_shape_selection",
     "examples/vision_guided_bin_pick.deployment.yaml": "vision_bin_selection",
     "examples/vision_guided_pose_pick.deployment.yaml": "vision_pose_selection",
+    "examples/isaac_lite6_lite_gripper_pick_and_place.deployment.yaml": None,
+    "examples/isaac_manipulator_scene_light_assistant.deployment.yaml": (
+        "assistant_scene_authoring"
+    ),
+    "examples/isaac_manipulator_scene_light_ros2_control.deployment.yaml": None,
+    "examples/isaac_manipulator_scene_light_ros2_control_collision.deployment.yaml": None,
+    "examples/trocar_lite6_foundationpose_pick.deployment.yaml": None,
 }
 _EXPECTED_COMPATIBILITY: Final = {
     "examples/assistant_modes_scene_authoring.deployment.yaml": {
@@ -194,6 +314,69 @@ _EXPECTED_COMPATIBILITY: Final = {
         "provides": ["vision_pose_inference"],
         "tags": ["ur5", "vision-pick"],
     },
+    "examples/isaac_lite6_lite_gripper_pick_and_place.deployment.yaml": {
+        "lane": "isaac-sim",
+        "provides": ["lite_gripper", "ros2_control"],
+        "tags": ["isaac-sim", "lite6", "pick-and-place"],
+    },
+    "examples/isaac_manipulator_scene_light_assistant.deployment.yaml": {
+        "lane": "isaac-sim",
+        "provides": [
+            "robotiq_2f_140_gripper",
+            "ros2_control",
+            "scene_authoring_tools",
+        ],
+        "tags": ["assistant", "isaac-sim", "pick-and-place", "robotiq", "ur10e"],
+    },
+    "examples/isaac_manipulator_scene_light_ros2_control.deployment.yaml": {
+        "lane": "isaac-sim",
+        "provides": ["robotiq_2f_140_gripper", "ros2_control"],
+        "tags": ["isaac-sim", "pick-and-place", "robotiq", "ur10e"],
+    },
+    "examples/isaac_manipulator_scene_light_ros2_control_collision.deployment.yaml": {
+        "lane": "isaac-sim",
+        "provides": ["robotiq_2f_140_gripper", "ros2_control"],
+        "tags": ["isaac-sim", "robotiq", "runtime-collision", "ur10e"],
+    },
+    "examples/trocar_lite6_foundationpose_pick.deployment.yaml": {
+        "lane": "isaac-sim",
+        "provides": ["foundationpose", "lite_gripper", "ros2_control"],
+        "tags": ["foundationpose", "isaac-sim", "lite6", "pick-and-place"],
+    },
+}
+_EXPECTED_I9_BEHAVIOR_OBLIGATIONS: Final = {
+    "examples/isaac_lite6_lite_gripper_pick_and_place.deployment.yaml": [
+        "articulated_lite_gripper_effort_mimic_and_observed_state",
+        "commanded_sim_arm_jtc_and_joint_state_authority",
+        "contact_force_collision_and_touch_link_behavior",
+        "scene_load_reset_world_readback_and_object_motion",
+        "viewer_ghost_status_and_gripper_convergence",
+    ],
+    "examples/isaac_manipulator_scene_light_assistant.deployment.yaml": [
+        "assistant_scene_inspection_and_operator_approved_mutation",
+        "commanded_sim_arm_jtc_and_joint_state_authority",
+        "scene_load_reset_world_readback_and_object_motion",
+        "viewer_mesh_ghost_reset_and_structured_status",
+    ],
+    "examples/isaac_manipulator_scene_light_ros2_control.deployment.yaml": [
+        "commanded_sim_arm_jtc_and_joint_state_authority",
+        "robotiq_gripper_command_feedback_and_convergence",
+        "scene_load_reset_world_readback_and_object_motion",
+        "viewer_mesh_ghost_reset_and_structured_status",
+    ],
+    "examples/isaac_manipulator_scene_light_ros2_control_collision.deployment.yaml": [
+        "commanded_sim_arm_jtc_and_joint_state_authority",
+        "pose_source_snapshot_and_runtime_collision_stop",
+        "scene_load_reset_world_readback_and_object_motion",
+        "structured_stop_trace_status_and_alarm_correlation",
+    ],
+    "examples/trocar_lite6_foundationpose_pick.deployment.yaml": [
+        "articulated_lite_gripper_effort_mimic_and_observed_state",
+        "camera_tf_and_foundationpose_detection_source",
+        "commanded_sim_arm_jtc_and_joint_state_authority",
+        "pose_source_snapshot_pick_and_drop",
+        "scene_load_reset_world_readback_and_object_motion",
+    ],
 }
 _EXPECTED_ASSISTANT_PROFILE_CONTRACTS: Final = {
     "assistant_scene_authoring": {
@@ -1559,6 +1742,8 @@ def validate(source: Path, root: Path) -> None:
         )
     ):
         path = f"$.runtime_restoration_profiles[{index}]"
+        raw_profile_object = _object(raw_profile, path=path)
+        is_ros2_control = "ros2_control_runtime" in raw_profile_object
         profile = _exact(
             raw_profile,
             required=frozenset(
@@ -1566,7 +1751,11 @@ def validate(source: Path, root: Path) -> None:
                     "runtime_restoration_profile_id",
                     "model_family_id",
                     "source_fields",
-                    "native_runtime",
+                    (
+                        "ros2_control_runtime"
+                        if is_ros2_control
+                        else "native_runtime"
+                    ),
                     "stop_profiles",
                     "acceptance_obligations",
                 }
@@ -1591,11 +1780,21 @@ def validate(source: Path, root: Path) -> None:
             raise SourceDescriptionError(
                 f"{path} changes the exact historical runtime restoration input"
             )
-        if profile["source_fields"] != _RUNTIME_RESTORATION_SOURCE_FIELDS:
+        expected_source_fields = (
+            _ROS2_CONTROL_RUNTIME_RESTORATION_SOURCE_FIELDS
+            if is_ros2_control
+            else _RUNTIME_RESTORATION_SOURCE_FIELDS
+        )
+        if profile["source_fields"] != expected_source_fields:
             raise SourceDescriptionError(
                 f"{path}.source_fields changes the pinned I0 field mapping"
             )
-        if profile["acceptance_obligations"] != _RUNTIME_RESTORATION_ACCEPTANCE:
+        expected_acceptance = (
+            _ROS2_CONTROL_RUNTIME_RESTORATION_ACCEPTANCE
+            if is_ros2_control
+            else _RUNTIME_RESTORATION_ACCEPTANCE
+        )
+        if profile["acceptance_obligations"] != expected_acceptance:
             raise SourceDescriptionError(
                 f"{path}.acceptance_obligations changes the deferred owner gates"
             )
@@ -1615,7 +1814,7 @@ def validate(source: Path, root: Path) -> None:
         runtime_profile_ids
     ) != set(_EXPECTED_RUNTIME_RESTORATION_PROFILE_DIGESTS):
         raise SourceDescriptionError(
-            "$.runtime_restoration_profiles must exactly cover the four "
+            "$.runtime_restoration_profiles must exactly cover the six "
             "canonical-sorted historical profiles"
         )
 
@@ -1627,25 +1826,38 @@ def validate(source: Path, root: Path) -> None:
         _array(top["deployments"], path="$.deployments")
     ):
         path = f"$.deployments[{index}]"
+        raw_deployment_object = _object(raw_deployment, path=path)
+        raw_deployment_source = _text(
+            raw_deployment_object.get("deployment_source"),
+            path=f"{path}.deployment_source",
+        )
+        is_i9 = raw_deployment_source in _I9_DEPLOYMENT_SOURCES
+        deployment_fields = {
+            "deployment_source",
+            "deployment_artifact_id",
+            "cell_id",
+            "name",
+            "description",
+            "compatibility",
+            "assistant_profile_id",
+            "historical_blob",
+            "model_family_id",
+            "runtime_restoration_profile_id",
+            "component_occurrence_id",
+            "program_role_assignments",
+            "policy_restoration_inputs",
+        }
+        if is_i9:
+            deployment_fields.update(
+                {
+                    "historical_program_source",
+                    "historical_program_blob",
+                    "i9_behavior_obligations",
+                }
+            )
         row = _exact(
             raw_deployment,
-            required=frozenset(
-                {
-                    "deployment_source",
-                    "deployment_artifact_id",
-                    "cell_id",
-                    "name",
-                    "description",
-                    "compatibility",
-                    "assistant_profile_id",
-                    "historical_blob",
-                    "model_family_id",
-                    "runtime_restoration_profile_id",
-                    "component_occurrence_id",
-                    "program_role_assignments",
-                    "policy_restoration_inputs",
-                }
-            ),
+            required=frozenset(deployment_fields),
             path=path,
         )
         deployment_source = _source_path(
@@ -1702,6 +1914,31 @@ def validate(source: Path, root: Path) -> None:
             raise SourceDescriptionError(
                 f"{path}.historical_blob changes the pinned I0 source"
             )
+        if is_i9:
+            historical_program = _EXPECTED_I9_HISTORICAL_PROGRAMS[
+                deployment_source
+            ]
+            if (
+                row["historical_program_source"] != historical_program["source"]
+                or row["historical_program_blob"] != historical_program["blob"]
+            ):
+                raise SourceDescriptionError(
+                    f"{path} changes the exact pinned I9 Program audit source"
+                )
+            obligations = [
+                _identifier(item, path=f"{path}.i9_behavior_obligations[{item_index}]")
+                for item_index, item in enumerate(
+                    _array(
+                        row["i9_behavior_obligations"],
+                        path=f"{path}.i9_behavior_obligations",
+                    )
+                )
+            ]
+            _canonical_unique(obligations, path=f"{path}.i9_behavior_obligations")
+            if obligations != _EXPECTED_I9_BEHAVIOR_OBLIGATIONS[deployment_source]:
+                raise SourceDescriptionError(
+                    f"{path}.i9_behavior_obligations changes the I9 audit closure"
+                )
         if row["model_family_id"] not in family_ids:
             raise SourceDescriptionError(f"{path}.model_family_id is unavailable")
         runtime_profile_id = _identifier(
@@ -1784,11 +2021,11 @@ def validate(source: Path, root: Path) -> None:
         or speed_sources != _EXPECTED_DEPLOYMENT_SOURCES
     ):
         raise SourceDescriptionError(
-            "the exact seven maintained deployment/speed inputs are incomplete"
+            "the exact twelve maintained deployment/speed inputs are incomplete"
         )
     if open_loop_sources != _EXPECTED_OPEN_LOOP_SOURCES:
         raise SourceDescriptionError(
-            "the exact three historical open-loop inputs are incomplete"
+            "the exact eight historical open-loop inputs are incomplete"
         )
 
 

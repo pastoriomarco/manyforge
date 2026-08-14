@@ -275,6 +275,14 @@ TEST(RetainedRos2ControlBackendFactoryTest,
             (std::vector<core::ComponentLifecycleStateDTO>{
                 core::ComponentLifecycleStateDTO::kPrepared,
                 core::ComponentLifecycleStateDTO::kActive}));
+  const auto semantic = core::ComputeBrandLifecyclePlanCatalogSemanticDigest(
+      core::ProviderManifestId(
+          std::string(kRos2ControlLifecycleProviderManifestId)),
+      plans);
+  ASSERT_TRUE(semantic.ok()) << semantic.error().message;
+  EXPECT_EQ(semantic.value().value(),
+            "sha256:"
+            "b56660c812db2e09af08d4bf7b7850b08a28fbfc2d24f9fb9fcace34e2dbcef2");
 
   auto catalog =
       make_retained_ros2_control_lifecycle_catalog(ros_lifecycle_manifest());

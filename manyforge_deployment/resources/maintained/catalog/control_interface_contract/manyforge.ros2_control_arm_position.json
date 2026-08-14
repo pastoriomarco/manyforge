@@ -1,0 +1,20 @@
+{
+  "api_version": "manyforge.control_interface_contract.v1",
+  "command_interfaces": [
+    {
+      "interface_name": "position",
+      "resource_role_id": "arm_joints"
+    }
+  ],
+  "control_interface_contract_id": "manyforge.ros2_control_arm_position",
+  "control_interface_revision": "sha256:d951ffd368654ba9998355a4b12844014469753c3c21e05df3b61f6f669cbb4b",
+  "ordering": [
+    "arm_joints"
+  ],
+  "state_interfaces": [
+    {
+      "interface_name": "position",
+      "resource_role_id": "arm_joints"
+    }
+  ]
+}
