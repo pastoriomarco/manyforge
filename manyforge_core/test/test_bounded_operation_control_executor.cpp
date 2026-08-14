@@ -28,7 +28,6 @@ class FakeEngine final : public IResolvedParticipantExecutionEngine,
   Result<std::uint64_t> execute(const ExecuteRequestDTO&) override {
     return Result<std::uint64_t>::Err(unsupported());
   }
-  StopResultDTO stop() override { return {false, unsupported()}; }
   PauseResultDTO pause() override {
     std::unique_lock lock(mutex_);
     ++pause_calls_;

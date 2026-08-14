@@ -2311,7 +2311,9 @@ InterruptIngestResult ExecutionKernel::publish_runtime_collision_fault_interrupt
   auto result =
       publish_fast_interrupt_signals_internal(std::vector<InterruptSignalUpdate>{std::move(signal)},
                                               /*apply_preemption_inline=*/false);
-  schedule_latched_interrupt_preemption(result);
+  if (!config_.runtime_collision_stop_owned_by_addressed_kernel) {
+    schedule_latched_interrupt_preemption(result);
+  }
   // Collision-tick thread: provably never a lifecycle owner, so the
   // try-refresh is safe here and publishes the Interrupted/waiting
   // assessment promptly after the fault latch.
@@ -4418,10 +4420,12 @@ void ExecutionKernel::notify_execution_waiters() {
   worker_signals_.notify();
 }
 
-bool ExecutionKernel::retire_execute_worker(std::unique_lock<std::mutex>& lifecycle_lock) {
+bool ExecutionKernel::retire_execute_worker(std::unique_lock<std::mutex>& lifecycle_lock,
+                                            const bool containment_already_certified) {
   if (!worker_thread_.joinable()) {
     return true;
   }
+  certified_containment_retirement_.store(containment_already_certified, std::memory_order_release);
   if (worker_thread_.get_id() == std::this_thread::get_id()) {
     worker_thread_.request_stop();
     worker_signals_.notify();
@@ -4434,6 +4438,7 @@ bool ExecutionKernel::retire_execute_worker(std::unique_lock<std::mutex>& lifecy
   lifecycle_lock.unlock();
   worker_thread_.join();
   lifecycle_lock.lock();
+  certified_containment_retirement_.store(false, std::memory_order_release);
   lifecycle_worker_retirement_in_progress_.store(false, std::memory_order_release);
   return true;
 }
@@ -6598,14 +6603,18 @@ void ExecutionKernel::async_execute_worker(
       stop_collision_monitoring(RuntimeCollisionMonitorRelease::kWorkerRetirement,
                                 motion_state.runtime_collision_protection_generation);
       const auto state_before_stop = sm_.status().state;
-      auto backend_stop = execution_backend_.stop();
+      const bool containment_already_certified =
+          certified_containment_retirement_.load(std::memory_order_acquire);
+      auto backend_stop = containment_already_certified ? StopResultDTO{true, std::nullopt}
+                                                        : execution_backend_.stop();
       const bool already_terminal = state_before_stop == ExecutionState::kStopped ||
                                     state_before_stop == ExecutionState::kIdle ||
                                     state_before_stop == ExecutionState::kCompleted ||
                                     state_before_stop == ExecutionState::kFailed ||
                                     state_before_stop == ExecutionState::kInterrupted ||
                                     state_before_stop == ExecutionState::kInterventionRequired;
-      const bool stop_confirmed = backend_stop.accepted || already_terminal;
+      const bool stop_confirmed =
+          containment_already_certified || backend_stop.accepted || already_terminal;
       if ((state_before_stop == ExecutionState::kExecuting ||
            state_before_stop == ExecutionState::kPaused) &&
           stop_confirmed) {
@@ -6633,12 +6642,14 @@ void ExecutionKernel::async_execute_worker(
         terminal_snapshot.error = stop_error;
       }
       publish_execution_snapshot(std::move(terminal_snapshot));
-      finalize_motion_execution_outcome(
-          motion_state,
-          stop_confirmed ? MotionExecutionTerminalCause::kStopped
-                         : MotionExecutionTerminalCause::kFailed,
-          stop_error, std::nullopt,
-          stop_confirmed ? "worker_stop_token_requested" : "worker_stop_token_backend_stop_failed");
+      const char* terminal_reason = containment_already_certified
+                                        ? "worker_retired_after_certified_containment"
+                                    : stop_confirmed ? "worker_stop_token_requested"
+                                                     : "worker_stop_token_backend_stop_failed";
+      finalize_motion_execution_outcome(motion_state,
+                                        stop_confirmed ? MotionExecutionTerminalCause::kStopped
+                                                       : MotionExecutionTerminalCause::kFailed,
+                                        stop_error, std::nullopt, terminal_reason);
     };
     const auto fault_preempt_pending_budget_ns = [&]() -> int64_t {
       std::optional<MotionInterruptStopProfileDTO> profile;
@@ -6857,7 +6868,19 @@ void ExecutionKernel::async_execute_worker(
         auto latch = interrupt_manager_.active_latch();
         if (latch &&
             latch->preemption_action_requested == InterruptPreemptionAction::kPreemptTrajectory) {
-          if (latch->preemption_result == InterruptPreemptionResult::kPending) {
+          const bool addressed_collision_pending =
+              latch->preemption_result == InterruptPreemptionResult::kPending &&
+              config_.runtime_collision_stop_owned_by_addressed_kernel &&
+              latch->source_id == kRuntimeCollisionFaultSourceId;
+          // The addressed owner has already accepted this collision into its
+          // bounded StopControl lane. Keep monitoring until its exact stage
+          // makes the backend handle terminal; never arm the legacy watchdog
+          // or issue a second backend Stop.
+          if (addressed_collision_pending && !completed) {
+            continue;
+          }
+          if (latch->preemption_result == InterruptPreemptionResult::kPending &&
+              !addressed_collision_pending) {
             const auto now = clock_.now();
             if (!pending_fault_preempt_latch_id.has_value() ||
                 *pending_fault_preempt_latch_id != latch->latch_id) {
@@ -9668,8 +9691,17 @@ ResetResultDTO ExecutionKernel::reset_after_certified_containment(
   request_fault_preempt_controlled_stop();
   fault_preempt_worker_.stop_and_join();
   operator_stop_worker_.stop_and_join();
-  stop_collision_monitoring(RuntimeCollisionMonitorRelease::kResetOrTeardown);
-  if (!retire_execute_worker(lifecycle_lock)) {
+  stop_collision_monitoring(RuntimeCollisionMonitorRelease::kResetOrTeardown, std::nullopt,
+                            /*drain_callbacks=*/true);
+  if (get_active_interrupt_latch()) {
+    auto clear = interrupt_manager_.clear_active_latch("addressed_stop_certificate", clock_.now());
+    if (!clear.ok()) {
+      return ResetResultDTO{false, clear.error()};
+    }
+    record_terminal_fault_authority(clear.value());
+    emit_interrupt_events(clear.value());
+  }
+  if (!retire_execute_worker(lifecycle_lock, /*containment_already_certified=*/true)) {
     return ResetResultDTO{false, ErrorDTO{kErrorInvalidRequest,
                                           "Execution worker cannot retire from its own callback",
                                           {{"reason_code", "worker_retirement_self_thread"}}}};

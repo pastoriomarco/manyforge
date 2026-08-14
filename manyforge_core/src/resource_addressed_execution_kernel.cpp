@@ -10175,6 +10175,41 @@ Result<void> ResourceAddressedExecutionKernel::apply_subordinate_state(
 
 void ResourceAddressedExecutionKernel::on_engine_event(IResolvedParticipantExecutionEngine* engine,
                                                        const KernelEvent& event) {
+  if (event.type == KernelEventType::kCollisionDetected) {
+    std::optional<StopIntentDTO> containment;
+    {
+      std::lock_guard state_lock(state_mutex_);
+      const auto operation_id = find_event_operation_locked(engine, event.execution_id);
+      auto* operation =
+          operation_id.has_value() ? find_active_operation_locked(*operation_id) : nullptr;
+      auto* participant = operation == nullptr ? nullptr : operation->participant_for(engine);
+      if (operation != nullptr && participant != nullptr && !terminal(operation->state.state) &&
+          !operation->state.active_stop_id.has_value()) {
+        const auto material = config_.request_owner_epoch.value() + "\nruntime-collision\n" +
+                              operation->state.operation_id.value() + "\n" +
+                              std::to_string(operation->state.operation_revision.value()) + "\n" +
+                              participant->slot_owner.participant_id.value();
+        containment = StopIntentDTO{
+            PublicRequestContextDTO{RequestId(manyforge::content_identity::sha256_digest(material)),
+                                    config_.request_owner_epoch, "kernel.runtime_collision",
+                                    participant->slot_owner.participant_id.value()},
+            std::vector<StopOperationTargetDTO>{StopOperationTargetDTO{
+                operation->state.operation_id, operation->state.operation_revision,
+                operation->state.active_stop_generation.value_or(StopGeneration(0U))}},
+            std::string("runtime_collision_fault"),
+            RequestAttributionDTO{RequestTransportDTO::kInternal, RequestAssuranceDTO::kUnverified,
+                                  std::nullopt}};
+      }
+    }
+    if (containment.has_value()) {
+      auto stopped = accept_stop(EmergencyStopProjectedIntentDTO{std::move(*containment)});
+      if (!stopped.ok()) {
+        std::lock_guard state_lock(state_mutex_);
+        motion_admission_closed_ = true;
+      }
+    }
+    return;
+  }
   if (event.type == KernelEventType::kParticipantPrepared) {
     std::optional<OperationId> operation_id;
     {

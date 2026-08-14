@@ -240,6 +240,14 @@ struct ExecutionKernelConfig {
   // current path" (default soft-on-path).
   std::shared_ptr<MotionInterruptStopProfileDTO> operator_stop_profile;
 
+  // The maintained addressed runtime owns the sole public Stop transaction.
+  // In that composition the subordinate still detects and publishes runtime
+  // collision/interrupt truth, but it MUST NOT call a backend Stop surface;
+  // ResourceAddressedExecutionKernel accepts the exact scoped Stop instead.
+  // Standalone, not-yet-restored lanes retain their historical local
+  // preemption behavior until their later product gate.
+  bool runtime_collision_stop_owned_by_addressed_kernel = false;
+
   /// Exact implementation revision of the Kernel-owned validation pipeline
   /// recorded in every prepared motion participant. A changed pipeline
   /// contract rotates this value; operation callers never supply it.
@@ -342,7 +350,7 @@ class ExecutionKernel : public IResolvedParticipantExecutionEngine,
   /// Non-blocking stop from any non-terminal state.
   /// Accepted stop invalidates older lifecycle/recovery commands by bumping
   /// `control_command_epoch()`. Stop is never rejectable by epoch staleness.
-  StopResultDTO stop() override;
+  StopResultDTO stop();
 
   /// Non-blocking pause. Only valid from Executing.
   PauseResultDTO pause() override;
@@ -827,7 +835,8 @@ class ExecutionKernel : public IResolvedParticipantExecutionEngine,
 
   void finish_execute_worker();
   void notify_execution_waiters();
-  bool retire_execute_worker(std::unique_lock<std::mutex>& lifecycle_lock);
+  bool retire_execute_worker(std::unique_lock<std::mutex>& lifecycle_lock,
+                             bool containment_already_certified = false);
 
   void invalidate_gripper_authority(GripperInvalidationReason reason) noexcept;
   void authorize_gripper_authority() noexcept;
@@ -1046,6 +1055,10 @@ class ExecutionKernel : public IResolvedParticipantExecutionEngine,
   std::atomic<bool> planning_reset_requested_{false};
   std::atomic<bool> lifecycle_reset_waiting_for_stop_{false};
   std::atomic<bool> lifecycle_worker_retirement_in_progress_{false};
+  // Set before requesting worker retirement only after the addressed owner has
+  // committed its immutable Stop certificate. The retiring worker must then
+  // release local state without issuing a duplicate backend Stop.
+  std::atomic<bool> certified_containment_retirement_{false};
   // Monotonic per-execution terminal authority. Active interrupt latches can
   // be consumed by preemption/stop machinery before the backend finalizer runs;
   // this flag preserves the fact that safety authority existed so a later

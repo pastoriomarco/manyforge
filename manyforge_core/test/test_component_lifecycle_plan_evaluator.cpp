@@ -214,5 +214,52 @@ TEST(ComponentLifecyclePlanEvaluator, RecoverAmbiguityAndInconclusivenessFailClo
   EXPECT_EQ(target.error().code, "component_lifecycle_recover_target_inconclusive");
 }
 
+TEST(ComponentLifecyclePlanEvaluator,
+     IndependentUrShapedFakeMappingIsDeclarativeAndUnsupportedOperationsFailClosed) {
+  auto catalog = MakeBrandLifecyclePlanCatalog(
+      ProviderManifestId("fake.ur.lifecycle-provider"),
+      ProviderManifestRevision(
+          "sha256:2222222222222222222222222222222222222222222222222222222222222222"),
+      {{ComponentLifecycleIntentKindDTO::kPrepare,
+        ComponentLifecycleStateDTO::kPrepared,
+        std::nullopt,
+        Predicate(ComponentLifecycleStateDTO::kPrepared,
+                  std::pair{std::string("robot_mode"), std::string("running")}),
+        1'000,
+        {Transition("ur.power_on_and_release_brakes",
+                    Predicate(ComponentLifecycleStateDTO::kDeclared,
+                              std::pair{std::string("robot_mode"), std::string("power_off")}),
+                    ComponentLifecycleStateDTO::kPrepared)}},
+       {ComponentLifecycleIntentKindDTO::kDisable,
+        ComponentLifecycleStateDTO::kDisabled,
+        std::nullopt,
+        Predicate(ComponentLifecycleStateDTO::kDisabled,
+                  std::pair{std::string("robot_mode"), std::string("power_off")}),
+        1'000,
+        {Transition("ur.stop_and_power_off", Predicate(ComponentLifecycleStateDTO::kActive),
+                    ComponentLifecycleStateDTO::kDisabled)}}});
+  ASSERT_TRUE(catalog.ok()) << catalog.error().message;
+
+  auto observation = Observation(ComponentLifecycleStateDTO::kDeclared,
+                                 {{LifecycleFactId("robot_mode"), Token("power_off")}});
+  observation.provider_manifest_id = catalog.value().provider_manifest_id;
+  observation.provider_manifest_revision = catalog.value().provider_manifest_revision;
+
+  const auto prepare = EvaluateLifecycleDomainPlan(ComponentLifecycleIntentKindDTO::kPrepare,
+                                                   ComponentLifecycleStateDTO::kPrepared,
+                                                   catalog.value(), observation);
+  ASSERT_TRUE(prepare.ok()) << prepare.error().message;
+  ASSERT_TRUE(prepare.value().selected_transition.has_value());
+  EXPECT_EQ(prepare.value().selected_transition->lifecycle_primitive_id,
+            LifecyclePrimitiveId("ur.power_on_and_release_brakes"));
+
+  const auto unsupported = EvaluateLifecycleDomainPlan(ComponentLifecycleIntentKindDTO::kEnable,
+                                                       ComponentLifecycleStateDTO::kActive,
+                                                       catalog.value(), observation);
+  ASSERT_FALSE(unsupported.ok());
+  EXPECT_EQ(unsupported.error().code, "component_lifecycle_intent_unsupported");
+  EXPECT_EQ(unsupported.error().details.at("reason"), "selected_plan_missing");
+}
+
 }  // namespace
 }  // namespace manyforge::core

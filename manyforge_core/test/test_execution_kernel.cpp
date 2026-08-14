@@ -6053,6 +6053,83 @@ TEST_F(ExecutionKernelTest, CollisionMonitoring_SchedulerTickLatchesRuntimeColli
   }));
 }
 
+TEST_F(ExecutionKernelTest,
+       AddressedStopOwnerModePublishesRuntimeCollisionWithoutCallingBackendStop) {
+  ControlledExecution controlled_execution;
+  ThreadSafeFakeClock local_clock;
+  ThreadSafeManualScheduler local_scheduler;
+  TrajectoryCache local_cache{CacheConfig{10}};
+  ExecutionKernelConfig config;
+  config.collision_monitor_period_ns = 10'000'000;
+  config.runtime_collision_immediate_query_budget_ns = 10'000'000;
+  config.runtime_collision_stop_owned_by_addressed_kernel = true;
+  MockCollisionWorldPublisher local_collision_world;
+  auto local_collision_engine = std::make_shared<MockCollisionEngine>();
+  auto local_runtime_engine = std::make_shared<MockCollisionEngine>();
+  std::mutex events_mu;
+  std::condition_variable events_cv;
+  std::vector<KernelEvent> events;
+  ExecutionKernel controlled_kernel{
+      planner, context, controlled_execution, local_clock, local_scheduler, local_cache, config};
+  configure_runtime_collision_monitoring(controlled_kernel, local_collision_world,
+                                         local_collision_engine, local_runtime_engine);
+  controlled_kernel.subscribe_events([&](const KernelEvent& event) {
+    {
+      std::lock_guard<std::mutex> lock(events_mu);
+      events.push_back(event);
+    }
+    events_cv.notify_all();
+  });
+
+  auto live_snapshot = make_test_collision_world_snapshot();
+  live_snapshot.revision = CollisionWorldRevision{100, "addressed-owner-scene"};
+  local_collision_world.current_snapshot =
+      std::make_shared<const CollisionWorldSnapshot>(std::move(live_snapshot));
+  const auto result = controlled_kernel.execute(make_test_request());
+  ASSERT_TRUE(result.ok());
+  ASSERT_TRUE(controlled_execution.wait_until_execute_called());
+  ASSERT_TRUE(wait_for_state(controlled_kernel, ExecutionState::kExecuting));
+  local_runtime_engine->default_result = make_authoritative_collision_result();
+  ASSERT_TRUE(wait_for_pending_scheduler_work(local_scheduler));
+
+  local_clock.advance(10'000'000);
+  local_scheduler.advance_to(local_clock.now());
+  {
+    std::unique_lock<std::mutex> lock(events_mu);
+    ASSERT_TRUE(events_cv.wait_for(lock, std::chrono::seconds(1), [&]() {
+      return std::any_of(events.begin(), events.end(), [](const KernelEvent& event) {
+        return event.type == KernelEventType::kCollisionDetected;
+      });
+    }));
+  }
+  for (int attempt = 0;
+       attempt < 1000 && !controlled_kernel.get_active_interrupt_latch().has_value(); ++attempt) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+  }
+
+  const auto latch = controlled_kernel.get_active_interrupt_latch();
+  ASSERT_TRUE(latch.has_value());
+  EXPECT_EQ(latch->source_id, "manyforge.kernel.runtime_collision_fault");
+  EXPECT_EQ(latch->preemption_result, InterruptPreemptionResult::kPending);
+  EXPECT_EQ(controlled_execution.stop_count_value(), 0);
+  EXPECT_EQ(controlled_execution.controlled_stop_count_value(), 0);
+  EXPECT_EQ(controlled_kernel.get_status().state, ExecutionState::kInterrupted);
+  {
+    std::lock_guard<std::mutex> lock(events_mu);
+    EXPECT_FALSE(std::any_of(events.begin(), events.end(), [](const KernelEvent& event) {
+      return event.type == KernelEventType::kInterruptPreemptApplied;
+    }));
+  }
+
+  controlled_execution.release();
+  EXPECT_TRUE(controlled_kernel.wait_for_completion(1'000'000'000));
+  const auto reset = controlled_kernel.reset_after_certified_containment(result.value());
+  ASSERT_TRUE(reset.accepted) << reset.error->message;
+  EXPECT_EQ(controlled_execution.stop_count_value(), 0);
+  EXPECT_EQ(controlled_execution.reset_count, 1);
+  EXPECT_FALSE(controlled_kernel.get_active_interrupt_latch().has_value());
+}
+
 TEST_F(ExecutionKernelTest, CollisionLookahead_FutureCollisionSignalsAuthorityBeforeTelemetry) {
   ControlledExecution controlled_execution;
   controlled_execution.enable_execution_progress_publication();

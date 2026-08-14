@@ -1863,6 +1863,7 @@ void attach_retained_native_addressed_owner(
 std::shared_ptr<RetainedNativeRuntime>
 create_retained_native_runtime(RetainedNativeRuntimeInput input,
                                RetainedNativeRuntimeConfig config) {
+  config.kernel.runtime_collision_stop_owned_by_addressed_kernel = true;
   auto stop_budget = config.cell_stop_deadline_budget;
   if (!stop_budget.has_value() && input.motion_stop_readiness.has_value()) {
     stop_budget = input.motion_stop_readiness->value()

@@ -385,12 +385,6 @@ class FakeParticipantEngine final : public IResolvedParticipantExecutionEngine,
         projection_inventory.bundle.world->revision, 0U});
   }
 
-  StopResultDTO stop() override {
-    ++stop_calls;
-    Trace("engine:stop");
-    return next_stop_result;
-  }
-
   ParticipantStopStageResultDTO TranslateStopStage(const ResolvedParticipantStopStageDTO& stage,
                                                    const RemainingStopBudgetDTO&,
                                                    std::stop_token) override {
@@ -688,6 +682,23 @@ class FakeParticipantEngine final : public IResolvedParticipantExecutionEngine,
                             current,
                             std::move(error),
                             {}};
+    const auto snapshot = callbacks;
+    for (const auto& [id, callback] : snapshot) {
+      (void)id;
+      callback(event);
+    }
+  }
+
+  void emit_collision(std::map<std::string, std::string> details = {}) {
+    details.try_emplace("reason", "runtime_collision_detected");
+    const auto current = get_status().state;
+    const KernelEvent event{KernelEventType::kCollisionDetected,
+                            next_execution_id,
+                            0,
+                            current,
+                            current,
+                            std::nullopt,
+                            std::move(details)};
     const auto snapshot = callbacks;
     for (const auto& [id, callback] : snapshot) {
       (void)id;
@@ -2297,6 +2308,66 @@ TEST(ResourceAddressedExecutionKernelTest,
                             return entry.dispatch_state ==
                                    StopScopeDispatchStateDTO::kNeverDispatchedCancelled;
                           }));
+}
+
+TEST(ResourceAddressedExecutionKernelTest,
+     RuntimeCollisionUsesTheAddressedStopOwnerAndDeclaredCoordinatedScopeExactlyOnce) {
+  FakeClock clock;
+  FakeParticipantEngine first_engine;
+  FakeParticipantEngine second_engine;
+  const auto first =
+      make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular);
+  const auto second = coordinated_occurrence(first, "2");
+  ResourceAddressedExecutionKernel kernel(
+      {registration(first, first_engine), registration(second, second_engine)}, clock,
+      default_journal, {RequestOwnerEpoch("kernel.epoch.1"), CellId("cell.test"), 16U});
+
+  const auto accepted =
+      kernel.execute(coordinated_motion_operation("request.motion.coordinated.collision"));
+  ASSERT_TRUE(accepted.ok()) << accepted.error().message;
+  first_engine.emit_transition(ExecutionState::kPlanning, ExecutionState::kExecuting);
+  second_engine.emit_transition(ExecutionState::kPlanning, ExecutionState::kExecuting);
+
+  first_engine.emit_collision({{"contact_a", "component/robot/body/tool/collision/0"},
+                               {"contact_b", "scene/workpiece/shape/0"}});
+  std::optional<StopId> stop_id;
+  ASSERT_TRUE(wait_until([&] {
+    const auto operation = kernel.get_operation_state(accepted.value().operation_id);
+    if (!operation.ok() || !operation.value().active_stop_id.has_value()) {
+      return false;
+    }
+    stop_id = operation.value().active_stop_id;
+    return first_engine.translate_stop_stage_calls.load() == 1 &&
+           second_engine.translate_stop_stage_calls.load() == 1;
+  }));
+  ASSERT_TRUE(stop_id.has_value());
+  ASSERT_TRUE(wait_until([&] {
+    const auto status = kernel.get_stop_status(*stop_id);
+    return status.ok() && status.value().state == StopStatusStateDTO::kSucceeded;
+  }));
+
+  const auto status = kernel.get_stop_status(*stop_id);
+  ASSERT_TRUE(status.ok()) << status.error().message;
+  EXPECT_EQ(status.value().accepted.resolution_disposition, StopResolutionDispositionDTO::kExact);
+  EXPECT_EQ(status.value().accepted.resolution_reason,
+            StopScopeResolutionReasonDTO::kExactCurrentScope);
+  ASSERT_EQ(status.value().accepted.participant_budget_allocations.size(), 2U);
+  ASSERT_TRUE(status.value().stop_certificate.has_value());
+  const auto certificate =
+      kernel.get_stop_certificate(status.value().stop_certificate->stop_certificate_id);
+  ASSERT_TRUE(certificate.ok()) << certificate.error().message;
+  EXPECT_EQ(certificate.value().requested_selector.kind,
+            StopRequestedSelectorKindDTO::kOrdinaryOperations);
+  ASSERT_EQ(certificate.value().scope_entries.size(), 2U);
+  ASSERT_EQ(certificate.value().attempted_stage_results.size(), 2U);
+  EXPECT_TRUE(std::all_of(certificate.value().scope_entries.begin(),
+                          certificate.value().scope_entries.end(), [](const auto& entry) {
+                            return entry.dispatch_state == StopScopeDispatchStateDTO::kDispatched;
+                          }));
+
+  second_engine.emit_collision();
+  EXPECT_EQ(first_engine.translate_stop_stage_calls.load(), 1);
+  EXPECT_EQ(second_engine.translate_stop_stage_calls.load(), 1);
 }
 
 TEST(ResourceAddressedExecutionKernelTest,

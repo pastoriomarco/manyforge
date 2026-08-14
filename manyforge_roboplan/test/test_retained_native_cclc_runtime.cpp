@@ -730,9 +730,6 @@ public:
     return Unsupported<void>();
   }
 
-  [[nodiscard]] core::StopResultDTO stop() override {
-    return {true, std::nullopt};
-  }
   [[nodiscard]] core::PauseResultDTO pause() override {
     return {true, std::nullopt};
   }

@@ -152,7 +152,6 @@ public:
   execute(const core::ExecuteRequestDTO &) override {
     return core::Result<std::uint64_t>::Err(Unavailable());
   }
-  core::StopResultDTO stop() override { return {false, Unavailable()}; }
   core::PauseResultDTO pause() override { return {false, Unavailable()}; }
   core::ResumeResultDTO resume(std::optional<std::uint64_t>) override {
     return {false, Unavailable()};
