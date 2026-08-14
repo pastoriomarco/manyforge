@@ -344,6 +344,7 @@ def _fixture(
         model_queries=invocation,
         assistant_requests=task,
         pick_place=task,
+        simulator_control=task,
         kernel_controls=invocation,
         program_run_scope=scope,
         program_run_context=context_port,

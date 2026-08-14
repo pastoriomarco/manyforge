@@ -462,6 +462,7 @@ class NodeAdapterPorts:
     model_queries: OwnerInvocationPort | None = None
     assistant_requests: OwnerTaskPort | None = None
     pick_place: OwnerTaskPort | None = None
+    simulator_control: OwnerTaskPort | None = None
     cclc_lifecycle: OwnerTaskPort | None = None
     cclc_routes: OwnerTaskPort | None = None
     kernel_controls: OwnerInvocationPort | None = None

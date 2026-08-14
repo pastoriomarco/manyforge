@@ -40,7 +40,6 @@ from manyforge_behavior.orchestration_ports import (
 from manyforge_behavior.orchestration_values import NodeAttemptInputResolver
 
 I8_ADAPTER_REASON: Final = "kernel_policy_node_adapter_unavailable_until_i8"
-I9_ADAPTER_REASON: Final = "simulation_node_adapter_unavailable_until_i9"
 I11_ADAPTER_REASON: Final = "semantic_io_node_adapter_unavailable_until_i11"
 
 
@@ -364,6 +363,7 @@ _TASK_OWNER_PORTS: Final[Mapping[str, str]] = MappingProxyType(
         "kernel.operation": "kernel_operations",
         "kernel.pick_place_sequence": "pick_place",
         "planning.pick_sequence": "pick_place",
+        "simulator.control": "simulator_control",
     }
 )
 _INVOCATION_OWNER_PORTS: Final[Mapping[str, str]] = MappingProxyType(
@@ -390,10 +390,6 @@ _DEFERRED_BY_NODE: Final[Mapping[str, tuple[str, tuple[str, ...]]]] = MappingPro
             I8_ADAPTER_REASON,
             ("I8", "P5"),
         ),
-        "simulation.reset": (I9_ADAPTER_REASON, ("I9", "I")),
-        "simulation.set_entity_pose": (I9_ADAPTER_REASON, ("I9", "I")),
-        "simulation.set_state": (I9_ADAPTER_REASON, ("I9", "I")),
-        "simulation.step": (I9_ADAPTER_REASON, ("I9", "I")),
     }
 )
 

@@ -386,7 +386,7 @@ struct DeferredAdapter final {
   std::string_view gate;
 };
 
-constexpr std::array<DeferredAdapter, 11U> kDeferredAdapters{{
+constexpr std::array<DeferredAdapter, 7U> kDeferredAdapters{{
     {"io.get_input", "semantic_io_node_adapter_unavailable_until_i11", "I11",
      "T"},
     {"io.set_output", "semantic_io_node_adapter_unavailable_until_i11", "I11",
@@ -401,14 +401,6 @@ constexpr std::array<DeferredAdapter, 11U> kDeferredAdapters{{
      "I8", "P5"},
     {"recovery.apply_offered_action",
      "kernel_policy_node_adapter_unavailable_until_i8", "I8", "P5"},
-    {"simulation.reset", "simulation_node_adapter_unavailable_until_i9", "I9",
-     "I"},
-    {"simulation.set_entity_pose",
-     "simulation_node_adapter_unavailable_until_i9", "I9", "I"},
-    {"simulation.set_state", "simulation_node_adapter_unavailable_until_i9",
-     "I9", "I"},
-    {"simulation.step", "simulation_node_adapter_unavailable_until_i9", "I9",
-     "I"},
 }};
 
 const DeferredAdapter *DeferredDisposition(const std::string_view node_id) {

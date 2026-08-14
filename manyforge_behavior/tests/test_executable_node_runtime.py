@@ -18,7 +18,6 @@ from manyforge_behavior.canonical_artifact import compute_content_identity
 from manyforge_behavior.catalog import NodeCatalog
 from manyforge_behavior.executable_node_resolver import (
     ExecutableNodeResolverError,
-    ExecutableNodeUnavailableError,
     NodeAdapterBuildContext,
     build_executable_node_resolver,
 )
@@ -265,6 +264,7 @@ def _ports(
         model_queries=invocation_port,
         assistant_requests=task_port,
         pick_place=task_port,
+        simulator_control=task_port,
         kernel_controls=invocation_port,
     )
 
@@ -297,8 +297,8 @@ def test_closed_resolver_exactly_disposes_all_fifty_rows() -> None:
     dispositions = resolver.dispositions
 
     assert len(dispositions) == len(environment.registry.rows) == 50
-    assert sum(item.adapter_build_qualified for item in dispositions) == 39
-    assert sum(not item.adapter_build_qualified for item in dispositions) == 11
+    assert sum(item.adapter_build_qualified for item in dispositions) == 43
+    assert sum(not item.adapter_build_qualified for item in dispositions) == 7
     assert all(
         (
             (item.unavailable_reason_code is None and not item.restoration_gates)
@@ -362,25 +362,40 @@ def test_closed_resolver_rejects_unknown_and_missing_algorithm_bindings(
         build_executable_node_resolver(environment)
 
 
-def test_future_row_is_typed_unavailable_before_context_access() -> None:
-    environment = build_node_environment()
-    resolver = build_executable_node_resolver(environment)
-    row = environment.registry.record("simulation.reset")
-
-    with pytest.raises(
-        ExecutableNodeUnavailableError,
-        match="simulation_node_adapter_unavailable_until_i9",
-    ) as raised:
-        resolver.instantiate(
-            row,
-            NodeAdapterBuildContext(
-                name="reset_sim",
-                node_instance_id="reset_sim",
-                parameters={},
+def test_simulation_row_uses_the_focused_cancellable_task_owner() -> None:
+    document = _minimal_document()
+    document["tree"] = {
+        "node_id": "simulation.reset",
+        "instance_id": "reset_sim",
+        "parameters": {},
+        "children": [],
+    }
+    catalog = _catalog()
+    program = Program.from_dict(_identified(document), catalog)
+    task = _TaskPort((OwnerTaskState.ACTIVE, OwnerTaskState.SUCCEEDED))
+    resolver = build_executable_node_resolver(build_node_environment())
+    adapter = resolver.instantiate(
+        build_node_environment().registry.record("simulation.reset"),
+        NodeAdapterBuildContext(
+            name="reset_sim",
+            node_instance_id="reset_sim",
+            parameters={},
+            input_resolver=NodeAttemptInputResolver(
+                program=program,
+                catalog=catalog,
+                value_store=ProgramValueStore.from_program(program),
             ),
-        )
+            attempt_source=ProgramRunAttemptSource("run.simulation"),
+            ports=NodeAdapterPorts(simulator_control=task),
+        ),
+    )
 
-    assert raised.value.restoration_gates == ("I9", "I")
+    adapter.initialise()
+    assert adapter.update() is py_trees.common.Status.RUNNING
+    assert task.starts[0][0] == "simulation.reset"
+    assert task.starts[0][2].parameters == {}
+    assert adapter.update() is py_trees.common.Status.SUCCESS
+    assert task.acknowledgements == [("task-1", task.starts[0][1])]
 
 
 def test_availability_keeps_adapter_binding_owner_and_execution_separate() -> None:
@@ -412,12 +427,11 @@ def test_availability_keeps_adapter_binding_owner_and_execution_separate() -> No
         "restoration_gates": [],
     }
     assert by_node["simulation.reset"]["authoring_available"] is True
-    assert by_node["simulation.reset"]["adapter_build_qualified"] is False
+    assert by_node["simulation.reset"]["adapter_build_qualified"] is True
     assert by_node["simulation.reset"]["owner_health_available"] is False
     assert by_node["simulation.reset"]["reason_codes"] == [
         "program_binding_unselected",
         "program_runtime_owner_unavailable",
-        "simulation_node_adapter_unavailable_until_i9",
     ]
 
     selected = project_node_execution_availability(
@@ -429,7 +443,7 @@ def test_availability_keeps_adapter_binding_owner_and_execution_separate() -> No
     assert selected["reason_codes"] == []
     assert {item["node_id"]: item for item in selected["implementations"]}[
         "simulation.reset"
-    ]["execution_available"] is False
+    ]["execution_available"] is True
 
     incomplete = dict(_readiness(_DIGEST_A).binding_by_node)
     incomplete.pop("sequence")

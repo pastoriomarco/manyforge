@@ -119,8 +119,8 @@ TEST(NodeEnvironmentProjection,
             std::string::npos);
   EXPECT_NE(bytes.find("\"adapter_build_qualified\":true"), std::string::npos);
   EXPECT_NE(bytes.find("\"adapter_build_qualified\":false"), std::string::npos);
-  EXPECT_EQ(Count(bytes, "\"adapter_build_qualified\":true"), 39U);
-  EXPECT_EQ(Count(bytes, "\"adapter_build_qualified\":false"), 11U);
+  EXPECT_EQ(Count(bytes, "\"adapter_build_qualified\":true"), 43U);
+  EXPECT_EQ(Count(bytes, "\"adapter_build_qualified\":false"), 7U);
   EXPECT_NE(bytes.find("\"binding_available\":false"), std::string::npos);
   EXPECT_NE(bytes.find("\"owner_health_available\":false"), std::string::npos);
   EXPECT_EQ(Count(bytes, "\"owner_health_available\":true"), 11U);
@@ -129,7 +129,7 @@ TEST(NodeEnvironmentProjection,
             std::string::npos);
   EXPECT_NE(bytes.find("\"kernel_policy_node_adapter_unavailable_until_i8\""),
             std::string::npos);
-  EXPECT_NE(bytes.find("\"simulation_node_adapter_unavailable_until_i9\""),
+  EXPECT_EQ(bytes.find("\"simulation_node_adapter_unavailable_until_i9\""),
             std::string::npos);
   EXPECT_NE(bytes.find("\"semantic_io_node_adapter_unavailable_until_i11\""),
             std::string::npos);
