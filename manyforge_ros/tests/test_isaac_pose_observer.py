@@ -19,6 +19,7 @@ from manyforge_ros.isaac_pose_observer import (
 from manyforge_ros.manager_scene_runtime import (
     PoseObservationIntent,
     PoseObservationResult,
+    PoseObserverBinding,
     PoseObserverSession,
     SceneRuntimeIdentity,
     SceneRuntimeManagerError,
@@ -111,6 +112,15 @@ def test_site_config_is_closed_bounded_and_preserves_exact_bindings(
         ("isaac_cheese_box", "continuous_unattached"),
         ("graspable", "before_planning"),
     }
+    assert config.observer_bindings == (
+        PoseObserverBinding("graspable", "before_planning", True),
+        PoseObserverBinding(
+            "isaac_cheese_box", "continuous_unattached", True
+        ),
+        PoseObserverBinding(
+            "isaac_ur10e_light_robot", "viewer.measured_robot", False
+        ),
+    )
 
 
 def test_site_config_rejects_symlink_duplicates_unknown_fields_and_key_aliases(
@@ -275,9 +285,11 @@ class _FakeSceneRuntimeClient:
         self,
         owner: SceneRuntimeOwnerSnapshot,
         *,
+        bindings: tuple[PoseObserverBinding, ...],
         source_id: str,
         source_epoch: str,
     ) -> PoseObserverSession:
+        assert bindings
         self.opens.append((source_id, source_epoch))
         return PoseObserverSession(
             cell_id=owner.cell_id,
@@ -374,6 +386,29 @@ def test_dispatcher_is_latest_per_key_and_rejoins_with_exact_retry() -> None:
     assert [event.kind for event in events] == ["retry", "delivered"]
 
 
+def test_dispatcher_registers_its_exact_bindings_before_any_sample() -> None:
+    client = _FakeSceneRuntimeClient()
+    binding = PoseObserverBinding(
+        object_id="robot",
+        policy_id="viewer.measured_robot",
+        eligible=False,
+    )
+    dispatcher = ObservationDispatcher(
+        client=client,
+        expected_cell_id="cell.1",
+        source_id="isaac.observer",
+        allowed_keys=frozenset({("robot", "viewer.measured_robot")}),
+        observer_bindings=(binding,),
+        source_epoch_factory=lambda: "source.epoch.1",
+    )
+    dispatcher.start()
+    _wait_for(lambda: dispatcher.snapshot().joins == 1)
+    assert dispatcher.close()
+    assert dispatcher.snapshot().submitted == 0
+    assert client.observations == []
+    assert client.opens == [("isaac.observer", "source.epoch.1")]
+
+
 def test_dispatcher_drops_an_undeliverable_sample_after_its_lifetime() -> None:
     clock = _Clock()
     client = _FakeSceneRuntimeClient(fail_first=True, clock=clock)
@@ -417,3 +452,13 @@ def test_dispatcher_rejects_unconfigured_keys_without_growing_a_queue() -> None:
             )
         )
     assert dispatcher.snapshot().pending == 0
+
+    with pytest.raises(ValueError, match="exactly cover"):
+        ObservationDispatcher(
+            client=_FakeSceneRuntimeClient(),
+            expected_cell_id="cell.1",
+            source_id="isaac.observer",
+            allowed_keys=frozenset({("robot", "viewer.measured_robot")}),
+            observer_bindings=(),
+            source_epoch_factory=lambda: "source.epoch.1",
+        )

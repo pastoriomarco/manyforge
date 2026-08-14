@@ -26,6 +26,7 @@ from manyforge_ros.manager_scene_runtime import (
     ManagerSceneRuntimeClient,
     PoseObservationIntent,
     PoseObservationResult,
+    PoseObserverBinding,
     PoseObserverSession,
     SceneRuntimeManagerError,
     SceneRuntimeOwnerSnapshot,
@@ -127,6 +128,19 @@ class IsaacPoseObserverSiteConfig:
     def keys(self) -> frozenset[tuple[str, str]]:
         return frozenset(binding.key for binding in self.bindings)
 
+    @property
+    def observer_bindings(self) -> tuple[PoseObserverBinding, ...]:
+        return tuple(
+            sorted(
+                PoseObserverBinding(
+                    object_id=binding.object_id,
+                    policy_id=binding.policy_id,
+                    eligible=binding.eligible,
+                )
+                for binding in self.bindings
+            )
+        )
+
 
 @dataclass(frozen=True)
 class ObservationDispatchEvent:
@@ -159,6 +173,7 @@ class _SceneRuntimeClient(Protocol):
         self,
         owner: SceneRuntimeOwnerSnapshot,
         *,
+        bindings: tuple[PoseObserverBinding, ...],
         source_id: str,
         source_epoch: str,
     ) -> PoseObserverSession: ...
@@ -429,6 +444,7 @@ class ObservationDispatcher:
         expected_cell_id: str,
         source_id: str,
         allowed_keys: frozenset[tuple[str, str]],
+        observer_bindings: tuple[PoseObserverBinding, ...] | None = None,
         event_callback: Callable[[ObservationDispatchEvent], None] | None = None,
         clock_ns: Callable[[], int] = time.monotonic_ns,
         source_epoch_factory: Callable[[], str] | None = None,
@@ -441,6 +457,27 @@ class ObservationDispatcher:
         if not allowed_keys or len(allowed_keys) > MAX_CONFIGURED_OBSERVATIONS:
             raise ValueError("allowed_keys must be one bounded non-empty set")
         self._allowed_keys = frozenset(allowed_keys)
+        self._observer_bindings = (
+            tuple(
+                PoseObserverBinding(
+                    object_id=object_id,
+                    policy_id=policy_id,
+                    eligible=False,
+                )
+                for object_id, policy_id in sorted(self._allowed_keys)
+            )
+            if observer_bindings is None
+            else observer_bindings
+        )
+        if (
+            tuple(sorted(self._observer_bindings)) != self._observer_bindings
+            or {
+                (binding.object_id, binding.policy_id)
+                for binding in self._observer_bindings
+            }
+            != self._allowed_keys
+        ):
+            raise ValueError("observer bindings must exactly cover allowed_keys")
         self._event_callback = event_callback
         self._clock_ns = clock_ns
         self._source_epoch_factory = source_epoch_factory or (
@@ -471,6 +508,7 @@ class ObservationDispatcher:
         self._expired = 0
         self._joins = 0
         self._last_error_code = ""
+        self._manager_owner_epoch: str | None = None
 
     @classmethod
     def for_manager_root(
@@ -489,6 +527,7 @@ class ObservationDispatcher:
             expected_cell_id=config.cell_id,
             source_id=config.source_id,
             allowed_keys=config.keys,
+            observer_bindings=config.observer_bindings,
             event_callback=event_callback,
         )
 
@@ -547,28 +586,88 @@ class ObservationDispatcher:
     def _run(self) -> None:
         retry_delay = self._retry_initial_s
         while True:
+            if self._session is None:
+                try:
+                    owner = self._client.read_owner()
+                    if owner.cell_id != self._expected_cell_id:
+                        raise SceneRuntimeManagerError(
+                            "pose_observer_cell_mismatch",
+                            "Manager active cell does not match the site config",
+                        )
+                    self._session = self._client.open_observer(
+                        owner,
+                        bindings=self._observer_bindings,
+                        source_id=self._source_id,
+                        source_epoch=self._source_epoch,
+                    )
+                    self._manager_owner_epoch = owner.owner_epoch
+                except SceneRuntimeManagerError as exc:
+                    with self._condition:
+                        self._retries += 1
+                        self._last_error_code = exc.code
+                        if not self._stop_requested:
+                            self._condition.wait(timeout=retry_delay)
+                    retry_delay = min(self._retry_max_s, retry_delay * 2.0)
+                    continue
+                with self._condition:
+                    self._joins += 1
+                    self._last_error_code = ""
+                retry_delay = self._retry_initial_s
             with self._condition:
+                heartbeat = False
+                restart_session = False
                 while (
                     not self._stop_requested
                     and self._inflight is None
                     and not self._pending
                 ):
-                    self._condition.wait()
+                    self._condition.wait(timeout=1.0)
+                    if not self._pending and not self._stop_requested:
+                        heartbeat = True
+                        break
                 if self._stop_requested:
                     return
-                if self._inflight is None:
-                    if self._next_sequence > MAXIMUM_SAFE_INTEGER:
-                        self._source_epoch = self._new_source_epoch()
+                if heartbeat:
+                    pending = None
+                else:
+                    if self._inflight is None:
+                        if self._next_sequence > MAXIMUM_SAFE_INTEGER:
+                            self._source_epoch = self._new_source_epoch()
+                            self._session = None
+                            self._manager_owner_epoch = None
+                            self._next_sequence = 1
+                            restart_session = True
+                        else:
+                            key, (intent, enqueued_at) = self._pending.popitem(
+                                last=False
+                            )
+                            self._inflight = _PendingObservation(
+                                key=key,
+                                intent=intent,
+                                enqueued_at_ns=enqueued_at,
+                                source_sequence=self._next_sequence,
+                            )
+                    pending = None if restart_session else self._inflight
+            if restart_session:
+                continue
+            if heartbeat:
+                try:
+                    owner = self._client.read_owner()
+                    if (
+                        owner.cell_id != self._expected_cell_id
+                        or self._session is None
+                        or owner.owner_epoch != self._manager_owner_epoch
+                        or owner.runtime_identity != self._session.runtime_identity
+                    ):
                         self._session = None
-                        self._next_sequence = 1
-                    key, (intent, enqueued_at) = self._pending.popitem(last=False)
-                    self._inflight = _PendingObservation(
-                        key=key,
-                        intent=intent,
-                        enqueued_at_ns=enqueued_at,
-                        source_sequence=self._next_sequence,
-                    )
-                pending = self._inflight
+                        self._manager_owner_epoch = None
+                except SceneRuntimeManagerError as exc:
+                    with self._condition:
+                        self._retries += 1
+                        self._last_error_code = exc.code
+                    self._session = None
+                    self._manager_owner_epoch = None
+                continue
             assert pending is not None
             age_ns = max(0, self._clock_ns() - pending.enqueued_at_ns)
             if age_ns > pending.intent.lifetime_ns:
@@ -586,20 +685,7 @@ class ObservationDispatcher:
                 retry_delay = self._retry_initial_s
                 continue
             try:
-                if self._session is None:
-                    owner = self._client.read_owner()
-                    if owner.cell_id != self._expected_cell_id:
-                        raise SceneRuntimeManagerError(
-                            "pose_observer_cell_mismatch",
-                            "Manager active cell does not match the site config",
-                        )
-                    self._session = self._client.open_observer(
-                        owner,
-                        source_id=self._source_id,
-                        source_epoch=self._source_epoch,
-                    )
-                    with self._condition:
-                        self._joins += 1
+                assert self._session is not None
                 result = self._client.observe(
                     self._session,
                     source_sequence=pending.source_sequence,
@@ -611,9 +697,11 @@ class ObservationDispatcher:
                     self._last_error_code = exc.code
                     if exc.code in _REJOIN_CODES:
                         self._session = None
+                        self._manager_owner_epoch = None
                     elif exc.code == "scene_runtime_observation_request_conflict":
                         self._source_epoch = self._new_source_epoch()
                         self._session = None
+                        self._manager_owner_epoch = None
                         pending.source_sequence = 1
                         self._next_sequence = 1
                 self._emit(

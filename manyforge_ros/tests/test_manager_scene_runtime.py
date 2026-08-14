@@ -14,9 +14,20 @@ from manyforge_ros.manager_scene_runtime import (
     MANAGER_RESPONSE_VERSION,
     ManagerSceneRuntimeClient,
     PoseObservationIntent,
+    PoseObserverBinding,
     SceneRuntimeManagerError,
     SceneRuntimeOwnerSnapshot,
 )
+
+
+def _bindings() -> tuple[PoseObserverBinding, ...]:
+    return (
+        PoseObserverBinding(
+            object_id="ur10e",
+            policy_id="viewer.measured_robot",
+            eligible=False,
+        ),
+    )
 
 
 def _identity(runtime_generation: int = 7) -> dict[str, object]:
@@ -44,6 +55,7 @@ def _owner_response() -> dict[str, object]:
 def _open_response() -> dict[str, object]:
     return {
         "api_version": MANAGER_RESPONSE_VERSION,
+        "bindings": [binding.to_value() for binding in _bindings()],
         "cell_id": "cell.ur10",
         "ok": True,
         "runtime_identity": _identity(),
@@ -105,6 +117,7 @@ def test_client_exchanges_exact_canonical_owner_open_and_observe_packets(
         owner = client.read_owner()
         session = client.open_observer(
             owner,
+            bindings=_bindings(),
             source_id="isaac.observer",
             source_epoch="orin-observer.1",
         )
@@ -146,6 +159,9 @@ def test_client_exchanges_exact_canonical_owner_open_and_observe_packets(
         "command": "scene_runtime_owner_read",
     }
     assert decoded[1]["expected_runtime_identity"] == _identity()
+    assert decoded[1]["bindings"] == [
+        binding.to_value() for binding in _bindings()
+    ]
     assert decoded[2]["source_sequence"] == 1
     assert decoded[2]["payload"]["positions"] == [0.25]
     assert set(decoded[2]) == {
@@ -264,6 +280,7 @@ def test_client_rejects_wrong_endpoint_and_response_identity(
     with pytest.raises(SceneRuntimeManagerError) as crossed:
         client.open_observer(
             owner,
+            bindings=_bindings(),
             source_id="isaac.observer",
             source_epoch="orin-observer.1",
         )
@@ -315,6 +332,7 @@ def test_observation_intent_and_sequence_are_strict_and_bounded(
     monkeypatch.setattr(client, "_exchange", lambda _command: _open_response())
     session = client.open_observer(
         owner,
+        bindings=_bindings(),
         source_id="isaac.observer",
         source_epoch="orin-observer.1",
     )

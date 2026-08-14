@@ -586,17 +586,29 @@ DifferentSceneRuntimeIdentityValue(const SourceSnapshot &scene_runtime_source) {
   });
 }
 
-std::string
-SceneRuntimeObserverOpenRequest(const SourceSnapshot &scene_runtime_source,
-                                const std::string_view source_epoch) {
+std::string SceneRuntimeObserverOpenRequest(
+    const SourceSnapshot &scene_runtime_source,
+    const std::string_view source_epoch,
+    const std::string_view source_id = "isaac.observer",
+    const std::string_view object_id = "robot",
+    const std::string_view policy_id = "viewer.measured_robot",
+    const bool eligible = false) {
   using content_identity::CanonicalValue;
   return content_identity::canonical_json(CanonicalValue(CanonicalValue::Object{
       {"api_version", CanonicalValue("manyforge.manager_command.v1")},
+      {"bindings",
+       CanonicalValue(CanonicalValue::Array{
+           CanonicalValue(CanonicalValue::Object{
+               {"eligible", CanonicalValue(eligible)},
+               {"object_id", CanonicalValue(std::string(object_id))},
+               {"policy_id", CanonicalValue(std::string(policy_id))},
+           }),
+       })},
       {"command", CanonicalValue("scene_runtime_observer_open")},
       {"expected_runtime_identity",
        SceneRuntimeIdentityValue(scene_runtime_source)},
       {"source_epoch", CanonicalValue(std::string(source_epoch))},
-      {"source_id", CanonicalValue("isaac.observer")},
+      {"source_id", CanonicalValue(std::string(source_id))},
   }));
 }
 
@@ -605,18 +617,22 @@ std::string SceneRuntimeObserveRequest(
     const std::string_view source_epoch, const std::uint64_t source_sequence,
     const std::uint64_t lifetime_ns = 1000000000ULL,
     const double position = 0.25,
-    const content_identity::CanonicalValue *expected_identity = nullptr) {
+    const content_identity::CanonicalValue *expected_identity = nullptr,
+    const std::string_view source_id = "isaac.observer",
+    const std::string_view object_id = "robot",
+    const std::string_view policy_id = "viewer.measured_robot",
+    const bool eligible = false) {
   using content_identity::CanonicalValue;
   return content_identity::canonical_json(CanonicalValue(CanonicalValue::Object{
       {"api_version", CanonicalValue("manyforge.manager_command.v1")},
       {"command", CanonicalValue("scene_runtime_observe")},
-      {"eligible", CanonicalValue(false)},
+      {"eligible", CanonicalValue(eligible)},
       {"expected_runtime_identity",
        expected_identity == nullptr
            ? SceneRuntimeIdentityValue(scene_runtime_source)
            : *expected_identity},
       {"lifetime_ns", CanonicalValue(static_cast<double>(lifetime_ns))},
-      {"object_id", CanonicalValue("robot")},
+      {"object_id", CanonicalValue(std::string(object_id))},
       {"payload",
        CanonicalValue(CanonicalValue::Object{
            {"api_version", CanonicalValue("manyforge.ros_pose_observation.v1")},
@@ -625,10 +641,10 @@ std::string SceneRuntimeObserveRequest(
                              CanonicalValue(position),
                          })},
        })},
-      {"policy_id", CanonicalValue("viewer.measured_robot")},
+      {"policy_id", CanonicalValue(std::string(policy_id))},
       {"quality", CanonicalValue("good")},
       {"source_epoch", CanonicalValue(std::string(source_epoch))},
-      {"source_id", CanonicalValue("isaac.observer")},
+      {"source_id", CanonicalValue(std::string(source_id))},
       {"source_sequence", CanonicalValue(static_cast<double>(source_sequence))},
   }));
 }
@@ -817,6 +833,15 @@ TEST(ManagerDaemonProcess,
         SceneRuntimeObserverOpenRequest(*initial, "observer-epoch-1"));
     EXPECT_NE(opened_first.find("\"source_epoch_order\":1"), std::string::npos)
         << opened_first;
+    const auto changed_registration =
+        SendCommand(directory.socket_path(),
+                    SceneRuntimeObserverOpenRequest(
+                        *initial, "observer-epoch-1", "isaac.observer",
+                        "scene_object", "continuous_unattached", true));
+    EXPECT_NE(
+        changed_registration.find("scene_runtime_observer_request_conflict"),
+        std::string::npos)
+        << changed_registration;
     const auto accepted = SendCommand(
         directory.socket_path(),
         SceneRuntimeObserveRequest(*initial, "observer-epoch-1", 1U));
@@ -843,6 +868,32 @@ TEST(ManagerDaemonProcess,
     EXPECT_NE(crossed_runtime.find("scene_runtime_identity_changed"),
               std::string::npos)
         << crossed_runtime;
+
+    const auto writable_open =
+        SendCommand(directory.socket_path(),
+                    SceneRuntimeObserverOpenRequest(
+                        *initial, "writer-epoch-1", "isaac.writer.a",
+                        "scene_object", "continuous_unattached", true));
+    EXPECT_NE(writable_open.find("\"ok\":true"), std::string::npos)
+        << writable_open;
+    const auto conflicting_writer =
+        SendCommand(directory.socket_path(),
+                    SceneRuntimeObserverOpenRequest(
+                        *initial, "writer-epoch-1", "isaac.writer.b",
+                        "scene_object", "before_planning", true));
+    EXPECT_NE(conflicting_writer.find("scene_runtime_pose_writer_conflict"),
+              std::string::npos)
+        << conflicting_writer;
+    const auto undeclared_observation =
+        SendCommand(directory.socket_path(),
+                    SceneRuntimeObserveRequest(*initial, "writer-epoch-1", 1U,
+                                               1000000000ULL, 0.25, nullptr,
+                                               "isaac.writer.a", "scene_object",
+                                               "before_planning", true));
+    EXPECT_NE(
+        undeclared_observation.find("scene_runtime_observation_not_declared"),
+        std::string::npos)
+        << undeclared_observation;
 
     const auto observed = scene_runtime_source.Read();
     ASSERT_TRUE(observed.has_value());

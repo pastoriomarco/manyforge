@@ -135,6 +135,26 @@ class PoseObserverSession:
     source_epoch_order: int
 
 
+@dataclass(frozen=True, order=True)
+class PoseObserverBinding:
+    object_id: str
+    policy_id: str
+    eligible: bool
+
+    def __post_init__(self) -> None:
+        _bounded_text(self.object_id, label="object_id")
+        _bounded_text(self.policy_id, label="policy_id")
+        if type(self.eligible) is not bool:
+            raise TypeError("eligible must be an exact bool")
+
+    def to_value(self) -> dict[str, object]:
+        return {
+            "eligible": self.eligible,
+            "object_id": self.object_id,
+            "policy_id": self.policy_id,
+        }
+
+
 @dataclass(frozen=True)
 class PoseObservationIntent:
     object_id: str
@@ -257,6 +277,7 @@ class ManagerSceneRuntimeClient:
         self,
         owner: SceneRuntimeOwnerSnapshot,
         *,
+        bindings: tuple[PoseObserverBinding, ...],
         source_id: str,
         source_epoch: str,
     ) -> PoseObserverSession:
@@ -264,9 +285,19 @@ class ManagerSceneRuntimeClient:
             raise TypeError("owner must be a SceneRuntimeOwnerSnapshot")
         source_id = _bounded_text(source_id, label="source_id")
         source_epoch = _bounded_text(source_epoch, label="source_epoch")
+        if (
+            not bindings
+            or len(bindings) > 128
+            or any(not isinstance(binding, PoseObserverBinding) for binding in bindings)
+        ):
+            raise ValueError("bindings must be one bounded non-empty tuple")
+        normalized_bindings = tuple(sorted(bindings))
+        if normalized_bindings != bindings or len(set(bindings)) != len(bindings):
+            raise ValueError("bindings must be unique and canonically ordered")
         response = self._exchange(
             {
                 "api_version": MANAGER_COMMAND_VERSION,
+                "bindings": [binding.to_value() for binding in bindings],
                 "command": "scene_runtime_observer_open",
                 "expected_runtime_identity": owner.runtime_identity.to_value(),
                 "source_epoch": source_epoch,
@@ -277,6 +308,7 @@ class ManagerSceneRuntimeClient:
             response,
             {
                 "api_version",
+                "bindings",
                 "cell_id",
                 "ok",
                 "runtime_identity",
@@ -293,6 +325,7 @@ class ManagerSceneRuntimeClient:
             epoch_order = _safe_integer(
                 record["source_epoch_order"], label="source_epoch_order"
             )
+            response_bindings = _pose_observer_bindings(record["bindings"])
         except (TypeError, ValueError) as exc:
             raise _response_invalid("observer-open response is invalid") from exc
         if (
@@ -300,6 +333,7 @@ class ManagerSceneRuntimeClient:
             or response_identity != owner.runtime_identity
             or record["source_id"] != source_id
             or record["source_epoch"] != source_epoch
+            or response_bindings != bindings
         ):
             raise SceneRuntimeManagerError(
                 "manager_scene_runtime_response_identity_mismatch",
@@ -566,6 +600,29 @@ def _strict_json_object(payload: bytes) -> dict[str, Any]:
     if not isinstance(value, dict):
         raise _response_invalid("Manager scene-runtime response is not an object")
     return value
+
+
+def _pose_observer_bindings(value: object) -> tuple[PoseObserverBinding, ...]:
+    if not isinstance(value, list) or not value or len(value) > 128:
+        raise ValueError("observer bindings must be one bounded non-empty array")
+    result: list[PoseObserverBinding] = []
+    for item in value:
+        record = _exact_object(
+            item,
+            {"eligible", "object_id", "policy_id"},
+            label="observer binding",
+        )
+        result.append(
+            PoseObserverBinding(
+                object_id=record["object_id"],
+                policy_id=record["policy_id"],
+                eligible=record["eligible"],
+            )
+        )
+    bindings = tuple(result)
+    if bindings != tuple(sorted(bindings)) or len(set(bindings)) != len(bindings):
+        raise ValueError("observer bindings are not unique and ordered")
+    return bindings
 
 
 def _exact_object(

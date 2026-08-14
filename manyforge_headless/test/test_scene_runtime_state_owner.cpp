@@ -234,6 +234,36 @@ TEST(SceneRuntimeStateOwner,
   EXPECT_EQ(batch.observations.front().source_epoch, "source-epoch-2");
 }
 
+TEST(SceneRuntimeStateOwner,
+     RetainsBeforePlanningPoseWithoutApplyingOrBarrierReplay) {
+  std::int64_t now = 10;
+  SceneRuntimeStateOwner owner([&] { return now; }, [] { return "token-1"; });
+  owner.EstablishOpenRuntime(RuntimeIdentity(1U), 1U, "bootstrap");
+
+  auto observation = Observation(1U, 10, 100);
+  observation.key.policy_id = "before_planning";
+  EXPECT_EQ(owner.ObservePose(observation).disposition,
+            PoseObservationDisposition::kObservedOnly);
+  ASSERT_EQ(owner.Snapshot().pose_sources.size(), 1U);
+  EXPECT_FALSE(owner.Snapshot().pose_sources.front().buffered);
+
+  const auto token =
+      owner.BeginInitialization(RuntimeIdentity(2U), false, "load");
+  observation.source_sequence = 2U;
+  observation.observed_at_ns = 20;
+  observation.expires_at_ns = 120;
+  now = 20;
+  EXPECT_EQ(owner.ObservePose(observation).disposition,
+            PoseObservationDisposition::kObservedOnly);
+  EXPECT_FALSE(owner.Snapshot().pose_sources.front().buffered);
+  owner.PrepareReset(token, "reset");
+  owner.MarkSeeded(token);
+  const auto batch = owner.BeginReplay(token);
+  EXPECT_TRUE(batch.observations.empty());
+  owner.CompleteReplay(batch, 0U);
+  EXPECT_EQ(owner.Snapshot().state, SceneInitializationState::kOpen);
+}
+
 TEST(SceneRuntimeStateOwner, EmitsOneClosedCanonicalProjection) {
   std::int64_t now = 10;
   SceneRuntimeStateOwner owner([&] { return now; }, [] { return "token-1"; });

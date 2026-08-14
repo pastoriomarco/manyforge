@@ -97,6 +97,10 @@ bool IsPending(const SceneInitializationState state) noexcept {
          state == SceneInitializationState::kFailed;
 }
 
+bool IsImmediatePosePolicy(const std::string_view policy_id) noexcept {
+  return policy_id == "continuous" || policy_id == "continuous_unattached";
+}
+
 CanonicalValue Number(const std::uint64_t value, const std::string_view label,
                       const bool nonzero = false) {
   ValidateSafeInteger(value, label, nonzero);
@@ -472,7 +476,8 @@ SceneRuntimeStateOwner::BeginReplay(const std::string_view token) {
     if (!record.buffered) {
       continue;
     }
-    if (record.observation.quality == PoseSourceQuality::kGood &&
+    if (IsImmediatePosePolicy(record.observation.key.policy_id) &&
+        record.observation.quality == PoseSourceQuality::kGood &&
         record.observation.eligible &&
         record.observation.expires_at_ns >= now) {
       observations.push_back(record.observation);
@@ -645,7 +650,8 @@ SceneRuntimeStateOwner::ObservePose(PoseSourceObservation observation) {
 
   const bool fresh = observation.quality == PoseSourceQuality::kGood &&
                      observation.expires_at_ns >= now;
-  const bool can_apply = fresh && observation.eligible;
+  const bool can_apply = fresh && observation.eligible &&
+                         IsImmediatePosePolicy(observation.key.policy_id);
   const bool was_buffered =
       found != pose_records_.end() && found->second.buffered;
   PoseObservationDisposition disposition =

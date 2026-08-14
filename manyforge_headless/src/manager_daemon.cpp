@@ -46,6 +46,7 @@
 #include <string>
 #include <string_view>
 #include <system_error>
+#include <tuple>
 #include <utility>
 #include <variant>
 #include <vector>
@@ -312,6 +313,20 @@ enum class CommandKind {
   kShutdownRuntime,
 };
 
+struct PoseObserverBinding final {
+  std::string object_id;
+  std::string policy_id;
+  bool eligible{};
+
+  friend bool operator==(const PoseObserverBinding &,
+                         const PoseObserverBinding &) = default;
+  friend bool operator<(const PoseObserverBinding &left,
+                        const PoseObserverBinding &right) noexcept {
+    return std::tie(left.object_id, left.policy_id) <
+           std::tie(right.object_id, right.policy_id);
+  }
+};
+
 struct ManagerCommand final {
   CommandKind kind;
   std::optional<std::string> request_id{};
@@ -337,6 +352,7 @@ struct ManagerCommand final {
   std::optional<PoseSourceQuality> pose_quality{};
   std::optional<bool> pose_eligible{};
   std::optional<CanonicalValue> pose_payload{};
+  std::vector<PoseObserverBinding> pose_observer_bindings{};
 };
 
 const CanonicalValue &RequiredMember(const CanonicalValue &root,
@@ -484,6 +500,37 @@ RequiredSceneResourceIds(const CanonicalValue &value) {
   return result;
 }
 
+std::vector<PoseObserverBinding>
+RequiredPoseObserverBindings(const CanonicalValue &value) {
+  const auto *rows = std::get_if<CanonicalValue::Array>(&value.storage());
+  Require(rows != nullptr && !rows->empty() &&
+              rows->size() <= kMaximumPoseObserverSessions,
+          "pose observer bindings must be one bounded non-empty array");
+  std::vector<PoseObserverBinding> result;
+  result.reserve(rows->size());
+  std::optional<std::string> writable_object_id;
+  for (const auto &row : *rows) {
+    RequireExactObjectSize(row, 3U, "pose observer binding");
+    PoseObserverBinding binding{RequiredString(row, "object_id"),
+                                RequiredString(row, "policy_id"),
+                                RequiredBool(row, "eligible")};
+    if (binding.eligible) {
+      Require(binding.policy_id == "continuous_unattached" ||
+                  binding.policy_id == "before_planning",
+              "eligible pose observer binding uses an unsupported policy");
+      Require(!writable_object_id.has_value() ||
+                  *writable_object_id != binding.object_id,
+              "pose observer bindings declare more than one writable policy "
+              "for one object");
+      writable_object_id = binding.object_id;
+    }
+    Require(result.empty() || result.back() < binding,
+            "pose observer bindings must be unique and canonically ordered");
+    result.push_back(std::move(binding));
+  }
+  return result;
+}
+
 ManagerCommand DecodeCommand(const std::string_view bytes) {
   Require(!bytes.empty() && bytes.size() <= kMaximumCommandBytes,
           "command packet is empty or exceeds its byte bound");
@@ -570,8 +617,10 @@ ManagerCommand DecodeCommand(const std::string_view bytes) {
     return ManagerCommand{.kind = CommandKind::kSceneRuntimeOwnerRead};
   }
   if (command == "scene_runtime_observer_open") {
-    RequireExactObjectSize(root, 5U, "scene-runtime observer open command");
+    RequireExactObjectSize(root, 6U, "scene-runtime observer open command");
     ManagerCommand result{.kind = CommandKind::kSceneRuntimeObserverOpen};
+    result.pose_observer_bindings =
+        RequiredPoseObserverBindings(RequiredMember(root, "bindings"));
     result.expected_scene_runtime_identity = RequiredSceneRuntimeIdentity(
         RequiredMember(root, "expected_runtime_identity"));
     result.pose_source_epoch = RequiredString(root, "source_epoch");
@@ -741,10 +790,21 @@ SceneRuntimeOwnerReadResponse(const std::string_view cell_id,
 CanonicalValue SceneRuntimeObserverOpenResponse(
     const std::string_view cell_id, const SceneRuntimeIdentity &identity,
     const std::string_view source_id, const std::string_view source_epoch,
-    const std::uint64_t source_epoch_order) {
+    const std::uint64_t source_epoch_order,
+    const std::vector<PoseObserverBinding> &bindings) {
+  CanonicalValue::Array binding_values;
+  binding_values.reserve(bindings.size());
+  for (const auto &binding : bindings) {
+    binding_values.emplace_back(CanonicalValue::Object{
+        {"eligible", CanonicalValue(binding.eligible)},
+        {"object_id", CanonicalValue(binding.object_id)},
+        {"policy_id", CanonicalValue(binding.policy_id)},
+    });
+  }
   return CanonicalValue(CanonicalValue::Object{
       {"api_version",
        CanonicalValue(std::string(kManagerCommandResponseApiVersion))},
+      {"bindings", CanonicalValue(std::move(binding_values))},
       {"cell_id", CanonicalValue(std::string(cell_id))},
       {"ok", CanonicalValue(true)},
       {"runtime_identity", SceneRuntimeIdentityResponseValue(identity)},
@@ -1195,6 +1255,7 @@ private:
     SceneRuntimeIdentity runtime_identity;
     std::string source_epoch;
     std::uint64_t source_epoch_order{};
+    std::vector<PoseObserverBinding> bindings;
   };
 
   struct PoseObservationReplay final {
@@ -1657,7 +1718,8 @@ private:
       case CommandKind::kSceneRuntimeObserverOpen: {
         Require(command.expected_scene_runtime_identity.has_value() &&
                     command.pose_source_id.has_value() &&
-                    command.pose_source_epoch.has_value(),
+                    command.pose_source_epoch.has_value() &&
+                    !command.pose_observer_bindings.empty(),
                 "decoded scene-runtime observer open lacks identity");
         const auto snapshot = scene_runtime_owner_.Snapshot();
         if (!snapshot.runtime_identity.has_value() ||
@@ -1683,6 +1745,15 @@ private:
         if (found != pose_observer_sessions_.end()) {
           if (found->second.runtime_identity == *snapshot.runtime_identity &&
               found->second.source_epoch == *command.pose_source_epoch) {
+            if (found->second.bindings != command.pose_observer_bindings) {
+              TrySendResponse(
+                  client.get(),
+                  ErrorResponse(
+                      "scene_runtime_observer_request_conflict",
+                      "observer epoch identity was reused with changed "
+                      "bindings"));
+              return false;
+            }
             source_epoch_order = found->second.source_epoch_order;
           } else {
             if (found->second.source_epoch_order >= 9007199254740991ULL) {
@@ -1695,16 +1766,43 @@ private:
             source_epoch_order = found->second.source_epoch_order + 1U;
           }
         }
+        for (const auto &binding : command.pose_observer_bindings) {
+          if (!binding.eligible) {
+            continue;
+          }
+          for (const auto &[other_source_id, other_session] :
+               pose_observer_sessions_) {
+            if (other_source_id == *command.pose_source_id ||
+                other_session.runtime_identity != *snapshot.runtime_identity) {
+              continue;
+            }
+            const auto conflict = std::find_if(
+                other_session.bindings.begin(), other_session.bindings.end(),
+                [&](const PoseObserverBinding &other) {
+                  return other.eligible && other.object_id == binding.object_id;
+                });
+            if (conflict != other_session.bindings.end()) {
+              TrySendResponse(
+                  client.get(),
+                  ErrorResponse(
+                      "scene_runtime_pose_writer_conflict",
+                      "another observer session already declares the object "
+                      "as collision-scene writable"));
+              return false;
+            }
+          }
+        }
         pose_observer_sessions_.insert_or_assign(
             *command.pose_source_id,
             PoseObserverSession{*snapshot.runtime_identity,
-                                *command.pose_source_epoch,
-                                source_epoch_order});
+                                *command.pose_source_epoch, source_epoch_order,
+                                command.pose_observer_bindings});
         TrySendResponse(client.get(),
                         SceneRuntimeObserverOpenResponse(
                             admission_.cell_id().value(),
                             *snapshot.runtime_identity, *command.pose_source_id,
-                            *command.pose_source_epoch, source_epoch_order));
+                            *command.pose_source_epoch, source_epoch_order,
+                            command.pose_observer_bindings));
         return false;
       }
       case CommandKind::kSceneRuntimeObserve: {
@@ -1739,6 +1837,22 @@ private:
                           ErrorResponse("scene_runtime_observer_session_stale",
                                         "pose observation does not match the "
                                         "active observer session"));
+          return false;
+        }
+        const auto declared = std::lower_bound(
+            session->second.bindings.begin(), session->second.bindings.end(),
+            PoseObserverBinding{*command.pose_object_id,
+                                *command.pose_policy_id,
+                                *command.pose_eligible});
+        if (declared == session->second.bindings.end() ||
+            declared->object_id != *command.pose_object_id ||
+            declared->policy_id != *command.pose_policy_id ||
+            declared->eligible != *command.pose_eligible) {
+          TrySendResponse(
+              client.get(),
+              ErrorResponse(
+                  "scene_runtime_observation_not_declared",
+                  "pose observation does not match its registered binding"));
           return false;
         }
         const PoseObservationKey observation_key{*command.pose_source_id,
