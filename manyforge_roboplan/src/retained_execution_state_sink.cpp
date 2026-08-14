@@ -85,12 +85,14 @@ RetainedExecutionStateSink::apply_group_joint_positions(
                   [](const double value) { return !std::isfinite(value); })) {
     return {core::ExecutionStateSinkStatus::kInvalidPositions};
   }
-  const auto now_ns = clock_->now();
   if (binding->publish_on_apply) {
+    std::lock_guard lock(publish_on_apply_mutex_);
+    const auto now_ns = clock_->now();
     return map_result(binding->state_channel->publish_and_project(
         positions_si, std::vector<double>(positions_si.size(), 0.0), now_ns,
         now_ns, projection_mode(mode)));
   }
+  const auto now_ns = clock_->now();
   return map_result(
       binding->state_channel->project_latest(now_ns, projection_mode(mode)));
 }
@@ -136,6 +138,7 @@ RetainedExecutionStateSink::apply_group_joint_position(
   if (!std::isfinite(position_si)) {
     return {core::ExecutionStateSinkStatus::kInvalidPositions};
   }
+  std::lock_guard lock(publish_on_apply_mutex_);
   const auto current = binding->state_channel->current_controlled_state();
   if (!current.ok() ||
       current.value().positions.size() != context.joint_names.size()) {
@@ -148,7 +151,10 @@ RetainedExecutionStateSink::apply_group_joint_position(
   }
   positions[static_cast<std::size_t>(
       std::distance(context.joint_names.begin(), found))] = position_si;
-  return apply_group_joint_positions(group_id, positions, mode);
+  const auto now_ns = clock_->now();
+  return map_result(binding->state_channel->publish_and_project(
+      positions, std::vector<double>(positions.size(), 0.0), now_ns, now_ns,
+      projection_mode(mode)));
 }
 
 }  // namespace manyforge::roboplan_backend

@@ -1,6 +1,7 @@
 #pragma once
 
 #include <memory>
+#include <mutex>
 #include <string>
 #include <vector>
 
@@ -57,6 +58,9 @@ class RetainedExecutionStateSink final : public core::IExecutionStateSink {
 
   core::IClock* clock_{};
   std::vector<RetainedExecutionStateSinkBinding> bindings_;
+  /// Serializes every publish-on-apply read/update/publication as one writer
+  /// transaction. Projection-only motion bindings never acquire this lock.
+  std::mutex publish_on_apply_mutex_;
 };
 
 }  // namespace manyforge::roboplan_backend

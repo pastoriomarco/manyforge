@@ -286,12 +286,14 @@ public:
 
   Result<ControlledStateDTO> current_controlled_state() const override {
     std::unique_lock lock(mutex_);
+    const auto snapshot = state_;
     if (block_read_) {
       read_entered_ = true;
+      ++read_entered_count_;
       read_cv_.notify_all();
       read_cv_.wait_for(lock, 2s, [&] { return release_read_; });
     }
-    return Result<ControlledStateDTO>::Ok(state_);
+    return Result<ControlledStateDTO>::Ok(snapshot);
   }
 
   const ObservedStateQueryContextDTO &query_context() const noexcept override {
@@ -333,12 +335,20 @@ public:
     std::lock_guard lock(mutex_);
     block_read_ = true;
     read_entered_ = false;
+    read_entered_count_ = 0;
     release_read_ = false;
   }
 
   [[nodiscard]] bool wait_for_read() const {
     std::unique_lock lock(mutex_);
     return read_cv_.wait_for(lock, 2s, [&] { return read_entered_; });
+  }
+
+  [[nodiscard]] bool wait_for_read_count(
+      const int count, const std::chrono::milliseconds timeout) const {
+    std::unique_lock lock(mutex_);
+    return read_cv_.wait_for(
+        lock, timeout, [&] { return read_entered_count_ >= count; });
   }
 
   void release_read() {
@@ -391,6 +401,7 @@ private:
   bool release_publish_{};
   mutable bool block_read_{};
   mutable bool read_entered_{};
+  mutable int read_entered_count_{};
   mutable bool release_read_{};
 };
 
@@ -507,6 +518,45 @@ TEST(RetainedExecutionStateSinkTest,
   EXPECT_EQ(channel->project_applied_calls(), 1);
   EXPECT_DOUBLE_EQ(*sink.group_joint_position("gripper", "finger_joint"),
                    0.02);
+}
+
+TEST(RetainedExecutionStateSinkTest,
+     ConcurrentScalarWritersCannotLoseAnotherJointUpdate) {
+  auto binding = make_binding(CoordinateKind::kAngular, "arm.target");
+  auto channel = std::make_shared<FakeRetainedStateChannel>(
+      binding, std::vector<double>{0.0, 0.0});
+  FakeClock clock;
+  clock.set(123);
+  RetainedExecutionStateSink sink(
+      clock, {{binding.value().model_groups.front().compiled_group_name,
+               channel, true}});
+  channel->block_read();
+
+  std::optional<ExecutionStateSinkResult> first_result;
+  std::optional<ExecutionStateSinkResult> second_result;
+  std::thread first([&] {
+    first_result = sink.apply_group_joint_position(
+        "arm", "joint_1", 0.1, ExecutionStateUpdateMode::kBlocking);
+  });
+  const bool first_entered = channel->wait_for_read();
+  EXPECT_TRUE(first_entered);
+  std::thread second([&] {
+    second_result = sink.apply_group_joint_position(
+        "arm", "joint_2", 0.2, ExecutionStateUpdateMode::kBlocking);
+  });
+
+  EXPECT_FALSE(channel->wait_for_read_count(2, 50ms));
+  channel->release_read();
+  first.join();
+  second.join();
+
+  ASSERT_TRUE(first_result.has_value());
+  ASSERT_TRUE(second_result.has_value());
+  EXPECT_TRUE(first_result->applied());
+  EXPECT_TRUE(second_result->applied());
+  EXPECT_EQ(channel->publish_calls(), 2);
+  EXPECT_DOUBLE_EQ(*sink.group_joint_position("arm", "joint_1"), 0.1);
+  EXPECT_DOUBLE_EQ(*sink.group_joint_position("arm", "joint_2"), 0.2);
 }
 
 TEST(RetainedExecutionStateSinkTest,
