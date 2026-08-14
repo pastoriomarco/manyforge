@@ -9,6 +9,8 @@
 #include <manyforge_component_manager/durable_store_set.hpp>
 #include <manyforge_core/build_owned_lifecycle_plan_catalog_source.hpp>
 #include <manyforge_core/component_lifecycle_plan_catalog_codec.hpp>
+#include <manyforge_core/prepared_operation_participant_codec.hpp>
+#include <manyforge_core/prepared_participant_stop_plan_codec.hpp>
 #include <manyforge_core/resource_addressed_execution_kernel.hpp>
 #include <manyforge_core/sqlite_operation_journal.hpp>
 #include <manyforge_core/time/fake_clock.hpp>
@@ -594,8 +596,10 @@ private:
   core::GraphRevision active_graph_revision_{"unset"};
 };
 
-class AdmissionEngine final : public core::IResolvedParticipantExecutionEngine,
-                              public core::IControlDomainExecutionPort {
+class AdmissionEngine final
+    : public core::IResolvedParticipantExecutionEngine,
+      public core::IResolvedPreparedParticipantExecutionEngine,
+      public core::IControlDomainExecutionPort {
 public:
   [[nodiscard]] core::Result<std::uint64_t>
   execute(const core::ExecuteRequestDTO &) override {
@@ -603,6 +607,127 @@ public:
     status_.state = core::ExecutionState::kPlanning;
     status_.execution_id = 1U;
     return core::Result<std::uint64_t>::Ok(1U);
+  }
+
+  [[nodiscard]] core::Result<std::uint64_t> PrepareMotion(
+      core::ResolvedPreparedMotionExecutionRequestDTO request) override {
+    auto participant = MakePreparedMotionParticipant(request);
+    if (!participant.ok()) {
+      return core::Result<std::uint64_t>::Err(participant.error());
+    }
+    auto retained =
+        std::make_shared<const core::PreparedOperationParticipantDTO>(
+            std::move(participant.value()));
+    auto backend_prepare = core::MakePrepareParticipantResult(
+        *retained, core::PrepareParticipantResultStateDTO::kPrepared);
+    if (!backend_prepare.ok()) {
+      return core::Result<std::uint64_t>::Err(backend_prepare.error());
+    }
+    prepared_request_ = std::move(request);
+    prepared_snapshot_ = core::ResolvedPreparedMotionExecutionSnapshotDTO{
+        1U, core::ResolvedPreparedMotionExecutionStateDTO::kPrepared, retained,
+        std::move(backend_prepare.value()), std::nullopt};
+    const core::KernelEvent event{
+        core::KernelEventType::kParticipantPrepared,
+        1U,
+        0U,
+        {},
+        {},
+        std::nullopt,
+        {{"prepared_contract_digest",
+          retained->prepared_contract_digest.value()}}};
+    const auto callbacks = callbacks_;
+    for (const auto &[id, callback] : callbacks) {
+      (void)id;
+      callback(event);
+    }
+    return core::Result<std::uint64_t>::Ok(1U);
+  }
+
+  [[nodiscard]] core::Result<core::ResolvedPreparedMotionExecutionSnapshotDTO>
+  ObservePreparedMotion(std::uint64_t execution_id) const override {
+    if (!prepared_snapshot_.has_value() ||
+        prepared_snapshot_->execution_id != execution_id) {
+      return core::Result<core::ResolvedPreparedMotionExecutionSnapshotDTO>::
+          Err({"prepared_motion_missing",
+               "test prepared motion is unavailable",
+               {}});
+    }
+    return core::Result<core::ResolvedPreparedMotionExecutionSnapshotDTO>::Ok(
+        *prepared_snapshot_);
+  }
+
+  [[nodiscard]] core::Result<void> DispatchPreparedMotion(
+      std::uint64_t execution_id,
+      const core::ContentDigest &prepared_contract_digest) override {
+    if (!prepared_request_.has_value() || !prepared_snapshot_.has_value() ||
+        !prepared_snapshot_->participant ||
+        prepared_snapshot_->execution_id != execution_id ||
+        prepared_snapshot_->participant->prepared_contract_digest !=
+            prepared_contract_digest) {
+      return core::Result<void>::Err(
+          {"prepared_motion_dispatch_mismatch",
+           "test prepared motion dispatch identity differs",
+           {}});
+    }
+    prepared_snapshot_->state =
+        core::ResolvedPreparedMotionExecutionStateDTO::kDispatched;
+    auto dispatched = execute(prepared_request_->execution_request);
+    return dispatched.ok() ? core::Result<void>::Ok()
+                           : core::Result<void>::Err(dispatched.error());
+  }
+
+  [[nodiscard]] core::Result<void>
+  PrepareResumeMotion(std::uint64_t,
+                      core::ResolvedPreparedMotionResumeRequestDTO) override {
+    return Unsupported<void>();
+  }
+
+  [[nodiscard]] core::Result<void>
+  DispatchPreparedResumeMotion(std::uint64_t,
+                               const core::ContentDigest &) override {
+    return Unsupported<void>();
+  }
+
+  [[nodiscard]] core::Result<void>
+  CancelPreparedResumeMotion(std::uint64_t) override {
+    return Unsupported<void>();
+  }
+
+  [[nodiscard]] core::Result<void>
+  CancelPreparedMotion(std::uint64_t execution_id) override {
+    if (!prepared_snapshot_.has_value() ||
+        prepared_snapshot_->execution_id != execution_id) {
+      return core::Result<void>::Err({"prepared_motion_missing",
+                                      "test prepared motion is unavailable",
+                                      {}});
+    }
+    prepared_snapshot_->state =
+        core::ResolvedPreparedMotionExecutionStateDTO::kCancelledPreDispatch;
+    return core::Result<void>::Ok();
+  }
+
+  [[nodiscard]] core::Result<std::uint64_t> PrepareCapabilityCommand(
+      core::ResolvedPreparedCapabilityCommandExecutionRequestDTO) override {
+    return Unsupported<std::uint64_t>();
+  }
+
+  [[nodiscard]]
+  core::Result<core::ResolvedPreparedCapabilityCommandSnapshotDTO>
+  ObservePreparedCapabilityCommand(std::uint64_t) const override {
+    return Unsupported<core::ResolvedPreparedCapabilityCommandSnapshotDTO>();
+  }
+
+  [[nodiscard]] core::Result<core::GripperCommandResultDTO>
+  DispatchPreparedCapabilityCommand(std::uint64_t, const core::ContentDigest &,
+                                    const core::ControllerGoalId &,
+                                    core::ControllerGoalGeneration) override {
+    return Unsupported<core::GripperCommandResultDTO>();
+  }
+
+  [[nodiscard]] core::Result<void>
+  CancelPreparedCapabilityCommand(std::uint64_t) override {
+    return Unsupported<void>();
   }
 
   [[nodiscard]] core::StopResultDTO stop() override {
@@ -631,12 +756,12 @@ public:
 
   [[nodiscard]] core::Result<core::ResolvedRuntimeScaleAcceptedDTO>
   set_runtime_scale(const core::ResolvedRuntimeScaleCommandDTO &) override {
-    return unsupported<core::ResolvedRuntimeScaleAcceptedDTO>();
+    return Unsupported<core::ResolvedRuntimeScaleAcceptedDTO>();
   }
   [[nodiscard]] core::Result<core::ResolvedRuntimeScaleStatusDTO>
   runtime_scale_status(const core::OperationId &,
                        const core::ControlBindingId &) const override {
-    return unsupported<core::ResolvedRuntimeScaleStatusDTO>();
+    return Unsupported<core::ResolvedRuntimeScaleStatusDTO>();
   }
   [[nodiscard]] core::GripperCommandResultDTO
   command_gripper(const core::GripperCommandRequestDTO &) override {
@@ -646,7 +771,7 @@ public:
   }
   [[nodiscard]] core::Result<void> validate_gripper_command(
       const core::GripperCommandRequestDTO &) const override {
-    return unsupported<void>();
+    return Unsupported<void>();
   }
   [[nodiscard]] core::GripperCommandStatusDTO
   get_gripper_status(const std::string &) const override {
@@ -654,11 +779,11 @@ public:
   }
   [[nodiscard]] core::Result<std::uint64_t>
   stop_gripper(const std::string &, std::uint64_t, std::uint64_t) override {
-    return unsupported<std::uint64_t>();
+    return Unsupported<std::uint64_t>();
   }
   [[nodiscard]] core::Result<void>
   reset_gripper(const std::string &, std::uint64_t, std::uint64_t) override {
-    return unsupported<void>();
+    return Unsupported<void>();
   }
   [[nodiscard]] core::ExecutionStatus get_status() const override {
     return status_;
@@ -685,15 +810,248 @@ public:
 
 private:
   template <typename Value>
-  [[nodiscard]] static core::Result<Value> unsupported() {
+  [[nodiscard]] static core::Result<Value> Unsupported() {
     return core::Result<Value>::Err(
         {"unsupported_capability", "test engine path is unsupported", {}});
+  }
+
+  [[nodiscard]] static core::Result<core::PreparedOperationParticipantDTO>
+  MakePreparedMotionParticipant(
+      const core::ResolvedPreparedMotionExecutionRequestDTO &authority) {
+    using namespace manyforge::core;
+    const auto &request = authority.execution_request;
+    const auto &binding = authority.binding.value();
+    const auto &control = *binding.control_path;
+    std::vector<CoordinatePositionDTO> positions;
+    positions.reserve(binding.resources.size());
+    for (const auto &resource : binding.resources) {
+      positions.emplace_back(
+          resource.coordinate_kind == CoordinateKind::kAngular
+              ? CoordinatePositionDTO{AngularPositionDTO{0.0}}
+              : CoordinatePositionDTO{LinearPositionDTO{0.0}});
+    }
+    ControlledStateDTO start{
+        binding.controllable_component_id,
+        binding.command_target_id,
+        control.control_domain_id,
+        control.control_domain_revision,
+        control.control_binding_id,
+        control.control_binding_revision,
+        control.controller_topology_id,
+        control.topology_revision,
+        control.control_route_id,
+        control.active_control_configuration_id,
+        control.active_control_configuration_generation,
+        request.binding.resources,
+        request.binding.model_group_binding.compiled_joint_names,
+        std::move(positions),
+        std::nullopt};
+    ProjectionRevisionDTO projection{
+        binding.retained_bundle_id, binding.graph_revision,
+        SceneRevision{SceneId(Sha('a')), 1U, ContentDigest(Sha('b'))}};
+    PlanRequestDTO plan_request{
+        request.binding.operation_id,
+        request.binding.participant_id,
+        request.binding.program_id,
+        request.binding.program_revision,
+        request.binding.program_binding_id,
+        request.binding.program_run_id,
+        MoveId(request.move_id),
+        request.binding.controllable_component_id,
+        request.binding.component_type_id,
+        request.binding.component_type_revision,
+        request.binding.command_target_id,
+        request.binding.capability_id,
+        request.binding.capability_definition_revision,
+        request.binding.planner_capability_binding,
+        request.binding.model_bindings,
+        request.binding.model_group_binding,
+        request.binding.control_domain_id,
+        request.binding.control_domain_revision,
+        request.binding.control_binding_id,
+        request.binding.control_binding_revision,
+        request.binding.control_interface_contract_id,
+        request.binding.control_interface_revision,
+        request.binding.controller_topology_id,
+        request.binding.topology_revision,
+        request.binding.control_route_id,
+        request.binding.activation_set_id,
+        request.binding.active_control_configuration_id,
+        request.binding.active_control_configuration_generation,
+        request.binding.provider_instance_id,
+        request.binding.provider_manifest_id,
+        request.binding.provider_manifest_revision,
+        request.binding.provider_runtime_epoch,
+        request.binding.runtime_unit_bindings,
+        request.binding.resources,
+        request.action_span,
+        request.binding.base_frame,
+        request.binding.tcp_frame,
+        start,
+        request.motion,
+        request.tolerances,
+        request.speed_profile,
+        request.planning_profile,
+        request.contact_policy_id.empty()
+            ? std::nullopt
+            : std::optional<std::string>{request.contact_policy_id},
+        request.per_resource_dynamics_limits,
+        request.timeouts.planning_timeout_s,
+        0U,
+        ProjectionLeaseBindingDTO{projection,
+                                  ProjectionLeaseId("lease.native.readiness")},
+        request.binding.component_attachment_revisions,
+        request.binding.carried_object_attachment_revisions,
+        {},
+        {}};
+    std::vector<double> zeros(request.binding.resources.size(), 0.0);
+    TrajectoryDTO trajectory{
+        request.binding.resources,
+        request.binding.model_group_binding.compiled_joint_names,
+        {{0.0, zeros, {}, {}}, {1.0, zeros, {}, {}}}};
+    PlanResultDTO planning_result{trajectory, std::nullopt, projection};
+    CollisionWorldRevision world{1U, Sha('c')};
+    CollisionDecision decision;
+    decision.accepted = true;
+    decision.severity = CollisionDecisionSeverity::kNone;
+    decision.action = CollisionDecisionAction::kDispatch;
+    decision.collision_world_revision = world;
+
+    std::vector<PreparedMotionInterruptScopeDTO> scopes;
+    scopes.reserve(request.motion_interrupt_scopes.size());
+    for (const auto &scope : request.motion_interrupt_scopes) {
+      if (!scope.stop_profile) {
+        return core::Result<core::PreparedOperationParticipantDTO>::Err(
+            {"stop_profile_missing",
+             "test prepared scope has no Stop profile",
+             {}});
+      }
+      PreparedParticipantStopPlanContextDTO context{
+          request.binding.operation_id,
+          authority.operation_revision,
+          request.binding.participant_id,
+          request.binding.program_id,
+          request.binding.program_revision,
+          request.binding.program_binding_id,
+          request.binding.program_run_id,
+          scope.stop_profile,
+          ParticipantStopProfilePurposeDTO::kMotionInterruptScope,
+          scope.scope_id,
+          scope.node_category};
+      auto stop = MakePreparedParticipantStopPlan(
+          authority.stop_readiness.value().resolved_stop_base_plan,
+          std::move(context), binding.resources,
+          authority.retained_default_stop_limits);
+      if (!stop.ok()) {
+        return core::Result<core::PreparedOperationParticipantDTO>::Err(
+            stop.error());
+      }
+      scopes.push_back({MotionInterruptScopeId(scope.scope_id),
+                        InterruptPolicyId(scope.policy_id),
+                        scope.activation_mode, scope.arm_timeout_ns,
+                        scope.result_binding_key, scope.required,
+                        *scope.stop_profile, scope.node_category,
+                        scope.metadata, std::move(stop.value())});
+    }
+    std::sort(scopes.begin(), scopes.end(),
+              [](const auto &left, const auto &right) {
+                return left.scope_id < right.scope_id;
+              });
+
+    std::optional<PreparedContactPolicyRefDTO> contact_policy;
+    if (request.resolved_contact_grasp) {
+      contact_policy = PreparedContactPolicyRefDTO{
+          request.resolved_contact_grasp->contact_policy_id,
+          request.resolved_contact_grasp->contact_policy_revision};
+    }
+    PreparedMotionExecutionDTO payload{
+        MoveId(request.move_id),
+        plan_request,
+        trajectory,
+        start,
+        {std::move(planning_result), 0U,
+         request.binding.planner_capability_binding},
+        {ValidationRevision("validation.native.readiness"),
+         ValidationResultDTO{true, std::nullopt}, world,
+         CollisionPolicyRevision{1U, Sha('d')}, decision},
+        std::move(contact_policy),
+        {authority.runtime_policy.value().policy.runtime_policy_id,
+         authority.runtime_policy.value().policy.runtime_policy_revision},
+        std::move(scopes),
+        request.timeouts.execution_timeout_s};
+
+    std::vector<ResourceId> resources = request.binding.resources;
+    std::sort(resources.begin(), resources.end());
+    std::optional<PreparedCapabilityProviderRuntimeOccurrenceDTO>
+        capability_provider;
+    if (binding.capability_provider_path) {
+      const auto &provider = *binding.capability_provider_path;
+      capability_provider = PreparedCapabilityProviderRuntimeOccurrenceDTO{
+          provider.capability_provider_binding_id,
+          provider.capability_provider_binding_revision,
+          {provider.provider_instance_id, provider.provider_manifest_id,
+           provider.provider_manifest_revision,
+           provider.provider_runtime_unit_id, provider.provider_runtime_epoch}};
+    }
+    PreparedOperationParticipantDTO candidate{
+        ContentDigest("pending"),
+        request.binding.operation_id,
+        authority.operation_revision,
+        request.binding.participant_id,
+        binding.program_id,
+        binding.program_revision,
+        binding.program_binding_id,
+        request.binding.program_run_id,
+        binding.retained_bundle_id,
+        binding.graph_revision,
+        binding.controllable_component_id,
+        authority.stop_readiness.value().component_lifecycle_generation,
+        binding.component_type_id,
+        binding.component_type_revision,
+        binding.command_target_id,
+        binding.capability_id,
+        binding.capability_definition_revision,
+        binding.model_bindings,
+        binding.frame_bindings,
+        control.control_domain_id,
+        control.control_domain_revision,
+        control.control_binding_id,
+        control.control_binding_revision,
+        control.control_interface_contract_id,
+        control.control_interface_revision,
+        control.controller_topology_id,
+        control.topology_revision,
+        control.control_route_id,
+        control.activation_set_id,
+        {control.provider_instance_id, control.provider_manifest_id,
+         control.provider_manifest_revision, control.provider_runtime_unit_id,
+         control.provider_runtime_epoch},
+        std::move(capability_provider),
+        std::move(resources),
+        PreparedParticipantFocusedPortDTO{control.provider_runtime_unit_id},
+        {},
+        {},
+        control.active_control_configuration_id,
+        control.active_control_configuration_generation,
+        binding.runtime_unit_epochs,
+        control.stop_evidence_policy_id,
+        control.stop_evidence_policy_revision,
+        *authority.ordinary_stop_plan,
+        std::move(payload)};
+    return MakePreparedOperationParticipant(
+        std::move(candidate), authority.binding, authority.stop_readiness,
+        &authority.runtime_policy, authority.retained_default_stop_limits,
+        authority.stop_node_category);
   }
 
   std::size_t execute_count_{};
   std::uint64_t next_subscription_id_{1U};
   core::ExecutionStatus status_{};
   std::map<std::uint64_t, core::EventCallback> callbacks_;
+  std::optional<core::ResolvedPreparedMotionExecutionRequestDTO>
+      prepared_request_;
+  std::optional<core::ResolvedPreparedMotionExecutionSnapshotDTO>
+      prepared_snapshot_;
 };
 
 class PublicationOwner final
@@ -751,7 +1109,8 @@ public:
         core::MotionInterruptNodeCategory::kGeneric,
         &engine_,
         &engine_,
-        std::move(runtime_policy.value())};
+        std::move(runtime_policy.value()),
+        &engine_};
     if (kernel_ == nullptr) {
       journal_ = std::make_unique<core::SqliteOperationJournal>(journal_path_,
                                                                 cell_id_);

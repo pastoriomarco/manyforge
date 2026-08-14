@@ -130,8 +130,7 @@ TextMember(const deployment::CanonicalValue &root,
 struct NativeFixture final {
   explicit NativeFixture(
       std::filesystem::path fixture_root = MANYFORGE_I6_NATIVE_FIXTURE_ROOT)
-      : root(std::move(fixture_root)),
-        bundle_source(root / "retained-package"),
+      : root(std::move(fixture_root)), bundle_source(root / "retained-package"),
         artifact_source(root / "retained-package") {
     const auto manifest = deployment::parse_strict_json_model_yaml(
         ReadFile(root / "manifest.json"));
@@ -514,8 +513,9 @@ TEST(RetainedNativeRuntimeUnitAdapter,
             component_manager::ProcessPresenceState::kAbsent);
 }
 
-TEST(RetainedNativeRuntimeUnitAdapter,
-     RetainedBuildIdentityMatchesOnceAndRejectsTargetDigestMismatchBeforeLaunch) {
+TEST(
+    RetainedNativeRuntimeUnitAdapter,
+    RetainedBuildIdentityMatchesOnceAndRejectsTargetDigestMismatchBeforeLaunch) {
   NativeFixture fixture(MANYFORGE_I7_BUILD_IDENTIFIED_NATIVE_FIXTURE_ROOT);
   ASSERT_TRUE(fixture.product.has_value());
   ASSERT_TRUE(fixture.product->implementation_build_identity().has_value());
@@ -526,20 +526,20 @@ TEST(RetainedNativeRuntimeUnitAdapter,
       std::string(contract::kInstalledTargetId);
   const auto target =
       target_root.path() / std::string(contract::kInstalledTargetId);
-  ASSERT_TRUE(std::filesystem::copy_file(
-      source, target, std::filesystem::copy_options::none));
-  std::filesystem::permissions(
-      target, std::filesystem::status(source).permissions(),
-      std::filesystem::perm_options::replace);
+  ASSERT_TRUE(std::filesystem::copy_file(source, target,
+                                         std::filesystem::copy_options::none));
+  std::filesystem::permissions(target,
+                               std::filesystem::status(source).permissions(),
+                               std::filesystem::perm_options::replace);
   const auto candidate_worker_source =
       std::filesystem::path(MANYFORGE_NATIVE_EXECUTION_TARGET_ROOT) /
       std::string(contract::kCandidateWorkerInstalledTargetId);
   const auto candidate_worker_target =
       target_root.path() /
       std::string(contract::kCandidateWorkerInstalledTargetId);
-  ASSERT_TRUE(std::filesystem::copy_file(
-      candidate_worker_source, candidate_worker_target,
-      std::filesystem::copy_options::none));
+  ASSERT_TRUE(std::filesystem::copy_file(candidate_worker_source,
+                                         candidate_worker_target,
+                                         std::filesystem::copy_options::none));
   std::filesystem::permissions(
       candidate_worker_target,
       std::filesystem::status(candidate_worker_source).permissions(),
@@ -638,8 +638,8 @@ TEST(RetainedNativeRuntimeUnitAdapter,
       manager_epoch};
   const auto competing_status = adapter.QueryStatus(competing_status_query);
   ASSERT_EQ(competing_status.state, core::ConfigurationFenceState::kHeld);
-  const auto competing_release = adapter.Release(
-      core::ConfigurationFenceReleaseDTO{
+  const auto competing_release =
+      adapter.Release(core::ConfigurationFenceReleaseDTO{
           competing_status.reconciliation_evidence, manager_epoch});
   EXPECT_EQ(competing_release.request.reconciliation_evidence,
             competing_status.reconciliation_evidence);
@@ -800,96 +800,16 @@ TEST(RetainedNativeRuntimeUnitAdapter,
       "manager-runtime-physical-admission-test");
   const core::ConfigurationFenceAdmissionQueryDTO admission_query{
       physical_scope, manager_epoch};
-  auto admission = adapter.ObserveAdmission(admission_query);
-  const auto admission_deadline =
-      std::chrono::steady_clock::now() + std::chrono::seconds(10);
-  while (admission.active_control_configurations.size() !=
-             physical_scope.domains.size() &&
-         std::chrono::steady_clock::now() < admission_deadline) {
-    std::this_thread::sleep_for(std::chrono::milliseconds(10));
-    admission = adapter.ObserveAdmission(admission_query);
-  }
-  ASSERT_TRUE(admission.matches(admission_query));
-  ASSERT_EQ(admission.active_control_configurations.size(),
-            physical_scope.domains.size());
-  EXPECT_EQ(admission.active_projection_revision, initial_revision);
-  EXPECT_EQ(admission.operation_resource_generation, 0U);
-  EXPECT_EQ(admission.affected_queued_operation_count, 0U);
-  EXPECT_EQ(admission.affected_active_operation_count, 0U);
-  EXPECT_EQ(admission.active_control_configurations.size(),
-            physical_scope.domains.size());
-  const core::ApplyConfigurationFenceIntentDTO physical_fence_intent{
-      core::PublicRequestContextDTO{
-          core::RequestId("native-physical-fence-request-1"),
-          core::RequestOwnerEpoch("manager-owner-physical-fence-test"),
-          "retained-native-adapter-test", std::nullopt},
-      core::ApplyFenceOwnerDTO{core::ApplyId("native-physical-fence-apply-1"),
-                               core::ApplyGeneration(1U)},
-      physical_scope,
-      core::ApplyFenceBusyDispositionDTO::kRejectIfAffectedBusy,
-      fixture.bundle->retained_bundle_id(),
-      fixture.bundle->value().cell_graph.graph_revision,
-      admission.operation_resource_generation,
-      admission.configuration_fence_generation,
-      admission.active_control_configurations,
-      "verify physical Kernel table and durable fence admission share one "
-      "truth"};
-  ASSERT_TRUE(physical_fence_intent.valid());
-  const auto physical_fence = adapter.Acquire(physical_fence_intent);
-  ASSERT_TRUE(physical_fence.matches(physical_fence_intent));
-  const core::ConfigurationFenceStatusQueryDTO physical_status_query{
-      physical_fence_intent.owner_transaction,
-      physical_fence.configuration_fence_id,
-      physical_fence.configuration_fence_generation,
-      physical_fence.captured_scope, manager_epoch};
-  const auto physical_held = adapter.QueryStatus(physical_status_query);
-  ASSERT_TRUE(physical_held.matches(physical_status_query));
-  EXPECT_EQ(physical_held.reconciliation_evidence.active_control_configurations,
-            admission.active_control_configurations);
-  const auto canonical_bundle = fixture.bundle->canonical_bytes();
-  ASSERT_FALSE(canonical_bundle.empty());
-  const component_manager::ManagerSelectedRuntimeCompositionRequestDTO
-      composition_request{
-          initial_scene.shared()->revision.content_hash,
-          physical_fence_intent.owner_transaction.apply_id,
-          physical_fence_intent.owner_transaction.apply_generation,
-          core::ProjectionStageGeneration(1U),
-          initial_revision,
-          publication.publication_generation,
-          publication.durable_public_pointer_content_digest,
-          core::ContentDigest(
-              content_identity::sha256_digest(canonical_bundle)),
-          static_cast<std::uint64_t>(canonical_bundle.size()),
-          fixture.query->plan.runtime_unit_id,
-          first_epoch,
-          manager_epoch,
-          physical_fence.configuration_fence_id,
-          physical_fence.configuration_fence_generation,
-          physical_fence.captured_scope,
-      };
-  ASSERT_TRUE(composition_request.valid());
-  auto composition = adapter.InstallOrObserve(composition_request);
-  const auto composition_deadline =
-      std::chrono::steady_clock::now() + std::chrono::seconds(10);
-  while (composition.state ==
-             component_manager::ManagerSelectedRuntimeCompositionState::
-                 kPreparing &&
-         std::chrono::steady_clock::now() < composition_deadline) {
-    std::this_thread::sleep_for(std::chrono::milliseconds(10));
-    composition = adapter.InstallOrObserve(composition_request);
-  }
-  ASSERT_EQ(
-      composition.state,
-      component_manager::ManagerSelectedRuntimeCompositionState::kInstalled);
-  const auto physical_reconfigured = adapter.QueryStatus(physical_status_query);
-  ASSERT_TRUE(physical_reconfigured.matches(physical_status_query));
-  EXPECT_GT(
-      physical_reconfigured.reconciliation_evidence
-          .operation_resource_generation,
-      physical_held.reconciliation_evidence.operation_resource_generation);
-  const core::ConfigurationFenceReleaseDTO physical_release{
-      physical_reconfigured.reconciliation_evidence, manager_epoch};
-  EXPECT_TRUE(adapter.Release(physical_release).valid());
+  // The retained I6 fixture deliberately has no CCLC-issued Stop readiness.
+  // Its exact physical route is therefore observable through the projection
+  // client but is not a reconciled predecessor configuration that may back an
+  // Apply fence. The L0.7 product-process gate separately proves the positive
+  // lifecycle/route/readiness/fence path; this legacy fixture must fail closed
+  // without disturbing its private projection owner.
+  EXPECT_THROW(static_cast<void>(adapter.ObserveAdmission(admission_query)),
+               component_manager::RetainedNativeRuntimeUnitAdapterError);
+  EXPECT_EQ(adapter.ObserveProcess(*fixture.query).process_incarnation(),
+            first_epoch.value());
 
   ASSERT_FALSE(fixture.bundle->value().cell_graph.control_bindings.empty());
   const auto &control_binding =
