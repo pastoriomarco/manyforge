@@ -75,7 +75,84 @@ template <typename Range, typename Projection>
          !path.provider_runtime_unit_id.empty() && !path.provider_runtime_epoch.empty();
 }
 
+template <typename Available, typename Selected, typename Matches>
+[[nodiscard]] bool is_unambiguous_subset(
+    const std::vector<Available>& available,
+    const std::vector<Selected>& selected,
+    Matches matches) noexcept {
+  return std::all_of(selected.begin(), selected.end(), [&](const auto& value) {
+    return std::count_if(available.begin(), available.end(),
+                         [&](const auto& candidate) {
+                           return matches(candidate, value);
+                         }) == 1;
+  });
+}
+
 }  // namespace
+
+bool runtime_participant_binding_physically_contains(
+    const RuntimeParticipantBinding& physical,
+    const RuntimeParticipantBinding& selected) noexcept {
+  const auto& available = physical.value();
+  const auto& value = selected.value();
+  return available.retained_bundle_id == value.retained_bundle_id &&
+         available.graph_revision == value.graph_revision &&
+         available.controllable_component_id ==
+             value.controllable_component_id &&
+         available.component_type_id == value.component_type_id &&
+         available.component_type_revision == value.component_type_revision &&
+         available.command_target_id == value.command_target_id &&
+         available.capability_id == value.capability_id &&
+         available.capability_definition_revision ==
+             value.capability_definition_revision &&
+         available.command_schema == value.command_schema &&
+         is_unambiguous_subset(
+             available.model_bindings, value.model_bindings,
+             [](const auto& left, const auto& right) {
+               return left.model_instance_id == right.model_instance_id &&
+                      left.model_revision == right.model_revision;
+             }) &&
+         is_unambiguous_subset(
+             available.model_groups, value.model_groups,
+             [](const auto& left, const auto& right) {
+               return left.model_instance_id == right.model_instance_id &&
+                      left.compiled_group_name == right.compiled_group_name &&
+                      left.expanded_compiled_joint_names ==
+                          right.expanded_compiled_joint_names;
+             }) &&
+         is_unambiguous_subset(
+             available.frame_bindings, value.frame_bindings,
+             [](const auto& left, const auto& right) {
+               return left.model_instance_id == right.model_instance_id &&
+                      left.model_revision == right.model_revision &&
+                      left.compiled_frame_name == right.compiled_frame_name;
+             }) &&
+         is_unambiguous_subset(
+             available.resources, value.resources,
+             [](const auto& left, const auto& right) {
+               return left.resource_id == right.resource_id &&
+                      left.source_joint_name == right.source_joint_name &&
+                      left.compiled_resource_name ==
+                          right.compiled_resource_name &&
+                      left.coordinate_kind == right.coordinate_kind;
+             }) &&
+         is_unambiguous_subset(
+             available.collision_body_bindings,
+             value.collision_body_bindings,
+             [](const auto& left, const auto& right) {
+               return left.model_instance_id == right.model_instance_id &&
+                      left.model_revision == right.model_revision &&
+                      left.compiled_collision_body_names ==
+                          right.compiled_collision_body_names;
+             }) &&
+         available.control_path == value.control_path &&
+         available.capability_provider_path == value.capability_provider_path &&
+         is_unambiguous_subset(
+             available.supporting_capability_provider_paths,
+             value.supporting_capability_provider_paths,
+             [](const auto& left, const auto& right) { return left == right; }) &&
+         available.runtime_unit_epochs == value.runtime_unit_epochs;
+}
 
 Result<RuntimeParticipantBinding> verify_runtime_participant_binding(
     RuntimeParticipantBindingDTO value) {

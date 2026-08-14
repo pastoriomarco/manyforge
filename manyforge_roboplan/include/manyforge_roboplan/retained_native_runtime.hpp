@@ -62,6 +62,35 @@ struct RetainedNativeAddressedOwnerConfig final {
   std::optional<core::StopDeadlineBudgetDTO> cell_stop_deadline_budget;
 };
 
+using RetainedMotionBackendRouteRebinder =
+    std::function<core::Result<void>(
+        core::RuntimeParticipantBinding,
+        std::vector<core::RuntimeParticipantBinding>)>;
+
+using RetainedGripperBackendRouteRebinder =
+    std::function<core::Result<void>(
+        core::RuntimeParticipantBinding,
+        std::shared_ptr<IRetainedObservedStateChannel>)>;
+
+/// One exact execution adapter set selected by a retained runtime product.
+/// The two interface pointers may alias the same dual-role adapter; shared
+/// ownership keeps that case single-instance and gives it one shutdown path.
+struct RetainedRuntimeBackendSet final {
+  std::shared_ptr<core::IExecutionBackend> execution;
+  std::shared_ptr<core::IGripperCommandBackend> gripper;
+  core::IControlDomainExecutionPort *gripper_stop_execution_port{};
+  RetainedMotionBackendRouteRebinder rebind_motion_route;
+  RetainedGripperBackendRouteRebinder rebind_gripper_route;
+};
+
+using RetainedRuntimeBackendFactory =
+    std::function<RetainedRuntimeBackendSet(
+        const core::RuntimeParticipantBinding &,
+        const std::optional<core::RuntimeParticipantBinding> &,
+        const std::shared_ptr<RetainedObservedStateChannel> &,
+        const std::shared_ptr<RetainedObservedStateChannel> &, core::IClock &,
+        core::IScheduler &)>;
+
 using RetainedReferenceResolverFactory =
     std::function<std::shared_ptr<core::IReferencePoseResolver>(
         const std::vector<std::shared_ptr<RetainedObservedStateChannel>> &)>;
@@ -117,6 +146,16 @@ struct RetainedNativeRuntimeInput final {
   /// Exact Deployment-qualified retained runtime policy. Absence is
   /// observable and keeps motion admission closed.
   std::optional<core::RuntimePolicyDTO> runtime_policy{};
+  /// Optional product-selected state authority. Empty preserves the native
+  /// predicted-state channel. A controller-backed simulation supplies its
+  /// exact commanded source set here before constructing the sole writer.
+  std::optional<RetainedObservedStateChannelConfig>
+      motion_state_channel_config;
+  std::optional<RetainedObservedStateChannelConfig>
+      gripper_state_channel_config;
+  /// Optional retained-product execution adapter factory. Empty preserves the
+  /// existing native execution and gripper implementations.
+  RetainedRuntimeBackendFactory backend_factory;
 };
 
 /// Owning native composition root. Destruction order is deliberate: the public
@@ -157,8 +196,11 @@ struct RetainedNativeRuntime final
   std::unique_ptr<RoboPlanTrajectoryValidator> trajectory_validator;
   std::unique_ptr<RoboPlanCollisionTrajectoryProjector>
       collision_trajectory_projector;
-  std::unique_ptr<RoboPlanExecutionBackend> execution;
-  std::unique_ptr<RetainedGripperCommandBackend> gripper;
+  std::shared_ptr<core::IExecutionBackend> execution;
+  std::shared_ptr<core::IGripperCommandBackend> gripper;
+  core::IControlDomainExecutionPort *gripper_stop_execution_port{};
+  RetainedMotionBackendRouteRebinder rebind_motion_route;
+  RetainedGripperBackendRouteRebinder rebind_gripper_route;
   std::optional<RetainedGripperPositionLimits> gripper_position_limits;
 
   std::shared_ptr<core::ICollisionWorldSnapshotPublisher> collision_publisher;

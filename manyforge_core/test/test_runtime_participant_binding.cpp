@@ -176,6 +176,44 @@ TEST(RuntimeParticipantBindingTest, RequiresAtLeastOneRuntimePath) {
   EXPECT_EQ(result.error().details.at("reason"), "runtime_participant_path_missing");
 }
 
+TEST(RuntimeParticipantBindingTest,
+     PhysicalContainmentIgnoresProgramIdentityButFencesRuntimeFacts) {
+  auto physical = verify_runtime_participant_binding(valid_binding());
+  ASSERT_TRUE(physical.ok()) << physical.error().message;
+
+  auto alias_value = physical.value().value();
+  alias_value.program_id = ProgramId("program.place");
+  alias_value.program_revision = ProgramRevision("program-place-revision");
+  alias_value.program_binding_id = ProgramBindingId("program-place-binding");
+  alias_value.component_role_id = ComponentRoleId("place_robot");
+  alias_value.target_role_id = TargetRoleId("place_arm");
+  alias_value.resources.pop_back();
+  auto alias = verify_runtime_participant_binding(std::move(alias_value));
+  ASSERT_TRUE(alias.ok()) << alias.error().message;
+  EXPECT_TRUE(runtime_participant_binding_physically_contains(
+      physical.value(), alias.value()));
+
+  auto crossed_resource_value = alias.value().value();
+  crossed_resource_value.resources.front().compiled_resource_name =
+      "mf2_other_joint_1";
+  auto crossed_resource =
+      verify_runtime_participant_binding(std::move(crossed_resource_value));
+  ASSERT_TRUE(crossed_resource.ok()) << crossed_resource.error().message;
+  EXPECT_FALSE(runtime_participant_binding_physically_contains(
+      physical.value(), crossed_resource.value()));
+
+  auto crossed_epoch_value = alias.value().value();
+  crossed_epoch_value.control_path->provider_runtime_epoch =
+      RuntimeEpoch("runtime-epoch.2");
+  crossed_epoch_value.runtime_unit_epochs.front().runtime_epoch =
+      RuntimeEpoch("runtime-epoch.2");
+  auto crossed_epoch =
+      verify_runtime_participant_binding(std::move(crossed_epoch_value));
+  ASSERT_TRUE(crossed_epoch.ok()) << crossed_epoch.error().message;
+  EXPECT_FALSE(runtime_participant_binding_physically_contains(
+      physical.value(), crossed_epoch.value()));
+}
+
 TEST(RuntimeParticipantBindingTest, ResolvesOverlappingSemanticBodyRolesToOnePhysicalProjection) {
   auto value = valid_binding();
   const auto semantic = make_component_collision_body_id(value.controllable_component_id,

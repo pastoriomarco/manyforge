@@ -4253,7 +4253,7 @@ BuildProductComposition(CompositionBuildInput input) {
                   "component-local resources");
           state_sources.push_back(RetainedSceneFrameStateSourceInput{
               channel->query_context(),
-              core::ObservedStateSourceKind::kPredictedState,
+              channel->source_kind(),
               std::shared_ptr<const core::IObservedStateProvider>(
                   channel, channel->addressed_publication()),
               {}});
@@ -4267,7 +4267,10 @@ BuildProductComposition(CompositionBuildInput input) {
       std::move(participant_resolver),
       participant_resolver_factory,
       input.operation_admission_gate,
-      std::move(runtime_policy)};
+      std::move(runtime_policy),
+      {},
+      {},
+      {}};
   auto kernel_config = core::ExecutionKernelConfig{};
   kernel_config.collision_monitor_period_ns = collision_monitor_period_ns;
   auto execution_config = RoboPlanExecutionBackendConfig{};

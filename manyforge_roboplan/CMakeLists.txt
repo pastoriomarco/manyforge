@@ -12,6 +12,8 @@ find_package(OpenSSL REQUIRED)
 find_package(SQLite3 3.37 REQUIRED)
 find_package(Threads REQUIRED)
 option(BUILD_TESTING "Build unit tests" ON)
+option(MANYFORGE_BUILD_ROS2_CONTROL_RUNTIME
+  "Build the retained ros2_control/Isaac execution product" OFF)
 
 # I6 restores the selected native planning dependency as an ordinary product
 # target. Discover cmeel's prefix before resolving Pinocchio/RoboPlan so the
@@ -279,6 +281,30 @@ target_link_libraries(manyforge_roboplan_native_runtime PUBLIC
   manyforge::deployment_resolved_stop_base_plan_resolver
   PRIVATE manyforge::content_identity)
 
+if(MANYFORGE_BUILD_ROS2_CONTROL_RUNTIME)
+  if(NOT TARGET manyforge_ros2_control_execution)
+    set(_MANYFORGE_ROBOPLAN_BUILD_TESTING "${BUILD_TESTING}")
+    cmake_policy(PUSH)
+    cmake_policy(SET CMP0077 NEW)
+    set(BUILD_TESTING OFF)
+    add_subdirectory(
+      "${_MANYFORGE_REPOSITORY_SOURCE_ROOT}/manyforge_ros2_control_execution"
+      "${CMAKE_CURRENT_BINARY_DIR}/manyforge_ros2_control_execution"
+      EXCLUDE_FROM_ALL)
+    cmake_policy(POP)
+    set(BUILD_TESTING "${_MANYFORGE_ROBOPLAN_BUILD_TESTING}")
+    unset(_MANYFORGE_ROBOPLAN_BUILD_TESTING)
+  endif()
+  add_library(manyforge_roboplan_ros2_control_runtime
+    src/retained_ros2_control_backend_factory.cpp)
+  target_include_directories(manyforge_roboplan_ros2_control_runtime PUBLIC
+    $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+    $<INSTALL_INTERFACE:include>)
+  target_link_libraries(manyforge_roboplan_ros2_control_runtime PUBLIC
+    manyforge_roboplan_native_runtime
+    manyforge_ros2_control_execution)
+endif()
+
 if(NOT TARGET manyforge_deployment_cclc_runtime_composition)
   message(FATAL_ERROR
     "retained native CCLC composition requires the Deployment runtime owner")
@@ -373,13 +399,16 @@ install(TARGETS
   manyforge_roboplan_candidate_worker
   RUNTIME DESTINATION bin)
 
-message(STATUS
-  "manyforge_roboplan I6 cutover: retained-product projection, addressed "
-  "native state, focused planning, execution/gripper adapters, runtime "
-  "composition, and process-contained candidate computation are built; "
-  "the bounded N3 headless/Python callers are available, while full Program "
-  "execution, event collection, ROS adapters, and product workflow lanes "
-  "remain unavailable until their I6 gates")
+if(MANYFORGE_BUILD_ROS2_CONTROL_RUNTIME)
+  message(STATUS
+    "manyforge_roboplan retained runtime: native execution remains available "
+    "and the I9 ros2_control adapter seam is built; its separate installed "
+    "runtime product and host remain gated")
+else()
+  message(STATUS
+    "manyforge_roboplan retained runtime: native execution is built; the I9 "
+    "ros2_control adapter seam is not selected in this build")
+endif()
 
 # Tests
 if(BUILD_TESTING)
@@ -516,6 +545,15 @@ if(BUILD_TESTING)
       manyforge_roboplan_native_execution
       manyforge_roboplan_native_gripper
       GTest::gtest_main)
+
+    if(MANYFORGE_BUILD_ROS2_CONTROL_RUNTIME)
+      add_executable(test_retained_ros2_control_backend_factory
+        test/test_retained_ros2_control_backend_factory.cpp)
+      target_link_libraries(test_retained_ros2_control_backend_factory PRIVATE
+        manyforge_roboplan_ros2_control_runtime
+        GTest::gtest_main)
+      gtest_discover_tests(test_retained_ros2_control_backend_factory)
+    endif()
 
     add_executable(test_retained_stop_surveillance_owner
       test/test_retained_stop_surveillance_owner.cpp)

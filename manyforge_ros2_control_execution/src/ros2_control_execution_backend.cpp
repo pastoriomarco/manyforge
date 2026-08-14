@@ -408,6 +408,7 @@ Ros2ControlExecutionBackend::Ros2ControlExecutionBackend(
     throw std::invalid_argument("execution state sink must not be null");
   }
   validate_config();
+  initialize_prepared_participant_bindings();
   if (addressed_state_publication == nullptr) {
     initialize_observed_state_publication();
   } else {
@@ -422,6 +423,19 @@ Ros2ControlExecutionBackend::Ros2ControlExecutionBackend(
   initialize_ros();
   if (!defer_ros_executor_start) {
     complete_ros_configuration();
+  }
+}
+
+void Ros2ControlExecutionBackend::initialize_prepared_participant_bindings() {
+  prepared_participant_aliases_.store(
+      std::make_shared<
+          const std::vector<core::RuntimeParticipantBinding>>(),
+      std::memory_order_release);
+  if (config_.prepared_participant_binding.has_value()) {
+    prepared_participant_binding_.store(
+        std::make_shared<const core::RuntimeParticipantBinding>(
+            *config_.prepared_participant_binding),
+        std::memory_order_release);
   }
 }
 
@@ -494,11 +508,13 @@ void Ros2ControlExecutionBackend::validate_config() const {
     std::vector<std::string> binding_joints;
     binding_joints.reserve(binding.resources.size());
     for (const auto &resource : binding.resources) {
-      if (!resource.source_joint_name.has_value()) {
+      if (!resource.source_joint_name.has_value() ||
+          resource.compiled_resource_name.empty()) {
         throw std::invalid_argument(
-            "prepared ros2_control binding requires source joint names");
+            "prepared ros2_control binding requires model-backed compiled "
+            "joint names");
       }
-      binding_joints.push_back(*resource.source_joint_name);
+      binding_joints.push_back(resource.compiled_resource_name);
     }
     if (binding_joints != config_.required_joints) {
       throw std::invalid_argument(
@@ -676,14 +692,29 @@ core::PrepareParticipantResultDTO Ros2ControlExecutionBackend::Prepare(
     }
     return std::move(result.value());
   };
-  if (!config_.prepared_participant_binding.has_value()) {
+  std::lock_guard<std::mutex> lock(prepared_execution_mutex_);
+  const auto retained_binding =
+      prepared_participant_binding_.load(std::memory_order_acquire);
+  if (!retained_binding) {
     return reject("prepared_backend_binding_unavailable");
   }
-  if (const auto field_error =
-          core::prepared_participant_backend_binding_field_error(
-              participant, *config_.prepared_participant_binding,
-              core::PreparedParticipantPayloadKindDTO::kMotionExecution)) {
-    return reject(std::string(*field_error));
+  const auto binding_error =
+      [&](const core::RuntimeParticipantBinding &binding) {
+        return core::prepared_participant_backend_binding_field_error(
+            participant, binding,
+            core::PreparedParticipantPayloadKindDTO::kMotionExecution);
+      };
+  auto field_error = binding_error(*retained_binding);
+  if (field_error.has_value()) {
+    const auto aliases =
+        prepared_participant_aliases_.load(std::memory_order_acquire);
+    const auto matched = std::find_if(
+        aliases->begin(), aliases->end(), [&](const auto &alias) {
+          return !binding_error(alias).has_value();
+        });
+    if (matched == aliases->end()) {
+      return reject(std::string(*field_error));
+    }
   }
   const auto &motion =
       std::get<core::PreparedMotionExecutionDTO>(participant.payload);
@@ -692,7 +723,6 @@ core::PrepareParticipantResultDTO Ros2ControlExecutionBackend::Prepare(
     return reject("prepared_trajectory_scope_mismatch");
   }
 
-  std::lock_guard<std::mutex> lock(prepared_execution_mutex_);
   const auto key =
       std::make_tuple(participant.operation_id, participant.operation_revision,
                       participant.participant_id);
@@ -741,14 +771,28 @@ core::ExecutionHandle Ros2ControlExecutionBackend::dispatch_prepared(
   if (controller_goal_id.empty() || !controller_goal_generation.nonzero()) {
     return rejected("controller_goal_identity_invalid");
   }
-  if (!config_.prepared_participant_binding.has_value()) {
+  const auto retained_binding =
+      prepared_participant_binding_.load(std::memory_order_acquire);
+  if (!retained_binding) {
     return rejected("prepared_backend_binding_unavailable");
   }
-  if (const auto field_error =
-          core::prepared_participant_backend_binding_field_error(
-              participant, *config_.prepared_participant_binding,
-              core::PreparedParticipantPayloadKindDTO::kMotionExecution)) {
-    return rejected(std::string(*field_error));
+  const auto binding_error =
+      [&](const core::RuntimeParticipantBinding &binding) {
+        return core::prepared_participant_backend_binding_field_error(
+            participant, binding,
+            core::PreparedParticipantPayloadKindDTO::kMotionExecution);
+      };
+  auto field_error = binding_error(*retained_binding);
+  if (field_error.has_value()) {
+    const auto aliases =
+        prepared_participant_aliases_.load(std::memory_order_acquire);
+    const auto matched = std::find_if(
+        aliases->begin(), aliases->end(), [&](const auto &alias) {
+          return !binding_error(alias).has_value();
+        });
+    if (matched == aliases->end()) {
+      return rejected(std::string(*field_error));
+    }
   }
   const auto prepared_key =
       std::make_tuple(participant.operation_id, participant.operation_revision,
@@ -800,6 +844,78 @@ core::ExecutionHandle Ros2ControlExecutionBackend::DispatchResume(
     core::ControllerGoalGeneration controller_goal_generation) {
   return dispatch_prepared(participant, controller_goal_id,
                            controller_goal_generation, true);
+}
+
+core::Result<void> Ros2ControlExecutionBackend::RebindRoute(
+    core::RuntimeParticipantBinding binding,
+    std::vector<core::RuntimeParticipantBinding> program_aliases) {
+  const auto error = [](core::ErrorCode code, std::string reason,
+                        std::string message) {
+    return core::Result<void>::Err(core::ErrorDTO{
+        std::string(core::to_string(code)), std::move(message),
+        {{"reason", std::move(reason)}}});
+  };
+  const auto &value = binding.value();
+  std::vector<std::string> binding_joints;
+  binding_joints.reserve(value.resources.size());
+  if (!value.control_path.has_value() || value.resources.empty() ||
+      std::any_of(value.resources.begin(), value.resources.end(),
+                  [&](const auto &resource) {
+                    if (!resource.source_joint_name.has_value() ||
+                        resource.compiled_resource_name.empty() ||
+                        resource.coordinate_kind !=
+                            core::CoordinateKind::kAngular) {
+                      return true;
+                    }
+                    binding_joints.push_back(resource.compiled_resource_name);
+                    return false;
+                  }) ||
+      binding_joints != config_.required_joints) {
+    return error(core::ErrorCode::kInvalidRequest,
+                 "ros2_control_motion_route_rebind_mismatch",
+                 "ros2_control route publication crosses its configured "
+                 "motion resources");
+  }
+  if (program_aliases.size() > 64U ||
+      std::any_of(program_aliases.begin(), program_aliases.end(),
+                  [&](const auto &alias) {
+                    return !core::runtime_participant_binding_physically_contains(
+                        binding, alias);
+                  })) {
+    return error(core::ErrorCode::kInvalidRequest,
+                 "ros2_control_motion_program_alias_mismatch",
+                 "ros2_control Program aliases cross the physical backend");
+  }
+  try {
+    auto retained = std::make_shared<const core::RuntimeParticipantBinding>(
+        std::move(binding));
+    auto retained_aliases =
+        std::make_shared<
+            const std::vector<core::RuntimeParticipantBinding>>(
+            std::move(program_aliases));
+    std::lock_guard<std::mutex> prepared_lock(prepared_execution_mutex_);
+    {
+      std::lock_guard<std::mutex> execution_lock(execution_mutex_);
+      if (running_ || !terminal_) {
+        return error(core::ErrorCode::kExecutionRejected,
+                     "ros2_control_motion_route_rebind_busy",
+                     "ros2_control route publication cannot rebind an active "
+                     "motion backend");
+      }
+    }
+    prepared_participants_.clear();
+    prepared_goals_.clear();
+    prepared_participant_binding_.store(std::move(retained),
+                                        std::memory_order_release);
+    prepared_participant_aliases_.store(std::move(retained_aliases),
+                                        std::memory_order_release);
+    return core::Result<void>::Ok();
+  } catch (...) {
+    return error(core::ErrorCode::kInternalError,
+                 "ros2_control_motion_route_rebind_capacity_unavailable",
+                 "ros2_control route publication could not retain the motion "
+                 "binding");
+  }
 }
 
 void Ros2ControlExecutionBackend::initialize_observed_state_publication() {
@@ -7864,6 +7980,111 @@ void Ros2ControlExecutionBackend::authorize_gripper_commands() noexcept {
   }
   ++gripper_authority_generation_;
   gripper_admission_blocked_ = false;
+}
+
+core::Result<void> Ros2ControlExecutionBackend::validate_gripper_command(
+    const core::GripperCommandRequestDTO &request) const {
+  const auto rejected = [](std::string reason, std::string message) {
+    return core::Result<void>::Err(core::ErrorDTO{
+        std::string(core::to_string(core::ErrorCode::kInvalidRequest)),
+        std::move(message), {{"reason", std::move(reason)}}});
+  };
+  const double max_effort = request.max_effort.value_or(0.0);
+  if (request.gripper_id.empty() || !std::isfinite(request.target_position) ||
+      !std::isfinite(request.duration_s) || !std::isfinite(max_effort) ||
+      request.duration_s < 0.0) {
+    return rejected(ros2_control_fault_reason::kGripperInvalidCommand,
+                    "Invalid gripper command target, duration, or max effort");
+  }
+
+  std::shared_ptr<GripperRuntime> runtime;
+  {
+    std::lock_guard<std::mutex> authority_lock(gripper_authority_mutex_);
+    if (gripper_admission_blocked_) {
+      return rejected(
+          "gripper_command_not_authorized",
+          "Gripper command admission is closed by the execution lifecycle");
+    }
+    std::lock_guard<std::mutex> map_lock(gripper_map_mutex_);
+    const auto configured = grippers_.find(request.gripper_id);
+    if (configured == grippers_.end()) {
+      return rejected(ros2_control_fault_reason::kGripperNotConfigured,
+                      "No gripper transport configured for " +
+                          request.gripper_id);
+    }
+    runtime = configured->second;
+  }
+
+  Ros2GripperActionConfig runtime_config;
+  {
+    std::lock_guard<std::mutex> lock(runtime->mutex);
+    runtime_config = runtime->config;
+    if (runtime->executing) {
+      return rejected(ros2_control_fault_reason::kGripperBusy,
+                      "Gripper is already executing");
+    }
+    if (runtime->state == "failed" &&
+        runtime->reason_code != "grasp_confirmation_lost") {
+      return rejected(runtime->reason_code.empty()
+                          ? "gripper_request_failed"
+                          : runtime->reason_code,
+                      runtime->error.empty()
+                          ? "Gripper state is unavailable"
+                          : runtime->error);
+    }
+    if (runtime->projection_state ==
+        core::GripperProjectionState::kPending) {
+      return rejected(ros2_control_fault_reason::kGripperBusy,
+                      "Gripper terminal scene projection is still pending");
+    }
+    if (runtime->projection_state == core::GripperProjectionState::kFailed) {
+      return rejected(
+          "gripper_projection_failed",
+          "Gripper terminal scene projection failed; reset before retrying");
+    }
+  }
+  if ((!request.transport_kind.empty() &&
+       request.transport_kind != runtime_config.transport_kind) ||
+      (!request.group_id.empty() &&
+       request.group_id != runtime_config.group_id) ||
+      (!request.joint_name.empty() &&
+       request.joint_name != runtime_config.joint_name) ||
+      (!request.completion_policy.empty() &&
+       request.completion_policy != runtime_config.completion_policy)) {
+    return rejected(
+        ros2_control_fault_reason::kInvalidGripperSemantics,
+        "Gripper request semantics do not match the configured transport");
+  }
+
+  if (!runtime_config.group_id.empty() ||
+      !runtime_config.joint_name.empty()) {
+    std::optional<double> start_position;
+    try {
+      start_position = scene_group_joint_position(runtime_config.group_id,
+                                                  runtime_config.joint_name);
+    } catch (const std::exception &exception) {
+      return rejected("gripper_state_unavailable",
+                      std::string("Cannot read gripper execution state: ") +
+                          exception.what());
+    } catch (...) {
+      return rejected("gripper_state_unavailable",
+                      "Cannot read gripper execution state");
+    }
+    if (!start_position.has_value()) {
+      return rejected(
+          ros2_control_fault_reason::kGripperNotConfigured,
+          "Cannot project gripper '" + request.gripper_id +
+              "' into execution-state sink group '" +
+              runtime_config.group_id + "' joint '" +
+              runtime_config.joint_name + "'");
+    }
+    if (!std::isfinite(*start_position)) {
+      return rejected(
+          ros2_control_fault_reason::kGripperStateNotFinite,
+          "Configured gripper execution-state position is not finite");
+    }
+  }
+  return core::Result<void>::Ok();
 }
 
 core::GripperCommandResultDTO Ros2ControlExecutionBackend::command_gripper(

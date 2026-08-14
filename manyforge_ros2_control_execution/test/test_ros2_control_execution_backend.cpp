@@ -71,6 +71,86 @@ Ros2ControlExecutionBackendConfig base_config() {
   return config;
 }
 
+core::RuntimeParticipantBinding motion_binding(std::string program_id) {
+  core::RuntimeParticipantBindingDTO value{
+      core::ProgramId(std::move(program_id)),
+      core::ProgramRevision("program-revision"),
+      core::ProgramBindingId("program-binding"),
+      core::RetainedBundleId("bundle"),
+      core::GraphRevision("graph"),
+      core::ComponentRoleId("robot"),
+      core::TargetRoleId("arm"),
+      core::ControllableComponentId("robot.1"),
+      core::ComponentTypeId("robot.type"),
+      core::ComponentTypeRevision("robot-type-revision"),
+      core::CommandTargetId("arm.target"),
+      core::CapabilityId("execution.trajectory.execute"),
+      core::CapabilityDefinitionRevision("capability-revision"),
+      std::nullopt,
+      {core::ProgramModelRoleBindingDTO{
+          core::ModelRoleId("body"), core::ModelInstanceId("robot.model"),
+          core::ModelRevision("model-revision")}},
+      {core::RuntimeModelGroupBindingDTO{
+          core::ModelGroupRoleId("arm_group"),
+          core::ModelInstanceId("robot.model"), "arm", {"joint_1"}}},
+      {core::ProgramFrameRoleBindingDTO{
+          core::FrameRoleId("tcp"), core::ModelInstanceId("robot.model"),
+          core::ModelRevision("model-revision"), "tcp"}},
+      {core::RuntimeResourceBindingDTO{
+          core::ResourceRoleId("joint_1"), core::ResourceId("robot.joint.1"),
+          "source_joint_1", "joint_1", core::CoordinateKind::kAngular}},
+      {},
+      core::RuntimeControlPathDTO{
+          core::ControlDomainId("domain.arm"),
+          core::ControlDomainRevision("domain-revision"),
+          core::ControlBindingId("binding.arm"),
+          core::ControlBindingRevision("binding-revision"),
+          core::ControlInterfaceContractId("interface.trajectory"),
+          core::ControlInterfaceRevision("interface-revision"),
+          core::ControllerTopologyId("topology.ros2_control"),
+          core::TopologyRevision("topology-revision"),
+          core::ControlRouteId("route.ros2_control"),
+          core::ActivationSetId("activation.ros2_control"),
+          core::ActiveControlConfigurationId("active.ros2_control"),
+          core::ActiveControlConfigurationGeneration(1U),
+          core::ProviderInstanceId("provider.ros2_control"),
+          core::ProviderManifestId("provider-manifest.ros2_control"),
+          core::ProviderManifestRevision("provider-manifest-revision"),
+          core::RuntimeUnitId("runtime.ros2_control"),
+          core::RuntimeEpoch("runtime-epoch.1"),
+          core::StateAuthorityId("state.commanded"),
+          core::StateAuthorityClass::kCommanded,
+          core::StopEvidencePolicyId("stop.ros2_control"),
+          core::StopEvidencePolicyRevision("stop-revision"),
+          core::ContainmentGranularity::kResource,
+          std::nullopt},
+      std::nullopt,
+      {},
+      {core::RuntimeUnitEpochBindingDTO{
+          core::RuntimeUnitId("runtime.ros2_control"),
+          core::RuntimeEpoch("runtime-epoch.1")}}};
+  auto sealed = core::verify_runtime_participant_binding(std::move(value));
+  if (!sealed.ok()) {
+    throw std::logic_error(sealed.error().message);
+  }
+  return std::move(sealed.value());
+}
+
+core::RuntimeParticipantBinding program_alias(
+    const core::RuntimeParticipantBinding &physical) {
+  auto value = physical.value();
+  value.program_id = core::ProgramId("program.alias");
+  value.program_revision = core::ProgramRevision("program-alias-revision");
+  value.program_binding_id = core::ProgramBindingId("program-alias-binding");
+  value.component_role_id = core::ComponentRoleId("alias_robot");
+  value.target_role_id = core::TargetRoleId("alias_arm");
+  auto sealed = core::verify_runtime_participant_binding(std::move(value));
+  if (!sealed.ok()) {
+    throw std::logic_error(sealed.error().message);
+  }
+  return std::move(sealed.value());
+}
+
 core::ResolvedParticipantStopStageDTO direct_stage_fixture() {
   const core::OperationId operation_id("operation.direct");
   const core::OperationRevision operation_revision(1U);
@@ -942,6 +1022,47 @@ TEST(Ros2ControlExecutionBackendTest,
           Ros2ControlExecutionBackend::TestingNoRosStartupTag{}, wrong_source,
           sink, "arm", clock, scheduler, config),
       std::invalid_argument);
+}
+
+TEST(Ros2ControlExecutionBackendTest,
+     RouteRebindAcceptsContainedAliasesAndRejectsCrossedRuntimeFacts) {
+  auto binding = motion_binding("program.physical");
+  auto config = base_config();
+  config.prepared_participant_binding = binding;
+  auto sink = std::make_shared<RecordingExecutionStateSink>();
+  core::FakeClock clock;
+  core::ManualScheduler scheduler;
+  Ros2ControlExecutionBackend backend(
+      Ros2ControlExecutionBackend::TestingNoRosStartupTag{}, sink, "arm", clock,
+      scheduler, config);
+
+  auto alias = program_alias(binding);
+  auto accepted = backend.RebindRoute(binding, {alias});
+  ASSERT_TRUE(accepted.ok()) << accepted.error().message;
+
+  auto crossed_alias_value = alias.value();
+  crossed_alias_value.control_path->provider_runtime_epoch =
+      core::RuntimeEpoch("runtime-epoch.2");
+  crossed_alias_value.runtime_unit_epochs.front().runtime_epoch =
+      core::RuntimeEpoch("runtime-epoch.2");
+  auto crossed_alias =
+      core::verify_runtime_participant_binding(std::move(crossed_alias_value));
+  ASSERT_TRUE(crossed_alias.ok()) << crossed_alias.error().message;
+  auto alias_rejected = backend.RebindRoute(binding, {crossed_alias.value()});
+  ASSERT_FALSE(alias_rejected.ok());
+  EXPECT_EQ(alias_rejected.error().details.at("reason"),
+            "ros2_control_motion_program_alias_mismatch");
+
+  auto crossed_binding_value = binding.value();
+  crossed_binding_value.resources.front().compiled_resource_name =
+      "different_joint";
+  auto crossed_binding =
+      core::verify_runtime_participant_binding(std::move(crossed_binding_value));
+  ASSERT_TRUE(crossed_binding.ok()) << crossed_binding.error().message;
+  auto binding_rejected = backend.RebindRoute(crossed_binding.value(), {});
+  ASSERT_FALSE(binding_rejected.ok());
+  EXPECT_EQ(binding_rejected.error().details.at("reason"),
+            "ros2_control_motion_route_rebind_mismatch");
 }
 
 TEST(Ros2ControlExecutionBackendTest,
@@ -1960,6 +2081,69 @@ TEST(Ros2ControlExecutionBackendTest,
   ASSERT_EQ(reads.size(), 1u);
   EXPECT_EQ(reads.front().group_id, "gripper");
   EXPECT_EQ(reads.front().joint_name, "finger_joint");
+  EXPECT_TRUE(sink->single_updates().empty());
+}
+
+TEST(Ros2ControlExecutionBackendTest,
+     GripperPreflightRejectsCrossedSemanticsWithoutAdmittingAnEffect) {
+  auto sink = std::make_shared<RecordingExecutionStateSink>();
+  sink->set_joint_position("gripper", "finger_joint", 0.7);
+  core::FakeClock clock;
+  core::ManualScheduler scheduler;
+  Ros2ControlExecutionBackend backend(
+      Ros2ControlExecutionBackend::DeferredRosExecutorStartTag{}, sink, "arm",
+      clock, scheduler, base_config());
+  backend.configure_gripper_action(
+      "tool", isaac_gripper_config("/manyforge_preflight_gripper_" +
+                                    unique_suffix()));
+
+  const auto valid = make_gripper_request(
+      0.0, 0.2, 0.0, "isaac_joint_state_effort", "dwell_elapsed");
+  EXPECT_TRUE(backend.validate_gripper_command(valid).ok());
+  EXPECT_EQ(backend.get_gripper_status("tool").state,
+            core::GripperCommandState::kIdle);
+  EXPECT_TRUE(sink->single_updates().empty());
+
+  auto crossed = valid;
+  crossed.joint_name = "another_finger";
+  const auto rejected = backend.validate_gripper_command(crossed);
+  ASSERT_FALSE(rejected.ok());
+  EXPECT_EQ(rejected.error().code,
+            core::to_string(core::ErrorCode::kInvalidRequest));
+  EXPECT_EQ(rejected.error().details.at("reason"),
+            ros2_control_fault_reason::kInvalidGripperSemantics);
+  EXPECT_EQ(backend.get_gripper_status("tool").state,
+            core::GripperCommandState::kIdle);
+  EXPECT_TRUE(sink->single_updates().empty());
+}
+
+TEST(Ros2ControlExecutionBackendTest,
+     GripperPreflightRejectsUnavailableStateAndClosedLifecycle) {
+  auto sink = std::make_shared<RecordingExecutionStateSink>();
+  core::FakeClock clock;
+  core::ManualScheduler scheduler;
+  Ros2ControlExecutionBackend backend(
+      Ros2ControlExecutionBackend::DeferredRosExecutorStartTag{}, sink, "arm",
+      clock, scheduler, base_config());
+  backend.configure_gripper_action(
+      "tool", isaac_gripper_config("/manyforge_preflight_state_gripper_" +
+                                    unique_suffix()));
+  const auto request = make_gripper_request(
+      0.0, 0.2, 0.0, "isaac_joint_state_effort", "dwell_elapsed");
+
+  const auto unavailable = backend.validate_gripper_command(request);
+  ASSERT_FALSE(unavailable.ok());
+  EXPECT_EQ(unavailable.error().details.at("reason"),
+            ros2_control_fault_reason::kGripperNotConfigured);
+
+  sink->set_joint_position("gripper", "finger_joint", 0.7);
+  backend.invalidate_gripper_commands(core::GripperInvalidationReason::kReset);
+  const auto closed = backend.validate_gripper_command(request);
+  ASSERT_FALSE(closed.ok());
+  EXPECT_EQ(closed.error().details.at("reason"),
+            "gripper_command_not_authorized");
+  EXPECT_EQ(backend.get_gripper_status("tool").state,
+            core::GripperCommandState::kIdle);
   EXPECT_TRUE(sink->single_updates().empty());
 }
 

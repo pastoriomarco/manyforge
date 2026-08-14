@@ -2315,7 +2315,7 @@ TEST(RetainedProductCrossConsumer,
             for (const auto &channel : channels) {
               state_sources.push_back(RetainedSceneFrameStateSourceInput{
                   channel->query_context(),
-                  core::ObservedStateSourceKind::kPredictedState,
+                  channel->source_kind(),
                   std::shared_ptr<const core::IObservedStateProvider>(
                       channel, channel->addressed_publication()),
                   {}});
@@ -2330,7 +2330,10 @@ TEST(RetainedProductCrossConsumer,
           {},
           {},
           &admission_gate,
-          runtime_policy->value()},
+          runtime_policy->value(),
+          {},
+          {},
+          {}},
       std::move(runtime_config));
 
   ASSERT_NE(runtime, nullptr);

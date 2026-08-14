@@ -194,6 +194,13 @@ public:
       const core::ControllerGoalId &controller_goal_id,
       core::ControllerGoalGeneration controller_goal_generation) override;
 
+  /// Rebind one quiescent adapter to a verified successor route and its exact
+  /// Program-scoped aliases. Old prepared replay membership is discarded
+  /// before the successor becomes visible.
+  [[nodiscard]] core::Result<void> RebindRoute(
+      core::RuntimeParticipantBinding binding,
+      std::vector<core::RuntimeParticipantBinding> program_aliases);
+
   // Deployment-owned ROS entities, including gripper transports, must be
   // installed before this one-way transition. Mutating the ROS graph while the
   // executor spins is rejected because rclcpp/rcutils graph construction is not
@@ -280,6 +287,8 @@ public:
 
   void configure_gripper_action(std::string gripper_id,
                                 Ros2GripperActionConfig config);
+  [[nodiscard]] core::Result<void> validate_gripper_command(
+      const core::GripperCommandRequestDTO &request) const override;
   core::GripperCommandResultDTO
   command_gripper(const core::GripperCommandRequestDTO &request) override;
   core::GripperCommandResultDTO mark_gripper_grasp_lost(
@@ -340,6 +349,7 @@ public:
       throw std::invalid_argument("execution state sink must not be null");
     }
     validate_config();
+    initialize_prepared_participant_bindings();
     initialize_observed_state_publication();
     initialize_execution_progress_publication();
     initialize_scene_projection_worker();
@@ -362,6 +372,7 @@ public:
       throw std::invalid_argument("execution state sink must not be null");
     }
     validate_config();
+    initialize_prepared_participant_bindings();
     validate_injected_observed_state_publication();
     initialize_execution_progress_publication();
     initialize_scene_projection_worker();
@@ -745,6 +756,7 @@ private:
                     core::ControllerGoalGeneration controller_goal_generation,
                     bool resume_dispatch);
   void initialize_observed_state_publication();
+  void initialize_prepared_participant_bindings();
   void validate_injected_observed_state_publication();
   void initialize_execution_progress_publication();
   void initialize_scene_projection_worker();
@@ -1028,6 +1040,11 @@ private:
            core::ContentDigest>
       prepared_participants_;
   std::map<core::ControllerGoalId, PreparedGoalRecord> prepared_goals_;
+  std::atomic<std::shared_ptr<const core::RuntimeParticipantBinding>>
+      prepared_participant_binding_;
+  std::atomic<
+      std::shared_ptr<const std::vector<core::RuntimeParticipantBinding>>>
+      prepared_participant_aliases_;
   const std::string execution_backend_component_epoch_;
   std::unique_ptr<core::ObservedRobotStatePublication>
       owned_observed_state_publication_;

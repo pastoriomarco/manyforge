@@ -56,6 +56,12 @@ publication_config(const core::RuntimeParticipantBinding &binding,
     sources.push_back(core::ObservedRobotStateSourceConfig{
         numeric_source_kind(config.source_kind), config.source_id, profile,
         config.freshness_budget_ns, "retained_native_state_authority"});
+  } else if (sources.front().kind != numeric_source_kind(config.source_kind) ||
+             sources.front().source_id != config.source_id ||
+             sources.front().authority_profile != profile) {
+    throw std::invalid_argument(
+        "retained observed-state primary source differs from its addressed "
+        "authority");
   }
   return core::AddressedObservedStatePublicationConfig{
       std::move(context.value()),

@@ -786,10 +786,13 @@ create_retained_native_runtime_participants(
   runtime->cache = std::make_unique<core::TrajectoryCache>(config.cache);
   runtime->planner = std::move(input.planner);
 
+  auto motion_state_config =
+      input.motion_state_channel_config.value_or(
+          native_state_config(runtime->motion_binding));
   runtime->motion_state_channel =
       std::make_shared<RetainedObservedStateChannel>(
           runtime->motion_binding, runtime->state_projector,
-          native_state_config(runtime->motion_binding));
+          std::move(motion_state_config));
   const auto initial_timestamp_ns = runtime->clock->now();
   const auto motion_initialized =
       config.initial_motion_positions_rad.empty()
@@ -814,14 +817,6 @@ create_retained_native_runtime_participants(
   runtime->collision_trajectory_projector =
       RoboPlanCollisionTrajectoryProjector::create(
           runtime->motion_binding, runtime->scene, runtime->scene_mutex);
-  runtime->execution = std::make_unique<RoboPlanExecutionBackend>(
-      runtime->motion_binding, runtime->motion_state_channel, *runtime->clock,
-      *runtime->scheduler, std::move(config.execution));
-  if (const auto rebound = runtime->execution->RebindRoute(
-          runtime->motion_binding, runtime->motion_binding_aliases);
-      !rebound.ok()) {
-    throw std::invalid_argument(rebound.error().message);
-  }
 
   if (runtime->gripper_binding.has_value()) {
     const auto &gripper_value = runtime->gripper_binding->value();
@@ -842,7 +837,8 @@ create_retained_native_runtime_participants(
         std::make_shared<RetainedObservedStateChannel>(
             *runtime->gripper_binding,
             model_backed ? runtime->state_projector : nullptr,
-            native_state_config(*runtime->gripper_binding));
+            input.gripper_state_channel_config.value_or(
+                native_state_config(*runtime->gripper_binding)));
     if (model_backed) {
       const auto gripper_initialized =
           runtime->gripper_state_channel->initialize_from_projection(
@@ -854,10 +850,84 @@ create_retained_native_runtime_participants(
       runtime->gripper_position_limits =
           retained_gripper_limits(*runtime->scene, *runtime->gripper_binding);
     }
-    runtime->gripper = std::make_unique<RetainedGripperCommandBackend>(
-        *runtime->gripper_binding, runtime->gripper_state_channel,
-        runtime->gripper_position_limits, *runtime->clock, *runtime->scheduler,
-        config.gripper_update_period_ns);
+  }
+
+  if (input.backend_factory) {
+    auto selected = input.backend_factory(
+        runtime->motion_binding, runtime->gripper_binding,
+        runtime->motion_state_channel, runtime->gripper_state_channel,
+        *runtime->clock, *runtime->scheduler);
+    runtime->execution = std::move(selected.execution);
+    runtime->gripper = std::move(selected.gripper);
+    runtime->gripper_stop_execution_port =
+        selected.gripper_stop_execution_port;
+    runtime->rebind_motion_route =
+        std::move(selected.rebind_motion_route);
+    runtime->rebind_gripper_route =
+        std::move(selected.rebind_gripper_route);
+  } else {
+    auto native_execution = std::make_shared<RoboPlanExecutionBackend>(
+        runtime->motion_binding, runtime->motion_state_channel, *runtime->clock,
+        *runtime->scheduler, std::move(config.execution));
+    runtime->execution = native_execution;
+    runtime->rebind_motion_route =
+        [native_execution](core::RuntimeParticipantBinding binding,
+                           std::vector<core::RuntimeParticipantBinding>
+                               program_aliases) {
+          return native_execution->RebindRoute(std::move(binding),
+                                               std::move(program_aliases));
+        };
+    if (runtime->gripper_binding.has_value()) {
+      auto native_gripper =
+          std::make_shared<RetainedGripperCommandBackend>(
+              *runtime->gripper_binding, runtime->gripper_state_channel,
+              runtime->gripper_position_limits, *runtime->clock,
+              *runtime->scheduler, config.gripper_update_period_ns);
+      runtime->gripper = native_gripper;
+      runtime->gripper_stop_execution_port = native_gripper.get();
+      runtime->rebind_gripper_route =
+          [native_gripper](
+              core::RuntimeParticipantBinding binding,
+              std::shared_ptr<IRetainedObservedStateChannel> state_channel) {
+            return native_gripper->RebindRoute(std::move(binding),
+                                               std::move(state_channel));
+          };
+    }
+  }
+  if (!runtime->execution || !runtime->rebind_motion_route ||
+      runtime->execution->observed_robot_state_publication() !=
+          &runtime->motion_state_channel->publication().numeric_publication() ||
+      runtime->gripper_binding.has_value() !=
+          static_cast<bool>(runtime->gripper) ||
+      (runtime->gripper_binding.has_value() &&
+       !runtime->rebind_gripper_route)) {
+    throw std::invalid_argument(
+        "retained runtime execution adapter set is incomplete or owns a "
+        "second state authority");
+  }
+  if (runtime->gripper_binding.has_value() &&
+      runtime->gripper_stop_execution_port == nullptr) {
+    throw std::invalid_argument(
+        "retained runtime gripper adapter has no Stop execution port");
+  }
+  if (runtime->gripper_binding.has_value()) {
+    const auto *execution_stop =
+        static_cast<core::IControlDomainExecutionPort *>(
+            runtime->execution.get());
+    const auto *gripper_owned_stop =
+        dynamic_cast<core::IControlDomainExecutionPort *>(
+            runtime->gripper.get());
+    if (runtime->gripper_stop_execution_port != execution_stop &&
+        runtime->gripper_stop_execution_port != gripper_owned_stop) {
+      throw std::invalid_argument(
+          "retained runtime gripper Stop port is not owned by its adapter "
+          "set");
+    }
+  }
+  if (const auto rebound = runtime->rebind_motion_route(
+          runtime->motion_binding, runtime->motion_binding_aliases);
+      !rebound.ok()) {
+    throw std::invalid_argument(rebound.error().message);
   }
 
   std::vector<std::shared_ptr<RetainedObservedStateChannel>> state_channels{
@@ -936,13 +1006,14 @@ create_retained_native_runtime_participants(
   if (runtime->gripper_binding.has_value()) {
     registrations.push_back(runtime_registration(
         *runtime->gripper_binding, input.gripper_stop_readiness,
-        runtime->participant_engine.get(), runtime->gripper.get(),
+        runtime->participant_engine.get(),
+        runtime->gripper_stop_execution_port,
         std::nullopt));
   }
   for (const auto &alias : runtime->gripper_binding_aliases) {
     registrations.push_back(runtime_registration(
         alias, input.gripper_stop_readiness, runtime->participant_engine.get(),
-        runtime->gripper.get(), std::nullopt));
+        runtime->gripper_stop_execution_port, std::nullopt));
   }
   std::vector<core::RuntimeParticipantExecutionRegistration>
       physical_registrations;
@@ -953,7 +1024,8 @@ create_retained_native_runtime_participants(
   if (runtime->gripper_binding.has_value()) {
     physical_registrations.push_back(runtime_registration(
         *runtime->gripper_binding, input.gripper_stop_readiness,
-        runtime->participant_engine.get(), runtime->gripper.get(),
+        runtime->participant_engine.get(),
+        runtime->gripper_stop_execution_port,
         std::nullopt));
   }
   auto binding_resolver = std::move(input.participant_resolver);
@@ -1215,7 +1287,7 @@ RetainedNativeRuntime::PublishAndReadBackRouteConfiguration(
     if (next_gripper.has_value()) {
       physical_registrations.push_back(runtime_registration(
           *next_gripper, gripper_readiness, participant_engine.get(),
-          gripper.get(), std::nullopt));
+          gripper_stop_execution_port, std::nullopt));
     }
     std::vector<core::RuntimeParticipantExecutionRegistration> registrations =
         physical_registrations;
@@ -1226,8 +1298,8 @@ RetainedNativeRuntime::PublishAndReadBackRouteConfiguration(
     }
     for (const auto &alias : next_gripper_aliases) {
       registrations.push_back(runtime_registration(
-          alias, gripper_readiness, participant_engine.get(), gripper.get(),
-          std::nullopt));
+          alias, gripper_readiness, participant_engine.get(),
+          gripper_stop_execution_port, std::nullopt));
     }
 
     RetainedRuntimeParticipantResolver binding_resolver;
@@ -1265,15 +1337,15 @@ RetainedNativeRuntime::PublishAndReadBackRouteConfiguration(
         if (gripper_rebound && old_gripper.has_value() && gripper != nullptr) {
           const auto now_ns = clock->now();
           if (gripper_state_channel->RebindRoute(*old_gripper, now_ns).ok()) {
-            static_cast<void>(
-                gripper->RebindRoute(*old_gripper, gripper_state_channel));
+            static_cast<void>(rebind_gripper_route(*old_gripper,
+                                                   gripper_state_channel));
           }
         }
         if (motion_rebound && execution != nullptr) {
           const auto now_ns = clock->now();
           if (motion_state_channel->RebindRoute(old_motion, now_ns).ok()) {
-            static_cast<void>(
-                execution->RebindRoute(old_motion, motion_binding_aliases));
+            static_cast<void>(rebind_motion_route(old_motion,
+                                                  motion_binding_aliases));
           }
         }
       } catch (...) {
@@ -1289,7 +1361,7 @@ RetainedNativeRuntime::PublishAndReadBackRouteConfiguration(
             rebound.error().message);
       }
       motion_rebound = true;
-      rebound = execution->RebindRoute(next_motion, next_motion_aliases);
+      rebound = rebind_motion_route(next_motion, next_motion_aliases);
       if (!rebound.ok()) {
         rollback_physical_route();
         return route_publication_error<
@@ -1321,7 +1393,8 @@ RetainedNativeRuntime::PublishAndReadBackRouteConfiguration(
             rebound.error().message);
       }
       gripper_rebound = true;
-      rebound = gripper->RebindRoute(*next_gripper, gripper_state_channel);
+      rebound =
+          rebind_gripper_route(*next_gripper, gripper_state_channel);
       if (!rebound.ok()) {
         rollback_physical_route();
         return route_publication_error<
@@ -1513,7 +1586,7 @@ RetainedNativeRuntime::AdoptAndReadBackRouteConfigurationPredecessor(
     if (next_gripper.has_value()) {
       physical_registrations.push_back(runtime_registration(
           *next_gripper, gripper_readiness, participant_engine.get(),
-          gripper.get(), std::nullopt));
+          gripper_stop_execution_port, std::nullopt));
     }
     auto registrations = physical_registrations;
     for (const auto &alias : next_motion_aliases) {
@@ -1523,8 +1596,8 @@ RetainedNativeRuntime::AdoptAndReadBackRouteConfigurationPredecessor(
     }
     for (const auto &alias : next_gripper_aliases) {
       registrations.push_back(runtime_registration(
-          alias, gripper_readiness, participant_engine.get(), gripper.get(),
-          std::nullopt));
+          alias, gripper_readiness, participant_engine.get(),
+          gripper_stop_execution_port, std::nullopt));
     }
 
     RetainedRuntimeParticipantResolver binding_resolver;
@@ -1562,15 +1635,15 @@ RetainedNativeRuntime::AdoptAndReadBackRouteConfigurationPredecessor(
             gripper_state_channel != nullptr) {
           const auto now_ns = clock->now();
           if (gripper_state_channel->RebindRoute(*old_gripper, now_ns).ok()) {
-            static_cast<void>(
-                gripper->RebindRoute(*old_gripper, gripper_state_channel));
+            static_cast<void>(rebind_gripper_route(*old_gripper,
+                                                   gripper_state_channel));
           }
         }
         if (motion_rebound) {
           const auto now_ns = clock->now();
           if (motion_state_channel->RebindRoute(old_motion, now_ns).ok()) {
-            static_cast<void>(
-                execution->RebindRoute(old_motion, motion_binding_aliases));
+            static_cast<void>(rebind_motion_route(old_motion,
+                                                  motion_binding_aliases));
           }
         }
       } catch (...) {
@@ -1584,7 +1657,7 @@ RetainedNativeRuntime::AdoptAndReadBackRouteConfigurationPredecessor(
             rebound.error());
       }
       motion_rebound = true;
-      rebound = execution->RebindRoute(next_motion, next_motion_aliases);
+      rebound = rebind_motion_route(next_motion, next_motion_aliases);
       if (!rebound.ok()) {
         rollback();
         return core::Result<core::RuntimeRouteConfigurationReadbackDTO>::Err(
@@ -1610,7 +1683,8 @@ RetainedNativeRuntime::AdoptAndReadBackRouteConfigurationPredecessor(
             rebound.error());
       }
       gripper_rebound = true;
-      rebound = gripper->RebindRoute(*next_gripper, gripper_state_channel);
+      rebound =
+          rebind_gripper_route(*next_gripper, gripper_state_channel);
       if (!rebound.ok()) {
         rollback();
         return core::Result<core::RuntimeRouteConfigurationReadbackDTO>::Err(

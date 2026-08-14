@@ -131,6 +131,9 @@ public:
   binding() const noexcept {
     return *current_binding_.load(std::memory_order_acquire);
   }
+  [[nodiscard]] core::ObservedStateSourceKind source_kind() const noexcept {
+    return config_.source_kind;
+  }
   [[nodiscard]] const core::ObservedStateQueryContextDTO &
   query_context() const noexcept override {
     return publication_.query_context();

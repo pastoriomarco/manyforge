@@ -182,4 +182,12 @@ class RuntimeParticipantBinding final {
 [[nodiscard]] Result<ObservedStateQueryContextDTO> make_observed_state_query_context(
     const RuntimeParticipantBinding& binding, std::int64_t freshness_budget_ns);
 
+/// Return true when `selected` is one Program-scoped view of the same exact
+/// physical execution owner as `physical`. Program/role identities may differ;
+/// model, resource, route, provider, and runtime-epoch facts may only narrow
+/// by an unambiguous subset and can never cross the physical owner.
+[[nodiscard]] bool runtime_participant_binding_physically_contains(
+    const RuntimeParticipantBinding& physical,
+    const RuntimeParticipantBinding& selected) noexcept;
+
 }  // namespace manyforge::core
