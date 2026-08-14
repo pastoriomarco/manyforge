@@ -268,6 +268,39 @@ TEST(Ros2CapabilityTest,
             "decelerate_on_cancel_evidence_incomplete");
 }
 
+TEST(Ros2ObservedStateSourcesTest,
+     CommandedSimulationPrecedesMeasuredDiagnosticsExactly) {
+  auto config = base_config();
+  config.execution_state_source_mode = "commanded_sim";
+  config.observed_state_source_precedence = {
+      "controller_state", "joint_state", "action_feedback"};
+  config.joint_state_max_age_s = 0.25;
+
+  const auto sources = ros2_control_observed_state_sources(config);
+
+  ASSERT_EQ(sources.size(), 4U);
+  EXPECT_EQ(sources[0].kind, ObservedRobotStateSourceKind::kCommandedState);
+  EXPECT_EQ(sources[0].source_id, "commanded_state");
+  EXPECT_EQ(sources[0].authority_profile,
+            ObservedRobotStateAuthorityProfile::kCommandedSimulation);
+  EXPECT_EQ(sources[0].freshness_budget_ns, 0);
+  EXPECT_EQ(sources[0].authority_profile_id,
+            "ros2_control_commanded_sim_v1");
+  for (std::size_t index = 1; index < sources.size(); ++index) {
+    EXPECT_EQ(sources[index].authority_profile,
+              ObservedRobotStateAuthorityProfile::kMeasured);
+    EXPECT_EQ(sources[index].freshness_budget_ns, 250'000'000);
+    EXPECT_EQ(sources[index].authority_profile_id,
+              "ros2_control_measured_diagnostic_v1");
+  }
+  EXPECT_EQ(ros2_control_addressed_state_sources(config),
+            std::vector<ObservedRobotStateSourceConfig>{sources.front()});
+  const std::vector<ObservedRobotStateSourceConfig> expected_diagnostics(
+      sources.begin() + 1, sources.end());
+  EXPECT_EQ(ros2_control_diagnostic_state_sources(config),
+            expected_diagnostics);
+}
+
 TEST(Ros2CapabilityTest,
      FaultErrorCarriesStableReasonTokenAndMeasurements) {
   auto error = make_ros2_control_fault_error(

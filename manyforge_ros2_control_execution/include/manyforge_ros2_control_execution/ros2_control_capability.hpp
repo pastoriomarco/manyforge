@@ -8,6 +8,7 @@
 #include <vector>
 
 #include <manyforge_core/motion_interrupt/soft_on_path_stop_planner.hpp>
+#include <manyforge_core/observed_robot_state_publication.hpp>
 #include <manyforge_core/runtime_participant_binding.hpp>
 #include <manyforge_core/types/error_code.hpp>
 #include <manyforge_core/types/motion_interrupt.hpp>
@@ -126,6 +127,29 @@ struct Ros2ControlExecutionBackendConfig {
   /// admission fail closed until product composition supplies the referent.
   std::optional<core::RuntimeParticipantBinding> prepared_participant_binding;
 };
+
+/// Exact bounded observed-state source set owned by one backend config.
+/// Command-authoritative simulation is first and non-expiring; ROS feedback
+/// remains measured diagnostic input behind it. A retained addressed owner
+/// uses this derivation to inject the sole numeric publication instead of
+/// creating a second state authority.
+std::vector<core::ObservedRobotStateSourceConfig>
+ros2_control_observed_state_sources(
+    const Ros2ControlExecutionBackendConfig& config);
+
+/// Authority-compatible subset suitable for one addressed publication. For
+/// commanded/authored lanes this contains only the non-expiring owner-issued
+/// source; measured ROS inputs remain diagnostic and cannot become fallback
+/// planning authority. Measured lanes retain their declared precedence set.
+std::vector<core::ObservedRobotStateSourceConfig>
+ros2_control_addressed_state_sources(
+    const Ros2ControlExecutionBackendConfig& config);
+
+/// Measured diagnostic sources split from an addressed authored authority.
+/// Empty for measured lanes, whose addressed publication already owns them.
+std::vector<core::ObservedRobotStateSourceConfig>
+ros2_control_diagnostic_state_sources(
+    const Ros2ControlExecutionBackendConfig& config);
 
 /// Pure capability evaluation for ros2_control deployments. This helper
 /// intentionally has no ROS message/runtime dependency so tests and deployment

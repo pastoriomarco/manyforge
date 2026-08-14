@@ -5,6 +5,78 @@
 #include <utility>
 
 namespace manyforge::ros2_control_execution {
+
+std::vector<core::ObservedRobotStateSourceConfig>
+ros2_control_observed_state_sources(
+    const Ros2ControlExecutionBackendConfig& config) {
+  const bool authored = config.execution_state_source_mode == "commanded_sim" ||
+                        config.execution_state_source_mode == "authored_preview";
+  const auto freshness_budget_ns = static_cast<std::int64_t>(
+      config.joint_state_max_age_s * 1'000'000'000.0);
+  std::vector<core::ObservedRobotStateSourceConfig> sources;
+  sources.reserve(config.observed_state_source_precedence.size() +
+                  (authored ? 1U : 0U));
+  if (authored) {
+    const bool commanded_sim =
+        config.execution_state_source_mode == "commanded_sim";
+    sources.emplace_back(
+        commanded_sim ? core::ObservedRobotStateSourceKind::kCommandedState
+                      : core::ObservedRobotStateSourceKind::kPredictedState,
+        commanded_sim ? "commanded_state" : "authored_preview_state",
+        core::ObservedRobotStateAuthorityProfile::kCommandedSimulation,
+        /*freshness_budget_ns=*/0,
+        config.observed_state_authority_profile_id.empty()
+            ? (commanded_sim ? "ros2_control_commanded_sim_v1"
+                             : "ros2_control_authored_preview_v1")
+            : config.observed_state_authority_profile_id);
+  }
+  for (const auto& source_name : config.observed_state_source_precedence) {
+    core::ObservedRobotStateSourceKind source_kind;
+    if (source_name == "action_feedback") {
+      source_kind = core::ObservedRobotStateSourceKind::kActionFeedback;
+    } else if (source_name == "controller_state") {
+      source_kind = core::ObservedRobotStateSourceKind::kControllerState;
+    } else {
+      source_kind = core::ObservedRobotStateSourceKind::kJointState;
+    }
+    sources.emplace_back(
+        source_kind, source_name,
+        core::ObservedRobotStateAuthorityProfile::kMeasured,
+        freshness_budget_ns,
+        authored
+            ? "ros2_control_measured_diagnostic_v1"
+            : (config.observed_state_authority_profile_id.empty()
+                   ? "ros2_control_measured_v1"
+                   : config.observed_state_authority_profile_id));
+  }
+  return sources;
+}
+
+std::vector<core::ObservedRobotStateSourceConfig>
+ros2_control_addressed_state_sources(
+    const Ros2ControlExecutionBackendConfig& config) {
+  auto sources = ros2_control_observed_state_sources(config);
+  const bool authored = config.execution_state_source_mode == "commanded_sim" ||
+                        config.execution_state_source_mode == "authored_preview";
+  if (authored && sources.size() > 1U) {
+    sources.erase(sources.begin() + 1, sources.end());
+  }
+  return sources;
+}
+
+std::vector<core::ObservedRobotStateSourceConfig>
+ros2_control_diagnostic_state_sources(
+    const Ros2ControlExecutionBackendConfig& config) {
+  auto sources = ros2_control_observed_state_sources(config);
+  const bool authored = config.execution_state_source_mode == "commanded_sim" ||
+                        config.execution_state_source_mode == "authored_preview";
+  if (!authored) {
+    return {};
+  }
+  sources.erase(sources.begin());
+  return sources;
+}
+
 namespace {
 
 bool soft_on_path_capability_config_valid(

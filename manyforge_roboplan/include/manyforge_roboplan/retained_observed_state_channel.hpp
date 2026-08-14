@@ -6,6 +6,7 @@
 #include <mutex>
 #include <span>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include <manyforge_core/addressed_observed_state_publication.hpp>
@@ -15,11 +16,30 @@
 namespace manyforge::roboplan_backend {
 
 struct RetainedObservedStateChannelConfig final {
+  RetainedObservedStateChannelConfig() = default;
+
+  RetainedObservedStateChannelConfig(
+      core::ObservedStateSourceKind selected_source_kind,
+      std::string selected_source_id,
+      std::int64_t selected_freshness_budget_ns,
+      std::uint64_t selected_authority_generation,
+      std::vector<core::ObservedRobotStateSourceConfig>
+          selected_source_precedence = {})
+      : source_kind(selected_source_kind),
+        source_id(std::move(selected_source_id)),
+        freshness_budget_ns(selected_freshness_budget_ns),
+        authority_generation(selected_authority_generation),
+        source_precedence(std::move(selected_source_precedence)) {}
+
   core::ObservedStateSourceKind source_kind{
       core::ObservedStateSourceKind::kPredictedState};
   std::string source_id;
   std::int64_t freshness_budget_ns{};
   std::uint64_t authority_generation{1U};
+  /// Optional exact authority-compatible source precedence. Empty preserves
+  /// the native single-source default. Measured diagnostic sources belonging
+  /// to a commanded adapter are intentionally not valid here.
+  std::vector<core::ObservedRobotStateSourceConfig> source_precedence;
 };
 
 /// One exact native state-authority channel for a sealed runtime participant.
@@ -118,6 +138,10 @@ public:
   [[nodiscard]] const core::AddressedObservedStatePublication &
   publication() const noexcept {
     return publication_;
+  }
+  [[nodiscard]] core::ObservedRobotStatePublication &
+  numeric_publication_writer() noexcept {
+    return publication_.numeric_publication_writer();
   }
   [[nodiscard]] const core::AddressedObservedStatePublication *
   addressed_publication() const noexcept override {

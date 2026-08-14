@@ -367,7 +367,8 @@ Ros2ControlExecutionBackend::Ros2ControlExecutionBackend(
     std::shared_ptr<core::IExecutionStateSink> execution_state_sink,
     std::string group_name, core::IClock &clock, core::IScheduler &scheduler,
     Ros2ControlExecutionBackendConfig config)
-    : Ros2ControlExecutionBackend(false, std::move(execution_state_sink),
+    : Ros2ControlExecutionBackend(false, nullptr,
+                                  std::move(execution_state_sink),
                                   std::move(group_name), clock, scheduler,
                                   std::move(config)) {}
 
@@ -376,12 +377,25 @@ Ros2ControlExecutionBackend::Ros2ControlExecutionBackend(
     std::shared_ptr<core::IExecutionStateSink> execution_state_sink,
     std::string group_name, core::IClock &clock, core::IScheduler &scheduler,
     Ros2ControlExecutionBackendConfig config)
-    : Ros2ControlExecutionBackend(true, std::move(execution_state_sink),
+    : Ros2ControlExecutionBackend(true, nullptr,
+                                  std::move(execution_state_sink),
+                                  std::move(group_name), clock, scheduler,
+                                  std::move(config)) {}
+
+Ros2ControlExecutionBackend::Ros2ControlExecutionBackend(
+    DeferredRosExecutorStartTag,
+    core::ObservedRobotStatePublication &addressed_state_publication,
+    std::shared_ptr<core::IExecutionStateSink> execution_state_sink,
+    std::string group_name, core::IClock &clock, core::IScheduler &scheduler,
+    Ros2ControlExecutionBackendConfig config)
+    : Ros2ControlExecutionBackend(true, &addressed_state_publication,
+                                  std::move(execution_state_sink),
                                   std::move(group_name), clock, scheduler,
                                   std::move(config)) {}
 
 Ros2ControlExecutionBackend::Ros2ControlExecutionBackend(
     bool defer_ros_executor_start,
+    core::ObservedRobotStatePublication *addressed_state_publication,
     std::shared_ptr<core::IExecutionStateSink> execution_state_sink,
     std::string group_name, core::IClock &clock, core::IScheduler &scheduler,
     Ros2ControlExecutionBackendConfig config)
@@ -394,7 +408,12 @@ Ros2ControlExecutionBackend::Ros2ControlExecutionBackend(
     throw std::invalid_argument("execution state sink must not be null");
   }
   validate_config();
-  initialize_observed_state_publication();
+  if (addressed_state_publication == nullptr) {
+    initialize_observed_state_publication();
+  } else {
+    observed_state_publication_ = addressed_state_publication;
+    validate_injected_observed_state_publication();
+  }
   initialize_execution_progress_publication();
   initialize_scene_projection_worker();
   initialize_dispatch_admission();
@@ -784,48 +803,35 @@ core::ExecutionHandle Ros2ControlExecutionBackend::DispatchResume(
 }
 
 void Ros2ControlExecutionBackend::initialize_observed_state_publication() {
-  const bool authored = uses_authored_backend_state();
-  const auto budget_ns = static_cast<std::int64_t>(
-      config_.joint_state_max_age_s * 1'000'000'000.0);
-  std::vector<core::ObservedRobotStateSourceConfig> sources;
-  sources.reserve(config_.observed_state_source_precedence.size() +
-                  (authored ? 1u : 0u));
-  if (authored) {
-    const bool commanded_sim = is_commanded_sim_mode();
-    sources.emplace_back(
-        commanded_sim ? core::ObservedRobotStateSourceKind::kCommandedState
-                      : core::ObservedRobotStateSourceKind::kPredictedState,
-        commanded_sim ? "commanded_state" : "authored_preview_state",
-        core::ObservedRobotStateAuthorityProfile::kCommandedSimulation,
-        /*budget_ns=*/0,
-        config_.observed_state_authority_profile_id.empty()
-            ? (commanded_sim ? "ros2_control_commanded_sim_v1"
-                             : "ros2_control_authored_preview_v1")
-            : config_.observed_state_authority_profile_id);
+  if (uses_authored_backend_state()) {
     authored_at_rest_velocities_.assign(config_.required_joints.size(), 0.0);
   }
-  for (const auto &name : config_.observed_state_source_precedence) {
-    core::ObservedRobotStateSourceKind kind;
-    if (name == "action_feedback") {
-      kind = core::ObservedRobotStateSourceKind::kActionFeedback;
-    } else if (name == "controller_state") {
-      kind = core::ObservedRobotStateSourceKind::kControllerState;
-    } else {
-      kind = core::ObservedRobotStateSourceKind::kJointState;
-    }
-    auto source = core::ObservedRobotStateSourceConfig{
-        kind, name, core::ObservedRobotStateAuthorityProfile::kMeasured,
-        budget_ns};
-    source.authority_profile_id =
-        authored ? "ros2_control_measured_diagnostic_v1"
-                 : (config_.observed_state_authority_profile_id.empty()
-                        ? "ros2_control_measured_v1"
-                        : config_.observed_state_authority_profile_id);
-    sources.push_back(std::move(source));
-  }
-  observed_state_publication_ =
+  owned_observed_state_publication_ =
       std::make_unique<core::ObservedRobotStatePublication>(
-          config_.required_joints, std::move(sources));
+          config_.required_joints, ros2_control_observed_state_sources(config_));
+  observed_state_publication_ = owned_observed_state_publication_.get();
+}
+
+void Ros2ControlExecutionBackend::validate_injected_observed_state_publication() {
+  if (observed_state_publication_ == nullptr ||
+      !std::equal(observed_state_publication_->canonical_joint_names().begin(),
+                  observed_state_publication_->canonical_joint_names().end(),
+                  config_.required_joints.begin(), config_.required_joints.end()) ||
+      observed_state_publication_->source_configs() !=
+          ros2_control_addressed_state_sources(config_)) {
+    throw std::invalid_argument(
+        "injected observed-state publication differs from the backend config");
+  }
+  if (uses_authored_backend_state()) {
+    authored_at_rest_velocities_.assign(config_.required_joints.size(), 0.0);
+  }
+  const auto diagnostic_sources =
+      ros2_control_diagnostic_state_sources(config_);
+  if (!diagnostic_sources.empty()) {
+    diagnostic_observed_state_publication_ =
+        std::make_unique<core::ObservedRobotStatePublication>(
+            config_.required_joints, diagnostic_sources);
+  }
 }
 
 void Ros2ControlExecutionBackend::initialize_execution_progress_publication() {
@@ -895,9 +901,14 @@ void Ros2ControlExecutionBackend::publish_observed_robot_state(
   if (observed_state_publication_ == nullptr) {
     return;
   }
-  (void)observed_state_publication_->publish(source, joint_names, positions,
-                                             velocities, source_timestamp_ns,
-                                             received_timestamp_ns);
+  auto *publication = observed_state_publication_;
+  if (diagnostic_observed_state_publication_ != nullptr &&
+      source != core::ObservedRobotStateSourceKind::kCommandedState &&
+      source != core::ObservedRobotStateSourceKind::kPredictedState) {
+    publication = diagnostic_observed_state_publication_.get();
+  }
+  (void)publication->publish(source, joint_names, positions, velocities,
+                             source_timestamp_ns, received_timestamp_ns);
 }
 
 bool Ros2ControlExecutionBackend::publish_authored_robot_state(
@@ -2683,6 +2694,24 @@ Ros2ControlExecutionBackend::controller_progress_metrics() const {
         publication_metrics.slot_exhausted_total;
     metrics.observed_state_sources =
         observed_state_publication_->source_metrics();
+  }
+  if (diagnostic_observed_state_publication_ != nullptr) {
+    const auto diagnostic_metrics =
+        diagnostic_observed_state_publication_->metrics();
+    metrics.observed_state_reader_retry_exhausted_total +=
+        diagnostic_metrics.reader_retry_exhausted_total;
+    metrics.observed_state_published_total +=
+        diagnostic_metrics.published_total;
+    metrics.observed_state_rejected_total += diagnostic_metrics.rejected_total;
+    metrics.observed_state_writer_busy_total +=
+        diagnostic_metrics.writer_busy_total;
+    metrics.observed_state_slot_exhausted_total +=
+        diagnostic_metrics.slot_exhausted_total;
+    auto diagnostic_sources =
+        diagnostic_observed_state_publication_->source_metrics();
+    metrics.observed_state_sources.insert(
+        metrics.observed_state_sources.end(), diagnostic_sources.begin(),
+        diagnostic_sources.end());
   }
   metrics.authored_active_publications_total =
       authored_active_publications_total_.load(std::memory_order_relaxed);

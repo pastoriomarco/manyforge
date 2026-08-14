@@ -55,6 +55,9 @@ struct ObservedRobotStateSourceConfig {
   /// only for explicitly qualified commanded/predicted authorities.
   std::int64_t freshness_budget_ns = 0;
   std::string authority_profile_id;
+
+  friend bool operator==(const ObservedRobotStateSourceConfig&,
+                         const ObservedRobotStateSourceConfig&) = default;
 };
 
 struct ObservedRobotStateSnapshotDTO {
@@ -213,6 +216,12 @@ class ObservedRobotStatePublication final {
   }
   [[nodiscard]] ObservedRobotStatePublicationMetrics metrics() const noexcept;
   [[nodiscard]] std::vector<ObservedRobotStateSourceMetrics> source_metrics()
+      const;
+  /// Construction-time source identity in authority-precedence order. This
+  /// bounded NRT readback lets an enclosing addressed owner prove that an
+  /// injected single-writer publication has exactly the adapter's sources;
+  /// mutable lane storage remains private.
+  [[nodiscard]] std::vector<ObservedRobotStateSourceConfig> source_configs()
       const;
 
  private:

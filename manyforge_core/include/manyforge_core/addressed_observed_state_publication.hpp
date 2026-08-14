@@ -56,6 +56,13 @@ class AddressedObservedStatePublication final : public IObservedStateProvider {
   [[nodiscard]] const ObservedRobotStatePublication& numeric_publication() const noexcept {
     return publication_;
   }
+  /// Single-writer construction seam for a retained execution adapter. The
+  /// addressed owner keeps storage and query authority; callers may only
+  /// publish source kinds already sealed into this instance.
+  [[nodiscard]] ObservedRobotStatePublication& numeric_publication_writer()
+      noexcept {
+    return publication_;
+  }
 
  private:
   [[nodiscard]] ObservedStateSnapshotDTO make_snapshot(

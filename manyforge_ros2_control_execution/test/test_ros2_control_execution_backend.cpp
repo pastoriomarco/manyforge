@@ -876,6 +876,75 @@ TEST(Ros2ControlExecutionBackendTest, RejectsNullExecutionStateSink) {
 }
 
 TEST(Ros2ControlExecutionBackendTest,
+     InjectedAddressedPublicationIsTheSoleCommandedStateChannel) {
+  auto config = base_config();
+  config.execution_state_source_mode = "commanded_sim";
+  config.initial_joint_positions_rad = {0.25};
+  core::ObservedRobotStatePublication publication(
+      config.required_joints, ros2_control_addressed_state_sources(config));
+  auto sink = std::make_shared<RecordingExecutionStateSink>();
+  core::FakeClock clock;
+  clock.set(123'000'000);
+  core::ManualScheduler scheduler;
+
+  Ros2ControlExecutionBackend backend(
+      Ros2ControlExecutionBackend::TestingNoRosStartupTag{}, publication, sink,
+      "arm", clock, scheduler, config);
+
+  EXPECT_EQ(backend.observed_robot_state_publication(), &publication);
+  const auto snapshot = publication.snapshot(clock.now());
+  ASSERT_TRUE(snapshot.has_value());
+  EXPECT_EQ(snapshot->source_kind,
+            core::ObservedRobotStateSourceKind::kCommandedState);
+  EXPECT_EQ(snapshot->source_id, "commanded_state");
+  EXPECT_EQ(snapshot->authority_profile,
+            "ros2_control_commanded_sim_v1");
+  ASSERT_EQ(snapshot->positions_rad.size(), 1U);
+  EXPECT_DOUBLE_EQ(snapshot->positions_rad.front(), 0.25);
+
+  backend.testing_store_latest_joint_sample(
+      config.required_joints, {9.0},
+      std::chrono::steady_clock::time_point(std::chrono::milliseconds(124)));
+  const auto after_feedback = publication.snapshot(clock.now());
+  ASSERT_TRUE(after_feedback.has_value());
+  ASSERT_EQ(after_feedback->positions_rad.size(), 1U);
+  EXPECT_DOUBLE_EQ(after_feedback->positions_rad.front(), 0.25);
+  const auto metrics = backend.controller_progress_metrics();
+  EXPECT_EQ(metrics.observed_state_published_total, 2U);
+  ASSERT_EQ(metrics.observed_state_sources.size(), 4U);
+  EXPECT_EQ(metrics.observed_state_sources.front().source_kind,
+            core::ObservedRobotStateSourceKind::kCommandedState);
+  EXPECT_EQ(metrics.observed_state_sources[2].source_kind,
+            core::ObservedRobotStateSourceKind::kJointState);
+  EXPECT_EQ(metrics.observed_state_sources[2].published_total, 1U);
+}
+
+TEST(Ros2ControlExecutionBackendTest,
+     InjectedAddressedPublicationRejectsAnySourceOrJointMismatch) {
+  auto config = base_config();
+  auto sink = std::make_shared<RecordingExecutionStateSink>();
+  core::FakeClock clock;
+  core::ManualScheduler scheduler;
+  core::ObservedRobotStatePublication wrong_joints(
+      {"different_joint"}, ros2_control_addressed_state_sources(config));
+  EXPECT_THROW(
+      Ros2ControlExecutionBackend(
+          Ros2ControlExecutionBackend::TestingNoRosStartupTag{}, wrong_joints,
+          sink, "arm", clock, scheduler, config),
+      std::invalid_argument);
+
+  auto wrong_sources = ros2_control_addressed_state_sources(config);
+  wrong_sources.front().source_id = "different_source";
+  core::ObservedRobotStatePublication wrong_source(config.required_joints,
+                                                    wrong_sources);
+  EXPECT_THROW(
+      Ros2ControlExecutionBackend(
+          Ros2ControlExecutionBackend::TestingNoRosStartupTag{}, wrong_source,
+          sink, "arm", clock, scheduler, config),
+      std::invalid_argument);
+}
+
+TEST(Ros2ControlExecutionBackendTest,
      DirectStageFailsBeforeEffectWhenPreparedGoalMembershipIsUnavailable) {
   auto sink = std::make_shared<RecordingExecutionStateSink>();
   core::FakeClock clock;

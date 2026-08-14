@@ -149,6 +149,7 @@ target_link_libraries(manyforge_roboplan_collision_projection PUBLIC
 
 add_library(manyforge_roboplan_native_state_projection
   src/retained_kinematic_state_projector.cpp
+  src/retained_execution_state_sink.cpp
   src/retained_observed_state_channel.cpp)
 target_include_directories(manyforge_roboplan_native_state_projection PUBLIC
   $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>

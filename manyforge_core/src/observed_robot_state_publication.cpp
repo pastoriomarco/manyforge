@@ -514,6 +514,16 @@ ObservedRobotStatePublication::source_metrics() const {
   return result;
 }
 
+std::vector<ObservedRobotStateSourceConfig>
+ObservedRobotStatePublication::source_configs() const {
+  std::vector<ObservedRobotStateSourceConfig> result;
+  result.reserve(lanes_.size());
+  for (const auto& lane : lanes_) {
+    result.push_back(lane->source);
+  }
+  return result;
+}
+
 std::string ObservedRobotStatePublication::make_joint_order_token(
     std::span<const std::string> joint_names) {
   std::string token;

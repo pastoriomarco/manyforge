@@ -172,6 +172,15 @@ public:
       std::shared_ptr<core::IExecutionStateSink> execution_state_sink,
       std::string group_name, core::IClock &clock, core::IScheduler &scheduler,
       Ros2ControlExecutionBackendConfig config);
+  /// Construct against the numeric channel owned by a retained addressed
+  /// publication. The backend remains its sole writer; construction rejects a
+  /// joint order or source set that differs from the exact backend config.
+  Ros2ControlExecutionBackend(
+      DeferredRosExecutorStartTag,
+      core::ObservedRobotStatePublication &addressed_state_publication,
+      std::shared_ptr<core::IExecutionStateSink> execution_state_sink,
+      std::string group_name, core::IClock &clock, core::IScheduler &scheduler,
+      Ros2ControlExecutionBackendConfig config);
   ~Ros2ControlExecutionBackend() override;
 
   core::PrepareParticipantResultDTO
@@ -201,7 +210,7 @@ public:
   core::ExecutionSnapshot get_execution_snapshot() const override;
   const core::ObservedRobotStatePublication *
   observed_robot_state_publication() const noexcept override {
-    return observed_state_publication_.get();
+    return observed_state_publication_;
   }
   const core::ExecutionProgressPublication *
   execution_progress_publication() const noexcept override {
@@ -332,6 +341,28 @@ public:
     }
     validate_config();
     initialize_observed_state_publication();
+    initialize_execution_progress_publication();
+    initialize_scene_projection_worker();
+    initialize_dispatch_admission();
+    snapshot_.timestamp_ns = clock_.now();
+    initialize_authored_state();
+  }
+
+  Ros2ControlExecutionBackend(
+      TestingNoRosStartupTag,
+      core::ObservedRobotStatePublication &addressed_state_publication,
+      std::shared_ptr<core::IExecutionStateSink> execution_state_sink,
+      std::string group_name, core::IClock &clock, core::IScheduler &scheduler,
+      Ros2ControlExecutionBackendConfig config)
+      : execution_state_sink_(std::move(execution_state_sink)),
+        group_name_(std::move(group_name)), clock_(clock),
+        scheduler_(scheduler), config_(std::move(config)),
+        observed_state_publication_(&addressed_state_publication) {
+    if (!execution_state_sink_) {
+      throw std::invalid_argument("execution state sink must not be null");
+    }
+    validate_config();
+    validate_injected_observed_state_publication();
     initialize_execution_progress_publication();
     initialize_scene_projection_worker();
     initialize_dispatch_admission();
@@ -714,6 +745,7 @@ private:
                     core::ControllerGoalGeneration controller_goal_generation,
                     bool resume_dispatch);
   void initialize_observed_state_publication();
+  void validate_injected_observed_state_publication();
   void initialize_execution_progress_publication();
   void initialize_scene_projection_worker();
   void initialize_dispatch_admission();
@@ -732,6 +764,7 @@ private:
       bool invalidate_before_publish) noexcept;
   Ros2ControlExecutionBackend(
       bool defer_ros_executor_start,
+      core::ObservedRobotStatePublication *addressed_state_publication,
       std::shared_ptr<core::IExecutionStateSink> execution_state_sink,
       std::string group_name, core::IClock &clock, core::IScheduler &scheduler,
       Ros2ControlExecutionBackendConfig config);
@@ -997,7 +1030,10 @@ private:
   std::map<core::ControllerGoalId, PreparedGoalRecord> prepared_goals_;
   const std::string execution_backend_component_epoch_;
   std::unique_ptr<core::ObservedRobotStatePublication>
-      observed_state_publication_;
+      owned_observed_state_publication_;
+  core::ObservedRobotStatePublication *observed_state_publication_{};
+  std::unique_ptr<core::ObservedRobotStatePublication>
+      diagnostic_observed_state_publication_;
   std::unique_ptr<core::ExecutionProgressPublication>
       execution_progress_publication_;
   // Command/predicted authority has one backend-owned writer domain. This leaf

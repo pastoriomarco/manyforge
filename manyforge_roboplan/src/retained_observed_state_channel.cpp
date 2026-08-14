@@ -51,11 +51,15 @@ publication_config(const core::RuntimeParticipantBinding &binding,
         "retained observed-state channel has incomplete source identity");
   }
   const auto profile = authority_profile(context.value().state_authority_class);
+  auto sources = config.source_precedence;
+  if (sources.empty()) {
+    sources.push_back(core::ObservedRobotStateSourceConfig{
+        numeric_source_kind(config.source_kind), config.source_id, profile,
+        config.freshness_budget_ns, "retained_native_state_authority"});
+  }
   return core::AddressedObservedStatePublicationConfig{
       std::move(context.value()),
-      {core::ObservedRobotStateSourceConfig{
-          numeric_source_kind(config.source_kind), config.source_id, profile,
-          config.freshness_budget_ns, "retained_native_state_authority"}},
+      std::move(sources),
       config.authority_generation,
       256U};
 }

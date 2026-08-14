@@ -8,6 +8,7 @@
 #include <manyforge_core/runtime_participant_binding.hpp>
 #include <manyforge_core/time/fake_clock.hpp>
 #include <manyforge_core/time/manual_scheduler.hpp>
+#include <manyforge_roboplan/retained_execution_state_sink.hpp>
 #include <manyforge_roboplan/retained_gripper_command_backend.hpp>
 #include <manyforge_roboplan/roboplan_execution_backend.hpp>
 #include <memory>
@@ -465,6 +466,74 @@ gripper_request(const RuntimeParticipantBinding &binding, double target,
 gripper_limits(const RuntimeParticipantBinding &binding) {
   return RetainedGripperPositionLimits{
       binding.value().resources.front().coordinate_kind, -1.0, 1.0};
+}
+
+TEST(RetainedExecutionStateSinkTest,
+     MotionProjectionNeverRepublishesTheAdapterSuppliedVector) {
+  auto binding = make_binding(CoordinateKind::kAngular, "arm.target");
+  auto channel = std::make_shared<FakeRetainedStateChannel>(
+      binding, std::vector<double>{0.1, 0.2});
+  FakeClock clock;
+  RetainedExecutionStateSink sink(
+      clock, {{binding.value().model_groups.front().compiled_group_name,
+               channel, false}});
+
+  const auto result = sink.apply_group_joint_positions(
+      "arm", {9.0, 8.0}, ExecutionStateUpdateMode::kBestEffort);
+
+  EXPECT_TRUE(result.applied());
+  EXPECT_EQ(channel->publish_calls(), 0);
+  EXPECT_EQ(channel->project_calls(), 1);
+  EXPECT_DOUBLE_EQ(*sink.group_joint_position("arm", "joint_1"), 0.1);
+}
+
+TEST(RetainedExecutionStateSinkTest,
+     ExplicitScalarWriterPublishesAndProjectsOneAddressedState) {
+  auto binding = make_binding(CoordinateKind::kLinear, "gripper.target");
+  auto channel = std::make_shared<FakeRetainedStateChannel>(
+      binding, std::vector<double>{0.0});
+  FakeClock clock;
+  clock.set(123);
+  RetainedExecutionStateSink sink(
+      clock, {{binding.value().model_groups.front().compiled_group_name,
+               channel, true}});
+
+  const auto result = sink.apply_group_joint_position(
+      "gripper", "finger_joint", 0.02,
+      ExecutionStateUpdateMode::kBlocking);
+
+  EXPECT_TRUE(result.applied());
+  EXPECT_EQ(channel->publish_calls(), 1);
+  EXPECT_EQ(channel->project_applied_calls(), 1);
+  EXPECT_DOUBLE_EQ(*sink.group_joint_position("gripper", "finger_joint"),
+                   0.02);
+}
+
+TEST(RetainedExecutionStateSinkTest,
+     BindingShapeAndProjectionBackpressureFailClosed) {
+  auto binding = make_binding(CoordinateKind::kAngular, "arm.target");
+  auto channel = std::make_shared<FakeRetainedStateChannel>(
+      binding, std::vector<double>{0.1, 0.2});
+  FakeClock clock;
+  RetainedExecutionStateSink sink(
+      clock, {{binding.value().model_groups.front().compiled_group_name,
+               channel, false}});
+
+  EXPECT_EQ(sink.apply_group_joint_positions(
+                    "other", {0.1, 0.2},
+                    ExecutionStateUpdateMode::kBlocking)
+                .status,
+            ExecutionStateSinkStatus::kInvalidGroup);
+  EXPECT_EQ(sink.apply_group_joint_positions(
+                    "arm", {0.1}, ExecutionStateUpdateMode::kBlocking)
+                .status,
+            ExecutionStateSinkStatus::kInvalidPositions);
+  channel->make_projection_busy(1);
+  EXPECT_EQ(sink.apply_group_joint_positions(
+                    "arm", {0.1, 0.2},
+                    ExecutionStateUpdateMode::kBestEffort)
+                .status,
+            ExecutionStateSinkStatus::kBusy);
 }
 
 [[nodiscard]] TrajectoryDTO trajectory(const RuntimeParticipantBinding &binding,
