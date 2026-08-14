@@ -1,9 +1,12 @@
 #pragma once
 
+#include <atomic>
 #include <cstdint>
 #include <memory>
+#include <mutex>
 #include <span>
 #include <string>
+#include <vector>
 
 #include <manyforge_core/addressed_observed_state_publication.hpp>
 #include <manyforge_core/runtime_participant_binding.hpp>
@@ -31,95 +34,106 @@ struct RetainedObservedStateChannelConfig final {
 /// this boundary; only an explicitly constructed all-angular compatibility
 /// adapter may expose the historical RobotStateDTO view.
 class IRetainedObservedStateChannel {
- public:
+public:
   virtual ~IRetainedObservedStateChannel() = default;
 
-  [[nodiscard]] virtual RetainedStateProjectionResult publish_state(
-      std::span<const double> positions_si,
-      std::span<const double> velocities_si,
-      std::int64_t source_timestamp_ns,
-      std::int64_t received_timestamp_ns) = 0;
-  [[nodiscard]] virtual RetainedStateProjectionResult project_latest(
-      std::int64_t now_ns, RetainedStateProjectionMode mode) = 0;
+  [[nodiscard]] virtual RetainedStateProjectionResult
+  publish_state(std::span<const double> positions_si,
+                std::span<const double> velocities_si,
+                std::int64_t source_timestamp_ns,
+                std::int64_t received_timestamp_ns) = 0;
+  [[nodiscard]] virtual RetainedStateProjectionResult
+  project_latest(std::int64_t now_ns, RetainedStateProjectionMode mode) = 0;
   [[nodiscard]] virtual RetainedStateProjectionResult publish_and_project(
       std::span<const double> positions_si,
-      std::span<const double> velocities_si,
-      std::int64_t source_timestamp_ns,
-      std::int64_t received_timestamp_ns,
-      RetainedStateProjectionMode mode) = 0;
+      std::span<const double> velocities_si, std::int64_t source_timestamp_ns,
+      std::int64_t received_timestamp_ns, RetainedStateProjectionMode mode) = 0;
   [[nodiscard]] virtual core::Result<core::ObservedStateSnapshotDTO>
   current_state(std::int64_t now_ns) const = 0;
   [[nodiscard]] virtual core::Result<core::ControlledStateDTO>
   current_controlled_state() const = 0;
-  [[nodiscard]] virtual const core::ObservedStateQueryContextDTO&
+  [[nodiscard]] virtual const core::ObservedStateQueryContextDTO &
   query_context() const noexcept = 0;
-  [[nodiscard]] virtual const core::AddressedObservedStatePublication*
+  [[nodiscard]] virtual const core::AddressedObservedStatePublication *
   addressed_publication() const noexcept = 0;
 };
 
 class RetainedObservedStateChannel final
     : public IRetainedObservedStateChannel {
- public:
+public:
   RetainedObservedStateChannel(
       core::RuntimeParticipantBinding binding,
       std::shared_ptr<RetainedKinematicStateProjector> projector,
       RetainedObservedStateChannelConfig config);
 
-  RetainedObservedStateChannel(const RetainedObservedStateChannel&) = delete;
-  RetainedObservedStateChannel& operator=(
-      const RetainedObservedStateChannel&) = delete;
+  RetainedObservedStateChannel(const RetainedObservedStateChannel &) = delete;
+  RetainedObservedStateChannel &
+  operator=(const RetainedObservedStateChannel &) = delete;
 
   /// Seed this channel from the exact retained scene state. This is the only
   /// supported native bootstrap path; callers cannot supply unnamed vectors.
-  [[nodiscard]] RetainedStateProjectionResult initialize_from_projection(
-      std::int64_t timestamp_ns);
+  [[nodiscard]] RetainedStateProjectionResult
+  initialize_from_projection(std::int64_t timestamp_ns);
+
+  /// Rebind this stable physical source to one verified route/configuration
+  /// identity. The caller must hold the Kernel route fence; the channel
+  /// republishes its complete predicted state before exposing the new binding.
+  [[nodiscard]] core::Result<void>
+  RebindRoute(core::RuntimeParticipantBinding binding,
+              std::int64_t transition_time_ns);
 
   /// Publish exact target-order SI values and project them into the shared
   /// retained model. The source kind and target namespace are construction-time
   /// facts and cannot be changed per call.
-  [[nodiscard]] RetainedStateProjectionResult publish_and_project(
-      std::span<const double> positions_si,
-      std::span<const double> velocities_si,
-      std::int64_t source_timestamp_ns,
-      std::int64_t received_timestamp_ns,
-      RetainedStateProjectionMode mode =
-          RetainedStateProjectionMode::kBlocking) override;
+  [[nodiscard]] RetainedStateProjectionResult
+  publish_and_project(std::span<const double> positions_si,
+                      std::span<const double> velocities_si,
+                      std::int64_t source_timestamp_ns,
+                      std::int64_t received_timestamp_ns,
+                      RetainedStateProjectionMode mode =
+                          RetainedStateProjectionMode::kBlocking) override;
 
-  [[nodiscard]] RetainedStateProjectionResult publish_state(
-      std::span<const double> positions_si,
-      std::span<const double> velocities_si,
-      std::int64_t source_timestamp_ns,
-      std::int64_t received_timestamp_ns) override;
-  [[nodiscard]] RetainedStateProjectionResult project_latest(
-      std::int64_t now_ns, RetainedStateProjectionMode mode) override;
+  [[nodiscard]] RetainedStateProjectionResult
+  publish_state(std::span<const double> positions_si,
+                std::span<const double> velocities_si,
+                std::int64_t source_timestamp_ns,
+                std::int64_t received_timestamp_ns) override;
+  [[nodiscard]] RetainedStateProjectionResult
+  project_latest(std::int64_t now_ns,
+                 RetainedStateProjectionMode mode) override;
 
-  [[nodiscard]] core::Result<core::ObservedStateSnapshotDTO> current_state(
-      std::int64_t now_ns) const override;
+  [[nodiscard]] core::Result<core::ObservedStateSnapshotDTO>
+  current_state(std::int64_t now_ns) const override;
   [[nodiscard]] core::Result<core::ControlledStateDTO>
   current_controlled_state() const override;
 
-  [[nodiscard]] const core::RuntimeParticipantBinding& binding()
-      const noexcept {
-    return binding_;
+  [[nodiscard]] const core::RuntimeParticipantBinding &
+  binding() const noexcept {
+    return *current_binding_.load(std::memory_order_acquire);
   }
-  [[nodiscard]] const core::ObservedStateQueryContextDTO& query_context()
-      const noexcept override {
+  [[nodiscard]] const core::ObservedStateQueryContextDTO &
+  query_context() const noexcept override {
     return publication_.query_context();
   }
-  [[nodiscard]] const core::AddressedObservedStatePublication& publication()
-      const noexcept {
+  [[nodiscard]] const core::AddressedObservedStatePublication &
+  publication() const noexcept {
     return publication_;
   }
-  [[nodiscard]] const core::AddressedObservedStatePublication*
+  [[nodiscard]] const core::AddressedObservedStatePublication *
   addressed_publication() const noexcept override {
     return &publication_;
   }
 
- private:
-  core::RuntimeParticipantBinding binding_;
+private:
+  core::RuntimeParticipantBinding initial_binding_;
   std::shared_ptr<RetainedKinematicStateProjector> projector_;
   RetainedObservedStateChannelConfig config_;
   core::AddressedObservedStatePublication publication_;
+  core::ObservedStateQueryContextDTO projection_context_;
+  mutable std::mutex route_rebind_mutex_;
+  std::vector<std::unique_ptr<const core::RuntimeParticipantBinding>>
+      retained_route_bindings_;
+  std::atomic<const core::RuntimeParticipantBinding *> current_binding_;
 };
 
-}  // namespace manyforge::roboplan_backend
+} // namespace manyforge::roboplan_backend

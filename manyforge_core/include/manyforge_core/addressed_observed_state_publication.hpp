@@ -6,6 +6,7 @@
 #include <manyforge_core/ports/iobserved_robot_state_provider.hpp>
 #include <manyforge_core/ports/iobserved_state_provider.hpp>
 #include <memory>
+#include <mutex>
 #include <span>
 #include <vector>
 
@@ -40,9 +41,15 @@ class AddressedObservedStatePublication final : public IObservedStateProvider {
       const ControlBindingId& control_binding_id,
       const ControlBindingRevision& control_binding_revision) const override;
 
-  [[nodiscard]] const ObservedStateQueryContextDTO& query_context() const noexcept {
-    return config_.query_context;
-  }
+  /// Rebind only the route/configuration identity of a commanded or predicted
+  /// source while retaining its exact physical source and numeric channel.
+  /// The latest complete sample is republished at `transition_time_ns` before
+  /// the new context becomes visible. Measured authorities must instead
+  /// publish a fresh measurement through their owning adapter.
+  [[nodiscard]] Result<void> rebind_route_context(ObservedStateQueryContextDTO query_context,
+                                                  std::int64_t transition_time_ns);
+
+  [[nodiscard]] const ObservedStateQueryContextDTO& query_context() const noexcept;
   [[nodiscard]] std::uint64_t authority_generation() const noexcept {
     return config_.authority_generation;
   }
@@ -52,10 +59,14 @@ class AddressedObservedStatePublication final : public IObservedStateProvider {
 
  private:
   [[nodiscard]] ObservedStateSnapshotDTO make_snapshot(
-      const ObservedRobotStatePublication::ReadView& view) const;
+      const ObservedRobotStatePublication::ReadView& view,
+      const ObservedStateQueryContextDTO& context) const;
 
   AddressedObservedStatePublicationConfig config_;
   ObservedRobotStatePublication publication_;
+  mutable std::mutex route_context_mutex_;
+  std::vector<std::unique_ptr<const ObservedStateQueryContextDTO>> retained_route_contexts_;
+  std::atomic<const ObservedStateQueryContextDTO*> current_query_context_;
 };
 
 /// Explicit compatibility adapter for the existing all-angular subordinate

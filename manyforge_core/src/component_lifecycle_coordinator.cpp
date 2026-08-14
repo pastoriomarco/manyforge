@@ -1771,8 +1771,13 @@ class ComponentLifecycleCoordinator::Impl final {
           *runtime->status.resulting_active_control_configuration);
     } catch (...) {
     }
-    if (!publication.ok() ||
-        !VerifyRouteReadinessPublicationReceipt(runtime->status, publication.value()).ok()) {
+    if (!publication.ok()) {
+      ScheduleRoute(runtime);
+      return;
+    }
+    const auto verified_receipt =
+        VerifyRouteReadinessPublicationReceipt(runtime->status, publication.value());
+    if (!verified_receipt.ok()) {
       ScheduleRoute(runtime);
       return;
     }

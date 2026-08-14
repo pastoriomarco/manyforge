@@ -235,6 +235,7 @@ def _error_status(code: str) -> int:
     }:
         return 404
     if "conflict" in code or "stale" in code or "fence" in code or code in {
+        "invalid_state_transition",
         "object_already_exists",
         "program_apply_deployment_not_active",
         "scene_projection_transition_in_progress",

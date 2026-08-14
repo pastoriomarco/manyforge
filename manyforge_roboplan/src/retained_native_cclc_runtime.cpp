@@ -9,6 +9,9 @@
 #include <utility>
 
 #include <manyforge_core/component_lifecycle_plan_catalog_codec.hpp>
+#include <manyforge_core/filesystem_resolved_stop_base_plan_repository.hpp>
+#include <manyforge_core/sqlite_cclc_journal.hpp>
+#include <manyforge_deployment/resolved_stop_base_plan_resolver.hpp>
 #include <manyforge_deployment/verified_controller_lifecycle_expected_domain.hpp>
 #include <manyforge_roboplan/retained_native_controller_lifecycle_port.hpp>
 
@@ -88,6 +91,205 @@ exact_graph_binding(const core::RuntimeParticipantBindingDTO &physical,
          path.provider_runtime_unit_id == binding.provider_runtime_unit_id &&
          path.state_authority_id == binding.state_authority_id &&
          path.state_authority_class == binding.state_authority_class;
+}
+
+[[nodiscard]] bool active_configuration_matches_desired(
+    const core::ActiveControlConfigurationDTO &active,
+    const core::DesiredControlConfigurationDTO &desired) noexcept {
+  if (active.control_domain_id != desired.control_domain_id ||
+      active.control_domain_revision != desired.control_domain_revision ||
+      active.controller_topology_id != desired.controller_topology_id ||
+      active.topology_revision != desired.topology_revision ||
+      active.activation_set_id != desired.activation_set_id ||
+      active.binding_routes.size() != desired.binding_routes.size()) {
+    return false;
+  }
+  for (std::size_t index = 0U; index < active.binding_routes.size(); ++index) {
+    const auto &current = active.binding_routes[index];
+    const auto &candidate = desired.binding_routes[index];
+    if (current.control_binding_id != candidate.control_binding_id ||
+        current.control_binding_revision !=
+            candidate.control_binding_revision ||
+        current.control_route_id != candidate.control_route_id) {
+      return false;
+    }
+  }
+  return true;
+}
+
+[[nodiscard]] core::Result<void> adopt_durable_route_configurations(
+    const deployment::CCLCRuntimeCompositionConfig &config,
+    const deployment::RetainedBundle &retained_bundle,
+    const deployment::IVerifiedRetainedProductArtifactSource &artifact_source,
+    RetainedNativeRuntime &runtime) {
+  try {
+    const auto &bundle = retained_bundle.value();
+    std::set<core::ControllableComponentId> component_ids;
+    std::set<core::ControlDomainId> domain_ids;
+    for (const auto *binding :
+         {&runtime.motion_binding, runtime.gripper_binding.has_value()
+                                       ? &*runtime.gripper_binding
+                                       : nullptr}) {
+      if (binding == nullptr || !binding->value().control_path.has_value()) {
+        continue;
+      }
+      component_ids.insert(binding->value().controllable_component_id);
+      domain_ids.insert(binding->value().control_path->control_domain_id);
+    }
+    if (component_ids.empty() || domain_ids.empty()) {
+      return reject<void>(
+          "native_cclc_restart_scope_empty",
+          "native CCLC restart adoption has no physical route scope");
+    }
+
+    core::SqliteCCLCJournal journal(
+        config.state_root / std::string(core::kCCLCJournalFilename),
+        config.cell_id, config.exact_result_history_capacity,
+        config.terminal_result_bytes_capacity);
+    const auto facts = journal.LoadCurrentSnapshotFacts(
+        std::vector<core::ControllableComponentId>(component_ids.begin(),
+                                                   component_ids.end()),
+        std::vector<core::ControlDomainId>(domain_ids.begin(),
+                                           domain_ids.end()));
+    if (!facts.ok()) {
+      return core::Result<void>::Err(facts.error());
+    }
+
+    core::FilesystemResolvedStopBasePlanRepository repository(
+        config.resolved_stop_plan_root, config.maximum_resolved_stop_plan_count,
+        config.maximum_resolved_stop_plan_bytes,
+        config.maximum_single_resolved_stop_plan_bytes);
+    for (const auto &domain : facts.value().domains) {
+      if (!domain.current_active_control_configuration.has_value()) {
+        continue;
+      }
+      const auto &active = *domain.current_active_control_configuration;
+      const auto desired = std::find_if(
+          bundle.desired_control_configurations.begin(),
+          bundle.desired_control_configurations.end(),
+          [&](const auto &candidate) {
+            return active_configuration_matches_desired(active, candidate);
+          });
+      if (desired == bundle.desired_control_configurations.end()) {
+        return reject<void>(
+            "native_cclc_restart_configuration_not_retained",
+            "durable current route is absent from the active retained bundle");
+      }
+
+      if (active.state == core::ActiveControlConfigurationStateDTO::
+                              kExternalOrUnknownUnreconciled) {
+        auto published =
+            runtime.PublishAndReadBackRouteConfiguration(active, {});
+        if (!published.ok()) {
+          return core::Result<void>::Err(published.error());
+        }
+        continue;
+      }
+      if (active.state !=
+          core::ActiveControlConfigurationStateDTO::kReconciled) {
+        return reject<void>("native_cclc_restart_configuration_invalid",
+                            "durable current route has an unknown state");
+      }
+
+      auto physical = runtime.ReadCurrentPhysicalParticipants(active);
+      if (!physical.ok()) {
+        return core::Result<void>::Err(physical.error());
+      }
+      std::optional<core::RuntimeUnitId> current_source_unit;
+      std::optional<core::RuntimeEpoch> current_source_epoch;
+      for (const auto &participant : physical.value()) {
+        if (!participant.value().control_path.has_value()) {
+          return reject<void>(
+              "native_cclc_restart_source_missing",
+              "durable current route has a participant without a control "
+              "source");
+        }
+        const auto &path = *participant.value().control_path;
+        if (!current_source_unit.has_value()) {
+          current_source_unit = path.provider_runtime_unit_id;
+          current_source_epoch = path.provider_runtime_epoch;
+        } else if (*current_source_unit != path.provider_runtime_unit_id ||
+                   *current_source_epoch != path.provider_runtime_epoch) {
+          return reject<void>(
+              "native_cclc_restart_source_ambiguous",
+              "durable current route spans multiple current source "
+              "incarnations");
+        }
+      }
+      if (!current_source_unit.has_value() ||
+          !current_source_epoch.has_value() ||
+          *current_source_unit != active.source_runtime_unit_id) {
+        return reject<void>(
+            "native_cclc_restart_source_mismatch",
+            "durable current route belongs to another runtime unit");
+      }
+      if (*current_source_epoch != active.source_runtime_epoch) {
+        auto adopted =
+            runtime.AdoptAndReadBackRouteConfigurationPredecessor(active);
+        if (!adopted.ok()) {
+          return core::Result<void>::Err(adopted.error());
+        }
+        continue;
+      }
+
+      const auto expected =
+          deployment::load_verified_controller_lifecycle_expected_domain(
+              retained_bundle, artifact_source, *desired,
+              active.source_runtime_unit_id, active.source_runtime_epoch);
+      std::set<core::ControllableComponentId> contributing_components;
+      for (const auto &route : desired->binding_routes) {
+        const auto *binding = unique_by(
+            bundle.cell_graph.control_bindings, route.control_binding_id,
+            [](const auto &row) { return row.control_binding_id; });
+        if (binding == nullptr || binding->control_binding_revision !=
+                                      route.control_binding_revision) {
+          return reject<void>(
+              "native_cclc_restart_binding_not_retained",
+              "durable current route has no exact retained binding");
+        }
+        contributing_components.insert(binding->controllable_component_id);
+      }
+      std::vector<core::RouteSelectionComponentExpectationDTO>
+          component_expectations;
+      component_expectations.reserve(contributing_components.size());
+      for (const auto &component_id : contributing_components) {
+        const auto fact = std::find_if(
+            facts.value().components.begin(), facts.value().components.end(),
+            [&](const auto &candidate) {
+              return candidate.controllable_component_id == component_id;
+            });
+        if (fact == facts.value().components.end() ||
+            !fact->durable_generation.has_value() ||
+            !fact->current_state.has_value()) {
+          return reject<void>(
+              "native_cclc_restart_lifecycle_fact_missing",
+              "durable current route has no complete lifecycle generation");
+        }
+        component_expectations.push_back(
+            {component_id, *fact->durable_generation, *fact->current_state});
+      }
+
+      auto participants =
+          deployment::resolve_store_and_verify_route_readiness_batch(
+              retained_bundle, artifact_source, expected, active,
+              component_expectations, physical.value(), repository);
+      if (!participants.ok()) {
+        return core::Result<void>::Err(participants.error());
+      }
+      auto published = runtime.PublishAndReadBackRouteConfiguration(
+          active, std::move(participants.value()));
+      if (!published.ok()) {
+        return core::Result<void>::Err(published.error());
+      }
+    }
+    return core::Result<void>::Ok();
+  } catch (const std::exception &error) {
+    return reject<void>("native_cclc_restart_adoption_failed", error.what());
+  } catch (...) {
+    return reject<void>(
+        "native_cclc_restart_adoption_failed",
+        "durable current routes could not be adopted by the new Kernel");
+  }
 }
 
 [[nodiscard]] bool provider_matches_component(
@@ -388,7 +590,11 @@ CreateRetainedNativeCCLCRuntime(
     core::ICCLCKernelRouteConfigurationFencePort &kernel_route_fence_port,
     deployment::IRouteConfigurationKernelPublicationOwner
         &kernel_publication_owner,
-    core::IClock &clock, core::IScheduler &scheduler) {
+    core::IClock &clock, core::IScheduler &scheduler,
+    std::function<
+        core::Result<std::optional<core::ActiveControlConfigurationDTO>>(
+            const core::ControlDomainId &)>
+        kernel_current_configuration_source) {
   if (retained_bundle == nullptr) {
     return reject<std::unique_ptr<deployment::CCLCRuntimeComposition>>(
         "native_cclc_retained_bundle_missing",
@@ -410,7 +616,8 @@ CreateRetainedNativeCCLCRuntime(
       std::move(value.controller_sources), std::move(value.brand_ports),
       std::move(value.controller_ports), std::move(value.source_projections),
       kernel_disable_handoff_port, kernel_route_fence_port,
-      kernel_publication_owner, clock, scheduler);
+      kernel_publication_owner, clock, scheduler,
+      std::move(kernel_current_configuration_source));
 }
 
 core::Result<std::unique_ptr<deployment::CCLCRuntimeComposition>>
@@ -425,12 +632,18 @@ CreateRetainedNativeCCLCRuntime(
     RetainedNativeRuntime &runtime,
     core::ICCLCKernelDisableHandoffPort &kernel_disable_handoff_port,
     core::ICCLCKernelRouteConfigurationFencePort &kernel_route_fence_port) {
-  if (runtime.clock == nullptr || runtime.scheduler == nullptr ||
-      runtime.addressed_kernel == nullptr) {
+  if (retained_bundle == nullptr || runtime.clock == nullptr ||
+      runtime.scheduler == nullptr || runtime.addressed_kernel == nullptr) {
     return reject<std::unique_ptr<deployment::CCLCRuntimeComposition>>(
         "native_cclc_runtime_incomplete",
         "native CCLC requires the stable addressed owner, clock, and "
         "scheduler");
+  }
+  const auto adopted = adopt_durable_route_configurations(
+      config.composition, *retained_bundle, artifact_source, runtime);
+  if (!adopted.ok()) {
+    return core::Result<std::unique_ptr<deployment::CCLCRuntimeComposition>>::
+        Err(adopted.error());
   }
   std::vector<core::RuntimeParticipantBinding> physical_bindings{
       runtime.motion_binding};
@@ -442,7 +655,10 @@ CreateRetainedNativeCCLCRuntime(
       std::move(expected_active_publication), artifact_source,
       lifecycle_catalog_source, std::move(brand_ports),
       std::move(physical_bindings), kernel_disable_handoff_port,
-      kernel_route_fence_port, runtime, *runtime.clock, *runtime.scheduler);
+      kernel_route_fence_port, runtime, *runtime.clock, *runtime.scheduler,
+      [&runtime](const core::ControlDomainId &domain_id) {
+        return runtime.ReadCurrentPublishedRouteConfiguration(domain_id);
+      });
 }
 
 } // namespace manyforge::roboplan_backend

@@ -43,6 +43,8 @@
 #include <manyforge_roboplan/retained_collision_world_projector.hpp>
 #include <manyforge_roboplan/retained_collision_world_publisher.hpp>
 #include <manyforge_roboplan/retained_kinematic_state_projector.hpp>
+#include <manyforge_roboplan/retained_native_cclc_runtime.hpp>
+#include <manyforge_roboplan/retained_native_lifecycle_product.hpp>
 #include <manyforge_roboplan/retained_native_runtime.hpp>
 #include <manyforge_roboplan/retained_planner_scene_projection.hpp>
 #include <manyforge_roboplan/retained_planning_model_stage.hpp>
@@ -3755,6 +3757,14 @@ struct Composition final {
       pick_place_sequence_coordinator;
   std::unique_ptr<core::AddressedPickPlaceExecutionOwner>
       pick_place_execution_owner;
+  std::unique_ptr<component_manager::SqliteActiveBundlePublicationStore>
+      cclc_active_publication_reader;
+  std::unique_ptr<deployment::FilesystemVerifiedRetainedProductArtifactSource>
+      cclc_artifact_source;
+  std::unique_ptr<deployment::FilesystemVerifiedRetainedProviderManifestSource>
+      cclc_provider_manifest_source;
+  std::unique_ptr<RetainedNativeLifecycleProduct> cclc_lifecycle_product;
+  std::unique_ptr<deployment::CCLCRuntimeComposition> cclc_runtime;
 
   Composition(
       std::shared_ptr<const deployment::RetainedBundle> selected_bundle,
@@ -3879,6 +3889,8 @@ struct CompositionBuildInput final {
   core::ActiveBundlePublicationGeneration publication_generation;
   std::shared_ptr<core::ICollisionWorldSnapshotPublisher> collision_publisher;
   collision::ManyForgeCollisionEngine::SharedModelPtr collision_shared_model;
+  std::vector<core::RuntimeParticipantBinding> motion_program_aliases;
+  std::vector<core::RuntimeParticipantBinding> gripper_program_aliases;
   ManagedKernelAdmissionGate *operation_admission_gate{};
   std::shared_ptr<const deployment::ProgramBindingContract> status_program;
   std::shared_ptr<const deployment::ProgramBinding> status_program_binding;
@@ -4212,8 +4224,8 @@ BuildProductComposition(CompositionBuildInput input) {
       direct_control_gripper_binding.value(),
       {},
       {},
-      {},
-      {},
+      std::move(input.motion_program_aliases),
+      std::move(input.gripper_program_aliases),
       scene,
       scene_mutex,
       state_projector,
@@ -4341,7 +4353,8 @@ BuildProductComposition(CompositionBuildInput input) {
 [[nodiscard]] std::unique_ptr<Composition>
 BuildComposition(const HostConfig &config,
                  const core::RequestOwnerEpoch &owner_epoch,
-                 const core::RuntimeEpoch &runtime_epoch) {
+                 const core::RuntimeEpoch &runtime_epoch,
+                 ManagedKernelAdmissionGate *operation_admission_gate) {
   component_manager::SqliteActiveBundlePublicationStore publication_store(
       config.manager_state_root /
           std::string(component_manager::kActiveBundlePublicationStoreFilename),
@@ -4396,6 +4409,84 @@ BuildComposition(const HostConfig &config,
   Require(program != nullptr,
           "Program and exact retained Program Binding disagree");
 
+  const deployment::FilesystemCatalogArtifactStore catalog_store(
+      config.package_root);
+  auto direct_inventory =
+      deployment::compile_direct_control_program_binding_inventory(
+          *bundle, *model_map, catalog_store);
+  Require(direct_inventory.motion.size() == 1U &&
+              direct_inventory.gripper.size() == 1U,
+          "native Program aliases have no sole physical target pair");
+  const auto physical_motion = deployment::resolve_runtime_program_target(
+      *direct_inventory.motion.front(),
+      core::TargetRoleId(std::string(deployment::kDirectControlTargetRoleId)),
+      core::CapabilityId("execution.trajectory.execute"), *bundle, *model_map);
+  const auto physical_gripper = deployment::resolve_runtime_program_target(
+      *direct_inventory.gripper.front(),
+      core::TargetRoleId(std::string(deployment::kDirectControlTargetRoleId)),
+      core::CapabilityId("tool.gripper.command"), *bundle, *model_map);
+  std::vector<deployment::RuntimeProgramTargetBinding> physical_support;
+  const auto &selected_target = program_binding->value().target_role_bindings;
+  const auto selected_motion = deployment::resolve_runtime_program_target(
+      *program_binding, core::TargetRoleId(config.motion_target_role_id),
+      core::CapabilityId("execution.trajectory.execute"), *bundle, *model_map);
+  const auto selected_motion_role = std::find_if(
+      selected_target.begin(), selected_target.end(), [&](const auto &role) {
+        return role.target_role_id ==
+               core::TargetRoleId(config.motion_target_role_id);
+      });
+  Require(selected_motion_role != selected_target.end(),
+          "native Program motion target role is absent");
+  for (const auto &capability : selected_motion_role->capability_bindings) {
+    if (capability.capability_id.value().starts_with("planning.motion.")) {
+      physical_support.push_back(deployment::resolve_runtime_program_target(
+          *program_binding, core::TargetRoleId(config.motion_target_role_id),
+          capability.capability_id, *bundle, *model_map));
+    }
+  }
+  const auto motion_alias = core::verify_runtime_participant_binding(
+      deployment::build_runtime_participant_binding_dto(
+          selected_motion,
+          ActiveFacts(
+              selected_motion,
+              std::span<const deployment::RuntimeProgramTargetBinding>(
+                  physical_support),
+              runtime_epoch,
+              core::ActiveControlConfigurationId("active.i6.native.arm")),
+          std::span<const deployment::RuntimeProgramTargetBinding>(
+              physical_support)));
+  Require(motion_alias.ok(), "native Program motion alias failed verification");
+
+  std::vector<core::RuntimeParticipantBinding> motion_aliases;
+  motion_aliases.push_back(motion_alias.value());
+  std::vector<core::RuntimeParticipantBinding> gripper_aliases;
+  const bool selected_program_has_gripper = std::any_of(
+      selected_target.begin(), selected_target.end(), [](const auto &role) {
+        return std::any_of(role.capability_bindings.begin(),
+                           role.capability_bindings.end(), [](const auto &cap) {
+                             return cap.capability_id.value() ==
+                                    "tool.gripper.command";
+                           });
+      });
+  if (selected_program_has_gripper) {
+    const auto selected_gripper = deployment::resolve_runtime_program_target(
+        *program_binding, core::TargetRoleId(config.gripper_target_role_id),
+        core::CapabilityId("tool.gripper.command"), *bundle, *model_map);
+    const auto gripper_alias = core::verify_runtime_participant_binding(
+        deployment::build_runtime_participant_binding_dto(
+            selected_gripper, ActiveFacts(selected_gripper, {}, runtime_epoch,
+                                          core::ActiveControlConfigurationId(
+                                              "active.i6.native.gripper"))));
+    Require(gripper_alias.ok(),
+            "native Program gripper alias failed verification");
+    gripper_aliases.push_back(gripper_alias.value());
+  }
+  Require(physical_motion.component().controllable_component_id ==
+                  selected_motion.component().controllable_component_id &&
+              physical_gripper.component().controllable_component_id ==
+                  selected_motion.component().controllable_component_id,
+          "native Program aliases cross their physical component");
+
   return BuildProductComposition(CompositionBuildInput{
       config.package_root,
       config.execution_state_root,
@@ -4411,7 +4502,9 @@ BuildComposition(const HostConfig &config,
       receipt.publication_generation,
       {},
       {},
-      nullptr,
+      std::move(motion_aliases),
+      std::move(gripper_aliases),
+      operation_admission_gate,
       std::move(program),
       std::move(program_binding),
       core::TargetRoleId(config.motion_target_role_id),
@@ -4421,6 +4514,82 @@ BuildComposition(const HostConfig &config,
       {},
       {},
   });
+}
+
+void AttachRetainedNativeCCLC(Composition &composition,
+                              const HostConfig &config,
+                              const core::RequestOwnerEpoch &owner_epoch,
+                              ManagedKernelApplyFenceOwner &fence_owner) {
+  Require(composition.runtime != nullptr &&
+              composition.runtime->addressed_kernel != nullptr &&
+              composition.runtime->clock != nullptr &&
+              composition.runtime->scheduler != nullptr &&
+              composition.cclc_runtime == nullptr,
+          "native CCLC attachment requires one stable addressed runtime");
+
+  auto active_publication_reader =
+      std::make_unique<component_manager::SqliteActiveBundlePublicationStore>(
+          config.manager_state_root /
+              std::string(
+                  component_manager::kActiveBundlePublicationStoreFilename),
+          core::CellId(config.cell_id));
+  const auto integrity = active_publication_reader->VerifyIntegrity();
+  Require(integrity.current_generation == composition.publication_generation,
+          "native CCLC active publication changed during composition");
+  auto active_publication =
+      active_publication_reader->ReadActiveBundlePublication(
+          integrity.current_generation);
+  Require(
+      active_publication.ok() && active_publication.value().valid() &&
+          active_publication.value().request.candidate_retained_bundle_id ==
+              composition.bundle->retained_bundle_id() &&
+          active_publication.value().request.candidate_projection_revision ==
+              composition.projection_revision,
+      "native CCLC cannot re-read the exact active product");
+
+  auto artifact_source = std::make_unique<
+      deployment::FilesystemVerifiedRetainedProductArtifactSource>(
+      config.package_root);
+  auto provider_manifest_source = std::make_unique<
+      deployment::FilesystemVerifiedRetainedProviderManifestSource>(
+      config.package_root);
+  std::vector<core::RuntimeParticipantBinding> physical_bindings{
+      composition.runtime->motion_binding};
+  if (composition.runtime->gripper_binding.has_value()) {
+    physical_bindings.push_back(*composition.runtime->gripper_binding);
+  }
+  auto lifecycle_product = RetainedNativeLifecycleProduct::Create(
+      composition.bundle, *provider_manifest_source, physical_bindings,
+      *composition.runtime->clock, 1'000'000'000LL);
+  if (!lifecycle_product.ok()) {
+    Fail("native lifecycle product cannot be composed: " +
+         lifecycle_product.error().message);
+  }
+
+  deployment::CCLCRuntimeCompositionConfig cclc_config{
+      config.execution_state_root,
+      config.execution_state_root,
+      core::CellId(config.cell_id),
+      {owner_epoch, 1024U, 2U, 2U, 10'000'000LL, 30'000'000'000LL,
+       30'000'000'000LL}};
+  auto cclc = CreateRetainedNativeCCLCRuntime(
+      RetainedNativeCCLCRuntimeConfig{std::move(cclc_config), 1'000'000'000LL},
+      composition.bundle, *active_publication_reader,
+      std::move(active_publication.value()), *artifact_source,
+      lifecycle_product.value()->catalog_source(),
+      lifecycle_product.value()->brand_ports(), *composition.runtime,
+      fence_owner, fence_owner);
+  if (!cclc.ok()) {
+    Fail("native CCLC composition failed: " + cclc.error().message);
+  }
+
+  composition.cclc_active_publication_reader =
+      std::move(active_publication_reader);
+  composition.cclc_artifact_source = std::move(artifact_source);
+  composition.cclc_provider_manifest_source =
+      std::move(provider_manifest_source);
+  composition.cclc_lifecycle_product = std::move(lifecycle_product.value());
+  composition.cclc_runtime = std::move(cclc.value());
 }
 
 [[nodiscard]] std::optional<CompositionBuildInput>
@@ -4533,6 +4702,8 @@ TryBuildCurrentManagedCompositionInput(
       receipt.publication_generation,
       std::move(projection),
       std::move(collision_model),
+      {},
+      {},
       &admission_gate,
       {},
       {},
@@ -4730,6 +4901,8 @@ LoadExactManagedCandidateBundle(
       core::ActiveBundlePublicationGeneration(predecessor_generation + 1U),
       std::move(projection),
       std::move(collision_model),
+      {},
+      {},
       &admission_gate,
       {},
       {},
@@ -6329,8 +6502,29 @@ public:
   explicit NativeExecutionHost(HostConfig config)
       : config_(std::move(config)),
         owner_epoch_(RandomToken("execution-host-")),
-        runtime_epoch_(RandomToken("native-runtime-")),
-        composition_(BuildComposition(config_, owner_epoch_, runtime_epoch_)) {
+        runtime_epoch_(RandomToken("native-runtime-")), admission_gate_(),
+        composition_(BuildComposition(config_, owner_epoch_, runtime_epoch_,
+                                      &admission_gate_)) {
+    const auto &runtime_units =
+        composition_->runtime->motion_binding.value().runtime_unit_epochs;
+    Require(runtime_units.size() == 1U,
+            "standalone native host has no sole runtime-unit identity");
+    fence_owner_ = std::make_unique<ManagedKernelApplyFenceOwner>(
+        ManagedKernelApplyFenceOwnerConfig{
+            config_.execution_state_root / "kernel-apply-fence.sqlite3",
+            config_.manager_state_root, config_.package_root,
+            core::CellId(config_.cell_id),
+            runtime_units.front().runtime_unit_id, runtime_epoch_, owner_epoch_,
+            [] {
+              return std::chrono::duration_cast<std::chrono::nanoseconds>(
+                         std::chrono::steady_clock::now().time_since_epoch())
+                  .count();
+            }},
+        admission_gate_);
+    fence_owner_->BindDisableHandoffKernel(
+        *composition_->runtime->addressed_kernel);
+    AttachRetainedNativeCCLC(*composition_, config_, owner_epoch_,
+                             *fence_owner_);
     composition_access_.current = composition_.get();
     command_surface_ = std::make_unique<ExecutionCommandSurface>(
         config_.execution_state_root, composition_access_, owner_epoch_);
@@ -6344,6 +6538,8 @@ private:
   // The development launcher remains one process incarnation while a5.5
   // qualifies and then retires it in favor of the Manager-owned surface.
   core::RuntimeEpoch runtime_epoch_;
+  ManagedKernelAdmissionGate admission_gate_;
+  std::unique_ptr<ManagedKernelApplyFenceOwner> fence_owner_;
   std::unique_ptr<Composition> composition_;
   ExecutionCompositionAccess composition_access_;
   std::unique_ptr<ExecutionCommandSurface> command_surface_;

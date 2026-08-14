@@ -468,6 +468,55 @@ rebase_program_alias(const core::RuntimeParticipantBinding &alias,
   return sealed;
 }
 
+[[nodiscard]] core::Result<core::RuntimeParticipantBinding>
+rebase_runtime_binding_to_predecessor(
+    const core::RuntimeParticipantBinding &binding,
+    const core::ActiveControlConfigurationDTO &configuration) {
+  const auto &value = binding.value();
+  if (!configuration.locally_valid() ||
+      configuration.state !=
+          core::ActiveControlConfigurationStateDTO::kReconciled ||
+      !value.control_path.has_value()) {
+    return route_publication_error<core::RuntimeParticipantBinding>(
+        "route_predecessor_rebind_input_invalid",
+        "durable route predecessor rebind has no exact control path",
+        core::ErrorCode::kInvalidRequest);
+  }
+  const auto &path = *value.control_path;
+  const auto selected =
+      std::find_if(configuration.binding_routes.begin(),
+                   configuration.binding_routes.end(), [&](const auto &row) {
+                     return row.control_binding_id == path.control_binding_id;
+                   });
+  if (path.control_domain_id != configuration.control_domain_id ||
+      path.control_domain_revision != configuration.control_domain_revision ||
+      path.controller_topology_id != configuration.controller_topology_id ||
+      path.topology_revision != configuration.topology_revision ||
+      path.provider_runtime_unit_id != configuration.source_runtime_unit_id ||
+      selected == configuration.binding_routes.end() ||
+      selected->control_binding_revision != path.control_binding_revision) {
+    return route_publication_error<core::RuntimeParticipantBinding>(
+        "route_predecessor_rebind_mismatch",
+        "durable route predecessor crosses its retained runtime binding",
+        core::ErrorCode::kInvalidRequest);
+  }
+  auto candidate = value;
+  candidate.control_path->control_route_id = selected->control_route_id;
+  candidate.control_path->activation_set_id = configuration.activation_set_id;
+  candidate.control_path->active_control_configuration_id =
+      configuration.active_control_configuration_id;
+  candidate.control_path->active_control_configuration_generation =
+      configuration.active_control_configuration_generation;
+  candidate.control_path->runtime_scale_qualification.reset();
+  auto sealed = core::verify_runtime_participant_binding(std::move(candidate));
+  if (!sealed.ok()) {
+    return route_publication_error<core::RuntimeParticipantBinding>(
+        "route_predecessor_rebind_invalid", sealed.error().message,
+        core::ErrorCode::kInvalidRequest);
+  }
+  return sealed;
+}
+
 [[nodiscard]] core::RuntimeParticipantAdmissionResolver
 make_kernel_participant_resolver(
     RetainedRuntimeParticipantResolver binding_resolver,
@@ -664,7 +713,12 @@ create_retained_native_runtime_participants(
           runtime->motion_binding, runtime->scene, runtime->scene_mutex);
   runtime->execution = std::make_unique<RoboPlanExecutionBackend>(
       runtime->motion_binding, runtime->motion_state_channel, *runtime->clock,
-      std::move(config.execution));
+      *runtime->scheduler, std::move(config.execution));
+  if (const auto rebound = runtime->execution->RebindRoute(
+          runtime->motion_binding, runtime->motion_binding_aliases);
+      !rebound.ok()) {
+    throw std::invalid_argument(rebound.error().message);
+  }
 
   if (runtime->gripper_binding.has_value()) {
     const auto &gripper_value = runtime->gripper_binding->value();
@@ -779,12 +833,13 @@ create_retained_native_runtime_participants(
   if (runtime->gripper_binding.has_value()) {
     registrations.push_back(runtime_registration(
         *runtime->gripper_binding, input.gripper_stop_readiness,
-        runtime->participant_engine.get(), nullptr, std::nullopt));
+        runtime->participant_engine.get(), runtime->gripper.get(),
+        std::nullopt));
   }
   for (const auto &alias : runtime->gripper_binding_aliases) {
     registrations.push_back(runtime_registration(
         alias, input.gripper_stop_readiness, runtime->participant_engine.get(),
-        nullptr, std::nullopt));
+        runtime->gripper.get(), std::nullopt));
   }
   std::vector<core::RuntimeParticipantExecutionRegistration>
       physical_registrations;
@@ -795,7 +850,8 @@ create_retained_native_runtime_participants(
   if (runtime->gripper_binding.has_value()) {
     physical_registrations.push_back(runtime_registration(
         *runtime->gripper_binding, input.gripper_stop_readiness,
-        runtime->participant_engine.get(), nullptr, std::nullopt));
+        runtime->participant_engine.get(), runtime->gripper.get(),
+        std::nullopt));
   }
   auto binding_resolver = std::move(input.participant_resolver);
   if (runtime->participant_resolver_factory) {
@@ -865,6 +921,30 @@ RetainedNativeRuntime::ReadCurrentPhysicalParticipants(
   }
   return core::Result<std::vector<core::RuntimeParticipantBinding>>::Ok(
       std::move(result));
+}
+
+core::Result<std::optional<core::ActiveControlConfigurationDTO>>
+RetainedNativeRuntime::ReadCurrentPublishedRouteConfiguration(
+    const core::ControlDomainId &control_domain_id) const {
+  if (addressed_kernel == nullptr) {
+    return route_publication_error<
+        std::optional<core::ActiveControlConfigurationDTO>>(
+        "route_publication_kernel_missing",
+        "native route current-fact read has no stable Kernel owner",
+        core::ErrorCode::kMissingReference);
+  }
+  const auto readback =
+      addressed_kernel->current_runtime_route_configuration(control_domain_id);
+  if (!readback.ok()) {
+    return core::Result<std::optional<core::ActiveControlConfigurationDTO>>::
+        Err(readback.error());
+  }
+  if (!readback.value().has_value()) {
+    return core::Result<std::optional<core::ActiveControlConfigurationDTO>>::Ok(
+        std::nullopt);
+  }
+  return core::Result<std::optional<core::ActiveControlConfigurationDTO>>::Ok(
+      readback.value()->active_configuration);
 }
 
 core::Result<core::RuntimeRouteConfigurationReadbackDTO>
@@ -1031,8 +1111,8 @@ RetainedNativeRuntime::PublishAndReadBackRouteConfiguration(
         execution.get(), motion_runtime_policy));
     if (next_gripper.has_value()) {
       physical_registrations.push_back(runtime_registration(
-          *next_gripper, gripper_readiness, participant_engine.get(), nullptr,
-          std::nullopt));
+          *next_gripper, gripper_readiness, participant_engine.get(),
+          gripper.get(), std::nullopt));
     }
     std::vector<core::RuntimeParticipantExecutionRegistration> registrations =
         physical_registrations;
@@ -1042,9 +1122,9 @@ RetainedNativeRuntime::PublishAndReadBackRouteConfiguration(
           motion_runtime_policy));
     }
     for (const auto &alias : next_gripper_aliases) {
-      registrations.push_back(runtime_registration(alias, gripper_readiness,
-                                                   participant_engine.get(),
-                                                   nullptr, std::nullopt));
+      registrations.push_back(runtime_registration(
+          alias, gripper_readiness, participant_engine.get(), gripper.get(),
+          std::nullopt));
     }
 
     RetainedRuntimeParticipantResolver binding_resolver;
@@ -1071,6 +1151,82 @@ RetainedNativeRuntime::PublishAndReadBackRouteConfiguration(
     }
     auto kernel_resolver = make_kernel_participant_resolver(
         std::move(binding_resolver), physical_registrations);
+
+    const auto transition_time_ns = clock->now();
+    const auto old_motion = motion_binding;
+    const auto old_gripper = gripper_binding;
+    bool motion_rebound = false;
+    bool gripper_rebound = false;
+    const auto rollback_physical_route = [&]() noexcept {
+      try {
+        if (gripper_rebound && old_gripper.has_value() && gripper != nullptr) {
+          const auto now_ns = clock->now();
+          if (gripper_state_channel->RebindRoute(*old_gripper, now_ns).ok()) {
+            static_cast<void>(
+                gripper->RebindRoute(*old_gripper, gripper_state_channel));
+          }
+        }
+        if (motion_rebound && execution != nullptr) {
+          const auto now_ns = clock->now();
+          if (motion_state_channel->RebindRoute(old_motion, now_ns).ok()) {
+            static_cast<void>(
+                execution->RebindRoute(old_motion, motion_binding_aliases));
+          }
+        }
+      } catch (...) {
+      }
+    };
+    if (next_motion.value() != motion_binding.value()) {
+      auto rebound =
+          motion_state_channel->RebindRoute(next_motion, transition_time_ns);
+      if (!rebound.ok()) {
+        return route_publication_error<
+            core::RuntimeRouteConfigurationReadbackDTO>(
+            "route_publication_motion_state_rebind_failed",
+            rebound.error().message);
+      }
+      motion_rebound = true;
+      rebound = execution->RebindRoute(next_motion, next_motion_aliases);
+      if (!rebound.ok()) {
+        rollback_physical_route();
+        return route_publication_error<
+            core::RuntimeRouteConfigurationReadbackDTO>(
+            "route_publication_motion_backend_rebind_failed",
+            rebound.error().message);
+      }
+    }
+    const bool gripper_binding_changed =
+        next_gripper.has_value() != gripper_binding.has_value() ||
+        (next_gripper.has_value() && gripper_binding.has_value() &&
+         next_gripper->value() != gripper_binding->value());
+    if (gripper_binding_changed) {
+      if (!next_gripper.has_value() || !gripper_binding.has_value() ||
+          gripper_state_channel == nullptr || gripper == nullptr) {
+        rollback_physical_route();
+        return route_publication_error<
+            core::RuntimeRouteConfigurationReadbackDTO>(
+            "route_publication_gripper_owner_missing",
+            "native route publication cannot rebind a missing gripper owner");
+      }
+      auto rebound =
+          gripper_state_channel->RebindRoute(*next_gripper, transition_time_ns);
+      if (!rebound.ok()) {
+        rollback_physical_route();
+        return route_publication_error<
+            core::RuntimeRouteConfigurationReadbackDTO>(
+            "route_publication_gripper_state_rebind_failed",
+            rebound.error().message);
+      }
+      gripper_rebound = true;
+      rebound = gripper->RebindRoute(*next_gripper, gripper_state_channel);
+      if (!rebound.ok()) {
+        rollback_physical_route();
+        return route_publication_error<
+            core::RuntimeRouteConfigurationReadbackDTO>(
+            "route_publication_gripper_backend_rebind_failed",
+            rebound.error().message);
+      }
+    }
     auto next_surveillance_sources = stop_surveillance_sources(
         next_motion, motion_readiness, motion_state_channel, next_gripper,
         gripper_readiness, gripper_state_channel);
@@ -1078,6 +1234,7 @@ RetainedNativeRuntime::PublishAndReadBackRouteConfiguration(
       auto valid = RetainedStopSurveillanceOwner::ValidateSources(
           next_surveillance_sources);
       if (!valid.ok()) {
+        rollback_physical_route();
         return route_publication_error<
             core::RuntimeRouteConfigurationReadbackDTO>(
             "route_publication_surveillance_source_invalid",
@@ -1087,6 +1244,7 @@ RetainedNativeRuntime::PublishAndReadBackRouteConfiguration(
     auto published = addressed_kernel->publish_runtime_route_configuration(
         configuration, registrations, kernel_resolver);
     if (!published.ok()) {
+      rollback_physical_route();
       return published;
     }
     auto readback = addressed_kernel->runtime_route_configuration_readback(
@@ -1094,6 +1252,7 @@ RetainedNativeRuntime::PublishAndReadBackRouteConfiguration(
         configuration.active_control_configuration_id,
         configuration.active_control_configuration_generation);
     if (!readback.ok() || readback.value() != published.value()) {
+      rollback_physical_route();
       return route_publication_error<
           core::RuntimeRouteConfigurationReadbackDTO>(
           "route_publication_independent_readback_mismatch",
@@ -1130,6 +1289,284 @@ RetainedNativeRuntime::PublishAndReadBackRouteConfiguration(
     return route_publication_error<core::RuntimeRouteConfigurationReadbackDTO>(
         "route_publication_native_composition_failed",
         "native route publication failed");
+  }
+}
+
+core::Result<core::RuntimeRouteConfigurationReadbackDTO>
+RetainedNativeRuntime::AdoptAndReadBackRouteConfigurationPredecessor(
+    const core::ActiveControlConfigurationDTO &configuration) {
+  if (!configuration.locally_valid() ||
+      configuration.state !=
+          core::ActiveControlConfigurationStateDTO::kReconciled) {
+    return route_publication_error<core::RuntimeRouteConfigurationReadbackDTO>(
+        "route_predecessor_configuration_invalid",
+        "native restart predecessor is not one reconciled configuration",
+        core::ErrorCode::kInvalidRequest);
+  }
+  std::lock_guard lock(route_publication_mutex_);
+  if (addressed_kernel == nullptr || participant_engine == nullptr ||
+      execution == nullptr || motion_state_channel == nullptr ||
+      clock == nullptr) {
+    return route_publication_error<core::RuntimeRouteConfigurationReadbackDTO>(
+        "route_predecessor_runtime_incomplete",
+        "native restart predecessor has no stable runtime owner",
+        core::ErrorCode::kMissingReference);
+  }
+
+  try {
+    auto next_motion = motion_binding;
+    auto next_gripper = gripper_binding;
+    const auto rebase_if_selected =
+        [&](const core::RuntimeParticipantBinding &binding)
+        -> core::Result<core::RuntimeParticipantBinding> {
+      if (!binding.value().control_path.has_value() ||
+          binding.value().control_path->control_domain_id !=
+              configuration.control_domain_id) {
+        return core::Result<core::RuntimeParticipantBinding>::Ok(binding);
+      }
+      return rebase_runtime_binding_to_predecessor(binding, configuration);
+    };
+    auto motion_rebase = rebase_if_selected(motion_binding);
+    if (!motion_rebase.ok()) {
+      return core::Result<core::RuntimeRouteConfigurationReadbackDTO>::Err(
+          motion_rebase.error());
+    }
+    next_motion = std::move(motion_rebase.value());
+    if (gripper_binding.has_value()) {
+      auto gripper_rebase = rebase_if_selected(*gripper_binding);
+      if (!gripper_rebase.ok()) {
+        return core::Result<core::RuntimeRouteConfigurationReadbackDTO>::Err(
+            gripper_rebase.error());
+      }
+      next_gripper = std::move(gripper_rebase.value());
+    }
+
+    const auto current_registration =
+        [&](const core::RuntimeParticipantBinding &binding)
+        -> const core::RuntimeParticipantExecutionRegistration * {
+      const auto found = std::find_if(
+          participant_registrations.begin(), participant_registrations.end(),
+          [&](const auto &candidate) {
+            return candidate.binding.value() == binding.value();
+          });
+      return found == participant_registrations.end() ? nullptr : &*found;
+    };
+    std::optional<core::RuntimeParticipantStopReadiness> motion_readiness;
+    std::optional<core::RuntimeParticipantStopReadiness> gripper_readiness;
+    std::optional<core::RuntimeParticipantPolicySelection>
+        motion_runtime_policy;
+    if (const auto *current = current_registration(motion_binding);
+        current != nullptr) {
+      motion_readiness = current->stop_readiness;
+      motion_runtime_policy = current->runtime_policy;
+    }
+    if (gripper_binding.has_value()) {
+      if (const auto *current = current_registration(*gripper_binding);
+          current != nullptr) {
+        gripper_readiness = current->stop_readiness;
+      }
+    }
+    if (next_motion.value().control_path.has_value() &&
+        next_motion.value().control_path->control_domain_id ==
+            configuration.control_domain_id) {
+      motion_readiness.reset();
+    }
+    if (next_gripper.has_value() &&
+        next_gripper->value().control_path.has_value() &&
+        next_gripper->value().control_path->control_domain_id ==
+            configuration.control_domain_id) {
+      gripper_readiness.reset();
+    }
+
+    std::vector<core::RuntimeParticipantBinding> next_motion_aliases;
+    next_motion_aliases.reserve(motion_binding_aliases.size());
+    for (const auto &alias : motion_binding_aliases) {
+      auto rebound = rebase_program_alias(alias, motion_binding, next_motion);
+      if (!rebound.ok()) {
+        return core::Result<core::RuntimeRouteConfigurationReadbackDTO>::Err(
+            rebound.error());
+      }
+      next_motion_aliases.push_back(std::move(rebound.value()));
+    }
+    std::vector<core::RuntimeParticipantBinding> next_gripper_aliases;
+    next_gripper_aliases.reserve(gripper_binding_aliases.size());
+    if (gripper_binding.has_value() && next_gripper.has_value()) {
+      for (const auto &alias : gripper_binding_aliases) {
+        auto rebound =
+            rebase_program_alias(alias, *gripper_binding, *next_gripper);
+        if (!rebound.ok()) {
+          return core::Result<core::RuntimeRouteConfigurationReadbackDTO>::Err(
+              rebound.error());
+        }
+        next_gripper_aliases.push_back(std::move(rebound.value()));
+      }
+    }
+
+    std::vector<core::RuntimeParticipantExecutionRegistration>
+        physical_registrations;
+    physical_registrations.push_back(runtime_registration(
+        next_motion, motion_readiness, participant_engine.get(),
+        execution.get(), motion_runtime_policy));
+    if (next_gripper.has_value()) {
+      physical_registrations.push_back(runtime_registration(
+          *next_gripper, gripper_readiness, participant_engine.get(),
+          gripper.get(), std::nullopt));
+    }
+    auto registrations = physical_registrations;
+    for (const auto &alias : next_motion_aliases) {
+      registrations.push_back(runtime_registration(
+          alias, motion_readiness, participant_engine.get(), execution.get(),
+          motion_runtime_policy));
+    }
+    for (const auto &alias : next_gripper_aliases) {
+      registrations.push_back(runtime_registration(
+          alias, gripper_readiness, participant_engine.get(), gripper.get(),
+          std::nullopt));
+    }
+
+    RetainedRuntimeParticipantResolver binding_resolver;
+    if (participant_resolver_factory) {
+      std::vector<core::RuntimeParticipantBinding> physical_bindings{
+          next_motion};
+      if (next_gripper.has_value()) {
+        physical_bindings.push_back(*next_gripper);
+      }
+      binding_resolver =
+          participant_resolver_factory(std::move(physical_bindings));
+      if (!binding_resolver) {
+        return route_publication_error<
+            core::RuntimeRouteConfigurationReadbackDTO>(
+            "route_predecessor_resolver_factory_failed",
+            "native predecessor resolver factory returned no resolver");
+      }
+    } else if (participant_resolver) {
+      return route_publication_error<
+          core::RuntimeRouteConfigurationReadbackDTO>(
+          "route_predecessor_resolver_factory_missing",
+          "native predecessor adoption cannot retain a stale resolver");
+    }
+    auto kernel_resolver = make_kernel_participant_resolver(
+        std::move(binding_resolver), physical_registrations);
+
+    const auto transition_time_ns = clock->now();
+    const auto old_motion = motion_binding;
+    const auto old_gripper = gripper_binding;
+    bool motion_rebound = false;
+    bool gripper_rebound = false;
+    const auto rollback = [&]() noexcept {
+      try {
+        if (gripper_rebound && old_gripper.has_value() && gripper != nullptr &&
+            gripper_state_channel != nullptr) {
+          const auto now_ns = clock->now();
+          if (gripper_state_channel->RebindRoute(*old_gripper, now_ns).ok()) {
+            static_cast<void>(
+                gripper->RebindRoute(*old_gripper, gripper_state_channel));
+          }
+        }
+        if (motion_rebound) {
+          const auto now_ns = clock->now();
+          if (motion_state_channel->RebindRoute(old_motion, now_ns).ok()) {
+            static_cast<void>(
+                execution->RebindRoute(old_motion, motion_binding_aliases));
+          }
+        }
+      } catch (...) {
+      }
+    };
+    if (next_motion.value() != motion_binding.value()) {
+      auto rebound =
+          motion_state_channel->RebindRoute(next_motion, transition_time_ns);
+      if (!rebound.ok()) {
+        return core::Result<core::RuntimeRouteConfigurationReadbackDTO>::Err(
+            rebound.error());
+      }
+      motion_rebound = true;
+      rebound = execution->RebindRoute(next_motion, next_motion_aliases);
+      if (!rebound.ok()) {
+        rollback();
+        return core::Result<core::RuntimeRouteConfigurationReadbackDTO>::Err(
+            rebound.error());
+      }
+    }
+    if (next_gripper.has_value() != gripper_binding.has_value() ||
+        (next_gripper.has_value() && gripper_binding.has_value() &&
+         next_gripper->value() != gripper_binding->value())) {
+      if (!next_gripper.has_value() || !gripper_binding.has_value() ||
+          gripper_state_channel == nullptr || gripper == nullptr) {
+        rollback();
+        return route_publication_error<
+            core::RuntimeRouteConfigurationReadbackDTO>(
+            "route_predecessor_gripper_owner_missing",
+            "native predecessor rebind has no gripper owner");
+      }
+      auto rebound =
+          gripper_state_channel->RebindRoute(*next_gripper, transition_time_ns);
+      if (!rebound.ok()) {
+        rollback();
+        return core::Result<core::RuntimeRouteConfigurationReadbackDTO>::Err(
+            rebound.error());
+      }
+      gripper_rebound = true;
+      rebound = gripper->RebindRoute(*next_gripper, gripper_state_channel);
+      if (!rebound.ok()) {
+        rollback();
+        return core::Result<core::RuntimeRouteConfigurationReadbackDTO>::Err(
+            rebound.error());
+      }
+    }
+
+    auto published =
+        addressed_kernel->adopt_runtime_route_configuration_predecessor(
+            configuration, registrations, kernel_resolver);
+    if (!published.ok()) {
+      rollback();
+      return published;
+    }
+    auto readback = addressed_kernel->runtime_route_configuration_readback(
+        configuration.control_domain_id,
+        configuration.active_control_configuration_id,
+        configuration.active_control_configuration_generation);
+    if (!readback.ok() || readback.value() != published.value() ||
+        readback.value().operation_admission_open ||
+        !readback.value().readiness_rows.empty()) {
+      rollback();
+      return route_publication_error<
+          core::RuntimeRouteConfigurationReadbackDTO>(
+          "route_predecessor_readback_mismatch",
+          "native predecessor adoption failed independent closed readback");
+    }
+
+    if (stop_surveillance_owner != nullptr) {
+      auto next_sources = stop_surveillance_sources(
+          next_motion, motion_readiness, motion_state_channel, next_gripper,
+          gripper_readiness, gripper_state_channel);
+      auto valid = RetainedStopSurveillanceOwner::ValidateSources(next_sources);
+      if (!valid.ok()) {
+        throw std::logic_error(
+            "predecessor surveillance source validation failed");
+      }
+      auto replaced =
+          stop_surveillance_owner->ReplaceSources(std::move(next_sources));
+      if (!replaced.ok()) {
+        throw std::logic_error(
+            "predecessor surveillance source replacement failed");
+      }
+    }
+
+    motion_binding = std::move(next_motion);
+    gripper_binding = std::move(next_gripper);
+    motion_binding_aliases = std::move(next_motion_aliases);
+    gripper_binding_aliases = std::move(next_gripper_aliases);
+    participant_registrations = std::move(registrations);
+    participant_resolver = std::move(kernel_resolver);
+    return readback;
+  } catch (const std::exception &exception) {
+    return route_publication_error<core::RuntimeRouteConfigurationReadbackDTO>(
+        "route_predecessor_adoption_failed", exception.what());
+  } catch (...) {
+    return route_publication_error<core::RuntimeRouteConfigurationReadbackDTO>(
+        "route_predecessor_adoption_failed",
+        "native predecessor adoption raised an unknown exception");
   }
 }
 

@@ -6124,7 +6124,8 @@ void ExecutionKernel::execute_worker_finalize_phase(const ExecuteRequestDTO& req
 
 Result<std::shared_ptr<const PreparedOperationParticipantDTO>>
 ExecutionKernel::make_and_prepare_motion_participant(
-    const ExecuteRequestDTO& request, const ExecuteWorkerPlanPhaseResult& plan_phase,
+    const ExecuteRequestDTO& request, const TrajectoryDTO& trajectory,
+    const ExecuteWorkerPlanPhaseResult& plan_phase,
     const ExecuteWorkerValidationPhaseResult& validation_phase,
     const std::shared_ptr<PreparedMotionSession>& prepared_session) {
   const auto reject = [](std::string reason, std::string message) {
@@ -6199,7 +6200,7 @@ ExecutionKernel::make_and_prepare_motion_participant(
   PreparedMotionExecutionDTO payload{
       MoveId(request.move_id),
       std::move(canonical_plan_request),
-      plan_phase.trajectory,
+      trajectory,
       plan_phase.plan_request->start_state,
       PreparedMotionPlanningEvidenceDTO{*plan_phase.planning_result,
                                         plan_phase.plan_request->planning_attempt_index,
@@ -6458,8 +6459,8 @@ void ExecutionKernel::async_execute_worker(
 
     std::shared_ptr<const PreparedOperationParticipantDTO> prepared_participant;
     if (prepared_session) {
-      auto prepared = make_and_prepare_motion_participant(request, plan_phase, validation_phase,
-                                                          prepared_session);
+      auto prepared = make_and_prepare_motion_participant(
+          request, trajectory, plan_phase, validation_phase, prepared_session);
       bool cancelled = false;
       if (prepared.ok()) {
         std::lock_guard lock(prepared_session->mutex);
@@ -7303,7 +7304,8 @@ void ExecutionKernel::async_execute_worker(
                 resume_validation.value().collision_policy_revision,
                 resume_validation.value().collision_decision};
             auto prepared = make_and_prepare_motion_participant(
-                resume_request, resume_plan_phase, resume_validation_phase, prepared_session);
+                resume_request, resumed_trajectory, resume_plan_phase,
+                resume_validation_phase, prepared_session);
             if (!prepared.ok()) {
               fail_resume_closed(prepared.error(), "resume backend preparation failed",
                                  "resume_backend_preparation_failed", false, false);
@@ -7810,7 +7812,10 @@ Result<std::uint64_t> ExecutionKernel::PrepareMotion(
                  "Prepared motion session allocation failed before admission",
                  {{"reason", "prepared_motion_session_allocation_failed"}}});
   }
-  return execute_impl(session->authority.execution_request, std::move(session));
+  // Keep the owner stable while evaluating the request reference. Function
+  // argument evaluation order must not allow moving `session` before the
+  // request argument is formed.
+  return execute_impl(session->authority.execution_request, session);
 }
 
 Result<ResolvedPreparedMotionExecutionSnapshotDTO> ExecutionKernel::ObservePreparedMotion(

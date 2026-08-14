@@ -68,6 +68,13 @@ if(NOT TARGET manyforge_core)
   unset(MANYFORGE_CORE_BUILD_FILESYSTEM_RESOLVED_STOP_BASE_PLAN_REPOSITORY)
 endif()
 
+if(NOT TARGET manyforge_lite6_product)
+  add_subdirectory(
+    "${_MANYFORGE_REPOSITORY_SOURCE_ROOT}/manyforge_lite6_product"
+    "${CMAKE_CURRENT_BINARY_DIR}/manyforge_lite6_product"
+    EXCLUDE_FROM_ALL)
+endif()
+
 # The I6 native projection boundary consumes the ManyForge-owned collision
 # model directly. Build it without its package-local integration suite here;
 # cumulative collision qualification remains owned by the dedicated collision
@@ -155,13 +162,24 @@ target_link_libraries(manyforge_roboplan_native_state_projection PUBLIC
 
 add_library(manyforge_roboplan_native_runtime_support
   src/native_runtime_support.cpp
-  src/retained_native_controller_lifecycle_port.cpp)
+  src/retained_native_controller_lifecycle_port.cpp
+  src/retained_native_brand_lifecycle_port.cpp)
 target_include_directories(manyforge_roboplan_native_runtime_support PUBLIC
   $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
   $<INSTALL_INTERFACE:include>)
 target_link_libraries(manyforge_roboplan_native_runtime_support
   PUBLIC manyforge_core
   PRIVATE Threads::Threads)
+
+add_library(manyforge_roboplan_native_lifecycle_product
+  src/retained_native_lifecycle_product.cpp)
+target_include_directories(manyforge_roboplan_native_lifecycle_product PUBLIC
+  $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+  $<INSTALL_INTERFACE:include>)
+target_link_libraries(manyforge_roboplan_native_lifecycle_product PUBLIC
+  manyforge_roboplan_native_runtime_support
+  manyforge_lite6_product
+  manyforge_deployment)
 
 add_library(manyforge_roboplan_native_gripper
   src/retained_gripper_command_backend.cpp)
@@ -272,6 +290,7 @@ target_include_directories(manyforge_roboplan_native_cclc_runtime PUBLIC
 target_link_libraries(manyforge_roboplan_native_cclc_runtime PUBLIC
   manyforge_roboplan_native_runtime
   manyforge_roboplan_native_runtime_support
+  manyforge_roboplan_native_lifecycle_product
   manyforge::deployment_cclc_runtime_composition)
 
 add_library(manyforge_roboplan_worker_protocol STATIC
@@ -337,6 +356,7 @@ target_compile_definitions(manyforge_native_execution_host PRIVATE
   COAL_DISABLE_HPP_FCL_WARNINGS)
 target_link_libraries(manyforge_native_execution_host PRIVATE
   manyforge_roboplan_managed_kernel_apply_fence
+  manyforge_roboplan_native_cclc_runtime
   manyforge_roboplan_native_runtime
   manyforge_roboplan_process_candidate_client
   manyforge_roboplan_retained_consumer
@@ -400,6 +420,7 @@ if(BUILD_TESTING)
     target_link_libraries(
       manyforge_native_execution_host_pick_place_fixture PRIVATE
       manyforge_roboplan_managed_kernel_apply_fence
+      manyforge_roboplan_native_cclc_runtime
       manyforge_roboplan_native_runtime
       manyforge_roboplan_process_candidate_client
       manyforge_roboplan_retained_consumer
@@ -874,6 +895,7 @@ if(BUILD_TESTING)
       generate_lite6_native_execution_fixture_tool PRIVATE
       manyforge_deployment
       manyforge_component_manager
+      manyforge_lite6_product
       manyforge_core)
 
     set(_MANYFORGE_I6_NATIVE_EXECUTION_FIXTURE_ROOT
@@ -987,6 +1009,53 @@ if(BUILD_TESTING)
       MANYFORGE_I7_STOP_QUALIFIED_FIXTURE_ROOT="${_MANYFORGE_I7_STOP_QUALIFIED_FIXTURE_ROOT}")
     add_dependencies(test_retained_native_cclc_runtime
       manyforge_materialize_stop_qualified_native_execution_fixture)
+
+    # L0.7 production-process fixture. It retains the same executable and
+    # Stop qualification evidence as the focused L0.1 packet, while adding
+    # the complete arm+gripper lifecycle catalogs, runnable Program products,
+    # and two-domain route configuration consumed by the generic native host.
+    set(_MANYFORGE_L07_NATIVE_CCLC_FIXTURE_ROOT
+      "${CMAKE_CURRENT_BINARY_DIR}/lite6_native_cclc_product_fixture")
+    set(_MANYFORGE_L07_NATIVE_CCLC_FIXTURE_MANIFEST
+      "${_MANYFORGE_L07_NATIVE_CCLC_FIXTURE_ROOT}/manifest.json")
+    add_custom_command(
+      OUTPUT "${_MANYFORGE_L07_NATIVE_CCLC_FIXTURE_MANIFEST}"
+      COMMAND
+        "${CMAKE_COMMAND}" -E rm -rf
+        "${_MANYFORGE_L07_NATIVE_CCLC_FIXTURE_ROOT}"
+      COMMAND
+        "${CMAKE_COMMAND}" -E make_directory
+        "${_MANYFORGE_L07_NATIVE_CCLC_FIXTURE_ROOT}"
+      COMMAND
+        "$<TARGET_FILE:generate_lite6_native_execution_fixture_tool>"
+        --output-root "${_MANYFORGE_L07_NATIVE_CCLC_FIXTURE_ROOT}"
+        --fixture-kind cclc-product
+        --stop-implementation-build
+          "${_MANYFORGE_NATIVE_STOP_BUILD_CLOSURE}"
+        --stop-installed-target
+          "$<TARGET_FILE:manyforge_native_execution_host>"
+        --stop-runner-contract
+          "${_MANYFORGE_NATIVE_STOP_RUNNER_CONTRACT}"
+        --stop-runner-executable
+          "$<TARGET_FILE:manyforge_native_stop_qualification_runner>"
+        --stop-implementation-evidence
+          "${_MANYFORGE_NATIVE_STOP_IMPLEMENTATION_EVIDENCE}"
+        --stop-substitution-evidence
+          "${_MANYFORGE_NATIVE_STOP_SUBSTITUTION_EVIDENCE}"
+      DEPENDS
+        generate_lite6_native_execution_fixture_tool
+        manyforge_native_execution_host
+        manyforge_native_stop_qualification_runner
+        "${_MANYFORGE_NATIVE_STOP_BUILD_CLOSURE}"
+        "${_MANYFORGE_NATIVE_STOP_RUNNER_CONTRACT}"
+        "${_MANYFORGE_NATIVE_STOP_IMPLEMENTATION_EVIDENCE}"
+        "${_MANYFORGE_NATIVE_STOP_SUBSTITUTION_EVIDENCE}"
+        "${_MANYFORGE_ROBOPLAN_LITE6_FIXTURE_ROOT}/model.urdf"
+        "${_MANYFORGE_ROBOPLAN_LITE6_FIXTURE_ROOT}/model.srdf"
+        ${_MANYFORGE_ROBOPLAN_LITE6_RESOURCE_INPUTS}
+      VERBATIM)
+    add_custom_target(generate_lite6_native_cclc_product_fixture ALL
+      DEPENDS "${_MANYFORGE_L07_NATIVE_CCLC_FIXTURE_MANIFEST}")
 
     add_executable(test_retained_product_consumer
       src/product_backed_runtime_participant_resolver.cpp
@@ -1176,7 +1245,7 @@ if(BUILD_TESTING)
       native_addressed_execution_process
       PROPERTIES
         ENVIRONMENT
-          "PYTHONPATH=${_MANYFORGE_WORKSPACE_ROOT}/manyforge_behavior:${_MANYFORGE_WORKSPACE_ROOT};LD_LIBRARY_PATH=${_LIB_PATHS};MANYFORGE_NATIVE_EXECUTION_HOST=$<TARGET_FILE:manyforge_native_execution_host>;MANYFORGE_NATIVE_PICK_PLACE_FIXTURE_HOST=$<TARGET_FILE:manyforge_native_execution_host_pick_place_fixture>;MANYFORGE_ROBOPLAN_CANDIDATE_WORKER=$<TARGET_FILE:manyforge_roboplan_candidate_worker>;MANYFORGE_ROBOPLAN_FAKE_WORKER=$<TARGET_FILE:fake_process_candidate_worker>;MANYFORGE_I6_NATIVE_FIXTURE_ROOT=${_MANYFORGE_I6_NATIVE_EXECUTION_FIXTURE_ROOT}"
+          "PYTHONPATH=${_MANYFORGE_WORKSPACE_ROOT}/manyforge_behavior:${_MANYFORGE_WORKSPACE_ROOT};LD_LIBRARY_PATH=${_LIB_PATHS};MANYFORGE_NATIVE_EXECUTION_HOST=$<TARGET_FILE:manyforge_native_execution_host>;MANYFORGE_NATIVE_PICK_PLACE_FIXTURE_HOST=$<TARGET_FILE:manyforge_native_execution_host_pick_place_fixture>;MANYFORGE_ROBOPLAN_CANDIDATE_WORKER=$<TARGET_FILE:manyforge_roboplan_candidate_worker>;MANYFORGE_ROBOPLAN_FAKE_WORKER=$<TARGET_FILE:fake_process_candidate_worker>;MANYFORGE_I6_NATIVE_FIXTURE_ROOT=${_MANYFORGE_L07_NATIVE_CCLC_FIXTURE_ROOT}"
         TIMEOUT 60)
 
   endif()

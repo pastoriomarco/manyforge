@@ -51,7 +51,8 @@ template <typename Value>
       configuration.controller_topology_id != expected.controller_topology_id ||
       configuration.topology_revision != expected.topology_revision ||
       configuration.source_runtime_unit_id != expected.source_runtime_unit_id ||
-      configuration.source_runtime_epoch != expected.source_runtime_epoch ||
+      (configuration.source_runtime_epoch != expected.source_runtime_epoch &&
+       configuration.state != ActiveControlConfigurationStateDTO::kReconciled) ||
       configuration.binding_routes.size() != expected.desired_configuration.binding_routes.size()) {
     return false;
   }

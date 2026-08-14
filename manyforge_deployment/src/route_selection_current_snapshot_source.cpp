@@ -55,13 +55,19 @@ VerifiedRouteSelectionCurrentSnapshotSource::
         core::ActiveBundlePublicationReceiptDTO expected_active_publication,
         core::ICCLCCurrentFactReader &current_fact_reader,
         const IVerifiedRetainedProductArtifactSource &artifact_source,
-        std::vector<ControllerLifecycleSourceOccurrenceDTO> controller_sources)
+        std::vector<ControllerLifecycleSourceOccurrenceDTO> controller_sources,
+        std::function<
+            core::Result<std::optional<core::ActiveControlConfigurationDTO>>(
+                const core::ControlDomainId &)>
+            kernel_current_configuration_source)
     : retained_bundle_(retained_bundle),
       active_publication_reader_(active_publication_reader),
       expected_active_publication_(std::move(expected_active_publication)),
       current_fact_reader_(current_fact_reader),
       artifact_source_(artifact_source),
-      controller_sources_(std::move(controller_sources)) {
+      controller_sources_(std::move(controller_sources)),
+      kernel_current_configuration_source_(
+          std::move(kernel_current_configuration_source)) {
   if (!verify_retained_bundle_identity(retained_bundle_) ||
       !expected_active_publication_.valid() ||
       expected_active_publication_.request.candidate_retained_bundle_id !=
@@ -239,13 +245,32 @@ VerifiedRouteSelectionCurrentSnapshotSource::ReadCurrentRouteSelectionSnapshot(
              core::ComponentLifecycleStateDTO::kDeclared)});
   }
 
-  const auto &active_configuration =
+  auto active_configuration =
       facts.value().domains.front().current_active_control_configuration;
+  if (kernel_current_configuration_source_) {
+    const auto kernel_current =
+        kernel_current_configuration_source_(domain->control_domain_id);
+    if (!kernel_current.ok()) {
+      return core::Result<core::RouteSelectionCurrentSnapshot>::Err(
+          kernel_current.error());
+    }
+    if (active_configuration.has_value() &&
+        kernel_current.value() != active_configuration) {
+      return fail<core::RouteSelectionCurrentSnapshot>(
+          "current_configuration_owner_mismatch",
+          "CCLC durable and Kernel current route facts disagree");
+    }
+    if (!active_configuration.has_value()) {
+      active_configuration = kernel_current.value();
+    }
+  }
   if (active_configuration.has_value() &&
       (active_configuration->source_runtime_unit_id !=
            source->source_runtime_unit_id ||
-       active_configuration->source_runtime_epoch !=
-           source->source_runtime_epoch)) {
+       (active_configuration->source_runtime_epoch !=
+            source->source_runtime_epoch &&
+        active_configuration->state !=
+            core::ActiveControlConfigurationStateDTO::kReconciled))) {
     return fail<core::RouteSelectionCurrentSnapshot>(
         "current_controller_source_mismatch",
         "durable active configuration belongs to another controller source");

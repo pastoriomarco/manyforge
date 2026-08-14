@@ -31,22 +31,13 @@ using core::ErrorDTO;
   return {false, {}, {}, {}, std::move(value)};
 }
 
-[[nodiscard]] bool
-valid_collision_world_content_hash(const std::string_view value) noexcept {
-  return value.size() == 16U &&
-         std::all_of(value.begin(), value.end(), [](const char digit) {
-           return (digit >= '0' && digit <= '9') ||
-                  (digit >= 'a' && digit <= 'f');
-         });
-}
-
 [[nodiscard]] std::optional<ErrorDTO> validate_retained_projection(
     const core::ProjectionLeaseBindingDTO &binding,
     const core::CollisionWorldSnapshotPtr &world,
     const std::shared_ptr<const core::CollisionPolicySnapshot> &policy) {
   if (!binding.valid() || !world || !policy ||
       world->revision.revision_id == 0U ||
-      !valid_collision_world_content_hash(world->revision.content_hash) ||
+      !core::IsExactLowercaseSha256Digest(world->revision.content_hash) ||
       policy->revision.revision_id == 0U ||
       !core::IsExactLowercaseSha256Digest(policy->revision.content_hash)) {
     return error(ErrorCode::kInvalidRequest,

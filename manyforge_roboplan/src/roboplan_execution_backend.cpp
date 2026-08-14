@@ -17,11 +17,343 @@
 #include <utility>
 
 namespace manyforge::roboplan_backend {
+
+namespace detail {
+
+struct MotionIdleHeartbeatState final {
+  std::shared_ptr<IRetainedObservedStateChannel> state_channel;
+  core::IClock *clock{};
+  core::IScheduler *scheduler{};
+  core::Duration period_ns{};
+
+  std::mutex mutex;
+  std::shared_ptr<const std::vector<double>> positions;
+  std::shared_ptr<const std::vector<double>> velocities;
+  std::optional<core::ScheduleHandle> scheduled_handle;
+  std::uint64_t schedule_generation{};
+  int consecutive_busy{};
+  bool enabled{};
+  bool closing{};
+};
+
+} // namespace detail
+
 namespace {
+
+template <typename Available, typename Selected, typename Matches>
+[[nodiscard]] bool is_subset(const std::vector<Available> &available,
+                             const std::vector<Selected> &selected,
+                             Matches matches) noexcept {
+  return std::all_of(selected.begin(), selected.end(), [&](const auto &value) {
+    return std::count_if(available.begin(), available.end(),
+                         [&](const auto &candidate) {
+                           return matches(candidate, value);
+                         }) == 1;
+  });
+}
+
+[[nodiscard]] bool physically_contains_execution_binding(
+    const core::RuntimeParticipantBinding &physical,
+    const core::RuntimeParticipantBinding &selected) noexcept {
+  const auto &available = physical.value();
+  const auto &value = selected.value();
+  return available.retained_bundle_id == value.retained_bundle_id &&
+         available.graph_revision == value.graph_revision &&
+         available.controllable_component_id ==
+             value.controllable_component_id &&
+         available.component_type_id == value.component_type_id &&
+         available.component_type_revision == value.component_type_revision &&
+         available.command_target_id == value.command_target_id &&
+         available.capability_id == value.capability_id &&
+         available.capability_definition_revision ==
+             value.capability_definition_revision &&
+         available.command_schema == value.command_schema &&
+         is_subset(available.model_bindings, value.model_bindings,
+                   [](const auto &left, const auto &right) {
+                     return left.model_instance_id == right.model_instance_id &&
+                            left.model_revision == right.model_revision;
+                   }) &&
+         is_subset(available.model_groups, value.model_groups,
+                   [](const auto &left, const auto &right) {
+                     return left.model_instance_id == right.model_instance_id &&
+                            left.compiled_group_name ==
+                                right.compiled_group_name &&
+                            left.expanded_compiled_joint_names ==
+                                right.expanded_compiled_joint_names;
+                   }) &&
+         is_subset(available.frame_bindings, value.frame_bindings,
+                   [](const auto &left, const auto &right) {
+                     return left.model_instance_id == right.model_instance_id &&
+                            left.model_revision == right.model_revision &&
+                            left.compiled_frame_name ==
+                                right.compiled_frame_name;
+                   }) &&
+         is_subset(available.resources, value.resources,
+                   [](const auto &left, const auto &right) {
+                     return left.resource_id == right.resource_id &&
+                            left.source_joint_name == right.source_joint_name &&
+                            left.compiled_resource_name ==
+                                right.compiled_resource_name &&
+                            left.coordinate_kind == right.coordinate_kind;
+                   }) &&
+         is_subset(available.collision_body_bindings,
+                   value.collision_body_bindings,
+                   [](const auto &left, const auto &right) {
+                     return left.model_instance_id == right.model_instance_id &&
+                            left.model_revision == right.model_revision &&
+                            left.compiled_collision_body_names ==
+                                right.compiled_collision_body_names;
+                   }) &&
+         available.control_path == value.control_path &&
+         available.capability_provider_path == value.capability_provider_path &&
+         is_subset(available.supporting_capability_provider_paths,
+                   value.supporting_capability_provider_paths,
+                   [](const auto &left, const auto &right) {
+                     return left == right;
+                   }) &&
+         available.runtime_unit_epochs == value.runtime_unit_epochs;
+}
 
 constexpr int kTerminalSceneProjectionRetryAttempts = 10;
 constexpr auto kTerminalSceneProjectionRetryDelay =
     std::chrono::milliseconds(20);
+constexpr int kIdleHeartbeatBusyRetryLimit = 10;
+
+struct HeartbeatScheduleAttempt final {
+  std::atomic<bool> callback_admitted{false};
+};
+
+[[nodiscard]] core::TimePoint
+saturating_deadline(const core::TimePoint now,
+                    const core::Duration duration) noexcept {
+  if (duration > 0 &&
+      now > std::numeric_limits<core::TimePoint>::max() - duration) {
+    return std::numeric_limits<core::TimePoint>::max();
+  }
+  return now + duration;
+}
+
+[[nodiscard]] bool schedule_idle_heartbeat(
+    const std::shared_ptr<detail::MotionIdleHeartbeatState> &state,
+    core::TimePoint deadline_ns);
+
+void run_idle_heartbeat(
+    const std::shared_ptr<detail::MotionIdleHeartbeatState> &state,
+    const std::uint64_t schedule_generation,
+    const core::TimePoint scheduled_deadline_ns,
+    const std::shared_ptr<HeartbeatScheduleAttempt> &attempt) noexcept {
+  std::shared_ptr<const std::vector<double>> positions;
+  std::shared_ptr<const std::vector<double>> velocities;
+  core::TimePoint now_ns{};
+  {
+    std::lock_guard lock(state->mutex);
+    if (state->closing || !state->enabled ||
+        state->schedule_generation != schedule_generation) {
+      return;
+    }
+    attempt->callback_admitted.store(true, std::memory_order_release);
+    state->scheduled_handle.reset();
+    now_ns = state->clock->now();
+    if (now_ns < scheduled_deadline_ns || !state->positions ||
+        !state->velocities) {
+      state->enabled = false;
+      return;
+    }
+    positions = state->positions;
+    velocities = state->velocities;
+  }
+
+  RetainedStateProjectionResult published;
+  try {
+    published = state->state_channel->publish_state(*positions, *velocities,
+                                                    now_ns, now_ns);
+  } catch (const std::exception &error) {
+    published = {
+        RetainedStateProjectionStatus::kFailed,
+        core::ErrorDTO{
+            std::string(core::to_string(core::ErrorCode::kInternalError)),
+            "Native motion idle-state heartbeat threw",
+            {{"reason", "native_motion_state_heartbeat_exception"},
+             {"exception", error.what()}}}};
+  } catch (...) {
+    published = {
+        RetainedStateProjectionStatus::kFailed,
+        core::ErrorDTO{
+            std::string(core::to_string(core::ErrorCode::kInternalError)),
+            "Native motion idle-state heartbeat threw",
+            {{"reason", "native_motion_state_heartbeat_exception"}}}};
+  }
+
+  bool schedule_again = false;
+  {
+    std::lock_guard lock(state->mutex);
+    if (state->closing || !state->enabled ||
+        state->schedule_generation != schedule_generation) {
+      return;
+    }
+    if (published.applied()) {
+      state->consecutive_busy = 0;
+      schedule_again = true;
+    } else if (published.status == RetainedStateProjectionStatus::kBusy &&
+               ++state->consecutive_busy < kIdleHeartbeatBusyRetryLimit) {
+      schedule_again = true;
+    } else {
+      // Loss of the owner-issued state source is observable as unavailable
+      // evidence. Do not refresh timestamps or fabricate recovery truth.
+      state->enabled = false;
+    }
+  }
+  if (schedule_again) {
+    (void)schedule_idle_heartbeat(
+        state, saturating_deadline(now_ns, state->period_ns));
+  }
+}
+
+[[nodiscard]] bool schedule_idle_heartbeat(
+    const std::shared_ptr<detail::MotionIdleHeartbeatState> &state,
+    const core::TimePoint deadline_ns) {
+  std::optional<core::ScheduleHandle> old_handle;
+  std::uint64_t schedule_generation{};
+  {
+    std::lock_guard lock(state->mutex);
+    if (state->closing || !state->enabled || !state->positions ||
+        !state->velocities) {
+      return false;
+    }
+    old_handle = state->scheduled_handle;
+    state->scheduled_handle.reset();
+    schedule_generation = ++state->schedule_generation;
+  }
+  if (old_handle.has_value()) {
+    try {
+      state->scheduler->cancel(*old_handle);
+    } catch (...) {
+      // The incremented generation makes a late callback inert.
+    }
+  }
+
+  const std::weak_ptr<detail::MotionIdleHeartbeatState> weak_state = state;
+  const auto attempt = std::make_shared<HeartbeatScheduleAttempt>();
+  core::ScheduleHandle handle{};
+  try {
+    handle = state->scheduler->schedule(
+        deadline_ns,
+        [weak_state, attempt, schedule_generation, deadline_ns]() noexcept {
+          if (const auto retained = weak_state.lock()) {
+            run_idle_heartbeat(retained, schedule_generation, deadline_ns,
+                               attempt);
+          }
+        },
+        core::SchedulerPriority::RuntimeSafety);
+  } catch (...) {
+    if (attempt->callback_admitted.load(std::memory_order_acquire)) {
+      return true;
+    }
+    std::lock_guard lock(state->mutex);
+    if (!state->closing && state->enabled &&
+        state->schedule_generation == schedule_generation) {
+      state->enabled = false;
+    }
+    return false;
+  }
+
+  bool retained = attempt->callback_admitted.load(std::memory_order_acquire);
+  {
+    std::lock_guard lock(state->mutex);
+    if (!state->closing && state->enabled) {
+      if (state->schedule_generation == schedule_generation &&
+          !attempt->callback_admitted.load(std::memory_order_acquire)) {
+        state->scheduled_handle = handle;
+      }
+      retained = true;
+    }
+  }
+  if (!retained) {
+    try {
+      state->scheduler->cancel(handle);
+    } catch (...) {
+      // A stale callback is generation-fenced at entry.
+    }
+  }
+  return retained;
+}
+
+void arm_idle_heartbeat(
+    const std::shared_ptr<detail::MotionIdleHeartbeatState> &state,
+    const std::vector<double> &positions) noexcept {
+  if (!state || positions.empty()) {
+    return;
+  }
+  try {
+    auto retained_positions =
+        std::make_shared<const std::vector<double>>(positions);
+    auto retained_velocities =
+        std::make_shared<const std::vector<double>>(positions.size(), 0.0);
+    {
+      std::lock_guard lock(state->mutex);
+      if (state->closing) {
+        return;
+      }
+      state->positions = std::move(retained_positions);
+      state->velocities = std::move(retained_velocities);
+      state->consecutive_busy = 0;
+      state->enabled = true;
+    }
+    (void)schedule_idle_heartbeat(
+        state, saturating_deadline(state->clock->now(), state->period_ns));
+  } catch (...) {
+    std::lock_guard lock(state->mutex);
+    state->enabled = false;
+  }
+}
+
+void disarm_idle_heartbeat(
+    const std::shared_ptr<detail::MotionIdleHeartbeatState> &state) noexcept {
+  if (!state) {
+    return;
+  }
+  std::optional<core::ScheduleHandle> handle;
+  {
+    std::lock_guard lock(state->mutex);
+    state->enabled = false;
+    ++state->schedule_generation;
+    handle = state->scheduled_handle;
+    state->scheduled_handle.reset();
+  }
+  if (handle.has_value()) {
+    try {
+      state->scheduler->cancel(*handle);
+    } catch (...) {
+    }
+  }
+}
+
+void close_idle_heartbeat(
+    const std::shared_ptr<detail::MotionIdleHeartbeatState> &state) noexcept {
+  if (!state) {
+    return;
+  }
+  std::optional<core::ScheduleHandle> handle;
+  {
+    std::lock_guard lock(state->mutex);
+    state->closing = true;
+    state->enabled = false;
+    ++state->schedule_generation;
+    handle = state->scheduled_handle;
+    state->scheduled_handle.reset();
+  }
+  if (handle.has_value()) {
+    try {
+      state->scheduler->cancel(*handle);
+    } catch (...) {
+    }
+  }
+  try {
+    (void)state->scheduler->drain_for(core::SchedulerPriority::RuntimeSafety,
+                                      std::chrono::seconds(5));
+  } catch (...) {
+  }
+}
 
 double controlled_stop_wait_timeout_s(
     const core::MotionInterruptStopProfileDTO &profile,
@@ -127,16 +459,28 @@ RoboPlanExecutionBackend::RoboPlanExecutionBackend(
     std::shared_ptr<IRetainedObservedStateChannel> state_channel,
     core::IClock &clock, RoboPlanExecutionBackendConfig config)
     : RoboPlanExecutionBackend(std::move(binding), std::move(state_channel),
-                               clock, std::move(config), nullptr) {}
+                               clock, std::move(config), nullptr, nullptr) {}
+
+RoboPlanExecutionBackend::RoboPlanExecutionBackend(
+    core::RuntimeParticipantBinding binding,
+    std::shared_ptr<IRetainedObservedStateChannel> state_channel,
+    core::IClock &clock, core::IScheduler &scheduler,
+    RoboPlanExecutionBackendConfig config)
+    : RoboPlanExecutionBackend(std::move(binding), std::move(state_channel),
+                               clock, std::move(config), &scheduler, nullptr) {}
 
 RoboPlanExecutionBackend::RoboPlanExecutionBackend(
     core::RuntimeParticipantBinding binding,
     std::shared_ptr<IRetainedObservedStateChannel> state_channel,
     core::IClock &clock, RoboPlanExecutionBackendConfig config,
+    core::IScheduler *heartbeat_scheduler,
     detail::INativeStopQualificationProbe *qualification_probe)
-    : binding_(std::move(binding)), state_channel_(std::move(state_channel)),
-      clock_(clock), config_(std::move(config)),
-      qualification_probe_(qualification_probe) {
+    : binding_(std::make_shared<const core::RuntimeParticipantBinding>(
+          std::move(binding))),
+      program_aliases_(std::make_shared<
+                       const std::vector<core::RuntimeParticipantBinding>>()),
+      state_channel_(std::move(state_channel)), clock_(clock),
+      config_(std::move(config)), qualification_probe_(qualification_probe) {
   if (config_.reset_completion_timeout_s <= 0.0 ||
       !std::isfinite(config_.reset_completion_timeout_s)) {
     throw std::invalid_argument(
@@ -177,7 +521,8 @@ RoboPlanExecutionBackend::RoboPlanExecutionBackend(
           "names and finite positive values");
     }
   }
-  const auto &value = binding_.value();
+  const auto retained_binding = binding_.load(std::memory_order_acquire);
+  const auto &value = retained_binding->value();
   if (!state_channel_ || !value.control_path.has_value() ||
       value.model_groups.size() != 1U || value.resources.empty()) {
     throw std::invalid_argument(
@@ -194,7 +539,7 @@ RoboPlanExecutionBackend::RoboPlanExecutionBackend(
     }
   }
   auto expected_context = core::make_observed_state_query_context(
-      binding_, state_channel_->query_context().freshness_budget_ns);
+      *retained_binding, state_channel_->query_context().freshness_budget_ns);
   if (!expected_context.ok() ||
       expected_context.value() != state_channel_->query_context()) {
     throw std::invalid_argument(
@@ -208,10 +553,44 @@ RoboPlanExecutionBackend::RoboPlanExecutionBackend(
           "native_predicted_progress_v1",
           /*freshness_budget_ns=*/0);
   state_.snapshot.timestamp_ns = clock_.now();
+  if (heartbeat_scheduler != nullptr) {
+    const auto freshness_budget_ns =
+        state_channel_->query_context().freshness_budget_ns;
+    const auto heartbeat_period_ns =
+        freshness_budget_ns > 1 ? std::min(config_.execution_tick_period_ns,
+                                           freshness_budget_ns / 2)
+                                : config_.execution_tick_period_ns;
+    idle_heartbeat_ = std::make_shared<detail::MotionIdleHeartbeatState>();
+    idle_heartbeat_->state_channel = state_channel_;
+    idle_heartbeat_->clock = &clock_;
+    idle_heartbeat_->scheduler = heartbeat_scheduler;
+    idle_heartbeat_->period_ns =
+        std::max<core::Duration>(1, heartbeat_period_ns);
+  }
+
+  auto controlled = state_channel_->current_controlled_state();
+  if (controlled.ok() &&
+      controlled.value().positions.size() == value.resources.size()) {
+    std::vector<double> positions;
+    positions.reserve(controlled.value().positions.size());
+    bool all_angular = true;
+    for (const auto &position : controlled.value().positions) {
+      const auto *angular = std::get_if<core::AngularPositionDTO>(&position);
+      if (angular == nullptr || !std::isfinite(angular->value_rad)) {
+        all_angular = false;
+        break;
+      }
+      positions.push_back(angular->value_rad);
+    }
+    if (all_angular) {
+      (void)publish_snapshot(core::ExecutionState::kIdle, 0.0, positions);
+    }
+  }
 }
 
 RoboPlanExecutionBackend::~RoboPlanExecutionBackend() {
   stop_terminal_scene_projection_retry_worker();
+  close_idle_heartbeat(idle_heartbeat_);
   (void)reset();
   // jthread auto-joins
 }
@@ -229,11 +608,23 @@ core::PrepareParticipantResultDTO RoboPlanExecutionBackend::Prepare(
     }
     return std::move(result.value());
   };
-  if (const auto field_error =
-          core::prepared_participant_backend_binding_field_error(
-              participant, binding_,
-              core::PreparedParticipantPayloadKindDTO::kMotionExecution)) {
-    return reject(std::string(*field_error));
+  const auto retained_binding = binding_.load(std::memory_order_acquire);
+  const auto binding_error =
+      [&](const core::RuntimeParticipantBinding &binding) {
+        return core::prepared_participant_backend_binding_field_error(
+            participant, binding,
+            core::PreparedParticipantPayloadKindDTO::kMotionExecution);
+      };
+  auto field_error = binding_error(*retained_binding);
+  if (field_error.has_value()) {
+    const auto aliases = program_aliases_.load(std::memory_order_acquire);
+    const auto matched =
+        std::find_if(aliases->begin(), aliases->end(), [&](const auto &alias) {
+          return !binding_error(alias).has_value();
+        });
+    if (matched == aliases->end()) {
+      return reject(std::string(*field_error));
+    }
   }
   const auto &motion =
       std::get<core::PreparedMotionExecutionDTO>(participant.payload);
@@ -289,11 +680,23 @@ core::ExecutionHandle RoboPlanExecutionBackend::dispatch_prepared(
   if (controller_goal_id.empty() || !controller_goal_generation.nonzero()) {
     return rejected("controller_goal_identity_invalid");
   }
-  if (const auto field_error =
-          core::prepared_participant_backend_binding_field_error(
-              participant, binding_,
-              core::PreparedParticipantPayloadKindDTO::kMotionExecution)) {
-    return rejected(std::string(*field_error));
+  const auto retained_binding = binding_.load(std::memory_order_acquire);
+  const auto binding_error =
+      [&](const core::RuntimeParticipantBinding &binding) {
+        return core::prepared_participant_backend_binding_field_error(
+            participant, binding,
+            core::PreparedParticipantPayloadKindDTO::kMotionExecution);
+      };
+  auto field_error = binding_error(*retained_binding);
+  if (field_error.has_value()) {
+    const auto aliases = program_aliases_.load(std::memory_order_acquire);
+    const auto matched =
+        std::find_if(aliases->begin(), aliases->end(), [&](const auto &alias) {
+          return !binding_error(alias).has_value();
+        });
+    if (matched == aliases->end()) {
+      return rejected(std::string(*field_error));
+    }
   }
   const auto prepared_key =
       std::make_tuple(participant.operation_id, participant.operation_revision,
@@ -359,6 +762,13 @@ std::int64_t RoboPlanExecutionBackend::publish_snapshot(
     const std::vector<double> &joint_positions,
     std::optional<core::ErrorDTO> error) {
   const auto timestamp_ns = clock_.now();
+  const bool at_rest_state =
+      state == core::ExecutionState::kIdle ||
+      state == core::ExecutionState::kPaused ||
+      state == core::ExecutionState::kStopped ||
+      state == core::ExecutionState::kCompleted ||
+      state == core::ExecutionState::kFailed ||
+      state == core::ExecutionState::kInterventionRequired;
   {
     std::lock_guard<std::mutex> lock(state_mutex_);
     state_.snapshot.timestamp_ns = timestamp_ns;
@@ -368,18 +778,13 @@ std::int64_t RoboPlanExecutionBackend::publish_snapshot(
     state_.snapshot.joint_positions_rad = joint_positions;
     state_.snapshot.error = std::move(error);
   }
+  disarm_idle_heartbeat(idle_heartbeat_);
   // RT-8C publication is deliberately outside state_mutex_: the RT0 writer
   // has its own bounded preallocated lane and cannot queue behind lifecycle
   // snapshot readers.
+  bool state_published = false;
   if (joint_positions.size() ==
       state_channel_->query_context().joint_names.size()) {
-    const bool at_rest_state =
-        state == core::ExecutionState::kIdle ||
-        state == core::ExecutionState::kPaused ||
-        state == core::ExecutionState::kStopped ||
-        state == core::ExecutionState::kCompleted ||
-        state == core::ExecutionState::kFailed ||
-        state == core::ExecutionState::kInterventionRequired;
     const std::span<const double> velocities =
         at_rest_state ? std::span<const double>(observed_at_rest_velocities_)
                       : std::span<const double>{};
@@ -387,14 +792,20 @@ std::int64_t RoboPlanExecutionBackend::publish_snapshot(
     for (int attempt = 0; attempt < attempts; ++attempt) {
       const auto published = publish_observed_state_authority(
           joint_positions, velocities, timestamp_ns);
-      if (published.applied() ||
-          published.status != RetainedStateProjectionStatus::kBusy) {
+      if (published.applied()) {
+        state_published = true;
+        break;
+      }
+      if (published.status != RetainedStateProjectionStatus::kBusy) {
         break;
       }
       if (attempt + 1 < attempts) {
         std::this_thread::yield();
       }
     }
+  }
+  if (at_rest_state && state_published) {
+    arm_idle_heartbeat(idle_heartbeat_, joint_positions);
   }
   return timestamp_ns;
 }
@@ -509,6 +920,53 @@ RoboPlanExecutionBackend::scene_projection_metrics() const {
         static_cast<std::uint64_t>(now_ns - metrics.last_success_timestamp_ns);
   }
   return metrics;
+}
+
+core::Result<void> RoboPlanExecutionBackend::RebindRoute(
+    core::RuntimeParticipantBinding binding,
+    std::vector<core::RuntimeParticipantBinding> program_aliases) {
+  if (state_.running.load(std::memory_order_acquire) ||
+      controlled_stop_activity_count_.load(std::memory_order_acquire) != 0U) {
+    return core::Result<void>::Err(core::ErrorDTO{
+        std::string(core::to_string(core::ErrorCode::kExecutionRejected)),
+        "native route publication cannot rebind an active motion backend",
+        {{"reason", "native_motion_route_rebind_busy"}}});
+  }
+  auto expected = core::make_observed_state_query_context(
+      binding, state_channel_->query_context().freshness_budget_ns);
+  if (!expected.ok() || expected.value() != state_channel_->query_context()) {
+    return core::Result<void>::Err(core::ErrorDTO{
+        std::string(core::to_string(core::ErrorCode::kInvalidRequest)),
+        "native route publication crosses the motion state authority",
+        {{"reason", "native_motion_route_rebind_mismatch"}}});
+  }
+  if (program_aliases.size() > 64U ||
+      std::any_of(program_aliases.begin(), program_aliases.end(),
+                  [&](const auto &alias) {
+                    return !physically_contains_execution_binding(binding,
+                                                                  alias);
+                  })) {
+    return core::Result<void>::Err(core::ErrorDTO{
+        std::string(core::to_string(core::ErrorCode::kInvalidRequest)),
+        "native execution Program aliases cross the physical backend",
+        {{"reason", "native_motion_program_alias_mismatch"}}});
+  }
+  try {
+    auto retained = std::make_shared<const core::RuntimeParticipantBinding>(
+        std::move(binding));
+    auto retained_aliases =
+        std::make_shared<const std::vector<core::RuntimeParticipantBinding>>(
+            std::move(program_aliases));
+    binding_.store(std::move(retained), std::memory_order_release);
+    program_aliases_.store(std::move(retained_aliases),
+                           std::memory_order_release);
+    return core::Result<void>::Ok();
+  } catch (...) {
+    return core::Result<void>::Err(core::ErrorDTO{
+        std::string(core::to_string(core::ErrorCode::kInternalError)),
+        "native route publication could not retain the motion binding",
+        {{"reason", "native_motion_route_rebind_capacity_unavailable"}}});
+  }
 }
 
 void RoboPlanExecutionBackend::schedule_terminal_scene_projection_retry(
@@ -988,7 +1446,8 @@ RoboPlanExecutionBackend::TranslateStopStage(
         stage, "resolved_stop_stage_budget_invalid",
         "native Stop stage has no valid remaining Kernel budget");
   }
-  const auto &binding = binding_.value();
+  const auto retained_binding = binding_.load(std::memory_order_acquire);
+  const auto &binding = retained_binding->value();
   const auto &path = *binding.control_path;
   std::vector<core::ResourceId> exact_resources;
   exact_resources.reserve(binding.resources.size());
@@ -1904,6 +2363,7 @@ RoboPlanExecutionBackend::resume(const core::TrajectoryDTO &trajectory) {
 core::ResetResultDTO RoboPlanExecutionBackend::reset() {
   const auto reset_timeout =
       std::chrono::duration<double>(config_.reset_completion_timeout_s);
+  auto reset_positions = get_execution_snapshot().joint_positions_rad;
 
   state_.pause_requested.store(false);
   execution_progress_publication_->invalidate();
@@ -1947,7 +2407,21 @@ core::ResetResultDTO RoboPlanExecutionBackend::reset() {
     state_.active_trajectory_time_s = 0.0;
     state_.active_runtime_velocity_scale = 1.0;
   }
-  publish_snapshot(core::ExecutionState::kIdle, 0.0, {});
+  if (reset_positions.empty()) {
+    auto controlled = state_channel_->current_controlled_state();
+    if (controlled.ok()) {
+      reset_positions.reserve(controlled.value().positions.size());
+      for (const auto &position : controlled.value().positions) {
+        const auto *angular = std::get_if<core::AngularPositionDTO>(&position);
+        if (angular == nullptr || !std::isfinite(angular->value_rad)) {
+          reset_positions.clear();
+          break;
+        }
+        reset_positions.push_back(angular->value_rad);
+      }
+    }
+  }
+  publish_snapshot(core::ExecutionState::kIdle, 0.0, reset_positions);
   return core::ResetResultDTO{true, std::nullopt};
 }
 

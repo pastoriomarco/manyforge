@@ -49,8 +49,10 @@ class IResolvedParticipantExecutionEngine {
   virtual Result<void> validate_gripper_command(const GripperCommandRequestDTO& request) const = 0;
   virtual GripperCommandStatusDTO get_gripper_status(const std::string& gripper_id) const = 0;
   /// Cancel or reset the exact subordinate gripper generation without routing
-  /// through the motion state machine. The addressed owner has already
-  /// journaled and generation-fenced the enclosing operation.
+  /// through the motion state machine. Reset is invoked only after the
+  /// addressed owner has either observed an ordinary terminal generation or
+  /// committed an immutable containment certificate. In the latter case the
+  /// backend may already have advanced to a newer idle generation.
   virtual Result<std::uint64_t> stop_gripper(const std::string& gripper_id,
                                              std::uint64_t expected_command_id,
                                              std::uint64_t expected_generation) = 0;

@@ -2183,6 +2183,61 @@ FilesystemVerifiedRetainedProductArtifactSource::
   (void)require_read_only_retention_paths(trusted_package_root_);
 }
 
+FilesystemVerifiedRetainedProviderManifestSource::
+    FilesystemVerifiedRetainedProviderManifestSource(
+        std::filesystem::path trusted_package_root)
+    : trusted_package_root_(posix::normalize_existing_plain_root(
+          trusted_package_root, kPosixErrors, kTrustedRootMessages)) {
+  (void)require_read_only_retention_paths(trusted_package_root_);
+  (void)require_read_only_catalog_data(trusted_package_root_);
+}
+
+std::optional<QualifiedProviderManifest>
+FilesystemVerifiedRetainedProviderManifestSource::get_verified(
+    const RetainedProviderManifestQuery &query) const {
+  const std::filesystem::path current_root = require_unchanged_trusted_root(
+      trusted_package_root_, "read-only retained-provider-manifest");
+  const ReadOnlyRetentionPaths paths =
+      require_read_only_retention_paths(current_root);
+  const auto bundle =
+      read_verified_bundle_entry(paths.bundle_data, query.retained_bundle_id);
+  if (bundle == nullptr) {
+    return std::nullopt;
+  }
+  const core::ProviderManifestCatalogRecordRefDTO *selected = nullptr;
+  for (const auto &record : bundle->value().catalogs.records) {
+    const auto *manifest =
+        std::get_if<core::ProviderManifestCatalogRecordRefDTO>(&record);
+    if (manifest == nullptr ||
+        manifest->record_id != query.provider_manifest_id ||
+        manifest->record_revision != query.provider_manifest_revision) {
+      continue;
+    }
+    if (selected != nullptr) {
+      detail::fail_retained_bundle(
+          "retained provider manifest selection is ambiguous");
+    }
+    selected = manifest;
+  }
+  if (selected == nullptr) {
+    return std::nullopt;
+  }
+  const auto catalog_data = require_read_only_catalog_data(current_root);
+  const std::string bytes = read_verified_catalog_reference(
+      catalog_data, selected->content_addressed_store_key,
+      selected->content_digest, std::nullopt,
+      "selected retained provider manifest");
+  auto qualified = resolve_and_qualify_provider_manifest(
+      *selected, selected->content_addressed_store_key, bytes);
+  if (qualified.value().provider_manifest_id != query.provider_manifest_id ||
+      qualified.value().provider_manifest_revision !=
+          query.provider_manifest_revision) {
+    detail::fail_retained_bundle(
+        "selected retained provider manifest changed identity");
+  }
+  return qualified;
+}
+
 std::optional<VerifiedRetainedProductArtifact>
 FilesystemVerifiedRetainedProductArtifactSource::get_verified(
     const RetainedProductArtifactQuery& query) const {

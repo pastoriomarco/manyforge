@@ -12,6 +12,7 @@
 #include <manyforge_deployment/route_configuration_publication.hpp>
 #include <manyforge_deployment/route_selection_current_snapshot_source.hpp>
 #include <manyforge_deployment/verified_retained_bundle.hpp>
+#include <functional>
 #include <memory>
 #include <vector>
 
@@ -72,7 +73,11 @@ public:
       core::ICCLCKernelDisableHandoffPort &kernel_disable_handoff_port,
       core::ICCLCKernelRouteConfigurationFencePort &kernel_route_fence_port,
       IRouteConfigurationKernelPublicationOwner &kernel_publication_owner,
-      core::IClock &clock, core::IScheduler &scheduler);
+      core::IClock &clock, core::IScheduler &scheduler,
+      std::function<core::Result<
+          std::optional<core::ActiveControlConfigurationDTO>>(
+          const core::ControlDomainId &)>
+          kernel_current_configuration_source = {});
 
   ~CCLCRuntimeComposition();
 
@@ -104,6 +109,10 @@ private:
           controller_ports,
       std::vector<core::KinematicResourceSourceProjectionDTO>
           source_projections,
+      std::function<core::Result<
+          std::optional<core::ActiveControlConfigurationDTO>>(
+          const core::ControlDomainId &)>
+          kernel_current_configuration_source,
       core::ICCLCKernelDisableHandoffPort &kernel_disable_handoff_port,
       core::ICCLCKernelRouteConfigurationFencePort &kernel_route_fence_port,
       IRouteConfigurationKernelPublicationOwner &kernel_publication_owner,

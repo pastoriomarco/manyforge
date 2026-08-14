@@ -1,6 +1,7 @@
 #pragma once
 
 #include <chrono>
+#include <manyforge_core/ports/icontrol_domain_execution_port.hpp>
 #include <manyforge_core/ports/igripper_command_backend.hpp>
 #include <manyforge_core/runtime_participant_binding.hpp>
 #include <manyforge_core/time/iclock.hpp>
@@ -24,39 +25,46 @@ struct RetainedGripperPositionLimits final {
 /// sealed binding, owns progression/deadlines/generation fencing, and writes
 /// unit-tagged state through IRetainedObservedStateChannel.
 class RetainedGripperCommandBackend final
-    : public core::IGripperCommandBackend {
- public:
+    : public core::IGripperCommandBackend,
+      public core::IControlDomainExecutionPort {
+public:
   struct SharedState;
 
   RetainedGripperCommandBackend(
       core::RuntimeParticipantBinding binding,
       std::shared_ptr<IRetainedObservedStateChannel> state_channel,
       std::optional<RetainedGripperPositionLimits> position_limits,
-      core::IClock& clock,
-      core::IScheduler& scheduler,
+      core::IClock &clock, core::IScheduler &scheduler,
       core::Duration update_period_ns = 10'000'000);
   ~RetainedGripperCommandBackend() override;
 
-  RetainedGripperCommandBackend(const RetainedGripperCommandBackend&) = delete;
-  RetainedGripperCommandBackend& operator=(
-      const RetainedGripperCommandBackend&) = delete;
+  RetainedGripperCommandBackend(const RetainedGripperCommandBackend &) = delete;
+  RetainedGripperCommandBackend &
+  operator=(const RetainedGripperCommandBackend &) = delete;
 
   core::Result<void> validate_gripper_command(
-      const core::GripperCommandRequestDTO& request) const override;
-  core::GripperCommandResultDTO command_gripper(
-      const core::GripperCommandRequestDTO& request) override;
-  core::GripperCommandStatusDTO get_gripper_status(
-      const std::string& gripper_id) const override;
+      const core::GripperCommandRequestDTO &request) const override;
+  core::GripperCommandResultDTO
+  command_gripper(const core::GripperCommandRequestDTO &request) override;
+  core::GripperCommandStatusDTO
+  get_gripper_status(const std::string &gripper_id) const override;
   core::GripperCommandResultDTO mark_gripper_grasp_lost(
-      const std::string& gripper_id, std::uint64_t expected_command_id,
-      std::uint64_t expected_generation, const std::string& evidence_label,
-      const std::string& message, const std::string& reason_code) override;
+      const std::string &gripper_id, std::uint64_t expected_command_id,
+      std::uint64_t expected_generation, const std::string &evidence_label,
+      const std::string &message, const std::string &reason_code) override;
   void invalidate_gripper_commands(
       core::GripperInvalidationReason reason) noexcept override;
   void authorize_gripper_commands() noexcept override;
+  [[nodiscard]] core::Result<void>
+  RebindRoute(core::RuntimeParticipantBinding binding,
+              std::shared_ptr<IRetainedObservedStateChannel> state_channel);
+  [[nodiscard]] core::ParticipantStopStageResultDTO
+  TranslateStopStage(const core::ResolvedParticipantStopStageDTO &stage,
+                     const core::RemainingStopBudgetDTO &budget,
+                     std::stop_token cancellation) override;
 
- private:
+private:
   std::shared_ptr<SharedState> state_;
 };
 
-}  // namespace manyforge::roboplan_backend
+} // namespace manyforge::roboplan_backend

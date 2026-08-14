@@ -107,8 +107,9 @@ Result<void> ExecutionKernel::reset_gripper(const std::string& gripper_id,
   }
   const auto before = gripper_command_backend_->get_gripper_status(gripper_id);
   if (before.gripper_id != gripper_id || before.command_id == 0U ||
-      before.command_id != expected_command_id || before.generation != expected_generation ||
-      before.state == GripperCommandState::kExecuting) {
+      before.command_id != expected_command_id || before.generation < expected_generation ||
+      before.state == GripperCommandState::kExecuting ||
+      (before.generation != expected_generation && before.state != GripperCommandState::kIdle)) {
     return Result<void>::Err(ErrorDTO{"stale_gripper_state",
                                       "Gripper identity or lifecycle changed before scoped Reset",
                                       {{"reason", "stale_gripper_state"}}});

@@ -185,6 +185,18 @@ struct RetainedNativeRuntime final
       std::vector<deployment::VerifiedRouteReadinessParticipant> participants)
       override;
 
+  /// Rebind the new in-process runtime to one exact durable predecessor while
+  /// retaining the new provider epoch and keeping operation admission closed.
+  /// CCLC uses this only during owner replacement before it explicitly
+  /// observes and republishes a current-source successor configuration.
+  [[nodiscard]] core::Result<core::RuntimeRouteConfigurationReadbackDTO>
+  AdoptAndReadBackRouteConfigurationPredecessor(
+      const core::ActiveControlConfigurationDTO &configuration);
+
+  [[nodiscard]] core::Result<std::optional<core::ActiveControlConfigurationDTO>>
+  ReadCurrentPublishedRouteConfiguration(
+      const core::ControlDomainId &control_domain_id) const;
+
 private:
   mutable std::mutex route_publication_mutex_;
 };

@@ -2,11 +2,11 @@
 // determinism (sort + hash), sensitivity, count accuracy, mesh flag,
 // shared_ptr wrapping.
 
-#include <manyforge_core/collision/collision_world_snapshot_builder.hpp>
-#include <manyforge_core/execution_collision_support.hpp>
-
 #include <gtest/gtest.h>
 
+#include <manyforge_core/collision/collision_world_snapshot_builder.hpp>
+#include <manyforge_core/execution_collision_support.hpp>
+#include <manyforge_core/types/projection_common.hpp>
 #include <map>
 #include <string>
 #include <type_traits>
@@ -27,22 +27,19 @@ CollisionGeometryDescriptor make_box_geom(const CollisionBodyId& body_id,
   return g;
 }
 
-CollisionWorldBody make_component_body(const std::string& body_role,
-                                       double pose_x = 0.0) {
-  CollisionBodyId body_id =
-      "component/arm/model/arm_model/body/" + body_role + "/collision/0";
+CollisionWorldBody make_component_body(const std::string& body_role, double pose_x = 0.0) {
+  CollisionBodyId body_id = "component/arm/model/arm_model/body/" + body_role + "/collision/0";
   CollisionWorldBody b;
   b.body_id = body_id;
   b.owner_kind = CollisionOwnerKind::kComponentModelBody;
   b.frame_id = "compiled_" + body_role;
   b.pose = Pose3DTO{{pose_x, 0.0, 0.0}, {0.0, 0.0, 0.0, 1.0}};
-  b.geometries.push_back(
-      make_box_geom(body_id, CollisionOwnerKind::kComponentModelBody));
+  b.geometries.push_back(make_box_geom(body_id, CollisionOwnerKind::kComponentModelBody));
   return b;
 }
 
-CollisionWorldBody make_carried_scene_resource(
-    const std::string& resource_id, const CollisionBodyId& parent_body_id) {
+CollisionWorldBody make_carried_scene_resource(const std::string& resource_id,
+                                               const CollisionBodyId& parent_body_id) {
   CollisionBodyId body_id = "scene/" + resource_id + "/shape/0";
   CollisionWorldBody b;
   b.body_id = body_id;
@@ -50,21 +47,18 @@ CollisionWorldBody make_carried_scene_resource(
   b.parent_body_id = parent_body_id;
   b.frame_id = parent_body_id;
   b.pose = Pose3DTO{{0.1, 0.0, 0.0}, {0.0, 0.0, 0.0, 1.0}};
-  b.geometries.push_back(
-      make_box_geom(body_id, CollisionOwnerKind::kSceneResource));
+  b.geometries.push_back(make_box_geom(body_id, CollisionOwnerKind::kSceneResource));
   return b;
 }
 
-CollisionWorldBody make_scene_resource(const std::string& resource_id,
-                                       double pose_x = 1.0) {
+CollisionWorldBody make_scene_resource(const std::string& resource_id, double pose_x = 1.0) {
   CollisionBodyId body_id = "scene/" + resource_id + "/shape/0";
   CollisionWorldBody b;
   b.body_id = body_id;
   b.owner_kind = CollisionOwnerKind::kSceneResource;
   b.frame_id = "world";
   b.pose = Pose3DTO{{pose_x, 0.0, 0.0}, {0.0, 0.0, 0.0, 1.0}};
-  b.geometries.push_back(
-      make_box_geom(body_id, CollisionOwnerKind::kSceneResource));
+  b.geometries.push_back(make_box_geom(body_id, CollisionOwnerKind::kSceneResource));
   return b;
 }
 
@@ -79,8 +73,7 @@ CollisionWorldBody make_runtime_object(const std::string& object_id) {
   b.owner_kind = CollisionOwnerKind::kRuntimeObject;
   b.frame_id = "world";
   b.pose = Pose3DTO{{3.0, 0.0, 0.0}, {0.0, 0.0, 0.0, 1.0}};
-  b.geometries.push_back(
-      make_box_geom(body_id, CollisionOwnerKind::kRuntimeObject));
+  b.geometries.push_back(make_box_geom(body_id, CollisionOwnerKind::kRuntimeObject));
   return b;
 }
 
@@ -91,40 +84,45 @@ CollisionWorldSnapshotBuilder fresh_builder() {
 }
 
 CollisionComponentModelFrame make_component_model_frame(double x = 0.0) {
-  return CollisionComponentModelFrame{
-      ControllableComponentId{"arm"}, ModelInstanceId{"arm_model"},
-      FrameRoleId{"base"}, "base_link", ModelRevision{"model-revision-1"},
-      Pose3DTO{{x, 0.0, 0.0}, {0.0, 0.0, 0.0, 1.0}}};
+  return CollisionComponentModelFrame{ControllableComponentId{"arm"},
+                                      ModelInstanceId{"arm_model"},
+                                      FrameRoleId{"base"},
+                                      "base_link",
+                                      ModelRevision{"model-revision-1"},
+                                      Pose3DTO{{x, 0.0, 0.0}, {0.0, 0.0, 0.0, 1.0}}};
 }
 
 // --- Happy path ---
 
 TEST(CollisionWorldSnapshotBuilder, BuildsMinimalSnapshot) {
-  auto result =
-      fresh_builder().add_body(make_component_body("link1")).build();
+  auto result = fresh_builder().add_body(make_component_body("link1")).build();
   ASSERT_TRUE(result.ok()) << result.error().message;
   const auto snap = result.value();
   EXPECT_EQ(snap.publisher_id, "test_publisher");
   EXPECT_EQ(snap.revision.revision_id, 1u);
-  EXPECT_FALSE(snap.revision.content_hash.empty());
+  EXPECT_TRUE(IsExactLowercaseSha256Digest(snap.revision.content_hash));
   EXPECT_EQ(snap.body_count, 1);
   EXPECT_TRUE(snap.component_model_frames.empty());
   EXPECT_EQ(snap.geometry_count, 1);
   EXPECT_EQ(snap.component_model_body_count, 1);
   EXPECT_FALSE(snap.contains_mesh_geometry);
   EXPECT_TRUE(snap.all_bodies_have_geometry);
-  EXPECT_FALSE(snap.bodies.front().body_content_hash.empty());
+  EXPECT_TRUE(IsExactLowercaseSha256Digest(snap.bodies.front().body_content_hash));
 }
 
 TEST(CollisionWorldSnapshotBuilder, CarriesSortedComponentModelFrames) {
-  CollisionComponentModelFrame b{
-      ControllableComponentId{"component_b"}, ModelInstanceId{"model_b"},
-      FrameRoleId{"base"}, "component_b_base", ModelRevision{"revision-b"},
-      Pose3DTO{{0.2, 0.0, 0.0}, {0.0, 0.0, 0.0, 1.0}}};
-  CollisionComponentModelFrame a{
-      ControllableComponentId{"component_a"}, ModelInstanceId{"model_a"},
-      FrameRoleId{"base"}, "component_a_base", ModelRevision{"revision-a"},
-      Pose3DTO{{0.1, 0.0, 0.0}, {0.0, 0.0, 0.0, 1.0}}};
+  CollisionComponentModelFrame b{ControllableComponentId{"component_b"},
+                                 ModelInstanceId{"model_b"},
+                                 FrameRoleId{"base"},
+                                 "component_b_base",
+                                 ModelRevision{"revision-b"},
+                                 Pose3DTO{{0.2, 0.0, 0.0}, {0.0, 0.0, 0.0, 1.0}}};
+  CollisionComponentModelFrame a{ControllableComponentId{"component_a"},
+                                 ModelInstanceId{"model_a"},
+                                 FrameRoleId{"base"},
+                                 "component_a_base",
+                                 ModelRevision{"revision-a"},
+                                 Pose3DTO{{0.1, 0.0, 0.0}, {0.0, 0.0, 0.0, 1.0}}};
 
   auto result = fresh_builder()
                     .add_component_model_frame(std::move(b))
@@ -133,11 +131,9 @@ TEST(CollisionWorldSnapshotBuilder, CarriesSortedComponentModelFrames) {
                     .build();
   ASSERT_TRUE(result.ok()) << result.error().message;
   ASSERT_EQ(result.value().component_model_frames.size(), 2u);
-  EXPECT_EQ(result.value().component_model_frames[0]
-                .controllable_component_id.value(),
+  EXPECT_EQ(result.value().component_model_frames[0].controllable_component_id.value(),
             "component_a");
-  EXPECT_EQ(result.value().component_model_frames[1]
-                .controllable_component_id.value(),
+  EXPECT_EQ(result.value().component_model_frames[1].controllable_component_id.value(),
             "component_b");
 }
 
@@ -146,8 +142,7 @@ TEST(CollisionWorldSnapshotBuilder, CountsByOwnerKind) {
                     .add_body(make_component_body("link1"))
                     .add_body(make_component_body("link2"))
                     .add_body(make_carried_scene_resource(
-                        "gripper_load",
-                        "component/arm/model/arm_model/body/link1/collision/0"))
+                        "gripper_load", "component/arm/model/arm_model/body/link1/collision/0"))
                     .add_body(make_scene_resource("crate_a"))
                     .add_body(make_fixture("wall"))
                     .add_body(make_runtime_object("detected_person"))
@@ -203,8 +198,7 @@ TEST(CollisionWorldSnapshotBuilder, ContentHashIsOrderInvariantInAddBody) {
                         .build();
   ASSERT_TRUE(r_ascending.ok());
   ASSERT_TRUE(r_shuffled.ok());
-  EXPECT_EQ(r_ascending.value().revision.content_hash,
-            r_shuffled.value().revision.content_hash);
+  EXPECT_EQ(r_ascending.value().revision.content_hash, r_shuffled.value().revision.content_hash);
 }
 
 TEST(CollisionWorldSnapshotBuilder, ContentHashChangesWhenPoseChanges) {
@@ -215,8 +209,7 @@ TEST(CollisionWorldSnapshotBuilder, ContentHashChangesWhenPoseChanges) {
   EXPECT_NE(r1.value().revision.content_hash, r2.value().revision.content_hash);
 }
 
-TEST(CollisionWorldSnapshotBuilder,
-     ContentHashChangesWhenComponentModelFramePoseChanges) {
+TEST(CollisionWorldSnapshotBuilder, ContentHashChangesWhenComponentModelFramePoseChanges) {
   auto r1 = fresh_builder()
                 .add_component_model_frame(make_component_model_frame(0.0))
                 .add_body(make_component_body("link1"))
@@ -227,8 +220,7 @@ TEST(CollisionWorldSnapshotBuilder,
                 .build();
   ASSERT_TRUE(r1.ok());
   ASSERT_TRUE(r2.ok());
-  EXPECT_NE(r1.value().revision.content_hash,
-            r2.value().revision.content_hash);
+  EXPECT_NE(r1.value().revision.content_hash, r2.value().revision.content_hash);
 }
 
 TEST(CollisionWorldSnapshotBuilder, ContentHashChangesWhenBoxDimensionsChange) {
@@ -271,16 +263,25 @@ TEST(CollisionWorldSnapshotBuilder, ContentHashChangesWhenFreshnessBudgetChanges
   EXPECT_NE(r1.value().revision.content_hash, r2.value().revision.content_hash);
 }
 
-TEST(CollisionWorldSnapshotBuilder, ReusesPrecomputedBodyContentHash) {
+TEST(CollisionWorldSnapshotBuilder, RecomputesCallerProvidedBodyContentHash) {
   CollisionWorldBody body = make_component_body("link1");
   const auto body_hash = compute_collision_world_body_content_hash(body);
-  body.body_content_hash = body_hash;
+  body.body_content_hash = "forged";
 
   auto result = fresh_builder().add_body(std::move(body)).build();
 
   ASSERT_TRUE(result.ok()) << result.error().message;
   ASSERT_EQ(result.value().bodies.size(), 1u);
   EXPECT_EQ(result.value().bodies.front().body_content_hash, body_hash);
+}
+
+TEST(CollisionWorldSnapshotBuilder, RejectsInvalidPolicyOverlayDigest) {
+  auto result = fresh_builder()
+                    .set_policy_overlay_content_hash("legacy-policy-hash")
+                    .add_body(make_component_body("link1"))
+                    .build();
+  ASSERT_FALSE(result.ok());
+  EXPECT_EQ(result.error().code, "invariant_violation");
 }
 
 TEST(CollisionWorldSnapshotBuilder, ContentHashChangesWhenMeshScaleChanges) {
@@ -355,8 +356,7 @@ TEST(CollisionWorldSnapshotBuilder, ContainsMeshGeometryFiresOnCompound) {
   EXPECT_TRUE(result.value().contains_mesh_geometry);
 }
 
-TEST(CollisionWorldSnapshotBuilder,
-     ContainsMeshGeometryStaysFalseForPrimitivesOnly) {
+TEST(CollisionWorldSnapshotBuilder, ContainsMeshGeometryStaysFalseForPrimitivesOnly) {
   auto result = fresh_builder()
                     .add_body(make_component_body("link_a"))
                     .add_body(make_fixture("wall"))
@@ -385,18 +385,14 @@ TEST(CollisionWorldSnapshotBuilder, RejectsZeroRevisionId) {
 }
 
 TEST(CollisionWorldSnapshotBuilder, RejectsZeroSnapshotFormatVersion) {
-  auto result = fresh_builder()
-                    .set_snapshot_format_version(0)
-                    .add_body(make_component_body("link1"))
-                    .build();
+  auto result =
+      fresh_builder().set_snapshot_format_version(0).add_body(make_component_body("link1")).build();
   ASSERT_FALSE(result.ok());
 }
 
 TEST(CollisionWorldSnapshotBuilder, RejectsNegativeEmissionTime) {
-  auto result = fresh_builder()
-                    .set_emitted_at_ns(-1)
-                    .add_body(make_component_body("link1"))
-                    .build();
+  auto result =
+      fresh_builder().set_emitted_at_ns(-1).add_body(make_component_body("link1")).build();
   ASSERT_FALSE(result.ok());
 }
 
@@ -459,8 +455,7 @@ TEST(CollisionWorldSnapshotBuilder, RejectsEmptyBodyId) {
   empty.body_id = "";
   empty.owner_kind = CollisionOwnerKind::kSceneResource;
   empty.frame_id = "world";
-  empty.geometries.push_back(
-      make_box_geom("", CollisionOwnerKind::kSceneResource));
+  empty.geometries.push_back(make_box_geom("", CollisionOwnerKind::kSceneResource));
   auto result = fresh_builder().add_body(std::move(empty)).build();
   ASSERT_FALSE(result.ok());
 }
@@ -567,24 +562,23 @@ TEST(CollisionWorldSnapshotBuilder, AcceptsDetachedSceneResourceWithoutParent) {
 }
 
 TEST(CollisionWorldSnapshotBuilder, RejectsCarriedWithNonComponentBodyParent) {
-  auto attached = make_carried_scene_resource(
-      "load", "component/arm/model/arm_model/body/tcp/collision/0");
+  auto attached =
+      make_carried_scene_resource("load", "component/arm/model/arm_model/body/tcp/collision/0");
   attached.parent_body_id = "scene/not_a_component_body/shape/0";
   auto result = fresh_builder().add_body(std::move(attached)).build();
   ASSERT_FALSE(result.ok());
 }
 
 TEST(CollisionWorldSnapshotBuilder, RejectsCarriedWithMissingParentBody) {
-  auto attached = make_carried_scene_resource(
-      "load", "component/arm/model/arm_model/body/tcp/collision/0");
+  auto attached =
+      make_carried_scene_resource("load", "component/arm/model/arm_model/body/tcp/collision/0");
   auto result = fresh_builder().add_body(std::move(attached)).build();
   ASSERT_FALSE(result.ok());
 }
 
 TEST(CollisionWorldSnapshotBuilder, RejectsRuntimeObjectWithParent) {
   auto runtime_object = make_runtime_object("transient_obstacle");
-  runtime_object.parent_body_id =
-      "component/arm/model/arm_model/body/tcp/collision/0";
+  runtime_object.parent_body_id = "component/arm/model/arm_model/body/tcp/collision/0";
   auto result = fresh_builder().add_body(std::move(runtime_object)).build();
   ASSERT_FALSE(result.ok());
 }
@@ -592,30 +586,25 @@ TEST(CollisionWorldSnapshotBuilder, RejectsRuntimeObjectWithParent) {
 // --- shared_ptr wrapper ---
 
 TEST(CollisionWorldSnapshotBuilder, BuildSharedReturnsImmutableSharedPtr) {
-  auto result = fresh_builder()
-                    .add_body(make_component_body("link1"))
-                    .build_shared();
+  auto result = fresh_builder().add_body(make_component_body("link1")).build_shared();
   ASSERT_TRUE(result.ok());
   CollisionWorldSnapshotPtr ptr = result.value();
   ASSERT_TRUE(ptr);
   EXPECT_EQ(ptr->body_count, 1);
   // shared_ptr<const CollisionWorldSnapshot> — type cannot be mutated.
-  static_assert(
-      std::is_const_v<typename CollisionWorldSnapshotPtr::element_type>,
-      "CollisionWorldSnapshotPtr must point to const snapshot");
+  static_assert(std::is_const_v<typename CollisionWorldSnapshotPtr::element_type>,
+                "CollisionWorldSnapshotPtr must point to const snapshot");
 }
 
 TEST(CollisionWorldSnapshotBuilder, BuildSharedPropagatesError) {
-  auto result =
-      CollisionWorldSnapshotBuilder().set_revision_id(1).build_shared();
+  auto result = CollisionWorldSnapshotBuilder().set_revision_id(1).build_shared();
   ASSERT_FALSE(result.ok());
   EXPECT_EQ(result.error().code, "invariant_violation");
 }
 
 // --- Per-body content hash ---
 
-TEST(CollisionWorldSnapshotBuilder,
-     PerBodyContentHashChangesIndependentlyOfOtherBodies) {
+TEST(CollisionWorldSnapshotBuilder, PerBodyContentHashChangesIndependentlyOfOtherBodies) {
   auto r1 = fresh_builder()
                 .add_body(make_component_body("link_a"))
                 .add_body(make_component_body("link_b"))
@@ -629,18 +618,14 @@ TEST(CollisionWorldSnapshotBuilder,
   ASSERT_EQ(r1.value().bodies.size(), 2u);
   ASSERT_EQ(r2.value().bodies.size(), 2u);
   // link_a unchanged → same per-body hash.
-  EXPECT_EQ(r1.value().bodies[0].body_content_hash,
-            r2.value().bodies[0].body_content_hash);
+  EXPECT_EQ(r1.value().bodies[0].body_content_hash, r2.value().bodies[0].body_content_hash);
   // link_b moved → different per-body hash.
-  EXPECT_NE(r1.value().bodies[1].body_content_hash,
-            r2.value().bodies[1].body_content_hash);
+  EXPECT_NE(r1.value().bodies[1].body_content_hash, r2.value().bodies[1].body_content_hash);
   // World hash differs because link_b changed.
-  EXPECT_NE(r1.value().revision.content_hash,
-            r2.value().revision.content_hash);
+  EXPECT_NE(r1.value().revision.content_hash, r2.value().revision.content_hash);
 }
 
-TEST(CollisionWorldSnapshotBuilder,
-     RuntimeFreshnessSidecarOverridesSnapshotTimestamp) {
+TEST(CollisionWorldSnapshotBuilder, RuntimeFreshnessSidecarOverridesSnapshotTimestamp) {
   auto body = make_scene_resource("dynamic_box");
   body.source_id = "vision";
   body.source_timestamp_ns = 0;
@@ -656,13 +641,12 @@ TEST(CollisionWorldSnapshotBuilder,
   std::vector<CollisionWorldBodyFreshness> sidecar{freshness};
 
   std::map<std::string, std::string> details;
-  EXPECT_FALSE(validate_dynamic_body_freshness(
-      result.value(), sidecar, 1'000, 1'000, details).has_value());
+  EXPECT_FALSE(
+      validate_dynamic_body_freshness(result.value(), sidecar, 1'000, 1'000, details).has_value());
   EXPECT_EQ(details.at("dynamic_body_source_timestamp_ns"), "950");
 }
 
-TEST(CollisionWorldSnapshotBuilder,
-     RuntimeFreshnessSidecarFailsClosedWhenUnsorted) {
+TEST(CollisionWorldSnapshotBuilder, RuntimeFreshnessSidecarFailsClosedWhenUnsorted) {
   auto body_a = make_scene_resource("dynamic_box_a");
   body_a.source_id = "vision";
   body_a.source_timestamp_ns = 0;
@@ -687,8 +671,8 @@ TEST(CollisionWorldSnapshotBuilder,
   std::vector<CollisionWorldBodyFreshness> sidecar{freshness_b, freshness_a};
 
   std::map<std::string, std::string> details;
-  const auto reason = validate_dynamic_body_freshness(
-      result.value(), sidecar, 1'000, 1'000, details);
+  const auto reason =
+      validate_dynamic_body_freshness(result.value(), sidecar, 1'000, 1'000, details);
   ASSERT_TRUE(reason.has_value());
   EXPECT_EQ(*reason, "dynamic_body_freshness_sidecar_not_sorted");
   EXPECT_EQ(details.at("dynamic_body_freshness_sidecar_status"), "unsorted");

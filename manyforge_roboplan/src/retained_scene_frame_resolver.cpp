@@ -265,18 +265,25 @@ public:
               "predicted candidate state has no exact retained path source")
               .error());
     }
+    const auto current =
+        source->provider->publication(source->context.control_binding_id,
+                                      source->context.control_binding_revision);
+    if (!current.ok()) {
+      return core::Result<void>::Err(current.error());
+    }
     const auto &expected = source->context;
+    const auto &publication = current.value();
     if (state.controllable_component_id != expected.controllable_component_id ||
         state.command_target_id != expected.command_target_id ||
         state.control_domain_id != expected.control_domain_id ||
         state.control_domain_revision != expected.control_domain_revision ||
         state.controller_topology_id != expected.controller_topology_id ||
         state.topology_revision != expected.topology_revision ||
-        state.control_route_id != expected.control_route_id ||
+        state.control_route_id != publication.control_route_id ||
         state.active_control_configuration_id !=
-            expected.active_control_configuration_id ||
+            publication.active_control_configuration_id ||
         state.active_control_configuration_generation !=
-            expected.active_control_configuration_generation ||
+            publication.active_control_configuration_generation ||
         state.resources != expected.resources ||
         state.joint_names != expected.joint_names ||
         state.positions.size() != expected.coordinate_kinds.size()) {
@@ -363,11 +370,18 @@ public:
             "kinematic_state_source_ambiguous",
             "one frame resource resolves to multiple observed-state sources");
       }
+      const auto current = source->provider->publication(
+          source->context.control_binding_id,
+          source->context.control_binding_revision);
+      if (!current.ok()) {
+        return core::Result<core::KinematicStatePathQueryDTO>::Err(
+            current.error());
+      }
       const core::KinematicActiveControlConfigurationExpectationDTO expected{
-          source->context.control_domain_id,
-          source->context.control_domain_revision,
-          source->context.active_control_configuration_id,
-          source->context.active_control_configuration_generation};
+          current.value().control_domain_id,
+          current.value().control_domain_revision,
+          current.value().active_control_configuration_id,
+          current.value().active_control_configuration_generation};
       const auto [configuration, unique] =
           configurations.emplace(expected.control_domain_id, expected);
       if (!unique && configuration->second != expected) {
@@ -424,8 +438,7 @@ std::shared_ptr<RetainedSceneFrameResolver> RetainedSceneFrameResolver::create(
   std::sort(input.target_frames.begin(), input.target_frames.end(),
             [](const auto &left, const auto &right) {
               return std::tie(left.controllable_component_id,
-                              left.command_target_id,
-                              left.target_frame_role_id,
+                              left.command_target_id, left.target_frame_role_id,
                               left.frame.model_instance_id) <
                      std::tie(right.controllable_component_id,
                               right.command_target_id,

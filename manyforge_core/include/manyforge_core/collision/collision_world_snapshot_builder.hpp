@@ -1,14 +1,22 @@
 #pragma once
 
 #include <cstdint>
-#include <memory>
-#include <string>
-#include <vector>
-
 #include <manyforge_core/types/collision_world_snapshot.hpp>
 #include <manyforge_core/types/error_code.hpp>
+#include <memory>
+#include <string>
+#include <string_view>
+#include <vector>
 
 namespace manyforge::core {
+
+inline constexpr std::string_view kCollisionWorldBodyContentApiVersion =
+    "manyforge.collision_world_body.v1";
+inline constexpr std::string_view kCollisionWorldBodyContentIdentityDomain =
+    "collision-world-body-content";
+inline constexpr std::string_view kCollisionWorldContentApiVersion =
+    "manyforge.collision_world_snapshot.v1";
+inline constexpr std::string_view kCollisionWorldContentIdentityDomain = "collision-world-content";
 
 /// Build a deterministic, validated `CollisionWorldSnapshot` (spec
 /// §3.8.1, defined by the kernel-architecture sprint
@@ -46,16 +54,16 @@ namespace manyforge::core {
 ///     form. Other owner categories do not carry a parent.
 ///
 /// **Deterministic outputs:**
-///   - Bodies are sorted lexicographically by `body_id` after
-///     validation. If a body already carries `body_content_hash`, the builder
-///     reuses it; publishers that precompute hashes must use
-///     `compute_collision_world_body_content_hash()`.
+///   - Bodies are sorted lexicographically by `body_id` after validation.
+///     The builder always recomputes `body_content_hash`; caller-provided
+///     values are never identity authority.
 ///   - Each body's `body_content_hash` is computed by the builder
-///     using `ContentHasher` over (body_id, owner_kind, parent_body_id,
-///     frame_id, pose, freshness budget, geometries' source-defining fields).
+///     using the qualified RFC 8785/framed SHA-256 projection over
+///     (body_id, owner_kind, parent_body_id, frame_id, pose, freshness budget,
+///     geometries' source-defining fields).
 ///     `source_timestamp_ns` is intentionally excluded so freshness-only
 ///     updates do not change collision-world content identity.
-///   - The snapshot's `revision.content_hash` is the digest over
+///   - The snapshot's `revision.content_hash` is the framed SHA-256 digest over
 ///     `publisher_id`, `snapshot_format_version`, component-model frames, and
 ///     the sorted bodies' `body_content_hash` values, plus the effective policy
 ///     content hash when supplied by the authoritative paired publisher. The
@@ -80,17 +88,14 @@ class CollisionWorldSnapshotBuilder {
   CollisionWorldSnapshotBuilder() = default;
 
   CollisionWorldSnapshotBuilder& set_publisher_id(std::string id);
-  CollisionWorldSnapshotBuilder& set_snapshot_format_version(
-      std::uint32_t version);
+  CollisionWorldSnapshotBuilder& set_snapshot_format_version(std::uint32_t version);
   CollisionWorldSnapshotBuilder& set_revision_id(std::uint64_t revision_id);
   CollisionWorldSnapshotBuilder& set_emitted_at_ns(std::int64_t emitted_at_ns);
   /// Bind the effective decision-policy content without copying mutable policy
   /// state into CollisionWorldSnapshot. A coherent publisher serves that exact
   /// policy beside the resulting world snapshot.
-  CollisionWorldSnapshotBuilder& set_policy_overlay_content_hash(
-      std::string content_hash);
-  CollisionWorldSnapshotBuilder& add_component_model_frame(
-      CollisionComponentModelFrame frame);
+  CollisionWorldSnapshotBuilder& set_policy_overlay_content_hash(std::string content_hash);
+  CollisionWorldSnapshotBuilder& add_component_model_frame(CollisionComponentModelFrame frame);
 
   /// Append a body. Bodies are validated and sorted at `build()`
   /// time, not at `add_body()` time, so callers may add bodies in
@@ -123,7 +128,6 @@ class CollisionWorldSnapshotBuilder {
   std::vector<CollisionWorldBody> bodies_;
 };
 
-std::string compute_collision_world_body_content_hash(
-    const CollisionWorldBody& body);
+std::string compute_collision_world_body_content_hash(const CollisionWorldBody& body);
 
 }  // namespace manyforge::core

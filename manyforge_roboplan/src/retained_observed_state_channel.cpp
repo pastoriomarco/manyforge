@@ -8,40 +8,39 @@
 namespace manyforge::roboplan_backend {
 namespace {
 
-[[nodiscard]] core::ObservedRobotStateSourceKind numeric_source_kind(
-    const core::ObservedStateSourceKind source) noexcept {
+[[nodiscard]] core::ObservedRobotStateSourceKind
+numeric_source_kind(const core::ObservedStateSourceKind source) noexcept {
   switch (source) {
-    case core::ObservedStateSourceKind::kActionFeedback:
-      return core::ObservedRobotStateSourceKind::kActionFeedback;
-    case core::ObservedStateSourceKind::kControllerState:
-      return core::ObservedRobotStateSourceKind::kControllerState;
-    case core::ObservedStateSourceKind::kJointState:
-      return core::ObservedRobotStateSourceKind::kJointState;
-    case core::ObservedStateSourceKind::kCommandedState:
-      return core::ObservedRobotStateSourceKind::kCommandedState;
-    case core::ObservedStateSourceKind::kPredictedState:
-      return core::ObservedRobotStateSourceKind::kPredictedState;
+  case core::ObservedStateSourceKind::kActionFeedback:
+    return core::ObservedRobotStateSourceKind::kActionFeedback;
+  case core::ObservedStateSourceKind::kControllerState:
+    return core::ObservedRobotStateSourceKind::kControllerState;
+  case core::ObservedStateSourceKind::kJointState:
+    return core::ObservedRobotStateSourceKind::kJointState;
+  case core::ObservedStateSourceKind::kCommandedState:
+    return core::ObservedRobotStateSourceKind::kCommandedState;
+  case core::ObservedStateSourceKind::kPredictedState:
+    return core::ObservedRobotStateSourceKind::kPredictedState;
   }
   return core::ObservedRobotStateSourceKind::kJointState;
 }
 
-[[nodiscard]] core::ObservedRobotStateAuthorityProfile authority_profile(
-    const core::StateAuthorityClass authority) {
+[[nodiscard]] core::ObservedRobotStateAuthorityProfile
+authority_profile(const core::StateAuthorityClass authority) {
   switch (authority) {
-    case core::StateAuthorityClass::kMeasured:
-      return core::ObservedRobotStateAuthorityProfile::kMeasured;
-    case core::StateAuthorityClass::kCommanded:
-      return core::ObservedRobotStateAuthorityProfile::kCommandedSimulation;
-    case core::StateAuthorityClass::kPredicted:
-      return core::ObservedRobotStateAuthorityProfile::kPredictedNative;
+  case core::StateAuthorityClass::kMeasured:
+    return core::ObservedRobotStateAuthorityProfile::kMeasured;
+  case core::StateAuthorityClass::kCommanded:
+    return core::ObservedRobotStateAuthorityProfile::kCommandedSimulation;
+  case core::StateAuthorityClass::kPredicted:
+    return core::ObservedRobotStateAuthorityProfile::kPredictedNative;
   }
   throw std::invalid_argument("unknown retained state authority class");
 }
 
 [[nodiscard]] core::AddressedObservedStatePublicationConfig
-publication_config(
-    const core::RuntimeParticipantBinding& binding,
-    const RetainedObservedStateChannelConfig& config) {
+publication_config(const core::RuntimeParticipantBinding &binding,
+                   const RetainedObservedStateChannelConfig &config) {
   auto context = core::make_observed_state_query_context(
       binding, config.freshness_budget_ns);
   if (!context.ok()) {
@@ -55,9 +54,8 @@ publication_config(
   return core::AddressedObservedStatePublicationConfig{
       std::move(context.value()),
       {core::ObservedRobotStateSourceConfig{
-          numeric_source_kind(config.source_kind), config.source_id,
-          profile, config.freshness_budget_ns,
-          "retained_native_state_authority"}},
+          numeric_source_kind(config.source_kind), config.source_id, profile,
+          config.freshness_budget_ns, "retained_native_state_authority"}},
       config.authority_generation,
       256U};
 }
@@ -66,38 +64,41 @@ publication_config(
                                            std::string message) {
   return core::ErrorDTO{
       std::string(core::to_string(core::ErrorCode::kInvalidRequest)),
-      std::move(message), {{"reason", std::move(reason)}}};
+      std::move(message),
+      {{"reason", std::move(reason)}}};
 }
 
-[[nodiscard]] bool publication_backpressured(
-    const std::string_view reason) noexcept {
+[[nodiscard]] bool
+publication_backpressured(const std::string_view reason) noexcept {
   return reason == "source_writer_busy" ||
          reason == "publication_slots_exhausted";
 }
 
-[[nodiscard]] double position_value(
-    const core::CoordinatePositionDTO& position) noexcept {
-  if (const auto* angular =
-          std::get_if<core::AngularPositionDTO>(&position)) {
+[[nodiscard]] double
+position_value(const core::CoordinatePositionDTO &position) noexcept {
+  if (const auto *angular = std::get_if<core::AngularPositionDTO>(&position)) {
     return angular->value_rad;
   }
   return std::get<core::LinearPositionDTO>(position).value_m;
 }
 
-}  // namespace
+} // namespace
 
 RetainedObservedStateChannel::RetainedObservedStateChannel(
     core::RuntimeParticipantBinding binding,
     std::shared_ptr<RetainedKinematicStateProjector> projector,
     RetainedObservedStateChannelConfig config)
-    : binding_(std::move(binding)),
-      projector_(std::move(projector)),
+    : initial_binding_(std::move(binding)), projector_(std::move(projector)),
       config_(std::move(config)),
-      publication_(publication_config(binding_, config_)) {
+      publication_(publication_config(initial_binding_, config_)),
+      projection_context_(publication_.query_context()),
+      current_binding_(&initial_binding_) {
+  retained_route_bindings_.reserve(4096U);
   if (!projector_) {
-    if (!binding_.value().model_groups.empty() ||
-        std::any_of(binding_.value().resources.begin(),
-                    binding_.value().resources.end(), [](const auto& resource) {
+    if (!initial_binding_.value().model_groups.empty() ||
+        std::any_of(initial_binding_.value().resources.begin(),
+                    initial_binding_.value().resources.end(),
+                    [](const auto &resource) {
                       return resource.source_joint_name.has_value();
                     })) {
       throw std::invalid_argument(
@@ -105,18 +106,57 @@ RetainedObservedStateChannel::RetainedObservedStateChannel(
     }
     return;
   }
-  if (std::any_of(binding_.value().resources.begin(),
-                  binding_.value().resources.end(), [](const auto& resource) {
+  if (std::any_of(initial_binding_.value().resources.begin(),
+                  initial_binding_.value().resources.end(),
+                  [](const auto &resource) {
                     return !resource.source_joint_name.has_value();
                   })) {
     throw std::invalid_argument(
         "projected observed-state channel contains a component-local resource");
   }
-  const auto& context = publication_.query_context();
+  const auto &context = publication_.query_context();
   const auto contexts = projector_->query_contexts();
   if (std::count(contexts.begin(), contexts.end(), context) != 1) {
-    throw std::invalid_argument(
-        "retained observed-state channel target is not registered exactly once");
+    throw std::invalid_argument("retained observed-state channel target is not "
+                                "registered exactly once");
+  }
+}
+
+core::Result<void> RetainedObservedStateChannel::RebindRoute(
+    core::RuntimeParticipantBinding binding,
+    const std::int64_t transition_time_ns) {
+  try {
+    auto context = core::make_observed_state_query_context(
+        binding, config_.freshness_budget_ns);
+    if (!context.ok()) {
+      return core::Result<void>::Err(context.error());
+    }
+    std::lock_guard lock(route_rebind_mutex_);
+    if (retained_route_bindings_.size() >= 4096U) {
+      return core::Result<void>::Err(channel_error(
+          "retained_state_route_rebind_capacity_exhausted",
+          "native route-state binding history reached its fixed bound"));
+    }
+    retained_route_bindings_.push_back(
+        std::make_unique<const core::RuntimeParticipantBinding>(
+            std::move(binding)));
+    auto rebound = publication_.rebind_route_context(std::move(context.value()),
+                                                     transition_time_ns);
+    if (!rebound.ok()) {
+      retained_route_bindings_.pop_back();
+      return rebound;
+    }
+    current_binding_.store(retained_route_bindings_.back().get(),
+                           std::memory_order_release);
+    return core::Result<void>::Ok();
+  } catch (const std::exception &) {
+    return core::Result<void>::Err(
+        channel_error("retained_state_route_rebind_failed",
+                      "native route-state binding could not be retained"));
+  } catch (...) {
+    return core::Result<void>::Err(
+        channel_error("retained_state_route_rebind_failed",
+                      "native route-state binding could not be retained"));
   }
 }
 
@@ -124,10 +164,10 @@ RetainedStateProjectionResult
 RetainedObservedStateChannel::initialize_from_projection(
     const std::int64_t timestamp_ns) {
   if (!projector_) {
-    return {RetainedStateProjectionStatus::kRejected,
-            channel_error(
-                "component_local_state_has_no_model_projection",
-                "component-local state cannot be seeded from a model")};
+    return {
+        RetainedStateProjectionStatus::kRejected,
+        channel_error("component_local_state_has_no_model_projection",
+                      "component-local state cannot be seeded from a model")};
   }
   auto state = projector_->current_state(
       publication_.query_context().control_binding_id,
@@ -137,7 +177,7 @@ RetainedObservedStateChannel::initialize_from_projection(
   }
   std::vector<double> positions;
   positions.reserve(state.value().positions.size());
-  for (const auto& position : state.value().positions) {
+  for (const auto &position : state.value().positions) {
     positions.push_back(position_value(position));
   }
   std::vector<double> velocities(positions.size(), 0.0);
@@ -145,16 +185,14 @@ RetainedObservedStateChannel::initialize_from_projection(
                              RetainedStateProjectionMode::kBlocking);
 }
 
-RetainedStateProjectionResult
-RetainedObservedStateChannel::publish_and_project(
+RetainedStateProjectionResult RetainedObservedStateChannel::publish_and_project(
     const std::span<const double> positions_si,
     const std::span<const double> velocities_si,
     const std::int64_t source_timestamp_ns,
     const std::int64_t received_timestamp_ns,
     const RetainedStateProjectionMode mode) {
   auto published = publish_state(positions_si, velocities_si,
-                                 source_timestamp_ns,
-                                 received_timestamp_ns);
+                                 source_timestamp_ns, received_timestamp_ns);
   if (!published.applied()) {
     return published;
   }
@@ -166,7 +204,7 @@ RetainedStateProjectionResult RetainedObservedStateChannel::publish_state(
     const std::span<const double> velocities_si,
     const std::int64_t source_timestamp_ns,
     const std::int64_t received_timestamp_ns) {
-  const auto& context = publication_.query_context();
+  const auto &context = publication_.query_context();
   if (positions_si.size() != context.resources.size() ||
       (!velocities_si.empty() &&
        velocities_si.size() != context.resources.size())) {
@@ -182,18 +220,18 @@ RetainedStateProjectionResult RetainedObservedStateChannel::publish_state(
     const std::string reason = published.reason == nullptr
                                    ? "retained_state_publication_failed"
                                    : published.reason;
-    return {publication_backpressured(reason)
-                ? RetainedStateProjectionStatus::kBusy
-                : RetainedStateProjectionStatus::kRejected,
-            channel_error(reason,
-                          "native state publication was not committed")};
+    return {
+        publication_backpressured(reason)
+            ? RetainedStateProjectionStatus::kBusy
+            : RetainedStateProjectionStatus::kRejected,
+        channel_error(reason, "native state publication was not committed")};
   }
   return {RetainedStateProjectionStatus::kApplied, std::nullopt};
 }
 
 RetainedStateProjectionResult RetainedObservedStateChannel::project_latest(
     const std::int64_t now_ns, const RetainedStateProjectionMode mode) {
-  const auto& context = publication_.query_context();
+  const auto &context = publication_.query_context();
   auto snapshot = publication_.current_state(context, now_ns);
   if (!snapshot.ok()) {
     return {RetainedStateProjectionStatus::kFailed, snapshot.error()};
@@ -201,7 +239,13 @@ RetainedStateProjectionResult RetainedObservedStateChannel::project_latest(
   if (!projector_) {
     return {RetainedStateProjectionStatus::kApplied, std::nullopt};
   }
-  return projector_->apply(snapshot.value(), now_ns, mode);
+  auto projected = std::move(snapshot.value());
+  projected.control_route_id = projection_context_.control_route_id;
+  projected.active_control_configuration_id =
+      projection_context_.active_control_configuration_id;
+  projected.active_control_configuration_generation =
+      projection_context_.active_control_configuration_generation;
+  return projector_->apply(projected, now_ns, mode);
 }
 
 core::Result<core::ObservedStateSnapshotDTO>
@@ -211,39 +255,34 @@ RetainedObservedStateChannel::current_state(const std::int64_t now_ns) const {
 
 core::Result<core::ControlledStateDTO>
 RetainedObservedStateChannel::current_controlled_state() const {
-  if (!projector_) {
-    const auto& context = publication_.query_context();
-    auto current = publication_.publication(context.control_binding_id,
-                                             context.control_binding_revision);
-    if (!current.ok()) {
-      return core::Result<core::ControlledStateDTO>::Err(current.error());
-    }
-    const auto& snapshot = current.value().snapshot;
-    core::ControlledStateDTO state{
-        snapshot.controllable_component_id,
-        snapshot.command_target_id,
-        snapshot.control_domain_id,
-        snapshot.control_domain_revision,
-        snapshot.control_binding_id,
-        snapshot.control_binding_revision,
-        snapshot.controller_topology_id,
-        snapshot.topology_revision,
-        snapshot.control_route_id,
-        snapshot.active_control_configuration_id,
-        snapshot.active_control_configuration_generation,
-        snapshot.resources,
-        snapshot.joint_names,
-        snapshot.positions,
-        snapshot.velocities};
-    auto valid = core::validate_controlled_state(state);
-    if (!valid.ok()) {
-      return core::Result<core::ControlledStateDTO>::Err(valid.error());
-    }
-    return core::Result<core::ControlledStateDTO>::Ok(std::move(state));
+  const auto &context = publication_.query_context();
+  auto current = publication_.publication(context.control_binding_id,
+                                          context.control_binding_revision);
+  if (!current.ok()) {
+    return core::Result<core::ControlledStateDTO>::Err(current.error());
   }
-  return projector_->current_state(
-      publication_.query_context().control_binding_id,
-      publication_.query_context().control_binding_revision);
+  const auto &snapshot = current.value().snapshot;
+  core::ControlledStateDTO state{
+      snapshot.controllable_component_id,
+      snapshot.command_target_id,
+      snapshot.control_domain_id,
+      snapshot.control_domain_revision,
+      snapshot.control_binding_id,
+      snapshot.control_binding_revision,
+      snapshot.controller_topology_id,
+      snapshot.topology_revision,
+      snapshot.control_route_id,
+      snapshot.active_control_configuration_id,
+      snapshot.active_control_configuration_generation,
+      snapshot.resources,
+      snapshot.joint_names,
+      snapshot.positions,
+      snapshot.velocities};
+  auto valid = core::validate_controlled_state(state);
+  if (!valid.ok()) {
+    return core::Result<core::ControlledStateDTO>::Err(valid.error());
+  }
+  return core::Result<core::ControlledStateDTO>::Ok(std::move(state));
 }
 
-}  // namespace manyforge::roboplan_backend
+} // namespace manyforge::roboplan_backend

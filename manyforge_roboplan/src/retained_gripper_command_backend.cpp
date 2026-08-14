@@ -25,8 +25,8 @@ constexpr int kTerminalProjectionRetryLimit = 10;
   return std::clamp(progress, 0.0, 1.0);
 }
 
-[[nodiscard]] bool supersedable_grasp_loss(
-    const std::optional<core::ErrorDTO>& error) noexcept {
+[[nodiscard]] bool
+supersedable_grasp_loss(const std::optional<core::ErrorDTO> &error) noexcept {
   return error.has_value() && error->code == "grasp_confirmation_lost";
 }
 
@@ -41,8 +41,9 @@ constexpr int kTerminalProjectionRetryLimit = 10;
   return static_cast<core::Duration>(nanos);
 }
 
-[[nodiscard]] core::TimePoint saturating_deadline(
-    const core::TimePoint started_at, const core::Duration duration) {
+[[nodiscard]] core::TimePoint
+saturating_deadline(const core::TimePoint started_at,
+                    const core::Duration duration) {
   const auto maximum = std::numeric_limits<core::TimePoint>::max();
   if (duration > 0 && started_at > maximum - duration) {
     return maximum;
@@ -50,26 +51,26 @@ constexpr int kTerminalProjectionRetryLimit = 10;
   return started_at + duration;
 }
 
-[[nodiscard]] double position_value(
-    const core::CoordinatePositionDTO& position) noexcept {
-  if (const auto* angular = std::get_if<core::AngularPositionDTO>(&position)) {
+[[nodiscard]] double
+position_value(const core::CoordinatePositionDTO &position) noexcept {
+  if (const auto *angular = std::get_if<core::AngularPositionDTO>(&position)) {
     return angular->value_rad;
   }
   return std::get<core::LinearPositionDTO>(position).value_m;
 }
 
-[[nodiscard]] std::string projection_reason(
-    const RetainedStateProjectionResult& result) {
+[[nodiscard]] std::string
+projection_reason(const RetainedStateProjectionResult &result) {
   if (!result.error.has_value()) {
     switch (result.status) {
-      case RetainedStateProjectionStatus::kApplied:
-        return {};
-      case RetainedStateProjectionStatus::kBusy:
-        return "retained_state_projection_busy";
-      case RetainedStateProjectionStatus::kRejected:
-        return "retained_state_projection_rejected";
-      case RetainedStateProjectionStatus::kFailed:
-        return "retained_state_projection_failed";
+    case RetainedStateProjectionStatus::kApplied:
+      return {};
+    case RetainedStateProjectionStatus::kBusy:
+      return "retained_state_projection_busy";
+    case RetainedStateProjectionStatus::kRejected:
+      return "retained_state_projection_rejected";
+    case RetainedStateProjectionStatus::kFailed:
+      return "retained_state_projection_failed";
     }
   }
   const auto found = result.error->details.find("reason");
@@ -77,7 +78,7 @@ constexpr int kTerminalProjectionRetryLimit = 10;
                                               : found->second;
 }
 
-}  // namespace
+} // namespace
 
 struct RetainedGripperCommandBackend::SharedState {
   struct Runtime final {
@@ -91,8 +92,9 @@ struct RetainedGripperCommandBackend::SharedState {
   };
 
   std::shared_ptr<IRetainedObservedStateChannel> state_channel;
-  core::IClock* clock{};
-  core::IScheduler* scheduler{};
+  std::optional<core::RuntimeParticipantBinding> binding;
+  core::IClock *clock{};
+  core::IScheduler *scheduler{};
   core::Duration update_period_ns{10'000'000};
   std::string gripper_id;
   std::string group_id;
@@ -118,14 +120,14 @@ struct ScheduleAttempt final {
   std::atomic<bool> callback_admitted{false};
 };
 
-[[nodiscard]] bool schedule_tick(const std::shared_ptr<SharedState>& state,
-                                 const std::string& gripper_id,
+[[nodiscard]] bool schedule_tick(const std::shared_ptr<SharedState> &state,
+                                 const std::string &gripper_id,
                                  std::uint64_t command_id,
                                  std::uint64_t generation,
                                  core::TimePoint deadline_ns);
 
 void update_projection_result_locked(
-    SharedState::Runtime& runtime, const RetainedStateProjectionResult& result,
+    SharedState::Runtime &runtime, const RetainedStateProjectionResult &result,
     const bool terminal) {
   if (result.applied()) {
     runtime.status.projection_state = core::GripperProjectionState::kApplied;
@@ -157,13 +159,15 @@ void update_projection_result_locked(
   ++runtime.status.revision;
 }
 
-void run_tick(const std::shared_ptr<SharedState>& state,
-              const std::string& gripper_id, const std::uint64_t command_id,
+void run_tick(const std::shared_ptr<SharedState> &state,
+              const std::string &gripper_id, const std::uint64_t command_id,
               const std::uint64_t generation,
               const std::uint64_t schedule_generation,
-              const std::shared_ptr<ScheduleAttempt>& attempt) {
+              const core::TimePoint scheduled_deadline_ns,
+              const std::shared_ptr<ScheduleAttempt> &attempt) {
   double position = 0.0;
   bool terminal = false;
+  bool idle_heartbeat = false;
   core::TimePoint next_deadline = 0;
   {
     std::lock_guard<std::mutex> lock(state->mutex);
@@ -171,7 +175,7 @@ void run_tick(const std::shared_ptr<SharedState>& state,
     if (state->closing || found == state->runtimes.end()) {
       return;
     }
-    auto& runtime = found->second;
+    auto &runtime = found->second;
     if (runtime.status.command_id != command_id ||
         runtime.status.generation != generation ||
         runtime.schedule_generation != schedule_generation) {
@@ -179,32 +183,53 @@ void run_tick(const std::shared_ptr<SharedState>& state,
     }
     attempt->callback_admitted.store(true, std::memory_order_release);
     runtime.scheduled_handle.reset();
-    if (runtime.status.state == core::GripperCommandState::kFailed ||
-        runtime.status.state == core::GripperCommandState::kIdle) {
+    if (runtime.status.state == core::GripperCommandState::kFailed) {
       return;
     }
 
     const auto now_ns = state->clock->now();
-    const auto total_ns = std::max<core::Duration>(
-        1, runtime.deadline_ns - runtime.started_at_ns);
-    const auto elapsed_ns =
-        std::max<core::Duration>(0, now_ns - runtime.started_at_ns);
-    const double progress =
-        runtime.deadline_ns <= runtime.started_at_ns
-            ? 1.0
-            : clamp_progress(static_cast<double>(elapsed_ns) /
-                             static_cast<double>(total_ns));
-    position =
-        runtime.start_position +
-        (*runtime.status.target_position - runtime.start_position) * progress;
-    runtime.status.progress = progress;
-    runtime.status.current_position = position;
-    runtime.status.observed_position = position;
-    terminal = progress >= 1.0;
-    ++runtime.status.revision;
-    next_deadline = terminal ? now_ns + state->update_period_ns
-                             : std::min(runtime.deadline_ns,
-                                        now_ns + state->update_period_ns);
+    if (runtime.status.state == core::GripperCommandState::kIdle) {
+      // A real state source continues reporting while no command is active.
+      // The retained native backend models that same authority so post-Stop
+      // surveillance and recovery never depend on a one-shot Reset sample.
+      // An IScheduler callback is contractually not early; fail closed rather
+      // than recurse if a test adapter violates that contract.
+      if (state->admission_blocked || now_ns < scheduled_deadline_ns ||
+          !runtime.status.current_position.has_value() ||
+          !std::isfinite(*runtime.status.current_position)) {
+        return;
+      }
+      idle_heartbeat = true;
+      position = *runtime.status.current_position;
+      next_deadline = saturating_deadline(now_ns, state->update_period_ns);
+    } else {
+      if (runtime.status.state != core::GripperCommandState::kExecuting ||
+          !runtime.status.target_position.has_value()) {
+        return;
+      }
+      const auto total_ns = std::max<core::Duration>(
+          1, runtime.deadline_ns - runtime.started_at_ns);
+      const auto elapsed_ns =
+          std::max<core::Duration>(0, now_ns - runtime.started_at_ns);
+      const double progress =
+          runtime.deadline_ns <= runtime.started_at_ns
+              ? 1.0
+              : clamp_progress(static_cast<double>(elapsed_ns) /
+                               static_cast<double>(total_ns));
+      position =
+          runtime.start_position +
+          (*runtime.status.target_position - runtime.start_position) * progress;
+      runtime.status.progress = progress;
+      runtime.status.current_position = position;
+      runtime.status.observed_position = position;
+      terminal = progress >= 1.0;
+      ++runtime.status.revision;
+      next_deadline =
+          terminal
+              ? saturating_deadline(now_ns, state->update_period_ns)
+              : std::min(runtime.deadline_ns,
+                         saturating_deadline(now_ns, state->update_period_ns));
+    }
   }
 
   bool schedule_again = false;
@@ -226,10 +251,13 @@ void run_tick(const std::shared_ptr<SharedState>& state,
       const std::array<double, 1U> positions{position};
       const std::array<double, 1U> velocities{0.0};
       const auto now_ns = state->clock->now();
-      projection = state->state_channel->publish_and_project(
-          positions, velocities, now_ns, now_ns,
-          RetainedStateProjectionMode::kBestEffort);
-    } catch (const std::exception& error) {
+      projection = idle_heartbeat
+                       ? state->state_channel->publish_state(
+                             positions, velocities, now_ns, now_ns)
+                       : state->state_channel->publish_and_project(
+                             positions, velocities, now_ns, now_ns,
+                             RetainedStateProjectionMode::kBestEffort);
+    } catch (const std::exception &error) {
       projection = {
           RetainedStateProjectionStatus::kFailed,
           gripper_error("gripper_projection_exception", error.what())};
@@ -238,12 +266,38 @@ void run_tick(const std::shared_ptr<SharedState>& state,
                     gripper_error("gripper_projection_exception",
                                   "Native gripper state projection threw")};
     }
-    update_projection_result_locked(found->second, projection, terminal);
-    schedule_again =
-        found->second.status.state == core::GripperCommandState::kExecuting ||
-        (found->second.status.state == core::GripperCommandState::kCompleted &&
-         found->second.status.projection_state ==
-             core::GripperProjectionState::kPending);
+    if (idle_heartbeat) {
+      auto &runtime = found->second;
+      if (projection.applied()) {
+        runtime.terminal_projection_attempts = 0;
+        schedule_again =
+            !state->admission_blocked &&
+            runtime.status.state == core::GripperCommandState::kIdle;
+      } else if (projection.status == RetainedStateProjectionStatus::kBusy &&
+                 ++runtime.terminal_projection_attempts <
+                     kTerminalProjectionRetryLimit) {
+        schedule_again =
+            !state->admission_blocked &&
+            runtime.status.state == core::GripperCommandState::kIdle;
+      } else {
+        state->admission_blocked = true;
+        runtime.status.state = core::GripperCommandState::kFailed;
+        runtime.status.projection_state = core::GripperProjectionState::kFailed;
+        runtime.status.projection_reason = projection_reason(projection);
+        runtime.status.error = gripper_error(
+            "gripper_state_heartbeat_failed",
+            "Native gripper idle state publication could not be maintained");
+        ++runtime.status.revision;
+      }
+    } else {
+      update_projection_result_locked(found->second, projection, terminal);
+      schedule_again =
+          found->second.status.state == core::GripperCommandState::kExecuting ||
+          (found->second.status.state ==
+               core::GripperCommandState::kCompleted &&
+           found->second.status.projection_state ==
+               core::GripperProjectionState::kPending);
+    }
   }
   if (schedule_again) {
     (void)schedule_tick(state, gripper_id, command_id, generation,
@@ -251,8 +305,8 @@ void run_tick(const std::shared_ptr<SharedState>& state,
   }
 }
 
-bool schedule_tick(const std::shared_ptr<SharedState>& state,
-                   const std::string& gripper_id,
+bool schedule_tick(const std::shared_ptr<SharedState> &state,
+                   const std::string &gripper_id,
                    const std::uint64_t command_id,
                    const std::uint64_t generation,
                    const core::TimePoint deadline_ns) {
@@ -285,10 +339,10 @@ bool schedule_tick(const std::shared_ptr<SharedState>& state,
     handle = state->scheduler->schedule(
         deadline_ns,
         [weak_state, attempt, gripper_id, command_id, generation,
-         schedule_generation]() {
+         schedule_generation, deadline_ns]() {
           if (const auto locked = weak_state.lock()) {
             run_tick(locked, gripper_id, command_id, generation,
-                     schedule_generation, attempt);
+                     schedule_generation, deadline_ns, attempt);
           }
         },
         core::SchedulerPriority::ControllerCommand);
@@ -338,8 +392,8 @@ bool schedule_tick(const std::shared_ptr<SharedState>& state,
   return admitted;
 }
 
-[[nodiscard]] bool exact_request(const core::GripperCommandRequestDTO& request,
-                                 const SharedState& state) noexcept {
+[[nodiscard]] bool exact_request(const core::GripperCommandRequestDTO &request,
+                                 const SharedState &state) noexcept {
   return request.gripper_id == state.gripper_id &&
          request.group_id == state.group_id &&
          request.joint_name == state.joint_name &&
@@ -349,8 +403,9 @@ bool schedule_tick(const std::shared_ptr<SharedState>& state,
          request.transport_kind == "resolved_binding";
 }
 
-[[nodiscard]] std::optional<core::ErrorDTO> validate_request(
-    const core::GripperCommandRequestDTO& request, const SharedState& state) {
+[[nodiscard]] std::optional<core::ErrorDTO>
+validate_request(const core::GripperCommandRequestDTO &request,
+                 const SharedState &state) {
   if (!exact_request(request, state) ||
       !std::isfinite(request.target_position) ||
       !std::isfinite(request.duration_s) || request.duration_s < 0.0 ||
@@ -373,24 +428,23 @@ bool schedule_tick(const std::shared_ptr<SharedState>& state,
   return std::nullopt;
 }
 
-}  // namespace
+} // namespace
 
 RetainedGripperCommandBackend::RetainedGripperCommandBackend(
     core::RuntimeParticipantBinding binding,
     std::shared_ptr<IRetainedObservedStateChannel> state_channel,
     std::optional<RetainedGripperPositionLimits> position_limits,
-    core::IClock& clock,
-    core::IScheduler& scheduler, const core::Duration update_period_ns) {
+    core::IClock &clock, core::IScheduler &scheduler,
+    const core::Duration update_period_ns) {
   if (!state_channel || update_period_ns <= 0 ||
       (position_limits.has_value() &&
        (!std::isfinite(position_limits->lower_position) ||
         !std::isfinite(position_limits->upper_position) ||
         position_limits->lower_position > position_limits->upper_position))) {
-    throw std::invalid_argument(
-        "retained gripper backend requires state, "
-        "limits, and a positive period");
+    throw std::invalid_argument("retained gripper backend requires state, "
+                                "limits, and a positive period");
   }
-  const auto& value = binding.value();
+  const auto &value = binding.value();
   const bool model_backed =
       value.resources.size() == 1U &&
       value.resources.front().source_joint_name.has_value();
@@ -409,9 +463,8 @@ RetainedGripperCommandBackend::RetainedGripperCommandBackend(
     throw std::invalid_argument(
         "retained gripper backend requires one exact command coordinate");
   }
-  if (position_limits.has_value() &&
-      value.resources.front().coordinate_kind !=
-          position_limits->coordinate_kind) {
+  if (position_limits.has_value() && value.resources.front().coordinate_kind !=
+                                         position_limits->coordinate_kind) {
     throw std::invalid_argument(
         "retained gripper limits differ from the bound coordinate kind");
   }
@@ -439,6 +492,7 @@ RetainedGripperCommandBackend::RetainedGripperCommandBackend(
           : "linear";
   state_->state_authority = value.control_path->state_authority_id.value();
   state_->position_limits = std::move(position_limits);
+  state_->binding = std::move(binding);
 }
 
 RetainedGripperCommandBackend::~RetainedGripperCommandBackend() {
@@ -446,8 +500,45 @@ RetainedGripperCommandBackend::~RetainedGripperCommandBackend() {
   state_.reset();
 }
 
+core::Result<void> RetainedGripperCommandBackend::RebindRoute(
+    core::RuntimeParticipantBinding binding,
+    std::shared_ptr<IRetainedObservedStateChannel> state_channel) {
+  if (!state_channel) {
+    return core::Result<void>::Err(
+        gripper_error("gripper_route_rebind_state_missing",
+                      "Native gripper route publication has no state channel"));
+  }
+  auto expected = core::make_observed_state_query_context(
+      binding, state_channel->query_context().freshness_budget_ns);
+  if (!expected.ok() || expected.value() != state_channel->query_context()) {
+    return core::Result<void>::Err(gripper_error(
+        "gripper_route_rebind_mismatch",
+        "Native gripper route publication crosses its retained authority"));
+  }
+  try {
+    std::lock_guard lock(state_->mutex);
+    if (state_->closing ||
+        std::any_of(state_->runtimes.begin(), state_->runtimes.end(),
+                    [](const auto &row) {
+                      return row.second.status.state ==
+                             core::GripperCommandState::kExecuting;
+                    })) {
+      return core::Result<void>::Err(gripper_error(
+          "gripper_route_rebind_busy",
+          "Native gripper route publication cannot replace active state"));
+    }
+    state_->binding = std::move(binding);
+    state_->state_channel = std::move(state_channel);
+    return core::Result<void>::Ok();
+  } catch (...) {
+    return core::Result<void>::Err(gripper_error(
+        "gripper_route_rebind_capacity_unavailable",
+        "Native gripper route publication could not retain its binding"));
+  }
+}
+
 core::Result<void> RetainedGripperCommandBackend::validate_gripper_command(
-    const core::GripperCommandRequestDTO& request) const {
+    const core::GripperCommandRequestDTO &request) const {
   const auto invalid = validate_request(request, *state_);
   if (invalid.has_value()) {
     auto public_error = *invalid;
@@ -464,24 +555,22 @@ core::Result<void> RetainedGripperCommandBackend::validate_gripper_command(
   }
   const auto current = state_->runtimes.find(request.gripper_id);
   if (current != state_->runtimes.end() &&
-      current->second.status.state ==
-          core::GripperCommandState::kExecuting) {
+      current->second.status.state == core::GripperCommandState::kExecuting) {
     return core::Result<void>::Err(gripper_error(
         "gripper_busy", "Gripper is already executing a command"));
   }
   if (current != state_->runtimes.end() &&
       current->second.status.state == core::GripperCommandState::kFailed &&
       !supersedable_grasp_loss(current->second.status.error)) {
-    return core::Result<void>::Err(
-        current->second.status.error.value_or(gripper_error(
-            "gripper_command_failed",
-            "Gripper requires recovery before another command")));
+    return core::Result<void>::Err(current->second.status.error.value_or(
+        gripper_error("gripper_command_failed",
+                      "Gripper requires recovery before another command")));
   }
   return core::Result<void>::Ok();
 }
 
 core::GripperCommandResultDTO RetainedGripperCommandBackend::command_gripper(
-    const core::GripperCommandRequestDTO& request) {
+    const core::GripperCommandRequestDTO &request) {
   if (const auto invalid = validate_request(request, *state_);
       invalid.has_value()) {
     return {false, 0U, 0U, *invalid};
@@ -529,10 +618,10 @@ core::GripperCommandResultDTO RetainedGripperCommandBackend::command_gripper(
                       "Native gripper start position has invalid shape"))
                 : std::optional<core::ErrorDTO>(controlled.error())};
   }
-  const double start_position = establish_component_local_state
-                                    ? request.target_position
-                                    : position_value(
-                                          controlled.value().positions.front());
+  const double start_position =
+      establish_component_local_state
+          ? request.target_position
+          : position_value(controlled.value().positions.front());
   if (!std::isfinite(start_position)) {
     return {false, 0U, 0U,
             gripper_error("gripper_state_not_finite",
@@ -542,6 +631,7 @@ core::GripperCommandResultDTO RetainedGripperCommandBackend::command_gripper(
   std::uint64_t command_id = 0U;
   std::uint64_t generation = 0U;
   core::TimePoint first_deadline = 0;
+  std::optional<core::ScheduleHandle> superseded_handle;
   {
     std::lock_guard<std::mutex> lock(state_->mutex);
     if (state_->closing || state_->admission_blocked ||
@@ -569,7 +659,8 @@ core::GripperCommandResultDTO RetainedGripperCommandBackend::command_gripper(
 
     command_id = state_->next_command_id++;
     generation = state_->next_generation++;
-    auto& runtime = state_->runtimes[request.gripper_id];
+    auto &runtime = state_->runtimes[request.gripper_id];
+    superseded_handle = runtime.scheduled_handle;
     runtime = SharedState::Runtime{};
     runtime.start_position = start_position;
     runtime.started_at_ns = state_->clock->now();
@@ -581,7 +672,7 @@ core::GripperCommandResultDTO RetainedGripperCommandBackend::command_gripper(
             : std::min(runtime.deadline_ns,
                        runtime.started_at_ns + state_->update_period_ns);
 
-    auto& status = runtime.status;
+    auto &status = runtime.status;
     status.state = core::GripperCommandState::kExecuting;
     status.gripper_id = request.gripper_id;
     status.command_id = command_id;
@@ -602,6 +693,14 @@ core::GripperCommandResultDTO RetainedGripperCommandBackend::command_gripper(
     status.projection_state = core::GripperProjectionState::kPending;
   }
 
+  if (superseded_handle.has_value()) {
+    try {
+      state_->scheduler->cancel(*superseded_handle);
+    } catch (...) {
+      // The command and generation replacement already fence the callback.
+    }
+  }
+
   if (!schedule_tick(state_, request.gripper_id, command_id, generation,
                      first_deadline)) {
     const auto status = get_gripper_status(request.gripper_id);
@@ -617,7 +716,7 @@ core::GripperCommandResultDTO RetainedGripperCommandBackend::command_gripper(
 }
 
 core::GripperCommandStatusDTO RetainedGripperCommandBackend::get_gripper_status(
-    const std::string& gripper_id) const {
+    const std::string &gripper_id) const {
   std::lock_guard<std::mutex> lock(state_->mutex);
   const auto found = state_->runtimes.find(gripper_id);
   if (found == state_->runtimes.end()) {
@@ -630,9 +729,9 @@ core::GripperCommandStatusDTO RetainedGripperCommandBackend::get_gripper_status(
 
 core::GripperCommandResultDTO
 RetainedGripperCommandBackend::mark_gripper_grasp_lost(
-    const std::string& gripper_id, const std::uint64_t expected_command_id,
-    const std::uint64_t expected_generation, const std::string& evidence_label,
-    const std::string& message, const std::string& reason_code) {
+    const std::string &gripper_id, const std::uint64_t expected_command_id,
+    const std::uint64_t expected_generation, const std::string &evidence_label,
+    const std::string &message, const std::string &reason_code) {
   std::optional<core::ScheduleHandle> handle;
   std::uint64_t command_id = 0U;
   std::uint64_t generation = 0U;
@@ -649,7 +748,7 @@ RetainedGripperCommandBackend::mark_gripper_grasp_lost(
                   "Gripper identity changed before grasp-loss evidence was "
                   "applied")};
     }
-    auto& runtime = found->second;
+    auto &runtime = found->second;
     handle = runtime.scheduled_handle;
     runtime.scheduled_handle.reset();
     ++runtime.schedule_generation;
@@ -696,7 +795,7 @@ void RetainedGripperCommandBackend::invalidate_gripper_commands(
         reason == core::GripperInvalidationReason::kDeploymentSwap) {
       state_->closing = true;
     }
-    for (auto& [unused, runtime] : state_->runtimes) {
+    for (auto &[unused, runtime] : state_->runtimes) {
       static_cast<void>(unused);
       if (runtime.scheduled_handle.has_value()) {
         handles.push_back(*runtime.scheduled_handle);
@@ -726,12 +825,360 @@ void RetainedGripperCommandBackend::authorize_gripper_commands() noexcept {
   if (!state_) {
     return;
   }
+  std::shared_ptr<IRetainedObservedStateChannel> state_channel;
+  std::vector<double> positions;
+  std::uint64_t authority_generation = 0U;
+  struct HeartbeatTarget final {
+    std::string gripper_id;
+    std::uint64_t command_id{};
+    std::uint64_t generation{};
+    core::TimePoint first_deadline_ns{};
+  };
+  std::vector<HeartbeatTarget> heartbeat_targets;
+  bool state_available = true;
+  {
+    std::lock_guard<std::mutex> lock(state_->mutex);
+    if (state_->closing || !state_->admission_blocked) {
+      return;
+    }
+    state_channel = state_->state_channel;
+    authority_generation = state_->authority_generation;
+    positions.reserve(state_->runtimes.size());
+    for (const auto &[unused, runtime] : state_->runtimes) {
+      static_cast<void>(unused);
+      if (!runtime.status.current_position.has_value()) {
+        state_available = false;
+        break;
+      }
+      positions.push_back(*runtime.status.current_position);
+    }
+  }
+
+  bool state_refreshed = state_available && positions.empty();
+  if (state_available && !state_refreshed && state_channel != nullptr) {
+    try {
+      std::vector<double> velocities(positions.size(), 0.0);
+      const auto observed_at_ns = state_->clock->now();
+      state_refreshed = state_channel
+                            ->publish_state(positions, velocities,
+                                            observed_at_ns, observed_at_ns)
+                            .applied();
+    } catch (...) {
+      state_refreshed = false;
+    }
+  }
+
+  {
+    std::lock_guard<std::mutex> lock(state_->mutex);
+    if (state_->closing || !state_->admission_blocked ||
+        state_->authority_generation != authority_generation ||
+        !state_refreshed) {
+      return;
+    }
+    heartbeat_targets.reserve(state_->runtimes.size());
+    const auto first_deadline_ns =
+        saturating_deadline(state_->clock->now(), state_->update_period_ns);
+    for (const auto &[gripper_id, runtime] : state_->runtimes) {
+      if (runtime.status.state != core::GripperCommandState::kIdle ||
+          !runtime.status.current_position.has_value()) {
+        return;
+      }
+      heartbeat_targets.push_back(
+          HeartbeatTarget{gripper_id, runtime.status.command_id,
+                          runtime.status.generation, first_deadline_ns});
+    }
+  }
+
+  for (const auto &target : heartbeat_targets) {
+    if (!schedule_tick(state_, target.gripper_id, target.command_id,
+                       target.generation, target.first_deadline_ns)) {
+      return;
+    }
+  }
+
   std::lock_guard<std::mutex> lock(state_->mutex);
-  if (state_->closing || !state_->admission_blocked) {
+  if (state_->closing || !state_->admission_blocked ||
+      state_->authority_generation != authority_generation) {
     return;
+  }
+  for (const auto &target : heartbeat_targets) {
+    const auto found = state_->runtimes.find(target.gripper_id);
+    if (found == state_->runtimes.end() ||
+        found->second.status.command_id != target.command_id ||
+        found->second.status.generation != target.generation ||
+        !found->second.scheduled_handle.has_value()) {
+      return;
+    }
   }
   ++state_->authority_generation;
   state_->admission_blocked = false;
 }
 
-}  // namespace manyforge::roboplan_backend
+core::ParticipantStopStageResultDTO
+RetainedGripperCommandBackend::TranslateStopStage(
+    const core::ResolvedParticipantStopStageDTO &stage,
+    const core::RemainingStopBudgetDTO &budget,
+    const std::stop_token cancellation) {
+  const auto started_at = state_->clock->now();
+  const auto failure =
+      [&](std::string reason, std::string message,
+          const core::StopStageAttemptDispositionDTO disposition =
+              core::StopStageAttemptDispositionDTO::kNotDispatched) {
+        const core::ErrorDTO error{core::kErrorMotionInterruptBackendStopFailed,
+                                   std::move(message),
+                                   {{"reason", std::move(reason)}}};
+        core::ParticipantStopStageResultDTO result{
+            stage,
+            disposition,
+            core::ParticipantStopStageOutcomeDTO::kFailed,
+            std::nullopt,
+            std::nullopt,
+            std::nullopt,
+            std::nullopt,
+            std::nullopt,
+            std::nullopt,
+            std::max<std::int64_t>(0, state_->clock->now() - started_at),
+            {},
+            error};
+        if (stage.stage_index <
+            stage.participant_stop_plan.stage_commands.size()) {
+          const auto &requirements =
+              stage.participant_stop_plan.stage_commands[stage.stage_index]
+                  .resolved_stage.evidence_requirements;
+          result.evidence_items.reserve(requirements.size());
+          for (const auto &requirement : requirements) {
+            result.evidence_items.push_back(
+                {requirement.requirement.evidence_item_id,
+                 requirement.requirement.evidence_kind,
+                 core::StopEvidenceItemStateDTO::kMissing,
+                 requirement.resolved_source, std::nullopt, std::nullopt,
+                 std::nullopt, std::nullopt, error});
+          }
+        }
+        return result;
+      };
+  const auto superseded = [&] {
+    auto result = failure("stop_stage_superseded_before_dispatch",
+                          "Stop stage was cancelled before dispatch");
+    result.outcome = core::ParticipantStopStageOutcomeDTO::kSupersededNoEffect;
+    result.error = core::ErrorDTO{"stop_stage_superseded_before_dispatch",
+                                  "Stop stage was cancelled before dispatch",
+                                  {}};
+    for (auto &item : result.evidence_items) {
+      item.state = core::StopEvidenceItemStateDTO::kInapplicable;
+      item.error = result.error;
+    }
+    return result;
+  };
+  if (cancellation.stop_requested()) {
+    return superseded();
+  }
+  if (!state_->binding.has_value() ||
+      stage.stage_index >= stage.participant_stop_plan.stage_commands.size() ||
+      budget.stop_id != stage.stop_id ||
+      budget.stop_generation != stage.stop_generation ||
+      budget.remaining_outer_duration_ns <= 0) {
+    return failure("resolved_stop_stage_budget_invalid",
+                   "native gripper Stop has no valid remaining Kernel budget");
+  }
+
+  const auto &binding = state_->binding->value();
+  const auto &path = *binding.control_path;
+  const auto &command =
+      stage.participant_stop_plan.stage_commands[stage.stage_index]
+          .resolved_stage;
+  std::vector<core::ResourceId> exact_resources;
+  exact_resources.reserve(binding.resources.size());
+  for (const auto &resource : binding.resources) {
+    exact_resources.push_back(resource.resource_id);
+  }
+  std::sort(exact_resources.begin(), exact_resources.end());
+  const auto phase = std::find_if(
+      budget.phases.begin(), budget.phases.end(), [&](const auto &candidate) {
+        return candidate.phase_id ==
+               command.containment_command.command_phase_id;
+      });
+  if (stage.resources != exact_resources) {
+    return failure("resolved_stop_stage_resource_mismatch",
+                   "native gripper Stop crosses its exact resource scope");
+  }
+  if (stage.control_domain_id != path.control_domain_id ||
+      stage.control_domain_revision != path.control_domain_revision ||
+      stage.control_binding_id != path.control_binding_id ||
+      stage.control_binding_revision != path.control_binding_revision ||
+      stage.control_route_id != path.control_route_id ||
+      stage.active_control_configuration_id !=
+          path.active_control_configuration_id ||
+      stage.active_control_configuration_generation !=
+          path.active_control_configuration_generation) {
+    return failure("resolved_stop_stage_control_path_mismatch",
+                   "native gripper Stop crosses its retained control path");
+  }
+  if (command.command_target.provider_instance_id !=
+          path.provider_instance_id ||
+      command.command_target.provider_manifest_id !=
+          path.provider_manifest_id ||
+      command.command_target.provider_manifest_revision !=
+          path.provider_manifest_revision ||
+      command.command_target.runtime_unit_id != path.provider_runtime_unit_id ||
+      command.command_target.provider_runtime_epoch !=
+          path.provider_runtime_epoch) {
+    return failure("resolved_stop_stage_provider_occurrence_mismatch",
+                   "native gripper Stop names another provider occurrence");
+  }
+  if (phase == budget.phases.end() ||
+      phase->remaining_deadline_offset_ns <= 0) {
+    return failure("resolved_stop_stage_phase_budget_expired",
+                   "native gripper Stop phase has no remaining budget");
+  }
+  if (command.containment_command.command_kind ==
+      core::StopContainmentCommandKind::kControllerGoalCancel) {
+    return failure("controller_goal_dispatch_membership_unavailable",
+                   "native gripper execution has no exact goal-bound "
+                   "dispatch membership");
+  }
+  if (command.containment_command.command_kind !=
+          core::StopContainmentCommandKind::kRegistered ||
+      !command.containment_command.registered_command_kind_id.has_value() ||
+      command.containment_command.registered_command_kind_id->value() !=
+          "manyforge.stop.software_hard") {
+    return failure("resolved_stop_stage_command_mismatch",
+                   "native gripper Stop does not name its registered "
+                   "software-hard command");
+  }
+
+  const auto before =
+      state_->state_channel->current_state(state_->clock->now());
+  if (!before.ok()) {
+    return failure("stop_evidence_source_unavailable", before.error().message);
+  }
+  if (cancellation.stop_requested()) {
+    return superseded();
+  }
+  invalidate_gripper_commands(core::GripperInvalidationReason::kStop);
+  std::vector<double> positions;
+  positions.reserve(before.value().positions.size());
+  for (const auto &position : before.value().positions) {
+    positions.push_back(std::visit(
+        [](const auto &typed) {
+          if constexpr (requires { typed.value_rad; }) {
+            return typed.value_rad;
+          } else {
+            return typed.value_m;
+          }
+        },
+        position));
+  }
+  std::vector<double> velocities(positions.size(), 0.0);
+  const auto projection_time = state_->clock->now();
+  const auto projected = state_->state_channel->publish_state(
+      positions, velocities, projection_time, projection_time);
+
+  core::ParticipantStopStageResultDTO result{
+      stage,
+      core::StopStageAttemptDispositionDTO::kDispatched,
+      core::ParticipantStopStageOutcomeDTO::kFailed,
+      std::nullopt,
+      std::nullopt,
+      std::nullopt,
+      std::nullopt,
+      std::nullopt,
+      std::nullopt,
+      std::max<std::int64_t>(0, state_->clock->now() - started_at),
+      {},
+      std::nullopt};
+  const auto fail_after_dispatch = [&](std::string reason,
+                                       std::string message) {
+    result.error = core::ErrorDTO{core::kErrorMotionInterruptBackendStopFailed,
+                                  std::move(message),
+                                  {{"reason", std::move(reason)}}};
+    result.evidence_items.clear();
+    result.evidence_items.reserve(command.evidence_requirements.size());
+    for (const auto &requirement : command.evidence_requirements) {
+      result.evidence_items.push_back({requirement.requirement.evidence_item_id,
+                                       requirement.requirement.evidence_kind,
+                                       core::StopEvidenceItemStateDTO::kMissing,
+                                       requirement.resolved_source,
+                                       std::nullopt, std::nullopt, std::nullopt,
+                                       std::nullopt, result.error});
+    }
+    return result;
+  };
+  if (!projected.applied()) {
+    return fail_after_dispatch(
+        "stop_state_projection_failed",
+        "native gripper rest state could not be published");
+  }
+  const auto observed =
+      state_->state_channel->current_state(state_->clock->now());
+  if (!observed.ok() || !observed.value().velocities.has_value() ||
+      observed.value().resources != exact_resources ||
+      observed.value().source_epoch != path.provider_runtime_epoch ||
+      observed.value().sequence == 0U ||
+      std::any_of(observed.value().velocities->begin(),
+                  observed.value().velocities->end(), [](const auto &value) {
+                    return std::visit(
+                        [](const auto &velocity) {
+                          if constexpr (requires { velocity.value_rad_s; }) {
+                            return velocity.value_rad_s != 0.0;
+                          } else {
+                            return velocity.value_m_s != 0.0;
+                          }
+                        },
+                        value);
+                  })) {
+    return fail_after_dispatch(
+        "stop_evidence_not_at_rest",
+        "native gripper state does not prove exact rest");
+  }
+  const auto &snapshot = observed.value();
+  result.evidence_items.reserve(command.evidence_requirements.size());
+  for (const auto &requirement : command.evidence_requirements) {
+    const auto age = std::max<std::int64_t>(
+        0, state_->clock->now() - snapshot.received_timestamp_ns);
+    if (requirement.requirement.evidence_kind !=
+        core::StopEvidenceRequirementKind::kMotionRest) {
+      return fail_after_dispatch("stop_evidence_kind_mismatch",
+                                 "native gripper stage requires unsupported "
+                                 "evidence");
+    }
+    if (requirement.resolved_source.source_kind !=
+        core::StopEvidenceSourceKind::kBindingStateAuthority) {
+      return fail_after_dispatch(
+          "stop_evidence_source_kind_mismatch",
+          "native gripper stage requires another evidence source kind");
+    }
+    if (requirement.resolved_source.runtime_target.provider_runtime_epoch !=
+        snapshot.source_epoch) {
+      return fail_after_dispatch(
+          "stop_evidence_source_epoch_mismatch",
+          "native gripper stage crosses its provider runtime epoch");
+    }
+    if (requirement.resolved_source.state_authority_id !=
+            std::optional(snapshot.state_authority_id) ||
+        requirement.resolved_source.state_authority_class !=
+            std::optional(snapshot.state_authority_class)) {
+      return fail_after_dispatch(
+          "stop_evidence_state_authority_mismatch",
+          "native gripper stage requires another state authority");
+    }
+    if (age > requirement.requirement.source_requirement.freshness_budget_ns) {
+      return fail_after_dispatch("stop_evidence_source_stale",
+                                 "native gripper rest evidence is stale");
+    }
+    result.evidence_items.push_back(
+        {requirement.requirement.evidence_item_id,
+         requirement.requirement.evidence_kind,
+         core::StopEvidenceItemStateDTO::kSatisfied,
+         requirement.resolved_source, snapshot.source_epoch, snapshot.sequence,
+         age, core::JsonValueDTO{true}, std::nullopt});
+  }
+  result.outcome = core::ParticipantStopStageOutcomeDTO::kSucceeded;
+  result.source_epoch = snapshot.source_epoch;
+  result.source_sequence = snapshot.sequence;
+  result.receiver_elapsed_duration_ns =
+      std::max<std::int64_t>(0, state_->clock->now() - started_at);
+  return result;
+}
+
+} // namespace manyforge::roboplan_backend

@@ -12,9 +12,10 @@ namespace manyforge::core {
 /// FNV-1a 64-bit content-hash primitives (spec §3.8.1, added by the
 /// kernel-architecture sprint P-2-impl-snapshot chunk).
 ///
-/// This is NOT a cryptographic hash. It is a process-independent
-/// diagnostic fingerprint used for `CollisionWorldRevision.content_hash`
-/// and similar content-defined identifiers. Stability properties:
+/// This is NOT a cryptographic hash. It is retained only as a
+/// process-independent diagnostic fingerprint for legacy/local callers.
+/// Authoritative content identities use `manyforge_content_identity` framed
+/// SHA-256. Stability properties:
 ///
 ///   - **Deterministic.** Identical byte streams produce identical
 ///     digests across builds, hosts, and architectures.
@@ -40,8 +41,7 @@ class ContentHasher {
   ContentHasher& mix(std::string_view field) noexcept {
     mix_byte(kTypeString);
     mix_uint64_le(static_cast<std::uint64_t>(field.size()));
-    mix_bytes(reinterpret_cast<const unsigned char*>(field.data()),
-              field.size());
+    mix_bytes(reinterpret_cast<const unsigned char*>(field.data()), field.size());
     return *this;
   }
 

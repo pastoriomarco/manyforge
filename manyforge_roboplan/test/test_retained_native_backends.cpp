@@ -667,6 +667,47 @@ TEST(RetainedGripperCommandBackendTest,
 }
 
 TEST(RetainedGripperCommandBackendTest,
+     AuthorizationMaintainsFreshIdleStateUntilACommandTakesOwnership) {
+  auto binding = make_binding(CoordinateKind::kLinear);
+  auto channel = std::make_shared<FakeRetainedStateChannel>(
+      binding, std::vector<double>{0.0});
+  FakeClock clock;
+  ManualScheduler scheduler;
+  RetainedGripperCommandBackend backend(
+      binding, channel, gripper_limits(binding), clock, scheduler);
+  const auto first =
+      backend.command_gripper(gripper_request(binding, 0.02, 1.0));
+  ASSERT_TRUE(first.accepted);
+
+  backend.invalidate_gripper_commands(GripperInvalidationReason::kReset);
+  clock.advance(25'000'000);
+  backend.authorize_gripper_commands();
+  ASSERT_EQ(channel->publish_calls(), 1);
+  EXPECT_EQ(backend.get_gripper_status("gripper.target").state,
+            GripperCommandState::kIdle);
+
+  clock.advance(10'000'000);
+  scheduler.advance_to(clock.now());
+  ASSERT_EQ(channel->publish_calls(), 2);
+  auto observed = channel->current_state(clock.now());
+  ASSERT_TRUE(observed.ok());
+  EXPECT_EQ(observed.value().received_timestamp_ns, clock.now());
+
+  clock.advance(10'000'000);
+  scheduler.advance_to(clock.now());
+  ASSERT_EQ(channel->publish_calls(), 3);
+
+  const auto replacement =
+      backend.command_gripper(gripper_request(binding, 0.01, 1.0));
+  ASSERT_TRUE(replacement.accepted);
+  clock.advance(10'000'000);
+  scheduler.advance_to(clock.now());
+  EXPECT_EQ(channel->publish_calls(), 4);
+  EXPECT_EQ(backend.get_gripper_status("gripper.target").state,
+            GripperCommandState::kExecuting);
+}
+
+TEST(RetainedGripperCommandBackendTest,
      TerminalProjectionRetryIsBoundedAndVisible) {
   auto binding = make_binding(CoordinateKind::kLinear);
   auto channel = std::make_shared<FakeRetainedStateChannel>(
@@ -871,6 +912,37 @@ TEST(RoboPlanExecutionBackendTest,
   EXPECT_DOUBLE_EQ(
       std::get<AngularPositionDTO>(state.value().positions[1]).value_rad, -0.3);
   EXPECT_TRUE(backend.sync_observed_state_before_planning().ok());
+}
+
+TEST(RoboPlanExecutionBackendTest,
+     MaintainsFreshOwnerIssuedMotionStateWhileIdle) {
+  auto binding = make_binding(CoordinateKind::kAngular, "arm.target");
+  auto channel = std::make_shared<FakeRetainedStateChannel>(
+      binding, std::vector<double>{0.1, -0.2});
+  FakeClock clock;
+  ManualScheduler scheduler;
+  RoboPlanExecutionBackend backend(binding, channel, clock, scheduler);
+
+  const int initial_publications = channel->publish_calls();
+  ASSERT_GT(initial_publications, 0);
+  EXPECT_EQ(scheduler.last_priority(), SchedulerPriority::RuntimeSafety);
+
+  clock.advance(10'000'000);
+  scheduler.advance_to(clock.now());
+  EXPECT_EQ(channel->publish_calls(), initial_publications + 1);
+  const auto observed = channel->current_state(clock.now());
+  ASSERT_TRUE(observed.ok());
+  EXPECT_EQ(observed.value().received_timestamp_ns, clock.now());
+  ASSERT_TRUE(observed.value().velocities.has_value());
+  ASSERT_EQ(observed.value().velocities->size(), 2U);
+  EXPECT_DOUBLE_EQ(
+      std::get<AngularVelocityDTO>((*observed.value().velocities)[0])
+          .value_rad_s,
+      0.0);
+  EXPECT_DOUBLE_EQ(
+      std::get<AngularVelocityDTO>((*observed.value().velocities)[1])
+          .value_rad_s,
+      0.0);
 }
 
 TEST(RoboPlanExecutionBackendTest,

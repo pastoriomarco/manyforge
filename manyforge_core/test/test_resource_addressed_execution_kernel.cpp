@@ -6304,6 +6304,16 @@ TEST(ResourceAddressedExecutionKernelTest,
   ASSERT_FALSE(blocked.ok());
   EXPECT_EQ(blocked.error().details.at("reason"), "runtime_route_publication_required");
   EXPECT_EQ(engine.execute_calls, 0);
+  const DisableHandoffAdmissionQueryDTO bootstrap_query{
+      binding.value().controllable_component_id,
+      DisableHandoffScopeRequestKindDTO::kFullStopRequired, std::nullopt};
+  const auto bootstrap = kernel.capture_disable_handoff_runtime_snapshot(bootstrap_query);
+  ASSERT_TRUE(bootstrap.ok()) << bootstrap.error().message;
+  ASSERT_EQ(bootstrap.value().current_active_control_configurations.size(), 1U);
+  EXPECT_EQ(bootstrap.value()
+                .current_active_control_configurations.front()
+                .active_control_configuration.presence,
+            ExpectedActiveControlConfigurationPresenceDTO::kAbsent);
 
   const auto qualified = registration(binding, engine);
   const auto published =
@@ -6314,6 +6324,67 @@ TEST(ResourceAddressedExecutionKernelTest,
   const auto admitted = kernel.execute(motion_operation("request.motion.bootstrap-open"));
   ASSERT_TRUE(admitted.ok()) << admitted.error().message;
   EXPECT_EQ(engine.execute_calls, 1);
+}
+
+TEST(ResourceAddressedExecutionKernelTest,
+     OwnerReplacementAdoptsDurableRoutePredecessorWithoutOpeningAdmission) {
+  FakeClock clock;
+  FakeParticipantEngine engine;
+  FakeOperationJournal journal;
+  const auto predecessor_binding =
+      make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular);
+  const auto predecessor_configuration =
+      route_configuration_for(registration(predecessor_binding, engine));
+
+  auto current_value = predecessor_binding.value();
+  const RuntimeEpoch current_epoch("runtime-epoch.2");
+  current_value.control_path->provider_runtime_epoch = current_epoch;
+  for (auto& provider : current_value.supporting_capability_provider_paths) {
+    provider.provider_runtime_epoch = current_epoch;
+  }
+  for (auto& runtime : current_value.runtime_unit_epochs) {
+    runtime.runtime_epoch = current_epoch;
+  }
+  auto current_binding = verify_runtime_participant_binding(std::move(current_value));
+  ASSERT_TRUE(current_binding.ok()) << current_binding.error().message;
+
+  ResourceAddressedExecutionKernel kernel(
+      {unqualified_registration(current_binding.value(), engine)}, clock, journal,
+      ResourceAddressedExecutionKernelConfig{RequestOwnerEpoch("kernel.epoch.2"),
+                                             CellId("cell.test"), 16U});
+  const auto adopted = kernel.adopt_runtime_route_configuration_predecessor(
+      predecessor_configuration, {unqualified_registration(current_binding.value(), engine)});
+  ASSERT_TRUE(adopted.ok()) << adopted.error().message;
+  EXPECT_EQ(adopted.value().active_configuration, predecessor_configuration);
+  EXPECT_TRUE(adopted.value().readiness_rows.empty());
+  EXPECT_FALSE(adopted.value().operation_admission_open);
+
+  const auto readback =
+      kernel.current_runtime_route_configuration(predecessor_configuration.control_domain_id);
+  ASSERT_TRUE(readback.ok()) << readback.error().message;
+  ASSERT_TRUE(readback.value().has_value());
+  EXPECT_EQ(*readback.value(), adopted.value());
+
+  const DisableHandoffAdmissionQueryDTO query{
+      current_binding.value().value().controllable_component_id,
+      DisableHandoffScopeRequestKindDTO::kFullStopRequired, std::nullopt};
+  const auto snapshot = kernel.capture_disable_handoff_runtime_snapshot(query);
+  ASSERT_TRUE(snapshot.ok()) << snapshot.error().message;
+  ASSERT_EQ(snapshot.value().current_active_control_configurations.size(), 1U);
+  const auto& current =
+      snapshot.value().current_active_control_configurations.front().active_control_configuration;
+  EXPECT_EQ(current.presence, ExpectedActiveControlConfigurationPresenceDTO::kPresent);
+  EXPECT_EQ(current.active_control_configuration_id,
+            predecessor_configuration.active_control_configuration_id);
+  EXPECT_EQ(current.active_control_configuration_generation,
+            predecessor_configuration.active_control_configuration_generation);
+
+  auto intent = motion_operation("request.motion.predecessor-closed");
+  intent.request_context.request_owner_epoch = RequestOwnerEpoch("kernel.epoch.2");
+  const auto blocked = kernel.execute(intent);
+  ASSERT_FALSE(blocked.ok());
+  EXPECT_EQ(blocked.error().details.at("reason"), "runtime_route_publication_required");
+  EXPECT_EQ(engine.execute_calls, 0);
 }
 
 TEST(ResourceAddressedExecutionKernelTest,

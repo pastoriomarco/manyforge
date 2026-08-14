@@ -62,20 +62,6 @@ template <typename Counter>
   });
 }
 
-[[nodiscard]] bool uses_capability_provider(StopContainmentCommandKind command_kind) noexcept {
-  switch (command_kind) {
-    case StopContainmentCommandKind::kControllerGoalCancel:
-    case StopContainmentCommandKind::kMotionControlledStop:
-      return false;
-    case StopContainmentCommandKind::kCapabilityCommandCancel:
-    case StopContainmentCommandKind::kSafeOutputCommand:
-    case StopContainmentCommandKind::kLogicalCancel:
-    case StopContainmentCommandKind::kRegistered:
-      return true;
-  }
-  return false;
-}
-
 [[nodiscard]] std::size_t containment_rank(ContainmentGranularity value) noexcept {
   switch (value) {
     case ContainmentGranularity::kResource:
@@ -458,8 +444,6 @@ template <typename ProviderPath>
     return invalid("participant_stop_runtime_join_invalid");
   }
   const auto& resolved = command->resolved_stage;
-  const bool capability_provider_selected =
-      uses_capability_provider(resolved.containment_command.command_kind);
   const RuntimeCapabilityProviderPathDTO* selected_capability_provider = nullptr;
   const auto matches_binding_pair = [&](const RuntimeCapabilityProviderPathDTO& candidate) {
     return stage.capability_provider_binding_id.has_value() &&
@@ -478,12 +462,23 @@ template <typename ProviderPath>
       supporting_provider != binding.supporting_capability_provider_paths.end()) {
     selected_capability_provider = &*supporting_provider;
   }
-  if (stage.capability_provider_binding_id.has_value() != capability_provider_selected ||
-      (capability_provider_selected && selected_capability_provider == nullptr)) {
+  const auto target_matches_capability_provider =
+      [&](const RuntimeCapabilityProviderPathDTO& candidate) {
+        return target_matches_provider(resolved.command_target, candidate);
+      };
+  const bool capability_provider_target_available =
+      (binding.capability_provider_path.has_value() &&
+       target_matches_capability_provider(*binding.capability_provider_path)) ||
+      std::any_of(binding.supporting_capability_provider_paths.begin(),
+                  binding.supporting_capability_provider_paths.end(),
+                  target_matches_capability_provider);
+  if ((stage.capability_provider_binding_id.has_value() &&
+       selected_capability_provider == nullptr) ||
+      (!stage.capability_provider_binding_id.has_value() && capability_provider_target_available)) {
     return invalid("participant_stop_capability_provider_join_invalid");
   }
   const bool target_matches_selected_provider =
-      capability_provider_selected
+      selected_capability_provider != nullptr
           ? target_matches_provider(resolved.command_target, *selected_capability_provider)
           : target_matches_provider(resolved.command_target, path);
   const bool target_epoch_join =
@@ -655,10 +650,9 @@ Result<void> ValidateParticipantStopStageResult(
     return invalid("participant_stop_stage_result_source_epoch_invalid");
   }
   const auto expected_mode = requested_mode(*command);
-  if (!expected_mode.has_value() &&
-      (result.actual_provider_contract_mode.has_value() ||
-       result.actual_provider_contract_provenance.has_value() ||
-       result.recoverable_substitution_reason.has_value())) {
+  if (!expected_mode.has_value() && (result.actual_provider_contract_mode.has_value() ||
+                                     result.actual_provider_contract_provenance.has_value() ||
+                                     result.recoverable_substitution_reason.has_value())) {
     return invalid("participant_stop_stage_result_mode_not_defined");
   }
   if (result.attempt_disposition == StopStageAttemptDispositionDTO::kNotDispatched &&

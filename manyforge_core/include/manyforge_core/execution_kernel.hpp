@@ -616,7 +616,8 @@ class ExecutionKernel : public IResolvedParticipantExecutionEngine,
 
   Result<std::shared_ptr<const PreparedOperationParticipantDTO>>
   make_and_prepare_motion_participant(
-      const ExecuteRequestDTO& request, const ExecuteWorkerPlanPhaseResult& plan_phase,
+      const ExecuteRequestDTO& request, const TrajectoryDTO& trajectory,
+      const ExecuteWorkerPlanPhaseResult& plan_phase,
       const ExecuteWorkerValidationPhaseResult& validation_phase,
       const std::shared_ptr<PreparedMotionSession>& prepared_session);
 

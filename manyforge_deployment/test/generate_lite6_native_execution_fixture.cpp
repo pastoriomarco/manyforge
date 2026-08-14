@@ -13,6 +13,7 @@
 #include <manyforge_deployment/program_binding_compiler.hpp>
 #include <manyforge_deployment/program_contract.hpp>
 #include <manyforge_deployment/verified_retained_bundle.hpp>
+#include <manyforge_lite6_product/lifecycle_profile.hpp>
 #include <memory>
 #include <optional>
 #include <span>
@@ -50,13 +51,15 @@ struct GeneratorArguments final {
   std::filesystem::path output_root;
   std::optional<std::filesystem::path> test_build_identity_target;
   std::optional<StopQualificationInputPaths> stop_qualification;
+  bool cclc_product{};
 };
 
 [[nodiscard]] GeneratorArguments parse_arguments(int argc, char** argv) {
   if (argc < 3 || argc % 2 == 0) {
     throw std::invalid_argument(
         "usage: generate_lite6_native_execution_fixture "
-        "--output-root PATH [--test-build-identity-target PATH | "
+        "--output-root PATH [--fixture-kind cclc-product] "
+        "[--test-build-identity-target PATH | "
         "--stop-implementation-build PATH --stop-installed-target PATH "
         "--stop-runner-contract PATH --stop-runner-executable PATH "
         "--stop-implementation-evidence PATH "
@@ -88,6 +91,9 @@ struct GeneratorArguments final {
         "native execution fixture output root is missing");
   }
   const auto test_identity = take("--test-build-identity-target");
+  const auto fixture_kind = take("--fixture-kind");
+  const bool cclc_product =
+      fixture_kind.has_value() && fixture_kind->string() == "cclc-product";
   const std::array qualification_names{
       std::string_view("--stop-implementation-build"),
       std::string_view("--stop-installed-target"),
@@ -103,17 +109,21 @@ struct GeneratorArguments final {
     qualification_count += qualification_values[index].has_value() ? 1U : 0U;
   }
   const std::size_t expected_argument_count =
-      1U + (test_identity.has_value() ? 1U : 0U) + qualification_count;
+      1U + (fixture_kind.has_value() ? 1U : 0U) +
+      (test_identity.has_value() ? 1U : 0U) + qualification_count;
   if (values.size() != expected_argument_count ||
+      (fixture_kind.has_value() && !cclc_product) ||
       (qualification_count != 0U &&
        qualification_count != qualification_names.size()) ||
-      (test_identity.has_value() && qualification_count != 0U)) {
+      (test_identity.has_value() && qualification_count != 0U) ||
+      (cclc_product && qualification_count == 0U)) {
     throw std::invalid_argument(
         "native execution fixture argument set is unknown, partial, or "
         "combines authoritative and test-only identity modes");
   }
 
-  GeneratorArguments result{*output_root, test_identity, std::nullopt};
+  GeneratorArguments result{*output_root, test_identity, std::nullopt,
+                            cclc_product};
   if (qualification_count != 0U) {
     result.stop_qualification = StopQualificationInputPaths{
         *qualification_values[0], *qualification_values[1],
@@ -168,46 +178,55 @@ struct GeneratorArguments final {
 
 void require_stop_qualified_durable_projection(
     const deployment::RetainedBundle& bundle,
-    const deployment::detail::StopQualificationEvidenceCandidate& candidate) {
+    const deployment::detail::StopQualificationEvidenceCandidate& candidate,
+    const std::size_t expected_control_domains = 1U,
+    const bool expect_substitution = true) {
   if (!candidate.implementation_qualification_package_bytes.has_value() ||
       !candidate.controlled_substitution_package_bytes.has_value()) {
     throw std::logic_error(
         "Stop-qualified retained fixture lacks one evidence family");
   }
   const auto& compiled = bundle.value().compiled_products;
-  if (compiled.control_domain_products.size() != 1U ||
-      compiled.control_domain_products.front().products.size() != 1U) {
+  if (compiled.control_domain_products.size() != expected_control_domains ||
+      std::any_of(compiled.control_domain_products.begin(),
+                  compiled.control_domain_products.end(), [](const auto &row) {
+                    return row.products.size() != 1U;
+                  })) {
     throw std::logic_error(
-        "Stop-qualified retained fixture has no sole control product");
+        "Stop-qualified retained fixture has the wrong control-domain "
+        "cardinality");
   }
-  const auto& control =
-      compiled.control_domain_products.front().products.front();
-  if (control.product_contract_id.value() !=
-          deployment::detail::kControlDomainControlContractId ||
-      control.artifact_refs.size() != 3U) {
-    throw std::logic_error(
-        "Stop-qualified retained fixture has the wrong control closure");
+  for (const auto &domain : compiled.control_domain_products) {
+    const auto &control = domain.products.front();
+    if (control.product_contract_id.value() !=
+            deployment::detail::kControlDomainControlContractId ||
+        control.artifact_refs.size() != (expect_substitution ? 3U : 2U)) {
+      throw std::logic_error(
+          "Stop-qualified retained fixture has the wrong control closure");
+    }
+    const auto main = std::find_if(
+        control.artifact_refs.begin(), control.artifact_refs.end(),
+        [](const auto &artifact) {
+          return artifact.artifact_role_id.value() ==
+                 deployment::detail::kControlDomainControlArtifactRole;
+        });
+    if (main == control.artifact_refs.end() ||
+        main->media_type != deployment::detail::kControlDomainControlMediaType) {
+      throw std::logic_error(
+          "Stop-qualified retained fixture lost its primary control artifact");
+    }
+    static_cast<void>(require_exact_artifact(
+        control, core::kStopImplementationQualificationArtifactRole,
+        core::kStopImplementationQualificationMediaType,
+        *candidate.implementation_qualification_package_bytes));
+    if (expect_substitution) {
+      static_cast<void>(require_exact_artifact(
+          control,
+          core::kControlledStopSubstitutionQualificationArtifactRole,
+          core::kControlledStopSubstitutionQualificationMediaType,
+          *candidate.controlled_substitution_package_bytes));
+    }
   }
-  const auto main = std::find_if(
-      control.artifact_refs.begin(), control.artifact_refs.end(),
-      [](const auto& artifact) {
-        return artifact.artifact_role_id.value() ==
-               deployment::detail::kControlDomainControlArtifactRole;
-      });
-  if (main == control.artifact_refs.end() ||
-      main->media_type !=
-          deployment::detail::kControlDomainControlMediaType) {
-    throw std::logic_error(
-        "Stop-qualified retained fixture lost its primary control artifact");
-  }
-  static_cast<void>(require_exact_artifact(
-      control, core::kStopImplementationQualificationArtifactRole,
-      core::kStopImplementationQualificationMediaType,
-      *candidate.implementation_qualification_package_bytes));
-  static_cast<void>(require_exact_artifact(
-      control, core::kControlledStopSubstitutionQualificationArtifactRole,
-      core::kControlledStopSubstitutionQualificationMediaType,
-      *candidate.controlled_substitution_package_bytes));
 
   if (compiled.runtime_unit_products.size() != 1U) {
     throw std::logic_error(
@@ -471,6 +490,24 @@ int main(int argc, char** argv) {
     }
     auto materialized = [&]() {
       if (stop_candidate.has_value()) {
+        if (arguments.cclc_product) {
+          const auto arm_semantic = manyforge::lite6_product::
+              compute_lite6_lifecycle_catalog_semantic_digest();
+          const auto gripper_semantic = manyforge::lite6_product::
+              compute_lite6_gripper_lifecycle_catalog_semantic_digest();
+          if (!arm_semantic.ok() || !gripper_semantic.ok()) {
+            throw std::logic_error(
+                "native CCLC lifecycle semantic digest is unavailable");
+          }
+          return deployment::test::
+              materialize_lite6_native_cclc_product_retained_consumer_fixture(
+                  package_root,
+                  std::span<const deployment::detail::
+                                StopQualificationEvidenceCandidate>(
+                      &*stop_candidate, 1U),
+                  arm_semantic.value().value(),
+                  gripper_semantic.value().value());
+        }
         return deployment::test::
             materialize_lite6_stop_qualified_native_motion_retained_consumer_fixture(
                 package_root,
@@ -490,7 +527,7 @@ int main(int argc, char** argv) {
     if (materialized.bundle == nullptr) {
       throw std::logic_error("native execution fixture has no bundle");
     }
-    if (stop_candidate.has_value()) {
+    if (stop_candidate.has_value() && !arguments.cclc_product) {
       const core::RetainedBundleId retained_bundle_id =
           materialized.bundle->retained_bundle_id();
       const std::string retained_bundle_bytes{
@@ -529,6 +566,10 @@ int main(int argc, char** argv) {
                        deployment::canonical_json(manifest));
       std::cout << (output_root / "manifest.json").string() << '\n';
       return 0;
+    }
+    if (stop_candidate.has_value()) {
+      require_stop_qualified_durable_projection(*materialized.bundle,
+                                                *stop_candidate, 2U, false);
     }
     const auto& bundle = *materialized.bundle;
     const auto& products = bundle.value().compiled_products;
@@ -592,6 +633,7 @@ int main(int argc, char** argv) {
     write_exact_file(program_path, program_bytes);
     const CanonicalValue manifest(CanonicalValue::Object{
         {"api_version", CanonicalValue("manyforge.i6.native-execution-fixture.v1")},
+        {"cclc_product", CanonicalValue(arguments.cclc_product)},
         {"cell_id", CanonicalValue(bundle.value().cell_graph.cell_id.value())},
         {"retained_bundle_id", CanonicalValue(bundle.retained_bundle_id().value())},
         {"graph_revision", CanonicalValue(bundle.value().cell_graph.graph_revision.value())},

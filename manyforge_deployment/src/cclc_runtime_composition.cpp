@@ -54,7 +54,11 @@ CCLCRuntimeComposition::CreateAndStart(
     core::ICCLCKernelDisableHandoffPort &kernel_disable_handoff_port,
     core::ICCLCKernelRouteConfigurationFencePort &kernel_route_fence_port,
     IRouteConfigurationKernelPublicationOwner &kernel_publication_owner,
-    core::IClock &clock, core::IScheduler &scheduler) {
+    core::IClock &clock, core::IScheduler &scheduler,
+    std::function<core::Result<
+        std::optional<core::ActiveControlConfigurationDTO>>(
+        const core::ControlDomainId &)>
+        kernel_current_configuration_source) {
   if (!config.locally_valid() || retained_bundle == nullptr ||
       !expected_active_publication.valid() ||
       expected_active_publication.request.candidate_retained_bundle_id !=
@@ -77,6 +81,7 @@ CCLCRuntimeComposition::CreateAndStart(
             std::move(lifecycle_provider_occurrences),
             std::move(controller_sources), std::move(brand_ports),
             std::move(controller_ports), std::move(source_projections),
+            std::move(kernel_current_configuration_source),
             kernel_disable_handoff_port, kernel_route_fence_port,
             kernel_publication_owner, clock, scheduler));
     auto started = result->coordinator_.Start();
@@ -127,6 +132,10 @@ CCLCRuntimeComposition::CCLCRuntimeComposition(
     std::vector<core::BrandLifecyclePortRegistrationDTO> brand_ports,
     std::vector<core::ControllerLifecyclePortRegistrationDTO> controller_ports,
     std::vector<core::KinematicResourceSourceProjectionDTO> source_projections,
+    std::function<core::Result<
+        std::optional<core::ActiveControlConfigurationDTO>>(
+        const core::ControlDomainId &)>
+        kernel_current_configuration_source,
     core::ICCLCKernelDisableHandoffPort &kernel_disable_handoff_port,
     core::ICCLCKernelRouteConfigurationFencePort &kernel_route_fence_port,
     IRouteConfigurationKernelPublicationOwner &kernel_publication_owner,
@@ -146,7 +155,8 @@ CCLCRuntimeComposition::CCLCRuntimeComposition(
                                  std::move(lifecycle_provider_occurrences)),
       route_snapshot_source_(*retained_bundle_, active_publication_reader,
                              expected_active_publication, journal_,
-                             artifact_source, std::move(controller_sources)),
+                             artifact_source, std::move(controller_sources),
+                             std::move(kernel_current_configuration_source)),
       route_publication_port_(*retained_bundle_, artifact_source,
                               plan_repository_, kernel_publication_owner,
                               std::move(source_projections),

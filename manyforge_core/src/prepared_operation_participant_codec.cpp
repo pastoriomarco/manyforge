@@ -92,8 +92,16 @@ void require_portable(std::string_view value, std::string reason) {
   if (!portable(value)) fail(std::move(reason));
 }
 
-[[nodiscard]] CanonicalValue embedded(const Result<std::string>& encoded) {
-  if (!encoded.ok()) fail("nested_value_invalid");
+[[nodiscard]] CanonicalValue embedded(const Result<std::string>& encoded,
+                                      std::string_view failure_reason) {
+  if (!encoded.ok()) {
+    auto reason = std::string(failure_reason);
+    const auto nested = encoded.error().details.find("reason");
+    if (nested != encoded.error().details.end() && !nested->second.empty()) {
+      reason.append(".").append(nested->second);
+    }
+    fail(std::move(reason));
+  }
   return content_identity::parse_canonical_json(encoded.value());
 }
 
@@ -651,13 +659,19 @@ template <class Id>
     scopes.push_back(motion_scope_value(scope, base, resources, defaults));
   CanonicalValue::Object fields{
       {"move_id", CanonicalValue(value.move_id.value())},
-      {"plan_request", embedded(EncodePreparedPlanRequest(value.plan_request))},
-      {"trajectory", embedded(EncodePreparedTrajectory(value.trajectory))},
-      {"start_state", embedded(EncodePreparedControlledState(value.start_state))},
+      {"plan_request",
+       embedded(EncodePreparedPlanRequest(value.plan_request),
+                "prepared_plan_request_encoding_invalid")},
+      {"trajectory", embedded(EncodePreparedTrajectory(value.trajectory),
+                              "prepared_trajectory_encoding_invalid")},
+      {"start_state", embedded(EncodePreparedControlledState(value.start_state),
+                               "prepared_start_state_encoding_invalid")},
       {"planning_evidence",
-       embedded(EncodePreparedMotionPlanningEvidence(value.planning_evidence))},
+       embedded(EncodePreparedMotionPlanningEvidence(value.planning_evidence),
+                "prepared_planning_evidence_encoding_invalid")},
       {"validation_evidence",
-       embedded(EncodePreparedMotionValidationEvidence(value.validation_evidence))},
+       embedded(EncodePreparedMotionValidationEvidence(value.validation_evidence),
+                "prepared_validation_evidence_encoding_invalid")},
       {"runtime_policy",
        CanonicalValue(CanonicalValue::Object{
            {"runtime_policy_id", CanonicalValue(value.runtime_policy.runtime_policy_id.value())},
@@ -784,7 +798,8 @@ template <class Id>
        CanonicalValue(value.stop_evidence_policy_revision.value())},
       {"ordinary_stop_plan",
        embedded(EncodePreparedParticipantStopPlan(base, value.ordinary_stop_plan, resources,
-                                                  defaults, node_category))}};
+                                                  defaults, node_category),
+                "prepared_ordinary_stop_plan_encoding_invalid")}};
   if (value.capability_provider)
     fields.emplace_back("capability_provider",
                         capability_provider_value(*value.capability_provider));

@@ -603,9 +603,7 @@ bool RouteSelectionAcceptedDTO::locally_valid() const noexcept {
          predecessor.controller_topology_id == desired_configuration.controller_topology_id &&
          predecessor.topology_revision == desired_configuration.topology_revision &&
          predecessor.source_runtime_unit_id ==
-             controller_lifecycle_observation_query.source_runtime_unit_id &&
-         predecessor.source_runtime_epoch ==
-             controller_lifecycle_observation_query.source_runtime_epoch;
+             controller_lifecycle_observation_query.source_runtime_unit_id;
 }
 
 bool RouteSelectionStatusDTO::locally_valid() const noexcept {
@@ -937,8 +935,7 @@ Result<PreparedRouteSelectionAdmission> PrepareRouteSelectionAdmission(
         current.controller_topology_id != intent.desired_configuration.controller_topology_id ||
         current.topology_revision != intent.desired_configuration.topology_revision ||
         current.source_runtime_unit_id !=
-            candidate.expected_controller_domain.source_runtime_unit_id ||
-        current.source_runtime_epoch != candidate.expected_controller_domain.source_runtime_epoch) {
+            candidate.expected_controller_domain.source_runtime_unit_id) {
       return reject("route_selection_configuration_stale",
                     "the predecessor configuration is not one reconciled current domain fact",
                     "predecessor_identity_or_runtime_changed");

@@ -507,7 +507,7 @@ TEST(PreparedOperationParticipantCodecTest, BackendBindingRejectsCrossedParticip
   crossed.control_route_id = ControlRouteId("route.other");
   EXPECT_EQ(prepared_participant_backend_binding_field_error(
                 crossed, inputs.binding, PreparedParticipantPayloadKindDTO::kMotionExecution),
-            "prepared_participant_backend_binding_mismatch");
+            "prepared_participant_backend_control_route_id_mismatch");
 }
 
 TEST(PreparedOperationParticipantCodecTest,

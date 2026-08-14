@@ -523,6 +523,37 @@ TEST_F(ComponentLifecycleCurrentSnapshotSourceTest,
           .active_control_configuration_generation,
       active_configuration(facts).active_control_configuration_generation);
   EXPECT_TRUE(templates.value().locally_valid());
+
+  VerifiedRouteSelectionCurrentSnapshotSource replacement_source(
+      bundle(), publication_reader, receipt, current, artifacts,
+      {{facts.domain->control_domain_id,
+        facts.provider.provider_runtime_unit_id,
+        core::RuntimeEpoch("replacement-controller-epoch")}},
+      [configuration =
+           active_configuration(facts)](const core::ControlDomainId &domain_id)
+          -> core::Result<std::optional<core::ActiveControlConfigurationDTO>> {
+        if (domain_id != configuration.control_domain_id) {
+          return core::
+              Result<std::optional<core::ActiveControlConfigurationDTO>>::Ok(
+                  std::nullopt);
+        }
+        return core::
+            Result<std::optional<core::ActiveControlConfigurationDTO>>::Ok(
+                configuration);
+      });
+  const auto replacement = replacement_source.ReadCurrentRouteSelectionSnapshot(
+      bundle().retained_bundle_id(), bundle().value().cell_graph.graph_revision,
+      *facts.desired);
+  ASSERT_TRUE(replacement.ok()) << replacement.error().message;
+  EXPECT_EQ(replacement.value()
+                .value()
+                .active_control_configuration->source_runtime_epoch,
+            facts.provider.provider_runtime_epoch);
+  EXPECT_EQ(replacement.value()
+                .expected_controller_domain()
+                .value()
+                .source_runtime_epoch,
+            core::RuntimeEpoch("replacement-controller-epoch"));
 }
 
 TEST_F(ComponentLifecycleCurrentSnapshotSourceTest,
@@ -571,8 +602,8 @@ TEST_F(ComponentLifecycleCurrentSnapshotSourceTest,
   VerifiedRouteSelectionCurrentSnapshotSource foreign(
       bundle(), stable, receipt, prepared, artifacts,
       {{facts.domain->control_domain_id,
-        facts.provider.provider_runtime_unit_id,
-        core::RuntimeEpoch("foreign-controller-epoch")}});
+        core::RuntimeUnitId("foreign-controller-runtime"),
+        facts.provider.provider_runtime_epoch}});
   EXPECT_FALSE(foreign
                    .ReadCurrentRouteSelectionSnapshot(
                        bundle().retained_bundle_id(),

@@ -276,6 +276,18 @@ class ResourceAddressedExecutionKernel final : public IAddressedOperationOwner,
       std::vector<RuntimeParticipantExecutionRegistration> registrations,
       RuntimeParticipantAdmissionResolver participant_resolver = {});
 
+  /// Rehydrate one exact durable route predecessor after execution-host
+  /// replacement without claiming that the new provider incarnation is
+  /// Stop-ready. The supplied registrations must name the predecessor's
+  /// domain/configuration but carry no readiness for that domain. This keeps
+  /// operation admission closed while allowing CCLC to acquire the exact
+  /// route fence and publish a freshly observed successor configuration.
+  [[nodiscard]] Result<RuntimeRouteConfigurationReadbackDTO>
+  adopt_runtime_route_configuration_predecessor(
+      ActiveControlConfigurationDTO configuration,
+      std::vector<RuntimeParticipantExecutionRegistration> registrations,
+      RuntimeParticipantAdmissionResolver participant_resolver = {});
+
   /// Atomically install one reconciled domain's complete runtime
   /// registrations and independently retained readiness projection. An
   /// unreconciled publication carries no candidate registrations and closes
@@ -291,6 +303,12 @@ class ResourceAddressedExecutionKernel final : public IAddressedOperationOwner,
       const ControlDomainId& control_domain_id,
       const ActiveControlConfigurationId& active_configuration_id,
       ActiveControlConfigurationGeneration active_configuration_generation) const;
+
+  /// Current Kernel-owned route publication fact for one domain. Absence is
+  /// the exact pre-publication state; this performs no mutation or provider
+  /// I/O.
+  [[nodiscard]] Result<std::optional<RuntimeRouteConfigurationReadbackDTO>>
+  current_runtime_route_configuration(const ControlDomainId& control_domain_id) const;
 
   /// A removed subordinate engine stays lifetime-pinned while an operation
   /// still references it. Once this returns false, release_retired_engine()
@@ -360,6 +378,10 @@ class ResourceAddressedExecutionKernel final : public IAddressedOperationOwner,
   void CompleteOperationControlEffect(OperationControlEffectResult result) noexcept;
   [[nodiscard]] Result<void> settle_control_operation_locked(const OperationId& operation_id,
                                                              OperationControlKind control);
+  [[nodiscard]] Result<void> reconfigure_runtime_participants_impl(
+      std::vector<RuntimeParticipantExecutionRegistration> registrations,
+      RuntimeParticipantAdmissionResolver participant_resolver,
+      bool retain_unready_configuration_facts);
   [[nodiscard]] StopIntentDTO internal_control_stop_intent_locked(
       const ActiveOperation& operation, const OperationControlAcceptedDTO& accepted,
       std::string_view reason) const;

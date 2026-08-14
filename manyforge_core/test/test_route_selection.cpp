@@ -487,6 +487,15 @@ TEST(RouteSelectionAdmission, RejectsPartialStaleOrBusyInputBeforeEffect) {
   auto stale = Candidate();
   stale.current_active_control_configuration->source_runtime_epoch = RuntimeEpoch("epoch.changed");
   result = PrepareRouteSelectionAdmission(Intent(), stale);
+  ASSERT_TRUE(result.ok()) << result.error().message;
+  EXPECT_EQ(
+      result.value().acceptance.predecessor_active_control_configuration->source_runtime_epoch,
+      RuntimeEpoch("epoch.changed"));
+
+  auto foreign_source = Candidate();
+  foreign_source.current_active_control_configuration->source_runtime_unit_id =
+      RuntimeUnitId("runtime.foreign");
+  result = PrepareRouteSelectionAdmission(Intent(), foreign_source);
   ASSERT_FALSE(result.ok());
   EXPECT_EQ(result.error().details.at("reason"), "predecessor_identity_or_runtime_changed");
 
@@ -686,6 +695,21 @@ TEST(RouteSelectionOwnerContracts, SealsOnlyCompleteCoherentCurrentSnapshots) {
   auto stale = CurrentSnapshot();
   stale.active_control_configuration->source_runtime_epoch = RuntimeEpoch("epoch.stale");
   result = verify_route_selection_current_snapshot(std::move(stale));
+  ASSERT_TRUE(result.ok()) << result.error().message;
+
+  auto stale_unreconciled = CurrentSnapshot();
+  stale_unreconciled.active_control_configuration->source_runtime_epoch =
+      RuntimeEpoch("epoch.stale");
+  stale_unreconciled.active_control_configuration->state =
+      ActiveControlConfigurationStateDTO::kExternalOrUnknownUnreconciled;
+  result = verify_route_selection_current_snapshot(std::move(stale_unreconciled));
+  ASSERT_FALSE(result.ok());
+  EXPECT_EQ(result.error().details.at("reason"), "current_configuration_invalid");
+
+  auto foreign_source = CurrentSnapshot();
+  foreign_source.active_control_configuration->source_runtime_unit_id =
+      RuntimeUnitId("runtime.foreign");
+  result = verify_route_selection_current_snapshot(std::move(foreign_source));
   ASSERT_FALSE(result.ok());
   EXPECT_EQ(result.error().details.at("reason"), "current_configuration_invalid");
 }

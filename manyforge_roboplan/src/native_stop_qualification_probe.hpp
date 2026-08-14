@@ -40,7 +40,7 @@ enum class NativeStopQualificationEvent : std::uint8_t {
 };
 
 class INativeStopQualificationProbe {
- public:
+public:
   virtual ~INativeStopQualificationProbe() = default;
 
   virtual void observe(NativeStopQualificationEvent event,
@@ -53,8 +53,8 @@ struct NativeStopQualificationScope final {
   std::vector<std::string> resource_ids;
   std::vector<std::string> compiled_resource_names;
 
-  friend bool operator==(const NativeStopQualificationScope&,
-                         const NativeStopQualificationScope&) = default;
+  friend bool operator==(const NativeStopQualificationScope &,
+                         const NativeStopQualificationScope &) = default;
 };
 
 /// Uninstalled friend seam for the build-owned qualification executable.
@@ -62,32 +62,36 @@ struct NativeStopQualificationScope final {
 /// It can inject the dormant probe and deliberately hold the real nominal
 /// adapter lock. It cannot replace the backend's software-hard implementation.
 class NativeStopQualificationAccess final {
- public:
-  [[nodiscard]] static std::unique_ptr<RoboPlanExecutionBackend> construct(
-      core::RuntimeParticipantBinding binding,
-      std::shared_ptr<IRetainedObservedStateChannel> state_channel,
-      core::IClock& clock, RoboPlanExecutionBackendConfig config,
-      INativeStopQualificationProbe& probe) {
+public:
+  [[nodiscard]] static std::unique_ptr<RoboPlanExecutionBackend>
+  construct(core::RuntimeParticipantBinding binding,
+            std::shared_ptr<IRetainedObservedStateChannel> state_channel,
+            core::IClock &clock, RoboPlanExecutionBackendConfig config,
+            INativeStopQualificationProbe &probe) {
     return std::unique_ptr<RoboPlanExecutionBackend>(
         new RoboPlanExecutionBackend(std::move(binding),
                                      std::move(state_channel), clock,
-                                     std::move(config), &probe));
+                                     std::move(config), nullptr, &probe));
   }
 
-  [[nodiscard]] static std::unique_lock<std::mutex> lock_nominal_adapter(
-      RoboPlanExecutionBackend& backend) {
+  [[nodiscard]] static std::unique_lock<std::mutex>
+  lock_nominal_adapter(RoboPlanExecutionBackend &backend) {
     return std::unique_lock<std::mutex>(backend.state_mutex_);
   }
 
-  [[nodiscard]] static NativeStopQualificationScope scope(
-      const RoboPlanExecutionBackend& backend) {
-    const auto& binding = backend.binding_.value();
+  [[nodiscard]] static NativeStopQualificationScope
+  scope(const RoboPlanExecutionBackend &backend) {
+    const auto retained_binding =
+        backend.binding_.load(std::memory_order_acquire);
+    const auto &binding = retained_binding->value();
     NativeStopQualificationScope result{
         binding.controllable_component_id.value(),
-        binding.command_target_id.value(), {}, {}};
+        binding.command_target_id.value(),
+        {},
+        {}};
     result.resource_ids.reserve(binding.resources.size());
     result.compiled_resource_names.reserve(binding.resources.size());
-    for (const auto& resource : binding.resources) {
+    for (const auto &resource : binding.resources) {
       result.resource_ids.push_back(resource.resource_id.value());
       result.compiled_resource_names.push_back(resource.compiled_resource_name);
     }
@@ -95,4 +99,4 @@ class NativeStopQualificationAccess final {
   }
 };
 
-}  // namespace manyforge::roboplan_backend::detail
+} // namespace manyforge::roboplan_backend::detail

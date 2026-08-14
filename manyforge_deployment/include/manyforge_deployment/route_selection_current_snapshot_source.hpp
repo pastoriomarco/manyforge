@@ -7,6 +7,7 @@
 #include <manyforge_deployment/verified_controller_lifecycle_expected_domain.hpp>
 #include <manyforge_deployment/verified_retained_bundle.hpp>
 
+#include <functional>
 #include <vector>
 
 namespace manyforge::deployment {
@@ -40,7 +41,11 @@ public:
       core::ActiveBundlePublicationReceiptDTO expected_active_publication,
       core::ICCLCCurrentFactReader &current_fact_reader,
       const IVerifiedRetainedProductArtifactSource &artifact_source,
-      std::vector<ControllerLifecycleSourceOccurrenceDTO> controller_sources);
+      std::vector<ControllerLifecycleSourceOccurrenceDTO> controller_sources,
+      std::function<core::Result<
+          std::optional<core::ActiveControlConfigurationDTO>>(
+          const core::ControlDomainId &)>
+          kernel_current_configuration_source = {});
 
   [[nodiscard]] core::Result<core::RouteSelectionCurrentSnapshot>
   ReadCurrentRouteSelectionSnapshot(
@@ -60,6 +65,10 @@ private:
   core::ICCLCCurrentFactReader &current_fact_reader_;
   const IVerifiedRetainedProductArtifactSource &artifact_source_;
   std::vector<ControllerLifecycleSourceOccurrenceDTO> controller_sources_;
+  std::function<core::Result<
+      std::optional<core::ActiveControlConfigurationDTO>>(
+      const core::ControlDomainId &)>
+      kernel_current_configuration_source_;
 };
 
 } // namespace manyforge::deployment

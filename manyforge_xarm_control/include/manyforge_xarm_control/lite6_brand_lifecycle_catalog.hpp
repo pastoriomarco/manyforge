@@ -18,47 +18,48 @@
 
 #include <manyforge_core/build_owned_lifecycle_plan_catalog_source.hpp>
 #include <manyforge_core/component_lifecycle_plan_catalog_codec.hpp>
+#include <manyforge_lite6_product/lifecycle_profile.hpp>
 
 namespace manyforge::xarm_control {
 
 inline constexpr std::string_view kLite6LifecycleProviderManifestId =
-    "lite6_arm_provider";
+    lite6_product::kLifecycleProviderManifestId;
 
 inline constexpr std::string_view kXArmMotionEnabledFactId =
-    "xarm.motion_enabled";
+    lite6_product::kMotionEnabledFactId;
 inline constexpr std::string_view kXArmPositionValidFactId =
-    "xarm.position_valid";
+    lite6_product::kPositionValidFactId;
 inline constexpr std::string_view kXArmJointServoModeSelectedFactId =
-    "xarm.joint_servo_mode_selected";
+    lite6_product::kJointServoModeSelectedFactId;
 inline constexpr std::string_view kXArmVendorControlReadyFactId =
-    "xarm.vendor_control_ready";
+    lite6_product::kVendorControlReadyFactId;
 inline constexpr std::string_view kXArmVendorStoppedFactId =
-    "xarm.vendor_stopped";
+    lite6_product::kVendorStoppedFactId;
 inline constexpr std::string_view kXArmFaultPresentFactId =
-    "xarm.fault_present";
+    lite6_product::kFaultPresentFactId;
 inline constexpr std::string_view kXArmRecoveryRequiredFactId =
-    "xarm.recovery_required";
+    lite6_product::kRecoveryRequiredFactId;
 inline constexpr std::string_view kXArmWarningPresentFactId =
-    "xarm.warning_present";
+    lite6_product::kWarningPresentFactId;
 inline constexpr std::string_view kXArmReadyStateRequestEligibleFactId =
-    "xarm.ready_state_request_eligible";
+    lite6_product::kReadyStateRequestEligibleFactId;
 inline constexpr std::string_view kXArmVendorFeedbackClassFactId =
-    "xarm.vendor_feedback_class";
+    lite6_product::kVendorFeedbackClassFactId;
 
 inline constexpr std::string_view kXArmEnableMotionPrimitiveId =
-    "xarm.enable_motion";
+    lite6_product::kEnableMotionPrimitiveId;
 inline constexpr std::string_view kXArmSelectJointServoModePrimitiveId =
-    "xarm.select_joint_servo_mode";
+    lite6_product::kSelectJointServoModePrimitiveId;
 inline constexpr std::string_view kXArmSetReadyStatePrimitiveId =
-    "xarm.set_ready_state";
+    lite6_product::kSetReadyStatePrimitiveId;
 inline constexpr std::string_view kXArmSetStoppedStatePrimitiveId =
-    "xarm.set_stopped_state";
+    lite6_product::kSetStoppedStatePrimitiveId;
 inline constexpr std::string_view kXArmDisableMotionPrimitiveId =
-    "xarm.disable_motion";
+    lite6_product::kDisableMotionPrimitiveId;
 inline constexpr std::string_view kXArmClearErrorPrimitiveId =
-    "xarm.clear_error";
+    lite6_product::kClearErrorPrimitiveId;
 inline constexpr std::string_view kXArmClearWarningPrimitiveId =
-    "xarm.clear_warning";
+    lite6_product::kClearWarningPrimitiveId;
 
 /// Compute the acyclic semantic anchor which the build-owned Lite6 provider
 /// manifest must carry before its content-derived revision is minted.

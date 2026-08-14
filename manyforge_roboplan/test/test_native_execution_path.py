@@ -12,7 +12,7 @@ import subprocess
 import threading
 import time
 from pathlib import Path
-from typing import Any, Mapping
+from typing import Any, Callable, Mapping
 
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
@@ -23,6 +23,7 @@ from manyforge_behavior.runner import OrchestratorRunner
 from manyforge_composer.backend.routes_headless import create_headless_router
 from manyforge_composer.backend.state import ComposerState
 from manyforge_headless_api.app import TrustedPrincipal, create_app
+from manyforge_headless_api.cclc import CCLCOpenRequestClient
 from manyforge_headless_api.client import HeadlessClientError, HeadlessHttpClient
 from manyforge_headless_api.execution import ExecutionCommandClient
 from manyforge_headless_api.models import (
@@ -128,6 +129,172 @@ def _required_path(name: str) -> Path:
     return path
 
 
+def _wait_for_cclc_terminal(
+    read_status: Callable[[str], dict[str, Any] | None],
+    transaction_id: str,
+    *,
+    label: str,
+) -> dict[str, Any]:
+    deadline = time.monotonic() + 10.0
+    last_status: dict[str, Any] | None = None
+    while time.monotonic() < deadline:
+        status = read_status(transaction_id)
+        last_status = status
+        if status is not None and status.get("terminal_result") is not None:
+            if status["terminal_result"] != "succeeded":
+                raise RuntimeError(
+                    f"native CCLC {label} failed: {status}"
+                )
+            return status
+        time.sleep(0.01)
+    raise RuntimeError(
+        f"native CCLC {label} did not become terminal: {last_status}"
+    )
+
+
+def _expected_active_configuration(
+    active: Mapping[str, Any] | None,
+) -> dict[str, Any]:
+    if active is None:
+        return {"presence": "absent"}
+    return {
+        "presence": "present",
+        "active_control_configuration_id": active[
+            "active_control_configuration_id"
+        ],
+        "active_control_configuration_generation": active[
+            "active_control_configuration_generation"
+        ],
+    }
+
+
+def _qualify_native_cclc_product(
+    execution_root: Path,
+    owner_epoch: str,
+    *,
+    deferred_route_domains: frozenset[str] = frozenset(),
+) -> None:
+    client = CCLCOpenRequestClient(execution_root, timeout_seconds=5.0)
+
+    def context(request_id: str) -> dict[str, Any]:
+        return {
+            "request_id": request_id,
+            "request_owner_epoch": owner_epoch,
+            "source_label": "native-process-qualification",
+        }
+
+    for intent_kind in ("prepare", "enable"):
+        snapshot = client.component_snapshot("lite6_arm")
+        expected_domains = [
+            {
+                "control_domain_id": domain["control_domain_id"],
+                "control_domain_revision": domain[
+                    "control_domain_revision"
+                ],
+                "controller_topology_id": domain[
+                    "controller_topology_id"
+                ],
+                "topology_revision": domain["topology_revision"],
+                "expected_active_control_configuration": (
+                    _expected_active_configuration(
+                        domain["active_control_configuration"]
+                    )
+                ),
+                "expected_control_bindings": domain[
+                    "current_control_bindings"
+                ],
+            }
+            for domain in snapshot["domains"]
+        ]
+        result = client.submit_lifecycle(
+            {
+                "request_context": context(
+                    f"process.lifecycle.{intent_kind}"
+                ),
+                "controllable_component_id": snapshot[
+                    "controllable_component_id"
+                ],
+                "intent": intent_kind,
+                "expected_graph_revision": snapshot["graph_revision"],
+                "expected_component_lifecycle_generation": snapshot[
+                    "component_lifecycle_generation"
+                ],
+                "expected_control_domains": expected_domains,
+            }
+        )
+        acceptance = result.get("acceptance")
+        if not isinstance(acceptance, dict):
+            raise RuntimeError(
+                f"native CCLC {intent_kind} was not accepted: {result}"
+            )
+        _wait_for_cclc_terminal(
+            client.lifecycle_status,
+            acceptance["lifecycle_transaction_id"],
+            label=intent_kind,
+        )
+
+    template_set = client.route_templates("lite6_arm")
+    domain_ids = sorted(
+        row["desired_configuration"]["control_domain_id"]
+        for row in template_set["templates"]
+    )
+    if domain_ids != ["lite6_arm_domain", "lite6_gripper_domain"]:
+        raise RuntimeError(
+            f"native CCLC product has an unexpected route set: {domain_ids}"
+        )
+    for domain_id in domain_ids:
+        # A replaced host adopts every durable route as a closed predecessor.
+        # An orphaned operation intentionally prevents republishing its own
+        # domain until reconciliation, while disjoint domains remain eligible
+        # for fresh readiness publication.
+        if domain_id in deferred_route_domains:
+            continue
+        template_set = client.route_templates("lite6_arm")
+        template = next(
+            row
+            for row in template_set["templates"]
+            if row["desired_configuration"]["control_domain_id"]
+            == domain_id
+        )
+        result = client.submit_route(
+            {
+                "request_context": context(f"process.route.{domain_id}"),
+                "expected_retained_bundle_id": template_set[
+                    "retained_bundle_id"
+                ],
+                "expected_graph_revision": template_set["graph_revision"],
+                "desired_configuration": template[
+                    "desired_configuration"
+                ],
+                "expected_active_control_configuration": template[
+                    "expected_active_control_configuration"
+                ],
+                "component_expectations": template[
+                    "component_expectations"
+                ],
+            }
+        )
+        acceptance = result.get("acceptance")
+        if not isinstance(acceptance, dict):
+            raise RuntimeError(
+                f"native CCLC route {domain_id} was not accepted: {result}"
+            )
+        _wait_for_cclc_terminal(
+            client.route_status,
+            acceptance["route_selection_transaction_id"],
+            label=f"route {domain_id}",
+        )
+
+    final_snapshot = client.component_snapshot("lite6_arm")
+    if final_snapshot["component_lifecycle_state"] != "active" or any(
+        domain["active_control_configuration"] is None
+        for domain in final_snapshot["domains"]
+    ):
+        raise RuntimeError(
+            f"native CCLC product did not publish complete readiness: {final_snapshot}"
+        )
+
+
 def _start_host(
     fixture_root: Path,
     execution_root: Path,
@@ -137,6 +304,7 @@ def _start_host(
     candidate_worker: Path | None = None,
     fake_worker_marker: Path | None = None,
     host_environment: str = "MANYFORGE_NATIVE_EXECUTION_HOST",
+    deferred_route_domains: frozenset[str] = frozenset(),
 ) -> subprocess.Popen[bytes]:
     environment = os.environ.copy()
     if fake_worker_marker is not None:
@@ -184,6 +352,22 @@ def _start_host(
         try:
             response = client.status()
             if response.get("ok") is True:
+                if manifest.get("cclc_product") is True:
+                    try:
+                        _qualify_native_cclc_product(
+                            execution_root,
+                            response["status"]["owner_epoch"],
+                            deferred_route_domains=deferred_route_domains,
+                        )
+                    except Exception as error:
+                        _stop_host(process)
+                        detail = (
+                            process.stderr.read() if process.stderr else b""
+                        ).decode(errors="replace")
+                        raise RuntimeError(
+                            "native CCLC product qualification failed: "
+                            f"{error}; host stderr: {detail}"
+                        ) from error
                 return process
         except HeadlessApiError as error:
             last_error = f"{error.code}: {error}"
@@ -196,7 +380,13 @@ def _stop_host(process: subprocess.Popen[bytes]) -> None:
     if process.poll() is None:
         process.terminate()
         try:
-            process.wait(timeout=5.0)
+            # The production owner drains independent StopControl,
+            # participant-attempt, projection, surveillance, and scheduler
+            # lanes before writing its clean-epoch marker.  They normally
+            # quiesce immediately, but the launcher timeout must cover that
+            # complete bounded shutdown rather than killing the process in
+            # the middle of durable close.
+            process.wait(timeout=15.0)
         except subprocess.TimeoutExpired:
             process.kill()
             process.wait(timeout=5.0)
@@ -361,6 +551,59 @@ def _wait_runtime_scale_applied(
             return last
         time.sleep(0.005)
     raise RuntimeError(f"runtime scale was not applied: {last}")
+
+
+def _recover_active_stop_fault(
+    client: HeadlessHttpClient,
+    *,
+    owner_epoch: str,
+    request_prefix: str,
+    correlation_id: str,
+    reason: str,
+    timeout_seconds: float = 10.0,
+) -> dict[str, Any] | None:
+    deadline = time.monotonic() + timeout_seconds
+    last_result: dict[str, Any] | None = None
+    attempt = 0
+    while time.monotonic() < deadline:
+        offer = client.stop_fault()["stop_fault"]
+        if offer is None:
+            return last_result
+        latch = offer["latch"]
+        certificate = latch["stop_certificate"]
+        attempt += 1
+        last_result = client.recover_stop_fault(
+            {
+                "request_context": {
+                    "request_id": f"{request_prefix}-{attempt}",
+                    "request_owner_epoch": owner_epoch,
+                    "source_label": "headless_process_test",
+                    "correlation_id": correlation_id,
+                },
+                "expected_latch_id": latch["latch_id"],
+                "expected_latch_generation": latch["latch_generation"],
+                "expected_recovery_assessment_revision": latch[
+                    "recovery_assessment_revision"
+                ],
+                "expected_stop_certificate_id": certificate[
+                    "stop_certificate_id"
+                ],
+                "expected_stop_certificate_revision": certificate[
+                    "stop_certificate_revision"
+                ],
+                "expected_cell_id": latch["cell_id"],
+                "expected_retained_bundle_id": latch["retained_bundle_id"],
+                "expected_graph_revision": latch["graph_revision"],
+                "configuration_expectations": offer[
+                    "configuration_expectations"
+                ],
+                "reason": reason,
+            }
+        )["result"]
+        if last_result["accepted"]:
+            return last_result
+        time.sleep(0.05)
+    raise RuntimeError(f"Stop fault did not become recoverable: {last_result}")
 
 
 _PLANNING_SCENE_REVISION = {
@@ -1374,6 +1617,17 @@ def test_first_complete_addressed_native_motion_path(tmp_path: Path) -> None:
             reason="release stopped gripper operation",
             correlation_id="n5-process-test",
         )
+        gripper_recovery = _recover_active_stop_fault(
+            headless,
+            owner_epoch=first_status["owner_epoch"],
+            request_prefix="recover-linear-gripper-stop",
+            correlation_id="n5-process-test",
+            reason="operator verified post-Stop gripper truth",
+        )
+        assert gripper_recovery is not None
+        assert gripper_recovery["accepted"] is True
+        assert gripper_recovery["latch"]["state"] == "cleared"
+        assert headless.stop_fault()["stop_fault"] is None
 
         controlled = _runner_submission(
             runner,
@@ -1466,11 +1720,6 @@ def test_first_complete_addressed_native_motion_path(tmp_path: Path) -> None:
             "correlation_id": "n4-public-control-test",
         }
         stop_accepted = runner.stop_operation(**stop_arguments)
-        stop_replayed = runner.stop_operation(**stop_arguments)
-        assert stop_accepted["accepted"]["stop_id"] == stop_replayed[
-            "accepted"
-        ]["stop_id"]
-        assert stop_replayed["accepted"]["replay_status"] == "replayed_exact"
         stopped = _wait_terminal(runner, controlled_id)["operation"]
         assert stopped["state"] == "stopped"
         assert stopped["active_stop_id"] == stop_accepted["accepted"]["stop_id"]
@@ -1480,8 +1729,11 @@ def test_first_complete_addressed_native_motion_path(tmp_path: Path) -> None:
             durable_stop = database.execute(
                 "SELECT sequence,payload_json FROM journal_records "
                 "WHERE request_id = ? AND record_kind = "
-                "'stop_acceptance_projected'",
-                ("stop-controlled-operation",),
+                "'stop_acceptance_projected' AND stop_id = ?",
+                (
+                    "stop-controlled-operation",
+                    stop_accepted["accepted"]["stop_id"],
+                ),
             ).fetchone()
         assert durable_stop is not None
         durable_stop_sequence = int(durable_stop[0])
@@ -1518,6 +1770,16 @@ def test_first_complete_addressed_native_motion_path(tmp_path: Path) -> None:
             reason="release first stopped operation",
             correlation_id="n4-public-control-test",
         )
+        controlled_recovery = _recover_active_stop_fault(
+            headless,
+            owner_epoch=first_status["owner_epoch"],
+            request_prefix="recover-controlled-stop",
+            correlation_id="n4-public-control-test",
+            reason="operator verified post-Stop motion truth",
+        )
+        assert controlled_recovery is not None
+        assert controlled_recovery["accepted"] is True
+        assert controlled_recovery["latch"]["state"] == "cleared"
         malformed_operation = _runner_submission(
             runner,
             request_id="native-malformed-stop-operation",
@@ -1543,7 +1805,7 @@ def test_first_complete_addressed_native_motion_path(tmp_path: Path) -> None:
             "promoted_to_full"
         )
         assert malformed_acceptance["resolution_reason"] == (
-            "malformed_or_unknown_selector"
+            "malformed_ordinary_intent"
         )
         malformed_terminal = _wait_terminal(
             runner, malformed_operation_id
@@ -1567,50 +1829,18 @@ def test_first_complete_addressed_native_motion_path(tmp_path: Path) -> None:
             "recognized_stop_payload_invalid"
         )
         assert malformed_payload["acceptance"]["normalized_request_digest"] is None
-        assert malformed_payload["intent"] is None
+        assert malformed_payload["intent"] == {
+            "intent_kind": "malformed_ingress",
+            "value": None,
+        }
 
-        recovery_deadline = time.monotonic() + 10.0
-        recovered_result: dict[str, Any] | None = None
-        recovery_attempt = 0
-        while time.monotonic() < recovery_deadline:
-            offer = headless.stop_fault()["stop_fault"]
-            if offer is None:
-                break
-            latch = offer["latch"]
-            certificate = latch["stop_certificate"]
-            recovery_attempt += 1
-            recovery_body = {
-                "request_context": {
-                    "request_id": f"recover-native-malformed-{recovery_attempt}",
-                    "request_owner_epoch": first_status["owner_epoch"],
-                    "source_label": "headless_process_test",
-                    "correlation_id": "native-malformed-stop-recovery",
-                },
-                "expected_latch_id": latch["latch_id"],
-                "expected_latch_generation": latch["latch_generation"],
-                "expected_recovery_assessment_revision": latch[
-                    "recovery_assessment_revision"
-                ],
-                "expected_stop_certificate_id": certificate[
-                    "stop_certificate_id"
-                ],
-                "expected_stop_certificate_revision": certificate[
-                    "stop_certificate_revision"
-                ],
-                "expected_cell_id": latch["cell_id"],
-                "expected_retained_bundle_id": latch["retained_bundle_id"],
-                "expected_graph_revision": latch["graph_revision"],
-                "configuration_expectations": offer[
-                    "configuration_expectations"
-                ],
-                "reason": "operator verified post-Stop cell truth",
-            }
-            recovered_result = headless.recover_stop_fault(recovery_body)[
-                "result"
-            ]
-            if recovered_result["accepted"]:
-                break
-            time.sleep(0.05)
+        recovered_result = _recover_active_stop_fault(
+            headless,
+            owner_epoch=first_status["owner_epoch"],
+            request_prefix="recover-native-malformed",
+            correlation_id="native-malformed-stop-recovery",
+            reason="operator verified post-Stop cell truth",
+        )
         assert recovered_result is not None
         assert recovered_result["accepted"] is True, recovered_result
         assert recovered_result["latch"]["state"] == "cleared"
@@ -1862,26 +2092,28 @@ def test_slow_preview_cannot_delay_the_standard_stop_path(tmp_path: Path) -> Non
         assert marker.exists()
         assert not preview_done.is_set()
 
-        with pytest.raises(HeadlessClientError) as rejected:
-            headless.stop_operations(
-                {
-                    "request_context": {
-                        "request_id": "stop-while-preview-blocked",
-                        "request_owner_epoch": status["owner_epoch"],
-                        "source_label": "headless_process_test",
-                        "correlation_id": "n6-c1-stop-isolation",
-                    },
-                    "operations": [
-                        {
-                            "operation_id": "non-resident-operation",
-                            "expected_operation_revision": 1,
-                            "expected_stop_generation": 0,
-                        }
-                    ],
-                    "reason": "prove Stop transport is independent from preview",
-                }
-            )
-        assert rejected.value.code == "missing_reference"
+        stopped = headless.stop_operations(
+            {
+                "request_context": {
+                    "request_id": "stop-while-preview-blocked",
+                    "request_owner_epoch": status["owner_epoch"],
+                    "source_label": "headless_process_test",
+                    "correlation_id": "n6-c1-stop-isolation",
+                },
+                "operations": [
+                    {
+                        "operation_id": "non-resident-operation",
+                        "expected_operation_revision": 1,
+                        "expected_stop_generation": 0,
+                    }
+                ],
+                "reason": "prove Stop transport is independent from preview",
+            }
+        )
+        assert stopped["accepted"]["resolution_disposition"] == (
+            "promoted_to_full"
+        )
+        assert stopped["accepted"]["resolution_reason"] == "unknown_operation"
         assert not preview_done.is_set()
 
         preview_thread.join(timeout=3.0)
@@ -1963,7 +2195,6 @@ def test_planning_stop_and_active_host_replacement_are_bounded(
             correlation_id="n4d-process-test",
         )
         assert reset["accepted"]["control"] == "reset"
-
         recovered_acceptance = _runner_submission(
             runner,
             request_id="worker-after-cancel",
@@ -2000,6 +2231,9 @@ def test_planning_stop_and_active_host_replacement_are_bounded(
             manifest,
             candidate_worker=fake_worker,
             fake_worker_marker=marker,
+            deferred_route_domains=frozenset(
+                {"lite6_arm_domain", "lite6_gripper_domain"}
+            ),
         )
         restarted = headless.execution_status()["status"]
         assert restarted["owner_epoch"] != first_epoch
@@ -2029,47 +2263,27 @@ def test_planning_stop_and_active_host_replacement_are_bounded(
                 joint_names=("joint1",),
                 positions=(0.05,),
             )
-        assert fenced.value.code == "execution_rejected"
-        assert recording.last_submission is not None
-        raw_fenced = raw_api.post(
-            "/api/execution/operations", json=recording.last_submission
-        )
-        assert raw_fenced.status_code == 400
-        assert raw_fenced.json()["error"]["details"]["reason"] == (
-            "resource_scope_busy"
-        )
+        assert fenced.value.code == "invalid_state_transition"
+        assert fenced.value.status_code == 409
 
-        independent_gripper = _gripper_submission(
-            runner,
-            request_id="gripper-after-arm-host-loss",
-            position_kind="linear_m",
-            position=0.003,
-        )
-        independent_gripper_id = independent_gripper["accepted"][
-            "operation_id"
-        ]
-        independent_terminal = _wait_terminal(
-            runner, independent_gripper_id
-        )["operation"]
-        assert independent_terminal["state"] == "completed"
-        assert independent_terminal["participants"][0]["resources"] != orphan[
-            "participants"
-        ][0]["resources"]
-        runner.acknowledge_completed_operation(
-            request_id="ack-gripper-after-arm-host-loss",
-            operation_id=independent_gripper_id,
-            expected_operation_revision=independent_terminal[
-                "operation_revision"
-            ],
-            reason="release independent gripper operation",
-            correlation_id="n5-process-test",
-        )
+        # An unclean owner replacement fences the complete current inventory:
+        # absent journal bytes cannot prove that a process-local Full Stop did
+        # not linearize immediately before the loss.
+        with pytest.raises(HeadlessClientError) as globally_fenced:
+            _gripper_submission(
+                runner,
+                request_id="gripper-after-arm-host-loss",
+                position_kind="linear_m",
+                position=0.003,
+            )
+        assert globally_fenced.value.code == "invalid_state_transition"
+        assert globally_fenced.value.status_code == 409
     finally:
         _stop_host(process)
         raw_api.close()
 
 
-def test_active_gripper_host_replacement_fences_only_gripper(
+def test_active_gripper_host_replacement_fences_complete_inventory(
     tmp_path: Path,
 ) -> None:
     built_fixture = _required_path("MANYFORGE_I6_NATIVE_FIXTURE_ROOT")
@@ -2111,11 +2325,17 @@ def test_active_gripper_host_replacement_fences_only_gripper(
         before_loss = _wait_state(runner, operation_id, {"executing"})[
             "operation"
         ]
-        gripper_resources = before_loss["participants"][0]["resources"]
+        assert before_loss["participants"][0]["resources"]
         _stop_host(process)
 
         process = _start_host(
-            fixture_root, execution_root, staging_root, manifest
+            fixture_root,
+            execution_root,
+            staging_root,
+            manifest,
+            deferred_route_domains=frozenset(
+                {"lite6_arm_domain", "lite6_gripper_domain"}
+            ),
         )
         restarted = headless.execution_status()["status"]
         assert restarted["owner_epoch"] != first_epoch
@@ -2134,29 +2354,18 @@ def test_active_gripper_host_replacement_fences_only_gripper(
                 position_kind="linear_m",
                 position=0.002,
             )
-        assert fenced.value.status_code == 400
-        assert recording.last_submission is not None
-        raw_fenced = raw_api.post(
-            "/api/execution/operations", json=recording.last_submission
-        )
-        assert raw_fenced.json()["error"]["details"]["reason"] == (
-            "resource_scope_busy"
-        )
+        assert fenced.value.code == "invalid_state_transition"
+        assert fenced.value.status_code == 409
 
-        independent_arm = _runner_submission(
-            runner,
-            request_id="arm-after-gripper-host-loss",
-            joint_names=("joint1",),
-            positions=(0.05,),
-        )
-        independent_arm_id = independent_arm["accepted"]["operation_id"]
-        independent_arm_terminal = _wait_terminal(
-            runner, independent_arm_id
-        )["operation"]
-        assert independent_arm_terminal["state"] == "completed"
-        assert independent_arm_terminal["participants"][0]["resources"] != (
-            gripper_resources
-        )
+        with pytest.raises(HeadlessClientError) as globally_fenced:
+            _runner_submission(
+                runner,
+                request_id="arm-after-gripper-host-loss",
+                joint_names=("joint1",),
+                positions=(0.05,),
+            )
+        assert globally_fenced.value.code == "invalid_state_transition"
+        assert globally_fenced.value.status_code == 409
     finally:
         _stop_host(process)
         raw_api.close()

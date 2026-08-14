@@ -126,11 +126,11 @@ struct ExactFixture final {
   ResolvedParticipantStopStageDTO stage;
 };
 
-[[nodiscard]] ExactFixture Fixture() {
+[[nodiscard]] ExactFixture Fixture(const std::size_t stage_index = 0U) {
   auto base = BasePlan();
   auto binding = Binding(base);
   auto plan = Plan(base, binding);
-  const auto& selected = plan.stage_commands.front().resolved_stage;
+  const auto& selected = plan.stage_commands.at(stage_index).resolved_stage;
   ResolvedParticipantStopStageDTO stage{StopId("stop.1"),
                                         StopGeneration(7U),
                                         plan.operation_id,
@@ -158,7 +158,7 @@ struct ExactFixture final {
                                         base.stop_evidence_policy_id,
                                         base.stop_evidence_policy_revision,
                                         std::move(plan),
-                                        0U,
+                                        stage_index,
                                         ContentDigest("pending")};
   auto made =
       MakeResolvedParticipantStopStage(stage, Budget(stage), base, binding, {},
@@ -213,6 +213,22 @@ TEST(ParticipantStopStageTest, AcceptsExactVerifiedPreparedStageAndShortenedBudg
   const auto budget = Budget(fixture.stage);
   EXPECT_TRUE(ValidateStage(fixture, fixture.stage, budget).ok());
   EXPECT_TRUE(ValidateResult(fixture, Success(fixture.stage)).ok());
+}
+
+TEST(ParticipantStopStageTest, AcceptsRegisteredControlPathProviderWithoutCapabilityBinding) {
+  const auto initial = Fixture();
+  const auto registered = std::find_if(
+      initial.stage.participant_stop_plan.stage_commands.begin(),
+      initial.stage.participant_stop_plan.stage_commands.end(), [](const auto& command) {
+        return command.resolved_stage.containment_command.command_kind ==
+               StopContainmentCommandKind::kRegistered;
+      });
+  ASSERT_NE(registered, initial.stage.participant_stop_plan.stage_commands.end());
+  const auto stage_index = static_cast<std::size_t>(
+      std::distance(initial.stage.participant_stop_plan.stage_commands.begin(), registered));
+  const auto fixture = Fixture(stage_index);
+  EXPECT_FALSE(fixture.stage.capability_provider_binding_id.has_value());
+  EXPECT_TRUE(ValidateStage(fixture, fixture.stage, Budget(fixture.stage)).ok());
 }
 
 TEST(ParticipantStopStageTest, RejectsForeignOrExtendedBudgetAndExpandedScope) {

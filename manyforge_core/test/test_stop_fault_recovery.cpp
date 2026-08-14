@@ -13,6 +13,8 @@ inline constexpr char kDigestC[] =
     "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc";
 inline constexpr char kDigestD[] =
     "sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd";
+inline constexpr char kDigestE[] =
+    "sha256:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee";
 
 [[nodiscard]] StopAcceptedDTO Accepted() {
   return StopAcceptedDTO{RequestId("stop-request.1"),
@@ -218,6 +220,14 @@ TEST(StopFaultRecoveryTest, ReadyAssessmentIsStableUntilSemanticFactsChange) {
 
   status.fault_latch = ready.value();
   auto replay = AssessStopFaultRecovery(status, facts);
+  ASSERT_TRUE(replay.ok()) << replay.error().message;
+  EXPECT_EQ(replay.value(), ready.value());
+
+  auto refreshed = facts;
+  ++*refreshed.resource_facts.front().source_sequence;
+  refreshed.resource_facts.front().source_age_ns = 0;
+  refreshed.resource_facts.front().evidence_digest = ContentDigest(kDigestE);
+  replay = AssessStopFaultRecovery(status, refreshed);
   ASSERT_TRUE(replay.ok()) << replay.error().message;
   EXPECT_EQ(replay.value(), ready.value());
 

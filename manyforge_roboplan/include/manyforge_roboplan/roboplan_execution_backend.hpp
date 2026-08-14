@@ -17,6 +17,7 @@
 #include <manyforge_core/ports/iexecution_backend.hpp>
 #include <manyforge_core/runtime_participant_binding.hpp>
 #include <manyforge_core/time/iclock.hpp>
+#include <manyforge_core/time/ischeduler.hpp>
 #include <manyforge_roboplan/retained_observed_state_channel.hpp>
 
 namespace manyforge::roboplan_backend {
@@ -25,6 +26,7 @@ namespace detail {
 class INativeStopQualificationProbe;
 class NativeStopQualificationAccess;
 enum class NativeStopQualificationEvent : std::uint8_t;
+struct MotionIdleHeartbeatState;
 } // namespace detail
 
 struct RoboPlanExecutionBackendConfig {
@@ -63,6 +65,11 @@ public:
       core::RuntimeParticipantBinding binding,
       std::shared_ptr<IRetainedObservedStateChannel> state_channel,
       core::IClock &clock, RoboPlanExecutionBackendConfig config = {});
+  RoboPlanExecutionBackend(
+      core::RuntimeParticipantBinding binding,
+      std::shared_ptr<IRetainedObservedStateChannel> state_channel,
+      core::IClock &clock, core::IScheduler &scheduler,
+      RoboPlanExecutionBackendConfig config = {});
   ~RoboPlanExecutionBackend() override;
 
   core::PrepareParticipantResultDTO
@@ -121,6 +128,12 @@ public:
 
   RoboPlanSceneProjectionMetrics scene_projection_metrics() const;
 
+  /// Publish a verified route binding after the owning Kernel fence is held.
+  /// No operation may be active while the physical backend identity changes.
+  [[nodiscard]] core::Result<void> RebindRoute(
+      core::RuntimeParticipantBinding binding,
+      std::vector<core::RuntimeParticipantBinding> program_aliases = {});
+
   // Controlled-stop capability + result surface for motion-scoped
   // interrupt outcomes (spec/260 §5.6). The native simulator supports
   // `kSpringBackHold` and native `kSoftOnPath`. `kHardDeceleration`
@@ -142,6 +155,7 @@ private:
       core::RuntimeParticipantBinding binding,
       std::shared_ptr<IRetainedObservedStateChannel> state_channel,
       core::IClock &clock, RoboPlanExecutionBackendConfig config,
+      core::IScheduler *heartbeat_scheduler,
       detail::INativeStopQualificationProbe *qualification_probe);
 
   struct ExecutionStateData {
@@ -205,8 +219,12 @@ private:
     std::int64_t source_timestamp_ns = 0;
   };
 
-  core::RuntimeParticipantBinding binding_;
+  std::atomic<std::shared_ptr<const core::RuntimeParticipantBinding>> binding_;
+  std::atomic<
+      std::shared_ptr<const std::vector<core::RuntimeParticipantBinding>>>
+      program_aliases_;
   std::shared_ptr<IRetainedObservedStateChannel> state_channel_;
+  std::shared_ptr<detail::MotionIdleHeartbeatState> idle_heartbeat_;
   core::IClock &clock_;
   RoboPlanExecutionBackendConfig config_;
   detail::INativeStopQualificationProbe *qualification_probe_{};

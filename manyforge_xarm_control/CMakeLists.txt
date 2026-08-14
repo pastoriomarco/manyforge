@@ -33,6 +33,18 @@ if(NOT TARGET manyforge_core)
   set(BUILD_TESTING "${_MANYFORGE_XARM_BUILD_TESTING}")
   unset(_MANYFORGE_XARM_BUILD_TESTING)
 endif()
+
+set(
+  MANYFORGE_LITE6_PRODUCT_SOURCE_DIR
+  "${CMAKE_CURRENT_SOURCE_DIR}/../manyforge_lite6_product"
+  CACHE PATH
+  "Path to the ROS-independent Lite6 product source tree")
+if(NOT TARGET manyforge_lite6_product)
+  add_subdirectory(
+    "${MANYFORGE_LITE6_PRODUCT_SOURCE_DIR}"
+    "${CMAKE_CURRENT_BINARY_DIR}/manyforge_lite6_product"
+    EXCLUDE_FROM_ALL)
+endif()
 if(NOT TARGET manyforge_core)
   message(FATAL_ERROR "manyforge_xarm_control could not resolve manyforge_core")
 endif()
@@ -53,7 +65,7 @@ ament_target_dependencies(${PROJECT_NAME}_brand_lifecycle
   xarm_msgs
 )
 set_property(TARGET ${PROJECT_NAME}_brand_lifecycle APPEND PROPERTY
-  LINK_LIBRARIES manyforge_core)
+  LINK_LIBRARIES manyforge_core manyforge_lite6_product)
 
 install(
   DIRECTORY include/

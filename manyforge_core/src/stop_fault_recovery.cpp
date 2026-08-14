@@ -414,8 +414,17 @@ Result<StopFaultLatchDTO> AssessStopFaultRecovery(const StopStatusDTO& terminal_
   const auto next_status = derive_status(current, facts);
   const auto next_reason = std::string(reason_for(next_status));
   const auto next_evidence = collect_evidence(facts);
+  // Once the complete predicate set is ready, a newer fresh observation is
+  // stronger proof of the same semantic assessment, not a new assessment.
+  // Keep the exact evidence snapshot that made the latch ready so a caller can
+  // name that stable revision while the physical state source keeps publishing
+  // newer sequence/timestamp-bearing samples. A loss of readiness still
+  // advances immediately and publishes the changed predicate truth.
+  const bool equivalent_ready_refresh =
+      assessed.recovery_status == StopFaultRecoveryStatusDTO::kReady &&
+      next_status == StopFaultRecoveryStatusDTO::kReady && assessed.reason_code == next_reason;
   if (assessed.recovery_status != next_status || assessed.reason_code != next_reason ||
-      assessed.evidence_refs != next_evidence) {
+      (!equivalent_ready_refresh && assessed.evidence_refs != next_evidence)) {
     if (assessed.recovery_assessment_revision == std::numeric_limits<std::uint64_t>::max()) {
       return invalid<StopFaultLatchDTO>("stop_fault_recovery_revision_exhausted",
                                         "Stop recovery assessment revision is exhausted");

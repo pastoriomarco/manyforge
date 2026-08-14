@@ -196,40 +196,69 @@ std::optional<std::string_view> prepared_participant_backend_binding_field_error
   const auto expected_capability_provider =
       binding.capability_provider_path ? std::optional(provider(*binding.capability_provider_path))
                                        : std::nullopt;
-  if (participant.program_id != binding.program_id ||
-      participant.program_revision != binding.program_revision ||
-      participant.program_binding_id != binding.program_binding_id ||
-      participant.retained_bundle_id != binding.retained_bundle_id ||
-      participant.graph_revision != binding.graph_revision ||
-      participant.controllable_component_id != binding.controllable_component_id ||
-      participant.component_type_id != binding.component_type_id ||
-      participant.component_type_revision != binding.component_type_revision ||
-      participant.command_target_id != binding.command_target_id ||
-      participant.capability_id != binding.capability_id ||
-      participant.capability_definition_revision != binding.capability_definition_revision ||
-      participant.model_bindings != binding.model_bindings ||
-      participant.frame_bindings != binding.frame_bindings ||
-      participant.control_domain_id != path.control_domain_id ||
-      participant.control_domain_revision != path.control_domain_revision ||
-      participant.control_binding_id != path.control_binding_id ||
-      participant.control_binding_revision != path.control_binding_revision ||
-      participant.control_interface_contract_id != path.control_interface_contract_id ||
-      participant.control_interface_revision != path.control_interface_revision ||
-      participant.controller_topology_id != path.controller_topology_id ||
-      participant.topology_revision != path.topology_revision ||
-      participant.control_route_id != path.control_route_id ||
-      participant.activation_set_id != path.activation_set_id ||
-      participant.control_provider != provider(path) ||
-      participant.capability_provider != expected_capability_provider ||
-      participant.resources != binding_resources(binding) ||
-      participant.active_control_configuration_id != path.active_control_configuration_id ||
-      participant.active_control_configuration_generation !=
-          path.active_control_configuration_generation ||
-      participant.runtime_unit_epochs != binding.runtime_unit_epochs ||
-      participant.stop_evidence_policy_id != path.stop_evidence_policy_id ||
-      participant.stop_evidence_policy_revision != path.stop_evidence_policy_revision) {
-    return "prepared_participant_backend_binding_mismatch";
-  }
+  if (participant.program_id != binding.program_id)
+    return "prepared_participant_backend_program_id_mismatch";
+  if (participant.program_revision != binding.program_revision)
+    return "prepared_participant_backend_program_revision_mismatch";
+  if (participant.program_binding_id != binding.program_binding_id)
+    return "prepared_participant_backend_program_binding_id_mismatch";
+  if (participant.retained_bundle_id != binding.retained_bundle_id)
+    return "prepared_participant_backend_retained_bundle_id_mismatch";
+  if (participant.graph_revision != binding.graph_revision)
+    return "prepared_participant_backend_graph_revision_mismatch";
+  if (participant.controllable_component_id != binding.controllable_component_id)
+    return "prepared_participant_backend_component_id_mismatch";
+  if (participant.component_type_id != binding.component_type_id)
+    return "prepared_participant_backend_component_type_id_mismatch";
+  if (participant.component_type_revision != binding.component_type_revision)
+    return "prepared_participant_backend_component_type_revision_mismatch";
+  if (participant.command_target_id != binding.command_target_id)
+    return "prepared_participant_backend_command_target_id_mismatch";
+  if (participant.capability_id != binding.capability_id)
+    return "prepared_participant_backend_capability_id_mismatch";
+  if (participant.capability_definition_revision != binding.capability_definition_revision)
+    return "prepared_participant_backend_capability_revision_mismatch";
+  if (participant.model_bindings != binding.model_bindings)
+    return "prepared_participant_backend_model_bindings_mismatch";
+  if (participant.frame_bindings != binding.frame_bindings)
+    return "prepared_participant_backend_frame_bindings_mismatch";
+  if (participant.control_domain_id != path.control_domain_id)
+    return "prepared_participant_backend_control_domain_id_mismatch";
+  if (participant.control_domain_revision != path.control_domain_revision)
+    return "prepared_participant_backend_control_domain_revision_mismatch";
+  if (participant.control_binding_id != path.control_binding_id)
+    return "prepared_participant_backend_control_binding_id_mismatch";
+  if (participant.control_binding_revision != path.control_binding_revision)
+    return "prepared_participant_backend_control_binding_revision_mismatch";
+  if (participant.control_interface_contract_id != path.control_interface_contract_id)
+    return "prepared_participant_backend_interface_contract_id_mismatch";
+  if (participant.control_interface_revision != path.control_interface_revision)
+    return "prepared_participant_backend_interface_revision_mismatch";
+  if (participant.controller_topology_id != path.controller_topology_id)
+    return "prepared_participant_backend_controller_topology_id_mismatch";
+  if (participant.topology_revision != path.topology_revision)
+    return "prepared_participant_backend_topology_revision_mismatch";
+  if (participant.control_route_id != path.control_route_id)
+    return "prepared_participant_backend_control_route_id_mismatch";
+  if (participant.activation_set_id != path.activation_set_id)
+    return "prepared_participant_backend_activation_set_id_mismatch";
+  if (participant.control_provider != provider(path))
+    return "prepared_participant_backend_control_provider_mismatch";
+  if (participant.capability_provider != expected_capability_provider)
+    return "prepared_participant_backend_capability_provider_mismatch";
+  if (participant.resources != binding_resources(binding))
+    return "prepared_participant_backend_resources_mismatch";
+  if (participant.active_control_configuration_id != path.active_control_configuration_id)
+    return "prepared_participant_backend_active_configuration_id_mismatch";
+  if (participant.active_control_configuration_generation !=
+      path.active_control_configuration_generation)
+    return "prepared_participant_backend_active_configuration_generation_mismatch";
+  if (participant.runtime_unit_epochs != binding.runtime_unit_epochs)
+    return "prepared_participant_backend_runtime_unit_epochs_mismatch";
+  if (participant.stop_evidence_policy_id != path.stop_evidence_policy_id)
+    return "prepared_participant_backend_stop_evidence_policy_id_mismatch";
+  if (participant.stop_evidence_policy_revision != path.stop_evidence_policy_revision)
+    return "prepared_participant_backend_stop_evidence_policy_revision_mismatch";
   const auto& stop_plan = participant.ordinary_stop_plan;
   if (stop_plan.operation_id != participant.operation_id ||
       stop_plan.operation_revision != participant.operation_revision ||

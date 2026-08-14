@@ -146,4 +146,19 @@ materialize_lite6_stop_qualified_native_motion_retained_consumer_fixture(
       stop_evidence_candidates);
 }
 
+[[nodiscard]] inline DurableLite6RetainedConsumerFixture
+materialize_lite6_native_cclc_product_retained_consumer_fixture(
+    const std::filesystem::path &package_root,
+    std::span<const detail::StopQualificationEvidenceCandidate>
+        stop_evidence_candidates,
+    std::string_view arm_lifecycle_semantic_digest,
+    std::string_view gripper_lifecycle_semantic_digest) {
+  return materialize_lite6_retained_consumer_fixture_from(
+      package_root,
+      make_lite6_native_cclc_product_retention_fixture(
+          arm_lifecycle_semantic_digest,
+          gripper_lifecycle_semantic_digest),
+      stop_evidence_candidates);
+}
+
 }  // namespace manyforge::deployment::test

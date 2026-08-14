@@ -8,6 +8,7 @@
 #include <manyforge_core/types/strong_id.hpp>
 #include <manyforge_deployment/canonical_value.hpp>
 #include <manyforge_deployment/cell_composition.hpp>
+#include <manyforge_deployment/provider_manifest_codec.hpp>
 #include <memory>
 #include <optional>
 #include <stdexcept>
@@ -92,6 +93,26 @@ class RetainedBundle final {
 
 [[nodiscard]] bool
 verify_retained_bundle_identity(const RetainedBundle& bundle);
+
+struct RetainedProviderManifestQuery final {
+  core::RetainedBundleId retained_bundle_id;
+  core::ProviderManifestId provider_manifest_id;
+  core::ProviderManifestRevision provider_manifest_revision;
+
+  friend bool operator==(const RetainedProviderManifestQuery &,
+                         const RetainedProviderManifestQuery &) = default;
+};
+
+/// Exact point-read capability for one provider manifest retained by a
+/// verified bundle. Implementations must re-read and re-qualify the manifest;
+/// callers cannot select a latest revision or supply raw bytes.
+class IVerifiedRetainedProviderManifestSource {
+public:
+  virtual ~IVerifiedRetainedProviderManifestSource() = default;
+
+  [[nodiscard]] virtual std::optional<QualifiedProviderManifest>
+  get_verified(const RetainedProviderManifestQuery &query) const = 0;
+};
 
 /// Exact immutable coordinates for one retained product artifact.
 ///
@@ -931,6 +952,19 @@ class FilesystemVerifiedRetainedProductArtifactSource final
   get_verified(const RetainedProductArtifactQuery& query) const override;
 
  private:
+  std::filesystem::path trusted_package_root_;
+};
+
+class FilesystemVerifiedRetainedProviderManifestSource final
+    : public IVerifiedRetainedProviderManifestSource {
+public:
+  explicit FilesystemVerifiedRetainedProviderManifestSource(
+      std::filesystem::path trusted_package_root);
+
+  [[nodiscard]] std::optional<QualifiedProviderManifest>
+  get_verified(const RetainedProviderManifestQuery &query) const override;
+
+private:
   std::filesystem::path trusted_package_root_;
 };
 
