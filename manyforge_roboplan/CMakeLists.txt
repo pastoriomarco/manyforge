@@ -165,6 +165,7 @@ target_link_libraries(manyforge_roboplan_native_state_projection PUBLIC
 
 add_library(manyforge_roboplan_native_runtime_support
   src/native_runtime_support.cpp
+  src/retained_externally_managed_lifecycle_ports.cpp
   src/retained_native_controller_lifecycle_port.cpp
   src/retained_native_brand_lifecycle_port.cpp)
 target_include_directories(manyforge_roboplan_native_runtime_support PUBLIC
@@ -296,7 +297,8 @@ if(MANYFORGE_BUILD_ROS2_CONTROL_RUNTIME)
     unset(_MANYFORGE_ROBOPLAN_BUILD_TESTING)
   endif()
   add_library(manyforge_roboplan_ros2_control_runtime
-    src/retained_ros2_control_backend_factory.cpp)
+    src/retained_ros2_control_backend_factory.cpp
+    src/retained_ros2_control_runtime_handle.cpp)
   target_include_directories(manyforge_roboplan_ros2_control_runtime PUBLIC
     $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
     $<INSTALL_INTERFACE:include>)

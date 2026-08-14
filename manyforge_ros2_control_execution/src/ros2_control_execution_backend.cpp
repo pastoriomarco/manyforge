@@ -368,20 +368,18 @@ Ros2ControlExecutionBackend::Ros2ControlExecutionBackend(
     std::shared_ptr<core::IExecutionStateSink> execution_state_sink,
     std::string group_name, core::IClock &clock, core::IScheduler &scheduler,
     Ros2ControlExecutionBackendConfig config)
-    : Ros2ControlExecutionBackend(false, nullptr,
-                                  std::move(execution_state_sink),
-                                  std::move(group_name), clock, scheduler,
-                                  std::move(config)) {}
+    : Ros2ControlExecutionBackend(
+          false, nullptr, std::move(execution_state_sink),
+          std::move(group_name), clock, scheduler, std::move(config)) {}
 
 Ros2ControlExecutionBackend::Ros2ControlExecutionBackend(
     DeferredRosExecutorStartTag,
     std::shared_ptr<core::IExecutionStateSink> execution_state_sink,
     std::string group_name, core::IClock &clock, core::IScheduler &scheduler,
     Ros2ControlExecutionBackendConfig config)
-    : Ros2ControlExecutionBackend(true, nullptr,
-                                  std::move(execution_state_sink),
-                                  std::move(group_name), clock, scheduler,
-                                  std::move(config)) {}
+    : Ros2ControlExecutionBackend(
+          true, nullptr, std::move(execution_state_sink), std::move(group_name),
+          clock, scheduler, std::move(config)) {}
 
 Ros2ControlExecutionBackend::Ros2ControlExecutionBackend(
     DeferredRosExecutorStartTag,
@@ -389,10 +387,9 @@ Ros2ControlExecutionBackend::Ros2ControlExecutionBackend(
     std::shared_ptr<core::IExecutionStateSink> execution_state_sink,
     std::string group_name, core::IClock &clock, core::IScheduler &scheduler,
     Ros2ControlExecutionBackendConfig config)
-    : Ros2ControlExecutionBackend(true, &addressed_state_publication,
-                                  std::move(execution_state_sink),
-                                  std::move(group_name), clock, scheduler,
-                                  std::move(config)) {}
+    : Ros2ControlExecutionBackend(
+          true, &addressed_state_publication, std::move(execution_state_sink),
+          std::move(group_name), clock, scheduler, std::move(config)) {}
 
 Ros2ControlExecutionBackend::Ros2ControlExecutionBackend(
     bool defer_ros_executor_start,
@@ -429,8 +426,7 @@ Ros2ControlExecutionBackend::Ros2ControlExecutionBackend(
 
 void Ros2ControlExecutionBackend::initialize_prepared_participant_bindings() {
   prepared_participant_aliases_.store(
-      std::make_shared<
-          const std::vector<core::RuntimeParticipantBinding>>(),
+      std::make_shared<const std::vector<core::RuntimeParticipantBinding>>(),
       std::memory_order_release);
   if (config_.prepared_participant_binding.has_value()) {
     prepared_participant_binding_.store(
@@ -502,7 +498,7 @@ void Ros2ControlExecutionBackend::validate_config() const {
   }
   const auto &transport_joints = transport_joint_names();
   const std::set<std::string> unique_transport_joints(transport_joints.begin(),
-                                                       transport_joints.end());
+                                                      transport_joints.end());
   if (transport_joints.size() != config_.required_joints.size() ||
       unique_transport_joints.size() != transport_joints.size() ||
       std::any_of(transport_joints.begin(), transport_joints.end(),
@@ -725,8 +721,8 @@ core::PrepareParticipantResultDTO Ros2ControlExecutionBackend::Prepare(
   if (field_error.has_value()) {
     const auto aliases =
         prepared_participant_aliases_.load(std::memory_order_acquire);
-    const auto matched = std::find_if(
-        aliases->begin(), aliases->end(), [&](const auto &alias) {
+    const auto matched =
+        std::find_if(aliases->begin(), aliases->end(), [&](const auto &alias) {
           return !binding_error(alias).has_value();
         });
     if (matched == aliases->end()) {
@@ -803,8 +799,8 @@ core::ExecutionHandle Ros2ControlExecutionBackend::dispatch_prepared(
   if (field_error.has_value()) {
     const auto aliases =
         prepared_participant_aliases_.load(std::memory_order_acquire);
-    const auto matched = std::find_if(
-        aliases->begin(), aliases->end(), [&](const auto &alias) {
+    const auto matched =
+        std::find_if(aliases->begin(), aliases->end(), [&](const auto &alias) {
           return !binding_error(alias).has_value();
         });
     if (matched == aliases->end()) {
@@ -868,9 +864,10 @@ core::Result<void> Ros2ControlExecutionBackend::RebindRoute(
     std::vector<core::RuntimeParticipantBinding> program_aliases) {
   const auto error = [](core::ErrorCode code, std::string reason,
                         std::string message) {
-    return core::Result<void>::Err(core::ErrorDTO{
-        std::string(core::to_string(code)), std::move(message),
-        {{"reason", std::move(reason)}}});
+    return core::Result<void>::Err(
+        core::ErrorDTO{std::string(core::to_string(code)),
+                       std::move(message),
+                       {{"reason", std::move(reason)}}});
   };
   const auto &value = binding.value();
   std::vector<std::string> binding_joints;
@@ -878,19 +875,18 @@ core::Result<void> Ros2ControlExecutionBackend::RebindRoute(
   binding_joints.reserve(value.resources.size());
   binding_transport_joints.reserve(value.resources.size());
   if (!value.control_path.has_value() || value.resources.empty() ||
-      std::any_of(value.resources.begin(), value.resources.end(),
-                  [&](const auto &resource) {
-                    if (!resource.source_joint_name.has_value() ||
-                        resource.compiled_resource_name.empty() ||
-                        resource.coordinate_kind !=
-                            core::CoordinateKind::kAngular) {
-                      return true;
-                    }
-                    binding_joints.push_back(resource.compiled_resource_name);
-                    binding_transport_joints.push_back(
-                        *resource.source_joint_name);
-                    return false;
-                  }) ||
+      std::any_of(
+          value.resources.begin(), value.resources.end(),
+          [&](const auto &resource) {
+            if (!resource.source_joint_name.has_value() ||
+                resource.compiled_resource_name.empty() ||
+                resource.coordinate_kind != core::CoordinateKind::kAngular) {
+              return true;
+            }
+            binding_joints.push_back(resource.compiled_resource_name);
+            binding_transport_joints.push_back(*resource.source_joint_name);
+            return false;
+          }) ||
       binding_joints != config_.required_joints ||
       binding_transport_joints != transport_joint_names()) {
     return error(core::ErrorCode::kInvalidRequest,
@@ -899,11 +895,12 @@ core::Result<void> Ros2ControlExecutionBackend::RebindRoute(
                  "motion resources");
   }
   if (program_aliases.size() > 64U ||
-      std::any_of(program_aliases.begin(), program_aliases.end(),
-                  [&](const auto &alias) {
-                    return !core::runtime_participant_binding_physically_contains(
-                        binding, alias);
-                  })) {
+      std::any_of(
+          program_aliases.begin(), program_aliases.end(),
+          [&](const auto &alias) {
+            return !core::runtime_participant_binding_physically_contains(
+                binding, alias);
+          })) {
     return error(core::ErrorCode::kInvalidRequest,
                  "ros2_control_motion_program_alias_mismatch",
                  "ros2_control Program aliases cross the physical backend");
@@ -912,8 +909,7 @@ core::Result<void> Ros2ControlExecutionBackend::RebindRoute(
     auto retained = std::make_shared<const core::RuntimeParticipantBinding>(
         std::move(binding));
     auto retained_aliases =
-        std::make_shared<
-            const std::vector<core::RuntimeParticipantBinding>>(
+        std::make_shared<const std::vector<core::RuntimeParticipantBinding>>(
             std::move(program_aliases));
     std::lock_guard<std::mutex> prepared_lock(prepared_execution_mutex_);
     {
@@ -946,15 +942,18 @@ void Ros2ControlExecutionBackend::initialize_observed_state_publication() {
   }
   owned_observed_state_publication_ =
       std::make_unique<core::ObservedRobotStatePublication>(
-          config_.required_joints, ros2_control_observed_state_sources(config_));
+          config_.required_joints,
+          ros2_control_observed_state_sources(config_));
   observed_state_publication_ = owned_observed_state_publication_.get();
 }
 
-void Ros2ControlExecutionBackend::validate_injected_observed_state_publication() {
+void Ros2ControlExecutionBackend::
+    validate_injected_observed_state_publication() {
   if (observed_state_publication_ == nullptr ||
       !std::equal(observed_state_publication_->canonical_joint_names().begin(),
                   observed_state_publication_->canonical_joint_names().end(),
-                  config_.required_joints.begin(), config_.required_joints.end()) ||
+                  config_.required_joints.begin(),
+                  config_.required_joints.end()) ||
       observed_state_publication_->source_configs() !=
           ros2_control_addressed_state_sources(config_)) {
     throw std::invalid_argument(
@@ -1067,8 +1066,8 @@ void Ros2ControlExecutionBackend::publish_observed_robot_state(
               joint_names.end()) {
         return;
       }
-      const auto index = static_cast<std::size_t>(
-          std::distance(joint_names.begin(), found));
+      const auto index =
+          static_cast<std::size_t>(std::distance(joint_names.begin(), found));
       remapped_positions.push_back(positions[index]);
       if (!velocities.empty()) {
         remapped_velocities.push_back(velocities[index]);
@@ -2568,7 +2567,7 @@ Ros2ControlExecutionBackend::wait_for_fresh_passive_sample_after(
 const std::vector<std::string> &
 Ros2ControlExecutionBackend::transport_joint_names() const noexcept {
   return config_.transport_joint_names.empty() ? config_.required_joints
-                                                : config_.transport_joint_names;
+                                               : config_.transport_joint_names;
 }
 
 std::vector<double> Ros2ControlExecutionBackend::positions_for_joints(
@@ -2887,9 +2886,9 @@ Ros2ControlExecutionBackend::controller_progress_metrics() const {
         diagnostic_metrics.slot_exhausted_total;
     auto diagnostic_sources =
         diagnostic_observed_state_publication_->source_metrics();
-    metrics.observed_state_sources.insert(
-        metrics.observed_state_sources.end(), diagnostic_sources.begin(),
-        diagnostic_sources.end());
+    metrics.observed_state_sources.insert(metrics.observed_state_sources.end(),
+                                          diagnostic_sources.begin(),
+                                          diagnostic_sources.end());
   }
   metrics.authored_active_publications_total =
       authored_active_publications_total_.load(std::memory_order_relaxed);
@@ -5445,8 +5444,7 @@ void Ros2ControlExecutionBackend::monitor_worker(
     }
     if (sample.has_value()) {
       try {
-        auto observed =
-            positions_for_joints(*sample, transport_joint_names());
+        auto observed = positions_for_joints(*sample, transport_joint_names());
         if (!uses_authored_backend_state() &&
             (last_progress_projection_at ==
                  std::chrono::steady_clock::time_point::min() ||
@@ -5896,8 +5894,7 @@ Ros2ControlExecutionBackend::execute_controlled_stop(
            {"freshest_sample_age_s", std::to_string(freshest_age_s)}}};
       return result;
     }
-    observed_positions =
-        positions_for_joints(*sample, transport_joint_names());
+    observed_positions = positions_for_joints(*sample, transport_joint_names());
     if (sample->velocities.size() == sample->joint_names.size()) {
       observed_velocities.reserve(joint_names.size());
       for (const auto &joint : transport_joint_names()) {
@@ -8048,12 +8045,108 @@ void Ros2ControlExecutionBackend::authorize_gripper_commands() noexcept {
   gripper_admission_blocked_ = false;
 }
 
+Ros2GripperTransportReadinessSnapshot
+Ros2ControlExecutionBackend::gripper_transport_readiness(
+    const std::string &gripper_id) const {
+  Ros2GripperTransportReadinessSnapshot result;
+  result.command_gate_open =
+      config_.command_gate_topic.empty() ||
+      command_gate_enabled_.load(std::memory_order_acquire);
+  if (gripper_id.empty()) {
+    result.reason_codes.push_back("gripper_identity_missing");
+    return result;
+  }
+
+  std::shared_ptr<GripperRuntime> runtime;
+  {
+    std::lock_guard<std::mutex> map_lock(gripper_map_mutex_);
+    const auto found = grippers_.find(gripper_id);
+    if (found == grippers_.end()) {
+      result.reason_codes.push_back("gripper_transport_not_configured");
+      return result;
+    }
+    runtime = found->second;
+  }
+
+  Ros2GripperActionConfig runtime_config;
+  rclcpp_action::Client<GripperCommand>::SharedPtr action_client;
+  rclcpp::Publisher<sensor_msgs::msg::JointState>::SharedPtr command_publisher;
+  std::optional<std::chrono::steady_clock::time_point> observed_at;
+  {
+    std::lock_guard<std::mutex> runtime_lock(runtime->mutex);
+    runtime_config = runtime->config;
+    action_client = runtime->action_client;
+    command_publisher = runtime->joint_state_pub;
+    observed_at = runtime->observed_at;
+  }
+  result.transport_kind = runtime_config.transport_kind;
+  result.configured = true;
+
+  try {
+    if (runtime_config.transport_kind == "ros_gripper_command") {
+      result.command_path_ready =
+          action_client && action_client->action_server_is_ready();
+      result.feedback_path_ready = result.command_path_ready;
+      if (!result.command_path_ready) {
+        result.reason_codes.push_back("gripper_action_server_unavailable");
+      }
+    } else if (runtime_config.transport_kind == "isaac_joint_state_effort") {
+      result.command_path_ready =
+          command_publisher && command_publisher->get_subscription_count() > 0U;
+      if (!result.command_path_ready) {
+        result.reason_codes.push_back("gripper_command_subscriber_unavailable");
+      }
+      if (runtime_config.state_topic.empty()) {
+        result.feedback_path_ready = true;
+      } else if (observed_at.has_value()) {
+        const auto age = std::chrono::steady_clock::now() - *observed_at;
+        const auto freshness = std::chrono::duration<double>(
+            runtime_config.state_freshness_timeout_s);
+        result.feedback_path_ready =
+            age >= decltype(age)::zero() && age <= freshness;
+      }
+      if (!result.feedback_path_ready) {
+        result.reason_codes.push_back("gripper_state_feedback_unavailable");
+      }
+    } else {
+      result.reason_codes.push_back("gripper_transport_kind_invalid");
+    }
+  } catch (...) {
+    result.command_path_ready = false;
+    result.feedback_path_ready = false;
+    result.reason_codes.push_back("gripper_transport_readiness_exception");
+  }
+
+  if (!result.command_gate_open) {
+    result.reason_codes.push_back("gripper_command_gate_closed");
+  }
+  {
+    std::lock_guard<std::mutex> map_lock(gripper_map_mutex_);
+    const auto current = grippers_.find(gripper_id);
+    if (current == grippers_.end() || current->second != runtime) {
+      result.configured = false;
+      result.command_path_ready = false;
+      result.feedback_path_ready = false;
+      result.reason_codes.push_back("gripper_transport_replaced");
+    }
+  }
+  std::sort(result.reason_codes.begin(), result.reason_codes.end());
+  result.reason_codes.erase(
+      std::unique(result.reason_codes.begin(), result.reason_codes.end()),
+      result.reason_codes.end());
+  result.ready = result.configured && result.command_path_ready &&
+                 result.feedback_path_ready && result.command_gate_open &&
+                 result.reason_codes.empty();
+  return result;
+}
+
 core::Result<void> Ros2ControlExecutionBackend::validate_gripper_command(
     const core::GripperCommandRequestDTO &request) const {
   const auto rejected = [](std::string reason, std::string message) {
     return core::Result<void>::Err(core::ErrorDTO{
         std::string(core::to_string(core::ErrorCode::kInvalidRequest)),
-        std::move(message), {{"reason", std::move(reason)}}});
+        std::move(message),
+        {{"reason", std::move(reason)}}});
   };
   const double max_effort = request.max_effort.value_or(0.0);
   if (request.gripper_id.empty() || !std::isfinite(request.target_position) ||
@@ -8091,15 +8184,12 @@ core::Result<void> Ros2ControlExecutionBackend::validate_gripper_command(
     }
     if (runtime->state == "failed" &&
         runtime->reason_code != "grasp_confirmation_lost") {
-      return rejected(runtime->reason_code.empty()
-                          ? "gripper_request_failed"
-                          : runtime->reason_code,
-                      runtime->error.empty()
-                          ? "Gripper state is unavailable"
-                          : runtime->error);
+      return rejected(runtime->reason_code.empty() ? "gripper_request_failed"
+                                                   : runtime->reason_code,
+                      runtime->error.empty() ? "Gripper state is unavailable"
+                                             : runtime->error);
     }
-    if (runtime->projection_state ==
-        core::GripperProjectionState::kPending) {
+    if (runtime->projection_state == core::GripperProjectionState::kPending) {
       return rejected(ros2_control_fault_reason::kGripperBusy,
                       "Gripper terminal scene projection is still pending");
     }
@@ -8122,8 +8212,7 @@ core::Result<void> Ros2ControlExecutionBackend::validate_gripper_command(
         "Gripper request semantics do not match the configured transport");
   }
 
-  if (!runtime_config.group_id.empty() ||
-      !runtime_config.joint_name.empty()) {
+  if (!runtime_config.group_id.empty() || !runtime_config.joint_name.empty()) {
     std::optional<double> start_position;
     try {
       start_position = scene_group_joint_position(runtime_config.group_id,
@@ -8137,12 +8226,11 @@ core::Result<void> Ros2ControlExecutionBackend::validate_gripper_command(
                       "Cannot read gripper execution state");
     }
     if (!start_position.has_value()) {
-      return rejected(
-          ros2_control_fault_reason::kGripperNotConfigured,
-          "Cannot project gripper '" + request.gripper_id +
-              "' into execution-state sink group '" +
-              runtime_config.group_id + "' joint '" +
-              runtime_config.joint_name + "'");
+      return rejected(ros2_control_fault_reason::kGripperNotConfigured,
+                      "Cannot project gripper '" + request.gripper_id +
+                          "' into execution-state sink group '" +
+                          runtime_config.group_id + "' joint '" +
+                          runtime_config.joint_name + "'");
     }
     if (!std::isfinite(*start_position)) {
       return rejected(

@@ -3,6 +3,7 @@
 #include <optional>
 
 #include <manyforge_roboplan/retained_native_runtime.hpp>
+#include <manyforge_roboplan/retained_ros2_control_runtime_handle.hpp>
 #include <manyforge_ros2_control_execution/ros2_control_execution_backend.hpp>
 
 namespace manyforge::roboplan_backend {
@@ -36,6 +37,7 @@ retained_ros2_control_gripper_state_config(
 /// competing Kernel or state publication.
 [[nodiscard]] RetainedRuntimeBackendFactory
 make_retained_ros2_control_backend_factory(
-    RetainedRos2ControlBackendConfig config);
+    RetainedRos2ControlBackendConfig config,
+    std::shared_ptr<RetainedRos2ControlRuntimeHandle> runtime_handle = {});
 
 } // namespace manyforge::roboplan_backend

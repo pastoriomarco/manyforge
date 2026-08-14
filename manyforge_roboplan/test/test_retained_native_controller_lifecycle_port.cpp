@@ -2,6 +2,7 @@
 
 #include <manyforge_core/controller_lifecycle_evaluator.hpp>
 #include <manyforge_core/time/fake_clock.hpp>
+#include <manyforge_roboplan/retained_externally_managed_lifecycle_ports.hpp>
 #include <manyforge_roboplan/retained_native_controller_lifecycle_port.hpp>
 #include <optional>
 #include <stop_token>
@@ -270,6 +271,158 @@ TEST(RetainedNativeControllerLifecyclePort,
   EXPECT_EQ(result.error->details.at("reason"),
             "native_controller_topology_immutable");
   EXPECT_TRUE(result.locally_valid());
+}
+
+TEST(RetainedExternallyManagedLifecyclePorts,
+     ExactExternalControllerStateReconcilesWithoutMutationAuthority) {
+  FakeClock clock;
+  clock.set(1'000);
+  const auto expected = MakeExpectedDomain();
+  RetainedExternallyManagedDomainSnapshot external{
+      7U, ComponentLifecycleStateDTO::kActive, true, {}};
+  auto created = RetainedExternallyManagedControllerLifecyclePort::Create(
+      expected, {MakePhysicalBinding()},
+      [&external](const ControlDomainId &domain_id, const TimePoint)
+          -> Result<RetainedExternallyManagedDomainSnapshot> {
+        if (domain_id != ControlDomainId("domain.arm")) {
+          return Result<RetainedExternallyManagedDomainSnapshot>::Err(
+              {"unexpected_domain", "unexpected domain", {}});
+        }
+        return Result<RetainedExternallyManagedDomainSnapshot>::Ok(external);
+      },
+      clock, 500);
+  ASSERT_TRUE(created.ok()) << created.error().message;
+
+  const auto query = MakeControllerLifecycleObservationQuery(expected.value());
+  const auto observed = created.value()->Observe(query);
+  ASSERT_TRUE(observed.ok()) << observed.error().message;
+  ASSERT_TRUE(observed.value().active_configuration.has_value());
+  ASSERT_EQ(observed.value().controllers.size(), 1U);
+  EXPECT_EQ(observed.value().controllers.front().activity,
+            ControllerLifecycleActivityDTO::kActive);
+  ASSERT_EQ(observed.value().endpoints.size(), 1U);
+  EXPECT_TRUE(observed.value().endpoints.front().ready);
+  const auto reconciled =
+      ReconcileControllerLifecycle(expected.value(), observed.value(), 1'001);
+  ASSERT_TRUE(reconciled.ok()) << reconciled.error().message;
+  EXPECT_EQ(reconciled.value().disposition,
+            ControllerLifecycleReconciliationDispositionDTO::kReconciled);
+
+  ControllerLifecycleTransitionIntentDTO transition{
+      query,
+      observed.value().source_sequence,
+      0U,
+      {ControllerLifecycleTransitionKindDTO::kDeactivate,
+       {ControllerRoleId("native_execution")}},
+      100};
+  const auto result =
+      created.value()->ApplyTransitionStep(transition, std::stop_token{});
+  ASSERT_TRUE(result.locally_valid());
+  EXPECT_EQ(result.dispatch_state,
+            ControllerLifecycleTransitionDispatchStateDTO::kNotDispatched);
+  ASSERT_TRUE(result.error.has_value());
+  EXPECT_EQ(result.error->details.at("reason"),
+            "external_controller_observer_only");
+}
+
+TEST(RetainedExternallyManagedLifecyclePorts,
+     ExternalGenerationChangePublishesUnreconciledControllerTruth) {
+  FakeClock clock;
+  clock.set(1'000);
+  const auto expected = MakeExpectedDomain();
+  RetainedExternallyManagedDomainSnapshot external{
+      1U, ComponentLifecycleStateDTO::kActive, true, {}};
+  auto created = RetainedExternallyManagedControllerLifecyclePort::Create(
+      expected, {MakePhysicalBinding()},
+      [&external](const ControlDomainId &, const TimePoint) {
+        return Result<RetainedExternallyManagedDomainSnapshot>::Ok(external);
+      },
+      clock, 500);
+  ASSERT_TRUE(created.ok());
+  const auto query = MakeControllerLifecycleObservationQuery(expected.value());
+  ASSERT_TRUE(created.value()->Observe(query).ok());
+
+  external = {2U, ComponentLifecycleStateDTO::kDegraded, false, {}};
+  clock.advance(10);
+  const auto changed = created.value()->Observe(query);
+  ASSERT_TRUE(changed.ok()) << changed.error().message;
+  EXPECT_FALSE(changed.value().active_configuration.has_value());
+  const auto reconciliation =
+      ReconcileControllerLifecycle(expected.value(), changed.value(), 1'011);
+  ASSERT_TRUE(reconciliation.ok()) << reconciliation.error().message;
+  EXPECT_EQ(reconciliation.value().disposition,
+            ControllerLifecycleReconciliationDispositionDTO::
+                kExternalOrUnknownUnreconciled);
+
+  external = {2U, ComponentLifecycleStateDTO::kFaulted, false, {}};
+  clock.advance(10);
+  const auto conflicting = created.value()->Observe(query);
+  ASSERT_FALSE(conflicting.ok());
+  EXPECT_EQ(conflicting.error().details.at("reason"),
+            "external_controller_lifecycle_generation_invalid");
+}
+
+TEST(RetainedExternallyManagedLifecyclePorts,
+     BrandLifecycleIsReadOnlyAndPreservesExternalGeneration) {
+  FakeClock clock;
+  clock.set(5'000);
+  const ResolvedLifecycleProviderOccurrenceDTO occurrence{
+      ControlDomainId("domain.arm"),
+      ControlDomainRevision("domain-revision"),
+      ProviderInstanceId("provider.external"),
+      ProviderManifestId("provider-manifest.external"),
+      ProviderManifestRevision("provider-manifest-revision"),
+      RuntimeUnitId("runtime.native"),
+      RuntimeEpoch("runtime-epoch.1"),
+      ContentDigest("catalog-digest")};
+  auto created = RetainedExternallyManagedBrandLifecyclePort::Create(
+      occurrence,
+      [](const ControlDomainId &, const TimePoint) {
+        return Result<RetainedExternallyManagedDomainSnapshot>::Ok(
+            {11U, ComponentLifecycleStateDTO::kActive, true, {}});
+      },
+      clock, 1'000);
+  ASSERT_TRUE(created.ok()) << created.error().message;
+  const BrandLifecycleObservationQueryDTO query{
+      LifecycleTransactionId("transaction"),
+      LifecycleTransactionGeneration(1U),
+      ControllableComponentId("robot.1"),
+      occurrence.control_domain_id,
+      occurrence.control_domain_revision,
+      occurrence.provider_instance_id,
+      occurrence.provider_manifest_id,
+      occurrence.provider_manifest_revision,
+      occurrence.provider_runtime_unit_id,
+      occurrence.provider_runtime_epoch};
+  const auto observed = created.value()->Observe(query);
+  ASSERT_TRUE(observed.ok()) << observed.error().message;
+  EXPECT_EQ(observed.value().observation_generation, 11U);
+  EXPECT_EQ(observed.value().observed_state,
+            ComponentLifecycleStateDTO::kActive);
+
+  const BrandLifecyclePrimitiveIntentDTO intent{
+      query.lifecycle_transaction_id,
+      query.lifecycle_transaction_generation,
+      query.controllable_component_id,
+      query.control_domain_id,
+      query.control_domain_revision,
+      query.provider_instance_id,
+      query.provider_manifest_id,
+      query.provider_manifest_revision,
+      query.provider_runtime_unit_id,
+      query.provider_runtime_epoch,
+      LifecyclePrimitiveId("external.wait_for_ready"),
+      LifecyclePrimitiveAttemptId("attempt.1"),
+      observed.value().observation_generation,
+      100};
+  const auto result = created.value()->Dispatch(intent, std::stop_token{});
+  ASSERT_TRUE(result.locally_valid());
+  EXPECT_EQ(result.dispatch_state,
+            LifecyclePrimitiveDispatchStateDTO::kNotDispatched);
+  EXPECT_EQ(result.effect, LifecyclePrimitiveEffectDTO::kNone);
+  ASSERT_TRUE(result.error.has_value());
+  EXPECT_EQ(result.error->details.at("reason"),
+            "external_brand_lifecycle_observer_only");
 }
 
 } // namespace

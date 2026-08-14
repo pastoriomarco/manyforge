@@ -32,8 +32,8 @@ private:
   std::optional<RetainedRos2ControlBackendConfig> config_;
 };
 
-[[nodiscard]] core::ObservedStateSourceKind addressed_source_kind(
-    const core::ObservedRobotStateSourceKind source) {
+[[nodiscard]] core::ObservedStateSourceKind
+addressed_source_kind(const core::ObservedRobotStateSourceKind source) {
   switch (source) {
   case core::ObservedRobotStateSourceKind::kActionFeedback:
     return core::ObservedStateSourceKind::kActionFeedback;
@@ -49,8 +49,8 @@ private:
   throw std::invalid_argument("unknown ros2_control state source kind");
 }
 
-[[nodiscard]] std::vector<std::string> compiled_resources(
-    const core::RuntimeParticipantBinding &binding) {
+[[nodiscard]] std::vector<std::string>
+compiled_resources(const core::RuntimeParticipantBinding &binding) {
   std::vector<std::string> result;
   result.reserve(binding.value().resources.size());
   for (const auto &resource : binding.value().resources) {
@@ -64,8 +64,8 @@ private:
   return result;
 }
 
-[[nodiscard]] std::vector<std::string> source_resources(
-    const core::RuntimeParticipantBinding &binding) {
+[[nodiscard]] std::vector<std::string>
+source_resources(const core::RuntimeParticipantBinding &binding) {
   std::vector<std::string> result;
   result.reserve(binding.value().resources.size());
   for (const auto &resource : binding.value().resources) {
@@ -79,9 +79,9 @@ private:
   return result;
 }
 
-[[nodiscard]] std::string sole_compiled_group(
-    const core::RuntimeParticipantBinding &binding,
-    const char *description) {
+[[nodiscard]] std::string
+sole_compiled_group(const core::RuntimeParticipantBinding &binding,
+                    const char *description) {
   if (binding.value().model_groups.size() != 1U ||
       binding.value().model_groups.front().compiled_group_name.empty()) {
     throw std::invalid_argument(std::string(description) +
@@ -113,8 +113,7 @@ private:
 
 } // namespace
 
-RetainedObservedStateChannelConfig
-retained_ros2_control_motion_state_config(
+RetainedObservedStateChannelConfig retained_ros2_control_motion_state_config(
     const ros2_control_execution::Ros2ControlExecutionBackendConfig &config) {
   auto sources =
       ros2_control_execution::ros2_control_addressed_state_sources(config);
@@ -128,8 +127,7 @@ retained_ros2_control_motion_state_config(
       primary.freshness_budget_ns, 1U, std::move(sources)};
 }
 
-RetainedObservedStateChannelConfig
-retained_ros2_control_gripper_state_config(
+RetainedObservedStateChannelConfig retained_ros2_control_gripper_state_config(
     const core::RuntimeParticipantBinding &binding) {
   if (!binding.value().control_path.has_value() ||
       binding.value().control_path->state_authority_class !=
@@ -140,7 +138,10 @@ retained_ros2_control_gripper_state_config(
   const std::string source_id =
       binding.value().command_target_id.value() + ".commanded_state";
   return RetainedObservedStateChannelConfig{
-      core::ObservedStateSourceKind::kCommandedState, source_id, 0, 1U,
+      core::ObservedStateSourceKind::kCommandedState,
+      source_id,
+      0,
+      1U,
       {core::ObservedRobotStateSourceConfig{
           core::ObservedRobotStateSourceKind::kCommandedState, source_id,
           core::ObservedRobotStateAuthorityProfile::kCommandedSimulation, 0,
@@ -148,110 +149,122 @@ retained_ros2_control_gripper_state_config(
 }
 
 RetainedRuntimeBackendFactory make_retained_ros2_control_backend_factory(
-    RetainedRos2ControlBackendConfig config) {
-  auto single_use = std::make_shared<SingleUseRos2ControlBackendConfig>(
-      std::move(config));
-  return [single_use = std::move(single_use)](
-             const core::RuntimeParticipantBinding &motion_binding,
-             const std::optional<core::RuntimeParticipantBinding>
-                 &gripper_binding,
-             const std::shared_ptr<RetainedObservedStateChannel>
-                 &motion_channel,
-             const std::shared_ptr<RetainedObservedStateChannel>
-             &gripper_channel,
-             core::IClock &clock,
-             core::IScheduler &scheduler) -> RetainedRuntimeBackendSet {
-    auto selected = single_use->take();
-    const auto expected_authority =
-        selected.execution.execution_state_source_mode == "commanded_sim"
-            ? core::StateAuthorityClass::kCommanded
-        : selected.execution.execution_state_source_mode == "authored_preview"
-            ? core::StateAuthorityClass::kPredicted
-            : core::StateAuthorityClass::kMeasured;
-    if (!motion_channel || !motion_binding.value().control_path.has_value() ||
-        motion_binding.value().control_path->state_authority_class !=
-            expected_authority) {
-      throw std::invalid_argument(
-          "ros2_control backend differs from the retained state authority");
-    }
-    const auto joints = compiled_resources(motion_binding);
-    if (selected.execution.required_joints != joints) {
-      throw std::invalid_argument(
-          "ros2_control required joints differ from retained resources");
-    }
-    const auto transport_joints = source_resources(motion_binding);
-    if (selected.execution.transport_joint_names.empty()) {
-      selected.execution.transport_joint_names = transport_joints;
-    } else if (selected.execution.transport_joint_names != transport_joints) {
-      throw std::invalid_argument(
-          "ros2_control transport joints differ from retained source "
-          "resources");
-    }
-    const auto motion_group =
-        sole_compiled_group(motion_binding, "ros2_control motion binding");
-    selected.execution.prepared_participant_binding = motion_binding;
+    RetainedRos2ControlBackendConfig config,
+    std::shared_ptr<RetainedRos2ControlRuntimeHandle> runtime_handle) {
+  auto single_use =
+      std::make_shared<SingleUseRos2ControlBackendConfig>(std::move(config));
+  return
+      [single_use = std::move(single_use),
+       runtime_handle = std::move(runtime_handle)](
+          const core::RuntimeParticipantBinding &motion_binding,
+          const std::optional<core::RuntimeParticipantBinding> &gripper_binding,
+          const std::shared_ptr<RetainedObservedStateChannel> &motion_channel,
+          const std::shared_ptr<RetainedObservedStateChannel> &gripper_channel,
+          core::IClock &clock,
+          core::IScheduler &scheduler) -> RetainedRuntimeBackendSet {
+        auto selected = single_use->take();
+        const auto expected_authority =
+            selected.execution.execution_state_source_mode == "commanded_sim"
+                ? core::StateAuthorityClass::kCommanded
+            : selected.execution.execution_state_source_mode ==
+                    "authored_preview"
+                ? core::StateAuthorityClass::kPredicted
+                : core::StateAuthorityClass::kMeasured;
+        if (!motion_channel ||
+            !motion_binding.value().control_path.has_value() ||
+            motion_binding.value().control_path->state_authority_class !=
+                expected_authority) {
+          throw std::invalid_argument(
+              "ros2_control backend differs from the retained state authority");
+        }
+        const auto joints = compiled_resources(motion_binding);
+        if (selected.execution.required_joints != joints) {
+          throw std::invalid_argument(
+              "ros2_control required joints differ from retained resources");
+        }
+        const auto transport_joints = source_resources(motion_binding);
+        if (selected.execution.transport_joint_names.empty()) {
+          selected.execution.transport_joint_names = transport_joints;
+        } else if (selected.execution.transport_joint_names !=
+                   transport_joints) {
+          throw std::invalid_argument(
+              "ros2_control transport joints differ from retained source "
+              "resources");
+        }
+        const auto motion_group =
+            sole_compiled_group(motion_binding, "ros2_control motion binding");
+        selected.execution.prepared_participant_binding = motion_binding;
 
-    std::vector<RetainedExecutionStateSinkBinding> sink_bindings{
-        {motion_group, motion_channel, false}};
-    if (gripper_binding.has_value()) {
-      if (!selected.gripper.has_value() || !gripper_channel) {
-        throw std::invalid_argument(
-            "retained ros2_control gripper product is incomplete");
-      }
-      const auto gripper_group = sole_compiled_group(
-          *gripper_binding, "ros2_control gripper binding");
-      if (selected.gripper->group_id != gripper_group ||
-          gripper_binding->value().resources.size() != 1U ||
-          selected.gripper->joint_name !=
-              gripper_binding->value().resources.front().compiled_resource_name) {
-        throw std::invalid_argument(
-            "ros2_control gripper config differs from retained resources");
-      }
-      sink_bindings.push_back({gripper_group, gripper_channel, true});
-    } else if (selected.gripper.has_value()) {
-      throw std::invalid_argument(
-          "ros2_control product config contains an unbound gripper");
-    }
+        std::vector<RetainedExecutionStateSinkBinding> sink_bindings{
+            {motion_group, motion_channel, false}};
+        if (gripper_binding.has_value()) {
+          if (!selected.gripper.has_value() || !gripper_channel) {
+            throw std::invalid_argument(
+                "retained ros2_control gripper product is incomplete");
+          }
+          const auto gripper_group = sole_compiled_group(
+              *gripper_binding, "ros2_control gripper binding");
+          if (selected.gripper->group_id != gripper_group ||
+              gripper_binding->value().resources.size() != 1U ||
+              selected.gripper->joint_name != gripper_binding->value()
+                                                  .resources.front()
+                                                  .compiled_resource_name) {
+            throw std::invalid_argument(
+                "ros2_control gripper config differs from retained resources");
+          }
+          sink_bindings.push_back({gripper_group, gripper_channel, true});
+        } else if (selected.gripper.has_value()) {
+          throw std::invalid_argument(
+              "ros2_control product config contains an unbound gripper");
+        }
 
-    auto sink = std::make_shared<RetainedExecutionStateSink>(
-        clock, std::move(sink_bindings));
-    auto backend = std::make_shared<
-        ros2_control_execution::Ros2ControlExecutionBackend>(
-        ros2_control_execution::Ros2ControlExecutionBackend::
-            DeferredRosExecutorStartTag{},
-        motion_channel->numeric_publication_writer(), sink, motion_group, clock,
-        scheduler, selected.execution);
-    if (gripper_binding.has_value()) {
-      backend->configure_gripper_action(
-          gripper_binding->value().command_target_id.value(),
-          *selected.gripper);
-    }
-    backend->complete_ros_configuration();
+        auto sink = std::make_shared<RetainedExecutionStateSink>(
+            clock, std::move(sink_bindings));
+        auto backend = std::make_shared<
+            ros2_control_execution::Ros2ControlExecutionBackend>(
+            ros2_control_execution::Ros2ControlExecutionBackend::
+                DeferredRosExecutorStartTag{},
+            motion_channel->numeric_publication_writer(), sink, motion_group,
+            clock, scheduler, selected.execution);
+        if (gripper_binding.has_value()) {
+          backend->configure_gripper_action(
+              gripper_binding->value().command_target_id.value(),
+              *selected.gripper);
+        }
+        backend->complete_ros_configuration();
+        if (runtime_handle) {
+          const auto bound = runtime_handle->BindBackend(
+              backend, motion_binding, gripper_binding);
+          if (!bound.ok()) {
+            throw std::invalid_argument(bound.error().message);
+          }
+        }
 
-    const auto gripper_target =
-        gripper_binding.has_value()
-            ? std::optional(gripper_binding->value().command_target_id)
-            : std::nullopt;
-    RetainedRuntimeBackendSet result;
-    result.execution = backend;
-    if (gripper_binding.has_value()) {
-      result.gripper = backend;
-      result.gripper_stop_execution_port = backend.get();
-      result.rebind_gripper_route =
-          [backend, expected_target = *gripper_target](
-              core::RuntimeParticipantBinding binding,
-              std::shared_ptr<IRetainedObservedStateChannel> channel) {
-            static_cast<void>(backend);
-            return gripper_rebind_result(binding, channel, expected_target);
-          };
-    }
-    result.rebind_motion_route =
-        [backend](core::RuntimeParticipantBinding binding,
-                  std::vector<core::RuntimeParticipantBinding> aliases) {
-          return backend->RebindRoute(std::move(binding), std::move(aliases));
-        };
-    return result;
-  };
+        const auto gripper_target =
+            gripper_binding.has_value()
+                ? std::optional(gripper_binding->value().command_target_id)
+                : std::nullopt;
+        RetainedRuntimeBackendSet result;
+        result.execution = backend;
+        if (gripper_binding.has_value()) {
+          result.gripper = backend;
+          result.gripper_stop_execution_port = backend.get();
+          result.rebind_gripper_route =
+              [backend, expected_target = *gripper_target](
+                  core::RuntimeParticipantBinding binding,
+                  std::shared_ptr<IRetainedObservedStateChannel> channel) {
+                static_cast<void>(backend);
+                return gripper_rebind_result(binding, channel, expected_target);
+              };
+        }
+        result.rebind_motion_route =
+            [backend](core::RuntimeParticipantBinding binding,
+                      std::vector<core::RuntimeParticipantBinding> aliases) {
+              return backend->RebindRoute(std::move(binding),
+                                          std::move(aliases));
+            };
+        return result;
+      };
 }
 
 } // namespace manyforge::roboplan_backend

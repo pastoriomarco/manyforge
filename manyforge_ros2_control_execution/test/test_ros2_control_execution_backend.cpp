@@ -87,12 +87,13 @@ core::RuntimeParticipantBinding motion_binding(std::string program_id) {
       core::CapabilityId("execution.trajectory.execute"),
       core::CapabilityDefinitionRevision("capability-revision"),
       std::nullopt,
-      {core::ProgramModelRoleBindingDTO{
-          core::ModelRoleId("body"), core::ModelInstanceId("robot.model"),
-          core::ModelRevision("model-revision")}},
-      {core::RuntimeModelGroupBindingDTO{
-          core::ModelGroupRoleId("arm_group"),
-          core::ModelInstanceId("robot.model"), "arm", {"joint_1"}}},
+      {core::ProgramModelRoleBindingDTO{core::ModelRoleId("body"),
+                                        core::ModelInstanceId("robot.model"),
+                                        core::ModelRevision("model-revision")}},
+      {core::RuntimeModelGroupBindingDTO{core::ModelGroupRoleId("arm_group"),
+                                         core::ModelInstanceId("robot.model"),
+                                         "arm",
+                                         {"joint_1"}}},
       {core::ProgramFrameRoleBindingDTO{
           core::FrameRoleId("tcp"), core::ModelInstanceId("robot.model"),
           core::ModelRevision("model-revision"), "tcp"}},
@@ -136,8 +137,8 @@ core::RuntimeParticipantBinding motion_binding(std::string program_id) {
   return std::move(sealed.value());
 }
 
-core::RuntimeParticipantBinding program_alias(
-    const core::RuntimeParticipantBinding &physical) {
+core::RuntimeParticipantBinding
+program_alias(const core::RuntimeParticipantBinding &physical) {
   auto value = physical.value();
   value.program_id = core::ProgramId("program.alias");
   value.program_revision = core::ProgramRevision("program-alias-revision");
@@ -977,8 +978,7 @@ TEST(Ros2ControlExecutionBackendTest,
   EXPECT_EQ(snapshot->source_kind,
             core::ObservedRobotStateSourceKind::kCommandedState);
   EXPECT_EQ(snapshot->source_id, "commanded_state");
-  EXPECT_EQ(snapshot->authority_profile,
-            "ros2_control_commanded_sim_v1");
+  EXPECT_EQ(snapshot->authority_profile, "ros2_control_commanded_sim_v1");
   ASSERT_EQ(snapshot->positions_rad.size(), 1U);
   EXPECT_DOUBLE_EQ(snapshot->positions_rad.front(), 0.25);
 
@@ -1007,21 +1007,19 @@ TEST(Ros2ControlExecutionBackendTest,
   core::ManualScheduler scheduler;
   core::ObservedRobotStatePublication wrong_joints(
       {"different_joint"}, ros2_control_addressed_state_sources(config));
-  EXPECT_THROW(
-      Ros2ControlExecutionBackend(
-          Ros2ControlExecutionBackend::TestingNoRosStartupTag{}, wrong_joints,
-          sink, "arm", clock, scheduler, config),
-      std::invalid_argument);
+  EXPECT_THROW(Ros2ControlExecutionBackend(
+                   Ros2ControlExecutionBackend::TestingNoRosStartupTag{},
+                   wrong_joints, sink, "arm", clock, scheduler, config),
+               std::invalid_argument);
 
   auto wrong_sources = ros2_control_addressed_state_sources(config);
   wrong_sources.front().source_id = "different_source";
   core::ObservedRobotStatePublication wrong_source(config.required_joints,
-                                                    wrong_sources);
-  EXPECT_THROW(
-      Ros2ControlExecutionBackend(
-          Ros2ControlExecutionBackend::TestingNoRosStartupTag{}, wrong_source,
-          sink, "arm", clock, scheduler, config),
-      std::invalid_argument);
+                                                   wrong_sources);
+  EXPECT_THROW(Ros2ControlExecutionBackend(
+                   Ros2ControlExecutionBackend::TestingNoRosStartupTag{},
+                   wrong_source, sink, "arm", clock, scheduler, config),
+               std::invalid_argument);
 }
 
 TEST(Ros2ControlExecutionBackendTest,
@@ -1094,8 +1092,8 @@ TEST(Ros2ControlExecutionBackendTest,
   auto crossed_binding_value = binding.value();
   crossed_binding_value.resources.front().compiled_resource_name =
       "different_joint";
-  auto crossed_binding =
-      core::verify_runtime_participant_binding(std::move(crossed_binding_value));
+  auto crossed_binding = core::verify_runtime_participant_binding(
+      std::move(crossed_binding_value));
   ASSERT_TRUE(crossed_binding.ok()) << crossed_binding.error().message;
   auto binding_rejected = backend.RebindRoute(crossed_binding.value(), {});
   ASSERT_FALSE(binding_rejected.ok());
@@ -2123,6 +2121,36 @@ TEST(Ros2ControlExecutionBackendTest,
 }
 
 TEST(Ros2ControlExecutionBackendTest,
+     GripperTransportReadinessIsNonBlockingAndFailClosed) {
+  auto sink = std::make_shared<RecordingExecutionStateSink>();
+  core::FakeClock clock;
+  core::ManualScheduler scheduler;
+  Ros2ControlExecutionBackend backend(
+      Ros2ControlExecutionBackend::DeferredRosExecutorStartTag{}, sink, "arm",
+      clock, scheduler, base_config());
+
+  const auto absent = backend.gripper_transport_readiness("missing");
+  EXPECT_FALSE(absent.configured);
+  EXPECT_FALSE(absent.ready);
+  EXPECT_EQ(absent.reason_codes,
+            std::vector<std::string>{"gripper_transport_not_configured"});
+
+  Ros2GripperActionConfig gripper;
+  gripper.action_name =
+      "/manyforge_missing_gripper_readiness_" + unique_suffix();
+  backend.configure_gripper_action("tool", gripper);
+  const auto configured = backend.gripper_transport_readiness("tool");
+  EXPECT_TRUE(configured.configured);
+  EXPECT_EQ(configured.transport_kind, "ros_gripper_command");
+  EXPECT_FALSE(configured.command_path_ready);
+  EXPECT_FALSE(configured.feedback_path_ready);
+  EXPECT_TRUE(configured.command_gate_open);
+  EXPECT_FALSE(configured.ready);
+  EXPECT_EQ(configured.reason_codes,
+            std::vector<std::string>{"gripper_action_server_unavailable"});
+}
+
+TEST(Ros2ControlExecutionBackendTest,
      GripperPreflightRejectsCrossedSemanticsWithoutAdmittingAnEffect) {
   auto sink = std::make_shared<RecordingExecutionStateSink>();
   sink->set_joint_position("gripper", "finger_joint", 0.7);
@@ -2132,8 +2160,8 @@ TEST(Ros2ControlExecutionBackendTest,
       Ros2ControlExecutionBackend::DeferredRosExecutorStartTag{}, sink, "arm",
       clock, scheduler, base_config());
   backend.configure_gripper_action(
-      "tool", isaac_gripper_config("/manyforge_preflight_gripper_" +
-                                    unique_suffix()));
+      "tool",
+      isaac_gripper_config("/manyforge_preflight_gripper_" + unique_suffix()));
 
   const auto valid = make_gripper_request(
       0.0, 0.2, 0.0, "isaac_joint_state_effort", "dwell_elapsed");
@@ -2165,7 +2193,7 @@ TEST(Ros2ControlExecutionBackendTest,
       clock, scheduler, base_config());
   backend.configure_gripper_action(
       "tool", isaac_gripper_config("/manyforge_preflight_state_gripper_" +
-                                    unique_suffix()));
+                                   unique_suffix()));
   const auto request = make_gripper_request(
       0.0, 0.2, 0.0, "isaac_joint_state_effort", "dwell_elapsed");
 

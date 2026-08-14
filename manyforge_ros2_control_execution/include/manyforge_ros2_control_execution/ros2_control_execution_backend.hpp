@@ -78,6 +78,23 @@ struct Ros2GripperActionConfig {
   double result_timeout_s = 5.0;
 };
 
+/// One bounded, non-blocking readiness read for a configured gripper
+/// transport. This is diagnostic/lifecycle evidence only; it grants no command
+/// authority and performs no discovery wait.
+struct Ros2GripperTransportReadinessSnapshot {
+  std::string transport_kind;
+  bool configured{};
+  bool command_path_ready{};
+  bool feedback_path_ready{};
+  bool command_gate_open{};
+  bool ready{};
+  std::vector<std::string> reason_codes;
+
+  friend bool
+  operator==(const Ros2GripperTransportReadinessSnapshot &,
+             const Ros2GripperTransportReadinessSnapshot &) = default;
+};
+
 struct Ros2ControlSceneProjectionMetrics {
   std::uint64_t misses_total = 0;
   std::uint64_t successful_updates_total = 0;
@@ -197,9 +214,9 @@ public:
   /// Rebind one quiescent adapter to a verified successor route and its exact
   /// Program-scoped aliases. Old prepared replay membership is discarded
   /// before the successor becomes visible.
-  [[nodiscard]] core::Result<void> RebindRoute(
-      core::RuntimeParticipantBinding binding,
-      std::vector<core::RuntimeParticipantBinding> program_aliases);
+  [[nodiscard]] core::Result<void>
+  RebindRoute(core::RuntimeParticipantBinding binding,
+              std::vector<core::RuntimeParticipantBinding> program_aliases);
 
   // Deployment-owned ROS entities, including gripper transports, must be
   // installed before this one-way transition. Mutating the ROS graph while the
@@ -287,6 +304,8 @@ public:
 
   void configure_gripper_action(std::string gripper_id,
                                 Ros2GripperActionConfig config);
+  [[nodiscard]] Ros2GripperTransportReadinessSnapshot
+  gripper_transport_readiness(const std::string &gripper_id) const;
   [[nodiscard]] core::Result<void> validate_gripper_command(
       const core::GripperCommandRequestDTO &request) const override;
   core::GripperCommandResultDTO
