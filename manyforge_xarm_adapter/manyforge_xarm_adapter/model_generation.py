@@ -299,18 +299,29 @@ def _validate_generated_model(
     if normalized_runtime != model_urdf:
         raise ValueError('runtime/model URDF model semantics diverged')
 
-    for label, candidate, expected_plugin, expected_backend in (
+    for (
+        label,
+        candidate,
+        expected_plugin,
+        expected_backend,
+        expected_params,
+    ) in (
         (
             'supervised production',
             supervised_runtime,
             SUPERVISED_HARDWARE_PLUGIN,
+            None,
             None,
         ),
         (
             'supervised fake',
             supervised_fake_runtime,
             SUPERVISED_FAKE_HARDWARE_PLUGIN,
-            'fake',
+            None,
+            {
+                'mock_sensor_commands': 'false',
+                'calculate_dynamics': 'false',
+            },
         ),
     ):
         candidate_root = ET.fromstring(candidate)
@@ -333,6 +344,8 @@ def _validate_generated_model(
             )
         ):
             raise ValueError(f'{label} URDF has the wrong backend policy')
+        if expected_params is not None and parameters != expected_params:
+            raise ValueError(f'{label} URDF has the wrong hardware parameters')
         candidate_joints = candidate_control.findall('./joint')
         if tuple(joint.get('name') for joint in candidate_joints) != tuple(
             f'{profile.prefix}joint{index}' for index in range(1, 7)

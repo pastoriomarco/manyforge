@@ -110,6 +110,17 @@ def test_supervised_runtime_changes_only_execution_owner() -> None:
     assert SUPERVISED_FAKE_HARDWARE_PLUGIN in qualification
     assert 'authority_profile' not in qualification
     assert 'authority_session' not in qualification
+    qualification_hardware = ET.fromstring(qualification).find(
+        './ros2_control/hardware'
+    )
+    assert qualification_hardware is not None
+    assert {
+        parameter.get('name'): parameter.text
+        for parameter in qualification_hardware.findall('./param')
+    } == {
+        'mock_sensor_commands': 'false',
+        'calculate_dynamics': 'false',
+    }
 
 
 def test_source_manifest_rejects_non_exact_tree_identity(

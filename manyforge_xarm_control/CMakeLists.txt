@@ -66,6 +66,10 @@ ament_target_dependencies(${PROJECT_NAME}_brand_lifecycle
 )
 set_property(TARGET ${PROJECT_NAME}_brand_lifecycle APPEND PROPERTY
   LINK_LIBRARIES manyforge_core manyforge_lite6_product)
+set_property(TARGET ${PROJECT_NAME}_brand_lifecycle APPEND PROPERTY
+  INTERFACE_LINK_LIBRARIES
+    "$<BUILD_INTERFACE:manyforge_core>"
+    "$<BUILD_INTERFACE:manyforge_lite6_product>")
 
 install(
   DIRECTORY include/
