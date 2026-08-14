@@ -1936,8 +1936,9 @@ class ResourceAddressedExecutionKernel::StopProjectionWorker final {
         requested_(std::make_unique<std::atomic_uint64_t[]>(capacity)),
         delivered_(std::make_unique<std::atomic_uint64_t[]>(capacity)),
         worker_([this](std::stop_token token) noexcept { Run(token); }) {
-    std::unique_lock lock(mutex_);
-    changed_.wait(lock, [this] { return ready_.load(std::memory_order_acquire); });
+    while (!ready_.load(std::memory_order_acquire)) {
+      ready_.wait(false, std::memory_order_acquire);
+    }
   }
 
   ~StopProjectionWorker() {
@@ -1997,6 +1998,7 @@ class ResourceAddressedExecutionKernel::StopProjectionWorker final {
  private:
   void Run(const std::stop_token stop_token) noexcept {
     ready_.store(true, std::memory_order_release);
+    ready_.notify_all();
     changed_.notify_all();
     while (!stop_token.stop_requested()) {
       bool progressed = false;

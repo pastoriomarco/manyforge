@@ -36,9 +36,9 @@ class BoundedStopControlExecutor::Impl final {
     }
     slots_ = std::make_unique<Slot[]>(capacity_);
     worker_ = std::jthread([this](std::stop_token stop_token) noexcept { Run(stop_token); });
-    std::unique_lock lock(wait_mutex_);
-    state_changed_.wait(
-        lock, [this]() noexcept { return worker_ready_.load(std::memory_order_acquire); });
+    while (!worker_ready_.load(std::memory_order_acquire)) {
+      worker_ready_.wait(false, std::memory_order_acquire);
+    }
   }
 
   ~Impl() {
@@ -218,6 +218,7 @@ class BoundedStopControlExecutor::Impl final {
   void Run(const std::stop_token stop_token) noexcept {
     worker_running_.store(true, std::memory_order_release);
     worker_ready_.store(true, std::memory_order_release);
+    worker_ready_.notify_all();
     Signal();
     auto observed_wake = wake_sequence_.load(std::memory_order_acquire);
 

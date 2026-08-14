@@ -55,8 +55,11 @@ class BoundedStopStageAttemptExecutor::Impl final {
       }
       throw;
     }
-    std::unique_lock lock(state_mutex_);
-    state_changed_.wait(lock, [this] { return ready_workers_ == capacity_; });
+    auto ready = ready_workers_.load(std::memory_order_acquire);
+    while (ready != capacity_) {
+      ready_workers_.wait(ready, std::memory_order_acquire);
+      ready = ready_workers_.load(std::memory_order_acquire);
+    }
   }
 
   ~Impl() {
@@ -247,6 +250,7 @@ class BoundedStopStageAttemptExecutor::Impl final {
 
   void Run(Slot& slot, const std::uint32_t slot_index, const std::stop_token worker_stop) noexcept {
     ready_workers_.fetch_add(1U, std::memory_order_acq_rel);
+    ready_workers_.notify_all();
     SignalStateChange();
     while (!worker_stop.stop_requested()) {
       StopStageAttemptRequest request;
@@ -289,6 +293,7 @@ class BoundedStopStageAttemptExecutor::Impl final {
       SignalStateChange();
     }
     ready_workers_.fetch_sub(1U, std::memory_order_acq_rel);
+    ready_workers_.notify_all();
     SignalStateChange();
   }
 
