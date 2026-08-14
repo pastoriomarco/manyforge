@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import threading
+import time
 
 from geometry_msgs.msg import Vector3
 import rclpy
@@ -28,8 +29,24 @@ from simulation_interfaces.srv import (
     StepSimulation,
 )
 
+from manyforge_behavior.orchestration_ports import (
+    NodeAttemptIdentity,
+    OwnerNodeInputs,
+    OwnerTaskState,
+    ProgramRunPortContext,
+)
+from manyforge_ros.program_simulation_port import (
+    RosSimulationProgramTaskPort,
+    SimulationProgramSiteConfig,
+    SimulationScenarioSiteConfig,
+)
 from manyforge_ros.scene_mirror_probe import SimulationSceneMirrorClient
 from manyforge_ros.simulation_control import SimulationControlClient
+
+
+_DIGEST_A = "sha256:" + "a" * 64
+_DIGEST_B = "sha256:" + "b" * 64
+_DIGEST_C = "sha256:" + "c" * 64
 
 
 def test_control_and_scene_clients_share_the_typed_simulator_owner() -> None:
@@ -38,6 +55,7 @@ def test_control_and_scene_clients_share_the_typed_simulator_owner() -> None:
     client_node: Node | None = None
     executor = SingleThreadedExecutor()
     worker: threading.Thread | None = None
+    program_port: RosSimulationProgramTaskPort | None = None
     state = {
         "simulation_state": int(SimulationState.STATE_STOPPED),
         "entity_state": EntityState(),
@@ -60,14 +78,46 @@ def test_control_and_scene_clients_share_the_typed_simulator_owner() -> None:
         assert control.get_simulation_state().state == "playing"
         assert control.set_simulation_state(state="stopped").success
         assert control.step(steps=2).success
-        assert control.set_entity_state(
-            entity="/World/soup_can",
-            pose={
-                "frame_id": "world",
-                "position_m": [0.25, -0.5, 0.75],
-                "orientation_xyzw": [0.0, 0.0, 0.0, 1.0],
-            },
-        ).success
+        program_port = RosSimulationProgramTaskPort(
+            SimulationProgramSiteConfig(
+                service_prefix="auto",
+                service_timeout_s=2.0,
+                scenarios=(
+                    SimulationScenarioSiteConfig(
+                        scenario_id="isaac-cell",
+                        cell_frame_id="world",
+                        scene_entities={"soup_can": "/World/soup_can"},
+                    ),
+                ),
+            ),
+        )
+        program_port.bind(_program_context())
+        identity = NodeAttemptIdentity(
+            program_run_id="run.simulation.transport",
+            node_instance_id="move_soup_can",
+            node_attempt_id="run.simulation.transport/move_soup_can/1",
+        )
+        started = program_port.start(
+            "simulation.set_entity_pose",
+            identity,
+            OwnerNodeInputs(
+                parameters={
+                    "scene_resource_id": "soup_can",
+                    "pose": {
+                        "frame_ref": {"kind": "cell_frame"},
+                        "position_m": [0.25, -0.5, 0.75],
+                        "orientation": {"xyzw": [0.0, 0.0, 0.0, 1.0]},
+                    },
+                }
+            ),
+        )
+        deadline = time.monotonic() + 2.0
+        terminal = program_port.observe(started.task_id)
+        while terminal.state is OwnerTaskState.ACTIVE and time.monotonic() < deadline:
+            time.sleep(0.005)
+            terminal = program_port.observe(started.task_id)
+        assert terminal.state is OwnerTaskState.SUCCEEDED
+        program_port.acknowledge(started.task_id, identity)
 
         snapshot = SimulationSceneMirrorClient(
             client_node,
@@ -84,6 +134,8 @@ def test_control_and_scene_clients_share_the_typed_simulator_owner() -> None:
         assert entity.bounds.type_name == "TYPE_BOX"
         assert state["steps"] == 2
     finally:
+        if program_port is not None:
+            program_port.close()
         if client_node is not None:
             client_node.destroy_node()
         executor.shutdown()
@@ -93,6 +145,33 @@ def test_control_and_scene_clients_share_the_typed_simulator_owner() -> None:
             server.destroy_node()
         if rclpy.ok():
             rclpy.shutdown()
+
+
+def _program_context() -> ProgramRunPortContext:
+    return ProgramRunPortContext(
+        program_run_id="run.simulation.transport",
+        scenario_id="isaac-cell",
+        scenario_catalog_revision=_DIGEST_A,
+        program_id="simulation_transport",
+        program_revision=_DIGEST_B,
+        program_binding_id=_DIGEST_C,
+        retained_bundle_id=_DIGEST_A,
+        graph_revision=_DIGEST_B,
+        node_environment_digest=_DIGEST_C,
+        program={
+            "program_id": "simulation_transport",
+            "program_revision": _DIGEST_B,
+            "scene": [{"scene_resource_id": "soup_can"}],
+        },
+        program_binding={
+            "program_binding_id": _DIGEST_C,
+            "program_id": "simulation_transport",
+            "program_revision": _DIGEST_B,
+            "retained_bundle_id": _DIGEST_A,
+            "graph_revision": _DIGEST_B,
+            "target_role_bindings": [],
+        },
+    )
 
 
 def _install_services(node: Node, state: dict[str, object]) -> None:

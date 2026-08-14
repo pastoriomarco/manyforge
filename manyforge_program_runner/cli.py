@@ -27,11 +27,14 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--tick-interval-ms", type=float, default=10.0)
     parser.add_argument("--tick-workers", type=int, default=4)
     parser.add_argument("--model-endpoint-config")
+    parser.add_argument("--simulation-control-config")
     return parser
 
 
 def main(argv: Sequence[str] | None = None) -> int:
     args = _parser().parse_args(argv)
+    runtime: ProgramRuntime | None = None
+    simulation_control = None
     try:
         config = ProgramRunnerConfig(
             headless_url=args.headless_url,
@@ -47,8 +50,30 @@ def main(argv: Sequence[str] | None = None) -> int:
                 load_program_model_endpoint_configs(args.model_endpoint_config)
             )
         )
+        if args.simulation_control_config is not None:
+            try:
+                from manyforge_ros.program_simulation_port import (
+                    create_ros_simulation_program_port,
+                )
+
+                simulation_control = create_ros_simulation_program_port(
+                    args.simulation_control_config,
+                    maximum_retained_tasks=config.maximum_retained_runs,
+                )
+            except ValueError:
+                raise
+            except Exception as error:
+                raise ProgramRunnerError(
+                    "program_runner_simulation_owner_unavailable",
+                    str(error) or type(error).__name__,
+                ) from error
+        runtime = ProgramRuntime(
+            config,
+            model_transport=model_transport,
+            simulation_control=simulation_control,
+        )
         uvicorn.run(
-            create_app(ProgramRuntime(config, model_transport=model_transport)),
+            create_app(runtime),
             host=args.host,
             port=args.port,
         )
@@ -57,6 +82,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         code = getattr(error, "code", "program_runner_configuration_invalid")
         print(f"{code}: {error}", file=sys.stderr)
         return 69 if "unavailable" in code else 65
+    finally:
+        if runtime is None and simulation_control is not None:
+            simulation_control.close()
 
 
 __all__ = ["main"]

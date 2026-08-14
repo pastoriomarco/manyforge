@@ -72,6 +72,7 @@ class FakeRuntime:
             "started": self.started,
             "closed": self.closed,
             "assistant_model_transport_available": False,
+            "simulation_control_available": False,
         }
 
     def runs(self, *, active_only: bool, limit: int) -> dict[str, Any]:

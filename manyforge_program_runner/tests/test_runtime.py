@@ -185,6 +185,32 @@ class _Host:
         self.shutdowns += 1
 
 
+class _SimulationControl:
+    def __init__(self) -> None:
+        self.closed = 0
+
+    def bind(self, _context: object) -> None:
+        pass
+
+    def unbind(self, _program_run_id: str) -> None:
+        pass
+
+    def start(self, *_args: object, **_kwargs: object) -> None:
+        raise AssertionError("unexpected simulation task")
+
+    def observe(self, _task_id: str) -> None:
+        raise AssertionError("unexpected simulation task")
+
+    def cancel(self, *_args: object) -> None:
+        raise AssertionError("unexpected simulation task")
+
+    def acknowledge(self, *_args: object) -> None:
+        raise AssertionError("unexpected simulation task")
+
+    def close(self) -> None:
+        self.closed += 1
+
+
 def _start_request(*, request_id: str = "request.start.1") -> ProgramRunStartRequest:
     return ProgramRunStartRequest.model_validate(
         {
@@ -316,3 +342,21 @@ def test_runtime_rejects_a_stale_applied_selection_before_tree_admission(
     assert host.start_admissions == []
     assert headless.selection_reads == 0
     runtime.shutdown()
+
+
+def test_runtime_injects_and_closes_the_focused_simulation_owner() -> None:
+    simulation = _SimulationControl()
+    runtime = ProgramRuntime(
+        ProgramRunnerConfig(headless_url="http://headless.test"),
+        headless_client=_Headless(),  # type: ignore[arg-type]
+        simulation_control=simulation,  # type: ignore[arg-type]
+    )
+
+    assert runtime._ports.simulator_control is simulation  # noqa: SLF001
+    assert runtime._owner_availability[  # noqa: SLF001
+        "simulator_control"
+    ].available
+    assert runtime.health()["simulation_control_available"] is True
+    runtime.shutdown()
+    runtime.shutdown()
+    assert simulation.closed == 1

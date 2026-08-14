@@ -25,6 +25,7 @@ from manyforge_behavior.node_environment import build_node_environment
 from manyforge_behavior.orchestration_ports import (
     CompositeProgramRunContextPort,
     NodeAdapterPorts,
+    OwnerTaskPort,
 )
 from manyforge_behavior.production_ports import (
     HeadlessSceneProgramPort,
@@ -130,6 +131,7 @@ class ProgramRuntime:
         *,
         headless_client: HeadlessHttpClient | None = None,
         model_transport: ProgramModelTransport | None = None,
+        simulation_control: OwnerTaskPort | None = None,
     ) -> None:
         if not isinstance(config, ProgramRunnerConfig):
             raise TypeError("Program runtime requires one ProgramRunnerConfig")
@@ -142,6 +144,22 @@ class ProgramRuntime:
             timeout_seconds=config.headless_timeout_seconds,
         )
         self._model_transport = model_transport
+        if simulation_control is not None and any(
+            not callable(getattr(simulation_control, method, None))
+            for method in (
+                "acknowledge",
+                "bind",
+                "cancel",
+                "close",
+                "observe",
+                "start",
+                "unbind",
+            )
+        ):
+            raise TypeError(
+                "simulation_control must implement task, context, and close ports"
+            )
+        self._simulation_control = simulation_control
         self._environment = build_node_environment()
         self._native = NativeKernelProgramPort(KernelClient(self._headless))
         self._scene = HeadlessSceneProgramPort(self._headless)
@@ -162,6 +180,8 @@ class ProgramRuntime:
         context_members = [self._native, self._scene, self._cclc]
         if self._assistant is not None:
             context_members.append(self._assistant)
+        if self._simulation_control is not None:
+            context_members.append(self._simulation_control)  # type: ignore[arg-type]
         self._interventions = ProgramInterventionRegistry(
             maximum_retained_runs=config.maximum_retained_runs
         )
@@ -170,6 +190,7 @@ class ProgramRuntime:
             scene_transactions=self._scene,
             assistant_requests=self._assistant,
             pick_place=self._native.pick_place,
+            simulator_control=self._simulation_control,
             cclc_lifecycle=self._cclc,
             cclc_routes=self._cclc,
             program_run_scope=self._native.scope,
@@ -318,6 +339,7 @@ class ProgramRuntime:
             "started": self._started,
             "closed": self._closed,
             "assistant_model_transport_available": self._assistant is not None,
+            "simulation_control_available": self._simulation_control is not None,
         }
 
     def runs(self, *, active_only: bool, limit: int) -> dict[str, Any]:
@@ -480,6 +502,11 @@ class ProgramRuntime:
         if self._assistant is not None:
             try:
                 self._assistant.close()
+            except Exception as error:
+                errors.append(error)
+        if self._simulation_control is not None:
+            try:
+                self._simulation_control.close()  # type: ignore[attr-defined]
             except Exception as error:
                 errors.append(error)
         if self._model_transport is not None:
