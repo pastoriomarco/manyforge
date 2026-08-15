@@ -2322,11 +2322,6 @@ def run_live_row(config: LiveConfig) -> dict[str, Any]:
         )
         tf_probe: dict[str, Any] | None = None
         with HeadlessHttpClient(api_url, timeout_seconds=15.0) as client:
-            cclc_startup = _prepare_and_select_cclc_routes(
-                client,
-                config.spec,
-                timeout_s=config.startup_timeout_s,
-            )
             catalog = client.scenarios()
             scene_before = client.scene()
             _prime_run_evidence(
@@ -2337,6 +2332,11 @@ def run_live_row(config: LiveConfig) -> dict[str, Any]:
                 config.spec,
                 program_definition,
                 catalog,
+                timeout_s=config.startup_timeout_s,
+            )
+            cclc_startup = _prepare_and_select_cclc_routes(
+                client,
+                config.spec,
                 timeout_s=config.startup_timeout_s,
             )
             program_snapshot = _run_program(
