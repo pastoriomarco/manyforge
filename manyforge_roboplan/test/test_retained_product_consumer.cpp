@@ -51,6 +51,7 @@
 #include "mf2_joint_name_internal.hpp"
 #include "product_backed_runtime_participant_resolver.hpp"
 #include "retained_bundle_internal.hpp"
+#include "retained_native_runtime_internal.hpp"
 
 namespace manyforge::roboplan_backend {
 namespace {
@@ -2159,6 +2160,59 @@ TEST(
   ASSERT_FALSE(conflict.ok());
   EXPECT_EQ(conflict.error().details.at("reason"),
             "program_reference_start_state_mismatch");
+}
+
+TEST(RetainedProductCrossConsumer,
+     ProductSelectedStateConfigDoesNotEvaluateNativePredictedFallback) {
+  ScopedTemporaryRoot temporary;
+  const std::filesystem::path package_root =
+      temporary.path() / "retained-package";
+  ASSERT_TRUE(std::filesystem::create_directory(package_root));
+
+  const auto materialized = deployment::test::
+      materialize_lite6_native_motion_arm_gripper_retained_consumer_fixture(
+          package_root);
+  ASSERT_NE(materialized.bundle, nullptr);
+  const auto &products = materialized.bundle->value().compiled_products;
+  ASSERT_EQ(products.symbol_role_maps.size(), 1U);
+  const auto model_map = load_lite6_model_map(
+      package_root, deployment::RetainedModelMapQuery{
+                        materialized.bundle->retained_bundle_id(),
+                        products.symbol_role_maps.front().product_id});
+  const auto &graph = materialized.bundle->value().cell_graph;
+  ASSERT_EQ(graph.runtime_units.size(), 1U);
+  const core::RuntimeEpoch runtime_epoch(
+      "epoch." + graph.runtime_units.front().runtime_unit_id.value());
+  const core::ControllableComponentId component_id(
+      std::string(deployment::test::kLite6ControllableComponentId));
+  const core::CommandTargetId target_id(
+      std::string(deployment::test::kLite6ArmTargetId));
+  const auto commanded_binding = make_fixture_runtime_participant(
+      *materialized.bundle, model_map, component_id, target_id,
+      core::StateAuthorityClass::kCommanded, std::nullopt, runtime_epoch);
+  const auto predicted_binding = make_fixture_runtime_participant(
+      *materialized.bundle, model_map, component_id, target_id,
+      core::StateAuthorityClass::kPredicted, std::nullopt, runtime_epoch);
+
+  const RetainedObservedStateChannelConfig selected{
+      core::ObservedStateSourceKind::kCommandedState,
+      "test/product-selected-commanded-state", 0, 7U};
+  const auto resolved = detail::select_retained_state_channel_config(
+      std::optional<RetainedObservedStateChannelConfig>{selected},
+      commanded_binding);
+  EXPECT_EQ(resolved.source_kind,
+            core::ObservedStateSourceKind::kCommandedState);
+  EXPECT_EQ(resolved.source_id, selected.source_id);
+  EXPECT_EQ(resolved.authority_generation, 7U);
+
+  EXPECT_THROW(static_cast<void>(detail::select_retained_state_channel_config(
+                   std::nullopt, commanded_binding)),
+               std::invalid_argument);
+  const auto native_default = detail::select_retained_state_channel_config(
+      std::nullopt, predicted_binding);
+  EXPECT_EQ(native_default.source_kind,
+            core::ObservedStateSourceKind::kPredictedState);
+  EXPECT_EQ(native_default.authority_generation, 1U);
 }
 
 TEST(RetainedProductCrossConsumer,

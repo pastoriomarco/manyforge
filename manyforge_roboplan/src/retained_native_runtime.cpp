@@ -3,6 +3,7 @@
 #include <manyforge_content_identity/canonical_value.hpp>
 #include <manyforge_content_identity/content_identity.hpp>
 #include <manyforge_roboplan/retained_native_runtime.hpp>
+#include "retained_native_runtime_internal.hpp"
 #include <map>
 #include <set>
 #include <stdexcept>
@@ -674,6 +675,19 @@ make_kernel_participant_resolver(
 
 } // namespace
 
+namespace detail {
+
+RetainedObservedStateChannelConfig select_retained_state_channel_config(
+    std::optional<RetainedObservedStateChannelConfig> selected,
+    const core::RuntimeParticipantBinding &binding) {
+  if (selected.has_value()) {
+    return std::move(*selected);
+  }
+  return native_state_config(binding);
+}
+
+} // namespace detail
+
 std::shared_ptr<RetainedNativeRuntime>
 create_retained_native_runtime_participants(
     RetainedNativeRuntimeInput input, RetainedNativeRuntimeConfig config,
@@ -786,9 +800,8 @@ create_retained_native_runtime_participants(
   runtime->cache = std::make_unique<core::TrajectoryCache>(config.cache);
   runtime->planner = std::move(input.planner);
 
-  auto motion_state_config =
-      input.motion_state_channel_config.value_or(
-          native_state_config(runtime->motion_binding));
+  auto motion_state_config = detail::select_retained_state_channel_config(
+      std::move(input.motion_state_channel_config), runtime->motion_binding);
   runtime->motion_state_channel =
       std::make_shared<RetainedObservedStateChannel>(
           runtime->motion_binding, runtime->state_projector,
@@ -837,8 +850,9 @@ create_retained_native_runtime_participants(
         std::make_shared<RetainedObservedStateChannel>(
             *runtime->gripper_binding,
             model_backed ? runtime->state_projector : nullptr,
-            input.gripper_state_channel_config.value_or(
-                native_state_config(*runtime->gripper_binding)));
+            detail::select_retained_state_channel_config(
+                std::move(input.gripper_state_channel_config),
+                *runtime->gripper_binding));
     if (model_backed) {
       const auto gripper_initialized =
           runtime->gripper_state_channel->initialize_from_projection(

@@ -1264,6 +1264,7 @@ if(BUILD_TESTING)
       MANYFORGE_LITE6_RETAINED_CONSUMER_FIXTURE_ROOT="${_MANYFORGE_LITE6_RETAINED_CONSUMER_FIXTURE_ROOT}"
       MANYFORGE_ROBOPLAN_CANDIDATE_WORKER_PATH="$<TARGET_FILE:manyforge_roboplan_candidate_worker>")
     target_include_directories(test_retained_product_consumer PRIVATE
+      "${CMAKE_CURRENT_SOURCE_DIR}/src"
       "${_MANYFORGE_REPOSITORY_SOURCE_ROOT}/manyforge_deployment/src"
       "${_MANYFORGE_REPOSITORY_SOURCE_ROOT}/manyforge_deployment/test")
     target_link_libraries(test_retained_product_consumer PRIVATE
