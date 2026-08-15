@@ -868,6 +868,8 @@ def _simulation_binding(value: object) -> SimulationEntityBinding:
             "local_position_xyz",
             "object_id",
             "policy_id",
+            "source_coordinate_frame_id",
+            "source_header_frame_id",
             "target_frame_id",
         },
         label="simulation entity",
@@ -879,6 +881,8 @@ def _simulation_binding(value: object) -> SimulationEntityBinding:
         request = SimulationEntityPoseRequest(
             entity=record["entity"],
             target_frame_id=target_frame_id,
+            source_header_frame_id=record["source_header_frame_id"],
+            source_coordinate_frame_id=record["source_coordinate_frame_id"],
             local_position_xyz=tuple(record["local_position_xyz"]),
             local_orientation_xyzw=tuple(record["local_orientation_xyzw"]),
         )

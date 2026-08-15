@@ -75,6 +75,8 @@ def _config_value() -> dict[str, object]:
                 "local_position_xyz": [0.0, 0.0, 0.0],
                 "object_id": "isaac_cheese_box",
                 "policy_id": "continuous_unattached",
+                "source_coordinate_frame_id": "world",
+                "source_header_frame_id": "mac_n_cheese_centered",
                 "target_frame_id": "universe",
             }
         ],
@@ -105,6 +107,12 @@ def test_site_config_is_closed_bounded_and_preserves_exact_bindings(
     assert config.joint_state.required_joint_names == ("joint_a", "joint_b")
     assert config.simulation_entities[0].request.entity == (
         "/mac_n_cheese_centered"
+    )
+    assert config.simulation_entities[0].request.source_header_frame_id == (
+        "mac_n_cheese_centered"
+    )
+    assert config.simulation_entities[0].request.source_coordinate_frame_id == (
+        "world"
     )
     assert config.detection3d_sources[0].selector.selection == "first"
     assert config.keys == {

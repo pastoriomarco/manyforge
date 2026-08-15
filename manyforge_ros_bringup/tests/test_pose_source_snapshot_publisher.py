@@ -355,6 +355,17 @@ def test_retained_site_configs_preserve_historical_pose_source_contracts() -> No
         )
         assert ur_config.simulation_entities[1].eligible is True
         assert ur_config.simulation_entities[1].lifetime_ns == 1_000_000_000
+        assert [
+            (
+                binding.request.source_header_frame_id,
+                binding.request.source_coordinate_frame_id,
+                binding.request.target_frame_id,
+            )
+            for binding in ur_config.simulation_entities
+        ] == [
+            ("robotiq_arg2f_base_link", "world", "universe"),
+            ("mac_n_cheese_centered", "world", "universe"),
+        ]
 
     foundation = load_isaac_pose_observer_site_config(
         config_root / "isaac_lite6_trocar_foundationpose.pose_observer.json"

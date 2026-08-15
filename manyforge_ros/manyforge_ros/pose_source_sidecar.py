@@ -144,11 +144,17 @@ class SimulationEntityPoseRequest:
     """Read-only request for one simulator entity pose.
 
     ``target_frame_id`` requests a real TF transform.  It never relabels a
-    pose whose source frame differs.
+    pose whose source frame differs.  A producer with a known nonconforming
+    header may instead declare both ``source_header_frame_id`` and
+    ``source_coordinate_frame_id``.  The adapter then requires the exact
+    reported header before assigning the explicitly declared coordinate frame
+    and performing the normal target-frame transform.
     """
 
     entity: str
     target_frame_id: str = ""
+    source_header_frame_id: str = ""
+    source_coordinate_frame_id: str = ""
     local_position_xyz: tuple[float, float, float] = (0.0, 0.0, 0.0)
     local_orientation_xyzw: tuple[float, float, float, float] = (
         0.0,
@@ -171,6 +177,25 @@ class SimulationEntityPoseRequest:
                 label="target_frame_id",
             ),
         )
+        for field_name in (
+            "source_header_frame_id",
+            "source_coordinate_frame_id",
+        ):
+            object.__setattr__(
+                self,
+                field_name,
+                _bounded_optional_source_text(
+                    getattr(self, field_name),
+                    label=field_name,
+                ),
+            )
+        if bool(self.source_header_frame_id) != bool(
+            self.source_coordinate_frame_id
+        ):
+            raise ValueError(
+                "source_header_frame_id and source_coordinate_frame_id "
+                "must be declared together"
+            )
         object.__setattr__(
             self,
             "local_position_xyz",
@@ -605,6 +630,20 @@ def capture_simulation_entity_poses(
                 request.local_position_xyz,
                 request.local_orientation_xyzw,
             )
+            if request.source_header_frame_id:
+                if pose.frame_id != request.source_header_frame_id:
+                    raise ObservationNormalizationError(
+                        "source_frame_mismatch",
+                        "simulation entity header changed: expected "
+                        f"{request.source_header_frame_id}, observed "
+                        f"{pose.frame_id}",
+                    )
+                pose = PoseSnapshot(
+                    frame_id=request.source_coordinate_frame_id,
+                    stamp_sec=pose.stamp_sec,
+                    position_xyz=pose.position_xyz,
+                    orientation_xyzw=pose.orientation_xyzw,
+                )
             pose = transform_pose_snapshot(
                 pose,
                 target_frame_id=request.target_frame_id,

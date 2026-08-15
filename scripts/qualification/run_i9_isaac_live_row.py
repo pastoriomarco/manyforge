@@ -2584,9 +2584,7 @@ def run_live_row(config: LiveConfig) -> dict[str, Any]:
         with HeadlessHttpClient(api_url, timeout_seconds=15.0) as client:
             catalog = client.scenarios()
             scene_before = client.scene()
-            _prime_run_evidence(
-                run_evidence, client, scene_before, config.spec
-            )
+            _record_scene_evidence(run_evidence, scene_before)
             # The retained Lite6 gripper publishes feedback on playback ticks.
             # Playing is therefore part of the bounded readiness probe and the
             # immediately following active scenario, never an idle-state
@@ -2607,6 +2605,12 @@ def run_live_row(config: LiveConfig) -> dict[str, Any]:
                 program_definition,
                 catalog,
                 timeout_s=config.startup_timeout_s,
+            )
+            _prime_run_evidence(
+                run_evidence,
+                client,
+                client.scene(),
+                config.spec,
             )
             cclc_startup = _prepare_and_select_cclc_routes(
                 client,

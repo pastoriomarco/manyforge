@@ -376,6 +376,12 @@ def test_simulation_request_values_are_bounded_finite_and_normalized() -> None:
     assert request.target_frame_id == "world"
     assert request.local_orientation_xyzw == (0.0, 0.0, 0.0, 1.0)
 
+    with pytest.raises(ValueError, match="must be declared together"):
+        SimulationEntityPoseRequest(
+            entity="/World/tool0",
+            source_header_frame_id="tool0",
+        )
+
     with pytest.raises(ValueError, match="target_frame_id exceeds"):
         SimulationEntityPoseRequest(
             entity="/World/tool0",
@@ -396,6 +402,69 @@ def test_simulation_request_values_are_bounded_finite_and_normalized() -> None:
             entity="/World/tool0",
             local_orientation_xyzw=(0.0, 0.0, 0.0, 0.0),
         )
+
+
+def test_simulation_capture_requires_exact_declared_header_before_real_tf() -> None:
+    snapshot = _namespace(
+        entities=(
+            _namespace(
+                name="/World/tool0",
+                pose=PoseSnapshot(
+                    frame_id="tool0",
+                    stamp_sec=1.0,
+                    position_xyz=(1.0, 2.0, 3.0),
+                    orientation_xyzw=(0.0, 0.0, 0.0, 1.0),
+                ),
+                errors=(),
+            ),
+        ),
+        errors=(),
+    )
+    buffer = _FakeTfBuffer(
+        {("universe", "world"): _transform("universe", "world", 10.0, 0.0, 0.0)}
+    )
+    request = SimulationEntityPoseRequest(
+        entity="/World/tool0",
+        target_frame_id="universe",
+        source_header_frame_id="tool0",
+        source_coordinate_frame_id="world",
+    )
+
+    batch = capture_simulation_entity_poses(
+        _FakeSimulationClient(snapshot),
+        [request],
+        tf_buffer=buffer,
+    )
+
+    assert batch.failures == ()
+    assert batch.observations[0].pose.frame_id == "universe"
+    assert batch.observations[0].pose.position_xyz == pytest.approx(
+        (11.0, 2.0, 3.0)
+    )
+
+    changed = _namespace(
+        entities=(
+            _namespace(
+                name="/World/tool0",
+                pose=PoseSnapshot(
+                    frame_id="changed_tool0",
+                    stamp_sec=1.0,
+                    position_xyz=(1.0, 2.0, 3.0),
+                    orientation_xyzw=(0.0, 0.0, 0.0, 1.0),
+                ),
+                errors=(),
+            ),
+        ),
+        errors=(),
+    )
+    rejected = capture_simulation_entity_poses(
+        _FakeSimulationClient(changed),
+        [request],
+        tf_buffer=buffer,
+    )
+    assert rejected.observations == ()
+    assert rejected.failures[0].code == "frame_or_pose_invalid"
+    assert "source_frame_mismatch" in rejected.failures[0].detail
 
 
 def test_simulation_capture_rejects_duplicate_or_unbounded_source_rows() -> None:
