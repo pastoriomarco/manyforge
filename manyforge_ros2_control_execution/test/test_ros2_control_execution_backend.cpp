@@ -1318,7 +1318,7 @@ TEST(Ros2ControlExecutionBackendTest,
   const auto stage = software_hard_stage_fixture();
 
   backend.testing_set_running_state(true);
-  ASSERT_TRUE(backend.testing_publish_snapshot(core::ExecutionState::kExecuting,
+  ASSERT_TRUE(backend.testing_publish_snapshot(core::ExecutionState::kStopping,
                                                {0.0}));
   backend.testing_install_prepared_goal_membership(
       stage, core::ContentDigest("prepared.software_hard"));

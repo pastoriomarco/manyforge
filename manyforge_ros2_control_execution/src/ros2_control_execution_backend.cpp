@@ -5933,11 +5933,12 @@ Ros2ControlExecutionBackend::TranslateStopStage(
   }
 
   const auto dispatch_generation = prepared_goal->handle.execution_generation;
+  const auto active_snapshot = prepared_goal->handle.get_snapshot();
   if (dispatch_generation == 0U ||
       running_generation_.load(std::memory_order_acquire) !=
           dispatch_generation ||
-      prepared_goal->handle.get_snapshot().state !=
-          core::ExecutionState::kExecuting) {
+      (active_snapshot.state != core::ExecutionState::kExecuting &&
+       active_snapshot.state != core::ExecutionState::kStopping)) {
     return failure_before_effect(
         "prepared_goal_not_active",
         "ros2_control prepared goal no longer owns the active execution");
