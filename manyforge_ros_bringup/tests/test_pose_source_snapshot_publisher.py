@@ -244,16 +244,29 @@ def test_retained_site_configs_match_exact_five_deployment_identities(
 
 def test_retained_site_configs_preserve_historical_pose_source_contracts() -> None:
     config_root = _REPOSITORY_ROOT / "manyforge_ros_bringup" / "config"
-    ur_config = load_isaac_pose_observer_site_config(
-        config_root / "isaac_ur10e_light.pose_observer.json"
+    rigid_gripper = (
+        "/World/ur10e_robotiq2f_140_ROS/ur10e_robotiq2f_140/"
+        "ee_link/robotiq_arg2f_base_link"
     )
-    assert ur_config.simulation_poll_period_ms == 250
-    assert [binding.request.entity for binding in ur_config.simulation_entities] == [
-        "/World/ur10e_robotiq2f_140_ROS/ur10e_robotiq2f_140/ee_link",
-        "/mac_n_cheese_centered",
-    ]
-    assert ur_config.simulation_entities[1].eligible is True
-    assert ur_config.simulation_entities[1].lifetime_ns == 1_000_000_000
+    for config_name in (
+        "isaac_ur10e_light.pose_observer.json",
+        "isaac_ur10e_collision.pose_observer.json",
+        "isaac_ur10e_assistant.pose_observer.json",
+    ):
+        ur_config = load_isaac_pose_observer_site_config(
+            config_root / config_name
+        )
+        assert ur_config.simulation_poll_period_ms == 250
+        assert [
+            binding.request.entity for binding in ur_config.simulation_entities
+        ] == [rigid_gripper, "/mac_n_cheese_centered"]
+        assert ur_config.simulation_entities[0].request.local_position_xyz == (
+            0.0,
+            0.0,
+            0.2,
+        )
+        assert ur_config.simulation_entities[1].eligible is True
+        assert ur_config.simulation_entities[1].lifetime_ns == 1_000_000_000
 
     foundation = load_isaac_pose_observer_site_config(
         config_root / "isaac_lite6_trocar_foundationpose.pose_observer.json"
