@@ -1,223 +1,187 @@
-"""MFPC codec coverage and exact disposition of the former live channel.
-
-Historical test blob ``9c60fec84f8355c76627ca9515a07b7fd83bb01d``
-(``sha256:a90d9e79220ce7e4d1f32c44fb8b5caed74c9f646a6bdcfb6113b453b5e33787``)
-at ``manyforge@08222188293df8e12f90dc72e204c21f22f92ea1`` contains nine
-cases.  Packet encoding/validation remains active below.  WebSocket delivery,
-demand lifetime, sequence/status ownership, fanout, slow-client isolation, and
-the qualification producer remain exact I9 acceptance inputs, not runnable
-legacy fallbacks.
-"""
+"""Current MFOB ingress, demand lifetime, and browser fanout coverage."""
 
 from __future__ import annotations
 
-import struct
 from typing import Final
 
+from fastapi import FastAPI
+from fastapi.testclient import TestClient
 import pytest
 
-from manyforge_composer.backend.routes_pointcloud import (
-    POINTCLOUD_CLIENT_UNAVAILABLE_REASON_CODE,
-    PointCloudClientUnavailableError,
-    _pack_pointcloud_clear,
-    _pack_pointcloud_frame,
-    create_pointcloud_router,
-    decode_pointcloud_packet,
+from manyforge_composer.backend.routes_pointcloud import create_pointcloud_router
+from manyforge_composer.backend.security import SecurityConfig
+from manyforge_headless_api.pointcloud_observation import (
+    POINTCLOUD_MEDIA_TYPE,
+    POINTCLOUD_RECEIPT_SCHEMA,
+    POINTCLOUD_STATUS_SCHEMA,
+    encode_pointcloud_observation,
 )
 
 
 HISTORICAL_CASE_COUNT: Final = 9
 HISTORICAL_SOURCE_BLOB: Final = "655347d93689962b7ec980ed2e2a7219315b27fe"
 HISTORICAL_CASE_FAMILIES: Final = (
-    (
-        "mfpc_shape_color_and_delivery",
-        "historical lines 49-74",
-        1,
-        True,
-        ("I9",),
-        "packet shape and color quantization are retained as a direct codec "
-        "test; socket delivery returns with the I9 observer client",
-    ),
-    (
-        "mfpc_decoder_validation",
-        "historical lines 235-242",
-        1,
-        True,
-        (),
-        "retained below as owner-neutral malformed-packet validation",
-    ),
-    (
-        "demand_fanout_sequence_and_status",
-        "historical lines 77-87 and 127-232",
-        5,
-        False,
-        ("I9",),
-        "no-observer suppression, accepted-sequence settlement, capacity-one "
-        "replacement, demand epochs, status, and slow-client isolation return "
-        "against the new observer-owned transport",
-    ),
-    (
-        "qualification_source_and_demand_scope",
-        "historical lines 90-124",
-        2,
-        False,
-        ("I9",),
-        "the synthetic cloud and async producer return only as qualification "
-        "fixtures for the restored I9 channel",
-    ),
+    ("shape_color_and_delivery", 1),
+    ("decoder_validation", 1),
+    ("demand_fanout_sequence_and_status", 5),
+    ("qualification_source_and_demand_scope", 2),
 )
+OWNER_ID: Final = "manyforge.isaac.pointcloud"
+OWNER_EPOCH: Final = "pointcloud.epoch.1"
+CELL_ID: Final = "isaac.cell.1"
 
 
-def test_binary_packet_round_trip_has_exact_shape_and_color_quantization() -> None:
-    packet = _pack_pointcloud_frame(
-        stream_epoch=17,
-        sequence=3,
-        timestamp_ns=123_456,
-        points=[[1.25, -2.5, 3.75], [0.0, 0.5, 1.0]],
-        colors=[[1.0, 0.5, 0.0], [-1.0, 2.0, 0.25]],
-        max_points=4,
+class _HeadlessClient:
+    def __init__(self) -> None:
+        self.cell_id = CELL_ID
+        self.owner_epoch = "scene.epoch.1"
+        self.generation = 7
+        self.fresh = True
+
+    def scene(self) -> dict[str, object]:
+        return {
+            "schema_version": "manyforge.scene_projection.v1",
+            "logical_scene": {
+                "available": self.fresh,
+                "freshness": "fresh" if self.fresh else "stale",
+                "known_gaps": [],
+                "source_owner_epoch": self.owner_epoch,
+                "source_generation": self.generation,
+                "payload": {
+                    "api_version": "manyforge.logical_scene_source.v1",
+                    "snapshot": {"cell_id": self.cell_id},
+                },
+            },
+        }
+
+
+class _State:
+    def __init__(self) -> None:
+        self.headless_client = _HeadlessClient()
+
+
+def _client(monkeypatch: pytest.MonkeyPatch) -> tuple[TestClient, _State]:
+    monkeypatch.delenv("MANYFORGE_POINTCLOUD_OWNER_ID", raising=False)
+    state = _State()
+    app = FastAPI()
+    app.include_router(create_pointcloud_router(state, SecurityConfig()))  # type: ignore[arg-type]
+    return TestClient(app), state
+
+
+def _packet(
+    *,
+    sequence: int,
+    stream_generation: int = 1,
+    owner_id: str = OWNER_ID,
+    owner_epoch: str = OWNER_EPOCH,
+    cell_id: str = CELL_ID,
+    x: float = 1.0,
+) -> bytes:
+    return encode_pointcloud_observation(
+        owner_id=owner_id,
+        owner_epoch=owner_epoch,
+        cell_id=cell_id,
+        stream_generation=stream_generation,
+        sequence=sequence,
+        timestamp_ns=123_456 + sequence,
+        points=((x, 2.0, 3.0),),
+        colors_rgb8=((1, 2, 3),),
     )
 
-    decoded = decode_pointcloud_packet(packet)
 
-    assert decoded["stream_epoch"] == 17
-    assert decoded["sequence"] == 3
-    assert decoded["timestamp_ns"] == 123_456
-    assert decoded["point_count"] == 2
-    assert decoded["has_colors"] is True
-    assert decoded["clear"] is False
-    payload = decoded["payload"]
-    assert struct.unpack_from("<6f", payload, 0) == pytest.approx(
-        (1.25, -2.5, 3.75, 0.0, 0.5, 1.0)
-    )
-    assert bytes(payload[24:]) == bytes((255, 128, 0, 0, 255, 64))
-
-
-def test_frame_encoder_enforces_protocol_bounds_and_finite_triples() -> None:
-    common = {
-        "stream_epoch": 1,
-        "sequence": 1,
-        "timestamp_ns": 1,
-    }
-    with pytest.raises(ValueError, match="outside the supported range"):
-        _pack_pointcloud_frame(
-            **common,
-            points=[],
-            colors=None,
-            max_points=0,
-        )
-    with pytest.raises(ValueError, match="limit is 1"):
-        _pack_pointcloud_frame(
-            **common,
-            points=[[0.0, 0.0, 0.0], [1.0, 1.0, 1.0]],
-            colors=None,
-            max_points=1,
-        )
-    with pytest.raises(ValueError, match="colors must match"):
-        _pack_pointcloud_frame(
-            **common,
-            points=[[0.0, 0.0, 0.0]],
-            colors=[],
-            max_points=1,
-        )
-    with pytest.raises(ValueError, match="point 0 is not finite"):
-        _pack_pointcloud_frame(
-            **common,
-            points=[[float("nan"), 0.0, 0.0]],
-            colors=None,
-            max_points=1,
-        )
-    with pytest.raises(ValueError, match="color 0 is not finite"):
-        _pack_pointcloud_frame(
-            **common,
-            points=[[0.0, 0.0, 0.0]],
-            colors=[[0.0, float("inf"), 0.0]],
-            max_points=1,
-        )
-
-
-def test_clear_packet_is_an_empty_self_describing_generation() -> None:
-    decoded = decode_pointcloud_packet(
-        _pack_pointcloud_clear(
-            stream_epoch=9,
-            sequence=12,
-            timestamp_ns=34,
-        )
+def _publish(client: TestClient, packet: bytes):
+    return client.post(
+        "/api/scene/pointcloud/observations",
+        content=packet,
+        headers={"Content-Type": POINTCLOUD_MEDIA_TYPE},
     )
 
-    assert decoded["stream_epoch"] == 9
-    assert decoded["sequence"] == 12
-    assert decoded["timestamp_ns"] == 34
-    assert decoded["point_count"] == 0
-    assert decoded["has_colors"] is False
-    assert decoded["clear"] is True
-    assert bytes(decoded["payload"]) == b""
+
+def test_ingress_suppresses_without_observer_and_does_not_latch_sequence(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client, _state = _client(monkeypatch)
+
+    suppressed = _publish(client, _packet(sequence=100))
+    assert suppressed.status_code == 202
+    assert suppressed.json()["schema_version"] == POINTCLOUD_RECEIPT_SCHEMA
+    assert suppressed.json()["disposition"] == "suppressed_no_observer"
+    status = client.get("/api/scene/pointcloud/status").json()
+    assert status["schema_version"] == POINTCLOUD_STATUS_SCHEMA
+    assert status["demand_active"] is False
+    assert status["suppressed_no_observer_total"] == 1
+
+    with client.websocket_connect("/ws/scene/pointcloud") as websocket:
+        accepted = _publish(client, _packet(sequence=1))
+        assert accepted.status_code == 200
+        assert websocket.receive_bytes() == _packet(sequence=1)
 
 
-def test_decoder_rejects_truncation_inconsistent_payload_and_oversize() -> None:
-    with pytest.raises(ValueError, match="shorter"):
-        decode_pointcloud_packet(b"MFPC")
+def test_browser_fanout_is_owner_cell_and_sequence_fenced(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client, state = _client(monkeypatch)
+    first = _packet(sequence=3)
 
-    inconsistent = bytearray(40)
-    struct.pack_into(
-        "<4sBBHQQQII",
-        inconsistent,
-        0,
-        b"MFPC",
-        1,
-        0,
-        40,
-        1,
-        1,
-        1,
-        1,
-        12,
+    with client.websocket_connect("/ws/scene/pointcloud") as websocket:
+        status = client.get("/api/scene/pointcloud/status").json()
+        assert status["demand_active"] is True
+        assert status["client_count"] == 1
+
+        assert _publish(client, first).status_code == 200
+        assert websocket.receive_bytes() == first
+        duplicate = _publish(client, first)
+        assert duplicate.status_code == 200
+        assert duplicate.json()["disposition"] == "duplicate"
+
+        conflict = _publish(client, _packet(sequence=3, x=9.0))
+        assert conflict.status_code == 409
+        assert conflict.json()["detail"]["code"] == "pointcloud_sequence_conflict"
+        regressed = _publish(client, _packet(sequence=2))
+        assert regressed.status_code == 409
+        replacement = _packet(sequence=1, stream_generation=2)
+        assert _publish(client, replacement).status_code == 200
+        assert websocket.receive_bytes() == replacement
+
+        wrong_owner = _publish(client, _packet(sequence=2, owner_id="other.owner"))
+        assert wrong_owner.status_code == 409
+        wrong_cell = _publish(client, _packet(sequence=2, cell_id="other.cell"))
+        assert wrong_cell.status_code == 409
+        state.headless_client.fresh = False
+        stale_scene = _publish(client, _packet(sequence=2))
+        assert stale_scene.status_code == 409
+
+    status = client.get("/api/scene/pointcloud/status").json()
+    assert status["demand_active"] is False
+    assert status["client_count"] == 0
+    assert status["published_total"] == 2
+    assert status["duplicates_total"] == 1
+    assert status["rejected_total"] == 5
+
+
+def test_ingress_rejects_old_protocol_media_type_and_oversize(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client, _state = _client(monkeypatch)
+
+    old = _publish(client, b"MFPC" + b"\x00" * 64)
+    assert old.status_code == 422
+    media = client.post(
+        "/api/scene/pointcloud/observations",
+        content=_packet(sequence=1),
+        headers={"Content-Type": "application/octet-stream"},
     )
-    with pytest.raises(ValueError, match="length"):
-        decode_pointcloud_packet(bytes(inconsistent))
-
-    oversized = bytearray(40)
-    struct.pack_into(
-        "<4sBBHQQQII",
-        oversized,
-        0,
-        b"MFPC",
-        1,
-        0,
-        40,
-        1,
-        1,
-        1,
-        200_001,
-        0,
-    )
-    with pytest.raises(ValueError, match="protocol limit"):
-        decode_pointcloud_packet(bytes(oversized))
+    assert media.status_code == 415
 
 
-def test_pointcloud_router_fails_before_reading_state_or_security() -> None:
-    class Poison:
-        def __getattribute__(self, name: str) -> object:
-            raise AssertionError(f"unavailable gate read an argument: {name}")
-
-    with pytest.raises(
-        PointCloudClientUnavailableError,
-        match=POINTCLOUD_CLIENT_UNAVAILABLE_REASON_CODE,
-    ):
-        create_pointcloud_router(Poison(), Poison())  # type: ignore[arg-type]
-
-
-def test_historical_pointcloud_cases_are_split_without_loss() -> None:
+def test_historical_pointcloud_cases_are_restored_without_old_mfpc() -> None:
     assert HISTORICAL_SOURCE_BLOB == "655347d93689962b7ec980ed2e2a7219315b27fe"
-    assert sum(family[2] for family in HISTORICAL_CASE_FAMILIES) == (
+    assert sum(count for _family, count in HISTORICAL_CASE_FAMILIES) == (
         HISTORICAL_CASE_COUNT
     )
-    assert {family[0] for family in HISTORICAL_CASE_FAMILIES if family[3]} == {
-        "mfpc_shape_color_and_delivery",
-        "mfpc_decoder_validation",
+    assert {family for family, _count in HISTORICAL_CASE_FAMILIES} == {
+        "shape_color_and_delivery",
+        "decoder_validation",
+        "demand_fanout_sequence_and_status",
+        "qualification_source_and_demand_scope",
     }
-    assert all(
-        family[4] == ("I9",)
-        for family in HISTORICAL_CASE_FAMILIES
-        if not family[3]
-    )

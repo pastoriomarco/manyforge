@@ -78,11 +78,11 @@
       "name": "point_cloud",
       "description": "Focused viewer with the representative bounded point-cloud or octomap layer active.",
       "capture": {"duration_s": 90.0, "warmup_s": 8.0, "hz": 2.0, "timeout_s": 2.0},
-      "requirements": {"active_client": true, "client_count_min": 1, "active_client_count_min": 1, "observer_counter_delta_min": {"point_cloud": {"published": 1, "sent_total": 1}}},
+      "requirements": {"active_client": true, "client_count_min": 1, "active_client_count_min": 1, "observer_counter_delta_min": {"point_cloud": {"published_total": 1, "fanout.sent_total": 1}}},
       "budgets": {"viewer_route_p95_ms": 10.0, "process_cpu_p95_percent": {"composer": 55.0, "viewer_worker": 75.0, "browser": 250.0}, "client_long_tasks_max": 3, "client_materialization_max_ms": 10.0, "client_react_commits_per_frame_max": 0.03, "client_unmatched_topology_rebuilds_max": 0, "build_failures_max": 0, "publication_sink_drops_max": 0},
       "required_process_labels": ["composer", "viewer_worker", "browser", "controller_manager"],
       "observer_paths": {"point_cloud": "/api/scene/pointcloud/status"},
-      "preconditions": ["Start Composer with MANYFORGE_POINTCLOUD_QUALIFICATION_FIXTURE=ON (optionally set the bounded point count/rate), focus the browser, and verify /api/scene/pointcloud/status reports the fixture enabled and publishing through the real point-cloud channel."]
+      "preconditions": ["Enable the browser point-cloud layer, publish the bounded qualification PointCloud2 on the configured ROS topic in the exact cell frame, and verify /api/scene/pointcloud/status reports active demand plus increasing published_total and fanout.sent_total counters."]
     },
     {
       "name": "source_flood",

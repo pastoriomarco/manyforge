@@ -90,6 +90,34 @@ def generate_launch_description() -> LaunchDescription:
                 "pose_observer_retry_log_period_s", default_value="5.0"
             ),
             DeclareLaunchArgument(
+                "pointcloud_topic",
+                default_value="",
+                description=(
+                    "Absolute cell-frame PointCloud2 topic. Empty disables the "
+                    "demand-driven browser observation bridge."
+                ),
+            ),
+            DeclareLaunchArgument(
+                "pointcloud_source_cell_frame_id", default_value="universe"
+            ),
+            DeclareLaunchArgument("pointcloud_cell_id", default_value=""),
+            DeclareLaunchArgument(
+                "pointcloud_composer_base_url",
+                default_value="http://127.0.0.1:8000",
+            ),
+            DeclareLaunchArgument(
+                "pointcloud_owner_id",
+                default_value="manyforge.isaac.pointcloud",
+            ),
+            DeclareLaunchArgument("pointcloud_max_points", default_value="200000"),
+            DeclareLaunchArgument(
+                "pointcloud_minimum_period_s", default_value="0.1"
+            ),
+            DeclareLaunchArgument(
+                "pointcloud_demand_poll_period_s", default_value="0.5"
+            ),
+            DeclareLaunchArgument("pointcloud_http_timeout_s", default_value="1.0"),
+            DeclareLaunchArgument(
                 "additional_required_topics",
                 default_value="",
                 description=(
@@ -593,6 +621,84 @@ def _launch_setup(context, *_, **__) -> list[object]:
                 on_exit=_shutdown("Isaac pose-observer adapter exited"),
             )
         )
+    pointcloud_topic_raw = LaunchConfiguration("pointcloud_topic").perform(
+        context
+    ).strip()
+    if pointcloud_topic_raw:
+        pointcloud_topic = _absolute_ros_name(
+            pointcloud_topic_raw,
+            name="pointcloud_topic",
+        )
+        pointcloud_cell_id = _bounded_observer_identity(
+            LaunchConfiguration("pointcloud_cell_id").perform(context),
+            name="pointcloud_cell_id",
+            maximum_bytes=256,
+        )
+        control_actions.append(
+            Node(
+                package="manyforge_ros_bringup",
+                executable="isaac_pointcloud_observer_bridge",
+                name="manyforge_isaac_pointcloud_observer_bridge",
+                namespace=runtime_namespace,
+                output="screen",
+                parameters=[
+                    {
+                        "pointcloud_topic": pointcloud_topic,
+                        "source_cell_frame_id": _bounded_observer_identity(
+                            LaunchConfiguration(
+                                "pointcloud_source_cell_frame_id"
+                            ).perform(context),
+                            name="pointcloud_source_cell_frame_id",
+                            maximum_bytes=256,
+                        ),
+                        "cell_id": pointcloud_cell_id,
+                        "composer_base_url": LaunchConfiguration(
+                            "pointcloud_composer_base_url"
+                        ).perform(context),
+                        "owner_id": _bounded_observer_identity(
+                            LaunchConfiguration("pointcloud_owner_id").perform(
+                                context
+                            ),
+                            name="pointcloud_owner_id",
+                            maximum_bytes=128,
+                        ),
+                        "max_points": _parse_bounded_int_launch_value(
+                            LaunchConfiguration("pointcloud_max_points").perform(
+                                context
+                            ),
+                            name="pointcloud_max_points",
+                            minimum=1,
+                            maximum=200_000,
+                        ),
+                        "minimum_period_s": _bounded_float(
+                            LaunchConfiguration(
+                                "pointcloud_minimum_period_s"
+                            ).perform(context),
+                            name="pointcloud_minimum_period_s",
+                            minimum=0.0,
+                            maximum=10.0,
+                        ),
+                        "demand_poll_period_s": _bounded_float(
+                            LaunchConfiguration(
+                                "pointcloud_demand_poll_period_s"
+                            ).perform(context),
+                            name="pointcloud_demand_poll_period_s",
+                            minimum=0.1,
+                            maximum=10.0,
+                        ),
+                        "http_timeout_s": _bounded_float(
+                            LaunchConfiguration(
+                                "pointcloud_http_timeout_s"
+                            ).perform(context),
+                            name="pointcloud_http_timeout_s",
+                            minimum=0.05,
+                            maximum=5.0,
+                        ),
+                    }
+                ],
+                on_exit=_shutdown("Isaac point-cloud observer adapter exited"),
+            )
+        )
 
     # The gate publishes its fail-closed state before hardware activation. The
     # repeated transient-local Stop sample then reaches the topic-based system
@@ -773,6 +879,25 @@ def _optional_absolute_path(value: str, *, name: str) -> str:
         or len(normalized.encode("utf-8")) > 4096
     ):
         raise ValueError(f"{name} must be one bounded absolute path")
+    return normalized
+
+
+def _bounded_observer_identity(
+    value: str,
+    *,
+    name: str,
+    maximum_bytes: int,
+) -> str:
+    normalized = value.strip()
+    allowed = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789._:/-"
+    if (
+        not normalized
+        or normalized != value
+        or normalized[0] not in allowed[:62]
+        or any(character not in allowed for character in normalized)
+        or len(normalized.encode("utf-8")) > maximum_bytes
+    ):
+        raise ValueError(f"{name} must be one bounded observer identity")
     return normalized
 
 

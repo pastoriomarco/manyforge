@@ -81,6 +81,8 @@ def test_launch_declares_exact_world_and_has_no_retired_semantic_owner() -> None
         "command_gate_owner_namespace",
         "manager_state_root",
         "pose_observer_site_config",
+        "pointcloud_topic",
+        "pointcloud_cell_id",
     }
     assert (
         sum(isinstance(action, OpaqueFunction) for action in description.entities)
@@ -244,6 +246,39 @@ def test_launch_releases_exact_pose_observer_only_after_scene_barrier(
             module._launch_setup(invalid)
 
 
+def test_launch_adds_demand_pointcloud_bridge_only_with_exact_cell_inputs(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module = _load_launch_module()
+    monkeypatch.setattr(
+        module.FindPackageShare,
+        "find",
+        lambda _self, _name: str(_PACKAGE_ROOT),
+    )
+    context = _launch_context(module, profile="ur10e")
+    context.launch_configurations["pointcloud_topic"] = "/isaac_cell_cloud"
+    context.launch_configurations["pointcloud_cell_id"] = "isaac.cell.1"
+    registration = module._launch_setup(context)[1]
+    event_handler = getattr(
+        registration, "_RegisterEventHandler__event_handler"
+    )
+    callback = getattr(event_handler, "_OnActionEventBase__on_event")
+    released = callback(SimpleNamespace(returncode=0), LaunchContext())
+
+    bridge = next(
+        action
+        for action in released
+        if _node_executable(action) == "isaac_pointcloud_observer_bridge"
+    )
+    assert _node_namespace(bridge, context) == module.DEFAULT_RUNTIME_NAMESPACE
+    assert getattr(bridge, "_ExecuteLocal__on_exit") is not None
+
+    invalid = _launch_context(module, profile="ur10e")
+    invalid.launch_configurations["pointcloud_topic"] = "/isaac_cell_cloud"
+    with pytest.raises(ValueError, match="pointcloud_cell_id"):
+        module._launch_setup(invalid)
+
+
 def test_scene_barrier_return_code_is_exact_and_fail_closed() -> None:
     module = _load_launch_module()
     sentinel = object()
@@ -323,13 +358,32 @@ def test_launch_name_topic_and_vector_parsers_are_bounded() -> None:
     for invalid in ("relative", "/" + ("x" * 4096), "/bad\x00path"):
         with pytest.raises(ValueError):
             module._optional_absolute_path(invalid, name="path")
+    assert module._bounded_observer_identity(
+        "isaac.cell/1",
+        name="identity",
+        maximum_bytes=256,
+    ) == "isaac.cell/1"
+    for invalid in ("", " bad", "bad value", "-bad"):
+        with pytest.raises(ValueError):
+            module._bounded_observer_identity(
+                invalid,
+                name="identity",
+                maximum_bytes=256,
+            )
     for invalid in ("0 1", "0 1 2 3", f"0 1 {math.inf}"):
         with pytest.raises(ValueError):
             module._parse_vector3(invalid, name="xyz")
 
 
-def test_launch_rejects_crossed_command_owner_namespace() -> None:
+def test_launch_rejects_crossed_command_owner_namespace(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     module = _load_launch_module()
+    monkeypatch.setattr(
+        module.FindPackageShare,
+        "find",
+        lambda _self, _name: str(_PACKAGE_ROOT),
+    )
     context = _launch_context(module, profile="ur10e")
     context.launch_configurations["command_gate_owner_namespace"] = (
         "/manyforge/another_robot"

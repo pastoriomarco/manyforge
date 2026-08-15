@@ -116,6 +116,23 @@ if [[ -n "${MANYFORGE_MANAGER_STATE_ROOT:-}" || \
         "pose_observer_site_config:=${ISAAC_POSE_OBSERVER_SITE_CONFIG}"
     )
 fi
+if [[ -n "${ISAAC_POINTCLOUD_TOPIC:-}" ]]; then
+    if [[ -z "${MANYFORGE_ISAAC_CELL_ID:-}" ]]; then
+        printf 'MANYFORGE_ISAAC_CELL_ID is required with ISAAC_POINTCLOUD_TOPIC.\n' >&2
+        exit 2
+    fi
+    launch_arguments+=(
+        "pointcloud_topic:=${ISAAC_POINTCLOUD_TOPIC}"
+        "pointcloud_source_cell_frame_id:=${ISAAC_POINTCLOUD_CELL_FRAME_ID:-universe}"
+        "pointcloud_cell_id:=${MANYFORGE_ISAAC_CELL_ID}"
+        "pointcloud_composer_base_url:=${MANYFORGE_COMPOSER_BASE_URL:-http://127.0.0.1:8000}"
+        "pointcloud_owner_id:=${MANYFORGE_POINTCLOUD_OWNER_ID:-manyforge.isaac.pointcloud}"
+        "pointcloud_max_points:=${MANYFORGE_POINTCLOUD_MAX_POINTS:-200000}"
+        "pointcloud_minimum_period_s:=${MANYFORGE_POINTCLOUD_MINIMUM_PERIOD_S:-0.1}"
+        "pointcloud_demand_poll_period_s:=${MANYFORGE_POINTCLOUD_DEMAND_POLL_PERIOD_S:-0.5}"
+        "pointcloud_http_timeout_s:=${MANYFORGE_POINTCLOUD_HTTP_TIMEOUT_S:-1.0}"
+    )
+fi
 
 manyforge_exec_with_nrt_affinity \
     ros2 launch manyforge_ros_bringup isaac_topic_based_control.launch.py \

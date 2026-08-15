@@ -80,10 +80,12 @@ def test_fanout_keeps_only_latest_opaque_payload_per_client() -> None:
             assert socket.text == []
             assert socket.binary == [b"latest"]
             status = await fanout.status()
+            assert status["sent_total"] == 1
             assert status["replaced_total"] == 1
         finally:
             await fanout.detach("observer-a")
             await sender
+        assert (await fanout.status())["sent_total"] == 1
 
     asyncio.run(scenario())
 

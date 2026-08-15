@@ -960,6 +960,7 @@ export function SceneAuthoringWorkspace({
           ownerEpoch: headlessState.snapshot.runtime.projectionOwnerEpoch,
           generation: headlessState.snapshot.runtime.projectionGeneration,
         } : undefined}
+        pointCloudCellId={facts?.logicalScene.snapshot?.cell_id}
         viewer={viewer}
       />
     </>

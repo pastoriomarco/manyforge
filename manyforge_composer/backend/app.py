@@ -427,6 +427,7 @@ def create_app(
     if state.headless_client is not None:
         from .headless_ws import serve_headless_state
         from .routes_headless import create_headless_router
+        from .routes_pointcloud import create_pointcloud_router
         from .routes_scene_meshes import create_scene_meshes_router
         from .routes_snapshot import create_snapshot_router
 
@@ -437,6 +438,10 @@ def create_app(
         app.include_router(
             create_scene_meshes_router(state),
             tags=["headless-scene-mesh-client"],
+        )
+        app.include_router(
+            create_pointcloud_router(state, security),
+            tags=["headless-pointcloud-observer-client"],
         )
         app.include_router(
             create_snapshot_router(state, security),

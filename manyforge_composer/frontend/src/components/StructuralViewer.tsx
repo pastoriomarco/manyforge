@@ -22,6 +22,8 @@ import {
   subscribeSnapshotObserver,
   uploadSnapshotObserverResult,
 } from '../api/snapshotObserverClient';
+import type { PointCloudFrame } from '../api/pointcloudObserverClient';
+import { usePointCloudFrame } from '../hooks/usePointCloudFrame';
 import { SnapshotResponder } from './SnapshotResponder';
 import type { StructuralResourceState } from '../state/structuralResource';
 import type { RuntimeScenePresentation } from '../state/runtimeScenePresentation';
@@ -68,6 +70,7 @@ interface StructuralViewerProps {
     ownerEpoch: string;
     generation: number;
   };
+  pointCloudCellId?: string;
   viewer?: ProgramViewerMetadata;
 }
 
@@ -715,6 +718,35 @@ function MeasuredTcpMarker({
   );
 }
 
+function PointCloudPoints({ frame }: { frame: PointCloudFrame }) {
+  const geometry = useMemo(() => {
+    const result = new THREE.BufferGeometry();
+    result.setAttribute('position', new THREE.BufferAttribute(frame.positions, 3));
+    if (frame.colors !== null) {
+      result.setAttribute(
+        'color',
+        new THREE.Uint8BufferAttribute(frame.colors, 3, true),
+      );
+    }
+    result.computeBoundingSphere();
+    return result;
+  }, [frame]);
+  useEffect(() => () => geometry.dispose(), [geometry]);
+  return (
+    <points geometry={geometry} frustumCulled renderOrder={6}>
+      <pointsMaterial
+        color={frame.colors === null ? '#75d7ff' : '#ffffff'}
+        vertexColors={frame.colors !== null}
+        size={0.006}
+        sizeAttenuation
+        transparent
+        opacity={0.9}
+        depthWrite={false}
+      />
+    </points>
+  );
+}
+
 function ViewerCanvas({
   manifest,
   collisionsVisible,
@@ -728,6 +760,7 @@ function ViewerCanvas({
   runtimePresentation,
   sceneOwnerIdentity,
   viewerFrameIdentity,
+  pointCloudFrame,
   viewer,
 }: {
   manifest: SceneUrdfManifest | null;
@@ -742,6 +775,7 @@ function ViewerCanvas({
   runtimePresentation: RuntimeScenePresentation | undefined;
   sceneOwnerIdentity: StructuralViewerProps['sceneOwnerIdentity'];
   viewerFrameIdentity: StructuralViewerProps['viewerFrameIdentity'];
+  pointCloudFrame: PointCloudFrame | null;
   viewer: ProgramViewerMetadata | undefined;
 }) {
   const devicePixelRatio = typeof window === 'undefined'
@@ -870,6 +904,7 @@ function ViewerCanvas({
           axesSizeM={viewer?.frame_gizmo_size_m ?? 0.1}
         />
       )}
+      {pointCloudFrame !== null && <PointCloudPoints frame={pointCloudFrame} />}
       {viewerFrameIdentity !== undefined && (
         <BoundSnapshotResponder frameIdentity={viewerFrameIdentity} />
       )}
@@ -888,10 +923,14 @@ function StructuralViewerContent({
   runtimePresentation,
   sceneOwnerIdentity,
   viewerFrameIdentity,
+  pointCloudCellId,
   viewer,
 }: StructuralViewerProps) {
   const [collisionsVisible, setCollisionsVisible] = useState(false);
+  const [pointCloudVisible, setPointCloudVisible] = useState(false);
   const [assetError, setAssetError] = useState<Error | null>(null);
+  const pointCloudEnabled = pointCloudVisible && pointCloudCellId !== undefined;
+  const pointCloud = usePointCloudFrame(pointCloudEnabled, pointCloudCellId);
   const camera = useMemo(
     () => parseViewerCameraQuery(
       typeof window === 'undefined' ? '' : window.location.search,
@@ -971,6 +1010,15 @@ function StructuralViewerContent({
             />
             <span>Collision geometry</span>
           </label>
+          <label className="toggle-control">
+            <input
+              type="checkbox"
+              checked={pointCloudVisible}
+              onChange={(event) => setPointCloudVisible(event.target.checked)}
+              disabled={pointCloudCellId === undefined}
+            />
+            <span>Point cloud</span>
+          </label>
           <button type="button" className="quiet-button" onClick={retry}>
             Reload model
           </button>
@@ -978,7 +1026,11 @@ function StructuralViewerContent({
       </header>
 
       <div className="viewer-stage" role="img" aria-label="Scene authoring viewport">
-        {(visibleGeometryCount > 0 || viewerFrameIdentity !== undefined) && (
+        {(
+          visibleGeometryCount > 0
+          || viewerFrameIdentity !== undefined
+          || pointCloudEnabled
+        ) && (
           <ViewerCanvas
             key={`${manifest.status === 'ready' ? manifest.data.model_key : 'no-structural-model'}:${collisionsVisible ? 'collision' : 'visual'}:${sceneOwnerIdentity?.ownerEpoch ?? 'no-scene-owner'}:${sceneOwnerIdentity?.generation ?? -1}`}
             manifest={manifest.status === 'ready' ? manifest.data : null}
@@ -993,31 +1045,32 @@ function StructuralViewerContent({
             runtimePresentation={runtimePresentation}
             sceneOwnerIdentity={sceneOwnerIdentity}
             viewerFrameIdentity={viewerFrameIdentity}
+            pointCloudFrame={pointCloud.frame}
             viewer={viewer}
           />
         )}
 
-        {manifest.status === 'loading' && visibleGeometryCount === 0 && (
+        {manifest.status === 'loading' && visibleGeometryCount === 0 && !pointCloudEnabled && (
           <div className="viewer-state" role="status">
             <strong>Loading active model…</strong>
             <span>Waiting for a complete retained-neutral projection.</span>
           </div>
         )}
-        {manifest.status === 'absent' && visibleGeometryCount === 0 && (
+        {manifest.status === 'absent' && visibleGeometryCount === 0 && !pointCloudEnabled && (
           <div className="viewer-state">
             <strong>No active retained deployment model</strong>
             <span>{manifest.message}</span>
             <span>No empty or placeholder robot is substituted.</span>
           </div>
         )}
-        {manifest.status === 'error' && visibleGeometryCount === 0 && (
+        {manifest.status === 'error' && visibleGeometryCount === 0 && !pointCloudEnabled && (
           <div className="viewer-state error-state" role="alert">
             <strong>Structural manifest unavailable</strong>
             <span>{manifest.message}</span>
             <button type="button" onClick={retry}>Retry manifest</button>
           </div>
         )}
-        {visibleGeometryCount === 0 && manifest.status === 'ready' && (
+        {visibleGeometryCount === 0 && manifest.status === 'ready' && !pointCloudEnabled && (
           <div className="viewer-state">
             <strong>No geometry selected for display</strong>
             <span>
@@ -1041,6 +1094,12 @@ function StructuralViewerContent({
                 : assetError.message}
             </span>
             <button type="button" onClick={retry}>Reload active model</button>
+          </div>
+        )}
+        {pointCloudEnabled && pointCloud.error !== null && (
+          <div className="viewer-state viewer-state-overlay error-state" role="alert">
+            <strong>Point-cloud observer unavailable</strong>
+            <span>{pointCloud.error}</span>
           </div>
         )}
 

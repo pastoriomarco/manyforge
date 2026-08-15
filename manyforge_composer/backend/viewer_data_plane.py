@@ -416,6 +416,7 @@ class BoundedViewerFanout:
         self._lock = asyncio.Lock()
         self._loop: asyncio.AbstractEventLoop | None = None
         self._published = 0
+        self._retired_sent = 0
         self._retired_replaced = 0
         self._retired_send_errors = 0
         self._retired_send_timeouts = 0
@@ -446,6 +447,7 @@ class BoundedViewerFanout:
             client = self._clients.pop(client_id, None)
             if client is None:
                 return
+            self._retired_sent += client.sent
             self._retired_replaced += client.replaced
             self._retired_send_errors += client.send_errors
             self._retired_send_timeouts += client.send_timeouts
@@ -576,6 +578,10 @@ class BoundedViewerFanout:
             return {
                 "client_count": len(clients),
                 "published": self._published,
+                "sent_total": (
+                    self._retired_sent
+                    + sum(client.sent for client in self._clients.values())
+                ),
                 "replaced_total": (
                     self._retired_replaced
                     + sum(client.replaced for client in self._clients.values())

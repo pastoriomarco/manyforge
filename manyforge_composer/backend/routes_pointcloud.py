@@ -1,201 +1,360 @@
-"""Owner-neutral MFPC codec and typed I9 point-cloud client gate.
-
-The last full Composer implementation is pinned at
-``manyforge@08222188293df8e12f90dc72e204c21f22f92ea1``.  Its source blob
-``655347d93689962b7ec980ed2e2a7219315b27fe`` records the exact interaction
-baseline: environment/qualification helpers at lines 35-96, the retained
-codec at lines 98-225, the WebSocket client/publisher and demand/status owner
-at lines 228-523, the qualification producer at lines 526-594, and the old
-route at lines 597-663.  The removed cohorts are I9 restoration and acceptance
-inputs, not dormant fallback code.
-
-This module intentionally creates no socket, task, thread, demand registry,
-fanout queue, source fixture, or runtime status owner.  It retains only the
-bounded binary codec and a route factory that fails before reading state or
-security configuration.
-"""
+"""Demand-scoped MFOB point-cloud ingress and capacity-one browser fanout."""
 
 from __future__ import annotations
 
-import math
+import asyncio
+from dataclasses import dataclass
+import hashlib
 import os
-import struct
-from array import array
-from typing import Any, Final, Sequence, TYPE_CHECKING
+import threading
+from typing import Any, Final, TYPE_CHECKING
+import uuid
 
-from fastapi import APIRouter
+from fastapi import APIRouter, Request, WebSocket, WebSocketDisconnect
+from fastapi.responses import JSONResponse
+
+from manyforge_headless_api.client import HeadlessClientError
+from manyforge_headless_api.pointcloud_observation import (
+    POINTCLOUD_MAX_PACKET_BYTES,
+    POINTCLOUD_MEDIA_TYPE,
+    POINTCLOUD_PROTOCOL_ID,
+    POINTCLOUD_RECEIPT_SCHEMA,
+    POINTCLOUD_STATUS_SCHEMA,
+    PointCloudObservation,
+    decode_pointcloud_observation,
+)
 
 from .security import SecurityConfig
+from .viewer_data_plane import BoundedViewerFanout, ViewerTransportItem
 
 if TYPE_CHECKING:
     from .state import ComposerState
 
 
-_POINTCLOUD_MAGIC: Final = b"MFPC"
-_POINTCLOUD_VERSION: Final = 1
-_POINTCLOUD_FLAG_COLORS: Final = 1 << 0
-_POINTCLOUD_FLAG_CLEAR: Final = 1 << 1
-_POINTCLOUD_HEADER: Final = struct.Struct("<4sBBHQQQII")
-_PROTOCOL_MAX_POINTS: Final = 200_000
-
-POINTCLOUD_CLIENT_UNAVAILABLE_REASON_CODE: Final = (
-    "composable_cell_pointcloud_client_unavailable"
-)
-POINTCLOUD_RESTORATION_GATE: Final = "I9"
+_DEFAULT_OWNER_ID: Final = "manyforge.isaac.pointcloud"
 
 
-def _pack_pointcloud_frame(
-    *,
-    stream_epoch: int,
-    sequence: int,
-    timestamp_ns: int,
-    points: Sequence[Sequence[float]],
-    colors: Sequence[Sequence[float]] | None,
-    max_points: int,
-) -> bytes:
-    """Encode one bounded MFPC frame without transport or runtime ownership."""
-    if max_points <= 0 or max_points > _PROTOCOL_MAX_POINTS:
-        raise ValueError("max_points is outside the supported range")
-    count = len(points)
-    if count > max_points:
-        raise ValueError(f"point cloud has {count} points; limit is {max_points}")
-    if colors is not None and len(colors) != count:
-        raise ValueError("point cloud colors must match point count")
+@dataclass(frozen=True, slots=True)
+class _AcceptedSourceFrame:
+    owner_epoch: str
+    stream_generation: int
+    sequence: int
+    packet_sha256: str
 
-    positions = array("f")
-    color_bytes = bytearray(count * 3) if colors is not None else None
-    for index, point in enumerate(points):
+
+def _configured_owner_id() -> str:
+    value = os.environ.get("MANYFORGE_POINTCLOUD_OWNER_ID", _DEFAULT_OWNER_ID)
+    if (
+        not value
+        or len(value.encode("utf-8", errors="strict")) > 128
+        or value[0] not in "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
+        or any(
+            character
+            not in "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789._:/-"
+            for character in value
+        )
+    ):
+        raise ValueError("MANYFORGE_POINTCLOUD_OWNER_ID is invalid")
+    return value
+
+
+def _fresh_scene_cell(state: "ComposerState") -> tuple[str, str, int]:
+    client = getattr(state, "headless_client", None)
+    if client is None or not callable(getattr(client, "scene", None)):
+        raise RuntimeError("pointcloud_scene_owner_unavailable")
+    try:
+        projection = client.scene()
+    except HeadlessClientError as error:
+        raise RuntimeError(error.code) from error
+    except Exception as error:
+        raise RuntimeError("pointcloud_scene_owner_unavailable") from error
+    if type(projection) is not dict:
+        raise RuntimeError("pointcloud_scene_owner_stale")
+    section = (
+        projection.get("logical_scene")
+    )
+    payload = section.get("payload") if type(section) is dict else None
+    snapshot = payload.get("snapshot") if type(payload) is dict else None
+    if (
+        projection.get("schema_version") != "manyforge.scene_projection.v1"
+        or type(section) is not dict
+        or section.get("available") is not True
+        or section.get("freshness") != "fresh"
+        or section.get("known_gaps") != []
+        or type(section.get("source_owner_epoch")) is not str
+        or not section["source_owner_epoch"]
+        or type(section.get("source_generation")) is not int
+        or isinstance(section.get("source_generation"), bool)
+        or section["source_generation"] < 0
+        or type(payload) is not dict
+        or payload.get("api_version") != "manyforge.logical_scene_source.v1"
+        or type(snapshot) is not dict
+        or type(snapshot.get("cell_id")) is not str
+        or not snapshot["cell_id"]
+    ):
+        raise RuntimeError("pointcloud_scene_owner_stale")
+    return (
+        snapshot["cell_id"],
+        section["source_owner_epoch"],
+        section["source_generation"],
+    )
+
+
+class PointCloudObservationService:
+    """One explicit source owner and one capacity-one slot per browser."""
+
+    def __init__(self, *, expected_owner_id: str | None = None) -> None:
+        self._expected_owner_id = expected_owner_id or _configured_owner_id()
+        self._fanout = BoundedViewerFanout(send_timeout_s=2.0)
+        self._lock = threading.Lock()
+        self._client_count = 0
+        self._demand_revision = 0
+        self._accepted: _AcceptedSourceFrame | None = None
+        self._scene_owner_epoch: str | None = None
+        self._scene_generation: int | None = None
+        self._received_total = 0
+        self._published_total = 0
+        self._duplicates_total = 0
+        self._suppressed_total = 0
+        self._rejected_total = 0
+        self._clear_total = 0
+        self._bytes_total = 0
+
+    async def attach(self, websocket: WebSocket, client_id: str) -> None:
+        await self._fanout.attach(websocket, client_id=client_id)
+        with self._lock:
+            self._client_count += 1
+            self._demand_revision += 1
+
+    async def detach(self, client_id: str) -> None:
+        await self._fanout.detach(client_id)
+        with self._lock:
+            if self._client_count > 0:
+                self._client_count -= 1
+                self._demand_revision += 1
+            if self._client_count == 0:
+                self._accepted = None
+
+    async def send_loop(self, client_id: str) -> None:
+        await self._fanout.send_loop(client_id)
+
+    def _admit_sequence(
+        self,
+        observation: PointCloudObservation,
+        digest: str,
+    ) -> str:
+        current = self._accepted
+        if current is None or observation.owner_epoch != current.owner_epoch:
+            self._accepted = _AcceptedSourceFrame(
+                observation.owner_epoch,
+                observation.stream_generation,
+                observation.sequence,
+                digest,
+            )
+            return "accepted"
+        if observation.stream_generation < current.stream_generation:
+            return "stream_generation_regressed"
+        if observation.stream_generation > current.stream_generation:
+            self._accepted = _AcceptedSourceFrame(
+                observation.owner_epoch,
+                observation.stream_generation,
+                observation.sequence,
+                digest,
+            )
+            return "accepted"
+        if observation.sequence < current.sequence:
+            return "sequence_regressed"
+        if observation.sequence == current.sequence:
+            return "duplicate" if digest == current.packet_sha256 else "sequence_conflict"
+        self._accepted = _AcceptedSourceFrame(
+            observation.owner_epoch,
+            observation.stream_generation,
+            observation.sequence,
+            digest,
+        )
+        return "accepted"
+
+    async def ingest(
+        self,
+        state: "ComposerState",
+        packet: bytes,
+    ) -> tuple[str, PointCloudObservation]:
+        observation = decode_pointcloud_observation(packet)
+        with self._lock:
+            self._received_total += 1
+        if observation.owner_id != self._expected_owner_id:
+            with self._lock:
+                self._rejected_total += 1
+            return "source_owner_mismatch", observation
         try:
-            x, y, z = float(point[0]), float(point[1]), float(point[2])
-        except (IndexError, TypeError, ValueError) as exc:
-            raise ValueError(f"point {index} is not an xyz triple") from exc
-        if not (math.isfinite(x) and math.isfinite(y) and math.isfinite(z)):
-            raise ValueError(f"point {index} is not finite")
-        positions.extend((x, y, z))
-        if color_bytes is not None and colors is not None:
-            color = colors[index]
-            try:
-                red, green, blue = (
-                    float(color[0]),
-                    float(color[1]),
-                    float(color[2]),
-                )
-            except (IndexError, TypeError, ValueError) as exc:
-                raise ValueError(f"color {index} is not an rgb triple") from exc
-            if not (
-                math.isfinite(red)
-                and math.isfinite(green)
-                and math.isfinite(blue)
-            ):
-                raise ValueError(f"color {index} is not finite")
-            offset = index * 3
-            color_bytes[offset] = round(max(0.0, min(1.0, red)) * 255.0)
-            color_bytes[offset + 1] = round(max(0.0, min(1.0, green)) * 255.0)
-            color_bytes[offset + 2] = round(max(0.0, min(1.0, blue)) * 255.0)
+            cell_id, scene_epoch, scene_generation = _fresh_scene_cell(state)
+        except RuntimeError:
+            with self._lock:
+                self._rejected_total += 1
+            return "scene_owner_unavailable", observation
+        if observation.cell_id != cell_id:
+            with self._lock:
+                self._rejected_total += 1
+            return "cell_identity_mismatch", observation
+        digest = hashlib.sha256(packet).hexdigest()
+        with self._lock:
+            self._scene_owner_epoch = scene_epoch
+            self._scene_generation = scene_generation
+            if self._client_count == 0:
+                self._suppressed_total += 1
+                return "suppressed_no_observer", observation
+            admission = self._admit_sequence(observation, digest)
+            if admission == "duplicate":
+                self._duplicates_total += 1
+                return admission, observation
+            if admission != "accepted":
+                self._rejected_total += 1
+                return admission, observation
+            self._published_total += 1
+            self._bytes_total += len(packet)
+            if observation.clear:
+                self._clear_total += 1
+        await self._fanout.publish(
+            ViewerTransportItem(sequence=observation.sequence, payload=packet)
+        )
+        return "accepted", observation
 
-    if positions.itemsize != 4:
-        raise RuntimeError("platform float array is not IEEE-754 float32")
-    if os.sys.byteorder != "little":
-        positions.byteswap()
-    payload = positions.tobytes()
-    flags = 0
-    if color_bytes is not None:
-        flags |= _POINTCLOUD_FLAG_COLORS
-        payload += color_bytes
-    header = _POINTCLOUD_HEADER.pack(
-        _POINTCLOUD_MAGIC,
-        _POINTCLOUD_VERSION,
-        flags,
-        _POINTCLOUD_HEADER.size,
-        int(stream_epoch),
-        int(sequence),
-        int(timestamp_ns),
-        count,
-        len(payload),
-    )
-    return header + payload
-
-
-def _pack_pointcloud_clear(
-    *,
-    stream_epoch: int,
-    sequence: int,
-    timestamp_ns: int,
-) -> bytes:
-    """Encode one empty MFPC clear generation without transport effects."""
-    return _POINTCLOUD_HEADER.pack(
-        _POINTCLOUD_MAGIC,
-        _POINTCLOUD_VERSION,
-        _POINTCLOUD_FLAG_CLEAR,
-        _POINTCLOUD_HEADER.size,
-        int(stream_epoch),
-        int(sequence),
-        int(timestamp_ns),
-        0,
-        0,
-    )
+    async def status(self) -> dict[str, Any]:
+        fanout = await self._fanout.status()
+        with self._lock:
+            accepted = self._accepted
+            status = {
+                "schema_version": POINTCLOUD_STATUS_SCHEMA,
+                "protocol": POINTCLOUD_PROTOCOL_ID,
+                "expected_owner_id": self._expected_owner_id,
+                "demand_active": self._client_count > 0,
+                "demand_revision": self._demand_revision,
+                "client_count": self._client_count,
+                "source_owner_epoch": None if accepted is None else accepted.owner_epoch,
+                "stream_generation": None if accepted is None else accepted.stream_generation,
+                "sequence": None if accepted is None else accepted.sequence,
+                "scene_owner_epoch": self._scene_owner_epoch,
+                "scene_generation": self._scene_generation,
+                "received_total": self._received_total,
+                "published_total": self._published_total,
+                "duplicates_total": self._duplicates_total,
+                "suppressed_no_observer_total": self._suppressed_total,
+                "rejected_total": self._rejected_total,
+                "clear_total": self._clear_total,
+                "bytes_total": self._bytes_total,
+            }
+        status["fanout"] = fanout
+        return status
 
 
-def decode_pointcloud_packet(packet: bytes) -> dict[str, Any]:
-    """Validate and describe one bounded MFPC packet without copying payload."""
-    if len(packet) < _POINTCLOUD_HEADER.size:
-        raise ValueError("point-cloud packet is shorter than its header")
-    (
-        magic,
-        version,
-        flags,
-        header_size,
-        stream_epoch,
-        sequence,
-        timestamp_ns,
-        point_count,
-        payload_bytes,
-    ) = _POINTCLOUD_HEADER.unpack_from(packet)
-    if magic != _POINTCLOUD_MAGIC or version != _POINTCLOUD_VERSION:
-        raise ValueError("unsupported point-cloud protocol")
-    if header_size != _POINTCLOUD_HEADER.size:
-        raise ValueError("invalid point-cloud header size")
-    if flags & ~(_POINTCLOUD_FLAG_COLORS | _POINTCLOUD_FLAG_CLEAR):
-        raise ValueError("unsupported point-cloud flags")
-    if point_count > _PROTOCOL_MAX_POINTS:
-        raise ValueError("point-cloud count exceeds protocol limit")
-    expected_payload = point_count * 12
-    if flags & _POINTCLOUD_FLAG_COLORS:
-        expected_payload += point_count * 3
-    if flags & _POINTCLOUD_FLAG_CLEAR:
-        if point_count != 0 or payload_bytes != 0:
-            raise ValueError("clear packet carries point data")
-    elif payload_bytes != expected_payload:
-        raise ValueError("point-cloud payload shape is inconsistent")
-    if len(packet) != header_size + payload_bytes:
-        raise ValueError("point-cloud packet length is inconsistent")
-    return {
-        "stream_epoch": stream_epoch,
-        "sequence": sequence,
-        "timestamp_ns": timestamp_ns,
-        "point_count": point_count,
-        "has_colors": bool(flags & _POINTCLOUD_FLAG_COLORS),
-        "clear": bool(flags & _POINTCLOUD_FLAG_CLEAR),
-        "payload": memoryview(packet)[header_size:],
-    }
-
-
-class PointCloudClientUnavailableError(RuntimeError):
-    """Raised before state access, transport creation, or route registration."""
+def get_pointcloud_observation_service(
+    state: "ComposerState",
+) -> PointCloudObservationService:
+    service = getattr(state, "_pointcloud_observation_service", None)
+    if isinstance(service, PointCloudObservationService):
+        return service
+    service = PointCloudObservationService()
+    setattr(state, "_pointcloud_observation_service", service)
+    return service
 
 
 def create_pointcloud_router(
-    _state: "ComposerState",
-    _security: SecurityConfig,
+    state: "ComposerState",
+    security: SecurityConfig,
 ) -> APIRouter:
-    raise PointCloudClientUnavailableError(
-        f"{POINTCLOUD_CLIENT_UNAVAILABLE_REASON_CODE}: point-cloud WebSocket "
-        "routing returns at I9 after binding to the new observer owner"
-    )
+    del security
+    service = get_pointcloud_observation_service(state)
+    router = APIRouter()
+
+    @router.get("/api/scene/pointcloud/status")
+    async def pointcloud_status() -> dict[str, Any]:
+        return await service.status()
+
+    @router.post("/api/scene/pointcloud/observations")
+    async def publish_pointcloud(request: Request) -> JSONResponse:
+        content_type = request.headers.get("content-type", "").split(";", 1)[0]
+        if content_type.strip().lower() != POINTCLOUD_MEDIA_TYPE:
+            return JSONResponse(
+                status_code=415,
+                content={"detail": {"code": "pointcloud_media_type_invalid"}},
+            )
+        body = bytearray()
+        async for chunk in request.stream():
+            if len(body) + len(chunk) > POINTCLOUD_MAX_PACKET_BYTES:
+                return JSONResponse(
+                    status_code=413,
+                    content={"detail": {"code": "pointcloud_packet_oversized"}},
+                )
+            body.extend(chunk)
+        try:
+            disposition, observation = await service.ingest(state, bytes(body))
+        except ValueError as error:
+            return JSONResponse(
+                status_code=422,
+                content={
+                    "detail": {
+                        "code": "pointcloud_observation_invalid",
+                        "message": str(error),
+                    }
+                },
+            )
+        if disposition in {
+            "source_owner_mismatch",
+            "scene_owner_unavailable",
+            "cell_identity_mismatch",
+            "stream_generation_regressed",
+            "sequence_regressed",
+            "sequence_conflict",
+        }:
+            return JSONResponse(
+                status_code=409,
+                content={"detail": {"code": f"pointcloud_{disposition}"}},
+            )
+        return JSONResponse(
+            status_code=202 if disposition == "suppressed_no_observer" else 200,
+            content={
+                "schema_version": POINTCLOUD_RECEIPT_SCHEMA,
+                "disposition": disposition,
+                "owner_epoch": observation.owner_epoch,
+                "stream_generation": observation.stream_generation,
+                "sequence": observation.sequence,
+            },
+        )
+
+    @router.websocket("/ws/scene/pointcloud")
+    async def pointcloud_observer(websocket: WebSocket) -> None:
+        await websocket.accept()
+        client_id = uuid.uuid4().hex
+        await service.attach(websocket, client_id)
+        send_task = asyncio.create_task(service.send_loop(client_id))
+
+        async def receive_until_disconnect() -> None:
+            while True:
+                message = await websocket.receive_text()
+                if message != "ping":
+                    await websocket.close(code=1003, reason="unsupported message")
+                    return
+                await websocket.send_text("pong")
+
+        receive_task = asyncio.create_task(receive_until_disconnect())
+        try:
+            await asyncio.wait(
+                {send_task, receive_task},
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+        except WebSocketDisconnect:
+            pass
+        finally:
+            await service.detach(client_id)
+            for task in (send_task, receive_task):
+                task.cancel()
+            await asyncio.gather(send_task, receive_task, return_exceptions=True)
+
+    return router
 
 
 __all__ = [
-    "PointCloudClientUnavailableError",
+    "PointCloudObservationService",
     "create_pointcloud_router",
-    "decode_pointcloud_packet",
+    "get_pointcloud_observation_service",
 ]

@@ -1,11 +1,11 @@
 export interface SequencedFrame<T> {
-  streamEpoch: bigint;
+  streamIdentity: string;
   sequence: bigint;
   frame: T | null;
 }
 
 export interface LatestFrameSlot<T> {
-  streamEpoch: bigint | null;
+  streamIdentity: string | null;
   sequence: bigint;
   version: number;
   appliedVersion: number;
@@ -14,7 +14,7 @@ export interface LatestFrameSlot<T> {
 
 export function emptyLatestFrameSlot<T>(): LatestFrameSlot<T> {
   return {
-    streamEpoch: null,
+    streamIdentity: null,
     sequence: -1n,
     version: 0,
     appliedVersion: -1,
@@ -24,22 +24,22 @@ export function emptyLatestFrameSlot<T>(): LatestFrameSlot<T> {
 
 /**
  * Retain only the newest validated frame for render-time materialization.
- * Future I5-I9 thin clients and observer adapters decode owner-issued frames;
- * this reducer has no viewer-protocol knowledge or runtime authority.
+ * Thin observer clients decode owner-issued frames; this reducer has no
+ * viewer-protocol knowledge or runtime authority.
  */
 export function publishLatestFrame<T>(
   state: LatestFrameSlot<T>,
   incoming: SequencedFrame<T>,
 ): LatestFrameSlot<T> {
   if (
-    state.streamEpoch === incoming.streamEpoch
+    state.streamIdentity === incoming.streamIdentity
     && incoming.sequence <= state.sequence
   ) {
     return state;
   }
   return {
     ...state,
-    streamEpoch: incoming.streamEpoch,
+    streamIdentity: incoming.streamIdentity,
     sequence: incoming.sequence,
     version: state.version + 1,
     frame: incoming.frame,
@@ -66,7 +66,7 @@ export function invalidateLatestFrame<T>(
 ): LatestFrameSlot<T> {
   return {
     ...state,
-    streamEpoch: null,
+    streamIdentity: null,
     sequence: -1n,
     version: state.version + 1,
     frame: null,
