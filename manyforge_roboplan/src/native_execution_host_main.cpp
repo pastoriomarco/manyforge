@@ -22,6 +22,7 @@
 #include <exception>
 #include <filesystem>
 #include <iostream>
+#include <iterator>
 #include <limits>
 #include <manyforge_collision/manyforge_collision_engine.hpp>
 #include <manyforge_component_manager/active_bundle_publication_store.hpp>
@@ -3887,6 +3888,95 @@ ActiveFacts(const deployment::RuntimeProgramTargetBinding &primary,
       std::move(provider_epochs)};
 }
 
+[[nodiscard]] std::vector<core::RuntimeParticipantBinding>
+BuildControlBindingRepresentatives(
+    const deployment::ProgramBinding &direct_control_binding,
+    const core::RuntimeParticipantBinding &primary_binding,
+    const deployment::RetainedBundle &bundle,
+    const deployment::VerifiedRetainedModelMap &model_map,
+    const core::RuntimeEpoch &runtime_epoch,
+    const core::ActiveControlConfigurationId &active_configuration_id) {
+  const auto &primary = primary_binding.value();
+  Require(primary.control_path.has_value(),
+          "direct-control primary has no exact control path");
+  const auto &primary_path = *primary.control_path;
+  const auto &targets = direct_control_binding.value().target_role_bindings;
+  const auto target = std::find_if(
+      targets.begin(), targets.end(), [&](const auto &candidate) {
+        return candidate.controllable_component_id ==
+                   primary.controllable_component_id &&
+               candidate.command_target_id == primary.command_target_id;
+      });
+  Require(target != targets.end() &&
+              std::find_if(std::next(target), targets.end(),
+                           [&](const auto &candidate) {
+                             return candidate.controllable_component_id ==
+                                        primary.controllable_component_id &&
+                                    candidate.command_target_id ==
+                                        primary.command_target_id;
+                           }) == targets.end(),
+          "direct-control physical target is absent or ambiguous");
+
+  std::vector<core::RuntimeParticipantBinding> representatives;
+  for (const auto &capability : target->capability_bindings) {
+    if (!capability.control_binding.has_value()) {
+      continue;
+    }
+    if (capability.capability_id == primary.capability_id) {
+      representatives.push_back(primary_binding);
+      continue;
+    }
+    const auto resolved = deployment::resolve_runtime_program_target(
+        direct_control_binding, target->target_role_id,
+        capability.capability_id, bundle, model_map);
+    auto sealed = core::verify_runtime_participant_binding(
+        deployment::build_runtime_participant_binding_dto(
+            resolved,
+            ActiveFacts(resolved, {}, runtime_epoch,
+                        active_configuration_id)));
+    if (!sealed.ok()) {
+      Fail("direct-control control-binding representative failed "
+           "verification: " +
+           sealed.error().message);
+    }
+    representatives.push_back(std::move(sealed.value()));
+  }
+  std::sort(representatives.begin(), representatives.end(),
+            [](const auto &left, const auto &right) {
+              return left.value().control_path->control_binding_id <
+                     right.value().control_path->control_binding_id;
+            });
+
+  const auto &desired = bundle.value().desired_control_configurations;
+  const auto configuration = std::find_if(
+      desired.begin(), desired.end(), [&](const auto &candidate) {
+        return candidate.control_domain_id == primary_path.control_domain_id;
+      });
+  Require(configuration != desired.end() &&
+              std::find_if(std::next(configuration), desired.end(),
+                           [&](const auto &candidate) {
+                             return candidate.control_domain_id ==
+                                    primary_path.control_domain_id;
+                           }) == desired.end() &&
+              representatives.size() ==
+                  configuration->binding_routes.size(),
+          "direct-control target does not cover its exact desired domain");
+  for (const auto &route : configuration->binding_routes) {
+    const auto found = std::find_if(
+        representatives.begin(), representatives.end(),
+        [&](const auto &candidate) {
+          const auto &path = *candidate.value().control_path;
+          return path.control_binding_id == route.control_binding_id &&
+                 path.control_binding_revision ==
+                     route.control_binding_revision &&
+                 path.control_route_id == route.control_route_id;
+        });
+    Require(found != representatives.end(),
+            "direct-control target omits one desired control binding");
+  }
+  return representatives;
+}
+
 struct Composition final {
   std::shared_ptr<const deployment::RetainedBundle> bundle;
   std::shared_ptr<const deployment::ProgramBindingContract> program;
@@ -4239,6 +4329,28 @@ BuildProductComposition(CompositionBuildInput input) {
     Fail("direct-control gripper participant binding failed verification: " +
          direct_control_gripper_binding.error().message);
   }
+  auto control_binding_representatives = BuildControlBindingRepresentatives(
+      *direct_control_binding, direct_control_motion_binding.value(),
+      *input.bundle, input.model_map, input.runtime_epoch,
+      core::ActiveControlConfigurationId("active.i6.native.arm"));
+  auto gripper_control_binding_representatives =
+      BuildControlBindingRepresentatives(
+          *direct_control_gripper_program_binding,
+          direct_control_gripper_binding.value(), *input.bundle,
+          input.model_map, input.runtime_epoch,
+          core::ActiveControlConfigurationId("active.i6.native.gripper"));
+  control_binding_representatives.insert(
+      control_binding_representatives.end(),
+      std::make_move_iterator(
+          gripper_control_binding_representatives.begin()),
+      std::make_move_iterator(
+          gripper_control_binding_representatives.end()));
+  std::sort(control_binding_representatives.begin(),
+            control_binding_representatives.end(),
+            [](const auto &left, const auto &right) {
+              return left.value().control_path->control_binding_id <
+                     right.value().control_path->control_binding_id;
+            });
 
   auto local_runtime_unit_id = input.runtime_unit_id;
   if (!local_runtime_unit_id.has_value()) {
@@ -4445,7 +4557,10 @@ BuildProductComposition(CompositionBuildInput input) {
       {},
       {},
       {},
+      {},
       {}};
+  runtime_input.control_binding_representatives =
+      std::move(control_binding_representatives);
   if (input.planner_scene_projection != nullptr) {
     runtime_input.planning_scene_synchronizer =
         std::make_shared<ManagerPlanningSceneSynchronizer>(

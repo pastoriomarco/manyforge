@@ -1,7 +1,6 @@
 #include "manyforge_deployment/program_binding_compiler.hpp"
 
 #include <algorithm>
-#include <array>
 #include <map>
 #include <optional>
 #include <set>
@@ -1318,28 +1317,28 @@ make_direct_control_motion_contract(
   const auto collision_roles =
       sorted_ids<core::CollisionBodyRoleId>(collision_role_names);
 
-  constexpr std::array<std::pair<std::string_view, bool>, 4U>
-      kMotionCapabilities{{
-          {"execution.trajectory.execute", true},
-          {"planning.motion.cartesian_path", false},
-          {"planning.motion.joint_goal", true},
-          {"planning.motion.pose_goal", false},
-      }};
+  if (find_target_capability(target, "execution.trajectory.execute") ==
+          nullptr ||
+      find_target_capability(target, "planning.motion.joint_goal") ==
+          nullptr) {
+    fail("direct-control motion target omits a required execution or "
+         "joint-planning capability");
+  }
   std::vector<core::ProgramCapabilityRequirementDTO> capabilities;
-  for (const auto& [capability_id, required] : kMotionCapabilities) {
-    const auto* capability = find_target_capability(target, capability_id);
-    if (capability == nullptr) {
-      if (required) {
-        fail("direct-control motion target omits a required execution or "
-             "joint-planning capability");
-      }
-      continue;
-    }
+  capabilities.reserve(target.capabilities.size());
+  for (const auto& capability : target.capabilities) {
     capabilities.push_back(core::ProgramCapabilityRequirementDTO{
-        capability->capability_id,
-        capability->capability_definition_revision,
+        capability.capability_id,
+        capability.capability_definition_revision,
         core::ProgramCapabilityDisposition::kRequired});
   }
+  std::sort(capabilities.begin(), capabilities.end(),
+            [](const auto& left, const auto& right) {
+              return std::tie(left.capability_id,
+                              left.capability_definition_revision) <
+                     std::tie(right.capability_id,
+                              right.capability_definition_revision);
+            });
 
   CanonicalValue::Array capability_projection;
   capability_projection.reserve(capabilities.size());
@@ -1355,7 +1354,7 @@ make_direct_control_motion_contract(
   }
   const CanonicalValue projection(CanonicalValue::Object{
       {"api_version",
-       CanonicalValue("manyforge.direct_control_motion_program.v1")},
+       CanonicalValue("manyforge.direct_control_motion_program.v2")},
       {"component_role_id",
        CanonicalValue(std::string(kDirectControlComponentRoleId))},
       {"model_roles", strong_id_array(model_roles)},
@@ -1383,7 +1382,7 @@ make_direct_control_motion_contract(
        })},
   });
   std::string revision_preimage{
-      "manyforge.direct-control-motion-program-revision.v1"};
+      "manyforge.direct-control-motion-program-revision.v2"};
   revision_preimage.push_back('\0');
   revision_preimage.append(canonical_json(projection));
 
@@ -1408,9 +1407,9 @@ make_direct_control_motion_contract(
 make_direct_control_gripper_contract(
     const core::RetainedNodeEnvironmentDTO& node_environment,
     const core::ComponentTypeCommandTargetDTO& target) {
-  const auto* capability =
+  const auto* command_capability =
       find_target_capability(target, "tool.gripper.command");
-  if (capability == nullptr) {
+  if (command_capability == nullptr) {
     fail("direct-control gripper target omits tool.gripper.command");
   }
 
@@ -1459,15 +1458,37 @@ make_direct_control_gripper_contract(
       sorted_ids<core::ResourceRoleId>(resource_role_names);
   const auto collision_roles =
       sorted_ids<core::CollisionBodyRoleId>(collision_role_names);
-  std::vector<core::ProgramCapabilityRequirementDTO> capabilities{
-      core::ProgramCapabilityRequirementDTO{
-          capability->capability_id,
-          capability->capability_definition_revision,
-          core::ProgramCapabilityDisposition::kRequired}};
+  std::vector<core::ProgramCapabilityRequirementDTO> capabilities;
+  capabilities.reserve(target.capabilities.size());
+  for (const auto& capability : target.capabilities) {
+    capabilities.push_back(core::ProgramCapabilityRequirementDTO{
+        capability.capability_id,
+        capability.capability_definition_revision,
+        core::ProgramCapabilityDisposition::kRequired});
+  }
+  std::sort(capabilities.begin(), capabilities.end(),
+            [](const auto& left, const auto& right) {
+              return std::tie(left.capability_id,
+                              left.capability_definition_revision) <
+                     std::tie(right.capability_id,
+                              right.capability_definition_revision);
+            });
+
+  CanonicalValue::Array capability_projection;
+  capability_projection.reserve(capabilities.size());
+  for (const auto& capability : capabilities) {
+    capability_projection.emplace_back(CanonicalValue::Object{
+        {"capability_definition_revision",
+         CanonicalValue(
+             capability.capability_definition_revision.value())},
+        {"capability_id", CanonicalValue(capability.capability_id.value())},
+        {"disposition", CanonicalValue("required")},
+    });
+  }
 
   const CanonicalValue projection(CanonicalValue::Object{
       {"api_version",
-       CanonicalValue("manyforge.direct_control_gripper_program.v1")},
+       CanonicalValue("manyforge.direct_control_gripper_program.v2")},
       {"component_role_id",
        CanonicalValue(std::string(kDirectControlComponentRoleId))},
       {"model_roles", strong_id_array(model_roles)},
@@ -1486,15 +1507,7 @@ make_direct_control_gripper_contract(
       {"target_role",
        CanonicalValue(CanonicalValue::Object{
            {"capabilities",
-            CanonicalValue(CanonicalValue::Array{CanonicalValue(
-                CanonicalValue::Object{
-                    {"capability_definition_revision",
-                     CanonicalValue(
-                         capability->capability_definition_revision.value())},
-                    {"capability_id",
-                     CanonicalValue(capability->capability_id.value())},
-                    {"disposition", CanonicalValue("required")},
-                })})},
+            CanonicalValue(std::move(capability_projection))},
            {"collision_body_roles", strong_id_array(collision_roles)},
            {"frame_roles", strong_id_array(frame_roles)},
            {"resource_roles", strong_id_array(resource_roles)},
@@ -1503,7 +1516,7 @@ make_direct_control_gripper_contract(
        })},
   });
   std::string revision_preimage{
-      "manyforge.direct-control-gripper-program-revision.v1"};
+      "manyforge.direct-control-gripper-program-revision.v2"};
   revision_preimage.push_back('\0');
   revision_preimage.append(canonical_json(projection));
 

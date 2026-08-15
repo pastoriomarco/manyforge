@@ -683,11 +683,7 @@ CreateRetainedNativeCCLCRuntime(
     return core::Result<std::unique_ptr<deployment::CCLCRuntimeComposition>>::
         Err(adopted.error());
   }
-  std::vector<core::RuntimeParticipantBinding> physical_bindings{
-      runtime.motion_binding};
-  if (runtime.gripper_binding.has_value()) {
-    physical_bindings.push_back(*runtime.gripper_binding);
-  }
+  auto physical_bindings = runtime.control_binding_representatives;
   return CreateRetainedNativeCCLCRuntime(
       std::move(config), std::move(retained_bundle), active_publication_reader,
       std::move(expected_active_publication), artifact_source,

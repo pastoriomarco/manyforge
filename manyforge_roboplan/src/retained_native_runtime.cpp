@@ -4,6 +4,7 @@
 #include <manyforge_content_identity/content_identity.hpp>
 #include <manyforge_roboplan/retained_native_runtime.hpp>
 #include "retained_native_runtime_internal.hpp"
+#include <iterator>
 #include <map>
 #include <set>
 #include <stdexcept>
@@ -456,6 +457,77 @@ readiness_for(const std::vector<core::RuntimeParticipantExecutionRegistration>
          left.runtime_unit_epochs == right.runtime_unit_epochs;
 }
 
+/// Control-facing capabilities on one command target may have distinct graph
+/// binding/capability identities while still terminating at the same exact
+/// backend occurrence. Keep that relationship separate from Program aliases,
+/// which must preserve the complete control path.
+[[nodiscard]] bool same_backend_owner(
+    const core::RuntimeParticipantBinding &primary,
+    const core::RuntimeParticipantBinding &representative) noexcept {
+  const auto &left = primary.value();
+  const auto &right = representative.value();
+  if (!left.control_path.has_value() || !right.control_path.has_value()) {
+    return false;
+  }
+  const auto &left_path = *left.control_path;
+  const auto &right_path = *right.control_path;
+  return left.retained_bundle_id == right.retained_bundle_id &&
+         left.graph_revision == right.graph_revision &&
+         left.controllable_component_id == right.controllable_component_id &&
+         left.component_type_id == right.component_type_id &&
+         left.component_type_revision == right.component_type_revision &&
+         left.command_target_id == right.command_target_id &&
+         left.model_bindings == right.model_bindings &&
+         left.model_groups == right.model_groups &&
+         left.frame_bindings == right.frame_bindings &&
+         left.resources == right.resources &&
+         left.collision_body_bindings == right.collision_body_bindings &&
+         left.runtime_unit_epochs == right.runtime_unit_epochs &&
+         right.contact_grasp_bindings.empty() &&
+         left_path.control_domain_id == right_path.control_domain_id &&
+         left_path.control_domain_revision ==
+             right_path.control_domain_revision &&
+         left_path.control_interface_contract_id ==
+             right_path.control_interface_contract_id &&
+         left_path.control_interface_revision ==
+             right_path.control_interface_revision &&
+         left_path.controller_topology_id ==
+             right_path.controller_topology_id &&
+         left_path.topology_revision == right_path.topology_revision &&
+         left_path.control_route_id == right_path.control_route_id &&
+         left_path.activation_set_id == right_path.activation_set_id &&
+         left_path.active_control_configuration_id ==
+             right_path.active_control_configuration_id &&
+         left_path.active_control_configuration_generation ==
+             right_path.active_control_configuration_generation &&
+         left_path.provider_instance_id == right_path.provider_instance_id &&
+         left_path.provider_manifest_id == right_path.provider_manifest_id &&
+         left_path.provider_manifest_revision ==
+             right_path.provider_manifest_revision &&
+         left_path.provider_runtime_unit_id ==
+             right_path.provider_runtime_unit_id &&
+         left_path.provider_runtime_epoch ==
+             right_path.provider_runtime_epoch &&
+         left_path.state_authority_id == right_path.state_authority_id &&
+         left_path.state_authority_class == right_path.state_authority_class &&
+         left_path.stop_evidence_policy_id ==
+             right_path.stop_evidence_policy_id &&
+         left_path.stop_evidence_policy_revision ==
+             right_path.stop_evidence_policy_revision &&
+         left_path.containment_granularity ==
+             right_path.containment_granularity;
+}
+
+[[nodiscard]] bool represents_binding(
+    const core::RuntimeParticipantBinding &candidate,
+    const core::ControlBindingId &binding_id,
+    const core::ControlBindingRevision &binding_revision) noexcept {
+  return candidate.value().control_path.has_value() &&
+         candidate.value().control_path->control_binding_id == binding_id &&
+         candidate.value().control_path->control_binding_revision ==
+             binding_revision;
+}
+
 template <typename Value>
 [[nodiscard]] core::Result<Value> route_publication_error(
     std::string reason, std::string message,
@@ -722,18 +794,72 @@ create_retained_native_runtime_participants(
   const auto &projection_revision =
       current_inventory->projection_binding.projection_revision;
   const auto &motion_value = input.motion_binding.value();
+  if (input.control_binding_representatives.empty()) {
+    input.control_binding_representatives.push_back(input.motion_binding);
+    if (input.gripper_binding.has_value()) {
+      input.control_binding_representatives.push_back(*input.gripper_binding);
+    }
+  }
+  if (std::any_of(input.control_binding_representatives.begin(),
+                  input.control_binding_representatives.end(),
+                  [](const auto &candidate) {
+                    return !candidate.value().control_path.has_value();
+                  })) {
+    throw std::invalid_argument(
+        "native control inventory contains an unaddressed representative");
+  }
+  std::sort(input.control_binding_representatives.begin(),
+            input.control_binding_representatives.end(),
+            [](const auto &left, const auto &right) {
+              return left.value().control_path->control_binding_id <
+                     right.value().control_path->control_binding_id;
+            });
   const std::size_t registration_count =
-      1U + input.motion_binding_aliases.size() +
-      (input.gripper_binding.has_value() ? 1U : 0U) +
+      input.control_binding_representatives.size() +
+      input.motion_binding_aliases.size() +
       input.gripper_binding_aliases.size();
+  const auto representative_owner_count = [&](const auto &candidate) {
+    return static_cast<std::size_t>(
+               same_backend_owner(input.motion_binding, candidate)) +
+           static_cast<std::size_t>(
+               input.gripper_binding.has_value() &&
+               same_backend_owner(*input.gripper_binding, candidate));
+  };
+  const auto contains_exact_representative = [&](const auto &binding) {
+    return std::count_if(
+               input.control_binding_representatives.begin(),
+               input.control_binding_representatives.end(),
+               [&](const auto &candidate) {
+                 return candidate.value() == binding.value();
+               }) == 1;
+  };
   if (registration_count > core::kMaxOperationParticipants ||
+      input.control_binding_representatives.size() >
+          core::kMaxRouteReadinessPublicationRows ||
+      std::any_of(input.control_binding_representatives.begin(),
+                  input.control_binding_representatives.end(),
+                  [&](const auto &candidate) {
+                    return !candidate.value().control_path.has_value() ||
+                           representative_owner_count(candidate) != 1U;
+                  }) ||
+      std::adjacent_find(
+          input.control_binding_representatives.begin(),
+          input.control_binding_representatives.end(),
+          [](const auto &left, const auto &right) {
+            return left.value().control_path->control_binding_id ==
+                   right.value().control_path->control_binding_id;
+          }) != input.control_binding_representatives.end() ||
+      !contains_exact_representative(input.motion_binding) ||
+      (input.gripper_binding.has_value() &&
+       !contains_exact_representative(*input.gripper_binding)) ||
       std::any_of(input.motion_binding_aliases.begin(),
                   input.motion_binding_aliases.end(), [&](const auto &alias) {
                     return !same_physical_binding(input.motion_binding, alias,
                                                   true);
                   })) {
     throw std::invalid_argument(
-        "native motion alias crosses or widens its physical runtime binding");
+        "native control inventory is incomplete, duplicated, or crosses its "
+        "physical backend owner");
   }
   if ((!input.gripper_binding.has_value() &&
        !input.gripper_binding_aliases.empty()) ||
@@ -786,6 +912,8 @@ create_retained_native_runtime_participants(
                                                          input.gripper_binding);
   runtime->motion_binding_aliases = std::move(input.motion_binding_aliases);
   runtime->gripper_binding_aliases = std::move(input.gripper_binding_aliases);
+  runtime->control_binding_representatives =
+      std::move(input.control_binding_representatives);
   runtime->participant_resolver_factory =
       std::move(input.participant_resolver_factory);
   runtime->scene = std::move(input.scene);
@@ -1011,21 +1139,31 @@ create_retained_native_runtime_participants(
       runtime->collision_publisher->collision_policy_snapshot());
 
   std::vector<core::RuntimeParticipantExecutionRegistration> registrations;
-  registrations.push_back(
-      runtime_registration(runtime->motion_binding, input.motion_stop_readiness,
-                           runtime->participant_engine.get(),
-                           runtime->execution.get(), motion_runtime_policy));
+  registrations.reserve(runtime->control_binding_representatives.size() +
+                        runtime->motion_binding_aliases.size() +
+                        runtime->gripper_binding_aliases.size());
+  for (const auto &representative :
+       runtime->control_binding_representatives) {
+    const bool motion_owner =
+        same_backend_owner(runtime->motion_binding, representative);
+    const bool primary = representative.value() ==
+                         (motion_owner ? runtime->motion_binding.value()
+                                       : runtime->gripper_binding->value());
+    registrations.push_back(runtime_registration(
+        representative,
+        primary ? (motion_owner ? input.motion_stop_readiness
+                                : input.gripper_stop_readiness)
+                : std::nullopt,
+        runtime->participant_engine.get(),
+        motion_owner ? static_cast<core::IControlDomainExecutionPort *>(
+                           runtime->execution.get())
+                     : runtime->gripper_stop_execution_port,
+        primary && motion_owner ? motion_runtime_policy : std::nullopt));
+  }
   for (const auto &alias : runtime->motion_binding_aliases) {
     registrations.push_back(runtime_registration(
         alias, input.motion_stop_readiness, runtime->participant_engine.get(),
         runtime->execution.get(), motion_runtime_policy));
-  }
-  if (runtime->gripper_binding.has_value()) {
-    registrations.push_back(runtime_registration(
-        *runtime->gripper_binding, input.gripper_stop_readiness,
-        runtime->participant_engine.get(),
-        runtime->gripper_stop_execution_port,
-        std::nullopt));
   }
   for (const auto &alias : runtime->gripper_binding_aliases) {
     registrations.push_back(runtime_registration(
@@ -1081,14 +1219,11 @@ RetainedNativeRuntime::ReadCurrentPhysicalParticipants(
   result.reserve(configuration.binding_routes.size());
   for (const auto &selected : configuration.binding_routes) {
     const core::RuntimeParticipantBinding *physical = nullptr;
-    for (const auto *candidate :
-         {&motion_binding,
-          gripper_binding.has_value() ? &*gripper_binding : nullptr}) {
-      if (candidate == nullptr ||
-          !candidate->value().control_path.has_value()) {
+    for (const auto &candidate : control_binding_representatives) {
+      if (!candidate.value().control_path.has_value()) {
         continue;
       }
-      const auto &path = *candidate->value().control_path;
+      const auto &path = *candidate.value().control_path;
       if (path.control_domain_id != configuration.control_domain_id ||
           path.control_binding_id != selected.control_binding_id ||
           path.control_binding_revision != selected.control_binding_revision) {
@@ -1100,7 +1235,7 @@ RetainedNativeRuntime::ReadCurrentPhysicalParticipants(
             "route_publication_physical_binding_ambiguous",
             "native runtime has multiple physical owners for one binding");
       }
-      physical = candidate;
+      physical = &candidate;
     }
     if (physical == nullptr) {
       return route_publication_error<
@@ -1188,8 +1323,10 @@ RetainedNativeRuntime::PublishAndReadBackRouteConfiguration(
   try {
     auto next_motion = motion_binding;
     auto next_gripper = gripper_binding;
-    std::optional<core::RuntimeParticipantStopReadiness> motion_readiness;
-    std::optional<core::RuntimeParticipantStopReadiness> gripper_readiness;
+    auto next_representatives = control_binding_representatives;
+    std::map<core::ControlBindingId,
+             std::optional<core::RuntimeParticipantStopReadiness>>
+        readiness_by_binding;
     std::optional<core::RuntimeParticipantPolicySelection>
         motion_runtime_policy;
     const auto current_registration =
@@ -1202,16 +1339,20 @@ RetainedNativeRuntime::PublishAndReadBackRouteConfiguration(
           });
       return found == participant_registrations.end() ? nullptr : &*found;
     };
+    for (const auto &representative : control_binding_representatives) {
+      const auto *current = current_registration(representative);
+      if (current == nullptr ||
+          !representative.value().control_path.has_value()) {
+        throw std::logic_error(
+            "native control representative has no current registration");
+      }
+      readiness_by_binding.emplace(
+          representative.value().control_path->control_binding_id,
+          current->stop_readiness);
+    }
     if (const auto *current = current_registration(motion_binding);
         current != nullptr) {
-      motion_readiness = current->stop_readiness;
       motion_runtime_policy = current->runtime_policy;
-    }
-    if (gripper_binding.has_value()) {
-      if (const auto *current = current_registration(*gripper_binding);
-          current != nullptr) {
-        gripper_readiness = current->stop_readiness;
-      }
     }
 
     std::set<core::ControlBindingId> supplied_bindings;
@@ -1236,28 +1377,43 @@ RetainedNativeRuntime::PublishAndReadBackRouteConfiguration(
             "route_publication_participant_referent_mismatch",
             "route readiness participant differs from its publication row");
       }
-      const auto matches_motion =
-          motion_binding.value().control_path.has_value() &&
-          motion_binding.value().control_path->control_binding_id ==
-              value.control_path->control_binding_id;
-      const auto matches_gripper =
-          gripper_binding.has_value() &&
-          gripper_binding->value().control_path.has_value() &&
-          gripper_binding->value().control_path->control_binding_id ==
-              value.control_path->control_binding_id;
-      if (matches_motion == matches_gripper) {
+      const auto current = std::find_if(
+          control_binding_representatives.begin(),
+          control_binding_representatives.end(), [&](const auto &candidate) {
+            return represents_binding(
+                candidate, value.control_path->control_binding_id,
+                value.control_path->control_binding_revision);
+          });
+      if (current == control_binding_representatives.end() ||
+          std::find_if(std::next(current),
+                       control_binding_representatives.end(),
+                       [&](const auto &candidate) {
+                         return represents_binding(
+                             candidate,
+                             value.control_path->control_binding_id,
+                             value.control_path->control_binding_revision);
+                       }) != control_binding_representatives.end()) {
         return route_publication_error<
             core::RuntimeRouteConfigurationReadbackDTO>(
             "route_publication_physical_binding_mismatch",
-            "route readiness participant has no sole physical owner");
+            "route readiness participant has no sole control representative");
       }
-      if (matches_motion) {
-        next_motion = std::move(participant.participant_binding);
-        motion_readiness = std::move(participant.stop_readiness);
-      } else {
-        next_gripper = std::move(participant.participant_binding);
-        gripper_readiness = std::move(participant.stop_readiness);
+      const bool primary_motion =
+          current->value() == motion_binding.value();
+      const bool primary_gripper =
+          gripper_binding.has_value() &&
+          current->value() == gripper_binding->value();
+      const auto index = static_cast<std::size_t>(
+          std::distance(control_binding_representatives.begin(), current));
+      if (primary_motion) {
+        next_motion = participant.participant_binding;
+      } else if (primary_gripper) {
+        next_gripper = participant.participant_binding;
       }
+      readiness_by_binding.at(value.control_path->control_binding_id) =
+          std::move(participant.stop_readiness);
+      next_representatives[index] =
+          std::move(participant.participant_binding);
     }
     if (supplied_bindings.size() != configuration.binding_routes.size() ||
         std::any_of(configuration.binding_routes.begin(),
@@ -1271,6 +1427,16 @@ RetainedNativeRuntime::PublishAndReadBackRouteConfiguration(
           "route readiness omits one selected physical binding",
           core::ErrorCode::kMissingReference);
     }
+
+    const auto readiness_for_binding = [&](const auto &binding) {
+      return readiness_by_binding.at(
+          binding.value().control_path->control_binding_id);
+    };
+    const auto motion_readiness = readiness_for_binding(next_motion);
+    const auto gripper_readiness =
+        next_gripper.has_value()
+            ? readiness_for_binding(*next_gripper)
+            : std::optional<core::RuntimeParticipantStopReadiness>{};
 
     std::vector<core::RuntimeParticipantBinding> next_motion_aliases;
     next_motion_aliases.reserve(motion_binding_aliases.size());
@@ -1306,8 +1472,33 @@ RetainedNativeRuntime::PublishAndReadBackRouteConfiguration(
           *next_gripper, gripper_readiness, participant_engine.get(),
           gripper_stop_execution_port, std::nullopt));
     }
-    std::vector<core::RuntimeParticipantExecutionRegistration> registrations =
-        physical_registrations;
+    std::vector<core::RuntimeParticipantExecutionRegistration> registrations;
+    registrations.reserve(next_representatives.size() +
+                          next_motion_aliases.size() +
+                          next_gripper_aliases.size());
+    for (const auto &representative : next_representatives) {
+      const bool motion_owner =
+          same_backend_owner(next_motion, representative);
+      const bool gripper_owner =
+          next_gripper.has_value() &&
+          same_backend_owner(*next_gripper, representative);
+      if (motion_owner == gripper_owner) {
+        return route_publication_error<
+            core::RuntimeRouteConfigurationReadbackDTO>(
+            "route_publication_backend_owner_mismatch",
+            "rebound control representative has no sole backend owner");
+      }
+      const bool primary =
+          representative.value() ==
+          (motion_owner ? next_motion.value() : next_gripper->value());
+      registrations.push_back(runtime_registration(
+          representative, readiness_for_binding(representative),
+          participant_engine.get(),
+          motion_owner ? static_cast<core::IControlDomainExecutionPort *>(
+                             execution.get())
+                       : gripper_stop_execution_port,
+          primary && motion_owner ? motion_runtime_policy : std::nullopt));
+    }
     for (const auto &alias : next_motion_aliases) {
       registrations.push_back(runtime_registration(
           alias, motion_readiness, participant_engine.get(), execution.get(),
@@ -1465,6 +1656,7 @@ RetainedNativeRuntime::PublishAndReadBackRouteConfiguration(
     gripper_binding = std::move(next_gripper);
     motion_binding_aliases = std::move(next_motion_aliases);
     gripper_binding_aliases = std::move(next_gripper_aliases);
+    control_binding_representatives = std::move(next_representatives);
     participant_registrations = std::move(registrations);
     participant_resolver = std::move(kernel_resolver);
     if (motion_readiness.has_value()) {
@@ -1509,6 +1701,7 @@ RetainedNativeRuntime::AdoptAndReadBackRouteConfigurationPredecessor(
   try {
     auto next_motion = motion_binding;
     auto next_gripper = gripper_binding;
+    auto next_representatives = control_binding_representatives;
     const auto rebase_if_selected =
         [&](const core::RuntimeParticipantBinding &binding)
         -> core::Result<core::RuntimeParticipantBinding> {
@@ -1519,21 +1712,6 @@ RetainedNativeRuntime::AdoptAndReadBackRouteConfigurationPredecessor(
       }
       return rebase_runtime_binding_to_predecessor(binding, configuration);
     };
-    auto motion_rebase = rebase_if_selected(motion_binding);
-    if (!motion_rebase.ok()) {
-      return core::Result<core::RuntimeRouteConfigurationReadbackDTO>::Err(
-          motion_rebase.error());
-    }
-    next_motion = std::move(motion_rebase.value());
-    if (gripper_binding.has_value()) {
-      auto gripper_rebase = rebase_if_selected(*gripper_binding);
-      if (!gripper_rebase.ok()) {
-        return core::Result<core::RuntimeRouteConfigurationReadbackDTO>::Err(
-            gripper_rebase.error());
-      }
-      next_gripper = std::move(gripper_rebase.value());
-    }
-
     const auto current_registration =
         [&](const core::RuntimeParticipantBinding &binding)
         -> const core::RuntimeParticipantExecutionRegistration * {
@@ -1544,32 +1722,54 @@ RetainedNativeRuntime::AdoptAndReadBackRouteConfigurationPredecessor(
           });
       return found == participant_registrations.end() ? nullptr : &*found;
     };
-    std::optional<core::RuntimeParticipantStopReadiness> motion_readiness;
-    std::optional<core::RuntimeParticipantStopReadiness> gripper_readiness;
+    std::map<core::ControlBindingId,
+             std::optional<core::RuntimeParticipantStopReadiness>>
+        readiness_by_binding;
     std::optional<core::RuntimeParticipantPolicySelection>
         motion_runtime_policy;
     if (const auto *current = current_registration(motion_binding);
         current != nullptr) {
-      motion_readiness = current->stop_readiness;
       motion_runtime_policy = current->runtime_policy;
     }
-    if (gripper_binding.has_value()) {
-      if (const auto *current = current_registration(*gripper_binding);
-          current != nullptr) {
-        gripper_readiness = current->stop_readiness;
+    for (std::size_t index = 0U;
+         index < control_binding_representatives.size(); ++index) {
+      const auto &representative = control_binding_representatives[index];
+      const auto *current = current_registration(representative);
+      if (current == nullptr ||
+          !representative.value().control_path.has_value()) {
+        throw std::logic_error(
+            "native predecessor representative has no registration");
       }
+      auto readiness = current->stop_readiness;
+      auto rebound = rebase_if_selected(representative);
+      if (!rebound.ok()) {
+        return core::Result<core::RuntimeRouteConfigurationReadbackDTO>::Err(
+            rebound.error());
+      }
+      if (representative.value() == motion_binding.value()) {
+        next_motion = rebound.value();
+      } else if (gripper_binding.has_value() &&
+                 representative.value() == gripper_binding->value()) {
+        next_gripper = rebound.value();
+      }
+      if (representative.value().control_path->control_domain_id ==
+          configuration.control_domain_id) {
+        readiness.reset();
+      }
+      readiness_by_binding.emplace(
+          rebound.value().value().control_path->control_binding_id,
+          std::move(readiness));
+      next_representatives[index] = std::move(rebound.value());
     }
-    if (next_motion.value().control_path.has_value() &&
-        next_motion.value().control_path->control_domain_id ==
-            configuration.control_domain_id) {
-      motion_readiness.reset();
-    }
-    if (next_gripper.has_value() &&
-        next_gripper->value().control_path.has_value() &&
-        next_gripper->value().control_path->control_domain_id ==
-            configuration.control_domain_id) {
-      gripper_readiness.reset();
-    }
+    const auto readiness_for_binding = [&](const auto &binding) {
+      return readiness_by_binding.at(
+          binding.value().control_path->control_binding_id);
+    };
+    const auto motion_readiness = readiness_for_binding(next_motion);
+    const auto gripper_readiness =
+        next_gripper.has_value()
+            ? readiness_for_binding(*next_gripper)
+            : std::optional<core::RuntimeParticipantStopReadiness>{};
 
     std::vector<core::RuntimeParticipantBinding> next_motion_aliases;
     next_motion_aliases.reserve(motion_binding_aliases.size());
@@ -1605,7 +1805,33 @@ RetainedNativeRuntime::AdoptAndReadBackRouteConfigurationPredecessor(
           *next_gripper, gripper_readiness, participant_engine.get(),
           gripper_stop_execution_port, std::nullopt));
     }
-    auto registrations = physical_registrations;
+    std::vector<core::RuntimeParticipantExecutionRegistration> registrations;
+    registrations.reserve(next_representatives.size() +
+                          next_motion_aliases.size() +
+                          next_gripper_aliases.size());
+    for (const auto &representative : next_representatives) {
+      const bool motion_owner =
+          same_backend_owner(next_motion, representative);
+      const bool gripper_owner =
+          next_gripper.has_value() &&
+          same_backend_owner(*next_gripper, representative);
+      if (motion_owner == gripper_owner) {
+        return route_publication_error<
+            core::RuntimeRouteConfigurationReadbackDTO>(
+            "route_predecessor_backend_owner_mismatch",
+            "predecessor control representative has no sole backend owner");
+      }
+      const bool primary =
+          representative.value() ==
+          (motion_owner ? next_motion.value() : next_gripper->value());
+      registrations.push_back(runtime_registration(
+          representative, readiness_for_binding(representative),
+          participant_engine.get(),
+          motion_owner ? static_cast<core::IControlDomainExecutionPort *>(
+                             execution.get())
+                       : gripper_stop_execution_port,
+          primary && motion_owner ? motion_runtime_policy : std::nullopt));
+    }
     for (const auto &alias : next_motion_aliases) {
       registrations.push_back(runtime_registration(
           alias, motion_readiness, participant_engine.get(), execution.get(),
@@ -1751,6 +1977,7 @@ RetainedNativeRuntime::AdoptAndReadBackRouteConfigurationPredecessor(
     gripper_binding = std::move(next_gripper);
     motion_binding_aliases = std::move(next_motion_aliases);
     gripper_binding_aliases = std::move(next_gripper_aliases);
+    control_binding_representatives = std::move(next_representatives);
     participant_registrations = std::move(registrations);
     participant_resolver = std::move(kernel_resolver);
 

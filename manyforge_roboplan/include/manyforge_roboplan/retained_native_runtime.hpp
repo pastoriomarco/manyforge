@@ -159,6 +159,13 @@ struct RetainedNativeRuntimeInput final {
   /// Optional owner-coordinated scene observation latch retained for every
   /// fresh planning admission.
   std::shared_ptr<core::IPlanningSceneSynchronizer> planning_scene_synchronizer;
+  /// Complete build-owned physical-control inventory for CCLC and route
+  /// readiness. It contains one exact representative for every selected
+  /// graph control binding while motion/gripper bindings above remain the
+  /// sole backend owners. Empty preserves the focused-runtime one-binding-per-
+  /// owner shape.
+  std::vector<core::RuntimeParticipantBinding>
+      control_binding_representatives{};
 };
 
 /// Owning native composition root. Destruction order is deliberate: the public
@@ -178,6 +185,8 @@ struct RetainedNativeRuntime final
   std::optional<core::RuntimeParticipantBinding> gripper_binding;
   std::vector<core::RuntimeParticipantBinding> motion_binding_aliases;
   std::vector<core::RuntimeParticipantBinding> gripper_binding_aliases;
+  std::vector<core::RuntimeParticipantBinding>
+      control_binding_representatives;
   std::optional<core::StopDeadlineBudgetDTO> cell_stop_deadline_budget;
   std::optional<core::StopSurveillancePolicyDTO> stop_surveillance_policy;
   std::optional<core::RequestOwnerEpoch> addressed_request_owner_epoch;

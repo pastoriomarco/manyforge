@@ -56,11 +56,13 @@ struct DirectControlProgramBindingInventory final {
 ///
 /// The contract is derived entirely from the qualified component type and
 /// retained node environment. It requires trajectory execution and joint-goal
-/// planning, and includes pose/Cartesian planning only when the target
-/// declares those exact capabilities. The returned Program Binding is an
-/// ordinary content-addressed binding; callers must register it with the same
-/// physical execution engine rather than inventing a separate direct-control
-/// runtime or borrowing a scenario Program Binding.
+/// planning and retains every other qualified capability declared by the same
+/// physical target. The complete target closure lets lifecycle composition
+/// project one exact representative per selected control binding while all of
+/// those representatives remain registered with the same physical execution
+/// engine. The returned Program Binding is an ordinary content-addressed
+/// binding; callers must not invent a separate direct-control runtime or
+/// borrow a scenario Program Binding.
 [[nodiscard]] std::shared_ptr<const ProgramBinding>
 compile_direct_control_motion_program_binding(
     const core::ControllableComponentId& controllable_component_id,
@@ -73,9 +75,9 @@ compile_direct_control_motion_program_binding(
 /// retained command target.
 ///
 /// The binding uses the target's qualified command schema and complete
-/// model/resource/control closure. It is an ordinary Program Binding that may
-/// alias an existing physical gripper engine only after exact physical
-/// equality is verified.
+/// model/resource/control capability closure. It is an ordinary Program
+/// Binding whose control-binding representatives may share an existing
+/// physical gripper engine only after exact owner equality is verified.
 [[nodiscard]] std::shared_ptr<const ProgramBinding>
 compile_direct_control_gripper_program_binding(
     const core::ControllableComponentId& controllable_component_id,
