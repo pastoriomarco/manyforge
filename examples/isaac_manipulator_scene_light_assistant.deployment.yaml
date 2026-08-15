@@ -1243,7 +1243,7 @@
     ]
   },
   "deployment_artifact_id": "isaac_manipulator_scene_light_assistant",
-  "deployment_revision": "sha256:db4288e04a673730643cabd8e25266cd967f588255b8acce03429e29b7e3b65f",
+  "deployment_revision": "sha256:03458895795033dbc4a2d4539d86bdd7d8364a462423899dff202e8b3df8eddb",
   "description": "Retained Isaac UR10e light-scene deployment with the ROS 2 control execution product and the finite assistant scene-authoring overlay; simulator mutation remains operator-approved.",
   "desired_control_configurations": [
     {
@@ -2092,13 +2092,13 @@
           "orientation_xyzw": [
             0,
             0,
-            0,
-            1
+            -0.7071067690846544,
+            0.7071067932884405
           ],
           "position_m": [
-            0,
-            0,
-            0
+            -0.21814000606536865,
+            -0.571590006351471,
+            0.12999999523162842
           ]
         },
         "runtime_unit_ids": [

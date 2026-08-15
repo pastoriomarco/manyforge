@@ -58,7 +58,7 @@
         "tool": "isaac_ur10e_assistant_robot"
       },
       "deployment_artifact_id": "isaac_manipulator_scene_light_assistant",
-      "deployment_revision": "sha256:db4288e04a673730643cabd8e25266cd967f588255b8acce03429e29b7e3b65f",
+      "deployment_revision": "sha256:03458895795033dbc4a2d4539d86bdd7d8364a462423899dff202e8b3df8eddb",
       "deployment_source": "examples/isaac_manipulator_scene_light_assistant.deployment.yaml",
       "program_id": "isaac_manipulator_scene_light",
       "program_revision": "sha256:85e8b2bae0a338e652e6b59c408a55511bb4162d0a82020ccf75b8187cef21af",
@@ -84,7 +84,7 @@
         "tool": "isaac_ur10e_light_robot"
       },
       "deployment_artifact_id": "isaac_manipulator_scene_light_ros2_control",
-      "deployment_revision": "sha256:5117145b90ca04fc458c0ad39a5ef6d87ee8feff30e1ccf6a3cdb06a761e143f",
+      "deployment_revision": "sha256:1e6535cb4e1226c8b2c509f5b1571286c4d06504dedba0dd8d0e9af04731a35f",
       "deployment_source": "examples/isaac_manipulator_scene_light_ros2_control.deployment.yaml",
       "program_id": "isaac_manipulator_scene_light",
       "program_revision": "sha256:85e8b2bae0a338e652e6b59c408a55511bb4162d0a82020ccf75b8187cef21af",
@@ -110,7 +110,7 @@
         "tool": "isaac_ur10e_collision_robot"
       },
       "deployment_artifact_id": "isaac_manipulator_scene_light_ros2_control_collision",
-      "deployment_revision": "sha256:3e78b462bed1bfac4e41f07e92c5df21cb52726310e22d92ac3aae798768bfd1",
+      "deployment_revision": "sha256:6f045026a3a90cf883e5038552983882de86ffaf8c2263239f3c6d68a537cde9",
       "deployment_source": "examples/isaac_manipulator_scene_light_ros2_control_collision.deployment.yaml",
       "program_id": "isaac_manipulator_scene_light_collision",
       "program_revision": "sha256:47eae98a1a3c12c1d4567a9e264ef8198331b9169861a18b5a20ddee30a061e3",
