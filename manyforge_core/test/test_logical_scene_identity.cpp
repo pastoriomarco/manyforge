@@ -294,6 +294,40 @@ TEST(LogicalSceneIdentity, SceneHashCoversPortableContent) {
   });
 }
 
+TEST(LogicalSceneIdentity,
+     SceneObjectCollisionIdentitySeparatesSamplesFromCollisionSemantics) {
+  const auto snapshot = RichSnapshot();
+  const auto& object = snapshot.objects.front();
+  const auto identity =
+      ComputeSceneObjectCollisionIdentity(object, snapshot.cell_id);
+
+  auto changed = object;
+  auto& fixed =
+      std::get<CellFixedSceneObjectPlacementDTO>(changed.placement);
+  fixed.pose_in_cell.position_m.x_m += 0.5;
+  changed.provider_evidence->provider_source_sequence += 1U;
+  changed.provider_evidence->received_at_ns += 100;
+  changed.provider_evidence->source_timestamp_ns = 1234;
+  EXPECT_EQ(ComputeSceneObjectCollisionIdentity(changed, snapshot.cell_id),
+            identity);
+
+  changed = object;
+  std::get<SphereShapeDTO>(changed.collision_shapes.front()).radius_m += 0.01;
+  EXPECT_NE(ComputeSceneObjectCollisionIdentity(changed, snapshot.cell_id),
+            identity);
+
+  changed = object;
+  changed.provider_evidence->provider_source_epoch = "epoch-b";
+  EXPECT_NE(ComputeSceneObjectCollisionIdentity(changed, snapshot.cell_id),
+            identity);
+
+  changed = object;
+  changed.support_contacts = {
+      SupportContactDTO{.support_object_id = "object-b"}};
+  EXPECT_NE(ComputeSceneObjectCollisionIdentity(changed, snapshot.cell_id),
+            identity);
+}
+
 TEST(LogicalSceneIdentity, SceneHashExcludesLineageAndOwnerCounters) {
   const auto baseline = RichSnapshot();
   const auto digest = ComputeLogicalSceneContentHash(baseline);

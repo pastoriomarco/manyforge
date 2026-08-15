@@ -706,7 +706,9 @@ RetainedCollisionWorldProjector::project_live_objects(
       }
     }
     live.object_revision_token =
-        logical_scene.revision.content_hash.value() + "/" + live.object_id;
+        core::logical_scene_identity::ComputeSceneObjectCollisionIdentity(
+            object, logical_scene.cell_id)
+            .value();
     if (const auto* fixed =
             std::get_if<core::CellFixedSceneObjectPlacementDTO>(
                 &object.placement)) {

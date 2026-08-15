@@ -23,6 +23,8 @@ using manyforge::content_identity::CanonicalValueError;
 
 constexpr std::uint64_t kMaxSafeIntegral = 9007199254740991ULL;
 constexpr std::int64_t kMinSafeIntegral = -9007199254740991LL;
+constexpr std::string_view kSceneObjectCollisionIdentityDomain =
+    "scene-object-collision-content";
 
 [[noreturn]] void Fail(std::string message) {
   throw LogicalSceneIdentityError(std::move(message));
@@ -808,6 +810,35 @@ CarriedObjectAttachmentRevision ComputeCarriedObjectAttachmentRevision(
   return TranslateCodecErrors<CarriedObjectAttachmentRevision>([&] {
     return AttachmentRevision(normalized_attachment,
                               "carried_object_attachment");
+  });
+}
+
+ContentDigest ComputeSceneObjectCollisionIdentity(
+    const SceneObjectSnapshotDTO& normalized_object,
+    const CellId& snapshot_cell) {
+  return TranslateCodecErrors<ContentDigest>([&] {
+    // Validate the complete supplied row before projecting its deliberately
+    // stable non-pose identity. This keeps unsafe sample counters and poses
+    // from being silently normalized into an otherwise valid token.
+    (void)SceneObject(normalized_object, "scene_object", snapshot_cell);
+
+    auto identity_object = normalized_object;
+    if (auto* fixed = std::get_if<CellFixedSceneObjectPlacementDTO>(
+            &identity_object.placement)) {
+      fixed->pose_in_cell = {
+          {0.0, 0.0, 0.0},
+          {0.0, 0.0, 0.0, 1.0},
+      };
+    }
+    if (identity_object.provider_evidence.has_value()) {
+      auto& evidence = *identity_object.provider_evidence;
+      evidence.provider_source_sequence = 0U;
+      evidence.received_at_ns = 0;
+      evidence.source_timestamp_ns.reset();
+    }
+    return ContentDigest(manyforge::content_identity::framed_sha256(
+        kSceneObjectCollisionIdentityDomain, kLogicalSceneApiVersion,
+        SceneObject(identity_object, "scene_object", snapshot_cell)));
   });
 }
 

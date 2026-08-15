@@ -26,6 +26,15 @@ class LogicalSceneIdentityError : public std::invalid_argument {
 ComputeCarriedObjectAttachmentRevision(
     const CarriedObjectAttachmentDTO& normalized_attachment);
 
+/// Computes one object's non-pose collision identity. Provider sample
+/// sequence/timestamps and a cell-fixed pose are deliberately excluded so a
+/// live observation can be checked by the scene-snapshot lease's explicit
+/// freshness and pose-drift rules. Geometry, support/attachment semantics,
+/// provider lineage, and freshness policy remain covered.
+[[nodiscard]] ContentDigest ComputeSceneObjectCollisionIdentity(
+    const SceneObjectSnapshotDTO& normalized_object,
+    const CellId& snapshot_cell);
+
 /// Computes pure logical-scene content identity. SceneRevision and the
 /// transaction/topology/policy counters are deliberately excluded.
 [[nodiscard]] ContentDigest ComputeLogicalSceneContentHash(
