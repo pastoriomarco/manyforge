@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import base64
 from copy import deepcopy
 from hashlib import sha256
 from pathlib import Path
@@ -18,6 +19,7 @@ from manyforge_behavior.assistant_program_port import (
     ProgramAssistantPortError,
     ProgramModelRequest,
     ProgramModelResponse,
+    ProgramSnapshotSourceError,
 )
 from manyforge_behavior.catalog import NodeCatalog
 from manyforge_behavior.nodes.selection import (
@@ -42,6 +44,7 @@ _DIGEST_B = "sha256:" + "b" * 64
 _DIGEST_C = "sha256:" + "c" * 64
 _DIGEST_D = "sha256:" + "d" * 64
 _DIGEST_E = "sha256:" + "e" * 64
+_JPEG = b"\xff\xd8\xff\xe0manyforge-snapshot"
 
 
 def _catalog() -> NodeCatalog:
@@ -321,6 +324,32 @@ class _LateModelTransport(_ModelTransport):
         self.started.set()
         assert self.release.wait(timeout=1.0)
         return self.responses.pop(0)
+
+
+class _SnapshotSource:
+    def __init__(self, *, failure: ProgramSnapshotSourceError | None = None) -> None:
+        self.failure = failure
+        self.requests: list[dict[str, Any]] = []
+
+    def capture_snapshot(self, **parameters: Any) -> Mapping[str, Any]:
+        self.requests.append(dict(parameters))
+        if self.failure is not None:
+            raise self.failure
+        return {
+            "data_url": "data:image/jpeg;base64,"
+            + base64.b64encode(_JPEG).decode("ascii"),
+            "kind": "snapshot_image",
+            "media_type": "image/jpeg",
+            "source": {
+                "height": parameters["height"],
+                "image_sha256": "sha256:" + sha256(_JPEG).hexdigest(),
+                "schema_version": "manyforge.program_snapshot_source.v1",
+                "viewer_generation": 19,
+                "viewer_owner_epoch": "headless.epoch.1",
+                "width": parameters["width"],
+            },
+            "transport": "inline_data_url",
+        }
 
 
 class _AuditSink:
@@ -612,7 +641,82 @@ def test_query_program_requires_a_durable_model_attempt_sink() -> None:
         port.close()
 
 
-def test_snapshot_image_program_query_is_typed_unavailable_until_i9() -> None:
+def test_snapshot_image_program_query_carries_owner_attributed_inline_image() -> None:
+    program = _program("vision_guided_pose_pick.program.yaml")
+    query = _node(program, "infer_grasp_pose")
+    pose = {
+        "frame_ref": {
+            "kind": "target_frame",
+            "target_role": "arm",
+            "frame_role": "base",
+        },
+        "position_m": [0.4, -0.14, 0.2],
+        "orientation": {"xyzw": [0.0, 0.0, 0.0, 1.0]},
+    }
+    transport = _ModelTransport(
+        [
+            ProgramModelResponse(
+                text=json.dumps(
+                    {
+                        "approach_pose": pose,
+                        "confidence": 0.95,
+                        "grasp_pose": {
+                            **pose,
+                            "position_m": [0.4, -0.14, 0.05],
+                        },
+                        "reason": "fixture grasp",
+                        "selected_object_id": "left_part",
+                    }
+                )
+            )
+        ]
+    )
+    snapshot = _SnapshotSource()
+    audit = _AuditSink()
+    port = ProgramAssistantPort(
+        transport,
+        HeadlessProgramSceneSource(_SceneTransport()),
+        audit_sink=audit,
+        snapshot_source=snapshot,
+    )
+    try:
+        port.bind(
+            _context(
+                program,
+                assistant_projection=_vision_assistant_projection(
+                    "infer_grasp_pose_v1"
+                ),
+            )
+        )
+        started = port.start(
+            "assistant.query_model",
+            _identity("snapshot-image"),
+            OwnerNodeInputs(parameters=query.parameters),
+        )
+        terminal = _wait_terminal(port, started.task_id)
+
+        assert terminal.state is OwnerTaskState.SUCCEEDED
+        assert terminal.output["selected_object_id"] == "left_part"
+        assert terminal.metadata["snapshot_source"] == {
+            "height": 480,
+            "image_sha256": "sha256:" + sha256(_JPEG).hexdigest(),
+            "schema_version": "manyforge.program_snapshot_source.v1",
+            "viewer_generation": 19,
+            "viewer_owner_epoch": "headless.epoch.1",
+            "width": 640,
+        }
+        assert snapshot.requests[0]["transport"] == "inline_data_url"
+        assert 0.0 < snapshot.requests[0]["timeout_s"] <= 90.0
+        request = transport.requests[0]
+        assert request.attachment is not None
+        assert request.attachment["data_url"].startswith("data:image/jpeg;base64,")
+        assert len(audit.records) == 1
+        assert audit.records[0]["attachment_digest"].startswith("sha256:")
+    finally:
+        port.close()
+
+
+def test_snapshot_image_program_query_fails_typed_without_a_snapshot_source() -> None:
     program = _program("vision_guided_pose_pick.program.yaml")
     query = _node(program, "infer_grasp_pose")
     transport = _ModelTransport()
@@ -633,17 +737,55 @@ def test_snapshot_image_program_query_is_typed_unavailable_until_i9() -> None:
         )
         started = port.start(
             "assistant.query_model",
-            _identity("snapshot-image"),
+            _identity("snapshot-image-missing"),
             OwnerNodeInputs(parameters=query.parameters),
         )
         terminal = _wait_terminal(port, started.task_id)
 
         assert terminal.state is OwnerTaskState.FAILED
-        assert terminal.reason_code == (
-            "model_snapshot_image_unavailable_until_i9"
+        assert terminal.reason_code == "model_snapshot_image_source_unavailable"
+        assert terminal.metadata["authored_failure_policy"] == "pause_for_operator"
+        assert transport.requests == []
+        assert audit.records == []
+    finally:
+        port.close()
+
+
+def test_snapshot_source_failure_stays_typed_and_never_calls_the_model() -> None:
+    program = _program("vision_guided_pose_pick.program.yaml")
+    query = _node(program, "infer_grasp_pose")
+    transport = _ModelTransport()
+    audit = _AuditSink()
+    source = _SnapshotSource(
+        failure=ProgramSnapshotSourceError(
+            "model_snapshot_observer_unavailable",
+            "no generation-matched viewer snapshot is available",
         )
-        assert "authored_failure_policy" not in terminal.metadata
-        assert "authored_failure_policy_parameter" not in terminal.metadata
+    )
+    port = ProgramAssistantPort(
+        transport,
+        HeadlessProgramSceneSource(_SceneTransport()),
+        audit_sink=audit,
+        snapshot_source=source,
+    )
+    try:
+        port.bind(
+            _context(
+                program,
+                assistant_projection=_vision_assistant_projection(
+                    "infer_grasp_pose_v1"
+                ),
+            )
+        )
+        started = port.start(
+            "assistant.query_model",
+            _identity("snapshot-observer-missing"),
+            OwnerNodeInputs(parameters=query.parameters),
+        )
+        terminal = _wait_terminal(port, started.task_id)
+
+        assert terminal.state is OwnerTaskState.FAILED
+        assert terminal.reason_code == "model_snapshot_observer_unavailable"
         assert transport.requests == []
         assert audit.records == []
     finally:

@@ -14,6 +14,7 @@ from manyforge_behavior.assistant_program_port import (
     HeadlessProgramSceneSource,
     ProgramAssistantPort,
     ProgramModelTransport,
+    ProgramSnapshotSource,
 )
 from manyforge_behavior.cclc_program_port import CCLCProgramTaskPort
 from manyforge_behavior.executable_node_resolver import (
@@ -131,10 +132,17 @@ class ProgramRuntime:
         *,
         headless_client: HeadlessHttpClient | None = None,
         model_transport: ProgramModelTransport | None = None,
+        snapshot_source: ProgramSnapshotSource | None = None,
         simulation_control: OwnerTaskPort | None = None,
     ) -> None:
         if not isinstance(config, ProgramRunnerConfig):
             raise TypeError("Program runtime requires one ProgramRunnerConfig")
+        if snapshot_source is not None and not callable(
+            getattr(snapshot_source, "capture_snapshot", None)
+        ):
+            raise TypeError("snapshot_source must capture bounded snapshots")
+        if snapshot_source is not None and model_transport is None:
+            raise ValueError("snapshot_source requires a Program model transport")
         self.config = config
         self.owner_id = config.owner_id
         self.owner_epoch = config.owner_epoch or f"program-runner-{uuid4().hex}"
@@ -144,6 +152,7 @@ class ProgramRuntime:
             timeout_seconds=config.headless_timeout_seconds,
         )
         self._model_transport = model_transport
+        self._snapshot_source = snapshot_source
         if simulation_control is not None and any(
             not callable(getattr(simulation_control, method, None))
             for method in (
@@ -175,6 +184,7 @@ class ProgramRuntime:
                 model_transport,
                 HeadlessProgramSceneSource(self._headless),
                 audit_sink=HeadlessProgramModelAuditSink(self._headless),
+                snapshot_source=snapshot_source,
             )
         )
         context_members = [self._native, self._scene, self._cclc]
@@ -339,6 +349,7 @@ class ProgramRuntime:
             "started": self._started,
             "closed": self._closed,
             "assistant_model_transport_available": self._assistant is not None,
+            "assistant_snapshot_source_available": self._snapshot_source is not None,
             "simulation_control_available": self._simulation_control is not None,
         }
 
@@ -504,6 +515,13 @@ class ProgramRuntime:
                 self._assistant.close()
             except Exception as error:
                 errors.append(error)
+        if self._snapshot_source is not None:
+            close = getattr(self._snapshot_source, "close", None)
+            if callable(close):
+                try:
+                    close()
+                except Exception as error:
+                    errors.append(error)
         if self._simulation_control is not None:
             try:
                 self._simulation_control.close()  # type: ignore[attr-defined]

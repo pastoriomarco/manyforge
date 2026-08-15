@@ -15,6 +15,7 @@ from manyforge_headless_api.program_model_transport import (
 
 from .app import create_app
 from .runtime import ProgramRunnerConfig, ProgramRunnerError, ProgramRuntime
+from .snapshot_source import ComposerProgramSnapshotSource
 
 
 def _parser() -> argparse.ArgumentParser:
@@ -27,6 +28,7 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--tick-interval-ms", type=float, default=10.0)
     parser.add_argument("--tick-workers", type=int, default=4)
     parser.add_argument("--model-endpoint-config")
+    parser.add_argument("--snapshot-url")
     parser.add_argument("--simulation-control-config")
     return parser
 
@@ -34,6 +36,8 @@ def _parser() -> argparse.ArgumentParser:
 def main(argv: Sequence[str] | None = None) -> int:
     args = _parser().parse_args(argv)
     runtime: ProgramRuntime | None = None
+    model_transport = None
+    snapshot_source = None
     simulation_control = None
     try:
         config = ProgramRunnerConfig(
@@ -50,6 +54,10 @@ def main(argv: Sequence[str] | None = None) -> int:
                 load_program_model_endpoint_configs(args.model_endpoint_config)
             )
         )
+        if args.snapshot_url is not None:
+            if model_transport is None:
+                raise ValueError("--snapshot-url requires --model-endpoint-config")
+            snapshot_source = ComposerProgramSnapshotSource(args.snapshot_url)
         if args.simulation_control_config is not None:
             try:
                 from manyforge_ros.program_simulation_port import (
@@ -70,6 +78,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         runtime = ProgramRuntime(
             config,
             model_transport=model_transport,
+            snapshot_source=snapshot_source,
             simulation_control=simulation_control,
         )
         uvicorn.run(
@@ -83,8 +92,11 @@ def main(argv: Sequence[str] | None = None) -> int:
         print(f"{code}: {error}", file=sys.stderr)
         return 69 if "unavailable" in code else 65
     finally:
-        if runtime is None and simulation_control is not None:
-            simulation_control.close()
+        if runtime is None:
+            for resource in (snapshot_source, simulation_control, model_transport):
+                close = getattr(resource, "close", None)
+                if callable(close):
+                    close()
 
 
 __all__ = ["main"]

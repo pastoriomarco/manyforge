@@ -34,7 +34,7 @@ ALARM_CATALOG = Path(
 )
 MODEL_ID = "qwen3.6-35b-a3b-nvfp4-tq-mtp-manyforge"
 POSE_MODEL_ID = "cosmos-reason2-8b"
-EXPECTED_I9_GATE = "model_snapshot_image_unavailable_until_i9"
+EXPECTED_SNAPSHOT_SOURCE_GATE = "model_snapshot_image_source_unavailable"
 
 SCENARIOS = (
     (
@@ -474,7 +474,7 @@ def qualify_scenario(
                 )
             if (
                 expected_state == "failed"
-                and snapshot["reason_code"] != EXPECTED_I9_GATE
+                and snapshot["reason_code"] != EXPECTED_SNAPSHOT_SOURCE_GATE
             ):
                 raise RuntimeError(
                     f"{scenario_id} failed for the wrong reason: {snapshot}"

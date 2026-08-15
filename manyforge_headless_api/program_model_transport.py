@@ -16,9 +16,11 @@ from urllib.parse import urlsplit
 import httpx
 
 from manyforge_behavior.assistant_program_port import (
+    ProgramAssistantPortError,
     ProgramModelRequest,
     ProgramModelResponse,
     ProgramModelTransportError,
+    validate_program_snapshot_attachment,
 )
 from manyforge_headless_api.native import HeadlessCorePort
 
@@ -462,42 +464,60 @@ class OpenAICompatibleProgramModelTransport:
 
     @staticmethod
     def _request_body(request: ProgramModelRequest) -> dict[str, Any]:
-        content = request.prompt
+        content: str | list[dict[str, Any]] = request.prompt
         if request.attachment is not None:
-            if request.attachment.get("kind") != "state_json":
+            attachment_kind = request.attachment.get("kind")
+            if attachment_kind == "snapshot_image":
+                try:
+                    attachment = validate_program_snapshot_attachment(
+                        request.attachment
+                    )
+                except ProgramAssistantPortError as exc:
+                    raise ProgramModelTransportError(
+                        "site transport received an invalid snapshot attachment"
+                    ) from exc
+                content = [
+                    {"type": "text", "text": request.prompt},
+                    {
+                        "type": "image_url",
+                        "image_url": {"url": attachment["data_url"]},
+                    },
+                ]
+            elif attachment_kind != "state_json":
                 raise ProgramModelTransportError(
                     "site transport received an unsupported attachment"
                 )
-            state_json = request.attachment.get("state_json")
-            if isinstance(state_json, str):
-                try:
-                    state_value = _strict_object(
-                        state_json.encode("utf-8"),
-                        label="state attachment",
-                    )
-                except UnicodeError as exc:
-                    raise ProgramModelTransportError(
-                        "state attachment is not UTF-8 JSON"
-                    ) from exc
-            elif isinstance(state_json, Mapping):
-                state_value = dict(state_json)
             else:
-                raise ProgramModelTransportError(
-                    "state attachment root must be an object"
-                )
-            try:
-                encoded = json.dumps(
-                    state_value,
-                    allow_nan=False,
-                    ensure_ascii=False,
-                    separators=(",", ":"),
-                    sort_keys=True,
-                )
-            except (RecursionError, TypeError, ValueError) as exc:
-                raise ProgramModelTransportError(
-                    "state attachment is not finite JSON"
-                ) from exc
-            content = f"{content}\n\nAttached state JSON:\n{encoded}"
+                state_json = request.attachment.get("state_json")
+                if isinstance(state_json, str):
+                    try:
+                        state_value = _strict_object(
+                            state_json.encode("utf-8"),
+                            label="state attachment",
+                        )
+                    except UnicodeError as exc:
+                        raise ProgramModelTransportError(
+                            "state attachment is not UTF-8 JSON"
+                        ) from exc
+                elif isinstance(state_json, Mapping):
+                    state_value = dict(state_json)
+                else:
+                    raise ProgramModelTransportError(
+                        "state attachment root must be an object"
+                    )
+                try:
+                    encoded = json.dumps(
+                        state_value,
+                        allow_nan=False,
+                        ensure_ascii=False,
+                        separators=(",", ":"),
+                        sort_keys=True,
+                    )
+                except (RecursionError, TypeError, ValueError) as exc:
+                    raise ProgramModelTransportError(
+                        "state attachment is not finite JSON"
+                    ) from exc
+                content = f"{content}\n\nAttached state JSON:\n{encoded}"
         body: dict[str, Any] = {
             "model": request.model_id,
             "messages": [{"role": "user", "content": content}],

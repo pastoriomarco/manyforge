@@ -72,6 +72,7 @@ class FakeRuntime:
             "started": self.started,
             "closed": self.closed,
             "assistant_model_transport_available": False,
+            "assistant_snapshot_source_available": False,
             "simulation_control_available": False,
         }
 

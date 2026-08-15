@@ -33,6 +33,7 @@ class _Headless:
         "cclc_component",
         "cclc_route_templates",
         "component_lifecycle_status",
+        "commit_program_model_attempt",
         "execute",
         "execution_status",
         "manager_graph",
@@ -211,6 +212,31 @@ class _SimulationControl:
         self.closed += 1
 
 
+class _ModelTransport:
+    def __init__(self) -> None:
+        self.closed = 0
+
+    def validate_endpoint(self, **_kwargs: object) -> None:
+        pass
+
+    def complete(self, *_args: object, **_kwargs: object) -> None:
+        raise AssertionError("unexpected model request")
+
+    def close(self) -> None:
+        self.closed += 1
+
+
+class _SnapshotSource:
+    def __init__(self) -> None:
+        self.closed = 0
+
+    def capture_snapshot(self, **_kwargs: object) -> None:
+        raise AssertionError("unexpected snapshot request")
+
+    def close(self) -> None:
+        self.closed += 1
+
+
 def _start_request(*, request_id: str = "request.start.1") -> ProgramRunStartRequest:
     return ProgramRunStartRequest.model_validate(
         {
@@ -360,3 +386,22 @@ def test_runtime_injects_and_closes_the_focused_simulation_owner() -> None:
     runtime.shutdown()
     runtime.shutdown()
     assert simulation.closed == 1
+
+
+def test_runtime_injects_and_closes_the_program_snapshot_source() -> None:
+    headless = _Headless()
+    model = _ModelTransport()
+    snapshot = _SnapshotSource()
+    runtime = ProgramRuntime(
+        ProgramRunnerConfig(headless_url="http://headless.test"),
+        headless_client=headless,  # type: ignore[arg-type]
+        model_transport=model,  # type: ignore[arg-type]
+        snapshot_source=snapshot,  # type: ignore[arg-type]
+    )
+
+    assert runtime._assistant is not None  # noqa: SLF001
+    assert runtime.health()["assistant_snapshot_source_available"] is True
+    runtime.shutdown()
+    runtime.shutdown()
+    assert snapshot.closed == 1
+    assert model.closed == 1

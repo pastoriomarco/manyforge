@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+import base64
+from dataclasses import replace
+from hashlib import sha256
 import json
 from pathlib import Path
 from threading import Event
@@ -23,6 +26,7 @@ from manyforge_headless_api.program_model_transport import (
 
 
 _DIGEST = "sha256:" + "a" * 64
+_JPEG = b"\xff\xd8\xff\xe0manyforge-model-snapshot"
 
 
 def _config() -> ProgramModelEndpointConfig:
@@ -63,6 +67,24 @@ def _request(*, tool: bool = False) -> ProgramModelRequest:
             "state_json": '{"objects":[]}',
         },
     )
+
+
+def _snapshot_attachment() -> dict[str, object]:
+    return {
+        "data_url": "data:image/jpeg;base64,"
+        + base64.b64encode(_JPEG).decode("ascii"),
+        "kind": "snapshot_image",
+        "media_type": "image/jpeg",
+        "source": {
+            "height": 480,
+            "image_sha256": "sha256:" + sha256(_JPEG).hexdigest(),
+            "schema_version": "manyforge.program_snapshot_source.v1",
+            "viewer_generation": 19,
+            "viewer_owner_epoch": "headless.epoch.1",
+            "width": 640,
+        },
+        "transport": "inline_data_url",
+    }
 
 
 def test_json_request_uses_explicit_site_endpoint_and_bounded_contract() -> None:
@@ -139,6 +161,42 @@ def test_tool_call_response_is_transport_neutral() -> None:
 
     assert response.tool_name == "return_selection"
     assert response.tool_arguments == '{"selected_object_id":"part"}'
+
+
+def test_snapshot_request_uses_standard_multimodal_content_parts() -> None:
+    captured: list[dict[str, object]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured.append(json.loads(request.read()))
+        return httpx.Response(
+            200,
+            json={
+                "model": "model-a",
+                "choices": [{"message": {"content": '{"visible":true}'}}],
+            },
+        )
+
+    transport = OpenAICompatibleProgramModelTransport(
+        (_config(),),
+        client=httpx.Client(transport=httpx.MockTransport(handler)),
+    )
+    request = replace(_request(), attachment=_snapshot_attachment())
+
+    assert transport.complete(request, Event()).text == '{"visible":true}'
+    assert captured[0]["messages"] == [
+        {
+            "role": "user",
+            "content": [
+                {"type": "text", "text": "Select one object"},
+                {
+                    "type": "image_url",
+                    "image_url": {
+                        "url": _snapshot_attachment()["data_url"],
+                    },
+                },
+            ],
+        }
+    ]
 
 
 def test_site_allowlist_and_pre_dispatch_cancellation_fail_closed() -> None:

@@ -9,6 +9,8 @@ endpoint/template request.
 
 from __future__ import annotations
 
+import base64
+import binascii
 from collections.abc import Mapping, Sequence
 from concurrent.futures import Future, ThreadPoolExecutor
 from copy import deepcopy
@@ -58,6 +60,7 @@ _MAX_MODEL_VERSION_BYTES: Final = 4_096
 _MAX_MODEL_USAGE_BYTES: Final = 64 * 1024
 _MAX_MODEL_AUDIT_RECORD_BYTES: Final = 256 * 1024
 _MAX_MODEL_AUDIT_CANDIDATE_BYTES: Final = _MAX_MODEL_TEXT_BYTES + 512 * 1024
+_MAX_INLINE_IMAGE_BYTES: Final = 2 * 1024 * 1024
 _MAX_SCENE_POSE_QUERY_RESOURCES: Final = 128
 _MAX_SAFE_INTEGER: Final = 9_007_199_254_740_991
 _PARSE_RETRY_SUFFIX: Final = (
@@ -123,6 +126,20 @@ class ProgramAssistantPortError(RuntimeError):
 
 class ProgramModelTransportError(RuntimeError):
     """A bounded model transport failed before returning a valid response."""
+
+
+class ProgramSnapshotSourceError(RuntimeError):
+    """A snapshot source failed with one safe Program-facing reason."""
+
+    def __init__(self, reason_code: str, message: str) -> None:
+        if (
+            not isinstance(reason_code, str)
+            or not reason_code
+            or len(reason_code.encode("utf-8")) > 256
+        ):
+            raise ValueError("snapshot source reason code must be bounded text")
+        super().__init__(_bounded_nfc_text(str(message), maximum_bytes=4_096))
+        self.reason_code = reason_code
 
 
 @dataclass(frozen=True, slots=True)
@@ -201,19 +218,22 @@ class ProgramModelRequest:
                 )
             ),
         )
+        attachment = (
+            None
+            if self.attachment is None
+            else _bounded_json_copy(
+                self.attachment,
+                field="model attachment",
+            )
+        )
+        if isinstance(attachment, Mapping) and attachment.get("kind") == (
+            "snapshot_image"
+        ):
+            attachment = validate_program_snapshot_attachment(attachment)
         object.__setattr__(
             self,
             "attachment",
-            (
-                None
-                if self.attachment is None
-                else MappingProxyType(
-                    _bounded_json_copy(
-                        self.attachment,
-                        field="model attachment",
-                    )
-                )
-            ),
+            None if attachment is None else MappingProxyType(attachment),
         )
 
 
@@ -298,6 +318,21 @@ class ProgramModelTransport(Protocol):
         request: ProgramModelRequest,
         cancel_event: Event,
     ) -> ProgramModelResponse: ...
+
+
+class ProgramSnapshotSource(Protocol):
+    """Transport-neutral bounded source for one owner-attributed image."""
+
+    def capture_snapshot(
+        self,
+        *,
+        width: int,
+        height: int,
+        image_format: str,
+        transport: str,
+        timeout_s: float,
+        cancel_event: Event,
+    ) -> Mapping[str, Any]: ...
 
 
 class ProgramModelAuditSink(Protocol):
@@ -399,6 +434,91 @@ def _text(value: object, *, field: str, maximum_bytes: int = 512) -> str:
 def _exact(value: Mapping[str, Any], fields: set[str], *, path: str) -> None:
     if set(value) != fields:
         raise ProgramAssistantPortError(f"{path} has wrong fields")
+
+
+def validate_program_snapshot_attachment(
+    value: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Validate and copy one exact inline snapshot attachment."""
+
+    attachment = dict(_mapping(value, field="snapshot attachment"))
+    _exact(
+        attachment,
+        {"data_url", "kind", "media_type", "source", "transport"},
+        path="snapshot attachment",
+    )
+    media_type = attachment.get("media_type")
+    if (
+        attachment.get("kind") != "snapshot_image"
+        or attachment.get("transport") != "inline_data_url"
+        or media_type not in {"image/jpeg", "image/png"}
+    ):
+        raise ProgramAssistantPortError("snapshot attachment contract is invalid")
+    data_url = attachment.get("data_url")
+    prefix = f"data:{media_type};base64,"
+    if (
+        not isinstance(data_url, str)
+        or not data_url.startswith(prefix)
+        or len(data_url.encode("ascii", errors="ignore")) != len(data_url)
+        or len(data_url) > len(prefix) + 4 * ((_MAX_INLINE_IMAGE_BYTES + 2) // 3)
+    ):
+        raise ProgramAssistantPortError("snapshot data URL is invalid or oversized")
+    encoded_image = data_url[len(prefix) :]
+    try:
+        image = base64.b64decode(encoded_image, validate=True)
+    except (binascii.Error, ValueError) as exc:
+        raise ProgramAssistantPortError("snapshot data URL is not canonical base64") from exc
+    if (
+        not image
+        or len(image) > _MAX_INLINE_IMAGE_BYTES
+        or base64.b64encode(image).decode("ascii") != encoded_image
+        or (media_type == "image/jpeg" and not image.startswith(b"\xff\xd8\xff"))
+        or (
+            media_type == "image/png"
+            and not image.startswith(b"\x89PNG\r\n\x1a\n")
+        )
+    ):
+        raise ProgramAssistantPortError("snapshot image payload is invalid")
+    source = dict(_mapping(attachment.get("source"), field="snapshot source"))
+    _exact(
+        source,
+        {
+            "height",
+            "image_sha256",
+            "schema_version",
+            "viewer_generation",
+            "viewer_owner_epoch",
+            "width",
+        },
+        path="snapshot source",
+    )
+    owner_epoch = source.get("viewer_owner_epoch")
+    allowed = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789._:-"
+    if (
+        source.get("schema_version") != "manyforge.program_snapshot_source.v1"
+        or not isinstance(owner_epoch, str)
+        or not owner_epoch
+        or len(owner_epoch.encode("utf-8")) > 256
+        or owner_epoch[0]
+        not in "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
+        or any(character not in allowed for character in owner_epoch)
+        or type(source.get("viewer_generation")) is not int
+        or not 0 <= source["viewer_generation"] <= _MAX_SAFE_INTEGER
+        or type(source.get("width")) is not int
+        or not 64 <= source["width"] <= 1_920
+        or type(source.get("height")) is not int
+        or not 64 <= source["height"] <= 1_080
+        or source["image_sha256"]
+        != _DIGEST_PREFIX + sha256(image).hexdigest()
+    ):
+        raise ProgramAssistantPortError("snapshot source identity is invalid")
+    return {
+        "data_url": data_url,
+        "kind": "snapshot_image",
+        "media_type": media_type,
+        "source": source,
+        "transport": "inline_data_url",
+    }
 
 
 def _parse_assistant(value: Mapping[str, Any]) -> _AssistantContract:
@@ -1178,6 +1298,7 @@ class ProgramAssistantPort:
         scene_source: HeadlessProgramSceneSource,
         *,
         audit_sink: ProgramModelAuditSink | None = None,
+        snapshot_source: ProgramSnapshotSource | None = None,
         maximum_workers: int = 4,
         maximum_tasks: int = _MAX_TASKS,
         clock: Any = time.monotonic,
@@ -1192,6 +1313,10 @@ class ProgramAssistantPort:
             getattr(audit_sink, "commit", None)
         ):
             raise TypeError("audit_sink must commit durable model attempts")
+        if snapshot_source is not None and not callable(
+            getattr(snapshot_source, "capture_snapshot", None)
+        ):
+            raise TypeError("snapshot_source must capture bounded snapshots")
         if (
             type(maximum_workers) is not int
             or not 1 <= maximum_workers <= _MAX_WORKERS
@@ -1204,6 +1329,7 @@ class ProgramAssistantPort:
         self._model_transport = model_transport
         self._scene_source = scene_source
         self._audit_sink = audit_sink
+        self._snapshot_source = snapshot_source
         self._executor = ThreadPoolExecutor(
             max_workers=maximum_workers,
             thread_name_prefix="manyforge-program-model",
@@ -1334,7 +1460,7 @@ class ProgramAssistantPort:
         if parameters.get("image_source", "none") != "none":
             raise _TaskFailure(
                 "selection_image_source_unavailable",
-                "viewer snapshots return at I9; no image was requested from Composer",
+                "scene-selection context accepts authoritative scene data only",
             )
         candidate_ids = list(
             _sequence(
@@ -1424,6 +1550,9 @@ class ProgramAssistantPort:
         self,
         context: _BoundContext,
         inputs: OwnerNodeInputs,
+        *,
+        deadline_s: float,
+        cancel_event: Event,
     ) -> Mapping[str, Any] | None:
         kind = inputs.parameters.get("scene_attachment", "none")
         if kind == "none":
@@ -1434,10 +1563,54 @@ class ProgramAssistantPort:
                 "state_json": self._scene_source.state_json(context.capture),
             }
         if kind == "snapshot_image":
-            raise _TaskFailure(
-                "model_snapshot_image_unavailable_until_i9",
-                "viewer snapshot transport returns at I9",
-            )
+            if self._snapshot_source is None:
+                raise _TaskFailure(
+                    "model_snapshot_image_source_unavailable",
+                    "no Program snapshot source is configured",
+                )
+            if cancel_event.is_set():
+                raise _TaskFailure(
+                    "model_request_cancelled",
+                    "model request was cancelled",
+                )
+            remaining_s = deadline_s - self._clock()
+            if remaining_s <= 0.0:
+                raise _TaskFailure(
+                    "model_request_timeout",
+                    "model request timed out before snapshot capture",
+                )
+            try:
+                attachment = self._snapshot_source.capture_snapshot(
+                    width=inputs.parameters.get("scene_snapshot_width", 640),
+                    height=inputs.parameters.get("scene_snapshot_height", 480),
+                    image_format=inputs.parameters.get(
+                        "scene_snapshot_format", "jpeg"
+                    ),
+                    transport=inputs.parameters.get(
+                        "scene_snapshot_transport", "inline_data_url"
+                    ),
+                    timeout_s=remaining_s,
+                    cancel_event=cancel_event,
+                )
+            except ProgramSnapshotSourceError as exc:
+                raise _TaskFailure(exc.reason_code, str(exc)) from exc
+            except Exception as exc:
+                raise _TaskFailure(
+                    "model_snapshot_capture_failed",
+                    "Program snapshot capture failed",
+                ) from exc
+            if cancel_event.is_set():
+                raise _TaskFailure(
+                    "model_request_cancelled",
+                    "model request was cancelled",
+                )
+            try:
+                return validate_program_snapshot_attachment(attachment)
+            except ProgramAssistantPortError as exc:
+                raise _TaskFailure(
+                    "model_snapshot_capture_invalid",
+                    str(exc),
+                ) from exc
         raise ProgramAssistantPortError("model scene_attachment is invalid")
 
     def _parse_model_response(
@@ -1784,7 +1957,12 @@ class ProgramAssistantPort:
                 )
             except (ModelOutputValidationError, TypeError, ValueError) as exc:
                 raise _TaskFailure("model_output_contract_invalid", str(exc)) from exc
-        attachment = self._attachment(context, inputs)
+        attachment = self._attachment(
+            context,
+            inputs,
+            deadline_s=deadline_s,
+            cancel_event=cancel_event,
+        )
         timeout_s = deadline_s - started_at_s
         minimum_confidence = parameters.get("min_confidence", 0.0)
         confidence_declared = "confidence" in output_schema["properties"]
@@ -2010,6 +2188,8 @@ class ProgramAssistantPort:
                 attachment,
                 field="model attachment",
             )
+            if attachment.get("kind") == "snapshot_image":
+                metadata["snapshot_source"] = _thaw(attachment["source"])
         if audit["redact_argument_values"] is not True:
             metadata["template_variables"] = _thaw(raw_variables)
         if audit["store_full_prompts"] is True:
@@ -2027,12 +2207,6 @@ class ProgramAssistantPort:
         task: _Task,
         reason_code: str,
     ) -> Mapping[str, Any]:
-        # This is an architectural availability gate, not a model-runtime
-        # failure.  It must fail the pre-I9 run without converting the
-        # Program's historical pause-for-operator policy into a permanent
-        # condition-failure policy for all future model errors.
-        if reason_code == "model_snapshot_image_unavailable_until_i9":
-            return {}
         parameter: str | None = None
         if task.node_id == "assistant.query_model":
             parameter = (
@@ -2368,4 +2542,7 @@ __all__ = [
     "ProgramModelAuditSink",
     "ProgramModelTransport",
     "ProgramModelTransportError",
+    "ProgramSnapshotSource",
+    "ProgramSnapshotSourceError",
+    "validate_program_snapshot_attachment",
 ]
