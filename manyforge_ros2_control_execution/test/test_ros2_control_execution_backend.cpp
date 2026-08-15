@@ -4365,6 +4365,43 @@ TEST(Ros2ControlExecutionBackendTest,
 }
 
 TEST(Ros2ControlExecutionBackendTest,
+     AuthoredWriterSerializationKeepsDelayedSourceProvenance) {
+  auto sink = std::make_shared<RecordingExecutionStateSink>();
+  core::FakeClock clock;
+  clock.set(1'000);
+  core::ManualScheduler scheduler;
+  auto config = base_config();
+  config.execution_state_source_mode = "commanded_sim";
+  config.initial_joint_positions_rad = {0.0};
+  Ros2ControlExecutionBackend backend(
+      Ros2ControlExecutionBackend::TestingNoRosStartupTag{}, sink, "arm", clock,
+      scheduler, config);
+  backend.testing_set_running_state(true);
+
+  clock.set(2'000);
+  ASSERT_TRUE(backend.testing_publish_snapshot(core::ExecutionState::kExecuting,
+                                               {0.5}));
+  const auto token = backend.testing_begin_jtc_cancel_reference_authority();
+  ASSERT_NE(token, 0u);
+
+  // This reference was received before the preceding authored snapshot but
+  // reached the serialized publication lane afterwards. Its source time must
+  // remain intact while its local publication-receipt time reflects that
+  // serialization order.
+  clock.set(3'000);
+  ASSERT_TRUE(backend.testing_publish_jtc_cancel_reference(
+      {"joint_1"}, {0.25}, {0.0}, 1'500, token));
+
+  auto selected = backend.observed_robot_state_publication()->acquire(3'000);
+  ASSERT_TRUE(selected);
+  EXPECT_EQ(selected.source_timestamp_ns(), 1'500);
+  EXPECT_EQ(selected.received_timestamp_ns(), 3'000);
+  ASSERT_EQ(selected.positions_rad().size(), 1u);
+  EXPECT_DOUBLE_EQ(selected.positions_rad()[0], 0.25);
+  backend.testing_end_jtc_cancel_reference_authority(token);
+}
+
+TEST(Ros2ControlExecutionBackendTest,
      ObservedRos2NeverDelegatesAuthorityToJtcCommandReference) {
   auto sink = std::make_shared<RecordingExecutionStateSink>();
   core::FakeClock clock;

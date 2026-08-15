@@ -847,9 +847,9 @@ private:
                                const std::vector<double> &velocities,
                                std::int64_t source_timestamp_ns,
                                std::int64_t received_timestamp_ns) noexcept;
-  bool publish_authored_robot_state(
+  core::ObservedRobotStatePublishResult publish_authored_robot_state(
       std::span<const double> positions, std::span<const double> velocities,
-      std::int64_t timestamp_ns,
+      std::int64_t source_timestamp_ns,
       std::optional<std::uint64_t> expected_running_generation,
       bool invalidate_before_publish) noexcept;
   Ros2ControlExecutionBackend(

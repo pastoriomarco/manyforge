@@ -1168,22 +1168,27 @@ void Ros2ControlExecutionBackend::publish_observed_robot_state(
                              source_timestamp_ns, received_timestamp_ns);
 }
 
-bool Ros2ControlExecutionBackend::publish_authored_robot_state(
+core::ObservedRobotStatePublishResult
+Ros2ControlExecutionBackend::publish_authored_robot_state(
     std::span<const double> positions, std::span<const double> velocities,
-    std::int64_t timestamp_ns,
+    std::int64_t source_timestamp_ns,
     std::optional<std::uint64_t> expected_running_generation,
     bool invalidate_before_publish) noexcept {
-  if (!uses_authored_backend_state() ||
-      observed_state_publication_ == nullptr ||
-      positions.size() != config_.required_joints.size()) {
-    return false;
+  if (!uses_authored_backend_state()) {
+    return {false, false, false, 0, "authored_state_disabled"};
+  }
+  if (observed_state_publication_ == nullptr) {
+    return {false, false, false, 0, "publication_unavailable"};
+  }
+  if (positions.size() != config_.required_joints.size()) {
+    return {false, false, false, 0, "position_shape_mismatch"};
   }
 
   std::lock_guard<std::mutex> writer_lock(authored_state_publication_mutex_);
   if (expected_running_generation.has_value() &&
       running_generation_.load(std::memory_order_acquire) !=
           *expected_running_generation) {
-    return false;
+    return {false, false, false, 0, "running_generation_stale"};
   }
   auto authority_epoch =
       authored_state_authority_epoch_.load(std::memory_order_relaxed);
@@ -1198,12 +1203,18 @@ bool Ros2ControlExecutionBackend::publish_authored_robot_state(
   } else if ((authority_epoch & 1u) != 0u) {
     // A progress writer may update an already-valid active generation but may
     // never resurrect authority invalidated by a lifecycle/terminal boundary.
-    return false;
+    return {false, false, false, 0, "authored_authority_invalid"};
   }
 
   const auto source = is_commanded_sim_mode()
                           ? core::ObservedRobotStateSourceKind::kCommandedState
                           : core::ObservedRobotStateSourceKind::kPredictedState;
+  // Source time records when the writer produced or received the reference;
+  // receive time records when this single-writer lane actually serializes it.
+  // Capturing receive time under the writer lock prevents a delayed writer
+  // from being rejected merely because it sampled the clock before a newer
+  // writer acquired the lane.
+  const auto received_timestamp_ns = clock_.now();
   // Readers pin slots only while copying one bounded joint vector. A terminal
   // authority update gets a few bounded retries so transient slot pinning does
   // not leave the next plan on the previous command reference. The runtime
@@ -1211,31 +1222,32 @@ bool Ros2ControlExecutionBackend::publish_authored_robot_state(
   const int attempt_count = invalidate_before_publish ? 8 : 1;
   for (int attempt = 0; attempt < attempt_count; ++attempt) {
     const auto result = observed_state_publication_->publish(
-        source, config_.required_joints, positions, velocities, timestamp_ns,
-        timestamp_ns);
+        source, config_.required_joints, positions, velocities,
+        source_timestamp_ns, received_timestamp_ns);
     if (result.published) {
       if (expected_running_generation.has_value()) {
         authored_active_publications_total_.fetch_add(
             1, std::memory_order_relaxed);
         const auto previous = authored_active_last_publication_ns_.exchange(
-            timestamp_ns, std::memory_order_acq_rel);
-        if (previous > 0 && timestamp_ns >= previous) {
+            received_timestamp_ns, std::memory_order_acq_rel);
+        if (previous > 0 && received_timestamp_ns >= previous) {
           atomic_max(authored_active_interarrival_max_ns_,
-                     static_cast<std::uint64_t>(timestamp_ns - previous));
+                     static_cast<std::uint64_t>(received_timestamp_ns -
+                                                previous));
         }
       }
       if (invalidate_before_publish) {
         authored_state_authority_epoch_.store(authority_epoch + 1,
                                               std::memory_order_release);
       }
-      return true;
+      return result;
     }
     if (std::string_view(result.reason) != "publication_slots_exhausted") {
-      return false;
+      return result;
     }
     std::this_thread::yield();
   }
-  return false;
+  return {false, false, false, 0, "publication_slots_exhausted"};
 }
 
 void Ros2ControlExecutionBackend::initialize_ros() {
@@ -1826,10 +1838,10 @@ bool Ros2ControlExecutionBackend::publish_jtc_cancel_reference(
       expected_token) {
     return reject();
   }
-  const bool published = publish_authored_robot_state(
+  const auto publication = publish_authored_robot_state(
       ordered_positions, ordered_velocities, received_timestamp_ns,
       std::nullopt, /*invalidate_before_publish=*/false);
-  if (!published) {
+  if (!publication.published) {
     return reject();
   }
   jtc_cancel_reference_publications_total_.fetch_add(1,
@@ -3496,20 +3508,27 @@ bool Ros2ControlExecutionBackend::publish_snapshot(
                    ? std::span<const double>(authored_at_rest_velocities_)
                    : std::span<const double>{});
     const bool authority_boundary = !expected_running_generation.has_value();
-    const bool authored_published = publish_authored_robot_state(
+    const auto authored_publication = publish_authored_robot_state(
         joint_positions, velocities, now_ns, expected_running_generation,
         authority_boundary);
-    if (!authored_published &&
+    if (!authored_publication.published &&
         (!expected_running_generation.has_value() ||
          running_generation_.load(std::memory_order_acquire) ==
              *expected_running_generation) &&
         node_) {
+      const auto metrics = observed_state_publication_->metrics();
       RCLCPP_ERROR_THROTTLE(
           node_->get_logger(), *node_->get_clock(), 5000,
           "Failed to publish backend-authored robot state; planning authority "
-          "remains invalid until an authoritative replacement is published");
+          "remains invalid until an authoritative replacement is published "
+          "(reason=%s rejected_total=%llu writer_busy_total=%llu "
+          "slot_exhausted_total=%llu)",
+          authored_publication.reason,
+          static_cast<unsigned long long>(metrics.rejected_total),
+          static_cast<unsigned long long>(metrics.writer_busy_total),
+          static_cast<unsigned long long>(metrics.slot_exhausted_total));
     }
-    return authored_published;
+    return authored_publication.published;
   }
   if (uses_authored_backend_state() &&
       authority == SnapshotPublicationAuthority::kBackendAuthored &&
