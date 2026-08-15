@@ -757,11 +757,12 @@ ManagedKernelAdmissionObservation ManagedKernelAdmissionGate::Observe(
   Require(table != nullptr || !resource_table_was_bound_,
           "the bound Kernel resource table is no longer available");
   if (table == nullptr) {
-    return {0U, {}, 0U, 0U};
+    return {0U, {}, {}, 0U, 0U};
   }
   const auto snapshot = table->admission_snapshot(scope.resources);
   return {snapshot.operation_resource_generation,
           snapshot.active_control_configurations,
+          snapshot.route_published_active_control_configurations,
           snapshot.affected_queued_operation_count,
           snapshot.affected_active_operation_count};
 }
@@ -835,8 +836,8 @@ void ManagedKernelAdmissionGate::AcquireRouteFenceDurably(
           "affected operation admission is busy or changed before route-fence "
           "acquisition");
   Require(
-      SelectExpectedConfiguration(observation.active_control_configurations,
-                                  scope) ==
+      SelectExpectedConfiguration(
+          observation.route_published_active_control_configurations, scope) ==
           expected_active_control_configuration,
       "active control configuration changed before route-fence acquisition");
   Require(
@@ -872,6 +873,7 @@ ManagedKernelAdmissionGate::AcquireDisableFenceDurably(
   ManagedKernelAdmissionObservation observation{
       snapshot.operation_resource_generation,
       snapshot.active_control_configurations,
+      snapshot.route_published_active_control_configurations,
       snapshot.affected_queued_operation_count,
       snapshot.affected_active_operation_count};
   held_fences_.push_back({fence_id, scope});
@@ -913,6 +915,7 @@ void ManagedKernelAdmissionGate::WidenDisableFenceDurably(
   ManagedKernelAdmissionObservation observation{
       snapshot.operation_resource_generation,
       snapshot.active_control_configurations,
+      snapshot.route_published_active_control_configurations,
       snapshot.affected_queued_operation_count,
       snapshot.affected_active_operation_count};
   found->scope = widened_scope;
@@ -943,6 +946,7 @@ void ManagedKernelAdmissionGate::ReleaseDisableFenceDurably(
   ManagedKernelAdmissionObservation observation{
       snapshot.operation_resource_generation,
       snapshot.active_control_configurations,
+      snapshot.route_published_active_control_configurations,
       snapshot.affected_queued_operation_count,
       snapshot.affected_active_operation_count};
   commit_durable_release(observation);
@@ -2305,7 +2309,7 @@ private:
             "active publication differs from the route-fence expectation");
     const auto observation = admission_gate_.Observe(query.scope);
     const auto current = SelectExpectedConfiguration(
-        observation.active_control_configurations, query.scope);
+        observation.route_published_active_control_configurations, query.scope);
     Require(current == query.expected_active_control_configuration,
             "active control configuration differs from the route expectation");
     core::RouteConfigurationFenceAdmissionSnapshotDTO snapshot{
@@ -2376,7 +2380,8 @@ private:
     const auto active = ReadActivePublication();
     const auto observation = admission_gate_.Observe(query.expected_scope);
     const auto current = SelectExpectedConfiguration(
-        observation.active_control_configurations, query.expected_scope);
+        observation.route_published_active_control_configurations,
+        query.expected_scope);
     core::RouteConfigurationFenceReconciliationEvidenceDTO evidence{
         ExecutionHostEpoch(active.receipt),
         query.route_selection_transaction_id,

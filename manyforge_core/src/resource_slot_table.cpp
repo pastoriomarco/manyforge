@@ -79,7 +79,8 @@ ResourceSlotTable::ResourceSlotTable(
     std::shared_ptr<std::recursive_mutex> admission_mutex)
     : admission_mutex_(admission_mutex != nullptr ? std::move(admission_mutex)
                                                   : std::make_shared<std::recursive_mutex>()),
-      active_control_configurations_(std::move(active_control_configurations)) {
+      active_control_configurations_(std::move(active_control_configurations)),
+      route_published_active_control_configurations_(active_control_configurations_) {
   if (resources.empty() || resources.size() > kMaxKernelResourceSlots) {
     throw std::invalid_argument("Kernel resource inventory is empty or exceeds its fixed bound");
   }
@@ -818,7 +819,9 @@ Result<std::uint64_t> ResourceSlotTable::reconcile_unreconciled_external_or_orph
 
 Result<void> ResourceSlotTable::reconfigure_runtime_inventory(
     std::vector<ResourceId> resources,
-    std::vector<DomainActiveControlConfigurationDTO> active_control_configurations) {
+    std::vector<DomainActiveControlConfigurationDTO> active_control_configurations,
+    std::vector<DomainActiveControlConfigurationDTO>
+        route_published_active_control_configurations) {
   if (resources.size() > kMaxKernelResourceSlots) {
     return reject("candidate Kernel resource inventory is oversized",
                   "runtime_resource_inventory_count_invalid", ErrorCode::kInvalidRequest);
@@ -827,7 +830,9 @@ Result<void> ResourceSlotTable::reconfigure_runtime_inventory(
   if (std::any_of(resources.begin(), resources.end(),
                   [](const ResourceId& id) { return id.empty(); }) ||
       std::adjacent_find(resources.begin(), resources.end()) != resources.end() ||
-      !canonical_active_configurations(active_control_configurations)) {
+      !canonical_active_configurations(active_control_configurations) ||
+      !canonical_active_configurations(
+          route_published_active_control_configurations)) {
     return reject("candidate Kernel runtime inventory is noncanonical",
                   "runtime_resource_inventory_noncanonical", ErrorCode::kInvalidRequest);
   }
@@ -878,6 +883,28 @@ Result<void> ResourceSlotTable::reconfigure_runtime_inventory(
   }
   slots_ = std::move(candidate_slots);
   active_control_configurations_ = std::move(active_control_configurations);
+  route_published_active_control_configurations_ =
+      std::move(route_published_active_control_configurations);
+  advance_generation_locked();
+  return Result<void>::Ok();
+}
+
+Result<void> ResourceSlotTable::replace_route_publication_inventory(
+    std::vector<DomainActiveControlConfigurationDTO>
+        route_published_active_control_configurations) {
+  if (!canonical_active_configurations(
+          route_published_active_control_configurations)) {
+    return reject("route-publication inventory is noncanonical",
+                  "runtime_route_publication_inventory_noncanonical",
+                  ErrorCode::kInvalidRequest);
+  }
+  std::lock_guard lock(*admission_mutex_);
+  auto generation = require_generation_available_locked();
+  if (!generation.ok()) {
+    return generation;
+  }
+  route_published_active_control_configurations_ =
+      std::move(route_published_active_control_configurations);
   advance_generation_locked();
   return Result<void>::Ok();
 }
@@ -925,6 +952,7 @@ ResourceSlotAdmissionSnapshotDTO ResourceSlotTable::admission_snapshot(
   }
   return ResourceSlotAdmissionSnapshotDTO{
       operation_resource_generation_, active_control_configurations_,
+      route_published_active_control_configurations_,
       static_cast<std::uint64_t>(queued.size()),
       static_cast<std::uint64_t>(active.size()) + (unreconciled_orphan_present ? 1U : 0U)};
 }

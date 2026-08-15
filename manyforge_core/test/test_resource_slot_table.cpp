@@ -268,6 +268,8 @@ TEST(ResourceSlotTableTest, ProjectsExactGenerationConfigurationsAndAffectedOper
   const auto initial = table.admission_snapshot({ResourceId("joint.2")});
   EXPECT_EQ(initial.operation_resource_generation, 0U);
   ASSERT_EQ(initial.active_control_configurations.size(), 1U);
+  EXPECT_EQ(initial.route_published_active_control_configurations,
+            initial.active_control_configurations);
   EXPECT_EQ(initial.active_control_configurations.front().control_domain_id,
             ControlDomainId("domain.arm"));
   EXPECT_EQ(initial.affected_queued_operation_count, 0U);
@@ -684,7 +686,7 @@ TEST(ResourceSlotTableTest, ReconfiguresFreeInventoryWhilePreservingOneUnchanged
 
   const auto reconfigured = table.reconfigure_runtime_inventory(
       {ResourceId("joint.2"), ResourceId("added.free"), ResourceId("joint.1")},
-      active_configurations());
+      active_configurations(), active_configurations());
   ASSERT_TRUE(reconfigured.ok()) << reconfigured.error().message;
 
   const auto snapshot = table.snapshot();
@@ -710,7 +712,8 @@ TEST(ResourceSlotTableTest, RejectsReconfigurationThatRemovesAnOccupiedResource)
   ASSERT_TRUE(table.reserve(operation, arm_resources()).ok());
 
   const auto rejected =
-      table.reconfigure_runtime_inventory({ResourceId("joint.1")}, active_configurations());
+      table.reconfigure_runtime_inventory({ResourceId("joint.1")}, active_configurations(),
+                                          active_configurations());
   ASSERT_FALSE(rejected.ok());
   EXPECT_EQ(rejected.error().details.at("reason"),
             "runtime_resource_inventory_removes_occupied_resource");
@@ -723,7 +726,8 @@ TEST(ResourceSlotTableTest, RejectsReconfigurationThatChangesAnOccupiedControlCo
   ASSERT_TRUE(table.reserve(operation, arm_resources()).ok());
 
   const auto rejected = table.reconfigure_runtime_inventory(
-      arm_resources(), active_configurations("active.replaced"));
+      arm_resources(), active_configurations("active.replaced"),
+      active_configurations("active.replaced"));
   ASSERT_FALSE(rejected.ok());
   EXPECT_EQ(rejected.error().details.at("reason"), "runtime_active_control_configuration_changed");
   const auto admission = table.admission_snapshot(arm_resources());
@@ -734,14 +738,36 @@ TEST(ResourceSlotTableTest, RejectsReconfigurationThatChangesAnOccupiedControlCo
 TEST(ResourceSlotTableTest, ReconfiguresAQuiescentRuntimeToNoCommandableResources) {
   ResourceSlotTable table(arm_resources(), active_configurations());
 
-  const auto reconfigured = table.reconfigure_runtime_inventory({}, {});
+  const auto reconfigured = table.reconfigure_runtime_inventory({}, {}, {});
   ASSERT_TRUE(reconfigured.ok()) << reconfigured.error().message;
   EXPECT_TRUE(table.snapshot().empty());
   const auto admission = table.admission_snapshot(arm_resources());
   EXPECT_EQ(admission.operation_resource_generation, 1U);
   EXPECT_TRUE(admission.active_control_configurations.empty());
+  EXPECT_TRUE(admission.route_published_active_control_configurations.empty());
   EXPECT_EQ(admission.affected_queued_operation_count, 0U);
   EXPECT_EQ(admission.affected_active_operation_count, 0U);
+}
+
+TEST(ResourceSlotTableTest, SeparatesApplyStagedAndRoutePublishedConfigurations) {
+  ResourceSlotTable table(arm_resources(), active_configurations());
+
+  const auto staged = table.reconfigure_runtime_inventory(
+      arm_resources(), active_configurations("active.staged"), {});
+  ASSERT_TRUE(staged.ok()) << staged.error().message;
+  const auto admission = table.admission_snapshot(arm_resources());
+  EXPECT_EQ(admission.active_control_configurations,
+            active_configurations("active.staged"));
+  EXPECT_TRUE(admission.route_published_active_control_configurations.empty());
+
+  const auto published = table.replace_route_publication_inventory(
+      active_configurations("active.cclc"));
+  ASSERT_TRUE(published.ok()) << published.error().message;
+  const auto current = table.admission_snapshot(arm_resources());
+  EXPECT_EQ(current.active_control_configurations,
+            active_configurations("active.staged"));
+  EXPECT_EQ(current.route_published_active_control_configurations,
+            active_configurations("active.cclc"));
 }
 
 }  // namespace

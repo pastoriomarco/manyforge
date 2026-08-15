@@ -3310,6 +3310,7 @@ TEST(ResourceAddressedExecutionKernelTest,
   ASSERT_TRUE(staged.ok()) << staged.error().message;
   const auto admission = kernel.resource_admission_table()->admission_snapshot(scope.resources);
   ASSERT_EQ(admission.active_control_configurations.size(), 1U);
+  EXPECT_TRUE(admission.route_published_active_control_configurations.empty());
   EXPECT_EQ(admission.active_control_configurations.front().control_domain_id,
             path.control_domain_id);
   EXPECT_EQ(admission.active_control_configurations.front().active_control_configuration_id,

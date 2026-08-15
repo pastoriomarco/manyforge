@@ -159,6 +159,34 @@ extract_published_active_control_configurations(
   return configurations;
 }
 
+[[nodiscard]] std::vector<DomainActiveControlConfigurationDTO>
+route_publication_identities(
+    const std::map<ControlDomainId, RuntimeRouteConfigurationReadbackDTO>& readbacks,
+    const RuntimeRouteConfigurationReadbackDTO* replacement = nullptr) {
+  std::vector<DomainActiveControlConfigurationDTO> result;
+  result.reserve(readbacks.size() + (replacement != nullptr ? 1U : 0U));
+  for (const auto& [domain_id, readback] : readbacks) {
+    if (replacement != nullptr &&
+        domain_id == replacement->active_configuration.control_domain_id) {
+      continue;
+    }
+    result.push_back(DomainActiveControlConfigurationDTO{
+        domain_id,
+        readback.active_configuration.active_control_configuration_id,
+        readback.active_configuration.active_control_configuration_generation});
+  }
+  if (replacement != nullptr) {
+    result.push_back(DomainActiveControlConfigurationDTO{
+        replacement->active_configuration.control_domain_id,
+        replacement->active_configuration.active_control_configuration_id,
+        replacement->active_configuration.active_control_configuration_generation});
+    std::sort(result.begin(), result.end(), [](const auto& lhs, const auto& rhs) {
+      return lhs.control_domain_id < rhs.control_domain_id;
+    });
+  }
+  return result;
+}
+
 [[nodiscard]] Result<std::vector<RouteReadinessPublicationRowDTO>>
 derive_route_readiness_projection(
     const ActiveControlConfigurationDTO& configuration,
@@ -2540,7 +2568,8 @@ ResourceAddressedExecutionKernel::stage_current_runtime_configuration_facts_unde
     }
 
     const auto declared = extract_active_control_configurations(registrations_);
-    auto staged = resource_slots_->admission_snapshot({}).active_control_configurations;
+    auto admission = resource_slots_->admission_snapshot({});
+    auto staged = admission.active_control_configurations;
     for (const auto& domain : scope.domains) {
       const auto existing = std::lower_bound(
           staged.begin(), staged.end(), domain.control_domain_id,
@@ -2578,8 +2607,9 @@ ResourceAddressedExecutionKernel::stage_current_runtime_configuration_facts_unde
                                      }),
                     *candidate);
     }
-    return resource_slots_->reconfigure_runtime_inventory(registry_.resource_inventory(),
-                                                          std::move(staged));
+    return resource_slots_->reconfigure_runtime_inventory(
+        registry_.resource_inventory(), std::move(staged),
+        std::move(admission.route_published_active_control_configurations));
   } catch (const std::exception& exception) {
     return reject<void>(std::string("candidate configuration staging failed: ") + exception.what(),
                         "runtime_configuration_staging_failed", ErrorCode::kInvariantViolation);
@@ -2611,6 +2641,7 @@ Result<void> ResourceAddressedExecutionKernel::reconfigure_runtime_participants_
   std::vector<DomainActiveControlConfigurationDTO> candidate_configurations;
   std::vector<DomainActiveControlConfigurationDTO> declared_candidate_configurations;
   std::vector<DomainActiveControlConfigurationDTO> table_configurations;
+  std::vector<DomainActiveControlConfigurationDTO> table_route_publications;
   std::optional<StopStaticFacts> candidate_stop_facts;
   std::set<ControlDomainId> changed_domains;
   try {
@@ -2757,10 +2788,30 @@ Result<void> ResourceAddressedExecutionKernel::reconfigure_runtime_participants_
   {
     std::lock_guard state_lock(state_mutex_);
     std::lock_guard admission_lock(*admission_mutex_);
+    table_route_publications.reserve(runtime_route_configuration_readbacks_.size());
+    for (const auto& [domain_id, readback] : runtime_route_configuration_readbacks_) {
+      if (changed_domains.contains(domain_id)) {
+        const auto candidate = std::find_if(
+            candidate_configurations.begin(), candidate_configurations.end(),
+            [&](const auto& item) { return item.control_domain_id == domain_id; });
+        if (candidate == candidate_configurations.end() ||
+            candidate->active_control_configuration_id !=
+                readback.active_configuration.active_control_configuration_id ||
+            candidate->active_control_configuration_generation !=
+                readback.active_configuration.active_control_configuration_generation) {
+          continue;
+        }
+      }
+      table_route_publications.push_back(DomainActiveControlConfigurationDTO{
+          domain_id,
+          readback.active_configuration.active_control_configuration_id,
+          readback.active_configuration.active_control_configuration_generation});
+    }
     auto table_result = resource_slots_->reconfigure_runtime_inventory(
         candidate_registry->resource_inventory(), retain_unready_configuration_facts
                                                       ? declared_candidate_configurations
-                                                      : table_configurations);
+                                                      : table_configurations,
+        table_route_publications);
     if (!table_result.ok()) {
       table_error = table_result.error();
     } else {
@@ -2926,6 +2977,14 @@ ResourceAddressedExecutionKernel::adopt_runtime_route_configuration_predecessor(
     std::lock_guard submit_lock(submission_mutex_);
     std::lock_guard state_lock(state_mutex_);
     std::lock_guard admission_lock(*admission_mutex_);
+    auto publications =
+        route_publication_identities(runtime_route_configuration_readbacks_, &candidate);
+    auto publication_inventory =
+        resource_slots_->replace_route_publication_inventory(std::move(publications));
+    if (!publication_inventory.ok()) {
+      return Result<RuntimeRouteConfigurationReadbackDTO>::Err(
+          publication_inventory.error());
+    }
     runtime_route_configuration_readbacks_.erase(candidate.active_configuration.control_domain_id);
     runtime_route_configuration_readbacks_.insert(std::move(staged_node));
     runtime_route_configuration_publication_required_.insert(
@@ -2992,6 +3051,14 @@ ResourceAddressedExecutionKernel::publish_runtime_route_configuration(
   {
     std::lock_guard state_lock(state_mutex_);
     std::lock_guard admission_lock(*admission_mutex_);
+    auto publications =
+        route_publication_identities(runtime_route_configuration_readbacks_, &candidate);
+    auto publication_inventory =
+        resource_slots_->replace_route_publication_inventory(std::move(publications));
+    if (!publication_inventory.ok()) {
+      return Result<RuntimeRouteConfigurationReadbackDTO>::Err(
+          publication_inventory.error());
+    }
     runtime_route_configuration_readbacks_.erase(candidate.active_configuration.control_domain_id);
     runtime_route_configuration_readbacks_.insert(std::move(staged_node));
     runtime_route_configuration_publication_required_.erase(

@@ -120,7 +120,14 @@ struct ResourceSlotStopFenceResultDTO final {
 /// unreconciled orphan work are active for Apply-admission purposes.
 struct ResourceSlotAdmissionSnapshotDTO final {
   std::uint64_t operation_resource_generation{};
+  /// Installed runtime identity, including candidate facts staged under an
+  /// Apply fence. Apply/Disable reconciliation consumes this inventory.
   std::vector<DomainActiveControlConfigurationDTO> active_control_configurations;
+  /// Only configurations with an authoritative Kernel route publication.
+  /// CCLC route-fence admission consumes this inventory so an unready
+  /// Apply-staged candidate cannot masquerade as a published predecessor.
+  std::vector<DomainActiveControlConfigurationDTO>
+      route_published_active_control_configurations;
   std::uint64_t affected_queued_operation_count{};
   std::uint64_t affected_active_operation_count{};
 };
@@ -226,7 +233,16 @@ class ResourceSlotTable final {
   /// configuration fence that covers every changed resource.
   [[nodiscard]] Result<void> reconfigure_runtime_inventory(
       std::vector<ResourceId> resources,
-      std::vector<DomainActiveControlConfigurationDTO> active_control_configurations);
+      std::vector<DomainActiveControlConfigurationDTO> active_control_configurations,
+      std::vector<DomainActiveControlConfigurationDTO>
+          route_published_active_control_configurations);
+
+  /// Replace only the authoritative route-publication identities. The caller
+  /// uses the shared admission mutex to join this mutation atomically with
+  /// its durable runtime-route readback update.
+  [[nodiscard]] Result<void> replace_route_publication_inventory(
+      std::vector<DomainActiveControlConfigurationDTO>
+          route_published_active_control_configurations);
 
   [[nodiscard]] std::vector<ResourceSlotSnapshotDTO> snapshot() const;
   [[nodiscard]] ResourceSlotTableSnapshotDTO coherent_snapshot() const;
@@ -250,6 +266,8 @@ class ResourceSlotTable final {
   std::shared_ptr<std::recursive_mutex> admission_mutex_;
   std::vector<ResourceSlotSnapshotDTO> slots_;
   std::vector<DomainActiveControlConfigurationDTO> active_control_configurations_;
+  std::vector<DomainActiveControlConfigurationDTO>
+      route_published_active_control_configurations_;
   std::uint64_t operation_resource_generation_{};
 };
 

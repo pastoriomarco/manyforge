@@ -292,8 +292,10 @@ class ResourceAddressedExecutionKernel final : public IAddressedOperationOwner,
   /// Publish the candidate-side active-configuration identities already
   /// declared by the installed registrations while the exact durable Apply
   /// fence still closes every affected resource. This does not publish Stop
-  /// readiness or open route admission; CCLC must replace these staged facts
-  /// with independently verified readiness before the fence is released.
+  /// readiness or create a CCLC route predecessor: route-fence admission sees
+  /// the separately tracked authoritative publication inventory. CCLC must
+  /// replace these staged facts with independently verified readiness before
+  /// addressed command admission can reopen.
   [[nodiscard]] Result<void> stage_current_runtime_configuration_facts_under_apply_fence(
       const ConfigurationFenceScopeDTO& scope);
 

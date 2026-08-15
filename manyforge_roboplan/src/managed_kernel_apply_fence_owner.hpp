@@ -22,6 +22,8 @@ struct ManagedKernelAdmissionObservation final {
   std::uint64_t operation_resource_generation;
   std::vector<manyforge::core::DomainActiveControlConfigurationDTO>
       active_control_configurations;
+  std::vector<manyforge::core::DomainActiveControlConfigurationDTO>
+      route_published_active_control_configurations;
   std::uint64_t affected_queued_operation_count;
   std::uint64_t affected_active_operation_count;
 
