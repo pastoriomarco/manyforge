@@ -72,6 +72,7 @@ _MOTION_NODE_IDS: Final = frozenset(
 )
 _MAX_CONTEXTS: Final = 4_096
 _MAX_TASKS: Final = 65_536
+_MAX_SCENE_INITIALIZATION_STALE_RETRIES: Final = 16
 
 
 class ProductionPortError(RuntimeError):
@@ -2590,19 +2591,37 @@ class HeadlessSceneProgramPort:
         def commit(operation: Mapping[str, Any], coordinate: str) -> None:
             nonlocal expected, ordinal
             ordinal += 1
-            expected, _response = self._commit(
-                context=parsed,
-                request_id=_request_identity(
-                    "scene-init",
-                    context.program_run_id,
-                    str(ordinal),
-                    coordinate,
-                ),
-                correlation_id=context.program_run_id,
-                request_owner_epoch=view.request_owner_epoch,
-                expected_projection_revision=expected,
-                operation=operation,
-            )
+            for attempt in range(_MAX_SCENE_INITIALIZATION_STALE_RETRIES):
+                try:
+                    expected, _response = self._commit(
+                        context=parsed,
+                        request_id=_request_identity(
+                            "scene-init",
+                            context.program_run_id,
+                            str(ordinal),
+                            coordinate,
+                            str(attempt),
+                        ),
+                        correlation_id=context.program_run_id,
+                        request_owner_epoch=view.request_owner_epoch,
+                        expected_projection_revision=expected,
+                        operation=operation,
+                    )
+                    return
+                except Exception as error:
+                    if getattr(error, "code", None) != "stale_revision":
+                        raise
+                    if attempt + 1 == _MAX_SCENE_INITIALIZATION_STALE_RETRIES:
+                        raise ProductionPortError(
+                            "logical-scene initialization could not acquire a "
+                            "stable revision"
+                        ) from error
+                    refreshed = self._read_view(parsed)
+                    if refreshed.request_owner_epoch != view.request_owner_epoch:
+                        raise ProductionPortError(
+                            "logical-scene owner changed during initialization"
+                        ) from error
+                    expected = refreshed.projection_revision
 
         for attachment in view.attachments:
             attachment_id = _text(
@@ -2663,8 +2682,19 @@ class HeadlessSceneProgramPort:
                 f"add:{scene_resource_id}",
             )
         verified = self._read_view(parsed)
+        expected_scene = _mapping(
+            expected.get("scene_revision"), field="expected scene revision"
+        )
+        verified_scene = _mapping(
+            verified.projection_revision.get("scene_revision"),
+            field="verified scene revision",
+        )
         if (
-            verified.projection_revision != expected
+            verified.request_owner_epoch != view.request_owner_epoch
+            or verified_scene.get("scene_id") != expected_scene.get("scene_id")
+            or type(verified_scene.get("revision_id")) is not int
+            or type(expected_scene.get("revision_id")) is not int
+            or verified_scene["revision_id"] < expected_scene["revision_id"]
             or verified.attachments
             or tuple(verified.objects) != tuple(ids)
         ):

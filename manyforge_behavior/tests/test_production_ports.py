@@ -1091,6 +1091,58 @@ def test_scene_initialization_clears_dependencies_then_applies_authored_order() 
     assert sorted(transport.objects) == ["graspable", "table"]
 
 
+def test_scene_initialization_retries_concurrent_pose_revision_without_losing_shape(
+) -> None:
+    class _StaleRevision(RuntimeError):
+        code = "stale_revision"
+
+    class _ConcurrentPoseTransport(_SceneTransport):
+        def __init__(self) -> None:
+            super().__init__()
+            self.rejected_requests: list[dict[str, Any]] = []
+            self.injected_stale = False
+            self.injected_final_pose = False
+
+        def _advance_pose_revision(self) -> None:
+            revision_id = self.revision["scene_revision"]["revision_id"] + 1
+            self.revision["scene_revision"] = {
+                "scene_id": _DIGEST_D,
+                "revision_id": revision_id,
+                "content_hash": "sha256:" + f"{revision_id:064x}"[-64:],
+            }
+
+        def commit_scene_transaction(
+            self, body: Mapping[str, Any]
+        ) -> dict[str, Any]:
+            operation = body["operation"]
+            if not self.injected_stale:
+                self.injected_stale = True
+                self.rejected_requests.append(deepcopy(dict(body)))
+                self._advance_pose_revision()
+                raise _StaleRevision("external pose update advanced the scene")
+            response = super().commit_scene_transaction(body)
+            if (
+                operation.get("scene_resource_id") == "table"
+                and not self.injected_final_pose
+            ):
+                self.injected_final_pose = True
+                self._advance_pose_revision()
+            return response
+
+    transport = _ConcurrentPoseTransport()
+    port = HeadlessSceneProgramPort(transport)
+
+    port.initialize(_scene_context(), _authored_scene())
+
+    assert transport.injected_stale is True
+    assert transport.injected_final_pose is True
+    assert sorted(transport.objects) == ["graspable", "table"]
+    assert (
+        transport.rejected_requests[0]["request_context"]["request_id"]
+        != transport.submissions[0]["request_context"]["request_id"]
+    )
+
+
 def test_scene_context_can_bind_atomically_before_initialization_and_release() -> None:
     transport = _SceneTransport()
     port = HeadlessSceneProgramPort(transport)
