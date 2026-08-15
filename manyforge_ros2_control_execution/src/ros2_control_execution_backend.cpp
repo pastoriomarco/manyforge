@@ -423,6 +423,23 @@ rejected_gripper_command(std::string reason_code, std::string message,
       core::ErrorDTO{std::move(reason_code), std::move(message), {}}};
 }
 
+bool gripper_request_matches_transport(
+    const core::GripperCommandRequestDTO &request,
+    const Ros2GripperActionConfig &config) noexcept {
+  const auto selects = [](const std::string &requested,
+                          const std::string &physical,
+                          const std::string_view resolved) {
+    return requested.empty() || requested == physical || requested == resolved;
+  };
+  return (request.group_id.empty() || request.group_id == config.group_id) &&
+         (request.joint_name.empty() ||
+          request.joint_name == config.joint_name) &&
+         selects(request.transport_kind, config.transport_kind,
+                 "resolved_binding") &&
+         selects(request.completion_policy, config.completion_policy,
+                 "goal_fenced_target_reached");
+}
+
 void disable_fjt_controller_tolerances(
     control_msgs::action::FollowJointTrajectory::Goal &goal,
     const std::vector<std::string> &joint_names) {
@@ -8936,14 +8953,7 @@ core::Result<void> Ros2ControlExecutionBackend::validate_gripper_command(
           "Gripper terminal scene projection failed; reset before retrying");
     }
   }
-  if ((!request.transport_kind.empty() &&
-       request.transport_kind != runtime_config.transport_kind) ||
-      (!request.group_id.empty() &&
-       request.group_id != runtime_config.group_id) ||
-      (!request.joint_name.empty() &&
-       request.joint_name != runtime_config.joint_name) ||
-      (!request.completion_policy.empty() &&
-       request.completion_policy != runtime_config.completion_policy)) {
+  if (!gripper_request_matches_transport(request, runtime_config)) {
     return rejected(
         ros2_control_fault_reason::kInvalidGripperSemantics,
         "Gripper request semantics do not match the configured transport");
@@ -9047,14 +9057,7 @@ core::GripperCommandResultDTO Ros2ControlExecutionBackend::command_gripper(
   if (auto rejected = reject_existing_state()) {
     return *rejected;
   }
-  if ((!request.transport_kind.empty() &&
-       request.transport_kind != runtime_config.transport_kind) ||
-      (!request.group_id.empty() &&
-       request.group_id != runtime_config.group_id) ||
-      (!request.joint_name.empty() &&
-       request.joint_name != runtime_config.joint_name) ||
-      (!request.completion_policy.empty() &&
-       request.completion_policy != runtime_config.completion_policy)) {
+  if (!gripper_request_matches_transport(request, runtime_config)) {
     return rejected_gripper_command(
         ros2_control_fault_reason::kInvalidGripperSemantics,
         "Gripper request semantics do not match the configured transport");

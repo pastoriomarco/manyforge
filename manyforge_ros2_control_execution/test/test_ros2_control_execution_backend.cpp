@@ -2629,6 +2629,32 @@ TEST(Ros2ControlExecutionBackendTest,
 }
 
 TEST(Ros2ControlExecutionBackendTest,
+     GripperAcceptsResolvedBindingSemanticsAtThePhysicalTransportBoundary) {
+  auto sink = std::make_shared<RecordingExecutionStateSink>();
+  sink->set_joint_position("gripper", "finger_joint", 0.7);
+  core::FakeClock clock;
+  core::ManualScheduler scheduler;
+  Ros2ControlExecutionBackend backend(
+      Ros2ControlExecutionBackend::DeferredRosExecutorStartTag{}, sink, "arm",
+      clock, scheduler, base_config());
+  backend.configure_gripper_action(
+      "tool", isaac_gripper_config("/manyforge_resolved_gripper_" +
+                                    unique_suffix()));
+
+  const auto request = make_gripper_request(
+      0.0, 0.2, 0.0, "resolved_binding", "goal_fenced_target_reached");
+  EXPECT_TRUE(backend.validate_gripper_command(request).ok());
+
+  const auto accepted = backend.command_gripper(request);
+  ASSERT_TRUE(accepted.accepted)
+      << (accepted.error ? accepted.error->message : "");
+  const auto status = backend.get_gripper_status("tool");
+  EXPECT_EQ(status.state, core::GripperCommandState::kExecuting);
+  EXPECT_EQ(status.transport_kind, "isaac_joint_state_effort");
+  EXPECT_EQ(status.completion_policy, "goal_fenced_target_reached");
+}
+
+TEST(Ros2ControlExecutionBackendTest,
      GripperPreflightRejectsUnavailableStateAndClosedLifecycle) {
   auto sink = std::make_shared<RecordingExecutionStateSink>();
   core::FakeClock clock;
