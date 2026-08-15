@@ -167,9 +167,10 @@ services:
     profiles:
       - ros-full
 
-  # Isaac ros2_control I9 porting target. Its launch script currently exits
-  # unavailable before ROS or simulator effects. Old Composer/DemoSupervisor
-  # auto-load and fixed v0 artifact wires are intentionally absent.
+  # I9 mechanical Isaac ros2_control product. Isaac remains a separately
+  # owned laptop process; this Orin-side service builds into the persistent
+  # cache, proves the exact stopped world, then exposes JTC and thin adapters.
+  # Composer/Program auto-load and DemoSupervisor ownership remain absent.
   isaac-topic-control:
     image: ${MANYFORGE_ROS_FULL_IMAGE:-manyforge-ros-jazzy-full}
     logging: *default-logging
@@ -182,8 +183,8 @@ services:
     environment:
       - ROS_DOMAIN_ID=${ROS_DOMAIN_ID:-0}
       - RMW_IMPLEMENTATION=${RMW_IMPLEMENTATION:-rmw_fastrtps_cpp}
-      - ROS_AUTOMATIC_DISCOVERY_RANGE
-      - ROS_STATIC_PEERS
+      - ROS_AUTOMATIC_DISCOVERY_RANGE=${ROS_AUTOMATIC_DISCOVERY_RANGE:-LOCALHOST}
+      - ROS_STATIC_PEERS=${ROS_STATIC_PEERS:-192.168.1.132;192.168.1.68}
       - FASTRTPS_DEFAULT_PROFILES_FILE
       - FASTDDS_DEFAULT_PROFILES_FILE
     working_dir: /workspace

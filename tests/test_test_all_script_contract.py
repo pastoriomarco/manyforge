@@ -170,7 +170,7 @@ def test_roboplan_suite_qualifies_only_the_retained_product_consumer() -> None:
     assert "manyforge_roboplan/python" not in body
 
 
-def test_compose_retains_fenced_runtime_clients_without_claiming_availability() -> None:
+def test_compose_retains_explicit_ros_runtime_products_and_build_cache() -> None:
     compose = yaml.safe_load(
         (_REPO_ROOT / "docker-compose.yaml").read_text(encoding="utf-8")
     )
@@ -186,6 +186,14 @@ def test_compose_retains_fenced_runtime_clients_without_claiming_availability() 
     assert services["isaac-topic-control"]["command"][-1] == (
         "./scripts/ros/launch-isaac-topic-based-control.sh"
     )
+    assert services["isaac-topic-control"]["network_mode"] == "host"
+    assert services["isaac-topic-control"]["ipc"] == "host"
+    assert {
+        "ROS_DOMAIN_ID=${ROS_DOMAIN_ID:-0}",
+        "RMW_IMPLEMENTATION=${RMW_IMPLEMENTATION:-rmw_fastrtps_cpp}",
+        "ROS_AUTOMATIC_DISCOVERY_RANGE=${ROS_AUTOMATIC_DISCOVERY_RANGE:-LOCALHOST}",
+        "ROS_STATIC_PEERS=${ROS_STATIC_PEERS:-192.168.1.132;192.168.1.68}",
+    } <= set(services["isaac-topic-control"]["environment"])
     assert "ros-full-build-cache" in compose["volumes"]
 
 
@@ -366,7 +374,6 @@ def test_launcher_libraries_have_no_dormant_runtime_body(
 @pytest.mark.parametrize(
     "relative",
     (
-        "scripts/ros/build-ros2-control-runtime.sh",
         "scripts/ros/start-composer-ros.sh",
         "scripts/ros/start-lite6-real-robot-composer.sh",
         "scripts/test-ros-full.sh",
@@ -391,6 +398,64 @@ def test_ros_runtime_wrappers_share_one_explicit_unavailable_boundary(
     )
     assert completed.returncode == 78
     assert completed.stderr.strip() == _UNAVAILABLE_MESSAGE
+
+
+def test_i9_ros2_control_builder_selects_only_current_runtime_products() -> None:
+    source = (
+        _REPO_ROOT / "scripts/ros/build-ros2-control-runtime.sh"
+    ).read_text(encoding="utf-8")
+
+    assert "manyforge_fail_composable_cell_runtime_unavailable" not in source
+    assert "MANYFORGE_BUILD_ROS2_CONTROL_RUNTIME=ON" in source
+    assert "manyforge_ros2_control_execution_host" in source
+    assert "manyforge_roboplan_candidate_worker" in source
+    assert "manyforge_cclc_msgs" in source
+    assert "manyforge_ros_bringup" in source
+    assert "--symlink-install" in source
+    for forbidden in (
+        "isaac_demo_supervisor",
+        "manyforge_native_execution_host",
+        "composer",
+        "docker ",
+    ):
+        assert forbidden not in source
+
+
+def test_i9_isaac_launcher_enforces_the_recorded_topology_and_owner_split() -> None:
+    source = (
+        _REPO_ROOT / "scripts/ros/launch-isaac-topic-based-control.sh"
+    ).read_text(encoding="utf-8")
+
+    assert "manyforge_fail_composable_cell_runtime_unavailable" not in source
+    assert 'ROS_DOMAIN_ID="${ROS_DOMAIN_ID:-0}"' in source
+    assert 'RMW_IMPLEMENTATION="${RMW_IMPLEMENTATION:-rmw_fastrtps_cpp}"' in source
+    assert (
+        'ROS_AUTOMATIC_DISCOVERY_RANGE="${ROS_AUTOMATIC_DISCOVERY_RANGE:-LOCALHOST}"'
+        in source
+    )
+    assert (
+        'ROS_STATIC_PEERS="${ROS_STATIC_PEERS:-192.168.1.132;192.168.1.68}"'
+        in source
+    )
+    for stale_override in (
+        "FASTRTPS_DEFAULT_PROFILES_FILE",
+        "FASTDDS_DEFAULT_PROFILES_FILE",
+        "ROS_DISCOVERY_SERVER",
+        "ROS_SUPER_CLIENT",
+        "CYCLONEDDS_URI",
+    ):
+        assert stale_override in source
+    assert "build-ros2-control-runtime.sh" in source
+    assert "isaac_topic_based_control.launch.py" in source
+    assert "simulation_interfaces" in source
+    for forbidden in (
+        "isaac_demo_supervisor",
+        "program_path:=",
+        "deployment_path:=",
+        "composer_url:=",
+        "docker ",
+    ):
+        assert forbidden not in source
 
 
 @pytest.mark.parametrize(
