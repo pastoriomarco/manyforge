@@ -157,7 +157,8 @@ request(const ProcessFixture &fixture) {
 [[nodiscard]] ProcessContainedCandidateClientConfig
 config(const std::filesystem::path &worker) {
   return ProcessContainedCandidateClientConfig{
-      worker, 10s, 250ms, 500ms, 4U * 1024U * 1024U, 256U * 1024U * 1024U};
+      worker, 10s, 250ms, 500ms, 4U * 1024U * 1024U,
+      256U * 1024U * 1024U, false, std::nullopt};
 }
 
 [[nodiscard]] Pose3DTO identity_pose(double x_m = 0.0) {
