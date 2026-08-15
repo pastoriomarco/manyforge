@@ -1619,6 +1619,68 @@ TEST(Ros2ControlExecutionBackendTest,
 }
 
 TEST(Ros2ControlExecutionBackendTest,
+     CommandedSimControllerReadinessResetsBeforeOpeningGateAndOnRecovery) {
+  const std::string suffix = unique_suffix();
+  const std::string controller_manager =
+      "/manyforge_commanded_sim_readiness_" + suffix + "/controller_manager";
+  auto config = base_config();
+  config.action_name = "/manyforge_commanded_sim_readiness_" + suffix +
+                       "/follow_joint_trajectory";
+  config.joint_state_topic =
+      "/manyforge_commanded_sim_readiness_" + suffix + "/joint_states";
+  config.controller_state_topic =
+      "/manyforge_commanded_sim_readiness_" + suffix + "/controller_state";
+  config.command_gate_topic =
+      "/manyforge_commanded_sim_readiness_" + suffix + "/command_gate";
+  config.execution_state_source_mode = "commanded_sim";
+  config.initial_joint_positions_rad = {0.25};
+  config.sim_reset_motion_duration_s = 0.0;
+  config.wait_for_action_server_timeout_s = 1.0;
+  config.controller_binding = binding_contract_for(config, controller_manager);
+  config.controller_binding_refresh_timeout_s = 1.0;
+
+  FakeFjtServer server(config.action_name);
+  FakeControllerManager manager(controller_manager, *config.controller_binding);
+  auto sink = std::make_shared<RecordingExecutionStateSink>();
+  core::FakeClock clock;
+  core::ManualScheduler scheduler;
+  clock.set(1'000'000'000);
+  Ros2ControlExecutionBackend backend(sink, "arm", clock, scheduler, config);
+  ASSERT_TRUE(manager.wait_for_activity_subscription());
+
+  ASSERT_TRUE(server.wait_for_goal());
+  ASSERT_TRUE(server.succeed_current_goal());
+  const auto initialized = wait_for_binding_snapshot(
+      backend, [](const ControllerBindingSnapshot &candidate) {
+        return candidate.valid;
+      });
+  ASSERT_TRUE(initialized.has_value());
+  EXPECT_TRUE(backend.command_gate_enabled());
+
+  manager.set_controller_active(false);
+  const auto inactive = wait_for_binding_snapshot(
+      backend, [initialized](const ControllerBindingSnapshot &candidate) {
+        return candidate.activity_generation >
+                   initialized->activity_generation &&
+               !candidate.valid &&
+               has_reason(candidate, "trajectory_controller_inactive");
+      });
+  ASSERT_TRUE(inactive.has_value());
+  EXPECT_FALSE(backend.command_gate_enabled());
+
+  manager.set_controller_active(true);
+  ASSERT_TRUE(server.wait_for_goal_count(2));
+  ASSERT_TRUE(server.succeed_current_goal());
+  const auto recovered = wait_for_binding_snapshot(
+      backend, [inactive](const ControllerBindingSnapshot &candidate) {
+        return candidate.activity_generation > inactive->activity_generation &&
+               candidate.valid;
+      });
+  ASSERT_TRUE(recovered.has_value());
+  EXPECT_TRUE(backend.command_gate_enabled());
+}
+
+TEST(Ros2ControlExecutionBackendTest,
      AdmissionPublicationIsMonotonicAndIdempotent) {
   auto sink = std::make_shared<RecordingExecutionStateSink>();
   core::FakeClock clock;

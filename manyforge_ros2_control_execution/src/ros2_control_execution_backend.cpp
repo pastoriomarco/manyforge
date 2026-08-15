@@ -1504,6 +1504,9 @@ void Ros2ControlExecutionBackend::publish_controller_binding_snapshot(
 
 void Ros2ControlExecutionBackend::invalidate_controller_binding(
     std::string reason_code) {
+  if (is_commanded_sim_mode()) {
+    set_command_gate(false);
+  }
   ControllerBindingSnapshot snapshot;
   snapshot.activity_generation =
       controller_binding_activity_generation_.load(std::memory_order_acquire);
@@ -1751,8 +1754,23 @@ void Ros2ControlExecutionBackend::controller_binding_monitor_worker(
         snapshot.controller_type_matches && snapshot.claimed_interfaces_match &&
         snapshot.state_interfaces_available &&
         snapshot.conflicting_claims_absent && snapshot.reason_codes.empty();
+    if (!snapshot.valid && is_commanded_sim_mode()) {
+      set_command_gate(false);
+    } else if (snapshot.valid && is_commanded_sim_mode() &&
+               !config_.command_gate_topic.empty()) {
+      auto initialization = command_sim_initial_state(
+          "controller_binding_ready_commanded_sim_reset",
+          /*only_if_gate_closed=*/true);
+      if (!initialization.ok()) {
+        append_reason("commanded_sim_initialization_failed");
+        snapshot.valid = false;
+      }
+    }
     if (controller_binding_activity_generation_.load(
             std::memory_order_acquire) != activity_generation) {
+      if (is_commanded_sim_mode()) {
+        set_command_gate(false);
+      }
       request_controller_binding_refresh();
       continue;
     }
@@ -2454,8 +2472,14 @@ bool Ros2ControlExecutionBackend::end_controlled_stop_runtime_scale_freeze() {
 }
 
 core::Result<void>
-Ros2ControlExecutionBackend::command_sim_initial_state(std::string phase) {
+Ros2ControlExecutionBackend::command_sim_initial_state(
+    std::string phase, const bool only_if_gate_closed) {
   if (!is_commanded_sim_mode()) {
+    return core::Result<void>::Ok();
+  }
+  std::lock_guard<std::mutex> reset_lock(commanded_sim_reset_mutex_);
+  if (only_if_gate_closed &&
+      command_gate_enabled_.load(std::memory_order_acquire)) {
     return core::Result<void>::Ok();
   }
   if (config_.initial_joint_positions_rad.size() !=

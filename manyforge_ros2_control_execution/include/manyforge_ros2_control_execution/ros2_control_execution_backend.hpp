@@ -1006,7 +1006,9 @@ private:
       std::chrono::steady_clock::time_point deadline,
       std::stop_token stop_token = {});
   std::uint64_t complete_managed_controlled_stop_execution();
-  core::Result<void> command_sim_initial_state(std::string phase);
+  core::Result<void>
+  command_sim_initial_state(std::string phase,
+                            bool only_if_gate_closed = false);
   bool update_scene_positions(const std::vector<double> &joint_positions,
                               SceneUpdateMode mode = SceneUpdateMode::kBlocking,
                               std::int64_t source_timestamp_ns = 0);
@@ -1220,6 +1222,10 @@ private:
   // diagnostics so a closed gate is named as the rejection cause instead of
   // surfacing as an unexplained controller refusal.
   std::atomic<bool> command_gate_enabled_{false};
+  // Controller recovery and an operator Reset can both require the exact
+  // commanded-sim initialization goal. Serialize that physical boundary so a
+  // delayed readiness refresh cannot overlap or replay an admitted Reset.
+  mutable std::mutex commanded_sim_reset_mutex_;
 #ifdef MANYFORGE_HAS_SPEED_SCALING_FACTOR_MSG
   rclcpp::Publisher<control_msgs::msg::SpeedScalingFactor>::SharedPtr
       speed_scaling_pub_;
