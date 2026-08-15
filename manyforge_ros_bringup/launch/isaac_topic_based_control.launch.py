@@ -62,7 +62,7 @@ def generate_launch_description() -> LaunchDescription:
                 description="Exact GetCurrentWorld name required after LoadWorld.",
             ),
             DeclareLaunchArgument("scene_startup_timeout_s", default_value="180.0"),
-            DeclareLaunchArgument("scene_service_timeout_s", default_value="30.0"),
+            DeclareLaunchArgument("scene_service_timeout_s", default_value="120.0"),
             DeclareLaunchArgument(
                 "pose_observer_site_config",
                 default_value="",

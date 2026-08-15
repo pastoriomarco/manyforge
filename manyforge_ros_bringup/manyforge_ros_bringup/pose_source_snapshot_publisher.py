@@ -284,7 +284,14 @@ class PoseSourceSnapshotPublisher(Node):
             for binding in self._config.simulation_entities
         ):
             self._ensure_tf()
-        self._simulation_node = Node("manyforge_isaac_pose_service_client")
+        # The entrypoint deliberately owns a private rclpy Context.  Every
+        # auxiliary node must join that same context; falling back to rclpy's
+        # uninitialized global context makes the UR10 simulation-entity
+        # observer fail during construction while joint-only Lite6 profiles
+        # happen to remain unaffected.
+        self._simulation_node = Node(
+            "manyforge_isaac_pose_service_client", context=self.context
+        )
         self._simulation_client = self._simulation_client_factory(
             self._simulation_node,
             self._simulation_service_timeout_s,

@@ -7,6 +7,7 @@ import time
 import pytest
 import rclpy
 from rclpy.executors import SingleThreadedExecutor
+from rclpy.context import Context
 from rclpy.node import Node
 from sensor_msgs.msg import JointState
 
@@ -142,6 +143,39 @@ def test_ros_joint_state_adapter_forwards_good_and_unknown_manager_intents(
             rclpy.shutdown()
     assert dispatcher.started is True
     assert dispatcher.closed is True
+
+
+def test_simulation_auxiliary_node_uses_the_entrypoint_private_context(
+    tmp_path: Path,
+) -> None:
+    context = Context()
+    rclpy.init(context=context)
+    dispatcher = _FakeDispatcher()
+    publisher: pose_source_snapshot_publisher.PoseSourceSnapshotPublisher | None = (
+        None
+    )
+    try:
+        publisher = pose_source_snapshot_publisher.PoseSourceSnapshotPublisher(
+            site_config_path=(
+                _REPOSITORY_ROOT
+                / "manyforge_ros_bringup/config/isaac_ur10e_light.pose_observer.json"
+            ),
+            manager_state_root=tmp_path,
+            dispatcher_factory=lambda _root, _config, _callback: dispatcher,
+            simulation_client_factory=lambda node, _timeout_s: node,
+            context=context,
+        )
+
+        assert publisher.context is context
+        assert len(publisher.auxiliary_nodes) == 1
+        assert publisher.auxiliary_nodes[0].context is context
+    finally:
+        if publisher is not None:
+            for auxiliary in publisher.auxiliary_nodes:
+                auxiliary.destroy_node()
+            publisher.destroy_node()
+        if context.ok():
+            rclpy.shutdown(context=context)
 
 
 def test_entrypoint_has_no_retired_composer_or_deployment_owner_surface() -> None:

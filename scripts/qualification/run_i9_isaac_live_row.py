@@ -2218,7 +2218,8 @@ def _process_commands(
             f"world_uri:={config.spec.world_uri}",
             f"expected_world_name:={config.spec.world_name}",
             f"scene_startup_timeout_s:={config.startup_timeout_s}",
-            "scene_service_timeout_s:=30.0",
+            "scene_service_timeout_s:="
+            + str(min(config.startup_timeout_s, 120.0)),
             "controller_manager_lock_memory:=false",
             f"manager_state_root:={manager_root}",
             "pose_observer_site_config:="
