@@ -815,7 +815,6 @@ private:
 
   struct ProjectionAssets final {
     RetainedCollisionWorldProjector projector;
-    std::shared_ptr<const RetainedSceneFrameResolver> frame_resolver;
   };
 
   [[nodiscard]] static std::int64_t MonotonicNowNs() {
@@ -868,13 +867,7 @@ private:
         stage.srdf_path(), stage.package_paths(), group);
     auto projector = RetainedCollisionWorldProjector::create_verified(
         shared_model, *bundle, *model_map, *planning_model);
-    auto frame_resolver = RetainedSceneFrameResolver::create_verified(
-        std::move(shared_model), *bundle, *model_map, *planning_model,
-        core::RuntimeUnitId(config_.runtime_unit_id),
-        core::RuntimeEpoch(config_.runtime_epoch),
-        RetainedSceneFrameLocalStateMode::kCommandFencedNeutralBootstrap, {},
-        MonotonicNowNs());
-    ProjectionAssets assets{std::move(projector), std::move(frame_resolver)};
+    ProjectionAssets assets{std::move(projector)};
     const auto [inserted, unique] =
         projection_asset_cache_.emplace(cache_key, std::move(assets));
     Require(unique, "native projection model cache insertion conflicted");
@@ -906,7 +899,7 @@ private:
               "managed-native-projection-" +
                   request.native_runtime_binding.provider_binding_id.value(),
               256U, RetainedCollisionWorldPublisher::kDefaultLedgerCapacity},
-          MonotonicNowNs, std::move(assets.frame_resolver));
+          MonotonicNowNs);
       if (!created.ok()) {
         Fail("native projection construction failed: " +
              created.error().message);
@@ -919,8 +912,7 @@ private:
       Require(found->second != nullptr,
               "native projection registry contains an empty participant");
       auto prepared = found->second->PrepareCandidateProjection(
-          std::move(assets.projector), request.planning_collision_model,
-          std::move(assets.frame_resolver));
+          std::move(assets.projector), request.planning_collision_model);
       if (!prepared.ok()) {
         Fail("native projection candidate preparation failed: " +
              prepared.error().message);
@@ -4439,14 +4431,12 @@ BuildProductComposition(CompositionBuildInput input) {
               channel->query_context(),
               channel->source_kind(),
               std::shared_ptr<const core::IObservedStateProvider>(
-                  channel, channel->addressed_publication()),
-              {}});
+                  channel, channel->addressed_publication())});
         }
         return RetainedSceneFrameResolver::create_verified(
             reference_collision_model, *input.bundle, input.model_map,
             *retained_model, reference_runtime_unit_id, reference_runtime_epoch,
-            RetainedSceneFrameLocalStateMode::kRequireDirectProviders,
-            std::move(state_sources), 0);
+            std::move(state_sources));
       },
       std::move(participant_resolver),
       participant_resolver_factory,

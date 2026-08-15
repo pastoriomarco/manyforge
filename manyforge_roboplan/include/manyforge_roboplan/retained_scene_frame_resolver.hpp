@@ -27,26 +27,11 @@ struct RetainedSceneFrameStateSourceInput final {
   core::ObservedStateSourceKind publication_source{
       core::ObservedStateSourceKind::kPredictedState};
   std::shared_ptr<const core::IObservedStateProvider> provider;
-  std::string local_source_id;
 };
 
 struct RetainedSceneFrameComponentAttachmentInput final {
   core::ComponentAttachmentId component_attachment_id;
   core::ComponentAttachmentRevision component_attachment_revision;
-};
-
-/// Construction policy for state owned by the selected local runtime unit.
-///
-/// A command-capable runtime must use kRequireDirectProviders and register the
-/// exact existing owner publications. Explicit non-local providers use the
-/// same port and retain their source runtime epoch, which preserves the c2
-/// external receiver seam without adding transport here. The neutral bootstrap
-/// is reserved for the Manager child while its command surface is explicitly
-/// fenced closed; it must not silently survive activation of a command-capable
-/// composition.
-enum class RetainedSceneFrameLocalStateMode {
-  kRequireDirectProviders,
-  kCommandFencedNeutralBootstrap,
 };
 
 struct RetainedSceneFrameResolverInput final {
@@ -59,12 +44,13 @@ struct RetainedSceneFrameResolverInput final {
   std::vector<RetainedSceneFrameComponentAttachmentInput> component_attachments;
   std::vector<RetainedSceneFrameStateSourceInput> state_sources;
   std::int64_t maximum_receiver_time_skew_ns{10'000'000};
-  std::int64_t initialization_time_ns{};
 };
 
 /// Exact retained-graph scene-frame resolver. It builds c1 immutable state
 /// views from direct local providers or the unchanged c2 external provider
-/// seam, then evaluates FK against fresh model scratch only.
+/// seam, then evaluates FK against fresh model scratch only. A command-fenced
+/// projection is staged without a resolver; it never fabricates a local state
+/// publication and receives this resolver only from the active composition.
 class RetainedSceneFrameResolver final : public core::IReferencePoseResolver {
 public:
   [[nodiscard]] static std::shared_ptr<RetainedSceneFrameResolver>
@@ -81,9 +67,7 @@ public:
       const VerifiedRetainedPlanningModel &planning_model,
       const core::RuntimeUnitId &local_runtime_unit_id,
       const core::RuntimeEpoch &local_runtime_epoch,
-      const RetainedSceneFrameLocalStateMode local_state_mode,
-      std::vector<RetainedSceneFrameStateSourceInput> provided_state_sources,
-      const std::int64_t initialization_time_ns) {
+      std::vector<RetainedSceneFrameStateSourceInput> provided_state_sources) {
     if (!verify_retained_bundle_identity(retained_bundle)) {
       throw std::invalid_argument(
           "scene-frame resolver received an unverifiable retained bundle");
@@ -93,8 +77,7 @@ public:
             retained_bundle.retained_bundle_id() ||
         planning_model.query().retained_bundle_id !=
             retained_bundle.retained_bundle_id() ||
-        local_runtime_unit_id.empty() || local_runtime_epoch.empty() ||
-        initialization_time_ns < 0) {
+        local_runtime_unit_id.empty() || local_runtime_epoch.empty()) {
       throw std::invalid_argument(
           "scene-frame resolver crosses retained or runtime identity");
     }
@@ -108,8 +91,7 @@ public:
         {},
         {},
         {},
-        10'000'000,
-        initialization_time_ns};
+        10'000'000};
 
     for (const auto &attachment :
          retained_bundle.value().cell_graph.component_attachments) {
@@ -163,7 +145,7 @@ public:
         [&](const RetainedSceneFrameStateSourceInput &source,
             const core::ObservedStateQueryContextDTO &context,
             const bool local) {
-          return source.provider && source.local_source_id.empty() &&
+          return source.provider &&
                  source_matches_authority(context.state_authority_class,
                                           source.publication_source) &&
                  source.context.controllable_component_id ==
@@ -381,35 +363,21 @@ public:
         if (!local) {
           continue;
         }
-        if (local_state_mode ==
-            RetainedSceneFrameLocalStateMode::kRequireDirectProviders) {
-          const auto covered_by_direct_source =
-              std::any_of(input.state_sources.begin(),
-                          input.state_sources.end(),
-                          [&](const auto &source) {
-                            return source_group_covers(source, context, local);
-                          }) ||
-              std::any_of(provided_state_sources.begin(),
-                          provided_state_sources.end(),
-                          [&](const auto &source) {
-                            return source_group_covers(source, context, local);
-                          });
-          if (covered_by_direct_source) {
-            continue;
-          }
-          throw std::invalid_argument(
-              "scene-frame direct local state provider is missing");
+        const auto covered_by_direct_source =
+            std::any_of(input.state_sources.begin(), input.state_sources.end(),
+                        [&](const auto &source) {
+                          return source_group_covers(source, context, local);
+                        }) ||
+            std::any_of(provided_state_sources.begin(),
+                        provided_state_sources.end(),
+                        [&](const auto &source) {
+                          return source_group_covers(source, context, local);
+                        });
+        if (covered_by_direct_source) {
+          continue;
         }
-        if (graph_binding->state_authority_class !=
-            core::StateAuthorityClass::kPredicted) {
-          throw std::invalid_argument(
-              "scene-frame neutral local state authority is invalid");
-        }
-        input.state_sources.push_back(
-            {std::move(context), core::ObservedStateSourceKind::kPredictedState,
-             nullptr,
-             "manager-native-frame-state/" + local_runtime_unit_id.value() +
-                 "/" + graph_binding->control_binding_id.value()});
+        throw std::invalid_argument(
+            "scene-frame direct local state provider is missing");
       }
     }
     if (!provided_state_sources.empty()) {

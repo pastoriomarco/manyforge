@@ -1,5 +1,4 @@
 #include <cmath>
-#include <manyforge_core/addressed_observed_state_publication.hpp>
 #include <manyforge_core/geometry/pose_math.hpp>
 #include <manyforge_core/kinematic_state_view_provider.hpp>
 #include <manyforge_roboplan/retained_scene_frame_resolver.hpp>
@@ -38,36 +37,6 @@ position_value(const core::CoordinatePositionDTO &position) noexcept {
     return angular->value_rad;
   }
   return std::get<core::LinearPositionDTO>(position).value_m;
-}
-
-[[nodiscard]] core::ObservedRobotStateSourceKind
-numeric_source_kind(const core::ObservedStateSourceKind source) noexcept {
-  switch (source) {
-  case core::ObservedStateSourceKind::kActionFeedback:
-    return core::ObservedRobotStateSourceKind::kActionFeedback;
-  case core::ObservedStateSourceKind::kControllerState:
-    return core::ObservedRobotStateSourceKind::kControllerState;
-  case core::ObservedStateSourceKind::kJointState:
-    return core::ObservedRobotStateSourceKind::kJointState;
-  case core::ObservedStateSourceKind::kCommandedState:
-    return core::ObservedRobotStateSourceKind::kCommandedState;
-  case core::ObservedStateSourceKind::kPredictedState:
-    return core::ObservedRobotStateSourceKind::kPredictedState;
-  }
-  return core::ObservedRobotStateSourceKind::kJointState;
-}
-
-[[nodiscard]] core::ObservedRobotStateAuthorityProfile
-authority_profile(const core::StateAuthorityClass authority) {
-  switch (authority) {
-  case core::StateAuthorityClass::kMeasured:
-    return core::ObservedRobotStateAuthorityProfile::kMeasured;
-  case core::StateAuthorityClass::kCommanded:
-    return core::ObservedRobotStateAuthorityProfile::kCommandedSimulation;
-  case core::StateAuthorityClass::kPredicted:
-    return core::ObservedRobotStateAuthorityProfile::kPredictedNative;
-  }
-  throw std::invalid_argument("unknown frame-state authority class");
 }
 
 [[nodiscard]] bool
@@ -227,12 +196,9 @@ public:
 
   Impl(collision::ManyForgeCollisionEngine::SharedModelPtr model,
        RetainedSceneFrameResolverInput input,
-       std::vector<std::shared_ptr<core::AddressedObservedStatePublication>>
-           local_publications,
        std::vector<Source> sources,
        std::unique_ptr<core::ImmutableKinematicStateViewProvider> view_provider)
       : model_(std::move(model)), input_(std::move(input)),
-        local_publications_(std::move(local_publications)),
         sources_(std::move(sources)), view_provider_(std::move(view_provider)) {
   }
 
@@ -418,8 +384,6 @@ public:
 
   collision::ManyForgeCollisionEngine::SharedModelPtr model_;
   RetainedSceneFrameResolverInput input_;
-  std::vector<std::shared_ptr<core::AddressedObservedStatePublication>>
-      local_publications_;
   std::vector<Source> sources_;
   std::unique_ptr<core::ImmutableKinematicStateViewProvider> view_provider_;
 };
@@ -430,8 +394,7 @@ std::shared_ptr<RetainedSceneFrameResolver> RetainedSceneFrameResolver::create(
   if (!shared_model || input.retained_bundle_id.empty() ||
       input.graph_revision.empty() || input.cell_id.empty() ||
       input.compiled_cell_frame_name.empty() || input.frame_paths.empty() ||
-      input.maximum_receiver_time_skew_ns < 0 ||
-      input.initialization_time_ns < 0) {
+      input.maximum_receiver_time_skew_ns < 0) {
     throw std::invalid_argument(
         "retained scene-frame resolver input is incomplete");
   }
@@ -489,62 +452,19 @@ std::shared_ptr<RetainedSceneFrameResolver> RetainedSceneFrameResolver::create(
     }
   }
 
-  std::vector<std::shared_ptr<core::AddressedObservedStatePublication>>
-      local_publications;
   std::vector<Impl::Source> sources;
   std::vector<core::KinematicObservedStateSourceBinding> provider_bindings;
   for (auto &input_source : input.state_sources) {
-    std::shared_ptr<const core::IObservedStateProvider> provider =
-        input_source.provider;
-    if (provider && !input_source.local_source_id.empty()) {
+    if (!input_source.provider) {
       throw std::invalid_argument(
-          "direct frame-state provider also declares a bootstrap source");
-    }
-    if (!provider) {
-      if (input_source.local_source_id.empty() ||
-          input_source.context.state_authority_class !=
-              core::StateAuthorityClass::kPredicted ||
-          input_source.publication_source !=
-              core::ObservedStateSourceKind::kPredictedState) {
-        throw std::invalid_argument(
-            "local frame-state source is not exact predicted authority");
-      }
-      auto neutral = collision::ManyForgeCollisionEngine::
-          retained_neutral_scalar_joint_positions(
-              shared_model, input_source.context.joint_names);
-      if (!neutral.ok()) {
-        throw std::invalid_argument(neutral.error().message);
-      }
-      auto publication =
-          std::make_shared<core::AddressedObservedStatePublication>(
-              core::AddressedObservedStatePublicationConfig{
-                  input_source.context,
-                  {core::ObservedRobotStateSourceConfig{
-                      numeric_source_kind(input_source.publication_source),
-                      input_source.local_source_id,
-                      authority_profile(
-                          input_source.context.state_authority_class),
-                      input_source.context.freshness_budget_ns,
-                      "retained_scene_frame_local_state"}},
-                  1U,
-                  256U});
-      const std::vector<double> velocities(neutral.value().size(), 0.0);
-      const auto published = publication->publish(
-          input_source.publication_source, input_source.context.joint_names,
-          neutral.value(), velocities, input.initialization_time_ns,
-          input.initialization_time_ns);
-      if (!published.published || !published.complete) {
-        throw std::invalid_argument(
-            "retained scene-frame neutral state could not be published");
-      }
-      provider = publication;
-      local_publications.push_back(std::move(publication));
+          "retained scene-frame state provider is missing");
     }
     sources.push_back(
-        {input_source.context, input_source.publication_source, provider});
+        {input_source.context, input_source.publication_source,
+         input_source.provider});
     provider_bindings.push_back({input_source.context.control_binding_id,
                                  input_source.context.control_binding_revision,
-                                 std::move(provider)});
+                                 std::move(input_source.provider)});
   }
   std::sort(sources.begin(), sources.end(),
             [](const auto &left, const auto &right) {
@@ -567,8 +487,7 @@ std::shared_ptr<RetainedSceneFrameResolver> RetainedSceneFrameResolver::create(
           std::move(provider_bindings));
   return std::shared_ptr<RetainedSceneFrameResolver>(
       new RetainedSceneFrameResolver(std::make_shared<Impl>(
-          std::move(shared_model), std::move(input),
-          std::move(local_publications), std::move(sources),
+          std::move(shared_model), std::move(input), std::move(sources),
           std::move(view_provider))));
 }
 

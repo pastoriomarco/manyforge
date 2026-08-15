@@ -1901,8 +1901,7 @@ TEST(
   EXPECT_THROW(
       static_cast<void>(RetainedSceneFrameResolver::create_verified(
           collision_model, *materialized.bundle, model_map, retained,
-          local_runtime_unit_id, local_runtime_epoch,
-          RetainedSceneFrameLocalStateMode::kRequireDirectProviders, {}, 10)),
+          local_runtime_unit_id, local_runtime_epoch, {})),
       std::invalid_argument);
 
   const std::shared_ptr<const core::IObservedStateProvider> arm_provider(
@@ -1912,25 +1911,20 @@ TEST(
   const std::vector<RetainedSceneFrameStateSourceInput> provided_state_sources{
       {arm_channel->query_context(),
        core::ObservedStateSourceKind::kPredictedState,
-       arm_provider,
-       {}},
+       arm_provider},
       {gripper_channel->query_context(),
        core::ObservedStateSourceKind::kPredictedState,
-       gripper_provider,
-       {}}};
+       gripper_provider}};
   auto resolver = RetainedSceneFrameResolver::create_verified(
       collision_model, *materialized.bundle, model_map, retained,
-      local_runtime_unit_id, local_runtime_epoch,
-      RetainedSceneFrameLocalStateMode::kRequireDirectProviders,
-      provided_state_sources, 10);
+      local_runtime_unit_id, local_runtime_epoch, provided_state_sources);
   ASSERT_NE(resolver, nullptr);
 
   auto external_resolver = RetainedSceneFrameResolver::create_verified(
       collision_model, *materialized.bundle, model_map, retained,
       core::RuntimeUnitId("scene-frame-external-consumer"),
       core::RuntimeEpoch("scene-frame-external-receiver-epoch"),
-      RetainedSceneFrameLocalStateMode::kRequireDirectProviders,
-      provided_state_sources, 10);
+      provided_state_sources);
   ASSERT_NE(external_resolver, nullptr);
 
   const auto logical_scene = make_projection_runtime_shadow_snapshot(
@@ -2318,15 +2312,12 @@ TEST(RetainedProductCrossConsumer,
                   channel->query_context(),
                   channel->source_kind(),
                   std::shared_ptr<const core::IObservedStateProvider>(
-                      channel, channel->addressed_publication()),
-                  {}});
+                      channel, channel->addressed_publication())});
             }
             return RetainedSceneFrameResolver::create_verified(
                 shared_collision_model, *materialized.bundle, model_map,
                 retained, local_runtime.runtime_unit_id,
-                local_runtime.runtime_epoch,
-                RetainedSceneFrameLocalStateMode::kRequireDirectProviders,
-                std::move(state_sources), 0);
+                local_runtime.runtime_epoch, std::move(state_sources));
           },
           {},
           {},
@@ -3686,8 +3677,9 @@ TEST(RetainedProductCrossConsumer,
             "runtime_program_binding_unavailable");
 }
 
-TEST(RetainedProductCrossConsumer,
-     PlannerSceneProjectionPreparesCrossBundleCandidateBeforeStage) {
+TEST(
+    RetainedProductCrossConsumer,
+    PlannerSceneProjectionStagesWithoutFabricatedFrameStateBeforeDirectInstall) {
   ScopedTemporaryRoot temporary;
   const std::filesystem::path package_root =
       temporary.path() / "retained-package";
@@ -3772,6 +3764,20 @@ TEST(RetainedProductCrossConsumer,
   ASSERT_TRUE(projection_result.ok()) << projection_result.error().message;
   auto projection = std::move(projection_result.value());
   EXPECT_EQ(projection->collision_shared_model(), predecessor_shared_model);
+  const auto predecessor_lease = projection->RetainProjection(
+      predecessor_revision,
+      core::ProjectionLeaseId("command-fenced-predecessor-lease"));
+  ASSERT_TRUE(predecessor_lease.ok())
+      << predecessor_lease.error().message;
+  const auto predecessor_frame = projection->ResolveSceneFrame(
+      core::SceneFrameResolutionQueryDTO{
+          core::CellSceneFrameRefDTO{core::CellId(std::string(cell_id))},
+          predecessor_lease.value().projection_binding});
+  ASSERT_FALSE(predecessor_frame.ok());
+  EXPECT_EQ(predecessor_frame.error().details.at("reason"),
+            "native_scene_frame_lease_unavailable");
+  projection->ReleaseProjection(
+      predecessor_lease.value().projection_binding.projection_lease_id);
   const auto predecessor_world = projection->snapshot();
   ASSERT_NE(predecessor_world, nullptr);
 
@@ -3823,6 +3829,19 @@ TEST(RetainedProductCrossConsumer,
       projection->ProjectionHealth().healthy_for_target(candidate_revision));
   EXPECT_EQ(projection->collision_shared_model(), candidate_shared_model);
   EXPECT_NE(projection->snapshot(), predecessor_world);
+  const auto candidate_lease = projection->RetainProjection(
+      candidate_revision,
+      core::ProjectionLeaseId("command-fenced-candidate-lease"));
+  ASSERT_TRUE(candidate_lease.ok()) << candidate_lease.error().message;
+  const auto candidate_frame = projection->ResolveSceneFrame(
+      core::SceneFrameResolutionQueryDTO{
+          core::CellSceneFrameRefDTO{core::CellId(std::string(cell_id))},
+          candidate_lease.value().projection_binding});
+  ASSERT_FALSE(candidate_frame.ok());
+  EXPECT_EQ(candidate_frame.error().details.at("reason"),
+            "native_scene_frame_lease_unavailable");
+  projection->ReleaseProjection(
+      candidate_lease.value().projection_binding.projection_lease_id);
 }
 
 } // namespace

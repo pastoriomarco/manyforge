@@ -71,10 +71,11 @@ public:
       std::shared_ptr<const RetainedSceneFrameResolver>
           candidate_frame_resolver = nullptr);
 
-  /// Replace the command-fenced bootstrap resolver with the direct-provider
-  /// resolver assembled by the exact active physical composition. The caller
-  /// performs this once while the Apply configuration fence is held, after
-  /// candidate participants are installed and before command admission opens.
+  /// Install the direct-provider resolver assembled by the exact active
+  /// physical composition. A command-fenced candidate is staged without any
+  /// frame resolver or fabricated state. The caller performs this once while
+  /// the Apply configuration fence is held, after candidate participants are
+  /// installed and before command admission opens.
   [[nodiscard]] core::Result<void> InstallActiveFrameResolver(
       const core::ProjectionRevisionDTO &expected_active_revision,
       std::shared_ptr<const RetainedSceneFrameResolver> frame_resolver);
