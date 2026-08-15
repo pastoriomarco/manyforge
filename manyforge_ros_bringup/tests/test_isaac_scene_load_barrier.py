@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections.abc import Callable
 import threading
 from types import SimpleNamespace
 
@@ -127,14 +128,24 @@ def test_scene_barrier_runs_against_typed_fake_simulator() -> None:
     worker: threading.Thread | None = None
     try:
         simulator = Node("manyforge_fake_simulation_interfaces_owner")
-        _install_fake_simulator(simulator)
-        for topic, message_type in (
-            ("/clock", Clock),
-            ("/isaac_joint_states", JointState),
-            ("/isaac_joint_commands", JointState),
-            ("/isaac_gripper_state", JointState),
-        ):
-            simulator.create_publisher(message_type, topic, 1)
+        publishers = []
+
+        def publish_loaded_world_topics() -> None:
+            if publishers:
+                return
+            for topic, message_type in (
+                ("/clock", Clock),
+                ("/isaac_joint_states", JointState),
+                ("/isaac_joint_commands", JointState),
+                ("/isaac_gripper_state", JointState),
+            ):
+                publishers.append(
+                    simulator.create_publisher(message_type, topic, 1)
+                )
+
+        _install_fake_simulator(
+            simulator, on_load=publish_loaded_world_topics
+        )
         executor.add_node(simulator)
         worker = threading.Thread(target=executor.spin, daemon=True)
         worker.start()
@@ -182,7 +193,11 @@ def test_scene_barrier_runs_against_typed_fake_simulator() -> None:
             rclpy.shutdown()
 
 
-def _install_fake_simulator(node: Node) -> None:
+def _install_fake_simulator(
+    node: Node,
+    *,
+    on_load: Callable[[], None] | None = None,
+) -> None:
     feature_values = [
         int(SimulatorFeatures.WORLD_LOADING),
         int(SimulatorFeatures.WORLD_INFO_GETTING),
@@ -211,12 +226,17 @@ def _install_fake_simulator(node: Node) -> None:
         response.result.result = response.result.RESULT_OK
         return response
 
+    def load_world(_request, response):
+        if on_load is not None:
+            on_load()
+        return populate_world(response)
+
     node.create_service(
         GetSimulatorFeatures,
         "/get_simulator_features",
         features,
     )
-    node.create_service(LoadWorld, "/load_world", lambda _r, value: populate_world(value))
+    node.create_service(LoadWorld, "/load_world", load_world)
     node.create_service(
         GetCurrentWorld,
         "/get_current_world",

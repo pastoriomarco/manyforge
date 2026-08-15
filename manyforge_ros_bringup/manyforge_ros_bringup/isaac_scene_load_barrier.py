@@ -175,7 +175,8 @@ class IsaacSceneLoadBarrier(Node):
             raise ValueError("required_topics must be a bounded absolute-name list")
 
     def run(self) -> dict[str, Any]:
-        services = self._wait_for_services_and_topics()
+        startup_deadline = time.monotonic() + self.startup_timeout_s
+        services = self._wait_for_services(startup_deadline)
         features = self._call(
             services["features"],
             GetSimulatorFeatures,
@@ -243,6 +244,7 @@ class IsaacSceneLoadBarrier(Node):
             state = self._read_state(services["get_state"])
         if state != int(SimulationState.STATE_STOPPED):
             raise RuntimeError("Isaac world did not converge to stopped state")
+        self._wait_for_required_topics(startup_deadline)
 
         return {
             "schema_version": RESULT_SCHEMA,
@@ -254,35 +256,43 @@ class IsaacSceneLoadBarrier(Node):
             "features": sorted(observed_features),
         }
 
-    def _wait_for_services_and_topics(self) -> dict[str, str]:
-        deadline = time.monotonic() + self.startup_timeout_s
+    def _wait_for_services(self, deadline: float) -> dict[str, str]:
         last_services: dict[str, str] = {}
-        last_topics: set[str] = set()
         while time.monotonic() < deadline:
             graph = self.get_service_names_and_types()
             selected = {
                 key: select_service_name(graph, service_type=value)
                 for key, value in _SERVICE_TYPES.items()
             }
+            last_services = {
+                key: value for key, value in selected.items() if value is not None
+            }
+            if len(last_services) == len(_SERVICE_TYPES):
+                return last_services
+            time.sleep(0.05)
+        missing_services = sorted(set(_SERVICE_TYPES) - set(last_services))
+        raise TimeoutError(
+            "Isaac simulation-control readiness timed out; missing services="
+            f"{missing_services}"
+        )
+
+    def _wait_for_required_topics(self, deadline: float) -> None:
+        last_topics: set[str] = set()
+        required = set(self.required_topics)
+        while time.monotonic() < deadline:
             topic_rows = self.get_topic_names_and_types()
             last_topics = {
                 name
                 for name, types in topic_rows
                 if isinstance(types, (list, tuple)) and types
             }
-            last_services = {
-                key: value for key, value in selected.items() if value is not None
-            }
-            if len(last_services) == len(_SERVICE_TYPES) and set(
-                self.required_topics
-            ).issubset(last_topics):
-                return last_services
+            if required.issubset(last_topics):
+                return
             time.sleep(0.05)
-        missing_services = sorted(set(_SERVICE_TYPES) - set(last_services))
-        missing_topics = sorted(set(self.required_topics) - last_topics)
+        missing_topics = sorted(required - last_topics)
         raise TimeoutError(
-            "Isaac graph readiness timed out; missing services="
-            f"{missing_services}, topics={missing_topics}"
+            "Isaac loaded-world topic readiness timed out; missing topics="
+            f"{missing_topics}"
         )
 
     def _call(self, service_name: str, service_type: type, request: object) -> object:
