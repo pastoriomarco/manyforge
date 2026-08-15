@@ -715,7 +715,7 @@
         {
           "scenario_id": "isaac-lite6-pick-place",
           "scenario_aliases": [],
-          "program_source": "examples/lite6_lite_gripper_pick_and_place.program.yaml",
+          "program_source": "examples/isaac_lite6_lite_gripper_pick_and_place.program.yaml",
           "component_roles": {
             "robot": "isaac_lite6_robot",
             "tool": "isaac_lite6_robot"
@@ -786,7 +786,7 @@
         {
           "scenario_id": "isaac-ur10e-light-scene-assistant",
           "scenario_aliases": ["isaac-assistant"],
-          "program_source": "examples/pick_and_place_ur10e_robotiq.program.yaml",
+          "program_source": "examples/isaac_manipulator_scene_light.program.yaml",
           "component_roles": {
             "robot": "isaac_ur10e_assistant_robot",
             "tool": "isaac_ur10e_assistant_robot"
@@ -855,7 +855,7 @@
         {
           "scenario_id": "isaac-ur10e-light-scene",
           "scenario_aliases": ["isaac-light"],
-          "program_source": "examples/pick_and_place_ur10e_robotiq.program.yaml",
+          "program_source": "examples/isaac_manipulator_scene_light.program.yaml",
           "component_roles": {
             "robot": "isaac_ur10e_light_robot",
             "tool": "isaac_ur10e_light_robot"
@@ -924,7 +924,7 @@
         {
           "scenario_id": "isaac-ur10e-light-scene-collision",
           "scenario_aliases": [],
-          "program_source": "examples/pick_and_place_ur10e_robotiq.program.yaml",
+          "program_source": "examples/isaac_manipulator_scene_light_collision.program.yaml",
           "component_roles": {
             "robot": "isaac_ur10e_collision_robot",
             "tool": "isaac_ur10e_collision_robot"
@@ -1200,7 +1200,7 @@
         {
           "scenario_id": "isaac-lite6-trocar-foundationpose",
           "scenario_aliases": [],
-          "program_source": "examples/lite6_lite_gripper_pick_and_place.program.yaml",
+          "program_source": "examples/trocar_lite6_foundationpose_pick.program.yaml",
           "component_roles": {
             "robot": "isaac_lite6_trocar_robot",
             "tool": "isaac_lite6_trocar_robot"

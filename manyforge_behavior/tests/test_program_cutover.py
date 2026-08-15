@@ -28,14 +28,20 @@ from manyforge_behavior.program import (
 
 _ROOT = Path(__file__).resolve().parents[2]
 _MAINTAINED_PROGRAMS = (
+    "examples/isaac_lite6_lite_gripper_pick_and_place.program.yaml",
+    "examples/isaac_manipulator_scene_light.program.yaml",
+    "examples/isaac_manipulator_scene_light_collision.program.yaml",
     "examples/lite6_lite_gripper_pick_and_place.program.yaml",
     "examples/pick_and_place.program.yaml",
     "examples/pick_and_place_minimal.program.yaml",
     "examples/pick_and_place_ur10e_robotiq.program.yaml",
     "examples/semantic_shape_pick.program.yaml",
+    "examples/trocar_lite6_foundationpose_pick.program.yaml",
     "examples/vision_guided_bin_pick.program.yaml",
     "examples/vision_guided_pose_pick.program.yaml",
 )
+_MINIMAL_PROGRAM = "examples/pick_and_place_minimal.program.yaml"
+_CONTACT_PROGRAM = "examples/semantic_shape_pick.program.yaml"
 
 
 def _catalog() -> NodeCatalog:
@@ -107,7 +113,7 @@ def test_maintained_v1_programs_validate_against_active_catalog(
 
 def test_program_document_copy_is_detached() -> None:
     catalog = _catalog()
-    program = Program(_ROOT / _MAINTAINED_PROGRAMS[2], catalog)
+    program = Program(_ROOT / _MINIMAL_PROGRAM, catalog)
 
     first = program.to_dict()
     first["tree"]["parameters"]["unexpected"] = True
@@ -117,7 +123,7 @@ def test_program_document_copy_is_detached() -> None:
 
 def test_program_rejects_stale_revision_before_semantic_use() -> None:
     catalog = _catalog()
-    document = load_strict_json_yaml(_ROOT / _MAINTAINED_PROGRAMS[2])
+    document = load_strict_json_yaml(_ROOT / _MINIMAL_PROGRAM)
     document["name"] = "changed without updating identity"
 
     with pytest.raises(ProgramValidationError, match="content identity mismatch"):
@@ -126,7 +132,7 @@ def test_program_rejects_stale_revision_before_semantic_use() -> None:
 
 def test_program_rejects_removed_singleton_surface() -> None:
     catalog = _catalog()
-    document = load_strict_json_yaml(_ROOT / _MAINTAINED_PROGRAMS[2])
+    document = load_strict_json_yaml(_ROOT / _MINIMAL_PROGRAM)
     document["robot"] = {"robot_id": "ur5", "group_id": "manipulator"}
 
     with pytest.raises(ProgramValidationError, match="unknown fields.*robot"):
@@ -135,7 +141,7 @@ def test_program_rejects_removed_singleton_surface() -> None:
 
 def test_program_rejects_dynamic_target_selection() -> None:
     catalog = _catalog()
-    document = load_strict_json_yaml(_ROOT / _MAINTAINED_PROGRAMS[2])
+    document = load_strict_json_yaml(_ROOT / _MINIMAL_PROGRAM)
     document["parameters"].append(
         {
             "parameter_id": "selected_target",
@@ -159,7 +165,7 @@ def test_program_rejects_dynamic_target_selection() -> None:
 
 def test_program_rejects_value_source_type_mismatch() -> None:
     catalog = _catalog()
-    document = load_strict_json_yaml(_ROOT / _MAINTAINED_PROGRAMS[2])
+    document = load_strict_json_yaml(_ROOT / _MINIMAL_PROGRAM)
     declaration = document["parameters"][0]
     declaration["type"] = "bool"
     declaration["default"] = True
@@ -171,7 +177,7 @@ def test_program_rejects_value_source_type_mismatch() -> None:
 
 def test_program_rejects_duplicate_source_joint_goal() -> None:
     catalog = _catalog()
-    document = load_strict_json_yaml(_ROOT / _MAINTAINED_PROGRAMS[2])
+    document = load_strict_json_yaml(_ROOT / _MINIMAL_PROGRAM)
     goal = document["tree"]["children"][0]["parameters"]["goal"]
     goal.append(deepcopy(goal[0]))
 
@@ -181,7 +187,7 @@ def test_program_rejects_duplicate_source_joint_goal() -> None:
 
 def test_program_accepts_ordered_free_text_parameter_defaults() -> None:
     catalog = _catalog()
-    document = load_strict_json_yaml(_ROOT / _MAINTAINED_PROGRAMS[2])
+    document = load_strict_json_yaml(_ROOT / _MINIMAL_PROGRAM)
     document["parameters"] = [
         {
             "parameter_id": "labels",
@@ -229,7 +235,7 @@ def test_translated_historical_program_negative_corpus(
     message: str,
 ) -> None:
     catalog = _catalog()
-    document = load_strict_json_yaml(_ROOT / _MAINTAINED_PROGRAMS[2])
+    document = load_strict_json_yaml(_ROOT / _MINIMAL_PROGRAM)
     move = document["tree"]["children"][0]
 
     if mutation == "catalog_version":
@@ -290,7 +296,7 @@ def test_translated_historical_program_negative_corpus(
 
 def test_contact_selector_must_resolve_to_one_declared_target() -> None:
     catalog = _catalog()
-    document = load_strict_json_yaml(_ROOT / _MAINTAINED_PROGRAMS[4])
+    document = load_strict_json_yaml(_ROOT / _CONTACT_PROGRAM)
     document["target_roles"]["gripper_secondary"] = deepcopy(
         document["target_roles"]["gripper"]
     )

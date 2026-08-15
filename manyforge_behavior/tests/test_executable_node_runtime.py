@@ -649,7 +649,14 @@ def test_program_run_reuses_thin_ports_and_preserves_portable_inputs() -> None:
     assert len(task.starts) == 1
 
 
-def test_all_maintained_program_node_forms_execute_through_the_closed_runner() -> None:
+def test_all_maintained_program_node_forms_execute_through_the_closed_runner(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        py_trees.timers,
+        "Timer",
+        lambda name, duration: py_trees.behaviours.Success(name=name),
+    )
     index = json.loads(
         _MAINTAINED_PROGRAM_INDEX.read_text(encoding="utf-8")
     )
@@ -661,7 +668,7 @@ def test_all_maintained_program_node_forms_execute_through_the_closed_runner() -
             }
         )
     )
-    assert len(sources) == 7
+    assert len(sources) == 11
     environment = build_node_environment()
     exercised: set[str] = set()
 
@@ -695,11 +702,17 @@ def test_all_maintained_program_node_forms_execute_through_the_closed_runner() -
         "motion.move_to_pose",
         "motion.pick_object",
         "motion.place_object",
+        "parallel",
         "planning.plan_pick_sequence",
+        "scene.add_object",
         "scene.attach_carried_object",
         "scene.detach_carried_object",
         "scene.remove_object",
         "sequence",
+        "simulation.reset",
+        "simulation.set_entity_pose",
+        "simulation.set_state",
+        "timer",
     }
 
 

@@ -1124,20 +1124,20 @@ void verify_resolved_program_binding(
     verify_resolved_program_binding(*binding, *product->second.bundle,
                                     product->second.model_map);
   }
-  const auto reused_program = program_bundles.find(
+  const auto reused_generic_ur_program = program_bundles.find(
       "sha256:"
       "385569e5d9b2c2628abf67fc4633583e97cd9cfb0fc881d3cf3bae0750d2951a");
-  const auto reused_lite6_program = program_bundles.find(
+  const auto reused_isaac_ur_program = program_bundles.find(
       "sha256:"
-      "3569bdaa98278af447084b31f2e2f920e4b760e8c60ce803de1a18aac78ee7f2");
-  if (binding_ids.size() != 13U || program_revisions.size() != 7U ||
-      reopened.size() != 13U || program_reopened.size() != 7U ||
-      reused_program == program_bundles.end() ||
-      reused_program->second.size() != 5U ||
-      reused_lite6_program == program_bundles.end() ||
-      reused_lite6_program->second.size() != 3U) {
+      "85e8b2bae0a338e652e6b59c408a55511bb4162d0a82020ccf75b8187cef21af");
+  if (binding_ids.size() != 13U || program_revisions.size() != 11U ||
+      reopened.size() != 13U || program_reopened.size() != 11U ||
+      reused_generic_ur_program == program_bundles.end() ||
+      reused_generic_ur_program->second.size() != 2U ||
+      reused_isaac_ur_program == program_bundles.end() ||
+      reused_isaac_ur_program->second.size() != 2U) {
     throw std::logic_error(
-        "maintained Program-Binding set loses its seven-to-thirteen closure");
+        "maintained Program-Binding set loses its eleven-to-thirteen closure");
   }
   return stored;
 }

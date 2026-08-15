@@ -1,0 +1,95 @@
+{
+  "api_version": "manyforge.simulation_program_site_config.v1",
+  "scenarios": [
+    {
+      "cell_frame_id": "link_base",
+      "scenario_id": "isaac-lite6-pick-place",
+      "scene_entities": []
+    },
+    {
+      "cell_frame_id": "link_base",
+      "scenario_id": "isaac-lite6-trocar-foundationpose",
+      "scene_entities": []
+    },
+    {
+      "cell_frame_id": "universe",
+      "scenario_id": "isaac-ur10e-light-scene",
+      "scene_entities": [
+        {
+          "entity": "/mac_n_cheese_centered",
+          "scene_resource_id": "isaac_cheese_box"
+        },
+        {
+          "entity": "/World/small_KLT",
+          "scene_resource_id": "isaac_small_klt"
+        },
+        {
+          "entity": "/World/small_KLT_01",
+          "scene_resource_id": "isaac_small_klt_01"
+        },
+        {
+          "entity": "/World/soup_can",
+          "scene_resource_id": "isaac_soup_can"
+        },
+        {
+          "entity": "/background/table_low_327",
+          "scene_resource_id": "isaac_table_low_327"
+        }
+      ]
+    },
+    {
+      "cell_frame_id": "universe",
+      "scenario_id": "isaac-ur10e-light-scene-assistant",
+      "scene_entities": [
+        {
+          "entity": "/mac_n_cheese_centered",
+          "scene_resource_id": "isaac_cheese_box"
+        },
+        {
+          "entity": "/World/small_KLT",
+          "scene_resource_id": "isaac_small_klt"
+        },
+        {
+          "entity": "/World/small_KLT_01",
+          "scene_resource_id": "isaac_small_klt_01"
+        },
+        {
+          "entity": "/World/soup_can",
+          "scene_resource_id": "isaac_soup_can"
+        },
+        {
+          "entity": "/background/table_low_327",
+          "scene_resource_id": "isaac_table_low_327"
+        }
+      ]
+    },
+    {
+      "cell_frame_id": "universe",
+      "scenario_id": "isaac-ur10e-light-scene-collision",
+      "scene_entities": [
+        {
+          "entity": "/mac_n_cheese_centered",
+          "scene_resource_id": "isaac_cheese_box"
+        },
+        {
+          "entity": "/World/small_KLT",
+          "scene_resource_id": "isaac_small_klt"
+        },
+        {
+          "entity": "/World/small_KLT_01",
+          "scene_resource_id": "isaac_small_klt_01"
+        },
+        {
+          "entity": "/World/soup_can",
+          "scene_resource_id": "isaac_soup_can"
+        },
+        {
+          "entity": "/background/table_low_327",
+          "scene_resource_id": "isaac_table_low_327"
+        }
+      ]
+    }
+  ],
+  "service_prefix": "auto",
+  "service_timeout_s": 10.0
+}

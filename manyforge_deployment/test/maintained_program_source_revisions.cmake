@@ -4,11 +4,15 @@ if(NOT DEFINED MANYFORGE_PROGRAM_REVISION_TOOL OR
 endif()
 
 set(maintained_programs
+  examples/isaac_lite6_lite_gripper_pick_and_place.program.yaml
+  examples/isaac_manipulator_scene_light.program.yaml
+  examples/isaac_manipulator_scene_light_collision.program.yaml
   examples/lite6_lite_gripper_pick_and_place.program.yaml
   examples/pick_and_place.program.yaml
   examples/pick_and_place_minimal.program.yaml
   examples/pick_and_place_ur10e_robotiq.program.yaml
   examples/semantic_shape_pick.program.yaml
+  examples/trocar_lite6_foundationpose_pick.program.yaml
   examples/vision_guided_bin_pick.program.yaml
   examples/vision_guided_pose_pick.program.yaml)
 
