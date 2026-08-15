@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+import threading
 import time
 
 import pytest
@@ -174,6 +175,59 @@ def test_simulation_auxiliary_node_uses_the_entrypoint_private_context(
             for auxiliary in publisher.auxiliary_nodes:
                 auxiliary.destroy_node()
             publisher.destroy_node()
+        if context.ok():
+            rclpy.shutdown(context=context)
+
+
+def test_simulation_capture_waits_for_attached_private_executor_spin(
+    tmp_path: Path,
+) -> None:
+    context = Context()
+    rclpy.init(context=context)
+    dispatcher = _FakeDispatcher()
+    captures = threading.Event()
+
+    class _SimulationClient:
+        def capture(self, **_kwargs: object) -> object:
+            captures.set()
+            raise RuntimeError("bounded test capture")
+
+    publisher: pose_source_snapshot_publisher.PoseSourceSnapshotPublisher | None = (
+        None
+    )
+    executor = SingleThreadedExecutor(context=context)
+    spin_thread: threading.Thread | None = None
+    try:
+        publisher = pose_source_snapshot_publisher.PoseSourceSnapshotPublisher(
+            site_config_path=(
+                _REPOSITORY_ROOT
+                / "manyforge_ros_bringup/config/isaac_ur10e_light.pose_observer.json"
+            ),
+            manager_state_root=tmp_path,
+            dispatcher_factory=lambda _root, _config, _callback: dispatcher,
+            simulation_client_factory=lambda _node, _timeout_s: _SimulationClient(),
+            context=context,
+        )
+        executor.add_node(publisher)
+        for auxiliary in publisher.auxiliary_nodes:
+            executor.add_node(auxiliary)
+        publisher.start()
+
+        assert not captures.wait(timeout=0.1)
+        spin_thread = threading.Thread(target=executor.spin, daemon=True)
+        spin_thread.start()
+        assert captures.wait(timeout=2.0)
+    finally:
+        if publisher is not None:
+            assert publisher.stop()
+            for auxiliary in publisher.auxiliary_nodes:
+                executor.remove_node(auxiliary)
+                auxiliary.destroy_node()
+            executor.remove_node(publisher)
+            publisher.destroy_node()
+        executor.shutdown(timeout_sec=2.0)
+        if spin_thread is not None:
+            spin_thread.join(timeout=2.0)
         if context.ok():
             rclpy.shutdown(context=context)
 

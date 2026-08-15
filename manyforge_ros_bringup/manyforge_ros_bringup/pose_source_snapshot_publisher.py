@@ -376,6 +376,21 @@ class PoseSourceSnapshotPublisher(Node):
             binding.request for binding in self._config.simulation_entities
         )
         while not self._stop_event.is_set():
+            # ``start()`` runs immediately before the entrypoint begins
+            # spinning its already-attached executor.  Do not let the
+            # background service client enter rclpy's global-executor fallback
+            # during that narrow window: this process deliberately owns only a
+            # private Context.  Once spinning, the normal client path observes
+            # the attached executor and waits for its future without competing
+            # for node ownership.
+            executor = (
+                None
+                if self._simulation_node is None
+                else self._simulation_node.executor
+            )
+            if executor is not None and not executor.is_spinning:
+                self._stop_event.wait(min(0.01, period_s))
+                continue
             started = time.monotonic()
             try:
                 batch = capture_simulation_entity_poses(
