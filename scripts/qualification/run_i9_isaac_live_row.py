@@ -51,6 +51,7 @@ _TERMINAL_STATES: Final = frozenset({"succeeded", "failed", "stopped"})
 _OBJECT_MOTION_RESOURCE: Final = "isaac_cheese_box"
 _OBJECT_MOTION_MINIMUM_M: Final = 0.05
 _GRIPPER_TOLERANCE_BY_PROFILE: Final = {"lite6": 0.004, "ur10e": 0.04}
+_RECOVERY_BOUND_S: Final = 60.0
 
 
 class LiveRowError(RuntimeError):
@@ -213,6 +214,66 @@ class RunEvidence:
             ),
             "scene_projection_generation_min": min(
                 self.scene_projection_generations or {-1}
+            ),
+        }
+
+
+@dataclass(frozen=True, slots=True)
+class RecoveryEvidence:
+    component_id: str
+    provider_epoch_before: str
+    provider_sequence_before: int
+    provider_epoch_after: str
+    provider_sequence_after: int
+    dds_loss_elapsed_s: float
+    dds_rejoin_elapsed_s: float
+    provider_loss_elapsed_s: float
+    provider_recovery_elapsed_s: float
+    output_sample: Mapping[str, Any]
+    exact_world_after_rejoin: bool
+    simulation_stopped_during_outage: bool
+    simulation_stopped_after_rejoin: bool
+
+    def to_dict(self) -> dict[str, Any]:
+        passed = bool(
+            self.provider_epoch_before != self.provider_epoch_after
+            and self.provider_sequence_before > 0
+            and self.provider_sequence_after > 0
+            and 0.0 <= self.dds_loss_elapsed_s <= _RECOVERY_BOUND_S
+            and 0.0 <= self.dds_rejoin_elapsed_s <= _RECOVERY_BOUND_S
+            and 0.0 <= self.provider_loss_elapsed_s <= _RECOVERY_BOUND_S
+            and 0.0 <= self.provider_recovery_elapsed_s <= _RECOVERY_BOUND_S
+            and self.output_sample.get("seen") is True
+            and self.exact_world_after_rejoin
+            and self.simulation_stopped_during_outage
+            and self.simulation_stopped_after_rejoin
+        )
+        return {
+            "schema_version": "manyforge.i9_isaac_recovery.v1",
+            "component_id": self.component_id,
+            "dds": {
+                "loss_elapsed_s": round(self.dds_loss_elapsed_s, 3),
+                "rejoin_elapsed_s": round(self.dds_rejoin_elapsed_s, 3),
+            },
+            "exact_world_after_rejoin": self.exact_world_after_rejoin,
+            "output_sample": dict(self.output_sample),
+            "passed": passed,
+            "provider": {
+                "epoch_after": self.provider_epoch_after,
+                "epoch_before": self.provider_epoch_before,
+                "loss_elapsed_s": round(self.provider_loss_elapsed_s, 3),
+                "recovery_elapsed_s": round(
+                    self.provider_recovery_elapsed_s, 3
+                ),
+                "sequence_after": self.provider_sequence_after,
+                "sequence_before": self.provider_sequence_before,
+                "source_id": "foundationpose_trocar",
+            },
+            "simulation_stopped_after_rejoin": (
+                self.simulation_stopped_after_rejoin
+            ),
+            "simulation_stopped_during_outage": (
+                self.simulation_stopped_during_outage
             ),
         }
 
@@ -457,9 +518,48 @@ def _wait_for_barrier(
     )
 
 
+def _wait_for_controllers(
+    launch: ManagedProcess,
+    spec: ScenarioSpec,
+    *,
+    environment: Mapping[str, str],
+    timeout_s: float,
+) -> dict[str, Any]:
+    controller_manager = f"/manyforge/{spec.component_id}/controller_manager"
+    deadline = time.monotonic() + timeout_s
+    observed: dict[str, Any] = {}
+    while time.monotonic() < deadline:
+        launch.require_alive()
+        observed = _run_bounded(
+            [
+                "ros2",
+                "control",
+                "list_controllers",
+                "--controller-manager",
+                controller_manager,
+            ],
+            environment=environment,
+            timeout_s=8.0,
+        )
+        output = observed["output"]
+        if (
+            observed["returncode"] == 0
+            and "isaac_arm_controller" in output
+            and "joint_state_broadcaster" in output
+            and output.count(" active") >= 2
+        ):
+            return observed
+        time.sleep(0.1)
+    raise LiveRowError(
+        "Isaac controllers did not become active: "
+        + json.dumps(_summary(observed), separators=(",", ":"), sort_keys=True)
+    )
+
+
 def _simulation_snapshot(
     spec: ScenarioSpec,
     *,
+    play: bool = False,
     reset: bool = False,
     stop: bool = False,
 ) -> dict[str, Any]:
@@ -476,8 +576,15 @@ def _simulation_snapshot(
     rclpy.init(args=None)
     node = Node(f"manyforge_i9_world_probe_{os.getpid()}")
     try:
+        if play and stop:
+            raise LiveRowError("simulation snapshot cannot play and stop together")
         control = SimulationControlClient(node, service_timeout_s=10.0)
         reset_result = control.reset().to_dict() if reset else None
+        play_result = (
+            control.set_simulation_state(state="playing").to_dict()
+            if play
+            else None
+        )
         stop_result = (
             control.set_simulation_state(state="stopped").to_dict()
             if stop
@@ -517,6 +624,7 @@ def _simulation_snapshot(
         return {
             "exact_world": world
             == {"name": spec.world_name, "uri": spec.world_uri},
+            "play": play_result,
             "reset": reset_result,
             "state": state,
             "stop": stop_result,
@@ -885,25 +993,16 @@ def _record_execution_evidence(
 def _foundationpose_source_rows(
     scene: Mapping[str, Any]
 ) -> tuple[Mapping[str, Any], ...]:
-    payload = _section_payload(scene, "scene_runtime")
-    state = payload.get("state") if payload is not None else None
-    rows = state.get("pose_sources") if isinstance(state, dict) else None
-    if not isinstance(rows, list):
-        return ()
+    rows = _foundationpose_lifetime_rows(scene)
     exact: list[Mapping[str, Any]] = []
     for row in rows:
-        if not isinstance(row, dict):
-            continue
         observation = row.get("payload")
         pose = observation.get("pose") if isinstance(observation, dict) else None
         source = (
             observation.get("source") if isinstance(observation, dict) else None
         )
         if (
-            row.get("source_id") == "foundationpose_trocar"
-            and row.get("object_id") == "graspable"
-            and row.get("policy_id") == "before_planning"
-            and row.get("quality") == "good"
+            row.get("quality") == "good"
             and row.get("fresh") is True
             and row.get("eligible") is True
             and isinstance(observation, dict)
@@ -918,6 +1017,65 @@ def _foundationpose_source_rows(
         ):
             exact.append(row)
     return tuple(exact)
+
+
+def _foundationpose_lifetime_rows(
+    scene: Mapping[str, Any]
+) -> tuple[Mapping[str, Any], ...]:
+    payload = _section_payload(scene, "scene_runtime")
+    state = payload.get("state") if payload is not None else None
+    rows = state.get("pose_sources") if isinstance(state, dict) else None
+    if not isinstance(rows, list):
+        return ()
+    selected: list[Mapping[str, Any]] = []
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        if (
+            row.get("source_id") == "foundationpose_trocar"
+            and row.get("object_id") == "graspable"
+            and row.get("policy_id") == "before_planning"
+        ):
+            selected.append(row)
+    return tuple(selected)
+
+
+def _foundationpose_identity(
+    scene: Mapping[str, Any], *, require_fresh: bool
+) -> tuple[str, int] | None:
+    rows = (
+        _foundationpose_source_rows(scene)
+        if require_fresh
+        else _foundationpose_lifetime_rows(scene)
+    )
+    identities = {
+        (row.get("source_epoch"), row.get("source_sequence"))
+        for row in rows
+        if isinstance(row.get("source_epoch"), str)
+        and type(row.get("source_sequence")) is int
+        and row["source_sequence"] > 0
+    }
+    if len(identities) != 1:
+        return None
+    epoch, sequence = next(iter(identities))
+    return str(epoch), int(sequence)
+
+
+def _wait_for_foundationpose_identity(
+    client: HeadlessHttpClient,
+    *,
+    timeout_s: float,
+    different_from_epoch: str | None = None,
+) -> tuple[str, int]:
+    deadline = time.monotonic() + timeout_s
+    while time.monotonic() < deadline:
+        identity = _foundationpose_identity(client.scene(), require_fresh=True)
+        if identity is not None and (
+            different_from_epoch is None or identity[0] != different_from_epoch
+        ):
+            return identity
+        time.sleep(0.05)
+    raise LiveRowError("FoundationPose source did not publish one fresh identity")
 
 
 def _record_scene_evidence(
@@ -1464,6 +1622,196 @@ def _process_commands(
     return commands
 
 
+def _wait_for_runtime_node_presence(
+    spec: ScenarioSpec,
+    *,
+    environment: Mapping[str, str],
+    present: bool,
+    timeout_s: float,
+    started: float,
+) -> float:
+    expected = f"/manyforge/{spec.component_id}/controller_manager"
+    deadline = time.monotonic() + timeout_s
+    while time.monotonic() < deadline:
+        observed = _run_bounded(
+            ["ros2", "node", "list"],
+            environment=environment,
+            timeout_s=10.0,
+        )
+        names = {
+            line.strip()
+            for line in observed["output"].splitlines()
+            if line.strip().startswith("/")
+        }
+        if observed["returncode"] == 0 and ((expected in names) is present):
+            return time.monotonic() - started
+        time.sleep(0.05)
+    state = "join" if present else "leave"
+    raise LiveRowError(f"runtime node did not {state} the DDS graph: {expected}")
+
+
+def _wait_for_foundationpose_loss(
+    client: HeadlessHttpClient,
+    *,
+    source_epoch: str,
+    timeout_s: float,
+    started: float,
+) -> float:
+    deadline = time.monotonic() + timeout_s
+    while time.monotonic() < deadline:
+        scene = client.scene()
+        if _foundationpose_loss_projected(scene, source_epoch=source_epoch):
+            return time.monotonic() - started
+        time.sleep(0.05)
+    raise LiveRowError("FoundationPose provider loss was not projected")
+
+
+def _foundationpose_loss_projected(
+    scene: Mapping[str, Any], *, source_epoch: str
+) -> bool:
+    lifetime_rows = _foundationpose_lifetime_rows(scene)
+    if len(lifetime_rows) > 1:
+        return False
+    fresh_rows = _foundationpose_source_rows(scene)
+    if fresh_rows:
+        return False
+    if not lifetime_rows:
+        return True
+    lifetime = _foundationpose_identity(scene, require_fresh=False)
+    return lifetime is not None and lifetime[0] == source_epoch
+
+
+def _run_foundationpose_recovery(
+    config: LiveConfig,
+    *,
+    api_url: str,
+    original_ros: ManagedProcess,
+    ros_command: Sequence[str],
+    environment: Mapping[str, str],
+    processes: list[ManagedProcess],
+) -> tuple[ManagedProcess, dict[str, Any], dict[str, Any], RecoveryEvidence]:
+    with HeadlessHttpClient(api_url, timeout_seconds=15.0) as client:
+        try:
+            playing_before = _simulation_snapshot(config.spec, play=True)
+            if (
+                playing_before.get("exact_world") is not True
+                or playing_before.get("state", {}).get("state") != "playing"
+                or playing_before.get("play", {}).get("success") is not True
+            ):
+                raise LiveRowError(
+                    "FoundationPose readiness play transition was not exact"
+                )
+            before_epoch, before_sequence = _wait_for_foundationpose_identity(
+                client, timeout_s=config.startup_timeout_s
+            )
+        finally:
+            stopped_before_loss = _simulation_snapshot(config.spec, stop=True)
+        if (
+            stopped_before_loss.get("exact_world") is not True
+            or stopped_before_loss.get("state", {}).get("state") != "stopped"
+            or stopped_before_loss.get("stop", {}).get("success") is not True
+        ):
+            raise LiveRowError(
+                "simulation did not stop after provider readiness probe"
+            )
+
+        loss_started = time.monotonic()
+        original_ros.stop()
+        dds_loss_elapsed = _wait_for_runtime_node_presence(
+            config.spec,
+            environment=environment,
+            present=False,
+            timeout_s=_RECOVERY_BOUND_S,
+            started=loss_started,
+        )
+        provider_loss_elapsed = _wait_for_foundationpose_loss(
+            client,
+            source_epoch=before_epoch,
+            timeout_s=_RECOVERY_BOUND_S,
+            started=loss_started,
+        )
+        outage = _simulation_snapshot(config.spec, stop=True)
+
+        rejoin_started = time.monotonic()
+        replacement = _start_process(
+            "ros-rejoin",
+            ros_command,
+            environment=environment,
+            run_root=config.run_root,
+        )
+        processes.append(replacement)
+        barrier = _wait_for_barrier(
+            replacement, config.spec, timeout_s=config.startup_timeout_s
+        )
+        controllers = _wait_for_controllers(
+            replacement,
+            config.spec,
+            environment=environment,
+            timeout_s=config.startup_timeout_s,
+        )
+        dds_rejoin_elapsed = _wait_for_runtime_node_presence(
+            config.spec,
+            environment=environment,
+            present=True,
+            timeout_s=_RECOVERY_BOUND_S,
+            started=rejoin_started,
+        )
+        output_sample = _start_topic_sample("/output", environment=environment)
+        try:
+            playing_after = _simulation_snapshot(config.spec, play=True)
+            if (
+                playing_after.get("exact_world") is not True
+                or playing_after.get("state", {}).get("state") != "playing"
+                or playing_after.get("play", {}).get("success") is not True
+            ):
+                raise LiveRowError(
+                    "FoundationPose recovery play transition was not exact"
+                )
+            after_epoch, after_sequence = _wait_for_foundationpose_identity(
+                client,
+                timeout_s=config.startup_timeout_s,
+                different_from_epoch=before_epoch,
+            )
+            provider_recovery_elapsed = time.monotonic() - rejoin_started
+            sampled_output = output_sample.settle(timeout_s=5.0)
+        finally:
+            output_sample.stop()
+            stopped_after = _simulation_snapshot(config.spec, stop=True)
+
+    evidence = RecoveryEvidence(
+        component_id=config.spec.component_id,
+        provider_epoch_before=before_epoch,
+        provider_sequence_before=before_sequence,
+        provider_epoch_after=after_epoch,
+        provider_sequence_after=after_sequence,
+        dds_loss_elapsed_s=dds_loss_elapsed,
+        dds_rejoin_elapsed_s=dds_rejoin_elapsed,
+        provider_loss_elapsed_s=provider_loss_elapsed,
+        provider_recovery_elapsed_s=provider_recovery_elapsed,
+        output_sample=sampled_output,
+        exact_world_after_rejoin=bool(
+            barrier.get("world_name") == config.spec.world_name
+            and barrier.get("world_uri") == config.spec.world_uri
+            and stopped_after.get("exact_world") is True
+        ),
+        simulation_stopped_during_outage=bool(
+            outage.get("exact_world") is True
+            and outage.get("state", {}).get("state") == "stopped"
+            and outage.get("stop", {}).get("success") is True
+        ),
+        simulation_stopped_after_rejoin=bool(
+            stopped_after.get("state", {}).get("state") == "stopped"
+            and stopped_after.get("stop", {}).get("success") is True
+        ),
+    )
+    if evidence.to_dict()["passed"] is not True:
+        raise LiveRowError(
+            "FoundationPose recovery did not satisfy its bounded contract: "
+            + json.dumps(evidence.to_dict(), separators=(",", ":"), sort_keys=True)
+        )
+    return replacement, barrier, controllers, evidence
+
+
 def run_live_row(config: LiveConfig) -> dict[str, Any]:
     validate_config(config)
     started = time.monotonic()
@@ -1543,33 +1891,22 @@ def run_live_row(config: LiveConfig) -> dict[str, Any]:
             ros, config.spec, timeout_s=config.startup_timeout_s
         )
         simulation_services_ready = True
-        controller_manager = (
-            f"/manyforge/{config.spec.component_id}/controller_manager"
+        controllers = _wait_for_controllers(
+            ros,
+            config.spec,
+            environment=environment,
+            timeout_s=config.startup_timeout_s,
         )
-        controller_deadline = time.monotonic() + config.startup_timeout_s
-        controllers: dict[str, Any] = {}
-        while time.monotonic() < controller_deadline:
-            ros.require_alive()
-            controllers = _run_bounded(
-                [
-                    "ros2",
-                    "control",
-                    "list_controllers",
-                    "--controller-manager",
-                    controller_manager,
-                ],
+        recovery: RecoveryEvidence | None = None
+        if config.spec.scenario_id == "isaac-lite6-trocar-foundationpose":
+            ros, barrier, controllers, recovery = _run_foundationpose_recovery(
+                config,
+                api_url=api_url,
+                original_ros=ros,
+                ros_command=commands["ros"],
                 environment=environment,
-                timeout_s=8.0,
+                processes=processes,
             )
-            output = controllers["output"]
-            if (
-                controllers["returncode"] == 0
-                and "isaac_arm_controller" in output
-                and "joint_state_broadcaster" in output
-                and output.count(" active") >= 2
-            ):
-                break
-            time.sleep(0.1)
         nodes = _run_bounded(
             ["ros2", "node", "list"], environment=environment, timeout_s=10.0
         )
@@ -1702,6 +2039,7 @@ def run_live_row(config: LiveConfig) -> dict[str, Any]:
             "history": _summary(history),
             "operator_alarms": _summary(alarms),
             "program": _summary(program_snapshot),
+            "recovery": None if recovery is None else recovery.to_dict(),
             "run_evidence": run_evidence.summary(),
             "ros_nodes": {
                 key: nodes[key] for key in ("bytes", "returncode", "sha256")

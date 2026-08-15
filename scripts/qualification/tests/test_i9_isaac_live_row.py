@@ -437,3 +437,72 @@ def test_process_commands_bind_exact_component_world_and_pose_config(
     assert f"expected_world_name:={scenario.world_name}" in ros
     assert "additional_required_topics:=/output,/tf,/tf_static" in ros
     assert not any("DemoSupervisor" in item for item in ros)
+
+
+def test_recovery_evidence_requires_new_provider_epoch_and_bounded_outage(
+    live: ModuleType,
+) -> None:
+    evidence = live.RecoveryEvidence(
+        component_id="isaac_lite6_trocar_robot",
+        provider_epoch_before="pose.epoch.1",
+        provider_sequence_before=7,
+        provider_epoch_after="pose.epoch.2",
+        provider_sequence_after=1,
+        dds_loss_elapsed_s=1.0,
+        dds_rejoin_elapsed_s=2.0,
+        provider_loss_elapsed_s=5.1,
+        provider_recovery_elapsed_s=2.5,
+        output_sample={"seen": True, "sha256": "a" * 64},
+        exact_world_after_rejoin=True,
+        simulation_stopped_during_outage=True,
+        simulation_stopped_after_rejoin=True,
+    )
+    assert evidence.to_dict()["passed"] is True
+
+    same_epoch = live.RecoveryEvidence(
+        **{
+            field: getattr(evidence, field)
+            for field in evidence.__dataclass_fields__
+            if field != "provider_epoch_after"
+        },
+        provider_epoch_after="pose.epoch.1",
+    )
+    assert same_epoch.to_dict()["passed"] is False
+
+    late = live.RecoveryEvidence(
+        **{
+            field: getattr(evidence, field)
+            for field in evidence.__dataclass_fields__
+            if field != "dds_rejoin_elapsed_s"
+        },
+        dds_rejoin_elapsed_s=live._RECOVERY_BOUND_S + 0.001,  # noqa: SLF001
+    )
+    assert late.to_dict()["passed"] is False
+
+
+def test_foundationpose_loss_rejects_fresh_or_ambiguous_sources(
+    live: ModuleType,
+) -> None:
+    scenario = live.SCENARIO_BY_ID["isaac-lite6-trocar-foundationpose"]
+    scene = base_observations(live, scenario)["scene_after"]
+    assert live._foundationpose_loss_projected(  # noqa: SLF001
+        scene, source_epoch="pose.epoch.1"
+    ) is False
+
+    source = scene["scene_runtime"]["payload"]["state"]["pose_sources"][0]
+    source["fresh"] = False
+    assert live._foundationpose_loss_projected(  # noqa: SLF001
+        scene, source_epoch="pose.epoch.1"
+    ) is True
+
+    duplicate = dict(source)
+    duplicate["source_epoch"] = "pose.epoch.crossed"
+    scene["scene_runtime"]["payload"]["state"]["pose_sources"].append(
+        duplicate
+    )
+    assert live._foundationpose_identity(  # noqa: SLF001
+        scene, require_fresh=False
+    ) is None
+    assert live._foundationpose_loss_projected(  # noqa: SLF001
+        scene, source_epoch="pose.epoch.1"
+    ) is False
