@@ -4508,7 +4508,8 @@ BuildProductComposition(CompositionBuildInput input) {
               .rng_seed = retained_runtime_configuration.planner_rng_seed},
           ProcessContainedCandidateClientConfig{
               .worker_executable = input.candidate_worker,
-              .require_retained_projection = true});
+              .require_retained_projection = true,
+              .scene_asset_root = input.package_root});
   Require(candidate_client->requires_retained_projection(),
           "production native planner must consume the exact retained scene "
           "projection");

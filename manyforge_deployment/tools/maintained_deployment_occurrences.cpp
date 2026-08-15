@@ -1360,6 +1360,75 @@ program_assistant_mode(const deployment::CanonicalValue &program_root) {
   return destination;
 }
 
+void stage_program_scene_assets(
+    const std::filesystem::path &workspace_root,
+    const std::filesystem::path &package_root,
+    const deployment::CanonicalValue &program_root,
+    std::map<std::string, std::filesystem::path, std::less<>> &staged) {
+  const auto *scene = program_root.find_object_member("scene");
+  if (scene == nullptr) {
+    return;
+  }
+  for (const auto &resource : require_array(*scene, "maintained Program scene")) {
+    const auto &shape = require_member(resource, "shape", "scene resource");
+    const auto &type = require_text(
+        require_member(shape, "type", "scene resource shape"),
+        "scene resource shape.type");
+    if (type != "mesh") {
+      continue;
+    }
+    const auto &uri = require_text(
+        require_member(shape, "mesh_resource_uri", "scene mesh shape"),
+        "scene mesh shape.mesh_resource_uri");
+    const auto relative =
+        require_relative_path(uri, "maintained Program scene mesh URI");
+    if (relative.empty() || relative == ".") {
+      throw std::invalid_argument(
+          "maintained Program scene mesh URI must name one file");
+    }
+    const auto destination = package_root / relative;
+    const auto [found, inserted] = staged.emplace(uri, destination);
+    if (!inserted) {
+      if (found->second != destination) {
+        throw std::logic_error(
+            "maintained Program scene mesh URI aliases another destination");
+      }
+      continue;
+    }
+
+    const auto source = workspace_root / relative;
+    const std::string bytes = read_file(source);
+    std::error_code filesystem_error;
+    std::filesystem::create_directories(destination.parent_path(),
+                                        filesystem_error);
+    if (filesystem_error || std::filesystem::exists(destination)) {
+      throw std::runtime_error(
+          "cannot reserve maintained Program scene mesh destination: " +
+          destination.string());
+    }
+    {
+      std::ofstream stream(destination, std::ios::binary | std::ios::trunc);
+      if (!stream) {
+        throw std::runtime_error(
+            "cannot stage maintained Program scene mesh: " +
+            destination.string());
+      }
+      stream.write(bytes.data(), static_cast<std::streamsize>(bytes.size()));
+      stream.flush();
+      if (!stream) {
+        throw std::runtime_error(
+            "cannot complete maintained Program scene mesh: " +
+            destination.string());
+      }
+    }
+    if (read_file(destination) != bytes) {
+      throw std::runtime_error(
+          "maintained Program scene mesh failed exact read-back: " +
+          destination.string());
+    }
+  }
+}
+
 void publish_and_verify_scenario_catalog(
     const std::filesystem::path &workspace_root,
     const std::map<std::string, ScenarioProduct, std::less<>> &products,
@@ -1384,6 +1453,8 @@ void publish_and_verify_scenario_catalog(
                                 record.deployment_source, staged);
     const auto program =
         deployment::parse_strict_json_model_yaml(read_file(program_path));
+    stage_program_scene_assets(workspace_root, package_root, program.root(),
+                               staged);
     rows.push_back(deployment::ScenarioCatalogRowDTO{
         .scenario_id = record.scenario_id,
         .description = std::nullopt,

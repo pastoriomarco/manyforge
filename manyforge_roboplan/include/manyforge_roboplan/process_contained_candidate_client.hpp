@@ -46,6 +46,11 @@ struct ProcessContainedCandidateClientConfig final {
   /// projection generation selected by the Kernel. Fixed-model tests leave
   /// this false.
   bool require_retained_projection{false};
+  /// Trusted, product-contained root for Program-authored scene meshes.
+  /// Relative mesh_resource_uri values are resolved below this one canonical
+  /// root before the worker is created. Model-local asset:// values continue
+  /// to resolve only through the retained planning-model stage.
+  std::optional<std::filesystem::path> scene_asset_root;
 };
 
 /// Long-lived RoboPlan worker client.

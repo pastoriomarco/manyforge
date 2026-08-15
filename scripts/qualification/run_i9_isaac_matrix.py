@@ -438,6 +438,7 @@ def validate_package(package_root: Path, source_root: Path) -> dict[str, Any]:
         raise QualificationError("materialized catalog omits an I9 scenario")
 
     validated: list[dict[str, str]] = []
+    scene_mesh_assets: dict[str, str] = {}
     for spec in SCENARIOS:
         row = by_id[spec.scenario_id]
         if row.get("deployment_artifact_id") != spec.deployment_artifact_id:
@@ -457,6 +458,50 @@ def validate_package(package_root: Path, source_root: Path) -> dict[str, Any]:
         expected_program_id = spec.program_filename.removesuffix(".program.yaml")
         if program.get("program_id") != expected_program_id:
             raise QualificationError(f"{spec.scenario_id} selected another Program")
+        for resource in _object_rows(
+            program.get("scene", []), label=f"{spec.scenario_id} Program scene"
+        ):
+            shape = _object(
+                resource.get("shape"),
+                label=f"{spec.scenario_id} Program scene shape",
+            )
+            if shape.get("type") != "mesh":
+                continue
+            uri = _text(
+                shape.get("mesh_resource_uri"),
+                label=f"{spec.scenario_id} Program scene mesh URI",
+            )
+            relative = Path(uri)
+            if (
+                relative.is_absolute()
+                or relative.as_posix() != uri
+                or any(part in {"", ".", ".."} for part in relative.parts)
+                or "://" in uri
+            ):
+                raise QualificationError(
+                    f"{spec.scenario_id} Program scene mesh is not package-relative"
+                )
+            source_asset = source_root / relative
+            packaged_asset = package_root / relative
+            if (
+                not source_asset.is_file()
+                or source_asset.is_symlink()
+                or not packaged_asset.is_file()
+                or packaged_asset.is_symlink()
+            ):
+                raise QualificationError(
+                    f"{spec.scenario_id} Program scene mesh is not product-contained"
+                )
+            source_digest = _sha256_file(source_asset)
+            if _sha256_file(packaged_asset) != source_digest:
+                raise QualificationError(
+                    f"{spec.scenario_id} Program scene mesh differs from source"
+                )
+            previous = scene_mesh_assets.setdefault(uri, source_digest)
+            if previous != source_digest:
+                raise QualificationError(
+                    f"{spec.scenario_id} Program scene mesh identity is ambiguous"
+                )
         pose_config = source_root / "manyforge_ros_bringup/config" / (
             spec.pose_observer_filename
         )
@@ -496,6 +541,10 @@ def validate_package(package_root: Path, source_root: Path) -> dict[str, Any]:
             catalog.get("scenario_catalog_revision"),
             label="scenario catalog revision",
         ),
+        "scene_mesh_assets": [
+            {"sha256": digest, "uri": uri}
+            for uri, digest in sorted(scene_mesh_assets.items())
+        ],
         "scenarios": validated,
     }
 

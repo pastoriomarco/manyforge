@@ -241,8 +241,41 @@ def test_package_preflight_binds_catalog_program_pose_and_site(
         json.dumps({"scenarios": site_rows}), encoding="utf-8"
     )
 
+    mesh_uri = "examples/isaac_manipulator_scene_light/meshes/fixture.obj"
+    mesh_bytes = b"v 0 0 0\nv 1 0 0\nv 0 1 0\nf 1 2 3\n"
+    for root in (source, package):
+        mesh = root / mesh_uri
+        mesh.parent.mkdir(parents=True)
+        mesh.write_bytes(mesh_bytes)
+    program_path = package / "isaac_manipulator_scene_light.program.yaml"
+    program_path.write_text(
+        json.dumps(
+            {
+                "program_id": "isaac_manipulator_scene_light",
+                "scene": [
+                    {
+                        "scene_resource_id": "fixture",
+                        "shape": {
+                            "type": "mesh",
+                            "mesh_resource_uri": mesh_uri,
+                        },
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+
     result = runner.validate_package(package, source)
     assert len(result["scenarios"]) == 5
+    assert result["scene_mesh_assets"] == [
+        {"sha256": runner._sha256_file(source / mesh_uri), "uri": mesh_uri}
+    ]
+
+    (package / mesh_uri).write_bytes(b"changed")
+    with pytest.raises(runner.QualificationError, match="differs from source"):
+        runner.validate_package(package, source)
+    (package / mesh_uri).write_bytes(mesh_bytes)
 
     catalog_rows[1]["deployment_artifact_id"] = catalog_rows[0][
         "deployment_artifact_id"

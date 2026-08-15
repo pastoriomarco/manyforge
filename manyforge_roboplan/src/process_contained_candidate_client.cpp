@@ -70,32 +70,43 @@ native_geometry_name(const std::string_view body_id,
 
 [[nodiscard]] std::filesystem::path
 resolve_retained_mesh_path(const RoboPlanWorkerModelDTO &model,
+                           const std::optional<std::filesystem::path>
+                               &scene_asset_root,
                            const std::string_view uri) {
   constexpr std::string_view kAssetPrefix = "asset://";
-  if (!uri.starts_with(kAssetPrefix) || model.package_paths.size() != 1U) {
+  const bool model_asset = uri.starts_with(kAssetPrefix);
+  if ((model_asset && model.package_paths.size() != 1U) ||
+      (!model_asset &&
+       (!scene_asset_root.has_value() || uri.find("://") != uri.npos))) {
     throw std::invalid_argument(
         "retained worker mesh has no exact staged asset path");
   }
-  const std::filesystem::path relative(uri.substr(kAssetPrefix.size()));
+  const std::filesystem::path relative(
+      model_asset ? uri.substr(kAssetPrefix.size()) : uri);
   if (relative.empty() || relative.is_absolute() ||
+      relative != relative.lexically_normal() ||
       std::any_of(relative.begin(), relative.end(), [](const auto &part) {
         return part.empty() || part == "." || part == "..";
       })) {
     throw std::invalid_argument("retained worker mesh asset path is invalid");
   }
   std::error_code filesystem_error;
-  const auto root = std::filesystem::weakly_canonical(
-      model.package_paths.front(), filesystem_error);
-  if (filesystem_error) {
+  const auto root = std::filesystem::canonical(
+      model_asset ? model.package_paths.front() : *scene_asset_root,
+      filesystem_error);
+  if (filesystem_error || !std::filesystem::is_directory(root)) {
     throw std::invalid_argument(
         "retained worker package root cannot be resolved");
   }
-  const auto selected =
-      std::filesystem::weakly_canonical(root / relative, filesystem_error);
+  const auto selected = std::filesystem::canonical(root / relative,
+                                                   filesystem_error);
   if (filesystem_error || !std::filesystem::is_regular_file(selected)) {
     throw std::invalid_argument("retained worker mesh asset is unavailable");
   }
-  if (!std::equal(root.begin(), root.end(), selected.begin(), selected.end())) {
+  const auto [root_end, selected_end] = std::mismatch(
+      root.begin(), root.end(), selected.begin(), selected.end());
+  static_cast<void>(selected_end);
+  if (root_end != root.end()) {
     throw std::invalid_argument(
         "retained worker mesh escapes its staged package root");
   }
@@ -140,6 +151,8 @@ projected_shape(const core::CollisionGeometryDescriptor &geometry) {
 
 [[nodiscard]] RoboPlanWorkerModelDTO
 project_worker_model(const RoboPlanWorkerModelDTO &base,
+                     const std::optional<std::filesystem::path>
+                         &scene_asset_root,
                      const RoboPlanCandidateProjectionDTO &projection) {
   if (!projection.projection_binding.valid() || !projection.world ||
       !projection.policy) {
@@ -164,7 +177,8 @@ project_worker_model(const RoboPlanWorkerModelDTO &base,
       auto shape = projected_shape(geometry);
       std::optional<std::filesystem::path> mesh_path;
       if (const auto *mesh = std::get_if<core::MeshShapeDTO>(&shape)) {
-        mesh_path = resolve_retained_mesh_path(model, mesh->resource_uri);
+        mesh_path = resolve_retained_mesh_path(model, scene_asset_root,
+                                               mesh->resource_uri);
       }
       const auto name = native_geometry_name(body.body_id, index);
       names.push_back(name);
@@ -617,7 +631,7 @@ struct ProcessContainedRoboPlanCandidateClient::Impl final {
     shutdown_worker();
   }
 
-  void validate_config() const {
+  void validate_config() {
     if (!config.worker_executable.is_absolute() ||
         !std::filesystem::is_regular_file(config.worker_executable) ||
         ::access(config.worker_executable.c_str(), X_OK) != 0 ||
@@ -633,6 +647,17 @@ struct ProcessContainedRoboPlanCandidateClient::Impl final {
         config.maximum_response_bytes > 256U * 1024U * 1024U) {
       throw std::invalid_argument(
           "RoboPlan process-contained client configuration is invalid");
+    }
+    if (config.scene_asset_root.has_value()) {
+      std::error_code filesystem_error;
+      const auto canonical = std::filesystem::canonical(
+          *config.scene_asset_root, filesystem_error);
+      if (filesystem_error || !canonical.is_absolute() ||
+          !std::filesystem::is_directory(canonical)) {
+        throw std::invalid_argument(
+            "RoboPlan process-contained scene asset root is invalid");
+      }
+      config.scene_asset_root = canonical;
     }
   }
 
@@ -650,7 +675,8 @@ struct ProcessContainedRoboPlanCandidateClient::Impl final {
     }
     RoboPlanWorkerModelDTO projected;
     try {
-      projected = project_worker_model(base_model, projection);
+      projected = project_worker_model(base_model, config.scene_asset_root,
+                                       projection);
     } catch (const std::exception &exception) {
       return core::Result<void>::Err(
           error(core::ErrorCode::kInvalidRequest,

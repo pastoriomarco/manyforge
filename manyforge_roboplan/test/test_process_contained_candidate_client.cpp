@@ -5,6 +5,7 @@
 #include <Eigen/Geometry>
 #include <chrono>
 #include <filesystem>
+#include <fstream>
 #include <future>
 #include <manyforge_core/collision/collision_world_snapshot_builder.hpp>
 #include <manyforge_roboplan/process_contained_candidate_client.hpp>
@@ -245,7 +246,8 @@ frame_relative_collision_projection(const ProcessFixture &fixture) {
 }
 
 [[nodiscard]] CollisionWorldBody far_scene_body(
-    const bool carried_by_component = false) {
+    const bool carried_by_component = false,
+    const std::optional<std::string> &mesh_resource_uri = std::nullopt) {
   CollisionWorldBody body;
   body.body_id = CollisionBodyId(std::string(kSceneBodyId));
   body.owner_kind = CollisionOwnerKind::kSceneResource;
@@ -254,7 +256,18 @@ frame_relative_collision_projection(const ProcessFixture &fixture) {
     body.parent_body_id = CollisionBodyId(std::string(kComponentBodyId));
   }
   body.pose = identity_pose(100.0);
-  body.geometries.push_back(box_geometry(body.body_id, body.owner_kind));
+  if (mesh_resource_uri.has_value()) {
+    CollisionGeometryDescriptor geometry;
+    geometry.body_id = body.body_id;
+    geometry.owner_kind = body.owner_kind;
+    geometry.geometry_kind = CollisionGeometryKind::kTriangleMesh;
+    geometry.local_pose = identity_pose();
+    geometry.source_uri = *mesh_resource_uri;
+    geometry.mesh_scale = Vector3DTO{1.0, 1.0, 1.0};
+    body.geometries.push_back(std::move(geometry));
+  } else {
+    body.geometries.push_back(box_geometry(body.body_id, body.owner_kind));
+  }
   return body;
 }
 
@@ -266,7 +279,9 @@ frame_relative_collision_projection(const ProcessFixture &fixture) {
 [[nodiscard]] RoboPlanCandidateProjectionDTO
 projection(std::uint64_t world_revision = 1U,
            std::uint64_t scene_revision = 1U,
-           const bool carried_by_component = false) {
+           const bool carried_by_component = false,
+           const std::optional<std::string> &mesh_resource_uri =
+               std::nullopt) {
   auto policy = std::make_shared<CollisionPolicySnapshot>();
   policy->policy_id = "process-client-projection";
   policy->revision = CollisionPolicyRevision{1U, std::string(kDigestZero)};
@@ -277,7 +292,8 @@ projection(std::uint64_t world_revision = 1U,
           .set_revision_id(world_revision)
           .set_policy_overlay_content_hash(policy->revision.content_hash)
           .add_body(component_body())
-          .add_body(far_scene_body(carried_by_component))
+          .add_body(
+              far_scene_body(carried_by_component, mesh_resource_uri))
           .build_shared();
   if (!world.ok()) {
     throw std::runtime_error(world.error().message);
@@ -404,6 +420,52 @@ TEST(ProcessContainedCandidateClientTest,
             values(fixture.start));
   EXPECT_EQ(planned.value().waypoints.back().positions_rad,
             values(fixture.goal));
+}
+
+TEST(ProcessContainedCandidateClientTest,
+     RetainedProjectionResolvesOnlyProductContainedRelativeSceneMeshes) {
+  auto fixture = make_fixture();
+  const auto asset_root =
+      std::filesystem::temp_directory_path() /
+      ("manyforge-program-scene-assets-" + std::to_string(::getpid()));
+  std::error_code ignored;
+  std::filesystem::remove_all(asset_root, ignored);
+  const auto mesh = asset_root / "examples/scene/meshes/fixture.obj";
+  ASSERT_TRUE(std::filesystem::create_directories(mesh.parent_path()));
+  {
+    std::ofstream stream(mesh, std::ios::binary | std::ios::trunc);
+    ASSERT_TRUE(stream.good());
+    stream << "v 0 0 0\nv 1 0 0\nv 0 1 0\nf 1 2 3\n";
+    stream.flush();
+    ASSERT_TRUE(stream.good());
+  }
+
+  auto process_config = config(MANYFORGE_ROBOPLAN_FAKE_WORKER_PATH);
+  process_config.require_retained_projection = true;
+  process_config.scene_asset_root = asset_root;
+  ProcessContainedRoboPlanCandidateClient client(
+      fixture.model, fixture.binding,
+      RoboPlanCandidateComputerConfig{0x1234U, 65'536U, 0.01},
+      std::move(process_config));
+
+  const auto traversal = client.select_retained_projection(
+      projection(1U, 1U, false, "../outside.obj"));
+  ASSERT_FALSE(traversal.ok());
+  EXPECT_EQ(traversal.error().details.at("reason"),
+            "native_planner_projection_selection_failed");
+
+  const auto selected = client.select_retained_projection(
+      projection(2U, 2U, false,
+                 "examples/scene/meshes/fixture.obj"));
+  ASSERT_TRUE(selected.ok()) << selected.error().message;
+
+  const auto missing = client.select_retained_projection(
+      projection(3U, 3U, false,
+                 "examples/scene/meshes/missing.obj"));
+  ASSERT_FALSE(missing.ok());
+  EXPECT_NE(missing.error().message.find("asset is unavailable"),
+            std::string::npos);
+  std::filesystem::remove_all(asset_root, ignored);
 }
 
 TEST(ProcessContainedCandidateClientTest,
