@@ -472,9 +472,12 @@ template <typename ProviderPath>
       std::any_of(binding.supporting_capability_provider_paths.begin(),
                   binding.supporting_capability_provider_paths.end(),
                   target_matches_capability_provider);
+  const bool control_path_target_available =
+      target_matches_provider(resolved.command_target, path);
   if ((stage.capability_provider_binding_id.has_value() &&
        selected_capability_provider == nullptr) ||
-      (!stage.capability_provider_binding_id.has_value() && capability_provider_target_available)) {
+      (!stage.capability_provider_binding_id.has_value() &&
+       capability_provider_target_available && !control_path_target_available)) {
     return invalid("participant_stop_capability_provider_join_invalid");
   }
   const bool target_matches_selected_provider =

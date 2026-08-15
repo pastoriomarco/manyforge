@@ -1876,6 +1876,24 @@ FakeOperationJournal default_journal;
   return std::move(sealed.value());
 }
 
+[[nodiscard]] RuntimeParticipantBinding with_colocated_supporting_capability(
+    const RuntimeParticipantBinding& source) {
+  auto value = source.value();
+  const auto& path = *value.control_path;
+  for (auto& provider : value.supporting_capability_provider_paths) {
+    provider.provider_instance_id = path.provider_instance_id;
+    provider.provider_manifest_id = path.provider_manifest_id;
+    provider.provider_manifest_revision = path.provider_manifest_revision;
+    provider.provider_runtime_unit_id = path.provider_runtime_unit_id;
+    provider.provider_runtime_epoch = path.provider_runtime_epoch;
+  }
+  auto sealed = verify_runtime_participant_binding(std::move(value));
+  if (!sealed.ok()) {
+    throw std::logic_error(sealed.error().message);
+  }
+  return std::move(sealed.value());
+}
+
 [[nodiscard]] OperationIntentDTO motion_operation(std::string request_id = "request.motion.1") {
   return OperationIntentDTO{
       PublicRequestContextDTO{RequestId(std::move(request_id)), RequestOwnerEpoch("kernel.epoch.1"),
@@ -2410,6 +2428,63 @@ TEST(ResourceAddressedExecutionKernelTest,
   ASSERT_EQ(kernel.resource_snapshot().size(), 1U);
   EXPECT_EQ(kernel.resource_snapshot().front().state, ResourceSlotState::kTerminal);
   EXPECT_EQ(engine.translate_stop_stage_calls.load(), 1);
+}
+
+TEST(ResourceAddressedExecutionKernelTest,
+     StopResolverPrefersDirectPathWhenSupportingProviderIsCoLocated) {
+  FakeClock clock;
+  FakeParticipantEngine engine;
+  const auto binding = with_colocated_supporting_capability(
+      make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular));
+  ResourceAddressedExecutionKernel kernel(
+      {registration(binding, engine)}, clock, default_journal,
+      {RequestOwnerEpoch("kernel.epoch.1"), CellId("cell.test"), 16U});
+
+  const auto accepted =
+      kernel.execute(motion_operation("request.motion.collision.colocated-stop-provider"));
+  ASSERT_TRUE(accepted.ok()) << accepted.error().message;
+  engine.emit_transition(ExecutionState::kPlanning, ExecutionState::kExecuting);
+  std::vector<std::tuple<StopContainmentCommandKind, bool, bool>> resolved_authorities;
+  std::mutex resolved_authorities_mutex;
+  engine.translate_stop_stage_hook = [&] {
+    if (!engine.last_stop_stage.has_value()) {
+      return;
+    }
+    const auto& stage = *engine.last_stop_stage;
+    const auto kind = stage.participant_stop_plan.stage_commands.at(stage.stage_index)
+                          .resolved_stage.containment_command.command_kind;
+    {
+      std::lock_guard lock(resolved_authorities_mutex);
+      resolved_authorities.emplace_back(
+          kind, stage.capability_provider_binding_id.has_value(),
+          stage.capability_provider_binding_revision.has_value());
+    }
+    engine.next_stop_result =
+        StopResultDTO{false,
+                      ErrorDTO{"controller_stop_rejected", "advance to retained fallback",
+                               {{"reason", "controller_stop_rejected"}}}};
+  };
+
+  engine.emit_collision();
+  std::optional<StopId> stop_id;
+  ASSERT_TRUE(wait_until([&] {
+    const auto operation = kernel.get_operation_state(accepted.value().operation_id);
+    if (!operation.ok() || !operation.value().active_stop_id.has_value()) {
+      return false;
+    }
+    stop_id = operation.value().active_stop_id;
+    const auto status = kernel.get_stop_status(*stop_id);
+    return status.ok() && status.value().stop_certificate.has_value();
+  }));
+
+  std::lock_guard lock(resolved_authorities_mutex);
+  const auto registered = std::find_if(
+      resolved_authorities.begin(), resolved_authorities.end(), [](const auto& authority) {
+        return std::get<0>(authority) == StopContainmentCommandKind::kRegistered;
+      });
+  ASSERT_NE(registered, resolved_authorities.end());
+  EXPECT_FALSE(std::get<1>(*registered));
+  EXPECT_FALSE(std::get<2>(*registered));
 }
 
 TEST(ResourceAddressedExecutionKernelTest,

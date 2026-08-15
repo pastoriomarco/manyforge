@@ -231,6 +231,30 @@ TEST(ParticipantStopStageTest, AcceptsRegisteredControlPathProviderWithoutCapabi
   EXPECT_TRUE(ValidateStage(fixture, fixture.stage, Budget(fixture.stage)).ok());
 }
 
+TEST(ParticipantStopStageTest, AcceptsDirectTargetWhenSupportingProviderIsCoLocated) {
+  const auto fixture = Fixture();
+  auto value = fixture.binding.value();
+  const auto& path = *value.control_path;
+  value.supporting_capability_provider_paths = {RuntimeCapabilityProviderPathDTO{
+      CapabilityId("planning.motion.pose_goal"),
+      CapabilityDefinitionRevision("planning.motion.pose_goal.revision"),
+      CapabilityProviderBindingId("planning.motion.pose_goal.provider"),
+      CapabilityProviderBindingRevision("planning.motion.pose_goal.provider.revision"),
+      path.provider_instance_id,
+      path.provider_manifest_id,
+      path.provider_manifest_revision,
+      path.provider_runtime_unit_id,
+      path.provider_runtime_epoch}};
+  auto colocated = verify_runtime_participant_binding(std::move(value));
+  ASSERT_TRUE(colocated.ok()) << colocated.error().message;
+
+  EXPECT_FALSE(fixture.stage.capability_provider_binding_id.has_value());
+  EXPECT_TRUE(ValidateResolvedParticipantStopStage(
+                  fixture.stage, Budget(fixture.stage), fixture.base, colocated.value(), {},
+                  MotionInterruptNodeCategory::kGeneric, fixture.stage.resources)
+                  .ok());
+}
+
 TEST(ParticipantStopStageTest, RejectsForeignOrExtendedBudgetAndExpandedScope) {
   const auto fixture = Fixture();
   auto budget = Budget(fixture.stage);

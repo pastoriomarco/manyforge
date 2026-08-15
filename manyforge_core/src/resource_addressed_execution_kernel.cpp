@@ -1654,6 +1654,12 @@ constexpr std::size_t kMaximumResidentStopTerminalRecords = 64U;
     provider_binding_id = provider.capability_provider_binding_id;
     provider_binding_revision = provider.capability_provider_binding_revision;
   };
+  const bool control_path_matches =
+      selected.command_target.provider_instance_id == path.provider_instance_id &&
+      selected.command_target.provider_manifest_id == path.provider_manifest_id &&
+      selected.command_target.provider_manifest_revision == path.provider_manifest_revision &&
+      selected.command_target.runtime_unit_id == path.provider_runtime_unit_id &&
+      selected.command_target.provider_runtime_epoch == path.provider_runtime_epoch;
   switch (selected.containment_command.command_kind) {
     case StopContainmentCommandKind::kControllerGoalCancel:
     case StopContainmentCommandKind::kMotionControlledStop:
@@ -1662,6 +1668,13 @@ constexpr std::size_t kMaximumResidentStopTerminalRecords = 64U;
     case StopContainmentCommandKind::kSafeOutputCommand:
     case StopContainmentCommandKind::kLogicalCancel:
     case StopContainmentCommandKind::kRegistered:
+      // Absence of a capability-provider binding names the direct control
+      // path.  Preserve that authority when a supporting capability is
+      // co-located in the same provider/runtime unit; target identity alone
+      // cannot make the supporting path more specific than the direct path.
+      if (control_path_matches) {
+        break;
+      }
       if (binding.capability_provider_path.has_value() &&
           provider_matches(*binding.capability_provider_path)) {
         select_provider(*binding.capability_provider_path);
