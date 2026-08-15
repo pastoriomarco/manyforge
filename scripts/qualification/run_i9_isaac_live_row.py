@@ -1901,6 +1901,7 @@ def _build_checks(
     *,
     barrier: Mapping[str, Any],
     before_control: Mapping[str, Any],
+    active_control: Mapping[str, Any],
     after_control: Mapping[str, Any],
     controllers: Mapping[str, Any],
     nodes: Mapping[str, Any],
@@ -1922,6 +1923,7 @@ def _build_checks(
     namespace = f"/manyforge/{spec.component_id}"
     expected_terminal = "failed" if "collision" in spec.scenario_id else "succeeded"
     control_before_state = before_control.get("state", {}).get("state")
+    control_active_state = active_control.get("state", {}).get("state")
     control_after_state = after_control.get("state", {}).get("state")
     reset_result = after_control.get("reset")
     program_run_id = _program_run_id(program)
@@ -1989,6 +1991,12 @@ def _build_checks(
                 for other in SCENARIO_BY_ID.values()
                 if other.component_id != spec.component_id
             )
+        ),
+        "simulation_playing_during": bool(
+            active_control.get("exact_world") is True
+            and control_active_state == "playing"
+            and isinstance(active_control.get("play"), dict)
+            and active_control["play"].get("success") is True
         ),
         "simulation_stopped_after": bool(
             control_after_state == "stopped"
@@ -2542,6 +2550,20 @@ def run_live_row(config: LiveConfig) -> dict[str, Any]:
             _prime_run_evidence(
                 run_evidence, client, scene_before, config.spec
             )
+            # The retained Lite6 gripper publishes feedback on playback ticks.
+            # Playing is therefore part of the bounded readiness probe and the
+            # immediately following active scenario, never an idle-state
+            # workaround. The finally path still owns fail-safe Stop.
+            active_control = _simulation_snapshot(config.spec, play=True)
+            if (
+                active_control.get("exact_world") is not True
+                or active_control.get("state", {}).get("state") != "playing"
+                or not isinstance(active_control.get("play"), dict)
+                or active_control["play"].get("success") is not True
+            ):
+                raise LiveRowError(
+                    "simulation did not enter playing for runtime readiness"
+                )
             applied = _apply_program(
                 client,
                 config.spec,
@@ -2609,6 +2631,7 @@ def run_live_row(config: LiveConfig) -> dict[str, Any]:
             config.spec,
             barrier=barrier,
             before_control=before_control,
+            active_control=active_control,
             after_control=after_control,
             controllers=controllers,
             nodes=nodes,
@@ -2650,6 +2673,7 @@ def run_live_row(config: LiveConfig) -> dict[str, Any]:
             "scene_after": _summary(scene_after),
             "scene_before": _summary(scene_before),
             "simulation_after": after_control,
+            "simulation_active": active_control,
             "simulation_before": before_control,
             "tf_probe": None if tf_probe is None else {
                 key: tf_probe[key] for key in ("bytes", "returncode", "sha256")

@@ -78,6 +78,7 @@ COMMON_ROW_CHECKS: Final = frozenset(
         "reset_observed",
         "required_topics_exact",
         "runtime_namespace_exact",
+        "simulation_playing_during",
         "simulation_stopped_after",
         "simulation_stopped_before",
         "status_trace_correlated",

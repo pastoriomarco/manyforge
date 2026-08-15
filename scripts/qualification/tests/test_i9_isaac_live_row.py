@@ -212,6 +212,11 @@ def base_observations(live: ModuleType, scenario):
             "exact_world": True,
             "state": {"state": "stopped"},
         },
+        "active_control": {
+            "exact_world": True,
+            "play": {"success": True},
+            "state": {"state": "playing"},
+        },
         "after_control": {
             "exact_world": True,
             "state": {"state": "stopped"},
