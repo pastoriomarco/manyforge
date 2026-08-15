@@ -1,6 +1,7 @@
 #include "manyforge_deployment/canonical_empty_admission.hpp"
 
 #include <algorithm>
+#include <array>
 #include <filesystem>
 #include <initializer_list>
 #include <memory>
@@ -20,6 +21,7 @@
 #include "manyforge_deployment/content_identity.hpp"
 #include "manyforge_deployment/deployment_artifact_codec.hpp"
 #include "manyforge_deployment/native_execution_runtime_contract.hpp"
+#include "manyforge_deployment/ros2_control_execution_runtime_contract.hpp"
 #include "posix_durability_internal.hpp"
 
 namespace manyforge::deployment {
@@ -34,6 +36,43 @@ constexpr std::string_view kAdmissionFilename =
     "canonical-empty-admission.json";
 constexpr std::string_view kZeroDigest =
     "sha256:0000000000000000000000000000000000000000000000000000000000000000";
+
+struct CanonicalEmptyExecutionRuntimeContract final {
+  std::string_view runtime_profile_id;
+  std::string_view product_contract_id;
+  std::string_view runtime_role_id;
+  std::string_view process_adapter_contract_id;
+  std::string_view operating_system;
+  std::string_view launch_environment_contract;
+};
+
+constexpr std::array<CanonicalEmptyExecutionRuntimeContract, 2U>
+    kCanonicalEmptyExecutionRuntimeContracts{{
+        {native_execution_runtime_contract::kRuntimeProfileId,
+         native_execution_runtime_contract::kProductContractId,
+         native_execution_runtime_contract::kRuntimeRoleId,
+         native_execution_runtime_contract::kProcessAdapterContractId,
+         native_execution_runtime_contract::kOperatingSystem,
+         native_execution_runtime_contract::kLaunchEnvironmentContract},
+        {ros2_control_execution_runtime_contract::kRuntimeProfileId,
+         ros2_control_execution_runtime_contract::kProductContractId,
+         ros2_control_execution_runtime_contract::kRuntimeRoleId,
+         ros2_control_execution_runtime_contract::kProcessAdapterContractId,
+         ros2_control_execution_runtime_contract::kOperatingSystem,
+         ros2_control_execution_runtime_contract::kLaunchEnvironmentContract},
+    }};
+
+[[nodiscard]] const CanonicalEmptyExecutionRuntimeContract *
+canonical_empty_execution_runtime_contract(std::string_view profile_id) {
+  const auto found = std::find_if(
+      kCanonicalEmptyExecutionRuntimeContracts.begin(),
+      kCanonicalEmptyExecutionRuntimeContracts.end(),
+      [profile_id](const auto &candidate) {
+        return candidate.runtime_profile_id == profile_id;
+      });
+  return found == kCanonicalEmptyExecutionRuntimeContracts.end() ? nullptr
+                                                                 : &*found;
+}
 
 [[noreturn]] void fail(std::string_view message) {
   throw CanonicalEmptyAdmissionError(std::string(message));
@@ -391,15 +430,16 @@ void require_canonical_empty_shape(const RetainedBundle &bundle,
       &value.catalogs.records.front());
   const auto &product_group =
       value.compiled_products.runtime_unit_products.front();
-  if (runtime.runtime_profile_id.value() !=
-          native_execution_runtime_contract::kRuntimeProfileId ||
+  const auto *runtime_contract = canonical_empty_execution_runtime_contract(
+      runtime.runtime_profile_id.value());
+  if (runtime_contract == nullptr ||
       !runtime.dependency_runtime_unit_ids.empty() || profile == nullptr ||
       profile->record_id != runtime.runtime_profile_id ||
       profile->record_revision != runtime.runtime_profile_revision ||
       product_group.runtime_unit_id != runtime.runtime_unit_id ||
       product_group.products.size() != 1U ||
       product_group.products.front().product_contract_id.value() !=
-          native_execution_runtime_contract::kProductContractId) {
+          runtime_contract->product_contract_id) {
     fail("cell-scoped canonical-empty admission retains a foreign or "
          "incomplete execution host runtime");
   }
@@ -408,15 +448,13 @@ void require_canonical_empty_shape(const RetainedBundle &bundle,
       verify_runtime_unit_product(bundle, runtime.runtime_unit_id, artifacts);
   if (!product.has_value() ||
       product->product_contract_id().value() !=
-          native_execution_runtime_contract::kProductContractId ||
-      product->runtime_role_id() !=
-          native_execution_runtime_contract::kRuntimeRoleId ||
+          runtime_contract->product_contract_id ||
+      product->runtime_role_id() != runtime_contract->runtime_role_id ||
       product->process_adapter_contract_id() !=
-          native_execution_runtime_contract::kProcessAdapterContractId ||
-      product->operating_system() !=
-          native_execution_runtime_contract::kOperatingSystem ||
+          runtime_contract->process_adapter_contract_id ||
+      product->operating_system() != runtime_contract->operating_system ||
       product->launch_environment_contract() !=
-          native_execution_runtime_contract::kLaunchEnvironmentContract) {
+          runtime_contract->launch_environment_contract) {
     fail("cell-scoped canonical-empty execution host product is not exactly "
          "build-qualified");
   }

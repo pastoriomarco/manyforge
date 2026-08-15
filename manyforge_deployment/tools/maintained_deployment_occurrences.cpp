@@ -24,12 +24,14 @@
 #include <manyforge_deployment/deployment_artifact_codec.hpp>
 #include <manyforge_deployment/model_asset_codec.hpp>
 #include <manyforge_deployment/model_source.hpp>
+#include <manyforge_deployment/native_execution_runtime_contract.hpp>
 #include <manyforge_deployment/program_binding.hpp>
 #include <manyforge_deployment/program_binding_compiler.hpp>
 #include <manyforge_deployment/program_contract.hpp>
 #include <manyforge_deployment/provider_manifest_codec.hpp>
 #include <manyforge_deployment/retained_bundle.hpp>
 #include <manyforge_deployment/retention_qualified_deployment.hpp>
+#include <manyforge_deployment/ros2_control_execution_runtime_contract.hpp>
 #include <manyforge_deployment/runtime_policy_codec.hpp>
 #include <manyforge_deployment/runtime_profile_codec.hpp>
 #include <manyforge_deployment/runtime_program_binding.hpp>
@@ -54,17 +56,46 @@
 
 #include "canonical_empty_admission_internal.hpp"
 #include "retained_bundle_internal.hpp"
+#include "stop_qualification_evidence_internal.hpp"
 
 namespace {
 
 namespace core = manyforge::core;
 namespace deployment = manyforge::deployment;
 
+struct StopQualificationInputPaths final {
+  std::filesystem::path implementation_build;
+  std::filesystem::path installed_target;
+  std::filesystem::path runner_contract;
+  std::filesystem::path runner_executable;
+  std::optional<std::filesystem::path> implementation_evidence;
+  std::optional<std::filesystem::path> substitution_evidence;
+};
+
 struct Options final {
   std::filesystem::path workspace_root;
   std::optional<std::filesystem::path> package_root;
   std::map<std::string, std::filesystem::path, std::less<>> prepared_roots;
+  std::vector<StopQualificationInputPaths> stop_qualifications;
   bool expect_external_stop_qualification = false;
+};
+
+struct LoadedStopQualifications final {
+  std::optional<deployment::detail::StopQualificationEvidenceCandidate>
+      native_execution;
+  std::optional<deployment::detail::StopQualificationEvidenceCandidate>
+      ros2_control_execution;
+
+  [[nodiscard]] const deployment::detail::StopQualificationEvidenceCandidate &
+  select(bool ros2_control) const {
+    const auto &candidate =
+        ros2_control ? ros2_control_execution : native_execution;
+    if (!candidate.has_value()) {
+      throw std::logic_error(
+          "maintained scenario has no exact runtime Stop qualification");
+    }
+    return *candidate;
+  }
 };
 
 struct Scenario final {
@@ -104,28 +135,69 @@ constexpr std::array<Scenario, 12U> kScenarios{{
 }};
 
 [[nodiscard]] Options parse_options(int argc, char **argv) {
-  if (argc < 6 || std::string_view(argv[1]) != "--check") {
+  if (argc < 3 || std::string_view(argv[1]) != "--check") {
     throw std::invalid_argument(
         "usage: manyforge_maintained_deployment_occurrences --check "
         "--workspace-root <manyforge-root> "
         "[--package-root <empty-output-directory>] "
         "[--stop-evidence-mode require-external-qualification] "
+        "[--stop-evidence-candidate IMPLEMENTATION_BUILD INSTALLED_TARGET "
+        "RUNNER_CONTRACT RUNNER_EXECUTABLE IMPLEMENTATION_EVIDENCE_OR_DASH "
+        "SUBSTITUTION_EVIDENCE_OR_DASH] "
         "--prepared <family-id>=<directory> [--prepared ...]");
   }
   Options result;
-  for (int index = 2; index < argc; index += 2) {
+  for (int index = 2; index < argc;) {
+    const std::string_view option(argv[index]);
+    if (option == "--stop-evidence-candidate") {
+      if (index + 6 >= argc || result.stop_qualifications.size() >= 2U) {
+        throw std::invalid_argument(
+            "maintained Stop qualification candidate is partial or excessive");
+      }
+      std::array<std::string, 6U> values;
+      for (std::size_t offset = 0U; offset < values.size(); ++offset) {
+        const char *const argument =
+            argv[index + 1 + static_cast<int>(offset)];
+        if (argument == nullptr || std::string_view(argument).empty()) {
+          throw std::invalid_argument(
+              "maintained Stop qualification candidate has an empty path");
+        }
+        values[offset] = argument;
+      }
+      const auto optional_evidence_path = [](const std::string &value)
+          -> std::optional<std::filesystem::path> {
+        if (value == "-") {
+          return std::nullopt;
+        }
+        return std::filesystem::path(value);
+      };
+      auto implementation_evidence = optional_evidence_path(values[4]);
+      auto substitution_evidence = optional_evidence_path(values[5]);
+      if (!implementation_evidence.has_value() &&
+          !substitution_evidence.has_value()) {
+        throw std::invalid_argument(
+            "maintained Stop qualification candidate has no evidence package");
+      }
+      result.stop_qualifications.push_back(StopQualificationInputPaths{
+          values[0], values[1], values[2], values[3],
+          std::move(implementation_evidence),
+          std::move(substitution_evidence)});
+      index += 7;
+      continue;
+    }
     if (index + 1 >= argc) {
       throw std::invalid_argument(
           "maintained qualification option has no value");
     }
-    const std::string_view option(argv[index]);
     const std::string value(argv[index + 1]);
     if (option == "--workspace-root" && result.workspace_root.empty()) {
       result.workspace_root = value;
+      index += 2;
       continue;
     }
     if (option == "--package-root" && !result.package_root.has_value()) {
       result.package_root = value;
+      index += 2;
       continue;
     }
     if (option == "--prepared") {
@@ -136,6 +208,7 @@ constexpr std::array<Scenario, 12U> kScenarios{{
               .emplace(value.substr(0U, separator),
                        value.substr(separator + 1U))
               .second) {
+        index += 2;
         continue;
       }
     }
@@ -143,6 +216,7 @@ constexpr std::array<Scenario, 12U> kScenarios{{
         value == "require-external-qualification" &&
         !result.expect_external_stop_qualification) {
       result.expect_external_stop_qualification = true;
+      index += 2;
       continue;
     }
     throw std::invalid_argument(
@@ -152,30 +226,124 @@ constexpr std::array<Scenario, 12U> kScenarios{{
     throw std::invalid_argument("maintained qualification requires one "
                                 "workspace root and three prepared families");
   }
+  if (result.expect_external_stop_qualification &&
+      !result.stop_qualifications.empty()) {
+    throw std::invalid_argument(
+        "external-qualification refusal mode cannot consume evidence");
+  }
   return result;
 }
 
-[[nodiscard]] std::string read_file(const std::filesystem::path &path) {
+inline constexpr std::uintmax_t kMaxStopQualificationExecutableBytes =
+    512U * 1024U * 1024U;
+
+[[nodiscard]] std::string read_bounded_plain_file(
+    const std::filesystem::path &path, std::uintmax_t maximum_bytes,
+    std::string_view label) {
   if (std::filesystem::is_symlink(path) ||
       !std::filesystem::is_regular_file(path)) {
-    throw std::invalid_argument("maintained source is not one plain file: " +
-                                path.string());
+    throw std::invalid_argument(std::string(label) +
+                                " is not one plain file: " + path.string());
   }
   const auto size = std::filesystem::file_size(path);
-  if (size > deployment::kMaxArtifactEncodedBytes) {
-    throw std::invalid_argument(
-        "maintained source exceeds the artifact bound: " + path.string());
+  if (size == 0U || size > maximum_bytes) {
+    throw std::invalid_argument(std::string(label) +
+                                " violates its byte bound: " + path.string());
   }
   std::ifstream stream(path, std::ios::binary);
   if (!stream) {
-    throw std::runtime_error("cannot open maintained source: " + path.string());
+    throw std::runtime_error("cannot open " + std::string(label) + ": " +
+                             path.string());
   }
   std::string bytes(static_cast<std::size_t>(size), '\0');
   stream.read(bytes.data(), static_cast<std::streamsize>(bytes.size()));
-  if (!stream && !bytes.empty()) {
-    throw std::runtime_error("cannot read maintained source: " + path.string());
+  if (stream.gcount() != static_cast<std::streamsize>(bytes.size()) ||
+      stream.peek() != std::char_traits<char>::eof()) {
+    throw std::runtime_error(std::string(label) +
+                             " changed during its bounded read: " +
+                             path.string());
   }
   return bytes;
+}
+
+[[nodiscard]] std::string read_file(const std::filesystem::path &path) {
+  return read_bounded_plain_file(path, deployment::kMaxArtifactEncodedBytes,
+                                 "maintained source");
+}
+
+[[nodiscard]] LoadedStopQualifications
+load_stop_qualifications(const Options &options) {
+  if (options.stop_qualifications.size() != 2U) {
+    throw std::invalid_argument(
+        "maintained package materialization requires exact native and ROS "
+        "Stop qualification candidates");
+  }
+  LoadedStopQualifications result;
+  for (const auto &paths : options.stop_qualifications) {
+    const auto read_document = [](const std::filesystem::path &path,
+                                  std::string_view label) {
+      return read_bounded_plain_file(
+          path, deployment::detail::kMaxStopQualificationEvidenceBytes, label);
+    };
+    std::string implementation_build =
+        read_document(paths.implementation_build,
+                      "Stop implementation build closure");
+    std::string installed_target = read_bounded_plain_file(
+        paths.installed_target, kMaxStopQualificationExecutableBytes,
+        "Stop installed target");
+    std::string runner_contract =
+        read_document(paths.runner_contract, "Stop runner contract");
+    std::string runner_executable = read_bounded_plain_file(
+        paths.runner_executable, kMaxStopQualificationExecutableBytes,
+        "Stop qualification runner executable");
+    const auto read_optional_document = [&read_document](
+                                            const std::optional<
+                                                std::filesystem::path> &path,
+                                            std::string_view label)
+        -> std::optional<std::string> {
+      if (!path.has_value()) {
+        return std::nullopt;
+      }
+      return read_document(*path, label);
+    };
+    auto implementation_evidence = read_optional_document(
+        paths.implementation_evidence, "Stop implementation evidence");
+    auto substitution_evidence = read_optional_document(
+        paths.substitution_evidence, "Stop substitution evidence");
+
+    const auto build_identity =
+        deployment::detail::verify_stop_implementation_build_candidate(
+            implementation_build, installed_target);
+    static_cast<void>(
+        deployment::detail::verify_stop_qualification_runner_candidate(
+            runner_contract, runner_executable));
+    deployment::detail::StopQualificationEvidenceCandidate candidate{
+        std::move(implementation_build), std::move(installed_target),
+        std::move(runner_contract), std::move(runner_executable),
+        std::move(implementation_evidence), std::move(substitution_evidence)};
+    auto *destination =
+        build_identity.implementation_id ==
+                deployment::native_execution_runtime_contract::kImplementationId
+            ? &result.native_execution
+        : build_identity.implementation_id ==
+                  deployment::ros2_control_execution_runtime_contract::
+                      kImplementationId
+            ? &result.ros2_control_execution
+            : nullptr;
+    if (destination == nullptr || destination->has_value()) {
+      throw std::invalid_argument(
+          "maintained Stop qualification implementation is unknown or "
+          "duplicated");
+    }
+    destination->emplace(std::move(candidate));
+  }
+  if (!result.native_execution.has_value() ||
+      !result.ros2_control_execution.has_value()) {
+    throw std::invalid_argument(
+        "maintained package materialization requires one native and one ROS "
+        "Stop qualification implementation");
+  }
+  return result;
 }
 
 [[nodiscard]] const deployment::CanonicalValue &
@@ -520,7 +688,8 @@ materialize_scenarios(const std::filesystem::path &root,
                       const QualifiedCatalogClosure &catalog,
                       const ExactCompilerInputSource &input_source,
                       const std::filesystem::path &package_root,
-                      bool expect_external_stop_qualification) {
+                      bool expect_external_stop_qualification,
+                      const LoadedStopQualifications *stop_qualifications) {
   const std::string overlay_bytes = read_file(
       root / "manyforge_deployment/resources/maintained/site_overlays/"
              "manyforge_local_examples.site_overlay.json");
@@ -734,10 +903,19 @@ materialize_scenarios(const std::filesystem::path &root,
           "maintained Stop deployment materialized without external build "
           "qualification evidence");
     }
+    if (stop_qualifications == nullptr) {
+      throw std::logic_error(
+          "maintained package materialization lost its Stop qualifications");
+    }
+    const auto &stop_candidate =
+        stop_qualifications->select(scenario.ros2_control_execution);
+    const std::span<const deployment::detail::
+                        StopQualificationEvidenceCandidate>
+        stop_candidates(&stop_candidate, 1U);
     auto bundle = deployment::detail::RetainedBundleMaterializer::
         materialize_store_and_reload_production(
             qualified, manifest_repository, input_source, selected_preparation,
-            catalog_store, raw_store, bundle_repository);
+            catalog_store, raw_store, bundle_repository, stop_candidates);
     if (bundle == nullptr ||
         bundle->value().compiled_products.symbol_role_maps.size() != 1U) {
       throw std::logic_error("scenario did not retain one exact model map");
@@ -780,7 +958,7 @@ materialize_scenarios(const std::filesystem::path &root,
     const auto empty_bundle = deployment::detail::RetainedBundleMaterializer::
         materialize_store_and_reload_production(
             empty_qualified, manifest_repository, input_source, {},
-            catalog_store, raw_store, bundle_repository);
+            catalog_store, raw_store, bundle_repository, stop_candidates);
     if (empty_bundle == nullptr ||
         empty_bundle->value().cell_graph.runtime_units !=
             bundle->value().cell_graph.runtime_units ||
@@ -1940,10 +2118,17 @@ int main(int argc, char **argv) {
     const QualifiedCatalogClosure catalog =
         qualify_catalog(root, input_source, families);
     verify_scenarios(root, catalog);
+    std::optional<LoadedStopQualifications> stop_qualifications;
+    if (!options.expect_external_stop_qualification) {
+      stop_qualifications.emplace(load_stop_qualifications(options));
+    }
     TemporaryPackage package(options.package_root);
     const auto products =
         materialize_scenarios(root, catalog, input_source, package.path(),
-                              options.expect_external_stop_qualification);
+                              options.expect_external_stop_qualification,
+                              stop_qualifications.has_value()
+                                  ? &*stop_qualifications
+                                  : nullptr);
     if (options.expect_external_stop_qualification) {
       if (!products.empty()) {
         throw std::logic_error(
