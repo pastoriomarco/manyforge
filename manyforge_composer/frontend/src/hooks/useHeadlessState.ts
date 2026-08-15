@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 import { resolveStructuralAssetUrl } from '../api/client';
 import { parseComposerHeadlessState } from '../api/parsers';
 import type { ComposerHeadlessState } from '../types/headless';
@@ -9,6 +9,77 @@ export interface HeadlessStateResult {
   snapshot: ComposerHeadlessState | null;
   error: string | null;
   reconnect: () => void;
+}
+
+export interface HeadlessStateAdmission {
+  accepted: boolean;
+  reason: string | null;
+}
+
+function exactSnapshotEqual(left: unknown, right: unknown): boolean {
+  return JSON.stringify(left) === JSON.stringify(right);
+}
+
+function monotonicOwnerSection(
+  label: string,
+  currentOwnerId: string,
+  currentOwnerEpoch: string,
+  currentGeneration: number,
+  candidateOwnerId: string,
+  candidateOwnerEpoch: string,
+  candidateGeneration: number,
+  currentValue: unknown,
+  candidateValue: unknown,
+): string | null {
+  if (candidateOwnerEpoch !== currentOwnerEpoch) return null;
+  if (candidateOwnerId !== currentOwnerId) {
+    return `${label} reused an owner epoch with a different owner ID.`;
+  }
+  if (candidateGeneration < currentGeneration) {
+    return `${label} generation regressed within one owner epoch.`;
+  }
+  if (
+    candidateGeneration === currentGeneration
+    && !exactSnapshotEqual(candidateValue, currentValue)
+  ) {
+    return `${label} conflicted at an already observed owner generation.`;
+  }
+  return null;
+}
+
+export function admitHeadlessState(
+  current: ComposerHeadlessState | null,
+  candidate: ComposerHeadlessState,
+): HeadlessStateAdmission {
+  if (current === null) return { accepted: true, reason: null };
+  const runtimeReason = monotonicOwnerSection(
+    'Headless runtime projection',
+    current.runtime.projectionOwnerId,
+    current.runtime.projectionOwnerEpoch,
+    current.runtime.projectionGeneration,
+    candidate.runtime.projectionOwnerId,
+    candidate.runtime.projectionOwnerEpoch,
+    candidate.runtime.projectionGeneration,
+    current.runtime,
+    candidate.runtime,
+  );
+  if (runtimeReason !== null) {
+    return { accepted: false, reason: runtimeReason };
+  }
+  const alarmReason = monotonicOwnerSection(
+    'Headless alarm projection',
+    current.alarms.ownerId,
+    current.alarms.ownerEpoch,
+    current.alarms.generation,
+    candidate.alarms.ownerId,
+    candidate.alarms.ownerEpoch,
+    candidate.alarms.generation,
+    current.alarms,
+    candidate.alarms,
+  );
+  return alarmReason === null
+    ? { accepted: true, reason: null }
+    : { accepted: false, reason: alarmReason };
 }
 
 function websocketUrl(): string {
@@ -22,11 +93,13 @@ function websocketUrl(): string {
 
 export function useHeadlessState(enabled: boolean): HeadlessStateResult {
   const [snapshot, setSnapshot] = useState<ComposerHeadlessState | null>(null);
+  const snapshotRef = useRef<ComposerHeadlessState | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [reconnectToken, setReconnectToken] = useState(0);
 
   useEffect(() => {
     if (!enabled) {
+      snapshotRef.current = null;
       setSnapshot(null);
       setError(null);
       return undefined;
@@ -56,7 +129,15 @@ export function useHeadlessState(enabled: boolean): HeadlessStateResult {
               return;
             }
           }
-          setSnapshot(parseComposerHeadlessState(raw));
+          const candidate = parseComposerHeadlessState(raw);
+          const admission = admitHeadlessState(snapshotRef.current, candidate);
+          if (!admission.accepted) {
+            setError(admission.reason);
+            socket?.close(1002, 'non-monotonic headless projection');
+            return;
+          }
+          snapshotRef.current = candidate;
+          setSnapshot(candidate);
           setError(null);
         } catch (reason) {
           setError(

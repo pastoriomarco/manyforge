@@ -952,6 +952,14 @@ export function SceneAuthoringWorkspace({
         candidateTcpPose={ghost}
         candidateStale={robotControl.state.ghostStale}
         runtimePresentation={runtimePresentation}
+        sceneOwnerIdentity={facts === null ? undefined : {
+          ownerEpoch: facts.sourceOwnerEpoch,
+          generation: facts.sourceGeneration,
+        }}
+        viewerFrameIdentity={headlessState.snapshot?.runtime.complete === true ? {
+          ownerEpoch: headlessState.snapshot.runtime.projectionOwnerEpoch,
+          generation: headlessState.snapshot.runtime.projectionGeneration,
+        } : undefined}
         viewer={viewer}
       />
     </>

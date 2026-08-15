@@ -20,6 +20,7 @@ import {
   parseProgramRunStatus,
   parseScenarioCatalogResponse,
   parseSceneTransactionResponse,
+  parseSceneMeshAssetMetadata,
   parseSceneUrdfManifest,
   parseSourceModelProjection,
 } from './parsers';
@@ -50,6 +51,7 @@ import type {
   ScenarioCatalogResponse,
   SceneTransactionRequest,
   SceneTransactionResponse,
+  SceneMeshAssetMetadata,
   SceneUrdfManifest,
   SourceModelProjection,
 } from '../types/api';
@@ -514,6 +516,23 @@ export const api = {
     ),
   },
   scene: {
+    resolveMesh: (
+      resourceUri: string,
+      scale: { x: number; y: number; z: number },
+      signal?: AbortSignal,
+    ): Promise<SceneMeshAssetMetadata> => {
+      const params = new URLSearchParams({
+        resource_uri: resourceUri,
+        scale_x: String(scale.x),
+        scale_y: String(scale.y),
+        scale_z: String(scale.z),
+      });
+      return requestJson(
+        `/api/scene/object-meshes/resolve?${params.toString()}`,
+        parseSceneMeshAssetMetadata,
+        signal,
+      );
+    },
     commit: (
       transaction: SceneTransactionRequest,
       signal?: AbortSignal,

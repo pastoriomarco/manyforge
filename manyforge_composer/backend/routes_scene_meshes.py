@@ -1,33 +1,34 @@
-"""Bounded mesh transport primitives and the explicit I9 client gate.
+"""Bounded scene-mesh client over fresh Headless owner projections.
 
 The last full Composer implementation is pinned at
 ``manyforge@08222188293df8e12f90dc72e204c21f22f92ea1``.  Source blob
 ``b0a37123e4cb89de32e7cdec055a63b2352bede3`` records limit parsing and
 scale validation at lines 63-113, the descriptor and state-bound cache/service
 at lines 116-633, content identity at lines 636-659, path-based conversion at
-lines 662-739, and state/router integration at lines 742-794.  Removed scene
-lookup, resource resolution, cache, prewarming, and HTTP behavior remain exact
-I9 restoration inputs, not dormant fallback code.
+lines 662-739, and state/router integration at lines 742-794. The current
+implementation preserves those behaviors through Headless-issued identities;
+it does not restore the former Composer scene owner.
 
-This module retains only owner-neutral identity, exact DTO validation, one
-contained no-symlink source snapshot, and subprocess-isolated conversion of
-that immutable snapshot.  The worker receives no source path or external
-resource resolver.  OBJ materials and GLTF external buffers/images are not
-loaded; DAE returns at I9 because the pinned image has no pycollada parser and
-its XML/resource closure is not captured here.  Worker address space, output
-file size, CPU time, and post-start parent wait/teardown are bounded; OS process
-creation and a kernel task that remains alive after SIGKILL cannot be made a
-hard user-space wall-time guarantee.  The parent accepts only a bounded regular
-structurally valid GLB from a private temporary directory.  All state-bound and
-route entrypoints fail before reading state.
+The current service never enumerates a Composer scene. It accepts a mesh URI
+only when that exact URI and scale are present in the fresh logical-scene
+projection returned by Headless, then captures one contained no-symlink local
+source snapshot and converts only those immutable bytes in a bounded
+subprocess. The worker receives no source path or external resource resolver.
+OBJ materials and GLTF external buffers/images are not loaded; DAE remains
+unsupported because its XML/resource closure is not captured here. Worker
+address space, output file size, CPU time, and post-start parent wait/teardown
+are bounded. The parent accepts only a bounded regular structurally valid GLB
+from a private temporary directory.
 """
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from collections import OrderedDict
+from dataclasses import dataclass, field
 import hashlib
 import io
 import json
+import logging
 import math
 import multiprocessing as mp
 import os
@@ -35,10 +36,15 @@ from pathlib import Path
 import stat as stat_module
 import struct
 import tempfile
+import threading
 import time
 from typing import Any, Final, Literal, TYPE_CHECKING
+from urllib.parse import unquote, urlencode, urlsplit
 
-from fastapi import APIRouter
+from fastapi import APIRouter, HTTPException, Path as ApiPath, Query
+from fastapi.responses import JSONResponse, Response
+
+from manyforge_headless_api.client import HeadlessClientError
 
 if TYPE_CHECKING:
     from .state import ComposerState
@@ -109,10 +115,11 @@ _GLB_BINARY_CHUNK_TYPE: Final = b"BIN\x00"
 _MIN_GLB_BYTES: Final = 24
 _MAX_GLB_JSON_BYTES: Final = 4 * 1024 * 1024
 
-SCENE_MESH_CLIENT_UNAVAILABLE_REASON_CODE: Final = (
-    "composable_cell_scene_mesh_client_unavailable"
-)
-SCENE_MESH_RESTORATION_GATE: Final = "I9"
+_MAX_SERVICE_RECORDS: Final = 64
+_MAX_SERVICE_CACHE_BYTES: Final = 256 * 1024 * 1024
+_MESH_METADATA_SCHEMA: Final = "manyforge.scene_mesh_asset.v1"
+
+logger = logging.getLogger(__name__)
 
 
 class SceneMeshInputError(ValueError):
@@ -121,17 +128,6 @@ class SceneMeshInputError(ValueError):
 
 class SceneMeshBoundsError(SceneMeshInputError):
     """Raised before retained mesh work can exceed a hard resource bound."""
-
-
-class SceneMeshClientUnavailableError(RuntimeError):
-    """Raised before state lookup, cache creation, or route registration."""
-
-
-def _raise_scene_mesh_client_unavailable() -> None:
-    raise SceneMeshClientUnavailableError(
-        f"{SCENE_MESH_CLIENT_UNAVAILABLE_REASON_CODE}: state-bound scene mesh "
-        "lookup and routing return at I9 on the new observer owner"
-    )
 
 
 def _env_float(name: str, default: float, *, hard_max: float) -> float:
@@ -634,8 +630,8 @@ def _read_authorized_mesh_input(
     suffix = candidate.suffix.lower()
     if suffix in _DEFERRED_EXTENSIONS:
         raise SceneMeshInputError(
-            "DAE conversion is unavailable until I9 captures and qualifies its "
-            "XML/resource closure"
+            "DAE conversion is unsupported because its XML/resource closure "
+            "is not part of the retained mesh contract"
         )
     if suffix not in _SUPPORTED_EXTENSIONS:
         raise SceneMeshInputError(f"unsupported mesh format {suffix!r}")
@@ -1142,52 +1138,639 @@ def _convert_mesh_asset_subprocess(
                     process.close()
 
 
+@dataclass(frozen=True, slots=True)
+class _OwnerMeshBinding:
+    source_owner_epoch: str
+    source_generation: int
+    cell_id: str
+    source_uri: str
+    mesh_scale: tuple[float, float, float]
+
+
+@dataclass(slots=True)
+class _MeshRecord:
+    descriptor: MeshAssetDescriptor
+    binding: _OwnerMeshBinding
+    mesh_input: AuthorizedMeshInput | None
+    converted: bytes | None = None
+    conversion_error: str | None = None
+    conversion_error_kind: Literal["timeout", "bounds", "parse"] | None = None
+    lock: threading.Lock = field(default_factory=threading.Lock)
+
+
+def _scene_mesh_error(
+    status_code: int,
+    code: str,
+    message: str,
+) -> HTTPException:
+    return HTTPException(
+        status_code=status_code,
+        detail={"code": code, "message": message},
+    )
+
+
+def _owner_mesh_binding(
+    state: "ComposerState",
+    source_uri: str,
+    mesh_scale: tuple[float, float, float],
+) -> _OwnerMeshBinding:
+    client = getattr(state, "headless_client", None)
+    if client is None or not callable(getattr(client, "scene", None)):
+        raise _scene_mesh_error(
+            503,
+            "scene_mesh_owner_unavailable",
+            "the Headless logical-scene owner is unavailable",
+        )
+    try:
+        projection = client.scene()
+    except HeadlessClientError as error:
+        raise _scene_mesh_error(
+            error.status_code or 503,
+            error.code,
+            str(error),
+        ) from error
+    except Exception as error:
+        raise _scene_mesh_error(
+            503,
+            "scene_mesh_owner_unavailable",
+            "the Headless logical-scene projection could not be read",
+        ) from error
+    if (
+        type(projection) is not dict
+        or projection.get("schema_version") != "manyforge.scene_projection.v1"
+    ):
+        raise _scene_mesh_error(
+            503,
+            "scene_mesh_owner_projection_invalid",
+            "the Headless scene projection has an unsupported contract",
+        )
+    section = projection.get("logical_scene")
+    if (
+        type(section) is not dict
+        or section.get("available") is not True
+        or section.get("freshness") != "fresh"
+        or section.get("known_gaps") != []
+        or type(section.get("source_owner_epoch")) is not str
+        or not section["source_owner_epoch"]
+        or type(section.get("source_generation")) is not int
+        or isinstance(section.get("source_generation"), bool)
+        or section["source_generation"] < 0
+    ):
+        raise _scene_mesh_error(
+            409,
+            "scene_mesh_owner_projection_stale",
+            "the logical-scene projection is unavailable, stale, or incomplete",
+        )
+    payload = section.get("payload")
+    snapshot = payload.get("snapshot") if type(payload) is dict else None
+    if (
+        type(payload) is not dict
+        or payload.get("api_version") != "manyforge.logical_scene_source.v1"
+        or type(snapshot) is not dict
+        or type(snapshot.get("cell_id")) is not str
+        or not snapshot["cell_id"]
+        or type(snapshot.get("objects")) is not list
+    ):
+        raise _scene_mesh_error(
+            503,
+            "scene_mesh_owner_projection_invalid",
+            "the logical-scene payload is incomplete",
+        )
+    if len(snapshot["objects"]) > 4_096:
+        raise _scene_mesh_error(
+            503,
+            "scene_mesh_owner_projection_invalid",
+            "the logical-scene object bound is exceeded",
+        )
+    matches = 0
+    for scene_object in snapshot["objects"]:
+        shapes = (
+            scene_object.get("collision_shapes")
+            if type(scene_object) is dict
+            else None
+        )
+        if type(shapes) is not list:
+            continue
+        if len(shapes) > 4_096:
+            raise _scene_mesh_error(
+                503,
+                "scene_mesh_owner_projection_invalid",
+                "the logical-scene shape bound is exceeded",
+            )
+        for shape in shapes:
+            if (
+                type(shape) is not dict
+                or shape.get("type") != "mesh"
+                or shape.get("resource_uri") != source_uri
+            ):
+                continue
+            scale = shape.get("scale")
+            if type(scale) is not dict or set(scale) != {"x", "y", "z"}:
+                continue
+            try:
+                candidate_scale = _normalize_scale(
+                    [scale["x"], scale["y"], scale["z"]]
+                )
+            except SceneMeshInputError:
+                continue
+            if candidate_scale == mesh_scale:
+                matches += 1
+    if matches == 0:
+        raise _scene_mesh_error(
+            409,
+            "scene_mesh_not_owner_authorized",
+            "the requested mesh URI and scale are absent from current owner truth",
+        )
+    return _OwnerMeshBinding(
+        source_owner_epoch=section["source_owner_epoch"],
+        source_generation=section["source_generation"],
+        cell_id=snapshot["cell_id"],
+        source_uri=source_uri,
+        mesh_scale=mesh_scale,
+    )
+
+
+def _resolved_mesh_source(
+    state: "ComposerState",
+    source_uri: str,
+) -> tuple[Path, tuple[Path, ...]]:
+    uri = _bounded_text(
+        source_uri,
+        label="mesh_resource_uri",
+        maximum=_MAX_URI_CHARS,
+    )
+    parsed = urlsplit(uri)
+    if parsed.scheme not in {"", "file"}:
+        raise SceneMeshInputError(
+            "scene mesh resources must use a relative path, absolute path, or file URI"
+        )
+    if parsed.scheme == "file" and parsed.netloc not in {"", "localhost"}:
+        raise SceneMeshInputError("scene mesh file URI must be local")
+    if parsed.query or parsed.fragment:
+        raise SceneMeshInputError("scene mesh resource URI cannot contain query or fragment")
+    raw = unquote(parsed.path) if parsed.scheme == "file" else uri
+    if "\x00" in raw or not raw:
+        raise SceneMeshInputError("mesh_resource_uri is invalid")
+
+    configured = getattr(state, "allowed_fs_roots", None)
+    if type(configured) is not list or not configured:
+        raise SceneMeshInputError("Composer has no configured mesh resource roots")
+    roots = _resolved_allowed_roots(configured)
+    path = Path(raw)
+    candidates: list[Path] = []
+    if path.is_absolute():
+        candidates.append(path)
+    else:
+        program_source = getattr(state, "program_source_path", None)
+        if type(program_source) is str and program_source:
+            candidates.append(Path(program_source).parent / path)
+        candidates.extend(root / path for root in roots)
+    for candidate in candidates:
+        normalized = Path(os.path.normpath(str(candidate)))
+        if not normalized.is_absolute():
+            continue
+        try:
+            _relative_to_deepest_root(normalized, roots)
+        except SceneMeshInputError:
+            continue
+        if normalized.exists():
+            return normalized, roots
+    raise SceneMeshInputError(
+        "mesh_resource_uri does not resolve to an allowed local source"
+    )
+
+
 class SceneMeshAssetService:
-    """Stable I9 reconnection marker; it owns no state or cache today."""
+    """Read-only, owner-bound mesh conversion and bounded presentation cache."""
+
+    def __init__(self, *, limits: MeshConversionLimits | None = None) -> None:
+        self._limits = limits or MeshConversionLimits.from_environment()
+        if type(self._limits) is not MeshConversionLimits:
+            raise TypeError("limits must be a MeshConversionLimits DTO")
+        self._lock = threading.RLock()
+        self._records: OrderedDict[str, _MeshRecord] = OrderedDict()
+        self._cache_bytes = 0
+
+    def _evict_one_locked(self, *, exclude: set[str] | None = None) -> bool:
+        excluded = exclude or set()
+        for identity, record in tuple(self._records.items()):
+            if identity in excluded or record.lock.locked():
+                continue
+            self._records.pop(identity, None)
+            if record.converted is not None:
+                self._cache_bytes -= len(record.converted)
+            return True
+        return False
+
+    def _record_for_shape(
+        self,
+        state: "ComposerState",
+        mesh_resource_uri: str | None,
+        mesh_scale: list[float] | tuple[float, ...] | None,
+    ) -> _MeshRecord:
+        source_uri = _bounded_text(
+            mesh_resource_uri,
+            label="mesh_resource_uri",
+            maximum=_MAX_URI_CHARS,
+        )
+        scale = _normalize_scale(mesh_scale)
+        binding = _owner_mesh_binding(state, source_uri, scale)
+        path, roots = _resolved_mesh_source(state, source_uri)
+        mesh_input = _read_authorized_mesh_input(
+            path,
+            list(roots),
+            limits=self._limits,
+        )
+        asset_hash = _asset_hash(
+            mesh_input.resolved_realpath,
+            mesh_input.content_sha256,
+            scale,
+        )
+        with self._lock:
+            existing = self._records.get(asset_hash)
+            if existing is not None:
+                existing.binding = binding
+                self._records.move_to_end(asset_hash)
+                return existing
+            while len(self._records) >= _MAX_SERVICE_RECORDS:
+                if self._evict_one_locked():
+                    continue
+                raise SceneMeshBoundsError(
+                    "all bounded scene mesh cache records are active"
+                )
+            record = _MeshRecord(
+                descriptor=MeshAssetDescriptor(
+                    asset_hash=asset_hash,
+                    source_uri=source_uri,
+                    resolved_realpath=mesh_input.resolved_realpath,
+                    file_content_sha256=mesh_input.content_sha256,
+                    mesh_scale=scale,
+                ),
+                binding=binding,
+                mesh_input=mesh_input,
+            )
+            self._records[asset_hash] = record
+            return record
+
+    def _metadata(self, record: _MeshRecord) -> dict[str, str | int | None]:
+        with self._lock:
+            binding = record.binding
+        status = (
+            "parse_failed"
+            if record.conversion_error is not None
+            else "ok" if record.converted is not None else "pending"
+        )
+        query = urlencode(
+            {
+                "owner_epoch": binding.source_owner_epoch,
+                "generation": str(binding.source_generation),
+            }
+        )
+        return {
+            "schema_version": _MESH_METADATA_SCHEMA,
+            "asset_hash": record.descriptor.asset_hash,
+            "mesh_asset_url": (
+                f"/api/scene/object-meshes/{record.descriptor.asset_hash}.glb?{query}"
+            ),
+            "mesh_asset_status": status,
+            "source_owner_epoch": binding.source_owner_epoch,
+            "source_generation": binding.source_generation,
+            "cell_id": binding.cell_id,
+            "last_error": record.conversion_error,
+        }
 
     def metadata_for_shape(
         self,
-        *_args: object,
-        **_kwargs: object,
-    ) -> dict[str, str | None]:
-        _raise_scene_mesh_client_unavailable()
+        state: "ComposerState",
+        mesh_resource_uri: str | None,
+        mesh_scale: list[float] | tuple[float, ...] | None,
+        *,
+        schedule_conversion: bool = True,
+    ) -> dict[str, str | int | None]:
+        del schedule_conversion
+        return self._metadata(
+            self._record_for_shape(state, mesh_resource_uri, mesh_scale)
+        )
 
     def validate_boundary_or_409(
         self,
-        *_args: object,
-        **_kwargs: object,
+        state: "ComposerState",
+        mesh_resource_uri: str | None,
+        mesh_scale: list[float] | tuple[float, ...] | None,
     ) -> None:
-        _raise_scene_mesh_client_unavailable()
+        try:
+            self._record_for_shape(state, mesh_resource_uri, mesh_scale)
+        except HTTPException:
+            raise
+        except SceneMeshBoundsError as error:
+            raise _scene_mesh_error(
+                413,
+                "scene_mesh_bounds_exceeded",
+                str(error),
+            ) from error
+        except SceneMeshInputError as error:
+            raise _scene_mesh_error(
+                409,
+                "scene_mesh_input_invalid",
+                str(error),
+            ) from error
 
-    def prewarm(self, *_args: object, **_kwargs: object) -> None:
-        _raise_scene_mesh_client_unavailable()
+    def prewarm(self, state: "ComposerState") -> None:
+        client = getattr(state, "headless_client", None)
+        if client is None:
+            return
+        try:
+            projection = client.scene()
+            objects = projection["logical_scene"]["payload"]["snapshot"]["objects"]
+        except Exception:
+            return
+        for scene_object in objects[:4_096]:
+            if type(scene_object) is not dict:
+                continue
+            shapes = scene_object.get("collision_shapes")
+            if type(shapes) is not list:
+                continue
+            for shape in shapes[:4_096]:
+                if type(shape) is not dict or shape.get("type") != "mesh":
+                    continue
+                scale = shape.get("scale", {})
+                if type(scale) is not dict:
+                    continue
+                try:
+                    self._record_for_shape(
+                        state,
+                        shape.get("resource_uri"),
+                        [scale.get("x"), scale.get("y"), scale.get("z")],
+                    )
+                except Exception:
+                    logger.debug("scene mesh prewarm admission failed", exc_info=True)
 
-    def get_glb_response(self, *_args: object, **_kwargs: object) -> None:
-        _raise_scene_mesh_client_unavailable()
+    def _validate_binding(
+        self,
+        state: "ComposerState",
+        record: _MeshRecord,
+        expected_owner_epoch: str,
+        expected_generation: int,
+    ) -> _OwnerMeshBinding:
+        with self._lock:
+            if self._records.get(record.descriptor.asset_hash) is not record:
+                raise _scene_mesh_error(
+                    404,
+                    "scene_mesh_asset_unknown",
+                    "the scene mesh asset has left the bounded cache",
+                )
+            binding = record.binding
+        if (
+            binding.source_owner_epoch != expected_owner_epoch
+            or binding.source_generation != expected_generation
+        ):
+            raise _scene_mesh_error(
+                409,
+                "scene_mesh_owner_generation_changed",
+                "the mesh URL belongs to a superseded logical-scene generation",
+            )
+        current = _owner_mesh_binding(
+            state,
+            binding.source_uri,
+            binding.mesh_scale,
+        )
+        with self._lock:
+            if self._records.get(record.descriptor.asset_hash) is not record:
+                raise _scene_mesh_error(
+                    404,
+                    "scene_mesh_asset_unknown",
+                    "the scene mesh asset has left the bounded cache",
+                )
+            if current != binding or record.binding != binding:
+                raise _scene_mesh_error(
+                    409,
+                    "scene_mesh_owner_generation_changed",
+                    "the mesh URL belongs to a superseded logical-scene generation",
+                )
+            self._records.move_to_end(record.descriptor.asset_hash)
+        return binding
+
+    @staticmethod
+    def _raise_cached_conversion(record: _MeshRecord) -> None:
+        message = record.conversion_error or "scene mesh conversion failed"
+        if record.conversion_error_kind == "timeout":
+            raise TimeoutError(message)
+        if record.conversion_error_kind == "bounds":
+            raise SceneMeshBoundsError(message)
+        raise SceneMeshInputError(message)
+
+    def _convert(self, record: _MeshRecord) -> bytes:
+        with record.lock:
+            if record.converted is not None:
+                return record.converted
+            if record.conversion_error is not None:
+                self._raise_cached_conversion(record)
+            mesh_input = record.mesh_input
+            if mesh_input is None:
+                raise SceneMeshInputError("scene mesh source snapshot is unavailable")
+            try:
+                result = _convert_mesh_asset_subprocess(
+                    mesh_input,
+                    record.descriptor.mesh_scale,
+                    limits=self._limits,
+                )
+            except Exception as error:
+                record.conversion_error = _bounded_worker_message(error)
+                record.conversion_error_kind = (
+                    "timeout"
+                    if isinstance(error, TimeoutError)
+                    else "bounds"
+                    if isinstance(error, SceneMeshBoundsError)
+                    else "parse"
+                )
+                record.mesh_input = None
+                raise
+            with self._lock:
+                if self._records.get(record.descriptor.asset_hash) is not record:
+                    return result
+                while self._cache_bytes + len(result) > _MAX_SERVICE_CACHE_BYTES:
+                    if self._evict_one_locked(
+                        exclude={record.descriptor.asset_hash},
+                    ):
+                        continue
+                    raise SceneMeshBoundsError(
+                        "all bounded scene mesh cache bytes are active"
+                    )
+                record.converted = result
+                record.mesh_input = None
+                self._cache_bytes += len(result)
+                self._records.move_to_end(record.descriptor.asset_hash)
+            return result
+
+    def get_glb_response(
+        self,
+        state: "ComposerState",
+        asset_hash: str,
+        expected_owner_epoch: str,
+        expected_generation: int,
+    ) -> Response:
+        try:
+            identity = _validate_lower_hex(
+                asset_hash,
+                label="asset_hash",
+                length=16,
+            )
+        except SceneMeshInputError as error:
+            return JSONResponse(
+                status_code=404,
+                content={
+                    "detail": {
+                        "code": "scene_mesh_asset_unknown",
+                        "message": str(error),
+                    }
+                },
+            )
+        with self._lock:
+            record = self._records.get(identity)
+        if record is None:
+            return JSONResponse(
+                status_code=404,
+                content={
+                    "detail": {
+                        "code": "scene_mesh_asset_unknown",
+                        "message": "unknown scene mesh asset",
+                    }
+                },
+            )
+        try:
+            binding = self._validate_binding(
+                state,
+                record,
+                expected_owner_epoch,
+                expected_generation,
+            )
+            content = self._convert(record)
+        except HTTPException as error:
+            return JSONResponse(
+                status_code=error.status_code,
+                content={"detail": error.detail},
+            )
+        except TimeoutError as error:
+            return JSONResponse(
+                status_code=504,
+                content={
+                    "detail": {
+                        "code": "scene_mesh_conversion_timeout",
+                        "message": str(error),
+                    }
+                },
+            )
+        except SceneMeshBoundsError as error:
+            return JSONResponse(
+                status_code=413,
+                content={
+                    "detail": {
+                        "code": "scene_mesh_bounds_exceeded",
+                        "message": str(error),
+                    }
+                },
+            )
+        except Exception as error:
+            return JSONResponse(
+                status_code=422,
+                content={
+                    "detail": {
+                        "code": "scene_mesh_conversion_failed",
+                        "message": _bounded_worker_message(error),
+                    }
+                },
+            )
+        return Response(
+            content=content,
+            media_type="model/gltf-binary",
+            headers={
+                "Cache-Control": "private, no-cache",
+                "ETag": f'"{identity}"',
+                "X-ManyForge-Scene-Owner-Epoch": binding.source_owner_epoch,
+                "X-ManyForge-Scene-Generation": str(binding.source_generation),
+            },
+        )
 
 
-def get_scene_mesh_asset_service(_state: "ComposerState") -> SceneMeshAssetService:
-    _raise_scene_mesh_client_unavailable()
+def get_scene_mesh_asset_service(state: "ComposerState") -> SceneMeshAssetService:
+    service = getattr(state, "_scene_mesh_asset_service", None)
+    if isinstance(service, SceneMeshAssetService):
+        return service
+    service = SceneMeshAssetService()
+    setattr(state, "_scene_mesh_asset_service", service)
+    return service
 
 
 def scene_mesh_shape_metadata(
-    _state: "ComposerState",
-    _mesh_resource_uri: str | None,
-    _mesh_scale: list[float] | tuple[float, ...] | None,
-) -> dict[str, str | None]:
-    _raise_scene_mesh_client_unavailable()
+    state: "ComposerState",
+    mesh_resource_uri: str | None,
+    mesh_scale: list[float] | tuple[float, ...] | None,
+) -> dict[str, str | int | None]:
+    return get_scene_mesh_asset_service(state).metadata_for_shape(
+        state,
+        mesh_resource_uri,
+        mesh_scale,
+    )
 
 
 def validate_scene_mesh_resource_or_409(
-    _state: "ComposerState",
-    _mesh_resource_uri: str | None,
-    _mesh_scale: list[float] | tuple[float, ...] | None,
+    state: "ComposerState",
+    mesh_resource_uri: str | None,
+    mesh_scale: list[float] | tuple[float, ...] | None,
 ) -> None:
-    _raise_scene_mesh_client_unavailable()
+    get_scene_mesh_asset_service(state).validate_boundary_or_409(
+        state,
+        mesh_resource_uri,
+        mesh_scale,
+    )
 
 
-def create_scene_meshes_router(_state: "ComposerState") -> APIRouter:
-    _raise_scene_mesh_client_unavailable()
+def create_scene_meshes_router(state: "ComposerState") -> APIRouter:
+    service = get_scene_mesh_asset_service(state)
+    router = APIRouter()
+
+    @router.get("/api/scene/object-meshes/resolve")
+    def resolve_scene_object_mesh(
+        resource_uri: str = Query(min_length=1, max_length=_MAX_URI_CHARS),
+        scale_x: float = Query(gt=0.0, le=_MAX_SCALE_COMPONENT),
+        scale_y: float = Query(gt=0.0, le=_MAX_SCALE_COMPONENT),
+        scale_z: float = Query(gt=0.0, le=_MAX_SCALE_COMPONENT),
+    ) -> dict[str, str | int | None]:
+        try:
+            return service.metadata_for_shape(
+                state,
+                resource_uri,
+                [scale_x, scale_y, scale_z],
+            )
+        except HTTPException:
+            raise
+        except SceneMeshBoundsError as error:
+            raise _scene_mesh_error(
+                413,
+                "scene_mesh_bounds_exceeded",
+                str(error),
+            ) from error
+        except SceneMeshInputError as error:
+            raise _scene_mesh_error(
+                409,
+                "scene_mesh_input_invalid",
+                str(error),
+            ) from error
+
+    @router.get("/api/scene/object-meshes/{asset_hash}.glb")
+    def get_scene_object_mesh(
+        asset_hash: str = ApiPath(min_length=16, max_length=16),
+        owner_epoch: str = Query(min_length=1, max_length=256),
+        generation: int = Query(ge=0),
+    ) -> Response:
+        return service.get_glb_response(
+            state,
+            asset_hash,
+            owner_epoch,
+            generation,
+        )
+
+    return router
 
 
 __all__ = [
@@ -1196,7 +1779,6 @@ __all__ = [
     "MeshConversionLimits",
     "SceneMeshAssetService",
     "SceneMeshBoundsError",
-    "SceneMeshClientUnavailableError",
     "SceneMeshInputError",
     "create_scene_meshes_router",
     "get_scene_mesh_asset_service",

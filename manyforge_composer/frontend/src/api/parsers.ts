@@ -40,6 +40,7 @@ import type {
   SceneRuntimeObservationPose,
   SceneRuntimePoseSource,
   SceneRuntimeUnknownObservationPayload,
+  SceneMeshAssetMetadata,
   SceneTransactionResponse,
   SceneUrdfCollision,
   SceneUrdfJoint,
@@ -2245,6 +2246,102 @@ function parseLogicalSceneObject(value: unknown, path: string): LogicalSceneObje
       : jsonRecordAt(record.provider_evidence, `${path}.provider_evidence`),
     support_contacts: boundedArrayAt(record.support_contacts, `${path}.support_contacts`, 4096)
       .map((item, index) => jsonRecordAt(item, `${path}.support_contacts[${index}]`)),
+  };
+}
+
+export function parseSceneMeshAssetMetadata(
+  value: unknown,
+): SceneMeshAssetMetadata {
+  const record = objectAt(value, 'sceneMeshAsset');
+  exactKeysAt(
+    record,
+    [
+      'asset_hash',
+      'cell_id',
+      'last_error',
+      'mesh_asset_status',
+      'mesh_asset_url',
+      'schema_version',
+      'source_generation',
+      'source_owner_epoch',
+    ],
+    'sceneMeshAsset',
+  );
+  const schemaVersion = stringAt(
+    record.schema_version,
+    'sceneMeshAsset.schema_version',
+  );
+  if (schemaVersion !== 'manyforge.scene_mesh_asset.v1') {
+    return fail(
+      'sceneMeshAsset.schema_version',
+      'manyforge.scene_mesh_asset.v1',
+    );
+  }
+  const assetHash = stringAt(record.asset_hash, 'sceneMeshAsset.asset_hash');
+  if (!/^[0-9a-f]{16}$/.test(assetHash)) {
+    return fail('sceneMeshAsset.asset_hash', '16 lowercase hexadecimal characters');
+  }
+  const status = stringAt(
+    record.mesh_asset_status,
+    'sceneMeshAsset.mesh_asset_status',
+  );
+  if (!['pending', 'ok', 'parse_failed'].includes(status)) {
+    return fail(
+      'sceneMeshAsset.mesh_asset_status',
+      'pending, ok, or parse_failed',
+    );
+  }
+  const lastError = nullableStringAt(
+    record.last_error,
+    'sceneMeshAsset.last_error',
+  );
+  if ((status === 'parse_failed') !== (lastError !== null)) {
+    return fail(
+      'sceneMeshAsset.last_error',
+      'present exactly for parse_failed status',
+    );
+  }
+  const sourceOwnerEpoch = stringAt(
+    record.source_owner_epoch,
+    'sceneMeshAsset.source_owner_epoch',
+  );
+  if (!/^[A-Za-z0-9][A-Za-z0-9._:-]{0,255}$/.test(sourceOwnerEpoch)) {
+    return fail('sceneMeshAsset.source_owner_epoch', 'a bounded owner epoch');
+  }
+  const sourceGeneration = integerAt(
+    record.source_generation,
+    'sceneMeshAsset.source_generation',
+  );
+  const cellId = stringAt(record.cell_id, 'sceneMeshAsset.cell_id');
+  if (!cellId || cellId.length > 256) {
+    return fail('sceneMeshAsset.cell_id', 'a bounded non-empty cell ID');
+  }
+  const meshAssetUrl = stringAt(
+    record.mesh_asset_url,
+    'sceneMeshAsset.mesh_asset_url',
+  );
+  const expectedParams = new URLSearchParams({
+    owner_epoch: sourceOwnerEpoch,
+    generation: String(sourceGeneration),
+  });
+  if (
+    meshAssetUrl
+    !== `/api/scene/object-meshes/${assetHash}.glb?${expectedParams.toString()}`
+  ) {
+    return fail(
+      'sceneMeshAsset.mesh_asset_url',
+      'the exact owner-generation-bound asset URL',
+    );
+  }
+  return {
+    schema_version: schemaVersion,
+    asset_hash: assetHash,
+    mesh_asset_url: meshAssetUrl,
+    mesh_asset_status: status as SceneMeshAssetMetadata['mesh_asset_status'],
+    source_owner_epoch: sourceOwnerEpoch,
+    source_generation: sourceGeneration,
+    cell_id: cellId,
+    last_error: lastError,
   };
 }
 

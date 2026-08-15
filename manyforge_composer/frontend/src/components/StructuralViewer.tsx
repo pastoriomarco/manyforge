@@ -1,4 +1,12 @@
-import { Component, Suspense, useMemo, useState } from 'react';
+import {
+  Component,
+  Suspense,
+  useCallback,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+} from 'react';
 import type { ErrorInfo, ReactNode } from 'react';
 import { Canvas } from '@react-three/fiber';
 import {
@@ -9,7 +17,12 @@ import {
   useGLTF,
 } from '@react-three/drei';
 import * as THREE from 'three';
-import { resolveStructuralAssetUrl } from '../api/client';
+import { api, resolveStructuralAssetUrl } from '../api/client';
+import {
+  subscribeSnapshotObserver,
+  uploadSnapshotObserverResult,
+} from '../api/snapshotObserverClient';
+import { SnapshotResponder } from './SnapshotResponder';
 import type { StructuralResourceState } from '../state/structuralResource';
 import type { RuntimeScenePresentation } from '../state/runtimeScenePresentation';
 import type {
@@ -47,6 +60,14 @@ interface StructuralViewerProps {
   candidateTcpPose?: Pose3Value | null;
   candidateStale?: boolean;
   runtimePresentation?: RuntimeScenePresentation;
+  sceneOwnerIdentity?: {
+    ownerEpoch: string;
+    generation: number;
+  };
+  viewerFrameIdentity?: {
+    ownerEpoch: string;
+    generation: number;
+  };
   viewer?: ProgramViewerMetadata;
 }
 
@@ -147,6 +168,94 @@ function CollisionMesh({ url }: { url: string }) {
     return root;
   }, [gltf.scene]);
   return <primitive object={clone} />;
+}
+
+function SceneObjectMeshAsset({
+  url,
+  measured,
+  selected,
+}: {
+  url: string;
+  measured: boolean;
+  selected: boolean;
+}) {
+  const gltf = useGLTF(resolveStructuralAssetUrl(url));
+  const clone = useMemo(() => {
+    const root = gltf.scene.clone(true);
+    root.traverse((object) => {
+      const mesh = object as THREE.Mesh;
+      if (!mesh.isMesh) return;
+      const sources = Array.isArray(mesh.material)
+        ? mesh.material
+        : [mesh.material];
+      const materials = sources.map((source) => {
+        const material = source.clone() as THREE.MeshStandardMaterial;
+        material.color?.set(measured ? '#43d7ec' : selected ? '#65d3f2' : '#8c6fe0');
+        material.emissive?.set(measured ? '#0c5060' : selected ? '#144c62' : '#251a48');
+        material.transparent = true;
+        material.opacity = measured ? 0.4 : selected ? 0.72 : 0.5;
+        material.wireframe = true;
+        material.depthWrite = false;
+        material.side = THREE.DoubleSide;
+        return material;
+      });
+      mesh.material = Array.isArray(mesh.material) ? materials : materials[0];
+      mesh.renderOrder = measured ? 16 : selected ? 12 : 8;
+    });
+    return root;
+  }, [gltf.scene, measured, selected]);
+  return <primitive object={clone} />;
+}
+
+function SceneObjectMesh({
+  shape,
+  ownerIdentity,
+  measured,
+  selected,
+  onAssetError,
+}: {
+  shape: Extract<LogicalSceneShape, { type: 'mesh' }>;
+  ownerIdentity: NonNullable<StructuralViewerProps['sceneOwnerIdentity']>;
+  measured: boolean;
+  selected: boolean;
+  onAssetError: (error: Error) => void;
+}) {
+  const [url, setUrl] = useState<string | null>(null);
+  useEffect(() => {
+    const controller = new AbortController();
+    setUrl(null);
+    void api.scene.resolveMesh(
+      shape.resource_uri,
+      shape.scale,
+      controller.signal,
+    ).then((asset) => {
+      if (
+        asset.source_owner_epoch !== ownerIdentity.ownerEpoch
+        || asset.source_generation !== ownerIdentity.generation
+      ) {
+        throw new Error('Scene mesh belongs to a superseded owner generation.');
+      }
+      setUrl(asset.mesh_asset_url);
+    }).catch((error: unknown) => {
+      if (controller.signal.aborted) return;
+      onAssetError(
+        error instanceof Error ? error : new Error('Scene mesh resolution failed.'),
+      );
+    });
+    return () => controller.abort();
+  }, [
+    onAssetError,
+    ownerIdentity.generation,
+    ownerIdentity.ownerEpoch,
+    shape.resource_uri,
+    shape.scale,
+    shape.scale.x,
+    shape.scale.y,
+    shape.scale.z,
+  ]);
+  return url === null
+    ? null
+    : <SceneObjectMeshAsset url={url} measured={measured} selected={selected} />;
 }
 
 function MeasuredVisualMesh({ url }: { url: string }) {
@@ -381,11 +490,15 @@ function LogicalSceneObjects({
   selectedSceneResourceId,
   onSelect,
   axesSizeM,
+  ownerIdentity,
+  onAssetError,
 }: {
   objects: LogicalSceneObject[];
   selectedSceneResourceId: string | null;
   onSelect: (sceneResourceId: string) => void;
   axesSizeM: number;
+  ownerIdentity: StructuralViewerProps['sceneOwnerIdentity'];
+  onAssetError: (error: Error) => void;
 }) {
   return (
     <group name="owner-logical-scene">
@@ -405,7 +518,16 @@ function LogicalSceneObjects({
             }}
           >
             {object.collision_shapes.map((shape, index) => shape.type === 'mesh'
-              ? null
+              ? ownerIdentity === undefined ? null : (
+                  <SceneObjectMesh
+                    key={`${object.scene_resource_id}:${index}`}
+                    shape={shape}
+                    ownerIdentity={ownerIdentity}
+                    measured={false}
+                    selected={selected}
+                    onAssetError={onAssetError}
+                  />
+                )
               : (
                   <mesh
                     // Three cylinders use Y as their long axis; scene shapes use Z.
@@ -436,10 +558,14 @@ function MeasuredLogicalSceneObjects({
   objects,
   presentation,
   onSelect,
+  ownerIdentity,
+  onAssetError,
 }: {
   objects: LogicalSceneObject[];
   presentation: RuntimeScenePresentation;
   onSelect: (sceneResourceId: string) => void;
+  ownerIdentity: StructuralViewerProps['sceneOwnerIdentity'];
+  onAssetError: (error: Error) => void;
 }) {
   const objectById = new Map(
     objects.map((object) => [object.scene_resource_id, object]),
@@ -461,7 +587,16 @@ function MeasuredLogicalSceneObjects({
             }}
           >
             {object.collision_shapes.map((shape, index) => shape.type === 'mesh'
-              ? null
+              ? ownerIdentity === undefined ? null : (
+                  <SceneObjectMesh
+                    key={`measured-scene:${measurement.objectId}:${index}`}
+                    shape={shape}
+                    ownerIdentity={ownerIdentity}
+                    measured
+                    selected={false}
+                    onAssetError={onAssetError}
+                  />
+                )
               : (
                   <mesh
                     key={`measured-scene:${measurement.objectId}:${index}`}
@@ -521,6 +656,37 @@ function CandidateTcpGhost({
   );
 }
 
+function BoundSnapshotResponder({
+  frameIdentity,
+}: {
+  frameIdentity: NonNullable<StructuralViewerProps['viewerFrameIdentity']>;
+}) {
+  const current = useRef(frameIdentity);
+  useEffect(() => {
+    current.current = frameIdentity;
+  }, [frameIdentity]);
+  const ensureFrame = useCallback(async (
+    required: { ownerEpoch: string; generation: number },
+    timeoutMs: number,
+  ): Promise<{ ownerEpoch: string; generation: number } | null> => {
+    const deadline = performance.now() + timeoutMs;
+    while (performance.now() <= deadline) {
+      const observed = current.current;
+      if (observed.ownerEpoch !== required.ownerEpoch) return null;
+      if (observed.generation >= required.generation) return observed;
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+    return null;
+  }, []);
+  return (
+    <SnapshotResponder
+      subscribe={subscribeSnapshotObserver}
+      upload={uploadSnapshotObserverResult}
+      ensureFrame={ensureFrame}
+    />
+  );
+}
+
 function MeasuredTcpMarker({
   presentation,
   axesSizeM,
@@ -560,6 +726,8 @@ function ViewerCanvas({
   candidateTcpPose,
   candidateStale,
   runtimePresentation,
+  sceneOwnerIdentity,
+  viewerFrameIdentity,
   viewer,
 }: {
   manifest: SceneUrdfManifest | null;
@@ -572,6 +740,8 @@ function ViewerCanvas({
   candidateTcpPose: Pose3Value | null;
   candidateStale: boolean;
   runtimePresentation: RuntimeScenePresentation | undefined;
+  sceneOwnerIdentity: StructuralViewerProps['sceneOwnerIdentity'];
+  viewerFrameIdentity: StructuralViewerProps['viewerFrameIdentity'];
   viewer: ProgramViewerMetadata | undefined;
 }) {
   const devicePixelRatio = typeof window === 'undefined'
@@ -674,12 +844,16 @@ function ViewerCanvas({
         selectedSceneResourceId={selectedSceneResourceId}
         onSelect={(sceneResourceId) => onSelectSceneResource(sceneResourceId)}
         axesSizeM={viewer?.object_axes_gizmo_size_m ?? 0.1}
+        ownerIdentity={sceneOwnerIdentity}
+        onAssetError={onAssetError}
       />
       {runtimePresentation !== undefined && (
         <MeasuredLogicalSceneObjects
           objects={sceneObjects}
           presentation={runtimePresentation}
           onSelect={(sceneResourceId) => onSelectSceneResource(sceneResourceId)}
+          ownerIdentity={sceneOwnerIdentity}
+          onAssetError={onAssetError}
         />
       )}
       {runtimePresentation?.measuredTcp !== null
@@ -696,6 +870,9 @@ function ViewerCanvas({
           axesSizeM={viewer?.frame_gizmo_size_m ?? 0.1}
         />
       )}
+      {viewerFrameIdentity !== undefined && (
+        <BoundSnapshotResponder frameIdentity={viewerFrameIdentity} />
+      )}
     </Canvas>
   );
 }
@@ -709,6 +886,8 @@ function StructuralViewerContent({
   candidateTcpPose = null,
   candidateStale = false,
   runtimePresentation,
+  sceneOwnerIdentity,
+  viewerFrameIdentity,
   viewer,
 }: StructuralViewerProps) {
   const [collisionsVisible, setCollisionsVisible] = useState(false);
@@ -732,9 +911,9 @@ function StructuralViewerContent({
   const visibleGeometryCount = visualCount
     + (collisionsVisible ? collisionCount : 0)
     + sceneObjects.reduce(
-      (total, object) => total + object.collision_shapes.filter(
-        (shape) => shape.type !== 'mesh',
-      ).length,
+      (total, object) => total + object.collision_shapes.filter((shape) => (
+        shape.type !== 'mesh' || sceneOwnerIdentity !== undefined
+      )).length,
       0,
     )
     + (candidateTcpPose === null ? 0 : 1)
@@ -747,9 +926,9 @@ function StructuralViewerContent({
         const object = sceneObjects.find(
           (candidate) => candidate.scene_resource_id === measurement.objectId,
         );
-        return total + (object?.collision_shapes.filter(
-          (shape) => shape.type !== 'mesh',
-        ).length ?? 0);
+        return total + (object?.collision_shapes.filter((shape) => (
+          shape.type !== 'mesh' || sceneOwnerIdentity !== undefined
+        )).length ?? 0);
       }, 0,
     ) ?? 0)
     + (runtimePresentation?.measuredTcp === null
@@ -799,9 +978,9 @@ function StructuralViewerContent({
       </header>
 
       <div className="viewer-stage" role="img" aria-label="Scene authoring viewport">
-        {visibleGeometryCount > 0 && (
+        {(visibleGeometryCount > 0 || viewerFrameIdentity !== undefined) && (
           <ViewerCanvas
-            key={`${manifest.status === 'ready' ? manifest.data.model_key : 'no-structural-model'}:${collisionsVisible ? 'collision' : 'visual'}`}
+            key={`${manifest.status === 'ready' ? manifest.data.model_key : 'no-structural-model'}:${collisionsVisible ? 'collision' : 'visual'}:${sceneOwnerIdentity?.ownerEpoch ?? 'no-scene-owner'}:${sceneOwnerIdentity?.generation ?? -1}`}
             manifest={manifest.status === 'ready' ? manifest.data : null}
             collisionsVisible={collisionsVisible}
             onAssetError={setAssetError}
@@ -812,6 +991,8 @@ function StructuralViewerContent({
             candidateTcpPose={candidateTcpPose}
             candidateStale={candidateStale}
             runtimePresentation={runtimePresentation}
+            sceneOwnerIdentity={sceneOwnerIdentity}
+            viewerFrameIdentity={viewerFrameIdentity}
             viewer={viewer}
           />
         )}

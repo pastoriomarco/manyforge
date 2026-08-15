@@ -18,6 +18,7 @@ import {
   parseProgramRunStatus,
   parseScenarioCatalogResponse,
   parseSceneRuntimeProjection,
+  parseSceneMeshAssetMetadata,
   parseSceneTransactionResponse,
   parseSceneUrdfManifest,
   parseSourceModelProjection,
@@ -376,6 +377,26 @@ describe('parseSceneUrdfManifest', () => {
     expect(() => parseSceneUrdfManifest(fixture)).toThrow(
       'manifest must be free of runtime authority and live-state fields',
     );
+  });
+});
+
+describe('scene mesh asset parser', () => {
+  const asset = () => ({
+    schema_version: 'manyforge.scene_mesh_asset.v1',
+    asset_hash: '0123456789abcdef',
+    mesh_asset_url: '/api/scene/object-meshes/0123456789abcdef.glb?owner_epoch=scene.epoch.1&generation=7',
+    mesh_asset_status: 'pending',
+    source_owner_epoch: 'scene.epoch.1',
+    source_generation: 7,
+    cell_id: 'cell.1',
+    last_error: null,
+  });
+
+  it('requires the exact owner-generation-bound URL', () => {
+    expect(parseSceneMeshAssetMetadata(asset()).source_generation).toBe(7);
+    const stale = asset();
+    stale.mesh_asset_url = '/api/scene/object-meshes/0123456789abcdef.glb?owner_epoch=scene.epoch.1&generation=6';
+    expect(() => parseSceneMeshAssetMetadata(stale)).toThrow(/owner-generation/);
   });
 });
 

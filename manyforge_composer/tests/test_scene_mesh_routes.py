@@ -1,11 +1,10 @@
-"""Bounded mesh primitives and exact disposition of the former live route.
+"""Bounded mesh primitives and current owner-bound live route.
 
 Historical test blob ``26431589ac4534354e3d33e2120fcaeb6822b112``
 at ``manyforge@08222188293df8e12f90dc72e204c21f22f92ea1`` contains six
 cases.  Content identity, bounded conversion, source containment, and file-size
-admission remain active below.  Scene mutation/state projection, workspace and
-package resource resolution, service caching/prewarming, and HTTP delivery are
-I9 acceptance inputs, not runnable legacy fallbacks.
+admission remain active below. Owner authorization, generation fencing,
+resource containment, bounded conversion/cache, and HTTP delivery are current.
 """
 
 from __future__ import annotations
@@ -16,6 +15,8 @@ import struct
 from typing import Final
 
 import pytest
+from fastapi import FastAPI
+from fastapi.testclient import TestClient
 
 from manyforge_composer.backend import routes_scene_meshes as meshes
 
@@ -29,9 +30,9 @@ HISTORICAL_CASE_FAMILIES: Final = (
         "historical line 53",
         1,
         True,
-        ("I9",),
-        "bounded conversion remains active; scene mutation, state projection, "
-        "cache settlement, URL minting, and HTTP delivery return at I9",
+        (),
+        "bounded conversion, owner projection, cache settlement, URL minting, "
+        "and HTTP delivery are current",
     ),
     (
         "content_identity_ignores_mtime",
@@ -45,37 +46,33 @@ HISTORICAL_CASE_FAMILIES: Final = (
         "workspace_relative_resource_resolution",
         "historical line 116",
         1,
-        False,
-        ("I9",),
-        "workspace/package URI policy returns only with addressed observer "
-        "inputs and the I9 client contract",
+        True,
+        (),
+        "workspace-relative URI policy is bound to addressed observer inputs",
     ),
     (
         "scene_state_mesh_projection",
         "historical line 151",
         1,
-        False,
-        ("I9",),
-        "scene editing, observer projection, conversion scheduling, and URL "
-        "publication return at I9",
+        True,
+        (),
+        "observer projection, bounded conversion, and URL publication are current",
     ),
     (
         "outside_root_rejection",
         "historical line 188",
         1,
         True,
-        ("I9",),
-        "single-open source authorization remains active; the HTTP 409 mapping "
-        "returns with the I9 route",
+        (),
+        "single-open source authorization and its HTTP 409 mapping are current",
     ),
     (
         "oversize_rejection",
         "historical line 208",
         1,
         True,
-        ("I9",),
-        "hard source and output bounds remain active; scene-edit admission "
-        "returns with the I9 route",
+        (),
+        "hard source/output bounds and route admission are current",
     ),
 )
 
@@ -423,7 +420,7 @@ def test_authorized_reader_rejects_outside_symlink_directory_and_oversize(
 
     deferred_dae = root / "deferred.dae"
     deferred_dae.write_text("<COLLADA/>", encoding="utf-8")
-    with pytest.raises(meshes.SceneMeshInputError, match="until I9"):
+    with pytest.raises(meshes.SceneMeshInputError, match="unsupported"):
         meshes._read_authorized_mesh_input(  # noqa: SLF001
             deferred_dae,
             [root],
@@ -619,32 +616,119 @@ def test_worker_converts_only_the_authorized_snapshot(
     )
 
 
-def test_state_bound_mesh_surfaces_fail_before_argument_access() -> None:
-    class Poison:
-        def __getattribute__(self, name: str) -> object:
-            raise AssertionError(f"unavailable gate read an argument: {name}")
+class _SceneClient:
+    def __init__(self, source_uri: str) -> None:
+        self.source_uri = source_uri
+        self.generation = 7
 
-    service = meshes.SceneMeshAssetService()
-    calls = (
-        lambda: service.metadata_for_shape(Poison()),
-        lambda: service.validate_boundary_or_409(Poison()),
-        lambda: service.prewarm(Poison()),
-        lambda: service.get_glb_response(Poison()),
-        lambda: meshes.get_scene_mesh_asset_service(Poison()),
-        lambda: meshes.scene_mesh_shape_metadata(Poison(), None, None),
-        lambda: meshes.validate_scene_mesh_resource_or_409(
-            Poison(),
-            None,
-            None,
-        ),
-        lambda: meshes.create_scene_meshes_router(Poison()),
+    def scene(self) -> dict[str, object]:
+        return {
+            "schema_version": "manyforge.scene_projection.v1",
+            "logical_scene": {
+                "available": True,
+                "freshness": "fresh",
+                "known_gaps": [],
+                "source_owner_epoch": "scene.epoch.1",
+                "source_generation": self.generation,
+                "payload": {
+                    "api_version": "manyforge.logical_scene_source.v1",
+                    "snapshot": {
+                        "cell_id": "cell.1",
+                        "objects": [{
+                            "collision_shapes": [{
+                                "type": "mesh",
+                                "resource_uri": self.source_uri,
+                                "scale": {"x": 1.0, "y": 2.0, "z": 3.0},
+                            }],
+                        }],
+                    },
+                },
+            },
+        }
+
+
+class _SceneState:
+    def __init__(self, root: Path, source_uri: str) -> None:
+        self.allowed_fs_roots = [str(root)]
+        self.program_source_path = None
+        self.headless_client = _SceneClient(source_uri)
+
+
+def test_owner_bound_route_converts_and_fences_superseded_generation(
+    tmp_path: Path,
+) -> None:
+    mesh_file = tmp_path / "part.obj"
+    _write_obj(mesh_file)
+    state = _SceneState(tmp_path, "part.obj")
+    app = FastAPI()
+    app.include_router(meshes.create_scene_meshes_router(state))  # type: ignore[arg-type]
+    client = TestClient(app)
+    params = {
+        "resource_uri": "part.obj",
+        "scale_x": 1.0,
+        "scale_y": 2.0,
+        "scale_z": 3.0,
+    }
+
+    metadata = client.get("/api/scene/object-meshes/resolve", params=params)
+    assert metadata.status_code == 200
+    asset = metadata.json()
+    assert asset["schema_version"] == "manyforge.scene_mesh_asset.v1"
+    assert asset["source_generation"] == 7
+    assert "owner_epoch=scene.epoch.1" in asset["mesh_asset_url"]
+    assert "generation=7" in asset["mesh_asset_url"]
+
+    converted = client.get(asset["mesh_asset_url"])
+    assert converted.status_code == 200
+    assert converted.headers["content-type"] == "model/gltf-binary"
+    assert converted.content.startswith(b"glTF")
+    assert converted.headers["x-manyforge-scene-generation"] == "7"
+
+    state.headless_client.generation = 8
+    stale = client.get(asset["mesh_asset_url"])
+    assert stale.status_code == 409
+    assert stale.json()["detail"]["code"] == "scene_mesh_owner_generation_changed"
+
+    replacement = client.get("/api/scene/object-meshes/resolve", params=params)
+    assert replacement.status_code == 200
+    assert replacement.json()["asset_hash"] == asset["asset_hash"]
+    assert "generation=8" in replacement.json()["mesh_asset_url"]
+    assert client.get(replacement.json()["mesh_asset_url"]).status_code == 200
+
+
+def test_owner_bound_route_rejects_unowned_and_outside_sources(tmp_path: Path) -> None:
+    _write_obj(tmp_path / "part.obj")
+    outside = tmp_path.parent / "outside.obj"
+    _write_obj(outside)
+    state = _SceneState(tmp_path, "part.obj")
+    app = FastAPI()
+    app.include_router(meshes.create_scene_meshes_router(state))  # type: ignore[arg-type]
+    client = TestClient(app)
+
+    unowned = client.get(
+        "/api/scene/object-meshes/resolve",
+        params={
+            "resource_uri": str(outside),
+            "scale_x": 1.0,
+            "scale_y": 2.0,
+            "scale_z": 3.0,
+        },
     )
-    for call in calls:
-        with pytest.raises(
-            meshes.SceneMeshClientUnavailableError,
-            match=meshes.SCENE_MESH_CLIENT_UNAVAILABLE_REASON_CODE,
-        ):
-            call()
+    assert unowned.status_code == 409
+    assert unowned.json()["detail"]["code"] == "scene_mesh_not_owner_authorized"
+
+    state.headless_client.source_uri = str(outside)
+    outside_root = client.get(
+        "/api/scene/object-meshes/resolve",
+        params={
+            "resource_uri": str(outside),
+            "scale_x": 1.0,
+            "scale_y": 2.0,
+            "scale_z": 3.0,
+        },
+    )
+    assert outside_root.status_code == 409
+    assert outside_root.json()["detail"]["code"] == "scene_mesh_input_invalid"
 
 
 def test_historical_scene_mesh_cases_are_split_without_loss() -> None:
@@ -653,12 +737,5 @@ def test_historical_scene_mesh_cases_are_split_without_loss() -> None:
     assert sum(family[2] for family in HISTORICAL_CASE_FAMILIES) == (
         HISTORICAL_CASE_COUNT
     )
-    assert {family[0] for family in HISTORICAL_CASE_FAMILIES if not family[3]} == {
-        "workspace_relative_resource_resolution",
-        "scene_state_mesh_projection",
-    }
-    assert all(
-        "I9" in family[4]
-        for family in HISTORICAL_CASE_FAMILIES
-        if family[4]
-    )
+    assert all(family[3] for family in HISTORICAL_CASE_FAMILIES)
+    assert all(family[4] == () for family in HISTORICAL_CASE_FAMILIES)

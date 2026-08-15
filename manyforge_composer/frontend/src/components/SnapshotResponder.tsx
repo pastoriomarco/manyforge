@@ -17,7 +17,8 @@ export interface SnapshotRequestView {
   width: number;
   height: number;
   mime: 'image/png' | 'image/jpeg';
-  requiredFrame?: { streamEpoch: bigint; sequence: bigint };
+  requiredFrame: { ownerEpoch: string; generation: number };
+  timeoutMs: number;
 }
 
 export function validateSnapshotRequest(request: SnapshotRequestView): string | null {
@@ -27,16 +28,41 @@ export function validateSnapshotRequest(request: SnapshotRequestView): string | 
     || !Number.isInteger(request.height)
     || request.width < 1
     || request.height < 1
+    || request.width > 1920
+    || request.height > 1080
   ) {
-    return 'Snapshot dimensions must be positive integers';
+    return 'Snapshot dimensions are outside the qualified bounds';
   }
+  if (!['image/png', 'image/jpeg'].includes(request.mime)) {
+    return 'Snapshot media type is unsupported';
+  }
+  if (
+    !Number.isInteger(request.timeoutMs)
+    || request.timeoutMs < 1
+    || request.timeoutMs > 2_000
+  ) return 'Snapshot timeout is outside the qualified bounds';
+  if (
+    request.requiredFrame === undefined
+    || (
+      !request.requiredFrame.ownerEpoch.trim()
+      || !Number.isSafeInteger(request.requiredFrame.generation)
+      || request.requiredFrame.generation < 0
+    )
+  ) return 'Snapshot required frame identity is invalid';
   return null;
 }
 
 interface SnapshotResponderProps {
   subscribe: (handler: (request: SnapshotRequestView) => void) => () => void;
-  upload: (requestId: string, result: Blob | null) => Promise<void>;
-  ensureFrame?: (frame: NonNullable<SnapshotRequestView['requiredFrame']>) => Promise<boolean>;
+  upload: (
+    requestId: string,
+    result: Blob | null,
+    observedFrame: SnapshotRequestView['requiredFrame'] | null,
+  ) => Promise<void>;
+  ensureFrame: (
+    frame: NonNullable<SnapshotRequestView['requiredFrame']>,
+    timeoutMs: number,
+  ) => Promise<SnapshotRequestView['requiredFrame'] | null>;
   applyFrame?: () => void;
 }
 
@@ -61,7 +87,10 @@ export function SnapshotResponder({
   useEffect(() => {
     let active = true;
 
-    const capture = async (request: SnapshotRequestView): Promise<Blob> => {
+    const capture = async (
+      request: SnapshotRequestView,
+      deadlineMs: number,
+    ): Promise<Blob> => {
       const validation = validateSnapshotRequest(request);
       if (validation) throw new Error(validation);
       const { gl, scene, camera } = store.getState();
@@ -126,24 +155,33 @@ export function SnapshotResponder({
         0,
         0,
       );
-      return canvasToBlobWithTimeout(canvas, request.mime, 0.9, 1_000);
+      const remainingMs = Math.max(1, Math.floor(deadlineMs - performance.now()));
+      return canvasToBlobWithTimeout(
+        canvas,
+        request.mime,
+        0.9,
+        Math.min(1_000, remainingMs),
+      );
     };
 
     const handle = async (request: SnapshotRequestView) => {
       try {
-        if (request.requiredFrame) {
-          if (!ensureFrame || !await ensureFrame(request.requiredFrame)) {
-            throw new Error('Required viewer frame is unavailable');
-          }
-          applyFrame?.();
+        const deadlineMs = performance.now() + request.timeoutMs;
+        const observedFrame = await ensureFrame(
+          request.requiredFrame,
+          request.timeoutMs,
+        );
+        if (observedFrame === null) {
+          throw new Error('Required viewer frame is unavailable');
         }
-        const blob = await capture(request);
-        if (active) await upload(request.requestId, blob);
+        applyFrame?.();
+        const blob = await capture(request, deadlineMs);
+        if (active) await upload(request.requestId, blob, observedFrame);
       } catch (error) {
         console.warn('snapshot capture failed', error);
         if (active) {
           try {
-            await upload(request.requestId, null);
+            await upload(request.requestId, null, null);
           } catch (uploadError) {
             console.warn('snapshot failure report could not be uploaded', uploadError);
           }

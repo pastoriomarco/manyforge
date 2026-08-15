@@ -214,7 +214,12 @@ def create_app(
         CORSMiddleware,
         allow_origins=security.cors_origins,
         allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
-        allow_headers=["Content-Type", "X-Request-ID"],
+        allow_headers=[
+            "Content-Type",
+            "X-Request-ID",
+            "X-ManyForge-Viewer-Owner-Epoch",
+            "X-ManyForge-Viewer-Generation",
+        ],
     )
     if state.headless_client is not None:
         for recognized_stop_path in (
@@ -422,10 +427,20 @@ def create_app(
     if state.headless_client is not None:
         from .headless_ws import serve_headless_state
         from .routes_headless import create_headless_router
+        from .routes_scene_meshes import create_scene_meshes_router
+        from .routes_snapshot import create_snapshot_router
 
         app.include_router(
             create_headless_router(state.headless_client, state),
             tags=["headless-runtime-client"],
+        )
+        app.include_router(
+            create_scene_meshes_router(state),
+            tags=["headless-scene-mesh-client"],
+        )
+        app.include_router(
+            create_snapshot_router(state, security),
+            tags=["headless-viewer-snapshot-client"],
         )
 
         @app.exception_handler(RequestValidationError)
