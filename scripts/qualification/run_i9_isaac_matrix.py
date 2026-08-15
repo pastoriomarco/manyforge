@@ -45,16 +45,28 @@ STALE_DDS_KEYS: Final = (
 SHA256_PATTERN: Final = re.compile(r"^[0-9a-f]{64}$")
 MAX_JSON_BYTES: Final = 8 * 1024 * 1024
 MAX_CHECK_DETAIL_CHARS: Final = 4096
+TOPIC_TYPE_BY_NAME: Final = {
+    "/clock": "rosgraph_msgs/msg/Clock",
+    "/isaac_gripper_state": "sensor_msgs/msg/JointState",
+    "/isaac_joint_commands": "sensor_msgs/msg/JointState",
+    "/isaac_joint_commands_gripper": "sensor_msgs/msg/JointState",
+    "/isaac_joint_states": "sensor_msgs/msg/JointState",
+    "/output": "vision_msgs/msg/Detection3DArray",
+    "/tf": "tf2_msgs/msg/TFMessage",
+    "/tf_static": "tf2_msgs/msg/TFMessage",
+}
 
 COMMON_ROW_CHECKS: Final = frozenset(
     {
         "controller_ready",
         "cross_host_clock_payload",
         "exact_world_readback",
+        "execution_owner_exact",
         "joint_command_payload",
         "joint_state_payload",
         "program_terminal",
         "reset_observed",
+        "required_topics_exact",
         "runtime_namespace_exact",
         "simulation_stopped_after",
         "simulation_stopped_before",

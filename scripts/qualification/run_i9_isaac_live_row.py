@@ -1,0 +1,1800 @@
+#!/usr/bin/env python3
+"""Run one bounded source-matched I9 Isaac scenario on the Orin worker.
+
+Isaac Sim is an already-started, separately owned laptop process.  This runner
+owns only the scoped Orin-side Manager, Headless, Program, Composer (assistant
+row only), ROS control launch, and observation clients.  Robot commands flow
+exclusively through the Applied Program and the addressed Kernel owner.
+"""
+
+from __future__ import annotations
+
+import argparse
+from collections.abc import Mapping, Sequence
+from contextlib import suppress
+from dataclasses import dataclass, field
+import hashlib
+import json
+import math
+import os
+from pathlib import Path
+import re
+import shutil
+import signal
+import socket
+import subprocess
+import sys
+import time
+from typing import Any, Final
+from urllib.request import urlopen
+
+from manyforge_behavior.canonical_artifact import load_strict_json_yaml
+from manyforge_headless_api.client import HeadlessClientError, HeadlessHttpClient
+
+from run_i9_assistant_snapshot_probe import run_probe as run_snapshot_probe
+from run_i9_isaac_matrix import (
+    ROW_SCHEMA,
+    SCENARIO_BY_ID,
+    TOPIC_TYPE_BY_NAME,
+    ScenarioSpec,
+    QualificationError,
+    validate_dds_environment,
+    validate_row,
+)
+
+
+_MAX_LOG_BYTES: Final = 64 * 1024 * 1024
+_MAX_SAMPLE_BYTES: Final = 2 * 1024 * 1024
+_MAX_COMMAND_BYTES: Final = 4 * 1024 * 1024
+_SHA256_PREFIX: Final = "sha256:"
+_TERMINAL_STATES: Final = frozenset({"succeeded", "failed", "stopped"})
+_OBJECT_MOTION_RESOURCE: Final = "isaac_cheese_box"
+_OBJECT_MOTION_MINIMUM_M: Final = 0.05
+_GRIPPER_TOLERANCE_BY_PROFILE: Final = {"lite6": 0.004, "ur10e": 0.04}
+
+
+class LiveRowError(RuntimeError):
+    """One live orchestration, product, or observation failure."""
+
+
+@dataclass(frozen=True, slots=True)
+class LiveConfig:
+    spec: ScenarioSpec
+    source_root: Path
+    package_root: Path
+    installed_root: Path
+    run_root: Path
+    node_catalog: Path
+    alarm_catalog: Path
+    static_dir: Path
+    startup_timeout_s: float
+    run_timeout_s: float
+    composer_port: int | None
+
+
+@dataclass(slots=True)
+class ManagedProcess:
+    name: str
+    process: subprocess.Popen[bytes]
+    log_path: Path
+    log_stream: Any
+
+    def require_alive(self) -> None:
+        code = self.process.poll()
+        if code is not None:
+            raise LiveRowError(
+                f"{self.name} exited with {code}: {_log_tail(self.log_path)}"
+            )
+
+    def stop(self) -> None:
+        if self.process.poll() is None:
+            with suppress(ProcessLookupError):
+                os.killpg(self.process.pid, signal.SIGTERM)
+            try:
+                self.process.wait(timeout=8.0)
+            except subprocess.TimeoutExpired:
+                with suppress(ProcessLookupError):
+                    os.killpg(self.process.pid, signal.SIGKILL)
+                self.process.wait(timeout=5.0)
+        self.log_stream.close()
+
+
+@dataclass(slots=True)
+class TopicSample:
+    topic: str
+    process: subprocess.Popen[bytes]
+
+    def settle(self, timeout_s: float = 5.0) -> dict[str, Any]:
+        try:
+            stdout, _stderr = self.process.communicate(timeout=timeout_s)
+        except subprocess.TimeoutExpired:
+            _signal_process_group(self.process, signal.SIGTERM)
+            try:
+                stdout, _stderr = self.process.communicate(timeout=2.0)
+            except subprocess.TimeoutExpired:
+                _signal_process_group(self.process, signal.SIGKILL)
+                stdout, _stderr = self.process.communicate(timeout=2.0)
+        if len(stdout) > _MAX_SAMPLE_BYTES:
+            raise LiveRowError(f"ROS sample exceeded its byte bound: {self.topic}")
+        return {
+            "bytes": len(stdout),
+            "returncode": self.process.returncode,
+            "sha256": _digest(stdout),
+            "seen": self.process.returncode == 0 and bool(stdout.strip()),
+        }
+
+    def stop(self) -> None:
+        if self.process.poll() is None:
+            _signal_process_group(self.process, signal.SIGTERM)
+            try:
+                self.process.wait(timeout=2.0)
+            except subprocess.TimeoutExpired:
+                _signal_process_group(self.process, signal.SIGKILL)
+                self.process.wait(timeout=2.0)
+
+
+@dataclass(frozen=True, order=True, slots=True)
+class GripperTarget:
+    target_role_id: str
+    coordinate_kind: str
+    value: float
+
+    @property
+    def value_field(self) -> str:
+        return "value_m" if self.coordinate_kind == "linear_m" else "value_rad"
+
+
+@dataclass(slots=True)
+class RunEvidence:
+    gripper_targets: tuple[GripperTarget, ...]
+    execution_samples: int = 0
+    execution_owner_epochs: set[str] = field(default_factory=set)
+    execution_cell_ids: set[str] = field(default_factory=set)
+    execution_component_ids: set[str] = field(default_factory=set)
+    gripper_hits: set[GripperTarget] = field(default_factory=set)
+    object_initial_position: tuple[float, float, float] | None = None
+    object_max_displacement_m: float = 0.0
+    object_pose_samples: int = 0
+    object_carried_observed: bool = False
+    pose_query_rejections: int = 0
+    foundationpose_source_sequences: set[int] = field(default_factory=set)
+    foundationpose_source_identities: set[tuple[str, int]] = field(
+        default_factory=set
+    )
+    foundationpose_provider_sequences: set[int] = field(default_factory=set)
+    foundationpose_provider_match: bool = False
+    scene_projection_generations: set[int] = field(default_factory=set)
+
+    def summary(self) -> dict[str, Any]:
+        source_sequences = sorted(self.foundationpose_source_sequences)
+        provider_sequences = sorted(self.foundationpose_provider_sequences)
+        return {
+            "execution": {
+                "cell_ids": sorted(self.execution_cell_ids),
+                "component_ids": sorted(self.execution_component_ids),
+                "owner_epochs": sorted(self.execution_owner_epochs),
+                "samples": self.execution_samples,
+            },
+            "foundationpose": {
+                "provider_match": self.foundationpose_provider_match,
+                "provider_sequences": provider_sequences[-8:],
+                "source_sequence_max": (
+                    source_sequences[-1] if source_sequences else None
+                ),
+                "source_sequence_min": (
+                    source_sequences[0] if source_sequences else None
+                ),
+                "source_sequence_samples": len(source_sequences),
+            },
+            "gripper": {
+                "hit_count": len(self.gripper_hits),
+                "target_count": len(self.gripper_targets),
+                "targets_digest": _digest(
+                    _json_bytes(
+                        [
+                            {
+                                "coordinate_kind": target.coordinate_kind,
+                                "target_role_id": target.target_role_id,
+                                "value": target.value,
+                            }
+                            for target in self.gripper_targets
+                        ]
+                    )
+                ),
+            },
+            "object_motion": {
+                "carried_observed": self.object_carried_observed,
+                "max_displacement_m": round(self.object_max_displacement_m, 6),
+                "pose_query_rejections": self.pose_query_rejections,
+                "pose_samples": self.object_pose_samples,
+            },
+            "scene_projection_generation_max": max(
+                self.scene_projection_generations or {-1}
+            ),
+            "scene_projection_generation_min": min(
+                self.scene_projection_generations or {-1}
+            ),
+        }
+
+
+def _signal_process_group(
+    process: subprocess.Popen[bytes], signal_number: signal.Signals
+) -> None:
+    with suppress(ProcessLookupError):
+        os.killpg(process.pid, signal_number)
+
+
+def _bounded_positive(value: float, *, label: str, maximum: float) -> float:
+    if (
+        isinstance(value, bool)
+        or not isinstance(value, (int, float))
+        or not math.isfinite(float(value))
+        or not 0.1 <= float(value) <= maximum
+    ):
+        raise LiveRowError(f"{label} must be finite and in [0.1, {maximum}]")
+    return float(value)
+
+
+def _plain_directory(path: Path, *, label: str, create: bool = False) -> Path:
+    if create:
+        path.mkdir(parents=True, exist_ok=True)
+    if not path.is_absolute() or not path.is_dir() or path.is_symlink():
+        raise LiveRowError(f"{label} must be one absolute non-symlink directory")
+    return path
+
+
+def _plain_file(path: Path, *, label: str, executable: bool = False) -> Path:
+    if not path.is_absolute() or not path.is_file() or path.is_symlink():
+        raise LiveRowError(f"{label} must be one absolute regular file")
+    if executable and not os.access(path, os.X_OK):
+        raise LiveRowError(f"{label} must be executable")
+    return path
+
+
+def validate_config(config: LiveConfig) -> LiveConfig:
+    _plain_directory(config.source_root, label="source root")
+    _plain_directory(config.package_root, label="package root")
+    _plain_directory(config.installed_root, label="installed target root")
+    _plain_directory(config.run_root, label="run root", create=True)
+    if any(config.run_root.iterdir()):
+        raise LiveRowError("run root must be empty for one owner epoch")
+    _plain_file(config.node_catalog, label="node catalog")
+    _plain_file(config.alarm_catalog, label="alarm catalog")
+    _plain_directory(config.static_dir, label="Composer static directory")
+    for executable in (
+        "manyforge_manager_daemon",
+        "manyforge_roboplan_candidate_worker",
+        "manyforge_ros2_control_execution_host",
+    ):
+        _plain_file(
+            config.installed_root / executable,
+            label=f"installed {executable}",
+            executable=True,
+        )
+    _bounded_positive(
+        config.startup_timeout_s, label="startup timeout", maximum=600.0
+    )
+    _bounded_positive(config.run_timeout_s, label="run timeout", maximum=900.0)
+    if config.composer_port is not None and not 1024 <= config.composer_port <= 65535:
+        raise LiveRowError("Composer port must be in [1024, 65535]")
+    validate_dds_environment(os.environ)
+    if shutil.which("ros2") is None:
+        raise LiveRowError("ros2 is absent; source the exact Jazzy overlay first")
+    return config
+
+
+def _free_port() -> int:
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as listener:
+        listener.bind(("127.0.0.1", 0))
+        return int(listener.getsockname()[1])
+
+
+def _start_process(
+    name: str,
+    command: Sequence[str],
+    *,
+    environment: Mapping[str, str],
+    run_root: Path,
+) -> ManagedProcess:
+    if not command or any(not isinstance(item, str) or not item for item in command):
+        raise LiveRowError(f"{name} command is invalid")
+    log_path = run_root / f"{name}.log"
+    log = log_path.open("xb")
+    try:
+        process = subprocess.Popen(
+            list(command),
+            stdin=subprocess.DEVNULL,
+            stdout=log,
+            stderr=subprocess.STDOUT,
+            env=dict(environment),
+            start_new_session=True,
+        )
+    except Exception:
+        log.close()
+        raise
+    return ManagedProcess(name, process, log_path, log)
+
+
+def _run_bounded(
+    command: Sequence[str],
+    *,
+    environment: Mapping[str, str],
+    timeout_s: float = 10.0,
+) -> dict[str, Any]:
+    try:
+        completed = subprocess.run(
+            list(command),
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            env=dict(environment),
+            check=False,
+            timeout=timeout_s,
+        )
+    except subprocess.TimeoutExpired as error:
+        raise LiveRowError(f"bounded command timed out: {command[0]}") from error
+    output = completed.stdout
+    if len(output) > _MAX_COMMAND_BYTES:
+        raise LiveRowError(f"bounded command output is oversized: {command[0]}")
+    return {
+        "bytes": len(output),
+        "output": output.decode("utf-8", errors="replace"),
+        "returncode": completed.returncode,
+        "sha256": _digest(output),
+    }
+
+
+def _start_topic_sample(
+    topic: str,
+    *,
+    environment: Mapping[str, str],
+) -> TopicSample:
+    process = subprocess.Popen(
+        ["ros2", "topic", "echo", topic, "--once"],
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        env=dict(environment),
+        start_new_session=True,
+    )
+    return TopicSample(topic, process)
+
+
+def _wait_for_api(
+    base_url: str,
+    scenario_id: str,
+    processes: Sequence[ManagedProcess],
+    *,
+    timeout_s: float,
+) -> dict[str, Any]:
+    deadline = time.monotonic() + timeout_s
+    last_error: Exception | None = None
+    while time.monotonic() < deadline:
+        for process in processes:
+            process.require_alive()
+        try:
+            with HeadlessHttpClient(base_url, timeout_seconds=1.0) as client:
+                runtime = client.runtime()
+                catalog = client.scenarios()
+            if runtime.get("complete") is True and scenario_id in {
+                row.get("scenario_id")
+                for row in catalog.get("scenarios", [])
+                if isinstance(row, dict)
+            }:
+                return runtime
+        except Exception as error:
+            last_error = error
+        time.sleep(0.05)
+    raise LiveRowError(f"Headless API did not become complete: {last_error}")
+
+
+def _wait_for_composer(
+    base_url: str,
+    process: ManagedProcess,
+    *,
+    timeout_s: float,
+) -> None:
+    deadline = time.monotonic() + timeout_s
+    last_error: Exception | None = None
+    while time.monotonic() < deadline:
+        process.require_alive()
+        try:
+            with urlopen(  # noqa: S310
+                f"{base_url}/api/scenarios", timeout=1.0
+            ) as response:
+                value = json.loads(response.read())
+            if value.get("api_version") == "manyforge.scenario_catalog.v1":
+                return
+        except Exception as error:
+            last_error = error
+        time.sleep(0.05)
+    raise LiveRowError(f"Composer did not become ready: {last_error}")
+
+
+def _log_tail(path: Path, maximum: int = 12_000) -> str:
+    try:
+        size = path.stat().st_size
+        if size > _MAX_LOG_BYTES:
+            return "<log exceeded its qualification bound>"
+        with path.open("rb") as stream:
+            stream.seek(max(0, size - maximum))
+            return stream.read(maximum).decode("utf-8", errors="replace")
+    except OSError as error:
+        return f"<unable to read log: {error}>"
+
+
+def _wait_for_barrier(
+    launch: ManagedProcess,
+    spec: ScenarioSpec,
+    *,
+    timeout_s: float,
+) -> dict[str, Any]:
+    deadline = time.monotonic() + timeout_s
+    while time.monotonic() < deadline:
+        launch.require_alive()
+        text = _log_tail(launch.log_path, maximum=256 * 1024)
+        for line in reversed(text.splitlines()):
+            start = line.find("{")
+            if start < 0 or "manyforge.isaac_scene_load_barrier.v1" not in line:
+                continue
+            try:
+                value = json.loads(line[start:])
+            except json.JSONDecodeError:
+                continue
+            if value.get("success") is False:
+                raise LiveRowError(f"Isaac scene barrier failed: {value}")
+            if (
+                value.get("schema_version")
+                == "manyforge.isaac_scene_load_barrier.v1"
+                and value.get("world_name") == spec.world_name
+                and value.get("world_uri") == spec.world_uri
+                and value.get("simulation_state") == "stopped"
+            ):
+                return value
+        time.sleep(0.05)
+    raise LiveRowError(
+        "Isaac scene barrier did not settle: " + _log_tail(launch.log_path)
+    )
+
+
+def _simulation_snapshot(
+    spec: ScenarioSpec,
+    *,
+    reset: bool = False,
+    stop: bool = False,
+) -> dict[str, Any]:
+    import rclpy
+    from rclpy.node import Node
+    from simulation_interfaces.srv import GetCurrentWorld
+
+    from manyforge_ros.simulation_control import SimulationControlClient
+    from manyforge_ros_bringup.isaac_scene_load_barrier import (
+        normalize_file_world_uri,
+        select_service_name,
+    )
+
+    rclpy.init(args=None)
+    node = Node(f"manyforge_i9_world_probe_{os.getpid()}")
+    try:
+        control = SimulationControlClient(node, service_timeout_s=10.0)
+        reset_result = control.reset().to_dict() if reset else None
+        stop_result = (
+            control.set_simulation_state(state="stopped").to_dict()
+            if stop
+            else None
+        )
+        state = control.get_simulation_state().to_dict()
+        deadline = time.monotonic() + 10.0
+        service_name: str | None = None
+        while time.monotonic() < deadline and service_name is None:
+            service_name = select_service_name(
+                node.get_service_names_and_types(),
+                service_type="simulation_interfaces/srv/GetCurrentWorld",
+            )
+            if service_name is None:
+                time.sleep(0.05)
+        if service_name is None:
+            raise LiveRowError("GetCurrentWorld service is unavailable")
+        client = node.create_client(GetCurrentWorld, service_name)
+        try:
+            if not client.wait_for_service(timeout_sec=10.0):
+                raise LiveRowError("GetCurrentWorld service did not become ready")
+            future = client.call_async(GetCurrentWorld.Request())
+            rclpy.spin_until_future_complete(node, future, timeout_sec=10.0)
+            response = future.result() if future.done() else None
+        finally:
+            node.destroy_client(client)
+        if response is None or int(response.result.result) != int(
+            response.result.RESULT_OK
+        ):
+            raise LiveRowError("GetCurrentWorld returned no successful response")
+        world = {
+            "name": str(response.world.name),
+            "uri": normalize_file_world_uri(
+                str(response.world.world_resource.uri)
+            ),
+        }
+        return {
+            "exact_world": world
+            == {"name": spec.world_name, "uri": spec.world_uri},
+            "reset": reset_result,
+            "state": state,
+            "stop": stop_result,
+            "world": world,
+        }
+    finally:
+        node.destroy_node()
+        if rclpy.ok():
+            rclpy.shutdown()
+
+
+def _apply_program(
+    client: HeadlessHttpClient,
+    spec: ScenarioSpec,
+    program: Mapping[str, Any],
+    catalog: Mapping[str, Any],
+    *,
+    timeout_s: float,
+) -> dict[str, Any]:
+    body: dict[str, Any] = {
+        "expected_applied_record_digest": None,
+        "program": program,
+        "scenario_catalog_revision": catalog["scenario_catalog_revision"],
+        "scenario_id": spec.scenario_id,
+    }
+    deadline = time.monotonic() + timeout_s
+    last: dict[str, Any] = {}
+    while time.monotonic() < deadline:
+        last = client.program_apply(body)
+        if last.get("status") == "applied" and isinstance(last.get("applied"), dict):
+            return last["applied"]
+        time.sleep(0.05)
+    raise LiveRowError(f"Program Apply did not converge: {last}")
+
+
+def _run_program(
+    client: HeadlessHttpClient,
+    spec: ScenarioSpec,
+    catalog: Mapping[str, Any],
+    applied: Mapping[str, Any],
+    evidence: RunEvidence,
+    *,
+    timeout_s: float,
+) -> dict[str, Any]:
+    source = applied.get("source")
+    if not isinstance(source, dict) or not isinstance(source.get("record_digest"), str):
+        raise LiveRowError("Applied Program omitted its immutable record digest")
+    correlation = f"i9.{spec.scenario_id}"
+    snapshot = client.program_run_start(
+        {
+            "correlation_id": correlation,
+            "expected_applied_record_digest": source["record_digest"],
+            "request_id": f"i9.start.{spec.scenario_id}",
+            "request_owner_epoch": "i9-isaac-matrix",
+            "scenario_catalog_revision": catalog["scenario_catalog_revision"],
+            "scenario_id": spec.scenario_id,
+            "source_label": "i9_isaac_matrix",
+        }
+    )
+    capture = snapshot.get("capture")
+    if not isinstance(capture, dict) or not isinstance(
+        capture.get("program_run_id"), str
+    ):
+        raise LiveRowError("Program Run start omitted its owner identity")
+    run_id = capture["program_run_id"]
+    deadline = time.monotonic() + timeout_s
+    next_observation = 0.0
+    while snapshot.get("state") not in _TERMINAL_STATES:
+        now = time.monotonic()
+        if now >= deadline:
+            raise LiveRowError(f"Program Run did not settle: {_summary(snapshot)}")
+        if now >= next_observation:
+            _observe_run_evidence(evidence, client, spec)
+            next_observation = now + 0.1
+        time.sleep(0.05)
+        snapshot = client.program_run(run_id)
+    _observe_run_evidence(evidence, client, spec)
+    return snapshot
+
+
+def _json_bytes(value: Any) -> bytes:
+    return json.dumps(value, separators=(",", ":"), sort_keys=True).encode()
+
+
+def _digest(value: bytes) -> str:
+    return _SHA256_PREFIX + hashlib.sha256(value).hexdigest()
+
+
+def _summary(value: Any) -> dict[str, Any]:
+    encoded = _json_bytes(value)
+    if len(encoded) > _MAX_COMMAND_BYTES:
+        raise LiveRowError("observation exceeds its compact evidence bound")
+    result: dict[str, Any] = {
+        "bytes": len(encoded),
+        "sha256": _digest(encoded),
+    }
+    if isinstance(value, dict):
+        for key in (
+            "api_version",
+            "complete",
+            "generation",
+            "owner_epoch",
+            "program_run_id",
+            "projection_generation",
+            "projection_owner_epoch",
+            "reason_code",
+            "schema_version",
+            "state",
+        ):
+            if key in value and isinstance(value[key], (str, int, bool, type(None))):
+                result[key] = value[key]
+    return result
+
+
+def _contains(value: Any, text: str) -> bool:
+    return text.lower() in _json_bytes(value).decode("utf-8", errors="replace").lower()
+
+
+def _scene_fresh(runtime: Mapping[str, Any], scene: Mapping[str, Any]) -> bool:
+    sections = runtime.get("sections")
+    if not isinstance(sections, dict):
+        return False
+    for key in ("logical_scene", "scene_runtime"):
+        section = sections.get(key)
+        if (
+            not isinstance(section, dict)
+            or section.get("available") is not True
+            or section.get("freshness") != "fresh"
+        ):
+            return False
+    return scene.get("schema_version") == "manyforge.scene_projection.v1"
+
+
+def _generation(value: Mapping[str, Any]) -> int:
+    for key in ("projection_generation", "generation", "scene_generation"):
+        candidate = value.get(key)
+        if type(candidate) is int and candidate >= 0:
+            return candidate
+    return -1
+
+
+def _program_run_id(program: Mapping[str, Any]) -> str | None:
+    capture = program.get("capture")
+    if not isinstance(capture, dict):
+        return None
+    value = capture.get("program_run_id")
+    return value if isinstance(value, str) and value else None
+
+
+def _extract_gripper_targets(program: Mapping[str, Any]) -> tuple[GripperTarget, ...]:
+    targets: set[GripperTarget] = set()
+
+    def add_target(
+        *, target_role: object, position: object, label: str
+    ) -> None:
+        if not isinstance(target_role, str) or not target_role:
+            raise LiveRowError(f"{label} has no exact target role")
+        if not isinstance(position, dict):
+            raise LiveRowError(f"{label} has no typed position")
+        kind = position.get("kind")
+        if kind not in {"linear_m", "angular_rad"}:
+            raise LiveRowError(f"{label} has an unsupported coordinate kind")
+        field_name = "value_m" if kind == "linear_m" else "value_rad"
+        value = position.get(field_name)
+        if (
+            isinstance(value, bool)
+            or not isinstance(value, (int, float))
+            or not math.isfinite(float(value))
+        ):
+            raise LiveRowError(f"{label} has a non-finite target")
+        targets.add(GripperTarget(target_role, kind, float(value)))
+
+    def visit(node: object) -> None:
+        if not isinstance(node, dict):
+            raise LiveRowError("Program tree contains a non-object node")
+        node_id = node.get("node_id")
+        parameters = node.get("parameters")
+        if not isinstance(parameters, dict):
+            raise LiveRowError("Program tree node has no parameter object")
+        if node_id == "gripper.command_position":
+            add_target(
+                target_role=parameters.get("target_role"),
+                position=parameters.get("position"),
+                label="gripper.command_position",
+            )
+        elif node_id == "planning.plan_pick_sequence":
+            add_target(
+                target_role=parameters.get("tool_target_role"),
+                position=parameters.get("tool_position"),
+                label="planning.plan_pick_sequence tool command",
+            )
+        children = node.get("children")
+        if not isinstance(children, list):
+            raise LiveRowError("Program tree node has no children array")
+        for child in children:
+            visit(child)
+
+    visit(program.get("tree"))
+    if not targets:
+        raise LiveRowError("I9 Program has no typed gripper command target")
+    return tuple(sorted(targets))
+
+
+def _read_topic_types(
+    spec: ScenarioSpec, *, environment: Mapping[str, str]
+) -> dict[str, dict[str, Any]]:
+    results: dict[str, dict[str, Any]] = {}
+    for topic in spec.required_topics:
+        observed = _run_bounded(
+            ["ros2", "topic", "type", topic],
+            environment=environment,
+            timeout_s=10.0,
+        )
+        lines = [
+            line.strip()
+            for line in observed["output"].splitlines()
+            if line.strip()
+        ]
+        results[topic] = {
+            "returncode": observed["returncode"],
+            "type": lines[0] if len(lines) == 1 else None,
+        }
+    return results
+
+
+def _section(scene: Mapping[str, Any], name: str) -> Mapping[str, Any] | None:
+    value = scene.get(name)
+    return value if isinstance(value, dict) else None
+
+
+def _section_payload(
+    scene: Mapping[str, Any], name: str
+) -> Mapping[str, Any] | None:
+    section = _section(scene, name)
+    if section is None:
+        return None
+    payload = section.get("payload")
+    return payload if isinstance(payload, dict) else None
+
+
+def _logical_snapshot(scene: Mapping[str, Any]) -> Mapping[str, Any] | None:
+    payload = _section_payload(scene, "logical_scene")
+    if payload is None:
+        return None
+    snapshot = payload.get("snapshot")
+    return snapshot if isinstance(snapshot, dict) else None
+
+
+def _projection_revision(scene: Mapping[str, Any]) -> Mapping[str, Any] | None:
+    payload = _section_payload(scene, "logical_scene")
+    if payload is None:
+        return None
+    access = payload.get("access")
+    if not isinstance(access, dict):
+        return None
+    revision = access.get("active_projection")
+    return revision if isinstance(revision, dict) else None
+
+
+def _resolved_position(
+    client: HeadlessHttpClient,
+    scene: Mapping[str, Any],
+    scene_resource_id: str,
+) -> tuple[float, float, float]:
+    revision = _projection_revision(scene)
+    if revision is None:
+        raise LiveRowError("logical scene has no active projection revision")
+    response = client.resolve_scene_resources(
+        {
+            "api_version": "manyforge.scene_resource_pose_query.v1",
+            "expected_projection_revision": dict(revision),
+            "scene_resource_ids": [scene_resource_id],
+        }
+    )
+    poses = response.get("poses")
+    if not isinstance(poses, list) or len(poses) != 1:
+        raise LiveRowError("scene resource pose query was incomplete")
+    row = poses[0]
+    if not isinstance(row, dict) or row.get("scene_resource_id") != scene_resource_id:
+        raise LiveRowError("scene resource pose query crossed object identity")
+    pose = row.get("pose_in_cell")
+    position = pose.get("position_m") if isinstance(pose, dict) else None
+    if not isinstance(position, dict):
+        raise LiveRowError("scene resource pose query omitted its position")
+    coordinates = tuple(position.get(axis) for axis in ("x", "y", "z"))
+    if any(
+        isinstance(value, bool)
+        or not isinstance(value, (int, float))
+        or not math.isfinite(float(value))
+        for value in coordinates
+    ):
+        raise LiveRowError("scene resource pose query returned invalid coordinates")
+    return tuple(float(value) for value in coordinates)  # type: ignore[arg-type]
+
+
+def _record_execution_evidence(
+    evidence: RunEvidence,
+    spec: ScenarioSpec,
+    response: Mapping[str, Any],
+) -> None:
+    status = response.get("status")
+    if (
+        response.get("ok") is not True
+        or response.get("command") != "status"
+        or not isinstance(status, dict)
+    ):
+        raise LiveRowError("execution status is not one successful owner projection")
+    owner_epoch = status.get("owner_epoch")
+    cell_id = status.get("cell_id")
+    observed_targets = status.get("observed_targets")
+    if (
+        not isinstance(owner_epoch, str)
+        or not owner_epoch
+        or not isinstance(cell_id, str)
+        or not cell_id
+        or not isinstance(observed_targets, list)
+        or not observed_targets
+    ):
+        raise LiveRowError("execution status identity or targets are incomplete")
+    evidence.execution_samples += 1
+    evidence.execution_owner_epochs.add(owner_epoch)
+    evidence.execution_cell_ids.add(cell_id)
+    for target in observed_targets:
+        if not isinstance(target, dict):
+            raise LiveRowError("execution observed target is not an object")
+        component_id = target.get("controllable_component_id")
+        if not isinstance(component_id, str) or not component_id:
+            raise LiveRowError("execution observed target omitted its component")
+        evidence.execution_component_ids.add(component_id)
+
+    gripper_role = status.get("gripper_target_role_id")
+    matching = [
+        target
+        for target in observed_targets
+        if isinstance(target, dict) and target.get("target_role_id") == gripper_role
+    ]
+    if len(matching) != 1 or not isinstance(gripper_role, str):
+        raise LiveRowError("execution status has no sole gripper target")
+    gripper = matching[0]
+    positions = gripper.get("positions")
+    if gripper.get("complete") is not True or not isinstance(positions, list):
+        return
+    tolerance = _GRIPPER_TOLERANCE_BY_PROFILE[spec.profile]
+    for position in positions:
+        if not isinstance(position, dict):
+            continue
+        kind = position.get("kind")
+        value_field = "value_m" if kind == "linear_m" else "value_rad"
+        value = position.get(value_field)
+        if (
+            kind not in {"linear_m", "angular_rad"}
+            or isinstance(value, bool)
+            or not isinstance(value, (int, float))
+            or not math.isfinite(float(value))
+        ):
+            continue
+        for expected in evidence.gripper_targets:
+            if (
+                expected.target_role_id == gripper_role
+                and expected.coordinate_kind == kind
+                and abs(float(value) - expected.value) <= tolerance
+            ):
+                evidence.gripper_hits.add(expected)
+
+
+def _foundationpose_source_rows(
+    scene: Mapping[str, Any]
+) -> tuple[Mapping[str, Any], ...]:
+    payload = _section_payload(scene, "scene_runtime")
+    state = payload.get("state") if payload is not None else None
+    rows = state.get("pose_sources") if isinstance(state, dict) else None
+    if not isinstance(rows, list):
+        return ()
+    exact: list[Mapping[str, Any]] = []
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        observation = row.get("payload")
+        pose = observation.get("pose") if isinstance(observation, dict) else None
+        source = (
+            observation.get("source") if isinstance(observation, dict) else None
+        )
+        if (
+            row.get("source_id") == "foundationpose_trocar"
+            and row.get("object_id") == "graspable"
+            and row.get("policy_id") == "before_planning"
+            and row.get("quality") == "good"
+            and row.get("fresh") is True
+            and row.get("eligible") is True
+            and isinstance(observation, dict)
+            and observation.get("api_version")
+            == "manyforge.ros_pose_observation.v1"
+            and observation.get("kind") == "detection3d_pose"
+            and isinstance(pose, dict)
+            and pose.get("frame_kind") == "cell_frame"
+            and pose.get("frame_id") == "link_base"
+            and isinstance(source, dict)
+            and source.get("topic") == "/output"
+        ):
+            exact.append(row)
+    return tuple(exact)
+
+
+def _record_scene_evidence(
+    evidence: RunEvidence,
+    scene: Mapping[str, Any],
+) -> None:
+    generation = _generation(scene)
+    if generation >= 0:
+        evidence.scene_projection_generations.add(generation)
+    source_rows = _foundationpose_source_rows(scene)
+    by_identity: dict[tuple[str, int], Mapping[str, Any]] = {}
+    for row in source_rows:
+        epoch = row.get("source_epoch")
+        sequence = row.get("source_sequence")
+        if isinstance(epoch, str) and type(sequence) is int and sequence > 0:
+            evidence.foundationpose_source_sequences.add(sequence)
+            evidence.foundationpose_source_identities.add((epoch, sequence))
+            by_identity[(epoch, sequence)] = row
+    snapshot = _logical_snapshot(scene)
+    if snapshot is None:
+        return
+    attachments = snapshot.get("carried_object_attachments")
+    if isinstance(attachments, list):
+        evidence.object_carried_observed = evidence.object_carried_observed or any(
+            isinstance(row, dict)
+            and row.get("scene_resource_id") == _OBJECT_MOTION_RESOURCE
+            for row in attachments
+        )
+    objects = snapshot.get("objects")
+    if not isinstance(objects, list):
+        return
+    graspable = next(
+        (
+            row
+            for row in objects
+            if isinstance(row, dict)
+            and row.get("scene_resource_id") == "graspable"
+        ),
+        None,
+    )
+    provider = (
+        graspable.get("provider_evidence")
+        if isinstance(graspable, dict)
+        else None
+    )
+    if not isinstance(provider, dict):
+        return
+    epoch = provider.get("provider_source_epoch")
+    sequence = provider.get("provider_source_sequence")
+    if isinstance(epoch, str) and type(sequence) is int and sequence > 0:
+        evidence.foundationpose_provider_sequences.add(sequence)
+        evidence.foundationpose_provider_match = (
+            evidence.foundationpose_provider_match
+            or (epoch, sequence) in by_identity
+            or (epoch, sequence) in evidence.foundationpose_source_identities
+        )
+
+
+def _prime_run_evidence(
+    evidence: RunEvidence,
+    client: HeadlessHttpClient,
+    scene: Mapping[str, Any],
+    spec: ScenarioSpec,
+) -> None:
+    _record_scene_evidence(evidence, scene)
+    if "object_motion_observed" in spec.required_checks:
+        evidence.object_initial_position = _resolved_position(
+            client, scene, _OBJECT_MOTION_RESOURCE
+        )
+        evidence.object_pose_samples = 1
+
+
+def _observe_run_evidence(
+    evidence: RunEvidence,
+    client: HeadlessHttpClient,
+    spec: ScenarioSpec,
+) -> None:
+    _record_execution_evidence(evidence, spec, client.execution_status())
+    scene = client.scene()
+    _record_scene_evidence(evidence, scene)
+    if "object_motion_observed" not in spec.required_checks:
+        return
+    try:
+        position = _resolved_position(client, scene, _OBJECT_MOTION_RESOURCE)
+    except HeadlessClientError:
+        evidence.pose_query_rejections += 1
+        return
+    if evidence.object_initial_position is None:
+        raise LiveRowError("object-motion observation has no initial pose")
+    evidence.object_pose_samples += 1
+    displacement = math.dist(evidence.object_initial_position, position)
+    evidence.object_max_displacement_m = max(
+        evidence.object_max_displacement_m, displacement
+    )
+
+
+def _history_program_run_ids(history: Mapping[str, Any]) -> set[str]:
+    found: set[str] = set()
+
+    def visit(value: Any) -> None:
+        if isinstance(value, dict):
+            for key, item in value.items():
+                if key == "program_run_id" and isinstance(item, str) and item:
+                    found.add(item)
+                else:
+                    visit(item)
+        elif isinstance(value, list):
+            for item in value:
+                visit(item)
+
+    visit(history.get("events"))
+    return found
+
+
+def _collision_alarm_exact(
+    alarms: Mapping[str, Any], program_run_id: str | None
+) -> bool:
+    rows = alarms.get("alarms")
+    if not isinstance(rows, list) or program_run_id is None:
+        return False
+    for alarm in rows:
+        if not isinstance(alarm, dict):
+            continue
+        subject = alarm.get("subject")
+        details = alarm.get("details")
+        correlations = alarm.get("correlations")
+        if (
+            alarm.get("definition_id") == "manyforge.motion.runtime_collision"
+            and alarm.get("lifecycle_state") == "active_unacknowledged"
+            and alarm.get("priority") == "critical"
+            and alarm.get("requires_motion_attention") is True
+            and isinstance(subject, dict)
+            and subject.get("subject_kind") == "operation"
+            and isinstance(subject.get("subject_id"), str)
+            and isinstance(subject.get("resource_ids"), list)
+            and bool(subject["resource_ids"])
+            and isinstance(details, dict)
+            and details.get("reason") == "runtime_collision_fault"
+            and details.get("source_label") == "kernel.runtime_collision"
+            and isinstance(correlations, dict)
+            and correlations.get("program_run_id") == program_run_id
+            and isinstance(correlations.get("participant_id"), str)
+            and isinstance(correlations.get("request_id"), str)
+        ):
+            return True
+    return False
+
+
+def _collision_stop_history_exact(
+    history: Mapping[str, Any], program_run_id: str | None
+) -> bool:
+    rows = history.get("events")
+    if not isinstance(rows, list) or program_run_id is None:
+        return False
+    for stored in rows:
+        event = stored.get("event") if isinstance(stored, dict) else None
+        if (
+            not isinstance(event, dict)
+            or event.get("event_type") != "stop_acceptance_projected"
+        ):
+            continue
+        envelope = event.get("payload")
+        journal = (
+            envelope.get("journal_payload")
+            if isinstance(envelope, dict)
+            else None
+        )
+        intent = journal.get("intent") if isinstance(journal, dict) else None
+        value = intent.get("value") if isinstance(intent, dict) else None
+        context = value.get("request_context") if isinstance(value, dict) else None
+        affected = journal.get("affected_state") if isinstance(journal, dict) else None
+        operations = affected.get("operations") if isinstance(affected, dict) else None
+        if (
+            isinstance(journal, dict)
+            and journal.get("api_version")
+            == "manyforge.stop_acceptance_projection.v2"
+            and isinstance(intent, dict)
+            and intent.get("intent_kind") == "ordinary_stop"
+            and isinstance(value, dict)
+            and value.get("reason") == "runtime_collision_fault"
+            and isinstance(context, dict)
+            and context.get("source_label") == "kernel.runtime_collision"
+            and isinstance(operations, list)
+            and len(operations) == 1
+            and isinstance(operations[0], dict)
+            and operations[0].get("program_run_id") == program_run_id
+        ):
+            return True
+    return False
+
+
+def _wait_for_trace_evidence(
+    client: HeadlessHttpClient,
+    spec: ScenarioSpec,
+    program_run_id: str,
+    *,
+    timeout_s: float,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    deadline = time.monotonic() + min(timeout_s, 15.0)
+    history: dict[str, Any] = {}
+    alarms: dict[str, Any] = {}
+    collision = "collision_stop_terminal" in spec.required_checks
+    while time.monotonic() < deadline:
+        alarms = client.alarms(limit=128, ordering="attention_newest")
+        history = client.history(params=(("limit", 128),))
+        if program_run_id in _history_program_run_ids(history) and (
+            not collision
+            or (
+                _collision_alarm_exact(alarms, program_run_id)
+                and _collision_stop_history_exact(history, program_run_id)
+            )
+        ):
+            return alarms, history
+        time.sleep(0.05)
+    return alarms, history
+
+
+def _logical_viewer_owner_exact(
+    scene: Mapping[str, Any], runtime: Mapping[str, Any], spec: ScenarioSpec
+) -> bool:
+    logical = _section(scene, "logical_scene")
+    runtime_section = _section(scene, "scene_runtime")
+    snapshot = _logical_snapshot(scene)
+    return bool(
+        logical is not None
+        and runtime_section is not None
+        and snapshot is not None
+        and logical.get("source_owner_id") == f"logical-scene.{spec.cell_id}"
+        and isinstance(logical.get("source_owner_epoch"), str)
+        and runtime_section.get("source_owner_id")
+        == f"scene-runtime.{spec.cell_id}"
+        and isinstance(runtime_section.get("source_owner_epoch"), str)
+        and logical.get("projection_generation")
+        == runtime.get("projection_generation")
+        and runtime_section.get("projection_generation")
+        == runtime.get("projection_generation")
+        and snapshot.get("cell_id") == spec.cell_id
+    )
+
+
+def _build_checks(
+    spec: ScenarioSpec,
+    *,
+    barrier: Mapping[str, Any],
+    before_control: Mapping[str, Any],
+    after_control: Mapping[str, Any],
+    controllers: Mapping[str, Any],
+    nodes: Mapping[str, Any],
+    command_info: Mapping[str, Any],
+    samples: Mapping[str, Mapping[str, Any]],
+    topic_types: Mapping[str, Mapping[str, Any]],
+    program: Mapping[str, Any],
+    run_evidence: RunEvidence,
+    runtime: Mapping[str, Any],
+    scene_before: Mapping[str, Any],
+    scene_after: Mapping[str, Any],
+    alarms: Mapping[str, Any],
+    history: Mapping[str, Any],
+    tf_probe: Mapping[str, Any] | None,
+    assistant: Mapping[str, Any] | None,
+    viewer_cell_id: str | None,
+) -> dict[str, bool]:
+    namespace = f"/manyforge/{spec.component_id}"
+    expected_terminal = "failed" if "collision" in spec.scenario_id else "succeeded"
+    control_before_state = before_control.get("state", {}).get("state")
+    control_after_state = after_control.get("state", {}).get("state")
+    reset_result = after_control.get("reset")
+    program_run_id = _program_run_id(program)
+    capture = program.get("capture")
+    execution_owner_exact = bool(
+        run_evidence.execution_samples > 0
+        and len(run_evidence.execution_owner_epochs) == 1
+        and run_evidence.execution_cell_ids == {spec.cell_id}
+        and run_evidence.execution_component_ids == {spec.component_id}
+    )
+    required_topics_exact = bool(
+        set(topic_types) == set(spec.required_topics)
+        and all(
+            topic_types[topic].get("returncode") == 0
+            and topic_types[topic].get("type") == TOPIC_TYPE_BY_NAME[topic]
+            for topic in spec.required_topics
+        )
+    )
+    checks: dict[str, bool] = {
+        "controller_ready": (
+            controllers.get("returncode") == 0
+            and "isaac_arm_controller" in str(controllers.get("output", ""))
+            and "joint_state_broadcaster" in str(controllers.get("output", ""))
+            and str(controllers.get("output", "")).count(" active") >= 2
+        ),
+        "cross_host_clock_payload": bool(samples.get("/clock", {}).get("seen")),
+        "exact_world_readback": bool(
+            barrier.get("world_name") == spec.world_name
+            and barrier.get("world_uri") == spec.world_uri
+            and before_control.get("exact_world") is True
+            and after_control.get("exact_world") is True
+        ),
+        "execution_owner_exact": execution_owner_exact,
+        "joint_command_payload": bool(
+            samples.get("/isaac_joint_commands", {}).get("seen")
+            and "Subscription count:" in str(command_info.get("output", ""))
+            and not re.search(
+                r"Subscription count:\s*0(?:\D|$)",
+                str(command_info.get("output", "")),
+            )
+        ),
+        "joint_state_payload": bool(
+            samples.get("/isaac_joint_states", {}).get("seen")
+        ),
+        "program_terminal": bool(
+            program.get("state") == expected_terminal
+            and isinstance(capture, dict)
+            and capture.get("scenario_id") == spec.scenario_id
+            and program_run_id is not None
+        ),
+        "reset_observed": bool(
+            isinstance(reset_result, dict) and reset_result.get("success") is True
+        ),
+        "required_topics_exact": required_topics_exact,
+        "runtime_namespace_exact": bool(
+            nodes.get("returncode") == 0
+            and namespace in str(nodes.get("output", ""))
+            and all(
+                f"/manyforge/{other.component_id}" not in str(nodes.get("output", ""))
+                for other in SCENARIO_BY_ID.values()
+                if other.component_id != spec.component_id
+            )
+        ),
+        "simulation_stopped_after": bool(
+            control_after_state == "stopped"
+            and isinstance(after_control.get("stop"), dict)
+            and after_control["stop"].get("success") is True
+        ),
+        "simulation_stopped_before": control_before_state == "stopped",
+        "status_trace_correlated": bool(
+            program_run_id is not None
+            and program_run_id in _history_program_run_ids(history)
+        ),
+    }
+    if "scene_observation_fresh" in spec.required_checks:
+        checks["scene_observation_fresh"] = _scene_fresh(runtime, scene_after)
+    if "gripper_converged" in spec.required_checks:
+        gripper_topic = (
+            "/isaac_joint_commands_gripper"
+            if spec.profile == "lite6"
+            else "/isaac_gripper_state"
+        )
+        checks["gripper_converged"] = bool(
+            samples.get(gripper_topic, {}).get("seen")
+            and program.get("state") == "succeeded"
+            and len(run_evidence.gripper_targets) >= 2
+            and run_evidence.gripper_hits == set(run_evidence.gripper_targets)
+        )
+    if "object_motion_observed" in spec.required_checks:
+        checks["object_motion_observed"] = bool(
+            program.get("state") == "succeeded"
+            and run_evidence.object_carried_observed
+            and run_evidence.object_pose_samples >= 2
+            and run_evidence.object_max_displacement_m
+            > _OBJECT_MOTION_MINIMUM_M
+        )
+    if "foundationpose_detection_fresh" in spec.required_checks:
+        checks["foundationpose_detection_fresh"] = bool(
+            samples.get("/output", {}).get("seen")
+            and run_evidence.foundationpose_source_identities
+        )
+        checks["foundationpose_pose_latched"] = (
+            run_evidence.foundationpose_provider_match
+        )
+        checks["tf_chain_exact"] = bool(
+            tf_probe is not None
+            and tf_probe.get("bytes", 0) > 0
+            and _contains(tf_probe, "camera_color_optical_frame")
+            and _contains(tf_probe, "link_base")
+        )
+    if "collision_stop_terminal" in spec.required_checks:
+        checks["collision_stop_terminal"] = bool(
+            program.get("state") == "failed"
+            and _collision_stop_history_exact(history, program_run_id)
+        )
+        checks["collision_stop_kernel_owned"] = _collision_alarm_exact(
+            alarms, program_run_id
+        )
+    if "assistant_snapshot_owner_exact" in spec.required_checks:
+        viewer_generation = (
+            assistant.get("viewer_generation") if assistant is not None else None
+        )
+        projection_generation = runtime.get("projection_generation")
+        checks["assistant_snapshot_owner_exact"] = bool(
+            assistant is not None
+            and assistant.get("passed") is True
+            and assistant.get("viewer_owner_epoch")
+            == runtime.get("projection_owner_epoch")
+            and type(viewer_generation) is int
+            and type(projection_generation) is int
+            and viewer_generation >= projection_generation
+        )
+        checks["assistant_snapshot_transmitted"] = bool(
+            assistant is not None
+            and assistant.get("model_requests") == 1
+            and assistant.get("snapshot_completed_delta") == 1
+        )
+        checks["ghost_and_viewer_owner_exact"] = bool(
+            viewer_cell_id == spec.cell_id
+            and _logical_viewer_owner_exact(scene_after, runtime, spec)
+        )
+    if set(checks) != spec.required_checks:
+        missing = sorted(spec.required_checks - set(checks))
+        extra = sorted(set(checks) - spec.required_checks)
+        raise LiveRowError(
+            f"derived check set changed: missing={missing}, extra={extra}"
+        )
+    return checks
+
+
+def _process_commands(
+    config: LiveConfig,
+    *,
+    api_port: int,
+    runner_port: int,
+    composer_port: int | None,
+    manager_root: Path,
+    runtime_root: Path,
+    publication_root: Path,
+) -> dict[str, list[str]]:
+    api_url = f"http://127.0.0.1:{api_port}"
+    runner_url = f"http://127.0.0.1:{runner_port}"
+    commands = {
+        "manager": [
+            str(config.installed_root / "manyforge_manager_daemon"),
+            "--package-root",
+            str(config.package_root),
+            "--canonical-empty-admission-filename",
+            config.spec.admission_filename,
+            "--manager-state-root",
+            str(manager_root),
+            "--runtime-state-root",
+            str(runtime_root),
+            "--logical-scene-database",
+            str(config.run_root / "logical-scene.sqlite3"),
+            "--publication-root",
+            str(publication_root),
+            "--reconciliation-period-ms",
+            "20",
+        ],
+        "program": [
+            sys.executable,
+            "-m",
+            "manyforge_program_runner",
+            "--host",
+            "127.0.0.1",
+            "--port",
+            str(runner_port),
+            "--headless-url",
+            api_url,
+            "--owner-id",
+            f"program-runner.{config.spec.scenario_id}",
+            "--headless-timeout-s",
+            "10",
+            "--simulation-control-config",
+            str(
+                config.source_root
+                / "manyforge_ros_bringup/config/isaac_program_simulation_site.json"
+            ),
+        ],
+        "headless": [
+            sys.executable,
+            "-m",
+            "manyforge_headless_api",
+            "serve",
+            "--host",
+            "127.0.0.1",
+            "--port",
+            str(api_port),
+            "--publication-root",
+            str(publication_root),
+            "--package-root",
+            str(config.package_root),
+            "--node-catalog-path",
+            str(config.node_catalog),
+            "--alarm-catalog-path",
+            str(config.alarm_catalog),
+            "--historian-database-path",
+            str(config.run_root / "history.sqlite3"),
+            "--manager-state-root",
+            str(manager_root),
+            "--execution-state-root",
+            str(runtime_root),
+            "--cell-id",
+            config.spec.cell_id,
+            "--owner-id",
+            f"headless-api.{config.spec.scenario_id}",
+            "--freshness-ms",
+            "120000",
+            "--manager-timeout-s",
+            "5",
+            "--program-runner-url",
+            runner_url,
+            "--program-runner-timeout-s",
+            "10",
+        ],
+        "ros": [
+            "ros2",
+            "launch",
+            "manyforge_ros_bringup",
+            "isaac_topic_based_control.launch.py",
+            f"isaac_profile:={config.spec.profile}",
+            f"runtime_namespace:=/manyforge/{config.spec.component_id}",
+            f"command_gate_owner_namespace:=/manyforge/{config.spec.component_id}",
+            f"world_uri:={config.spec.world_uri}",
+            f"expected_world_name:={config.spec.world_name}",
+            f"scene_startup_timeout_s:={config.startup_timeout_s}",
+            "scene_service_timeout_s:=30.0",
+            "controller_manager_lock_memory:=false",
+            f"manager_state_root:={manager_root}",
+            "pose_observer_site_config:="
+            + str(
+                config.source_root
+                / "manyforge_ros_bringup/config"
+                / config.spec.pose_observer_filename
+            ),
+        ],
+    }
+    if config.spec.scenario_id == "isaac-lite6-trocar-foundationpose":
+        commands["ros"].append("additional_required_topics:=/output,/tf,/tf_static")
+    if composer_port is not None:
+        commands["composer"] = [
+            sys.executable,
+            "-m",
+            "manyforge_composer",
+            "--host",
+            "127.0.0.1",
+            "--port",
+            str(composer_port),
+            "--program-path",
+            str(config.package_root / config.spec.program_filename),
+            "--static-dir",
+            str(config.static_dir),
+            "--headless-api-url",
+            api_url,
+            "--headless-api-timeout-s",
+            "15",
+        ]
+    return commands
+
+
+def run_live_row(config: LiveConfig) -> dict[str, Any]:
+    validate_config(config)
+    started = time.monotonic()
+    for directory in ("manager", "runtime", "publications"):
+        (config.run_root / directory).mkdir()
+    manager_root = config.run_root / "manager"
+    runtime_root = config.run_root / "runtime"
+    publication_root = config.run_root / "publications"
+    api_port = _free_port()
+    runner_port = _free_port()
+    composer_port = config.composer_port
+    commands = _process_commands(
+        config,
+        api_port=api_port,
+        runner_port=runner_port,
+        composer_port=composer_port,
+        manager_root=manager_root,
+        runtime_root=runtime_root,
+        publication_root=publication_root,
+    )
+    environment = dict(os.environ)
+    environment["ROS2CLI_NO_DAEMON"] = "1"
+    environment["MANYFORGE_API_TOKEN"] = "i9-local-fixture"
+    environment["MANYFORGE_FS_ROOTS"] = str(config.package_root)
+    processes: list[ManagedProcess] = []
+    samples: list[TopicSample] = []
+    simulation_services_ready = False
+    simulation_stopped = False
+    try:
+        manager = _start_process(
+            "manager",
+            commands["manager"],
+            environment=environment,
+            run_root=config.run_root,
+        )
+        processes.append(manager)
+        program = _start_process(
+            "program",
+            commands["program"],
+            environment=environment,
+            run_root=config.run_root,
+        )
+        processes.append(program)
+        headless = _start_process(
+            "headless",
+            commands["headless"],
+            environment=environment,
+            run_root=config.run_root,
+        )
+        processes.append(headless)
+        api_url = f"http://127.0.0.1:{api_port}"
+        runtime_initial = _wait_for_api(
+            api_url,
+            config.spec.scenario_id,
+            processes,
+            timeout_s=config.startup_timeout_s,
+        )
+        composer: ManagedProcess | None = None
+        composer_url: str | None = None
+        if "composer" in commands:
+            composer = _start_process(
+                "composer",
+                commands["composer"],
+                environment=environment,
+                run_root=config.run_root,
+            )
+            processes.append(composer)
+            composer_url = f"http://127.0.0.1:{composer_port}"
+            _wait_for_composer(
+                composer_url, composer, timeout_s=config.startup_timeout_s
+            )
+        ros = _start_process(
+            "ros", commands["ros"], environment=environment, run_root=config.run_root
+        )
+        processes.append(ros)
+        barrier = _wait_for_barrier(
+            ros, config.spec, timeout_s=config.startup_timeout_s
+        )
+        simulation_services_ready = True
+        controller_manager = (
+            f"/manyforge/{config.spec.component_id}/controller_manager"
+        )
+        controller_deadline = time.monotonic() + config.startup_timeout_s
+        controllers: dict[str, Any] = {}
+        while time.monotonic() < controller_deadline:
+            ros.require_alive()
+            controllers = _run_bounded(
+                [
+                    "ros2",
+                    "control",
+                    "list_controllers",
+                    "--controller-manager",
+                    controller_manager,
+                ],
+                environment=environment,
+                timeout_s=8.0,
+            )
+            output = controllers["output"]
+            if (
+                controllers["returncode"] == 0
+                and "isaac_arm_controller" in output
+                and "joint_state_broadcaster" in output
+                and output.count(" active") >= 2
+            ):
+                break
+            time.sleep(0.1)
+        nodes = _run_bounded(
+            ["ros2", "node", "list"], environment=environment, timeout_s=10.0
+        )
+        command_info = _run_bounded(
+            ["ros2", "topic", "info", "/isaac_joint_commands", "-v"],
+            environment=environment,
+            timeout_s=10.0,
+        )
+        topic_types = _read_topic_types(config.spec, environment=environment)
+        before_control = _simulation_snapshot(config.spec)
+        topic_names = {
+            "/clock",
+            "/isaac_joint_commands",
+            "/isaac_joint_states",
+            (
+                "/isaac_joint_commands_gripper"
+                if config.spec.profile == "lite6"
+                else "/isaac_gripper_state"
+            ),
+        }
+        if config.spec.scenario_id == "isaac-lite6-trocar-foundationpose":
+            topic_names.add("/output")
+        samples = [
+            _start_topic_sample(topic, environment=environment)
+            for topic in sorted(topic_names)
+        ]
+        program_definition = load_strict_json_yaml(
+            config.package_root / config.spec.program_filename
+        )
+        if not isinstance(program_definition, dict):
+            raise LiveRowError("selected Program is not an object")
+        run_evidence = RunEvidence(
+            gripper_targets=_extract_gripper_targets(program_definition)
+        )
+        tf_probe: dict[str, Any] | None = None
+        with HeadlessHttpClient(api_url, timeout_seconds=15.0) as client:
+            catalog = client.scenarios()
+            scene_before = client.scene()
+            _prime_run_evidence(
+                run_evidence, client, scene_before, config.spec
+            )
+            applied = _apply_program(
+                client,
+                config.spec,
+                program_definition,
+                catalog,
+                timeout_s=config.startup_timeout_s,
+            )
+            program_snapshot = _run_program(
+                client,
+                config.spec,
+                catalog,
+                applied,
+                run_evidence,
+                timeout_s=config.run_timeout_s,
+            )
+            program_run_id = _program_run_id(program_snapshot)
+            if program_run_id is None:
+                raise LiveRowError("terminal Program Run lost its owner identity")
+            alarms, history = _wait_for_trace_evidence(
+                client,
+                config.spec,
+                program_run_id,
+                timeout_s=config.startup_timeout_s,
+            )
+            if config.spec.scenario_id == "isaac-lite6-trocar-foundationpose":
+                tf_probe = _run_bounded(
+                    [
+                        "timeout",
+                        "5s",
+                        "ros2",
+                        "run",
+                        "tf2_ros",
+                        "tf2_echo",
+                        "link_base",
+                        "camera_color_optical_frame",
+                    ],
+                    environment=environment,
+                    timeout_s=8.0,
+                )
+            after_control = _simulation_snapshot(
+                config.spec, reset=True, stop=True
+            )
+            simulation_stopped = bool(
+                after_control.get("state", {}).get("state") == "stopped"
+                and isinstance(after_control.get("stop"), dict)
+                and after_control["stop"].get("success") is True
+            )
+            runtime = client.runtime()
+            scene_after = client.scene()
+            _record_scene_evidence(run_evidence, scene_after)
+            viewer_cell_id: str | None = None
+            if composer_url is not None:
+                viewer_cell_id = client.viewer_model_urdf().cell_id
+                assistant = run_snapshot_probe(composer_url)
+            else:
+                assistant = None
+        sample_results = {sample.topic: sample.settle() for sample in samples}
+        samples.clear()
+        checks = _build_checks(
+            config.spec,
+            barrier=barrier,
+            before_control=before_control,
+            after_control=after_control,
+            controllers=controllers,
+            nodes=nodes,
+            command_info=command_info,
+            samples=sample_results,
+            topic_types=topic_types,
+            program=program_snapshot,
+            run_evidence=run_evidence,
+            runtime=runtime,
+            scene_before=scene_before,
+            scene_after=scene_after,
+            alarms=alarms,
+            history=history,
+            tf_probe=tf_probe,
+            assistant=assistant,
+            viewer_cell_id=viewer_cell_id,
+        )
+        details = {
+            "assistant": None if assistant is None else _summary(assistant),
+            "barrier": _summary(barrier),
+            "controllers": {
+                key: controllers[key]
+                for key in ("bytes", "returncode", "sha256")
+            },
+            "headless_runtime_initial": _summary(runtime_initial),
+            "headless_runtime_terminal": _summary(runtime),
+            "history": _summary(history),
+            "operator_alarms": _summary(alarms),
+            "program": _summary(program_snapshot),
+            "run_evidence": run_evidence.summary(),
+            "ros_nodes": {
+                key: nodes[key] for key in ("bytes", "returncode", "sha256")
+            },
+            "ros_samples": sample_results,
+            "ros_topic_types": topic_types,
+            "scene_after": _summary(scene_after),
+            "scene_before": _summary(scene_before),
+            "simulation_after": after_control,
+            "simulation_before": before_control,
+            "tf_probe": None if tf_probe is None else {
+                key: tf_probe[key] for key in ("bytes", "returncode", "sha256")
+            },
+        }
+        row = {
+            "schema_version": ROW_SCHEMA,
+            "scenario_id": config.spec.scenario_id,
+            "component_id": config.spec.component_id,
+            "world": {
+                "name": config.spec.world_name,
+                "sha256": config.spec.world_sha256,
+                "uri": config.spec.world_uri,
+            },
+            "checks": checks,
+            "details": details,
+            "elapsed_s": round(time.monotonic() - started, 3),
+        }
+        return validate_row(row)
+    finally:
+        if simulation_services_ready and not simulation_stopped:
+            with suppress(Exception):
+                _simulation_snapshot(config.spec, stop=True)
+        for sample in reversed(samples):
+            with suppress(Exception):
+                sample.stop()
+        for process in reversed(processes):
+            with suppress(Exception):
+                process.stop()
+
+
+def _default_paths(source_root: Path) -> dict[str, Path]:
+    return {
+        "alarm_catalog": source_root
+        / "manyforge_headless/resources/operator-alarm-catalog.v1.yaml",
+        "node_catalog": source_root
+        / "manyforge_behavior/resources/node_catalog.yaml",
+        "static_dir": source_root / "manyforge_composer/frontend/dist",
+    }
+
+
+def main(argv: Sequence[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--scenario", choices=tuple(SCENARIO_BY_ID), required=True)
+    parser.add_argument("--source-root", type=Path, required=True)
+    parser.add_argument("--package-root", type=Path, required=True)
+    parser.add_argument("--installed-root", type=Path, required=True)
+    parser.add_argument("--run-root", type=Path, required=True)
+    parser.add_argument("--node-catalog", type=Path)
+    parser.add_argument("--alarm-catalog", type=Path)
+    parser.add_argument("--static-dir", type=Path)
+    parser.add_argument("--startup-timeout-s", type=float, default=180.0)
+    parser.add_argument("--run-timeout-s", type=float, default=300.0)
+    parser.add_argument("--composer-port", type=int, default=9000)
+    args = parser.parse_args(argv)
+    source_root = args.source_root.resolve()
+    defaults = _default_paths(source_root)
+    spec = SCENARIO_BY_ID[args.scenario]
+    composer_port = (
+        args.composer_port
+        if args.scenario == "isaac-ur10e-light-scene-assistant"
+        else None
+    )
+    config = LiveConfig(
+        spec=spec,
+        source_root=source_root,
+        package_root=args.package_root.resolve(),
+        installed_root=args.installed_root.resolve(),
+        run_root=args.run_root.resolve(),
+        node_catalog=(args.node_catalog or defaults["node_catalog"]).resolve(),
+        alarm_catalog=(args.alarm_catalog or defaults["alarm_catalog"]).resolve(),
+        static_dir=(args.static_dir or defaults["static_dir"]).resolve(),
+        startup_timeout_s=args.startup_timeout_s,
+        run_timeout_s=args.run_timeout_s,
+        composer_port=composer_port,
+    )
+    try:
+        row = run_live_row(config)
+    except (LiveRowError, QualificationError, HeadlessClientError, OSError) as error:
+        print(f"I9 live row failed: {error}", file=sys.stderr)
+        return 2
+    print(json.dumps(row, separators=(",", ":"), sort_keys=True))
+    return 0 if all(row["checks"].values()) else 2
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
