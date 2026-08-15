@@ -378,6 +378,63 @@ def test_live_row_primes_object_motion_only_after_program_run_initializes_scene(
     )
 
 
+def test_scene_pose_query_retries_only_the_exact_stale_revision(
+    live: ModuleType,
+) -> None:
+    def scene(revision: int) -> dict:
+        return {
+            "logical_scene": {
+                "payload": {
+                    "access": {
+                        "active_projection": {
+                            "graph_revision": f"graph.{revision}",
+                            "retained_bundle_id": f"bundle.{revision}",
+                            "scene_revision": {
+                                "content_hash": f"content.{revision}",
+                                "revision_id": revision,
+                                "scene_id": f"scene.{revision}",
+                            },
+                        }
+                    }
+                }
+            }
+        }
+
+    class Client:
+        calls: list[dict] = []
+
+        def scene(self) -> dict:
+            return scene(2)
+
+        def resolve_scene_resources(self, body: dict) -> dict:
+            self.calls.append(body)
+            if len(self.calls) == 1:
+                raise live.HeadlessClientError(
+                    "stale_revision",
+                    "projection advanced",
+                    409,
+                )
+            return {
+                "poses": [
+                    {
+                        "scene_resource_id": "isaac_cheese_box",
+                        "pose_in_cell": {
+                            "position_m": {"x": 1.0, "y": 2.0, "z": 3.0}
+                        },
+                    }
+                ]
+            }
+
+    client = Client()
+    assert live._resolved_position(  # noqa: SLF001
+        client, scene(1), "isaac_cheese_box"
+    ) == (1.0, 2.0, 3.0)
+    assert [
+        call["expected_projection_revision"]["graph_revision"]
+        for call in client.calls
+    ] == ["graph.1", "graph.2"]
+
+
 def test_check_reducer_requires_source_matched_foundationpose_latch(
     live: ModuleType,
 ) -> None:

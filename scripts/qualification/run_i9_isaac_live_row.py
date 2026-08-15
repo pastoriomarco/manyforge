@@ -52,6 +52,7 @@ _OBJECT_MOTION_RESOURCE: Final = "isaac_cheese_box"
 _OBJECT_MOTION_MINIMUM_M: Final = 0.05
 _GRIPPER_TOLERANCE_BY_PROFILE: Final = {"lite6": 0.004, "ur10e": 0.04}
 _RECOVERY_BOUND_S: Final = 60.0
+_SCENE_POSE_QUERY_ATTEMPTS: Final = 16
 _CCLC_STARTUP_SCHEMA: Final = "manyforge.i9_cclc_startup.v1"
 _ROS2_CONTROL_LIFECYCLE_OBSERVATION_SCHEMA: Final = (
     "manyforge.ros2_control_lifecycle_observation.v1"
@@ -1510,16 +1511,32 @@ def _resolved_position(
     scene: Mapping[str, Any],
     scene_resource_id: str,
 ) -> tuple[float, float, float]:
-    revision = _projection_revision(scene)
-    if revision is None:
-        raise LiveRowError("logical scene has no active projection revision")
-    response = client.resolve_scene_resources(
-        {
-            "api_version": "manyforge.scene_resource_pose_query.v1",
-            "expected_projection_revision": dict(revision),
-            "scene_resource_ids": [scene_resource_id],
-        }
-    )
+    current_scene = scene
+    response: Mapping[str, Any] | None = None
+    for attempt in range(_SCENE_POSE_QUERY_ATTEMPTS):
+        revision = _projection_revision(current_scene)
+        if revision is None:
+            raise LiveRowError("logical scene has no active projection revision")
+        try:
+            response = client.resolve_scene_resources(
+                {
+                    "api_version": "manyforge.scene_resource_pose_query.v1",
+                    "expected_projection_revision": dict(revision),
+                    "scene_resource_ids": [scene_resource_id],
+                }
+            )
+            break
+        except HeadlessClientError as error:
+            if error.code != "stale_revision":
+                raise
+            if attempt + 1 == _SCENE_POSE_QUERY_ATTEMPTS:
+                raise LiveRowError(
+                    "scene resource pose query could not acquire a stable revision"
+                ) from error
+            time.sleep(0.01)
+            current_scene = client.scene()
+    if response is None:
+        raise LiveRowError("scene resource pose query produced no response")
     poses = response.get("poses")
     if not isinstance(poses, list) or len(poses) != 1:
         raise LiveRowError("scene resource pose query was incomplete")
