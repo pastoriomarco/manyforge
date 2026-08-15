@@ -711,6 +711,10 @@
       "model_family_id": "lite6_lite_gripper",
       "runtime_restoration_profile_id": "lite6_isaac_commanded_v0",
       "component_occurrence_id": "isaac_lite6_robot",
+      "root_pose_in_cell": {
+        "position_m": [0.0, 0.0, 0.0],
+        "orientation_xyzw": [0.0, 0.0, 0.0, 1.0]
+      },
       "program_role_assignments": [
         {
           "scenario_id": "isaac-lite6-pick-place",
@@ -782,6 +786,10 @@
       "model_family_id": "ur10e_robotiq_2f_140",
       "runtime_restoration_profile_id": "ur10e_robotiq_isaac_commanded_v0",
       "component_occurrence_id": "isaac_ur10e_assistant_robot",
+      "root_pose_in_cell": {
+        "position_m": [-0.21814000606536865, -0.571590006351471, 0.12999999523162842],
+        "orientation_xyzw": [0.0, 0.0, -0.7071067690846544, 0.7071067932884405]
+      },
       "program_role_assignments": [
         {
           "scenario_id": "isaac-ur10e-light-scene-assistant",
@@ -851,6 +859,10 @@
       "model_family_id": "ur10e_robotiq_2f_140",
       "runtime_restoration_profile_id": "ur10e_robotiq_isaac_commanded_v0",
       "component_occurrence_id": "isaac_ur10e_light_robot",
+      "root_pose_in_cell": {
+        "position_m": [-0.21814000606536865, -0.571590006351471, 0.12999999523162842],
+        "orientation_xyzw": [0.0, 0.0, -0.7071067690846544, 0.7071067932884405]
+      },
       "program_role_assignments": [
         {
           "scenario_id": "isaac-ur10e-light-scene",
@@ -920,6 +932,10 @@
       "model_family_id": "ur10e_robotiq_2f_140",
       "runtime_restoration_profile_id": "ur10e_robotiq_isaac_commanded_v0",
       "component_occurrence_id": "isaac_ur10e_collision_robot",
+      "root_pose_in_cell": {
+        "position_m": [-0.21814000606536865, -0.571590006351471, 0.12999999523162842],
+        "orientation_xyzw": [0.0, 0.0, -0.7071067690846544, 0.7071067932884405]
+      },
       "program_role_assignments": [
         {
           "scenario_id": "isaac-ur10e-light-scene-collision",
@@ -1196,6 +1212,10 @@
       "model_family_id": "lite6_lite_gripper",
       "runtime_restoration_profile_id": "lite6_isaac_commanded_v0",
       "component_occurrence_id": "isaac_lite6_trocar_robot",
+      "root_pose_in_cell": {
+        "position_m": [0.0, 0.0, 0.0],
+        "orientation_xyzw": [0.0, 0.0, 0.0, 1.0]
+      },
       "program_role_assignments": [
         {
           "scenario_id": "isaac-lite6-trocar-foundationpose",

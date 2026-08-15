@@ -1927,10 +1927,15 @@ def graph_and_applicability(
                     }
                 ],
                 "runtime_unit_ids": [runtime_unit_id],
-                "root_pose_in_cell": {
-                    "position_m": [0.0, 0.0, 0.0],
-                    "orientation_xyzw": [0.0, 0.0, 0.0, 1.0],
-                },
+                "root_pose_in_cell": copy.deepcopy(
+                    deployment.get(
+                        "root_pose_in_cell",
+                        {
+                            "position_m": [0.0, 0.0, 0.0],
+                            "orientation_xyzw": [0.0, 0.0, 0.0, 1.0],
+                        },
+                    )
+                ),
             }
         ],
         "control_domains": [

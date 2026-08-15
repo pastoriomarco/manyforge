@@ -42,6 +42,28 @@ _I9_DEPLOYMENT_SOURCES: Final = frozenset(
 _EXPECTED_DEPLOYMENT_SOURCES: Final = (
     _NATIVE_DEPLOYMENT_SOURCES | _I9_DEPLOYMENT_SOURCES
 )
+_EXPECTED_I9_ROOT_POSES_IN_CELL: Final = {
+    "examples/isaac_lite6_lite_gripper_pick_and_place.deployment.yaml": {
+        "position_m": [0.0, 0.0, 0.0],
+        "orientation_xyzw": [0.0, 0.0, 0.0, 1.0],
+    },
+    "examples/isaac_manipulator_scene_light_assistant.deployment.yaml": {
+        "position_m": [-0.21814000606536865, -0.571590006351471, 0.12999999523162842],
+        "orientation_xyzw": [0.0, 0.0, -0.7071067690846544, 0.7071067932884405],
+    },
+    "examples/isaac_manipulator_scene_light_ros2_control.deployment.yaml": {
+        "position_m": [-0.21814000606536865, -0.571590006351471, 0.12999999523162842],
+        "orientation_xyzw": [0.0, 0.0, -0.7071067690846544, 0.7071067932884405],
+    },
+    "examples/isaac_manipulator_scene_light_ros2_control_collision.deployment.yaml": {
+        "position_m": [-0.21814000606536865, -0.571590006351471, 0.12999999523162842],
+        "orientation_xyzw": [0.0, 0.0, -0.7071067690846544, 0.7071067932884405],
+    },
+    "examples/trocar_lite6_foundationpose_pick.deployment.yaml": {
+        "position_m": [0.0, 0.0, 0.0],
+        "orientation_xyzw": [0.0, 0.0, 0.0, 1.0],
+    },
+}
 _EXPECTED_HISTORICAL_BLOBS: Final = {
     "examples/assistant_modes_scene_authoring.deployment.yaml": (
         "7149aba89619f3f1c426148ef2f2972cd0c730f0"
@@ -1853,6 +1875,7 @@ def validate(source: Path, root: Path) -> None:
                     "historical_program_source",
                     "historical_program_blob",
                     "i9_behavior_obligations",
+                    "root_pose_in_cell",
                 }
             )
         row = _exact(
@@ -1938,6 +1961,17 @@ def validate(source: Path, root: Path) -> None:
             if obligations != _EXPECTED_I9_BEHAVIOR_OBLIGATIONS[deployment_source]:
                 raise SourceDescriptionError(
                     f"{path}.i9_behavior_obligations changes the I9 audit closure"
+                )
+            root_pose = _exact(
+                row["root_pose_in_cell"],
+                required=frozenset({"position_m", "orientation_xyzw"}),
+                path=f"{path}.root_pose_in_cell",
+            )
+            expected_root_pose = _EXPECTED_I9_ROOT_POSES_IN_CELL[deployment_source]
+            if root_pose != expected_root_pose:
+                raise SourceDescriptionError(
+                    f"{path}.root_pose_in_cell changes the exact historical "
+                    "Isaac world placement"
                 )
         if row["model_family_id"] not in family_ids:
             raise SourceDescriptionError(f"{path}.model_family_id is unavailable")
