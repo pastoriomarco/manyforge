@@ -120,12 +120,15 @@ This measured TCP is for simulator truth/scene synchronization; it does not
 change the commanded-simulation authority rules for arm execution.
 
 Isaac Sim 5.1's `simulation_interfaces/GetEntityState` implementation reports
-these poses in simulator `world` coordinates while its header contains the
-entity basename.  Each retained UR pose-observer binding therefore declares
-both the exact expected `source_header_frame_id` and the actual
-`source_coordinate_frame_id: world`.  The adapter rejects a changed header,
-then performs the configured `world` to `universe` TF transform.  This keeps
-the historical scene behavior without the old unconditional frame relabel.
+these poses in the retained stage/cell coordinates while its header contains
+the entity basename.  The retained world uses the launch's exact identity
+`universe` to `world` mapping, so each UR pose-observer binding declares both
+the exact expected `source_header_frame_id` and
+`source_coordinate_frame_id: universe`.  The adapter rejects a changed header
+before assigning that explicit coordinate contract.  A scene with a non-
+identity stage-to-cell transform must declare its real source coordinate frame
+and provide the corresponding TF.  This keeps the historical scene behavior
+without the old unconditional frame relabel.
 
 ## Direct Smoke Test
 

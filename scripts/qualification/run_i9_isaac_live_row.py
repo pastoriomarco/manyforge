@@ -1303,6 +1303,11 @@ def _run_program(
     ):
         raise LiveRowError("Program Run start omitted its owner identity")
     run_id = capture["program_run_id"]
+    # Program Run start synchronously initializes and publishes the authored
+    # logical scene before tree construction.  Object-motion evidence cannot
+    # be sampled earlier: Program Apply selects the product but deliberately
+    # leaves the logical-scene owner empty.
+    _prime_run_evidence(evidence, client, client.scene(), spec)
     deadline = time.monotonic() + timeout_s
     next_observation = 0.0
     while snapshot.get("state") not in _TERMINAL_STATES:
@@ -2605,12 +2610,6 @@ def run_live_row(config: LiveConfig) -> dict[str, Any]:
                 program_definition,
                 catalog,
                 timeout_s=config.startup_timeout_s,
-            )
-            _prime_run_evidence(
-                run_evidence,
-                client,
-                client.scene(),
-                config.spec,
             )
             cclc_startup = _prepare_and_select_cclc_routes(
                 client,

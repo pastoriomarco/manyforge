@@ -363,8 +363,8 @@ def test_retained_site_configs_preserve_historical_pose_source_contracts() -> No
             )
             for binding in ur_config.simulation_entities
         ] == [
-            ("robotiq_arg2f_base_link", "world", "universe"),
-            ("mac_n_cheese_centered", "world", "universe"),
+            ("robotiq_arg2f_base_link", "universe", "universe"),
+            ("mac_n_cheese_centered", "universe", "universe"),
         ]
 
     foundation = load_isaac_pose_observer_site_config(

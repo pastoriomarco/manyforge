@@ -365,14 +365,16 @@ def test_check_reducer_requires_each_gripper_target_and_physical_object_motion(
     assert checks["object_motion_observed"] is False
 
 
-def test_live_row_primes_object_motion_only_after_program_apply(
+def test_live_row_primes_object_motion_only_after_program_run_initializes_scene(
     live: ModuleType,
 ) -> None:
     source = Path(live.__file__).read_text(encoding="utf-8")
-    run_source = source[source.index("def run_live_row(") :]
+    run_source = source[
+        source.index("def _run_program(") : source.index("def _json_bytes(")
+    ]
 
-    assert run_source.index("applied = _apply_program(") < run_source.index(
-        "_prime_run_evidence("
+    assert run_source.index("snapshot = client.program_run_start(") < (
+        run_source.index("_prime_run_evidence(")
     )
 
 

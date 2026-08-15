@@ -27,7 +27,7 @@
       "local_position_xyz": [0, 0, 0.2],
       "object_id": "isaac_ur10e_collision_robot",
       "policy_id": "viewer.measured_tcp",
-      "source_coordinate_frame_id": "world",
+      "source_coordinate_frame_id": "universe",
       "source_header_frame_id": "robotiq_arg2f_base_link",
       "target_frame_id": "universe"
     },
@@ -40,7 +40,7 @@
       "local_position_xyz": [0, 0, 0],
       "object_id": "isaac_cheese_box",
       "policy_id": "continuous_unattached",
-      "source_coordinate_frame_id": "world",
+      "source_coordinate_frame_id": "universe",
       "source_header_frame_id": "mac_n_cheese_centered",
       "target_frame_id": "universe"
     }
