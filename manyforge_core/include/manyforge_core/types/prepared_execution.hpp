@@ -148,6 +148,17 @@ struct ExecutionBackendStatusDTO final {
     const RuntimeParticipantBinding& backend_binding,
     PreparedParticipantPayloadKindDTO expected_payload_kind) noexcept;
 
+/// Validate that an already sealed Program-scoped participant is contained by
+/// one exact physical backend owner. Program and role identities may differ;
+/// retained product, model/frame scope, resources, route, provider occurrence,
+/// runtime epochs, and Stop evidence remain fail-closed. This is the adapter
+/// counterpart of product-scoped startup plus operation-scoped Program Binding.
+[[nodiscard]] std::optional<std::string_view>
+prepared_participant_backend_physical_binding_field_error(
+    const PreparedOperationParticipantDTO& participant,
+    const RuntimeParticipantBinding& physical_backend_binding,
+    PreparedParticipantPayloadKindDTO expected_payload_kind) noexcept;
+
 /// Validate one backend result against the exact already-verified prepared
 /// participant that was supplied to the backend.
 [[nodiscard]] std::optional<std::string_view> prepare_participant_result_field_error(

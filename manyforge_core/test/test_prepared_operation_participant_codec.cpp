@@ -511,6 +511,41 @@ TEST(PreparedOperationParticipantCodecTest, BackendBindingRejectsCrossedParticip
 }
 
 TEST(PreparedOperationParticipantCodecTest,
+     BackendPhysicalBindingAcceptsContainedProgramAndRejectsCrossedRoute) {
+  const auto base = BasePlan();
+  auto inputs = Inputs(base, false);
+  auto made = MakePreparedOperationParticipant(
+      Candidate(inputs.binding, inputs.readiness, MotionPayload(inputs)), inputs.binding,
+      inputs.readiness, &*inputs.runtime_policy, {}, MotionInterruptNodeCategory::kGeneric);
+  ASSERT_TRUE(made.ok());
+
+  auto physical_value = inputs.binding.value();
+  physical_value.program_id = ProgramId("direct-control.product-owner");
+  physical_value.program_revision = ProgramRevision(Digest('e'));
+  physical_value.program_binding_id = ProgramBindingId(Digest('f'));
+  physical_value.component_role_id = ComponentRoleId("direct_control_component");
+  physical_value.target_role_id = TargetRoleId("direct_control_target");
+  auto physical = verify_runtime_participant_binding(std::move(physical_value));
+  ASSERT_TRUE(physical.ok()) << physical.error().message;
+
+  EXPECT_EQ(prepared_participant_backend_binding_field_error(
+                made.value(), physical.value(),
+                PreparedParticipantPayloadKindDTO::kMotionExecution),
+            "prepared_participant_backend_program_id_mismatch");
+  EXPECT_FALSE(prepared_participant_backend_physical_binding_field_error(
+                   made.value(), physical.value(),
+                   PreparedParticipantPayloadKindDTO::kMotionExecution)
+                   .has_value());
+
+  auto crossed = made.value();
+  crossed.control_route_id = ControlRouteId("route.other");
+  EXPECT_EQ(prepared_participant_backend_physical_binding_field_error(
+                crossed, physical.value(),
+                PreparedParticipantPayloadKindDTO::kMotionExecution),
+            "prepared_participant_backend_control_route_id_mismatch");
+}
+
+TEST(PreparedOperationParticipantCodecTest,
      MotionRequiresExactSealedRuntimePolicyReferentAndEffectiveCeiling) {
   const auto base = BasePlan();
   auto inputs = Inputs(base, false);

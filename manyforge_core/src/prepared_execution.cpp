@@ -58,6 +58,17 @@ template <typename Counter>
   return true;
 }
 
+template <typename Available, typename Selected, typename Matches>
+[[nodiscard]] bool unambiguous_subset(
+    const std::vector<Available>& available, const std::vector<Selected>& selected,
+    Matches matches) noexcept {
+  return std::all_of(selected.begin(), selected.end(), [&](const auto& value) {
+    return std::count_if(available.begin(), available.end(), [&](const auto& candidate) {
+             return matches(candidate, value);
+           }) == 1;
+  });
+}
+
 [[nodiscard]] bool participant_identity_shape(
     const PreparedOperationParticipantDTO& participant) noexcept {
   return digest(participant.prepared_contract_digest) && identity(participant.operation_id) &&
@@ -174,6 +185,22 @@ template <typename Counter>
                   {{"reason", std::string(reason)}}};
 }
 
+[[nodiscard]] bool stop_plan_matches_participant(
+    const PreparedOperationParticipantDTO& participant) noexcept {
+  const auto& stop_plan = participant.ordinary_stop_plan;
+  return stop_plan.operation_id == participant.operation_id &&
+         stop_plan.operation_revision == participant.operation_revision &&
+         stop_plan.participant_id == participant.participant_id &&
+         stop_plan.program_id == participant.program_id &&
+         stop_plan.program_revision == participant.program_revision &&
+         stop_plan.program_binding_id == participant.program_binding_id &&
+         stop_plan.program_run_id == participant.program_run_id &&
+         stop_plan.participant_stop_profile_purpose ==
+             ParticipantStopProfilePurposeDTO::kOrdinary &&
+         !stop_plan.participant_stop_profile.has_value() &&
+         !stop_plan.motion_interrupt_scope_id.has_value();
+}
+
 }  // namespace
 
 PreparedParticipantPayloadKindDTO prepared_participant_payload_kind(
@@ -259,19 +286,100 @@ std::optional<std::string_view> prepared_participant_backend_binding_field_error
     return "prepared_participant_backend_stop_evidence_policy_id_mismatch";
   if (participant.stop_evidence_policy_revision != path.stop_evidence_policy_revision)
     return "prepared_participant_backend_stop_evidence_policy_revision_mismatch";
-  const auto& stop_plan = participant.ordinary_stop_plan;
-  if (stop_plan.operation_id != participant.operation_id ||
-      stop_plan.operation_revision != participant.operation_revision ||
-      stop_plan.participant_id != participant.participant_id ||
-      stop_plan.program_id != participant.program_id ||
-      stop_plan.program_revision != participant.program_revision ||
-      stop_plan.program_binding_id != participant.program_binding_id ||
-      stop_plan.program_run_id != participant.program_run_id ||
-      stop_plan.participant_stop_profile_purpose != ParticipantStopProfilePurposeDTO::kOrdinary ||
-      stop_plan.participant_stop_profile.has_value() ||
-      stop_plan.motion_interrupt_scope_id.has_value()) {
+  if (!stop_plan_matches_participant(participant)) {
     return "prepared_participant_backend_stop_plan_mismatch";
   }
+  return std::nullopt;
+}
+
+std::optional<std::string_view>
+prepared_participant_backend_physical_binding_field_error(
+    const PreparedOperationParticipantDTO& participant,
+    const RuntimeParticipantBinding& physical_backend_binding,
+    PreparedParticipantPayloadKindDTO expected_payload_kind) noexcept {
+  const auto& binding = physical_backend_binding.value();
+  if (!participant_identity_shape(participant) || !binding.control_path.has_value() ||
+      prepared_participant_payload_kind(participant) != expected_payload_kind) {
+    return "prepared_participant_backend_shape_invalid";
+  }
+  const auto& path = *binding.control_path;
+  const auto expected_capability_provider =
+      binding.capability_provider_path ? std::optional(provider(*binding.capability_provider_path))
+                                       : std::nullopt;
+  if (participant.retained_bundle_id != binding.retained_bundle_id)
+    return "prepared_participant_backend_retained_bundle_id_mismatch";
+  if (participant.graph_revision != binding.graph_revision)
+    return "prepared_participant_backend_graph_revision_mismatch";
+  if (participant.controllable_component_id != binding.controllable_component_id)
+    return "prepared_participant_backend_component_id_mismatch";
+  if (participant.component_type_id != binding.component_type_id)
+    return "prepared_participant_backend_component_type_id_mismatch";
+  if (participant.component_type_revision != binding.component_type_revision)
+    return "prepared_participant_backend_component_type_revision_mismatch";
+  if (participant.command_target_id != binding.command_target_id)
+    return "prepared_participant_backend_command_target_id_mismatch";
+  if (participant.capability_id != binding.capability_id)
+    return "prepared_participant_backend_capability_id_mismatch";
+  if (participant.capability_definition_revision != binding.capability_definition_revision)
+    return "prepared_participant_backend_capability_revision_mismatch";
+  if (!unambiguous_subset(
+          binding.model_bindings, participant.model_bindings,
+          [](const auto& available, const auto& selected) {
+            return available.model_instance_id == selected.model_instance_id &&
+                   available.model_revision == selected.model_revision;
+          }))
+    return "prepared_participant_backend_model_bindings_mismatch";
+  if (!unambiguous_subset(
+          binding.frame_bindings, participant.frame_bindings,
+          [](const auto& available, const auto& selected) {
+            return available.model_instance_id == selected.model_instance_id &&
+                   available.model_revision == selected.model_revision &&
+                   available.compiled_frame_name == selected.compiled_frame_name;
+          }))
+    return "prepared_participant_backend_frame_bindings_mismatch";
+  if (participant.control_domain_id != path.control_domain_id)
+    return "prepared_participant_backend_control_domain_id_mismatch";
+  if (participant.control_domain_revision != path.control_domain_revision)
+    return "prepared_participant_backend_control_domain_revision_mismatch";
+  if (participant.control_binding_id != path.control_binding_id)
+    return "prepared_participant_backend_control_binding_id_mismatch";
+  if (participant.control_binding_revision != path.control_binding_revision)
+    return "prepared_participant_backend_control_binding_revision_mismatch";
+  if (participant.control_interface_contract_id != path.control_interface_contract_id)
+    return "prepared_participant_backend_interface_contract_id_mismatch";
+  if (participant.control_interface_revision != path.control_interface_revision)
+    return "prepared_participant_backend_interface_revision_mismatch";
+  if (participant.controller_topology_id != path.controller_topology_id)
+    return "prepared_participant_backend_controller_topology_id_mismatch";
+  if (participant.topology_revision != path.topology_revision)
+    return "prepared_participant_backend_topology_revision_mismatch";
+  if (participant.control_route_id != path.control_route_id)
+    return "prepared_participant_backend_control_route_id_mismatch";
+  if (participant.activation_set_id != path.activation_set_id)
+    return "prepared_participant_backend_activation_set_id_mismatch";
+  if (participant.control_provider != provider(path))
+    return "prepared_participant_backend_control_provider_mismatch";
+  if (participant.capability_provider != expected_capability_provider)
+    return "prepared_participant_backend_capability_provider_mismatch";
+  if (!unambiguous_subset(
+          binding.resources, participant.resources,
+          [](const auto& available, const auto& selected) {
+            return available.resource_id == selected;
+          }))
+    return "prepared_participant_backend_resources_mismatch";
+  if (participant.active_control_configuration_id != path.active_control_configuration_id)
+    return "prepared_participant_backend_active_configuration_id_mismatch";
+  if (participant.active_control_configuration_generation !=
+      path.active_control_configuration_generation)
+    return "prepared_participant_backend_active_configuration_generation_mismatch";
+  if (participant.runtime_unit_epochs != binding.runtime_unit_epochs)
+    return "prepared_participant_backend_runtime_unit_epochs_mismatch";
+  if (participant.stop_evidence_policy_id != path.stop_evidence_policy_id)
+    return "prepared_participant_backend_stop_evidence_policy_id_mismatch";
+  if (participant.stop_evidence_policy_revision != path.stop_evidence_policy_revision)
+    return "prepared_participant_backend_stop_evidence_policy_revision_mismatch";
+  if (!stop_plan_matches_participant(participant))
+    return "prepared_participant_backend_stop_plan_mismatch";
   return std::nullopt;
 }
 

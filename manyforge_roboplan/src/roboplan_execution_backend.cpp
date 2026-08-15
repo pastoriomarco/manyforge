@@ -549,7 +549,12 @@ core::PrepareParticipantResultDTO RoboPlanExecutionBackend::Prepare(
           return !binding_error(alias).has_value();
         });
     if (matched == aliases->end()) {
-      return reject(std::string(*field_error));
+      field_error = core::prepared_participant_backend_physical_binding_field_error(
+          participant, *retained_binding,
+          core::PreparedParticipantPayloadKindDTO::kMotionExecution);
+      if (field_error.has_value()) {
+        return reject(std::string(*field_error));
+      }
     }
   }
   const auto &motion =
@@ -621,7 +626,12 @@ core::ExecutionHandle RoboPlanExecutionBackend::dispatch_prepared(
           return !binding_error(alias).has_value();
         });
     if (matched == aliases->end()) {
-      return rejected(std::string(*field_error));
+      field_error = core::prepared_participant_backend_physical_binding_field_error(
+          participant, *retained_binding,
+          core::PreparedParticipantPayloadKindDTO::kMotionExecution);
+      if (field_error.has_value()) {
+        return rejected(std::string(*field_error));
+      }
     }
   }
   const auto prepared_key =
