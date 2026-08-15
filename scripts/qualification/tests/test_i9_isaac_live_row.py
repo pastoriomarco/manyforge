@@ -366,6 +366,33 @@ def test_check_reducer_requires_source_matched_foundationpose_latch(
     assert checks["foundationpose_pose_latched"] is False
 
 
+def test_trace_probe_uses_the_headless_history_page_bound(live: ModuleType) -> None:
+    class Client:
+        history_params = None
+
+        @staticmethod
+        def alarms(*, limit: int, ordering: str):
+            assert limit == 128
+            assert ordering == "attention_newest"
+            return {"alarms": []}
+
+        def history(self, *, params):
+            self.history_params = params
+            return {"events": [{"event": {"program_run_id": "program-run.1"}}]}
+
+    client = Client()
+    alarms, history = live._wait_for_trace_evidence(  # noqa: SLF001
+        client,
+        live.SCENARIO_BY_ID["isaac-lite6-pick-place"],
+        "program-run.1",
+        timeout_s=1.0,
+    )
+
+    assert client.history_params == (("limit", 32),)
+    assert alarms == {"alarms": []}
+    assert live._history_program_run_ids(history) == {"program-run.1"}  # noqa: SLF001
+
+
 def test_extract_gripper_targets_reads_typed_leaf_and_pick_sequence(
     live: ModuleType,
 ) -> None:

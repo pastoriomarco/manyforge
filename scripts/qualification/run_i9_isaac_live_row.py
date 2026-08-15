@@ -1283,7 +1283,7 @@ def _wait_for_trace_evidence(
     collision = "collision_stop_terminal" in spec.required_checks
     while time.monotonic() < deadline:
         alarms = client.alarms(limit=128, ordering="attention_newest")
-        history = client.history(params=(("limit", 128),))
+        history = client.history(params=(("limit", 32),))
         if program_run_id in _history_program_run_ids(history) and (
             not collision
             or (
