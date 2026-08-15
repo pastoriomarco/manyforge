@@ -5247,6 +5247,30 @@ core::ExecutionHandle Ros2ControlExecutionBackend::execute_trajectory(
     if (!decision.admitted || !decision.pin.has_value()) {
       const bool binding_rejection =
           decision.reason_code.rfind("controller_", 0) == 0;
+      decision.details["controller_binding_activity_events_total"] =
+          std::to_string(controller_binding_activity_events_total_.load(
+              std::memory_order_relaxed));
+      decision.details["controller_binding_refresh_attempts_total"] =
+          std::to_string(controller_binding_refresh_attempts_total_.load(
+              std::memory_order_relaxed));
+      decision.details["controller_binding_refresh_successes_total"] =
+          std::to_string(controller_binding_refresh_successes_total_.load(
+              std::memory_order_relaxed));
+      decision.details["controller_binding_refresh_failures_total"] =
+          std::to_string(controller_binding_refresh_failures_total_.load(
+              std::memory_order_relaxed));
+      if (binding != nullptr) {
+        decision.details["controller_binding_snapshot_generation"] =
+            std::to_string(binding->generation);
+        decision.details["controller_binding_activity_generation"] =
+            std::to_string(binding->activity_generation);
+        decision.details["controller_binding_received_timestamp_ns"] =
+            std::to_string(binding->received_timestamp_ns);
+        decision.details["controller_binding_fresh_until_ns"] =
+            std::to_string(binding->fresh_until_ns);
+        decision.details["controller_binding_valid"] =
+            binding->valid ? "true" : "false";
+      }
       (binding_rejection ? controller_binding_dispatch_rejections_total_
                          : execution_admission_dispatch_rejections_total_)
           .fetch_add(1, std::memory_order_relaxed);

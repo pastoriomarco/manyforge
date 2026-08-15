@@ -273,7 +273,11 @@ make_retained_isaac_ros2_control_backend_config(
   execution.command_gate_topic = scoped_name(
       runtime_namespace, "manyforge/isaac_arm_command_enable");
   execution.require_execution_admission_snapshot = true;
-  execution.controller_binding_refresh_timeout_s = 0.25;
+  // Controller-manager activity invalidates this proof immediately.  The
+  // service timeout is only the bounded fallback refresh path; leave enough
+  // margin for a loaded DDS executor without turning scheduler jitter into a
+  // false lifecycle transition.
+  execution.controller_binding_refresh_timeout_s = 0.5;
   execution.enable_jtc_speed_scaling_input = false;
   execution.decelerate_on_cancel = true;
   execution.velocity_state_interface_joints =
@@ -314,7 +318,7 @@ make_retained_isaac_ros2_control_backend_config(
       interfaces(transport_joints, kCommandInterfaces);
   controller.required_state_interfaces =
       interfaces(transport_joints, kStateInterfaces);
-  controller.snapshot_max_age_ns = 1'000'000'000LL;
+  controller.snapshot_max_age_ns = 2'000'000'000LL;
   execution.controller_binding = std::move(controller);
 
   const auto &gripper = *gripper_binding;

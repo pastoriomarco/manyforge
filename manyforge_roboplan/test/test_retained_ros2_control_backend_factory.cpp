@@ -253,7 +253,11 @@ TEST(RetainedRos2ControlBackendFactoryTest,
   EXPECT_FALSE(selected.execution.enable_jtc_speed_scaling_input);
   EXPECT_TRUE(selected.execution.enable_soft_on_path_path_ramp);
   EXPECT_TRUE(selected.execution.require_execution_admission_snapshot);
+  EXPECT_DOUBLE_EQ(selected.execution.controller_binding_refresh_timeout_s,
+                   0.5);
   ASSERT_TRUE(selected.execution.controller_binding.has_value());
+  EXPECT_EQ(selected.execution.controller_binding->snapshot_max_age_ns,
+            2'000'000'000LL);
   EXPECT_EQ(selected.execution.controller_binding->hardware_component_name,
             "IsaacLite6TopicBasedSystem");
   EXPECT_EQ(selected.execution.controller_binding->controller_manager,
