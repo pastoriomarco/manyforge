@@ -2407,7 +2407,9 @@ TEST(ResourceAddressedExecutionKernelTest,
     engine.emit_transition(ExecutionState::kStopping, ExecutionState::kStopped);
   };
 
-  engine.emit_collision();
+  engine.emit_collision({{"contact_a", "component/robot/body/tool/collision/0"},
+                         {"contact_b", "scene/workpiece/shape/0"},
+                         {"runtime_query_engine_status", "ok"}});
   std::optional<StopId> stop_id;
   ASSERT_TRUE(wait_until([&] {
     const auto operation = kernel.get_operation_state(accepted.value().operation_id);
@@ -2424,7 +2426,19 @@ TEST(ResourceAddressedExecutionKernelTest,
   EXPECT_EQ(operation.value().state, OperationStateKind::kStopped);
   ASSERT_EQ(operation.value().participants.size(), 1U);
   EXPECT_EQ(operation.value().participants.front().state, OperationStateKind::kStopped);
-  EXPECT_FALSE(operation.value().participants.front().terminal_error.has_value());
+  ASSERT_TRUE(operation.value().participants.front().terminal_error.has_value());
+  const auto& terminal_error =
+      *operation.value().participants.front().terminal_error;
+  EXPECT_EQ(terminal_error.code,
+            std::string(to_string(ErrorCode::kExecutionAborted)));
+  EXPECT_EQ(terminal_error.message,
+            "Runtime collision containment stopped the operation");
+  EXPECT_EQ(terminal_error.details.at("reason"), "runtime_collision_fault");
+  EXPECT_EQ(terminal_error.details.at("contact_a"),
+            "component/robot/body/tool/collision/0");
+  EXPECT_EQ(terminal_error.details.at("contact_b"),
+            "scene/workpiece/shape/0");
+  EXPECT_EQ(terminal_error.details.at("runtime_query_engine_status"), "ok");
   ASSERT_EQ(kernel.resource_snapshot().size(), 1U);
   EXPECT_EQ(kernel.resource_snapshot().front().state, ResourceSlotState::kTerminal);
   EXPECT_EQ(engine.translate_stop_stage_calls.load(), 1);

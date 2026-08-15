@@ -7914,6 +7914,12 @@ void ResourceAddressedExecutionKernel::ProgressStop(const StopControlWorkToken t
       const auto stop_id = *transaction.stop_id;
       const auto stop_generation = transaction.stop_generation;
       const auto now = clock_.now();
+      const auto* ordinary_stop =
+          std::get_if<StopIntentDTO>(&transaction.projected_intent);
+      const bool runtime_collision_containment =
+          ordinary_stop != nullptr &&
+          ordinary_stop->reason == std::optional<std::string>{"runtime_collision_fault"} &&
+          ordinary_stop->request_context.source_label == "kernel.runtime_collision";
 
       if (!transaction.participant_work_initialized) {
         transaction.participants.reserve(transaction.operations.size());
@@ -8222,7 +8228,12 @@ void ResourceAddressedExecutionKernel::ProgressStop(const StopControlWorkToken t
         }
         participant_state->state = item.contained ? OperationStateKind::kStopped
                                                   : OperationStateKind::kInterventionRequired;
-        participant_state->terminal_error = item.contained ? std::nullopt : item.terminal_error;
+        participant_state->terminal_error =
+            item.contained
+                ? (runtime_collision_containment
+                       ? active_participant->last_subordinate_error
+                       : std::optional<ErrorDTO>{})
+                : item.terminal_error;
         const bool all_participants_terminal =
             std::all_of(operation->state.participants.begin(), operation->state.participants.end(),
                         [](const auto& candidate) { return terminal(candidate.state); });
@@ -10365,6 +10376,12 @@ void ResourceAddressedExecutionKernel::on_engine_event(IResolvedParticipantExecu
       auto* participant = operation == nullptr ? nullptr : operation->participant_for(engine);
       if (operation != nullptr && participant != nullptr && !terminal(operation->state.state) &&
           !operation->state.active_stop_id.has_value()) {
+        auto collision_details = event.details;
+        collision_details["reason"] = "runtime_collision_fault";
+        participant->last_subordinate_error =
+            ErrorDTO{std::string(to_string(ErrorCode::kExecutionAborted)),
+                     "Runtime collision containment stopped the operation",
+                     std::move(collision_details)};
         const auto material = config_.request_owner_epoch.value() + "\nruntime-collision\n" +
                               operation->state.operation_id.value() + "\n" +
                               std::to_string(operation->state.operation_revision.value()) + "\n" +
