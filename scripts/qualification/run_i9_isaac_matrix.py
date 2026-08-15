@@ -161,7 +161,7 @@ SCENARIOS: Final = (
         world_uri=f"file:{_ISAAC_ASSET_ROOT}/lite6_grf_ros2.usda",
         world_name="lite6_grf_ros2",
         world_sha256=(
-            "64f9511a717f57556d028f171132e4ee8240daddbfb03114699098b4e7499e4e"
+            "94cf6c23e693f7034bbdaa08b7130e82366473412836082c881aac1386f133c0"
         ),
         required_topics=(
             "/clock",
@@ -191,7 +191,7 @@ SCENARIOS: Final = (
         ),
         world_name="test_scene_realsense_foundationpose_trocar",
         world_sha256=(
-            "7808872d07f9242976c0bc4f62e434b3d7299518ef61287dadc19ee286ef5aa9"
+            "47574d43d9b05db72c92034a198be854da43ad1deaa783e256722676f1b76692"
         ),
         required_topics=(
             "/clock",

@@ -129,6 +129,7 @@ def test_scene_barrier_runs_against_typed_fake_simulator() -> None:
     try:
         simulator = Node("manyforge_fake_simulation_interfaces_owner")
         publishers = []
+        state_transitions: list[int] = []
 
         def publish_loaded_world_topics() -> None:
             if publishers:
@@ -144,7 +145,9 @@ def test_scene_barrier_runs_against_typed_fake_simulator() -> None:
                 )
 
         _install_fake_simulator(
-            simulator, on_load=publish_loaded_world_topics
+            simulator,
+            on_play=publish_loaded_world_topics,
+            state_transitions=state_transitions,
         )
         executor.add_node(simulator)
         worker = threading.Thread(target=executor.spin, daemon=True)
@@ -174,6 +177,19 @@ def test_scene_barrier_runs_against_typed_fake_simulator() -> None:
             "file:/opt/isaac/worlds/retained scene.usda"
         )
         assert result["simulation_state"] == "stopped"
+        assert result["readiness_probe"] == {
+            "mode": "playing_then_stopped",
+            "observed_topics": [
+                "/clock",
+                "/isaac_gripper_state",
+                "/isaac_joint_commands",
+                "/isaac_joint_states",
+            ],
+        }
+        assert state_transitions == [
+            int(SimulationState.STATE_PLAYING),
+            int(SimulationState.STATE_STOPPED),
+        ]
         assert set(result["services"]) == {
             "features",
             "load_world",
@@ -193,10 +209,60 @@ def test_scene_barrier_runs_against_typed_fake_simulator() -> None:
             rclpy.shutdown()
 
 
+def test_scene_barrier_stops_after_playing_readiness_timeout() -> None:
+    rclpy.init()
+    simulator: Node | None = None
+    barrier: IsaacSceneLoadBarrier | None = None
+    executor = SingleThreadedExecutor()
+    worker: threading.Thread | None = None
+    try:
+        simulator = Node("manyforge_fake_timeout_simulation_interfaces_owner")
+        state_transitions: list[int] = []
+        _install_fake_simulator(
+            simulator,
+            state_transitions=state_transitions,
+        )
+        executor.add_node(simulator)
+        worker = threading.Thread(target=executor.spin, daemon=True)
+        worker.start()
+
+        barrier = IsaacSceneLoadBarrier(
+            parameter_overrides=[
+                Parameter("world_uri", value=WORLD_URI),
+                Parameter("expected_world_name", value="retained_world"),
+                Parameter("startup_timeout_s", value=0.3),
+                Parameter("service_timeout_s", value=0.1),
+                Parameter("required_topics", value=["/never_materializes"]),
+            ]
+        )
+        with pytest.raises(
+            TimeoutError,
+            match="missing topics=.*never_materializes",
+        ):
+            barrier.run()
+
+        assert state_transitions == [
+            int(SimulationState.STATE_PLAYING),
+            int(SimulationState.STATE_STOPPED),
+        ]
+    finally:
+        if barrier is not None:
+            barrier.destroy_node()
+        executor.shutdown()
+        if worker is not None:
+            worker.join(timeout=2.0)
+        if simulator is not None:
+            simulator.destroy_node()
+        if rclpy.ok():
+            rclpy.shutdown()
+
+
 def _install_fake_simulator(
     node: Node,
     *,
     on_load: Callable[[], None] | None = None,
+    on_play: Callable[[], None] | None = None,
+    state_transitions: list[int] | None = None,
 ) -> None:
     feature_values = [
         int(SimulatorFeatures.WORLD_LOADING),
@@ -217,12 +283,20 @@ def _install_fake_simulator(
         )
         return response
 
+    current_state = {"value": int(SimulationState.STATE_STOPPED)}
+
     def state(_request, response):
         response.result.result = response.result.RESULT_OK
-        response.state.state = int(SimulationState.STATE_STOPPED)
+        response.state.state = current_state["value"]
         return response
 
-    def set_state(_request, response):
+    def set_state(request, response):
+        target = int(request.state.state)
+        current_state["value"] = target
+        if state_transitions is not None:
+            state_transitions.append(target)
+        if target == int(SimulationState.STATE_PLAYING) and on_play is not None:
+            on_play()
         response.result.result = response.result.RESULT_OK
         return response
 

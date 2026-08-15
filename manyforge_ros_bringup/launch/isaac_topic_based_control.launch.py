@@ -122,7 +122,9 @@ def generate_launch_description() -> LaunchDescription:
                 default_value="",
                 description=(
                     "Comma-separated absolute topic names that must join the "
-                    "profile's Isaac control graph before bringup continues."
+                    "profile's simulator-owned Isaac graph before bringup "
+                    "continues. Topics owned by downstream providers must be "
+                    "validated after those providers start."
                 ),
             ),
             DeclareLaunchArgument(

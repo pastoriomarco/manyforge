@@ -52,6 +52,9 @@ _OBJECT_MOTION_RESOURCE: Final = "isaac_cheese_box"
 _OBJECT_MOTION_MINIMUM_M: Final = 0.05
 _GRIPPER_TOLERANCE_BY_PROFILE: Final = {"lite6": 0.004, "ur10e": 0.04}
 _RECOVERY_BOUND_S: Final = 60.0
+# The launch barrier owns two fresh, 30-second-bounded service calls to force
+# and read back STOPPED even after its startup deadline expires.
+_SCENE_BARRIER_CLEANUP_MARGIN_S: Final = 65.0
 
 
 class LiveRowError(RuntimeError):
@@ -1600,7 +1603,7 @@ def _process_commands(
         ],
     }
     if config.spec.scenario_id == "isaac-lite6-trocar-foundationpose":
-        commands["ros"].append("additional_required_topics:=/output,/tf,/tf_static")
+        commands["ros"].append("additional_required_topics:=/tf")
     if composer_port is not None:
         commands["composer"] = [
             sys.executable,
@@ -1741,7 +1744,11 @@ def _run_foundationpose_recovery(
         )
         processes.append(replacement)
         barrier = _wait_for_barrier(
-            replacement, config.spec, timeout_s=config.startup_timeout_s
+            replacement,
+            config.spec,
+            timeout_s=(
+                config.startup_timeout_s + _SCENE_BARRIER_CLEANUP_MARGIN_S
+            ),
         )
         controllers = _wait_for_controllers(
             replacement,
@@ -1888,7 +1895,11 @@ def run_live_row(config: LiveConfig) -> dict[str, Any]:
         )
         processes.append(ros)
         barrier = _wait_for_barrier(
-            ros, config.spec, timeout_s=config.startup_timeout_s
+            ros,
+            config.spec,
+            timeout_s=(
+                config.startup_timeout_s + _SCENE_BARRIER_CLEANUP_MARGIN_S
+            ),
         )
         simulation_services_ready = True
         controllers = _wait_for_controllers(

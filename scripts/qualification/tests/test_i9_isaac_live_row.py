@@ -435,7 +435,7 @@ def test_process_commands_bind_exact_component_world_and_pose_config(
     assert f"runtime_namespace:=/manyforge/{scenario.component_id}" in ros
     assert f"world_uri:={scenario.world_uri}" in ros
     assert f"expected_world_name:={scenario.world_name}" in ros
-    assert "additional_required_topics:=/output,/tf,/tf_static" in ros
+    assert "additional_required_topics:=/tf" in ros
     assert not any("DemoSupervisor" in item for item in ros)
 
 

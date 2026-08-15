@@ -177,74 +177,114 @@ class IsaacSceneLoadBarrier(Node):
     def run(self) -> dict[str, Any]:
         startup_deadline = time.monotonic() + self.startup_timeout_s
         services = self._wait_for_services(startup_deadline)
-        features = self._call(
-            services["features"],
-            GetSimulatorFeatures,
-            GetSimulatorFeatures.Request(),
-        ).features
-        required_features = {
-            int(SimulatorFeatures.WORLD_LOADING),
-            int(SimulatorFeatures.WORLD_INFO_GETTING),
-            int(SimulatorFeatures.SIMULATION_STATE_GETTING),
-            int(SimulatorFeatures.SIMULATION_STATE_SETTING),
-        }
-        observed_features = {int(value) for value in features.features}
-        missing_features = sorted(required_features - observed_features)
-        if missing_features:
-            raise RuntimeError(
-                "Isaac simulation adapter lacks required features: "
-                + ",".join(str(value) for value in missing_features)
-            )
-
-        request = LoadWorld.Request()
-        request.uri = self.world_uri
-        request.resource_string = ""
-        request.fail_on_unsupported_element = True
-        request.ignore_missing_or_unsupported_assets = False
-        loaded = self._call(services["load_world"], LoadWorld, request)
-        self._require_ok(loaded.result, operation="LoadWorld")
-        if not world_readback_matches(
-            loaded.world,
-            expected_uri=self.world_uri,
-            expected_name=self.expected_world_name,
-        ):
-            raise RuntimeError("LoadWorld response differs from the selected world")
-
-        current = self._call(
-            services["current_world"],
-            GetCurrentWorld,
-            GetCurrentWorld.Request(),
-        )
-        self._require_ok(current.result, operation="GetCurrentWorld")
-        if not world_readback_matches(
-            current.world,
-            expected_uri=self.world_uri,
-            expected_name=self.expected_world_name,
-        ):
-            raise RuntimeError("GetCurrentWorld readback differs from LoadWorld")
-
-        state = self._read_state(services["get_state"])
-        if state != int(SimulationState.STATE_STOPPED):
-            request_state = SetSimulationState.Request()
-            request_state.state.state = int(SimulationState.STATE_STOPPED)
-            changed = self._call(
-                services["set_state"],
-                SetSimulationState,
-                request_state,
-            )
-            code = int(changed.result.result)
-            if code not in {
-                int(changed.result.RESULT_OK),
-                int(SetSimulationState.Response.ALREADY_IN_TARGET_STATE),
-            }:
+        startup_error: Exception | None = None
+        observed_features: set[int] = set()
+        observed_topics: list[str] = []
+        try:
+            features = self._call(
+                services["features"],
+                GetSimulatorFeatures,
+                GetSimulatorFeatures.Request(),
+                deadline=startup_deadline,
+            ).features
+            required_features = {
+                int(SimulatorFeatures.WORLD_LOADING),
+                int(SimulatorFeatures.WORLD_INFO_GETTING),
+                int(SimulatorFeatures.SIMULATION_STATE_GETTING),
+                int(SimulatorFeatures.SIMULATION_STATE_SETTING),
+            }
+            observed_features = {int(value) for value in features.features}
+            missing_features = sorted(required_features - observed_features)
+            if missing_features:
                 raise RuntimeError(
-                    "SetSimulationState(stopped) failed: "
-                    f"{code}: {changed.result.error_message}"
+                    "Isaac simulation adapter lacks required features: "
+                    + ",".join(str(value) for value in missing_features)
                 )
+
+            request = LoadWorld.Request()
+            request.uri = self.world_uri
+            request.resource_string = ""
+            request.fail_on_unsupported_element = True
+            request.ignore_missing_or_unsupported_assets = False
+            loaded = self._call(
+                services["load_world"],
+                LoadWorld,
+                request,
+                deadline=startup_deadline,
+            )
+            self._require_ok(loaded.result, operation="LoadWorld")
+            if not world_readback_matches(
+                loaded.world,
+                expected_uri=self.world_uri,
+                expected_name=self.expected_world_name,
+            ):
+                raise RuntimeError(
+                    "LoadWorld response differs from the selected world"
+                )
+
+            current = self._call(
+                services["current_world"],
+                GetCurrentWorld,
+                GetCurrentWorld.Request(),
+                deadline=startup_deadline,
+            )
+            self._require_ok(current.result, operation="GetCurrentWorld")
+            if not world_readback_matches(
+                current.world,
+                expected_uri=self.world_uri,
+                expected_name=self.expected_world_name,
+            ):
+                raise RuntimeError(
+                    "GetCurrentWorld readback differs from LoadWorld"
+                )
+
+            # Retained Isaac graphs materialize their ROS publishers on the
+            # first simulation tick. Probe while playing; command owners are
+            # still held behind this process's successful exit.
+            if self.required_topics:
+                self._set_state(
+                    services["set_state"],
+                    int(SimulationState.STATE_PLAYING),
+                    operation="SetSimulationState(playing readiness probe)",
+                    deadline=startup_deadline,
+                )
+                if self._read_state(
+                    services["get_state"], deadline=startup_deadline
+                ) != int(
+                    SimulationState.STATE_PLAYING
+                ):
+                    raise RuntimeError(
+                        "Isaac world did not enter playing readiness probe"
+                    )
+                observed_topics = self._wait_for_required_topics(
+                    startup_deadline
+                )
+        except Exception as error:
+            startup_error = error
+
+        # Stopped convergence is unconditional after typed services have been
+        # found, including load/readback/readiness failures. These two bounded
+        # cleanup calls intentionally receive a fresh service timeout.
+        try:
+            self._set_state(
+                services["set_state"],
+                int(SimulationState.STATE_STOPPED),
+                operation="SetSimulationState(stopped handoff)",
+            )
             state = self._read_state(services["get_state"])
-        if state != int(SimulationState.STATE_STOPPED):
-            raise RuntimeError("Isaac world did not converge to stopped state")
-        self._wait_for_required_topics(startup_deadline)
+            if state != int(SimulationState.STATE_STOPPED):
+                raise RuntimeError(
+                    "Isaac world did not converge to stopped handoff state"
+                )
+        except Exception as stop_error:
+            if startup_error is not None:
+                raise RuntimeError(
+                    "Isaac startup failed and stopped-state cleanup also "
+                    f"failed: startup={startup_error}; cleanup={stop_error}"
+                ) from stop_error
+            raise
+        if startup_error is not None:
+            raise startup_error
 
         return {
             "schema_version": RESULT_SCHEMA,
@@ -253,6 +293,10 @@ class IsaacSceneLoadBarrier(Node):
             "simulation_state": "stopped",
             "services": services,
             "required_topics": list(self.required_topics),
+            "readiness_probe": {
+                "mode": "playing_then_stopped",
+                "observed_topics": observed_topics,
+            },
             "features": sorted(observed_features),
         }
 
@@ -276,7 +320,7 @@ class IsaacSceneLoadBarrier(Node):
             f"{missing_services}"
         )
 
-    def _wait_for_required_topics(self, deadline: float) -> None:
+    def _wait_for_required_topics(self, deadline: float) -> list[str]:
         last_topics: set[str] = set()
         required = set(self.required_topics)
         while time.monotonic() < deadline:
@@ -287,7 +331,7 @@ class IsaacSceneLoadBarrier(Node):
                 if isinstance(types, (list, tuple)) and types
             }
             if required.issubset(last_topics):
-                return
+                return sorted(required)
             time.sleep(0.05)
         missing_topics = sorted(required - last_topics)
         raise TimeoutError(
@@ -295,18 +339,64 @@ class IsaacSceneLoadBarrier(Node):
             f"{missing_topics}"
         )
 
-    def _call(self, service_name: str, service_type: type, request: object) -> object:
+    def _set_state(
+        self,
+        service_name: str,
+        target_state: int,
+        *,
+        operation: str,
+        deadline: float | None = None,
+    ) -> None:
+        request = SetSimulationState.Request()
+        request.state.state = target_state
+        changed = self._call(
+            service_name,
+            SetSimulationState,
+            request,
+            deadline=deadline,
+        )
+        code = int(changed.result.result)
+        if code not in {
+            int(changed.result.RESULT_OK),
+            int(SetSimulationState.Response.ALREADY_IN_TARGET_STATE),
+        }:
+            raise RuntimeError(
+                f"{operation} failed: {code}: {changed.result.error_message}"
+            )
+
+    def _call(
+        self,
+        service_name: str,
+        service_type: type,
+        request: object,
+        *,
+        deadline: float | None = None,
+    ) -> object:
+        call_deadline = time.monotonic() + self.service_timeout_s
+        if deadline is not None:
+            call_deadline = min(call_deadline, deadline)
         client = self.create_client(service_type, service_name)
         try:
-            if not client.wait_for_service(timeout_sec=self.service_timeout_s):
+            wait_timeout = call_deadline - time.monotonic()
+            if wait_timeout <= 0.0:
+                raise TimeoutError(
+                    f"service deadline expired before call: {service_name}"
+                )
+            if not client.wait_for_service(timeout_sec=wait_timeout):
                 raise TimeoutError(f"service unavailable: {service_name}")
             future = client.call_async(request)
+            response_timeout = call_deadline - time.monotonic()
+            if response_timeout <= 0.0:
+                raise TimeoutError(
+                    f"service deadline expired before response: {service_name}"
+                )
             rclpy.spin_until_future_complete(
                 self,
                 future,
-                timeout_sec=self.service_timeout_s,
+                timeout_sec=response_timeout,
             )
             if not future.done():
+                future.cancel()
                 raise TimeoutError(f"service response timed out: {service_name}")
             response = future.result()
             if response is None:
@@ -315,11 +405,17 @@ class IsaacSceneLoadBarrier(Node):
         finally:
             self.destroy_client(client)
 
-    def _read_state(self, service_name: str) -> int:
+    def _read_state(
+        self,
+        service_name: str,
+        *,
+        deadline: float | None = None,
+    ) -> int:
         response = self._call(
             service_name,
             GetSimulationState,
             GetSimulationState.Request(),
+            deadline=deadline,
         )
         self._require_ok(response.result, operation="GetSimulationState")
         return int(response.state.state)
@@ -338,7 +434,10 @@ def main() -> int:
     try:
         node = IsaacSceneLoadBarrier()
         result = node.run()
-        print(json.dumps(result, sort_keys=True, separators=(",", ":")))
+        print(
+            json.dumps(result, sort_keys=True, separators=(",", ":")),
+            flush=True,
+        )
         return 0
     except Exception as error:
         print(
@@ -350,7 +449,8 @@ def main() -> int:
                 },
                 sort_keys=True,
                 separators=(",", ":"),
-            )
+            ),
+            flush=True,
         )
         return 2
     finally:
