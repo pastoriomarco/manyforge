@@ -79,8 +79,7 @@ lifecycle_facts(const bool controller_ready, const bool fault_present,
   std::ostringstream stream;
   stream << "gripper:" << snapshot.transport_kind << ':' << snapshot.configured
          << ':' << snapshot.command_path_ready << ':'
-         << snapshot.feedback_path_ready << ':' << snapshot.command_gate_open
-         << ':' << snapshot.ready;
+         << snapshot.feedback_path_ready << ':' << snapshot.ready;
   for (const auto &reason : snapshot.reason_codes) {
     stream << ':' << reason;
   }

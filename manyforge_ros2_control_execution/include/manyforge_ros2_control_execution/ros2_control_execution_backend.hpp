@@ -96,7 +96,11 @@ struct Ros2GripperTransportReadinessSnapshot {
   bool configured{};
   bool command_path_ready{};
   bool feedback_path_ready{};
+  // Diagnostic admission state only; a closed gate does not make the
+  // underlying physical transport unavailable.
   bool command_gate_open{};
+  // Exact physical transport readiness. Command admission remains separately
+  // fail-closed through command_gate_open and the backend lifecycle authority.
   bool ready{};
   std::uint64_t feedback_publisher_count{};
   std::uint64_t feedback_messages_received{};

@@ -8853,9 +8853,6 @@ Ros2ControlExecutionBackend::gripper_transport_readiness(
     result.reason_codes.push_back("gripper_transport_readiness_exception");
   }
 
-  if (!result.command_gate_open) {
-    result.reason_codes.push_back("gripper_command_gate_closed");
-  }
   {
     std::lock_guard<std::mutex> map_lock(gripper_map_mutex_);
     const auto current = grippers_.find(gripper_id);
@@ -8870,9 +8867,13 @@ Ros2ControlExecutionBackend::gripper_transport_readiness(
   result.reason_codes.erase(
       std::unique(result.reason_codes.begin(), result.reason_codes.end()),
       result.reason_codes.end());
+  // Lifecycle readiness describes the physical transport, not command
+  // admission. The simulator gate remains independently observable and every
+  // command path still rejects while it is closed. Including the gate here
+  // creates a startup cycle: CCLC requires external lifecycle readiness before
+  // it can select the route whose reset flow opens the gate.
   result.ready = result.configured && result.command_path_ready &&
-                 result.feedback_path_ready && result.command_gate_open &&
-                 result.reason_codes.empty();
+                 result.feedback_path_ready && result.reason_codes.empty();
   return result;
 }
 

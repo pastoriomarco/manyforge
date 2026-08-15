@@ -687,6 +687,49 @@ private:
   rclcpp::Publisher<sensor_msgs::msg::JointState>::SharedPtr publisher_;
 };
 
+class JointStateSubscriber {
+public:
+  explicit JointStateSubscriber(const std::string &topic) {
+    context_ = std::make_shared<rclcpp::Context>();
+    int argc = 0;
+    char **argv = nullptr;
+    context_->init(argc, argv);
+
+    rclcpp::NodeOptions options;
+    options.context(context_);
+    node_ = std::make_shared<rclcpp::Node>(
+        "manyforge_joint_state_sub_test_" + unique_suffix(), options);
+    subscription_ = node_->create_subscription<sensor_msgs::msg::JointState>(
+        topic, rclcpp::SystemDefaultsQoS(),
+        [](const sensor_msgs::msg::JointState::SharedPtr) {});
+  }
+
+  ~JointStateSubscriber() {
+    if (context_) {
+      context_->shutdown("test shutdown");
+    }
+    subscription_.reset();
+    node_.reset();
+    context_.reset();
+  }
+
+  bool wait_for_publisher() const {
+    const auto deadline = std::chrono::steady_clock::now() + 1s;
+    while (std::chrono::steady_clock::now() < deadline) {
+      if (subscription_->get_publisher_count() > 0) {
+        return true;
+      }
+      std::this_thread::sleep_for(10ms);
+    }
+    return subscription_->get_publisher_count() > 0;
+  }
+
+private:
+  std::shared_ptr<rclcpp::Context> context_;
+  rclcpp::Node::SharedPtr node_;
+  rclcpp::Subscription<sensor_msgs::msg::JointState>::SharedPtr subscription_;
+};
+
 class FakeFjtServer {
 public:
   explicit FakeFjtServer(const std::string &action_name) {
@@ -2496,6 +2539,60 @@ TEST(Ros2ControlExecutionBackendTest,
   EXPECT_EQ(readiness.reason_codes,
             std::vector<std::string>{
                 "gripper_command_subscriber_unavailable"});
+}
+
+TEST(Ros2ControlExecutionBackendTest,
+     ClosedSimulatorGateDoesNotHideReadyGripperTransportOrAdmitCommand) {
+  const std::string suffix = unique_suffix();
+  const std::string command_topic =
+      "/manyforge_gated_gripper_command_" + suffix;
+  const std::string state_topic = "/manyforge_gated_gripper_state_" + suffix;
+
+  auto sink = std::make_shared<RecordingExecutionStateSink>();
+  sink->set_joint_position("gripper", "finger_joint", 0.7);
+  core::FakeClock clock;
+  core::ManualScheduler scheduler;
+  auto config = base_config();
+  config.command_gate_topic = "/manyforge_command_gate_" + suffix;
+  Ros2ControlExecutionBackend backend(
+      Ros2ControlExecutionBackend::DeferredRosExecutorStartTag{}, sink, "arm",
+      clock, scheduler, std::move(config));
+
+  auto gripper = isaac_gripper_config(command_topic);
+  gripper.state_topic = state_topic;
+  gripper.state_joint_name = "finger_joint";
+  backend.configure_gripper_action("tool", std::move(gripper));
+  backend.complete_ros_configuration();
+
+  JointStateSubscriber command_subscriber(command_topic);
+  JointStatePublisher state_publisher(state_topic);
+  ASSERT_TRUE(command_subscriber.wait_for_publisher());
+  ASSERT_TRUE(state_publisher.wait_for_subscription());
+  for (int attempt = 0; attempt < 5; ++attempt) {
+    state_publisher.publish({"finger_joint"}, {0.7});
+    std::this_thread::sleep_for(20ms);
+  }
+
+  const auto closed = backend.gripper_transport_readiness("tool");
+  EXPECT_TRUE(closed.configured);
+  EXPECT_TRUE(closed.command_path_ready);
+  EXPECT_TRUE(closed.feedback_path_ready);
+  EXPECT_FALSE(closed.command_gate_open);
+  EXPECT_TRUE(closed.ready);
+  EXPECT_TRUE(closed.reason_codes.empty());
+
+  const auto rejected = backend.command_gripper(make_gripper_request(
+      0.0, 0.2, 0.0, "isaac_joint_state_effort", "dwell_elapsed"));
+  EXPECT_FALSE(rejected.accepted);
+  ASSERT_TRUE(rejected.error.has_value());
+  EXPECT_EQ(rejected.error->code,
+            ros2_control_fault_reason::kGripperGoalRejected);
+
+  EXPECT_TRUE(backend.request_command_gate(true));
+  const auto open = backend.gripper_transport_readiness("tool");
+  EXPECT_TRUE(open.command_gate_open);
+  EXPECT_TRUE(open.ready);
+  EXPECT_TRUE(open.reason_codes.empty());
 }
 
 TEST(Ros2ControlExecutionBackendTest,
