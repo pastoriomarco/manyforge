@@ -2371,6 +2371,48 @@ TEST(ResourceAddressedExecutionKernelTest,
 }
 
 TEST(ResourceAddressedExecutionKernelTest,
+     StopCertificateReusesBackendPublishedTerminalResourceState) {
+  FakeClock clock;
+  FakeParticipantEngine engine;
+  ResourceAddressedExecutionKernel kernel(
+      {registration(
+          make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular),
+          engine)},
+      clock, default_journal,
+      {RequestOwnerEpoch("kernel.epoch.1"), CellId("cell.test"), 16U});
+
+  const auto accepted =
+      kernel.execute(motion_operation("request.motion.collision.backend-terminal"));
+  ASSERT_TRUE(accepted.ok()) << accepted.error().message;
+  engine.emit_transition(ExecutionState::kPlanning, ExecutionState::kExecuting);
+  engine.translate_stop_stage_hook = [&] {
+    engine.emit_transition(ExecutionState::kStopping, ExecutionState::kStopped);
+  };
+
+  engine.emit_collision();
+  std::optional<StopId> stop_id;
+  ASSERT_TRUE(wait_until([&] {
+    const auto operation = kernel.get_operation_state(accepted.value().operation_id);
+    if (!operation.ok() || !operation.value().active_stop_id.has_value()) {
+      return false;
+    }
+    stop_id = operation.value().active_stop_id;
+    const auto status = kernel.get_stop_status(*stop_id);
+    return status.ok() && status.value().state == StopStatusStateDTO::kSucceeded;
+  }));
+
+  const auto operation = kernel.get_operation_state(accepted.value().operation_id);
+  ASSERT_TRUE(operation.ok()) << operation.error().message;
+  EXPECT_EQ(operation.value().state, OperationStateKind::kStopped);
+  ASSERT_EQ(operation.value().participants.size(), 1U);
+  EXPECT_EQ(operation.value().participants.front().state, OperationStateKind::kStopped);
+  EXPECT_FALSE(operation.value().participants.front().terminal_error.has_value());
+  ASSERT_EQ(kernel.resource_snapshot().size(), 1U);
+  EXPECT_EQ(kernel.resource_snapshot().front().state, ResourceSlotState::kTerminal);
+  EXPECT_EQ(engine.translate_stop_stage_calls.load(), 1);
+}
+
+TEST(ResourceAddressedExecutionKernelTest,
      CoordinatedOverlapRejectsBeforePrepareAndLeavesTheResourceTableUnchanged) {
   FakeClock clock;
   FakeParticipantEngine first_engine;
@@ -2862,8 +2904,7 @@ TEST(ResourceAddressedExecutionKernelTest,
   FakeParticipantEngine engine;
   const auto binding =
       make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular);
-  auto unqualified = registration(binding, engine);
-  unqualified.stop_readiness.reset();
+  auto unqualified = unqualified_registration(binding, engine);
   unqualified.stop_execution_port = nullptr;
 
   ResourceAddressedExecutionKernel kernel(

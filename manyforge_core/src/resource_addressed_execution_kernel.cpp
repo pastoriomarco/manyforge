@@ -8224,16 +8224,24 @@ void ResourceAddressedExecutionKernel::ProgressStop(const StopControlWorkToken t
                   : OperationStateKind::kInterventionRequired;
         }
         operation->state.updated_at_ns = now;
-        const auto transitioned = resource_slots_->transition(active_participant->slot_owner,
-                                                              active_participant->resources,
-                                                              ResourceSlotState::kTerminal);
-        if (transitioned.ok()) {
-          active_participant->slot_state = ResourceSlotState::kTerminal;
-        } else {
-          motion_admission_closed_ = true;
-          operation->state.state = OperationStateKind::kInterventionRequired;
-          participant_state->state = OperationStateKind::kInterventionRequired;
-          participant_state->terminal_error = transitioned.error();
+        // A production Stop backend can publish its terminal state before the
+        // isolated Stop-stage result is consumed.  That callback already
+        // terminalizes the same resource slots under state_mutex_.  Treat the
+        // subsequent certificate commit as the same terminal fact instead of
+        // attempting the illegal Terminal -> Terminal transition and masking
+        // the original Stop outcome as an intervention.
+        if (active_participant->slot_state != ResourceSlotState::kTerminal) {
+          const auto transitioned = resource_slots_->transition(active_participant->slot_owner,
+                                                                active_participant->resources,
+                                                                ResourceSlotState::kTerminal);
+          if (transitioned.ok()) {
+            active_participant->slot_state = ResourceSlotState::kTerminal;
+          } else {
+            motion_admission_closed_ = true;
+            operation->state.state = OperationStateKind::kInterventionRequired;
+            participant_state->state = OperationStateKind::kInterventionRequired;
+            participant_state->terminal_error = transitioned.error();
+          }
         }
       }
 
