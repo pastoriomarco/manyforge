@@ -469,6 +469,56 @@ public:
     terminal_ = !running;
   }
 
+  void testing_install_prepared_goal_membership(
+      const core::ResolvedParticipantStopStageDTO &stage,
+      core::ContentDigest prepared_contract_digest) {
+    const auto execution_generation =
+        running_generation_.load(std::memory_order_acquire);
+    core::ExecutionHandle handle{
+        [this](std::int64_t timeout_ns) {
+          std::unique_lock<std::mutex> lock(execution_mutex_);
+          if (timeout_ns > 0) {
+            return execution_cv_.wait_for(
+                lock, std::chrono::nanoseconds(timeout_ns),
+                [this]() { return terminal_; });
+          }
+          return terminal_;
+        },
+        [this]() { return get_execution_snapshot(); },
+        execution_generation,
+        stage.controller_goal_id,
+        stage.controller_goal_generation,
+        prepared_contract_digest};
+    std::lock_guard<std::mutex> lock(prepared_execution_mutex_);
+    prepared_goals_.erase(stage.controller_goal_id);
+    prepared_goals_.emplace(
+        stage.controller_goal_id,
+        PreparedGoalRecord{
+            stage.controller_goal_generation,
+            std::move(prepared_contract_digest),
+            stage.operation_id,
+            stage.operation_revision,
+            stage.participant_id,
+            stage.controllable_component_id,
+            stage.command_target_id,
+            stage.capability_id,
+            stage.control_domain_id,
+            stage.control_domain_revision,
+            stage.control_binding_id,
+            stage.control_binding_revision,
+            stage.controller_topology_id,
+            stage.topology_revision,
+            stage.control_route_id,
+            stage.active_control_configuration_id,
+            stage.active_control_configuration_generation,
+            stage.provider_runtime_epoch,
+            stage.resources,
+            stage.stop_evidence_policy_id,
+            stage.stop_evidence_policy_revision,
+            {stage.participant_stop_plan},
+            std::move(handle)});
+  }
+
   void testing_store_action_feedback_sample(
       const std::vector<std::string> &joint_names,
       const std::vector<double> &positions,
@@ -769,6 +819,8 @@ private:
   };
 
   void validate_config() const;
+  core::StopResultDTO stop_if_running_generation(
+      std::optional<std::uint64_t> expected_running_generation);
   core::ExecutionHandle
   dispatch_prepared(const core::PreparedOperationParticipantDTO &participant,
                     const core::ControllerGoalId &controller_goal_id,
@@ -1052,6 +1104,33 @@ private:
   struct PreparedGoalRecord final {
     core::ControllerGoalGeneration generation;
     core::ContentDigest prepared_contract_digest;
+    // Retain the exact Stop-visible projection of the sealed participant used
+    // at Dispatch. A Stop stage does not carry the outer prepared-contract
+    // digest, so goal id/generation alone cannot prove membership. Keeping the
+    // bounded projection avoids retaining unrelated planning/collision data in
+    // the replay table while still joining every adapter-visible identity and
+    // every ordinary/interrupt Stop plan byte-for-byte.
+    core::OperationId operation_id;
+    core::OperationRevision operation_revision;
+    core::OperationParticipantId participant_id;
+    core::ControllableComponentId controllable_component_id;
+    core::CommandTargetId command_target_id;
+    core::CapabilityId capability_id;
+    core::ControlDomainId control_domain_id;
+    core::ControlDomainRevision control_domain_revision;
+    core::ControlBindingId control_binding_id;
+    core::ControlBindingRevision control_binding_revision;
+    core::ControllerTopologyId controller_topology_id;
+    core::TopologyRevision topology_revision;
+    core::ControlRouteId control_route_id;
+    core::ActiveControlConfigurationId active_control_configuration_id;
+    core::ActiveControlConfigurationGeneration
+        active_control_configuration_generation;
+    core::RuntimeEpoch provider_runtime_epoch;
+    std::vector<core::ResourceId> resources;
+    core::StopEvidencePolicyId stop_evidence_policy_id;
+    core::StopEvidencePolicyRevision stop_evidence_policy_revision;
+    std::vector<core::PreparedParticipantStopPlanDTO> stop_plans;
     core::ExecutionHandle handle;
   };
   static constexpr std::size_t kPreparedReplayCapacity = 4096U;

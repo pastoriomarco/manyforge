@@ -156,6 +156,66 @@ core::ResolvedParticipantStopStageDTO direct_stage_fixture() {
   const core::OperationId operation_id("operation.direct");
   const core::OperationRevision operation_revision(1U);
   const core::OperationParticipantId participant_id("participant.direct");
+  const auto binding = motion_binding("program.direct");
+  const auto &value = binding.value();
+  const auto &path = *value.control_path;
+  const std::vector<core::ResourceId> resources{value.resources.front().resource_id};
+  core::ResolvedStopRuntimeTargetDTO target{
+      path.provider_instance_id,
+      path.provider_manifest_id,
+      path.provider_manifest_revision,
+      path.provider_runtime_unit_id,
+      core::ProductId("product.ros2_control"),
+      core::ProductContractId("product.contract.ros2_control"),
+      core::ProductContractRevision("product-contract-revision"),
+      core::ContentDigest("runtime-target-digest"),
+      path.provider_runtime_epoch,
+      path.provider_runtime_epoch,
+      std::nullopt,
+      std::nullopt,
+      std::nullopt,
+      std::nullopt,
+      std::nullopt,
+      std::nullopt,
+      std::nullopt,
+      std::nullopt};
+  core::ResolvedStopEscalationStageDTO resolved_command{
+      0U,
+      core::StopEscalationStageId("stage.cancel"),
+      core::StopEscalationStageKind::kNominal,
+      core::ContainmentGranularity::kResource,
+      core::StopContainmentCommandDTO{
+          core::StopBudgetPhaseId("command"),
+          core::StopContainmentCommandKind::kControllerGoalCancel,
+          std::nullopt,
+          std::nullopt},
+      std::nullopt,
+      core::ResolvedStopCommandQualificationDTO{},
+      target,
+      core::ResolvedStopResourceContainmentScopeDTO{path.activation_set_id,
+                                                    resources},
+      core::StopEvidenceConjunction::kAllOf,
+      {core::ResolvedStopEvidenceRequirementDTO{
+          core::StopEvidenceRequirementDTO{
+              core::StopEvidenceItemId("goal.terminal"),
+              core::StopBudgetPhaseId("terminal"),
+              core::StopEvidenceRequirementKind::kControllerGoalTerminal,
+              std::nullopt,
+              std::nullopt,
+              core::StopEvidenceSourceRequirementDTO{
+                  core::StopEvidenceSourceKind::kControllerGoalStatus,
+                  100'000'000,
+                  std::nullopt,
+                  {}},
+              core::StopEvidenceObservationDTO{
+                  core::StopEvidenceObservationKind::kPostCommandSample,
+                  std::nullopt}},
+          core::ResolvedStopEvidenceSourceDTO{
+              core::StopEvidenceSourceKind::kControllerGoalStatus,
+              target,
+              std::nullopt,
+              std::nullopt,
+              std::nullopt}}}};
   return core::ResolvedParticipantStopStageDTO{
       core::StopId("stop.direct"),
       core::StopGeneration(1U),
@@ -164,42 +224,99 @@ core::ResolvedParticipantStopStageDTO direct_stage_fixture() {
       participant_id,
       core::ControllerGoalId("goal.direct"),
       core::ControllerGoalGeneration(1U),
-      core::ControllableComponentId("robot.1"),
-      core::CommandTargetId("arm.target"),
-      core::CapabilityId("execution.trajectory.execute"),
-      core::ControlDomainId("domain.arm"),
-      core::ControlDomainRevision("domain.revision"),
-      core::ControlBindingId("binding.arm"),
-      core::ControlBindingRevision("binding.revision"),
-      core::ActiveControlConfigurationId("active.arm"),
-      core::ActiveControlConfigurationGeneration(1U),
-      core::ControllerTopologyId("topology.arm"),
-      core::TopologyRevision("topology.revision"),
-      core::ControlRouteId("route.arm"),
+      value.controllable_component_id,
+      value.command_target_id,
+      value.capability_id,
+      path.control_domain_id,
+      path.control_domain_revision,
+      path.control_binding_id,
+      path.control_binding_revision,
+      path.active_control_configuration_id,
+      path.active_control_configuration_generation,
+      path.controller_topology_id,
+      path.topology_revision,
+      path.control_route_id,
       std::nullopt,
       std::nullopt,
-      core::RuntimeEpoch("runtime.epoch"),
-      {},
+      path.provider_runtime_epoch,
+      resources,
       core::ContainmentGranularity::kResource,
-      core::StopEvidencePolicyId("policy.arm"),
-      core::StopEvidencePolicyRevision("policy.revision"),
+      path.stop_evidence_policy_id,
+      path.stop_evidence_policy_revision,
       core::PreparedParticipantStopPlanDTO{
           core::ContentDigest("plan.digest"),
           core::ResolvedStopBasePlanId("base.plan"),
           operation_id,
           operation_revision,
           participant_id,
-          core::ProgramId("program.direct"),
-          core::ProgramRevision("program.revision"),
-          core::ProgramBindingId("program.binding"),
+          value.program_id,
+          value.program_revision,
+          value.program_binding_id,
           core::ProgramRunId("program.run"),
           std::nullopt,
           core::ParticipantStopProfilePurposeDTO::kOrdinary,
           std::nullopt,
-          core::StopDeadlineBudgetDTO{1'000'000'000, 1, {}},
-          {}},
+          core::StopDeadlineBudgetDTO{
+              1'000'000'000,
+              100'000'000,
+              {{core::StopBudgetPhaseId("command"), 500'000'000},
+               {core::StopBudgetPhaseId("terminal"), 900'000'000}}},
+          {core::PreparedStopStageCommandDTO{std::move(resolved_command),
+                                             std::nullopt, std::nullopt}}},
       0U,
       core::ContentDigest("scope.digest")};
+}
+
+core::ResolvedParticipantStopStageDTO software_hard_stage_fixture() {
+  auto stage = direct_stage_fixture();
+  auto &command =
+      stage.participant_stop_plan.stage_commands.front().resolved_stage;
+  command.stop_escalation_stage_id =
+      core::StopEscalationStageId("stage.software_hard");
+  command.stage_kind = core::StopEscalationStageKind::kSoftwareHard;
+  command.containment_command = core::StopContainmentCommandDTO{
+      core::StopBudgetPhaseId("hard_command"),
+      core::StopContainmentCommandKind::kRegistered,
+      std::nullopt,
+      core::RegisteredStopCommandKindId("manyforge.stop.software_hard")};
+  auto &evidence = command.evidence_requirements.front();
+  evidence.requirement.evidence_item_id =
+      core::StopEvidenceItemId("hard.rest");
+  evidence.requirement.phase_id = core::StopBudgetPhaseId("hard_terminal");
+  evidence.requirement.evidence_kind =
+      core::StopEvidenceRequirementKind::kMotionRest;
+  evidence.requirement.source_requirement =
+      core::StopEvidenceSourceRequirementDTO{
+          core::StopEvidenceSourceKind::kBindingStateAuthority,
+          100'000'000,
+          std::nullopt,
+          {core::StateAuthorityClass::kCommanded}};
+  evidence.requirement.observation_semantics =
+      core::StopEvidenceObservationDTO{
+          core::StopEvidenceObservationKind::kPostCommandDwell, 10'000'000};
+  const auto binding = motion_binding("program.direct");
+  const auto &path = *binding.value().control_path;
+  evidence.resolved_source.source_kind =
+      core::StopEvidenceSourceKind::kBindingStateAuthority;
+  evidence.resolved_source.state_authority_id = path.state_authority_id;
+  evidence.resolved_source.state_authority_class = path.state_authority_class;
+  stage.participant_stop_plan.deadline_budget.phases = {
+      {core::StopBudgetPhaseId("hard_command"), 500'000'000},
+      {core::StopBudgetPhaseId("hard_terminal"), 900'000'000}};
+  return stage;
+}
+
+core::RemainingStopBudgetDTO
+remaining_budget(const core::ResolvedParticipantStopStageDTO &stage) {
+  core::RemainingStopBudgetDTO budget{
+      stage.stop_id, stage.stop_generation,
+      stage.participant_stop_plan.deadline_budget.outer_duration_ns, {}};
+  for (const auto &phase :
+       stage.participant_stop_plan.deadline_budget.phases) {
+    budget.phases.push_back(
+        {phase.phase_id, phase.deadline_offset_ns});
+  }
+  return budget;
 }
 
 ControllerBindingContract
@@ -1103,15 +1220,21 @@ TEST(Ros2ControlExecutionBackendTest,
 
 TEST(Ros2ControlExecutionBackendTest,
      DirectStageFailsBeforeEffectWhenPreparedGoalMembershipIsUnavailable) {
+  auto config = base_config();
+  config.prepared_participant_binding = motion_binding("program.direct");
+  config.transport_joint_names = {"source_joint_1"};
   auto sink = std::make_shared<RecordingExecutionStateSink>();
   core::FakeClock clock;
   core::ManualScheduler scheduler;
   Ros2ControlExecutionBackend backend(
       Ros2ControlExecutionBackend::TestingNoRosStartupTag{}, sink, "arm", clock,
-      scheduler, base_config());
+      scheduler, std::move(config));
   const auto stage = direct_stage_fixture();
   const core::RemainingStopBudgetDTO budget{
-      stage.stop_id, stage.stop_generation, 1'000'000'000, {}};
+      stage.stop_id,
+      stage.stop_generation,
+      1'000'000'000,
+      {{core::StopBudgetPhaseId("command"), 500'000'000}}};
 
   const auto result =
       backend.TranslateStopStage(stage, budget, std::stop_token{});
@@ -1125,6 +1248,96 @@ TEST(Ros2ControlExecutionBackendTest,
             "resolved_stop_stage_dispatch_membership_unavailable");
   EXPECT_EQ(backend.get_execution_snapshot().state,
             core::ExecutionState::kIdle);
+}
+
+TEST(Ros2ControlExecutionBackendTest,
+     ExactPreparedGoalCancelReturnsTerminalEvidenceAndCannotCrossDrive) {
+  auto config = base_config();
+  config.execution_state_source_mode = "commanded_sim";
+  config.initial_joint_positions_rad = {0.0};
+  config.prepared_participant_binding = motion_binding("program.direct");
+  config.transport_joint_names = {"source_joint_1"};
+  auto sink = std::make_shared<RecordingExecutionStateSink>();
+  core::FakeClock clock;
+  clock.set(1'000'000'000);
+  core::ManualScheduler scheduler;
+  Ros2ControlExecutionBackend backend(
+      Ros2ControlExecutionBackend::TestingNoRosStartupTag{}, sink, "arm", clock,
+      scheduler, std::move(config));
+  const auto stage = direct_stage_fixture();
+
+  backend.testing_set_running_state(true);
+  ASSERT_TRUE(backend.testing_publish_snapshot(core::ExecutionState::kExecuting,
+                                               {0.0}));
+  backend.testing_install_prepared_goal_membership(
+      stage, core::ContentDigest("prepared.direct"));
+  const auto result = backend.TranslateStopStage(
+      stage, remaining_budget(stage), std::stop_token{});
+
+  EXPECT_EQ(result.attempt_disposition,
+            core::StopStageAttemptDispositionDTO::kDispatched);
+  EXPECT_EQ(result.outcome,
+            core::ParticipantStopStageOutcomeDTO::kSucceeded);
+  ASSERT_EQ(result.evidence_items.size(), 1U);
+  EXPECT_EQ(result.evidence_items.front().state,
+            core::StopEvidenceItemStateDTO::kSatisfied);
+  ASSERT_TRUE(result.controller_acknowledgement_sequence.has_value());
+  EXPECT_EQ(backend.get_execution_snapshot().state,
+            core::ExecutionState::kStopped);
+
+  backend.testing_set_running_state(true);
+  ASSERT_TRUE(backend.testing_publish_snapshot(core::ExecutionState::kExecuting,
+                                               {0.25}));
+  const auto crossed = backend.TranslateStopStage(
+      stage, remaining_budget(stage), std::stop_token{});
+  EXPECT_EQ(crossed.attempt_disposition,
+            core::StopStageAttemptDispositionDTO::kNotDispatched);
+  EXPECT_EQ(crossed.outcome, core::ParticipantStopStageOutcomeDTO::kFailed);
+  ASSERT_TRUE(crossed.error.has_value());
+  EXPECT_EQ(crossed.error->details.at("reason"),
+            "prepared_goal_not_active");
+  EXPECT_EQ(backend.get_execution_snapshot().state,
+            core::ExecutionState::kExecuting);
+  EXPECT_TRUE(backend.stop().accepted);
+}
+
+TEST(Ros2ControlExecutionBackendTest,
+     ExactPreparedSoftwareHardStopRequiresBoundedAddressedRestEvidence) {
+  auto config = base_config();
+  config.execution_state_source_mode = "commanded_sim";
+  config.initial_joint_positions_rad = {0.0};
+  config.prepared_participant_binding = motion_binding("program.direct");
+  config.transport_joint_names = {"source_joint_1"};
+  auto sink = std::make_shared<RecordingExecutionStateSink>();
+  core::FakeClock clock;
+  clock.set(1'000'000'000);
+  core::ManualScheduler scheduler;
+  Ros2ControlExecutionBackend backend(
+      Ros2ControlExecutionBackend::TestingNoRosStartupTag{}, sink, "arm", clock,
+      scheduler, std::move(config));
+  const auto stage = software_hard_stage_fixture();
+
+  backend.testing_set_running_state(true);
+  ASSERT_TRUE(backend.testing_publish_snapshot(core::ExecutionState::kExecuting,
+                                               {0.0}));
+  backend.testing_install_prepared_goal_membership(
+      stage, core::ContentDigest("prepared.software_hard"));
+  const auto result = backend.TranslateStopStage(
+      stage, remaining_budget(stage), std::stop_token{});
+
+  EXPECT_EQ(result.attempt_disposition,
+            core::StopStageAttemptDispositionDTO::kDispatched);
+  EXPECT_EQ(result.outcome,
+            core::ParticipantStopStageOutcomeDTO::kSucceeded);
+  ASSERT_EQ(result.evidence_items.size(), 1U);
+  EXPECT_EQ(result.evidence_items.front().required_class,
+            core::StopEvidenceRequirementKind::kMotionRest);
+  EXPECT_EQ(result.evidence_items.front().state,
+            core::StopEvidenceItemStateDTO::kSatisfied);
+  ASSERT_TRUE(result.source_epoch.has_value());
+  ASSERT_TRUE(result.source_sequence.has_value());
+  EXPECT_EQ(backend.get_execution_snapshot().state,
+            core::ExecutionState::kStopped);
 }
 
 TEST(Ros2ControlExecutionBackendTest,
