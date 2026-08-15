@@ -440,6 +440,7 @@ def test_cclc_startup_uses_fresh_owner_templates_and_full_binding_sets(
         def __init__(self) -> None:
             self.state = "declared"
             self.generation = 1
+            self.execution_status_calls = 0
             self.lifecycle_requests = []
             self.route_requests = []
             self.lifecycle_statuses = {}
@@ -467,12 +468,42 @@ def test_cclc_startup_uses_fresh_owner_templates_and_full_binding_sets(
                 ],
             }
 
-        @staticmethod
-        def execution_status():
+        def execution_status(self):
+            self.execution_status_calls += 1
+            ready = self.execution_status_calls >= 3
             return {
                 "ok": True,
                 "command": "status",
-                "status": {"owner_epoch": "kernel-owner.runtime.1"},
+                "status": {
+                    "owner_epoch": "kernel-owner.runtime.1",
+                    "ros2_control_lifecycle_observation": {
+                        "schema_version": (
+                            live._ROS2_CONTROL_LIFECYCLE_OBSERVATION_SCHEMA
+                        ),
+                        "ready": ready,
+                        "domains": [
+                            {
+                                "component_lifecycle_state": (
+                                    "active" if ready else "degraded"
+                                ),
+                                "control_domain_id": domain_id,
+                                "exact_controller_configuration_active": ready,
+                                "facts": [
+                                    {
+                                        "lifecycle_fact_id": fact_id,
+                                        "value": value if ready else False,
+                                    }
+                                    for fact_id, value in sorted(
+                                        live._ROS2_CONTROL_LIFECYCLE_READY_FACTS.items()
+                                    )
+                                ],
+                                "ready": ready,
+                                "source_generation": self.execution_status_calls,
+                            }
+                            for domain_id in sorted(self.bindings)
+                        ],
+                    },
+                },
             }
 
         def cclc_component(self, component_id):
@@ -607,6 +638,8 @@ def test_cclc_startup_uses_fresh_owner_templates_and_full_binding_sets(
     assert evidence["passed"] is True
     assert evidence["initial"] == {"generation": 1, "state": "declared"}
     assert evidence["final"] == {"generation": 3, "state": "active"}
+    assert evidence["external_readiness"]["ready"] is True
+    assert client.execution_status_calls >= 3
     assert [row["intent"] for row in evidence["lifecycle"]] == [
         "prepare",
         "enable",

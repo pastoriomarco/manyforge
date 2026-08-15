@@ -6083,6 +6083,100 @@ public:
   }
 
 private:
+#if defined(MANYFORGE_ROS2_CONTROL_EXECUTION_HOST)
+  [[nodiscard]] CanonicalValue
+  Ros2ControlLifecycleObservationValue(Composition &composition) const {
+    Require(composition.ros2_control_runtime_handle != nullptr &&
+                composition.runtime != nullptr &&
+                composition.runtime->clock != nullptr,
+            "ROS lifecycle status has no selected observer or clock");
+
+    std::vector<core::ControlDomainId> domain_ids;
+    domain_ids.reserve(2U);
+    for (const auto *binding : {&composition.direct_control_motion_binding,
+                                &composition.direct_control_gripper_binding}) {
+      Require(binding->value().control_path.has_value(),
+              "ROS lifecycle status binding has no retained control path");
+      domain_ids.push_back(binding->value().control_path->control_domain_id);
+    }
+    std::sort(domain_ids.begin(), domain_ids.end());
+    domain_ids.erase(std::unique(domain_ids.begin(), domain_ids.end()),
+                     domain_ids.end());
+    Require(!domain_ids.empty(),
+            "ROS lifecycle status has no retained control domain");
+
+    const auto now_ns = composition.runtime->clock->now();
+    bool every_domain_ready = true;
+    CanonicalValue::Array domains;
+    domains.reserve(domain_ids.size());
+    for (const auto &domain_id : domain_ids) {
+      const auto sampled =
+          composition.ros2_control_runtime_handle->ReadLifecycleSnapshot(
+              domain_id, now_ns);
+      if (!sampled.ok()) {
+        Fail("ROS lifecycle status observation failed: " +
+             sampled.error().message);
+      }
+      const auto &observation = sampled.value();
+      Require(observation.locally_valid(),
+              "ROS lifecycle status observation is malformed");
+
+      std::optional<bool> controller_configuration_ready;
+      std::optional<bool> fault_present;
+      std::optional<bool> transport_ready;
+      CanonicalValue::Array facts;
+      facts.reserve(observation.facts.size());
+      for (const auto &fact : observation.facts) {
+        Require(fact.locally_valid() &&
+                    fact.value.kind ==
+                        core::LifecycleFactValueKindDTO::kBoolean &&
+                    fact.value.boolean_value.has_value(),
+                "ROS lifecycle status fact is not one exact boolean");
+        const auto &fact_id = fact.lifecycle_fact_id.value();
+        const bool value = *fact.value.boolean_value;
+        if (fact_id == "external.controller_configuration_ready") {
+          controller_configuration_ready = value;
+        } else if (fact_id == "external.fault_present") {
+          fault_present = value;
+        } else if (fact_id == "external.transport_ready") {
+          transport_ready = value;
+        }
+        facts.emplace_back(CanonicalValue::Object{
+            {"lifecycle_fact_id", CanonicalValue(fact_id)},
+            {"value", CanonicalValue(value)},
+        });
+      }
+      Require(controller_configuration_ready.has_value() &&
+                  fault_present.has_value() && transport_ready.has_value(),
+              "ROS lifecycle status omits one retained readiness fact");
+      const bool ready = observation.component_state ==
+                             core::ComponentLifecycleStateDTO::kActive &&
+                         observation.exact_controller_configuration_active &&
+                         *controller_configuration_ready && !*fault_present &&
+                         *transport_ready;
+      every_domain_ready = every_domain_ready && ready;
+      domains.emplace_back(CanonicalValue::Object{
+          {"component_lifecycle_state",
+           CanonicalValue(
+               std::string(core::to_string(observation.component_state)))},
+          {"control_domain_id", CanonicalValue(domain_id.value())},
+          {"exact_controller_configuration_active",
+           CanonicalValue(observation.exact_controller_configuration_active)},
+          {"facts", CanonicalValue(std::move(facts))},
+          {"ready", CanonicalValue(ready)},
+          {"source_generation",
+           CanonicalValue(static_cast<double>(observation.source_generation))},
+      });
+    }
+    return CanonicalValue(CanonicalValue::Object{
+        {"domains", CanonicalValue(std::move(domains))},
+        {"ready", CanonicalValue(every_domain_ready)},
+        {"schema_version",
+         CanonicalValue("manyforge.ros2_control_lifecycle_observation.v1")},
+    });
+  }
+#endif
+
   [[nodiscard]] CanonicalValue DirectControlStatusValue(
       Composition &composition,
       const core::ObservedStateSnapshotDTO &observed_state) const {
@@ -6398,6 +6492,10 @@ private:
               CanonicalValue(status_program.program_revision.value())},
              {"retained_bundle_id",
               CanonicalValue(bundle.retained_bundle_id().value())},
+#if defined(MANYFORGE_ROS2_CONTROL_EXECUTION_HOST)
+             {"ros2_control_lifecycle_observation",
+              Ros2ControlLifecycleObservationValue(composition)},
+#endif
              {"scene_revision",
               SceneRevisionValue(status_projection.scene_revision)},
          })},

@@ -53,6 +53,14 @@ _OBJECT_MOTION_MINIMUM_M: Final = 0.05
 _GRIPPER_TOLERANCE_BY_PROFILE: Final = {"lite6": 0.004, "ur10e": 0.04}
 _RECOVERY_BOUND_S: Final = 60.0
 _CCLC_STARTUP_SCHEMA: Final = "manyforge.i9_cclc_startup.v1"
+_ROS2_CONTROL_LIFECYCLE_OBSERVATION_SCHEMA: Final = (
+    "manyforge.ros2_control_lifecycle_observation.v1"
+)
+_ROS2_CONTROL_LIFECYCLE_READY_FACTS: Final = {
+    "external.controller_configuration_ready": True,
+    "external.fault_present": False,
+    "external.transport_ready": True,
+}
 # The launch barrier owns two fresh, 30-second-bounded service calls to force
 # and read back STOPPED even after its startup deadline expires.
 _SCENE_BARRIER_CLEANUP_MARGIN_S: Final = 65.0
@@ -784,14 +792,187 @@ def _wait_for_cclc_terminal(
                 raise LiveRowError(
                     f"CCLC {label} failed: "
                     + json.dumps(
-                        _summary(status), separators=(",", ":"), sort_keys=True
+                        _cclc_status_diagnostic(status),
+                        separators=(",", ":"),
+                        sort_keys=True,
                     )
                 )
             return status
         time.sleep(0.05)
     raise LiveRowError(
         f"CCLC {label} did not become terminal: "
-        + json.dumps(_summary(last), separators=(",", ":"), sort_keys=True)
+        + json.dumps(
+            _cclc_status_diagnostic(last),
+            separators=(",", ":"),
+            sort_keys=True,
+        )
+    )
+
+
+def _bounded_error(value: object) -> dict[str, Any] | None:
+    if not isinstance(value, dict):
+        return None
+    details = value.get("details")
+    reason = details.get("reason") if isinstance(details, dict) else None
+    result = {
+        "code": value.get("code"),
+        "message": (
+            value.get("message")[:256]
+            if isinstance(value.get("message"), str)
+            else None
+        ),
+        "reason": reason if isinstance(reason, str) else None,
+    }
+    return {key: item for key, item in result.items() if item is not None}
+
+
+def _cclc_status_diagnostic(value: object) -> dict[str, Any] | None:
+    if not isinstance(value, dict):
+        return None
+    domains = value.get("domains")
+    domain_rows = []
+    if isinstance(domains, list):
+        for domain in domains[:16]:
+            if not isinstance(domain, dict):
+                continue
+            domain_rows.append(
+                {
+                    "action_state": domain.get("action_state"),
+                    "control_domain_id": domain.get("control_domain_id"),
+                    "current_state": domain.get("current_state"),
+                    "effect": domain.get("effect"),
+                    "error": _bounded_error(domain.get("error")),
+                }
+            )
+    return {
+        "domains": domain_rows,
+        "error": _bounded_error(value.get("error")),
+        "phase": value.get("phase"),
+        "status_sequence": value.get("status_sequence"),
+        "terminal_result": value.get("terminal_result"),
+    }
+
+
+def _validate_ros2_control_lifecycle_observation(
+    value: object,
+    *,
+    expected_domain_ids: Sequence[str],
+) -> bool:
+    if not isinstance(value, dict):
+        raise LiveRowError("execution status omitted ROS lifecycle observation")
+    if value.get("schema_version") != (
+        _ROS2_CONTROL_LIFECYCLE_OBSERVATION_SCHEMA
+    ):
+        raise LiveRowError("ROS lifecycle observation schema is not exact")
+    domains = value.get("domains")
+    if not isinstance(domains, list) or not domains:
+        raise LiveRowError("ROS lifecycle observation has no domains")
+    observed_domain_ids = [
+        row.get("control_domain_id") if isinstance(row, dict) else None
+        for row in domains
+    ]
+    if observed_domain_ids != list(expected_domain_ids):
+        raise LiveRowError("ROS lifecycle observation crosses its CCLC domains")
+
+    domain_ready: list[bool] = []
+    expected_fact_ids = sorted(_ROS2_CONTROL_LIFECYCLE_READY_FACTS)
+    for row in domains:
+        if not isinstance(row, dict):
+            raise LiveRowError("ROS lifecycle observation domain is not an object")
+        generation = row.get("source_generation")
+        facts = row.get("facts")
+        if type(generation) is not int or generation < 1:
+            raise LiveRowError("ROS lifecycle observation generation is invalid")
+        if not isinstance(facts, list):
+            raise LiveRowError("ROS lifecycle observation facts are absent")
+        fact_ids = [
+            fact.get("lifecycle_fact_id")
+            if isinstance(fact, dict)
+            else None
+            for fact in facts
+        ]
+        if fact_ids != expected_fact_ids:
+            raise LiveRowError("ROS lifecycle observation facts are not exact")
+        fact_values = {
+            fact["lifecycle_fact_id"]: fact.get("value")
+            for fact in facts
+            if isinstance(fact, dict)
+        }
+        if any(type(item) is not bool for item in fact_values.values()):
+            raise LiveRowError("ROS lifecycle observation fact is not boolean")
+        ready = bool(
+            row.get("component_lifecycle_state") == "active"
+            and row.get("exact_controller_configuration_active") is True
+            and fact_values == _ROS2_CONTROL_LIFECYCLE_READY_FACTS
+        )
+        if row.get("ready") is not ready:
+            raise LiveRowError("ROS lifecycle observation readiness is incoherent")
+        domain_ready.append(ready)
+    ready = all(domain_ready)
+    if value.get("ready") is not ready:
+        raise LiveRowError("aggregate ROS lifecycle readiness is incoherent")
+    return ready
+
+
+def _ros2_control_lifecycle_diagnostic(value: object) -> dict[str, Any] | None:
+    if not isinstance(value, dict):
+        return None
+    domains = value.get("domains")
+    rows = []
+    if isinstance(domains, list):
+        for domain in domains[:16]:
+            if not isinstance(domain, dict):
+                continue
+            facts = domain.get("facts")
+            rows.append(
+                {
+                    "component_lifecycle_state": domain.get(
+                        "component_lifecycle_state"
+                    ),
+                    "control_domain_id": domain.get("control_domain_id"),
+                    "facts": facts if isinstance(facts, list) else None,
+                    "ready": domain.get("ready"),
+                    "source_generation": domain.get("source_generation"),
+                }
+            )
+    return {"domains": rows, "ready": value.get("ready")}
+
+
+def _wait_for_ros2_control_lifecycle_readiness(
+    client: HeadlessHttpClient,
+    *,
+    expected_owner_epoch: str,
+    expected_domain_ids: Sequence[str],
+    timeout_s: float,
+) -> dict[str, Any]:
+    deadline = time.monotonic() + timeout_s
+    last: object = None
+    while time.monotonic() < deadline:
+        response = client.execution_status()
+        status = response.get("status") if isinstance(response, dict) else None
+        if (
+            not isinstance(response, dict)
+            or response.get("ok") is not True
+            or response.get("command") != "status"
+            or not isinstance(status, dict)
+            or status.get("owner_epoch") != expected_owner_epoch
+        ):
+            raise LiveRowError(
+                "execution owner changed while awaiting ROS lifecycle readiness"
+            )
+        last = status.get("ros2_control_lifecycle_observation")
+        if _validate_ros2_control_lifecycle_observation(
+            last, expected_domain_ids=expected_domain_ids
+        ):
+            return last
+        time.sleep(0.05)
+    raise LiveRowError(
+        "ROS lifecycle observation did not become ready: "
+        + json.dumps(
+            _ros2_control_lifecycle_diagnostic(last),
+            separators=(",", ":"),
+            sort_keys=True,
+        )
     )
 
 
@@ -835,6 +1016,12 @@ def _prepare_and_select_cclc_routes(
         raise LiveRowError("fresh CCLC component snapshot is not declared and exact")
     _initial_domains, initial_bindings = _lifecycle_expected_domains(initial)
     domain_ids = sorted(initial_bindings)
+    external_readiness = _wait_for_ros2_control_lifecycle_readiness(
+        client,
+        expected_owner_epoch=request_owner_epoch,
+        expected_domain_ids=domain_ids,
+        timeout_s=timeout_s,
+    )
     lifecycle_rows: list[dict[str, Any]] = []
     correlation_id = f"i9.{spec.scenario_id}.cclc"
 
@@ -1030,6 +1217,18 @@ def _prepare_and_select_cclc_routes(
         "final": {
             "generation": final["component_lifecycle_generation"],
             "state": final["component_lifecycle_state"],
+        },
+        "external_readiness": {
+            "digest": _digest(_json_bytes(external_readiness)),
+            "domains": [
+                {
+                    "control_domain_id": row["control_domain_id"],
+                    "source_generation": row["source_generation"],
+                }
+                for row in external_readiness["domains"]
+            ],
+            "ready": True,
+            "schema_version": external_readiness["schema_version"],
         },
         "lifecycle": lifecycle_rows,
         "routes": route_rows,
