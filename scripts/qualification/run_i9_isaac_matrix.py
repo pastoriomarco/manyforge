@@ -15,6 +15,7 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 import hashlib
 import json
+import math
 import os
 from pathlib import Path
 import re
@@ -25,9 +26,13 @@ from manyforge_behavior.canonical_artifact import load_strict_json_yaml
 
 
 MATRIX_SCHEMA: Final = "manyforge.i9_isaac_matrix.v1"
+MATRIX_EVIDENCE_SCHEMA: Final = "manyforge.i9_isaac_matrix_evidence.v1"
 PREFLIGHT_SCHEMA: Final = "manyforge.i9_isaac_preflight.v1"
 ROW_SCHEMA: Final = "manyforge.i9_isaac_row.v1"
 WORLD_MANIFEST_SCHEMA: Final = "manyforge.i9_isaac_world_manifest.v1"
+CLOCK_EVIDENCE_SCHEMA: Final = "manyforge.i9_cross_host_clock.v1"
+STATIC_PROBES_SCHEMA: Final = "manyforge.i9_static_probes.v1"
+RECOVERY_EVIDENCE_SCHEMA: Final = "manyforge.i9_isaac_recovery.v1"
 
 EXPECTED_DDS: Final = {
     "ROS_DOMAIN_ID": "0",
@@ -45,6 +50,10 @@ STALE_DDS_KEYS: Final = (
 SHA256_PATTERN: Final = re.compile(r"^[0-9a-f]{64}$")
 MAX_JSON_BYTES: Final = 8 * 1024 * 1024
 MAX_CHECK_DETAIL_CHARS: Final = 4096
+CLOCK_SAMPLE_COUNT: Final = 7
+CLOCK_MAX_ABS_OFFSET_NS: Final = 250_000_000
+CLOCK_MAX_ROUND_TRIP_NS: Final = 1_000_000_000
+RECOVERY_BOUND_S: Final = 60.0
 TOPIC_TYPE_BY_NAME: Final = {
     "/clock": "rosgraph_msgs/msg/Clock",
     "/isaac_gripper_state": "sensor_msgs/msg/JointState",
@@ -87,6 +96,29 @@ MATRIX_CHECKS: Final = frozenset(
         "two_same_type_instances_isolated",
     }
 )
+PROBE_CONTRACTS: Final = {
+    "demo_supervisor_absent": (
+        "pytest",
+        "manyforge_ros_bringup/tests/"
+        "test_isaac_topic_based_control_launch.py::"
+        "test_demo_supervisor_entrypoint_has_no_backup_owner",
+    ),
+    "direct_controller_route": (
+        "gtest",
+        "RetainedRos2ControlBackendFactoryTest."
+        "RetainedIsaacProfileExpandsToExactControllerAndGripperContract",
+    ),
+    "representative_chained_controller_route": (
+        "gtest",
+        "VerifiedControllerLifecycleExpectedDomainTest."
+        "ChainedProductPreservesCompleteTopologyOrderAndSelectedEndpoints",
+    ),
+    "two_same_type_instances_isolated": (
+        "gtest",
+        "RetainedRos2ControlBackendFactoryTest."
+        "SameTypeIsaacInstancesHaveDisjointControlPlaneEndpoints",
+    ),
+}
 
 
 @dataclass(frozen=True, slots=True)
@@ -520,13 +552,369 @@ def validate_row(value: Any) -> dict[str, Any]:
     return row
 
 
+def validate_clock_evidence(value: Any) -> tuple[dict[str, Any], bool]:
+    """Validate raw cross-host samples and derive the synchronized verdict."""
+
+    evidence = _object(value, label="clock evidence")
+    if set(evidence) != {"hosts", "samples", "schema_version"}:
+        raise QualificationError("clock evidence fields differ from the v1 schema")
+    if evidence["schema_version"] != CLOCK_EVIDENCE_SCHEMA:
+        raise QualificationError("clock evidence schema is not I9 v1")
+    hosts = _object(evidence["hosts"], label="clock hosts")
+    if set(hosts) != {"laptop", "orin"}:
+        raise QualificationError("clock evidence must contain laptop and Orin")
+    normalized_hosts: dict[str, Any] = {}
+    hosts_synchronized = True
+    for label, expected_hostname, expected_address in (
+        ("laptop", "tndlux-G16", "192.168.1.132"),
+        ("orin", "localhost.localdomain", "192.168.1.68"),
+    ):
+        host = _object(hosts[label], label=f"{label} clock host")
+        required = {
+            "address",
+            "clock_synchronized",
+            "hostname",
+            "synchronization_marker",
+        }
+        if set(host) != required:
+            raise QualificationError(
+                f"{label} clock host fields differ from the v1 schema"
+            )
+        if host["hostname"] != expected_hostname:
+            raise QualificationError(f"clock evidence selected another {label}")
+        if host["address"] != expected_address:
+            raise QualificationError(
+                f"clock evidence selected another {label} address"
+            )
+        synchronized = _boolean(
+            host["clock_synchronized"], label=f"{label} clock synchronized"
+        )
+        marker = _boolean(
+            host["synchronization_marker"],
+            label=f"{label} synchronization marker",
+        )
+        hosts_synchronized = hosts_synchronized and synchronized and marker
+        normalized_hosts[label] = {
+            "address": expected_address,
+            "clock_synchronized": synchronized,
+            "hostname": expected_hostname,
+            "synchronization_marker": marker,
+        }
+
+    samples = _object_rows(evidence["samples"], label="clock samples")
+    if len(samples) != CLOCK_SAMPLE_COUNT:
+        raise QualificationError(
+            f"clock evidence requires exactly {CLOCK_SAMPLE_COUNT} samples"
+        )
+    offsets: list[int] = []
+    round_trips: list[int] = []
+    for sample in samples:
+        if set(sample) != {"local_receive_ns", "local_send_ns", "remote_ns"}:
+            raise QualificationError(
+                "clock sample fields differ from the v1 schema"
+            )
+        sent = _integer(
+            sample["local_send_ns"], label="clock sample local send", minimum=1
+        )
+        received = _integer(
+            sample["local_receive_ns"],
+            label="clock sample local receive",
+            minimum=sent,
+        )
+        remote = _integer(
+            sample["remote_ns"], label="clock sample remote", minimum=1
+        )
+        round_trips.append(received - sent)
+        offsets.append(remote - ((sent + received) // 2))
+    maximum_offset = max(abs(offset) for offset in offsets)
+    maximum_round_trip = max(round_trips)
+    passed = bool(
+        hosts_synchronized
+        and maximum_offset <= CLOCK_MAX_ABS_OFFSET_NS
+        and maximum_round_trip <= CLOCK_MAX_ROUND_TRIP_NS
+    )
+    return {
+        "hosts": normalized_hosts,
+        "maximum_abs_midpoint_offset_ns": maximum_offset,
+        "maximum_round_trip_ns": maximum_round_trip,
+        "sample_count": len(samples),
+    }, passed
+
+
+def validate_static_probes(
+    value: Any,
+) -> tuple[dict[str, Any], dict[str, bool]]:
+    """Validate exact test selectors and derive their four pass/fail facts."""
+
+    evidence = _object(value, label="static probe evidence")
+    if set(evidence) != {"probes", "schema_version", "source"}:
+        raise QualificationError(
+            "static probe evidence fields differ from the v1 schema"
+        )
+    if evidence["schema_version"] != STATIC_PROBES_SCHEMA:
+        raise QualificationError("static probe evidence schema is not I9 v1")
+    source = _object(evidence["source"], label="static probe source")
+    if set(source) != {"commit", "dirty", "tree"}:
+        raise QualificationError("static probe source fields differ from v1")
+    commit = _git_oid(source["commit"], label="static probe source commit")
+    tree = _git_oid(source["tree"], label="static probe source tree")
+    clean = not _boolean(source["dirty"], label="static probe source dirty")
+
+    rows = _object_rows(evidence["probes"], label="static probes")
+    by_id: dict[str, dict[str, Any]] = {}
+    for row in rows:
+        required = {
+            "elapsed_s",
+            "kind",
+            "output_bytes",
+            "output_sha256",
+            "probe_id",
+            "returncode",
+            "selector",
+            "subject_sha256",
+        }
+        if set(row) != required:
+            raise QualificationError("static probe row fields differ from v1")
+        probe_id = _text(row["probe_id"], label="static probe id")
+        if probe_id in by_id:
+            raise QualificationError(f"duplicate static probe: {probe_id}")
+        by_id[probe_id] = row
+    if set(by_id) != set(PROBE_CONTRACTS):
+        raise QualificationError("static probes differ from the frozen I9 set")
+
+    normalized_rows: list[dict[str, Any]] = []
+    checks: dict[str, bool] = {}
+    for probe_id in sorted(PROBE_CONTRACTS):
+        row = by_id[probe_id]
+        expected_kind, expected_selector = PROBE_CONTRACTS[probe_id]
+        if row["kind"] != expected_kind or row["selector"] != expected_selector:
+            raise QualificationError(
+                f"static probe {probe_id} selected another test"
+            )
+        output_bytes = _integer(
+            row["output_bytes"],
+            label=f"{probe_id} output bytes",
+            minimum=0,
+            maximum=MAX_JSON_BYTES,
+        )
+        returncode = _integer(
+            row["returncode"],
+            label=f"{probe_id} return code",
+            minimum=-255,
+            maximum=255,
+        )
+        elapsed = _number(
+            row["elapsed_s"],
+            label=f"{probe_id} elapsed",
+            minimum=0.0,
+            maximum=600.0,
+        )
+        output_digest = _sha256(
+            row["output_sha256"], label=f"{probe_id} output sha256"
+        )
+        subject_digest = _sha256(
+            row["subject_sha256"], label=f"{probe_id} subject sha256"
+        )
+        checks[probe_id] = bool(clean and returncode == 0 and output_bytes > 0)
+        normalized_rows.append(
+            {
+                "elapsed_s": elapsed,
+                "kind": expected_kind,
+                "output_bytes": output_bytes,
+                "output_sha256": output_digest,
+                "probe_id": probe_id,
+                "returncode": returncode,
+                "selector": expected_selector,
+                "subject_sha256": subject_digest,
+            }
+        )
+    return {
+        "probes": normalized_rows,
+        "source": {"commit": commit, "dirty": not clean, "tree": tree},
+    }, checks
+
+
+def validate_matrix_evidence(
+    value: Any,
+) -> tuple[dict[str, Any], bool, dict[str, bool]]:
+    evidence = _object(value, label="matrix evidence")
+    if set(evidence) != {"clock", "schema_version", "static_probes"}:
+        raise QualificationError("matrix evidence fields differ from the v1 schema")
+    if evidence["schema_version"] != MATRIX_EVIDENCE_SCHEMA:
+        raise QualificationError("matrix evidence schema is not I9 v1")
+    clock, clock_passed = validate_clock_evidence(evidence["clock"])
+    probes, probe_checks = validate_static_probes(evidence["static_probes"])
+    return {"clock": clock, "static_probes": probes}, clock_passed, probe_checks
+
+
+def validate_recovery_evidence(
+    row: Mapping[str, Any],
+) -> tuple[dict[str, Any], dict[str, bool]]:
+    details = _object(row.get("details"), label="FoundationPose row details")
+    recovery = _object(details.get("recovery"), label="FoundationPose recovery")
+    required = {
+        "component_id",
+        "dds",
+        "exact_world_after_rejoin",
+        "output_sample",
+        "passed",
+        "provider",
+        "schema_version",
+        "simulation_stopped_after_rejoin",
+        "simulation_stopped_during_outage",
+    }
+    if set(recovery) != required:
+        raise QualificationError("FoundationPose recovery fields differ from v1")
+    if recovery["schema_version"] != RECOVERY_EVIDENCE_SCHEMA:
+        raise QualificationError("FoundationPose recovery schema is not I9 v1")
+    expected_component = SCENARIO_BY_ID[
+        "isaac-lite6-trocar-foundationpose"
+    ].component_id
+    if recovery["component_id"] != expected_component:
+        raise QualificationError("FoundationPose recovery crossed components")
+
+    dds = _object(recovery["dds"], label="FoundationPose recovery DDS")
+    if set(dds) != {"loss_elapsed_s", "rejoin_elapsed_s"}:
+        raise QualificationError("FoundationPose DDS evidence differs from v1")
+    dds_loss = _number(
+        dds["loss_elapsed_s"],
+        label="DDS loss elapsed",
+        minimum=0.0,
+        maximum=RECOVERY_BOUND_S,
+    )
+    dds_rejoin = _number(
+        dds["rejoin_elapsed_s"],
+        label="DDS rejoin elapsed",
+        minimum=0.0,
+        maximum=RECOVERY_BOUND_S,
+    )
+
+    provider = _object(
+        recovery["provider"], label="FoundationPose provider recovery"
+    )
+    provider_fields = {
+        "epoch_after",
+        "epoch_before",
+        "loss_elapsed_s",
+        "recovery_elapsed_s",
+        "sequence_after",
+        "sequence_before",
+        "source_id",
+    }
+    if set(provider) != provider_fields:
+        raise QualificationError("FoundationPose provider fields differ from v1")
+    if provider["source_id"] != "foundationpose_trocar":
+        raise QualificationError("FoundationPose recovery selected another source")
+    epoch_before = _text(provider["epoch_before"], label="provider epoch before")
+    epoch_after = _text(provider["epoch_after"], label="provider epoch after")
+    sequence_before = _integer(
+        provider["sequence_before"],
+        label="provider sequence before",
+        minimum=1,
+    )
+    sequence_after = _integer(
+        provider["sequence_after"],
+        label="provider sequence after",
+        minimum=1,
+    )
+    provider_loss = _number(
+        provider["loss_elapsed_s"],
+        label="provider loss elapsed",
+        minimum=0.0,
+        maximum=RECOVERY_BOUND_S,
+    )
+    provider_recovery = _number(
+        provider["recovery_elapsed_s"],
+        label="provider recovery elapsed",
+        minimum=0.0,
+        maximum=RECOVERY_BOUND_S,
+    )
+
+    output = _object(recovery["output_sample"], label="recovery output sample")
+    if set(output) != {"bytes", "returncode", "seen", "sha256"}:
+        raise QualificationError("recovery output sample fields differ from v1")
+    output_bytes = _integer(
+        output["bytes"],
+        label="recovery output bytes",
+        minimum=0,
+        maximum=MAX_JSON_BYTES,
+    )
+    output_returncode = _integer(
+        output["returncode"],
+        label="recovery output return code",
+        minimum=-255,
+        maximum=255,
+    )
+    output_seen = _boolean(output["seen"], label="recovery output seen")
+    output_digest = _sha256(
+        output["sha256"], label="recovery output sha256"
+    )
+    exact_world = _boolean(
+        recovery["exact_world_after_rejoin"],
+        label="exact world after rejoin",
+    )
+    stopped_during = _boolean(
+        recovery["simulation_stopped_during_outage"],
+        label="simulation stopped during outage",
+    )
+    stopped_after = _boolean(
+        recovery["simulation_stopped_after_rejoin"],
+        label="simulation stopped after rejoin",
+    )
+    reported_pass = _boolean(recovery["passed"], label="recovery reported pass")
+    dds_passed = stopped_during and stopped_after
+    provider_passed = bool(
+        epoch_before != epoch_after
+        and output_seen
+        and output_returncode == 0
+        and output_bytes > 0
+        and exact_world
+        and stopped_during
+        and stopped_after
+    )
+    derived_pass = dds_passed and provider_passed
+    if reported_pass != derived_pass:
+        raise QualificationError(
+            "FoundationPose recovery pass field differs from derived evidence"
+        )
+    normalized = {
+        "component_id": expected_component,
+        "dds": {
+            "loss_elapsed_s": dds_loss,
+            "rejoin_elapsed_s": dds_rejoin,
+        },
+        "exact_world_after_rejoin": exact_world,
+        "output_sample": {
+            "bytes": output_bytes,
+            "returncode": output_returncode,
+            "seen": output_seen,
+            "sha256": output_digest,
+        },
+        "provider": {
+            "epoch_after": epoch_after,
+            "epoch_before": epoch_before,
+            "loss_elapsed_s": provider_loss,
+            "recovery_elapsed_s": provider_recovery,
+            "sequence_after": sequence_after,
+            "sequence_before": sequence_before,
+            "source_id": "foundationpose_trocar",
+        },
+        "simulation_stopped_after_rejoin": stopped_after,
+        "simulation_stopped_during_outage": stopped_during,
+    }
+    return normalized, {
+        "dds_loss_rejoin_bounded": dds_passed,
+        "provider_loss_recovery_bounded": provider_passed,
+    }
+
+
 def reduce_matrix(
     rows: Sequence[Any],
-    matrix_checks: Mapping[str, Any],
+    matrix_evidence: Mapping[str, Any],
     *,
     preflight: Mapping[str, Any],
 ) -> dict[str, Any]:
-    """Reduce exactly five rows plus recovery evidence into one verdict."""
+    """Derive one verdict from five rows and structured matrix evidence."""
 
     if len(rows) != len(SCENARIOS):
         raise QualificationError("I9 matrix requires exactly five rows")
@@ -534,14 +922,50 @@ def reduce_matrix(
     by_id = {row["scenario_id"]: row for row in validated}
     if len(by_id) != len(validated) or set(by_id) != set(SCENARIO_BY_ID):
         raise QualificationError("I9 matrix rows are missing, duplicate, or extra")
-    if set(matrix_checks) != MATRIX_CHECKS:
-        raise QualificationError("I9 matrix checks differ from the frozen set")
-    for check, passed in matrix_checks.items():
-        if type(passed) is not bool:
-            raise QualificationError(f"matrix check {check} must be boolean")
     if preflight.get("schema_version") != PREFLIGHT_SCHEMA:
         raise QualificationError("I9 matrix preflight is absent or incompatible")
     ordered = [by_id[spec.scenario_id] for spec in SCENARIOS]
+    evidence, clock_passed, probe_checks = validate_matrix_evidence(
+        matrix_evidence
+    )
+    foundation_row = by_id["isaac-lite6-trocar-foundationpose"]
+    recovery, recovery_checks = validate_recovery_evidence(foundation_row)
+    collision_checks = by_id["isaac-ur10e-light-scene-collision"]["checks"]
+    namespace_checks = all(
+        row["checks"]["runtime_namespace_exact"]
+        and row["checks"]["execution_owner_exact"]
+        for row in ordered
+    )
+    exact_world_checks = all(
+        row["checks"]["exact_world_readback"] for row in ordered
+    )
+    same_type_isolated = probe_checks["two_same_type_instances_isolated"]
+    matrix_checks = {
+        "clock_synchronized": clock_passed,
+        "dds_loss_rejoin_bounded": recovery_checks[
+            "dds_loss_rejoin_bounded"
+        ],
+        "demo_supervisor_absent": probe_checks["demo_supervisor_absent"],
+        "direct_controller_route": probe_checks["direct_controller_route"],
+        "no_cross_drive": namespace_checks and same_type_isolated,
+        "provider_loss_recovery_bounded": recovery_checks[
+            "provider_loss_recovery_bounded"
+        ],
+        "representative_chained_controller_route": probe_checks[
+            "representative_chained_controller_route"
+        ],
+        "scene_reload_exact": bool(
+            exact_world_checks and recovery["exact_world_after_rejoin"]
+        ),
+        "structured_alarm_correlation": bool(
+            collision_checks["collision_stop_kernel_owned"]
+            and collision_checks["collision_stop_terminal"]
+            and collision_checks["status_trace_correlated"]
+        ),
+        "two_same_type_instances_isolated": same_type_isolated,
+    }
+    if set(matrix_checks) != MATRIX_CHECKS:
+        raise QualificationError("derived matrix checks differ from the frozen set")
     failed_rows = {
         row["scenario_id"]: sorted(
             check for check, passed in row["checks"].items() if not passed
@@ -557,6 +981,7 @@ def reduce_matrix(
         "passed": not failed_rows and not failed_matrix_checks,
         "preflight": dict(preflight),
         "rows": ordered,
+        "evidence": {**evidence, "recovery": recovery},
         "matrix_checks": dict(sorted(matrix_checks.items())),
         "failures": {
             "matrix_checks": failed_matrix_checks,
@@ -578,6 +1003,20 @@ def build_preflight(
         "package": validate_package(package_root, source_root),
         "world_manifest": validate_world_manifest(world_manifest),
     }
+
+
+def build_matrix_evidence(
+    *,
+    clock: Mapping[str, Any],
+    static_probes: Mapping[str, Any],
+) -> dict[str, Any]:
+    evidence = {
+        "schema_version": MATRIX_EVIDENCE_SCHEMA,
+        "clock": dict(clock),
+        "static_probes": dict(static_probes),
+    }
+    validate_matrix_evidence(evidence)
+    return evidence
 
 
 def _load_json(path: Path) -> Any:
@@ -620,6 +1059,57 @@ def _text(value: Any, *, label: str) -> str:
     return value
 
 
+def _boolean(value: Any, *, label: str) -> bool:
+    if type(value) is not bool:
+        raise QualificationError(f"{label} must be boolean")
+    return value
+
+
+def _integer(
+    value: Any,
+    *,
+    label: str,
+    minimum: int,
+    maximum: int = 9_007_199_254_740_991_999,
+) -> int:
+    if type(value) is not int or not minimum <= value <= maximum:
+        raise QualificationError(
+            f"{label} must be an integer in [{minimum}, {maximum}]"
+        )
+    return value
+
+
+def _number(
+    value: Any,
+    *,
+    label: str,
+    minimum: float,
+    maximum: float,
+) -> float:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise QualificationError(f"{label} must be numeric")
+    number = float(value)
+    if not math.isfinite(number) or not minimum <= number <= maximum:
+        raise QualificationError(
+            f"{label} must be finite and in [{minimum}, {maximum}]"
+        )
+    return number
+
+
+def _sha256(value: Any, *, label: str) -> str:
+    digest = _text(value, label=label)
+    if SHA256_PATTERN.fullmatch(digest) is None:
+        raise QualificationError(f"{label} must be one lowercase SHA-256")
+    return digest
+
+
+def _git_oid(value: Any, *, label: str) -> str:
+    oid = _text(value, label=label)
+    if re.fullmatch(r"[0-9a-f]{40,64}", oid) is None:
+        raise QualificationError(f"{label} must be one lowercase Git object ID")
+    return oid
+
+
 def _emit(value: Mapping[str, Any]) -> None:
     encoded = json.dumps(value, separators=(",", ":"), sort_keys=True)
     if len(encoded.encode("utf-8")) > MAX_JSON_BYTES:
@@ -641,9 +1131,13 @@ def main(argv: Sequence[str] | None = None) -> int:
     preflight_parser.add_argument("--source-root", type=Path, required=True)
     preflight_parser.add_argument("--world-manifest", type=Path, required=True)
 
+    evidence_parser = subparsers.add_parser("matrix-evidence")
+    evidence_parser.add_argument("--clock", type=Path, required=True)
+    evidence_parser.add_argument("--static-probes", type=Path, required=True)
+
     reduce_parser = subparsers.add_parser("reduce")
     reduce_parser.add_argument("--preflight", type=Path, required=True)
-    reduce_parser.add_argument("--matrix-checks", type=Path, required=True)
+    reduce_parser.add_argument("--matrix-evidence", type=Path, required=True)
     reduce_parser.add_argument("rows", nargs="+", type=Path)
 
     args = parser.parse_args(argv)
@@ -661,10 +1155,22 @@ def main(argv: Sequence[str] | None = None) -> int:
                     environment=os.environ,
                 )
             )
+        elif args.command == "matrix-evidence":
+            _emit(
+                build_matrix_evidence(
+                    clock=_object(_load_json(args.clock), label="clock evidence"),
+                    static_probes=_object(
+                        _load_json(args.static_probes),
+                        label="static probe evidence",
+                    ),
+                )
+            )
         else:
             result = reduce_matrix(
                 [_load_json(path) for path in args.rows],
-                _object(_load_json(args.matrix_checks), label="matrix checks"),
+                _object(
+                    _load_json(args.matrix_evidence), label="matrix evidence"
+                ),
                 preflight=_object(_load_json(args.preflight), label="preflight"),
             )
             _emit(result)

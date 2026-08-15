@@ -32,6 +32,9 @@ def exact_environment(runner: ModuleType) -> dict[str, str]:
 
 
 def row_for(runner: ModuleType, scenario) -> dict[str, object]:
+    details: dict[str, object] = {"terminal": {"state": "qualified"}}
+    if scenario.scenario_id == "isaac-lite6-trocar-foundationpose":
+        details["recovery"] = recovery_for(runner, scenario)
     return {
         "schema_version": runner.ROW_SCHEMA,
         "scenario_id": scenario.scenario_id,
@@ -42,13 +45,99 @@ def row_for(runner: ModuleType, scenario) -> dict[str, object]:
             "uri": scenario.world_uri,
         },
         "checks": {key: True for key in scenario.required_checks},
-        "details": {"terminal": {"state": "qualified"}},
+        "details": details,
         "elapsed_s": 1.25,
     }
 
 
 def preflight_for(runner: ModuleType) -> dict[str, object]:
     return {"schema_version": runner.PREFLIGHT_SCHEMA}
+
+
+def recovery_for(runner: ModuleType, scenario) -> dict[str, object]:
+    return {
+        "schema_version": runner.RECOVERY_EVIDENCE_SCHEMA,
+        "component_id": scenario.component_id,
+        "dds": {"loss_elapsed_s": 1.0, "rejoin_elapsed_s": 2.0},
+        "exact_world_after_rejoin": True,
+        "output_sample": {
+            "bytes": 128,
+            "returncode": 0,
+            "seen": True,
+            "sha256": "c" * 64,
+        },
+        "passed": True,
+        "provider": {
+            "epoch_after": "pose.epoch.2",
+            "epoch_before": "pose.epoch.1",
+            "loss_elapsed_s": 5.1,
+            "recovery_elapsed_s": 2.5,
+            "sequence_after": 1,
+            "sequence_before": 7,
+            "source_id": "foundationpose_trocar",
+        },
+        "simulation_stopped_after_rejoin": True,
+        "simulation_stopped_during_outage": True,
+    }
+
+
+def matrix_evidence_for(runner: ModuleType) -> dict[str, object]:
+    base_ns = 1_800_000_000_000_000_000
+    samples = []
+    for index in range(runner.CLOCK_SAMPLE_COUNT):
+        sent = base_ns + index * 10_000_000
+        received = sent + 1_000_000
+        samples.append(
+            {
+                "local_send_ns": sent,
+                "local_receive_ns": received,
+                "remote_ns": sent + 500_000,
+            }
+        )
+    probes = []
+    for probe_id, (kind, selector) in runner.PROBE_CONTRACTS.items():
+        probes.append(
+            {
+                "elapsed_s": 0.1,
+                "kind": kind,
+                "output_bytes": 100,
+                "output_sha256": "d" * 64,
+                "probe_id": probe_id,
+                "returncode": 0,
+                "selector": selector,
+                "subject_sha256": "e" * 64,
+            }
+        )
+    return {
+        "schema_version": runner.MATRIX_EVIDENCE_SCHEMA,
+        "clock": {
+            "schema_version": runner.CLOCK_EVIDENCE_SCHEMA,
+            "hosts": {
+                "laptop": {
+                    "address": "192.168.1.132",
+                    "clock_synchronized": True,
+                    "hostname": "tndlux-G16",
+                    "synchronization_marker": True,
+                },
+                "orin": {
+                    "address": "192.168.1.68",
+                    "clock_synchronized": True,
+                    "hostname": "localhost.localdomain",
+                    "synchronization_marker": True,
+                },
+            },
+            "samples": samples,
+        },
+        "static_probes": {
+            "schema_version": runner.STATIC_PROBES_SCHEMA,
+            "source": {
+                "commit": "a" * 40,
+                "dirty": False,
+                "tree": "b" * 40,
+            },
+            "probes": probes,
+        },
+    }
 
 
 def test_frozen_matrix_has_exact_five_non_aliasing_owner_rows(
@@ -194,31 +283,49 @@ def test_row_validation_rejects_world_component_and_obligation_substitution(
         runner.validate_row(missing)
 
 
-def test_reducer_requires_all_rows_and_all_matrix_checks(runner: ModuleType) -> None:
+def test_reducer_derives_all_checks_from_structured_evidence(
+    runner: ModuleType,
+) -> None:
     rows = [row_for(runner, scenario) for scenario in runner.SCENARIOS]
-    checks = {key: True for key in runner.MATRIX_CHECKS}
+    evidence = matrix_evidence_for(runner)
     result = runner.reduce_matrix(
-        rows, checks, preflight=preflight_for(runner)
+        rows, evidence, preflight=preflight_for(runner)
     )
     assert result["passed"] is True
+    assert result["matrix_checks"] == {
+        check: True for check in sorted(runner.MATRIX_CHECKS)
+    }
     assert [row["scenario_id"] for row in result["rows"]] == [
         scenario.scenario_id for scenario in runner.SCENARIOS
     ]
 
     with pytest.raises(runner.QualificationError, match="exactly five"):
-        runner.reduce_matrix(rows[:-1], checks, preflight=preflight_for(runner))
+        runner.reduce_matrix(
+            rows[:-1], evidence, preflight=preflight_for(runner)
+        )
 
     crossed = [dict(row) for row in rows]
     crossed[1] = dict(crossed[0])
     with pytest.raises(runner.QualificationError, match="duplicate"):
-        runner.reduce_matrix(crossed, checks, preflight=preflight_for(runner))
+        runner.reduce_matrix(
+            crossed, evidence, preflight=preflight_for(runner)
+        )
 
-    checks["no_cross_drive"] = False
+    failed = matrix_evidence_for(runner)
+    failed_probe = next(
+        probe
+        for probe in failed["static_probes"]["probes"]
+        if probe["probe_id"] == "two_same_type_instances_isolated"
+    )
+    failed_probe["returncode"] = 1
     result = runner.reduce_matrix(
-        rows, checks, preflight=preflight_for(runner)
+        rows, failed, preflight=preflight_for(runner)
     )
     assert result["passed"] is False
-    assert result["failures"]["matrix_checks"] == ["no_cross_drive"]
+    assert result["failures"]["matrix_checks"] == [
+        "no_cross_drive",
+        "two_same_type_instances_isolated",
+    ]
 
 
 def test_reducer_surfaces_failed_row_checks_without_accepting_pass_field(
@@ -228,10 +335,55 @@ def test_reducer_surfaces_failed_row_checks_without_accepting_pass_field(
     rows[4]["checks"]["collision_stop_terminal"] = False
     result = runner.reduce_matrix(
         rows,
-        {key: True for key in runner.MATRIX_CHECKS},
+        matrix_evidence_for(runner),
         preflight=preflight_for(runner),
     )
     assert result["passed"] is False
     assert result["failures"]["rows"] == {
         "isaac-ur10e-light-scene-collision": ["collision_stop_terminal"]
     }
+
+
+def test_clock_and_recovery_evidence_are_recomputed_fail_closed(
+    runner: ModuleType,
+) -> None:
+    rows = [row_for(runner, scenario) for scenario in runner.SCENARIOS]
+    evidence = matrix_evidence_for(runner)
+    evidence["clock"]["samples"][0]["remote_ns"] += (
+        runner.CLOCK_MAX_ABS_OFFSET_NS + 1
+    )
+    result = runner.reduce_matrix(
+        rows, evidence, preflight=preflight_for(runner)
+    )
+    assert result["matrix_checks"]["clock_synchronized"] is False
+
+    recovery = rows[1]["details"]["recovery"]
+    recovery["provider"]["epoch_after"] = recovery["provider"]["epoch_before"]
+    with pytest.raises(runner.QualificationError, match="pass field"):
+        runner.reduce_matrix(
+            rows,
+            matrix_evidence_for(runner),
+            preflight=preflight_for(runner),
+        )
+
+
+def test_static_probe_evidence_requires_exact_selectors_and_clean_source(
+    runner: ModuleType,
+) -> None:
+    rows = [row_for(runner, scenario) for scenario in runner.SCENARIOS]
+    evidence = matrix_evidence_for(runner)
+    evidence["static_probes"]["probes"][0]["selector"] = "weak.proxy"
+    with pytest.raises(runner.QualificationError, match="another test"):
+        runner.reduce_matrix(
+            rows, evidence, preflight=preflight_for(runner)
+        )
+
+    dirty = matrix_evidence_for(runner)
+    dirty["static_probes"]["source"]["dirty"] = True
+    result = runner.reduce_matrix(
+        rows, dirty, preflight=preflight_for(runner)
+    )
+    assert result["passed"] is False
+    assert set(result["failures"]["matrix_checks"]) >= set(
+        runner.PROBE_CONTRACTS
+    )
