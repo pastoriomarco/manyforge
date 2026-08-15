@@ -126,6 +126,9 @@ constexpr int kSocketBacklog = 16;
 constexpr int kReconcilePeriodMilliseconds = 5;
 constexpr int kClientPacketDeadlineMilliseconds = 100;
 constexpr int kManagerSceneDeadlineMilliseconds = 5000;
+constexpr std::size_t kPlanningSceneSynchronizationAttempts = 32U;
+constexpr auto kPlanningSceneSynchronizationRetryDelay =
+    std::chrono::milliseconds(10);
 
 [[nodiscard]] std::string SelectedExecutionImplementationRevision() {
 #if defined(MANYFORGE_ROS2_CONTROL_EXECUTION_HOST)
@@ -3708,66 +3711,90 @@ public:
   [[nodiscard]] core::Result<core::ProjectionRevisionDTO>
   SynchronizeBeforePlanning() override {
     try {
-      const auto current =
-          collision_publisher_->current_scene_snapshot_lease_inventory();
-      if (!current.has_value() ||
-          !current->projection_binding.projection_revision.valid() ||
-          current->projection_binding.projection_revision.retained_bundle_id !=
-              retained_bundle_id_ ||
-          current->projection_binding.projection_revision.graph_revision !=
-              graph_revision_) {
-        return Failure(
-            "planning_scene_projection_unavailable",
-            "local native predecessor projection is unavailable or stale");
-      }
-      const auto predecessor = current->projection_binding.projection_revision;
-      const auto response = ExchangeManagerCommand(
-          manager_state_root_,
-          CanonicalValue(CanonicalValue::Object{
-              {"api_version",
-               CanonicalValue(std::string(kManagerCommandApiVersion))},
-              {"command",
-               CanonicalValue("scene_runtime_latch_before_planning")},
-              {"expected_projection_revision",
-               ProjectionRevisionValue(predecessor)},
-              {"expected_runtime_identity", RuntimeIdentityValue()},
-          }));
-      if (!Boolean(response, "ok")) {
-        return core::Result<core::ProjectionRevisionDTO>::Err(
-            DecodeManagerError(Member(response, "error")));
-      }
-      RequireExactObjectSize(response, 10U,
-                             "Manager before-planning latch response");
-      RequireRuntimeIdentity(Member(response, "runtime_identity"));
-      const auto initial = DecodeProjectionRevision(
-          Member(response, "initial_projection_revision"));
-      const auto projection =
-          DecodeProjectionRevision(Member(response, "projection_revision"));
-      const auto latched = Counter(response, "latched_observation_count", 0U);
-      const auto committed =
-          Counter(response, "committed_observation_count", 0U);
-      const auto already_applied =
-          Counter(response, "already_applied_observation_count", 0U);
-      const auto skipped_attached =
-          Counter(response, "skipped_attached_observation_count", 0U);
-      static_cast<void>(
-          Counter(response, "scene_runtime_source_generation", 1U));
-      Require(initial == predecessor && projection.valid() &&
-                  projection.retained_bundle_id == retained_bundle_id_ &&
-                  projection.graph_revision == graph_revision_ &&
-                  projection.scene_revision.scene_id ==
-                      predecessor.scene_revision.scene_id &&
-                  latched == committed + already_applied + skipped_attached,
-              "Manager before-planning latch response crossed its request");
-      const auto converged =
-          collision_publisher_->current_scene_snapshot_lease_inventory();
-      if (!converged.has_value() ||
-          converged->projection_binding.projection_revision != projection) {
+      for (std::size_t attempt = 0U;
+           attempt < kPlanningSceneSynchronizationAttempts; ++attempt) {
+        const auto current =
+            collision_publisher_->current_scene_snapshot_lease_inventory();
+        if (!current.has_value() ||
+            !current->projection_binding.projection_revision.valid() ||
+            current->projection_binding.projection_revision
+                    .retained_bundle_id != retained_bundle_id_ ||
+            current->projection_binding.projection_revision.graph_revision !=
+                graph_revision_) {
+          return Failure(
+              "planning_scene_projection_unavailable",
+              "local native predecessor projection is unavailable or stale");
+        }
+        const auto predecessor =
+            current->projection_binding.projection_revision;
+        const auto response = ExchangeManagerCommand(
+            manager_state_root_,
+            CanonicalValue(CanonicalValue::Object{
+                {"api_version",
+                 CanonicalValue(std::string(kManagerCommandApiVersion))},
+                {"command",
+                 CanonicalValue("scene_runtime_latch_before_planning")},
+                {"expected_projection_revision",
+                 ProjectionRevisionValue(predecessor)},
+                {"expected_runtime_identity", RuntimeIdentityValue()},
+            }));
+        if (!Boolean(response, "ok")) {
+          auto error = DecodeManagerError(Member(response, "error"));
+          if (error.code == "scene_runtime_pose_projection_changed" &&
+              attempt + 1U < kPlanningSceneSynchronizationAttempts) {
+            std::this_thread::sleep_for(
+                kPlanningSceneSynchronizationRetryDelay);
+            continue;
+          }
+          return core::Result<core::ProjectionRevisionDTO>::Err(
+              std::move(error));
+        }
+        RequireExactObjectSize(response, 10U,
+                               "Manager before-planning latch response");
+        RequireRuntimeIdentity(Member(response, "runtime_identity"));
+        const auto initial = DecodeProjectionRevision(
+            Member(response, "initial_projection_revision"));
+        const auto projection = DecodeProjectionRevision(
+            Member(response, "projection_revision"));
+        const auto latched =
+            Counter(response, "latched_observation_count", 0U);
+        const auto committed =
+            Counter(response, "committed_observation_count", 0U);
+        const auto already_applied =
+            Counter(response, "already_applied_observation_count", 0U);
+        const auto skipped_attached =
+            Counter(response, "skipped_attached_observation_count", 0U);
+        static_cast<void>(
+            Counter(response, "scene_runtime_source_generation", 1U));
+        Require(initial == predecessor && projection.valid() &&
+                    projection.retained_bundle_id == retained_bundle_id_ &&
+                    projection.graph_revision == graph_revision_ &&
+                    projection.scene_revision.scene_id ==
+                        predecessor.scene_revision.scene_id &&
+                    latched == committed + already_applied + skipped_attached,
+                "Manager before-planning latch response crossed its request");
+        for (std::size_t convergence_attempt = 0U;
+             convergence_attempt < kPlanningSceneSynchronizationAttempts;
+             ++convergence_attempt) {
+          const auto converged =
+              collision_publisher_->current_scene_snapshot_lease_inventory();
+          if (converged.has_value() &&
+              converged->projection_binding.projection_revision ==
+                  projection) {
+            return core::Result<core::ProjectionRevisionDTO>::Ok(projection);
+          }
+          if (convergence_attempt + 1U <
+              kPlanningSceneSynchronizationAttempts) {
+            std::this_thread::sleep_for(
+                kPlanningSceneSynchronizationRetryDelay);
+          }
+        }
         return Failure(
             "planning_scene_projection_not_converged",
             "local native projection did not converge to the Manager latch");
       }
-      return core::Result<core::ProjectionRevisionDTO>::Ok(projection);
+      return Failure("planning_scene_projection_changed",
+                     "logical scene kept changing before Manager pose latch");
     } catch (const std::exception &error) {
       return Failure("planning_scene_synchronization_failed", error.what());
     } catch (...) {
