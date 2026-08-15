@@ -2617,6 +2617,35 @@ TEST_F(ExecutionKernelTest, Execute_HappyPath_ReturnsExecutionId) {
   EXPECT_EQ(kernel.get_status().state, ExecutionState::kCompleted);
 }
 
+TEST_F(ExecutionKernelTest,
+       Execute_BackendRejectedDispatchPreservesExactBackendCause) {
+  execution.next_terminal_state = ExecutionState::kFailed;
+  execution.snapshot.error =
+      ErrorDTO{kErrorExecutionRejected,
+               "Execution progress authority could not be armed",
+               {{"reason", "execution_progress_publication_rejected"},
+                {"publication_reason", "execution_generation_retired"}}};
+
+  auto result = execute_sync(make_test_request("backend_dispatch_rejected"));
+
+  ASSERT_TRUE(result.ok());
+  EXPECT_EQ(kernel.get_status().state, ExecutionState::kFailed);
+  const auto snapshot = kernel.get_execution_snapshot();
+  ASSERT_TRUE(snapshot.error.has_value());
+  EXPECT_EQ(snapshot.error->code, kErrorExecutionRejected);
+  EXPECT_EQ(snapshot.error->details.at("reason"),
+            "execution_progress_publication_rejected");
+  EXPECT_EQ(snapshot.error->details.at("publication_reason"),
+            "execution_generation_retired");
+  EXPECT_EQ(snapshot.error->details.at("dispatch_boundary"),
+            "execution_backend_handle");
+  EXPECT_EQ(snapshot.error->details.at("execution_generation"), "0");
+  const auto outcome = kernel.get_execution_outcome(result.value());
+  ASSERT_TRUE(outcome.has_value());
+  ASSERT_TRUE(outcome->error.has_value());
+  EXPECT_EQ(outcome->error, snapshot.error);
+}
+
 TEST_F(ExecutionKernelTest, Execute_FromTerminalWorkerCallbackRejectedWithoutReplacingWorker) {
   std::promise<std::optional<ErrorDTO>> nested_result;
   auto nested_result_future = nested_result.get_future();

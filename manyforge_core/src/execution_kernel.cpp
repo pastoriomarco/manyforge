@@ -5921,6 +5921,76 @@ ExecutionKernel::ExecuteWorkerDispatchPhaseResult ExecutionKernel::execute_worke
       return phase_result;
     }
   }
+  // A generation-less handle is also the backend's explicit rejected-dispatch
+  // representation.  Inspect a terminal handle before arming lookahead so the
+  // backend's exact rejection (stale state, admission drift, action rejection,
+  // progress-authority failure, ...) remains the operation-visible cause.
+  // Otherwise lookahead correctly rejects generation 0 but masks the earlier,
+  // much more actionable error as `execution_progress_generation_unavailable`.
+  if (phase_result.execution_handle.execution_generation == 0 &&
+      phase_result.execution_handle.get_snapshot) {
+    auto rejected_snapshot = phase_result.execution_handle.get_snapshot();
+    const bool backend_rejected =
+        rejected_snapshot.state == ExecutionState::kFailed ||
+        rejected_snapshot.state == ExecutionState::kInterventionRequired;
+    if (backend_rejected) {
+      auto dispatch_error = rejected_snapshot.error.value_or(
+          ErrorDTO{kErrorExecutionRejected,
+                   "Execution backend rejected dispatch without an error",
+                   {{"reason", "backend_dispatch_rejected_without_error"}}});
+      dispatch_error.details.try_emplace("dispatch_boundary",
+                                         "execution_backend_handle");
+      dispatch_error.details.try_emplace("execution_generation", "0");
+      stop_collision_monitoring(
+          RuntimeCollisionMonitorRelease::kFailClosedTerminal,
+          motion_state.runtime_collision_protection_generation);
+      sm_.set_last_error(error_code_from_dto(dispatch_error));
+      const auto previous_state = sm_.status().state;
+      const auto requested_terminal =
+          rejected_snapshot.state == ExecutionState::kInterventionRequired
+              ? ExecutionState::kInterventionRequired
+              : ExecutionState::kFailed;
+      auto terminal_commit =
+          commit_terminal(requested_terminal, "terminal_commit");
+      if (terminal_commit.committed != requested_terminal &&
+          finalize_overridden_terminal_authority(
+              request, exec_id, motion_state, terminal_commit.committed,
+              "backend_dispatch_rejection_overridden_by_terminal_authority",
+              dispatch_error)) {
+        phase_result.status = ExecuteWorkerPhaseStatus::kTerminal;
+        return phase_result;
+      }
+      rejected_snapshot.timestamp_ns = clock_.now();
+      rejected_snapshot.execution_id = exec_id;
+      rejected_snapshot.move_id = request.move_id;
+      rejected_snapshot.state = terminal_commit.committed;
+      rejected_snapshot.error = dispatch_error;
+      publish_execution_snapshot(std::move(rejected_snapshot));
+      emit_event({KernelEventType::kErrorRaised,
+                  exec_id,
+                  clock_.now(),
+                  {},
+                  {},
+                  dispatch_error,
+                  dispatch_error.details});
+      emit_event({KernelEventType::kStateTransition,
+                  exec_id,
+                  clock_.now(),
+                  previous_state,
+                  terminal_commit.committed,
+                  dispatch_error,
+                  {{"reason", "backend_dispatch_rejected"}}});
+      {
+        std::lock_guard<std::mutex> metrics_lock(metrics_mutex_);
+        metrics_.executions_failed++;
+      }
+      finalize_motion_execution_outcome(
+          motion_state, MotionExecutionTerminalCause::kFailed,
+          dispatch_error, std::nullopt, "backend_dispatch_rejected");
+      phase_result.status = ExecuteWorkerPhaseStatus::kTerminal;
+      return phase_result;
+    }
+  }
   arm_runtime_collision_lookahead(exec_id, phase_result.execution_handle.execution_generation,
                                   std::move(collision_trajectory), request.contact_policy_id,
                                   scene_snapshot_lease_inventory);
