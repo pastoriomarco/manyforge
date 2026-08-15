@@ -1577,6 +1577,20 @@ void Ros2ControlExecutionBackend::controller_binding_monitor_worker(
     const auto fail_refresh = [this](std::string reason) {
       controller_binding_refresh_failures_total_.fetch_add(
           1, std::memory_order_relaxed);
+      const auto now = clock_.now();
+      const auto current =
+          controller_binding_snapshot_.load(std::memory_order_acquire);
+      // A periodic service miss is not itself evidence that the retained
+      // controller binding changed. Preserve a still-fresh valid snapshot and
+      // retry within its existing lease; the admission owner independently
+      // closes at fresh_until_ns if failures persist. Activity callbacks
+      // publish an invalid snapshot before requesting a refresh, so genuine
+      // controller-manager churn never receives this grace.
+      if (current != nullptr && current->valid &&
+          current->received_timestamp_ns <= now &&
+          current->fresh_until_ns > now) {
+        return;
+      }
       invalidate_controller_binding(std::move(reason));
     };
 

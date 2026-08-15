@@ -1003,6 +1003,11 @@ public:
 
   void announce_activity() { publish_activity(); }
 
+  void stop_services_without_activity() {
+    list_controllers_service_.reset();
+    list_hardware_service_.reset();
+  }
+
 private:
   void fill_controllers(
       controller_manager_msgs::srv::ListControllers::Response &response) {
@@ -1616,6 +1621,60 @@ TEST(Ros2ControlExecutionBackendTest,
       });
   ASSERT_TRUE(restarted.has_value());
   EXPECT_TRUE(restarted->controller_active);
+}
+
+TEST(Ros2ControlExecutionBackendTest,
+     ControllerManagerRefreshFailureUsesOnlyRemainingFreshLease) {
+  const std::string suffix = unique_suffix();
+  const std::string controller_manager =
+      "/manyforge_binding_refresh_grace_" + suffix + "/controller_manager";
+  auto config = base_config();
+  config.action_name = "/manyforge_binding_refresh_grace_" + suffix +
+                       "/follow_joint_trajectory";
+  config.joint_state_topic =
+      "/manyforge_binding_refresh_grace_" + suffix + "/joint_states";
+  config.controller_state_topic =
+      "/manyforge_binding_refresh_grace_" + suffix + "/controller_state";
+  config.controller_binding = binding_contract_for(config, controller_manager);
+  config.controller_binding_refresh_timeout_s = 0.05;
+
+  FakeControllerManager manager(controller_manager, *config.controller_binding);
+  auto sink = std::make_shared<RecordingExecutionStateSink>();
+  core::FakeClock clock;
+  core::ManualScheduler scheduler;
+  clock.set(1'000'000'000);
+  Ros2ControlExecutionBackend backend(sink, "arm", clock, scheduler, config);
+  ASSERT_TRUE(manager.wait_for_activity_subscription());
+
+  const auto initial = wait_for_binding_snapshot(
+      backend,
+      [](const ControllerBindingSnapshot &candidate) { return candidate.valid; });
+  ASSERT_TRUE(initial.has_value());
+  const auto failures_before = backend.controller_progress_metrics()
+                                   .controller_binding_refresh_failures_total;
+
+  manager.stop_services_without_activity();
+  const auto failure_deadline = std::chrono::steady_clock::now() + 2s;
+  while (std::chrono::steady_clock::now() < failure_deadline &&
+         backend.controller_progress_metrics()
+                 .controller_binding_refresh_failures_total == failures_before) {
+    std::this_thread::sleep_for(10ms);
+  }
+  ASSERT_GT(backend.controller_progress_metrics()
+                .controller_binding_refresh_failures_total,
+            failures_before);
+  const auto retained = backend.controller_binding_snapshot();
+  ASSERT_TRUE(retained.has_value());
+  EXPECT_TRUE(retained->valid);
+  EXPECT_EQ(retained->generation, initial->generation);
+
+  clock.set(initial->fresh_until_ns + 1);
+  const auto expired = wait_for_binding_snapshot(
+      backend, [initial](const ControllerBindingSnapshot &candidate) {
+        return candidate.generation > initial->generation && !candidate.valid &&
+               has_reason(candidate, "controller_list_service_unavailable");
+      });
+  ASSERT_TRUE(expired.has_value());
 }
 
 TEST(Ros2ControlExecutionBackendTest,
