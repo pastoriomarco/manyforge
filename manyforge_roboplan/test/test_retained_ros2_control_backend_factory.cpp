@@ -42,7 +42,8 @@ public:
   }
 };
 
-[[nodiscard]] core::RuntimeParticipantBinding commanded_binding() {
+[[nodiscard]] core::RuntimeParticipantBinding
+commanded_binding(std::string component_id = "robot_1") {
   core::RuntimeParticipantBindingDTO value{
       core::ProgramId("program.physical"),
       core::ProgramRevision("program-revision"),
@@ -51,7 +52,7 @@ public:
       core::GraphRevision("graph"),
       core::ComponentRoleId("robot"),
       core::TargetRoleId("arm"),
-      core::ControllableComponentId("robot.1"),
+      core::ControllableComponentId(std::move(component_id)),
       core::ComponentTypeId("robot.type"),
       core::ComponentTypeRevision("robot-type-revision"),
       core::CommandTargetId("arm.target"),
@@ -108,7 +109,8 @@ public:
   return std::move(sealed.value());
 }
 
-[[nodiscard]] core::RuntimeParticipantBinding commanded_gripper_binding() {
+[[nodiscard]] core::RuntimeParticipantBinding
+commanded_gripper_binding(std::string component_id = "robot_1") {
   core::RuntimeParticipantBindingDTO value{
       core::ProgramId("program.physical"),
       core::ProgramRevision("program-revision"),
@@ -117,7 +119,7 @@ public:
       core::GraphRevision("graph"),
       core::ComponentRoleId("robot"),
       core::TargetRoleId("gripper"),
-      core::ControllableComponentId("robot.1"),
+      core::ControllableComponentId(std::move(component_id)),
       core::ComponentTypeId("robot.type"),
       core::ComponentTypeRevision("robot-type-revision"),
       core::CommandTargetId("gripper.target"),
@@ -237,6 +239,16 @@ TEST(RetainedRos2ControlBackendFactoryTest,
             (std::vector<std::string>{"joint_1"}));
   EXPECT_EQ(selected.execution.transport_joint_names,
             (std::vector<std::string>{"source_joint_1"}));
+  EXPECT_EQ(selected.execution.node_namespace, "/manyforge/robot_1");
+  EXPECT_EQ(selected.execution.action_name,
+            "/manyforge/robot_1/isaac_arm_controller/"
+            "follow_joint_trajectory");
+  EXPECT_EQ(selected.execution.joint_state_topic,
+            "/manyforge/robot_1/joint_states");
+  EXPECT_EQ(selected.execution.controller_state_topic,
+            "/manyforge/robot_1/isaac_arm_controller/controller_state");
+  EXPECT_EQ(selected.execution.command_gate_topic,
+            "/manyforge/robot_1/manyforge/isaac_arm_command_enable");
   EXPECT_EQ(selected.execution.execution_state_source_mode, "commanded_sim");
   EXPECT_FALSE(selected.execution.enable_jtc_speed_scaling_input);
   EXPECT_TRUE(selected.execution.enable_soft_on_path_path_ramp);
@@ -244,6 +256,13 @@ TEST(RetainedRos2ControlBackendFactoryTest,
   ASSERT_TRUE(selected.execution.controller_binding.has_value());
   EXPECT_EQ(selected.execution.controller_binding->hardware_component_name,
             "IsaacLite6TopicBasedSystem");
+  EXPECT_EQ(selected.execution.controller_binding->controller_manager,
+            "/manyforge/robot_1/controller_manager");
+  EXPECT_EQ(selected.execution.controller_binding->activity_topic,
+            "/manyforge/robot_1/controller_manager/activity");
+  EXPECT_EQ(selected.execution.controller_binding
+                ->trajectory_controller_ros_name,
+            "/manyforge/robot_1/isaac_arm_controller");
   EXPECT_EQ(selected.execution.controller_binding->required_joints,
             (std::vector<std::string>{"source_joint_1"}));
   EXPECT_EQ(selected.execution.controller_binding->claimed_command_interfaces,
@@ -252,12 +271,80 @@ TEST(RetainedRos2ControlBackendFactoryTest,
             (std::vector<std::string>{"source_joint_1/position",
                                       "source_joint_1/velocity"}));
   ASSERT_TRUE(selected.gripper.has_value());
+  EXPECT_EQ(selected.gripper->action_name,
+            "/manyforge/robot_1/lite_gripper_controller/gripper_cmd");
   EXPECT_EQ(selected.gripper->transport_kind, "isaac_joint_state_effort");
   EXPECT_EQ(selected.gripper->command_joint_names,
             (std::vector<std::string>{"source_gripper_joint"}));
   EXPECT_EQ(selected.gripper->group_id, "gripper");
   EXPECT_EQ(selected.gripper->joint_name, "gripper_joint");
   EXPECT_EQ(selected.gripper->completion_policy, "dwell_elapsed");
+}
+
+TEST(RetainedRos2ControlBackendFactoryTest,
+     SameTypeIsaacInstancesHaveDisjointControlPlaneEndpoints) {
+  deployment::ros2_control_execution_runtime_contract::Configuration runtime{
+      "ur10e", 12345U, {0.0}, 100U, 50.0};
+
+  const auto first = make_retained_isaac_ros2_control_backend_config(
+      runtime, commanded_binding("robot_a"),
+      commanded_gripper_binding("robot_a"));
+  const auto second = make_retained_isaac_ros2_control_backend_config(
+      runtime, commanded_binding("robot_b"),
+      commanded_gripper_binding("robot_b"));
+
+  ASSERT_TRUE(first.execution.controller_binding.has_value());
+  ASSERT_TRUE(second.execution.controller_binding.has_value());
+  ASSERT_TRUE(first.gripper.has_value());
+  ASSERT_TRUE(second.gripper.has_value());
+  const std::vector<std::string> first_endpoints{
+      first.execution.action_name,
+      first.execution.joint_state_topic,
+      first.execution.controller_state_topic,
+      first.execution.command_gate_topic,
+      first.execution.controller_binding->controller_manager,
+      first.execution.controller_binding->activity_topic,
+      first.execution.controller_binding->trajectory_controller_ros_name,
+      first.gripper->action_name};
+  const std::vector<std::string> second_endpoints{
+      second.execution.action_name,
+      second.execution.joint_state_topic,
+      second.execution.controller_state_topic,
+      second.execution.command_gate_topic,
+      second.execution.controller_binding->controller_manager,
+      second.execution.controller_binding->activity_topic,
+      second.execution.controller_binding->trajectory_controller_ros_name,
+      second.gripper->action_name};
+  ASSERT_EQ(first_endpoints.size(), second_endpoints.size());
+  for (std::size_t index = 0; index < first_endpoints.size(); ++index) {
+    EXPECT_NE(first_endpoints[index], second_endpoints[index]);
+  }
+  EXPECT_NE(first.execution.controller_binding->generation_id,
+            second.execution.controller_binding->generation_id);
+
+  // These are the configurable raw Isaac transport wires, not runtime-owned
+  // admission endpoints. A two-world fixture must give each launch instance
+  // distinct raw topics; the retained single-world defaults intentionally
+  // stay source-compatible.
+  EXPECT_EQ(first.gripper->command_topic, second.gripper->command_topic);
+  EXPECT_EQ(first.gripper->state_topic, second.gripper->state_topic);
+}
+
+TEST(RetainedRos2ControlBackendFactoryTest,
+     RetainedIsaacNamespaceRejectsLossyOrCrossedComponentIdentity) {
+  deployment::ros2_control_execution_runtime_contract::Configuration runtime{
+      "ur10e", 12345U, {0.0}, 100U, 50.0};
+
+  EXPECT_THROW(
+      static_cast<void>(make_retained_isaac_ros2_control_backend_config(
+          runtime, commanded_binding("robot.1"),
+          commanded_gripper_binding("robot.1"))),
+      std::invalid_argument);
+  EXPECT_THROW(
+      static_cast<void>(make_retained_isaac_ros2_control_backend_config(
+          runtime, commanded_binding("robot_a"),
+          commanded_gripper_binding("robot_b"))),
+      std::invalid_argument);
 }
 
 TEST(RetainedRos2ControlBackendFactoryTest,
@@ -423,7 +510,7 @@ TEST(RetainedRos2ControlBackendFactoryTest,
   backend->testing_publish_controller_binding_snapshot(std::move(ready));
 
   RetainedRos2ControlAdmissionOwnerConfig owner_config{
-      core::ControllableComponentId("robot.1"),
+      core::ControllableComponentId("robot_1"),
       core::RuntimeEpoch("runtime-epoch.1"),
       binding_generation,
       "provider-epoch.1",

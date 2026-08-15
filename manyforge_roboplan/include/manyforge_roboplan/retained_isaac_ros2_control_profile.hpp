@@ -1,12 +1,19 @@
 #pragma once
 
 #include <optional>
+#include <string>
 
 #include <manyforge_core/runtime_participant_binding.hpp>
 #include <manyforge_deployment/ros2_control_execution_runtime_contract.hpp>
 #include <manyforge_roboplan/retained_ros2_control_backend_factory.hpp>
 
 namespace manyforge::roboplan_backend {
+
+/// Exact ROS namespace assigned to one retained Isaac controllable component.
+/// Component identities that cannot be represented as one bounded ROS token
+/// are rejected instead of being lossy-normalized into a crossed endpoint.
+[[nodiscard]] std::string retained_isaac_ros_namespace(
+    const core::RuntimeParticipantBinding &binding);
 
 /// Expand one closed retained Isaac profile into the exact generic ROS/JTC
 /// adapter configuration used by the installed execution host.

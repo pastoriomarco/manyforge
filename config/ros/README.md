@@ -1,13 +1,42 @@
 # ROS Environment Profiles
 
-> **Current `dev` boundary:** these profiles are retained configuration and
-> historical topology references. Sourcing one does not make an Isaac/ROS
-> product lane available or qualified. Do not execute the linked bring-up
-> recipes until I9/I restores the Isaac lane and its prerequisite headless
-> gates.
+> **Current `dev` boundary:** `isaac_i9.env.sh` is the active I9 topology input
+> for the source-matched mechanical Isaac/Jazzy product. The older
+> FoundationPose profile remains a historical reference; it is not the I9
+> topology API. Sourcing either file alone is not scenario qualification.
 
 This directory contains sourceable ROS 2 environment profiles from the last
 qualified ManyForge operator workflows.
+
+## I9 laptop and Orin topology
+
+Source `isaac_i9.env.sh` in the laptop Isaac shell and in every Orin ROS
+participant/container shell:
+
+```bash
+MANYFORGE_ROOT="${MANYFORGE_ROOT:-${HOME}/workspaces/dev_ws/src/manyforge}"
+source "${MANYFORGE_ROOT}/config/ros/isaac_i9.env.sh"
+```
+
+Its recorded default is one role-free explicit peer list:
+
+- `ROS_DOMAIN_ID=0`
+- `RMW_IMPLEMENTATION=rmw_fastrtps_cpp`
+- `ROS_AUTOMATIC_DISCOVERY_RANGE=LOCALHOST`
+- `ROS_STATIC_PEERS=192.168.1.132;192.168.1.68`
+
+The profile unsets stale Fast DDS discovery-server/profile and Cyclone DDS
+inputs. A different domain or peer set is valid only when applied to every
+participant as one recorded topology input. Use `MANYFORGE_ROS_DOMAIN_ID`,
+`MANYFORGE_RMW_IMPLEMENTATION`,
+`MANYFORGE_ROS_AUTOMATIC_DISCOVERY_RANGE`, and
+`MANYFORGE_ROS_STATIC_PEERS` for that deliberate whole-topology override.
+
+The Orin launcher derives `/manyforge/<controllable_component_id>` from
+`MANYFORGE_ISAAC_COMPONENT_ID` and passes that same namespace to the retained
+execution backend, controller manager, command gate, and gripper adapter. Raw
+Isaac transport topics remain explicit launch inputs so a multi-world fixture
+can assign disjoint wires without changing the retained single-UR10 defaults.
 
 ## Isaac Lite6 Trocar FoundationPose
 

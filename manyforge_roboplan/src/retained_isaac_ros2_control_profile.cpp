@@ -40,7 +40,7 @@ constexpr IsaacProfileFacts kLite6Profile{
     40.0,
     1.5,
     "isaac_joint_state_effort",
-    "/lite_gripper_controller/gripper_cmd",
+    "lite_gripper_controller/gripper_cmd",
     "/isaac_joint_commands_gripper",
     "/isaac_joint_states",
     "dwell_elapsed",
@@ -59,7 +59,7 @@ constexpr IsaacProfileFacts kUr10eProfile{
     50.0,
     0.5,
     "ros_gripper_command",
-    "/robotiq_gripper_controller/gripper_cmd",
+    "robotiq_gripper_controller/gripper_cmd",
     "/isaac_gripper_state",
     "/isaac_joint_states",
     "position_reached",
@@ -139,12 +139,15 @@ interfaces(const std::vector<std::string> &joints,
 
 [[nodiscard]] std::string controller_binding_generation(
     const IsaacProfileFacts &profile,
+    const std::string_view runtime_namespace,
     const std::vector<std::string> &transport_joints) {
-  std::string preimage("manyforge.isaac-controller-binding.v1");
+  std::string preimage("manyforge.isaac-controller-binding.v2");
   preimage.push_back('\0');
   preimage.append(profile.profile_id);
   preimage.push_back('\0');
   preimage.append(profile.hardware_component_name);
+  preimage.push_back('\0');
+  preimage.append(runtime_namespace);
   for (const auto &joint : transport_joints) {
     preimage.push_back('\0');
     preimage.append(joint);
@@ -152,7 +155,48 @@ interfaces(const std::vector<std::string> &joints,
   return manyforge::content_identity::sha256_digest(preimage);
 }
 
+[[nodiscard]] bool is_ascii_alpha(const char value) noexcept {
+  return (value >= 'A' && value <= 'Z') ||
+         (value >= 'a' && value <= 'z');
+}
+
+[[nodiscard]] bool is_ascii_digit(const char value) noexcept {
+  return value >= '0' && value <= '9';
+}
+
+[[nodiscard]] bool is_ros_name_token(const std::string_view token) noexcept {
+  if (token.empty() || token.size() > 255U ||
+      (!is_ascii_alpha(token.front()) && token.front() != '_')) {
+    return false;
+  }
+  return std::all_of(token.begin() + 1, token.end(), [](const char character) {
+    return is_ascii_alpha(character) || is_ascii_digit(character) ||
+           character == '_';
+  });
+}
+
+[[nodiscard]] std::string scoped_name(
+    const std::string_view runtime_namespace,
+    const std::string_view relative_name) {
+  std::string result(runtime_namespace);
+  result.push_back('/');
+  result.append(relative_name);
+  return result;
+}
+
 } // namespace
+
+std::string retained_isaac_ros_namespace(
+    const core::RuntimeParticipantBinding &binding) {
+  const auto &component_id =
+      binding.value().controllable_component_id.value();
+  if (!is_ros_name_token(component_id)) {
+    throw std::invalid_argument(
+        "retained Isaac controllable component id must be one bounded ROS "
+        "name token");
+  }
+  return "/manyforge/" + component_id;
+}
 
 RetainedRos2ControlBackendConfig
 make_retained_isaac_ros2_control_backend_config(
@@ -161,6 +205,8 @@ make_retained_isaac_ros2_control_backend_config(
     const core::RuntimeParticipantBinding &motion_binding,
     const std::optional<core::RuntimeParticipantBinding> &gripper_binding) {
   const auto &profile = profile_facts(runtime_configuration.isaac_profile);
+  const auto runtime_namespace =
+      retained_isaac_ros_namespace(motion_binding);
   if (!motion_binding.value().control_path.has_value() ||
       motion_binding.value().control_path->state_authority_class !=
           core::StateAuthorityClass::kCommanded ||
@@ -171,6 +217,12 @@ make_retained_isaac_ros2_control_backend_config(
     throw std::invalid_argument(
         "retained Isaac ROS profile requires commanded motion and gripper "
         "control paths");
+  }
+  if (motion_binding.value().controllable_component_id !=
+      gripper_binding->value().controllable_component_id) {
+    throw std::invalid_argument(
+        "retained Isaac motion and gripper bindings must address the same "
+        "controllable component");
   }
 
   const auto compiled_joints = compiled_resources(motion_binding);
@@ -190,11 +242,13 @@ make_retained_isaac_ros2_control_backend_config(
 
   ros2_control_execution::Ros2ControlExecutionBackendConfig execution;
   execution.node_name = "manyforge_ros2_control_execution_backend";
-  execution.action_name =
-      "/isaac_arm_controller/follow_joint_trajectory";
-  execution.joint_state_topic = "/joint_states";
-  execution.controller_state_topic =
-      "/isaac_arm_controller/controller_state";
+  execution.node_namespace = runtime_namespace;
+  execution.action_name = scoped_name(
+      runtime_namespace, "isaac_arm_controller/follow_joint_trajectory");
+  execution.joint_state_topic =
+      scoped_name(runtime_namespace, "joint_states");
+  execution.controller_state_topic = scoped_name(
+      runtime_namespace, "isaac_arm_controller/controller_state");
   execution.required_joints = compiled_joints;
   execution.transport_joint_names = transport_joints;
   execution.observed_state_source_precedence = {
@@ -216,7 +270,8 @@ make_retained_isaac_ros2_control_backend_config(
   execution.execution_state_source_mode = "commanded_sim";
   execution.initial_joint_positions_rad =
       runtime_configuration.initial_joint_positions_rad;
-  execution.command_gate_topic = "/manyforge/isaac_arm_command_enable";
+  execution.command_gate_topic = scoped_name(
+      runtime_namespace, "manyforge/isaac_arm_command_enable");
   execution.require_execution_admission_snapshot = true;
   execution.controller_binding_refresh_timeout_s = 0.25;
   execution.enable_jtc_speed_scaling_input = false;
@@ -236,12 +291,16 @@ make_retained_isaac_ros2_control_backend_config(
 
   ros2_control_execution::ControllerBindingContract controller;
   controller.generation_id =
-      controller_binding_generation(profile, transport_joints);
-  controller.controller_manager = "/controller_manager";
-  controller.activity_topic = "/controller_manager/activity";
+      controller_binding_generation(profile, runtime_namespace,
+                                    transport_joints);
+  controller.controller_manager =
+      scoped_name(runtime_namespace, "controller_manager");
+  controller.activity_topic =
+      scoped_name(runtime_namespace, "controller_manager/activity");
   controller.hardware_component_name = profile.hardware_component_name;
   controller.trajectory_controller_manager_name = "isaac_arm_controller";
-  controller.trajectory_controller_ros_name = "/isaac_arm_controller";
+  controller.trajectory_controller_ros_name =
+      scoped_name(runtime_namespace, "isaac_arm_controller");
   controller.trajectory_controller_type =
       "joint_trajectory_controller/JointTrajectoryController";
   controller.follow_joint_trajectory_action = execution.action_name;
@@ -267,7 +326,8 @@ make_retained_isaac_ros2_control_backend_config(
         "retained Isaac ROS gripper has no exact coordinate mapping");
   }
   ros2_control_execution::Ros2GripperActionConfig gripper_config;
-  gripper_config.action_name = profile.gripper_action_name;
+  gripper_config.action_name =
+      scoped_name(runtime_namespace, profile.gripper_action_name);
   gripper_config.transport_kind = profile.gripper_transport_kind;
   gripper_config.command_topic = profile.gripper_command_topic;
   gripper_config.state_topic = profile.gripper_state_topic;

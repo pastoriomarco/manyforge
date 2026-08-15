@@ -32,6 +32,7 @@ DEFAULT_WORLD_URI = (
     "isaac_manipulator_scene_light.usda"
 )
 DEFAULT_WORLD_NAME = "isaac_manipulator_scene_light"
+DEFAULT_RUNTIME_NAMESPACE = "/manyforge/isaac_ur10e_light_robot"
 
 
 def generate_launch_description() -> LaunchDescription:
@@ -41,6 +42,14 @@ def generate_launch_description() -> LaunchDescription:
                 "isaac_profile",
                 default_value="ur10e",
                 description="Retained Isaac transport profile: ur10e or lite6.",
+            ),
+            DeclareLaunchArgument(
+                "runtime_namespace",
+                default_value=DEFAULT_RUNTIME_NAMESPACE,
+                description=(
+                    "Exact /manyforge/<controllable_component_id> namespace "
+                    "shared by this runtime and its mechanical adapters."
+                ),
             ),
             DeclareLaunchArgument(
                 "world_uri",
@@ -114,14 +123,19 @@ def generate_launch_description() -> LaunchDescription:
             ),
             DeclareLaunchArgument(
                 "command_gate_enable_topic",
-                default_value="/manyforge/isaac_arm_command_enable",
+                default_value="manyforge/isaac_arm_command_enable",
             ),
             DeclareLaunchArgument(
                 "command_gate_owner_node",
                 default_value="manyforge_ros2_control_execution_backend",
             ),
             DeclareLaunchArgument(
-                "command_gate_owner_namespace", default_value="/"
+                "command_gate_owner_namespace",
+                default_value="",
+                description=(
+                    "Optional exact owner namespace assertion. Empty selects "
+                    "runtime_namespace; any crossed value is rejected."
+                ),
             ),
             DeclareLaunchArgument(
                 "stop_joint_commands_topic", default_value="/stop_joint_commands"
@@ -146,7 +160,7 @@ def generate_launch_description() -> LaunchDescription:
             DeclareLaunchArgument("joint6_initial", default_value="0.0"),
             DeclareLaunchArgument(
                 "gripper_action_name",
-                default_value="/robotiq_gripper_controller/gripper_cmd",
+                default_value="robotiq_gripper_controller/gripper_cmd",
             ),
             DeclareLaunchArgument(
                 "gripper_command_topic", default_value="/isaac_gripper_state"
@@ -156,7 +170,7 @@ def generate_launch_description() -> LaunchDescription:
             ),
             DeclareLaunchArgument(
                 "gripper_readiness_topic",
-                default_value="/manyforge/isaac_gripper_bridge/ready",
+                default_value="manyforge/isaac_gripper_bridge/ready",
             ),
             DeclareLaunchArgument(
                 "start_gripper_action_bridge",
@@ -181,6 +195,10 @@ def _launch_setup(context, *_, **__) -> list[object]:
     )
     profile = _profile_configuration(
         LaunchConfiguration("isaac_profile").perform(context)
+    )
+    runtime_namespace = _instance_namespace(
+        LaunchConfiguration("runtime_namespace").perform(context),
+        name="runtime_namespace",
     )
     joint_commands_topic = _absolute_ros_name(
         LaunchConfiguration("joint_commands_topic").perform(context),
@@ -318,12 +336,24 @@ def _launch_setup(context, *_, **__) -> list[object]:
         LaunchConfiguration("command_gate_owner_node").perform(context),
         name="command_gate_owner_node",
     )
-    owner_namespace = _absolute_namespace(
-        LaunchConfiguration("command_gate_owner_namespace").perform(context),
-        name="command_gate_owner_namespace",
+    requested_owner_namespace = LaunchConfiguration(
+        "command_gate_owner_namespace"
+    ).perform(context).strip()
+    owner_namespace = (
+        runtime_namespace
+        if not requested_owner_namespace
+        else _instance_namespace(
+            requested_owner_namespace,
+            name="command_gate_owner_namespace",
+        )
     )
-    enable_topic = _absolute_ros_name(
+    if owner_namespace != runtime_namespace:
+        raise ValueError(
+            "command_gate_owner_namespace must equal runtime_namespace"
+        )
+    enable_topic = _scoped_ros_name(
         LaunchConfiguration("command_gate_enable_topic").perform(context),
+        runtime_namespace=runtime_namespace,
         name="command_gate_enable_topic",
     )
     stop_topic = _absolute_ros_name(
@@ -335,6 +365,7 @@ def _launch_setup(context, *_, **__) -> list[object]:
         package="manyforge_ros_bringup",
         executable="isaac_scene_load_barrier",
         name="manyforge_isaac_scene_load_barrier",
+        namespace=runtime_namespace,
         output="screen",
         parameters=[
             {
@@ -362,6 +393,7 @@ def _launch_setup(context, *_, **__) -> list[object]:
         package="manyforge_ros_bringup",
         executable="isaac_topic_command_gate",
         name="manyforge_isaac_topic_command_gate",
+        namespace=runtime_namespace,
         output="screen",
         parameters=[
             {
@@ -384,6 +416,7 @@ def _launch_setup(context, *_, **__) -> list[object]:
     robot_state_publisher = Node(
         package="robot_state_publisher",
         executable="robot_state_publisher",
+        namespace=runtime_namespace,
         output="screen",
         parameters=[{"robot_description": robot_description}],
     )
@@ -397,6 +430,7 @@ def _launch_setup(context, *_, **__) -> list[object]:
         package="tf2_ros",
         executable="static_transform_publisher",
         name="manyforge_static_base_tf",
+        namespace=runtime_namespace,
         output="screen",
         arguments=[
             "--x",
@@ -421,6 +455,7 @@ def _launch_setup(context, *_, **__) -> list[object]:
         package="controller_manager",
         executable="ros2_control_node",
         name=controller_manager_name,
+        namespace=runtime_namespace,
         output="screen",
         parameters=[
             {"robot_description": robot_description},
@@ -429,10 +464,13 @@ def _launch_setup(context, *_, **__) -> list[object]:
         ],
         on_exit=_shutdown("Isaac controller_manager exited"),
     )
-    controller_manager_path = f"/{controller_manager_name}"
+    controller_manager_path = _join_namespace(
+        runtime_namespace, controller_manager_name
+    )
     joint_state_broadcaster = Node(
         package="controller_manager",
         executable="spawner",
+        namespace=runtime_namespace,
         output="screen",
         arguments=[
             "joint_state_broadcaster",
@@ -445,6 +483,7 @@ def _launch_setup(context, *_, **__) -> list[object]:
     arm_controller = Node(
         package="controller_manager",
         executable="spawner",
+        namespace=runtime_namespace,
         output="screen",
         arguments=[
             arm_controller_name,
@@ -470,6 +509,7 @@ def _launch_setup(context, *_, **__) -> list[object]:
                 package="manyforge_ros_bringup",
                 executable="isaac_gripper_action_bridge",
                 name="manyforge_isaac_gripper_action_bridge",
+                namespace=runtime_namespace,
                 output="screen",
                 parameters=[
                     str(
@@ -478,10 +518,11 @@ def _launch_setup(context, *_, **__) -> list[object]:
                         / "isaac_robotiq_2f_140_gripper_bridge.yaml"
                     ),
                     {
-                        "action_name": _absolute_ros_name(
+                        "action_name": _scoped_ros_name(
                             LaunchConfiguration("gripper_action_name").perform(
                                 context
                             ),
+                            runtime_namespace=runtime_namespace,
                             name="gripper_action_name",
                         ),
                         "command_topic": _absolute_ros_name(
@@ -496,10 +537,11 @@ def _launch_setup(context, *_, **__) -> list[object]:
                             ),
                             name="gripper_state_topic",
                         ),
-                        "readiness_topic": _absolute_ros_name(
+                        "readiness_topic": _scoped_ros_name(
                             LaunchConfiguration("gripper_readiness_topic").perform(
                                 context
                             ),
+                            runtime_namespace=runtime_namespace,
                             name="gripper_readiness_topic",
                         ),
                         "command_enable_topic": enable_topic,
@@ -516,6 +558,7 @@ def _launch_setup(context, *_, **__) -> list[object]:
                 package="manyforge_ros_bringup",
                 executable="pose_source_snapshot_publisher",
                 name="manyforge_isaac_pose_observer",
+                namespace=runtime_namespace,
                 output="screen",
                 parameters=[
                     {
@@ -645,6 +688,12 @@ def _relative_ros_name(value: str, *, name: str) -> str:
         or normalized.startswith("/")
         or "/" in normalized
         or any(character.isspace() for character in normalized)
+        or not normalized.isascii()
+        or (not normalized[0].isalpha() and normalized[0] != "_")
+        or any(
+            not character.isalnum() and character != "_"
+            for character in normalized[1:]
+        )
         or len(normalized.encode("utf-8")) > 256
     ):
         raise ValueError(f"{name} must be one bounded relative ROS node name")
@@ -656,6 +705,50 @@ def _absolute_namespace(value: str, *, name: str) -> str:
     if normalized == "/":
         return normalized
     return _absolute_ros_name(normalized, name=name)
+
+
+def _instance_namespace(value: str, *, name: str) -> str:
+    normalized = _absolute_namespace(value, name=name)
+    prefix = "/manyforge/"
+    if not normalized.startswith(prefix):
+        raise ValueError(
+            f"{name} must be /manyforge/<controllable_component_id>"
+        )
+    component_id = normalized[len(prefix) :]
+    if "/" in component_id:
+        raise ValueError(
+            f"{name} must contain exactly one controllable-component token"
+        )
+    _relative_ros_name(component_id, name=name)
+    return normalized
+
+
+def _relative_ros_path(value: str, *, name: str) -> str:
+    normalized = value.strip().strip("/")
+    if (
+        not normalized
+        or value.strip().startswith("/")
+        or value.strip().endswith("/")
+        or "//" in normalized
+        or len(normalized.encode("utf-8")) > 1024
+    ):
+        raise ValueError(f"{name} must be one bounded relative ROS name")
+    for token in normalized.split("/"):
+        _relative_ros_name(token, name=name)
+    return normalized
+
+
+def _join_namespace(namespace: str, relative_name: str) -> str:
+    return f"{namespace}/{relative_name}"
+
+
+def _scoped_ros_name(
+    value: str, *, runtime_namespace: str, name: str
+) -> str:
+    return _join_namespace(
+        runtime_namespace,
+        _relative_ros_path(value, name=name),
+    )
 
 
 def _parse_topic_csv(value: str, *, name: str) -> list[str]:

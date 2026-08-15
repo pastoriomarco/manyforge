@@ -1,8 +1,9 @@
 """Fail-closed adapter from the retained backend gate to Isaac's Stop topic.
 
 The C++ ros2_control execution backend is the sole command-admission owner and
-the sole publisher of ``/manyforge/isaac_arm_command_enable``. This node owns
-no admission policy: it mechanically inverts that one Boolean fact for
+the sole publisher of its component-scoped
+``manyforge/isaac_arm_command_enable`` endpoint. This node owns no admission
+policy: it mechanically inverts that one Boolean fact for
 ``topic_based_ros2_control`` and closes the gate whenever the exact publisher
 topology disappears or becomes ambiguous.
 """
@@ -18,10 +19,13 @@ from rclpy.qos import DurabilityPolicy, QoSProfile, ReliabilityPolicy
 from std_msgs.msg import Bool
 
 
-DEFAULT_ENABLE_TOPIC: Final = "/manyforge/isaac_arm_command_enable"
+DEFAULT_RUNTIME_NAMESPACE: Final = "/manyforge/isaac_ur10e_light_robot"
+DEFAULT_ENABLE_TOPIC: Final = (
+    DEFAULT_RUNTIME_NAMESPACE + "/manyforge/isaac_arm_command_enable"
+)
 DEFAULT_STOP_TOPIC: Final = "/stop_joint_commands"
 DEFAULT_OWNER_NODE: Final = "manyforge_ros2_control_execution_backend"
-DEFAULT_OWNER_NAMESPACE: Final = "/"
+DEFAULT_OWNER_NAMESPACE: Final = DEFAULT_RUNTIME_NAMESPACE
 
 
 def stop_topic_value(*, owner_command_enabled: bool) -> bool:

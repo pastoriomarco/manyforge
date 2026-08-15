@@ -121,12 +121,15 @@ class IsaacGripperActionBridge(Node):
 
     def _declare_parameters(self) -> None:
         self.declare_parameter(
-            "action_name", "/robotiq_gripper_controller/gripper_cmd"
+            "action_name",
+            DEFAULT_OWNER_NAMESPACE
+            + "/robotiq_gripper_controller/gripper_cmd",
         )
         self.declare_parameter("command_topic", "/isaac_gripper_state")
         self.declare_parameter("state_topic", "/isaac_joint_states")
         self.declare_parameter(
-            "readiness_topic", "/manyforge/isaac_gripper_bridge/ready"
+            "readiness_topic",
+            DEFAULT_OWNER_NAMESPACE + "/manyforge/isaac_gripper_bridge/ready",
         )
         self.declare_parameter("command_enable_topic", DEFAULT_ENABLE_TOPIC)
         self.declare_parameter("expected_owner_node", DEFAULT_OWNER_NODE)

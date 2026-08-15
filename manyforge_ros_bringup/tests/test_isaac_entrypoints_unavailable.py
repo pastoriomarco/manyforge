@@ -41,7 +41,7 @@ def test_isaac_stop_topic_translation_rejects_non_boolean_owner_facts(
 def test_owner_topology_requires_one_exact_backend_publisher() -> None:
     exact = SimpleNamespace(
         node_name=isaac_topic_command_gate.DEFAULT_OWNER_NODE,
-        node_namespace="/",
+        node_namespace=isaac_topic_command_gate.DEFAULT_OWNER_NAMESPACE,
     )
     foreign = SimpleNamespace(node_name="foreign_gate_owner", node_namespace="/")
     namespaced = SimpleNamespace(
@@ -67,7 +67,7 @@ def test_owner_topology_requires_one_exact_backend_publisher() -> None:
 
     endpoint = SimpleNamespace(
         node_name=isaac_topic_command_gate.DEFAULT_OWNER_NODE,
-        node_namespace="/",
+        node_namespace=isaac_topic_command_gate.DEFAULT_OWNER_NAMESPACE,
         endpoint_gid=range(16),
     )
     assert isaac_topic_command_gate.owner_endpoint_identity(
@@ -81,7 +81,8 @@ def test_both_wire_adapters_consume_the_same_retained_owner_fact() -> None:
     gripper_source = inspect.getsource(isaac_gripper_action_bridge)
 
     assert isaac_topic_command_gate.DEFAULT_ENABLE_TOPIC == (
-        "/manyforge/isaac_arm_command_enable"
+        "/manyforge/isaac_ur10e_light_robot/"
+        "manyforge/isaac_arm_command_enable"
     )
     assert isaac_topic_command_gate.DEFAULT_OWNER_NODE == (
         "manyforge_ros2_control_execution_backend"
@@ -115,7 +116,10 @@ def test_command_gate_closes_again_when_exact_owner_disappears() -> None:
         reliability=ReliabilityPolicy.RELIABLE,
     )
     try:
-        owner = Node(isaac_topic_command_gate.DEFAULT_OWNER_NODE)
+        owner = Node(
+            isaac_topic_command_gate.DEFAULT_OWNER_NODE,
+            namespace=isaac_topic_command_gate.DEFAULT_OWNER_NAMESPACE,
+        )
         enable = owner.create_publisher(
             Bool,
             isaac_topic_command_gate.DEFAULT_ENABLE_TOPIC,

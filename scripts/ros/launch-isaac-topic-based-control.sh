@@ -18,17 +18,8 @@ ROS_OVERLAY="${MANYFORGE_ISAAC_ROS_OVERLAY:-${BUILD_ROOT}/ros-overlay}"
 
 # shellcheck source=../lib/realtime-resources.sh
 source "${WORKSPACE}/scripts/lib/realtime-resources.sh"
-
-export ROS_DOMAIN_ID="${ROS_DOMAIN_ID:-0}"
-export RMW_IMPLEMENTATION="${RMW_IMPLEMENTATION:-rmw_fastrtps_cpp}"
-export ROS_AUTOMATIC_DISCOVERY_RANGE="${ROS_AUTOMATIC_DISCOVERY_RANGE:-LOCALHOST}"
-export ROS_STATIC_PEERS="${ROS_STATIC_PEERS:-192.168.1.132;192.168.1.68}"
-unset \
-    FASTRTPS_DEFAULT_PROFILES_FILE \
-    FASTDDS_DEFAULT_PROFILES_FILE \
-    ROS_DISCOVERY_SERVER \
-    ROS_SUPER_CLIENT \
-    CYCLONEDDS_URI
+# shellcheck source=../../config/ros/isaac_i9.env.sh
+source "${WORKSPACE}/config/ros/isaac_i9.env.sh"
 
 if [[ ! "${ROS_DOMAIN_ID}" =~ ^[0-9]+$ ]] || ((10#${ROS_DOMAIN_ID} > 232)); then
     printf 'ROS_DOMAIN_ID must be an integer in [0, 232].\n' >&2
@@ -42,10 +33,42 @@ if [[ "${ROS_AUTOMATIC_DISCOVERY_RANGE}" != LOCALHOST ]]; then
     printf 'I9 requires ROS_AUTOMATIC_DISCOVERY_RANGE=LOCALHOST.\n' >&2
     exit 2
 fi
-if [[ -z "${ROS_STATIC_PEERS}" || "${ROS_STATIC_PEERS}" == *[[:space:]]* ]]; then
+if [[ -z "${ROS_STATIC_PEERS}" || \
+      "${ROS_STATIC_PEERS}" == *[[:space:]]* || \
+      "${ROS_STATIC_PEERS}" == \;* || \
+      "${ROS_STATIC_PEERS}" == *\; || \
+      "${ROS_STATIC_PEERS}" == *\;\;* || \
+      ${#ROS_STATIC_PEERS} -gt 4096 ]]; then
     printf 'ROS_STATIC_PEERS must be one non-empty explicit peer list.\n' >&2
     exit 2
 fi
+
+isaac_profile="${ISAAC_TOPIC_CONTROL_PROFILE:-ur10e}"
+case "${isaac_profile}" in
+    ur10e)
+        default_component_id=isaac_ur10e_light_robot
+        ;;
+    lite6)
+        default_component_id=isaac_lite6_robot
+        ;;
+    *)
+        printf 'ISAAC_TOPIC_CONTROL_PROFILE must be ur10e or lite6.\n' >&2
+        exit 2
+        ;;
+esac
+component_id="${MANYFORGE_ISAAC_COMPONENT_ID:-${default_component_id}}"
+if [[ ! "${component_id}" =~ ^[A-Za-z_][A-Za-z0-9_]{0,254}$ ]]; then
+    printf 'MANYFORGE_ISAAC_COMPONENT_ID must be one bounded ROS name token.\n' >&2
+    exit 2
+fi
+runtime_namespace="/manyforge/${component_id}"
+
+printf 'I9 DDS topology: domain=%s rmw=%s discovery=%s peers=%s runtime=%s\n' \
+    "${ROS_DOMAIN_ID}" \
+    "${RMW_IMPLEMENTATION}" \
+    "${ROS_AUTOMATIC_DISCOVERY_RANGE}" \
+    "${ROS_STATIC_PEERS}" \
+    "${runtime_namespace}"
 
 "${WORKSPACE}/scripts/ros/build-ros2-control-runtime.sh"
 
@@ -61,7 +84,9 @@ set -u
 export PYTHONPATH="${WORKSPACE}/manyforge_ros:${WORKSPACE}/manyforge_behavior:${WORKSPACE}:${PYTHONPATH:-}"
 
 launch_arguments=(
-    "isaac_profile:=${ISAAC_TOPIC_CONTROL_PROFILE:-ur10e}"
+    "isaac_profile:=${isaac_profile}"
+    "runtime_namespace:=${runtime_namespace}"
+    "command_gate_owner_namespace:=${runtime_namespace}"
     "world_uri:=${ISAAC_WORLD_URI:-file:/home/tndlux/workspaces/isaac_ros-dev/src/isaac_sim_custom_examples/Scenario/IsaacManipulator/UniversalRobots/isaac_manipulator_scene_light.usda}"
     "expected_world_name:=${ISAAC_EXPECTED_WORLD_NAME:-isaac_manipulator_scene_light}"
     "scene_startup_timeout_s:=${ISAAC_SCENE_STARTUP_TIMEOUT_S:-180.0}"

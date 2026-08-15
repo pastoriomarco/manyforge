@@ -425,17 +425,19 @@ def test_i9_isaac_launcher_enforces_the_recorded_topology_and_owner_split() -> N
     source = (
         _REPO_ROOT / "scripts/ros/launch-isaac-topic-based-control.sh"
     ).read_text(encoding="utf-8")
+    topology_source = (
+        _REPO_ROOT / "config/ros/isaac_i9.env.sh"
+    ).read_text(encoding="utf-8")
 
     assert "manyforge_fail_composable_cell_runtime_unavailable" not in source
-    assert 'ROS_DOMAIN_ID="${ROS_DOMAIN_ID:-0}"' in source
-    assert 'RMW_IMPLEMENTATION="${RMW_IMPLEMENTATION:-rmw_fastrtps_cpp}"' in source
+    assert 'source "${WORKSPACE}/config/ros/isaac_i9.env.sh"' in source
+    assert 'ROS_DOMAIN_ID:-0' in topology_source
+    assert 'RMW_IMPLEMENTATION:-rmw_fastrtps_cpp' in topology_source
     assert (
-        'ROS_AUTOMATIC_DISCOVERY_RANGE="${ROS_AUTOMATIC_DISCOVERY_RANGE:-LOCALHOST}"'
-        in source
+        'ROS_AUTOMATIC_DISCOVERY_RANGE:-LOCALHOST' in topology_source
     )
     assert (
-        'ROS_STATIC_PEERS="${ROS_STATIC_PEERS:-192.168.1.132;192.168.1.68}"'
-        in source
+        'ROS_STATIC_PEERS:-192.168.1.132;192.168.1.68' in topology_source
     )
     for stale_override in (
         "FASTRTPS_DEFAULT_PROFILES_FILE",
@@ -444,10 +446,13 @@ def test_i9_isaac_launcher_enforces_the_recorded_topology_and_owner_split() -> N
         "ROS_SUPER_CLIENT",
         "CYCLONEDDS_URI",
     ):
-        assert stale_override in source
+        assert stale_override in topology_source
     assert "build-ros2-control-runtime.sh" in source
     assert "isaac_topic_based_control.launch.py" in source
     assert "simulation_interfaces" in source
+    assert 'runtime_namespace:=${runtime_namespace}' in source
+    assert 'command_gate_owner_namespace:=${runtime_namespace}' in source
+    assert "MANYFORGE_ISAAC_COMPONENT_ID" in source
     for forbidden in (
         "isaac_demo_supervisor",
         "program_path:=",
@@ -456,6 +461,53 @@ def test_i9_isaac_launcher_enforces_the_recorded_topology_and_owner_split() -> N
         "docker ",
     ):
         assert forbidden not in source
+
+
+def test_i9_topology_input_clears_stale_dds_overrides_and_is_role_free() -> None:
+    topology = _REPO_ROOT / "config/ros/isaac_i9.env.sh"
+    environment = os.environ.copy()
+    for variable in (
+        "ROS_DOMAIN_ID",
+        "RMW_IMPLEMENTATION",
+        "ROS_AUTOMATIC_DISCOVERY_RANGE",
+        "ROS_STATIC_PEERS",
+        "MANYFORGE_ROS_DOMAIN_ID",
+        "MANYFORGE_RMW_IMPLEMENTATION",
+        "MANYFORGE_ROS_AUTOMATIC_DISCOVERY_RANGE",
+        "MANYFORGE_ROS_STATIC_PEERS",
+    ):
+        environment.pop(variable, None)
+    environment.update(
+        {
+            "FASTRTPS_DEFAULT_PROFILES_FILE": "/stale/fastdds.xml",
+            "CYCLONEDDS_URI": "file:///stale/cyclone.xml",
+        }
+    )
+    command = (
+        f"source {str(topology)!r}; "
+        "printf '%s|%s|%s|%s|%s|%s' "
+        '"$ROS_DOMAIN_ID" "$RMW_IMPLEMENTATION" '
+        '"$ROS_AUTOMATIC_DISCOVERY_RANGE" "$ROS_STATIC_PEERS" '
+        '"${FASTRTPS_DEFAULT_PROFILES_FILE-unset}" '
+        '"${CYCLONEDDS_URI-unset}"'
+    )
+
+    completed = subprocess.run(
+        ["/bin/bash", "--noprofile", "--norc", "-c", command],
+        cwd=_REPO_ROOT,
+        env=environment,
+        text=True,
+        capture_output=True,
+        check=True,
+    )
+
+    assert completed.stdout == (
+        "0|rmw_fastrtps_cpp|LOCALHOST|"
+        "192.168.1.132;192.168.1.68|unset|unset"
+    )
+    source = topology.read_text(encoding="utf-8")
+    for host_role in ("THOR", "ISAAC_SIM_IP", "ORIN_IP", "MANAGER_IP"):
+        assert host_role not in source
 
 
 @pytest.mark.parametrize(

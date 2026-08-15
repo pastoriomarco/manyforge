@@ -38,6 +38,52 @@ constexpr double kRuntimeScaleSlewPerSecond = 4.0; // 0→1 in 250 ms.
 constexpr auto kIdleSceneProjectionMinPeriod = std::chrono::milliseconds(100);
 constexpr auto kSceneProjectionBarrierTimeout = std::chrono::seconds(1);
 
+bool is_ascii_alpha(const char value) noexcept {
+  return (value >= 'A' && value <= 'Z') ||
+         (value >= 'a' && value <= 'z');
+}
+
+bool is_ascii_digit(const char value) noexcept {
+  return value >= '0' && value <= '9';
+}
+
+bool is_ros_name_token(const std::string_view token) noexcept {
+  if (token.empty() || token.size() > 255U ||
+      (!is_ascii_alpha(token.front()) && token.front() != '_')) {
+    return false;
+  }
+  return std::all_of(token.begin() + 1, token.end(), [](const char character) {
+    return is_ascii_alpha(character) || is_ascii_digit(character) ||
+           character == '_';
+  });
+}
+
+bool is_absolute_ros_namespace(const std::string_view value) noexcept {
+  if (value == "/") {
+    return true;
+  }
+  if (value.empty() || value.front() != '/' || value.back() == '/' ||
+      value.size() > 1024U) {
+    return false;
+  }
+  std::size_t token_begin = 1U;
+  while (token_begin < value.size()) {
+    const auto token_end = value.find('/', token_begin);
+    const auto token = value.substr(
+        token_begin, token_end == std::string_view::npos
+                         ? std::string_view::npos
+                         : token_end - token_begin);
+    if (!is_ros_name_token(token)) {
+      return false;
+    }
+    if (token_end == std::string_view::npos) {
+      return true;
+    }
+    token_begin = token_end + 1U;
+  }
+  return false;
+}
+
 std::string new_component_epoch(std::string_view role) {
   std::random_device random;
   std::array<std::uint32_t, 4> words{};
@@ -488,6 +534,15 @@ Ros2ControlExecutionBackend::~Ros2ControlExecutionBackend() {
 }
 
 void Ros2ControlExecutionBackend::validate_config() const {
+  if (!is_ros_name_token(config_.node_name)) {
+    throw std::invalid_argument(
+        "ros2_control node_name must be one bounded ROS name token");
+  }
+  if (!is_absolute_ros_namespace(config_.node_namespace)) {
+    throw std::invalid_argument(
+        "ros2_control node_namespace must be one bounded absolute ROS "
+        "namespace");
+  }
   if (config_.action_name.empty()) {
     throw std::invalid_argument("ros2_control action_name must not be empty");
   }
@@ -1190,7 +1245,8 @@ void Ros2ControlExecutionBackend::initialize_ros() {
   context_->init(argc, argv);
   rclcpp::NodeOptions options;
   options.context(context_);
-  node_ = std::make_shared<rclcpp::Node>(config_.node_name, options);
+  node_ = std::make_shared<rclcpp::Node>(
+      config_.node_name, config_.node_namespace, options);
 
   action_callback_group_ = node_->create_callback_group(
       rclcpp::CallbackGroupType::MutuallyExclusive);

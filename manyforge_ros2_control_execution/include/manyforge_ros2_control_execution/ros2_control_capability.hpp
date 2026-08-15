@@ -18,6 +18,10 @@ namespace manyforge::ros2_control_execution {
 
 struct Ros2ControlExecutionBackendConfig {
   std::string node_name = "manyforge_ros2_control_execution_backend";
+  /// Absolute ROS namespace for this exact runtime instance. Retained
+  /// products derive it from the controllable-component identity so two
+  /// same-type instances cannot share command-admission endpoints.
+  std::string node_namespace = "/";
   std::string action_name;
   std::string joint_state_topic = "/joint_states";
   std::string controller_state_topic;

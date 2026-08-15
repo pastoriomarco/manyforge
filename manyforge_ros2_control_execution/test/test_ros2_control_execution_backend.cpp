@@ -2340,6 +2340,34 @@ TEST(Ros2ControlExecutionBackendTest,
 }
 
 TEST(Ros2ControlExecutionBackendTest,
+     RejectsLossyOrRelativeRuntimeNodeIdentityBeforeRosStartup) {
+  auto sink = std::make_shared<RecordingExecutionStateSink>();
+  core::FakeClock clock;
+  core::ManualScheduler scheduler;
+
+  for (const std::string invalid_name : {"", "node/name", "9node"}) {
+    auto config = base_config();
+    config.node_name = invalid_name;
+    EXPECT_THROW(
+        (Ros2ControlExecutionBackend(
+            Ros2ControlExecutionBackend::TestingNoRosStartupTag{}, sink,
+            "arm", clock, scheduler, config)),
+        std::invalid_argument);
+  }
+  for (const std::string invalid_namespace :
+       {"", "manyforge/robot", "/manyforge/robot/", "/manyforge/robot.1",
+        "/manyforge//robot"}) {
+    auto config = base_config();
+    config.node_namespace = invalid_namespace;
+    EXPECT_THROW(
+        (Ros2ControlExecutionBackend(
+            Ros2ControlExecutionBackend::TestingNoRosStartupTag{}, sink,
+            "arm", clock, scheduler, config)),
+        std::invalid_argument);
+  }
+}
+
+TEST(Ros2ControlExecutionBackendTest,
      ObservedModeRequiresPassivePostResultStateSource) {
   auto sink = std::make_shared<RecordingExecutionStateSink>();
   core::FakeClock clock;
