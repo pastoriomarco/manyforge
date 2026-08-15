@@ -258,4 +258,19 @@ RetainedRos2ControlRuntimeHandle::controller_binding_snapshot() const {
   return backend ? backend->controller_binding_snapshot() : std::nullopt;
 }
 
+std::optional<ros2_control_execution::Ros2GripperTransportReadinessSnapshot>
+RetainedRos2ControlRuntimeHandle::gripper_transport_readiness_snapshot() const {
+  std::shared_ptr<ros2_control_execution::Ros2ControlExecutionBackend> backend;
+  std::optional<std::string> gripper_id;
+  {
+    std::lock_guard lock(mutex_);
+    backend = backend_.lock();
+    gripper_id = gripper_id_;
+  }
+  if (!backend || !gripper_id.has_value()) {
+    return std::nullopt;
+  }
+  return backend->gripper_transport_readiness(*gripper_id);
+}
+
 } // namespace manyforge::roboplan_backend

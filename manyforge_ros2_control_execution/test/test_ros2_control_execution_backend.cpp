@@ -2465,6 +2465,20 @@ TEST(Ros2ControlExecutionBackendTest,
   JointStatePublisher publisher(state_topic);
   ASSERT_TRUE(publisher.wait_for_subscription());
   for (int attempt = 0; attempt < 5; ++attempt) {
+    publisher.publish({"compiled_only_finger_joint"}, {0.0081});
+    std::this_thread::sleep_for(20ms);
+  }
+  const auto unmatched = backend.gripper_transport_readiness("tool");
+  EXPECT_GT(unmatched.feedback_publisher_count, 0U);
+  EXPECT_GT(unmatched.feedback_messages_received, 0U);
+  EXPECT_EQ(unmatched.feedback_samples_matched, 0U);
+  EXPECT_FALSE(unmatched.feedback_path_ready);
+  EXPECT_EQ(unmatched.reason_codes,
+            (std::vector<std::string>{"gripper_command_subscriber_unavailable",
+                                      "gripper_state_feedback_unavailable",
+                                      "gripper_state_joint_unobserved"}));
+
+  for (int attempt = 0; attempt < 5; ++attempt) {
     publisher.publish({"right_finger_joint"}, {0.0081});
     std::this_thread::sleep_for(20ms);
   }
@@ -2472,6 +2486,11 @@ TEST(Ros2ControlExecutionBackendTest,
   const auto readiness = backend.gripper_transport_readiness("tool");
   EXPECT_TRUE(readiness.configured);
   EXPECT_TRUE(readiness.feedback_path_ready);
+  EXPECT_EQ(readiness.state_topic, state_topic);
+  EXPECT_EQ(readiness.state_joint_name, "right_finger_joint");
+  EXPECT_GT(readiness.feedback_publisher_count, 0U);
+  EXPECT_GT(readiness.feedback_messages_received, 0U);
+  EXPECT_GT(readiness.feedback_samples_matched, 0U);
   EXPECT_FALSE(readiness.command_path_ready);
   EXPECT_FALSE(readiness.ready);
   EXPECT_EQ(readiness.reason_codes,

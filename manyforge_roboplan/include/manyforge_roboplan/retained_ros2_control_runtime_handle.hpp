@@ -51,6 +51,12 @@ public:
   [[nodiscard]] std::optional<ros2_control_execution::ControllerBindingSnapshot>
   controller_binding_snapshot() const;
 
+  /// Read-only transport diagnostics for the exactly bound gripper target.
+  /// Absence means this handle has no live gripper binding/backend.
+  [[nodiscard]] std::optional<
+      ros2_control_execution::Ros2GripperTransportReadinessSnapshot>
+  gripper_transport_readiness_snapshot() const;
+
 private:
   struct DomainGenerationState final {
     std::uint64_t publication_generation{};

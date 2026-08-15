@@ -6175,6 +6175,53 @@ private:
          CanonicalValue("manyforge.ros2_control_lifecycle_observation.v1")},
     });
   }
+
+  [[nodiscard]] CanonicalValue
+  Ros2ControlTransportDiagnosticValue(Composition &composition) const {
+    Require(composition.ros2_control_runtime_handle != nullptr,
+            "ROS transport diagnostics have no selected observer");
+    const auto sampled = composition.ros2_control_runtime_handle
+                             ->gripper_transport_readiness_snapshot();
+    Require(sampled.has_value(),
+            "ROS transport diagnostics have no bound gripper transport");
+    const auto &snapshot = *sampled;
+    constexpr std::uint64_t kMaximumSafeUnsignedInteger =
+        9'007'199'254'740'991ULL;
+    Require(snapshot.feedback_publisher_count <= kMaximumSafeUnsignedInteger &&
+                snapshot.feedback_messages_received <=
+                    kMaximumSafeUnsignedInteger &&
+                snapshot.feedback_samples_matched <=
+                    kMaximumSafeUnsignedInteger,
+            "ROS transport diagnostic counter exceeds JSON safe integer");
+
+    CanonicalValue::Array reason_codes;
+    reason_codes.reserve(snapshot.reason_codes.size());
+    for (const auto &reason : snapshot.reason_codes) {
+      Require(!reason.empty() && reason.size() <= kMaximumIdentityBytes,
+              "ROS transport diagnostic reason is not bounded");
+      reason_codes.emplace_back(CanonicalValue(reason));
+    }
+    return CanonicalValue(CanonicalValue::Object{
+        {"command_gate_open", CanonicalValue(snapshot.command_gate_open)},
+        {"command_path_ready", CanonicalValue(snapshot.command_path_ready)},
+        {"configured", CanonicalValue(snapshot.configured)},
+        {"feedback_messages_received",
+         CanonicalValue(
+             static_cast<double>(snapshot.feedback_messages_received))},
+        {"feedback_path_ready", CanonicalValue(snapshot.feedback_path_ready)},
+        {"feedback_publisher_count", CanonicalValue(static_cast<double>(
+                                         snapshot.feedback_publisher_count))},
+        {"feedback_samples_matched", CanonicalValue(static_cast<double>(
+                                         snapshot.feedback_samples_matched))},
+        {"ready", CanonicalValue(snapshot.ready)},
+        {"reason_codes", CanonicalValue(std::move(reason_codes))},
+        {"schema_version",
+         CanonicalValue("manyforge.ros2_control_transport_diagnostic.v1")},
+        {"state_joint_name", CanonicalValue(snapshot.state_joint_name)},
+        {"state_topic", CanonicalValue(snapshot.state_topic)},
+        {"transport_kind", CanonicalValue(snapshot.transport_kind)},
+    });
+  }
 #endif
 
   [[nodiscard]] CanonicalValue DirectControlStatusValue(
@@ -6495,6 +6542,8 @@ private:
 #if defined(MANYFORGE_ROS2_CONTROL_EXECUTION_HOST)
              {"ros2_control_lifecycle_observation",
               Ros2ControlLifecycleObservationValue(composition)},
+             {"ros2_control_transport_diagnostic",
+              Ros2ControlTransportDiagnosticValue(composition)},
 #endif
              {"scene_revision",
               SceneRevisionValue(status_projection.scene_revision)},

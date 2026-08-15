@@ -8378,10 +8378,18 @@ void Ros2ControlExecutionBackend::configure_gripper_action(
                   return;
                 }
                 const auto position = position_for_joint(*msg, observed_joint);
+                std::lock_guard<std::mutex> lock(runtime->mutex);
+                if (runtime->feedback_messages_received !=
+                    std::numeric_limits<std::uint64_t>::max()) {
+                  ++runtime->feedback_messages_received;
+                }
                 if (!position.has_value()) {
                   return;
                 }
-                std::lock_guard<std::mutex> lock(runtime->mutex);
+                if (runtime->feedback_samples_matched !=
+                    std::numeric_limits<std::uint64_t>::max()) {
+                  ++runtime->feedback_samples_matched;
+                }
                 runtime->observed_position = *position;
                 runtime->observed_at = std::chrono::steady_clock::now();
                 ++runtime->revision;
@@ -8779,15 +8787,22 @@ Ros2ControlExecutionBackend::gripper_transport_readiness(
   Ros2GripperActionConfig runtime_config;
   rclcpp_action::Client<GripperCommand>::SharedPtr action_client;
   rclcpp::Publisher<sensor_msgs::msg::JointState>::SharedPtr command_publisher;
+  rclcpp::Subscription<sensor_msgs::msg::JointState>::SharedPtr
+      state_subscriber;
   std::optional<std::chrono::steady_clock::time_point> observed_at;
   {
     std::lock_guard<std::mutex> runtime_lock(runtime->mutex);
     runtime_config = runtime->config;
     action_client = runtime->action_client;
     command_publisher = runtime->joint_state_pub;
+    state_subscriber = runtime->joint_state_sub;
     observed_at = runtime->observed_at;
+    result.feedback_messages_received = runtime->feedback_messages_received;
+    result.feedback_samples_matched = runtime->feedback_samples_matched;
   }
   result.transport_kind = runtime_config.transport_kind;
+  result.state_topic = runtime_config.state_topic;
+  result.state_joint_name = runtime_config.state_joint_name;
   result.configured = true;
 
   try {
@@ -8806,15 +8821,28 @@ Ros2ControlExecutionBackend::gripper_transport_readiness(
       }
       if (runtime_config.state_topic.empty()) {
         result.feedback_path_ready = true;
-      } else if (observed_at.has_value()) {
-        const auto age = std::chrono::steady_clock::now() - *observed_at;
-        const auto freshness = std::chrono::duration<double>(
-            runtime_config.state_freshness_timeout_s);
-        result.feedback_path_ready =
-            age >= decltype(age)::zero() && age <= freshness;
+      } else {
+        result.feedback_publisher_count =
+            state_subscriber ? state_subscriber->get_publisher_count() : 0U;
+        if (observed_at.has_value()) {
+          const auto age = std::chrono::steady_clock::now() - *observed_at;
+          const auto freshness = std::chrono::duration<double>(
+              runtime_config.state_freshness_timeout_s);
+          result.feedback_path_ready =
+              age >= decltype(age)::zero() && age <= freshness;
+        }
       }
       if (!result.feedback_path_ready) {
         result.reason_codes.push_back("gripper_state_feedback_unavailable");
+        if (result.feedback_publisher_count == 0U) {
+          result.reason_codes.push_back("gripper_state_publisher_unavailable");
+        } else if (result.feedback_messages_received == 0U) {
+          result.reason_codes.push_back("gripper_state_message_unreceived");
+        } else if (result.feedback_samples_matched == 0U) {
+          result.reason_codes.push_back("gripper_state_joint_unobserved");
+        } else {
+          result.reason_codes.push_back("gripper_state_feedback_stale");
+        }
       }
     } else {
       result.reason_codes.push_back("gripper_transport_kind_invalid");

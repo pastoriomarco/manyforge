@@ -430,6 +430,7 @@ TEST(RetainedRos2ControlBackendFactoryTest,
   const auto binding = commanded_binding();
   const auto bound = handle->BindBackend(backend, binding, std::nullopt);
   ASSERT_TRUE(bound.ok()) << bound.error().message;
+  EXPECT_FALSE(handle->gripper_transport_readiness_snapshot().has_value());
 
   const auto unavailable = handle->ReadLifecycleSnapshot(
       core::ControlDomainId("domain.arm"), clock.now());

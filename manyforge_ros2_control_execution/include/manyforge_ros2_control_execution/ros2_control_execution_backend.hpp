@@ -91,11 +91,16 @@ struct Ros2GripperActionConfig {
 /// authority and performs no discovery wait.
 struct Ros2GripperTransportReadinessSnapshot {
   std::string transport_kind;
+  std::string state_topic;
+  std::string state_joint_name;
   bool configured{};
   bool command_path_ready{};
   bool feedback_path_ready{};
   bool command_gate_open{};
   bool ready{};
+  std::uint64_t feedback_publisher_count{};
+  std::uint64_t feedback_messages_received{};
+  std::uint64_t feedback_samples_matched{};
   std::vector<std::string> reason_codes;
 
   friend bool
@@ -811,6 +816,8 @@ private:
     std::optional<double> current_position;
     std::optional<double> observed_position;
     std::optional<std::chrono::steady_clock::time_point> observed_at;
+    std::uint64_t feedback_messages_received = 0;
+    std::uint64_t feedback_samples_matched = 0;
     std::optional<double> max_effort;
     double target_position = 0.0;
     double duration_s = 0.0;

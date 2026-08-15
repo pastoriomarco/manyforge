@@ -938,6 +938,35 @@ def _ros2_control_lifecycle_diagnostic(value: object) -> dict[str, Any] | None:
     return {"domains": rows, "ready": value.get("ready")}
 
 
+def _ros2_control_transport_diagnostic(
+    value: object,
+) -> dict[str, Any] | None:
+    if not isinstance(value, dict):
+        return None
+    reason_codes = value.get("reason_codes")
+    return {
+        key: value.get(key)
+        for key in (
+            "command_gate_open",
+            "command_path_ready",
+            "configured",
+            "feedback_messages_received",
+            "feedback_path_ready",
+            "feedback_publisher_count",
+            "feedback_samples_matched",
+            "ready",
+            "schema_version",
+            "state_joint_name",
+            "state_topic",
+            "transport_kind",
+        )
+    } | {
+        "reason_codes": (
+            reason_codes[:16] if isinstance(reason_codes, list) else None
+        )
+    }
+
+
 def _wait_for_ros2_control_lifecycle_readiness(
     client: HeadlessHttpClient,
     *,
@@ -947,6 +976,7 @@ def _wait_for_ros2_control_lifecycle_readiness(
 ) -> dict[str, Any]:
     deadline = time.monotonic() + timeout_s
     last: object = None
+    last_transport: object = None
     while time.monotonic() < deadline:
         response = client.execution_status()
         status = response.get("status") if isinstance(response, dict) else None
@@ -961,6 +991,7 @@ def _wait_for_ros2_control_lifecycle_readiness(
                 "execution owner changed while awaiting ROS lifecycle readiness"
             )
         last = status.get("ros2_control_lifecycle_observation")
+        last_transport = status.get("ros2_control_transport_diagnostic")
         if _validate_ros2_control_lifecycle_observation(
             last, expected_domain_ids=expected_domain_ids
         ):
@@ -969,7 +1000,12 @@ def _wait_for_ros2_control_lifecycle_readiness(
     raise LiveRowError(
         "ROS lifecycle observation did not become ready: "
         + json.dumps(
-            _ros2_control_lifecycle_diagnostic(last),
+            {
+                "lifecycle": _ros2_control_lifecycle_diagnostic(last),
+                "transport": _ros2_control_transport_diagnostic(
+                    last_transport
+                ),
+            },
             separators=(",", ":"),
             sort_keys=True,
         )
