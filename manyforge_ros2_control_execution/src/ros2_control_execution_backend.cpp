@@ -38,6 +38,35 @@ constexpr double kRuntimeScaleSlewPerSecond = 4.0; // 0→1 in 250 ms.
 constexpr auto kIdleSceneProjectionMinPeriod = std::chrono::milliseconds(100);
 constexpr auto kSceneProjectionBarrierTimeout = std::chrono::seconds(1);
 
+bool is_settled_execution_state(const core::ExecutionState state) noexcept {
+  switch (state) {
+  case core::ExecutionState::kPaused:
+  case core::ExecutionState::kStopped:
+  case core::ExecutionState::kCompleted:
+  case core::ExecutionState::kFailed:
+  case core::ExecutionState::kInterrupted:
+  case core::ExecutionState::kInterventionRequired:
+    return true;
+  case core::ExecutionState::kIdle:
+  case core::ExecutionState::kPlanning:
+  case core::ExecutionState::kValidating:
+  case core::ExecutionState::kExecuting:
+  case core::ExecutionState::kStopping:
+    return false;
+  }
+  return false;
+}
+
+bool would_regress_settled_snapshot(
+    const core::ExecutionState proposed_state,
+    const core::ExecutionState current_state,
+    const std::uint64_t publication_generation,
+    const std::uint64_t snapshot_generation) noexcept {
+  return proposed_state == core::ExecutionState::kStopping &&
+         publication_generation == snapshot_generation &&
+         is_settled_execution_state(current_state);
+}
+
 bool is_ascii_alpha(const char value) noexcept {
   return (value >= 'A' && value <= 'Z') ||
          (value >= 'a' && value <= 'z');
@@ -3475,9 +3504,17 @@ bool Ros2ControlExecutionBackend::publish_snapshot(
             *expected_running_generation) {
       return false;
     }
+    const auto publication_generation = expected_running_generation.value_or(
+        running_generation_.load(std::memory_order_acquire));
+    if (would_regress_settled_snapshot(
+            state, snapshot_.state, publication_generation,
+            snapshot_execution_generation_)) {
+      return false;
+    }
     snapshot_.timestamp_ns = now_ns;
     snapshot_.sequence_number++;
     snapshot_.state = state;
+    snapshot_execution_generation_ = publication_generation;
     snapshot_.progress = clamp_progress(progress);
     snapshot_.joint_positions_rad = joint_positions;
     // Velocities are settle evidence and are only valid for the exact state
@@ -3598,6 +3635,11 @@ bool Ros2ControlExecutionBackend::publish_observed_snapshot(
       expected_running_generation) {
     return false;
   }
+  if (would_regress_settled_snapshot(
+          state, snapshot_.state, expected_running_generation,
+          snapshot_execution_generation_)) {
+    return false;
+  }
   if (snapshot_.state_source == "observed_ros2" &&
       snapshot_.source_timestamp_ns > source_timestamp_ns) {
     return false;
@@ -3606,6 +3648,7 @@ bool Ros2ControlExecutionBackend::publish_observed_snapshot(
   snapshot_.timestamp_ns = now_ns;
   snapshot_.sequence_number++;
   snapshot_.state = state;
+  snapshot_execution_generation_ = expected_running_generation;
   snapshot_.progress = clamp_progress(progress);
   snapshot_.joint_positions_rad = joint_positions;
   snapshot_.joint_velocities_rad_s = joint_velocities;
@@ -3626,9 +3669,15 @@ bool Ros2ControlExecutionBackend::publish_observed_metadata(
       expected_running_generation) {
     return false;
   }
+  if (would_regress_settled_snapshot(
+          state, snapshot_.state, expected_running_generation,
+          snapshot_execution_generation_)) {
+    return false;
+  }
   snapshot_.timestamp_ns = clock_.now();
   snapshot_.sequence_number++;
   snapshot_.state = state;
+  snapshot_execution_generation_ = expected_running_generation;
   snapshot_.progress = clamp_progress(progress);
   // Position, velocity, source and source timestamp deliberately remain
   // unchanged. In observed_ros2 mode an execution-state transition is
@@ -4710,6 +4759,7 @@ void Ros2ControlExecutionBackend::commit_completion_gate_terminal(
     snapshot_.timestamp_ns = clock_.now();
     snapshot_.sequence_number++;
     snapshot_.state = terminal_state;
+    snapshot_execution_generation_ = request.execution_generation;
     snapshot_.progress = clamp_progress(terminal_progress);
     snapshot_.source_age_ns =
         snapshot_.timestamp_ns >= snapshot_.source_timestamp_ns
@@ -6210,9 +6260,17 @@ Ros2ControlExecutionBackend::TranslateStopStage(
   }
   const auto terminal_snapshot = prepared_goal->handle.get_snapshot();
   if (terminal_snapshot.state != core::ExecutionState::kStopped) {
-    return fail_after_dispatch(
+    auto failure = fail_after_dispatch(
         "stop_goal_terminal_state_mismatch",
         "ros2_control goal did not terminate through the requested Stop");
+    if (failure.error.has_value()) {
+      failure.error->details["expected_terminal_state"] = "stopped";
+      failure.error->details["observed_terminal_state"] =
+          core::to_string(terminal_snapshot.state);
+      failure.error->details["terminal_sequence"] =
+          std::to_string(terminal_snapshot.sequence_number);
+    }
+    return failure;
   }
 
   if (controller_goal_cancel) {
@@ -8035,7 +8093,8 @@ core::PauseResultDTO Ros2ControlExecutionBackend::pause() {
   const auto state = cancel_requested ? core::ExecutionState::kStopping
                                       : core::ExecutionState::kPaused;
   if (uses_authored_backend_state()) {
-    publish_snapshot(state, snapshot.progress, snapshot.joint_positions_rad);
+    publish_snapshot(state, snapshot.progress, snapshot.joint_positions_rad,
+                     std::nullopt, "", publication_generation);
   } else {
     (void)publish_observed_metadata(state, snapshot.progress, std::nullopt,
                                     publication_generation);

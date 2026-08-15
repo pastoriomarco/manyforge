@@ -264,7 +264,8 @@ struct ScheduledStage final {
 }
 
 void require_successful_stage(
-    const core::ParticipantStopStageResultDTO &result) {
+    const core::ParticipantStopStageResultDTO &result,
+    const ObstructionCase obstruction, const int repetition) {
   if (result.attempt_disposition !=
           core::StopStageAttemptDispositionDTO::kDispatched ||
       result.outcome != core::ParticipantStopStageOutcomeDTO::kSucceeded ||
@@ -278,8 +279,21 @@ void require_successful_stage(
         result.error.has_value() && result.error->details.contains("reason")
             ? result.error->details.at("reason")
             : "stage_result_incomplete";
+    const auto detail = [&](std::string_view key) {
+      if (!result.error.has_value()) {
+        return std::string("unavailable");
+      }
+      const auto found = result.error->details.find(std::string(key));
+      return found == result.error->details.end()
+                 ? std::string("unavailable")
+                 : found->second;
+    };
     fail("software-hard stage did not retain terminal motion-rest evidence: " +
-         reason);
+         reason + " obstruction=" + std::string(obstruction_name(obstruction)) +
+         " repetition=" + std::to_string(repetition) +
+         " expected_terminal_state=" + detail("expected_terminal_state") +
+         " observed_terminal_state=" + detail("observed_terminal_state") +
+         " terminal_sequence=" + detail("terminal_sequence"));
   }
 }
 
@@ -419,7 +433,7 @@ void require_successful_stage(
     if (scheduled.result.wait_for(2s) != std::future_status::ready) {
       fail("software-hard ROS Stop stage did not finish its bounded evidence");
     }
-    require_successful_stage(scheduled.result.get());
+    require_successful_stage(scheduled.result.get(), obstruction, repetition);
     if (nominal.wait_for(2s) != std::future_status::ready) {
       fail("nominal ROS Stop did not unwind after software-hard escalation");
     }

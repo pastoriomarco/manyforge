@@ -638,6 +638,13 @@ public:
                             expected_running_generation);
   }
 
+  bool testing_publish_observed_metadata_for_generation(
+      core::ExecutionState state,
+      std::uint64_t expected_running_generation) {
+    return publish_observed_metadata(state, 0.0, std::nullopt,
+                                     expected_running_generation);
+  }
+
   bool testing_action_progress_has_dedicated_callback_group() const {
     return action_callback_group_ && state_callback_group_ &&
            action_callback_group_.get() != state_callback_group_.get();
@@ -1210,6 +1217,10 @@ private:
   std::optional<JointSample> latest_action_feedback_;
   std::optional<JointSample> latest_action_feedback_error_;
   core::ExecutionSnapshot snapshot_;
+  // Generation that owns snapshot_.state. This is protected by state_mutex_
+  // and lets a delayed same-generation transitional publisher fail closed
+  // without rejecting a valid transition at the start of a new execution.
+  std::uint64_t snapshot_execution_generation_{0};
 
   mutable std::mutex execution_mutex_;
   std::condition_variable_any execution_cv_;

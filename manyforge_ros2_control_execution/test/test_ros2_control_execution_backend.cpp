@@ -4459,6 +4459,69 @@ TEST(Ros2ControlExecutionBackendTest,
 }
 
 TEST(Ros2ControlExecutionBackendTest,
+     SameGenerationStoppingCannotRegressAuthoredTerminalSnapshot) {
+  auto sink = std::make_shared<RecordingExecutionStateSink>();
+  core::FakeClock clock;
+  core::ManualScheduler scheduler;
+  auto config = base_config();
+  config.execution_state_source_mode = "commanded_sim";
+  config.initial_joint_positions_rad = {0.0};
+  Ros2ControlExecutionBackend backend(
+      Ros2ControlExecutionBackend::TestingNoRosStartupTag{}, sink, "arm", clock,
+      scheduler, config);
+
+  backend.testing_set_running_state(true);
+  const auto execution_generation = backend.testing_running_generation();
+  ASSERT_TRUE(backend.testing_publish_snapshot_for_generation(
+      core::ExecutionState::kExecuting, {0.5}, execution_generation));
+  ASSERT_TRUE(backend.testing_publish_snapshot_for_generation(
+      core::ExecutionState::kStopped, {0.5}, execution_generation));
+  const auto terminal = backend.get_execution_snapshot();
+
+  EXPECT_FALSE(backend.testing_publish_snapshot_for_generation(
+      core::ExecutionState::kStopping, {0.25}, execution_generation));
+  const auto retained = backend.get_execution_snapshot();
+  EXPECT_EQ(retained.state, core::ExecutionState::kStopped);
+  EXPECT_EQ(retained.sequence_number, terminal.sequence_number);
+  EXPECT_EQ(retained.joint_positions_rad, terminal.joint_positions_rad);
+
+  backend.testing_set_running_state(false);
+  backend.testing_set_running_state(true);
+  const auto replacement_generation = backend.testing_running_generation();
+  ASSERT_GT(replacement_generation, execution_generation);
+  EXPECT_TRUE(backend.testing_publish_snapshot_for_generation(
+      core::ExecutionState::kStopping, {0.75}, replacement_generation));
+  EXPECT_EQ(backend.get_execution_snapshot().state,
+            core::ExecutionState::kStopping);
+}
+
+TEST(Ros2ControlExecutionBackendTest,
+     SameGenerationStoppingCannotRegressObservedTerminalMetadata) {
+  auto sink = std::make_shared<RecordingExecutionStateSink>();
+  core::FakeClock clock;
+  core::ManualScheduler scheduler;
+  auto config = base_config();
+  config.execution_state_source_mode = "observed_ros2";
+  Ros2ControlExecutionBackend backend(
+      Ros2ControlExecutionBackend::TestingNoRosStartupTag{}, sink, "arm", clock,
+      scheduler, config);
+
+  backend.testing_set_running_state(true);
+  const auto execution_generation = backend.testing_running_generation();
+  ASSERT_TRUE(backend.testing_publish_observed_metadata_for_generation(
+      core::ExecutionState::kExecuting, execution_generation));
+  ASSERT_TRUE(backend.testing_publish_observed_metadata_for_generation(
+      core::ExecutionState::kStopped, execution_generation));
+  const auto terminal = backend.get_execution_snapshot();
+
+  EXPECT_FALSE(backend.testing_publish_observed_metadata_for_generation(
+      core::ExecutionState::kStopping, execution_generation));
+  const auto retained = backend.get_execution_snapshot();
+  EXPECT_EQ(retained.state, core::ExecutionState::kStopped);
+  EXPECT_EQ(retained.sequence_number, terminal.sequence_number);
+}
+
+TEST(Ros2ControlExecutionBackendTest,
      TerminalCommandPublicationFailureInvalidatesPlanningAuthority) {
   auto sink = std::make_shared<RecordingExecutionStateSink>();
   core::FakeClock clock;
