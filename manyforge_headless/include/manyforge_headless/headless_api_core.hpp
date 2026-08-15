@@ -270,6 +270,11 @@ private:
   RefreshRuntimeHealthAdapterLocked(const HeadlessRuntimeSnapshot &runtime);
   void RefreshSceneAdapterLocked(const HeadlessRuntimeSnapshot &runtime);
   void RegisterOperationEpochLocked(std::string source_owner_epoch);
+  void ReconcileRuntimeCollisionStopLocked(
+      const manyforge::content_identity::CanonicalValue &journal_payload,
+      std::uint64_t native_sequence, std::string_view payload_digest,
+      std::int64_t occurred_at_ns, std::string_view occurred_at_wall,
+      std::string_view raw_event_id);
   void ReconcileOperationFaultLocked(
       const manyforge::content_identity::CanonicalValue &journal_payload,
       std::string_view record_kind, std::string_view request_id,
@@ -328,6 +333,8 @@ private:
   std::string operation_native_record_digest_;
   std::map<std::string, AlarmSubject> active_operation_faults_;
   std::set<std::string> observed_operation_faults_;
+  std::map<std::string, AlarmSubject> active_runtime_collisions_;
+  std::set<std::string> observed_runtime_collisions_;
   mutable std::mutex mutex_;
   std::map<std::string, ReplayEntry> replay_;
   std::uint64_t node_environment_generation_{};

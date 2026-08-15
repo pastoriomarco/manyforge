@@ -310,18 +310,109 @@ StopAcceptanceProjectionPayload(const std::string &owner_epoch,
                          {"entry_state", CanonicalValue(entry_state)},
                          {"owner_epoch", CanonicalValue(owner_epoch)},
                          {"request_id", CanonicalValue("stop-request.1")},
+                         {"stop_generation", CanonicalValue(1.0)},
+                         {"stop_id", CanonicalValue("stop.test.1")},
                      })},
+      {"accepted", CanonicalValue(CanonicalValue::Object{
+                       {"request_id", CanonicalValue("stop-request.1")},
+                       {"stop_generation", CanonicalValue(1.0)},
+                       {"stop_id", CanonicalValue("stop.test.1")},
+                   })},
       {"affected_state",
        CanonicalValue(CanonicalValue::Object{
            {"operations", CanonicalValue(CanonicalValue::Array{})},
            {"resources", CanonicalValue(CanonicalValue::Array{})},
        })},
       {"api_version",
-       CanonicalValue("manyforge.stop_acceptance_projection.v1")},
+       CanonicalValue("manyforge.stop_acceptance_projection.v2")},
       {"intent", CanonicalValue(CanonicalValue::Object{
                      {"intent_kind", CanonicalValue("full_stop")},
                      {"value", CanonicalValue(CanonicalValue::Object{})},
                  })},
+      {"record_kind", CanonicalValue("stop_acceptance_projected")},
+  });
+}
+
+CanonicalValue RuntimeCollisionStopAcceptanceProjectionPayload(
+    const std::string &owner_epoch) {
+  return CanonicalValue(CanonicalValue::Object{
+      {"acceptance",
+       CanonicalValue(CanonicalValue::Object{
+           {"entry_state", CanonicalValue("active")},
+           {"owner_epoch", CanonicalValue(owner_epoch)},
+           {"request_id", CanonicalValue("stop-request.collision.1")},
+           {"stop_generation", CanonicalValue(1.0)},
+           {"stop_id", CanonicalValue("stop.collision.1")},
+       })},
+      {"accepted",
+       CanonicalValue(CanonicalValue::Object{
+           {"request_id", CanonicalValue("stop-request.collision.1")},
+           {"stop_generation", CanonicalValue(1.0)},
+           {"stop_id", CanonicalValue("stop.collision.1")},
+       })},
+      {"affected_state",
+       CanonicalValue(CanonicalValue::Object{
+           {"operations",
+            CanonicalValue(
+                CanonicalValue::Array{CanonicalValue(CanonicalValue::Object{
+                    {"operation_id", CanonicalValue("operation.test.1")},
+                    {"operation_revision", CanonicalValue(2.0)},
+                    {"participants",
+                     CanonicalValue(CanonicalValue::Array{
+                         CanonicalValue(CanonicalValue::Object{
+                             {"participant_id",
+                              CanonicalValue("participant.collision.1")},
+                             {"resources",
+                              CanonicalValue(CanonicalValue::Array{
+                                  CanonicalValue("resource.arm.a")})},
+                             {"terminal_error", CanonicalValue(nullptr)},
+                         })})},
+                    {"program_binding_id",
+                     CanonicalValue("program-binding.test")},
+                    {"program_run_id", CanonicalValue("program-run.test")},
+                    {"state", CanonicalValue("stopping")},
+                })})},
+           {"resources", CanonicalValue(CanonicalValue::Array{
+                             CanonicalValue("resource.arm.a")})},
+       })},
+      {"api_version",
+       CanonicalValue("manyforge.stop_acceptance_projection.v2")},
+      {"intent",
+       CanonicalValue(CanonicalValue::Object{
+           {"intent_kind", CanonicalValue("ordinary_stop")},
+           {"value",
+            CanonicalValue(CanonicalValue::Object{
+                {"reason", CanonicalValue("runtime_collision_fault")},
+                {"request_attribution",
+                 CanonicalValue(CanonicalValue::Object{
+                     {"assurance", CanonicalValue("unverified")},
+                     {"principal_id", CanonicalValue(nullptr)},
+                     {"transport", CanonicalValue("internal")},
+                 })},
+                {"request_context",
+                 CanonicalValue(CanonicalValue::Object{
+                     {"correlation_id",
+                      CanonicalValue("participant.collision.1")},
+                     {"request_id", CanonicalValue("stop-request.collision.1")},
+                     {"request_owner_epoch", CanonicalValue(owner_epoch)},
+                     {"source_label",
+                      CanonicalValue("kernel.runtime_collision")},
+                 })},
+                {"selector",
+                 CanonicalValue(CanonicalValue::Object{
+                     {"operations",
+                      CanonicalValue(CanonicalValue::Array{
+                          CanonicalValue(CanonicalValue::Object{
+                              {"expected_operation_revision",
+                               CanonicalValue(1.0)},
+                              {"expected_stop_generation", CanonicalValue(0.0)},
+                              {"operation_id",
+                               CanonicalValue("operation.test.1")},
+                          })})},
+                     {"selector_kind", CanonicalValue("operations")},
+                 })},
+            })},
+       })},
       {"record_kind", CanonicalValue("stop_acceptance_projected")},
   });
 }
@@ -934,6 +1025,7 @@ TEST(HeadlessApiCore,
       std::nullopt, std::nullopt, 100U, "2026-08-07T10:00:00.000000001Z", true,
       projection, projection_digest);
   EXPECT_EQ(Text(ingested, "status"), "ingested");
+  EXPECT_TRUE(Array(core.AlarmSnapshot(), "alarms").empty());
 
   HistorianQuery query;
   query.components.insert("manyforge.runtime");
@@ -965,6 +1057,66 @@ TEST(HeadlessApiCore,
           std::nullopt, 101U, "2026-08-07T10:00:00.000000002Z", false,
           projection, projection_digest)),
       OperatorAlarmError);
+}
+
+TEST(HeadlessApiCore,
+     KernelRuntimeCollisionStopDrivesDedicatedAlarmUntilAcceptedReset) {
+  TemporaryDirectory directory;
+  HeadlessApiCore core(Config(directory, "api.epoch.1"), Clocks());
+  const std::string source_epoch = "execution-host.epoch.collision";
+  const auto projection =
+      RuntimeCollisionStopAcceptanceProjectionPayload(source_epoch);
+  const auto projection_digest = content_identity::sha256_digest(
+      content_identity::canonical_json(projection));
+
+  const auto ingested = core.IngestOperationEvent(
+      source_epoch, 1U, "stop_acceptance_projected", "stop-request.collision.1",
+      std::nullopt, std::nullopt, 300U, "2026-08-07T10:00:00.000000007Z", true,
+      projection, projection_digest);
+  EXPECT_EQ(Text(ingested, "status"), "ingested");
+  static_cast<void>(core.CompleteOperationEventSnapshot(source_epoch, 1U));
+
+  const auto active_snapshot = core.AlarmSnapshot();
+  const auto &active = OnlyAlarm(active_snapshot);
+  EXPECT_EQ(Text(active, "definition_id"),
+            "manyforge.motion.runtime_collision");
+  EXPECT_EQ(Text(active, "lifecycle_state"), "active_unacknowledged");
+  EXPECT_EQ(Text(active, "priority"), "critical");
+  EXPECT_TRUE(
+      std::get<bool>(Member(active, "requires_motion_attention").storage()));
+  EXPECT_EQ(Text(Member(active, "subject"), "subject_id"), "operation.test.1");
+  ASSERT_EQ(Array(Member(active, "subject"), "resource_ids").size(), 1U);
+  EXPECT_EQ(
+      std::get<std::string>(
+          Array(Member(active, "subject"), "resource_ids").front().storage()),
+      "resource.arm.a");
+  EXPECT_EQ(Text(Member(active, "details"), "reason"),
+            "runtime_collision_fault");
+  EXPECT_EQ(Text(Member(active, "details"), "source_label"),
+            "kernel.runtime_collision");
+  EXPECT_EQ(Text(Member(active, "correlations"), "participant_id"),
+            "participant.collision.1");
+  EXPECT_EQ(Text(Member(active, "correlations"), "program_run_id"),
+            "program-run.test");
+
+  const auto reset = OperationJournalPayload(
+      source_epoch, "control_accepted", "intervention_required",
+      CanonicalValue(CanonicalValue::Object{}), "reset");
+  const auto reset_digest =
+      content_identity::sha256_digest(content_identity::canonical_json(reset));
+  static_cast<void>(core.IngestOperationEvent(
+      source_epoch, 2U, "control_accepted", "request.reset.collision.1",
+      "operation.test.1", 1U, 301U, "2026-08-07T10:00:00.000000008Z", true,
+      reset, reset_digest));
+  static_cast<void>(core.CompleteOperationEventSnapshot(source_epoch, 2U));
+
+  const auto returned_snapshot = core.AlarmSnapshot();
+  const auto &returned = OnlyAlarm(returned_snapshot);
+  EXPECT_EQ(Text(returned, "definition_id"),
+            "manyforge.motion.runtime_collision");
+  EXPECT_EQ(Text(returned, "lifecycle_state"), "returned_unacknowledged");
+  EXPECT_EQ(Text(Member(returned, "details"), "reason"),
+            "operation_reset_accepted");
 }
 
 TEST(HeadlessApiCore,

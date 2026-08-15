@@ -1087,13 +1087,25 @@ CanonicalValue HeadlessApiCore::IngestOperationEvent(
   const CanonicalValue *operation_state = nullptr;
   if (stop_acceptance_projection) {
     const auto &acceptance = RequiredMember(journal_payload, "acceptance");
+    const auto &accepted = RequiredMember(journal_payload, "accepted");
+    const auto &affected_state =
+        RequiredMember(journal_payload, "affected_state");
+    const auto &intent = RequiredMember(journal_payload, "intent");
     const auto entry_state = RequiredString(acceptance, "entry_state");
+    const auto stop_id = RequiredString(acceptance, "stop_id");
+    const auto stop_generation =
+        RequiredCounter(acceptance, "stop_generation", 1U);
     Require(RequiredString(journal_payload, "api_version") ==
-                    "manyforge.stop_acceptance_projection.v1" &&
-                request_id.has_value() &&
+                    "manyforge.stop_acceptance_projection.v2" &&
+                accepted.is_object() && affected_state.is_object() &&
+                intent.is_object() && request_id.has_value() &&
                 RequiredString(acceptance, "owner_epoch") ==
                     source_owner_epoch &&
                 RequiredString(acceptance, "request_id") == *request_id &&
+                RequiredString(accepted, "request_id") == *request_id &&
+                RequiredString(accepted, "stop_id") == stop_id &&
+                RequiredCounter(accepted, "stop_generation", 1U) ==
+                    stop_generation &&
                 (entry_state == "active" || entry_state == "terminal") &&
                 effect_pending == (entry_state == "active"),
             "headless_operation_event_invalid",
@@ -1202,7 +1214,11 @@ CanonicalValue HeadlessApiCore::IngestOperationEvent(
         "operation historian delivery raised an unknown failure");
   }
 
-  if (operation_state != nullptr) {
+  if (stop_acceptance_projection) {
+    ReconcileRuntimeCollisionStopLocked(
+        journal_payload, source_sequence, payload_digest, occurred_at_ns,
+        occurred_at_wall, event_id.value_or(""));
+  } else if (operation_state != nullptr) {
     ReconcileOperationFaultLocked(journal_payload, record_kind,
                                   request_id.value_or(""), source_sequence,
                                   payload_digest, occurred_at_ns,
@@ -1268,6 +1284,41 @@ CanonicalValue HeadlessApiCore::CompleteOperationEventSnapshot(
   }
   for (const auto &operation : retired) {
     active_operation_faults_.erase(operation);
+  }
+  retired.clear();
+  for (const auto &[operation, subject] : active_runtime_collisions_) {
+    if (observed_runtime_collisions_.contains(operation)) {
+      continue;
+    }
+    Require(operation_adapter_.source_sequence < kMaximumSafeInteger,
+            "headless_adapter_sequence_exhausted",
+            "operation alarm adapter sequence is exhausted");
+    ++operation_adapter_.source_sequence;
+    AlarmConditionUpdate update{
+        "manyforge.motion.runtime_collision",
+        subject,
+        false,
+        operation_adapter_.source_id,
+        operation_adapter_.source_epoch,
+        operation_adapter_.source_sequence,
+        clocks_.monotonic_time_ns(),
+        clocks_.wall_time_text(),
+        AlarmConditionQuality::kGood,
+        CanonicalValue(CanonicalValue::Object{}),
+        CanonicalValue(CanonicalValue::Object{
+            {"reason", CanonicalValue("execution_context_retired")},
+        }),
+        {},
+        CanonicalValue(CanonicalValue::Object{
+            {"operation_id", CanonicalValue(operation)},
+        }),
+    };
+    const auto mutation = alarm_owner_.Submit(std::move(update));
+    static_cast<void>(DeliverFactsLocked(mutation.lifecycle_facts));
+    retired.push_back(operation);
+  }
+  for (const auto &operation : retired) {
+    active_runtime_collisions_.erase(operation);
   }
   alarm_owner_.CompleteSourceSnapshot(operation_adapter_.source_id,
                                       operation_adapter_.source_epoch,
@@ -1872,6 +1923,110 @@ void HeadlessApiCore::RegisterOperationEpochLocked(
   operation_native_sequence_ = 0U;
   operation_native_record_digest_.clear();
   observed_operation_faults_.clear();
+  observed_runtime_collisions_.clear();
+}
+
+void HeadlessApiCore::ReconcileRuntimeCollisionStopLocked(
+    const CanonicalValue &journal_payload, const std::uint64_t native_sequence,
+    const std::string_view payload_digest, const std::int64_t occurred_at_ns,
+    const std::string_view occurred_at_wall,
+    const std::string_view raw_event_id) {
+  const auto &intent = RequiredMember(journal_payload, "intent");
+  if (RequiredString(intent, "intent_kind") != "ordinary_stop") {
+    return;
+  }
+  const auto &value = RequiredMember(intent, "value");
+  Require(value.is_object(), "headless_operation_event_invalid",
+          "ordinary Stop projection value must be an object");
+  const auto &context = RequiredMember(value, "request_context");
+  const auto source_label = RequiredString(context, "source_label");
+  if (source_label != "kernel.runtime_collision") {
+    return;
+  }
+  const auto reason = OptionalStringMember(value, "reason");
+  const auto correlation = OptionalStringMember(context, "correlation_id");
+  const auto &affected = RequiredMember(journal_payload, "affected_state");
+  const auto &operations = RequiredArray(affected, "operations");
+  auto resources = StringArray(affected, "resources");
+  Require(reason.has_value() && *reason == "runtime_collision_fault" &&
+              correlation.has_value() && operations.size() == 1U &&
+              !resources.empty(),
+          "headless_operation_event_invalid",
+          "kernel runtime-collision Stop projection has invalid scope");
+  std::sort(resources.begin(), resources.end());
+  const auto unique_end = std::unique(resources.begin(), resources.end());
+  Require(unique_end == resources.end() &&
+              resources.size() <= kMaximumAlarmSubjectResources,
+          "headless_operation_event_invalid",
+          "kernel runtime-collision Stop resources are invalid");
+  const auto operation_id = RequiredString(operations.front(), "operation_id");
+  const auto program_run_id =
+      RequiredString(operations.front(), "program_run_id");
+  const auto &acceptance = RequiredMember(journal_payload, "acceptance");
+  const auto stop_id = RequiredString(acceptance, "stop_id");
+  const auto stop_generation =
+      RequiredCounter(acceptance, "stop_generation", 1U);
+  const auto request_id = RequiredString(context, "request_id");
+  const auto &selector = RequiredMember(value, "selector");
+  const auto &selected_operations = RequiredArray(selector, "operations");
+  bool participant_matches = false;
+  for (const auto &participant :
+       RequiredArray(operations.front(), "participants")) {
+    participant_matches =
+        participant_matches ||
+        RequiredString(participant, "participant_id") == *correlation;
+  }
+  Require(RequiredString(context, "request_owner_epoch") ==
+                  RequiredString(acceptance, "owner_epoch") &&
+              request_id == RequiredString(acceptance, "request_id") &&
+              RequiredString(selector, "selector_kind") == "operations" &&
+              selected_operations.size() == 1U &&
+              RequiredString(selected_operations.front(), "operation_id") ==
+                  operation_id &&
+              participant_matches,
+          "headless_operation_event_invalid",
+          "kernel runtime-collision Stop attribution is inconsistent");
+
+  Require(operation_adapter_.source_sequence < kMaximumSafeInteger,
+          "headless_adapter_sequence_exhausted",
+          "operation alarm adapter sequence is exhausted");
+  ++operation_adapter_.source_sequence;
+  std::vector<std::string> evidence_refs;
+  if (!raw_event_id.empty()) {
+    evidence_refs.emplace_back(raw_event_id);
+  }
+  AlarmConditionUpdate update{
+      "manyforge.motion.runtime_collision",
+      AlarmSubject{"operation", operation_id, resources},
+      true,
+      operation_adapter_.source_id,
+      operation_adapter_.source_epoch,
+      operation_adapter_.source_sequence,
+      occurred_at_ns,
+      std::string(occurred_at_wall),
+      AlarmConditionQuality::kGood,
+      CanonicalValue(CanonicalValue::Object{}),
+      CanonicalValue(CanonicalValue::Object{
+          {"native_sequence", Number(native_sequence, "native_sequence")},
+          {"payload_digest", CanonicalValue(std::string(payload_digest))},
+          {"reason", CanonicalValue(*reason)},
+          {"source_label", CanonicalValue(source_label)},
+          {"stop_generation", Number(stop_generation, "stop_generation")},
+          {"stop_id", CanonicalValue(stop_id)},
+      }),
+      std::move(evidence_refs),
+      CanonicalValue(CanonicalValue::Object{
+          {"operation_id", CanonicalValue(operation_id)},
+          {"participant_id", CanonicalValue(*correlation)},
+          {"program_run_id", CanonicalValue(program_run_id)},
+          {"request_id", CanonicalValue(request_id)},
+      }),
+  };
+  const auto mutation = alarm_owner_.Submit(std::move(update));
+  static_cast<void>(DeliverFactsLocked(mutation.lifecycle_facts));
+  active_runtime_collisions_.insert_or_assign(
+      operation_id, AlarmSubject{"operation", operation_id, resources});
+  observed_runtime_collisions_.insert(operation_id);
 }
 
 void HeadlessApiCore::ReconcileOperationFaultLocked(
@@ -1887,6 +2042,49 @@ void HeadlessApiCore::ReconcileOperationFaultLocked(
   if (record_kind == "control_accepted") {
     reset_accepted = RequiredString(RequiredMember(journal_payload, "result"),
                                     "control") == "reset";
+  }
+  if (reset_accepted) {
+    const auto collision = active_runtime_collisions_.find(operation_id);
+    if (collision != active_runtime_collisions_.end()) {
+      Require(operation_adapter_.source_sequence < kMaximumSafeInteger,
+              "headless_adapter_sequence_exhausted",
+              "operation alarm adapter sequence is exhausted");
+      ++operation_adapter_.source_sequence;
+      AlarmConditionUpdate update{
+          "manyforge.motion.runtime_collision",
+          collision->second,
+          false,
+          operation_adapter_.source_id,
+          operation_adapter_.source_epoch,
+          operation_adapter_.source_sequence,
+          occurred_at_ns,
+          std::string(occurred_at_wall),
+          AlarmConditionQuality::kGood,
+          CanonicalValue(CanonicalValue::Object{}),
+          CanonicalValue(CanonicalValue::Object{
+              {"native_sequence", Number(native_sequence, "native_sequence")},
+              {"payload_digest", CanonicalValue(std::string(payload_digest))},
+              {"reason", CanonicalValue("operation_reset_accepted")},
+              {"record_kind", CanonicalValue(std::string(record_kind))},
+          }),
+          raw_event_id.empty()
+              ? std::vector<std::string>{}
+              : std::vector<std::string>{std::string(raw_event_id)},
+          CanonicalValue(CanonicalValue::Object{
+              {"operation_id", CanonicalValue(operation_id)},
+              {"program_binding_id",
+               RequiredMember(state, "program_binding_id")},
+              {"program_run_id", RequiredMember(state, "program_run_id")},
+              {"request_id", request_id.empty()
+                                 ? CanonicalValue(nullptr)
+                                 : CanonicalValue(std::string(request_id))},
+          }),
+      };
+      const auto mutation = alarm_owner_.Submit(std::move(update));
+      static_cast<void>(DeliverFactsLocked(mutation.lifecycle_facts));
+      active_runtime_collisions_.erase(collision);
+      observed_runtime_collisions_.erase(operation_id);
+    }
   }
   const bool active = IsOperationFaultState(state_name) && !reset_accepted;
   const bool clear = reset_accepted || IsNormalOperationTerminal(state_name);

@@ -63,9 +63,16 @@ def _stop_projection_event(
             "entry_state": "active",
             "owner_epoch": owner_epoch,
             "request_id": "stop-request.1",
+            "stop_generation": 1,
+            "stop_id": "stop.1",
+        },
+        "accepted": {
+            "request_id": "stop-request.1",
+            "stop_generation": 1,
+            "stop_id": "stop.1",
         },
         "affected_state": {"operations": [], "resources": []},
-        "api_version": "manyforge.stop_acceptance_projection.v1",
+        "api_version": "manyforge.stop_acceptance_projection.v2",
         "intent": {"intent_kind": "full_stop", "value": {}},
         "record_kind": "stop_acceptance_projected",
     }
