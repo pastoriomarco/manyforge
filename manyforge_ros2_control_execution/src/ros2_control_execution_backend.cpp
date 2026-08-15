@@ -1589,6 +1589,12 @@ void Ros2ControlExecutionBackend::controller_binding_monitor_worker(
       if (current != nullptr && current->valid &&
           current->received_timestamp_ns <= now &&
           current->fresh_until_ns > now) {
+        // Retry immediately inside the unchanged lease. Waiting another full
+        // periodic interval can move the next bounded service read across the
+        // lease edge and momentarily revoke an otherwise unchanged binding.
+        // A sustained outage still invalidates at fresh_until_ns, and an
+        // activity event has already published an invalid snapshot above.
+        request_controller_binding_refresh();
         return;
       }
       invalidate_controller_binding(std::move(reason));

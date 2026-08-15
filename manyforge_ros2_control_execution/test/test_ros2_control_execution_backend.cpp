@@ -1652,6 +1652,8 @@ TEST(Ros2ControlExecutionBackendTest,
   ASSERT_TRUE(initial.has_value());
   const auto failures_before = backend.controller_progress_metrics()
                                    .controller_binding_refresh_failures_total;
+  const auto attempts_before = backend.controller_progress_metrics()
+                                   .controller_binding_refresh_attempts_total;
 
   manager.stop_services_without_activity();
   const auto failure_deadline = std::chrono::steady_clock::now() + 2s;
@@ -1663,6 +1665,18 @@ TEST(Ros2ControlExecutionBackendTest,
   ASSERT_GT(backend.controller_progress_metrics()
                 .controller_binding_refresh_failures_total,
             failures_before);
+  const auto immediate_retry_deadline =
+      std::chrono::steady_clock::now() + 300ms;
+  while (std::chrono::steady_clock::now() < immediate_retry_deadline &&
+         backend.controller_progress_metrics()
+                 .controller_binding_refresh_attempts_total <
+             attempts_before + 2U) {
+    std::this_thread::sleep_for(10ms);
+  }
+  EXPECT_GE(backend.controller_progress_metrics()
+                .controller_binding_refresh_attempts_total,
+            attempts_before + 2U)
+      << "a retained lease must be retried before the next periodic edge";
   const auto retained = backend.controller_binding_snapshot();
   ASSERT_TRUE(retained.has_value());
   EXPECT_TRUE(retained->valid);
