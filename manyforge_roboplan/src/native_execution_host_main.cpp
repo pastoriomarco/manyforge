@@ -866,9 +866,11 @@ private:
             "native projection retained planning model is absent or invalid");
     auto stage = RetainedPlanningModelStage::create_verified(
         *planning_model, config_.staging_root);
+    auto package_paths = stage.package_paths();
+    package_paths.insert(package_paths.begin(), config_.package_root);
     auto shared_model = collision::ManyForgeCollisionEngine::load_shared_model(
         "manyforge_managed_native_projection", stage.loader_urdf_path(),
-        stage.srdf_path(), stage.package_paths(), group);
+        stage.srdf_path(), package_paths, group);
     auto projector = RetainedCollisionWorldProjector::create_verified(
         shared_model, *bundle, *model_map, *planning_model);
     ProjectionAssets assets{std::move(projector)};
@@ -4458,9 +4460,11 @@ BuildProductComposition(CompositionBuildInput input) {
   if (publisher == nullptr) {
     const auto &group =
         direct_control_motion_binding.value().value().model_groups.front();
+    auto package_paths = stage.package_paths();
+    package_paths.insert(package_paths.begin(), input.package_root);
     collision_model = collision::ManyForgeCollisionEngine::load_shared_model(
         "manyforge_i6_native_execution_host", stage.loader_urdf_path(),
-        stage.srdf_path(), stage.package_paths(), group.compiled_group_name);
+        stage.srdf_path(), package_paths, group.compiled_group_name);
     auto collision_projector = RetainedCollisionWorldProjector::create_verified(
         collision_model, *input.bundle, input.model_map, *retained_model);
     const auto logical_scene =

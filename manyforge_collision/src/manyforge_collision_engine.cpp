@@ -444,10 +444,15 @@ std::optional<std::filesystem::path> resolve_mesh_resource_uri(
 
   const std::filesystem::path candidate(path_text);
   std::vector<std::filesystem::path> candidates;
-  candidates.push_back(candidate);
   if (candidate.is_relative()) {
+    for (const auto& prefix : package_paths) {
+      candidates.push_back(prefix / candidate);
+    }
+    candidates.push_back(candidate);
     candidates.push_back(std::filesystem::current_path() / candidate);
     candidates.push_back(std::filesystem::path("/workspace") / candidate);
+  } else {
+    candidates.push_back(candidate);
   }
   if (auto resolved = first_existing_path(candidates)) {
     return resolved;
