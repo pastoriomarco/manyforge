@@ -467,6 +467,14 @@ def test_cclc_startup_uses_fresh_owner_templates_and_full_binding_sets(
                 ],
             }
 
+        @staticmethod
+        def execution_status():
+            return {
+                "ok": True,
+                "command": "status",
+                "status": {"owner_epoch": "kernel-owner.runtime.1"},
+            }
+
         def cclc_component(self, component_id):
             assert component_id == scenario.component_id
             return {
@@ -611,7 +619,7 @@ def test_cclc_startup_uses_fresh_owner_templates_and_full_binding_sets(
     assert all(request["confirmed"] is True for request in client.route_requests)
     assert all(
         request["request_context"]["request_owner_epoch"]
-        == "i9-isaac-matrix"
+        == "kernel-owner.runtime.1"
         for request in client.lifecycle_requests + client.route_requests
     )
 

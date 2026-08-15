@@ -808,6 +808,21 @@ def _prepare_and_select_cclc_routes(
     selection; every mutable expectation below comes from a fresh CCLC read.
     """
 
+    execution = client.execution_status()
+    execution_status = execution.get("status")
+    request_owner_epoch = (
+        execution_status.get("owner_epoch")
+        if isinstance(execution_status, dict)
+        else None
+    )
+    if (
+        execution.get("ok") is not True
+        or execution.get("command") != "status"
+        or not isinstance(request_owner_epoch, str)
+        or not request_owner_epoch
+    ):
+        raise LiveRowError("execution owner epoch is unavailable for CCLC startup")
+
     initial = client.cclc_component(spec.component_id)
     if (
         initial.get("controllable_component_id") != spec.component_id
@@ -832,7 +847,7 @@ def _prepare_and_select_cclc_routes(
             {
                 "request_context": {
                     "request_id": f"i9.lifecycle.{intent}.{spec.scenario_id}",
-                    "request_owner_epoch": "i9-isaac-matrix",
+                    "request_owner_epoch": request_owner_epoch,
                     "source_label": "i9_isaac_matrix",
                     "correlation_id": correlation_id,
                 },
@@ -929,7 +944,7 @@ def _prepare_and_select_cclc_routes(
             {
                 "request_context": {
                     "request_id": request_id,
-                    "request_owner_epoch": "i9-isaac-matrix",
+                    "request_owner_epoch": request_owner_epoch,
                     "source_label": "i9_isaac_matrix",
                     "correlation_id": correlation_id,
                 },
@@ -1018,6 +1033,7 @@ def _prepare_and_select_cclc_routes(
         },
         "lifecycle": lifecycle_rows,
         "routes": route_rows,
+        "request_owner_epoch": request_owner_epoch,
         "passed": True,
     }
 
