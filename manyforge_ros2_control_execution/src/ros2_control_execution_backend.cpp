@@ -1546,8 +1546,13 @@ void Ros2ControlExecutionBackend::on_controller_manager_activity(
 void Ros2ControlExecutionBackend::controller_binding_monitor_worker(
     std::stop_token stop_token) {
   const auto &contract = *config_.controller_binding;
+  // Each refresh performs two sequential, independently bounded controller
+  // manager service reads. Start at one quarter of the retained snapshot age
+  // so their combined timeout and scheduler jitter cannot consume the entire
+  // lease before the next publication. Controller-manager activity still
+  // invalidates the current snapshot immediately.
   const auto refresh_period = std::chrono::nanoseconds(
-      std::max<std::int64_t>(1, contract.snapshot_max_age_ns / 2));
+      std::max<std::int64_t>(1, contract.snapshot_max_age_ns / 4));
   const auto service_timeout =
       std::chrono::duration_cast<std::chrono::nanoseconds>(
           std::chrono::duration<double>(
