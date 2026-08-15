@@ -729,13 +729,16 @@ def _summary(value: Any) -> dict[str, Any]:
             "api_version",
             "complete",
             "generation",
+            "message",
             "owner_epoch",
             "program_run_id",
             "projection_generation",
             "projection_owner_epoch",
             "reason_code",
+            "run_revision",
             "schema_version",
             "state",
+            "tree_status",
         ):
             if key in value and isinstance(value[key], (str, int, bool, type(None))):
                 result[key] = value[key]
