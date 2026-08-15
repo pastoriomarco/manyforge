@@ -65,6 +65,10 @@ struct Ros2GripperActionConfig {
   std::string command_topic;
   std::string state_topic;
   std::vector<std::string> command_joint_names;
+  // Exact joint identity carried by the raw transport state topic. This is
+  // intentionally separate from joint_name, which is the compiled coordinate
+  // used by the execution-state projection sink.
+  std::string state_joint_name;
   // Optional execution-state sink projection metadata. When set, the ROS
   // gripper command/status path also updates the declared gripper group so
   // Composer's FK/link-pose scene state renders the gripper through the same

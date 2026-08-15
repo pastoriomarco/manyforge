@@ -276,6 +276,7 @@ TEST(RetainedRos2ControlBackendFactoryTest,
   EXPECT_EQ(selected.gripper->transport_kind, "isaac_joint_state_effort");
   EXPECT_EQ(selected.gripper->command_joint_names,
             (std::vector<std::string>{"source_gripper_joint"}));
+  EXPECT_EQ(selected.gripper->state_joint_name, "source_gripper_joint");
   EXPECT_EQ(selected.gripper->group_id, "gripper");
   EXPECT_EQ(selected.gripper->joint_name, "gripper_joint");
   EXPECT_EQ(selected.gripper->completion_policy, "dwell_elapsed");

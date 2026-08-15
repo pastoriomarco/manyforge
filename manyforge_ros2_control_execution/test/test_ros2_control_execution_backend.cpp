@@ -2442,6 +2442,44 @@ TEST(Ros2ControlExecutionBackendTest,
 }
 
 TEST(Ros2ControlExecutionBackendTest,
+     IsaacGripperFeedbackUsesRawSourceJointIdentity) {
+  const std::string suffix = unique_suffix();
+  const std::string state_topic =
+      "/manyforge_gripper_source_feedback_" + suffix;
+
+  auto sink = std::make_shared<RecordingExecutionStateSink>();
+  core::FakeClock clock;
+  core::ManualScheduler scheduler;
+  Ros2ControlExecutionBackend backend(
+      Ros2ControlExecutionBackend::DeferredRosExecutorStartTag{}, sink, "arm",
+      clock, scheduler, base_config());
+  auto gripper = isaac_gripper_config(
+      "/manyforge_gripper_source_command_" + suffix);
+  gripper.state_topic = state_topic;
+  gripper.command_joint_names = {"right_finger_joint"};
+  gripper.state_joint_name = "right_finger_joint";
+  gripper.joint_name = "robot_1__right_finger_joint";
+  backend.configure_gripper_action("tool", std::move(gripper));
+  backend.complete_ros_configuration();
+
+  JointStatePublisher publisher(state_topic);
+  ASSERT_TRUE(publisher.wait_for_subscription());
+  for (int attempt = 0; attempt < 5; ++attempt) {
+    publisher.publish({"right_finger_joint"}, {0.0081});
+    std::this_thread::sleep_for(20ms);
+  }
+
+  const auto readiness = backend.gripper_transport_readiness("tool");
+  EXPECT_TRUE(readiness.configured);
+  EXPECT_TRUE(readiness.feedback_path_ready);
+  EXPECT_FALSE(readiness.command_path_ready);
+  EXPECT_FALSE(readiness.ready);
+  EXPECT_EQ(readiness.reason_codes,
+            std::vector<std::string>{
+                "gripper_command_subscriber_unavailable"});
+}
+
+TEST(Ros2ControlExecutionBackendTest,
      GripperPreflightRejectsCrossedSemanticsWithoutAdmittingAnEffect) {
   auto sink = std::make_shared<RecordingExecutionStateSink>();
   sink->set_joint_position("gripper", "finger_joint", 0.7);

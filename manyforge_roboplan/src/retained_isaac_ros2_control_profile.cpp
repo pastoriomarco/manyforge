@@ -333,6 +333,8 @@ make_retained_isaac_ros2_control_backend_config(
   gripper_config.state_topic = profile.gripper_state_topic;
   gripper_config.command_joint_names = {
       *gripper.value().resources.front().source_joint_name};
+  gripper_config.state_joint_name =
+      *gripper.value().resources.front().source_joint_name;
   gripper_config.group_id =
       sole_compiled_group(gripper, "retained Isaac ROS gripper binding");
   gripper_config.joint_name =

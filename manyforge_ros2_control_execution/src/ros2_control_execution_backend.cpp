@@ -8319,6 +8319,14 @@ void Ros2ControlExecutionBackend::configure_gripper_action(
       throw std::invalid_argument(
           "isaac_joint_state_effort gripper positions and efforts are invalid");
     }
+    if (!config.state_topic.empty() && config.state_joint_name.empty()) {
+      if (config.command_joint_names.size() != 1U) {
+        throw std::invalid_argument(
+            "gripper state_joint_name is required when the raw state topic "
+            "cannot be resolved from one command joint");
+      }
+      config.state_joint_name = config.command_joint_names.front();
+    }
   }
   if (!std::isfinite(config.state_freshness_timeout_s) ||
       !std::isfinite(config.wait_for_action_server_timeout_s) ||
@@ -8364,11 +8372,8 @@ void Ros2ControlExecutionBackend::configure_gripper_action(
                 if (!runtime || !msg) {
                   return;
                 }
-                std::string observed_joint = runtime->config.joint_name;
-                if (observed_joint.empty() &&
-                    !runtime->config.command_joint_names.empty()) {
-                  observed_joint = runtime->config.command_joint_names.front();
-                }
+                const auto &observed_joint =
+                    runtime->config.state_joint_name;
                 if (observed_joint.empty()) {
                   return;
                 }
