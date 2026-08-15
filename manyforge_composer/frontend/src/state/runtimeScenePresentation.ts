@@ -21,7 +21,9 @@ export interface RuntimeLinkTransform {
 export interface MeasuredRobotPresentation {
   objectId: string;
   sourceId: string;
+  sourceEpoch: string;
   sourceSequence: number;
+  observedAtNs: number;
   linkTransforms: Record<string, RuntimeLinkTransform>;
 }
 
@@ -29,7 +31,9 @@ export interface MeasuredPosePresentation {
   objectId: string;
   policyId: string;
   sourceId: string;
+  sourceEpoch: string;
   sourceSequence: number;
+  observedAtNs: number;
   pose: SceneRuntimeObservationPose;
 }
 
@@ -182,7 +186,9 @@ export function runtimeScenePresentation(
           measuredRobot = {
             objectId: source.object_id,
             sourceId: source.source_id,
+            sourceEpoch: source.source_epoch,
             sourceSequence: source.source_sequence,
+            observedAtNs: source.observed_at_ns,
             linkTransforms,
           };
         }
@@ -211,7 +217,9 @@ export function runtimeScenePresentation(
       objectId,
       policyId: source.policy_id,
       sourceId: source.source_id,
+      sourceEpoch: source.source_epoch,
       sourceSequence: source.source_sequence,
+      observedAtNs: source.observed_at_ns,
       pose: source.payload.pose,
     });
   }
@@ -229,7 +237,9 @@ export function runtimeScenePresentation(
       objectId: source.object_id,
       policyId: source.policy_id,
       sourceId: source.source_id,
+      sourceEpoch: source.source_epoch,
       sourceSequence: source.source_sequence,
+      observedAtNs: source.observed_at_ns,
       pose: source.payload.pose,
     };
   }

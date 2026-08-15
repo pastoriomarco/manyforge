@@ -3,12 +3,13 @@ import {
   Suspense,
   useCallback,
   useEffect,
+  useLayoutEffect,
   useMemo,
   useRef,
   useState,
 } from 'react';
 import type { ErrorInfo, ReactNode } from 'react';
-import { Canvas } from '@react-three/fiber';
+import { Canvas, useFrame, useThree } from '@react-three/fiber';
 import {
   Bounds,
   Grid,
@@ -25,16 +26,29 @@ import {
 import type { PointCloudFrame } from '../api/pointcloudObserverClient';
 import { usePointCloudFrame } from '../hooks/usePointCloudFrame';
 import { SnapshotResponder } from './SnapshotResponder';
+import {
+  applyAuthoritativeTransformTransition,
+  authoritativeInterpolationDurationMs,
+  createAuthoritativeTransformTransition,
+  sameAuthoritativeTransformFrame,
+  sameAuthoritativeTransformPose,
+} from '../state/authoritativeInterpolation';
+import type {
+  AuthoritativeTransformFrame,
+  AuthoritativeTransformTransition,
+} from '../state/authoritativeInterpolation';
 import type { StructuralResourceState } from '../state/structuralResource';
 import type { RuntimeScenePresentation } from '../state/runtimeScenePresentation';
 import type {
   LogicalSceneObject,
   LogicalSceneShape,
   ProgramViewerMetadata,
+  QuaternionXyzwTuple,
   SceneUrdfCollision,
   SceneUrdfManifest,
   SceneUrdfPrimitive,
   SceneUrdfVisual,
+  Vector3Tuple,
 } from '../types/api';
 import type { Pose3Value } from '../types/robotControl';
 import {
@@ -132,6 +146,130 @@ class AssetErrorBoundary extends Component<
   render(): ReactNode {
     return this.state.failed ? null : this.props.children;
   }
+}
+
+function authoritativeStreamIdentity(
+  ownerIdentity: StructuralViewerProps['sceneOwnerIdentity'],
+  ...parts: Array<string | number>
+): string {
+  return JSON.stringify([
+    ownerIdentity?.ownerEpoch ?? 'unbound-owner',
+    ownerIdentity?.generation ?? -1,
+    ...parts,
+  ]);
+}
+
+/**
+ * Apply authoritative transforms outside React's commit path. Each source
+ * update may create one bounded visual transition; render frames only mutate
+ * this stable Three.js group and stop invalidating as soon as the newest
+ * authoritative transform is reached.
+ */
+function AuthoritativeTransformGroup({
+  name,
+  streamIdentity,
+  sourceSequence,
+  observedAtNs,
+  positionM,
+  orientationXyzw,
+  latestFrameAppliers,
+  children,
+}: {
+  name: string;
+  streamIdentity: string;
+  sourceSequence: number;
+  observedAtNs: number;
+  positionM: Vector3Tuple;
+  orientationXyzw: QuaternionXyzwTuple;
+  latestFrameAppliers: Set<() => void>;
+  children: ReactNode;
+}) {
+  const group = useRef<THREE.Group>(null);
+  const previous = useRef<AuthoritativeTransformFrame | null>(null);
+  const active = useRef<AuthoritativeTransformTransition | null>(null);
+  const invalidate = useThree((state) => state.invalidate);
+  const [px, py, pz] = positionM;
+  const [qx, qy, qz, qw] = orientationXyzw;
+  const applyLatestFrame = useCallback(() => {
+    if (group.current === null || active.current === null) return;
+    group.current.position.copy(active.current.toPosition);
+    group.current.quaternion.copy(active.current.toQuaternion);
+    active.current = null;
+    invalidate();
+  }, [invalidate]);
+
+  useLayoutEffect(() => {
+    latestFrameAppliers.add(applyLatestFrame);
+    return () => {
+      latestFrameAppliers.delete(applyLatestFrame);
+    };
+  }, [applyLatestFrame, latestFrameAppliers]);
+
+  useLayoutEffect(() => {
+    if (group.current === null) return;
+    const next: AuthoritativeTransformFrame = {
+      streamIdentity,
+      sourceSequence,
+      observedAtNs,
+      positionM: [px, py, pz],
+      orientationXyzw: [qx, qy, qz, qw],
+    };
+    if (
+      previous.current !== null
+      && sameAuthoritativeTransformFrame(previous.current, next)
+    ) return;
+
+    if (
+      previous.current !== null
+      && authoritativeInterpolationDurationMs(previous.current, next) > 0
+      && sameAuthoritativeTransformPose(previous.current, next)
+    ) {
+      previous.current = next;
+      return;
+    }
+
+    const transition = createAuthoritativeTransformTransition(
+      previous.current,
+      next,
+      group.current.position,
+      group.current.quaternion,
+      performance.now(),
+    );
+    previous.current = next;
+    active.current = transition;
+    if (transition === null) {
+      const orientation = normalizeQuaternion(next.orientationXyzw);
+      group.current.position.set(...next.positionM);
+      group.current.quaternion.set(...orientation);
+    }
+    invalidate();
+  }, [
+    invalidate,
+    observedAtNs,
+    px,
+    py,
+    pz,
+    qw,
+    qx,
+    qy,
+    qz,
+    sourceSequence,
+    streamIdentity,
+  ]);
+
+  useFrame(() => {
+    if (group.current === null || active.current === null) return;
+    const complete = applyAuthoritativeTransformTransition(
+      active.current,
+      performance.now(),
+      group.current.position,
+      group.current.quaternion,
+    );
+    if (complete) active.current = null;
+    else invalidate();
+  });
+
+  return <group ref={group} name={name}>{children}</group>;
 }
 
 function VisualMesh({ url }: { url: string }) {
@@ -431,9 +569,13 @@ function RetainedNeutralModel({
 function MeasuredRuntimeModel({
   manifest,
   presentation,
+  ownerIdentity,
+  latestFrameAppliers,
 }: {
   manifest: SceneUrdfManifest;
   presentation: NonNullable<RuntimeScenePresentation['measuredRobot']>;
+  ownerIdentity: StructuralViewerProps['sceneOwnerIdentity'];
+  latestFrameAppliers: Set<() => void>;
 }) {
   return (
     <group name={`owner-measured-robot:${presentation.objectId}`}>
@@ -441,11 +583,23 @@ function MeasuredRuntimeModel({
         const transform = presentation.linkTransforms[link.name];
         if (transform === undefined) return null;
         return (
-          <group
+          <AuthoritativeTransformGroup
             key={`measured:${manifest.model_key}:${link.name}`}
             name={`measured:${link.name}`}
-            position={transform.position_m}
-            quaternion={normalizeQuaternion(transform.orientation_xyzw)}
+            streamIdentity={authoritativeStreamIdentity(
+              ownerIdentity,
+              'robot',
+              manifest.model_key,
+              presentation.objectId,
+              presentation.sourceId,
+              presentation.sourceEpoch,
+              link.name,
+            )}
+            sourceSequence={presentation.sourceSequence}
+            observedAtNs={presentation.observedAtNs}
+            positionM={transform.position_m}
+            orientationXyzw={transform.orientation_xyzw}
+            latestFrameAppliers={latestFrameAppliers}
           >
             {link.visuals.map((visual) => {
               const origin = visual.visual_origin;
@@ -464,7 +618,7 @@ function MeasuredRuntimeModel({
                 </group>
               );
             })}
-          </group>
+          </AuthoritativeTransformGroup>
         );
       })}
     </group>
@@ -563,12 +717,14 @@ function MeasuredLogicalSceneObjects({
   onSelect,
   ownerIdentity,
   onAssetError,
+  latestFrameAppliers,
 }: {
   objects: LogicalSceneObject[];
   presentation: RuntimeScenePresentation;
   onSelect: (sceneResourceId: string) => void;
   ownerIdentity: StructuralViewerProps['sceneOwnerIdentity'];
   onAssetError: (error: Error) => void;
+  latestFrameAppliers: Set<() => void>;
 }) {
   const objectById = new Map(
     objects.map((object) => [object.scene_resource_id, object]),
@@ -579,45 +735,59 @@ function MeasuredLogicalSceneObjects({
         const object = objectById.get(measurement.objectId);
         if (object === undefined) return null;
         return (
-          <group
-            key={`measured-scene:${measurement.objectId}:${measurement.sourceSequence}`}
+          <AuthoritativeTransformGroup
+            key={`measured-scene:${measurement.objectId}`}
             name={`measured-scene:${measurement.objectId}`}
-            position={measurement.pose.position_m}
-            quaternion={normalizeQuaternion(measurement.pose.orientation_xyzw)}
-            onClick={(event) => {
-              event.stopPropagation();
-              onSelect(measurement.objectId);
-            }}
+            streamIdentity={authoritativeStreamIdentity(
+              ownerIdentity,
+              'scene-object',
+              measurement.objectId,
+              measurement.policyId,
+              measurement.sourceId,
+              measurement.sourceEpoch,
+            )}
+            sourceSequence={measurement.sourceSequence}
+            observedAtNs={measurement.observedAtNs}
+            positionM={measurement.pose.position_m}
+            orientationXyzw={measurement.pose.orientation_xyzw}
+            latestFrameAppliers={latestFrameAppliers}
           >
-            {object.collision_shapes.map((shape, index) => shape.type === 'mesh'
-              ? ownerIdentity === undefined ? null : (
-                  <SceneObjectMesh
-                    key={`measured-scene:${measurement.objectId}:${index}`}
-                    shape={shape}
-                    ownerIdentity={ownerIdentity}
-                    measured
-                    selected={false}
-                    onAssetError={onAssetError}
-                  />
-                )
-              : (
-                  <mesh
-                    key={`measured-scene:${measurement.objectId}:${index}`}
-                    rotation={shape.type === 'cylinder' ? [Math.PI / 2, 0, 0] : undefined}
-                    renderOrder={16}
-                  >
-                    <LogicalShapeGeometry shape={shape} />
-                    <meshStandardMaterial
-                      color="#43d7ec"
-                      emissive="#0c5060"
-                      transparent
-                      opacity={0.4}
-                      wireframe
-                      depthWrite={false}
+            <group
+              onClick={(event) => {
+                event.stopPropagation();
+                onSelect(measurement.objectId);
+              }}
+            >
+              {object.collision_shapes.map((shape, index) => shape.type === 'mesh'
+                ? ownerIdentity === undefined ? null : (
+                    <SceneObjectMesh
+                      key={`measured-scene:${measurement.objectId}:${index}`}
+                      shape={shape}
+                      ownerIdentity={ownerIdentity}
+                      measured
+                      selected={false}
+                      onAssetError={onAssetError}
                     />
-                  </mesh>
-                ))}
-          </group>
+                  )
+                : (
+                    <mesh
+                      key={`measured-scene:${measurement.objectId}:${index}`}
+                      rotation={shape.type === 'cylinder' ? [Math.PI / 2, 0, 0] : undefined}
+                      renderOrder={16}
+                    >
+                      <LogicalShapeGeometry shape={shape} />
+                      <meshStandardMaterial
+                        color="#43d7ec"
+                        emissive="#0c5060"
+                        transparent
+                        opacity={0.4}
+                        wireframe
+                        depthWrite={false}
+                      />
+                    </mesh>
+                  ))}
+            </group>
+          </AuthoritativeTransformGroup>
         );
       })}
     </group>
@@ -661,8 +831,10 @@ function CandidateTcpGhost({
 
 function BoundSnapshotResponder({
   frameIdentity,
+  applyLatestFrame,
 }: {
   frameIdentity: NonNullable<StructuralViewerProps['viewerFrameIdentity']>;
+  applyLatestFrame: () => void;
 }) {
   const current = useRef(frameIdentity);
   useEffect(() => {
@@ -686,6 +858,7 @@ function BoundSnapshotResponder({
       subscribe={subscribeSnapshotObserver}
       upload={uploadSnapshotObserverResult}
       ensureFrame={ensureFrame}
+      applyFrame={applyLatestFrame}
     />
   );
 }
@@ -693,15 +866,30 @@ function BoundSnapshotResponder({
 function MeasuredTcpMarker({
   presentation,
   axesSizeM,
+  ownerIdentity,
+  latestFrameAppliers,
 }: {
   presentation: NonNullable<RuntimeScenePresentation['measuredTcp']>;
   axesSizeM: number;
+  ownerIdentity: StructuralViewerProps['sceneOwnerIdentity'];
+  latestFrameAppliers: Set<() => void>;
 }) {
   return (
-    <group
+    <AuthoritativeTransformGroup
       name={`owner-measured-tcp:${presentation.objectId}`}
-      position={presentation.pose.position_m}
-      quaternion={normalizeQuaternion(presentation.pose.orientation_xyzw)}
+      streamIdentity={authoritativeStreamIdentity(
+        ownerIdentity,
+        'tcp',
+        presentation.objectId,
+        presentation.policyId,
+        presentation.sourceId,
+        presentation.sourceEpoch,
+      )}
+      sourceSequence={presentation.sourceSequence}
+      observedAtNs={presentation.observedAtNs}
+      positionM={presentation.pose.position_m}
+      orientationXyzw={presentation.pose.orientation_xyzw}
+      latestFrameAppliers={latestFrameAppliers}
     >
       <mesh renderOrder={18}>
         <octahedronGeometry args={[Math.max(axesSizeM * 0.1, 0.008), 0]} />
@@ -714,7 +902,7 @@ function MeasuredTcpMarker({
         />
       </mesh>
       <axesHelper args={[axesSizeM]} />
-    </group>
+    </AuthoritativeTransformGroup>
   );
 }
 
@@ -790,6 +978,10 @@ function ViewerCanvas({
     ...selectViewerPresentationProfile(false, devicePixelRatio),
   }));
   const selectedCamera = camera ?? DEFAULT_VIEWER_CAMERA;
+  const latestFrameAppliers = useMemo(() => new Set<() => void>(), []);
+  const applyLatestFrame = useCallback(() => {
+    for (const apply of latestFrameAppliers) apply();
+  }, [latestFrameAppliers]);
 
   return (
     <Canvas
@@ -867,6 +1059,8 @@ function ViewerCanvas({
                 <MeasuredRuntimeModel
                   manifest={manifest}
                   presentation={runtimePresentation.measuredRobot}
+                  ownerIdentity={sceneOwnerIdentity}
+                  latestFrameAppliers={latestFrameAppliers}
                 />
               )}
             </Bounds>
@@ -888,6 +1082,7 @@ function ViewerCanvas({
           onSelect={(sceneResourceId) => onSelectSceneResource(sceneResourceId)}
           ownerIdentity={sceneOwnerIdentity}
           onAssetError={onAssetError}
+          latestFrameAppliers={latestFrameAppliers}
         />
       )}
       {runtimePresentation?.measuredTcp !== null
@@ -895,6 +1090,8 @@ function ViewerCanvas({
         <MeasuredTcpMarker
           presentation={runtimePresentation.measuredTcp}
           axesSizeM={viewer?.frame_gizmo_size_m ?? 0.1}
+          ownerIdentity={sceneOwnerIdentity}
+          latestFrameAppliers={latestFrameAppliers}
         />
       )}
       {candidateTcpPose !== null && (
@@ -906,7 +1103,10 @@ function ViewerCanvas({
       )}
       {pointCloudFrame !== null && <PointCloudPoints frame={pointCloudFrame} />}
       {viewerFrameIdentity !== undefined && (
-        <BoundSnapshotResponder frameIdentity={viewerFrameIdentity} />
+        <BoundSnapshotResponder
+          frameIdentity={viewerFrameIdentity}
+          applyLatestFrame={applyLatestFrame}
+        />
       )}
     </Canvas>
   );

@@ -261,9 +261,24 @@ describe('runtime scene presentation', () => {
       .toBeCloseTo(1);
     expect(presentation.measuredRobot?.linkTransforms.tip.position_m[1])
       .toBeCloseTo(1);
+    expect(presentation.measuredRobot).toMatchObject({
+      sourceEpoch: 'epoch-1',
+      sourceSequence: 1,
+      observedAtNs: 1_000_000_000,
+    });
     expect(presentation.measuredTcp?.policyId).toBe('viewer.measured_tcp');
+    expect(presentation.measuredTcp).toMatchObject({
+      sourceEpoch: 'epoch-1',
+      sourceSequence: 2,
+      observedAtNs: 1_000_000_000,
+    });
     expect(presentation.measuredObjects.map((item) => item.objectId))
       .toEqual(['part']);
+    expect(presentation.measuredObjects[0]).toMatchObject({
+      sourceEpoch: 'epoch-1',
+      sourceSequence: 3,
+      observedAtNs: 1_000_000_000,
+    });
     expect(presentation.status).toMatchObject({
       total: 4,
       freshGood: 3,
