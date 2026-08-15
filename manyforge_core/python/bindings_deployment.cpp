@@ -18,6 +18,7 @@
 #include <manyforge_deployment/deployment_artifact_codec.hpp>
 #include <manyforge_deployment/model_asset_codec.hpp>
 #include <manyforge_deployment/provider_manifest_codec.hpp>
+#include <manyforge_deployment/runtime_policy_codec.hpp>
 #include <manyforge_deployment/runtime_profile_codec.hpp>
 #include <manyforge_deployment/site_overlay_resolution.hpp>
 #include <manyforge_deployment/stop_evidence_policy_codec.hpp>
@@ -64,6 +65,58 @@ template <typename Value, typename Error>
                            std::string(expected_type) + " values");
     }
     bounded.push_back(item.cast<const Value&>());
+  }
+  return bounded;
+}
+
+template <typename Record>
+[[nodiscard]] bool append_catalog_record_ref_if_exact_type(
+    const py::handle& item, std::vector<CatalogRecordRefDTO>& bounded) {
+  if (!py::isinstance<Record>(item)) {
+    return false;
+  }
+  bounded.emplace_back(item.cast<const Record&>());
+  return true;
+}
+
+[[nodiscard]] std::vector<CatalogRecordRefDTO>
+bounded_catalog_record_refs_from_python(const py::iterable& values,
+                                        std::size_t maximum,
+                                        std::string_view argument_name) {
+  std::vector<CatalogRecordRefDTO> bounded;
+  for (const auto& item : values) {
+    if (bounded.size() == maximum) {
+      throw deployment::DeploymentApplicabilityCodecError(
+          std::string(argument_name) +
+          " exceeds its public compiler-ingress bound");
+    }
+    const bool appended =
+        append_catalog_record_ref_if_exact_type<
+            ModelAssetCatalogRecordRefDTO>(item, bounded) ||
+        append_catalog_record_ref_if_exact_type<
+            RuntimeProfileCatalogRecordRefDTO>(item, bounded) ||
+        append_catalog_record_ref_if_exact_type<
+            ComponentTypeCatalogRecordRefDTO>(item, bounded) ||
+        append_catalog_record_ref_if_exact_type<
+            ControlInterfaceContractCatalogRecordRefDTO>(item, bounded) ||
+        append_catalog_record_ref_if_exact_type<
+            ControllerTopologyCatalogRecordRefDTO>(item, bounded) ||
+        append_catalog_record_ref_if_exact_type<
+            ProviderManifestCatalogRecordRefDTO>(item, bounded) ||
+        append_catalog_record_ref_if_exact_type<CommandSchemaCatalogRecordRefDTO>(
+            item, bounded) ||
+        append_catalog_record_ref_if_exact_type<
+            CapabilityDefinitionCatalogRecordRefDTO>(item, bounded) ||
+        append_catalog_record_ref_if_exact_type<ContactPolicyCatalogRecordRefDTO>(
+            item, bounded) ||
+        append_catalog_record_ref_if_exact_type<
+            StopEvidencePolicyCatalogRecordRefDTO>(item, bounded) ||
+        append_catalog_record_ref_if_exact_type<
+            RuntimePolicyCatalogRecordRefDTO>(item, bounded);
+    if (!appended) {
+      throw py::type_error(std::string(argument_name) +
+                           " must contain only CatalogRecordRefDTO values");
+    }
   }
   return bounded;
 }
@@ -1031,11 +1084,11 @@ void register_deployment_candidate_bindings(py::module_& module) {
                  commissioned_stop_interfaces, 256U,
                  "commissioned_stop_interfaces",
                  "CommissionedStopInterfaceDTO");
-             auto bounded_policy_records = bounded_values_from_python<
-                 CatalogRecordRefDTO,
-                 deployment::DeploymentApplicabilityCodecError>(
-                 retained_policy_records, kMaxDeploymentApplicabilityRows,
-                 "retained_policy_records", "CatalogRecordRefDTO");
+             auto bounded_policy_records =
+                 bounded_catalog_record_refs_from_python(
+                     retained_policy_records,
+                     kMaxDeploymentApplicabilityRows,
+                     "retained_policy_records");
              return DeploymentApplicabilityInputsDTO{
                  std::move(site_overlay_ref),
                  std::move(bounded_configurations),
@@ -1592,6 +1645,17 @@ void register_deployment_candidate_bindings(py::module_& module) {
             return deployment::canonical_json(profile.normalized_root());
           });
 
+  py::class_<deployment::QualifiedRuntimePolicy>(
+      module, "QualifiedRuntimePolicy", py::is_final())
+      .def_property_readonly(
+          "value", &deployment::QualifiedRuntimePolicy::value)
+      .def_property_readonly(
+          "normalized_canonical_json",
+          [](const deployment::QualifiedRuntimePolicy& policy) {
+            py::gil_scoped_release release;
+            return deployment::canonical_json(policy.normalized_root());
+          });
+
   py::class_<deployment::QualifiedStopEvidencePolicy>(
       module, "QualifiedStopEvidencePolicy", py::is_final())
       .def_property_readonly(
@@ -1762,6 +1826,11 @@ void register_deployment_candidate_bindings(py::module_& module) {
              py::call_guard<py::gil_scoped_release>());
   module.def("resolve_and_qualify_runtime_profile",
              &deployment::resolve_and_qualify_runtime_profile,
+             py::arg("reference"), py::arg("resolved_store_key"),
+             py::arg("stored_bytes"),
+             py::call_guard<py::gil_scoped_release>());
+  module.def("resolve_and_qualify_runtime_policy",
+             &deployment::resolve_and_qualify_runtime_policy,
              py::arg("reference"), py::arg("resolved_store_key"),
              py::arg("stored_bytes"),
              py::call_guard<py::gil_scoped_release>());

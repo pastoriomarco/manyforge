@@ -643,6 +643,7 @@ def _applicability_constructor_fixture():
         "external_resources": (external,),
         "stop_stage_parameters": (),
         "commissioned_stop_interfaces": (),
+        "retained_policy_records": (),
     }
     return {
         "binding_routes": (
@@ -1772,15 +1773,17 @@ target: 0.5
         for entry in registry.catalog_schemas
         if entry.qualification == core.CatalogSchemaQualification.kQualified
     ]
-    assert len(qualified_entries) == 9
+    assert len(qualified_entries) == 11
     assert {entry.record_kind for entry in qualified_entries} == {
         core.CatalogRecordKind.kCapabilityDefinition,
         core.CatalogRecordKind.kCommandSchema,
         core.CatalogRecordKind.kComponentType,
+        core.CatalogRecordKind.kContactPolicy,
         core.CatalogRecordKind.kControlInterfaceContract,
         core.CatalogRecordKind.kControllerTopology,
         core.CatalogRecordKind.kModelAsset,
         core.CatalogRecordKind.kProviderManifest,
+        core.CatalogRecordKind.kRuntimePolicy,
         core.CatalogRecordKind.kRuntimeProfile,
         core.CatalogRecordKind.kStopEvidencePolicy,
     }
@@ -1789,10 +1792,12 @@ target: 0.5
         "catalog/manyforge.capability_definition.v1.yaml",
         "catalog/manyforge.command_schema.v1.yaml",
         "catalog/manyforge.component_type.v1.yaml",
+        "catalog/manyforge.contact_policy.v1.yaml",
         "catalog/manyforge.control_interface_contract.v1.yaml",
         "catalog/manyforge.controller_topology.v1.yaml",
         "catalog/manyforge.model_asset.v1.yaml",
         "catalog/manyforge.provider_manifest.v1.yaml",
+        "catalog/manyforge.runtime_policy.v1.yaml",
         "catalog/manyforge.runtime_profile.v1.yaml",
         "catalog/manyforge.stop_evidence_policy.v2.yaml",
     }
@@ -1801,7 +1806,7 @@ target: 0.5
         for entry in registry.catalog_schemas
         if entry.qualification == core.CatalogSchemaQualification.kUnqualified
     )
-    assert len(registry.value_schemas) == 4
+    assert len(registry.value_schemas) == 5
     assert {
         (entry.schema_id.value, entry.schema_revision.value)
         for entry in registry.value_schemas
@@ -1822,9 +1827,13 @@ target: 0.5
             "manyforge.value_schema.runtime.native_execution.v1",
             "sha256:c20bf40303bddd213d8db77b7075c0fe224e00928f4e6bda3cbfd7ebba880d6e",
         ),
+        (
+            "manyforge.value_schema.runtime.ros2_control_execution.v1",
+            "sha256:2404a4d3156048f5969c651c550e7f785d5b23e4ccc07df9004f3ba2d98e6bc6",
+        ),
     }
     assert registry.qualification_registry_digest.value == (
-        "sha256:019bf635a4675e91fd319a5f8f34e7d05cd86f65983a38acea3a2d16c7a16833"
+        "sha256:65ee605872372888db7677aa168be992961e04b05c924ebe05f4283e3b0f8c74"
     )
     assert (
         json.loads(registry.normalized_projection_canonical_json)["catalog_schemas"][0][

@@ -9,6 +9,7 @@
 #include <manyforge_core/types/controller_topology.hpp>
 #include <manyforge_core/types/model_asset.hpp>
 #include <manyforge_core/types/provider_manifest.hpp>
+#include <manyforge_core/types/runtime_policy.hpp>
 #include <manyforge_core/types/runtime_profile.hpp>
 #include <manyforge_core/types/stop_control.hpp>
 #include <manyforge_core/types/stop_evidence_policy.hpp>
@@ -378,6 +379,169 @@ void register_catalog_record_bindings(py::module_& module) {
 
   module.attr("RUNTIME_PROFILE_API_VERSION") = std::string(kRuntimeProfileApiVersion);
   module.attr("MAX_RUNTIME_PROFILE_ROLE_IDS") = kMaxRuntimeProfileRoleIds;
+
+  py::class_<RuntimePolicyCellScopeDTO>(
+      module, "RuntimePolicyCellScopeDTO", py::is_final())
+      .def(py::init<>())
+      .def(
+          "__eq__",
+          [](const RuntimePolicyCellScopeDTO& lhs,
+             const RuntimePolicyCellScopeDTO& rhs) { return lhs == rhs; },
+          py::is_operator())
+      .def(
+          "__ne__",
+          [](const RuntimePolicyCellScopeDTO& lhs,
+             const RuntimePolicyCellScopeDTO& rhs) { return lhs != rhs; },
+          py::is_operator());
+
+  py::class_<RuntimePolicyCommandTargetScopeDTO>(
+      module, "RuntimePolicyCommandTargetScopeDTO", py::is_final())
+      .def(py::init([](ControllableComponentId controllable_component_id,
+                       CommandTargetId command_target_id) {
+             return RuntimePolicyCommandTargetScopeDTO{
+                 std::move(controllable_component_id),
+                 std::move(command_target_id)};
+           }),
+           py::arg("controllable_component_id"),
+           py::arg("command_target_id"))
+      .def_readonly(
+          "controllable_component_id",
+          &RuntimePolicyCommandTargetScopeDTO::controllable_component_id)
+      .def_readonly("command_target_id",
+                    &RuntimePolicyCommandTargetScopeDTO::command_target_id)
+      .def(
+          "__eq__",
+          [](const RuntimePolicyCommandTargetScopeDTO& lhs,
+             const RuntimePolicyCommandTargetScopeDTO& rhs) {
+            return lhs == rhs;
+          },
+          py::is_operator())
+      .def(
+          "__ne__",
+          [](const RuntimePolicyCommandTargetScopeDTO& lhs,
+             const RuntimePolicyCommandTargetScopeDTO& rhs) {
+            return lhs != rhs;
+          },
+          py::is_operator());
+
+  py::class_<RuntimeMotionSpeedLimitDTO>(
+      module, "RuntimeMotionSpeedLimitDTO", py::is_final())
+      .def(py::init([](RuntimePolicyMotionScopeDTO scope,
+                       double maximum_tcp_linear_speed_mps) {
+             return RuntimeMotionSpeedLimitDTO{
+                 std::move(scope), maximum_tcp_linear_speed_mps};
+           }),
+           py::arg("scope"), py::arg("maximum_tcp_linear_speed_mps"))
+      .def_readonly("scope", &RuntimeMotionSpeedLimitDTO::scope)
+      .def_readonly("maximum_tcp_linear_speed_mps",
+                    &RuntimeMotionSpeedLimitDTO::maximum_tcp_linear_speed_mps)
+      .def(
+          "__eq__",
+          [](const RuntimeMotionSpeedLimitDTO& lhs,
+             const RuntimeMotionSpeedLimitDTO& rhs) { return lhs == rhs; },
+          py::is_operator())
+      .def(
+          "__ne__",
+          [](const RuntimeMotionSpeedLimitDTO& lhs,
+             const RuntimeMotionSpeedLimitDTO& rhs) { return lhs != rhs; },
+          py::is_operator());
+
+  py::enum_<OpenLoopGraspEnvironmentDTO>(
+      module, "OpenLoopGraspEnvironmentDTO")
+      .value("kSimulation", OpenLoopGraspEnvironmentDTO::kSimulation)
+      .value("kCommissionedHardware",
+             OpenLoopGraspEnvironmentDTO::kCommissionedHardware);
+
+  py::class_<RuntimeOpenLoopGraspAcknowledgementDTO>(
+      module, "RuntimeOpenLoopGraspAcknowledgementDTO", py::is_final())
+      .def(py::init([](ControllableComponentId controllable_component_id,
+                       CommandTargetId command_target_id,
+                       OpenLoopGraspEnvironmentDTO environment, bool allowed) {
+             return RuntimeOpenLoopGraspAcknowledgementDTO{
+                 std::move(controllable_component_id),
+                 std::move(command_target_id), environment, allowed};
+           }),
+           py::arg("controllable_component_id"),
+           py::arg("command_target_id"), py::arg("environment"),
+           py::arg("allowed"))
+      .def_readonly(
+          "controllable_component_id",
+          &RuntimeOpenLoopGraspAcknowledgementDTO::controllable_component_id)
+      .def_readonly(
+          "command_target_id",
+          &RuntimeOpenLoopGraspAcknowledgementDTO::command_target_id)
+      .def_readonly("environment",
+                    &RuntimeOpenLoopGraspAcknowledgementDTO::environment)
+      .def_readonly("allowed",
+                    &RuntimeOpenLoopGraspAcknowledgementDTO::allowed)
+      .def(
+          "__eq__",
+          [](const RuntimeOpenLoopGraspAcknowledgementDTO& lhs,
+             const RuntimeOpenLoopGraspAcknowledgementDTO& rhs) {
+            return lhs == rhs;
+          },
+          py::is_operator())
+      .def(
+          "__ne__",
+          [](const RuntimeOpenLoopGraspAcknowledgementDTO& lhs,
+             const RuntimeOpenLoopGraspAcknowledgementDTO& rhs) {
+            return lhs != rhs;
+          },
+          py::is_operator());
+
+  py::class_<RuntimePolicyDTO>(module, "RuntimePolicyDTO", py::is_final())
+      .def(py::init([](
+               RuntimePolicyId runtime_policy_id,
+               RuntimePolicyRevision runtime_policy_revision,
+               std::optional<std::string> description,
+               std::vector<InterruptPolicyId> interrupt_policy_ids,
+               std::vector<RuntimeMotionSpeedLimitDTO> motion_speed_limits,
+               std::vector<RuntimeOpenLoopGraspAcknowledgementDTO>
+                   open_loop_grasp_acknowledgements) {
+             return RuntimePolicyDTO{
+                 std::move(runtime_policy_id),
+                 std::move(runtime_policy_revision), std::move(description),
+                 std::move(interrupt_policy_ids),
+                 std::move(motion_speed_limits),
+                 std::move(open_loop_grasp_acknowledgements)};
+           }),
+           py::arg("runtime_policy_id"),
+           py::arg("runtime_policy_revision"),
+           py::arg("description") = std::nullopt,
+           py::arg("interrupt_policy_ids") =
+               std::vector<InterruptPolicyId>{},
+           py::arg("motion_speed_limits") =
+               std::vector<RuntimeMotionSpeedLimitDTO>{},
+           py::arg("open_loop_grasp_acknowledgements") =
+               std::vector<RuntimeOpenLoopGraspAcknowledgementDTO>{})
+      .def_readonly("runtime_policy_id", &RuntimePolicyDTO::runtime_policy_id)
+      .def_readonly("runtime_policy_revision",
+                    &RuntimePolicyDTO::runtime_policy_revision)
+      .def_readonly("description", &RuntimePolicyDTO::description)
+      .def_readonly("interrupt_policy_ids",
+                    &RuntimePolicyDTO::interrupt_policy_ids)
+      .def_readonly("motion_speed_limits",
+                    &RuntimePolicyDTO::motion_speed_limits)
+      .def_readonly("open_loop_grasp_acknowledgements",
+                    &RuntimePolicyDTO::open_loop_grasp_acknowledgements)
+      .def(
+          "__eq__",
+          [](const RuntimePolicyDTO& lhs, const RuntimePolicyDTO& rhs) {
+            return lhs == rhs;
+          },
+          py::is_operator())
+      .def(
+          "__ne__",
+          [](const RuntimePolicyDTO& lhs, const RuntimePolicyDTO& rhs) {
+            return lhs != rhs;
+          },
+          py::is_operator());
+
+  module.attr("RUNTIME_POLICY_API_VERSION") =
+      std::string(kRuntimePolicyApiVersion);
+  module.attr("MAX_RUNTIME_POLICY_RULES") = kMaxRuntimePolicyRules;
+  module.attr("MAX_RUNTIME_POLICY_DESCRIPTION_BYTES") =
+      kMaxRuntimePolicyDescriptionBytes;
 
   py::class_<CapabilityDefinitionDTO>(module, "CapabilityDefinitionDTO", py::is_final())
       .def(py::init([](CapabilityId capability_id, CapabilityDefinitionRevision revision,

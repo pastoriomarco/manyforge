@@ -2399,6 +2399,7 @@ void register_model_compiler_bindings(py::module_& module) {
          const deployment::RevisionVerifiedDeploymentApplicabilityInputs&
              deployment_inputs,
          const py::iterable& runtime_profiles,
+         const py::iterable& runtime_policies,
          const py::iterable& command_schemas,
          const py::iterable& capability_definitions,
          const py::iterable& control_interface_contracts,
@@ -2414,6 +2415,11 @@ void register_model_compiler_bindings(py::module_& module) {
                 deployment::QualifiedRuntimeProfile>(
                 runtime_profiles, "runtime_profiles",
                 "QualifiedRuntimeProfile");
+        auto bounded_runtime_policies =
+            bounded_qualified_closure_from_python<
+                deployment::QualifiedRuntimePolicy>(
+                runtime_policies, "runtime_policies",
+                "QualifiedRuntimePolicy");
         auto bounded_command_schemas =
             bounded_qualified_closure_from_python<
                 deployment::QualifiedCommandSchema>(
@@ -2461,6 +2467,8 @@ void register_model_compiler_bindings(py::module_& module) {
             composition, deployment_inputs,
             std::span<const deployment::QualifiedRuntimeProfile>{
                 bounded_runtime_profiles},
+            std::span<const deployment::QualifiedRuntimePolicy>{
+                bounded_runtime_policies},
             std::span<const deployment::QualifiedCommandSchema>{
                 bounded_command_schemas},
             std::span<const deployment::QualifiedCapabilityDefinition>{
@@ -2480,7 +2488,8 @@ void register_model_compiler_bindings(py::module_& module) {
             selected_site_overlay);
       },
       py::arg("composition"), py::arg("deployment_inputs"),
-      py::arg("runtime_profiles"), py::arg("command_schemas"),
+      py::arg("runtime_profiles"), py::arg("runtime_policies"),
+      py::arg("command_schemas"),
       py::arg("capability_definitions"),
       py::arg("control_interface_contracts"),
       py::arg("controller_topologies"), py::arg("provider_manifests"),
