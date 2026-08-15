@@ -378,8 +378,11 @@ def test_live_row_primes_object_motion_only_after_program_run_initializes_scene(
     )
 
 
-def test_scene_pose_query_retries_only_the_exact_stale_revision(
-    live: ModuleType,
+@pytest.mark.parametrize(
+    "retry_code", ("stale_revision", "scene_projection_changed")
+)
+def test_scene_pose_query_retries_only_exact_projection_races(
+    live: ModuleType, retry_code: str,
 ) -> None:
     def scene(revision: int) -> dict:
         return {
@@ -410,7 +413,7 @@ def test_scene_pose_query_retries_only_the_exact_stale_revision(
             self.calls.append(body)
             if len(self.calls) == 1:
                 raise live.HeadlessClientError(
-                    "stale_revision",
+                    retry_code,
                     "projection advanced",
                     409,
                 )
@@ -433,6 +436,37 @@ def test_scene_pose_query_retries_only_the_exact_stale_revision(
         call["expected_projection_revision"]["graph_revision"]
         for call in client.calls
     ] == ["graph.1", "graph.2"]
+
+
+def test_scene_pose_query_does_not_retry_other_failures(live: ModuleType) -> None:
+    scene = {
+        "logical_scene": {
+            "payload": {
+                "access": {
+                    "active_projection": {
+                        "graph_revision": "graph.1",
+                        "retained_bundle_id": "bundle.1",
+                        "scene_revision": {
+                            "content_hash": "content.1",
+                            "revision_id": 1,
+                            "scene_id": "scene.1",
+                        },
+                    }
+                }
+            }
+        }
+    }
+
+    class Client:
+        @staticmethod
+        def resolve_scene_resources(body: dict) -> dict:
+            del body
+            raise live.HeadlessClientError(
+                "scene_pose_unavailable", "pose missing", 409
+            )
+
+    with pytest.raises(live.HeadlessClientError, match="pose missing"):
+        live._resolved_position(Client(), scene, "isaac_cheese_box")  # noqa: SLF001
 
 
 def test_check_reducer_requires_source_matched_foundationpose_latch(

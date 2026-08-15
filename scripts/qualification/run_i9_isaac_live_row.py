@@ -1527,7 +1527,7 @@ def _resolved_position(
             )
             break
         except HeadlessClientError as error:
-            if error.code != "stale_revision":
+            if error.code not in {"stale_revision", "scene_projection_changed"}:
                 raise
             if attempt + 1 == _SCENE_POSE_QUERY_ATTEMPTS:
                 raise LiveRowError(
