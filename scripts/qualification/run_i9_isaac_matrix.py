@@ -67,6 +67,7 @@ TOPIC_TYPE_BY_NAME: Final = {
 
 COMMON_ROW_CHECKS: Final = frozenset(
     {
+        "cclc_route_ready",
         "controller_ready",
         "cross_host_clock_payload",
         "exact_world_readback",

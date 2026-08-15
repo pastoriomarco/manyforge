@@ -230,6 +230,11 @@ def base_observations(live: ModuleType, scenario):
             "output": f"/manyforge/{scenario.component_id}/controller_manager\n",
         },
         "command_info": {"output": "Subscription count: 1\n"},
+        "cclc_startup": {
+            "schema_version": live._CCLC_STARTUP_SCHEMA,  # noqa: SLF001
+            "component_id": scenario.component_id,
+            "passed": True,
+        },
         "samples": samples,
         "topic_types": {
             topic: {
@@ -423,6 +428,191 @@ def test_extract_gripper_targets_reads_typed_leaf_and_pick_sequence(
     assert live._extract_gripper_targets(program) == (  # noqa: SLF001
         live.GripperTarget("gripper", "linear_m", 0.0),
         live.GripperTarget("gripper", "linear_m", 0.0081),
+    )
+
+
+def test_cclc_startup_uses_fresh_owner_templates_and_full_binding_sets(
+    live: ModuleType,
+) -> None:
+    scenario = live.SCENARIO_BY_ID["isaac-lite6-pick-place"]
+
+    class Client:
+        def __init__(self) -> None:
+            self.state = "declared"
+            self.generation = 1
+            self.lifecycle_requests = []
+            self.route_requests = []
+            self.lifecycle_statuses = {}
+            self.route_statuses = {}
+            self.active = {}
+            self.bindings = {
+                "domain.arm": [
+                    {
+                        "control_binding_id": "binding.arm.execute",
+                        "control_binding_revision": "revision.arm.execute",
+                        "control_route_id": "route.arm",
+                    },
+                    {
+                        "control_binding_id": "binding.arm.plan",
+                        "control_binding_revision": "revision.arm.plan",
+                        "control_route_id": "route.arm",
+                    },
+                ],
+                "domain.gripper": [
+                    {
+                        "control_binding_id": "binding.gripper.command",
+                        "control_binding_revision": "revision.gripper.command",
+                        "control_route_id": "route.gripper",
+                    }
+                ],
+            }
+
+        def cclc_component(self, component_id):
+            assert component_id == scenario.component_id
+            return {
+                "controllable_component_id": component_id,
+                "component_lifecycle_state": self.state,
+                "component_lifecycle_generation": self.generation,
+                "graph_revision": "graph.1",
+                "domains": [
+                    {
+                        "active_control_configuration": self.active.get(
+                            domain_id
+                        ),
+                        "control_domain_id": domain_id,
+                        "control_domain_revision": f"revision.{domain_id}",
+                        "controller_topology_id": f"topology.{domain_id}",
+                        "topology_revision": f"topology-revision.{domain_id}",
+                        "current_control_bindings": bindings,
+                        "current_resources": [],
+                    }
+                    for domain_id, bindings in sorted(self.bindings.items())
+                ],
+            }
+
+        def submit_component_lifecycle(self, body):
+            self.lifecycle_requests.append(body)
+            assert body["confirmed"] is True
+            assert body["expected_component_lifecycle_generation"] == self.generation
+            self.generation += 1
+            self.state = {
+                "prepare": "prepared",
+                "enable": "active",
+            }[body["intent"]]
+            transaction_id = f"lifecycle.{body['intent']}"
+            self.lifecycle_statuses[transaction_id] = {
+                "controllable_component_id": scenario.component_id,
+                "current_state": self.state,
+                "terminal_result": "succeeded",
+            }
+            return {
+                "acceptance": {
+                    "component_lifecycle_generation": self.generation,
+                    "lifecycle_transaction_id": transaction_id,
+                    "request_id": body["request_context"]["request_id"],
+                },
+                "replay_status": "accepted_new",
+            }
+
+        def component_lifecycle_status(self, transaction_id):
+            return {"status": self.lifecycle_statuses[transaction_id]}
+
+        def cclc_route_templates(self, component_id):
+            assert component_id == scenario.component_id
+            return {
+                "controllable_component_id": component_id,
+                "retained_bundle_id": "bundle.1",
+                "graph_revision": "graph.1",
+                "templates": [
+                    {
+                        "desired_configuration": {
+                            "control_domain_id": domain_id,
+                            "control_domain_revision": f"revision.{domain_id}",
+                            "controller_topology_id": f"topology.{domain_id}",
+                            "topology_revision": f"topology-revision.{domain_id}",
+                            "activation_set_id": f"activation.{domain_id}",
+                            "binding_routes": bindings,
+                        },
+                        "expected_active_control_configuration": (
+                            {"presence": "absent"}
+                            if domain_id not in self.active
+                            else {
+                                "presence": "present",
+                                "active_control_configuration_id": self.active[
+                                    domain_id
+                                ]["active_control_configuration_id"],
+                                "active_control_configuration_generation": self.active[
+                                    domain_id
+                                ]["active_control_configuration_generation"],
+                            }
+                        ),
+                        "component_expectations": [
+                            {
+                                "controllable_component_id": component_id,
+                                "expected_component_lifecycle_generation": (
+                                    self.generation
+                                ),
+                                "expected_component_lifecycle_state": self.state,
+                            }
+                        ],
+                    }
+                    for domain_id, bindings in sorted(self.bindings.items())
+                ],
+            }
+
+        def submit_route_selection(self, body):
+            self.route_requests.append(body)
+            assert body["confirmed"] is True
+            desired = body["desired_configuration"]
+            domain_id = desired["control_domain_id"]
+            transaction_id = f"route.{domain_id}"
+            active = {
+                **desired,
+                "active_control_configuration_id": f"configuration.{domain_id}",
+                "active_control_configuration_generation": 1,
+                "source_runtime_epoch": "runtime.epoch.1",
+                "source_runtime_unit_id": "runtime.unit.1",
+                "source_sequence": 1,
+                "state": "reconciled",
+            }
+            self.active[domain_id] = active
+            self.route_statuses[transaction_id] = {
+                "terminal_result": "succeeded",
+                "resulting_active_control_configuration": active,
+            }
+            return {
+                "acceptance": {
+                    "route_selection_transaction_id": transaction_id,
+                    "request_id": body["request_context"]["request_id"],
+                },
+                "replay_status": "accepted_new",
+            }
+
+        def route_selection_status(self, transaction_id):
+            return {"status": self.route_statuses[transaction_id]}
+
+    client = Client()
+    evidence = live._prepare_and_select_cclc_routes(  # noqa: SLF001
+        client, scenario, timeout_s=1.0
+    )
+
+    assert evidence["passed"] is True
+    assert evidence["initial"] == {"generation": 1, "state": "declared"}
+    assert evidence["final"] == {"generation": 3, "state": "active"}
+    assert [row["intent"] for row in evidence["lifecycle"]] == [
+        "prepare",
+        "enable",
+    ]
+    assert [row["control_domain_id"] for row in evidence["routes"]] == [
+        "domain.arm",
+        "domain.gripper",
+    ]
+    assert [row["binding_count"] for row in evidence["routes"]] == [2, 1]
+    assert all(request["confirmed"] is True for request in client.route_requests)
+    assert all(
+        request["request_context"]["request_owner_epoch"]
+        == "i9-isaac-matrix"
+        for request in client.lifecycle_requests + client.route_requests
     )
 
 

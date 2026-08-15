@@ -10,7 +10,7 @@ exclusively through the Applied Program and the addressed Kernel owner.
 from __future__ import annotations
 
 import argparse
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from contextlib import suppress
 from dataclasses import dataclass, field
 import hashlib
@@ -52,6 +52,7 @@ _OBJECT_MOTION_RESOURCE: Final = "isaac_cheese_box"
 _OBJECT_MOTION_MINIMUM_M: Final = 0.05
 _GRIPPER_TOLERANCE_BY_PROFILE: Final = {"lite6": 0.004, "ur10e": 0.04}
 _RECOVERY_BOUND_S: Final = 60.0
+_CCLC_STARTUP_SCHEMA: Final = "manyforge.i9_cclc_startup.v1"
 # The launch barrier owns two fresh, 30-second-bounded service calls to force
 # and read back STOPPED even after its startup deadline expires.
 _SCENE_BARRIER_CLEANUP_MARGIN_S: Final = 65.0
@@ -661,6 +662,364 @@ def _apply_program(
             return last["applied"]
         time.sleep(0.05)
     raise LiveRowError(f"Program Apply did not converge: {last}")
+
+
+def _expected_active_configuration(
+    active: Mapping[str, Any] | None,
+) -> dict[str, Any]:
+    if active is None:
+        return {"presence": "absent"}
+    identity = active.get("active_control_configuration_id")
+    generation = active.get("active_control_configuration_generation")
+    if (
+        not isinstance(identity, str)
+        or not identity
+        or type(generation) is not int
+        or generation < 1
+    ):
+        raise LiveRowError("CCLC active configuration identity is incomplete")
+    return {
+        "presence": "present",
+        "active_control_configuration_id": identity,
+        "active_control_configuration_generation": generation,
+    }
+
+
+def _binding_rows(
+    value: object, *, label: str
+) -> tuple[tuple[str, str, str], ...]:
+    if not isinstance(value, list) or not value:
+        raise LiveRowError(f"{label} has no control bindings")
+    rows: list[tuple[str, str, str]] = []
+    for item in value:
+        if not isinstance(item, dict):
+            raise LiveRowError(f"{label} contains a non-object binding")
+        row = tuple(
+            item.get(key)
+            for key in (
+                "control_binding_id",
+                "control_binding_revision",
+                "control_route_id",
+            )
+        )
+        if any(not isinstance(field, str) or not field for field in row):
+            raise LiveRowError(f"{label} contains an incomplete binding")
+        rows.append(row)  # type: ignore[arg-type]
+    if rows != sorted(rows) or len({row[0] for row in rows}) != len(rows):
+        raise LiveRowError(f"{label} bindings are not canonical and unique")
+    return tuple(rows)
+
+
+def _lifecycle_expected_domains(
+    snapshot: Mapping[str, Any],
+) -> tuple[
+    list[dict[str, Any]],
+    dict[str, tuple[tuple[str, str, str], ...]],
+]:
+    domains = snapshot.get("domains")
+    if not isinstance(domains, list) or not domains:
+        raise LiveRowError("CCLC component snapshot has no control domains")
+    expected: list[dict[str, Any]] = []
+    bindings_by_domain: dict[str, tuple[tuple[str, str, str], ...]] = {}
+    for domain in domains:
+        if not isinstance(domain, dict):
+            raise LiveRowError("CCLC component snapshot has a non-object domain")
+        domain_id = domain.get("control_domain_id")
+        if not isinstance(domain_id, str) or not domain_id:
+            raise LiveRowError("CCLC component snapshot has no domain identity")
+        bindings = _binding_rows(
+            domain.get("current_control_bindings"),
+            label=f"CCLC domain {domain_id}",
+        )
+        bindings_by_domain[domain_id] = bindings
+        row = {
+            "control_domain_id": domain_id,
+            "control_domain_revision": domain.get("control_domain_revision"),
+            "controller_topology_id": domain.get("controller_topology_id"),
+            "topology_revision": domain.get("topology_revision"),
+            "expected_active_control_configuration": (
+                _expected_active_configuration(
+                    domain.get("active_control_configuration")
+                )
+            ),
+            "expected_control_bindings": domain.get(
+                "current_control_bindings"
+            ),
+        }
+        if any(
+            not isinstance(row[key], str) or not row[key]
+            for key in (
+                "control_domain_revision",
+                "controller_topology_id",
+                "topology_revision",
+            )
+        ):
+            raise LiveRowError(f"CCLC domain {domain_id} identity is incomplete")
+        expected.append(row)
+    domain_ids = [row["control_domain_id"] for row in expected]
+    if domain_ids != sorted(domain_ids) or len(set(domain_ids)) != len(domain_ids):
+        raise LiveRowError("CCLC component domains are not canonical and unique")
+    return expected, bindings_by_domain
+
+
+def _wait_for_cclc_terminal(
+    read_status: Callable[[str], dict[str, Any]],
+    transaction_id: str,
+    *,
+    label: str,
+    timeout_s: float,
+) -> dict[str, Any]:
+    if not isinstance(transaction_id, str) or not transaction_id:
+        raise LiveRowError(f"CCLC {label} acceptance omitted its transaction ID")
+    deadline = time.monotonic() + timeout_s
+    last: dict[str, Any] | None = None
+    while time.monotonic() < deadline:
+        response = read_status(transaction_id)
+        status = response.get("status") if isinstance(response, dict) else None
+        if status is not None and not isinstance(status, dict):
+            raise LiveRowError(f"CCLC {label} status is not an object")
+        last = status
+        if isinstance(status, dict) and status.get("terminal_result") is not None:
+            if status.get("terminal_result") != "succeeded":
+                raise LiveRowError(
+                    f"CCLC {label} failed: "
+                    + json.dumps(
+                        _summary(status), separators=(",", ":"), sort_keys=True
+                    )
+                )
+            return status
+        time.sleep(0.05)
+    raise LiveRowError(
+        f"CCLC {label} did not become terminal: "
+        + json.dumps(_summary(last), separators=(",", ":"), sort_keys=True)
+    )
+
+
+def _prepare_and_select_cclc_routes(
+    client: HeadlessHttpClient,
+    spec: ScenarioSpec,
+    *,
+    timeout_s: float,
+) -> dict[str, Any]:
+    """Issue explicit, owner-template-derived CCLC startup requests.
+
+    This is the I9 qualification client's operator-confirmed choice. The
+    runtime remains fail-closed and performs no discovery or default route
+    selection; every mutable expectation below comes from a fresh CCLC read.
+    """
+
+    initial = client.cclc_component(spec.component_id)
+    if (
+        initial.get("controllable_component_id") != spec.component_id
+        or initial.get("component_lifecycle_state") != "declared"
+        or type(initial.get("component_lifecycle_generation")) is not int
+        or initial["component_lifecycle_generation"] < 1
+        or not isinstance(initial.get("graph_revision"), str)
+        or not initial["graph_revision"]
+    ):
+        raise LiveRowError("fresh CCLC component snapshot is not declared and exact")
+    _initial_domains, initial_bindings = _lifecycle_expected_domains(initial)
+    domain_ids = sorted(initial_bindings)
+    lifecycle_rows: list[dict[str, Any]] = []
+    correlation_id = f"i9.{spec.scenario_id}.cclc"
+
+    for intent, expected_state in (("prepare", "prepared"), ("enable", "active")):
+        snapshot = client.cclc_component(spec.component_id)
+        expected_domains, current_bindings = _lifecycle_expected_domains(snapshot)
+        if current_bindings != initial_bindings:
+            raise LiveRowError("CCLC control bindings changed during lifecycle startup")
+        result = client.submit_component_lifecycle(
+            {
+                "request_context": {
+                    "request_id": f"i9.lifecycle.{intent}.{spec.scenario_id}",
+                    "request_owner_epoch": "i9-isaac-matrix",
+                    "source_label": "i9_isaac_matrix",
+                    "correlation_id": correlation_id,
+                },
+                "controllable_component_id": spec.component_id,
+                "intent": intent,
+                "expected_graph_revision": snapshot["graph_revision"],
+                "expected_component_lifecycle_generation": snapshot[
+                    "component_lifecycle_generation"
+                ],
+                "expected_control_domains": expected_domains,
+                "reason": "I9 operator-confirmed simulator startup",
+                "confirmed": True,
+            }
+        )
+        acceptance = result.get("acceptance")
+        if not isinstance(acceptance, dict):
+            raise LiveRowError(f"CCLC {intent} was not accepted: {_summary(result)}")
+        status = _wait_for_cclc_terminal(
+            client.component_lifecycle_status,
+            acceptance.get("lifecycle_transaction_id"),
+            label=intent,
+            timeout_s=timeout_s,
+        )
+        settled = client.cclc_component(spec.component_id)
+        if (
+            status.get("controllable_component_id") != spec.component_id
+            or status.get("current_state") != expected_state
+            or settled.get("component_lifecycle_state") != expected_state
+            or settled.get("component_lifecycle_generation")
+            != acceptance.get("component_lifecycle_generation")
+        ):
+            raise LiveRowError(f"CCLC {intent} did not settle to {expected_state}")
+        lifecycle_rows.append(
+            {
+                "component_lifecycle_generation": settled[
+                    "component_lifecycle_generation"
+                ],
+                "intent": intent,
+                "state": expected_state,
+                "transaction_id": acceptance["lifecycle_transaction_id"],
+            }
+        )
+
+    templates = client.cclc_route_templates(spec.component_id)
+    template_rows = templates.get("templates")
+    if not isinstance(template_rows, list):
+        raise LiveRowError("CCLC route-template result is incomplete")
+    template_domain_ids = [
+        row.get("desired_configuration", {}).get("control_domain_id")
+        if isinstance(row, dict)
+        and isinstance(row.get("desired_configuration"), dict)
+        else None
+        for row in template_rows
+    ]
+    if template_domain_ids != domain_ids:
+        raise LiveRowError(
+            "CCLC route templates do not exactly cover the component domains"
+        )
+
+    route_rows: list[dict[str, Any]] = []
+    desired_bindings: dict[str, tuple[tuple[str, str, str], ...]] = {}
+    for index, domain_id in enumerate(domain_ids, start=1):
+        fresh = client.cclc_route_templates(spec.component_id)
+        fresh_rows = fresh.get("templates")
+        matches = (
+            [
+                row
+                for row in fresh_rows
+                if isinstance(row, dict)
+                and isinstance(row.get("desired_configuration"), dict)
+                and row["desired_configuration"].get("control_domain_id")
+                == domain_id
+            ]
+            if isinstance(fresh_rows, list)
+            else []
+        )
+        if len(matches) != 1:
+            raise LiveRowError(f"CCLC route template for {domain_id} is not sole")
+        template = matches[0]
+        desired = template["desired_configuration"]
+        bindings = _binding_rows(
+            desired.get("binding_routes"), label=f"CCLC desired route {domain_id}"
+        )
+        if bindings != initial_bindings[domain_id]:
+            raise LiveRowError(
+                f"CCLC desired route {domain_id} does not cover every retained binding"
+            )
+        desired_bindings[domain_id] = bindings
+        request_id = "i9.route.%d.%s" % (
+            index,
+            hashlib.sha256(domain_id.encode()).hexdigest()[:16],
+        )
+        result = client.submit_route_selection(
+            {
+                "request_context": {
+                    "request_id": request_id,
+                    "request_owner_epoch": "i9-isaac-matrix",
+                    "source_label": "i9_isaac_matrix",
+                    "correlation_id": correlation_id,
+                },
+                "expected_retained_bundle_id": fresh["retained_bundle_id"],
+                "expected_graph_revision": fresh["graph_revision"],
+                "desired_configuration": desired,
+                "expected_active_control_configuration": template[
+                    "expected_active_control_configuration"
+                ],
+                "component_expectations": template["component_expectations"],
+                "confirmed": True,
+            }
+        )
+        acceptance = result.get("acceptance")
+        if not isinstance(acceptance, dict):
+            raise LiveRowError(
+                f"CCLC route {domain_id} was not accepted: {_summary(result)}"
+            )
+        status = _wait_for_cclc_terminal(
+            client.route_selection_status,
+            acceptance.get("route_selection_transaction_id"),
+            label=f"route {domain_id}",
+            timeout_s=timeout_s,
+        )
+        active = status.get("resulting_active_control_configuration")
+        if (
+            not isinstance(active, dict)
+            or active.get("control_domain_id") != domain_id
+            or active.get("state") != "reconciled"
+            or _binding_rows(
+                active.get("binding_routes"),
+                label=f"CCLC active route {domain_id}",
+            )
+            != bindings
+        ):
+            raise LiveRowError(f"CCLC route {domain_id} did not reconcile exactly")
+        route_rows.append(
+            {
+                "active_control_configuration_generation": active[
+                    "active_control_configuration_generation"
+                ],
+                "active_control_configuration_id": active[
+                    "active_control_configuration_id"
+                ],
+                "binding_count": len(bindings),
+                "bindings_digest": _digest(_json_bytes(bindings)),
+                "control_domain_id": domain_id,
+                "transaction_id": acceptance[
+                    "route_selection_transaction_id"
+                ],
+            }
+        )
+
+    final = client.cclc_component(spec.component_id)
+    final_expected, final_bindings = _lifecycle_expected_domains(final)
+    if (
+        final.get("component_lifecycle_state") != "active"
+        or sorted(final_bindings) != domain_ids
+        or len(final_expected) != len(domain_ids)
+    ):
+        raise LiveRowError("CCLC final component snapshot is not fully active")
+    for domain in final["domains"]:
+        domain_id = domain["control_domain_id"]
+        active = domain.get("active_control_configuration")
+        if (
+            not isinstance(active, dict)
+            or active.get("state") != "reconciled"
+            or _binding_rows(
+                active.get("binding_routes"),
+                label=f"CCLC final route {domain_id}",
+            )
+            != desired_bindings[domain_id]
+        ):
+            raise LiveRowError(f"CCLC final route {domain_id} lost readiness")
+
+    return {
+        "schema_version": _CCLC_STARTUP_SCHEMA,
+        "component_id": spec.component_id,
+        "initial": {
+            "generation": initial["component_lifecycle_generation"],
+            "state": initial["component_lifecycle_state"],
+        },
+        "final": {
+            "generation": final["component_lifecycle_generation"],
+            "state": final["component_lifecycle_state"],
+        },
+        "lifecycle": lifecycle_rows,
+        "routes": route_rows,
+        "passed": True,
+    }
 
 
 def _run_program(
@@ -1331,6 +1690,7 @@ def _build_checks(
     controllers: Mapping[str, Any],
     nodes: Mapping[str, Any],
     command_info: Mapping[str, Any],
+    cclc_startup: Mapping[str, Any],
     samples: Mapping[str, Mapping[str, Any]],
     topic_types: Mapping[str, Mapping[str, Any]],
     program: Mapping[str, Any],
@@ -1366,6 +1726,11 @@ def _build_checks(
         )
     )
     checks: dict[str, bool] = {
+        "cclc_route_ready": bool(
+            cclc_startup.get("schema_version") == _CCLC_STARTUP_SCHEMA
+            and cclc_startup.get("component_id") == spec.component_id
+            and cclc_startup.get("passed") is True
+        ),
         "controller_ready": (
             controllers.get("returncode") == 0
             and "isaac_arm_controller" in str(controllers.get("output", ""))
@@ -1957,6 +2322,11 @@ def run_live_row(config: LiveConfig) -> dict[str, Any]:
         )
         tf_probe: dict[str, Any] | None = None
         with HeadlessHttpClient(api_url, timeout_seconds=15.0) as client:
+            cclc_startup = _prepare_and_select_cclc_routes(
+                client,
+                config.spec,
+                timeout_s=config.startup_timeout_s,
+            )
             catalog = client.scenarios()
             scene_before = client.scene()
             _prime_run_evidence(
@@ -2028,6 +2398,7 @@ def run_live_row(config: LiveConfig) -> dict[str, Any]:
             controllers=controllers,
             nodes=nodes,
             command_info=command_info,
+            cclc_startup=cclc_startup,
             samples=sample_results,
             topic_types=topic_types,
             program=program_snapshot,
@@ -2044,6 +2415,7 @@ def run_live_row(config: LiveConfig) -> dict[str, Any]:
         details = {
             "assistant": None if assistant is None else _summary(assistant),
             "barrier": _summary(barrier),
+            "cclc_startup": cclc_startup,
             "controllers": {
                 key: controllers[key]
                 for key in ("bytes", "returncode", "sha256")
