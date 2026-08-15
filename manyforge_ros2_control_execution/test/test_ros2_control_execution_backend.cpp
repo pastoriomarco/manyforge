@@ -6,6 +6,7 @@
 #undef MANYFORGE_ROS2_CONTROL_EXECUTION_TESTING
 
 #include "../src/scene_projection_worker.hpp"
+#include "../src/ros2_control_stop_qualification_probe.hpp"
 
 #include <control_msgs/action/follow_joint_trajectory.hpp>
 #include <controller_manager_msgs/msg/controller_manager_activity.hpp>
@@ -1336,6 +1337,55 @@ TEST(Ros2ControlExecutionBackendTest,
             core::StopEvidenceItemStateDTO::kSatisfied);
   ASSERT_TRUE(result.source_epoch.has_value());
   ASSERT_TRUE(result.source_sequence.has_value());
+  EXPECT_EQ(backend.get_execution_snapshot().state,
+            core::ExecutionState::kStopped);
+}
+
+TEST(Ros2ControlExecutionBackendTest,
+     ForcedManagedGoalTerminalStopsOnlyItsExecutionGeneration) {
+  auto config = base_config();
+  config.execution_state_source_mode = "commanded_sim";
+  config.initial_joint_positions_rad = {0.0};
+  auto sink = std::make_shared<RecordingExecutionStateSink>();
+  core::FakeClock clock;
+  core::ManualScheduler scheduler;
+  Ros2ControlExecutionBackend backend(
+      Ros2ControlExecutionBackend::TestingNoRosStartupTag{}, sink, "arm", clock,
+      scheduler, std::move(config));
+
+  backend.testing_set_running_state(true);
+  ASSERT_TRUE(backend.testing_publish_snapshot(core::ExecutionState::kStopping,
+                                               {0.25}));
+  const auto execution_generation = backend.testing_running_generation();
+  rclcpp_action::GoalUUID goal_id{};
+  goal_id.front() = 7U;
+  constexpr std::uint64_t managed_generation = 11U;
+  backend.testing_begin_managed_fjt_terminal_session(managed_generation,
+                                                     goal_id);
+  detail::Ros2ControlStopQualificationAccess::
+      arm_forced_managed_terminal_for_test(
+          backend, execution_generation - 1U, managed_generation);
+  Ros2ControlExecutionBackend::TestingGoalHandleFJT::WrappedResult stale;
+  stale.goal_id = goal_id;
+  stale.code = rclcpp_action::ResultCode::CANCELED;
+  stale.result = std::make_shared<FollowJointTrajectory::Result>();
+  backend.testing_on_managed_fjt_terminal_result(stale, managed_generation);
+  EXPECT_EQ(backend.get_execution_snapshot().state,
+            core::ExecutionState::kStopping);
+
+  rclcpp_action::GoalUUID replacement_goal_id{};
+  replacement_goal_id.front() = 8U;
+  backend.testing_begin_managed_fjt_terminal_session(managed_generation + 1U,
+                                                     replacement_goal_id);
+  detail::Ros2ControlStopQualificationAccess::
+      arm_forced_managed_terminal_for_test(
+          backend, execution_generation, managed_generation + 1U);
+  Ros2ControlExecutionBackend::TestingGoalHandleFJT::WrappedResult current;
+  current.goal_id = replacement_goal_id;
+  current.code = rclcpp_action::ResultCode::CANCELED;
+  current.result = std::make_shared<FollowJointTrajectory::Result>();
+  backend.testing_on_managed_fjt_terminal_result(current,
+                                                 managed_generation + 1U);
   EXPECT_EQ(backend.get_execution_snapshot().state,
             core::ExecutionState::kStopped);
 }

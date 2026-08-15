@@ -13,6 +13,7 @@
 #include <stdexcept>
 #include <stop_token>
 #include <string>
+#include <string_view>
 #include <thread>
 #include <tuple>
 #include <unordered_map>
@@ -48,6 +49,9 @@
 namespace manyforge::ros2_control_execution {
 
 namespace detail {
+enum class Ros2ControlStopQualificationEvent : std::uint8_t;
+class IRos2ControlStopQualificationProbe;
+class Ros2ControlStopQualificationAccess;
 class SceneProjectionWorker;
 struct SceneProjectionCompletion;
 struct SceneProjectionWorkerDeleter {
@@ -704,6 +708,8 @@ public:
 #endif
 
 private:
+  friend class detail::Ros2ControlStopQualificationAccess;
+
   enum class SnapshotPublicationAuthority {
     kBackendAuthored,
     kMeasuredDiagnostic,
@@ -820,7 +826,8 @@ private:
 
   void validate_config() const;
   core::StopResultDTO stop_if_running_generation(
-      std::optional<std::uint64_t> expected_running_generation);
+      std::optional<std::uint64_t> expected_running_generation,
+      bool observe_software_hard_issue = false);
   core::ExecutionHandle
   dispatch_prepared(const core::PreparedOperationParticipantDTO &participant,
                     const core::ControllerGoalId &controller_goal_id,
@@ -961,6 +968,8 @@ private:
       const core::TrajectoryDTO &trajectory,
       std::chrono::steady_clock::time_point started_at);
   void clear_managed_controlled_stop_state();
+  bool complete_forced_managed_stop_execution(
+      std::uint64_t expected_running_generation);
   bool publish_controlled_stop_command_reference_snapshot(
       std::chrono::steady_clock::time_point now,
       std::optional<std::uint64_t> expected_running_generation = std::nullopt);
@@ -1299,6 +1308,9 @@ private:
   void
   on_managed_fjt_terminal_result(const GoalHandleFJT::WrappedResult &result,
                                  std::uint64_t generation);
+  void observe_stop_qualification(
+      detail::Ros2ControlStopQualificationEvent event,
+      std::string_view detail_text) const;
 
   mutable std::mutex managed_fjt_mutex_;
   std::condition_variable_any managed_fjt_cv_;
@@ -1331,6 +1343,12 @@ private:
   std::optional<std::chrono::steady_clock::time_point>
       managed_fjt_terminal_result_received_at_;
   std::optional<core::ErrorDTO> managed_fjt_terminal_error_;
+  // A public Stop arriving while a controlled-stop replacement owns the JTC
+  // goal records both generations before issuing cancel. Only the exact
+  // matching managed terminal callback may retire the execution; stale
+  // callbacks therefore cannot stop a replacement execution.
+  std::optional<std::uint64_t> forced_managed_stop_execution_generation_;
+  std::optional<std::uint64_t> forced_managed_stop_generation_;
   std::shared_ptr<const core::TrajectoryDTO>
       controlled_stop_path_deviation_reference_;
   std::atomic<bool> controlled_stop_path_deviation_tracking_active_{false};
@@ -1372,6 +1390,11 @@ private:
   std::atomic<std::uint64_t> authored_active_publications_total_{0};
   std::atomic<std::uint64_t> authored_active_interarrival_max_ns_{0};
   std::atomic<std::int64_t> authored_active_last_publication_ns_{0};
+  // Null in every normal runtime construction. The explicit offline runner
+  // installs one observer before starting its workload; observation points
+  // remain dormant in the installed production target.
+  std::atomic<detail::IRos2ControlStopQualificationProbe *>
+      stop_qualification_probe_{nullptr};
   mutable std::mutex scene_projection_barrier_mutex_;
   std::unique_ptr<detail::SceneProjectionWorker,
                   detail::SceneProjectionWorkerDeleter>

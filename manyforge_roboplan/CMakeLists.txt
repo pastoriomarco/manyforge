@@ -733,6 +733,126 @@ if(BUILD_TESTING)
         "${_MANYFORGE_NATIVE_STOP_IMPLEMENTATION_EVIDENCE}"
         "${_MANYFORGE_NATIVE_STOP_SUBSTITUTION_EVIDENCE}")
 
+    if(MANYFORGE_BUILD_ROS2_CONTROL_RUNTIME)
+      # I9 exact ROS software-hard qualification. Like the native runner, this
+      # executable links the production backend and production StopControl
+      # scheduler. Its private observer can block only nominal provider stages;
+      # it cannot replace the software-hard issue or terminal implementation.
+      add_executable(manyforge_ros2_control_stop_qualification_runner
+        EXCLUDE_FROM_ALL
+        test/run_ros2_control_stop_qualification.cpp)
+      target_include_directories(
+        manyforge_ros2_control_stop_qualification_runner PRIVATE
+        "${CMAKE_CURRENT_SOURCE_DIR}/test"
+        "${_MANYFORGE_REPOSITORY_SOURCE_ROOT}/manyforge_ros2_control_execution/src"
+        "${_MANYFORGE_REPOSITORY_SOURCE_ROOT}/manyforge_deployment/src")
+      target_compile_definitions(
+        manyforge_ros2_control_stop_qualification_runner PRIVATE
+        MANYFORGE_ROS2_CONTROL_STOP_QUALIFICATION_REPETITIONS=16
+        MANYFORGE_ROS2_CONTROL_STOP_ISSUE_BOUND_NS=50000000)
+      target_link_libraries(
+        manyforge_ros2_control_stop_qualification_runner PRIVATE
+        manyforge_ros2_control_execution
+        manyforge_roboplan_native_runtime_support
+        manyforge_deployment
+        manyforge_core
+        Threads::Threads)
+
+      set(_MANYFORGE_ROS2_CONTROL_STOP_QUALIFICATION_ROOT
+        "${CMAKE_CURRENT_BINARY_DIR}/qualification/ros2_control_stop")
+      set(_MANYFORGE_ROS2_CONTROL_STOP_BUILD_CLOSURE
+        "${_MANYFORGE_ROS2_CONTROL_STOP_QUALIFICATION_ROOT}/implementation-build.json")
+      set(_MANYFORGE_ROS2_CONTROL_STOP_RUNNER_CONTRACT
+        "${_MANYFORGE_ROS2_CONTROL_STOP_QUALIFICATION_ROOT}/runner-contract.json")
+      set(_MANYFORGE_ROS2_CONTROL_STOP_IMPLEMENTATION_EVIDENCE
+        "${_MANYFORGE_ROS2_CONTROL_STOP_QUALIFICATION_ROOT}/implementation-evidence.json")
+      set(_MANYFORGE_ROS2_CONTROL_STOP_CLOSURE_GENERATOR
+        "${CMAKE_CURRENT_SOURCE_DIR}/tools/generate_ros2_control_stop_build_closure.py")
+      set(_MANYFORGE_ROS2_CONTROL_STOP_BASE_CLOSURE_GENERATOR
+        "${CMAKE_CURRENT_SOURCE_DIR}/tools/generate_native_stop_build_closure.py")
+      set(_MANYFORGE_ROS2_CONTROL_STOP_CASE_CONTRACT
+        "${CMAKE_CURRENT_SOURCE_DIR}/resources/contracts/ros2_control_stop_qualification_case_contract.v1.json")
+      set(_MANYFORGE_ROS2_CONTROL_STOP_PROBE
+        "${_MANYFORGE_REPOSITORY_SOURCE_ROOT}/manyforge_ros2_control_execution/src/ros2_control_stop_qualification_probe.hpp")
+      set(_MANYFORGE_ROS2_CONTROL_STOP_SEMANTIC_INPUTS
+        "${_MANYFORGE_REPOSITORY_SOURCE_ROOT}/manyforge_ros2_control_execution/include/manyforge_ros2_control_execution/ros2_control_execution_backend.hpp"
+        "${_MANYFORGE_REPOSITORY_SOURCE_ROOT}/manyforge_ros2_control_execution/src/ros2_control_execution_backend.cpp"
+        "${_MANYFORGE_ROS2_CONTROL_STOP_PROBE}"
+        "${_MANYFORGE_REPOSITORY_SOURCE_ROOT}/manyforge_core/include/manyforge_core/types/stop_control.hpp"
+        "${_MANYFORGE_REPOSITORY_SOURCE_ROOT}/manyforge_core/include/manyforge_core/execution_stop_support.hpp"
+        "${_MANYFORGE_REPOSITORY_SOURCE_ROOT}/manyforge_core/src/execution_stop_support.cpp"
+        "${_MANYFORGE_REPOSITORY_SOURCE_ROOT}/manyforge_deployment/include/manyforge_deployment/ros2_control_execution_runtime_contract.hpp"
+        "${_MANYFORGE_REPOSITORY_SOURCE_ROOT}/manyforge_deployment/resources/closed_schema/value/manyforge.value_schema.provider_contract.empty.v1.yaml")
+      set(_MANYFORGE_ROS2_CONTROL_STOP_SEMANTIC_ARGUMENTS)
+      foreach(_semantic_input IN LISTS
+          _MANYFORGE_ROS2_CONTROL_STOP_SEMANTIC_INPUTS)
+        list(APPEND _MANYFORGE_ROS2_CONTROL_STOP_SEMANTIC_ARGUMENTS
+          --semantic-input "${_semantic_input}")
+      endforeach()
+      add_custom_command(
+        OUTPUT
+          "${_MANYFORGE_ROS2_CONTROL_STOP_BUILD_CLOSURE}"
+          "${_MANYFORGE_ROS2_CONTROL_STOP_RUNNER_CONTRACT}"
+        COMMAND "${CMAKE_COMMAND}" -E make_directory
+          "${_MANYFORGE_ROS2_CONTROL_STOP_QUALIFICATION_ROOT}"
+        COMMAND
+          "${Python3_EXECUTABLE}"
+          "${_MANYFORGE_ROS2_CONTROL_STOP_CLOSURE_GENERATOR}"
+          --source-root "${_MANYFORGE_REPOSITORY_SOURCE_ROOT}"
+          --build-root "${CMAKE_BINARY_DIR}"
+          --implementation-target manyforge_ros2_control_execution_host
+          --implementation-id manyforge.ros2_control_execution_host
+          --installed-target-id manyforge_ros2_control_execution_host
+          --installed-target "$<TARGET_FILE:manyforge_ros2_control_execution_host>"
+          --runner-target manyforge_ros2_control_stop_qualification_runner
+          --runner-executable
+            "$<TARGET_FILE:manyforge_ros2_control_stop_qualification_runner>"
+          --case-contract "${_MANYFORGE_ROS2_CONTROL_STOP_CASE_CONTRACT}"
+          --runner-source-input
+            "${CMAKE_CURRENT_SOURCE_DIR}/test/ros2_control_stop_qualification_fixture.hpp"
+          --runner-source-input
+            "${_MANYFORGE_REPOSITORY_SOURCE_ROOT}/manyforge_deployment/src/stop_qualification_evidence_internal.hpp"
+          --runner-source-input
+            "${_MANYFORGE_ROS2_CONTROL_STOP_CLOSURE_GENERATOR}"
+          ${_MANYFORGE_ROS2_CONTROL_STOP_SEMANTIC_ARGUMENTS}
+          --implementation-output
+            "${_MANYFORGE_ROS2_CONTROL_STOP_BUILD_CLOSURE}"
+          --runner-output
+            "${_MANYFORGE_ROS2_CONTROL_STOP_RUNNER_CONTRACT}"
+        DEPENDS
+          manyforge_ros2_control_execution_host
+          manyforge_ros2_control_stop_qualification_runner
+          "${_MANYFORGE_ROS2_CONTROL_STOP_CLOSURE_GENERATOR}"
+          "${_MANYFORGE_ROS2_CONTROL_STOP_BASE_CLOSURE_GENERATOR}"
+          "${_MANYFORGE_ROS2_CONTROL_STOP_CASE_CONTRACT}"
+          "${CMAKE_CURRENT_SOURCE_DIR}/test/ros2_control_stop_qualification_fixture.hpp"
+          "${_MANYFORGE_REPOSITORY_SOURCE_ROOT}/manyforge_deployment/src/stop_qualification_evidence_internal.hpp"
+          ${_MANYFORGE_ROS2_CONTROL_STOP_SEMANTIC_INPUTS}
+        COMMAND_EXPAND_LISTS
+        VERBATIM)
+      add_custom_target(manyforge_ros2_control_stop_qualification_closure
+        DEPENDS
+          "${_MANYFORGE_ROS2_CONTROL_STOP_BUILD_CLOSURE}"
+          "${_MANYFORGE_ROS2_CONTROL_STOP_RUNNER_CONTRACT}")
+      add_custom_command(
+        OUTPUT "${_MANYFORGE_ROS2_CONTROL_STOP_IMPLEMENTATION_EVIDENCE}"
+        COMMAND
+          "$<TARGET_FILE:manyforge_ros2_control_stop_qualification_runner>"
+          --implementation-build
+            "${_MANYFORGE_ROS2_CONTROL_STOP_BUILD_CLOSURE}"
+          --runner-contract
+            "${_MANYFORGE_ROS2_CONTROL_STOP_RUNNER_CONTRACT}"
+          --implementation-output
+            "${_MANYFORGE_ROS2_CONTROL_STOP_IMPLEMENTATION_EVIDENCE}"
+        DEPENDS
+          manyforge_ros2_control_stop_qualification_runner
+          "${_MANYFORGE_ROS2_CONTROL_STOP_BUILD_CLOSURE}"
+          "${_MANYFORGE_ROS2_CONTROL_STOP_RUNNER_CONTRACT}"
+        VERBATIM)
+      add_custom_target(manyforge_run_ros2_control_stop_qualification
+        DEPENDS "${_MANYFORGE_ROS2_CONTROL_STOP_IMPLEMENTATION_EVIDENCE}")
+    endif()
+
     add_test(
       NAME native_stop_build_closure_generator
       COMMAND "${Python3_EXECUTABLE}"
