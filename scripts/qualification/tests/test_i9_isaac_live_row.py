@@ -341,6 +341,24 @@ def test_check_reducer_requires_kernel_collision_and_real_snapshot_counters(
     assert checks["assistant_snapshot_transmitted"] is False
 
 
+def test_check_reducer_joins_monotonic_scene_after_runtime_snapshot(
+    live: ModuleType,
+) -> None:
+    scenario = live.SCENARIO_BY_ID["isaac-ur10e-light-scene-assistant"]
+    observations = base_observations(live, scenario)
+    scene_after = observations["scene_after"]
+    scene_after["projection_generation"] = 6
+    scene_after["logical_scene"]["projection_generation"] = 6
+    scene_after["scene_runtime"]["projection_generation"] = 6
+
+    checks = live._build_checks(scenario, **observations)  # noqa: SLF001
+    assert checks["ghost_and_viewer_owner_exact"] is True
+
+    scene_after["scene_runtime"]["projection_generation"] = 5
+    checks = live._build_checks(scenario, **observations)  # noqa: SLF001
+    assert checks["ghost_and_viewer_owner_exact"] is False
+
+
 def test_check_reducer_rejects_wrong_topic_type_and_legacy_run_id(
     live: ModuleType,
 ) -> None:

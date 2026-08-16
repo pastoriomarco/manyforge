@@ -2306,19 +2306,27 @@ def _logical_viewer_owner_exact(
     logical = _section(scene, "logical_scene")
     runtime_section = _section(scene, "scene_runtime")
     snapshot = _logical_snapshot(scene)
+    runtime_generation = runtime.get("projection_generation")
+    scene_generation = scene.get("projection_generation")
     return bool(
         logical is not None
         and runtime_section is not None
         and snapshot is not None
+        and type(runtime_generation) is int
+        and type(scene_generation) is int
         and logical.get("source_owner_id") == f"logical-scene.{spec.cell_id}"
         and isinstance(logical.get("source_owner_epoch"), str)
         and runtime_section.get("source_owner_id")
         == f"scene-runtime.{spec.cell_id}"
         and isinstance(runtime_section.get("source_owner_epoch"), str)
-        and logical.get("projection_generation")
-        == runtime.get("projection_generation")
-        and runtime_section.get("projection_generation")
-        == runtime.get("projection_generation")
+        and scene.get("projection_owner_epoch")
+        == runtime.get("projection_owner_epoch")
+        and logical.get("projection_generation") == scene_generation
+        and runtime_section.get("projection_generation") == scene_generation
+        # Runtime and scene are separate HTTP snapshots.  A fresh pose update
+        # may advance the scene between the two reads, but it must never make
+        # the later scene snapshot older than the retained runtime snapshot.
+        and scene_generation >= runtime_generation
         and snapshot.get("cell_id") == spec.cell_id
     )
 
