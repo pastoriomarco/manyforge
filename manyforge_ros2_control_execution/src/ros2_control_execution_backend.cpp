@@ -1547,10 +1547,10 @@ void Ros2ControlExecutionBackend::controller_binding_monitor_worker(
     std::stop_token stop_token) {
   const auto &contract = *config_.controller_binding;
   // Start well inside the retained snapshot age and issue both independent
-  // controller-manager reads together. Their replies share one steady-clock
-  // deadline below, so a slow read cannot consume a second full timeout and
-  // move the next valid publication across the lease edge. Controller-manager
-  // activity still invalidates the current snapshot immediately.
+  // controller-manager reads together. Service discovery and both replies
+  // share one steady-clock deadline below, so a slow phase cannot consume a
+  // second full timeout and move the next valid publication across the lease
+  // edge. Controller-manager activity still invalidates immediately.
   const auto refresh_period = std::chrono::nanoseconds(
       std::max<std::int64_t>(1, contract.snapshot_max_age_ns / 8));
   const auto service_timeout =
@@ -1604,11 +1604,22 @@ void Ros2ControlExecutionBackend::controller_binding_monitor_worker(
       fail_refresh("controller_binding_monitor_unavailable");
       continue;
     }
-    if (!list_controllers_client_->wait_for_service(service_timeout)) {
+    const auto refresh_deadline =
+        std::chrono::steady_clock::now() + service_timeout;
+    const auto remaining_refresh_budget = [&refresh_deadline]() {
+      const auto now = std::chrono::steady_clock::now();
+      return now < refresh_deadline
+                 ? std::chrono::duration_cast<std::chrono::nanoseconds>(
+                       refresh_deadline - now)
+                 : std::chrono::nanoseconds::zero();
+    };
+    if (!list_controllers_client_->wait_for_service(
+            remaining_refresh_budget())) {
       fail_refresh("controller_list_service_unavailable");
       continue;
     }
-    if (!list_hardware_components_client_->wait_for_service(service_timeout)) {
+    if (!list_hardware_components_client_->wait_for_service(
+            remaining_refresh_budget())) {
       fail_refresh("hardware_list_service_unavailable");
       continue;
     }
@@ -1626,9 +1637,7 @@ void Ros2ControlExecutionBackend::controller_binding_monitor_worker(
     auto hardware_future = list_hardware_components_client_->async_send_request(
         std::make_shared<
             controller_manager_msgs::srv::ListHardwareComponents::Request>());
-    const auto response_deadline =
-        std::chrono::steady_clock::now() + service_timeout;
-    if (controllers_future.wait_until(response_deadline) !=
+    if (controllers_future.wait_until(refresh_deadline) !=
         std::future_status::ready) {
       static_cast<void>(
           list_controllers_client_->remove_pending_request(controllers_future));
@@ -1638,7 +1647,7 @@ void Ros2ControlExecutionBackend::controller_binding_monitor_worker(
       fail_refresh("controller_list_service_timeout");
       continue;
     }
-    if (hardware_future.wait_until(response_deadline) !=
+    if (hardware_future.wait_until(refresh_deadline) !=
         std::future_status::ready) {
       static_cast<void>(
           list_hardware_components_client_->remove_pending_request(

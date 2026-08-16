@@ -424,7 +424,15 @@ def _start_topic_sample(
     environment: Mapping[str, str],
 ) -> TopicSample:
     process = subprocess.Popen(
-        ["ros2", "topic", "echo", topic, "--once"],
+        [
+            "ros2",
+            "topic",
+            "echo",
+            topic,
+            TOPIC_TYPE_BY_NAME[topic],
+            "--once",
+            "--no-daemon",
+        ],
         stdin=subprocess.DEVNULL,
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
