@@ -1075,6 +1075,9 @@ def test_process_commands_bind_exact_component_world_and_pose_config(
     assert "scene_service_timeout_s:=120.0" in ros
     assert "additional_required_topics:=/tf" in ros
     assert not any("DemoSupervisor" in item for item in ros)
+    headless = commands["headless"]
+    timeout_index = headless.index("--manager-timeout-s")
+    assert headless[timeout_index + 1] == "12.0"
 
 
 def test_recovery_evidence_requires_new_provider_epoch_and_bounded_outage(

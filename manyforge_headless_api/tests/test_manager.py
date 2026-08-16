@@ -18,6 +18,12 @@ from manyforge_headless_api.models import (
 from manyforge_headless_api.native import HeadlessApiError
 
 
+def test_manager_transport_accepts_bounded_cold_apply_timeout(tmp_path: Path) -> None:
+    ManagerCommandClient(tmp_path, timeout_seconds=12.0)
+    with pytest.raises(ValueError, match=r"\(0, 15\]"):
+        ManagerCommandClient(tmp_path, timeout_seconds=15.1)
+
+
 def _request() -> ManagerApplyRequest:
     return ManagerApplyRequest.model_validate(
         {

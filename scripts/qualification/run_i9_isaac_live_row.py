@@ -53,6 +53,7 @@ _OBJECT_MOTION_MINIMUM_M: Final = 0.05
 _GRIPPER_TOLERANCE_BY_PROFILE: Final = {"lite6": 0.004, "ur10e": 0.04}
 _RECOVERY_BOUND_S: Final = 60.0
 _SCENE_POSE_QUERY_ATTEMPTS: Final = 16
+_I9_MANAGER_COMMAND_TIMEOUT_S: Final = 12.0
 _CCLC_STARTUP_SCHEMA: Final = "manyforge.i9_cclc_startup.v1"
 _ROS2_CONTROL_LIFECYCLE_OBSERVATION_SCHEMA: Final = (
     "manyforge.ros2_control_lifecycle_observation.v1"
@@ -2424,7 +2425,7 @@ def _process_commands(
             "--freshness-ms",
             "120000",
             "--manager-timeout-s",
-            "5",
+            str(_I9_MANAGER_COMMAND_TIMEOUT_S),
             "--program-runner-url",
             runner_url,
             "--program-runner-timeout-s",

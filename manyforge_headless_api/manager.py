@@ -21,6 +21,7 @@ from .models import (
 from .native import (
     DEFAULT_MANAGER_COMMAND_TIMEOUT_SECONDS,
     HeadlessApiError,
+    MAX_MANAGER_COMMAND_TIMEOUT_SECONDS,
     strict_json_object,
 )
 
@@ -83,8 +84,11 @@ class ManagerCommandClient:
         *,
         timeout_seconds: float = DEFAULT_MANAGER_COMMAND_TIMEOUT_SECONDS,
     ) -> None:
-        if timeout_seconds <= 0 or timeout_seconds > 5:
-            raise ValueError("Manager timeout must be in (0, 5] seconds")
+        if (
+            timeout_seconds <= 0
+            or timeout_seconds > MAX_MANAGER_COMMAND_TIMEOUT_SECONDS
+        ):
+            raise ValueError("Manager timeout must be in (0, 15] seconds")
         self._socket_path = state_root / MANAGER_SOCKET_FILE
         self._timeout_seconds = timeout_seconds
 
