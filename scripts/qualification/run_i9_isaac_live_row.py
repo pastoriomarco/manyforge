@@ -167,6 +167,7 @@ class RunEvidence:
     execution_component_ids: set[str] = field(default_factory=set)
     gripper_hits: set[GripperTarget] = field(default_factory=set)
     object_initial_position: tuple[float, float, float] | None = None
+    object_last_position: tuple[float, float, float] | None = None
     object_max_displacement_m: float = 0.0
     object_pose_samples: int = 0
     object_carried_observed: bool = False
@@ -1676,6 +1677,34 @@ def _snapshot_position(
     return tuple(float(value) for value in coordinates)  # type: ignore[arg-type]
 
 
+def _snapshot_object_is_carried(
+    scene: Mapping[str, Any], scene_resource_id: str
+) -> bool:
+    snapshot = _logical_snapshot(scene)
+    objects = snapshot.get("objects") if isinstance(snapshot, dict) else None
+    if not isinstance(objects, list):
+        return False
+    selected = [
+        row
+        for row in objects
+        if isinstance(row, dict)
+        and row.get("scene_resource_id") == scene_resource_id
+    ]
+    if len(selected) != 1:
+        return False
+    placement = selected[0].get("placement")
+    return bool(
+        isinstance(placement, dict)
+        and placement.get("kind") == "carried"
+        and isinstance(placement.get("carried_object_attachment_id"), str)
+        and placement["carried_object_attachment_id"]
+        and isinstance(
+            placement.get("carried_object_attachment_revision"), str
+        )
+        and placement["carried_object_attachment_revision"]
+    )
+
+
 def _sample_position(
     evidence: RunEvidence,
     client: HeadlessHttpClient,
@@ -1688,14 +1717,37 @@ def _sample_position(
         # publication read and this request indefinitely.  That expected race
         # must stay fail-closed at the query boundary; the already revision-
         # bound logical-scene snapshot remains a coherent observation.
-        return _resolved_position(
+        position = _resolved_position(
             client, scene, scene_resource_id, attempts=1
         )
     except HeadlessClientError as error:
-        if error.code not in {"stale_revision", "scene_projection_changed"}:
+        exact_revision_race = error.code in {
+            "stale_revision",
+            "scene_projection_changed",
+        }
+        carried_projection_ambiguity = bool(
+            error.code == "missing_reference"
+            and error.details.get("reason")
+            == "scene_frame_resolution_ambiguous"
+        )
+        if not exact_revision_race and not carried_projection_ambiguity:
             raise
         evidence.pose_query_rejections += 1
-        return _snapshot_position(scene, scene_resource_id)
+        try:
+            position = _snapshot_position(scene, scene_resource_id)
+        except LiveRowError:
+            # A carried logical-scene row intentionally has no cell pose. If
+            # its active projections disagree, retain only the last proven
+            # sample until a later exact query (normally after detach) resolves
+            # it. Reusing a sample cannot create displacement evidence.
+            if (
+                evidence.object_last_position is None
+                or not _snapshot_object_is_carried(scene, scene_resource_id)
+            ):
+                raise
+            position = evidence.object_last_position
+    evidence.object_last_position = position
+    return position
 
 
 def _record_execution_evidence(

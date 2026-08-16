@@ -588,6 +588,59 @@ def test_scene_motion_sample_uses_revision_bound_snapshot_during_continuous_race
     assert evidence.pose_query_rejections == 1
 
 
+def test_scene_motion_sample_holds_only_proven_pose_during_carried_ambiguity(
+    live: ModuleType,
+) -> None:
+    scene = {
+        "logical_scene": {
+            "payload": {
+                "access": {
+                    "active_projection": {
+                        "graph_revision": "graph.1",
+                        "retained_bundle_id": "bundle.1",
+                        "scene_revision": {
+                            "content_hash": "content.1",
+                            "revision_id": 1,
+                            "scene_id": "scene.1",
+                        },
+                    }
+                },
+                "snapshot": {
+                    "objects": [
+                        {
+                            "scene_resource_id": "isaac_cheese_box",
+                            "placement": {
+                                "kind": "carried",
+                                "carried_object_attachment_id": "attachment.1",
+                                "carried_object_attachment_revision": "revision.1",
+                            },
+                        }
+                    ]
+                },
+            }
+        }
+    }
+
+    class Client:
+        @staticmethod
+        def resolve_scene_resources(body: dict) -> dict:
+            del body
+            raise live.HeadlessClientError(
+                "missing_reference",
+                "active native projections disagree on scene-frame meaning",
+                500,
+                details={"reason": "scene_frame_resolution_ambiguous"},
+            )
+
+    evidence = live.RunEvidence(
+        gripper_targets=(), object_last_position=(1.0, 2.0, 3.0)
+    )
+    assert live._sample_position(  # noqa: SLF001
+        evidence, Client(), scene, "isaac_cheese_box"
+    ) == (1.0, 2.0, 3.0)
+    assert evidence.pose_query_rejections == 1
+
+
 def test_check_reducer_requires_source_matched_foundationpose_latch(
     live: ModuleType,
 ) -> None:
