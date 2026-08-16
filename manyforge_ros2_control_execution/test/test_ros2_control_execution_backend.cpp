@@ -2020,6 +2020,18 @@ TEST(Ros2ControlExecutionBackendTest,
             "planning_to_dispatch_environment_pin");
   EXPECT_EQ(terminal.error->details.at("reason"),
             "execution_environment_epoch_changed");
+  EXPECT_EQ(terminal.error->details.at("changed_dimensions"),
+            "lifecycle_generation,transport_owner_component_epoch");
+  EXPECT_EQ(terminal.error->details.at("planning_lifecycle_generation"),
+            "1");
+  EXPECT_EQ(terminal.error->details.at("dispatch_lifecycle_generation"),
+            "2");
+  EXPECT_EQ(
+      terminal.error->details.at("planning_transport_owner_component_epoch"),
+      "owner-epoch-1");
+  EXPECT_EQ(
+      terminal.error->details.at("dispatch_transport_owner_component_epoch"),
+      "owner-epoch-2");
   EXPECT_EQ(server.goal_count(), 0u);
 }
 

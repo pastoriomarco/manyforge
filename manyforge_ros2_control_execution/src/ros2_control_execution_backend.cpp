@@ -147,6 +147,83 @@ bool same_execution_environment(const DispatchAuthorityPin &expected,
              observed.execution_backend_component_epoch;
 }
 
+std::map<std::string, std::string> execution_environment_change_details(
+    const DispatchAuthorityPin &planning,
+    const DispatchAuthorityPin &dispatch) {
+  std::map<std::string, std::string> details{
+      {"phase", "planning_to_dispatch_environment_pin"},
+      {"reason", "execution_environment_epoch_changed"},
+      {"planning_binding_snapshot_generation",
+       std::to_string(planning.binding_snapshot_generation)},
+      {"dispatch_binding_snapshot_generation",
+       std::to_string(dispatch.binding_snapshot_generation)},
+      {"planning_admission_snapshot_generation",
+       std::to_string(planning.admission_snapshot_generation)},
+      {"dispatch_admission_snapshot_generation",
+       std::to_string(dispatch.admission_snapshot_generation)}};
+  std::string changed_dimensions;
+  const auto append_dimension = [&changed_dimensions](
+                                    const std::string_view dimension) {
+    if (!changed_dimensions.empty()) {
+      changed_dimensions.push_back(',');
+    }
+    changed_dimensions.append(dimension);
+  };
+  const auto append_string_change =
+      [&details, &append_dimension](const std::string_view dimension,
+                                    const std::string &planning_value,
+                                    const std::string &dispatch_value) {
+        if (planning_value == dispatch_value) {
+          return;
+        }
+        append_dimension(dimension);
+        details.emplace("planning_" + std::string(dimension), planning_value);
+        details.emplace("dispatch_" + std::string(dimension), dispatch_value);
+      };
+  const auto append_generation_change =
+      [&details, &append_dimension](const std::string_view dimension,
+                                    const std::uint64_t planning_value,
+                                    const std::uint64_t dispatch_value) {
+        if (planning_value == dispatch_value) {
+          return;
+        }
+        append_dimension(dimension);
+        details.emplace("planning_" + std::string(dimension),
+                        std::to_string(planning_value));
+        details.emplace("dispatch_" + std::string(dimension),
+                        std::to_string(dispatch_value));
+      };
+
+  append_string_change("binding_contract_generation_id",
+                       planning.binding_contract_generation_id,
+                       dispatch.binding_contract_generation_id);
+  append_generation_change("binding_activity_generation",
+                           planning.binding_activity_generation,
+                           dispatch.binding_activity_generation);
+  append_generation_change("lifecycle_generation",
+                           planning.lifecycle_generation,
+                           dispatch.lifecycle_generation);
+  append_string_change("runtime_generation_id", planning.runtime_generation_id,
+                       dispatch.runtime_generation_id);
+  append_string_change("provider_component_epoch",
+                       planning.provider_component_epoch,
+                       dispatch.provider_component_epoch);
+  append_string_change("transport_owner_component_epoch",
+                       planning.transport_owner_component_epoch,
+                       dispatch.transport_owner_component_epoch);
+  append_string_change("authority_component_epoch",
+                       planning.authority_component_epoch,
+                       dispatch.authority_component_epoch);
+  append_string_change("cell_supervisor_component_epoch",
+                       planning.cell_supervisor_component_epoch,
+                       dispatch.cell_supervisor_component_epoch);
+  append_string_change("execution_backend_component_epoch",
+                       planning.execution_backend_component_epoch,
+                       dispatch.execution_backend_component_epoch);
+  details.emplace("changed_dimensions", std::move(changed_dimensions));
+  return details;
+}
+
 core::Duration gripper_duration_ns(double seconds) noexcept {
   constexpr double kNanosecondsPerSecond = 1'000'000'000.0;
   const double nanoseconds = seconds * kNanosecondsPerSecond;
@@ -5337,14 +5414,18 @@ core::ExecutionHandle Ros2ControlExecutionBackend::execute_trajectory(
                                      *decision.pin))) {
       execution_admission_dispatch_rejections_total_.fetch_add(
           1, std::memory_order_relaxed);
+      auto details = planning_environment_authority_.has_value()
+                         ? execution_environment_change_details(
+                               *planning_environment_authority_, *decision.pin)
+                         : std::map<std::string, std::string>{
+                               {"phase",
+                                "planning_to_dispatch_environment_pin"},
+                               {"reason", "planning_environment_pin_missing"}};
       fail_execution(
           "Execution environment changed between planning and dispatch",
           core::ErrorCode::kExecutionRejected,
           ros2_control_fault_reason::kExecutionAdmissionRejected,
-          {{"phase", "planning_to_dispatch_environment_pin"},
-           {"reason", planning_environment_authority_.has_value()
-                          ? "execution_environment_epoch_changed"
-                          : "planning_environment_pin_missing"}});
+          std::move(details));
       return core::ExecutionHandle{
           [](int64_t) { return true; },
           [this]() { return get_execution_snapshot(); }};
