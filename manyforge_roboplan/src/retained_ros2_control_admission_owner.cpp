@@ -108,7 +108,14 @@ void RetainedRos2ControlAdmissionOwner::Run(
     const std::stop_token stop_token) noexcept {
   std::uint64_t publication_generation = 0U;
   std::uint64_t lifecycle_generation = 0U;
+  bool binding_lease_expiration_deferred = false;
   std::string previous_semantics;
+  const auto wait_for_next_observation = [this, &stop_token]() {
+    std::unique_lock wait_lock(wakeup_mutex_);
+    wakeup_.wait_for(wait_lock, stop_token,
+                     std::chrono::nanoseconds(config_.publication_period_ns),
+                     [] { return false; });
+  };
   {
     std::lock_guard lock(status_mutex_);
     status_.running = true;
@@ -136,19 +143,48 @@ void RetainedRos2ControlAdmissionOwner::Run(
       }
       const auto binding = runtime_handle_->controller_binding_snapshot();
       bool controller_ready = false;
+      bool defer_binding_lease_expiration = false;
       std::vector<std::string> reasons;
       if (!binding.has_value()) {
+        binding_lease_expiration_deferred = false;
         reasons.emplace_back("controller_binding_unavailable");
       } else if (binding->contract_generation_id !=
                  config_.binding_contract_generation_id) {
+        binding_lease_expiration_deferred = false;
         reasons.emplace_back("controller_binding_contract_mismatch");
-      } else if (binding->received_timestamp_ns > now ||
-                 binding->fresh_until_ns <= now) {
+      } else if (binding->received_timestamp_ns > now) {
+        binding_lease_expiration_deferred = false;
         reasons.emplace_back("controller_binding_stale");
       } else if (!binding->valid) {
+        binding_lease_expiration_deferred = false;
         reasons.emplace_back("controller_binding_invalid");
+      } else if (binding->fresh_until_ns <= now) {
+        // The backend checks this same lease directly at dispatch and every
+        // active-goal tick. Do not let one sub-period expiry observed only by
+        // this slower lifecycle join publish a false semantic transition
+        // after the backend has already refreshed. A second consecutive join
+        // observation still publishes stale, while activity/invalid binding
+        // evidence above remains immediate and fail-closed.
+        if (!binding_lease_expiration_deferred) {
+          binding_lease_expiration_deferred = true;
+          defer_binding_lease_expiration = true;
+        } else {
+          reasons.emplace_back("controller_binding_stale");
+        }
       } else {
+        binding_lease_expiration_deferred = false;
         controller_ready = true;
+      }
+
+      if (defer_binding_lease_expiration) {
+        {
+          std::lock_guard lock(status_mutex_);
+          status_.healthy = true;
+          ++status_.binding_lease_expirations_deferred_total;
+          status_.reason_code.clear();
+        }
+        wait_for_next_observation();
+        continue;
       }
 
       bool lifecycle_active = false;
@@ -223,11 +259,7 @@ void RetainedRos2ControlAdmissionOwner::Run(
         status_.reason_code.clear();
       }
 
-      std::unique_lock wait_lock(wakeup_mutex_);
-      wakeup_.wait_for(
-          wait_lock, stop_token,
-          std::chrono::nanoseconds(config_.publication_period_ns),
-          [] { return false; });
+      wait_for_next_observation();
     }
   } catch (const std::exception &error) {
     std::lock_guard lock(status_mutex_);

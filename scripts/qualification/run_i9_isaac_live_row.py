@@ -2645,24 +2645,7 @@ def run_live_row(config: LiveConfig) -> dict[str, Any]:
                 environment=environment,
                 processes=processes,
             )
-        nodes, command_info, topic_types = _read_ros_graph(config.spec)
         before_control = _simulation_snapshot(config.spec)
-        topic_names = {
-            "/clock",
-            "/isaac_joint_commands",
-            "/isaac_joint_states",
-            (
-                "/isaac_joint_commands_gripper"
-                if config.spec.profile == "lite6"
-                else "/isaac_gripper_state"
-            ),
-        }
-        if config.spec.scenario_id == "isaac-lite6-trocar-foundationpose":
-            topic_names.add("/output")
-        samples = [
-            _start_topic_sample(topic, environment=environment)
-            for topic in sorted(topic_names)
-        ]
         program_definition = load_strict_json_yaml(
             config.package_root / config.spec.program_filename
         )
@@ -2690,6 +2673,27 @@ def run_live_row(config: LiveConfig) -> dict[str, Any]:
                 raise LiveRowError(
                     "simulation did not enter playing for runtime readiness"
                 )
+            # Isaac advertises /clock only while playback is active. Read one
+            # converged graph before starting echo observers so the command
+            # subscription count cannot be satisfied by our own evidence
+            # process.
+            nodes, command_info, topic_types = _read_ros_graph(config.spec)
+            topic_names = {
+                "/clock",
+                "/isaac_joint_commands",
+                "/isaac_joint_states",
+                (
+                    "/isaac_joint_commands_gripper"
+                    if config.spec.profile == "lite6"
+                    else "/isaac_gripper_state"
+                ),
+            }
+            if config.spec.scenario_id == "isaac-lite6-trocar-foundationpose":
+                topic_names.add("/output")
+            samples = [
+                _start_topic_sample(topic, environment=environment)
+                for topic in sorted(topic_names)
+            ]
             applied = _apply_program(
                 client,
                 config.spec,

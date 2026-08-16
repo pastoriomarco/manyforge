@@ -3322,6 +3322,32 @@ void Ros2ControlExecutionBackend::fail_active_dispatch_authority(
   }
   dispatch_authority_losses_total_.fetch_add(1, std::memory_order_relaxed);
   cancel_goal_if_known(handle_to_cancel);
+  decision.details["controller_binding_activity_events_total"] =
+      std::to_string(controller_binding_activity_events_total_.load(
+          std::memory_order_relaxed));
+  decision.details["controller_binding_refresh_attempts_total"] =
+      std::to_string(controller_binding_refresh_attempts_total_.load(
+          std::memory_order_relaxed));
+  decision.details["controller_binding_refresh_successes_total"] =
+      std::to_string(controller_binding_refresh_successes_total_.load(
+          std::memory_order_relaxed));
+  decision.details["controller_binding_refresh_failures_total"] =
+      std::to_string(controller_binding_refresh_failures_total_.load(
+          std::memory_order_relaxed));
+  const auto binding =
+      controller_binding_snapshot_.load(std::memory_order_acquire);
+  if (binding != nullptr) {
+    decision.details["controller_binding_snapshot_generation"] =
+        std::to_string(binding->generation);
+    decision.details["controller_binding_activity_generation"] =
+        std::to_string(binding->activity_generation);
+    decision.details["controller_binding_received_timestamp_ns"] =
+        std::to_string(binding->received_timestamp_ns);
+    decision.details["controller_binding_fresh_until_ns"] =
+        std::to_string(binding->fresh_until_ns);
+    decision.details["controller_binding_valid"] =
+        binding->valid ? "true" : "false";
+  }
   decision.details["admission_failure_reason"] = decision.reason_code;
   fail_execution(decision.message.empty()
                      ? "Controller binding or lifecycle admission was lost"

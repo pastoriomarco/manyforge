@@ -555,5 +555,101 @@ TEST(RetainedRos2ControlBackendFactoryTest,
   EXPECT_TRUE(admission->authority_component_epoch.empty());
 }
 
+TEST(RetainedRos2ControlBackendFactoryTest,
+     AdmissionOwnerDoesNotPublishOneIsolatedBindingLeaseEdge) {
+  deployment::ros2_control_execution_runtime_contract::Configuration runtime{
+      "lite6", 12345U, {0.0}, 100U, 50.0};
+  auto selected = make_retained_isaac_ros2_control_backend_config(
+      runtime, commanded_binding(), commanded_gripper_binding());
+  ASSERT_TRUE(selected.execution.controller_binding.has_value());
+  const auto binding_contract = *selected.execution.controller_binding;
+
+  core::FakeClock clock;
+  clock.set(1'000);
+  core::ManualScheduler scheduler;
+  auto sink = std::make_shared<NullExecutionStateSink>();
+  auto backend =
+      std::make_shared<ros2_control_execution::Ros2ControlExecutionBackend>(
+          ros2_control_execution::Ros2ControlExecutionBackend::
+              TestingNoRosStartupTag{},
+          sink, "arm", clock, scheduler, std::move(selected.execution));
+  auto handle = std::make_shared<RetainedRos2ControlRuntimeHandle>();
+  ASSERT_TRUE(
+      handle->BindBackend(backend, commanded_binding(), std::nullopt).ok());
+
+  const auto publish_ready_binding = [&]() {
+    ros2_control_execution::ControllerBindingSnapshot ready;
+    ready.activity_generation = 1U;
+    ready.contract_generation_id = binding_contract.generation_id;
+    ready.observed_timestamp_ns = clock.now();
+    ready.received_timestamp_ns = clock.now();
+    ready.fresh_until_ns = clock.now() + 100'000'000;
+    ready.valid = true;
+    backend->testing_publish_controller_binding_snapshot(std::move(ready));
+  };
+  publish_ready_binding();
+
+  auto owner = RetainedRos2ControlAdmissionOwner::Create(
+      RetainedRos2ControlAdmissionOwnerConfig{
+          core::ControllableComponentId("robot_1"),
+          core::RuntimeEpoch("runtime-epoch.1"), binding_contract.generation_id,
+          "provider-epoch.1", "cell-supervisor-epoch.1", 100'000'000,
+          500'000'000},
+      handle, clock, [] {
+        return core::Result<core::ComponentLifecycleCurrentSnapshotDTO>::Err(
+            core::ErrorDTO{std::string(core::to_string(
+                               core::ErrorCode::kInvariantViolation)),
+                           "component snapshot intentionally unavailable",
+                           {}});
+      });
+  ASSERT_TRUE(owner.ok()) << owner.error().message;
+
+  const auto initial_deadline = std::chrono::steady_clock::now() + 2s;
+  while (owner.value()->status().publication_generation == 0U &&
+         std::chrono::steady_clock::now() < initial_deadline) {
+    std::this_thread::sleep_for(1ms);
+  }
+  const auto initial_status = owner.value()->status();
+  ASSERT_GT(initial_status.publication_generation, 0U);
+  const auto initial_admission = backend->execution_admission_snapshot();
+  ASSERT_TRUE(initial_admission.has_value());
+  ASSERT_TRUE(initial_admission->controller_ready);
+
+  clock.set(100'001'001);
+  const auto deferred_deadline = std::chrono::steady_clock::now() + 2s;
+  while (owner.value()->status().binding_lease_expirations_deferred_total ==
+             0U &&
+         std::chrono::steady_clock::now() < deferred_deadline) {
+    std::this_thread::sleep_for(1ms);
+  }
+  const auto deferred_status = owner.value()->status();
+  ASSERT_EQ(deferred_status.binding_lease_expirations_deferred_total, 1U);
+  EXPECT_EQ(deferred_status.publication_generation,
+            initial_status.publication_generation);
+  const auto retained_admission = backend->execution_admission_snapshot();
+  ASSERT_TRUE(retained_admission.has_value());
+  EXPECT_TRUE(retained_admission->controller_ready);
+  EXPECT_EQ(retained_admission->lifecycle_generation,
+            initial_admission->lifecycle_generation);
+
+  publish_ready_binding();
+  const auto recovery_deadline = std::chrono::steady_clock::now() + 2s;
+  while (owner.value()->status().publication_generation <=
+             initial_status.publication_generation &&
+         std::chrono::steady_clock::now() < recovery_deadline) {
+    std::this_thread::sleep_for(1ms);
+  }
+  const auto recovered_status = owner.value()->status();
+  ASSERT_GT(recovered_status.publication_generation,
+            initial_status.publication_generation);
+  EXPECT_EQ(recovered_status.lifecycle_generation,
+            initial_status.lifecycle_generation);
+  const auto recovered_admission = backend->execution_admission_snapshot();
+  ASSERT_TRUE(recovered_admission.has_value());
+  EXPECT_TRUE(recovered_admission->controller_ready);
+  EXPECT_EQ(recovered_admission->lifecycle_generation,
+            initial_admission->lifecycle_generation);
+}
+
 } // namespace
 } // namespace manyforge::roboplan_backend
