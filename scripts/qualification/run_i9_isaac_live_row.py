@@ -1730,7 +1730,17 @@ def _sample_position(
             and error.details.get("reason")
             == "scene_frame_resolution_ambiguous"
         )
-        if not exact_revision_race and not carried_projection_ambiguity:
+        observed_state_reconciliation = bool(
+            error.code == "invalid_request"
+            and error.details.get("reason")
+            == "kinematic_state_publication_mismatch"
+            and error.details.get("mismatch_field")
+        )
+        if (
+            not exact_revision_race
+            and not carried_projection_ambiguity
+            and not observed_state_reconciliation
+        ):
             raise
         evidence.pose_query_rejections += 1
         try:
@@ -1739,7 +1749,8 @@ def _sample_position(
             # A carried logical-scene row intentionally has no cell pose. If
             # its active projections disagree, retain only the last proven
             # sample until a later exact query (normally after detach) resolves
-            # it. Reusing a sample cannot create displacement evidence.
+            # it. The mismatch field remains observable on every rejected
+            # query, and reusing a sample cannot create displacement evidence.
             if (
                 evidence.object_last_position is None
                 or not _snapshot_object_is_carried(scene, scene_resource_id)

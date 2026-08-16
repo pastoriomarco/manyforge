@@ -1,6 +1,6 @@
 api_version: manyforge.program.v1
 program_id: isaac_manipulator_scene_light
-program_revision: sha256:85e8b2bae0a338e652e6b59c408a55511bb4162d0a82020ccf75b8187cef21af
+program_revision: sha256:65d15a2be5027c80eb82f02a6cb57805458c7c480e9d9ad38b98fe1a0ec4211e
 program_profile: composable-cell-v1
 name: isaac_manipulator_scene_light
 description: >-
@@ -84,13 +84,13 @@ scene:
       support_contacts:
         - support_object_id: isaac_table_low_327
           mode: contact_release
-          release_evidence_mode: signed_penetration
-          enforce_max_start_penetration: true
-          max_start_penetration_m: 0.03
-          release_tolerance_m: 0.001
+          release_evidence_mode: binary_contact
+          enforce_max_start_penetration: false
+          max_start_penetration_m: 0.0
+          release_tolerance_m: 0.0
           min_release_progress_m: 0.0
           require_separation_by_end: true
-          require_strictly_decreasing_penetration: true
+          require_strictly_decreasing_penetration: false
           allow_recontact: false
   - scene_resource_id: isaac_small_klt
     shape:
