@@ -410,3 +410,20 @@ def test_scene_pose_client_fences_and_validates_the_owner_projection(
     with pytest.raises(HeadlessApiError) as captured:
         client.resolve_scene_resources(query)
     assert captured.value.code == "manager_command_response_identity_mismatch"
+
+    rejected = {
+        "api_version": "manyforge.manager_command_response.v1",
+        "error": {
+            "code": "missing_reference",
+            "details": {"reason": "scene_frame_resolution_ambiguous"},
+            "message": "active native projections disagree",
+        },
+        "ok": False,
+    }
+    monkeypatch.setattr(client, "_exchange", lambda _command: rejected)
+    with pytest.raises(HeadlessApiError) as rejected_error:
+        client.resolve_scene_resources(query)
+    assert rejected_error.value.code == "missing_reference"
+    assert rejected_error.value.details == {
+        "reason": "scene_frame_resolution_ambiguous"
+    }

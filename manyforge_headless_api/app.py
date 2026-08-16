@@ -414,6 +414,7 @@ def create_app(
             content={
                 "detail": {
                     "code": error.code,
+                    "details": error.details,
                     "message": str(error),
                     "request_id": getattr(request.state, "request_id", None),
                 }

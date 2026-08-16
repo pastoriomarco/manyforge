@@ -1365,6 +1365,34 @@ def test_scene_pose_query_is_read_only_revision_fenced_and_canonical() -> None:
     assert noncanonical.status_code == 422
 
 
+def test_scene_pose_error_preserves_structured_owner_details() -> None:
+    client, _core, manager = _client()
+    projection = _scene_body()["expected_projection_revision"]
+
+    def reject(_request: SceneResourcePoseQuery) -> dict[str, Any]:
+        raise HeadlessApiError(
+            "missing_reference",
+            "active native projections disagree",
+            details={"reason": "scene_frame_resolution_ambiguous"},
+        )
+
+    manager.resolve_scene_resources = reject  # type: ignore[method-assign]
+    with client:
+        response = client.post(
+            "/api/scene/resource-poses/query",
+            json={
+                "api_version": "manyforge.scene_resource_pose_query.v1",
+                "expected_projection_revision": projection,
+                "scene_resource_ids": ["part.1"],
+            },
+        )
+
+    assert response.status_code == 404
+    assert response.json()["detail"]["details"] == {
+        "reason": "scene_frame_resolution_ambiguous"
+    }
+
+
 def test_scene_support_declaration_crosses_http_without_native_names() -> None:
     client, _core, manager = _client(trusted=True)
     body = _scene_body()

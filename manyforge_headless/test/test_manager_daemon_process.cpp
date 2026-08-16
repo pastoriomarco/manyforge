@@ -1209,9 +1209,15 @@ TEST(ManagerDaemonProcess,
         ScenePoseRequest(*initial, "scene-process-box"));
     EXPECT_NE(stale_pose.find("\"scene_projection_changed\""),
               std::string::npos);
+    EXPECT_EQ(stale_pose.find("\"details\":"), std::string::npos)
+        << stale_pose;
     const auto absent_pose = SendCommand(
         directory.socket_path(), ScenePoseRequest(*published, "absent-object"));
     EXPECT_NE(absent_pose.find("\"object_not_found\""), std::string::npos);
+    EXPECT_NE(absent_pose.find(
+                  "\"details\":{\"scene_resource_id\":\"absent-object\"}"),
+              std::string::npos)
+        << absent_pose;
     committed_digest = published->semantic_content_digest;
     committed_generation = published->source_generation;
 

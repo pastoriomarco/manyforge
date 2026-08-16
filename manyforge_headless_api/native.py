@@ -27,9 +27,16 @@ _SHA256_PATTERN = re.compile(r"^sha256:[0-9a-f]{64}$")
 class HeadlessApiError(RuntimeError):
     """Stable failure returned by a headless owner or projection adapter."""
 
-    def __init__(self, code: str, message: str) -> None:
+    def __init__(
+        self,
+        code: str,
+        message: str,
+        *,
+        details: Mapping[str, str] | None = None,
+    ) -> None:
         super().__init__(message)
         self.code = code
+        self.details = dict(details or {})
 
 
 @dataclass(frozen=True, slots=True)

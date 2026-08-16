@@ -1045,6 +1045,18 @@ CanonicalValue ErrorResponse(const std::string_view code,
   });
 }
 
+CanonicalValue DetailedErrorResponse(
+    const std::string_view code, const std::string_view message,
+    const std::map<std::string, std::string> &details) {
+  return CanonicalValue(CanonicalValue::Object{
+      {"api_version",
+       CanonicalValue(std::string(kManagerCommandResponseApiVersion))},
+      {"error", ErrorValue(core::ErrorDTO{std::string(code),
+                                           std::string(message), details})},
+      {"ok", CanonicalValue(false)},
+  });
+}
+
 CanonicalValue ApplyErrorResponse(const ManagerCommand &command,
                                   const std::string_view code,
                                   const std::string_view message) {
@@ -2011,11 +2023,12 @@ private:
             const auto &error = pose.error();
             TrySendResponse(
                 client.get(),
-                ErrorResponse(
+                DetailedErrorResponse(
                     error.code.empty() ? "scene_pose_unavailable" : error.code,
                     error.message.empty()
                         ? "logical-scene object pose is unavailable"
-                        : error.message));
+                        : error.message,
+                    error.details));
             return false;
           }
           poses.emplace_back(scene_resource_id, pose.value());

@@ -362,11 +362,24 @@ class ManagerCommandClient:
             error = response.get("error")
             code = error.get("code") if isinstance(error, dict) else None
             message = error.get("message") if isinstance(error, dict) else None
+            details = error.get("details") if isinstance(error, dict) else None
+            if details is not None and (
+                not isinstance(details, dict)
+                or not all(
+                    isinstance(key, str) and isinstance(value, str)
+                    for key, value in details.items()
+                )
+            ):
+                raise HeadlessApiError(
+                    "manager_command_response_invalid",
+                    "Manager scene pose error details are invalid",
+                )
             raise HeadlessApiError(
                 code if isinstance(code, str) and code else "scene_pose_unavailable",
                 message
                 if isinstance(message, str) and message
                 else "Manager scene pose query was rejected",
+                details=details if isinstance(details, dict) else None,
             )
         if set(response) != {
             "api_version",
