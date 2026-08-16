@@ -1265,6 +1265,63 @@ def test_scene_nodes_translate_roles_and_detach_at_current_pose() -> None:
     assert transport.attachments == []
 
 
+def test_scene_node_retries_a_concurrent_pose_revision_with_one_correlation() -> None:
+    class _StaleRevision(RuntimeError):
+        code = "stale_revision"
+
+    class _ConcurrentPoseTransport(_SceneTransport):
+        def __init__(self) -> None:
+            super().__init__()
+            self.reject_next_node = False
+            self.rejected_requests: list[dict[str, Any]] = []
+
+        def commit_scene_transaction(
+            self, body: Mapping[str, Any]
+        ) -> dict[str, Any]:
+            if self.reject_next_node:
+                self.reject_next_node = False
+                self.rejected_requests.append(deepcopy(dict(body)))
+                revision_id = self.revision["scene_revision"]["revision_id"] + 1
+                self.revision["scene_revision"] = {
+                    "scene_id": _DIGEST_D,
+                    "revision_id": revision_id,
+                    "content_hash": "sha256:" + f"{revision_id:064x}"[-64:],
+                }
+                raise _StaleRevision("external pose update advanced the scene")
+            return super().commit_scene_transaction(body)
+
+    transport = _ConcurrentPoseTransport()
+    port = HeadlessSceneProgramPort(transport)
+    port.initialize(_scene_context(), [_authored_scene()[0]])
+    transport.submissions.clear()
+    transport.reject_next_node = True
+
+    result = port.invoke(
+        "scene.attach_carried_object",
+        _identity("attach-after-pose-update"),
+        OwnerNodeInputs(
+            parameters={
+                "scene_resource_id": "graspable",
+                "target_role": "arm",
+                "carrier_frame_role": "tcp",
+                "touch_body_roles": ["tool_collision"],
+            }
+        ),
+    )
+
+    assert result.succeeded is True
+    assert result.metadata["stale_revision_retry_count"] == 1
+    assert len(transport.rejected_requests) == 1
+    assert len(transport.submissions) == 1
+    rejected_context = transport.rejected_requests[0]["request_context"]
+    committed_context = transport.submissions[0]["request_context"]
+    assert rejected_context["request_id"] != committed_context["request_id"]
+    assert (
+        rejected_context["correlation_id"]
+        == committed_context["correlation_id"]
+    )
+
+
 def test_scene_resource_relative_pose_is_forwarded_to_the_scene_owner() -> None:
     transport = _SceneTransport()
     port = HeadlessSceneProgramPort(transport)

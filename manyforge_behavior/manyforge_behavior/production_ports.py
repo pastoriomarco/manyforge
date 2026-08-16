@@ -73,6 +73,7 @@ _MOTION_NODE_IDS: Final = frozenset(
 _MAX_CONTEXTS: Final = 4_096
 _MAX_TASKS: Final = 65_536
 _MAX_SCENE_INITIALIZATION_STALE_RETRIES: Final = 16
+_MAX_SCENE_NODE_STALE_RETRIES: Final = 16
 
 
 class ProductionPortError(RuntimeError):
@@ -2862,28 +2863,55 @@ class HeadlessSceneProgramPort:
                 raise ProductionPortError(
                     f"scene Program port does not implement {node_id!r}"
                 )
-            committed, response = self._commit(
-                context=context,
-                request_id=_request_identity(
-                    "scene-node",
-                    identity.program_run_id,
-                    identity.node_instance_id,
-                    identity.node_attempt_id,
-                    node_id,
-                ),
-                correlation_id=identity.node_attempt_id,
-                request_owner_epoch=view.request_owner_epoch,
-                expected_projection_revision=view.projection_revision,
-                operation=operation,
+            base_request_id = _request_identity(
+                "scene-node",
+                identity.program_run_id,
+                identity.node_instance_id,
+                identity.node_attempt_id,
+                node_id,
             )
-            return OwnerInvocationResult(
-                True,
-                output={"committed_projection_revision": committed},
-                metadata={
-                    "transaction_sequence": response.get("transaction_sequence"),
-                    "update_status": response.get("update_status"),
-                },
-            )
+            for attempt in range(_MAX_SCENE_NODE_STALE_RETRIES):
+                request_id = (
+                    base_request_id
+                    if attempt == 0
+                    else _request_identity(
+                        "scene-node-retry", base_request_id, str(attempt)
+                    )
+                )
+                try:
+                    committed, response = self._commit(
+                        context=context,
+                        request_id=request_id,
+                        correlation_id=identity.node_attempt_id,
+                        request_owner_epoch=view.request_owner_epoch,
+                        expected_projection_revision=view.projection_revision,
+                        operation=operation,
+                    )
+                except Exception as error:
+                    if (
+                        getattr(error, "code", None) != "stale_revision"
+                        or attempt + 1 == _MAX_SCENE_NODE_STALE_RETRIES
+                    ):
+                        raise
+                    refreshed = self._read_view(context)
+                    if refreshed.request_owner_epoch != view.request_owner_epoch:
+                        raise ProductionPortError(
+                            "logical-scene owner changed during node mutation"
+                        ) from error
+                    view = refreshed
+                    continue
+                return OwnerInvocationResult(
+                    True,
+                    output={"committed_projection_revision": committed},
+                    metadata={
+                        "transaction_sequence": response.get(
+                            "transaction_sequence"
+                        ),
+                        "update_status": response.get("update_status"),
+                        "stale_revision_retry_count": attempt,
+                    },
+                )
+            raise AssertionError("scene-node retry loop did not terminate")
         except Exception as exc:
             reason_code = getattr(exc, "code", None)
             if not isinstance(reason_code, str) or not reason_code:
