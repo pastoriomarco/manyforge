@@ -2585,6 +2585,26 @@ class HeadlessSceneProgramPort:
         ]
         if ids != sorted(ids) or len(ids) != len(set(ids)):
             raise ProductionPortError("initial scene is not canonical")
+        initialization_rows: list[tuple[bool, int, Mapping[str, Any]]] = []
+        for index, raw_row in enumerate(rows):
+            row = _mapping(raw_row, field=f"initial_scene[{index}]")
+            resource_roles = {
+                _text(role, field=f"initial_scene[{index}].resource_roles")
+                for role in _sequence(
+                    row.get("resource_roles", ()),
+                    field=f"initial_scene[{index}].resource_roles",
+                )
+            }
+            initialization_rows.append(
+                ("pick_object" in resource_roles, index, row)
+            )
+        # Continuously observed pick resources become writable as soon as they
+        # exist. Commit every static resource first so a fast external pose
+        # writer cannot starve the remainder of this optimistic transaction
+        # sequence. Canonical source order remains a validated input contract;
+        # the priority is deterministic and preserves identity within each
+        # class.
+        initialization_rows.sort(key=lambda item: (item[0], ids[item[1]]))
         view = self._read_view(parsed)
         expected = view.projection_revision
         ordinal = 0
@@ -2660,8 +2680,7 @@ class HeadlessSceneProgramPort:
                 },
                 f"remove:{scene_resource_id}",
             )
-        for index, raw_row in enumerate(rows):
-            row = _mapping(raw_row, field=f"initial_scene[{index}]")
+        for _pick_object, index, row in initialization_rows:
             scene_resource_id = ids[index]
             pose, frame_ref = self._initial_pose_and_frame(
                 parsed,

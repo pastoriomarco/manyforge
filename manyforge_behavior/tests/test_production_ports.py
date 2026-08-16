@@ -1034,6 +1034,7 @@ def _authored_scene() -> list[dict[str, Any]]:
     return [
         {
             "scene_resource_id": "graspable",
+            "resource_roles": ["pick_object"],
             "shape": {
                 "type": "box",
                 "box_dimensions_m": [0.1, 0.1, 0.1],
@@ -1064,7 +1065,7 @@ def _authored_scene() -> list[dict[str, Any]]:
     ]
 
 
-def test_scene_initialization_clears_dependencies_then_applies_authored_order() -> None:
+def test_scene_initialization_adds_pick_resources_last() -> None:
     transport = _SceneTransport(populated=True)
     port = HeadlessSceneProgramPort(transport)
 
@@ -1080,8 +1081,8 @@ def test_scene_initialization_clears_dependencies_then_applies_authored_order() 
     assert [
         request["operation"].get("scene_resource_id")
         for request in transport.submissions[1:]
-    ] == ["old-part", "old-support", "graspable", "table"]
-    table = transport.submissions[-1]["operation"]
+    ] == ["old-part", "old-support", "table", "graspable"]
+    table = transport.submissions[-2]["operation"]
     assert table["frame_ref"] == {
         "kind": "component_frame",
         "controllable_component_id": "robot.1",
@@ -1122,7 +1123,7 @@ def test_scene_initialization_retries_concurrent_pose_revision_without_losing_sh
                 raise _StaleRevision("external pose update advanced the scene")
             response = super().commit_scene_transaction(body)
             if (
-                operation.get("scene_resource_id") == "table"
+                operation.get("scene_resource_id") == "graspable"
                 and not self.injected_final_pose
             ):
                 self.injected_final_pose = True
