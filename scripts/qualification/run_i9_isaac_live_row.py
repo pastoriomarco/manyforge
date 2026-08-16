@@ -2633,6 +2633,8 @@ def _process_commands(
     }
     if config.spec.scenario_id == "isaac-lite6-trocar-foundationpose":
         commands["ros"].append("additional_required_topics:=/tf")
+    for resource_id in config.spec.runtime_resource_ids:
+        commands["headless"].extend(("--resource-id", resource_id))
     if composer_port is not None:
         commands["composer"] = [
             sys.executable,

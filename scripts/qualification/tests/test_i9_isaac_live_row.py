@@ -1312,6 +1312,11 @@ def test_process_commands_bind_exact_component_world_and_pose_config(
     headless = commands["headless"]
     timeout_index = headless.index("--manager-timeout-s")
     assert headless[timeout_index + 1] == "12.0"
+    assert tuple(
+        headless[index + 1]
+        for index, argument in enumerate(headless)
+        if argument == "--resource-id"
+    ) == scenario.runtime_resource_ids
 
 
 def test_recovery_evidence_requires_new_provider_epoch_and_bounded_outage(
