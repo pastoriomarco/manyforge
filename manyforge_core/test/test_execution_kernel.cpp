@@ -6227,6 +6227,95 @@ TEST_F(ExecutionKernelTest,
   EXPECT_FALSE(controlled_kernel.get_active_interrupt_latch().has_value());
 }
 
+TEST_F(ExecutionKernelTest,
+       AddressedStopOwnerModeHandsLookaheadCollisionToOwnerBeforeInterruptedProjection) {
+  ControlledExecution controlled_execution;
+  controlled_execution.enable_execution_progress_publication();
+  ThreadSafeFakeClock local_clock;
+  ThreadSafeManualScheduler local_scheduler;
+  TrajectoryCache local_cache{CacheConfig{10}};
+  ExecutionKernelConfig config;
+  config.collision_monitor_period_ns = 10'000'000;
+  config.runtime_collision_immediate_query_budget_ns = 10'000'000;
+  config.runtime_collision_lookahead_cycle_budget_ns = 100'000'000;
+  config.runtime_collision_lookahead_query_budget_ns = 75'000'000;
+  config.runtime_collision_lookahead_horizon_ns = 2'000'000'000;
+  config.runtime_collision_lookahead_max_samples = 8;
+  config.runtime_collision_lookahead_workers = 1;
+  config.runtime_collision_lookahead_workers_declared = true;
+  config.runtime_collision_lookahead_min_waypoints_for_parallel = 2;
+  config.runtime_collision_stop_owned_by_addressed_kernel = true;
+  MockCollisionWorldPublisher local_collision_world;
+  auto local_validation_engine = std::make_shared<MockCollisionEngine>();
+  auto local_runtime_engine = std::make_shared<MockCollisionEngine>();
+  auto local_lookahead_engine = std::make_shared<MockCollisionEngine>();
+  local_lookahead_engine->default_result = make_authoritative_collision_result();
+  std::mutex events_mutex;
+  std::condition_variable events_changed;
+  std::vector<KernelEvent> events;
+  ExecutionKernel controlled_kernel{
+      planner, context, controlled_execution, local_clock, local_scheduler, local_cache, config};
+  configure_runtime_collision_monitoring(controlled_kernel, local_collision_world,
+                                         local_validation_engine, local_runtime_engine,
+                                         {local_lookahead_engine});
+  controlled_kernel.subscribe_events([&](const KernelEvent& event) {
+    {
+      std::lock_guard<std::mutex> lock(events_mutex);
+      events.push_back(event);
+    }
+    events_changed.notify_all();
+  });
+
+  const auto result = controlled_kernel.execute(make_test_request());
+  ASSERT_TRUE(result.ok());
+  ASSERT_TRUE(controlled_execution.wait_until_execute_called());
+  ASSERT_TRUE(wait_for_state(controlled_kernel, ExecutionState::kExecuting));
+  ASSERT_TRUE(wait_for_pending_scheduler_work(local_scheduler));
+  const auto permit = drive_until_lookahead_permit_admitted(
+      controlled_kernel, local_clock, local_scheduler, config.collision_monitor_period_ns);
+  ASSERT_TRUE(permit.admitted);
+
+  std::vector<KernelEvent> captured;
+  {
+    std::unique_lock<std::mutex> lock(events_mutex);
+    ASSERT_TRUE(events_changed.wait_for(lock, std::chrono::seconds(5), [&]() {
+      const bool handoff = std::any_of(events.begin(), events.end(), [](const auto& event) {
+        const auto surface = event.details.find("surface");
+        return event.type == KernelEventType::kCollisionDetected &&
+               surface != event.details.end() &&
+               surface->second == "addressed_runtime_collision_authority";
+      });
+      const bool interrupted =
+          std::any_of(events.begin(), events.end(), [](const auto& event) {
+            const auto reason = event.details.find("reason");
+            return event.type == KernelEventType::kStateTransition &&
+                   event.to_state == ExecutionState::kInterrupted &&
+                   reason != event.details.end() && reason->second == "interrupt_latched";
+          });
+      return handoff && interrupted;
+    }));
+    captured = events;
+  }
+  const auto handoff = std::find_if(captured.begin(), captured.end(), [](const auto& event) {
+    const auto surface = event.details.find("surface");
+    return event.type == KernelEventType::kCollisionDetected &&
+           surface != event.details.end() &&
+           surface->second == "addressed_runtime_collision_authority";
+  });
+  const auto interrupted =
+      std::find_if(captured.begin(), captured.end(), [](const auto& event) {
+        return event.type == KernelEventType::kStateTransition &&
+               event.to_state == ExecutionState::kInterrupted;
+      });
+  ASSERT_NE(handoff, captured.end());
+  ASSERT_NE(interrupted, captured.end());
+  EXPECT_EQ(handoff->details.at("addressed_stop_authority_handoff"), "true");
+  EXPECT_LT(handoff->sequence, interrupted->sequence);
+
+  controlled_execution.release();
+  EXPECT_TRUE(controlled_kernel.wait_for_completion(1'000'000'000));
+}
+
 TEST_F(ExecutionKernelTest, CollisionLookahead_FutureCollisionSignalsAuthorityBeforeTelemetry) {
   ControlledExecution controlled_execution;
   controlled_execution.enable_execution_progress_publication();

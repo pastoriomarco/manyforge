@@ -4268,6 +4268,7 @@ ExecutionKernel::apply_runtime_collision_lookahead_authority(
   }
 
   InterruptIngestResult interrupt;
+  bool addressed_owner_handoff = false;
   {
     EventDeferralScope event_scope(*this);
     std::unique_lock<std::mutex> lock(runtime_collision_protection_mutex_);
@@ -4295,16 +4296,45 @@ ExecutionKernel::apply_runtime_collision_lookahead_authority(
       return RuntimeCollisionLookaheadAuthorityDisposition::kStale;
     }
     cache_.invalidate_all();
-    // Authority first. Any event/status publication below is evidence of a
-    // stop request that has already been latched, never a predictor of one.
-    interrupt = publish_runtime_collision_fault_interrupt(check, authority_details);
-    lock.unlock();
-    event_scope.flush();
+    if (config_.runtime_collision_stop_owned_by_addressed_kernel) {
+      // The addressed Kernel resolves and durably accepts the Stop from this
+      // synchronous event. Publish that authority handoff before the local
+      // interrupt latch can project kInterrupted back to the addressed
+      // operation; otherwise the Stop resolver sees an already-terminal
+      // operation and loses the exact affected-operation projection.
+      auto handoff_details = authority_details;
+      handoff_details["surface"] = "addressed_runtime_collision_authority";
+      handoff_details["addressed_stop_authority_handoff"] = "true";
+      KernelEvent handoff_event;
+      handoff_event.type = KernelEventType::kCollisionDetected;
+      handoff_event.execution_id = result.execution_id;
+      handoff_event.timestamp_ns = clock_.now();
+      handoff_event.details = std::move(handoff_details);
+      emit_event(std::move(handoff_event));
+      addressed_owner_handoff = true;
+      lock.unlock();
+      event_scope.flush();
+    } else {
+      // Authority first. Any event/status publication below is evidence of a
+      // stop request that has already been latched, never a predictor of one.
+      interrupt = publish_runtime_collision_fault_interrupt(check, authority_details);
+      lock.unlock();
+      event_scope.flush();
+    }
   }
 
-  result.stop_authority_signalled = !interrupt.rejected;
-  result.authority_rejected = interrupt.rejected;
-  result.authority_rejection_reason = interrupt.reason;
+  if (addressed_owner_handoff) {
+    // Retain the inner collision latch as a fail-closed fallback when no
+    // addressed subscriber accepts the handoff. When an addressed Stop has
+    // already moved the inner engine out of an interruptible phase, this is
+    // rejected without replacing that owner's terminal authority.
+    interrupt = publish_runtime_collision_fault_interrupt(check, authority_details);
+  }
+
+  result.stop_authority_signalled = addressed_owner_handoff || !interrupt.rejected;
+  result.authority_rejected = !addressed_owner_handoff && interrupt.rejected;
+  result.authority_rejection_reason =
+      result.authority_rejected ? interrupt.reason : std::string{};
   return RuntimeCollisionLookaheadAuthorityDisposition::kAccepted;
 }
 
