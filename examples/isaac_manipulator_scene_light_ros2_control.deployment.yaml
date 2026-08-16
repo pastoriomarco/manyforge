@@ -1092,7 +1092,7 @@
     ]
   },
   "deployment_artifact_id": "isaac_manipulator_scene_light_ros2_control",
-  "deployment_revision": "sha256:8fdaf2837ae0e479ba49640832b30fd86b5c7359414fb53706b3cd0b34f40538",
+  "deployment_revision": "sha256:0be60551300c00c8ba537c97698ff414176abee01ed3a4406befd049d156933b",
   "description": "Retained Isaac UR10e light-scene pick-and-place deployment using the separately retained ROS 2 control execution product, commanded state authority, and Robotiq bridge profile.",
   "desired_control_configurations": [
     {
@@ -1964,7 +1964,7 @@
           "runtime_collision_lookahead_query_budget_ms": 75,
           "runtime_collision_lookahead_s": 2,
           "runtime_collision_lookahead_workers": 4,
-          "runtime_dynamic_body_max_age_cap_ms": 750,
+          "runtime_dynamic_body_max_age_cap_ms": 1000,
           "validation_collision_workers": 4
         },
         "dependency_runtime_unit_ids": [],

@@ -1092,7 +1092,7 @@
     ]
   },
   "deployment_artifact_id": "isaac_manipulator_scene_light_ros2_control_collision",
-  "deployment_revision": "sha256:68c5c00f12cd9f8c4ec3fa873665ee62846da1e9411ab015badaed626cce66b4",
+  "deployment_revision": "sha256:300e8732fb0ec215f6af1db951cbdcb3cade5b2dde7adaa830662d96d9e12e78",
   "description": "Retained Isaac UR10e light-scene collision scenario using commanded ROS 2 control execution, the authoritative runtime collision projection, and Kernel-owned Stop evidence.",
   "desired_control_configurations": [
     {
@@ -1964,7 +1964,7 @@
           "runtime_collision_lookahead_query_budget_ms": 75,
           "runtime_collision_lookahead_s": 2,
           "runtime_collision_lookahead_workers": 4,
-          "runtime_dynamic_body_max_age_cap_ms": 750,
+          "runtime_dynamic_body_max_age_cap_ms": 1000,
           "validation_collision_workers": 4
         },
         "dependency_runtime_unit_ids": [],

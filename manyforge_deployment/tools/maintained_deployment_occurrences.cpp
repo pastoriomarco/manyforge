@@ -2108,7 +2108,7 @@ void verify_scenarios(const std::filesystem::path &root,
           "runtime_collision_lookahead_workers", core::JsonValueDTO{4.0});
       expected_runtime_configuration.emplace(
           "runtime_dynamic_body_max_age_cap_ms",
-          core::JsonValueDTO{750.0});
+          core::JsonValueDTO{1000.0});
       expected_runtime_configuration.emplace(
           "validation_collision_workers", core::JsonValueDTO{4.0});
     }

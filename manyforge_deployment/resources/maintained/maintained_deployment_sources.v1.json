@@ -385,7 +385,7 @@
         "runtime_collision_lookahead_query_budget_ms": 75.0,
         "runtime_collision_lookahead_s": 2.0,
         "runtime_collision_lookahead_workers": 4,
-        "runtime_dynamic_body_max_age_cap_ms": 750.0,
+        "runtime_dynamic_body_max_age_cap_ms": 1000.0,
         "validation_collision_workers": 4
       },
       "stop_profiles": {

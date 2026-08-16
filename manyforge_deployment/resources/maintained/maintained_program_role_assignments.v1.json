@@ -84,7 +84,7 @@
         "tool": "isaac_ur10e_light_robot"
       },
       "deployment_artifact_id": "isaac_manipulator_scene_light_ros2_control",
-      "deployment_revision": "sha256:8fdaf2837ae0e479ba49640832b30fd86b5c7359414fb53706b3cd0b34f40538",
+      "deployment_revision": "sha256:0be60551300c00c8ba537c97698ff414176abee01ed3a4406befd049d156933b",
       "deployment_source": "examples/isaac_manipulator_scene_light_ros2_control.deployment.yaml",
       "program_id": "isaac_manipulator_scene_light",
       "program_revision": "sha256:85e8b2bae0a338e652e6b59c408a55511bb4162d0a82020ccf75b8187cef21af",
@@ -110,7 +110,7 @@
         "tool": "isaac_ur10e_collision_robot"
       },
       "deployment_artifact_id": "isaac_manipulator_scene_light_ros2_control_collision",
-      "deployment_revision": "sha256:68c5c00f12cd9f8c4ec3fa873665ee62846da1e9411ab015badaed626cce66b4",
+      "deployment_revision": "sha256:300e8732fb0ec215f6af1db951cbdcb3cade5b2dde7adaa830662d96d9e12e78",
       "deployment_source": "examples/isaac_manipulator_scene_light_ros2_control_collision.deployment.yaml",
       "program_id": "isaac_manipulator_scene_light_collision",
       "program_revision": "sha256:47eae98a1a3c12c1d4567a9e264ef8198331b9169861a18b5a20ddee30a061e3",

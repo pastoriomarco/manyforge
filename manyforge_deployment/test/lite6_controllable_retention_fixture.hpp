@@ -187,7 +187,7 @@ provider_contract_role_id(const CanonicalValue &declaration) {
       {"runtime_collision_lookahead_s", CanonicalValue(2.0)},
       {"runtime_collision_lookahead_max_samples", CanonicalValue(32.0)},
       {"runtime_collision_lookahead_workers", CanonicalValue(4.0)},
-      {"runtime_dynamic_body_max_age_cap_ms", CanonicalValue(750.0)},
+      {"runtime_dynamic_body_max_age_cap_ms", CanonicalValue(1000.0)},
       {"validation_collision_workers", CanonicalValue(4.0)},
   });
 }
