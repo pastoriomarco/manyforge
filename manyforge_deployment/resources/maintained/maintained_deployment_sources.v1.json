@@ -215,12 +215,20 @@
         "validation_collision_workers": "orchestrator.config.validation_collision_workers"
       },
       "ros2_control_runtime": {
-        "collision_monitor_period_ms": 50.0,
+        "collision_monitor_period_ms": 100.0,
         "execution_tick_hz": 100,
         "initial_joint_positions_rad": [2.63422544, -0.875980752, 1.551074106, -2.29231544, -1.560498884, -2.038544566],
         "isaac_profile": "ur10e",
         "mode": "commanded_sim",
-        "planner_rng_seed": 12345
+        "planner_rng_seed": 12345,
+        "runtime_collision_immediate_query_budget_ms": 75.0,
+        "runtime_collision_lookahead_cycle_budget_ms": 350.0,
+        "runtime_collision_lookahead_max_samples": 32,
+        "runtime_collision_lookahead_query_budget_ms": 75.0,
+        "runtime_collision_lookahead_s": 2.0,
+        "runtime_collision_lookahead_workers": 4,
+        "runtime_dynamic_body_max_age_cap_ms": 1000.0,
+        "validation_collision_workers": 4
       },
       "stop_profiles": {
         "default_fault_stop_profile": {

@@ -1243,7 +1243,7 @@
     ]
   },
   "deployment_artifact_id": "isaac_manipulator_scene_light_assistant",
-  "deployment_revision": "sha256:643250ad697c963d6d1a69aaac18c0d02931106acfb2f6e337b50a36a31901e8",
+  "deployment_revision": "sha256:1774adbd9da8e74a8c1a342ec33f9036d1a83bf27d9de63a343e4e5c329758d6",
   "description": "Retained Isaac UR10e light-scene deployment with the ROS 2 control execution product and the finite assistant scene-authoring overlay; simulator mutation remains operator-approved.",
   "desired_control_configurations": [
     {
@@ -2116,7 +2116,7 @@
     "runtime_units": [
       {
         "configuration": {
-          "collision_monitor_period_ms": 50,
+          "collision_monitor_period_ms": 100,
           "execution_tick_hz": 100,
           "initial_joint_positions_rad": [
             2.63422544,
@@ -2128,7 +2128,15 @@
           ],
           "isaac_profile": "ur10e",
           "mode": "commanded_sim",
-          "planner_rng_seed": 12345
+          "planner_rng_seed": 12345,
+          "runtime_collision_immediate_query_budget_ms": 75,
+          "runtime_collision_lookahead_cycle_budget_ms": 350,
+          "runtime_collision_lookahead_max_samples": 32,
+          "runtime_collision_lookahead_query_budget_ms": 75,
+          "runtime_collision_lookahead_s": 2,
+          "runtime_collision_lookahead_workers": 4,
+          "runtime_dynamic_body_max_age_cap_ms": 1000,
+          "validation_collision_workers": 4
         },
         "dependency_runtime_unit_ids": [],
         "runtime_profile_id": "manyforge.ros2_control_execution_runtime",

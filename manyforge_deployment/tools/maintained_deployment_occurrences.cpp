@@ -2069,6 +2069,9 @@ void verify_scenarios(const std::filesystem::path &root,
     const bool mesh_heavy_isaac_runtime =
         scenario.source == std::string_view(
                                "examples/isaac_manipulator_scene_light_"
+                               "assistant.deployment.yaml") ||
+        scenario.source == std::string_view(
+                               "examples/isaac_manipulator_scene_light_"
                                "ros2_control.deployment.yaml") ||
         scenario.source == std::string_view(
                                "examples/isaac_manipulator_scene_light_"
