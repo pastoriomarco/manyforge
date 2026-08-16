@@ -623,6 +623,73 @@ TEST(RetainedRos2ControlBackendFactoryTest,
 }
 
 TEST(RetainedRos2ControlBackendFactoryTest,
+     AdmissionOwnerTimestampsJoinAfterConcurrentBindingRefresh) {
+  const auto runtime = isaac_runtime_configuration("lite6");
+  auto selected = make_retained_isaac_ros2_control_backend_config(
+      runtime, commanded_binding(), commanded_gripper_binding());
+  ASSERT_TRUE(selected.execution.controller_binding.has_value());
+  const auto binding_contract = *selected.execution.controller_binding;
+
+  core::FakeClock clock;
+  clock.set(1'000);
+  core::ManualScheduler scheduler;
+  auto sink = std::make_shared<NullExecutionStateSink>();
+  auto backend =
+      std::make_shared<ros2_control_execution::Ros2ControlExecutionBackend>(
+          ros2_control_execution::Ros2ControlExecutionBackend::
+              TestingNoRosStartupTag{},
+          sink, "arm", clock, scheduler, std::move(selected.execution));
+  auto handle = std::make_shared<RetainedRos2ControlRuntimeHandle>();
+  ASSERT_TRUE(
+      handle->BindBackend(backend, commanded_binding(), std::nullopt).ok());
+
+  const auto component = active_component_snapshot();
+  std::atomic<bool> refreshed{false};
+  auto owner = RetainedRos2ControlAdmissionOwner::Create(
+      RetainedRos2ControlAdmissionOwnerConfig{
+          core::ControllableComponentId("robot_1"),
+          core::RuntimeEpoch("runtime-epoch.1"), binding_contract.generation_id,
+          "provider-epoch.1", "cell-supervisor-epoch.1", 500'000'000,
+          1'000'000'000},
+      handle, clock, [&] {
+        if (!refreshed.exchange(true, std::memory_order_acq_rel)) {
+          // Reproduce the live interleaving: the controller monitor publishes
+          // while the admission owner is inside its durable lifecycle read.
+          clock.set(2'000);
+          ros2_control_execution::ControllerBindingSnapshot ready;
+          ready.activity_generation = 1U;
+          ready.contract_generation_id = binding_contract.generation_id;
+          ready.observed_timestamp_ns = clock.now();
+          ready.received_timestamp_ns = clock.now();
+          ready.fresh_until_ns = clock.now() + 2'000'000'000;
+          ready.valid = true;
+          backend->testing_publish_controller_binding_snapshot(
+              std::move(ready));
+        }
+        return core::Result<core::ComponentLifecycleCurrentSnapshotDTO>::Ok(
+            component);
+      });
+  ASSERT_TRUE(owner.ok()) << owner.error().message;
+
+  const auto publication_deadline =
+      std::chrono::steady_clock::now() + std::chrono::seconds(2);
+  while (owner.value()->status().publication_generation == 0U &&
+         std::chrono::steady_clock::now() < publication_deadline) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+  }
+  const auto status = owner.value()->status();
+  ASSERT_EQ(status.publication_generation, 1U);
+  ASSERT_TRUE(status.healthy) << status.reason_code;
+
+  const auto admission = backend->execution_admission_snapshot();
+  ASSERT_TRUE(admission.has_value());
+  EXPECT_EQ(admission->observed_timestamp_ns, 2'000);
+  EXPECT_TRUE(admission->controller_ready);
+  EXPECT_TRUE(admission->motion_admitted);
+  EXPECT_TRUE(admission->reason_codes.empty());
+}
+
+TEST(RetainedRos2ControlBackendFactoryTest,
      AdmissionOwnerDefersTransientBindingLeaseEdgesAndClosesOnPersistence) {
   const auto runtime = isaac_runtime_configuration("lite6");
   auto selected = make_retained_isaac_ros2_control_backend_config(

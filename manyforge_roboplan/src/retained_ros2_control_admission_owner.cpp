@@ -134,13 +134,6 @@ void RetainedRos2ControlAdmissionOwner::Run(
   }
   try {
     while (!stop_token.stop_requested()) {
-      const auto now = clock_.now();
-      if (now <= 0 ||
-          now > std::numeric_limits<core::TimePoint>::max() -
-                    config_.freshness_ns) {
-        throw std::runtime_error("ROS admission clock is outside its bound");
-      }
-
       std::optional<core::ComponentLifecycleCurrentSnapshotDTO> component;
       bool defer_component_readback_gap = false;
       try {
@@ -166,6 +159,16 @@ void RetainedRos2ControlAdmissionOwner::Run(
         defer_component_readback_gap = true;
       }
       const auto binding = runtime_handle_->controller_binding_snapshot();
+      // Timestamp the joined observation after both source reads. The durable
+      // component readback can be slower than a controller-monitor refresh;
+      // sampling time before that read would make a newly published binding
+      // appear to come from the future and falsely revoke admission.
+      const auto now = clock_.now();
+      if (now <= 0 ||
+          now > std::numeric_limits<core::TimePoint>::max() -
+                    config_.freshness_ns) {
+        throw std::runtime_error("ROS admission clock is outside its bound");
+      }
       bool controller_ready = false;
       bool defer_binding_lease_expiration = false;
       std::vector<std::string> reasons;
