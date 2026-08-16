@@ -245,7 +245,7 @@ _EXPECTED_RUNTIME_RESTORATION_PROFILE_DIGESTS: Final = {
         "35e27129b5cf16c680c8722c93524d9d83d8b9ec0b8a9baf5735df5449e1a611"
     ),
     "ur10e_robotiq_assistant_isaac_commanded_v0": (
-        "c038b1e278a0c0957e48c91c74c544eec860aaec8dca8cff3af5f469b0baf9de"
+        "c334ba022f55d83199ef995747d778016d498753cbf28dec99d22bc9de6f7330"
     ),
     "ur10e_robotiq_assistant_native_simulated_v0": (
         "61ec7a2ea3346234e83d457a1ba24833d729de141750c15214c4997657842f69"

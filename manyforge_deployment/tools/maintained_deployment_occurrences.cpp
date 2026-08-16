@@ -2076,6 +2076,10 @@ void verify_scenarios(const std::filesystem::path &root,
         scenario.source == std::string_view(
                                "examples/isaac_manipulator_scene_light_"
                                "ros2_control_collision.deployment.yaml");
+    const bool assistant_isaac_runtime =
+        scenario.source == std::string_view(
+                               "examples/isaac_manipulator_scene_light_"
+                               "assistant.deployment.yaml");
     core::JsonObjectDTO expected_runtime_configuration{
         {"collision_monitor_period_ms",
          core::JsonValueDTO{mesh_heavy_isaac_runtime ? 100.0 : 50.0}},
@@ -2111,7 +2115,7 @@ void verify_scenarios(const std::filesystem::path &root,
           "runtime_collision_lookahead_workers", core::JsonValueDTO{4.0});
       expected_runtime_configuration.emplace(
           "runtime_dynamic_body_max_age_cap_ms",
-          core::JsonValueDTO{1000.0});
+          core::JsonValueDTO{assistant_isaac_runtime ? 1500.0 : 1000.0});
       expected_runtime_configuration.emplace(
           "validation_collision_workers", core::JsonValueDTO{4.0});
     }

@@ -58,7 +58,7 @@
         "tool": "isaac_ur10e_assistant_robot"
       },
       "deployment_artifact_id": "isaac_manipulator_scene_light_assistant",
-      "deployment_revision": "sha256:1774adbd9da8e74a8c1a342ec33f9036d1a83bf27d9de63a343e4e5c329758d6",
+      "deployment_revision": "sha256:b2ef2e720200323960e475d9ef9616f2aede460a1930d39d07083c8b60121776",
       "deployment_source": "examples/isaac_manipulator_scene_light_assistant.deployment.yaml",
       "program_id": "isaac_manipulator_scene_light",
       "program_revision": "sha256:65d15a2be5027c80eb82f02a6cb57805458c7c480e9d9ad38b98fe1a0ec4211e",
