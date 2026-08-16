@@ -45,12 +45,10 @@ def base_observations(live: ModuleType, scenario):
     scene_before = {
         "schema_version": "manyforge.scene_projection.v1",
         "projection_generation": 3,
-        "projection_owner_epoch": "headless.epoch.1",
     }
     scene_after = {
         "schema_version": "manyforge.scene_projection.v1",
         "projection_generation": 5,
-        "projection_owner_epoch": "headless.epoch.1",
         "logical_scene": {
             "source_owner_id": f"logical-scene.{scenario.cell_id}",
             "source_owner_epoch": "logical.epoch.1",

@@ -2319,8 +2319,6 @@ def _logical_viewer_owner_exact(
         and runtime_section.get("source_owner_id")
         == f"scene-runtime.{spec.cell_id}"
         and isinstance(runtime_section.get("source_owner_epoch"), str)
-        and scene.get("projection_owner_epoch")
-        == runtime.get("projection_owner_epoch")
         and logical.get("projection_generation") == scene_generation
         and runtime_section.get("projection_generation") == scene_generation
         # Runtime and scene are separate HTTP snapshots.  A fresh pose update
