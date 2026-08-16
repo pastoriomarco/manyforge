@@ -177,6 +177,18 @@ commanded_gripper_binding(std::string component_id = "robot_1") {
   return std::move(sealed.value());
 }
 
+[[nodiscard]]
+deployment::ros2_control_execution_runtime_contract::Configuration
+isaac_runtime_configuration(std::string profile) {
+  deployment::ros2_control_execution_runtime_contract::Configuration result;
+  result.isaac_profile = std::move(profile);
+  result.planner_rng_seed = 12345U;
+  result.initial_joint_positions_rad = {0.0};
+  result.execution_tick_hz = 100U;
+  result.collision_monitor_period_ms = 50.0;
+  return result;
+}
+
 [[nodiscard]] core::ProviderManifestDTO ros_lifecycle_manifest() {
   const auto plans = retained_ros2_control_lifecycle_plans();
   const core::ProviderManifestId manifest_id{
@@ -229,8 +241,7 @@ TEST(RetainedRos2ControlBackendFactoryTest,
 
 TEST(RetainedRos2ControlBackendFactoryTest,
      RetainedIsaacProfileExpandsToExactControllerAndGripperContract) {
-  deployment::ros2_control_execution_runtime_contract::Configuration runtime{
-      "lite6", 12345U, {0.0}, 100U, 50.0};
+  const auto runtime = isaac_runtime_configuration("lite6");
 
   const auto selected = make_retained_isaac_ros2_control_backend_config(
       runtime, commanded_binding(), commanded_gripper_binding());
@@ -288,8 +299,7 @@ TEST(RetainedRos2ControlBackendFactoryTest,
 
 TEST(RetainedRos2ControlBackendFactoryTest,
      SameTypeIsaacInstancesHaveDisjointControlPlaneEndpoints) {
-  deployment::ros2_control_execution_runtime_contract::Configuration runtime{
-      "ur10e", 12345U, {0.0}, 100U, 50.0};
+  const auto runtime = isaac_runtime_configuration("ur10e");
 
   const auto first = make_retained_isaac_ros2_control_backend_config(
       runtime, commanded_binding("robot_a"),
@@ -337,8 +347,7 @@ TEST(RetainedRos2ControlBackendFactoryTest,
 
 TEST(RetainedRos2ControlBackendFactoryTest,
      RetainedIsaacNamespaceRejectsLossyOrCrossedComponentIdentity) {
-  deployment::ros2_control_execution_runtime_contract::Configuration runtime{
-      "ur10e", 12345U, {0.0}, 100U, 50.0};
+  const auto runtime = isaac_runtime_configuration("ur10e");
 
   EXPECT_THROW(
       static_cast<void>(make_retained_isaac_ros2_control_backend_config(
@@ -479,8 +488,7 @@ TEST(RetainedRos2ControlBackendFactoryTest,
 
 TEST(RetainedRos2ControlBackendFactoryTest,
      AdmissionOwnerFailsClosedWhenLifecycleReadbackIsUnavailable) {
-  deployment::ros2_control_execution_runtime_contract::Configuration runtime{
-      "lite6", 12345U, {0.0}, 100U, 50.0};
+  const auto runtime = isaac_runtime_configuration("lite6");
   auto selected = make_retained_isaac_ros2_control_backend_config(
       runtime, commanded_binding(), commanded_gripper_binding());
   ASSERT_TRUE(selected.execution.controller_binding.has_value());
@@ -557,8 +565,7 @@ TEST(RetainedRos2ControlBackendFactoryTest,
 
 TEST(RetainedRos2ControlBackendFactoryTest,
      AdmissionOwnerDoesNotPublishOneIsolatedBindingLeaseEdge) {
-  deployment::ros2_control_execution_runtime_contract::Configuration runtime{
-      "lite6", 12345U, {0.0}, 100U, 50.0};
+  const auto runtime = isaac_runtime_configuration("lite6");
   auto selected = make_retained_isaac_ros2_control_backend_config(
       runtime, commanded_binding(), commanded_gripper_binding());
   ASSERT_TRUE(selected.execution.controller_binding.has_value());
@@ -604,10 +611,11 @@ TEST(RetainedRos2ControlBackendFactoryTest,
       });
   ASSERT_TRUE(owner.ok()) << owner.error().message;
 
-  const auto initial_deadline = std::chrono::steady_clock::now() + 2s;
+  const auto initial_deadline =
+      std::chrono::steady_clock::now() + std::chrono::seconds(2);
   while (owner.value()->status().publication_generation == 0U &&
          std::chrono::steady_clock::now() < initial_deadline) {
-    std::this_thread::sleep_for(1ms);
+    std::this_thread::sleep_for(std::chrono::milliseconds(1));
   }
   const auto initial_status = owner.value()->status();
   ASSERT_GT(initial_status.publication_generation, 0U);
@@ -616,11 +624,12 @@ TEST(RetainedRos2ControlBackendFactoryTest,
   ASSERT_TRUE(initial_admission->controller_ready);
 
   clock.set(100'001'001);
-  const auto deferred_deadline = std::chrono::steady_clock::now() + 2s;
+  const auto deferred_deadline =
+      std::chrono::steady_clock::now() + std::chrono::seconds(2);
   while (owner.value()->status().binding_lease_expirations_deferred_total ==
              0U &&
          std::chrono::steady_clock::now() < deferred_deadline) {
-    std::this_thread::sleep_for(1ms);
+    std::this_thread::sleep_for(std::chrono::milliseconds(1));
   }
   const auto deferred_status = owner.value()->status();
   ASSERT_EQ(deferred_status.binding_lease_expirations_deferred_total, 1U);
@@ -633,11 +642,12 @@ TEST(RetainedRos2ControlBackendFactoryTest,
             initial_admission->lifecycle_generation);
 
   publish_ready_binding();
-  const auto recovery_deadline = std::chrono::steady_clock::now() + 2s;
+  const auto recovery_deadline =
+      std::chrono::steady_clock::now() + std::chrono::seconds(2);
   while (owner.value()->status().publication_generation <=
              initial_status.publication_generation &&
          std::chrono::steady_clock::now() < recovery_deadline) {
-    std::this_thread::sleep_for(1ms);
+    std::this_thread::sleep_for(std::chrono::milliseconds(1));
   }
   const auto recovered_status = owner.value()->status();
   ASSERT_GT(recovered_status.publication_generation,
