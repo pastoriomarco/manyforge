@@ -353,8 +353,13 @@ def test_retained_site_configs_preserve_historical_pose_source_contracts() -> No
             0.0,
             0.2,
         )
+        assert ur_config.simulation_entities[0].lifetime_ns == 1_000_000_000
         assert ur_config.simulation_entities[1].eligible is True
-        assert ur_config.simulation_entities[1].lifetime_ns == 1_000_000_000
+        # The movable scene object crosses the Manager-owned observer and
+        # scene-commit path. Keep its freshness lease bounded to eight polls so
+        # one transient serialized delivery cycle cannot make a current sample
+        # stale while motion is being validated.
+        assert ur_config.simulation_entities[1].lifetime_ns == 2_000_000_000
         assert [
             (
                 binding.request.source_header_frame_id,

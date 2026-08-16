@@ -35,7 +35,7 @@
       "eligible": true,
       "entity": "/mac_n_cheese_centered",
       "frame_kind": "cell_frame",
-      "lifetime_ns": 1000000000,
+      "lifetime_ns": 2000000000,
       "local_orientation_xyzw": [0, 0, 0, 1],
       "local_position_xyz": [0, 0, 0],
       "object_id": "isaac_cheese_box",
