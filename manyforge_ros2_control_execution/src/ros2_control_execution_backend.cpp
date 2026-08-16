@@ -1546,13 +1546,13 @@ void Ros2ControlExecutionBackend::on_controller_manager_activity(
 void Ros2ControlExecutionBackend::controller_binding_monitor_worker(
     std::stop_token stop_token) {
   const auto &contract = *config_.controller_binding;
-  // Each refresh performs two sequential, independently bounded controller
-  // manager service reads. Start at one quarter of the retained snapshot age
-  // so their combined timeout and scheduler jitter cannot consume the entire
-  // lease before the next publication. Controller-manager activity still
-  // invalidates the current snapshot immediately.
+  // Start well inside the retained snapshot age and issue both independent
+  // controller-manager reads together. Their replies share one steady-clock
+  // deadline below, so a slow read cannot consume a second full timeout and
+  // move the next valid publication across the lease edge. Controller-manager
+  // activity still invalidates the current snapshot immediately.
   const auto refresh_period = std::chrono::nanoseconds(
-      std::max<std::int64_t>(1, contract.snapshot_max_age_ns / 4));
+      std::max<std::int64_t>(1, contract.snapshot_max_age_ns / 8));
   const auto service_timeout =
       std::chrono::duration_cast<std::chrono::nanoseconds>(
           std::chrono::duration<double>(
@@ -1623,17 +1623,22 @@ void Ros2ControlExecutionBackend::controller_binding_monitor_worker(
     auto controllers_future = list_controllers_client_->async_send_request(
         std::make_shared<
             controller_manager_msgs::srv::ListControllers::Request>());
-    if (controllers_future.wait_for(service_timeout) !=
-        std::future_status::ready) {
-      static_cast<void>(
-          list_controllers_client_->remove_pending_request(controllers_future));
-      fail_refresh("controller_list_service_timeout");
-      continue;
-    }
     auto hardware_future = list_hardware_components_client_->async_send_request(
         std::make_shared<
             controller_manager_msgs::srv::ListHardwareComponents::Request>());
-    if (hardware_future.wait_for(service_timeout) !=
+    const auto response_deadline =
+        std::chrono::steady_clock::now() + service_timeout;
+    if (controllers_future.wait_until(response_deadline) !=
+        std::future_status::ready) {
+      static_cast<void>(
+          list_controllers_client_->remove_pending_request(controllers_future));
+      static_cast<void>(
+          list_hardware_components_client_->remove_pending_request(
+              hardware_future));
+      fail_refresh("controller_list_service_timeout");
+      continue;
+    }
+    if (hardware_future.wait_until(response_deadline) !=
         std::future_status::ready) {
       static_cast<void>(
           list_hardware_components_client_->remove_pending_request(

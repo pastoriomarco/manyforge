@@ -378,6 +378,69 @@ def test_live_row_primes_object_motion_only_after_program_run_initializes_scene(
     )
 
 
+def test_graph_probe_converges_with_one_participant(
+    live: ModuleType, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    scenario = live.SCENARIO_BY_ID["isaac-ur10e-light-scene"]
+    calls: list[str] = []
+
+    class FakeNode:
+        def __init__(self, name: str) -> None:
+            calls.append(f"node:{name}")
+
+        def destroy_node(self) -> None:
+            calls.append("destroy")
+
+        def get_node_names_and_namespaces(self):
+            return [
+                ("controller_manager", f"/manyforge/{scenario.component_id}"),
+                ("ros_bridge", "/"),
+            ]
+
+        def get_topic_names_and_types(self):
+            return [
+                (topic, [live.TOPIC_TYPE_BY_NAME[topic]])
+                for topic in scenario.required_topics
+            ]
+
+        def get_subscriptions_info_by_topic(self, topic: str):
+            assert topic == "/isaac_joint_commands"
+            return [object()]
+
+    fake_rclpy = ModuleType("rclpy")
+    fake_rclpy.init = lambda *, args: calls.append(f"init:{args}")
+    fake_rclpy.spin_once = (
+        lambda node, *, timeout_sec: calls.append(f"spin:{timeout_sec}")
+    )
+    fake_rclpy.ok = lambda: True
+    fake_rclpy.shutdown = lambda: calls.append("shutdown")
+    fake_node_module = ModuleType("rclpy.node")
+    fake_node_module.Node = FakeNode
+    monkeypatch.setitem(sys.modules, "rclpy", fake_rclpy)
+    monkeypatch.setitem(sys.modules, "rclpy.node", fake_node_module)
+
+    nodes, command_info, topic_types = live._read_ros_graph(  # noqa: SLF001
+        scenario, timeout_s=0.1
+    )
+
+    assert calls.count("destroy") == 1
+    assert calls.count("shutdown") == 1
+    assert sum(call.startswith("node:") for call in calls) == 1
+    assert (
+        f"/manyforge/{scenario.component_id}/controller_manager\n"
+        in nodes["output"]
+    )
+    assert "/ros_bridge\n" in nodes["output"]
+    assert command_info["output"] == "Subscription count: 1\n"
+    assert topic_types == {
+        topic: {
+            "returncode": 0,
+            "type": live.TOPIC_TYPE_BY_NAME[topic],
+        }
+        for topic in scenario.required_topics
+    }
+
+
 @pytest.mark.parametrize(
     "retry_code", ("stale_revision", "scene_projection_changed")
 )

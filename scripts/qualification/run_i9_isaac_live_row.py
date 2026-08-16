@@ -1450,26 +1450,103 @@ def _extract_gripper_targets(program: Mapping[str, Any]) -> tuple[GripperTarget,
     return tuple(sorted(targets))
 
 
-def _read_topic_types(
-    spec: ScenarioSpec, *, environment: Mapping[str, str]
-) -> dict[str, dict[str, Any]]:
-    results: dict[str, dict[str, Any]] = {}
-    for topic in spec.required_topics:
-        observed = _run_bounded(
-            ["ros2", "topic", "type", topic],
-            environment=environment,
-            timeout_s=10.0,
-        )
-        lines = [
-            line.strip()
-            for line in observed["output"].splitlines()
-            if line.strip()
-        ]
-        results[topic] = {
-            "returncode": observed["returncode"],
-            "type": lines[0] if len(lines) == 1 else None,
+def _read_ros_graph(
+    spec: ScenarioSpec, *, timeout_s: float = 30.0
+) -> tuple[dict[str, Any], dict[str, Any], dict[str, dict[str, Any]]]:
+    """Read one converged graph without racing short-lived CLI participants."""
+    import rclpy
+    from rclpy.node import Node
+
+    def bounded_result(output: str) -> dict[str, Any]:
+        encoded = output.encode()
+        if len(encoded) > _MAX_COMMAND_BYTES:
+            raise LiveRowError("ROS graph observation exceeded its byte bound")
+        return {
+            "bytes": len(encoded),
+            "output": output,
+            "returncode": 0,
+            "sha256": _digest(encoded),
         }
-    return results
+
+    expected_namespace = f"/manyforge/{spec.component_id}"
+    other_namespaces = {
+        f"/manyforge/{candidate.component_id}"
+        for candidate in SCENARIO_BY_ID.values()
+        if candidate.component_id != spec.component_id
+    }
+    nodes: list[str] = []
+    topic_names_and_types: dict[str, list[str]] = {}
+    command_subscriptions = 0
+    deadline = time.monotonic() + timeout_s
+
+    rclpy.init(args=None)
+    node = Node(f"manyforge_i9_graph_probe_{os.getpid()}")
+    try:
+        while True:
+            remaining_s = deadline - time.monotonic()
+            if remaining_s <= 0.0:
+                break
+            rclpy.spin_once(node, timeout_sec=min(0.1, remaining_s))
+            nodes = sorted(
+                {
+                    (
+                        f"/{name.lstrip('/')}"
+                        if namespace in ("", "/")
+                        else f"/{namespace.strip('/')}/{name.lstrip('/')}"
+                    )
+                    for name, namespace in node.get_node_names_and_namespaces()
+                }
+            )
+            topic_names_and_types = {
+                topic: sorted(set(types))
+                for topic, types in node.get_topic_names_and_types()
+            }
+            command_subscriptions = len(
+                node.get_subscriptions_info_by_topic("/isaac_joint_commands")
+            )
+            topic_types_exact = all(
+                topic_names_and_types.get(topic)
+                == [TOPIC_TYPE_BY_NAME[topic]]
+                for topic in spec.required_topics
+            )
+            namespace_exact = any(
+                candidate == expected_namespace
+                or candidate.startswith(expected_namespace + "/")
+                for candidate in nodes
+            ) and not any(
+                candidate == other
+                or candidate.startswith(other + "/")
+                for candidate in nodes
+                for other in other_namespaces
+            )
+            if topic_types_exact and namespace_exact and command_subscriptions > 0:
+                break
+    finally:
+        node.destroy_node()
+        if rclpy.ok():
+            rclpy.shutdown()
+
+    node_output = "".join(f"{name}\n" for name in nodes)
+    command_output = f"Subscription count: {command_subscriptions}\n"
+    topic_types = {
+        topic: {
+            "returncode": int(
+                topic_names_and_types.get(topic)
+                != [TOPIC_TYPE_BY_NAME[topic]]
+            ),
+            "type": (
+                topic_names_and_types[topic][0]
+                if len(topic_names_and_types.get(topic, ())) == 1
+                else None
+            ),
+        }
+        for topic in spec.required_topics
+    }
+    return (
+        bounded_result(node_output),
+        bounded_result(command_output),
+        topic_types,
+    )
 
 
 def _section(scene: Mapping[str, Any], name: str) -> Mapping[str, Any] | None:
@@ -2568,15 +2645,7 @@ def run_live_row(config: LiveConfig) -> dict[str, Any]:
                 environment=environment,
                 processes=processes,
             )
-        nodes = _run_bounded(
-            ["ros2", "node", "list"], environment=environment, timeout_s=10.0
-        )
-        command_info = _run_bounded(
-            ["ros2", "topic", "info", "/isaac_joint_commands", "-v"],
-            environment=environment,
-            timeout_s=10.0,
-        )
-        topic_types = _read_topic_types(config.spec, environment=environment)
+        nodes, command_info, topic_types = _read_ros_graph(config.spec)
         before_control = _simulation_snapshot(config.spec)
         topic_names = {
             "/clock",
