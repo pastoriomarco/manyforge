@@ -623,7 +623,7 @@ TEST(RetainedRos2ControlBackendFactoryTest,
 }
 
 TEST(RetainedRos2ControlBackendFactoryTest,
-     AdmissionOwnerDoesNotPublishOneIsolatedBindingLeaseEdge) {
+     AdmissionOwnerDefersTransientBindingLeaseEdgesAndClosesOnPersistence) {
   const auto runtime = isaac_runtime_configuration("lite6");
   auto selected = make_retained_isaac_ros2_control_backend_config(
       runtime, commanded_binding(), commanded_gripper_binding());
@@ -718,6 +718,27 @@ TEST(RetainedRos2ControlBackendFactoryTest,
   EXPECT_TRUE(recovered_admission->controller_ready);
   EXPECT_EQ(recovered_admission->lifecycle_generation,
             initial_admission->lifecycle_generation);
+
+  clock.set(200'001'002);
+  const auto persistent_deadline =
+      std::chrono::steady_clock::now() + std::chrono::seconds(2);
+  while (owner.value()->status().publication_generation <=
+             recovered_status.publication_generation &&
+         std::chrono::steady_clock::now() < persistent_deadline) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+  }
+  const auto persistent_status = owner.value()->status();
+  ASSERT_GT(persistent_status.publication_generation,
+            recovered_status.publication_generation);
+  EXPECT_EQ(persistent_status.binding_lease_expirations_deferred_total, 6U);
+  const auto closed_admission = backend->execution_admission_snapshot();
+  ASSERT_TRUE(closed_admission.has_value());
+  EXPECT_FALSE(closed_admission->controller_ready);
+  EXPECT_FALSE(closed_admission->motion_admitted);
+  EXPECT_EQ(closed_admission->reason_codes,
+            (std::vector<std::string>{
+                "component_lifecycle_snapshot_unavailable",
+                "controller_binding_stale"}));
 }
 
 TEST(RetainedRos2ControlBackendFactoryTest,

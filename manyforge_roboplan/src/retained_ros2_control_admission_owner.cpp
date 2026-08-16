@@ -108,10 +108,19 @@ void RetainedRos2ControlAdmissionOwner::Run(
     const std::stop_token stop_token) noexcept {
   std::uint64_t publication_generation = 0U;
   std::uint64_t lifecycle_generation = 0U;
-  bool binding_lease_expiration_deferred = false;
+  std::uint64_t consecutive_binding_lease_expirations = 0U;
   bool component_readback_gap_deferred = false;
   bool exact_component_readback_observed = false;
   std::string previous_semantics;
+  // Bound the projection hold by the admission snapshot lease.
+  // The backend independently checks the controller-binding lease at dispatch
+  // and every active-goal tick, so this only prevents a slower join from
+  // publishing a stale semantic transition just before a successful refresh.
+  const auto admission_lease_periods =
+      config_.freshness_ns / config_.publication_period_ns;
+  const auto binding_lease_expiration_deferral_limit =
+      static_cast<std::uint64_t>(
+          std::max<core::Duration>(1, admission_lease_periods));
   const auto wait_for_next_observation = [this, &stop_token]() {
     std::unique_lock wait_lock(wakeup_mutex_);
     wakeup_.wait_for(wait_lock, stop_token,
@@ -161,33 +170,35 @@ void RetainedRos2ControlAdmissionOwner::Run(
       bool defer_binding_lease_expiration = false;
       std::vector<std::string> reasons;
       if (!binding.has_value()) {
-        binding_lease_expiration_deferred = false;
+        consecutive_binding_lease_expirations = 0U;
         reasons.emplace_back("controller_binding_unavailable");
       } else if (binding->contract_generation_id !=
                  config_.binding_contract_generation_id) {
-        binding_lease_expiration_deferred = false;
+        consecutive_binding_lease_expirations = 0U;
         reasons.emplace_back("controller_binding_contract_mismatch");
       } else if (binding->received_timestamp_ns > now) {
-        binding_lease_expiration_deferred = false;
+        consecutive_binding_lease_expirations = 0U;
         reasons.emplace_back("controller_binding_stale");
       } else if (!binding->valid) {
-        binding_lease_expiration_deferred = false;
+        consecutive_binding_lease_expirations = 0U;
         reasons.emplace_back("controller_binding_invalid");
       } else if (binding->fresh_until_ns <= now) {
         // The backend checks this same lease directly at dispatch and every
-        // active-goal tick. Do not let one sub-period expiry observed only by
-        // this slower lifecycle join publish a false semantic transition
-        // after the backend has already refreshed. A second consecutive join
-        // observation still publishes stale, while activity/invalid binding
-        // evidence above remains immediate and fail-closed.
-        if (!binding_lease_expiration_deferred) {
-          binding_lease_expiration_deferred = true;
+        // active-goal tick. Do not let a bounded sub-lease expiry observed only
+        // by this slower lifecycle join publish a false semantic transition
+        // immediately before the asynchronous refresh completes. The hold is
+        // bounded by this owner's existing admission lease; its expiry and
+        // the backend's direct binding check still close a persistent gap,
+        // while activity/invalid binding evidence above remains immediate.
+        if (consecutive_binding_lease_expirations <
+            binding_lease_expiration_deferral_limit) {
+          ++consecutive_binding_lease_expirations;
           defer_binding_lease_expiration = true;
         } else {
           reasons.emplace_back("controller_binding_stale");
         }
       } else {
-        binding_lease_expiration_deferred = false;
+        consecutive_binding_lease_expirations = 0U;
         controller_ready = true;
       }
 
