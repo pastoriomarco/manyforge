@@ -676,7 +676,7 @@ TEST(ClosedSchema, BuildRegistryQualifiesOnlyTheCompleteAdmittedFamilies) {
   EXPECT_EQ(qualified_count, 11U);
   EXPECT_EQ(registry.qualification_registry_digest().value(),
             "sha256:"
-            "65ee605872372888db7677aa168be992961e04b05c924ebe05f4283e3b0f8c74");
+            "50b5f0670b82edbc106cf413030af6481bb4390a7d8fee2dedfeb3686fd7adb5");
   EXPECT_NE(
       registry.find_qualified_value_schema(
           core::SchemaId("manyforge.value_schema.provider_contract.empty.v1"),

@@ -34,7 +34,7 @@
         "tool": "isaac_lite6_robot"
       },
       "deployment_artifact_id": "isaac_lite6_lite_gripper_pick_and_place",
-      "deployment_revision": "sha256:6514f1022c6862f2ddfc68a15060de3c0cea74de767e6cbc0b656d9346e16dac",
+      "deployment_revision": "sha256:d2b1aed89c301185699b577097ceb88a8c45baefbdd86b4b53e3e83665a7881f",
       "deployment_source": "examples/isaac_lite6_lite_gripper_pick_and_place.deployment.yaml",
       "program_id": "isaac_lite6_lite_gripper_pick_and_place",
       "program_revision": "sha256:5a633348aed818f5f2ce0b391c9de9ff58ff9614efe99b4d33ee66f5136533e5",
@@ -58,7 +58,7 @@
         "tool": "isaac_ur10e_assistant_robot"
       },
       "deployment_artifact_id": "isaac_manipulator_scene_light_assistant",
-      "deployment_revision": "sha256:03458895795033dbc4a2d4539d86bdd7d8364a462423899dff202e8b3df8eddb",
+      "deployment_revision": "sha256:643250ad697c963d6d1a69aaac18c0d02931106acfb2f6e337b50a36a31901e8",
       "deployment_source": "examples/isaac_manipulator_scene_light_assistant.deployment.yaml",
       "program_id": "isaac_manipulator_scene_light",
       "program_revision": "sha256:85e8b2bae0a338e652e6b59c408a55511bb4162d0a82020ccf75b8187cef21af",
@@ -84,7 +84,7 @@
         "tool": "isaac_ur10e_light_robot"
       },
       "deployment_artifact_id": "isaac_manipulator_scene_light_ros2_control",
-      "deployment_revision": "sha256:1e6535cb4e1226c8b2c509f5b1571286c4d06504dedba0dd8d0e9af04731a35f",
+      "deployment_revision": "sha256:8fdaf2837ae0e479ba49640832b30fd86b5c7359414fb53706b3cd0b34f40538",
       "deployment_source": "examples/isaac_manipulator_scene_light_ros2_control.deployment.yaml",
       "program_id": "isaac_manipulator_scene_light",
       "program_revision": "sha256:85e8b2bae0a338e652e6b59c408a55511bb4162d0a82020ccf75b8187cef21af",
@@ -110,7 +110,7 @@
         "tool": "isaac_ur10e_collision_robot"
       },
       "deployment_artifact_id": "isaac_manipulator_scene_light_ros2_control_collision",
-      "deployment_revision": "sha256:6f045026a3a90cf883e5038552983882de86ffaf8c2263239f3c6d68a537cde9",
+      "deployment_revision": "sha256:68c5c00f12cd9f8c4ec3fa873665ee62846da1e9411ab015badaed626cce66b4",
       "deployment_source": "examples/isaac_manipulator_scene_light_ros2_control_collision.deployment.yaml",
       "program_id": "isaac_manipulator_scene_light_collision",
       "program_revision": "sha256:47eae98a1a3c12c1d4567a9e264ef8198331b9169861a18b5a20ddee30a061e3",
@@ -257,7 +257,7 @@
         "tool": "isaac_lite6_trocar_robot"
       },
       "deployment_artifact_id": "trocar_lite6_foundationpose_pick",
-      "deployment_revision": "sha256:2ec0c46ccf8f1ae8a96991eff654a3fe56323b383887c8eacd06b941ca01d171",
+      "deployment_revision": "sha256:02f75eb13265d49dd01c9ef77e89129620b50a8f7c2a66a075cd8d57b281c9a3",
       "deployment_source": "examples/trocar_lite6_foundationpose_pick.deployment.yaml",
       "program_id": "trocar_lite6_foundationpose_pick",
       "program_revision": "sha256:ab14e1ad6d8917934f315e62ed56609530bfad4c170e2a98b526da7c5519f9f7",

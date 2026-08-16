@@ -2066,8 +2066,16 @@ void verify_scenarios(const std::filesystem::path &root,
                            core::JsonValueDTO{1.57},  core::JsonValueDTO{-1.57},
                            core::JsonValueDTO{-1.57}, core::JsonValueDTO{0.0}};
     }
+    const bool mesh_heavy_isaac_runtime =
+        scenario.source == std::string_view(
+                               "examples/isaac_manipulator_scene_light_"
+                               "ros2_control.deployment.yaml") ||
+        scenario.source == std::string_view(
+                               "examples/isaac_manipulator_scene_light_"
+                               "ros2_control_collision.deployment.yaml");
     core::JsonObjectDTO expected_runtime_configuration{
-        {"collision_monitor_period_ms", core::JsonValueDTO{50.0}},
+        {"collision_monitor_period_ms",
+         core::JsonValueDTO{mesh_heavy_isaac_runtime ? 100.0 : 50.0}},
         {"execution_tick_hz", core::JsonValueDTO{100.0}},
         {"initial_joint_positions_rad",
          core::JsonValueDTO{std::move(initial_positions)}},
@@ -2080,6 +2088,29 @@ void verify_scenarios(const std::filesystem::path &root,
       expected_runtime_configuration.emplace(
           "isaac_profile",
           core::JsonValueDTO{std::string(scenario.isaac_profile)});
+    }
+    if (mesh_heavy_isaac_runtime) {
+      expected_runtime_configuration.emplace(
+          "runtime_collision_immediate_query_budget_ms",
+          core::JsonValueDTO{75.0});
+      expected_runtime_configuration.emplace(
+          "runtime_collision_lookahead_cycle_budget_ms",
+          core::JsonValueDTO{350.0});
+      expected_runtime_configuration.emplace(
+          "runtime_collision_lookahead_max_samples",
+          core::JsonValueDTO{32.0});
+      expected_runtime_configuration.emplace(
+          "runtime_collision_lookahead_query_budget_ms",
+          core::JsonValueDTO{75.0});
+      expected_runtime_configuration.emplace(
+          "runtime_collision_lookahead_s", core::JsonValueDTO{2.0});
+      expected_runtime_configuration.emplace(
+          "runtime_collision_lookahead_workers", core::JsonValueDTO{4.0});
+      expected_runtime_configuration.emplace(
+          "runtime_dynamic_body_max_age_cap_ms",
+          core::JsonValueDTO{750.0});
+      expected_runtime_configuration.emplace(
+          "validation_collision_workers", core::JsonValueDTO{4.0});
     }
     if (runtime.configuration != expected_runtime_configuration) {
       throw std::invalid_argument(

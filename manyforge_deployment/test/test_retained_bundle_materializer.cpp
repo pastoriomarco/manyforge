@@ -1435,7 +1435,7 @@ TEST(RetainedBundleMaterializer,
           manifest);
   EXPECT_EQ(
       canonical_json(member(parsed_manifest, "configuration")),
-      R"({"collision_monitor_period_ms":50,"execution_tick_hz":100,"initial_joint_positions_rad":[0,0,1.57,0,0,0],"isaac_profile":"lite6","mode":"commanded_sim","planner_rng_seed":12345})");
+      R"({"collision_monitor_period_ms":100,"execution_tick_hz":100,"initial_joint_positions_rad":[0,0,1.57,0,0,0],"isaac_profile":"lite6","mode":"commanded_sim","planner_rng_seed":12345,"runtime_collision_immediate_query_budget_ms":75,"runtime_collision_lookahead_cycle_budget_ms":350,"runtime_collision_lookahead_max_samples":32,"runtime_collision_lookahead_query_budget_ms":75,"runtime_collision_lookahead_s":2,"runtime_collision_lookahead_workers":4,"runtime_dynamic_body_max_age_cap_ms":750,"validation_collision_workers":4})");
   EXPECT_NO_THROW(
       detail::require_ros2_control_execution_runtime_product_matches_retained_bundle(
           manifest, launch_descriptor, std::nullopt, bundle->value(),
@@ -1449,7 +1449,19 @@ TEST(RetainedBundleMaterializer,
   EXPECT_EQ(runtime_configuration.initial_joint_positions_rad,
             (std::vector<double>{0.0, 0.0, 1.57, 0.0, 0.0, 0.0}));
   EXPECT_EQ(runtime_configuration.execution_tick_hz, 100U);
-  EXPECT_DOUBLE_EQ(runtime_configuration.collision_monitor_period_ms, 50.0);
+  EXPECT_DOUBLE_EQ(runtime_configuration.collision_monitor_period_ms, 100.0);
+  EXPECT_EQ(runtime_configuration.runtime_collision_immediate_query_budget_ms,
+            75.0);
+  EXPECT_EQ(runtime_configuration.runtime_collision_lookahead_query_budget_ms,
+            75.0);
+  EXPECT_EQ(runtime_configuration.runtime_collision_lookahead_cycle_budget_ms,
+            350.0);
+  EXPECT_EQ(runtime_configuration.runtime_collision_lookahead_s, 2.0);
+  EXPECT_EQ(runtime_configuration.runtime_collision_lookahead_max_samples,
+            32U);
+  EXPECT_EQ(runtime_configuration.runtime_collision_lookahead_workers, 4U);
+  EXPECT_EQ(runtime_configuration.runtime_dynamic_body_max_age_cap_ms, 750.0);
+  EXPECT_EQ(runtime_configuration.validation_collision_workers, 4U);
 
   const std::string changed_configuration =
       replace_once(manifest, "\"isaac_profile\":\"lite6\"",

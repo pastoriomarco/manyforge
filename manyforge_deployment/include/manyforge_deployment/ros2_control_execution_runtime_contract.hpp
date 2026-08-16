@@ -2,6 +2,7 @@
 
 #include <cstdint>
 #include <manyforge_core/types/strong_id.hpp>
+#include <optional>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -54,9 +55,17 @@ struct Configuration final {
   std::vector<double> initial_joint_positions_rad;
   std::uint32_t execution_tick_hz{};
   double collision_monitor_period_ms{};
+  std::optional<double> runtime_collision_immediate_query_budget_ms;
+  std::optional<double> runtime_collision_lookahead_query_budget_ms;
+  std::optional<double> runtime_collision_lookahead_cycle_budget_ms;
+  std::optional<double> runtime_collision_lookahead_s;
+  std::optional<std::uint32_t> runtime_collision_lookahead_max_samples;
+  std::optional<std::uint32_t> runtime_collision_lookahead_workers;
+  std::optional<double> runtime_dynamic_body_max_age_cap_ms;
+  std::optional<std::uint32_t> validation_collision_workers;
 
-  friend bool operator==(const Configuration &, const Configuration &) =
-      default;
+  friend bool operator==(const Configuration &,
+                         const Configuration &) = default;
 };
 
 [[nodiscard]] Configuration

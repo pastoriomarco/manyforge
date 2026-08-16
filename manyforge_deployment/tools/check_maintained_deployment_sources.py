@@ -182,6 +182,30 @@ _ROS2_CONTROL_RUNTIME_RESTORATION_SOURCE_FIELDS: Final = {
     "mode": "adapters.execution.config.execution_state_source_mode",
     "operator_stop_profile": "adapters.execution.config.operator_stop_profile",
     "planner_rng_seed": "adapters.planning.config.rng_seed",
+    "runtime_collision_immediate_query_budget_ms": (
+        "orchestrator.config.runtime_collision_immediate_query_budget_ms"
+    ),
+    "runtime_collision_lookahead_cycle_budget_ms": (
+        "orchestrator.config.runtime_collision_lookahead_cycle_budget_ms"
+    ),
+    "runtime_collision_lookahead_max_samples": (
+        "orchestrator.config.runtime_collision_lookahead_max_samples"
+    ),
+    "runtime_collision_lookahead_query_budget_ms": (
+        "orchestrator.config.runtime_collision_lookahead_query_budget_ms"
+    ),
+    "runtime_collision_lookahead_s": (
+        "orchestrator.config.runtime_collision_lookahead_s"
+    ),
+    "runtime_collision_lookahead_workers": (
+        "orchestrator.config.runtime_collision_lookahead_workers"
+    ),
+    "runtime_dynamic_body_max_age_cap_ms": (
+        "orchestrator.config.runtime_dynamic_body_max_age_cap_ms"
+    ),
+    "validation_collision_workers": (
+        "orchestrator.config.validation_collision_workers"
+    ),
 }
 _ROS2_CONTROL_RUNTIME_RESTORATION_ACCEPTANCE: Final = [
     {
@@ -201,6 +225,10 @@ _ROS2_CONTROL_RUNTIME_RESTORATION_ACCEPTANCE: Final = [
         "acceptance_steps": ["I9/I"],
     },
     {
+        "obligation_id": "retained_isaac_runtime_collision_tuning",
+        "acceptance_steps": ["I9/I"],
+    },
+    {
         "obligation_id": "commanded_simulation_state_authority",
         "acceptance_steps": ["I9/I"],
     },
@@ -211,19 +239,22 @@ _ROS2_CONTROL_RUNTIME_RESTORATION_ACCEPTANCE: Final = [
 ]
 _EXPECTED_RUNTIME_RESTORATION_PROFILE_DIGESTS: Final = {
     "lite6_isaac_commanded_v0": (
-        "47e2fd5805bc000d307375cd5cca204f1365437cd0610d2b5afae0328d64f2c0"
+        "5465175c487df3cc2cc34ef714b3372550bec75396cbb24809f3a5140dab9ed1"
     ),
     "lite6_native_simulated_v0": (
         "35e27129b5cf16c680c8722c93524d9d83d8b9ec0b8a9baf5735df5449e1a611"
     ),
+    "ur10e_robotiq_assistant_isaac_commanded_v0": (
+        "3cbb3e1f1bea127a25f801a3ca5ecff5605e9394a2da49921647149217331e48"
+    ),
     "ur10e_robotiq_assistant_native_simulated_v0": (
         "61ec7a2ea3346234e83d457a1ba24833d729de141750c15214c4997657842f69"
     ),
+    "ur10e_robotiq_isaac_commanded_v0": (
+        "901217ded7289dbe69e15e41eda7ec6585a250f0078d1caaf631b7d14552d696"
+    ),
     "ur10e_robotiq_native_simulated_v0": (
         "acdbd2176ce72be69ab0d995aab56eb0b43a23f105d65920e5463d3bc42ab43b"
-    ),
-    "ur10e_robotiq_isaac_commanded_v0": (
-        "15c70dac72fd4b559d77a9e08c644a04dede5eab1c3f441e02d1e91bdfdc6ffd"
     ),
     "ur5_native_simulated_v0": (
         "5fa7f58a5abc5f9bc22a1f48dae3e8c8006b44c24140ab9954321a50b9b73f55"
@@ -232,9 +263,10 @@ _EXPECTED_RUNTIME_RESTORATION_PROFILE_DIGESTS: Final = {
 _EXPECTED_RUNTIME_RESTORATION_PROFILE_FAMILIES: Final = {
     "lite6_isaac_commanded_v0": "lite6_lite_gripper",
     "lite6_native_simulated_v0": "lite6_lite_gripper",
+    "ur10e_robotiq_assistant_isaac_commanded_v0": "ur10e_robotiq_2f_140",
     "ur10e_robotiq_assistant_native_simulated_v0": "ur10e_robotiq_2f_140",
-    "ur10e_robotiq_native_simulated_v0": "ur10e_robotiq_2f_140",
     "ur10e_robotiq_isaac_commanded_v0": "ur10e_robotiq_2f_140",
+    "ur10e_robotiq_native_simulated_v0": "ur10e_robotiq_2f_140",
     "ur5_native_simulated_v0": "ur5_roboplan",
 }
 _EXPECTED_DEPLOYMENT_RUNTIME_PROFILE_IDS: Final = {
@@ -255,7 +287,7 @@ _EXPECTED_DEPLOYMENT_RUNTIME_PROFILE_IDS: Final = {
         "lite6_isaac_commanded_v0"
     ),
     "examples/isaac_manipulator_scene_light_assistant.deployment.yaml": (
-        "ur10e_robotiq_isaac_commanded_v0"
+        "ur10e_robotiq_assistant_isaac_commanded_v0"
     ),
     "examples/isaac_manipulator_scene_light_ros2_control.deployment.yaml": (
         "ur10e_robotiq_isaac_commanded_v0"
@@ -1836,7 +1868,7 @@ def validate(source: Path, root: Path) -> None:
         runtime_profile_ids
     ) != set(_EXPECTED_RUNTIME_RESTORATION_PROFILE_DIGESTS):
         raise SourceDescriptionError(
-            "$.runtime_restoration_profiles must exactly cover the six "
+            "$.runtime_restoration_profiles must exactly cover the seven "
             "canonical-sorted historical profiles"
         )
 

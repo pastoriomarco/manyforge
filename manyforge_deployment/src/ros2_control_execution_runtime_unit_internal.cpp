@@ -726,6 +726,35 @@ require_configuration(const RetainedBundle &retained_bundle,
     }
     return static_cast<std::uint32_t>(number);
   };
+  const auto optional_number = [&](const std::string_view name)
+      -> std::optional<double> {
+    const auto found = unit.configuration.find(name);
+    if (found == unit.configuration.end()) {
+      return std::nullopt;
+    }
+    const auto *number = std::get_if<double>(&found->second.value);
+    if (number == nullptr || !std::isfinite(*number)) {
+      throw RetainedBundleError(
+          "ros2_control runtime configuration has invalid " +
+          std::string(name));
+    }
+    return *number;
+  };
+  const auto optional_uint32 = [&](const std::string_view name)
+      -> std::optional<std::uint32_t> {
+    const auto number = optional_number(name);
+    if (!number.has_value()) {
+      return std::nullopt;
+    }
+    if (std::trunc(*number) != *number || *number < 0.0 ||
+        *number >
+            static_cast<double>(std::numeric_limits<std::uint32_t>::max())) {
+      throw RetainedBundleError(
+          "ros2_control runtime configuration has invalid " +
+          std::string(name));
+    }
+    return static_cast<std::uint32_t>(*number);
+  };
 
   const auto *mode = std::get_if<std::string>(&require_member("mode").value);
   const auto *profile =
@@ -745,6 +774,22 @@ require_configuration(const RetainedBundle &retained_bundle,
   result.execution_tick_hz = require_uint32("execution_tick_hz");
   result.collision_monitor_period_ms =
       require_number("collision_monitor_period_ms");
+  result.runtime_collision_immediate_query_budget_ms =
+      optional_number("runtime_collision_immediate_query_budget_ms");
+  result.runtime_collision_lookahead_query_budget_ms =
+      optional_number("runtime_collision_lookahead_query_budget_ms");
+  result.runtime_collision_lookahead_cycle_budget_ms =
+      optional_number("runtime_collision_lookahead_cycle_budget_ms");
+  result.runtime_collision_lookahead_s =
+      optional_number("runtime_collision_lookahead_s");
+  result.runtime_collision_lookahead_max_samples =
+      optional_uint32("runtime_collision_lookahead_max_samples");
+  result.runtime_collision_lookahead_workers =
+      optional_uint32("runtime_collision_lookahead_workers");
+  result.runtime_dynamic_body_max_age_cap_ms =
+      optional_number("runtime_dynamic_body_max_age_cap_ms");
+  result.validation_collision_workers =
+      optional_uint32("validation_collision_workers");
   result.initial_joint_positions_rad.reserve(positions->size());
   for (const auto &position : *positions) {
     const auto *number = std::get_if<double>(&position.value);
@@ -756,9 +801,13 @@ require_configuration(const RetainedBundle &retained_bundle,
     result.initial_joint_positions_rad.push_back(*number);
   }
   if (result.execution_tick_hz == 0U ||
-      !(result.collision_monitor_period_ms > 0.0)) {
+      !(result.collision_monitor_period_ms > 0.0) ||
+      !(result.runtime_collision_immediate_query_budget_ms.value_or(50.0) <=
+        result.collision_monitor_period_ms) ||
+      !(result.runtime_collision_lookahead_query_budget_ms.value_or(75.0) <=
+        result.runtime_collision_lookahead_cycle_budget_ms.value_or(200.0))) {
     throw RetainedBundleError(
-        "ros2_control runtime configuration has an invalid cadence");
+        "ros2_control runtime configuration has invalid collision cadences");
   }
   return result;
 }

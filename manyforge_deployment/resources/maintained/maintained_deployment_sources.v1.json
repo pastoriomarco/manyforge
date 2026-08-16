@@ -44,7 +44,15 @@
         "isaac_profile": "robot_config.robot_id",
         "mode": "adapters.execution.config.execution_state_source_mode",
         "operator_stop_profile": "adapters.execution.config.operator_stop_profile",
-        "planner_rng_seed": "adapters.planning.config.rng_seed"
+        "planner_rng_seed": "adapters.planning.config.rng_seed",
+        "runtime_collision_immediate_query_budget_ms": "orchestrator.config.runtime_collision_immediate_query_budget_ms",
+        "runtime_collision_lookahead_cycle_budget_ms": "orchestrator.config.runtime_collision_lookahead_cycle_budget_ms",
+        "runtime_collision_lookahead_max_samples": "orchestrator.config.runtime_collision_lookahead_max_samples",
+        "runtime_collision_lookahead_query_budget_ms": "orchestrator.config.runtime_collision_lookahead_query_budget_ms",
+        "runtime_collision_lookahead_s": "orchestrator.config.runtime_collision_lookahead_s",
+        "runtime_collision_lookahead_workers": "orchestrator.config.runtime_collision_lookahead_workers",
+        "runtime_dynamic_body_max_age_cap_ms": "orchestrator.config.runtime_dynamic_body_max_age_cap_ms",
+        "validation_collision_workers": "orchestrator.config.validation_collision_workers"
       },
       "ros2_control_runtime": {
         "collision_monitor_period_ms": 50.0,
@@ -100,6 +108,10 @@
         },
         {
           "obligation_id": "retained_runtime_collision_monitor_period",
+          "acceptance_steps": ["I9/I"]
+        },
+        {
+          "obligation_id": "retained_isaac_runtime_collision_tuning",
           "acceptance_steps": ["I9/I"]
         },
         {
@@ -182,6 +194,97 @@
       ]
     },
     {
+      "runtime_restoration_profile_id": "ur10e_robotiq_assistant_isaac_commanded_v0",
+      "model_family_id": "ur10e_robotiq_2f_140",
+      "source_fields": {
+        "collision_monitor_period_ms": "orchestrator.config.collision_monitor_period_ms",
+        "default_fault_stop_profile": "adapters.execution.config.default_fault_stop_profile",
+        "execution_tick_hz": "retained_runtime_defaults.execution_tick_hz",
+        "initial_joint_positions_rad": "adapters.execution.config.initial_joint_positions_rad",
+        "isaac_profile": "robot_config.robot_id",
+        "mode": "adapters.execution.config.execution_state_source_mode",
+        "operator_stop_profile": "adapters.execution.config.operator_stop_profile",
+        "planner_rng_seed": "adapters.planning.config.rng_seed",
+        "runtime_collision_immediate_query_budget_ms": "orchestrator.config.runtime_collision_immediate_query_budget_ms",
+        "runtime_collision_lookahead_cycle_budget_ms": "orchestrator.config.runtime_collision_lookahead_cycle_budget_ms",
+        "runtime_collision_lookahead_max_samples": "orchestrator.config.runtime_collision_lookahead_max_samples",
+        "runtime_collision_lookahead_query_budget_ms": "orchestrator.config.runtime_collision_lookahead_query_budget_ms",
+        "runtime_collision_lookahead_s": "orchestrator.config.runtime_collision_lookahead_s",
+        "runtime_collision_lookahead_workers": "orchestrator.config.runtime_collision_lookahead_workers",
+        "runtime_dynamic_body_max_age_cap_ms": "orchestrator.config.runtime_dynamic_body_max_age_cap_ms",
+        "validation_collision_workers": "orchestrator.config.validation_collision_workers"
+      },
+      "ros2_control_runtime": {
+        "collision_monitor_period_ms": 50.0,
+        "execution_tick_hz": 100,
+        "initial_joint_positions_rad": [2.63422544, -0.875980752, 1.551074106, -2.29231544, -1.560498884, -2.038544566],
+        "isaac_profile": "ur10e",
+        "mode": "commanded_sim",
+        "planner_rng_seed": 12345
+      },
+      "stop_profiles": {
+        "default_fault_stop_profile": {
+          "deceleration_time_s": 1.0,
+          "per_joint_max_deceleration_rad_s2": {
+            "elbow_joint": 10.0,
+            "shoulder_lift_joint": 10.0,
+            "shoulder_pan_joint": 10.0,
+            "wrist_1_joint": 10.0,
+            "wrist_2_joint": 10.0,
+            "wrist_3_joint": 10.0
+          },
+          "profile_id": "fault_spring_back_hold",
+          "require_backend_confirmation": true,
+          "stop_mode": "spring_back_hold"
+        },
+        "operator_stop_profile": {
+          "allow_natural_completion_on_short_path": true,
+          "deceleration_time_s": 1.0,
+          "per_joint_max_deceleration_rad_s2": {
+            "elbow_joint": 10.0,
+            "shoulder_lift_joint": 10.0,
+            "shoulder_pan_joint": 10.0,
+            "wrist_1_joint": 10.0,
+            "wrist_2_joint": 10.0,
+            "wrist_3_joint": 10.0
+          },
+          "profile_id": "operator_soft_on_path",
+          "require_backend_confirmation": true,
+          "stop_mode": "soft_on_path"
+        }
+      },
+      "acceptance_obligations": [
+        {
+          "obligation_id": "retained_isaac_initial_state_and_execution_cadence",
+          "acceptance_steps": ["I9/I"]
+        },
+        {
+          "obligation_id": "retained_isaac_planner_seed",
+          "acceptance_steps": ["I9/I"]
+        },
+        {
+          "obligation_id": "retained_ros2_control_stop_profiles",
+          "acceptance_steps": ["I8/P5", "I9/I"]
+        },
+        {
+          "obligation_id": "retained_runtime_collision_monitor_period",
+          "acceptance_steps": ["I9/I"]
+        },
+        {
+          "obligation_id": "retained_isaac_runtime_collision_tuning",
+          "acceptance_steps": ["I9/I"]
+        },
+        {
+          "obligation_id": "commanded_simulation_state_authority",
+          "acceptance_steps": ["I9/I"]
+        },
+        {
+          "obligation_id": "exact_isaac_ros2_control_profile_and_transport",
+          "acceptance_steps": ["I9/I"]
+        }
+      ]
+    },
+    {
       "runtime_restoration_profile_id": "ur10e_robotiq_assistant_native_simulated_v0",
       "model_family_id": "ur10e_robotiq_2f_140",
       "source_fields": {
@@ -259,15 +362,31 @@
         "isaac_profile": "robot_config.robot_id",
         "mode": "adapters.execution.config.execution_state_source_mode",
         "operator_stop_profile": "adapters.execution.config.operator_stop_profile",
-        "planner_rng_seed": "adapters.planning.config.rng_seed"
+        "planner_rng_seed": "adapters.planning.config.rng_seed",
+        "runtime_collision_immediate_query_budget_ms": "orchestrator.config.runtime_collision_immediate_query_budget_ms",
+        "runtime_collision_lookahead_cycle_budget_ms": "orchestrator.config.runtime_collision_lookahead_cycle_budget_ms",
+        "runtime_collision_lookahead_max_samples": "orchestrator.config.runtime_collision_lookahead_max_samples",
+        "runtime_collision_lookahead_query_budget_ms": "orchestrator.config.runtime_collision_lookahead_query_budget_ms",
+        "runtime_collision_lookahead_s": "orchestrator.config.runtime_collision_lookahead_s",
+        "runtime_collision_lookahead_workers": "orchestrator.config.runtime_collision_lookahead_workers",
+        "runtime_dynamic_body_max_age_cap_ms": "orchestrator.config.runtime_dynamic_body_max_age_cap_ms",
+        "validation_collision_workers": "orchestrator.config.validation_collision_workers"
       },
       "ros2_control_runtime": {
-        "collision_monitor_period_ms": 50.0,
+        "collision_monitor_period_ms": 100.0,
         "execution_tick_hz": 100,
         "initial_joint_positions_rad": [2.63422544, -0.875980752, 1.551074106, -2.29231544, -1.560498884, -2.038544566],
         "isaac_profile": "ur10e",
         "mode": "commanded_sim",
-        "planner_rng_seed": 12345
+        "planner_rng_seed": 12345,
+        "runtime_collision_immediate_query_budget_ms": 75.0,
+        "runtime_collision_lookahead_cycle_budget_ms": 350.0,
+        "runtime_collision_lookahead_max_samples": 32,
+        "runtime_collision_lookahead_query_budget_ms": 75.0,
+        "runtime_collision_lookahead_s": 2.0,
+        "runtime_collision_lookahead_workers": 4,
+        "runtime_dynamic_body_max_age_cap_ms": 750.0,
+        "validation_collision_workers": 4
       },
       "stop_profiles": {
         "default_fault_stop_profile": {
@@ -315,6 +434,10 @@
         },
         {
           "obligation_id": "retained_runtime_collision_monitor_period",
+          "acceptance_steps": ["I9/I"]
+        },
+        {
+          "obligation_id": "retained_isaac_runtime_collision_tuning",
           "acceptance_steps": ["I9/I"]
         },
         {
@@ -784,7 +907,7 @@
         "viewer_mesh_ghost_reset_and_structured_status"
       ],
       "model_family_id": "ur10e_robotiq_2f_140",
-      "runtime_restoration_profile_id": "ur10e_robotiq_isaac_commanded_v0",
+      "runtime_restoration_profile_id": "ur10e_robotiq_assistant_isaac_commanded_v0",
       "component_occurrence_id": "isaac_ur10e_assistant_robot",
       "root_pose_in_cell": {
         "position_m": [-0.21814000606536865, -0.571590006351471, 0.12999999523162842],

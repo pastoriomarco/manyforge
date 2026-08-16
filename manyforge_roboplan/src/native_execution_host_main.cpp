@@ -4624,6 +4624,59 @@ BuildProductComposition(CompositionBuildInput input) {
 #endif
   auto kernel_config = core::ExecutionKernelConfig{};
   kernel_config.collision_monitor_period_ns = collision_monitor_period_ns;
+#if defined(MANYFORGE_ROS2_CONTROL_EXECUTION_HOST)
+  const auto milliseconds_to_ns = [](const double value) {
+    return static_cast<core::Duration>(std::llround(value * 1'000'000.0));
+  };
+  if (retained_runtime_configuration
+          .runtime_collision_immediate_query_budget_ms.has_value()) {
+    kernel_config.runtime_collision_immediate_query_budget_ns =
+        milliseconds_to_ns(*retained_runtime_configuration
+                                .runtime_collision_immediate_query_budget_ms);
+  }
+  if (retained_runtime_configuration
+          .runtime_collision_lookahead_query_budget_ms.has_value()) {
+    kernel_config.runtime_collision_lookahead_query_budget_ns =
+        milliseconds_to_ns(*retained_runtime_configuration
+                                .runtime_collision_lookahead_query_budget_ms);
+  }
+  if (retained_runtime_configuration
+          .runtime_collision_lookahead_cycle_budget_ms.has_value()) {
+    kernel_config.runtime_collision_lookahead_cycle_budget_ns =
+        milliseconds_to_ns(*retained_runtime_configuration
+                                .runtime_collision_lookahead_cycle_budget_ms);
+  }
+  if (retained_runtime_configuration.runtime_collision_lookahead_s
+          .has_value()) {
+    kernel_config.runtime_collision_lookahead_horizon_ns =
+        static_cast<core::Duration>(std::llround(
+            *retained_runtime_configuration.runtime_collision_lookahead_s *
+            1'000'000'000.0));
+  }
+  if (retained_runtime_configuration.runtime_collision_lookahead_max_samples
+          .has_value()) {
+    kernel_config.runtime_collision_lookahead_max_samples =
+        *retained_runtime_configuration
+             .runtime_collision_lookahead_max_samples;
+  }
+  if (retained_runtime_configuration.runtime_collision_lookahead_workers
+          .has_value()) {
+    kernel_config.runtime_collision_lookahead_workers = static_cast<int>(
+        *retained_runtime_configuration.runtime_collision_lookahead_workers);
+    kernel_config.runtime_collision_lookahead_workers_declared = true;
+  }
+  if (retained_runtime_configuration.runtime_dynamic_body_max_age_cap_ms
+          .has_value()) {
+    kernel_config.runtime_dynamic_body_max_age_cap_ns = milliseconds_to_ns(
+        *retained_runtime_configuration.runtime_dynamic_body_max_age_cap_ms);
+  }
+  if (retained_runtime_configuration.validation_collision_workers
+          .has_value()) {
+    kernel_config.validation_collision_workers = static_cast<int>(
+        *retained_runtime_configuration.validation_collision_workers);
+    kernel_config.validation_collision_workers_declared = true;
+  }
+#endif
   auto execution_config = RoboPlanExecutionBackendConfig{};
   execution_config.execution_tick_period_ns = execution_tick_period_ns;
   RetainedNativeRuntimeConfig runtime_config{

@@ -1058,11 +1058,11 @@
         "schema_revision": "sha256:330a7505c585d69b231a1322bffbcd71775a1070c3a519a1ef7eb013ed5b5e9f"
       },
       {
-        "content_addressed_store_key": "catalog/maintained/runtime_profile/manyforge.ros2_control_execution_runtime/7d0e2fcd76a509af711fed1e46e2d6c2008e22f76c7e6d58aa089be97e5b0110",
-        "content_digest": "sha256:a062b8ed059602dbcfd669afbd48f3acce03821f837623cfd923aab9b56de4d6",
+        "content_addressed_store_key": "catalog/maintained/runtime_profile/manyforge.ros2_control_execution_runtime/434fcba1ae9687c7dc7fb2031b06210f1b6cc9a18934b6551abf519c7cf3750b",
+        "content_digest": "sha256:f231d8f52a7858c2ebbf4c1334650aeb973407ac780d2c4fbd194df0209e4cea",
         "record_id": "manyforge.ros2_control_execution_runtime",
         "record_kind": "runtime_profile",
-        "record_revision": "sha256:7d0e2fcd76a509af711fed1e46e2d6c2008e22f76c7e6d58aa089be97e5b0110",
+        "record_revision": "sha256:434fcba1ae9687c7dc7fb2031b06210f1b6cc9a18934b6551abf519c7cf3750b",
         "schema_id": "manyforge.runtime_profile.v1",
         "schema_revision": "sha256:c254afa8c2bfcc803f12a7af63b1f09a8ee804b1ffa2a65b7361ad9309b87ae7"
       },
@@ -1093,7 +1093,7 @@
     ]
   },
   "deployment_artifact_id": "trocar_lite6_foundationpose_pick",
-  "deployment_revision": "sha256:2ec0c46ccf8f1ae8a96991eff654a3fe56323b383887c8eacd06b941ca01d171",
+  "deployment_revision": "sha256:02f75eb13265d49dd01c9ef77e89129620b50a8f7c2a66a075cd8d57b281c9a3",
   "description": "Retained Isaac Lite6 trocar pick deployment using the commanded ROS 2 control runtime and the qualified FoundationPose Detection3D pose-source client.",
   "desired_control_configurations": [
     {
@@ -1962,7 +1962,7 @@
         },
         "dependency_runtime_unit_ids": [],
         "runtime_profile_id": "manyforge.ros2_control_execution_runtime",
-        "runtime_profile_revision": "sha256:7d0e2fcd76a509af711fed1e46e2d6c2008e22f76c7e6d58aa089be97e5b0110",
+        "runtime_profile_revision": "sha256:434fcba1ae9687c7dc7fb2031b06210f1b6cc9a18934b6551abf519c7cf3750b",
         "runtime_unit_id": "isaac_lite6_trocar_robot.ros2_control_execution"
       }
     ]

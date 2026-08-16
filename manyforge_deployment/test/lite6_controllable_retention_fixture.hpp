@@ -180,7 +180,15 @@ provider_contract_role_id(const CanonicalValue &declaration) {
            CanonicalValue(0.0), CanonicalValue(0.0), CanonicalValue(0.0),
        })},
       {"execution_tick_hz", CanonicalValue(100.0)},
-      {"collision_monitor_period_ms", CanonicalValue(50.0)},
+      {"collision_monitor_period_ms", CanonicalValue(100.0)},
+      {"runtime_collision_immediate_query_budget_ms", CanonicalValue(75.0)},
+      {"runtime_collision_lookahead_query_budget_ms", CanonicalValue(75.0)},
+      {"runtime_collision_lookahead_cycle_budget_ms", CanonicalValue(350.0)},
+      {"runtime_collision_lookahead_s", CanonicalValue(2.0)},
+      {"runtime_collision_lookahead_max_samples", CanonicalValue(32.0)},
+      {"runtime_collision_lookahead_workers", CanonicalValue(4.0)},
+      {"runtime_dynamic_body_max_age_cap_ms", CanonicalValue(750.0)},
+      {"validation_collision_workers", CanonicalValue(4.0)},
   });
 }
 

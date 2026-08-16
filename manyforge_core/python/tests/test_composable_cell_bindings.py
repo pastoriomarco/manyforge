@@ -1829,11 +1829,11 @@ target: 0.5
         ),
         (
             "manyforge.value_schema.runtime.ros2_control_execution.v1",
-            "sha256:2404a4d3156048f5969c651c550e7f785d5b23e4ccc07df9004f3ba2d98e6bc6",
+            "sha256:4ff0c6d3d2e4cf9eae515f0ba3343404e3f30939a08f886aadfe26fa57fe173d",
         ),
     }
     assert registry.qualification_registry_digest.value == (
-        "sha256:65ee605872372888db7677aa168be992961e04b05c924ebe05f4283e3b0f8c74"
+        "sha256:50b5f0670b82edbc106cf413030af6481bb4390a7d8fee2dedfeb3686fd7adb5"
     )
     assert (
         json.loads(registry.normalized_projection_canonical_json)["catalog_schemas"][0][
