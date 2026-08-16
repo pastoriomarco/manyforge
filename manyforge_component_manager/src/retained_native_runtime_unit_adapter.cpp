@@ -62,6 +62,10 @@ constexpr std::size_t kMaximumControlPacketBytes =
 constexpr auto kExecTimeout = std::chrono::seconds(10);
 constexpr auto kReadyTimeout = std::chrono::seconds(10);
 constexpr auto kStatusTimeout = std::chrono::milliseconds(750);
+// Cold candidate projection preparation may stage the complete immutable
+// planning/collision product. Keep that bounded independently from the short
+// steady-state status, fence, composition, and projection-query budget.
+constexpr auto kProjectionPreparationTimeout = std::chrono::seconds(10);
 constexpr auto kGracefulStopTimeout = std::chrono::seconds(2);
 constexpr auto kTermStopTimeout = std::chrono::seconds(1);
 
@@ -742,10 +746,12 @@ struct RetainedNativeRuntimeUnitAdapter::Impl final
 
   [[nodiscard]] detail::NativeProjectionRpcResponse
   ExchangeProjectionRaw(Child &child,
-                        const detail::NativeProjectionRpcRequest &request) {
+                        const detail::NativeProjectionRpcRequest &request,
+                        const std::chrono::milliseconds timeout =
+                            kStatusTimeout) {
     const auto encoded = detail::EncodeNativeProjectionRpcRequest(request);
-    SendPacket(child.channel.get(), encoded, kStatusTimeout);
-    const auto packet = ReceivePacket(child.channel.get(), kStatusTimeout);
+    SendPacket(child.channel.get(), encoded, timeout);
+    const auto packet = ReceivePacket(child.channel.get(), timeout);
     if (!packet.has_value()) {
       Fail("native projection response timed out");
     }
@@ -755,8 +761,10 @@ struct RetainedNativeRuntimeUnitAdapter::Impl final
 
   [[nodiscard]] detail::NativeProjectionRpcResponse
   ExchangeProjection(Child &child,
-                     const detail::NativeProjectionRpcRequest &request) {
-    auto response = ExchangeProjectionRaw(child, request);
+                     const detail::NativeProjectionRpcRequest &request,
+                     const std::chrono::milliseconds timeout =
+                         kStatusTimeout) {
+    auto response = ExchangeProjectionRaw(child, request, timeout);
     if (const auto *failure =
             std::get_if<detail::NativeProjectionRpcFailure>(&response)) {
       Fail("native projection request failed [" + failure->error.code +
@@ -931,7 +939,10 @@ struct RetainedNativeRuntimeUnitAdapter::Impl final
               request.planning_collision_model) {
         continue;
       }
-      auto response = ExchangeProjection(child, request);
+      auto response = ExchangeProjection(
+          child, request,
+          std::chrono::duration_cast<std::chrono::milliseconds>(
+              kProjectionPreparationTimeout));
       const auto *prepared =
           std::get_if<detail::NativeProjectionPrepareResult>(&response);
       if (prepared == nullptr ||
