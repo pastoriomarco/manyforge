@@ -3,7 +3,7 @@ from __future__ import annotations
 import importlib.util
 from pathlib import Path
 import sys
-from types import ModuleType
+from types import ModuleType, SimpleNamespace
 
 import pytest
 
@@ -220,7 +220,14 @@ def base_observations(live: ModuleType, scenario):
         "after_control": {
             "exact_world": True,
             "state": {"state": "stopped"},
-            "reset": {"success": True},
+            "reset": {
+                "operation": "load_world_reset",
+                "success": True,
+                "world": {
+                    "name": scenario.world_name,
+                    "uri": scenario.world_uri,
+                },
+            },
             "stop": {"success": True},
         },
         "controllers": {
@@ -439,6 +446,217 @@ def test_graph_probe_converges_with_one_participant(
         }
         for topic in scenario.required_topics
     }
+
+
+def test_reset_snapshot_stops_before_reload_and_recovers_fresh_services(
+    live: ModuleType, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    scenario = live.SCENARIO_BY_ID["isaac-ur10e-light-scene"]
+    calls: list[str] = []
+    state = {"reset": False, "post_reset_stop_attempts": 0, "world_calls": 0}
+
+    class Result:
+        def __init__(self, value):
+            self.value = value
+
+        def to_dict(self):
+            return dict(self.value)
+
+    class FakeControl:
+        def __init__(self, node, *, service_timeout_s: float):
+            calls.append(f"control:{node.name}:{service_timeout_s}")
+
+        def set_simulation_state(self, *, state: str):
+            calls.append(f"set:{state}")
+            if state == "stopped" and globals_state["reset"]:
+                globals_state["post_reset_stop_attempts"] += 1
+                if globals_state["post_reset_stop_attempts"] == 1:
+                    return Result(
+                        {"success": False, "error": "departed service endpoint"}
+                    )
+            return Result({"success": True, "state": state})
+
+        def get_simulation_state(self):
+            calls.append("get_state")
+            return Result({"success": True, "state": "stopped"})
+
+    # Keep the closure readable while avoiding the method parameter named
+    # ``state`` shadowing the mutable test state.
+    globals_state = state
+
+    class FakeFuture:
+        def __init__(self, response):
+            self.response = response
+
+        def done(self):
+            return True
+
+        def result(self):
+            return self.response
+
+    class FakeWorldClient:
+        def wait_for_service(self, *, timeout_sec: float):
+            calls.append(f"world_ready:{timeout_sec}")
+            return True
+
+        def call_async(self, _request):
+            globals_state["world_calls"] += 1
+            calls.append("world_call")
+            if globals_state["world_calls"] == 1:
+                return FakeFuture(None)
+            return FakeFuture(
+                SimpleNamespace(
+                    result=SimpleNamespace(
+                        result=0, RESULT_OK=0, error_message=""
+                    ),
+                    world=SimpleNamespace(
+                        name=scenario.world_name,
+                        world_resource=SimpleNamespace(uri=scenario.world_uri),
+                    ),
+                )
+            )
+
+    class FakeLoadWorldClient:
+        def wait_for_service(self, *, timeout_sec: float):
+            calls.append(f"reload_ready:{timeout_sec}")
+            return True
+
+        def call_async(self, request):
+            calls.append("load_world")
+            assert request.uri == scenario.world_uri
+            assert request.resource_string == ""
+            assert request.fail_on_unsupported_element is True
+            assert request.ignore_missing_or_unsupported_assets is False
+            globals_state["reset"] = True
+            return FakeFuture(
+                SimpleNamespace(
+                    result=SimpleNamespace(
+                        result=0, RESULT_OK=0, error_message=""
+                    ),
+                    world=SimpleNamespace(
+                        name=scenario.world_name,
+                        world_resource=SimpleNamespace(uri=scenario.world_uri),
+                    ),
+                )
+            )
+
+    class FakeNode:
+        def __init__(self, name: str):
+            self.name = name
+            calls.append(f"node:{name}")
+
+        def destroy_node(self):
+            calls.append(f"destroy_node:{self.name}")
+
+        def get_service_names_and_types(self):
+            return [
+                (
+                    "/load_world",
+                    ["simulation_interfaces/srv/LoadWorld"],
+                ),
+                (
+                    "/get_current_world",
+                    ["simulation_interfaces/srv/GetCurrentWorld"],
+                )
+            ]
+
+        def create_client(self, _service_type, service_name: str):
+            if service_name == "/load_world":
+                return FakeLoadWorldClient()
+            assert service_name == "/get_current_world"
+            return FakeWorldClient()
+
+        def destroy_client(self, _client):
+            calls.append("destroy_world_client")
+
+    class GetCurrentWorld:
+        class Request:
+            pass
+
+    class LoadWorld:
+        class Request:
+            pass
+
+    fake_rclpy = ModuleType("rclpy")
+    fake_rclpy.init = lambda *, args: calls.append(f"init:{args}")
+    fake_rclpy.ok = lambda: True
+    fake_rclpy.shutdown = lambda: calls.append("shutdown")
+    fake_rclpy.spin_until_future_complete = (
+        lambda _node, _future, *, timeout_sec: calls.append(
+            f"world_spin:{timeout_sec}"
+        )
+    )
+    fake_node_module = ModuleType("rclpy.node")
+    fake_node_module.Node = FakeNode
+    fake_simulation_interfaces = ModuleType("simulation_interfaces")
+    fake_simulation_srv = ModuleType("simulation_interfaces.srv")
+    fake_simulation_srv.GetCurrentWorld = GetCurrentWorld
+    fake_simulation_srv.LoadWorld = LoadWorld
+    fake_control_module = ModuleType("manyforge_ros.simulation_control")
+    fake_control_module.SimulationControlClient = FakeControl
+    fake_barrier_module = ModuleType(
+        "manyforge_ros_bringup.isaac_scene_load_barrier"
+    )
+    fake_barrier_module.normalize_file_world_uri = lambda uri: uri
+    fake_barrier_module.select_service_name = (
+        lambda _services, *, service_type: (
+            {
+                "simulation_interfaces/srv/GetCurrentWorld": (
+                    "/get_current_world"
+                ),
+                "simulation_interfaces/srv/LoadWorld": "/load_world",
+            }.get(service_type)
+        )
+    )
+    monkeypatch.setitem(sys.modules, "rclpy", fake_rclpy)
+    monkeypatch.setitem(sys.modules, "rclpy.node", fake_node_module)
+    monkeypatch.setitem(
+        sys.modules, "simulation_interfaces", fake_simulation_interfaces
+    )
+    monkeypatch.setitem(
+        sys.modules, "simulation_interfaces.srv", fake_simulation_srv
+    )
+    monkeypatch.setitem(
+        sys.modules, "manyforge_ros.simulation_control", fake_control_module
+    )
+    monkeypatch.setitem(
+        sys.modules,
+        "manyforge_ros_bringup.isaac_scene_load_barrier",
+        fake_barrier_module,
+    )
+    monkeypatch.setattr(live.time, "sleep", lambda _seconds: None)
+
+    snapshot = live._simulation_snapshot(  # noqa: SLF001
+        scenario, reset=True, stop=True
+    )
+
+    effects = [
+        call
+        for call in calls
+        if call
+        in {"set:stopped", "load_world", "get_state", "world_call"}
+    ]
+    assert effects == [
+        "set:stopped",
+        "load_world",
+        "set:stopped",
+        "set:stopped",
+        "get_state",
+        "world_call",
+        "world_call",
+    ]
+    assert sum(call.startswith("node:") for call in calls) == 2
+    assert sum(call.startswith("destroy_node:") for call in calls) == 2
+    assert calls.count("destroy_world_client") == 3
+    assert snapshot["exact_world"] is True
+    assert snapshot["reset"]["operation"] == "load_world_reset"
+    assert snapshot["reset"]["success"] is True
+    assert snapshot["reset"]["world"] == {
+        "name": scenario.world_name,
+        "uri": scenario.world_uri,
+    }
+    assert snapshot["stop"]["success"] is True
+    assert snapshot["state"] == {"success": True, "state": "stopped"}
 
 
 @pytest.mark.parametrize(

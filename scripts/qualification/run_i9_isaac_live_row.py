@@ -54,6 +54,9 @@ _GRIPPER_TOLERANCE_BY_PROFILE: Final = {"lite6": 0.004, "ur10e": 0.04}
 _RECOVERY_BOUND_S: Final = 60.0
 _SCENE_POSE_QUERY_ATTEMPTS: Final = 16
 _I9_MANAGER_COMMAND_TIMEOUT_S: Final = 12.0
+_SIMULATION_RELOAD_RECOVERY_TIMEOUT_S: Final = 30.0
+_SIMULATION_RELOAD_ATTEMPT_TIMEOUT_S: Final = 3.0
+_SIMULATION_WORLD_RELOAD_TIMEOUT_S: Final = 120.0
 _CCLC_STARTUP_SCHEMA: Final = "manyforge.i9_cclc_startup.v1"
 _ROS2_CONTROL_LIFECYCLE_OBSERVATION_SCHEMA: Final = (
     "manyforge.ros2_control_lifecycle_observation.v1"
@@ -588,7 +591,7 @@ def _simulation_snapshot(
 ) -> dict[str, Any]:
     import rclpy
     from rclpy.node import Node
-    from simulation_interfaces.srv import GetCurrentWorld
+    from simulation_interfaces.srv import GetCurrentWorld, LoadWorld
 
     from manyforge_ros.simulation_control import SimulationControlClient
     from manyforge_ros_bringup.isaac_scene_load_barrier import (
@@ -596,48 +599,212 @@ def _simulation_snapshot(
         select_service_name,
     )
 
+    def retry_control(
+        operation: Callable[[SimulationControlClient], object],
+        *,
+        timeout_s: float,
+    ) -> dict[str, Any]:
+        deadline = time.monotonic() + timeout_s
+        last: dict[str, Any] = {}
+        while True:
+            remaining_s = deadline - time.monotonic()
+            attempt_timeout_s = min(
+                _SIMULATION_RELOAD_ATTEMPT_TIMEOUT_S,
+                max(0.05, remaining_s),
+            )
+            attempt = operation(
+                SimulationControlClient(
+                    node,
+                    service_timeout_s=attempt_timeout_s,
+                )
+            )
+            last = attempt.to_dict()  # type: ignore[attr-defined]
+            if last.get("success") is True or time.monotonic() >= deadline:
+                return last
+            time.sleep(min(0.05, max(0.0, deadline - time.monotonic())))
+
     rclpy.init(args=None)
     node = Node(f"manyforge_i9_world_probe_{os.getpid()}")
     try:
         if play and stop:
             raise LiveRowError("simulation snapshot cannot play and stop together")
-        control = SimulationControlClient(node, service_timeout_s=10.0)
-        reset_result = control.reset().to_dict() if reset else None
+        if reset and stop:
+            before_reset_stop = retry_control(
+                lambda client: client.set_simulation_state(state="stopped"),
+                timeout_s=10.0,
+            )
+            if before_reset_stop.get("success") is not True:
+                raise LiveRowError(
+                    "simulation did not stop before reset: "
+                    + json.dumps(
+                        before_reset_stop, separators=(",", ":"), sort_keys=True
+                    )
+                )
+
+        reset_result: dict[str, Any] | None = None
+        if reset:
+            # Isaac 5.1 ResetSimulation only removes service-spawned prims and
+            # unconditionally restarts the timeline.  On the retained, large
+            # USD it can also spend an unbounded interval traversing the
+            # Fabric stage.  Reloading the exact checked world is the retained
+            # scene-reset semantic and the same simulation_interfaces path
+            # used by the launch barrier.
+            reload_started = time.monotonic()
+            reload_deadline = (
+                reload_started + _SIMULATION_WORLD_RELOAD_TIMEOUT_S
+            )
+            load_service_name: str | None = None
+            while (
+                load_service_name is None
+                and time.monotonic() < reload_deadline
+            ):
+                load_service_name = select_service_name(
+                    node.get_service_names_and_types(),
+                    service_type="simulation_interfaces/srv/LoadWorld",
+                )
+                if load_service_name is None:
+                    time.sleep(0.05)
+            if load_service_name is None:
+                raise LiveRowError("LoadWorld reset service is unavailable")
+            request = LoadWorld.Request()
+            request.uri = spec.world_uri
+            request.resource_string = ""
+            request.fail_on_unsupported_element = True
+            request.ignore_missing_or_unsupported_assets = False
+            load_client = node.create_client(LoadWorld, load_service_name)
+            try:
+                remaining_s = max(0.05, reload_deadline - time.monotonic())
+                if not load_client.wait_for_service(timeout_sec=remaining_s):
+                    raise LiveRowError(
+                        f"LoadWorld reset service did not become ready: "
+                        f"{load_service_name}"
+                    )
+                future = load_client.call_async(request)
+                rclpy.spin_until_future_complete(
+                    node,
+                    future,
+                    timeout_sec=max(0.05, reload_deadline - time.monotonic()),
+                )
+                loaded = future.result() if future.done() else None
+            finally:
+                node.destroy_client(load_client)
+            if loaded is None:
+                raise LiveRowError("LoadWorld reset returned no response")
+            result_code = int(loaded.result.result)
+            result_message = str(loaded.result.error_message)[:512]
+            if result_code != int(loaded.result.RESULT_OK):
+                raise LiveRowError(
+                    f"LoadWorld reset returned result {result_code}: "
+                    + result_message
+                )
+            loaded_world = {
+                "name": str(loaded.world.name),
+                "uri": normalize_file_world_uri(
+                    str(loaded.world.world_resource.uri)
+                ),
+            }
+            expected_world = {
+                "name": spec.world_name,
+                "uri": spec.world_uri,
+            }
+            if loaded_world != expected_world:
+                raise LiveRowError(
+                    "LoadWorld reset crossed world identity: "
+                    + json.dumps(
+                        loaded_world, separators=(",", ":"), sort_keys=True
+                    )
+                )
+            reset_result = {
+                "duration_s": time.monotonic() - reload_started,
+                "operation": "load_world_reset",
+                "result_code": result_code,
+                "result_message": result_message,
+                "service_name": load_service_name,
+                "success": True,
+                "world": loaded_world,
+            }
+            # World reload rebuilds the stage's ROS graph. Force fresh
+            # requester endpoints before post-reset state/readback assertions.
+            node.destroy_node()
+            node = Node(f"manyforge_i9_world_probe_{os.getpid()}_post_reset")
+
+        recovery_timeout_s = (
+            _SIMULATION_RELOAD_RECOVERY_TIMEOUT_S if reset else 10.0
+        )
         play_result = (
-            control.set_simulation_state(state="playing").to_dict()
+            retry_control(
+                lambda client: client.set_simulation_state(state="playing"),
+                timeout_s=recovery_timeout_s,
+            )
             if play
             else None
         )
         stop_result = (
-            control.set_simulation_state(state="stopped").to_dict()
+            retry_control(
+                lambda client: client.set_simulation_state(state="stopped"),
+                timeout_s=recovery_timeout_s,
+            )
             if stop
             else None
         )
-        state = control.get_simulation_state().to_dict()
-        deadline = time.monotonic() + 10.0
-        service_name: str | None = None
-        while time.monotonic() < deadline and service_name is None:
+        state = retry_control(
+            lambda client: client.get_simulation_state(),
+            timeout_s=recovery_timeout_s,
+        )
+
+        deadline = time.monotonic() + recovery_timeout_s
+        response = None
+        last_world_error = "GetCurrentWorld service is unavailable"
+        while response is None and time.monotonic() < deadline:
             service_name = select_service_name(
                 node.get_service_names_and_types(),
                 service_type="simulation_interfaces/srv/GetCurrentWorld",
             )
-            if service_name is None:
-                time.sleep(0.05)
-        if service_name is None:
-            raise LiveRowError("GetCurrentWorld service is unavailable")
-        client = node.create_client(GetCurrentWorld, service_name)
-        try:
-            if not client.wait_for_service(timeout_sec=10.0):
-                raise LiveRowError("GetCurrentWorld service did not become ready")
-            future = client.call_async(GetCurrentWorld.Request())
-            rclpy.spin_until_future_complete(node, future, timeout_sec=10.0)
-            response = future.result() if future.done() else None
-        finally:
-            node.destroy_client(client)
-        if response is None or int(response.result.result) != int(
-            response.result.RESULT_OK
-        ):
-            raise LiveRowError("GetCurrentWorld returned no successful response")
+            if service_name is not None:
+                remaining_s = max(0.05, deadline - time.monotonic())
+                attempt_timeout_s = min(
+                    _SIMULATION_RELOAD_ATTEMPT_TIMEOUT_S, remaining_s
+                )
+                client = node.create_client(GetCurrentWorld, service_name)
+                try:
+                    if not client.wait_for_service(timeout_sec=attempt_timeout_s):
+                        last_world_error = (
+                            f"GetCurrentWorld service did not become ready: "
+                            f"{service_name}"
+                        )
+                    else:
+                        future = client.call_async(GetCurrentWorld.Request())
+                        rclpy.spin_until_future_complete(
+                            node, future, timeout_sec=attempt_timeout_s
+                        )
+                        candidate = future.result() if future.done() else None
+                        if candidate is None:
+                            last_world_error = (
+                                "GetCurrentWorld returned no response"
+                            )
+                        elif int(candidate.result.result) != int(
+                            candidate.result.RESULT_OK
+                        ):
+                            last_world_error = (
+                                "GetCurrentWorld returned result "
+                                f"{int(candidate.result.result)}: "
+                                f"{str(candidate.result.error_message)[:512]}"
+                            )
+                        else:
+                            response = candidate
+                except Exception as error:
+                    last_world_error = (
+                        "GetCurrentWorld request failed: " + str(error)[:512]
+                    )
+                finally:
+                    node.destroy_client(client)
+            if response is None:
+                time.sleep(min(0.05, max(0.0, deadline - time.monotonic())))
+        if response is None:
+            raise LiveRowError(
+                "GetCurrentWorld returned no successful response: "
+                + last_world_error
+            )
         world = {
             "name": str(response.world.name),
             "uri": normalize_file_world_uri(
@@ -2240,7 +2407,11 @@ def _build_checks(
             and program_run_id is not None
         ),
         "reset_observed": bool(
-            isinstance(reset_result, dict) and reset_result.get("success") is True
+            isinstance(reset_result, dict)
+            and reset_result.get("success") is True
+            and reset_result.get("operation") == "load_world_reset"
+            and reset_result.get("world")
+            == {"name": spec.world_name, "uri": spec.world_uri}
         ),
         "required_topics_exact": required_topics_exact,
         "runtime_namespace_exact": bool(
