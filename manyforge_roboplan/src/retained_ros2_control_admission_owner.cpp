@@ -109,6 +109,8 @@ void RetainedRos2ControlAdmissionOwner::Run(
   std::uint64_t publication_generation = 0U;
   std::uint64_t lifecycle_generation = 0U;
   bool binding_lease_expiration_deferred = false;
+  bool component_readback_gap_deferred = false;
+  bool exact_component_readback_observed = false;
   std::string previous_semantics;
   const auto wait_for_next_observation = [this, &stop_token]() {
     std::unique_lock wait_lock(wakeup_mutex_);
@@ -131,15 +133,28 @@ void RetainedRos2ControlAdmissionOwner::Run(
       }
 
       std::optional<core::ComponentLifecycleCurrentSnapshotDTO> component;
+      bool defer_component_readback_gap = false;
       try {
         auto readback = component_snapshot_source_();
         if (readback.ok() && readback.value().locally_valid() &&
             readback.value().controllable_component_id ==
                 config_.controllable_component_id) {
           component = std::move(readback.value());
+          exact_component_readback_observed = true;
+          component_readback_gap_deferred = false;
         }
       } catch (...) {
         component.reset();
+      }
+      if (!component.has_value() && exact_component_readback_observed &&
+          !component_readback_gap_deferred) {
+        // A current-fact read joins multiple durable read-only stores and can
+        // lose one observation to bounded reader contention. The already
+        // published admission has its own short lease, so hold exactly one
+        // publication period instead of inventing an inactive lifecycle
+        // transition. A second consecutive gap still fails closed below.
+        component_readback_gap_deferred = true;
+        defer_component_readback_gap = true;
       }
       const auto binding = runtime_handle_->controller_binding_snapshot();
       bool controller_ready = false;
@@ -181,6 +196,16 @@ void RetainedRos2ControlAdmissionOwner::Run(
           std::lock_guard lock(status_mutex_);
           status_.healthy = true;
           ++status_.binding_lease_expirations_deferred_total;
+          status_.reason_code.clear();
+        }
+        wait_for_next_observation();
+        continue;
+      }
+      if (defer_component_readback_gap && controller_ready) {
+        {
+          std::lock_guard lock(status_mutex_);
+          status_.healthy = true;
+          ++status_.component_readback_gaps_deferred_total;
           status_.reason_code.clear();
         }
         wait_for_next_observation();

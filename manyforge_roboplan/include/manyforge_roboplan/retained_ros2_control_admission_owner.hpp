@@ -35,6 +35,7 @@ struct RetainedRos2ControlAdmissionOwnerStatus final {
   std::uint64_t publication_generation{};
   std::uint64_t lifecycle_generation{};
   std::uint64_t binding_lease_expirations_deferred_total{};
+  std::uint64_t component_readback_gaps_deferred_total{};
   core::TimePoint last_publication_ns{};
   std::string reason_code;
 };

@@ -12,6 +12,7 @@
 #include <gtest/gtest.h>
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <stdexcept>
 #include <string>
@@ -187,6 +188,64 @@ isaac_runtime_configuration(std::string profile) {
   result.execution_tick_hz = 100U;
   result.collision_monitor_period_ms = 50.0;
   return result;
+}
+
+[[nodiscard]] core::ComponentLifecycleCurrentSnapshotDTO
+active_component_snapshot() {
+  const std::string scene_digest =
+      "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+  const core::ProjectionRevisionDTO revision{
+      core::RetainedBundleId("bundle"), core::GraphRevision("graph"),
+      {core::SceneId(scene_digest), 1U, core::ContentDigest(scene_digest)}};
+  const core::ActiveBundlePublicationReceiptDTO publication{
+      {core::BootstrapPublicationTransactionDTO{
+           core::BootstrapId("bootstrap.admission"),
+           core::BootstrapGeneration(1U)},
+       revision,
+       revision.retained_bundle_id,
+       revision.graph_revision,
+       std::nullopt,
+       core::ContentDigest("private-materialization"),
+       core::ContentDigest("retired-command-surfaces")},
+      core::ActiveBundlePublicationGeneration(1U),
+      core::ContentDigest("active-public-pointer")};
+  const core::ExpectedControlBindingRevisionDTO binding{
+      core::ControlBindingId("binding.arm"),
+      core::ControlBindingRevision("binding-revision"),
+      core::ControlRouteId("route.ros2_control")};
+  const core::ResolvedLifecycleControlDomainScopeDTO domain{
+      core::ControlDomainId("domain.arm"),
+      core::ControlDomainRevision("domain-revision"),
+      core::ControllerTopologyId("topology.ros2_control"),
+      core::TopologyRevision("topology-revision"),
+      std::nullopt,
+      {binding},
+      {core::ResourceId("robot.joint.1")}};
+  const core::ResolvedLifecycleProviderOccurrenceDTO provider{
+      domain.control_domain_id,
+      domain.control_domain_revision,
+      core::ProviderInstanceId("provider.ros2_control"),
+      core::ProviderManifestId("provider-manifest.ros2_control"),
+      core::ProviderManifestRevision("provider-manifest-revision"),
+      core::RuntimeUnitId("runtime.ros2_control"),
+      core::RuntimeEpoch("runtime-epoch.1"),
+      core::ContentDigest("lifecycle-catalog-digest")};
+  core::ComponentLifecycleCurrentSnapshotDTO snapshot{
+      core::ContentDigest("pending-snapshot-digest"),
+      core::ControllableComponentId("robot_1"),
+      core::ComponentLifecycleGeneration(3U),
+      core::ComponentLifecycleStateDTO::kActive,
+      publication,
+      {domain},
+      {provider}};
+  const auto digest =
+      core::ComputeComponentLifecycleCurrentSnapshotDigest(snapshot);
+  if (!digest.ok()) {
+    throw std::logic_error("test could not seal lifecycle snapshot: " +
+                           digest.error().message);
+  }
+  snapshot.snapshot_digest = digest.value();
+  return snapshot;
 }
 
 [[nodiscard]] core::ProviderManifestDTO ros_lifecycle_manifest() {
@@ -659,6 +718,120 @@ TEST(RetainedRos2ControlBackendFactoryTest,
   EXPECT_TRUE(recovered_admission->controller_ready);
   EXPECT_EQ(recovered_admission->lifecycle_generation,
             initial_admission->lifecycle_generation);
+}
+
+TEST(RetainedRos2ControlBackendFactoryTest,
+     AdmissionOwnerHoldsOneLifecycleReadbackGapAndClosesOnSecond) {
+  const auto runtime = isaac_runtime_configuration("lite6");
+  auto selected = make_retained_isaac_ros2_control_backend_config(
+      runtime, commanded_binding(), commanded_gripper_binding());
+  ASSERT_TRUE(selected.execution.controller_binding.has_value());
+  const auto binding_contract = *selected.execution.controller_binding;
+
+  core::FakeClock clock;
+  clock.set(1'000);
+  core::ManualScheduler scheduler;
+  auto sink = std::make_shared<NullExecutionStateSink>();
+  auto backend =
+      std::make_shared<ros2_control_execution::Ros2ControlExecutionBackend>(
+          ros2_control_execution::Ros2ControlExecutionBackend::
+              TestingNoRosStartupTag{},
+          sink, "arm", clock, scheduler, std::move(selected.execution));
+  auto handle = std::make_shared<RetainedRos2ControlRuntimeHandle>();
+  ASSERT_TRUE(
+      handle->BindBackend(backend, commanded_binding(), std::nullopt).ok());
+
+  ros2_control_execution::ControllerBindingSnapshot ready;
+  ready.activity_generation = 1U;
+  ready.contract_generation_id = binding_contract.generation_id;
+  ready.observed_timestamp_ns = clock.now();
+  ready.received_timestamp_ns = clock.now();
+  ready.fresh_until_ns = clock.now() + 1'000'000'000;
+  ready.valid = true;
+  backend->testing_publish_controller_binding_snapshot(std::move(ready));
+
+  const auto component = active_component_snapshot();
+  std::atomic<bool> readback_available{true};
+  auto owner = RetainedRos2ControlAdmissionOwner::Create(
+      RetainedRos2ControlAdmissionOwnerConfig{
+          core::ControllableComponentId("robot_1"),
+          core::RuntimeEpoch("runtime-epoch.1"), binding_contract.generation_id,
+          "provider-epoch.1", "cell-supervisor-epoch.1", 100'000'000,
+          500'000'000},
+      handle, clock, [&component, &readback_available] {
+        if (!readback_available.load(std::memory_order_acquire)) {
+          return core::Result<core::ComponentLifecycleCurrentSnapshotDTO>::Err(
+              core::ErrorDTO{std::string(core::to_string(
+                                 core::ErrorCode::kInvariantViolation)),
+                             "component snapshot intentionally unavailable",
+                             {}});
+        }
+        return core::Result<core::ComponentLifecycleCurrentSnapshotDTO>::Ok(
+            component);
+      });
+  ASSERT_TRUE(owner.ok()) << owner.error().message;
+
+  const auto initial_deadline =
+      std::chrono::steady_clock::now() + std::chrono::seconds(2);
+  while (owner.value()->status().publication_generation == 0U &&
+         std::chrono::steady_clock::now() < initial_deadline) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+  }
+  const auto initial_status = owner.value()->status();
+  ASSERT_GT(initial_status.publication_generation, 0U);
+  const auto initial_admission = backend->execution_admission_snapshot();
+  ASSERT_TRUE(initial_admission.has_value());
+  ASSERT_TRUE(initial_admission->motion_admitted);
+
+  readback_available.store(false, std::memory_order_release);
+  const auto gap_deadline =
+      std::chrono::steady_clock::now() + std::chrono::seconds(2);
+  while (owner.value()->status().component_readback_gaps_deferred_total == 0U &&
+         std::chrono::steady_clock::now() < gap_deadline) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+  }
+  const auto gap_status = owner.value()->status();
+  ASSERT_EQ(gap_status.component_readback_gaps_deferred_total, 1U);
+  EXPECT_EQ(gap_status.publication_generation,
+            initial_status.publication_generation);
+  const auto retained_admission = backend->execution_admission_snapshot();
+  ASSERT_TRUE(retained_admission.has_value());
+  EXPECT_TRUE(retained_admission->motion_admitted);
+  EXPECT_EQ(retained_admission->lifecycle_generation,
+            initial_admission->lifecycle_generation);
+
+  readback_available.store(true, std::memory_order_release);
+  const auto recovery_deadline =
+      std::chrono::steady_clock::now() + std::chrono::seconds(2);
+  while (owner.value()->status().publication_generation <=
+             initial_status.publication_generation &&
+         std::chrono::steady_clock::now() < recovery_deadline) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+  }
+  const auto recovered_status = owner.value()->status();
+  ASSERT_GT(recovered_status.publication_generation,
+            initial_status.publication_generation);
+  EXPECT_EQ(recovered_status.lifecycle_generation,
+            initial_status.lifecycle_generation);
+
+  readback_available.store(false, std::memory_order_release);
+  const auto closed_deadline =
+      std::chrono::steady_clock::now() + std::chrono::seconds(2);
+  bool closed = false;
+  while (std::chrono::steady_clock::now() < closed_deadline) {
+    const auto admission = backend->execution_admission_snapshot();
+    if (admission.has_value() && !admission->motion_admitted) {
+      closed = true;
+      EXPECT_TRUE(std::binary_search(
+          admission->reason_codes.begin(), admission->reason_codes.end(),
+          "component_lifecycle_snapshot_unavailable"));
+      EXPECT_GT(admission->lifecycle_generation,
+                initial_admission->lifecycle_generation);
+      break;
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+  }
+  EXPECT_TRUE(closed);
 }
 
 } // namespace
