@@ -61,7 +61,7 @@
       "deployment_revision": "sha256:643250ad697c963d6d1a69aaac18c0d02931106acfb2f6e337b50a36a31901e8",
       "deployment_source": "examples/isaac_manipulator_scene_light_assistant.deployment.yaml",
       "program_id": "isaac_manipulator_scene_light",
-      "program_revision": "sha256:85e8b2bae0a338e652e6b59c408a55511bb4162d0a82020ccf75b8187cef21af",
+      "program_revision": "sha256:65d15a2be5027c80eb82f02a6cb57805458c7c480e9d9ad38b98fe1a0ec4211e",
       "program_source": "examples/isaac_manipulator_scene_light.program.yaml",
       "scenario_aliases": [
         "isaac-assistant"
@@ -87,7 +87,7 @@
       "deployment_revision": "sha256:0be60551300c00c8ba537c97698ff414176abee01ed3a4406befd049d156933b",
       "deployment_source": "examples/isaac_manipulator_scene_light_ros2_control.deployment.yaml",
       "program_id": "isaac_manipulator_scene_light",
-      "program_revision": "sha256:85e8b2bae0a338e652e6b59c408a55511bb4162d0a82020ccf75b8187cef21af",
+      "program_revision": "sha256:65d15a2be5027c80eb82f02a6cb57805458c7c480e9d9ad38b98fe1a0ec4211e",
       "program_source": "examples/isaac_manipulator_scene_light.program.yaml",
       "scenario_aliases": [
         "isaac-light"

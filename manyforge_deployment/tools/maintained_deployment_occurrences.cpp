@@ -1307,7 +1307,7 @@ void verify_resolved_program_binding(
       "385569e5d9b2c2628abf67fc4633583e97cd9cfb0fc881d3cf3bae0750d2951a");
   const auto reused_isaac_ur_program = program_bundles.find(
       "sha256:"
-      "85e8b2bae0a338e652e6b59c408a55511bb4162d0a82020ccf75b8187cef21af");
+      "65d15a2be5027c80eb82f02a6cb57805458c7c480e9d9ad38b98fe1a0ec4211e");
   if (binding_ids.size() != 13U || program_revisions.size() != 11U ||
       reopened.size() != 13U || program_reopened.size() != 11U ||
       reused_generic_ur_program == program_bundles.end() ||
