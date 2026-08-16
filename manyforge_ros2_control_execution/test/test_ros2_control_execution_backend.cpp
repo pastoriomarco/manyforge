@@ -1003,6 +1003,16 @@ public:
 
   void announce_activity() { publish_activity(); }
 
+  void replay_last_activity() {
+    controller_manager_msgs::msg::ControllerManagerActivity activity;
+    {
+      std::lock_guard<std::mutex> lock(mutex_);
+      ASSERT_TRUE(last_activity_.has_value());
+      activity = *last_activity_;
+    }
+    activity_publisher_->publish(activity);
+  }
+
   void stop_services_without_activity() {
     list_controllers_service_.reset();
     list_hardware_service_.reset();
@@ -1058,6 +1068,7 @@ private:
     controller_manager_msgs::msg::ControllerManagerActivity activity;
     {
       std::lock_guard<std::mutex> lock(mutex_);
+      activity.header.stamp.nanosec = ++activity_sequence_;
       controller_manager_msgs::msg::NamedLifecycleState controller;
       controller.name = contract_.trajectory_controller_manager_name;
       controller.state.id =
@@ -1071,6 +1082,7 @@ private:
       hardware.state.id = lifecycle_msgs::msg::State::PRIMARY_STATE_ACTIVE;
       hardware.state.label = "active";
       activity.hardware_components.push_back(std::move(hardware));
+      last_activity_ = activity;
     }
     activity_publisher_->publish(activity);
   }
@@ -1090,6 +1102,9 @@ private:
   mutable std::mutex mutex_;
   bool controller_active_ = true;
   bool conflicting_claim_ = false;
+  std::uint32_t activity_sequence_ = 0;
+  std::optional<controller_manager_msgs::msg::ControllerManagerActivity>
+      last_activity_;
 };
 
 template <typename Predicate>
@@ -1554,6 +1569,57 @@ TEST(Ros2ControlExecutionBackendTest,
         return candidate.activity_generation > 0 && candidate.valid;
       });
   ASSERT_TRUE(admitted.has_value());
+}
+
+TEST(Ros2ControlExecutionBackendTest,
+     ExactTransientLocalActivityReplayDoesNotFenceDispatch) {
+  const std::string suffix = unique_suffix();
+  const std::string controller_manager =
+      "/manyforge_binding_activity_replay_" + suffix + "/controller_manager";
+  auto config = base_config();
+  config.action_name = "/manyforge_binding_activity_replay_" + suffix +
+                       "/follow_joint_trajectory";
+  config.joint_state_topic =
+      "/manyforge_binding_activity_replay_" + suffix + "/joint_states";
+  config.controller_state_topic =
+      "/manyforge_binding_activity_replay_" + suffix + "/controller_state";
+  config.controller_binding = binding_contract_for(config, controller_manager);
+  config.controller_binding_refresh_timeout_s = 1.0;
+
+  FakeControllerManager manager(controller_manager, *config.controller_binding);
+  auto sink = std::make_shared<RecordingExecutionStateSink>();
+  core::FakeClock clock;
+  core::ManualScheduler scheduler;
+  clock.set(1'000'000'000);
+  Ros2ControlExecutionBackend backend(sink, "arm", clock, scheduler, config);
+  ASSERT_TRUE(manager.wait_for_activity_subscription());
+
+  const auto admitted = wait_for_binding_snapshot(
+      backend, [](const ControllerBindingSnapshot &candidate) {
+        return candidate.activity_generation > 0 && candidate.valid;
+      });
+  ASSERT_TRUE(admitted.has_value());
+  const auto metrics_before = backend.controller_progress_metrics();
+
+  manager.replay_last_activity();
+  const auto duplicate_deadline = std::chrono::steady_clock::now() + 2s;
+  while (std::chrono::steady_clock::now() < duplicate_deadline &&
+         backend.controller_progress_metrics()
+                 .controller_binding_activity_duplicates_total ==
+             metrics_before.controller_binding_activity_duplicates_total) {
+    std::this_thread::sleep_for(10ms);
+  }
+
+  const auto metrics_after = backend.controller_progress_metrics();
+  EXPECT_EQ(metrics_after.controller_binding_activity_duplicates_total,
+            metrics_before.controller_binding_activity_duplicates_total + 1);
+  EXPECT_EQ(metrics_after.controller_binding_activity_events_total,
+            metrics_before.controller_binding_activity_events_total);
+  const auto after_replay = backend.controller_binding_snapshot();
+  ASSERT_TRUE(after_replay.has_value());
+  EXPECT_TRUE(after_replay->valid);
+  EXPECT_EQ(after_replay->activity_generation,
+            admitted->activity_generation);
 }
 
 TEST(Ros2ControlExecutionBackendTest,

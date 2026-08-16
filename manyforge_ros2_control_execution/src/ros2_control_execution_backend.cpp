@@ -1609,7 +1609,18 @@ void Ros2ControlExecutionBackend::invalidate_controller_binding(
 }
 
 void Ros2ControlExecutionBackend::on_controller_manager_activity(
-    const controller_manager_msgs::msg::ControllerManagerActivity::SharedPtr) {
+    const controller_manager_msgs::msg::ControllerManagerActivity::SharedPtr
+        msg) {
+  {
+    std::lock_guard<std::mutex> lock(controller_binding_monitor_mutex_);
+    if (last_controller_manager_activity_.has_value() &&
+        *last_controller_manager_activity_ == *msg) {
+      controller_binding_activity_duplicates_total_.fetch_add(
+          1, std::memory_order_relaxed);
+      return;
+    }
+    last_controller_manager_activity_ = *msg;
+  }
   controller_binding_activity_events_total_.fetch_add(
       1, std::memory_order_relaxed);
   controller_binding_activity_generation_.fetch_add(1,
@@ -3137,6 +3148,9 @@ Ros2ControlExecutionBackend::controller_progress_metrics() const {
       jtc_cancel_reference_rejections_total_.load(std::memory_order_relaxed);
   metrics.controller_binding_activity_events_total =
       controller_binding_activity_events_total_.load(std::memory_order_relaxed);
+  metrics.controller_binding_activity_duplicates_total =
+      controller_binding_activity_duplicates_total_.load(
+          std::memory_order_relaxed);
   metrics.controller_binding_refresh_attempts_total =
       controller_binding_refresh_attempts_total_.load(
           std::memory_order_relaxed);
@@ -3410,6 +3424,9 @@ void Ros2ControlExecutionBackend::fail_active_dispatch_authority(
   cancel_goal_if_known(handle_to_cancel);
   decision.details["controller_binding_activity_events_total"] =
       std::to_string(controller_binding_activity_events_total_.load(
+          std::memory_order_relaxed));
+  decision.details["controller_binding_activity_duplicates_total"] =
+      std::to_string(controller_binding_activity_duplicates_total_.load(
           std::memory_order_relaxed));
   decision.details["controller_binding_refresh_attempts_total"] =
       std::to_string(controller_binding_refresh_attempts_total_.load(
@@ -5366,6 +5383,9 @@ core::ExecutionHandle Ros2ControlExecutionBackend::execute_trajectory(
           decision.reason_code.rfind("controller_", 0) == 0;
       decision.details["controller_binding_activity_events_total"] =
           std::to_string(controller_binding_activity_events_total_.load(
+              std::memory_order_relaxed));
+      decision.details["controller_binding_activity_duplicates_total"] =
+          std::to_string(controller_binding_activity_duplicates_total_.load(
               std::memory_order_relaxed));
       decision.details["controller_binding_refresh_attempts_total"] =
           std::to_string(controller_binding_refresh_attempts_total_.load(

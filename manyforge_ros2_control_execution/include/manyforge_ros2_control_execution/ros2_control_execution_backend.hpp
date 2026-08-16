@@ -158,6 +158,7 @@ struct Ros2ControlControllerProgressMetrics {
   std::uint64_t jtc_cancel_reference_publications_total = 0;
   std::uint64_t jtc_cancel_reference_rejections_total = 0;
   std::uint64_t controller_binding_activity_events_total = 0;
+  std::uint64_t controller_binding_activity_duplicates_total = 0;
   std::uint64_t controller_binding_refresh_attempts_total = 0;
   std::uint64_t controller_binding_refresh_successes_total = 0;
   std::uint64_t controller_binding_refresh_failures_total = 0;
@@ -1308,6 +1309,11 @@ private:
   std::atomic<std::uint64_t> next_controller_binding_snapshot_generation_{1};
   std::atomic<std::uint64_t> controller_binding_activity_generation_{0};
   mutable std::mutex controller_binding_monitor_mutex_;
+  // Fast DDS may redeliver the transient-local activity sample after a match
+  // disturbance. Preserve the complete sample so an exact replay can be
+  // observed without inventing a new controller lifecycle generation.
+  std::optional<controller_manager_msgs::msg::ControllerManagerActivity>
+      last_controller_manager_activity_;
   std::condition_variable_any controller_binding_monitor_cv_;
   bool controller_binding_refresh_requested_ = false;
   std::jthread controller_binding_monitor_thread_;
@@ -1413,6 +1419,7 @@ private:
   std::atomic<std::uint64_t> jtc_cancel_reference_publications_total_{0};
   std::atomic<std::uint64_t> jtc_cancel_reference_rejections_total_{0};
   std::atomic<std::uint64_t> controller_binding_activity_events_total_{0};
+  std::atomic<std::uint64_t> controller_binding_activity_duplicates_total_{0};
   std::atomic<std::uint64_t> controller_binding_refresh_attempts_total_{0};
   std::atomic<std::uint64_t> controller_binding_refresh_successes_total_{0};
   std::atomic<std::uint64_t> controller_binding_refresh_failures_total_{0};
