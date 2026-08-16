@@ -1077,6 +1077,14 @@ private:
               : lifecycle_msgs::msg::State::PRIMARY_STATE_INACTIVE;
       controller.state.label = controller_active_ ? "active" : "inactive";
       activity.controllers.push_back(std::move(controller));
+      if (conflicting_claim_) {
+        controller_manager_msgs::msg::NamedLifecycleState conflict;
+        conflict.name = "conflicting_controller";
+        conflict.state.id =
+            lifecycle_msgs::msg::State::PRIMARY_STATE_ACTIVE;
+        conflict.state.label = "active";
+        activity.controllers.push_back(std::move(conflict));
+      }
       controller_manager_msgs::msg::NamedLifecycleState hardware;
       hardware.name = contract_.hardware_component_name;
       hardware.state.id = lifecycle_msgs::msg::State::PRIMARY_STATE_ACTIVE;
@@ -1572,7 +1580,7 @@ TEST(Ros2ControlExecutionBackendTest,
 }
 
 TEST(Ros2ControlExecutionBackendTest,
-     ExactTransientLocalActivityReplayDoesNotFenceDispatch) {
+     EquivalentActivitySnapshotsDoNotFenceDispatch) {
   const std::string suffix = unique_suffix();
   const std::string controller_manager =
       "/manyforge_binding_activity_replay_" + suffix + "/controller_manager";
@@ -1601,7 +1609,10 @@ TEST(Ros2ControlExecutionBackendTest,
   ASSERT_TRUE(admitted.has_value());
   const auto metrics_before = backend.controller_progress_metrics();
 
-  manager.replay_last_activity();
+  // A controller-manager publication carries a fresh header timestamp even
+  // when its lifecycle snapshot is unchanged. It and an exact transient-local
+  // replay are both observations of the same authority generation.
+  manager.announce_activity();
   const auto duplicate_deadline = std::chrono::steady_clock::now() + 2s;
   while (std::chrono::steady_clock::now() < duplicate_deadline &&
          backend.controller_progress_metrics()
@@ -1614,6 +1625,20 @@ TEST(Ros2ControlExecutionBackendTest,
   EXPECT_EQ(metrics_after.controller_binding_activity_duplicates_total,
             metrics_before.controller_binding_activity_duplicates_total + 1);
   EXPECT_EQ(metrics_after.controller_binding_activity_events_total,
+            metrics_before.controller_binding_activity_events_total);
+
+  manager.replay_last_activity();
+  const auto replay_deadline = std::chrono::steady_clock::now() + 2s;
+  while (std::chrono::steady_clock::now() < replay_deadline &&
+         backend.controller_progress_metrics()
+                 .controller_binding_activity_duplicates_total ==
+             metrics_after.controller_binding_activity_duplicates_total) {
+    std::this_thread::sleep_for(10ms);
+  }
+  const auto metrics_after_replay = backend.controller_progress_metrics();
+  EXPECT_EQ(metrics_after_replay.controller_binding_activity_duplicates_total,
+            metrics_before.controller_binding_activity_duplicates_total + 2);
+  EXPECT_EQ(metrics_after_replay.controller_binding_activity_events_total,
             metrics_before.controller_binding_activity_events_total);
   const auto after_replay = backend.controller_binding_snapshot();
   ASSERT_TRUE(after_replay.has_value());

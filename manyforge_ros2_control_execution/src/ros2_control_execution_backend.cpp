@@ -1614,7 +1614,10 @@ void Ros2ControlExecutionBackend::on_controller_manager_activity(
   {
     std::lock_guard<std::mutex> lock(controller_binding_monitor_mutex_);
     if (last_controller_manager_activity_.has_value() &&
-        *last_controller_manager_activity_ == *msg) {
+        last_controller_manager_activity_->controllers == msg->controllers &&
+        last_controller_manager_activity_->hardware_components ==
+            msg->hardware_components) {
+      last_controller_manager_activity_ = *msg;
       controller_binding_activity_duplicates_total_.fetch_add(
           1, std::memory_order_relaxed);
       return;
