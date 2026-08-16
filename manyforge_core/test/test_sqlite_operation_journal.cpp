@@ -408,6 +408,21 @@ TEST(SqliteOperationJournalTest, StopTerminalProjectionIsAtomicReplaySafeAndReco
                                                   terminal->certificate, terminal->fault_latch);
     EXPECT_EQ(first.state, StopForensicProjectionStateDTO::kRecorded);
     ASSERT_TRUE(first.journal_sequence.has_value());
+
+    const auto operational =
+        journal.ReadOperationalEvents(epoch, 0U, kMaximumOperationJournalEventPage);
+    ASSERT_TRUE(operational.ok()) << operational.error().message;
+    ASSERT_EQ(operational.value().events.size(), 1U);
+    EXPECT_EQ(operational.value().events.front().record_kind,
+              "stop_acceptance_projected");
+    EXPECT_FALSE(operational.value().has_more);
+
+    const auto forensic =
+        journal.ReadEvents(epoch, 0U, kMaximumOperationJournalEventPage);
+    ASSERT_TRUE(forensic.ok()) << forensic.error().message;
+    ASSERT_EQ(forensic.value().events.size(), 2U);
+    EXPECT_EQ(forensic.value().events.back().record_kind,
+              "stop_terminal_projected");
     const auto replay = journal.RecordStopTerminal(epoch, terminal->stop_status,
                                                    terminal->certificate, terminal->fault_latch);
     EXPECT_EQ(replay.state, StopForensicProjectionStateDTO::kRecorded);

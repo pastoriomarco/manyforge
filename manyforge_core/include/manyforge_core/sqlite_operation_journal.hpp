@@ -107,6 +107,13 @@ class SqliteOperationJournal final : public IOperationJournal {
       const RequestOwnerEpoch& owner_epoch, std::uint64_t after_sequence,
       std::size_t limit = kMaximumOperationJournalEventPage);
 
+  /// Read the bounded operational projection consumed by the headless event
+  /// pump. Forensic-only Stop terminal, surveillance, fault-clear, and owner
+  /// lifecycle records remain durable but cannot poison this external page.
+  [[nodiscard]] Result<OperationJournalEventPageDTO> ReadOperationalEvents(
+      const RequestOwnerEpoch& owner_epoch, std::uint64_t after_sequence,
+      std::size_t limit = kMaximumOperationJournalEventPage);
+
   void Close();
 
  private:

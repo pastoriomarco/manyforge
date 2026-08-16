@@ -2170,7 +2170,8 @@ class SqliteOperationJournal::Impl final {
                                      const char* transition_reason);
 
   OperationJournalEventPageDTO ReadEvents(const RequestOwnerEpoch& owner_epoch,
-                                          std::uint64_t after_sequence, std::size_t limit);
+                                          std::uint64_t after_sequence, std::size_t limit,
+                                          bool operational_only = false);
 
  private:
   void RequireOpen() const {
@@ -2666,7 +2667,7 @@ std::uint64_t SqliteOperationJournal::Impl::AppendStopTerminal(
 
 OperationJournalEventPageDTO SqliteOperationJournal::Impl::ReadEvents(
     const RequestOwnerEpoch& owner_epoch, const std::uint64_t after_sequence,
-    const std::size_t limit) {
+    const std::size_t limit, const bool operational_only) {
   Require(!owner_epoch.empty() && after_sequence <= kMaximumSafeInteger && limit > 0U &&
               limit <= kMaximumOperationJournalEventPage,
           "operation_journal_event_query_invalid",
@@ -2680,11 +2681,20 @@ OperationJournalEventPageDTO SqliteOperationJournal::Impl::ReadEvents(
           "operation_journal_owner_epoch_stale",
           "operation event query names a non-active owner epoch");
 
-  Statement query(database_,
-                  "SELECT sequence,record_kind,request_id,operation_id,"
-                  "operation_revision,occurred_at_ns,occurred_at_wall,effect_pending,"
-                  "payload_json,payload_digest FROM journal_records "
-                  "WHERE owner_epoch=? AND sequence>? ORDER BY sequence LIMIT ?");
+  Statement query(
+      database_,
+      operational_only
+          ? "SELECT sequence,record_kind,request_id,operation_id,"
+            "operation_revision,occurred_at_ns,occurred_at_wall,effect_pending,"
+            "payload_json,payload_digest FROM journal_records "
+            "WHERE owner_epoch=? AND sequence>? AND record_kind IN "
+            "('operation_accepted','control_accepted','stop_acceptance_projected',"
+            "'runtime_scale_accepted','state_observed','host_replaced') "
+            "ORDER BY sequence LIMIT ?"
+          : "SELECT sequence,record_kind,request_id,operation_id,"
+            "operation_revision,occurred_at_ns,occurred_at_wall,effect_pending,"
+            "payload_json,payload_digest FROM journal_records "
+            "WHERE owner_epoch=? AND sequence>? ORDER BY sequence LIMIT ?");
   query.Bind(1, owner_epoch.value());
   query.Bind(2, static_cast<std::int64_t>(after_sequence));
   query.Bind(3, static_cast<std::int64_t>(limit + 1U));
@@ -3478,6 +3488,13 @@ Result<OperationJournalEventPageDTO> SqliteOperationJournal::ReadEvents(
     const std::size_t limit) {
   return AsResult<OperationJournalEventPageDTO>(
       [&] { return impl_->ReadEvents(owner_epoch, after_sequence, limit); });
+}
+
+Result<OperationJournalEventPageDTO> SqliteOperationJournal::ReadOperationalEvents(
+    const RequestOwnerEpoch& owner_epoch, const std::uint64_t after_sequence,
+    const std::size_t limit) {
+  return AsResult<OperationJournalEventPageDTO>(
+      [&] { return impl_->ReadEvents(owner_epoch, after_sequence, limit, true); });
 }
 
 void SqliteOperationJournal::Close() {

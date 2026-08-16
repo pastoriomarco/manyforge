@@ -6691,7 +6691,7 @@ private:
       return StatusResponse(composition);
     }
     if (command.kind == CommandKind::kEvents) {
-      const auto page = composition.runtime->operation_journal->ReadEvents(
+      const auto page = composition.runtime->operation_journal->ReadOperationalEvents(
           *command.event_owner_epoch, command.after_sequence,
           command.event_limit);
       if (!page.ok()) {
