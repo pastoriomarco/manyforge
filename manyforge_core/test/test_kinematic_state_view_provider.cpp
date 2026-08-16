@@ -306,7 +306,11 @@ TEST(ImmutableKinematicStateViewProviderTest, RejectsStaleOrForeignPublicationBe
   stale_source->publications.begin()->second.received_timestamp_ns = 700;
   const ImmutableKinematicStateViewProvider stale_provider({KinematicObservedStateSourceBinding{
       ControlBindingId("binding-a"), ControlBindingRevision("binding-rev-a"), stale_source}});
-  EXPECT_FALSE(stale_provider.current_kinematic_state_path(query(), 1000).ok());
+  const auto stale = stale_provider.current_kinematic_state_path(query(), 1000);
+  ASSERT_FALSE(stale.ok());
+  EXPECT_EQ(stale.error().details.at("reason"), "kinematic_state_publication_mismatch");
+  EXPECT_EQ(stale.error().details.at("mismatch_field"),
+            "publication_invalid:observation_stale");
 
   auto foreign_source = valid_source();
   foreign_source->publications.begin()->second.provider_instance_id =
@@ -315,7 +319,10 @@ TEST(ImmutableKinematicStateViewProviderTest, RejectsStaleOrForeignPublicationBe
       ProviderInstanceId("other-provider");
   const ImmutableKinematicStateViewProvider foreign_provider({KinematicObservedStateSourceBinding{
       ControlBindingId("binding-a"), ControlBindingRevision("binding-rev-a"), foreign_source}});
-  EXPECT_FALSE(foreign_provider.current_kinematic_state_path(query(), 1000).ok());
+  const auto foreign = foreign_provider.current_kinematic_state_path(query(), 1000);
+  ASSERT_FALSE(foreign.ok());
+  EXPECT_EQ(foreign.error().details.at("reason"), "kinematic_state_publication_mismatch");
+  EXPECT_EQ(foreign.error().details.at("mismatch_field"), "provider_instance_id");
 }
 
 TEST(ImmutableKinematicStateViewProviderTest, RejectsMissingAndCallerAddedResourceCoverage) {

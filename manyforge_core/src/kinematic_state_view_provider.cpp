@@ -666,18 +666,41 @@ Result<KinematicStatePathViewDTO> ImmutableKinematicStateViewProvider::current_k
       const auto* configuration = find_expected_configuration(query, value);
       const CoordinatePositionDTO* position =
           find_resource_position(value, source_projection.resource_id);
-      if (!validate_observed_state_publication(value, now_ns).ok() || configuration == nullptr ||
-          position == nullptr || value.control_domain_id != path_source->second.first ||
-          value.control_domain_revision != path_source->second.second ||
-          value.provider_instance_id != source_projection.provider_instance_id ||
-          value.provider_manifest_id != source_projection.provider_manifest_id ||
-          value.provider_manifest_revision != source_projection.provider_manifest_revision ||
-          value.state_authority_id != source_projection.state_authority_id ||
-          value.state_authority_class != source_projection.state_authority_class ||
-          value.snapshot.source_kind != source_projection.publication_source) {
-        return Result<KinematicStatePathViewDTO>::Err(
-            state_view_error("kinematic_state_publication_mismatch",
-                             "Observed state differs from the retained path expectation"));
+      const auto valid_publication = validate_observed_state_publication(value, now_ns);
+      std::string mismatch_field;
+      if (!valid_publication.ok()) {
+        const auto reason = valid_publication.error().details.find("reason");
+        mismatch_field = reason == valid_publication.error().details.end()
+                             ? "publication_invalid"
+                             : "publication_invalid:" + reason->second;
+      } else if (configuration == nullptr) {
+        mismatch_field = "active_control_configuration";
+      } else if (position == nullptr) {
+        mismatch_field = "resource_position";
+      } else if (value.control_domain_id != path_source->second.first) {
+        mismatch_field = "control_domain_id";
+      } else if (value.control_domain_revision != path_source->second.second) {
+        mismatch_field = "control_domain_revision";
+      } else if (value.provider_instance_id != source_projection.provider_instance_id) {
+        mismatch_field = "provider_instance_id";
+      } else if (value.provider_manifest_id != source_projection.provider_manifest_id) {
+        mismatch_field = "provider_manifest_id";
+      } else if (value.provider_manifest_revision !=
+                 source_projection.provider_manifest_revision) {
+        mismatch_field = "provider_manifest_revision";
+      } else if (value.state_authority_id != source_projection.state_authority_id) {
+        mismatch_field = "state_authority_id";
+      } else if (value.state_authority_class != source_projection.state_authority_class) {
+        mismatch_field = "state_authority_class";
+      } else if (value.snapshot.source_kind != source_projection.publication_source) {
+        mismatch_field = "publication_source";
+      }
+      if (!mismatch_field.empty()) {
+        auto error = state_view_error(
+            "kinematic_state_publication_mismatch",
+            "Observed state differs from the retained path expectation");
+        error.details.emplace("mismatch_field", std::move(mismatch_field));
+        return Result<KinematicStatePathViewDTO>::Err(std::move(error));
       }
       used_domains.insert(configuration->control_domain_id);
       if (first_publication == nullptr) {
