@@ -1595,10 +1595,14 @@ def _resolved_position(
     client: HeadlessHttpClient,
     scene: Mapping[str, Any],
     scene_resource_id: str,
+    *,
+    attempts: int = _SCENE_POSE_QUERY_ATTEMPTS,
 ) -> tuple[float, float, float]:
+    if attempts <= 0:
+        raise ValueError("scene pose query attempts must be positive")
     current_scene = scene
     response: Mapping[str, Any] | None = None
-    for attempt in range(_SCENE_POSE_QUERY_ATTEMPTS):
+    for attempt in range(attempts):
         revision = _projection_revision(current_scene)
         if revision is None:
             raise LiveRowError("logical scene has no active projection revision")
@@ -1614,10 +1618,8 @@ def _resolved_position(
         except HeadlessClientError as error:
             if error.code not in {"stale_revision", "scene_projection_changed"}:
                 raise
-            if attempt + 1 == _SCENE_POSE_QUERY_ATTEMPTS:
-                raise LiveRowError(
-                    "scene resource pose query could not acquire a stable revision"
-                ) from error
+            if attempt + 1 == attempts:
+                raise
             time.sleep(0.01)
             current_scene = client.scene()
     if response is None:
@@ -1641,6 +1643,59 @@ def _resolved_position(
     ):
         raise LiveRowError("scene resource pose query returned invalid coordinates")
     return tuple(float(value) for value in coordinates)  # type: ignore[arg-type]
+
+
+def _snapshot_position(
+    scene: Mapping[str, Any], scene_resource_id: str
+) -> tuple[float, float, float]:
+    snapshot = _logical_snapshot(scene)
+    objects = snapshot.get("objects") if isinstance(snapshot, dict) else None
+    if not isinstance(objects, list):
+        raise LiveRowError("logical scene snapshot omitted its objects")
+    selected = [
+        row
+        for row in objects
+        if isinstance(row, dict)
+        and row.get("scene_resource_id") == scene_resource_id
+    ]
+    if len(selected) != 1:
+        raise LiveRowError("logical scene snapshot crossed object identity")
+    placement = selected[0].get("placement")
+    pose = placement.get("pose_in_cell") if isinstance(placement, dict) else None
+    position = pose.get("position_m") if isinstance(pose, dict) else None
+    if not isinstance(position, dict):
+        raise LiveRowError("logical scene snapshot omitted the object position")
+    coordinates = tuple(position.get(axis) for axis in ("x", "y", "z"))
+    if any(
+        isinstance(value, bool)
+        or not isinstance(value, (int, float))
+        or not math.isfinite(float(value))
+        for value in coordinates
+    ):
+        raise LiveRowError("logical scene snapshot returned invalid coordinates")
+    return tuple(float(value) for value in coordinates)  # type: ignore[arg-type]
+
+
+def _sample_position(
+    evidence: RunEvidence,
+    client: HeadlessHttpClient,
+    scene: Mapping[str, Any],
+    scene_resource_id: str,
+) -> tuple[float, float, float]:
+    try:
+        # Exercise the revision-fenced read without delaying motion sampling.
+        # A continuous pose source can advance the owner between the atomic
+        # publication read and this request indefinitely.  That expected race
+        # must stay fail-closed at the query boundary; the already revision-
+        # bound logical-scene snapshot remains a coherent observation.
+        return _resolved_position(
+            client, scene, scene_resource_id, attempts=1
+        )
+    except HeadlessClientError as error:
+        if error.code not in {"stale_revision", "scene_projection_changed"}:
+            raise
+        evidence.pose_query_rejections += 1
+        return _snapshot_position(scene, scene_resource_id)
 
 
 def _record_execution_evidence(
@@ -1865,8 +1920,8 @@ def _prime_run_evidence(
 ) -> None:
     _record_scene_evidence(evidence, scene)
     if "object_motion_observed" in spec.required_checks:
-        evidence.object_initial_position = _resolved_position(
-            client, scene, _OBJECT_MOTION_RESOURCE
+        evidence.object_initial_position = _sample_position(
+            evidence, client, scene, _OBJECT_MOTION_RESOURCE
         )
         evidence.object_pose_samples = 1
 
@@ -1881,11 +1936,9 @@ def _observe_run_evidence(
     _record_scene_evidence(evidence, scene)
     if "object_motion_observed" not in spec.required_checks:
         return
-    try:
-        position = _resolved_position(client, scene, _OBJECT_MOTION_RESOURCE)
-    except HeadlessClientError:
-        evidence.pose_query_rejections += 1
-        return
+    position = _sample_position(
+        evidence, client, scene, _OBJECT_MOTION_RESOURCE
+    )
     if evidence.object_initial_position is None:
         raise LiveRowError("object-motion observation has no initial pose")
     evidence.object_pose_samples += 1

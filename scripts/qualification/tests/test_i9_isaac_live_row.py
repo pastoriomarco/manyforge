@@ -532,6 +532,62 @@ def test_scene_pose_query_does_not_retry_other_failures(live: ModuleType) -> Non
         live._resolved_position(Client(), scene, "isaac_cheese_box")  # noqa: SLF001
 
 
+def test_scene_motion_sample_uses_revision_bound_snapshot_during_continuous_race(
+    live: ModuleType,
+) -> None:
+    scene = {
+        "logical_scene": {
+            "payload": {
+                "access": {
+                    "active_projection": {
+                        "graph_revision": "graph.1",
+                        "retained_bundle_id": "bundle.1",
+                        "scene_revision": {
+                            "content_hash": "content.1",
+                            "revision_id": 1,
+                            "scene_id": "scene.1",
+                        },
+                    }
+                },
+                "snapshot": {
+                    "objects": [
+                        {
+                            "scene_resource_id": "isaac_cheese_box",
+                            "placement": {
+                                "pose_in_cell": {
+                                    "position_m": {
+                                        "x": 1.0,
+                                        "y": 2.0,
+                                        "z": 3.0,
+                                    }
+                                }
+                            },
+                        }
+                    ]
+                },
+            }
+        }
+    }
+
+    class Client:
+        calls = 0
+
+        def resolve_scene_resources(self, body: dict) -> dict:
+            del body
+            self.calls += 1
+            raise live.HeadlessClientError(
+                "scene_projection_changed", "continuous source advanced", 409
+            )
+
+    client = Client()
+    evidence = live.RunEvidence(gripper_targets=())
+    assert live._sample_position(  # noqa: SLF001
+        evidence, client, scene, "isaac_cheese_box"
+    ) == (1.0, 2.0, 3.0)
+    assert client.calls == 1
+    assert evidence.pose_query_rejections == 1
+
+
 def test_check_reducer_requires_source_matched_foundationpose_latch(
     live: ModuleType,
 ) -> None:
