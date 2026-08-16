@@ -277,6 +277,21 @@ def _scene_shape(value: object, *, field: str) -> dict[str, Any]:
     raise ProductionPortError(f"{field} has an unsupported shape")
 
 
+def _scene_support_contacts(value: object, *, field: str) -> list[dict[str, Any]]:
+    if value is None:
+        return []
+    metadata = _mapping(value, field=field)
+    return [
+        dict(_mapping(contact, field=f"{field}.support_contacts[{index}]"))
+        for index, contact in enumerate(
+            _sequence(
+                metadata.get("support_contacts", ()),
+                field=f"{field}.support_contacts",
+            )
+        )
+    ]
+
+
 def _reference(
     value: object,
     *,
@@ -2585,7 +2600,9 @@ class HeadlessSceneProgramPort:
         ]
         if ids != sorted(ids) or len(ids) != len(set(ids)):
             raise ProductionPortError("initial scene is not canonical")
-        initialization_rows: list[tuple[bool, int, Mapping[str, Any]]] = []
+        initialization_rows: list[
+            tuple[bool, int, Mapping[str, Any], list[dict[str, Any]]]
+        ] = []
         for index, raw_row in enumerate(rows):
             row = _mapping(raw_row, field=f"initial_scene[{index}]")
             resource_roles = {
@@ -2596,7 +2613,15 @@ class HeadlessSceneProgramPort:
                 )
             }
             initialization_rows.append(
-                ("pick_object" in resource_roles, index, row)
+                (
+                    "pick_object" in resource_roles,
+                    index,
+                    row,
+                    _scene_support_contacts(
+                        row.get("metadata"),
+                        field=f"initial_scene[{index}].metadata",
+                    ),
+                )
             )
         # Continuously observed pick resources become writable as soon as they
         # exist. Commit every static resource first so a fast external pose
@@ -2680,7 +2705,7 @@ class HeadlessSceneProgramPort:
                 },
                 f"remove:{scene_resource_id}",
             )
-        for _pick_object, index, row in initialization_rows:
+        for _pick_object, index, row, support_contacts in initialization_rows:
             scene_resource_id = ids[index]
             pose, frame_ref = self._initial_pose_and_frame(
                 parsed,
@@ -2697,7 +2722,7 @@ class HeadlessSceneProgramPort:
                     ),
                     "pose": pose,
                     "frame_ref": frame_ref,
-                    "support_contacts": [],
+                    "support_contacts": support_contacts,
                 },
                 f"add:{scene_resource_id}",
             )

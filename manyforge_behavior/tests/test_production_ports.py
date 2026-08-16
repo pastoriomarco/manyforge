@@ -976,9 +976,11 @@ class _SceneTransport:
         elif kind == "remove_object":
             self.objects.pop(operation["scene_resource_id"])
         elif kind in {"add_object", "upsert_object"}:
-            self.objects[operation["scene_resource_id"]] = _fixed_scene_object(
-                operation["scene_resource_id"]
+            scene_object = _fixed_scene_object(operation["scene_resource_id"])
+            scene_object["support_contacts"] = deepcopy(
+                operation["support_contacts"]
             )
+            self.objects[operation["scene_resource_id"]] = scene_object
         elif kind == "update_object_pose":
             pass
         elif kind == "attach_carried_object":
@@ -1090,6 +1092,39 @@ def test_scene_initialization_adds_pick_resources_last() -> None:
         "frame_role_id": "base",
     }
     assert sorted(transport.objects) == ["graspable", "table"]
+
+
+def test_scene_initialization_forwards_authored_support_contact_policy() -> None:
+    transport = _SceneTransport()
+    port = HeadlessSceneProgramPort(transport)
+    scene = _authored_scene()
+    support_contact = {
+        "support_object_id": "table",
+        "mode": "contact_release",
+        "release_evidence_mode": "binary_contact",
+        "enforce_max_start_penetration": False,
+        "max_start_penetration_m": 0.0,
+        "release_tolerance_m": 0.0,
+        "min_release_progress_m": 0.0,
+        "require_separation_by_end": True,
+        "require_strictly_decreasing_penetration": False,
+        "allow_recontact": False,
+    }
+    scene[0]["metadata"] = {"support_contacts": [support_contact]}
+
+    port.initialize(_scene_context(), scene)
+
+    add_operations = [
+        request["operation"]
+        for request in transport.submissions
+        if request["operation"]["kind"] == "add_object"
+    ]
+    assert [operation["scene_resource_id"] for operation in add_operations] == [
+        "table",
+        "graspable",
+    ]
+    assert add_operations[1]["support_contacts"] == [support_contact]
+    assert transport.objects["graspable"]["support_contacts"] == [support_contact]
 
 
 def test_scene_initialization_retries_concurrent_pose_revision_without_losing_shape(
