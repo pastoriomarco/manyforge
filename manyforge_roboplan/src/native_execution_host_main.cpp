@@ -4624,6 +4624,13 @@ BuildProductComposition(CompositionBuildInput input) {
 #endif
   auto kernel_config = core::ExecutionKernelConfig{};
   kernel_config.collision_monitor_period_ns = collision_monitor_period_ns;
+  // Every product composition built by this host executes beneath the
+  // resource-addressed Kernel owner.  Managed successor compositions are
+  // intentionally built without constructing a second owner and are then
+  // installed beneath the retained owner during the fenced swap; they still
+  // must hand runtime-collision Stop authority to that owner from their first
+  // executable instant.
+  kernel_config.runtime_collision_stop_owned_by_addressed_kernel = true;
 #if defined(MANYFORGE_ROS2_CONTROL_EXECUTION_HOST)
   const auto milliseconds_to_ns = [](const double value) {
     return static_cast<core::Duration>(std::llround(value * 1'000'000.0));
