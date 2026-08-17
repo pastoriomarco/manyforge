@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
@@ -179,6 +180,44 @@ def test_failed_cleanup_after_start_failure_is_degraded(
     assert raised.value.status is not None
     assert raised.value.status.state is LaunchInstanceState.DEGRADED
     assert raised.value.status.last_failure.reason_code == "cleanup_deadline_exceeded"
+
+
+def test_readiness_timeout_preserves_terminal_failure_without_recleaning(
+    tmp_path: Path, configuration_factory, status_factory, monkeypatch
+):
+    launcher = NativeLauncher(
+        replace(_config(tmp_path), readiness_timeout_seconds=0.01)
+    )
+    configuration = configuration_factory()
+    stopped = status_factory(
+        configuration, state=LaunchInstanceState.STOPPED, with_resources=False
+    )
+    calls: list[FailureRecord] = []
+    monkeypatch.setattr(
+        "manyforge_operator.orchestrator._configuration",
+        lambda _config: configuration,
+    )
+    monkeypatch.setattr(launcher, "_port_available", lambda: None)
+    monkeypatch.setattr(
+        "manyforge_operator.orchestrator.native_commands", lambda _config: ()
+    )
+    monkeypatch.setattr(
+        launcher, "_readiness", lambda: (False, [], "owner did not become ready")
+    )
+    monkeypatch.setattr("manyforge_operator.orchestrator.time.sleep", lambda _seconds: None)
+
+    def finish(_configuration, failure, readiness=()):
+        calls.append(failure)
+        return stopped
+
+    monkeypatch.setattr(launcher, "_finish_failed_start", finish)
+
+    with pytest.raises(LauncherError) as raised:
+        launcher.start()
+
+    assert raised.value.code == "readiness_timeout"
+    assert raised.value.status is stopped
+    assert len(calls) == 1
 
 
 def test_spawned_component_is_retained_when_next_spawn_raises(

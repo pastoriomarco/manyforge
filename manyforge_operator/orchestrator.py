@@ -1101,7 +1101,7 @@ class NativeLauncher:
                     status=stopped,
                 )
             except LauncherError as error:
-                if error.code == "cleanup_deadline_exceeded":
+                if error.code == "cleanup_deadline_exceeded" or error.status is not None:
                     raise
                 failure = FailureRecord(
                     reason_code=error.code,
