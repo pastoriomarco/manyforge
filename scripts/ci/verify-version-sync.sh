@@ -69,7 +69,8 @@ for pkg in \
     manyforge_composer \
     manyforge_assistant_bridge \
     manyforge_headless_api \
-    manyforge_program_runner; do
+    manyforge_program_runner \
+    manyforge_operator; do
     file="${REPO_ROOT}/${pkg}/pyproject.toml"
     if [[ ! -f "${file}" ]]; then
         printf '  ✗ %-50s pyproject.toml missing\n' "${pkg}"

@@ -390,6 +390,7 @@ run_python_tests() {
     setup_pythonpath
     if pytest \
         manyforge_behavior/tests/ \
+        manyforge_operator/tests/ \
         tests/composable_cell_i4/ \
         tests/test_benchmark.py \
         tests/test_public_contract_entrypoint_reconciliation.py \

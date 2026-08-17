@@ -1,0 +1,23 @@
+[build-system]
+requires = ["setuptools>=68.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "manyforge_operator"
+version = "0.1.0"
+description = "Frozen O1.2 ManyForge operator-launch machine contracts and pure lifecycle decisions"
+license = { text = "Apache-2.0" }
+authors = [{ name = "Marco Pastorio" }]
+requires-python = ">=3.11"
+dependencies = [
+    "pydantic>=2.7,<3",
+    "rfc8785==0.1.4",
+]
+
+[tool.setuptools]
+# Flat layout — the directory containing this pyproject.toml IS the package.
+package-dir = { "manyforge_operator" = "." }
+packages = ["manyforge_operator"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
