@@ -49,7 +49,10 @@ from .contracts import (
     ServiceEndpoint,
     ServiceKind,
     SourceIdentityV1,
+    StartDisposition,
+    can_transition,
     configuration_digest,
+    decide_start,
 )
 
 
@@ -103,6 +106,7 @@ class NativeLauncherConfig:
     execution_state_root: Path
     logical_scene_database: Path
     historian_database_path: Path
+    composer_static_dir: Path | None = None
     state_root: Path = DEFAULT_STATE_ROOT
     advertised_host: str = "localhost"
     instance_id: str = "native"
@@ -149,6 +153,15 @@ class NativeLauncherConfig:
             value = Path(getattr(self, name))
             if not value.exists():
                 raise ValueError(f"{name} does not exist: {value}")
+        if self.composer_static_dir is not None:
+            static_dir = Path(self.composer_static_dir)
+            if not static_dir.is_absolute():
+                raise ValueError("composer_static_dir must be an absolute path")
+            if not static_dir.is_dir() or not (static_dir / "index.html").is_file():
+                raise ValueError(
+                    "composer_static_dir must be a directory containing index.html"
+                )
+            object.__setattr__(self, "composer_static_dir", static_dir)
         if not self.advertised_host or any(
             character.isspace() for character in self.advertised_host
         ):
@@ -296,21 +309,24 @@ def native_commands(config: NativeLauncherConfig) -> tuple[ProcessSpec, ...]:
         base_env,
         config.source_root,
     )
+    composer_argv = (
+        sys.executable,
+        "-m",
+        "manyforge_composer",
+        "--host",
+        SERVICE_BIND_HOSTS["composer"],
+        "--port",
+        str(SERVICE_PORTS["composer"]),
+        "--headless-api-url",
+        config.headless_url,
+        "--headless-api-timeout-s",
+        "30",
+    )
+    if config.composer_static_dir is not None:
+        composer_argv += ("--static-dir", str(config.composer_static_dir))
     composer = ProcessSpec(
         "composer",
-        (
-            sys.executable,
-            "-m",
-            "manyforge_composer",
-            "--host",
-            SERVICE_BIND_HOSTS["composer"],
-            "--port",
-            str(SERVICE_PORTS["composer"]),
-            "--headless-api-url",
-            config.headless_url,
-            "--headless-api-timeout-s",
-            "30",
-        ),
+        composer_argv,
         base_env,
         config.source_root,
     )
@@ -516,8 +532,23 @@ def _status(
 ) -> LaunchInstanceStatus:
     from .contracts import ProcessResourceIdentity
 
+    identity_fields = {
+        "kind",
+        "resource_id",
+        "component_id",
+        "host_id",
+        "pid",
+        "start_ticks",
+        "boot_id",
+        "process_group_id",
+        "log_reference",
+    }
     owned = [
-        ProcessResourceIdentity.model_validate_json(json.dumps(item))
+        ProcessResourceIdentity.model_validate_json(
+            json.dumps(
+                {key: value for key, value in item.items() if key in identity_fields}
+            )
+        )
         for item in resources
     ]
     owned.sort(key=lambda item: item.resource_id)
@@ -599,11 +630,13 @@ class NativeLauncher:
                     "component_id": item.component_id,
                     "resource_id": component,
                     "kind": ResourceKind.PROCESS.value,
+                    "host_id": "runtime",
                     "argv": list(item.argv),
                     "pid": item.pid,
                     "start_ticks": item.start_ticks,
                     "boot_id": item.boot_id,
                     "process_group_id": item.process_group_id,
+                    "log_reference": str(item.log_path),
                     "log_path": str(item.log_path),
                 }
                 for component, item in self._managed.items()
@@ -620,6 +653,11 @@ class NativeLauncher:
                 "resource_id": str(item.get("resource_id", component)),
                 "kind": ResourceKind.PROCESS.value,
                 "component_id": str(item.get("component_id", component)),
+                "host_id": str(item.get("host_id", "runtime")),
+                "log_reference": str(
+                    item.get("log_reference", item.get("log_path", ""))
+                )
+                or None,
             }
             for component, item in sorted(processes.items())
         ]
@@ -766,8 +804,9 @@ class NativeLauncher:
             time.sleep(0.01)
         observation = _proc_observation(process.pid)
         if observation is None:
+            self._terminate_unrecorded_process(process)
             raise LauncherError("process_identity_unavailable", f"cannot observe {spec.component_id} PID {process.pid}", exit_code=70)
-        return _ManagedProcess(
+        managed = _ManagedProcess(
             component_id=spec.component_id,
             process=process,
             argv=spec.argv,
@@ -777,6 +816,43 @@ class NativeLauncher:
             boot_id=_boot_id(),
             process_group_id=os.getpgid(process.pid),
         )
+        self._managed[spec.component_id] = managed
+        return managed
+
+    @staticmethod
+    def _terminate_unrecorded_process(process: subprocess.Popen[bytes]) -> None:
+        """Stop a just-spawned child whose identity could not be recorded.
+
+        ``start_new_session=True`` makes the Popen PID the exact process-group
+        leader.  This fallback therefore remains scoped to the child just
+        created by this launcher and never searches for or kills by name/port.
+        """
+
+        if process.poll() is not None:
+            return
+        try:
+            os.killpg(process.pid, signal.SIGTERM)
+        except (ProcessLookupError, PermissionError, OSError):
+            try:
+                process.terminate()
+            except (ProcessLookupError, PermissionError, OSError):
+                pass
+        try:
+            process.wait(timeout=2.0)
+            return
+        except subprocess.TimeoutExpired:
+            pass
+        try:
+            os.killpg(process.pid, signal.SIGKILL)
+        except (ProcessLookupError, PermissionError, OSError):
+            try:
+                process.kill()
+            except (ProcessLookupError, PermissionError, OSError):
+                pass
+        try:
+            process.wait(timeout=2.0)
+        except subprocess.TimeoutExpired:
+            pass
 
     def _resource_records(self) -> list[dict[str, Any]]:
         return [
@@ -802,11 +878,131 @@ class NativeLauncher:
         failure: FailureRecord | None = None,
         generation: int = 1,
     ) -> LaunchInstanceStatus:
+        previous = self.store.read()
+        if previous is not None and not can_transition(previous[0].state, state):
+            raise LauncherError(
+                "invalid_state_transition",
+                f"cannot transition {previous[0].state.value} to {state.value}",
+                exit_code=70,
+                status=previous[0],
+            )
         resources = self._resource_records()
         observations = self._resource_observations(self._mechanical()["processes"].values())
+        if state is LaunchInstanceState.STOPPED and any(
+            observation.presence is not ResourcePresence.ABSENT
+            for observation in observations
+        ):
+            raise LauncherError(
+                "cleanup_deadline_exceeded",
+                "one or more recorded native processes remain after cleanup",
+                exit_code=74,
+            )
         status = _status(configuration, self.config.instance_id, state, resources, readiness, observations, generation, failure)
         self.store.write(status, self._mechanical())
         return status
+
+    def _refresh_status(
+        self,
+        old_status: LaunchInstanceStatus,
+        mechanical: Mapping[str, Any],
+    ) -> LaunchInstanceStatus:
+        """Reconcile recorded processes and owner readiness without restarting."""
+
+        processes = mechanical.get("processes", {})
+        resources = self._resource_records_from_mechanical(processes)
+        observations = self._resource_observations(resources)
+        all_present = bool(resources) and all(
+            observation.presence is ResourcePresence.PRESENT
+            for observation in observations
+        )
+        if old_status.state is LaunchInstanceState.STOPPING:
+            ready, rows, reason = False, [], "native launch remains stopping"
+            state = (
+                LaunchInstanceState.DEGRADED
+                if any(
+                    observation.presence is not ResourcePresence.ABSENT
+                    for observation in observations
+                )
+                else LaunchInstanceState.STOPPED
+            )
+        else:
+            ready, rows, reason = (
+                self._readiness(old_status.configuration)
+                if all_present
+                else (False, [], "one or more owned processes are absent")
+            )
+            state = (
+                LaunchInstanceState.READY
+                if all_present and ready
+                else LaunchInstanceState.DEGRADED
+            )
+        failure = None if state is LaunchInstanceState.READY else FailureRecord(
+            reason_code="component_unavailable",
+            component_id="native",
+            detail=(reason or "native launch is degraded")[:4096],
+            occurred_at_unix_ns=_safe_unix_timestamp(),
+        )
+        if not can_transition(old_status.state, state):
+            raise LauncherError(
+                "invalid_state_transition",
+                f"cannot transition {old_status.state.value} to {state.value}",
+                exit_code=70,
+                status=old_status,
+            )
+        status = _status(
+            old_status.configuration,
+            old_status.launch_instance_id,
+            state,
+            resources,
+            rows,
+            observations,
+            old_status.record_generation + 1,
+            failure,
+        )
+        self.store.write(status, mechanical)
+        return status
+
+    def _finish_failed_start(
+        self,
+        configuration: LaunchConfiguration,
+        failure: FailureRecord,
+        readiness: Sequence[ReadinessObservation] = (),
+    ) -> LaunchInstanceStatus:
+        """Boundedly clean a failed start and retain its terminal evidence."""
+
+        current = self.store.read()
+        if current is None or current[0].state is not LaunchInstanceState.STOPPING:
+            self._write_live(
+                configuration,
+                LaunchInstanceState.STOPPING,
+                readiness,
+                failure,
+            )
+        if self._cleanup_authenticated():
+            return self._write_live(
+                configuration,
+                LaunchInstanceState.STOPPED,
+                readiness,
+                failure,
+            )
+        cleanup_failure = FailureRecord(
+            reason_code="cleanup_deadline_exceeded",
+            component_id="native",
+            detail="one or more authenticated native processes remain after bounded cleanup",
+            occurred_at_unix_ns=_safe_unix_timestamp(),
+        )
+        degraded = self._write_live(
+            configuration,
+            LaunchInstanceState.DEGRADED,
+            readiness,
+            cleanup_failure,
+        )
+        raise LauncherError(
+            "cleanup_deadline_exceeded",
+            str(cleanup_failure.detail),
+            exit_code=74,
+            status=degraded,
+        )
 
     def start(self) -> LaunchInstanceStatus:
         self.last_start_idempotent = False
@@ -817,20 +1013,41 @@ class NativeLauncher:
             existing = self.store.read()
             if existing is not None:
                 old_status, mechanical = existing
-                if (
-                    old_status.state is not LaunchInstanceState.STOPPED
-                    and (
-                        old_status.configuration_digest != configuration.configuration_digest
-                        or old_status.configuration.profile is not LaunchProfile.NATIVE
+                if old_status.configuration.profile is not LaunchProfile.NATIVE:
+                    raise LauncherError(
+                        "incompatible_owner",
+                        "stored launch has a different native configuration",
+                        exit_code=70,
+                        status=old_status,
                     )
+                disposition = decide_start(
+                    old_status, configuration.configuration_digest
+                )
+                if disposition in (
+                    StartDisposition.IDEMPOTENT,
+                    StartDisposition.RECOVER,
                 ):
-                    raise LauncherError("incompatible_owner", "stored launch has a different native configuration", exit_code=70, status=old_status)
+                    self.last_start_idempotent = True
+                    return self._refresh_status(old_status, mechanical)
+                if disposition is StartDisposition.CONFLICT:
+                    raise LauncherError(
+                        "incompatible_owner",
+                        "stored launch is stopping or has a different configuration",
+                        exit_code=70,
+                        status=old_status,
+                    )
                 processes = mechanical.get("processes", {})
-                if old_status.state in {LaunchInstanceState.READY, LaunchInstanceState.STARTING, LaunchInstanceState.DEGRADED}:
-                    if processes and all(_process_is_authenticated(item) for item in processes.values()):
-                        self.last_start_idempotent = True
-                        return old_status
-                    raise LauncherError("stale_launch_record", "stored native launch resources are not authenticated", exit_code=70, status=old_status)
+                resources = self._resource_records_from_mechanical(processes)
+                if any(
+                    observation.presence is ResourcePresence.PRESENT
+                    for observation in self._resource_observations(resources)
+                ):
+                    raise LauncherError(
+                        "incompatible_owner",
+                        "stored launch still owns an authenticated process",
+                        exit_code=70,
+                        status=old_status,
+                    )
             self._port_available()
             self.config.instance_root.mkdir(parents=True, exist_ok=True)
             for path in (
@@ -858,8 +1075,7 @@ class NativeLauncher:
                     detail=(reason or "native owner readiness timed out")[:4096],
                     occurred_at_unix_ns=_safe_unix_timestamp(),
                 )
-                self._cleanup_authenticated()
-                return self._write_live(configuration, LaunchInstanceState.STOPPED, [
+                stopped_readiness = [
                     ReadinessObservation(
                         component_id=row.component_id,
                         authority=row.authority,
@@ -872,13 +1088,44 @@ class NativeLauncher:
                         reason_code="startup_failed",
                     )
                     for row in last_rows
-                ], failure)
-            except LauncherError:
-                self._cleanup_authenticated()
+                ]
+                stopped = self._finish_failed_start(
+                    configuration,
+                    failure,
+                    stopped_readiness,
+                )
+                raise LauncherError(
+                    "readiness_timeout",
+                    str(failure.detail),
+                    exit_code=73,
+                    status=stopped,
+                )
+            except LauncherError as error:
+                if error.code == "cleanup_deadline_exceeded":
+                    raise
+                failure = FailureRecord(
+                    reason_code=error.code,
+                    component_id="native",
+                    detail=str(error)[:4096],
+                    occurred_at_unix_ns=_safe_unix_timestamp(),
+                )
+                stopped = self._finish_failed_start(configuration, failure)
+                error.status = stopped
                 raise
             except Exception as error:
-                self._cleanup_authenticated()
-                raise LauncherError("native_start_failed", str(error), exit_code=70) from error
+                failure = FailureRecord(
+                    reason_code="native_start_failed",
+                    component_id="native",
+                    detail=str(error)[:4096],
+                    occurred_at_unix_ns=_safe_unix_timestamp(),
+                )
+                stopped = self._finish_failed_start(configuration, failure)
+                raise LauncherError(
+                    "native_start_failed",
+                    str(error),
+                    exit_code=70,
+                    status=stopped,
+                ) from error
 
     def status(self) -> LaunchInstanceStatus | None:
         with self.store.lock():
@@ -887,25 +1134,23 @@ class NativeLauncher:
                 return None
             old_status, mechanical = existing
             if old_status.state is LaunchInstanceState.STOPPED:
+                resources = self._resource_records_from_mechanical(
+                    mechanical.get("processes", {})
+                )
+                observations = self._resource_observations(resources)
+                if any(
+                    observation.presence is not ResourcePresence.ABSENT
+                    for observation in observations
+                ):
+                    raise LauncherError(
+                        "stale_launch_record",
+                        "stopped launch has a recorded process that is not proven absent",
+                        exit_code=70,
+                        status=old_status,
+                    )
                 return old_status
-            processes = mechanical.get("processes", {})
             self._managed = {}
-            if not processes:
-                return old_status
-            resources = self._resource_records_from_mechanical(processes)
-            all_present = all(_process_is_authenticated(item) for item in resources)
-            ready, rows, reason = self._readiness(old_status.configuration) if all_present else (False, [], "one or more owned processes are absent")
-            state = LaunchInstanceState.READY if all_present and ready else LaunchInstanceState.DEGRADED
-            failure = None if state is LaunchInstanceState.READY else FailureRecord(
-                reason_code="component_unavailable",
-                component_id="native",
-                detail=(reason or "native launch is degraded")[:4096],
-                occurred_at_unix_ns=_safe_unix_timestamp(),
-            )
-            observations = self._resource_observations(resources)
-            status = _status(old_status.configuration, old_status.launch_instance_id, state, resources, rows, observations, old_status.record_generation + 1, failure)
-            self.store.write(status, mechanical)
-            return status
+            return self._refresh_status(old_status, mechanical)
 
     def _cleanup_authenticated(
         self,
@@ -962,10 +1207,30 @@ class NativeLauncher:
             if existing is None:
                 return None
             old_status, mechanical = existing
-            if old_status.state is LaunchInstanceState.STOPPED:
-                self.last_stop_already_stopped = True
-                return old_status
             processes = mechanical.get("processes", {})
+            if old_status.state is LaunchInstanceState.STOPPED:
+                resources = self._resource_records_from_mechanical(processes)
+                if all(
+                    observation.presence is ResourcePresence.ABSENT
+                    for observation in self._resource_observations(resources)
+                ):
+                    self.last_stop_already_stopped = True
+                    return old_status
+                raise LauncherError(
+                    "stale_launch_record",
+                    "stopped launch still has an authenticated recorded process",
+                    exit_code=70,
+                    status=old_status,
+                )
+            if not can_transition(
+                old_status.state, LaunchInstanceState.STOPPING
+            ):
+                raise LauncherError(
+                    "invalid_state_transition",
+                    f"cannot transition {old_status.state.value} to stopping",
+                    exit_code=70,
+                    status=old_status,
+                )
             stopping = _status(
                 old_status.configuration,
                 old_status.launch_instance_id,
@@ -1001,6 +1266,17 @@ class NativeLauncher:
                 self.store.write(degraded, mechanical)
                 raise LauncherError("cleanup_deadline_exceeded", str(failure.detail), exit_code=74, status=degraded)
             stopped = _status(old_status.configuration, old_status.launch_instance_id, LaunchInstanceState.STOPPED, self._resource_records_from_mechanical(processes), (), observations, stopping.record_generation + 1)
+            if not can_transition(
+                stopping.state, stopped.state
+            ) or any(
+                observation.presence is not ResourcePresence.ABSENT
+                for observation in observations
+            ):
+                raise LauncherError(
+                    "cleanup_deadline_exceeded",
+                    "recorded native processes remain after bounded cleanup",
+                    exit_code=74,
+                )
             self.store.write(stopped, mechanical)
             return stopped
 

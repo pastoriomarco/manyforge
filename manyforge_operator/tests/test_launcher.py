@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
@@ -61,6 +62,15 @@ def test_native_commands_retain_four_owner_entrypoints(tmp_path: Path):
     assert "--port 9000" in commands[3]
     assert all("--apply" not in spec.argv and "--run" not in spec.argv for spec in specs)
     assert all(spec.environment["MANYFORGE_FS_ROOTS"] == str(config.package_root) for spec in specs)
+
+
+def test_native_commands_pass_explicit_composer_static_dir(tmp_path: Path):
+    static_dir = tmp_path / "static"
+    static_dir.mkdir()
+    (static_dir / "index.html").write_text("<html></html>\n", encoding="utf-8")
+    config = replace(_config(tmp_path), composer_static_dir=static_dir)
+    composer = native_commands(config)[-1]
+    assert composer.argv[-2:] == ("--static-dir", str(static_dir))
 
 
 def test_native_configuration_requires_explicit_artifact_digests(tmp_path: Path):

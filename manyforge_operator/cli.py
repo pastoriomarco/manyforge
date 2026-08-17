@@ -29,6 +29,7 @@ def _parser() -> argparse.ArgumentParser:
     start.add_argument("--package-root", type=Path, required=True)
     start.add_argument("--node-catalog-path", type=Path, required=True)
     start.add_argument("--alarm-catalog-path", type=Path, required=True)
+    start.add_argument("--composer-static-dir", type=Path)
     start.add_argument("--publication-root", type=Path, required=True)
     start.add_argument("--manager-state-root", type=Path, required=True)
     start.add_argument("--runtime-state-root", type=Path, required=True)
@@ -78,6 +79,7 @@ def _config(args: argparse.Namespace) -> NativeLauncherConfig:
         package_root=args.package_root,
         node_catalog_path=args.node_catalog_path,
         alarm_catalog_path=args.alarm_catalog_path,
+        composer_static_dir=args.composer_static_dir,
         publication_root=args.publication_root,
         manager_state_root=args.manager_state_root,
         runtime_state_root=args.runtime_state_root,
