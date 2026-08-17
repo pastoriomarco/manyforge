@@ -1,5 +1,6 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { ApiError, api, resolveStructuralAssetUrl } from './client';
+import type { ManagerApplyRequest } from '../types/api';
 import type { OperatorAlarmRecord } from '../types/headless';
 
 afterEach(() => {
@@ -325,6 +326,40 @@ describe('headless intent client', () => {
     expect(fetchMock.mock.calls[0]?.[0]).toBe(
       '/api/execution/alarms?limit=32&ordering=attention_newest',
     );
+  });
+
+  it('posts manager apply with revision fences and calls manager graph endpoint', async () => {
+    const request: ManagerApplyRequest = {
+      request_id: 'request-manager-1',
+      request_owner_epoch: 'owner.epoch.1',
+      source_label: 'composer_ui',
+      correlation_id: null,
+      deployment_artifact_id: 'artifact-1',
+      deployment_revision: 'rev-2',
+      expected_current: {
+        graph_revision: 'graph-9',
+        retained_bundle_id: 'bundle-9',
+      },
+      reject_if_affected_busy: true,
+    };
+
+    const fetchMock = vi.fn()
+      .mockResolvedValue(response({}))
+      .mockResolvedValue(response({}))
+      .mockResolvedValue(response({}));
+    vi.stubGlobal('fetch', fetchMock);
+
+    await api.manager.graph();
+    await api.manager.apply(request);
+    await api.manager.diff();
+
+    expect(fetchMock.mock.calls[0]?.[0]).toBe('/api/manager/graph');
+    expect(fetchMock.mock.calls[1]?.[0]).toBe('/api/manager/apply');
+    expect(fetchMock.mock.calls[2]?.[0]).toBe('/api/manager/diff');
+
+    const [, applyOptions] = fetchMock.mock.calls[1] as [string, RequestInit];
+    expect(applyOptions.method).toBe('POST');
+    expect(JSON.parse(String(applyOptions.body))).toEqual(request);
   });
 
   it('submits one exact alarm activation without a caller-supplied principal', async () => {

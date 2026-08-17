@@ -700,6 +700,20 @@ export interface DraftFenceRequest {
   expectedDraftRevision: number;
 }
 
+export interface ManagerApplyRequest {
+  request_id: string;
+  request_owner_epoch: string;
+  source_label: 'composer_ui';
+  correlation_id: string | null;
+  deployment_artifact_id: string;
+  deployment_revision: string;
+  expected_current: {
+    graph_revision: string;
+    retained_bundle_id: string;
+  };
+  reject_if_affected_busy: true;
+}
+
 export interface DraftMutationResponse {
   mutation: string;
   details: Record<string, JsonValue>;

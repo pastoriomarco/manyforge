@@ -38,6 +38,7 @@ import type {
   ArtifactKind,
   AppliedProgramSelection,
   CatalogResponse,
+  ManagerApplyRequest,
   DraftFenceRequest,
   DraftMutationResponse,
   FileBrowserResponse,
@@ -454,6 +455,32 @@ export const api = {
       parseProgramRunStatus,
       signal,
       { method: 'POST', body: JSON.stringify(body) },
+    ),
+  },
+  manager: {
+    status: (signal?: AbortSignal): Promise<Record<string, unknown>> => requestJson(
+      '/api/manager/status',
+      parseObjectResponse,
+      signal,
+    ),
+    graph: (signal?: AbortSignal): Promise<Record<string, unknown>> => requestJson(
+      '/api/manager/graph',
+      parseObjectResponse,
+      signal,
+    ),
+    diff: (signal?: AbortSignal): Promise<Record<string, unknown>> => requestJson(
+      '/api/manager/diff',
+      parseObjectResponse,
+      signal,
+    ),
+    apply: (
+      request: ManagerApplyRequest,
+      signal?: AbortSignal,
+    ): Promise<Record<string, unknown>> => requestJson(
+      '/api/manager/apply',
+      parseObjectResponse,
+      signal,
+      { method: 'POST', body: JSON.stringify(request) },
     ),
   },
   files: {
