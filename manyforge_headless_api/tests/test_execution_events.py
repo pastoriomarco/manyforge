@@ -647,6 +647,7 @@ def test_execution_client_verifies_capability_command_preview_receipt(
 class _RecordingCore:
     def __init__(self) -> None:
         self.ingested: list[dict[str, Any]] = []
+        self.completed_calls: list[dict[str, Any]] = []
         self.completed = threading.Event()
         self.unknown = threading.Event()
 
@@ -654,7 +655,8 @@ class _RecordingCore:
         self.ingested.append(kwargs)
         return {"status": "ingested"}
 
-    def complete_operation_event_snapshot(self, **_kwargs: Any) -> dict[str, Any]:
+    def complete_operation_event_snapshot(self, **kwargs: Any) -> dict[str, Any]:
+        self.completed_calls.append(kwargs)
         self.completed.set()
         return {"status": "complete"}
 
@@ -694,6 +696,34 @@ class _PagedExecution:
         }
 
 
+class _IdleExecution:
+    def __init__(self, *, include_epoch: bool = True) -> None:
+        self.owner_epoch = "kernel-owner.runtime-epoch"
+        self.include_epoch = include_epoch
+        self.status_calls = 0
+        self.events_calls = 0
+
+    def status(self) -> dict[str, Any]:
+        self.status_calls += 1
+        details = {"owner_epoch": self.owner_epoch} if self.include_epoch else {}
+        return {
+            "api_version": "manyforge.execution_command_response.v1",
+            "command": "status",
+            "error": {
+                "code": "execution_owner_not_ready",
+                "details": details,
+                "message": "the managed execution owner has no active physical product",
+            },
+            "ok": False,
+        }
+
+    def events(
+        self, _owner_epoch: str, _after_sequence: int, *, limit: int = 16
+    ) -> dict[str, Any]:
+        self.events_calls += 1
+        raise AssertionError("idle owner must not be queried for events")
+
+
 def test_event_pump_delivers_without_frontend_polling_and_stops_cleanly() -> None:
     core = _RecordingCore()
     execution = _PagedExecution()
@@ -711,6 +741,44 @@ def test_event_pump_delivers_without_frontend_polling_and_stops_cleanly() -> Non
     assert core.ingested[0]["payload_json"] == rfc8785.dumps(
         _event(execution.owner_epoch, 1)["payload"]
     ).decode("utf-8")
+
+
+def test_event_pump_reconciles_typed_idle_owner_without_querying_events() -> None:
+    core = _RecordingCore()
+    execution = _IdleExecution()
+    pump = ExecutionEventPump(  # type: ignore[arg-type]
+        core, execution, poll_seconds=0.01, page_limit=1
+    )
+    pump.start()
+    assert core.completed.wait(timeout=1.0)
+    pump.shutdown()
+
+    assert pump.last_error is None
+    assert execution.status_calls >= 1
+    assert execution.events_calls == 0
+    assert core.completed_calls[0] == {
+        "source_owner_epoch": execution.owner_epoch,
+        "through_source_sequence": 0,
+    }
+
+
+def test_event_pump_rejects_untyped_idle_owner_response() -> None:
+    core = _RecordingCore()
+    execution = _IdleExecution(include_epoch=False)
+    pump = ExecutionEventPump(  # type: ignore[arg-type]
+        core, execution, poll_seconds=0.01, page_limit=1
+    )
+    pump.start()
+    deadline = threading.Event()
+    for _ in range(100):
+        if pump.last_error is not None:
+            break
+        deadline.wait(0.01)
+    pump.shutdown()
+
+    assert pump.last_error is not None
+    assert "execution_owner_not_ready" in pump.last_error
+    assert not core.completed.is_set()
 
 
 def test_event_pump_preserves_global_stop_projection_null_identity() -> None:

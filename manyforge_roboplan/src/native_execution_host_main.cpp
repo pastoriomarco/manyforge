@@ -1989,11 +1989,14 @@ struct Command final {
 }
 
 [[nodiscard]] CanonicalValue ErrorResponse(std::string code,
-                                           std::string message) {
+                                           std::string message,
+                                           std::map<std::string, std::string>
+                                               details = {}) {
   return CanonicalValue(CanonicalValue::Object{
       {"api_version", CanonicalValue(std::string(kResponseApiVersion))},
-      {"error",
-       ErrorValue(core::ErrorDTO{std::move(code), std::move(message), {}})},
+       {"error",
+       ErrorValue(core::ErrorDTO{std::move(code), std::move(message),
+                                 std::move(details)})},
       {"ok", CanonicalValue(false)},
   });
 }
@@ -7159,7 +7162,8 @@ private:
           if (composition_access_.current == nullptr) {
             response = ErrorResponse(
                 "execution_owner_not_ready",
-                "the managed execution owner has no active physical product");
+                "the managed execution owner has no active physical product",
+                {{"owner_epoch", owner_epoch_.value()}});
           } else {
             response = stop_only
                            ? ExecuteStop(command, *composition_access_.current)

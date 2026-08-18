@@ -1488,6 +1488,29 @@ class ExecutionEventPump:
                     prefix += f"{code}: "
                 self._last_error = prefix + str(error)
 
+    @staticmethod
+    def _idle_owner_epoch(response: dict[str, Any]) -> str | None:
+        """Return the typed epoch of an idle owner, if the response proves it."""
+        if response.get("ok") is not False:
+            return None
+        error = response.get("error")
+        details = error.get("details") if isinstance(error, dict) else None
+        owner_epoch = details.get("owner_epoch") if isinstance(details, dict) else None
+        if (
+            not isinstance(error, dict)
+            or error.get("code") != "execution_owner_not_ready"
+            or not isinstance(error.get("message"), str)
+            or not error["message"]
+            or not isinstance(details, dict)
+            or set(details) != {"owner_epoch"}
+            or not isinstance(owner_epoch, str)
+            or not owner_epoch
+            or len(owner_epoch.encode("utf-8")) > 2_048
+            or unicodedata.normalize("NFC", owner_epoch) != owner_epoch
+        ):
+            return None
+        return owner_epoch
+
     def _run(self) -> None:
         owner_epoch: str | None = None
         after_sequence = 0
@@ -1496,7 +1519,16 @@ class ExecutionEventPump:
                 if owner_epoch is None:
                     status_response = self._execution.status()
                     if status_response.get("ok") is not True:
-                        ExecutionCommandClient._raise_error_response(status_response)
+                        idle_epoch = self._idle_owner_epoch(status_response)
+                        if idle_epoch is None:
+                            ExecutionCommandClient._raise_error_response(status_response)
+                        self._core.complete_operation_event_snapshot(
+                            source_owner_epoch=idle_epoch,
+                            through_source_sequence=0,
+                        )
+                        self._record_error(None)
+                        self._stop.wait(self._poll_seconds)
+                        continue
                     status = status_response.get("status")
                     next_epoch = (
                         status.get("owner_epoch")

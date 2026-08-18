@@ -1331,6 +1331,9 @@ TEST(ManagerDaemonProcess,
                   "\"code\":\"execution_owner_not_ready\""),
               std::string::npos)
         << execution_status;
+    EXPECT_NE(execution_status.find("\"details\":{\"owner_epoch\":\"kernel-owner-"),
+              std::string::npos)
+        << execution_status;
     ASSERT_TRUE(std::filesystem::remove(directory.apply_package_root() /
                                         "maintained.scenario-catalog.yaml"));
     const auto replayed = SendCommand(directory.socket_path(), request);
@@ -1393,6 +1396,10 @@ TEST(ManagerDaemonProcess,
       << recovered_execution_status;
   EXPECT_NE(recovered_execution_status.find(
                 "\"code\":\"execution_owner_not_ready\""),
+            std::string::npos)
+      << recovered_execution_status;
+  EXPECT_NE(recovered_execution_status.find(
+                "\"details\":{\"owner_epoch\":\"kernel-owner-"),
             std::string::npos)
       << recovered_execution_status;
   const auto stale = SendCommand(directory.socket_path(), request);
