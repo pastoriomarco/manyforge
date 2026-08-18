@@ -3,11 +3,13 @@ from __future__ import annotations
 import os
 from dataclasses import replace
 from pathlib import Path
+import socket
 
 import pytest
 
 from manyforge_operator import LaunchProfile, LaunchInstanceState
 from manyforge_operator.orchestrator import (
+    LauncherError,
     NativeLauncher,
     NativeLauncherConfig,
     _StateStore,
@@ -162,6 +164,60 @@ def test_launcher_start_outcome_flag_defaults_to_non_idempotent(tmp_path: Path):
     launcher = NativeLauncher(_config(tmp_path))
     assert launcher.last_start_idempotent is False
     assert launcher.last_stop_already_stopped is False
+
+
+def _server_port_in_time_wait() -> int:
+    server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    server.bind(("127.0.0.1", 0))
+    server.listen()
+    server.settimeout(1.0)
+    port = server.getsockname()[1]
+    client = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    client.settimeout(1.0)
+    accepted = None
+    try:
+        client.connect(("127.0.0.1", port))
+        accepted, _ = server.accept()
+        server.close()
+        server = None
+        accepted.close()
+        accepted = None
+        assert client.recv(1) == b""
+        client.close()
+        client = None
+    finally:
+        if accepted is not None:
+            accepted.close()
+        if client is not None:
+            client.close()
+        if server is not None:
+            server.close()
+    return port
+
+
+def test_port_preflight_allows_reuse_enabled_time_wait(tmp_path: Path):
+    launcher = NativeLauncher(_config(tmp_path))
+    port = _server_port_in_time_wait()
+
+    launcher._port_available(probes=(("127.0.0.1", port),))
+
+
+def test_port_preflight_rejects_a_current_listener(tmp_path: Path):
+    launcher = NativeLauncher(_config(tmp_path))
+    listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    listener.bind(("127.0.0.1", 0))
+    listener.listen()
+    try:
+        with pytest.raises(LauncherError) as raised:
+            launcher._port_available(
+                probes=(("127.0.0.1", listener.getsockname()[1]),)
+            )
+        assert raised.value.code == "port_occupied"
+        assert raised.value.exit_code == 72
+    finally:
+        listener.close()
 
 
 def test_readiness_uses_local_bind_addresses_for_publicly_advertised_stack(

@@ -762,19 +762,26 @@ class NativeLauncher:
             for component, item in sorted(processes.items())
         ]
 
-    def _port_available(self) -> None:
-        probes = ((SERVICE_BIND_HOSTS["composer"], 9000), ("127.0.0.1", 9010), ("127.0.0.1", 9011))
+    def _port_available(
+        self, *, probes: Sequence[tuple[str, int]] | None = None
+    ) -> None:
+        if probes is None:
+            probes = (
+                (SERVICE_BIND_HOSTS["composer"], 9000),
+                ("127.0.0.1", 9010),
+                ("127.0.0.1", 9011),
+            )
         listeners: list[socket.socket] = []
         try:
             for host, port in probes:
                 listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-                listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 0)
+                listeners.append(listener)
+                listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
                 try:
                     listener.bind((host, port))
+                    listener.listen()
                 except OSError as error:
-                    listener.close()
                     raise LauncherError("port_occupied", f"{host}:{port} is occupied: {error}", exit_code=72) from error
-                listeners.append(listener)
         finally:
             for listener in listeners:
                 listener.close()
