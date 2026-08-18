@@ -1,4 +1,4 @@
-"""CLI for the O1.3 native operator boundary."""
+"""CLI for the source-matched native and split-Isaac operator boundary."""
 
 from __future__ import annotations
 
@@ -8,6 +8,14 @@ from pathlib import Path
 import sys
 
 from .contracts import LaunchOperation, LaunchProfile, OperatorCommandResult
+from .isaac import (
+    DEFAULT_RUNTIME_HOST,
+    DEFAULT_SIMULATOR_HOST,
+    DEFAULT_WORLD_NAME,
+    IsaacLauncher,
+    IsaacLauncherConfig,
+    RemoteNativeConfig,
+)
 from .orchestrator import (
     DEFAULT_STATE_ROOT,
     LauncherError,
@@ -25,32 +33,61 @@ def _parser() -> argparse.ArgumentParser:
     start = commands.add_parser("start")
     start.add_argument("--profile", choices=[item.value for item in LaunchProfile], default="native")
     start.add_argument("--source-root", type=Path, required=True)
-    start.add_argument("--manager-executable", type=Path, required=True)
-    start.add_argument("--package-root", type=Path, required=True)
-    start.add_argument("--node-catalog-path", type=Path, required=True)
-    start.add_argument("--alarm-catalog-path", type=Path, required=True)
+    start.add_argument("--manager-executable", type=Path)
+    start.add_argument("--package-root", type=Path)
+    start.add_argument("--node-catalog-path", type=Path)
+    start.add_argument("--alarm-catalog-path", type=Path)
     start.add_argument("--composer-static-dir", type=Path)
+    start.add_argument("--simulation-control-config", type=Path)
     start.add_argument(
         "--canonical-empty-admission-filename",
         default="canonical-empty-admission.json",
     )
     start.add_argument("--cell-id", default="native")
-    start.add_argument("--publication-root", type=Path, required=True)
-    start.add_argument("--manager-state-root", type=Path, required=True)
-    start.add_argument("--runtime-state-root", type=Path, required=True)
-    start.add_argument("--execution-state-root", type=Path, required=True)
-    start.add_argument("--logical-scene-database", type=Path, required=True)
-    start.add_argument("--historian-database-path", type=Path, required=True)
-    start.add_argument("--package-aggregate-sha256", required=True)
-    start.add_argument("--compiler-build-manifest-sha256", required=True)
-    start.add_argument("--node-environment-sha256", required=True)
-    start.add_argument("--advertised-host", default="localhost")
+    start.add_argument("--publication-root", type=Path)
+    start.add_argument("--manager-state-root", type=Path)
+    start.add_argument("--runtime-state-root", type=Path)
+    start.add_argument("--execution-state-root", type=Path)
+    start.add_argument("--logical-scene-database", type=Path)
+    start.add_argument("--historian-database-path", type=Path)
+    start.add_argument("--package-aggregate-sha256")
+    start.add_argument("--compiler-build-manifest-sha256")
+    start.add_argument("--node-environment-sha256")
+    start.add_argument("--advertised-host")
     start.add_argument("--expected-source-fingerprint")
     start.add_argument("--expected-head-commit")
     start.add_argument("--expected-head-tree")
     start.add_argument("--readiness-timeout-s", type=float, default=60.0)
     start.add_argument("--poll-interval-s", type=float, default=0.25)
     start.add_argument("--reconciliation-period-ms", type=int, default=20)
+    start.add_argument("--manager-timeout-s", type=float, default=60.0)
+    start.add_argument("--isaac-executable", type=Path)
+    start.add_argument("--world-path", type=Path)
+    start.add_argument("--expected-world-name", default=DEFAULT_WORLD_NAME)
+    start.add_argument("--simulator-host", default=DEFAULT_SIMULATOR_HOST)
+    start.add_argument("--control-host", default="")
+    start.add_argument("--remote-target", default=DEFAULT_RUNTIME_HOST)
+    start.add_argument("--remote-source-root")
+    start.add_argument("--remote-manager-executable")
+    start.add_argument("--remote-package-root")
+    start.add_argument("--remote-node-catalog-path")
+    start.add_argument("--remote-alarm-catalog-path")
+    start.add_argument("--remote-publication-root")
+    start.add_argument("--remote-manager-state-root")
+    start.add_argument("--remote-runtime-state-root")
+    start.add_argument("--remote-execution-state-root")
+    start.add_argument("--remote-logical-scene-database")
+    start.add_argument("--remote-historian-database-path")
+    start.add_argument("--remote-state-root")
+    start.add_argument("--remote-composer-static-dir")
+    start.add_argument("--remote-simulation-control-config")
+    start.add_argument("--remote-bridge-state-root")
+    start.add_argument("--local-ros-setup-script", type=Path)
+    start.add_argument("--local-ros-environment-script", type=Path)
+    start.add_argument("--remote-ros-setup-script")
+    start.add_argument("--remote-ros-environment-script")
+    start.add_argument("--remote-python-executable", default="python3")
+    start.add_argument("--static-peer", action="append", dest="static_peers")
     commands.add_parser("status")
     commands.add_parser("stop")
     return parser
@@ -78,6 +115,24 @@ def _result(
 
 
 def _config(args: argparse.Namespace) -> NativeLauncherConfig:
+    required = (
+        "manager_executable",
+        "package_root",
+        "node_catalog_path",
+        "alarm_catalog_path",
+        "publication_root",
+        "manager_state_root",
+        "runtime_state_root",
+        "execution_state_root",
+        "logical_scene_database",
+        "historian_database_path",
+        "package_aggregate_sha256",
+        "compiler_build_manifest_sha256",
+        "node_environment_sha256",
+    )
+    missing = [name.replace("_", "-") for name in required if getattr(args, name, None) is None]
+    if missing:
+        raise ValueError(f"native profile requires: {', '.join(missing)}")
     return NativeLauncherConfig(
         source_root=args.source_root,
         manager_executable=args.manager_executable,
@@ -85,6 +140,7 @@ def _config(args: argparse.Namespace) -> NativeLauncherConfig:
         node_catalog_path=args.node_catalog_path,
         alarm_catalog_path=args.alarm_catalog_path,
         composer_static_dir=args.composer_static_dir,
+        simulation_control_config=args.simulation_control_config,
         canonical_empty_admission_filename=args.canonical_empty_admission_filename,
         cell_id=args.cell_id,
         publication_root=args.publication_root,
@@ -94,7 +150,7 @@ def _config(args: argparse.Namespace) -> NativeLauncherConfig:
         logical_scene_database=args.logical_scene_database,
         historian_database_path=args.historian_database_path,
         state_root=args.state_root,
-        advertised_host=args.advertised_host,
+        advertised_host=args.advertised_host or "localhost",
         instance_id=args.instance_id,
         package_aggregate_sha256=args.package_aggregate_sha256,
         compiler_build_manifest_sha256=args.compiler_build_manifest_sha256,
@@ -105,7 +161,99 @@ def _config(args: argparse.Namespace) -> NativeLauncherConfig:
         readiness_timeout_seconds=args.readiness_timeout_s,
         poll_interval_seconds=args.poll_interval_s,
         reconciliation_period_ms=args.reconciliation_period_ms,
+        manager_timeout_seconds=args.manager_timeout_s,
     )
+
+
+def _isaac_config(args: argparse.Namespace) -> IsaacLauncherConfig:
+    required = (
+        "isaac_executable",
+        "world_path",
+        "remote_source_root",
+        "remote_manager_executable",
+        "remote_package_root",
+        "remote_node_catalog_path",
+        "remote_alarm_catalog_path",
+        "remote_publication_root",
+        "remote_manager_state_root",
+        "remote_runtime_state_root",
+        "remote_execution_state_root",
+        "remote_logical_scene_database",
+        "remote_historian_database_path",
+        "remote_state_root",
+        "remote_simulation_control_config",
+        "remote_ros_environment_script",
+        "package_aggregate_sha256",
+        "compiler_build_manifest_sha256",
+        "node_environment_sha256",
+    )
+    missing = [name.replace("_", "-") for name in required if getattr(args, name, None) is None]
+    if missing:
+        raise ValueError(f"isaac profile requires: {', '.join(missing)}")
+    local_environment = args.local_ros_environment_script
+    if local_environment is None:
+        local_environment = args.source_root / "config/ros/isaac_i9.env.sh"
+    local_setup = args.local_ros_setup_script or Path("/opt/ros/jazzy/setup.bash")
+    remote = RemoteNativeConfig(
+        target=args.remote_target,
+        source_root=args.remote_source_root,
+        manager_executable=args.remote_manager_executable,
+        package_root=args.remote_package_root,
+        node_catalog_path=args.remote_node_catalog_path,
+        alarm_catalog_path=args.remote_alarm_catalog_path,
+        publication_root=args.remote_publication_root,
+        manager_state_root=args.remote_manager_state_root,
+        runtime_state_root=args.remote_runtime_state_root,
+        execution_state_root=args.remote_execution_state_root,
+        logical_scene_database=args.remote_logical_scene_database,
+        historian_database_path=args.remote_historian_database_path,
+        state_root=args.remote_state_root,
+        composer_static_dir=args.remote_composer_static_dir or "",
+        simulation_control_config=args.remote_simulation_control_config,
+        bridge_state_root=args.remote_bridge_state_root or "/mnt/nova_ssd/codex-manyforge/runners/isaac-bridge",
+        ros_setup_script=args.remote_ros_setup_script or "/opt/ros/jazzy/setup.bash",
+        ros_environment_script=args.remote_ros_environment_script,
+        python_executable=args.remote_python_executable,
+        advertised_host=args.advertised_host or "192.168.1.68",
+        canonical_empty_admission_filename=args.canonical_empty_admission_filename,
+        cell_id=args.cell_id,
+        package_aggregate_sha256=args.package_aggregate_sha256,
+        compiler_build_manifest_sha256=args.compiler_build_manifest_sha256,
+        node_environment_sha256=args.node_environment_sha256,
+    )
+    peers = tuple(sorted(set(args.static_peers or ("192.168.1.132", "192.168.1.68"))))
+    return IsaacLauncherConfig(
+        source_root=args.source_root,
+        isaac_executable=args.isaac_executable,
+        world_path=args.world_path,
+        state_root=args.state_root,
+        instance_id=args.instance_id,
+        remote=remote,
+        simulator_host=args.simulator_host,
+        control_host=args.control_host,
+        static_peers=peers,
+        local_ros_setup_script=local_setup,
+        local_ros_environment_script=local_environment,
+        expected_world_name=args.expected_world_name,
+        expected_source_fingerprint=args.expected_source_fingerprint,
+        expected_head_commit=args.expected_head_commit,
+        expected_head_tree=args.expected_head_tree,
+        readiness_timeout_seconds=args.readiness_timeout_s,
+        poll_interval_seconds=args.poll_interval_s,
+        manager_timeout_seconds=args.manager_timeout_s,
+    )
+
+
+def _persisted_profile(state_root: Path, instance_id: str) -> LaunchProfile | None:
+    record = state_root.absolute() / instance_id / "launch_instance.json"
+    if not record.is_file():
+        return None
+    try:
+        envelope = json.loads(record.read_text(encoding="utf-8"))
+        profile = envelope["status"]["configuration"]["profile"]
+        return LaunchProfile(profile)
+    except (KeyError, OSError, TypeError, ValueError, json.JSONDecodeError) as error:
+        raise LauncherError("status_record_invalid", str(error), exit_code=70) from error
 
 
 def _emit(value: dict, *, json_output: bool) -> None:
@@ -127,15 +275,9 @@ def main(argv: list[str] | None = None) -> int:
     try:
         if operation is LaunchOperation.START:
             if args.profile == LaunchProfile.ISAAC.value:
-                value = _result(
-                    operation,
-                    outcome="failed",
-                    code="isaac_profile_unavailable",
-                    message="Isaac native split lifecycle is deferred to O1.4",
-                )
-                _emit(value, json_output=args.json_output)
-                return 78
-            launcher = NativeLauncher(_config(args))
+                launcher = IsaacLauncher(_isaac_config(args))
+            else:
+                launcher = NativeLauncher(_config(args))
             try:
                 status = launcher.start()
                 value = _result(
@@ -149,12 +291,17 @@ def main(argv: list[str] | None = None) -> int:
                 value = _result(operation, outcome="failed", status=error.status, code=error.code, message=str(error))
                 _emit(value, json_output=args.json_output)
                 return error.exit_code
-        launcher = NativeLauncher.from_state_root(args.state_root, args.instance_id)
+        profile = _persisted_profile(args.state_root, args.instance_id)
+        launcher = (
+            IsaacLauncher.from_state_root(args.state_root, args.instance_id)
+            if profile is LaunchProfile.ISAAC
+            else NativeLauncher.from_state_root(args.state_root, args.instance_id)
+        )
         status = launcher.status() if operation is LaunchOperation.STATUS else launcher.stop()
         if status is None:
             value = _result(operation, outcome="failed", code="instance_unavailable", message="no persisted launch instance exists")
             _emit(value, json_output=args.json_output)
-            return 0 if operation is LaunchOperation.STOP else 70
+            return 70
         if operation is LaunchOperation.STATUS:
             outcome = "reported"
         else:

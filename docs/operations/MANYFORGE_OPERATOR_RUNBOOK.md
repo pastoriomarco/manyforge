@@ -1,9 +1,11 @@
 # ManyForge operator runbook
 
-> **Current boundary (O1.3):** the `native` operator entrypoint is
-> implemented at the source boundary below. Live product qualification is
-> still open. `isaac` is unavailable until O1.4 lands; this document must not
-> be read as an Isaac availability claim.
+> **Current boundary (O1 implementation snapshot):** the `native` and split
+> `isaac` operator entrypoints, durable identities, recovery paths, and the
+> Composer deployment-composition client are implemented and container-tested.
+> Clean-source live qualification and `FV-O1` remain open; this document is
+> not a live availability claim until the dated O1 evidence names the exact
+> source/package/world identities and green runtime rows.
 
 ## 1. Preconditions and identity
 
@@ -13,21 +15,24 @@ executable, catalogs, and all state paths below must be on that host. Use
 absolute paths. The source must be clean: the launcher collects
 `manyforge.source_identity.v1` and rejects a dirty checkout.
 
-The current native launcher source anchor is:
+The exact clean source, package, compiler, and environment identities are
+source-matched inputs and must be copied from the dated O1 evidence for the
+commit being qualified. Do not reuse the historical values from an older
+runbook revision or invent placeholders for a live launch.
 
 | Input | Value |
 |---|---|
-| ManyForge commit | `13f9131888c8f740bc172b9e89d00b308f973cec` |
-| ManyForge tree | `8556e53f72e53cc8d440e1e80cb18ebf36dd9722` |
-| Source fingerprint | `041149aa4f472e4c00ffa92db94a88249f8b7b9b416204812d391258a503f803` |
+| ManyForge commit/tree/fingerprint | See the exact dated O1 evidence for the qualified freeze |
+| Package/compiler/environment digests | See the source-matched package record named by that evidence |
 
 The three artifact identity inputs are mandatory and must come from the
 source-matched build/package record; do not invent or reuse values:
 `package_aggregate_sha256`, `compiler_build_manifest_sha256`, and
 `node_environment_sha256`. O1.3 native records a `mounted_install`, not a
 container image, so no container image ID is supplied to this native command.
-An O1.4 Isaac image/world identity must be published before that profile is
-usable.
+The split Isaac profile records a mounted remote install and a mounted local
+world; its exact source/package/world identity must be published in the dated
+O1 evidence before live use.
 
 Before starting, reserve the frozen ports: Composer `9000`, Headless
 loopback `9010`, and Program runner loopback `9011`. Keep the runtime host
@@ -54,6 +59,9 @@ under `PACKAGE_ROOT`.
 
 ```bash
 MANYFORGE_ROOT=/absolute/path/to/manyforge
+MANYFORGE_COMMIT=<qualified-manyforge-commit>
+MANYFORGE_TREE=<qualified-manyforge-tree>
+SOURCE_FINGERPRINT=<qualified-source-fingerprint>
 STATE_ROOT=/absolute/path/to/operator-state
 INSTANCE_ID=native
 ADVERTISED_HOST=orion-hostname-or-address
@@ -96,11 +104,11 @@ python3 -m manyforge_operator \
   --compiler-build-manifest-sha256 "$COMPILER_SHA256" \
   --node-environment-sha256 "$NODE_ENV_SHA256" \
   --advertised-host "$ADVERTISED_HOST" \
-  --expected-source-fingerprint "041149aa4f472e4c00ffa92db94a88249f8b7b9b416204812d391258a503f803" \
-  --expected-head-commit "13f9131888c8f740bc172b9e89d00b308f973cec" \
-  --expected-head-tree "8556e53f72e53cc8d440e1e80cb18ebf36dd9722" \
+  --expected-source-fingerprint "$SOURCE_FINGERPRINT" \
+  --expected-head-commit "$MANYFORGE_COMMIT" \
+  --expected-head-tree "$MANYFORGE_TREE" \
   --readiness-timeout-s 60 --poll-interval-s 0.25 \
-  --reconciliation-period-ms 20
+  --reconciliation-period-ms 20 --manager-timeout-s 60
 ```
 
 `--readiness-timeout-s`, `--poll-interval-s`, and
@@ -180,31 +188,70 @@ failure reasons. In particular:
   process cleanup. Only the recorded launch instance may be terminated; a
   deadline failure is `cleanup_deadline_exceeded`, not success.
 - If Orin or the runtime host is unreachable, a laptop browser cannot recover
-  it and the current O1.3 launcher makes no remote-host recovery claim. Restore
-  the host, run `status` locally, then use the matching `stop`/`start` flow.
-  Do not use broad process-name kills or SSH recipes.
+  it. Native status/stop must be run on the runtime host; split Isaac status/
+  stop reports the remote-unavailable condition when it cannot prove a stopped
+  record absent. Restore the host, then use the matching `status`/`stop`/`start`
+  flow. Do not use broad process-name kills or SSH recipes.
 
-## 5. Isaac and other unavailable lanes
+## 5. Split Isaac topology and other unavailable lanes
 
-The split Isaac topology is **deferred and unavailable at this base**. The
-intended O1.4 shape is: the source-matched ManyForge composition and Composer
-run on Orin; a laptop-side outer lifecycle owner starts the installed
-`${HOME}/isaac-sim` process, verifies the Jazzy bridge,
-`simulation_interfaces`, and the retained UR10 world, and keeps simulation
-stopped until an explicit simulator action. The future profile must also
-record its exact Fast DDS/RMW/static-peer, image, and world identities; those
-inputs are not supplied by O1.3. This topology is not an O1.3 command or
-qualification claim. At this base, selecting `--profile isaac`
-returns the stable `isaac_profile_unavailable` result (exit `78`) before
-starting Isaac or any ManyForge process.
+The implemented Isaac profile is a laptop-owned outer lifecycle around the
+source-matched Orin runtime. It is intentionally still a live-qualification
+gate. The laptop starts `/home/tndlux/isaac-sim/isaac-sim.sh` headless with
+`isaacsim.ros2.bridge` and `isaacsim.ros2.sim_control`; SSH starts the retained
+ROS bridge and native ManyForge operator on Orin. The bridge barrier loads and
+reads back the retained UR10 world, verifies the five
+`simulation_interfaces` services and required topics, and leaves simulation
+stopped. The outer owner records exact local and remote process identities,
+source/artifact/world identities, readiness, failures, and cleanup results.
 
-When O1.4 is integrated, the required Isaac lifecycle is still fail-closed:
-startup failure, explicit overall stop, and leaving an active simulator
-session stop Isaac; after a deliberate Program Run it returns to stopped.
-Isaac must never auto-play or remain active outside an active session. Isaac
-loss must be reported as unavailable/degraded rather than inferred from a
-port. Until that implementation lands, do not attempt to reconstruct this
-lifecycle with another script.
+Use the same global state root/instance ID and provide every source-matched
+remote path and digest. The command shape is:
+
+```bash
+python3 -m manyforge_operator \
+  --state-root "$STATE_ROOT" --instance-id isaac --json \
+  start --profile isaac --source-root "$MANYFORGE_ROOT" \
+  --isaac-executable /home/tndlux/isaac-sim/isaac-sim.sh \
+  --world-path /home/tndlux/workspaces/isaac_ros-dev/src/isaac_sim_custom_examples/Scenario/IsaacManipulator/UniversalRobots/isaac_manipulator_scene_light.usda \
+  --local-ros-setup-script /opt/ros/jazzy/setup.bash \
+  --local-ros-environment-script "$MANYFORGE_ROOT/config/ros/isaac_i9.env.sh" \
+  --remote-target tndlux@192.168.1.68 \
+  --remote-source-root /mnt/nova_ssd/codex-manyforge/runners/manyforge \
+  --remote-manager-executable /mnt/nova_ssd/codex-manyforge/builds/current/package/bin/manyforge_manager_daemon \
+  --remote-package-root /mnt/nova_ssd/codex-manyforge/builds/current/package \
+  --remote-node-catalog-path /mnt/nova_ssd/codex-manyforge/builds/current/package/share/node_catalog.yaml \
+  --remote-alarm-catalog-path /mnt/nova_ssd/codex-manyforge/builds/current/package/share/alarm_catalog.yaml \
+  --remote-publication-root /mnt/nova_ssd/codex-manyforge/runners/state/publication \
+  --remote-manager-state-root /mnt/nova_ssd/codex-manyforge/runners/state/manager \
+  --remote-runtime-state-root /mnt/nova_ssd/codex-manyforge/runners/state/runtime \
+  --remote-execution-state-root /mnt/nova_ssd/codex-manyforge/runners/state/execution \
+  --remote-logical-scene-database /mnt/nova_ssd/codex-manyforge/runners/state/scene.sqlite3 \
+  --remote-historian-database-path /mnt/nova_ssd/codex-manyforge/runners/state/history.sqlite3 \
+  --remote-state-root /mnt/nova_ssd/codex-manyforge/runners/state/operator \
+  --remote-simulation-control-config /mnt/nova_ssd/codex-manyforge/runners/manyforge/manyforge_ros_bringup/config/isaac_program_simulation_site.json \
+  --remote-ros-setup-script /opt/ros/jazzy/setup.bash \
+  --remote-ros-environment-script /mnt/nova_ssd/codex-manyforge/runners/manyforge/config/ros/isaac_i9.env.sh \
+  --package-aggregate-sha256 "$PACKAGE_SHA256" \
+  --compiler-build-manifest-sha256 "$COMPILER_SHA256" \
+  --node-environment-sha256 "$NODE_ENV_SHA256" \
+  --expected-source-fingerprint "$SOURCE_FINGERPRINT" \
+  --expected-head-commit "$MANYFORGE_COMMIT" \
+  --expected-head-tree "$MANYFORGE_TREE"
+```
+
+The Isaac topology is fixed to `ROS_DOMAIN_ID=0`,
+`RMW_IMPLEMENTATION=rmw_fastrtps_cpp`,
+`ROS_AUTOMATIC_DISCOVERY_RANGE=LOCALHOST`, and static peers
+`192.168.1.132;192.168.1.68`. Source `config/ros/isaac_i9.env.sh` for every
+participant. Isaac never auto-plays, selects a scenario, Applies a graph, or
+Runs a Program. Explicit `status` and `stop` use the persisted profile and
+identity; startup failure, Orin/simulator loss, explicit stop, and cleanup
+failure are reported as typed stopped/degraded outcomes rather than inferred
+from a port. A stopped Isaac record is re-probed against Orin before
+idempotent status/stop is reported; if Orin is unreachable, the result is
+`runtime_host_unavailable` rather than an unverified stopped claim. Do not
+recreate this lifecycle with a historical script.
 
 The physical ROS/real-robot lane, assistant-provider bring-up, packaged
 installation, historical aggregate launchers, and old Isaac recipes are not

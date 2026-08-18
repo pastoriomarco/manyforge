@@ -88,7 +88,7 @@ class ManagerCommandClient:
             timeout_seconds <= 0
             or timeout_seconds > MAX_MANAGER_COMMAND_TIMEOUT_SECONDS
         ):
-            raise ValueError("Manager timeout must be in (0, 15] seconds")
+            raise ValueError("Manager timeout must be in (0, 60] seconds")
         self._socket_path = state_root / MANAGER_SOCKET_FILE
         self._timeout_seconds = timeout_seconds
 

@@ -8,6 +8,9 @@ import {
   parseHealthResponse,
   parseHeadlessRuntimeSnapshot,
   parseHistorianPage,
+  parseManagerDiffProjection,
+  parseManagerGraphProjection,
+  parseManagerStatusProjection,
   parseOperatorAlarmSnapshot,
   parseMotionPreviewResponse,
   parseNodeEnvironmentResponse,
@@ -880,6 +883,64 @@ describe('headless projection parsers', () => {
     expect(structural.headless).toBeNull();
     expect(headless.mode).toBe('headless_client');
     expect(headless.runtimeAvailability).toBeNull();
+  });
+
+  it('parses exact Manager status, graph, and diff identities', () => {
+    const source = {
+      available: true,
+      freshness: 'fresh',
+      known_gaps: [],
+      projection_generation: 4,
+      projection_owner_epoch: 'projection.epoch.1',
+      receiver_age_ns: 10,
+      source_content_digest: 'sha256:' + 'a'.repeat(64),
+      source_generation: 2,
+      source_owner_epoch: 'manager.epoch.1',
+      source_owner_id: 'component-manager.cell-a',
+    };
+    const status = parseManagerStatusProjection({
+      schema_version: 'manyforge.manager_status_projection.v1',
+      source,
+      status: {
+        api_version: 'manyforge.manager_source.v1',
+        active: {
+          cell_graph: { cell_id: 'cell-a', components: [] },
+          graph_revision: 'graph.1',
+          retained_bundle_id: 'bundle.1',
+          publication: {},
+        },
+        apply: {
+          mutation_available: true,
+          records: [],
+          unavailable_reason_code: null,
+        },
+        cell_id: 'cell-a',
+        manager_ready: true,
+        runtime: {
+          converged: true,
+          desired_units: [],
+          observed_units: [],
+        },
+      },
+    });
+    const graph = parseManagerGraphProjection({
+      schema_version: 'manyforge.manager_graph_projection.v1',
+      source,
+      graph_revision: 'graph.1',
+      retained_bundle_id: 'bundle.1',
+      cell_graph: { cell_id: 'cell-a', components: [] },
+    });
+    const diff = parseManagerDiffProjection({
+      schema_version: 'manyforge.manager_diff_projection.v1',
+      source,
+      converged: true,
+      desired_units: [],
+      observed_units: [],
+    });
+
+    expect(status.status.active.graphRevision).toBe('graph.1');
+    expect(graph.retainedBundleId).toBe('bundle.1');
+    expect(diff.converged).toBe(true);
   });
 
   it('accepts exact runtime and four-state alarm snapshots', () => {

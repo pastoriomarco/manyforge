@@ -69,6 +69,51 @@ function workspaceFixture(): Record<string, unknown> {
   };
 }
 
+function managerSourceFixture(): Record<string, unknown> {
+  return {
+    available: true,
+    freshness: 'fresh',
+    known_gaps: [],
+    projection_generation: 4,
+    projection_owner_epoch: 'projection.epoch.1',
+    receiver_age_ns: 10,
+    source_content_digest: 'sha256:' + 'a'.repeat(64),
+    source_generation: 2,
+    source_owner_epoch: 'manager.epoch.1',
+    source_owner_id: 'component-manager.cell-a',
+  };
+}
+
+function managerGraphFixture(): Record<string, unknown> {
+  return {
+    schema_version: 'manyforge.manager_graph_projection.v1',
+    source: managerSourceFixture(),
+    graph_revision: 'graph.9',
+    retained_bundle_id: 'bundle.9',
+    cell_graph: { cell_id: 'cell-a', components: [] },
+  };
+}
+
+function managerDiffFixture(): Record<string, unknown> {
+  return {
+    schema_version: 'manyforge.manager_diff_projection.v1',
+    source: managerSourceFixture(),
+    converged: true,
+    desired_units: [],
+    observed_units: [],
+  };
+}
+
+function managerApplyFixture(request: ManagerApplyRequest): Record<string, unknown> {
+  return {
+    api_version: 'manyforge.manager_command_response.v1',
+    ok: true,
+    error: null,
+    request_id: request.request_id,
+    request_owner_epoch: request.request_owner_epoch,
+  };
+}
+
 describe('structural API client', () => {
   it('uses the owner mode index and bridge-owned request status routes', async () => {
     const fetchMock = vi.fn()
@@ -344,9 +389,9 @@ describe('headless intent client', () => {
     };
 
     const fetchMock = vi.fn()
-      .mockResolvedValue(response({}))
-      .mockResolvedValue(response({}))
-      .mockResolvedValue(response({}));
+      .mockResolvedValueOnce(response(managerGraphFixture()))
+      .mockResolvedValueOnce(response(managerApplyFixture(request)))
+      .mockResolvedValueOnce(response(managerDiffFixture()));
     vi.stubGlobal('fetch', fetchMock);
 
     await api.manager.graph();

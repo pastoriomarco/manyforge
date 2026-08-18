@@ -8,6 +8,10 @@ import {
   parseHeadlessRuntimeSnapshot,
   parseHistorianPage,
   parseExecutionOwnerStatus,
+  parseManagerApplyResponse,
+  parseManagerDiffProjection,
+  parseManagerGraphProjection,
+  parseManagerStatusProjection,
   parseMotionPreviewResponse,
   parseNodeEnvironmentResponse,
   parseObjectResponse,
@@ -44,7 +48,11 @@ import type {
   FileBrowserResponse,
   HealthResponse,
   JsonValue,
+  ManagerApplyResponse,
   NodeEnvironmentResponse,
+  ManagerDiffProjection,
+  ManagerGraphProjection,
+  ManagerStatusProjection,
   ProgramWorkspaceResponse,
   ProgramWorkspaceTransitionResponse,
   ProgramRunIndex,
@@ -458,27 +466,27 @@ export const api = {
     ),
   },
   manager: {
-    status: (signal?: AbortSignal): Promise<Record<string, unknown>> => requestJson(
+    status: (signal?: AbortSignal): Promise<ManagerStatusProjection> => requestJson(
       '/api/manager/status',
-      parseObjectResponse,
+      parseManagerStatusProjection,
       signal,
     ),
-    graph: (signal?: AbortSignal): Promise<Record<string, unknown>> => requestJson(
+    graph: (signal?: AbortSignal): Promise<ManagerGraphProjection> => requestJson(
       '/api/manager/graph',
-      parseObjectResponse,
+      parseManagerGraphProjection,
       signal,
     ),
-    diff: (signal?: AbortSignal): Promise<Record<string, unknown>> => requestJson(
+    diff: (signal?: AbortSignal): Promise<ManagerDiffProjection> => requestJson(
       '/api/manager/diff',
-      parseObjectResponse,
+      parseManagerDiffProjection,
       signal,
     ),
     apply: (
       request: ManagerApplyRequest,
       signal?: AbortSignal,
-    ): Promise<Record<string, unknown>> => requestJson(
+    ): Promise<ManagerApplyResponse> => requestJson(
       '/api/manager/apply',
-      parseObjectResponse,
+      parseManagerApplyResponse,
       signal,
       { method: 'POST', body: JSON.stringify(request) },
     ),

@@ -5,6 +5,7 @@ import { ArtifactBrowser } from './components/ArtifactBrowser';
 import { AssistantOverlay } from './components/AssistantOverlay';
 import { CatalogPanel } from './components/CatalogPanel';
 import { CCLCPanel } from './components/CCLCPanel';
+import { DeploymentCompositionPanel } from './components/DeploymentCompositionPanel';
 import { ProgramWorkspace } from './components/ProgramWorkspace';
 import { ProgramRuntimePanel } from './components/ProgramRuntimePanel';
 import { SceneAuthoringWorkspace } from './components/SceneAuthoringWorkspace';
@@ -74,6 +75,8 @@ export default function App() {
         enabled={headlessEnabled}
         headlessState={headlessState}
       />
+
+      <DeploymentCompositionPanel enabled={headlessEnabled} />
 
       <RobotControlPanelView
         enabled={headlessEnabled}

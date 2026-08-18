@@ -13,6 +13,14 @@ import type {
   NodeEnvironmentResponse,
   NodeImplementationAvailability,
   AppliedProgramSelection,
+  ManagerActiveProjection,
+  ManagerApplyAvailability,
+  ManagerApplyResponse,
+  ManagerDiffProjection,
+  ManagerGraphProjection,
+  ManagerRuntimeProjection,
+  ManagerSourceMetadata,
+  ManagerStatusProjection,
   ProgramDocument,
   ProgramParameterDeclaration,
   ProgramSceneFrameRef,
@@ -1032,6 +1040,290 @@ function parseRuntimeAvailability(value: unknown, path: string) {
     code: stringAt(record.code, `${path}.code`),
     message: stringAt(record.message, `${path}.message`),
     restorationGates: stringArrayAt(record.restorationGates, `${path}.restorationGates`),
+  };
+}
+
+function parseManagerSourceMetadata(
+  value: unknown,
+  path: string,
+): ManagerSourceMetadata {
+  const record = objectAt(value, path);
+  exactKeysAt(
+    record,
+    [
+      'available',
+      'freshness',
+      'known_gaps',
+      'projection_generation',
+      'projection_owner_epoch',
+      'receiver_age_ns',
+      'source_content_digest',
+      'source_generation',
+      'source_owner_epoch',
+      'source_owner_id',
+    ],
+    path,
+  );
+  return {
+    projectionGeneration: integerAt(
+      record.projection_generation,
+      path + '.projection_generation',
+    ),
+    projectionOwnerEpoch: stringAt(
+      record.projection_owner_epoch,
+      path + '.projection_owner_epoch',
+    ),
+    available: booleanAt(record.available, path + '.available'),
+    freshness: sourceFreshnessAt(record.freshness, path + '.freshness'),
+    knownGaps: stringArrayAt(record.known_gaps, path + '.known_gaps'),
+    receiverAgeNs: nullableNumberAt(
+      record.receiver_age_ns,
+      path + '.receiver_age_ns',
+    ),
+    sourceGeneration: nullableNumberAt(
+      record.source_generation,
+      path + '.source_generation',
+    ),
+    sourceOwnerEpoch: nullableStringAt(
+      record.source_owner_epoch,
+      path + '.source_owner_epoch',
+    ),
+    sourceOwnerId: nullableStringAt(
+      record.source_owner_id,
+      path + '.source_owner_id',
+    ),
+    sourceContentDigest: nullableStringAt(
+      record.source_content_digest,
+      path + '.source_content_digest',
+    ),
+  };
+}
+
+function parseManagerActiveProjection(
+  value: unknown,
+  path: string,
+): ManagerActiveProjection {
+  const record = objectAt(value, path);
+  exactKeysAt(
+    record,
+    ['cell_graph', 'graph_revision', 'publication', 'retained_bundle_id'],
+    path,
+  );
+  return {
+    cellGraph: jsonRecordAt(record.cell_graph, path + '.cell_graph'),
+    graphRevision: stringAt(record.graph_revision, path + '.graph_revision'),
+    retainedBundleId: stringAt(
+      record.retained_bundle_id,
+      path + '.retained_bundle_id',
+    ),
+    publication: jsonRecordAt(record.publication, path + '.publication'),
+  };
+}
+
+function parseManagerApplyAvailability(
+  value: unknown,
+  path: string,
+): ManagerApplyAvailability {
+  const record = objectAt(value, path);
+  exactKeysAt(
+    record,
+    ['mutation_available', 'records', 'unavailable_reason_code'],
+    path,
+  );
+  return {
+    mutationAvailable: booleanAt(
+      record.mutation_available,
+      path + '.mutation_available',
+    ),
+    records: boundedArrayAt(record.records, path + '.records', 4096).map(
+      (item, index) => jsonValueAt(item, path + '.records[' + index + ']'),
+    ),
+    unavailableReasonCode: nullableStringAt(
+      record.unavailable_reason_code,
+      path + '.unavailable_reason_code',
+    ),
+  };
+}
+
+function parseManagerRuntimeProjection(
+  value: unknown,
+  path: string,
+): ManagerRuntimeProjection {
+  const record = objectAt(value, path);
+  exactKeysAt(record, ['converged', 'desired_units', 'observed_units'], path);
+  return {
+    converged: booleanAt(record.converged, path + '.converged'),
+    desiredUnits: boundedArrayAt(
+      record.desired_units,
+      path + '.desired_units',
+      4096,
+    ).map((item, index) => jsonValueAt(item, path + '.desired_units[' + index + ']')),
+    observedUnits: boundedArrayAt(
+      record.observed_units,
+      path + '.observed_units',
+      4096,
+    ).map((item, index) => jsonValueAt(item, path + '.observed_units[' + index + ']')),
+  };
+}
+
+export function parseManagerStatusProjection(
+  value: unknown,
+): ManagerStatusProjection {
+  const record = objectAt(value, 'managerStatus');
+  exactKeysAt(record, ['schema_version', 'source', 'status'], 'managerStatus');
+  const schemaVersion = stringAt(
+    record.schema_version,
+    'managerStatus.schema_version',
+  );
+  if (schemaVersion !== 'manyforge.manager_status_projection.v1') {
+    return fail(
+      'managerStatus.schema_version',
+      'manyforge.manager_status_projection.v1',
+    );
+  }
+  const status = objectAt(record.status, 'managerStatus.status');
+  exactKeysAt(
+    status,
+    ['active', 'api_version', 'apply', 'cell_id', 'manager_ready', 'runtime'],
+    'managerStatus.status',
+  );
+  const apiVersion = stringAt(
+    status.api_version,
+    'managerStatus.status.api_version',
+  );
+  if (apiVersion !== 'manyforge.manager_source.v1') {
+    return fail(
+      'managerStatus.status.api_version',
+      'manyforge.manager_source.v1',
+    );
+  }
+  return {
+    schemaVersion,
+    source: parseManagerSourceMetadata(record.source, 'managerStatus.source'),
+    status: {
+      apiVersion,
+      active: parseManagerActiveProjection(
+        status.active,
+        'managerStatus.status.active',
+      ),
+      apply: parseManagerApplyAvailability(
+        status.apply,
+        'managerStatus.status.apply',
+      ),
+      cellId: stringAt(status.cell_id, 'managerStatus.status.cell_id'),
+      managerReady: booleanAt(
+        status.manager_ready,
+        'managerStatus.status.manager_ready',
+      ),
+      runtime: parseManagerRuntimeProjection(
+        status.runtime,
+        'managerStatus.status.runtime',
+      ),
+    },
+  };
+}
+
+export function parseManagerGraphProjection(
+  value: unknown,
+): ManagerGraphProjection {
+  const record = objectAt(value, 'managerGraph');
+  exactKeysAt(
+    record,
+    ['cell_graph', 'graph_revision', 'retained_bundle_id', 'schema_version', 'source'],
+    'managerGraph',
+  );
+  const schemaVersion = stringAt(
+    record.schema_version,
+    'managerGraph.schema_version',
+  );
+  if (schemaVersion !== 'manyforge.manager_graph_projection.v1') {
+    return fail(
+      'managerGraph.schema_version',
+      'manyforge.manager_graph_projection.v1',
+    );
+  }
+  return {
+    schemaVersion,
+    source: parseManagerSourceMetadata(record.source, 'managerGraph.source'),
+    graphRevision: stringAt(record.graph_revision, 'managerGraph.graph_revision'),
+    retainedBundleId: stringAt(
+      record.retained_bundle_id,
+      'managerGraph.retained_bundle_id',
+    ),
+    cellGraph: jsonRecordAt(record.cell_graph, 'managerGraph.cell_graph'),
+  };
+}
+
+export function parseManagerDiffProjection(
+  value: unknown,
+): ManagerDiffProjection {
+  const record = objectAt(value, 'managerDiff');
+  exactKeysAt(
+    record,
+    ['converged', 'desired_units', 'observed_units', 'schema_version', 'source'],
+    'managerDiff',
+  );
+  const schemaVersion = stringAt(
+    record.schema_version,
+    'managerDiff.schema_version',
+  );
+  if (schemaVersion !== 'manyforge.manager_diff_projection.v1') {
+    return fail(
+      'managerDiff.schema_version',
+      'manyforge.manager_diff_projection.v1',
+    );
+  }
+  return {
+    schemaVersion,
+    source: parseManagerSourceMetadata(record.source, 'managerDiff.source'),
+    converged: booleanAt(record.converged, 'managerDiff.converged'),
+    desiredUnits: boundedArrayAt(
+      record.desired_units,
+      'managerDiff.desired_units',
+      4096,
+    ).map((item, index) => jsonValueAt(item, 'managerDiff.desired_units[' + index + ']')),
+    observedUnits: boundedArrayAt(
+      record.observed_units,
+      'managerDiff.observed_units',
+      4096,
+    ).map((item, index) => jsonValueAt(item, 'managerDiff.observed_units[' + index + ']')),
+  };
+}
+
+export function parseManagerApplyResponse(value: unknown): ManagerApplyResponse {
+  const record = objectAt(value, 'managerApply');
+  allowedKeysAt(
+    record,
+    ['api_version', 'error', 'ok', 'request_id', 'request_owner_epoch'],
+    ['projection_status', 'replay_status', 'transaction_sequence'],
+    'managerApply',
+  );
+  const apiVersion = stringAt(record.api_version, 'managerApply.api_version');
+  if (apiVersion !== 'manyforge.manager_command_response.v1') {
+    return fail(
+      'managerApply.api_version',
+      'manyforge.manager_command_response.v1',
+    );
+  }
+  const error = record.error === null
+    ? null
+    : (() => {
+        const parsed = objectAt(record.error, 'managerApply.error');
+        exactKeysAt(parsed, ['code', 'message'], 'managerApply.error');
+        return {
+          code: stringAt(parsed.code, 'managerApply.error.code'),
+          message: stringAt(parsed.message, 'managerApply.error.message'),
+        };
+      })();
+  return {
+    apiVersion,
+    ok: booleanAt(record.ok, 'managerApply.ok'),
+    error,
+    requestId: stringAt(record.request_id, 'managerApply.request_id'),
+    requestOwnerEpoch: stringAt(
+      record.request_owner_epoch,
+      'managerApply.request_owner_epoch',
+    ),
   };
 }
 

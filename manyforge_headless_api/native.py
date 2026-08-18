@@ -21,7 +21,7 @@ MAX_STANDARD_REQUEST_BODY_BYTES = 1024 * 1024
 MAX_PROGRAM_APPLY_REQUEST_BYTES = 17 * 1024 * 1024
 MAX_PROGRAM_MODEL_ATTEMPT_BYTES = 256 * 1024
 DEFAULT_MANAGER_COMMAND_TIMEOUT_SECONDS = 5.0
-MAX_MANAGER_COMMAND_TIMEOUT_SECONDS = 15.0
+MAX_MANAGER_COMMAND_TIMEOUT_SECONDS = 60.0
 _SHA256_PATTERN = re.compile(r"^sha256:[0-9a-f]{64}$")
 
 
@@ -102,7 +102,7 @@ class HeadlessApiConfig:
         if self.freshness_milliseconds < 1:
             raise ValueError("freshness_milliseconds must be positive")
         if not 0 < self.manager_timeout_seconds <= MAX_MANAGER_COMMAND_TIMEOUT_SECONDS:
-            raise ValueError("manager_timeout_seconds must be in (0, 15]")
+            raise ValueError("manager_timeout_seconds must be in (0, 60]")
         if not 0 < self.execution_timeout_seconds <= 30:
             raise ValueError("execution_timeout_seconds must be in (0, 30]")
         if not 0 < self.cclc_timeout_seconds <= 30:

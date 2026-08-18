@@ -714,6 +714,75 @@ export interface ManagerApplyRequest {
   reject_if_affected_busy: true;
 }
 
+export interface ManagerSourceMetadata {
+  projectionGeneration: number;
+  projectionOwnerEpoch: string;
+  available: boolean;
+  freshness: 'fresh' | 'stale' | 'unavailable';
+  knownGaps: string[];
+  receiverAgeNs: number | null;
+  sourceGeneration: number | null;
+  sourceOwnerEpoch: string | null;
+  sourceOwnerId: string | null;
+  sourceContentDigest: string | null;
+}
+
+export interface ManagerActiveProjection {
+  cellGraph: Record<string, JsonValue>;
+  graphRevision: string;
+  retainedBundleId: string;
+  publication: Record<string, JsonValue>;
+}
+
+export interface ManagerApplyAvailability {
+  mutationAvailable: boolean;
+  records: JsonValue[];
+  unavailableReasonCode: string | null;
+}
+
+export interface ManagerRuntimeProjection {
+  converged: boolean;
+  desiredUnits: JsonValue[];
+  observedUnits: JsonValue[];
+}
+
+export interface ManagerStatusProjection {
+  schemaVersion: 'manyforge.manager_status_projection.v1';
+  source: ManagerSourceMetadata;
+  status: {
+    apiVersion: 'manyforge.manager_source.v1';
+    active: ManagerActiveProjection;
+    apply: ManagerApplyAvailability;
+    cellId: string;
+    managerReady: boolean;
+    runtime: ManagerRuntimeProjection;
+  };
+}
+
+export interface ManagerGraphProjection {
+  schemaVersion: 'manyforge.manager_graph_projection.v1';
+  source: ManagerSourceMetadata;
+  graphRevision: string;
+  retainedBundleId: string;
+  cellGraph: Record<string, JsonValue>;
+}
+
+export interface ManagerDiffProjection {
+  schemaVersion: 'manyforge.manager_diff_projection.v1';
+  source: ManagerSourceMetadata;
+  converged: boolean;
+  desiredUnits: JsonValue[];
+  observedUnits: JsonValue[];
+}
+
+export interface ManagerApplyResponse {
+  apiVersion: 'manyforge.manager_command_response.v1';
+  ok: boolean;
+  error: { code: string; message: string } | null;
+  requestId: string;
+  requestOwnerEpoch: string;
+}
+
 export interface DraftMutationResponse {
   mutation: string;
   details: Record<string, JsonValue>;

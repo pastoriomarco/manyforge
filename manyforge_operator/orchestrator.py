@@ -107,6 +107,7 @@ class NativeLauncherConfig:
     logical_scene_database: Path
     historian_database_path: Path
     composer_static_dir: Path | None = None
+    simulation_control_config: Path | None = None
     canonical_empty_admission_filename: str = "canonical-empty-admission.json"
     cell_id: str = "native"
     state_root: Path = DEFAULT_STATE_ROOT
@@ -121,6 +122,7 @@ class NativeLauncherConfig:
     readiness_timeout_seconds: float = DEFAULT_TIMEOUT_SECONDS
     poll_interval_seconds: float = DEFAULT_POLL_SECONDS
     reconciliation_period_ms: int = 20
+    manager_timeout_seconds: float = 60.0
 
     def __post_init__(self) -> None:
         path_fields = (
@@ -164,6 +166,13 @@ class NativeLauncherConfig:
                     "composer_static_dir must be a directory containing index.html"
                 )
             object.__setattr__(self, "composer_static_dir", static_dir)
+        if self.simulation_control_config is not None:
+            simulation_config = Path(self.simulation_control_config)
+            if not simulation_config.is_absolute() or not simulation_config.is_file():
+                raise ValueError(
+                    "simulation_control_config must be an existing absolute file"
+                )
+            object.__setattr__(self, "simulation_control_config", simulation_config)
         if (
             not self.canonical_empty_admission_filename
             or Path(self.canonical_empty_admission_filename).is_absolute()
@@ -208,6 +217,8 @@ class NativeLauncherConfig:
             raise ValueError("poll_interval_seconds must be in [0.01, 5]")
         if not 1 <= self.reconciliation_period_ms <= 60_000:
             raise ValueError("reconciliation_period_ms must be in [1, 60000]")
+        if not 0 < self.manager_timeout_seconds <= 60.0:
+            raise ValueError("manager_timeout_seconds must be in (0, 60]")
 
     @property
     def instance_root(self) -> Path:
@@ -310,15 +321,15 @@ def native_commands(config: NativeLauncherConfig) -> tuple[ProcessSpec, ...]:
             f"headless-api.{config.instance_id}",
             "--freshness-ms",
             "2000",
+            "--manager-timeout-s",
+            str(config.manager_timeout_seconds),
             "--program-runner-url",
             config.program_runner_url,
         ),
         base_env,
         config.source_root,
     )
-    program_runner = ProcessSpec(
-        "program_runner",
-        (
+    program_argv = [
             sys.executable,
             "-m",
             "manyforge_program_runner",
@@ -332,7 +343,14 @@ def native_commands(config: NativeLauncherConfig) -> tuple[ProcessSpec, ...]:
             f"program-runner.{config.instance_id}",
             "--headless-timeout-s",
             "30",
-        ),
+    ]
+    if config.simulation_control_config is not None:
+        program_argv.extend(
+            ("--simulation-control-config", str(config.simulation_control_config))
+        )
+    program_runner = ProcessSpec(
+        "program_runner",
+        tuple(program_argv),
         base_env,
         config.source_root,
     )
@@ -406,6 +424,20 @@ def _process_is_authenticated(meta: Mapping[str, Any]) -> bool:
     return observed is not None and observed[: len(expected)] == expected
 
 
+def _safe_process_is_authenticated(meta: Mapping[str, Any]) -> bool:
+    """Treat an incomplete or unreadable mechanical row as unauthenticated.
+
+    The row remains recorded and therefore visible to status; this helper only
+    prevents malformed state from turning reconciliation into an unsafe broad
+    kill or an unbounded exception.
+    """
+
+    try:
+        return _process_is_authenticated(meta)
+    except (KeyError, TypeError, ValueError, OSError):
+        return False
+
+
 def _sha256_json(value: Mapping[str, Any]) -> str:
     payload = json.dumps(
         value, ensure_ascii=False, sort_keys=True, separators=(",", ":")
@@ -418,6 +450,12 @@ def _launch_input_digest(config: NativeLauncherConfig) -> str:
         {
             "canonical_empty_admission_filename": config.canonical_empty_admission_filename,
             "cell_id": config.cell_id,
+            "manager_timeout_seconds": config.manager_timeout_seconds,
+            "simulation_control_config": (
+                str(config.simulation_control_config)
+                if config.simulation_control_config is not None
+                else None
+            ),
             "composer_static_dir": (
                 str(config.composer_static_dir)
                 if config.composer_static_dir is not None
@@ -658,6 +696,12 @@ class NativeLauncher:
             "launch_inputs": {
                 "canonical_empty_admission_filename": self.config.canonical_empty_admission_filename,
                 "cell_id": self.config.cell_id,
+                "manager_timeout_seconds": self.config.manager_timeout_seconds,
+                "simulation_control_config": (
+                    str(self.config.simulation_control_config)
+                    if self.config.simulation_control_config is not None
+                    else None
+                ),
                 "composer_static_dir": (
                     str(self.config.composer_static_dir)
                     if self.config.composer_static_dir is not None
@@ -675,6 +719,11 @@ class NativeLauncher:
                 "manager_state_root": str(self.config.manager_state_root),
                 "runtime_state_root": str(self.config.runtime_state_root),
                 "execution_state_root": str(self.config.execution_state_root),
+                "simulation_control_config": (
+                    str(self.config.simulation_control_config)
+                    if self.config.simulation_control_config is not None
+                    else None
+                ),
             },
             "processes": {
                 component: {
@@ -823,7 +872,7 @@ class NativeLauncher:
         return [
             ResourceObservation(
                 resource_id=str(item["resource_id"]),
-                presence=(ResourcePresence.PRESENT if _process_is_authenticated(item) else ResourcePresence.ABSENT),
+                presence=(ResourcePresence.PRESENT if _safe_process_is_authenticated(item) else ResourcePresence.ABSENT),
                 observed_at_unix_ns=now,
             )
             for item in resources
@@ -1083,12 +1132,85 @@ class NativeLauncher:
                 disposition = decide_start(
                     old_status, configuration.configuration_digest
                 )
-                if disposition in (
-                    StartDisposition.IDEMPOTENT,
-                    StartDisposition.RECOVER,
-                ):
+                if disposition is StartDisposition.IDEMPOTENT:
                     self.last_start_idempotent = True
                     return self._refresh_status(old_status, mechanical)
+                if disposition is StartDisposition.RECOVER:
+                    processes = mechanical.get("processes", {})
+                    if not isinstance(processes, dict):
+                        raise LauncherError(
+                            "status_record_invalid",
+                            "stored mechanical process record is not an object",
+                            exit_code=70,
+                            status=old_status,
+                        )
+                    if old_status.state is not LaunchInstanceState.UNAVAILABLE:
+                        resources = self._resource_records_from_mechanical(processes)
+                        previous_observations = self._resource_observations(resources)
+                        stopping = _status(
+                            old_status.configuration,
+                            old_status.launch_instance_id,
+                            LaunchInstanceState.STOPPING,
+                            resources,
+                            (),
+                            previous_observations,
+                            old_status.record_generation + 1,
+                            old_status.last_failure,
+                        )
+                        self.store.write(stopping, mechanical)
+                        paths = mechanical.get("paths")
+                        manager_root = (
+                            Path(paths["manager_state_root"])
+                            if isinstance(paths, dict)
+                            and isinstance(paths.get("manager_state_root"), str)
+                            else self.config.manager_state_root
+                        )
+                        clean = self._cleanup_authenticated(
+                            processes,
+                            manager_state_root=manager_root,
+                        )
+                        observations = self._resource_observations(resources)
+                        if not clean or any(
+                            observation.presence is not ResourcePresence.ABSENT
+                            for observation in observations
+                        ):
+                            failure = FailureRecord(
+                                reason_code="cleanup_deadline_exceeded",
+                                component_id="native",
+                                detail=(
+                                    "degraded recovery could not prove prior "
+                                    "owned resources absent"
+                                ),
+                                occurred_at_unix_ns=_safe_unix_timestamp(),
+                            )
+                            degraded = _status(
+                                old_status.configuration,
+                                old_status.launch_instance_id,
+                                LaunchInstanceState.DEGRADED,
+                                resources,
+                                (),
+                                observations,
+                                stopping.record_generation + 1,
+                                failure,
+                            )
+                            self.store.write(degraded, mechanical)
+                            raise LauncherError(
+                                "cleanup_deadline_exceeded",
+                                str(failure.detail),
+                                exit_code=74,
+                                status=degraded,
+                            )
+                        stopped = _status(
+                            old_status.configuration,
+                            old_status.launch_instance_id,
+                            LaunchInstanceState.STOPPED,
+                            resources,
+                            (),
+                            observations,
+                            stopping.record_generation + 1,
+                        )
+                        self.store.write(stopped, mechanical)
+                    self._managed = {}
                 if disposition is StartDisposition.CONFLICT:
                     raise LauncherError(
                         "incompatible_owner",
@@ -1224,7 +1346,7 @@ class NativeLauncher:
             else self._mechanical().get("processes", {})
         )
         manager = processes.get("manager")
-        if manager is not None and _process_is_authenticated(manager):
+        if manager is not None and _safe_process_is_authenticated(manager):
             socket_path = (manager_state_root or self.config.manager_state_root) / "manager-command.sock"
             try:
                 with socket.socket(socket.AF_UNIX, socket.SOCK_SEQPACKET) as client:
@@ -1237,7 +1359,7 @@ class NativeLauncher:
         deadline = time.monotonic() + min(10.0, self.config.readiness_timeout_seconds)
         for component in ("composer", "program_runner", "headless", "manager"):
             item = processes.get(component)
-            if item is None or not _process_is_authenticated(item):
+            if item is None or not _safe_process_is_authenticated(item):
                 continue
             pgid = int(item["process_group_id"])
             if pgid > 1 and pgid != os.getpgrp():
@@ -1246,11 +1368,11 @@ class NativeLauncher:
                 except ProcessLookupError:
                     pass
         while time.monotonic() < deadline:
-            if not any(_process_is_authenticated(item) for item in processes.values()):
+            if not any(_safe_process_is_authenticated(item) for item in processes.values()):
                 return True
             time.sleep(0.05)
         for item in processes.values():
-            if _process_is_authenticated(item):
+            if _safe_process_is_authenticated(item):
                 pgid = int(item["process_group_id"])
                 if pgid > 1 and pgid != os.getpgrp():
                     try:
@@ -1258,7 +1380,7 @@ class NativeLauncher:
                     except ProcessLookupError:
                         pass
         time.sleep(0.05)
-        return not any(_process_is_authenticated(item) for item in processes.values())
+        return not any(_safe_process_is_authenticated(item) for item in processes.values())
 
     def stop(self) -> LaunchInstanceStatus | None:
         self.last_stop_already_stopped = False
@@ -1310,7 +1432,7 @@ class NativeLauncher:
             observations = [
                 ResourceObservation(
                     resource_id=str(item.get("resource_id", component)),
-                    presence=ResourcePresence.ABSENT if not _process_is_authenticated(item) else ResourcePresence.UNKNOWN,
+                    presence=ResourcePresence.ABSENT if not _safe_process_is_authenticated(item) else ResourcePresence.UNKNOWN,
                     observed_at_unix_ns=_safe_unix_timestamp(),
                 )
                 for component, item in processes.items()
