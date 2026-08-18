@@ -52,6 +52,9 @@ EMPTY_PROVIDER_CONTRACT_SCHEMA_REVISION: Final = (
 )
 LIFECYCLE_CATALOG_API_VERSION: Final = "manyforge.brand_lifecycle_plan_catalog.v1"
 LITE6_LIFECYCLE_PROVIDER_ID: Final = "lite6_arm_provider"
+LITE6_GRIPPER_LIFECYCLE_PROVIDER_ID: Final = "lite6_gripper_provider"
+LITE6_NATIVE_MODEL_FAMILY_ID: Final = "lite6_lite_gripper"
+LIFECYCLE_INTENTS: Final = ("disable", "enable", "observe", "prepare", "recover")
 ROS2_CONTROL_PROVIDER_ID: Final = "manyforge.provider.ros2_control"
 
 CAPABILITIES: Final = {
@@ -1110,11 +1113,12 @@ def lite6_lifecycle_plans() -> list[dict[str, Any]]:
     ]
 
 
-def lite6_lifecycle_product() -> tuple[dict[str, Any], dict[str, Any]]:
-    plans = lite6_lifecycle_plans()
+def lifecycle_product(
+    provider_id: str, plans: list[dict[str, Any]]
+) -> tuple[dict[str, Any], dict[str, Any]]:
     semantic_projection = {
         "api_version": LIFECYCLE_CATALOG_API_VERSION,
-        "provider_manifest_id": LITE6_LIFECYCLE_PROVIDER_ID,
+        "provider_manifest_id": provider_id,
         "plans": plans,
     }
     semantic_digest = sha256_digest(
@@ -1126,12 +1130,12 @@ def lite6_lifecycle_product() -> tuple[dict[str, Any], dict[str, Any]]:
     )
     lifecycle_capabilities = tuple(
         f"component.lifecycle.{intent}"
-        for intent in ("disable", "enable", "observe", "prepare", "recover")
+        for intent in LIFECYCLE_INTENTS
     )
     manifest = revisioned_document(
         {
             "api_version": "manyforge.provider_manifest.v1",
-            "provider_manifest_id": LITE6_LIFECYCLE_PROVIDER_ID,
+            "provider_manifest_id": provider_id,
             "offered_capabilities": [
                 {
                     **capability_selector(capability_id),
@@ -1161,6 +1165,120 @@ def lite6_lifecycle_product() -> tuple[dict[str, Any], dict[str, Any]]:
         + canonical_bytes(catalog_content)
     )
     return manifest, {**catalog_content, "catalog_digest": catalog_digest}
+
+
+def lite6_lifecycle_product() -> tuple[dict[str, Any], dict[str, Any]]:
+    return lifecycle_product(LITE6_LIFECYCLE_PROVIDER_ID, lite6_lifecycle_plans())
+
+
+def lite6_gripper_lifecycle_predicate(
+    state: str, enabled: bool, fault_present: bool
+) -> dict[str, Any]:
+    return lifecycle_predicate(
+        [state],
+        {
+            "native.gripper.command_admission_enabled": lifecycle_boolean(enabled),
+            "native.gripper.fault_present": lifecycle_boolean(fault_present),
+        },
+    )
+
+
+def lite6_gripper_lifecycle_plans() -> list[dict[str, Any]]:
+    timeout_ns = 30_000_000_000
+    declared = lite6_gripper_lifecycle_predicate("declared", False, False)
+    prepared = lite6_gripper_lifecycle_predicate("prepared", False, False)
+    active = lite6_gripper_lifecycle_predicate("active", True, False)
+    disabled = lite6_gripper_lifecycle_predicate("disabled", False, False)
+    return [
+        {
+            "intent": "prepare",
+            "requested_state": "prepared",
+            "requested_postcondition": prepared,
+            "timeout_duration_ns": timeout_ns,
+            "transitions": [
+                lifecycle_transition("native.gripper.prepare", declared, prepared)
+            ],
+        },
+        {
+            "intent": "enable",
+            "requested_state": "active",
+            "requested_postcondition": active,
+            "timeout_duration_ns": timeout_ns,
+            "transitions": [
+                lifecycle_transition("native.gripper.enable", prepared, active)
+            ],
+        },
+        {
+            "intent": "disable",
+            "requested_state": "disabled",
+            "requested_postcondition": disabled,
+            "timeout_duration_ns": timeout_ns,
+            "transitions": [
+                lifecycle_transition(
+                    "native.gripper.disable",
+                    lifecycle_predicate(
+                        ["prepared", "active", "degraded", "faulted"], {}
+                    ),
+                    disabled,
+                )
+            ],
+        },
+        {
+            "intent": "recover",
+            "requested_state": "disabled",
+            "recover_target_eligibility": lite6_gripper_lifecycle_predicate(
+                "disabled", False, True
+            ),
+            "requested_postcondition": disabled,
+            "timeout_duration_ns": timeout_ns,
+            "transitions": [
+                lifecycle_transition(
+                    "native.gripper.clear_fault",
+                    lite6_gripper_lifecycle_predicate("disabled", False, True),
+                    disabled,
+                )
+            ],
+        },
+    ]
+
+
+def lite6_gripper_lifecycle_product() -> tuple[dict[str, Any], dict[str, Any]]:
+    return lifecycle_product(
+        LITE6_GRIPPER_LIFECYCLE_PROVIDER_ID, lite6_gripper_lifecycle_plans()
+    )
+
+
+def native_lite6_provider_manifest(
+    lifecycle_manifest: dict[str, Any],
+    capability_ids: tuple[str, ...],
+) -> dict[str, Any]:
+    lifecycle_capabilities = {
+        offer["capability_id"]: offer
+        for offer in lifecycle_manifest["offered_capabilities"]
+    }
+    offered_capabilities = list(lifecycle_capabilities.values())
+    offered_capabilities.extend(
+        {
+            **capability_selector(capability_id),
+            "required_endpoint_role_ids": ["command", "state"],
+        }
+        for capability_id in capability_ids
+    )
+    offered_capabilities.sort(key=lambda row: row["capability_id"])
+    return revisioned_document(
+        {
+            "api_version": "manyforge.provider_manifest.v1",
+            "provider_manifest_id": lifecycle_manifest["provider_manifest_id"],
+            "offered_capabilities": offered_capabilities,
+            "provider_contracts": [software_hard_provider_contract()],
+            "lifecycle_plan_catalog": copy.deepcopy(
+                lifecycle_manifest["lifecycle_plan_catalog"]
+            ),
+        },
+        domain="catalog-record-revision/provider_manifest",
+        api_version="manyforge.provider_manifest.v1",
+        revision_field="provider_manifest_revision",
+    )
 
 
 def ros2_control_lifecycle_plans() -> list[dict[str, Any]]:
@@ -1579,6 +1697,29 @@ def catalog_sources(
         )
     )
     lifecycle_manifest, lifecycle_catalog = lite6_lifecycle_product()
+    gripper_lifecycle_manifest, _gripper_lifecycle_catalog = (
+        lite6_gripper_lifecycle_product()
+    )
+    native_arm_capabilities = tuple(
+        sorted(
+            capability_id
+            for capability_id in ARM_CAPABILITIES
+            if CAPABILITIES[capability_id][2] == "control_binding"
+        )
+    )
+    native_gripper_capabilities = tuple(
+        sorted(
+            capability_id
+            for capability_id in GRIPPER_CAPABILITIES
+            if CAPABILITIES[capability_id][2] == "control_binding"
+        )
+    )
+    native_arm_manifest = native_lite6_provider_manifest(
+        lifecycle_manifest, native_arm_capabilities
+    )
+    native_gripper_manifest = native_lite6_provider_manifest(
+        gripper_lifecycle_manifest, native_gripper_capabilities
+    )
     manifests = {
         "control": provider_manifest(
             "manyforge.provider.native_control",
@@ -1606,7 +1747,8 @@ def catalog_sources(
             ("assistant.model.invoke",),
             ["model_inference"],
         ),
-        "lite6_lifecycle": lifecycle_manifest,
+        "lite6_arm": native_arm_manifest,
+        "lite6_gripper": native_gripper_manifest,
         "ros2_control": ros2_control_provider_manifest(
             control_capabilities, planner_capabilities
         ),
@@ -1624,7 +1766,7 @@ def catalog_sources(
             schema_id="manyforge.provider_manifest.v1",
             schema_revision=schemas["provider_manifest"],
             value=document,
-            canonical_output=(key == "lite6_lifecycle"),
+            canonical_output=(key in ("lite6_arm", "lite6_gripper")),
         )
 
     policy = stop_policy()
@@ -1768,6 +1910,12 @@ def catalog_sources(
         ),
         (
             root
+            / "manyforge_xarm_control/resources/lifecycle/lite6_arm_provider.json",
+            canonical_bytes(lifecycle_manifest),
+            "build-owned Lite6 lifecycle provider manifest",
+        ),
+        (
+            root
             / "manyforge_xarm_control/include/manyforge_xarm_control/generated/lite6_brand_lifecycle_product_identity.hpp",
             lite6_lifecycle_identity_header(lifecycle_manifest, lifecycle_catalog),
             "build-owned Lite6 lifecycle product identity",
@@ -1804,11 +1952,16 @@ def graph_and_applicability(
         "ros2_control_runtime" if ros2_control else "native_runtime"
     ]
     key_prefix = "ros2_control:" if ros2_control else ""
+    native_lite6_lifecycle = (
+        not ros2_control and family_id == LITE6_NATIVE_MODEL_FAMILY_ID
+    )
     component_ref = refs[f"component:{family_id}"]
     model_ref = refs[f"model:{family_id}"]
     runtime_ref = refs[f"runtime{':ros2_control' if ros2_control else ''}"]
     stop_ref = refs["stop"]
-    control_ref = refs["provider:ros2_control" if ros2_control else "provider:control"]
+    control_ref = refs[
+        "provider:ros2_control" if ros2_control else "provider:control"
+    ]
     planning_ref = refs[
         "provider:ros2_control" if ros2_control else "provider:planning"
     ]
@@ -1851,6 +2004,16 @@ def graph_and_applicability(
         ("arm", ARM_CAPABILITIES, arm_resources),
         ("gripper", GRIPPER_CAPABILITIES, gripper_resources),
     ):
+        target_control_ref = (
+            refs[f"provider:lite6_{target}"]
+            if native_lite6_lifecycle
+            else control_ref
+        )
+        target_provider_instance_id = (
+            f"{occurrence}.native_gripper_control"
+            if native_lite6_lifecycle and target == "gripper"
+            else physical_provider_instance_id
+        )
         contract = refs[f"contract:{key_prefix}{target}"]
         topology = refs[f"topology:{key_prefix}{target}"]
         for capability_id in capabilities:
@@ -1879,10 +2042,12 @@ def graph_and_applicability(
                             "state_endpoint_role_ids": ["state"],
                         }
                     ],
-                    "provider_instance_id": physical_provider_instance_id,
+                    "provider_instance_id": target_provider_instance_id,
                     "provider_runtime_unit_id": runtime_unit_id,
-                    "provider_manifest_id": control_ref["record_id"],
-                    "provider_manifest_revision": control_ref["record_revision"],
+                    "provider_manifest_id": target_control_ref["record_id"],
+                    "provider_manifest_revision": target_control_ref[
+                        "record_revision"
+                    ],
                     "state_authority_id": (
                         f"{occurrence}.{target}.commanded_sim_state"
                         if ros2_control
@@ -2265,6 +2430,9 @@ def deployment_candidate(
         refs,
     )
     family_id = family["model_family_id"]
+    native_lite6_lifecycle = (
+        not ros2_control and family_id == LITE6_NATIVE_MODEL_FAMILY_ID
+    )
     catalog_keys = {
         *(f"capability:{capability_id}" for capability_id in ARM_CAPABILITIES),
         *(f"capability:{capability_id}" for capability_id in GRIPPER_CAPABILITIES),
@@ -2272,9 +2440,9 @@ def deployment_candidate(
         *(
             (
                 f"capability:component.lifecycle.{intent}"
-                for intent in ("disable", "enable", "observe", "prepare", "recover")
+                for intent in LIFECYCLE_INTENTS
             )
-            if ros2_control
+            if ros2_control or native_lite6_lifecycle
             else []
         ),
         "command_schema",
@@ -2283,7 +2451,11 @@ def deployment_candidate(
         f"contract:{key_prefix}gripper",
         f"model:{family_id}",
         "provider:logical_scene",
-        ("provider:ros2_control" if ros2_control else "provider:control"),
+        *(
+            ("provider:lite6_arm", "provider:lite6_gripper")
+            if native_lite6_lifecycle
+            else ("provider:ros2_control" if ros2_control else "provider:control",)
+        ),
         *( [] if ros2_control else ["provider:planning"] ),
         ("runtime:ros2_control" if ros2_control else "runtime"),
         (

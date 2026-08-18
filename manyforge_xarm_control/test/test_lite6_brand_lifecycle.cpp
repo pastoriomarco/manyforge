@@ -298,8 +298,8 @@ TEST(Lite6BrandLifecycleCatalog,
             encoded.value());
 
   const auto manifest_bytes =
-      read_file(root / "manyforge_deployment/resources/maintained/catalog/"
-                       "provider_manifest/lite6_arm_provider.json");
+      read_file(root / "manyforge_xarm_control/resources/lifecycle/"
+                       "lite6_arm_provider.json");
   ASSERT_FALSE(manifest_bytes.empty());
   EXPECT_NE(manifest_bytes.find(std::string(
                 generated::kLite6LifecycleProviderManifestRevision)),
@@ -307,6 +307,19 @@ TEST(Lite6BrandLifecycleCatalog,
   EXPECT_NE(manifest_bytes.find(
                 std::string(generated::kLite6LifecycleCatalogSemanticDigest)),
             std::string::npos);
+}
+
+TEST(Lite6BrandLifecycleCatalog,
+     MaintainedNativeGripperManifestUsesTheProductLifecycleProfile) {
+  const auto semantic =
+      lite6_product::compute_lite6_gripper_lifecycle_catalog_semantic_digest();
+  ASSERT_TRUE(semantic.ok()) << semantic.error().message;
+  const std::filesystem::path root(MANYFORGE_LITE6_LIFECYCLE_PRODUCT_ROOT);
+  const auto manifest_bytes = read_file(
+      root / "manyforge_deployment/resources/maintained/catalog/"
+           "provider_manifest/lite6_gripper_provider.json");
+  ASSERT_FALSE(manifest_bytes.empty());
+  EXPECT_NE(manifest_bytes.find(semantic.value().value()), std::string::npos);
 }
 
 TEST(Lite6BrandLifecyclePort, NormalizesExactStatesAndRejectsCrossEpoch) {

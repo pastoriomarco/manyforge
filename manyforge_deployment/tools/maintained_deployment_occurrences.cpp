@@ -1754,26 +1754,41 @@ qualify_catalog(const std::filesystem::path &root,
     insert_reference(result, reference);
   }
 
-  bool found_lite6_lifecycle_manifest = false;
+  bool found_lite6_arm_lifecycle_manifest = false;
+  bool found_lite6_gripper_lifecycle_manifest = false;
   bool found_ros2_control_lifecycle_manifest = false;
   for (const auto &path :
-       source_files(catalog_root / "provider_manifest", 7U)) {
+       source_files(catalog_root / "provider_manifest", 8U)) {
     const std::string bytes = read_file(path);
     const auto reference =
         make_reference<core::ProviderManifestCatalogRecordRefDTO>(bytes);
     auto manifest = deployment::resolve_and_qualify_provider_manifest(
         reference, reference.content_addressed_store_key, bytes);
     if (manifest.value().provider_manifest_id.value() == "lite6_arm_provider") {
-      if (found_lite6_lifecycle_manifest ||
+      if (found_lite6_arm_lifecycle_manifest ||
           !manifest.value().lifecycle_plan_catalog.has_value() ||
           manifest.value()
                   .lifecycle_plan_catalog->catalog_api_version.value() !=
               core::kBrandLifecyclePlanCatalogApiVersion ||
-          manifest.value().offered_capabilities.size() != 5U) {
+          manifest.value().offered_capabilities.size() != 15U ||
+          manifest.value().provider_contracts.size() != 1U) {
         throw std::logic_error(
-            "maintained Lite6 lifecycle provider manifest is not exact");
+            "maintained Lite6 arm lifecycle provider manifest is not exact");
       }
-      found_lite6_lifecycle_manifest = true;
+      found_lite6_arm_lifecycle_manifest = true;
+    } else if (manifest.value().provider_manifest_id.value() ==
+               "lite6_gripper_provider") {
+      if (found_lite6_gripper_lifecycle_manifest ||
+          !manifest.value().lifecycle_plan_catalog.has_value() ||
+          manifest.value()
+                  .lifecycle_plan_catalog->catalog_api_version.value() !=
+              core::kBrandLifecyclePlanCatalogApiVersion ||
+          manifest.value().offered_capabilities.size() != 7U ||
+          manifest.value().provider_contracts.size() != 1U) {
+        throw std::logic_error(
+            "maintained Lite6 gripper lifecycle provider manifest is not exact");
+      }
+      found_lite6_gripper_lifecycle_manifest = true;
     } else if (manifest.value().provider_manifest_id.value() ==
                "manyforge.provider.ros2_control") {
       if (found_ros2_control_lifecycle_manifest ||
@@ -1793,7 +1808,8 @@ qualify_catalog(const std::filesystem::path &root,
                      reference.content_digest, bytes);
     insert_reference(result, reference);
   }
-  if (!found_lite6_lifecycle_manifest ||
+  if (!found_lite6_arm_lifecycle_manifest ||
+      !found_lite6_gripper_lifecycle_manifest ||
       !found_ros2_control_lifecycle_manifest) {
     throw std::logic_error(
         "maintained lifecycle provider manifest closure is missing");
@@ -1942,7 +1958,7 @@ qualify_catalog(const std::filesystem::path &root,
     result.model_assets.push_back(std::move(verified));
     result.structural_preparations.push_back(std::move(preparation));
   }
-  if (result.records.size() != 71U || result.runtime_profiles.size() != 2U ||
+  if (result.records.size() != 72U || result.runtime_profiles.size() != 2U ||
       result.runtime_policies.size() != 2U) {
     throw std::logic_error("maintained exact catalog closure is incomplete");
   }
@@ -2011,7 +2027,9 @@ void verify_scenarios(const std::filesystem::path &root,
       external_manifest_ids.insert(resource.provider_manifest_id);
     }
     const std::size_t expected_catalog_count =
-        (scenario.ros2_control_execution ? 53U : 49U) +
+        (scenario.ros2_control_execution
+             ? 53U
+             : (scenario.family_id == "lite6_lite_gripper" ? 55U : 49U)) +
         2U * external_manifest_ids.size();
     if (verified.catalog_records().size() != expected_catalog_count) {
       throw std::invalid_argument(

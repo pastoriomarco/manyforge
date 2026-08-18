@@ -134,7 +134,7 @@
         "tool": "lite6_robot"
       },
       "deployment_artifact_id": "lite6_lite_gripper_pick_and_place",
-      "deployment_revision": "sha256:d46926f6726e8d0ef557c7c7d2fb7bf6b0ce255ae5549cbde6e56f63e84800a1",
+      "deployment_revision": "sha256:f2f2bc5eceeb79e31dc1866c65623062d76afa799c53f16fa0f17d9b134411fd",
       "deployment_source": "examples/lite6_lite_gripper_pick_and_place.deployment.yaml",
       "program_id": "lite6_lite_gripper_pick_and_place",
       "program_revision": "sha256:3569bdaa98278af447084b31f2e2f920e4b760e8c60ce803de1a18aac78ee7f2",
