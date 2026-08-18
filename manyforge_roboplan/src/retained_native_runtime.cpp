@@ -308,6 +308,16 @@ runtime_registration(
           engine)};
 }
 
+[[nodiscard]] std::optional<core::RuntimeParticipantPolicySelection>
+representative_runtime_policy(
+    const bool primary, const bool motion_owner,
+    const std::optional<core::RuntimeParticipantPolicySelection> &policy) {
+  if (primary && motion_owner) {
+    return policy;
+  }
+  return std::nullopt;
+}
+
 [[nodiscard]] std::vector<core::ResourceId>
 stop_observation_resources(const core::RuntimeParticipantBinding &binding,
                            const core::ResolvedStopEscalationStageDTO &stage) {
@@ -1158,7 +1168,8 @@ create_retained_native_runtime_participants(
         motion_owner ? static_cast<core::IControlDomainExecutionPort *>(
                            runtime->execution.get())
                      : runtime->gripper_stop_execution_port,
-        primary && motion_owner ? motion_runtime_policy : std::nullopt));
+        representative_runtime_policy(primary, motion_owner,
+                                      motion_runtime_policy)));
   }
   for (const auto &alias : runtime->motion_binding_aliases) {
     registrations.push_back(runtime_registration(
@@ -1497,7 +1508,8 @@ RetainedNativeRuntime::PublishAndReadBackRouteConfiguration(
           motion_owner ? static_cast<core::IControlDomainExecutionPort *>(
                              execution.get())
                        : gripper_stop_execution_port,
-          primary && motion_owner ? motion_runtime_policy : std::nullopt));
+          representative_runtime_policy(primary, motion_owner,
+                                        motion_runtime_policy)));
     }
     for (const auto &alias : next_motion_aliases) {
       registrations.push_back(runtime_registration(
@@ -1830,7 +1842,8 @@ RetainedNativeRuntime::AdoptAndReadBackRouteConfigurationPredecessor(
           motion_owner ? static_cast<core::IControlDomainExecutionPort *>(
                              execution.get())
                        : gripper_stop_execution_port,
-          primary && motion_owner ? motion_runtime_policy : std::nullopt));
+          representative_runtime_policy(primary, motion_owner,
+                                        motion_runtime_policy)));
     }
     for (const auto &alias : next_motion_aliases) {
       registrations.push_back(runtime_registration(
