@@ -57,11 +57,46 @@ def test_native_commands_retain_four_owner_entrypoints(tmp_path: Path):
         "composer",
     ]
     commands = [" ".join(spec.argv) for spec in specs]
+    assert "--canonical-empty-admission-filename canonical-empty-admission.json" in commands[0]
+    assert "--cell-id native" in commands[1]
     assert "--port 9010" in commands[1]
     assert "--port 9011" in commands[2]
     assert "--port 9000" in commands[3]
     assert all("--apply" not in spec.argv and "--run" not in spec.argv for spec in specs)
     assert all(spec.environment["MANYFORGE_FS_ROOTS"] == str(config.package_root) for spec in specs)
+
+
+def test_native_commands_bind_explicit_cell_admission_and_static_inputs(tmp_path: Path):
+    static_dir = tmp_path / "static"
+    static_dir.mkdir()
+    (static_dir / "index.html").write_text("<html></html>\n", encoding="utf-8")
+    config = replace(
+        _config(tmp_path),
+        canonical_empty_admission_filename="canonical-empty-admission.lite6.json",
+        cell_id="lite6_pick_place_cell",
+        composer_static_dir=static_dir,
+    )
+
+    specs = native_commands(config)
+
+    assert "canonical-empty-admission.lite6.json" in specs[0].argv
+    assert "lite6_pick_place_cell" in specs[1].argv
+    assert specs[-1].argv[-2:] == ("--static-dir", str(static_dir))
+
+
+@pytest.mark.parametrize(
+    "field,value",
+    [
+        ("canonical_empty_admission_filename", "../admission.json"),
+        ("canonical_empty_admission_filename", "/tmp/admission.json"),
+        ("cell_id", "cell with spaces"),
+    ],
+)
+def test_native_configuration_rejects_unsafe_cell_admission_inputs(
+    tmp_path: Path, field: str, value: str
+):
+    with pytest.raises(ValueError, match=field if field != "cell_id" else "cell_id"):
+        replace(_config(tmp_path), **{field: value})
 
 
 def test_native_commands_pass_explicit_composer_static_dir(tmp_path: Path):

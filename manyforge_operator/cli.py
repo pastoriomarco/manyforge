@@ -30,6 +30,11 @@ def _parser() -> argparse.ArgumentParser:
     start.add_argument("--node-catalog-path", type=Path, required=True)
     start.add_argument("--alarm-catalog-path", type=Path, required=True)
     start.add_argument("--composer-static-dir", type=Path)
+    start.add_argument(
+        "--canonical-empty-admission-filename",
+        default="canonical-empty-admission.json",
+    )
+    start.add_argument("--cell-id", default="native")
     start.add_argument("--publication-root", type=Path, required=True)
     start.add_argument("--manager-state-root", type=Path, required=True)
     start.add_argument("--runtime-state-root", type=Path, required=True)
@@ -80,6 +85,8 @@ def _config(args: argparse.Namespace) -> NativeLauncherConfig:
         node_catalog_path=args.node_catalog_path,
         alarm_catalog_path=args.alarm_catalog_path,
         composer_static_dir=args.composer_static_dir,
+        canonical_empty_admission_filename=args.canonical_empty_admission_filename,
+        cell_id=args.cell_id,
         publication_root=args.publication_root,
         manager_state_root=args.manager_state_root,
         runtime_state_root=args.runtime_state_root,

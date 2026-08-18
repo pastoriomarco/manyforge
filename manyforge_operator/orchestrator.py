@@ -107,6 +107,8 @@ class NativeLauncherConfig:
     logical_scene_database: Path
     historian_database_path: Path
     composer_static_dir: Path | None = None
+    canonical_empty_admission_filename: str = "canonical-empty-admission.json"
+    cell_id: str = "native"
     state_root: Path = DEFAULT_STATE_ROOT
     advertised_host: str = "localhost"
     instance_id: str = "native"
@@ -162,12 +164,31 @@ class NativeLauncherConfig:
                     "composer_static_dir must be a directory containing index.html"
                 )
             object.__setattr__(self, "composer_static_dir", static_dir)
+        if (
+            not self.canonical_empty_admission_filename
+            or Path(self.canonical_empty_admission_filename).is_absolute()
+            or Path(self.canonical_empty_admission_filename).name
+            != self.canonical_empty_admission_filename
+            or self.canonical_empty_admission_filename in {".", ".."}
+            or "/" in self.canonical_empty_admission_filename
+            or "\\" in self.canonical_empty_admission_filename
+        ):
+            raise ValueError(
+                "canonical_empty_admission_filename must be one package-relative filename"
+            )
         if not self.advertised_host or any(
             character.isspace() for character in self.advertised_host
         ):
             raise ValueError("advertised_host must be one bounded host reference")
         if not self.instance_id or "/" in self.instance_id or "\\" in self.instance_id:
             raise ValueError("instance_id must be one path-safe non-empty identifier")
+        if (
+            not self.cell_id
+            or "/" in self.cell_id
+            or "\\" in self.cell_id
+            or any(character.isspace() for character in self.cell_id)
+        ):
+            raise ValueError("cell_id must be one path-safe non-empty identifier")
         for name in (
             "package_aggregate_sha256",
             "compiler_build_manifest_sha256",
@@ -237,6 +258,8 @@ def native_commands(config: NativeLauncherConfig) -> tuple[ProcessSpec, ...]:
                 config.manager_executable,
                 "--package-root",
                 config.package_root,
+                "--canonical-empty-admission-filename",
+                config.canonical_empty_admission_filename,
                 "--manager-state-root",
                 config.manager_state_root,
                 "--runtime-state-root",
@@ -278,7 +301,7 @@ def native_commands(config: NativeLauncherConfig) -> tuple[ProcessSpec, ...]:
             "--execution-state-root",
             str(config.execution_state_root),
             "--cell-id",
-            config.instance_id,
+            config.cell_id,
             "--owner-id",
             f"headless-api.{config.instance_id}",
             "--freshness-ms",
@@ -384,6 +407,20 @@ def _sha256_json(value: Mapping[str, Any]) -> str:
         value, ensure_ascii=False, sort_keys=True, separators=(",", ":")
     ).encode("utf-8")
     return hashlib.sha256(payload).hexdigest()
+
+
+def _launch_input_digest(config: NativeLauncherConfig) -> str:
+    return _sha256_json(
+        {
+            "canonical_empty_admission_filename": config.canonical_empty_admission_filename,
+            "cell_id": config.cell_id,
+            "composer_static_dir": (
+                str(config.composer_static_dir)
+                if config.composer_static_dir is not None
+                else None
+            ),
+        }
+    )
 
 
 def _source_identity(source_root: Path) -> SourceIdentityV1:
@@ -613,6 +650,16 @@ class NativeLauncher:
     def _mechanical(self) -> dict[str, Any]:
         return {
             "profile": "native",
+            "launch_input_digest": _launch_input_digest(self.config),
+            "launch_inputs": {
+                "canonical_empty_admission_filename": self.config.canonical_empty_admission_filename,
+                "cell_id": self.config.cell_id,
+                "composer_static_dir": (
+                    str(self.config.composer_static_dir)
+                    if self.config.composer_static_dir is not None
+                    else None
+                ),
+            },
             "paths": {
                 "source_root": str(self.config.source_root),
                 "package_root": str(self.config.package_root),
@@ -1017,6 +1064,15 @@ class NativeLauncher:
                     raise LauncherError(
                         "incompatible_owner",
                         "stored launch has a different native configuration",
+                        exit_code=70,
+                        status=old_status,
+                    )
+                if mechanical.get("launch_input_digest") != _launch_input_digest(
+                    self.config
+                ):
+                    raise LauncherError(
+                        "incompatible_owner",
+                        "stored launch has different cell, admission, or Composer static inputs",
                         exit_code=70,
                         status=old_status,
                     )
