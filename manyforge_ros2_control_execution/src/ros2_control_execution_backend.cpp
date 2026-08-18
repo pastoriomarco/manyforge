@@ -597,9 +597,9 @@ Ros2ControlExecutionBackend::Ros2ControlExecutionBackend(
     : execution_state_sink_(std::move(execution_state_sink)),
       group_name_(std::move(group_name)), clock_(clock), scheduler_(scheduler),
       config_(std::move(config)),
-      addressed_state_writer_(std::move(addressed_state_writer)),
       execution_backend_component_epoch_(
-          new_component_epoch("execution-backend")) {
+          new_component_epoch("execution-backend")),
+      addressed_state_writer_(std::move(addressed_state_writer)) {
   if (!execution_state_sink_) {
     throw std::invalid_argument("execution state sink must not be null");
   }
