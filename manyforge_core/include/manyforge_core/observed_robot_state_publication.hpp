@@ -197,6 +197,10 @@ class ObservedRobotStatePublication final {
   /// If no such source exists, returns the highest-precedence published sample
   /// so callers can report the exact incomplete/stale reason fail-closed.
   [[nodiscard]] ReadView acquire(std::int64_t now_ns) const noexcept;
+  /// Select the newest fresh, complete sample at or before `now_ns` in the
+  /// first source lane with an eligible sample. Unlike acquire(), this
+  /// fail-closed temporal surface never returns a future or stale fallback.
+  [[nodiscard]] ReadView acquire_as_of(std::int64_t now_ns) const noexcept;
   /// Select the highest-precedence published source without evaluating
   /// freshness. This is the immutable latest-publication surface; admission
   /// callers must use acquire(now_ns) instead.
@@ -225,6 +229,7 @@ class ObservedRobotStatePublication final {
       const;
 
  private:
+  ReadView acquire_slot(const SourceLane& lane, std::size_t index) const noexcept;
   ReadView acquire_lane(const SourceLane& lane) const noexcept;
   static std::string make_joint_order_token(
       std::span<const std::string> joint_names);

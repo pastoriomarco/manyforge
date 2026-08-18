@@ -2072,6 +2072,16 @@ TEST(
       core::ReferenceDTO::Type::kRuntimeObject, "selected-object");
   const core::Pose3DTO inline_pose{{0.1, -0.2, 0.3}, {0.0, 0.0, 0.0, 1.0}};
   const core::ReferenceDTO inline_reference(inline_pose);
+  const std::vector<double> later_positions{0.1, -0.6, 0.5, 0.2, 1.2, -0.1};
+  ASSERT_TRUE(
+      arm_channel->publish_state(later_positions, zero_velocities, 30, 30)
+          .applied());
+  auto newer_publication = arm_channel->addressed_publication()->publication(
+      exact_binding.control_binding_id, exact_binding.control_binding_revision);
+  ASSERT_TRUE(newer_publication.ok()) << newer_publication.error().message;
+  EXPECT_GT(newer_publication.value().publication_sequence,
+            start_publication.value().publication_sequence);
+  EXPECT_EQ(newer_publication.value().snapshot.received_timestamp_ns, 30);
   core::ProgramFrameResolutionCaptureDTO capture{
       exact_binding,
       controlled_start,
@@ -2086,6 +2096,19 @@ TEST(
   auto captured = resolver->capture_program_frame_resolution_context(capture);
   ASSERT_TRUE(captured.ok()) << captured.error().message;
   ASSERT_TRUE(captured.value().valid());
+  const auto captured_view = std::find_if(
+      captured.value().kinematic_state_path_views.begin(),
+      captured.value().kinematic_state_path_views.end(),
+      [](const auto &view) { return !view.resource_states.empty(); });
+  ASSERT_NE(captured_view,
+            captured.value().kinematic_state_path_views.end());
+  for (const auto &view : captured.value().kinematic_state_path_views) {
+    for (const auto &resource : view.resource_states) {
+      EXPECT_EQ(resource.publication_received_timestamp_ns, 20);
+      EXPECT_EQ(resource.publication_sequence,
+                start_publication.value().publication_sequence);
+    }
+  }
 
   const auto resolved_tcp =
       resolver->resolve_reference_pose(tcp_reference, captured.value());
@@ -2140,18 +2163,11 @@ TEST(
   expect_pose_near(resolved_tcp.value(), expected_tcp);
   expect_pose_near(resolved_scene.value(), expected_scene);
 
-  const std::vector<double> later_positions{0.1, -0.6, 0.5, 0.2, 1.2, -0.1};
-  ASSERT_TRUE(
-      arm_channel->publish_state(later_positions, zero_velocities, 30, 30)
-          .applied());
   const auto frozen_tcp =
       resolver->resolve_reference_pose(tcp_reference, captured.value());
   ASSERT_TRUE(frozen_tcp.ok()) << frozen_tcp.error().message;
   EXPECT_EQ(frozen_tcp.value(), resolved_tcp.value());
 
-  auto newer_publication = arm_channel->addressed_publication()->publication(
-      exact_binding.control_binding_id, exact_binding.control_binding_revision);
-  ASSERT_TRUE(newer_publication.ok()) << newer_publication.error().message;
   auto conflicting_capture = capture;
   conflicting_capture.observed_start_publication = newer_publication.value();
   conflicting_capture.captured_at_ns = 30;

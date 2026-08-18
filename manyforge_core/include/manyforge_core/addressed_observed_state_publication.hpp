@@ -40,6 +40,10 @@ class AddressedObservedStatePublication final : public IObservedStateProvider {
   [[nodiscard]] Result<ObservedStatePublicationDTO> publication(
       const ControlBindingId& control_binding_id,
       const ControlBindingRevision& control_binding_revision) const override;
+  [[nodiscard]] Result<ObservedStatePublicationDTO> publication_at(
+      const ControlBindingId& control_binding_id,
+      const ControlBindingRevision& control_binding_revision,
+      std::int64_t now_ns) const override;
 
   /// Rebind only the route/configuration identity of a commanded or predicted
   /// source while retaining its exact physical source and numeric channel.
@@ -66,6 +70,9 @@ class AddressedObservedStatePublication final : public IObservedStateProvider {
 
  private:
   [[nodiscard]] ObservedStateSnapshotDTO make_snapshot(
+      const ObservedRobotStatePublication::ReadView& view,
+      const ObservedStateQueryContextDTO& context) const;
+  [[nodiscard]] ObservedStatePublicationDTO make_publication(
       const ObservedRobotStatePublication::ReadView& view,
       const ObservedStateQueryContextDTO& context) const;
 

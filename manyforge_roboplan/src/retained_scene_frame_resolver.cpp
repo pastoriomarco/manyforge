@@ -275,7 +275,8 @@ public:
   }
 
   [[nodiscard]] core::Result<core::KinematicStatePathQueryDTO>
-  BuildQuery(const core::KinematicFramePathDTO &path) const {
+  BuildQuery(const core::KinematicFramePathDTO &path,
+             const std::int64_t now_ns) const {
     std::map<core::ResourceId, const Source *> selected_sources;
     std::map<core::ControlDomainId,
              core::KinematicActiveControlConfigurationExpectationDTO>
@@ -336,9 +337,9 @@ public:
             "kinematic_state_source_ambiguous",
             "one frame resource resolves to multiple observed-state sources");
       }
-      const auto current = source->provider->publication(
+      const auto current = source->provider->publication_at(
           source->context.control_binding_id,
-          source->context.control_binding_revision);
+          source->context.control_binding_revision, now_ns);
       if (!current.ok()) {
         return core::Result<core::KinematicStatePathQueryDTO>::Err(
             current.error());
@@ -627,7 +628,7 @@ RetainedSceneFrameResolver::capture_program_frame_resolution_context(
             [&](const auto &existing) { return existing.path == *selected; })) {
       return core::Result<void>::Ok();
     }
-    auto query = impl_->BuildQuery(*selected);
+    auto query = impl_->BuildQuery(*selected, capture.captured_at_ns);
     if (!query.ok()) {
       return core::Result<void>::Err(query.error());
     }
@@ -1381,7 +1382,7 @@ RetainedSceneFrameResolver::ResolveWithCandidateState(
   attachment_revisions.erase(
       std::unique(attachment_revisions.begin(), attachment_revisions.end()),
       attachment_revisions.end());
-  auto state_query = impl_->BuildQuery(*path);
+  auto state_query = impl_->BuildQuery(*path, now_ns);
   if (!state_query.ok()) {
     return core::Result<core::ResolvedSceneFramePoseDTO>::Err(
         state_query.error());

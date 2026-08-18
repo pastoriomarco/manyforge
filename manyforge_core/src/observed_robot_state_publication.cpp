@@ -375,6 +375,27 @@ ObservedRobotStatePublishResult ObservedRobotStatePublication::publish(
 }
 
 ObservedRobotStatePublication::ReadView
+ObservedRobotStatePublication::acquire_slot(const SourceLane& lane,
+                                            std::size_t index) const noexcept {
+  if (index >= lane.slots.size()) {
+    return {};
+  }
+  const Slot& slot = lane.slots[index];
+  std::int32_t users = slot.users.load(std::memory_order_acquire);
+  while (users >= 0) {
+    if (users == std::numeric_limits<std::int32_t>::max()) {
+      return {};
+    }
+    if (slot.users.compare_exchange_weak(
+            users, users + 1, std::memory_order_acq_rel,
+            std::memory_order_acquire)) {
+      return ReadView(this, &lane, &slot);
+    }
+  }
+  return {};
+}
+
+ObservedRobotStatePublication::ReadView
 ObservedRobotStatePublication::acquire_lane(const SourceLane& lane) const
     noexcept {
   for (int attempt = 0; attempt < 3; ++attempt) {
@@ -382,19 +403,11 @@ ObservedRobotStatePublication::acquire_lane(const SourceLane& lane) const
     if (index < 0 || index >= static_cast<int>(lane.slots.size())) {
       return {};
     }
-    const Slot& slot = lane.slots[static_cast<std::size_t>(index)];
-    std::int32_t users = slot.users.load(std::memory_order_acquire);
-    while (users >= 0) {
-      if (slot.users.compare_exchange_weak(
-              users, users + 1, std::memory_order_acq_rel,
-              std::memory_order_acquire)) {
-        if (lane.published_slot.load(std::memory_order_acquire) == index) {
-          return ReadView(this, &lane, &slot);
-        }
-        slot.users.fetch_sub(1, std::memory_order_release);
-        break;
-      }
+    auto view = acquire_slot(lane, static_cast<std::size_t>(index));
+    if (view && lane.published_slot.load(std::memory_order_acquire) == index) {
+      return view;
     }
+    view = ReadView{};
   }
   reader_retry_exhausted_total_.fetch_add(1, std::memory_order_relaxed);
   return {};
@@ -424,6 +437,37 @@ ObservedRobotStatePublication::ReadView ObservedRobotStatePublication::acquire(
   }
   return complete_fallback ? std::move(complete_fallback)
                            : std::move(any_fallback);
+}
+
+ObservedRobotStatePublication::ReadView
+ObservedRobotStatePublication::acquire_as_of(std::int64_t now_ns) const noexcept {
+  for (const auto& lane : lanes_) {
+    ReadView selected;
+    for (std::size_t index = 0; index < lane->slots.size(); ++index) {
+      auto candidate = acquire_slot(*lane, index);
+      if (!candidate || candidate.sequence() == 0 || !candidate.complete() ||
+          candidate.received_timestamp_ns() < 0 ||
+          candidate.received_timestamp_ns() > now_ns) {
+        continue;
+      }
+      const auto budget = candidate.freshness_budget_ns();
+      if (budget != 0 &&
+          now_ns - candidate.received_timestamp_ns() > budget) {
+        continue;
+      }
+      if (!selected ||
+          candidate.received_timestamp_ns() > selected.received_timestamp_ns() ||
+          (candidate.received_timestamp_ns() ==
+               selected.received_timestamp_ns() &&
+           candidate.sequence() > selected.sequence())) {
+        selected = std::move(candidate);
+      }
+    }
+    if (selected) {
+      return selected;
+    }
+  }
+  return {};
 }
 
 ObservedRobotStatePublication::ReadView

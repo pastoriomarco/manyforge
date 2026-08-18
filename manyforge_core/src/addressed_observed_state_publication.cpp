@@ -273,6 +273,34 @@ ObservedStateSnapshotDTO AddressedObservedStatePublication::make_snapshot(
                                   view.complete()};
 }
 
+ObservedStatePublicationDTO AddressedObservedStatePublication::make_publication(
+    const ObservedRobotStatePublication::ReadView& view,
+    const ObservedStateQueryContextDTO& context) const {
+  auto snapshot = make_snapshot(view, context);
+  return ObservedStatePublicationDTO{
+      context.controllable_component_id,
+      context.command_target_id,
+      context.control_domain_id,
+      context.control_domain_revision,
+      context.control_binding_id,
+      context.control_binding_revision,
+      context.controller_topology_id,
+      context.topology_revision,
+      context.control_route_id,
+      context.active_control_configuration_id,
+      context.active_control_configuration_generation,
+      context.provider_instance_id,
+      context.provider_manifest_id,
+      context.provider_manifest_revision,
+      context.state_authority_id,
+      context.state_authority_class,
+      context.runtime_epoch,
+      config_.authority_generation,
+      view.sequence(),
+      std::move(snapshot),
+      view.received_timestamp_ns()};
+}
+
 Result<ObservedStateSnapshotDTO> AddressedObservedStatePublication::current_state(
     const ObservedStateQueryContextDTO& context, std::int64_t now_ns) const {
   const auto& current = query_context();
@@ -304,29 +332,35 @@ Result<ObservedStatePublicationDTO> AddressedObservedStatePublication::publicati
   if (!view) {
     return Result<ObservedStatePublicationDTO>::Err(state_error("observed_state_not_published"));
   }
-  auto snapshot = make_snapshot(view, context);
   return Result<ObservedStatePublicationDTO>::Ok(
-      ObservedStatePublicationDTO{context.controllable_component_id,
-                                  context.command_target_id,
-                                  context.control_domain_id,
-                                  context.control_domain_revision,
-                                  context.control_binding_id,
-                                  context.control_binding_revision,
-                                  context.controller_topology_id,
-                                  context.topology_revision,
-                                  context.control_route_id,
-                                  context.active_control_configuration_id,
-                                  context.active_control_configuration_generation,
-                                  context.provider_instance_id,
-                                  context.provider_manifest_id,
-                                  context.provider_manifest_revision,
-                                  context.state_authority_id,
-                                  context.state_authority_class,
-                                  context.runtime_epoch,
-                                  config_.authority_generation,
-                                  view.sequence(),
-                                  std::move(snapshot),
-                                  view.received_timestamp_ns()});
+      make_publication(view, context));
+}
+
+Result<ObservedStatePublicationDTO> AddressedObservedStatePublication::publication_at(
+    const ControlBindingId& control_binding_id,
+    const ControlBindingRevision& control_binding_revision,
+    std::int64_t now_ns) const {
+  const auto& context = query_context();
+  if (control_binding_id != context.control_binding_id ||
+      control_binding_revision != context.control_binding_revision) {
+    return Result<ObservedStatePublicationDTO>::Err(
+        state_error("observed_state_publication_binding_mismatch"));
+  }
+  if (now_ns < 0) {
+    return Result<ObservedStatePublicationDTO>::Err(
+        state_error("observed_state_evaluation_time_invalid"));
+  }
+  auto view = publication_.acquire_as_of(now_ns);
+  if (!view) {
+    return Result<ObservedStatePublicationDTO>::Err(
+        state_error("observed_state_unavailable_at_evaluation_time"));
+  }
+  auto result = make_publication(view, context);
+  if (auto valid = validate_observed_state_publication(result, now_ns);
+      !valid.ok()) {
+    return Result<ObservedStatePublicationDTO>::Err(valid.error());
+  }
+  return Result<ObservedStatePublicationDTO>::Ok(std::move(result));
 }
 
 AddressedAngularObservedRobotStateAdapter::AddressedAngularObservedRobotStateAdapter(

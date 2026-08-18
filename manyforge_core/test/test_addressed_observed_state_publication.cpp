@@ -110,6 +110,50 @@ TEST(AddressedObservedStatePublicationTest,
 }
 
 TEST(AddressedObservedStatePublicationTest,
+     AsOfPublicationRetainsPriorSampleAndValidatesItsEnvelopeAtRequestedTime) {
+  AddressedObservedStatePublication publication(
+      config(context({CoordinateKind::kAngular})));
+  const auto names = publication.query_context().joint_names;
+  const std::array first_position{0.1};
+  const std::array second_position{0.2};
+  const auto first = publication.publish(
+      ObservedStateSourceKind::kPredictedState, names, first_position, {},
+      100, 100);
+  ASSERT_TRUE(first.published);
+  const auto second = publication.publish(
+      ObservedStateSourceKind::kPredictedState, names, second_position, {},
+      101, 101);
+  ASSERT_TRUE(second.published);
+
+  const auto at_100 = publication.publication_at(
+      publication.query_context().control_binding_id,
+      publication.query_context().control_binding_revision, 100);
+  ASSERT_TRUE(at_100.ok()) << at_100.error().message;
+  EXPECT_EQ(at_100.value().publication_sequence, first.sequence);
+  EXPECT_EQ(at_100.value().snapshot.received_timestamp_ns, 100);
+  EXPECT_TRUE(validate_observed_state_publication(at_100.value(), 100).ok());
+
+  const auto before_first = publication.publication_at(
+      publication.query_context().control_binding_id,
+      publication.query_context().control_binding_revision, 99);
+  ASSERT_FALSE(before_first.ok());
+  EXPECT_EQ(before_first.error().details.at("reason"),
+            "observed_state_unavailable_at_evaluation_time");
+
+  const auto at_101 = publication.publication_at(
+      publication.query_context().control_binding_id,
+      publication.query_context().control_binding_revision, 101);
+  ASSERT_TRUE(at_101.ok());
+  EXPECT_EQ(at_101.value().publication_sequence, second.sequence);
+
+  const auto latest = publication.publication(
+      publication.query_context().control_binding_id,
+      publication.query_context().control_binding_revision);
+  ASSERT_TRUE(latest.ok());
+  EXPECT_EQ(latest.value().publication_sequence, second.sequence);
+}
+
+TEST(AddressedObservedStatePublicationTest,
      RejectsForeignContextAndStaleMeasuredState) {
   AddressedObservedStatePublication publication(config(context(
       {CoordinateKind::kAngular}, StateAuthorityClass::kMeasured, 100)));

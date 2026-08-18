@@ -93,6 +93,36 @@ TEST(ObservedRobotStatePublicationTest,
 }
 
 TEST(ObservedRobotStatePublicationTest,
+     AsOfSelectsNewestEligibleSampleWithoutReturningFuturePublication) {
+  ObservedRobotStatePublication publication(
+      {"j1"},
+      {source(ObservedRobotStateSourceKind::kJointState, "joint", 1000)});
+  const std::vector<std::string> joints{"j1"};
+  ASSERT_TRUE(publication.publish(
+                          ObservedRobotStateSourceKind::kJointState, joints,
+                          std::vector<double>{1.0}, {}, 100, 100)
+                  .published);
+  const auto second = publication.publish(
+      ObservedRobotStateSourceKind::kJointState, joints,
+      std::vector<double>{2.0}, {}, 101, 101);
+  ASSERT_TRUE(second.published);
+
+  const auto at_100 = publication.acquire_as_of(100);
+  ASSERT_TRUE(at_100);
+  EXPECT_EQ(at_100.received_timestamp_ns(), 100);
+  EXPECT_DOUBLE_EQ(at_100.positions_rad().front(), 1.0);
+  EXPECT_FALSE(publication.acquire_as_of(99));
+
+  const auto at_101 = publication.acquire_as_of(101);
+  ASSERT_TRUE(at_101);
+  EXPECT_EQ(at_101.sequence(), second.sequence);
+  EXPECT_DOUBLE_EQ(at_101.positions_rad().front(), 2.0);
+  const auto latest = publication.acquire_latest();
+  ASSERT_TRUE(latest);
+  EXPECT_EQ(latest.sequence(), second.sequence);
+}
+
+TEST(ObservedRobotStatePublicationTest,
      ProviderRejectsFallbackFromRequiredCommandAuthorityToMeasuredData) {
   auto command_source = ObservedRobotStateSourceConfig{
       ObservedRobotStateSourceKind::kCommandedState, "commanded_state",
@@ -196,7 +226,7 @@ TEST(ObservedRobotStatePublicationTest,
                   .publish(ObservedRobotStateSourceKind::kJointState, joints,
                            two, {}, 2, 2)
                   .published);
-  auto second = publication.acquire(2);
+  auto second = publication.acquire_as_of(2);
   ASSERT_TRUE(second);
   ASSERT_TRUE(publication
                   .publish(ObservedRobotStateSourceKind::kJointState, joints,
@@ -309,6 +339,60 @@ TEST(ObservedRobotStatePublicationTest,
       }
     }
   });
+  writer.join();
+  reader.join();
+  EXPECT_FALSE(mixed_sample.load(std::memory_order_acquire));
+}
+
+TEST(ObservedRobotStatePublicationTest,
+     BoundedConcurrentAsOfReaderNeverObservesMixedPublication) {
+  ObservedRobotStatePublication publication(
+      {"j1", "j2"},
+      {source(ObservedRobotStateSourceKind::kJointState, "joint",
+              1'000'000)});
+  const std::vector<std::string> joints{"j1", "j2"};
+  const std::vector<double> initial{0.0, 0.0};
+  ASSERT_TRUE(publication
+                  .publish(ObservedRobotStateSourceKind::kJointState, joints,
+                           initial, {}, 1, 1)
+                  .published);
+
+  constexpr int kPublicationCount = 4'000;
+  constexpr int kReaderAttempts = 4'000;
+  std::atomic<bool> start{false};
+  std::atomic<bool> mixed_sample{false};
+  std::thread writer([&]() {
+    while (!start.load(std::memory_order_acquire)) {
+      std::this_thread::yield();
+    }
+    for (int i = 1; i <= kPublicationCount; ++i) {
+      const std::vector<double> positions{static_cast<double>(i),
+                                          -static_cast<double>(i)};
+      while (!publication
+                  .publish(ObservedRobotStateSourceKind::kJointState, joints,
+                           positions, {}, i + 1, i + 1)
+                  .published) {
+        std::this_thread::yield();
+      }
+    }
+  });
+  std::thread reader([&]() {
+    while (!start.load(std::memory_order_acquire)) {
+      std::this_thread::yield();
+    }
+    for (int attempt = 0;
+         attempt < kReaderAttempts &&
+         !mixed_sample.load(std::memory_order_acquire);
+         ++attempt) {
+      auto view = publication.acquire_as_of(kPublicationCount + 1);
+      if (view && view.complete() && view.positions_rad().size() == 2u &&
+          view.positions_rad()[0] != -view.positions_rad()[1]) {
+        mixed_sample.store(true, std::memory_order_release);
+        return;
+      }
+    }
+  });
+  start.store(true, std::memory_order_release);
   writer.join();
   reader.join();
   EXPECT_FALSE(mixed_sample.load(std::memory_order_acquire));

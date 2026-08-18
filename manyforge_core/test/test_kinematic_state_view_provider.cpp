@@ -17,7 +17,9 @@ using SourceKey = std::pair<ControlBindingId, ControlBindingRevision>;
 class FakeObservedStateProvider final : public IObservedStateProvider {
  public:
   std::map<SourceKey, ObservedStatePublicationDTO> publications;
+  std::map<SourceKey, ObservedStatePublicationDTO> as_of_publications;
   mutable std::atomic<std::uint64_t> publication_reads{0U};
+  mutable std::atomic<std::uint64_t> as_of_reads{0U};
 
   [[nodiscard]] Result<ObservedStateSnapshotDTO> current_state(const ObservedStateQueryContextDTO&,
                                                                std::int64_t) const override {
@@ -33,6 +35,19 @@ class FakeObservedStateProvider final : public IObservedStateProvider {
       return Result<ObservedStatePublicationDTO>::Err(ErrorCode::kMissingReference);
     }
     return Result<ObservedStatePublicationDTO>::Ok(found->second);
+  }
+
+  [[nodiscard]] Result<ObservedStatePublicationDTO> publication_at(
+      const ControlBindingId& binding_id,
+      const ControlBindingRevision& binding_revision,
+      std::int64_t now_ns) const override {
+    as_of_reads.fetch_add(1U);
+    const auto found = as_of_publications.find({binding_id, binding_revision});
+    if (found != as_of_publications.end()) {
+      return Result<ObservedStatePublicationDTO>::Ok(found->second);
+    }
+    return IObservedStateProvider::publication_at(binding_id, binding_revision,
+                                                   now_ns);
   }
 };
 
@@ -233,6 +248,59 @@ TEST(ImmutableKinematicStateViewProviderTest,
       std::get<LinearPositionDTO>(result.value().model_states.front().positions[1]).value_m, 0.5);
   EXPECT_TRUE(IsExactLowercaseSha256Digest(result.value().view_digest.value()));
   EXPECT_EQ(result.value().actual_receiver_time_skew_ns, 0);
+}
+
+TEST(ImmutableKinematicStateViewProviderTest,
+     UsesPriorAsOfPublicationInsteadOfFutureLatestPublication) {
+  const auto source = valid_source();
+  const auto key = SourceKey{ControlBindingId("binding-a"),
+                             ControlBindingRevision("binding-rev-a")};
+  auto future = source->publications.at(key);
+  future.received_timestamp_ns = 101;
+  future.snapshot.received_timestamp_ns = 101;
+  future.snapshot.positions = {AngularPositionDTO{0.9},
+                               LinearPositionDTO{0.8}};
+  source->publications.at(key) = future;
+
+  auto prior = future;
+  prior.publication_sequence = 10U;
+  prior.snapshot.sequence = 10U;
+  prior.received_timestamp_ns = 100;
+  prior.snapshot.received_timestamp_ns = 100;
+  prior.snapshot.positions = {AngularPositionDTO{0.5},
+                               LinearPositionDTO{0.2}};
+  source->as_of_publications.emplace(key, std::move(prior));
+
+  const ImmutableKinematicStateViewProvider provider(
+      {KinematicObservedStateSourceBinding{key.first, key.second, source}});
+  const auto result = provider.current_kinematic_state_path(query(), 100);
+
+  ASSERT_TRUE(result.ok()) << result.error().message;
+  EXPECT_EQ(source->as_of_reads.load(), 1U);
+  EXPECT_EQ(source->publication_reads.load(), 0U);
+  EXPECT_DOUBLE_EQ(
+      std::get<AngularPositionDTO>(result.value().resource_states.front().position)
+          .value_rad,
+      0.5);
+  EXPECT_EQ(result.value().resource_states.front().publication_received_timestamp_ns,
+            100);
+}
+
+TEST(ImmutableKinematicStateViewProviderTest,
+     FailsPreciselyWhenNoPublicationExistsAtEvaluationTime) {
+  const auto source = valid_source();
+  const auto key = SourceKey{ControlBindingId("binding-a"),
+                             ControlBindingRevision("binding-rev-a")};
+  source->publications.at(key).received_timestamp_ns = 101;
+  source->publications.at(key).snapshot.received_timestamp_ns = 101;
+
+  const ImmutableKinematicStateViewProvider provider(
+      {KinematicObservedStateSourceBinding{key.first, key.second, source}});
+  const auto result = provider.current_kinematic_state_path(query(), 100);
+
+  ASSERT_FALSE(result.ok());
+  EXPECT_EQ(result.error().details.at("reason"),
+            "observed_state_unavailable_at_evaluation_time");
 }
 
 TEST(ImmutableKinematicStateViewProviderTest,

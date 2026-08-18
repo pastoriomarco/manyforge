@@ -656,7 +656,8 @@ Result<KinematicStatePathViewDTO> ImmutableKinematicStateViewProvider::current_k
               state_view_error("kinematic_state_source_unavailable",
                                "Required observed-state source is unavailable"));
         }
-        auto read = registered->provider->publication(key.first, key.second);
+        auto read =
+            registered->provider->publication_at(key.first, key.second, now_ns);
         if (!read.ok()) {
           return Result<KinematicStatePathViewDTO>::Err(read.error());
         }
