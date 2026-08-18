@@ -724,6 +724,36 @@ class _IdleExecution:
         raise AssertionError("idle owner must not be queried for events")
 
 
+class _RetiringExecution(_PagedExecution):
+    def __init__(self) -> None:
+        super().__init__()
+        self.retired = False
+
+    def status(self) -> dict[str, Any]:
+        if not self.retired:
+            return super().status()
+        return {
+            "api_version": "manyforge.execution_command_response.v1",
+            "command": "status",
+            "error": {
+                "code": "execution_owner_not_ready",
+                "details": {"owner_epoch": self.owner_epoch},
+                "message": "the managed execution owner has no active physical product",
+            },
+            "ok": False,
+        }
+
+    def events(
+        self, owner_epoch: str, after_sequence: int, *, limit: int = 16
+    ) -> dict[str, Any]:
+        if self.fail:
+            self.retired = True
+        page = super().events(owner_epoch, after_sequence, limit=limit)
+        if not after_sequence:
+            self.fail = True
+        return page
+
+
 def test_event_pump_delivers_without_frontend_polling_and_stops_cleanly() -> None:
     core = _RecordingCore()
     execution = _PagedExecution()
@@ -759,6 +789,28 @@ def test_event_pump_reconciles_typed_idle_owner_without_querying_events() -> Non
     assert core.completed_calls[0] == {
         "source_owner_epoch": execution.owner_epoch,
         "through_source_sequence": 0,
+    }
+
+
+def test_event_pump_reconciles_idle_after_owner_retirement_at_event_high_water() -> None:
+    core = _RecordingCore()
+    execution = _RetiringExecution()
+    pump = ExecutionEventPump(  # type: ignore[arg-type]
+        core, execution, poll_seconds=0.01, page_limit=1
+    )
+    pump.start()
+    deadline = threading.Event()
+    for _ in range(100):
+        if len(core.completed_calls) >= 2:
+            break
+        deadline.wait(0.01)
+    pump.shutdown()
+
+    assert pump.last_error is None
+    assert len(core.ingested) == 1
+    assert core.completed_calls[-1] == {
+        "source_owner_epoch": execution.owner_epoch,
+        "through_source_sequence": 1,
     }
 
 

@@ -1514,6 +1514,8 @@ class ExecutionEventPump:
     def _run(self) -> None:
         owner_epoch: str | None = None
         after_sequence = 0
+        source_high_water_epoch: str | None = None
+        source_high_water = 0
         while not self._stop.is_set():
             try:
                 if owner_epoch is None:
@@ -1522,9 +1524,12 @@ class ExecutionEventPump:
                         idle_epoch = self._idle_owner_epoch(status_response)
                         if idle_epoch is None:
                             ExecutionCommandClient._raise_error_response(status_response)
+                        if source_high_water_epoch != idle_epoch:
+                            source_high_water_epoch = idle_epoch
+                            source_high_water = 0
                         self._core.complete_operation_event_snapshot(
                             source_owner_epoch=idle_epoch,
-                            through_source_sequence=0,
+                            through_source_sequence=source_high_water,
                         )
                         self._record_error(None)
                         self._stop.wait(self._poll_seconds)
@@ -1540,8 +1545,13 @@ class ExecutionEventPump:
                             "execution_command_response_invalid",
                             "execution status has no owner epoch",
                         )
+                    if source_high_water_epoch != next_epoch:
+                        source_high_water_epoch = next_epoch
+                        source_high_water = 0
+                        after_sequence = 0
+                    else:
+                        after_sequence = source_high_water
                     owner_epoch = next_epoch
-                    after_sequence = 0
                 page = self._execution.events(
                     owner_epoch,
                     after_sequence,
@@ -1562,6 +1572,7 @@ class ExecutionEventPump:
                         payload_digest=event["payload_digest"],
                     )
                     after_sequence = event["sequence"]
+                    source_high_water = after_sequence
                 if page["next_after_sequence"] != after_sequence:
                     raise HeadlessApiError(
                         "execution_command_response_invalid",
@@ -1588,7 +1599,7 @@ class ExecutionEventPump:
                         )
                 self._record_error(error)
                 owner_epoch = None
-                after_sequence = 0
+                after_sequence = source_high_water
                 self._stop.wait(self._poll_seconds)
 
 
