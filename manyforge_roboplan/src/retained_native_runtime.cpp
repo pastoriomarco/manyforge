@@ -1725,6 +1725,25 @@ RetainedNativeRuntime::AdoptAndReadBackRouteConfigurationPredecessor(
       }
       return rebase_runtime_binding_to_predecessor(binding, configuration);
     };
+    // Rebase each backend owner from its own retained participant binding.
+    // Control-binding representatives may be distinct capability/Program
+    // identities for the same physical owner; using one of those identities
+    // as the owner would leave the state channel and orphan facts on the
+    // successor route while Kernel registrations use the predecessor route.
+    auto rebound_motion = rebase_if_selected(motion_binding);
+    if (!rebound_motion.ok()) {
+      return core::Result<core::RuntimeRouteConfigurationReadbackDTO>::Err(
+          rebound_motion.error());
+    }
+    next_motion = std::move(rebound_motion.value());
+    if (gripper_binding.has_value()) {
+      auto rebound_gripper = rebase_if_selected(*gripper_binding);
+      if (!rebound_gripper.ok()) {
+        return core::Result<core::RuntimeRouteConfigurationReadbackDTO>::Err(
+            rebound_gripper.error());
+      }
+      next_gripper = std::move(rebound_gripper.value());
+    }
     const auto current_registration =
         [&](const core::RuntimeParticipantBinding &binding)
         -> const core::RuntimeParticipantExecutionRegistration * {
@@ -1758,12 +1777,6 @@ RetainedNativeRuntime::AdoptAndReadBackRouteConfigurationPredecessor(
       if (!rebound.ok()) {
         return core::Result<core::RuntimeRouteConfigurationReadbackDTO>::Err(
             rebound.error());
-      }
-      if (representative.value() == motion_binding.value()) {
-        next_motion = rebound.value();
-      } else if (gripper_binding.has_value() &&
-                 representative.value() == gripper_binding->value()) {
-        next_gripper = rebound.value();
       }
       if (representative.value().control_path->control_domain_id ==
           configuration.control_domain_id) {

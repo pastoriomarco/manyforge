@@ -375,12 +375,20 @@ observe_current_quiescence(const RetainedStopSurveillanceSourceInput &source,
   }
   const auto &snapshot = observed.value();
   const auto &context = source.state_channel->query_context();
-  if (!core::validate_observed_state_snapshot(snapshot, assessed_at_ns).ok() ||
+  // The source binding and channel context are published by different owner
+  // steps during route adoption. Never combine a current binding with a
+  // predecessor publication (especially its runtime epoch) into one fact.
+  const auto expected_context = core::make_observed_state_query_context(
+      source.binding, context.freshness_budget_ns);
+  if (!expected_context.ok() ||
+      !core::validate_observed_state_snapshot(snapshot, assessed_at_ns).ok() ||
       !snapshot_matches_context(snapshot, context) ||
+      expected_context.value() != context ||
       assessed_at_ns < snapshot.received_timestamp_ns) {
     return invalid<CurrentQuiescenceObservation>(
         "native_current_resource_identity_mismatch",
-        "native current-resource state differs from its retained source");
+        "native current-resource state differs from its retained source "
+        "binding");
   }
   const auto age_ns = assessed_at_ns - snapshot.received_timestamp_ns;
   if (age_ns > kRetainedNativeReconciliationFreshnessBudgetNs) {
