@@ -1298,10 +1298,10 @@ public:
         scene_runtime_owner_id_("scene-runtime." +
                                 admission_.cell_id().value()) {
     EnsureBootstrap();
-    static_cast<void>(ReconcileAndPublish());
     if (TryRecoverIncompleteApply()) {
       static_cast<void>(ReconcileAndPublish());
     }
+    static_cast<void>(ReconcileAndPublish());
   }
 
   int Run() {
@@ -1612,10 +1612,10 @@ private:
 
   void TryPeriodicReconcile() noexcept {
     try {
-      static_cast<void>(ReconcileAndPublish());
       if (TryRecoverIncompleteApply()) {
         static_cast<void>(ReconcileAndPublish());
       }
+      static_cast<void>(ReconcileAndPublish());
     } catch (const std::exception &error) {
       std::cerr << "Manager daemon periodic reconciliation failed: "
                 << error.what() << '\n';
