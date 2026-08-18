@@ -540,7 +540,7 @@ Ros2ControlExecutionBackend::Ros2ControlExecutionBackend(
     std::string group_name, core::IClock &clock, core::IScheduler &scheduler,
     Ros2ControlExecutionBackendConfig config)
     : Ros2ControlExecutionBackend(
-          false, nullptr, std::move(execution_state_sink),
+          false, nullptr, {}, std::move(execution_state_sink),
           std::move(group_name), clock, scheduler, std::move(config)) {}
 
 Ros2ControlExecutionBackend::Ros2ControlExecutionBackend(
@@ -549,8 +549,32 @@ Ros2ControlExecutionBackend::Ros2ControlExecutionBackend(
     std::string group_name, core::IClock &clock, core::IScheduler &scheduler,
     Ros2ControlExecutionBackendConfig config)
     : Ros2ControlExecutionBackend(
-          true, nullptr, std::move(execution_state_sink), std::move(group_name),
-          clock, scheduler, std::move(config)) {}
+          true, nullptr, {}, std::move(execution_state_sink),
+          std::move(group_name), clock, scheduler, std::move(config)) {}
+
+Ros2ControlExecutionBackend::Ros2ControlExecutionBackend(
+    DeferredRosExecutorStartTag,
+    core::AddressedObservedStatePublication &addressed_state_publication,
+    ObservedRobotStatePublishWriter addressed_state_writer,
+    std::shared_ptr<core::IExecutionStateSink> execution_state_sink,
+    std::string group_name, core::IClock &clock, core::IScheduler &scheduler,
+    Ros2ControlExecutionBackendConfig config)
+    : Ros2ControlExecutionBackend(
+          true, &addressed_state_publication.numeric_publication_writer(),
+          std::move(addressed_state_writer), std::move(execution_state_sink),
+          std::move(group_name), clock, scheduler, std::move(config)) {}
+
+Ros2ControlExecutionBackend::Ros2ControlExecutionBackend(
+    DeferredRosExecutorStartTag,
+    core::ObservedRobotStatePublication &addressed_state_publication,
+    ObservedRobotStatePublishWriter addressed_state_writer,
+    std::shared_ptr<core::IExecutionStateSink> execution_state_sink,
+    std::string group_name, core::IClock &clock, core::IScheduler &scheduler,
+    Ros2ControlExecutionBackendConfig config)
+    : Ros2ControlExecutionBackend(
+          true, &addressed_state_publication, std::move(addressed_state_writer),
+          std::move(execution_state_sink), std::move(group_name), clock,
+          scheduler, std::move(config)) {}
 
 Ros2ControlExecutionBackend::Ros2ControlExecutionBackend(
     DeferredRosExecutorStartTag,
@@ -559,18 +583,21 @@ Ros2ControlExecutionBackend::Ros2ControlExecutionBackend(
     std::string group_name, core::IClock &clock, core::IScheduler &scheduler,
     Ros2ControlExecutionBackendConfig config)
     : Ros2ControlExecutionBackend(
-          true, &addressed_state_publication, std::move(execution_state_sink),
-          std::move(group_name), clock, scheduler, std::move(config)) {}
+          true, &addressed_state_publication, {},
+          std::move(execution_state_sink), std::move(group_name), clock,
+          scheduler, std::move(config)) {}
 
 Ros2ControlExecutionBackend::Ros2ControlExecutionBackend(
     bool defer_ros_executor_start,
     core::ObservedRobotStatePublication *addressed_state_publication,
+    ObservedRobotStatePublishWriter addressed_state_writer,
     std::shared_ptr<core::IExecutionStateSink> execution_state_sink,
     std::string group_name, core::IClock &clock, core::IScheduler &scheduler,
     Ros2ControlExecutionBackendConfig config)
     : execution_state_sink_(std::move(execution_state_sink)),
       group_name_(std::move(group_name)), clock_(clock), scheduler_(scheduler),
       config_(std::move(config)),
+      addressed_state_writer_(std::move(addressed_state_writer)),
       execution_backend_component_epoch_(
           new_component_epoch("execution-backend")) {
   if (!execution_state_sink_) {
@@ -1296,9 +1323,41 @@ void Ros2ControlExecutionBackend::publish_observed_robot_state(
     ordered_positions = &remapped_positions;
     ordered_velocities = &remapped_velocities;
   }
-  (void)publication->publish(source, config_.required_joints,
-                             *ordered_positions, *ordered_velocities,
-                             source_timestamp_ns, received_timestamp_ns);
+  if (publication == observed_state_publication_ &&
+      addressed_state_writer_) {
+    (void)publish_addressed_state(
+        source, config_.required_joints, *ordered_positions,
+        *ordered_velocities, source_timestamp_ns, received_timestamp_ns);
+  } else {
+    (void)publication->publish(source, config_.required_joints,
+                               *ordered_positions, *ordered_velocities,
+                               source_timestamp_ns, received_timestamp_ns);
+  }
+}
+
+core::ObservedRobotStatePublishResult
+Ros2ControlExecutionBackend::publish_addressed_state(
+    const core::ObservedRobotStateSourceKind source,
+    const std::span<const std::string> source_joint_names,
+    const std::span<const double> positions,
+    const std::span<const double> velocities,
+    const std::int64_t source_timestamp_ns,
+    const std::int64_t received_timestamp_ns) noexcept {
+  if (addressed_state_writer_) {
+    try {
+      return addressed_state_writer_(
+          source, source_joint_names, positions, velocities,
+          source_timestamp_ns, received_timestamp_ns);
+    } catch (...) {
+      return {false, false, false, 0, "addressed_state_writer_failed"};
+    }
+  }
+  if (observed_state_publication_ == nullptr) {
+    return {false, false, false, 0, "publication_unavailable"};
+  }
+  return observed_state_publication_->publish(
+      source, source_joint_names, positions, velocities, source_timestamp_ns,
+      received_timestamp_ns);
 }
 
 core::ObservedRobotStatePublishResult
@@ -1354,7 +1413,7 @@ Ros2ControlExecutionBackend::publish_authored_robot_state(
   // monitor performs exactly one try and never yields or waits on readers.
   const int attempt_count = invalidate_before_publish ? 8 : 1;
   for (int attempt = 0; attempt < attempt_count; ++attempt) {
-    const auto result = observed_state_publication_->publish(
+    const auto result = publish_addressed_state(
         source, config_.required_joints, positions, velocities,
         source_timestamp_ns, received_timestamp_ns);
     if (result.published) {

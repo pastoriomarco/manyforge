@@ -10,6 +10,7 @@
 #include <manyforge_core/time/manual_scheduler.hpp>
 #include <manyforge_roboplan/retained_execution_state_sink.hpp>
 #include <manyforge_roboplan/retained_gripper_command_backend.hpp>
+#include <manyforge_roboplan/retained_observed_state_channel.hpp>
 #include <manyforge_roboplan/roboplan_execution_backend.hpp>
 #include <memory>
 #include <mutex>
@@ -22,6 +23,15 @@
 #include <vector>
 
 namespace manyforge::roboplan_backend {
+
+class RetainedObservedStateChannelTestAccess final {
+public:
+  static std::unique_lock<std::mutex>
+  lock_route(RetainedObservedStateChannel &channel) {
+    return std::unique_lock<std::mutex>(channel.route_rebind_mutex_);
+  }
+};
+
 namespace {
 
 using namespace manyforge::core;
@@ -29,7 +39,8 @@ using namespace std::chrono_literals;
 
 [[nodiscard]] RuntimeParticipantBinding
 make_binding(CoordinateKind kind, std::string target = "gripper.target",
-             bool component_local = false) {
+             bool component_local = false,
+             std::string route = "route.native") {
   const bool angular = kind == CoordinateKind::kAngular;
   const std::vector<std::string> joints =
       angular ? std::vector<std::string>{"joint_1", "joint_2"}
@@ -103,7 +114,7 @@ make_binding(CoordinateKind kind, std::string target = "gripper.target",
           ControlInterfaceRevision("interface-revision"),
           ControllerTopologyId("topology.native"),
           TopologyRevision("topology-revision"),
-          ControlRouteId("route.native"),
+          ControlRouteId(std::move(route)),
           ActivationSetId("activation.native"),
           ActiveControlConfigurationId("active.native"),
           ActiveControlConfigurationGeneration(1U),
@@ -238,6 +249,28 @@ public:
     return {RetainedStateProjectionStatus::kApplied, std::nullopt};
   }
 
+  RetainedStateProjectionResult publish_state_bounded(
+      std::span<const double> positions_si,
+      std::span<const double> velocities_si, std::int64_t source_timestamp_ns,
+      std::int64_t received_timestamp_ns, std::int64_t,
+      std::stop_token cancellation) override {
+    if (cancellation.stop_requested()) {
+      return {RetainedStateProjectionStatus::kFailed,
+              ErrorDTO{"invalid_request", "fake publication cancelled",
+                       {{"reason", "fake_publication_cancelled"}}}};
+    }
+    {
+      std::lock_guard lock(mutex_);
+      if (block_publish_) {
+        return {RetainedStateProjectionStatus::kFailed,
+                ErrorDTO{"invalid_request", "fake publication blocked",
+                         {{"reason", "fake_publication_deadline"}}}};
+      }
+    }
+    return publish_state(positions_si, velocities_si, source_timestamp_ns,
+                         received_timestamp_ns);
+  }
+
   RetainedStateProjectionResult
   publish_and_project(std::span<const double> positions_si,
                       std::span<const double> velocities_si,
@@ -282,6 +315,25 @@ public:
         1U,
         context_.freshness_budget_ns,
         true});
+  }
+
+  Result<ObservedStateSnapshotDTO>
+  current_state_bounded(std::int64_t now_ns, std::int64_t,
+                        std::stop_token cancellation) const override {
+    if (cancellation.stop_requested()) {
+      return Result<ObservedStateSnapshotDTO>::Err(
+          ErrorDTO{"invalid_request", "fake read cancelled",
+                   {{"reason", "fake_read_cancelled"}}});
+    }
+    {
+      std::lock_guard lock(mutex_);
+      if (block_read_) {
+        return Result<ObservedStateSnapshotDTO>::Err(
+            ErrorDTO{"invalid_request", "fake read blocked",
+                     {{"reason", "fake_read_deadline"}}});
+      }
+    }
+    return current_state(now_ns);
   }
 
   Result<ControlledStateDTO> current_controlled_state() const override {
@@ -477,6 +529,240 @@ gripper_request(const RuntimeParticipantBinding &binding, double target,
 gripper_limits(const RuntimeParticipantBinding &binding) {
   return RetainedGripperPositionLimits{
       binding.value().resources.front().coordinate_kind, -1.0, 1.0};
+}
+
+[[nodiscard]] ResolvedParticipantStopStageDTO
+gripper_stop_stage(const RuntimeParticipantBinding &binding) {
+  const auto &value = binding.value();
+  const auto &path = *value.control_path;
+  const StopBudgetPhaseId command_phase("gripper.hard.command");
+  const std::vector<ResourceId> resources{value.resources.front().resource_id};
+  const ResolvedStopRuntimeTargetDTO target{
+      path.provider_instance_id,
+      path.provider_manifest_id,
+      path.provider_manifest_revision,
+      path.provider_runtime_unit_id,
+      ProductId("product.native"),
+      ProductContractId("contract.native"),
+      ProductContractRevision("contract.revision"),
+      ContentDigest("target.digest"),
+      path.provider_runtime_epoch,
+      path.provider_runtime_epoch,
+      EndpointRoleId("state.stop"),
+      "state.stop",
+      std::nullopt,
+      std::nullopt,
+      std::nullopt,
+      std::nullopt,
+      std::nullopt,
+      std::nullopt};
+  const ResolvedStopEvidenceSourceDTO evidence_source{
+      StopEvidenceSourceKind::kBindingStateAuthority,
+      target,
+      path.state_authority_id,
+      path.state_authority_class,
+      std::nullopt};
+  const ResolvedStopEscalationStageDTO resolved_stage{
+      0U,
+      StopEscalationStageId("stage.gripper.hard"),
+      StopEscalationStageKind::kSoftwareHard,
+      ContainmentGranularity::kResource,
+      StopContainmentCommandDTO{
+          command_phase, StopContainmentCommandKind::kRegistered,
+          std::nullopt,
+          RegisteredStopCommandKindId("manyforge.stop.software_hard")},
+      std::nullopt,
+      ResolvedStopCommandQualificationDTO{},
+      target,
+      ResolvedStopResourceContainmentScopeDTO{path.activation_set_id,
+                                               resources},
+      StopEvidenceConjunction::kAllOf,
+      {ResolvedStopEvidenceRequirementDTO{
+          StopEvidenceRequirementDTO{
+              StopEvidenceItemId("gripper.rest"),
+              StopBudgetPhaseId("gripper.hard.rest"),
+              StopEvidenceRequirementKind::kMotionRest,
+              std::nullopt,
+              std::nullopt,
+              StopEvidenceSourceRequirementDTO{
+                  StopEvidenceSourceKind::kBindingStateAuthority,
+                  100'000'000,
+                  EndpointRoleId("state.stop"),
+                  {path.state_authority_class}},
+              StopEvidenceObservationDTO{
+                  StopEvidenceObservationKind::kPostCommandDwell, 0}},
+          evidence_source}}};
+  const OperationId operation_id("operation.gripper.stop");
+  const OperationRevision operation_revision(1U);
+  const OperationParticipantId participant_id("participant.gripper");
+  return ResolvedParticipantStopStageDTO{
+      StopId("stop.gripper"),
+      StopGeneration(1U),
+      operation_id,
+      operation_revision,
+      participant_id,
+      ControllerGoalId("goal.gripper"),
+      ControllerGoalGeneration(1U),
+      value.controllable_component_id,
+      value.command_target_id,
+      value.capability_id,
+      path.control_domain_id,
+      path.control_domain_revision,
+      path.control_binding_id,
+      path.control_binding_revision,
+      path.active_control_configuration_id,
+      path.active_control_configuration_generation,
+      path.controller_topology_id,
+      path.topology_revision,
+      path.control_route_id,
+      std::nullopt,
+      std::nullopt,
+      path.provider_runtime_epoch,
+      resources,
+      ContainmentGranularity::kResource,
+      path.stop_evidence_policy_id,
+      path.stop_evidence_policy_revision,
+      PreparedParticipantStopPlanDTO{
+          ContentDigest("plan.digest"),
+          ResolvedStopBasePlanId("base.gripper"),
+          operation_id,
+          operation_revision,
+          participant_id,
+          value.program_id,
+          value.program_revision,
+          value.program_binding_id,
+          ProgramRunId("run.gripper"),
+          std::nullopt,
+          ParticipantStopProfilePurposeDTO::kOrdinary,
+          std::nullopt,
+          StopDeadlineBudgetDTO{
+              1'000'000, 100'000,
+              {{command_phase, 500'000},
+               {StopBudgetPhaseId("gripper.hard.rest"), 900'000}}},
+          {PreparedStopStageCommandDTO{resolved_stage, std::nullopt,
+                                       std::nullopt}}},
+      0U,
+      ContentDigest("scope.digest")};
+}
+
+TEST(RetainedGripperCommandBackendTest,
+     StopStageReadAndPublishBlockersReturnBoundedTerminalFailures) {
+  const auto binding = make_binding(CoordinateKind::kLinear);
+  const auto stage = gripper_stop_stage(binding);
+  const RemainingStopBudgetDTO budget{
+      stage.stop_id, stage.stop_generation, 1'000'000,
+      {{StopBudgetPhaseId("gripper.hard.command"), 500'000},
+       {StopBudgetPhaseId("gripper.hard.rest"), 900'000}}};
+  FakeClock clock;
+  ManualScheduler scheduler;
+
+  {
+    auto channel = std::make_shared<FakeRetainedStateChannel>(
+        binding, std::vector<double>{0.0});
+    channel->block_read();
+    RetainedGripperCommandBackend backend(
+        binding, channel, gripper_limits(binding), clock, scheduler);
+    const auto result =
+        backend.TranslateStopStage(stage, budget, std::stop_token{});
+    EXPECT_EQ(result.attempt_disposition,
+              StopStageAttemptDispositionDTO::kNotDispatched);
+    EXPECT_EQ(result.outcome, ParticipantStopStageOutcomeDTO::kFailed);
+    ASSERT_TRUE(result.error.has_value());
+    EXPECT_EQ(result.error->details.at("reason"),
+              "stop_evidence_source_unavailable");
+  }
+
+  {
+    auto channel = std::make_shared<FakeRetainedStateChannel>(
+        binding, std::vector<double>{0.0});
+    channel->block_publish();
+    RetainedGripperCommandBackend backend(
+        binding, channel, gripper_limits(binding), clock, scheduler);
+    const auto result =
+        backend.TranslateStopStage(stage, budget, std::stop_token{});
+    EXPECT_EQ(result.attempt_disposition,
+              StopStageAttemptDispositionDTO::kDispatched);
+    EXPECT_EQ(result.outcome, ParticipantStopStageOutcomeDTO::kFailed);
+    ASSERT_TRUE(result.error.has_value());
+    EXPECT_EQ(result.error->details.at("reason"),
+              "fake_publication_deadline");
+  }
+}
+
+TEST(RetainedObservedStateChannelTest,
+     BoundedReadAndPublishFailClosedUnderRouteContention) {
+  auto binding = make_binding(CoordinateKind::kLinear, "gripper.target", true);
+  FakeClock clock;
+  clock.set(100);
+  RetainedObservedStateChannel channel(
+      binding, nullptr,
+      RetainedObservedStateChannelConfig{
+          ObservedStateSourceKind::kPredictedState, "native.predicted", 0,
+          1U},
+      &clock);
+  const std::array<double, 1U> initial_position{0.0};
+  const std::array<double, 1U> initial_velocity{0.0};
+  ASSERT_TRUE(channel
+                  .publish_state(initial_position, initial_velocity, 100, 100)
+                  .applied());
+
+  std::promise<void> route_locked;
+  std::promise<void> release_route;
+  auto route_locked_future = route_locked.get_future();
+  auto release_route_future = release_route.get_future();
+  std::thread holder([&channel, route_locked = std::move(route_locked),
+                      release_route_future = std::move(release_route_future)]() mutable {
+    auto route_lock =
+        RetainedObservedStateChannelTestAccess::lock_route(channel);
+    route_locked.set_value();
+    release_route_future.wait();
+  });
+  route_locked_future.wait();
+  const auto started = std::chrono::steady_clock::now();
+  const std::array<double, 1U> next_position{0.1};
+  const auto published = channel.publish_state_bounded(
+      next_position, initial_velocity, 100, 100, 1'000, std::stop_token{});
+  const auto read = channel.current_state_bounded(
+      100, 1'000, std::stop_token{});
+  const auto elapsed = std::chrono::steady_clock::now() - started;
+  release_route.set_value();
+  holder.join();
+
+  EXPECT_FALSE(published.applied());
+  ASSERT_TRUE(published.error.has_value());
+  EXPECT_EQ(published.error->details.at("reason"), "retained_state_route_busy");
+  EXPECT_FALSE(read.ok());
+  EXPECT_EQ(read.error().details.at("reason"), "retained_state_route_busy");
+  EXPECT_LT(elapsed, 100ms);
+}
+
+TEST(RetainedObservedStateChannelTest,
+     SameOwnerRouteRebindRepublishesSeedAndNoopStaysReadable) {
+  const auto binding = make_binding(CoordinateKind::kLinear, "gripper.target",
+                                    true, "route.native");
+  const auto rebound = make_binding(CoordinateKind::kLinear, "gripper.target",
+                                    true, "route.successor");
+  RetainedObservedStateChannel channel(
+      binding, nullptr,
+      RetainedObservedStateChannelConfig{
+          ObservedStateSourceKind::kPredictedState, "native.predicted", 0,
+          1U});
+  const std::array<double, 1U> position{0.0};
+  const std::array<double, 1U> velocity{0.0};
+  ASSERT_TRUE(channel.publish_state(position, velocity, 100, 100).applied());
+  ASSERT_TRUE(channel.RebindRoute(binding, 101).ok());
+  const auto initial = channel.current_state(101);
+  ASSERT_TRUE(initial.ok()) << initial.error().message;
+  EXPECT_EQ(initial.value().control_route_id, ControlRouteId("route.native"));
+  ASSERT_TRUE(channel.RebindRoute(rebound, 102).ok());
+
+  const auto current = channel.current_state(102);
+  ASSERT_TRUE(current.ok()) << current.error().message;
+  EXPECT_EQ(current.value().control_route_id, ControlRouteId("route.successor"));
+  EXPECT_DOUBLE_EQ(
+      std::get<LinearPositionDTO>(current.value().positions.front()).value_m,
+      0.0);
+  EXPECT_TRUE(channel.wait_for_fresh_state(0ns));
 }
 
 TEST(RetainedExecutionStateSinkTest,

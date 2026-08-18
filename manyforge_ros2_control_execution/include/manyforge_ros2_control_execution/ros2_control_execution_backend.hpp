@@ -5,6 +5,7 @@
 #include <condition_variable>
 #include <cstddef>
 #include <cstdint>
+#include <functional>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -36,6 +37,7 @@
 #include <std_msgs/msg/bool.hpp>
 #include <trajectory_msgs/msg/joint_trajectory_point.hpp>
 
+#include <manyforge_core/addressed_observed_state_publication.hpp>
 #include <manyforge_core/execution_kernel.hpp>
 #include <manyforge_core/ports/iexecution_backend.hpp>
 #include <manyforge_core/ports/iexecution_state_sink.hpp>
@@ -197,6 +199,11 @@ class Ros2ControlExecutionBackend final : public core::IExecutionBackend,
                                           public core::IGripperCommandBackend {
 public:
   struct DeferredRosExecutorStartTag {};
+  using ObservedRobotStatePublishWriter =
+      std::function<core::ObservedRobotStatePublishResult(
+          core::ObservedRobotStateSourceKind,
+          std::span<const std::string>, std::span<const double>,
+          std::span<const double>, std::int64_t, std::int64_t)>;
 
   Ros2ControlExecutionBackend(
       std::shared_ptr<core::IExecutionStateSink> execution_state_sink,
@@ -207,9 +214,23 @@ public:
       std::shared_ptr<core::IExecutionStateSink> execution_state_sink,
       std::string group_name, core::IClock &clock, core::IScheduler &scheduler,
       Ros2ControlExecutionBackendConfig config);
-  /// Construct against the numeric channel owned by a retained addressed
-  /// publication. The backend remains its sole writer; construction rejects a
-  /// joint order or source set that differs from the exact backend config.
+  /// Construct against a channel-owned addressed publication writer. The
+  /// backend remains its sole adapter writer; construction rejects a joint
+  /// order or source set that differs from the exact backend config.
+  Ros2ControlExecutionBackend(
+      DeferredRosExecutorStartTag,
+      core::AddressedObservedStatePublication &addressed_state_publication,
+      ObservedRobotStatePublishWriter addressed_state_writer,
+      std::shared_ptr<core::IExecutionStateSink> execution_state_sink,
+      std::string group_name, core::IClock &clock, core::IScheduler &scheduler,
+      Ros2ControlExecutionBackendConfig config);
+  Ros2ControlExecutionBackend(
+      DeferredRosExecutorStartTag,
+      core::ObservedRobotStatePublication &addressed_state_publication,
+      ObservedRobotStatePublishWriter addressed_state_writer,
+      std::shared_ptr<core::IExecutionStateSink> execution_state_sink,
+      std::string group_name, core::IClock &clock, core::IScheduler &scheduler,
+      Ros2ControlExecutionBackendConfig config);
   Ros2ControlExecutionBackend(
       DeferredRosExecutorStartTag,
       core::ObservedRobotStatePublication &addressed_state_publication,
@@ -870,6 +891,14 @@ private:
                                const std::vector<double> &velocities,
                                std::int64_t source_timestamp_ns,
                                std::int64_t received_timestamp_ns) noexcept;
+  [[nodiscard]] core::ObservedRobotStatePublishResult
+  publish_addressed_state(
+      core::ObservedRobotStateSourceKind source,
+      std::span<const std::string> source_joint_names,
+      std::span<const double> positions,
+      std::span<const double> velocities,
+      std::int64_t source_timestamp_ns,
+      std::int64_t received_timestamp_ns) noexcept;
   core::ObservedRobotStatePublishResult publish_authored_robot_state(
       std::span<const double> positions, std::span<const double> velocities,
       std::int64_t source_timestamp_ns,
@@ -878,6 +907,7 @@ private:
   Ros2ControlExecutionBackend(
       bool defer_ros_executor_start,
       core::ObservedRobotStatePublication *addressed_state_publication,
+      ObservedRobotStatePublishWriter addressed_state_writer,
       std::shared_ptr<core::IExecutionStateSink> execution_state_sink,
       std::string group_name, core::IClock &clock, core::IScheduler &scheduler,
       Ros2ControlExecutionBackendConfig config);
@@ -1183,6 +1213,7 @@ private:
   std::unique_ptr<core::ObservedRobotStatePublication>
       owned_observed_state_publication_;
   core::ObservedRobotStatePublication *observed_state_publication_{};
+  ObservedRobotStatePublishWriter addressed_state_writer_;
   std::unique_ptr<core::ObservedRobotStatePublication>
       diagnostic_observed_state_publication_;
   std::unique_ptr<core::ExecutionProgressPublication>

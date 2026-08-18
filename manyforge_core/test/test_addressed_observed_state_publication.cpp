@@ -178,6 +178,80 @@ TEST(AddressedObservedStatePublicationTest,
 }
 
 TEST(AddressedObservedStatePublicationTest,
+     RepublishesPredictedOwnerSampleAtSameProviderEpochRouteRebind) {
+  AddressedObservedStatePublication publication(
+      config(context({CoordinateKind::kAngular})));
+  const auto names = publication.query_context().joint_names;
+  const std::array old_position{0.1};
+  const std::array<double, 1U> old_velocity{0.0};
+  ASSERT_TRUE(publication
+                  .publish(ObservedStateSourceKind::kPredictedState, names,
+                           old_position, old_velocity, 100, 100)
+                  .published);
+
+  auto rebound = publication.query_context();
+  rebound.control_route_id = ControlRouteId("route-b");
+  rebound.active_control_configuration_id =
+      ActiveControlConfigurationId("active-b");
+  rebound.active_control_configuration_generation =
+      ActiveControlConfigurationGeneration(5U);
+  ASSERT_TRUE(publication.rebind_route_context(std::move(rebound), 110).ok());
+
+  const auto rebound_state = publication.current_state(
+      publication.query_context(), 110);
+  ASSERT_TRUE(rebound_state.ok()) << rebound_state.error().message;
+  EXPECT_EQ(rebound_state.value().control_route_id, ControlRouteId("route-b"));
+  EXPECT_EQ(rebound_state.value().received_timestamp_ns, 110);
+  EXPECT_DOUBLE_EQ(
+      std::get<AngularPositionDTO>(rebound_state.value().positions.front())
+          .value_rad,
+      0.1);
+
+  const auto rebound_publication = publication.publication(
+      publication.query_context().control_binding_id,
+      publication.query_context().control_binding_revision);
+  ASSERT_TRUE(rebound_publication.ok());
+  EXPECT_EQ(rebound_publication.value().publication_sequence, 2U);
+  EXPECT_EQ(rebound_publication.value().snapshot.control_route_id,
+            ControlRouteId("route-b"));
+
+  const std::array new_position{0.2};
+  const std::array<double, 1U> new_velocity{0.0};
+  ASSERT_TRUE(publication
+                  .publish(ObservedStateSourceKind::kPredictedState, names,
+                           new_position, new_velocity, 111, 111)
+                  .published);
+  const auto current =
+      publication.current_state(publication.query_context(), 111);
+  ASSERT_TRUE(current.ok()) << current.error().message;
+  EXPECT_EQ(current.value().control_route_id, ControlRouteId("route-b"));
+  EXPECT_DOUBLE_EQ(
+      std::get<AngularPositionDTO>(current.value().positions.front()).value_rad,
+      0.2);
+}
+
+TEST(AddressedObservedStatePublicationTest,
+     DoesNotRebindMeasuredAuthorityWithoutAFreshMeasurement) {
+  AddressedObservedStatePublication publication(
+      config(context({CoordinateKind::kAngular},
+                     StateAuthorityClass::kMeasured, 100)));
+  const auto names = publication.query_context().joint_names;
+  const std::array position{0.1};
+  ASSERT_TRUE(publication
+                  .publish(ObservedStateSourceKind::kJointState, names,
+                           position, std::span<const double>{}, 100, 100)
+                  .published);
+
+  auto rebound = publication.query_context();
+  rebound.control_route_id = ControlRouteId("route-b");
+  const auto result =
+      publication.rebind_route_context(std::move(rebound), 110);
+  ASSERT_FALSE(result.ok());
+  EXPECT_EQ(result.error().details.at("reason"),
+            "observed_state_route_rebind_not_permitted");
+}
+
+TEST(AddressedObservedStatePublicationTest,
      AllowsLegacyProjectionOnlyForProvenAllAngularTarget) {
   AddressedObservedStatePublication angular(
       config(context({CoordinateKind::kAngular, CoordinateKind::kAngular})));

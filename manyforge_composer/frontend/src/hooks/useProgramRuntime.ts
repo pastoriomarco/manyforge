@@ -44,6 +44,29 @@ const INITIAL_STATE: ProgramRuntimeState = {
   error: null,
 };
 
+export function retainedScenarioSelection(
+  selectedScenarioId: string | null,
+  catalog: ScenarioCatalogResponse | null,
+): string | null {
+  if (selectedScenarioId === null || catalog === null) return null;
+  return catalog.scenarios.some((row) => row.scenarioId === selectedScenarioId)
+    ? selectedScenarioId
+    : null;
+}
+
+export function scenarioSelectionAfterRequest(
+  selectedScenarioId: string | null,
+  catalog: ScenarioCatalogResponse | null,
+  requestedScenarioId: string | null,
+): string | null {
+  if (requestedScenarioId === null) return null;
+  return catalog?.scenarios.some(
+    (row) => row.scenarioId === requestedScenarioId,
+  )
+    ? requestedScenarioId
+    : selectedScenarioId;
+}
+
 export function useProgramRuntime(enabled: boolean) {
   const [state, setState] = useState<ProgramRuntimeState>(INITIAL_STATE);
   const mounted = useRef(true);
@@ -121,21 +144,17 @@ export function useProgramRuntime(enabled: boolean) {
 
       setState((current) => {
         const nextCatalog = catalog ?? current.catalog;
-        const availableIds = new Set(
-          nextCatalog?.scenarios.map((row) => row.scenarioId) ?? [],
-        );
-        const preferred = current.selectedScenarioId
-          && availableIds.has(current.selectedScenarioId)
-          ? current.selectedScenarioId
-          : applied && availableIds.has(applied.scenarioId)
-            ? applied.scenarioId
-            : nextCatalog?.scenarios[0]?.scenarioId ?? null;
         return {
           ...current,
           catalog: nextCatalog,
           applied,
           run,
-          selectedScenarioId: preferred,
+          // Owner-issued Applied state is a projection, not operator intent.
+          // Refresh may retain an explicit selection but must never create one.
+          selectedScenarioId: retainedScenarioSelection(
+            current.selectedScenarioId,
+            nextCatalog,
+          ),
           runnerAvailable,
           loading: false,
           error: errors.length > 0 ? [...new Set(errors)].join(' ') : null,
@@ -169,11 +188,25 @@ export function useProgramRuntime(enabled: boolean) {
   }, [enabled, refresh]);
 
   const selectScenario = useCallback((scenarioId: string) => {
-    setState((current) => (
-      current.catalog?.scenarios.some((row) => row.scenarioId === scenarioId)
-        ? { ...current, selectedScenarioId: scenarioId }
-        : current
-    ));
+    setState((current) => ({
+      ...current,
+      selectedScenarioId: scenarioSelectionAfterRequest(
+        current.selectedScenarioId,
+        current.catalog,
+        scenarioId,
+      ),
+    }));
+  }, []);
+
+  const clearScenarioSelection = useCallback(() => {
+    setState((current) => ({
+      ...current,
+      selectedScenarioId: scenarioSelectionAfterRequest(
+        current.selectedScenarioId,
+        current.catalog,
+        null,
+      ),
+    }));
   }, []);
 
   const run = useCallback(async () => {
@@ -255,6 +288,7 @@ export function useProgramRuntime(enabled: boolean) {
     active,
     refresh,
     selectScenario,
+    clearScenarioSelection,
     run,
     stop,
   };

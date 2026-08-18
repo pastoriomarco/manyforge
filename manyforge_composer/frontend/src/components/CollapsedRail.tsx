@@ -1,13 +1,22 @@
+import type { Ref } from 'react';
+
 interface CollapsedRailProps {
   label: string;
   side: 'left' | 'right';
   onExpand: () => void;
+  buttonRef?: Ref<HTMLButtonElement>;
 }
 
-export function CollapsedRail({ label, side, onExpand }: CollapsedRailProps) {
+export function CollapsedRail({
+  label,
+  side,
+  onExpand,
+  buttonRef,
+}: CollapsedRailProps) {
   return (
     <button
       type="button"
+      ref={buttonRef}
       onClick={onExpand}
       className="collapsed-rail"
       title={`Expand ${label}`}

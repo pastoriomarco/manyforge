@@ -157,10 +157,19 @@ export function ProgramWorkspace({
             <label className="program-save-as-path">
               Qualified scenario
               <select
+                aria-label="Qualified scenario"
                 value={runtime.state.selectedScenarioId ?? ''}
                 disabled={busy || scenarioCatalog === null}
-                onChange={(event) => runtime.selectScenario(event.target.value)}
+                onChange={(event) => {
+                  const scenarioId = event.target.value;
+                  if (scenarioId === '') {
+                    runtime.clearScenarioSelection();
+                  } else {
+                    runtime.selectScenario(scenarioId);
+                  }
+                }}
               >
+                <option value="">Select a scenario</option>
                 {scenarioCatalog?.scenarios.map((row) => (
                   <option key={row.scenarioId} value={row.scenarioId}>
                     {row.description

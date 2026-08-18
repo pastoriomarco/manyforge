@@ -1,19 +1,25 @@
 #pragma once
 
 #include <atomic>
+#include <chrono>
 #include <cstdint>
+#include <condition_variable>
 #include <memory>
 #include <mutex>
 #include <span>
 #include <string>
+#include <stop_token>
 #include <utility>
 #include <vector>
 
 #include <manyforge_core/addressed_observed_state_publication.hpp>
 #include <manyforge_core/runtime_participant_binding.hpp>
+#include <manyforge_core/time/iclock.hpp>
 #include <manyforge_roboplan/retained_kinematic_state_projector.hpp>
 
 namespace manyforge::roboplan_backend {
+
+class RetainedObservedStateChannelTestAccess;
 
 struct RetainedObservedStateChannelConfig final {
   RetainedObservedStateChannelConfig() = default;
@@ -62,6 +68,35 @@ public:
                 std::span<const double> velocities_si,
                 std::int64_t source_timestamp_ns,
                 std::int64_t received_timestamp_ns) = 0;
+  /// Stop-stage callers use this bounded adapter seam. Implementations must
+  /// not wait past deadline_ns or rely on worker abandonment.
+  [[nodiscard]] virtual RetainedStateProjectionResult publish_state_bounded(
+      std::span<const double> positions_si,
+      std::span<const double> velocities_si,
+      std::int64_t source_timestamp_ns, std::int64_t received_timestamp_ns,
+      std::int64_t deadline_ns, std::stop_token cancellation) {
+    if (cancellation.stop_requested() ||
+        (deadline_ns >= 0 && received_timestamp_ns >= deadline_ns)) {
+      return {RetainedStateProjectionStatus::kFailed,
+              core::ErrorDTO{
+                  "invalid_request",
+                  cancellation.stop_requested()
+                      ? "retained state publication was cancelled"
+                      : "retained state publication missed its deadline",
+                  {{"reason", cancellation.stop_requested()
+                                 ? "retained_state_publication_cancelled"
+                                 : "retained_state_publication_deadline_expired"}}}};
+    }
+    static_cast<void>(positions_si);
+    static_cast<void>(velocities_si);
+    static_cast<void>(source_timestamp_ns);
+    static_cast<void>(received_timestamp_ns);
+    return {RetainedStateProjectionStatus::kFailed,
+            core::ErrorDTO{
+                "invalid_request", "bounded retained state publication is "
+                                   "not available",
+                {{"reason", "retained_state_bounded_publication_unavailable"}}}};
+  }
   [[nodiscard]] virtual RetainedStateProjectionResult
   project_latest(std::int64_t now_ns, RetainedStateProjectionMode mode) = 0;
   [[nodiscard]] virtual RetainedStateProjectionResult publish_and_project(
@@ -70,12 +105,40 @@ public:
       std::int64_t received_timestamp_ns, RetainedStateProjectionMode mode) = 0;
   [[nodiscard]] virtual core::Result<core::ObservedStateSnapshotDTO>
   current_state(std::int64_t now_ns) const = 0;
+  [[nodiscard]] virtual core::Result<core::ObservedStateSnapshotDTO>
+  current_state_bounded(std::int64_t now_ns, std::int64_t deadline_ns,
+                        std::stop_token cancellation) const {
+    if (cancellation.stop_requested() ||
+        (deadline_ns >= 0 && now_ns >= deadline_ns)) {
+      return core::Result<core::ObservedStateSnapshotDTO>::Err(
+          core::ErrorDTO{
+              "invalid_request",
+              cancellation.stop_requested()
+                  ? "retained state read was cancelled"
+                  : "retained state read missed its deadline",
+              {{"reason", cancellation.stop_requested()
+                             ? "retained_state_read_cancelled"
+                             : "retained_state_read_deadline_expired"}}});
+    }
+    static_cast<void>(now_ns);
+    return core::Result<core::ObservedStateSnapshotDTO>::Err(
+        core::ErrorDTO{
+            "invalid_request", "bounded retained state read is not available",
+            {{"reason", "retained_state_bounded_read_unavailable"}}});
+  }
   [[nodiscard]] virtual core::Result<core::ControlledStateDTO>
   current_controlled_state() const = 0;
   [[nodiscard]] virtual const core::ObservedStateQueryContextDTO &
   query_context() const noexcept = 0;
   [[nodiscard]] virtual const core::AddressedObservedStatePublication *
   addressed_publication() const noexcept = 0;
+  /// Wait for a source-owned sample after a route rebind. The default keeps
+  /// older focused sources fail-closed rather than fabricating freshness.
+  [[nodiscard]] virtual bool wait_for_fresh_state(
+      std::chrono::nanoseconds timeout) const {
+    static_cast<void>(timeout);
+    return false;
+  }
 };
 
 class RetainedObservedStateChannel final
@@ -84,7 +147,8 @@ public:
   RetainedObservedStateChannel(
       core::RuntimeParticipantBinding binding,
       std::shared_ptr<RetainedKinematicStateProjector> projector,
-      RetainedObservedStateChannelConfig config);
+      RetainedObservedStateChannelConfig config,
+      core::IClock *clock = nullptr);
 
   RetainedObservedStateChannel(const RetainedObservedStateChannel &) = delete;
   RetainedObservedStateChannel &
@@ -96,8 +160,9 @@ public:
   initialize_from_projection(std::int64_t timestamp_ns);
 
   /// Rebind this stable physical source to one verified route/configuration
-  /// identity. The caller must hold the Kernel route fence; the channel
-  /// republishes its complete predicted state before exposing the new binding.
+  /// identity. The caller must hold the Kernel route fence; a legitimate
+  /// same-owner commanded/predicted rebind republishes the complete seed at
+  /// the transition time before exposing the new binding.
   [[nodiscard]] core::Result<void>
   RebindRoute(core::RuntimeParticipantBinding binding,
               std::int64_t transition_time_ns);
@@ -118,14 +183,35 @@ public:
                 std::span<const double> velocities_si,
                 std::int64_t source_timestamp_ns,
                 std::int64_t received_timestamp_ns) override;
+  /// Adapter-owned publication facade. Unlike numeric_publication_writer(),
+  /// this path also clears the channel's route-freshness gate and wakes
+  /// bounded recovery readers.
+  [[nodiscard]] core::ObservedRobotStatePublishResult
+  publish_adapter_state(
+      core::ObservedRobotStateSourceKind source,
+      std::span<const std::string> source_joint_names,
+      std::span<const double> positions_si,
+      std::span<const double> velocities_si,
+      std::int64_t source_timestamp_ns,
+      std::int64_t received_timestamp_ns);
+  [[nodiscard]] RetainedStateProjectionResult publish_state_bounded(
+      std::span<const double> positions_si,
+      std::span<const double> velocities_si,
+      std::int64_t source_timestamp_ns, std::int64_t received_timestamp_ns,
+      std::int64_t deadline_ns, std::stop_token cancellation) override;
   [[nodiscard]] RetainedStateProjectionResult
   project_latest(std::int64_t now_ns,
                  RetainedStateProjectionMode mode) override;
 
   [[nodiscard]] core::Result<core::ObservedStateSnapshotDTO>
   current_state(std::int64_t now_ns) const override;
+  [[nodiscard]] core::Result<core::ObservedStateSnapshotDTO>
+  current_state_bounded(std::int64_t now_ns, std::int64_t deadline_ns,
+                        std::stop_token cancellation) const override;
   [[nodiscard]] core::Result<core::ControlledStateDTO>
   current_controlled_state() const override;
+  [[nodiscard]] bool wait_for_fresh_state(
+      std::chrono::nanoseconds timeout) const override;
 
   [[nodiscard]] const core::RuntimeParticipantBinding &
   binding() const noexcept {
@@ -142,6 +228,10 @@ public:
   publication() const noexcept {
     return publication_;
   }
+  [[nodiscard]] core::AddressedObservedStatePublication &
+  addressed_publication_writer() noexcept {
+    return publication_;
+  }
   [[nodiscard]] core::ObservedRobotStatePublication &
   numeric_publication_writer() noexcept {
     return publication_.numeric_publication_writer();
@@ -152,12 +242,19 @@ public:
   }
 
 private:
+  friend class RetainedObservedStateChannelTestAccess;
+
   core::RuntimeParticipantBinding initial_binding_;
   std::shared_ptr<RetainedKinematicStateProjector> projector_;
   RetainedObservedStateChannelConfig config_;
+  core::IClock *clock_{};
   core::AddressedObservedStatePublication publication_;
   core::ObservedStateQueryContextDTO projection_context_;
   mutable std::mutex route_rebind_mutex_;
+  mutable std::mutex fresh_state_mutex_;
+  mutable std::condition_variable fresh_state_cv_;
+  std::atomic<bool> fresh_state_required_{};
+  std::atomic<std::uint64_t> fresh_sample_generation_{};
   std::vector<std::unique_ptr<const core::RuntimeParticipantBinding>>
       retained_route_bindings_;
   std::atomic<const core::RuntimeParticipantBinding *> current_binding_;

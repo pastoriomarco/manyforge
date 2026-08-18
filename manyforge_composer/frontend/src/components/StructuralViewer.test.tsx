@@ -1,7 +1,12 @@
+import { readFileSync } from 'node:fs';
+
 import { renderToStaticMarkup } from 'react-dom/server';
 import { describe, expect, it } from 'vitest';
 
-import { ViewerFailureBoundary } from './StructuralViewer';
+import {
+  DEFAULT_WIREFRAME_VISIBLE,
+  ViewerFailureBoundary,
+} from './StructuralViewer';
 
 describe('viewer failure isolation', () => {
   it('replaces only the failed viewer subtree with its fallback', () => {
@@ -14,5 +19,45 @@ describe('viewer failure isolation', () => {
     expect(renderToStaticMarkup(boundary.render())).toContain(
       'isolated; authoring remains usable',
     );
+  });
+
+  it('defaults scene presentation to solid geometry and keeps wireframe optional', () => {
+    const source = readFileSync(
+      new URL('./StructuralViewer.tsx', import.meta.url),
+      'utf8',
+    );
+
+    expect(DEFAULT_WIREFRAME_VISIBLE).toBe(false);
+    expect(source).toContain('<span>Wireframe overlays</span>');
+    expect(source).toContain('wireframe={wireframe}');
+    expect(source).toContain('depthWrite={!wireframe}');
+  });
+
+  it('wraps native viewer controls instead of clipping them at narrow widths', () => {
+    const css = readFileSync(new URL('../index.css', import.meta.url), 'utf8');
+    const source = readFileSync(
+      new URL('./StructuralViewer.tsx', import.meta.url),
+      'utf8',
+    );
+
+    expect(css).toMatch(/\.viewer-controls\s*\{\s*flex-wrap: wrap;/);
+    expect(source.match(/type="checkbox"/g)).toHaveLength(3);
+    expect(source).toContain('<button type="button" className="quiet-button"');
+  });
+
+  it('frames robot, scene, measured overlays, and point clouds together', () => {
+    const source = readFileSync(
+      new URL('./StructuralViewer.tsx', import.meta.url),
+      'utf8',
+    );
+    const bounds = source.indexOf('<Bounds fit={camera === null}');
+    const boundsEnd = source.indexOf('</Bounds>', bounds);
+
+    expect(bounds).toBeGreaterThan(0);
+    expect(source.indexOf('<RetainedNeutralModel', bounds)).toBeLessThan(boundsEnd);
+    expect(source.indexOf('<LogicalSceneObjects', bounds)).toBeLessThan(boundsEnd);
+    expect(source.indexOf('<MeasuredLogicalSceneObjects', bounds)).toBeLessThan(boundsEnd);
+    expect(source.indexOf('<PointCloudPoints', bounds)).toBeLessThan(boundsEnd);
+    expect(source).toContain('viewer-stage viewer-fallback-stage');
   });
 });

@@ -220,12 +220,30 @@ RetainedRuntimeBackendFactory make_retained_ros2_control_backend_factory(
 
         auto sink = std::make_shared<RetainedExecutionStateSink>(
             clock, std::move(sink_bindings));
+        const std::weak_ptr<RetainedObservedStateChannel> weak_motion_channel =
+            motion_channel;
         auto backend = std::make_shared<
             ros2_control_execution::Ros2ControlExecutionBackend>(
             ros2_control_execution::Ros2ControlExecutionBackend::
                 DeferredRosExecutorStartTag{},
-            motion_channel->numeric_publication_writer(), sink, motion_group,
-            clock, scheduler, selected.execution);
+            motion_channel->addressed_publication_writer(),
+            [weak_motion_channel](
+                const core::ObservedRobotStateSourceKind source,
+                const std::span<const std::string> source_joint_names,
+                const std::span<const double> positions,
+                const std::span<const double> velocities,
+                const std::int64_t source_timestamp_ns,
+                const std::int64_t received_timestamp_ns) {
+              const auto channel = weak_motion_channel.lock();
+              if (!channel) {
+                return core::ObservedRobotStatePublishResult{
+                    false, false, false, 0, "publication_unavailable"};
+              }
+              return channel->publish_adapter_state(
+                  source, source_joint_names, positions, velocities,
+                  source_timestamp_ns, received_timestamp_ns);
+            },
+            sink, motion_group, clock, scheduler, selected.execution);
         if (gripper_binding.has_value()) {
           backend->configure_gripper_action(
               gripper_binding->value().command_target_id.value(),

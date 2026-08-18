@@ -943,7 +943,7 @@ create_retained_native_runtime_participants(
   runtime->motion_state_channel =
       std::make_shared<RetainedObservedStateChannel>(
           runtime->motion_binding, runtime->state_projector,
-          std::move(motion_state_config));
+          std::move(motion_state_config), runtime->clock.get());
   const auto initial_timestamp_ns = runtime->clock->now();
   const auto motion_initialized =
       config.initial_motion_positions_rad.empty()
@@ -990,7 +990,8 @@ create_retained_native_runtime_participants(
             model_backed ? runtime->state_projector : nullptr,
             detail::select_retained_state_channel_config(
                 std::move(input.gripper_state_channel_config),
-                *runtime->gripper_binding));
+                *runtime->gripper_binding),
+            runtime->clock.get());
     if (model_backed) {
       const auto gripper_initialized =
           runtime->gripper_state_channel->initialize_from_projection(
@@ -2101,7 +2102,8 @@ void attach_retained_native_addressed_owner(
                                     *runtime->gripper_binding)
                     : std::nullopt,
                 runtime->gripper_state_channel,
-                runtime->participant_engine.get()));
+                runtime->participant_engine.get()),
+            runtime->clock.get());
     if (runtime->stop_surveillance_policy.has_value()) {
       stop_surveillance_config = core::StopSurveillanceExecutionConfig{
           runtime->scheduler.get(), runtime->stop_surveillance_owner.get(),

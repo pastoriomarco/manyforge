@@ -63,6 +63,7 @@ function controller(
       .includes(state),
     refresh: vi.fn(),
     selectScenario: vi.fn(),
+    clearScenarioSelection: vi.fn(),
     run: vi.fn(),
     stop: vi.fn(),
   };

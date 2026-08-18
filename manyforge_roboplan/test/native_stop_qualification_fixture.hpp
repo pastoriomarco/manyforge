@@ -6,6 +6,7 @@
 #include <manyforge_roboplan/retained_observed_state_channel.hpp>
 
 #include <cstddef>
+#include <chrono>
 #include <cstdint>
 #include <memory>
 #include <mutex>
@@ -222,7 +223,7 @@ public:
             state_.positions,
             state_.velocities,
             "qualification.native.state",
-            context_.runtime_epoch,
+            source_epoch_,
             core::ObservedStateSourceKind::kPredictedState,
             source_timestamp_ns_,
             received_timestamp_ns_,
@@ -231,6 +232,20 @@ public:
             1U,
             context_.freshness_budget_ns,
             true});
+  }
+
+  core::Result<core::ObservedStateSnapshotDTO>
+  current_state_bounded(std::int64_t now_ns, std::int64_t deadline_ns,
+                        std::stop_token cancellation) const override {
+    if (cancellation.stop_requested() ||
+        (deadline_ns >= 0 && now_ns >= deadline_ns)) {
+      return core::Result<core::ObservedStateSnapshotDTO>::Err(
+          core::ErrorDTO{"invalid_request", "qualification state unavailable",
+                         {{"reason", cancellation.stop_requested()
+                                        ? "retained_state_read_cancelled"
+                                        : "retained_state_read_deadline_expired"}}});
+    }
+    return current_state(now_ns);
   }
 
   core::Result<core::ControlledStateDTO>
@@ -249,6 +264,29 @@ public:
     return nullptr;
   }
 
+  void set_source_epoch(core::RuntimeEpoch epoch) {
+    std::lock_guard lock(mutex_);
+    source_epoch_ = std::move(epoch);
+  }
+
+  void refresh_source_on_wait(bool enabled) {
+    std::lock_guard lock(mutex_);
+    refresh_source_on_wait_ = enabled;
+  }
+
+  bool wait_for_fresh_state(std::chrono::nanoseconds) const override {
+    std::lock_guard lock(mutex_);
+    if (!refresh_source_on_wait_) {
+      return false;
+    }
+    source_epoch_ = context_.runtime_epoch;
+    ++sequence_;
+    if (received_timestamp_ns_ < 101) {
+      received_timestamp_ns_ = 101;
+    }
+    return true;
+  }
+
 private:
   [[nodiscard]] static RetainedStateProjectionResult
   failure(std::string reason) {
@@ -262,9 +300,11 @@ private:
   core::ObservedStateQueryContextDTO context_;
   mutable std::mutex mutex_;
   core::ControlledStateDTO state_;
-  std::uint64_t sequence_{};
+  mutable std::uint64_t sequence_{};
   std::int64_t source_timestamp_ns_{};
-  std::int64_t received_timestamp_ns_{};
+  mutable std::int64_t received_timestamp_ns_{};
+  mutable core::RuntimeEpoch source_epoch_{context_.runtime_epoch};
+  bool refresh_source_on_wait_{};
 };
 
 [[nodiscard]] inline core::TrajectoryDTO

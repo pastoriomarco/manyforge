@@ -4,8 +4,10 @@
 #include <manyforge_content_identity/content_identity.hpp>
 #include <manyforge_roboplan/retained_stop_surveillance_owner.hpp>
 #include <map>
+#include <limits>
 #include <set>
 #include <stdexcept>
+#include <stop_token>
 #include <string>
 #include <tuple>
 #include <utility>
@@ -331,16 +333,43 @@ struct CurrentQuiescenceObservation final {
   core::ContentDigest configuration_evidence_digest;
 };
 
+struct RefreshedCurrentQuiescenceObservation final {
+  CurrentQuiescenceObservation observation;
+  std::int64_t assessed_at_ns{};
+};
+
+[[nodiscard]] bool quiescence_refreshable(const core::ErrorDTO &failure) {
+  if (failure.code.rfind("native_current_resource_", 0U) == 0U ||
+      failure.code.rfind("retained_state_", 0U) == 0U ||
+      failure.code.rfind("observed_state_", 0U) == 0U ||
+      failure.code == "observation_stale") {
+    return true;
+  }
+  const auto reason = failure.details.find("reason");
+  if (reason == failure.details.end()) {
+    return failure.code == "invalid_request";
+  }
+  return reason->second == "observation_stale" ||
+         reason->second.rfind("native_current_resource_", 0U) == 0U ||
+         reason->second.rfind("retained_state_", 0U) == 0U ||
+         reason->second.rfind("observed_state_", 0U) == 0U;
+}
+
 [[nodiscard]] core::Result<CurrentQuiescenceObservation>
 observe_current_quiescence(const RetainedStopSurveillanceSourceInput &source,
                            const std::vector<core::ResourceId> &resources,
-                           const std::int64_t assessed_at_ns) {
+                           const std::int64_t assessed_at_ns,
+                           const std::int64_t read_deadline_ns = -1) {
   if (!source.no_active_goal_evidence_source || resources.empty()) {
     return invalid<CurrentQuiescenceObservation>(
         "native_no_active_goal_source_missing",
         "native current-resource proof has no goal-activity source");
   }
-  auto observed = source.state_channel->current_state(assessed_at_ns);
+  auto observed =
+      read_deadline_ns >= 0
+          ? source.state_channel->current_state_bounded(
+                assessed_at_ns, read_deadline_ns, std::stop_token{})
+          : source.state_channel->current_state(assessed_at_ns);
   if (!observed.ok()) {
     return core::Result<CurrentQuiescenceObservation>::Err(observed.error());
   }
@@ -395,6 +424,50 @@ observe_current_quiescence(const RetainedStopSurveillanceSourceInput &source,
           snapshot, age_ns, std::move(no_active_goal.value()),
           configuration_evidence_digest(configuration, value.retained_bundle_id,
                                         value.graph_revision)});
+}
+
+[[nodiscard]] core::Result<RefreshedCurrentQuiescenceObservation>
+observe_current_quiescence_after_refresh(
+    const RetainedStopSurveillanceSourceInput &source,
+    const std::vector<core::ResourceId> &resources,
+    const std::int64_t assessed_at_ns, core::IClock *clock) {
+  const auto deadline_for = [](const std::int64_t assessed) {
+    return assessed >
+                   std::numeric_limits<std::int64_t>::max() -
+                       kRetainedNativeReconciliationFreshnessBudgetNs
+               ? std::numeric_limits<std::int64_t>::max()
+               : assessed + kRetainedNativeReconciliationFreshnessBudgetNs;
+  };
+  auto assessed = assessed_at_ns;
+  auto observed =
+      observe_current_quiescence(source, resources, assessed,
+                                 deadline_for(assessed));
+  if (observed.ok() || !quiescence_refreshable(observed.error())) {
+    if (!observed.ok()) {
+      return core::Result<RefreshedCurrentQuiescenceObservation>::Err(
+          observed.error());
+    }
+    return core::Result<RefreshedCurrentQuiescenceObservation>::Ok(
+        RefreshedCurrentQuiescenceObservation{std::move(observed.value()),
+                                               assessed});
+  }
+  if (!source.state_channel->wait_for_fresh_state(
+          std::chrono::nanoseconds(kRetainedNativeReconciliationFreshnessBudgetNs))) {
+    return core::Result<RefreshedCurrentQuiescenceObservation>::Err(
+        observed.error());
+  }
+  if (clock != nullptr) {
+    assessed = std::max(assessed, clock->now());
+  }
+  observed = observe_current_quiescence(source, resources, assessed,
+                                        deadline_for(assessed));
+  if (!observed.ok()) {
+    return core::Result<RefreshedCurrentQuiescenceObservation>::Err(
+        observed.error());
+  }
+  return core::Result<RefreshedCurrentQuiescenceObservation>::Ok(
+      RefreshedCurrentQuiescenceObservation{std::move(observed.value()),
+                                             assessed});
 }
 
 [[nodiscard]] std::optional<SelectedSource>
@@ -527,7 +600,9 @@ latest_motion_rest_requirements(const core::StopStatusDTO &status,
 } // namespace
 
 RetainedStopSurveillanceOwner::RetainedStopSurveillanceOwner(
-    std::vector<RetainedStopSurveillanceSourceInput> sources) {
+    std::vector<RetainedStopSurveillanceSourceInput> sources,
+    core::IClock *clock)
+    : clock_(clock) {
   auto replaced = ReplaceSources(std::move(sources));
   if (!replaced.ok())
     throw std::invalid_argument(replaced.error().message);
@@ -815,8 +890,8 @@ RetainedStopSurveillanceOwner::BuildRecoveryFacts(
         }
         if (selected_resources.empty())
           continue;
-        auto quiescence = observe_current_quiescence(source, selected_resources,
-                                                     assessed_at_ns);
+        auto quiescence = observe_current_quiescence_after_refresh(
+            source, selected_resources, assessed_at_ns, clock_);
         if (!quiescence.ok())
           continue;
         for (const auto &resource : selected_resources) {
@@ -827,7 +902,7 @@ RetainedStopSurveillanceOwner::BuildRecoveryFacts(
               !settlement->second.evidence_digest.has_value()) {
             continue;
           }
-          const auto &observed = quiescence.value();
+          const auto &observed = quiescence.value().observation;
           external_facts.push_back(core::StopFaultRecoveryResourceFactDTO{
               resource, core::StopFaultRecoveryResourceStateDTO::kSettled,
               observed.snapshot.source_epoch, observed.snapshot.sequence,
@@ -930,19 +1005,46 @@ RetainedStopSurveillanceOwner::BuildOrphanResourceReconciliationFacts(
       resources_by_source[found->second].push_back(resource);
     }
 
-    std::vector<core::OrphanResourceReconciliationFactDTO> facts;
-    facts.reserve(resources.size());
+    struct PendingObservation final {
+      std::size_t source_index{};
+      std::vector<core::ResourceId> resources;
+      CurrentQuiescenceObservation observation;
+    };
+    std::vector<PendingObservation> pending;
+    pending.reserve(resources_by_source.size());
+    auto effective_assessed_at_ns = assessed_at_ns;
     for (const auto &[source_index, selected_resources] : resources_by_source) {
       const auto &source = sources[source_index];
-      auto observed = observe_current_quiescence(source, selected_resources,
-                                                 assessed_at_ns);
+      auto observed = observe_current_quiescence_after_refresh(
+          source, selected_resources, assessed_at_ns, clock_);
       if (!observed.ok()) {
         return core::Result<core::OrphanResourceReconciliationFactsDTO>::Err(
             observed.error());
       }
+      auto refreshed = std::move(observed.value());
+      effective_assessed_at_ns =
+          std::max(effective_assessed_at_ns, refreshed.assessed_at_ns);
+      pending.push_back(PendingObservation{
+          source_index, selected_resources,
+          std::move(refreshed.observation)});
+    }
+
+    std::vector<core::OrphanResourceReconciliationFactDTO> facts;
+    facts.reserve(resources.size());
+    for (auto &pending_observation : pending) {
+      const auto &source = sources[pending_observation.source_index];
+      const auto &observed = pending_observation.observation;
+      const auto source_age_ns =
+          effective_assessed_at_ns - observed.snapshot.received_timestamp_ns;
+      if (source_age_ns < 0 ||
+          source_age_ns > kRetainedNativeReconciliationFreshnessBudgetNs) {
+        return invalid<core::OrphanResourceReconciliationFactsDTO>(
+            "native_current_resource_state_stale",
+            "native current-resource state became stale before reconciliation");
+      }
       const auto &binding = source.binding.value();
       const auto &path = *binding.control_path;
-      for (const auto &resource : selected_resources) {
+      for (const auto &resource : pending_observation.resources) {
         core::OrphanResourceReconciliationFactDTO fact{
             resource,
             binding.controllable_component_id,
@@ -956,17 +1058,16 @@ RetainedStopSurveillanceOwner::BuildOrphanResourceReconciliationFacts(
             path.provider_runtime_epoch,
             core::StopFaultRecoveryResourceFactDTO{
                 resource, core::StopFaultRecoveryResourceStateDTO::kSettled,
-                observed.value().snapshot.source_epoch,
-                observed.value().snapshot.sequence,
-                observed.value().source_age_ns,
+                observed.snapshot.source_epoch,
+                observed.snapshot.sequence,
+                source_age_ns,
                 kRetainedNativeReconciliationFreshnessBudgetNs, std::nullopt,
                 std::nullopt},
-            observed.value().no_active_goal_evidence_digest,
-            observed.value().configuration_evidence_digest};
+            observed.no_active_goal_evidence_digest,
+            observed.configuration_evidence_digest};
         fact.settlement.evidence_digest = current_resource_evidence_digest(
-            fact, observed.value().snapshot,
-            observed.value().no_active_goal_evidence_digest,
-            observed.value().configuration_evidence_digest, assessed_at_ns);
+            fact, observed.snapshot, observed.no_active_goal_evidence_digest,
+            observed.configuration_evidence_digest, effective_assessed_at_ns);
         facts.push_back(std::move(fact));
       }
     }
@@ -981,7 +1082,7 @@ RetainedStopSurveillanceOwner::BuildOrphanResourceReconciliationFacts(
         value.retained_bundle_id,
         value.graph_revision,
         expected_operation_resource_generation,
-        assessed_at_ns,
+        effective_assessed_at_ns,
         std::move(facts)};
     if (core::orphan_resource_reconciliation_facts_field_error(result)
             .has_value()) {

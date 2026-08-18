@@ -192,5 +192,46 @@ TEST(RetainedStopSurveillanceOwnerTest,
   EXPECT_EQ(rejected.error().details.at("reason"), "test_goal_active");
 }
 
+TEST(RetainedStopSurveillanceOwnerTest,
+     RejectsOrWaitsInsteadOfRelabelingAStaleEpochForOrphanFacts) {
+  const auto binding = make_binding();
+  auto channel = std::make_shared<StateChannel>(binding);
+  const auto source = ObservationSource(binding);
+  const auto goal_source = [](std::int64_t) {
+    return core::Result<core::ContentDigest>::Ok(
+        core::ContentDigest("sha256:" + std::string(64U, 'b')));
+  };
+  RetainedStopSurveillanceOwner owner(
+      {RetainedStopSurveillanceSourceInput{binding, channel, {}, goal_source}});
+  ASSERT_TRUE(channel
+                  ->publish_state({std::array<double, 2U>{0.0, 0.0}},
+                                  {std::array<double, 2U>{0.0, 0.0}}, 100, 100)
+                  .applied());
+  channel->set_source_epoch(core::RuntimeEpoch("stale.epoch"));
+  std::vector<core::ResourceId> resources;
+  for (const auto &resource : binding.value().resources) {
+    resources.push_back(resource.resource_id);
+  }
+  std::sort(resources.begin(), resources.end());
+
+  const auto rejected = owner.BuildOrphanResourceReconciliationFacts(
+      core::RequestOwnerEpoch("owner.2"), core::CellId("cell.test"), 7U,
+      resources, 105);
+  ASSERT_FALSE(rejected.ok());
+  EXPECT_EQ(rejected.error().code,
+            "native_current_resource_identity_mismatch");
+
+  channel->refresh_source_on_wait(true);
+  const auto reconciled = owner.BuildOrphanResourceReconciliationFacts(
+      core::RequestOwnerEpoch("owner.2"), core::CellId("cell.test"), 7U,
+      resources, 105);
+  ASSERT_TRUE(reconciled.ok()) << reconciled.error().message;
+  ASSERT_EQ(reconciled.value().resources.size(), resources.size());
+  for (const auto &fact : reconciled.value().resources) {
+    EXPECT_EQ(fact.settlement.source_epoch,
+              binding.value().control_path->provider_runtime_epoch);
+  }
+}
+
 } // namespace
 } // namespace manyforge::roboplan_backend

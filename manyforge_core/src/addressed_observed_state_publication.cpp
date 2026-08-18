@@ -170,7 +170,6 @@ Result<void> AddressedObservedStatePublication::rebind_route_context(
         query_context.state_authority_class == StateAuthorityClass::kMeasured) {
       return Result<void>::Err(state_error("observed_state_route_rebind_not_permitted"));
     }
-
     std::lock_guard lock(route_context_mutex_);
     const auto* current = current_query_context_.load(std::memory_order_acquire);
     if (query_context == *current) {
@@ -182,19 +181,25 @@ Result<void> AddressedObservedStatePublication::rebind_route_context(
     }
     auto latest = publication_.acquire_latest();
     if (!latest || !latest.complete() || !latest.velocities_complete()) {
-      return Result<void>::Err(state_error("observed_state_route_rebind_source_unavailable"));
+      return Result<void>::Err(
+          state_error("observed_state_route_rebind_source_unavailable"));
     }
 
     retained_route_contexts_.push_back(
-        std::make_unique<const ObservedStateQueryContextDTO>(std::move(query_context)));
+        std::make_unique<const ObservedStateQueryContextDTO>(
+            std::move(query_context)));
     const auto seeded =
-        publication_.publish(latest.source_kind(), latest.joint_names(), latest.positions_rad(),
-                             latest.velocities_rad_s(), transition_time_ns, transition_time_ns);
-    if (!seeded.published || !seeded.complete || !seeded.velocities_complete) {
+        publication_.publish(latest.source_kind(), latest.joint_names(),
+                             latest.positions_rad(), latest.velocities_rad_s(),
+                             transition_time_ns, transition_time_ns);
+    if (!seeded.published || !seeded.complete ||
+        !seeded.velocities_complete) {
       retained_route_contexts_.pop_back();
-      return Result<void>::Err(state_error("observed_state_route_rebind_publish_failed"));
+      return Result<void>::Err(
+          state_error("observed_state_route_rebind_publish_failed"));
     }
-    current_query_context_.store(retained_route_contexts_.back().get(), std::memory_order_release);
+    current_query_context_.store(retained_route_contexts_.back().get(),
+                                 std::memory_order_release);
     return Result<void>::Ok();
   } catch (const std::exception&) {
     return Result<void>::Err(state_error("observed_state_route_rebind_capacity_unavailable"));
@@ -212,8 +217,9 @@ ObservedRobotStatePublishResult AddressedObservedStatePublication::publish(
     ObservedStateSourceKind source, std::span<const std::string> source_joint_names,
     std::span<const double> positions_si, std::span<const double> velocities_si,
     std::int64_t source_timestamp_ns, std::int64_t received_timestamp_ns) noexcept {
-  return publication_.publish(numeric_source_kind(source), source_joint_names, positions_si,
-                              velocities_si, source_timestamp_ns, received_timestamp_ns);
+  return publication_.publish(numeric_source_kind(source), source_joint_names,
+                              positions_si, velocities_si, source_timestamp_ns,
+                              received_timestamp_ns);
 }
 
 ObservedStateSnapshotDTO AddressedObservedStatePublication::make_snapshot(

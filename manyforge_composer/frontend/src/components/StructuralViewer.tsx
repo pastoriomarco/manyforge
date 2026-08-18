@@ -103,6 +103,8 @@ interface ViewerFailureBoundaryState {
   failed: boolean;
 }
 
+export const DEFAULT_WIREFRAME_VISIBLE = false;
+
 /** Keep WebGL/Three failures local so Program authoring remains usable. */
 export class ViewerFailureBoundary extends Component<
   ViewerFailureBoundaryProps,
@@ -315,10 +317,12 @@ function SceneObjectMeshAsset({
   url,
   measured,
   selected,
+  wireframe,
 }: {
   url: string;
   measured: boolean;
   selected: boolean;
+  wireframe: boolean;
 }) {
   const gltf = useGLTF(resolveStructuralAssetUrl(url));
   const clone = useMemo(() => {
@@ -334,9 +338,9 @@ function SceneObjectMeshAsset({
         material.color?.set(measured ? '#43d7ec' : selected ? '#65d3f2' : '#8c6fe0');
         material.emissive?.set(measured ? '#0c5060' : selected ? '#144c62' : '#251a48');
         material.transparent = true;
-        material.opacity = measured ? 0.4 : selected ? 0.72 : 0.5;
-        material.wireframe = true;
-        material.depthWrite = false;
+        material.opacity = measured ? 0.55 : selected ? 0.9 : 0.82;
+        material.wireframe = wireframe;
+        material.depthWrite = !wireframe;
         material.side = THREE.DoubleSide;
         return material;
       });
@@ -344,7 +348,7 @@ function SceneObjectMeshAsset({
       mesh.renderOrder = measured ? 16 : selected ? 12 : 8;
     });
     return root;
-  }, [gltf.scene, measured, selected]);
+  }, [gltf.scene, measured, selected, wireframe]);
   return <primitive object={clone} />;
 }
 
@@ -353,12 +357,14 @@ function SceneObjectMesh({
   ownerIdentity,
   measured,
   selected,
+  wireframe,
   onAssetError,
 }: {
   shape: Extract<LogicalSceneShape, { type: 'mesh' }>;
   ownerIdentity: NonNullable<StructuralViewerProps['sceneOwnerIdentity']>;
   measured: boolean;
   selected: boolean;
+  wireframe: boolean;
   onAssetError: (error: Error) => void;
 }) {
   const [url, setUrl] = useState<string | null>(null);
@@ -396,7 +402,14 @@ function SceneObjectMesh({
   ]);
   return url === null
     ? null
-    : <SceneObjectMeshAsset url={url} measured={measured} selected={selected} />;
+    : (
+      <SceneObjectMeshAsset
+        url={url}
+        measured={measured}
+        selected={selected}
+        wireframe={wireframe}
+      />
+    );
 }
 
 function MeasuredVisualMesh({ url }: { url: string }) {
@@ -647,6 +660,7 @@ function LogicalSceneObjects({
   selectedSceneResourceId,
   onSelect,
   axesSizeM,
+  wireframe,
   ownerIdentity,
   onAssetError,
 }: {
@@ -654,6 +668,7 @@ function LogicalSceneObjects({
   selectedSceneResourceId: string | null;
   onSelect: (sceneResourceId: string) => void;
   axesSizeM: number;
+  wireframe: boolean;
   ownerIdentity: StructuralViewerProps['sceneOwnerIdentity'];
   onAssetError: (error: Error) => void;
 }) {
@@ -682,6 +697,7 @@ function LogicalSceneObjects({
                     ownerIdentity={ownerIdentity}
                     measured={false}
                     selected={selected}
+                    wireframe={wireframe}
                     onAssetError={onAssetError}
                   />
                 )
@@ -697,9 +713,9 @@ function LogicalSceneObjects({
                       color={selected ? '#65d3f2' : '#8c6fe0'}
                       emissive={selected ? '#144c62' : '#251a48'}
                       transparent
-                      opacity={selected ? 0.72 : 0.5}
-                      wireframe
-                      depthWrite={false}
+                      opacity={selected ? 0.9 : 0.82}
+                      wireframe={wireframe}
+                      depthWrite={!wireframe}
                     />
                   </mesh>
                 ))}
@@ -715,6 +731,7 @@ function MeasuredLogicalSceneObjects({
   objects,
   presentation,
   onSelect,
+  wireframe,
   ownerIdentity,
   onAssetError,
   latestFrameAppliers,
@@ -722,6 +739,7 @@ function MeasuredLogicalSceneObjects({
   objects: LogicalSceneObject[];
   presentation: RuntimeScenePresentation;
   onSelect: (sceneResourceId: string) => void;
+  wireframe: boolean;
   ownerIdentity: StructuralViewerProps['sceneOwnerIdentity'];
   onAssetError: (error: Error) => void;
   latestFrameAppliers: Set<() => void>;
@@ -766,6 +784,7 @@ function MeasuredLogicalSceneObjects({
                       ownerIdentity={ownerIdentity}
                       measured
                       selected={false}
+                      wireframe={wireframe}
                       onAssetError={onAssetError}
                     />
                   )
@@ -780,9 +799,9 @@ function MeasuredLogicalSceneObjects({
                         color="#43d7ec"
                         emissive="#0c5060"
                         transparent
-                        opacity={0.4}
-                        wireframe
-                        depthWrite={false}
+                        opacity={0.55}
+                        wireframe={wireframe}
+                        depthWrite={!wireframe}
                       />
                     </mesh>
                   ))}
@@ -938,6 +957,7 @@ function PointCloudPoints({ frame }: { frame: PointCloudFrame }) {
 function ViewerCanvas({
   manifest,
   collisionsVisible,
+  wireframeVisible,
   onAssetError,
   camera,
   sceneObjects,
@@ -953,6 +973,7 @@ function ViewerCanvas({
 }: {
   manifest: SceneUrdfManifest | null;
   collisionsVisible: boolean;
+  wireframeVisible: boolean;
   onAssetError: (error: Error) => void;
   camera: ViewerCamera | null;
   sceneObjects: LogicalSceneObject[];
@@ -1043,13 +1064,13 @@ function ViewerCanvas({
         dampingFactor={0.1}
         target={selectedCamera.target}
       />
-      {manifest !== null && (
-        <AssetErrorBoundary
-          resetKey={manifest.model_key}
-          onError={onAssetError}
-        >
-          <Suspense fallback={null}>
-            <Bounds fit={camera === null} clip observe margin={1.25}>
+      <Bounds fit={camera === null} clip observe margin={1.25}>
+        {manifest !== null && (
+          <AssetErrorBoundary
+            resetKey={manifest.model_key}
+            onError={onAssetError}
+          >
+            <Suspense fallback={null}>
               <RetainedNeutralModel
                 manifest={manifest}
                 collisionsVisible={collisionsVisible}
@@ -1063,45 +1084,47 @@ function ViewerCanvas({
                   latestFrameAppliers={latestFrameAppliers}
                 />
               )}
-            </Bounds>
-          </Suspense>
-        </AssetErrorBoundary>
-      )}
-      <LogicalSceneObjects
-        objects={sceneObjects}
-        selectedSceneResourceId={selectedSceneResourceId}
-        onSelect={(sceneResourceId) => onSelectSceneResource(sceneResourceId)}
-        axesSizeM={viewer?.object_axes_gizmo_size_m ?? 0.1}
-        ownerIdentity={sceneOwnerIdentity}
-        onAssetError={onAssetError}
-      />
-      {runtimePresentation !== undefined && (
-        <MeasuredLogicalSceneObjects
+            </Suspense>
+          </AssetErrorBoundary>
+        )}
+        <LogicalSceneObjects
           objects={sceneObjects}
-          presentation={runtimePresentation}
+          selectedSceneResourceId={selectedSceneResourceId}
           onSelect={(sceneResourceId) => onSelectSceneResource(sceneResourceId)}
+          axesSizeM={viewer?.object_axes_gizmo_size_m ?? 0.1}
+          wireframe={wireframeVisible}
           ownerIdentity={sceneOwnerIdentity}
           onAssetError={onAssetError}
-          latestFrameAppliers={latestFrameAppliers}
         />
-      )}
-      {runtimePresentation?.measuredTcp !== null
-        && runtimePresentation?.measuredTcp !== undefined && (
-        <MeasuredTcpMarker
-          presentation={runtimePresentation.measuredTcp}
-          axesSizeM={viewer?.frame_gizmo_size_m ?? 0.1}
-          ownerIdentity={sceneOwnerIdentity}
-          latestFrameAppliers={latestFrameAppliers}
-        />
-      )}
-      {candidateTcpPose !== null && (
-        <CandidateTcpGhost
-          pose={candidateTcpPose}
-          stale={candidateStale}
-          axesSizeM={viewer?.frame_gizmo_size_m ?? 0.1}
-        />
-      )}
-      {pointCloudFrame !== null && <PointCloudPoints frame={pointCloudFrame} />}
+        {runtimePresentation !== undefined && (
+          <MeasuredLogicalSceneObjects
+            objects={sceneObjects}
+            presentation={runtimePresentation}
+            onSelect={(sceneResourceId) => onSelectSceneResource(sceneResourceId)}
+            wireframe={wireframeVisible}
+            ownerIdentity={sceneOwnerIdentity}
+            onAssetError={onAssetError}
+            latestFrameAppliers={latestFrameAppliers}
+          />
+        )}
+        {runtimePresentation?.measuredTcp !== null
+          && runtimePresentation?.measuredTcp !== undefined && (
+          <MeasuredTcpMarker
+            presentation={runtimePresentation.measuredTcp}
+            axesSizeM={viewer?.frame_gizmo_size_m ?? 0.1}
+            ownerIdentity={sceneOwnerIdentity}
+            latestFrameAppliers={latestFrameAppliers}
+          />
+        )}
+        {candidateTcpPose !== null && (
+          <CandidateTcpGhost
+            pose={candidateTcpPose}
+            stale={candidateStale}
+            axesSizeM={viewer?.frame_gizmo_size_m ?? 0.1}
+          />
+        )}
+        {pointCloudFrame !== null && <PointCloudPoints frame={pointCloudFrame} />}
+      </Bounds>
       {viewerFrameIdentity !== undefined && (
         <BoundSnapshotResponder
           frameIdentity={viewerFrameIdentity}
@@ -1127,6 +1150,9 @@ function StructuralViewerContent({
   viewer,
 }: StructuralViewerProps) {
   const [collisionsVisible, setCollisionsVisible] = useState(false);
+  const [wireframeVisible, setWireframeVisible] = useState(
+    DEFAULT_WIREFRAME_VISIBLE,
+  );
   const [pointCloudVisible, setPointCloudVisible] = useState(false);
   const [assetError, setAssetError] = useState<Error | null>(null);
   const pointCloudEnabled = pointCloudVisible && pointCloudCellId !== undefined;
@@ -1204,6 +1230,14 @@ function StructuralViewerContent({
           <label className="toggle-control">
             <input
               type="checkbox"
+              checked={wireframeVisible}
+              onChange={(event) => setWireframeVisible(event.target.checked)}
+            />
+            <span>Wireframe overlays</span>
+          </label>
+          <label className="toggle-control">
+            <input
+              type="checkbox"
               checked={collisionsVisible}
               onChange={(event) => setCollisionsVisible(event.target.checked)}
               disabled={manifest.status !== 'ready'}
@@ -1235,6 +1269,7 @@ function StructuralViewerContent({
             key={`${manifest.status === 'ready' ? manifest.data.model_key : 'no-structural-model'}:${collisionsVisible ? 'collision' : 'visual'}:${sceneOwnerIdentity?.ownerEpoch ?? 'no-scene-owner'}:${sceneOwnerIdentity?.generation ?? -1}`}
             manifest={manifest.status === 'ready' ? manifest.data : null}
             collisionsVisible={collisionsVisible}
+            wireframeVisible={wireframeVisible}
             onAssetError={setAssetError}
             camera={camera}
             sceneObjects={sceneObjects}
@@ -1352,12 +1387,14 @@ export function StructuralViewer(props: StructuralViewerProps) {
   };
   const fallback = (
     <section className="panel viewer-panel" aria-labelledby="viewer-failure-title">
-      <div className="viewer-state error-state" role="alert">
-        <strong id="viewer-failure-title">3D viewer isolated</strong>
-        <span>
-          The viewport failed, but Program Draft and runtime controls remain usable and unchanged.
-        </span>
-        <button type="button" onClick={retry}>Retry viewer</button>
+      <div className="viewer-stage viewer-fallback-stage">
+        <div className="viewer-state error-state" role="alert">
+          <strong id="viewer-failure-title">3D viewer isolated</strong>
+          <span>
+            The viewport failed, but Program Draft and runtime controls remain usable and unchanged.
+          </span>
+          <button type="button" onClick={retry}>Retry viewer</button>
+        </div>
       </div>
     </section>
   );

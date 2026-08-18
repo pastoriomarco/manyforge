@@ -6,6 +6,7 @@
 #include <manyforge_core/ports/istop_surveillance_observation_port.hpp>
 #include <manyforge_core/runtime_participant_binding.hpp>
 #include <manyforge_core/stop_fault_recovery.hpp>
+#include <manyforge_core/time/iclock.hpp>
 #include <manyforge_core/types/resolved_stop_base_plan.hpp>
 #include <manyforge_roboplan/retained_observed_state_channel.hpp>
 #include <memory>
@@ -51,7 +52,8 @@ class RetainedStopSurveillanceOwner final
     : public core::IStopSurveillanceObservationPort {
 public:
   explicit RetainedStopSurveillanceOwner(
-      std::vector<RetainedStopSurveillanceSourceInput> sources);
+      std::vector<RetainedStopSurveillanceSourceInput> sources,
+      core::IClock *clock = nullptr);
 
   RetainedStopSurveillanceOwner(const RetainedStopSurveillanceOwner &) = delete;
   RetainedStopSurveillanceOwner &
@@ -88,6 +90,7 @@ public:
       std::int64_t assessed_at_ns) noexcept;
 
 private:
+  core::IClock *clock_{};
   mutable std::mutex mutex_;
   std::vector<RetainedStopSurveillanceSourceInput> sources_;
 };

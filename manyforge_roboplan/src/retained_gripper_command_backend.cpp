@@ -1031,6 +1031,9 @@ RetainedGripperCommandBackend::TranslateStopStage(
     return failure("resolved_stop_stage_phase_budget_expired",
                    "native gripper Stop phase has no remaining budget");
   }
+  const auto stage_deadline_ns = std::min(
+      saturating_deadline(started_at, budget.remaining_outer_duration_ns),
+      saturating_deadline(started_at, phase->remaining_deadline_offset_ns));
   if (command.containment_command.command_kind ==
       core::StopContainmentCommandKind::kControllerGoalCancel) {
     return failure("controller_goal_dispatch_membership_unavailable",
@@ -1047,9 +1050,18 @@ RetainedGripperCommandBackend::TranslateStopStage(
                    "software-hard command");
   }
 
-  const auto before =
-      state_->state_channel->current_state(state_->clock->now());
+  const auto before_now_ns = state_->clock->now();
+  if (before_now_ns >= stage_deadline_ns) {
+    return failure("stop_evidence_source_deadline_expired",
+                   "native gripper Stop ran out of its bounded state-read "
+                   "budget");
+  }
+  const auto before = state_->state_channel->current_state_bounded(
+      before_now_ns, stage_deadline_ns, cancellation);
   if (!before.ok()) {
+    if (cancellation.stop_requested()) {
+      return superseded();
+    }
     return failure("stop_evidence_source_unavailable", before.error().message);
   }
   if (cancellation.stop_requested()) {
@@ -1071,8 +1083,9 @@ RetainedGripperCommandBackend::TranslateStopStage(
   }
   std::vector<double> velocities(positions.size(), 0.0);
   const auto projection_time = state_->clock->now();
-  const auto projected = state_->state_channel->publish_state(
-      positions, velocities, projection_time, projection_time);
+  const auto projected = state_->state_channel->publish_state_bounded(
+      positions, velocities, projection_time, projection_time,
+      stage_deadline_ns, cancellation);
 
   core::ParticipantStopStageResultDTO result{
       stage,
@@ -1106,12 +1119,30 @@ RetainedGripperCommandBackend::TranslateStopStage(
   };
   if (!projected.applied()) {
     return fail_after_dispatch(
-        "stop_state_projection_failed",
-        "native gripper rest state could not be published");
+        projection_reason(projected),
+        "native gripper rest state could not be published within its "
+        "bounded Stop-stage budget");
   }
-  const auto observed =
-      state_->state_channel->current_state(state_->clock->now());
-  if (!observed.ok() || !observed.value().velocities.has_value() ||
+  if (cancellation.stop_requested()) {
+    return fail_after_dispatch(
+        "stop_state_projection_cancelled",
+        "native gripper Stop publication completed after cancellation");
+  }
+  const auto observed_now_ns = state_->clock->now();
+  if (observed_now_ns >= stage_deadline_ns) {
+    return fail_after_dispatch(
+        "stop_evidence_source_deadline_expired",
+        "native gripper rest evidence missed its bounded Stop-stage budget");
+  }
+  const auto observed = state_->state_channel->current_state_bounded(
+      observed_now_ns, stage_deadline_ns, cancellation);
+  if (!observed.ok()) {
+    return fail_after_dispatch(
+        cancellation.stop_requested() ? "stop_evidence_observation_cancelled"
+                                      : "stop_evidence_source_unavailable",
+        observed.error().message);
+  }
+  if (!observed.value().velocities.has_value() ||
       observed.value().resources != exact_resources ||
       observed.value().source_epoch != path.provider_runtime_epoch ||
       observed.value().sequence == 0U ||
