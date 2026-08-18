@@ -5020,6 +5020,38 @@ void AttachRetainedNativeCCLC(Composition &composition,
   if (composition.runtime->gripper_binding.has_value()) {
     physical_bindings.push_back(*composition.runtime->gripper_binding);
   }
+
+  // The ordinary maintained native products predate the lifecycle-qualified
+  // CCLC product and deliberately retain the generic native-control provider
+  // manifest.  They remain valid direct native runtimes, but have no lifecycle
+  // product to attach.  A lifecycle declaration is the sealed package-level
+  // opt-in; once one physical provider declares it, the product constructor
+  // below remains fail-closed for every desired domain and exact manifest.
+  std::set<std::pair<core::ProviderManifestId,
+                     core::ProviderManifestRevision>> provider_manifest_keys;
+  bool lifecycle_product_declared = false;
+  for (const auto &binding : physical_bindings) {
+    Require(binding.value().control_path.has_value(),
+            "native CCLC eligibility has no exact control path");
+    const auto &path = *binding.value().control_path;
+    const auto key = std::pair{path.provider_manifest_id,
+                               path.provider_manifest_revision};
+    if (!provider_manifest_keys.insert(key).second) {
+      continue;
+    }
+    const auto manifest = provider_manifest_source->get_verified(
+        {composition.bundle->retained_bundle_id(), path.provider_manifest_id,
+         path.provider_manifest_revision});
+    Require(manifest.has_value(),
+            "native CCLC eligibility cannot resolve the exact provider "
+            "manifest");
+    lifecycle_product_declared =
+        lifecycle_product_declared ||
+        manifest->value().lifecycle_plan_catalog.has_value();
+  }
+  if (!lifecycle_product_declared) {
+    return;
+  }
 #if defined(MANYFORGE_ROS2_CONTROL_EXECUTION_HOST)
   Require(composition.ros2_control_runtime_handle != nullptr &&
               !composition.ros2_control_binding_contract_generation_id.empty(),
