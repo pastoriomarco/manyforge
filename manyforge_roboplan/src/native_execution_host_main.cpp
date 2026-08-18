@@ -6831,7 +6831,7 @@ private:
               predecessor->projection_binding.projection_revision
                   .scene_revision) {
         return ErrorResponse(
-            "motion_preview_scene_revision_mismatch",
+            "scene_changed_during_validation",
             "motion preview does not name the pre-latch scene revision");
       }
       if (composition.runtime->planning_scene_synchronizer != nullptr) {
