@@ -299,7 +299,11 @@ def native_commands(config: NativeLauncherConfig) -> tuple[ProcessSpec, ...]:
             "--manager-state-root",
             str(config.manager_state_root),
             "--execution-state-root",
-            str(config.execution_state_root),
+            # The native profile uses Manager's managed execution host.  Its
+            # command and CCLC surfaces are intentionally published under the
+            # Manager-provided staging/runtime root, not the standalone-host
+            # execution root.
+            str(config.runtime_state_root),
             "--cell-id",
             config.cell_id,
             "--owner-id",
