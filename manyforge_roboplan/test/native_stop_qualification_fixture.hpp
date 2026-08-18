@@ -269,6 +269,17 @@ public:
     source_epoch_ = std::move(epoch);
   }
 
+  void rebind_context(const core::RuntimeParticipantBinding &binding) {
+    std::lock_guard lock(mutex_);
+    auto context = core::make_observed_state_query_context(
+        binding, context_.freshness_budget_ns);
+    if (!context.ok()) {
+      throw std::logic_error(context.error().message);
+    }
+    context_ = std::move(context.value());
+    source_epoch_ = context_.runtime_epoch;
+  }
+
   void refresh_source_on_wait(bool enabled) {
     std::lock_guard lock(mutex_);
     refresh_source_on_wait_ = enabled;

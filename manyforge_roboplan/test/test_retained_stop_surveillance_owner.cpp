@@ -235,30 +235,31 @@ TEST(RetainedStopSurveillanceOwnerTest,
 
 TEST(RetainedStopSurveillanceOwnerTest,
      RejectsFactsBeforeAChangedBindingIsPublishedToItsStateChannel) {
-  const auto observed_binding = make_binding();
-  auto retained_source_value = observed_binding.value();
-  ASSERT_TRUE(retained_source_value.control_path.has_value());
-  retained_source_value.control_path->active_control_configuration_id =
-      core::ActiveControlConfigurationId("active.reconstructed");
-  retained_source_value.control_path->provider_runtime_epoch =
-      core::RuntimeEpoch("runtime.reconstructed");
-  const auto retained_source =
-      core::verify_runtime_participant_binding(std::move(retained_source_value));
-  ASSERT_TRUE(retained_source.ok()) << retained_source.error().message;
-
-  auto channel = std::make_shared<StateChannel>(observed_binding);
+  const auto binding = make_binding();
+  auto channel = std::make_shared<StateChannel>(binding);
   const auto goal_source = [](std::int64_t) {
     return core::Result<core::ContentDigest>::Ok(
         core::ContentDigest("sha256:" + std::string(64U, 'c')));
   };
-  RetainedStopSurveillanceOwner owner({RetainedStopSurveillanceSourceInput{
-      retained_source.value(), channel, {}, goal_source}});
+  RetainedStopSurveillanceOwner owner(
+      {RetainedStopSurveillanceSourceInput{binding, channel, {}, goal_source}});
   ASSERT_TRUE(channel
                   ->publish_state({std::array<double, 2U>{0.0, 0.0}},
                                   {std::array<double, 2U>{0.0, 0.0}}, 100, 100)
                   .applied());
+  auto changed_binding_value = binding.value();
+  ASSERT_TRUE(changed_binding_value.control_path.has_value());
+  changed_binding_value.control_path->active_control_configuration_id =
+      core::ActiveControlConfigurationId("active.reconstructed");
+  changed_binding_value.control_path->provider_runtime_epoch =
+      core::RuntimeEpoch("runtime.reconstructed");
+  const auto changed_binding = core::verify_runtime_participant_binding(
+      std::move(changed_binding_value));
+  ASSERT_TRUE(changed_binding.ok()) << changed_binding.error().message;
+  channel->rebind_context(changed_binding.value());
+
   std::vector<core::ResourceId> resources;
-  for (const auto &resource : observed_binding.value().resources) {
+  for (const auto &resource : binding.value().resources) {
     resources.push_back(resource.resource_id);
   }
   std::sort(resources.begin(), resources.end());
