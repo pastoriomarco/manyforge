@@ -649,6 +649,34 @@ public:
                : nullptr;
   }
 
+  [[nodiscard]] std::optional<core::ProjectionRevisionDTO>
+  FindCurrentProjectionRevision(
+      const core::ProjectionRevisionDTO &expected,
+      const core::ProjectionNativeRuntimeBindingDTO &binding) const {
+    std::lock_guard lock(mutex_);
+    RequireLocalBinding(binding);
+    const auto found = projections_.find(Key(binding));
+    if (found == projections_.end() || found->second == nullptr ||
+        found->second->ProjectionHealth().native_runtime_binding != binding) {
+      return std::nullopt;
+    }
+    const auto inventory =
+        found->second->current_scene_snapshot_lease_inventory();
+    if (!inventory.has_value()) {
+      return std::nullopt;
+    }
+    const auto &projection =
+        inventory->projection_binding.projection_revision;
+    if (!projection.valid() ||
+        projection.retained_bundle_id != expected.retained_bundle_id ||
+        projection.graph_revision != expected.graph_revision ||
+        projection.scene_revision.scene_id != expected.scene_revision.scene_id ||
+        !found->second->ProjectionHealth().healthy_for_target(projection)) {
+      return std::nullopt;
+    }
+    return projection;
+  }
+
   void InstallActiveFrameResolverSet(
       const deployment::RetainedBundle &bundle,
       const core::ProjectionRevisionDTO &expected,
@@ -5005,8 +5033,17 @@ void AttachRetainedNativeCCLC(Composition &composition,
       active_publication.ok() && active_publication.value().valid() &&
           active_publication.value().request.candidate_retained_bundle_id ==
               composition.bundle->retained_bundle_id() &&
-          active_publication.value().request.candidate_projection_revision ==
-              composition.projection_revision,
+          active_publication.value()
+                  .request.candidate_projection_revision.retained_bundle_id ==
+              composition.projection_revision.retained_bundle_id &&
+          active_publication.value()
+                  .request.candidate_projection_revision.graph_revision ==
+              composition.projection_revision.graph_revision &&
+          active_publication.value()
+                  .request.candidate_projection_revision.scene_revision.scene_id ==
+              composition.projection_revision.scene_revision.scene_id &&
+          active_publication.value().request.candidate_graph_revision ==
+              composition.bundle->value().cell_graph.graph_revision,
       "native CCLC cannot re-read the exact active product");
 
   auto artifact_source = std::make_unique<
@@ -5256,6 +5293,21 @@ TryBuildCurrentManagedCompositionInput(
   };
   auto projection = projections.FindActiveProjection(
       receipt.request.candidate_projection_revision, joint_projection_binding);
+  auto projection_revision = receipt.request.candidate_projection_revision;
+  if (!projection) {
+    // The active publication stores a historical projection revision when only
+    // logical-scene state advanced; rebuild against the same durable binding.
+    const auto current_projection =
+        projections.FindCurrentProjectionRevision(
+            receipt.request.candidate_projection_revision,
+            joint_projection_binding);
+    if (!current_projection.has_value()) {
+      return std::nullopt;
+    }
+    projection_revision = *current_projection;
+    projection = projections.FindActiveProjection(
+        projection_revision, joint_projection_binding);
+  }
   if (projection == nullptr) {
     return std::nullopt;
   }
@@ -5275,7 +5327,7 @@ TryBuildCurrentManagedCompositionInput(
       core::RuntimeEpoch(config.runtime_epoch),
       std::move(bundle),
       std::move(*model_map),
-      receipt.request.candidate_projection_revision,
+      projection_revision,
       receipt.publication_generation,
       std::move(projection),
       std::move(collision_model),

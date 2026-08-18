@@ -11,6 +11,7 @@
 #include <filesystem>
 #include <fstream>
 #include <iterator>
+#include <optional>
 #include <manyforge_component_manager/durable_store_set.hpp>
 #include <manyforge_component_manager/manager_apply_journal.hpp>
 #include <manyforge_content_identity/content_identity.hpp>
@@ -1420,12 +1421,15 @@ TEST(ManagerDaemonProcess,
   std::string first_manager_epoch;
   std::string apply_request;
   std::string child_recovered_owner_epoch;
+  std::uint64_t advanced_scene_generation = 0U;
   {
     ManagerProcess manager(directory, package_root, fixture.admission_filename,
                            installed_manager.string());
     manager.WaitReady(directory);
     AtomicSourceSnapshotChannel manager_source(directory.publication_root(),
                                                "manager-source.json");
+    AtomicSourceSnapshotChannel scene_source(directory.publication_root(),
+                                            "logical-scene-source.json");
     const auto before = manager_source.Read();
     ASSERT_TRUE(before.has_value());
     first_manager_epoch = before->source_owner_epoch;
@@ -1454,6 +1458,35 @@ TEST(ManagerDaemonProcess,
     const auto initial = WaitForExecutionReady(
         directory, fixture.physical_candidate_retained_bundle_id);
     ASSERT_FALSE(initial.owner_epoch.empty());
+
+    const auto advanced_scene_projection = scene_source.Read();
+    ASSERT_TRUE(advanced_scene_projection.has_value());
+    const auto advanced_scene = SendCommand(
+        directory.socket_path(),
+        SceneAddRequest(*advanced_scene_projection,
+                        "manager-physical-recovery-scene.1"));
+    EXPECT_NE(advanced_scene.find("\"ok\":true"), std::string::npos)
+        << advanced_scene;
+    const auto scene_advance_deadline =
+        std::chrono::steady_clock::now() + std::chrono::seconds(5);
+    std::optional<SourceSnapshot> after_scene_advance;
+    while (std::chrono::steady_clock::now() < scene_advance_deadline &&
+           (!after_scene_advance.has_value() ||
+            after_scene_advance->source_generation <=
+                advanced_scene_projection->source_generation)) {
+      after_scene_advance = scene_source.Read();
+      if (after_scene_advance.has_value() &&
+          after_scene_advance->source_generation >
+              advanced_scene_projection->source_generation) {
+        break;
+      }
+      std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+    ASSERT_TRUE(after_scene_advance.has_value());
+    EXPECT_GT(after_scene_advance->source_generation,
+              advanced_scene_projection->source_generation);
+    advanced_scene_generation = after_scene_advance->source_generation;
+
     const auto first_child = WaitForSoleManagedChild(manager.pid());
     ASSERT_EQ(::kill(first_child, SIGKILL), 0);
 
@@ -1479,8 +1512,13 @@ TEST(ManagerDaemonProcess,
                              fixture.admission_filename,
                              installed_manager.string());
   replacement.WaitReady(directory);
+  AtomicSourceSnapshotChannel scene_source(directory.publication_root(),
+                                          "logical-scene-source.json");
   const auto recovered = WaitForExecutionReady(
       directory, fixture.physical_candidate_retained_bundle_id);
+  const auto recovered_scene = scene_source.Read();
+  ASSERT_TRUE(recovered_scene.has_value());
+  EXPECT_GE(recovered_scene->source_generation, advanced_scene_generation);
   EXPECT_NE(recovered.owner_epoch, child_recovered_owner_epoch);
   EXPECT_NE(recovered.response.find(
                 fixture.physical_candidate_retained_bundle_id),
