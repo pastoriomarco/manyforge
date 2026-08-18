@@ -13,13 +13,13 @@ executable, catalogs, and all state paths below must be on that host. Use
 absolute paths. The source must be clean: the launcher collects
 `manyforge.source_identity.v1` and rejects a dirty checkout.
 
-The O1.3 source anchor is:
+The current native launcher source anchor is:
 
 | Input | Value |
 |---|---|
-| ManyForge commit | `2e06d0d372d04efb0e421455834da8310c21aec9` |
-| ManyForge tree | `53dad33b46660d2c6542ce391aacaa9b856de88c` |
-| Source fingerprint | `2a7d0675ceb66cb28354233df523c80ffb825c9a173c1145267a38667134cd0b` |
+| ManyForge commit | `13f9131888c8f740bc172b9e89d00b308f973cec` |
+| ManyForge tree | `8556e53f72e53cc8d440e1e80cb18ebf36dd9722` |
+| Source fingerprint | `041149aa4f472e4c00ffa92db94a88249f8b7b9b416204812d391258a503f803` |
 
 The three artifact identity inputs are mandatory and must come from the
 source-matched build/package record; do not invent or reuse values:
@@ -36,24 +36,34 @@ semantics in this boundary; do not expose it beyond that trusted network.
 
 ## 2. Native topology and commands
 
-The native profile starts four owned processes on one runtime host:
-**Manager**, **Headless API**, **Program runner**, and **Composer**. Manager
-owns runtime convergence; Headless and Program runner expose owner facts and
+The operator owns four processes on one runtime host: **Manager**, **Headless
+API**, **Program runner**, and **Composer**. Manager owns runtime convergence
+and, from the exact admitted retained bundle, owns the native execution-host
+child and its private runtime channel. The operator does not fork or adopt
+that child separately. Headless and Program runner expose owner facts and
 intents; Composer is a stateless client. Composer binds `0.0.0.0:9000`;
 Headless and Program runner bind loopback only.
 
 Set these to the actual source-matched installation. Every path is required
-by `start`; the hash values must be full lowercase SHA-256 strings.
+by `start`; the hash values must be full lowercase SHA-256 strings. `MANAGER`
+must be colocated with the source-matched `manyforge_native_execution_host`
+and `manyforge_roboplan_candidate_worker` targets because Manager resolves
+those owned runtime targets from its executable directory. The admission
+filename is package-relative and selects the exact idle cell; it must exist
+under `PACKAGE_ROOT`.
 
 ```bash
 MANYFORGE_ROOT=/absolute/path/to/manyforge
 STATE_ROOT=/absolute/path/to/operator-state
 INSTANCE_ID=native
 ADVERTISED_HOST=orion-hostname-or-address
+CELL_ID=lite6_pick_place_cell
+ADMISSION_FILENAME=canonical-empty-admission.lite6_pick_place_cell.json
 MANAGER=/absolute/path/to/manyforge-manager
 PACKAGE_ROOT=/absolute/path/to/package-root
 NODE_CATALOG=/absolute/path/to/node_catalog.yaml
 ALARM_CATALOG=/absolute/path/to/alarm_catalog.yaml
+COMPOSER_STATIC_DIR=/absolute/path/to/composer-dist
 PUBLICATION_ROOT=/absolute/path/to/publication
 MANAGER_STATE=/absolute/path/to/manager-state
 RUNTIME_STATE=/absolute/path/to/runtime-state
@@ -74,6 +84,9 @@ python3 -m manyforge_operator \
   --source-root "$MANYFORGE_ROOT" --manager-executable "$MANAGER" \
   --package-root "$PACKAGE_ROOT" --node-catalog-path "$NODE_CATALOG" \
   --alarm-catalog-path "$ALARM_CATALOG" \
+  --composer-static-dir "$COMPOSER_STATIC_DIR" \
+  --canonical-empty-admission-filename "$ADMISSION_FILENAME" \
+  --cell-id "$CELL_ID" \
   --publication-root "$PUBLICATION_ROOT" \
   --manager-state-root "$MANAGER_STATE" --runtime-state-root "$RUNTIME_STATE" \
   --execution-state-root "$EXECUTION_STATE" \
@@ -83,9 +96,9 @@ python3 -m manyforge_operator \
   --compiler-build-manifest-sha256 "$COMPILER_SHA256" \
   --node-environment-sha256 "$NODE_ENV_SHA256" \
   --advertised-host "$ADVERTISED_HOST" \
-  --expected-source-fingerprint "2a7d0675ceb66cb28354233df523c80ffb825c9a173c1145267a38667134cd0b" \
-  --expected-head-commit "2e06d0d372d04efb0e421455834da8310c21aec9" \
-  --expected-head-tree "53dad33b46660d2c6542ce391aacaa9b856de88c" \
+  --expected-source-fingerprint "041149aa4f472e4c00ffa92db94a88249f8b7b9b416204812d391258a503f803" \
+  --expected-head-commit "13f9131888c8f740bc172b9e89d00b308f973cec" \
+  --expected-head-tree "8556e53f72e53cc8d440e1e80cb18ebf36dd9722" \
   --readiness-timeout-s 60 --poll-interval-s 0.25 \
   --reconciliation-period-ms 20
 ```
