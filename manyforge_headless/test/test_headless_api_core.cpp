@@ -487,6 +487,35 @@ TEST(HeadlessApiCore,
 }
 
 TEST(HeadlessApiCore,
+     IdleOperationSnapshotReconcilesOnlyImplementedAlarmDomains) {
+  TemporaryDirectory directory;
+  PublishHealthySources(directory, "open");
+  HeadlessApiCore core(Config(directory, "api.epoch.1"), Clocks());
+
+  static_cast<void>(core.RuntimeSnapshot());
+  static_cast<void>(core.CompleteOperationEventSnapshot(
+      "execution-host.epoch.idle", 0U));
+
+  const auto alarms = core.AlarmSnapshot();
+  EXPECT_TRUE(Array(alarms, "alarms").empty());
+  EXPECT_TRUE(std::get<bool>(Member(alarms, "reconciled").storage()));
+  const auto &domains = Array(alarms, "domains");
+  ASSERT_EQ(domains.size(), 2U);
+  const auto motion = std::find_if(
+      domains.begin(), domains.end(),
+      [](const auto &domain) { return Text(domain, "domain") == "motion"; });
+  ASSERT_NE(motion, domains.end());
+  EXPECT_TRUE(std::get<bool>(Member(*motion, "reconciled").storage()));
+  const auto runtime_health = std::find_if(
+      domains.begin(), domains.end(), [](const auto &domain) {
+        return Text(domain, "domain") == "runtime_health";
+      });
+  ASSERT_NE(runtime_health, domains.end());
+  EXPECT_TRUE(
+      std::get<bool>(Member(*runtime_health, "reconciled").storage()));
+}
+
+TEST(HeadlessApiCore,
      RejectsAnOverlappingAlarmOwnerAndAllowsOrderlyReplacement) {
   TemporaryDirectory directory;
   HeadlessApiCore owner(Config(directory, "api.epoch.1"), Clocks());

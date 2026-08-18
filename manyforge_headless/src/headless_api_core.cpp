@@ -433,7 +433,12 @@ HeadlessApiCore::HeadlessApiCore(HeadlessApiCoreConfig config,
       alarm_owner_(OperatorAlarmCatalog::Load(config_.alarm_catalog_path),
                    config_.cell_id, config_.resource_ids,
                    config_.owner_id + ".alarm", config_.owner_epoch,
-                   clocks_.monotonic_time_ns, clocks_.wall_time_text),
+                   clocks_.monotonic_time_ns, clocks_.wall_time_text,
+                   // Headless currently owns operation and runtime-health
+                   // alarm adapters.  Scene-initialization faults use the
+                   // runtime-health adapter; no independent scene-domain
+                   // producer exists on this boundary.
+                   {"motion", "runtime_health"}),
       runtime_health_adapter_{
           config_.owner_id + ".runtime-health-adapter",
           "runtime_health",
