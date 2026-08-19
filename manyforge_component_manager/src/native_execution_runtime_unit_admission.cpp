@@ -4,6 +4,8 @@
 #include <manyforge_deployment/artifact_codec.hpp>
 #include <manyforge_deployment/native_execution_runtime_contract.hpp>
 #include <manyforge_deployment/ros2_control_execution_runtime_contract.hpp>
+#include <manyforge_deployment/runtime_contract_registry.hpp>
+#include <manyforge_core/runtime_contract_manifest_codec.hpp>
 #include <string>
 #include <utility>
 
@@ -18,9 +20,9 @@ namespace ros2_control_contract =
 constexpr std::string_view kLaunchApiVersion =
     "manyforge.installed_target_launch.v1";
 constexpr std::string_view kReadyApiVersion =
-    "manyforge.native-execution-ready.v1";
+    "manyforge.native-execution-ready.v2";
 constexpr std::string_view kStatusApiVersion =
-    "manyforge.native-execution-status.v1";
+    "manyforge.native-execution-status.v2";
 
 [[noreturn]] void Fail(const std::string &detail) {
   throw NativeExecutionRuntimeUnitAdmissionError(detail);
@@ -71,7 +73,24 @@ struct RuntimeContractFacts final {
   std::string_view status_endpoint_contract_id;
   std::string_view process_adapter_contract_id;
   std::string_view retrieval_contract_id;
+  std::string_view runtime_contract_offer_digest;
 };
+
+[[nodiscard]] std::string_view OfferDigestForFamily(
+    const std::string_view implementation_id) {
+  const auto &offers =
+      manyforge::deployment::build_qualified_runtime_contract_registry()
+          .package_manifest_set()
+          .offers;
+  const auto found = std::find_if(
+      offers.begin(), offers.end(), [&](const auto &offer) {
+        return offer.runtime_implementation_id.value() == implementation_id;
+      });
+  if (found == offers.end()) {
+    Fail("execution runtime has no build-qualified contract offer");
+  }
+  return found->offer_digest.value();
+}
 
 [[nodiscard]] RuntimeContractFacts
 RequireRuntimeContract(const std::string_view product_contract_id) {
@@ -85,7 +104,8 @@ RequireRuntimeContract(const std::string_view product_contract_id) {
             native_contract::kStatusEndpointRoleId,
             native_contract::kStatusEndpointContractId,
             native_contract::kProcessAdapterContractId,
-            native_contract::kRetrievalContractId};
+            native_contract::kRetrievalContractId,
+            OfferDigestForFamily(native_contract::kImplementationId)};
   }
   if (product_contract_id == ros2_control_contract::kProductContractId) {
     return {ros2_control_contract::kProductContractId,
@@ -97,7 +117,8 @@ RequireRuntimeContract(const std::string_view product_contract_id) {
             ros2_control_contract::kStatusEndpointRoleId,
             ros2_control_contract::kStatusEndpointContractId,
             ros2_control_contract::kProcessAdapterContractId,
-            ros2_control_contract::kRetrievalContractId};
+            ros2_control_contract::kRetrievalContractId,
+            OfferDigestForFamily(ros2_control_contract::kImplementationId)};
   }
   Fail("execution admission received an unsupported runtime product");
 }
@@ -162,7 +183,7 @@ std::string NativeExecutionRuntimeUnitAdmission::expected_ready_packet(
   }
   return std::string(kReadyApiVersion) + " " +
          product_.runtime_unit_id().value() + " " + runtime_epoch.value() +
-         " " + implementation_revision_ + " " +
+         " " + runtime_contract_offer_digest_ + " " +
          product_.product_identity().value() + " " +
          product_.configuration_identity().value();
 }
@@ -176,7 +197,8 @@ std::string NativeExecutionRuntimeUnitAdmission::expected_status_packet(
   return std::string(kStatusApiVersion) + " " +
          product_.runtime_unit_id().value() + " " + runtime_epoch.value() +
          " " + std::to_string(source_report_sequence) + " 1 serving healthy " +
-         implementation_revision_ + " " + product_.product_identity().value() +
+         runtime_contract_offer_digest_ + " " +
+         product_.product_identity().value() +
          " " + product_.configuration_identity().value() + " " +
          std::string(product_.runtime_role_id()) +
          " closed_no_active_effect";
@@ -212,6 +234,35 @@ VerifyNativeExecutionRuntimeUnitForHost(
   }
   const RuntimeContractFacts contract =
       RequireRuntimeContract(product->product_contract_id().value());
+  const auto runtime_unit = std::find_if(
+      bundle.value().cell_graph.runtime_units.begin(),
+      bundle.value().cell_graph.runtime_units.end(),
+      [&](const auto &candidate) {
+        return candidate.runtime_unit_id == runtime_unit_id;
+      });
+  const auto requirement = std::find_if(
+      bundle.value().runtime_contract_requirements.begin(),
+      bundle.value().runtime_contract_requirements.end(),
+      [&](const auto &candidate) {
+        return candidate.runtime_unit_id == runtime_unit_id;
+      });
+  const auto *qualified =
+      runtime_unit == bundle.value().cell_graph.runtime_units.end()
+          ? nullptr
+          : manyforge::deployment::build_qualified_runtime_contract_registry()
+                .find(runtime_unit->runtime_profile_id,
+                      runtime_unit->runtime_profile_revision,
+                      product->product_contract_id(),
+                      product->product_contract_revision());
+  if (qualified == nullptr ||
+      requirement == bundle.value().runtime_contract_requirements.end() ||
+      qualified->offer().offer_digest.value() !=
+          contract.runtime_contract_offer_digest ||
+      !manyforge::core::CheckRuntimeContractCompatibility(
+           qualified->offer(), requirement->requirement)
+           .ok()) {
+    Fail("execution runtime contract admission is not qualified");
+  }
   const bool launch_environment_matches = std::find(
       launch_environment_contracts.begin(), launch_environment_contracts.end(),
       product->launch_environment_contract()) !=
@@ -236,7 +287,8 @@ VerifyNativeExecutionRuntimeUnitForHost(
   return NativeExecutionRuntimeUnitAdmission(
       std::move(*product), std::move(descriptor.implementation_revision),
       std::move(descriptor.installed_target_id),
-      std::string(contract.candidate_worker_installed_target_id));
+      std::string(contract.candidate_worker_installed_target_id),
+      std::string(contract.runtime_contract_offer_digest));
 }
 
 } // namespace manyforge::component_manager

@@ -1,6 +1,7 @@
 #include <gtest/gtest.h>
 
 #include <manyforge_component_manager/manager_active_runtime_coordinator.hpp>
+#include <manyforge_core/runtime_contract_manifest_codec.hpp>
 
 #include <map>
 #include <optional>
@@ -23,6 +24,11 @@ constexpr std::string_view kDigestThree =
 [[nodiscard]] RuntimeUnitConvergencePlanRowDTO
 ManagedRow(const std::string &runtime_unit_id,
            std::vector<RuntimeUnitId> dependencies = {}) {
+  const auto requirement = MakeRuntimeContractRequirement(
+      RuntimeImplementationFamilyId("runtime-family"), {}, {});
+  if (!requirement.ok()) {
+    throw std::runtime_error("active runtime test requirement is invalid");
+  }
   return {
       RuntimeUnitId(runtime_unit_id),
       RuntimeProfileId("profile.reference"),
@@ -48,6 +54,8 @@ ManagedRow(const std::string &runtime_unit_id,
       1U,
       "linux",
       "posix.1-2017",
+      requirement.value(),
+      RuntimeContractOfferDigest(std::string(kDigestOne)),
   };
 }
 
@@ -193,7 +201,8 @@ public:
         id, found->second, sequence, 1U, RuntimeSourcePhase::kServing,
         RuntimeSourceHealth::kHealthy, query.plan.product_identity.value(),
         query.plan.configuration_identity.value(), std::move(roles),
-        ManagedCommandSurfaceState::kClosedNoActiveEffect);
+        ManagedCommandSurfaceState::kClosedNoActiveEffect, {},
+        query.plan.runtime_contract_offer_digest.value());
   }
 
   std::vector<std::string> events;

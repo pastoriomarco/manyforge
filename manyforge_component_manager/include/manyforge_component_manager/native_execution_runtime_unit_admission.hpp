@@ -45,6 +45,10 @@ public:
   [[nodiscard]] const std::string &implementation_revision() const noexcept {
     return implementation_revision_;
   }
+  [[nodiscard]] const std::string&
+  runtime_contract_offer_digest() const noexcept {
+    return runtime_contract_offer_digest_;
+  }
   [[nodiscard]] const std::string &installed_target_id() const noexcept {
     return installed_target_id_;
   }
@@ -66,17 +70,21 @@ private:
   NativeExecutionRuntimeUnitAdmission(
       manyforge::deployment::VerifiedRetainedRuntimeUnitProduct product,
       std::string implementation_revision, std::string installed_target_id,
-      std::string candidate_worker_installed_target_id)
+      std::string candidate_worker_installed_target_id,
+      std::string runtime_contract_offer_digest)
       : product_(std::move(product)),
         implementation_revision_(std::move(implementation_revision)),
         installed_target_id_(std::move(installed_target_id)),
         candidate_worker_installed_target_id_(
-            std::move(candidate_worker_installed_target_id)) {}
+            std::move(candidate_worker_installed_target_id)),
+        runtime_contract_offer_digest_(
+            std::move(runtime_contract_offer_digest)) {}
 
   manyforge::deployment::VerifiedRetainedRuntimeUnitProduct product_;
   std::string implementation_revision_;
   std::string installed_target_id_;
   std::string candidate_worker_installed_target_id_;
+  std::string runtime_contract_offer_digest_;
 
   friend std::optional<NativeExecutionRuntimeUnitAdmission>
   VerifyNativeExecutionRuntimeUnitForHost(

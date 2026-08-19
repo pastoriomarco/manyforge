@@ -5,6 +5,7 @@
 #include <unistd.h>
 
 #include <atomic>
+#include <algorithm>
 #include <cerrno>
 #include <chrono>
 #include <cstdint>
@@ -16,6 +17,7 @@
 #include <manyforge_component_manager/retained_posix_runtime_unit_adapter.hpp>
 #include <manyforge_deployment/build_manifest.hpp>
 #include <manyforge_deployment/retained_bundle.hpp>
+#include <manyforge_deployment/runtime_contract_registry.hpp>
 #include <memory>
 #include <optional>
 #include <stdexcept>
@@ -106,6 +108,20 @@ Query(const RuntimePackage &package) {
   if (!admission.has_value()) {
     throw std::runtime_error("retained POSIX adapter fixture has no admission");
   }
+  const auto requirement = std::find_if(
+      package.bundle->value().runtime_contract_requirements.begin(),
+      package.bundle->value().runtime_contract_requirements.end(),
+      [&](const auto &candidate) {
+        return candidate.runtime_unit_id == unit.runtime_unit_id;
+      });
+  const auto *qualified =
+      deployment::build_qualified_runtime_contract_registry().find(
+          unit.runtime_profile_id, unit.runtime_profile_revision,
+          admission->product_contract_id(), admission->product_contract_revision());
+  if (requirement == package.bundle->value().runtime_contract_requirements.end() ||
+      qualified == nullptr) {
+    throw std::runtime_error("retained POSIX fixture has no contract admission");
+  }
   RuntimeUnitConvergencePlanRowDTO plan{
       unit.runtime_unit_id,
       unit.runtime_profile_id,
@@ -131,6 +147,8 @@ Query(const RuntimePackage &package) {
       static_cast<std::uint64_t>(admission->launchable_bytes().size()),
       admission->operating_system(),
       admission->shell_contract(),
+      requirement->requirement,
+      qualified->offer().offer_digest,
   };
   RuntimeUnitConvergenceQueryDTO query{
       ApplyId("apply-1"),
@@ -277,6 +295,8 @@ TEST(RetainedPosixRuntimeUnitAdapter,
   EXPECT_EQ(initial->product_identity(), query.plan.product_identity.value());
   EXPECT_EQ(initial->configuration_identity(),
             query.plan.configuration_identity.value());
+  EXPECT_EQ(initial->offered_runtime_contract_offer_digest(),
+            query.plan.runtime_contract_offer_digest.value());
   EXPECT_EQ(initial->ready_runtime_role_ids(),
             (std::vector<std::string>{"manager_fixture"}));
   EXPECT_EQ(initial->command_surface_state(),

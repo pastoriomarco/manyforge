@@ -4,6 +4,7 @@
 #include <cstdint>
 #include <manyforge_component_manager/runtime_observation.hpp>
 #include <manyforge_core/types/active_bundle_publication.hpp>
+#include <manyforge_core/types/runtime_contract_manifest.hpp>
 #include <manyforge_core/types/retained_product.hpp>
 #include <manyforge_core/types/runtime_profile.hpp>
 #include <optional>
@@ -53,6 +54,10 @@ struct RuntimeUnitConvergencePlanRowDTO final {
   std::uint64_t launchable_byte_size;
   std::string operating_system;
   std::string shell_contract;
+  manyforge::core::RuntimeContractRequirementDTO
+      runtime_contract_requirement;
+  manyforge::core::RuntimeContractOfferDigest
+      runtime_contract_offer_digest;
 
   [[nodiscard]] bool valid() const noexcept;
 
@@ -223,6 +228,8 @@ struct RuntimeUnitStagedReadyEvidenceDTO final {
   std::uint64_t presence_age_ns;
   std::uint64_t report_age_ns;
   std::uint64_t progress_age_ns;
+  manyforge::core::RuntimeContractOfferDigest
+      observed_runtime_contract_offer_digest;
 
   [[nodiscard]] bool valid() const noexcept;
 

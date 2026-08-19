@@ -220,8 +220,15 @@ std::string reference_runtime_profile_revision() {
                         "reference_runtime_profile");
 }
 
-std::string_view reference_runtime_launchable_script() noexcept {
-  return "#!/bin/sh\n"
+const std::string& reference_runtime_launchable_script() {
+  static const std::string script = [] {
+    const auto& runtime_contract = require_runtime_contract(
+        core::RuntimeProfileId(std::string(kReferenceRuntimeProfileId)),
+        core::RuntimeProfileRevision(reference_runtime_profile_revision()),
+        core::ProductContractId(
+            std::string(kReferenceRuntimeProductContractId)),
+        reference_runtime_product_contract_revision());
+    return std::string("#!/bin/sh\n") +
          "set -eu\n"
          "if [ \"$#\" -ne 8 ] || "
          "[ \"$1\" != \"--runtime-unit-id\" ] || "
@@ -234,13 +241,16 @@ std::string_view reference_runtime_launchable_script() noexcept {
          "runtime_epoch=$4\n"
          "product_identity=$6\n"
          "configuration_identity=$8\n"
+         "runtime_contract_offer_digest='" +
+         runtime_contract.offer().offer_digest.value() + "'\n" +
          "source_report_sequence=0\n"
          "emit_status() {\n"
          "  source_report_sequence=$((source_report_sequence + 1))\n"
-         "  printf '%s\\n' \"manyforge.reference-runtime-status.v1 "
+         "  printf '%s\\n' \"manyforge.reference-runtime-status.v2 "
          "$runtime_unit_id $runtime_epoch $source_report_sequence 1 serving "
          "healthy "
-         "$product_identity $configuration_identity manager_fixture "
+         "$runtime_contract_offer_digest $product_identity "
+         "$configuration_identity manager_fixture "
          "closed_no_active_effect\"\n"
          "}\n"
          "emit_status\n"
@@ -252,19 +262,22 @@ std::string_view reference_runtime_launchable_script() noexcept {
          "  esac\n"
          "done\n"
          "exit 0\n";
+  }();
+  return script;
 }
 
 std::string reference_runtime_implementation_revision() {
   return contract_revision(
       "runtime-implementation",
-      "reference_process_lifecycle;role=manager_fixture;status=stdout-v1");
+      "reference_process_lifecycle;role=manager_fixture;status=stdout-v2;"
+      "embedded-runtime-contract-offer-digest");
 }
 
 std::string reference_runtime_process_adapter_revision() {
   return contract_revision(
       "process-adapter",
       "manager_managed;posix-sh;retained-script;fixed-argv;adapter-epoch;"
-      "stdin-status-shutdown");
+      "embedded-runtime-contract-offer-digest;stdin-status-shutdown");
 }
 
 std::string reference_runtime_retrieval_contract_revision() {
@@ -276,9 +289,10 @@ std::string reference_runtime_retrieval_contract_revision() {
 std::string reference_runtime_status_endpoint_revision() {
   return contract_revision(
       "status-endpoint",
-      "stdout-line;reference-runtime-status-v1;runtime-unit-id;runtime-epoch;"
+      "stdout-line;reference-runtime-status-v2;runtime-unit-id;runtime-epoch;"
       "source-sequence;critical-sequence;phase;health;product-identity;"
-      "configuration-identity;runtime-role;command-surface");
+      "configuration-identity;runtime-role;command-surface;"
+      "runtime-contract-offer-digest");
 }
 
 std::string

@@ -24,6 +24,7 @@
 #include <vector>
 
 #include "manyforge_component_manager/manager_apply_journal.hpp"
+#include <manyforge_core/runtime_contract_manifest_codec.hpp>
 
 namespace manyforge::component_manager {
 namespace {
@@ -254,6 +255,11 @@ AcceptedFence(core::RequestReplayStatusDTO replay_status =
 }
 
 RuntimeUnitConvergencePlanRowDTO RuntimePlanRow() {
+  const auto requirement = core::MakeRuntimeContractRequirement(
+      core::RuntimeImplementationFamilyId("runtime-family"), {}, {});
+  if (!requirement.ok()) {
+    throw std::runtime_error("test runtime requirement is invalid");
+  }
   return {
       RuntimeUnitId("runtime-1"),
       RuntimeProfileId("profile-1"),
@@ -268,7 +274,7 @@ RuntimeUnitConvergencePlanRowDTO RuntimePlanRow() {
       {},
       {RuntimeRoleId("runtime.role.reference")},
       EndpointRoleId("runtime.status"),
-      "manyforge.reference-runtime-status.v1",
+      "manyforge.reference-runtime-status.v2",
       "1",
       "stdout_line",
       "manyforge.process-adapter.posix-shell.v1",
@@ -279,6 +285,8 @@ RuntimeUnitConvergencePlanRowDTO RuntimePlanRow() {
       128U,
       "linux",
       "posix-sh",
+      requirement.value(),
+      core::RuntimeContractOfferDigest(std::string(kDigestOne)),
   };
 }
 
@@ -322,6 +330,7 @@ RuntimeStagedReady(const ContentDigest &convergence_digest,
         generation,
         generation + 1U,
         generation + 2U,
+        core::RuntimeContractOfferDigest(std::string(kDigestOne)),
     });
   }
   return {

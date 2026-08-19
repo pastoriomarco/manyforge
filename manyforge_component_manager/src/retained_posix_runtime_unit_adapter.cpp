@@ -24,6 +24,8 @@
 #include <fstream>
 #include <limits>
 #include <manyforge_component_manager/reference_runtime_unit_admission.hpp>
+#include <manyforge_core/runtime_contract_manifest_codec.hpp>
+#include <manyforge_deployment/runtime_contract_registry.hpp>
 #include <manyforge_deployment/verified_retained_bundle.hpp>
 #include <map>
 #include <mutex>
@@ -892,6 +894,16 @@ void VerifyAdmissionMatchesQuery(const ReferenceRuntimeUnitAdmission &admission,
                                  const RuntimeUnitConvergenceQueryDTO &query) {
   const auto &plan = query.plan;
   const auto &runtime_unit = FindRuntimeUnit(bundle, plan.runtime_unit_id);
+  const auto requirement = std::find_if(
+      bundle.value().runtime_contract_requirements.begin(),
+      bundle.value().runtime_contract_requirements.end(),
+      [&](const auto &candidate) {
+        return candidate.runtime_unit_id == plan.runtime_unit_id;
+      });
+  const auto *contract =
+      manyforge::deployment::build_qualified_runtime_contract_registry().find(
+          runtime_unit.runtime_profile_id, runtime_unit.runtime_profile_revision,
+          plan.product_contract_id, plan.product_contract_revision);
   std::vector<manyforge::core::RuntimeRoleId> roles{
       manyforge::core::RuntimeRoleId(admission.runtime_role_id())};
   if (bundle.retained_bundle_id() != query.candidate_retained_bundle_id ||
@@ -926,6 +938,14 @@ void VerifyAdmissionMatchesQuery(const ReferenceRuntimeUnitAdmission &admission,
       admission.retrieval_contract_id() != plan.retrieval_contract_id ||
       admission.retrieval_contract_revision() !=
           plan.retrieval_contract_revision ||
+      (!plan.runtime_contract_offer_digest.empty() &&
+       (requirement == bundle.value().runtime_contract_requirements.end() ||
+        plan.runtime_contract_requirement != requirement->requirement ||
+        contract == nullptr ||
+        plan.runtime_contract_offer_digest != contract->offer().offer_digest ||
+        !manyforge::core::CheckRuntimeContractCompatibility(
+             contract->offer(), requirement->requirement)
+             .ok())) ||
       !plan.launchable_content_digest.has_value() ||
       admission.launchable_content_digest() !=
           plan.launchable_content_digest->value() ||
@@ -1271,7 +1291,7 @@ SourceSequenceFromStatusLine(const std::string &line,
   while (stream >> field) {
     fields.push_back(std::move(field));
   }
-  if (fields.size() != 11U) {
+  if (fields.size() != 12U) {
     Fail("retained runtime emitted a malformed status field count");
   }
   const auto sequence =
@@ -1648,7 +1668,8 @@ struct RetainedPosixRuntimeUnitAdapter::Impl final {
         query.plan.product_identity.value(),
         query.plan.configuration_identity.value(),
         {admission.runtime_role_id()},
-        ManagedCommandSurfaceState::kClosedNoActiveEffect);
+        ManagedCommandSurfaceState::kClosedNoActiveEffect, {},
+        admission.runtime_contract_offer_digest());
   }
 
   std::filesystem::path root_path;

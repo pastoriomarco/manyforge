@@ -380,6 +380,12 @@ void VerifyAdmissionMatchesQuery(
   const auto &product = admission.product();
   const auto &plan = query.plan;
   const auto &runtime_unit = FindRuntimeUnit(bundle, plan.runtime_unit_id);
+  const auto requirement = std::find_if(
+      bundle.value().runtime_contract_requirements.begin(),
+      bundle.value().runtime_contract_requirements.end(),
+      [&](const auto &candidate) {
+        return candidate.runtime_unit_id == plan.runtime_unit_id;
+      });
   const std::vector<manyforge::core::RuntimeRoleId> roles{
       manyforge::core::RuntimeRoleId(std::string(product.runtime_role_id()))};
   if (bundle.retained_bundle_id() != query.candidate_retained_bundle_id ||
@@ -413,6 +419,12 @@ void VerifyAdmissionMatchesQuery(
       product.retrieval_contract_id() != plan.retrieval_contract_id ||
       product.retrieval_contract_revision() !=
           plan.retrieval_contract_revision ||
+      (!plan.runtime_contract_offer_digest.empty() &&
+       (requirement == bundle.value().runtime_contract_requirements.end() ||
+        plan.runtime_contract_requirement != requirement->requirement)) ||
+      (!plan.runtime_contract_offer_digest.empty() &&
+       admission.runtime_contract_offer_digest() !=
+           plan.runtime_contract_offer_digest.value()) ||
       !plan.launchable_content_digest.has_value() ||
       product.launchable_artifact_ref().content_digest !=
           *plan.launchable_content_digest ||
@@ -429,11 +441,12 @@ void VerifyAdmissionMatchesQuery(
 SameChildProduct(const NativeExecutionRuntimeUnitAdmission &admission,
                  const std::string &product_identity,
                  const std::string &configuration_identity,
-                 const std::string &implementation_revision) {
+                 const std::string &runtime_contract_offer_digest) {
   return admission.product().product_identity().value() == product_identity &&
          admission.product().configuration_identity().value() ==
              configuration_identity &&
-         admission.implementation_revision() == implementation_revision;
+         admission.runtime_contract_offer_digest() ==
+             runtime_contract_offer_digest;
 }
 
 [[noreturn]] void ChildExit(const int error_fd, const int error) noexcept {
@@ -571,7 +584,7 @@ struct RetainedNativeRuntimeUnitAdapter::Impl final
     UniqueFd channel;
     std::string product_identity;
     std::string configuration_identity;
-    std::string implementation_revision;
+    std::string runtime_contract_offer_digest;
     std::set<ProjectionBindingKey> admitted_projection_bindings;
     std::map<ProjectionBindingKey, ProjectionPreparation>
         prepared_projection_products;
@@ -579,13 +592,14 @@ struct RetainedNativeRuntimeUnitAdapter::Impl final
     Child(pid_t child_pid, RuntimeEpoch child_epoch, UniqueFd child_channel,
           std::string selected_product_identity,
           std::string selected_configuration_identity,
-          std::string selected_implementation_revision,
+          std::string selected_runtime_contract_offer_digest,
           std::set<ProjectionBindingKey> selected_projection_bindings)
         : pid(child_pid), runtime_epoch(std::move(child_epoch)),
           channel(std::move(child_channel)),
           product_identity(std::move(selected_product_identity)),
           configuration_identity(std::move(selected_configuration_identity)),
-          implementation_revision(std::move(selected_implementation_revision)),
+          runtime_contract_offer_digest(
+              std::move(selected_runtime_contract_offer_digest)),
           admitted_projection_bindings(
               std::move(selected_projection_bindings)) {}
 
@@ -1101,7 +1115,7 @@ struct RetainedNativeRuntimeUnitAdapter::Impl final
     Child child(pid, runtime_epoch, std::move(channels[0]),
                 admission.product().product_identity().value(),
                 admission.product().configuration_identity().value(),
-                admission.implementation_revision(), {});
+                admission.runtime_contract_offer_digest(), {});
     try {
       PrepareChildProjectionBindings(child, bundle,
                                      admission.product().runtime_unit_id());
@@ -1123,7 +1137,7 @@ struct RetainedNativeRuntimeUnitAdapter::Impl final
     }
     if (!SameChildProduct(admission, found->second.product_identity,
                           found->second.configuration_identity,
-                          found->second.implementation_revision)) {
+                          found->second.runtime_contract_offer_digest)) {
       if (ChildIsLive(found->second)) {
         Fail("live native runtime child differs from the selected product");
       }
@@ -1147,7 +1161,7 @@ struct RetainedNativeRuntimeUnitAdapter::Impl final
     if (found != children.end()) {
       if (!SameChildProduct(admission, found->second.product_identity,
                             found->second.configuration_identity,
-                            found->second.implementation_revision)) {
+                            found->second.runtime_contract_offer_digest)) {
         if (ChildIsLive(found->second)) {
           Fail("cannot replace a live native child with another product");
         }
@@ -1181,7 +1195,7 @@ struct RetainedNativeRuntimeUnitAdapter::Impl final
     }
     if (!SameChildProduct(admission, found->second.product_identity,
                           found->second.configuration_identity,
-                          found->second.implementation_revision)) {
+                          found->second.runtime_contract_offer_digest)) {
       Fail("native runtime stop query differs from the tracked child");
     }
     StopChild(found->second);
@@ -1205,7 +1219,7 @@ struct RetainedNativeRuntimeUnitAdapter::Impl final
     }
     if (!SameChildProduct(admission, found->second.product_identity,
                           found->second.configuration_identity,
-                          found->second.implementation_revision)) {
+                          found->second.runtime_contract_offer_digest)) {
       Fail("native runtime progress query differs from the tracked child");
     }
     if (!ChildIsLive(found->second)) {
@@ -1240,7 +1254,8 @@ struct RetainedNativeRuntimeUnitAdapter::Impl final
         query.plan.configuration_identity.value(),
         std::vector<std::string>{
             std::string(admission.product().runtime_role_id())},
-        ManagedCommandSurfaceState::kClosedNoActiveEffect);
+        ManagedCommandSurfaceState::kClosedNoActiveEffect, {},
+        admission.runtime_contract_offer_digest());
   }
 
   [[nodiscard]] manyforge::core::Result<

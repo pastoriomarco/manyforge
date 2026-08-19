@@ -41,6 +41,7 @@
 #include <manyforge_deployment/program_binding_compiler.hpp>
 #include <manyforge_deployment/program_contract.hpp>
 #include <manyforge_deployment/retained_runtime_policy.hpp>
+#include <manyforge_deployment/runtime_contract_registry.hpp>
 #include <manyforge_deployment/runtime_program_binding.hpp>
 #include <manyforge_deployment/verified_retained_bundle.hpp>
 #include <manyforge_roboplan/process_contained_candidate_client.hpp>
@@ -130,14 +131,28 @@ constexpr std::size_t kPlanningSceneSynchronizationAttempts = 32U;
 constexpr auto kPlanningSceneSynchronizationRetryDelay =
     std::chrono::milliseconds(10);
 
-[[nodiscard]] std::string SelectedExecutionImplementationRevision() {
+[[nodiscard]] std::string SelectedExecutionOfferDigest() {
 #if defined(MANYFORGE_ROS2_CONTROL_EXECUTION_HOST)
-  return deployment::ros2_control_execution_runtime_contract::
-      implementation_revision();
+  constexpr auto family =
+      deployment::ros2_control_execution_runtime_contract::
+          kImplementationId;
 #else
-  return deployment::native_execution_runtime_contract::
-      implementation_revision();
+  constexpr auto family =
+      deployment::native_execution_runtime_contract::kImplementationId;
 #endif
+  const auto &offers =
+      deployment::build_qualified_runtime_contract_registry()
+          .package_manifest_set()
+          .offers;
+  const auto found = std::find_if(
+      offers.begin(), offers.end(), [&](const auto &offer) {
+        return offer.runtime_implementation_id.value() == family;
+      });
+  if (found == offers.end()) {
+    throw std::runtime_error(
+        "selected execution host has no qualified runtime offer");
+  }
+  return found->offer_digest.value();
 }
 
 [[nodiscard]] constexpr std::string_view SelectedExecutionRuntimeRole() {
@@ -5546,10 +5561,10 @@ LoadExactManagedCandidateBundle(
 
 [[nodiscard]] int
 RunManagedRuntimeChild(const ManagedRuntimeChildConfig &config) {
-  const auto implementation_revision = SelectedExecutionImplementationRevision();
+  const auto offer_digest = SelectedExecutionOfferDigest();
   const std::string ready_packet =
-      "manyforge.native-execution-ready.v1 " + config.runtime_unit_id + " " +
-      config.runtime_epoch + " " + implementation_revision + " " +
+      "manyforge.native-execution-ready.v2 " + config.runtime_unit_id + " " +
+      config.runtime_epoch + " " + offer_digest + " " +
       config.product_identity + " " + config.configuration_identity;
   std::uint64_t source_report_sequence = 0U;
   ManagedKernelAdmissionGate admission_gate;
@@ -6079,10 +6094,10 @@ RunManagedRuntimeChild(const ManagedRuntimeChildConfig &config) {
       ++source_report_sequence;
       SendManagedRuntimePacket(
           config.manager_channel_fd,
-          "manyforge.native-execution-status.v1 " + config.runtime_unit_id +
+          "manyforge.native-execution-status.v2 " + config.runtime_unit_id +
               " " + config.runtime_epoch + " " +
               std::to_string(source_report_sequence) + " 1 serving healthy " +
-              implementation_revision + " " + config.product_identity + " " +
+              offer_digest + " " + config.product_identity + " " +
               config.configuration_identity +
               " " + std::string(SelectedExecutionRuntimeRole()) +
               " closed_no_active_effect");

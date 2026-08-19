@@ -83,7 +83,8 @@ require_configuration(const RetainedBundle &retained_bundle,
                       const core::RuntimeUnitId &runtime_unit_id);
 
 /// Revision embedded independently in the retained descriptor and installed
-/// host. A Manager child handshake must match this build-owned value.
+/// host for installed-target integrity and provenance. Runtime compatibility
+/// and child status correlation use the build-qualified contract offer.
 [[nodiscard]] std::string implementation_revision();
 
 } // namespace manyforge::deployment::native_execution_runtime_contract

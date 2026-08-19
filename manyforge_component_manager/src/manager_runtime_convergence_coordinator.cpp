@@ -2,6 +2,8 @@
 
 #include <algorithm>
 #include <exception>
+#include <manyforge_core/runtime_contract_manifest_codec.hpp>
+#include <manyforge_deployment/runtime_contract_registry.hpp>
 #include <map>
 #include <set>
 #include <utility>
@@ -80,6 +82,8 @@ void VerifyApplyInputs(const ManagerApplyIntentDTO &apply_intent,
 [[nodiscard]] RuntimeUnitConvergencePlanRowDTO MakeVerifiedPlanRow(
     const manyforge::core::RuntimeUnitDTO &runtime_unit,
     const manyforge::deployment::VerifiedRetainedRuntimeUnitProduct &product,
+    const manyforge::core::RuntimeContractRequirementDTO &requirement,
+    const manyforge::core::RuntimeContractOfferDigest &offer_digest,
     const RuntimeUnitCandidateDisposition disposition) {
   RuntimeUnitConvergencePlanRowDTO row{
       runtime_unit.runtime_unit_id,
@@ -107,6 +111,8 @@ void VerifyApplyInputs(const ManagerApplyIntentDTO &apply_intent,
       product.launchable_artifact_ref().byte_size,
       std::string(product.operating_system()),
       std::string(product.launch_environment_contract()),
+      requirement,
+      offer_digest,
   };
   if (!row.valid()) {
     Fail("verified runtime product produced an invalid convergence row");
@@ -140,8 +146,39 @@ VerifyRuntimeProducts(
            "environment: " +
            runtime_unit.runtime_unit_id.value());
     }
+    const auto requirement_row = std::find_if(
+        bundle.value().runtime_contract_requirements.begin(),
+        bundle.value().runtime_contract_requirements.end(),
+        [&](const auto &candidate) {
+          return candidate.runtime_unit_id == runtime_unit.runtime_unit_id;
+        });
+    if (requirement_row ==
+        bundle.value().runtime_contract_requirements.end()) {
+      Fail("runtime unit has no retained contract-manifest requirement: " +
+           runtime_unit.runtime_unit_id.value());
+    }
+    const auto *contract =
+        manyforge::deployment::build_qualified_runtime_contract_registry()
+            .find(runtime_unit.runtime_profile_id,
+                  runtime_unit.runtime_profile_revision,
+                  product->product_contract_id(),
+                  product->product_contract_revision());
+    if (contract == nullptr ||
+        requirement_row->requirement.runtime_implementation_id !=
+            contract->offer().runtime_implementation_id) {
+      Fail("runtime unit has no selected build-qualified contract offer: " +
+           runtime_unit.runtime_unit_id.value());
+    }
+    const auto compatible = manyforge::core::CheckRuntimeContractCompatibility(
+        contract->offer(), requirement_row->requirement);
+    if (!compatible.ok()) {
+      Fail("runtime unit retained contract requirement is incompatible with "
+           "its selected offer: " +
+           runtime_unit.runtime_unit_id.value());
+    }
     auto row =
-        MakeVerifiedPlanRow(runtime_unit, *product,
+        MakeVerifiedPlanRow(runtime_unit, *product, requirement_row->requirement,
+                            contract->offer().offer_digest,
                             RuntimeUnitCandidateDisposition::kRetainedExact);
     if (!plans.emplace(runtime_unit.runtime_unit_id.value(), std::move(row))
              .second) {
@@ -149,6 +186,23 @@ VerifyRuntimeProducts(
     }
   }
   return plans;
+}
+
+[[nodiscard]] bool CompatibleRuntimeSuccessor(
+    const RuntimeUnitConvergencePlanRowDTO &predecessor,
+    const RuntimeUnitConvergencePlanRowDTO &candidate) {
+  // Product/configuration and executable-derived identities deliberately do
+  // not participate in predecessor/successor compatibility. Each bundle was
+  // already verified against its own exact product, bindings, endpoints, and
+  // configuration, and each requirement was independently admitted against
+  // the selected immutable package offer. Runtime reports must still match
+  // the exact candidate facts before staged readiness. This predicate owns
+  // only stable unit/lifecycle continuity and implementation-family
+  // compatibility; adapters retain independent launch-target integrity.
+  return predecessor.runtime_unit_id == candidate.runtime_unit_id &&
+         predecessor.lifecycle_control == candidate.lifecycle_control &&
+         predecessor.runtime_contract_requirement.runtime_implementation_id ==
+             candidate.runtime_contract_requirement.runtime_implementation_id;
 }
 
 [[nodiscard]] std::vector<RuntimeUnitConvergencePlanRowDTO> BuildCandidatePlan(
@@ -179,7 +233,8 @@ VerifyRuntimeProducts(
     if (predecessor_row == predecessor_plans.end()) {
       candidate_row.candidate_disposition =
           RuntimeUnitCandidateDisposition::kAdded;
-    } else if (predecessor_row->second != candidate_row) {
+    } else if (!CompatibleRuntimeSuccessor(predecessor_row->second,
+                                           candidate_row)) {
       Fail("runtime-unit replacement is not qualified by the current I4 "
            "checkpoint: " +
            runtime_id);
@@ -312,7 +367,31 @@ MakeExpectation(const RuntimeUnitConvergencePlanRowDTO &plan) {
       plan.product_identity.value(), plan.configuration_identity.value(),
       kManagerRuntimeMaximumPresenceAgeNs, kManagerRuntimeMaximumReportAgeNs,
       std::nullopt, std::move(dependencies), std::move(roles),
-      ManagedCommandSurfaceState::kClosedNoActiveEffect);
+      ManagedCommandSurfaceState::kClosedNoActiveEffect,
+      plan.runtime_contract_offer_digest.value());
+}
+
+void VerifyRuntimeContractAdmission(
+    const RuntimeUnitConvergencePlanRowDTO &plan) {
+  if (plan.runtime_contract_offer_digest.empty() ||
+      plan.runtime_contract_requirement.requirement_digest.empty()) {
+    Fail("runtime convergence plan has no sealed contract-manifest admission");
+  }
+  const auto *contract =
+      manyforge::deployment::build_qualified_runtime_contract_registry().find(
+          plan.runtime_profile_id, plan.runtime_profile_revision,
+          plan.product_contract_id, plan.product_contract_revision);
+  if (contract == nullptr ||
+      contract->offer().offer_digest != plan.runtime_contract_offer_digest) {
+    Fail("runtime convergence plan selected offer differs from the immutable "
+         "build-qualified registry");
+  }
+  const auto compatible = manyforge::core::CheckRuntimeContractCompatibility(
+      contract->offer(), plan.runtime_contract_requirement);
+  if (!compatible.ok()) {
+    Fail("runtime convergence plan requirement is incompatible with its "
+         "selected offer");
+  }
 }
 
 [[nodiscard]] RuntimeUnitStagedReadyEvidenceDTO
@@ -327,7 +406,9 @@ MakeStagedEvidence(const RuntimeUnitConvergencePlanRowDTO &plan,
       !observation.command_surface_state().has_value() ||
       !observation.presence_age_ns().has_value() ||
       !observation.report_age_ns().has_value() ||
-      !observation.progress_age_ns().has_value()) {
+      !observation.progress_age_ns().has_value() ||
+      observation.observed_runtime_contract_offer_digest() !=
+          plan.runtime_contract_offer_digest.value()) {
     Fail("converged runtime observation lacks complete staged-ready evidence");
   }
   std::vector<RuntimeRoleId> roles;
@@ -361,6 +442,8 @@ MakeStagedEvidence(const RuntimeUnitConvergencePlanRowDTO &plan,
       *observation.presence_age_ns(),
       *observation.report_age_ns(),
       *observation.progress_age_ns(),
+      manyforge::core::RuntimeContractOfferDigest(
+          observation.observed_runtime_contract_offer_digest()),
   };
   if (!evidence.valid()) {
     Fail("Manager produced invalid staged-ready runtime evidence");
@@ -537,7 +620,9 @@ ManagerApplyRuntimeConvergenceCoordinator::ConvergeOrRecover(
                    process.process_incarnation() &&
                found->observed_product_identity == plan.product_identity &&
                found->observed_configuration_identity ==
-                   plan.configuration_identity;
+                   plan.configuration_identity &&
+               found->observed_runtime_contract_offer_digest ==
+                   plan.runtime_contract_offer_digest;
       };
 
   std::vector<std::string> declared_runtime_ids;
@@ -563,6 +648,7 @@ ManagerApplyRuntimeConvergenceCoordinator::ConvergeOrRecover(
     if (!query.valid()) {
       Fail("Manager produced an invalid runtime convergence query");
     }
+    VerifyRuntimeContractAdmission(query.plan);
 
     ProcessPresenceObservation process =
         ObserveProcessSafely(process_port_, query);
@@ -570,6 +656,10 @@ ManagerApplyRuntimeConvergenceCoordinator::ConvergeOrRecover(
     if (plan.lifecycle_control ==
             manyforge::core::RuntimeLifecycleControl::kManagerManaged &&
         !prior_proves_candidate_preparation(plan, process)) {
+      // Re-read the durable row's sealed requirement immediately before the
+      // only managed lifecycle effect.  A journal replay cannot bypass this
+      // admission by reusing an old process query.
+      VerifyRuntimeContractAdmission(query.plan);
       try {
         // A surviving exact process still has candidate-scoped staged-ready
         // work to reconcile (for example, preparing newly retained native

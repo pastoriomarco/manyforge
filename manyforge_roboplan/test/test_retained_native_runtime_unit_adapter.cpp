@@ -20,6 +20,7 @@
 #include <manyforge_core/types/native_projection_capability.hpp>
 #include <manyforge_deployment/artifact_codec.hpp>
 #include <manyforge_deployment/native_execution_runtime_contract.hpp>
+#include <manyforge_deployment/runtime_contract_registry.hpp>
 #include <manyforge_deployment/verified_retained_bundle.hpp>
 #include <optional>
 #include <set>
@@ -149,6 +150,22 @@ struct NativeFixture final {
       throw std::runtime_error(
           "native adapter fixture has no exact native runtime product");
     }
+    const auto requirement = std::find_if(
+        bundle->value().runtime_contract_requirements.begin(),
+        bundle->value().runtime_contract_requirements.end(),
+        [&](const auto &candidate) {
+          return candidate.runtime_unit_id == unit.runtime_unit_id;
+        });
+    const auto *qualified =
+        deployment::build_qualified_runtime_contract_registry().find(
+            unit.runtime_profile_id, unit.runtime_profile_revision,
+            product->product_contract_id(),
+            product->product_contract_revision());
+    if (requirement == bundle->value().runtime_contract_requirements.end() ||
+        qualified == nullptr) {
+      throw std::runtime_error(
+          "native adapter fixture has no contract admission");
+    }
     component_manager::RuntimeUnitConvergencePlanRowDTO plan{
         unit.runtime_unit_id,
         unit.runtime_profile_id,
@@ -174,6 +191,8 @@ struct NativeFixture final {
         product->launchable_artifact_ref().byte_size,
         std::string(product->operating_system()),
         std::string(product->launch_environment_contract()),
+        requirement->requirement,
+        qualified->offer().offer_digest,
     };
     query.emplace(component_manager::RuntimeUnitConvergenceQueryDTO{
         core::ApplyId("native-adapter-apply"),
@@ -433,8 +452,26 @@ TEST(NativeExecutionRuntimeUnitAdmission,
   EXPECT_EQ(admission->installed_target_id(), contract::kInstalledTargetId);
   EXPECT_EQ(admission->implementation_revision(),
             contract::implementation_revision());
+  EXPECT_EQ(admission->runtime_contract_offer_digest(),
+            fixture.query->plan.runtime_contract_offer_digest.value());
+  const core::RuntimeEpoch packet_epoch("native-runtime-test-epoch");
+  const auto ready_packet = admission->expected_ready_packet(packet_epoch);
+  const auto status_packet =
+      admission->expected_status_packet(packet_epoch, 1U);
+  EXPECT_TRUE(ready_packet.starts_with(
+      "manyforge.native-execution-ready.v2 "));
+  EXPECT_TRUE(status_packet.starts_with(
+      "manyforge.native-execution-status.v2 "));
+  EXPECT_NE(ready_packet.find(admission->runtime_contract_offer_digest()),
+            std::string::npos);
+  EXPECT_NE(status_packet.find(admission->runtime_contract_offer_digest()),
+            std::string::npos);
+  EXPECT_EQ(ready_packet.find(admission->implementation_revision()),
+            std::string::npos);
+  EXPECT_EQ(status_packet.find(admission->implementation_revision()),
+            std::string::npos);
   const auto arguments = admission->launch_arguments(
-      3, core::RuntimeEpoch("native-runtime-test-epoch"));
+      3, packet_epoch);
   ASSERT_EQ(arguments.size(), 10U);
   EXPECT_EQ(arguments.front(), "--manyforge-managed-runtime-channel-fd");
   EXPECT_EQ(arguments[1], "3");
@@ -489,6 +526,8 @@ TEST(RetainedNativeRuntimeUnitAdapter,
             fixture.query->plan.product_identity.value());
   EXPECT_EQ(first->configuration_identity(),
             fixture.query->plan.configuration_identity.value());
+  EXPECT_EQ(first->offered_runtime_contract_offer_digest(),
+            fixture.query->plan.runtime_contract_offer_digest.value());
   EXPECT_EQ(first->ready_runtime_role_ids(),
             std::vector<std::string>{std::string(contract::kRuntimeRoleId)});
   EXPECT_EQ(

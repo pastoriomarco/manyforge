@@ -63,6 +63,10 @@ public:
   [[nodiscard]] const std::string &configuration_identity() const noexcept {
     return configuration_identity_;
   }
+  [[nodiscard]] const std::string &
+  runtime_contract_offer_digest() const noexcept {
+    return runtime_contract_offer_digest_;
+  }
   [[nodiscard]] const std::string &launchable_content_digest() const noexcept {
     return launchable_content_digest_;
   }
@@ -134,7 +138,8 @@ private:
       std::string shell_contract, std::string process_adapter_contract_id,
       std::string process_adapter_contract_revision,
       std::string retrieval_contract_id,
-      std::string retrieval_contract_revision)
+      std::string retrieval_contract_revision,
+      std::string runtime_contract_offer_digest)
       : runtime_unit_id_(std::move(runtime_unit_id)),
         retained_bundle_id_(std::move(retained_bundle_id)),
         product_id_(std::move(product_id)),
@@ -157,7 +162,9 @@ private:
         process_adapter_contract_revision_(
             std::move(process_adapter_contract_revision)),
         retrieval_contract_id_(std::move(retrieval_contract_id)),
-        retrieval_contract_revision_(std::move(retrieval_contract_revision)) {}
+        retrieval_contract_revision_(std::move(retrieval_contract_revision)),
+        runtime_contract_offer_digest_(
+            std::move(runtime_contract_offer_digest)) {}
 
   std::string runtime_unit_id_;
   core::RetainedBundleId retained_bundle_id_;
@@ -180,6 +187,7 @@ private:
   std::string process_adapter_contract_revision_;
   std::string retrieval_contract_id_;
   std::string retrieval_contract_revision_;
+  std::string runtime_contract_offer_digest_;
 
   friend std::optional<ReferenceRuntimeUnitAdmission>
   VerifyReferenceRuntimeUnitForHost(

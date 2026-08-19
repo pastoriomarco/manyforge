@@ -433,7 +433,8 @@ std::string native_execution_runtime_implementation_revision() {
       "logical-scene-services-v1;manager-managed-product-composition;"
       "build-owned-candidate-worker;sha256-projection-content;"
       "atomic-resource-table-admission;"
-      "resource-derived-active-configurations");
+      "resource-derived-active-configurations;"
+      "runtime-contract-offer-correlation-v2");
 }
 
 std::string native_execution_runtime_process_adapter_revision() {
@@ -441,7 +442,8 @@ std::string native_execution_runtime_process_adapter_revision() {
       "process-adapter",
       "manager-managed;installed-target;fixed-argv;direct-child-epoch;"
       "inherited-seqpacket-channel;same-user-direct-parent;"
-      "command-fenced-readiness;fixed-sibling-candidate-worker");
+      "command-fenced-readiness;runtime-contract-offer-digest-echo;"
+      "fixed-sibling-candidate-worker");
 }
 
 std::string native_execution_runtime_retrieval_contract_revision() {
@@ -453,8 +455,9 @@ std::string native_execution_runtime_retrieval_contract_revision() {
 std::string native_execution_runtime_status_endpoint_revision() {
   return contract_revision(
       "status-endpoint",
-      "adapter-private;native-execution-status-v1;direct-child-epoch;"
-      "source-sequence;phase;health;product;configuration;roles;fence");
+      "adapter-private;native-execution-status-v2;direct-child-epoch;"
+      "source-sequence;phase;health;product;configuration;roles;fence;"
+      "runtime-contract-offer-digest");
 }
 
 std::string native_execution_runtime_projection_endpoint_revision() {

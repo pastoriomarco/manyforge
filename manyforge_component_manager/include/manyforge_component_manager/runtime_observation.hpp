@@ -73,7 +73,8 @@ class RuntimeUnitExpectation final {
       std::vector<std::string> dependency_runtime_unit_ids = {},
       std::vector<std::string> required_runtime_role_ids = {},
       ManagedCommandSurfaceState required_command_surface_state =
-          ManagedCommandSurfaceState::kClosedNoActiveEffect);
+          ManagedCommandSurfaceState::kClosedNoActiveEffect,
+      std::string selected_runtime_contract_offer_digest = {});
 
   [[nodiscard]] const std::string& runtime_unit_id() const noexcept;
   [[nodiscard]] RuntimeLifecycleControl lifecycle_control() const noexcept;
@@ -89,6 +90,8 @@ class RuntimeUnitExpectation final {
       const noexcept;
   [[nodiscard]] ManagedCommandSurfaceState required_command_surface_state()
       const noexcept;
+  [[nodiscard]] const std::string&
+  selected_runtime_contract_offer_digest() const noexcept;
 
  private:
   std::string runtime_unit_id_;
@@ -101,6 +104,7 @@ class RuntimeUnitExpectation final {
   std::vector<std::string> dependency_runtime_unit_ids_;
   std::vector<std::string> required_runtime_role_ids_;
   ManagedCommandSurfaceState required_command_surface_state_;
+  std::string selected_runtime_contract_offer_digest_;
 };
 
 class ProcessPresenceObservation final {
@@ -141,7 +145,8 @@ class RuntimeUnitSourceReport final {
       std::string configuration_identity,
       std::vector<std::string> ready_runtime_role_ids,
       ManagedCommandSurfaceState command_surface_state,
-      std::vector<std::string> reason_codes = {});
+      std::vector<std::string> reason_codes = {},
+      std::string offered_runtime_contract_offer_digest = {});
 
   [[nodiscard]] const std::string& runtime_unit_id() const noexcept;
   [[nodiscard]] const std::string& process_incarnation() const noexcept;
@@ -155,6 +160,8 @@ class RuntimeUnitSourceReport final {
       const noexcept;
   [[nodiscard]] ManagedCommandSurfaceState command_surface_state()
       const noexcept;
+  [[nodiscard]] const std::string&
+  offered_runtime_contract_offer_digest() const noexcept;
   [[nodiscard]] const std::vector<std::string>& reason_codes() const noexcept;
 
   bool operator==(const RuntimeUnitSourceReport&) const = default;
@@ -170,6 +177,7 @@ class RuntimeUnitSourceReport final {
   std::string configuration_identity_;
   std::vector<std::string> ready_runtime_role_ids_;
   ManagedCommandSurfaceState command_surface_state_;
+  std::string offered_runtime_contract_offer_digest_;
   std::vector<std::string> reason_codes_;
 };
 
@@ -190,6 +198,8 @@ class RuntimeUnitObservation final {
   [[nodiscard]] const std::string& observed_product_identity() const noexcept;
   [[nodiscard]] const std::string& observed_configuration_identity()
       const noexcept;
+  [[nodiscard]] const std::string&
+  observed_runtime_contract_offer_digest() const noexcept;
   [[nodiscard]] std::optional<RuntimeSourcePhase> source_phase() const noexcept;
   [[nodiscard]] std::optional<RuntimeSourceHealth> source_health()
       const noexcept;
@@ -230,6 +240,7 @@ class RuntimeUnitObservation final {
       std::optional<std::uint64_t> critical_progress_sequence,
       std::vector<std::string> ready_runtime_role_ids,
       std::optional<ManagedCommandSurfaceState> command_surface_state,
+      std::string observed_runtime_contract_offer_digest,
       std::map<std::string, std::string> dependency_runtime_epochs,
       std::vector<std::string> source_reason_codes,
       std::vector<std::string> reason_codes);
@@ -252,6 +263,7 @@ class RuntimeUnitObservation final {
   std::optional<std::uint64_t> critical_progress_sequence_;
   std::vector<std::string> ready_runtime_role_ids_;
   std::optional<ManagedCommandSurfaceState> command_surface_state_;
+  std::string observed_runtime_contract_offer_digest_;
   std::map<std::string, std::string> dependency_runtime_epochs_;
   std::vector<std::string> source_reason_codes_;
   std::vector<std::string> reason_codes_;

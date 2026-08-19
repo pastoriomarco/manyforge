@@ -1,6 +1,7 @@
 #include "manyforge_component_manager/runtime_convergence.hpp"
 
 #include <algorithm>
+#include <manyforge_core/runtime_contract_manifest_codec.hpp>
 #include <set>
 
 namespace manyforge::component_manager {
@@ -38,9 +39,22 @@ Digest(const manyforge::core::ContentDigest &value) noexcept {
          });
 }
 
+[[nodiscard]] bool DigestText(const std::string_view text) noexcept {
+  return text.size() == 71U && text.starts_with("sha256:") &&
+         std::all_of(text.begin() + 7, text.end(), [](const char character) {
+           return (character >= '0' && character <= '9') ||
+                  (character >= 'a' && character <= 'f');
+         });
+}
+
 } // namespace
 
 bool RuntimeUnitConvergencePlanRowDTO::valid() const noexcept {
+  const bool contract_fields_valid =
+      (DigestText(runtime_contract_offer_digest.value()) &&
+       manyforge::core::VerifyRuntimeContractRequirement(
+           runtime_contract_requirement)
+           .ok());
   const bool base =
       !runtime_unit_id.empty() && !runtime_profile_id.empty() &&
       !runtime_profile_revision.empty() && !product_id.empty() &&
@@ -62,7 +76,7 @@ bool RuntimeUnitConvergencePlanRowDTO::valid() const noexcept {
       PrintableIdentifier(shell_contract) &&
       !ToString(candidate_disposition).empty() &&
       !manyforge::core::to_string(lifecycle_control).empty();
-  if (!base) {
+  if (!base || !contract_fields_valid) {
     return false;
   }
   if (lifecycle_control ==
@@ -120,6 +134,7 @@ bool RuntimeUnitStagedReadyEvidenceDTO::valid() const noexcept {
              [](const auto &left, const auto &right) {
                return !(left.runtime_unit_id < right.runtime_unit_id);
              }) == dependency_runtime_epochs.end() &&
+         DigestText(observed_runtime_contract_offer_digest.value()) &&
          !ToString(candidate_disposition).empty() &&
          !manyforge::core::to_string(lifecycle_control).empty();
 }

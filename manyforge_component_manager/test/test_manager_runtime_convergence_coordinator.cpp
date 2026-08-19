@@ -704,7 +704,8 @@ public:
         RuntimeSourcePhase::kServing, RuntimeSourceHealth::kHealthy,
         query.plan.product_identity.value(),
         query.plan.configuration_identity.value(), std::move(roles),
-        ManagedCommandSurfaceState::kClosedNoActiveEffect);
+        ManagedCommandSurfaceState::kClosedNoActiveEffect, {},
+        query.plan.runtime_contract_offer_digest.value());
   }
 
   bool throw_after_ensure_effect{false};

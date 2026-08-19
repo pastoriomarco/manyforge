@@ -263,6 +263,63 @@ TEST(RuntimeObservationReducer, MissingThenExactEvidenceConverges) {
   EXPECT_EQ(converged.observation("unit")->report_age_ns(), 0);
 }
 
+TEST(RuntimeObservationReducer, OfferEchoIsFreshEpochBoundEvidence) {
+  constexpr std::string_view kOfferDigest =
+      "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+  ManualClock clock;
+  RuntimeObservationReducer subject(
+      [&clock] { return clock(); }, {"unit"});
+  const auto target = RuntimeUnitExpectation(
+      "unit", RuntimeLifecycleControl::kManagerManaged, "product-v1",
+      "configuration-v1", 100, 100, std::nullopt, {}, {"status"},
+      ManagedCommandSurfaceState::kClosedNoActiveEffect,
+      std::string(kOfferDigest));
+  EXPECT_TRUE(subject.ObserveProcess(Presence("unit", "epoch")));
+  EXPECT_TRUE(subject.IngestSourceReport(RuntimeUnitSourceReport(
+      "unit", "epoch", 1, 1, RuntimeSourcePhase::kServing,
+      RuntimeSourceHealth::kHealthy, "product-v1", "configuration-v1",
+      {"status"}, ManagedCommandSurfaceState::kClosedNoActiveEffect, {},
+      std::string(kOfferDigest))));
+  const auto accepted = subject.Evaluate({target});
+  ASSERT_NE(accepted.observation("unit"), nullptr);
+  EXPECT_TRUE(accepted.observation("unit")->converged());
+  EXPECT_TRUE(subject.ObserveProcess(ProcessPresenceObservation(
+      "unit", "observer-a", 2U, ProcessPresenceState::kAbsent)));
+  EXPECT_TRUE(subject.ObserveProcess(Presence("unit", "epoch-2", 3U)));
+  EXPECT_FALSE(subject.IngestSourceReport(RuntimeUnitSourceReport(
+      "unit", "epoch", 2U, 2U, RuntimeSourcePhase::kServing,
+      RuntimeSourceHealth::kHealthy, "product-v1", "configuration-v1",
+      {"status"}, ManagedCommandSurfaceState::kClosedNoActiveEffect, {},
+      std::string(kOfferDigest))));
+  const auto replaced = subject.Evaluate({target});
+  ASSERT_NE(replaced.observation("unit"), nullptr);
+  EXPECT_FALSE(replaced.observation("unit")->converged());
+  EXPECT_EQ(replaced.observation("unit")->reason_codes(),
+            std::vector<std::string>{"source_report_missing"});
+  EXPECT_TRUE(subject.IngestSourceReport(RuntimeUnitSourceReport(
+      "unit", "epoch-2", 1U, 1U, RuntimeSourcePhase::kServing,
+      RuntimeSourceHealth::kHealthy, "product-v1", "configuration-v1",
+      {"status"}, ManagedCommandSurfaceState::kClosedNoActiveEffect, {},
+      std::string(kOfferDigest))));
+  const auto recorrelated = subject.Evaluate({target});
+  ASSERT_NE(recorrelated.observation("unit"), nullptr);
+  EXPECT_TRUE(recorrelated.observation("unit")->converged());
+
+  RuntimeObservationReducer mismatch(
+      [&clock] { return clock(); }, {"unit"});
+  EXPECT_TRUE(mismatch.ObserveProcess(Presence("unit", "epoch")));
+  EXPECT_TRUE(mismatch.IngestSourceReport(RuntimeUnitSourceReport(
+      "unit", "epoch", 1, 1, RuntimeSourcePhase::kServing,
+      RuntimeSourceHealth::kHealthy, "product-v1", "configuration-v1",
+      {"status"}, ManagedCommandSurfaceState::kClosedNoActiveEffect, {},
+      "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb")));
+  const auto rejected = mismatch.Evaluate({target});
+  ASSERT_NE(rejected.observation("unit"), nullptr);
+  EXPECT_FALSE(rejected.observation("unit")->converged());
+  EXPECT_EQ(rejected.observation("unit")->reason_codes(),
+            std::vector<std::string>{"runtime_contract_offer_digest_mismatch"});
+}
+
 TEST(RuntimeObservationReducer, DuplicateAndConflictDoNotRenewFreshness) {
   ManualClock clock;
   RuntimeObservationReducer subject(

@@ -54,7 +54,7 @@ inline constexpr std::size_t kMaxReferenceRuntimeLaunchableBytes = 4U * 1024U;
 ///
 /// This is a real bounded POSIX-shell process contract used to qualify I4
 /// lifecycle mechanics. It is not a planner, robot owner, or supported lane.
-[[nodiscard]] std::string_view reference_runtime_launchable_script() noexcept;
+[[nodiscard]] const std::string& reference_runtime_launchable_script();
 
 [[nodiscard]] std::string reference_runtime_implementation_revision();
 [[nodiscard]] std::string reference_runtime_process_adapter_revision();

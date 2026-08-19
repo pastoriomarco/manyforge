@@ -6,6 +6,7 @@
 #include <sqlite3.h>
 
 #include <manyforge_persistence/sqlite_read_only_preflight.hpp>
+#include <manyforge_core/runtime_contract_manifest_codec.hpp>
 
 #include "embedded_manager_apply_journal_schema.hpp"
 #include "sqlite_store_startup_internal.hpp"
@@ -121,9 +122,9 @@ constexpr std::string_view kFenceAttemptDigestDomain =
 constexpr std::string_view kFenceAcceptanceDigestDomain =
     "manyforge.component-manager-apply-fence-acceptance.v2";
 constexpr std::string_view kRuntimeConvergenceIntentDigestDomain =
-    "manyforge.component-manager-runtime-convergence-intent.v1";
+    "manyforge.component-manager-runtime-convergence-intent.v2";
 constexpr std::string_view kRuntimeStagedReadyDigestDomain =
-    "manyforge.component-manager-runtime-staged-ready.v1";
+    "manyforge.component-manager-runtime-staged-ready.v2";
 constexpr std::string_view kSceneStageIntentDigestDomain =
     "manyforge.component-manager-scene-stage-intent.v1";
 constexpr std::string_view kSceneStagedEvidenceDigestDomain =
@@ -1508,7 +1509,7 @@ EncodeRuntimeRoleIds(const std::vector<RuntimeRoleId> &runtime_role_ids) {
 std::string EncodeRuntimePlanRows(
     const std::vector<RuntimeUnitConvergencePlanRowDTO> &runtime_units) {
   std::vector<std::string> tokens;
-  tokens.reserve(runtime_units.size() * 25U);
+  tokens.reserve(runtime_units.size() * 27U);
   for (const auto &row : runtime_units) {
     if (!row.valid()) {
       throw std::invalid_argument("runtime convergence plan row is invalid");
@@ -1540,6 +1541,17 @@ std::string EncodeRuntimePlanRows(
     tokens.push_back(std::to_string(row.launchable_byte_size));
     tokens.push_back(row.operating_system);
     tokens.push_back(row.shell_contract);
+    ValidateDigest(row.runtime_contract_offer_digest.value(),
+                   "runtime contract offer digest");
+    const auto requirement =
+        core::EncodeRuntimeContractRequirement(
+            row.runtime_contract_requirement);
+    if (!requirement.ok()) {
+      throw std::invalid_argument(
+          "runtime convergence requirement encoding failed");
+    }
+    tokens.push_back(row.runtime_contract_offer_digest.value());
+    tokens.push_back(requirement.value());
   }
   return EncodeTokens(tokens);
 }
@@ -1570,7 +1582,7 @@ DecodeRuntimeCandidateDisposition(const std::string_view value) {
 
 std::vector<RuntimeUnitConvergencePlanRowDTO>
 DecodeRuntimePlanRows(const std::string &encoding) {
-  constexpr std::size_t kFieldsPerRow = 25U;
+  constexpr std::size_t kFieldsPerRow = 27U;
   const auto tokens =
       DecodeTokens(encoding, kMaximumRuntimeUnits * kFieldsPerRow,
                    "runtime convergence plan");
@@ -1631,6 +1643,16 @@ DecodeRuntimePlanRows(const std::string &encoding) {
                                "runtime launchable byte size"),
         tokens[index + 23U],
         tokens[index + 24U],
+        [&]() {
+          const auto requirement = core::DecodeRuntimeContractRequirement(
+              tokens[index + 26U]);
+          if (!requirement.ok()) {
+            throw ManagerApplyJournalIntegrityError(
+                "stored runtime contract requirement is invalid");
+          }
+          return requirement.value();
+        }(),
+        core::RuntimeContractOfferDigest(tokens[index + 25U]),
     };
     if (!row.valid()) {
       throw ManagerApplyJournalIntegrityError(
@@ -1658,7 +1680,7 @@ std::string EncodeDependencyEpochs(
 std::string EncodeRuntimeStagedReadyRows(
     const std::vector<RuntimeUnitStagedReadyEvidenceDTO> &runtime_units) {
   std::vector<std::string> tokens;
-  tokens.reserve(runtime_units.size() * 18U);
+  tokens.reserve(runtime_units.size() * 19U);
   for (const auto &row : runtime_units) {
     if (!row.valid()) {
       throw std::invalid_argument("runtime staged-ready row is invalid");
@@ -1681,6 +1703,7 @@ std::string EncodeRuntimeStagedReadyRows(
     tokens.push_back(std::to_string(row.presence_age_ns));
     tokens.push_back(std::to_string(row.report_age_ns));
     tokens.push_back(std::to_string(row.progress_age_ns));
+    tokens.push_back(row.observed_runtime_contract_offer_digest.value());
   }
   return EncodeTokens(tokens);
 }
@@ -1712,7 +1735,7 @@ DecodeRuntimeCommandSurface(const std::string_view value) {
 
 std::vector<RuntimeUnitStagedReadyEvidenceDTO>
 DecodeRuntimeStagedReadyRows(const std::string &encoding) {
-  constexpr std::size_t kFieldsPerRow = 18U;
+  constexpr std::size_t kFieldsPerRow = 19U;
   const auto tokens =
       DecodeTokens(encoding, kMaximumRuntimeUnits * kFieldsPerRow,
                    "runtime staged-ready evidence");
@@ -1765,6 +1788,7 @@ DecodeRuntimeStagedReadyRows(const std::string &encoding) {
         ParseCanonicalUnsigned(tokens[index + 15U], "presence age"),
         ParseCanonicalUnsigned(tokens[index + 16U], "report age"),
         ParseCanonicalUnsigned(tokens[index + 17U], "progress age"),
+        core::RuntimeContractOfferDigest(tokens[index + 18U]),
     };
     if (!row.valid()) {
       throw ManagerApplyJournalIntegrityError(
@@ -3853,6 +3877,8 @@ public:
             evidence.observed_product_identity != plan.product_identity ||
             evidence.observed_configuration_identity !=
                 plan.configuration_identity ||
+            evidence.observed_runtime_contract_offer_digest !=
+                plan.runtime_contract_offer_digest ||
             evidence.ready_runtime_role_ids != plan.required_runtime_role_ids ||
             evidence.dependency_runtime_epochs.size() !=
                 plan.dependency_runtime_unit_ids.size()) {

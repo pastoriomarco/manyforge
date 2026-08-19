@@ -164,6 +164,7 @@ StagedRuntime(std::string id, std::string epoch) {
       0U,
       0U,
       0U,
+      RuntimeContractOfferDigest(std::string(kDigestOne)),
   };
 }
 

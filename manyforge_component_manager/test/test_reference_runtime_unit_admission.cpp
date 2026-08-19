@@ -111,12 +111,14 @@ TEST(ReferenceRuntimeUnitAdmission,
                 admission->product_identity(), "--configuration-identity",
                 admission->configuration_identity()}));
   EXPECT_EQ(admission->expected_status_line(runtime_epoch, 1U),
-            "manyforge.reference-runtime-status.v1 reference_runtime "
+            "manyforge.reference-runtime-status.v2 reference_runtime "
             "runtime-epoch-1 1 1 "
-            "serving healthy " +
-                admission->product_identity() + " " +
+            "serving healthy " + admission->runtime_contract_offer_digest() +
+                " " + admission->product_identity() + " " +
                 admission->configuration_identity() +
                 " manager_fixture closed_no_active_effect");
+  EXPECT_TRUE(admission->runtime_contract_offer_digest().starts_with(
+      "sha256:"));
   EXPECT_EQ(admission->status_command(), "status\n");
   EXPECT_EQ(admission->shutdown_command(), "shutdown\n");
   EXPECT_EQ(admission->runtime_role_id(), "manager_fixture");

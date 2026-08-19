@@ -2,6 +2,9 @@
 
 #include "manyforge_component_manager/retained_posix_runtime_unit_adapter.hpp"
 
+#include <algorithm>
+#include <manyforge_core/runtime_contract_manifest_codec.hpp>
+#include <manyforge_deployment/runtime_contract_registry.hpp>
 #include <manyforge_deployment/verified_retained_bundle.hpp>
 #include <string>
 #include <utility>
@@ -27,9 +30,10 @@ std::string ReferenceRuntimeUnitAdmission::expected_status_line(
   if (runtime_epoch.empty() || source_report_sequence == 0U) {
     throw std::invalid_argument("reference runtime status identity is invalid");
   }
-  return "manyforge.reference-runtime-status.v1 " + runtime_unit_id_ + " " +
+  return "manyforge.reference-runtime-status.v2 " + runtime_unit_id_ + " " +
          runtime_epoch.value() + " " + std::to_string(source_report_sequence) +
-         " 1 serving healthy " + product_identity_ + " " +
+         " 1 serving healthy " + runtime_contract_offer_digest_ + " " +
+         product_identity_ + " " +
          configuration_identity_ + " " + runtime_role_id_ +
          " closed_no_active_effect";
 }
@@ -48,6 +52,35 @@ std::optional<ReferenceRuntimeUnitAdmission> VerifyReferenceRuntimeUnitForHost(
       shell_contract != product->shell_contract()) {
     throw ReferenceRuntimeUnitAdmissionError(
         "reference runtime product is incompatible with the selected host");
+  }
+
+  const auto runtime_unit = std::find_if(
+      bundle.value().cell_graph.runtime_units.begin(),
+      bundle.value().cell_graph.runtime_units.end(),
+      [&](const auto &candidate) {
+        return candidate.runtime_unit_id == runtime_unit_id;
+      });
+  const auto requirement = std::find_if(
+      bundle.value().runtime_contract_requirements.begin(),
+      bundle.value().runtime_contract_requirements.end(),
+      [&](const auto &candidate) {
+        return candidate.runtime_unit_id == runtime_unit_id;
+      });
+  const auto *qualified =
+      runtime_unit == bundle.value().cell_graph.runtime_units.end()
+          ? nullptr
+          : deployment::build_qualified_runtime_contract_registry().find(
+                runtime_unit->runtime_profile_id,
+                runtime_unit->runtime_profile_revision,
+                product->product_contract_id(),
+                product->product_contract_revision());
+  if (qualified == nullptr ||
+      requirement == bundle.value().runtime_contract_requirements.end() ||
+      !core::CheckRuntimeContractCompatibility(
+           qualified->offer(), requirement->requirement)
+           .ok()) {
+    throw ReferenceRuntimeUnitAdmissionError(
+        "reference runtime contract admission is not qualified");
   }
   if (product->process_adapter_contract_id() !=
           kRetainedPosixProcessAdapterContractId ||
@@ -76,7 +109,8 @@ std::optional<ReferenceRuntimeUnitAdmission> VerifyReferenceRuntimeUnitForHost(
       std::string(product->process_adapter_contract_id()),
       std::string(product->process_adapter_contract_revision()),
       std::string(product->retrieval_contract_id()),
-      std::string(product->retrieval_contract_revision()));
+      std::string(product->retrieval_contract_revision()),
+      qualified->offer().offer_digest.value());
 }
 
 } // namespace manyforge::component_manager

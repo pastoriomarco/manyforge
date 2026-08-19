@@ -439,7 +439,7 @@ std::string ros2_control_execution_runtime_implementation_revision() {
       "controller-observation-only;commanded-simulation-authority;"
       "jtc-follow-joint-trajectory;topic-gripper-transport;"
       "planner-scene-projection-v1;logical-scene-services-v1;"
-      "build-owned-candidate-worker");
+      "build-owned-candidate-worker;runtime-contract-offer-correlation-v2");
 }
 
 std::string ros2_control_execution_runtime_process_adapter_revision() {
@@ -447,7 +447,8 @@ std::string ros2_control_execution_runtime_process_adapter_revision() {
       "process-adapter",
       "manager-managed;installed-target;fixed-argv;direct-child-epoch;"
       "inherited-seqpacket-channel;same-user-direct-parent;"
-      "command-fenced-readiness;fixed-sibling-candidate-worker");
+      "command-fenced-readiness;runtime-contract-offer-digest-echo;"
+      "fixed-sibling-candidate-worker");
 }
 
 std::string ros2_control_execution_runtime_retrieval_contract_revision() {
@@ -459,8 +460,9 @@ std::string ros2_control_execution_runtime_retrieval_contract_revision() {
 std::string ros2_control_execution_runtime_status_endpoint_revision() {
   return contract_revision(
       "status-endpoint",
-      "adapter-private;native-execution-status-v1;direct-child-epoch;"
-      "source-sequence;phase;health;product;configuration;roles;fence");
+      "adapter-private;native-execution-status-v2;direct-child-epoch;"
+      "source-sequence;phase;health;product;configuration;roles;fence;"
+      "runtime-contract-offer-digest");
 }
 
 std::string ros2_control_execution_runtime_projection_endpoint_revision() {

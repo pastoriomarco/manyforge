@@ -36,6 +36,14 @@ void ValidatePositive(
   }
 }
 
+bool IsSha256Digest(const std::string_view value) noexcept {
+  return value.size() == 71U && value.starts_with("sha256:") &&
+         std::all_of(value.begin() + 7, value.end(), [](const char character) {
+           return (character >= '0' && character <= '9') ||
+                  (character >= 'a' && character <= 'f');
+         });
+}
+
 std::vector<std::string> NormalizeIdentifiers(
     std::vector<std::string> values,
     const std::string_view label,
@@ -96,7 +104,8 @@ RuntimeUnitExpectation::RuntimeUnitExpectation(
     const std::optional<std::uint64_t> maximum_progress_age_ns,
     std::vector<std::string> dependency_runtime_unit_ids,
     std::vector<std::string> required_runtime_role_ids,
-    const ManagedCommandSurfaceState required_command_surface_state)
+    const ManagedCommandSurfaceState required_command_surface_state,
+    std::string selected_runtime_contract_offer_digest)
     : runtime_unit_id_(std::move(runtime_unit_id)),
       lifecycle_control_(lifecycle_control),
       product_identity_(std::move(product_identity)),
@@ -112,7 +121,9 @@ RuntimeUnitExpectation::RuntimeUnitExpectation(
           std::move(required_runtime_role_ids),
           "required_runtime_role_ids",
           kMaximumRuntimeRoles)),
-      required_command_surface_state_(required_command_surface_state) {
+      required_command_surface_state_(required_command_surface_state),
+      selected_runtime_contract_offer_digest_(
+          std::move(selected_runtime_contract_offer_digest)) {
   static_cast<void>(ToString(lifecycle_control_));
   static_cast<void>(ToString(required_command_surface_state_));
   ValidateIdentifier(runtime_unit_id_, "runtime_unit_id");
@@ -122,6 +133,13 @@ RuntimeUnitExpectation::RuntimeUnitExpectation(
   ValidatePositive(maximum_report_age_ns_, "maximum_report_age_ns");
   if (maximum_progress_age_ns_) {
     ValidatePositive(*maximum_progress_age_ns_, "maximum_progress_age_ns");
+  }
+  if (!selected_runtime_contract_offer_digest_.empty() &&
+      !IsSha256Digest(selected_runtime_contract_offer_digest_)) {
+    ValidateIdentifier(selected_runtime_contract_offer_digest_,
+                       "selected_runtime_contract_offer_digest");
+    throw std::invalid_argument(
+        "selected_runtime_contract_offer_digest must be a sha256 digest");
   }
   if (std::binary_search(
           dependency_runtime_unit_ids_.begin(),
@@ -176,6 +194,12 @@ RuntimeUnitExpectation::required_runtime_role_ids() const noexcept {
 ManagedCommandSurfaceState
 RuntimeUnitExpectation::required_command_surface_state() const noexcept {
   return required_command_surface_state_;
+}
+
+const std::string&
+RuntimeUnitExpectation::selected_runtime_contract_offer_digest()
+    const noexcept {
+  return selected_runtime_contract_offer_digest_;
 }
 
 ProcessPresenceObservation::ProcessPresenceObservation(
@@ -236,7 +260,8 @@ RuntimeUnitSourceReport::RuntimeUnitSourceReport(
     std::string configuration_identity,
     std::vector<std::string> ready_runtime_role_ids,
     const ManagedCommandSurfaceState command_surface_state,
-    std::vector<std::string> reason_codes)
+    std::vector<std::string> reason_codes,
+    std::string offered_runtime_contract_offer_digest)
     : runtime_unit_id_(std::move(runtime_unit_id)),
       process_incarnation_(std::move(process_incarnation)),
       source_report_sequence_(source_report_sequence),
@@ -250,6 +275,8 @@ RuntimeUnitSourceReport::RuntimeUnitSourceReport(
           "ready_runtime_role_ids",
           kMaximumRuntimeRoles)),
       command_surface_state_(command_surface_state),
+      offered_runtime_contract_offer_digest_(
+          std::move(offered_runtime_contract_offer_digest)),
       reason_codes_(NormalizeIdentifiers(
           std::move(reason_codes),
           "reason_codes",
@@ -262,6 +289,13 @@ RuntimeUnitSourceReport::RuntimeUnitSourceReport(
   ValidatePositive(source_report_sequence_, "source_report_sequence");
   ValidateIdentifier(product_identity_, "product_identity");
   ValidateIdentifier(configuration_identity_, "configuration_identity");
+  if (!offered_runtime_contract_offer_digest_.empty() &&
+      !IsSha256Digest(offered_runtime_contract_offer_digest_)) {
+    ValidateIdentifier(offered_runtime_contract_offer_digest_,
+                       "offered_runtime_contract_offer_digest");
+    throw std::invalid_argument(
+        "offered_runtime_contract_offer_digest must be a sha256 digest");
+  }
 }
 
 const std::string& RuntimeUnitSourceReport::runtime_unit_id() const noexcept {
@@ -310,6 +344,12 @@ ManagedCommandSurfaceState RuntimeUnitSourceReport::command_surface_state()
   return command_surface_state_;
 }
 
+const std::string&
+RuntimeUnitSourceReport::offered_runtime_contract_offer_digest()
+    const noexcept {
+  return offered_runtime_contract_offer_digest_;
+}
+
 const std::vector<std::string>& RuntimeUnitSourceReport::reason_codes()
     const noexcept {
   return reason_codes_;
@@ -334,6 +374,7 @@ RuntimeUnitObservation::RuntimeUnitObservation(
     const std::optional<std::uint64_t> critical_progress_sequence,
     std::vector<std::string> ready_runtime_role_ids,
     const std::optional<ManagedCommandSurfaceState> command_surface_state,
+    std::string observed_runtime_contract_offer_digest,
     std::map<std::string, std::string> dependency_runtime_epochs,
     std::vector<std::string> source_reason_codes,
     std::vector<std::string> reason_codes)
@@ -359,6 +400,8 @@ RuntimeUnitObservation::RuntimeUnitObservation(
           "ready_runtime_role_ids",
           kMaximumRuntimeRoles)),
       command_surface_state_(command_surface_state),
+      observed_runtime_contract_offer_digest_(
+          std::move(observed_runtime_contract_offer_digest)),
       dependency_runtime_epochs_(std::move(dependency_runtime_epochs)),
       source_reason_codes_(NormalizeIdentifiers(
           std::move(source_reason_codes),
@@ -395,6 +438,13 @@ RuntimeUnitObservation::RuntimeUnitObservation(
     ValidateIdentifier(
         observed_configuration_identity_,
         "observed_configuration_identity");
+  }
+  if (!observed_runtime_contract_offer_digest_.empty() &&
+      !IsSha256Digest(observed_runtime_contract_offer_digest_)) {
+    ValidateIdentifier(observed_runtime_contract_offer_digest_,
+                       "observed_runtime_contract_offer_digest");
+    throw std::invalid_argument(
+        "observed_runtime_contract_offer_digest must be a sha256 digest");
   }
   const bool has_report = source_report_sequence_.has_value();
   const bool report_complete =
@@ -476,6 +526,12 @@ const std::string& RuntimeUnitObservation::observed_product_identity()
 const std::string& RuntimeUnitObservation::observed_configuration_identity()
     const noexcept {
   return observed_configuration_identity_;
+}
+
+const std::string&
+RuntimeUnitObservation::observed_runtime_contract_offer_digest()
+    const noexcept {
+  return observed_runtime_contract_offer_digest_;
 }
 
 std::optional<RuntimeSourcePhase> RuntimeUnitObservation::source_phase()
@@ -1129,6 +1185,9 @@ class RuntimeObservationReducer::Impl final {
         report == nullptr
             ? std::optional<ManagedCommandSurfaceState>{}
             : report->command_surface_state(),
+        report == nullptr
+            ? std::string{}
+            : report->offered_runtime_contract_offer_digest(),
         std::move(dependency_epochs),
         report == nullptr
             ? std::vector<std::string>{}
@@ -1247,6 +1306,11 @@ class RuntimeObservationReducer::Impl final {
     if (source.configuration_identity() !=
         expectation.configuration_identity()) {
       reasons.insert("runtime_configuration_identity_mismatch");
+    }
+    if (!expectation.selected_runtime_contract_offer_digest().empty() &&
+        source.offered_runtime_contract_offer_digest() !=
+            expectation.selected_runtime_contract_offer_digest()) {
+      reasons.insert("runtime_contract_offer_digest_mismatch");
     }
     if (source.local_phase() != RuntimeSourcePhase::kServing) {
       reasons.insert(
