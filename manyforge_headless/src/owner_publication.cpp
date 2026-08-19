@@ -757,6 +757,8 @@ ToString(const ManagerApplyMutationAvailability availability) noexcept {
     return "available";
   case ManagerApplyMutationAvailability::kKernelOwnerUnavailable:
     return "unavailable";
+  case ManagerApplyMutationAvailability::kFullStackRestartRequired:
+    return "full_stack_restart_required";
   }
   return {};
 }
@@ -805,13 +807,19 @@ CanonicalValue BuildManagerSourcePayload(
 
   const bool apply_available =
       apply_availability == ManagerApplyMutationAvailability::kAvailable;
-  const auto reason =
-      apply_available
-          ? CanonicalValue(nullptr)
-          : CanonicalValue(std::string(kKernelOwnerUnavailableReasonCode));
+  const auto reason = apply_available
+                          ? CanonicalValue(nullptr)
+                          : CanonicalValue(std::string(
+                                apply_availability ==
+                                        ManagerApplyMutationAvailability::
+                                            kFullStackRestartRequired
+                                    ? "full_stack_restart_required"
+                                    : kKernelOwnerUnavailableReasonCode));
   const bool runtime_converged =
       runtime.state ==
-      component_manager::ManagerActiveRuntimeConvergenceState::kConverged;
+          component_manager::ManagerActiveRuntimeConvergenceState::kConverged &&
+      apply_availability !=
+          ManagerApplyMutationAvailability::kFullStackRestartRequired;
   return CanonicalValue(CanonicalValue::Object{
       {"active",
        CanonicalValue(CanonicalValue::Object{

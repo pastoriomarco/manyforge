@@ -51,6 +51,7 @@ if(NOT TARGET manyforge::deployment_verification_core OR
 endif()
 
 add_library(manyforge_headless
+  src/manager_package_generation.cpp
   src/operator_alarm_catalog.cpp
   src/operator_alarm_metrics.cpp
   src/operator_alarm_owner.cpp
@@ -207,6 +208,13 @@ if(BUILD_TESTING)
   include(GoogleTest)
   set(MANYFORGE_HEADLESS_GTEST_TIMEOUT_SECONDS "60" CACHE STRING
       "Per-test timeout for manyforge_headless gtest cases")
+
+  add_executable(test_manager_package_generation
+    test/test_manager_package_generation.cpp)
+  target_link_libraries(test_manager_package_generation PRIVATE
+    manyforge_headless GTest::gtest_main)
+  gtest_discover_tests(test_manager_package_generation
+    PROPERTIES TIMEOUT ${MANYFORGE_HEADLESS_GTEST_TIMEOUT_SECONDS})
 
   add_executable(test_source_snapshot test/test_source_snapshot.cpp)
   target_link_libraries(test_source_snapshot PRIVATE

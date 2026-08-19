@@ -1136,6 +1136,84 @@ TEST(ManagerDaemonProcess,
   EXPECT_TRUE(WIFEXITED(replacement.Stop(SIGTERM)));
 }
 
+TEST(ManagerDaemonProcess,
+     PackageRootReplacementLatchesTypedRestartWhileReadsAndStopRemainOpen) {
+  DaemonDirectory directory;
+  std::filesystem::copy(MANYFORGE_HEADLESS_TEST_CANONICAL_EMPTY_PACKAGE_ROOT,
+                        directory.apply_package_root(),
+                        std::filesystem::copy_options::recursive);
+  const auto selected_root = directory.apply_package_root();
+  const auto displaced_root = selected_root.string() + ".displaced";
+  ManagerProcess manager(directory, selected_root.string());
+  manager.WaitReady(directory);
+  AtomicSourceSnapshotChannel manager_source(directory.publication_root(),
+                                             "manager-source.json");
+  const auto before = manager_source.Read();
+  ASSERT_TRUE(before.has_value());
+
+  std::filesystem::rename(selected_root, displaced_root);
+  ASSERT_TRUE(std::filesystem::create_directory(selected_root));
+
+  const auto reconcile = SendCommand(
+      directory.socket_path(),
+      R"({"api_version":"manyforge.manager_command.v1","command":"reconcile"})");
+  EXPECT_NE(reconcile.find("\"code\":\"full_stack_restart_required\""),
+            std::string::npos)
+      << reconcile;
+  EXPECT_NE(reconcile.find("\"reason\":\"snapshot_integrity_lost\""),
+            std::string::npos)
+      << reconcile;
+  EXPECT_NE(reconcile.find("\"retryable\":\"false\""),
+            std::string::npos)
+      << reconcile;
+  EXPECT_NE(reconcile.find(
+                "\"required_action\":\"complete_stack_stop_start\""),
+            std::string::npos)
+      << reconcile;
+
+  const auto apply = SendCommand(
+      directory.socket_path(),
+      ApplyRequest(before->source_owner_epoch));
+  EXPECT_NE(apply.find("\"code\":\"full_stack_restart_required\""),
+            std::string::npos)
+      << apply;
+  EXPECT_NE(apply.find("\"request_id\":"), std::string::npos) << apply;
+
+  const auto owner_read = SendCommand(
+      directory.socket_path(),
+      R"({"api_version":"manyforge.manager_command.v1","command":"scene_owner_read"})");
+  EXPECT_NE(owner_read.find("\"ok\":true"), std::string::npos) << owner_read;
+
+  const auto deadline =
+      std::chrono::steady_clock::now() + std::chrono::seconds(2);
+  std::optional<SourceSnapshot> blocked;
+  while (std::chrono::steady_clock::now() < deadline) {
+    blocked = manager_source.Read();
+    if (blocked.has_value() &&
+        content_identity::canonical_json(blocked->payload)
+                .find("full_stack_restart_required") != std::string::npos) {
+      break;
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds(5));
+  }
+  ASSERT_TRUE(blocked.has_value());
+  const auto blocked_payload =
+      content_identity::canonical_json(blocked->payload);
+  EXPECT_NE(blocked_payload.find("\"manager_ready\":false"),
+            std::string::npos);
+  EXPECT_NE(blocked_payload.find(
+                "\"unavailable_reason_code\":\"full_stack_restart_required\""),
+            std::string::npos);
+
+  const auto shutdown = SendCommand(
+      directory.socket_path(),
+      R"({"api_version":"manyforge.manager_command.v1","command":"shutdown_runtime"})");
+  EXPECT_NE(shutdown.find("\"ok\":true"), std::string::npos) << shutdown;
+  const auto status = manager.Wait();
+  EXPECT_TRUE(WIFEXITED(status));
+  EXPECT_EQ(WEXITSTATUS(status), 0);
+}
+
 TEST(ManagerDaemonProcess, EnforcesOneProcessOwnerPerManagerStateRoot) {
   DaemonDirectory directory;
   ManagerProcess owner(directory);

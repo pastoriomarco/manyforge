@@ -1,4 +1,5 @@
 #include "manyforge_headless/owner_publication.hpp"
+#include "manyforge_headless/manager_package_generation.hpp"
 #include "manyforge_headless/scene_runtime_pose_projector.hpp"
 #include "manyforge_headless/scene_runtime_state_owner.hpp"
 #include "manyforge_headless/source_snapshot.hpp"
@@ -16,6 +17,7 @@
 #include <manyforge_deployment/canonical_empty_admission.hpp>
 #include <manyforge_deployment/native_execution_runtime_contract.hpp>
 #include <manyforge_deployment/ros2_control_execution_runtime_contract.hpp>
+#include <manyforge_deployment/runtime_contract_registry.hpp>
 #include <manyforge_deployment/scenario_apply_candidate_source.hpp>
 #include <manyforge_deployment/verified_retained_bundle.hpp>
 #include <manyforge_scene/canonical_empty_scene_owner.hpp>
@@ -42,6 +44,7 @@
 #include <iostream>
 #include <limits>
 #include <map>
+#include <memory>
 #include <optional>
 #include <stdexcept>
 #include <string>
@@ -314,6 +317,26 @@ enum class CommandKind {
   kReconcile,
   kShutdownRuntime,
 };
+
+[[nodiscard]] bool RequiresCurrentPackageGeneration(
+    const CommandKind command) noexcept {
+  switch (command) {
+  case CommandKind::kApply:
+  case CommandKind::kSceneCommit:
+  case CommandKind::kSceneCandidatePreview:
+  case CommandKind::kSceneRuntimeObserverOpen:
+  case CommandKind::kSceneRuntimeObserve:
+  case CommandKind::kSceneRuntimeLatchBeforePlanning:
+  case CommandKind::kReconcile:
+    return true;
+  case CommandKind::kSceneOwnerRead:
+  case CommandKind::kScenePoseQuery:
+  case CommandKind::kSceneRuntimeOwnerRead:
+  case CommandKind::kShutdownRuntime:
+    return false;
+  }
+  return true;
+}
 
 struct PoseObserverBinding final {
   std::string object_id;
@@ -1076,6 +1099,21 @@ CanonicalValue ApplyErrorResponse(const ManagerCommand &command,
   });
 }
 
+CanonicalValue ApplyDetailedErrorResponse(const ManagerCommand &command,
+                                          const core::ErrorDTO &error) {
+  Require(command.request_id.has_value() &&
+              command.request_owner_epoch.has_value(),
+          "decoded Apply command lacks request identity");
+  return CanonicalValue(CanonicalValue::Object{
+      {"api_version",
+       CanonicalValue(std::string(kManagerCommandResponseApiVersion))},
+      {"error", ErrorValue(error)},
+      {"ok", CanonicalValue(false)},
+      {"request_id", CanonicalValue(*command.request_id)},
+      {"request_owner_epoch", CanonicalValue(*command.request_owner_epoch)},
+  });
+}
+
 CanonicalValue ApplyUnavailableResponse(const ManagerCommand &command) {
   return ApplyErrorResponse(
       command, kKernelOwnerUnavailableReasonCode,
@@ -1230,6 +1268,10 @@ public:
   explicit ManagerDaemon(DaemonConfig config)
       : config_(ValidateConfig(std::move(config))),
         started_at_(std::chrono::steady_clock::now()),
+        package_generation_(
+            config_.package_root,
+            deployment::build_qualified_runtime_contract_registry()
+                .package_manifest_set()),
         daemon_lock_(config_.manager_state_root),
         admission_(deployment::FilesystemCanonicalEmptyRetainedBundleSource(
                        config_.package_root,
@@ -1297,7 +1339,9 @@ public:
         scene_owner_id_("logical-scene." + admission_.cell_id().value()),
         scene_runtime_owner_id_("scene-runtime." +
                                 admission_.cell_id().value()) {
+    RequireCurrentPackageGeneration();
     EnsureBootstrap();
+    RequireCurrentPackageGeneration();
     if (TryRecoverIncompleteApply()) {
       static_cast<void>(ReconcileAndPublish());
     }
@@ -1360,6 +1404,11 @@ private:
   static DaemonConfig ValidateConfig(DaemonConfig config) {
     config.package_root =
         ExistingDirectory(std::move(config.package_root), "package root");
+    std::error_code package_root_error;
+    config.package_root =
+        std::filesystem::canonical(config.package_root, package_root_error);
+    Require(!package_root_error && config.package_root.is_absolute(),
+            "package root could not be canonicalized");
     config.manager_state_root = ExistingDirectory(
         std::move(config.manager_state_root), "Manager state root");
     config.runtime_state_root = ExistingDirectory(
@@ -1488,13 +1537,16 @@ private:
   }
 
   PublicationGenerations ReconcileAndPublish() {
+    RequireCurrentPackageGeneration();
     const auto runtime = active_runtime_.Reconcile();
+    last_runtime_ = runtime;
     kernel_apply_available_ = HasConvergedKernelApplyOwner(runtime);
     const auto bundle_id =
         runtime.plan.active_publication.request.candidate_retained_bundle_id;
     const auto active_bundle = bundle_source_.get_verified(bundle_id);
     Require(active_bundle != nullptr,
             "active publication has no independently verified retained bundle");
+    last_active_bundle_ = active_bundle;
     if (runtime.state ==
         component_manager::ManagerActiveRuntimeConvergenceState::kConverged) {
       const auto current_bindings =
@@ -1612,10 +1664,15 @@ private:
 
   void TryPeriodicReconcile() noexcept {
     try {
+      RequireCurrentPackageGeneration();
       if (TryRecoverIncompleteApply()) {
         static_cast<void>(ReconcileAndPublish());
       }
       static_cast<void>(ReconcileAndPublish());
+    } catch (const ManagerPackageGenerationRestartRequired &error) {
+      PublishPackageRestartRequired();
+      std::cerr << "Manager daemon package generation changed: "
+                << error.what() << '\n';
     } catch (const std::exception &error) {
       std::cerr << "Manager daemon periodic reconciliation failed: "
                 << error.what() << '\n';
@@ -1637,6 +1694,34 @@ private:
                    "fail-closed after an unknown failure\n";
     }
     return false;
+  }
+
+  void RequireCurrentPackageGeneration() {
+    package_generation_.RequireCurrent(
+        deployment::build_qualified_runtime_contract_registry()
+            .package_manifest_set());
+  }
+
+  void PublishPackageRestartRequired() noexcept {
+    kernel_apply_available_ = false;
+    if (!last_runtime_.has_value() || last_active_bundle_ == nullptr) {
+      return;
+    }
+    try {
+      static_cast<void>(manager_channel_.Publish(
+          "component_manager", manager_owner_id_, manager_owner_epoch_,
+          static_cast<std::int64_t>(ElapsedNs()),
+          BuildManagerSourcePayload(
+              *last_active_bundle_, *last_runtime_, stores_.apply_journal(),
+              ManagerApplyMutationAvailability::kFullStackRestartRequired)));
+    } catch (const std::exception &publication_error) {
+      std::cerr << "Manager daemon could not publish package-generation "
+                   "failure: "
+                << publication_error.what() << '\n';
+    } catch (...) {
+      std::cerr << "Manager daemon could not publish package-generation "
+                   "failure\n";
+    }
   }
 
   core::Result<SceneRuntimePoseApplicationResult>
@@ -1899,6 +1984,25 @@ private:
     }
     try {
       const auto command = DecodeCommand(*packet);
+      if (RequiresCurrentPackageGeneration(command.kind)) {
+        try {
+          RequireCurrentPackageGeneration();
+        } catch (const ManagerPackageGenerationRestartRequired &error) {
+          PublishPackageRestartRequired();
+          if (command.kind == CommandKind::kApply &&
+              command.request_id.has_value() &&
+              command.request_owner_epoch.has_value()) {
+            TrySendResponse(client.get(),
+                            ApplyDetailedErrorResponse(command, error.error()));
+          } else {
+            TrySendResponse(client.get(),
+                            DetailedErrorResponse(error.error().code,
+                                                  error.error().message,
+                                                  error.error().details));
+          }
+          return false;
+        }
+      }
       switch (command.kind) {
       case CommandKind::kApply: {
         if (*command.request_owner_epoch != manager_owner_epoch_) {
@@ -2341,6 +2445,12 @@ private:
                                         std::nullopt, std::nullopt));
         return true;
       }
+    } catch (const ManagerPackageGenerationRestartRequired &error) {
+      PublishPackageRestartRequired();
+      TrySendResponse(client.get(),
+                      DetailedErrorResponse(error.error().code,
+                                            error.error().message,
+                                            error.error().details));
     } catch (const std::exception &error) {
       TrySendResponse(client.get(),
                       ErrorResponse("manager_command_rejected", error.what()));
@@ -2354,6 +2464,7 @@ private:
 
   DaemonConfig config_;
   std::chrono::steady_clock::time_point started_at_;
+  ManagerPackageGeneration package_generation_;
   DaemonLock daemon_lock_;
   deployment::CanonicalEmptyRetainedBundleAdmission admission_;
   deployment::FilesystemVerifiedRetainedBundleSource bundle_source_;
@@ -2368,6 +2479,9 @@ private:
   component_manager::RuntimeUnitAdapterRouter runtime_adapter_router_;
   component_manager::ManagerActiveRuntimeCoordinator active_runtime_;
   bool kernel_apply_available_{};
+  std::optional<component_manager::ManagerActiveRuntimeConvergenceResult>
+      last_runtime_;
+  std::shared_ptr<const deployment::RetainedBundle> last_active_bundle_;
   core::RuntimeEpoch manager_runtime_epoch_;
   component_manager::ManagerNamedApplyCoordinator named_apply_;
   SceneRuntimeStateOwner scene_runtime_owner_;

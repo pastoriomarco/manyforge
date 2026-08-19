@@ -16,6 +16,7 @@ namespace manyforge::headless {
 enum class ManagerApplyMutationAvailability {
   kAvailable,
   kKernelOwnerUnavailable,
+  kFullStackRestartRequired,
 };
 
 [[nodiscard]] std::string_view

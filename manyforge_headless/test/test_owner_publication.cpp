@@ -241,6 +241,24 @@ TEST(ManagerSourcePublication,
   EXPECT_EQ(bytes.find("\"configuration_fence_id\":\""), std::string::npos);
 }
 
+TEST(ManagerSourcePublication,
+     PackageGenerationFailureClosesReadinessWithTypedReason) {
+  const auto admission = LoadAdmission();
+  TemporaryDirectory directory;
+  component_manager::SqliteManagerApplyJournal journal(
+      directory.path() / "apply.sqlite3", admission.cell_id());
+
+  const auto bytes = content_identity::canonical_json(BuildManagerSourcePayload(
+      admission.retained_bundle(), Runtime(admission), journal,
+      ManagerApplyMutationAvailability::kFullStackRestartRequired));
+  EXPECT_NE(bytes.find("\"manager_ready\":false"), std::string::npos);
+  EXPECT_NE(bytes.find("\"converged\":false"), std::string::npos);
+  EXPECT_NE(bytes.find("\"mutation_available\":false"), std::string::npos);
+  EXPECT_NE(bytes.find(
+                "\"unavailable_reason_code\":\"full_stack_restart_required\""),
+            std::string::npos);
+}
+
 TEST(LogicalSceneSourcePublication,
      DistinguishesUnavailableBootstrapFromAnActiveImmutableSnapshot) {
   const auto admission = LoadAdmission();
