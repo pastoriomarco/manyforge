@@ -32,8 +32,10 @@
 #include "manyforge_deployment/controller_topology_codec.hpp"
 #include "manyforge_deployment/model_source.hpp"
 #include "manyforge_deployment/provider_manifest_codec.hpp"
+#include "manyforge_core/runtime_contract_manifest_codec.hpp"
 #include "manyforge_deployment/runtime_policy_codec.hpp"
 #include "manyforge_deployment/runtime_profile_codec.hpp"
+#include "manyforge_deployment/runtime_contract_registry.hpp"
 #include "manyforge_deployment/stop_evidence_policy_codec.hpp"
 #include "native_execution_runtime_unit_internal.hpp"
 #include "planning_resource_map_internal.hpp"
@@ -382,7 +384,9 @@ catalogs_projection(std::span<const core::CatalogRecordRefDTO> records,
     const core::RetainedProductDTO &viewer_model,
     std::vector<core::RetainedControlDomainProductsDTO> control_domain_products,
     std::vector<core::RetainedProductDTO> symbol_role_maps,
-    std::vector<core::RetainedRuntimeUnitProductsDTO> runtime_unit_products) {
+    std::vector<core::RetainedRuntimeUnitProductsDTO> runtime_unit_products,
+    std::vector<core::RetainedRuntimeContractRequirementDTO>
+        runtime_contract_requirements) {
   const auto &deployment = qualified.deployment();
   const auto &registry = build_qualified_closed_schema_registry();
   return core::RetainedBundleDTO{
@@ -468,6 +472,7 @@ catalogs_projection(std::span<const core::CatalogRecordRefDTO> records,
                     .assistant_settings()
                     .retained_projection())
           : std::nullopt,
+      std::move(runtime_contract_requirements),
   };
 }
 
@@ -484,7 +489,9 @@ catalogs_projection(std::span<const core::CatalogRecordRefDTO> records,
         control_domain_products,
     std::span<const core::RetainedProductDTO> symbol_role_maps,
     std::span<const core::RetainedRuntimeUnitProductsDTO>
-        runtime_unit_products) {
+        runtime_unit_products,
+    std::span<const core::RetainedRuntimeContractRequirementDTO>
+        runtime_contract_requirements) {
   const auto &deployment = qualified.deployment();
   CanonicalValue::Object root{
       {"api_version",
@@ -508,6 +515,26 @@ catalogs_projection(std::span<const core::CatalogRecordRefDTO> records,
        *detail::encode_deployment_catalogs(
             deployment.applicability_inputs().value().retained_policy_records)
             .find_object_member("records")},
+      {"runtime_contract_requirements",
+       [&]() {
+         CanonicalValue::Array rows;
+         rows.reserve(runtime_contract_requirements.size());
+         for (const auto& row : runtime_contract_requirements) {
+           const auto encoded = core::EncodeRuntimeContractRequirement(
+               row.requirement);
+           if (!encoded.ok()) {
+             throw std::logic_error(
+                 "runtime requirement encoding failed during retention");
+           }
+           rows.emplace_back(CanonicalValue::Object{
+               {"runtime_unit_id",
+                CanonicalValue(row.runtime_unit_id.value())},
+               {"requirement",
+                parse_strict_json_model_yaml(encoded.value()).root()},
+           });
+         }
+         return CanonicalValue(std::move(rows));
+       }()},
       {"compiled_products",
        compiled_products_projection(planning_collision_model, viewer_model,
                                     control_domain_products, symbol_role_maps,
@@ -2427,6 +2454,19 @@ void require_verified_current_bundle_artifacts(
   }
 }
 
+void require_runtime_contracts_before_store(
+    const RetentionQualifiedDeployment& qualified) {
+  const auto& applicability = qualified.compiler_ir().applicability();
+  static_cast<void>(detail::derive_runtime_contract_requirements(
+      applicability.composition().graph(),
+      qualified.deployment()
+          .applicability_inputs()
+          .value()
+          .capability_provider_bindings,
+      applicability.capabilities(), applicability.provider_endpoints(),
+      applicability.runtime_profiles(), {}));
+}
+
 } // namespace
 
 void detail::require_pinocchio_family_mimic_profile(
@@ -2524,6 +2564,16 @@ detail::RetainedBundleMaterializer::materialize_prepared(
     std::span<const core::RetainedSourceRecordDTO> source_records,
     std::span<const core::RetainedGeneratorRecordDTO> generator_records,
     IRawArtifactStore &artifact_store) {
+  const auto &applicability = qualified.compiler_ir().applicability();
+  const auto runtime_contract_requirements =
+      detail::derive_runtime_contract_requirements(
+          qualified.compiler_ir().applicability().composition().graph(),
+          qualified.deployment()
+              .applicability_inputs()
+              .value()
+              .capability_provider_bindings,
+          applicability.capabilities(), applicability.provider_endpoints(),
+          applicability.runtime_profiles(), {});
   const std::vector<detail::RetainedArtifactInput> artifacts{
       {core::ArtifactRoleId(
            std::string(detail::kPlanningResourceMapArtifactRole)),
@@ -2774,11 +2824,18 @@ detail::RetainedBundleMaterializer::materialize_prepared(
         input.runtime_unit_id,
         std::vector<core::RetainedProductDTO>{std::move(product)}});
   }
+  detail::require_runtime_contract_requirements(
+      qualified.compiler_ir().applicability().composition().graph(),
+      qualified.deployment()
+          .applicability_inputs()
+          .value()
+          .capability_provider_bindings,
+      runtime_contract_requirements, runtime_unit_products);
 
   const CanonicalValue placeholder = retained_bundle_projection(
       kZeroDigest, qualified, context, schema_artifacts, source_records,
       generator_records, planning, viewer, control_domain_products,
-      symbol_role_maps, runtime_unit_products);
+      symbol_role_maps, runtime_unit_products, runtime_contract_requirements);
   const std::string retained_bundle_id = detail::compute_content_identity(
       placeholder,
       detail::ContentIdentitySpec{
@@ -2789,7 +2846,7 @@ detail::RetainedBundleMaterializer::materialize_prepared(
   CanonicalValue root = retained_bundle_projection(
       retained_bundle_id, qualified, context, schema_artifacts, source_records,
       generator_records, planning, viewer, control_domain_products,
-      symbol_role_maps, runtime_unit_products);
+      symbol_role_maps, runtime_unit_products, runtime_contract_requirements);
   std::string bytes = canonical_json(root);
   core::RetainedBundleDTO value = retained_bundle_value(
       retained_bundle_id, qualified, context,
@@ -2800,7 +2857,7 @@ detail::RetainedBundleMaterializer::materialize_prepared(
       std::vector<core::RetainedGeneratorRecordDTO>(generator_records.begin(),
                                                     generator_records.end()),
       planning, viewer, control_domain_products, symbol_role_maps,
-      runtime_unit_products);
+      runtime_unit_products, runtime_contract_requirements);
   auto bundle = detail::RetainedBundleConstructionAuthority::construct(
       core::RetainedBundleId(retained_bundle_id), std::move(value),
       std::move(root), std::move(bytes));
@@ -2839,6 +2896,7 @@ detail::RetainedBundleMaterializer::materialize_store_and_reload_production(
       prepare_planning_collision_product_before_store(
           qualified, preflight_context, input_artifact_source,
           structural_model_preparations);
+  require_runtime_contracts_before_store(qualified);
   const BuildQualifiedRetentionContext context =
       BuildQualifiedRetentionAuthority::qualify_persisted(
           manifest_repository, stop_evidence_candidates);
@@ -2884,6 +2942,7 @@ detail::RetainedBundleMaterializer::materialize(
       prepare_planning_collision_product_before_store(
           qualified, context, input_artifact_source,
           structural_model_preparations);
+  require_runtime_contracts_before_store(qualified);
   retain_prepared_inputs(prepared, input_artifact_source,
                          catalog_artifact_store, artifact_store);
   return materialize_prepared(

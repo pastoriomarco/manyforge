@@ -12,6 +12,7 @@
 #include "manyforge_deployment/artifact_codec.hpp"
 #include "manyforge_deployment/closed_schema.hpp"
 #include "manyforge_deployment/content_identity.hpp"
+#include "manyforge_deployment/runtime_contract_registry.hpp"
 #include "stop_qualification_evidence_internal.hpp"
 #include "verified_retained_bundle_internal.hpp"
 
@@ -278,6 +279,9 @@ native_execution_runtime_manifest_projection(const core::RuntimeUnitDTO &unit) {
             CanonicalValue(
                 std::string(kNativeExecutionRuntimeLaunchEnvironmentContract))},
        })},
+      {"runtime_contract_offer",
+       runtime_contract_offer_projection(
+           require_runtime_contract_for_unit(unit).offer())},
   });
 }
 
@@ -535,6 +539,14 @@ CanonicalValue parse_and_verify_native_execution_runtime_manifest(
       {},
       configuration,
   };
+  const auto embedded_offer = decode_runtime_contract_offer_projection(
+      require_member(object, "runtime_contract_offer",
+                     "native_execution_runtime_manifest"),
+      "native_execution_runtime_manifest.runtime_contract_offer");
+  if (embedded_offer != require_runtime_contract_for_unit(expected).offer()) {
+    fail_retained_bundle(
+        "native runtime embedded offer differs from package offer");
+  }
   if (api != kNativeExecutionRuntimeManifestApiVersion ||
       root != native_execution_runtime_manifest_projection(expected)) {
     fail_retained_bundle(

@@ -35,6 +35,12 @@ inline constexpr std::string_view kReferenceRuntimeRetrievalContractId =
     "manyforge.retained_raw_artifact";
 inline constexpr std::string_view kReferenceRuntimeStatusEndpointContractId =
     "manyforge.reference_runtime.status_stdout";
+// These are immutable public API identities, not endpoint-contract revisions.
+// Their semantic owner is the reference runtime process.
+inline constexpr std::string_view kReferenceRuntimeRoleApiContractId =
+    "manyforge.api.reference.execution";
+inline constexpr std::string_view kReferenceRuntimeStatusApiContractId =
+    "manyforge.api.reference.status";
 inline constexpr std::string_view kReferenceRuntimeOperatingSystem = "linux";
 inline constexpr std::string_view kReferenceRuntimeShellContract = "posix.1-2017";
 inline constexpr std::size_t kMaxReferenceRuntimeManifestBytes = 64U * 1024U;

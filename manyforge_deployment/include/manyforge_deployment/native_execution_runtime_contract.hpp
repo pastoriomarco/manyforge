@@ -42,6 +42,16 @@ inline constexpr std::string_view kProjectionEndpointContractId =
     "manyforge.planner_scene_projection.rpc";
 inline constexpr std::string_view kLogicalSceneEndpointContractId =
     "manyforge.logical_scene.services";
+// These are immutable public API identities, not endpoint-contract revisions.
+// Their semantic owner is the native execution host.
+inline constexpr std::string_view kRuntimeRoleApiContractId =
+    "manyforge.api.native.execution";
+inline constexpr std::string_view kStatusEndpointApiContractId =
+    "manyforge.api.native.status";
+inline constexpr std::string_view kProjectionEndpointApiContractId =
+    "manyforge.api.native.projection";
+inline constexpr std::string_view kLogicalSceneEndpointApiContractId =
+    "manyforge.api.native.logical_scene";
 inline constexpr std::string_view kOperatingSystem = "linux";
 inline constexpr std::string_view kLaunchEnvironmentContract =
     "manyforge.native_execution_host.abi.v1";

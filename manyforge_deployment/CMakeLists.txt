@@ -143,6 +143,18 @@ if(NOT IS_DIRECTORY "${MANYFORGE_CORE_INCLUDE_DIR}")
     "the configured manyforge_core include root does not exist: "
     "${MANYFORGE_CORE_INCLUDE_DIR}")
 endif()
+get_filename_component(
+  MANYFORGE_CORE_SOURCE_DIR
+  "${MANYFORGE_CORE_INCLUDE_DIR}/.."
+  ABSOLUTE)
+set(
+  MANYFORGE_RUNTIME_CONTRACT_CODEC_SOURCE
+  "${MANYFORGE_CORE_SOURCE_DIR}/src/runtime_contract_manifest_codec.cpp")
+if(NOT EXISTS "${MANYFORGE_RUNTIME_CONTRACT_CODEC_SOURCE}")
+  message(FATAL_ERROR
+    "manyforge_deployment requires the O1.4b runtime-contract codec source: "
+    "${MANYFORGE_RUNTIME_CONTRACT_CODEC_SOURCE}")
+endif()
 
 set(
   MANYFORGE_CONTENT_IDENTITY_SOURCE_DIR
@@ -183,7 +195,8 @@ file(
   "${CMAKE_CURRENT_SOURCE_DIR}/tools/*.py"
   "${MANYFORGE_CONTENT_IDENTITY_SOURCE_DIR}/include/*"
   "${MANYFORGE_CONTENT_IDENTITY_SOURCE_DIR}/src/*.cpp"
-  "${MANYFORGE_CORE_INCLUDE_DIR}/*")
+  "${MANYFORGE_CORE_INCLUDE_DIR}/*"
+  "${MANYFORGE_RUNTIME_CONTRACT_CODEC_SOURCE}")
 list(
   REMOVE_ITEM
   MANYFORGE_COMPILER_SOURCE_INPUTS
@@ -216,6 +229,10 @@ function(
     elseif(relative_path MATCHES
            "^manyforge_core/include/(.+)\\.(h|hpp)$")
       set(logical_id "cpp-public-header:${CMAKE_MATCH_1}")
+    elseif(relative_path MATCHES
+           "^manyforge_core/src/(.+)\\.cpp$")
+      set(logical_id
+          "cpp-translation-unit:manyforge_core/${CMAKE_MATCH_1}")
     elseif(relative_path MATCHES
            "^manyforge_content_identity/include/(.+)\\.(h|hpp)$")
       set(
@@ -573,10 +590,30 @@ set(MANYFORGE_DEPLOYMENT_EXTERNAL_LIBRARIES
   PkgConfig::LIBYAML
 )
 
+if(TARGET manyforge_core)
+  set(MANYFORGE_RUNTIME_CONTRACT_CODEC_TARGET manyforge_core)
+else()
+  # Deployment is also qualified as a standalone CMake package. Reuse the
+  # exact O1.4b Core translation unit in that package rather than inventing a
+  # second runtime-contract codec or requiring the full Core link closure.
+  add_library(manyforge_deployment_runtime_contract_codec STATIC
+    "${MANYFORGE_RUNTIME_CONTRACT_CODEC_SOURCE}")
+  target_include_directories(manyforge_deployment_runtime_contract_codec
+    PUBLIC
+    "${MANYFORGE_CORE_INCLUDE_DIR}"
+    "${MANYFORGE_CONTENT_IDENTITY_SOURCE_DIR}/include")
+  target_link_libraries(manyforge_deployment_runtime_contract_codec PUBLIC
+    manyforge::content_identity)
+  set(MANYFORGE_RUNTIME_CONTRACT_CODEC_TARGET
+    manyforge_deployment_runtime_contract_codec)
+endif()
+
 # Canonical projection/parsing, identity, exact build-evidence verification,
 # and retained-bundle readback. This private substrate cannot mint retention
 # authority and is deliberately free of materializer, repository-writer,
-# package-generator, and admission-selection effects.
+# package-generator, and admission-selection effects. The O1.4c runtime
+# contract boundary reuses Core's verified runtime-contract codec, either
+# through the concrete Core target or its exact standalone translation unit.
 add_library(manyforge_deployment_verification_core
   src/assistant_settings_codec.cpp
   src/apply_affected_scope.cpp
@@ -604,6 +641,7 @@ add_library(manyforge_deployment_verification_core
   src/provider_manifest_codec.cpp
   src/runtime_program_binding.cpp
   src/reference_runtime_unit_verifier.cpp
+  src/runtime_contract_registry.cpp
   src/verified_retained_projection.cpp
   src/runtime_profile_codec.cpp
   src/runtime_policy_codec.cpp
@@ -624,7 +662,8 @@ target_include_directories(manyforge_deployment_verification_core PRIVATE
   "${CMAKE_CURRENT_BINARY_DIR}/generated")
 target_link_libraries(manyforge_deployment_verification_core PUBLIC
   manyforge::content_identity
-  ${MANYFORGE_DEPLOYMENT_EXTERNAL_LIBRARIES})
+  ${MANYFORGE_DEPLOYMENT_EXTERNAL_LIBRARIES}
+  ${MANYFORGE_RUNTIME_CONTRACT_CODEC_TARGET})
 set_target_properties(
   manyforge_deployment_verification_core
   PROPERTIES POSITION_INDEPENDENT_CODE ON)
@@ -1733,6 +1772,15 @@ if(BUILD_TESTING)
   target_link_libraries(test_retained_bundle_materializer PRIVATE
     manyforge_deployment GTest::gtest_main)
   gtest_discover_tests(test_retained_bundle_materializer
+    PROPERTIES TIMEOUT ${MANYFORGE_GTEST_TIMEOUT_SECONDS})
+
+  add_executable(test_runtime_contract_registry
+    test/test_runtime_contract_registry.cpp)
+  target_include_directories(test_runtime_contract_registry PRIVATE
+    "${CMAKE_CURRENT_SOURCE_DIR}/src")
+  target_link_libraries(test_runtime_contract_registry PRIVATE
+    manyforge_deployment GTest::gtest_main)
+  gtest_discover_tests(test_runtime_contract_registry
     PROPERTIES TIMEOUT ${MANYFORGE_GTEST_TIMEOUT_SECONDS})
 
   add_executable(test_build_manifest

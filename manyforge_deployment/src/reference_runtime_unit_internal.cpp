@@ -7,6 +7,7 @@
 #include "manyforge_deployment/artifact_codec.hpp"
 #include "manyforge_deployment/cell_compiler.hpp"
 #include "manyforge_deployment/content_identity.hpp"
+#include "manyforge_deployment/runtime_contract_registry.hpp"
 #include "verified_retained_bundle_internal.hpp"
 
 namespace manyforge::deployment::detail {
@@ -52,6 +53,7 @@ namespace {
 [[nodiscard]] CanonicalValue reference_runtime_projection(
     const CompilerQualifiedCellIr& compiler_ir, const core::RuntimeUnitId& runtime_unit_id) {
   const auto& unit = require_reference_runtime_unit(compiler_ir, runtime_unit_id);
+  const auto& runtime_contract = require_runtime_contract_for_unit(unit);
   return CanonicalValue(CanonicalValue::Object{
       {"api_version", CanonicalValue(std::string(kReferenceRuntimeManifestApiVersion))},
       {"runtime_unit_id", CanonicalValue(unit.runtime_unit_id.value())},
@@ -103,6 +105,8 @@ namespace {
            {"operating_system", CanonicalValue(std::string(kReferenceRuntimeOperatingSystem))},
            {"shell_contract", CanonicalValue(std::string(kReferenceRuntimeShellContract))},
        })},
+      {"runtime_contract_offer",
+       runtime_contract_offer_projection(runtime_contract.offer())},
   });
 }
 

@@ -11,6 +11,7 @@
 
 #include "manyforge_deployment/artifact_codec.hpp"
 #include "manyforge_deployment/content_identity.hpp"
+#include "manyforge_deployment/runtime_contract_registry.hpp"
 #include "reference_runtime_unit_internal.hpp"
 #include "verified_retained_bundle_internal.hpp"
 
@@ -312,7 +313,8 @@ parse_and_verify_reference_runtime_manifest(std::string_view canonical_bytes) {
                        {"api_version", "runtime_unit_id", "runtime_product_id",
                         "runtime_profile", "process_adapter",
                         "runtime_role_mappings", "source_endpoint_mappings",
-                        "launchable_artifact", "platform_constraints"},
+                        "launchable_artifact", "platform_constraints",
+                        "runtime_contract_offer"},
                        "runtime_manifest");
   if (require_string(require_member(object, "api_version", "runtime_manifest"),
                      "runtime_manifest.api_version") !=
@@ -327,6 +329,19 @@ parse_and_verify_reference_runtime_manifest(std::string_view canonical_bytes) {
           reference_runtime_product_id(core::RuntimeUnitId(runtime_unit_id))) {
     fail_retained_bundle(
         "reference runtime manifest has an unqualified subject identity");
+  }
+  const auto embedded_offer = decode_runtime_contract_offer_projection(
+      require_member(object, "runtime_contract_offer", "runtime_manifest"),
+      "runtime_manifest.runtime_contract_offer");
+  const auto& runtime_contract = require_runtime_contract(
+      core::RuntimeProfileId(std::string(kReferenceRuntimeProfileId)),
+      core::RuntimeProfileRevision(reference_runtime_profile_revision()),
+      core::ProductContractId(
+          std::string(kReferenceRuntimeProductContractId)),
+      reference_runtime_product_contract_revision());
+  if (embedded_offer != runtime_contract.offer()) {
+    fail_retained_bundle(
+        "reference runtime embedded offer differs from package offer");
   }
 
   const auto &profile = require_object(

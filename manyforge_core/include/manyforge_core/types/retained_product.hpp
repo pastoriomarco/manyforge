@@ -6,6 +6,7 @@
 #include <manyforge_core/types/cell_graph.hpp>
 #include <manyforge_core/types/deployment_applicability.hpp>
 #include <manyforge_core/types/retained_artifact.hpp>
+#include <manyforge_core/types/runtime_contract_manifest.hpp>
 #include <manyforge_core/types/strong_id.hpp>
 #include <optional>
 #include <string>
@@ -120,6 +121,19 @@ struct RetainedRuntimeUnitProductsDTO final {
 
   friend bool operator==(const RetainedRuntimeUnitProductsDTO&,
                          const RetainedRuntimeUnitProductsDTO&) = default;
+};
+
+/// One compiler-sealed runtime-contract requirement.  This is intentionally
+/// a top-level retained table rather than runtime product metadata: product
+/// artifacts own lifecycle/configuration facts, while this row owns the
+/// pre-store compatibility proof.
+struct RetainedRuntimeContractRequirementDTO final {
+  RuntimeUnitId runtime_unit_id;
+  RuntimeContractRequirementDTO requirement;
+
+  friend bool operator==(const RetainedRuntimeContractRequirementDTO&,
+                         const RetainedRuntimeContractRequirementDTO&) =
+      default;
 };
 
 /// Complete closed v1 compiled-product placement table.
@@ -257,6 +271,8 @@ struct RetainedBundleDTO final {
   std::optional<SiteOverlayRefDTO> selected_site_overlay_ref;
   std::vector<ExternalResourceDTO> external_resources;
   std::optional<RetainedAssistantProjectionDTO> assistant;
+  std::vector<RetainedRuntimeContractRequirementDTO>
+      runtime_contract_requirements;
 
   friend bool operator==(const RetainedBundleDTO&,
                          const RetainedBundleDTO&) = default;

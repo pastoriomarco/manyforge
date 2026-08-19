@@ -12,6 +12,7 @@
 #include "manyforge_deployment/artifact_codec.hpp"
 #include "manyforge_deployment/closed_schema.hpp"
 #include "manyforge_deployment/content_identity.hpp"
+#include "manyforge_deployment/runtime_contract_registry.hpp"
 #include "stop_qualification_evidence_internal.hpp"
 #include "verified_retained_bundle_internal.hpp"
 
@@ -353,6 +354,9 @@ CanonicalValue ros2_control_execution_runtime_manifest_projection(
             CanonicalValue(std::string(
                 kRos2ControlExecutionRuntimeLaunchEnvironmentContract))},
        })},
+      {"runtime_contract_offer",
+       runtime_contract_offer_projection(
+           require_runtime_contract_for_unit(unit).offer())},
   });
 }
 
@@ -548,6 +552,14 @@ CanonicalValue parse_and_verify_ros2_control_execution_runtime_manifest(
       {},
       configuration,
   };
+  const auto embedded_offer = decode_runtime_contract_offer_projection(
+      require_member(object, "runtime_contract_offer",
+                     "ros2_control_execution_runtime_manifest"),
+      "ros2_control_execution_runtime_manifest.runtime_contract_offer");
+  if (embedded_offer != require_runtime_contract_for_unit(expected).offer()) {
+    fail_retained_bundle(
+        "ros2_control runtime embedded offer differs from package offer");
+  }
   if (api != kRos2ControlExecutionRuntimeManifestApiVersion ||
       root != ros2_control_execution_runtime_manifest_projection(expected)) {
     fail_retained_bundle("ros2_control execution runtime manifest differs "

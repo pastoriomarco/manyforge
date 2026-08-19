@@ -25,7 +25,9 @@
 #include "manyforge_deployment/closed_schema.hpp"
 #include "manyforge_deployment/content_identity.hpp"
 #include "manyforge_deployment/deployment_applicability_codec.hpp"
+#include "manyforge_core/runtime_contract_manifest_codec.hpp"
 #include "manyforge_deployment/runtime_profile_codec.hpp"
+#include "manyforge_deployment/runtime_contract_registry.hpp"
 #include "manyforge_deployment/structural_model_preparation.hpp"
 #include "composed_model_symbol_role_map_internal.hpp"
 #include "native_execution_runtime_unit_internal.hpp"
@@ -1282,7 +1284,7 @@ verify_current_retained_bundle_projection(const CanonicalValue& root) {
       {"api_version", "retained_bundle_id", "deployment_artifact_id",
        "deployment_revision", "cell_graph", "catalogs",
        "desired_control_configurations", "capability_provider_bindings",
-       "retained_policy_records",
+       "retained_policy_records", "runtime_contract_requirements",
        "compiled_products", "provenance"},
       {"site_overlay_ref", "external_resources", "assistant"},
       "retained_bundle");
@@ -1420,6 +1422,43 @@ verify_current_retained_bundle_projection(const CanonicalValue& root) {
           std::string("retained assistant projection is invalid: ") +
           error.what());
     }
+  }
+
+  const auto& requirement_values = require_array(
+      require_member(object, "runtime_contract_requirements",
+                     "retained_bundle"),
+      "retained_bundle.runtime_contract_requirements");
+  std::vector<core::RetainedRuntimeContractRequirementDTO>
+      runtime_contract_requirements;
+  runtime_contract_requirements.reserve(requirement_values.size());
+  for (std::size_t index = 0U; index < requirement_values.size(); ++index) {
+    const std::string path =
+        "retained_bundle.runtime_contract_requirements[" +
+        std::to_string(index) + "]";
+    const auto& row = require_object(requirement_values[index], path);
+    require_exact_fields(row, {"runtime_unit_id", "requirement"}, path);
+    const std::string runtime_unit_id =
+        require_string(require_member(row, "runtime_unit_id", path),
+                       path + ".runtime_unit_id");
+    detail::require_retained_portable_identity(
+        runtime_unit_id, path + ".runtime_unit_id");
+    const auto& requirement_value =
+        require_member(row, "requirement", path);
+    const auto decoded = core::DecodeRuntimeContractRequirement(
+        canonical_json(requirement_value));
+    if (!decoded.ok()) {
+      detail::fail_retained_bundle(
+          path + ".requirement is not a canonical verified requirement");
+    }
+    const auto reencoded =
+        core::EncodeRuntimeContractRequirement(decoded.value());
+    if (!reencoded.ok() ||
+        reencoded.value() != canonical_json(requirement_value)) {
+      detail::fail_retained_bundle(
+          path + ".requirement is not a canonical verified requirement");
+    }
+    runtime_contract_requirements.push_back(
+        {core::RuntimeUnitId(runtime_unit_id), decoded.value()});
   }
 
   const auto& products = require_object(
@@ -1632,6 +1671,16 @@ verify_current_retained_bundle_projection(const CanonicalValue& root) {
         core::RuntimeUnitId(runtime_unit_id),
         std::vector<core::RetainedProductDTO>{std::move(product)}});
   }
+  const auto independently_derived_requirements =
+      detail::derive_runtime_contract_requirements(
+          verified_graph.graph(),
+          applicability.value().capability_provider_bindings, {}, {},
+          runtime_profiles, runtime_unit_products);
+  if (independently_derived_requirements != runtime_contract_requirements) {
+    detail::fail_retained_bundle(
+        "retained runtime-contract requirements differ from independent "
+        "rederivation");
+  }
 
   const auto& provenance =
       require_object(require_member(object, "provenance", "retained_bundle"),
@@ -1774,6 +1823,7 @@ verify_current_retained_bundle_projection(const CanonicalValue& root) {
       applicability.value().site_overlay_ref,
       applicability.value().external_resources,
       std::move(assistant),
+      std::move(runtime_contract_requirements),
   };
 }
 

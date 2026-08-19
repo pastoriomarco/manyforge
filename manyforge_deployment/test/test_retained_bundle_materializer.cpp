@@ -12,6 +12,7 @@
 #include <manyforge_deployment/retention_qualified_deployment.hpp>
 #include <manyforge_deployment/ros2_control_execution_runtime_contract.hpp>
 #include <manyforge_deployment/runtime_policy_codec.hpp>
+#include <manyforge_deployment/runtime_contract_registry.hpp>
 #include <manyforge_deployment/site_overlay_resolution.hpp>
 
 #include <algorithm>
@@ -24,6 +25,7 @@
 #include <string_view>
 #include <type_traits>
 #include <variant>
+#include <vector>
 
 #include "composed_model_symbol_role_map_internal.hpp"
 #include "content_identity_internal.hpp"
@@ -586,7 +588,7 @@ TEST(RetainedBundleMaterializer,
   EXPECT_EQ(store.size(), 3U);
 
   const CanonicalValue &root = bundle->normalized_root();
-  EXPECT_EQ(root.as_object().size(), 11U);
+  EXPECT_EQ(root.as_object().size(), 12U);
   EXPECT_EQ(string_member(root, "api_version"),
             core::kRetainedBundleApiVersion);
   EXPECT_EQ(string_member(root, "deployment_artifact_id"),
@@ -609,6 +611,7 @@ TEST(RetainedBundleMaterializer,
   EXPECT_TRUE(array_member(root, "desired_control_configurations").empty());
   EXPECT_TRUE(array_member(root, "capability_provider_bindings").empty());
   EXPECT_TRUE(array_member(root, "retained_policy_records").empty());
+  EXPECT_TRUE(array_member(root, "runtime_contract_requirements").empty());
   EXPECT_TRUE(bundle->value().retained_policy_records.empty());
 
   const CanonicalValue &products = member(root, "compiled_products");
@@ -1498,6 +1501,90 @@ TEST(RetainedBundleMaterializer,
   ASSERT_EQ(bundle->value().cell_graph.runtime_units.size(), 2U);
   ASSERT_EQ(bundle->value().capability_provider_bindings.size(), 6U);
   ASSERT_EQ(bundle->value().compiled_products.runtime_unit_products.size(), 2U);
+  ASSERT_EQ(bundle->value().runtime_contract_requirements.size(), 2U);
+  const auto expected_requirements =
+      detail::derive_runtime_contract_requirements(
+          fixture.qualified.compiler_ir()
+              .applicability()
+              .composition()
+              .graph(),
+          fixture.qualified.deployment()
+              .applicability_inputs()
+              .value()
+              .capability_provider_bindings,
+          fixture.qualified.compiler_ir().applicability().capabilities(),
+          fixture.qualified.compiler_ir()
+              .applicability()
+              .provider_endpoints(),
+          fixture.qualified.compiler_ir().applicability().runtime_profiles(), {});
+  EXPECT_EQ(bundle->value().runtime_contract_requirements,
+            expected_requirements);
+
+  const auto &graph =
+      fixture.qualified.compiler_ir().applicability().composition().graph();
+  ASSERT_EQ(graph.runtime_units.size(), 2U);
+  const auto &first_runtime = graph.runtime_units.front().runtime_unit_id;
+  const auto &second_runtime = graph.runtime_units.back().runtime_unit_id;
+  const auto &logical_capabilities =
+      fixture.qualified.compiler_ir().applicability().capabilities();
+  const auto &logical_endpoints =
+      fixture.qualified.compiler_ir().applicability().provider_endpoints();
+  const LogicalCapabilityTemplate *second_runtime_capability = nullptr;
+  for (const auto &capability : logical_capabilities) {
+    const auto *owner =
+        std::get_if<CapabilityProviderCapabilityOwner>(&capability.owner);
+    if (owner == nullptr) {
+      continue;
+    }
+    const auto endpoint = std::find_if(
+        logical_endpoints.begin(), logical_endpoints.end(),
+        [&](const auto &candidate) {
+          const auto *source =
+              std::get_if<RuntimeEndpointSourceTemplate>(&candidate.source);
+          return candidate.capability_provider_binding_id ==
+                     owner->capability_provider_binding_id &&
+                 candidate.capability_provider_binding_revision ==
+                     owner->capability_provider_binding_revision &&
+                 source != nullptr && source->runtime_unit_id == second_runtime;
+        });
+    if (endpoint != logical_endpoints.end()) {
+      second_runtime_capability = &capability;
+      break;
+    }
+  }
+  ASSERT_NE(second_runtime_capability, nullptr);
+  const std::vector<LogicalCapabilityTemplate> isolated_capability{
+      *second_runtime_capability};
+  const auto isolated_requirements =
+      detail::derive_runtime_contract_requirements(
+          graph,
+          fixture.qualified.deployment()
+              .applicability_inputs()
+              .value()
+              .capability_provider_bindings,
+          isolated_capability, logical_endpoints,
+          fixture.qualified.compiler_ir().applicability().runtime_profiles(),
+          {});
+  const auto isolated_ref = core::RuntimeCapabilityContractRefDTO{
+      second_runtime_capability->capability_id,
+      second_runtime_capability->capability_definition_revision};
+  for (const auto &row : isolated_requirements) {
+    const bool has_isolated_capability = std::binary_search(
+        row.requirement.required_capabilities.begin(),
+        row.requirement.required_capabilities.end(), isolated_ref,
+        [](const auto &left, const auto &right) {
+          if (left.capability_id != right.capability_id) {
+            return left.capability_id < right.capability_id;
+          }
+          return left.capability_definition_revision <
+                 right.capability_definition_revision;
+        });
+    if (row.runtime_unit_id == first_runtime) {
+      EXPECT_FALSE(has_isolated_capability);
+    } else if (row.runtime_unit_id == second_runtime) {
+      EXPECT_TRUE(has_isolated_capability);
+    }
+  }
 
   std::map<std::string, std::set<std::string>> capabilities_by_runtime;
   for (const auto &provider : bundle->value().capability_provider_bindings) {
@@ -1557,6 +1644,248 @@ TEST(RetainedBundleMaterializer,
     SCOPED_TRACE(runtime_id);
     EXPECT_EQ(capabilities, expected_capabilities);
   }
+}
+
+TEST(RetainedBundleMaterializer,
+     ExternalProviderEndpointsDoNotContributeRuntimeRequirements) {
+  const auto fixture = test::make_lite6_native_motion_retention_fixture();
+  const auto& applicability = fixture.qualified.compiler_ir().applicability();
+  const auto& graph = applicability.composition().graph();
+  ASSERT_EQ(graph.runtime_units.size(), 1U);
+
+  std::vector<core::CapabilityProviderBindingDTO> bindings(
+      fixture.qualified.deployment()
+          .applicability_inputs()
+          .value()
+          .capability_provider_bindings.begin(),
+      fixture.qualified.deployment()
+          .applicability_inputs()
+          .value()
+          .capability_provider_bindings.end());
+  std::vector<LogicalProviderEndpointTemplate> endpoints(
+      applicability.provider_endpoints().begin(),
+      applicability.provider_endpoints().end());
+
+  const auto binding_for = [&](std::string_view capability_id)
+      -> core::CapabilityProviderBindingDTO* {
+    const auto found = std::find_if(
+        bindings.begin(), bindings.end(), [capability_id](const auto& binding) {
+          return binding.capability_id.value() == capability_id;
+        });
+    return found == bindings.end() ? nullptr : &*found;
+  };
+  auto* mixed_binding = binding_for("planning.motion.joint_goal");
+  auto* external_only_binding = binding_for("planning.motion.pose_goal");
+  ASSERT_NE(mixed_binding, nullptr);
+  ASSERT_NE(external_only_binding, nullptr);
+
+  const auto endpoint_for =
+      [&](const core::CapabilityProviderBindingDTO& binding) {
+        return std::find_if(
+            endpoints.begin(), endpoints.end(), [&](const auto& endpoint) {
+              return endpoint.capability_provider_binding_id ==
+                         binding.capability_provider_binding_id &&
+                     endpoint.capability_provider_binding_revision ==
+                         binding.capability_provider_binding_revision;
+            });
+      };
+  const auto external_source =
+      [](const LogicalProviderEndpointTemplate& endpoint,
+         std::string_view alias, std::string_view role)
+      -> LogicalEndpointSourceTemplate {
+    return LogicalEndpointSourceTemplate(ExternalEndpointSourceTemplate{
+        core::ExternalResourceAlias(std::string(alias)),
+        core::ExternalResourceKind::kServiceEndpoint,
+        endpoint.provider_instance_id,
+        endpoint.provider_manifest_id,
+        endpoint.provider_manifest_revision,
+        core::EndpointRoleId(std::string(role)),
+        core::SiteOverlayValueRef("test.external"),
+        core::SiteOverlayId("test_overlay"),
+        core::SiteOverlayRevision(std::string(kZeroDigest)),
+        core::ContentDigest(std::string(kZeroDigest)),
+    });
+  };
+
+  const auto mixed_endpoint = endpoint_for(*mixed_binding);
+  ASSERT_NE(mixed_endpoint, endpoints.end());
+  ASSERT_TRUE(std::holds_alternative<RuntimeEndpointSourceTemplate>(
+      mixed_endpoint->source));
+  mixed_binding->endpoint_bindings.push_back(
+      {core::EndpointRoleId("mixed_external"),
+       core::CapabilityEndpointSourceKind::kExternalResource,
+       core::ExternalResourceAlias("mixed_external"),
+       core::EndpointRoleId("mixed_external")});
+  auto mixed_external_endpoint = *mixed_endpoint;
+  mixed_external_endpoint.endpoint_role_id =
+      core::EndpointRoleId("mixed_external");
+  mixed_external_endpoint.source =
+      external_source(*mixed_endpoint, "mixed_external", "mixed_external");
+  mixed_external_endpoint.logical_endpoint_symbol = "test_mixed_external";
+  endpoints.push_back(std::move(mixed_external_endpoint));
+
+  const auto external_only_endpoint = endpoint_for(*external_only_binding);
+  ASSERT_NE(external_only_endpoint, endpoints.end());
+  external_only_binding->endpoint_bindings = {
+      {core::EndpointRoleId("external_only"),
+       core::CapabilityEndpointSourceKind::kExternalResource,
+       core::ExternalResourceAlias("external_only"),
+       core::EndpointRoleId("external_only")}};
+  external_only_endpoint->endpoint_role_id =
+      core::EndpointRoleId("external_only");
+  external_only_endpoint->source =
+      external_source(*external_only_endpoint, "external_only",
+                      "external_only");
+
+  ASSERT_EQ(mixed_binding->endpoint_bindings.size(), 2U);
+  EXPECT_EQ(std::count_if(
+                mixed_binding->endpoint_bindings.begin(),
+                mixed_binding->endpoint_bindings.end(), [](const auto& endpoint) {
+                  return endpoint.source_kind ==
+                         core::CapabilityEndpointSourceKind::kRuntimeUnit;
+                }),
+            1U);
+  EXPECT_EQ(std::count_if(
+                mixed_binding->endpoint_bindings.begin(),
+                mixed_binding->endpoint_bindings.end(), [](const auto& endpoint) {
+                  return endpoint.source_kind ==
+                         core::CapabilityEndpointSourceKind::kExternalResource;
+                }),
+            1U);
+  ASSERT_EQ(external_only_binding->endpoint_bindings.size(), 1U);
+  EXPECT_EQ(external_only_binding->endpoint_bindings.front().source_kind,
+            core::CapabilityEndpointSourceKind::kExternalResource);
+  EXPECT_EQ(std::count_if(
+                endpoints.begin(), endpoints.end(), [&](const auto& endpoint) {
+                  return endpoint.capability_provider_binding_id ==
+                             mixed_binding->capability_provider_binding_id &&
+                         std::holds_alternative<RuntimeEndpointSourceTemplate>(
+                             endpoint.source);
+                }),
+            1U);
+  EXPECT_EQ(std::count_if(
+                endpoints.begin(), endpoints.end(), [&](const auto& endpoint) {
+                  return endpoint.capability_provider_binding_id ==
+                             mixed_binding->capability_provider_binding_id &&
+                         std::holds_alternative<ExternalEndpointSourceTemplate>(
+                             endpoint.source);
+                }),
+            1U);
+  EXPECT_TRUE(std::holds_alternative<ExternalEndpointSourceTemplate>(
+      endpoints[static_cast<std::size_t>(
+                    std::distance(endpoints.begin(), external_only_endpoint))]
+          .source));
+
+  const auto requirements = detail::derive_runtime_contract_requirements(
+      graph, bindings, applicability.capabilities(), endpoints,
+      applicability.runtime_profiles(), {});
+  ASSERT_EQ(requirements.size(), 1U);
+  const auto& requirement = requirements.front();
+  EXPECT_EQ(requirement.runtime_unit_id,
+            graph.runtime_units.front().runtime_unit_id);
+  ASSERT_EQ(requirement.requirement.required_api_contract_ids.size(), 3U);
+  EXPECT_EQ(
+      requirement.requirement.required_api_contract_ids,
+      (std::vector<core::ApiContractId>{
+          core::ApiContractId(std::string(
+              native_execution_runtime_contract::kRuntimeRoleApiContractId)),
+          core::ApiContractId(std::string(native_execution_runtime_contract::
+                                              kProjectionEndpointApiContractId)),
+          core::ApiContractId(std::string(
+              native_execution_runtime_contract::kStatusEndpointApiContractId))}));
+
+  const auto capability_for = [&](std::string_view capability_id)
+      -> const LogicalCapabilityTemplate* {
+    const auto found = std::find_if(
+        applicability.capabilities().begin(), applicability.capabilities().end(),
+        [capability_id](const auto& capability) {
+          return capability.capability_id.value() == capability_id;
+        });
+    return found == applicability.capabilities().end() ? nullptr : &*found;
+  };
+  const auto* control_capability =
+      capability_for("execution.trajectory.execute");
+  const auto* cartesian_capability =
+      capability_for("planning.motion.cartesian_path");
+  const auto* joint_capability = capability_for("planning.motion.joint_goal");
+  const auto* pose_capability = capability_for("planning.motion.pose_goal");
+  ASSERT_NE(control_capability, nullptr);
+  ASSERT_NE(cartesian_capability, nullptr);
+  ASSERT_NE(joint_capability, nullptr);
+  ASSERT_NE(pose_capability, nullptr);
+  ASSERT_EQ(requirement.requirement.required_capabilities.size(), 3U);
+  EXPECT_EQ(
+      requirement.requirement.required_capabilities,
+      (std::vector<core::RuntimeCapabilityContractRefDTO>{
+          {control_capability->capability_id,
+           control_capability->capability_definition_revision},
+          {cartesian_capability->capability_id,
+           cartesian_capability->capability_definition_revision},
+          {joint_capability->capability_id,
+           joint_capability->capability_definition_revision}}));
+  EXPECT_EQ(std::count_if(
+                requirement.requirement.required_capabilities.begin(),
+                requirement.requirement.required_capabilities.end(),
+                [&](const auto& capability) {
+                  return capability.capability_id ==
+                         pose_capability->capability_id;
+                }),
+            0U);
+}
+
+TEST(RetainedBundleMaterializer,
+     RuntimeContractRequirementsRejectMalformedCoverageAndNestedDigest) {
+  const auto fixture =
+      test::make_two_lite6_same_type_native_motion_retention_fixture();
+  const test::Lite6ControllableCompilerInputArtifactSource input_source(
+      fixture);
+  test::InMemoryCatalogArtifactStoreFixture catalog_store;
+  test::InMemoryRawArtifactStoreFixture raw_store;
+  const auto bundle = detail::RetainedBundleMaterializer::materialize(
+      fixture.qualified,
+      detail::RetentionMaterializerTestAccess::make_context(), input_source,
+      fixture.structural_preparations(), catalog_store, raw_store);
+  ASSERT_NE(bundle, nullptr);
+
+  CanonicalValue missing = bundle->normalized_root();
+  auto missing_rows =
+      array_member(missing, "runtime_contract_requirements");
+  missing_rows.pop_back();
+  missing = replace_root_member(
+      missing, "runtime_contract_requirements",
+      CanonicalValue(std::move(missing_rows)));
+  missing = reidentify_retained_bundle(std::move(missing));
+  EXPECT_THROW(static_cast<void>(detail::RetainedBundleReloadAuthority::reload(
+                   canonical_json(missing))),
+               RetainedBundleError);
+
+  CanonicalValue extra = bundle->normalized_root();
+  auto extra_rows = array_member(extra, "runtime_contract_requirements");
+  extra_rows.push_back(extra_rows.front());
+  extra = replace_root_member(
+      extra, "runtime_contract_requirements",
+      CanonicalValue(std::move(extra_rows)));
+  extra = reidentify_retained_bundle(std::move(extra));
+  EXPECT_THROW(static_cast<void>(detail::RetainedBundleReloadAuthority::reload(
+                   canonical_json(extra))),
+               RetainedBundleError);
+
+  CanonicalValue bad_digest = bundle->normalized_root();
+  auto digest_rows = array_member(bad_digest, "runtime_contract_requirements");
+  auto first_row = digest_rows.front();
+  auto requirement = member(first_row, "requirement");
+  requirement = replace_object_member(
+      requirement, "requirement_digest", CanonicalValue(std::string(kZeroDigest)));
+  first_row = replace_object_member(first_row, "requirement",
+                                    std::move(requirement));
+  digest_rows.front() = std::move(first_row);
+  bad_digest = replace_root_member(
+      bad_digest, "runtime_contract_requirements",
+      CanonicalValue(std::move(digest_rows)));
+  bad_digest = reidentify_retained_bundle(std::move(bad_digest));
+  EXPECT_THROW(static_cast<void>(detail::RetainedBundleReloadAuthority::reload(
+                   canonical_json(bad_digest))),
+               RetainedBundleError);
 }
 
 TEST(RetainedBundleMaterializer,
