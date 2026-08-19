@@ -231,4 +231,5 @@ cd "${REPO_ROOT}"
   manyforge_core/python/tests/test_operation_runtime_bindings.py \
   manyforge_core/python/tests/test_provider_manifest_bindings.py \
   manyforge_core/python/tests/test_runtime_profile_bindings.py \
+  manyforge_core/python/tests/test_runtime_contract_manifest_bindings.py \
   verification/composable_cell_i2/binding_contract_tests.py

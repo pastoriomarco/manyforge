@@ -341,6 +341,7 @@ _EXPECTED_CONSTRUCTIBLE_DTO_PROPERTIES: dict[str, tuple[str, ...]] = {
         "commissioned_stop_interfaces",
         "desired_control_configurations",
         "external_resources",
+        "retained_policy_records",
         "site_overlay_ref",
         "stop_stage_parameters",
     ),
@@ -421,6 +422,7 @@ _EXPECTED_CONSTRUCTOR_PARAMETERS: dict[str, tuple[str, ...]] = {
         "external_resources",
         "stop_stage_parameters",
         "commissioned_stop_interfaces",
+        "retained_policy_records",
     ),
     "DesiredControlBindingRouteDTO": (
         "control_binding_id",
@@ -1073,6 +1075,7 @@ def _canonical_empty_pipeline(module: ModuleType) -> dict[str, Any]:
         (),
         (),
         (),
+        (),
         selected_overlay,
     )
     compiler = _callable(module, "compile_cell_ir")(applicability)
@@ -1301,6 +1304,7 @@ def _constructible_dto_fixture(module: ModuleType) -> dict[str, Any]:
         "external_resources": (external_b, external_a),
         "stop_stage_parameters": (),
         "commissioned_stop_interfaces": (),
+        "retained_policy_records": (),
     }
     applicability_inputs = module.DeploymentApplicabilityInputsDTO(
         **applicability_inputs_kwargs

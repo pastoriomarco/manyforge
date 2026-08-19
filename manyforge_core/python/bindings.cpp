@@ -33,6 +33,7 @@ PYBIND11_MODULE(manyforge_core_py, m) {
   m.doc() = "ROS-free ManyForge DTO and pure deployment-compiler bindings";
 
   manyforge::core::python::register_strong_identity_bindings(m);
+  manyforge::core::python::register_runtime_contract_manifest_bindings(m);
   manyforge::core::python::register_catalog_record_bindings(m);
   manyforge::core::python::register_cell_graph_bindings(m);
   manyforge::core::python::register_component_type_bindings(m);

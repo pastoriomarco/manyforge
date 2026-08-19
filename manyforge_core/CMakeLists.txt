@@ -46,6 +46,7 @@ add_library(manyforge_core
   src/component_lifecycle_plan_catalog_codec.cpp
   src/component_lifecycle_plan_evaluator.cpp
   src/fixed_cclc_port_registry.cpp
+  src/runtime_contract_manifest_codec.cpp
   src/controller_lifecycle.cpp
   src/controller_lifecycle_evaluator.cpp
   src/cclc_domain_reservation_table.cpp
@@ -341,6 +342,13 @@ if(BUILD_TESTING)
   target_link_libraries(test_component_lifecycle_plan_catalog_codec PRIVATE
     manyforge_core GTest::gtest_main)
   gtest_discover_tests(test_component_lifecycle_plan_catalog_codec
+    PROPERTIES TIMEOUT ${MANYFORGE_GTEST_TIMEOUT_SECONDS})
+
+  add_executable(test_runtime_contract_manifest_codec
+    test/test_runtime_contract_manifest_codec.cpp)
+  target_link_libraries(test_runtime_contract_manifest_codec PRIVATE
+    manyforge_core GTest::gtest_main)
+  gtest_discover_tests(test_runtime_contract_manifest_codec
     PROPERTIES TIMEOUT ${MANYFORGE_GTEST_TIMEOUT_SECONDS})
 
   add_executable(test_cclc_domain_reservation_table
