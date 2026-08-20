@@ -489,14 +489,12 @@ RuntimeOfferProjection WaitForRuntimeOfferProjection(
       "Manager source did not publish the expected runtime offer projection");
 }
 
-pid_t WaitForSoleManagedChild(const pid_t manager,
-                              const pid_t excluded_child = -1) {
+pid_t WaitForSoleManagedChild(const pid_t manager) {
   const auto deadline =
       std::chrono::steady_clock::now() + std::chrono::seconds(10);
   while (std::chrono::steady_clock::now() < deadline) {
     const auto children = ReadDirectChildren(manager);
-    if (children.size() == 1U && children.front() != excluded_child &&
-        ::kill(children.front(), 0) == 0) {
+    if (children.size() == 1U && ::kill(children.front(), 0) == 0) {
       return children.front();
     }
     std::this_thread::sleep_for(std::chrono::milliseconds(10));
@@ -1923,9 +1921,10 @@ TEST(ManagerDaemonProcess,
     EXPECT_TRUE(recovered.observed_closed) << recovered.response;
     EXPECT_NE(recovered.owner_epoch, initial.owner_epoch);
     child_recovered_owner_epoch = recovered.owner_epoch;
-    const auto replacement_child =
-        WaitForSoleManagedChild(manager.pid(), first_child);
-    EXPECT_NE(replacement_child, first_child);
+    // A small PID namespace may immediately reuse the numeric PID. The fresh
+    // owner epoch above and one live direct child prove replacement without
+    // treating PID allocation as runtime identity.
+    EXPECT_GT(WaitForSoleManagedChild(manager.pid()), 0);
 
     child_recovered_offer =
         WaitForRuntimeOfferProjection(manager_source, recovered.owner_epoch);
