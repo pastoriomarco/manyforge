@@ -62,5 +62,24 @@ describe('headless availability banner', () => {
     expect(html).toContain('Complete product readiness remains gated');
     expect(html).toContain('Missing owners remain unknown');
     expect(html).toContain('Complete I6 qualification at N7');
+    expect(html).toContain('availability-connected');
+    expect(html).toContain('Qualification boundary');
+    expect(html).not.toContain('status-pill-danger');
+  });
+
+  it('keeps degraded health precise while making Retry and details explicit', () => {
+    const html = renderToStaticMarkup(createElement(UnavailableBanner, {
+      health: {
+        status: 'error',
+        message: 'Health request timed out.',
+      },
+      onRetry: () => undefined,
+    }));
+
+    expect(html).toContain('Runtime operations are unavailable');
+    expect(html).toContain('Health request timed out.');
+    expect(html).toContain('Retry health');
+    expect(html).toContain('Details');
+    expect(html).toContain('No readiness is inferred');
   });
 });

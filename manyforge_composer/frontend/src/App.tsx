@@ -1,10 +1,5 @@
-import {
-  useCallback,
-  useEffect,
-  useRef,
-  useState,
-} from 'react';
-import type { CSSProperties, KeyboardEvent, RefObject } from 'react';
+import { useCallback, useRef, useState } from 'react';
+import type { CSSProperties, RefObject } from 'react';
 
 import { ApiError, api } from './api/client';
 import { ArtifactBrowser } from './components/ArtifactBrowser';
@@ -12,13 +7,13 @@ import { AssistantOverlay } from './components/AssistantOverlay';
 import { CatalogPanel } from './components/CatalogPanel';
 import { CCLCPanel } from './components/CCLCPanel';
 import { CollapsedRail } from './components/CollapsedRail';
-import { DeploymentCompositionPanel } from './components/DeploymentCompositionPanel';
-import { ProgramWorkspace } from './components/ProgramWorkspace';
 import { ProgramRuntimePanel } from './components/ProgramRuntimePanel';
+import { ProgramWorkspace } from './components/ProgramWorkspace';
 import { SceneAuthoringWorkspace } from './components/SceneAuthoringWorkspace';
 import { UnavailableBanner } from './components/UnavailableBanner';
 import { HeadlessRuntimeSurfaces } from './components/HeadlessRuntimeSurfaces';
 import { RobotControlPanelView } from './components/RobotControlPanel';
+import { DeploymentCompositionPanel } from './components/DeploymentCompositionPanel';
 import { useHeadlessStateSource } from './hooks/useHeadlessState';
 import { useProgramWorkspace } from './hooks/useProgramWorkspace';
 import { useProgramRuntime } from './hooks/useProgramRuntime';
@@ -26,35 +21,16 @@ import { useRobotControl } from './hooks/useRobotControl';
 import { useStructuralResource } from './state/structuralResource';
 import type { ArtifactKind, FileBrowserEntry } from './types/api';
 
-type WorkspaceTab = 'program' | 'deployment' | 'scene';
-type MobilePane = 'navigation' | 'workspace' | 'commands';
-const MOBILE_WORKBENCH_QUERY = '(max-width: 76rem)';
-
-function useMobileWorkbench(): boolean {
-  const [mobile, setMobile] = useState(false);
-  useEffect(() => {
-    const query = window.matchMedia(MOBILE_WORKBENCH_QUERY);
-    const update = () => setMobile(query.matches);
-    update();
-    query.addEventListener('change', update);
-    return () => query.removeEventListener('change', update);
-  }, []);
-  return mobile;
-}
-
 function isNotFound(error: unknown): boolean {
   return error instanceof ApiError && error.status === 404;
 }
 
 export default function App() {
   const [selectedProgramPath, setSelectedProgramPath] = useState<string | null>(null);
-  const [workspaceTab, setWorkspaceTab] = useState<WorkspaceTab>('program');
-  const [mobilePane, setMobilePane] = useState<MobilePane>('workspace');
   const [navigationWidth, setNavigationWidth] = useState(320);
-  const [commandsWidth, setCommandsWidth] = useState(360);
+  const [commandsWidth, setCommandsWidth] = useState(520);
   const [navigationCollapsed, setNavigationCollapsed] = useState(false);
   const [commandsCollapsed, setCommandsCollapsed] = useState(false);
-  const mobileWorkbench = useMobileWorkbench();
   const navigationCollapse = useRef<HTMLButtonElement>(null);
   const navigationRail = useRef<HTMLButtonElement>(null);
   const commandsCollapse = useRef<HTMLButtonElement>(null);
@@ -79,8 +55,9 @@ export default function App() {
   const assistantEnabled = headlessEnabled
     && health.data.components.assistant_bridge === 'configured';
   const headlessStateSource = useHeadlessStateSource(headlessEnabled);
-  const viewerActive = workspaceTab === 'scene'
-    && (!mobileWorkbench || mobilePane === 'workspace');
+  // The workbench owns one persistent viewer. Its own observer throttling
+  // still controls demand rendering and latest-only data publication.
+  const viewerActive = !commandsCollapsed;
   const programController = useProgramWorkspace();
   const programRuntime = useProgramRuntime(headlessEnabled);
   const robotControl = useRobotControl(headlessEnabled);
@@ -90,22 +67,6 @@ export default function App() {
   ) => {
     setSelectedProgramPath(kind === 'program' ? entry?.path ?? null : null);
   }, []);
-  const selectAdjacentWorkspace = (
-    event: KeyboardEvent<HTMLButtonElement>,
-    current: WorkspaceTab,
-  ) => {
-    if (!['ArrowLeft', 'ArrowRight', 'Home', 'End'].includes(event.key)) return;
-    event.preventDefault();
-    const tabs: WorkspaceTab[] = ['program', 'deployment', 'scene'];
-    const index = tabs.indexOf(current);
-    const next = event.key === 'Home'
-      ? tabs[0]
-      : event.key === 'End'
-        ? tabs[tabs.length - 1]
-        : tabs[(index + (event.key === 'ArrowRight' ? 1 : -1) + tabs.length) % tabs.length];
-    setWorkspaceTab(next);
-    document.getElementById(`workspace-tab-${next}`)?.focus();
-  };
   const focusAfterLayout = (target: RefObject<HTMLButtonElement | null>) => {
     window.requestAnimationFrame(() => target.current?.focus());
   };
@@ -120,32 +81,18 @@ export default function App() {
         <div className="brand-mark" aria-hidden="true">MF</div>
         <div>
           <p className="eyebrow">ManyForge Composer</p>
-          <p className="app-title">Composable cell workspace</p>
+          <p className="app-title">Composable cell workbench</p>
         </div>
         <div className="header-boundary">
-          <span className="boundary-dot" aria-hidden="true" />
+          <span
+            className={`boundary-dot${headlessEnabled ? ' boundary-dot-connected' : ''}`}
+            aria-hidden="true"
+          />
           {headlessEnabled ? 'Headless owner connected' : 'Structural mode'}
         </div>
       </header>
 
       <UnavailableBanner health={health} onRetry={retryHealth} />
-
-      <nav className="mobile-pane-tabs" aria-label="Workbench areas">
-        {([
-          ['navigation', 'Navigate'],
-          ['workspace', 'Workspace'],
-          ['commands', 'Commands / status'],
-        ] as const).map(([id, label]) => (
-          <button
-            type="button"
-            key={id}
-            aria-pressed={mobilePane === id}
-            onClick={() => setMobilePane(id)}
-          >
-            {label}
-          </button>
-        ))}
-      </nav>
 
       <div
         className={[
@@ -154,12 +101,11 @@ export default function App() {
           commandsCollapsed ? 'commands-collapsed' : '',
         ].filter(Boolean).join(' ')}
         style={layoutStyle}
-        data-mobile-pane={mobilePane}
       >
-        <aside className="workbench-navigation" aria-label="Artifact and node navigation">
+        <aside className="workbench-navigation" aria-label="Catalog and artifact library">
           <div className="collapsed-rail-slot" hidden={!navigationCollapsed}>
             <CollapsedRail
-              label="Navigation"
+              label="Library"
               side="left"
               buttonRef={navigationRail}
               onExpand={() => {
@@ -170,11 +116,11 @@ export default function App() {
           </div>
           <div className="workbench-pane" hidden={navigationCollapsed}>
             <div className="pane-toolbar">
-              <strong>Navigate</strong>
+              <strong>Library</strong>
               <button
                 type="button"
                 ref={navigationCollapse}
-                aria-label="Collapse navigation pane"
+                aria-label="Collapse library pane"
                 onClick={() => {
                   setNavigationCollapsed(true);
                   focusAfterLayout(navigationRail);
@@ -184,91 +130,46 @@ export default function App() {
               </button>
             </div>
             <label className="pane-resize-control">
-              Navigation width
+              Library width
               <input
                 type="range"
-                aria-label="Navigation width"
-                min="240"
-                max="520"
+                aria-label="Library width"
+                min="220"
+                max="420"
                 step="10"
                 value={navigationWidth}
                 onChange={(event) => setNavigationWidth(event.currentTarget.valueAsNumber)}
               />
             </label>
-            <ArtifactBrowser onSelectionChange={handleArtifactSelection} />
+            {/* Catalog is first so the node palette is useful at startup. */}
             <CatalogPanel catalog={catalog} onRetry={retryCatalog} />
+            <details className="workbench-disclosure">
+              <summary>Artifacts · Program / Deployment</summary>
+              <ArtifactBrowser onSelectionChange={handleArtifactSelection} />
+            </details>
+            <details className="workbench-disclosure">
+              <summary>Deployment composition</summary>
+              <DeploymentCompositionPanel enabled={headlessEnabled} />
+            </details>
           </div>
         </aside>
 
-        <section className="workbench-workspace" aria-label="Authoring workspace">
-          <div className="workspace-tablist" role="tablist" aria-label="Workspace">
-            {([
-              ['program', 'Program'],
-              ['deployment', 'Deployment'],
-              ['scene', 'Scene / viewer'],
-            ] as const).map(([id, label]) => (
-              <button
-                type="button"
-                role="tab"
-                id={`workspace-tab-${id}`}
-                key={id}
-                aria-selected={workspaceTab === id}
-                aria-controls={`workspace-panel-${id}`}
-                tabIndex={workspaceTab === id ? 0 : -1}
-                onClick={() => setWorkspaceTab(id)}
-                onKeyDown={(event) => selectAdjacentWorkspace(event, id)}
-              >
-                {label}
-              </button>
-            ))}
-          </div>
-          <div
-            role="tabpanel"
-            id="workspace-panel-program"
-            aria-labelledby="workspace-tab-program"
-            hidden={workspaceTab !== 'program'}
-          >
-            <ProgramWorkspace
-              controller={programController}
-              runtime={programRuntime}
-              catalog={catalog}
-              environment={nodeEnvironment}
-              selectedProgramPath={selectedProgramPath}
-              onRetryCatalog={retryCatalog}
-              onRetryEnvironment={retryNodeEnvironment}
-            />
-          </div>
-          <div
-            role="tabpanel"
-            id="workspace-panel-deployment"
-            aria-labelledby="workspace-tab-deployment"
-            hidden={workspaceTab !== 'deployment'}
-          >
-            <DeploymentCompositionPanel enabled={headlessEnabled} />
-          </div>
-          <div
-            role="tabpanel"
-            id="workspace-panel-scene"
-            aria-labelledby="workspace-tab-scene"
-            hidden={workspaceTab !== 'scene'}
-          >
-            <SceneAuthoringWorkspace
-              enabled={headlessEnabled}
-              environment={nodeEnvironment}
-              headlessStateSource={headlessStateSource}
-              manifest={manifest}
-              onRetryManifest={retryManifest}
-              programController={programController}
-              robotControl={robotControl}
-              viewerActive={viewerActive}
-            />
-          </div>
+        <section className="workbench-workspace" aria-label="Program authoring workspace">
+          <ProgramWorkspace
+            controller={programController}
+            runtime={programRuntime}
+            catalog={catalog}
+            environment={nodeEnvironment}
+            selectedProgramPath={selectedProgramPath}
+            onRetryCatalog={retryCatalog}
+            onRetryEnvironment={retryNodeEnvironment}
+          />
         </section>
 
-        <aside className="workbench-commands" aria-label="Commands and owner status">
+        <aside className="workbench-commands" aria-label="Viewer and operations rail">
           <div className="collapsed-rail-slot" hidden={!commandsCollapsed}>
             <CollapsedRail
-              label="Commands"
+              label="Operations"
               side="right"
               buttonRef={commandsRail}
               onExpand={() => {
@@ -279,11 +180,11 @@ export default function App() {
           </div>
           <div className="workbench-pane" hidden={commandsCollapsed}>
             <div className="pane-toolbar">
-              <strong>Commands / owner status</strong>
+              <strong>Viewer / operations</strong>
               <button
                 type="button"
                 ref={commandsCollapse}
-                aria-label="Collapse commands and status pane"
+                aria-label="Collapse viewer and operations pane"
                 onClick={() => {
                   setCommandsCollapsed(true);
                   focusAfterLayout(commandsRail);
@@ -293,35 +194,59 @@ export default function App() {
               </button>
             </div>
             <label className="pane-resize-control">
-              Commands width
+              Operations rail width
               <input
                 type="range"
-                aria-label="Commands width"
-                min="300"
-                max="560"
+                aria-label="Operations rail width"
+                min="480"
+                max="720"
                 step="10"
                 value={commandsWidth}
                 onChange={(event) => setCommandsWidth(event.currentTarget.valueAsNumber)}
               />
             </label>
-            <ProgramRuntimePanel
-              enabled={headlessEnabled}
-              controller={programRuntime}
-            />
-            <RobotControlPanelView
-              enabled={headlessEnabled}
-              controller={robotControl}
-            />
-            <CCLCPanel enabled={headlessEnabled} />
-            <HeadlessRuntimeSurfaces
-              enabled={headlessEnabled}
-              headlessStateSource={headlessStateSource}
-            />
-            <AssistantOverlay
-              enabled={assistantEnabled}
-              headlessConnected={headlessEnabled}
-              programController={programController}
-            />
+            <div className="visual-operations-stack">
+              <SceneAuthoringWorkspace
+                enabled={headlessEnabled}
+                environment={nodeEnvironment}
+                headlessStateSource={headlessStateSource}
+                manifest={manifest}
+                onRetryManifest={retryManifest}
+                programController={programController}
+                robotControl={robotControl}
+                viewerActive={viewerActive}
+              />
+              <ProgramRuntimePanel
+                enabled={headlessEnabled}
+                controller={programRuntime}
+              />
+              <details className="workbench-disclosure">
+                <summary>Robot control</summary>
+                <RobotControlPanelView
+                  enabled={headlessEnabled}
+                  controller={robotControl}
+                />
+              </details>
+              <details className="workbench-disclosure">
+                <summary>Component lifecycle / CCLC</summary>
+                <CCLCPanel enabled={headlessEnabled} />
+              </details>
+              <details className="workbench-disclosure">
+                <summary>Runtime, alarms, and history</summary>
+                <HeadlessRuntimeSurfaces
+                  enabled={headlessEnabled}
+                  headlessStateSource={headlessStateSource}
+                />
+              </details>
+              <details className="workbench-disclosure">
+                <summary>Assistant</summary>
+                <AssistantOverlay
+                  enabled={assistantEnabled}
+                  headlessConnected={headlessEnabled}
+                  programController={programController}
+                />
+              </details>
+            </div>
           </div>
         </aside>
       </div>

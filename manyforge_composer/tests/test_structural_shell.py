@@ -277,6 +277,64 @@ def test_filesystem_browser_remains_sandboxed(tmp_path: Path) -> None:
     assert str(tmp_path) not in rejected.json()["detail"]
 
 
+@pytest.mark.parametrize("request_params", [{}, {"path": ""}])
+def test_filesystem_browser_defaults_to_first_allowed_root_outside_cwd(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    request_params: dict[str, str],
+) -> None:
+    outside = tmp_path / "outside"
+    first = tmp_path / "first"
+    second = tmp_path / "second"
+    outside.mkdir()
+    first.mkdir()
+    second.mkdir()
+    monkeypatch.chdir(outside)
+    client = _client(allowed_fs_roots=[str(first), str(second)])
+
+    response = client.get("/api/files/browse", params=request_params)
+
+    assert response.status_code == 200
+    assert response.json()["currentPath"] == str(first.resolve())
+
+
+def test_filesystem_browser_default_skips_only_unusable_configured_roots(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    missing = tmp_path / "missing"
+    available = tmp_path / "available"
+    outside = tmp_path / "outside"
+    available.mkdir()
+    outside.mkdir()
+    monkeypatch.chdir(outside)
+    client = _client(allowed_fs_roots=[str(missing), str(available)])
+
+    response = client.get("/api/files/browse")
+
+    assert response.status_code == 200
+    assert response.json()["currentPath"] == str(available.resolve())
+
+
+def test_filesystem_browser_default_fails_without_a_usable_configured_root(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    missing = tmp_path / "missing"
+    not_a_directory = tmp_path / "file"
+    outside = tmp_path / "outside"
+    not_a_directory.write_text("not a directory\n", encoding="utf-8")
+    outside.mkdir()
+    monkeypatch.chdir(outside)
+    client = _client(allowed_fs_roots=[str(missing), str(not_a_directory)])
+
+    response = client.get("/api/files/browse")
+
+    assert response.status_code == 503
+    assert response.json() == {"detail": "No accessible filesystem root"}
+    assert str(outside) not in response.text
+
+
 def test_filesystem_router_rejects_an_explicit_invalid_allowlist() -> None:
     with pytest.raises(ValueError, match="no valid allowed root"):
         routes_filesystem.create_filesystem_router([""])
@@ -384,10 +442,14 @@ def test_filesystem_browser_does_not_let_a_symlink_redefine_an_allowed_root(
     allowed.rename(moved)
     allowed.symlink_to(outside, target_is_directory=True)
     response = client.get("/api/files/browse", params={"path": str(allowed)})
+    default_response = client.get("/api/files/browse")
 
     assert response.status_code == 403
     assert response.json()["detail"] == "Path is outside allowed roots"
     assert str(outside) not in response.text
+    assert default_response.status_code == 503
+    assert default_response.json() == {"detail": "No accessible filesystem root"}
+    assert str(outside) not in default_response.text
 
 
 def test_filesystem_browser_stops_scanning_at_the_hard_entry_bound(

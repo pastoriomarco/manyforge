@@ -23,52 +23,73 @@ export function UnavailableBanner({ health, onRetry }: UnavailableBannerProps) {
     ? FALLBACK_GATES
     : availability.restorationGates;
 
+  if (headlessConnected) {
+    return (
+      <section className="unavailable-banner availability-notice availability-connected" aria-label="Headless owner status">
+        <span className="availability-dot" aria-hidden="true" />
+        <div className="availability-copy">
+          <p className="eyebrow">Owner boundary</p>
+          <strong>Headless runtime truth is connected</strong>
+          <span>
+            Manager, scene, alarm, history, addressed control, and the bounded
+            Program Run surface report owner-issued facts. Complete product
+            readiness remains gated.
+          </span>
+        </div>
+        <span className="status-pill status-pill-connected">headless_client_active</span>
+        <details className="availability-details">
+          <summary>Qualification boundary</summary>
+          <span>Missing owners remain unknown; this page does not infer robot readiness.</span>
+          <span>Complete I6 qualification at N7 · then L0 · P5 · I · R · T.</span>
+        </details>
+      </section>
+    );
+  }
+
+  const title = health.status === 'loading'
+    ? 'Reading runtime boundary status'
+    : 'Runtime operations are unavailable';
+  const reason = health.status === 'loading'
+    ? 'Checking the configured structural and headless owner boundary.'
+    : health.status === 'error' || health.status === 'absent'
+      ? health.message
+      : availability?.message ?? (
+        'Composer currently exposes authored structure only. It cannot run a '
+        + 'program, command a robot, edit a live scene, or report runtime state.'
+      );
+  const code = health.status === 'ready'
+    ? availability?.code ?? 'runtime_unavailable'
+    : health.status === 'absent' ? 'health_unavailable' : 'health_read_failed';
+
   return (
-    <section className="unavailable-banner" aria-labelledby="cutover-title">
+    <section className="unavailable-banner availability-notice" aria-labelledby="cutover-title">
       <div className="unavailable-icon" aria-hidden="true">!</div>
       <div className="unavailable-copy">
-        <p className="eyebrow">Composable-cell cutover boundary</p>
-        <h1 id="cutover-title">
-          {headlessConnected
-            ? 'Headless runtime truth is connected'
-            : 'Runtime operations are unavailable'}
-        </h1>
-        <p>
-          {headlessConnected
-            ? 'Manager, scene, alarm, history, addressed control, and the bounded Program Run surface no longer depend on Composer. Complete product readiness remains gated.'
-            : availability?.message ?? (
-            'Composer currently exposes authored structure only. It cannot run a '
-            + 'program, command a robot, edit a live scene, or report runtime state.'
-            )}
-        </p>
-        <p className="structural-scope">
-          {headlessConnected
-            ? 'Each runtime pane reports strict owner-issued facts. Missing owners remain unknown; this page does not infer robot readiness or a complete product lane.'
-            : 'Available here: immutable v2 catalog inspection, sandboxed artifact-path browsing, and an active retained-neutral URDF view. Nothing on this page asserts live or operational validity.'}
-        </p>
+        <p className="eyebrow">Runtime boundary</p>
+        <strong id="cutover-title">{title}</strong>
+        <span>{reason}</span>
       </div>
       <div className="availability-meta">
         <span className="status-pill status-pill-danger">
-          {headlessConnected
-            ? 'headless_client_active'
-            : availability?.code ?? 'runtime_unavailable'}
+          {code}
         </span>
-        <span className="gate-list">
-          {headlessConnected
-            ? 'Complete I6 qualification at N7 · then L0 · P5 · I · R · T'
-            : gates.length > 0
-              ? `Restore at ${gates.join(' · ')}`
-              : 'Check headless API connectivity and configuration'}
-        </span>
-        {health.status === 'error' && (
-          <>
-            <span className="health-error">Health read failed: {health.message}</span>
-            <button type="button" className="text-button" onClick={onRetry}>
-              Retry health
-            </button>
-          </>
-        )}
+        <button type="button" className="text-button" onClick={onRetry}>
+          Retry health
+        </button>
       </div>
+      <details className="availability-details">
+        <summary>Details</summary>
+        <span>
+          {gates.length > 0
+            ? `Restore at ${gates.join(' · ')}`
+            : 'Check headless API connectivity and configuration'}
+        </span>
+        {health.status === 'error' && <span>Health read failed: {health.message}</span>}
+        <span>
+          Available here: immutable catalog inspection, sandboxed artifact-path
+          browsing, and a retained-neutral URDF view. No readiness is inferred.
+        </span>
+      </details>
     </section>
   );
 }

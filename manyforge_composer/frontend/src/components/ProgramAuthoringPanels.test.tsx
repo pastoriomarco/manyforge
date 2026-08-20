@@ -1,6 +1,8 @@
 import { renderToStaticMarkup } from 'react-dom/server';
 import { describe, expect, it, vi } from 'vitest';
 
+import type { ProgramRuntimeController } from '../hooks/useProgramRuntime';
+import type { ProgramWorkspaceController } from '../hooks/useProgramWorkspace';
 import type {
   CatalogEntry,
   NodeEnvironmentResponse,
@@ -11,6 +13,7 @@ import { ProgramDeclarationsEditor } from './ProgramDeclarationsEditor';
 import { ProgramNodePalette } from './ProgramNodePalette';
 import { ProgramPropertyEditor } from './ProgramPropertyEditor';
 import { ProgramTreeCanvas } from './ProgramTreeCanvas';
+import { ProgramWorkspace } from './ProgramWorkspace';
 
 const sequence: CatalogEntry = {
   id: 'sequence',
@@ -183,5 +186,95 @@ describe('Program authoring panels', () => {
 
     expect(markup.match(/data-node-id=/g)).toHaveLength(513);
     expect(elapsedMs).toBeLessThan(2_000);
+  });
+
+  it('keeps the complete authoring geometry when no Draft is open', () => {
+    const controller = {
+      state: {
+        status: 'ready',
+        requestGeneration: 1,
+        pendingAction: null,
+        workspace: {
+          schemaVersion: 'manyforge.composer_program_workspace.v1',
+          draft: {
+            draftId: 'empty-draft',
+            draftRevision: 0,
+            programLoaded: false,
+            programRevision: null,
+            program: null,
+          },
+          saved: {
+            available: false,
+            matchesDraft: false,
+            path: null,
+            programRevision: null,
+          },
+          applied: {
+            available: false,
+            matchesDraft: null,
+            programRevision: null,
+            unavailableReason: null,
+          },
+          hasUnsavedChanges: false,
+          hasUnappliedChanges: null,
+        },
+        message: null,
+        error: null,
+      },
+      refresh: vi.fn(),
+      mutate: vi.fn(),
+      openDraft: vi.fn(),
+      save: vi.fn(),
+      saveAs: vi.fn(),
+      apply: vi.fn(),
+      load: vi.fn(),
+      clearFeedback: vi.fn(),
+    } satisfies ProgramWorkspaceController;
+    const runtime = {
+      state: {
+        catalog: null,
+        applied: null,
+        run: null,
+        selectedScenarioId: null,
+        runnerAvailable: false,
+        loading: false,
+        pending: null,
+        error: null,
+      },
+      active: false,
+      refresh: vi.fn(),
+      selectScenario: vi.fn(),
+      clearScenarioSelection: vi.fn(),
+      run: vi.fn(),
+      stop: vi.fn(),
+    } satisfies ProgramRuntimeController;
+    const markup = renderToStaticMarkup(
+      <ProgramWorkspace
+        controller={controller}
+        runtime={runtime}
+        catalog={{
+          status: 'ready',
+          data: {
+            apiVersion: 'manyforge.node_catalog.v2',
+            contentVersion: 'v2',
+            catalogId: 'test-catalog',
+            entries: [sequence, timer],
+            catalogDigest: 'sha256:catalog',
+            environmentDigest: environment.environmentDigest,
+          },
+        }}
+        environment={{ status: 'ready', data: environment }}
+        selectedProgramPath={null}
+        onRetryCatalog={vi.fn()}
+        onRetryEnvironment={vi.fn()}
+      />,
+    );
+
+    expect(markup).toContain('program-authoring-empty');
+    expect(markup).toContain('Open a Draft to use the palette');
+    expect(markup).toContain('No Program Draft is open');
+    expect(markup).toContain('Select a node to inspect properties');
+    expect(markup).toContain('Program actions · Open · Save As · Apply · Load');
+    expect(markup).not.toContain('program-tree-node');
   });
 });

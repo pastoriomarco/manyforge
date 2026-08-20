@@ -28,6 +28,53 @@ function shortRevision(revision: string | null): string {
   return revision.length > 22 ? `${revision.slice(0, 18)}…` : revision;
 }
 
+function EmptyAuthoringSurface() {
+  return (
+    <div className="program-authoring-grid program-authoring-empty" aria-label="Empty Program authoring surface">
+      <section
+        className="program-palette"
+        aria-labelledby="empty-palette-title"
+        aria-disabled="true"
+      >
+        <header className="program-subpanel-header">
+          <div>
+            <p className="eyebrow">Node catalog</p>
+            <h3 id="empty-palette-title">Authoring palette</h3>
+          </div>
+        </header>
+        <div className="program-empty-guidance">
+          <strong>Open a Draft to use the palette</strong>
+          <span>Catalog entries remain available in the Library at left.</span>
+        </div>
+      </section>
+      <section className="program-tree-surface" aria-labelledby="empty-tree-title">
+        <header className="program-subpanel-header">
+          <div>
+            <p className="eyebrow">Program graph</p>
+            <h3 id="empty-tree-title">Tree canvas</h3>
+          </div>
+        </header>
+        <div className="program-tree-scroll program-tree-empty">
+          <strong>No Program Draft is open</strong>
+          <span>Select an artifact in the Library, then choose Open as Draft.</span>
+        </div>
+      </section>
+      <section className="program-properties" aria-labelledby="empty-properties-title">
+        <header className="program-subpanel-header">
+          <div>
+            <p className="eyebrow">Selection</p>
+            <h3 id="empty-properties-title">Properties</h3>
+          </div>
+        </header>
+        <div className="program-empty-guidance">
+          <strong>Select a node to inspect properties</strong>
+          <span>Properties become editable after a Draft and node are selected.</span>
+        </div>
+      </section>
+    </div>
+  );
+}
+
 export function ProgramWorkspace({
   controller,
   runtime,
@@ -153,127 +200,132 @@ export function ProgramWorkspace({
             </div>
           </div>
 
-          <div className="program-artifact-actions program-apply-actions">
-            <label className="program-save-as-path">
-              Qualified scenario
-              <select
-                aria-label="Qualified scenario"
-                value={runtime.state.selectedScenarioId ?? ''}
-                disabled={busy || scenarioCatalog === null}
-                onChange={(event) => {
-                  const scenarioId = event.target.value;
-                  if (scenarioId === '') {
-                    runtime.clearScenarioSelection();
-                  } else {
-                    runtime.selectScenario(scenarioId);
+          <details className="program-actions-disclosure">
+            <summary>Program actions · Open · Save As · Apply · Load</summary>
+            <div className="program-actions-popover">
+              <div className="program-artifact-actions program-apply-actions">
+                <label className="program-save-as-path">
+                  Qualified scenario
+                  <select
+                    aria-label="Qualified scenario"
+                    value={runtime.state.selectedScenarioId ?? ''}
+                    disabled={busy || scenarioCatalog === null}
+                    onChange={(event) => {
+                      const scenarioId = event.target.value;
+                      if (scenarioId === '') {
+                        runtime.clearScenarioSelection();
+                      } else {
+                        runtime.selectScenario(scenarioId);
+                      }
+                    }}
+                  >
+                    <option value="">Select a scenario</option>
+                    {scenarioCatalog?.scenarios.map((row) => (
+                      <option key={row.scenarioId} value={row.scenarioId}>
+                        {row.description
+                          ? `${row.scenarioId} — ${row.description}`
+                          : row.scenarioId}
+                      </option>
+                    ))}
+                  </select>
+                </label>
+                <button
+                  type="button"
+                  disabled={busy || !program || selectedScenario === null}
+                  onClick={() => {
+                    if (!selectedScenario || !scenarioCatalog) return;
+                    applyDraft(
+                      selectedScenario.scenarioId,
+                      scenarioCatalog.scenarioCatalogRevision,
+                    );
+                  }}
+                >
+                  Apply Draft
+                </button>
+                <button
+                  type="button"
+                  disabled={
+                    busy
+                    || selectedProgramPath === null
+                    || selectedScenario === null
+                    || (replaceNeedsConfirmation && !confirmDiscard)
                   }
-                }}
-              >
-                <option value="">Select a scenario</option>
-                {scenarioCatalog?.scenarios.map((row) => (
-                  <option key={row.scenarioId} value={row.scenarioId}>
-                    {row.description
-                      ? `${row.scenarioId} — ${row.description}`
-                      : row.scenarioId}
-                  </option>
-                ))}
-              </select>
-            </label>
-            <button
-              type="button"
-              disabled={busy || !program || selectedScenario === null}
-              onClick={() => {
-                if (!selectedScenario || !scenarioCatalog) return;
-                applyDraft(
-                  selectedScenario.scenarioId,
-                  scenarioCatalog.scenarioCatalogRevision,
-                );
-              }}
-            >
-              Apply Draft
-            </button>
-            <button
-              type="button"
-              disabled={
-                busy
-                || selectedProgramPath === null
-                || selectedScenario === null
-                || (replaceNeedsConfirmation && !confirmDiscard)
-              }
-              onClick={() => {
-                if (!selectedProgramPath || !selectedScenario || !scenarioCatalog) return;
-                loadProgram(
-                  selectedProgramPath,
-                  selectedScenario.scenarioId,
-                  scenarioCatalog.scenarioCatalogRevision,
-                  confirmDiscard,
-                );
-                setConfirmDiscard(false);
-              }}
-            >
-              Load and Apply
-            </button>
-            <small>
-              Apply changes runtime only. Load validates and applies the selected
-              artifact before replacing Draft and Saved.
-            </small>
-          </div>
+                  onClick={() => {
+                    if (!selectedProgramPath || !selectedScenario || !scenarioCatalog) return;
+                    loadProgram(
+                      selectedProgramPath,
+                      selectedScenario.scenarioId,
+                      scenarioCatalog.scenarioCatalogRevision,
+                      confirmDiscard,
+                    );
+                    setConfirmDiscard(false);
+                  }}
+                >
+                  Load and Apply
+                </button>
+                <small>
+                  Apply changes runtime only. Load validates and applies the selected
+                  artifact before replacing Draft and Saved.
+                </small>
+              </div>
 
-          <div className="program-artifact-actions">
-            <div>
-              <span>Artifact-browser selection</span>
-              <code>{selectedProgramPath ?? 'Select a Program artifact below'}</code>
+              <div className="program-artifact-actions">
+                <div>
+                  <span>Artifact-browser selection</span>
+                  <code>{selectedProgramPath ?? 'Select a Program artifact below'}</code>
+                </div>
+                <label className="program-confirmation">
+                  <input
+                    type="checkbox"
+                    checked={confirmDiscard}
+                    onChange={(event) => setConfirmDiscard(event.target.checked)}
+                  />
+                  Allow discarding unsaved or unapplied Draft changes
+                </label>
+                <button
+                  type="button"
+                  disabled={
+                    busy
+                    || selectedProgramPath === null
+                    || (workspace.hasUnsavedChanges && !confirmDiscard)
+                  }
+                  onClick={() => {
+                    if (!selectedProgramPath) return;
+                    openDraft(selectedProgramPath, confirmDiscard);
+                    setConfirmDiscard(false);
+                  }}
+                >
+                  Open as Draft
+                </button>
+                <label className="program-save-as-path">
+                  Save As path
+                  <input
+                    value={saveAsPath}
+                    onChange={(event) => setSaveAsPath(event.target.value)}
+                    placeholder="Path inside an approved Program root"
+                  />
+                </label>
+                <label className="program-confirmation">
+                  <input
+                    type="checkbox"
+                    checked={confirmOverwrite}
+                    onChange={(event) => setConfirmOverwrite(event.target.checked)}
+                  />
+                  Allow replacing an existing file
+                </label>
+                <button
+                  type="button"
+                  disabled={busy || !program || !saveAsPath.trim()}
+                  onClick={() => {
+                    saveAs(saveAsPath.trim(), confirmOverwrite);
+                    setConfirmOverwrite(false);
+                  }}
+                >
+                  Save As
+                </button>
+              </div>
             </div>
-            <label className="program-confirmation">
-              <input
-                type="checkbox"
-                checked={confirmDiscard}
-                onChange={(event) => setConfirmDiscard(event.target.checked)}
-              />
-              Allow discarding unsaved or unapplied Draft changes
-            </label>
-            <button
-              type="button"
-              disabled={
-                busy
-                || selectedProgramPath === null
-                || (workspace.hasUnsavedChanges && !confirmDiscard)
-              }
-              onClick={() => {
-                if (!selectedProgramPath) return;
-                openDraft(selectedProgramPath, confirmDiscard);
-                setConfirmDiscard(false);
-              }}
-            >
-              Open as Draft
-            </button>
-            <label className="program-save-as-path">
-              Save As path
-              <input
-                value={saveAsPath}
-                onChange={(event) => setSaveAsPath(event.target.value)}
-                placeholder="Path inside an approved Program root"
-              />
-            </label>
-            <label className="program-confirmation">
-              <input
-                type="checkbox"
-                checked={confirmOverwrite}
-                onChange={(event) => setConfirmOverwrite(event.target.checked)}
-              />
-              Allow replacing an existing file
-            </label>
-            <button
-              type="button"
-              disabled={busy || !program || !saveAsPath.trim()}
-              onClick={() => {
-                saveAs(saveAsPath.trim(), confirmOverwrite);
-                setConfirmOverwrite(false);
-              }}
-            >
-              Save As
-            </button>
-          </div>
+          </details>
 
           {(state.message || state.error) && (
             <div
@@ -339,14 +391,7 @@ export function ProgramWorkspace({
               <span>Draft inspection, Open as Draft, and Save remain available.</span>
             </div>
           )}
-          {!program && environmentAligned && (
-            <div className="panel-state program-empty-state">
-              <strong>No Program Draft is open</strong>
-              <span>Select a Program artifact and use Open as Draft. This does not Apply or execute it.</span>
-            </div>
-          )}
-
-          {program && environmentAligned && (
+          {program && (
             <>
               <div className="program-authoring-grid">
                 <ProgramNodePalette
@@ -388,6 +433,7 @@ export function ProgramWorkspace({
           )}
         </>
       )}
+      {(!workspace || !program) && <EmptyAuthoringSurface />}
     </section>
   );
 }

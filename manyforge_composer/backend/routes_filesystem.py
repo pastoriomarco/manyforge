@@ -143,11 +143,10 @@ def _validate_path_text(
     )
 
 
-def _normalize_browse_path(raw_path: str | None, allowed_roots: list[str]) -> Path:
-    if raw_path is not None:
-        _validate_path_text(raw_path)
+def _normalize_browse_path(raw_path: str, allowed_roots: list[str]) -> Path:
+    _validate_path_text(raw_path)
     try:
-        candidate = Path(raw_path).expanduser() if raw_path else Path.cwd()
+        candidate = Path(raw_path).expanduser()
         resolved = candidate.resolve(strict=True)
     except FileNotFoundError as exc:
         raise HTTPException(status_code=404, detail="Path not found") from exc
@@ -308,6 +307,24 @@ def _open_directory(
     return descriptor, metadata
 
 
+def _open_default_browse_root(
+    allowed_roots: list[str],
+) -> tuple[Path, int, os.stat_result]:
+    """Open the first configured root that is still an accessible directory."""
+
+    for root in allowed_roots:
+        current_dir = Path(root)
+        try:
+            descriptor, metadata = _open_directory(current_dir, allowed_roots)
+        except HTTPException:
+            continue
+        return current_dir, descriptor, metadata
+    raise HTTPException(
+        status_code=503,
+        detail="No accessible filesystem root",
+    )
+
+
 def _entry_payload(current_dir: Path, name: str, *, is_dir: bool) -> dict[str, Any]:
     _utf8_size(
         name,
@@ -458,8 +475,18 @@ def create_filesystem_router(allowed_roots: list[str] | None = None) -> APIRoute
         path: str | None = Query(default=None),
         kind: str = Query(default="program", pattern="^(program|deployment)$"),
     ) -> dict:
-        current_dir = _normalize_browse_path(path, roots)
-        descriptor, initial_metadata = _open_directory(current_dir, roots)
+        if path is None:
+            current_dir, descriptor, initial_metadata = _open_default_browse_root(
+                roots
+            )
+        elif not path.strip():
+            _validate_path_text(path)
+            current_dir, descriptor, initial_metadata = _open_default_browse_root(
+                roots
+            )
+        else:
+            current_dir = _normalize_browse_path(path, roots)
+            descriptor, initial_metadata = _open_directory(current_dir, roots)
         try:
             entries = _scan_directory(descriptor, current_dir, kind)
             _attest_directory(

@@ -772,6 +772,25 @@ export function SceneAuthoringWorkspace({
     setLivePose({ ...livePose, orientation_xyzw: orientation });
   };
 
+  const viewerSurface = (
+    <SceneViewerBridge
+      active={viewerActive}
+      source={headlessStateSource}
+      sourceValue={sourceValue}
+      environmentValue={environmentValue}
+      manifest={manifest}
+      onRetry={onRetryManifest}
+      program={program}
+      viewer={viewer}
+      selectedObjectId={selectedObjectId}
+      livePose={livePose}
+      selectionLocked={selectionLocked}
+      onSelect={setSelectedObjectId}
+      ghost={ghost}
+      ghostStale={robotControl.state.ghostStale}
+    />
+  );
+
   const commitLivePose = async () => {
     if (facts === null || selectedObject === null || livePose === null) return;
     const id = requestId();
@@ -809,6 +828,7 @@ export function SceneAuthoringWorkspace({
 
   return (
     <>
+      {viewerSurface}
       <section className="panel scene-authoring-workspace" aria-labelledby="scene-authoring-title">
         <header className="panel-header">
           <div>
@@ -1023,22 +1043,6 @@ export function SceneAuthoringWorkspace({
         </div>
       </section>
 
-      <SceneViewerBridge
-        active={viewerActive}
-        source={headlessStateSource}
-        sourceValue={sourceValue}
-        environmentValue={environmentValue}
-        manifest={manifest}
-        onRetry={onRetryManifest}
-        program={program}
-        viewer={viewer}
-        selectedObjectId={selectedObjectId}
-        livePose={livePose}
-        selectionLocked={selectionLocked}
-        onSelect={setSelectedObjectId}
-        ghost={ghost}
-        ghostStale={robotControl.state.ghostStale}
-      />
     </>
   );
 }
