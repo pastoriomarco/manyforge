@@ -5452,23 +5452,38 @@ TEST(ResourceAddressedExecutionKernelTest,
 
   std::promise<void> first_stage_entered_promise;
   auto first_stage_entered = first_stage_entered_promise.get_future();
-  std::promise<void> release_first_stage_promise;
-  const auto release_first_stage = release_first_stage_promise.get_future().share();
+  std::promise<void> second_stage_entered_promise;
+  auto second_stage_entered = second_stage_entered_promise.get_future();
+  std::promise<void> release_stages_promise;
+  const auto release_stages = release_stages_promise.get_future().share();
   first_engine.translate_stop_stage_hook = [&] {
     first_stage_entered_promise.set_value();
-    release_first_stage.wait();
+    release_stages.wait();
+  };
+  second_engine.translate_stop_stage_hook = [&] {
+    second_stage_entered_promise.set_value();
+    release_stages.wait();
   };
   const auto first_stop =
       kernel.stop(stop_request("request.aggregate-two.first", first.value(), 1U));
   ASSERT_TRUE(first_stop.ok()) << first_stop.error().message;
   const auto entered_status = first_stage_entered.wait_for(std::chrono::seconds(10));
   if (entered_status != std::future_status::ready) {
-    release_first_stage_promise.set_value();
+    release_stages_promise.set_value();
     FAIL() << "first predecessor did not reach its blocking stage";
   }
   const auto second_stop =
       kernel.stop(stop_request("request.aggregate-two.second", second.value(), 1U));
-  ASSERT_TRUE(second_stop.ok()) << second_stop.error().message;
+  if (!second_stop.ok()) {
+    release_stages_promise.set_value();
+    FAIL() << second_stop.error().message;
+  }
+  const auto second_entered_status =
+      second_stage_entered.wait_for(std::chrono::seconds(10));
+  if (second_entered_status != std::future_status::ready) {
+    release_stages_promise.set_value();
+    FAIL() << "second predecessor did not reach its blocking stage";
+  }
   EXPECT_NE(first_stop.value().stop_id, second_stop.value().stop_id);
 
   const FullStopIntentDTO full_intent{
@@ -5477,7 +5492,7 @@ TEST(ResourceAddressedExecutionKernelTest,
       second_stop.value().stop_generation,
       {}};
   const auto aggregate = kernel.full_stop(full_intent);
-  release_first_stage_promise.set_value();
+  release_stages_promise.set_value();
   ASSERT_TRUE(aggregate.ok()) << aggregate.error().message;
   ASSERT_EQ(aggregate.value().joined_predecessor_stops.size(), 2U);
   EXPECT_EQ(aggregate.value().joined_predecessor_stops[0].predecessor_stop_id,
