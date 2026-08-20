@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useRef, useState } from 'react';
+import { useCallback, useEffect, useState } from 'react';
 
 import { api } from '../api/client';
 import type {
@@ -11,6 +11,7 @@ import type {
   CCLCRouteTemplateSet,
   CCLCTransactionStatus,
 } from '../types/cclc';
+import type { ExecutionOwnerStatus } from '../types/robotControl';
 
 const POLL_INTERVAL_MS = 250;
 let fallbackIdentitySequence = 0;
@@ -57,6 +58,25 @@ function requestContext(
     source_label: 'manyforge_composer',
     correlation_id: correlation,
   };
+}
+
+export function cclcRequestOwnerEpoch(
+  snapshot: CCLCComponentSnapshot,
+  execution: ExecutionOwnerStatus,
+): string {
+  if (
+    execution.graphRevision !== snapshot.graphRevision
+    || execution.retainedBundleId !== snapshot.retainedBundleId
+  ) {
+    throw new Error('CCLC component and execution-owner projections are torn');
+  }
+  return execution.ownerEpoch;
+}
+
+export function lifecycleSupportsRouteSelection(
+  state: CCLCComponentSnapshot['lifecycleState'],
+): boolean {
+  return state === 'prepared' || state === 'active';
 }
 
 export function lifecycleRequestFromSnapshot(
@@ -119,7 +139,6 @@ export function routeRequestFromTemplate(
 }
 
 export function useCCLC(enabled: boolean): CCLCController {
-  const ownerEpoch = useRef(browserRequestIdentity('composer-cclc-epoch'));
   const [componentId, setComponentIdValue] = useState('');
   const [snapshot, setSnapshot] = useState<CCLCComponentSnapshot | null>(null);
   const [routeTemplates, setRouteTemplates] = useState<CCLCRouteTemplateSet | null>(null);
@@ -142,20 +161,30 @@ export function useCCLC(enabled: boolean): CCLCController {
     if (!enabled) throw new Error('CCLC client is unavailable');
     const identity = componentId.trim();
     if (!identity) throw new Error('Enter a component identity first');
-    const [nextSnapshot, nextTemplates] = await Promise.all([
+    const [nextSnapshot, execution] = await Promise.all([
       api.cclc.component(identity, signal),
-      api.cclc.routeTemplates(identity, signal),
+      api.execution.status(signal),
     ]);
-    if (
-      nextSnapshot.componentId !== nextTemplates.componentId
-      || nextSnapshot.retainedBundleId !== nextTemplates.retainedBundleId
-      || nextSnapshot.graphRevision !== nextTemplates.graphRevision
-    ) {
-      throw new Error('CCLC component and route projections are torn');
+    const ownerEpoch = cclcRequestOwnerEpoch(nextSnapshot, execution);
+    let nextTemplates: CCLCRouteTemplateSet = {
+      componentId: nextSnapshot.componentId,
+      retainedBundleId: nextSnapshot.retainedBundleId,
+      graphRevision: nextSnapshot.graphRevision,
+      templates: [],
+    };
+    if (lifecycleSupportsRouteSelection(nextSnapshot.lifecycleState)) {
+      nextTemplates = await api.cclc.routeTemplates(identity, signal);
+      if (
+        nextSnapshot.componentId !== nextTemplates.componentId
+        || nextSnapshot.retainedBundleId !== nextTemplates.retainedBundleId
+        || nextSnapshot.graphRevision !== nextTemplates.graphRevision
+      ) {
+        throw new Error('CCLC component and route projections are torn');
+      }
     }
     setSnapshot(nextSnapshot);
     setRouteTemplates(nextTemplates);
-    return { snapshot: nextSnapshot, templates: nextTemplates };
+    return { snapshot: nextSnapshot, templates: nextTemplates, ownerEpoch };
   }, [componentId, enabled]);
 
   const refresh = useCallback(async () => {
@@ -184,7 +213,7 @@ export function useCCLC(enabled: boolean): CCLCController {
         lifecycleRequestFromSnapshot(
           current.snapshot,
           intent,
-          requestContext(ownerEpoch.current, `lifecycle:${intent}`),
+          requestContext(current.ownerEpoch, `lifecycle:${intent}`),
         ),
       );
       if (result.transactionId === null) {
@@ -218,7 +247,7 @@ export function useCCLC(enabled: boolean): CCLCController {
           current.templates,
           selected,
           requestContext(
-            ownerEpoch.current,
+            current.ownerEpoch,
             `route:${selected.desired_configuration.control_domain_id}`,
           ),
         ),

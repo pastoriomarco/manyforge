@@ -2,6 +2,8 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 
 import {
   browserRequestIdentity,
+  cclcRequestOwnerEpoch,
+  lifecycleSupportsRouteSelection,
   lifecycleRequestFromSnapshot,
   routeRequestFromTemplate,
 } from './useCCLC';
@@ -10,6 +12,7 @@ import type {
   CCLCRequestContext,
   CCLCRouteTemplateSet,
 } from '../types/cclc';
+import type { ExecutionOwnerStatus } from '../types/robotControl';
 
 const context: CCLCRequestContext = {
   request_id: 'request.1',
@@ -69,12 +72,33 @@ const templates: CCLCRouteTemplateSet = {
   }],
 };
 
+const execution = {
+  ownerEpoch: 'kernel-owner.1',
+  graphRevision: snapshot.graphRevision,
+  retainedBundleId: snapshot.retainedBundleId,
+} as ExecutionOwnerStatus;
+
 afterEach(() => {
   vi.restoreAllMocks();
   vi.unstubAllGlobals();
 });
 
 describe('CCLC request projection', () => {
+  it('targets the fresh execution-owner epoch and rejects torn projections', () => {
+    expect(cclcRequestOwnerEpoch(snapshot, execution)).toBe('kernel-owner.1');
+    expect(() => cclcRequestOwnerEpoch(snapshot, {
+      ...execution,
+      graphRevision: 'graph.2',
+    })).toThrow('projections are torn');
+  });
+
+  it('reads retained routes only in route-capable lifecycle states', () => {
+    expect(lifecycleSupportsRouteSelection('declared')).toBe(false);
+    expect(lifecycleSupportsRouteSelection('prepared')).toBe(true);
+    expect(lifecycleSupportsRouteSelection('active')).toBe(true);
+    expect(lifecycleSupportsRouteSelection('disabled')).toBe(false);
+  });
+
   it('creates bounded identities when randomUUID is unavailable on trusted-LAN HTTP', () => {
     vi.stubGlobal('crypto', {
       getRandomValues: (words: Uint32Array) => {
