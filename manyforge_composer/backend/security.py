@@ -29,18 +29,27 @@ class SecurityConfig:
     # Paths outside these roots (after symlink resolution) are rejected.
     allowed_fs_roots: list[str] = field(default_factory=lambda: ["/workspace"])
 
+    # Program-artifact write roots.  ``None`` preserves the historical
+    # behavior of using ``allowed_fs_roots`` for writes; an explicit empty
+    # list is a fail-closed configuration.
+    allowed_program_write_roots: list[str] | None = None
+
     @classmethod
     def from_env(cls) -> SecurityConfig:
         """Build the CORS and filesystem bounds from environment variables."""
 
         def _csv(var: str) -> list[str] | None:
-            raw = os.environ.get(var, "")
+            if var not in os.environ:
+                return None
+            raw = os.environ[var]
             items = [s.strip() for s in raw.split(",") if s.strip()]
-            return items or None
+            return items
 
+        program_write_roots = _csv("MANYFORGE_PROGRAM_WRITE_ROOTS")
         return cls(
             cors_origins=_csv("MANYFORGE_CORS_ORIGINS") or ["http://localhost:3000"],
             allowed_fs_roots=_csv("MANYFORGE_FS_ROOTS") or ["/workspace"],
+            allowed_program_write_roots=program_write_roots,
         )
 
 

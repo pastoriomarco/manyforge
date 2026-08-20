@@ -179,6 +179,14 @@ def _workspace(state: ComposerState) -> dict[str, Any]:
     )
 
 
+def _program_write_roots(state: ComposerState) -> list[str]:
+    """Use the explicit Program-write boundary, or preserve legacy callers."""
+
+    if state.allowed_program_write_roots is not None:
+        return state.allowed_program_write_roots
+    return state.allowed_fs_roots
+
+
 def _apply_program(
     state: ComposerState,
     *,
@@ -312,7 +320,7 @@ def create_draft_router(state: ComposerState) -> APIRouter:
                 writer=lambda program, path: save_program_artifact(
                     program,
                     path,
-                    allowed_roots=state.allowed_fs_roots,
+                    allowed_roots=_program_write_roots(state),
                     overwrite=True,
                 ),
             )
@@ -338,7 +346,7 @@ def create_draft_router(state: ComposerState) -> APIRouter:
                 writer=lambda program, path: save_program_artifact(
                     program,
                     path,
-                    allowed_roots=state.allowed_fs_roots,
+                    allowed_roots=_program_write_roots(state),
                     overwrite=overwrite,
                 ),
             )

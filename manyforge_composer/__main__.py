@@ -115,6 +115,7 @@ def main() -> None:
         state = ComposerState.from_paths(
             program_path=args.program_path,
             allowed_fs_roots=security.allowed_fs_roots,
+            allowed_program_write_roots=security.allowed_program_write_roots,
             headless_client=headless_client,
             assistant_client=assistant_client,
         )

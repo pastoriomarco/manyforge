@@ -32,6 +32,7 @@ def _root(tmp_path: Path) -> Path:
 def _config(tmp_path: Path, package_root: Path) -> NativeLauncherConfig:
     source = tmp_path / "source"
     source.mkdir()
+    (source / "examples").mkdir()
     manager = tmp_path / "manager"
     manager.write_text("#!/bin/sh\n", encoding="utf-8")
     manager.chmod(0o755)
@@ -223,6 +224,7 @@ def test_operator_cli_missing_package_precedes_state_creation_with_valid_inputs(
 ):
     source = tmp_path / "source"
     source.mkdir()
+    (source / "examples").mkdir()
     manager = tmp_path / "manager"
     manager.write_text("#!/bin/sh\n", encoding="utf-8")
     manager.chmod(0o755)

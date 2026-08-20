@@ -185,6 +185,11 @@ def create_app(
 
     security = security or SecurityConfig()
     state.allowed_fs_roots = list(security.allowed_fs_roots)
+    state.allowed_program_write_roots = (
+        None
+        if security.allowed_program_write_roots is None
+        else list(security.allowed_program_write_roots)
+    )
 
     app = FastAPI(title="ManyForge Composer (replaceable client)")
     app.add_middleware(

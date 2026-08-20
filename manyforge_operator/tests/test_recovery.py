@@ -23,6 +23,7 @@ from manyforge_operator.package_aggregate import package_aggregate_sha256
 def _config(tmp_path: Path) -> NativeLauncherConfig:
     source = tmp_path / "source"
     source.mkdir()
+    (source / "examples").mkdir()
     manager = tmp_path / "manager-daemon"
     manager.write_text("#!/bin/sh\n", encoding="utf-8")
     manager.chmod(0o755)

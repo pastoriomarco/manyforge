@@ -201,13 +201,24 @@ class NativeLauncherConfig:
         ):
             raise ValueError("instance_id must be one path-safe non-empty identifier")
         for name, root in (
+            ("source_root", str(self.source_root)),
+            ("examples_root", str(self.source_root / "examples")),
             ("package_root", str(self.package_root)),
             ("program_workspace", str(self.program_workspace)),
         ):
-            if "," in root or root != root.strip():
+            if "\x00" in root or "," in root or root != root.strip():
                 raise ValueError(
                     f"{name} must be unambiguous in MANYFORGE_FS_ROOTS"
                 )
+        examples_root = self.source_root / "examples"
+        try:
+            resolved_examples_root = examples_root.resolve(strict=True)
+        except (OSError, RuntimeError) as error:
+            raise ValueError(
+                "examples_root must resolve to an existing directory"
+            ) from error
+        if not resolved_examples_root.is_dir():
+            raise ValueError("examples_root must resolve to a directory")
         try:
             resolved_package_root = self.package_root.resolve(strict=False)
             resolved_program_workspace = self.program_workspace.resolve(strict=False)
@@ -408,8 +419,10 @@ def native_commands(config: NativeLauncherConfig) -> tuple[ProcessSpec, ...]:
         composer_argv,
         {
             "MANYFORGE_FS_ROOTS": (
+                f"{config.source_root / 'examples'},"
                 f"{config.package_root},{config.program_workspace}"
-            )
+            ),
+            "MANYFORGE_PROGRAM_WRITE_ROOTS": str(config.program_workspace),
         },
         config.source_root,
     )

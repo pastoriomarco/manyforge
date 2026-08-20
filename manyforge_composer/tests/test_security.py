@@ -9,6 +9,7 @@ import pytest
 from fastapi import HTTPException
 
 from manyforge_composer.backend.security import (
+    SecurityConfig,
     WS_MAX_MESSAGE_SIZE,
     is_path_within_roots,
     normalize_allowed_roots,
@@ -84,3 +85,17 @@ def test_explicit_empty_or_invalid_allowed_roots_do_not_widen_to_workspace() -> 
     assert normalize_allowed_roots([]) == []
     assert normalize_allowed_roots([""]) == []
     assert normalize_allowed_roots(["invalid\x00root"]) == []
+
+
+def test_program_write_roots_preserve_legacy_default_and_explicit_empty(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("MANYFORGE_PROGRAM_WRITE_ROOTS", raising=False)
+    assert SecurityConfig().allowed_program_write_roots is None
+    assert SecurityConfig.from_env().allowed_program_write_roots is None
+
+    monkeypatch.setenv("MANYFORGE_PROGRAM_WRITE_ROOTS", "")
+    assert SecurityConfig.from_env().allowed_program_write_roots == []
+
+    monkeypatch.setenv("MANYFORGE_PROGRAM_WRITE_ROOTS", " /one , /two ")
+    assert SecurityConfig.from_env().allowed_program_write_roots == ["/one", "/two"]

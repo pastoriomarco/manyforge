@@ -46,6 +46,7 @@ class ComposerState:
         program: Program | None = None,
         program_source_path: str | None = None,
         allowed_fs_roots: list[str] | None = None,
+        allowed_program_write_roots: list[str] | None = None,
         headless_client: "HeadlessHttpClient | None" = None,
         assistant_client: "AssistantProviderHttpClient | None" = None,
     ) -> None:
@@ -72,6 +73,11 @@ class ComposerState:
             source_path=self.program_source_path,
         )
         self.allowed_fs_roots = list(allowed_fs_roots or [])
+        self.allowed_program_write_roots = (
+            None
+            if allowed_program_write_roots is None
+            else list(allowed_program_write_roots)
+        )
         self.headless_client = headless_client
         self.assistant_client = assistant_client
         # Presentation-cache identity only. Runtime and Apply truth remain in
@@ -85,6 +91,7 @@ class ComposerState:
         *,
         program_path: str | None,
         allowed_fs_roots: list[str] | None = None,
+        allowed_program_write_roots: list[str] | None = None,
         headless_client: "HeadlessHttpClient | None" = None,
         assistant_client: "AssistantProviderHttpClient | None" = None,
     ) -> "ComposerState":
@@ -102,6 +109,7 @@ class ComposerState:
             program=program,
             program_source_path=resolved_program,
             allowed_fs_roots=allowed_fs_roots,
+            allowed_program_write_roots=allowed_program_write_roots,
             headless_client=headless_client,
             assistant_client=assistant_client,
         )

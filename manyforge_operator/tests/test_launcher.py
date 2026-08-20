@@ -5,8 +5,12 @@ from dataclasses import replace
 from pathlib import Path
 import socket
 
+from fastapi.testclient import TestClient
 import pytest
 
+from manyforge_composer.backend.app import create_app
+from manyforge_composer.backend.security import SecurityConfig
+from manyforge_composer.backend.state import ComposerState
 from manyforge_operator import LaunchProfile, LaunchInstanceState, ResourcePresence
 from manyforge_operator.orchestrator import (
     LauncherError,
@@ -22,6 +26,16 @@ from manyforge_operator.package_aggregate import package_aggregate_sha256
 def _config(tmp_path: Path) -> NativeLauncherConfig:
     source = tmp_path / "source"
     source.mkdir()
+    examples = source / "examples"
+    examples.mkdir()
+    (examples / "fixture.program.yaml").write_text(
+        "schema_version: manyforge.program.v1\n",
+        encoding="utf-8",
+    )
+    (examples / "fixture.deployment.yaml").write_text(
+        "schema_version: manyforge.deployment.v1\n",
+        encoding="utf-8",
+    )
     manager = tmp_path / "manager-daemon"
     manager.write_text("#!/bin/sh\n", encoding="utf-8")
     manager.chmod(0o755)
@@ -75,9 +89,39 @@ def test_native_commands_retain_four_owner_entrypoints(tmp_path: Path):
         spec.environment["MANYFORGE_FS_ROOTS"] == str(config.package_root)
         for spec in specs[:3]
     )
-    assert specs[3].environment["MANYFORGE_FS_ROOTS"] == (
-        f"{config.package_root},{config.program_workspace}"
+    assert specs[3].environment == {
+        "MANYFORGE_FS_ROOTS": (
+            f"{config.source_root / 'examples'},"
+            f"{config.package_root},{config.program_workspace}"
+        ),
+        "MANYFORGE_PROGRAM_WRITE_ROOTS": str(config.program_workspace),
+    }
+
+
+def test_native_ordered_roots_make_examples_the_default_browse_root(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    config = _config(tmp_path)
+    composer_environment = native_commands(config)[-1].environment
+    for name, value in composer_environment.items():
+        monkeypatch.setenv(name, value)
+
+    client = TestClient(
+        create_app(ComposerState(), security=SecurityConfig.from_env())
     )
+    expected_root = str((config.source_root / "examples").resolve())
+
+    for kind, expected_name in (
+        ("program", "fixture.program.yaml"),
+        ("deployment", "fixture.deployment.yaml"),
+    ):
+        response = client.get("/api/files/browse", params={"kind": kind})
+
+        assert response.status_code == 200
+        assert response.json()["currentPath"] == expected_root
+        assert expected_name in {
+            entry["name"] for entry in response.json()["entries"]
+        }
 
 
 @pytest.mark.parametrize(
@@ -97,6 +141,38 @@ def test_native_configuration_rejects_ambiguous_composer_roots_before_effects(
 
     with pytest.raises(ValueError, match="MANYFORGE_FS_ROOTS"):
         replace(config, **{field: replacement})
+
+
+@pytest.mark.parametrize("source_name", ["source,ambiguous", "source "])
+def test_native_configuration_rejects_ambiguous_examples_root_before_effects(
+    tmp_path: Path, source_name: str
+):
+    source = tmp_path / source_name
+    source.mkdir()
+    config = _config(tmp_path)
+
+    with pytest.raises(ValueError, match="MANYFORGE_FS_ROOTS"):
+        replace(config, source_root=source)
+
+    assert not config.state_root.exists()
+
+
+@pytest.mark.parametrize("examples_kind", ["missing", "not-a-directory"])
+def test_native_configuration_requires_usable_examples_root_before_effects(
+    tmp_path: Path, examples_kind: str
+):
+    config = _config(tmp_path)
+    examples = config.source_root / "examples"
+    for child in examples.iterdir():
+        child.unlink()
+    examples.rmdir()
+    if examples_kind == "not-a-directory":
+        examples.write_text("not a directory\n", encoding="utf-8")
+
+    with pytest.raises(ValueError, match="examples_root"):
+        replace(config, source_root=config.source_root)
+
+    assert not config.state_root.exists()
 
 
 @pytest.mark.parametrize("instance_id", [".", ".."])

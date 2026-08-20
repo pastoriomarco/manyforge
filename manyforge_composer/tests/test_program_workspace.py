@@ -32,12 +32,18 @@ def _copy_program(tmp_path: Path, name: str = "fixture.program.yaml") -> Path:
     return target
 
 
-def _client(tmp_path: Path) -> TestClient:
+def _client(
+    tmp_path: Path,
+    *,
+    allowed_fs_roots: list[str] | None = None,
+    allowed_program_write_roots: list[str] | None = None,
+) -> TestClient:
     return TestClient(
         create_app(
             ComposerState(),
             security=SecurityConfig(
-                allowed_fs_roots=[str(tmp_path)],
+                allowed_fs_roots=allowed_fs_roots or [str(tmp_path)],
+                allowed_program_write_roots=allowed_program_write_roots,
                 cors_origins=["http://localhost:3000"],
             ),
         )
@@ -107,6 +113,136 @@ def test_open_mutate_save_and_save_as_preserve_exact_workspace_facts(
     expected_copy = tmp_path / "copy.program.yaml"
     assert save_as["saved"]["path"] == str(expected_copy.resolve())
     assert expected_copy.is_file()
+
+
+def test_examples_open_read_only_and_save_as_is_confined_to_program_workspace(
+    tmp_path: Path,
+) -> None:
+    workspace_root = tmp_path / "program-workspace"
+    outside_root = tmp_path / "outside"
+    workspace_root.mkdir()
+    outside_root.mkdir()
+    client = _client(
+        tmp_path,
+        allowed_fs_roots=[str(_ROOT / "examples"), str(workspace_root)],
+        allowed_program_write_roots=[str(workspace_root)],
+    )
+
+    empty = client.get("/api/program/workspace").json()
+    opened_response = client.post(
+        "/api/program/open-draft",
+        json={
+            **_fence(empty),
+            "path": str(_SOURCE_PROGRAM),
+            "confirmDiscard": False,
+        },
+    )
+    assert opened_response.status_code == 200
+    opened = opened_response.json()
+    assert opened["saved"]["path"] == str(_SOURCE_PROGRAM.resolve())
+
+    before_failed_save = client.get("/api/program/workspace").json()
+    denied_save = client.post("/api/program/save", json=_fence(before_failed_save))
+    assert denied_save.status_code == 403
+    assert denied_save.json()["detail"]["code"] == "program_artifact_path_invalid"
+    assert client.get("/api/program/workspace").json() == before_failed_save
+
+    for path in (_SOURCE_PROGRAM, outside_root / "outside"):
+        denied_save_as = client.post(
+            "/api/program/save-as",
+            json={
+                **_fence(before_failed_save),
+                "path": str(path),
+                "confirmOverwrite": False,
+            },
+        )
+        assert denied_save_as.status_code == 403
+        assert (
+            denied_save_as.json()["detail"]["code"]
+            == "program_artifact_path_invalid"
+        )
+        assert client.get("/api/program/workspace").json() == before_failed_save
+
+    saved = client.post(
+        "/api/program/save-as",
+        json={
+            **_fence(before_failed_save),
+            "path": str(workspace_root / "saved"),
+            "confirmOverwrite": False,
+        },
+    )
+    assert saved.status_code == 200
+    assert saved.json()["saved"]["path"] == str(
+        (workspace_root / "saved.program.yaml").resolve()
+    )
+
+
+def test_explicit_invalid_program_write_roots_fail_closed_without_draft_change(
+    tmp_path: Path,
+) -> None:
+    source = _copy_program(tmp_path)
+    client = _client(
+        tmp_path,
+        allowed_program_write_roots=["invalid\x00root"],
+    )
+    empty = client.get("/api/program/workspace").json()
+    opened = client.post(
+        "/api/program/open-draft",
+        json={**_fence(empty), "path": str(source)},
+    ).json()
+    before = client.get("/api/program/workspace").json()
+
+    rejected = client.post("/api/program/save", json=_fence(before))
+
+    assert rejected.status_code == 503
+    assert rejected.json()["detail"]["code"] == "program_artifact_roots_unavailable"
+    assert client.get("/api/program/workspace").json() == before
+
+
+def test_create_app_security_fallback_overrides_preseeded_write_roots(
+    tmp_path: Path,
+) -> None:
+    read_root = tmp_path / "read-root"
+    preseeded_write_root = tmp_path / "preseeded-write-root"
+    read_root.mkdir()
+    preseeded_write_root.mkdir()
+    source = _copy_program(read_root)
+    state = ComposerState(
+        allowed_fs_roots=[str(preseeded_write_root)],
+        allowed_program_write_roots=[str(preseeded_write_root)],
+    )
+    client = TestClient(
+        create_app(
+            state,
+            security=SecurityConfig(
+                allowed_fs_roots=[str(read_root)],
+                allowed_program_write_roots=None,
+                cors_origins=["http://localhost:3000"],
+            ),
+        )
+    )
+
+    empty = client.get("/api/program/workspace").json()
+    opened = client.post(
+        "/api/program/open-draft",
+        json={**_fence(empty), "path": str(source)},
+    ).json()
+    before = client.get("/api/program/workspace").json()
+
+    rejected = client.post(
+        "/api/program/save-as",
+        json={
+            **_fence(before),
+            "path": str(preseeded_write_root / "bypass"),
+            "confirmOverwrite": False,
+        },
+    )
+
+    assert state.allowed_program_write_roots is None
+    assert rejected.status_code == 403
+    assert rejected.json()["detail"]["code"] == "program_artifact_path_invalid"
+    assert client.get("/api/program/workspace").json() == before
+    assert not (preseeded_write_root / "bypass.program.yaml").exists()
 
 
 def test_dirty_open_confirmation_and_rotated_identity_are_fail_closed(
