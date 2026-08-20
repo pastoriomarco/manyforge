@@ -54,6 +54,10 @@ from .contracts import (
     configuration_digest,
     decide_start,
 )
+from .package_aggregate import (
+    PackageAggregateUnavailable,
+    package_aggregate_sha256,
+)
 
 
 STATUS_ENVELOPE_SCHEMA = "manyforge.native_operator_instance.v1"
@@ -150,7 +154,6 @@ class NativeLauncherConfig:
             raise ValueError("manager_executable must be an executable file")
         for name in (
             "source_root",
-            "package_root",
             "node_catalog_path",
             "alarm_catalog_path",
         ):
@@ -655,6 +658,22 @@ class NativeLauncher:
 
     def __init__(self, config: NativeLauncherConfig) -> None:
         self.config = config
+        try:
+            observed_package_aggregate = package_aggregate_sha256(
+                config.package_root
+            )
+        except PackageAggregateUnavailable as error:
+            raise LauncherError(
+                "package_aggregate_unavailable",
+                str(error),
+                exit_code=71,
+            ) from error
+        if observed_package_aggregate != config.package_aggregate_sha256:
+            raise LauncherError(
+                "package_aggregate_mismatch",
+                "observed package aggregate does not match the expected digest",
+                exit_code=71,
+            )
         self.store = _StateStore(config)
         self._managed: dict[str, _ManagedProcess] = {}
         self.last_start_idempotent = False

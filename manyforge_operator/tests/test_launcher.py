@@ -16,6 +16,7 @@ from manyforge_operator.orchestrator import (
     _proc_observation,
     native_commands,
 )
+from manyforge_operator.package_aggregate import package_aggregate_sha256
 
 
 def _config(tmp_path: Path) -> NativeLauncherConfig:
@@ -43,7 +44,7 @@ def _config(tmp_path: Path) -> NativeLauncherConfig:
         logical_scene_database=tmp_path / "scene.sqlite3",
         historian_database_path=tmp_path / "history.sqlite3",
         state_root=tmp_path / "operator-state",
-        package_aggregate_sha256="a" * 64,
+        package_aggregate_sha256=package_aggregate_sha256(package),
         compiler_build_manifest_sha256="b" * 64,
         node_environment_sha256="c" * 64,
     )
@@ -117,7 +118,9 @@ def test_native_commands_pass_explicit_composer_static_dir(tmp_path: Path):
 
 def test_native_configuration_requires_explicit_artifact_digests(tmp_path: Path):
     valid = _config(tmp_path)
-    assert valid.package_aggregate_sha256 == "a" * 64
+    assert valid.package_aggregate_sha256 == package_aggregate_sha256(
+        valid.package_root
+    )
     with pytest.raises(ValueError, match="package_aggregate_sha256"):
         NativeLauncherConfig(
             source_root=valid.source_root,

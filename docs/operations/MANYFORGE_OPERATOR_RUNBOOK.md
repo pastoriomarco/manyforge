@@ -83,10 +83,23 @@ mkdir "$PACKAGE_ROOT" || exit 1
 ```
 
 The command must complete successfully before the root is usable. Discard a
-failed or partial root. Independently reload the successful root through the
-Manager `start` below, then keep that root read-only for the entire Manager
-generation. Do not select a root while materialization is running, mutate it
-after reload, or add a second generator mode.
+failed or partial root. Capture the package-root aggregate only after
+successful materialization:
+
+```bash
+PACKAGE_SHA256="$(
+  python3 -m manyforge_operator.package_aggregate --package-root "$PACKAGE_ROOT"
+)" || exit 1
+```
+
+The command emits one lowercase SHA-256 digest. The native `start` below
+independently recomputes that aggregate and rejects an unavailable, changed,
+or mismatched root before state creation, port probes, or process effects.
+The digest is provenance/integrity evidence only; it does not alter component
+compatibility or admission semantics. Independently reload the successful
+root through Manager `start`, then keep that root read-only for the entire
+Manager generation. Do not select a root while materialization is running,
+mutate it after reload, or add a second generator mode.
 
 Before starting, reserve the frozen ports: Composer `9000`, Headless
 loopback `9010`, and Program runner loopback `9011`. Keep the runtime host
