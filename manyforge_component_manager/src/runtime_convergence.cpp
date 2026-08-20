@@ -2,7 +2,9 @@
 
 #include <algorithm>
 #include <manyforge_core/runtime_contract_manifest_codec.hpp>
+#include <manyforge_deployment/runtime_contract_registry.hpp>
 #include <set>
+#include <stdexcept>
 
 namespace manyforge::component_manager {
 namespace {
@@ -48,6 +50,32 @@ Digest(const manyforge::core::ContentDigest &value) noexcept {
 }
 
 } // namespace
+
+void VerifyRuntimeContractAdmission(
+    const RuntimeUnitConvergencePlanRowDTO &plan) {
+  if (plan.runtime_contract_offer_digest.empty() ||
+      plan.runtime_contract_requirement.requirement_digest.empty()) {
+    throw std::invalid_argument(
+        "runtime convergence plan has no sealed contract-manifest admission");
+  }
+  const auto *contract =
+      manyforge::deployment::build_qualified_runtime_contract_registry().find(
+          plan.runtime_profile_id, plan.runtime_profile_revision,
+          plan.product_contract_id, plan.product_contract_revision);
+  if (contract == nullptr ||
+      contract->offer().offer_digest != plan.runtime_contract_offer_digest) {
+    throw std::invalid_argument(
+        "runtime convergence plan selected offer differs from the immutable "
+        "build-qualified registry");
+  }
+  const auto compatible = manyforge::core::CheckRuntimeContractCompatibility(
+      contract->offer(), plan.runtime_contract_requirement);
+  if (!compatible.ok()) {
+    throw std::invalid_argument(
+        "runtime convergence plan requirement is incompatible with its "
+        "selected offer");
+  }
+}
 
 bool RuntimeUnitConvergencePlanRowDTO::valid() const noexcept {
   const bool contract_fields_valid =

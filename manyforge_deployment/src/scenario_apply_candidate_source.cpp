@@ -1,6 +1,7 @@
 #include "manyforge_deployment/scenario_apply_candidate_source.hpp"
 
 #include "content_identity_internal.hpp"
+#include "posix_durability_internal.hpp"
 
 #include <manyforge_deployment/artifact_codec.hpp>
 #include <manyforge_deployment/content_identity.hpp>
@@ -145,16 +146,26 @@ DeploymentCompatibility(const CanonicalValue &row,
 }
 
 [[nodiscard]] std::filesystem::path ExistingRoot(std::filesystem::path root) {
-  Require(!root.empty(), "scenario Apply package root is empty");
-  std::error_code error;
-  const auto supplied = std::filesystem::symlink_status(root, error);
-  Require(!error && !std::filesystem::is_symlink(supplied) &&
-              std::filesystem::is_directory(supplied),
-          "scenario Apply package root must be a plain directory");
-  root = std::filesystem::canonical(root, error);
-  Require(!error && root.is_absolute(),
-          "scenario Apply package root cannot be resolved");
-  return root;
+  const detail::posix_durability::ErrorPolicy errors{
+      [](const std::string_view message) {
+        return std::make_exception_ptr(
+            ScenarioApplyCandidateError(std::string(message)));
+      }};
+  constexpr detail::posix_durability::TrustedRootMessages messages{
+      "scenario Apply package root is empty",
+      "scenario Apply package root cannot be resolved",
+      "scenario Apply package root must be a plain directory",
+  };
+  try {
+    return detail::posix_durability::normalize_existing_plain_root(
+        std::move(root), errors, messages);
+  } catch (const ScenarioApplyCandidateError &) {
+    throw;
+  } catch (const std::exception &error) {
+    throw ScenarioApplyCandidateError(
+        "scenario Apply package root is unavailable: " +
+        std::string(error.what()));
+  }
 }
 
 class FileDescriptor final {

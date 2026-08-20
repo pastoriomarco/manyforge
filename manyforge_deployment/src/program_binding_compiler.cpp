@@ -119,7 +119,7 @@ template <typename Record>
 
 template <typename Record>
 [[nodiscard]] std::string read_catalog_record(
-    const Record& record, const ICatalogArtifactStore& store,
+    const Record& record, const ICatalogArtifactSource& store,
     std::string_view label) {
   auto bytes = store.get_verified(record.content_addressed_store_key,
                                   record.content_digest, std::nullopt);
@@ -136,7 +136,7 @@ struct QualifiedCatalogClosure final {
 
 [[nodiscard]] QualifiedCatalogClosure load_qualified_catalog_closure(
     const core::RetainedBundleDTO& bundle,
-    const ICatalogArtifactStore& store) {
+    const ICatalogArtifactSource& store) {
   QualifiedCatalogClosure result;
   for (const auto& record : bundle.catalogs.records) {
     if (const auto* capability =
@@ -219,7 +219,7 @@ select_component_capability_dependencies(
     const core::RetainedBundleDTO& bundle,
     const core::ControllableComponentDTO& component,
     std::span<const QualifiedCapabilityDefinition> retained_capabilities,
-    const ICatalogArtifactStore& store) {
+    const ICatalogArtifactSource& store) {
   const auto& record =
       require_catalog_record<core::ComponentTypeCatalogRecordRefDTO>(
           bundle, component.component_type_id.value(),
@@ -1027,7 +1027,7 @@ compile_program_binding_contract(
     core::ProgramRoleAssignmentDTO role_assignment,
     const RetainedBundle& retained_bundle,
     const VerifiedRetainedModelMap& retained_model_map,
-    const ICatalogArtifactStore& catalog_artifact_store) {
+    const ICatalogArtifactSource& catalog_artifact_store) {
   try {
     if (!verify_retained_bundle_identity(retained_bundle) ||
         retained_model_map.query().retained_bundle_id !=
@@ -1542,7 +1542,7 @@ std::shared_ptr<const ProgramBinding> compile_program_binding(
     core::ProgramRoleAssignmentDTO role_assignment,
     const RetainedBundle& retained_bundle,
     const VerifiedRetainedModelMap& retained_model_map,
-    const ICatalogArtifactStore& catalog_artifact_store) {
+    const ICatalogArtifactSource& catalog_artifact_store) {
   return compile_program_binding_contract(
       program_contract.value(), std::move(role_assignment), retained_bundle,
       retained_model_map, catalog_artifact_store);
@@ -1554,7 +1554,7 @@ compile_direct_control_motion_program_binding(
     const core::CommandTargetId& command_target_id,
     const RetainedBundle& retained_bundle,
     const VerifiedRetainedModelMap& retained_model_map,
-    const ICatalogArtifactStore& catalog_artifact_store) {
+    const ICatalogArtifactSource& catalog_artifact_store) {
   try {
     if (!verify_retained_bundle_identity(retained_bundle) ||
         retained_model_map.query().retained_bundle_id !=
@@ -1597,7 +1597,7 @@ compile_direct_control_gripper_program_binding(
     const core::CommandTargetId& command_target_id,
     const RetainedBundle& retained_bundle,
     const VerifiedRetainedModelMap& retained_model_map,
-    const ICatalogArtifactStore& catalog_artifact_store) {
+    const ICatalogArtifactSource& catalog_artifact_store) {
   try {
     if (!verify_retained_bundle_identity(retained_bundle) ||
         retained_model_map.query().retained_bundle_id !=
@@ -1647,7 +1647,7 @@ DirectControlProgramBindingInventory
 compile_direct_control_program_binding_inventory(
     const RetainedBundle& retained_bundle,
     const VerifiedRetainedModelMap& retained_model_map,
-    const ICatalogArtifactStore& catalog_artifact_store) {
+    const ICatalogArtifactSource& catalog_artifact_store) {
   try {
     if (!verify_retained_bundle_identity(retained_bundle) ||
         retained_model_map.query().retained_bundle_id !=

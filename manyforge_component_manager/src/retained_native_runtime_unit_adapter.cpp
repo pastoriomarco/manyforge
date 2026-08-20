@@ -21,6 +21,7 @@
 #include <algorithm>
 #include <array>
 #include <cerrno>
+#include <charconv>
 #include <chrono>
 #include <climits>
 #include <cstdint>
@@ -38,6 +39,7 @@
 #include <sstream>
 #include <string>
 #include <string_view>
+#include <system_error>
 #include <thread>
 #include <utility>
 #include <vector>
@@ -57,6 +59,7 @@ using ProjectionBindingKey =
 constexpr int kChildChannelFd = 3;
 constexpr int kChildExecErrorFd = 4;
 constexpr int kChildExecutableFd = 5;
+constexpr int kChildPackageRootFd = 6;
 constexpr std::size_t kMaximumControlPacketBytes =
     detail::kMaximumNativeProjectionRpcPacketBytes;
 constexpr auto kExecTimeout = std::chrono::seconds(10);
@@ -132,6 +135,24 @@ constexpr auto kTermStopTimeout = std::chrono::seconds(1);
   return result;
 }
 
+[[nodiscard]] std::optional<int>
+DescriptorMintedRootFd(const std::filesystem::path &path) {
+  const auto text = path.generic_string();
+  constexpr std::string_view prefix = "/proc/self/fd/";
+  if (!text.starts_with(prefix) || text.size() == prefix.size() ||
+      (text[prefix.size()] == '0' && text.size() != prefix.size() + 1U)) {
+    return std::nullopt;
+  }
+  unsigned int value = 0U;
+  const auto parsed = std::from_chars(
+      text.data() + prefix.size(), text.data() + text.size(), value);
+  if (parsed.ec != std::errc{} || parsed.ptr != text.data() + text.size() ||
+      value == 0U || value > static_cast<unsigned int>(INT_MAX)) {
+    return std::nullopt;
+  }
+  return static_cast<int>(value);
+}
+
 [[nodiscard]] std::filesystem::path
 NormalizedPlainDirectory(std::filesystem::path path,
                          const std::string_view label) {
@@ -144,6 +165,16 @@ NormalizedPlainDirectory(std::filesystem::path path,
     Fail(std::string(label) + " could not be resolved: " + error.message());
   }
   const auto status = std::filesystem::symlink_status(path, error);
+  if (!error) {
+    struct stat descriptor_status {};
+    if (const auto descriptor = DescriptorMintedRootFd(path);
+        descriptor.has_value()) {
+      if (::fstat(*descriptor, &descriptor_status) == 0 &&
+          S_ISDIR(descriptor_status.st_mode)) {
+        return path;
+      }
+    }
+  }
   if (error || !std::filesystem::is_directory(status) ||
       std::filesystem::is_symlink(status)) {
     Fail(std::string(label) + " is not one existing plain directory");
@@ -179,6 +210,30 @@ public:
 private:
   int fd_{-1};
 };
+
+[[nodiscard]] UniqueFd OpenPinnedPackageRoot(
+    const std::filesystem::path &path) {
+  if (const auto descriptor = DescriptorMintedRootFd(path);
+      descriptor.has_value()) {
+    struct stat status {};
+    if (::fstat(*descriptor, &status) != 0 || !S_ISDIR(status.st_mode)) {
+      Fail("trusted retained-package descriptor is not a directory");
+    }
+    const int duplicate =
+        ::fcntl(*descriptor, F_DUPFD_CLOEXEC, kChildPackageRootFd + 1);
+    if (duplicate < 0) {
+      Fail(ErrnoDetail("could not duplicate trusted retained-package root",
+                       errno));
+    }
+    return UniqueFd(duplicate);
+  }
+  const int descriptor =
+      ::open(path.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW);
+  if (descriptor < 0) {
+    Fail(ErrnoDetail("could not open trusted retained-package root", errno));
+  }
+  return UniqueFd(descriptor);
+}
 
 [[nodiscard]] std::array<UniqueFd, 2U> MakePacketPair() {
   int descriptors[2]{-1, -1};
@@ -469,6 +524,7 @@ SameChildProduct(const NativeExecutionRuntimeUnitAdmission &admission,
 
 [[noreturn]] void EnterChild(const pid_t expected_parent, const int channel_fd,
                              const int error_fd, const int executable_fd,
+                             const int package_root_fd,
                              char *const argv[]) noexcept {
   if (::prctl(PR_SET_PDEATHSIG, SIGTERM) != 0) {
     ChildExit(error_fd, errno);
@@ -477,20 +533,24 @@ SameChildProduct(const NativeExecutionRuntimeUnitAdmission &admission,
     ChildExit(error_fd, ECHILD);
   }
   const int channel_copy =
-      ::fcntl(channel_fd, F_DUPFD_CLOEXEC, kChildExecutableFd + 1);
+      ::fcntl(channel_fd, F_DUPFD_CLOEXEC, kChildPackageRootFd + 1);
   const int error_copy =
-      ::fcntl(error_fd, F_DUPFD_CLOEXEC, kChildExecutableFd + 1);
+      ::fcntl(error_fd, F_DUPFD_CLOEXEC, kChildPackageRootFd + 1);
   const int executable_copy =
-      ::fcntl(executable_fd, F_DUPFD_CLOEXEC, kChildExecutableFd + 1);
+      ::fcntl(executable_fd, F_DUPFD_CLOEXEC, kChildPackageRootFd + 1);
+  const int package_root_copy =
+      ::fcntl(package_root_fd, F_DUPFD_CLOEXEC, kChildPackageRootFd + 1);
   if (channel_copy < 0 || error_copy < 0 || executable_copy < 0 ||
+      package_root_copy < 0 ||
       ::dup3(channel_copy, kChildChannelFd, 0) < 0 ||
       ::dup3(error_copy, kChildExecErrorFd, O_CLOEXEC) < 0 ||
-      ::dup3(executable_copy, kChildExecutableFd, O_CLOEXEC) < 0) {
+      ::dup3(executable_copy, kChildExecutableFd, O_CLOEXEC) < 0 ||
+      ::dup3(package_root_copy, kChildPackageRootFd, 0) < 0) {
     ChildExit(error_fd, errno);
   }
 #ifdef SYS_close_range
   const long closed =
-      ::syscall(SYS_close_range, kChildExecutableFd + 1U, UINT_MAX, 0U);
+      ::syscall(SYS_close_range, kChildPackageRootFd + 1U, UINT_MAX, 0U);
   if (closed != 0 && errno != ENOSYS) {
     ChildExit(kChildExecErrorFd, errno);
   }
@@ -499,7 +559,7 @@ SameChildProduct(const NativeExecutionRuntimeUnitAdmission &admission,
     const long maximum = ::sysconf(_SC_OPEN_MAX);
     const int upper =
         maximum > 0 && maximum < INT_MAX ? static_cast<int>(maximum) : 65536;
-    for (int descriptor = kChildExecutableFd + 1; descriptor < upper;
+    for (int descriptor = kChildPackageRootFd + 1; descriptor < upper;
          ++descriptor) {
       static_cast<void>(::close(descriptor));
     }
@@ -624,6 +684,7 @@ struct RetainedNativeRuntimeUnitAdapter::Impl final
                                      "trusted installed-target root")),
         package_root_path(NormalizedPlainDirectory(
             std::move(trusted_package_root), "trusted retained-package root")),
+        package_root_fd(OpenPinnedPackageRoot(package_root_path)),
         manager_state_root_path(NormalizedPlainDirectory(
             std::move(manager_state_root), "Manager state root")),
         staging_root_path(NormalizedPlainDirectory(
@@ -1062,8 +1123,8 @@ struct RetainedNativeRuntimeUnitAdapter::Impl final
     arguments.push_back(admission.installed_target_id());
     arguments.insert(arguments.end(), launch_arguments.begin(),
                      launch_arguments.end());
-    arguments.emplace_back("--manyforge-managed-package-root");
-    arguments.push_back(package_root_path.string());
+    arguments.emplace_back("--manyforge-managed-package-root-fd");
+    arguments.push_back(std::to_string(kChildPackageRootFd));
     arguments.emplace_back("--manyforge-managed-manager-state-root");
     arguments.push_back(manager_state_root_path.string());
     arguments.emplace_back("--manyforge-managed-staging-root");
@@ -1088,7 +1149,7 @@ struct RetainedNativeRuntimeUnitAdapter::Impl final
     }
     if (pid == 0) {
       EnterChild(parent, channels[1].get(), exec_pipe[1].get(), target.get(),
-                 argv.data());
+                 package_root_fd.get(), argv.data());
     }
 
     channels[1].Reset();
@@ -1265,6 +1326,7 @@ struct RetainedNativeRuntimeUnitAdapter::Impl final
 
   std::filesystem::path target_root_path;
   std::filesystem::path package_root_path;
+  UniqueFd package_root_fd;
   std::filesystem::path manager_state_root_path;
   std::filesystem::path staging_root_path;
   const manyforge::deployment::IVerifiedRetainedBundleSource &bundle_source;

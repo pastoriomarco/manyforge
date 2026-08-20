@@ -371,26 +371,14 @@ MakeExpectation(const RuntimeUnitConvergencePlanRowDTO &plan) {
       plan.runtime_contract_offer_digest.value());
 }
 
-void VerifyRuntimeContractAdmission(
+void RequireRuntimeContractAdmission(
     const RuntimeUnitConvergencePlanRowDTO &plan) {
-  if (plan.runtime_contract_offer_digest.empty() ||
-      plan.runtime_contract_requirement.requirement_digest.empty()) {
-    Fail("runtime convergence plan has no sealed contract-manifest admission");
-  }
-  const auto *contract =
-      manyforge::deployment::build_qualified_runtime_contract_registry().find(
-          plan.runtime_profile_id, plan.runtime_profile_revision,
-          plan.product_contract_id, plan.product_contract_revision);
-  if (contract == nullptr ||
-      contract->offer().offer_digest != plan.runtime_contract_offer_digest) {
-    Fail("runtime convergence plan selected offer differs from the immutable "
-         "build-qualified registry");
-  }
-  const auto compatible = manyforge::core::CheckRuntimeContractCompatibility(
-      contract->offer(), plan.runtime_contract_requirement);
-  if (!compatible.ok()) {
-    Fail("runtime convergence plan requirement is incompatible with its "
-         "selected offer");
+  try {
+    VerifyRuntimeContractAdmission(plan);
+  } catch (const std::exception &error) {
+    Fail(error.what());
+  } catch (...) {
+    Fail("runtime convergence contract admission failed");
   }
 }
 
@@ -519,12 +507,13 @@ ManagerApplyRuntimeConvergenceCoordinator::
             &artifact_source,
         IRuntimeUnitProcessPort &process_port,
         IRuntimeUnitProgressPort &progress_port, std::string operating_system,
-        std::string shell_contract, RuntimeObservationReducer::Clock clock_ns)
+        std::string shell_contract, RuntimeObservationReducer::Clock clock_ns,
+        RuntimePreStartGuard pre_start_guard)
     : ManagerApplyRuntimeConvergenceCoordinator(
           fence_coordinator, apply_journal, publication_reader, artifact_source,
           process_port, progress_port, std::move(operating_system),
           std::vector<std::string>{std::move(shell_contract)},
-          std::move(clock_ns)) {}
+          std::move(clock_ns), std::move(pre_start_guard)) {}
 
 ManagerApplyRuntimeConvergenceCoordinator::
     ManagerApplyRuntimeConvergenceCoordinator(
@@ -537,14 +526,16 @@ ManagerApplyRuntimeConvergenceCoordinator::
         IRuntimeUnitProcessPort &process_port,
         IRuntimeUnitProgressPort &progress_port, std::string operating_system,
         std::vector<std::string> launch_environment_contracts,
-        RuntimeObservationReducer::Clock clock_ns)
+        RuntimeObservationReducer::Clock clock_ns,
+        RuntimePreStartGuard pre_start_guard)
     : fence_coordinator_(fence_coordinator), apply_journal_(apply_journal),
       publication_reader_(publication_reader),
       artifact_source_(artifact_source), process_port_(process_port),
       progress_port_(progress_port),
       operating_system_(std::move(operating_system)),
       launch_environment_contracts_(std::move(launch_environment_contracts)),
-      clock_ns_(std::move(clock_ns)) {
+      clock_ns_(std::move(clock_ns)),
+      pre_start_guard_(std::move(pre_start_guard)) {
   std::sort(launch_environment_contracts_.begin(),
             launch_environment_contracts_.end());
   if (operating_system_.empty() || launch_environment_contracts_.empty() ||
@@ -557,6 +548,9 @@ ManagerApplyRuntimeConvergenceCoordinator::
       !clock_ns_) {
     throw std::invalid_argument(
         "runtime convergence coordinator dependencies are invalid");
+  }
+  if (!pre_start_guard_) {
+    pre_start_guard_ = [] {};
   }
 }
 
@@ -648,7 +642,7 @@ ManagerApplyRuntimeConvergenceCoordinator::ConvergeOrRecover(
     if (!query.valid()) {
       Fail("Manager produced an invalid runtime convergence query");
     }
-    VerifyRuntimeContractAdmission(query.plan);
+    RequireRuntimeContractAdmission(query.plan);
 
     ProcessPresenceObservation process =
         ObserveProcessSafely(process_port_, query);
@@ -659,7 +653,10 @@ ManagerApplyRuntimeConvergenceCoordinator::ConvergeOrRecover(
       // Re-read the durable row's sealed requirement immediately before the
       // only managed lifecycle effect.  A journal replay cannot bypass this
       // admission by reusing an old process query.
-      VerifyRuntimeContractAdmission(query.plan);
+      RequireRuntimeContractAdmission(query.plan);
+      // This Manager-owned generation check is deliberately outside the
+      // effect-uncertain catch: a typed restart requirement is certain.
+      pre_start_guard_();
       try {
         // A surviving exact process still has candidate-scoped staged-ready
         // work to reconcile (for example, preparing newly retained native

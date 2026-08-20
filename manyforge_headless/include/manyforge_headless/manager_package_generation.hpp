@@ -38,6 +38,9 @@ public:
       delete;
 
   [[nodiscard]] const std::filesystem::path &package_root() const noexcept;
+  /// Internal descriptor-minted view retained for the generation lifetime.
+  /// This is not a canonicalized operator pathname.
+  [[nodiscard]] std::filesystem::path descriptor_bound_root() const;
   [[nodiscard]] const manyforge::core::RuntimeContractManifestSetDTO &
   manifest_set() const noexcept;
 

@@ -49,7 +49,7 @@ struct DirectControlProgramBindingInventory final {
     core::ProgramRoleAssignmentDTO role_assignment,
     const RetainedBundle& retained_bundle,
     const VerifiedRetainedModelMap& retained_model_map,
-    const ICatalogArtifactStore& catalog_artifact_store);
+    const ICatalogArtifactSource& catalog_artifact_store);
 
 /// Compile the build-owned direct Robot Control motion contract for one exact
 /// retained command target.
@@ -69,7 +69,7 @@ compile_direct_control_motion_program_binding(
     const core::CommandTargetId& command_target_id,
     const RetainedBundle& retained_bundle,
     const VerifiedRetainedModelMap& retained_model_map,
-    const ICatalogArtifactStore& catalog_artifact_store);
+    const ICatalogArtifactSource& catalog_artifact_store);
 
 /// Compile the build-owned direct Robot Control gripper contract for one exact
 /// retained command target.
@@ -84,7 +84,7 @@ compile_direct_control_gripper_program_binding(
     const core::CommandTargetId& command_target_id,
     const RetainedBundle& retained_bundle,
     const VerifiedRetainedModelMap& retained_model_map,
-    const ICatalogArtifactStore& catalog_artifact_store);
+    const ICatalogArtifactSource& catalog_artifact_store);
 
 /// Compile every complete direct-control target in deterministic retained-cell
 /// order. A target is included only when its qualified component type declares
@@ -94,6 +94,6 @@ compile_direct_control_gripper_program_binding(
 compile_direct_control_program_binding_inventory(
     const RetainedBundle& retained_bundle,
     const VerifiedRetainedModelMap& retained_model_map,
-    const ICatalogArtifactStore& catalog_artifact_store);
+    const ICatalogArtifactSource& catalog_artifact_store);
 
 }  // namespace manyforge::deployment

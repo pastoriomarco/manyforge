@@ -107,6 +107,18 @@ ManagerPackageGeneration::package_root() const noexcept {
   return package_root_;
 }
 
+std::filesystem::path ManagerPackageGeneration::descriptor_bound_root() const {
+  if (root_descriptor_ < 0) {
+    throw std::logic_error("Manager package root descriptor is closed");
+  }
+  struct stat status {};
+  if (::fstat(root_descriptor_, &status) != 0 || !S_ISDIR(status.st_mode)) {
+    throw std::logic_error("Manager package root descriptor is not a directory");
+  }
+  return std::filesystem::path("/proc/self/fd") /
+         std::to_string(root_descriptor_);
+}
+
 const RuntimeContractManifestSetDTO &
 ManagerPackageGeneration::manifest_set() const noexcept {
   return manifest_set_;

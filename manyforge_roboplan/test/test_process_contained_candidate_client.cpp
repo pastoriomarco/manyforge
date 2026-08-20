@@ -1,3 +1,4 @@
+#include <fcntl.h>
 #include <gtest/gtest.h>
 #include <unistd.h>
 
@@ -45,6 +46,54 @@ struct ProcessFixture final {
   Eigen::VectorXd start;
   Eigen::VectorXd goal;
   std::shared_ptr<roboplan::Scene> reference_scene;
+};
+
+class ScopedPackageRootDescriptor final {
+public:
+  explicit ScopedPackageRootDescriptor(const std::filesystem::path &root) {
+    const int existing_flags = ::fcntl(6, F_GETFD);
+    if (existing_flags >= 0) {
+      saved_flags_ = existing_flags;
+      saved_descriptor_ = ::dup(6);
+      if (saved_descriptor_ < 0) {
+        throw std::runtime_error("could not save test FD 6");
+      }
+    }
+    const int source =
+        ::open(root.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    if (source < 0) {
+      throw std::runtime_error("could not open test package root");
+    }
+    if (source != 6) {
+      if (::dup2(source, 6) < 0) {
+        static_cast<void>(::close(source));
+        throw std::runtime_error("could not reserve test FD 6");
+      }
+      static_cast<void>(::close(source));
+    }
+    const int flags = ::fcntl(6, F_GETFD);
+    if (flags < 0 || ::fcntl(6, F_SETFD, flags & ~FD_CLOEXEC) < 0) {
+      throw std::runtime_error("could not make test FD 6 inheritable");
+    }
+  }
+
+  ~ScopedPackageRootDescriptor() {
+    if (saved_descriptor_ >= 0) {
+      static_cast<void>(::dup2(saved_descriptor_, 6));
+      static_cast<void>(::fcntl(6, F_SETFD, saved_flags_));
+      static_cast<void>(::close(saved_descriptor_));
+    } else {
+      static_cast<void>(::close(6));
+    }
+  }
+
+  ScopedPackageRootDescriptor(const ScopedPackageRootDescriptor &) = delete;
+  ScopedPackageRootDescriptor &
+  operator=(const ScopedPackageRootDescriptor &) = delete;
+
+private:
+  int saved_descriptor_{-1};
+  int saved_flags_{-1};
 };
 
 [[nodiscard]] std::vector<double> values(const Eigen::VectorXd &vector) {
@@ -158,7 +207,7 @@ request(const ProcessFixture &fixture) {
 config(const std::filesystem::path &worker) {
   return ProcessContainedCandidateClientConfig{
       worker, 10s, 250ms, 500ms, 4U * 1024U * 1024U,
-      256U * 1024U * 1024U, false, std::nullopt};
+      256U * 1024U * 1024U, false, std::nullopt, std::nullopt};
 }
 
 [[nodiscard]] Pose3DTO identity_pose(double x_m = 0.0) {
@@ -467,6 +516,50 @@ TEST(ProcessContainedCandidateClientTest,
   EXPECT_NE(missing.error().message.find("asset is unavailable"),
             std::string::npos);
   std::filesystem::remove_all(asset_root, ignored);
+}
+
+TEST(ProcessContainedCandidateClientTest,
+     RetainedWorkerKeepsDescriptorBoundSceneAssetsAcrossRootReplacement) {
+  auto fixture = make_fixture();
+  const auto root_parent =
+      std::filesystem::temp_directory_path() /
+      ("manyforge-worker-fd6-" + std::to_string(::getpid()));
+  const auto package_a = root_parent / "package-a";
+  const auto package_b = root_parent / "package-b";
+  const auto mesh = package_a / "examples/scene/meshes/fixture.obj";
+  std::error_code ignored;
+  std::filesystem::remove_all(root_parent, ignored);
+  ASSERT_TRUE(std::filesystem::create_directories(mesh.parent_path()));
+  {
+    std::ofstream stream(mesh, std::ios::binary | std::ios::trunc);
+    ASSERT_TRUE(stream.good());
+    stream << "v 0 0 0\nv 1 0 0\nv 0 1 0\nf 1 2 3\n";
+    stream.flush();
+    ASSERT_TRUE(stream.good());
+  }
+  ASSERT_TRUE(std::filesystem::create_directory(package_b));
+  ScopedPackageRootDescriptor package_root(package_a);
+
+  auto process_config = config(MANYFORGE_ROBOPLAN_CANDIDATE_WORKER_PATH);
+  process_config.require_retained_projection = true;
+  process_config.scene_asset_root = std::filesystem::path("/proc/self/fd/6");
+  process_config.retained_package_root_fd = 6;
+  ProcessContainedRoboPlanCandidateClient client(
+      fixture.model, fixture.binding,
+      RoboPlanCandidateComputerConfig{0x1234U, 65'536U, 0.01},
+      std::move(process_config));
+
+  const auto selected = client.select_retained_projection(
+      projection(1U, 1U, false, "examples/scene/meshes/fixture.obj"));
+  ASSERT_TRUE(selected.ok()) << selected.error().message;
+
+  const auto displaced = root_parent / "package-a-displaced";
+  std::filesystem::rename(package_a, displaced);
+  std::filesystem::rename(package_b, package_a);
+  ASSERT_TRUE(std::filesystem::is_directory(package_a));
+  const auto planned = client.compute(request(fixture));
+  ASSERT_TRUE(planned.ok()) << planned.error().message;
+  std::filesystem::remove_all(root_parent, ignored);
 }
 
 TEST(ProcessContainedCandidateClientTest,

@@ -5,6 +5,8 @@
 #include <atomic>
 #include <cstdint>
 #include <filesystem>
+#include <fstream>
+#include <iterator>
 #include <memory>
 #include <stdexcept>
 #include <string>
@@ -17,6 +19,7 @@
 
 #include "content_identity_internal.hpp"
 #include "lite6_retained_consumer_fixture.hpp"
+#include "scoped_procfd_root.hpp"
 
 namespace {
 
@@ -30,6 +33,7 @@ using manyforge::core::ResourceRoleId;
 using manyforge::core::TargetRoleId;
 using manyforge::deployment::CanonicalValue;
 using manyforge::deployment::FilesystemVerifiedRetainedBundleSource;
+using manyforge::deployment::FilesystemVerifiedProgramSource;
 using manyforge::deployment::FilesystemProgramRepository;
 using manyforge::deployment::ProgramContractError;
 using manyforge::deployment::RetainedBundle;
@@ -365,6 +369,66 @@ TEST(ProgramContractTest,
                 contract->value().program_id,
                 ProgramRevision(std::string(kZeroDigest)), *bundle),
             nullptr);
+}
+
+TEST(ProgramContractTest,
+     VerifiedSourceReadsThroughProcfdAndLeavesMissingNamespaceAbsent) {
+  ScopedTrustedRoot root;
+  const auto bundle = make_bundle(root.path());
+  const std::string bytes = canonical_json(
+      with_program_revision(make_program_root(valid_options(*bundle))));
+  const auto contract = verify_program_binding_contract(bytes, *bundle);
+  {
+    FilesystemProgramRepository writer(root.path());
+    ASSERT_TRUE(writer.put_if_absent(contract, *bundle));
+  }
+
+  const auto entry_count_before = static_cast<std::size_t>(std::distance(
+      std::filesystem::recursive_directory_iterator(root.path()),
+      std::filesystem::recursive_directory_iterator()));
+  manyforge::deployment::test::ScopedProcfdRoot procfd(root.path());
+  const FilesystemVerifiedProgramSource source(procfd.path());
+  manyforge::deployment::test::ScopedPathReplacement replacement(
+      root.path());
+  const auto read = source.get_verified(
+      contract->value().program_id, contract->value().program_revision,
+      *bundle);
+  ASSERT_NE(read, nullptr);
+  EXPECT_EQ(read->canonical_program_bytes(), bytes);
+  EXPECT_EQ(source.get_verified(
+                contract->value().program_id,
+                ProgramRevision(std::string(kZeroDigest)), *bundle),
+            nullptr);
+  EXPECT_EQ(static_cast<std::size_t>(std::distance(
+      std::filesystem::recursive_directory_iterator(root.path()),
+                std::filesystem::recursive_directory_iterator())),
+            0U);
+  EXPECT_EQ(static_cast<std::size_t>(std::distance(
+                std::filesystem::recursive_directory_iterator(
+                    replacement.backing()),
+                std::filesystem::recursive_directory_iterator())),
+            entry_count_before);
+
+  ScopedTrustedRoot empty_root;
+  manyforge::deployment::test::ScopedProcfdRoot empty_procfd(
+      empty_root.path());
+  const FilesystemVerifiedProgramSource empty_source(empty_procfd.path());
+  EXPECT_EQ(empty_source.get_verified(
+                contract->value().program_id,
+                contract->value().program_revision, *bundle),
+            nullptr);
+  EXPECT_FALSE(std::filesystem::exists(empty_root.path() / "programs"));
+
+  ScopedTrustedRoot unsafe_root;
+  std::ofstream(unsafe_root.path() / "programs") << "not-a-directory";
+  manyforge::deployment::test::ScopedProcfdRoot unsafe_procfd(
+      unsafe_root.path());
+  const FilesystemVerifiedProgramSource unsafe_source(unsafe_procfd.path());
+  EXPECT_THROW(
+      static_cast<void>(unsafe_source.get_verified(
+          contract->value().program_id, contract->value().program_revision,
+          *bundle)),
+      manyforge::deployment::RetainedBundleError);
 }
 
 TEST(ProgramContractTest,

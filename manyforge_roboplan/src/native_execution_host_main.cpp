@@ -123,6 +123,7 @@ constexpr std::size_t kMaximumReasonBytes = 4096U;
 constexpr std::size_t kMaximumEventPage = 16U;
 constexpr double kMaximumSafeInteger = 9'007'199'254'740'991.0;
 constexpr std::size_t kOwnerEpochRandomBytes = 16U;
+constexpr int kManagedPackageRootFd = 6;
 constexpr int kSocketBacklog = 16;
 constexpr int kReconcilePeriodMilliseconds = 5;
 constexpr int kClientPacketDeadlineMilliseconds = 100;
@@ -369,6 +370,7 @@ struct HostConfig final {
 
 struct ManagedRuntimeChildConfig final {
   int manager_channel_fd{-1};
+  int package_root_fd{-1};
   std::filesystem::path package_root;
   std::filesystem::path manager_state_root;
   std::filesystem::path staging_root;
@@ -424,8 +426,8 @@ ParseManagedRuntimeArguments(const int argc, char **argv) {
             "duplicate managed runtime option " + option);
     if (option == "--manyforge-managed-runtime-channel-fd") {
       config.manager_channel_fd = ParseFileDescriptor(value);
-    } else if (option == "--manyforge-managed-package-root") {
-      config.package_root = value;
+    } else if (option == "--manyforge-managed-package-root-fd") {
+      config.package_root_fd = ParseFileDescriptor(value);
     } else if (option == "--manyforge-managed-manager-state-root") {
       config.manager_state_root = value;
     } else if (option == "--manyforge-managed-staging-root") {
@@ -446,7 +448,8 @@ ParseManagedRuntimeArguments(const int argc, char **argv) {
       Fail("unknown managed runtime option " + option);
     }
   }
-  Require(seen.size() == 10U && config.manager_channel_fd >= 0,
+  Require(seen.size() == 10U && config.manager_channel_fd >= 0 &&
+              config.package_root_fd == kManagedPackageRootFd,
           "managed runtime invocation is incomplete");
   Require(IsPortableRuntimeIdentity(config.cell_id) &&
               IsPortableRuntimeIdentity(config.runtime_unit_id) &&
@@ -455,8 +458,16 @@ ParseManagedRuntimeArguments(const int argc, char **argv) {
   Require(core::IsExactLowercaseSha256Digest(config.product_identity) &&
               core::IsExactLowercaseSha256Digest(config.configuration_identity),
           "managed runtime retained identity is invalid");
-  config.package_root = ExistingDirectory(std::move(config.package_root),
-                                          "managed retained-package root");
+  struct stat package_status {};
+  const int package_flags =
+      ::fcntl(config.package_root_fd, F_GETFD);
+  Require(::fstat(config.package_root_fd, &package_status) == 0 &&
+              S_ISDIR(package_status.st_mode) && package_flags >= 0 &&
+              (package_flags & FD_CLOEXEC) == 0,
+          "managed package-root descriptor is not a retained directory");
+  config.package_root =
+      std::filesystem::path("/proc/self/fd") /
+      std::to_string(config.package_root_fd);
   config.manager_state_root = ExistingDirectory(
       std::move(config.manager_state_root), "managed Manager state root");
   config.staging_root = ExistingDirectory(std::move(config.staging_root),
@@ -4258,7 +4269,7 @@ BuildProductComposition(CompositionBuildInput input) {
           "native physical composition inputs do not share one active "
           "product");
   const auto &products = input.bundle->value().compiled_products;
-  const deployment::FilesystemCatalogArtifactStore catalog_store(
+  const deployment::FilesystemVerifiedCatalogArtifactSource catalog_store(
       input.package_root);
   const auto qualified_runtime_policy =
       deployment::resolve_retained_runtime_policy(*input.bundle, catalog_store);
@@ -4559,7 +4570,11 @@ BuildProductComposition(CompositionBuildInput input) {
           ProcessContainedCandidateClientConfig{
               .worker_executable = input.candidate_worker,
               .require_retained_projection = true,
-              .scene_asset_root = input.package_root});
+              .scene_asset_root = input.package_root,
+              .retained_package_root_fd =
+                  input.runtime_unit_id.has_value()
+                      ? std::optional<int>{kManagedPackageRootFd}
+                      : std::nullopt});
   Require(candidate_client->requires_retained_projection(),
           "production native planner must consume the exact retained scene "
           "projection");
@@ -4861,13 +4876,13 @@ BuildComposition(const HostConfig &config,
   Require(model_map.has_value(),
           "active retained model map is absent or invalid");
 
-  const deployment::FilesystemProgramBindingRepository binding_repository(
+  const deployment::FilesystemVerifiedProgramBindingSource binding_repository(
       config.package_root);
   auto program_binding = binding_repository.get_verified(
       core::ProgramBindingId(config.program_binding_id), *bundle, *model_map);
   Require(program_binding != nullptr,
           "exact retained Program Binding is absent or invalid");
-  const deployment::FilesystemProgramRepository program_repository(
+  const deployment::FilesystemVerifiedProgramSource program_repository(
       config.package_root);
   auto program = program_repository.get_verified(
       program_binding->value().program_id,
@@ -4875,7 +4890,7 @@ BuildComposition(const HostConfig &config,
   Require(program != nullptr,
           "Program and exact retained Program Binding disagree");
 
-  const deployment::FilesystemCatalogArtifactStore catalog_store(
+  const deployment::FilesystemVerifiedCatalogArtifactSource catalog_store(
       config.package_root);
   auto direct_inventory =
       deployment::compile_direct_control_program_binding_inventory(

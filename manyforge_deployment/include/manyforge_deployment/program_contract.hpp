@@ -81,23 +81,47 @@ verify_program_binding_contract(
     std::string_view canonical_program_bytes,
     const RetainedBundle& retained_bundle);
 
-/// Immutable content-addressed Program repository port.
+/// Immutable content-addressed Program read port.
 ///
-/// ProgramRevision addresses the complete canonical Program. Publication and
-/// lookup remain contextual: the exact retained bundle must still validate
-/// every catalog and capability reference before a Program is returned.
-class IProgramRepository {
+/// ProgramRevision addresses the complete canonical Program. Lookup remains
+/// contextual: the exact retained bundle must still validate every catalog
+/// and capability reference before a Program is returned.
+class IProgramSource {
  public:
-  virtual ~IProgramRepository() = default;
-
-  [[nodiscard]] virtual bool put_if_absent(
-      std::shared_ptr<const ProgramBindingContract> program,
-      const RetainedBundle& retained_bundle) = 0;
+  virtual ~IProgramSource() = default;
 
   [[nodiscard]] virtual std::shared_ptr<const ProgramBindingContract>
   get_verified(const core::ProgramId& program_id,
                const core::ProgramRevision& program_revision,
                const RetainedBundle& retained_bundle) const = 0;
+};
+
+/// Immutable content-addressed Program publication and read port.
+class IProgramRepository : public IProgramSource {
+ public:
+  ~IProgramRepository() override = default;
+
+  [[nodiscard]] virtual bool put_if_absent(
+      std::shared_ptr<const ProgramBindingContract> program,
+      const RetainedBundle& retained_bundle) = 0;
+};
+
+/// Get-only Program source below one immutable package root.
+class FilesystemVerifiedProgramSource final : public IProgramSource {
+ public:
+  explicit FilesystemVerifiedProgramSource(
+      std::filesystem::path trusted_package_root,
+      std::uint64_t maximum_single_program_bytes =
+          kMaxArtifactEncodedBytes);
+
+  [[nodiscard]] std::shared_ptr<const ProgramBindingContract> get_verified(
+      const core::ProgramId& program_id,
+      const core::ProgramRevision& program_revision,
+      const RetainedBundle& retained_bundle) const override;
+
+ private:
+  std::filesystem::path trusted_package_root_;
+  std::uint64_t maximum_single_program_bytes_;
 };
 
 /// Durable Program repository below one pre-existing trusted package root.

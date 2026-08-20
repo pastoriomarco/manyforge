@@ -6,7 +6,7 @@
 namespace manyforge::deployment {
 
 std::optional<QualifiedRuntimePolicy> resolve_retained_runtime_policy(
-    const RetainedBundle& bundle, const ICatalogArtifactStore& artifact_store) {
+    const RetainedBundle& bundle, const ICatalogArtifactSource& artifact_store) {
   if (!verify_retained_bundle_identity(bundle)) {
     throw RetainedRuntimePolicyError(
         "runtime policy selection requires an "

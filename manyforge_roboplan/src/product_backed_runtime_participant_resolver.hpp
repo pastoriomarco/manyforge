@@ -36,8 +36,8 @@ class ProductBackedRuntimeParticipantResolver final {
       const ProductBackedRuntimeParticipantResolver&) = delete;
 
  private:
-  deployment::FilesystemProgramRepository programs_;
-  deployment::FilesystemProgramBindingRepository bindings_;
+  deployment::FilesystemVerifiedProgramSource programs_;
+  deployment::FilesystemVerifiedProgramBindingSource bindings_;
   std::shared_ptr<const deployment::RetainedBundle> retained_bundle_;
   deployment::VerifiedRetainedModelMap retained_model_map_;
   std::vector<core::RuntimeParticipantBinding> physical_bindings_;

@@ -65,6 +65,28 @@ const std::string &RequiredText(const content_identity::CanonicalValue &value,
   return *text;
 }
 
+struct RuntimeOfferProjection final {
+  std::string selected;
+  std::string observed;
+  std::string observed_epoch;
+};
+
+RuntimeOfferProjection ReadRuntimeOfferProjection(
+    const content_identity::CanonicalValue &payload) {
+  const auto &runtime = RequiredMember(payload, "runtime");
+  const auto &desired = RequiredMember(runtime, "desired_units").as_array();
+  const auto &observed = RequiredMember(runtime, "observed_units").as_array();
+  if (desired.size() != 1U || observed.size() != 1U) {
+    throw std::runtime_error(
+        "Manager source fixture must contain one runtime projection row");
+  }
+  return {
+      RequiredText(desired.front(), "selected_runtime_contract_offer_digest"),
+      RequiredText(observed.front(), "observed_runtime_contract_offer_digest"),
+      RequiredText(observed.front(), "runtime_epoch"),
+  };
+}
+
 struct ManagerApplyFixtureMetadata final {
   std::string admission_filename;
   std::string candidate_retained_bundle_id;
@@ -425,6 +447,32 @@ ExecutionReadyObservation WaitForExecutionReady(
   }
   throw std::runtime_error("execution owner did not reopen exact product: " +
                            observation.response);
+}
+
+RuntimeOfferProjection WaitForRuntimeOfferProjection(
+    const AtomicSourceSnapshotChannel &manager_source,
+    const std::string_view expected_execution_owner_epoch,
+    const std::chrono::seconds timeout = std::chrono::seconds(20)) {
+  const auto deadline = std::chrono::steady_clock::now() + timeout;
+  while (std::chrono::steady_clock::now() < deadline) {
+    try {
+      const auto snapshot = manager_source.Read();
+      if (snapshot.has_value()) {
+        const auto projection = ReadRuntimeOfferProjection(snapshot->payload);
+        if (!projection.selected.empty() && !projection.observed.empty() &&
+            projection.selected == projection.observed &&
+            expected_execution_owner_epoch ==
+                "kernel-owner-" + projection.observed_epoch) {
+          return projection;
+        }
+      }
+    } catch (const std::exception &) {
+      // Publication may still be converging to the execution owner epoch.
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds(10));
+  }
+  throw std::runtime_error(
+      "Manager source did not publish the expected runtime offer projection");
 }
 
 std::vector<pid_t> ReadDirectChildren(const pid_t parent) {
@@ -1278,6 +1326,7 @@ TEST(ManagerDaemonProcess,
                                              "manager-source.json");
   const auto before = manager_source.Read();
   ASSERT_TRUE(before.has_value());
+  const auto children_before_replacement = ReadDirectChildren(manager.pid());
 
   std::filesystem::rename(selected_root, displaced_root);
   ASSERT_TRUE(std::filesystem::create_directory(selected_root));
@@ -1285,6 +1334,8 @@ TEST(ManagerDaemonProcess,
   const auto reconcile = SendCommand(
       directory.socket_path(),
       R"({"api_version":"manyforge.manager_command.v1","command":"reconcile"})");
+  EXPECT_EQ(ReadDirectChildren(manager.pid()),
+            children_before_replacement);
   EXPECT_NE(reconcile.find("\"code\":\"full_stack_restart_required\""),
             std::string::npos)
       << reconcile;
@@ -1791,6 +1842,8 @@ TEST(ManagerDaemonProcess,
   std::string first_manager_epoch;
   std::string apply_request;
   std::string child_recovered_owner_epoch;
+  RuntimeOfferProjection initial_offer;
+  RuntimeOfferProjection child_recovered_offer;
   std::uint64_t advanced_scene_generation = 0U;
   {
     ManagerProcess manager(directory, package_root, fixture.admission_filename,
@@ -1828,6 +1881,11 @@ TEST(ManagerDaemonProcess,
     const auto initial = WaitForExecutionReady(
         directory, fixture.physical_candidate_retained_bundle_id);
     ASSERT_FALSE(initial.owner_epoch.empty());
+    initial_offer =
+        WaitForRuntimeOfferProjection(manager_source, initial.owner_epoch);
+    EXPECT_EQ(initial_offer.selected, initial_offer.observed);
+    EXPECT_EQ(initial.owner_epoch,
+              "kernel-owner-" + initial_offer.observed_epoch);
 
     const auto advanced_scene_projection = scene_source.Read();
     ASSERT_TRUE(advanced_scene_projection.has_value());
@@ -1869,8 +1927,15 @@ TEST(ManagerDaemonProcess,
         WaitForSoleManagedChild(manager.pid(), first_child);
     EXPECT_NE(replacement_child, first_child);
 
+    child_recovered_offer =
+        WaitForRuntimeOfferProjection(manager_source, recovered.owner_epoch);
+    EXPECT_EQ(recovered.owner_epoch,
+              "kernel-owner-" + child_recovered_offer.observed_epoch);
     const auto after = manager_source.Read();
     ASSERT_TRUE(after.has_value());
+    EXPECT_EQ(child_recovered_offer.selected, child_recovered_offer.observed);
+    EXPECT_EQ(child_recovered_offer.selected, initial_offer.selected);
+    EXPECT_NE(child_recovered_offer.observed_epoch, initial_offer.observed_epoch);
     EXPECT_NE(content_identity::canonical_json(after->payload)
                   .find(fixture.physical_candidate_retained_bundle_id),
               std::string::npos);
@@ -1895,8 +1960,16 @@ TEST(ManagerDaemonProcess,
             std::string::npos);
   AtomicSourceSnapshotChannel manager_source(directory.publication_root(),
                                              "manager-source.json");
+  const auto manager_recovered_offer =
+      WaitForRuntimeOfferProjection(manager_source, recovered.owner_epoch);
+  EXPECT_EQ(recovered.owner_epoch,
+            "kernel-owner-" + manager_recovered_offer.observed_epoch);
   const auto manager_recovered = manager_source.Read();
   ASSERT_TRUE(manager_recovered.has_value());
+  EXPECT_EQ(manager_recovered_offer.selected, manager_recovered_offer.observed);
+  EXPECT_EQ(manager_recovered_offer.selected, initial_offer.selected);
+  EXPECT_NE(manager_recovered_offer.observed_epoch,
+            child_recovered_offer.observed_epoch);
   EXPECT_NE(manager_recovered->source_owner_epoch, first_manager_epoch);
   EXPECT_NE(content_identity::canonical_json(manager_recovered->payload)
                 .find(fixture.physical_candidate_retained_bundle_id),

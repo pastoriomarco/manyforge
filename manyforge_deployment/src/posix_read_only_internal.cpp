@@ -4,7 +4,9 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
+#include <charconv>
 #include <cerrno>
+#include <climits>
 #include <cstddef>
 #include <cstring>
 #include <limits>
@@ -27,6 +29,26 @@ namespace {
                            std::strerror(errno));
 }
 
+[[nodiscard]] std::optional<int>
+descriptor_minted_root(const std::filesystem::path &root) noexcept {
+  const auto text = root.generic_string();
+  constexpr std::string_view prefix = "/proc/self/fd/";
+  if (!text.starts_with(prefix) || text.size() == prefix.size()) {
+    return std::nullopt;
+  }
+  if (text[prefix.size()] == '0' && text.size() != prefix.size() + 1U) {
+    return std::nullopt;
+  }
+  unsigned int value = 0U;
+  const auto parsed = std::from_chars(text.data() + prefix.size(),
+                                      text.data() + text.size(), value);
+  if (parsed.ec != std::errc{} || parsed.ptr != text.data() + text.size() ||
+      value == 0U || value > static_cast<unsigned int>(INT_MAX)) {
+    return std::nullopt;
+  }
+  return static_cast<int>(value);
+}
+
 }  // namespace
 
 std::filesystem::path normalize_existing_plain_root(
@@ -34,6 +56,16 @@ std::filesystem::path normalize_existing_plain_root(
     const TrustedRootMessages& messages) {
   if (root.empty()) {
     fail_semantic(errors, messages.empty);
+  }
+  if (const auto descriptor = descriptor_minted_root(root);
+      descriptor.has_value()) {
+    struct stat status {};
+    if (::fstat(*descriptor, &status) != 0 || !S_ISDIR(status.st_mode)) {
+      fail_semantic(errors, messages.not_existing_plain_directory);
+    }
+    // This exact procfd spelling is minted only from an owned, retained
+    // descriptor. Never canonicalize it back to the mutable operator path.
+    return root;
   }
   std::error_code error;
   std::filesystem::path absolute = std::filesystem::absolute(root, error);

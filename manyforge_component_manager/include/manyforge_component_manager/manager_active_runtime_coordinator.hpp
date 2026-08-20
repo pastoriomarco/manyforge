@@ -125,7 +125,8 @@ public:
       const IManagerActiveRuntimePlanSource &plan_source,
       IRuntimeUnitProcessPort &process_port,
       IRuntimeUnitProgressPort &progress_port,
-      RuntimeObservationReducer::Clock clock_ns);
+      RuntimeObservationReducer::Clock clock_ns,
+      RuntimePreStartGuard pre_start_guard = {});
 
   [[nodiscard]] ManagerActiveRuntimeConvergenceResult Reconcile();
   [[nodiscard]] ManagerActiveRuntimeShutdownResult Shutdown();
@@ -140,6 +141,7 @@ private:
   IRuntimeUnitProcessPort &process_port_;
   IRuntimeUnitProgressPort &progress_port_;
   RuntimeObservationReducer::Clock clock_ns_;
+  RuntimePreStartGuard pre_start_guard_;
   std::mutex operation_mutex_;
   std::optional<ManagerActiveRuntimePlanDTO> observation_plan_;
   std::optional<RuntimeObservationReducer> observation_reducer_;

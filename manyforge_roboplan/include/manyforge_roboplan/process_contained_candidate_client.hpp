@@ -51,6 +51,9 @@ struct ProcessContainedCandidateClientConfig final {
   /// root before the worker is created. Model-local asset:// values continue
   /// to resolve only through the retained planning-model stage.
   std::optional<std::filesystem::path> scene_asset_root;
+  /// When set, the native managed child intentionally carries this exact
+  /// descriptor into the candidate worker as reserved FD 6.
+  std::optional<int> retained_package_root_fd;
 };
 
 /// Long-lived RoboPlan worker client.

@@ -4,6 +4,7 @@
 #include <filesystem>
 #include <manyforge_component_manager/manager_apply_journal.hpp>
 #include <manyforge_component_manager/runtime_observation.hpp>
+#include <manyforge_core/runtime_contract_manifest_codec.hpp>
 #include <manyforge_content_identity/canonical_value.hpp>
 #include <manyforge_deployment/canonical_empty_admission.hpp>
 #include <memory>
@@ -111,6 +112,98 @@ Runtime(const deployment::CanonicalEmptyRetainedBundleAdmission &admission) {
       },
       reducer.Evaluate({}),
       component_manager::ManagerActiveRuntimeConvergenceState::kConverged,
+  };
+}
+
+component_manager::RuntimeUnitConvergencePlanRowDTO RuntimeRow() {
+  const auto requirement = core::MakeRuntimeContractRequirement(
+      core::RuntimeImplementationFamilyId("runtime-publication-family"), {}, {});
+  if (!requirement.ok()) {
+    throw std::runtime_error("owner-publication test requirement is invalid");
+  }
+  return {
+      core::RuntimeUnitId("runtime.publication"),
+      core::RuntimeProfileId("profile.reference"),
+      core::RuntimeProfileRevision("profile-revision-1"),
+      core::RuntimeLifecycleControl::kManagerManaged,
+      component_manager::RuntimeUnitCandidateDisposition::kAdded,
+      core::ProductId("runtime-publication-product"),
+      core::ProductContractId("runtime-publication-contract"),
+      core::ProductContractRevision("runtime-publication-contract-revision"),
+      core::ContentDigest(std::string(kDigestOne)),
+      core::ContentDigest(std::string(kDigestTwo)),
+      {},
+      {core::RuntimeRoleId("status")},
+      core::EndpointRoleId("status"),
+      "manyforge.runtime-publication.status",
+      "status-revision-1",
+      "private-controller",
+      "manyforge.posix_sh.retained_script",
+      "adapter-revision-1",
+      "retained-raw-artifact",
+      "retrieval-revision-1",
+      core::ContentDigest(std::string(kDigestTwo)),
+      1U,
+      "linux",
+      "posix.1-2017",
+      requirement.value(),
+      core::RuntimeContractOfferDigest(std::string(kDigestOne)),
+  };
+}
+
+component_manager::RuntimeUnitExpectation RuntimeExpectation() {
+  return {
+      "runtime.publication",
+      component_manager::RuntimeLifecycleControl::kManagerManaged,
+      std::string(kDigestOne),
+      std::string(kDigestTwo),
+      100U,
+      100U,
+      std::nullopt,
+      {},
+      {"status"},
+      component_manager::ManagedCommandSurfaceState::kClosedNoActiveEffect,
+      std::string(kDigestOne),
+  };
+}
+
+component_manager::RuntimeObservationSnapshot ObservationWithoutDigest() {
+  component_manager::RuntimeObservationReducer reducer(
+      [] { return 42U; }, {"runtime.publication"});
+  return reducer.Evaluate({RuntimeExpectation()});
+}
+
+component_manager::RuntimeObservationSnapshot ObservationWithDigest() {
+  component_manager::RuntimeObservationReducer reducer(
+      [] { return 42U; }, {"runtime.publication"});
+  if (!reducer.ObserveProcess(component_manager::ProcessPresenceObservation(
+          "runtime.publication", "owner-publication-observer", 1U,
+          component_manager::ProcessPresenceState::kPresent,
+          "runtime-publication-epoch")) ||
+      !reducer.IngestSourceReport(component_manager::RuntimeUnitSourceReport(
+          "runtime.publication", "runtime-publication-epoch", 1U, 1U,
+          component_manager::RuntimeSourcePhase::kServing,
+          component_manager::RuntimeSourceHealth::kHealthy,
+          std::string(kDigestOne), std::string(kDigestTwo), {"status"},
+          component_manager::ManagedCommandSurfaceState::kClosedNoActiveEffect,
+          {}, std::string(kDigestOne)))) {
+    throw std::runtime_error("owner-publication test observation was rejected");
+  }
+  return reducer.Evaluate({RuntimeExpectation()});
+}
+
+component_manager::ManagerActiveRuntimeConvergenceResult RuntimeWithRow(
+    const deployment::CanonicalEmptyRetainedBundleAdmission &admission,
+    component_manager::RuntimeObservationSnapshot observations,
+    const component_manager::ManagerActiveRuntimeConvergenceState state) {
+  return {
+      component_manager::ManagerActiveRuntimePlanDTO{
+          Publication(admission),
+          core::ContentDigest(std::string(kDigestTwo)),
+          {RuntimeRow()},
+      },
+      std::move(observations),
+      state,
   };
 }
 
@@ -256,6 +349,45 @@ TEST(ManagerSourcePublication,
   EXPECT_NE(bytes.find("\"mutation_available\":false"), std::string::npos);
   EXPECT_NE(bytes.find(
                 "\"unavailable_reason_code\":\"full_stack_restart_required\""),
+            std::string::npos);
+}
+
+TEST(ManagerSourcePublication, ProjectsSelectedAndObservedOfferDigests) {
+  const auto admission = LoadAdmission();
+  TemporaryDirectory directory;
+  component_manager::SqliteManagerApplyJournal journal(
+      directory.path() / "apply.sqlite3", admission.cell_id());
+
+  const auto bytes = content_identity::canonical_json(BuildManagerSourcePayload(
+      admission.retained_bundle(),
+      RuntimeWithRow(admission, ObservationWithDigest(),
+                     component_manager::ManagerActiveRuntimeConvergenceState::
+                         kConverged),
+      journal, ManagerApplyMutationAvailability::kKernelOwnerUnavailable));
+  EXPECT_NE(bytes.find("\"selected_runtime_contract_offer_digest\":\"" +
+                       std::string(kDigestOne) + "\""),
+            std::string::npos);
+  EXPECT_NE(bytes.find("\"observed_runtime_contract_offer_digest\":\"" +
+                       std::string(kDigestOne) + "\""),
+            std::string::npos);
+}
+
+TEST(ManagerSourcePublication, ProjectsMissingObservedOfferDigestAsNull) {
+  const auto admission = LoadAdmission();
+  TemporaryDirectory directory;
+  component_manager::SqliteManagerApplyJournal journal(
+      directory.path() / "apply.sqlite3", admission.cell_id());
+
+  const auto bytes = content_identity::canonical_json(BuildManagerSourcePayload(
+      admission.retained_bundle(),
+      RuntimeWithRow(admission, ObservationWithoutDigest(),
+                     component_manager::ManagerActiveRuntimeConvergenceState::
+                         kPending),
+      journal, ManagerApplyMutationAvailability::kKernelOwnerUnavailable));
+  EXPECT_NE(bytes.find("\"selected_runtime_contract_offer_digest\":\"" +
+                       std::string(kDigestOne) + "\""),
+            std::string::npos);
+  EXPECT_NE(bytes.find("\"observed_runtime_contract_offer_digest\":null"),
             std::string::npos);
 }
 

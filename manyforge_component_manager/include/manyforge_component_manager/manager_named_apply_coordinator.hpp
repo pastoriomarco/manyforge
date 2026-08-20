@@ -93,7 +93,8 @@ public:
       std::string operating_system,
       std::vector<std::string> launch_environment_contracts,
       RuntimeObservationReducer::Clock clock_ns,
-      ApplyIdFactory apply_id_factory);
+      ApplyIdFactory apply_id_factory,
+      RuntimePreStartGuard pre_start_guard = {});
 
   [[nodiscard]] ManagerNamedApplyResult
   ApplyOrRecover(const ManagerNamedApplyRequestDTO &request);

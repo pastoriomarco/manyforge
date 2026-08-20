@@ -1275,14 +1275,15 @@ public:
                 .package_manifest_set()),
         daemon_lock_(config_.manager_state_root),
         admission_(deployment::FilesystemCanonicalEmptyRetainedBundleSource(
-                       config_.package_root,
+                       package_generation_.descriptor_bound_root(),
                        config_.canonical_empty_admission_filename)
                        .load_verified()),
-        bundle_source_(config_.package_root),
-        artifact_source_(config_.package_root),
-        candidate_source_(config_.package_root, "maintained"),
+        bundle_source_(package_generation_.descriptor_bound_root()),
+        artifact_source_(package_generation_.descriptor_bound_root()),
+        candidate_source_(package_generation_.descriptor_bound_root(),
+                          "maintained"),
         native_runtime_adapter_(
-            InstalledTargetRoot(), config_.package_root,
+            InstalledTargetRoot(), package_generation_.descriptor_bound_root(),
             config_.manager_state_root, config_.runtime_state_root,
             bundle_source_, artifact_source_, "linux",
             std::vector<std::string>{
@@ -1310,7 +1311,8 @@ public:
               &native_runtime_adapter_, &native_runtime_adapter_}}),
         active_runtime_(plan_source_, runtime_adapter_router_,
                         runtime_adapter_router_,
-                        [this] { return ElapsedNs(); }),
+                        [this] { return ElapsedNs(); },
+                        [this] { RequireCurrentPackageGeneration(); }),
         manager_runtime_epoch_(RandomToken("manager-runtime-")),
         named_apply_(
             stores_.apply_journal(), plan_source_, bundle_source_,
@@ -1324,7 +1326,8 @@ public:
                  deployment::ros2_control_execution_runtime_contract::
                      kLaunchEnvironmentContract)},
             [this] { return ElapsedNs(); },
-            [] { return core::ApplyId(RandomToken("apply-")); }),
+            [] { return core::ApplyId(RandomToken("apply-")); },
+            [this] { RequireCurrentPackageGeneration(); }),
         scene_runtime_owner_(
             [] { return HostMonotonicNs(); },
             [] { return RandomToken("scene-init-"); }),
@@ -2065,6 +2068,12 @@ private:
           TrySendResponse(
               client.get(),
               ApplyErrorResponse(command, "apply_busy", error.what()));
+        } catch (const ManagerPackageGenerationRestartRequired &error) {
+          PublishPackageRestartRequired();
+          TrySendResponse(client.get(),
+                          DetailedErrorResponse(error.error().code,
+                                                error.error().message,
+                                                error.error().details));
         } catch (const std::exception &error) {
           TrySendResponse(
               client.get(),

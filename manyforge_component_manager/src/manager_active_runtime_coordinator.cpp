@@ -19,6 +19,17 @@ using manyforge::core::RuntimeEpoch;
   throw ManagerActiveRuntimeCoordinatorError(detail);
 }
 
+void RequireRuntimeContractAdmission(
+    const RuntimeUnitConvergencePlanRowDTO &plan) {
+  try {
+    VerifyRuntimeContractAdmission(plan);
+  } catch (const std::exception &error) {
+    Fail(error.what());
+  } catch (...) {
+    Fail("active runtime contract admission failed");
+  }
+}
+
 [[nodiscard]] std::vector<std::size_t>
 DependencyOrder(const std::vector<RuntimeUnitConvergencePlanRowDTO> &plans) {
   std::map<std::string, std::size_t> indexes;
@@ -335,12 +346,17 @@ ManagerActiveRuntimeCoordinator::ManagerActiveRuntimeCoordinator(
     const IManagerActiveRuntimePlanSource &plan_source,
     IRuntimeUnitProcessPort &process_port,
     IRuntimeUnitProgressPort &progress_port,
-    RuntimeObservationReducer::Clock clock_ns)
+    RuntimeObservationReducer::Clock clock_ns,
+    RuntimePreStartGuard pre_start_guard)
     : plan_source_(plan_source), process_port_(process_port),
-      progress_port_(progress_port), clock_ns_(std::move(clock_ns)) {
+      progress_port_(progress_port), clock_ns_(std::move(clock_ns)),
+      pre_start_guard_(std::move(pre_start_guard)) {
   if (!clock_ns_) {
     throw std::invalid_argument(
         "active runtime coordinator clock must be callable");
+  }
+  if (!pre_start_guard_) {
+    pre_start_guard_ = [] {};
   }
 }
 
@@ -374,6 +390,10 @@ ManagerActiveRuntimeCoordinator::Reconcile() {
     if (row.lifecycle_control ==
             manyforge::core::RuntimeLifecycleControl::kManagerManaged &&
         process.state() != ProcessPresenceState::kPresent) {
+      RequireRuntimeContractAdmission(query.plan);
+      // A generation replacement is certain and must not be translated into
+      // an effect-uncertain EnsureRunning failure.
+      pre_start_guard_();
       try {
         const auto ensured = process_port_.EnsureRunning(query);
         IngestEnsuredPresence(reducer, query, process, ensured);

@@ -11,7 +11,9 @@
 #include <algorithm>
 #include <array>
 #include <cerrno>
+#include <charconv>
 #include <chrono>
+#include <climits>
 #include <cstdint>
 #include <cstring>
 #include <limits>
@@ -102,10 +104,40 @@ InvokeDisableHandoffPort(Operation &&operation) noexcept {
   }
 }
 
+[[nodiscard]] std::optional<int>
+DescriptorFd(const std::filesystem::path &path) {
+  constexpr std::string_view prefix = "/proc/self/fd/";
+  const auto text = path.generic_string();
+  if (!text.starts_with(prefix) || text.size() == prefix.size() ||
+      (text[prefix.size()] == '0' && text.size() != prefix.size() + 1U)) {
+    return std::nullopt;
+  }
+  unsigned int descriptor = 0U;
+  const auto parsed = std::from_chars(
+      text.data() + prefix.size(), text.data() + text.size(), descriptor);
+  if (parsed.ec != std::errc{} ||
+      parsed.ptr != text.data() + text.size() || descriptor == 0U ||
+      descriptor > static_cast<unsigned int>(INT_MAX)) {
+    return std::nullopt;
+  }
+  return static_cast<int>(descriptor);
+}
+
 [[nodiscard]] std::filesystem::path
 ExistingPlainDirectory(std::filesystem::path path,
                        const std::string_view label) {
   Require(!path.empty(), std::string(label) + " is empty");
+  constexpr std::string_view proc_fd_prefix = "/proc/self/fd/";
+  if (path.generic_string().starts_with(proc_fd_prefix)) {
+    const auto descriptor = DescriptorFd(path);
+    Require(descriptor.has_value(),
+            std::string(label) + " is not an exact retained descriptor path");
+    struct stat status {};
+    Require(::fstat(*descriptor, &status) == 0 && S_ISDIR(status.st_mode),
+            std::string(label) +
+                " is not an existing retained descriptor directory");
+    return path;
+  }
   std::error_code error;
   const auto status = std::filesystem::symlink_status(path, error);
   Require(!error && !std::filesystem::is_symlink(status) &&

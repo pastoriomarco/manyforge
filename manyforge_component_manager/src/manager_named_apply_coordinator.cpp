@@ -133,7 +133,8 @@ ManagerNamedApplyCoordinator::ManagerNamedApplyCoordinator(
     IRuntimeUnitProgressPort &progress_port,
     core::RuntimeEpoch manager_runtime_epoch, std::string operating_system,
     std::vector<std::string> launch_environment_contracts,
-    RuntimeObservationReducer::Clock clock_ns, ApplyIdFactory apply_id_factory)
+    RuntimeObservationReducer::Clock clock_ns, ApplyIdFactory apply_id_factory,
+    RuntimePreStartGuard pre_start_guard)
     : apply_journal_(apply_journal), active_plan_source_(active_plan_source),
       retained_bundle_source_(retained_bundle_source),
       kernel_fence_(kernel_fence),
@@ -144,7 +145,7 @@ ManagerNamedApplyCoordinator::ManagerNamedApplyCoordinator(
                            publication_store, artifact_source, process_port,
                            progress_port, std::move(operating_system),
                            std::move(launch_environment_contracts),
-                           std::move(clock_ns)),
+                           std::move(clock_ns), std::move(pre_start_guard)),
       scene_stage_coordinator_(apply_journal_, retained_bundle_source_,
                                publication_store, scene_owner,
                                bootstrap_scene_owner),

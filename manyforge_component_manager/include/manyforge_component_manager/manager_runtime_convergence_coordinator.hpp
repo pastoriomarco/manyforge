@@ -94,7 +94,8 @@ public:
           &artifact_source,
       IRuntimeUnitProcessPort &process_port,
       IRuntimeUnitProgressPort &progress_port, std::string operating_system,
-      std::string shell_contract, RuntimeObservationReducer::Clock clock_ns);
+      std::string shell_contract, RuntimeObservationReducer::Clock clock_ns,
+      RuntimePreStartGuard pre_start_guard = {});
   ManagerApplyRuntimeConvergenceCoordinator(
       ManagerApplyFenceCoordinator &fence_coordinator,
       SqliteManagerApplyJournal &apply_journal,
@@ -104,7 +105,8 @@ public:
       IRuntimeUnitProcessPort &process_port,
       IRuntimeUnitProgressPort &progress_port, std::string operating_system,
       std::vector<std::string> launch_environment_contracts,
-      RuntimeObservationReducer::Clock clock_ns);
+      RuntimeObservationReducer::Clock clock_ns,
+      RuntimePreStartGuard pre_start_guard = {});
 
   [[nodiscard]] ManagerApplyRuntimeConvergenceResult
   ConvergeOrRecover(const ManagerApplyIntentDTO &apply_intent,
@@ -130,6 +132,7 @@ private:
   std::string operating_system_;
   std::vector<std::string> launch_environment_contracts_;
   RuntimeObservationReducer::Clock clock_ns_;
+  RuntimePreStartGuard pre_start_guard_;
   std::mutex operation_mutex_;
 };
 

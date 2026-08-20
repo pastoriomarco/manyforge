@@ -17,6 +17,6 @@ class RetainedRuntimePolicyError : public std::invalid_argument {
 /// Absence is observable and leaves motion unqualified. More than one policy
 /// is ambiguous because v1 has no runtime policy selector.
 [[nodiscard]] std::optional<QualifiedRuntimePolicy> resolve_retained_runtime_policy(
-    const RetainedBundle& bundle, const ICatalogArtifactStore& artifact_store);
+    const RetainedBundle& bundle, const ICatalogArtifactSource& artifact_store);
 
 }  // namespace manyforge::deployment

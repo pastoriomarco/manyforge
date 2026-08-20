@@ -87,25 +87,49 @@ reload_verified_program_binding(
 [[nodiscard]] bool verify_program_binding_identity(
     const ProgramBinding& binding) noexcept;
 
-/// Immutable Program-Binding repository port.
+/// Immutable Program-Binding read port.
 ///
-/// Publication and lookup are both contextual: a self-consistent envelope is
-/// not accepted unless its exact retained bundle and compiler-owned model map
-/// still give every role coordinate the same meaning. The repository owns no
-/// active/current alias and performs no Apply or runtime selection.
-class IProgramBindingRepository {
+/// Lookup is contextual: a self-consistent envelope is not accepted unless its
+/// exact retained bundle and compiler-owned model map still give every role
+/// coordinate the same meaning.
+class IProgramBindingSource {
  public:
-  virtual ~IProgramBindingRepository() = default;
-
-  [[nodiscard]] virtual bool put_if_absent(
-      std::shared_ptr<const ProgramBinding> binding,
-      const RetainedBundle& retained_bundle,
-      const VerifiedRetainedModelMap& retained_model_map) = 0;
+  virtual ~IProgramBindingSource() = default;
 
   [[nodiscard]] virtual std::shared_ptr<const ProgramBinding> get_verified(
       const core::ProgramBindingId& program_binding_id,
       const RetainedBundle& retained_bundle,
       const VerifiedRetainedModelMap& retained_model_map) const = 0;
+};
+
+/// Immutable Program-Binding publication and read port.
+class IProgramBindingRepository : public IProgramBindingSource {
+ public:
+  ~IProgramBindingRepository() override = default;
+
+  [[nodiscard]] virtual bool put_if_absent(
+      std::shared_ptr<const ProgramBinding> binding,
+      const RetainedBundle& retained_bundle,
+      const VerifiedRetainedModelMap& retained_model_map) = 0;
+};
+
+/// Get-only Program-Binding source below one immutable package root.
+class FilesystemVerifiedProgramBindingSource final
+    : public IProgramBindingSource {
+ public:
+  explicit FilesystemVerifiedProgramBindingSource(
+      std::filesystem::path trusted_package_root,
+      std::uint64_t maximum_single_binding_bytes =
+          kMaxArtifactEncodedBytes);
+
+  [[nodiscard]] std::shared_ptr<const ProgramBinding> get_verified(
+      const core::ProgramBindingId& program_binding_id,
+      const RetainedBundle& retained_bundle,
+      const VerifiedRetainedModelMap& retained_model_map) const override;
+
+ private:
+  std::filesystem::path trusted_package_root_;
+  std::uint64_t maximum_single_binding_bytes_;
 };
 
 /// Durable content-addressed Program-Binding repository.

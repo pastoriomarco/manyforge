@@ -2,9 +2,12 @@
 
 #include <manyforge_component_manager/manager_active_runtime_coordinator.hpp>
 #include <manyforge_core/runtime_contract_manifest_codec.hpp>
+#include <manyforge_deployment/runtime_contract_registry.hpp>
 
+#include <algorithm>
 #include <map>
 #include <optional>
+#include <stdexcept>
 #include <string>
 #include <utility>
 #include <vector>
@@ -24,20 +27,26 @@ constexpr std::string_view kDigestThree =
 [[nodiscard]] RuntimeUnitConvergencePlanRowDTO
 ManagedRow(const std::string &runtime_unit_id,
            std::vector<RuntimeUnitId> dependencies = {}) {
+  const auto &registry =
+      manyforge::deployment::build_qualified_runtime_contract_registry();
+  if (registry.contracts().empty()) {
+    throw std::runtime_error("active runtime test registry is empty");
+  }
+  const auto &qualified = registry.contracts().front();
   const auto requirement = MakeRuntimeContractRequirement(
-      RuntimeImplementationFamilyId("runtime-family"), {}, {});
+      qualified.offer().runtime_implementation_id, {}, {});
   if (!requirement.ok()) {
     throw std::runtime_error("active runtime test requirement is invalid");
   }
   return {
       RuntimeUnitId(runtime_unit_id),
-      RuntimeProfileId("profile.reference"),
-      RuntimeProfileRevision("profile-revision-1"),
+      qualified.runtime_profile_id(),
+      qualified.runtime_profile_revision(),
       manyforge::core::RuntimeLifecycleControl::kManagerManaged,
       RuntimeUnitCandidateDisposition::kAdded,
       ProductId("runtime_product_" + runtime_unit_id),
-      ProductContractId("manyforge.runtime-product"),
-      ProductContractRevision("runtime-product-revision-1"),
+      qualified.runtime_product_id(),
+      qualified.runtime_product_revision(),
       ContentDigest(std::string(kDigestOne)),
       ContentDigest(std::string(kDigestTwo)),
       std::move(dependencies),
@@ -55,7 +64,7 @@ ManagedRow(const std::string &runtime_unit_id,
       "linux",
       "posix.1-2017",
       requirement.value(),
-      RuntimeContractOfferDigest(std::string(kDigestOne)),
+      qualified.offer().offer_digest,
   };
 }
 
@@ -456,6 +465,55 @@ TEST(ManagerActiveRuntimeCoordinator,
   EXPECT_THROW(static_cast<void>(coordinator.Reconcile()),
                ManagerActiveRuntimeCoordinatorError);
   EXPECT_TRUE(ports.events.empty());
+}
+
+TEST(ManagerActiveRuntimeCoordinator,
+     UnregisteredRecoveryPlanRejectsBeforeAnyStartEffect) {
+  auto plan = ThreeUnitPlan();
+  plan.runtime_units.erase(plan.runtime_units.begin() + 1U,
+                           plan.runtime_units.end());
+  plan.runtime_units.front().runtime_contract_requirement =
+      MakeRuntimeContractRequirement(RuntimeImplementationFamilyId(
+                                         "unregistered.runtime.family"),
+                                     {}, {})
+          .value();
+  ASSERT_TRUE(plan.valid());
+  FixedPlanSource source(std::move(plan));
+  ScriptedLifecyclePorts ports;
+  std::uint64_t now = 500U;
+  ManagerActiveRuntimeCoordinator coordinator(source, ports, ports,
+                                               [&now]() { return ++now; });
+
+  EXPECT_THROW(static_cast<void>(coordinator.Reconcile()),
+               ManagerActiveRuntimeCoordinatorError);
+  EXPECT_TRUE(ports.start_calls.empty());
+  EXPECT_TRUE(ports.events.empty() ||
+              std::none_of(ports.events.begin(), ports.events.end(),
+                           [](const auto &event) {
+                             return event.starts_with("start:");
+                           }));
+}
+
+TEST(ManagerActiveRuntimeCoordinator,
+     PreStartGuardFailurePropagatesWithoutAnUncertainStart) {
+  auto plan = ThreeUnitPlan();
+  plan.runtime_units.erase(plan.runtime_units.begin() + 1U,
+                           plan.runtime_units.end());
+  ASSERT_TRUE(plan.valid());
+  FixedPlanSource source(std::move(plan));
+  ScriptedLifecyclePorts ports;
+  bool guard_called = false;
+  std::uint64_t now = 600U;
+  ManagerActiveRuntimeCoordinator coordinator(
+      source, ports, ports, [&now] { return ++now; },
+      [&guard_called] {
+        guard_called = true;
+        throw std::runtime_error("test package generation replacement");
+      });
+
+  EXPECT_THROW(static_cast<void>(coordinator.Reconcile()), std::runtime_error);
+  EXPECT_TRUE(guard_called);
+  EXPECT_TRUE(ports.start_calls.empty());
 }
 
 } // namespace

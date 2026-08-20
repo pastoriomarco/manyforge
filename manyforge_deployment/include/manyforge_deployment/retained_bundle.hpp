@@ -221,24 +221,54 @@ struct StoredCatalogArtifact final {
                          const StoredCatalogArtifact&) = default;
 };
 
-/// Exact-key immutable catalog-artifact port.
+/// Exact-key immutable catalog-artifact read port.
 ///
 /// Unlike IRawArtifactStore, the supplied content-store key is an opaque
 /// catalog identity and is not required to be digest-derived. Implementations
 /// must never interpret it as a path. The expected digest still binds the
 /// exact payload bytes independently.
-class ICatalogArtifactStore {
+class ICatalogArtifactSource {
  public:
-  virtual ~ICatalogArtifactStore() = default;
+  virtual ~ICatalogArtifactSource() = default;
+
+  [[nodiscard]] virtual std::optional<std::string> get_verified(
+      const core::ContentAddressedStoreKey& exact_key,
+      const core::ContentDigest& expected_digest,
+      std::optional<std::uint64_t> expected_size = std::nullopt) const = 0;
+};
+
+/// Exact-key immutable catalog-artifact publication and read port.
+class ICatalogArtifactStore : public ICatalogArtifactSource {
+ public:
+  ~ICatalogArtifactStore() override = default;
 
   [[nodiscard]] virtual StoredCatalogArtifact put_if_absent(
       const core::ContentAddressedStoreKey& exact_key,
       const core::ContentDigest& expected_digest,
       std::string_view bytes) = 0;
-  [[nodiscard]] virtual std::optional<std::string> get_verified(
+};
+
+/// Get-only catalog-artifact source below one immutable package root.
+///
+/// Construction and reads never create, lock, clean, enumerate, sync, or
+/// publish package content. Exact procfd roots remain descriptor-bound.
+class FilesystemVerifiedCatalogArtifactSource final
+    : public ICatalogArtifactSource {
+ public:
+  explicit FilesystemVerifiedCatalogArtifactSource(
+      std::filesystem::path trusted_package_root,
+      std::uint64_t maximum_single_payload_bytes =
+          kMaxDurableRetainedBlobBytes);
+
+  [[nodiscard]] std::optional<std::string> get_verified(
       const core::ContentAddressedStoreKey& exact_key,
       const core::ContentDigest& expected_digest,
-      std::optional<std::uint64_t> expected_size = std::nullopt) const = 0;
+      std::optional<std::uint64_t> expected_size =
+          std::nullopt) const override;
+
+ private:
+  std::filesystem::path trusted_package_root_;
+  std::uint64_t maximum_single_payload_bytes_;
 };
 
 /// Durable exact-key catalog-artifact store.

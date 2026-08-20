@@ -39,6 +39,7 @@ def test_closed_core_invalid_request_maps_to_a_client_error() -> None:
 
 
 def _manager_payload() -> dict[str, Any]:
+    offer_digest = "sha256:" + "c" * 64
     return {
         "api_version": "manyforge.manager_source.v1",
         "active": {
@@ -56,8 +57,18 @@ def _manager_payload() -> dict[str, Any]:
         "manager_ready": True,
         "runtime": {
             "converged": True,
-            "desired_units": [],
-            "observed_units": [],
+            "desired_units": [
+                {
+                    "runtime_unit_id": "runtime.fake",
+                    "selected_runtime_contract_offer_digest": offer_digest,
+                }
+            ],
+            "observed_units": [
+                {
+                    "runtime_unit_id": "runtime.fake",
+                    "observed_runtime_contract_offer_digest": offer_digest,
+                }
+            ],
         },
     }
 
@@ -862,6 +873,24 @@ def test_runtime_manager_scene_alarm_history_and_health_are_thin_reads() -> None
             "source_owner_id": None,
             "reason_code": "robot_readiness_owner_unavailable",
         }
+
+
+def test_manager_status_and_diff_preserve_offer_digest_fields() -> None:
+    client, _core, _manager = _client()
+    with client:
+        status = client.get("/api/manager/status").json()
+        diff = client.get("/api/manager/diff").json()
+
+    desired = status["status"]["runtime"]["desired_units"]
+    observed = status["status"]["runtime"]["observed_units"]
+    assert desired[0]["selected_runtime_contract_offer_digest"] == (
+        "sha256:" + "c" * 64
+    )
+    assert observed[0]["observed_runtime_contract_offer_digest"] == (
+        "sha256:" + "c" * 64
+    )
+    assert diff["desired_units"] == desired
+    assert diff["observed_units"] == observed
 
 
 def test_program_apply_skips_unchanged_deployment_and_publishes_exact_program() -> None:

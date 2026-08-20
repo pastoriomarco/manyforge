@@ -9,6 +9,7 @@
 #include <cstdint>
 #include <filesystem>
 #include <fstream>
+#include <iterator>
 #include <optional>
 #include <stdexcept>
 #include <string>
@@ -22,6 +23,7 @@
 #include <manyforge_deployment/retained_bundle.hpp>
 
 #include "catalog_artifact_store_internal.hpp"
+#include "scoped_procfd_root.hpp"
 
 namespace manyforge::deployment {
 namespace {
@@ -31,6 +33,9 @@ using namespace std::string_view_literals;
 static_assert(
     std::is_base_of_v<ICatalogArtifactStore,
                       FilesystemCatalogArtifactStore>);
+static_assert(
+    std::is_base_of_v<ICatalogArtifactSource,
+                      FilesystemVerifiedCatalogArtifactSource>);
 static_assert(
     !std::is_copy_constructible_v<FilesystemCatalogArtifactStore>);
 static_assert(
@@ -232,6 +237,63 @@ TEST(FilesystemCatalogArtifactStoreTest,
                        core::ContentAddressedStoreKey("other-key"),
                        digest)
                    .has_value());
+}
+
+TEST(FilesystemVerifiedCatalogArtifactSourceTest,
+     ProcfdPointReadIsVerifiedAndDoesNotCreateAnAbsentNamespace) {
+  ScopedTrustedRoot root;
+  const core::ContentAddressedStoreKey key("catalog-key");
+  const std::string payload("immutable catalog payload");
+  const core::ContentDigest digest(sha256_digest(payload));
+  {
+    FilesystemCatalogArtifactStore writer(root.path());
+    ASSERT_TRUE(writer.put_if_absent(key, digest, payload).inserted);
+  }
+
+  const auto entry_count_before = static_cast<std::size_t>(std::distance(
+      std::filesystem::recursive_directory_iterator(root.path()),
+      std::filesystem::recursive_directory_iterator()));
+  test::ScopedProcfdRoot procfd(root.path());
+  const FilesystemVerifiedCatalogArtifactSource source(procfd.path());
+  test::ScopedPathReplacement replacement(root.path());
+  EXPECT_EQ(source.get_verified(key, digest, payload.size()), payload);
+  EXPECT_FALSE(source
+                   .get_verified(
+                       core::ContentAddressedStoreKey("absent-key"),
+                       digest)
+                   .has_value());
+  EXPECT_EQ(static_cast<std::size_t>(std::distance(
+      std::filesystem::recursive_directory_iterator(root.path()),
+                std::filesystem::recursive_directory_iterator())),
+            0U);
+  EXPECT_EQ(static_cast<std::size_t>(std::distance(
+                std::filesystem::recursive_directory_iterator(
+                    replacement.backing()),
+                std::filesystem::recursive_directory_iterator())),
+            entry_count_before);
+
+  ScopedTrustedRoot empty_root;
+  test::ScopedProcfdRoot empty_procfd(empty_root.path());
+  const FilesystemVerifiedCatalogArtifactSource empty_source(
+      empty_procfd.path());
+  EXPECT_FALSE(empty_source.get_verified(key, digest).has_value());
+  EXPECT_TRUE(std::filesystem::is_empty(empty_root.path()));
+
+  ScopedTrustedRoot unsafe_root;
+  const auto outside = unsafe_root.path().parent_path() /
+                       (unsafe_root.path().filename().string() + "-outside");
+  std::filesystem::create_directory(outside);
+  std::filesystem::create_directory_symlink(
+      outside,
+      unsafe_root.path() /
+          std::string(detail::kCatalogArtifactNamespaceDirectory));
+  test::ScopedProcfdRoot unsafe_procfd(unsafe_root.path());
+  const FilesystemVerifiedCatalogArtifactSource unsafe_source(
+      unsafe_procfd.path());
+  EXPECT_THROW(static_cast<void>(unsafe_source.get_verified(key, digest)),
+               RetainedBundleError);
+  EXPECT_TRUE(std::filesystem::is_empty(outside));
+  std::filesystem::remove_all(outside);
 }
 
 TEST(FilesystemCatalogArtifactStoreTest,

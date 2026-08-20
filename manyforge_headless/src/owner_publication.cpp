@@ -84,6 +84,10 @@ CanonicalValue StringArray(const std::vector<std::string> &values) {
   return CanonicalValue(std::move(result));
 }
 
+CanonicalValue RuntimeContractOfferDigest(const std::string &value) {
+  return value.empty() ? CanonicalValue(nullptr) : CanonicalValue(value);
+}
+
 CanonicalValue ProjectionRevision(const core::ProjectionRevisionDTO &value) {
   Require(value.valid(), "projection revision is invalid");
   return CanonicalValue(CanonicalValue::Object{
@@ -177,6 +181,8 @@ CanonicalValue RuntimePlanRow(
       {"runtime_profile_id", CanonicalValue(value.runtime_profile_id.value())},
       {"runtime_profile_revision",
        CanonicalValue(value.runtime_profile_revision.value())},
+      {"selected_runtime_contract_offer_digest",
+       CanonicalValue(value.runtime_contract_offer_digest.value())},
       {"runtime_unit_id", CanonicalValue(value.runtime_unit_id.value())},
       {"status_endpoint_contract_id",
        CanonicalValue(value.status_endpoint_contract_id)},
@@ -247,6 +253,9 @@ RuntimeObservation(const component_manager::RuntimeUnitObservation &value) {
       {"source_report_sequence",
        OptionalUnsigned(value.source_report_sequence(),
                         "source_report_sequence")},
+      {"observed_runtime_contract_offer_digest",
+       RuntimeContractOfferDigest(
+           value.observed_runtime_contract_offer_digest())},
   });
 }
 

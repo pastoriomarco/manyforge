@@ -34,6 +34,60 @@ The split Isaac profile records a mounted remote install and a mounted local
 world; its exact source/package/world identity must be published in the dated
 O1 evidence before live use.
 
+### Prepare the immutable package root
+
+Prepare the package root from the same clean source and pinned container used
+for the qualified build. The maintained all-row production materializer is the
+only preparation path: it requires all three prepared model families and the
+exact native and ROS 2 control Stop-qualification tuples. Copy every value
+below from the source-matched build and dated qualification record; these
+variables are not evidence placeholders.
+
+```bash
+MANYFORGE_ROOT=/absolute/path/to/manyforge
+PACKAGE_ROOT=/absolute/path/to/new-empty-package-root
+MATERIALIZER=/absolute/path/to/manyforge_maintained_deployment_occurrences
+PREPARED_LITE6=/absolute/path/to/lite6_lite_gripper_structural
+PREPARED_UR5=/absolute/path/to/ur5_roboplan_structural
+PREPARED_UR10E=/absolute/path/to/ur10e_robotiq_2f_140_structural
+NATIVE_STOP_IMPLEMENTATION_BUILD=/absolute/path/to/native-implementation-build.json
+NATIVE_STOP_INSTALLED_TARGET=/absolute/path/to/native-installed-target
+NATIVE_STOP_RUNNER_CONTRACT=/absolute/path/to/native-runner-contract.json
+NATIVE_STOP_RUNNER=/absolute/path/to/native-stop-qualification-runner
+NATIVE_STOP_IMPLEMENTATION_EVIDENCE=/absolute/path/to/native-implementation-evidence.json
+NATIVE_STOP_SUBSTITUTION_EVIDENCE=/absolute/path/to/native-substitution-evidence.json
+ROS_STOP_IMPLEMENTATION_BUILD=/absolute/path/to/ros-implementation-build.json
+ROS_STOP_INSTALLED_TARGET=/absolute/path/to/ros-installed-target
+ROS_STOP_RUNNER_CONTRACT=/absolute/path/to/ros-runner-contract.json
+ROS_STOP_RUNNER=/absolute/path/to/ros-stop-qualification-runner
+ROS_STOP_IMPLEMENTATION_EVIDENCE=/absolute/path/to/ros-implementation-evidence.json
+if [ -e "$PACKAGE_ROOT" ]; then
+  printf 'PACKAGE_ROOT must be a new destination: %s\n' "$PACKAGE_ROOT" >&2
+  exit 1
+fi
+mkdir "$PACKAGE_ROOT" || exit 1
+
+"$MATERIALIZER" --check \
+  --workspace-root "$MANYFORGE_ROOT" --package-root "$PACKAGE_ROOT" \
+  --prepared "lite6_lite_gripper=$PREPARED_LITE6" \
+  --prepared "ur5_roboplan=$PREPARED_UR5" \
+  --prepared "ur10e_robotiq_2f_140=$PREPARED_UR10E" \
+  --stop-evidence-candidate \
+    "$NATIVE_STOP_IMPLEMENTATION_BUILD" "$NATIVE_STOP_INSTALLED_TARGET" \
+    "$NATIVE_STOP_RUNNER_CONTRACT" "$NATIVE_STOP_RUNNER" \
+    "$NATIVE_STOP_IMPLEMENTATION_EVIDENCE" "$NATIVE_STOP_SUBSTITUTION_EVIDENCE" \
+  --stop-evidence-candidate \
+    "$ROS_STOP_IMPLEMENTATION_BUILD" "$ROS_STOP_INSTALLED_TARGET" \
+    "$ROS_STOP_RUNNER_CONTRACT" "$ROS_STOP_RUNNER" \
+    "$ROS_STOP_IMPLEMENTATION_EVIDENCE" -
+```
+
+The command must complete successfully before the root is usable. Discard a
+failed or partial root. Independently reload the successful root through the
+Manager `start` below, then keep that root read-only for the entire Manager
+generation. Do not select a root while materialization is running, mutate it
+after reload, or add a second generator mode.
+
 Before starting, reserve the frozen ports: Composer `9000`, Headless
 loopback `9010`, and Program runner loopback `9011`. Keep the runtime host
 reachable from the laptop on a trusted LAN. Composer has no bearer-token
@@ -181,9 +235,16 @@ failure reasons. In particular:
   killing an unrelated process. Ports are frozen; do not silently remap them.
 - `stale_launch_record` or `incompatible_owner`: do not adopt the processes;
   inspect the recorded instance locally and use its matching identity.
-- Partial startup or component loss becomes `degraded` or a recorded stopped
-  startup failure. Stop and restart with the same complete identity set; the
-  launcher has no automatic component restart.
+- Loss of the Manager-owned managed child is recovered by Manager's
+  observe-first reconciliation. It must receive a fresh runtime epoch and a
+  fresh selected/observed offer-digest correlation before commands reopen; it
+  never adopts an arbitrary process.
+- Loss of Manager, Headless, Program runner, or Composer is outer-stack loss,
+  not child recovery. Use the supported complete-stack `stop` followed by
+  `start` with the same desired configuration and immutable package root.
+- Replacing the package root requires complete-stack `stop`/`start`. Manager
+  performs no live mixed-package upgrade and has no component-level version
+  compatibility path.
 - Stop asks Manager for semantic shutdown, then performs bounded authenticated
   process cleanup. Only the recorded launch instance may be terminated; a
   deadline failure is `cleanup_deadline_exceeded`, not success.

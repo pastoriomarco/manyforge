@@ -6,6 +6,7 @@
 #include <atomic>
 #include <cstdint>
 #include <filesystem>
+#include <iterator>
 #include <memory>
 #include <stdexcept>
 #include <string>
@@ -19,6 +20,7 @@
 
 #include "lite6_retained_consumer_fixture.hpp"
 #include "program_binding_internal.hpp"
+#include "scoped_procfd_root.hpp"
 
 namespace {
 
@@ -45,6 +47,7 @@ using manyforge::core::ResourceRoleId;
 using manyforge::core::TargetRoleId;
 using manyforge::deployment::CompositionComponentModelFrame;
 using manyforge::deployment::FilesystemProgramBindingRepository;
+using manyforge::deployment::FilesystemVerifiedProgramBindingSource;
 using manyforge::deployment::FilesystemVerifiedRetainedBundleSource;
 using manyforge::deployment::FilesystemVerifiedRetainedModelMapSource;
 using manyforge::deployment::ProgramBindingError;
@@ -336,6 +339,75 @@ TEST(ProgramBindingTest,
                 ProgramBindingId(std::string(kZeroDigest)),
                 *context.bundle, context.model_map),
             nullptr);
+}
+
+TEST(ProgramBindingTest,
+     VerifiedSourceReadsThroughProcfdAndLeavesMissingNamespaceAbsent) {
+  ScopedTrustedRoot root;
+  const BindingContext context = make_context(root.path());
+  const auto sealed =
+      ProgramBindingConstructionAuthority::seal(make_binding_value(context));
+  {
+    FilesystemProgramBindingRepository writer(root.path());
+    ASSERT_TRUE(writer.put_if_absent(
+        sealed, *context.bundle, context.model_map));
+  }
+
+  const auto entry_count_before = static_cast<std::size_t>(std::distance(
+      std::filesystem::recursive_directory_iterator(root.path()),
+      std::filesystem::recursive_directory_iterator()));
+  manyforge::deployment::test::ScopedProcfdRoot procfd(root.path());
+  const FilesystemVerifiedProgramBindingSource source(procfd.path());
+  manyforge::deployment::test::ScopedPathReplacement replacement(
+      root.path());
+  const auto read = source.get_verified(
+      sealed->program_binding_id(), *context.bundle, context.model_map);
+  ASSERT_NE(read, nullptr);
+  EXPECT_EQ(read->canonical_bytes(), sealed->canonical_bytes());
+  EXPECT_EQ(source.get_verified(
+                ProgramBindingId(std::string(kZeroDigest)),
+                *context.bundle, context.model_map),
+            nullptr);
+  EXPECT_EQ(static_cast<std::size_t>(std::distance(
+      std::filesystem::recursive_directory_iterator(root.path()),
+                std::filesystem::recursive_directory_iterator())),
+            0U);
+  EXPECT_EQ(static_cast<std::size_t>(std::distance(
+                std::filesystem::recursive_directory_iterator(
+                    replacement.backing()),
+                std::filesystem::recursive_directory_iterator())),
+            entry_count_before);
+
+  ScopedTrustedRoot empty_root;
+  manyforge::deployment::test::ScopedProcfdRoot empty_procfd(
+      empty_root.path());
+  const FilesystemVerifiedProgramBindingSource empty_source(
+      empty_procfd.path());
+  EXPECT_EQ(empty_source.get_verified(
+                sealed->program_binding_id(), *context.bundle,
+                context.model_map),
+            nullptr);
+  EXPECT_FALSE(
+      std::filesystem::exists(empty_root.path() / "program-bindings"));
+
+  ScopedTrustedRoot unsafe_root;
+  const auto outside = unsafe_root.path().parent_path() /
+                       (unsafe_root.path().filename().string() + "-outside");
+  std::filesystem::create_directory(outside);
+  std::filesystem::create_directory(
+      unsafe_root.path() / "program-bindings");
+  std::filesystem::create_directory_symlink(
+      outside, unsafe_root.path() / "program-bindings" / "sha256");
+  manyforge::deployment::test::ScopedProcfdRoot unsafe_procfd(
+      unsafe_root.path());
+  const FilesystemVerifiedProgramBindingSource unsafe_source(
+      unsafe_procfd.path());
+  EXPECT_THROW(
+      static_cast<void>(unsafe_source.get_verified(
+          sealed->program_binding_id(), *context.bundle, context.model_map)),
+      manyforge::deployment::RetainedBundleError);
+  EXPECT_TRUE(std::filesystem::is_empty(outside));
+  std::filesystem::remove_all(outside);
 }
 
 TEST(ProgramBindingTest,

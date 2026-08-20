@@ -50,6 +50,10 @@ TEST(ManagerPackageGeneration, UnchangedRootAndManifestRemainCurrent) {
   const auto manifest = Manifest("manyforge.test.runtime");
   ManagerPackageGeneration generation(root.path(), manifest);
   EXPECT_EQ(generation.manifest_set(), manifest);
+  const auto descriptor_root = generation.descriptor_bound_root();
+  EXPECT_TRUE(std::filesystem::is_directory(descriptor_root));
+  EXPECT_NE(descriptor_root.generic_string().find("/proc/self/fd/"),
+            std::string::npos);
   EXPECT_NO_THROW(generation.RequireCurrent(manifest));
   EXPECT_NO_THROW(generation.RequireCurrent(manifest));
 }

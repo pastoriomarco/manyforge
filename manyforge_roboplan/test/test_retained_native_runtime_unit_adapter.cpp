@@ -1,5 +1,6 @@
 #include <gtest/gtest.h>
 
+#include <fcntl.h>
 #include <unistd.h>
 
 #include <algorithm>
@@ -574,6 +575,46 @@ TEST(RetainedNativeRuntimeUnitAdapter,
   EXPECT_NE(restarted.process_incarnation(), first_epoch.value());
   EXPECT_EQ(adapter.EnsureStopped(*fixture.query).state(),
             component_manager::ProcessPresenceState::kAbsent);
+}
+
+TEST(RetainedNativeRuntimeUnitAdapter,
+     ManagedChildReadsThePinnedPackageAfterPathReplacement) {
+  NativeFixture fixture;
+  ScopedTemporaryRoot package_parent;
+  const auto mutable_root = package_parent.path() / "retained-package";
+  std::error_code copy_error;
+  std::filesystem::copy(fixture.root / "retained-package", mutable_root,
+                        std::filesystem::copy_options::recursive, copy_error);
+  ASSERT_FALSE(copy_error) << copy_error.message();
+
+  const int package_descriptor =
+      ::open(mutable_root.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+  ASSERT_GE(package_descriptor, 0);
+  const auto descriptor_root =
+      std::filesystem::path("/proc/self/fd") /
+      std::to_string(package_descriptor);
+  auto adapter = component_manager::RetainedNativeRuntimeUnitAdapter(
+      MANYFORGE_NATIVE_EXECUTION_TARGET_ROOT, descriptor_root,
+      fixture.staging_root.path(), fixture.staging_root.path(),
+      fixture.bundle_source, fixture.artifact_source,
+      std::string(contract::kOperatingSystem),
+      std::string(contract::kLaunchEnvironmentContract));
+
+  const auto displaced_root = package_parent.path() / "retained-package-a";
+  std::filesystem::rename(mutable_root, displaced_root);
+  ASSERT_TRUE(std::filesystem::create_directory(mutable_root));
+
+  const auto started = adapter.EnsureRunning(*fixture.query);
+  ASSERT_EQ(started.state(),
+            component_manager::ProcessPresenceState::kPresent);
+  const core::RuntimeEpoch epoch(started.process_incarnation());
+  const auto progress = adapter.ObserveProgress(*fixture.query, epoch);
+  ASSERT_TRUE(progress.has_value());
+  EXPECT_EQ(progress->product_identity(),
+            fixture.query->plan.product_identity.value());
+  EXPECT_EQ(adapter.EnsureStopped(*fixture.query).state(),
+            component_manager::ProcessPresenceState::kAbsent);
+  static_cast<void>(::close(package_descriptor));
 }
 
 TEST(

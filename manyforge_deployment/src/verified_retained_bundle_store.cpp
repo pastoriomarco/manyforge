@@ -29,7 +29,10 @@
 #include "manyforge_deployment/controller_topology_codec.hpp"
 #include "manyforge_deployment/model_asset_codec.hpp"
 #include "manyforge_deployment/model_source.hpp"
+#include "manyforge_deployment/program_binding.hpp"
+#include "manyforge_deployment/program_contract.hpp"
 #include "manyforge_deployment/provider_manifest_codec.hpp"
+#include "manyforge_deployment/retained_bundle.hpp"
 #include "manyforge_deployment/stop_evidence_policy_codec.hpp"
 #include "native_execution_runtime_unit_internal.hpp"
 #include "planning_resource_map_internal.hpp"
@@ -107,20 +110,45 @@ struct ReadOnlyRetentionPaths final {
   return {bundle_data, raw_data};
 }
 
+[[nodiscard]] std::optional<std::filesystem::path>
+find_read_only_data_directory(
+    const std::filesystem::path& trusted_root,
+    const std::string_view namespace_name,
+    const std::string_view data_directory_name) {
+  const std::filesystem::path value_namespace =
+      trusted_root / std::string(namespace_name);
+  const std::filesystem::path value_data =
+      value_namespace / std::string(data_directory_name);
+  for (const auto& directory :
+       {value_namespace, value_data}) {
+    std::error_code error;
+    const auto status = std::filesystem::symlink_status(directory, error);
+    if (error == std::errc::no_such_file_or_directory) {
+      return std::nullopt;
+    }
+    if (error) {
+      throw std::filesystem::filesystem_error(
+          std::string(kReadOnlyDirectoryMessages.inspect), directory, error);
+    }
+    if (!std::filesystem::is_directory(status) ||
+        std::filesystem::is_symlink(status)) {
+      detail::fail_retained_bundle(
+          kReadOnlyDirectoryMessages.not_existing_plain_directory);
+    }
+  }
+  return value_data;
+}
+
 [[nodiscard]] std::filesystem::path require_read_only_catalog_data(
     const std::filesystem::path& trusted_root) {
-  const std::filesystem::path catalog_namespace =
-      trusted_root /
-      detail::kCatalogArtifactNamespaceDirectory;
-  const std::filesystem::path catalog_data =
-      catalog_namespace /
-      detail::kCatalogArtifactDataDirectory;
-  for (const auto& directory :
-       {catalog_namespace, catalog_data}) {
-    posix::require_existing_plain_directory(
-        directory, kPosixErrors, kReadOnlyDirectoryMessages);
+  const auto data = find_read_only_data_directory(
+      trusted_root, detail::kCatalogArtifactNamespaceDirectory,
+      detail::kCatalogArtifactDataDirectory);
+  if (!data.has_value()) {
+    detail::fail_retained_bundle(
+        "read-only catalog-artifact store is absent");
   }
-  return catalog_data;
+  return *data;
 }
 
 [[nodiscard]] std::shared_ptr<const RetainedBundle>
@@ -179,44 +207,65 @@ read_verified_bundle_entry(
   return std::move(*bytes);
 }
 
-[[nodiscard]] std::string read_verified_catalog_reference(
+[[nodiscard]] std::optional<std::string> read_verified_catalog_entry(
     const std::filesystem::path& catalog_data,
     const core::ContentAddressedStoreKey& key,
     const core::ContentDigest& digest,
-    std::optional<std::uint64_t> expected_size,
-    std::string_view reference_label) {
+    const std::optional<std::uint64_t> expected_size,
+    const std::uint64_t maximum_single_payload_bytes) {
   const auto storage_hex =
       detail::catalog_artifact_storage_hex(key.value());
   if (!storage_hex.has_value() ||
       !is_sha256_digest(digest.value())) {
-    detail::fail_retained_bundle(
-        std::string(reference_label) +
-        " has invalid exact catalog-artifact coordinates");
+    return std::nullopt;
   }
-  constexpr std::uint64_t kMaximumEnvelopeBytes =
-      kMaxDurableRetainedBlobBytes +
+  if (maximum_single_payload_bytes == 0U ||
+      maximum_single_payload_bytes >
+          std::numeric_limits<std::uint64_t>::max() -
+              detail::kMaximumCatalogArtifactEnvelopeOverhead) {
+    throw std::invalid_argument(
+        "read-only catalog-artifact byte bound is invalid");
+  }
+  const std::uint64_t maximum_envelope_bytes =
+      maximum_single_payload_bytes +
       detail::kMaximumCatalogArtifactEnvelopeOverhead;
   auto envelope = posix::read_exact_regular_file(
       catalog_data /
           (std::string(*storage_hex) +
            std::string(detail::kCatalogArtifactFileSuffix)),
-      kMaximumEnvelopeBytes, true, kPosixErrors, kReadMessages);
+      maximum_envelope_bytes, true, kPosixErrors, kReadMessages);
   if (!envelope.has_value()) {
-    detail::fail_retained_bundle(
-        std::string(reference_label) +
-        " is absent from the durable catalog-artifact store");
+    return std::nullopt;
   }
   detail::DecodedCatalogArtifactEnvelope decoded =
       detail::decode_catalog_artifact_envelope(*envelope);
-  if (decoded.content_addressed_store_key != key.value() ||
-      decoded.content_digest != digest.value() ||
+  if (decoded.content_addressed_store_key != key.value()) {
+    detail::fail_retained_bundle(
+        "durable catalog-artifact filename collision");
+  }
+  if (decoded.content_digest != digest.value() ||
       (expected_size.has_value() &&
        decoded.payload.size() != *expected_size)) {
-    detail::fail_retained_bundle(
-        std::string(reference_label) +
-        " failed exact durable catalog-artifact verification");
+    return std::nullopt;
   }
   return std::string(decoded.payload);
+}
+
+[[nodiscard]] std::string read_verified_catalog_reference(
+    const std::filesystem::path& catalog_data,
+    const core::ContentAddressedStoreKey& key,
+    const core::ContentDigest& digest,
+    const std::optional<std::uint64_t> expected_size,
+    const std::string_view reference_label) {
+  auto bytes = read_verified_catalog_entry(
+      catalog_data, key, digest, expected_size,
+      kMaxDurableRetainedBlobBytes);
+  if (!bytes.has_value()) {
+    detail::fail_retained_bundle(
+        std::string(reference_label) +
+        " is absent or failed exact durable catalog-artifact verification");
+  }
+  return std::move(*bytes);
 }
 
 [[nodiscard]] const CanonicalValue& require_map_member(
@@ -2194,6 +2243,128 @@ void VerifiedRetainedModelMap::require_same_bundle_as(
     detail::fail_retained_bundle(
         "retained model map and planning model belong to different bundles");
   }
+}
+
+FilesystemVerifiedCatalogArtifactSource::
+    FilesystemVerifiedCatalogArtifactSource(
+        std::filesystem::path trusted_package_root,
+        const std::uint64_t maximum_single_payload_bytes)
+    : trusted_package_root_(posix::normalize_existing_plain_root(
+          trusted_package_root, kPosixErrors, kTrustedRootMessages)),
+      maximum_single_payload_bytes_(maximum_single_payload_bytes) {
+  if (maximum_single_payload_bytes_ == 0U ||
+      maximum_single_payload_bytes_ >
+          std::numeric_limits<std::uint64_t>::max() -
+              detail::kMaximumCatalogArtifactEnvelopeOverhead) {
+    throw std::invalid_argument(
+        "read-only catalog-artifact byte bound is invalid");
+  }
+}
+
+std::optional<std::string>
+FilesystemVerifiedCatalogArtifactSource::get_verified(
+    const core::ContentAddressedStoreKey& exact_key,
+    const core::ContentDigest& expected_digest,
+    const std::optional<std::uint64_t> expected_size) const {
+  const auto current_root = require_unchanged_trusted_root(
+      trusted_package_root_, "read-only catalog-artifact");
+  const auto catalog_data = find_read_only_data_directory(
+      current_root, detail::kCatalogArtifactNamespaceDirectory,
+      detail::kCatalogArtifactDataDirectory);
+  if (!catalog_data.has_value()) {
+    return std::nullopt;
+  }
+  return read_verified_catalog_entry(
+      *catalog_data, exact_key,
+      expected_digest, expected_size, maximum_single_payload_bytes_);
+}
+
+FilesystemVerifiedProgramSource::FilesystemVerifiedProgramSource(
+    std::filesystem::path trusted_package_root,
+    const std::uint64_t maximum_single_program_bytes)
+    : trusted_package_root_(posix::normalize_existing_plain_root(
+          trusted_package_root, kPosixErrors, kTrustedRootMessages)),
+      maximum_single_program_bytes_(maximum_single_program_bytes) {
+  if (maximum_single_program_bytes_ == 0U) {
+    throw std::invalid_argument("read-only Program byte bound is invalid");
+  }
+}
+
+std::shared_ptr<const ProgramBindingContract>
+FilesystemVerifiedProgramSource::get_verified(
+    const core::ProgramId& program_id,
+    const core::ProgramRevision& program_revision,
+    const RetainedBundle& retained_bundle) const {
+  const auto hex = detail::retained_digest_hex(program_revision.value());
+  if (!hex.has_value()) {
+    return nullptr;
+  }
+  const auto current_root = require_unchanged_trusted_root(
+      trusted_package_root_, "read-only Program");
+  const auto program_data = find_read_only_data_directory(
+      current_root, "programs", "sha256");
+  if (!program_data.has_value()) {
+    return nullptr;
+  }
+  const auto bytes = posix::read_exact_regular_file(
+      *program_data / (std::string(*hex) + ".json"),
+      maximum_single_program_bytes_, true, kPosixErrors, kReadMessages);
+  if (!bytes.has_value()) {
+    return nullptr;
+  }
+  const auto program =
+      verify_program_binding_contract(*bytes, retained_bundle);
+  if (program->value().program_id != program_id ||
+      program->value().program_revision != program_revision) {
+    throw ProgramContractError(
+        "read-only Program key/content or Program identity mismatch");
+  }
+  return program;
+}
+
+FilesystemVerifiedProgramBindingSource::
+    FilesystemVerifiedProgramBindingSource(
+        std::filesystem::path trusted_package_root,
+        const std::uint64_t maximum_single_binding_bytes)
+    : trusted_package_root_(posix::normalize_existing_plain_root(
+          trusted_package_root, kPosixErrors, kTrustedRootMessages)),
+      maximum_single_binding_bytes_(maximum_single_binding_bytes) {
+  if (maximum_single_binding_bytes_ == 0U) {
+    throw std::invalid_argument(
+        "read-only Program-Binding byte bound is invalid");
+  }
+}
+
+std::shared_ptr<const ProgramBinding>
+FilesystemVerifiedProgramBindingSource::get_verified(
+    const core::ProgramBindingId& program_binding_id,
+    const RetainedBundle& retained_bundle,
+    const VerifiedRetainedModelMap& retained_model_map) const {
+  const auto hex =
+      detail::retained_digest_hex(program_binding_id.value());
+  if (!hex.has_value()) {
+    return nullptr;
+  }
+  const auto current_root = require_unchanged_trusted_root(
+      trusted_package_root_, "read-only Program-Binding");
+  const auto binding_data = find_read_only_data_directory(
+      current_root, "program-bindings", "sha256");
+  if (!binding_data.has_value()) {
+    return nullptr;
+  }
+  const auto bytes = posix::read_exact_regular_file(
+      *binding_data / (std::string(*hex) + ".json"),
+      maximum_single_binding_bytes_, true, kPosixErrors, kReadMessages);
+  if (!bytes.has_value()) {
+    return nullptr;
+  }
+  const auto binding = reload_verified_program_binding(
+      *bytes, retained_bundle, retained_model_map);
+  if (binding->program_binding_id() != program_binding_id) {
+    throw ProgramBindingError(
+        "read-only Program-Binding key/content mismatch");
+  }
+  return binding;
 }
 
 FilesystemVerifiedRetainedBundleSource::

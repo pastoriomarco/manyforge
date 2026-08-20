@@ -2,6 +2,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <functional>
 #include <manyforge_component_manager/runtime_observation.hpp>
 #include <manyforge_core/types/active_bundle_publication.hpp>
 #include <manyforge_core/types/runtime_contract_manifest.hpp>
@@ -64,6 +65,13 @@ struct RuntimeUnitConvergencePlanRowDTO final {
   friend bool operator==(const RuntimeUnitConvergencePlanRowDTO &,
                          const RuntimeUnitConvergencePlanRowDTO &) = default;
 };
+
+/// Sole Manager-owned verification of the sealed runtime contract admission.
+/// Concrete adapters may repeat it as defense in depth.
+void VerifyRuntimeContractAdmission(
+    const RuntimeUnitConvergencePlanRowDTO &plan);
+
+using RuntimePreStartGuard = std::function<void()>;
 
 /// Complete immutable candidate-runtime convergence intent.
 ///

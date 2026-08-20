@@ -3,6 +3,7 @@
 #include <signal.h>
 #include <spawn.h>
 #include <sys/socket.h>
+#include <sys/stat.h>
 #include <sys/syscall.h>
 #include <sys/wait.h>
 #include <unistd.h>
@@ -17,6 +18,7 @@
 #include <cstdint>
 #include <cstring>
 #include <limits>
+#include <iterator>
 #include <manyforge_core/geometry/pose_math.hpp>
 #include <manyforge_roboplan/process_contained_candidate_client.hpp>
 #include <map>
@@ -89,6 +91,47 @@ resolve_retained_mesh_path(const RoboPlanWorkerModelDTO &model,
         return part.empty() || part == "." || part == "..";
       })) {
     throw std::invalid_argument("retained worker mesh asset path is invalid");
+  }
+  if (!model_asset && scene_asset_root.has_value() &&
+      scene_asset_root->generic_string() == "/proc/self/fd/6") {
+    struct stat root_status {};
+    if (::fstat(6, &root_status) != 0 || !S_ISDIR(root_status.st_mode)) {
+      throw std::invalid_argument(
+          "retained worker descriptor root is unavailable");
+    }
+    int current = ::fcntl(6, F_DUPFD_CLOEXEC, 7);
+    if (current < 0) {
+      throw std::invalid_argument(
+          "retained worker descriptor root could not be duplicated");
+    }
+    struct Close final {
+      int descriptor;
+      ~Close() {
+        if (descriptor >= 0) {
+          static_cast<void>(::close(descriptor));
+        }
+      }
+    } close_current{current};
+    for (auto part = relative.begin(); part != relative.end(); ++part) {
+      const bool last = std::next(part) == relative.end();
+      const int next = ::openat(
+          current, part->c_str(),
+          O_RDONLY | O_CLOEXEC | O_NOFOLLOW |
+              (last ? 0 : O_DIRECTORY));
+      if (next < 0) {
+        throw std::invalid_argument(
+            "retained worker mesh is unavailable below descriptor root");
+      }
+      static_cast<void>(::close(current));
+      current = next;
+      close_current.descriptor = current;
+    }
+    struct stat selected_status {};
+    if (::fstat(current, &selected_status) != 0 ||
+        !S_ISREG(selected_status.st_mode)) {
+      throw std::invalid_argument("retained worker mesh is not a regular file");
+    }
+    return *scene_asset_root / relative;
   }
   std::error_code filesystem_error;
   const auto root = std::filesystem::canonical(
@@ -648,8 +691,26 @@ struct ProcessContainedRoboPlanCandidateClient::Impl final {
       throw std::invalid_argument(
           "RoboPlan process-contained client configuration is invalid");
     }
+    if (config.retained_package_root_fd.has_value()) {
+      if (*config.retained_package_root_fd != 6 ||
+          !config.scene_asset_root.has_value() ||
+          config.scene_asset_root->generic_string() != "/proc/self/fd/6") {
+        throw std::invalid_argument(
+            "RoboPlan retained package descriptor must be reserved FD 6");
+      }
+      struct stat status {};
+      const int flags = ::fcntl(6, F_GETFD);
+      if (::fstat(6, &status) != 0 || !S_ISDIR(status.st_mode) ||
+          flags < 0 || (flags & FD_CLOEXEC) != 0) {
+        throw std::invalid_argument(
+            "RoboPlan retained package descriptor is not inherited");
+      }
+    }
     if (config.scene_asset_root.has_value()) {
       std::error_code filesystem_error;
+      if (config.retained_package_root_fd.has_value()) {
+        return;
+      }
       const auto canonical = std::filesystem::canonical(
           *config.scene_asset_root, filesystem_error);
       if (filesystem_error || !canonical.is_absolute() ||
@@ -766,6 +827,13 @@ struct ProcessContainedRoboPlanCandidateClient::Impl final {
       duplicated_child.reset(duplicate);
       child_descriptor = duplicate;
     }
+    // In the managed child, FD 3 is the Manager channel. Close it before
+    // the protocol dup2 below; FD 3 then becomes only the worker transport.
+    if (config.retained_package_root_fd.has_value() &&
+        ::posix_spawn_file_actions_addclose(&actions, 3) != 0) {
+      throw std::runtime_error(
+          "could not close the inherited Manager channel for worker");
+    }
     if ((child_descriptor != protocol_descriptor &&
          ::posix_spawn_file_actions_adddup2(&actions, child_descriptor,
                                             protocol_descriptor) != 0) ||
@@ -776,6 +844,14 @@ struct ProcessContainedRoboPlanCandidateClient::Impl final {
          ::posix_spawn_file_actions_addclose(&actions, child_descriptor) !=
              0)) {
       throw std::runtime_error("could not configure planner spawn actions");
+    }
+    if (config.retained_package_root_fd.has_value() &&
+        (::posix_spawn_file_actions_adddup2(
+             &actions, *config.retained_package_root_fd, 6) != 0 ||
+         ::posix_spawn_file_actions_addclose(&actions, 4) != 0 ||
+         ::posix_spawn_file_actions_addclose(&actions, 5) != 0)) {
+      throw std::runtime_error(
+          "could not preserve the retained package descriptor for worker");
     }
 
     const std::string executable = config.worker_executable.string();
