@@ -107,6 +107,7 @@ Bundle(std::string bundle_id, std::string graph_revision,
       },
       {},
       std::move(bindings),
+      {},
       RetainedCompiledProductsDTO{
           RetainedProductDTO{
               ProductId("product.test"),
@@ -130,6 +131,7 @@ Bundle(std::string bundle_id, std::string graph_revision,
       std::nullopt,
       {},
       std::nullopt,
+      {},
   };
 }
 

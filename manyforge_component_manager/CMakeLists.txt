@@ -219,6 +219,7 @@ add_library(manyforge_component_manager
   src/selected_bundle_transition.cpp
   src/selected_runtime_composition_rpc_internal.cpp
   src/sqlite_store_startup_internal.cpp
+  src/manager_state_marker_internal.cpp
 )
 add_library(
   manyforge::component_manager ALIAS manyforge_component_manager)

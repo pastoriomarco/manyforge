@@ -1,6 +1,8 @@
 #include <gtest/gtest.h>
+#include <fcntl.h>
 #include <signal.h>
 #include <sys/socket.h>
+#include <sys/stat.h>
 #include <sys/un.h>
 #include <sys/wait.h>
 #include <unistd.h>
@@ -16,6 +18,7 @@
 #include <manyforge_component_manager/manager_apply_journal.hpp>
 #include <manyforge_content_identity/content_identity.hpp>
 #include <manyforge_deployment/artifact_codec.hpp>
+#include <manyforge_deployment/canonical_empty_admission.hpp>
 #include <stdexcept>
 #include <string>
 #include <thread>
@@ -137,6 +140,9 @@ public:
   [[nodiscard]] std::filesystem::path socket_path() const {
     return manager_root() / "manager-command.sock";
   }
+  [[nodiscard]] std::filesystem::path startup_stderr() const {
+    return root_ / "manager-startup.stderr";
+  }
   [[nodiscard]] std::filesystem::path execution_socket_path() const {
     return runtime_root() / "execution-command.sock";
   }
@@ -169,11 +175,19 @@ public:
     const auto runtime_root = directory.runtime_root().string();
     const auto scene_database = directory.scene_database().string();
     const auto publication_root = directory.publication_root().string();
+    const auto startup_stderr = directory.startup_stderr().string();
     pid_ = ::fork();
     if (pid_ < 0) {
       throw std::runtime_error("Manager daemon test fork failed");
     }
     if (pid_ == 0) {
+      const int stderr_fd =
+          ::open(startup_stderr.c_str(),
+                 O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, S_IRUSR | S_IWUSR);
+      if (stderr_fd < 0 || ::dup2(stderr_fd, STDERR_FILENO) < 0) {
+        ::_exit(127);
+      }
+      static_cast<void>(::close(stderr_fd));
       ::execl(executable.c_str(), executable.c_str(), "--package-root",
               package_root.c_str(), "--canonical-empty-admission-filename",
               admission_filename.c_str(), "--manager-state-root",
@@ -444,6 +458,12 @@ void SendCommandAndDisconnect(const std::filesystem::path &path,
   static_cast<void>(::close(client));
 }
 
+std::string ReadStartupStderr(const DaemonDirectory& directory) {
+  std::ifstream input(directory.startup_stderr(), std::ios::binary);
+  return {std::istreambuf_iterator<char>(input),
+          std::istreambuf_iterator<char>()};
+}
+
 std::string ApplyRequest(
     const std::string_view manager_owner_epoch,
     const std::string_view deployment_artifact_id = "candidate",
@@ -709,6 +729,48 @@ std::string SceneRuntimeBeforePlanningLatchRequest(
       {"expected_runtime_identity",
        SceneRuntimeIdentityValue(scene_runtime_source)},
   }));
+}
+
+TEST(ManagerDaemonProcess,
+     RejectsPreManifestRootWithTypedStartupErrorBeforeIngress) {
+  DaemonDirectory legacy;
+  const deployment::FilesystemCanonicalEmptyRetainedBundleSource source(
+      MANYFORGE_HEADLESS_TEST_CANONICAL_EMPTY_PACKAGE_ROOT);
+  const auto admission = source.load_verified();
+  const auto legacy_journal =
+      legacy.manager_root() /
+      std::string(component_manager::kManagerBootstrapJournalFilename);
+  {
+    component_manager::SqliteManagerBootstrapJournal journal(
+        legacy_journal, admission.cell_id());
+  }
+
+  ManagerProcess manager(legacy);
+  const auto status = manager.Wait();
+  ASSERT_TRUE(WIFEXITED(status));
+  EXPECT_EQ(WEXITSTATUS(status), 70);
+  const auto startup_error = ReadStartupStderr(legacy);
+  EXPECT_NE(startup_error.find(
+                "\"code\":\"runtime_compatibility_manifest_missing\""),
+            std::string::npos);
+  EXPECT_NE(startup_error.find(
+                "\"required_action\":\"clean_canonical_bootstrap\""),
+            std::string::npos);
+  EXPECT_FALSE(std::filesystem::exists(legacy.socket_path()));
+  EXPECT_FALSE(std::filesystem::exists(legacy.execution_socket_path()));
+  EXPECT_FALSE(std::filesystem::exists(
+      legacy.publication_root() / "manager-source.json"));
+  EXPECT_TRUE(std::filesystem::exists(legacy_journal));
+  EXPECT_FALSE(std::filesystem::exists(
+      legacy.manager_root() /
+      std::string(component_manager::kManagerStateMarkerFilename)));
+
+  DaemonDirectory clean;
+  ManagerProcess supported(clean);
+  supported.WaitReady(clean);
+  EXPECT_TRUE(std::filesystem::exists(
+      clean.manager_root() /
+      std::string(component_manager::kManagerStateMarkerFilename)));
 }
 
 TEST(ManagerDaemonProcess,

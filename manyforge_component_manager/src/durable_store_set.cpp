@@ -1,5 +1,6 @@
 #include "manyforge_component_manager/durable_store_set.hpp"
 
+#include "manager_state_marker_internal.hpp"
 #include "sqlite_store_startup_internal.hpp"
 #include <manyforge_persistence/sqlite_read_only_preflight.hpp>
 
@@ -84,25 +85,25 @@ class StableStateDirectoryLock final {
  public:
   explicit StableStateDirectoryLock(
       const std::filesystem::path& directory) {
-    const auto lock_path =
-        directory / ".manager-durable-stores.lock";
+    // Lock the already-existing root directory itself. Creating a lock
+    // sidecar before the marker preflight would mutate a rejected
+    // pre-manifest root and would make diagnosis indistinguishable from a
+    // successful store-set startup.
     descriptor_ = open(
-        lock_path.c_str(),
-        O_RDWR | O_CREAT | O_CLOEXEC | O_NOFOLLOW,
-        S_IRUSR | S_IWUSR);
+        directory.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW);
     if (descriptor_ < 0) {
       throw ManagerBootstrapJournalError(
           "cannot open manager durable-store startup lock: " +
           std::string(std::strerror(errno)));
     }
     struct stat status {};
-    if (fstat(descriptor_, &status) != 0 || !S_ISREG(status.st_mode)) {
+    if (fstat(descriptor_, &status) != 0 || !S_ISDIR(status.st_mode)) {
       const auto detail = std::string(std::strerror(errno));
       close(descriptor_);
       descriptor_ = -1;
       throw ManagerBootstrapJournalError(
-          "manager durable-store startup lock is not a regular file: " +
-          detail);
+          "manager durable-store startup lock root is not a directory: " +
+              detail);
     }
     while (flock(descriptor_, LOCK_EX) != 0) {
       if (errno == EINTR) {
@@ -241,6 +242,20 @@ class ExternallyProvisionedManagerStores::Impl final {
       const auto apply_path =
           stable_state_directory_ /
           std::string(kManagerApplyJournalFilename);
+      const ManagerStateMarkerIdentity state_marker_identity{
+          admission_digest_.value(),
+          cell_id_.value(),
+          retained_bundle_id_.value(),
+          graph_revision_.value(),
+      };
+      const auto marker_state = PreflightManagerStateMarker(
+          stable_state_directory_, state_marker_identity);
+      if (marker_state == ManagerStateMarkerPreflightResult::kClean) {
+        // The marker is the first durable Manager-state artifact. Its
+        // directory fsync completes before any SQLite peer can be opened.
+        WriteManagerStateMarker(
+            stable_state_directory_, state_marker_identity);
+      }
       const bool journal_requires_validation =
           RequiresValidationBeforeInitialization(journal_path);
       const bool publication_requires_validation =

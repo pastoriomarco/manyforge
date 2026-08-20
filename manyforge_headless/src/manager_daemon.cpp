@@ -13,6 +13,7 @@
 #include <manyforge_component_manager/retained_native_runtime_unit_adapter.hpp>
 #include <manyforge_component_manager/retained_posix_runtime_unit_adapter.hpp>
 #include <manyforge_component_manager/runtime_unit_adapter_router.hpp>
+#include <manyforge_content_identity/canonical_value.hpp>
 #include <manyforge_deployment/artifact_codec.hpp>
 #include <manyforge_deployment/canonical_empty_admission.hpp>
 #include <manyforge_deployment/native_execution_runtime_contract.hpp>
@@ -2576,6 +2577,27 @@ void InstallSignalHandlers() {
 }
 
 } // namespace
+
+std::string EncodeManagerStartupError(const manyforge::core::ErrorDTO& error) {
+  manyforge::content_identity::CanonicalValue::Object details;
+  details.reserve(error.details.size());
+  for (const auto& [key, value] : error.details) {
+    details.emplace_back(
+        key, manyforge::content_identity::CanonicalValue(value));
+  }
+  return manyforge::content_identity::canonical_json(
+      manyforge::content_identity::CanonicalValue(
+          manyforge::content_identity::CanonicalValue::Object{
+              {"code",
+               manyforge::content_identity::CanonicalValue(error.code)},
+              {"details",
+               manyforge::content_identity::CanonicalValue(
+                   std::move(details))},
+              {"message",
+               manyforge::content_identity::CanonicalValue(error.message)},
+          }));
+}
+
 } // namespace manyforge::headless
 
 int main(int argc, char **argv) {
@@ -2584,6 +2606,12 @@ int main(int argc, char **argv) {
     manyforge::headless::ManagerDaemon daemon(
         manyforge::headless::ParseArguments(argc, argv));
     return daemon.Run();
+  } catch (const manyforge::component_manager::ManagerStateMarkerError&
+               error) {
+    std::cerr << manyforge::headless::EncodeManagerStartupError(
+                     error.error())
+              << '\n';
+    return 70;
   } catch (const std::exception &error) {
     std::cerr << error.what() << '\n';
     return 70;
