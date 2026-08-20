@@ -466,11 +466,7 @@ TEST(ProgramApplyOwnerTest,
           CandidateProgram(baseline, "Baseline source must be package-only")));
       FAIL() << "Program Apply accepted an unavailable package baseline";
     } catch (const ProgramApplyError &error) {
-      if (malformed) {
-        EXPECT_EQ(error.code(), "program_apply_preparation_failed");
-      } else {
-        EXPECT_EQ(error.code(), "program_apply_baseline_binding_invalid");
-      }
+      EXPECT_EQ(error.code(), "program_apply_preparation_failed");
     }
     EXPECT_EQ(PackageFiles(directory.package()), package_before);
   }
