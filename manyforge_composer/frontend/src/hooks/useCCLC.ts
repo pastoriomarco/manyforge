@@ -13,6 +13,7 @@ import type {
 } from '../types/cclc';
 
 const POLL_INTERVAL_MS = 250;
+let fallbackIdentitySequence = 0;
 
 export interface CCLCController {
   componentId: string;
@@ -30,8 +31,20 @@ export interface CCLCController {
   submitRoute: (template: CCLCRouteTemplate) => Promise<void>;
 }
 
-function randomIdentity(prefix: string): string {
-  return `${prefix}-${crypto.randomUUID()}`;
+export function browserRequestIdentity(prefix: string): string {
+  const browserCrypto = globalThis.crypto;
+  if (typeof browserCrypto?.randomUUID === 'function') {
+    return `${prefix}-${browserCrypto.randomUUID()}`;
+  }
+  if (typeof browserCrypto?.getRandomValues === 'function') {
+    const words = new Uint32Array(4);
+    browserCrypto.getRandomValues(words);
+    const suffix = Array.from(words, (word) => word.toString(16).padStart(8, '0'))
+      .join('');
+    return `${prefix}-${suffix}`;
+  }
+  fallbackIdentitySequence = (fallbackIdentitySequence + 1) % 0x1_0000_0000;
+  return `${prefix}-${Date.now().toString(36)}-${fallbackIdentitySequence.toString(36)}`;
 }
 
 function requestContext(
@@ -39,7 +52,7 @@ function requestContext(
   correlation: string,
 ): CCLCRequestContext {
   return {
-    request_id: randomIdentity('composer-cclc-request'),
+    request_id: browserRequestIdentity('composer-cclc-request'),
     request_owner_epoch: ownerEpoch,
     source_label: 'manyforge_composer',
     correlation_id: correlation,
@@ -106,7 +119,7 @@ export function routeRequestFromTemplate(
 }
 
 export function useCCLC(enabled: boolean): CCLCController {
-  const ownerEpoch = useRef(randomIdentity('composer-cclc-epoch'));
+  const ownerEpoch = useRef(browserRequestIdentity('composer-cclc-epoch'));
   const [componentId, setComponentIdValue] = useState('');
   const [snapshot, setSnapshot] = useState<CCLCComponentSnapshot | null>(null);
   const [routeTemplates, setRouteTemplates] = useState<CCLCRouteTemplateSet | null>(null);

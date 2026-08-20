@@ -1,6 +1,7 @@
-import { describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 
 import {
+  browserRequestIdentity,
   lifecycleRequestFromSnapshot,
   routeRequestFromTemplate,
 } from './useCCLC';
@@ -68,7 +69,36 @@ const templates: CCLCRouteTemplateSet = {
   }],
 };
 
+afterEach(() => {
+  vi.restoreAllMocks();
+  vi.unstubAllGlobals();
+});
+
 describe('CCLC request projection', () => {
+  it('creates bounded identities when randomUUID is unavailable on trusted-LAN HTTP', () => {
+    vi.stubGlobal('crypto', {
+      getRandomValues: (words: Uint32Array) => {
+        words.set([1, 2, 3, 4]);
+        return words;
+      },
+    });
+
+    expect(browserRequestIdentity('composer-test')).toBe(
+      'composer-test-00000001000000020000000300000004',
+    );
+  });
+
+  it('keeps the last-resort identity fallback unique without Web Crypto', () => {
+    vi.stubGlobal('crypto', undefined);
+    vi.spyOn(Date, 'now').mockReturnValue(1_787_247_600_000);
+
+    const first = browserRequestIdentity('composer-test');
+    const second = browserRequestIdentity('composer-test');
+    expect(first).not.toBe(second);
+    expect(first).toMatch(/^composer-test-[0-9a-z]+-[0-9a-z]+$/);
+    expect(second).toMatch(/^composer-test-[0-9a-z]+-[0-9a-z]+$/);
+  });
+
   it('copies lifecycle compare-and-set truth from the owner snapshot', () => {
     expect(lifecycleRequestFromSnapshot(snapshot, 'enable', context)).toEqual({
       request_context: context,

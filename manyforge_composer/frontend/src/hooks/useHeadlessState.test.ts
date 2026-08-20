@@ -6,6 +6,7 @@ import {
   HEADLESS_SHELL_PUBLICATION_MS,
   HeadlessStateSource,
   admitHeadlessState,
+  getHeadlessStateQualificationSnapshot,
   useHeadlessStateSource,
 } from './useHeadlessState';
 
@@ -164,6 +165,7 @@ describe('HeadlessStateSource delivery scheduling', () => {
     class FakeWebSocket {
       static instances: FakeWebSocket[] = [];
       readonly url: string;
+      onopen: (() => void) | null = null;
       onmessage: ((message: MessageEvent) => void) | null = null;
       onerror: (() => void) | null = null;
       onclose: (() => void) | null = null;
@@ -174,6 +176,10 @@ describe('HeadlessStateSource delivery scheduling', () => {
       }
 
       close(): void {}
+
+      open(): void {
+        this.onopen?.();
+      }
 
       sendFrame(value: unknown): void {
         this.onmessage?.({ data: JSON.stringify(value) } as MessageEvent);
@@ -197,7 +203,20 @@ describe('HeadlessStateSource delivery scheduling', () => {
     source.setEnabled(true);
 
     expect(FakeWebSocket.instances).toHaveLength(1);
+    expect(getHeadlessStateQualificationSnapshot()).toEqual(
+      expect.objectContaining({
+        sourceCount: 1,
+        activeSockets: 0,
+      }),
+    );
     const socket = FakeWebSocket.instances[0]!;
+    socket.open();
+    expect(getHeadlessStateQualificationSnapshot()).toEqual(
+      expect.objectContaining({
+        activeSockets: 1,
+        maxActiveSockets: 1,
+      }),
+    );
     for (let generation = 0; generation < 100; generation += 1) {
       socket.sendFrame(wireState(generation));
     }
@@ -215,6 +234,71 @@ describe('HeadlessStateSource delivery scheduling', () => {
     expect(source.getShellSnapshot().snapshot?.runtime.projectionGeneration).toBe(99);
     expect(FakeWebSocket.instances).toHaveLength(1);
     source.dispose();
+    expect(getHeadlessStateQualificationSnapshot().activeSockets).toBe(0);
+  });
+
+  it('counts only opened sockets through a failed transport reconnect', () => {
+    vi.useFakeTimers();
+    class FakeWebSocket {
+      static instances: FakeWebSocket[] = [];
+      onopen: (() => void) | null = null;
+      onmessage: ((message: MessageEvent) => void) | null = null;
+      onerror: (() => void) | null = null;
+      onclose: (() => void) | null = null;
+
+      constructor(url: string) {
+        void url;
+        FakeWebSocket.instances.push(this);
+      }
+
+      open(): void {
+        this.onopen?.();
+      }
+
+      fail(): void {
+        this.onerror?.();
+        this.onclose?.();
+      }
+
+      close(): void {
+        this.onclose?.();
+      }
+    }
+    vi.stubGlobal('window', {
+      location: { href: 'http://composer.test/' },
+      requestAnimationFrame: vi.fn(),
+      cancelAnimationFrame: vi.fn(),
+    });
+    vi.stubGlobal('WebSocket', FakeWebSocket);
+
+    const source = new HeadlessStateSource();
+    const initialCreations = getHeadlessStateQualificationSnapshot().socketCreations;
+    source.setEnabled(true);
+    expect(FakeWebSocket.instances).toHaveLength(1);
+    expect(getHeadlessStateQualificationSnapshot()).toEqual(
+      expect.objectContaining({
+        activeSockets: 0,
+        socketCreations: initialCreations + 1,
+      }),
+    );
+
+    FakeWebSocket.instances[0]!.open();
+    expect(getHeadlessStateQualificationSnapshot().activeSockets).toBe(1);
+    FakeWebSocket.instances[0]!.fail();
+    expect(getHeadlessStateQualificationSnapshot().activeSockets).toBe(0);
+
+    vi.advanceTimersByTime(1000);
+    expect(FakeWebSocket.instances).toHaveLength(2);
+    expect(getHeadlessStateQualificationSnapshot().activeSockets).toBe(0);
+    FakeWebSocket.instances[1]!.open();
+    expect(getHeadlessStateQualificationSnapshot()).toEqual(
+      expect.objectContaining({
+        activeSockets: 1,
+        maxActiveSockets: 1,
+      }),
+    );
+    source.dispose();
+    expect(getHeadlessStateQualificationSnapshot().activeSockets).toBe(0);
   });
 });
 
@@ -225,6 +309,7 @@ describe('useHeadlessStateSource lifecycle', () => {
       static instances: FakeWebSocket[] = [];
       readonly url: string;
       active = true;
+      onopen: (() => void) | null = null;
       onmessage: ((message: MessageEvent) => void) | null = null;
       onerror: (() => void) | null = null;
       onclose: (() => void) | null = null;
@@ -237,6 +322,10 @@ describe('useHeadlessStateSource lifecycle', () => {
       close(): void {
         this.active = false;
         this.onclose?.();
+      }
+
+      open(): void {
+        this.onopen?.();
       }
 
       sendFrame(value: unknown): void {
@@ -320,6 +409,7 @@ describe('useHeadlessStateSource lifecycle', () => {
     expect(FakeWebSocket.instances).toHaveLength(2);
     expect(FakeWebSocket.instances[0]?.active).toBe(false);
     expect(FakeWebSocket.instances.filter((socket) => socket.active)).toHaveLength(1);
+    FakeWebSocket.instances[1]?.open();
     FakeWebSocket.instances[1]?.sendFrame(wireState(1));
     expect(vi.getTimerCount()).toBe(2);
 

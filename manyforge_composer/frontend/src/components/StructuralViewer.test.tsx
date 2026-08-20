@@ -31,6 +31,9 @@ describe('viewer failure isolation', () => {
     expect(source).toContain('<span>Wireframe overlays</span>');
     expect(source).toContain('wireframe={wireframe}');
     expect(source).toContain('depthWrite={!wireframe}');
+    expect(source).toContain(
+      'setViewerQualificationWireframeDefault(DEFAULT_WIREFRAME_VISIBLE)',
+    );
   });
 
   it('wraps native viewer controls instead of clipping them at narrow widths', () => {
@@ -77,5 +80,22 @@ describe('viewer failure isolation', () => {
     expect(source.indexOf('const [pointCloudVisible')).toBeLessThan(
       source.indexOf('{viewerActive && ('),
     );
+  });
+
+  it('keeps qualification observation opt-in and demand-framed', () => {
+    const source = readFileSync(
+      new URL('./StructuralViewer.tsx', import.meta.url),
+      'utf8',
+    );
+
+    expect(source).toContain('Profiler id="manyforge-structural-viewer"');
+    expect(source).toContain('<ViewerPerformanceProbe />');
+    expect(source).toContain('recordViewerRenderFrame(nowMs)');
+    expect(source).toContain('recordViewerRenderWork(');
+    expect(source).toContain('startViewerPerformanceMonitoring()');
+    expect(source).toContain('stopViewerPerformanceMonitoring()');
+    expect(source).toContain('connectViewerQualification()');
+    expect(source).toContain('frameloop="demand"');
+    expect(source).not.toContain('frameloop="always"');
   });
 });

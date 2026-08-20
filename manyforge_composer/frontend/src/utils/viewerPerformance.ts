@@ -63,6 +63,58 @@ export interface ViewerPerformanceSnapshot {
   longTaskMaxMs: number;
 }
 
+export const VIEWER_QUALIFICATION_QUERY_KEY = 'manyforge_viewer_qualification';
+export const VIEWER_QUALIFICATION_GLOBAL = 'manyforgeViewerQualification';
+const VIEWER_QUALIFICATION_SCHEMA = 'manyforge.viewer.qualification.v1';
+const MAX_QUALIFICATION_ERRORS = 16;
+const MAX_QUALIFICATION_ERROR_LENGTH = 240;
+
+export interface ViewerQualificationTransportState {
+  socketPath: '/ws/state';
+  sourceCount: number;
+  activeSockets: number;
+  socketCreations: number;
+  maxActiveSockets: number;
+}
+
+export interface ViewerQualificationStatus {
+  schemaVersion: typeof VIEWER_QUALIFICATION_SCHEMA;
+  viewerActive: boolean;
+  canvasCount: number;
+  wireframeDefault: boolean;
+  wireframeVisible: boolean;
+  model: {
+    ready: boolean;
+    geometryCount: number;
+  };
+  renderer: (ViewerRendererInspection & ViewerPresentationProfile) | null;
+  browser: {
+    userAgent: string;
+    platform: string;
+  };
+  viewport: {
+    width: number;
+    height: number;
+    devicePixelRatio: number;
+  };
+  headless: ViewerQualificationTransportState;
+  errors: string[];
+}
+
+export interface ViewerQualificationSnapshot {
+  schemaVersion: typeof VIEWER_QUALIFICATION_SCHEMA;
+  status: ViewerQualificationStatus;
+  performance: ViewerPerformanceSnapshot;
+}
+
+export interface ViewerQualificationObject {
+  schemaVersion: typeof VIEWER_QUALIFICATION_SCHEMA;
+  status: () => ViewerQualificationStatus;
+  snapshot: () => ViewerQualificationSnapshot;
+  take: () => ViewerQualificationSnapshot;
+  reset: () => void;
+}
+
 /*
  * Browser-local presentation preference retained from source blob
  * 24e7e692df7864293d4572c0ef3fe6e876b9de6f and test blob
@@ -200,72 +252,157 @@ function percentile95(values: number[]): number | null {
 let metrics = newWindow();
 let observer: PerformanceObserver | null = null;
 let monitoring = false;
+let pendingModelBuild: number | null = null;
+let qualificationViewerActive = false;
+let qualificationCanvasMounted = false;
+let qualificationModelReady = false;
+let qualificationGeometryCount = 0;
+let qualificationRenderer:
+  (ViewerRendererInspection & ViewerPresentationProfile) | null = null;
+let qualificationWireframeDefault = false;
+let qualificationTransport: ViewerQualificationTransportState = {
+  socketPath: '/ws/state',
+  sourceCount: 0,
+  activeSockets: 0,
+  socketCreations: 0,
+  maxActiveSockets: 0,
+};
+let qualificationErrors: string[] = [];
 const longTaskSupported = typeof PerformanceObserver !== 'undefined'
   && Array.isArray(PerformanceObserver.supportedEntryTypes)
   && PerformanceObserver.supportedEntryTypes.includes('longtask');
 
-export function startViewerPerformanceMonitoring(): void {
-  if (monitoring) return;
-  monitoring = true;
-  metrics = newWindow();
-  if (!longTaskSupported) return;
-  observer = new PerformanceObserver((entries) => {
-    for (const entry of entries.getEntries()) {
-      metrics.longTasks += 1;
-      metrics.longTaskTotalMs += entry.duration;
-      metrics.longTaskMaxMs = Math.max(metrics.longTaskMaxMs, entry.duration);
-    }
-  });
-  observer.observe({ type: 'longtask', buffered: false });
-}
-
-export function stopViewerPerformanceMonitoring(): void {
-  monitoring = false;
-  observer?.disconnect();
-  observer = null;
-}
-
-export function recordViewerModelBuild(durationMs: number): void {
-  const duration = Math.max(0, durationMs);
-  metrics.modelBuilds += 1;
-  metrics.modelBuildTotalMs += duration;
-  metrics.modelBuildMaxMs = Math.max(metrics.modelBuildMaxMs, duration);
-}
-
-export function recordViewerReactCommit(durationMs: number): void {
-  const duration = Math.max(0, durationMs);
-  metrics.reactCommits += 1;
-  metrics.reactCommitTotalMs += duration;
-  metrics.reactCommitMaxMs = Math.max(metrics.reactCommitMaxMs, duration);
-}
-
-export function recordViewerRenderFrame(nowMs: number): void {
-  metrics.renderedFrames += 1;
-  if (metrics.lastRenderAtMs !== null) {
-    if (metrics.renderIntervalsMs.length >= MAX_RENDER_INTERVAL_SAMPLES) {
-      metrics.renderIntervalsMs.shift();
-    }
-    metrics.renderIntervalsMs.push(Math.max(0, nowMs - metrics.lastRenderAtMs));
+function isViewerQualificationOptedIn(): boolean {
+  if (typeof window === 'undefined') return false;
+  try {
+    const values = new URL(window.location.href).searchParams.getAll(
+      VIEWER_QUALIFICATION_QUERY_KEY,
+    );
+    return values.length === 1 && values[0] === '1';
+  } catch {
+    return false;
   }
-  metrics.lastRenderAtMs = nowMs;
 }
 
-export function recordViewerRenderWork(
-  drawCalls: number,
-  triangles: number,
-  canvasPixels: number,
+export function viewerQualificationOptedIn(): boolean {
+  return isViewerQualificationOptedIn();
+}
+
+function boundedErrorMessage(value: unknown): string {
+  const message = value instanceof Error ? value.message : String(value);
+  return message.slice(0, MAX_QUALIFICATION_ERROR_LENGTH);
+}
+
+export function reportViewerQualificationError(error: unknown): void {
+  if (!isViewerQualificationOptedIn()) return;
+  const message = boundedErrorMessage(error);
+  if (message.length === 0 || qualificationErrors.includes(message)) return;
+  qualificationErrors = [...qualificationErrors, message].slice(0, MAX_QUALIFICATION_ERRORS);
+}
+
+export function setViewerQualificationViewerActive(active: boolean): void {
+  qualificationViewerActive = active;
+}
+
+export function setViewerQualificationCanvasMounted(mounted: boolean): void {
+  qualificationCanvasMounted = mounted;
+}
+
+export function setViewerQualificationModel(
+  ready: boolean,
+  geometryCount: number,
 ): void {
-  metrics.drawCallsMax = Math.max(metrics.drawCallsMax, Math.max(0, Math.trunc(drawCalls)));
-  metrics.trianglesMax = Math.max(metrics.trianglesMax, Math.max(0, Math.trunc(triangles)));
-  metrics.canvasPixelsMax = Math.max(
-    metrics.canvasPixelsMax,
-    Math.max(0, Math.trunc(canvasPixels)),
-  );
+  qualificationModelReady = ready;
+  qualificationGeometryCount = Math.max(0, Math.trunc(geometryCount));
 }
 
-export function takeViewerPerformanceWindow(): ViewerPerformanceSnapshot {
-  const nowMs = performance.now();
-  const result: ViewerPerformanceSnapshot = {
+export function setViewerQualificationRenderer(
+  renderer: (ViewerRendererInspection & ViewerPresentationProfile) | null,
+): void {
+  qualificationRenderer = renderer === null
+    ? null
+    : {
+        ...renderer,
+        vendor: renderer.vendor?.slice(0, 240) ?? null,
+        renderer: renderer.renderer?.slice(0, 240) ?? null,
+      };
+}
+
+export function setViewerQualificationTransport(
+  transport: ViewerQualificationTransportState,
+): void {
+  qualificationTransport = {
+    socketPath: '/ws/state',
+    sourceCount: Math.min(1_000_000, Math.max(0, Math.trunc(transport.sourceCount))),
+    activeSockets: Math.min(1_000_000, Math.max(0, Math.trunc(transport.activeSockets))),
+    socketCreations: Math.min(
+      1_000_000_000,
+      Math.max(0, Math.trunc(transport.socketCreations)),
+    ),
+    maxActiveSockets: Math.min(
+      1_000_000,
+      Math.max(0, Math.trunc(transport.maxActiveSockets)),
+    ),
+  };
+}
+
+function currentQualificationStatus(): ViewerQualificationStatus {
+  const browser = typeof navigator === 'undefined'
+    ? { userAgent: '', platform: '' }
+    : {
+        userAgent: typeof navigator.userAgent === 'string'
+          ? navigator.userAgent.slice(0, 240)
+          : '',
+        platform: typeof navigator.platform === 'string'
+          ? navigator.platform.slice(0, 120)
+          : '',
+      };
+  const canvasCount = typeof document === 'undefined'
+    ? qualificationCanvasMounted ? 1 : 0
+    : document.querySelectorAll('.viewer-stage canvas').length;
+  const viewport = typeof window === 'undefined'
+    ? { width: 0, height: 0, devicePixelRatio: 1 }
+    : {
+        width: Number.isFinite(window.innerWidth)
+          ? Math.max(0, Math.trunc(window.innerWidth))
+          : 0,
+        height: Number.isFinite(window.innerHeight)
+          ? Math.max(0, Math.trunc(window.innerHeight))
+          : 0,
+        devicePixelRatio: Number.isFinite(window.devicePixelRatio)
+          ? window.devicePixelRatio
+          : 1,
+      };
+  return {
+    schemaVersion: VIEWER_QUALIFICATION_SCHEMA,
+    viewerActive: qualificationViewerActive,
+    canvasCount,
+    wireframeDefault: qualificationWireframeDefault,
+    wireframeVisible: qualificationWireframeVisible,
+    model: {
+      ready: qualificationModelReady,
+      geometryCount: qualificationGeometryCount,
+    },
+    renderer: qualificationRenderer === null ? null : { ...qualificationRenderer },
+    browser,
+    viewport,
+    headless: { ...qualificationTransport },
+    errors: [...qualificationErrors],
+  };
+}
+
+let qualificationWireframeVisible = false;
+
+export function setViewerQualificationWireframeDefault(defaultVisible: boolean): void {
+  qualificationWireframeDefault = defaultVisible;
+}
+
+export function setViewerQualificationWireframeVisible(visible: boolean): void {
+  qualificationWireframeVisible = visible;
+}
+
+function performanceSnapshot(nowMs = performance.now()): ViewerPerformanceSnapshot {
+  return {
     windowDurationMs: Math.min(60_000, Math.max(0, nowMs - metrics.startedAtMs)),
     modelBuilds: metrics.modelBuilds,
     modelBuildTotalMs: metrics.modelBuildTotalMs,
@@ -286,6 +423,163 @@ export function takeViewerPerformanceWindow(): ViewerPerformanceSnapshot {
     longTaskTotalMs: metrics.longTaskTotalMs,
     longTaskMaxMs: metrics.longTaskMaxMs,
   };
+}
+
+export function connectViewerQualification(): (() => void) {
+  if (!isViewerQualificationOptedIn() || typeof window === 'undefined') {
+    return () => undefined;
+  }
+  const onError = (event: ErrorEvent) => {
+    const message = event.message || event.error;
+    if (/(canvas|webgl|three|viewer|scene|model|shader)/i.test(String(message))) {
+      reportViewerQualificationError(message);
+    }
+  };
+  const onUnhandledRejection = (event: PromiseRejectionEvent) => {
+    if (/(canvas|webgl|three|viewer|scene|model|shader)/i.test(String(event.reason))) {
+      reportViewerQualificationError(event.reason);
+    }
+  };
+  const originalConsoleError = console.error;
+  const onConsoleError = (...values: unknown[]) => {
+    const message = values.map((value) => String(value)).join(' ');
+    if (/(canvas|webgl|three|viewer|scene|model|shader)/i.test(message)) {
+      reportViewerQualificationError(message);
+    }
+    originalConsoleError(...values);
+  };
+  window.addEventListener('error', onError);
+  window.addEventListener('unhandledrejection', onUnhandledRejection);
+  console.error = onConsoleError;
+  const qualification: ViewerQualificationObject = Object.freeze({
+    schemaVersion: VIEWER_QUALIFICATION_SCHEMA,
+    status: currentQualificationStatus,
+    snapshot: (): ViewerQualificationSnapshot => ({
+      schemaVersion: VIEWER_QUALIFICATION_SCHEMA,
+      status: currentQualificationStatus(),
+      performance: performanceSnapshot(),
+    }),
+    take: (): ViewerQualificationSnapshot => {
+      const nowMs = performance.now();
+      const result: ViewerQualificationSnapshot = {
+        schemaVersion: VIEWER_QUALIFICATION_SCHEMA,
+        status: currentQualificationStatus(),
+        performance: performanceSnapshot(nowMs),
+      };
+      metrics = newWindow(nowMs);
+      return result;
+    },
+    reset: () => {
+      metrics = newWindow();
+    },
+  });
+  Object.defineProperty(window, VIEWER_QUALIFICATION_GLOBAL, {
+    configurable: true,
+    enumerable: false,
+    writable: false,
+    value: qualification,
+  });
+  return () => {
+    window.removeEventListener('error', onError);
+    window.removeEventListener('unhandledrejection', onUnhandledRejection);
+    if (console.error === onConsoleError) console.error = originalConsoleError;
+    const windowValues = window as unknown as Window & Record<string, unknown>;
+    if (windowValues[VIEWER_QUALIFICATION_GLOBAL] === qualification) {
+      delete windowValues[VIEWER_QUALIFICATION_GLOBAL];
+    }
+  };
+}
+
+export function startViewerPerformanceMonitoring(): void {
+  if (monitoring) return;
+  monitoring = true;
+  const retainedModelBuild = metrics.modelBuilds > 0
+    ? {
+        count: metrics.modelBuilds,
+        totalMs: metrics.modelBuildTotalMs,
+        maxMs: metrics.modelBuildMaxMs,
+      }
+    : null;
+  metrics = newWindow();
+  if (retainedModelBuild !== null) {
+    metrics.modelBuilds = retainedModelBuild.count;
+    metrics.modelBuildTotalMs = retainedModelBuild.totalMs;
+    metrics.modelBuildMaxMs = retainedModelBuild.maxMs;
+  } else if (pendingModelBuild !== null) {
+    metrics.modelBuilds = 1;
+    metrics.modelBuildTotalMs = pendingModelBuild;
+    metrics.modelBuildMaxMs = pendingModelBuild;
+    pendingModelBuild = null;
+  }
+  if (!longTaskSupported) return;
+  observer = new PerformanceObserver((entries) => {
+    for (const entry of entries.getEntries()) {
+      metrics.longTasks += 1;
+      metrics.longTaskTotalMs += entry.duration;
+      metrics.longTaskMaxMs = Math.max(metrics.longTaskMaxMs, entry.duration);
+    }
+  });
+  observer.observe({ type: 'longtask', buffered: false });
+}
+
+export function stopViewerPerformanceMonitoring(): void {
+  monitoring = false;
+  observer?.disconnect();
+  observer = null;
+}
+
+export function recordViewerModelBuild(durationMs: number): void {
+  const duration = Math.min(60_000, Math.max(0, durationMs));
+  if (!monitoring) {
+    pendingModelBuild = duration;
+    return;
+  }
+  metrics.modelBuilds += 1;
+  metrics.modelBuildTotalMs += duration;
+  metrics.modelBuildMaxMs = Math.max(metrics.modelBuildMaxMs, duration);
+}
+
+export function recordViewerReactCommit(durationMs: number): void {
+  if (!monitoring) return;
+  const duration = Math.min(60_000, Math.max(0, durationMs));
+  metrics.reactCommits += 1;
+  metrics.reactCommitTotalMs += duration;
+  metrics.reactCommitMaxMs = Math.max(metrics.reactCommitMaxMs, duration);
+}
+
+export function recordViewerRenderFrame(nowMs: number): void {
+  if (!monitoring) return;
+  metrics.renderedFrames += 1;
+  if (metrics.lastRenderAtMs !== null) {
+    if (metrics.renderIntervalsMs.length >= MAX_RENDER_INTERVAL_SAMPLES) {
+      metrics.renderIntervalsMs.shift();
+    }
+    metrics.renderIntervalsMs.push(Math.max(0, nowMs - metrics.lastRenderAtMs));
+  }
+  metrics.lastRenderAtMs = nowMs;
+}
+
+export function recordViewerRenderWork(
+  drawCalls: number,
+  triangles: number,
+  canvasPixels: number,
+): void {
+  if (!monitoring) return;
+  metrics.drawCallsMax = Math.max(metrics.drawCallsMax, Math.max(0, Math.trunc(drawCalls)));
+  metrics.trianglesMax = Math.max(metrics.trianglesMax, Math.max(0, Math.trunc(triangles)));
+  metrics.canvasPixelsMax = Math.max(
+    metrics.canvasPixelsMax,
+    Math.max(0, Math.trunc(canvasPixels)),
+  );
+}
+
+export function takeViewerPerformanceWindow(): ViewerPerformanceSnapshot {
+  const nowMs = performance.now();
+  const result = performanceSnapshot(nowMs);
   metrics = newWindow(nowMs);
   return result;
+}
+
+export function peekViewerPerformanceWindow(): ViewerPerformanceSnapshot {
+  return performanceSnapshot();
 }

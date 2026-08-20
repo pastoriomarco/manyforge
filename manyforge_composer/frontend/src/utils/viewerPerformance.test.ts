@@ -1,5 +1,8 @@
-import { afterEach, describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import {
+  VIEWER_QUALIFICATION_GLOBAL,
+  VIEWER_QUALIFICATION_QUERY_KEY,
+  connectViewerQualification,
   getAutomaticViewerRateHz,
   getViewerRatePreferenceHz,
   isSoftwareRenderer,
@@ -19,6 +22,7 @@ describe('viewer presentation and performance', () => {
   afterEach(() => {
     stopViewerPerformanceMonitoring();
     setViewerRatePreferenceHz(null);
+    vi.unstubAllGlobals();
   });
 
   it('selects a bounded software or hardware presentation profile', () => {
@@ -76,5 +80,56 @@ describe('viewer presentation and performance', () => {
     setViewerRatePreferenceHz(null);
     expect(getViewerRatePreferenceHz()).toBeNull();
     expect(notifications).toBe(1);
+  });
+
+  it('installs one frozen qualification object only for the exact URL opt-in', () => {
+    const fakeWindow = {
+      location: { href: `http://composer.test/?${VIEWER_QUALIFICATION_QUERY_KEY}=1` },
+      addEventListener: vi.fn(),
+      removeEventListener: vi.fn(),
+    } as unknown as Window & Record<string, unknown>;
+    vi.stubGlobal('window', fakeWindow);
+
+    const disconnect = connectViewerQualification();
+    const qualification = fakeWindow[VIEWER_QUALIFICATION_GLOBAL] as {
+      schemaVersion: string;
+      status: () => unknown;
+      snapshot: () => unknown;
+      take: () => unknown;
+      reset: () => void;
+    };
+    expect(qualification.schemaVersion).toBe('manyforge.viewer.qualification.v1');
+    expect(Object.isFrozen(qualification)).toBe(true);
+    expect(qualification.status()).toEqual(
+      expect.objectContaining({
+        wireframeDefault: false,
+        canvasCount: 0,
+      }),
+    );
+    expect(qualification.snapshot()).toEqual(
+      expect.objectContaining({
+        schemaVersion: 'manyforge.viewer.qualification.v1',
+        performance: expect.any(Object),
+      }),
+    );
+    qualification.reset();
+    disconnect();
+    expect(fakeWindow[VIEWER_QUALIFICATION_GLOBAL]).toBeUndefined();
+
+    vi.stubGlobal(
+      'window',
+      {
+        location: {
+          href: `http://composer.test/?${VIEWER_QUALIFICATION_QUERY_KEY}=1&${VIEWER_QUALIFICATION_QUERY_KEY}=1`,
+        },
+        addEventListener: vi.fn(),
+        removeEventListener: vi.fn(),
+      },
+    );
+    const noDuplicateOptIn = connectViewerQualification();
+    expect((window as unknown as Record<string, unknown>)[
+      VIEWER_QUALIFICATION_GLOBAL
+    ]).toBeUndefined();
+    noDuplicateOptIn();
   });
 });

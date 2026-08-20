@@ -1,5 +1,6 @@
 import {
   Component,
+  Profiler,
   Suspense,
   useCallback,
   useEffect,
@@ -62,7 +63,22 @@ import {
 } from '../utils/viewerCamera';
 import {
   inspectViewerRenderer,
+  connectViewerQualification,
+  recordViewerModelBuild,
+  recordViewerReactCommit,
+  recordViewerRenderFrame,
+  recordViewerRenderWork,
   selectViewerPresentationProfile,
+  setViewerQualificationCanvasMounted,
+  setViewerQualificationModel,
+  setViewerQualificationRenderer,
+  setViewerQualificationWireframeDefault,
+  setViewerQualificationViewerActive,
+  setViewerQualificationWireframeVisible,
+  startViewerPerformanceMonitoring,
+  stopViewerPerformanceMonitoring,
+  reportViewerQualificationError,
+  viewerQualificationOptedIn,
   type ViewerPresentationProfile,
   type ViewerRendererInspection,
 } from '../utils/viewerPerformance';
@@ -119,6 +135,7 @@ export class ViewerFailureBoundary extends Component<
 
   componentDidCatch(error: Error, info: ErrorInfo): void {
     console.error('Scene authoring viewport failed:', error, info.componentStack);
+    reportViewerQualificationError(error);
   }
 
   render(): ReactNode {
@@ -547,10 +564,24 @@ function RobotCollision({ collision }: { collision: SceneUrdfCollision }) {
 function RetainedNeutralModel({
   manifest,
   collisionsVisible,
+  materializationStartedAtMs,
+  onMaterialized,
 }: {
   manifest: SceneUrdfManifest;
   collisionsVisible: boolean;
+  materializationStartedAtMs: { current: number | null };
+  onMaterialized: (durationMs: number) => void;
 }) {
+  const reported = useRef(false);
+  // This is one browser-local wall-clock interval from renderer creation to
+  // the post-commit effect after Suspense resolves; it is not a backend
+  // materialization duration.
+  useEffect(() => {
+    const startedAtMs = materializationStartedAtMs.current;
+    if (reported.current || startedAtMs === null) return;
+    reported.current = true;
+    onMaterialized(Math.max(0, performance.now() - startedAtMs));
+  }, [materializationStartedAtMs, onMaterialized]);
   return (
     <group name="authored-neutral-urdf">
       {manifest.links.map((link) => (
@@ -955,6 +986,41 @@ function PointCloudPoints({ frame }: { frame: PointCloudFrame }) {
   );
 }
 
+function ViewerPerformanceProbe() {
+  useFrame(({ gl }) => {
+    const nowMs = performance.now();
+    recordViewerRenderFrame(nowMs);
+    recordViewerRenderWork(
+      gl.info.render.calls,
+      gl.info.render.triangles,
+      gl.domElement.width * gl.domElement.height,
+    );
+  });
+  return null;
+}
+
+function ViewerQualificationProfiler({
+  enabled,
+  onRender,
+  children,
+}: {
+  enabled: boolean;
+  onRender: (
+    id: string,
+    phase: 'mount' | 'update' | 'nested-update',
+    actualDuration: number,
+  ) => void;
+  children: ReactNode;
+}) {
+  if (!enabled) return <>{children}</>;
+  return (
+    <Profiler id="manyforge-structural-viewer" onRender={onRender}>
+      <ViewerPerformanceProbe />
+      {children}
+    </Profiler>
+  );
+}
+
 interface RetainedCameraPresentation {
   camera: ViewerCamera;
   framed: boolean;
@@ -1009,6 +1075,8 @@ function ViewerCanvas({
   viewer,
   initialCameraPresentation,
   onCaptureCameraPresentation,
+  onModelMaterialized,
+  onViewerCommit,
 }: {
   manifest: SceneUrdfManifest | null;
   collisionsVisible: boolean;
@@ -1029,6 +1097,12 @@ function ViewerCanvas({
   onCaptureCameraPresentation: (
     presentation: RetainedCameraPresentation,
   ) => void;
+  onModelMaterialized: (durationMs: number) => void;
+  onViewerCommit: (
+    id: string,
+    phase: 'mount' | 'update' | 'nested-update',
+    actualDuration: number,
+  ) => void;
 }) {
   const devicePixelRatio = typeof window === 'undefined'
     ? 1
@@ -1042,10 +1116,20 @@ function ViewerCanvas({
     ...selectViewerPresentationProfile(false, devicePixelRatio),
   }));
   const selectedCamera = initialCameraPresentation.camera;
+  const qualificationEnabled = viewerQualificationOptedIn();
+  const materializationStartedAtMs = useRef<number | null>(null);
   const latestFrameAppliers = useMemo(() => new Set<() => void>(), []);
   const applyLatestFrame = useCallback(() => {
     for (const apply of latestFrameAppliers) apply();
   }, [latestFrameAppliers]);
+
+  useEffect(() => {
+    setViewerQualificationCanvasMounted(true);
+    return () => {
+      setViewerQualificationCanvasMounted(false);
+      setViewerQualificationRenderer(null);
+    };
+  }, []);
 
   return (
     <Canvas
@@ -1059,11 +1143,15 @@ function ViewerCanvas({
         preserveDrawingBuffer: renderer.preserveDrawingBuffer,
       }}
       onCreated={({ gl }) => {
+        if (qualificationEnabled && materializationStartedAtMs.current === null) {
+          materializationStartedAtMs.current = performance.now();
+        }
         const inspection = inspectViewerRenderer(gl);
         const presentation = selectViewerPresentationProfile(
           inspection.software,
           devicePixelRatio,
         );
+        setViewerQualificationRenderer({ ...inspection, ...presentation });
         setRenderer((current) => {
           const next = { ...inspection, ...presentation };
           return JSON.stringify(current) === JSON.stringify(next) ? current : next;
@@ -1072,6 +1160,10 @@ function ViewerCanvas({
       style={{ background: '#081019' }}
       onPointerMissed={() => onSelectSceneResource(null)}
     >
+      <ViewerQualificationProfiler
+        enabled={qualificationEnabled}
+        onRender={onViewerCommit}
+      >
       <color attach="background" args={['#081019']} />
       <PerspectiveCamera
         makeDefault
@@ -1126,6 +1218,8 @@ function ViewerCanvas({
               <RetainedNeutralModel
                 manifest={manifest}
                 collisionsVisible={collisionsVisible}
+                materializationStartedAtMs={materializationStartedAtMs}
+                onMaterialized={onModelMaterialized}
               />
               {runtimePresentation?.measuredRobot !== null
                 && runtimePresentation?.measuredRobot !== undefined && (
@@ -1183,6 +1277,7 @@ function ViewerCanvas({
           applyLatestFrame={applyLatestFrame}
         />
       )}
+      </ViewerQualificationProfiler>
     </Canvas>
   );
 }
@@ -1266,6 +1361,42 @@ function StructuralViewerContent({
     ) ?? 0)
     + (runtimePresentation?.measuredTcp === null
       || runtimePresentation?.measuredTcp === undefined ? 0 : 1);
+  const canvasDemandActive = viewerActive && (
+    visibleGeometryCount > 0
+    || viewerFrameIdentity !== undefined
+    || pointCloudEnabled
+  );
+  const reportModelMaterialized = useCallback((durationMs: number) => {
+    recordViewerModelBuild(durationMs);
+  }, []);
+  const reportAssetError = useCallback((error: Error) => {
+    reportViewerQualificationError(error);
+    setAssetError(error);
+  }, []);
+  const reportViewerCommit = useCallback((
+    _id: string,
+    _phase: 'mount' | 'update' | 'nested-update',
+    actualDuration: number,
+  ) => {
+    recordViewerReactCommit(actualDuration);
+  }, []);
+
+  useEffect(() => {
+    setViewerQualificationViewerActive(viewerActive);
+    setViewerQualificationWireframeVisible(wireframeVisible);
+    if (canvasDemandActive && viewerQualificationOptedIn()) {
+      startViewerPerformanceMonitoring();
+    } else {
+      stopViewerPerformanceMonitoring();
+    }
+    return () => stopViewerPerformanceMonitoring();
+  }, [canvasDemandActive, viewerActive, wireframeVisible]);
+  useEffect(() => {
+    setViewerQualificationModel(
+      manifest.status === 'ready' && visibleGeometryCount > 0,
+      visibleGeometryCount,
+    );
+  }, [manifest.status, visibleGeometryCount]);
 
   const retry = () => {
     if (manifest.status === 'ready') {
@@ -1334,24 +1465,26 @@ function StructuralViewerContent({
           || pointCloudEnabled
         ) && (
           <ViewerCanvas
-            key={`${manifest.status === 'ready' ? manifest.data.model_key : 'no-structural-model'}:${sceneOwnerIdentity?.ownerEpoch ?? 'no-scene-owner'}`}
-            manifest={manifest.status === 'ready' ? manifest.data : null}
-            collisionsVisible={collisionsVisible}
-            wireframeVisible={wireframeVisible}
-            onAssetError={setAssetError}
-            camera={camera}
-            sceneObjects={sceneObjects}
-            selectedSceneResourceId={selectedSceneResourceId}
-            onSelectSceneResource={onSelectSceneResource}
-            candidateTcpPose={candidateTcpPose}
-            candidateStale={candidateStale}
-            runtimePresentation={runtimePresentation}
-            sceneOwnerIdentity={sceneOwnerIdentity}
-            viewerFrameIdentity={viewerFrameIdentity}
-            pointCloudFrame={pointCloud.frame}
-            viewer={viewer}
-            initialCameraPresentation={cameraPresentation}
-            onCaptureCameraPresentation={captureCameraPresentation}
+              key={`${manifest.status === 'ready' ? manifest.data.model_key : 'no-structural-model'}:${sceneOwnerIdentity?.ownerEpoch ?? 'no-scene-owner'}`}
+              manifest={manifest.status === 'ready' ? manifest.data : null}
+              collisionsVisible={collisionsVisible}
+              wireframeVisible={wireframeVisible}
+              onAssetError={reportAssetError}
+              camera={camera}
+              sceneObjects={sceneObjects}
+              selectedSceneResourceId={selectedSceneResourceId}
+              onSelectSceneResource={onSelectSceneResource}
+              candidateTcpPose={candidateTcpPose}
+              candidateStale={candidateStale}
+              runtimePresentation={runtimePresentation}
+              sceneOwnerIdentity={sceneOwnerIdentity}
+              viewerFrameIdentity={viewerFrameIdentity}
+              pointCloudFrame={pointCloud.frame}
+              viewer={viewer}
+              initialCameraPresentation={cameraPresentation}
+              onCaptureCameraPresentation={captureCameraPresentation}
+              onModelMaterialized={reportModelMaterialized}
+              onViewerCommit={reportViewerCommit}
           />
         )}
 
@@ -1451,6 +1584,10 @@ function StructuralViewerContent({
 
 export function StructuralViewer(props: StructuralViewerProps) {
   const [recoveryGeneration, setRecoveryGeneration] = useState(0);
+  useEffect(() => {
+    setViewerQualificationWireframeDefault(DEFAULT_WIREFRAME_VISIBLE);
+    return connectViewerQualification();
+  }, []);
   const retry = () => {
     setRecoveryGeneration((current) => current + 1);
     props.onRetry();

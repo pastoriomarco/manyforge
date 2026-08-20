@@ -2,6 +2,10 @@ import { useEffect, useRef, useState, useSyncExternalStore } from 'react';
 import { resolveStructuralAssetUrl } from '../api/client';
 import { parseComposerHeadlessState } from '../api/parsers';
 import type { ComposerHeadlessState } from '../types/headless';
+import {
+  setViewerQualificationTransport,
+  type ViewerQualificationTransportState,
+} from '../utils/viewerPerformance';
 
 const RECONNECT_DELAY_MS = 1000;
 export const HEADLESS_SHELL_PUBLICATION_MS = 100;
@@ -92,6 +96,38 @@ function websocketUrl(): string {
 
 type Listener = () => void;
 
+interface HeadlessSourceQualificationRecord {
+  enabled: boolean;
+  disposed: boolean;
+  socketActive: boolean;
+}
+
+const headlessSourceRecords = new Set<HeadlessSourceQualificationRecord>();
+let headlessSocketCreations = 0;
+let headlessMaxActiveSockets = 0;
+
+function headlessQualificationSnapshot(): ViewerQualificationTransportState {
+  const activeSources = [...headlessSourceRecords].filter(
+    (record) => record.enabled && !record.disposed,
+  );
+  const activeSockets = activeSources.filter((record) => record.socketActive).length;
+  return {
+    socketPath: '/ws/state',
+    sourceCount: activeSources.length,
+    activeSockets,
+    socketCreations: headlessSocketCreations,
+    maxActiveSockets: headlessMaxActiveSockets,
+  };
+}
+
+function publishHeadlessQualification(): void {
+  setViewerQualificationTransport(headlessQualificationSnapshot());
+}
+
+export function getHeadlessStateQualificationSnapshot(): ViewerQualificationTransportState {
+  return headlessQualificationSnapshot();
+}
+
 /**
  * One transport and two bounded delivery lanes for copied owner facts.
  * This source performs parsing, admission, and scheduling only.
@@ -108,10 +144,17 @@ export class HeadlessStateSource {
   private latestError: string | null = null;
   private shellResult: HeadlessStateResult;
   private viewerResult: HeadlessStateResult;
+  private readonly qualificationRecord: HeadlessSourceQualificationRecord = {
+    enabled: false,
+    disposed: false,
+    socketActive: false,
+  };
   private readonly shellListeners = new Set<Listener>();
   private readonly viewerListeners = new Set<Listener>();
 
   constructor() {
+    headlessSourceRecords.add(this.qualificationRecord);
+    publishHeadlessQualification();
     this.shellResult = { snapshot: null, error: null, reconnect: this.reconnect };
     this.viewerResult = this.shellResult;
   }
@@ -132,6 +175,7 @@ export class HeadlessStateSource {
   setEnabled(enabled: boolean): void {
     if (this.disposed || enabled === this.enabled) return;
     this.enabled = enabled;
+    this.qualificationRecord.enabled = enabled;
     this.stopConnection('Composer headless source disabled');
     this.cancelPublications();
     this.latest = null;
@@ -141,6 +185,7 @@ export class HeadlessStateSource {
     } else {
       this.publishImmediate(null);
     }
+    publishHeadlessQualification();
   }
 
   readonly reconnect = (): void => {
@@ -152,10 +197,13 @@ export class HeadlessStateSource {
   dispose(): void {
     this.disposed = true;
     this.enabled = false;
+    this.qualificationRecord.enabled = false;
     this.stopConnection('Composer client unmounted');
     this.cancelPublications();
     this.shellListeners.clear();
     this.viewerListeners.clear();
+    headlessSourceRecords.delete(this.qualificationRecord);
+    publishHeadlessQualification();
   }
 
   private stopConnection(reason: string): void {
@@ -164,6 +212,10 @@ export class HeadlessStateSource {
     this.reconnectTimer = null;
     const socket = this.socket;
     this.socket = null;
+    if (socket !== null) {
+      this.qualificationRecord.socketActive = false;
+      publishHeadlessQualification();
+    }
     socket?.close(1000, reason);
   }
 
@@ -172,6 +224,20 @@ export class HeadlessStateSource {
     const serial = ++this.serial;
     const socket = new WebSocket(websocketUrl());
     this.socket = socket;
+    headlessSocketCreations += 1;
+    publishHeadlessQualification();
+    socket.onopen = () => {
+      if (
+        serial !== this.serial
+        || this.socket !== socket
+        || !this.enabled
+        || this.disposed
+      ) return;
+      this.qualificationRecord.socketActive = true;
+      const activeSockets = headlessQualificationSnapshot().activeSockets;
+      headlessMaxActiveSockets = Math.max(headlessMaxActiveSockets, activeSockets);
+      publishHeadlessQualification();
+    };
     socket.onmessage = (message) => {
       if (serial !== this.serial) return;
       try {
@@ -220,11 +286,18 @@ export class HeadlessStateSource {
       }
     };
     socket.onerror = () => {
-      if (serial === this.serial) this.publishError('Headless WebSocket transport failed.');
+      if (serial !== this.serial || this.socket !== socket) return;
+      this.qualificationRecord.socketActive = false;
+      publishHeadlessQualification();
+      this.publishError('Headless WebSocket transport failed.');
     };
     socket.onclose = () => {
       if (serial !== this.serial || !this.enabled || this.disposed) return;
-      this.socket = null;
+      if (this.socket === socket) {
+        this.socket = null;
+        this.qualificationRecord.socketActive = false;
+        publishHeadlessQualification();
+      }
       if (this.latestError === null) {
         this.publishError('Headless projection disconnected.');
       }
