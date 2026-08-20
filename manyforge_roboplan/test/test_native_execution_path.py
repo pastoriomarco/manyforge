@@ -231,6 +231,24 @@ def _qualify_native_cclc_product(
             label=intent_kind,
         )
 
+    _submit_native_cclc_routes(execution_root, owner_epoch)
+
+
+def _submit_native_cclc_routes(
+    execution_root: Path,
+    owner_epoch: str,
+    *,
+    request_prefix: str = "process.route",
+) -> None:
+    client = CCLCOpenRequestClient(execution_root, timeout_seconds=5.0)
+
+    def context(request_id: str) -> dict[str, Any]:
+        return {
+            "request_id": request_id,
+            "request_owner_epoch": owner_epoch,
+            "source_label": "native-process-qualification",
+        }
+
     template_set = client.route_templates("lite6_arm")
     domain_ids = sorted(
         row["desired_configuration"]["control_domain_id"]
@@ -250,7 +268,7 @@ def _qualify_native_cclc_product(
         )
         result = client.submit_route(
             {
-                "request_context": context(f"process.route.{domain_id}"),
+                "request_context": context(f"{request_prefix}.{domain_id}"),
                 "expected_retained_bundle_id": template_set[
                     "retained_bundle_id"
                 ],
@@ -287,6 +305,19 @@ def _qualify_native_cclc_product(
         )
 
 
+def _wait_for_cclc_component(execution_root: Path) -> dict[str, Any]:
+    client = CCLCOpenRequestClient(execution_root, timeout_seconds=1.0)
+    deadline = time.monotonic() + 10.0
+    last_error = ""
+    while time.monotonic() < deadline:
+        try:
+            return client.component_snapshot("lite6_arm")
+        except HeadlessApiError as error:
+            last_error = f"{error.code}: {error}"
+        time.sleep(0.01)
+    raise RuntimeError(f"native CCLC socket did not become ready: {last_error}")
+
+
 def _start_host(
     fixture_root: Path,
     execution_root: Path,
@@ -296,6 +327,7 @@ def _start_host(
     candidate_worker: Path | None = None,
     fake_worker_marker: Path | None = None,
     host_environment: str = "MANYFORGE_NATIVE_EXECUTION_HOST",
+    qualify_cclc: bool = True,
 ) -> subprocess.Popen[bytes]:
     environment = os.environ.copy()
     if fake_worker_marker is not None:
@@ -343,7 +375,7 @@ def _start_host(
         try:
             response = client.status()
             if response.get("ok") is True:
-                if manifest.get("cclc_product") is True:
+                if manifest.get("cclc_product") is True and qualify_cclc:
                     try:
                         _qualify_native_cclc_product(
                             execution_root,
@@ -2155,6 +2187,7 @@ def test_planning_stop_and_active_host_replacement_are_bounded(
 
     try:
         first_epoch = headless.execution_status()["status"]["owner_epoch"]
+        cclc_before_loss = _wait_for_cclc_component(execution_root)
         planning_acceptance = _runner_submission(
             runner,
             request_id="planning-stop-operation",
@@ -2212,7 +2245,8 @@ def test_planning_stop_and_active_host_replacement_are_bounded(
         orphan_id = orphan_acceptance["accepted"]["operation_id"]
         _wait_state(runner, orphan_id, {"planning"})
         assert marker.exists()
-        _stop_host(process)
+        process.kill()
+        process.wait(timeout=5.0)
 
         process = _start_host(
             fixture_root,
@@ -2221,9 +2255,52 @@ def test_planning_stop_and_active_host_replacement_are_bounded(
             manifest,
             candidate_worker=fake_worker,
             fake_worker_marker=marker,
+            qualify_cclc=False,
         )
         restarted = headless.execution_status()["status"]
         assert restarted["owner_epoch"] != first_epoch
+        cclc_after_loss = _wait_for_cclc_component(execution_root)
+        assert cclc_after_loss["component_lifecycle_state"] == "active"
+        assert (
+            cclc_after_loss["component_lifecycle_generation"]
+            == cclc_before_loss["component_lifecycle_generation"]
+        )
+        assert [
+            (
+                domain["control_domain_id"],
+                domain["current_control_bindings"],
+                domain["active_control_configuration"],
+            )
+            for domain in cclc_after_loss["domains"]
+        ] == [
+            (
+                domain["control_domain_id"],
+                domain["current_control_bindings"],
+                domain["active_control_configuration"],
+            )
+            for domain in cclc_before_loss["domains"]
+        ]
+        provider_epochs_before = {
+            (
+                row["control_domain_id"],
+                row["provider_instance_id"],
+                row["provider_runtime_unit_id"],
+            ): row["provider_runtime_epoch"]
+            for row in cclc_before_loss["provider_occurrences"]
+        }
+        provider_epochs_after = {
+            (
+                row["control_domain_id"],
+                row["provider_instance_id"],
+                row["provider_runtime_unit_id"],
+            ): row["provider_runtime_epoch"]
+            for row in cclc_after_loss["provider_occurrences"]
+        }
+        assert provider_epochs_after.keys() == provider_epochs_before.keys()
+        assert all(
+            provider_epochs_after[unit] != epoch
+            for unit, epoch in provider_epochs_before.items()
+        )
         orphan = runner.operation(orphan_id)["operation"]
         assert orphan["state"] == "intervention_required"
         terminal_error = orphan["participants"][0]["terminal_error"]
@@ -2242,6 +2319,41 @@ def test_planning_stop_and_active_host_replacement_are_bounded(
         with pytest.raises(HeadlessApiError) as stale_events:
             native.events(first_epoch, 0)
         assert stale_events.value.code == "operation_journal_owner_epoch_stale"
+
+        # Recovery retained lifecycle and route truth without replaying either
+        # lifecycle intent. The prior request epoch remains fenced, while one
+        # explicit fresh complete-domain route transaction is accepted.
+        cclc = CCLCOpenRequestClient(execution_root, timeout_seconds=5.0)
+        templates = cclc.route_templates("lite6_arm")
+        stale_template = templates["templates"][0]
+        with pytest.raises(HeadlessApiError):
+            cclc.submit_route(
+                {
+                    "request_context": {
+                        "request_id": "process.route.stale-owner",
+                        "request_owner_epoch": first_epoch,
+                        "source_label": "native-process-qualification",
+                    },
+                    "expected_retained_bundle_id": templates[
+                        "retained_bundle_id"
+                    ],
+                    "expected_graph_revision": templates["graph_revision"],
+                    "desired_configuration": stale_template[
+                        "desired_configuration"
+                    ],
+                    "expected_active_control_configuration": stale_template[
+                        "expected_active_control_configuration"
+                    ],
+                    "component_expectations": stale_template[
+                        "component_expectations"
+                    ],
+                }
+            )
+        _submit_native_cclc_routes(
+            execution_root,
+            restarted["owner_epoch"],
+            request_prefix="process.route.after-child-sigkill",
+        )
 
         # The new owner adopted the exact durable route, proved current
         # quiescence/no-live-goal without a command, released only those

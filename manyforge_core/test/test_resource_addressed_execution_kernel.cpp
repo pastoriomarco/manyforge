@@ -1854,6 +1854,62 @@ FakeOperationJournal default_journal;
   return std::move(sealed.value());
 }
 
+[[nodiscard]] RuntimeParticipantBinding same_owner_control_binding_sibling(
+    const RuntimeParticipantBinding& source) {
+  auto value = source.value();
+  value.program_revision = ProgramRevision(test_digest('2'));
+  value.program_binding_id = ProgramBindingId(test_digest('3'));
+  value.capability_id = CapabilityId("execution.trajectory.sibling");
+  value.capability_definition_revision = CapabilityDefinitionRevision(test_digest('4'));
+  auto& control = *value.control_path;
+  control.control_binding_id = ControlBindingId("binding.arm.sibling");
+  control.control_binding_revision = ControlBindingRevision(test_digest('5'));
+  control.control_route_id = ControlRouteId("route.native.sibling");
+  if (control.runtime_scale_qualification.has_value()) {
+    control.runtime_scale_qualification->control_route_id = control.control_route_id;
+  }
+  auto sealed = verify_runtime_participant_binding(std::move(value));
+  if (!sealed.ok()) {
+    throw std::logic_error(sealed.error().message);
+  }
+  return std::move(sealed.value());
+}
+
+[[nodiscard]] RuntimeParticipantBinding indexed_same_owner_control_binding_sibling(
+    const RuntimeParticipantBinding& source, const std::size_t index) {
+  auto value = same_owner_control_binding_sibling(source).value();
+  const auto suffix = std::to_string(index);
+  value.program_binding_id = ProgramBindingId("program-binding.sibling." + suffix);
+  value.capability_id = CapabilityId("execution.trajectory.sibling." + suffix);
+  auto& control = *value.control_path;
+  control.control_binding_id = ControlBindingId("binding.arm.sibling." + suffix);
+  control.control_route_id = ControlRouteId("route.native.sibling." + suffix);
+  if (control.runtime_scale_qualification.has_value()) {
+    control.runtime_scale_qualification->control_route_id = control.control_route_id;
+  }
+  auto sealed = verify_runtime_participant_binding(std::move(value));
+  if (!sealed.ok()) {
+    throw std::logic_error(sealed.error().message);
+  }
+  return std::move(sealed.value());
+}
+
+[[nodiscard]] ActiveControlConfigurationDTO route_configuration_for(
+    const RuntimeParticipantExecutionRegistration& source,
+    const RuntimeParticipantBinding& sibling) {
+  auto result = route_configuration_for(source);
+  const auto& sibling_path = *sibling.value().control_path;
+  result.binding_routes.push_back(
+      {sibling_path.control_binding_id, sibling_path.control_binding_revision,
+       sibling_path.control_route_id});
+  std::sort(result.binding_routes.begin(), result.binding_routes.end(),
+            CanonicalActiveControlConfigurationBindingRouteLess);
+  if (!result.locally_valid()) {
+    throw std::logic_error("test sibling route configuration is invalid");
+  }
+  return result;
+}
+
 [[nodiscard]] RuntimeParticipantBinding with_planner_capability(
     const RuntimeParticipantBinding& source, std::string capability_id) {
   const auto* definition = find_builtin_capability_definition(capability_id);
@@ -6599,6 +6655,197 @@ TEST(ResourceAddressedExecutionKernelTest,
   }
 
   EXPECT_EQ(std::count(journal.calls.begin(), journal.calls.end(), "owner_closed"), 0);
+}
+
+TEST(ResourceAddressedExecutionKernelTest,
+     OrphanRecoveryAcceptsEveryRoutedBindingOfOnePhysicalResourceOwner) {
+  FakeClock clock;
+  FakeParticipantEngine engine;
+  FakeOperationJournal journal;
+  const auto source =
+      make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular);
+  const auto sibling = same_owner_control_binding_sibling(source);
+  const auto source_registration = registration(source, engine);
+  const auto configuration = route_configuration_for(source_registration, sibling);
+  journal.recovery =
+      OperationJournalRecoveryDTO{{}, {}, RequestOwnerEpoch("kernel.epoch.old"),
+                                  {ResourceId("robot.joint_1")}};
+
+  ResourceAddressedExecutionKernel kernel(
+      {unqualified_registration(source, engine), unqualified_registration(sibling, engine)}, clock,
+      journal, {RequestOwnerEpoch("kernel.epoch.new"), CellId("cell.test"), 16U});
+  const auto adopted = kernel.adopt_runtime_route_configuration_predecessor(
+      configuration,
+      {unqualified_registration(source, engine), unqualified_registration(sibling, engine)});
+  ASSERT_TRUE(adopted.ok()) << adopted.error().message;
+  const auto before = kernel.resource_table_snapshot();
+  const auto facts =
+      orphan_reconciliation_facts(RequestOwnerEpoch("kernel.epoch.new"), CellId("cell.test"),
+                                  before.operation_resource_generation, {source},
+                                  {ResourceId("robot.joint_1")}, clock.now());
+
+  const auto reconciled = kernel.reconcile_orphaned_resources(facts);
+  ASSERT_TRUE(reconciled.ok()) << reconciled.error().message;
+  EXPECT_TRUE(reconciled.value().remaining_unreconciled_resources.empty());
+  EXPECT_EQ(reconciled.value().operation_resource_generation,
+            before.operation_resource_generation + 1U);
+}
+
+TEST(ResourceAddressedExecutionKernelTest,
+     OrphanRecoveryReconcilesBoundedScaleRoutedSameOwnerSiblings) {
+  constexpr std::size_t kBindingCount = 2048U;
+  constexpr std::size_t kSharedResourceCount = 32U;
+
+  FakeClock clock;
+  FakeParticipantEngine engine;
+  FakeOperationJournal journal;
+  auto source_value =
+      make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular).value();
+  std::vector<ResourceId> shared_resources{source_value.resources.front().resource_id};
+  shared_resources.reserve(kSharedResourceCount);
+  for (std::size_t index = 1U; index < kSharedResourceCount; ++index) {
+    const auto suffix = std::to_string(index);
+    const auto source_joint_name = "joint_scale_" + suffix;
+    const auto compiled_joint_name = "mf2_joint_scale_" + suffix;
+    source_value.resources.push_back(
+        {ResourceRoleId("arm_joints"), ResourceId("robot.joint.scale." + suffix),
+         source_joint_name, compiled_joint_name, CoordinateKind::kAngular});
+    source_value.model_groups.front().expanded_compiled_joint_names.push_back(compiled_joint_name);
+    shared_resources.emplace_back("robot.joint.scale." + suffix);
+  }
+  std::sort(source_value.resources.begin(), source_value.resources.end(),
+            [](const auto& left, const auto& right) {
+              return left.resource_id < right.resource_id;
+            });
+  std::sort(shared_resources.begin(), shared_resources.end());
+  auto sealed_source = verify_runtime_participant_binding(std::move(source_value));
+  ASSERT_TRUE(sealed_source.ok()) << sealed_source.error().message;
+  auto source = std::move(sealed_source.value());
+
+  std::vector<RuntimeParticipantBinding> bindings;
+  bindings.reserve(kBindingCount);
+  bindings.push_back(source);
+  for (std::size_t index = 1U; index < kBindingCount; ++index) {
+    bindings.push_back(indexed_same_owner_control_binding_sibling(source, index));
+  }
+
+  std::vector<RuntimeParticipantExecutionRegistration> registrations;
+  registrations.reserve(bindings.size());
+  for (const auto& binding : bindings) {
+    registrations.push_back(unqualified_registration(binding, engine));
+  }
+
+  auto configuration = route_configuration_for(registration(source, engine));
+  configuration.binding_routes.clear();
+  configuration.binding_routes.reserve(bindings.size());
+  for (const auto& binding : bindings) {
+    const auto& path = *binding.value().control_path;
+    configuration.binding_routes.push_back(
+        {path.control_binding_id, path.control_binding_revision, path.control_route_id});
+  }
+  std::sort(configuration.binding_routes.begin(), configuration.binding_routes.end(),
+            CanonicalActiveControlConfigurationBindingRouteLess);
+  ASSERT_TRUE(configuration.locally_valid());
+
+  journal.recovery = OperationJournalRecoveryDTO{
+      {}, {}, RequestOwnerEpoch("kernel.epoch.old"), shared_resources};
+  ResourceAddressedExecutionKernel kernel(
+      registrations, clock, journal,
+      {RequestOwnerEpoch("kernel.epoch.new"), CellId("cell.test"), 16U});
+  const auto adopted =
+      kernel.adopt_runtime_route_configuration_predecessor(configuration, registrations);
+  ASSERT_TRUE(adopted.ok()) << adopted.error().message;
+  const auto before = kernel.resource_table_snapshot();
+  const auto facts =
+      orphan_reconciliation_facts(RequestOwnerEpoch("kernel.epoch.new"), CellId("cell.test"),
+                                  before.operation_resource_generation, {source},
+                                  shared_resources, clock.now());
+
+  const auto reconciled = kernel.reconcile_orphaned_resources(facts);
+  ASSERT_TRUE(reconciled.ok()) << reconciled.error().message;
+  EXPECT_TRUE(reconciled.value().remaining_unreconciled_resources.empty());
+  EXPECT_EQ(reconciled.value().reconciled_resources.size(), kSharedResourceCount);
+  EXPECT_EQ(reconciled.value().operation_resource_generation,
+            before.operation_resource_generation + 1U);
+}
+
+TEST(ResourceAddressedExecutionKernelTest,
+     OrphanRecoveryRejectsForeignSiblingEpochRouteAndMissingFactSourceAtomically) {
+  const auto exercise_rejection =
+      [](RuntimeParticipantBinding sibling, bool install_wrong_route, bool remove_fact_source) {
+        FakeClock clock;
+        FakeParticipantEngine engine;
+        FakeOperationJournal journal;
+        const auto source =
+            make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular);
+        const auto source_registration = registration(source, engine);
+        const auto configuration = route_configuration_for(source_registration, sibling);
+        journal.recovery =
+            OperationJournalRecoveryDTO{{}, {}, RequestOwnerEpoch("kernel.epoch.old"),
+                                        {ResourceId("robot.joint_1")}};
+        ResourceAddressedExecutionKernel kernel(
+            {unqualified_registration(source, engine),
+             unqualified_registration(sibling, engine)},
+            clock, journal,
+            {RequestOwnerEpoch("kernel.epoch.new"), CellId("cell.test"), 16U});
+        const auto adopted = kernel.adopt_runtime_route_configuration_predecessor(
+            configuration,
+            {unqualified_registration(source, engine),
+             unqualified_registration(sibling, engine)});
+        ASSERT_TRUE(adopted.ok()) << adopted.error().message;
+
+        if (install_wrong_route) {
+          auto wrong = sibling.value();
+          wrong.control_path->control_route_id = ControlRouteId("route.native.wrong");
+          if (wrong.control_path->runtime_scale_qualification.has_value()) {
+            wrong.control_path->runtime_scale_qualification->control_route_id =
+                wrong.control_path->control_route_id;
+          }
+          auto sealed = verify_runtime_participant_binding(std::move(wrong));
+          ASSERT_TRUE(sealed.ok()) << sealed.error().message;
+          const auto installed = kernel.reconfigure_runtime_participants(
+              {unqualified_registration(source, engine),
+               unqualified_registration(sealed.value(), engine)});
+          ASSERT_TRUE(installed.ok()) << installed.error().message;
+        }
+
+        const auto before = kernel.resource_table_snapshot();
+        auto facts =
+            orphan_reconciliation_facts(RequestOwnerEpoch("kernel.epoch.new"),
+                                        CellId("cell.test"),
+                                        before.operation_resource_generation, {source},
+                                        {ResourceId("robot.joint_1")}, clock.now());
+        if (remove_fact_source) {
+          facts.resources.front().control_binding_id =
+              ControlBindingId("binding.arm.not-registered");
+        }
+        const auto rejected = kernel.reconcile_orphaned_resources(facts);
+        ASSERT_FALSE(rejected.ok());
+        EXPECT_EQ(kernel.resource_table_snapshot(), before);
+      };
+
+  const auto source =
+      make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular);
+  exercise_rejection(same_owner_control_binding_sibling(source), false, true);
+  exercise_rejection(same_owner_control_binding_sibling(source), true, false);
+
+  auto foreign_value = same_owner_control_binding_sibling(source).value();
+  foreign_value.controllable_component_id = ControllableComponentId("robot.foreign");
+  auto foreign = verify_runtime_participant_binding(std::move(foreign_value));
+  ASSERT_TRUE(foreign.ok()) << foreign.error().message;
+  exercise_rejection(std::move(foreign.value()), false, false);
+
+  auto stale_value = same_owner_control_binding_sibling(source).value();
+  stale_value.control_path->provider_runtime_epoch = RuntimeEpoch("runtime-epoch.stale");
+  for (auto& path : stale_value.supporting_capability_provider_paths) {
+    path.provider_runtime_epoch = RuntimeEpoch("runtime-epoch.stale");
+  }
+  for (auto& epoch : stale_value.runtime_unit_epochs) {
+    epoch.runtime_epoch = RuntimeEpoch("runtime-epoch.stale");
+  }
+  auto stale = verify_runtime_participant_binding(std::move(stale_value));
+  ASSERT_TRUE(stale.ok()) << stale.error().message;
+  exercise_rejection(std::move(stale.value()), false, false);
 }
 
 TEST(ResourceAddressedExecutionKernelTest,

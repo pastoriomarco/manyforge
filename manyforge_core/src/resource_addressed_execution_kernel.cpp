@@ -10737,7 +10737,40 @@ ResourceAddressedExecutionKernel::reconcile_orphaned_resources(
           ErrorCode::kInvalidStateTransition);
     }
 
-    bool matched = false;
+    const ActiveControlConfigurationDTO* active_configuration = nullptr;
+    const auto readback = runtime_route_configuration_readbacks_.find(fact.control_domain_id);
+    const bool has_domain_readback =
+        readback != runtime_route_configuration_readbacks_.end();
+    if (has_domain_readback &&
+        readback->second.active_configuration.active_control_configuration_id ==
+            fact.active_control_configuration_id &&
+        readback->second.active_configuration.active_control_configuration_generation ==
+            fact.active_control_configuration_generation &&
+        readback->second.active_configuration.state ==
+            ActiveControlConfigurationStateDTO::kReconciled) {
+      active_configuration = &readback->second.active_configuration;
+    }
+    const std::vector<DesiredControlBindingRouteDTO>* retained_binding_routes = nullptr;
+    if (!has_domain_readback) {
+      for (const auto& registration : registrations_) {
+        if (!registration.stop_readiness.has_value()) {
+          continue;
+        }
+        const auto& readiness = registration.stop_readiness->value();
+        const auto& expected = readiness.expected_controller_domain;
+        const auto& plan = readiness.resolved_stop_base_plan;
+        if (expected.control_domain_id == fact.control_domain_id &&
+            plan.active_control_configuration_id == fact.active_control_configuration_id &&
+            plan.active_control_configuration_generation ==
+                fact.active_control_configuration_generation) {
+          retained_binding_routes = &expected.desired_configuration.binding_routes;
+          break;
+        }
+      }
+    }
+
+    bool matched_source = false;
+    bool found_containing_registration = false;
     for (const auto& registration : registrations_) {
       const auto& binding = registration.binding.value();
       const bool contains = std::any_of(
@@ -10746,37 +10779,62 @@ ResourceAddressedExecutionKernel::reconcile_orphaned_resources(
       if (!contains) {
         continue;
       }
+      found_containing_registration = true;
       if (!binding.control_path.has_value()) {
         return reject<OrphanResourceReconciliationResultDTO>(
             "orphan resource has no exact current control path",
             "orphan_resource_reconciliation_binding_missing", ErrorCode::kInvariantViolation);
       }
       const auto& path = *binding.control_path;
-      const bool exact =
+      const bool same_physical_owner =
           binding.controllable_component_id == fact.controllable_component_id &&
           binding.command_target_id == fact.command_target_id &&
           path.control_domain_id == fact.control_domain_id &&
-          path.control_binding_id == fact.control_binding_id &&
-          path.control_binding_revision == fact.control_binding_revision &&
           path.active_control_configuration_id == fact.active_control_configuration_id &&
           path.active_control_configuration_generation ==
               fact.active_control_configuration_generation &&
           path.provider_runtime_unit_id == fact.provider_runtime_unit_id &&
           path.provider_runtime_epoch == fact.provider_runtime_epoch &&
           fact.settlement.source_epoch == std::optional<RuntimeEpoch>(path.provider_runtime_epoch);
-      if (!exact) {
+      if (!same_physical_owner) {
         return reject<OrphanResourceReconciliationResultDTO>(
             "orphan-resource reconciliation differs from a current binding",
             "orphan_resource_reconciliation_binding_mismatch", ErrorCode::kInvalidStateTransition);
       }
-      matched = true;
+
+      const auto route_matches = [&](const auto& routes) {
+        const auto route = std::lower_bound(
+            routes.begin(), routes.end(), path.control_binding_id,
+            [](const auto& row, const ControlBindingId& binding_id) {
+              return row.control_binding_id < binding_id;
+            });
+        return route != routes.end() &&
+               route->control_binding_id == path.control_binding_id &&
+               route->control_binding_revision == path.control_binding_revision &&
+               route->control_route_id == path.control_route_id;
+      };
+      const bool current_route =
+          active_configuration != nullptr
+              ? route_matches(active_configuration->binding_routes)
+              : retained_binding_routes != nullptr && route_matches(*retained_binding_routes);
+      if (!current_route) {
+        return reject<OrphanResourceReconciliationResultDTO>(
+            "orphan-resource reconciliation differs from current binding-route truth",
+            "orphan_resource_reconciliation_configuration_mismatch",
+            ErrorCode::kInvalidStateTransition);
+      }
+      matched_source =
+          matched_source ||
+          (path.control_binding_id == fact.control_binding_id &&
+           path.control_binding_revision == fact.control_binding_revision);
     }
     const auto configuration =
         std::lower_bound(configurations.begin(), configurations.end(), fact.control_domain_id,
                          [](const auto& row, const ControlDomainId& domain) {
                            return row.control_domain_id < domain;
                          });
-    if (!matched || configuration == configurations.end() ||
+    if (!found_containing_registration || !matched_source ||
+        configuration == configurations.end() ||
         configuration->control_domain_id != fact.control_domain_id ||
         configuration->active_control_configuration_id != fact.active_control_configuration_id ||
         configuration->active_control_configuration_generation !=
