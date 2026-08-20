@@ -19,6 +19,7 @@ import os
 from pathlib import Path
 import signal
 import socket
+import stat
 import subprocess
 import sys
 import time
@@ -192,8 +193,34 @@ class NativeLauncherConfig:
             character.isspace() for character in self.advertised_host
         ):
             raise ValueError("advertised_host must be one bounded host reference")
-        if not self.instance_id or "/" in self.instance_id or "\\" in self.instance_id:
+        if (
+            not self.instance_id
+            or self.instance_id in {".", ".."}
+            or "/" in self.instance_id
+            or "\\" in self.instance_id
+        ):
             raise ValueError("instance_id must be one path-safe non-empty identifier")
+        for name, root in (
+            ("package_root", str(self.package_root)),
+            ("program_workspace", str(self.program_workspace)),
+        ):
+            if "," in root or root != root.strip():
+                raise ValueError(
+                    f"{name} must be unambiguous in MANYFORGE_FS_ROOTS"
+                )
+        try:
+            resolved_package_root = self.package_root.resolve(strict=False)
+            resolved_program_workspace = self.program_workspace.resolve(strict=False)
+        except (OSError, RuntimeError) as error:
+            raise ValueError(
+                "package_root and program_workspace must be resolvable"
+            ) from error
+        if (
+            resolved_package_root == resolved_program_workspace
+            or resolved_package_root in resolved_program_workspace.parents
+            or resolved_program_workspace in resolved_package_root.parents
+        ):
+            raise ValueError("package_root and program_workspace must be disjoint")
         if (
             not self.cell_id
             or "/" in self.cell_id
@@ -226,6 +253,10 @@ class NativeLauncherConfig:
     @property
     def instance_root(self) -> Path:
         return self.state_root / self.instance_id
+
+    @property
+    def program_workspace(self) -> Path:
+        return self.instance_root / "program-workspace"
 
     @property
     def headless_url(self) -> str:
@@ -263,7 +294,7 @@ class _ManagedProcess:
 def native_commands(config: NativeLauncherConfig) -> tuple[ProcessSpec, ...]:
     """Return the exact four native process specifications, without I/O."""
 
-    base_env = {"MANYFORGE_FS_ROOTS": str(config.package_root)}
+    package_env = {"MANYFORGE_FS_ROOTS": str(config.package_root)}
     manager = ProcessSpec(
         "manager",
         tuple(
@@ -286,7 +317,7 @@ def native_commands(config: NativeLauncherConfig) -> tuple[ProcessSpec, ...]:
                 config.reconciliation_period_ms,
             )
         ),
-        base_env,
+        package_env,
         config.source_root,
     )
     headless = ProcessSpec(
@@ -329,7 +360,7 @@ def native_commands(config: NativeLauncherConfig) -> tuple[ProcessSpec, ...]:
             "--program-runner-url",
             config.program_runner_url,
         ),
-        base_env,
+        package_env,
         config.source_root,
     )
     program_argv = [
@@ -354,7 +385,7 @@ def native_commands(config: NativeLauncherConfig) -> tuple[ProcessSpec, ...]:
     program_runner = ProcessSpec(
         "program_runner",
         tuple(program_argv),
-        base_env,
+        package_env,
         config.source_root,
     )
     composer_argv = (
@@ -375,7 +406,11 @@ def native_commands(config: NativeLauncherConfig) -> tuple[ProcessSpec, ...]:
     composer = ProcessSpec(
         "composer",
         composer_argv,
-        base_env,
+        {
+            "MANYFORGE_FS_ROOTS": (
+                f"{config.package_root},{config.program_workspace}"
+            )
+        },
         config.source_root,
     )
     return (manager, headless, program_runner, composer)
@@ -683,9 +718,14 @@ class NativeLauncher:
     def from_state_root(cls, state_root: Path, instance_id: str) -> "NativeLauncher":
         """Open an existing record for status/stop without start inputs."""
 
-        root = Path(state_root).absolute() / instance_id
-        if not instance_id or "/" in instance_id or "\\" in instance_id:
+        if (
+            not instance_id
+            or instance_id in {".", ".."}
+            or "/" in instance_id
+            or "\\" in instance_id
+        ):
             raise LauncherError("invalid_instance_id", "instance id is invalid", exit_code=64)
+        root = Path(state_root).absolute() / instance_id
         root.mkdir(parents=True, exist_ok=True)
         launcher = cls.__new__(cls)
         launcher.config = SimpleNamespace(
@@ -730,6 +770,7 @@ class NativeLauncher:
             "paths": {
                 "source_root": str(self.config.source_root),
                 "package_root": str(self.config.package_root),
+                "program_workspace": str(self.config.program_workspace),
                 "manager_executable": str(self.config.manager_executable),
                 "node_catalog_path": str(self.config.node_catalog_path),
                 "alarm_catalog_path": str(self.config.alarm_catalog_path),
@@ -761,6 +802,67 @@ class NativeLauncher:
                 for component, item in self._managed.items()
             },
         }
+
+    def _prepare_program_workspace(self) -> None:
+        """Create or validate the one instance-owned Composer write root."""
+
+        no_follow = getattr(os, "O_NOFOLLOW", 0)
+        directory = getattr(os, "O_DIRECTORY", 0)
+        try:
+            instance_fd = os.open(
+                self.config.instance_root,
+                os.O_RDONLY | directory | no_follow,
+            )
+        except OSError as error:
+            raise LauncherError(
+                "program_workspace_invalid",
+                f"instance root cannot safely contain the Program workspace: {error}",
+                exit_code=70,
+            ) from error
+        try:
+            try:
+                os.mkdir("program-workspace", dir_fd=instance_fd)
+            except FileExistsError:
+                pass
+            workspace_stat = os.stat(
+                "program-workspace",
+                dir_fd=instance_fd,
+                follow_symlinks=False,
+            )
+            if not stat.S_ISDIR(workspace_stat.st_mode):
+                raise LauncherError(
+                    "program_workspace_invalid",
+                    "Program workspace exists but is not a physical directory",
+                    exit_code=70,
+                )
+            if not os.access(
+                "program-workspace",
+                os.W_OK | os.X_OK,
+                dir_fd=instance_fd,
+                effective_ids=True,
+                follow_symlinks=False,
+            ):
+                raise LauncherError(
+                    "program_workspace_invalid",
+                    "Program workspace is not writable by the operator",
+                    exit_code=70,
+                )
+            workspace_fd = os.open(
+                "program-workspace",
+                os.O_RDONLY | directory | no_follow,
+                dir_fd=instance_fd,
+            )
+            os.close(workspace_fd)
+        except LauncherError:
+            raise
+        except OSError as error:
+            raise LauncherError(
+                "program_workspace_invalid",
+                f"Program workspace cannot be safely prepared: {error}",
+                exit_code=70,
+            ) from error
+        finally:
+            os.close(instance_fd)
 
     @staticmethod
     def _resource_records_from_mechanical(
@@ -1136,9 +1238,25 @@ class NativeLauncher:
             raise LauncherError("invalid_instance_id", "instance id is empty", exit_code=64)
         with self.store.lock():
             configuration = _configuration(self.config)
+            self._prepare_program_workspace()
             existing = self.store.read()
             if existing is not None:
                 old_status, mechanical = existing
+                mechanical = dict(mechanical)
+                paths = mechanical.get("paths")
+                if paths is None:
+                    paths = {}
+                if not isinstance(paths, dict):
+                    raise LauncherError(
+                        "status_record_invalid",
+                        "stored mechanical paths record is not an object",
+                        exit_code=70,
+                        status=old_status,
+                    )
+                mechanical["paths"] = {
+                    **paths,
+                    "program_workspace": str(self.config.program_workspace),
+                }
                 if old_status.configuration.profile is not LaunchProfile.NATIVE:
                     raise LauncherError(
                         "incompatible_owner",

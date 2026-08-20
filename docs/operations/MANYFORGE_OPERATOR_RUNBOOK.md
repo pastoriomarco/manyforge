@@ -202,6 +202,36 @@ start the runtime. `/api/health`, `/api/manager/status`, `/api/runtime`, and
 
 ## 3. Deliberate Composer operation
 
+### Saved Program authoring
+
+Native `start` deterministically creates one instance-owned writable Program
+workspace:
+
+```text
+$STATE_ROOT/$INSTANCE_ID/program-workspace
+```
+
+Composer alone receives that directory in addition to the immutable
+`PACKAGE_ROOT`. Manager, Headless, and Program runner retain package-only
+filesystem access. The workspace path is also recorded in the launch record's
+internal mechanical `paths` metadata; it does not add a launcher option or
+change the public status DTO.
+
+To derive an editable Saved Program from maintained package content:
+
+1. Open the packaged Program as a Draft in Composer.
+2. Choose **Save As** and select a new `*.program.yaml` path under the
+   instance `program-workspace`.
+3. Continue editing and use **Save** for that workspace copy.
+4. Stop and restart the native stack with the same `STATE_ROOT` and
+   `INSTANCE_ID`, then reopen the Saved Program from `program-workspace`.
+
+The package is immutable reference content and is never a Save or Save As
+destination. Stop, failed child recovery, operator CLI restart, and complete
+stack restart perform process cleanup only and preserve workspace authoring
+content. Back up or remove that content only through a separate deliberate
+operator action; the launcher never deletes or replaces the workspace.
+
 1. Start native and wait for `ready`; inspect health, runtime, graph, alarms,
    and the current desired/active revisions.
 2. Select a maintained single-cell input or compose the current desired graph.

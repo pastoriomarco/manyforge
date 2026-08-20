@@ -7,7 +7,7 @@ import socket
 
 import pytest
 
-from manyforge_operator import LaunchProfile, LaunchInstanceState
+from manyforge_operator import LaunchProfile, LaunchInstanceState, ResourcePresence
 from manyforge_operator.orchestrator import (
     LauncherError,
     NativeLauncher,
@@ -71,7 +71,251 @@ def test_native_commands_retain_four_owner_entrypoints(tmp_path: Path):
     assert "--port 9011" in commands[2]
     assert "--port 9000" in commands[3]
     assert all("--apply" not in spec.argv and "--run" not in spec.argv for spec in specs)
-    assert all(spec.environment["MANYFORGE_FS_ROOTS"] == str(config.package_root) for spec in specs)
+    assert all(
+        spec.environment["MANYFORGE_FS_ROOTS"] == str(config.package_root)
+        for spec in specs[:3]
+    )
+    assert specs[3].environment["MANYFORGE_FS_ROOTS"] == (
+        f"{config.package_root},{config.program_workspace}"
+    )
+
+
+@pytest.mark.parametrize(
+    "field,value",
+    [
+        ("package_root", "package,extra"),
+        ("package_root", "package "),
+        ("state_root", "operator,state"),
+        ("instance_id", "native,extra"),
+    ],
+)
+def test_native_configuration_rejects_ambiguous_composer_roots_before_effects(
+    tmp_path: Path, field: str, value: str
+):
+    config = _config(tmp_path)
+    replacement = value if field == "instance_id" else tmp_path / value
+
+    with pytest.raises(ValueError, match="MANYFORGE_FS_ROOTS"):
+        replace(config, **{field: replacement})
+
+
+@pytest.mark.parametrize("instance_id", [".", ".."])
+def test_native_configuration_rejects_dot_instance_ids(
+    tmp_path: Path, instance_id: str
+):
+    config = _config(tmp_path)
+
+    with pytest.raises(ValueError, match="instance_id"):
+        replace(config, instance_id=instance_id)
+
+    assert not config.state_root.exists()
+
+
+@pytest.mark.parametrize("instance_id", [".", ".."])
+def test_from_state_root_rejects_dot_instance_ids_without_mutation(
+    tmp_path: Path, instance_id: str
+):
+    parent = tmp_path / "state-parent"
+    parent.mkdir()
+    marker = parent / "marker.txt"
+    marker.write_text("unchanged\n", encoding="utf-8")
+    state_root = parent / "operator-state"
+    entries_before = sorted(path.name for path in parent.iterdir())
+
+    with pytest.raises(LauncherError) as raised:
+        NativeLauncher.from_state_root(state_root, instance_id)
+
+    assert raised.value.code == "invalid_instance_id"
+    assert raised.value.exit_code == 64
+    assert not state_root.exists()
+    assert sorted(path.name for path in parent.iterdir()) == entries_before
+    assert marker.read_text(encoding="utf-8") == "unchanged\n"
+
+
+@pytest.mark.parametrize(
+    "relationship",
+    ["workspace-inside-package", "package-inside-workspace", "equal"],
+)
+def test_native_configuration_rejects_overlapping_composer_roots_without_mutation(
+    tmp_path: Path, relationship: str
+):
+    config = _config(tmp_path)
+    state_root = tmp_path / "prospective-state"
+    instance_id = "native"
+    prospective_workspace = state_root / instance_id / "program-workspace"
+    package_root = config.package_root
+
+    if relationship == "workspace-inside-package":
+        state_root = package_root / "operator-state"
+        prospective_workspace = state_root / instance_id / "program-workspace"
+    else:
+        prospective_workspace.mkdir(parents=True)
+        if relationship == "package-inside-workspace":
+            package_root = prospective_workspace / "immutable-package"
+            package_root.mkdir()
+        else:
+            package_root = prospective_workspace
+        (package_root / "immutable.txt").write_text(
+            "immutable\n", encoding="utf-8"
+        )
+
+    package_before = package_aggregate_sha256(package_root)
+    workspace_existed = prospective_workspace.exists()
+    workspace_entries = (
+        sorted(
+            path.relative_to(prospective_workspace)
+            for path in prospective_workspace.rglob("*")
+        )
+        if workspace_existed
+        else []
+    )
+
+    with pytest.raises(ValueError, match="must be disjoint"):
+        replace(
+            config,
+            package_root=package_root,
+            state_root=state_root,
+            instance_id=instance_id,
+            package_aggregate_sha256=package_before,
+        )
+
+    assert prospective_workspace.exists() is workspace_existed
+    if workspace_existed:
+        assert sorted(
+            path.relative_to(prospective_workspace)
+            for path in prospective_workspace.rglob("*")
+        ) == workspace_entries
+    assert package_aggregate_sha256(package_root) == package_before
+
+
+def test_start_records_and_preserves_the_instance_program_workspace(
+    tmp_path: Path, configuration_factory, monkeypatch
+):
+    from manyforge_operator.tests.conftest import make_readiness
+
+    config = _config(tmp_path)
+    launcher = NativeLauncher(config)
+    configuration = configuration_factory()
+    active_pids: set[int] = set()
+    spawn_count = 0
+
+    monkeypatch.setattr(
+        "manyforge_operator.orchestrator._configuration",
+        lambda _config: configuration,
+    )
+    monkeypatch.setattr(launcher, "_port_available", lambda: None)
+    monkeypatch.setattr(
+        "manyforge_operator.orchestrator._process_is_authenticated",
+        lambda record: int(record["pid"]) in active_pids,
+    )
+    monkeypatch.setattr(
+        launcher,
+        "_readiness",
+        lambda _configuration=None: (True, [make_readiness()], None),
+    )
+
+    def spawn(spec):
+        nonlocal spawn_count
+        spawn_count += 1
+        assert config.program_workspace.is_dir()
+        pid = 1000 + spawn_count
+        active_pids.add(pid)
+        return type(
+            "Managed",
+            (),
+            {
+                "component_id": spec.component_id,
+                "pid": pid,
+                "start_ticks": 1,
+                "boot_id": "22222222-2222-2222-2222-222222222222",
+                "process_group_id": pid,
+                "argv": spec.argv,
+                "log_path": config.instance_root / f"{spec.component_id}.log",
+            },
+        )()
+
+    def cleanup(process_records=None, *, manager_state_root=None):
+        assert process_records is not None
+        assert manager_state_root == config.manager_state_root
+        assert {int(item["pid"]) for item in process_records.values()} == active_pids
+        active_pids.clear()
+        return True
+
+    monkeypatch.setattr(launcher, "_spawn", spawn)
+    monkeypatch.setattr(launcher, "_cleanup_authenticated", cleanup)
+    package_before = package_aggregate_sha256(config.package_root)
+
+    first = launcher.start()
+    assert first.state is LaunchInstanceState.READY
+    assert all(
+        observation.presence is ResourcePresence.PRESENT
+        for observation in first.resource_observations
+    )
+    assert spawn_count == 4
+    saved = config.program_workspace / "saved.program.yaml"
+    saved.write_text("schema_version: manyforge.program.v1\n", encoding="utf-8")
+    record = launcher.store.read()
+    assert record is not None
+    assert record[1]["paths"]["program_workspace"] == str(
+        config.program_workspace
+    )
+
+    idempotent = launcher.start()
+    assert launcher.last_start_idempotent is True
+    assert idempotent.state is LaunchInstanceState.READY
+    assert spawn_count == 4
+    assert saved.is_file()
+
+    stopped = launcher.stop()
+    assert stopped is not None
+    assert stopped.state is LaunchInstanceState.STOPPED
+    assert all(
+        observation.presence is ResourcePresence.ABSENT
+        for observation in stopped.resource_observations
+    )
+    assert not active_pids
+    assert saved.is_file()
+    restarted = launcher.start()
+    assert restarted.state is LaunchInstanceState.READY
+    assert all(
+        observation.presence is ResourcePresence.PRESENT
+        for observation in restarted.resource_observations
+    )
+    assert spawn_count == 8
+    assert saved.read_text(encoding="utf-8") == (
+        "schema_version: manyforge.program.v1\n"
+    )
+    assert package_aggregate_sha256(config.package_root) == package_before
+
+
+@pytest.mark.parametrize("conflict", ["file", "symlink"])
+def test_start_rejects_an_unsafe_program_workspace_before_child_effects(
+    tmp_path: Path, configuration_factory, monkeypatch, conflict: str
+):
+    config = _config(tmp_path)
+    launcher = NativeLauncher(config)
+    if conflict == "file":
+        config.program_workspace.write_text("not a directory\n", encoding="utf-8")
+    else:
+        outside = tmp_path / "outside"
+        outside.mkdir()
+        config.program_workspace.symlink_to(outside, target_is_directory=True)
+
+    monkeypatch.setattr(
+        "manyforge_operator.orchestrator._configuration",
+        lambda _config: configuration_factory(),
+    )
+
+    def unexpected_effect():
+        raise AssertionError("port or child effects must not occur")
+
+    monkeypatch.setattr(launcher, "_port_available", unexpected_effect)
+    monkeypatch.setattr(launcher, "_spawn", lambda _spec: unexpected_effect())
+
+    with pytest.raises(LauncherError) as raised:
+        launcher.start()
+
+    assert raised.value.code == "program_workspace_invalid"
 
 
 def test_native_commands_bind_explicit_cell_admission_and_static_inputs(tmp_path: Path):
