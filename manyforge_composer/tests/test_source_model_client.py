@@ -10,11 +10,13 @@ from manyforge_behavior.canonical_artifact import (
     raw_sha256_digest,
 )
 from manyforge_composer.backend.node_environment_client import (
+    ActiveNodeEnvironmentProjectionError,
     VerifiedActiveNodeEnvironment,
 )
 from manyforge_composer.backend.source_model_client import (
     ActiveSourceModelProjectionError,
     verify_active_source_model,
+    verify_active_source_model_context,
 )
 from manyforge_composer.backend.state import ComposerState
 
@@ -213,6 +215,35 @@ def test_empty_projection_carries_no_model_map_identity() -> None:
     )
 
 
+def _context() -> tuple[ComposerState, dict]:
+    return ComposerState(), {
+        "schema_version": "manyforge.source_model_context.v1",
+        "node_environment": _node_environment().payload,
+        "source_model": _projection(),
+    }
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        lambda context: context.update(
+            {"schema_version": "manyforge.source_model_context.v0"}
+        ),
+        lambda context: context.update({"extra": True}),
+        lambda context: context.pop("source_model"),
+        lambda context: context.update({"node_environment": []}),
+    ],
+)
+def test_context_verifier_rejects_closed_shape_or_malformed_child(mutation) -> None:
+    state, context = _context()
+    mutation(context)
+
+    with pytest.raises(
+        (ActiveNodeEnvironmentProjectionError, ActiveSourceModelProjectionError)
+    ):
+        verify_active_source_model_context(state, context)
+
+
 def _duplicate_group_state_identity(payload: dict) -> None:
     occurrence = payload["occurrences"][0]
     duplicate = deepcopy(occurrence["srdf_group_states"][0])
@@ -239,6 +270,38 @@ def _duplicate_end_effector_identity(payload: dict) -> None:
         (
             lambda payload: payload["source"].update(
                 {"selection_source_generation": 4}
+            ),
+            "selection epochs disagree",
+        ),
+        (
+            lambda payload: payload.update({"retained_bundle_id": "bundle.2"}),
+            "different bundles",
+        ),
+        (
+            lambda payload: payload.update({"graph_revision": "graph.2"}),
+            "different bundles",
+        ),
+        (
+            lambda payload: payload["source"].update(
+                {"selection_projection_generation": 8}
+            ),
+            "selection epochs disagree",
+        ),
+        (
+            lambda payload: payload["source"].update(
+                {"selection_source_content_digest": "sha256:" + "c" * 64}
+            ),
+            "selection epochs disagree",
+        ),
+        (
+            lambda payload: payload["source"].update(
+                {"selection_source_owner_epoch": "manager.epoch.2"}
+            ),
+            "selection epochs disagree",
+        ),
+        (
+            lambda payload: payload["source"].update(
+                {"selection_source_owner_id": "component-manager.cell-b"}
             ),
             "selection epochs disagree",
         ),

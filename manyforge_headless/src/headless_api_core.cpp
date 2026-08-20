@@ -536,6 +536,18 @@ CanonicalValue HeadlessApiCore::SourceModelProjection() {
   return SourceModelProjectionLocked(RefreshLocked());
 }
 
+CanonicalValue HeadlessApiCore::SourceModelContext() {
+  std::lock_guard lock(mutex_);
+  Require(!shutdown_, "headless_api_closed", "headless API core is closed");
+  const auto runtime = RefreshLocked();
+  return CanonicalValue(CanonicalValue::Object{
+      {"node_environment", NodeEnvironmentProjectionLocked(runtime)},
+      {"schema_version",
+       CanonicalValue(std::string(kSourceModelContextSchemaVersion))},
+      {"source_model", SourceModelProjectionLocked(runtime)},
+  });
+}
+
 CanonicalValue HeadlessApiCore::ScenarioCatalogProjection() {
   std::lock_guard lock(mutex_);
   Require(!shutdown_, "headless_api_closed", "headless API core is closed");

@@ -212,6 +212,7 @@ def _error_status(code: str) -> int:
         "cclc_open_response_invalid",
         "cclc_open_response_identity_mismatch",
         "node_environment_projection_invalid",
+        "source_model_context_invalid",
         "program_apply_active_selection_invalid",
         "program_apply_baseline_binding_invalid",
         "program_apply_bundle_invalid",
@@ -534,6 +535,10 @@ def create_app(
     @app.get("/api/source-model")
     def source_model() -> dict[str, Any]:
         return service.source_model()
+
+    @app.get("/api/source-model-context")
+    def source_model_context() -> dict[str, Any]:
+        return service.source_model_context()
 
     @app.get("/api/scenarios")
     def scenarios() -> dict[str, Any]:

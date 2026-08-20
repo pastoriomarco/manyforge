@@ -1,5 +1,6 @@
 #include <gtest/gtest.h>
 
+#include <array>
 #include <chrono>
 #include <cstdint>
 #include <cstdlib>
@@ -655,6 +656,44 @@ TEST(HeadlessApiCore,
   EXPECT_EQ(Unsigned(Member(second, "source"), "projection_generation"), 1U);
   EXPECT_EQ(Text(Member(second, "source"), "source_content_digest"),
             Text(source, "source_content_digest"));
+}
+
+TEST(HeadlessApiCore,
+     SourceModelContextCorrelatesCanonicalEmptyChildrenFromOneRefresh) {
+  TemporaryDirectory directory;
+  PublishHealthySources(directory, "open");
+  HeadlessApiCore core(Config(directory, "api.epoch.1"), Clocks());
+
+  const auto context = core.SourceModelContext();
+  EXPECT_EQ(context.as_object().size(), 3U);
+  EXPECT_EQ(Text(context, "schema_version"),
+            kSourceModelContextSchemaVersion);
+  const auto &environment = Member(context, "node_environment");
+  const auto &source_model = Member(context, "source_model");
+  EXPECT_EQ(Text(environment, "schema_version"),
+            kNodeEnvironmentProjectionApiVersion);
+  EXPECT_EQ(Text(source_model, "schema_version"),
+            kSourceModelProjectionApiVersion);
+  EXPECT_EQ(Text(environment, "retained_bundle_id"),
+            Text(source_model, "retained_bundle_id"));
+  EXPECT_EQ(Text(environment, "graph_revision"),
+            Text(source_model, "graph_revision"));
+
+  constexpr std::array<std::string_view, 5> kSelectionFields{
+      "selection_projection_generation",
+      "selection_source_content_digest",
+      "selection_source_generation",
+      "selection_source_owner_epoch",
+      "selection_source_owner_id",
+  };
+  const auto &environment_source = Member(environment, "source");
+  const auto &source_model_source = Member(source_model, "source");
+  for (const auto field : kSelectionFields) {
+    EXPECT_EQ(Member(environment_source, field),
+              Member(source_model_source, field));
+  }
+  EXPECT_TRUE(Array(source_model, "occurrences").empty());
+  EXPECT_TRUE(Array(source_model, "targets").empty());
 }
 
 TEST(HeadlessApiCore,

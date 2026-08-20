@@ -12,6 +12,7 @@ from urllib.parse import quote
 import httpx
 
 from .native import (
+    MAX_SOURCE_MODEL_CONTEXT_RESPONSE_BYTES,
     MAX_VIEWER_MODEL_RESOURCE_BYTES,
     MAX_VIEWER_MODEL_RESOURCE_URI_BYTES,
     MAX_VIEWER_MODEL_URDF_BYTES,
@@ -120,9 +121,15 @@ class HeadlessHttpClient:
             ) as response:
                 chunks: list[bytes] = []
                 size = 0
+                maximum_response_bytes = (
+                    MAX_SOURCE_MODEL_CONTEXT_RESPONSE_BYTES
+                    if method.upper() == "GET"
+                    and path == "/api/source-model-context"
+                    else MAX_HTTP_RESPONSE_BYTES
+                )
                 for chunk in response.iter_bytes():
                     size += len(chunk)
-                    if size > MAX_HTTP_RESPONSE_BYTES:
+                    if size > maximum_response_bytes:
                         raise HeadlessClientError(
                             "headless_http_response_oversized",
                             "headless API response exceeds its byte bound",
@@ -146,7 +153,11 @@ class HeadlessHttpClient:
                 response.status_code,
             ) from exc
         try:
-            value = strict_json_object(text, label="headless HTTP response")
+            value = strict_json_object(
+                text,
+                label="headless HTTP response",
+                maximum_bytes=maximum_response_bytes,
+            )
         except RuntimeError as exc:
             raise HeadlessClientError(
                 getattr(exc, "code", "headless_http_response_invalid"),
@@ -380,6 +391,9 @@ class HeadlessHttpClient:
 
     def source_model(self) -> dict[str, Any]:
         return self.request("GET", "/api/source-model")
+
+    def source_model_context(self) -> dict[str, Any]:
+        return self.request("GET", "/api/source-model-context")
 
     def scenarios(self) -> dict[str, Any]:
         return self.request("GET", "/api/scenarios")

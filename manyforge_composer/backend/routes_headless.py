@@ -30,11 +30,10 @@ from manyforge_headless_api.models import (
 
 from .node_environment_client import (
     ActiveNodeEnvironmentProjectionError,
-    read_active_node_environment,
 )
 from .source_model_client import (
     ActiveSourceModelProjectionError,
-    read_active_source_model,
+    read_active_source_model_context,
 )
 from .state import ComposerState
 
@@ -164,11 +163,7 @@ def create_headless_router(
     @router.get("/api/source-model")
     def source_model() -> dict[str, Any]:
         try:
-            environment = read_active_node_environment(state)
-            return read_active_source_model(
-                state,
-                node_environment=environment,
-            ).payload
+            return read_active_source_model_context(state).payload
         except (
             ActiveNodeEnvironmentProjectionError,
             ActiveSourceModelProjectionError,

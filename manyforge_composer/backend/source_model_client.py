@@ -13,13 +13,17 @@ from manyforge_behavior.canonical_artifact import (
     raw_sha256_digest,
 )
 
-from .node_environment_client import VerifiedActiveNodeEnvironment
+from .node_environment_client import (
+    VerifiedActiveNodeEnvironment,
+    verify_active_node_environment,
+)
 
 if TYPE_CHECKING:
     from .state import ComposerState
 
 
 _PROJECTION_VERSION = "manyforge.source_model_projection.v1"
+_CONTEXT_VERSION = "manyforge.source_model_context.v1"
 _PROJECTION_IDENTITY_DOMAIN = "manyforge-source-model-projection-semantic"
 _PROJECTION_FIELDS = {
     "cell_id",
@@ -723,9 +727,54 @@ def read_active_source_model(
     return verify_active_source_model(payload, node_environment=node_environment)
 
 
+def verify_active_source_model_context(
+    state: "ComposerState",
+    payload: Any,
+) -> VerifiedActiveSourceModel:
+    context = _object(payload, "source model context")
+    _closed(
+        context,
+        {"node_environment", "schema_version", "source_model"},
+        "source model context",
+    )
+    if context.get("schema_version") != _CONTEXT_VERSION:
+        raise _invalid("source model context version is unsupported")
+    node_environment = verify_active_node_environment(
+        state,
+        context["node_environment"],
+    )
+    return verify_active_source_model(
+        context["source_model"],
+        node_environment=node_environment,
+    )
+
+
+def read_active_source_model_context(
+    state: "ComposerState",
+) -> VerifiedActiveSourceModel:
+    client = state.headless_client
+    if client is None:
+        raise _invalid("Composer has no configured headless client")
+    try:
+        payload = client.source_model_context()
+    except Exception as error:
+        code = getattr(error, "code", None)
+        if isinstance(code, str) and code:
+            status_code = getattr(error, "status_code", None)
+            raise ActiveSourceModelProjectionError(
+                code,
+                str(error),
+                status_code if isinstance(status_code, int) else 503,
+            ) from error
+        raise
+    return verify_active_source_model_context(state, payload)
+
+
 __all__ = [
     "ActiveSourceModelProjectionError",
     "VerifiedActiveSourceModel",
+    "read_active_source_model_context",
     "read_active_source_model",
+    "verify_active_source_model_context",
     "verify_active_source_model",
 ]

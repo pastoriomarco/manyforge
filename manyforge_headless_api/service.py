@@ -49,6 +49,7 @@ APPLIED_PROGRAM_SELECTION_VERSION = "manyforge.applied_program_selection.v1"
 PROGRAM_RUN_INDEX_VERSION = "manyforge.program_run_index.v1"
 PROGRAM_RUN_STATUS_VERSION = "manyforge.program_run_status.v1"
 PROGRAM_RUN_CAPTURE_VERSION = "manyforge.program_run_capture.v1"
+SOURCE_MODEL_CONTEXT_VERSION = "manyforge.source_model_context.v1"
 _PROGRAM_RUN_STATES = frozenset(
     {
         "running",
@@ -412,6 +413,26 @@ class HeadlessService:
                 "native core returned an unsupported source model projection",
             )
         return projection
+
+    def source_model_context(self) -> dict[str, Any]:
+        context = self.core.source_model_context()
+        if (
+            not isinstance(context, dict)
+            or set(context)
+            != {"node_environment", "schema_version", "source_model"}
+            or context.get("schema_version") != SOURCE_MODEL_CONTEXT_VERSION
+            or not isinstance(context.get("node_environment"), dict)
+            or not isinstance(context.get("source_model"), dict)
+            or context["node_environment"].get("schema_version")
+            != "manyforge.node_environment_projection.v1"
+            or context["source_model"].get("schema_version")
+            != "manyforge.source_model_projection.v1"
+        ):
+            raise HeadlessApiError(
+                "source_model_context_invalid",
+                "native core returned an unsupported source-model context",
+            )
+        return context
 
     def scenarios(self) -> dict[str, Any]:
         projection = self.core.scenario_catalog_projection()

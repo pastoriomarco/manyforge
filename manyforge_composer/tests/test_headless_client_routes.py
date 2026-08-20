@@ -237,6 +237,14 @@ def headless_client() -> (
             )
         )
     )
+    source_model_context = {
+        "schema_version": "manyforge.source_model_context.v1",
+        "node_environment": json.loads(json.dumps(node_environment)),
+        "source_model": json.loads(json.dumps(source_model)),
+    }
+    # Keep the legacy standalone fakes on opposite generations. Composer's
+    # source-model route must consume only the coherent context above.
+    source_model["source"]["selection_projection_generation"] = 5
     applied_program: dict[str, Any] | None = None
 
     def handler(request: httpx.Request) -> httpx.Response:
@@ -276,6 +284,8 @@ def headless_client() -> (
             payload = node_environment
         elif path == "/api/source-model":
             payload = source_model
+        elif path == "/api/source-model-context":
+            payload = source_model_context
         elif path == "/api/scenarios":
             payload = {
                 "api_version": "manyforge.scenario_catalog.v1",
@@ -548,6 +558,31 @@ def test_composer_projects_headless_reads_without_local_runtime_state(
         item for item in requests if item["path"] == "/api/execution/alarms"
     )
     assert alarm_request["query"] == "limit=3&ordering=attention_newest"
+
+
+def test_composer_source_model_uses_one_coherent_context_request(
+    headless_client,
+) -> None:
+    client, requests, _node_environment = headless_client
+    requests.clear()
+
+    with _composer(client) as composer:
+        response = composer.get("/api/source-model")
+
+    assert response.status_code == 200
+    assert response.json()["schema_version"] == (
+        "manyforge.source_model_projection.v1"
+    )
+    assert [
+        item["path"]
+        for item in requests
+        if item["path"]
+        in {
+            "/api/node-environment",
+            "/api/source-model",
+            "/api/source-model-context",
+        }
+    ] == ["/api/source-model-context"]
 
 
 def test_composer_program_routes_are_strict_stateless_forwarders(

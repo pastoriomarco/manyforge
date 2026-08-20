@@ -14,6 +14,12 @@ import rfc8785
 
 
 MAX_NATIVE_RESPONSE_BYTES = 64 * 1024 * 1024
+# Shared native/HTTP bound: two independently bounded projection children plus
+# only a fixed, bounded allowance for the context response/envelope framing.
+MAX_SOURCE_MODEL_CONTEXT_ENVELOPE_BYTES = 64 * 1024
+MAX_SOURCE_MODEL_CONTEXT_RESPONSE_BYTES = (
+    2 * MAX_NATIVE_RESPONSE_BYTES + MAX_SOURCE_MODEL_CONTEXT_ENVELOPE_BYTES
+)
 MAX_VIEWER_MODEL_URDF_BYTES = 16 * 1024 * 1024
 MAX_VIEWER_MODEL_RESOURCE_BYTES = 256 * 1024 * 1024
 MAX_VIEWER_MODEL_RESOURCE_URI_BYTES = 4096
@@ -159,6 +165,8 @@ class HeadlessCorePort(Protocol):
 
     def source_model_projection(self) -> dict[str, Any]: ...
 
+    def source_model_context(self) -> dict[str, Any]: ...
+
     def scenario_catalog_projection(self) -> dict[str, Any]: ...
 
     def scenario_program_selection(self, scenario_id: str) -> dict[str, Any]: ...
@@ -245,8 +253,13 @@ def _object_without_duplicates(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
     return result
 
 
-def strict_json_object(payload: str, *, label: str) -> dict[str, Any]:
-    if len(payload.encode("utf-8")) > MAX_NATIVE_RESPONSE_BYTES:
+def strict_json_object(
+    payload: str,
+    *,
+    label: str,
+    maximum_bytes: int = MAX_NATIVE_RESPONSE_BYTES,
+) -> dict[str, Any]:
+    if len(payload.encode("utf-8")) > maximum_bytes:
         raise HeadlessApiError(
             "headless_projection_response_oversized",
             f"{label} exceeds the native response byte bound",
@@ -310,7 +323,16 @@ class NativeHeadlessCore:
                 "headless_projection_response_invalid",
                 f"native {method} returned a non-text envelope",
             )
-        envelope = strict_json_object(payload, label=f"native {method} response")
+        maximum_bytes = (
+            MAX_SOURCE_MODEL_CONTEXT_RESPONSE_BYTES
+            if method == "source_model_context"
+            else MAX_NATIVE_RESPONSE_BYTES
+        )
+        envelope = strict_json_object(
+            payload,
+            label=f"native {method} response",
+            maximum_bytes=maximum_bytes,
+        )
         ok = envelope.get("ok")
         if ok is True and set(envelope) == {"ok", "value"}:
             return envelope["value"]
@@ -500,6 +522,12 @@ class NativeHeadlessCore:
         return self._require_object(
             self._invoke("source_model_projection"),
             method="source_model_projection",
+        )
+
+    def source_model_context(self) -> dict[str, Any]:
+        return self._require_object(
+            self._invoke("source_model_context"),
+            method="source_model_context",
         )
 
     def scenario_catalog_projection(self) -> dict[str, Any]:

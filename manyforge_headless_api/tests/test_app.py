@@ -102,6 +102,7 @@ class FakeCore:
         self.program_target_bundle = "bundle.1"
         self.program_target_graph = "graph.1"
         self.model_attempts: list[dict[str, Any]] = []
+        self.source_model_context_override: dict[str, Any] | None = None
 
     def runtime_snapshot(self) -> dict[str, Any]:
         return {
@@ -157,6 +158,15 @@ class FakeCore:
                 "known_gaps": [],
                 "source_owner_id": "headless-api.source-model",
             },
+        }
+
+    def source_model_context(self) -> dict[str, Any]:
+        if self.source_model_context_override is not None:
+            return copy.deepcopy(self.source_model_context_override)
+        return {
+            "schema_version": "manyforge.source_model_context.v1",
+            "node_environment": self.node_environment_projection(),
+            "source_model": self.source_model_projection(),
         }
 
     def scenario_catalog_projection(self) -> dict[str, Any]:
@@ -784,6 +794,30 @@ def _client(*, trusted: bool = False) -> tuple[TestClient, FakeCore, FakeManager
     return TestClient(app), core, manager
 
 
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        lambda context: context.update(
+            {"schema_version": "manyforge.source_model_context.v0"}
+        ),
+        lambda context: context.update({"extra": True}),
+        lambda context: context.pop("source_model"),
+        lambda context: context.update({"source_model": []}),
+    ],
+)
+def test_source_model_context_rejects_closed_or_malformed_envelopes(mutation) -> None:
+    client, core, _manager = _client()
+    context = core.source_model_context()
+    mutation(context)
+    core.source_model_context_override = context
+
+    with client:
+        response = client.get("/api/source-model-context")
+
+    assert response.status_code == 502
+    assert response.json()["detail"]["code"] == "source_model_context_invalid"
+
+
 def _caller() -> dict[str, Any]:
     return {
         "request_id": "request.1",
@@ -810,6 +844,14 @@ def test_runtime_manager_scene_alarm_history_and_health_are_thin_reads() -> None
         assert source_model["occurrences"] == []
         assert source_model["source"]["source_owner_id"] == (
             "headless-api.source-model"
+        )
+        context = client.get("/api/source-model-context").json()
+        assert context["schema_version"] == "manyforge.source_model_context.v1"
+        assert context["node_environment"]["schema_version"] == (
+            "manyforge.node_environment_projection.v1"
+        )
+        assert context["source_model"]["schema_version"] == (
+            "manyforge.source_model_projection.v1"
         )
         scenarios = client.get("/api/scenarios").json()
         assert scenarios["api_version"] == "manyforge.scenario_catalog.v1"
@@ -1673,6 +1715,7 @@ def test_openapi_contains_no_condition_mutation_route() -> None:
     assert "/api/execution/alarms/{condition_id}/acknowledge" in paths
     assert "/api/node-environment" in paths
     assert "/api/source-model" in paths
+    assert "/api/source-model-context" in paths
     assert "/api/scenarios" in paths
     assert "/api/viewer-model/urdf" in paths
     assert "/api/viewer-model/resource" in paths

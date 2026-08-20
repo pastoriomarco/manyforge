@@ -6,7 +6,49 @@ import json
 import httpx
 import pytest
 
-from manyforge_headless_api.client import HeadlessClientError, HeadlessHttpClient
+from manyforge_headless_api.client import (
+    MAX_HTTP_RESPONSE_BYTES,
+    HeadlessClientError,
+    HeadlessHttpClient,
+)
+from manyforge_headless_api.native import (
+    MAX_NATIVE_RESPONSE_BYTES,
+    MAX_SOURCE_MODEL_CONTEXT_RESPONSE_BYTES,
+    HeadlessApiError,
+    NativeHeadlessCore,
+)
+
+
+def _sized_context_payload(size: int, *, native: bool = False) -> bytes:
+    prefix = b'{"ok":true,"value":' if native else b""
+    prefix += (
+        b'{"schema_version":"manyforge.source_model_context.v1",'
+        b'"node_environment":{"schema_version":"manyforge.'
+        b'node_environment_projection.v1"},'
+        b'"source_model":{"schema_version":"manyforge.source_model_projection.v1",'
+        b'"padding":"'
+    )
+    suffix = b'"}}' + (b"}" if native else b"")
+    padding_size = size - len(prefix) - len(suffix)
+    assert padding_size >= 0
+    return prefix + (b"x" * padding_size) + suffix
+
+
+class _NativeResponseFixture:
+    def __init__(self, payload: str) -> None:
+        self.payload = payload
+
+    def source_model_context(self) -> str:
+        return self.payload
+
+    def runtime_snapshot(self) -> str:
+        return self.payload
+
+
+def _native_fixture(payload: bytes) -> NativeHeadlessCore:
+    core = object.__new__(NativeHeadlessCore)
+    core._native = _NativeResponseFixture(payload.decode("utf-8"))
+    return core
 
 
 def test_client_returns_bounded_strict_json_object() -> None:
@@ -69,6 +111,107 @@ def test_client_uses_the_dedicated_source_model_route() -> None:
     finally:
         raw.close()
     assert [request.url.path for request in requests] == ["/api/source-model"]
+
+
+def test_client_uses_the_atomic_source_model_context_route() -> None:
+    requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return httpx.Response(
+            200,
+            json={
+                "schema_version": "manyforge.source_model_context.v1",
+                "node_environment": {},
+                "source_model": {},
+            },
+            request=request,
+        )
+
+    raw = httpx.Client(
+        base_url="http://headless.test",
+        transport=httpx.MockTransport(handler),
+    )
+    client = HeadlessHttpClient("http://unused.test", client=raw)
+    try:
+        assert (
+            client.source_model_context()["schema_version"]
+            == "manyforge.source_model_context.v1"
+        )
+    finally:
+        raw.close()
+    assert [request.url.path for request in requests] == [
+        "/api/source-model-context"
+    ]
+
+
+def test_context_http_bound_is_method_specific() -> None:
+    payload = _sized_context_payload(MAX_HTTP_RESPONSE_BYTES + 1)
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, content=payload, request=request)
+
+    raw = httpx.Client(
+        base_url="http://headless.test",
+        transport=httpx.MockTransport(handler),
+    )
+    client = HeadlessHttpClient("http://unused.test", client=raw)
+    try:
+        assert (
+            client.source_model_context()["schema_version"]
+            == "manyforge.source_model_context.v1"
+        )
+        with pytest.raises(HeadlessClientError) as error:
+            client.runtime()
+    finally:
+        raw.close()
+    assert error.value.code == "headless_http_response_oversized"
+
+
+def test_context_http_bound_rejects_payload_over_context_limit() -> None:
+    payload = _sized_context_payload(
+        MAX_SOURCE_MODEL_CONTEXT_RESPONSE_BYTES + 1
+    )
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, content=payload, request=request)
+
+    raw = httpx.Client(
+        base_url="http://headless.test",
+        transport=httpx.MockTransport(handler),
+    )
+    client = HeadlessHttpClient("http://unused.test", client=raw)
+    try:
+        with pytest.raises(HeadlessClientError) as error:
+            client.source_model_context()
+    finally:
+        raw.close()
+    assert error.value.code == "headless_http_response_oversized"
+
+
+def test_context_native_bound_is_method_specific() -> None:
+    core = _native_fixture(
+        _sized_context_payload(MAX_NATIVE_RESPONSE_BYTES + 1, native=True)
+    )
+    assert (
+        core.source_model_context()["schema_version"]
+        == "manyforge.source_model_context.v1"
+    )
+    with pytest.raises(HeadlessApiError) as error:
+        core.runtime_snapshot()
+    assert error.value.code == "headless_projection_response_oversized"
+
+
+def test_context_native_bound_rejects_payload_over_context_limit() -> None:
+    core = _native_fixture(
+        _sized_context_payload(
+            MAX_SOURCE_MODEL_CONTEXT_RESPONSE_BYTES + 1,
+            native=True,
+        )
+    )
+    with pytest.raises(HeadlessApiError) as error:
+        core.source_model_context()
+    assert error.value.code == "headless_projection_response_oversized"
 
 
 def test_client_uses_the_verified_scenario_catalog_route() -> None:

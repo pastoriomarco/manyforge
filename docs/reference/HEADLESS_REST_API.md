@@ -74,5 +74,6 @@ OpenAPI version: `3.1.0`. Title: `ManyForge Headless Runtime API`.
 | `POST` | `/api/scene/resource-poses/query` |  | Scene Resource Poses |
 | `POST` | `/api/scene/transactions` |  | Scene Commit |
 | `GET` | `/api/source-model` |  | Source Model |
+| `GET` | `/api/source-model-context` |  | Source Model Context |
 | `GET` | `/api/viewer-model/resource` |  | Viewer Model Resource |
 | `GET` | `/api/viewer-model/urdf` |  | Viewer Model Urdf |
