@@ -1,7 +1,8 @@
 import { useEffect, useMemo, useState } from 'react';
 
 import { api } from '../api/client';
-import type { HeadlessStateResult } from '../hooks/useHeadlessState';
+import { useShellHeadlessState, useViewerHeadlessState } from '../hooks/useHeadlessState';
+import type { HeadlessStateSource } from '../hooks/useHeadlessState';
 import type { ProgramWorkspaceController } from '../hooks/useProgramWorkspace';
 import type { RobotControlController } from '../hooks/useRobotControl';
 import {
@@ -26,19 +27,23 @@ import type {
   NodeEnvironmentResponse,
   ProgramDocument,
   ProgramSceneResource,
+  ProgramViewerMetadata,
   SceneUrdfManifest,
+  SourceModelProjection,
   SourceModelOccurrence,
 } from '../types/api';
+import type { Pose3Value } from '../types/robotControl';
 import { StructuralViewer } from './StructuralViewer';
 
 interface SceneAuthoringWorkspaceProps {
   enabled: boolean;
   environment: StructuralResourceState<NodeEnvironmentResponse>;
-  headlessState: HeadlessStateResult;
+  headlessStateSource: HeadlessStateSource;
   manifest: StructuralResourceState<SceneUrdfManifest>;
   onRetryManifest: () => void;
   programController: ProgramWorkspaceController;
   robotControl: RobotControlController;
+  viewerActive: boolean;
 }
 
 const EMPTY_PROGRAM_RESOURCES: ProgramSceneResource[] = [];
@@ -548,15 +553,107 @@ function SourceOccurrencePanel({
   );
 }
 
+function SceneViewerBridge({
+  active,
+  source,
+  sourceValue,
+  environmentValue,
+  manifest,
+  onRetry,
+  program,
+  viewer,
+  selectedObjectId,
+  livePose,
+  selectionLocked,
+  onSelect,
+  ghost,
+  ghostStale,
+}: {
+  active: boolean;
+  source: HeadlessStateSource;
+  sourceValue: SourceModelProjection | null;
+  environmentValue: NodeEnvironmentResponse | null;
+  manifest: StructuralResourceState<SceneUrdfManifest>;
+  onRetry: () => void;
+  program: ProgramDocument | null;
+  viewer: ProgramViewerMetadata | undefined;
+  selectedObjectId: string | null;
+  livePose: LogicalScenePose | null;
+  selectionLocked: boolean;
+  onSelect: (identity: string | null) => void;
+  ghost: Pose3Value | null;
+  ghostStale: boolean;
+}) {
+  const headlessState = useViewerHeadlessState(source, active);
+  const factsResult = useMemo(
+    () => sceneOwnerFacts(
+      headlessState.snapshot?.runtime ?? null,
+      sourceValue,
+      environmentValue,
+    ),
+    [environmentValue, headlessState.snapshot?.runtime, sourceValue],
+  );
+  const facts = factsResult.available ? factsResult.facts : null;
+  const objects = facts?.logicalScene.snapshot?.objects ?? [];
+  const visibleObjects = objects.filter((object) => {
+    const resource = program?.scene?.find(
+      (candidate) => candidate.scene_resource_id === object.scene_resource_id,
+    );
+    return !(resource?.resource_roles ?? []).some(
+      (role) => viewer?.resource_role_visibility?.[role] === false,
+    );
+  });
+  const viewportObjects = visibleObjects.map((object) => (
+    object.scene_resource_id === selectedObjectId
+      && object.placement.kind === 'cell_fixed'
+      && livePose !== null
+      ? { ...object, placement: { ...object.placement, pose_in_cell: livePose } }
+      : object
+  ));
+  const runtimePresentation = runtimeScenePresentation(
+    facts?.sceneRuntime ?? null,
+    facts?.logicalScene ?? null,
+    sourceValue,
+    manifest.status === 'ready' ? manifest.data : null,
+  );
+  return (
+    <StructuralViewer
+      viewerActive={active}
+      manifest={manifest}
+      onRetry={onRetry}
+      sceneObjects={viewportObjects}
+      selectedSceneResourceId={selectedObjectId}
+      onSelectSceneResource={(identity) => {
+        if (!selectionLocked) onSelect(identity);
+      }}
+      candidateTcpPose={ghost}
+      candidateStale={ghostStale}
+      runtimePresentation={runtimePresentation}
+      sceneOwnerIdentity={facts === null ? undefined : {
+        ownerEpoch: facts.sourceOwnerEpoch,
+        generation: facts.sourceGeneration,
+      }}
+      viewerFrameIdentity={headlessState.snapshot?.runtime.complete === true ? {
+        ownerEpoch: headlessState.snapshot.runtime.projectionOwnerEpoch,
+        generation: headlessState.snapshot.runtime.projectionGeneration,
+      } : undefined}
+      pointCloudCellId={facts?.logicalScene.snapshot?.cell_id}
+      viewer={viewer}
+    />
+  );
+}
+
 export function SceneAuthoringWorkspace({
   enabled,
   environment,
-  headlessState,
+  headlessStateSource,
   manifest,
   onRetryManifest,
   programController,
   robotControl,
+  viewerActive,
 }: SceneAuthoringWorkspaceProps) {
+  const headlessState = useShellHeadlessState(headlessStateSource);
   const [sourceModel, retrySourceModel] = useStructuralResource(api.sourceModel.get, {
     enabled,
     disabledMessage: 'Source-model facts require a connected headless owner.',
@@ -579,13 +676,13 @@ export function SceneAuthoringWorkspace({
     () => facts?.logicalScene.snapshot?.objects ?? [],
     [facts],
   );
-  const runtimePresentation = useMemo(
+  const runtimeStatus = useMemo(
     () => runtimeScenePresentation(
       facts?.sceneRuntime ?? null,
       facts?.logicalScene ?? null,
       sourceValue,
       manifest.status === 'ready' ? manifest.data : null,
-    ),
+    ).status,
     [facts, manifest, sourceValue],
   );
   const [selectedOccurrenceId, setSelectedOccurrenceId] = useState<string | null>(null);
@@ -625,21 +722,6 @@ export function SceneAuthoringWorkspace({
   ]);
 
   const viewer = program?.viewer;
-  const visibleObjects = objects.filter((object) => {
-    const resource = program?.scene?.find(
-      (candidate) => candidate.scene_resource_id === object.scene_resource_id,
-    );
-    return !(resource?.resource_roles ?? []).some(
-      (role) => viewer?.resource_role_visibility?.[role] === false,
-    );
-  });
-  const viewportObjects = visibleObjects.map((object) => (
-    object.scene_resource_id === selectedObjectId
-      && object.placement.kind === 'cell_fixed'
-      && livePose !== null
-      ? { ...object, placement: { ...object.placement, pose_in_cell: livePose } }
-      : object
-  ));
   const directControl = robotControl.state.status?.directControl ?? null;
   const tcpRole = directControl?.tcpFrameRoleId ?? null;
   const ghostVisible = tcpRole === null
@@ -802,13 +884,13 @@ export function SceneAuthoringWorkspace({
                 <span>runtime source <code>{facts.runtimeSourceOwnerEpoch}</code> / {facts.runtimeSourceGeneration}</span>
                 <span>revision <code>{facts.logicalScene.snapshot?.revision.revision_id}</code></span>
                 <span>
-                  observations <strong>{runtimePresentation.status.freshGood}</strong> fresh / {runtimePresentation.status.total}
+                  observations <strong>{runtimeStatus.freshGood}</strong> fresh / {runtimeStatus.total}
                 </span>
-                <span>{runtimePresentation.status.staleGood} stale</span>
-                <span>{runtimePresentation.status.unknown} unknown</span>
-                <span>{runtimePresentation.status.buffered} buffered</span>
+                <span>{runtimeStatus.staleGood} stale</span>
+                <span>{runtimeStatus.unknown} unknown</span>
+                <span>{runtimeStatus.buffered} buffered</span>
               </div>
-              {runtimePresentation.status.warnings.map((warning) => (
+              {runtimeStatus.warnings.map((warning) => (
                 <p
                   className="scene-contract-note warning-state"
                   key={warning}
@@ -941,27 +1023,21 @@ export function SceneAuthoringWorkspace({
         </div>
       </section>
 
-      <StructuralViewer
+      <SceneViewerBridge
+        active={viewerActive}
+        source={headlessStateSource}
+        sourceValue={sourceValue}
+        environmentValue={environmentValue}
         manifest={manifest}
         onRetry={onRetryManifest}
-        sceneObjects={viewportObjects}
-        selectedSceneResourceId={selectedObjectId}
-        onSelectSceneResource={(identity) => {
-          if (!selectionLocked) setSelectedObjectId(identity);
-        }}
-        candidateTcpPose={ghost}
-        candidateStale={robotControl.state.ghostStale}
-        runtimePresentation={runtimePresentation}
-        sceneOwnerIdentity={facts === null ? undefined : {
-          ownerEpoch: facts.sourceOwnerEpoch,
-          generation: facts.sourceGeneration,
-        }}
-        viewerFrameIdentity={headlessState.snapshot?.runtime.complete === true ? {
-          ownerEpoch: headlessState.snapshot.runtime.projectionOwnerEpoch,
-          generation: headlessState.snapshot.runtime.projectionGeneration,
-        } : undefined}
-        pointCloudCellId={facts?.logicalScene.snapshot?.cell_id}
+        program={program}
         viewer={viewer}
+        selectedObjectId={selectedObjectId}
+        livePose={livePose}
+        selectionLocked={selectionLocked}
+        onSelect={setSelectedObjectId}
+        ghost={ghost}
+        ghostStale={robotControl.state.ghostStale}
       />
     </>
   );

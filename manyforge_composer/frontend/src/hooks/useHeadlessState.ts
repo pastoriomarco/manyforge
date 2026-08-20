@@ -1,9 +1,10 @@
-import { useCallback, useEffect, useRef, useState } from 'react';
+import { useEffect, useRef, useState, useSyncExternalStore } from 'react';
 import { resolveStructuralAssetUrl } from '../api/client';
 import { parseComposerHeadlessState } from '../api/parsers';
 import type { ComposerHeadlessState } from '../types/headless';
 
 const RECONNECT_DELAY_MS = 1000;
+export const HEADLESS_SHELL_PUBLICATION_MS = 100;
 
 export interface HeadlessStateResult {
   snapshot: ComposerHeadlessState | null;
@@ -63,9 +64,7 @@ export function admitHeadlessState(
     current.runtime,
     candidate.runtime,
   );
-  if (runtimeReason !== null) {
-    return { accepted: false, reason: runtimeReason };
-  }
+  if (runtimeReason !== null) return { accepted: false, reason: runtimeReason };
   const alarmReason = monotonicOwnerSection(
     'Headless alarm projection',
     current.alarms.ownerId,
@@ -91,84 +90,248 @@ function websocketUrl(): string {
   return resolved.toString();
 }
 
-export function useHeadlessState(enabled: boolean): HeadlessStateResult {
-  const [snapshot, setSnapshot] = useState<ComposerHeadlessState | null>(null);
-  const snapshotRef = useRef<ComposerHeadlessState | null>(null);
-  const [error, setError] = useState<string | null>(null);
-  const [reconnectToken, setReconnectToken] = useState(0);
+type Listener = () => void;
 
-  useEffect(() => {
-    if (!enabled) {
-      snapshotRef.current = null;
-      setSnapshot(null);
-      setError(null);
-      return undefined;
+/**
+ * One transport and two bounded delivery lanes for copied owner facts.
+ * This source performs parsing, admission, and scheduling only.
+ */
+export class HeadlessStateSource {
+  private enabled = false;
+  private disposed = false;
+  private serial = 0;
+  private socket: WebSocket | null = null;
+  private reconnectTimer: ReturnType<typeof setTimeout> | null = null;
+  private shellTimer: ReturnType<typeof setTimeout> | null = null;
+  private viewerFrame: number | ReturnType<typeof setTimeout> | null = null;
+  private latest: ComposerHeadlessState | null = null;
+  private latestError: string | null = null;
+  private shellResult: HeadlessStateResult;
+  private viewerResult: HeadlessStateResult;
+  private readonly shellListeners = new Set<Listener>();
+  private readonly viewerListeners = new Set<Listener>();
+
+  constructor() {
+    this.shellResult = { snapshot: null, error: null, reconnect: this.reconnect };
+    this.viewerResult = this.shellResult;
+  }
+
+  readonly subscribeShell = (listener: Listener) => {
+    this.shellListeners.add(listener);
+    return () => this.shellListeners.delete(listener);
+  };
+
+  readonly subscribeViewer = (listener: Listener) => {
+    this.viewerListeners.add(listener);
+    return () => this.viewerListeners.delete(listener);
+  };
+
+  readonly getShellSnapshot = () => this.shellResult;
+  readonly getViewerSnapshot = () => this.viewerResult;
+
+  setEnabled(enabled: boolean): void {
+    if (this.disposed || enabled === this.enabled) return;
+    this.enabled = enabled;
+    this.stopConnection('Composer headless source disabled');
+    this.cancelPublications();
+    this.latest = null;
+    this.latestError = null;
+    if (enabled) {
+      this.connect();
+    } else {
+      this.publishImmediate(null);
     }
-    let active = true;
-    let socket: WebSocket | null = null;
-    let reconnectTimer: ReturnType<typeof setTimeout> | null = null;
+  }
 
-    const connect = () => {
-      if (!active) return;
-      socket = new WebSocket(websocketUrl());
-      socket.onmessage = (message) => {
-        try {
-          const raw: unknown = JSON.parse(String(message.data));
-          if (raw !== null && typeof raw === 'object' && !Array.isArray(raw)) {
-            const errorValue = (raw as Record<string, unknown>).error;
-            if (
-              errorValue !== null
-              && typeof errorValue === 'object'
-              && !Array.isArray(errorValue)
-            ) {
-              const record = errorValue as Record<string, unknown>;
-              const detail = typeof record.message === 'string'
-                ? record.message
-                : 'Headless projection unavailable.';
-              setError(detail);
-              return;
-            }
-          }
-          const candidate = parseComposerHeadlessState(raw);
-          const admission = admitHeadlessState(snapshotRef.current, candidate);
-          if (!admission.accepted) {
-            setError(admission.reason);
-            socket?.close(1002, 'non-monotonic headless projection');
+  readonly reconnect = (): void => {
+    if (!this.enabled || this.disposed) return;
+    this.stopConnection('Composer client reconnect');
+    this.connect();
+  };
+
+  dispose(): void {
+    this.disposed = true;
+    this.enabled = false;
+    this.stopConnection('Composer client unmounted');
+    this.cancelPublications();
+    this.shellListeners.clear();
+    this.viewerListeners.clear();
+  }
+
+  private stopConnection(reason: string): void {
+    this.serial += 1;
+    if (this.reconnectTimer !== null) clearTimeout(this.reconnectTimer);
+    this.reconnectTimer = null;
+    const socket = this.socket;
+    this.socket = null;
+    socket?.close(1000, reason);
+  }
+
+  private connect(): void {
+    if (!this.enabled || this.disposed) return;
+    const serial = ++this.serial;
+    const socket = new WebSocket(websocketUrl());
+    this.socket = socket;
+    socket.onmessage = (message) => {
+      if (serial !== this.serial) return;
+      try {
+        const raw: unknown = JSON.parse(String(message.data));
+        if (raw !== null && typeof raw === 'object' && !Array.isArray(raw)) {
+          const errorValue = (raw as Record<string, unknown>).error;
+          if (
+            errorValue !== null
+            && typeof errorValue === 'object'
+            && !Array.isArray(errorValue)
+          ) {
+            const record = errorValue as Record<string, unknown>;
+            this.publishError(typeof record.message === 'string'
+              ? record.message
+              : 'Headless projection unavailable.');
             return;
           }
-          snapshotRef.current = candidate;
-          setSnapshot(candidate);
-          setError(null);
-        } catch (reason) {
-          setError(
-            reason instanceof Error
-              ? reason.message
-              : 'Invalid headless WebSocket projection.',
-          );
-          socket?.close(1002, 'invalid headless projection');
         }
-      };
-      socket.onerror = () => {
-        setError('Headless WebSocket transport failed.');
-      };
-      socket.onclose = () => {
-        if (active) {
-          setError((current) => current ?? 'Headless projection disconnected.');
-          reconnectTimer = setTimeout(connect, RECONNECT_DELAY_MS);
+        const candidate = parseComposerHeadlessState(raw);
+        const admission = admitHeadlessState(this.latest, candidate);
+        if (!admission.accepted) {
+          this.publishError(admission.reason);
+          socket.close(1002, 'non-monotonic headless projection');
+          return;
         }
-      };
+        if (
+          this.latestError === null
+          && this.latest?.runtime.projectionOwnerEpoch
+            === candidate.runtime.projectionOwnerEpoch
+          && this.latest.runtime.projectionGeneration
+            === candidate.runtime.projectionGeneration
+          && this.latest.alarms.ownerEpoch === candidate.alarms.ownerEpoch
+          && this.latest.alarms.generation === candidate.alarms.generation
+        ) return;
+        this.latest = candidate;
+        this.latestError = null;
+        this.scheduleViewer();
+        this.scheduleShell();
+      } catch (reason) {
+        this.publishError(
+          reason instanceof Error
+            ? reason.message
+            : 'Invalid headless WebSocket projection.',
+        );
+        socket.close(1002, 'invalid headless projection');
+      }
     };
-
-    connect();
-    return () => {
-      active = false;
-      if (reconnectTimer !== null) clearTimeout(reconnectTimer);
-      socket?.close(1000, 'Composer client unmounted');
+    socket.onerror = () => {
+      if (serial === this.serial) this.publishError('Headless WebSocket transport failed.');
     };
-  }, [enabled, reconnectToken]);
+    socket.onclose = () => {
+      if (serial !== this.serial || !this.enabled || this.disposed) return;
+      this.socket = null;
+      if (this.latestError === null) {
+        this.publishError('Headless projection disconnected.');
+      }
+      this.reconnectTimer = setTimeout(() => {
+        if (serial === this.serial) this.connect();
+      }, RECONNECT_DELAY_MS);
+    };
+  }
 
-  const reconnect = useCallback(() => {
-    setReconnectToken((current) => current + 1);
-  }, []);
-  return { snapshot, error, reconnect };
+  private result(): HeadlessStateResult {
+    return {
+      snapshot: this.latest,
+      error: this.latestError,
+      reconnect: this.reconnect,
+    };
+  }
+
+  private publishError(error: string | null): void {
+    this.latestError = error;
+    this.cancelPublications();
+    this.publishImmediate(this.result());
+  }
+
+  private publishImmediate(result: HeadlessStateResult | null): void {
+    const next = result ?? {
+      snapshot: this.latest,
+      error: this.latestError,
+      reconnect: this.reconnect,
+    };
+    this.shellResult = next;
+    this.viewerResult = next;
+    for (const listener of this.shellListeners) listener();
+    for (const listener of this.viewerListeners) listener();
+  }
+
+  private scheduleShell(): void {
+    if (this.shellTimer !== null) return;
+    this.shellTimer = setTimeout(() => {
+      this.shellTimer = null;
+      this.shellResult = this.result();
+      for (const listener of this.shellListeners) listener();
+    }, HEADLESS_SHELL_PUBLICATION_MS);
+  }
+
+  private scheduleViewer(): void {
+    if (this.viewerFrame !== null) return;
+    if (typeof window !== 'undefined' && typeof window.requestAnimationFrame === 'function') {
+      this.viewerFrame = window.requestAnimationFrame(() => this.flushViewer());
+    } else {
+      this.viewerFrame = setTimeout(() => this.flushViewer(), 16);
+    }
+  }
+
+  private flushViewer(): void {
+    this.viewerFrame = null;
+    this.viewerResult = this.result();
+    for (const listener of this.viewerListeners) listener();
+  }
+
+  private cancelViewerFrame(): void {
+    if (this.viewerFrame === null) return;
+    if (typeof this.viewerFrame === 'number'
+      && typeof window !== 'undefined'
+      && typeof window.cancelAnimationFrame === 'function') {
+      window.cancelAnimationFrame(this.viewerFrame);
+    } else {
+      clearTimeout(this.viewerFrame as ReturnType<typeof setTimeout>);
+    }
+    this.viewerFrame = null;
+  }
+
+  private cancelPublications(): void {
+    if (this.shellTimer !== null) clearTimeout(this.shellTimer);
+    this.shellTimer = null;
+    this.cancelViewerFrame();
+  }
+}
+
+export function useHeadlessStateSource(enabled: boolean): HeadlessStateSource {
+  const [source] = useState(() => new HeadlessStateSource());
+  useEffect(() => {
+    source.setEnabled(enabled);
+    return () => source.setEnabled(false);
+  }, [enabled, source]);
+  return source;
+}
+
+export function useShellHeadlessState(source: HeadlessStateSource): HeadlessStateResult {
+  return useSyncExternalStore(
+    source.subscribeShell,
+    source.getShellSnapshot,
+    source.getShellSnapshot,
+  );
+}
+
+export function useViewerHeadlessState(
+  source: HeadlessStateSource,
+  active: boolean,
+): HeadlessStateResult {
+  const inactive = useRef<HeadlessStateResult>({
+    snapshot: null,
+    error: null,
+    reconnect: source.reconnect,
+  });
+  return useSyncExternalStore(
+    active ? source.subscribeViewer : () => () => undefined,
+    active ? source.getViewerSnapshot : () => inactive.current,
+    active ? source.getViewerSnapshot : () => inactive.current,
+  );
 }

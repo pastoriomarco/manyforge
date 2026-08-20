@@ -47,7 +47,11 @@ describe('Composer shell continuity', () => {
     expect(source).toContain("'ArrowLeft', 'ArrowRight', 'Home', 'End'");
     expect(source).toContain('target.current?.focus()');
     expect(source.match(/<SceneAuthoringWorkspace/g)).toHaveLength(1);
-    expect(source.match(/useHeadlessState\(headlessEnabled\)/g)).toHaveLength(1);
+    expect(source.match(/useHeadlessStateSource\(headlessEnabled\)/g)).toHaveLength(1);
+    expect(source).not.toContain('useShellHeadlessState');
+    expect(source).not.toContain('useViewerHeadlessState');
+    expect(source).toContain("const viewerActive = workspaceTab === 'scene'");
+    expect(source).toContain("mobilePane === 'workspace'");
   });
 
   it('switches to mobile panes throughout the 1153-1210px overflow interval', () => {

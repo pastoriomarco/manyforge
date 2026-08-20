@@ -1,5 +1,6 @@
 import {
   useCallback,
+  useEffect,
   useRef,
   useState,
 } from 'react';
@@ -16,9 +17,9 @@ import { ProgramWorkspace } from './components/ProgramWorkspace';
 import { ProgramRuntimePanel } from './components/ProgramRuntimePanel';
 import { SceneAuthoringWorkspace } from './components/SceneAuthoringWorkspace';
 import { UnavailableBanner } from './components/UnavailableBanner';
-import { HeadlessRuntimeSurfacesView } from './components/HeadlessRuntimeSurfaces';
+import { HeadlessRuntimeSurfaces } from './components/HeadlessRuntimeSurfaces';
 import { RobotControlPanelView } from './components/RobotControlPanel';
-import { useHeadlessState } from './hooks/useHeadlessState';
+import { useHeadlessStateSource } from './hooks/useHeadlessState';
 import { useProgramWorkspace } from './hooks/useProgramWorkspace';
 import { useProgramRuntime } from './hooks/useProgramRuntime';
 import { useRobotControl } from './hooks/useRobotControl';
@@ -27,6 +28,19 @@ import type { ArtifactKind, FileBrowserEntry } from './types/api';
 
 type WorkspaceTab = 'program' | 'deployment' | 'scene';
 type MobilePane = 'navigation' | 'workspace' | 'commands';
+const MOBILE_WORKBENCH_QUERY = '(max-width: 76rem)';
+
+function useMobileWorkbench(): boolean {
+  const [mobile, setMobile] = useState(false);
+  useEffect(() => {
+    const query = window.matchMedia(MOBILE_WORKBENCH_QUERY);
+    const update = () => setMobile(query.matches);
+    update();
+    query.addEventListener('change', update);
+    return () => query.removeEventListener('change', update);
+  }, []);
+  return mobile;
+}
 
 function isNotFound(error: unknown): boolean {
   return error instanceof ApiError && error.status === 404;
@@ -40,6 +54,7 @@ export default function App() {
   const [commandsWidth, setCommandsWidth] = useState(360);
   const [navigationCollapsed, setNavigationCollapsed] = useState(false);
   const [commandsCollapsed, setCommandsCollapsed] = useState(false);
+  const mobileWorkbench = useMobileWorkbench();
   const navigationCollapse = useRef<HTMLButtonElement>(null);
   const navigationRail = useRef<HTMLButtonElement>(null);
   const commandsCollapse = useRef<HTMLButtonElement>(null);
@@ -63,7 +78,9 @@ export default function App() {
     && health.data.mode === 'headless_client';
   const assistantEnabled = headlessEnabled
     && health.data.components.assistant_bridge === 'configured';
-  const headlessState = useHeadlessState(headlessEnabled);
+  const headlessStateSource = useHeadlessStateSource(headlessEnabled);
+  const viewerActive = workspaceTab === 'scene'
+    && (!mobileWorkbench || mobilePane === 'workspace');
   const programController = useProgramWorkspace();
   const programRuntime = useProgramRuntime(headlessEnabled);
   const robotControl = useRobotControl(headlessEnabled);
@@ -238,11 +255,12 @@ export default function App() {
             <SceneAuthoringWorkspace
               enabled={headlessEnabled}
               environment={nodeEnvironment}
-              headlessState={headlessState}
+              headlessStateSource={headlessStateSource}
               manifest={manifest}
               onRetryManifest={retryManifest}
               programController={programController}
               robotControl={robotControl}
+              viewerActive={viewerActive}
             />
           </div>
         </section>
@@ -295,9 +313,9 @@ export default function App() {
               controller={robotControl}
             />
             <CCLCPanel enabled={headlessEnabled} />
-            <HeadlessRuntimeSurfacesView
+            <HeadlessRuntimeSurfaces
               enabled={headlessEnabled}
-              headlessState={headlessState}
+              headlessStateSource={headlessStateSource}
             />
             <AssistantOverlay
               enabled={assistantEnabled}

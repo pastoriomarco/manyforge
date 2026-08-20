@@ -1,7 +1,10 @@
 import { useEffect, useMemo, useState } from 'react';
 import { api } from '../api/client';
-import { useHeadlessState } from '../hooks/useHeadlessState';
-import type { HeadlessStateResult } from '../hooks/useHeadlessState';
+import { useShellHeadlessState } from '../hooks/useHeadlessState';
+import type {
+  HeadlessStateResult,
+  HeadlessStateSource,
+} from '../hooks/useHeadlessState';
 import type {
   AlarmLifecycleState,
   AlarmPriority,
@@ -147,9 +150,11 @@ function requestId(): string {
 
 interface HeadlessRuntimeSurfacesProps {
   enabled: boolean;
+  headlessStateSource: HeadlessStateSource;
 }
 
-interface HeadlessRuntimeSurfacesViewProps extends HeadlessRuntimeSurfacesProps {
+interface HeadlessRuntimeSurfacesViewProps {
+  enabled: boolean;
   headlessState: HeadlessStateResult;
 }
 
@@ -346,8 +351,11 @@ export function HeadlessRuntimeSurfacesView({
   );
 }
 
-export function HeadlessRuntimeSurfaces({ enabled }: HeadlessRuntimeSurfacesProps) {
-  const headlessState = useHeadlessState(enabled);
+export function HeadlessRuntimeSurfaces({
+  enabled,
+  headlessStateSource,
+}: HeadlessRuntimeSurfacesProps) {
+  const headlessState = useShellHeadlessState(headlessStateSource);
   return (
     <HeadlessRuntimeSurfacesView
       enabled={enabled}

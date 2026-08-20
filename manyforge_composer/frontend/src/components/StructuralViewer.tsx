@@ -68,6 +68,7 @@ import {
 } from '../utils/viewerPerformance';
 
 interface StructuralViewerProps {
+  viewerActive: boolean;
   manifest: StructuralResourceState<SceneUrdfManifest>;
   onRetry: () => void;
   sceneObjects?: LogicalSceneObject[];
@@ -954,6 +955,42 @@ function PointCloudPoints({ frame }: { frame: PointCloudFrame }) {
   );
 }
 
+interface RetainedCameraPresentation {
+  camera: ViewerCamera;
+  framed: boolean;
+}
+
+function CaptureCameraPresentation({
+  initialPresentation,
+  onCapture,
+}: {
+  initialPresentation: RetainedCameraPresentation;
+  onCapture: (presentation: RetainedCameraPresentation) => void;
+}) {
+  const camera = useThree((state) => state.camera);
+  const controls = useThree((state) => state.controls) as {
+    target?: THREE.Vector3;
+  } | null;
+  const latestPresentationRef = useRef(initialPresentation);
+  useFrame(() => {
+    const target = controls?.target;
+    latestPresentationRef.current = {
+      camera: {
+        position: [camera.position.x, camera.position.y, camera.position.z],
+        target: target === undefined
+          ? latestPresentationRef.current.camera.target
+          : [target.x, target.y, target.z],
+      },
+      framed: true,
+    };
+  });
+  useEffect(
+    () => () => onCapture(latestPresentationRef.current),
+    [onCapture],
+  );
+  return null;
+}
+
 function ViewerCanvas({
   manifest,
   collisionsVisible,
@@ -970,6 +1007,8 @@ function ViewerCanvas({
   viewerFrameIdentity,
   pointCloudFrame,
   viewer,
+  initialCameraPresentation,
+  onCaptureCameraPresentation,
 }: {
   manifest: SceneUrdfManifest | null;
   collisionsVisible: boolean;
@@ -986,6 +1025,10 @@ function ViewerCanvas({
   viewerFrameIdentity: StructuralViewerProps['viewerFrameIdentity'];
   pointCloudFrame: PointCloudFrame | null;
   viewer: ProgramViewerMetadata | undefined;
+  initialCameraPresentation: RetainedCameraPresentation;
+  onCaptureCameraPresentation: (
+    presentation: RetainedCameraPresentation,
+  ) => void;
 }) {
   const devicePixelRatio = typeof window === 'undefined'
     ? 1
@@ -998,7 +1041,7 @@ function ViewerCanvas({
     software: false,
     ...selectViewerPresentationProfile(false, devicePixelRatio),
   }));
-  const selectedCamera = camera ?? DEFAULT_VIEWER_CAMERA;
+  const selectedCamera = initialCameraPresentation.camera;
   const latestFrameAppliers = useMemo(() => new Set<() => void>(), []);
   const applyLatestFrame = useCallback(() => {
     for (const apply of latestFrameAppliers) apply();
@@ -1064,7 +1107,16 @@ function ViewerCanvas({
         dampingFactor={0.1}
         target={selectedCamera.target}
       />
-      <Bounds fit={camera === null} clip observe margin={1.25}>
+      <CaptureCameraPresentation
+        initialPresentation={initialCameraPresentation}
+        onCapture={onCaptureCameraPresentation}
+      />
+      <Bounds
+        fit={camera === null && !initialCameraPresentation.framed}
+        clip
+        observe
+        margin={1.25}
+      >
         {manifest !== null && (
           <AssetErrorBoundary
             resetKey={manifest.model_key}
@@ -1136,6 +1188,7 @@ function ViewerCanvas({
 }
 
 function StructuralViewerContent({
+  viewerActive,
   manifest,
   onRetry,
   sceneObjects = [],
@@ -1155,12 +1208,27 @@ function StructuralViewerContent({
   );
   const [pointCloudVisible, setPointCloudVisible] = useState(false);
   const [assetError, setAssetError] = useState<Error | null>(null);
-  const pointCloudEnabled = pointCloudVisible && pointCloudCellId !== undefined;
+  const pointCloudEnabled = viewerActive
+    && pointCloudVisible
+    && pointCloudCellId !== undefined;
   const pointCloud = usePointCloudFrame(pointCloudEnabled, pointCloudCellId);
   const camera = useMemo(
     () => parseViewerCameraQuery(
       typeof window === 'undefined' ? '' : window.location.search,
     ),
+    [],
+  );
+  const [cameraPresentation, setCameraPresentation] = useState<RetainedCameraPresentation>({
+    camera: camera ?? {
+      position: [...DEFAULT_VIEWER_CAMERA.position],
+      target: [...DEFAULT_VIEWER_CAMERA.target],
+    },
+    framed: camera !== null,
+  });
+  const captureCameraPresentation = useCallback(
+    (presentation: RetainedCameraPresentation) => {
+      setCameraPresentation(presentation);
+    },
     [],
   );
 
@@ -1260,13 +1328,13 @@ function StructuralViewerContent({
       </header>
 
       <div className="viewer-stage" role="img" aria-label="Scene authoring viewport">
-        {(
+        {viewerActive && (
           visibleGeometryCount > 0
           || viewerFrameIdentity !== undefined
           || pointCloudEnabled
         ) && (
           <ViewerCanvas
-            key={`${manifest.status === 'ready' ? manifest.data.model_key : 'no-structural-model'}:${collisionsVisible ? 'collision' : 'visual'}:${sceneOwnerIdentity?.ownerEpoch ?? 'no-scene-owner'}:${sceneOwnerIdentity?.generation ?? -1}`}
+            key={`${manifest.status === 'ready' ? manifest.data.model_key : 'no-structural-model'}:${sceneOwnerIdentity?.ownerEpoch ?? 'no-scene-owner'}`}
             manifest={manifest.status === 'ready' ? manifest.data : null}
             collisionsVisible={collisionsVisible}
             wireframeVisible={wireframeVisible}
@@ -1282,6 +1350,8 @@ function StructuralViewerContent({
             viewerFrameIdentity={viewerFrameIdentity}
             pointCloudFrame={pointCloud.frame}
             viewer={viewer}
+            initialCameraPresentation={cameraPresentation}
+            onCaptureCameraPresentation={captureCameraPresentation}
           />
         )}
 

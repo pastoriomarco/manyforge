@@ -50,7 +50,7 @@ describe('viewer failure isolation', () => {
       new URL('./StructuralViewer.tsx', import.meta.url),
       'utf8',
     );
-    const bounds = source.indexOf('<Bounds fit={camera === null}');
+    const bounds = source.indexOf('<Bounds');
     const boundsEnd = source.indexOf('</Bounds>', bounds);
 
     expect(bounds).toBeGreaterThan(0);
@@ -59,5 +59,23 @@ describe('viewer failure isolation', () => {
     expect(source.indexOf('<MeasuredLogicalSceneObjects', bounds)).toBeLessThan(boundsEnd);
     expect(source.indexOf('<PointCloudPoints', bounds)).toBeLessThan(boundsEnd);
     expect(source).toContain('viewer-stage viewer-fallback-stage');
+    expect(source).toContain(
+      'fit={camera === null && !initialCameraPresentation.framed}',
+    );
+  });
+
+  it('suspends only viewer observers while retaining outer presentation state', () => {
+    const source = readFileSync(
+      new URL('./StructuralViewer.tsx', import.meta.url),
+      'utf8',
+    );
+
+    expect(source).toContain('const pointCloudEnabled = viewerActive');
+    expect(source).toContain('{viewerActive && (');
+    expect(source).toContain('<BoundSnapshotResponder');
+    expect(source).not.toContain("sceneOwnerIdentity?.generation ?? -1");
+    expect(source.indexOf('const [pointCloudVisible')).toBeLessThan(
+      source.indexOf('{viewerActive && ('),
+    );
   });
 });
