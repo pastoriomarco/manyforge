@@ -10,6 +10,7 @@
 
 #include <manyforge_core/runtime_contract_manifest_codec.hpp>
 #include <manyforge_core/types/capability_definition.hpp>
+#include <manyforge_core/types/error_code.hpp>
 
 #include "native_execution_runtime_unit_internal.hpp"
 #include "reference_runtime_unit_internal.hpp"
@@ -26,6 +27,38 @@ using CapabilityReference = std::pair<std::string_view, std::string_view>;
 // These are the maintained installed-runtime declarations.  They are
 // intentionally explicit rather than being inferred from the node catalog,
 // executable registry, or the complete capability-definition registry.
+constexpr std::array<CapabilityReference, 14U>
+    kLogicalSceneServicesOfferedCapabilities{{
+        {"collision.query.detailed",
+         "sha256:59cfd352c4a08e315f95c2cb93ada8d2a16a6d2155f83b1c7603e9643088f73b"},
+        {"collision.query.pre_execution",
+         "sha256:c45cdcea2f79fbef5d1bc95db064078560c7d5d161b72667a5ce2c72a7432eca"},
+        {"observability.trace.scene",
+         "sha256:aa079df5821ad6ad0fdfc15f15368ca6682cd17dd1c804998e4e954fe1979180"},
+        {"scene.edit.add",
+         "sha256:9f7fbd7203abe565edfb6468d9e52fa15c028f3636615eb62a8d5e8e0c84fea5"},
+        {"scene.edit.attach_detach",
+         "sha256:444c80303025e78b49df614d71c7df35d0f40867cb0901a8bd0117e65d50eed2"},
+        {"scene.edit.remove",
+         "sha256:c19f72293c0b9f54b24e8f165b27112e3ad8496e1d319f0d20d74b7eee6951bc"},
+        {"scene.edit.update_pose",
+         "sha256:2289472ab0392c94e512d8bfe65406ef7a7ffafb73b40381bd36f627248de4f3"},
+        {"scene.edit.upsert",
+         "sha256:01668536a12a75af7024ce6dd1248ce5fd18f25f75d1fadfb953b4b7da0ed1f2"},
+        {"scene.object.query",
+         "sha256:59bad10b1c6eea73c493dbba88cf15befe3345d32bbebd0b7c7fce4947531109"},
+        {"scene.reference.resolve",
+         "sha256:4f66fab4656567598a11844b3b2572112b5239d9eaca4a538f90e082db7154d9"},
+        {"scene.shape.box",
+         "sha256:76e9a3ca351e30e271ec75e3b6de1ea42a718f81cca35cda6bab4ee642e1e12d"},
+        {"scene.shape.cylinder",
+         "sha256:4ffc860d1851db9b3a7fd82f5e9bd88eb1eca624dba372852fb2912fab9e34d5"},
+        {"scene.shape.mesh",
+         "sha256:5ea0a60f5d788c2133419b84f110f0edc033405c7bfd7385086888f09bd2779e"},
+        {"scene.shape.sphere",
+         "sha256:d84d92a0e0d9592ead27340278315b3a691c18a902fec44bc99626f36d9bc8f2"},
+    }};
+
 constexpr std::array<CapabilityReference, 22U>
     kNativeExecutionOfferedCapabilities{{
         {"execution.contact.geometric",
@@ -141,6 +174,26 @@ declared_capabilities(const std::array<CapabilityReference, N>& declaration) {
     result.emplace_back(core::CapabilityId(std::string(capability_id)),
                         core::CapabilityDefinitionRevision(
                             std::string(revision)));
+  }
+  return result;
+}
+
+template <std::size_t N, std::size_t M>
+[[nodiscard]] std::vector<RuntimeCapabilityContractRefDTO>
+declared_capabilities(
+    const std::array<CapabilityReference, N>& runtime_declaration,
+    const std::array<CapabilityReference, M>& shared_declaration) {
+  auto result = declared_capabilities(runtime_declaration);
+  const auto shared = declared_capabilities(shared_declaration);
+  result.insert(result.end(), shared.begin(), shared.end());
+  return result;
+}
+
+[[nodiscard]] std::string compatibility_diagnostic(
+    const core::ErrorDTO& error) {
+  std::string result = error.message;
+  for (const auto& [key, value] : error.details) {
+    result += " (" + key + "=" + value + ")";
   }
   return result;
 }
@@ -399,7 +452,8 @@ BuildQualifiedRuntimeContractRegistry::make_rows() {
            core::ApiContractId(std::string(
                native_execution_runtime_contract::
                    kLogicalSceneEndpointApiContractId))},
-          declared_capabilities(kNativeExecutionOfferedCapabilities)),
+          declared_capabilities(kNativeExecutionOfferedCapabilities,
+                                kLogicalSceneServicesOfferedCapabilities)),
       {role_mapping(detail::kNativeExecutionRuntimeRoleId,
                     native_execution_runtime_contract::kRuntimeRoleApiContractId,
                     "native-execution-host")},
@@ -437,8 +491,8 @@ BuildQualifiedRuntimeContractRegistry::make_rows() {
            core::ApiContractId(std::string(
                ros2_control_execution_runtime_contract::
                    kLogicalSceneEndpointApiContractId))},
-          declared_capabilities(
-              kRos2ControlExecutionOfferedCapabilities)),
+          declared_capabilities(kRos2ControlExecutionOfferedCapabilities,
+                                kLogicalSceneServicesOfferedCapabilities)),
       {role_mapping(
           detail::kRos2ControlExecutionRuntimeRoleId,
           ros2_control_execution_runtime_contract::kRuntimeRoleApiContractId,
@@ -873,7 +927,8 @@ derive_runtime_contract_requirements(
         row.offer(), requirement.value());
     if (!compatible.ok()) {
       fail_retained_bundle(
-          "runtime requirement is incompatible with its selected offer");
+          "runtime requirement is incompatible with its selected offer: " +
+          compatibility_diagnostic(compatible.error()));
     }
     result.push_back({unit.runtime_unit_id, requirement.value()});
   }
@@ -976,8 +1031,9 @@ void require_runtime_contract_requirements(
     const auto compatible = core::CheckRuntimeContractCompatibility(
         row.offer(), requirement.requirement);
     if (!compatible.ok()) {
-      fail_retained_bundle(
-          "retained runtime-contract requirement is incompatible");
+      fail_retained_bundle("retained runtime-contract requirement is "
+                           "incompatible: " +
+                           compatibility_diagnostic(compatible.error()));
     }
   }
   if (!runtime_unit_products.empty()) {

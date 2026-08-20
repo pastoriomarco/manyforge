@@ -1,6 +1,7 @@
 #include <gtest/gtest.h>
 
 #include <manyforge_core/runtime_contract_manifest_codec.hpp>
+#include <manyforge_core/types/capability_definition.hpp>
 #include <manyforge_deployment/artifact_codec.hpp>
 #include <manyforge_deployment/cell_applicability.hpp>
 #include <manyforge_deployment/cell_compiler.hpp>
@@ -22,9 +23,11 @@
 #include <memory>
 #include <set>
 #include <span>
+#include <stdexcept>
 #include <string>
 #include <string_view>
 #include <type_traits>
+#include <utility>
 #include <variant>
 #include <vector>
 
@@ -76,6 +79,124 @@ namespace {
 
 constexpr std::string_view kZeroDigest =
     "sha256:0000000000000000000000000000000000000000000000000000000000000000";
+
+using LogicalSceneCapabilityReference =
+    std::pair<std::string_view, std::string_view>;
+
+constexpr std::array<LogicalSceneCapabilityReference, 14U>
+    kLogicalSceneCapabilityReferences{{
+        {"collision.query.detailed",
+         "sha256:59cfd352c4a08e315f95c2cb93ada8d2a16a6d2155f83b1c7603e9643088f73b"},
+        {"collision.query.pre_execution",
+         "sha256:c45cdcea2f79fbef5d1bc95db064078560c7d5d161b72667a5ce2c72a7432eca"},
+        {"observability.trace.scene",
+         "sha256:aa079df5821ad6ad0fdfc15f15368ca6682cd17dd1c804998e4e954fe1979180"},
+        {"scene.edit.add",
+         "sha256:9f7fbd7203abe565edfb6468d9e52fa15c028f3636615eb62a8d5e8e0c84fea5"},
+        {"scene.edit.attach_detach",
+         "sha256:444c80303025e78b49df614d71c7df35d0f40867cb0901a8bd0117e65d50eed2"},
+        {"scene.edit.remove",
+         "sha256:c19f72293c0b9f54b24e8f165b27112e3ad8496e1d319f0d20d74b7eee6951bc"},
+        {"scene.edit.update_pose",
+         "sha256:2289472ab0392c94e512d8bfe65406ef7a7ffafb73b40381bd36f627248de4f3"},
+        {"scene.edit.upsert",
+         "sha256:01668536a12a75af7024ce6dd1248ce5fd18f25f75d1fadfb953b4b7da0ed1f2"},
+        {"scene.object.query",
+         "sha256:59bad10b1c6eea73c493dbba88cf15befe3345d32bbebd0b7c7fce4947531109"},
+        {"scene.reference.resolve",
+         "sha256:4f66fab4656567598a11844b3b2572112b5239d9eaca4a538f90e082db7154d9"},
+        {"scene.shape.box",
+         "sha256:76e9a3ca351e30e271ec75e3b6de1ea42a718f81cca35cda6bab4ee642e1e12d"},
+        {"scene.shape.cylinder",
+         "sha256:4ffc860d1851db9b3a7fd82f5e9bd88eb1eca624dba372852fb2912fab9e34d5"},
+        {"scene.shape.mesh",
+         "sha256:5ea0a60f5d788c2133419b84f110f0edc033405c7bfd7385086888f09bd2779e"},
+        {"scene.shape.sphere",
+         "sha256:d84d92a0e0d9592ead27340278315b3a691c18a902fec44bc99626f36d9bc8f2"},
+    }};
+
+struct LogicalSceneRuntimeCoverage final {
+  std::vector<core::CapabilityProviderBindingDTO> bindings;
+  std::vector<LogicalCapabilityTemplate> capabilities;
+  std::vector<LogicalProviderEndpointTemplate> endpoints;
+};
+
+[[nodiscard]] LogicalSceneRuntimeCoverage
+make_logical_scene_runtime_coverage(const core::RuntimeUnitDTO& runtime,
+                                    const core::CellId& cell_id) {
+  constexpr std::string_view kLogicalSceneEndpointRole =
+      "logical_scene_services";
+  const core::ProviderInstanceId provider_instance("logical_scene_provider");
+  const core::ProviderManifestId provider_manifest(
+      "manyforge.provider.logical_scene");
+  const core::ProviderManifestRevision provider_manifest_revision{
+      std::string(kZeroDigest)};
+  LogicalSceneRuntimeCoverage result;
+  result.bindings.reserve(kLogicalSceneCapabilityReferences.size());
+  result.capabilities.reserve(kLogicalSceneCapabilityReferences.size());
+  result.endpoints.reserve(kLogicalSceneCapabilityReferences.size());
+  for (const auto& [capability_id, capability_revision] :
+       kLogicalSceneCapabilityReferences) {
+    const auto* descriptor =
+        core::find_builtin_capability_definition(capability_id);
+    if (descriptor == nullptr ||
+        descriptor->capability_definition_revision != capability_revision) {
+      throw std::logic_error(
+          "logical-scene regression fixture has a stale capability");
+    }
+    const core::CapabilityProviderBindingId binding_id(
+        "logical_scene_" + std::string(capability_id));
+    const core::CapabilityProviderBindingRevision binding_revision{
+        std::string(kZeroDigest)};
+    const core::CapabilityId capability{std::string(capability_id)};
+    const core::CapabilityDefinitionRevision revision{
+        std::string(capability_revision)};
+    const core::EndpointRoleId endpoint_role{
+        std::string(kLogicalSceneEndpointRole)};
+    result.bindings.push_back({
+        binding_id,
+        binding_revision,
+        capability,
+        revision,
+        descriptor->scope,
+        core::CellGlobalCapabilityProviderTargetDTO{cell_id},
+        provider_instance,
+        provider_manifest,
+        provider_manifest_revision,
+        {{endpoint_role,
+          core::CapabilityEndpointSourceKind::kRuntimeUnit,
+          runtime.runtime_unit_id,
+          endpoint_role}},
+    });
+    result.capabilities.push_back({
+        CapabilityProviderCapabilityOwner{binding_id, binding_revision},
+        capability,
+        revision,
+        descriptor->scope,
+        descriptor->provider_binding_kind,
+        provider_instance,
+        provider_manifest,
+        provider_manifest_revision,
+        std::string(capability_id),
+    });
+    result.endpoints.push_back({
+        binding_id,
+        binding_revision,
+        endpoint_role,
+        provider_instance,
+        provider_manifest,
+        provider_manifest_revision,
+        RuntimeEndpointSourceTemplate{
+            runtime.runtime_unit_id,
+            runtime.runtime_profile_id,
+            runtime.runtime_profile_revision,
+            endpoint_role,
+        },
+        std::string(capability_id),
+    });
+  }
+  return result;
+}
 
 static_assert(!std::is_aggregate_v<detail::BuildQualifiedRetentionContext>);
 static_assert(
@@ -1644,6 +1765,55 @@ TEST(RetainedBundleMaterializer,
   for (const auto &[runtime_id, capabilities] : capabilities_by_runtime) {
     SCOPED_TRACE(runtime_id);
     EXPECT_EQ(capabilities, expected_capabilities);
+  }
+}
+
+TEST(RetainedBundleMaterializer,
+     LogicalSceneRuntimeRequirementsMatchNativeAndRos2ControlOffers) {
+  for (const bool ros2_control : {false, true}) {
+    SCOPED_TRACE(ros2_control ? "ros2_control" : "native");
+    const auto fixture =
+        ros2_control
+            ? test::make_lite6_ros2_control_motion_retention_fixture()
+            : test::make_lite6_native_motion_retention_fixture();
+    const auto& applicability = fixture.qualified.compiler_ir().applicability();
+    const auto& graph = applicability.composition().graph();
+    ASSERT_EQ(graph.runtime_units.size(), 1U);
+    const auto coverage = make_logical_scene_runtime_coverage(
+        graph.runtime_units.front(), graph.cell_id);
+
+    const auto requirements = detail::derive_runtime_contract_requirements(
+        graph, coverage.bindings, coverage.capabilities, coverage.endpoints,
+        applicability.runtime_profiles(), {});
+    ASSERT_EQ(requirements.size(), 1U);
+    const auto& requirement = requirements.front().requirement;
+    ASSERT_EQ(requirement.required_capabilities.size(),
+              kLogicalSceneCapabilityReferences.size());
+
+    std::vector<core::RuntimeCapabilityContractRefDTO> expected_capabilities;
+    expected_capabilities.reserve(kLogicalSceneCapabilityReferences.size());
+    for (const auto& [capability_id, capability_revision] :
+         kLogicalSceneCapabilityReferences) {
+      expected_capabilities.push_back({
+          core::CapabilityId(std::string(capability_id)),
+          core::CapabilityDefinitionRevision(std::string(capability_revision)),
+      });
+    }
+    EXPECT_EQ(requirement.required_capabilities, expected_capabilities);
+
+    const auto& selected_offer =
+        detail::require_runtime_contract_for_unit(graph.runtime_units.front())
+            .offer();
+    EXPECT_TRUE(
+        core::CheckRuntimeContractCompatibility(selected_offer, requirement)
+            .ok());
+    ASSERT_EQ(coverage.endpoints.front().endpoint_role_id.value(),
+              "logical_scene_services");
+    const auto* source = std::get_if<RuntimeEndpointSourceTemplate>(
+        &coverage.endpoints.front().source);
+    ASSERT_NE(source, nullptr);
+    EXPECT_EQ(source->runtime_unit_id,
+              graph.runtime_units.front().runtime_unit_id);
   }
 }
 

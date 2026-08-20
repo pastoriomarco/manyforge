@@ -1,11 +1,16 @@
 #include <gtest/gtest.h>
 
 #include <algorithm>
+#include <array>
 #include <string>
+#include <string_view>
 #include <vector>
 
 #include <manyforge_core/runtime_contract_manifest_codec.hpp>
+#include <manyforge_core/types/capability_definition.hpp>
+#include <manyforge_deployment/native_execution_runtime_contract.hpp>
 #include <manyforge_deployment/runtime_contract_registry.hpp>
+#include <manyforge_deployment/ros2_control_execution_runtime_contract.hpp>
 
 namespace manyforge::deployment {
 namespace {
@@ -71,6 +76,70 @@ TEST(RuntimeContractRegistry,
   std::sort(families.begin(), families.end());
   EXPECT_EQ(std::adjacent_find(families.begin(), families.end()),
             families.end());
+}
+
+TEST(RuntimeContractRegistry,
+     NativeAndRos2ControlOffersIncludeCanonicalLogicalSceneCapabilities) {
+  const auto& registry = build_qualified_runtime_contract_registry();
+  const std::array<std::string_view, 14U> logical_scene_capability_ids{{
+      "collision.query.detailed",
+      "collision.query.pre_execution",
+      "observability.trace.scene",
+      "scene.edit.add",
+      "scene.edit.attach_detach",
+      "scene.edit.remove",
+      "scene.edit.update_pose",
+      "scene.edit.upsert",
+      "scene.object.query",
+      "scene.reference.resolve",
+      "scene.shape.box",
+      "scene.shape.cylinder",
+      "scene.shape.mesh",
+      "scene.shape.sphere",
+  }};
+  const auto check_offer = [&](const auto& offer, std::size_t expected_size) {
+    ASSERT_EQ(offer.provided_capabilities.size(), expected_size);
+    EXPECT_TRUE(std::is_sorted(
+        offer.provided_capabilities.begin(), offer.provided_capabilities.end(),
+        [](const auto& left, const auto& right) {
+          if (left.capability_id != right.capability_id) {
+            return left.capability_id < right.capability_id;
+          }
+          return left.capability_definition_revision <
+                 right.capability_definition_revision;
+        }));
+    for (const auto capability_id : logical_scene_capability_ids) {
+      const auto* descriptor =
+          core::find_builtin_capability_definition(capability_id);
+      ASSERT_NE(descriptor, nullptr);
+      const core::RuntimeCapabilityContractRefDTO expected{
+          core::CapabilityId(std::string(capability_id)),
+          core::CapabilityDefinitionRevision(
+              std::string(descriptor->capability_definition_revision))};
+      EXPECT_NE(std::find(offer.provided_capabilities.begin(),
+                          offer.provided_capabilities.end(),
+                          expected),
+                offer.provided_capabilities.end())
+          << capability_id;
+    }
+  };
+
+  const auto native = std::find_if(
+      registry.contracts().begin(), registry.contracts().end(),
+      [](const auto& row) {
+        return row.offer().runtime_implementation_id.value() ==
+               native_execution_runtime_contract::kImplementationId;
+      });
+  const auto ros2_control = std::find_if(
+      registry.contracts().begin(), registry.contracts().end(),
+      [](const auto& row) {
+        return row.offer().runtime_implementation_id.value() ==
+               ros2_control_execution_runtime_contract::kImplementationId;
+      });
+  ASSERT_NE(native, registry.contracts().end());
+  ASSERT_NE(ros2_control, registry.contracts().end());
+  check_offer(native->offer(), 36U);
+  check_offer(ros2_control->offer(), 41U);
 }
 
 TEST(RuntimeContractRegistry,
