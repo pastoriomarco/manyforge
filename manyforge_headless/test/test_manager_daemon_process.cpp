@@ -305,6 +305,20 @@ private:
   pid_t pid_{-1};
 };
 
+std::vector<pid_t> ReadDirectChildren(const pid_t parent) {
+  std::ifstream stream(std::filesystem::path("/proc") /
+                       std::to_string(parent) / "task" /
+                       std::to_string(parent) / "children");
+  std::vector<pid_t> children;
+  pid_t child = 0;
+  while (stream >> child) {
+    if (child > 0) {
+      children.push_back(child);
+    }
+  }
+  return children;
+}
+
 #if defined(MANYFORGE_HEADLESS_TEST_NATIVE_EXECUTION_HOST)
 std::filesystem::path
 PrepareManagerApplyInstalledTargets(
@@ -473,20 +487,6 @@ RuntimeOfferProjection WaitForRuntimeOfferProjection(
   }
   throw std::runtime_error(
       "Manager source did not publish the expected runtime offer projection");
-}
-
-std::vector<pid_t> ReadDirectChildren(const pid_t parent) {
-  std::ifstream stream(std::filesystem::path("/proc") /
-                       std::to_string(parent) / "task" /
-                       std::to_string(parent) / "children");
-  std::vector<pid_t> children;
-  pid_t child = 0;
-  while (stream >> child) {
-    if (child > 0) {
-      children.push_back(child);
-    }
-  }
-  return children;
 }
 
 pid_t WaitForSoleManagedChild(const pid_t manager,
