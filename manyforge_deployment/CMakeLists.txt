@@ -598,6 +598,8 @@ else()
   # second runtime-contract codec or requiring the full Core link closure.
   add_library(manyforge_deployment_runtime_contract_codec STATIC
     "${MANYFORGE_RUNTIME_CONTRACT_CODEC_SOURCE}")
+  set_target_properties(manyforge_deployment_runtime_contract_codec
+    PROPERTIES POSITION_INDEPENDENT_CODE ON)
   target_include_directories(manyforge_deployment_runtime_contract_codec
     PUBLIC
     "${MANYFORGE_CORE_INCLUDE_DIR}"
