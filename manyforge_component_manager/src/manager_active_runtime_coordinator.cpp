@@ -130,7 +130,8 @@ MakeExpectation(const RuntimeUnitConvergencePlanRowDTO &row) {
       row.product_identity.value(), row.configuration_identity.value(),
       kManagerRuntimeMaximumPresenceAgeNs, kManagerRuntimeMaximumReportAgeNs,
       std::nullopt, std::move(dependencies), std::move(roles),
-      ManagedCommandSurfaceState::kClosedNoActiveEffect);
+      ManagedCommandSurfaceState::kClosedNoActiveEffect,
+      row.runtime_contract_offer_digest.value());
 }
 
 void IngestPresence(RuntimeObservationReducer &reducer,

@@ -894,6 +894,21 @@ TEST(ProgramBindingCompilerTest,
                    target, mismatched_provider_runtime)),
                RuntimeProgramBindingResolutionError);
 
+  auto foreign_provider = active_facts_for(target);
+  ASSERT_TRUE(target.control_binding().has_value());
+  const auto provider_fact = std::find_if(
+      foreign_provider.provider_epochs.begin(),
+      foreign_provider.provider_epochs.end(), [&](const auto &fact) {
+        return fact.provider_instance_id ==
+               target.control_binding()->provider_instance_id;
+      });
+  ASSERT_NE(provider_fact, foreign_provider.provider_epochs.end());
+  provider_fact->provider_instance_id =
+      manyforge::core::ProviderInstanceId("foreign_provider");
+  EXPECT_THROW(static_cast<void>(build_runtime_participant_binding_dto(
+                   target, foreign_provider)),
+               RuntimeProgramBindingResolutionError);
+
   auto wrong_route = active_facts_for(target);
   wrong_route.control_route_id = manyforge::core::ControlRouteId("other");
   EXPECT_THROW(static_cast<void>(

@@ -529,6 +529,42 @@ TEST(DeploymentApplicabilityCodec,
             produced.value()
                 .capability_provider_bindings[0]
                 .capability_provider_binding_revision);
+
+  const auto expect_stale_binding = [&](std::string_view from,
+                                        std::string_view to) {
+    EXPECT_THROW(
+        {
+          const auto stale = decode(replace_first(verified_document, from, to));
+          static_cast<void>(
+              verify_capability_provider_binding_revisions(stale));
+        },
+        DeploymentApplicabilityCodecError);
+  };
+  // A manifest match cannot repair a changed provider, binding, target, or
+  // scope: each is part of the exact applicability-owned binding identity.
+  expect_stale_binding("\"planner_provider\"", "\"foreign_provider\"");
+  expect_stale_binding("\"planner_binding\"", "\"foreign_binding\"");
+  expect_stale_binding("\"arm_target\"", "\"foreign_target\"");
+  const auto alternate_target = canonical_json(
+      parse_strict_json_model_yaml(
+          "{\"control_domain_id\":\"arm_domain\","
+          "\"control_domain_revision\":\"" +
+          std::string(kZeroDigest) +
+          "\",\"controller_topology_id\":\"standard_topology\","
+          "\"topology_revision\":\"" +
+          std::string(kZeroDigest) + "\"}")
+          .root());
+  const auto canonical_target = canonical_json(
+      parse_strict_json_model_yaml(target_binding_target()).root());
+  const auto alternate_scope_document = replace_first(
+      replace_first(verified_document, "\"scope\":\"target_binding\"",
+                    "\"scope\":\"control_domain\""),
+      "\"target\":" + canonical_target, "\"target\":" + alternate_target);
+  const auto alternate_scope = decode(alternate_scope_document);
+  EXPECT_THROW(
+      static_cast<void>(
+          verify_capability_provider_binding_revisions(alternate_scope)),
+      DeploymentApplicabilityCodecError);
 }
 
 TEST(DeploymentApplicabilityCodec,

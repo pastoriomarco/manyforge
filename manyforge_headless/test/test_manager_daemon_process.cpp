@@ -13,12 +13,17 @@
 #include <filesystem>
 #include <fstream>
 #include <iterator>
+#include <memory>
 #include <optional>
 #include <manyforge_component_manager/durable_store_set.hpp>
 #include <manyforge_component_manager/manager_apply_journal.hpp>
+#include <manyforge_component_manager/native_execution_runtime_unit_admission.hpp>
 #include <manyforge_content_identity/content_identity.hpp>
 #include <manyforge_deployment/artifact_codec.hpp>
 #include <manyforge_deployment/canonical_empty_admission.hpp>
+#include <manyforge_deployment/native_execution_runtime_contract.hpp>
+#include <manyforge_deployment/runtime_contract_registry.hpp>
+#include <manyforge_deployment/verified_retained_bundle.hpp>
 #include <stdexcept>
 #include <string>
 #include <thread>
@@ -73,9 +78,10 @@ struct ManagerApplyFixtureMetadata final {
   std::string predecessor_retained_bundle_id;
 };
 
-ManagerApplyFixtureMetadata ReadManagerApplyFixtureMetadata() {
-  std::ifstream stream(MANYFORGE_HEADLESS_TEST_MANAGER_APPLY_METADATA,
-                       std::ios::binary);
+ManagerApplyFixtureMetadata ReadManagerApplyFixtureMetadata(
+    const std::filesystem::path &metadata_path =
+        MANYFORGE_HEADLESS_TEST_MANAGER_APPLY_METADATA) {
+  std::ifstream stream(metadata_path, std::ios::binary);
   if (!stream) {
     throw std::runtime_error("Manager Apply fixture metadata is absent");
   }
@@ -279,7 +285,10 @@ private:
 
 #if defined(MANYFORGE_HEADLESS_TEST_NATIVE_EXECUTION_HOST)
 std::filesystem::path
-PrepareManagerApplyInstalledTargets(const DaemonDirectory &directory) {
+PrepareManagerApplyInstalledTargets(
+    const DaemonDirectory &directory,
+    const std::filesystem::path &native_host_source =
+        MANYFORGE_HEADLESS_TEST_NATIVE_EXECUTION_HOST) {
   std::filesystem::create_directory(directory.installed_root());
   const auto manager = directory.installed_root() / "manyforge_manager_daemon";
   const auto native_host =
@@ -288,8 +297,7 @@ PrepareManagerApplyInstalledTargets(const DaemonDirectory &directory) {
       directory.installed_root() / "manyforge_roboplan_candidate_worker";
   std::filesystem::copy_file(MANYFORGE_HEADLESS_TEST_MANAGER_DAEMON, manager,
                              std::filesystem::copy_options::overwrite_existing);
-  std::filesystem::copy_file(MANYFORGE_HEADLESS_TEST_NATIVE_EXECUTION_HOST,
-                             native_host,
+  std::filesystem::copy_file(native_host_source, native_host,
                              std::filesystem::copy_options::overwrite_existing);
   std::filesystem::copy_file(MANYFORGE_HEADLESS_TEST_NATIVE_EXECUTION_WORKER,
                              candidate_worker,
@@ -301,12 +309,70 @@ PrepareManagerApplyInstalledTargets(const DaemonDirectory &directory) {
       std::filesystem::perms::others_exec;
   std::filesystem::permissions(manager, protected_executable_permissions,
                                std::filesystem::perm_options::replace);
-  std::filesystem::permissions(native_host, protected_executable_permissions,
+  std::filesystem::permissions(native_host,
+                               std::filesystem::status(native_host_source)
+                                   .permissions(),
                                std::filesystem::perm_options::replace);
   std::filesystem::permissions(candidate_worker,
-                               protected_executable_permissions,
+                               std::filesystem::status(
+                                   MANYFORGE_HEADLESS_TEST_NATIVE_EXECUTION_WORKER)
+                                   .permissions(),
                                std::filesystem::perm_options::replace);
   return manager;
+}
+
+struct NativePackageIdentity final {
+  std::shared_ptr<const deployment::RetainedBundle> bundle;
+  deployment::VerifiedRetainedRuntimeUnitProduct product;
+  core::RuntimeContractOfferDTO offer;
+  std::string executable_digest;
+};
+
+NativePackageIdentity ReadNativePackageIdentity(
+    const std::filesystem::path &package_root,
+    const std::string_view retained_bundle_id,
+    const std::filesystem::path &installed_host) {
+  deployment::FilesystemVerifiedRetainedBundleSource bundle_source(
+      package_root);
+  deployment::FilesystemVerifiedRetainedProductArtifactSource artifact_source(
+      package_root);
+  const auto bundle = bundle_source.get_verified(
+      core::RetainedBundleId(std::string(retained_bundle_id)));
+  if (bundle == nullptr ||
+      bundle->value().cell_graph.runtime_units.size() != 1U) {
+    throw std::runtime_error("native package identity lacks one runtime");
+  }
+  const auto runtime_id = bundle->value().cell_graph.runtime_units.front()
+                              .runtime_unit_id;
+  const auto product =
+      deployment::verify_runtime_unit_product(*bundle, runtime_id,
+                                              artifact_source);
+  if (!product.has_value() ||
+      product->product_contract_id().value() !=
+          deployment::native_execution_runtime_contract::
+              kProductContractId) {
+    throw std::runtime_error("native package identity lacks native product");
+  }
+  const auto *qualified =
+      deployment::build_qualified_runtime_contract_registry().find(
+          bundle->value().cell_graph.runtime_units.front().runtime_profile_id,
+          bundle->value().cell_graph.runtime_units.front()
+              .runtime_profile_revision,
+          product->product_contract_id(),
+          product->product_contract_revision());
+  if (qualified == nullptr ||
+      !product->implementation_build_identity().has_value()) {
+    throw std::runtime_error(
+        "native package identity lacks qualified offer/build identity");
+  }
+  std::ifstream stream(installed_host, std::ios::binary);
+  const std::string bytes{std::istreambuf_iterator<char>(stream),
+                          std::istreambuf_iterator<char>()};
+  if (!stream && !stream.eof()) {
+    throw std::runtime_error("native package identity target is unreadable");
+  }
+  return {bundle, *product, qualified->offer(),
+          content_identity::sha256_digest(bytes)};
 }
 
 struct ExecutionReadyObservation final {
@@ -1392,6 +1458,170 @@ TEST(ManagerDaemonProcess,
 }
 
 #if defined(MANYFORGE_HEADLESS_TEST_NATIVE_EXECUTION_HOST)
+TEST(ManagerDaemonProcess,
+     DistinctNativePackageUsesFreshManagerGenerationAfterCleanStop) {
+  const auto fixture_a = ReadManagerApplyFixtureMetadata();
+  const auto fixture_b = ReadManagerApplyFixtureMetadata(
+      MANYFORGE_HEADLESS_TEST_MANAGER_APPLY_REPLACEMENT_METADATA);
+  ASSERT_NE(fixture_a.candidate_retained_bundle_id,
+            fixture_b.candidate_retained_bundle_id);
+
+  const std::filesystem::path package_a =
+      MANYFORGE_HEADLESS_TEST_MANAGER_APPLY_PACKAGE_ROOT;
+  const std::filesystem::path package_b =
+      MANYFORGE_HEADLESS_TEST_MANAGER_APPLY_REPLACEMENT_PACKAGE_ROOT;
+  ASSERT_NE(package_a, package_b);
+
+  DaemonDirectory directory_a;
+  const auto installed_manager_a = PrepareManagerApplyInstalledTargets(
+      directory_a, MANYFORGE_HEADLESS_TEST_NATIVE_EXECUTION_HOST);
+  const auto identity_a = ReadNativePackageIdentity(
+      package_a, fixture_a.physical_candidate_retained_bundle_id,
+      directory_a.installed_root() / "manyforge_native_execution_host");
+  ASSERT_TRUE(component_manager::VerifyNativeExecutionRuntimeUnitForHost(
+                  *identity_a.bundle,
+                  identity_a.bundle->value().cell_graph.runtime_units.front()
+                      .runtime_unit_id,
+                  deployment::FilesystemVerifiedRetainedProductArtifactSource(
+                      package_a),
+                  "linux",
+                  deployment::native_execution_runtime_contract::
+                      kLaunchEnvironmentContract)
+                  .has_value());
+
+  std::string manager_epoch_a;
+  std::string runtime_epoch_a;
+  {
+    ManagerProcess manager(
+        directory_a, package_a.string(), fixture_a.admission_filename,
+        installed_manager_a.string());
+    manager.WaitReady(directory_a);
+    AtomicSourceSnapshotChannel manager_source(directory_a.publication_root(),
+                                               "manager-source.json");
+    const auto initial = manager_source.Read();
+    ASSERT_TRUE(initial.has_value());
+    manager_epoch_a = initial->source_owner_epoch;
+    const auto request = ApplyRequest(
+        manager_epoch_a, fixture_a.physical_deployment_artifact_id,
+        fixture_a.physical_deployment_revision,
+        fixture_a.predecessor_graph_revision,
+        fixture_a.predecessor_retained_bundle_id,
+        "manager-o1-4g-replacement-a.1");
+    auto applied = SendCommand(directory_a.socket_path(), request);
+    const auto apply_deadline =
+        std::chrono::steady_clock::now() + std::chrono::seconds(20);
+    while (applied.find("\"state\":\"succeeded\"") == std::string::npos &&
+           std::chrono::steady_clock::now() < apply_deadline) {
+      std::this_thread::sleep_for(std::chrono::milliseconds(10));
+      applied = SendCommand(directory_a.socket_path(), request);
+    }
+    ASSERT_NE(applied.find("\"state\":\"succeeded\""), std::string::npos)
+        << applied;
+    ASSERT_NE(
+        applied.find(fixture_a.physical_candidate_retained_bundle_id),
+        std::string::npos)
+        << applied;
+    const auto ready = WaitForExecutionReady(
+        directory_a, fixture_a.physical_candidate_retained_bundle_id);
+    ASSERT_FALSE(ready.owner_epoch.empty());
+    runtime_epoch_a = ready.owner_epoch;
+    ASSERT_FALSE(runtime_epoch_a.empty());
+    const auto stopped = manager.Stop(SIGTERM);
+    ASSERT_TRUE(WIFEXITED(stopped));
+    EXPECT_EQ(WEXITSTATUS(stopped), 0);
+    EXPECT_FALSE(std::filesystem::exists(directory_a.socket_path()));
+    EXPECT_FALSE(std::filesystem::exists(directory_a.execution_socket_path()));
+  }
+
+  DaemonDirectory directory_b;
+  const auto installed_manager_b = PrepareManagerApplyInstalledTargets(
+      directory_b, MANYFORGE_HEADLESS_TEST_NATIVE_REPLACEMENT_EXECUTION_HOST);
+  const auto identity_b = ReadNativePackageIdentity(
+      package_b, fixture_b.physical_candidate_retained_bundle_id,
+      directory_b.installed_root() / "manyforge_native_execution_host");
+  ASSERT_TRUE(component_manager::VerifyNativeExecutionRuntimeUnitForHost(
+                  *identity_b.bundle,
+                  identity_b.bundle->value().cell_graph.runtime_units.front()
+                      .runtime_unit_id,
+                  deployment::FilesystemVerifiedRetainedProductArtifactSource(
+                      package_b),
+                  "linux",
+                  deployment::native_execution_runtime_contract::
+                      kLaunchEnvironmentContract)
+                  .has_value());
+  ASSERT_TRUE(identity_a.product.implementation_build_identity().has_value());
+  ASSERT_TRUE(identity_b.product.implementation_build_identity().has_value());
+  EXPECT_NE(identity_a.executable_digest, identity_b.executable_digest);
+  EXPECT_EQ(
+      identity_a.executable_digest,
+      identity_a.product.implementation_build_identity()
+          ->installed_target_content_digest.value());
+  EXPECT_EQ(
+      identity_b.executable_digest,
+      identity_b.product.implementation_build_identity()
+          ->installed_target_content_digest.value());
+  EXPECT_NE(identity_a.product.implementation_build_identity()
+                ->implementation_source_build_fingerprint,
+            identity_b.product.implementation_build_identity()
+                ->implementation_source_build_fingerprint);
+  EXPECT_NE(identity_a.product.product_identity(),
+            identity_b.product.product_identity());
+  // The same desired configuration is deliberately retained while bundle,
+  // product, executable, and source-build identities differ.
+  EXPECT_EQ(identity_a.product.configuration_identity(),
+            identity_b.product.configuration_identity());
+  EXPECT_NE(identity_a.bundle->retained_bundle_id(),
+            identity_b.bundle->retained_bundle_id());
+  EXPECT_EQ(identity_a.offer, identity_b.offer);
+  EXPECT_EQ(identity_a.offer.offer_digest, identity_b.offer.offer_digest);
+
+  std::string manager_epoch_b;
+  std::string runtime_epoch_b;
+  {
+    ManagerProcess manager(
+        directory_b, package_b.string(), fixture_b.admission_filename,
+        installed_manager_b.string());
+    manager.WaitReady(directory_b);
+    AtomicSourceSnapshotChannel manager_source(directory_b.publication_root(),
+                                               "manager-source.json");
+    const auto initial = manager_source.Read();
+    ASSERT_TRUE(initial.has_value());
+    manager_epoch_b = initial->source_owner_epoch;
+    const auto request = ApplyRequest(
+        manager_epoch_b, fixture_b.physical_deployment_artifact_id,
+        fixture_b.physical_deployment_revision,
+        fixture_b.predecessor_graph_revision,
+        fixture_b.predecessor_retained_bundle_id,
+        "manager-o1-4g-replacement-b.1");
+    auto applied = SendCommand(directory_b.socket_path(), request);
+    const auto apply_deadline =
+        std::chrono::steady_clock::now() + std::chrono::seconds(20);
+    while (applied.find("\"state\":\"succeeded\"") == std::string::npos &&
+           std::chrono::steady_clock::now() < apply_deadline) {
+      std::this_thread::sleep_for(std::chrono::milliseconds(10));
+      applied = SendCommand(directory_b.socket_path(), request);
+    }
+    ASSERT_NE(applied.find("\"state\":\"succeeded\""), std::string::npos)
+        << applied;
+    ASSERT_NE(
+        applied.find(fixture_b.physical_candidate_retained_bundle_id),
+        std::string::npos)
+        << applied;
+    const auto ready = WaitForExecutionReady(
+        directory_b, fixture_b.physical_candidate_retained_bundle_id);
+    ASSERT_FALSE(ready.owner_epoch.empty());
+    runtime_epoch_b = ready.owner_epoch;
+    ASSERT_FALSE(runtime_epoch_b.empty());
+    EXPECT_NE(manager_epoch_a, manager_epoch_b);
+    EXPECT_NE(runtime_epoch_a, runtime_epoch_b);
+    const auto stopped = manager.Stop(SIGTERM);
+    ASSERT_TRUE(WIFEXITED(stopped));
+    EXPECT_EQ(WEXITSTATUS(stopped), 0);
+    EXPECT_FALSE(std::filesystem::exists(directory_b.socket_path()));
+    EXPECT_FALSE(std::filesystem::exists(directory_b.execution_socket_path()));
+  }
+}
+
 TEST(ManagerDaemonProcess,
      RuntimeOnlyNamedApplyUsesTheRealManagedFenceAndSurvivesReplacement) {
   const auto fixture = ReadManagerApplyFixtureMetadata();

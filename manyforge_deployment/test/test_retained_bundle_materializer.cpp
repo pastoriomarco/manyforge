@@ -1,5 +1,6 @@
 #include <gtest/gtest.h>
 
+#include <manyforge_core/runtime_contract_manifest_codec.hpp>
 #include <manyforge_deployment/artifact_codec.hpp>
 #include <manyforge_deployment/cell_applicability.hpp>
 #include <manyforge_deployment/cell_compiler.hpp>
@@ -1915,7 +1916,7 @@ TEST(RetainedBundleMaterializer,
     std::string from;
     std::string to;
   };
-  const std::array<Mutation, 9U> mutations{{
+  const std::array<Mutation, 10U> mutations{{
       {"API version", "manyforge.native_execution_runtime_manifest.v1",
        "manyforge.native_execution_runtime_manifest.v2"},
       {"lifecycle", "manager_managed", "externally_managed"},
@@ -1933,6 +1934,8 @@ TEST(RetainedBundleMaterializer,
        "\"operating_system\":\"other\""},
       {"launch environment", "manyforge.native_execution_host.abi.v1",
        "manyforge.caller_selected_environment"},
+      {"runtime role", "\"runtime_role_id\":\"native_execution\"",
+       "\"runtime_role_id\":\"foreign_role\""},
   }};
   for (const auto &mutation : mutations) {
     SCOPED_TRACE(mutation.name);
@@ -1941,6 +1944,27 @@ TEST(RetainedBundleMaterializer,
                          replace_once(manifest, mutation.from, mutation.to))),
                  RetainedBundleError);
   }
+
+  const auto parsed_manifest =
+      detail::parse_and_verify_native_execution_runtime_manifest(manifest);
+  const auto embedded_offer = detail::decode_runtime_contract_offer_projection(
+      member(parsed_manifest, "runtime_contract_offer"),
+      "test.runtime_contract_offer");
+  auto forged_api_ids = embedded_offer.provided_api_contract_ids;
+  forged_api_ids.emplace_back("manyforge.api.forged");
+  const auto forged_offer = core::MakeRuntimeContractOffer(
+      embedded_offer.runtime_implementation_id, std::move(forged_api_ids),
+      embedded_offer.provided_capabilities);
+  ASSERT_TRUE(forged_offer.ok());
+  const auto forged_manifest = replace_object_member(
+      parsed_manifest, "runtime_contract_offer",
+      detail::runtime_contract_offer_projection(forged_offer.value()));
+  // The record is strict and self-consistent, but the added API has no
+  // build-qualified semantic owner and cannot become an admissible offer.
+  EXPECT_THROW(static_cast<void>(
+                   detail::parse_and_verify_native_execution_runtime_manifest(
+                       canonical_json(forged_manifest))),
+               RetainedBundleError);
 
   CanonicalValue::Object injected =
       parse_strict_json_model_yaml(manifest).root().as_object();

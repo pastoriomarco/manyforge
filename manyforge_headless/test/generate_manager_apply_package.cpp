@@ -11,7 +11,6 @@
 #include <fstream>
 #include <iostream>
 #include <iterator>
-#include <optional>
 #include <span>
 #include <stdexcept>
 #include <string>
@@ -212,7 +211,8 @@ int main(int argc, char **argv) {
           "Manager Apply fixture lacks its native runtime profile");
     }
     const auto &qualification_paths = arguments.stop_qualification;
-    auto installed_target = ReadExactFile(qualification_paths.installed_target);
+    auto installed_target =
+        ReadExactFile(qualification_paths.installed_target);
     auto runner_executable =
         ReadExactFile(qualification_paths.runner_executable);
     if (installed_target.empty() || runner_executable.empty()) {

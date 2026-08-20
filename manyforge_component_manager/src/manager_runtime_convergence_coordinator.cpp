@@ -683,8 +683,15 @@ ManagerApplyRuntimeConvergenceCoordinator::ConvergeOrRecover(
       const RuntimeEpoch runtime_epoch(process.process_incarnation());
       const auto report =
           ObserveProgressSafely(progress_port_, query, runtime_epoch);
-      if (report.has_value() && !reducer.IngestSourceReport(*report)) {
-        Fail("progress port returned rejected or foreign source evidence");
+      if (report.has_value()) {
+        if (report->offered_runtime_contract_offer_digest() !=
+            query.plan.runtime_contract_offer_digest.value()) {
+          Fail("progress report offered runtime contract differs from the "
+               "selected package offer");
+        }
+        if (!reducer.IngestSourceReport(*report)) {
+          Fail("progress port returned rejected or foreign source evidence");
+        }
       }
     }
   }

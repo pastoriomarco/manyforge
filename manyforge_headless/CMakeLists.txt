@@ -435,6 +435,21 @@ if(BUILD_TESTING)
     set(
       _MANYFORGE_HEADLESS_TEST_NATIVE_STOP_RUNNER
       "${_MANYFORGE_HEADLESS_TEST_NATIVE_EXECUTION_TARGET_ROOT}/manyforge_native_stop_qualification_runner")
+    set(
+      MANYFORGE_HEADLESS_TEST_NATIVE_REPLACEMENT_EXECUTION_HOST
+      "${_MANYFORGE_HEADLESS_TEST_NATIVE_EXECUTION_TARGET_ROOT}/manyforge_native_execution_host_pick_place_fixture")
+    set(
+      _MANYFORGE_HEADLESS_TEST_NATIVE_REPLACEMENT_STOP_IMPLEMENTATION_BUILD
+      "${_MANYFORGE_HEADLESS_TEST_NATIVE_EXECUTION_TARGET_ROOT}/qualification/native_stop_o1_4g_replacement/implementation-build.json")
+    set(
+      _MANYFORGE_HEADLESS_TEST_NATIVE_REPLACEMENT_STOP_RUNNER_CONTRACT
+      "${_MANYFORGE_HEADLESS_TEST_NATIVE_EXECUTION_TARGET_ROOT}/qualification/native_stop_o1_4g_replacement/runner-contract.json")
+    set(
+      _MANYFORGE_HEADLESS_TEST_NATIVE_REPLACEMENT_STOP_IMPLEMENTATION_EVIDENCE
+      "${_MANYFORGE_HEADLESS_TEST_NATIVE_EXECUTION_TARGET_ROOT}/qualification/native_stop_o1_4g_replacement/implementation-evidence.json")
+    set(
+      _MANYFORGE_HEADLESS_TEST_NATIVE_REPLACEMENT_STOP_SUBSTITUTION_EVIDENCE
+      "${_MANYFORGE_HEADLESS_TEST_NATIVE_EXECUTION_TARGET_ROOT}/qualification/native_stop_o1_4g_replacement/substitution-evidence.json")
     foreach(_native_stop_input IN ITEMS
         "${_MANYFORGE_HEADLESS_TEST_NATIVE_STOP_IMPLEMENTATION_BUILD}"
         "${_MANYFORGE_HEADLESS_TEST_NATIVE_STOP_RUNNER_CONTRACT}"
@@ -445,6 +460,19 @@ if(BUILD_TESTING)
         message(FATAL_ERROR
           "the source-matched native Stop qualification input for the "
           "Manager Apply process test does not exist: ${_native_stop_input}")
+      endif()
+    endforeach()
+    foreach(_native_replacement_stop_input IN ITEMS
+        "${MANYFORGE_HEADLESS_TEST_NATIVE_REPLACEMENT_EXECUTION_HOST}"
+        "${_MANYFORGE_HEADLESS_TEST_NATIVE_REPLACEMENT_STOP_IMPLEMENTATION_BUILD}"
+        "${_MANYFORGE_HEADLESS_TEST_NATIVE_REPLACEMENT_STOP_RUNNER_CONTRACT}"
+        "${_MANYFORGE_HEADLESS_TEST_NATIVE_STOP_RUNNER}"
+        "${_MANYFORGE_HEADLESS_TEST_NATIVE_REPLACEMENT_STOP_IMPLEMENTATION_EVIDENCE}"
+        "${_MANYFORGE_HEADLESS_TEST_NATIVE_REPLACEMENT_STOP_SUBSTITUTION_EVIDENCE}")
+      if(NOT EXISTS "${_native_replacement_stop_input}")
+        message(FATAL_ERROR
+          "the independently qualified O1.4g replacement native Stop input "
+          "does not exist: ${_native_replacement_stop_input}")
       endif()
     endforeach()
     if(NOT TARGET manyforge_lite6_product)
@@ -519,6 +547,59 @@ if(BUILD_TESTING)
       VERBATIM)
     add_custom_target(manyforge_headless_test_manager_apply_package
       DEPENDS "${MANYFORGE_HEADLESS_TEST_MANAGER_APPLY_METADATA}")
+
+    # O1.4g uses an independently qualified pick/place host to materialize a
+    # second immutable package. The production qualification inputs are never
+    # substituted for its exact replacement closure and evidence.
+    set(
+      MANYFORGE_HEADLESS_TEST_MANAGER_APPLY_REPLACEMENT_FIXTURE_ROOT
+      "${CMAKE_CURRENT_BINARY_DIR}/manager-apply-o1-4g-replacement-fixture")
+    set(
+      MANYFORGE_HEADLESS_TEST_MANAGER_APPLY_REPLACEMENT_PACKAGE_ROOT
+      "${MANYFORGE_HEADLESS_TEST_MANAGER_APPLY_REPLACEMENT_FIXTURE_ROOT}/retained-package")
+    set(
+      MANYFORGE_HEADLESS_TEST_MANAGER_APPLY_REPLACEMENT_METADATA
+      "${MANYFORGE_HEADLESS_TEST_MANAGER_APPLY_REPLACEMENT_FIXTURE_ROOT}/metadata.json")
+    add_custom_command(
+      OUTPUT "${MANYFORGE_HEADLESS_TEST_MANAGER_APPLY_REPLACEMENT_METADATA}"
+      COMMAND
+        "${CMAKE_COMMAND}" -E remove_directory
+        "${MANYFORGE_HEADLESS_TEST_MANAGER_APPLY_REPLACEMENT_FIXTURE_ROOT}"
+      COMMAND
+        "${CMAKE_COMMAND}" -E make_directory
+        "${MANYFORGE_HEADLESS_TEST_MANAGER_APPLY_REPLACEMENT_FIXTURE_ROOT}"
+      COMMAND
+        "$<TARGET_FILE:manyforge_generate_headless_manager_apply_test_package>"
+        --package-root
+        "${MANYFORGE_HEADLESS_TEST_MANAGER_APPLY_REPLACEMENT_PACKAGE_ROOT}"
+        --metadata
+        "${MANYFORGE_HEADLESS_TEST_MANAGER_APPLY_REPLACEMENT_METADATA}"
+        --stop-implementation-build
+        "${_MANYFORGE_HEADLESS_TEST_NATIVE_REPLACEMENT_STOP_IMPLEMENTATION_BUILD}"
+        --stop-installed-target
+        "${MANYFORGE_HEADLESS_TEST_NATIVE_REPLACEMENT_EXECUTION_HOST}"
+        --stop-runner-contract
+        "${_MANYFORGE_HEADLESS_TEST_NATIVE_REPLACEMENT_STOP_RUNNER_CONTRACT}"
+        --stop-runner-executable
+        "${_MANYFORGE_HEADLESS_TEST_NATIVE_STOP_RUNNER}"
+        --stop-implementation-evidence
+        "${_MANYFORGE_HEADLESS_TEST_NATIVE_REPLACEMENT_STOP_IMPLEMENTATION_EVIDENCE}"
+        --stop-substitution-evidence
+        "${_MANYFORGE_HEADLESS_TEST_NATIVE_REPLACEMENT_STOP_SUBSTITUTION_EVIDENCE}"
+      DEPENDS
+        manyforge_generate_headless_manager_apply_test_package
+        "${MANYFORGE_HEADLESS_TEST_NATIVE_REPLACEMENT_EXECUTION_HOST}"
+        "${_MANYFORGE_HEADLESS_TEST_NATIVE_REPLACEMENT_STOP_IMPLEMENTATION_BUILD}"
+        "${_MANYFORGE_HEADLESS_TEST_NATIVE_REPLACEMENT_STOP_RUNNER_CONTRACT}"
+        "${_MANYFORGE_HEADLESS_TEST_NATIVE_STOP_RUNNER}"
+        "${_MANYFORGE_HEADLESS_TEST_NATIVE_REPLACEMENT_STOP_IMPLEMENTATION_EVIDENCE}"
+        "${_MANYFORGE_HEADLESS_TEST_NATIVE_REPLACEMENT_STOP_SUBSTITUTION_EVIDENCE}"
+        "${MANYFORGE_HEADLESS_TEST_LITE6_FIXTURE_ROOT}/model.urdf"
+        "${MANYFORGE_HEADLESS_TEST_LITE6_FIXTURE_ROOT}/model.srdf"
+        ${MANYFORGE_HEADLESS_TEST_LITE6_RESOURCE_INPUTS}
+      VERBATIM)
+    add_custom_target(manyforge_headless_test_manager_apply_replacement_package
+      DEPENDS "${MANYFORGE_HEADLESS_TEST_MANAGER_APPLY_REPLACEMENT_METADATA}")
   endif()
 
   add_executable(manyforge_publish_headless_assistant_test_source
@@ -637,8 +718,13 @@ if(BUILD_TESTING)
     target_compile_definitions(test_manager_daemon_process PRIVATE
       MANYFORGE_HEADLESS_TEST_MANAGER_APPLY_METADATA="${MANYFORGE_HEADLESS_TEST_MANAGER_APPLY_METADATA}"
       MANYFORGE_HEADLESS_TEST_MANAGER_APPLY_PACKAGE_ROOT="${MANYFORGE_HEADLESS_TEST_MANAGER_APPLY_PACKAGE_ROOT}"
+      MANYFORGE_HEADLESS_TEST_MANAGER_APPLY_REPLACEMENT_METADATA="${MANYFORGE_HEADLESS_TEST_MANAGER_APPLY_REPLACEMENT_METADATA}"
+      MANYFORGE_HEADLESS_TEST_MANAGER_APPLY_REPLACEMENT_PACKAGE_ROOT="${MANYFORGE_HEADLESS_TEST_MANAGER_APPLY_REPLACEMENT_PACKAGE_ROOT}"
       MANYFORGE_HEADLESS_TEST_NATIVE_EXECUTION_HOST="${MANYFORGE_HEADLESS_TEST_NATIVE_EXECUTION_HOST}"
+      MANYFORGE_HEADLESS_TEST_NATIVE_REPLACEMENT_EXECUTION_HOST="${MANYFORGE_HEADLESS_TEST_NATIVE_REPLACEMENT_EXECUTION_HOST}"
       MANYFORGE_HEADLESS_TEST_NATIVE_EXECUTION_WORKER="${MANYFORGE_HEADLESS_TEST_NATIVE_EXECUTION_WORKER}")
+    add_dependencies(test_manager_daemon_process
+      manyforge_headless_test_manager_apply_replacement_package)
   endif()
   target_link_libraries(test_manager_daemon_process PRIVATE
     manyforge_headless_owner_publication

@@ -222,7 +222,7 @@ std::string reference_runtime_profile_revision() {
 
 const std::string& reference_runtime_launchable_script() {
   static const std::string script = [] {
-    const auto& runtime_contract = require_runtime_contract(
+    const auto runtime_contract = require_runtime_contract(
         core::RuntimeProfileId(std::string(kReferenceRuntimeProfileId)),
         core::RuntimeProfileRevision(reference_runtime_profile_revision()),
         core::ProductContractId(
@@ -347,7 +347,7 @@ parse_and_verify_reference_runtime_manifest(std::string_view canonical_bytes) {
   const auto embedded_offer = decode_runtime_contract_offer_projection(
       require_member(object, "runtime_contract_offer", "runtime_manifest"),
       "runtime_manifest.runtime_contract_offer");
-  const auto& runtime_contract = require_runtime_contract(
+  const auto runtime_contract = require_runtime_contract(
       core::RuntimeProfileId(std::string(kReferenceRuntimeProfileId)),
       core::RuntimeProfileRevision(reference_runtime_profile_revision()),
       core::ProductContractId(

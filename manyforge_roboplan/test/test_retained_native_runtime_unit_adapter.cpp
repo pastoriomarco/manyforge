@@ -113,6 +113,30 @@ private:
           std::istreambuf_iterator<char>()};
 }
 
+[[nodiscard]] std::filesystem::path InstallNativeTestTargets(
+    const std::filesystem::path &source,
+    const std::filesystem::path &candidate_worker_source,
+    const std::filesystem::path &target_root) {
+  const auto target = target_root / std::string(contract::kInstalledTargetId);
+  const auto candidate_worker =
+      target_root / std::string(contract::kCandidateWorkerInstalledTargetId);
+  if (!std::filesystem::copy_file(source, target,
+                                  std::filesystem::copy_options::none) ||
+      !std::filesystem::copy_file(
+          candidate_worker_source, candidate_worker,
+          std::filesystem::copy_options::none)) {
+    throw std::runtime_error("could not install native adapter test targets");
+  }
+  std::filesystem::permissions(
+      target, std::filesystem::status(source).permissions(),
+      std::filesystem::perm_options::replace);
+  std::filesystem::permissions(
+      candidate_worker,
+      std::filesystem::status(candidate_worker_source).permissions(),
+      std::filesystem::perm_options::replace);
+  return target;
+}
+
 [[nodiscard]] const std::string &
 TextMember(const deployment::CanonicalValue &root,
            const std::string_view name) {
@@ -607,6 +631,135 @@ TEST(
                component_manager::RetainedNativeRuntimeUnitAdapterError);
   EXPECT_EQ(adapter.ObserveProcess(*fixture.query).state(),
             component_manager::ProcessPresenceState::kAbsent);
+}
+
+TEST(RetainedNativeRuntimeUnitAdapter,
+     DistinctQualifiedNativePackagesReplaceOnlyAfterCleanStop) {
+  NativeFixture package_a(MANYFORGE_I7_BUILD_IDENTIFIED_NATIVE_FIXTURE_ROOT);
+  NativeFixture package_b(
+      MANYFORGE_O1_4G_REPLACEMENT_NATIVE_FIXTURE_ROOT);
+  ASSERT_TRUE(package_a.product.has_value());
+  ASSERT_TRUE(package_b.product.has_value());
+  ASSERT_TRUE(package_a.product->implementation_build_identity().has_value());
+  ASSERT_TRUE(package_b.product->implementation_build_identity().has_value());
+  ASSERT_NE(package_a.root, package_b.root);
+  ASSERT_NE(package_a.bundle->retained_bundle_id(),
+            package_b.bundle->retained_bundle_id());
+  EXPECT_NE(package_a.product->retained_bundle_id(),
+            package_b.product->retained_bundle_id());
+  EXPECT_NE(package_a.product->product_identity(),
+            package_b.product->product_identity());
+  // Configuration is deliberately retained while bundle, product, and build
+  // identities differ.
+  EXPECT_EQ(package_a.product->configuration_identity(),
+            package_b.product->configuration_identity());
+
+  const auto *qualified_a =
+      deployment::build_qualified_runtime_contract_registry().find(
+          package_a.query->plan.runtime_profile_id,
+          package_a.query->plan.runtime_profile_revision,
+          package_a.product->product_contract_id(),
+          package_a.product->product_contract_revision());
+  const auto *qualified_b =
+      deployment::build_qualified_runtime_contract_registry().find(
+          package_b.query->plan.runtime_profile_id,
+          package_b.query->plan.runtime_profile_revision,
+          package_b.product->product_contract_id(),
+          package_b.product->product_contract_revision());
+  ASSERT_NE(qualified_a, nullptr);
+  ASSERT_NE(qualified_b, nullptr);
+  EXPECT_EQ(qualified_a->offer(), qualified_b->offer());
+  const auto &qualified_manifest_set =
+      deployment::build_qualified_runtime_contract_registry()
+          .package_manifest_set();
+  ASSERT_FALSE(qualified_manifest_set.offers.empty());
+  EXPECT_EQ(qualified_a->offer(),
+            qualified_manifest_set.offers.front());
+  EXPECT_EQ(package_a.query->plan.runtime_contract_offer_digest,
+            package_b.query->plan.runtime_contract_offer_digest);
+  ASSERT_TRUE(component_manager::VerifyNativeExecutionRuntimeUnitForHost(
+                  *package_a.bundle, package_a.query->plan.runtime_unit_id,
+                  package_a.artifact_source, contract::kOperatingSystem,
+                  contract::kLaunchEnvironmentContract)
+                  .has_value());
+  ASSERT_TRUE(component_manager::VerifyNativeExecutionRuntimeUnitForHost(
+                  *package_b.bundle, package_b.query->plan.runtime_unit_id,
+                  package_b.artifact_source, contract::kOperatingSystem,
+                  contract::kLaunchEnvironmentContract)
+                  .has_value());
+
+  ScopedTemporaryRoot target_root_a;
+  ScopedTemporaryRoot target_root_b;
+  const auto candidate_worker_source =
+      std::filesystem::path(MANYFORGE_NATIVE_EXECUTION_TARGET_ROOT) /
+      std::string(contract::kCandidateWorkerInstalledTargetId);
+  const auto target_a = InstallNativeTestTargets(
+      std::filesystem::path(MANYFORGE_NATIVE_EXECUTION_TARGET_ROOT) /
+          std::string(contract::kInstalledTargetId),
+      candidate_worker_source,
+      target_root_a.path());
+  const auto target_b = InstallNativeTestTargets(
+      MANYFORGE_NATIVE_PICK_PLACE_EXECUTION_TARGET, candidate_worker_source,
+      target_root_b.path());
+  const auto executable_digest_a =
+      content_identity::sha256_digest(ReadFile(target_a));
+  const auto executable_digest_b =
+      content_identity::sha256_digest(ReadFile(target_b));
+  ASSERT_NE(executable_digest_a, executable_digest_b);
+  EXPECT_EQ(executable_digest_a,
+            package_a.product->implementation_build_identity()
+                ->installed_target_content_digest.value());
+  EXPECT_EQ(executable_digest_b,
+            package_b.product->implementation_build_identity()
+                ->installed_target_content_digest.value());
+  EXPECT_NE(package_a.product->implementation_build_identity()
+                ->implementation_source_build_fingerprint,
+            package_b.product->implementation_build_identity()
+                ->implementation_source_build_fingerprint);
+
+  // The package root and lifecycle owner are both out of scope before B is
+  // started; this is a sequential full-stop replacement, not a live swap.
+  {
+    auto adapter_a = MakeAdapter(package_a, target_root_a.path());
+    const auto started_a = adapter_a.EnsureRunning(*package_a.query);
+    ASSERT_EQ(started_a.state(),
+              component_manager::ProcessPresenceState::kPresent);
+    ASSERT_TRUE(adapter_a.ObserveProgress(
+        *package_a.query,
+        core::RuntimeEpoch(started_a.process_incarnation()))
+                    .has_value());
+    EXPECT_EQ(adapter_a.EnsureStopped(*package_a.query).state(),
+              component_manager::ProcessPresenceState::kAbsent);
+    EXPECT_EQ(adapter_a.ObserveProcess(*package_a.query).state(),
+              component_manager::ProcessPresenceState::kAbsent);
+  }
+
+  {
+    auto adapter_b = MakeAdapter(package_b, target_root_b.path());
+    const auto first_b = adapter_b.EnsureRunning(*package_b.query);
+    ASSERT_EQ(first_b.state(),
+              component_manager::ProcessPresenceState::kPresent);
+    const core::RuntimeEpoch first_epoch(first_b.process_incarnation());
+    ASSERT_TRUE(adapter_b.ObserveProgress(*package_b.query, first_epoch)
+                    .has_value());
+    EXPECT_EQ(adapter_b.EnsureStopped(*package_b.query).state(),
+              component_manager::ProcessPresenceState::kAbsent);
+    EXPECT_EQ(adapter_b.ObserveProcess(*package_b.query).state(),
+              component_manager::ProcessPresenceState::kAbsent);
+
+    const auto second_b = adapter_b.EnsureRunning(*package_b.query);
+    ASSERT_EQ(second_b.state(),
+              component_manager::ProcessPresenceState::kPresent);
+    EXPECT_NE(second_b.process_incarnation(), first_epoch.value());
+    ASSERT_TRUE(adapter_b.ObserveProgress(
+        *package_b.query,
+        core::RuntimeEpoch(second_b.process_incarnation()))
+                    .has_value());
+    EXPECT_EQ(adapter_b.EnsureStopped(*package_b.query).state(),
+              component_manager::ProcessPresenceState::kAbsent);
+    EXPECT_EQ(adapter_b.ObserveProcess(*package_b.query).state(),
+              component_manager::ProcessPresenceState::kAbsent);
+  }
 }
 
 TEST(RetainedNativeRuntimeUnitAdapter,

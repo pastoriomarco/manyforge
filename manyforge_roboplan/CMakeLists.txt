@@ -1148,6 +1148,130 @@ if(BUILD_TESTING)
       DEPENDS
         "${_MANYFORGE_I7_BUILD_IDENTIFIED_NATIVE_EXECUTION_FIXTURE_MANIFEST}")
 
+    # O1.4g replacement row: qualify a distinct runnable test target through
+    # the same native Stop machinery as production. The implementation closure
+    # and evidence therefore name the alternate target's actual sources,
+    # compile/link identity, and installed bytes.
+    set(_MANYFORGE_O1_4G_REPLACEMENT_NATIVE_EXECUTION_FIXTURE_ROOT
+      "${CMAKE_CURRENT_BINARY_DIR}/lite6_o1_4g_replacement_native_execution_fixture")
+    set(_MANYFORGE_O1_4G_REPLACEMENT_NATIVE_EXECUTION_FIXTURE_MANIFEST
+      "${_MANYFORGE_O1_4G_REPLACEMENT_NATIVE_EXECUTION_FIXTURE_ROOT}/manifest.json")
+    set(_MANYFORGE_NATIVE_STOP_O1_4G_REPLACEMENT_QUALIFICATION_ROOT
+      "${CMAKE_CURRENT_BINARY_DIR}/qualification/native_stop_o1_4g_replacement")
+    set(_MANYFORGE_NATIVE_STOP_O1_4G_REPLACEMENT_BUILD_CLOSURE
+      "${_MANYFORGE_NATIVE_STOP_O1_4G_REPLACEMENT_QUALIFICATION_ROOT}/implementation-build.json")
+    set(_MANYFORGE_NATIVE_STOP_O1_4G_REPLACEMENT_RUNNER_CONTRACT
+      "${_MANYFORGE_NATIVE_STOP_O1_4G_REPLACEMENT_QUALIFICATION_ROOT}/runner-contract.json")
+    set(_MANYFORGE_NATIVE_STOP_O1_4G_REPLACEMENT_IMPLEMENTATION_EVIDENCE
+      "${_MANYFORGE_NATIVE_STOP_O1_4G_REPLACEMENT_QUALIFICATION_ROOT}/implementation-evidence.json")
+    set(_MANYFORGE_NATIVE_STOP_O1_4G_REPLACEMENT_SUBSTITUTION_EVIDENCE
+      "${_MANYFORGE_NATIVE_STOP_O1_4G_REPLACEMENT_QUALIFICATION_ROOT}/substitution-evidence.json")
+    add_custom_command(
+      OUTPUT
+        "${_MANYFORGE_NATIVE_STOP_O1_4G_REPLACEMENT_BUILD_CLOSURE}"
+        "${_MANYFORGE_NATIVE_STOP_O1_4G_REPLACEMENT_RUNNER_CONTRACT}"
+      COMMAND "${CMAKE_COMMAND}" -E make_directory
+        "${_MANYFORGE_NATIVE_STOP_O1_4G_REPLACEMENT_QUALIFICATION_ROOT}"
+      COMMAND
+        "${Python3_EXECUTABLE}"
+        "${_MANYFORGE_NATIVE_STOP_CLOSURE_GENERATOR}"
+        --source-root "${_MANYFORGE_REPOSITORY_SOURCE_ROOT}"
+        --build-root "${CMAKE_BINARY_DIR}"
+        --implementation-target
+          manyforge_native_execution_host_pick_place_fixture
+        --implementation-id
+          manyforge.native_execution_host
+        --installed-target-id manyforge_native_execution_host
+        --installed-target
+          "$<TARGET_FILE:manyforge_native_execution_host_pick_place_fixture>"
+        --runner-target manyforge_native_stop_qualification_runner
+        --runner-executable
+          "$<TARGET_FILE:manyforge_native_stop_qualification_runner>"
+        --case-contract "${_MANYFORGE_NATIVE_STOP_CASE_CONTRACT}"
+        --runner-source-input
+          "${CMAKE_CURRENT_SOURCE_DIR}/test/native_stop_qualification_fixture.hpp"
+        --runner-source-input
+          "${_MANYFORGE_REPOSITORY_SOURCE_ROOT}/manyforge_deployment/src/stop_qualification_evidence_internal.hpp"
+        ${_MANYFORGE_NATIVE_STOP_SEMANTIC_ARGUMENTS}
+        --implementation-output
+          "${_MANYFORGE_NATIVE_STOP_O1_4G_REPLACEMENT_BUILD_CLOSURE}"
+        --runner-output
+          "${_MANYFORGE_NATIVE_STOP_O1_4G_REPLACEMENT_RUNNER_CONTRACT}"
+      DEPENDS
+        manyforge_native_execution_host_pick_place_fixture
+        manyforge_native_stop_qualification_runner
+        "${_MANYFORGE_NATIVE_STOP_CLOSURE_GENERATOR}"
+        "${_MANYFORGE_NATIVE_STOP_CASE_CONTRACT}"
+        "${CMAKE_CURRENT_SOURCE_DIR}/test/native_stop_qualification_fixture.hpp"
+        "${_MANYFORGE_REPOSITORY_SOURCE_ROOT}/manyforge_deployment/src/stop_qualification_evidence_internal.hpp"
+        ${_MANYFORGE_NATIVE_STOP_SEMANTIC_INPUTS}
+      COMMAND_EXPAND_LISTS
+      VERBATIM)
+    add_custom_command(
+      OUTPUT
+        "${_MANYFORGE_NATIVE_STOP_O1_4G_REPLACEMENT_IMPLEMENTATION_EVIDENCE}"
+        "${_MANYFORGE_NATIVE_STOP_O1_4G_REPLACEMENT_SUBSTITUTION_EVIDENCE}"
+      COMMAND
+        "$<TARGET_FILE:manyforge_native_stop_qualification_runner>"
+        --implementation-build
+          "${_MANYFORGE_NATIVE_STOP_O1_4G_REPLACEMENT_BUILD_CLOSURE}"
+        --runner-contract
+          "${_MANYFORGE_NATIVE_STOP_O1_4G_REPLACEMENT_RUNNER_CONTRACT}"
+        --implementation-output
+          "${_MANYFORGE_NATIVE_STOP_O1_4G_REPLACEMENT_IMPLEMENTATION_EVIDENCE}"
+        --substitution-output
+          "${_MANYFORGE_NATIVE_STOP_O1_4G_REPLACEMENT_SUBSTITUTION_EVIDENCE}"
+      DEPENDS
+        manyforge_native_stop_qualification_runner
+        "${_MANYFORGE_NATIVE_STOP_O1_4G_REPLACEMENT_BUILD_CLOSURE}"
+        "${_MANYFORGE_NATIVE_STOP_O1_4G_REPLACEMENT_RUNNER_CONTRACT}"
+      VERBATIM)
+    add_custom_target(manyforge_run_native_stop_o1_4g_replacement_qualification
+      DEPENDS
+        "${_MANYFORGE_NATIVE_STOP_O1_4G_REPLACEMENT_BUILD_CLOSURE}"
+        "${_MANYFORGE_NATIVE_STOP_O1_4G_REPLACEMENT_RUNNER_CONTRACT}"
+        "${_MANYFORGE_NATIVE_STOP_O1_4G_REPLACEMENT_IMPLEMENTATION_EVIDENCE}"
+        "${_MANYFORGE_NATIVE_STOP_O1_4G_REPLACEMENT_SUBSTITUTION_EVIDENCE}")
+    add_custom_command(
+      OUTPUT
+        "${_MANYFORGE_O1_4G_REPLACEMENT_NATIVE_EXECUTION_FIXTURE_MANIFEST}"
+      COMMAND
+        "${CMAKE_COMMAND}" -E rm -rf
+        "${_MANYFORGE_O1_4G_REPLACEMENT_NATIVE_EXECUTION_FIXTURE_ROOT}"
+      COMMAND
+        "${CMAKE_COMMAND}" -E make_directory
+        "${_MANYFORGE_O1_4G_REPLACEMENT_NATIVE_EXECUTION_FIXTURE_ROOT}"
+      COMMAND
+        "$<TARGET_FILE:generate_lite6_native_execution_fixture_tool>"
+        --output-root
+        "${_MANYFORGE_O1_4G_REPLACEMENT_NATIVE_EXECUTION_FIXTURE_ROOT}"
+        --stop-implementation-build
+        "${_MANYFORGE_NATIVE_STOP_O1_4G_REPLACEMENT_BUILD_CLOSURE}"
+        --stop-installed-target
+        "$<TARGET_FILE:manyforge_native_execution_host_pick_place_fixture>"
+        --stop-runner-contract
+        "${_MANYFORGE_NATIVE_STOP_O1_4G_REPLACEMENT_RUNNER_CONTRACT}"
+        --stop-runner-executable
+        "$<TARGET_FILE:manyforge_native_stop_qualification_runner>"
+        --stop-implementation-evidence
+        "${_MANYFORGE_NATIVE_STOP_O1_4G_REPLACEMENT_IMPLEMENTATION_EVIDENCE}"
+        --stop-substitution-evidence
+        "${_MANYFORGE_NATIVE_STOP_O1_4G_REPLACEMENT_SUBSTITUTION_EVIDENCE}"
+      DEPENDS
+        generate_lite6_native_execution_fixture_tool
+        manyforge_native_execution_host_pick_place_fixture
+        manyforge_native_stop_qualification_runner
+        manyforge_run_native_stop_o1_4g_replacement_qualification
+        "${_MANYFORGE_NATIVE_STOP_O1_4G_REPLACEMENT_BUILD_CLOSURE}"
+        "${_MANYFORGE_NATIVE_STOP_O1_4G_REPLACEMENT_RUNNER_CONTRACT}"
+        "${_MANYFORGE_NATIVE_STOP_O1_4G_REPLACEMENT_IMPLEMENTATION_EVIDENCE}"
+        "${_MANYFORGE_NATIVE_STOP_O1_4G_REPLACEMENT_SUBSTITUTION_EVIDENCE}"
+      VERBATIM)
+    add_custom_target(
+      generate_lite6_o1_4g_replacement_native_execution_fixture
+      DEPENDS
+        "${_MANYFORGE_O1_4G_REPLACEMENT_NATIVE_EXECUTION_FIXTURE_MANIFEST}")
+
     # Explicit L0.1 evidence lane. Building this target runs the real bounded
     # Stop qualifier once, then feeds its exact four canonical outputs plus
     # the two executable byte subjects through the production retained
@@ -1286,12 +1410,16 @@ if(BUILD_TESTING)
     add_dependencies(test_retained_native_runtime_unit_adapter
       generate_lite6_native_execution_fixture
       generate_lite6_build_identified_native_execution_fixture
+      generate_lite6_o1_4g_replacement_native_execution_fixture
+      manyforge_run_native_stop_o1_4g_replacement_qualification
       manyforge_native_execution_host
       manyforge_roboplan_candidate_worker)
     target_compile_definitions(
       test_retained_native_runtime_unit_adapter PRIVATE
       MANYFORGE_I6_NATIVE_FIXTURE_ROOT="${_MANYFORGE_I6_NATIVE_EXECUTION_FIXTURE_ROOT}"
       MANYFORGE_I7_BUILD_IDENTIFIED_NATIVE_FIXTURE_ROOT="${_MANYFORGE_I7_BUILD_IDENTIFIED_NATIVE_EXECUTION_FIXTURE_ROOT}"
+      MANYFORGE_O1_4G_REPLACEMENT_NATIVE_FIXTURE_ROOT="${_MANYFORGE_O1_4G_REPLACEMENT_NATIVE_EXECUTION_FIXTURE_ROOT}"
+      MANYFORGE_NATIVE_PICK_PLACE_EXECUTION_TARGET="$<TARGET_FILE:manyforge_native_execution_host_pick_place_fixture>"
       MANYFORGE_NATIVE_EXECUTION_TARGET_ROOT="$<TARGET_FILE_DIR:manyforge_native_execution_host>")
     target_link_libraries(test_retained_native_runtime_unit_adapter PRIVATE
       manyforge_component_manager

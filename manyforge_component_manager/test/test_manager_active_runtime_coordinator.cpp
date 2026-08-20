@@ -202,7 +202,8 @@ public:
         RuntimeSourceHealth::kHealthy, query.plan.product_identity.value(),
         query.plan.configuration_identity.value(), std::move(roles),
         ManagedCommandSurfaceState::kClosedNoActiveEffect, {},
-        query.plan.runtime_contract_offer_digest.value());
+        child_offer_digest_override.value_or(
+            query.plan.runtime_contract_offer_digest.value()));
   }
 
   std::vector<std::string> events;
@@ -212,6 +213,7 @@ public:
   std::map<std::string, std::string> epochs;
   std::string throw_after_start_effect;
   std::string throw_after_stop_effect;
+  std::optional<std::string> child_offer_digest_override;
   bool replay_last_report{false};
 
 private:
@@ -359,6 +361,53 @@ TEST(ManagerActiveRuntimeCoordinator,
   ports.replay_last_report = true;
   EXPECT_THROW(static_cast<void>(coordinator.Reconcile()),
                ManagerActiveRuntimeCoordinatorError);
+  EXPECT_EQ(ports.start_calls["runtime.a"], 1);
+  static_cast<void>(coordinator.Shutdown());
+}
+
+TEST(ManagerActiveRuntimeCoordinator,
+     ChildOfferMismatchStaysUnavailableWithoutDuplicateStartEffect) {
+  auto plan = ThreeUnitPlan();
+  plan.runtime_units.erase(plan.runtime_units.begin() + 1U,
+                           plan.runtime_units.end());
+  ASSERT_TRUE(plan.valid());
+  FixedPlanSource source(std::move(plan));
+  ScriptedLifecyclePorts ports;
+  ports.child_offer_digest_override = std::string(kDigestTwo);
+  std::uint64_t now = 275U;
+  ManagerActiveRuntimeCoordinator coordinator(source, ports, ports,
+                                              [&now]() { return ++now; });
+
+  const auto first = coordinator.Reconcile();
+  EXPECT_EQ(first.state, ManagerActiveRuntimeConvergenceState::kPending);
+  EXPECT_EQ(ports.events, (std::vector<std::string>{
+                              "observe:runtime.a",
+                              "start:runtime.a",
+                              "progress:runtime.a",
+                          }));
+  EXPECT_EQ(ports.start_calls["runtime.a"], 1);
+  ASSERT_EQ(first.observations.observations().size(), 1U);
+  const auto &first_observation = first.observations.observations().front();
+  EXPECT_EQ(first_observation.derived_state(),
+            RuntimeConvergenceState::kNonconverged);
+  EXPECT_EQ(first_observation.runtime_epoch(), ports.epochs["runtime.a"]);
+  EXPECT_EQ(first_observation.observed_runtime_contract_offer_digest(),
+            std::string(kDigestTwo));
+  const std::vector<std::string> expected_reasons{
+      "runtime_contract_offer_digest_mismatch",
+  };
+  EXPECT_EQ(first_observation.reason_codes(), expected_reasons);
+  ASSERT_TRUE(first_observation.command_surface_state().has_value());
+  EXPECT_EQ(*first_observation.command_surface_state(),
+            ManagedCommandSurfaceState::kClosedNoActiveEffect);
+
+  ports.events.clear();
+  const auto replay = coordinator.Reconcile();
+  EXPECT_EQ(replay.state, ManagerActiveRuntimeConvergenceState::kPending);
+  EXPECT_EQ(ports.events, (std::vector<std::string>{
+                              "observe:runtime.a",
+                              "progress:runtime.a",
+                          }));
   EXPECT_EQ(ports.start_calls["runtime.a"], 1);
   static_cast<void>(coordinator.Shutdown());
 }

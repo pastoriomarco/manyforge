@@ -695,22 +695,42 @@ public:
     if (runtime_epoch.value() != process_incarnation_) {
       throw std::runtime_error("progress query has the wrong runtime epoch");
     }
+    if (replayed_report.has_value()) {
+      last_report = replayed_report;
+      return replayed_report;
+    }
     std::vector<std::string> roles;
     for (const auto &role : query.plan.required_runtime_role_ids) {
       roles.push_back(role.value());
     }
-    return RuntimeUnitSourceReport(
-        query.plan.runtime_unit_id.value(), process_incarnation_, 1U, 1U,
+    last_report = RuntimeUnitSourceReport(
+        query.plan.runtime_unit_id.value(),
+        progress_report_incarnation.value_or(process_incarnation_), 1U, 1U,
         RuntimeSourcePhase::kServing, RuntimeSourceHealth::kHealthy,
         query.plan.product_identity.value(),
-        query.plan.configuration_identity.value(), std::move(roles),
+        progress_configuration_identity.value_or(
+            query.plan.configuration_identity.value()),
+        std::move(roles),
         ManagedCommandSurfaceState::kClosedNoActiveEffect, {},
-        query.plan.runtime_contract_offer_digest.value());
+        progress_offer_digest.value_or(
+            query.plan.runtime_contract_offer_digest.value()));
+    return last_report;
+  }
+
+  void ReplaceProcess(std::string process_incarnation) {
+    process_incarnation_ = std::move(process_incarnation);
+    state_ = ProcessPresenceState::kPresent;
+    ++observation_sequence_;
   }
 
   bool throw_after_ensure_effect{false};
   bool report_available{true};
   bool saw_durable_intent_before_ensure{false};
+  std::optional<std::string> progress_report_incarnation;
+  std::optional<std::string> progress_configuration_identity;
+  std::optional<std::string> progress_offer_digest;
+  std::optional<RuntimeUnitSourceReport> replayed_report;
+  std::optional<RuntimeUnitSourceReport> last_report;
   int observe_calls{0};
   int ensure_calls{0};
   int start_effect_calls{0};
@@ -1226,6 +1246,151 @@ TEST(ManagerApplyRuntimeConvergenceCoordinator,
 }
 
 TEST(ManagerApplyRuntimeConvergenceCoordinator,
+     StaleRuntimeEpochEvidenceFailsAfterObservedStartWithoutStagedReady) {
+  ScopedPackageRoot root;
+  CoordinatorFixture fixture(root.path());
+  fixture.runtime_ports.progress_report_incarnation = "stale-process-epoch";
+
+  EXPECT_THROW(static_cast<void>(fixture.Run()),
+               ManagerRuntimeConvergenceCoordinatorError);
+  ASSERT_TRUE(fixture.runtime_ports.last_report.has_value());
+  EXPECT_EQ(fixture.runtime_ports.last_report->process_incarnation(),
+            "stale-process-epoch");
+  EXPECT_EQ(fixture.runtime_ports.last_report->command_surface_state(),
+            ManagedCommandSurfaceState::kClosedNoActiveEffect);
+  EXPECT_EQ(fixture.kernel.acquire_calls, 1);
+  EXPECT_EQ(fixture.runtime_ports.ensure_calls, 1);
+  EXPECT_EQ(fixture.runtime_ports.start_effect_calls, 1);
+  EXPECT_EQ(fixture.runtime_ports.progress_calls, 1);
+  EXPECT_TRUE(fixture.journal
+                  .ReadRuntimeConvergenceIntent(ApplyId("apply-1"),
+                                                 ApplyGeneration(1U))
+                  .has_value());
+  EXPECT_FALSE(
+      fixture.journal.ReadLatestRuntimeStagedReady(ApplyId("apply-1"),
+                                                   ApplyGeneration(1U))
+          .has_value());
+  const auto report = fixture.journal.VerifyIntegrity();
+  EXPECT_EQ(report.fence_acceptance_count, 1);
+  EXPECT_EQ(report.runtime_convergence_intent_count, 1);
+  EXPECT_EQ(report.runtime_staged_ready_count, 0);
+}
+
+TEST(ManagerApplyRuntimeConvergenceCoordinator,
+     ReplayedPriorEpochSequenceAndOfferRemainUnavailableAfterReplacement) {
+  ScopedPackageRoot root;
+  CoordinatorFixture fixture(root.path());
+  const auto first = fixture.Run();
+  ASSERT_EQ(first.state, ManagerRuntimeConvergenceResultState::kStagedReady);
+  ASSERT_TRUE(first.durable_staged_ready.has_value());
+  ASSERT_TRUE(fixture.runtime_ports.last_report.has_value());
+  const auto prior_report = *fixture.runtime_ports.last_report;
+  fixture.runtime_ports.replayed_report = prior_report;
+  fixture.runtime_ports.ReplaceProcess("process-epoch-2");
+
+  EXPECT_THROW(static_cast<void>(fixture.Run()),
+               ManagerRuntimeConvergenceCoordinatorError);
+  EXPECT_EQ(prior_report.process_incarnation(), "process-epoch-1");
+  EXPECT_EQ(prior_report.source_report_sequence(), 1U);
+  EXPECT_EQ(prior_report.offered_runtime_contract_offer_digest(),
+            first.durable_staged_ready->record.staged_ready.runtime_units
+                .front()
+                .observed_runtime_contract_offer_digest.value());
+  EXPECT_EQ(fixture.kernel.acquire_calls, 1);
+  EXPECT_EQ(fixture.runtime_ports.ensure_calls, 2);
+  EXPECT_EQ(fixture.runtime_ports.start_effect_calls, 1);
+  EXPECT_EQ(fixture.runtime_ports.progress_calls, 2);
+  const auto latest = fixture.journal.ReadLatestRuntimeStagedReady(
+      ApplyId("apply-1"), ApplyGeneration(1U));
+  ASSERT_TRUE(latest.has_value());
+  EXPECT_EQ(*latest, first.durable_staged_ready->record);
+  ASSERT_EQ(latest->staged_ready.runtime_units.size(), 1U);
+  EXPECT_EQ(
+      latest->staged_ready.runtime_units.front().command_surface_state,
+      ManagedCommandSurfaceState::kClosedNoActiveEffect);
+  const auto report = fixture.journal.VerifyIntegrity();
+  EXPECT_EQ(report.runtime_convergence_intent_count, 1);
+  EXPECT_EQ(report.runtime_staged_ready_count, 1);
+}
+
+TEST(ManagerApplyRuntimeConvergenceCoordinator,
+     InjectedChildOfferMismatchFailsBeforeNewStagedReadyOrEligibility) {
+  ScopedPackageRoot root;
+  CoordinatorFixture fixture(root.path());
+  // This is injected progress-port evidence. The retained POSIX/native
+  // adapters derive the child echo from the sealed package and cannot
+  // honestly emit this mismatch while package integrity holds.
+  fixture.runtime_ports.progress_offer_digest = std::string(kDigestTwo);
+
+  EXPECT_THROW(static_cast<void>(fixture.Run()),
+               ManagerRuntimeConvergenceCoordinatorError);
+  EXPECT_THROW(static_cast<void>(fixture.Run()),
+               ManagerRuntimeConvergenceCoordinatorError);
+  ASSERT_TRUE(fixture.runtime_ports.last_report.has_value());
+  EXPECT_EQ(fixture.runtime_ports.last_report
+                ->offered_runtime_contract_offer_digest(),
+            std::string(kDigestTwo));
+  ASSERT_TRUE(fixture.runtime_ports.last_query.has_value());
+  EXPECT_NE(fixture.runtime_ports.last_report
+                ->offered_runtime_contract_offer_digest(),
+            fixture.runtime_ports.last_query->plan
+                .runtime_contract_offer_digest.value());
+  EXPECT_EQ(fixture.runtime_ports.last_report->command_surface_state(),
+            ManagedCommandSurfaceState::kClosedNoActiveEffect);
+  EXPECT_EQ(fixture.kernel.acquire_calls, 1);
+  EXPECT_EQ(fixture.runtime_ports.ensure_calls, 2);
+  EXPECT_EQ(fixture.runtime_ports.start_effect_calls, 1);
+  EXPECT_EQ(fixture.runtime_ports.progress_calls, 2);
+  const auto intent = fixture.journal.ReadRuntimeConvergenceIntent(
+      ApplyId("apply-1"), ApplyGeneration(1U));
+  ASSERT_TRUE(intent.has_value());
+  EXPECT_EQ(intent->runtime_convergence_intent.runtime_units.size(), 1U);
+  EXPECT_EQ(intent->runtime_convergence_intent.runtime_units.front()
+                .runtime_contract_offer_digest.value(),
+            fixture.runtime_ports.last_query->plan.runtime_contract_offer_digest
+                .value());
+  EXPECT_EQ(intent->runtime_convergence_intent.runtime_units.front(),
+            fixture.runtime_ports.last_query->plan);
+  EXPECT_FALSE(
+      fixture.journal.ReadLatestRuntimeStagedReady(ApplyId("apply-1"),
+                                                   ApplyGeneration(1U))
+          .has_value());
+  EXPECT_EQ(fixture.journal.VerifyIntegrity().runtime_staged_ready_count, 0);
+}
+
+TEST(ManagerApplyRuntimeConvergenceCoordinator,
+     ConfigurationIdentityMismatchRemainsUnavailableWithoutStagedReady) {
+  ScopedPackageRoot root;
+  CoordinatorFixture fixture(root.path());
+  fixture.runtime_ports.progress_configuration_identity =
+      std::string("sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff");
+
+  const auto result = fixture.Run();
+  EXPECT_EQ(result.state, ManagerRuntimeConvergenceResultState::kPending);
+  ASSERT_TRUE(fixture.runtime_ports.last_query.has_value());
+  const auto runtime_unit_id =
+      fixture.runtime_ports.last_query->plan.runtime_unit_id.value();
+  ASSERT_NE(result.observations.observation(runtime_unit_id), nullptr);
+  const auto *observation = result.observations.observation(runtime_unit_id);
+  EXPECT_FALSE(observation->converged());
+  EXPECT_EQ(observation->reason_codes(),
+            std::vector<std::string>{
+                "runtime_configuration_identity_mismatch"});
+  EXPECT_EQ(observation->command_surface_state(),
+            ManagedCommandSurfaceState::kClosedNoActiveEffect);
+  EXPECT_EQ(fixture.runtime_ports.start_effect_calls, 1);
+  EXPECT_TRUE(fixture.journal
+                  .ReadRuntimeConvergenceIntent(ApplyId("apply-1"),
+                                                 ApplyGeneration(1U))
+                  .has_value());
+  EXPECT_FALSE(
+      fixture.journal.ReadLatestRuntimeStagedReady(ApplyId("apply-1"),
+                                                   ApplyGeneration(1U))
+          .has_value());
+  EXPECT_EQ(fixture.journal.VerifyIntegrity().runtime_staged_ready_count, 0);
+}
+
+TEST(ManagerApplyRuntimeConvergenceCoordinator,
      PublicationDriftAfterStartPreventsStagedReadyCommit) {
   ScopedPackageRoot root;
   CoordinatorFixture fixture(root.path());
@@ -1241,13 +1406,15 @@ TEST(ManagerApplyRuntimeConvergenceCoordinator,
 }
 
 TEST(ManagerApplyRuntimeConvergenceCoordinator,
-     IncompatibleHostRejectsBeforeFenceOrProcessEffect) {
+     IncompatibleSelectedLaunchContractRejectsBeforeFenceOrProcessEffect) {
   ScopedPackageRoot root;
   CoordinatorFixture fixture(root.path());
+  // The sealed product is valid, but the selected host launch contract is
+  // not offered by that product. This must fail before any owner effect.
   ManagerApplyRuntimeConvergenceCoordinator incompatible(
       fixture.fence_coordinator, fixture.journal, fixture.publication,
       *fixture.package.artifact_source, fixture.runtime_ports,
-      fixture.runtime_ports, "darwin", "posix.1-2017", [] { return 1'000U; });
+      fixture.runtime_ports, "linux", "foreign.shell", [] { return 1'000U; });
 
   EXPECT_THROW(static_cast<void>(incompatible.ConvergeOrRecover(
                    fixture.apply_intent, *fixture.package.bundle,
@@ -1260,10 +1427,33 @@ TEST(ManagerApplyRuntimeConvergenceCoordinator,
                    ActiveBundlePublicationGeneration(3U))),
                ManagerRuntimeConvergenceCoordinatorError);
   EXPECT_EQ(fixture.kernel.acquire_calls, 0);
+  EXPECT_EQ(fixture.kernel.reconcile_calls, 0);
+  EXPECT_EQ(fixture.kernel.rehydrate_calls, 0);
   EXPECT_EQ(fixture.runtime_ports.observe_calls, 0);
+  EXPECT_EQ(fixture.runtime_ports.ensure_calls, 0);
+  EXPECT_EQ(fixture.runtime_ports.progress_calls, 0);
+  EXPECT_FALSE(fixture.runtime_ports.last_query.has_value());
   EXPECT_FALSE(
       fixture.journal.ReadIntent(ApplyId("apply-1"), ApplyGeneration(1U))
           .has_value());
+  EXPECT_FALSE(fixture.journal
+                   .ReadAffectedScope(ApplyId("apply-1"), ApplyGeneration(1U))
+                   .has_value());
+  EXPECT_FALSE(fixture.journal
+                   .ReadFenceAttempt(ApplyId("apply-1"), ApplyGeneration(1U))
+                   .has_value());
+  EXPECT_FALSE(fixture.journal
+                   .ReadFenceAcceptance(ApplyId("apply-1"),
+                                         ApplyGeneration(1U))
+                   .has_value());
+  EXPECT_FALSE(fixture.journal
+                   .ReadRuntimeConvergenceIntent(ApplyId("apply-1"),
+                                                 ApplyGeneration(1U))
+                   .has_value());
+  EXPECT_FALSE(fixture.journal
+                   .ReadLatestRuntimeStagedReady(ApplyId("apply-1"),
+                                                  ApplyGeneration(1U))
+                   .has_value());
 }
 
 TEST(ManagerApplyRuntimeConvergenceCoordinator,
