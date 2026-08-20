@@ -115,9 +115,9 @@ namespace {
 constexpr std::string_view kZeroDigest =
     "sha256:0000000000000000000000000000000000000000000000000000000000000000";
 constexpr std::string_view kExpectedNodeEnvironmentDigest =
-    "sha256:7abc624816fc0ce4fe232fda70e14ce339e425cc1c5d59b6f51b4657365789e9";
+    "sha256:3ef12681245ae640da52f3bb9a57b0029315360ed007a3c6b363f3a20c2d540d";
 constexpr std::string_view kExpectedCompilerContractDigest =
-    "sha256:74ce5703d8e13d32169a9b152e45ce9151ee36988416df07ee1e8048560525ef";
+    "sha256:ae5bf4c0d2ada1ef111f5f40f29dab2b93e951f28ffbb129dbaa380f3e392b8d";
 #ifdef MANYFORGE_VERIFY_CANONICAL_EMPTY_RELEASE_GOLDEN
 constexpr std::string_view kExpectedReleaseCompilerBuildDigest =
     "sha256:650704cb10bdb3699aca7c0e48a92f3bcf5555ac1f7eff4cbf506b5890f20b67";
