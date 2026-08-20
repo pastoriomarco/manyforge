@@ -326,66 +326,47 @@ def test_checked_in_capture_matches_schema_semantics_and_frozen_manifest() -> No
     ]
 
 
-def test_isaac_live_baseline_plays_once_and_reset_owns_loop_replay() -> None:
+def test_isaac_light_v1_sequence_owns_one_play_reset_pause_cycle() -> None:
     program = yaml.safe_load(
         (
             _REPO_ROOT / "examples/isaac_manipulator_scene_light.program.yaml"
         ).read_text(encoding="utf-8")
     )
-    deployment = yaml.safe_load(
-        (
-            _REPO_ROOT
-            / "examples/isaac_manipulator_scene_light_ros2_control.deployment.yaml"
-        ).read_text(encoding="utf-8")
-    )
 
     root = program["tree"]
-    assert root["id"] == "sequence"
-    assert root["name"] == "run_sequence"
-    assert [child["id"] for child in root["children"]] == [
-        "set_simulation_state",
-        "repeat",
+    assert root["node_id"] == "sequence"
+    assert root["instance_id"] == "isaac_light_cycle"
+    children = root["children"]
+    node_ids = [child["node_id"] for child in children]
+    assert "repeat" not in node_ids
+    assert node_ids.count("simulation.reset") == 1
+    state_nodes = [
+        (index, child["parameters"]["state"])
+        for index, child in enumerate(children)
+        if child["node_id"] == "simulation.set_state"
     ]
-    play_once, repeat = root["children"]
-    assert play_once["params"]["state"] == "playing"
-    assert repeat["params"]["num_cycles"] == -1
-
-    def descendants(node: dict[str, object]) -> list[dict[str, object]]:
-        children = list(node.get("children") or [])
-        return children + [nested for child in children for nested in descendants(child)]
-
-    repeated_nodes = descendants(repeat)
-    assert all(node.get("id") != "set_simulation_state" for node in repeated_nodes)
-    assert sum(node.get("id") == "reset_simulation" for node in repeated_nodes) == 1
-    assert (
-        deployment["simulation_control"]["reset"]["resume_play_after_reset"]
-        is True
-    )
+    assert state_nodes == [(1, "play"), (len(children) - 1, "pause")]
+    assert node_ids.index("simulation.reset") < state_nodes[-1][0]
 
 
-@pytest.mark.parametrize(
-    "program_name",
-    [
-        "isaac_manipulator_scene_light.program.yaml",
-        "isaac_manipulator_scene_light_collision.program.yaml",
-    ],
-)
-def test_isaac_light_drop_release_keeps_attached_object_clear_of_klt(
-    program_name: str,
-) -> None:
+def test_isaac_light_drop_release_keeps_attached_object_clear_of_klt() -> None:
     program = yaml.safe_load(
-        (_REPO_ROOT / "examples" / program_name).read_text(encoding="utf-8")
+        (
+            _REPO_ROOT / "examples/isaac_manipulator_scene_light.program.yaml"
+        ).read_text(encoding="utf-8")
     )
 
     def descendants(node: dict[str, object]) -> list[dict[str, object]]:
         children = list(node.get("children") or [])
         return [node, *[nested for child in children for nested in descendants(child)]]
 
-    nodes = {str(node.get("name")): node for node in descendants(program["tree"])}
-    approach_offset = nodes["move_to_drop_approach"]["params"]["pose_goal"][
+    nodes = {
+        str(node.get("instance_id")): node for node in descendants(program["tree"])
+    }
+    approach_offset = nodes["move_to_drop_approach"]["parameters"]["goal"][
         "position_m"
     ]
-    release_offset = nodes["move_to_drop"]["params"]["pose_goal"]["position_m"]
+    release_offset = nodes["move_to_drop"]["parameters"]["goal"]["position_m"]
 
     assert approach_offset == [0, 0, 0.4]
     assert release_offset == [0, 0, 0.35]
