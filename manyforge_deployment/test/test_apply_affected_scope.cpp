@@ -132,6 +132,7 @@ Bundle(core::CellGraphDTO graph, core::RetainedCompiledProductsDTO products) {
       std::nullopt,
       {},
       std::nullopt,
+      {},
   };
 }
 
