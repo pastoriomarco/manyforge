@@ -616,6 +616,7 @@ class _AllowedHygieneSymlink:
             link_parts,
             f"hygiene symbolic link parent {relative}",
         )
+        self.link_descriptor = -1
         self.target_parent: _BoundDirectory | None = None
         self.target_descriptor = -1
         try:
@@ -624,7 +625,23 @@ class _AllowedHygieneSymlink:
                 target_parts,
                 f"hygiene symbolic link target parent {self.target_relative}",
             )
-            link_metadata = os.stat(
+            link_path_flag = getattr(os, "O_PATH", None)
+            if link_path_flag is None:
+                raise ValidationError(
+                    "cannot bind hygiene symbolic link identity without O_PATH"
+                )
+            try:
+                self.link_descriptor = os.open(
+                    link_parts[-1],
+                    link_path_flag | os.O_NOFOLLOW | os.O_CLOEXEC,
+                    dir_fd=self.link_parent.descriptor,
+                )
+            except OSError as error:
+                raise ValidationError(
+                    f"cannot bind hygiene symbolic link {relative}: {error}"
+                ) from error
+            link_metadata = os.fstat(self.link_descriptor)
+            current_link_metadata = os.stat(
                 link_parts[-1],
                 dir_fd=self.link_parent.descriptor,
                 follow_symlinks=False,
@@ -637,6 +654,8 @@ class _AllowedHygieneSymlink:
                 not stat.S_ISLNK(link_metadata.st_mode)
                 or _metadata_signature(link_metadata)
                 != _metadata_signature(observed_metadata)
+                or _metadata_signature(current_link_metadata)
+                != _metadata_signature(link_metadata)
                 or target_text != expected_target
             ):
                 raise ValidationError(
@@ -711,6 +730,7 @@ class _AllowedHygieneSymlink:
                 dir_fd=self.link_parent.descriptor,
                 follow_symlinks=False,
             )
+            bound_link_metadata = os.fstat(self.link_descriptor)
             target_text = os.readlink(
                 link_parts[-1],
                 dir_fd=self.link_parent.descriptor,
@@ -723,7 +743,9 @@ class _AllowedHygieneSymlink:
             ) from error
         if (
             not stat.S_ISLNK(link_metadata.st_mode)
-            or _metadata_signature(link_metadata) != self.link_signature
+            or _metadata_signature(bound_link_metadata) != self.link_signature
+            or _metadata_signature(link_metadata)
+            != _metadata_signature(bound_link_metadata)
             or target_text != self.expected_target
         ):
             raise ValidationError(
@@ -743,6 +765,12 @@ class _AllowedHygieneSymlink:
             )
 
     def close(self) -> None:
+        if self.link_descriptor >= 0:
+            try:
+                os.close(self.link_descriptor)
+            except OSError:
+                pass
+            self.link_descriptor = -1
         if self.target_descriptor >= 0:
             try:
                 os.close(self.target_descriptor)
