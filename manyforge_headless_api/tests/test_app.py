@@ -36,6 +36,7 @@ def _program_document() -> dict[str, Any]:
 def test_closed_core_invalid_request_maps_to_a_client_error() -> None:
     assert _error_status("invalid_request") == 400
     assert _error_status("program_apply_request_oversized") == 413
+    assert _error_status("full_stack_restart_required") == 409
 
 
 def _manager_payload() -> dict[str, Any]:
@@ -918,6 +919,77 @@ def test_program_apply_skips_unchanged_deployment_and_publishes_exact_program() 
     assert len(core.program_commits) == 1
     assert applied.status_code == 200
     assert applied.json()["program_revision"] == program["program_revision"]
+
+
+def test_program_apply_fences_published_full_stack_restart_before_prepare() -> None:
+    core = FakeCore()
+    core.manager_payload["apply"] = {
+        "mutation_available": False,
+        "records": [],
+        "unavailable_reason_code": "full_stack_restart_required",
+    }
+    manager = FakeManager()
+    client = TestClient(create_app(service=HeadlessService(core, manager)))
+
+    with client:
+        response = client.post(
+            "/api/program/apply",
+            json={
+                "scenario_id": "cell-pick",
+                "scenario_catalog_revision": "sha256:" + "6" * 64,
+                "program": _program_document(),
+                "expected_applied_record_digest": None,
+            },
+        )
+
+    assert response.status_code == 409
+    assert response.json()["detail"]["code"] == "full_stack_restart_required"
+    assert core.program_preparations == []
+    assert core.program_commits == []
+    assert manager.requests == []
+
+
+def test_program_apply_fences_full_stack_restart_raced_by_preparation() -> None:
+    core = FakeCore()
+    original_prepare = core.prepare_program_apply
+
+    def prepare_then_publish_restart(
+        scenario_id: str,
+        scenario_catalog_revision: str,
+        program: dict[str, Any],
+    ) -> dict[str, Any]:
+        preparation = original_prepare(
+            scenario_id, scenario_catalog_revision, program
+        )
+        core.manager_payload["apply"] = {
+            "mutation_available": False,
+            "records": [],
+            "unavailable_reason_code": "full_stack_restart_required",
+        }
+        return preparation
+
+    core.prepare_program_apply = (  # type: ignore[method-assign]
+        prepare_then_publish_restart
+    )
+    manager = FakeManager()
+    client = TestClient(create_app(service=HeadlessService(core, manager)))
+
+    with client:
+        response = client.post(
+            "/api/program/apply",
+            json={
+                "scenario_id": "cell-pick",
+                "scenario_catalog_revision": "sha256:" + "6" * 64,
+                "program": _program_document(),
+                "expected_applied_record_digest": None,
+            },
+        )
+
+    assert response.status_code == 409
+    assert response.json()["detail"]["code"] == "full_stack_restart_required"
+    assert len(core.program_preparations) == 1
+    assert core.program_commits == []
+    assert manager.requests == []
 
 
 def test_program_runner_surface_is_a_strict_thin_owner_projection() -> None:

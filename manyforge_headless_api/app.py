@@ -200,6 +200,8 @@ class RequestBodyLimitMiddleware:
 def _error_status(code: str) -> int:
     if code == "program_apply_request_oversized":
         return 413
+    if code == "full_stack_restart_required":
+        return 409
     if code in {
         "headless_projection_response_invalid",
         "headless_projection_response_oversized",

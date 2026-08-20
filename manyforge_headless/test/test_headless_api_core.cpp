@@ -707,6 +707,92 @@ TEST(HeadlessApiCore,
   }
 }
 
+TEST(HeadlessApiCore, PackageReadsRemainPinnedToTheStartupDirectoryDescriptor) {
+  TemporaryDirectory directory;
+  const auto package = directory.path() / "selected-package";
+  const auto retained_package = directory.path() / "retained-package";
+  std::filesystem::copy(MANYFORGE_HEADLESS_TEST_ASSISTANT_PACKAGE_ROOT, package,
+                        std::filesystem::copy_options::recursive);
+
+  const deployment::FilesystemScenarioApplyCandidateSource scenarios(
+      package, "maintained");
+  const auto selection =
+      scenarios.LoadExactProgramSelection("program_apply_fixture");
+  const deployment::FilesystemVerifiedRetainedBundleSource bundles(package);
+  const auto bundle = bundles.get_verified(selection.retained_bundle_id);
+  ASSERT_NE(bundle, nullptr);
+  const auto cell_id = bundle->value().cell_graph.cell_id.value();
+
+  AtomicSourceSnapshotChannel manager(directory.publications(),
+                                      "manager-source.json");
+  static_cast<void>(
+      manager.Publish("component_manager", "component-manager." + cell_id,
+                      "manager.epoch.1", 1, ManagerPayloadFor(*bundle)));
+  auto config = Config(directory, "api.epoch.1", package);
+  config.cell_id = cell_id;
+  HeadlessApiCore core(std::move(config), Clocks());
+  std::filesystem::rename(package, retained_package);
+  std::filesystem::create_directory(package);
+
+  // First use verifies the Manager-selected retained bundle through the
+  // descriptor and exercises the node-environment reader's anchored "/."
+  // spelling.
+  const auto environment = core.NodeEnvironmentProjection();
+  EXPECT_EQ(Text(environment, "retained_bundle_id"),
+            selection.retained_bundle_id.value());
+  EXPECT_EQ(Text(environment, "graph_revision"),
+            selection.graph_revision.value());
+  EXPECT_EQ(Text(environment, "environment_digest"),
+            selection.node_environment_digest.value());
+
+  const auto catalog = core.ScenarioCatalogProjection();
+  EXPECT_EQ(Text(catalog, "scenario_catalog_revision"),
+            selection.scenario_catalog_revision.value());
+  const auto &catalog_scenarios = Array(catalog, "scenarios");
+  ASSERT_EQ(catalog_scenarios.size(), 1U);
+  EXPECT_EQ(Text(catalog_scenarios.front(), "scenario_id"),
+            selection.scenario_id);
+  EXPECT_EQ(Text(catalog_scenarios.front(), "retained_bundle_id"),
+            selection.retained_bundle_id.value());
+  EXPECT_EQ(Text(catalog_scenarios.front(), "program_binding_id"),
+            selection.program_binding_id.value());
+
+  const auto prepared = core.PrepareProgramApply(
+      selection.scenario_id, selection.scenario_catalog_revision.value(),
+      content_identity::canonical_json(selection.normalized_program_root));
+  EXPECT_EQ(Text(prepared, "retained_bundle_id"),
+            selection.retained_bundle_id.value());
+  EXPECT_EQ(Text(prepared, "graph_revision"), selection.graph_revision.value());
+  EXPECT_EQ(Text(prepared, "baseline_program_binding_id"),
+            selection.program_binding_id.value());
+  EXPECT_EQ(Text(prepared, "node_environment_digest"),
+            selection.node_environment_digest.value());
+
+  const auto source_model = core.SourceModelProjection();
+  EXPECT_EQ(Text(source_model, "retained_bundle_id"),
+            selection.retained_bundle_id.value());
+  EXPECT_EQ(Text(source_model, "graph_revision"),
+            selection.graph_revision.value());
+  const auto source_model_bytes =
+      content_identity::canonical_json(source_model);
+  EXPECT_NE(source_model_bytes.find(
+                "\"model_instance_id\":\"lite6_fixture_instance\""),
+            std::string::npos);
+  EXPECT_NE(source_model_bytes.find("\"component_id\":\"lite6_arm\""),
+            std::string::npos);
+
+  const auto viewer = core.ViewerModelUrdf();
+  EXPECT_EQ(viewer.retained_bundle_id().value(),
+            selection.retained_bundle_id.value());
+  EXPECT_EQ(viewer.graph_revision(), selection.graph_revision.value());
+  EXPECT_EQ(viewer.cell_id(), cell_id);
+  EXPECT_EQ(viewer.product_id().value(), "cell_viewer_model");
+  EXPECT_FALSE(viewer.bytes().empty());
+
+  EXPECT_TRUE(std::filesystem::is_directory(retained_package));
+  EXPECT_TRUE(std::filesystem::is_empty(package));
+}
+
 TEST(HeadlessApiCore,
      ProgramApplyDependsOnFreshManagerButNotUnrelatedSceneAvailability) {
   TemporaryDirectory directory;

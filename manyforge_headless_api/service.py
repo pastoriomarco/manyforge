@@ -789,6 +789,21 @@ class HeadlessService:
             )
         return source, payload, active
 
+    @staticmethod
+    def _fence_program_apply_for_package_restart(
+        payload: dict[str, Any],
+    ) -> None:
+        apply_state = payload.get("apply")
+        if (
+            isinstance(apply_state, dict)
+            and apply_state.get("unavailable_reason_code")
+            == "full_stack_restart_required"
+        ):
+            raise HeadlessApiError(
+                "full_stack_restart_required",
+                "Program Apply requires a full stack restart",
+            )
+
     def program_apply(self, request: ProgramApplyRequest) -> dict[str, Any]:
         with self._program_transition_lock:
             # An admitted run has already captured its immutable Applied
@@ -811,6 +826,9 @@ class HeadlessService:
                 "program_apply_program_invalid",
                 f"Program Apply candidate is invalid: {error}",
             ) from error
+        source, payload, active = self._program_apply_manager_selection()
+        self._fence_program_apply_for_package_restart(payload)
+
         preparation = self.core.prepare_program_apply(
             request.scenario_id,
             request.scenario_catalog_revision,
@@ -829,6 +847,7 @@ class HeadlessService:
             )
 
         source, payload, active = self._program_apply_manager_selection()
+        self._fence_program_apply_for_package_restart(payload)
         deployment_apply_required = (
             active["retained_bundle_id"] != target_bundle
             or active["graph_revision"] != target_graph

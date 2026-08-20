@@ -231,6 +231,8 @@ public:
   void Shutdown();
 
 private:
+  class PackageRootDescriptor;
+
   struct AdapterCursor final {
     std::string source_id;
     std::string domain;
@@ -303,6 +305,7 @@ private:
   HeadlessApiCoreConfig config_;
   HeadlessApiCoreClocks clocks_;
   std::unique_ptr<HeadlessApiOwnerLock> owner_lock_;
+  std::unique_ptr<PackageRootDescriptor> package_root_descriptor_;
   manyforge::deployment::FilesystemVerifiedRetainedBundleSource
       retained_bundle_source_;
   manyforge::deployment::FilesystemScenarioApplyCandidateSource

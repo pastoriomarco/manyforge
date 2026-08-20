@@ -408,21 +408,59 @@ std::string MintHeadlessOwnerEpoch(const std::string_view prefix) {
   return result;
 }
 
+class HeadlessApiCore::PackageRootDescriptor final {
+public:
+  explicit PackageRootDescriptor(const std::filesystem::path &package_root) {
+    descriptor_ = ::open(package_root.c_str(),
+                         O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW);
+    if (descriptor_ < 0) {
+      throw std::system_error(errno, std::generic_category(),
+                              "open Headless package root");
+    }
+  }
+
+  ~PackageRootDescriptor() {
+    if (descriptor_ >= 0) {
+      static_cast<void>(::close(descriptor_));
+    }
+  }
+
+  PackageRootDescriptor(const PackageRootDescriptor &) = delete;
+  PackageRootDescriptor &operator=(const PackageRootDescriptor &) = delete;
+
+  [[nodiscard]] std::filesystem::path root() const {
+    if (descriptor_ < 0) {
+      throw std::logic_error("Headless package root descriptor is closed");
+    }
+    return std::filesystem::path("/proc/self/fd") /
+           std::to_string(descriptor_);
+  }
+
+private:
+  int descriptor_{-1};
+};
+
 HeadlessApiCore::HeadlessApiCore(HeadlessApiCoreConfig config,
                                  HeadlessApiCoreClocks clocks)
     : config_(ValidateConfig(std::move(config))),
       clocks_(ResolveClocks(std::move(clocks))),
       owner_lock_(std::make_unique<HeadlessApiOwnerLock>(
           config_.historian_database_path)),
-      retained_bundle_source_(config_.package_root),
-      scenario_catalog_source_(config_.package_root, "maintained"),
-      program_apply_owner_(config_.package_root, config_.publication_root,
+      package_root_descriptor_(
+          std::make_unique<PackageRootDescriptor>(config_.package_root)),
+      retained_bundle_source_(package_root_descriptor_->root()),
+      scenario_catalog_source_(package_root_descriptor_->root(), "maintained"),
+      program_apply_owner_(package_root_descriptor_->root(),
+                           config_.publication_root,
                            config_.owner_id + ".program-selection",
                            config_.owner_epoch),
-      node_environment_projection_(config_.package_root,
+      // This reader validates the final path component with symlink_status;
+      // "." keeps that component directory-valued while traversal remains
+      // anchored through the retained procfd root.
+      node_environment_projection_(package_root_descriptor_->root() / ".",
                                    config_.node_catalog_path),
-      source_model_projection_(config_.package_root),
-      viewer_model_source_(config_.package_root),
+      source_model_projection_(package_root_descriptor_->root()),
+      viewer_model_source_(package_root_descriptor_->root()),
       history_store_(std::make_shared<SqliteEventHistoryStore>(
           config_.historian_database_path, config_.historian_record_retention)),
       historian_(history_store_, config_.historian_queue_capacity),
