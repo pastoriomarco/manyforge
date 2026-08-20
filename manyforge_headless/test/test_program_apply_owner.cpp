@@ -3,6 +3,8 @@
 #include <cstdint>
 #include <filesystem>
 #include <fstream>
+#include <iterator>
+#include <map>
 #include <stdexcept>
 #include <string>
 #include <string_view>
@@ -101,6 +103,74 @@ private:
   std::filesystem::path backup_;
 };
 
+class ScopedReadOnlyTree final {
+public:
+  explicit ScopedReadOnlyTree(const std::filesystem::path &root) {
+    paths_.emplace_back(root, std::filesystem::status(root).permissions());
+    for (const auto &entry : std::filesystem::recursive_directory_iterator(
+             root,
+             std::filesystem::directory_options::skip_permission_denied)) {
+      if (!entry.is_symlink()) {
+        paths_.emplace_back(
+            entry.path(), std::filesystem::status(entry.path()).permissions());
+      }
+    }
+    for (const auto &[path, permissions] : paths_) {
+      std::filesystem::permissions(
+          path, permissions &
+                    ~(std::filesystem::perms::owner_write |
+                      std::filesystem::perms::group_write |
+                      std::filesystem::perms::others_write),
+          std::filesystem::perm_options::replace);
+    }
+  }
+
+  ~ScopedReadOnlyTree() {
+    for (auto it = paths_.rbegin(); it != paths_.rend(); ++it) {
+      std::error_code error;
+      std::filesystem::permissions(it->first, it->second,
+                                   std::filesystem::perm_options::replace,
+                                   error);
+    }
+  }
+
+  ScopedReadOnlyTree(const ScopedReadOnlyTree &) = delete;
+  ScopedReadOnlyTree &operator=(const ScopedReadOnlyTree &) = delete;
+
+private:
+  std::vector<std::pair<std::filesystem::path, std::filesystem::perms>> paths_;
+};
+
+[[nodiscard]] std::map<std::string, std::string>
+PackageFiles(const std::filesystem::path &root) {
+  std::map<std::string, std::string> result;
+  for (const auto &entry :
+       std::filesystem::recursive_directory_iterator(root)) {
+    if (!entry.is_regular_file() || entry.is_symlink()) {
+      continue;
+    }
+    std::ifstream stream(entry.path(), std::ios::binary);
+    if (!stream) {
+      throw std::runtime_error("Program Apply test cannot read package file");
+    }
+    result.emplace(
+        std::filesystem::relative(entry.path(), root).generic_string(),
+        std::string(std::istreambuf_iterator<char>(stream),
+                    std::istreambuf_iterator<char>()));
+  }
+  return result;
+}
+
+[[nodiscard]] std::filesystem::path RepositoryEntry(
+    const std::filesystem::path &root, const std::string_view directory,
+    const std::string_view digest) {
+  if (!digest.starts_with("sha256:")) {
+    throw std::runtime_error("Program Apply test received a non-digest ID");
+  }
+  return root / directory / "sha256" /
+         (std::string(digest.substr(7U)) + ".json");
+}
+
 [[nodiscard]] const CanonicalValue &Member(const CanonicalValue &root,
                                            const std::string_view name) {
   const auto *value = root.find_object_member(name);
@@ -174,42 +244,62 @@ TEST(ProgramApplyOwnerTest,
      PreparesCommitsReplaysAndReopensOneExactAppliedSelection) {
   TemporaryDirectory directory;
   const auto baseline = Baseline(directory.package());
+  const auto package_before = PackageFiles(directory.package());
   ProgramApplyOwner owner(directory.package(), directory.publications(),
                           "headless-api.test.program-selection", "epoch.1");
-  const auto prepared = owner.Prepare(
-      baseline.scenario_id, baseline.scenario_catalog_revision.value(),
-      CandidateProgram(baseline, "Changed Program"));
+  CanonicalValue replay;
+  std::string preparation_bytes;
+  {
+    ScopedReadOnlyTree package_read_only(directory.package());
+    const auto prepared = owner.Prepare(
+        baseline.scenario_id, baseline.scenario_catalog_revision.value(),
+        CandidateProgram(baseline, "Changed Program"));
 
-  EXPECT_EQ(Text(prepared, "schema_version"),
-            kProgramApplyPreparationSchemaVersion);
-  EXPECT_EQ(Text(prepared, "baseline_program_binding_id"),
-            baseline.program_binding_id.value());
-  EXPECT_NE(Text(prepared, "program_revision"),
-            baseline.program_revision.value());
-  EXPECT_NE(Text(prepared, "program_binding_id"),
-            baseline.program_binding_id.value());
+    EXPECT_EQ(Text(prepared, "schema_version"),
+              kProgramApplyPreparationSchemaVersion);
+    EXPECT_EQ(Text(prepared, "baseline_program_binding_id"),
+              baseline.program_binding_id.value());
+    EXPECT_NE(Text(prepared, "program_revision"),
+              baseline.program_revision.value());
+    EXPECT_NE(Text(prepared, "program_binding_id"),
+              baseline.program_binding_id.value());
 
-  const auto preparation_bytes = content_identity::canonical_json(prepared);
-  const auto applied = owner.Commit(preparation_bytes, std::nullopt,
-                                    baseline.retained_bundle_id.value(),
-                                    baseline.graph_revision.value(), 10);
-  EXPECT_EQ(Text(applied, "schema_version"),
-            kAppliedProgramSelectionSchemaVersion);
-  EXPECT_EQ(Text(applied, "program_revision"),
-            Text(prepared, "program_revision"));
-  EXPECT_EQ(Text(applied, "program_binding_id"),
-            Text(prepared, "program_binding_id"));
-  const auto &source = Member(applied, "source");
-  const auto first_record = Text(source, "record_digest");
+    preparation_bytes = content_identity::canonical_json(prepared);
+    const auto applied = owner.Commit(preparation_bytes, std::nullopt,
+                                      baseline.retained_bundle_id.value(),
+                                      baseline.graph_revision.value(), 10);
+    EXPECT_EQ(Text(applied, "schema_version"),
+              kAppliedProgramSelectionSchemaVersion);
+    EXPECT_EQ(Text(applied, "program_revision"),
+              Text(prepared, "program_revision"));
+    EXPECT_EQ(Text(applied, "program_binding_id"),
+              Text(prepared, "program_binding_id"));
+    EXPECT_TRUE(std::filesystem::exists(RepositoryEntry(
+        directory.publications(), "programs",
+        Text(prepared, "program_revision"))));
+    EXPECT_TRUE(std::filesystem::exists(RepositoryEntry(
+        directory.publications(), "program-bindings",
+        Text(prepared, "program_binding_id"))));
+    EXPECT_FALSE(std::filesystem::exists(
+        RepositoryEntry(directory.package(), "programs",
+                        Text(prepared, "program_revision"))));
+    EXPECT_FALSE(std::filesystem::exists(
+        RepositoryEntry(directory.package(), "program-bindings",
+                        Text(prepared, "program_binding_id"))));
+    const auto &source = Member(applied, "source");
+    const auto first_record = Text(source, "record_digest");
 
-  const auto replay = owner.Commit(preparation_bytes, std::nullopt,
-                                   baseline.retained_bundle_id.value(),
-                                   baseline.graph_revision.value(), 11);
-  EXPECT_EQ(Text(Member(replay, "source"), "record_digest"), first_record);
-  EXPECT_EQ(owner.ReadApplied(), replay);
+    replay = owner.Commit(preparation_bytes, std::nullopt,
+                          baseline.retained_bundle_id.value(),
+                          baseline.graph_revision.value(), 11);
+    EXPECT_EQ(Text(Member(replay, "source"), "record_digest"), first_record);
+    EXPECT_EQ(owner.ReadApplied(), replay);
+    EXPECT_EQ(PackageFiles(directory.package()), package_before);
+  }
 
   ASSERT_TRUE(std::filesystem::remove(directory.package() /
                                       "maintained.scenario-catalog.yaml"));
+  const auto package_after_catalog_removal = PackageFiles(directory.package());
   ProgramApplyOwner restarted(directory.package(), directory.publications(),
                               "headless-api.test.program-selection", "epoch.2");
   EXPECT_EQ(restarted.ReadApplied(), replay);
@@ -217,6 +307,7 @@ TEST(ProgramApplyOwnerTest,
                              baseline.retained_bundle_id.value(),
                              baseline.graph_revision.value(), 12),
             replay);
+  EXPECT_EQ(PackageFiles(directory.package()), package_after_catalog_removal);
 }
 
 TEST(ProgramApplyOwnerTest,
@@ -310,8 +401,8 @@ TEST(ProgramApplyOwnerTest,
       Text(Member(first_applied, "source"), "record_digest");
 
   {
-    ScopedBlockedDirectory blocked_program_repository(directory.package() /
-                                                      "programs" / "sha256");
+    ScopedBlockedDirectory blocked_program_repository(
+        directory.publications() / "programs" / "sha256");
     try {
       static_cast<void>(owner.Prepare(
           baseline.scenario_id, baseline.scenario_catalog_revision.value(),
@@ -341,6 +432,48 @@ TEST(ProgramApplyOwnerTest,
   }
   EXPECT_EQ(Text(Member(owner.ReadApplied(), "source"), "record_digest"),
             first_record);
+}
+
+TEST(ProgramApplyOwnerTest,
+     MissingOrMalformedPackageBaselineNeverFallsBackToCandidateRepository) {
+  for (const bool malformed : {false, true}) {
+    TemporaryDirectory directory;
+    const auto baseline = Baseline(directory.package());
+    const auto package_binding = RepositoryEntry(
+        directory.package(), "program-bindings",
+        baseline.program_binding_id.value());
+    const auto candidate_binding = RepositoryEntry(
+        directory.publications(), "program-bindings",
+        baseline.program_binding_id.value());
+    std::filesystem::create_directories(candidate_binding.parent_path());
+    ASSERT_TRUE(std::filesystem::copy_file(
+        package_binding, candidate_binding,
+        std::filesystem::copy_options::overwrite_existing));
+    if (malformed) {
+      std::ofstream stream(package_binding, std::ios::binary | std::ios::trunc);
+      ASSERT_TRUE(stream);
+      stream << "{malformed";
+      ASSERT_TRUE(stream);
+    } else {
+      ASSERT_TRUE(std::filesystem::remove(package_binding));
+    }
+    const auto package_before = PackageFiles(directory.package());
+    ProgramApplyOwner owner(directory.package(), directory.publications(),
+                            "headless-api.test.program-selection", "epoch.1");
+    try {
+      static_cast<void>(owner.Prepare(
+          baseline.scenario_id, baseline.scenario_catalog_revision.value(),
+          CandidateProgram(baseline, "Baseline source must be package-only")));
+      FAIL() << "Program Apply accepted an unavailable package baseline";
+    } catch (const ProgramApplyError &error) {
+      if (malformed) {
+        EXPECT_EQ(error.code(), "program_apply_preparation_failed");
+      } else {
+        EXPECT_EQ(error.code(), "program_apply_baseline_binding_invalid");
+      }
+    }
+    EXPECT_EQ(PackageFiles(directory.package()), package_before);
+  }
 }
 
 } // namespace

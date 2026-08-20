@@ -7,6 +7,7 @@ from concurrent.futures import ThreadPoolExecutor
 import json
 import os
 from pathlib import Path
+import shutil
 import socket
 import subprocess
 import sys
@@ -15,6 +16,7 @@ from typing import Iterator
 
 import pytest
 
+from manyforge_behavior.canonical_artifact import compute_content_identity
 from manyforge_headless_api.client import HeadlessClientError, HeadlessHttpClient
 from manyforge_headless_api.program_runner_client import ProgramRunnerHttpClient
 
@@ -412,10 +414,13 @@ def _program_surface_stack(root: Path) -> Iterator[ProcessStack]:
 
 
 @contextmanager
-def _assistant_stack(root: Path) -> Iterator[ProcessStack]:
+def _assistant_stack(
+    root: Path, *, package_root: Path | None = None
+) -> Iterator[ProcessStack]:
     stack = ProcessStack(
         root,
-        package_root=_required_path("MANYFORGE_ASSISTANT_AUTHORING_PACKAGE_ROOT"),
+        package_root=package_root
+        or _required_path("MANYFORGE_ASSISTANT_AUTHORING_PACKAGE_ROOT"),
         cell_id="i6_two_lite6_controllable_cell",
         program_path=Path(
             "/workspace/examples/pick_and_place_ur10e_robotiq.program.yaml"
@@ -511,12 +516,46 @@ def _assistant_callback_body(
     }
 
 
-def _plain_package_files(root: Path) -> dict[str, tuple[int, int]]:
-    return {
-        str(path.relative_to(root)): (path.stat().st_size, path.stat().st_mtime_ns)
-        for path in sorted(root.rglob("*"))
-        if path.is_file() and not path.is_symlink()
-    }
+def _plain_package_files(root: Path) -> dict[str, tuple[bytes, int, int]]:
+    result: dict[str, tuple[bytes, int, int]] = {}
+    for path in sorted(root.rglob("*")):
+        if path.is_file() and not path.is_symlink():
+            stat = path.stat()
+            result[str(path.relative_to(root))] = (
+                path.read_bytes(),
+                stat.st_size,
+                stat.st_mtime_ns,
+            )
+    return result
+
+
+@contextmanager
+def _read_only_tree(root: Path) -> Iterator[None]:
+    modes: dict[Path, int] = {}
+    paths = [root, *root.rglob("*")]
+    for path in paths:
+        if path.is_symlink():
+            continue
+        modes[path] = path.stat().st_mode & 0o777
+        path.chmod(modes[path] & ~0o222)
+    try:
+        yield
+    finally:
+        for path, mode in reversed(list(modes.items())):
+            if path.exists():
+                path.chmod(mode)
+
+
+def _edited_program(program: dict) -> dict:
+    edited = json.loads(json.dumps(program))
+    edited["name"] = "Read-only package edited Program"
+    edited["program_revision"] = compute_content_identity(
+        edited,
+        own_field="program_revision",
+        identity_domain="program-revision",
+        api_version="manyforge.program.v1",
+    )
+    return edited
 
 
 def _sole_retained_program(package_root: Path) -> dict:
@@ -716,59 +755,94 @@ def test_real_assistant_callback_uses_headless_source_facts_and_only_edits_draft
 def test_real_program_apply_reuses_active_deployment_and_survives_api_restart(
     tmp_path: Path,
 ) -> None:
-    with _assistant_stack(tmp_path) as stack:
-        assert stack.wait_complete(True)["complete"] is True
-        package_before = _plain_package_files(stack.package_root)
-        program = _sole_retained_program(stack.package_root)
-
-        with HeadlessHttpClient(stack.base_url) as client:
-            scenarios = client.scenarios()
-            assert [row["scenario_id"] for row in scenarios["scenarios"]] == [
-                "program_apply_fixture"
-            ]
-            with pytest.raises(HeadlessClientError) as absent:
-                client.program_applied()
-            assert absent.value.code == "program_applied_selection_not_found"
-
-            result = client.program_apply(
-                {
-                    "scenario_id": "program_apply_fixture",
-                    "scenario_catalog_revision": scenarios[
-                        "scenario_catalog_revision"
-                    ],
-                    "program": program,
-                    "expected_applied_record_digest": None,
-                }
+    package_root = tmp_path / "read-only-package"
+    shutil.copytree(
+        _required_path("MANYFORGE_ASSISTANT_AUTHORING_PACKAGE_ROOT"), package_root
+    )
+    package_before = _plain_package_files(package_root)
+    with _read_only_tree(package_root):
+        with _assistant_stack(tmp_path, package_root=package_root) as stack:
+            assert stack.wait_complete(True)["complete"] is True
+            program = _edited_program(_sole_retained_program(stack.package_root))
+            package_program_path = (
+                stack.package_root
+                / "programs"
+                / "sha256"
+                / f"{program['program_revision'][7:]}.json"
             )
-            assert result["status"] == "applied"
-            assert result["deployment_apply_required"] is False
-            assert result["manager_response"] is None
-            assert result["applied"]["program_revision"] == program[
-                "program_revision"
-            ]
-            first_applied = client.program_applied()
-            assert first_applied == result["applied"]
-
-        stack.kill_api()
-        stack.start_api()
-        stack.wait_complete(True)
-        with HeadlessHttpClient(stack.base_url) as restarted:
-            reopened = restarted.program_applied()
-            assert reopened == first_applied
-            replay = restarted.program_apply(
-                {
-                    "scenario_id": "program_apply_fixture",
-                    "scenario_catalog_revision": scenarios[
-                        "scenario_catalog_revision"
-                    ],
-                    "program": program,
-                    "expected_applied_record_digest": first_applied["source"][
-                        "record_digest"
-                    ],
-                }
+            publication_program_path = (
+                stack.publication_root
+                / "programs"
+                / "sha256"
+                / f"{program['program_revision'][7:]}.json"
             )
-            assert replay["applied"] == first_applied
-        assert _plain_package_files(stack.package_root) == package_before
+            publication_binding_path = (
+                stack.publication_root
+                / "program-bindings"
+                / "sha256"
+            )
+
+            with HeadlessHttpClient(stack.base_url) as client:
+                scenarios = client.scenarios()
+                assert [row["scenario_id"] for row in scenarios["scenarios"]] == [
+                    "program_apply_fixture"
+                ]
+                with pytest.raises(HeadlessClientError) as absent:
+                    client.program_applied()
+                assert absent.value.code == "program_applied_selection_not_found"
+
+                result = client.program_apply(
+                    {
+                        "scenario_id": "program_apply_fixture",
+                        "scenario_catalog_revision": scenarios[
+                            "scenario_catalog_revision"
+                        ],
+                        "program": program,
+                        "expected_applied_record_digest": None,
+                    }
+                )
+                assert result["status"] == "applied"
+                assert result["deployment_apply_required"] is False
+                assert result["manager_response"] is None
+                assert result["applied"]["program_revision"] == program[
+                    "program_revision"
+                ]
+                first_applied = client.program_applied()
+                assert first_applied == result["applied"]
+                assert publication_program_path.is_file()
+                assert not package_program_path.exists()
+                candidate_binding_path = publication_binding_path / (
+                    f"{result['applied']['program_binding_id'][7:]}.json"
+                )
+                package_binding_path = (
+                    stack.package_root
+                    / "program-bindings"
+                    / "sha256"
+                    / f"{result['applied']['program_binding_id'][7:]}.json"
+                )
+                assert candidate_binding_path.is_file()
+                assert not package_binding_path.exists()
+
+            stack.kill_api()
+            stack.start_api()
+            stack.wait_complete(True)
+            with HeadlessHttpClient(stack.base_url) as restarted:
+                reopened = restarted.program_applied()
+                assert reopened == first_applied
+                replay = restarted.program_apply(
+                    {
+                        "scenario_id": "program_apply_fixture",
+                        "scenario_catalog_revision": scenarios[
+                            "scenario_catalog_revision"
+                        ],
+                        "program": program,
+                        "expected_applied_record_digest": first_applied["source"][
+                            "record_digest"
+                        ],
+                    }
+                )
+                assert replay["applied"] == first_applied
+            assert _plain_package_files(stack.package_root) == package_before
 
 
 def test_program_runner_headless_and_composer_are_independent_processes(

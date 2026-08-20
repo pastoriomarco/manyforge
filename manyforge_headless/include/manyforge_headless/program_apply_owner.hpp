@@ -82,7 +82,10 @@ private:
   manyforge::deployment::FilesystemVerifiedRetainedBundleSource bundle_source_;
   manyforge::deployment::FilesystemVerifiedRetainedModelMapSource
       model_map_source_;
-  manyforge::deployment::FilesystemCatalogArtifactStore catalog_store_;
+  manyforge::deployment::FilesystemVerifiedCatalogArtifactSource
+      catalog_source_;
+  manyforge::deployment::FilesystemVerifiedProgramBindingSource
+      baseline_binding_source_;
   manyforge::deployment::FilesystemProgramRepository program_repository_;
   manyforge::deployment::FilesystemProgramBindingRepository binding_repository_;
   AtomicSourceSnapshotChannel publication_;

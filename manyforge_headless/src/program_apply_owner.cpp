@@ -289,8 +289,9 @@ ProgramApplyOwner::ProgramApplyOwner(std::filesystem::path package_root,
                                      std::string owner_epoch)
     : scenario_source_(package_root, "maintained"),
       bundle_source_(package_root), model_map_source_(package_root),
-      catalog_store_(package_root), program_repository_(package_root),
-      binding_repository_(std::move(package_root)),
+      catalog_source_(package_root), baseline_binding_source_(package_root),
+      program_repository_(publication_root),
+      binding_repository_(publication_root),
       publication_(std::move(publication_root),
                    std::string(kAppliedProgramSelectionSourceFile)),
       source_owner_id_(std::move(owner_id)),
@@ -321,7 +322,7 @@ CanonicalValue ProgramApplyOwner::Prepare(
     Require(bundle != nullptr, "program_apply_bundle_invalid",
             "Program Apply retained bundle is absent or unverifiable");
     auto model_map = LoadModelMap(*bundle, model_map_source_);
-    const auto baseline = binding_repository_.get_verified(
+    const auto baseline = baseline_binding_source_.get_verified(
         scenario.program_binding_id, *bundle, model_map);
     Require(baseline != nullptr, "program_apply_baseline_binding_invalid",
             "Program Apply occurrence has no verified baseline binding");
@@ -350,7 +351,7 @@ CanonicalValue ProgramApplyOwner::Prepare(
       try {
         return deployment::compile_program_binding(
             *program, AssignmentFrom(*baseline), *bundle, model_map,
-            catalog_store_);
+            catalog_source_);
       } catch (const deployment::ProgramBindingCompilerError &error) {
         Fail("program_apply_binding_invalid",
              "Program Apply binding is invalid: " + std::string(error.what()));
@@ -452,7 +453,7 @@ CanonicalValue ProgramApplyOwner::Commit(
             "program_apply_bundle_invalid",
             "Program Apply target bundle is absent or divergent");
     auto model_map = LoadModelMap(*bundle, model_map_source_);
-    const auto baseline = binding_repository_.get_verified(
+    const auto baseline = baseline_binding_source_.get_verified(
         prepared.baseline_program_binding_id, *bundle, model_map);
     const auto program = program_repository_.get_verified(
         prepared.program_id, prepared.program_revision, *bundle);
@@ -525,7 +526,7 @@ CanonicalValue ProgramApplyOwner::ReadAppliedLocked() {
     Require(bundle != nullptr, "program_applied_selection_invalid",
             "Applied Program retained bundle is unavailable");
     auto model_map = LoadModelMap(*bundle, model_map_source_);
-    const auto baseline = binding_repository_.get_verified(
+    const auto baseline = baseline_binding_source_.get_verified(
         prepared.baseline_program_binding_id, *bundle, model_map);
     const auto program = program_repository_.get_verified(
         prepared.program_id, prepared.program_revision, *bundle);
