@@ -7,12 +7,15 @@
 #include <sys/wait.h>
 #include <unistd.h>
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <cctype>
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
 #include <iterator>
+#include <limits>
 #include <memory>
 #include <optional>
 #include <manyforge_component_manager/durable_store_set.hpp>
@@ -306,16 +309,38 @@ private:
 };
 
 std::vector<pid_t> ReadDirectChildren(const pid_t parent) {
-  std::ifstream stream(std::filesystem::path("/proc") /
-                       std::to_string(parent) / "task" /
-                       std::to_string(parent) / "children");
   std::vector<pid_t> children;
-  pid_t child = 0;
-  while (stream >> child) {
-    if (child > 0) {
-      children.push_back(child);
+  std::error_code error;
+  std::filesystem::directory_iterator iterator(
+      "/proc", std::filesystem::directory_options::skip_permission_denied,
+      error);
+  const std::filesystem::directory_iterator end;
+  while (!error && iterator != end) {
+    const auto pid_spelling = iterator->path().filename().string();
+    if (!pid_spelling.empty() &&
+        std::all_of(pid_spelling.begin(), pid_spelling.end(),
+                    [](const unsigned char character) {
+                      return std::isdigit(character) != 0;
+                    })) {
+      std::ifstream status(iterator->path() / "status");
+      std::string field;
+      pid_t observed_parent = 0;
+      char process_state = '\0';
+      while (status >> field) {
+        if (field == "State:") {
+          static_cast<void>(status >> process_state);
+        } else if (field == "PPid:") {
+          static_cast<void>(status >> observed_parent);
+        }
+        status.ignore(std::numeric_limits<std::streamsize>::max(), '\n');
+      }
+      if (observed_parent == parent && process_state != 'Z') {
+        children.push_back(static_cast<pid_t>(std::stol(pid_spelling)));
+      }
     }
+    iterator.increment(error);
   }
+  std::sort(children.begin(), children.end());
   return children;
 }
 
@@ -489,7 +514,8 @@ RuntimeOfferProjection WaitForRuntimeOfferProjection(
       "Manager source did not publish the expected runtime offer projection");
 }
 
-pid_t WaitForSoleManagedChild(const pid_t manager) {
+pid_t WaitForSoleManagedChild(const pid_t manager,
+                              const std::string_view observation_stage) {
   const auto deadline =
       std::chrono::steady_clock::now() + std::chrono::seconds(10);
   while (std::chrono::steady_clock::now() < deadline) {
@@ -499,7 +525,8 @@ pid_t WaitForSoleManagedChild(const pid_t manager) {
     }
     std::this_thread::sleep_for(std::chrono::milliseconds(10));
   }
-  throw std::runtime_error("Manager did not converge one replacement child");
+  throw std::runtime_error("Manager did not converge one child " +
+                           std::string(observation_stage));
 }
 #endif
 
@@ -1913,7 +1940,8 @@ TEST(ManagerDaemonProcess,
               advanced_scene_projection->source_generation);
     advanced_scene_generation = after_scene_advance->source_generation;
 
-    const auto first_child = WaitForSoleManagedChild(manager.pid());
+    const auto first_child =
+        WaitForSoleManagedChild(manager.pid(), "before deliberate SIGKILL");
     ASSERT_EQ(::kill(first_child, SIGKILL), 0);
 
     const auto recovered = WaitForExecutionReady(
@@ -1924,7 +1952,9 @@ TEST(ManagerDaemonProcess,
     // A small PID namespace may immediately reuse the numeric PID. The fresh
     // owner epoch above and one live direct child prove replacement without
     // treating PID allocation as runtime identity.
-    EXPECT_GT(WaitForSoleManagedChild(manager.pid()), 0);
+    EXPECT_GT(WaitForSoleManagedChild(manager.pid(),
+                                     "after fresh execution owner epoch"),
+              0);
 
     child_recovered_offer =
         WaitForRuntimeOfferProjection(manager_source, recovered.owner_epoch);
