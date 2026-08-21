@@ -17,4 +17,3 @@ describe('DeploymentCompositionPanel Apply contract', () => {
     expect(source).not.toContain('/api/program/runs');
   });
 });
-
