@@ -200,6 +200,11 @@ file(
 list(
   REMOVE_ITEM
   MANYFORGE_COMPILER_SOURCE_INPUTS
+  # These C0 transport/test artifacts are downstream of the native compiler
+  # and must not feed its own build identity through the recursive glob above.
+  "${CMAKE_CURRENT_SOURCE_DIR}/resources/program_binding_lite6_native.fixture.json"
+  "${CMAKE_CURRENT_SOURCE_DIR}/resources/program_binding_transport.v1.json"
+  "${CMAKE_CURRENT_SOURCE_DIR}/tools/generate_program_binding_transport.py"
   "${CMAKE_CURRENT_SOURCE_DIR}/src/embedded_build_evidence.hpp.in"
   "${CMAKE_CURRENT_SOURCE_DIR}/src/embedded_canonical_empty_deployment.hpp.in"
   "${CMAKE_CURRENT_SOURCE_DIR}/src/embedded_closed_schema.hpp.in"
