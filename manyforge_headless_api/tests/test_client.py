@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+from pathlib import Path
 
 import httpx
 import pytest
@@ -17,6 +18,91 @@ from manyforge_headless_api.native import (
     HeadlessApiError,
     NativeHeadlessCore,
 )
+from manyforge_behavior.canonical_artifact import compute_content_identity
+
+
+_BINDING_FIXTURE = (
+    Path(__file__).resolve().parents[2]
+    / "manyforge_deployment/resources/program_binding_lite6_native.fixture.json"
+)
+
+
+def _client_binding() -> dict[str, object]:
+    binding = json.loads(_BINDING_FIXTURE.read_text(encoding="utf-8"))
+    binding.update(
+        {
+            "program_binding_id": "sha256:" + "0" * 64,
+            "program_id": "fixture",
+            "program_revision": "sha256:" + "a" * 64,
+            "retained_bundle_id": "sha256:" + "b" * 64,
+            "graph_revision": "sha256:" + "c" * 64,
+        }
+    )
+    binding["program_binding_id"] = compute_content_identity(
+        binding,
+        own_field="program_binding_id",
+        identity_domain="program-binding-id",
+        api_version="manyforge.program_binding.v1",
+    )
+    return binding
+
+
+def _client_applied() -> dict[str, object]:
+    binding = _client_binding()
+    return {
+        "assistant_mode": "forbidden",
+        "baseline_program_binding_id": "sha256:" + "d" * 64,
+        "deployment_artifact_id": "cell-a",
+        "deployment_revision": "sha256:" + "e" * 64,
+        "graph_revision": binding["graph_revision"],
+        "node_environment_digest": binding["node_environment"][
+            "environment_digest"
+        ],
+        "preparation_digest": "sha256:" + "f" * 64,
+        "program": {
+            "program_id": "fixture",
+            "program_revision": "sha256:" + "a" * 64,
+        },
+        "program_binding": binding,
+        "program_binding_id": binding["program_binding_id"],
+        "program_id": "fixture",
+        "program_revision": "sha256:" + "a" * 64,
+        "retained_bundle_id": binding["retained_bundle_id"],
+        "scenario_catalog_revision": "sha256:" + "1" * 64,
+        "scenario_id": "cell-pick",
+        "schema_version": "manyforge.applied_program_selection.v1",
+        "source": {
+            "record_digest": "sha256:" + "2" * 64,
+            "semantic_content_digest": "sha256:" + "3" * 64,
+            "source_generation": 1,
+            "source_owner_epoch": "owner.epoch.1",
+            "source_owner_id": "owner.cell-a",
+        },
+        "typed_parameter_overrides": {},
+    }
+
+
+def _client_scenario_selection() -> dict[str, object]:
+    applied = _client_applied()
+    return {
+        "assistant_mode": applied["assistant_mode"],
+        "assistant_projection": None,
+        "deployment_artifact_id": applied["deployment_artifact_id"],
+        "deployment_revision": applied["deployment_revision"],
+        "graph_revision": applied["graph_revision"],
+        "node_environment_digest": applied["node_environment_digest"],
+        "owner_identities": [],
+        "program": applied["program"],
+        "program_binding": applied["program_binding"],
+        "program_binding_id": applied["program_binding_id"],
+        "program_id": applied["program_id"],
+        "program_revision": applied["program_revision"],
+        "retained_bundle_id": applied["retained_bundle_id"],
+        "scenario_catalog_revision": applied["scenario_catalog_revision"],
+        "scenario_id": "cell-pick",
+        "schema_version": "manyforge.scenario_program_selection.v2",
+        "typed_parameter_overrides": {},
+    }
 
 
 def _sized_context_payload(size: int, *, native: bool = False) -> bytes:
@@ -246,7 +332,13 @@ def test_client_uses_exact_program_selection_and_run_routes() -> None:
 
     def handler(request: httpx.Request) -> httpx.Response:
         requests.append(request)
-        return httpx.Response(200, json={"ok": True}, request=request)
+        if request.url.path.endswith("/program-selection"):
+            payload = _client_scenario_selection()
+        elif request.url.path == "/api/program/applied":
+            payload = _client_applied()
+        else:
+            payload = {"ok": True}
+        return httpx.Response(200, json=payload, request=request)
 
     raw = httpx.Client(
         base_url="http://headless.test",
@@ -280,6 +372,36 @@ def test_client_uses_exact_program_selection_and_run_routes() -> None:
     }
     assert json.loads(requests[3].read()) == {"request_id": "request.1"}
     assert json.loads(requests[5].read()) == {"request_id": "request.2"}
+
+
+def test_client_rejects_rehashed_malformed_scenario_binding() -> None:
+    selection = _client_scenario_selection()
+    binding = selection["program_binding"]
+    binding["target_role_bindings"][0]["frame_role_bindings"][0][
+        "unknown"
+    ] = True
+    binding["program_binding_id"] = compute_content_identity(
+        binding,
+        own_field="program_binding_id",
+        identity_domain="program-binding-id",
+        api_version="manyforge.program_binding.v1",
+    )
+    selection["program_binding_id"] = binding["program_binding_id"]
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json=selection, request=request)
+
+    raw = httpx.Client(
+        base_url="http://headless.test",
+        transport=httpx.MockTransport(handler),
+    )
+    try:
+        client = HeadlessHttpClient("http://unused.test", client=raw)
+        with pytest.raises(HeadlessClientError) as raised:
+            client.scenario_program_selection("cell-pick")
+    finally:
+        raw.close()
+    assert raised.value.code == "scenario_program_selection_invalid"
 
 
 def test_client_uses_the_revision_fenced_scene_pose_route() -> None:

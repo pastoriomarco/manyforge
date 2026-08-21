@@ -631,6 +631,8 @@ int main(int argc, char** argv) {
 
     const auto program_path = output_root / "program.json";
     write_exact_file(program_path, program_bytes);
+    write_exact_file(output_root / "program_binding.json",
+                     std::string(binding->canonical_bytes()));
     const CanonicalValue manifest(CanonicalValue::Object{
         {"api_version", CanonicalValue("manyforge.i6.native-execution-fixture.v1")},
         {"cclc_product", CanonicalValue(arguments.cclc_product)},

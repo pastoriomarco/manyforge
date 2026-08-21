@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import copy
 from functools import lru_cache
+import json
 from pathlib import Path
 from typing import Any, Sequence
 
@@ -23,6 +24,10 @@ from manyforge_headless_api.service import HeadlessService
 
 
 _ROOT = Path(__file__).resolve().parents[2]
+_BINDING_FIXTURE = (
+    _ROOT
+    / "manyforge_deployment/resources/program_binding_lite6_native.fixture.json"
+)
 
 
 @lru_cache(maxsize=1)
@@ -40,30 +45,12 @@ def _program_binding(
     retained_bundle_id: str = "sha256:" + "8" * 64,
     graph_revision: str = "sha256:" + "9" * 64,
 ) -> dict[str, Any]:
-    binding = {
-        "api_version": "manyforge.program_binding.v1",
-        "program_binding_id": "sha256:" + "0" * 64,
-        "program_id": program["program_id"],
-        "program_revision": program["program_revision"],
-        "retained_bundle_id": retained_bundle_id,
-        "graph_revision": graph_revision,
-        "node_environment": {
-            "catalog_id": "manyforge.default",
-            "content_version": "1.1.0",
-            "catalog_digest": "sha256:" + "1" * 64,
-            "environment_digest": "sha256:" + "2" * 64,
-        },
-        "component_role_bindings": [],
-        "target_role_bindings": [],
-        "contact_grasp_bindings": [],
-        "provenance": {
-            "binding_compiler_contract_digest": "sha256:" + "3" * 64,
-            "binding_compiler_build_digest": "sha256:" + "4" * 64,
-            "role_assignment_digest": "sha256:" + "5" * 64,
-            "source_records": [],
-            "resolved_output_records": [],
-        },
-    }
+    binding = json.loads(_BINDING_FIXTURE.read_text(encoding="utf-8"))
+    binding["program_binding_id"] = "sha256:" + "0" * 64
+    binding["program_id"] = program["program_id"]
+    binding["program_revision"] = program["program_revision"]
+    binding["retained_bundle_id"] = retained_bundle_id
+    binding["graph_revision"] = graph_revision
     binding["program_binding_id"] = compute_content_identity(
         binding,
         own_field="program_binding_id",
@@ -117,6 +104,35 @@ def _applied_projection(
     }
 
 
+def _scenario_selection(
+    *,
+    scenario_id: str = "cell-pick",
+) -> dict[str, Any]:
+    program = _program_document()
+    binding = _program_binding(program)
+    return {
+        "assistant_mode": "forbidden",
+        "assistant_projection": None,
+        "deployment_artifact_id": "cell_a",
+        "deployment_revision": "sha256:" + "1" * 64,
+        "graph_revision": binding["graph_revision"],
+        "node_environment_digest": binding["node_environment"][
+            "environment_digest"
+        ],
+        "owner_identities": [],
+        "program": copy.deepcopy(program),
+        "program_binding": binding,
+        "program_binding_id": binding["program_binding_id"],
+        "program_id": program["program_id"],
+        "program_revision": program["program_revision"],
+        "retained_bundle_id": binding["retained_bundle_id"],
+        "scenario_catalog_revision": "sha256:" + "6" * 64,
+        "scenario_id": scenario_id,
+        "schema_version": "manyforge.scenario_program_selection.v2",
+        "typed_parameter_overrides": {},
+    }
+
+
 def _remove_program_tree_with_valid_identity(value: dict[str, Any]) -> None:
     value["program"].pop("tree")
     value["program"]["program_revision"] = compute_content_identity(
@@ -136,6 +152,20 @@ def _remove_program_tree_with_valid_identity(value: dict[str, Any]) -> None:
     value["program_binding_id"] = value["program_binding"]["program_binding_id"]
 
 
+def _malform_binding_frame_with_valid_identity(value: dict[str, Any]) -> None:
+    binding = value["program_binding"]
+    binding["target_role_bindings"][0]["frame_role_bindings"][0][
+        "unknown"
+    ] = True
+    binding["program_binding_id"] = compute_content_identity(
+        binding,
+        own_field="program_binding_id",
+        identity_domain="program-binding-id",
+        api_version="manyforge.program_binding.v1",
+    )
+    value["program_binding_id"] = binding["program_binding_id"]
+
+
 def test_closed_core_invalid_request_maps_to_a_client_error() -> None:
     assert _error_status("invalid_request") == 400
     assert _error_status("program_apply_request_oversized") == 413
@@ -152,6 +182,27 @@ def test_full_native_applied_program_projection_is_accepted() -> None:
 
     assert response.status_code == 200
     assert response.json() == projection
+
+
+def test_scenario_program_selection_rejects_rehashed_malformed_binding() -> None:
+    core = FakeCore()
+    selection = _scenario_selection()
+    selection["program_binding"]["target_role_bindings"][0][
+        "frame_role_bindings"
+    ][0]["unknown"] = True
+    selection["program_binding"]["program_binding_id"] = compute_content_identity(
+        selection["program_binding"],
+        own_field="program_binding_id",
+        identity_domain="program-binding-id",
+        api_version="manyforge.program_binding.v1",
+    )
+    core.scenario_selection_override = selection
+    client = TestClient(create_app(service=HeadlessService(core, FakeManager())))
+
+    response = client.get("/api/scenarios/cell-pick/program-selection")
+
+    assert response.status_code == 502
+    assert response.json()["detail"]["code"] == "scenario_program_selection_invalid"
 
 
 @pytest.mark.parametrize(
@@ -175,6 +226,7 @@ def test_full_native_applied_program_projection_is_accepted() -> None:
         lambda value: value["program_binding"].__setitem__(
             "component_role_bindings", [False]
         ),
+        _malform_binding_frame_with_valid_identity,
         lambda value: value["source"].pop("semantic_content_digest"),
         lambda value: value["source"].__setitem__("record_digest", "invalid"),
     ],
@@ -309,6 +361,7 @@ class FakeCore:
         self.program_target_graph = "graph.1"
         self.model_attempts: list[dict[str, Any]] = []
         self.source_model_context_override: dict[str, Any] | None = None
+        self.scenario_selection_override: dict[str, Any] | None = None
 
     def runtime_snapshot(self) -> dict[str, Any]:
         return {
@@ -397,13 +450,9 @@ class FakeCore:
         }
 
     def scenario_program_selection(self, scenario_id: str) -> dict[str, Any]:
-        return {
-            "schema_version": "manyforge.scenario_program_selection.v2",
-            "scenario_id": scenario_id,
-            "program": _program_document(),
-            "program_binding": {},
-            "owner_identities": [],
-        }
+        if self.scenario_selection_override is not None:
+            return copy.deepcopy(self.scenario_selection_override)
+        return _scenario_selection(scenario_id=scenario_id)
 
     def prepare_program_apply(
         self,
@@ -1175,6 +1224,51 @@ def test_program_apply_skips_unchanged_deployment_and_publishes_exact_program() 
     assert applied.json()["program_revision"] == program["program_revision"]
 
 
+def test_program_apply_rejects_rehashed_malformed_applied_binding_result() -> None:
+    core = FakeCore()
+    core.program_target_bundle = "sha256:" + "b" * 64
+    core.program_target_graph = "sha256:" + "c" * 64
+    core.manager_payload["active"]["retained_bundle_id"] = (
+        core.program_target_bundle
+    )
+    core.manager_payload["active"]["graph_revision"] = core.program_target_graph
+    original_commit = core.commit_program_apply
+
+    def malformed_commit(
+        preparation: dict[str, Any],
+        expected_applied_record_digest: str | None,
+    ) -> dict[str, Any]:
+        result = original_commit(preparation, expected_applied_record_digest)
+        binding = result["program_binding"]
+        binding["target_role_bindings"][0]["frame_role_bindings"][0][
+            "unknown"
+        ] = True
+        binding["program_binding_id"] = compute_content_identity(
+            binding,
+            own_field="program_binding_id",
+            identity_domain="program-binding-id",
+            api_version="manyforge.program_binding.v1",
+        )
+        result["program_binding_id"] = binding["program_binding_id"]
+        return result
+
+    core.commit_program_apply = malformed_commit  # type: ignore[method-assign]
+    client = TestClient(create_app(service=HeadlessService(core, FakeManager())))
+
+    response = client.post(
+        "/api/program/apply",
+        json={
+            "scenario_id": "cell-pick",
+            "scenario_catalog_revision": "sha256:" + "6" * 64,
+            "program": copy.deepcopy(_program_document()),
+            "expected_applied_record_digest": None,
+        },
+    )
+
+    assert response.status_code == 502
+    assert response.json()["detail"]["code"] == "program_apply_response_invalid"
+
+
 def test_program_apply_fences_published_full_stack_restart_before_prepare() -> None:
     core = FakeCore()
     core.manager_payload["apply"] = {
@@ -1352,6 +1446,14 @@ def test_program_run_start_rejects_stale_applied_or_divergent_runner() -> None:
 
 def test_program_only_apply_does_not_mutate_an_active_captured_run() -> None:
     core = FakeCore()
+    core.program_target_bundle = "sha256:" + "b" * 64
+    core.program_target_graph = "sha256:" + "c" * 64
+    core.manager_payload["active"]["retained_bundle_id"] = (
+        core.program_target_bundle
+    )
+    core.manager_payload["active"]["graph_revision"] = (
+        core.program_target_graph
+    )
     runner = FakeProgramRunner()
     app = create_app(
         service=HeadlessService(

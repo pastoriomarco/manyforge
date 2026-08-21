@@ -44,43 +44,17 @@ from .models import (
 )
 from .native import HeadlessApiError, HeadlessCorePort, ViewerModelAsset
 from .program_runner_client import ProgramRunnerClientError, ProgramRunnerPort
+from .program_binding_transport import ProgramBindingTransportError
+from .program_binding_projection import (
+    validate_applied_program_selection,
+    validate_program_apply_result,
+    validate_scenario_program_selection,
+)
 
 
 RUNTIME_SNAPSHOT_VERSION = "manyforge.headless_runtime_snapshot.v1"
 MANAGER_SOURCE_VERSION = "manyforge.manager_source.v1"
 PROGRAM_APPLY_RESULT_VERSION = "manyforge.program_apply_result.v1"
-APPLIED_PROGRAM_SELECTION_VERSION = "manyforge.applied_program_selection.v1"
-_APPLIED_PROGRAM_SELECTION_FIELDS = frozenset(
-    {
-        "assistant_mode",
-        "baseline_program_binding_id",
-        "deployment_artifact_id",
-        "deployment_revision",
-        "graph_revision",
-        "node_environment_digest",
-        "preparation_digest",
-        "program",
-        "program_binding",
-        "program_binding_id",
-        "program_id",
-        "program_revision",
-        "retained_bundle_id",
-        "scenario_catalog_revision",
-        "scenario_id",
-        "schema_version",
-        "source",
-        "typed_parameter_overrides",
-    }
-)
-_APPLIED_PROGRAM_SOURCE_FIELDS = frozenset(
-    {
-        "record_digest",
-        "semantic_content_digest",
-        "source_generation",
-        "source_owner_epoch",
-        "source_owner_id",
-    }
-)
 PROGRAM_RUN_INDEX_VERSION = "manyforge.program_run_index.v1"
 PROGRAM_RUN_STATUS_VERSION = "manyforge.program_run_status.v1"
 PROGRAM_RUN_CAPTURE_VERSION = "manyforge.program_run_capture.v1"
@@ -99,47 +73,6 @@ _PROGRAM_RUN_STATES = frozenset(
 _ACTIVE_PROGRAM_RUN_STATES = frozenset(
     {"running", "intervention_required", "stopping", "finalizing"}
 )
-_PROGRAM_REQUIRED_FIELDS = frozenset(
-    {
-        "api_version",
-        "program_id",
-        "program_revision",
-        "program_profile",
-        "name",
-        "catalog",
-        "component_roles",
-        "target_roles",
-        "tree",
-    }
-)
-_PROGRAM_FIELDS = _PROGRAM_REQUIRED_FIELDS | frozenset(
-    {
-        "blackboard",
-        "compatibility",
-        "contact_policies",
-        "description",
-        "parameters",
-        "scene",
-        "viewer",
-    }
-)
-_PROGRAM_BINDING_FIELDS = frozenset(
-    {
-        "api_version",
-        "component_role_bindings",
-        "contact_grasp_bindings",
-        "graph_revision",
-        "node_environment",
-        "program_binding_id",
-        "program_id",
-        "program_revision",
-        "provenance",
-        "retained_bundle_id",
-        "target_role_bindings",
-    }
-)
-
-
 def _bounded_text(value: object, *, maximum_bytes: int) -> bool:
     return (
         isinstance(value, str)
@@ -525,18 +458,21 @@ class HeadlessService:
 
     def scenario_program_selection(self, scenario_id: str) -> dict[str, Any]:
         projection = self.core.scenario_program_selection(scenario_id)
-        if (
-            projection.get("schema_version")
-            != "manyforge.scenario_program_selection.v2"
-            or projection.get("scenario_id") != scenario_id
-            or not isinstance(projection.get("program"), dict)
-            or not isinstance(projection.get("program_binding"), dict)
-            or not isinstance(projection.get("owner_identities"), list)
-        ):
+        if not isinstance(projection, dict):
             raise HeadlessApiError(
                 "scenario_program_selection_invalid",
                 "native core returned an unsupported scenario Program selection",
             )
+        try:
+            validate_scenario_program_selection(
+                projection,
+                scenario_id=scenario_id,
+            )
+        except (ProgramBindingTransportError, TypeError, ValueError) as error:
+            raise HeadlessApiError(
+                "scenario_program_selection_invalid",
+                "native core returned an unsupported scenario Program selection",
+            ) from error
         return projection
 
     def program_applied(self) -> dict[str, Any]:
@@ -546,157 +482,18 @@ class HeadlessService:
                 "program_applied_selection_invalid",
                 "native core returned an invalid Applied Program projection",
             )
-        program = projection.get("program")
-        binding = projection.get("program_binding")
-        source = projection.get("source")
-        node_environment = (
-            binding.get("node_environment") if isinstance(binding, dict) else None
-        )
         try:
-            program_identity = (
-                verify_content_identity(
-                    program,
-                    own_field="program_revision",
-                    identity_domain="program-revision",
-                    api_version="manyforge.program.v1",
-                    label="applied_program.program",
-                )
-                if isinstance(program, dict)
-                else None
-            )
-            binding_identity = (
-                verify_content_identity(
-                    binding,
-                    own_field="program_binding_id",
-                    identity_domain="program-binding-id",
-                    api_version="manyforge.program_binding.v1",
-                    label="applied_program.program_binding",
-                )
-                if isinstance(binding, dict)
-                else None
-            )
-            validated_program = (
-                Program.from_dict(
-                    program,
-                    _program_catalog(),
-                    path="<headless-applied-program>",
-                )
-                if isinstance(program, dict)
-                else None
-            )
-        except (
-            ProgramValidationError,
-            StrictArtifactError,
-            TypeError,
-            ValueError,
-        ):
-            program_identity = None
-            binding_identity = None
-            validated_program = None
-        if (
-            set(projection) != _APPLIED_PROGRAM_SELECTION_FIELDS
-            or projection.get("schema_version")
-            != APPLIED_PROGRAM_SELECTION_VERSION
-            or projection.get("assistant_mode")
-            not in {"required", "optional", "forbidden"}
-            or not _sha256_identity(
-                projection.get("baseline_program_binding_id")
-            )
-            or not _bounded_text(
-                projection.get("deployment_artifact_id"),
-                maximum_bytes=256,
-            )
-            or not _sha256_identity(projection.get("deployment_revision"))
-            or not _sha256_identity(projection.get("node_environment_digest"))
-            or not _sha256_identity(projection.get("preparation_digest"))
-            or not _sha256_identity(
-                projection.get("scenario_catalog_revision")
-            )
-            or not _bounded_text(
-                projection.get("scenario_id"),
-                maximum_bytes=256,
-            )
-            or not isinstance(projection.get("typed_parameter_overrides"), dict)
-            or not _bounded_text(projection.get("program_id"), maximum_bytes=256)
-            or not _sha256_identity(projection.get("program_revision"))
-            or not _sha256_identity(projection.get("program_binding_id"))
-            or not _sha256_identity(projection.get("retained_bundle_id"))
-            or not _sha256_identity(projection.get("graph_revision"))
-            or not isinstance(program, dict)
-            or not _PROGRAM_REQUIRED_FIELDS.issubset(program)
-            or not set(program).issubset(_PROGRAM_FIELDS)
-            or not isinstance(program.get("catalog"), dict)
-            or not isinstance(program.get("component_roles"), dict)
-            or not isinstance(program.get("target_roles"), dict)
-            or not isinstance(program.get("tree"), dict)
-            or program.get("program_id") != projection.get("program_id")
-            or program_identity != projection.get("program_revision")
-            or validated_program is None
-            or validated_program.to_dict() != program
-            or not isinstance(binding, dict)
-            or set(binding) != _PROGRAM_BINDING_FIELDS
-            or binding.get("api_version") != "manyforge.program_binding.v1"
-            or binding.get("program_id") != projection.get("program_id")
-            or binding.get("program_revision") != projection.get("program_revision")
-            or binding_identity != projection.get("program_binding_id")
-            or binding.get("retained_bundle_id")
-            != projection.get("retained_bundle_id")
-            or binding.get("graph_revision") != projection.get("graph_revision")
-            or not isinstance(binding.get("component_role_bindings"), list)
-            or not all(
-                isinstance(row, dict)
-                for row in binding.get("component_role_bindings", ())
-            )
-            or not isinstance(binding.get("target_role_bindings"), list)
-            or not all(
-                isinstance(row, dict)
-                for row in binding.get("target_role_bindings", ())
-            )
-            or not isinstance(binding.get("contact_grasp_bindings"), list)
-            or not all(
-                isinstance(row, dict)
-                for row in binding.get("contact_grasp_bindings", ())
-            )
-            or not isinstance(binding.get("provenance"), dict)
-            or not isinstance(node_environment, dict)
-            or set(node_environment)
-            != {
-                "catalog_id",
-                "content_version",
-                "catalog_digest",
-                "environment_digest",
-            }
-            or not _bounded_text(
-                node_environment.get("catalog_id"),
-                maximum_bytes=256,
-            )
-            or not _bounded_text(
-                node_environment.get("content_version"),
-                maximum_bytes=128,
-            )
-            or not _sha256_identity(node_environment.get("catalog_digest"))
-            or not _sha256_identity(node_environment.get("environment_digest"))
-            or node_environment.get("environment_digest")
-            != projection.get("node_environment_digest")
-            or not isinstance(source, dict)
-            or set(source) != _APPLIED_PROGRAM_SOURCE_FIELDS
-            or not _sha256_identity(source.get("record_digest"))
-            or not _sha256_identity(source.get("semantic_content_digest"))
-            or type(source.get("source_generation")) is not int
-            or source.get("source_generation", 0) < 1
-            or not _bounded_text(
-                source.get("source_owner_epoch"),
-                maximum_bytes=256,
-            )
-            or not _bounded_text(
-                source.get("source_owner_id"),
-                maximum_bytes=256,
-            )
-        ):
+            validate_applied_program_selection(projection)
+        except (ProgramBindingTransportError, TypeError, ValueError) as error:
             raise HeadlessApiError(
                 "program_applied_selection_invalid",
                 "native core returned an unsupported Applied Program selection",
-            )
+            ) from error
+        self._validate_applied_program_semantics(
+            projection,
+            error_code="program_applied_selection_invalid",
+            message="native core returned an unsupported Applied Program selection",
+        )
         return projection
 
     def program_model_attempt(
@@ -1157,7 +954,7 @@ class HeadlessService:
             and active["graph_revision"] == target_graph
         )
         if not manager_matches:
-            return {
+            result = {
                 "schema_version": PROGRAM_APPLY_RESULT_VERSION,
                 "status": "pending_deployment",
                 "deployment_apply_required": deployment_apply_required,
@@ -1165,12 +962,20 @@ class HeadlessService:
                 "manager_response": manager_response,
                 "applied": None,
             }
+            try:
+                validate_program_apply_result(result)
+            except (ProgramBindingTransportError, TypeError, ValueError) as error:
+                raise HeadlessApiError(
+                    "program_apply_response_invalid",
+                    "native Program Apply returned an invalid result",
+                ) from error
+            return result
 
         applied = self.core.commit_program_apply(
             preparation,
             request.expected_applied_record_digest,
         )
-        return {
+        result = {
             "schema_version": PROGRAM_APPLY_RESULT_VERSION,
             "status": "applied",
             "deployment_apply_required": deployment_apply_required,
@@ -1178,6 +983,57 @@ class HeadlessService:
             "manager_response": manager_response,
             "applied": applied,
         }
+        try:
+            validate_program_apply_result(result)
+            self._validate_applied_program_semantics(
+                applied,
+                error_code="program_apply_response_invalid",
+                message="native Program Apply returned an invalid Applied selection",
+            )
+        except (
+            ProgramBindingTransportError,
+            TypeError,
+            ValueError,
+            HeadlessApiError,
+        ) as error:
+            if isinstance(error, HeadlessApiError):
+                raise
+            raise HeadlessApiError(
+                "program_apply_response_invalid",
+                "native Program Apply returned an invalid result",
+            ) from error
+        return result
+
+    @staticmethod
+    def _validate_applied_program_semantics(
+        applied: object,
+        *,
+        error_code: str,
+        message: str,
+    ) -> None:
+        if not isinstance(applied, dict):
+            raise HeadlessApiError(error_code, message)
+        program = applied["program"]
+        try:
+            identity = verify_content_identity(
+                program,
+                own_field="program_revision",
+                identity_domain="program-revision",
+                api_version="manyforge.program.v1",
+                label="applied_program.program",
+            )
+            validated = Program.from_dict(
+                program,
+                _program_catalog(),
+                path="<headless-applied-program>",
+            )
+        except (ProgramValidationError, StrictArtifactError, TypeError, ValueError):
+            raise HeadlessApiError(error_code, message)
+        if (
+            identity != applied["program_revision"]
+            or validated.to_dict() != program
+        ):
+            raise HeadlessApiError(error_code, message)
 
     @staticmethod
     def _verified_viewer_asset(

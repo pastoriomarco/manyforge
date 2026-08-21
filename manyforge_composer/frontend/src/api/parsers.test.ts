@@ -1,4 +1,5 @@
 import { describe, expect, it } from 'vitest';
+import nativeBindingFixture from '../../../../manyforge_deployment/resources/program_binding_lite6_native.fixture.json';
 import {
   StructuralContractError,
   parseAppliedProgramSelection,
@@ -96,24 +97,15 @@ function programBindingFixture(
   programRevision: string,
   programBindingId: string,
 ): Record<string, unknown> {
-  return {
-    api_version: 'manyforge.program_binding.v1',
-    program_binding_id: programBindingId,
-    program_id: programId,
-    program_revision: programRevision,
-    retained_bundle_id: `sha256:${'b'.repeat(64)}`,
-    graph_revision: `sha256:${'c'.repeat(64)}`,
-    node_environment: {
-      catalog_id: 'manyforge.default',
-      content_version: '1.1.0',
-      catalog_digest: `sha256:${'d'.repeat(64)}`,
-      environment_digest: `sha256:${'a'.repeat(64)}`,
-    },
-    component_role_bindings: [],
-    target_role_bindings: [],
-    contact_grasp_bindings: [],
-    provenance: {},
-  };
+  const binding = structuredClone(nativeBindingFixture) as Record<string, unknown>;
+  binding.program_binding_id = programBindingId;
+  binding.program_id = programId;
+  binding.program_revision = programRevision;
+  binding.retained_bundle_id = `sha256:${'b'.repeat(64)}`;
+  binding.graph_revision = `sha256:${'c'.repeat(64)}`;
+  (binding.node_environment as Record<string, unknown>).environment_digest =
+    `sha256:${'a'.repeat(64)}`;
+  return binding;
 }
 
 function sourceSectionFixture(): Record<string, unknown> {
@@ -514,6 +506,19 @@ describe('Program product projections', () => {
     expect(applied.sourceOwnerEpoch).toBe('headless.epoch.1');
     expect(applied.program.program_id).toBe('fixture');
     expect(applied.programBinding.program_binding_id).toBe(digestC);
+    expect(
+      applied.programBinding.component_role_bindings[0].component_role_id,
+    ).toBeTypeOf('string');
+    const nestedMalformed = programBindingFixture('fixture', digestA, digestC);
+    (
+      (
+        nestedMalformed.target_role_bindings as Record<string, unknown>[]
+      )[0].frame_role_bindings as Record<string, unknown>[]
+    )[0].unknown = true;
+    expect(() => parseAppliedProgramSelection({
+      ...appliedInput,
+      program_binding: nestedMalformed,
+    })).toThrow(/closed record/);
     expect(() => parseAppliedProgramSelection({
       ...appliedInput,
       program_binding: programBindingFixture(
@@ -549,7 +554,7 @@ describe('Program product projections', () => {
           unknown: true,
         },
       },
-    })).toThrow(/exactly/);
+    })).toThrow(/closed record/);
   });
 
   it('keeps run status and index tied to one exact runner owner', () => {
@@ -576,14 +581,63 @@ describe('Program product projections', () => {
   });
 
   it('parses Composer Apply, Load, and Revert wrappers without trusting headless details', () => {
+    const digestA = `sha256:${'a'.repeat(64)}`;
+    const digestB = `sha256:${'b'.repeat(64)}`;
+    const digestC = `sha256:${'c'.repeat(64)}`;
+    const applied = {
+      assistant_mode: 'forbidden',
+      baseline_program_binding_id: digestA,
+      deployment_artifact_id: 'cell-a',
+      deployment_revision: digestB,
+      graph_revision: digestC,
+      node_environment_digest: digestA,
+      preparation_digest: digestB,
+      program: programFixture(),
+      program_binding: programBindingFixture('fixture', digestA, digestC),
+      program_binding_id: digestC,
+      program_id: 'fixture',
+      program_revision: digestA,
+      retained_bundle_id: digestB,
+      scenario_catalog_revision: digestA,
+      scenario_id: 'cell-pick',
+      schema_version: 'manyforge.applied_program_selection.v1',
+      source: {
+        record_digest: digestC,
+        semantic_content_digest: digestB,
+        source_generation: 1,
+        source_owner_epoch: 'headless.epoch.1',
+        source_owner_id: 'headless.program-apply',
+      },
+      typed_parameter_overrides: {},
+    };
+    const headless = {
+      schema_version: 'manyforge.program_apply_result.v1',
+      status: 'applied',
+      deployment_apply_required: false,
+      preparation: {},
+      manager_response: null,
+      applied,
+    };
     const response = parseProgramWorkspaceTransitionResponse({
       status: 'applied',
-      headless: { schema_version: 'manyforge.program_apply_result.v1' },
+      headless,
       workspace: workspaceFixture(),
     });
 
     expect(response.status).toBe('applied');
     expect(response.workspace.draft.programLoaded).toBe(true);
+    expect(parseProgramWorkspaceTransitionResponse({
+      status: 'pending_deployment',
+      headless: {
+        schema_version: 'manyforge.program_apply_result.v1',
+        status: 'pending_deployment',
+        deployment_apply_required: true,
+        preparation: {},
+        manager_response: null,
+        applied: null,
+      },
+      workspace: workspaceFixture(),
+    }).status).toBe('pending_deployment');
     expect(parseProgramWorkspaceTransitionResponse({
       status: 'reverted',
       headless: null,
@@ -594,6 +648,18 @@ describe('Program product projections', () => {
       headless: null,
       workspace: workspaceFixture(),
     })).toThrow(/owner response/);
+    const malformed = structuredClone(applied);
+    (
+      (
+        malformed.program_binding
+          .target_role_bindings as Record<string, unknown>[]
+      )[0].frame_role_bindings as Record<string, unknown>[]
+    )[0].unknown = true;
+    expect(() => parseProgramWorkspaceTransitionResponse({
+      status: 'applied',
+      headless: { ...headless, applied: malformed },
+      workspace: workspaceFixture(),
+    })).toThrow(/closed record/);
   });
 });
 

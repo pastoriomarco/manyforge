@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import copy
 import json
 from pathlib import Path
 from typing import Any, Iterator
@@ -24,6 +25,31 @@ from manyforge_composer.backend.headless_ws import serve_headless_state
 from manyforge_composer.backend.security import SecurityConfig
 from manyforge_composer.backend.state import ComposerState
 from manyforge_headless_api.client import HeadlessClientError, HeadlessHttpClient
+
+_BINDING_FIXTURE = (
+    Path(__file__).resolve().parents[2]
+    / "manyforge_deployment/resources/program_binding_lite6_native.fixture.json"
+)
+
+
+def _binding_for_program(program: dict[str, Any]) -> dict[str, Any]:
+    binding = json.loads(_BINDING_FIXTURE.read_text(encoding="utf-8"))
+    binding.update(
+        {
+            "program_binding_id": "sha256:" + "0" * 64,
+            "program_id": program["program_id"],
+            "program_revision": program["program_revision"],
+            "retained_bundle_id": "sha256:" + "4" * 64,
+            "graph_revision": "sha256:" + "5" * 64,
+        }
+    )
+    binding["program_binding_id"] = compute_content_identity(
+        binding,
+        own_field="program_binding_id",
+        identity_domain="program-binding-id",
+        api_version="manyforge.program_binding.v1",
+    )
+    return binding
 
 
 def _runtime() -> dict[str, Any]:
@@ -358,54 +384,78 @@ def headless_client() -> (
                 body["scenario_id"] in {"malformed-scenario", "revert-malformed"}
                 and body["expected_applied_record_digest"] is not None
             ):
+                malformed_program = body["program"]
+                malformed_binding = _binding_for_program(malformed_program)
+                malformed_binding["target_role_bindings"][0][
+                    "frame_role_bindings"
+                ][0]["unknown"] = True
+                malformed_binding["program_binding_id"] = compute_content_identity(
+                    malformed_binding,
+                    own_field="program_binding_id",
+                    identity_domain="program-binding-id",
+                    api_version="manyforge.program_binding.v1",
+                )
                 return httpx.Response(
                     200,
                     json={
                         "schema_version": "manyforge.program_apply_result.v1",
                         "status": "applied",
-                        "applied": {"program_revision": "divergent"},
+                        "deployment_apply_required": False,
+                        "preparation": {},
+                        "manager_response": None,
+                        "applied": {
+                            "assistant_mode": "forbidden",
+                            "baseline_program_binding_id": "sha256:" + "3" * 64,
+                            "deployment_artifact_id": "cell_a",
+                            "deployment_revision": "sha256:" + "1" * 64,
+                            "graph_revision": malformed_binding["graph_revision"],
+                            "node_environment_digest": malformed_binding[
+                                "node_environment"
+                            ]["environment_digest"],
+                            "preparation_digest": "sha256:" + "4" * 64,
+                            "program": malformed_program,
+                            "program_binding": malformed_binding,
+                            "program_binding_id": malformed_binding[
+                                "program_binding_id"
+                            ],
+                            "program_id": malformed_program["program_id"],
+                            "program_revision": malformed_program[
+                                "program_revision"
+                            ],
+                            "retained_bundle_id": malformed_binding[
+                                "retained_bundle_id"
+                            ],
+                            "scenario_catalog_revision": body[
+                                "scenario_catalog_revision"
+                            ],
+                            "scenario_id": body["scenario_id"],
+                            "schema_version": (
+                                "manyforge.applied_program_selection.v1"
+                            ),
+                            "source": {
+                                "record_digest": "sha256:" + "6" * 64,
+                                "semantic_content_digest": "sha256:" + "7" * 64,
+                                "source_generation": 1,
+                                "source_owner_epoch": "program-owner.epoch.1",
+                                "source_owner_id": "program-owner.cell-a",
+                            },
+                            "typed_parameter_overrides": {},
+                        },
                     },
                     request=request,
                 )
             previous_applied_program = applied_program
             program = body["program"]
-            binding = {
-                "api_version": "manyforge.program_binding.v1",
-                "program_binding_id": "sha256:" + "0" * 64,
-                "program_id": program["program_id"],
-                "program_revision": program["program_revision"],
-                "retained_bundle_id": "sha256:" + "4" * 64,
-                "graph_revision": "sha256:" + "5" * 64,
-                "node_environment": {
-                    "catalog_id": "manyforge.default",
-                    "content_version": "1.1.0",
-                    "catalog_digest": "sha256:" + "1" * 64,
-                    "environment_digest": "sha256:" + "2" * 64,
-                },
-                "component_role_bindings": [],
-                "target_role_bindings": [],
-                "contact_grasp_bindings": [],
-                "provenance": {
-                    "binding_compiler_contract_digest": "sha256:" + "3" * 64,
-                    "binding_compiler_build_digest": "sha256:" + "4" * 64,
-                    "role_assignment_digest": "sha256:" + "5" * 64,
-                    "source_records": [],
-                    "resolved_output_records": [],
-                },
-            }
-            binding["program_binding_id"] = compute_content_identity(
-                binding,
-                own_field="program_binding_id",
-                identity_domain="program-binding-id",
-                api_version="manyforge.program_binding.v1",
-            )
+            binding = _binding_for_program(program)
             committed_program = {
                 "assistant_mode": "forbidden",
                 "baseline_program_binding_id": "sha256:" + "3" * 64,
                 "deployment_artifact_id": "cell_a",
                 "deployment_revision": "sha256:" + "1" * 64,
                 "graph_revision": "sha256:" + "5" * 64,
-                "node_environment_digest": "sha256:" + "2" * 64,
+                "node_environment_digest": binding["node_environment"][
+                    "environment_digest"
+                ],
                 "preparation_digest": "sha256:" + "4" * 64,
                 "program": program,
                 "program_binding": binding,
@@ -589,6 +639,184 @@ def _composer_with_program(client: HeadlessHttpClient) -> TestClient:
             ),
         )
     )
+
+
+def test_headless_http_client_rejects_rehashed_malformed_binding_ingress() -> None:
+    program = {
+        "program_id": "fixture",
+        "program_revision": "sha256:" + "a" * 64,
+    }
+    binding = _binding_for_program(program)
+    binding["target_role_bindings"][0]["frame_role_bindings"][0]["unknown"] = True
+    binding["program_binding_id"] = compute_content_identity(
+        binding,
+        own_field="program_binding_id",
+        identity_domain="program-binding-id",
+        api_version="manyforge.program_binding.v1",
+    )
+    projection = {
+        "program_binding": binding,
+        "program_binding_id": binding["program_binding_id"],
+        "program_id": binding["program_id"],
+        "program_revision": binding["program_revision"],
+        "retained_bundle_id": binding["retained_bundle_id"],
+        "graph_revision": binding["graph_revision"],
+        "node_environment_digest": binding["node_environment"][
+            "environment_digest"
+        ],
+    }
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json=projection, request=request)
+
+    raw = httpx.Client(
+        base_url="http://headless.test",
+        transport=httpx.MockTransport(handler),
+    )
+    try:
+        client = HeadlessHttpClient("http://unused.test", client=raw)
+        with pytest.raises(HeadlessClientError) as raised:
+            client.program_applied()
+    finally:
+        raw.close()
+    assert raised.value.code == "program_applied_selection_invalid"
+
+
+@pytest.mark.parametrize("record_kind", [[], {}])
+def test_headless_http_client_maps_non_string_provenance_kind_to_stable_apply_error(
+    record_kind,
+) -> None:
+    program = {
+        "program_id": "fixture",
+        "program_revision": "sha256:" + "a" * 64,
+    }
+    binding = _binding_for_program(program)
+    binding["provenance"]["source_records"][0]["record_kind"] = record_kind
+    binding["program_binding_id"] = compute_content_identity(
+        binding,
+        own_field="program_binding_id",
+        identity_domain="program-binding-id",
+        api_version="manyforge.program_binding.v1",
+    )
+    applied = {
+        "assistant_mode": "forbidden",
+        "baseline_program_binding_id": "sha256:" + "b" * 64,
+        "deployment_artifact_id": "cell_a",
+        "deployment_revision": "sha256:" + "c" * 64,
+        "graph_revision": binding["graph_revision"],
+        "node_environment_digest": binding["node_environment"][
+            "environment_digest"
+        ],
+        "preparation_digest": "sha256:" + "d" * 64,
+        "program": program,
+        "program_binding": binding,
+        "program_binding_id": binding["program_binding_id"],
+        "program_id": program["program_id"],
+        "program_revision": program["program_revision"],
+        "retained_bundle_id": binding["retained_bundle_id"],
+        "scenario_catalog_revision": "sha256:" + "e" * 64,
+        "scenario_id": "cell-pick",
+        "schema_version": "manyforge.applied_program_selection.v1",
+        "source": {
+            "record_digest": "sha256:" + "f" * 64,
+            "semantic_content_digest": "sha256:" + "1" * 64,
+            "source_generation": 1,
+            "source_owner_epoch": "owner.epoch.1",
+            "source_owner_id": "owner.cell-a",
+        },
+        "typed_parameter_overrides": {},
+    }
+    result = {
+        "schema_version": "manyforge.program_apply_result.v1",
+        "status": "applied",
+        "deployment_apply_required": False,
+        "preparation": {},
+        "manager_response": None,
+        "applied": applied,
+    }
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json=result, request=request)
+
+    raw = httpx.Client(
+        base_url="http://headless.test",
+        transport=httpx.MockTransport(handler),
+    )
+    try:
+        client = HeadlessHttpClient("http://unused.test", client=raw)
+        with pytest.raises(HeadlessClientError) as raised:
+            client.program_apply({})
+    finally:
+        raw.close()
+    assert raised.value.code == "program_apply_response_invalid"
+
+
+def test_headless_http_client_rejects_rehashed_malformed_apply_binding() -> None:
+    program = {
+        "program_id": "fixture",
+        "program_revision": "sha256:" + "a" * 64,
+    }
+    binding = _binding_for_program(program)
+    binding["target_role_bindings"][0]["frame_role_bindings"][0][
+        "unknown"
+    ] = True
+    binding["program_binding_id"] = compute_content_identity(
+        binding,
+        own_field="program_binding_id",
+        identity_domain="program-binding-id",
+        api_version="manyforge.program_binding.v1",
+    )
+    applied = {
+        "assistant_mode": "forbidden",
+        "baseline_program_binding_id": "sha256:" + "b" * 64,
+        "deployment_artifact_id": "cell_a",
+        "deployment_revision": "sha256:" + "c" * 64,
+        "graph_revision": binding["graph_revision"],
+        "node_environment_digest": binding["node_environment"][
+            "environment_digest"
+        ],
+        "preparation_digest": "sha256:" + "d" * 64,
+        "program": program,
+        "program_binding": binding,
+        "program_binding_id": binding["program_binding_id"],
+        "program_id": program["program_id"],
+        "program_revision": program["program_revision"],
+        "retained_bundle_id": binding["retained_bundle_id"],
+        "scenario_catalog_revision": "sha256:" + "e" * 64,
+        "scenario_id": "cell-pick",
+        "schema_version": "manyforge.applied_program_selection.v1",
+        "source": {
+            "record_digest": "sha256:" + "f" * 64,
+            "semantic_content_digest": "sha256:" + "1" * 64,
+            "source_generation": 1,
+            "source_owner_epoch": "owner.epoch.1",
+            "source_owner_id": "owner.cell-a",
+        },
+        "typed_parameter_overrides": {},
+    }
+    result = {
+        "schema_version": "manyforge.program_apply_result.v1",
+        "status": "applied",
+        "deployment_apply_required": False,
+        "preparation": {},
+        "manager_response": None,
+        "applied": applied,
+    }
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json=result, request=request)
+
+    raw = httpx.Client(
+        base_url="http://headless.test",
+        transport=httpx.MockTransport(handler),
+    )
+    try:
+        client = HeadlessHttpClient("http://unused.test", client=raw)
+        with pytest.raises(HeadlessClientError) as raised:
+            client.program_apply({})
+    finally:
+        raw.close()
+    assert raised.value.code == "program_apply_response_invalid"
 
 
 def _caller() -> dict[str, Any]:
@@ -1542,6 +1770,77 @@ def test_program_revert_failure_preserves_draft_saved_and_active_run(
     )
     assert apply_requests[0]["body"]["expected_applied_record_digest"] == (
         "sha256:" + "6" * 64
+    )
+
+
+def test_program_revert_rejects_malformed_binding_without_effect_or_apply(
+    headless_client,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client, requests, _node_environment = headless_client
+    with _composer_with_program(client) as composer:
+        saved = composer.get("/api/program/workspace").json()
+        dirty = composer.post(
+            "/api/program/draft/mutations",
+            json={
+                "draftId": saved["draft"]["draftId"],
+                "expectedDraftRevision": saved["draft"]["draftRevision"],
+                "mutation": "tree_draft_update_node_params",
+                "arguments": {
+                    "instance_id": "move_to_pick",
+                    "expected_node_id": "motion.move_to_joint_target",
+                    "parameters": {"planning_timeout_s": 3.0},
+                },
+            },
+        ).json()["workspace"]
+        applied_response = composer.post(
+            "/api/program/apply",
+            json={
+                "draftId": dirty["draft"]["draftId"],
+                "expectedDraftRevision": dirty["draft"]["draftRevision"],
+                "scenarioId": "cell-pick",
+                "scenarioCatalogRevision": "sha256:" + "7" * 64,
+            },
+        ).json()
+        before = applied_response["workspace"]
+        malformed_projection = copy.deepcopy(
+            applied_response["headless"]["applied"]
+        )
+        malformed = malformed_projection["program_binding"]
+        malformed["target_role_bindings"][0]["frame_role_bindings"][0][
+            "unknown"
+        ] = True
+        malformed["program_binding_id"] = compute_content_identity(
+            malformed,
+            own_field="program_binding_id",
+            identity_domain="program-binding-id",
+            api_version="manyforge.program_binding.v1",
+        )
+        malformed_projection["program_binding_id"] = malformed[
+            "program_binding_id"
+        ]
+        monkeypatch.setattr(
+            client,
+            "program_applied",
+            lambda: malformed_projection,
+        )
+        request_offset = len(requests)
+        response = composer.post(
+            "/api/program/revert",
+            json={
+                "draftId": before["draft"]["draftId"],
+                "expectedDraftRevision": before["draft"]["draftRevision"],
+            },
+        )
+        after = composer.get("/api/program/workspace").json()
+
+    assert response.status_code == 502
+    assert response.json()["detail"]["code"] == "program_applied_selection_invalid"
+    assert after["draft"] == before["draft"]
+    assert after["saved"] == before["saved"]
+    assert not any(
+        request["path"] == "/api/program/apply"
+        for request in requests[request_offset:]
     )
 
 

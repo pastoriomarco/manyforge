@@ -14,6 +14,11 @@ from manyforge_behavior.canonical_artifact import (
 )
 from manyforge_behavior.program import Program, ProgramValidationError
 from manyforge_headless_api.client import HeadlessClientError
+from manyforge_headless_api.program_binding_transport import ProgramBindingTransportError
+from manyforge_headless_api.program_binding_projection import (
+    validate_applied_program_selection,
+    validate_program_apply_result,
+)
 from pydantic import BaseModel, ConfigDict, Field
 
 from .draft_session import DraftSessionError, OPERATOR_DRAFT_MUTATIONS
@@ -53,37 +58,6 @@ _AUTHORING_MUTATIONS = frozenset(
     }
 )
 _DTO_CONFIG = ConfigDict(populate_by_name=True, extra="forbid", allow_inf_nan=False)
-_APPLIED_FIELDS = frozenset(
-    {
-        "assistant_mode",
-        "baseline_program_binding_id",
-        "deployment_artifact_id",
-        "deployment_revision",
-        "graph_revision",
-        "node_environment_digest",
-        "preparation_digest",
-        "program",
-        "program_binding",
-        "program_binding_id",
-        "program_id",
-        "program_revision",
-        "retained_bundle_id",
-        "scenario_catalog_revision",
-        "scenario_id",
-        "schema_version",
-        "source",
-        "typed_parameter_overrides",
-    }
-)
-_APPLIED_SOURCE_FIELDS = frozenset(
-    {
-        "record_digest",
-        "semantic_content_digest",
-        "source_generation",
-        "source_owner_epoch",
-        "source_owner_id",
-    }
-)
 _PROGRAM_REQUIRED_FIELDS = frozenset(
     {
         "api_version",
@@ -108,22 +82,6 @@ _PROGRAM_FIELDS = _PROGRAM_REQUIRED_FIELDS | frozenset(
         "viewer",
     }
 )
-_PROGRAM_BINDING_FIELDS = frozenset(
-    {
-        "api_version",
-        "component_role_bindings",
-        "contact_grasp_bindings",
-        "graph_revision",
-        "node_environment",
-        "program_binding_id",
-        "program_id",
-        "program_revision",
-        "provenance",
-        "retained_bundle_id",
-        "target_role_bindings",
-    }
-)
-
 
 class _DraftFence(BaseModel):
     model_config = _DTO_CONFIG
@@ -230,15 +188,6 @@ def _active_catalog(state: ComposerState):
     return read_active_node_environment(state).catalog
 
 
-def _sha256(value: object) -> bool:
-    return (
-        isinstance(value, str)
-        and len(value) == 71
-        and value.startswith("sha256:")
-        and all(character in "0123456789abcdef" for character in value[7:])
-    )
-
-
 def _applied_context(
     state: ComposerState,
 ) -> tuple[_AppliedContext | None, dict[str, Any] | None]:
@@ -267,11 +216,7 @@ def _applied_context(
     binding = applied.get("program_binding")
     program_id = applied.get("program_id")
     program_revision = applied.get("program_revision")
-    program_binding_id = applied.get("program_binding_id")
     record_digest = source.get("record_digest") if isinstance(source, dict) else None
-    node_environment = (
-        binding.get("node_environment") if isinstance(binding, dict) else None
-    )
     try:
         program_identity = (
             verify_content_identity(
@@ -284,40 +229,16 @@ def _applied_context(
             if isinstance(program, dict)
             else None
         )
-        binding_identity = (
-            verify_content_identity(
-                binding,
-                own_field="program_binding_id",
-                identity_domain="program-binding-id",
-                api_version="manyforge.program_binding.v1",
-                label="applied_program.program_binding",
-            )
-            if isinstance(binding, dict)
-            else None
-        )
-    except (StrictArtifactError, TypeError, ValueError):
+        validate_applied_program_selection(applied)
+    except (
+        ProgramBindingTransportError,
+        TypeError,
+        ValueError,
+        StrictArtifactError,
+    ):
         program_identity = None
-        binding_identity = None
     if (
-        set(applied) != _APPLIED_FIELDS
-        or applied.get("schema_version")
-        != "manyforge.applied_program_selection.v1"
-        or applied.get("assistant_mode")
-        not in {"required", "optional", "forbidden"}
-        or not _sha256(applied.get("baseline_program_binding_id"))
-        or not _sha256(applied.get("deployment_revision"))
-        or not _sha256(applied.get("node_environment_digest"))
-        or not _sha256(applied.get("preparation_digest"))
-        or not _sha256(applied.get("scenario_catalog_revision"))
-        or not isinstance(applied.get("scenario_id"), str)
-        or not applied.get("scenario_id")
-        or not isinstance(applied.get("deployment_artifact_id"), str)
-        or not applied.get("deployment_artifact_id")
-        or not isinstance(applied.get("typed_parameter_overrides"), dict)
-        or not isinstance(program_id, str)
-        or not program_id
-        or not _sha256(program_revision)
-        or not isinstance(program, dict)
+        not isinstance(program, dict)
         or not _PROGRAM_REQUIRED_FIELDS.issubset(program)
         or not set(program).issubset(_PROGRAM_FIELDS)
         or not isinstance(program.get("catalog"), dict)
@@ -326,52 +247,6 @@ def _applied_context(
         or not isinstance(program.get("tree"), dict)
         or program.get("program_id") != program_id
         or program_identity != program_revision
-        or not isinstance(binding, dict)
-        or set(binding) != _PROGRAM_BINDING_FIELDS
-        or binding.get("program_id") != program_id
-        or binding.get("program_revision") != program_revision
-        or binding_identity != program_binding_id
-        or binding.get("retained_bundle_id") != applied.get("retained_bundle_id")
-        or binding.get("graph_revision") != applied.get("graph_revision")
-        or binding.get("api_version") != "manyforge.program_binding.v1"
-        or not isinstance(binding.get("component_role_bindings"), list)
-        or not all(
-            isinstance(row, dict)
-            for row in binding.get("component_role_bindings", ())
-        )
-        or not isinstance(binding.get("target_role_bindings"), list)
-        or not all(
-            isinstance(row, dict)
-            for row in binding.get("target_role_bindings", ())
-        )
-        or not isinstance(binding.get("contact_grasp_bindings"), list)
-        or not all(
-            isinstance(row, dict)
-            for row in binding.get("contact_grasp_bindings", ())
-        )
-        or not isinstance(binding.get("provenance"), dict)
-        or not isinstance(node_environment, dict)
-        or set(node_environment)
-        != {
-            "catalog_id",
-            "content_version",
-            "catalog_digest",
-            "environment_digest",
-        }
-        or not _sha256(node_environment.get("catalog_digest"))
-        or not _sha256(node_environment.get("environment_digest"))
-        or node_environment.get("environment_digest")
-        != applied.get("node_environment_digest")
-        or not isinstance(source, dict)
-        or set(source) != _APPLIED_SOURCE_FIELDS
-        or not _sha256(record_digest)
-        or not _sha256(source.get("semantic_content_digest"))
-        or type(source.get("source_generation")) is not int
-        or source.get("source_generation", 0) < 1
-        or not isinstance(source.get("source_owner_id"), str)
-        or not source.get("source_owner_id")
-        or not isinstance(source.get("source_owner_epoch"), str)
-        or not source.get("source_owner_epoch")
     ):
         return None, {
             "code": "program_applied_selection_invalid",
@@ -444,6 +319,14 @@ def _apply_program(
             "expected_applied_record_digest": expected_applied_record_digest,
         }
     )
+    try:
+        validate_program_apply_result(result)
+    except (ProgramBindingTransportError, TypeError, ValueError) as error:
+        raise DraftSessionError(
+            "program_apply_response_invalid",
+            "headless Program Apply returned a divergent result",
+            status_code=502,
+        ) from error
     status = result.get("status")
     applied = result.get("applied")
     if (

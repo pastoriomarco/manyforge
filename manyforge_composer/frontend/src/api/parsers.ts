@@ -92,6 +92,10 @@ import type {
   ResourceSourceKind,
   SceneRevisionValue,
 } from '../types/robotControl';
+import {
+  parseProgramBindingTransport,
+  ProgramBindingTransportError,
+} from './programBindingTransport.generated';
 
 type JsonObject = Record<string, unknown>;
 
@@ -1606,72 +1610,15 @@ export function parseAppliedProgramSelection(value: unknown): AppliedProgramSele
   digestAt(record.preparation_digest, `${path}.preparation_digest`);
   const program = parseProgramDocument(record.program, `${path}.program`);
   const bindingPath = `${path}.program_binding`;
-  const programBinding = jsonRecordAt(record.program_binding, bindingPath);
-  exactKeysAt(
-    programBinding,
-    [
-      'api_version',
-      'component_role_bindings',
-      'contact_grasp_bindings',
-      'graph_revision',
-      'node_environment',
-      'program_binding_id',
-      'program_id',
-      'program_revision',
-      'provenance',
-      'retained_bundle_id',
-      'target_role_bindings',
-    ],
-    bindingPath,
-  );
-  if (programBinding.api_version !== 'manyforge.program_binding.v1') {
-    return fail(
-      `${bindingPath}.api_version`,
-      'manyforge.program_binding.v1',
-    );
+  let programBinding;
+  try {
+    programBinding = parseProgramBindingTransport(record.program_binding, bindingPath);
+  } catch (error) {
+    if (error instanceof ProgramBindingTransportError) {
+      throw new StructuralContractError(error.message);
+    }
+    throw error;
   }
-  const bindingRows = (field: string) => arrayAt(
-    programBinding[field],
-    `${bindingPath}.${field}`,
-  ).map((row, index) => jsonRecordAt(
-    row,
-    `${bindingPath}.${field}[${index}]`,
-  ));
-  const componentRoleBindings = bindingRows('component_role_bindings');
-  const targetRoleBindings = bindingRows('target_role_bindings');
-  const contactGraspBindings = bindingRows('contact_grasp_bindings');
-  const nodeEnvironmentPath = `${bindingPath}.node_environment`;
-  const nodeEnvironment = jsonRecordAt(
-    programBinding.node_environment,
-    nodeEnvironmentPath,
-  );
-  exactKeysAt(
-    nodeEnvironment,
-    ['catalog_id', 'content_version', 'catalog_digest', 'environment_digest'],
-    nodeEnvironmentPath,
-  );
-  const bindingNodeEnvironment = {
-    catalog_id: stringAt(
-      nodeEnvironment.catalog_id,
-      `${nodeEnvironmentPath}.catalog_id`,
-    ),
-    content_version: stringAt(
-      nodeEnvironment.content_version,
-      `${nodeEnvironmentPath}.content_version`,
-    ),
-    catalog_digest: digestAt(
-      nodeEnvironment.catalog_digest,
-      `${nodeEnvironmentPath}.catalog_digest`,
-    ),
-    environment_digest: digestAt(
-      nodeEnvironment.environment_digest,
-      `${nodeEnvironmentPath}.environment_digest`,
-    ),
-  };
-  const provenance = jsonRecordAt(
-    programBinding.provenance,
-    `${bindingPath}.provenance`,
-  );
   jsonRecordAt(record.typed_parameter_overrides, `${path}.typed_parameter_overrides`);
   const source = objectAt(record.source, `${path}.source`);
   exactKeysAt(
@@ -1718,7 +1665,7 @@ export function parseAppliedProgramSelection(value: unknown): AppliedProgramSele
     || programBinding.program_binding_id !== programBindingId
     || programBinding.retained_bundle_id !== retainedBundleId
     || programBinding.graph_revision !== graphRevision
-    || bindingNodeEnvironment.environment_digest !== nodeEnvironmentDigest
+    || programBinding.node_environment.environment_digest !== nodeEnvironmentDigest
   ) {
     return fail(path, 'content-identical Program and Program Binding identities');
   }
@@ -1746,19 +1693,7 @@ export function parseAppliedProgramSelection(value: unknown): AppliedProgramSele
       `${path}.source.source_generation`,
     ),
     program,
-    programBinding: {
-      api_version: 'manyforge.program_binding.v1',
-      program_binding_id: programBindingId,
-      program_id: programId,
-      program_revision: programRevision,
-      retained_bundle_id: retainedBundleId,
-      graph_revision: graphRevision,
-      node_environment: bindingNodeEnvironment,
-      component_role_bindings: componentRoleBindings,
-      target_role_bindings: targetRoleBindings,
-      contact_grasp_bindings: contactGraspBindings,
-      provenance,
-    },
+    programBinding,
   };
 }
 
@@ -1953,6 +1888,59 @@ export function parseProgramRunIndex(value: unknown): ProgramRunIndex {
   };
 }
 
+function parseProgramApplyResult(
+  value: unknown,
+  path: string,
+): Record<string, JsonValue> {
+  const record = jsonRecordAt(value, path);
+  exactKeysAt(
+    record,
+    [
+      'applied',
+      'deployment_apply_required',
+      'manager_response',
+      'preparation',
+      'schema_version',
+      'status',
+    ],
+    path,
+  );
+  if (
+    stringAt(record.schema_version, `${path}.schema_version`)
+    !== 'manyforge.program_apply_result.v1'
+  ) {
+    return fail(
+      `${path}.schema_version`,
+      'manyforge.program_apply_result.v1',
+    );
+  }
+  const status = stringAt(record.status, `${path}.status`);
+  if (status !== 'applied' && status !== 'pending_deployment') {
+    return fail(`${path}.status`, 'applied or pending_deployment');
+  }
+  booleanAt(
+    record.deployment_apply_required,
+    `${path}.deployment_apply_required`,
+  );
+  jsonRecordAt(record.preparation, `${path}.preparation`);
+  if (
+    record.manager_response !== null
+    && (record.manager_response === undefined
+      || typeof record.manager_response !== 'object'
+      || Array.isArray(record.manager_response))
+  ) {
+    return fail(`${path}.manager_response`, 'an object or null');
+  }
+  if (status === 'pending_deployment') {
+    if (record.applied !== null) {
+      return fail(`${path}.applied`, 'null for pending deployment');
+    }
+  } else {
+    parseAppliedProgramSelection(record.applied);
+  }
+  return record;
+}
+
 export function parseProgramWorkspaceTransitionResponse(
   value: unknown,
 ): ProgramWorkspaceTransitionResponse {
@@ -1973,7 +1961,7 @@ export function parseProgramWorkspaceTransitionResponse(
     }
     headless = null;
   } else {
-    headless = jsonRecordAt(record.headless, `${path}.headless`);
+    headless = parseProgramApplyResult(record.headless, `${path}.headless`);
   }
   return {
     status: status as ProgramWorkspaceTransitionResponse['status'],

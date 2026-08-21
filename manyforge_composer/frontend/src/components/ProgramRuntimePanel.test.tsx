@@ -60,7 +60,13 @@ function controller(
           component_role_bindings: [],
           target_role_bindings: [],
           contact_grasp_bindings: [],
-          provenance: {},
+          provenance: {
+            binding_compiler_contract_digest: `sha256:${'a'.repeat(64)}`,
+            binding_compiler_build_digest: `sha256:${'b'.repeat(64)}`,
+            role_assignment_digest: `sha256:${'c'.repeat(64)}`,
+            source_records: [],
+            resolved_output_records: [],
+          },
         },
       },
       run: {
