@@ -1,7 +1,13 @@
+import type { KeyboardEvent, Ref } from 'react';
+import { Handle, Position } from '@xyflow/react';
 import type {
   LayoutDirection,
   NodePresentationStatus,
 } from '../store/composerStore';
+import {
+  isProgramCanvasFormTarget,
+  programCanvasKeyIntent,
+} from '../utils/programCanvasInteraction';
 
 export interface BtNodePresentation {
   id: string;
@@ -12,9 +18,11 @@ export interface BtNodePresentation {
   childrenMax: number;
   childCount: number;
   hasParent: boolean;
+  isRoot?: boolean;
   status: NodePresentationStatus;
   selected: boolean;
   layoutDirection: LayoutDirection;
+  executionAvailable?: boolean;
 }
 
 export function btNodeConnectionAvailability(node: Pick<
@@ -36,12 +44,26 @@ function childHint(kind: string, childrenMax: number): string {
   return `${childrenMax} max`;
 }
 
-/**
- * Catalog-node presentation retained without a dependency on the deleted v1
- * Program store. An I6 graph adapter can supply qualified node data/handles.
- */
-export function BtNode({ node }: { node: BtNodePresentation }) {
+/** Catalog-node presentation with graph handles and no topology authority. */
+interface BtNodeProps {
+  node: BtNodePresentation;
+  onSelect?: (instanceId: string) => void;
+  onFocus?: (instanceId: string) => void;
+  onDelete?: (event: KeyboardEvent<HTMLDivElement>, instanceId: string) => void;
+  onNavigate?: (instanceId: string, key: string) => void;
+  elementRef?: Ref<HTMLDivElement>;
+}
+
+export function BtNode({
+  node,
+  onSelect,
+  onFocus,
+  onDelete,
+  onNavigate,
+  elementRef,
+}: BtNodeProps) {
   const connections = btNodeConnectionAvailability(node);
+  const targetConnectable = node.isRoot === true ? false : true;
   const glyph = node.kind === 'composite'
     ? '◆'
     : node.kind === 'decorator'
@@ -49,13 +71,41 @@ export function BtNode({ node }: { node: BtNodePresentation }) {
       : '•';
   return (
     <div
+      ref={elementRef}
       className={`bt-node category-${node.category} status-${node.status}${node.selected ? ' selected' : ''}`}
       data-node-id={node.id}
       data-layout-direction={node.layoutDirection}
+      role="button"
+      tabIndex={0}
+      aria-pressed={node.selected}
+      aria-label={`${node.label} Program node`}
+      title={node.executionAvailable
+        ? 'Execution implementation available'
+        : 'Authorable here; execution remains unavailable at its restoration gate'}
+      onClick={() => onSelect?.(node.id)}
+      onFocus={() => onFocus?.(node.id)}
+      onKeyDown={(event) => {
+        const intent = programCanvasKeyIntent(
+          event.key,
+          isProgramCanvasFormTarget(event.target) ? 'form' : 'node',
+        );
+        if (!intent) return;
+        event.preventDefault();
+        if (intent.type === 'delete') {
+          onDelete?.(event, node.id);
+        } else if (intent.type === 'select') {
+          onSelect?.(node.id);
+        } else {
+          onNavigate?.(node.id, intent.key);
+        }
+      }}
     >
-      <span
-        className={`bt-node-handle target${connections.targetConnectable ? '' : ' disabled'}`}
-        aria-hidden="true"
+      <Handle
+        type="target"
+        position={node.layoutDirection === 'vertical' ? Position.Top : Position.Left}
+        isConnectable={targetConnectable}
+        className={`bt-node-react-flow-handle${targetConnectable ? '' : ' disabled'}`}
+        aria-label={`Connect ${node.label} as child`}
       />
       <span className="bt-node-kind" aria-hidden="true">{glyph}</span>
       <small>{node.catalogId}</small>
@@ -64,11 +114,20 @@ export function BtNode({ node }: { node: BtNodePresentation }) {
         {childHint(node.kind, node.childrenMax)}
       </span>
       {node.childrenMax !== 0 && (
-        <span
-          className={`bt-node-handle source${connections.sourceConnectable ? '' : ' disabled'}`}
-          aria-hidden="true"
+        <Handle
+          type="source"
+          position={node.layoutDirection === 'vertical' ? Position.Bottom : Position.Right}
+          isConnectable={connections.sourceConnectable}
+          className={`bt-node-react-flow-handle${connections.sourceConnectable ? '' : ' disabled'}`}
+          aria-label={`Connect ${node.label} as parent`}
         />
       )}
+      <span
+        className={`node-availability-dot ${node.executionAvailable ? 'execution-ready' : 'authoring-only'}`}
+        aria-label={node.executionAvailable
+          ? 'Execution available'
+          : 'Authoring only'}
+      />
     </div>
   );
 }

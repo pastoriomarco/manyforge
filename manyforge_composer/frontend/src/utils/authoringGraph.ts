@@ -24,6 +24,7 @@ export interface AuthoringGraphNode {
   position: { x: number; y: number };
   width?: number;
   height?: number;
+  childrenMin?: number;
   childrenMax?: number;
 }
 
@@ -44,8 +45,12 @@ export function validateAuthoringConnection(
   if (edges.some((edge) => edge.source === sourceId && edge.target === targetId)) {
     return 'That link already exists';
   }
-  if (edges.some((edge) => edge.target === targetId)) {
-    return `Node '${target.label}' already has a parent`;
+  const targetParents = edges.filter((edge) => edge.target === targetId);
+  if (targetParents.length > 1) {
+    return `Node '${target.label}' already has multiple parents`;
+  }
+  if (targetParents.length === 1 && targetParents[0]?.source === sourceId) {
+    return 'That link already exists';
   }
   const childCount = edges.filter((edge) => edge.source === sourceId).length;
   if (source.childrenMax === 0) {
@@ -71,7 +76,85 @@ export function validateAuthoringConnection(
     seen.add(nodeId);
     stack.push(...(adjacency.get(nodeId) ?? []));
   }
+  if (targetParents.length === 0) {
+    return `Root node '${target.label}' cannot be reparented`;
+  }
+  const currentParentId = targetParents[0]?.source;
+  if (currentParentId && currentParentId !== sourceId) {
+    const currentParent = nodeMap.get(currentParentId);
+    const currentChildCount = edges.filter(
+      (edge) => edge.source === currentParentId,
+    ).length;
+    if (
+      currentParent
+      && currentParent.childrenMin !== undefined
+      && currentChildCount - 1 < currentParent.childrenMin
+    ) {
+      return `Node '${currentParent.label}' requires at least ${currentParent.childrenMin} child${currentParent.childrenMin === 1 ? '' : 'ren'}`;
+    }
+  }
   return null;
+}
+
+export function validateAuthoringDeletion(
+  nodes: AuthoringGraphNode[],
+  edges: AuthoringGraphEdge[],
+  targetId: string | null | undefined,
+): string | null {
+  if (!targetId) return 'Deletion must name a tree node';
+  const nodeMap = new Map(nodes.map((node) => [node.id, node]));
+  const target = nodeMap.get(targetId);
+  if (!target) return 'Deletion references an unknown node';
+  const parents = edges.filter((edge) => edge.target === targetId);
+  if (parents.length === 0) return `Root node '${target.label}' cannot be deleted`;
+  if (parents.length !== 1) return `Node '${target.label}' does not have one exact parent`;
+  const parentId = parents[0]?.source;
+  const parent = parentId ? nodeMap.get(parentId) : undefined;
+  if (!parent) return `Node '${target.label}' references an unknown parent`;
+  const childCount = edges.filter((edge) => edge.source === parentId).length;
+  if (
+    parent.childrenMin !== undefined
+    && childCount - 1 < parent.childrenMin
+  ) {
+    return `Node '${parent.label}' requires at least ${parent.childrenMin} child${parent.childrenMin === 1 ? '' : 'ren'}`;
+  }
+  return null;
+}
+
+export interface AuthoringMoveIntent {
+  instance_id: string;
+  new_parent_instance_id: string;
+  index: number;
+}
+
+export type AuthoringMoveResult =
+  | { intent: AuthoringMoveIntent; error: null }
+  | { intent: null; error: string };
+
+/**
+ * Convert one validated graph connection into the sole owner mutation used
+ * for both reparenting and newly connected presentation links. The graph is
+ * never changed locally: callers submit this intent and wait for the fenced
+ * Draft response.
+ */
+export function authoringMoveIntent(
+  nodes: AuthoringGraphNode[],
+  edges: AuthoringGraphEdge[],
+  sourceId: string | null | undefined,
+  targetId: string | null | undefined,
+): AuthoringMoveResult {
+  const error = validateAuthoringConnection(nodes, edges, sourceId, targetId);
+  if (error || !sourceId || !targetId) {
+    return { intent: null, error: error ?? 'Connections must include both a parent and a child node' };
+  }
+  return {
+    intent: {
+      instance_id: targetId,
+      new_parent_instance_id: sourceId,
+      index: edges.filter((edge) => edge.source === sourceId).length,
+    },
+    error: null,
+  };
 }
 
 export interface AuthoringGraphEdge {

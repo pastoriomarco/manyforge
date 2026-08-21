@@ -1,5 +1,10 @@
 import type { DragEvent } from 'react';
 import type { CatalogEntry } from '../types/api';
+import {
+  programPaletteClickIntent,
+  programPaletteDragData,
+  type ProgramPaletteActivation,
+} from '../utils/programCanvasInteraction';
 
 const KIND_ICONS: Record<string, string> = {
   leaf: '⬤',
@@ -12,7 +17,7 @@ const KIND_ICONS: Record<string, string> = {
 interface NodePaletteItemProps {
   entry: CatalogEntry;
   disabled?: boolean;
-  onActivate?: (entry: CatalogEntry) => void;
+  onActivate?: (activation: ProgramPaletteActivation) => void;
   executionNote?: string;
   allowDrag?: boolean;
 }
@@ -25,7 +30,9 @@ export function NodePaletteItem({
   allowDrag = false,
 }: NodePaletteItemProps) {
   const onDragStart = (event: DragEvent<HTMLButtonElement>) => {
-    event.dataTransfer.setData('application/manyforge-node', entry.id);
+    for (const [format, value] of Object.entries(programPaletteDragData(entry))) {
+      event.dataTransfer.setData(format, value);
+    }
     event.dataTransfer.effectAllowed = 'copy';
     const ghost = document.createElement('div');
     ghost.textContent = entry.name;
@@ -40,7 +47,7 @@ export function NodePaletteItem({
       type="button"
       draggable={!disabled && allowDrag}
       onDragStart={onDragStart}
-      onClick={() => onActivate?.(entry)}
+      onClick={() => onActivate?.(programPaletteClickIntent(entry))}
       disabled={disabled}
       className={`node-palette-item${disabled ? ' disabled' : ''}${allowDrag ? ' draggable' : ''}`}
       title={disabled ? 'Authoring is currently unavailable' : entry.description}

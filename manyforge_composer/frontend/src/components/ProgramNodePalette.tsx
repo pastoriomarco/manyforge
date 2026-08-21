@@ -1,4 +1,4 @@
-import { useMemo, useState } from 'react';
+import { useCallback, useEffect, useMemo, useState } from 'react';
 
 import type {
   CatalogEntry,
@@ -12,9 +12,17 @@ import {
   flattenProgramTree,
   nextProgramInstanceId,
 } from '../utils/programAuthoring';
+import type {
+  ProgramInsertionPlacement,
+  ProgramInsertionNode,
+  ProgramInsertionRequest,
+  ProgramPaletteActivation,
+} from '../utils/programCanvasInteraction';
+import {
+  programInsertionMutation,
+  validProgramInsertionPlacements,
+} from '../utils/programCanvasInteraction';
 import { NodePaletteItem } from './NodePaletteItem';
-
-type Placement = 'child' | 'sibling' | 'wrapper';
 
 interface ProgramNodePaletteProps {
   root: ProgramTreeNode;
@@ -23,6 +31,8 @@ interface ProgramNodePaletteProps {
   selectedId: string | null;
   busy: boolean;
   onMutate: (mutation: string, args: Record<string, JsonValue>) => void;
+  dropRequest?: ProgramInsertionRequest | null;
+  onDropRequestHandled?: () => void;
 }
 
 function executionNote(
@@ -86,15 +96,21 @@ export function ProgramNodePalette({
   selectedId,
   busy,
   onMutate,
+  dropRequest = null,
+  onDropRequestHandled,
 }: ProgramNodePaletteProps) {
   const [query, setQuery] = useState('');
   const [stagedId, setStagedId] = useState<string | null>(null);
   const [instanceId, setInstanceId] = useState('');
-  const [placement, setPlacement] = useState<Placement>('child');
+  const [placement, setPlacement] = useState<ProgramInsertionPlacement>('child');
+  const [stagedTargetId, setStagedTargetId] = useState<string | null>(null);
   const [parameterText, setParameterText] = useState('{}');
   const [error, setError] = useState<string | null>(null);
   const flat = useMemo(() => flattenProgramTree(root), [root]);
   const selected = flat.find((row) => row.node.instance_id === selectedId) ?? null;
+  const stagedTarget = stagedTargetId === null
+    ? selected
+    : flat.find((row) => row.node.instance_id === stagedTargetId) ?? null;
   const catalog = useMemo(
     () => new Map(catalogEntries.map((entry) => [entry.id, entry])),
     [catalogEntries],
@@ -115,46 +131,60 @@ export function ProgramNodePalette({
   const grouped = [...byCategory.entries()]
     .sort(([left], [right]) => left.localeCompare(right));
 
-  const placements = useMemo(() => {
-    if (!staged || !selected) return [];
-    const result: Placement[] = [];
-    const parentEntry = catalog.get(selected.node.node_id);
-    const childCapacity = parentEntry !== undefined
-      && parentEntry.childrenMax !== 0
-      && (
-        parentEntry.childrenMax < 0
-        || selected.node.children.length < parentEntry.childrenMax
-      );
-    if (childCapacity && staged.childrenMin === 0) result.push('child');
-    if (selected.parentId !== null && staged.childrenMin === 0) result.push('sibling');
-    if (
-      staged.childrenMin <= 1
-      && staged.childrenMax !== 0
-      && (staged.childrenMax < 0 || staged.childrenMax >= 1)
-    ) {
-      result.push('wrapper');
-    }
-    return result;
-  }, [catalog, selected, staged]);
+  const placements = useMemo(
+    () => staged
+      ? validProgramInsertionPlacements(root, catalogEntries, stagedTarget?.node.instance_id ?? null, staged)
+      : [],
+    [catalogEntries, root, staged, stagedTarget],
+  );
 
-  const begin = (entry: CatalogEntry) => {
+  const begin = useCallback((
+    activation: ProgramPaletteActivation,
+    targetId: string | null = selectedId,
+    preferredPlacement?: ProgramInsertionPlacement,
+  ) => {
+    const entry = catalog.get(activation.catalogId);
+    if (!entry) {
+      setError(`Unknown catalog entry '${activation.catalogId}'.`);
+      return;
+    }
     const existing = flat.map((row) => row.node.instance_id);
     setStagedId(entry.id);
+    setStagedTargetId(targetId);
     setInstanceId(nextProgramInstanceId(entry.id, existing));
     setParameterText(JSON.stringify(catalogDefaultParameters(entry), null, 2));
     setError(null);
-    const preferred: Placement = selected
-      && catalog.get(selected.node.node_id)?.childrenMax !== 0
-      && entry.childrenMin === 0
-      ? 'child'
-      : entry.childrenMin <= 1 && entry.childrenMax !== 0
-        ? 'wrapper'
-        : 'sibling';
-    setPlacement(preferred);
-  };
+    const validPlacements = validProgramInsertionPlacements(
+      root,
+      catalogEntries,
+      targetId,
+      entry,
+    );
+    setPlacement(
+      preferredPlacement && validPlacements.includes(preferredPlacement)
+        ? preferredPlacement
+        : validPlacements[0] ?? 'child',
+    );
+  }, [catalog, catalogEntries, flat, root, selectedId]);
+
+  useEffect(() => {
+    if (!dropRequest) return;
+    const entry = catalog.get(dropRequest.catalogId);
+    if (entry) {
+      begin(
+        { catalogId: entry.id },
+        dropRequest.targetId,
+        dropRequest.placement,
+      );
+    } else {
+      setError(`Unknown catalog entry '${dropRequest.catalogId}'.`);
+    }
+    onDropRequestHandled?.();
+  }, [begin, catalog, dropRequest, onDropRequestHandled]);
 
   const commit = () => {
-    if (!staged || !selected) {
+    if (busy) return;
+    if (!staged || !stagedTarget) {
       setError('Select a tree node before inserting a catalog entry.');
       return;
     }
@@ -166,39 +196,34 @@ export function ProgramNodePalette({
       setError('Instance ID is required.');
       return;
     }
+    if (flat.some((row) => row.node.instance_id === instanceId.trim())) {
+      setError(`Instance ID '${instanceId.trim()}' is already used in this Draft.`);
+      return;
+    }
+    if (!authoringAvailable(staged, environment)) {
+      setError('This catalog node is not available for portable authoring.');
+      return;
+    }
     const parsed = parseParameterObject(parameterText, staged);
     if (!parsed.parameters) {
       setError(parsed.error);
       return;
     }
-    const node = {
+    const node: ProgramInsertionNode = {
       node_id: staged.id,
       instance_id: instanceId.trim(),
       parameters: parsed.parameters,
       children: [],
     };
-    if (placement === 'wrapper') {
-      onMutate('tree_draft_wrap_node', {
-        target_instance_id: selected.node.instance_id,
-        wrapper: {
-          node_id: node.node_id,
-          instance_id: node.instance_id,
-          parameters: node.parameters,
-        },
-      });
-    } else if (placement === 'child') {
-      onMutate('tree_draft_insert_node', {
-        parent_instance_id: selected.node.instance_id,
-        index: selected.node.children.length,
-        node,
-      });
-    } else {
-      onMutate('tree_draft_insert_node', {
-        after_instance_id: selected.node.instance_id,
-        node,
-      });
-    }
+    const mutation = programInsertionMutation(
+      stagedTarget.node.instance_id,
+      placement,
+      stagedTarget.node.children.length,
+      node,
+    );
+    onMutate(mutation.mutation, mutation.args);
     setStagedId(null);
+    setStagedTargetId(null);
     setError(null);
   };
 
@@ -231,6 +256,7 @@ export function ProgramNodePalette({
                 disabled={busy || !authoringAvailable(entry, environment)}
                 onActivate={begin}
                 executionNote={executionNote(entry, environment)}
+                allowDrag
               />
             ))}
           </section>
@@ -241,7 +267,15 @@ export function ProgramNodePalette({
         <div className="program-staging-card">
           <div className="program-staging-heading">
             <strong>Add {staged.name}</strong>
-            <button type="button" onClick={() => setStagedId(null)}>Cancel</button>
+            <button
+              type="button"
+              onClick={() => {
+                setStagedId(null);
+                setStagedTargetId(null);
+              }}
+            >
+              Cancel
+            </button>
           </div>
           <p>
             Complete the node locally; it enters the Draft only after the exact
@@ -255,10 +289,12 @@ export function ProgramNodePalette({
             />
           </label>
           <label>
-            Placement relative to {selected?.node.instance_id ?? 'no selection'}
+            Placement relative to {stagedTarget?.node.instance_id ?? 'no selection'}
             <select
               value={placements.includes(placement) ? placement : ''}
-              onChange={(event) => setPlacement(event.target.value as Placement)}
+              onChange={(event) => setPlacement(
+                event.target.value as ProgramInsertionPlacement,
+              )}
             >
               <option value="" disabled>Select a valid placement</option>
               {placements.includes('child') && <option value="child">Last child</option>}
@@ -276,7 +312,7 @@ export function ProgramNodePalette({
             />
           </label>
           {error && <p className="program-form-error" role="alert">{error}</p>}
-          <button type="button" disabled={busy} onClick={commit}>Add to Draft</button>
+          <button type="button" disabled={busy || !stagedTarget} onClick={commit}>Add to Draft</button>
         </div>
       )}
     </section>

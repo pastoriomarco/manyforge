@@ -236,6 +236,11 @@ button:disabled {
   outline-offset: 0.2rem;
 }
 
+.bt-node:focus-visible {
+  outline: 2px solid #e6f6fa;
+  outline-offset: 0.35rem;
+}
+
 .bt-node-kind,
 .bt-node-child-hint,
 .bt-node small {
@@ -2167,6 +2172,85 @@ code {
     linear-gradient(90deg, rgb(37 59 70 / 26%) 1px, transparent 1px),
     #07131b;
   background-size: 24px 24px;
+}
+
+.program-tree-react-flow {
+  position: relative;
+  min-height: 31rem;
+  height: clamp(24rem, 52vh, 42rem);
+  overflow: hidden;
+  background:
+    linear-gradient(rgb(37 59 70 / 26%) 1px, transparent 1px),
+    linear-gradient(90deg, rgb(37 59 70 / 26%) 1px, transparent 1px),
+    #07131b;
+  background-size: 24px 24px;
+}
+
+.program-tree-react-flow .react-flow {
+  width: 100%;
+  height: 100%;
+  background: transparent;
+}
+
+.program-tree-react-flow .react-flow__pane {
+  cursor: grab;
+}
+
+.program-tree-react-flow .react-flow__pane:active {
+  cursor: grabbing;
+}
+
+.program-tree-react-flow .react-flow__node {
+  width: 11.25rem;
+  height: 4.4rem;
+  padding: 0;
+  border: 0;
+  border-radius: 0;
+  background: transparent;
+}
+
+.program-tree-react-flow .react-flow__node:focus-visible {
+  outline: 2px solid #e6f6fa;
+  outline-offset: 0.35rem;
+}
+
+.program-tree-react-flow .react-flow__handle.bt-node-react-flow-handle,
+.bt-node-react-flow-handle {
+  width: 0.8rem;
+  height: 0.8rem;
+  border: 2px solid #0a1720;
+  border-radius: 999px;
+  background: #c6d3d9;
+}
+
+.program-tree-react-flow .react-flow__handle.bt-node-react-flow-handle.disabled,
+.bt-node-react-flow-handle.disabled {
+  background: #51646e;
+  opacity: 0.6;
+}
+
+.program-tree-react-flow .react-flow__controls {
+  border: 1px solid #405764;
+  box-shadow: 0 0.7rem 1.5rem rgb(0 0 0 / 22%);
+}
+
+.program-tree-react-flow .react-flow__controls-button {
+  border-bottom-color: #405764;
+  color: #c6d3d9;
+  background: #0b1a23;
+  fill: #c6d3d9;
+}
+
+.program-tree-react-flow .react-flow__controls-button:hover {
+  background: #17313d;
+}
+
+.program-canvas-shortcuts {
+  margin: 0;
+  padding: 0.4rem 0.75rem 0;
+  color: #708793;
+  font-size: 0.66rem;
+  line-height: 1.4;
 }
 
 .program-tree-stage {

@@ -15,6 +15,7 @@ interface CanvasViewControlsProps {
   onEdgeStyleChange: (style: EdgeStyle) => void;
   onLayoutDirectionChange: (direction: LayoutDirection) => void;
   onAutoLayout: () => void;
+  onFitView?: () => void;
 }
 
 /** Prop-driven graph presentation controls, independent of runtime stores. */
@@ -25,6 +26,7 @@ export function CanvasViewControls({
   onEdgeStyleChange,
   onLayoutDirectionChange,
   onAutoLayout,
+  onFitView,
 }: CanvasViewControlsProps) {
   const nextDirection = layoutDirection === 'vertical' ? 'horizontal' : 'vertical';
   return (
@@ -47,6 +49,16 @@ export function CanvasViewControls({
         <span aria-hidden="true">▦</span>
         <span className="sr-only">Auto-align nodes</span>
       </button>
+      {onFitView && (
+        <button
+          type="button"
+          onClick={onFitView}
+          title="Fit complete tree in canvas"
+          aria-label="Fit complete tree in canvas"
+        >
+          <span aria-hidden="true">⌗</span>
+        </button>
+      )}
       <select
         value={edgeStyle}
         onChange={(event) => onEdgeStyleChange(event.target.value as EdgeStyle)}

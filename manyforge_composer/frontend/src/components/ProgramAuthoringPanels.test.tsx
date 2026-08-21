@@ -110,7 +110,7 @@ describe('Program authoring panels', () => {
     );
 
     expect(markup).toContain('Authoring only · execution gate N7');
-    expect(markup).toContain('draggable="false"');
+    expect(markup).toContain('draggable="true"');
     expect(markup).not.toContain('Authoring is currently unavailable');
   });
 

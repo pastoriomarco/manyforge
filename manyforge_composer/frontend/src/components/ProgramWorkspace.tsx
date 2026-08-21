@@ -8,6 +8,7 @@ import type {
   NodeEnvironmentResponse,
 } from '../types/api';
 import { flattenProgramTree } from '../utils/programAuthoring';
+import type { ProgramInsertionRequest } from '../utils/programCanvasInteraction';
 import { ProgramDeclarationsEditor } from './ProgramDeclarationsEditor';
 import { ProgramNodePalette } from './ProgramNodePalette';
 import { ProgramPropertyEditor } from './ProgramPropertyEditor';
@@ -96,6 +97,7 @@ export function ProgramWorkspace({
     clearFeedback,
   } = controller;
   const [selectedNodeId, setSelectedNodeId] = useState<string | null>(null);
+  const [insertionRequest, setInsertionRequest] = useState<ProgramInsertionRequest | null>(null);
   const [confirmDiscard, setConfirmDiscard] = useState(false);
   const [confirmOverwrite, setConfirmOverwrite] = useState(false);
   const [saveAsPath, setSaveAsPath] = useState('');
@@ -401,6 +403,8 @@ export function ProgramWorkspace({
                   selectedId={selectedNodeId}
                   busy={authoringBusy}
                   onMutate={mutate}
+                  dropRequest={insertionRequest}
+                  onDropRequestHandled={() => setInsertionRequest(null)}
                 />
                 <ProgramTreeCanvas
                   root={program.tree}
@@ -410,6 +414,10 @@ export function ProgramWorkspace({
                   busy={authoringBusy}
                   onSelect={setSelectedNodeId}
                   onMutate={mutate}
+                  onStageInsert={(request) => {
+                    setSelectedNodeId(request.targetId);
+                    setInsertionRequest(request);
+                  }}
                 />
                 <ProgramPropertyEditor
                   root={program.tree}
