@@ -102,6 +102,7 @@ def test_reduced_aggregate_has_an_explicit_retained_selector() -> None:
     assert "-p no:cacheprovider" in source
     assert "tests/test_public_contract_entrypoint_reconciliation.py" in source
     assert "tests/test_qualification_wrapper_entrypoints.py" in source
+    assert retained_body.count("run_roboplan_tests") == 1
 
 
 def test_direct_benchmark_entrypoint_fails_before_product_import(
@@ -161,13 +162,150 @@ def test_collision_lookup_perf_successor_is_docker_only_and_executable() -> None
 def test_roboplan_suite_qualifies_only_the_retained_product_consumer() -> None:
     source = _TEST_ALL.read_text(encoding="utf-8")
     body = source.split("run_roboplan_tests() {", 1)[1].split(
-        "run_pybind_tests() {", 1
+        "run_headless_cpp_tests() {", 1
     )[0]
 
     assert "C++ retained RoboPlan product-consumer tests" in body
     assert "MANYFORGE_ENABLE_ROS2_CONTROL" not in body
     assert "manyforge_roboplan_py" not in body
     assert "manyforge_roboplan/python" not in body
+    assert "configure_roboplan_build" in body
+    assert body.count("ctest --output-on-failure") == 1
+
+
+def test_headless_selector_builds_producer_closure_before_native_headless(
+    tmp_path: Path,
+) -> None:
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    build_root = tmp_path / "build"
+    marker = tmp_path / "events"
+
+    (fake_bin / "cmake").write_text(
+        "#!/bin/sh\n"
+        "set -eu\n"
+        "if [ \"${1:-}\" = \"--build\" ]; then\n"
+        "  root=\"$2\"\n"
+        "  if [ \"$root\" = \"${MANYFORGE_BUILD_DIR}/roboplan\" ]; then\n"
+        "    printf '%s\\n' producer-build >> \"$FAKE_LOG\"\n"
+        "    printf 'producer-targets:%s\\n' \"$*\" >> \"$FAKE_LOG\"\n"
+        "    mkdir -p \"$root/qualification/native_stop\" \\\n"
+        "      \"$root/qualification/native_stop_o1_4g_replacement\"\n"
+        "    for output in \\\n"
+        "      manyforge_native_execution_host \\\n"
+        "      manyforge_native_execution_host_pick_place_fixture \\\n"
+        "      manyforge_roboplan_candidate_worker \\\n"
+        "      manyforge_native_stop_qualification_runner; do\n"
+        "      : > \"$root/$output\"\n"
+        "    done\n"
+        "    for output in \\\n"
+        "      native_stop/implementation-build.json \\\n"
+        "      native_stop/runner-contract.json \\\n"
+        "      native_stop/implementation-evidence.json \\\n"
+        "      native_stop/substitution-evidence.json \\\n"
+        "      native_stop_o1_4g_replacement/implementation-build.json \\\n"
+        "      native_stop_o1_4g_replacement/runner-contract.json \\\n"
+        "      native_stop_o1_4g_replacement/implementation-evidence.json \\\n"
+        "      native_stop_o1_4g_replacement/substitution-evidence.json; do\n"
+        "      : > \"$root/qualification/$output\"\n"
+        "    done\n"
+        "  elif [ \"$root\" = \"${MANYFORGE_BUILD_DIR}/headless\" ]; then\n"
+        "    printf '%s\\n' headless-build >> \"$FAKE_LOG\"\n"
+        "    mkdir -p \"$root/manager-apply-test-fixture\" \\\n"
+        "      \"$root/manager-apply-o1-4g-replacement-fixture\"\n"
+        "    : > \"$root/manager-apply-test-fixture/metadata.json\"\n"
+        "    : > \"$root/manager-apply-o1-4g-replacement-fixture/metadata.json\"\n"
+        "  fi\n"
+        "  exit 0\n"
+        "fi\n"
+        "case \"$1\" in\n"
+        "  */manyforge_roboplan)\n"
+        "    printf '%s\\n' producer-configure >> \"$FAKE_LOG\"\n"
+        "    printf 'producer-args:%s\\n' \"$*\" >> \"$FAKE_LOG\";;\n"
+        "  */manyforge_headless)\n"
+        "    printf '%s\\n' headless-configure >> \"$FAKE_LOG\"\n"
+        "    printf 'headless-args:%s\\n' \"$*\" >> \"$FAKE_LOG\";;\n"
+        "esac\n",
+        encoding="utf-8",
+    )
+    (fake_bin / "cmake").chmod(0o755)
+    (fake_bin / "ctest").write_text(
+        "#!/bin/sh\n"
+        "set -eu\n"
+        "printf 'ctest:%s\\n' \"$*\" >> \"$FAKE_LOG\"\n"
+        "if [ \"${1:-}\" = \"-N\" ]; then\n"
+        "  printf '%s\\n' 'Test #1: ManagerDaemonProcess.RejectsPreManifestRootWithTypedStartupErrorBeforeIngress'\n"
+        "  if [ \"${FAKE_CTEST_OMIT_NATIVE:-0}\" != 1 ]; then\n"
+        "    printf '%s\\n' \\\n"
+        "      'Test #2: ManagerDaemonProcess.DistinctNativePackageUsesFreshManagerGenerationAfterCleanStop' \\\n"
+        "      'Test #3: ManagerDaemonProcess.RuntimeOnlyNamedApplyUsesTheRealManagedFenceAndSurvivesReplacement' \\\n"
+        "      'Test #4: ManagerDaemonProcess.PhysicalCompositionReopensAfterChildAndManagerReplacement'\n"
+        "  fi\n"
+        "  printf '%s\\n' 'Total Tests: 99'\n"
+        "fi\n",
+        encoding="utf-8",
+    )
+    (fake_bin / "ctest").chmod(0o755)
+    (fake_bin / "nproc").write_text("#!/bin/sh\nprintf '1\\n'\n", encoding="utf-8")
+    (fake_bin / "nproc").chmod(0o755)
+    (fake_bin / "python3").write_text(
+        "#!/bin/sh\n"
+        "if [ \"${1:-}\" = '-c' ] || [ \"${1:-}\" = '-' ]; then\n"
+        "  printf '/fake/python-package\\n'\n"
+        "  exit 0\n"
+        "fi\n"
+        "exit 1\n",
+        encoding="utf-8",
+    )
+    (fake_bin / "python3").chmod(0o755)
+    (fake_bin / "pytest").write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    (fake_bin / "pytest").chmod(0o755)
+
+    environment = {
+        **os.environ,
+        "FAKE_LOG": str(marker),
+        "MANYFORGE_BUILD_DIR": str(build_root),
+        "PATH": f"{fake_bin}:{os.environ['PATH']}",
+        "WORKSPACE": str(_REPO_ROOT),
+    }
+    completed = subprocess.run(
+        ["bash", str(_TEST_ALL), "headless"],
+        cwd=_REPO_ROOT,
+        env=environment,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert completed.returncode == 0
+    events = marker.read_text(encoding="utf-8").splitlines()
+    assert events.index("producer-configure") < events.index("producer-build")
+    assert events.index("producer-build") < events.index("headless-configure")
+    assert events.index("headless-configure") < events.index("headless-build")
+    producer_targets = next(
+        event for event in events if event.startswith("producer-targets:")
+    )
+    assert "manyforge_run_native_stop_qualification" in producer_targets
+    assert "manyforge_run_native_stop_o1_4g_replacement_qualification" in producer_targets
+    assert "manyforge_roboplan_candidate_worker" in producer_targets
+    headless_args = next(
+        event for event in events if event.startswith("headless-args:")
+    )
+    assert (
+        "-DMANYFORGE_HEADLESS_TEST_NATIVE_EXECUTION_HOST="
+        f"{build_root}/roboplan/manyforge_native_execution_host"
+    ) in headless_args
+    assert sum(event.startswith("ctest:--output-on-failure") for event in events) == 1
+
+    omitted = subprocess.run(
+        ["bash", str(_TEST_ALL), "headless"],
+        cwd=_REPO_ROOT,
+        env={**environment, "FAKE_CTEST_OMIT_NATIVE": "1"},
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert omitted.returncode != 0
 
 
 def test_compose_retains_explicit_ros_runtime_products_and_build_cache() -> None:

@@ -64,6 +64,7 @@ skip()    { echo -e "${YELLOW}  SKIP: $1${NC}"; }
 
 require_ctest_tests() {
     local suite="$1"
+    shift
     local listing
     listing="$(ctest -N)"
     echo "$listing" | tail -3
@@ -71,6 +72,13 @@ require_ctest_tests() {
         echo -e "${RED}  FAIL: ${suite} configured zero CTest tests${NC}"
         return 1
     fi
+    local required_test
+    for required_test in "$@"; do
+        if ! grep -Fq "$required_test" <<<"$listing"; then
+            echo -e "${RED}  FAIL: ${suite} omitted required ${required_test} test${NC}"
+            return 1
+        fi
+    done
     return 0
 }
 
@@ -162,6 +170,7 @@ build_manyforge_component_manager() {
 
 build_manyforge_headless() {
     local build="$1"
+    local native_execution_host="$2"
     local pybind11_cmake_dir
     pybind11_cmake_dir="$(
         python3 -c 'import pybind11; print(pybind11.get_cmake_dir())'
@@ -172,6 +181,7 @@ build_manyforge_headless() {
         -DBUILD_TESTING=ON \
         -DMANYFORGE_HEADLESS_BUILD_PYTHON=ON \
         -Dpybind11_DIR="$pybind11_cmake_dir" \
+        -DMANYFORGE_HEADLESS_TEST_NATIVE_EXECUTION_HOST="$native_execution_host" \
         -DMANYFORGE_HEADLESS_GTEST_TIMEOUT_SECONDS="$CTEST_TEST_TIMEOUT_S" 2>&1 | tail -3
     cmake --build "$build" --parallel "$BUILD_PARALLEL_LEVEL" 2>&1 | tail -5
 }
@@ -255,13 +265,17 @@ run_cpp_tests() {
     fi
 }
 
-run_roboplan_tests() {
-    section "C++ retained RoboPlan product-consumer tests"
-    local build="$BUILD_DIR/roboplan"
-    mkdir -p "$build"
-    cd "$build"
+ROBOPLAN_CONFIGURED_BUILD=""
+ROBOPLAN_HEADLESS_PRODUCER_BUILD=""
 
-    PINOCCHIO_CMAKE_DIR=$(
+configure_roboplan_build() {
+    local build="$BUILD_DIR/roboplan"
+    if [[ "$ROBOPLAN_CONFIGURED_BUILD" == "$build" ]]; then
+        return
+    fi
+
+    local pinocchio_cmake_dir
+    pinocchio_cmake_dir="$(
         python3 - <<'PY'
 import pathlib
 import site
@@ -278,24 +292,96 @@ for root in roots:
         raise SystemExit(0)
 raise SystemExit(1)
 PY
-    ) || true
-    if [ -z "$PINOCCHIO_CMAKE_DIR" ]; then
-        skip "Pinocchio CMake package not found; run roboplan tests in manyforge-dev or install pinocchio locally"
-        return
+    )" || {
+        echo -e "${RED}  FAIL: Pinocchio CMake package is required for the RoboPlan producer closure${NC}"
+        return 1
+    }
+    if [[ -z "$pinocchio_cmake_dir" ]]; then
+        echo -e "${RED}  FAIL: Pinocchio CMake package is required for the RoboPlan producer closure${NC}"
+        return 1
     fi
-    PINOCCHIO_PREFIX=$(dirname "$(dirname "$(dirname "$PINOCCHIO_CMAKE_DIR")")")
+
+    local pinocchio_prefix
+    pinocchio_prefix=$(dirname "$(dirname "$(dirname "$pinocchio_cmake_dir")")")
     local boost_root=""
-    if [ -f "${PINOCCHIO_PREFIX}/include/boost/version.hpp" ]; then
-        boost_root="${PINOCCHIO_PREFIX}"
+    if [[ -f "${pinocchio_prefix}/include/boost/version.hpp" ]]; then
+        boost_root="$pinocchio_prefix"
     fi
-    CMAKE_PREFIX_PATH="/usr/local:${PINOCCHIO_PREFIX}:${CMAKE_PREFIX_PATH:-}" \
-        BOOST_ROOT="${boost_root}" \
+    mkdir -p "$build"
+    cd "$build"
+    if ! CMAKE_PREFIX_PATH="/usr/local:${pinocchio_prefix}:${CMAKE_PREFIX_PATH:-}" \
+        BOOST_ROOT="$boost_root" \
         BOOST_INCLUDEDIR="${boost_root:+${boost_root}/include}" \
         BOOST_LIBRARYDIR="${boost_root:+${boost_root}/lib}" \
         cmake "$WORKSPACE/manyforge_roboplan" -DCMAKE_BUILD_TYPE=Release \
         -DBUILD_TESTING=ON \
-        -DMANYFORGE_GTEST_TIMEOUT_SECONDS="$CTEST_TEST_TIMEOUT_S" 2>&1 | tail -3
-    make -j"$BUILD_PARALLEL_LEVEL" 2>&1 | tail -5
+        -DMANYFORGE_GTEST_TIMEOUT_SECONDS="$CTEST_TEST_TIMEOUT_S" 2>&1 | tail -3; then
+        echo -e "${RED}  FAIL: RoboPlan producer configure failed${NC}"
+        return 1
+    fi
+    ROBOPLAN_CONFIGURED_BUILD="$build"
+}
+
+build_headless_roboplan_producer_closure() {
+    local build="$BUILD_DIR/roboplan"
+    if [[ "$ROBOPLAN_HEADLESS_PRODUCER_BUILD" == "$build" ]]; then
+        return
+    fi
+    configure_roboplan_build
+    local producer_targets=(
+        manyforge_native_execution_host
+        manyforge_native_execution_host_pick_place_fixture
+        manyforge_roboplan_candidate_worker
+        manyforge_run_native_stop_qualification
+        manyforge_run_native_stop_o1_4g_replacement_qualification
+    )
+    if ! cmake --build "$build" --parallel "$BUILD_PARALLEL_LEVEL" \
+        --target "${producer_targets[@]}" 2>&1 | tail -5; then
+        echo -e "${RED}  FAIL: RoboPlan producer closure build failed${NC}"
+        return 1
+    fi
+
+    local producer_input
+    for producer_input in \
+        "$build/manyforge_native_execution_host" \
+        "$build/manyforge_native_execution_host_pick_place_fixture" \
+        "$build/manyforge_roboplan_candidate_worker" \
+        "$build/manyforge_native_stop_qualification_runner" \
+        "$build/qualification/native_stop/implementation-build.json" \
+        "$build/qualification/native_stop/runner-contract.json" \
+        "$build/qualification/native_stop/implementation-evidence.json" \
+        "$build/qualification/native_stop/substitution-evidence.json" \
+        "$build/qualification/native_stop_o1_4g_replacement/implementation-build.json" \
+        "$build/qualification/native_stop_o1_4g_replacement/runner-contract.json" \
+        "$build/qualification/native_stop_o1_4g_replacement/implementation-evidence.json" \
+        "$build/qualification/native_stop_o1_4g_replacement/substitution-evidence.json"; do
+        if [[ ! -f "$producer_input" ]]; then
+            echo -e "${RED}  FAIL: RoboPlan producer closure did not create ${producer_input}${NC}"
+            return 1
+        fi
+    done
+    ROBOPLAN_HEADLESS_PRODUCER_BUILD="$build"
+}
+
+require_headless_native_packages() {
+    local build="$1"
+    local package_metadata
+    for package_metadata in \
+        "$build/manager-apply-test-fixture/metadata.json" \
+        "$build/manager-apply-o1-4g-replacement-fixture/metadata.json"; do
+        if [[ ! -f "$package_metadata" ]]; then
+            echo -e "${RED}  FAIL: Headless native package was not generated: ${package_metadata}${NC}"
+            return 1
+        fi
+    done
+    return 0
+}
+
+run_roboplan_tests() {
+    section "C++ retained RoboPlan product-consumer tests"
+    local build="$BUILD_DIR/roboplan"
+    configure_roboplan_build
+    cmake --build "$build" --parallel "$BUILD_PARALLEL_LEVEL" 2>&1 | tail -5
     if ! require_ctest_tests "manyforge_roboplan"; then
         FAIL=$((FAIL + 1))
     elif ctest --output-on-failure --timeout "$CTEST_TEST_TIMEOUT_S"; then
@@ -309,9 +395,16 @@ PY
 run_headless_cpp_tests() {
     section "C++ I5/H0 headless owner tests"
     local build="$BUILD_DIR/headless"
-    build_manyforge_headless "$build"
+    local native_execution_host="$BUILD_DIR/roboplan/manyforge_native_execution_host"
+    build_headless_roboplan_producer_closure
+    build_manyforge_headless "$build" "$native_execution_host"
     cd "$build"
-    if ! require_ctest_tests "manyforge_headless"; then
+    if ! require_ctest_tests "manyforge_headless" \
+        "ManagerDaemonProcess.DistinctNativePackageUsesFreshManagerGenerationAfterCleanStop" \
+        "ManagerDaemonProcess.RuntimeOnlyNamedApplyUsesTheRealManagedFenceAndSurvivesReplacement" \
+        "ManagerDaemonProcess.PhysicalCompositionReopensAfterChildAndManagerReplacement"; then
+        FAIL=$((FAIL + 1))
+    elif ! require_headless_native_packages "$build"; then
         FAIL=$((FAIL + 1))
     elif ctest --output-on-failure --timeout "$CTEST_TEST_TIMEOUT_S"; then
         PASS=$((PASS + 1))
