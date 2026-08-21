@@ -19,6 +19,7 @@ export function CollapsedRail({
       ref={buttonRef}
       onClick={onExpand}
       className="collapsed-rail"
+      aria-label={`Expand ${label} pane`}
       title={`Expand ${label}`}
     >
       <span className="collapsed-rail-arrow" aria-hidden="true">

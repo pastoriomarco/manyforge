@@ -81,10 +81,11 @@ class _FakeDriver:
         self.endpoint = endpoint
         self.timeout_s = timeout_s
         self.session_id: str | None = None
-        self.scene_active = True
+        self.operations_collapsed = False
         self.inactive_take_frames = list(self.__class__.inactive_take_frames)
         self.deleted = False
         self.commands: list[str] = []
+        self.scripts: list[str] = []
         self.__class__.instances.append(self)
 
     def create_session(self) -> str:
@@ -94,31 +95,37 @@ class _FakeDriver:
     def command(self, method: str, path: str, payload: dict[str, Any] | None = None) -> Any:
         self.commands.append(path)
         if path == "/url":
-            self.scene_active = True
+            self.operations_collapsed = False
             return None
         if path == "/execute/sync":
             script = str((payload or {}).get("script"))
+            self.scripts.append(script)
             if script == collector.OBSERVATION_SCRIPT:
-                snapshot = _snapshot(active=self.scene_active, long_tasks=self.long_tasks)
+                snapshot = _snapshot(
+                    active=not self.operations_collapsed,
+                    long_tasks=self.long_tasks,
+                )
                 return {
                     "qualification": snapshot,
                     "connected": True,
-                    "sceneTabPresent": True,
-                    "sceneActive": self.scene_active,
+                    "operationsPanePresent": True,
+                    "operationsCollapsed": self.operations_collapsed,
+                    "viewerPresent": True,
                     "wireframeUnchecked": True,
                 }
             if script == collector.TAKE_SCRIPT:
-                snapshot = _snapshot(active=self.scene_active, long_tasks=self.long_tasks)
-                if not self.scene_active and self.inactive_take_frames:
+                snapshot = _snapshot(
+                    active=not self.operations_collapsed,
+                    long_tasks=self.long_tasks,
+                )
+                if self.operations_collapsed and self.inactive_take_frames:
                     snapshot["performance"]["renderedFrames"] = self.inactive_take_frames.pop(0)
                 return snapshot
             if script == collector.COLLAPSE_SCRIPT:
-                return 2
-            if script == collector.PROGRAM_TAB_SCRIPT:
-                self.scene_active = False
+                self.operations_collapsed = True
                 return True
-            if script == collector.SCENE_TAB_SCRIPT:
-                self.scene_active = True
+            if script == collector.EXPAND_SCRIPT:
+                self.operations_collapsed = False
                 return True
         raise AssertionError(f"unexpected WebDriver command: {method} {path}")
 
@@ -145,7 +152,10 @@ def test_collector_cleans_up_exact_session_on_success_and_uses_exact_opt_in() ->
     assert result["topology"]["initial"]["socketPath"] == "/ws/state"
     assert result["topology"]["inactive"]["canvasCount"] == 0
     assert result["topology"]["inactive"]["activeSockets"] == 1
+    assert result["topology"]["returned"]["canvasCount"] == 1
     assert result["topology"]["reload"]["maxActiveSockets"] == 1
+    assert driver.scripts.count(collector.COLLAPSE_SCRIPT) == 1
+    assert driver.scripts.count(collector.EXPAND_SCRIPT) == 1
     assert result["longTasks"] == {"supported": False, "count": None}
 
 
@@ -196,8 +206,9 @@ def test_exact_opt_in_replaces_old_value_and_rejects_malformed_duplicate_state()
             {
                 "qualification": None,
                 "connected": True,
-                "sceneTabPresent": True,
-                "sceneActive": True,
+                "operationsPanePresent": True,
+                "operationsCollapsed": False,
+                "viewerPresent": True,
                 "wireframeUnchecked": True,
             }
         )
@@ -220,8 +231,9 @@ def test_duplicate_canvas_or_socket_fails_closed() -> None:
         {
             "qualification": _snapshot(),
             "connected": True,
-            "sceneTabPresent": True,
-            "sceneActive": True,
+            "operationsPanePresent": True,
+            "operationsCollapsed": False,
+            "viewerPresent": True,
             "wireframeUnchecked": True,
         }
     )
@@ -245,8 +257,9 @@ def test_polling_is_bounded() -> None:
             {
                 "qualification": _snapshot(),
                 "connected": False,
-                "sceneTabPresent": True,
-                "sceneActive": True,
+                "operationsPanePresent": True,
+                "operationsCollapsed": False,
+                "viewerPresent": True,
                 "wireframeUnchecked": True,
             }
         )

@@ -1,5 +1,10 @@
 import { useCallback, useRef, useState } from 'react';
-import type { CSSProperties, RefObject } from 'react';
+import type {
+  CSSProperties,
+  KeyboardEvent as ReactKeyboardEvent,
+  PointerEvent as ReactPointerEvent,
+  RefObject,
+} from 'react';
 
 import { ApiError, api } from './api/client';
 import { ArtifactBrowser } from './components/ArtifactBrowser';
@@ -23,6 +28,99 @@ import type { ArtifactKind, FileBrowserEntry } from './types/api';
 
 function isNotFound(error: unknown): boolean {
   return error instanceof ApiError && error.status === 404;
+}
+
+const NAVIGATION_WIDTH_MIN = 220;
+const NAVIGATION_WIDTH_MAX = 420;
+const COMMANDS_WIDTH_MIN = 480;
+const COMMANDS_WIDTH_MAX = 720;
+
+function clamp(value: number, min: number, max: number): number {
+  return Math.min(Math.max(value, min), max);
+}
+
+interface WorkbenchDividerProps {
+  label: string;
+  value: number;
+  min: number;
+  max: number;
+  direction: 1 | -1;
+  onChange: (value: number) => void;
+}
+
+function WorkbenchDivider({
+  label,
+  value,
+  min,
+  max,
+  direction,
+  onChange,
+}: WorkbenchDividerProps) {
+  const pointer = useRef<{ id: number; startX: number; startValue: number } | null>(null);
+
+  const handlePointerDown = (event: ReactPointerEvent<HTMLDivElement>) => {
+    event.preventDefault();
+    event.currentTarget.setPointerCapture(event.pointerId);
+    pointer.current = {
+      id: event.pointerId,
+      startX: event.clientX,
+      startValue: value,
+    };
+  };
+  const handlePointerMove = (event: ReactPointerEvent<HTMLDivElement>) => {
+    const active = pointer.current;
+    if (active === null || active.id !== event.pointerId) return;
+    onChange(clamp(
+      active.startValue + direction * (event.clientX - active.startX),
+      min,
+      max,
+    ));
+  };
+  const finishPointer = (event: ReactPointerEvent<HTMLDivElement>) => {
+    if (pointer.current?.id !== event.pointerId) return;
+    if (event.currentTarget.hasPointerCapture(event.pointerId)) {
+      event.currentTarget.releasePointerCapture(event.pointerId);
+    }
+    pointer.current = null;
+  };
+  const handleKeyDown = (event: ReactKeyboardEvent<HTMLDivElement>) => {
+    const step = event.shiftKey ? 50 : 10;
+    const next = event.key === 'ArrowLeft'
+      ? value - direction * step
+      : event.key === 'ArrowRight'
+        ? value + direction * step
+        : event.key === 'Home'
+          ? min
+          : event.key === 'End'
+            ? max
+            : null;
+    if (next === null) return;
+    event.preventDefault();
+    onChange(clamp(next, min, max));
+  };
+
+  return (
+    <div
+      className="pane-divider"
+      role="separator"
+      tabIndex={0}
+      aria-label={`Resize ${label} pane`}
+      aria-orientation="vertical"
+      aria-valuemin={min}
+      aria-valuemax={max}
+      aria-valuenow={value}
+      aria-valuetext={`${value} pixels`}
+      title={`Resize ${label} pane`}
+      onPointerDown={handlePointerDown}
+      onPointerMove={handlePointerMove}
+      onPointerUp={finishPointer}
+      onPointerCancel={finishPointer}
+      onLostPointerCapture={() => {
+        pointer.current = null;
+      }}
+      onKeyDown={handleKeyDown}
+    />
+  );
 }
 
 export default function App() {
@@ -129,21 +227,9 @@ export default function App() {
                 ‹
               </button>
             </div>
-            <label className="pane-resize-control">
-              Library width
-              <input
-                type="range"
-                aria-label="Library width"
-                min="220"
-                max="420"
-                step="10"
-                value={navigationWidth}
-                onChange={(event) => setNavigationWidth(event.currentTarget.valueAsNumber)}
-              />
-            </label>
             {/* Catalog is first so the node palette is useful at startup. */}
             <CatalogPanel catalog={catalog} onRetry={retryCatalog} />
-            <details className="workbench-disclosure">
+            <details className="workbench-disclosure" open>
               <summary>Artifacts · Program / Deployment</summary>
               <ArtifactBrowser onSelectionChange={handleArtifactSelection} />
             </details>
@@ -153,6 +239,17 @@ export default function App() {
             </details>
           </div>
         </aside>
+
+        {!navigationCollapsed && (
+          <WorkbenchDivider
+            label="Library"
+            value={navigationWidth}
+            min={NAVIGATION_WIDTH_MIN}
+            max={NAVIGATION_WIDTH_MAX}
+            direction={1}
+            onChange={setNavigationWidth}
+          />
+        )}
 
         <section className="workbench-workspace" aria-label="Program authoring workspace">
           <ProgramWorkspace
@@ -165,6 +262,17 @@ export default function App() {
             onRetryEnvironment={retryNodeEnvironment}
           />
         </section>
+
+        {!commandsCollapsed && (
+          <WorkbenchDivider
+            label="Operations"
+            value={commandsWidth}
+            min={COMMANDS_WIDTH_MIN}
+            max={COMMANDS_WIDTH_MAX}
+            direction={-1}
+            onChange={setCommandsWidth}
+          />
+        )}
 
         <aside className="workbench-commands" aria-label="Viewer and operations rail">
           <div className="collapsed-rail-slot" hidden={!commandsCollapsed}>
@@ -193,18 +301,6 @@ export default function App() {
                 ›
               </button>
             </div>
-            <label className="pane-resize-control">
-              Operations rail width
-              <input
-                type="range"
-                aria-label="Operations rail width"
-                min="480"
-                max="720"
-                step="10"
-                value={commandsWidth}
-                onChange={(event) => setCommandsWidth(event.currentTarget.valueAsNumber)}
-              />
-            </label>
             <div className="visual-operations-stack">
               <SceneAuthoringWorkspace
                 enabled={headlessEnabled}

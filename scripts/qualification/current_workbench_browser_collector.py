@@ -37,8 +37,9 @@ class CollectorError(RuntimeError):
 class _Observation:
     qualification: dict[str, Any]
     connected: bool
-    scene_tab_present: bool
-    scene_active: bool
+    operations_pane_present: bool
+    operations_collapsed: bool
+    viewer_present: bool
     wireframe_unchecked: bool
 
 
@@ -202,8 +203,9 @@ def _validate_observation(value: object) -> _Observation:
         {
             "qualification",
             "connected",
-            "sceneTabPresent",
-            "sceneActive",
+            "operationsPanePresent",
+            "operationsCollapsed",
+            "viewerPresent",
             "wireframeUnchecked",
         },
         "browser observation",
@@ -211,8 +213,9 @@ def _validate_observation(value: object) -> _Observation:
     qualification = _validate_qualification(result["qualification"])
     for key in (
         "connected",
-        "sceneTabPresent",
-        "sceneActive",
+        "operationsPanePresent",
+        "operationsCollapsed",
+        "viewerPresent",
         "wireframeUnchecked",
     ):
         if not isinstance(result[key], bool):
@@ -220,8 +223,9 @@ def _validate_observation(value: object) -> _Observation:
     return _Observation(
         qualification=qualification,
         connected=result["connected"],
-        scene_tab_present=result["sceneTabPresent"],
-        scene_active=result["sceneActive"],
+        operations_pane_present=result["operationsPanePresent"],
+        operations_collapsed=result["operationsCollapsed"],
+        viewer_present=result["viewerPresent"],
         wireframe_unchecked=result["wireframeUnchecked"],
     )
 
@@ -303,18 +307,21 @@ class RawWebDriver:
 
 OBSERVATION_SCRIPT = f"""return (() => {{
   const q = window.{QUALIFICATION_GLOBAL};
+  const shell = document.querySelector('.workbench');
+  const operations = document.querySelector('.workbench-commands');
+  const pane = operations?.querySelector('.workbench-pane');
   return {{
     qualification: q === undefined ? null : q.snapshot(),
     connected: document.querySelector('.header-boundary')?.textContent?.includes('Headless owner connected') === true,
-    sceneTabPresent: document.querySelector('#workspace-tab-scene') !== null,
-    sceneActive: document.querySelector('#workspace-tab-scene')?.getAttribute('aria-selected') === 'true',
+    operationsPanePresent: operations !== null && pane !== null,
+    operationsCollapsed: shell?.classList.contains('commands-collapsed') === true,
+    viewerPresent: pane?.querySelector('.viewer-panel') !== null,
     wireframeUnchecked: document.querySelector('.viewer-controls input[type="checkbox"]')?.checked === false
   }};
 }})();"""
 TAKE_SCRIPT = f"return window.{QUALIFICATION_GLOBAL}?.take() ?? null;"
-SCENE_TAB_SCRIPT = "return (() => { const node = document.querySelector('#workspace-tab-scene'); if (!node) return false; node.click(); return true; })();"
-PROGRAM_TAB_SCRIPT = "return (() => { const node = document.querySelector('#workspace-tab-program'); if (!node) return false; node.click(); return true; })();"
-COLLAPSE_SCRIPT = "return (() => { const nodes = [...document.querySelectorAll('[aria-label^=\"Collapse \"]')]; nodes.forEach((node) => node.click()); return nodes.length; })();"
+COLLAPSE_SCRIPT = "return (() => { const node = document.querySelector('[aria-label=\"Collapse viewer and operations pane\"]'); if (!node) return false; node.click(); return true; })();"
+EXPAND_SCRIPT = "return (() => { const node = document.querySelector('[aria-label=\"Expand Operations pane\"]'); if (!node) return false; node.click(); return true; })();"
 
 
 def _execute(driver: RawWebDriver, script: str) -> Any:
@@ -361,8 +368,13 @@ def _url_with_opt_in(composer_url: str) -> str:
 
 def _require_ready(observation: _Observation) -> None:
     status = observation.qualification["status"]
-    if not observation.connected or not observation.scene_tab_present or not observation.scene_active:
-        raise CollectorError("Composer workbench is not connected with the Scene tab available")
+    if (
+        not observation.connected
+        or not observation.operations_pane_present
+        or observation.operations_collapsed
+        or not observation.viewer_present
+    ):
+        raise CollectorError("Composer workbench is not connected with its viewer/operations pane available")
     if not observation.wireframe_unchecked:
         raise CollectorError("wireframe control is checked by default")
     if status["canvasCount"] != 1:
@@ -387,11 +399,12 @@ def _require_ready(observation: _Observation) -> None:
         raise CollectorError("viewer browser/runtime error was reported")
 
 
-def _scene_ready(observation: _Observation) -> bool:
+def _viewer_ready(observation: _Observation) -> bool:
     if not (
         observation.connected
-        and observation.scene_tab_present
-        and observation.scene_active
+        and observation.operations_pane_present
+        and not observation.operations_collapsed
+        and observation.viewer_present
         and observation.wireframe_unchecked
     ):
         return False
@@ -493,16 +506,19 @@ def collect_current_workbench(
         driver.command("POST", "/url", {"url": target_url})
         _wait(
             driver,
-            lambda item: item.connected and item.scene_tab_present,
-            "connected workbench and Scene tab",
+            lambda item: (
+                item.connected
+                and item.operations_pane_present
+                and not item.operations_collapsed
+                and item.viewer_present
+            ),
+            "connected workbench viewer and operations pane",
             timeout_s,
         )
-        if _execute(driver, SCENE_TAB_SCRIPT) is not True:
-            raise CollectorError("initial Scene-tab command returned unsupported response")
         ready = _wait(
             driver,
-            _scene_ready,
-            "connected solid Scene viewer",
+            _viewer_ready,
+            "connected solid viewer",
             timeout_s,
         )
         _require_ready(ready)
@@ -520,29 +536,33 @@ def collect_current_workbench(
         ):
             raise CollectorError("viewer produced no bounded geometry/render work")
 
-        if _execute(driver, COLLAPSE_SCRIPT) not in {0, 2}:
-            raise CollectorError("collapse presentation command returned unsupported response")
-        if _execute(driver, PROGRAM_TAB_SCRIPT) is not True:
-            raise CollectorError("workspace-tab command returned unsupported response")
+        if _execute(driver, COLLAPSE_SCRIPT) is not True:
+            raise CollectorError("viewer/operations collapse command returned unsupported response")
         inactive = _wait(driver, lambda item: (
-            not item.scene_active
+            item.operations_collapsed
+            and item.viewer_present
             and item.qualification["status"]["canvasCount"] == 0
+            and item.qualification["status"]["viewerActive"] is False
             and item.qualification["status"]["headless"]["activeSockets"] == 1
             and item.qualification["status"]["headless"]["maxActiveSockets"] == 1
         ), "inactive viewer demand with shell socket retained", timeout_s)
-        # Discard the transition/unmount window.  The scene tab click can
-        # leave one final demand frame in the window that observed inactivity.
+        # Discard the transition/unmount window.  Collapsing the pane can leave
+        # one final demand frame in the window that observed inactivity.
         _take(driver)
         time.sleep(POLL_INTERVAL_S)
         inactive_window = _take(driver)
-        if inactive_window["performance"]["renderedFrames"] != 0:
+        if (
+            inactive_window["status"]["viewerActive"] is not False
+            or inactive_window["status"]["canvasCount"] != 0
+            or inactive_window["performance"]["renderedFrames"] != 0
+        ):
             raise CollectorError("inactive viewer continued to render")
-        if _execute(driver, SCENE_TAB_SCRIPT) is not True:
-            raise CollectorError("Scene-tab command returned unsupported response")
+        if _execute(driver, EXPAND_SCRIPT) is not True:
+            raise CollectorError("viewer/operations expand command returned unsupported response")
         returned = _wait(
             driver,
-            _scene_ready,
-            "returned single Scene Canvas and shell socket",
+            _viewer_ready,
+            "returned single viewer Canvas and shell socket",
             timeout_s,
         )
         _require_ready(returned)
@@ -550,23 +570,27 @@ def collect_current_workbench(
         if (
             returned_topology["sourceCount"] != initial["sourceCount"]
             or returned_topology["socketCreations"] != initial["socketCreations"]
+            or returned_topology["canvasCount"] != 1
         ):
-            raise CollectorError("Scene presentation changed HeadlessStateSource topology")
+            raise CollectorError("viewer presentation changed HeadlessStateSource topology")
 
         driver.command("POST", "/url", {"url": target_url})
         _wait(
             driver,
-            lambda item: item.connected and item.scene_tab_present,
-            "reloaded connected workbench and Scene tab",
+            lambda item: (
+                item.connected
+                and item.operations_pane_present
+                and not item.operations_collapsed
+                and item.viewer_present
+            ),
+            "reloaded connected workbench viewer and operations pane",
             timeout_s,
         )
-        if _execute(driver, SCENE_TAB_SCRIPT) is not True:
-            raise CollectorError("reload Scene-tab command returned unsupported response")
         reloaded = _wait(
             driver,
-            lambda item: _scene_ready(item)
+            lambda item: _viewer_ready(item)
             and item.qualification["status"]["headless"]["maxActiveSockets"] <= 1,
-            "reload topology",
+            "reload viewer topology",
             timeout_s,
         )
         _require_ready(reloaded)
@@ -603,7 +627,7 @@ def collect_current_workbench(
             "reloadPerformance": final_performance,
             "longTasks": long_tasks,
             "claims": [
-                "focused-idle native Scene-active/inactive presentation demand",
+                "focused-idle native viewer-active/inactive presentation demand",
                 "one Canvas and one shared shell HeadlessStateSource socket",
                 "solid rendering, bounded browser timings, and reload topology",
             ],
