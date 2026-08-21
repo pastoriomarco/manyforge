@@ -13,6 +13,10 @@ from manyforge_behavior.catalog import (
     CatalogValidationError,
     NodeCatalog,
 )
+from manyforge_behavior.canonical_artifact import (
+    StrictArtifactError,
+    verify_content_identity,
+)
 from manyforge_behavior.node_environment import BUILTIN_CATALOG_PATH
 from manyforge_behavior.program import Program, ProgramValidationError
 
@@ -46,6 +50,37 @@ RUNTIME_SNAPSHOT_VERSION = "manyforge.headless_runtime_snapshot.v1"
 MANAGER_SOURCE_VERSION = "manyforge.manager_source.v1"
 PROGRAM_APPLY_RESULT_VERSION = "manyforge.program_apply_result.v1"
 APPLIED_PROGRAM_SELECTION_VERSION = "manyforge.applied_program_selection.v1"
+_APPLIED_PROGRAM_SELECTION_FIELDS = frozenset(
+    {
+        "assistant_mode",
+        "baseline_program_binding_id",
+        "deployment_artifact_id",
+        "deployment_revision",
+        "graph_revision",
+        "node_environment_digest",
+        "preparation_digest",
+        "program",
+        "program_binding",
+        "program_binding_id",
+        "program_id",
+        "program_revision",
+        "retained_bundle_id",
+        "scenario_catalog_revision",
+        "scenario_id",
+        "schema_version",
+        "source",
+        "typed_parameter_overrides",
+    }
+)
+_APPLIED_PROGRAM_SOURCE_FIELDS = frozenset(
+    {
+        "record_digest",
+        "semantic_content_digest",
+        "source_generation",
+        "source_owner_epoch",
+        "source_owner_id",
+    }
+)
 PROGRAM_RUN_INDEX_VERSION = "manyforge.program_run_index.v1"
 PROGRAM_RUN_STATUS_VERSION = "manyforge.program_run_status.v1"
 PROGRAM_RUN_CAPTURE_VERSION = "manyforge.program_run_capture.v1"
@@ -63,6 +98,45 @@ _PROGRAM_RUN_STATES = frozenset(
 )
 _ACTIVE_PROGRAM_RUN_STATES = frozenset(
     {"running", "intervention_required", "stopping", "finalizing"}
+)
+_PROGRAM_REQUIRED_FIELDS = frozenset(
+    {
+        "api_version",
+        "program_id",
+        "program_revision",
+        "program_profile",
+        "name",
+        "catalog",
+        "component_roles",
+        "target_roles",
+        "tree",
+    }
+)
+_PROGRAM_FIELDS = _PROGRAM_REQUIRED_FIELDS | frozenset(
+    {
+        "blackboard",
+        "compatibility",
+        "contact_policies",
+        "description",
+        "parameters",
+        "scene",
+        "viewer",
+    }
+)
+_PROGRAM_BINDING_FIELDS = frozenset(
+    {
+        "api_version",
+        "component_role_bindings",
+        "contact_grasp_bindings",
+        "graph_revision",
+        "node_environment",
+        "program_binding_id",
+        "program_id",
+        "program_revision",
+        "provenance",
+        "retained_bundle_id",
+        "target_role_bindings",
+    }
 )
 
 
@@ -467,14 +541,157 @@ class HeadlessService:
 
     def program_applied(self) -> dict[str, Any]:
         projection = self.core.applied_program_selection()
+        if not isinstance(projection, dict):
+            raise HeadlessApiError(
+                "program_applied_selection_invalid",
+                "native core returned an invalid Applied Program projection",
+            )
+        program = projection.get("program")
+        binding = projection.get("program_binding")
+        source = projection.get("source")
+        node_environment = (
+            binding.get("node_environment") if isinstance(binding, dict) else None
+        )
+        try:
+            program_identity = (
+                verify_content_identity(
+                    program,
+                    own_field="program_revision",
+                    identity_domain="program-revision",
+                    api_version="manyforge.program.v1",
+                    label="applied_program.program",
+                )
+                if isinstance(program, dict)
+                else None
+            )
+            binding_identity = (
+                verify_content_identity(
+                    binding,
+                    own_field="program_binding_id",
+                    identity_domain="program-binding-id",
+                    api_version="manyforge.program_binding.v1",
+                    label="applied_program.program_binding",
+                )
+                if isinstance(binding, dict)
+                else None
+            )
+            validated_program = (
+                Program.from_dict(
+                    program,
+                    _program_catalog(),
+                    path="<headless-applied-program>",
+                )
+                if isinstance(program, dict)
+                else None
+            )
+        except (
+            ProgramValidationError,
+            StrictArtifactError,
+            TypeError,
+            ValueError,
+        ):
+            program_identity = None
+            binding_identity = None
+            validated_program = None
         if (
-            projection.get("schema_version")
+            set(projection) != _APPLIED_PROGRAM_SELECTION_FIELDS
+            or projection.get("schema_version")
             != APPLIED_PROGRAM_SELECTION_VERSION
-            or not isinstance(projection.get("program_revision"), str)
-            or not isinstance(projection.get("program_binding_id"), str)
-            or not isinstance(projection.get("retained_bundle_id"), str)
-            or not isinstance(projection.get("graph_revision"), str)
-            or not isinstance(projection.get("source"), dict)
+            or projection.get("assistant_mode")
+            not in {"required", "optional", "forbidden"}
+            or not _sha256_identity(
+                projection.get("baseline_program_binding_id")
+            )
+            or not _bounded_text(
+                projection.get("deployment_artifact_id"),
+                maximum_bytes=256,
+            )
+            or not _sha256_identity(projection.get("deployment_revision"))
+            or not _sha256_identity(projection.get("node_environment_digest"))
+            or not _sha256_identity(projection.get("preparation_digest"))
+            or not _sha256_identity(
+                projection.get("scenario_catalog_revision")
+            )
+            or not _bounded_text(
+                projection.get("scenario_id"),
+                maximum_bytes=256,
+            )
+            or not isinstance(projection.get("typed_parameter_overrides"), dict)
+            or not _bounded_text(projection.get("program_id"), maximum_bytes=256)
+            or not _sha256_identity(projection.get("program_revision"))
+            or not _sha256_identity(projection.get("program_binding_id"))
+            or not _sha256_identity(projection.get("retained_bundle_id"))
+            or not _sha256_identity(projection.get("graph_revision"))
+            or not isinstance(program, dict)
+            or not _PROGRAM_REQUIRED_FIELDS.issubset(program)
+            or not set(program).issubset(_PROGRAM_FIELDS)
+            or not isinstance(program.get("catalog"), dict)
+            or not isinstance(program.get("component_roles"), dict)
+            or not isinstance(program.get("target_roles"), dict)
+            or not isinstance(program.get("tree"), dict)
+            or program.get("program_id") != projection.get("program_id")
+            or program_identity != projection.get("program_revision")
+            or validated_program is None
+            or validated_program.to_dict() != program
+            or not isinstance(binding, dict)
+            or set(binding) != _PROGRAM_BINDING_FIELDS
+            or binding.get("api_version") != "manyforge.program_binding.v1"
+            or binding.get("program_id") != projection.get("program_id")
+            or binding.get("program_revision") != projection.get("program_revision")
+            or binding_identity != projection.get("program_binding_id")
+            or binding.get("retained_bundle_id")
+            != projection.get("retained_bundle_id")
+            or binding.get("graph_revision") != projection.get("graph_revision")
+            or not isinstance(binding.get("component_role_bindings"), list)
+            or not all(
+                isinstance(row, dict)
+                for row in binding.get("component_role_bindings", ())
+            )
+            or not isinstance(binding.get("target_role_bindings"), list)
+            or not all(
+                isinstance(row, dict)
+                for row in binding.get("target_role_bindings", ())
+            )
+            or not isinstance(binding.get("contact_grasp_bindings"), list)
+            or not all(
+                isinstance(row, dict)
+                for row in binding.get("contact_grasp_bindings", ())
+            )
+            or not isinstance(binding.get("provenance"), dict)
+            or not isinstance(node_environment, dict)
+            or set(node_environment)
+            != {
+                "catalog_id",
+                "content_version",
+                "catalog_digest",
+                "environment_digest",
+            }
+            or not _bounded_text(
+                node_environment.get("catalog_id"),
+                maximum_bytes=256,
+            )
+            or not _bounded_text(
+                node_environment.get("content_version"),
+                maximum_bytes=128,
+            )
+            or not _sha256_identity(node_environment.get("catalog_digest"))
+            or not _sha256_identity(node_environment.get("environment_digest"))
+            or node_environment.get("environment_digest")
+            != projection.get("node_environment_digest")
+            or not isinstance(source, dict)
+            or set(source) != _APPLIED_PROGRAM_SOURCE_FIELDS
+            or not _sha256_identity(source.get("record_digest"))
+            or not _sha256_identity(source.get("semantic_content_digest"))
+            or type(source.get("source_generation")) is not int
+            or source.get("source_generation", 0) < 1
+            or not _bounded_text(
+                source.get("source_owner_epoch"),
+                maximum_bytes=256,
+            )
+            or not _bounded_text(
+                source.get("source_owner_id"),
+                maximum_bytes=256,
+            )
         ):
             raise HeadlessApiError(
                 "program_applied_selection_invalid",

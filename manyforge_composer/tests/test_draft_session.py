@@ -173,6 +173,280 @@ def test_save_updates_saved_identity_only_after_writer_success(tmp_path: Path) -
     )
     assert saved["saved"]["path"] == str(target.resolve())
     assert saved["saved"]["matchesDraft"] is True
+    assert type(session._saved_document) is dict
+    assert session._saved_document == session._program.to_dict()
+
+
+def test_saved_document_lifecycle_never_deepcopies_program_graph(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def reject_program_deepcopy(
+        _program: Program,
+        _memo: dict,
+    ) -> None:
+        pytest.fail("immutable Program graphs must not be deep-copied")
+
+    monkeypatch.setattr(Program, "__deepcopy__", reject_program_deepcopy, raising=False)
+    catalog = build_node_environment().catalog
+    initial = _program()
+    session = ComposerDraftSession(initial, source_path=str(_PROGRAM_PATH))
+    assert session._saved_document == initial.to_dict()
+
+    retained_initial = deepcopy(session._saved_document)
+
+    def corrupt_prepare(document: dict) -> tuple[Program, Program, object]:
+        document["name"] = "Corrupted callback copy"
+        raise RuntimeError("preparation failed")
+
+    with pytest.raises(RuntimeError, match="preparation failed"):
+        session.revert_saved_after_apply(
+            draft_id=session.draft_id,
+            expected_revision=session.revision,
+            prepare=corrupt_prepare,
+            applier=lambda _program, _context: pytest.fail("must not Apply"),
+        )
+    assert session._saved_document == retained_initial
+
+    loaded = _program(metadata={"selection": "loaded"})
+    session.load_and_apply_program(
+        draft_id=session.draft_id,
+        expected_revision=session.revision,
+        discard_changes=True,
+        current_applied_program_revision=initial.program_revision,
+        loader=lambda: (loaded, str(tmp_path / "loaded.program.yaml")),
+        applier=lambda _program: {"status": "applied"},
+    )
+    session.save_program(
+        draft_id=session.draft_id,
+        expected_revision=session.revision,
+        target_path=str(tmp_path / "saved.program.yaml"),
+        writer=lambda _program, path: path,
+    )
+    retained_saved = deepcopy(session._saved_document)
+
+    applied = _program(metadata={"selection": "applied"})
+    session.discard_to_applied(
+        draft_id=session.draft_id,
+        expected_revision=session.revision,
+        reader=lambda: applied,
+    )
+    result, reverted = session.revert_saved_after_apply(
+        draft_id=session.draft_id,
+        expected_revision=session.revision,
+        prepare=lambda document: (
+            Program.from_dict(document, catalog),
+            applied,
+            "current",
+        ),
+        applier=lambda _program, _context: {"status": "applied"},
+    )
+
+    assert result == {"status": "applied"}
+    assert session._saved_document == retained_saved
+    assert reverted["draft"]["program"] == retained_saved
+
+
+def test_discard_and_revert_use_exact_independent_owner_snapshots() -> None:
+    saved_program = _program()
+    applied_program = _program(metadata={"selection": "applied"})
+    session = ComposerDraftSession(saved_program, source_path=str(_PROGRAM_PATH))
+    original_saved = deepcopy(saved_program.to_dict())
+
+    discarded = session.discard_to_applied(
+        draft_id=session.draft_id,
+        expected_revision=session.revision,
+        reader=lambda: applied_program,
+    )
+    assert discarded["draft"]["program"] == applied_program.to_dict()
+    assert discarded["saved"]["programRevision"] == saved_program.program_revision
+    assert discarded["saved"]["path"] == str(_PROGRAM_PATH.resolve())
+    discarded_revision = session.revision
+
+    no_op = session.discard_to_applied(
+        draft_id=session.draft_id,
+        expected_revision=session.revision,
+        reader=lambda: applied_program,
+    )
+    assert no_op["draft"]["draftRevision"] == discarded_revision
+
+    applied: list[dict] = []
+    result, reverted = session.revert_saved_after_apply(
+        draft_id=session.draft_id,
+        expected_revision=session.revision,
+        prepare=lambda document: (
+            Program.from_dict(document, build_node_environment().catalog),
+            applied_program,
+            "current",
+        ),
+        applier=lambda program, _context: (
+            applied.append(deepcopy(program.to_dict()))
+            or {"status": "applied"}
+        ),
+    )
+    assert result["status"] == "applied"
+    assert applied == [original_saved]
+    assert reverted["draft"]["program"] == original_saved
+    assert reverted["saved"]["programRevision"] == saved_program.program_revision
+    reverted_revision = session.revision
+
+    session.revert_saved_after_apply(
+        draft_id=session.draft_id,
+        expected_revision=session.revision,
+        prepare=lambda document: (
+            Program.from_dict(document, build_node_environment().catalog),
+            saved_program,
+            "current",
+        ),
+        applier=lambda _program, _context: pytest.fail("no-op must not Apply"),
+    )
+    assert session.revision == reverted_revision
+
+
+def test_revert_failure_stale_fences_and_exhaustion_are_atomic() -> None:
+    session = ComposerDraftSession(_program(), source_path=str(_PROGRAM_PATH))
+    _mutate(
+        session,
+        "tree_draft_update_node_params",
+        {
+            "instance_id": "move_to_pick",
+            "expected_node_id": "motion.move_to_joint_target",
+            "parameters": {"planning_timeout_s": 3.0},
+        },
+    )
+    before = deepcopy(session.workspace_snapshot())
+
+    result, _snapshot = session.revert_saved_after_apply(
+        draft_id=session.draft_id,
+        expected_revision=session.revision,
+        prepare=lambda document: (
+            Program.from_dict(document, build_node_environment().catalog),
+            _program(metadata={"selection": "applied"}),
+            "current",
+        ),
+        applier=lambda _program, _context: {"status": "pending_deployment"},
+    )
+    assert result["status"] == "pending_deployment"
+    assert session.workspace_snapshot() == before
+
+    with pytest.raises(DraftSessionError) as stale:
+        session.discard_to_applied(
+            draft_id=session.draft_id,
+            expected_revision=session.revision - 1,
+            reader=lambda: _program(metadata={"unexpected": True}),
+        )
+    assert stale.value.code == "composer_draft_revision_stale"
+    assert session.workspace_snapshot() == before
+
+    effects: list[str] = []
+    session._revision = 9_007_199_254_740_991
+    for action in (
+        lambda: session.discard_to_applied(
+            draft_id=session.draft_id,
+            expected_revision=session.revision,
+            reader=lambda: effects.append("read") or _program(),
+        ),
+        lambda: session.revert_saved_after_apply(
+            draft_id=session.draft_id,
+            expected_revision=session.revision,
+            prepare=lambda document: (
+                effects.append("read")
+                or Program.from_dict(
+                    document,
+                    build_node_environment().catalog,
+                ),
+                _program(metadata={"selection": "applied"}),
+                "current",
+            ),
+            applier=lambda _program, _context: (
+                effects.append("apply") or {"status": "applied"}
+            ),
+        ),
+    ):
+        with pytest.raises(DraftSessionError) as exhausted:
+            action()
+        assert exhausted.value.code == "composer_draft_revision_exhausted"
+    assert effects == ["read", "read"]
+
+
+def test_new_draft_is_fresh_minimal_valid_and_clears_saved_identity() -> None:
+    catalog = build_node_environment().catalog
+    session = ComposerDraftSession(_program(), source_path=str(_PROGRAM_PATH))
+    before = session.workspace_snapshot(
+        applied_program_revision=session.snapshot()["program_revision"]
+    )
+
+    created = session.new_draft(
+        draft_id=before["draft"]["draftId"],
+        expected_revision=before["draft"]["draftRevision"],
+        confirm_discard=False,
+        applied_revision_reader=lambda: before["draft"]["programRevision"],
+        catalog_reader=lambda: catalog,
+    )
+
+    document = created["draft"]["program"]
+    assert Program.from_dict(document, catalog).to_dict() == document
+    assert document["program_id"].startswith("program-")
+    assert len(document["program_id"]) == len("program-") + 32
+    assert document["tree"] == {
+        "node_id": "logic.check_bool",
+        "instance_id": "root",
+        "parameters": {"actual_value": True, "expected_value": True},
+        "children": [],
+    }
+    assert created["draft"]["draftId"] != before["draft"]["draftId"]
+    assert created["draft"]["draftRevision"] == 1
+    assert created["saved"]["available"] is False
+    assert created["saved"]["path"] is None
+
+    second = session.new_draft(
+        draft_id=created["draft"]["draftId"],
+        expected_revision=created["draft"]["draftRevision"],
+        confirm_discard=True,
+        applied_revision_reader=lambda: pytest.fail("confirmed replacement"),
+        catalog_reader=lambda: catalog,
+    )
+    assert second["draft"]["program"]["program_id"] != document["program_id"]
+    assert second["draft"]["programRevision"] != document["program_revision"]
+
+    with pytest.raises(DraftSessionError) as replay:
+        session.new_draft(
+            draft_id=before["draft"]["draftId"],
+            expected_revision=before["draft"]["draftRevision"],
+            confirm_discard=True,
+            applied_revision_reader=lambda: pytest.fail("stale read"),
+            catalog_reader=lambda: pytest.fail("stale catalog"),
+        )
+    assert replay.value.code == "composer_draft_id_stale"
+
+
+def test_new_draft_confirmation_and_catalog_failure_are_atomic() -> None:
+    catalog = build_node_environment().catalog
+    session = ComposerDraftSession(_program(), source_path=str(_PROGRAM_PATH))
+    before = session.workspace_snapshot()
+
+    with pytest.raises(DraftSessionError) as unapplied:
+        session.new_draft(
+            draft_id=session.draft_id,
+            expected_revision=session.revision,
+            confirm_discard=False,
+            applied_revision_reader=lambda: "sha256:" + "f" * 64,
+            catalog_reader=lambda: pytest.fail("confirmation precedes catalog"),
+        )
+    assert unapplied.value.code == "composer_draft_discard_confirmation_required"
+    assert session.workspace_snapshot() == before
+
+    session._revision = 9_007_199_254_740_991
+    exhausted_id = session.draft_id
+    created = session.new_draft(
+        draft_id=exhausted_id,
+        expected_revision=session.revision,
+        confirm_discard=True,
+        applied_revision_reader=lambda: pytest.fail("confirmed replacement"),
+        catalog_reader=lambda: catalog,
+    )
+    assert created["draft"]["draftId"] != exhausted_id
+    assert created["draft"]["draftRevision"] == 1
 
 
 def test_successful_edit_reidentifies_and_atomically_swaps_the_program() -> None:

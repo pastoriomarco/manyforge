@@ -91,6 +91,31 @@ function workspaceFixture(): Record<string, unknown> {
   };
 }
 
+function programBindingFixture(
+  programId: string,
+  programRevision: string,
+  programBindingId: string,
+): Record<string, unknown> {
+  return {
+    api_version: 'manyforge.program_binding.v1',
+    program_binding_id: programBindingId,
+    program_id: programId,
+    program_revision: programRevision,
+    retained_bundle_id: `sha256:${'b'.repeat(64)}`,
+    graph_revision: `sha256:${'c'.repeat(64)}`,
+    node_environment: {
+      catalog_id: 'manyforge.default',
+      content_version: '1.1.0',
+      catalog_digest: `sha256:${'d'.repeat(64)}`,
+      environment_digest: `sha256:${'a'.repeat(64)}`,
+    },
+    component_role_bindings: [],
+    target_role_bindings: [],
+    contact_grasp_bindings: [],
+    provenance: {},
+  };
+}
+
 function sourceSectionFixture(): Record<string, unknown> {
   return {
     available: true,
@@ -456,7 +481,7 @@ describe('Program product projections', () => {
         typed_parameter_overrides: {},
       }],
     });
-    const applied = parseAppliedProgramSelection({
+    const appliedInput = {
       assistant_mode: 'forbidden',
       baseline_program_binding_id: digestA,
       deployment_artifact_id: 'cell-a',
@@ -465,7 +490,7 @@ describe('Program product projections', () => {
       node_environment_digest: digestA,
       preparation_digest: digestB,
       program: programFixture(),
-      program_binding: {},
+      program_binding: programBindingFixture('fixture', digestA, digestC),
       program_binding_id: digestC,
       program_id: 'fixture',
       program_revision: digestA,
@@ -481,11 +506,50 @@ describe('Program product projections', () => {
         source_owner_id: 'headless.program-apply',
       },
       typed_parameter_overrides: {},
-    });
+    };
+    const applied = parseAppliedProgramSelection(appliedInput);
 
     expect(catalog.scenarios[0].description).toBe('Pick one object');
     expect(applied.recordDigest).toBe(digestC);
     expect(applied.sourceOwnerEpoch).toBe('headless.epoch.1');
+    expect(applied.program.program_id).toBe('fixture');
+    expect(applied.programBinding.program_binding_id).toBe(digestC);
+    expect(() => parseAppliedProgramSelection({
+      ...appliedInput,
+      program_binding: programBindingFixture(
+        'another-program',
+        digestA,
+        digestC,
+      ),
+    })).toThrow(/content-identical Program and Program Binding identities/);
+    expect(() => parseAppliedProgramSelection({
+      ...appliedInput,
+      program_binding: {
+        ...programBindingFixture('fixture', digestA, digestC),
+        retained_bundle_id: digestA,
+      },
+    })).toThrow(/content-identical Program and Program Binding identities/);
+    expect(() => parseAppliedProgramSelection({
+      ...appliedInput,
+      program_binding: {
+        ...programBindingFixture('fixture', digestA, digestC),
+        graph_revision: digestA,
+      },
+    })).toThrow(/content-identical Program and Program Binding identities/);
+    expect(() => parseAppliedProgramSelection({
+      ...appliedInput,
+      program_binding: {
+        ...programBindingFixture('fixture', digestA, digestC),
+        node_environment: {
+          ...(programBindingFixture(
+            'fixture',
+            digestA,
+            digestC,
+          ).node_environment as Record<string, unknown>),
+          unknown: true,
+        },
+      },
+    })).toThrow(/exactly/);
   });
 
   it('keeps run status and index tied to one exact runner owner', () => {
@@ -511,7 +575,7 @@ describe('Program product projections', () => {
     })).toThrow(/exact indexed owner/);
   });
 
-  it('parses Composer Apply and Load wrappers without trusting headless details', () => {
+  it('parses Composer Apply, Load, and Revert wrappers without trusting headless details', () => {
     const response = parseProgramWorkspaceTransitionResponse({
       status: 'applied',
       headless: { schema_version: 'manyforge.program_apply_result.v1' },
@@ -520,6 +584,16 @@ describe('Program product projections', () => {
 
     expect(response.status).toBe('applied');
     expect(response.workspace.draft.programLoaded).toBe(true);
+    expect(parseProgramWorkspaceTransitionResponse({
+      status: 'reverted',
+      headless: null,
+      workspace: workspaceFixture(),
+    }).status).toBe('reverted');
+    expect(() => parseProgramWorkspaceTransitionResponse({
+      status: 'applied',
+      headless: null,
+      workspace: workspaceFixture(),
+    })).toThrow(/owner response/);
   });
 });
 

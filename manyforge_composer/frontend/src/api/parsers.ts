@@ -884,7 +884,7 @@ export function parseProgramDocument(value: unknown, path = 'program'): ProgramD
   const result: ProgramDocument = {
     api_version: apiVersion,
     program_id: stringAt(record.program_id, `${path}.program_id`),
-    program_revision: stringAt(record.program_revision, `${path}.program_revision`),
+    program_revision: digestAt(record.program_revision, `${path}.program_revision`),
     program_profile: programProfile,
     name: stringAt(record.name, `${path}.name`),
     catalog: {
@@ -1604,8 +1604,74 @@ export function parseAppliedProgramSelection(value: unknown): AppliedProgramSele
   stringAt(record.deployment_artifact_id, `${path}.deployment_artifact_id`);
   digestAt(record.deployment_revision, `${path}.deployment_revision`);
   digestAt(record.preparation_digest, `${path}.preparation_digest`);
-  jsonRecordAt(record.program, `${path}.program`);
-  jsonRecordAt(record.program_binding, `${path}.program_binding`);
+  const program = parseProgramDocument(record.program, `${path}.program`);
+  const bindingPath = `${path}.program_binding`;
+  const programBinding = jsonRecordAt(record.program_binding, bindingPath);
+  exactKeysAt(
+    programBinding,
+    [
+      'api_version',
+      'component_role_bindings',
+      'contact_grasp_bindings',
+      'graph_revision',
+      'node_environment',
+      'program_binding_id',
+      'program_id',
+      'program_revision',
+      'provenance',
+      'retained_bundle_id',
+      'target_role_bindings',
+    ],
+    bindingPath,
+  );
+  if (programBinding.api_version !== 'manyforge.program_binding.v1') {
+    return fail(
+      `${bindingPath}.api_version`,
+      'manyforge.program_binding.v1',
+    );
+  }
+  const bindingRows = (field: string) => arrayAt(
+    programBinding[field],
+    `${bindingPath}.${field}`,
+  ).map((row, index) => jsonRecordAt(
+    row,
+    `${bindingPath}.${field}[${index}]`,
+  ));
+  const componentRoleBindings = bindingRows('component_role_bindings');
+  const targetRoleBindings = bindingRows('target_role_bindings');
+  const contactGraspBindings = bindingRows('contact_grasp_bindings');
+  const nodeEnvironmentPath = `${bindingPath}.node_environment`;
+  const nodeEnvironment = jsonRecordAt(
+    programBinding.node_environment,
+    nodeEnvironmentPath,
+  );
+  exactKeysAt(
+    nodeEnvironment,
+    ['catalog_id', 'content_version', 'catalog_digest', 'environment_digest'],
+    nodeEnvironmentPath,
+  );
+  const bindingNodeEnvironment = {
+    catalog_id: stringAt(
+      nodeEnvironment.catalog_id,
+      `${nodeEnvironmentPath}.catalog_id`,
+    ),
+    content_version: stringAt(
+      nodeEnvironment.content_version,
+      `${nodeEnvironmentPath}.content_version`,
+    ),
+    catalog_digest: digestAt(
+      nodeEnvironment.catalog_digest,
+      `${nodeEnvironmentPath}.catalog_digest`,
+    ),
+    environment_digest: digestAt(
+      nodeEnvironment.environment_digest,
+      `${nodeEnvironmentPath}.environment_digest`,
+    ),
+  };
+  const provenance = jsonRecordAt(
+    programBinding.provenance,
+    `${bindingPath}.provenance`,
+  );
   jsonRecordAt(record.typed_parameter_overrides, `${path}.typed_parameter_overrides`);
   const source = objectAt(record.source, `${path}.source`);
   exactKeysAt(
@@ -1623,6 +1689,39 @@ export function parseAppliedProgramSelection(value: unknown): AppliedProgramSele
     source.semantic_content_digest,
     `${path}.source.semantic_content_digest`,
   );
+  const programId = stringAt(record.program_id, `${path}.program_id`);
+  const programRevision = digestAt(
+    record.program_revision,
+    `${path}.program_revision`,
+  );
+  const programBindingId = digestAt(
+    record.program_binding_id,
+    `${path}.program_binding_id`,
+  );
+  const retainedBundleId = digestAt(
+    record.retained_bundle_id,
+    `${path}.retained_bundle_id`,
+  );
+  const graphRevision = digestAt(
+    record.graph_revision,
+    `${path}.graph_revision`,
+  );
+  const nodeEnvironmentDigest = digestAt(
+    record.node_environment_digest,
+    `${path}.node_environment_digest`,
+  );
+  if (
+    program.program_id !== programId
+    || program.program_revision !== programRevision
+    || programBinding.program_id !== programId
+    || programBinding.program_revision !== programRevision
+    || programBinding.program_binding_id !== programBindingId
+    || programBinding.retained_bundle_id !== retainedBundleId
+    || programBinding.graph_revision !== graphRevision
+    || bindingNodeEnvironment.environment_digest !== nodeEnvironmentDigest
+  ) {
+    return fail(path, 'content-identical Program and Program Binding identities');
+  }
   return {
     schemaVersion,
     scenarioId: stringAt(record.scenario_id, `${path}.scenario_id`),
@@ -1630,21 +1729,12 @@ export function parseAppliedProgramSelection(value: unknown): AppliedProgramSele
       record.scenario_catalog_revision,
       `${path}.scenario_catalog_revision`,
     ),
-    programId: stringAt(record.program_id, `${path}.program_id`),
-    programRevision: digestAt(record.program_revision, `${path}.program_revision`),
-    programBindingId: digestAt(
-      record.program_binding_id,
-      `${path}.program_binding_id`,
-    ),
-    retainedBundleId: digestAt(
-      record.retained_bundle_id,
-      `${path}.retained_bundle_id`,
-    ),
-    graphRevision: digestAt(record.graph_revision, `${path}.graph_revision`),
-    nodeEnvironmentDigest: digestAt(
-      record.node_environment_digest,
-      `${path}.node_environment_digest`,
-    ),
+    programId,
+    programRevision,
+    programBindingId,
+    retainedBundleId,
+    graphRevision,
+    nodeEnvironmentDigest,
     recordDigest: digestAt(source.record_digest, `${path}.source.record_digest`),
     sourceOwnerId: stringAt(source.source_owner_id, `${path}.source.source_owner_id`),
     sourceOwnerEpoch: stringAt(
@@ -1655,6 +1745,20 @@ export function parseAppliedProgramSelection(value: unknown): AppliedProgramSele
       source.source_generation,
       `${path}.source.source_generation`,
     ),
+    program,
+    programBinding: {
+      api_version: 'manyforge.program_binding.v1',
+      program_binding_id: programBindingId,
+      program_id: programId,
+      program_revision: programRevision,
+      retained_bundle_id: retainedBundleId,
+      graph_revision: graphRevision,
+      node_environment: bindingNodeEnvironment,
+      component_role_bindings: componentRoleBindings,
+      target_role_bindings: targetRoleBindings,
+      contact_grasp_bindings: contactGraspBindings,
+      provenance,
+    },
   };
 }
 
@@ -1855,13 +1959,25 @@ export function parseProgramWorkspaceTransitionResponse(
   const path = 'programWorkspaceTransition';
   const record = objectAt(value, path);
   exactKeysAt(record, ['headless', 'status', 'workspace'], path);
-  jsonRecordAt(record.headless, `${path}.headless`);
   const status = stringAt(record.status, `${path}.status`);
-  if (!['applied', 'loaded', 'pending_deployment'].includes(status)) {
-    return fail(`${path}.status`, 'applied, loaded, or pending_deployment');
+  if (!['applied', 'loaded', 'reverted', 'pending_deployment'].includes(status)) {
+    return fail(
+      `${path}.status`,
+      'applied, loaded, reverted, or pending_deployment',
+    );
+  }
+  let headless: Record<string, JsonValue> | null;
+  if (record.headless === null) {
+    if (status !== 'reverted') {
+      return fail(`${path}.headless`, 'an owner response');
+    }
+    headless = null;
+  } else {
+    headless = jsonRecordAt(record.headless, `${path}.headless`);
   }
   return {
     status: status as ProgramWorkspaceTransitionResponse['status'],
+    headless,
     workspace: parseProgramWorkspaceResponse(record.workspace),
   };
 }

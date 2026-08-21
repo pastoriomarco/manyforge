@@ -394,6 +394,40 @@ export const api = {
         }),
       },
     ),
+    discard: (
+      fence: DraftFenceRequest,
+      signal?: AbortSignal,
+    ): Promise<ProgramWorkspaceResponse> => requestJson(
+      '/api/program/discard',
+      parseProgramWorkspaceResponse,
+      signal,
+      { method: 'POST', body: JSON.stringify(fence) },
+    ),
+    newDraft: (
+      fence: DraftFenceRequest,
+      confirmDiscard: boolean,
+      signal?: AbortSignal,
+    ): Promise<ProgramWorkspaceResponse> => requestJson(
+      '/api/program/new-draft',
+      parseProgramWorkspaceResponse,
+      signal,
+      {
+        method: 'POST',
+        body: JSON.stringify({ ...fence, confirmDiscard }),
+      },
+    ),
+    revert: (
+      fence: DraftFenceRequest,
+      signal?: AbortSignal,
+    ): Promise<ProgramWorkspaceTransitionResponse> => requestJson(
+      '/api/program/revert',
+      parseProgramWorkspaceTransitionResponse,
+      signal,
+      {
+        method: 'POST',
+        body: JSON.stringify(fence),
+      },
+    ),
     load: (
       fence: DraftFenceRequest,
       path: string,

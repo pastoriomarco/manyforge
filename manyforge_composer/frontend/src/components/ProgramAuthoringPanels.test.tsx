@@ -483,14 +483,18 @@ describe('Program authoring panels', () => {
           hasUnappliedChanges: null,
         },
         message: null,
+        transitionStatus: null,
         error: null,
       },
       refresh: vi.fn(),
       mutate: vi.fn(),
+      newDraft: vi.fn(),
       openDraft: vi.fn(),
       save: vi.fn(),
       saveAs: vi.fn(),
       apply: vi.fn(),
+      discard: vi.fn(),
+      revert: vi.fn(),
       load: vi.fn(),
       clearFeedback: vi.fn(),
     } satisfies ProgramWorkspaceController;
@@ -538,7 +542,9 @@ describe('Program authoring panels', () => {
     expect(markup).toContain('Open a Draft to use the palette');
     expect(markup).toContain('No Program Draft is open');
     expect(markup).toContain('Select a node to inspect properties');
-    expect(markup).toContain('Program actions · Open · Save As · Apply · Load');
+    expect(markup).toContain(
+      'Program actions · New · Open · Save As · Apply · Revert · Discard · Load',
+    );
     expect(markup).not.toContain('program-tree-node');
   });
 });

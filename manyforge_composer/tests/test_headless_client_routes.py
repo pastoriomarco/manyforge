@@ -13,6 +13,7 @@ from fastapi.testclient import TestClient
 from manyforge_behavior.canonical_artifact import (
     CONTENT_IDENTITY_PREFIX,
     canonical_json_bytes,
+    compute_content_identity,
     raw_sha256_digest,
 )
 from manyforge_behavior.executable_node_resolver import build_executable_node_resolver
@@ -323,7 +324,10 @@ def headless_client() -> (
             payload = applied_program
         elif path == "/api/program/apply":
             assert isinstance(body, dict)
-            if body["scenario_id"] == "pending-scenario":
+            if body["scenario_id"] == "pending-scenario" or (
+                body["scenario_id"] == "revert-pending"
+                and body["expected_applied_record_digest"] is not None
+            ):
                 return httpx.Response(
                     202,
                     json={
@@ -336,23 +340,108 @@ def headless_client() -> (
                     },
                     request=request,
                 )
+            if (
+                body["scenario_id"] in {"rejected-scenario", "revert-rejected"}
+                and body["expected_applied_record_digest"] is not None
+            ):
+                return httpx.Response(
+                    409,
+                    json={
+                        "detail": {
+                            "code": "program_apply_compare_and_swap_failed",
+                            "message": "foreign Apply won",
+                        }
+                    },
+                    request=request,
+                )
+            if (
+                body["scenario_id"] in {"malformed-scenario", "revert-malformed"}
+                and body["expected_applied_record_digest"] is not None
+            ):
+                return httpx.Response(
+                    200,
+                    json={
+                        "schema_version": "manyforge.program_apply_result.v1",
+                        "status": "applied",
+                        "applied": {"program_revision": "divergent"},
+                    },
+                    request=request,
+                )
+            previous_applied_program = applied_program
             program = body["program"]
-            applied_program = {
-                "schema_version": "manyforge.applied_program_selection.v1",
-                "scenario_id": body["scenario_id"],
+            binding = {
+                "api_version": "manyforge.program_binding.v1",
+                "program_binding_id": "sha256:" + "0" * 64,
+                "program_id": program["program_id"],
                 "program_revision": program["program_revision"],
-                "program_binding_id": "sha256:" + "3" * 64,
                 "retained_bundle_id": "sha256:" + "4" * 64,
                 "graph_revision": "sha256:" + "5" * 64,
-                "source": {"record_digest": "sha256:" + "6" * 64},
+                "node_environment": {
+                    "catalog_id": "manyforge.default",
+                    "content_version": "1.1.0",
+                    "catalog_digest": "sha256:" + "1" * 64,
+                    "environment_digest": "sha256:" + "2" * 64,
+                },
+                "component_role_bindings": [],
+                "target_role_bindings": [],
+                "contact_grasp_bindings": [],
+                "provenance": {
+                    "binding_compiler_contract_digest": "sha256:" + "3" * 64,
+                    "binding_compiler_build_digest": "sha256:" + "4" * 64,
+                    "role_assignment_digest": "sha256:" + "5" * 64,
+                    "source_records": [],
+                    "resolved_output_records": [],
+                },
             }
+            binding["program_binding_id"] = compute_content_identity(
+                binding,
+                own_field="program_binding_id",
+                identity_domain="program-binding-id",
+                api_version="manyforge.program_binding.v1",
+            )
+            committed_program = {
+                "assistant_mode": "forbidden",
+                "baseline_program_binding_id": "sha256:" + "3" * 64,
+                "deployment_artifact_id": "cell_a",
+                "deployment_revision": "sha256:" + "1" * 64,
+                "graph_revision": "sha256:" + "5" * 64,
+                "node_environment_digest": "sha256:" + "2" * 64,
+                "preparation_digest": "sha256:" + "4" * 64,
+                "program": program,
+                "program_binding": binding,
+                "program_binding_id": binding["program_binding_id"],
+                "program_id": program["program_id"],
+                "program_revision": program["program_revision"],
+                "retained_bundle_id": "sha256:" + "4" * 64,
+                "scenario_catalog_revision": body[
+                    "scenario_catalog_revision"
+                ],
+                "scenario_id": body["scenario_id"],
+                "schema_version": "manyforge.applied_program_selection.v1",
+                "source": {
+                    "record_digest": "sha256:" + "6" * 64,
+                    "semantic_content_digest": "sha256:" + "7" * 64,
+                    "source_generation": 1,
+                    "source_owner_epoch": "program-owner.epoch.1",
+                    "source_owner_id": "program-owner.cell-a",
+                },
+                "typed_parameter_overrides": {},
+            }
+            applied_program = (
+                previous_applied_program
+                if (
+                    body["scenario_id"] == "revert-raced"
+                    and body["expected_applied_record_digest"] is not None
+                )
+                else committed_program
+            )
             payload = {
                 "schema_version": "manyforge.program_apply_result.v1",
                 "status": "applied",
                 "deployment_apply_required": False,
                 "preparation": {},
                 "manager_response": None,
-                "applied": applied_program,
+                "applied": committed_program,
             }
         elif path == "/api/assistant/modes":
             payload = {
@@ -1098,6 +1187,83 @@ def test_composer_program_apply_advances_only_headless_applied_identity(
     assert forwarded[0]["body"]["expected_applied_record_digest"] is None
 
 
+def test_new_program_rotates_fenced_draft_without_disk_or_headless_mutation(
+    headless_client,
+) -> None:
+    client, requests, _node_environment = headless_client
+    disk_before = _PROGRAM_PATH.read_bytes()
+    with _composer_with_program(client) as composer:
+        before = composer.get("/api/program/workspace").json()
+        request_offset = len(requests)
+        created = composer.post(
+            "/api/program/new-draft",
+            json={
+                "draftId": before["draft"]["draftId"],
+                "expectedDraftRevision": before["draft"]["draftRevision"],
+                "confirmDiscard": False,
+            },
+        )
+        replay = composer.post(
+            "/api/program/new-draft",
+            json={
+                "draftId": before["draft"]["draftId"],
+                "expectedDraftRevision": before["draft"]["draftRevision"],
+                "confirmDiscard": True,
+            },
+        )
+
+    assert created.status_code == 200, created.text
+    workspace = created.json()
+    assert workspace["draft"]["draftId"] != before["draft"]["draftId"]
+    assert workspace["draft"]["draftRevision"] == 1
+    assert workspace["draft"]["program"]["name"] == "Untitled Program"
+    assert workspace["draft"]["program"]["tree"]["node_id"] == "logic.check_bool"
+    assert workspace["saved"]["available"] is False
+    assert workspace["saved"]["path"] is None
+    assert replay.status_code == 409
+    assert replay.json()["detail"]["code"] == "composer_draft_id_stale"
+    assert _PROGRAM_PATH.read_bytes() == disk_before
+    assert all(
+        request["method"] == "GET" for request in requests[request_offset:]
+    )
+
+
+def test_new_program_dirty_confirmation_precedes_owner_and_catalog_reads(
+    headless_client,
+) -> None:
+    client, requests, _node_environment = headless_client
+    with _composer_with_program(client) as composer:
+        before = composer.get("/api/program/workspace").json()
+        dirty = composer.post(
+            "/api/program/draft/mutations",
+            json={
+                "draftId": before["draft"]["draftId"],
+                "expectedDraftRevision": before["draft"]["draftRevision"],
+                "mutation": "tree_draft_update_node_params",
+                "arguments": {
+                    "instance_id": "move_to_pick",
+                    "expected_node_id": "motion.move_to_joint_target",
+                    "parameters": {"planning_timeout_s": 3.0},
+                },
+            },
+        ).json()["workspace"]
+        request_offset = len(requests)
+        rejected = composer.post(
+            "/api/program/new-draft",
+            json={
+                "draftId": dirty["draft"]["draftId"],
+                "expectedDraftRevision": dirty["draft"]["draftRevision"],
+                "confirmDiscard": False,
+            },
+        )
+
+    assert rejected.status_code == 409
+    assert rejected.json()["detail"]["code"] == (
+        "composer_draft_discard_confirmation_required"
+    )
+    assert requests[request_offset:] == []
+
+
 def test_normative_load_publishes_draft_and_saved_only_after_apply(
     headless_client,
 ) -> None:
@@ -1151,6 +1317,312 @@ def test_pending_normative_load_preserves_the_prior_workspace(
     assert pending.json()["status"] == "pending_deployment"
     assert pending.json()["workspace"] == before
     assert after == before
+
+
+def test_program_discard_reads_owner_truth_without_runtime_mutation(
+    headless_client,
+) -> None:
+    client, requests, _node_environment = headless_client
+    with _composer_with_program(client) as composer:
+        initial = composer.get("/api/program/workspace").json()
+        applied = composer.post(
+            "/api/program/apply",
+            json={
+                "draftId": initial["draft"]["draftId"],
+                "expectedDraftRevision": initial["draft"]["draftRevision"],
+                "scenarioId": "cell-pick",
+                "scenarioCatalogRevision": "sha256:" + "7" * 64,
+            },
+        ).json()["workspace"]
+        dirty = composer.post(
+            "/api/program/draft/mutations",
+            json={
+                "draftId": applied["draft"]["draftId"],
+                "expectedDraftRevision": applied["draft"]["draftRevision"],
+                "mutation": "tree_draft_update_node_params",
+                "arguments": {
+                    "instance_id": "move_to_pick",
+                    "expected_node_id": "motion.move_to_joint_target",
+                    "parameters": {"planning_timeout_s": 3.0},
+                },
+            },
+        ).json()["workspace"]
+        request_offset = len(requests)
+        discarded = composer.post(
+            "/api/program/discard",
+            json={
+                "draftId": dirty["draft"]["draftId"],
+                "expectedDraftRevision": dirty["draft"]["draftRevision"],
+            },
+        )
+        no_op = composer.post(
+            "/api/program/discard",
+            json={
+                "draftId": discarded.json()["draft"]["draftId"],
+                "expectedDraftRevision": discarded.json()["draft"][
+                    "draftRevision"
+                ],
+            },
+        )
+
+        assert discarded.status_code == 200, discarded.text
+        assert discarded.json()["saved"] == {
+            **dirty["saved"],
+            "matchesDraft": True,
+        }
+    assert discarded.json()["draft"]["program"] == initial["draft"]["program"]
+    assert no_op.json()["draft"]["draftRevision"] == discarded.json()["draft"][
+        "draftRevision"
+    ]
+    action_requests = requests[request_offset:]
+    assert all(request["method"] == "GET" for request in action_requests)
+    assert {
+        request["path"] for request in action_requests
+    } == {"/api/program/applied", "/api/node-environment"}
+
+
+def test_program_discard_without_applied_selection_is_typed_and_atomic(
+    headless_client,
+) -> None:
+    client, requests, _node_environment = headless_client
+    with _composer_with_program(client) as composer:
+        before = composer.get("/api/program/workspace").json()
+        request_offset = len(requests)
+        response = composer.post(
+            "/api/program/discard",
+            json={
+                "draftId": before["draft"]["draftId"],
+                "expectedDraftRevision": before["draft"]["draftRevision"],
+            },
+        )
+        after = composer.get("/api/program/workspace").json()
+
+    assert response.status_code == 404
+    assert response.json()["detail"]["code"] == (
+        "program_applied_selection_not_found"
+    )
+    assert after["draft"] == before["draft"]
+    assert after["saved"] == before["saved"]
+    assert [
+        request["method"]
+        for request in requests[request_offset:]
+        if request["path"] == "/api/program/applied"
+    ] == ["GET", "GET"]
+
+
+def test_program_revert_without_applied_selection_has_no_effect(
+    headless_client,
+) -> None:
+    client, requests, _node_environment = headless_client
+    with _composer_with_program(client) as composer:
+        before = composer.get("/api/program/workspace").json()
+        request_offset = len(requests)
+        response = composer.post(
+            "/api/program/revert",
+            json={
+                "draftId": before["draft"]["draftId"],
+                "expectedDraftRevision": before["draft"]["draftRevision"],
+            },
+        )
+        after = composer.get("/api/program/workspace").json()
+
+    assert response.status_code == 404
+    assert response.json()["detail"]["code"] == (
+        "program_applied_selection_not_found"
+    )
+    assert after["draft"] == before["draft"]
+    assert after["saved"] == before["saved"]
+    assert not any(
+        request["path"] == "/api/program/apply"
+        for request in requests[request_offset:]
+    )
+
+
+@pytest.mark.parametrize(
+    ("scenario_id", "expected_status", "expected_code"),
+    [
+        ("revert-pending", 202, None),
+        ("revert-rejected", 409, "program_apply_compare_and_swap_failed"),
+        ("revert-malformed", 502, "program_apply_response_invalid"),
+        ("revert-raced", 409, "program_apply_selection_stale"),
+    ],
+)
+def test_program_revert_failure_preserves_draft_saved_and_active_run(
+    headless_client,
+    scenario_id: str,
+    expected_status: int,
+    expected_code: str | None,
+) -> None:
+    client, requests, _node_environment = headless_client
+    disk_before = _PROGRAM_PATH.read_bytes()
+    with _composer_with_program(client) as composer:
+        before = composer.get("/api/program/workspace").json()
+        dirty = composer.post(
+            "/api/program/draft/mutations",
+            json={
+                "draftId": before["draft"]["draftId"],
+                "expectedDraftRevision": before["draft"]["draftRevision"],
+                "mutation": "tree_draft_update_node_params",
+                "arguments": {
+                    "instance_id": "move_to_pick",
+                    "expected_node_id": "motion.move_to_joint_target",
+                    "parameters": {"planning_timeout_s": 3.0},
+                },
+            },
+        ).json()["workspace"]
+        dirty = composer.post(
+            "/api/program/apply",
+            json={
+                "draftId": dirty["draft"]["draftId"],
+                "expectedDraftRevision": dirty["draft"]["draftRevision"],
+                "scenarioId": scenario_id,
+                "scenarioCatalogRevision": "sha256:" + "7" * 64,
+            },
+        ).json()["workspace"]
+        assert dirty["applied"]["programRevision"] != dirty["saved"][
+            "programRevision"
+        ]
+        forbidden_offset = len(requests)
+        caller_selected = composer.post(
+            "/api/program/revert",
+            json={
+                "draftId": dirty["draft"]["draftId"],
+                "expectedDraftRevision": dirty["draft"]["draftRevision"],
+                "scenarioId": "foreign",
+                "scenarioCatalogRevision": "sha256:" + "f" * 64,
+            },
+        )
+        assert caller_selected.status_code == 422
+        assert requests[forbidden_offset:] == []
+        capture_before = composer.get("/api/program/runs/program-run.1").json()[
+            "capture"
+        ]
+        stale_offset = len(requests)
+        stale = composer.post(
+            "/api/program/revert",
+            json={
+                "draftId": dirty["draft"]["draftId"],
+                "expectedDraftRevision": dirty["draft"]["draftRevision"] - 1,
+            },
+        )
+        assert stale.status_code == 409
+        assert requests[stale_offset:] == []
+        request_offset = len(requests)
+        response = composer.post(
+            "/api/program/revert",
+            json={
+                "draftId": dirty["draft"]["draftId"],
+                "expectedDraftRevision": dirty["draft"]["draftRevision"],
+            },
+        )
+        after = composer.get("/api/program/workspace").json()
+        capture_after = composer.get("/api/program/runs/program-run.1").json()[
+            "capture"
+        ]
+
+    assert response.status_code == expected_status
+    if expected_code is None:
+        assert response.json()["status"] == "pending_deployment"
+    else:
+        assert response.json()["detail"]["code"] == expected_code
+    assert after["draft"] == dirty["draft"]
+    assert after["saved"] == dirty["saved"]
+    assert _PROGRAM_PATH.read_bytes() == disk_before
+    assert capture_after == capture_before
+    apply_requests = [
+        request
+        for request in requests[request_offset:]
+        if request["path"] == "/api/program/apply"
+    ]
+    assert len(apply_requests) == 1
+    assert apply_requests[0]["body"]["program"] == before["draft"]["program"]
+    assert apply_requests[0]["body"]["scenario_id"] == scenario_id
+    assert apply_requests[0]["body"]["scenario_catalog_revision"] == (
+        "sha256:" + "7" * 64
+    )
+    assert apply_requests[0]["body"]["expected_applied_record_digest"] == (
+        "sha256:" + "6" * 64
+    )
+
+
+def test_program_revert_applies_exact_saved_content_and_preserves_run_capture(
+    headless_client,
+) -> None:
+    client, requests, _node_environment = headless_client
+    with _composer_with_program(client) as composer:
+        saved = composer.get("/api/program/workspace").json()
+        dirty = composer.post(
+            "/api/program/draft/mutations",
+            json={
+                "draftId": saved["draft"]["draftId"],
+                "expectedDraftRevision": saved["draft"]["draftRevision"],
+                "mutation": "tree_draft_update_node_params",
+                "arguments": {
+                    "instance_id": "move_to_pick",
+                    "expected_node_id": "motion.move_to_joint_target",
+                    "parameters": {"planning_timeout_s": 3.0},
+                },
+            },
+        ).json()["workspace"]
+        dirty = composer.post(
+            "/api/program/apply",
+            json={
+                "draftId": dirty["draft"]["draftId"],
+                "expectedDraftRevision": dirty["draft"]["draftRevision"],
+                "scenarioId": "cell-pick",
+                "scenarioCatalogRevision": "sha256:" + "7" * 64,
+            },
+        ).json()["workspace"]
+        assert dirty["applied"]["programRevision"] != dirty["saved"][
+            "programRevision"
+        ]
+        capture_before = composer.get("/api/program/runs/program-run.1").json()[
+            "capture"
+        ]
+        request_offset = len(requests)
+        reverted = composer.post(
+            "/api/program/revert",
+            json={
+                "draftId": dirty["draft"]["draftId"],
+                "expectedDraftRevision": dirty["draft"]["draftRevision"],
+            },
+        )
+        no_op_offset = len(requests)
+        no_op = composer.post(
+            "/api/program/revert",
+            json={
+                "draftId": reverted.json()["workspace"]["draft"]["draftId"],
+                "expectedDraftRevision": reverted.json()["workspace"]["draft"][
+                    "draftRevision"
+                ],
+            },
+        )
+        capture_after = composer.get("/api/program/runs/program-run.1").json()[
+            "capture"
+        ]
+
+    assert reverted.status_code == 200, reverted.text
+    assert reverted.json()["status"] == "reverted"
+    assert reverted.json()["workspace"]["draft"]["program"] == saved["draft"]["program"]
+    assert reverted.json()["workspace"]["saved"] == saved["saved"]
+    assert no_op.status_code == 200
+    assert no_op.json()["status"] == "reverted"
+    assert no_op.json()["headless"] is None
+    assert no_op.json()["workspace"]["draft"]["draftRevision"] == (
+        reverted.json()["workspace"]["draft"]["draftRevision"]
+    )
+    assert capture_after == capture_before
+    apply_requests = [
+        request
+        for request in requests[request_offset:]
+        if request["path"] == "/api/program/apply"
+    ]
+    assert len(apply_requests) == 1
+    assert apply_requests[0]["body"]["program"] == saved["draft"]["program"]
+    assert not any(
+        request["path"] == "/api/program/apply"
+        for request in requests[no_op_offset:]
+    )
 
 
 def test_composer_preserves_complete_scene_rejection(

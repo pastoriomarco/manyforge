@@ -89,10 +89,13 @@ export function ProgramWorkspace({
     state,
     refresh,
     mutate,
+    newDraft,
     openDraft,
     save,
     saveAs,
     apply: applyDraft,
+    discard,
+    revert,
     load: loadProgram,
     clearFeedback,
   } = controller;
@@ -203,7 +206,7 @@ export function ProgramWorkspace({
           </div>
 
           <details className="program-actions-disclosure">
-            <summary>Program actions · Open · Save As · Apply · Load</summary>
+            <summary>Program actions · New · Open · Save As · Apply · Revert · Discard · Load</summary>
             <div className="program-actions-popover">
               <div className="program-artifact-actions program-apply-actions">
                 <label className="program-save-as-path">
@@ -242,7 +245,43 @@ export function ProgramWorkspace({
                     );
                   }}
                 >
-                  Apply Draft
+                  {state.status === 'ready' && state.pendingAction === 'apply'
+                    ? 'Applying…'
+                    : 'Apply Draft'}
+                </button>
+                <button
+                  type="button"
+                  disabled={busy || (replaceNeedsConfirmation && !confirmDiscard)}
+                  onClick={() => {
+                    newDraft(confirmDiscard);
+                    setConfirmDiscard(false);
+                  }}
+                >
+                  {state.status === 'ready' && state.pendingAction === 'new'
+                    ? 'Creating…'
+                    : 'New Program'}
+                </button>
+                <button
+                  type="button"
+                  disabled={
+                    busy
+                    || !workspace.saved.available
+                    || !workspace.applied.available
+                  }
+                  onClick={revert}
+                >
+                  {state.status === 'ready' && state.pendingAction === 'revert'
+                    ? 'Reverting…'
+                    : 'Revert to Saved'}
+                </button>
+                <button
+                  type="button"
+                  disabled={busy || !workspace.applied.available}
+                  onClick={discard}
+                >
+                  {state.status === 'ready' && state.pendingAction === 'discard'
+                    ? 'Discarding…'
+                    : 'Discard to Applied'}
                 </button>
                 <button
                   type="button"
@@ -267,7 +306,9 @@ export function ProgramWorkspace({
                 </button>
                 <small>
                   Apply changes runtime only. Load validates and applies the selected
-                  artifact before replacing Draft and Saved.
+                  artifact before replacing Draft and Saved. New creates an unsaved
+                  Draft without a runtime effect. Revert uses the current Applied
+                  selection; Discard reads Applied and changes Draft only.
                 </small>
               </div>
 

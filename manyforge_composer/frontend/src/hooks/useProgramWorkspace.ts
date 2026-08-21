@@ -7,7 +7,12 @@ import {
   programWorkspaceReducer,
   type ProgramWorkspaceActionName,
 } from '../state/programWorkspace';
-import type { JsonValue, ProgramWorkspaceResponse } from '../types/api';
+import type {
+  JsonValue,
+  ProgramWorkspaceResponse,
+  ProgramWorkspaceTransitionResponse,
+  ProgramWorkspaceTransitionStatus,
+} from '../types/api';
 
 function fence(workspace: ProgramWorkspaceResponse) {
   return {
@@ -15,6 +20,58 @@ function fence(workspace: ProgramWorkspaceResponse) {
     expectedDraftRevision: workspace.draft.draftRevision,
   };
 }
+
+interface ProgramWorkspaceRunResult {
+  workspace: ProgramWorkspaceResponse;
+  message: string | null;
+  transitionStatus: ProgramWorkspaceTransitionStatus | null;
+}
+
+function workspaceResult(
+  workspace: ProgramWorkspaceResponse,
+  message: string | null,
+): ProgramWorkspaceRunResult {
+  return { workspace, message, transitionStatus: null };
+}
+
+export function programWorkspaceTransitionResult(
+  action: 'apply' | 'load' | 'revert',
+  response: ProgramWorkspaceTransitionResponse,
+): ProgramWorkspaceRunResult {
+  if (response.status === 'pending_deployment') {
+    const message = action === 'revert'
+      ? 'Revert is pending deployment; Draft and Saved were not replaced.'
+      : action === 'load'
+        ? 'Load is pending deployment; Draft, Saved, and Applied were not replaced.'
+        : 'Apply is pending deployment; Applied was not replaced.';
+    return { workspace: response.workspace, message, transitionStatus: response.status };
+  }
+  if (action === 'revert' && response.status === 'reverted') {
+    return {
+      workspace: response.workspace,
+      message: response.headless === null
+        ? 'Saved already matched Applied; Draft now matches Saved. No owner Apply was issued.'
+        : 'Revert completed through authoritative Apply; Draft now matches Saved.',
+      transitionStatus: response.status,
+    };
+  }
+  if (action === 'load' && response.status === 'loaded') {
+    return {
+      workspace: response.workspace,
+      message: 'Load completed; Draft, Saved, and Applied now match the loaded Program.',
+      transitionStatus: response.status,
+    };
+  }
+  if (action === 'apply' && response.status === 'applied') {
+    return {
+      workspace: response.workspace,
+      message: 'Apply completed; the owner-issued Applied state was replaced.',
+      transitionStatus: response.status,
+    };
+  }
+  throw new Error(`Unexpected ${response.status} status for ${action}.`);
+}
+
 export function useProgramWorkspace() {
   const [state, dispatch] = useReducer(
     programWorkspaceReducer,
@@ -25,20 +82,20 @@ export function useProgramWorkspace() {
 
   const run = useCallback(async (
     action: ProgramWorkspaceActionName,
-    request: () => Promise<ProgramWorkspaceResponse>,
-    successMessage: string | null,
+    request: () => Promise<ProgramWorkspaceRunResult>,
   ) => {
     const current = generation.current + 1;
     generation.current = current;
     dispatch({ type: 'request_started', generation: current, action });
     try {
-      const workspace = await request();
+      const result = await request();
       if (mounted.current) {
         dispatch({
           type: 'request_succeeded',
           generation: current,
-          workspace,
-          message: successMessage,
+          workspace: result.workspace,
+          message: result.message,
+          transitionStatus: result.transitionStatus,
         });
       }
     } catch (error: unknown) {
@@ -54,8 +111,8 @@ export function useProgramWorkspace() {
 
   const refresh = useCallback(() => run(
     'refresh',
-    () => api.programWorkspace.get(),
-    null,
+    () => api.programWorkspace.get().then((workspace) =>
+      workspaceResult(workspace, null)),
   ), [run]);
 
   useEffect(() => {
@@ -78,8 +135,7 @@ export function useProgramWorkspace() {
     void run(
       'mutate',
       () => api.programWorkspace.mutate(fence(workspace), mutation, args)
-        .then((response) => response.workspace),
-      'Draft updated.',
+        .then((response) => workspaceResult(response.workspace, 'Draft updated.')),
     );
   }, [requireWorkspace, run]);
 
@@ -92,8 +148,25 @@ export function useProgramWorkspace() {
         fence(workspace),
         path,
         confirmDiscard,
-      ),
-      'Program opened as Draft; runtime Applied state was not changed.',
+      ).then((next) => workspaceResult(
+        next,
+        'Program opened as Draft; runtime Applied state was not changed.',
+      )),
+    );
+  }, [requireWorkspace, run]);
+
+  const newDraft = useCallback((confirmDiscard: boolean) => {
+    const workspace = requireWorkspace();
+    if (!workspace) return;
+    void run(
+      'new',
+      () => api.programWorkspace.newDraft(
+        fence(workspace),
+        confirmDiscard,
+      ).then((next) => workspaceResult(
+        next,
+        'New unsaved Program Draft created; Saved, disk, and runtime were not changed.',
+      )),
     );
   }, [requireWorkspace, run]);
 
@@ -102,8 +175,11 @@ export function useProgramWorkspace() {
     if (!workspace) return;
     void run(
       'save',
-      () => api.programWorkspace.save(fence(workspace)),
-      'Draft saved; runtime Applied state was not changed.',
+      () => api.programWorkspace.save(fence(workspace)).then((next) =>
+        workspaceResult(
+          next,
+          'Draft saved; runtime Applied state was not changed.',
+        )),
     );
   }, [requireWorkspace, run]);
 
@@ -116,8 +192,10 @@ export function useProgramWorkspace() {
         fence(workspace),
         path,
         confirmOverwrite,
-      ),
-      'Draft saved to the selected path; runtime Applied state was not changed.',
+      ).then((next) => workspaceResult(
+        next,
+        'Draft saved to the selected path; runtime Applied state was not changed.',
+      )),
     );
   }, [requireWorkspace, run]);
 
@@ -133,8 +211,30 @@ export function useProgramWorkspace() {
         fence(workspace),
         scenarioId,
         scenarioCatalogRevision,
-      ).then((response) => response.workspace),
-      'Apply request accepted; the owner-issued Applied state is shown above.',
+      ).then((response) => programWorkspaceTransitionResult('apply', response)),
+    );
+  }, [requireWorkspace, run]);
+
+  const discard = useCallback(() => {
+    const workspace = requireWorkspace();
+    if (!workspace) return;
+    void run(
+      'discard',
+      () => api.programWorkspace.discard(fence(workspace)).then((next) =>
+        workspaceResult(
+          next,
+          'Draft discarded to the owner-issued Applied Program; Saved was unchanged.',
+        )),
+    );
+  }, [requireWorkspace, run]);
+
+  const revert = useCallback(() => {
+    const workspace = requireWorkspace();
+    if (!workspace) return;
+    void run(
+      'revert',
+      () => api.programWorkspace.revert(fence(workspace))
+        .then((response) => programWorkspaceTransitionResult('revert', response)),
     );
   }, [requireWorkspace, run]);
 
@@ -154,8 +254,7 @@ export function useProgramWorkspace() {
         scenarioId,
         scenarioCatalogRevision,
         confirmDiscard,
-      ).then((response) => response.workspace),
-      'Load request accepted; Draft, Saved, and Applied state are shown above.',
+      ).then((response) => programWorkspaceTransitionResult('load', response)),
     );
   }, [requireWorkspace, run]);
 
@@ -163,10 +262,13 @@ export function useProgramWorkspace() {
     state,
     refresh,
     mutate,
+    newDraft,
     openDraft,
     save,
     saveAs,
     apply,
+    discard,
+    revert,
     load,
     clearFeedback: () => dispatch({ type: 'clear_feedback' }),
   };

@@ -3,7 +3,7 @@
   Regenerate with:
     cd <repository-root>
     python3 scripts/regen-public-contracts.py structural-rest
-  Last regenerated: 2026-08-14 03:00:51 UTC
+  Last regenerated: 2026-08-21 09:58:22 UTC
   Generator source: scripts/regen-public-contracts.py:gen_rest_api
 -->
 
@@ -67,10 +67,13 @@ OpenAPI version: `3.1.0`. Title: `ManyForge Composer (replaceable client)`.
 | `GET` | `/api/nodes/environment` | node-environment | Get Node Environment |
 | `GET` | `/api/program/applied` | headless-runtime-client | Program Applied |
 | `POST` | `/api/program/apply` | composer-draft | Apply Draft |
+| `POST` | `/api/program/discard` | composer-draft | Discard Draft |
 | `GET` | `/api/program/draft` | composer-draft | Read Draft |
 | `POST` | `/api/program/draft/mutations` | composer-draft | Mutate Draft |
 | `POST` | `/api/program/load` | composer-draft | Load Program |
+| `POST` | `/api/program/new-draft` | composer-draft | New Draft |
 | `POST` | `/api/program/open-draft` | composer-draft | Open Draft |
+| `POST` | `/api/program/revert` | composer-draft | Revert Draft |
 | `GET` | `/api/program/runs` | headless-runtime-client | Program Runs |
 | `POST` | `/api/program/runs` | headless-runtime-client | Program Run Start |
 | `GET` | `/api/program/runs/{program_run_id}` | headless-runtime-client | Program Run Read |
@@ -81,6 +84,13 @@ OpenAPI version: `3.1.0`. Title: `ManyForge Composer (replaceable client)`.
 | `GET` | `/api/runtime` | headless-runtime-client | Runtime |
 | `GET` | `/api/scenarios` | headless-runtime-client | Scenarios |
 | `GET` | `/api/scene` | headless-runtime-client | Scene |
+| `GET` | `/api/scene/object-meshes/resolve` | headless-scene-mesh-client | Resolve Scene Object Mesh |
+| `GET` | `/api/scene/object-meshes/{asset_hash}.glb` | headless-scene-mesh-client | Get Scene Object Mesh |
+| `POST` | `/api/scene/pointcloud/observations` | headless-pointcloud-observer-client | Publish Pointcloud |
+| `GET` | `/api/scene/pointcloud/status` | headless-pointcloud-observer-client | Pointcloud Status |
+| `GET` | `/api/scene/snapshot/render` | headless-viewer-snapshot-client | Render Snapshot |
+| `GET` | `/api/scene/snapshot/status` | headless-viewer-snapshot-client | Snapshot Status |
+| `POST` | `/api/scene/snapshot/upload/{request_id}` | headless-viewer-snapshot-client | Upload Snapshot |
 | `POST` | `/api/scene/transactions` | headless-runtime-client | Scene Commit |
 | `GET` | `/api/scene/urdf/manifest` | structural-urdf | Get Manifest |
 | `GET` | `/api/scene/urdf/models/{model_key}/collision-meshes/{link_name}/{collision_index}` | structural-urdf | Get Model Collision Mesh |

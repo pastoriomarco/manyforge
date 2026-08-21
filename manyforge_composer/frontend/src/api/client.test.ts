@@ -290,6 +290,38 @@ describe('structural API client', () => {
       '/api/program/runs?active_only=true&limit=1',
     );
   });
+
+  it('submits exact fenced New, Discard, and Revert requests', async () => {
+    const fetchMock = vi.fn()
+      .mockResolvedValueOnce(response(workspaceFixture()))
+      .mockResolvedValueOnce(response(workspaceFixture()))
+      .mockResolvedValueOnce(response({
+        status: 'reverted',
+        headless: null,
+        workspace: workspaceFixture(),
+      }));
+    vi.stubGlobal('fetch', fetchMock);
+    const currentFence = { draftId: 'draft-1', expectedDraftRevision: 7 };
+
+    await api.programWorkspace.newDraft(currentFence, true);
+    await api.programWorkspace.discard(currentFence);
+    await api.programWorkspace.revert(currentFence);
+
+    expect(fetchMock.mock.calls.map(([url]) => url)).toEqual([
+      '/api/program/new-draft',
+      '/api/program/discard',
+      '/api/program/revert',
+    ]);
+    expect(JSON.parse(String(
+      (fetchMock.mock.calls[0]?.[1] as RequestInit).body,
+    ))).toEqual({ ...currentFence, confirmDiscard: true });
+    expect(JSON.parse(String(
+      (fetchMock.mock.calls[1]?.[1] as RequestInit).body,
+    ))).toEqual(currentFence);
+    expect(JSON.parse(String(
+      (fetchMock.mock.calls[2]?.[1] as RequestInit).body,
+    ))).toEqual(currentFence);
+  });
 });
 
 describe('resolveStructuralAssetUrl', () => {

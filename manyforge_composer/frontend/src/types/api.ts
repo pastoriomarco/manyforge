@@ -299,6 +299,27 @@ export interface AppliedProgramSelection {
   sourceOwnerId: string;
   sourceOwnerEpoch: string;
   sourceGeneration: number;
+  program: ProgramDocument;
+  programBinding: ProgramBindingDocument;
+}
+
+export interface ProgramBindingDocument {
+  api_version: 'manyforge.program_binding.v1';
+  program_binding_id: string;
+  program_id: string;
+  program_revision: string;
+  retained_bundle_id: string;
+  graph_revision: string;
+  node_environment: {
+    catalog_id: string;
+    content_version: string;
+    catalog_digest: string;
+    environment_digest: string;
+  };
+  component_role_bindings: Record<string, JsonValue>[];
+  target_role_bindings: Record<string, JsonValue>[];
+  contact_grasp_bindings: Record<string, JsonValue>[];
+  provenance: Record<string, JsonValue>;
 }
 
 export type ProgramRunStateName =
@@ -351,8 +372,15 @@ export interface ProgramRunIndex {
   runs: ProgramRunStatus[];
 }
 
+export type ProgramWorkspaceTransitionStatus =
+  | 'applied'
+  | 'loaded'
+  | 'reverted'
+  | 'pending_deployment';
+
 export interface ProgramWorkspaceTransitionResponse {
-  status: 'applied' | 'loaded' | 'pending_deployment';
+  status: ProgramWorkspaceTransitionStatus;
+  headless: Record<string, JsonValue> | null;
   workspace: ProgramWorkspaceResponse;
 }
 

@@ -1,10 +1,16 @@
-import type { ProgramWorkspaceResponse } from '../types/api';
+import type {
+  ProgramWorkspaceResponse,
+  ProgramWorkspaceTransitionStatus,
+} from '../types/api';
 
 export type ProgramWorkspaceActionName =
   | 'refresh'
+  | 'new'
   | 'mutate'
   | 'open_draft'
   | 'apply'
+  | 'discard'
+  | 'revert'
   | 'load'
   | 'save'
   | 'save_as';
@@ -16,6 +22,7 @@ export type ProgramWorkspaceState =
       pendingAction: ProgramWorkspaceActionName;
       workspace: null;
       message: null;
+      transitionStatus: null;
       error: null;
     }
   | {
@@ -24,6 +31,7 @@ export type ProgramWorkspaceState =
       pendingAction: ProgramWorkspaceActionName | null;
       workspace: ProgramWorkspaceResponse;
       message: string | null;
+      transitionStatus: ProgramWorkspaceTransitionStatus | null;
       error: string | null;
     }
   | {
@@ -32,6 +40,7 @@ export type ProgramWorkspaceState =
       pendingAction: null;
       workspace: ProgramWorkspaceResponse | null;
       message: null;
+      transitionStatus: null;
       error: string;
     };
 
@@ -46,6 +55,7 @@ export type ProgramWorkspaceStateAction =
       generation: number;
       workspace: ProgramWorkspaceResponse;
       message: string | null;
+      transitionStatus: ProgramWorkspaceTransitionStatus | null;
     }
   | {
       type: 'request_failed';
@@ -60,6 +70,7 @@ export const INITIAL_PROGRAM_WORKSPACE_STATE: ProgramWorkspaceState = {
   pendingAction: 'refresh',
   workspace: null,
   message: null,
+  transitionStatus: null,
   error: null,
 };
 
@@ -74,6 +85,7 @@ export function programWorkspaceReducer(
       pendingAction: action.action,
       workspace: state.workspace,
       message: null,
+      transitionStatus: null,
       error: null,
     } as ProgramWorkspaceState;
   }
@@ -86,6 +98,7 @@ export function programWorkspaceReducer(
         pendingAction: null,
         workspace: state.workspace,
         message: null,
+        transitionStatus: null,
         error: null,
       };
     }
@@ -99,6 +112,7 @@ export function programWorkspaceReducer(
       pendingAction: null,
       workspace: action.workspace,
       message: action.message,
+      transitionStatus: action.transitionStatus,
       error: null,
     };
   }
@@ -108,6 +122,7 @@ export function programWorkspaceReducer(
     pendingAction: null,
     workspace: state.workspace,
     message: null,
+    transitionStatus: null,
     error: action.error,
   };
 }

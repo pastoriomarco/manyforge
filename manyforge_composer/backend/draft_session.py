@@ -389,6 +389,9 @@ class ComposerDraftSession:
         self._saved_program_revision = (
             program.program_revision if resolved_source is not None else None
         )
+        self._saved_document = (
+            program.to_dict() if resolved_source is not None else None
+        )
 
     @property
     def draft_id(self) -> str:
@@ -613,6 +616,7 @@ class ComposerDraftSession:
             self._revision = 1
             self._saved_path = str(Path(source_path).resolve())
             self._saved_program_revision = program.program_revision
+            self._saved_document = program.to_dict()
             return self._workspace_snapshot_locked()
 
     def apply_current_program(
@@ -677,6 +681,7 @@ class ComposerDraftSession:
             self._revision = 1
             self._saved_path = str(Path(source_path).resolve())
             self._saved_program_revision = program.program_revision
+            self._saved_document = program.to_dict()
             return result, self._workspace_snapshot_locked(
                 applied_program_revision=program.program_revision,
             )
@@ -711,7 +716,187 @@ class ComposerDraftSession:
             saved_path = writer(self._program, selected_path)
             self._saved_path = str(Path(saved_path).resolve())
             self._saved_program_revision = self._program.program_revision
+            self._saved_document = self._program.to_dict()
             return self._workspace_snapshot_locked()
+
+    def new_draft(
+        self,
+        *,
+        draft_id: str,
+        expected_revision: int,
+        confirm_discard: bool,
+        applied_revision_reader: Callable[[], str | None],
+        catalog_reader: Callable[[], NodeCatalog],
+    ) -> dict[str, Any]:
+        """Create one fresh, validated minimal Program under the old fence."""
+
+        with self._lock:
+            self._require_identity_locked(
+                draft_id=draft_id,
+                expected_revision=expected_revision,
+            )
+            if (
+                self._program is not None
+                and not self._matches_saved_locked()
+                and not confirm_discard
+            ):
+                _error(
+                    "composer_draft_discard_confirmation_required",
+                    "creating a new Program would discard unsaved Draft changes",
+                    status_code=409,
+                )
+            if (
+                self._program is not None
+                and not confirm_discard
+                and (applied_revision := applied_revision_reader()) is not None
+                and self._program.program_revision != applied_revision
+            ):
+                _error(
+                    "composer_draft_discard_confirmation_required",
+                    "creating a new Program would discard unapplied Draft changes",
+                    status_code=409,
+                )
+
+            catalog = catalog_reader()
+            document = _identified(
+                {
+                    "api_version": _PROGRAM_API_VERSION,
+                    "program_id": f"program-{uuid.uuid4().hex}",
+                    "program_revision": "sha256:" + ("0" * 64),
+                    "program_profile": "composable-cell-v1",
+                    "name": "Untitled Program",
+                    "catalog": {
+                        "api_version": catalog.api_version,
+                        "content_version": catalog.content_version,
+                    },
+                    "component_roles": {"component": {}},
+                    "target_roles": {},
+                    "tree": {
+                        "node_id": "logic.check_bool",
+                        "instance_id": "root",
+                        "parameters": {
+                            "actual_value": True,
+                            "expected_value": True,
+                        },
+                        "children": [],
+                    },
+                }
+            )
+            try:
+                program = Program.from_dict(
+                    document,
+                    catalog,
+                    path="<composer-new-program>",
+                )
+            except ProgramValidationError as error:
+                _error(
+                    "composer_new_program_validation_failed",
+                    str(error),
+                    status_code=503,
+                    detail=str(error),
+                )
+
+            self._draft_id = f"draft-{uuid.uuid4().hex}"
+            self._program = program
+            self._revision = 1
+            self._saved_path = None
+            self._saved_program_revision = None
+            self._saved_document = None
+            return self._workspace_snapshot_locked()
+
+    def discard_to_applied(
+        self,
+        *,
+        draft_id: str,
+        expected_revision: int,
+        reader: Callable[[], Program],
+    ) -> dict[str, Any]:
+        """Replace Draft from one action-local authoritative Applied read."""
+
+        with self._lock:
+            self._require_identity_locked(
+                draft_id=draft_id,
+                expected_revision=expected_revision,
+            )
+            applied = reader()
+            if (
+                self._program is not None
+                and self._program.to_dict() == applied.to_dict()
+            ):
+                return self._workspace_snapshot_locked(
+                    applied_program_revision=applied.program_revision,
+                )
+            if self._revision >= _MAXIMUM_DRAFT_REVISION:
+                _error(
+                    "composer_draft_revision_exhausted",
+                    "Composer Draft revision is exhausted",
+                    status_code=503,
+                )
+            self._program = applied
+            self._revision += 1
+            return self._workspace_snapshot_locked(
+                applied_program_revision=applied.program_revision,
+            )
+
+    def revert_saved_after_apply(
+        self,
+        *,
+        draft_id: str,
+        expected_revision: int,
+        prepare: Callable[[dict[str, Any]], tuple[Program, Program, Any]],
+        applier: Callable[[Program, Any], dict[str, Any]],
+    ) -> tuple[dict[str, Any] | None, dict[str, Any]]:
+        """Apply exact Saved content, then publish it locally only on success."""
+
+        with self._lock:
+            self._require_identity_locked(
+                draft_id=draft_id,
+                expected_revision=expected_revision,
+            )
+            if self._saved_document is None:
+                _error(
+                    "composer_saved_program_unavailable",
+                    "Composer has no retained Saved Program",
+                    status_code=404,
+                )
+            saved_document = deepcopy(self._saved_document)
+            validated_saved, applied, applied_context = prepare(saved_document)
+            draft_matches_saved = (
+                self._program is not None
+                and self._program.to_dict() == saved_document
+            )
+            applied_matches_saved = applied.to_dict() == saved_document
+            if applied_matches_saved:
+                if not draft_matches_saved:
+                    if self._revision >= _MAXIMUM_DRAFT_REVISION:
+                        _error(
+                            "composer_draft_revision_exhausted",
+                            "Composer Draft revision is exhausted",
+                            status_code=503,
+                        )
+                    self._program = validated_saved
+                    self._revision += 1
+                return None, self._workspace_snapshot_locked(
+                    applied_program_revision=validated_saved.program_revision,
+                )
+            if (
+                not draft_matches_saved
+                and self._revision >= _MAXIMUM_DRAFT_REVISION
+            ):
+                _error(
+                    "composer_draft_revision_exhausted",
+                    "Composer Draft revision is exhausted",
+                    status_code=503,
+                )
+            result = applier(validated_saved, applied_context)
+            if result.get("status") != "applied":
+                return result, self._workspace_snapshot_locked()
+            if not draft_matches_saved:
+                self._program = validated_saved
+                self._revision += 1
+            return result, self._workspace_snapshot_locked(
+                applied_program_revision=validated_saved.program_revision,
+            )
 
     def mutate(
         self,

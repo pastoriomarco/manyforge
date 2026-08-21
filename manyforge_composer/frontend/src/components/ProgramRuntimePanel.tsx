@@ -64,6 +64,15 @@ export function ProgramRuntimePanel({
                   : `${state.applied.scenarioId} · ${shortIdentity(state.applied.programRevision)}`
                 : 'Apply a validated Draft before Run.'}
             </small>
+            {state.applied && (
+              <a
+                href="/api/program/applied"
+                target="_blank"
+                rel="noreferrer"
+              >
+                Inspect exact Applied Program and Binding JSON
+              </a>
+            )}
           </div>
           <div className="program-runtime-fact">
             <span>Owner-issued run state</span>

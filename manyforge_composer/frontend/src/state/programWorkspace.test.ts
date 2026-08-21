@@ -54,6 +54,7 @@ describe('Program workspace request fencing', () => {
       generation: 1,
       workspace: workspace('old', 1),
       message: null,
+      transitionStatus: null,
     });
 
     expect(stale).toBe(second);
@@ -70,6 +71,7 @@ describe('Program workspace request fencing', () => {
       generation: 3,
       workspace: workspace('replacement', 1),
       message: 'Opened as Draft.',
+      transitionStatus: null,
     });
 
     expect(succeeded.status).toBe('ready');
@@ -98,5 +100,82 @@ describe('Program workspace request fencing', () => {
     expect(dismissed.status).toBe('ready');
     expect(dismissed.workspace?.draft.draftId).toBe('draft-1');
     expect(dismissed.error).toBeNull();
+  });
+
+  it('surfaces pending lifecycle truth and preserves the last owner workspace on failure', () => {
+    const current = workspace('draft-1', 7);
+    const started = programWorkspaceReducer({
+      ...INITIAL_PROGRAM_WORKSPACE_STATE,
+      status: 'ready',
+      pendingAction: null,
+      workspace: current,
+    }, {
+      type: 'request_started',
+      generation: 8,
+      action: 'revert',
+    });
+    expect(started.pendingAction).toBe('revert');
+    const failed = programWorkspaceReducer(started, {
+      type: 'request_failed',
+      generation: 8,
+      error: 'stale Draft fence',
+    });
+    expect(failed.workspace).toBe(current);
+    expect(failed.error).toBe('stale Draft fence');
+  });
+
+  it('tracks New as an independent latest-generation lifecycle action', () => {
+    const current = workspace('draft-before-new', 12);
+    const started = programWorkspaceReducer({
+      ...INITIAL_PROGRAM_WORKSPACE_STATE,
+      status: 'ready',
+      pendingAction: null,
+      workspace: current,
+    }, {
+      type: 'request_started',
+      generation: 10,
+      action: 'new',
+    });
+    const created = workspace('fresh-new-draft', 1);
+    const succeeded = programWorkspaceReducer(started, {
+      type: 'request_succeeded',
+      generation: 10,
+      workspace: created,
+      message: 'New unsaved Program Draft created.',
+      transitionStatus: null,
+    });
+
+    expect(started.pendingAction).toBe('new');
+    expect(succeeded.workspace).toBe(created);
+    expect(succeeded.pendingAction).toBeNull();
+  });
+
+  it('clears Revert pending action with the owner-returned pending workspace', () => {
+    const previous = workspace('draft-before-revert', 7);
+    const ownerPending = workspace('owner-pending-revert', 8);
+    const started = programWorkspaceReducer({
+      ...INITIAL_PROGRAM_WORKSPACE_STATE,
+      status: 'ready',
+      pendingAction: null,
+      workspace: previous,
+    }, {
+      type: 'request_started',
+      generation: 9,
+      action: 'revert',
+    });
+    const pending = programWorkspaceReducer(started, {
+      type: 'request_succeeded',
+      generation: 9,
+      workspace: ownerPending,
+      message: 'Revert is pending deployment; Draft and Saved were not replaced.',
+      transitionStatus: 'pending_deployment',
+    });
+
+    expect(pending.status).toBe('ready');
+    expect(pending.pendingAction).toBeNull();
+    expect(pending.workspace).toBe(ownerPending);
+    expect(pending.transitionStatus).toBe('pending_deployment');
+    expect(pending.message).toContain('were not replaced');
+    expect(pending.message).not.toContain('Draft now matches Saved');
   });
 });

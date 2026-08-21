@@ -8,6 +8,7 @@ from typing import Any, Sequence
 import pytest
 from fastapi.testclient import TestClient
 
+from manyforge_behavior.canonical_artifact import compute_content_identity
 from manyforge_behavior.node_environment import build_node_environment
 from manyforge_behavior.program import Program
 
@@ -33,10 +34,215 @@ def _program_document() -> dict[str, Any]:
     ).to_dict()
 
 
+def _program_binding(
+    program: dict[str, Any],
+    *,
+    retained_bundle_id: str = "sha256:" + "8" * 64,
+    graph_revision: str = "sha256:" + "9" * 64,
+) -> dict[str, Any]:
+    binding = {
+        "api_version": "manyforge.program_binding.v1",
+        "program_binding_id": "sha256:" + "0" * 64,
+        "program_id": program["program_id"],
+        "program_revision": program["program_revision"],
+        "retained_bundle_id": retained_bundle_id,
+        "graph_revision": graph_revision,
+        "node_environment": {
+            "catalog_id": "manyforge.default",
+            "content_version": "1.1.0",
+            "catalog_digest": "sha256:" + "1" * 64,
+            "environment_digest": "sha256:" + "2" * 64,
+        },
+        "component_role_bindings": [],
+        "target_role_bindings": [],
+        "contact_grasp_bindings": [],
+        "provenance": {
+            "binding_compiler_contract_digest": "sha256:" + "3" * 64,
+            "binding_compiler_build_digest": "sha256:" + "4" * 64,
+            "role_assignment_digest": "sha256:" + "5" * 64,
+            "source_records": [],
+            "resolved_output_records": [],
+        },
+    }
+    binding["program_binding_id"] = compute_content_identity(
+        binding,
+        own_field="program_binding_id",
+        identity_domain="program-binding-id",
+        api_version="manyforge.program_binding.v1",
+    )
+    return binding
+
+
+def _applied_projection(
+    program: dict[str, Any],
+    *,
+    scenario_id: str = "cell-pick",
+    scenario_catalog_revision: str = "sha256:" + "6" * 64,
+    record_digest: str = "sha256:" + "5" * 64,
+    retained_bundle_id: str = "sha256:" + "8" * 64,
+    graph_revision: str = "sha256:" + "9" * 64,
+) -> dict[str, Any]:
+    binding = _program_binding(
+        program,
+        retained_bundle_id=retained_bundle_id,
+        graph_revision=graph_revision,
+    )
+    return {
+        "assistant_mode": "forbidden",
+        "baseline_program_binding_id": "sha256:" + "3" * 64,
+        "deployment_artifact_id": "cell_a",
+        "deployment_revision": "sha256:" + "1" * 64,
+        "graph_revision": binding["graph_revision"],
+        "node_environment_digest": binding["node_environment"][
+            "environment_digest"
+        ],
+        "preparation_digest": "sha256:" + "4" * 64,
+        "program": copy.deepcopy(program),
+        "program_binding": binding,
+        "program_binding_id": binding["program_binding_id"],
+        "program_id": program["program_id"],
+        "program_revision": program["program_revision"],
+        "retained_bundle_id": binding["retained_bundle_id"],
+        "scenario_catalog_revision": scenario_catalog_revision,
+        "scenario_id": scenario_id,
+        "schema_version": "manyforge.applied_program_selection.v1",
+        "source": {
+            "record_digest": record_digest,
+            "semantic_content_digest": "sha256:" + "7" * 64,
+            "source_generation": 1,
+            "source_owner_epoch": "program-owner.epoch.1",
+            "source_owner_id": "program-owner.cell-a",
+        },
+        "typed_parameter_overrides": {},
+    }
+
+
+def _remove_program_tree_with_valid_identity(value: dict[str, Any]) -> None:
+    value["program"].pop("tree")
+    value["program"]["program_revision"] = compute_content_identity(
+        value["program"],
+        own_field="program_revision",
+        identity_domain="program-revision",
+        api_version="manyforge.program.v1",
+    )
+    value["program_revision"] = value["program"]["program_revision"]
+    value["program_binding"]["program_revision"] = value["program_revision"]
+    value["program_binding"]["program_binding_id"] = compute_content_identity(
+        value["program_binding"],
+        own_field="program_binding_id",
+        identity_domain="program-binding-id",
+        api_version="manyforge.program_binding.v1",
+    )
+    value["program_binding_id"] = value["program_binding"]["program_binding_id"]
+
+
 def test_closed_core_invalid_request_maps_to_a_client_error() -> None:
     assert _error_status("invalid_request") == 400
     assert _error_status("program_apply_request_oversized") == 413
     assert _error_status("full_stack_restart_required") == 409
+
+
+def test_full_native_applied_program_projection_is_accepted() -> None:
+    core = FakeCore()
+    projection = _applied_projection(_program_document())
+    core.applied_program = copy.deepcopy(projection)
+    client = TestClient(create_app(service=HeadlessService(core, FakeManager())))
+
+    response = client.get("/api/program/applied")
+
+    assert response.status_code == 200
+    assert response.json() == projection
+
+
+@pytest.mark.parametrize(
+    "break_projection",
+    [
+        lambda value: value.__setitem__("unknown", True),
+        lambda value: value.pop("program"),
+        lambda value: value["program"].__setitem__("program_id", "mismatch"),
+        lambda value: value["program"].__setitem__(
+            "program_revision", "sha256:" + "f" * 64
+        ),
+        _remove_program_tree_with_valid_identity,
+        lambda value: value.pop("program_binding"),
+        lambda value: value["program_binding"].__setitem__(
+            "program_revision", "sha256:" + "f" * 64
+        ),
+        lambda value: value["program_binding"].__setitem__("unknown", True),
+        lambda value: value["program_binding"]["node_environment"].__setitem__(
+            "environment_digest", "sha256:" + "f" * 64
+        ),
+        lambda value: value["program_binding"].__setitem__(
+            "component_role_bindings", [False]
+        ),
+        lambda value: value["source"].pop("semantic_content_digest"),
+        lambda value: value["source"].__setitem__("record_digest", "invalid"),
+    ],
+)
+def test_applied_program_projection_rejects_missing_or_divergent_closure(
+    break_projection,
+) -> None:
+    core = FakeCore()
+    projection = _applied_projection(_program_document())
+    break_projection(projection)
+    core.applied_program = projection
+    client = TestClient(create_app(service=HeadlessService(core, FakeManager())))
+
+    response = client.get("/api/program/applied")
+
+    assert response.status_code != 200
+    assert response.json()["detail"]["code"] == "program_applied_selection_invalid"
+
+
+@pytest.mark.parametrize(
+    ("path", "invalid_value"),
+    [
+        (("baseline_program_binding_id",), "baseline.1"),
+        (("deployment_revision",), "deployment.1"),
+        (("graph_revision",), "graph.1"),
+        (("node_environment_digest",), "environment.1"),
+        (("preparation_digest",), "preparation.1"),
+        (("program_revision",), "program.1"),
+        (("program_binding_id",), "binding.1"),
+        (("retained_bundle_id",), "bundle.1"),
+        (("scenario_catalog_revision",), "catalog.1"),
+        (("source", "record_digest"), "record.1"),
+        (("source", "semantic_content_digest"), "semantic.1"),
+    ],
+)
+def test_applied_program_projection_rejects_malformed_exact_identity(
+    path: tuple[str, ...],
+    invalid_value: object,
+) -> None:
+    core = FakeCore()
+    projection = _applied_projection(_program_document())
+    target = projection
+    for field in path[:-1]:
+        target = target[field]
+    target[path[-1]] = invalid_value
+    core.applied_program = projection
+    client = TestClient(create_app(service=HeadlessService(core, FakeManager())))
+
+    response = client.get("/api/program/applied")
+
+    assert response.status_code != 200
+    assert response.json()["detail"]["code"] == "program_applied_selection_invalid"
+
+
+@pytest.mark.parametrize("source_generation", [True, False, 0])
+def test_applied_program_projection_rejects_invalid_source_generation(
+    source_generation: object,
+) -> None:
+    core = FakeCore()
+    projection = _applied_projection(_program_document())
+    projection["source"]["source_generation"] = source_generation
+    core.applied_program = projection
+    client = TestClient(create_app(service=HeadlessService(core, FakeManager())))
+
+    response = client.get("/api/program/applied")
+
+    assert response.status_code != 200
+    assert response.json()["detail"]["code"] == "program_applied_selection_invalid"
 
 
 def _manager_payload() -> dict[str, Any]:
@@ -233,15 +439,14 @@ class FakeCore:
             (copy.deepcopy(preparation), expected_applied_record_digest)
         )
         record_digest = "sha256:" + "5" * 64
-        self.applied_program = {
-            "schema_version": "manyforge.applied_program_selection.v1",
-            "scenario_id": preparation["scenario_id"],
-            "program_revision": preparation["program_revision"],
-            "program_binding_id": preparation["program_binding_id"],
-            "retained_bundle_id": preparation["retained_bundle_id"],
-            "graph_revision": preparation["graph_revision"],
-            "source": {"record_digest": record_digest},
-        }
+        self.applied_program = _applied_projection(
+            self.program_preparations[-1],
+            scenario_id=preparation["scenario_id"],
+            scenario_catalog_revision=preparation["scenario_catalog_revision"],
+            record_digest=record_digest,
+            retained_bundle_id=preparation["retained_bundle_id"],
+            graph_revision=preparation["graph_revision"],
+        )
         return copy.deepcopy(self.applied_program)
 
     def applied_program_selection(self) -> dict[str, Any]:
@@ -697,8 +902,13 @@ class FakeTrustedAdapter:
 
 def _program_run_snapshot(*, state: str = "running") -> dict[str, Any]:
     digest_a = "sha256:" + "a" * 64
-    digest_b = "sha256:" + "b" * 64
     digest_c = "sha256:" + "c" * 64
+    program = _program_document()
+    binding = _program_binding(
+        program,
+        retained_bundle_id=digest_c,
+        graph_revision=digest_a,
+    )
     return {
         "schema_version": "manyforge.program_run_status.v1",
         "owner_id": "program-runner.cell-a",
@@ -710,12 +920,14 @@ def _program_run_snapshot(*, state: str = "running") -> dict[str, Any]:
             "program_run_id": "program-run.1",
             "scenario_id": "cell-pick",
             "scenario_catalog_revision": "sha256:" + "6" * 64,
-            "program_id": "pick",
-            "program_revision": digest_a,
-            "program_binding_id": digest_b,
+            "program_id": program["program_id"],
+            "program_revision": program["program_revision"],
+            "program_binding_id": binding["program_binding_id"],
             "retained_bundle_id": digest_c,
             "graph_revision": digest_a,
-            "node_environment_digest": digest_b,
+            "node_environment_digest": binding["node_environment"][
+                "environment_digest"
+            ],
             "owner_identities": [
                 {
                     "owner_role": "program_runner",
@@ -734,18 +946,11 @@ def _program_run_snapshot(*, state: str = "running") -> dict[str, Any]:
 def _applied_for_program_run() -> dict[str, Any]:
     snapshot = _program_run_snapshot()
     capture = snapshot["capture"]
-    return {
-        "schema_version": "manyforge.applied_program_selection.v1",
-        "scenario_id": capture["scenario_id"],
-        "scenario_catalog_revision": capture["scenario_catalog_revision"],
-        "program_id": capture["program_id"],
-        "program_revision": capture["program_revision"],
-        "program_binding_id": capture["program_binding_id"],
-        "retained_bundle_id": capture["retained_bundle_id"],
-        "graph_revision": capture["graph_revision"],
-        "node_environment_digest": capture["node_environment_digest"],
-        "source": {"record_digest": "sha256:" + "5" * 64},
-    }
+    return _applied_projection(
+        _program_document(),
+        retained_bundle_id=capture["retained_bundle_id"],
+        graph_revision=capture["graph_revision"],
+    )
 
 
 class FakeProgramRunner:
@@ -938,6 +1143,12 @@ def test_manager_status_and_diff_preserve_offer_digest_fields() -> None:
 
 def test_program_apply_skips_unchanged_deployment_and_publishes_exact_program() -> None:
     client, core, manager = _client()
+    core.program_target_bundle = "sha256:" + "b" * 64
+    core.program_target_graph = "sha256:" + "c" * 64
+    core.manager_payload["active"]["retained_bundle_id"] = (
+        core.program_target_bundle
+    )
+    core.manager_payload["active"]["graph_revision"] = core.program_target_graph
     program = copy.deepcopy(_program_document())
     with client:
         absent = client.get("/api/program/applied")
@@ -960,6 +1171,7 @@ def test_program_apply_skips_unchanged_deployment_and_publishes_exact_program() 
     assert core.program_preparations == [program]
     assert len(core.program_commits) == 1
     assert applied.status_code == 200
+    assert applied.json() == response.json()["applied"]
     assert applied.json()["program_revision"] == program["program_revision"]
 
 
@@ -1270,15 +1482,11 @@ def test_program_apply_waits_for_manager_convergence_without_advancing_applied(
 
 def test_program_apply_manager_rejection_preserves_prior_applied_selection() -> None:
     core = FakeCore()
-    prior = {
-        "schema_version": "manyforge.applied_program_selection.v1",
-        "scenario_id": "prior-scenario",
-        "program_revision": "sha256:" + "7" * 64,
-        "program_binding_id": "sha256:" + "8" * 64,
-        "retained_bundle_id": "bundle.1",
-        "graph_revision": "graph.1",
-        "source": {"record_digest": "sha256:" + "9" * 64},
-    }
+    prior = _applied_projection(
+        _program_document(),
+        scenario_id="prior-scenario",
+        record_digest="sha256:" + "9" * 64,
+    )
     core.applied_program = copy.deepcopy(prior)
     core.program_target_bundle = "sha256:" + "b" * 64
     core.program_target_graph = "sha256:" + "c" * 64
