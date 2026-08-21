@@ -2,6 +2,7 @@
 
 #include <unistd.h>
 
+#include <algorithm>
 #include <atomic>
 #include <cstdint>
 #include <filesystem>
@@ -84,6 +85,9 @@ struct ProgramOptions final {
   bool include_contact_grasp{false};
   std::string value_source_kind;
   bool duplicate_value_source_parameter{false};
+  bool include_node_policy{false};
+  bool explicit_default_node_policy{false};
+  bool include_allowed_skill{false};
 };
 
 [[nodiscard]] CanonicalValue text_array(
@@ -198,6 +202,40 @@ struct ProgramOptions final {
     tree.emplace_back("value_sources", CanonicalValue(CanonicalValue::Object{
                                            {"velocity_scale", CanonicalValue(std::move(source))}}));
   }
+  if (options.include_node_policy || options.explicit_default_node_policy) {
+    const bool defaults = options.explicit_default_node_policy;
+    CanonicalValue::Array actions;
+    CanonicalValue::Array skills;
+    if (!defaults) {
+      actions.emplace_back(options.include_allowed_skill ? "intervention"
+                                                         : "runtime_override");
+    }
+    if (options.include_allowed_skill) {
+      skills.emplace_back("retained-skill");
+    }
+    tree.emplace_back(
+        "modification_policy",
+        CanonicalValue(CanonicalValue::Object{
+            {"runtime_override",
+             CanonicalValue(defaults ? "forbidden" : "human_approval")},
+            {"persistent_edit",
+             CanonicalValue(defaults ? "forbidden" : "llm_allowed")},
+            {"intervention_delegate",
+             CanonicalValue(defaults ? "forbidden" : "human_only")},
+        }));
+    tree.emplace_back(
+        "recovery_policy",
+        CanonicalValue(CanonicalValue::Object{
+            {"allow_intervention",
+             CanonicalValue(options.include_allowed_skill)},
+            {"allowed_recovery_actions", CanonicalValue(std::move(actions))},
+            {"max_retries", CanonicalValue(defaults ? 0.0 : 2.0)},
+            {"allowed_skills", CanonicalValue(std::move(skills))},
+            {"persistence_ceiling", CanonicalValue("session_only")},
+        }));
+    tree.emplace_back("operator_stop_policy",
+                      CanonicalValue(defaults ? "inherit" : "hold"));
+  }
 
   CanonicalValue::Object root{
       {"api_version", CanonicalValue("manyforge.program.v1")},
@@ -306,6 +344,62 @@ struct ProgramOptions final {
   ProgramOptions options;
   options.catalog_content_version = bundle.value().catalogs.node_environment.content_version;
   return options;
+}
+
+void erase_member(CanonicalValue::Object& object, std::string_view name) {
+  const auto found = std::find_if(
+      object.begin(), object.end(),
+      [name](const auto& member) { return member.first == name; });
+  if (found == object.end()) {
+    throw std::logic_error("test could not find requested object member");
+  }
+  object.erase(found);
+}
+
+void replace_member(CanonicalValue::Object& object, std::string_view name,
+                    CanonicalValue value) {
+  const auto found = std::find_if(
+      object.begin(), object.end(),
+      [name](const auto& member) { return member.first == name; });
+  if (found == object.end()) {
+    throw std::logic_error("test could not find requested object member");
+  }
+  found->second = std::move(value);
+}
+
+template <typename Mutation>
+void mutate_object_member(CanonicalValue::Object& object,
+                          std::string_view name, Mutation mutation) {
+  const auto found = std::find_if(
+      object.begin(), object.end(),
+      [name](const auto& member) { return member.first == name; });
+  if (found == object.end()) {
+    throw std::logic_error("test could not find requested object member");
+  }
+  auto child = found->second.as_object();
+  mutation(child);
+  found->second = CanonicalValue(std::move(child));
+}
+
+template <typename Mutation>
+[[nodiscard]] CanonicalValue make_policy_program(const RetainedBundle& bundle,
+                                                 Mutation mutation) {
+  ProgramOptions options;
+  options.catalog_content_version =
+      bundle.value().catalogs.node_environment.content_version;
+  options.include_node_policy = true;
+  auto root = make_program_root(options);
+  auto members = root.as_object();
+  for (auto& [name, value] : members) {
+    if (name != "tree") {
+      continue;
+    }
+    auto tree = value.as_object();
+    mutation(tree);
+    value = CanonicalValue(std::move(tree));
+    break;
+  }
+  return with_program_revision(CanonicalValue(std::move(members)));
 }
 
 TEST(ProgramContractTest, SealsExactCanonicalProgramAndRetainedCatalogContract) {
@@ -453,6 +547,375 @@ TEST(ProgramContractTest,
       "arm_collision");
   EXPECT_DOUBLE_EQ(policy.max_penetration_m, 0.002);
   EXPECT_DOUBLE_EQ(policy.terminal_window_start_fraction, 0.8);
+}
+
+TEST(ProgramContractTest, ExtractsSparseCompleteNodePolicies) {
+  ScopedTrustedRoot root;
+  const auto bundle = make_bundle(root.path());
+  ProgramOptions options = valid_options(*bundle);
+  options.include_node_policy = true;
+  const auto contract = verify_program_binding_contract(
+      canonical_json(with_program_revision(make_program_root(options))),
+      *bundle);
+
+  ASSERT_EQ(contract->value().node_policies.size(), 1U);
+  const auto& policy = contract->value().node_policies.front();
+  EXPECT_EQ(policy.instance_id.value(), "root");
+  EXPECT_EQ(policy.modification_policy.runtime_override,
+            manyforge::core::ProgramModificationPolicyValue::kHumanApproval);
+  EXPECT_EQ(policy.modification_policy.persistent_edit,
+            manyforge::core::ProgramModificationPolicyValue::kLlmAllowed);
+  EXPECT_EQ(policy.recovery_policy.allowed_recovery_actions,
+            (std::vector<manyforge::core::ProgramRecoveryAction>{
+                manyforge::core::ProgramRecoveryAction::kRuntimeOverride}));
+  EXPECT_EQ(policy.operator_stop_policy,
+            manyforge::core::ProgramOperatorStopPolicy::kHold);
+}
+
+TEST(ProgramContractTest,
+     ExplicitCompleteDefaultNodePoliciesNormalizeToOmission) {
+  ScopedTrustedRoot root;
+  const auto bundle = make_bundle(root.path());
+  const auto omitted = verify_program_binding_contract(
+      canonical_json(with_program_revision(make_program_root(
+          valid_options(*bundle)))),
+      *bundle);
+  ProgramOptions defaults = valid_options(*bundle);
+  defaults.explicit_default_node_policy = true;
+  auto explicit_root = with_program_revision(make_program_root(defaults));
+  auto explicit_members = explicit_root.as_object();
+  for (auto& [name, value] : explicit_members) {
+    if (name == "program_revision") {
+      value = CanonicalValue(omitted->value().program_revision.value());
+    }
+  }
+  const auto explicit_defaults = verify_program_binding_contract(
+      canonical_json(CanonicalValue(std::move(explicit_members))), *bundle);
+
+  EXPECT_EQ(explicit_defaults->canonical_program_bytes(),
+            omitted->canonical_program_bytes());
+  EXPECT_EQ(explicit_defaults->value().program_revision,
+            omitted->value().program_revision);
+  EXPECT_TRUE(explicit_defaults->value().node_policies.empty());
+}
+
+TEST(ProgramContractTest, RejectsSkillIdsWithoutQualifiedRetainedReferents) {
+  ScopedTrustedRoot root;
+  const auto bundle = make_bundle(root.path());
+  ProgramOptions options = valid_options(*bundle);
+  options.include_node_policy = true;
+  options.include_allowed_skill = true;
+
+  try {
+    static_cast<void>(verify_program_binding_contract(
+        canonical_json(with_program_revision(make_program_root(options))),
+        *bundle));
+    FAIL() << "nonempty allowed_skills unexpectedly verified";
+  } catch (const ProgramContractError& error) {
+    EXPECT_NE(
+        std::string(error.what()).find(
+            "exact revision-qualified retained skill referent"),
+        std::string::npos);
+  }
+}
+
+TEST(ProgramContractTest, RawNodePolicyEnvelopeRejectsMalformedAndUnqualifiedRows) {
+  ScopedTrustedRoot root;
+  const auto bundle = make_bundle(root.path());
+  const auto expect_rejected = [&](auto mutation) {
+    EXPECT_THROW(
+        static_cast<void>(verify_program_binding_contract(
+            canonical_json(make_policy_program(*bundle, mutation)), *bundle)),
+        ProgramContractError);
+  };
+
+  expect_rejected([](auto& tree) { erase_member(tree, "instance_id"); });
+  expect_rejected([](auto& tree) {
+    replace_member(tree, "modification_policy", CanonicalValue(nullptr));
+  });
+  expect_rejected([](auto& tree) {
+    mutate_object_member(tree, "modification_policy",
+                         [](auto& policy) {
+                           erase_member(policy, "persistent_edit");
+                         });
+  });
+  expect_rejected([](auto& tree) {
+    mutate_object_member(tree, "modification_policy",
+                         [](auto& policy) {
+                           policy.emplace_back("unexpected", CanonicalValue(true));
+                         });
+  });
+  expect_rejected([](auto& tree) {
+    mutate_object_member(tree, "modification_policy",
+                         [](auto& policy) {
+                           replace_member(policy, "runtime_override",
+                                          CanonicalValue("operator_allowed"));
+                         });
+  });
+  expect_rejected([](auto& tree) {
+    mutate_object_member(tree, "modification_policy",
+                         [](auto& policy) {
+                           replace_member(policy, "intervention_delegate",
+                                          CanonicalValue("operator"));
+                         });
+  });
+
+  expect_rejected([](auto& tree) {
+    replace_member(tree, "recovery_policy", CanonicalValue(nullptr));
+  });
+  expect_rejected([](auto& tree) {
+    mutate_object_member(tree, "recovery_policy",
+                         [](auto& policy) {
+                           erase_member(policy, "max_retries");
+                         });
+  });
+  expect_rejected([](auto& tree) {
+    mutate_object_member(tree, "recovery_policy",
+                         [](auto& policy) {
+                           policy.emplace_back("unexpected", CanonicalValue(true));
+                         });
+  });
+  expect_rejected([](auto& tree) {
+    mutate_object_member(tree, "recovery_policy",
+                         [](auto& policy) {
+                           replace_member(policy, "allow_intervention",
+                                          CanonicalValue(0.0));
+                         });
+  });
+  expect_rejected([](auto& tree) {
+    mutate_object_member(tree, "recovery_policy",
+                         [](auto& policy) {
+                           replace_member(policy, "allowed_recovery_actions",
+                                          CanonicalValue(CanonicalValue::Object{}));
+                         });
+  });
+  expect_rejected([](auto& tree) {
+    mutate_object_member(tree, "recovery_policy",
+                         [](auto& policy) {
+                           replace_member(
+                               policy, "allowed_recovery_actions",
+                               CanonicalValue(CanonicalValue::Array{
+                                   CanonicalValue("intervention"),
+                                   CanonicalValue("runtime_override"),
+                                   CanonicalValue("runtime_override")}));
+                         });
+  });
+  expect_rejected([](auto& tree) {
+    mutate_object_member(tree, "recovery_policy",
+                         [](auto& policy) {
+                           replace_member(
+                               policy, "allowed_recovery_actions",
+                               CanonicalValue(CanonicalValue::Array{
+                                   CanonicalValue("unknown")}));
+                         });
+  });
+  expect_rejected([](auto& tree) {
+    mutate_object_member(tree, "recovery_policy",
+                         [](auto& policy) {
+                           replace_member(
+                               policy, "allowed_recovery_actions",
+                               CanonicalValue(CanonicalValue::Array{
+                                   CanonicalValue("runtime_override"),
+                                   CanonicalValue("runtime_override")}));
+                         });
+  });
+  expect_rejected([](auto& tree) {
+    mutate_object_member(tree, "recovery_policy",
+                         [](auto& policy) {
+                           replace_member(
+                               policy, "allowed_recovery_actions",
+                               CanonicalValue(CanonicalValue::Array{
+                                   CanonicalValue("runtime_override"),
+                                   CanonicalValue("intervention")}));
+                           replace_member(policy, "allow_intervention",
+                                          CanonicalValue(true));
+                         });
+  });
+  expect_rejected([](auto& tree) {
+    mutate_object_member(tree, "recovery_policy",
+                         [](auto& policy) {
+                           replace_member(policy, "allowed_recovery_actions",
+                                          CanonicalValue("intervention"));
+                         });
+  });
+  expect_rejected([](auto& tree) {
+    mutate_object_member(tree, "recovery_policy",
+                         [](auto& policy) {
+                           replace_member(policy, "max_retries",
+                                          CanonicalValue(true));
+                         });
+  });
+  expect_rejected([](auto& tree) {
+    mutate_object_member(tree, "recovery_policy",
+                         [](auto& policy) {
+                           replace_member(policy, "max_retries",
+                                          CanonicalValue(256.0));
+                         });
+  });
+  expect_rejected([](auto& tree) {
+    mutate_object_member(tree, "recovery_policy",
+                         [](auto& policy) {
+                           replace_member(
+                               policy, "allowed_skills",
+                               CanonicalValue(CanonicalValue::Array{
+                                   CanonicalValue("Upper")}));
+                         });
+  });
+  expect_rejected([](auto& tree) {
+    mutate_object_member(tree, "recovery_policy",
+                         [](auto& policy) {
+                           replace_member(
+                               policy, "allowed_skills",
+                               CanonicalValue(CanonicalValue::Array{
+                                   CanonicalValue("z-skill"),
+                                   CanonicalValue("a-skill")}));
+                           replace_member(policy, "allow_intervention",
+                                          CanonicalValue(true));
+                           replace_member(
+                               policy, "allowed_recovery_actions",
+                               CanonicalValue(CanonicalValue::Array{
+                                   CanonicalValue("intervention")}));
+                         });
+  });
+  expect_rejected([](auto& tree) {
+    mutate_object_member(tree, "recovery_policy",
+                         [](auto& policy) {
+                           replace_member(
+                               policy, "allowed_skills",
+                               CanonicalValue(CanonicalValue::Array{
+                                   CanonicalValue("a-skill"),
+                                   CanonicalValue("a-skill")}));
+                           replace_member(policy, "allow_intervention",
+                                          CanonicalValue(true));
+                           replace_member(
+                               policy, "allowed_recovery_actions",
+                               CanonicalValue(CanonicalValue::Array{
+                                   CanonicalValue("intervention")}));
+                         });
+  });
+  expect_rejected([](auto& tree) {
+    mutate_object_member(tree, "recovery_policy",
+                         [](auto& policy) {
+                           replace_member(
+                               policy, "allowed_skills",
+                               CanonicalValue(CanonicalValue::Array{
+                                   CanonicalValue(std::string(129, 'a'))}));
+                         });
+  });
+  expect_rejected([](auto& tree) {
+    mutate_object_member(tree, "recovery_policy",
+                         [](auto& policy) {
+                           CanonicalValue::Array skills;
+                           for (std::size_t index = 0U; index < 257U; ++index) {
+                             skills.emplace_back("skill-" +
+                                                 std::to_string(index));
+                           }
+                           replace_member(
+                               policy, "allowed_skills",
+                               CanonicalValue(std::move(skills)));
+                         });
+  });
+  expect_rejected([](auto& tree) {
+    mutate_object_member(tree, "recovery_policy",
+                         [](auto& policy) {
+                           replace_member(policy, "persistence_ceiling",
+                                          CanonicalValue("persistent"));
+                         });
+  });
+  expect_rejected([](auto& tree) {
+    replace_member(tree, "operator_stop_policy", CanonicalValue("pause"));
+  });
+  expect_rejected([](auto& tree) {
+    replace_member(tree, "instance_id", CanonicalValue("Root"));
+  });
+  expect_rejected([](auto& tree) {
+    replace_member(tree, "instance_id", CanonicalValue(std::string(129, 'a')));
+  });
+
+  expect_rejected([](auto& tree) {
+    mutate_object_member(tree, "recovery_policy",
+                         [](auto& policy) {
+                           replace_member(policy, "allow_intervention",
+                                          CanonicalValue(true));
+                         });
+  });
+  expect_rejected([](auto& tree) {
+    mutate_object_member(tree, "recovery_policy",
+                         [](auto& policy) {
+                           replace_member(
+                               policy, "allowed_skills",
+                               CanonicalValue(CanonicalValue::Array{
+                                   CanonicalValue("a-skill")}));
+                         });
+  });
+  expect_rejected([](auto& tree) {
+    mutate_object_member(tree, "modification_policy",
+                         [](auto& policy) {
+                           replace_member(policy, "runtime_override",
+                                          CanonicalValue("forbidden"));
+                         });
+  });
+  expect_rejected([](auto& tree) {
+    mutate_object_member(tree, "modification_policy",
+                         [](auto& modification) {
+                           replace_member(modification, "runtime_override",
+                                          CanonicalValue("forbidden"));
+                           });
+    mutate_object_member(tree, "recovery_policy",
+                         [](auto& recovery) {
+                           replace_member(
+                               recovery, "allowed_recovery_actions",
+                               CanonicalValue(CanonicalValue::Array{
+                                   CanonicalValue("intervention")}));
+                           replace_member(recovery, "allow_intervention",
+                                          CanonicalValue(true));
+                           replace_member(recovery, "persistence_ceiling",
+                                          CanonicalValue("runtime_override"));
+                         });
+  });
+  expect_rejected([](auto& tree) {
+    mutate_object_member(tree, "modification_policy",
+                         [](auto& modification) {
+                           replace_member(modification, "persistent_edit",
+                                          CanonicalValue("forbidden"));
+                         });
+    mutate_object_member(tree, "recovery_policy",
+                         [](auto& recovery) {
+                           replace_member(
+                               recovery, "allowed_recovery_actions",
+                               CanonicalValue(CanonicalValue::Array{
+                                   CanonicalValue("intervention")}));
+                           replace_member(recovery, "allow_intervention",
+                                          CanonicalValue(true));
+                           replace_member(recovery, "persistence_ceiling",
+                                          CanonicalValue("draft_patch"));
+                         });
+  });
+  expect_rejected([](auto& tree) {
+    mutate_object_member(tree, "recovery_policy",
+                         [](auto& recovery) {
+                           replace_member(
+                               recovery, "allowed_recovery_actions",
+                               CanonicalValue(CanonicalValue::Array{}));
+                           replace_member(recovery, "max_retries",
+                                          CanonicalValue(1.0));
+                         });
+  });
+  expect_rejected([](auto& tree) {
+    mutate_object_member(tree, "recovery_policy",
+                         [](auto& recovery) {
+                           replace_member(
+                               recovery, "allowed_recovery_actions",
+                               CanonicalValue(CanonicalValue::Array{
+                                   CanonicalValue("intervention")}));
+                           replace_member(recovery, "allow_intervention",
+                                          CanonicalValue(true));
+                           replace_member(
+                               recovery, "allowed_skills",
+                               CanonicalValue(CanonicalValue::Array{
+                                   CanonicalValue("a-skill")}));
+                         });
+  });
 }
 
 TEST(ProgramContractTest, RejectsLegacySingletonRobotSurface) {

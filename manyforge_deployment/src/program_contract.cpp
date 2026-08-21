@@ -23,6 +23,8 @@ constexpr std::size_t kMaximumIdentityBytes = 128U;
 constexpr std::size_t kMaximumProgramTreeDepth = 256U;
 constexpr std::size_t kMaximumProgramTreeNodes = 100000U;
 constexpr std::size_t kMaximumProgramChildren = 10000U;
+constexpr std::size_t kMaximumProgramAllowedSkills = 256U;
+constexpr std::size_t kMaximumProgramSkillIdBytes = 128U;
 
 [[noreturn]] void fail(std::string message) {
   throw ProgramContractError(std::move(message));
@@ -268,15 +270,386 @@ void verify_value_source(const CanonicalValue& value, std::string_view path) {
   fail(std::string(path) + ": unsupported Program value-source kind");
 }
 
+[[nodiscard]] core::ProgramModificationPolicyValue
+parse_modification_value(const CanonicalValue& value, std::string_view path) {
+  const auto& spelling = require_string(value, path);
+  if (spelling == "forbidden") {
+    return core::ProgramModificationPolicyValue::kForbidden;
+  }
+  if (spelling == "human_approval") {
+    return core::ProgramModificationPolicyValue::kHumanApproval;
+  }
+  if (spelling == "llm_allowed") {
+    return core::ProgramModificationPolicyValue::kLlmAllowed;
+  }
+  fail(std::string(path) + ": invalid modification-policy value");
+}
+
+[[nodiscard]] core::ProgramInterventionDelegate parse_intervention_delegate(
+    const CanonicalValue& value, std::string_view path) {
+  const auto& spelling = require_string(value, path);
+  if (spelling == "forbidden") {
+    return core::ProgramInterventionDelegate::kForbidden;
+  }
+  if (spelling == "human_only") {
+    return core::ProgramInterventionDelegate::kHumanOnly;
+  }
+  if (spelling == "llm_allowed") {
+    return core::ProgramInterventionDelegate::kLlmAllowed;
+  }
+  if (spelling == "program_only") {
+    return core::ProgramInterventionDelegate::kProgramOnly;
+  }
+  fail(std::string(path) + ": invalid intervention-delegate value");
+}
+
+[[nodiscard]] core::ProgramRecoveryAction parse_recovery_action(
+    const CanonicalValue& value, std::string_view path) {
+  const auto& spelling = require_string(value, path);
+  if (spelling == "intervention") {
+    return core::ProgramRecoveryAction::kIntervention;
+  }
+  if (spelling == "runtime_override") {
+    return core::ProgramRecoveryAction::kRuntimeOverride;
+  }
+  fail(std::string(path) + ": invalid recovery action");
+}
+
+[[nodiscard]] core::ProgramRecoveryPersistenceCeiling
+parse_persistence_ceiling(const CanonicalValue& value, std::string_view path) {
+  const auto& spelling = require_string(value, path);
+  if (spelling == "session_only") {
+    return core::ProgramRecoveryPersistenceCeiling::kSessionOnly;
+  }
+  if (spelling == "runtime_override") {
+    return core::ProgramRecoveryPersistenceCeiling::kRuntimeOverride;
+  }
+  if (spelling == "draft_patch") {
+    return core::ProgramRecoveryPersistenceCeiling::kDraftPatch;
+  }
+  fail(std::string(path) + ": invalid persistence ceiling");
+}
+
+[[nodiscard]] core::ProgramOperatorStopPolicy parse_stop_policy(
+    const CanonicalValue& value, std::string_view path) {
+  const auto& spelling = require_string(value, path);
+  if (spelling == "inherit") {
+    return core::ProgramOperatorStopPolicy::kInherit;
+  }
+  if (spelling == "hold") {
+    return core::ProgramOperatorStopPolicy::kHold;
+  }
+  if (spelling == "continue") {
+    return core::ProgramOperatorStopPolicy::kContinue;
+  }
+  fail(std::string(path) + ": invalid operator Stop policy");
+}
+
+[[nodiscard]] std::uint8_t require_retry_count(const CanonicalValue& value,
+                                                std::string_view path) {
+  const double number = require_number(value, path);
+  if (number < 0.0 || number > 255.0 || std::trunc(number) != number) {
+    fail(std::string(path) + ": expected integer in 0..255");
+  }
+  return static_cast<std::uint8_t>(number);
+}
+
+[[nodiscard]] bool policy_is_default(const core::ProgramNodePolicyDTO& policy) {
+  return policy.modification_policy ==
+             core::ProgramNodeModificationPolicyDTO{} &&
+         policy.recovery_policy == core::ProgramNodeRecoveryPolicyDTO{} &&
+         policy.operator_stop_policy ==
+             core::ProgramOperatorStopPolicy::kInherit;
+}
+
+[[nodiscard]] core::ProgramNodePolicyDTO parse_node_policy(
+    const CanonicalValue::Object& node, std::string_view path) {
+  core::ProgramNodePolicyDTO result{
+      core::ProgramNodeInstanceId(require_string(
+          require_member(node, "instance_id", path),
+          child_path(path, "instance_id"))),
+      {},
+      {},
+      core::ProgramOperatorStopPolicy::kInherit};
+  require_program_local_identity(result.instance_id.value(),
+                                 child_path(path, "instance_id"));
+
+  if (const auto* modification = find_member(node, "modification_policy");
+      modification != nullptr) {
+    const auto& value = require_object(
+        *modification, child_path(path, "modification_policy"));
+    require_exact_fields(value,
+                         {"runtime_override", "persistent_edit",
+                          "intervention_delegate"},
+                         child_path(path, "modification_policy"));
+    result.modification_policy.runtime_override = parse_modification_value(
+        require_member(value, "runtime_override",
+                       child_path(path, "modification_policy")),
+        child_path(child_path(path, "modification_policy"),
+                   "runtime_override"));
+    result.modification_policy.persistent_edit = parse_modification_value(
+        require_member(value, "persistent_edit",
+                       child_path(path, "modification_policy")),
+        child_path(child_path(path, "modification_policy"),
+                   "persistent_edit"));
+    result.modification_policy.intervention_delegate =
+        parse_intervention_delegate(
+            require_member(value, "intervention_delegate",
+                           child_path(path, "modification_policy")),
+            child_path(child_path(path, "modification_policy"),
+                       "intervention_delegate"));
+  }
+
+  if (const auto* recovery = find_member(node, "recovery_policy");
+      recovery != nullptr) {
+    const auto& value =
+        require_object(*recovery, child_path(path, "recovery_policy"));
+    require_exact_fields(
+        value,
+        {"allow_intervention", "allowed_recovery_actions", "max_retries",
+         "allowed_skills", "persistence_ceiling"},
+        child_path(path, "recovery_policy"));
+    const auto& allow = require_member(
+        value, "allow_intervention", child_path(path, "recovery_policy"));
+    if (!allow.is_bool()) {
+      fail(child_path(child_path(path, "recovery_policy"),
+                      "allow_intervention") +
+           ": expected boolean");
+    }
+    result.recovery_policy.allow_intervention = allow.as_bool();
+
+    const std::string actions_path =
+        child_path(child_path(path, "recovery_policy"),
+                   "allowed_recovery_actions");
+    const auto& actions = require_array(
+        require_member(value, "allowed_recovery_actions",
+                       child_path(path, "recovery_policy")),
+        actions_path);
+    if (actions.size() > 2U) {
+      fail(actions_path + ": exceeds the closed action bound");
+    }
+    for (std::size_t index = 0U; index < actions.size(); ++index) {
+      result.recovery_policy.allowed_recovery_actions.push_back(
+          parse_recovery_action(actions[index], index_path(actions_path, index)));
+    }
+    if (!std::is_sorted(result.recovery_policy.allowed_recovery_actions.begin(),
+                        result.recovery_policy.allowed_recovery_actions.end()) ||
+        std::adjacent_find(
+            result.recovery_policy.allowed_recovery_actions.begin(),
+            result.recovery_policy.allowed_recovery_actions.end()) !=
+            result.recovery_policy.allowed_recovery_actions.end()) {
+      fail(actions_path + ": must be duplicate-free and canonical-sorted");
+    }
+
+    result.recovery_policy.max_retries = require_retry_count(
+        require_member(value, "max_retries",
+                       child_path(path, "recovery_policy")),
+        child_path(child_path(path, "recovery_policy"), "max_retries"));
+
+    const std::string skills_path =
+        child_path(child_path(path, "recovery_policy"), "allowed_skills");
+    const auto& skills = require_array(
+        require_member(value, "allowed_skills",
+                       child_path(path, "recovery_policy")),
+        skills_path);
+    if (skills.size() > kMaximumProgramAllowedSkills) {
+      fail(skills_path + ": exceeds the 256-skill bound");
+    }
+    for (std::size_t index = 0U; index < skills.size(); ++index) {
+      const std::string item_path = index_path(skills_path, index);
+      const auto& skill = require_string(skills[index], item_path);
+      if (skill.size() > kMaximumProgramSkillIdBytes) {
+        fail(item_path + ": exceeds the 128-byte skill ID bound");
+      }
+      require_program_local_identity(skill, item_path);
+      result.recovery_policy.allowed_skills.push_back(skill);
+    }
+    if (!std::is_sorted(result.recovery_policy.allowed_skills.begin(),
+                        result.recovery_policy.allowed_skills.end()) ||
+        std::adjacent_find(result.recovery_policy.allowed_skills.begin(),
+                           result.recovery_policy.allowed_skills.end()) !=
+            result.recovery_policy.allowed_skills.end()) {
+      fail(skills_path + ": must be duplicate-free and canonical-sorted");
+    }
+    result.recovery_policy.persistence_ceiling = parse_persistence_ceiling(
+        require_member(value, "persistence_ceiling",
+                       child_path(path, "recovery_policy")),
+        child_path(child_path(path, "recovery_policy"),
+                   "persistence_ceiling"));
+  }
+
+  if (const auto* stop = find_member(node, "operator_stop_policy");
+      stop != nullptr) {
+    result.operator_stop_policy =
+        parse_stop_policy(*stop, child_path(path, "operator_stop_policy"));
+  }
+
+  const auto& actions = result.recovery_policy.allowed_recovery_actions;
+  const bool intervention =
+      std::find(actions.begin(), actions.end(),
+                core::ProgramRecoveryAction::kIntervention) != actions.end();
+  if (result.recovery_policy.allow_intervention != intervention) {
+    fail(std::string(path) +
+         ".recovery_policy.allow_intervention must match intervention");
+  }
+  if (!result.recovery_policy.allowed_skills.empty() && !intervention) {
+    fail(std::string(path) +
+         ".recovery_policy.allowed_skills requires intervention");
+  }
+  const bool runtime_override =
+      std::find(actions.begin(), actions.end(),
+                core::ProgramRecoveryAction::kRuntimeOverride) !=
+      actions.end();
+  if (runtime_override &&
+      result.modification_policy.runtime_override ==
+          core::ProgramModificationPolicyValue::kForbidden) {
+    fail(std::string(path) +
+         ".recovery_policy.runtime_override requires modification permission");
+  }
+  if (result.recovery_policy.persistence_ceiling ==
+          core::ProgramRecoveryPersistenceCeiling::kRuntimeOverride &&
+      result.modification_policy.runtime_override ==
+          core::ProgramModificationPolicyValue::kForbidden) {
+    fail(std::string(path) +
+         ".recovery_policy.runtime_override persistence requires permission");
+  }
+  if (result.recovery_policy.persistence_ceiling ==
+          core::ProgramRecoveryPersistenceCeiling::kDraftPatch &&
+      result.modification_policy.persistent_edit ==
+          core::ProgramModificationPolicyValue::kForbidden) {
+    fail(std::string(path) +
+         ".recovery_policy.draft_patch persistence requires permission");
+  }
+  if (!result.recovery_policy.allowed_recovery_actions.empty() ||
+      result.recovery_policy.allow_intervention ||
+      result.recovery_policy.max_retries != 0U ||
+      !result.recovery_policy.allowed_skills.empty() ||
+      result.recovery_policy.persistence_ceiling !=
+          core::ProgramRecoveryPersistenceCeiling::kSessionOnly) {
+    if (actions.empty()) {
+      fail(std::string(path) +
+           ".recovery_policy non-default values require an action");
+    }
+  }
+  if (!result.recovery_policy.allowed_skills.empty()) {
+    fail(std::string(path) +
+         ".recovery_policy.allowed_skills requires an exact "
+         "revision-qualified retained skill referent; ID-only assistant "
+         "registry rows are insufficient");
+  }
+  return result;
+}
+
+[[nodiscard]] CanonicalValue node_policy_projection(
+    const core::ProgramNodePolicyDTO& policy) {
+  CanonicalValue::Object result;
+  if (policy.modification_policy !=
+      core::ProgramNodeModificationPolicyDTO{}) {
+    result.emplace_back(
+        "modification_policy",
+        CanonicalValue(CanonicalValue::Object{
+            {"intervention_delegate", CanonicalValue(std::string(
+                                           core::to_string(policy
+                                               .modification_policy
+                                               .intervention_delegate)))},
+            {"persistent_edit", CanonicalValue(std::string(
+                                     core::to_string(policy.modification_policy
+                                                         .persistent_edit)))},
+            {"runtime_override", CanonicalValue(std::string(
+                                      core::to_string(policy.modification_policy
+                                                          .runtime_override)))},
+        }));
+  }
+  if (policy.recovery_policy != core::ProgramNodeRecoveryPolicyDTO{}) {
+    CanonicalValue::Array actions;
+    for (const auto action :
+         policy.recovery_policy.allowed_recovery_actions) {
+      actions.emplace_back(std::string(core::to_string(action)));
+    }
+    CanonicalValue::Array skills;
+    for (const auto& skill : policy.recovery_policy.allowed_skills) {
+      skills.emplace_back(skill);
+    }
+    result.emplace_back(
+        "recovery_policy",
+        CanonicalValue(CanonicalValue::Object{
+            {"allow_intervention",
+             CanonicalValue(policy.recovery_policy.allow_intervention)},
+            {"allowed_recovery_actions", CanonicalValue(std::move(actions))},
+            {"allowed_skills", CanonicalValue(std::move(skills))},
+            {"max_retries", CanonicalValue(static_cast<double>(
+                                policy.recovery_policy.max_retries))},
+            {"persistence_ceiling",
+             CanonicalValue(std::string(core::to_string(
+                 policy.recovery_policy.persistence_ceiling)))},
+        }));
+  }
+  if (policy.operator_stop_policy !=
+      core::ProgramOperatorStopPolicy::kInherit) {
+    result.emplace_back(
+        "operator_stop_policy",
+        CanonicalValue(std::string(
+            core::to_string(policy.operator_stop_policy))));
+  }
+  return CanonicalValue(std::move(result));
+}
+
+[[nodiscard]] CanonicalValue normalize_program_tree(
+    const CanonicalValue& value, std::string_view path) {
+  const auto& node = require_object(value, path);
+  require_fields(node, {"node_id", "instance_id", "parameters", "children"},
+                 {"metadata", "value_sources", "modification_policy",
+                  "recovery_policy", "operator_stop_policy"},
+                 path);
+  const auto& instance = require_string(
+      require_member(node, "instance_id", path),
+      child_path(path, "instance_id"));
+  require_program_local_identity(instance, child_path(path, "instance_id"));
+  const auto policy = parse_node_policy(node, path);
+  CanonicalValue::Object normalized;
+  normalized.reserve(node.size());
+  for (const auto& [name, child] : node) {
+    if (name == "modification_policy" || name == "recovery_policy" ||
+        name == "operator_stop_policy") {
+      continue;
+    }
+    if (name == "children") {
+      const auto& children = require_array(child, child_path(path, name));
+      if (children.size() > kMaximumProgramChildren) {
+        fail(std::string(path) + ": child count exceeds fixed bound");
+      }
+      CanonicalValue::Array normalized_children;
+      normalized_children.reserve(children.size());
+      for (std::size_t index = 0U; index < children.size(); ++index) {
+        normalized_children.push_back(normalize_program_tree(
+            children[index], index_path(child_path(path, "children"), index)));
+      }
+      normalized.emplace_back(name, CanonicalValue(std::move(normalized_children)));
+    } else {
+      normalized.emplace_back(name, child);
+    }
+  }
+  if (!policy_is_default(policy)) {
+    const auto projected = node_policy_projection(policy);
+    for (const auto& [name, child] : projected.as_object()) {
+      normalized.emplace_back(name, child);
+    }
+  }
+  return CanonicalValue(std::move(normalized));
+}
+
 void verify_tree(const CanonicalValue& value, std::string_view path,
                  std::size_t depth, std::size_t& count,
-                 std::set<std::string>& instance_ids) {
+                 std::set<std::string>& instance_ids,
+                 std::vector<core::ProgramNodePolicyDTO>& node_policies) {
   if (depth > kMaximumProgramTreeDepth || ++count > kMaximumProgramTreeNodes) {
     fail(std::string(path) + ": Program tree exceeds fixed traversal bounds");
   }
   const auto& node = require_object(value, path);
   require_fields(node, {"node_id", "instance_id", "parameters", "children"},
-                 {"metadata", "value_sources"}, path);
+                 {"metadata", "value_sources", "modification_policy",
+                  "recovery_policy", "operator_stop_policy"},
+                 path);
   const std::string& node_id =
       require_string(require_member(node, "node_id", path), child_path(path, "node_id"));
   const std::string& instance_id =
@@ -285,6 +658,10 @@ void verify_tree(const CanonicalValue& value, std::string_view path,
   require_program_local_identity(instance_id, child_path(path, "instance_id"));
   if (!instance_ids.insert(instance_id).second) {
     fail(std::string(path) + ": duplicate tree instance_id");
+  }
+  const auto policy = parse_node_policy(node, path);
+  if (!policy_is_default(policy)) {
+    node_policies.push_back(policy);
   }
   const auto& parameters =
       require_object(require_member(node, "parameters", path), child_path(path, "parameters"));
@@ -315,7 +692,7 @@ void verify_tree(const CanonicalValue& value, std::string_view path,
   }
   for (std::size_t index = 0U; index < children.size(); ++index) {
     verify_tree(children[index], index_path(child_path(path, "children"), index),
-                depth + 1U, count, instance_ids);
+                depth + 1U, count, instance_ids, node_policies);
   }
 }
 
@@ -813,8 +1190,13 @@ parse_contact_grasp_templates(
   verify_optional_top_level_shapes(root);
   std::size_t tree_count = 0U;
   std::set<std::string> instance_ids;
+  std::vector<core::ProgramNodePolicyDTO> node_policies;
   verify_tree(require_member(root, "tree", "program"), "program.tree", 0U,
-              tree_count, instance_ids);
+              tree_count, instance_ids, node_policies);
+  std::sort(node_policies.begin(), node_policies.end(),
+            [](const auto& left, const auto& right) {
+              return left.instance_id < right.instance_id;
+            });
 
   const std::string& revision = require_string(
       require_member(root, "program_revision", "program"),
@@ -832,6 +1214,7 @@ parse_contact_grasp_templates(
       std::move(components),
       std::move(targets),
       std::move(contact_grasp_templates),
+      std::move(node_policies),
   };
 }
 
@@ -863,12 +1246,27 @@ verify_program_binding_contract(std::string_view canonical_program_bytes,
       fail("Program binding contract selected an invalid retained bundle");
     }
     const auto parsed = parse_strict_json_model_yaml(canonical_program_bytes);
-    CanonicalValue root = parsed.root();
-    if (canonical_json(root) != canonical_program_bytes) {
+    const CanonicalValue source_root = parsed.root();
+    if (canonical_json(source_root) != canonical_program_bytes) {
       fail("Program binding input is not schema-normalized RFC 8785 JSON");
+    }
+    CanonicalValue root = source_root;
+    if (root.find_object_member("tree") != nullptr) {
+      CanonicalValue::Object members;
+      const auto& source_members = require_object(root, "program");
+      members.reserve(source_members.size());
+      for (const auto& [name, value] : source_members) {
+        if (name == "tree") {
+          members.emplace_back(name, normalize_program_tree(value, "program.tree"));
+        } else {
+          members.emplace_back(name, value);
+        }
+      }
+      root = CanonicalValue(std::move(members));
     }
     core::ProgramBindingContractDTO value =
         extract_contract(root, retained_bundle);
+    const std::string normalized_bytes = canonical_json(root);
     if (!detail::verify_content_identity(
             root,
             detail::ContentIdentitySpec{
@@ -879,8 +1277,7 @@ verify_program_binding_contract(std::string_view canonical_program_bytes,
       fail("ProgramRevision does not match the complete canonical Program");
     }
     return detail::ProgramBindingContractConstructionAuthority::construct(
-        std::move(value), std::move(root),
-        std::string(canonical_program_bytes));
+        std::move(value), std::move(root), normalized_bytes);
   } catch (const ProgramContractError&) {
     throw;
   } catch (const std::exception& error) {

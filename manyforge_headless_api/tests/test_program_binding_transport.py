@@ -38,7 +38,7 @@ def _rehash(value: dict[str, Any]) -> None:
 
 
 def _fixture() -> dict[str, Any]:
-    """Enrich the native fixture with one valid contact row for parser coverage."""
+    """Enrich the native fixture with valid sparse rows for parser coverage."""
     value = _native_fixture()
     component = value["component_role_bindings"][0]
     target = value["target_role_bindings"][0]
@@ -82,8 +82,28 @@ def _fixture() -> dict[str, Any]:
             "terminal_window_start_fraction": 0.8,
         }
     ]
+    value["node_policies"] = [_node_policy()]
     _rehash(value)
     return value
+
+
+def _node_policy(*, instance_id: str = "root") -> dict[str, Any]:
+    return {
+        "instance_id": instance_id,
+        "modification_policy": {
+            "runtime_override": "human_approval",
+            "persistent_edit": "forbidden",
+            "intervention_delegate": "human_only",
+        },
+        "recovery_policy": {
+            "allow_intervention": False,
+            "allowed_recovery_actions": ["runtime_override"],
+            "max_retries": 1,
+            "allowed_skills": [],
+            "persistence_ceiling": "session_only",
+        },
+        "operator_stop_policy": "hold",
+    }
 
 
 def _rows(value: dict[str, Any]) -> tuple[dict[str, Any], ...]:
@@ -121,6 +141,10 @@ SHAPE_MUTATIONS: tuple[tuple[str, Mutation], ...] = (
     (".control_binding: expected closed record", _invalid_ref("control_binding", "control_binding_id", "control_binding_revision")),
     (".capability_provider_binding: expected closed record", _invalid_ref("capability_provider_binding", "capability_provider_binding_id", "capability_provider_binding_revision")),
     (".command_schema: expected closed record", _invalid_ref("command_schema", "command_schema_id", "command_schema_revision")),
+    (".node_policies[0]: expected closed record", _unknown(lambda value: value["node_policies"][0])),
+    (".node_policies[0]: expected closed record", lambda value: value["node_policies"][0].pop("recovery_policy")),
+    (".node_policies[0].modification_policy: expected closed record", _unknown(lambda value: value["node_policies"][0]["modification_policy"])),
+    (".node_policies[0].recovery_policy: expected closed record", _unknown(lambda value: value["node_policies"][0]["recovery_policy"])),
     (".contact_grasp_bindings[0]: expected closed record", _unknown(lambda value: _rows(value)[2])),
     (".allowed_body_bindings[0]: expected closed record", _unknown(lambda value: _rows(value)[2]["allowed_body_bindings"][0])),
     (".provenance: expected closed record", _unknown(lambda value: value["provenance"])),
@@ -136,6 +160,9 @@ def _case(name: str) -> Mutation:
         capability = target["capability_bindings"][0]
         body = contact["allowed_body_bindings"][0]
         provenance = value["provenance"]["source_records"]
+        policy = value["node_policies"][0]
+        modification = policy["modification_policy"]
+        recovery = policy["recovery_policy"]
         if name == "null":
             value["program_id"] = None
         elif name == "wrong_type":
@@ -215,6 +242,125 @@ def _case(name: str) -> Mutation:
             provenance[0]["record_kind"] = {}
         elif name == "provenance_order":
             provenance.append(copy.deepcopy(provenance[0]))
+        elif name == "node_policies_missing":
+            del value["node_policies"]
+        elif name == "node_policies_wrong_type":
+            value["node_policies"] = {}
+        elif name == "node_policy_null":
+            value["node_policies"] = [None]
+        elif name == "modification_null":
+            policy["modification_policy"] = None
+        elif name == "modification_empty":
+            policy["modification_policy"] = {}
+        elif name == "modification_partial":
+            del modification["persistent_edit"]
+        elif name == "modification_enum":
+            modification["runtime_override"] = "operator_allowed"
+        elif name == "recovery_null":
+            policy["recovery_policy"] = None
+        elif name == "recovery_empty":
+            policy["recovery_policy"] = {}
+        elif name == "recovery_partial":
+            del recovery["max_retries"]
+        elif name == "recovery_enum":
+            recovery["persistence_ceiling"] = "persistent"
+        elif name == "stop_enum":
+            policy["operator_stop_policy"] = "pause"
+        elif name == "stop_null":
+            policy["operator_stop_policy"] = None
+        elif name == "stop_wrong_type":
+            policy["operator_stop_policy"] = 1
+        elif name == "allow_intervention_type":
+            recovery["allow_intervention"] = 0
+        elif name == "retry_bool":
+            recovery["max_retries"] = True
+        elif name == "retry_low":
+            recovery["max_retries"] = -1
+        elif name == "retry_high":
+            recovery["max_retries"] = 256
+        elif name == "actions_wrong_type":
+            recovery["allowed_recovery_actions"] = {}
+        elif name == "actions_bound":
+            recovery["allowed_recovery_actions"] = [
+                "intervention", "runtime_override", "runtime_override"
+            ]
+        elif name == "actions_enum":
+            recovery["allowed_recovery_actions"] = ["unknown"]
+        elif name == "actions_duplicate":
+            recovery["allowed_recovery_actions"] = [
+                "runtime_override", "runtime_override"
+            ]
+        elif name == "actions_unsorted":
+            modification["runtime_override"] = "llm_allowed"
+            recovery["allow_intervention"] = True
+            recovery["allowed_recovery_actions"] = [
+                "runtime_override", "intervention"
+            ]
+        elif name == "skills_wrong_type":
+            recovery["allowed_skills"] = {}
+        elif name == "skills_bound":
+            recovery["allowed_skills"] = [f"skill-{i}" for i in range(257)]
+        elif name == "skill_upper":
+            recovery["allowed_skills"] = ["Upper"]
+        elif name == "skill_bytes":
+            recovery["allowed_skills"] = ["a" * 129]
+        elif name == "skills_duplicate":
+            recovery["allow_intervention"] = True
+            recovery["allowed_recovery_actions"] = ["intervention"]
+            recovery["allowed_skills"] = ["a-skill", "a-skill"]
+        elif name == "skills_unsorted":
+            recovery["allow_intervention"] = True
+            recovery["allowed_recovery_actions"] = ["intervention"]
+            recovery["allowed_skills"] = ["z-skill", "a-skill"]
+        elif name == "instance_upper":
+            policy["instance_id"] = "Root"
+        elif name == "instance_bytes":
+            policy["instance_id"] = "a" * 129
+        elif name == "table_duplicate":
+            value["node_policies"].append(copy.deepcopy(policy))
+        elif name == "table_unsorted":
+            value["node_policies"].append(_node_policy(instance_id="a"))
+        elif name == "table_bound":
+            value["node_policies"] = [policy] * 100001
+        elif name == "default_row":
+            value["node_policies"] = [{
+                "instance_id": "root",
+                "modification_policy": {
+                    "runtime_override": "forbidden",
+                    "persistent_edit": "forbidden",
+                    "intervention_delegate": "forbidden",
+                },
+                "recovery_policy": {
+                    "allow_intervention": False,
+                    "allowed_recovery_actions": [],
+                    "max_retries": 0,
+                    "allowed_skills": [],
+                    "persistence_ceiling": "session_only",
+                },
+                "operator_stop_policy": "inherit",
+            }]
+        elif name == "skills_fail_closed":
+            recovery["allow_intervention"] = True
+            recovery["allowed_recovery_actions"] = ["intervention"]
+            recovery["allowed_skills"] = ["a-skill"]
+        elif name == "allow_action_cross_field":
+            recovery["allow_intervention"] = True
+        elif name == "skills_intervention_cross_field":
+            recovery["allowed_skills"] = ["a-skill"]
+        elif name == "runtime_override_cross_field":
+            modification["runtime_override"] = "forbidden"
+        elif name == "runtime_persistence_cross_field":
+            modification["runtime_override"] = "forbidden"
+            recovery["allowed_recovery_actions"] = ["intervention"]
+            recovery["allow_intervention"] = True
+            recovery["persistence_ceiling"] = "runtime_override"
+        elif name == "draft_persistence_cross_field":
+            recovery["allowed_recovery_actions"] = ["intervention"]
+            recovery["allow_intervention"] = True
+            recovery["persistence_ceiling"] = "draft_patch"
+        elif name == "recovery_requires_action":
+            recovery["allowed_recovery_actions"] = []
+            recovery["max_retries"] = 1
         else:
             raise AssertionError(name)
     return mutate
@@ -259,12 +405,60 @@ CASES = (
     ("provenance_kind_list", "CatalogRecordKind"),
     ("provenance_kind_object", "CatalogRecordKind"),
     ("provenance_order", "canonical sorted unique"),
+    ("node_policies_missing", "expected closed record"),
+    ("node_policies_wrong_type", "expected bounded array"),
+    ("node_policy_null", "expected closed record"),
+    ("modification_null", "expected closed record"),
+    ("modification_empty", "expected closed record"),
+    ("modification_partial", "expected closed record"),
+    ("modification_enum", "closed enum value"),
+    ("recovery_null", "expected closed record"),
+    ("recovery_empty", "expected closed record"),
+    ("recovery_partial", "expected closed record"),
+    ("recovery_enum", "closed enum value"),
+    ("stop_enum", "closed enum value"),
+    ("stop_null", "closed enum value"),
+    ("stop_wrong_type", "closed enum value"),
+    ("allow_intervention_type", "boolean"),
+    ("retry_bool", "integer in bounded range"),
+    ("retry_low", "integer in bounded range"),
+    ("retry_high", "integer in bounded range"),
+    ("actions_wrong_type", "expected bounded array"),
+    ("actions_bound", "expected bounded array"),
+    ("actions_enum", "closed enum values"),
+    ("actions_duplicate", "canonical sorted unique"),
+    ("actions_unsorted", "canonical sorted unique"),
+    ("skills_wrong_type", "expected bounded array"),
+    ("skills_bound", "expected bounded array"),
+    ("skill_upper", "portable lower-case ID"),
+    ("skill_bytes", "bounded non-empty string"),
+    ("skills_duplicate", "canonical sorted unique"),
+    ("skills_unsorted", "canonical sorted unique"),
+    ("instance_upper", "portable lower-case ID"),
+    ("instance_bytes", "bounded non-empty string"),
+    ("table_duplicate", "canonical sorted unique"),
+    ("table_unsorted", "canonical sorted unique"),
+    ("table_bound", "expected bounded array"),
+    ("default_row", "default node-policy rows must be omitted"),
+    ("skills_fail_closed", "exact revision-qualified retained skill referent"),
+    ("allow_action_cross_field", "allow_intervention must match"),
+    ("skills_intervention_cross_field", "allowed_skills requires intervention"),
+    ("runtime_override_cross_field", "runtime_override action requires"),
+    ("runtime_persistence_cross_field", "runtime_override persistence requires"),
+    ("draft_persistence_cross_field", "draft_patch persistence requires"),
+    ("recovery_requires_action", "non-default recovery policy requires"),
 )
 
 
 def test_native_binding_fixture_is_accepted_without_copy() -> None:
     document = _native_fixture()
     assert validate_program_binding(document) is document
+
+
+def test_generated_parser_accepts_a_nonempty_sparse_node_policy() -> None:
+    document = _fixture()
+    assert validate_program_binding(document) is document
+    assert document["node_policies"][0]["instance_id"] == "root"
 
 
 @pytest.mark.parametrize(("expected", "mutation"), SHAPE_MUTATIONS)
@@ -283,7 +477,7 @@ def test_binding_transport_invariant_mutation_corpus(
 ) -> None:
     document = _fixture()
     _case(name)(document)
-    if name not in {"invalid_utf8", "contact_nonfinite"}:
+    if name not in {"invalid_utf8", "contact_nonfinite", "table_bound"}:
         _rehash(document)
     with pytest.raises(ProgramBindingTransportError, match=re.escape(expected)):
         validate_program_binding(document)

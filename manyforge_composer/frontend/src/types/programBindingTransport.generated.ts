@@ -1,6 +1,11 @@
 /* GENERATED FILE -- program_binding_transport.v1.json; DO NOT EDIT. */
 
 export type CatalogRecordKind = 'model_asset' | 'runtime_profile' | 'component_type' | 'control_interface_contract' | 'controller_topology' | 'provider_manifest' | 'command_schema' | 'capability_definition' | 'contact_policy' | 'stop_evidence_policy' | 'runtime_policy';
+export type ProgramModificationPolicyValue = 'forbidden' | 'human_approval' | 'llm_allowed';
+export type ProgramInterventionDelegate = 'forbidden' | 'human_only' | 'llm_allowed' | 'program_only';
+export type ProgramRecoveryAction = 'intervention' | 'runtime_override';
+export type ProgramPersistenceCeiling = 'session_only' | 'runtime_override' | 'draft_patch';
+export type ProgramOperatorStopPolicy = 'inherit' | 'hold' | 'continue';
 export interface ProgramBindingDocument {
   api_version: 'manyforge.program_binding.v1';
   program_binding_id: string;
@@ -11,6 +16,7 @@ export interface ProgramBindingDocument {
   node_environment: ProgramBindingNodeEnvironment;
   component_role_bindings: ProgramComponentRoleBinding[];
   target_role_bindings: ProgramTargetRoleBinding[];
+  node_policies: ProgramNodePolicy[];
   contact_grasp_bindings: ProgramContactGraspBinding[];
   provenance: ProgramBindingProvenance;
 }
@@ -65,6 +71,24 @@ export interface ProgramCapabilityBinding {
   control_binding: ProgramControlBindingRef | null;
   capability_provider_binding: ProgramCapabilityProviderBindingRef | null;
   command_schema: ProgramCommandSchemaRef | null;
+}
+export interface ProgramNodePolicy {
+  instance_id: string;
+  modification_policy: ProgramNodeModificationPolicy;
+  recovery_policy: ProgramNodeRecoveryPolicy;
+  operator_stop_policy: ProgramOperatorStopPolicy;
+}
+export interface ProgramNodeModificationPolicy {
+  runtime_override: ProgramModificationPolicyValue;
+  persistent_edit: ProgramModificationPolicyValue;
+  intervention_delegate: ProgramInterventionDelegate;
+}
+export interface ProgramNodeRecoveryPolicy {
+  allow_intervention: boolean;
+  allowed_recovery_actions: ProgramRecoveryAction[];
+  max_retries: number;
+  allowed_skills: string[];
+  persistence_ceiling: ProgramPersistenceCeiling;
 }
 export interface ProgramControlBindingRef {
   control_binding_id: string;

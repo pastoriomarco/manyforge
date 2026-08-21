@@ -16,6 +16,148 @@ inline constexpr std::string_view kComposableCellProgramProfile =
     "composable-cell-v1";
 inline constexpr std::size_t kMaxProgramContractRoles = 4096U;
 inline constexpr std::size_t kMaxProgramRoleRequirements = 4096U;
+inline constexpr std::size_t kMaxProgramTreeNodes = 100000U;
+inline constexpr std::size_t kMaxProgramNodePolicies = kMaxProgramTreeNodes;
+inline constexpr std::size_t kMaxProgramAllowedSkills = 256U;
+inline constexpr std::size_t kMaxProgramSkillIdBytes = 128U;
+
+struct ProgramNodeInstanceIdTag final {};
+using ProgramNodeInstanceId = StrongString<ProgramNodeInstanceIdTag>;
+
+enum class ProgramModificationPolicyValue : std::uint8_t {
+  kForbidden = 0,
+  kHumanApproval,
+  kLlmAllowed,
+};
+
+[[nodiscard]] constexpr std::string_view to_string(
+    ProgramModificationPolicyValue value) noexcept {
+  switch (value) {
+    case ProgramModificationPolicyValue::kForbidden:
+      return "forbidden";
+    case ProgramModificationPolicyValue::kHumanApproval:
+      return "human_approval";
+    case ProgramModificationPolicyValue::kLlmAllowed:
+      return "llm_allowed";
+  }
+  return {};
+}
+
+enum class ProgramInterventionDelegate : std::uint8_t {
+  kForbidden = 0,
+  kHumanOnly,
+  kLlmAllowed,
+  kProgramOnly,
+};
+
+[[nodiscard]] constexpr std::string_view to_string(
+    ProgramInterventionDelegate value) noexcept {
+  switch (value) {
+    case ProgramInterventionDelegate::kForbidden:
+      return "forbidden";
+    case ProgramInterventionDelegate::kHumanOnly:
+      return "human_only";
+    case ProgramInterventionDelegate::kLlmAllowed:
+      return "llm_allowed";
+    case ProgramInterventionDelegate::kProgramOnly:
+      return "program_only";
+  }
+  return {};
+}
+
+enum class ProgramRecoveryAction : std::uint8_t {
+  kIntervention = 0,
+  kRuntimeOverride,
+};
+
+[[nodiscard]] constexpr std::string_view to_string(
+    ProgramRecoveryAction value) noexcept {
+  switch (value) {
+    case ProgramRecoveryAction::kIntervention:
+      return "intervention";
+    case ProgramRecoveryAction::kRuntimeOverride:
+      return "runtime_override";
+  }
+  return {};
+}
+
+enum class ProgramRecoveryPersistenceCeiling : std::uint8_t {
+  kSessionOnly = 0,
+  kRuntimeOverride,
+  kDraftPatch,
+};
+
+[[nodiscard]] constexpr std::string_view to_string(
+    ProgramRecoveryPersistenceCeiling value) noexcept {
+  switch (value) {
+    case ProgramRecoveryPersistenceCeiling::kSessionOnly:
+      return "session_only";
+    case ProgramRecoveryPersistenceCeiling::kRuntimeOverride:
+      return "runtime_override";
+    case ProgramRecoveryPersistenceCeiling::kDraftPatch:
+      return "draft_patch";
+  }
+  return {};
+}
+
+enum class ProgramOperatorStopPolicy : std::uint8_t {
+  kInherit = 0,
+  kHold,
+  kContinue,
+};
+
+[[nodiscard]] constexpr std::string_view to_string(
+    ProgramOperatorStopPolicy value) noexcept {
+  switch (value) {
+    case ProgramOperatorStopPolicy::kInherit:
+      return "inherit";
+    case ProgramOperatorStopPolicy::kHold:
+      return "hold";
+    case ProgramOperatorStopPolicy::kContinue:
+      return "continue";
+  }
+  return {};
+}
+
+struct ProgramNodeModificationPolicyDTO final {
+  ProgramModificationPolicyValue runtime_override{
+      ProgramModificationPolicyValue::kForbidden};
+  ProgramModificationPolicyValue persistent_edit{
+      ProgramModificationPolicyValue::kForbidden};
+  ProgramInterventionDelegate intervention_delegate{
+      ProgramInterventionDelegate::kForbidden};
+
+  friend bool operator==(const ProgramNodeModificationPolicyDTO&,
+                         const ProgramNodeModificationPolicyDTO&) = default;
+};
+
+struct ProgramNodeRecoveryPolicyDTO final {
+  bool allow_intervention{false};
+  std::vector<ProgramRecoveryAction> allowed_recovery_actions;
+  std::uint8_t max_retries{0U};
+  std::vector<std::string> allowed_skills;
+  ProgramRecoveryPersistenceCeiling persistence_ceiling{
+      ProgramRecoveryPersistenceCeiling::kSessionOnly};
+
+  friend bool operator==(const ProgramNodeRecoveryPolicyDTO&,
+                         const ProgramNodeRecoveryPolicyDTO&) = default;
+};
+
+/// Complete resolved authored policy values for one non-default Program node.
+///
+/// This DTO is shared by the verified Program contract and its compiled
+/// Program-Binding. It intentionally contains no runtime state, node kind, or
+/// browser/editor metadata.
+struct ProgramNodePolicyDTO final {
+  ProgramNodeInstanceId instance_id;
+  ProgramNodeModificationPolicyDTO modification_policy;
+  ProgramNodeRecoveryPolicyDTO recovery_policy;
+  ProgramOperatorStopPolicy operator_stop_policy{
+      ProgramOperatorStopPolicy::kInherit};
+
+  friend bool operator==(const ProgramNodePolicyDTO&,
+                         const ProgramNodePolicyDTO&) = default;
+};
 
 enum class ProgramCapabilityDisposition : std::uint8_t {
   kRequired = 0,
@@ -105,6 +247,7 @@ struct ProgramBindingContractDTO final {
   std::vector<ProgramComponentRoleRequirementDTO> component_roles;
   std::vector<ProgramTargetRoleRequirementDTO> target_roles;
   std::vector<ProgramContactGraspTemplateDTO> contact_grasp_templates{};
+  std::vector<ProgramNodePolicyDTO> node_policies{};
 
   friend bool operator==(const ProgramBindingContractDTO&,
                          const ProgramBindingContractDTO&) = default;

@@ -247,6 +247,61 @@ struct BindingContext final {
   };
 }
 
+[[nodiscard]] ProgramBindingDTO make_policy_binding_value(
+    const BindingContext& context) {
+  auto value = make_binding_value(context);
+  value.node_policies.push_back(manyforge::core::ProgramNodePolicyDTO{
+      manyforge::core::ProgramNodeInstanceId("root"),
+      manyforge::core::ProgramNodeModificationPolicyDTO{
+          manyforge::core::ProgramModificationPolicyValue::kHumanApproval,
+          manyforge::core::ProgramModificationPolicyValue::kForbidden,
+          manyforge::core::ProgramInterventionDelegate::kHumanOnly},
+      manyforge::core::ProgramNodeRecoveryPolicyDTO{
+          false,
+          {manyforge::core::ProgramRecoveryAction::kRuntimeOverride},
+          1U,
+          {},
+          manyforge::core::ProgramRecoveryPersistenceCeiling::kSessionOnly},
+      manyforge::core::ProgramOperatorStopPolicy::kHold});
+  return value;
+}
+
+[[nodiscard]] std::string replace_once(std::string value,
+                                       std::string_view from,
+                                       std::string_view to) {
+  const auto position = value.find(from);
+  if (position == std::string::npos) {
+    throw std::logic_error("test could not find raw binding mutation");
+  }
+  value.replace(position, from.size(), to);
+  return value;
+}
+
+[[nodiscard]] std::string policy_row(const std::string& bytes) {
+  constexpr std::string_view prefix = "\"node_policies\":[";
+  constexpr std::string_view suffix = "],\"program_binding_id\"";
+  const auto begin = bytes.find(prefix);
+  const auto end = bytes.find(suffix, begin + prefix.size());
+  if (begin == std::string::npos || end == std::string::npos) {
+    throw std::logic_error("test binding omitted node-policy table");
+  }
+  return bytes.substr(begin + prefix.size(), end - begin - prefix.size());
+}
+
+[[nodiscard]] std::string replace_policy_table(
+    const std::string& bytes, const std::string& table) {
+  constexpr std::string_view prefix = "\"node_policies\":[";
+  constexpr std::string_view suffix = "],\"program_binding_id\"";
+  const auto begin = bytes.find(prefix);
+  const auto end = bytes.find(suffix, begin + prefix.size());
+  if (begin == std::string::npos || end == std::string::npos) {
+    throw std::logic_error("test binding omitted node-policy table");
+  }
+  std::string result = bytes;
+  result.replace(begin + prefix.size(), end - begin - prefix.size(), table);
+  return result;
+}
+
 TEST(ProgramBindingTest,
      SealedEnvelopeReloadsOnlyAgainstItsExactBundleAndModelMap) {
   ScopedTrustedRoot root;
@@ -264,6 +319,271 @@ TEST(ProgramBindingTest,
   ASSERT_NE(reloaded, nullptr);
   EXPECT_EQ(reloaded->program_binding_id(), sealed->program_binding_id());
   EXPECT_EQ(reloaded->value(), sealed->value());
+}
+
+TEST(ProgramBindingTest, NodePoliciesAreRequiredSparseAndIdentitySensitive) {
+  ScopedTrustedRoot root;
+  const BindingContext context = make_context(root.path());
+  ProgramBindingDTO value = make_binding_value(context);
+  value.node_policies.push_back(manyforge::core::ProgramNodePolicyDTO{
+      manyforge::core::ProgramNodeInstanceId("root"),
+      manyforge::core::ProgramNodeModificationPolicyDTO{
+          manyforge::core::ProgramModificationPolicyValue::kHumanApproval,
+          manyforge::core::ProgramModificationPolicyValue::kForbidden,
+          manyforge::core::ProgramInterventionDelegate::kHumanOnly},
+      manyforge::core::ProgramNodeRecoveryPolicyDTO{
+          false,
+          {manyforge::core::ProgramRecoveryAction::kRuntimeOverride},
+          1U,
+          {},
+          manyforge::core::ProgramRecoveryPersistenceCeiling::kSessionOnly},
+      manyforge::core::ProgramOperatorStopPolicy::kHold});
+  const auto sealed = ProgramBindingConstructionAuthority::seal(value);
+
+  ASSERT_NE(sealed, nullptr);
+  ASSERT_EQ(sealed->value().node_policies.size(), 1U);
+  EXPECT_EQ(sealed->value().node_policies.front().instance_id.value(), "root");
+  const auto reloaded = reload_verified_program_binding(
+      sealed->canonical_bytes(), *context.bundle, context.model_map);
+  ASSERT_NE(reloaded, nullptr);
+  EXPECT_EQ(reloaded->value(), sealed->value());
+
+  value.node_policies.front().operator_stop_policy =
+      manyforge::core::ProgramOperatorStopPolicy::kContinue;
+  const auto changed = ProgramBindingConstructionAuthority::seal(value);
+  EXPECT_NE(changed->program_binding_id(), sealed->program_binding_id());
+}
+
+TEST(ProgramBindingTest, NodePolicyWireAndCrossFieldNegativesFailClosed) {
+  ScopedTrustedRoot root;
+  const BindingContext context = make_context(root.path());
+
+  ProgramBindingDTO default_row = make_binding_value(context);
+  default_row.node_policies.push_back(manyforge::core::ProgramNodePolicyDTO{
+      manyforge::core::ProgramNodeInstanceId("root"),
+      {},
+      {},
+      manyforge::core::ProgramOperatorStopPolicy::kInherit});
+  EXPECT_THROW(
+      static_cast<void>(
+          ProgramBindingConstructionAuthority::seal(std::move(default_row))),
+      ProgramBindingError);
+
+  ProgramBindingDTO cross_field = make_binding_value(context);
+  cross_field.node_policies.push_back(manyforge::core::ProgramNodePolicyDTO{
+      manyforge::core::ProgramNodeInstanceId("root"),
+      {},
+      manyforge::core::ProgramNodeRecoveryPolicyDTO{
+          false,
+          {manyforge::core::ProgramRecoveryAction::kRuntimeOverride},
+          0U,
+          {},
+          manyforge::core::ProgramRecoveryPersistenceCeiling::kSessionOnly},
+      manyforge::core::ProgramOperatorStopPolicy::kInherit});
+  EXPECT_THROW(
+      static_cast<void>(
+          ProgramBindingConstructionAuthority::seal(std::move(cross_field))),
+      ProgramBindingError);
+
+  ProgramBindingDTO skills = make_binding_value(context);
+  skills.node_policies.push_back(manyforge::core::ProgramNodePolicyDTO{
+      manyforge::core::ProgramNodeInstanceId("root"),
+      {},
+      manyforge::core::ProgramNodeRecoveryPolicyDTO{
+          true,
+          {manyforge::core::ProgramRecoveryAction::kIntervention},
+          0U,
+          {"unqualified-skill"},
+          manyforge::core::ProgramRecoveryPersistenceCeiling::kSessionOnly},
+      manyforge::core::ProgramOperatorStopPolicy::kInherit});
+  try {
+    static_cast<void>(
+        ProgramBindingConstructionAuthority::seal(std::move(skills)));
+    FAIL() << "nonempty allowed_skills unexpectedly sealed";
+  } catch (const ProgramBindingError& error) {
+    EXPECT_NE(
+        std::string(error.what()).find(
+            "exact revision-qualified retained skill referent"),
+        std::string::npos);
+  }
+
+  const auto sealed =
+      ProgramBindingConstructionAuthority::seal(make_binding_value(context));
+  std::string missing_node_policies(sealed->canonical_bytes());
+  const std::string field = "\"node_policies\":[],";
+  const std::size_t position = missing_node_policies.find(field);
+  ASSERT_NE(position, std::string::npos);
+  missing_node_policies.erase(position, field.size());
+  EXPECT_THROW(
+      static_cast<void>(reload_verified_program_binding(
+          missing_node_policies, *context.bundle, context.model_map)),
+      ProgramBindingError);
+}
+
+TEST(ProgramBindingTest, RawNodePolicyReloadRejectsEveryBoundedNegativeFamily) {
+  ScopedTrustedRoot root;
+  const BindingContext context = make_context(root.path());
+  const auto sealed = ProgramBindingConstructionAuthority::seal(
+      make_policy_binding_value(context));
+  const std::string valid(sealed->canonical_bytes());
+  const std::string row = policy_row(valid);
+  const auto expect_rejected = [&](const std::string& bytes) {
+    EXPECT_THROW(
+        static_cast<void>(reload_verified_program_binding(
+            bytes, *context.bundle, context.model_map)),
+        ProgramBindingError);
+  };
+
+  expect_rejected(replace_policy_table(
+      valid,
+      replace_once(row, "\"persistence_ceiling\":\"session_only\"}}",
+                   "\"persistence_ceiling\":\"session_only\"},\"zzz\":true}")));
+  expect_rejected(replace_policy_table(
+      valid, replace_once(row, ",\"operator_stop_policy\":\"hold\"", "")));
+  expect_rejected(replace_policy_table(
+      valid,
+      replace_once(
+          row,
+          "\"modification_policy\":{\"intervention_delegate\":\"human_only\",\"persistent_edit\":\"forbidden\",\"runtime_override\":\"human_approval\"}",
+          "\"modification_policy\":null")));
+  expect_rejected(replace_policy_table(
+      valid, replace_once(row, ",\"persistent_edit\":\"forbidden\"", "")));
+  expect_rejected(replace_policy_table(
+      valid, replace_once(row, "\"runtime_override\":\"human_approval\"",
+                          "\"runtime_override\":\"operator_allowed\"")));
+  expect_rejected(replace_policy_table(
+      valid, replace_once(row, "\"intervention_delegate\":\"human_only\"",
+                          "\"intervention_delegate\":\"operator\"")));
+
+  expect_rejected(replace_policy_table(
+      valid,
+      replace_once(
+          row,
+          "\"recovery_policy\":{\"allow_intervention\":false,\"allowed_recovery_actions\":[\"runtime_override\"],\"allowed_skills\":[],\"max_retries\":1,\"persistence_ceiling\":\"session_only\"}",
+          "\"recovery_policy\":null")));
+  expect_rejected(replace_policy_table(
+      valid, replace_once(row, ",\"max_retries\":1", "")));
+  expect_rejected(replace_policy_table(
+      valid, replace_once(row, "\"allow_intervention\":false",
+                          "\"allow_intervention\":0")));
+  expect_rejected(replace_policy_table(
+      valid, replace_once(row, "\"allowed_recovery_actions\":[\"runtime_override\"]",
+                          "\"allowed_recovery_actions\":{}")));
+  expect_rejected(replace_policy_table(
+      valid,
+      replace_once(
+          row, "\"allowed_recovery_actions\":[\"runtime_override\"]",
+          "\"allowed_recovery_actions\":[\"intervention\",\"runtime_override\",\"runtime_override\"]")));
+  expect_rejected(replace_policy_table(
+      valid,
+      replace_once(row, "\"allowed_recovery_actions\":[\"runtime_override\"]",
+                   "\"allowed_recovery_actions\":[\"unknown\"]")));
+  expect_rejected(replace_policy_table(
+      valid,
+      replace_once(row, "\"allowed_recovery_actions\":[\"runtime_override\"]",
+                   "\"allowed_recovery_actions\":[\"runtime_override\",\"runtime_override\"]")));
+  expect_rejected(replace_policy_table(
+      valid,
+      replace_once(row, "\"allowed_recovery_actions\":[\"runtime_override\"]",
+                   "\"allowed_recovery_actions\":[\"runtime_override\",\"intervention\"]")));
+  expect_rejected(replace_policy_table(
+      valid, replace_once(row, "\"max_retries\":1", "\"max_retries\":true")));
+  expect_rejected(replace_policy_table(
+      valid, replace_once(row, "\"max_retries\":1", "\"max_retries\":256")));
+  expect_rejected(replace_policy_table(
+      valid,
+      replace_once(row, "\"allowed_skills\":[]",
+                   "\"allowed_skills\":[\"Upper\"]")));
+  expect_rejected(replace_policy_table(
+      valid,
+      replace_once(row, "\"allowed_skills\":[]",
+                   "\"allowed_skills\":{}")));
+  expect_rejected(replace_policy_table(
+      valid,
+      replace_once(row, "\"allowed_skills\":[]",
+                   "\"allowed_skills\":[\"a-skill\",\"a-skill\"]")));
+  expect_rejected(replace_policy_table(
+      valid,
+      replace_once(row, "\"allowed_skills\":[]",
+                   "\"allowed_skills\":[\"z-skill\",\"a-skill\"]")));
+  expect_rejected(replace_policy_table(
+      valid,
+      replace_once(row, "\"allowed_skills\":[]",
+                   "\"allowed_skills\":[\"a-skill\"]")));
+  std::string oversized_skills = "[";
+  for (std::size_t index = 0U; index < 257U; ++index) {
+    if (index != 0U) {
+      oversized_skills += ",";
+    }
+    oversized_skills += "\"skill-" + std::to_string(index) + "\"";
+  }
+  oversized_skills += "]";
+  expect_rejected(replace_policy_table(
+      valid, replace_once(row, "\"allowed_skills\":[]",
+                          "\"allowed_skills\":" + oversized_skills)));
+  expect_rejected(replace_policy_table(
+      valid,
+      replace_once(row, "\"allowed_skills\":[]",
+                   "\"allowed_skills\":[\"" + std::string(129, 'a') + "\"]")));
+
+  expect_rejected(replace_policy_table(
+      valid, replace_once(row, "\"instance_id\":\"root\"",
+                          "\"instance_id\":\"Root\"")));
+  expect_rejected(replace_policy_table(
+      valid,
+      replace_once(row, "\"operator_stop_policy\":\"hold\"",
+                   "\"operator_stop_policy\":\"pause\"")));
+  expect_rejected(replace_policy_table(
+      valid,
+      replace_once(row, "\"operator_stop_policy\":\"hold\"",
+                   "\"operator_stop_policy\":false")));
+  expect_rejected(replace_policy_table(
+      valid, replace_once(row, "\"runtime_override\":\"human_approval\"",
+                          "\"runtime_override\":\"forbidden\"")));
+
+  const std::string intervention_row = replace_once(
+      replace_once(
+          replace_once(row, "\"allow_intervention\":false",
+                       "\"allow_intervention\":true"),
+          "\"allowed_recovery_actions\":[\"runtime_override\"]",
+          "\"allowed_recovery_actions\":[\"intervention\"]"),
+      "\"allowed_skills\":[]", "\"allowed_skills\":[\"a-skill\"]");
+  expect_rejected(replace_policy_table(valid, intervention_row));
+  expect_rejected(replace_policy_table(
+      valid,
+      replace_once(
+          replace_once(
+              replace_once(
+                  replace_once(row, "\"runtime_override\":\"human_approval\"",
+                               "\"runtime_override\":\"forbidden\""),
+                  "\"allow_intervention\":false",
+                  "\"allow_intervention\":true"),
+              "\"allowed_recovery_actions\":[\"runtime_override\"]",
+              "\"allowed_recovery_actions\":[\"intervention\"]"),
+          "\"persistence_ceiling\":\"session_only\"",
+          "\"persistence_ceiling\":\"runtime_override\"")));
+  expect_rejected(replace_policy_table(
+      valid,
+      replace_once(
+          replace_once(
+              replace_once(row, "\"allow_intervention\":false",
+                           "\"allow_intervention\":true"),
+              "\"allowed_recovery_actions\":[\"runtime_override\"]",
+              "\"allowed_recovery_actions\":[\"intervention\"]"),
+          "\"persistence_ceiling\":\"session_only\"",
+          "\"persistence_ceiling\":\"draft_patch\"")));
+  expect_rejected(replace_policy_table(
+      valid,
+      replace_once(
+          replace_once(row, "\"allowed_recovery_actions\":[\"runtime_override\"]",
+                       "\"allowed_recovery_actions\":[]"),
+          "\"max_retries\":1", "\"max_retries\":2")));
+
+  const std::string duplicate_table = row + "," + row;
+  expect_rejected(replace_policy_table(valid, duplicate_table));
+  const std::string lower_row = replace_once(
+      row, "\"instance_id\":\"root\"", "\"instance_id\":\"a\"");
+  expect_rejected(replace_policy_table(valid, row + "," + lower_row));
 }
 
 TEST(ProgramBindingTest, ContextRejectsAResealedGeneratedFrameSubstitution) {

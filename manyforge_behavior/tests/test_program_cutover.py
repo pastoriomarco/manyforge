@@ -7,6 +7,7 @@ from typing import Any
 
 import pytest
 
+import manyforge_behavior.program as program_module
 from manyforge_behavior.catalog import NodeCatalog
 from manyforge_behavior.canonical_artifact import (
     compute_content_identity,
@@ -121,6 +122,256 @@ def test_program_document_copy_is_detached() -> None:
     assert "unexpected" not in program.to_dict()["tree"]["parameters"]
 
 
+def test_program_node_policy_defaults_are_omission_compatible() -> None:
+    catalog = _catalog()
+    source = load_strict_json_yaml(_ROOT / _MINIMAL_PROGRAM)
+    baseline = Program.from_dict(source, catalog)
+    explicit = deepcopy(source)
+    node = explicit["tree"]["children"][0]
+    node["modification_policy"] = {
+        "runtime_override": "forbidden",
+        "persistent_edit": "forbidden",
+        "intervention_delegate": "forbidden",
+    }
+    node["recovery_policy"] = {
+        "allow_intervention": False,
+        "allowed_recovery_actions": [],
+        "max_retries": 0,
+        "allowed_skills": [],
+        "persistence_ceiling": "session_only",
+    }
+    node["operator_stop_policy"] = "inherit"
+
+    explicit["program_revision"] = baseline.program_revision
+    normalized = Program.from_dict(explicit, catalog)
+
+    assert normalized.to_dict() == baseline.to_dict()
+    assert normalized.canonical_bytes == baseline.canonical_bytes
+    assert normalized.program_revision == baseline.program_revision
+
+
+@pytest.mark.parametrize(
+    "field,value",
+    [
+        (
+            "modification_policy",
+            {
+                "runtime_override": "forbidden",
+                "persistent_edit": "forbidden",
+                "intervention_delegate": "forbidden",
+            },
+        ),
+        (
+            "recovery_policy",
+            {
+                "allow_intervention": False,
+                "allowed_recovery_actions": [],
+                "max_retries": 0,
+                "allowed_skills": [],
+                "persistence_ceiling": "session_only",
+            },
+        ),
+        ("operator_stop_policy", "inherit"),
+    ],
+)
+def test_program_node_policy_independent_defaults_migrate_to_omission(
+    field: str, value: Any
+) -> None:
+    catalog = _catalog()
+    source = load_strict_json_yaml(_ROOT / _MINIMAL_PROGRAM)
+    baseline = Program.from_dict(source, catalog)
+    explicit = deepcopy(source)
+    explicit["tree"]["children"][0][field] = value
+    explicit["program_revision"] = baseline.program_revision
+
+    migrated = Program.from_dict(explicit, catalog)
+
+    assert migrated.to_dict() == baseline.to_dict()
+    assert migrated.canonical_bytes == baseline.canonical_bytes
+    assert migrated.program_revision == baseline.program_revision
+
+
+@pytest.mark.parametrize(
+    "policy",
+    [
+        {"modification_policy": None},
+        {"modification_policy": {}},
+        {
+            "modification_policy": {
+                "runtime_override": "forbidden",
+                "persistent_edit": "forbidden",
+            }
+        },
+        {"recovery_policy": None},
+        {"recovery_policy": {}},
+        {
+            "recovery_policy": {
+                "allow_intervention": False,
+                "allowed_recovery_actions": [],
+                "max_retries": 0,
+                "allowed_skills": [],
+            }
+        },
+        {"operator_stop_policy": None},
+    ],
+)
+def test_program_node_policy_rejects_null_empty_and_partial_objects(
+    policy: dict[str, Any],
+) -> None:
+    document = load_strict_json_yaml(_ROOT / _MINIMAL_PROGRAM)
+    document["tree"]["children"][0].update(policy)
+    with pytest.raises(ProgramValidationError):
+        Program.from_dict(_identified(document), _catalog())
+
+
+def test_program_node_policy_nondefaults_change_identity_and_round_trip() -> None:
+    document = load_strict_json_yaml(_ROOT / _MINIMAL_PROGRAM)
+    node = document["tree"]["children"][0]
+    node["modification_policy"] = {
+        "runtime_override": "human_approval",
+        "persistent_edit": "llm_allowed",
+        "intervention_delegate": "human_only",
+    }
+    node["recovery_policy"] = {
+        "allow_intervention": True,
+        "allowed_recovery_actions": ["intervention"],
+        "max_retries": 2,
+        "allowed_skills": [],
+        "persistence_ceiling": "draft_patch",
+    }
+    node["operator_stop_policy"] = "hold"
+
+    identified = _identified(document)
+    program = Program.from_dict(identified, _catalog())
+
+    assert program.to_dict()["tree"]["children"][0]["modification_policy"] == node[
+        "modification_policy"
+    ]
+    assert program.to_dict()["tree"]["children"][0]["recovery_policy"] == node[
+        "recovery_policy"
+    ]
+    assert program.to_dict()["tree"]["children"][0]["operator_stop_policy"] == "hold"
+    assert program.program_revision == identified["program_revision"]
+
+
+@pytest.mark.parametrize(
+    "field,value",
+    [
+        ("recovery_policy", {
+            "allow_intervention": False,
+            "allowed_recovery_actions": ["intervention"],
+            "max_retries": 0,
+            "allowed_skills": [],
+            "persistence_ceiling": "session_only",
+        }),
+        ("recovery_policy", {
+            "allow_intervention": True,
+            "allowed_recovery_actions": [],
+            "max_retries": 0,
+            "allowed_skills": [],
+            "persistence_ceiling": "session_only",
+        }),
+        ("recovery_policy", {
+            "allow_intervention": False,
+            "allowed_recovery_actions": ["runtime_override"],
+            "max_retries": 0,
+            "allowed_skills": [],
+            "persistence_ceiling": "session_only",
+        }),
+        ("recovery_policy", {
+            "allow_intervention": True,
+            "allowed_recovery_actions": ["intervention"],
+            "max_retries": 0,
+            "allowed_skills": ["z-skill", "a-skill"],
+            "persistence_ceiling": "session_only",
+        }),
+        ("recovery_policy", {
+            "allow_intervention": True,
+            "allowed_recovery_actions": ["intervention"],
+            "max_retries": 0,
+            "allowed_skills": ["a" * 129],
+            "persistence_ceiling": "session_only",
+        }),
+        ("recovery_policy", {
+            "allow_intervention": False,
+            "allowed_recovery_actions": [],
+            "max_retries": 1,
+            "allowed_skills": [],
+            "persistence_ceiling": "session_only",
+        }),
+    ],
+)
+def test_program_node_policy_cross_fields_are_closed(
+    field: str, value: dict[str, Any]
+) -> None:
+    document = load_strict_json_yaml(_ROOT / _MINIMAL_PROGRAM)
+    document["tree"]["children"][0][field] = value
+    with pytest.raises(ProgramValidationError):
+        Program.from_dict(_identified(document), _catalog())
+
+
+@pytest.mark.parametrize(
+    "field,value",
+    [
+        ("modification_policy", {
+            "runtime_override": "operator_allowed",
+            "persistent_edit": "forbidden",
+            "intervention_delegate": "human_only",
+        }),
+        ("recovery_policy", {
+            "allow_intervention": False,
+            "allowed_recovery_actions": ["runtime_override", "intervention"],
+            "max_retries": 0,
+            "allowed_skills": [],
+            "persistence_ceiling": "session_only",
+        }),
+        ("recovery_policy", {
+            "allow_intervention": False,
+            "allowed_recovery_actions": [],
+            "max_retries": True,
+            "allowed_skills": [],
+            "persistence_ceiling": "session_only",
+        }),
+        ("recovery_policy", {
+            "allow_intervention": False,
+            "allowed_recovery_actions": [],
+            "max_retries": 256,
+            "allowed_skills": [],
+            "persistence_ceiling": "session_only",
+        }),
+        ("recovery_policy", {
+            "allow_intervention": True,
+            "allowed_recovery_actions": ["intervention"],
+            "max_retries": 0,
+            "allowed_skills": ["Z-skill"],
+            "persistence_ceiling": "session_only",
+        }),
+        ("recovery_policy", {
+            "allow_intervention": True,
+            "allowed_recovery_actions": ["intervention"],
+            "max_retries": 0,
+            "allowed_skills": ["z-skill", "a-skill"],
+            "persistence_ceiling": "session_only",
+        }),
+        ("recovery_policy", {
+            "allow_intervention": False,
+            "allowed_recovery_actions": [],
+            "max_retries": 0,
+            "allowed_skills": [],
+            "persistence_ceiling": "persistent",
+        }),
+        ("operator_stop_policy", "pause"),
+    ],
+)
+def test_program_node_policy_rejects_closed_values_and_bounds(
+    field: str, value: Any
+) -> None:
+    document = load_strict_json_yaml(_ROOT / _MINIMAL_PROGRAM)
+    document["tree"]["children"][0][field] = value
+    with pytest.raises(ProgramValidationError):
+        Program.from_dict(_identified(document), _catalog())
+
+
 def test_program_rejects_stale_revision_before_semantic_use() -> None:
     catalog = _catalog()
     document = load_strict_json_yaml(_ROOT / _MINIMAL_PROGRAM)
@@ -128,6 +379,50 @@ def test_program_rejects_stale_revision_before_semantic_use() -> None:
 
     with pytest.raises(ProgramValidationError, match="content identity mismatch"):
         Program.from_dict(document, catalog)
+
+
+def test_program_stale_revision_wins_over_independently_invalid_semantics() -> None:
+    document = load_strict_json_yaml(_ROOT / _MINIMAL_PROGRAM)
+    document["program_revision"] = "sha256:" + "f" * 64
+    document["tree"]["children"][0]["node_id"] = "motion.not_in_catalog"
+
+    with pytest.raises(ProgramValidationError, match="content identity mismatch"):
+        Program.from_dict(document, _catalog())
+
+
+def test_program_stale_explicit_defaults_still_migrate_only_after_identity() -> None:
+    catalog = _catalog()
+    source = load_strict_json_yaml(_ROOT / _MINIMAL_PROGRAM)
+    baseline = Program.from_dict(source, catalog)
+    explicit = deepcopy(source)
+    explicit["tree"]["children"][0]["operator_stop_policy"] = "inherit"
+    explicit["program_revision"] = "sha256:" + "f" * 64
+
+    with pytest.raises(ProgramValidationError, match="content identity mismatch"):
+        Program.from_dict(explicit, catalog)
+
+    explicit["program_revision"] = baseline.program_revision
+    migrated = Program.from_dict(explicit, catalog)
+    assert migrated.program_revision == baseline.program_revision
+
+
+def test_program_default_policy_identity_migration_obeys_tree_bound(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    document = load_strict_json_yaml(_ROOT / _MINIMAL_PROGRAM)
+    document["tree"]["operator_stop_policy"] = "inherit"
+    monkeypatch.setattr(program_module, "_MAX_TREE_NODES", 1)
+
+    with pytest.raises(ProgramValidationError, match="content identity mismatch"):
+        Program.from_dict(document, _catalog())
+
+
+def test_program_identity_migration_does_not_enter_cyclic_json_model() -> None:
+    document = load_strict_json_yaml(_ROOT / _MINIMAL_PROGRAM)
+    document["tree"]["children"].append(document["tree"])
+
+    with pytest.raises(ProgramValidationError, match="collection nesting exceeds"):
+        Program.from_dict(document, _catalog())
 
 
 def test_program_rejects_removed_singleton_surface() -> None:

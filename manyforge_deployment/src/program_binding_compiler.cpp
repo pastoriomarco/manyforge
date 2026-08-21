@@ -1217,6 +1217,7 @@ compile_program_binding_contract(
     binding_value.contact_grasp_bindings = resolve_contact_grasp_bindings(
         program_contract, binding_value.component_role_bindings,
         binding_value.target_role_bindings);
+    binding_value.node_policies = program_contract.node_policies;
     auto sealed = detail::ProgramBindingConstructionAuthority::seal(
         std::move(binding_value));
     return reload_verified_program_binding(sealed->canonical_bytes(),

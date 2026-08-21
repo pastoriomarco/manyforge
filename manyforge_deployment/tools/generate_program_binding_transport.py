@@ -30,8 +30,13 @@ EXPECTED_LIMITS = {
     "compiled_text_bytes": 4096,
     "identity_bytes": 128,
     "nested_rows": 4096,
+    "node_policy_rows": 100000,
+    "allowed_recovery_actions": 2,
+    "allowed_skills": 256,
+    "skill_id_bytes": 128,
     "provenance_rows": 16384,
     "role_rows": 4096,
+    "max_retries": 255,
 }
 EXPECTED_SCALARS = {
     "digest": {"kind": "string", "pattern": r"^sha256:[0-9a-f]{64}$"},
@@ -46,8 +51,17 @@ EXPECTED_SCALARS = {
         "maximum_utf8_bytes": 4096,
     },
 }
+EXPECTED_ENUMS = {
+    "modification_policy_value": ["forbidden", "human_approval", "llm_allowed"],
+    "intervention_delegate": [
+        "forbidden", "human_only", "llm_allowed", "program_only",
+    ],
+    "recovery_action": ["intervention", "runtime_override"],
+    "persistence_ceiling": ["session_only", "runtime_override", "draft_patch"],
+    "operator_stop_policy": ["inherit", "hold", "continue"],
+}
 EXPECTED_RECORDS = {
-    "binding": ["api_version", "program_binding_id", "program_id", "program_revision", "retained_bundle_id", "graph_revision", "node_environment", "component_role_bindings", "target_role_bindings", "contact_grasp_bindings", "provenance"],
+    "binding": ["api_version", "program_binding_id", "program_id", "program_revision", "retained_bundle_id", "graph_revision", "node_environment", "component_role_bindings", "target_role_bindings", "node_policies", "contact_grasp_bindings", "provenance"],
     "node_environment": ["catalog_id", "content_version", "catalog_digest", "environment_digest"],
     "component": ["component_role_id", "controllable_component_id", "component_type_id", "component_type_revision", "model_role_bindings"],
     "model": ["model_role_id", "model_instance_id", "model_revision"],
@@ -56,6 +70,9 @@ EXPECTED_RECORDS = {
     "resource": ["resource_role_id", "resource_ids", "compiled_resource_names"],
     "collision": ["collision_body_role_id", "model_instance_id", "model_revision", "compiled_collision_body_names"],
     "capability": ["capability_id", "capability_definition_revision", "control_binding", "capability_provider_binding", "command_schema"],
+    "node_policy": ["instance_id", "modification_policy", "recovery_policy", "operator_stop_policy"],
+    "modification_policy": ["runtime_override", "persistent_edit", "intervention_delegate"],
+    "recovery_policy": ["allow_intervention", "allowed_recovery_actions", "max_retries", "allowed_skills", "persistence_ceiling"],
     "control": ["control_binding_id", "control_binding_revision"],
     "provider": ["capability_provider_binding_id", "capability_provider_binding_revision"],
     "command_schema": ["command_schema_id", "command_schema_revision"],
@@ -75,7 +92,10 @@ EXPECTED_FORMULAS = {
 }
 EXPECTED_INVARIANTS = [
     "closed_records", "bounded_scalars", "bounded_tables",
-    "canonical_sorted_unique", "resource_vector_correspondence",
+    "canonical_sorted_unique",
+    "node_policy_enums_and_cross_fields", "node_policy_sparse_rows",
+    "node_policy_skill_referents_fail_closed",
+    "resource_vector_correspondence",
     "resource_vector_independent_uniqueness", "collision_name_uniqueness",
     "capability_has_resolution", "target_component_correspondence",
     "finite_contact_ranges", "contact_target_collision_model_correspondence",
@@ -92,6 +112,9 @@ TYPE_NAMES = {
     "resource": "ProgramResourceRoleBinding",
     "collision": "ProgramCollisionBodyRoleBinding",
     "capability": "ProgramCapabilityBinding",
+    "node_policy": "ProgramNodePolicy",
+    "modification_policy": "ProgramNodeModificationPolicy",
+    "recovery_policy": "ProgramNodeRecoveryPolicy",
     "control": "ProgramControlBindingRef",
     "provider": "ProgramCapabilityProviderBindingRef",
     "command_schema": "ProgramCommandSchemaRef",
@@ -105,6 +128,7 @@ FIELD_TYPES = {
     ("binding", "node_environment"): "ProgramBindingNodeEnvironment",
     ("binding", "component_role_bindings"): "ProgramComponentRoleBinding[]",
     ("binding", "target_role_bindings"): "ProgramTargetRoleBinding[]",
+    ("binding", "node_policies"): "ProgramNodePolicy[]",
     ("binding", "contact_grasp_bindings"): "ProgramContactGraspBinding[]",
     ("binding", "provenance"): "ProgramBindingProvenance",
     ("component", "model_role_bindings"): "ProgramModelRoleBinding[]",
@@ -118,6 +142,17 @@ FIELD_TYPES = {
     ("capability", "control_binding"): "ProgramControlBindingRef | null",
     ("capability", "capability_provider_binding"): "ProgramCapabilityProviderBindingRef | null",
     ("capability", "command_schema"): "ProgramCommandSchemaRef | null",
+    ("node_policy", "modification_policy"): "ProgramNodeModificationPolicy",
+    ("node_policy", "recovery_policy"): "ProgramNodeRecoveryPolicy",
+    ("node_policy", "operator_stop_policy"): "ProgramOperatorStopPolicy",
+    ("modification_policy", "runtime_override"): "ProgramModificationPolicyValue",
+    ("modification_policy", "persistent_edit"): "ProgramModificationPolicyValue",
+    ("modification_policy", "intervention_delegate"): "ProgramInterventionDelegate",
+    ("recovery_policy", "allow_intervention"): "boolean",
+    ("recovery_policy", "allowed_recovery_actions"): "ProgramRecoveryAction[]",
+    ("recovery_policy", "max_retries"): "number",
+    ("recovery_policy", "allowed_skills"): "string[]",
+    ("recovery_policy", "persistence_ceiling"): "ProgramPersistenceCeiling",
     ("contact", "allowed_body_bindings"): "ProgramContactGraspBodyBinding[]",
     ("contact", "max_penetration_m"): "number",
     ("contact", "terminal_window_start_fraction"): "number",
@@ -135,7 +170,7 @@ def load_and_validate(path: Path) -> dict[str, Any]:
     except (OSError, UnicodeError, json.JSONDecodeError) as error:
         raise ValueError(f"invalid descriptor JSON: {error}") from error
     expected_root = {
-        "api_version", "binding_api_version", "limits", "scalars", "records",
+        "api_version", "binding_api_version", "limits", "scalars", "enums", "records",
         "catalog_record_kinds", "formulas", "invariants",
     }
     if not isinstance(value, dict) or set(value) != expected_root:
@@ -147,6 +182,7 @@ def load_and_validate(path: Path) -> dict[str, Any]:
     exact = (
         ("limits", EXPECTED_LIMITS),
         ("scalars", EXPECTED_SCALARS),
+        ("enums", EXPECTED_ENUMS),
         ("records", EXPECTED_RECORDS),
         ("catalog_record_kinds", EXPECTED_KINDS),
         ("formulas", EXPECTED_FORMULAS),
@@ -177,6 +213,11 @@ def _py_constants(descriptor: dict[str, Any]) -> str:
         "})",
         f'_MAX = {limits["nested_rows"]}',
         f'_ROLE_MAX = {limits["role_rows"]}',
+        f'_NODE_POLICY_MAX = {limits["node_policy_rows"]}',
+        f'_RECOVERY_ACTION_MAX = {limits["allowed_recovery_actions"]}',
+        f'_SKILL_MAX = {limits["allowed_skills"]}',
+        f'_SKILL_ID_MAX = {limits["skill_id_bytes"]}',
+        f'_RETRY_MAX = {limits["max_retries"]}',
         f'_PROVENANCE_MAX = {limits["provenance_rows"]}',
         f'_TEXT_MAX = {limits["compiled_text_bytes"]}',
         f'_IDENTITY_MAX = {limits["identity_bytes"]}',
@@ -188,6 +229,17 @@ def _py_constants(descriptor: dict[str, Any]) -> str:
         lines.append(f'    "{name}": ({entries}),')
     lines.extend([
         "}",
+        "_MODIFICATION_VALUES = frozenset(" +
+        repr(tuple(descriptor["enums"]["modification_policy_value"])) + ")",
+        "_INTERVENTION_DELEGATES = frozenset(" +
+        repr(tuple(descriptor["enums"]["intervention_delegate"])) + ")",
+        "_RECOVERY_ACTIONS = frozenset(" +
+        repr(tuple(descriptor["enums"]["recovery_action"])) + ")",
+        "_PERSISTENCE_CEILINGS = frozenset(" +
+        repr(tuple(descriptor["enums"]["persistence_ceiling"])) + ")",
+        "_STOP_POLICIES = frozenset(" +
+        repr(tuple(descriptor["enums"]["operator_stop_policy"])) + ")",
+        '_SKILL_ID = re.compile(r"^[a-z][a-z0-9_.-]*\\Z")',
         f'_COLLISION_BODY_ID = "{descriptor["formulas"]["collision_body_id"]}"',
     ])
     return "\n".join(lines)
@@ -215,9 +267,24 @@ def _ts_constants(descriptor: dict[str, Any]) -> str:
         lines.append(f"  {name}: [{', '.join(repr(field) for field in fields)}],")
     lines.extend([
         "} as const;",
+        "const MODIFICATION_VALUES = new Set(" +
+        repr(descriptor["enums"]["modification_policy_value"]) + ");",
+        "const INTERVENTION_DELEGATES = new Set(" +
+        repr(descriptor["enums"]["intervention_delegate"]) + ");",
+        "const RECOVERY_ACTIONS = new Set(" +
+        repr(descriptor["enums"]["recovery_action"]) + ");",
+        "const PERSISTENCE_CEILINGS = new Set(" +
+        repr(descriptor["enums"]["persistence_ceiling"]) + ");",
+        "const STOP_POLICIES = new Set(" +
+        repr(descriptor["enums"]["operator_stop_policy"]) + ");",
         f"const COLLISION_BODY_ID = {descriptor['formulas']['collision_body_id']!r};",
         f'const MAX_ROWS = {descriptor["limits"]["nested_rows"]};',
         f'const ROLE_MAX_ROWS = {descriptor["limits"]["role_rows"]};',
+        f'const NODE_POLICY_MAX_ROWS = {descriptor["limits"]["node_policy_rows"]};',
+        f'const RECOVERY_ACTION_MAX = {descriptor["limits"]["allowed_recovery_actions"]};',
+        f'const SKILL_MAX = {descriptor["limits"]["allowed_skills"]};',
+        f'const SKILL_ID_MAX_BYTES = {descriptor["limits"]["skill_id_bytes"]};',
+        f'const RETRY_MAX = {descriptor["limits"]["max_retries"]};',
         f'const PROVENANCE_MAX_ROWS = {descriptor["limits"]["provenance_rows"]};',
         f'const TEXT_MAX_BYTES = {descriptor["limits"]["compiled_text_bytes"]};',
         f'const IDENTITY_MAX_BYTES = {descriptor["limits"]["identity_bytes"]};',
@@ -228,7 +295,19 @@ def _ts_constants(descriptor: dict[str, Any]) -> str:
 
 def _type_interfaces(descriptor: dict[str, Any]) -> str:
     kinds = " | ".join(repr(kind) for kind in descriptor["catalog_record_kinds"])
-    sections = [f"export type CatalogRecordKind = {kinds};"]
+    sections = [
+        f"export type CatalogRecordKind = {kinds};",
+        "export type ProgramModificationPolicyValue = " +
+        " | ".join(repr(value) for value in descriptor["enums"]["modification_policy_value"]) + ";",
+        "export type ProgramInterventionDelegate = " +
+        " | ".join(repr(value) for value in descriptor["enums"]["intervention_delegate"]) + ";",
+        "export type ProgramRecoveryAction = " +
+        " | ".join(repr(value) for value in descriptor["enums"]["recovery_action"]) + ";",
+        "export type ProgramPersistenceCeiling = " +
+        " | ".join(repr(value) for value in descriptor["enums"]["persistence_ceiling"]) + ";",
+        "export type ProgramOperatorStopPolicy = " +
+        " | ".join(repr(value) for value in descriptor["enums"]["operator_stop_policy"]) + ";",
+    ]
     api_version = descriptor["binding_api_version"]
     for record_name, fields in descriptor["records"].items():
         sections.append(f"export interface {TYPE_NAMES[record_name]} {{")

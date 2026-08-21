@@ -1,5 +1,6 @@
 #pragma once
 
+#include <manyforge_core/types/program_contract.hpp>
 #include <manyforge_core/types/retained_product.hpp>
 
 #include <cstddef>
@@ -179,6 +180,7 @@ struct ProgramBindingDTO final {
   std::vector<ProgramTargetRoleBindingDTO> target_role_bindings;
   ProgramBindingProvenanceDTO provenance;
   std::vector<ProgramContactGraspBindingDTO> contact_grasp_bindings{};
+  std::vector<ProgramNodePolicyDTO> node_policies{};
 
   friend bool operator==(const ProgramBindingDTO&,
                          const ProgramBindingDTO&) = default;

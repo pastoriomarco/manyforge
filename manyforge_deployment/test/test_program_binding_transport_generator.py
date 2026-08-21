@@ -71,9 +71,12 @@ def test_checked_in_native_binding_fixture_is_exact() -> None:
     "mutation",
     [
         lambda value: value["limits"].update({"role_rows": 4097}),
+        lambda value: value["limits"].update({"node_policy_rows": 99999}),
         lambda value: value["records"]["component"].__setitem__(
             0, "renamed_component_role_id"
         ),
+        lambda value: value["records"]["node_policy"].remove("recovery_policy"),
+        lambda value: value["enums"]["recovery_action"].remove("intervention"),
         lambda value: value["records"]["target"].remove("command_target_id"),
         lambda value: value["records"]["component"].append("component_role_id"),
         lambda value: value["scalars"]["digest"].update(

@@ -59,6 +59,7 @@ function controller(
           },
           component_role_bindings: [],
           target_role_bindings: [],
+          node_policies: [],
           contact_grasp_bindings: [],
           provenance: {
             binding_compiler_contract_digest: `sha256:${'a'.repeat(64)}`,

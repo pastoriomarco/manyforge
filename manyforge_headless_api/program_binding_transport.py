@@ -23,12 +23,17 @@ _KINDS = frozenset({
 })
 _MAX = 4096
 _ROLE_MAX = 4096
+_NODE_POLICY_MAX = 100000
+_RECOVERY_ACTION_MAX = 2
+_SKILL_MAX = 256
+_SKILL_ID_MAX = 128
+_RETRY_MAX = 255
 _PROVENANCE_MAX = 16384
 _TEXT_MAX = 4096
 _IDENTITY_MAX = 128
 _BINDING_API_VERSION = "manyforge.program_binding.v1"
 _FIELDS = {
-    "binding": ("api_version", "program_binding_id", "program_id", "program_revision", "retained_bundle_id", "graph_revision", "node_environment", "component_role_bindings", "target_role_bindings", "contact_grasp_bindings", "provenance"),
+    "binding": ("api_version", "program_binding_id", "program_id", "program_revision", "retained_bundle_id", "graph_revision", "node_environment", "component_role_bindings", "target_role_bindings", "node_policies", "contact_grasp_bindings", "provenance"),
     "node_environment": ("catalog_id", "content_version", "catalog_digest", "environment_digest"),
     "component": ("component_role_id", "controllable_component_id", "component_type_id", "component_type_revision", "model_role_bindings"),
     "model": ("model_role_id", "model_instance_id", "model_revision"),
@@ -37,6 +42,9 @@ _FIELDS = {
     "resource": ("resource_role_id", "resource_ids", "compiled_resource_names"),
     "collision": ("collision_body_role_id", "model_instance_id", "model_revision", "compiled_collision_body_names"),
     "capability": ("capability_id", "capability_definition_revision", "control_binding", "capability_provider_binding", "command_schema"),
+    "node_policy": ("instance_id", "modification_policy", "recovery_policy", "operator_stop_policy"),
+    "modification_policy": ("runtime_override", "persistent_edit", "intervention_delegate"),
+    "recovery_policy": ("allow_intervention", "allowed_recovery_actions", "max_retries", "allowed_skills", "persistence_ceiling"),
     "control": ("control_binding_id", "control_binding_revision"),
     "provider": ("capability_provider_binding_id", "capability_provider_binding_revision"),
     "command_schema": ("command_schema_id", "command_schema_revision"),
@@ -45,6 +53,12 @@ _FIELDS = {
     "provenance": ("binding_compiler_contract_digest", "binding_compiler_build_digest", "role_assignment_digest", "source_records", "resolved_output_records"),
     "provenance_record": ("record_kind", "record_id", "revision"),
 }
+_MODIFICATION_VALUES = frozenset(('forbidden', 'human_approval', 'llm_allowed'))
+_INTERVENTION_DELEGATES = frozenset(('forbidden', 'human_only', 'llm_allowed', 'program_only'))
+_RECOVERY_ACTIONS = frozenset(('intervention', 'runtime_override'))
+_PERSISTENCE_CEILINGS = frozenset(('session_only', 'runtime_override', 'draft_patch'))
+_STOP_POLICIES = frozenset(('inherit', 'hold', 'continue'))
+_SKILL_ID = re.compile(r"^[a-z][a-z0-9_.-]*\Z")
 _COLLISION_BODY_ID = "component/{controllable_component_id}/model/{model_instance_id}/body/{collision_body_role_id}/collision/{index}"
 
 
@@ -117,6 +131,128 @@ def _id_array(value: object, path: str, *, text: bool = False) -> list[str]:
     if len(result) != len(set(result)):
         _fail(path, "expected duplicate-free values")
     return result
+
+
+def _policy_id(value: object, path: str) -> str:
+    result = _string(value, path, _SKILL_ID_MAX)
+    if _SKILL_ID.fullmatch(result) is None:
+        _fail(path, "expected portable lower-case ID")
+    return result
+
+
+def _node_policy(value: object, path: str) -> Mapping[str, Any]:
+    row = _record(value, _FIELDS["node_policy"], path)
+    _policy_id(row["instance_id"], f"{path}.instance_id")
+    modification = _record(
+        row["modification_policy"], _FIELDS["modification_policy"],
+        f"{path}.modification_policy",
+    )
+    for field in ("runtime_override", "persistent_edit"):
+        if (
+            type(modification[field]) is not str
+            or modification[field] not in _MODIFICATION_VALUES
+        ):
+            _fail(f"{path}.modification_policy.{field}", "closed enum value")
+    if (
+        type(modification["intervention_delegate"]) is not str
+        or modification["intervention_delegate"] not in _INTERVENTION_DELEGATES
+    ):
+        _fail(
+            f"{path}.modification_policy.intervention_delegate",
+            "closed enum value",
+        )
+    recovery = _record(
+        row["recovery_policy"], _FIELDS["recovery_policy"],
+        f"{path}.recovery_policy",
+    )
+    if type(recovery["allow_intervention"]) is not bool:
+        _fail(f"{path}.recovery_policy.allow_intervention", "boolean")
+    actions = _array(
+        recovery["allowed_recovery_actions"],
+        f"{path}.recovery_policy.allowed_recovery_actions",
+        maximum=_RECOVERY_ACTION_MAX,
+    )
+    if any(type(item) is not str or item not in _RECOVERY_ACTIONS for item in actions):
+        _fail(f"{path}.recovery_policy.allowed_recovery_actions", "closed enum values")
+    _sorted_unique(
+        [{"value": item} for item in actions],
+        lambda item: item["value"],
+        f"{path}.recovery_policy.allowed_recovery_actions",
+    )
+    retries = recovery["max_retries"]
+    if type(retries) is not int or not 0 <= retries <= _RETRY_MAX:
+        _fail(f"{path}.recovery_policy.max_retries", "integer in bounded range")
+    skills = _array(
+        recovery["allowed_skills"],
+        f"{path}.recovery_policy.allowed_skills",
+        maximum=_SKILL_MAX,
+    )
+    parsed_skills = [_policy_id(item, f"{path}.recovery_policy.allowed_skills[{i}]")
+                     for i, item in enumerate(skills)]
+    if parsed_skills != sorted(parsed_skills) or len(parsed_skills) != len(set(parsed_skills)):
+        _fail(f"{path}.recovery_policy.allowed_skills", "canonical sorted unique IDs")
+    if (
+        type(recovery["persistence_ceiling"]) is not str
+        or recovery["persistence_ceiling"] not in _PERSISTENCE_CEILINGS
+    ):
+        _fail(f"{path}.recovery_policy.persistence_ceiling", "closed enum value")
+    if (
+        type(row["operator_stop_policy"]) is not str
+        or row["operator_stop_policy"] not in _STOP_POLICIES
+    ):
+        _fail(f"{path}.operator_stop_policy", "closed enum value")
+    intervention = "intervention" in actions
+    if recovery["allow_intervention"] is not intervention:
+        _fail(path, "allow_intervention must match intervention action")
+    if parsed_skills and not intervention:
+        _fail(path, "allowed_skills requires intervention")
+    if (
+        "runtime_override" in actions
+        and modification["runtime_override"] == "forbidden"
+    ):
+        _fail(path, "runtime_override action requires modification permission")
+    if (
+        recovery["persistence_ceiling"] == "runtime_override"
+        and modification["runtime_override"] == "forbidden"
+    ):
+        _fail(path, "runtime_override persistence requires modification permission")
+    if (
+        recovery["persistence_ceiling"] == "draft_patch"
+        and modification["persistent_edit"] == "forbidden"
+    ):
+        _fail(path, "draft_patch persistence requires persistent-edit permission")
+    if (
+        not actions
+        and (
+            recovery["allow_intervention"]
+            or retries != 0
+            or parsed_skills
+            or recovery["persistence_ceiling"] != "session_only"
+        )
+    ):
+        _fail(path, "non-default recovery policy requires an action")
+    if not parsed_skills and (
+        modification == {
+            "runtime_override": "forbidden",
+            "persistent_edit": "forbidden",
+            "intervention_delegate": "forbidden",
+        }
+        and recovery == {
+            "allow_intervention": False,
+            "allowed_recovery_actions": [],
+            "max_retries": 0,
+            "allowed_skills": [],
+            "persistence_ceiling": "session_only",
+        }
+        and row["operator_stop_policy"] == "inherit"
+    ):
+        _fail(path, "default node-policy rows must be omitted")
+    if parsed_skills:
+        _fail(
+            f"{path}.recovery_policy.allowed_skills",
+            "requires an exact revision-qualified retained skill referent",
+        )
+    return row
 
 
 def validate_program_binding(value: object, *, label: str = "program_binding") -> ProgramBindingDocument:
@@ -214,6 +350,18 @@ def validate_program_binding(value: object, *, label: str = "program_binding") -
         _sorted_unique(capabilities, lambda x: x["capability_id"], f"{path}.capability_bindings")
         target_by_role[target["target_role_id"]] = target
     _sorted_unique(targets, lambda x: x["target_role_id"], f"{label}.target_role_bindings")
+
+    node_policies = _array(
+        root["node_policies"], f"{label}.node_policies",
+        maximum=_NODE_POLICY_MAX,
+    )
+    for index, item in enumerate(node_policies):
+        _node_policy(item, f"{label}.node_policies[{index}]")
+    _sorted_unique(
+        node_policies,
+        lambda x: x["instance_id"],
+        f"{label}.node_policies",
+    )
 
     contacts = _array(root["contact_grasp_bindings"], f"{label}.contact_grasp_bindings", maximum=_ROLE_MAX)
     for pi, item in enumerate(contacts):
