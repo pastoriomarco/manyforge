@@ -223,12 +223,17 @@ describe('Program workspace request fencing', () => {
       pendingAction: null,
       workspace: current,
     }, {
+      type: 'request_started',
+      generation: 12,
+      action: 'update_policies',
+    });
+    const updated = programWorkspaceReducer(started, {
       type: 'policy_mutation_succeeded',
       generation: 12,
       workspace: { ...current, draft: { ...current.draft, draftRevision: 8 } },
       message: 'Draft updated; Draft revision 8.',
     });
-    const failed = programWorkspaceReducer(started, {
+    const failed = programWorkspaceReducer(updated, {
       type: 'workspace_refresh_failed',
       generation: 12,
       warning: 'Draft updated; workspace status refresh failed. Your Draft change remains; retry refresh.',
