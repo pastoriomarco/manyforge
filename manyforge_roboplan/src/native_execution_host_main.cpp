@@ -6241,34 +6241,21 @@ public:
   int Run(const std::stop_token stop_token = {}) {
     std::jthread control_thread(
         [this](std::stop_token stop_token) { RunControlLane(stop_token); });
-    while (g_stop_requested == 0 && !stop_token.stop_requested()) {
-      {
-        std::shared_lock lock(composition_access_.mutex);
-        if (composition_access_.current != nullptr) {
-          auto &composition = *composition_access_.current;
-          const auto reconciled = composition.runtime->addressed_kernel
-                                      ->reconcile_subordinate_state();
-          if (!reconciled.ok()) {
-            last_reconcile_error_ = reconciled.error();
-          } else {
-            last_reconcile_error_.reset();
-          }
-          if (composition.pick_place_execution_owner) {
-            const auto pick_place_reconciled =
-                composition.pick_place_execution_owner->Reconcile();
-            if (!pick_place_reconciled.ok()) {
-              last_reconcile_error_ = pick_place_reconciled.error();
-            }
-          }
-        }
-      }
+    std::jthread reconciliation_thread([this](std::stop_token stop_token) {
+      RunReconciliationLane(stop_token);
+    });
+    while (g_stop_requested == 0 && !stop_token.stop_requested() &&
+           !reconciliation_lane_failed_.load(std::memory_order_acquire)) {
       pollfd descriptor{command_socket_.get(), POLLIN, 0};
       int ready = -1;
       do {
         ready = ::poll(&descriptor, 1, kReconcilePeriodMilliseconds);
       } while (ready < 0 && errno == EINTR && g_stop_requested == 0 &&
-               !stop_token.stop_requested());
-      if (g_stop_requested != 0 || stop_token.stop_requested()) {
+               !stop_token.stop_requested() &&
+               !reconciliation_lane_failed_.load(
+                   std::memory_order_acquire));
+      if (g_stop_requested != 0 || stop_token.stop_requested() ||
+          reconciliation_lane_failed_.load(std::memory_order_acquire)) {
         break;
       }
       if (ready < 0) {
@@ -6284,8 +6271,20 @@ public:
         Fail("execution Stop control socket became unavailable");
       }
     }
+    reconciliation_thread.request_stop();
     control_thread.request_stop();
+    reconciliation_thread.join();
     control_thread.join();
+    if (reconciliation_lane_failed_.load(std::memory_order_acquire)) {
+      std::exception_ptr failure;
+      {
+        std::lock_guard lock(reconcile_error_mutex_);
+        failure = reconciliation_lane_failure_;
+      }
+      Require(failure != nullptr,
+              "execution reconciliation lane failed without an exception");
+      std::rethrow_exception(failure);
+    }
     Require(!control_socket_failed_.load(std::memory_order_acquire),
             "execution Stop control socket became unavailable");
     return 0;
@@ -6875,10 +6874,29 @@ private:
           {"result", StopFaultRecoveryResultValue(result.value())},
       });
     }
-    if (last_reconcile_error_.has_value()) {
+    if (command.kind == CommandKind::kRead) {
+      const auto state =
+          composition.runtime->addressed_kernel->get_operation_state(
+              *command.operation_id);
+      if (!state.ok()) {
+        return CanonicalValue(CanonicalValue::Object{
+            {"api_version", CanonicalValue(std::string(kResponseApiVersion))},
+            {"error", ErrorValue(state.error())},
+            {"ok", CanonicalValue(false)},
+        });
+      }
       return CanonicalValue(CanonicalValue::Object{
           {"api_version", CanonicalValue(std::string(kResponseApiVersion))},
-          {"error", ErrorValue(*last_reconcile_error_)},
+          {"command", CanonicalValue("read")},
+          {"ok", CanonicalValue(true)},
+          {"operation", OperationStateValue(state.value())},
+      });
+    }
+    const auto reconcile_error = LastReconcileError();
+    if (reconcile_error.has_value()) {
+      return CanonicalValue(CanonicalValue::Object{
+          {"api_version", CanonicalValue(std::string(kResponseApiVersion))},
+          {"error", ErrorValue(*reconcile_error)},
           {"ok", CanonicalValue(false)},
       });
     }
@@ -7097,33 +7115,6 @@ private:
           {"ok", CanonicalValue(true)},
       });
     }
-    const auto reconciled =
-        composition.runtime->addressed_kernel->reconcile_subordinate_state();
-    if (!reconciled.ok()) {
-      return CanonicalValue(CanonicalValue::Object{
-          {"api_version", CanonicalValue(std::string(kResponseApiVersion))},
-          {"error", ErrorValue(reconciled.error())},
-          {"ok", CanonicalValue(false)},
-      });
-    }
-    if (command.kind == CommandKind::kRead) {
-      const auto state =
-          composition.runtime->addressed_kernel->get_operation_state(
-              *command.operation_id);
-      if (!state.ok()) {
-        return CanonicalValue(CanonicalValue::Object{
-            {"api_version", CanonicalValue(std::string(kResponseApiVersion))},
-            {"error", ErrorValue(state.error())},
-            {"ok", CanonicalValue(false)},
-        });
-      }
-      return CanonicalValue(CanonicalValue::Object{
-          {"api_version", CanonicalValue(std::string(kResponseApiVersion))},
-          {"command", CanonicalValue("read")},
-          {"ok", CanonicalValue(true)},
-          {"operation", OperationStateValue(state.value())},
-      });
-    }
     if (command.kind == CommandKind::kGetRuntimeScale) {
       const auto status =
           composition.runtime->addressed_kernel->get_runtime_scale(
@@ -7208,6 +7199,84 @@ private:
                         ControlName(control_result.value().control)))},
         {"ok", CanonicalValue(true)},
     });
+  }
+
+  [[nodiscard]] std::optional<core::ErrorDTO> LastReconcileError() const {
+    std::lock_guard lock(reconcile_error_mutex_);
+    return last_reconcile_error_;
+  }
+
+  void RunReconciliationLane(std::stop_token stop_token) noexcept {
+    try {
+      while (!stop_token.stop_requested()) {
+#if defined(MANYFORGE_ENABLE_FOCUSED_PICK_PLACE_PLANNING_FIXTURE)
+        const char *marker =
+            std::getenv("MANYFORGE_RECONCILIATION_TEST_MARKER");
+        const char *gate = std::getenv("MANYFORGE_RECONCILIATION_TEST_GATE");
+        if (marker != nullptr && marker[0] != '\0' && gate != nullptr &&
+            gate[0] != '\0') {
+          const int descriptor =
+              ::open(marker, O_WRONLY | O_CREAT | O_CLOEXEC, 0600);
+          if (descriptor >= 0) {
+            static_cast<void>(::close(descriptor));
+          }
+          while (!stop_token.stop_requested() &&
+                 ::access(gate, F_OK) != 0) {
+            pollfd interruptible_wait{-1, 0, 0};
+            static_cast<void>(
+                ::poll(&interruptible_wait, 0, kReconcilePeriodMilliseconds));
+          }
+        }
+        const char *injected_failure =
+            std::getenv("MANYFORGE_RECONCILIATION_TEST_THROW");
+        if (!stop_token.stop_requested() && injected_failure != nullptr &&
+            injected_failure[0] != '\0') {
+          throw std::runtime_error(injected_failure);
+        }
+#endif
+        {
+          // This shared lifetime lock prevents Manager reconfiguration from
+          // retiring a composition while its subordinate owners are in use.
+          std::shared_lock lock(composition_access_.mutex);
+          if (composition_access_.current != nullptr) {
+            auto &composition = *composition_access_.current;
+            auto error = [&]() -> std::optional<core::ErrorDTO> {
+              const auto reconciled = composition.runtime->addressed_kernel
+                                          ->reconcile_subordinate_state();
+              if (!reconciled.ok()) {
+                return reconciled.error();
+              }
+              if (composition.pick_place_execution_owner) {
+                const auto pick_place_reconciled =
+                    composition.pick_place_execution_owner->Reconcile();
+                if (!pick_place_reconciled.ok()) {
+                  return pick_place_reconciled.error();
+                }
+              }
+              return std::nullopt;
+            }();
+            std::lock_guard error_lock(reconcile_error_mutex_);
+            last_reconcile_error_ = std::move(error);
+          }
+        }
+        pollfd interruptible_wait{-1, 0, 0};
+        int waited = -1;
+        do {
+          waited =
+              ::poll(&interruptible_wait, 0, kReconcilePeriodMilliseconds);
+        } while (waited < 0 && errno == EINTR && !stop_token.stop_requested());
+        if (waited < 0 && !stop_token.stop_requested()) {
+          return;
+        }
+      }
+    } catch (...) {
+      const auto failure = std::current_exception();
+      {
+        std::lock_guard lock(reconcile_error_mutex_);
+        reconciliation_lane_failure_ = failure;
+      }
+      reconciliation_lane_failed_.store(true, std::memory_order_release);
+    }
   }
 
   void RunControlLane(std::stop_token stop_token) noexcept {
@@ -7320,7 +7389,10 @@ private:
   CommandSocket command_socket_;
   CommandSocket control_socket_;
   std::atomic<bool> control_socket_failed_{false};
+  std::atomic<bool> reconciliation_lane_failed_{false};
+  mutable std::mutex reconcile_error_mutex_;
   std::optional<core::ErrorDTO> last_reconcile_error_;
+  std::exception_ptr reconciliation_lane_failure_;
 };
 
 void RunManagedExecutionCommandSurface(

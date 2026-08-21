@@ -23,11 +23,13 @@ from manyforge_behavior.kernel_client import (
     ActionSpan,
     ExecutionState,
     KernelClient,
+    KernelOperationObservationUnavailableError,
 )
 from manyforge_behavior.orchestration_ports import (
     NodeAttemptIdentity,
     OwnerInvocationResult,
     OwnerNodeInputs,
+    OwnerTaskObservationUnavailableError,
     OwnerTaskSnapshot,
     OwnerTaskState,
     ProgramRunPortContext,
@@ -1600,7 +1602,12 @@ class NativeKernelProgramPort:
         return "operation_failed", "native operation did not succeed"
 
     def _observation(self, task: _OperationTask) -> tuple[dict[str, Any], OwnerTaskSnapshot]:
-        envelope = self._kernel.operation(task.operation_id)
+        try:
+            envelope = self._kernel.operation(task.operation_id)
+        except KernelOperationObservationUnavailableError as exc:
+            raise OwnerTaskObservationUnavailableError(
+                "accepted native operation is temporarily unavailable to observe"
+            ) from exc
         operation = dict(_mapping(envelope.get("operation"), field="operation"))
         if (
             operation.get("operation_id") != task.operation_id

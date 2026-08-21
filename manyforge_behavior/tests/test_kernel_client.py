@@ -11,6 +11,7 @@ from manyforge_behavior.kernel_client import (
     ExecutionState,
     KernelClient,
     KernelClientResponseError,
+    KernelOperationObservationUnavailableError,
     LegacyKernelMockUnavailableError,
     MockKernelClient,
 )
@@ -189,3 +190,23 @@ def test_malformed_success_and_legacy_stateful_mock_fail_closed() -> None:
         KernelClient(BadTransport()).status()
     with pytest.raises(LegacyKernelMockUnavailableError):
         MockKernelClient()
+
+
+def test_only_exact_operation_owner_unavailability_is_typed_for_retry() -> None:
+    class OwnerUnavailableError(RuntimeError):
+        code = "execution_owner_unavailable"
+
+    class UnavailableObservationTransport(FakeTransport):
+        def operation(self, operation_id: str) -> dict[str, Any]:
+            raise OwnerUnavailableError("HTTP 503")
+
+    client = KernelClient(UnavailableObservationTransport())
+    with pytest.raises(KernelOperationObservationUnavailableError):
+        client.operation("operation-1")
+
+    class MalformedObservationTransport(FakeTransport):
+        def operation(self, operation_id: str) -> dict[str, Any]:
+            return {"ok": False}
+
+    with pytest.raises(KernelClientResponseError):
+        KernelClient(MalformedObservationTransport()).operation("operation-1")

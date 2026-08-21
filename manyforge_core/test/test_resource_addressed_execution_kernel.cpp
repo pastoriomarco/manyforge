@@ -298,6 +298,9 @@ class FakeParticipantEngine final : public IResolvedParticipantExecutionEngine,
       ControllerGoalGeneration controller_goal_generation) override {
     ++dispatch_prepared_command_calls;
     Trace("engine:dispatch_prepared_command");
+    if (dispatch_prepared_command_hook) {
+      dispatch_prepared_command_hook();
+    }
     if (!prepared_command_snapshot.has_value() || !prepared_command_snapshot->participant ||
         prepared_command_snapshot->preparation_id != preparation_id ||
         prepared_command_snapshot->participant->prepared_contract_digest !=
@@ -599,6 +602,7 @@ class FakeParticipantEngine final : public IResolvedParticipantExecutionEngine,
   }
 
   GripperCommandStatusDTO get_gripper_status(const std::string&) const override {
+    ++get_gripper_status_calls;
     return gripper_status;
   }
 
@@ -721,6 +725,7 @@ class FakeParticipantEngine final : public IResolvedParticipantExecutionEngine,
   std::atomic<int> preview_calls{};
   std::atomic<int> command_calls{};
   mutable std::atomic<int> validate_command_calls{};
+  mutable std::atomic<int> get_gripper_status_calls{};
   std::atomic<int> stop_gripper_calls{};
   std::atomic<int> reset_gripper_calls{};
   std::atomic<int> stop_calls{};
@@ -755,6 +760,7 @@ class FakeParticipantEngine final : public IResolvedParticipantExecutionEngine,
   std::function<void()> pause_return_hook;
   std::function<void()> resume_return_hook;
   std::function<void()> prepare_command_hook;
+  std::function<void()> dispatch_prepared_command_hook;
   std::function<void()> translate_stop_stage_hook;
   GripperCommandStatusDTO gripper_status{};
   std::optional<ExecuteRequestDTO> last_execute;
@@ -4009,6 +4015,62 @@ TEST(ResourceAddressedExecutionKernelTest,
   const auto state = kernel.get_operation_state(accepted.value().operation_id);
   ASSERT_TRUE(state.ok());
   EXPECT_EQ(state.value().state, OperationStateKind::kCompleted);
+}
+
+TEST(ResourceAddressedExecutionKernelTest,
+     ReconciliationSkipsCapabilityCommandWhilePreparedDispatchEffectIsInFlight) {
+  FakeClock clock;
+  FakeParticipantEngine engine;
+  engine.gripper_status.state = GripperCommandState::kIdle;
+  std::promise<void> dispatch_entered;
+  std::promise<void> release_dispatch;
+  const auto release_future = release_dispatch.get_future().share();
+  engine.dispatch_prepared_command_hook = [&] {
+    dispatch_entered.set_value();
+    release_future.wait();
+  };
+  const ProgramCommandSchemaRefDTO schema{
+      CommandSchemaId(std::string(kGripperPositionCommandSchemaId)),
+      CommandSchemaRevision(std::string(kGripperPositionCommandSchemaRevision))};
+  ResourceAddressedExecutionKernel kernel(
+      {registration(make_binding("gripper", "gripper.target", "tool.gripper.command",
+                                 CoordinateKind::kLinear, schema),
+                    engine)},
+      clock, default_journal, {RequestOwnerEpoch("kernel.epoch.1"), CellId("cell.test"), 8U});
+
+  auto executing =
+      std::async(std::launch::async, [&] { return kernel.execute(command_operation()); });
+  ASSERT_EQ(dispatch_entered.get_future().wait_for(std::chrono::seconds(10)),
+            std::future_status::ready);
+  const OperationId operation_id("operation.kernel.epoch.1.1");
+  const auto before_reconciliation = kernel.get_operation_state(operation_id);
+  ASSERT_TRUE(before_reconciliation.ok()) << before_reconciliation.error().message;
+  const auto status_polls_before = engine.get_gripper_status_calls.load();
+
+  const auto reconciled_while_dispatching = kernel.reconcile_subordinate_state();
+  ASSERT_TRUE(reconciled_while_dispatching.ok())
+      << reconciled_while_dispatching.error().message;
+  EXPECT_EQ(engine.get_gripper_status_calls.load(), status_polls_before);
+  const auto unchanged = kernel.get_operation_state(operation_id);
+  ASSERT_TRUE(unchanged.ok()) << unchanged.error().message;
+  EXPECT_EQ(unchanged.value(), before_reconciliation.value());
+
+  release_dispatch.set_value();
+  const auto accepted = executing.get();
+  ASSERT_TRUE(accepted.ok()) << accepted.error().message;
+  EXPECT_EQ(accepted.value().operation_id, operation_id);
+  engine.gripper_status.state = GripperCommandState::kCompleted;
+  engine.gripper_status.command_id = engine.next_command_result.command_id;
+  engine.gripper_status.generation = engine.next_command_result.generation;
+  engine.gripper_status.progress = 1.0;
+
+  const auto reconciled_completion = kernel.reconcile_subordinate_state();
+  ASSERT_TRUE(reconciled_completion.ok()) << reconciled_completion.error().message;
+  EXPECT_EQ(engine.get_gripper_status_calls.load(), status_polls_before + 1);
+  const auto completed = kernel.get_operation_state(operation_id);
+  ASSERT_TRUE(completed.ok()) << completed.error().message;
+  EXPECT_EQ(completed.value().state, OperationStateKind::kCompleted);
+  EXPECT_EQ(completed.value().participants.front().state, OperationStateKind::kCompleted);
 }
 
 TEST(ResourceAddressedExecutionKernelTest,

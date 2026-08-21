@@ -17,6 +17,10 @@ class OwnerTaskState(Enum):
     INTERRUPTED = "interrupted"
 
 
+class OwnerTaskObservationUnavailableError(RuntimeError):
+    """The exact accepted owner task is temporarily unavailable to observe."""
+
+
 class ProgramRunScopeState(Enum):
     ACTIVE = "active"
     SETTLED = "settled"
@@ -487,6 +491,7 @@ __all__ = [
     "OwnerInvocationPort",
     "OwnerInvocationResult",
     "OwnerTaskPort",
+    "OwnerTaskObservationUnavailableError",
     "OwnerTaskSnapshot",
     "OwnerTaskState",
     "ProgramRunScopePort",

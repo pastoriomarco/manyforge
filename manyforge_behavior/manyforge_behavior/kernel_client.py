@@ -59,6 +59,10 @@ class KernelClientResponseError(RuntimeError):
     """Raised when a transport returns a successful but malformed projection."""
 
 
+class KernelOperationObservationUnavailableError(RuntimeError):
+    """An exact operation read could not reach the native owner temporarily."""
+
+
 class LegacyKernelMockUnavailableError(RuntimeError):
     """The removed stateful Python mock cannot become a second Kernel owner."""
 
@@ -202,9 +206,18 @@ class KernelClient:
         )
 
     def operation(self, operation_id: str) -> dict[str, Any]:
-        return self._successful(
-            self._transport.operation(operation_id), label="observation"
-        )
+        try:
+            response = self._transport.operation(operation_id)
+        except Exception as exc:
+            # Headless transports expose stable machine-readable error codes.
+            # Map only owner availability on this exact read; every other
+            # transport, protocol, and owner error retains its original type.
+            if getattr(exc, "code", None) == "execution_owner_unavailable":
+                raise KernelOperationObservationUnavailableError(
+                    "native operation observation is temporarily unavailable"
+                ) from exc
+            raise
+        return self._successful(response, label="observation")
 
     def pause(
         self, operation_id: str, request: Mapping[str, Any]
@@ -276,6 +289,7 @@ __all__ = [
     "ExecutionState",
     "HeadlessExecutionTransport",
     "KernelClient",
+    "KernelOperationObservationUnavailableError",
     "KernelClientResponseError",
     "LegacyKernelMockUnavailableError",
     "MockKernelClient",

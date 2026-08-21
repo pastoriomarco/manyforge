@@ -12,6 +12,7 @@ from manyforge_behavior.orchestration_ports import (
     NodeAttemptSource,
     OwnerInvocationPort,
     OwnerNodeInputs,
+    OwnerTaskObservationUnavailableError,
     OwnerTaskPort,
     OwnerTaskSnapshot,
     OwnerTaskState,
@@ -258,7 +259,13 @@ class OwnerTaskAdapter(_OwnerAdapter):
                 if self._require_initial_running:
                     return py_trees.common.Status.RUNNING
             elif self._task.state is OwnerTaskState.ACTIVE:
-                observed = self._port.observe(self._task.task_id)
+                try:
+                    observed = self._port.observe(self._task.task_id)
+                except OwnerTaskObservationUnavailableError:
+                    # Keep the accepted snapshot and retry only its exact task
+                    # identity on a later tick. Submission and acknowledgement
+                    # remain one-shot.
+                    return py_trees.common.Status.RUNNING
                 if observed.task_id != self._task.task_id:
                     self._record_failure(
                         "owner_task_identity_changed",

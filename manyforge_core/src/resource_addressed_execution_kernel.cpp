@@ -10537,7 +10537,7 @@ Result<void> ResourceAddressedExecutionKernel::reconcile_subordinate_state() {
       }
       for (auto& participant : operation->participants) {
         if (participant.reconciliation_in_flight || participant.prepare_in_flight ||
-            participant.subordinate_id == 0U) {
+            participant.dispatch_effect_in_flight || participant.subordinate_id == 0U) {
           continue;
         }
         const auto public_participant =

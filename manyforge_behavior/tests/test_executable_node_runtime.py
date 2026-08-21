@@ -33,6 +33,7 @@ from manyforge_behavior.orchestration_ports import (
     NodeAttemptIdentity,
     OwnerInvocationResult,
     OwnerNodeInputs,
+    OwnerTaskObservationUnavailableError,
     OwnerTaskSnapshot,
     OwnerTaskState,
 )
@@ -396,6 +397,112 @@ def test_simulation_row_uses_the_focused_cancellable_task_owner() -> None:
     assert task.starts[0][2].parameters == {}
     assert adapter.update() is py_trees.common.Status.SUCCESS
     assert task.acknowledgements == [("task-1", task.starts[0][1])]
+
+
+def test_accepted_task_retries_only_typed_observation_unavailability() -> None:
+    class _OneOutageTaskPort(_TaskPort):
+        def __init__(self) -> None:
+            super().__init__((OwnerTaskState.ACTIVE, OwnerTaskState.SUCCEEDED))
+            self.outage_pending = True
+
+        def observe(self, task_id: str) -> OwnerTaskSnapshot:
+            self.observations.append(task_id)
+            if self.outage_pending:
+                self.outage_pending = False
+                raise OwnerTaskObservationUnavailableError("temporarily unavailable")
+            state = self._states.pop(0)
+            return OwnerTaskSnapshot(task_id=task_id, state=state)
+
+    document = _minimal_document()
+    document["tree"] = {
+        "node_id": "simulation.reset",
+        "instance_id": "reset_sim",
+        "parameters": {},
+        "children": [],
+    }
+    catalog = _catalog()
+    program = Program.from_dict(_identified(document), catalog)
+    task = _OneOutageTaskPort()
+    adapter = build_executable_node_resolver(
+        build_node_environment()
+    ).instantiate(
+        build_node_environment().registry.record("simulation.reset"),
+        NodeAdapterBuildContext(
+            name="reset_sim",
+            node_instance_id="reset_sim",
+            parameters={},
+            input_resolver=NodeAttemptInputResolver(
+                program=program,
+                catalog=catalog,
+                value_store=ProgramValueStore.from_program(program),
+            ),
+            attempt_source=ProgramRunAttemptSource("run.simulation"),
+            ports=NodeAdapterPorts(simulator_control=task),
+        ),
+    )
+
+    adapter.initialise()
+    assert adapter.update() is py_trees.common.Status.RUNNING
+    assert adapter.update() is py_trees.common.Status.RUNNING
+    assert adapter.update() is py_trees.common.Status.SUCCESS
+    assert len(task.starts) == 1
+    assert task.observations == ["task-1", "task-1"]
+    assert task.acknowledgements == [("task-1", task.starts[0][1])]
+
+
+def test_non_transient_and_identity_changing_observations_still_fail() -> None:
+    class _ObservationFailureTaskPort(_TaskPort):
+        def __init__(self, failure: Exception | None) -> None:
+            super().__init__((OwnerTaskState.ACTIVE,))
+            self.failure = failure
+
+        def observe(self, task_id: str) -> OwnerTaskSnapshot:
+            if self.failure is not None:
+                raise self.failure
+            return OwnerTaskSnapshot(
+                task_id="another-task",
+                state=OwnerTaskState.ACTIVE,
+            )
+
+    document = _minimal_document()
+    document["tree"] = {
+        "node_id": "simulation.reset",
+        "instance_id": "reset_sim",
+        "parameters": {},
+        "children": [],
+    }
+    catalog = _catalog()
+    program = Program.from_dict(_identified(document), catalog)
+    for task, expected_reason in (
+        (
+            _ObservationFailureTaskPort(RuntimeError("malformed")),
+            "owner_request_failed",
+        ),
+        (_ObservationFailureTaskPort(None), "owner_task_identity_changed"),
+    ):
+        adapter = build_executable_node_resolver(
+            build_node_environment()
+        ).instantiate(
+            build_node_environment().registry.record("simulation.reset"),
+            NodeAdapterBuildContext(
+                name="reset_sim",
+                node_instance_id="reset_sim",
+                parameters={},
+                input_resolver=NodeAttemptInputResolver(
+                    program=program,
+                    catalog=catalog,
+                    value_store=ProgramValueStore.from_program(program),
+                ),
+                attempt_source=ProgramRunAttemptSource("run.simulation"),
+                ports=NodeAdapterPorts(simulator_control=task),
+            ),
+        )
+        adapter.initialise()
+        assert adapter.update() is py_trees.common.Status.RUNNING
+        assert adapter.update() is py_trees.common.Status.FAILURE
+        assert adapter.failure_reason_code == expected_reason
+        assert len(task.starts) == 1
+        assert task.acknowledgements == []
 
 
 def test_availability_keeps_adapter_binding_owner_and_execution_separate() -> None:

@@ -16,6 +16,7 @@ from manyforge_behavior.orchestration_ports import (
     CompositeProgramRunContextPort,
     NodeAttemptIdentity,
     OwnerNodeInputs,
+    OwnerTaskObservationUnavailableError,
     OwnerTaskSnapshot,
     OwnerTaskState,
     ProgramRunPortContext,
@@ -275,6 +276,40 @@ def test_completed_operation_is_acknowledged_with_exact_revision() -> None:
     scope = port.scope.observe("program-run.1")
     assert isinstance(scope, ProgramRunScopeSnapshot)
     assert scope.state is ProgramRunScopeState.SETTLED
+
+
+def test_accepted_operation_owner_unavailability_has_exact_task_port_type() -> None:
+    class OwnerUnavailableError(RuntimeError):
+        code = "execution_owner_unavailable"
+
+    class _UnavailableTransport(_Transport):
+        def operation(self, operation_id: str) -> dict[str, Any]:
+            raise OwnerUnavailableError("HTTP 503")
+
+    transport = _UnavailableTransport()
+    port = NativeKernelProgramPort(KernelClient(transport))
+    port.bind(_context())
+    started = port.operations.start(
+        "motion.move_to_pose", _identity(), _motion_inputs()
+    )
+
+    with pytest.raises(OwnerTaskObservationUnavailableError):
+        port.operations.observe(started.task_id)
+
+    assert len(transport.submissions) == 1
+
+
+def test_operation_identity_change_remains_a_terminal_observation_error() -> None:
+    transport = _Transport()
+    port = NativeKernelProgramPort(KernelClient(transport))
+    port.bind(_context())
+    started = port.operations.start(
+        "motion.move_to_pose", _identity(), _motion_inputs()
+    )
+    transport.operations[started.task_id]["operation_id"] = "operation-other"
+
+    with pytest.raises(ProductionPortError, match="changed identity"):
+        port.operations.observe(started.task_id)
 
 
 def test_native_context_cleanup_consumes_settled_tasks_but_refuses_active_work() -> None:

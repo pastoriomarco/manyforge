@@ -326,12 +326,27 @@ def _start_host(
     *,
     candidate_worker: Path | None = None,
     fake_worker_marker: Path | None = None,
+    reconciliation_test_marker: Path | None = None,
+    reconciliation_test_gate: Path | None = None,
+    reconciliation_test_throw: str | None = None,
     host_environment: str = "MANYFORGE_NATIVE_EXECUTION_HOST",
     qualify_cclc: bool = True,
 ) -> subprocess.Popen[bytes]:
     environment = os.environ.copy()
     if fake_worker_marker is not None:
         environment["MANYFORGE_FAKE_WORKER_MARKER"] = str(fake_worker_marker)
+    if reconciliation_test_marker is not None:
+        environment["MANYFORGE_RECONCILIATION_TEST_MARKER"] = str(
+            reconciliation_test_marker
+        )
+    if reconciliation_test_gate is not None:
+        environment["MANYFORGE_RECONCILIATION_TEST_GATE"] = str(
+            reconciliation_test_gate
+        )
+    if reconciliation_test_throw is not None:
+        environment["MANYFORGE_RECONCILIATION_TEST_THROW"] = (
+            reconciliation_test_throw
+        )
     process = subprocess.Popen(
         [
             str(_required_path(host_environment)),
@@ -996,6 +1011,119 @@ def _place_planning_request() -> dict[str, Any]:
             _planning_motion("place.retreat", _cartesian_path(0.2, 0.3)),
         ),
     }
+
+
+def test_reconciliation_gate_does_not_block_ordinary_accept_or_exact_read(
+    tmp_path: Path,
+) -> None:
+    built_fixture = _required_path("MANYFORGE_I6_NATIVE_FIXTURE_ROOT")
+    fixture_root = tmp_path / "fixture"
+    shutil.copytree(built_fixture, fixture_root)
+    manifest = json.loads((fixture_root / "manifest.json").read_text("utf-8"))
+    execution_root = tmp_path / "execution"
+    staging_root = tmp_path / "staging"
+    reconciliation_marker = tmp_path / "reconciliation-entered"
+    reconciliation_gate = tmp_path / "release-reconciliation"
+    execution_root.mkdir()
+    staging_root.mkdir()
+
+    process = _start_host(
+        fixture_root,
+        execution_root,
+        staging_root,
+        manifest,
+        host_environment="MANYFORGE_NATIVE_PICK_PLACE_FIXTURE_HOST",
+        reconciliation_test_marker=reconciliation_marker,
+        reconciliation_test_gate=reconciliation_gate,
+    )
+    native = ExecutionCommandClient(execution_root, timeout_seconds=0.5)
+    raw_api = TestClient(
+        create_app(
+            service=HeadlessService(
+                UnusedCore(),  # type: ignore[arg-type]
+                UnusedManager(),  # type: ignore[arg-type]
+                native,
+            ),
+            trusted_principal_adapter=FixedTrustedPrincipalAdapter(),
+        )
+    )
+    headless = HeadlessHttpClient("http://headless.test", client=raw_api)
+    runner = OrchestratorRunner(KernelClient(RecordingTransport(headless)))
+
+    try:
+        deadline = time.monotonic() + 2.0
+        while not reconciliation_marker.exists() and time.monotonic() < deadline:
+            time.sleep(0.005)
+        assert reconciliation_marker.exists()
+        assert not reconciliation_gate.exists()
+
+        status = headless.execution_status()
+        accepted = _runner_submission(
+            runner,
+            request_id="accept-while-reconciliation-gated",
+            joint_names=("joint1",),
+            positions=(0.1,),
+        )
+        operation_id = accepted["accepted"]["operation_id"]
+        observed = runner.operation(operation_id)
+
+        assert status["ok"] is True
+        assert observed["operation"]["operation_id"] == operation_id
+        assert observed["operation"]["state"] in {"planning", "executing"}
+        assert not reconciliation_gate.exists()
+
+        reconciliation_gate.touch()
+        terminal = _wait_terminal(runner, operation_id)["operation"]
+        assert terminal["state"] == "completed"
+    finally:
+        _stop_host(process)
+        raw_api.close()
+
+
+def test_reconciliation_exception_uses_caught_host_failure_path(
+    tmp_path: Path,
+) -> None:
+    built_fixture = _required_path("MANYFORGE_I6_NATIVE_FIXTURE_ROOT")
+    fixture_root = tmp_path / "fixture"
+    shutil.copytree(built_fixture, fixture_root)
+    manifest = json.loads((fixture_root / "manifest.json").read_text("utf-8"))
+    execution_root = tmp_path / "execution"
+    staging_root = tmp_path / "staging"
+    reconciliation_marker = tmp_path / "reconciliation-entered"
+    reconciliation_gate = tmp_path / "release-reconciliation"
+    injected_failure = "fixture injected reconciliation failure"
+    execution_root.mkdir()
+    staging_root.mkdir()
+
+    process = _start_host(
+        fixture_root,
+        execution_root,
+        staging_root,
+        manifest,
+        host_environment="MANYFORGE_NATIVE_PICK_PLACE_FIXTURE_HOST",
+        reconciliation_test_marker=reconciliation_marker,
+        reconciliation_test_gate=reconciliation_gate,
+        reconciliation_test_throw=injected_failure,
+    )
+
+    try:
+        deadline = time.monotonic() + 2.0
+        while not reconciliation_marker.exists() and time.monotonic() < deadline:
+            time.sleep(0.005)
+        assert reconciliation_marker.exists()
+
+        reconciliation_gate.touch()
+        assert process.wait(timeout=5.0) == 70
+        stderr = (process.stderr.read() if process.stderr else b"").decode(
+            errors="replace"
+        )
+
+        assert stderr == f"{injected_failure}\n"
+        assert process.poll() == 70
+        assert not (execution_root / "execution-command.sock").exists()
+        assert not (execution_root / "execution-control.sock").exists()
+    finally:
+        _stop_host(process)
 
 
 def test_pick_place_planning_crosses_real_cpp_owner_and_thin_clients(
