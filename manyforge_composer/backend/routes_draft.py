@@ -301,7 +301,6 @@ def _require_apply_ready(program: Program) -> None:
             reason["message"],
             status_code=409,
             detail={
-                "message": reason["message"],
                 "affectedInstanceIds": applicability["affectedInstanceIds"],
             },
         )

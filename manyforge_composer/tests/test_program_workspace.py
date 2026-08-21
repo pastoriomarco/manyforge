@@ -380,7 +380,7 @@ def test_node_policy_success_with_imported_node_a_skills_is_closed_and_headless_
             "an exact revision-qualified retained referent. Leave Allowed "
             "skills empty."
         ),
-        "affectedInstanceIds": ["move_to_pick"],
+        "context": {"affectedInstanceIds": ["move_to_pick"]},
     }
     assert headless.calls == []
 
