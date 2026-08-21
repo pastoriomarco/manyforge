@@ -16,6 +16,10 @@ import {
   resolveProgramParameterLiteralValue,
 } from '../utils/programAuthoring';
 import { DraftTextInput, DraftTextarea } from './common/DraftInputs';
+import {
+  ProgramSpecializedEditor,
+  supportsProgramSpecializedEditor,
+} from './property/ProgramSpecializedEditors';
 
 interface ProgramPropertyEditorProps {
   root: ProgramTreeNode;
@@ -30,6 +34,50 @@ interface ProgramPropertyEditorProps {
 interface SourceChoice {
   label: string;
   source: ProgramValueSource;
+}
+
+export type ProgramParameterTransition =
+  | { kind: 'literal'; value: JsonValue }
+  | { kind: 'source'; source: ProgramValueSource }
+  | { kind: 'clear' };
+
+export interface ProgramParameterMutation {
+  mutation: 'tree_draft_update_node_params';
+  args: Record<string, JsonValue>;
+}
+
+/**
+ * Build the one full-replacement Draft mutation used by every property
+ * interaction. The selected field changes representation atomically while
+ * every unrelated literal and source is retained.
+ */
+export function buildProgramParameterMutation(
+  node: ProgramTreeNode,
+  parameterId: string,
+  transition: ProgramParameterTransition,
+): ProgramParameterMutation {
+  const parameters = { ...node.parameters };
+  const sources = { ...(node.value_sources ?? {}) };
+  if (transition.kind === 'literal') {
+    parameters[parameterId] = transition.value;
+    delete sources[parameterId];
+  } else if (transition.kind === 'source') {
+    sources[parameterId] = transition.source;
+    delete parameters[parameterId];
+  } else {
+    delete parameters[parameterId];
+    delete sources[parameterId];
+  }
+  return {
+    mutation: 'tree_draft_update_node_params',
+    args: {
+      instance_id: node.instance_id,
+      expected_node_id: node.node_id,
+      merge: false,
+      parameters,
+      value_sources: sources as unknown as JsonValue,
+    },
+  };
 }
 
 function sourceChoices(
@@ -167,16 +215,13 @@ export function ProgramPropertyEditor({
     );
   }
 
-  const replaceFields = (
-    parameters: Record<string, JsonValue>,
-    sources: Record<string, ProgramValueSource>,
-  ) => onMutate('tree_draft_update_node_params', {
-    instance_id: selected.instance_id,
-    expected_node_id: selected.node_id,
-    merge: false,
-    parameters,
-    value_sources: sources as unknown as JsonValue,
-  });
+  const applyTransition = (
+    parameterId: string,
+    transition: ProgramParameterTransition,
+  ) => {
+    const request = buildProgramParameterMutation(selected, parameterId, transition);
+    onMutate(request.mutation, request.args);
+  };
 
   const commitLiteral = (parameter: CatalogParameter, value: JsonValue) => {
     const message = firstCatalogParameterValidationMessage(parameter, value);
@@ -189,37 +234,45 @@ export function ProgramPropertyEditor({
       delete next[parameter.id];
       return next;
     });
-    const parameters = { ...selected.parameters, [parameter.id]: value };
-    const sources = { ...(selected.value_sources ?? {}) };
-    delete sources[parameter.id];
-    replaceFields(parameters, sources);
+    applyTransition(parameter.id, { kind: 'literal', value });
   };
 
   const removeLiteral = (parameter: CatalogParameter) => {
-    const parameters = { ...selected.parameters };
-    const sources = { ...(selected.value_sources ?? {}) };
-    delete parameters[parameter.id];
-    delete sources[parameter.id];
-    replaceFields(parameters, sources);
+    applyTransition(parameter.id, { kind: 'clear' });
   };
 
   const selectSource = (parameter: CatalogParameter, encoded: string) => {
-    const parameters = { ...selected.parameters };
-    const sources = { ...(selected.value_sources ?? {}) };
     if (encoded) {
-      sources[parameter.id] = JSON.parse(encoded) as ProgramValueSource;
-      delete parameters[parameter.id];
+      applyTransition(parameter.id, {
+        kind: 'source',
+        source: JSON.parse(encoded) as ProgramValueSource,
+      });
     } else {
-      delete sources[parameter.id];
       const fallback = resolveProgramParameterLiteralValue(
         selected.value_sources?.[parameter.id],
         selected.parameters[parameter.id],
         parameter.hasDefault ? parameter.default as JsonValue : undefined,
         programParameters,
       );
-      if (fallback !== undefined) parameters[parameter.id] = fallback;
+      const fallbackMessage = fallback === undefined
+        ? parameter.required ? `${parameter.id} has no valid literal fallback` : null
+        : firstCatalogParameterValidationMessage(parameter, fallback);
+      if (fallbackMessage) {
+        setErrors((current) => ({ ...current, [parameter.id]: fallbackMessage }));
+        return;
+      }
+      applyTransition(
+        parameter.id,
+        fallback === undefined
+          ? { kind: 'clear' }
+          : { kind: 'literal', value: fallback },
+      );
     }
-    replaceFields(parameters, sources);
+    setErrors((current) => {
+      const next = { ...current };
+      delete next[parameter.id];
+      return next;
+    });
   };
 
   return (
@@ -247,8 +300,13 @@ export function ProgramPropertyEditor({
             programParameters,
             blackboardKeys,
           );
-          const literal = selected.parameters[parameter.id]
-            ?? (parameter.hasDefault ? parameter.default as JsonValue : undefined);
+          const hasLiteral = Object.prototype.hasOwnProperty.call(
+            selected.parameters,
+            parameter.id,
+          );
+          const literal = hasLiteral
+            ? selected.parameters[parameter.id]
+            : parameter.hasDefault ? parameter.default as JsonValue : undefined;
           const complex = !['string', 'number', 'integer', 'boolean']
             .includes(parameter.schema.type ?? '');
           const fallback = resolveProgramParameterLiteralValue(
@@ -257,6 +315,19 @@ export function ProgramPropertyEditor({
             parameter.hasDefault ? parameter.default as JsonValue : undefined,
             programParameters,
           );
+          const fallbackValid = fallback !== undefined
+            && firstCatalogParameterValidationMessage(parameter, fallback) === null;
+          const canSelectLiteral = !parameter.required || fallbackValid;
+          const literalValidation = hasLiteral
+            ? firstCatalogParameterValidationMessage(parameter, literal)
+            : null;
+          const repairMode = literalValidation !== null;
+          const specialized = literal !== undefined
+            && !repairMode
+            && supportsProgramSpecializedEditor(parameter.schema);
+          const currentSourceIsOffCatalog = source !== undefined
+            && !choices.some((choice) =>
+              JSON.stringify(choice.source) === JSON.stringify(source));
           return (
             <div className="program-property" key={parameter.id}>
               <div className="program-property-heading">
@@ -265,7 +336,7 @@ export function ProgramPropertyEditor({
                 </label>
                 <span>{parameter.required ? 'required' : 'optional'}</span>
               </div>
-              {choices.length > 0 && (
+              {(choices.length > 0 || source !== undefined) && (
                 <label className="program-source-select">
                   Value source
                   <select
@@ -275,14 +346,15 @@ export function ProgramPropertyEditor({
                   >
                     <option
                       value=""
-                      disabled={
-                        source !== undefined
-                        && fallback === undefined
-                        && parameter.required
-                      }
+                      disabled={source !== undefined && !canSelectLiteral}
                     >
                       Literal value
                     </option>
+                    {currentSourceIsOffCatalog && (
+                      <option value={JSON.stringify(source)}>
+                        Current binding (not compatible with this catalog)
+                      </option>
+                    )}
                     {choices.map((choice) => {
                       const encoded = JSON.stringify(choice.source);
                       return <option key={encoded} value={encoded}>{choice.label}</option>;
@@ -294,7 +366,43 @@ export function ProgramPropertyEditor({
                 <div className="program-source-summary">
                   <code>{source.kind}:{source.reference}{source.field ? `.${source.field}` : ''}</code>
                   <span>The literal is absent while this exact source is bound.</span>
+                  {!canSelectLiteral && (
+                    <span>A required parameter cannot become literal until a schema-valid fallback exists.</span>
+                  )}
                 </div>
+              ) : repairMode ? (
+                <>
+                  <p className="program-form-error" role="alert">
+                    Catalog-invalid value: {literalValidation}. Repair it as strict JSON; specialized controls are disabled to preserve every represented field.
+                  </p>
+                  <DraftTextarea
+                    id={`property-${selected.instance_id}-${parameter.id}`}
+                    rows={7}
+                    value={JSON.stringify(literal, null, 2)}
+                    disabled={busy}
+                    spellCheck={false}
+                    aria-label={`${parameter.id} strict JSON repair`}
+                    onCommit={(text) => {
+                      try {
+                        commitLiteral(parameter, JSON.parse(text) as JsonValue);
+                      } catch (error) {
+                        setErrors((current) => ({
+                          ...current,
+                          [parameter.id]: error instanceof Error
+                            ? error.message
+                            : 'Value must be strict JSON.',
+                        }));
+                      }
+                    }}
+                  />
+                </>
+              ) : specialized ? (
+                <ProgramSpecializedEditor
+                  schema={parameter.schema}
+                  value={literal}
+                  disabled={busy}
+                  onCommit={(value) => commitLiteral(parameter, value)}
+                />
               ) : complex ? (
                 <DraftTextarea
                   id={`property-${selected.instance_id}-${parameter.id}`}

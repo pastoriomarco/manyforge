@@ -11,7 +11,10 @@ import type {
 } from '../types/api';
 import { ProgramDeclarationsEditor } from './ProgramDeclarationsEditor';
 import { ProgramNodePalette } from './ProgramNodePalette';
-import { ProgramPropertyEditor } from './ProgramPropertyEditor';
+import {
+  buildProgramParameterMutation,
+  ProgramPropertyEditor,
+} from './ProgramPropertyEditor';
 import { ProgramTreeCanvas } from './ProgramTreeCanvas';
 import { ProgramWorkspace } from './ProgramWorkspace';
 
@@ -97,6 +100,139 @@ const environment: NodeEnvironmentResponse = {
 };
 
 describe('Program authoring panels', () => {
+  const mutationNode: ProgramTreeNode = {
+    node_id: 'specialized-node',
+    instance_id: 'specialized-instance',
+    parameters: {
+      pose: {
+        position_m: [0, 0, 0],
+        orientation: { rpy_deg: [0, 0, 0] },
+      },
+      coordinate: { kind: 'angular_rad', value_rad: 0.1 },
+      retained_literal: 7,
+    },
+    value_sources: {
+      program_bound: { kind: 'program_parameter', reference: 'speed' },
+      blackboard_bound: { kind: 'blackboard_key', reference: 'target' },
+    },
+    children: [],
+  };
+
+  it('builds exact full-replacement specialized motion and gripper literal mutations', () => {
+    const pose = {
+      position_m: [0.2, 0.3, 0.4],
+      orientation: { xyzw: [0, 0, 0, 1] },
+    };
+    expect(buildProgramParameterMutation(
+      mutationNode,
+      'pose',
+      { kind: 'literal', value: pose },
+    )).toEqual({
+      mutation: 'tree_draft_update_node_params',
+      args: {
+        instance_id: 'specialized-instance',
+        expected_node_id: 'specialized-node',
+        merge: false,
+        parameters: {
+          ...mutationNode.parameters,
+          pose,
+        },
+        value_sources: mutationNode.value_sources,
+      },
+    });
+
+    const coordinate = { kind: 'linear_m', value_m: 0.025 };
+    expect(buildProgramParameterMutation(
+      mutationNode,
+      'coordinate',
+      { kind: 'literal', value: coordinate },
+    ).args).toEqual({
+      instance_id: 'specialized-instance',
+      expected_node_id: 'specialized-node',
+      merge: false,
+      parameters: {
+        ...mutationNode.parameters,
+        coordinate,
+      },
+      value_sources: mutationNode.value_sources,
+    });
+  });
+
+  it('binds either source kind without losing unrelated sources or literals', () => {
+    expect(buildProgramParameterMutation(
+      mutationNode,
+      'pose',
+      {
+        kind: 'source',
+        source: { kind: 'program_parameter', reference: 'target_pose' },
+      },
+    ).args).toEqual({
+      instance_id: 'specialized-instance',
+      expected_node_id: 'specialized-node',
+      merge: false,
+      parameters: {
+        coordinate: mutationNode.parameters.coordinate,
+        retained_literal: 7,
+      },
+      value_sources: {
+        ...mutationNode.value_sources,
+        pose: { kind: 'program_parameter', reference: 'target_pose' },
+      },
+    });
+    expect(buildProgramParameterMutation(
+      mutationNode,
+      'coordinate',
+      {
+        kind: 'source',
+        source: { kind: 'blackboard_field', reference: 'tool', field: 'opening' },
+      },
+    ).args).toEqual({
+      instance_id: 'specialized-instance',
+      expected_node_id: 'specialized-node',
+      merge: false,
+      parameters: {
+        pose: mutationNode.parameters.pose,
+        retained_literal: 7,
+      },
+      value_sources: {
+        ...mutationNode.value_sources,
+        coordinate: { kind: 'blackboard_field', reference: 'tool', field: 'opening' },
+      },
+    });
+  });
+
+  it('returns one bound field to literal and clears only one optional counterpart', () => {
+    expect(buildProgramParameterMutation(
+      mutationNode,
+      'program_bound',
+      { kind: 'literal', value: 0.75 },
+    ).args).toEqual({
+      instance_id: 'specialized-instance',
+      expected_node_id: 'specialized-node',
+      merge: false,
+      parameters: {
+        ...mutationNode.parameters,
+        program_bound: 0.75,
+      },
+      value_sources: {
+        blackboard_bound: { kind: 'blackboard_key', reference: 'target' },
+      },
+    });
+    expect(buildProgramParameterMutation(
+      mutationNode,
+      'blackboard_bound',
+      { kind: 'clear' },
+    ).args).toEqual({
+      instance_id: 'specialized-instance',
+      expected_node_id: 'specialized-node',
+      merge: false,
+      parameters: mutationNode.parameters,
+      value_sources: {
+        program_bound: { kind: 'program_parameter', reference: 'speed' },
+      },
+    });
+  });
+
   it('keeps catalog authoring available while execution is separately gated', () => {
     const markup = renderToStaticMarkup(
       <ProgramNodePalette
@@ -141,6 +277,134 @@ describe('Program authoring panels', () => {
     expect(markup).toContain('aria-pressed="true"');
     expect(markup).toContain('program_parameter:wait_time');
     expect(markup).toContain('The literal is absent while this exact source is bound.');
+  });
+
+  it('keeps schema-invalid motion and gripper variants losslessly in JSON repair mode', () => {
+    const variantSchemas: CatalogEntry = {
+      ...timer,
+      id: 'variant-node',
+      parameters: [
+        {
+          id: 'pose',
+          required: true,
+          schema: {
+            type: 'object',
+            additionalProperties: false,
+            required: ['position_m', 'orientation'],
+            properties: {
+              position_m: {
+                type: 'array',
+                minItems: 3,
+                maxItems: 3,
+                items: { type: 'number' },
+              },
+              orientation: {
+                type: 'object',
+                additionalProperties: false,
+                properties: {
+                  rpy_deg: { type: 'array', minItems: 3, maxItems: 3, items: { type: 'number' } },
+                  xyzw: { type: 'array', minItems: 4, maxItems: 4, items: { type: 'number' } },
+                },
+                allOf: [{ oneOf: [{ required: ['rpy_deg'] }, { required: ['xyzw'] }] }],
+              },
+            },
+          },
+          schemaHash: 'sha256:pose',
+          hasDefault: false,
+        },
+        {
+          id: 'position',
+          required: true,
+          schema: {
+            type: 'object',
+            additionalProperties: false,
+            required: ['kind'],
+            properties: {
+              kind: { type: 'string', enum: ['angular_rad', 'linear_m'] },
+              value_rad: { type: 'number' },
+              value_m: { type: 'number' },
+            },
+            allOf: [{
+              oneOf: [{ required: ['value_rad'] }, { required: ['value_m'] }],
+            }],
+          },
+          schemaHash: 'sha256:position',
+          hasDefault: false,
+        },
+      ],
+    };
+    const invalidTree: ProgramTreeNode = {
+      node_id: 'variant-node',
+      instance_id: 'invalid',
+      parameters: {
+        pose: {
+          position_m: [0, 0, 0],
+          orientation: {
+            rpy_deg: [0, 0, 0],
+            xyzw: [0, 0, 0, 1],
+          },
+        },
+        position: {
+          kind: 'angular_rad',
+          value_rad: 0.2,
+          value_m: 0.01,
+        },
+      },
+      children: [],
+    };
+
+    const markup = renderToStaticMarkup(
+      <ProgramPropertyEditor
+        root={invalidTree}
+        selectedId="invalid"
+        catalogEntries={[variantSchemas]}
+        programParameters={[]}
+        blackboardKeys={[]}
+        busy={false}
+        onMutate={vi.fn()}
+      />,
+    );
+
+    expect(markup.match(/Catalog-invalid value:/g)).toHaveLength(2);
+    expect(markup).toContain('&quot;rpy_deg&quot;');
+    expect(markup).toContain('&quot;xyzw&quot;');
+    expect(markup).toContain('&quot;value_rad&quot;');
+    expect(markup).toContain('&quot;value_m&quot;');
+    expect(markup).not.toContain('data-editor="motion-pose"');
+    expect(markup).not.toContain('data-editor="gripper-coordinate"');
+  });
+
+  it('does not offer an empty Literal transition for a required blackboard binding', () => {
+    const requiredTree: ProgramTreeNode = {
+      node_id: 'timer',
+      instance_id: 'required-source',
+      parameters: {},
+      value_sources: {
+        duration_s: { kind: 'blackboard_key', reference: 'duration' },
+      },
+      children: [],
+    };
+    const markup = renderToStaticMarkup(
+      <ProgramPropertyEditor
+        root={requiredTree}
+        selectedId="required-source"
+        catalogEntries={[timer]}
+        programParameters={[]}
+        blackboardKeys={[{
+          key: 'duration',
+          type: 'float64',
+          access: 'read',
+          persistence: 'run',
+        }]}
+        busy={false}
+        onMutate={vi.fn()}
+      />,
+    );
+
+    expect(markup).toContain('<option value="" disabled="">Literal value</option>');
+    expect(markup).toContain(
+      'A required parameter cannot become literal until a schema-valid fallback exists.',
+    );
   });
 
   it('reports declaration usage and prevents deleting a referenced parameter', () => {

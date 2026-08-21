@@ -2387,6 +2387,65 @@ code {
   background: #0c2029;
 }
 
+.program-specialized-editor,
+.program-variant-editor,
+.program-waypoint,
+.program-joint-target {
+  display: grid;
+  gap: 0.55rem;
+}
+
+.program-specialized-editor label,
+.program-variant-editor label,
+.program-joint-target label {
+  display: grid;
+  gap: 0.25rem;
+  color: #91a8b3;
+  font-size: 0.68rem;
+}
+
+.program-vector-editor,
+.program-waypoint,
+.program-joint-target {
+  margin: 0;
+  padding: 0.55rem;
+  border: 1px solid #294652;
+  border-radius: 0.4rem;
+}
+
+.program-vector-editor legend,
+.program-waypoint legend {
+  padding: 0 0.3rem;
+  color: #b9cbd3;
+  font-size: 0.68rem;
+}
+
+.program-vector-editor legend span,
+.program-specialized-number span,
+.program-form-hint {
+  color: #708b98;
+  font-size: 0.62rem;
+}
+
+.program-vector-editor > div {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 0.35rem;
+}
+
+.program-specialized-number {
+  min-width: 0;
+}
+
+.program-specialized-number input {
+  width: 100%;
+  min-width: 0;
+}
+
+.program-form-hint {
+  margin: 0;
+}
+
 .program-declarations {
   padding-bottom: 0.75rem;
 }
