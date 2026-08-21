@@ -167,6 +167,59 @@ def test_composer_bounds_callback_bodies_without_narrowing_other_routes() -> Non
     )
 
 
+@pytest.mark.parametrize(
+    "path",
+    [
+        "/api/program/new-draft",
+        "/api/program/discard",
+        "/api/program/revert",
+    ],
+)
+@pytest.mark.parametrize("streamed", [False, True], ids=["declared", "streamed"])
+def test_program_lifecycle_mutations_reject_oversized_bodies_atomically(
+    path: str,
+    streamed: bool,
+) -> None:
+    class FailOnHeadlessCall:
+        def __init__(self) -> None:
+            self.calls: list[str] = []
+
+        def __getattr__(self, name: str) -> object:
+            self.calls.append(name)
+            raise AssertionError(f"unexpected headless call: {name}")
+
+    headless = FailOnHeadlessCall()
+    state = ComposerState(headless_client=headless)  # type: ignore[arg-type]
+    before = state.draft_session.workspace_snapshot()
+    body_size = 1024 * 1024 + 1
+    if streamed:
+        content = (
+            b"x" * min(64 * 1024, body_size - offset)
+            for offset in range(0, body_size, 64 * 1024)
+        )
+        headers = {
+            "content-type": "application/json",
+            "transfer-encoding": "chunked",
+        }
+    else:
+        content = b"x" * body_size
+        headers = {
+            "content-type": "application/json",
+            "content-length": str(body_size),
+        }
+
+    response = TestClient(create_app(state)).post(
+        path,
+        content=content,
+        headers=headers,
+    )
+
+    assert response.status_code == 413
+    assert response.json()["detail"]["code"] == "composer_request_body_oversized"
+    assert state.draft_session.workspace_snapshot() == before
+    assert headless.calls == []
+
+
 def test_unavailable_catch_all_has_stable_unique_openapi_operation_ids() -> None:
     app = create_app(ComposerState())
     catch_all_routes = [

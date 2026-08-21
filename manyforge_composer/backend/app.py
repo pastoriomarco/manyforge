@@ -206,7 +206,10 @@ def create_app(
         "/api/program/draft/",
         "/api/program/open-draft",
         "/api/program/apply",
+        "/api/program/new-draft",
+        "/api/program/discard",
         "/api/program/load",
+        "/api/program/revert",
         "/api/program/runs",
         "/api/program/save",
     ):
