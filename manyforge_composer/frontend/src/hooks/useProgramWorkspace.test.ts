@@ -1,4 +1,4 @@
-import { act, createElement, type ReactNode } from 'react';
+import { act, createElement, useEffect, type ReactNode } from 'react';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import type {
@@ -175,7 +175,13 @@ async function mountHarness(
   const { createRoot } = await import('react-dom/client');
   root = createRoot(makeNode('div') as unknown as Element);
   function Harness() {
-    latest = useProgramWorkspace();
+    const controller = useProgramWorkspace();
+    useEffect(() => {
+      latest = controller;
+      return () => {
+        latest = null;
+      };
+    }, [controller]);
     return null;
   }
   apiMock.programWorkspace.get.mockReturnValueOnce(initial.promise);

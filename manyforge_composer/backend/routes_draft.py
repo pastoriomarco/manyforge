@@ -47,7 +47,6 @@ _AUTHORING_MUTATIONS = frozenset(
         "blackboard_draft_upsert_namespaces",
         "program_draft_remove_parameters",
         "program_draft_upsert_parameters",
-        "program_draft_update_node_policies",
         "scene_draft_add_object",
         "scene_draft_remove_objects",
         "scene_draft_update_object",
@@ -293,14 +292,7 @@ def _program_write_roots(state: ComposerState) -> list[str]:
     return state.allowed_fs_roots
 
 
-def _apply_program(
-    state: ComposerState,
-    *,
-    program: Program,
-    scenario_id: str,
-    scenario_catalog_revision: str,
-    expected_applied_record_digest: str | None,
-) -> dict[str, Any]:
+def _require_apply_ready(program: Program) -> None:
     applicability = draft_applicability(program.to_dict())
     if not applicability["applyReady"]:
         reason = applicability["unavailableReason"]
@@ -313,6 +305,17 @@ def _apply_program(
                 "affectedInstanceIds": applicability["affectedInstanceIds"],
             },
         )
+
+
+def _apply_program(
+    state: ComposerState,
+    *,
+    program: Program,
+    scenario_id: str,
+    scenario_catalog_revision: str,
+    expected_applied_record_digest: str | None,
+) -> dict[str, Any]:
+    _require_apply_ready(program)
     if state.headless_client is None:
         raise DraftSessionError(
             "program_apply_unavailable",
@@ -522,20 +525,19 @@ def create_draft_router(state: ComposerState) -> APIRouter:
     @router.post("/api/program/apply")
     def apply_draft(body: ApplyDraftRequest) -> JSONResponse:
         try:
-            context, reason = _applied_context(state)
-            if (
-                reason is not None
-                and reason["code"] != "program_applied_selection_not_found"
-            ):
-                raise DraftSessionError(
-                    reason["code"],
-                    reason["message"],
-                    status_code=503,
-                )
-            result = state.draft_session.apply_current_program(
-                draft_id=body.draft_id,
-                expected_revision=body.expected_draft_revision,
-                applier=lambda program: _apply_program(
+            def apply_current_program(program: Program) -> dict[str, Any]:
+                _require_apply_ready(program)
+                context, reason = _applied_context(state)
+                if (
+                    reason is not None
+                    and reason["code"] != "program_applied_selection_not_found"
+                ):
+                    raise DraftSessionError(
+                        reason["code"],
+                        reason["message"],
+                        status_code=503,
+                    )
+                return _apply_program(
                     state,
                     program=program,
                     scenario_id=body.scenario_id,
@@ -543,7 +545,12 @@ def create_draft_router(state: ComposerState) -> APIRouter:
                     expected_applied_record_digest=(
                         context.record_digest if context is not None else None
                     ),
-                ),
+                )
+
+            result = state.draft_session.apply_current_program(
+                draft_id=body.draft_id,
+                expected_revision=body.expected_draft_revision,
+                applier=apply_current_program,
             )
             return JSONResponse(
                 status_code=200 if result.get("status") == "applied" else 202,

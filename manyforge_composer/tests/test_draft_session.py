@@ -13,6 +13,7 @@ from manyforge_behavior.program import Program
 from manyforge_composer.backend.draft_session import (
     ComposerDraftSession,
     DraftSessionError,
+    OPERATOR_DRAFT_MUTATIONS,
     SUPPORTED_DRAFT_MUTATIONS,
 )
 
@@ -1145,11 +1146,15 @@ def test_every_generated_draft_mutation_has_a_valid_atomic_path() -> None:
         "blackboard_draft_remove_namespaces",
         {"namespace_ids": ["scratch"]},
     )
-    invoke(
+    assert invoked == set(SUPPORTED_DRAFT_MUTATIONS)
+
+    operator_result = _mutate(
+        session,
         "program_draft_update_node_policies",
         _node_policy_arguments(session),
     )
 
-    assert invoked == set(SUPPORTED_DRAFT_MUTATIONS)
+    assert operator_result.mutation in OPERATOR_DRAFT_MUTATIONS
+    assert operator_result.mutation not in SUPPORTED_DRAFT_MUTATIONS
     assert session.snapshot()["saved"] is False
     assert session.snapshot()["applied"] is False

@@ -42,7 +42,6 @@ SUPPORTED_DRAFT_MUTATIONS = (
     "blackboard_draft_upsert_namespaces",
     "program_draft_remove_parameters",
     "program_draft_upsert_parameters",
-    "program_draft_update_node_policies",
     "scene_draft_add_object",
     "scene_draft_remove_objects",
     "scene_draft_update_object",
@@ -55,7 +54,10 @@ SUPPORTED_DRAFT_MUTATIONS = (
     "tree_draft_update_node_params",
     "tree_draft_wrap_node",
 )
-OPERATOR_DRAFT_MUTATIONS = ("viewer_draft_replace",)
+OPERATOR_DRAFT_MUTATIONS = (
+    "program_draft_update_node_policies",
+    "viewer_draft_replace",
+)
 _NODE_POLICY_MUTATION = "program_draft_update_node_policies"
 _PROGRAM_REVISION_PATTERN = re.compile(r"^sha256:[0-9a-f]{64}$")
 _PORTABLE_ID_PATTERN = re.compile(r"^[a-z][a-z0-9_.-]*$")
