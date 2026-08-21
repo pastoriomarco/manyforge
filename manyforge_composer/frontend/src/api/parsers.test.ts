@@ -1146,6 +1146,9 @@ describe('headless projection parsers', () => {
     });
     expect(succeeded.state).toBe('succeeded');
     expect(succeeded.applyId).toBe('apply-1');
+    if (succeeded.state !== 'succeeded') {
+      throw new Error('expected a succeeded Manager Apply receipt');
+    }
     expect(succeeded.candidateProjectionRevision.scene_revision.revision_id)
       .toBe(2);
   });

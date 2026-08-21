@@ -1618,7 +1618,7 @@ export function parseManagerApplyResponse(value: unknown): ManagerApplyResponse 
     );
   }
   const base = {
-    apiVersion,
+    apiVersion: 'manyforge.manager_command_response.v1' as const,
     applyGeneration: positiveIntegerAt(
       record.apply_generation,
       'managerApply.apply_generation',
