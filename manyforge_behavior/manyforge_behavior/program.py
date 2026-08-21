@@ -1319,6 +1319,157 @@ class ProgramTreeNode:
 
 
 @dataclass(frozen=True, slots=True)
+class ProgramNodePolicy:
+    """One complete immutable non-default policy row for a Program node."""
+
+    instance_id: str
+    modification_policy: Mapping[str, str]
+    recovery_policy: Mapping[str, Any]
+    operator_stop_policy: str
+
+    def __post_init__(self) -> None:
+        if (
+            type(self.instance_id) is not str
+            or _IDENTIFIER_RE.fullmatch(self.instance_id) is None
+            or len(self.instance_id.encode("ascii")) > 128
+        ):
+            raise ProgramValidationError(
+                "node policy instance_id must be a bounded portable ID"
+            )
+        modification = _parse_canonical_modification_policy(
+            dict(self.modification_policy),
+            path=f"node_policies.{self.instance_id}",
+        )
+        recovery_input = {
+            key: list(value) if isinstance(value, tuple) else value
+            for key, value in self.recovery_policy.items()
+        }
+        recovery = _parse_canonical_recovery_policy(
+            recovery_input,
+            path=f"node_policies.{self.instance_id}",
+        )
+        normalized = _normalize_canonical_node_policies(
+            {
+                "modification_policy": modification,
+                "recovery_policy": recovery,
+                "operator_stop_policy": self.operator_stop_policy,
+            },
+            path=f"node_policies.{self.instance_id}",
+        )
+        if normalized == (None, None, None):
+            raise ProgramValidationError(
+                "default node-policy rows must be omitted"
+            )
+        if recovery["allowed_skills"]:
+            raise ProgramValidationError(
+                "Program Run rejects nonempty allowed_skills until an exact "
+                "revision-qualified retained skill referent exists"
+            )
+        object.__setattr__(
+            self,
+            "modification_policy",
+            MappingProxyType(modification),
+        )
+        object.__setattr__(
+            self,
+            "recovery_policy",
+            MappingProxyType(
+                {
+                    key: tuple(value) if isinstance(value, list) else value
+                    for key, value in recovery.items()
+                }
+            ),
+        )
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "instance_id": self.instance_id,
+            "modification_policy": dict(self.modification_policy),
+            "recovery_policy": {
+                key: list(value) if isinstance(value, tuple) else value
+                for key, value in self.recovery_policy.items()
+            },
+            "operator_stop_policy": self.operator_stop_policy,
+        }
+
+
+def program_node_policies(program: "Program") -> tuple[ProgramNodePolicy, ...]:
+    """Independently derive the canonical sparse policy vector for ``program``."""
+
+    if not isinstance(program, Program):
+        raise TypeError("program must be one validated Program")
+    rows: list[ProgramNodePolicy] = []
+
+    def visit(node: ProgramTreeNode) -> None:
+        modification = {
+            **_CANONICAL_DEFAULT_MODIFICATION_POLICY,
+            **(
+                {}
+                if node.modification_policy is None
+                else dict(node.modification_policy)
+            ),
+        }
+        recovery = {
+            **_CANONICAL_DEFAULT_RECOVERY_POLICY,
+            **({} if node.recovery_policy is None else dict(node.recovery_policy)),
+        }
+        stop = node.operator_stop_policy or "inherit"
+        if recovery["allowed_skills"]:
+            raise ProgramValidationError(
+                "Program Run rejects nonempty allowed_skills until an exact "
+                "revision-qualified retained skill referent exists"
+            )
+        if (
+            modification != _CANONICAL_DEFAULT_MODIFICATION_POLICY
+            or recovery != _CANONICAL_DEFAULT_RECOVERY_POLICY
+            or stop != "inherit"
+        ):
+            rows.append(
+                ProgramNodePolicy(
+                    instance_id=node.instance_id,
+                    modification_policy=modification,
+                    recovery_policy=recovery,
+                    operator_stop_policy=stop,
+                )
+            )
+        for child in node.children:
+            visit(child)
+
+    visit(program.tree)
+    rows.sort(key=lambda row: row.instance_id)
+    return tuple(rows)
+
+
+def require_exact_program_binding_node_policies(
+    program: "Program",
+    program_binding: Mapping[str, Any],
+) -> tuple[ProgramNodePolicy, ...]:
+    """Reject a Binding unless its policy vector exactly equals the Program."""
+
+    if not isinstance(program_binding, Mapping):
+        raise TypeError("program_binding must be one verified mapping")
+    expected = program_node_policies(program)
+    raw_rows = program_binding.get("node_policies")
+    if type(raw_rows) is not list or len(raw_rows) > _MAX_TREE_NODES:
+        raise ProgramValidationError(
+            "Program Binding node_policies must be one bounded required list"
+        )
+    expected_documents = [row.to_dict() for row in expected]
+    try:
+        raw_bytes = canonical_json_bytes(raw_rows)
+        expected_bytes = canonical_json_bytes(expected_documents)
+    except StrictArtifactError as exc:
+        raise ProgramValidationError(
+            f"Program Binding node_policies are malformed: {exc}"
+        ) from exc
+    if raw_bytes != expected_bytes:
+        raise ProgramValidationError(
+            "Program Binding node_policies do not exactly equal the selected Program"
+        )
+    return expected
+
+
+@dataclass(frozen=True, slots=True)
 class ProgramParameterDeclaration:
     parameter_id: str
     type: str
@@ -3389,6 +3540,7 @@ __all__ = [
     "BlackboardFieldDeclaration",
     "BlackboardKeyDeclaration",
     "Program",
+    "ProgramNodePolicy",
     "ProgramParameterDeclaration",
     "ProgramTreeNode",
     "ProgramValidationError",
@@ -3397,5 +3549,7 @@ __all__ = [
     "compute_program_tree_hash",
     "find_tree_node_by_name",
     "merge_param_patch",
+    "program_node_policies",
+    "require_exact_program_binding_node_policies",
     "tree_node_from_dict",
 ]

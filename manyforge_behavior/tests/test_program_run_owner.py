@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 from collections.abc import Callable, Mapping, Sequence
+from copy import deepcopy
+from dataclasses import replace
 from pathlib import Path
 from threading import Event, Thread
 import time
@@ -11,6 +13,7 @@ from typing import Any
 import pytest
 
 from manyforge_behavior.catalog import NodeCatalog
+from manyforge_behavior.canonical_artifact import compute_content_identity
 from manyforge_behavior.executable_node_resolver import (
     build_executable_node_resolver,
 )
@@ -36,7 +39,7 @@ from manyforge_behavior.program_scheduling import (
     ProgramRunTickHost,
     ProgramSchedulingError,
 )
-from manyforge_behavior.program import Program
+from manyforge_behavior.program import Program, program_node_policies
 from manyforge_behavior.program_run_owner import (
     ProgramRunAdmission,
     ProgramRunOwner,
@@ -370,6 +373,7 @@ def _fixture(
             "program_revision": program.program_revision,
             "retained_bundle_id": _DIGEST_B,
             "graph_revision": _DIGEST_C,
+            "node_policies": [],
         },
         readiness=_readiness(_DIGEST_A),
         owner_identities=(
@@ -389,6 +393,48 @@ def _fixture(
         maximum_retained_runs=8,
     )
     return owner, admission, task, scope, events
+
+
+def _program_with_policies(
+    admission: ProgramRunAdmission,
+    *,
+    second_row: bool = False,
+    allowed_skill: bool = False,
+) -> Program:
+    document = admission.program.to_dict()
+    document["tree"]["operator_stop_policy"] = "hold"
+    if second_row:
+        document["tree"]["children"][0]["modification_policy"] = {
+            "runtime_override": "human_approval",
+            "persistent_edit": "forbidden",
+            "intervention_delegate": "human_only",
+        }
+    if allowed_skill:
+        document["tree"]["recovery_policy"] = {
+            "allow_intervention": True,
+            "allowed_recovery_actions": ["intervention"],
+            "max_retries": 1,
+            "allowed_skills": ["recover-pick"],
+            "persistence_ceiling": "session_only",
+        }
+    document["program_revision"] = compute_content_identity(
+        document,
+        own_field="program_revision",
+        identity_domain="program-revision",
+        api_version="manyforge.program.v1",
+    )
+    return Program.from_dict(document, admission.environment.catalog)
+
+
+def _admission_for_program(
+    admission: ProgramRunAdmission,
+    program: Program,
+    rows: list[dict[str, Any]],
+) -> ProgramRunAdmission:
+    binding = deepcopy(dict(admission.program_binding))
+    binding["program_revision"] = program.program_revision
+    binding["node_policies"] = rows
+    return replace(admission, program=program, program_binding=binding)
 
 
 def test_start_captures_the_exact_scenario_closure_before_the_first_tick() -> None:
@@ -414,10 +460,126 @@ def test_start_captures_the_exact_scenario_closure_before_the_first_tick() -> No
         "kernel_operations",
         "program_runner",
     ]
+    assert started.capture.node_policies == ()
+    assert dict(started.capture.node_policy_by_instance_id) == {}
 
     completed = owner.advance_once(started.capture.program_run_id)
     assert completed.state is ProgramRunState.SUCCEEDED
     assert completed.active_operation_count == 0
+
+
+def test_start_captures_exact_nondefault_policy_and_immutable_lookup() -> None:
+    owner, admission, _task, _scope, _events = _fixture(
+        initial_task_state=OwnerTaskState.SUCCEEDED
+    )
+    program = _program_with_policies(admission)
+    source_rows = [policy.to_dict() for policy in program_node_policies(program)]
+    admitted = _admission_for_program(admission, program, source_rows)
+
+    source_rows[0]["operator_stop_policy"] = "continue"
+    started = owner.start(admitted)
+    policy = started.capture.node_policy_by_instance_id[
+        program.tree.instance_id
+    ]
+
+    assert policy.to_dict() == {
+        "instance_id": program.tree.instance_id,
+        "modification_policy": {
+            "runtime_override": "forbidden",
+            "persistent_edit": "forbidden",
+            "intervention_delegate": "forbidden",
+        },
+        "recovery_policy": {
+            "allow_intervention": False,
+            "allowed_recovery_actions": [],
+            "max_retries": 0,
+            "allowed_skills": [],
+            "persistence_ceiling": "session_only",
+        },
+        "operator_stop_policy": "hold",
+    }
+    assert "node_policies" not in started.capture.to_dict()
+    with pytest.raises(TypeError):
+        started.capture.node_policy_by_instance_id[program.tree.instance_id] = policy
+    with pytest.raises(TypeError):
+        policy.modification_policy["runtime_override"] = "human_approval"
+    with pytest.raises(TypeError):
+        policy.recovery_policy["max_retries"] = 1
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        "missing",
+        "stale",
+        "default",
+        "duplicate",
+        "unsorted",
+        "reordered",
+        "nested",
+    ],
+)
+def test_program_run_admission_rejects_nonexact_policy_vectors(
+    mutation: str,
+) -> None:
+    _owner, admission, _task, _scope, _events = _fixture(
+        initial_task_state=OwnerTaskState.SUCCEEDED
+    )
+    program = _program_with_policies(admission, second_row=True)
+    rows = [policy.to_dict() for policy in program_node_policies(program)]
+    binding = deepcopy(dict(admission.program_binding))
+    binding["program_revision"] = program.program_revision
+    binding["node_policies"] = deepcopy(rows)
+    if mutation == "missing":
+        del binding["node_policies"]
+    elif mutation == "stale":
+        binding["node_policies"] = binding["node_policies"][:-1]
+    elif mutation == "default":
+        binding["node_policies"] = [
+            {
+                "instance_id": "unused",
+                "modification_policy": {
+                    "runtime_override": "forbidden",
+                    "persistent_edit": "forbidden",
+                    "intervention_delegate": "forbidden",
+                },
+                "recovery_policy": {
+                    "allow_intervention": False,
+                    "allowed_recovery_actions": [],
+                    "max_retries": 0,
+                    "allowed_skills": [],
+                    "persistence_ceiling": "session_only",
+                },
+                "operator_stop_policy": "inherit",
+            },
+            *rows,
+        ]
+    elif mutation == "duplicate":
+        binding["node_policies"].append(deepcopy(rows[-1]))
+    elif mutation in {"unsorted", "reordered"}:
+        binding["node_policies"].reverse()
+    else:
+        binding["node_policies"][0]["recovery_policy"]["max_retries"] = 1
+
+    with pytest.raises(ValueError, match="node_policies"):
+        replace(admission, program=program, program_binding=binding)
+
+
+def test_program_run_admission_rejects_policy_skills_and_wrong_program_identity() -> None:
+    _owner, admission, _task, _scope, _events = _fixture(
+        initial_task_state=OwnerTaskState.SUCCEEDED
+    )
+    program = _program_with_policies(admission, allowed_skill=True)
+    binding = deepcopy(dict(admission.program_binding))
+    binding["program_revision"] = program.program_revision
+    binding["node_policies"] = []
+
+    with pytest.raises(ValueError, match="revision-qualified retained skill"):
+        replace(admission, program=program, program_binding=binding)
+
+    binding["program_revision"] = admission.program.program_revision
+    with pytest.raises(ValueError, match="disagree"):
+        replace(admission, program=program, program_binding=binding)
 
 
 def test_owner_exposes_one_bounded_local_run_index_without_downstream_reads() -> None:
@@ -915,6 +1077,9 @@ def _scenario_selection(admission: ProgramRunAdmission) -> dict[str, Any]:
             "program_revision": program.program_revision,
             "retained_bundle_id": admission.retained_bundle_id,
             "graph_revision": admission.graph_revision,
+            "node_policies": [
+                policy.to_dict() for policy in admission.node_policies
+            ],
             "node_environment": {
                 "environment_digest": environment.environment_digest,
             },

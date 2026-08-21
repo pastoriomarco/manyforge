@@ -25,7 +25,12 @@ from manyforge_behavior.orchestration_ports import (
     ProgramRunScopeSnapshot,
     ProgramRunScopeState,
 )
-from manyforge_behavior.program import Program
+from manyforge_behavior.program import (
+    Program,
+    ProgramNodePolicy,
+    ProgramValidationError,
+    require_exact_program_binding_node_policies,
+)
 from manyforge_behavior.program_runtime import (
     ExecutableProgramRun,
     ProgramRunCapture,
@@ -88,6 +93,7 @@ class ProgramRunAdmission:
     owner_identities: tuple[ProgramRunOwnerIdentity, ...]
     program_parameter_values: Mapping[str, Any]
     assistant_projection: Mapping[str, Any] | None = None
+    node_policies: tuple[ProgramNodePolicy, ...] = field(init=False)
 
     def __post_init__(self) -> None:
         _text(self.scenario_id, field="scenario_id", maximum_bytes=128)
@@ -120,6 +126,14 @@ class ProgramRunAdmission:
             "program_binding",
             MappingProxyType(deepcopy(binding)),
         )
+        try:
+            node_policies = require_exact_program_binding_node_policies(
+                self.program,
+                binding,
+            )
+        except ProgramValidationError as exc:
+            raise ValueError(str(exc)) from exc
+        object.__setattr__(self, "node_policies", node_policies)
         if self.readiness.program_binding_id != self.program_binding_id:
             raise ValueError("readiness selects another Program Binding")
         if (
@@ -433,6 +447,7 @@ class ProgramRunOwner:
             graph_revision=admission.graph_revision,
             node_environment_digest=admission.environment.environment_digest,
             owner_identities=owner_identities,
+            node_policies=admission.node_policies,
         )
         context_port = self._ports.program_run_context
         initialization_port = self._ports.program_run_initialization

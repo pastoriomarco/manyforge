@@ -4,9 +4,10 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 from copy import deepcopy
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from hashlib import sha256
 from threading import Lock, RLock
+from types import MappingProxyType
 from typing import Any, Final
 
 import py_trees
@@ -25,7 +26,11 @@ from manyforge_behavior.orchestration_values import (
     NodeAttemptInputResolver,
     ProgramValueStore,
 )
-from manyforge_behavior.program import Program, ProgramTreeNode
+from manyforge_behavior.program import (
+    Program,
+    ProgramNodePolicy,
+    ProgramTreeNode,
+)
 
 PROGRAM_RUN_CAPTURE_API: Final = "manyforge.program_run_capture.v1"
 _MAX_ATTEMPTS_PER_NODE: Final = 1_000_000
@@ -89,6 +94,12 @@ class ProgramRunCapture:
     graph_revision: str
     node_environment_digest: str
     owner_identities: tuple[ProgramRunOwnerIdentity, ...]
+    node_policies: tuple[ProgramNodePolicy, ...] = ()
+    _node_policy_lookup: Mapping[str, ProgramNodePolicy] = field(
+        init=False,
+        repr=False,
+        compare=False,
+    )
 
     def __post_init__(self) -> None:
         _require_text(self.program_run_id, field="program_run_id")
@@ -126,6 +137,33 @@ class ProgramRunCapture:
                 "owner_identities must be unique, role-sorted, and include "
                 "program_runner"
             )
+        if (
+            not isinstance(self.node_policies, tuple)
+            or len(self.node_policies) > 100_000
+            or any(
+                not isinstance(policy, ProgramNodePolicy)
+                for policy in self.node_policies
+            )
+            or tuple(
+                sorted(
+                    self.node_policies,
+                    key=lambda policy: policy.instance_id,
+                )
+            )
+            != self.node_policies
+            or len({policy.instance_id for policy in self.node_policies})
+            != len(self.node_policies)
+        ):
+            raise ValueError(
+                "node_policies must be one bounded unique instance-sorted tuple"
+            )
+        object.__setattr__(
+            self,
+            "_node_policy_lookup",
+            MappingProxyType(
+                {policy.instance_id: policy for policy in self.node_policies}
+            ),
+        )
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -143,6 +181,12 @@ class ProgramRunCapture:
                 identity.to_dict() for identity in self.owner_identities
             ],
         }
+
+    @property
+    def node_policy_by_instance_id(self) -> Mapping[str, ProgramNodePolicy]:
+        """Return the runner-owned immutable per-run policy lookup."""
+
+        return self._node_policy_lookup
 
 
 class ProgramRunAttemptSource:
