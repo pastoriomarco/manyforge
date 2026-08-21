@@ -16,6 +16,7 @@ import {
   parseMotionPreviewResponse,
   parseNodeEnvironmentResponse,
   parseLogicalSceneProjection,
+  parseManagerApplyResponse,
   parseProgramWorkspaceResponse,
   parseProgramNodePolicyMutationResponse,
   parseProgramWorkspaceTransitionResponse,
@@ -1113,6 +1114,87 @@ describe('headless projection parsers', () => {
       update_status: 'pose_changed',
     });
     expect(parsed.committed_projection_revision.scene_revision.revision_id).toBe(2);
+  });
+
+  it('parses exact pending and succeeded Manager Apply receipts', () => {
+    const pending = parseManagerApplyResponse({
+      api_version: 'manyforge.manager_command_response.v1',
+      apply_generation: 1,
+      apply_id: 'apply-1',
+      candidate_projection_revision: null,
+      error: null,
+      ok: true,
+      replay_status: 'accepted_new',
+      request_id: 'request-1',
+      request_owner_epoch: 'manager-owner-1',
+      state: 'pending',
+    });
+    expect(pending.state).toBe('pending');
+    expect(pending.candidateProjectionRevision).toBeNull();
+
+    const succeeded = parseManagerApplyResponse({
+      api_version: 'manyforge.manager_command_response.v1',
+      apply_generation: 1,
+      apply_id: 'apply-1',
+      candidate_projection_revision: projectionRevisionFixture(2),
+      error: null,
+      ok: true,
+      replay_status: 'replayed_exact',
+      request_id: 'request-1',
+      request_owner_epoch: 'manager-owner-1',
+      state: 'succeeded',
+    });
+    expect(succeeded.state).toBe('succeeded');
+    expect(succeeded.applyId).toBe('apply-1');
+    expect(succeeded.candidateProjectionRevision.scene_revision.revision_id)
+      .toBe(2);
+  });
+
+  it('rejects obsolete, extra-field, and inconsistent Manager Apply receipts', () => {
+    const obsolete = {
+      api_version: 'manyforge.manager_command_response.v1',
+      error: null,
+      ok: true,
+      request_id: 'request-1',
+      request_owner_epoch: 'manager-owner-1',
+    };
+    expect(() => parseManagerApplyResponse(obsolete)).toThrow(/exactly/);
+
+    const extra = {
+      api_version: 'manyforge.manager_command_response.v1',
+      apply_generation: 1,
+      apply_id: 'apply-1',
+      candidate_projection_revision: null,
+      error: null,
+      ok: true,
+      replay_status: 'accepted_new',
+      request_id: 'request-1',
+      request_owner_epoch: 'manager-owner-1',
+      state: 'pending',
+      projection_status: 'pending',
+    };
+    expect(() => parseManagerApplyResponse(extra)).toThrow(/exactly/);
+
+    const pendingWithCandidate = {
+      ...extra,
+      projection_status: undefined,
+      candidate_projection_revision: projectionRevisionFixture(),
+    };
+    delete pendingWithCandidate.projection_status;
+    expect(() => parseManagerApplyResponse(pendingWithCandidate)).toThrow(
+      /null while Apply is pending/,
+    );
+
+    const succeededWithoutCandidate = {
+      ...extra,
+      projection_status: undefined,
+      candidate_projection_revision: null,
+      state: 'succeeded',
+    };
+    delete succeededWithoutCandidate.projection_status;
+    expect(() => parseManagerApplyResponse(succeededWithoutCandidate)).toThrow(
+      /projection revision while Apply has succeeded/,
+    );
   });
 
   it('keeps the maximum visible scene projection parse bounded', () => {

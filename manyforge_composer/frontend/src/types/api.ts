@@ -829,13 +829,37 @@ export interface ManagerDiffProjection {
   observedUnits: JsonValue[];
 }
 
-export interface ManagerApplyResponse {
+export type ManagerApplyReplayStatus = 'accepted_new' | 'replayed_exact';
+
+export interface ManagerApplyPendingResponse {
   apiVersion: 'manyforge.manager_command_response.v1';
-  ok: boolean;
-  error: { code: string; message: string } | null;
+  applyGeneration: number;
+  applyId: string;
+  candidateProjectionRevision: null;
+  error: null;
+  ok: true;
+  replayStatus: ManagerApplyReplayStatus;
   requestId: string;
   requestOwnerEpoch: string;
+  state: 'pending';
 }
+
+export interface ManagerApplySucceededResponse {
+  apiVersion: 'manyforge.manager_command_response.v1';
+  applyGeneration: number;
+  applyId: string;
+  candidateProjectionRevision: ProjectionRevision;
+  error: null;
+  ok: true;
+  replayStatus: ManagerApplyReplayStatus;
+  requestId: string;
+  requestOwnerEpoch: string;
+  state: 'succeeded';
+}
+
+export type ManagerApplyResponse =
+  | ManagerApplyPendingResponse
+  | ManagerApplySucceededResponse;
 
 export interface DraftMutationResponse {
   mutation: string;

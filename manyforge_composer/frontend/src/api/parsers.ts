@@ -1555,10 +1555,20 @@ export function parseManagerDiffProjection(
 
 export function parseManagerApplyResponse(value: unknown): ManagerApplyResponse {
   const record = objectAt(value, 'managerApply');
-  allowedKeysAt(
+  exactKeysAt(
     record,
-    ['api_version', 'error', 'ok', 'request_id', 'request_owner_epoch'],
-    ['projection_status', 'replay_status', 'transaction_sequence'],
+    [
+      'api_version',
+      'apply_generation',
+      'apply_id',
+      'candidate_projection_revision',
+      'error',
+      'ok',
+      'replay_status',
+      'request_id',
+      'request_owner_epoch',
+      'state',
+    ],
     'managerApply',
   );
   const apiVersion = stringAt(record.api_version, 'managerApply.api_version');
@@ -1568,25 +1578,80 @@ export function parseManagerApplyResponse(value: unknown): ManagerApplyResponse 
       'manyforge.manager_command_response.v1',
     );
   }
-  const error = record.error === null
-    ? null
-    : (() => {
-        const parsed = objectAt(record.error, 'managerApply.error');
-        exactKeysAt(parsed, ['code', 'message'], 'managerApply.error');
-        return {
-          code: stringAt(parsed.code, 'managerApply.error.code'),
-          message: stringAt(parsed.message, 'managerApply.error.message'),
-        };
-      })();
-  return {
-    apiVersion,
-    ok: booleanAt(record.ok, 'managerApply.ok'),
-    error,
-    requestId: stringAt(record.request_id, 'managerApply.request_id'),
-    requestOwnerEpoch: stringAt(
-      record.request_owner_epoch,
+  const ok = booleanAt(record.ok, 'managerApply.ok');
+  if (!ok) {
+    return fail('managerApply.ok', 'true for an accepted Apply');
+  }
+  if (record.error !== null) {
+    return fail('managerApply.error', 'null for an accepted Apply');
+  }
+  const replayStatus = stringAt(
+    record.replay_status,
+    'managerApply.replay_status',
+  );
+  if (replayStatus !== 'accepted_new' && replayStatus !== 'replayed_exact') {
+    return fail(
+      'managerApply.replay_status',
+      'accepted_new or replayed_exact',
+    );
+  }
+  const state = stringAt(record.state, 'managerApply.state');
+  if (state !== 'pending' && state !== 'succeeded') {
+    return fail('managerApply.state', 'pending or succeeded');
+  }
+  const applyId = stringAt(record.apply_id, 'managerApply.apply_id');
+  if (applyId.length === 0) {
+    return fail('managerApply.apply_id', 'a non-empty Apply identity');
+  }
+  const requestId = stringAt(record.request_id, 'managerApply.request_id');
+  if (requestId.length === 0) {
+    return fail('managerApply.request_id', 'a non-empty request identity');
+  }
+  const requestOwnerEpoch = stringAt(
+    record.request_owner_epoch,
+    'managerApply.request_owner_epoch',
+  );
+  if (requestOwnerEpoch.length === 0) {
+    return fail(
       'managerApply.request_owner_epoch',
+      'a non-empty request-owner epoch',
+    );
+  }
+  const base = {
+    apiVersion,
+    applyGeneration: positiveIntegerAt(
+      record.apply_generation,
+      'managerApply.apply_generation',
     ),
+    applyId,
+    error: null,
+    ok: true as const,
+    replayStatus,
+    requestId,
+    requestOwnerEpoch,
+  };
+  if (state === 'pending') {
+    if (record.candidate_projection_revision !== null) {
+      return fail(
+        'managerApply.candidate_projection_revision',
+        'null while Apply is pending',
+      );
+    }
+    return { ...base, candidateProjectionRevision: null, state };
+  }
+  if (record.candidate_projection_revision === null) {
+    return fail(
+      'managerApply.candidate_projection_revision',
+      'a projection revision while Apply has succeeded',
+    );
+  }
+  return {
+    ...base,
+    candidateProjectionRevision: parseProjectionRevision(
+      record.candidate_projection_revision,
+      'managerApply.candidate_projection_revision',
+    ),
+    state,
   };
 }
 

@@ -552,7 +552,16 @@ export const api = {
       signal?: AbortSignal,
     ): Promise<ManagerApplyResponse> => requestJson(
       '/api/manager/apply',
-      parseManagerApplyResponse,
+      (value) => {
+        const response = parseManagerApplyResponse(value);
+        if (
+          response.requestId !== request.request_id
+          || response.requestOwnerEpoch !== request.request_owner_epoch
+        ) {
+          throw new Error('Manager Apply response identity does not match the request');
+        }
+        return response;
+      },
       signal,
       { method: 'POST', body: JSON.stringify(request) },
     ),

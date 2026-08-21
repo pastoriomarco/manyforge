@@ -1,8 +1,10 @@
-import { useCallback, useEffect, useMemo, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 
 import { api } from '../api/client';
+import { completeManagerApply } from '../api/managerApplyCompletion';
 import type {
-  ManagerApplyResponse,
+  ManagerApplyRequest,
+  ManagerApplySucceededResponse,
   ManagerDiffProjection,
   ManagerGraphProjection,
   ManagerStatusProjection,
@@ -84,13 +86,10 @@ function previewValidation(
   return null;
 }
 
-function applyMessage(response: ManagerApplyResponse): string {
-  if (response.ok) {
-    return 'Manager accepted Apply ' + shortIdentity(response.requestId) + '.';
-  }
-  return response.error
-    ? response.error.code + ': ' + response.error.message
-    : 'Manager rejected Apply without a structured error.';
+function applySuccessMessage(response: ManagerApplySucceededResponse): string {
+  return 'Manager Apply ' + shortIdentity(response.applyId)
+    + ' succeeded at generation ' + response.applyGeneration
+    + '; projections were refreshed.';
 }
 
 export function DeploymentCompositionPanel({
@@ -104,10 +103,26 @@ export function DeploymentCompositionPanel({
   const [error, setError] = useState<string | null>(null);
   const [feedback, setFeedback] = useState<string | null>(null);
   const [reloadToken, setReloadToken] = useState(0);
+  const mountedRef = useRef(true);
+  const applyControllerRef = useRef<AbortController | null>(null);
 
   const refresh = useCallback(() => {
     setReloadToken((current) => current + 1);
   }, []);
+
+  useEffect(() => {
+    mountedRef.current = true;
+    return () => {
+      mountedRef.current = false;
+      applyControllerRef.current?.abort();
+    };
+  }, []);
+
+  useEffect(() => {
+    if (!enabled) {
+      applyControllerRef.current?.abort();
+    }
+  }, [enabled]);
 
   useEffect(() => {
     if (!enabled) {
@@ -181,30 +196,50 @@ export function DeploymentCompositionPanel({
     if (!readModel || !selectedScenario || !canApply) return;
     const ownerEpoch = readModel.status.source.sourceOwnerEpoch;
     if (ownerEpoch === null) return;
+    const request: ManagerApplyRequest = {
+      request_id: requestId(),
+      request_owner_epoch: ownerEpoch,
+      source_label: 'composer_ui',
+      correlation_id: null,
+      deployment_artifact_id: selectedScenario.deploymentArtifactId,
+      deployment_revision: selectedScenario.deploymentRevision,
+      expected_current: {
+        graph_revision: readModel.graph.graphRevision,
+        retained_bundle_id: readModel.graph.retainedBundleId,
+      },
+      reject_if_affected_busy: true,
+    };
+    const controller = new AbortController();
+    applyControllerRef.current = controller;
     setBusy('apply');
     setError(null);
     setFeedback(null);
     try {
-      const response = await api.manager.apply({
-        request_id: requestId(),
-        request_owner_epoch: ownerEpoch,
-        source_label: 'composer_ui',
-        correlation_id: null,
-        deployment_artifact_id: selectedScenario.deploymentArtifactId,
-        deployment_revision: selectedScenario.deploymentRevision,
-        expected_current: {
-          graph_revision: readModel.graph.graphRevision,
-          retained_bundle_id: readModel.graph.retainedBundleId,
-        },
-        reject_if_affected_busy: true,
-      });
-      setFeedback(applyMessage(response));
+      const completion = await completeManagerApply(
+        request,
+        (exactRequest, signal) => api.manager.apply(exactRequest, signal),
+        { signal: controller.signal },
+      );
+      if (!mountedRef.current || controller.signal.aborted) return;
+      if (completion.state === 'succeeded') {
+        setFeedback(applySuccessMessage(completion.response));
+      } else {
+        setFeedback(
+          'Manager accepted Apply ' + shortIdentity(completion.response.applyId)
+          + ', but the durable Apply remains pending after bounded observation. '
+          + 'Projections can be refreshed to observe completion.',
+        );
+      }
       setPreviewedScenarioId(null);
       refresh();
     } catch (reason: unknown) {
+      if (!mountedRef.current || controller.signal.aborted) return;
       setError(errorMessage(reason));
     } finally {
-      setBusy(null);
+      if (applyControllerRef.current === controller) {
+        applyControllerRef.current = null;
+      }
+      if (mountedRef.current) setBusy(null);
     }
   };
 

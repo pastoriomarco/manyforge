@@ -1975,6 +1975,51 @@ def test_composer_preserves_headless_unavailability_code(
     assert response.json()["detail"]["code"] == "kernel_owner_unavailable"
 
 
+def test_composer_preserves_manager_apply_success_receipt(
+    headless_client,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client, _requests, _node_environment = headless_client
+    receipt = {
+        "api_version": "manyforge.manager_command_response.v1",
+        "apply_generation": 3,
+        "apply_id": "apply.3",
+        "candidate_projection_revision": {
+            "graph_revision": "sha256:" + "b" * 64,
+            "retained_bundle_id": "sha256:" + "c" * 64,
+            "scene_revision": {
+                "content_hash": "sha256:" + "d" * 64,
+                "revision_id": 2,
+                "scene_id": "sha256:" + "e" * 64,
+            },
+        },
+        "error": None,
+        "ok": True,
+        "replay_status": "replayed_exact",
+        "request_id": "request.1",
+        "request_owner_epoch": "alarm.epoch.1",
+        "state": "succeeded",
+    }
+    monkeypatch.setattr(client, "manager_apply", lambda _body: receipt)
+    with _composer(client) as composer:
+        response = composer.post(
+            "/api/manager/apply",
+            json={
+                **_caller(),
+                "deployment_artifact_id": "deployment.3",
+                "deployment_revision": "sha256:" + "a" * 64,
+                "expected_current": {
+                    "graph_revision": "graph.2",
+                    "retained_bundle_id": "bundle.2",
+                },
+                "reject_if_affected_busy": True,
+            },
+        )
+
+    assert response.status_code == 200
+    assert response.json() == receipt
+
+
 def test_composer_websocket_streams_owner_snapshots_only(
     headless_client,
 ) -> None:

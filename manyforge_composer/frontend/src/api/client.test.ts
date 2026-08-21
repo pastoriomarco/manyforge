@@ -159,10 +159,23 @@ function managerDiffFixture(): Record<string, unknown> {
 function managerApplyFixture(request: ManagerApplyRequest): Record<string, unknown> {
   return {
     api_version: 'manyforge.manager_command_response.v1',
+    apply_generation: 1,
+    apply_id: 'apply-1',
+    candidate_projection_revision: {
+      retained_bundle_id: 'sha256:' + 'b'.repeat(64),
+      graph_revision: 'sha256:' + 'c'.repeat(64),
+      scene_revision: {
+        scene_id: 'sha256:' + 'd'.repeat(64),
+        revision_id: 2,
+        content_hash: 'sha256:' + 'e'.repeat(64),
+      },
+    },
     ok: true,
     error: null,
+    replay_status: 'replayed_exact',
     request_id: request.request_id,
     request_owner_epoch: request.request_owner_epoch,
+    state: 'succeeded',
   };
 }
 
@@ -534,7 +547,7 @@ describe('headless intent client', () => {
     vi.stubGlobal('fetch', fetchMock);
 
     await api.manager.graph();
-    await api.manager.apply(request);
+    const receipt = await api.manager.apply(request);
     await api.manager.diff();
 
     expect(fetchMock.mock.calls[0]?.[0]).toBe('/api/manager/graph');
@@ -544,6 +557,52 @@ describe('headless intent client', () => {
     const [, applyOptions] = fetchMock.mock.calls[1] as [string, RequestInit];
     expect(applyOptions.method).toBe('POST');
     expect(JSON.parse(String(applyOptions.body))).toEqual(request);
+    expect(receipt).toEqual({
+      apiVersion: 'manyforge.manager_command_response.v1',
+      applyId: 'apply-1',
+      applyGeneration: 1,
+      candidateProjectionRevision: {
+        retained_bundle_id: 'sha256:' + 'b'.repeat(64),
+        graph_revision: 'sha256:' + 'c'.repeat(64),
+        scene_revision: {
+          scene_id: 'sha256:' + 'd'.repeat(64),
+          revision_id: 2,
+          content_hash: 'sha256:' + 'e'.repeat(64),
+        },
+      },
+      error: null,
+      ok: true,
+      replayStatus: 'replayed_exact',
+      requestId: request.request_id,
+      requestOwnerEpoch: request.request_owner_epoch,
+      state: 'succeeded',
+    });
+  });
+
+  it('rejects a Manager Apply receipt with a mismatched request identity', async () => {
+    const request: ManagerApplyRequest = {
+      request_id: 'request-manager-identity',
+      request_owner_epoch: 'owner.epoch.1',
+      source_label: 'composer_ui',
+      correlation_id: null,
+      deployment_artifact_id: 'artifact-1',
+      deployment_revision: 'rev-2',
+      expected_current: {
+        graph_revision: 'graph-9',
+        retained_bundle_id: 'bundle-9',
+      },
+      reject_if_affected_busy: true,
+    };
+    const responsePayload = managerApplyFixture({
+      ...request,
+      request_id: 'request-manager-other',
+    });
+    const fetchMock = vi.fn().mockResolvedValue(response(responsePayload));
+    vi.stubGlobal('fetch', fetchMock);
+
+    await expect(api.manager.apply(request)).rejects.toThrow(
+      'Manager Apply response identity does not match the request',
+    );
   });
 
   it('submits one exact alarm activation without a caller-supplied principal', async () => {
