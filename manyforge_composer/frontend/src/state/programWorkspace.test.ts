@@ -251,7 +251,7 @@ describe('Program workspace request fencing', () => {
   it('recomputes all Draft-relative comparisons from the closed mutation Draft', () => {
     const current = workspace('draft-1', 7);
     const revision = `sha256:${'1'.repeat(64)}`;
-    const returnedDraft = {
+    const returnedDraft: ProgramWorkspaceResponse['draft'] = {
       ...current.draft,
       draftRevision: 8,
       programLoaded: true,

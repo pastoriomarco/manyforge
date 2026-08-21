@@ -811,7 +811,8 @@ describe('Program workspace parsers', () => {
     for (const change of cases) {
       const invalid = structuredClone(fixture);
       const invalidProgram = (invalid.draft as Record<string, unknown>).program as Record<string, unknown>;
-      Object.assign(invalidProgram.tree, change);
+      const invalidTree = invalidProgram.tree as Record<string, unknown>;
+      Object.assign(invalidTree, change);
       expect(() => parseProgramWorkspaceResponse(invalid)).toThrow();
     }
   });
