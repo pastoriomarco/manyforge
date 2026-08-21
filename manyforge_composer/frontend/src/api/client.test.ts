@@ -49,6 +49,11 @@ function workspaceFixture(): Record<string, unknown> {
         },
       },
     },
+    applicability: {
+      applyReady: true,
+      affectedInstanceIds: [],
+      unavailableReason: null,
+    },
     saved: {
       available: true,
       matchesDraft: true,
@@ -296,6 +301,61 @@ describe('structural API client', () => {
       },
     });
     expect(result.workspace.saved.matchesDraft).toBe(true);
+  });
+
+  it('submits the closed revision-fenced node-policy mutation', async () => {
+    const workspace = workspaceFixture();
+    const fetchMock = vi.fn().mockResolvedValue(response({
+      schemaVersion: 'manyforge.composer_draft_mutation.v1',
+      mutation: 'program_draft_update_node_policies',
+      details: { updated_instance_id: 'wait' },
+      draft: workspace.draft,
+    }));
+    vi.stubGlobal('fetch', fetchMock);
+
+    const result = await api.programWorkspace.updateNodePolicies(
+      { draftId: 'draft-1', expectedDraftRevision: 1 },
+      `sha256:${'a'.repeat(64)}`,
+      'wait',
+      {
+        runtime_override: 'human_approval',
+        persistent_edit: 'human_approval',
+        intervention_delegate: 'human_only',
+      },
+      {
+        allow_intervention: true,
+        allowed_recovery_actions: ['intervention'],
+        max_retries: 2,
+        allowed_skills: [],
+        persistence_ceiling: 'draft_patch',
+      },
+      'hold',
+    );
+
+    expect(result.details.updatedInstanceId).toBe('wait');
+    const [, options] = fetchMock.mock.calls[0] as [string, RequestInit];
+    expect(JSON.parse(String(options.body))).toEqual({
+      draftId: 'draft-1',
+      expectedDraftRevision: 1,
+      mutation: 'program_draft_update_node_policies',
+      arguments: {
+        expected_program_revision: `sha256:${'a'.repeat(64)}`,
+        instance_id: 'wait',
+        modification_policy: {
+          runtime_override: 'human_approval',
+          persistent_edit: 'human_approval',
+          intervention_delegate: 'human_only',
+        },
+        recovery_policy: {
+          allow_intervention: true,
+          allowed_recovery_actions: ['intervention'],
+          max_retries: 2,
+          allowed_skills: [],
+          persistence_ceiling: 'draft_patch',
+        },
+        operator_stop_policy: 'hold',
+      },
+    });
   });
 
   it('forwards Apply and bounded runner reads without client-owned state', async () => {

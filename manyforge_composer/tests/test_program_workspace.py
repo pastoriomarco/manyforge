@@ -9,6 +9,7 @@ import shutil
 from fastapi.testclient import TestClient
 import pytest
 
+from manyforge_behavior.canonical_artifact import compute_content_identity
 from manyforge_behavior.node_environment import build_node_environment
 from manyforge_behavior.program import Program
 from manyforge_composer.backend.app import create_app
@@ -113,6 +114,273 @@ def test_open_mutate_save_and_save_as_preserve_exact_workspace_facts(
     expected_copy = tmp_path / "copy.program.yaml"
     assert save_as["saved"]["path"] == str(expected_copy.resolve())
     assert expected_copy.is_file()
+
+
+def test_node_policy_mutation_is_closed_draft_only_and_revision_fenced(
+    tmp_path: Path,
+) -> None:
+    source = _copy_program(tmp_path)
+    original_bytes = source.read_bytes()
+    client = _client(tmp_path)
+    empty = client.get("/api/program/workspace").json()
+    opened = client.post(
+        "/api/program/open-draft",
+        json={**_fence(empty), "path": str(source)},
+    ).json()
+    program_revision = opened["draft"]["programRevision"]
+    arguments = {
+        "expected_program_revision": program_revision,
+        "instance_id": "move_to_pick",
+        "modification_policy": {
+            "runtime_override": "human_approval",
+            "persistent_edit": "human_approval",
+            "intervention_delegate": "human_only",
+        },
+        "recovery_policy": {
+            "allow_intervention": True,
+            "allowed_recovery_actions": ["intervention"],
+            "max_retries": 1,
+            "allowed_skills": [],
+            "persistence_ceiling": "draft_patch",
+        },
+        "operator_stop_policy": "hold",
+    }
+
+    response = client.post(
+        "/api/program/draft/mutations",
+        json={
+            **_fence(opened),
+            "mutation": "program_draft_update_node_policies",
+            "arguments": arguments,
+        },
+    )
+    assert response.status_code == 200
+    body = response.json()
+    assert set(body) == {"schemaVersion", "mutation", "details", "draft"}
+    assert body["schemaVersion"] == "manyforge.composer_draft_mutation.v1"
+    assert body["mutation"] == "program_draft_update_node_policies"
+    assert body["details"] == {"updated_instance_id": "move_to_pick"}
+    assert set(body["draft"]) == {
+        "draftId",
+        "draftRevision",
+        "programLoaded",
+        "programRevision",
+        "program",
+    }
+    assert body["draft"]["draftRevision"] == opened["draft"]["draftRevision"] + 1
+    assert source.read_bytes() == original_bytes
+
+    stale = client.post(
+        "/api/program/draft/mutations",
+        json={
+            **_fence({"draft": body["draft"]}),
+            "mutation": "program_draft_update_node_policies",
+            "arguments": {
+                **arguments,
+                "expected_program_revision": "sha256:" + "f" * 64,
+            },
+        },
+    )
+    assert stale.status_code == 409
+    assert stale.json()["detail"]["code"] == "composer_program_revision_stale"
+    assert client.get("/api/program/workspace").json()["draft"] == body["draft"]
+
+
+@pytest.mark.parametrize("invalid", ["skills", "instance_id"])
+def test_node_policy_rejections_are_atomic_and_do_not_read_headless(
+    tmp_path: Path,
+    invalid: str,
+) -> None:
+    source = _copy_program(tmp_path)
+    original_bytes = source.read_bytes()
+
+    class FailOnHeadlessCall:
+        def __init__(self) -> None:
+            self.calls: list[str] = []
+
+        def __getattr__(self, name: str) -> object:
+            self.calls.append(name)
+            raise AssertionError(f"unexpected headless call: {name}")
+
+    headless = FailOnHeadlessCall()
+    program = Program(source, build_node_environment().catalog)
+    state = ComposerState(
+        program=program,
+        program_source_path=str(source),
+        headless_client=headless,  # type: ignore[arg-type]
+    )
+    before = state.draft_session.workspace_snapshot()
+    client = TestClient(
+        create_app(
+            state,
+            security=SecurityConfig(
+                allowed_fs_roots=[str(tmp_path)],
+                cors_origins=["http://localhost:3000"],
+            ),
+        )
+    )
+    arguments = {
+        "expected_program_revision": before["draft"]["programRevision"],
+        "instance_id": "move_to_pick",
+        "modification_policy": {
+            "runtime_override": "human_approval",
+            "persistent_edit": "human_approval",
+            "intervention_delegate": "human_only",
+        },
+        "recovery_policy": {
+            "allow_intervention": True,
+            "allowed_recovery_actions": ["intervention"],
+            "max_retries": 1,
+            "allowed_skills": ["inspect"] if invalid == "skills" else [],
+            "persistence_ceiling": "draft_patch",
+        },
+        "operator_stop_policy": "hold",
+    }
+    if invalid == "instance_id":
+        arguments["instance_id"] = "a" + ("b" * 128)
+
+    response = client.post(
+        "/api/program/draft/mutations",
+        json={
+            **_fence(before),
+            "mutation": "program_draft_update_node_policies",
+            "arguments": arguments,
+        },
+    )
+
+    assert response.status_code == 409
+    if invalid == "skills":
+        assert response.json()["detail"] == {
+            "code": "composer_policy_skill_referent_unavailable",
+            "message": (
+                "Allowed recovery skills are unavailable: each skill requires "
+                "an exact revision-qualified retained referent. Leave Allowed "
+                "skills empty."
+            ),
+        }
+    else:
+        assert response.json()["detail"]["code"] == "draft_arguments_invalid"
+    assert headless.calls == []
+    assert state.draft_session.workspace_snapshot() == before
+    assert source.read_bytes() == original_bytes
+
+
+def test_node_policy_success_with_imported_node_a_skills_is_closed_and_headless_free(
+    tmp_path: Path,
+) -> None:
+    catalog = build_node_environment().catalog
+    document = Program(_SOURCE_PROGRAM, catalog).to_dict()
+    document["tree"]["children"][0]["modification_policy"] = {
+        "runtime_override": "human_approval",
+        "persistent_edit": "human_approval",
+        "intervention_delegate": "human_only",
+    }
+    document["tree"]["children"][0]["recovery_policy"] = {
+        "allow_intervention": True,
+        "allowed_recovery_actions": ["intervention"],
+        "max_retries": 0,
+        "allowed_skills": ["legacy.inspect"],
+        "persistence_ceiling": "session_only",
+    }
+    document["program_revision"] = compute_content_identity(
+        document,
+        own_field="program_revision",
+        identity_domain="program-revision",
+        api_version="manyforge.program.v1",
+    )
+    program = Program.from_dict(document, catalog)
+
+    class FailOnHeadlessCall:
+        def __init__(self) -> None:
+            self.calls: list[str] = []
+
+        def __getattr__(self, name: str) -> object:
+            self.calls.append(name)
+            raise AssertionError(f"unexpected headless call: {name}")
+
+    headless = FailOnHeadlessCall()
+    state = ComposerState(
+        program=program,
+        headless_client=headless,  # type: ignore[arg-type]
+    )
+    client = TestClient(
+        create_app(
+            state,
+            security=SecurityConfig(
+                allowed_fs_roots=[str(tmp_path)],
+                cors_origins=["http://localhost:3000"],
+            ),
+        )
+    )
+    before = state.draft_session.snapshot()
+    workspace = state.draft_session.workspace_snapshot()
+    assert workspace["applicability"] == {
+        "applyReady": False,
+        "affectedInstanceIds": ["move_to_pick"],
+        "unavailableReason": {
+            "code": "composer_policy_skill_referent_unavailable",
+            "message": (
+                "Allowed recovery skills are unavailable: each skill requires "
+                "an exact revision-qualified retained referent. Leave Allowed "
+                "skills empty."
+            ),
+            "restorationGates": [],
+        },
+    }
+    response = client.post(
+        "/api/program/draft/mutations",
+        json={
+            "draftId": before["draft_id"],
+            "expectedDraftRevision": before["draft_revision"],
+            "mutation": "program_draft_update_node_policies",
+            "arguments": {
+                "expected_program_revision": before["program_revision"],
+                "instance_id": "remove_table",
+                "modification_policy": {
+                    "runtime_override": "forbidden",
+                    "persistent_edit": "forbidden",
+                    "intervention_delegate": "forbidden",
+                },
+                "recovery_policy": {
+                    "allow_intervention": False,
+                    "allowed_recovery_actions": [],
+                    "max_retries": 0,
+                    "allowed_skills": [],
+                    "persistence_ceiling": "session_only",
+                },
+                "operator_stop_policy": "hold",
+            },
+        },
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert set(body) == {"schemaVersion", "mutation", "details", "draft"}
+    assert body["draft"]["program"]["tree"]["children"][0][
+        "recovery_policy"
+    ]["allowed_skills"] == ["legacy.inspect"]
+    assert body["draft"]["draftRevision"] == before["draft_revision"] + 1
+
+    blocked_apply = client.post(
+        "/api/program/apply",
+        json={
+            "draftId": body["draft"]["draftId"],
+            "expectedDraftRevision": body["draft"]["draftRevision"],
+            "scenarioId": "cell-pick",
+            "scenarioCatalogRevision": "sha256:" + "7" * 64,
+        },
+    )
+    assert blocked_apply.status_code == 409
+    assert blocked_apply.json()["detail"] == {
+        "code": "composer_policy_skill_referent_unavailable",
+        "message": (
+            "Allowed recovery skills are unavailable: each skill requires "
+            "an exact revision-qualified retained referent. Leave Allowed "
+            "skills empty."
+        ),
+        "affectedInstanceIds": ["move_to_pick"],
+    }
+    assert headless.calls == []
 
 
 def test_examples_open_read_only_and_save_as_is_confined_to_program_workspace(

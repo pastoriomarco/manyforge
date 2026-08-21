@@ -18,6 +18,11 @@ function workspace(draftId: string, revision: number): ProgramWorkspaceResponse 
       programRevision: null,
       program: null,
     },
+    applicability: {
+      applyReady: true,
+      affectedInstanceIds: [],
+      unavailableReason: null,
+    },
     saved: {
       available: false,
       matchesDraft: false,

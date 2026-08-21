@@ -1916,6 +1916,10 @@ code {
   box-shadow: inset 0 0.2rem #86524c;
 }
 
+.program-identity-strip .identity-refreshing {
+  box-shadow: inset 0 0.2rem #5f9fb0;
+}
+
 .program-artifact-actions {
   display: grid;
   grid-template-columns: minmax(16rem, 1fr) auto auto minmax(18rem, 1fr) auto auto;
@@ -1934,6 +1938,15 @@ code {
 .program-apply-actions small {
   align-self: center;
   color: #8097a4;
+  font-size: 0.7rem;
+  line-height: 1.4;
+}
+
+.program-apply-blocked {
+  display: grid;
+  grid-column: 1 / -1;
+  gap: 0.2rem;
+  color: #daa998;
   font-size: 0.7rem;
   line-height: 1.4;
 }
@@ -2388,6 +2401,147 @@ code {
 .program-source-summary span {
   color: #7b929e;
   font-size: 0.65rem;
+}
+
+.program-policy-editor {
+  margin: 0 0.75rem 0.85rem;
+  padding-top: 0.85rem;
+  border-top: 1px solid #38505c;
+}
+
+.program-policy-form {
+  display: grid;
+  gap: 0.7rem;
+}
+
+.program-policy-heading,
+.program-policy-actions-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.55rem;
+}
+
+.program-policy-heading h4 {
+  margin: 0;
+  color: #dbe8ee;
+  font-size: 0.85rem;
+}
+
+.program-policy-heading code {
+  color: #9bc4cf;
+  font-size: 0.65rem;
+}
+
+.program-policy-note,
+.program-policy-help,
+.program-policy-blocked {
+  margin: 0;
+  color: #8198a5;
+  font-size: 0.67rem;
+  line-height: 1.45;
+}
+
+.program-policy-fieldset {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 0.55rem;
+  min-width: 0;
+  margin: 0;
+  padding: 0.65rem;
+  border: 1px solid #294553;
+  border-radius: 0.45rem;
+  background: #0b1a23;
+}
+
+.program-policy-fieldset legend,
+.program-policy-actions legend {
+  padding: 0 0.3rem;
+  color: #b7dce7;
+  font-size: 0.68rem;
+  font-weight: 680;
+}
+
+.program-policy-field {
+  display: grid;
+  min-width: 0;
+  gap: 0.3rem;
+  color: #91a8b3;
+  font-size: 0.67rem;
+}
+
+.program-policy-field select,
+.program-policy-field input {
+  width: 100%;
+  min-width: 0;
+  padding: 0.42rem 0.5rem;
+  border: 1px solid #304b5a;
+  border-radius: 0.35rem;
+  color: #dce8ee;
+  background: #07141d;
+  font-size: 0.7rem;
+}
+
+.program-policy-field input:disabled {
+  color: #748b96;
+  background: #0a151c;
+  cursor: not-allowed;
+}
+
+.program-policy-checkbox {
+  display: flex;
+  min-width: 0;
+  align-items: center;
+  gap: 0.4rem;
+  color: #b2c7cf;
+  font-size: 0.68rem;
+}
+
+.program-policy-checkbox input {
+  width: auto;
+  accent-color: #60bed5;
+}
+
+.program-policy-actions {
+  display: grid;
+  grid-column: 1 / -1;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 0.45rem 0.65rem;
+  min-width: 0;
+  margin: 0;
+  padding: 0.5rem;
+  border: 1px solid #263f4b;
+  border-radius: 0.35rem;
+}
+
+.program-policy-actions legend,
+.program-policy-actions .program-form-error {
+  grid-column: 1 / -1;
+}
+
+.program-policy-help {
+  grid-column: 1 / -1;
+}
+
+.program-policy-fieldset > .program-form-error {
+  grid-column: 1 / -1;
+}
+
+.program-policy-field .program-form-error {
+  margin-top: -0.1rem;
+}
+
+.program-policy-actions-row {
+  align-items: flex-start;
+}
+
+.program-policy-actions-row button {
+  padding: 0.5rem 0.7rem;
+}
+
+.program-policy-blocked {
+  color: #daa998;
+  text-align: right;
 }
 
 .program-source-summary {
@@ -3163,6 +3317,15 @@ code {
   .scene-quaternion-grid,
   .viewer-role-controls {
     grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  .program-policy-fieldset,
+  .program-policy-actions {
+    grid-template-columns: 1fr;
+  }
+
+  .program-policy-actions {
+    grid-column: auto;
   }
 
   .program-identity-strip > div {

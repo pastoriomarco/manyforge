@@ -6,6 +6,8 @@ import type {
   CatalogParameter,
   CatalogResponse,
   DraftMutationResponse,
+  ProgramDraftProjection,
+  ProgramDraftApplicability,
   FileBrowserEntry,
   FileBrowserResponse,
   HealthResponse,
@@ -22,7 +24,15 @@ import type {
   ManagerSourceMetadata,
   ManagerStatusProjection,
   ProgramDocument,
+  ProgramInterventionDelegate,
+  ProgramModificationPolicyValue,
+  ProgramNodeModificationPolicy,
+  ProgramNodeRecoveryPolicy,
+  ProgramNodePolicyMutationResponse,
   ProgramParameterDeclaration,
+  ProgramOperatorStopPolicy,
+  ProgramPersistenceCeiling,
+  ProgramRecoveryAction,
   ProgramSceneFrameRef,
   ProgramScenePose,
   ProgramSceneResource,
@@ -561,6 +571,149 @@ function parseProgramValueSource(value: unknown, path: string): ProgramValueSour
   return result;
 }
 
+const MODIFICATION_POLICY_VALUES = new Set<ProgramModificationPolicyValue>([
+  'forbidden',
+  'human_approval',
+  'llm_allowed',
+]);
+const INTERVENTION_DELEGATES = new Set<ProgramInterventionDelegate>([
+  'forbidden',
+  'human_only',
+  'llm_allowed',
+  'program_only',
+]);
+const RECOVERY_ACTIONS = new Set<ProgramRecoveryAction>([
+  'intervention',
+  'runtime_override',
+]);
+const PERSISTENCE_CEILINGS = new Set<ProgramPersistenceCeiling>([
+  'session_only',
+  'runtime_override',
+  'draft_patch',
+]);
+const OPERATOR_STOP_POLICIES = new Set<ProgramOperatorStopPolicy>([
+  'inherit',
+  'hold',
+  'continue',
+]);
+
+function policyIdAt(value: unknown, path: string): string {
+  const id = stringAt(value, path);
+  if (!/^[a-z][a-z0-9_.-]*$/.test(id)
+      || new TextEncoder().encode(id).length > 128) {
+    return fail(path, 'a bounded portable lower-case policy ID');
+  }
+  return id;
+}
+
+function parseProgramNodeModificationPolicy(
+  value: unknown,
+  path: string,
+): ProgramNodeModificationPolicy {
+  const record = objectAt(value, path);
+  exactKeysAt(
+    record,
+    ['runtime_override', 'persistent_edit', 'intervention_delegate'],
+    path,
+  );
+  const runtimeOverride = stringAt(
+    record.runtime_override,
+    `${path}.runtime_override`,
+  ) as ProgramModificationPolicyValue;
+  const persistentEdit = stringAt(
+    record.persistent_edit,
+    `${path}.persistent_edit`,
+  ) as ProgramModificationPolicyValue;
+  const interventionDelegate = stringAt(
+    record.intervention_delegate,
+    `${path}.intervention_delegate`,
+  ) as ProgramInterventionDelegate;
+  if (!MODIFICATION_POLICY_VALUES.has(runtimeOverride)
+      || !MODIFICATION_POLICY_VALUES.has(persistentEdit)
+      || !INTERVENTION_DELEGATES.has(interventionDelegate)) {
+    return fail(path, 'closed modification-policy enums');
+  }
+  return {
+    runtime_override: runtimeOverride,
+    persistent_edit: persistentEdit,
+    intervention_delegate: interventionDelegate,
+  };
+}
+
+function parseProgramNodeRecoveryPolicy(
+  value: unknown,
+  path: string,
+): ProgramNodeRecoveryPolicy {
+  const record = objectAt(value, path);
+  exactKeysAt(
+    record,
+    [
+      'allow_intervention',
+      'allowed_recovery_actions',
+      'max_retries',
+      'allowed_skills',
+      'persistence_ceiling',
+    ],
+    path,
+  );
+  const actions = canonicalStringArrayAt(
+    boundedArrayAt(
+      record.allowed_recovery_actions,
+      `${path}.allowed_recovery_actions`,
+      2,
+    ),
+    `${path}.allowed_recovery_actions`,
+  ) as ProgramRecoveryAction[];
+  if (actions.some((action) => !RECOVERY_ACTIONS.has(action))) {
+    return fail(`${path}.allowed_recovery_actions`, 'closed recovery actions');
+  }
+  const maxRetries = integerAt(record.max_retries, `${path}.max_retries`);
+  if (maxRetries > 255) {
+    return fail(`${path}.max_retries`, 'an integer in 0..255');
+  }
+  const skills = boundedArrayAt(
+    record.allowed_skills,
+    `${path}.allowed_skills`,
+    256,
+  ).map((skill, index) => policyIdAt(
+    skill,
+    `${path}.allowed_skills[${index}]`,
+  ));
+  if (
+    skills.some((skill, index) => (
+      index > 0 && skill < skills[index - 1]
+    ))
+    || new Set(skills).size !== skills.length
+  ) {
+    return fail(`${path}.allowed_skills`, 'sorted unique policy IDs');
+  }
+  const allowIntervention = booleanAt(
+    record.allow_intervention,
+    `${path}.allow_intervention`,
+  );
+  const persistenceCeiling = stringAt(
+    record.persistence_ceiling,
+    `${path}.persistence_ceiling`,
+  ) as ProgramPersistenceCeiling;
+  if (!PERSISTENCE_CEILINGS.has(persistenceCeiling)) {
+    return fail(`${path}.persistence_ceiling`, 'a closed persistence ceiling');
+  }
+  const hasIntervention = actions.includes('intervention');
+  if (allowIntervention !== hasIntervention) {
+    return fail(path, 'matching intervention permission and action');
+  }
+  if (skills.length > 0 && !hasIntervention) {
+    return fail(path, 'allowed_skills only with intervention');
+  }
+  return {
+    allow_intervention: allowIntervention,
+    allowed_recovery_actions: actions,
+    max_retries: maxRetries,
+    allowed_skills: skills,
+    persistence_ceiling: persistenceCeiling,
+  };
+}
+
 function parseProgramTreeNode(
   value: unknown,
   path: string,
@@ -571,7 +724,13 @@ function parseProgramTreeNode(
   allowedKeysAt(
     record,
     ['node_id', 'instance_id', 'parameters', 'children'],
-    ['value_sources', 'metadata'],
+    [
+      'value_sources',
+      'metadata',
+      'modification_policy',
+      'recovery_policy',
+      'operator_stop_policy',
+    ],
     path,
   );
   const sources = record.value_sources === undefined
@@ -595,6 +754,106 @@ function parseProgramTreeNode(
   if (sources !== undefined) node.value_sources = sources;
   if (record.metadata !== undefined) {
     node.metadata = jsonRecordAt(record.metadata, `${path}.metadata`);
+  }
+  if (record.modification_policy !== undefined) {
+    node.modification_policy = parseProgramNodeModificationPolicy(
+      record.modification_policy,
+      `${path}.modification_policy`,
+    );
+  }
+  if (record.recovery_policy !== undefined) {
+    node.recovery_policy = parseProgramNodeRecoveryPolicy(
+      record.recovery_policy,
+      `${path}.recovery_policy`,
+    );
+  }
+  if (record.operator_stop_policy !== undefined) {
+    const operatorStop = stringAt(
+      record.operator_stop_policy,
+      `${path}.operator_stop_policy`,
+    ) as ProgramOperatorStopPolicy;
+    if (!OPERATOR_STOP_POLICIES.has(operatorStop)) {
+      return fail(`${path}.operator_stop_policy`, 'a closed Stop policy');
+    }
+    node.operator_stop_policy = operatorStop;
+  }
+  const modification = node.modification_policy ?? {
+    runtime_override: 'forbidden' as const,
+    persistent_edit: 'forbidden' as const,
+    intervention_delegate: 'forbidden' as const,
+  };
+  const recovery = node.recovery_policy ?? {
+    allow_intervention: false,
+    allowed_recovery_actions: [],
+    max_retries: 0,
+    allowed_skills: [],
+    persistence_ceiling: 'session_only' as const,
+  };
+  const operatorStop = node.operator_stop_policy ?? 'inherit';
+  if (
+    node.modification_policy !== undefined
+    && modification.runtime_override === 'forbidden'
+    && modification.persistent_edit === 'forbidden'
+    && modification.intervention_delegate === 'forbidden'
+  ) {
+    return fail(`${path}.modification_policy`, 'omit the canonical default policy');
+  }
+  if (
+    node.recovery_policy !== undefined
+    && !recovery.allow_intervention
+    && recovery.allowed_recovery_actions.length === 0
+    && recovery.max_retries === 0
+    && recovery.allowed_skills.length === 0
+    && recovery.persistence_ceiling === 'session_only'
+  ) {
+    return fail(`${path}.recovery_policy`, 'omit the canonical default policy');
+  }
+  if (
+    node.operator_stop_policy !== undefined
+    && operatorStop === 'inherit'
+  ) {
+    return fail(`${path}.operator_stop_policy`, 'omit the canonical default policy');
+  }
+  if (
+    recovery.allow_intervention
+    !== recovery.allowed_recovery_actions.includes('intervention')
+  ) {
+    return fail(path, 'matching intervention permission and action');
+  }
+  if (
+    recovery.allowed_skills.length > 0
+    && !recovery.allowed_recovery_actions.includes('intervention')
+  ) {
+    return fail(path, 'allowed_skills only with intervention');
+  }
+  if (
+    recovery.allowed_recovery_actions.includes('runtime_override')
+    && modification.runtime_override === 'forbidden'
+  ) {
+    return fail(path, 'runtime_override requires modification permission');
+  }
+  if (
+    recovery.persistence_ceiling === 'runtime_override'
+    && modification.runtime_override === 'forbidden'
+  ) {
+    return fail(path, 'runtime_override persistence requires modification permission');
+  }
+  if (
+    recovery.persistence_ceiling === 'draft_patch'
+    && modification.persistent_edit === 'forbidden'
+  ) {
+    return fail(path, 'draft_patch persistence requires persistent-edit permission');
+  }
+  if (
+    recovery.allowed_recovery_actions.length === 0
+    && (
+      recovery.allow_intervention
+      || recovery.max_retries !== 0
+      || recovery.allowed_skills.length !== 0
+      || recovery.persistence_ceiling !== 'session_only'
+    )
+  ) {
+    return fail(path, 'non-default recovery policy requires an action');
   }
   return node;
 }
@@ -1331,6 +1590,74 @@ export function parseManagerApplyResponse(value: unknown): ManagerApplyResponse 
   };
 }
 
+function parseProgramDraftProjection(
+  value: unknown,
+  path: string,
+): ProgramDraftProjection {
+  const draft = objectAt(value, path);
+  exactKeysAt(
+    draft,
+    ['draftId', 'draftRevision', 'programLoaded', 'programRevision', 'program'],
+    path,
+  );
+  const programLoaded = booleanAt(draft.programLoaded, `${path}.programLoaded`);
+  const program = draft.program === null
+    ? null
+    : parseProgramDocument(draft.program, `${path}.program`);
+  const programRevision = nullableStringAt(
+    draft.programRevision,
+    `${path}.programRevision`,
+  );
+  if (programLoaded !== (program !== null) || (program?.program_revision ?? null) !== programRevision) {
+    return fail(path, 'internally consistent Program identity');
+  }
+  const draftId = stringAt(draft.draftId, `${path}.draftId`);
+  if (!draftId) {
+    return fail(`${path}.draftId`, 'a non-empty Draft identity');
+  }
+  return {
+    draftId,
+    draftRevision: integerAt(draft.draftRevision, `${path}.draftRevision`),
+    programLoaded,
+    programRevision,
+    program,
+  };
+}
+
+function parseProgramDraftApplicability(
+  value: unknown,
+  path: string,
+): ProgramDraftApplicability {
+  const record = objectAt(value, path);
+  exactKeysAt(
+    record,
+    ['applyReady', 'affectedInstanceIds', 'unavailableReason'],
+    path,
+  );
+  const affectedInstanceIds = boundedArrayAt(
+    record.affectedInstanceIds,
+    `${path}.affectedInstanceIds`,
+    100_000,
+  ).map((instanceId, index) => policyIdAt(
+    instanceId,
+    `${path}.affectedInstanceIds[${index}]`,
+  ));
+  if (new Set(affectedInstanceIds).size !== affectedInstanceIds.length) {
+    return fail(`${path}.affectedInstanceIds`, 'unique instance IDs');
+  }
+  const unavailableReason = record.unavailableReason === null
+    ? null
+    : parseRuntimeAvailability(record.unavailableReason, `${path}.unavailableReason`);
+  const applyReady = booleanAt(record.applyReady, `${path}.applyReady`);
+  if (applyReady !== (affectedInstanceIds.length === 0)) {
+    return fail(path, 'an Apply-ready state matching affected instances');
+  }
+  if ((unavailableReason !== null) !== (affectedInstanceIds.length > 0)) {
+    return fail(path, 'an exact unavailable reason for affected instances');
+  }
+  return { applyReady, affectedInstanceIds, unavailableReason };
+}
+
 export function parseProgramWorkspaceResponse(value: unknown): ProgramWorkspaceResponse {
   const record = objectAt(value, 'programWorkspace');
   exactKeysAt(
@@ -1338,6 +1665,7 @@ export function parseProgramWorkspaceResponse(value: unknown): ProgramWorkspaceR
     [
       'schemaVersion',
       'draft',
+      'applicability',
       'saved',
       'applied',
       'hasUnsavedChanges',
@@ -1349,23 +1677,11 @@ export function parseProgramWorkspaceResponse(value: unknown): ProgramWorkspaceR
   if (schemaVersion !== 'manyforge.composer_program_workspace.v1') {
     return fail('programWorkspace.schemaVersion', 'the supported workspace version');
   }
-  const draft = objectAt(record.draft, 'programWorkspace.draft');
-  exactKeysAt(
-    draft,
-    ['draftId', 'draftRevision', 'programLoaded', 'programRevision', 'program'],
-    'programWorkspace.draft',
+  const draft = parseProgramDraftProjection(record.draft, 'programWorkspace.draft');
+  const applicability = parseProgramDraftApplicability(
+    record.applicability,
+    'programWorkspace.applicability',
   );
-  const programLoaded = booleanAt(draft.programLoaded, 'programWorkspace.draft.programLoaded');
-  const program = draft.program === null
-    ? null
-    : parseProgramDocument(draft.program, 'programWorkspace.draft.program');
-  const programRevision = nullableStringAt(
-    draft.programRevision,
-    'programWorkspace.draft.programRevision',
-  );
-  if (programLoaded !== (program !== null) || (program?.program_revision ?? null) !== programRevision) {
-    return fail('programWorkspace.draft', 'internally consistent Program identity');
-  }
   const saved = objectAt(record.saved, 'programWorkspace.saved');
   exactKeysAt(
     saved,
@@ -1387,9 +1703,9 @@ export function parseProgramWorkspaceResponse(value: unknown): ProgramWorkspaceR
   }
   if (
     savedMatchesDraft !== (
-      programRevision !== null
+      draft.programRevision !== null
       && savedRevision !== null
-      && programRevision === savedRevision
+      && draft.programRevision === savedRevision
     )
   ) {
     return fail('programWorkspace.saved', 'a truthful Draft/Saved comparison');
@@ -1436,7 +1752,7 @@ export function parseProgramWorkspaceResponse(value: unknown): ProgramWorkspaceR
     record.hasUnsavedChanges,
     'programWorkspace.hasUnsavedChanges',
   );
-  if (hasUnsavedChanges !== (programLoaded && !savedMatchesDraft)) {
+  if (hasUnsavedChanges !== (draft.programLoaded && !savedMatchesDraft)) {
     return fail(
       'programWorkspace.hasUnsavedChanges',
       'the exact Draft/Saved comparison',
@@ -1444,16 +1760,8 @@ export function parseProgramWorkspaceResponse(value: unknown): ProgramWorkspaceR
   }
   return {
     schemaVersion,
-    draft: {
-      draftId: stringAt(draft.draftId, 'programWorkspace.draft.draftId'),
-      draftRevision: integerAt(
-        draft.draftRevision,
-        'programWorkspace.draft.draftRevision',
-      ),
-      programLoaded,
-      programRevision,
-      program,
-    },
+    draft,
+    applicability,
     saved: {
       available: savedAvailable,
       matchesDraft: savedMatchesDraft,
@@ -3279,6 +3587,37 @@ export function parseDraftMutationResponse(value: unknown): DraftMutationRespons
     mutation: stringAt(record.mutation, 'draftMutation.mutation'),
     details: jsonRecordAt(record.details, 'draftMutation.details'),
     workspace: parseProgramWorkspaceResponse(record.workspace),
+  };
+}
+
+export function parseProgramNodePolicyMutationResponse(
+  value: unknown,
+): ProgramNodePolicyMutationResponse {
+  const path = 'programNodePolicyMutation';
+  const record = objectAt(value, path);
+  exactKeysAt(record, ['schemaVersion', 'mutation', 'details', 'draft'], path);
+  const schemaVersion = stringAt(record.schemaVersion, `${path}.schemaVersion`);
+  if (schemaVersion !== 'manyforge.composer_draft_mutation.v1') {
+    return fail(`${path}.schemaVersion`, 'manyforge.composer_draft_mutation.v1');
+  }
+  const mutation = stringAt(record.mutation, `${path}.mutation`);
+  if (mutation !== 'program_draft_update_node_policies') {
+    return fail(
+      `${path}.mutation`,
+      'program_draft_update_node_policies',
+    );
+  }
+  const details = objectAt(record.details, `${path}.details`);
+  exactKeysAt(details, ['updated_instance_id'], `${path}.details`);
+  const updatedInstanceId = policyIdAt(
+    details.updated_instance_id,
+    `${path}.details.updated_instance_id`,
+  );
+  return {
+    schemaVersion,
+    mutation,
+    details: { updatedInstanceId },
+    draft: parseProgramDraftProjection(record.draft, `${path}.draft`),
   };
 }
 

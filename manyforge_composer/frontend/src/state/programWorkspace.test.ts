@@ -4,6 +4,7 @@ import type { ProgramWorkspaceResponse } from '../types/api';
 import {
   INITIAL_PROGRAM_WORKSPACE_STATE,
   programWorkspaceReducer,
+  replaceProgramWorkspaceDraft,
 } from './programWorkspace';
 
 function workspace(draftId: string, revision: number): ProgramWorkspaceResponse {
@@ -15,6 +16,11 @@ function workspace(draftId: string, revision: number): ProgramWorkspaceResponse 
       programLoaded: false,
       programRevision: null,
       program: null,
+    },
+    applicability: {
+      applyReady: true,
+      affectedInstanceIds: [],
+      unavailableReason: null,
     },
     saved: {
       available: false,
@@ -177,5 +183,127 @@ describe('Program workspace request fencing', () => {
     expect(pending.transitionStatus).toBe('pending_deployment');
     expect(pending.message).toContain('were not replaced');
     expect(pending.message).not.toContain('Draft now matches Saved');
+  });
+
+  it('shows the closed Draft mutation before refreshing owner observations', () => {
+    const current = workspace('draft-1', 7);
+    const returnedDraft: ProgramWorkspaceResponse['draft'] = {
+      ...current.draft,
+      draftRevision: 8,
+    };
+    const started = programWorkspaceReducer({
+      ...INITIAL_PROGRAM_WORKSPACE_STATE,
+      status: 'ready',
+      pendingAction: null,
+      workspace: current,
+    }, {
+      type: 'request_started',
+      generation: 11,
+      action: 'update_policies',
+    });
+    const updated = programWorkspaceReducer(started, {
+      type: 'policy_mutation_succeeded',
+      generation: 11,
+      workspace: { ...current, draft: returnedDraft },
+      message: 'Draft updated; Draft revision 8. Workspace owner status is refreshing.',
+    });
+
+    expect(updated.pendingAction).toBe('refresh');
+    expect(updated.comparisonStatus).toBe('refreshing');
+    expect(updated.workspace?.draft.draftRevision).toBe(8);
+    expect(updated.workspace?.saved).toBe(current.saved);
+    expect(updated.workspace?.applied).toBe(current.applied);
+  });
+
+  it('retains a Draft-only success when the separate owner refresh fails', () => {
+    const current = workspace('draft-1', 7);
+    const started = programWorkspaceReducer({
+      ...INITIAL_PROGRAM_WORKSPACE_STATE,
+      status: 'ready',
+      pendingAction: null,
+      workspace: current,
+    }, {
+      type: 'policy_mutation_succeeded',
+      generation: 12,
+      workspace: { ...current, draft: { ...current.draft, draftRevision: 8 } },
+      message: 'Draft updated; Draft revision 8.',
+    });
+    const failed = programWorkspaceReducer(started, {
+      type: 'workspace_refresh_failed',
+      generation: 12,
+      warning: 'Draft updated; workspace status refresh failed. Your Draft change remains; retry refresh.',
+    });
+
+    expect(failed.status).toBe('ready');
+    expect(failed.pendingAction).toBeNull();
+    expect(failed.workspace?.draft.draftRevision).toBe(8);
+    expect(failed.refreshWarning).toBe(
+      'Draft updated; workspace status refresh failed. Your Draft change remains; retry refresh.',
+    );
+    expect(failed.comparisonStatus).toBe('stale');
+  });
+
+  it('recomputes all Draft-relative comparisons from the closed mutation Draft', () => {
+    const current = workspace('draft-1', 7);
+    const revision = `sha256:${'1'.repeat(64)}`;
+    const returnedDraft = {
+      ...current.draft,
+      draftRevision: 8,
+      programLoaded: true,
+      programRevision: revision,
+      program: {
+        api_version: 'manyforge.program.v1',
+        program_id: 'program-1',
+        program_revision: revision,
+        program_profile: 'composable-cell-v1',
+        name: 'Program',
+        catalog: {
+          api_version: 'manyforge.node_catalog.v2',
+          content_version: '1',
+        },
+        component_roles: {},
+        target_roles: {},
+        tree: {
+          node_id: 'timer',
+          instance_id: 'root',
+          parameters: {},
+          children: [],
+        },
+      },
+    };
+    const withOwners: ProgramWorkspaceResponse = {
+      ...current,
+      draft: {
+        ...current.draft,
+        programLoaded: true,
+        programRevision: `sha256:${'0'.repeat(64)}`,
+        program: returnedDraft.program,
+      },
+      applicability: {
+        applyReady: true,
+        affectedInstanceIds: [],
+        unavailableReason: null,
+      },
+      saved: {
+        available: true,
+        matchesDraft: false,
+        path: '/program.program.yaml',
+        programRevision: revision,
+      },
+      applied: {
+        available: true,
+        matchesDraft: false,
+        programRevision: `sha256:${'2'.repeat(64)}`,
+        unavailableReason: null,
+      },
+      hasUnsavedChanges: true,
+      hasUnappliedChanges: true,
+    };
+    const replaced = replaceProgramWorkspaceDraft(withOwners, returnedDraft);
+
+    expect(replaced.saved.matchesDraft).toBe(true);
+    expect(replaced.applied.matchesDraft).toBe(false);
+    expect(replaced.hasUnsavedChanges).toBe(false);
+    expect(replaced.hasUnappliedChanges).toBe(true);
   });
 });

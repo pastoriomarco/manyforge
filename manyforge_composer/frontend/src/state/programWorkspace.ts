@@ -7,6 +7,7 @@ export type ProgramWorkspaceActionName =
   | 'refresh'
   | 'new'
   | 'mutate'
+  | 'update_policies'
   | 'open_draft'
   | 'apply'
   | 'discard'
@@ -14,6 +15,11 @@ export type ProgramWorkspaceActionName =
   | 'load'
   | 'save'
   | 'save_as';
+
+export type ProgramWorkspaceOwnerComparisonStatus =
+  | 'observed'
+  | 'refreshing'
+  | 'stale';
 
 export type ProgramWorkspaceState =
   | {
@@ -24,6 +30,8 @@ export type ProgramWorkspaceState =
       message: null;
       transitionStatus: null;
       error: null;
+      comparisonStatus?: ProgramWorkspaceOwnerComparisonStatus;
+      refreshWarning?: string | null;
     }
   | {
       status: 'ready';
@@ -33,6 +41,8 @@ export type ProgramWorkspaceState =
       message: string | null;
       transitionStatus: ProgramWorkspaceTransitionStatus | null;
       error: string | null;
+      comparisonStatus?: ProgramWorkspaceOwnerComparisonStatus;
+      refreshWarning?: string | null;
     }
   | {
       status: 'error';
@@ -42,6 +52,8 @@ export type ProgramWorkspaceState =
       message: null;
       transitionStatus: null;
       error: string;
+      comparisonStatus?: ProgramWorkspaceOwnerComparisonStatus;
+      refreshWarning?: string | null;
     };
 
 export type ProgramWorkspaceStateAction =
@@ -58,6 +70,17 @@ export type ProgramWorkspaceStateAction =
       transitionStatus: ProgramWorkspaceTransitionStatus | null;
     }
   | {
+      type: 'policy_mutation_succeeded';
+      generation: number;
+      workspace: ProgramWorkspaceResponse;
+      message: string;
+    }
+  | {
+      type: 'workspace_refresh_failed';
+      generation: number;
+      warning: string;
+    }
+  | {
       type: 'request_failed';
       generation: number;
       error: string;
@@ -72,6 +95,8 @@ export const INITIAL_PROGRAM_WORKSPACE_STATE: ProgramWorkspaceState = {
   message: null,
   transitionStatus: null,
   error: null,
+  comparisonStatus: 'observed',
+  refreshWarning: null,
 };
 
 export function programWorkspaceReducer(
@@ -87,10 +112,21 @@ export function programWorkspaceReducer(
       message: null,
       transitionStatus: null,
       error: null,
+      comparisonStatus: action.action === 'refresh'
+        ? 'refreshing'
+        : state.comparisonStatus,
+      refreshWarning: null,
     } as ProgramWorkspaceState;
   }
   if (action.type === 'clear_feedback') {
-    if (state.status === 'ready') return { ...state, message: null, error: null };
+    if (state.status === 'ready') {
+      return {
+        ...state,
+        message: null,
+        error: null,
+        refreshWarning: null,
+      };
+    }
     if (state.status === 'error' && state.workspace !== null) {
       return {
         status: 'ready',
@@ -100,6 +136,8 @@ export function programWorkspaceReducer(
         message: null,
         transitionStatus: null,
         error: null,
+        comparisonStatus: state.comparisonStatus,
+        refreshWarning: null,
       };
     }
     return state;
@@ -114,6 +152,35 @@ export function programWorkspaceReducer(
       message: action.message,
       transitionStatus: action.transitionStatus,
       error: null,
+      comparisonStatus: 'observed',
+      refreshWarning: null,
+    };
+  }
+  if (action.type === 'policy_mutation_succeeded') {
+    return {
+      status: 'ready',
+      requestGeneration: action.generation,
+      pendingAction: 'refresh',
+      workspace: action.workspace,
+      message: action.message,
+      transitionStatus: null,
+      error: null,
+      comparisonStatus: 'refreshing',
+      refreshWarning: null,
+    };
+  }
+  if (action.type === 'workspace_refresh_failed') {
+    if (state.workspace === null) return state;
+    return {
+      status: 'ready',
+      requestGeneration: action.generation,
+      pendingAction: null,
+      workspace: state.workspace,
+      message: state.message,
+      transitionStatus: null,
+      error: null,
+      comparisonStatus: 'stale',
+      refreshWarning: action.warning,
     };
   }
   return {
@@ -124,5 +191,49 @@ export function programWorkspaceReducer(
     message: null,
     transitionStatus: null,
     error: action.error,
+    comparisonStatus: state.comparisonStatus === 'refreshing'
+      ? 'stale'
+      : state.comparisonStatus,
+    refreshWarning: null,
+  };
+}
+
+/**
+ * Replace only the closed Draft projection returned by a Draft-only mutation.
+ * Saved and Applied remain the last owner-issued observations until the
+ * follow-up workspace read succeeds.
+ */
+export function replaceProgramWorkspaceDraft(
+  workspace: ProgramWorkspaceResponse,
+  draft: ProgramWorkspaceResponse['draft'],
+): ProgramWorkspaceResponse {
+  const savedMatchesDraft = (
+    draft.programLoaded
+    && draft.programRevision !== null
+    && workspace.saved.available
+    && workspace.saved.programRevision === draft.programRevision
+  );
+  const appliedMatchesDraft = workspace.applied.available
+    ? (
+      draft.programLoaded
+      && draft.programRevision !== null
+      && workspace.applied.programRevision === draft.programRevision
+    )
+    : null;
+  return {
+    ...workspace,
+    draft,
+    saved: {
+      ...workspace.saved,
+      matchesDraft: savedMatchesDraft,
+    },
+    applied: {
+      ...workspace.applied,
+      matchesDraft: appliedMatchesDraft,
+    },
+    hasUnsavedChanges: draft.programLoaded && !savedMatchesDraft,
+    hasUnappliedChanges: workspace.applied.available
+      ? draft.programLoaded && !appliedMatchesDraft
+      : null,
   };
 }

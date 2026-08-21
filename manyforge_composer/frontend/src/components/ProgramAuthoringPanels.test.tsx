@@ -8,6 +8,7 @@ import type {
   NodeEnvironmentResponse,
   ProgramParameterDeclaration,
   ProgramTreeNode,
+  ProgramWorkspaceResponse,
 } from '../types/api';
 import { ProgramDeclarationsEditor } from './ProgramDeclarationsEditor';
 import { ProgramNodePalette } from './ProgramNodePalette';
@@ -270,6 +271,7 @@ describe('Program authoring panels', () => {
           blackboardKeys={[]}
           busy={false}
           onMutate={vi.fn()}
+          onUpdateNodePolicies={vi.fn()}
         />
       </div>,
     );
@@ -362,6 +364,7 @@ describe('Program authoring panels', () => {
         blackboardKeys={[]}
         busy={false}
         onMutate={vi.fn()}
+        onUpdateNodePolicies={vi.fn()}
       />,
     );
 
@@ -398,6 +401,7 @@ describe('Program authoring panels', () => {
         }]}
         busy={false}
         onMutate={vi.fn()}
+        onUpdateNodePolicies={vi.fn()}
       />,
     );
 
@@ -467,6 +471,11 @@ describe('Program authoring panels', () => {
             programRevision: null,
             program: null,
           },
+          applicability: {
+            applyReady: true,
+            affectedInstanceIds: [],
+            unavailableReason: null,
+          },
           saved: {
             available: false,
             matchesDraft: false,
@@ -496,6 +505,7 @@ describe('Program authoring panels', () => {
       discard: vi.fn(),
       revert: vi.fn(),
       load: vi.fn(),
+      updateNodePolicies: vi.fn(),
       clearFeedback: vi.fn(),
     } satisfies ProgramWorkspaceController;
     const runtime = {
@@ -546,5 +556,151 @@ describe('Program authoring panels', () => {
       'Program actions · New · Open · Save As · Apply · Revert · Discard · Load',
     );
     expect(markup).not.toContain('program-tree-node');
+  });
+
+  it('disables only global Apply for an imported skill on another node', () => {
+    const blockedTree: ProgramTreeNode = {
+      ...tree,
+      children: [{
+        ...tree.children[0]!,
+        recovery_policy: {
+          allow_intervention: true,
+          allowed_recovery_actions: ['intervention'],
+          max_retries: 0,
+          allowed_skills: ['legacy.inspect'],
+          persistence_ceiling: 'session_only',
+        },
+      }],
+    };
+    const blockedWorkspace: ProgramWorkspaceResponse = {
+      schemaVersion: 'manyforge.composer_program_workspace.v1',
+      draft: {
+        draftId: 'draft-blocked',
+        draftRevision: 2,
+        programLoaded: true,
+        programRevision: `sha256:${'a'.repeat(64)}`,
+        program: {
+          api_version: 'manyforge.program.v1',
+          program_id: 'program-blocked',
+          program_revision: `sha256:${'a'.repeat(64)}`,
+          program_profile: 'composable-cell-v1',
+          name: 'Blocked',
+          catalog: {
+            api_version: 'manyforge.node_catalog.v2',
+            content_version: 'fixture',
+          },
+          component_roles: {},
+          target_roles: {},
+          tree: blockedTree,
+        },
+      },
+      applicability: {
+        applyReady: false,
+        affectedInstanceIds: ['settle'],
+        unavailableReason: {
+          code: 'composer_policy_skill_referent_unavailable',
+          message: 'Allowed recovery skills are unavailable: each skill requires an exact revision-qualified retained referent. Leave Allowed skills empty.',
+          restorationGates: [],
+        },
+      },
+      saved: {
+        available: true,
+        matchesDraft: false,
+        path: '/workspace/blocked.program.yaml',
+        programRevision: `sha256:${'b'.repeat(64)}`,
+      },
+      applied: {
+        available: false,
+        matchesDraft: null,
+        programRevision: null,
+        unavailableReason: null,
+      },
+      hasUnsavedChanges: true,
+      hasUnappliedChanges: null,
+    };
+    const controller = {
+      state: {
+        status: 'ready',
+        requestGeneration: 1,
+        pendingAction: null,
+        workspace: blockedWorkspace,
+        message: null,
+        transitionStatus: null,
+        error: null,
+        comparisonStatus: 'observed',
+        refreshWarning: null,
+      },
+      refresh: vi.fn(),
+      mutate: vi.fn(),
+      newDraft: vi.fn(),
+      openDraft: vi.fn(),
+      save: vi.fn(),
+      saveAs: vi.fn(),
+      apply: vi.fn(),
+      discard: vi.fn(),
+      revert: vi.fn(),
+      load: vi.fn(),
+      updateNodePolicies: vi.fn(),
+      clearFeedback: vi.fn(),
+    } satisfies ProgramWorkspaceController;
+    const runtime = {
+      state: {
+        catalog: {
+          apiVersion: 'manyforge.scenario_catalog.v1',
+          scenarioCatalogRevision: `sha256:${'c'.repeat(64)}`,
+          scenarios: [{
+            scenarioId: 'qualified',
+            description: null,
+            aliases: [],
+            deploymentArtifactId: 'deployment',
+            deploymentRevision: `sha256:${'d'.repeat(64)}`,
+            retainedBundleId: `sha256:${'e'.repeat(64)}`,
+            programBindingId: `sha256:${'f'.repeat(64)}`,
+            assistantMode: 'optional',
+          }],
+        },
+        applied: null,
+        run: null,
+        selectedScenarioId: 'qualified',
+        runnerAvailable: true,
+        loading: false,
+        pending: null,
+        error: null,
+      },
+      active: false,
+      refresh: vi.fn(),
+      selectScenario: vi.fn(),
+      clearScenarioSelection: vi.fn(),
+      run: vi.fn(),
+      stop: vi.fn(),
+    } satisfies ProgramRuntimeController;
+    const markup = renderToStaticMarkup(
+      <ProgramWorkspace
+        controller={controller}
+        runtime={runtime}
+        catalog={{
+          status: 'ready',
+          data: {
+            apiVersion: 'manyforge.node_catalog.v2',
+            contentVersion: 'fixture',
+            catalogId: 'catalog',
+            entries: [sequence, timer],
+            catalogDigest: 'sha256:catalog',
+            environmentDigest: environment.environmentDigest,
+          },
+        }}
+        environment={{ status: 'ready', data: environment }}
+        selectedProgramPath={null}
+        onRetryCatalog={vi.fn()}
+        onRetryEnvironment={vi.fn()}
+      />,
+    );
+
+    expect(markup).toMatch(/<button type="button" disabled="">Apply Draft<\/button>/);
+    expect(markup).toContain('Affected node instances: settle.');
+    expect(markup).toContain(
+      'Allowed recovery skills are unavailable: each skill requires an exact revision-qualified retained referent. Leave Allowed skills empty.',
+    );
+    expect(markup).toContain('Save');
   });
 });

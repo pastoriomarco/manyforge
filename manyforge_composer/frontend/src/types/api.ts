@@ -183,6 +183,36 @@ export interface ProgramValueSource {
   field?: string;
 }
 
+export type ProgramModificationPolicyValue =
+  | 'forbidden'
+  | 'human_approval'
+  | 'llm_allowed';
+export type ProgramInterventionDelegate =
+  | 'forbidden'
+  | 'human_only'
+  | 'llm_allowed'
+  | 'program_only';
+export type ProgramRecoveryAction = 'intervention' | 'runtime_override';
+export type ProgramPersistenceCeiling =
+  | 'session_only'
+  | 'runtime_override'
+  | 'draft_patch';
+export type ProgramOperatorStopPolicy = 'inherit' | 'hold' | 'continue';
+
+export interface ProgramNodeModificationPolicy {
+  runtime_override: ProgramModificationPolicyValue;
+  persistent_edit: ProgramModificationPolicyValue;
+  intervention_delegate: ProgramInterventionDelegate;
+}
+
+export interface ProgramNodeRecoveryPolicy {
+  allow_intervention: boolean;
+  allowed_recovery_actions: ProgramRecoveryAction[];
+  max_retries: number;
+  allowed_skills: string[];
+  persistence_ceiling: ProgramPersistenceCeiling;
+}
+
 export interface ProgramTreeNode {
   node_id: string;
   instance_id: string;
@@ -190,6 +220,9 @@ export interface ProgramTreeNode {
   value_sources?: Record<string, ProgramValueSource>;
   children: ProgramTreeNode[];
   metadata?: Record<string, JsonValue>;
+  modification_policy?: ProgramNodeModificationPolicy;
+  recovery_policy?: ProgramNodeRecoveryPolicy;
+  operator_stop_policy?: ProgramOperatorStopPolicy;
 }
 
 export interface ProgramParameterDeclaration {
@@ -246,15 +279,24 @@ export interface ProgramDocument {
   tree: ProgramTreeNode;
 }
 
+export interface ProgramDraftProjection {
+  draftId: string;
+  draftRevision: number;
+  programLoaded: boolean;
+  programRevision: string | null;
+  program: ProgramDocument | null;
+}
+
+export interface ProgramDraftApplicability {
+  applyReady: boolean;
+  affectedInstanceIds: string[];
+  unavailableReason: RuntimeAvailability | null;
+}
+
 export interface ProgramWorkspaceResponse {
   schemaVersion: 'manyforge.composer_program_workspace.v1';
-  draft: {
-    draftId: string;
-    draftRevision: number;
-    programLoaded: boolean;
-    programRevision: string | null;
-    program: ProgramDocument | null;
-  };
+  draft: ProgramDraftProjection;
+  applicability: ProgramDraftApplicability;
   saved: {
     available: boolean;
     matchesDraft: boolean;
@@ -799,6 +841,23 @@ export interface DraftMutationResponse {
   mutation: string;
   details: Record<string, JsonValue>;
   workspace: ProgramWorkspaceResponse;
+}
+
+export interface ProgramNodePolicyMutationResponse {
+  schemaVersion: 'manyforge.composer_draft_mutation.v1';
+  mutation: 'program_draft_update_node_policies';
+  details: {
+    updatedInstanceId: string;
+  };
+  draft: ProgramDraftProjection;
+}
+
+export interface ProgramNodePolicyMutationArguments {
+  expected_program_revision: string;
+  instance_id: string;
+  modification_policy: ProgramNodeModificationPolicy;
+  recovery_policy: ProgramNodeRecoveryPolicy;
+  operator_stop_policy: ProgramOperatorStopPolicy;
 }
 
 export type Vector3Tuple = [number, number, number];

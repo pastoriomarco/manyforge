@@ -5,6 +5,9 @@ import type {
   CatalogEntry,
   CatalogParameter,
   JsonValue,
+  ProgramNodeModificationPolicy,
+  ProgramNodeRecoveryPolicy,
+  ProgramOperatorStopPolicy,
   ProgramParameterDeclaration,
   ProgramTreeNode,
   ProgramValueSource,
@@ -20,6 +23,7 @@ import {
   ProgramSpecializedEditor,
   supportsProgramSpecializedEditor,
 } from './property/ProgramSpecializedEditors';
+import { ProgramPolicyEditor } from './ProgramPolicyEditor';
 
 interface ProgramPropertyEditorProps {
   root: ProgramTreeNode;
@@ -29,6 +33,12 @@ interface ProgramPropertyEditorProps {
   blackboardKeys: BlackboardKeyDeclaration[];
   busy: boolean;
   onMutate: (mutation: string, args: Record<string, JsonValue>) => void;
+  onUpdateNodePolicies: (
+    instanceId: string,
+    modificationPolicy: ProgramNodeModificationPolicy,
+    recoveryPolicy: ProgramNodeRecoveryPolicy,
+    operatorStopPolicy: ProgramOperatorStopPolicy,
+  ) => void;
 }
 
 interface SourceChoice {
@@ -189,6 +199,7 @@ export function ProgramPropertyEditor({
   blackboardKeys,
   busy,
   onMutate,
+  onUpdateNodePolicies,
 }: ProgramPropertyEditorProps) {
   const [errors, setErrors] = useState<Record<string, string>>({});
   const selected = useMemo(
@@ -450,6 +461,11 @@ export function ProgramPropertyEditor({
           );
         })}
       </div>
+      <ProgramPolicyEditor
+        node={selected}
+        busy={busy}
+        onUpdate={onUpdateNodePolicies}
+      />
     </section>
   );
 }

@@ -37,6 +37,19 @@ def _program(*, metadata: dict | None = None) -> Program:
     return Program.from_dict(document, catalog)
 
 
+def _program_with_instance_id(instance_id: str) -> Program:
+    catalog = build_node_environment().catalog
+    document = _program().to_dict()
+    document["tree"]["children"][0]["instance_id"] = instance_id
+    document["program_revision"] = compute_content_identity(
+        document,
+        own_field="program_revision",
+        identity_domain="program-revision",
+        api_version="manyforge.program.v1",
+    )
+    return Program.from_dict(document, catalog)
+
+
 def _box_resource(identity: str) -> dict:
     return {
         "scene_resource_id": identity,
@@ -56,6 +69,30 @@ def _mutate(session: ComposerDraftSession, tool_id: str, arguments: dict):
         expected_revision=session.revision,
         catalog=build_node_environment().catalog,
     )
+
+
+def _node_policy_arguments(
+    session: ComposerDraftSession,
+    *,
+    instance_id: str = "move_to_pick",
+) -> dict:
+    return {
+        "expected_program_revision": session.snapshot()["program_revision"],
+        "instance_id": instance_id,
+        "modification_policy": {
+            "runtime_override": "human_approval",
+            "persistent_edit": "human_approval",
+            "intervention_delegate": "human_only",
+        },
+        "recovery_policy": {
+            "allow_intervention": True,
+            "allowed_recovery_actions": ["intervention"],
+            "max_retries": 2,
+            "allowed_skills": [],
+            "persistence_ceiling": "draft_patch",
+        },
+        "operator_stop_policy": "hold",
+    }
 
 
 def test_session_is_an_unsaved_unapplied_in_memory_draft() -> None:
@@ -481,7 +518,6 @@ def test_invalid_candidate_and_stale_revision_leave_the_draft_unchanged() -> Non
             {"scene_resource_ids": ["table"]},
         )
     assert session.snapshot() == before
-
     with pytest.raises(DraftSessionError) as stale:
         session.mutate(
             tool_id="scene_draft_add_object",
@@ -492,6 +528,242 @@ def test_invalid_candidate_and_stale_revision_leave_the_draft_unchanged() -> Non
     assert stale.value.code == "composer_draft_revision_stale"
     assert stale.value.status_code == 409
     assert session.snapshot() == before
+
+
+def test_node_policy_mutation_round_trips_nondefaults_and_reidentifies() -> None:
+    original = _program()
+    session = ComposerDraftSession(original)
+
+    result = _mutate(
+        session,
+        "program_draft_update_node_policies",
+        _node_policy_arguments(session),
+    )
+
+    node = result.snapshot["program"]["tree"]["children"][0]
+    assert result.snapshot["draft_revision"] == 2
+    assert result.snapshot["program_revision"] != original.program_revision
+    assert node["instance_id"] == "move_to_pick"
+    assert node["modification_policy"] == {
+        "runtime_override": "human_approval",
+        "persistent_edit": "human_approval",
+        "intervention_delegate": "human_only",
+    }
+    assert node["recovery_policy"] == {
+        "allow_intervention": True,
+        "allowed_recovery_actions": ["intervention"],
+        "max_retries": 2,
+        "allowed_skills": [],
+        "persistence_ceiling": "draft_patch",
+    }
+    assert node["operator_stop_policy"] == "hold"
+    assert Program.from_dict(
+        result.snapshot["program"],
+        build_node_environment().catalog,
+    ).to_dict() == result.snapshot["program"]
+
+
+def test_node_policy_rejects_unavailable_skills_atomically() -> None:
+    session = ComposerDraftSession(_program(), source_path=str(_PROGRAM_PATH))
+    arguments = _node_policy_arguments(session)
+    arguments["recovery_policy"]["allowed_skills"] = ["inspect"]
+    before = deepcopy(session.workspace_snapshot())
+
+    with pytest.raises(DraftSessionError) as failed:
+        _mutate(session, "program_draft_update_node_policies", arguments)
+
+    assert failed.value.status_code == 409
+    assert failed.value.code == "composer_policy_skill_referent_unavailable"
+    assert str(failed.value) == (
+        "Allowed recovery skills are unavailable: each skill requires an "
+        "exact revision-qualified retained referent. Leave Allowed skills empty."
+    )
+    assert session.workspace_snapshot() == before
+
+
+def test_node_policy_instance_id_uses_the_128_byte_portable_bound() -> None:
+    accepted_id = "a" + ("b" * 127)
+    accepted = ComposerDraftSession(_program_with_instance_id(accepted_id))
+    accepted_result = _mutate(
+        accepted,
+        "program_draft_update_node_policies",
+        _node_policy_arguments(accepted, instance_id=accepted_id),
+    )
+    assert accepted_result.snapshot["draft_revision"] == 2
+
+    rejected = ComposerDraftSession(
+        _program_with_instance_id("a" + ("b" * 128))
+    )
+    rejected_arguments = _node_policy_arguments(
+        rejected,
+        instance_id="a" + ("b" * 128),
+    )
+    before = deepcopy(rejected.workspace_snapshot())
+    with pytest.raises(DraftSessionError) as failed:
+        _mutate(
+            rejected,
+            "program_draft_update_node_policies",
+            rejected_arguments,
+        )
+    assert failed.value.status_code == 409
+    assert failed.value.code == "draft_arguments_invalid"
+    assert rejected.workspace_snapshot() == before
+
+
+def test_node_policy_explicit_defaults_normalize_to_omission_identity() -> None:
+    original = _program()
+    session = ComposerDraftSession(original)
+    arguments = _node_policy_arguments(session)
+    arguments["modification_policy"] = {
+        "runtime_override": "forbidden",
+        "persistent_edit": "forbidden",
+        "intervention_delegate": "forbidden",
+    }
+    arguments["recovery_policy"] = {
+        "allow_intervention": False,
+        "allowed_recovery_actions": [],
+        "max_retries": 0,
+        "allowed_skills": [],
+        "persistence_ceiling": "session_only",
+    }
+    arguments["operator_stop_policy"] = "inherit"
+
+    result = _mutate(session, "program_draft_update_node_policies", arguments)
+    repeated = _mutate(session, "program_draft_update_node_policies", arguments)
+
+    assert result.snapshot["program_revision"] == original.program_revision
+    assert repeated.snapshot["program_revision"] == original.program_revision
+    assert repeated.snapshot["draft_revision"] == result.snapshot["draft_revision"] == 1
+    node = result.snapshot["program"]["tree"]["children"][0]
+    assert "modification_policy" not in node
+    assert "recovery_policy" not in node
+    assert "operator_stop_policy" not in node
+
+
+def test_node_policy_noop_is_allowed_at_revision_exhaustion() -> None:
+    session = ComposerDraftSession(_program())
+    session._revision = 9_007_199_254_740_991
+    arguments = _node_policy_arguments(session)
+    arguments["modification_policy"] = {
+        "runtime_override": "forbidden",
+        "persistent_edit": "forbidden",
+        "intervention_delegate": "forbidden",
+    }
+    arguments["recovery_policy"] = {
+        "allow_intervention": False,
+        "allowed_recovery_actions": [],
+        "max_retries": 0,
+        "allowed_skills": [],
+        "persistence_ceiling": "session_only",
+    }
+    arguments["operator_stop_policy"] = "inherit"
+    before = deepcopy(session.snapshot())
+
+    result = _mutate(session, "program_draft_update_node_policies", arguments)
+
+    assert result.snapshot == before
+
+
+def test_node_policy_mutation_fences_and_instance_identity_are_atomic() -> None:
+    session = ComposerDraftSession(_program())
+    arguments = _node_policy_arguments(session)
+    before = deepcopy(session.snapshot())
+
+    with pytest.raises(DraftSessionError) as stale_program:
+        _mutate(
+            session,
+            "program_draft_update_node_policies",
+            {**arguments, "expected_program_revision": "sha256:" + "f" * 64},
+        )
+    assert stale_program.value.code == "composer_program_revision_stale"
+    assert session.snapshot() == before
+
+    with pytest.raises(DraftSessionError) as unknown:
+        _mutate(
+            session,
+            "program_draft_update_node_policies",
+            {**arguments, "instance_id": "missing"},
+        )
+    assert unknown.value.code == "draft_node_not_found"
+    assert session.snapshot() == before
+
+    with pytest.raises(DraftSessionError) as stale_draft:
+        session.mutate(
+            tool_id="program_draft_update_node_policies",
+            arguments=arguments,
+            expected_revision=session.revision - 1,
+            catalog=build_node_environment().catalog,
+            draft_id=session.draft_id,
+        )
+    assert stale_draft.value.code == "composer_draft_revision_stale"
+    assert session.snapshot() == before
+
+    with pytest.raises(DraftSessionError) as stale_id:
+        session.mutate(
+            tool_id="program_draft_update_node_policies",
+            arguments=arguments,
+            expected_revision=session.revision,
+            catalog=build_node_environment().catalog,
+            draft_id="draft-stale",
+        )
+    assert stale_id.value.code == "composer_draft_id_stale"
+    assert session.snapshot() == before
+
+    session._revision = 9_007_199_254_740_991
+    exhausted_before = deepcopy(session.snapshot())
+    with pytest.raises(DraftSessionError) as exhausted:
+        _mutate(
+            session,
+            "program_draft_update_node_policies",
+            _node_policy_arguments(session),
+        )
+    assert exhausted.value.code == "composer_draft_revision_exhausted"
+    assert session.snapshot() == exhausted_before
+
+
+@pytest.mark.parametrize(
+    "change",
+    [
+        lambda args: args.update({"modification_policy": None}),
+        lambda args: args["recovery_policy"].pop("max_retries"),
+        lambda args: args["recovery_policy"].update({"unexpected": 1}),
+        lambda args: args["modification_policy"].update({"runtime_override": "pause"}),
+        lambda args: args.update({"operator_stop_policy": "pause"}),
+    ],
+)
+def test_node_policy_mutation_rejects_closed_schema_values(change) -> None:
+    session = ComposerDraftSession(_program())
+    arguments = _node_policy_arguments(session)
+    change(arguments)
+    before = deepcopy(session.workspace_snapshot())
+
+    with pytest.raises(DraftSessionError):
+        _mutate(session, "program_draft_update_node_policies", arguments)
+    assert session.workspace_snapshot() == before
+
+
+def test_node_policy_cross_field_failure_preserves_saved_applied_and_revisions() -> None:
+    session = ComposerDraftSession(_program(), source_path=str(_PROGRAM_PATH))
+    before = deepcopy(
+        session.workspace_snapshot(
+            applied_program_revision=session.snapshot()["program_revision"],
+        )
+    )
+    arguments = _node_policy_arguments(session)
+    arguments["modification_policy"]["runtime_override"] = "forbidden"
+    arguments["recovery_policy"]["allowed_recovery_actions"] = ["runtime_override"]
+    arguments["recovery_policy"]["allow_intervention"] = False
+    arguments["recovery_policy"]["max_retries"] = 0
+    arguments["recovery_policy"]["allowed_skills"] = []
+    arguments["recovery_policy"]["persistence_ceiling"] = "session_only"
+
+    with pytest.raises(DraftSessionError) as failed:
+        _mutate(session, "program_draft_update_node_policies", arguments)
+
+    assert failed.value.code == "composer_draft_validation_failed"
+    assert session.workspace_snapshot(
+        applied_program_revision=before["draft"]["programRevision"],
+    ) == before
 
 
 def test_relative_orientation_resolves_to_absolute_and_preserves_metadata() -> None:
@@ -872,6 +1144,10 @@ def test_every_generated_draft_mutation_has_a_valid_atomic_path() -> None:
     invoke(
         "blackboard_draft_remove_namespaces",
         {"namespace_ids": ["scratch"]},
+    )
+    invoke(
+        "program_draft_update_node_policies",
+        _node_policy_arguments(session),
     )
 
     assert invoked == set(SUPPORTED_DRAFT_MUTATIONS)

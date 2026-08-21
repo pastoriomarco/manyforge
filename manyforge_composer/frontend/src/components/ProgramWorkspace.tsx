@@ -97,6 +97,7 @@ export function ProgramWorkspace({
     discard,
     revert,
     load: loadProgram,
+    updateNodePolicies,
     clearFeedback,
   } = controller;
   const [selectedNodeId, setSelectedNodeId] = useState<string | null>(null);
@@ -122,6 +123,12 @@ export function ProgramWorkspace({
   ) ?? null;
   const replaceNeedsConfirmation = workspace?.hasUnsavedChanges === true
     || workspace?.hasUnappliedChanges === true;
+  const ownerComparisonRefreshing = state.comparisonStatus === 'refreshing';
+  const ownerComparisonStale = state.comparisonStatus === 'stale';
+  const affectedPolicyInstances = workspace?.applicability.affectedInstanceIds ?? [];
+  const affectedPolicyInstanceSummary = affectedPolicyInstances.length <= 20
+    ? affectedPolicyInstances.join(', ')
+    : `${affectedPolicyInstances.slice(0, 20).join(', ')}, and ${affectedPolicyInstances.length - 20} more`;
 
   useEffect(() => {
     if (workspace?.saved.path) setSaveAsPath(workspace.saved.path);
@@ -182,12 +189,18 @@ export function ProgramWorkspace({
               <strong>{workspace.draft.programLoaded ? shortRevision(workspace.draft.programRevision) : 'empty'}</strong>
               <small>ID {workspace.draft.draftId} · edit {workspace.draft.draftRevision}</small>
             </div>
-            <div className={workspace.saved.matchesDraft ? 'identity-current' : 'identity-dirty'}>
+            <div className={`${workspace.saved.matchesDraft ? 'identity-current' : 'identity-dirty'}${ownerComparisonRefreshing || ownerComparisonStale ? ' identity-refreshing' : ''}`}>
               <span>Saved</span>
               <strong>{workspace.saved.available ? shortRevision(workspace.saved.programRevision) : 'not saved'}</strong>
-              <small>{workspace.saved.path ?? 'Use Save As to choose a path'}</small>
+              <small>
+                {ownerComparisonRefreshing
+                  ? 'Prior owner observation; refreshing comparison…'
+                  : ownerComparisonStale
+                  ? 'Prior Saved observation; Draft comparison refresh failed.'
+                  : workspace.saved.path ?? 'Use Save As to choose a path'}
+              </small>
             </div>
-            <div className={workspace.applied.available ? 'identity-current' : 'identity-unavailable'}>
+            <div className={`${workspace.applied.available ? 'identity-current' : 'identity-unavailable'}${ownerComparisonRefreshing || ownerComparisonStale ? ' identity-refreshing' : ''}`}>
               <span>Applied</span>
               <strong>
                 {workspace.applied.available
@@ -195,7 +208,11 @@ export function ProgramWorkspace({
                   : 'Unavailable'}
               </strong>
               <small>
-                {workspace.applied.available
+                {ownerComparisonRefreshing
+                  ? 'Prior owner observation; refreshing comparison…'
+                  : ownerComparisonStale
+                  ? 'Prior Applied observation; Draft comparison refresh failed.'
+                  : workspace.applied.available
                   ? workspace.applied.matchesDraft
                     ? 'Matches the current Draft.'
                     : 'Owner selection differs from Draft.'
@@ -236,7 +253,12 @@ export function ProgramWorkspace({
                 </label>
                 <button
                   type="button"
-                  disabled={busy || !program || selectedScenario === null}
+                  disabled={
+                    busy
+                    || !program
+                    || selectedScenario === null
+                    || !workspace.applicability.applyReady
+                  }
                   onClick={() => {
                     if (!selectedScenario || !scenarioCatalog) return;
                     applyDraft(
@@ -249,6 +271,17 @@ export function ProgramWorkspace({
                     ? 'Applying…'
                     : 'Apply Draft'}
                 </button>
+                {program && !workspace.applicability.applyReady && (
+                  <div className="program-apply-blocked" role="alert">
+                    <strong>Draft is not Apply-ready.</strong>
+                    <span>
+                      Affected node instances: {affectedPolicyInstanceSummary}.
+                    </span>
+                    <span>
+                      {workspace.applicability.unavailableReason?.message}
+                    </span>
+                  </div>
+                )}
                 <button
                   type="button"
                   disabled={busy || (replaceNeedsConfirmation && !confirmDiscard)}
@@ -370,12 +403,12 @@ export function ProgramWorkspace({
             </div>
           </details>
 
-          {(state.message || state.error) && (
+          {(state.message || state.error || state.refreshWarning) && (
             <div
-              className={`program-feedback${state.error ? ' error-state' : ''}`}
-              role={state.error ? 'alert' : 'status'}
+              className={`program-feedback${state.error || state.refreshWarning ? ' error-state' : ''}`}
+              role={state.error || state.refreshWarning ? 'alert' : 'status'}
             >
-              <span>{state.error ?? state.message}</span>
+              <span>{state.error ?? state.refreshWarning ?? state.message}</span>
               <button type="button" className="text-button" onClick={clearFeedback}>Dismiss</button>
             </div>
           )}
@@ -468,6 +501,7 @@ export function ProgramWorkspace({
                   blackboardKeys={program.blackboard?.keys ?? []}
                   busy={authoringBusy}
                   onMutate={mutate}
+                  onUpdateNodePolicies={updateNodePolicies}
                 />
               </div>
               <ProgramDeclarationsEditor

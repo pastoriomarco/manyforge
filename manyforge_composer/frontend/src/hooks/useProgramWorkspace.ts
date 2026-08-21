@@ -5,14 +5,22 @@ import { errorMessage } from '../state/structuralResource';
 import {
   INITIAL_PROGRAM_WORKSPACE_STATE,
   programWorkspaceReducer,
+  replaceProgramWorkspaceDraft,
   type ProgramWorkspaceActionName,
 } from '../state/programWorkspace';
 import type {
   JsonValue,
+  ProgramNodeModificationPolicy,
+  ProgramNodeRecoveryPolicy,
+  ProgramOperatorStopPolicy,
   ProgramWorkspaceResponse,
+  ProgramNodePolicyMutationResponse,
   ProgramWorkspaceTransitionResponse,
   ProgramWorkspaceTransitionStatus,
 } from '../types/api';
+
+const POLICY_REFRESH_FAILURE =
+  'Draft updated; workspace status refresh failed. Your Draft change remains; retry refresh.';
 
 function fence(workspace: ProgramWorkspaceResponse) {
   return {
@@ -79,6 +87,35 @@ export function useProgramWorkspace() {
   );
   const generation = useRef(0);
   const mounted = useRef(true);
+  const workspaceRead = useRef<Promise<ProgramWorkspaceResponse> | null>(null);
+  const workspaceReadGeneration = useRef<number | null>(null);
+
+  const readWorkspace = useCallback((requestGeneration: number) => {
+    if (
+      workspaceRead.current !== null
+      && workspaceReadGeneration.current === requestGeneration
+    ) {
+      return workspaceRead.current;
+    }
+    const request = api.programWorkspace.get();
+    workspaceRead.current = request;
+    workspaceReadGeneration.current = requestGeneration;
+    void request.then(
+      () => {
+        if (workspaceRead.current === request) {
+          workspaceRead.current = null;
+          workspaceReadGeneration.current = null;
+        }
+      },
+      () => {
+        if (workspaceRead.current === request) {
+          workspaceRead.current = null;
+          workspaceReadGeneration.current = null;
+        }
+      },
+    );
+    return request;
+  }, []);
 
   const run = useCallback(async (
     action: ProgramWorkspaceActionName,
@@ -111,9 +148,9 @@ export function useProgramWorkspace() {
 
   const refresh = useCallback(() => run(
     'refresh',
-    () => api.programWorkspace.get().then((workspace) =>
+    () => readWorkspace(generation.current).then((workspace) =>
       workspaceResult(workspace, null)),
-  ), [run]);
+  ), [readWorkspace, run]);
 
   useEffect(() => {
     mounted.current = true;
@@ -258,6 +295,75 @@ export function useProgramWorkspace() {
     );
   }, [requireWorkspace, run]);
 
+  const updateNodePolicies = useCallback((
+    instanceId: string,
+    modificationPolicy: ProgramNodeModificationPolicy,
+    recoveryPolicy: ProgramNodeRecoveryPolicy,
+    operatorStopPolicy: ProgramOperatorStopPolicy,
+  ) => {
+    const workspace = requireWorkspace();
+    const expectedProgramRevision = workspace?.draft.programRevision;
+    if (!workspace || !workspace.draft.programLoaded || !expectedProgramRevision) return;
+
+    const current = generation.current + 1;
+    generation.current = current;
+    dispatch({ type: 'request_started', generation: current, action: 'update_policies' });
+    void (async () => {
+      let response: ProgramNodePolicyMutationResponse;
+      try {
+        response = await api.programWorkspace.updateNodePolicies(
+          fence(workspace),
+          expectedProgramRevision,
+          instanceId,
+          modificationPolicy,
+          recoveryPolicy,
+          operatorStopPolicy,
+        );
+      } catch (error: unknown) {
+        if (mounted.current && generation.current === current) {
+          dispatch({
+            type: 'request_failed',
+            generation: current,
+            error: `${errorMessage(error, 'Draft policy update failed.')} Refresh workspace before retrying.`,
+          });
+        }
+        return;
+      }
+      if (!mounted.current || generation.current !== current) return;
+
+      const revisionMessage = response.draft.draftRevision === workspace.draft.draftRevision
+        ? `Draft policy unchanged; Draft revision ${response.draft.draftRevision} (no-op).`
+        : `Draft updated; Draft revision ${response.draft.draftRevision}.`;
+      dispatch({
+        type: 'policy_mutation_succeeded',
+        generation: current,
+        workspace: replaceProgramWorkspaceDraft(workspace, response.draft),
+        message: `${revisionMessage} Workspace owner status is refreshing.`,
+      });
+
+      try {
+        const refreshed = await readWorkspace(current);
+        if (mounted.current && generation.current === current) {
+          dispatch({
+            type: 'request_succeeded',
+            generation: current,
+            workspace: refreshed,
+            message: revisionMessage,
+            transitionStatus: null,
+          });
+        }
+      } catch {
+        if (mounted.current && generation.current === current) {
+          dispatch({
+            type: 'workspace_refresh_failed',
+            generation: current,
+            warning: POLICY_REFRESH_FAILURE,
+          });
+        }
+      }
+    })();
+  }, [readWorkspace, requireWorkspace]);
+
   return {
     state,
     refresh,
@@ -270,6 +376,7 @@ export function useProgramWorkspace() {
     discard,
     revert,
     load,
+    updateNodePolicies,
     clearFeedback: () => dispatch({ type: 'clear_feedback' }),
   };
 }

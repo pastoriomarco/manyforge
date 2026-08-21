@@ -21,7 +21,11 @@ from manyforge_headless_api.program_binding_projection import (
 )
 from pydantic import BaseModel, ConfigDict, Field
 
-from .draft_session import DraftSessionError, OPERATOR_DRAFT_MUTATIONS
+from .draft_session import (
+    DraftSessionError,
+    OPERATOR_DRAFT_MUTATIONS,
+    draft_applicability,
+)
 from .node_environment_client import (
     ActiveNodeEnvironmentProjectionError,
     read_active_node_environment,
@@ -43,6 +47,7 @@ _AUTHORING_MUTATIONS = frozenset(
         "blackboard_draft_upsert_namespaces",
         "program_draft_remove_parameters",
         "program_draft_upsert_parameters",
+        "program_draft_update_node_policies",
         "scene_draft_add_object",
         "scene_draft_remove_objects",
         "scene_draft_update_object",
@@ -82,6 +87,9 @@ _PROGRAM_FIELDS = _PROGRAM_REQUIRED_FIELDS | frozenset(
         "viewer",
     }
 )
+_POLICY_MUTATION = "program_draft_update_node_policies"
+_POLICY_MUTATION_API_VERSION = "manyforge.composer_draft_mutation.v1"
+
 
 class _DraftFence(BaseModel):
     model_config = _DTO_CONFIG
@@ -293,6 +301,18 @@ def _apply_program(
     scenario_catalog_revision: str,
     expected_applied_record_digest: str | None,
 ) -> dict[str, Any]:
+    applicability = draft_applicability(program.to_dict())
+    if not applicability["applyReady"]:
+        reason = applicability["unavailableReason"]
+        raise DraftSessionError(
+            reason["code"],
+            reason["message"],
+            status_code=409,
+            detail={
+                "message": reason["message"],
+                "affectedInstanceIds": applicability["affectedInstanceIds"],
+            },
+        )
     if state.headless_client is None:
         raise DraftSessionError(
             "program_apply_unavailable",
@@ -381,11 +401,32 @@ def create_draft_router(state: ComposerState) -> APIRouter:
                 tool_id=body.mutation,
                 arguments=body.arguments,
                 expected_revision=body.expected_draft_revision,
-                catalog=_active_catalog(state),
+                # Policy authoring is Draft-only.  In particular, do not
+                # turn this mutation into a Headless/runtime read merely to
+                # validate an unchanged Program catalog.
+                catalog=(
+                    state.node_catalog
+                    if body.mutation == "program_draft_update_node_policies"
+                    else _active_catalog(state)
+                ),
                 draft_id=body.draft_id,
             )
         except Exception as error:
             _raise_workspace_error(error)
+        if body.mutation == _POLICY_MUTATION:
+            draft = result.snapshot
+            return {
+                "schemaVersion": _POLICY_MUTATION_API_VERSION,
+                "mutation": result.mutation,
+                "details": result.details,
+                "draft": {
+                    "draftId": draft["draft_id"],
+                    "draftRevision": draft["draft_revision"],
+                    "programLoaded": draft["program_loaded"],
+                    "programRevision": draft["program_revision"],
+                    "program": draft["program"],
+                },
+            }
         return {
             "mutation": result.mutation,
             "details": result.details,

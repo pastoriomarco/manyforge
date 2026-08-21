@@ -17,6 +17,7 @@ import {
   parseNodeEnvironmentResponse,
   parseLogicalSceneProjection,
   parseProgramWorkspaceResponse,
+  parseProgramNodePolicyMutationResponse,
   parseProgramWorkspaceTransitionResponse,
   parseProgramRunIndex,
   parseProgramRunStatus,
@@ -70,6 +71,11 @@ function workspaceFixture(): Record<string, unknown> {
       programLoaded: true,
       programRevision: program.program_revision,
       program,
+    },
+    applicability: {
+      applyReady: true,
+      affectedInstanceIds: [],
+      unavailableReason: null,
     },
     saved: {
       available: true,
@@ -753,6 +759,135 @@ describe('Program workspace parsers', () => {
     expect(() => parseProgramWorkspaceResponse(fixture)).toThrow(
       'exactly [sphere_radius_m, type]',
     );
+  });
+
+  it('parses complete canonical node policies and rejects closed-shape drift', () => {
+    const fixture = workspaceFixture();
+    const program = (fixture.draft as Record<string, unknown>).program as Record<string, unknown>;
+    const tree = program.tree as Record<string, unknown>;
+    tree.modification_policy = {
+      runtime_override: 'human_approval',
+      persistent_edit: 'human_approval',
+      intervention_delegate: 'human_only',
+    };
+    tree.recovery_policy = {
+      allow_intervention: true,
+      allowed_recovery_actions: ['intervention'],
+      max_retries: 2,
+      allowed_skills: [],
+      persistence_ceiling: 'draft_patch',
+    };
+    tree.operator_stop_policy = 'hold';
+
+    const parsed = parseProgramWorkspaceResponse(fixture);
+    expect(parsed.draft.program?.tree.modification_policy).toEqual(
+      tree.modification_policy,
+    );
+    expect(parsed.draft.program?.tree.recovery_policy?.allowed_skills).toEqual([]);
+    expect(parsed.draft.program?.tree.operator_stop_policy).toBe('hold');
+
+    const cases = [
+      { modification_policy: null },
+      { recovery_policy: { allow_intervention: true } },
+      {
+        modification_policy: {
+          runtime_override: 'human_approval',
+          persistent_edit: 'human_approval',
+          intervention_delegate: 'human_only',
+          legacy: 'forbidden',
+        },
+      },
+      { operator_stop_policy: 'pause' },
+      {
+        recovery_policy: {
+          allow_intervention: false,
+          allowed_recovery_actions: ['runtime_override'],
+          max_retries: 0,
+          allowed_skills: [],
+          persistence_ceiling: 'session_only',
+        },
+      },
+    ];
+    for (const change of cases) {
+      const invalid = structuredClone(fixture);
+      const invalidProgram = (invalid.draft as Record<string, unknown>).program as Record<string, unknown>;
+      Object.assign(invalidProgram.tree, change);
+      expect(() => parseProgramWorkspaceResponse(invalid)).toThrow();
+    }
+  });
+
+  it('parses canonical imported skills without treating C1 applicability as syntax', () => {
+    const fixture = workspaceFixture();
+    const program = (fixture.draft as Record<string, unknown>).program as Record<string, unknown>;
+    const tree = program.tree as Record<string, unknown>;
+    tree.recovery_policy = {
+      allow_intervention: true,
+      allowed_recovery_actions: ['intervention'],
+      max_retries: 0,
+      allowed_skills: ['legacy.inspect'],
+      persistence_ceiling: 'session_only',
+    };
+    tree.children = [{
+      node_id: 'timer',
+      instance_id: 'update-b',
+      parameters: {},
+      children: [],
+    }];
+    fixture.applicability = {
+      applyReady: false,
+      affectedInstanceIds: ['wait'],
+      unavailableReason: {
+        code: 'composer_policy_skill_referent_unavailable',
+        message: 'Allowed recovery skills are unavailable: each skill requires an exact revision-qualified retained referent. Leave Allowed skills empty.',
+        restorationGates: [],
+      },
+    };
+    const parsed = parseProgramWorkspaceResponse(fixture);
+
+    expect(parsed.draft.program?.tree.recovery_policy?.allowed_skills)
+      .toEqual(['legacy.inspect']);
+    expect(parsed.applicability.affectedInstanceIds).toEqual(['wait']);
+    const mutation = parseProgramNodePolicyMutationResponse({
+      schemaVersion: 'manyforge.composer_draft_mutation.v1',
+      mutation: 'program_draft_update_node_policies',
+      details: { updated_instance_id: 'update-b' },
+      draft: fixture.draft,
+    });
+    expect(mutation.details.updatedInstanceId).toBe('update-b');
+    expect(mutation.draft.program?.tree.recovery_policy?.allowed_skills)
+      .toEqual(['legacy.inspect']);
+  });
+
+  it('parses only the closed Draft-only node-policy response', () => {
+    const workspace = workspaceFixture();
+    const draft = workspace.draft as Record<string, unknown>;
+    const response = {
+      schemaVersion: 'manyforge.composer_draft_mutation.v1',
+      mutation: 'program_draft_update_node_policies',
+      details: { updated_instance_id: 'wait' },
+      draft,
+    };
+    const parsed = parseProgramNodePolicyMutationResponse(response);
+    expect(parsed).toEqual({
+      schemaVersion: response.schemaVersion,
+      mutation: response.mutation,
+      details: { updatedInstanceId: 'wait' },
+      draft: workspace.draft,
+    });
+
+    const malformed = [
+      { schemaVersion: 'manyforge.composer_program_workspace.v1' },
+      { mutation: 'tree_draft_update_node_params' },
+      { details: { updated_instance_id: 'wait', extra: true } },
+      { draft: { ...draft, saved: false } },
+      { extra: true },
+    ];
+    for (const change of malformed) {
+      expect(() => parseProgramNodePolicyMutationResponse({
+        ...response,
+        ...change,
+      })).toThrow();
+    }
   });
 
   it('rejects inconsistent or historical Program binding shapes', () => {
