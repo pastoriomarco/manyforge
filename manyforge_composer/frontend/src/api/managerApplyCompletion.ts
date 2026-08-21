@@ -46,21 +46,17 @@ function boundedDuration(value: number, label: string): number {
 
 function delay(delayMs: number, signal?: AbortSignal): Promise<void> {
   return new Promise((resolve, reject) => {
-    if (signal?.aborted) {
-      reject(signal.reason ?? new DOMException('Aborted', 'AbortError'));
-      return;
-    }
-    let timer: ReturnType<typeof globalThis.setTimeout>;
-    const abort = () => {
+    function abort() {
       globalThis.clearTimeout(timer);
       signal?.removeEventListener('abort', abort);
       reject(signal?.reason ?? new DOMException('Aborted', 'AbortError'));
-    };
-    signal?.addEventListener('abort', abort, { once: true });
-    timer = globalThis.setTimeout(() => {
+    }
+    const timer = globalThis.setTimeout(() => {
       signal?.removeEventListener('abort', abort);
       resolve();
     }, delayMs);
+    signal?.addEventListener('abort', abort, { once: true });
+    if (signal?.aborted) abort();
   });
 }
 
