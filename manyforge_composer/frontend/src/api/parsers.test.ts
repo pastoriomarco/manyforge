@@ -801,7 +801,7 @@ describe('Program workspace parsers', () => {
       {
         recovery_policy: {
           allow_intervention: false,
-          allowed_recovery_actions: ['runtime_override'],
+          allowed_recovery_actions: ['intervention'],
           max_retries: 0,
           allowed_skills: [],
           persistence_ceiling: 'session_only',
