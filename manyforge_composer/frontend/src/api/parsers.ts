@@ -17,6 +17,7 @@ import type {
   AppliedProgramSelection,
   ManagerActiveProjection,
   ManagerApplyAvailability,
+  ManagerApplyReplayStatus,
   ManagerApplyResponse,
   ManagerDiffProjection,
   ManagerGraphProjection,
@@ -1626,7 +1627,7 @@ export function parseManagerApplyResponse(value: unknown): ManagerApplyResponse 
     applyId,
     error: null,
     ok: true as const,
-    replayStatus,
+    replayStatus: replayStatus as ManagerApplyReplayStatus,
     requestId,
     requestOwnerEpoch,
   };
