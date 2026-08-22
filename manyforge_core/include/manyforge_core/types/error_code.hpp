@@ -23,6 +23,8 @@ enum class ErrorCode {
     kInvalidRequest,
     kMissingReference,
     kAmbiguousReference,
+    kStaleGeneration,
+    kAuthoringNotReady,
     kUnsupportedCapability,
     kPlanningFailed,
     kPlanningTimeout,
@@ -65,6 +67,8 @@ inline const char* to_string(ErrorCode code) {
         case kInvalidRequest: return "invalid_request";
         case kMissingReference: return "missing_reference";
         case kAmbiguousReference: return "ambiguous_reference";
+        case kStaleGeneration: return "stale_generation";
+        case kAuthoringNotReady: return "authoring_not_ready";
         case kUnsupportedCapability: return "unsupported_capability";
         case kPlanningFailed: return "planning_failed";
         case kPlanningTimeout: return "planning_timeout";
@@ -254,6 +258,8 @@ public:
 inline const char* kErrorInvalidRequest = "invalid_request";
 inline const char* kErrorMissingReference = "missing_reference";
 inline const char* kErrorAmbiguousReference = "ambiguous_reference";
+inline const char* kErrorStaleGeneration = "stale_generation";
+inline const char* kErrorAuthoringNotReady = "authoring_not_ready";
 inline const char* kErrorUnsupportedCapability = "unsupported_capability";
 inline const char* kErrorRecoveryActionRejected = "recovery_action_rejected";
 

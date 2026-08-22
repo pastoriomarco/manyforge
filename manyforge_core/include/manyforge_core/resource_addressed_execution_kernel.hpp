@@ -8,6 +8,7 @@
 #include <manyforge_core/bounded_stop_control_executor.hpp>
 #include <manyforge_core/bounded_stop_stage_attempt_executor.hpp>
 #include <manyforge_core/emergency_stop_acceptance_reserve.hpp>
+#include <manyforge_core/kernel_cell_admission_owner.hpp>
 #include <manyforge_core/orphan_resource_reconciliation.hpp>
 #include <manyforge_core/ports/iaddressed_motion_preview.hpp>
 #include <manyforge_core/ports/iaddressed_operation_owner.hpp>
@@ -176,6 +177,10 @@ struct ResourceAddressedExecutionKernelConfig final {
   /// Construction-fixed current-facts owner. It reads only owner-issued
   /// immutable facts; callers cannot supply recovery evidence.
   StopFaultRecoveryFactsResolver stop_fault_recovery_facts_resolver;
+  std::size_t cell_admission_claim_capacity{1024U};
+  CellAdmissionInterventionValidator cell_admission_intervention_validator;
+  CellAdmissionSettlementValidator cell_admission_settlement_validator;
+  CellAdmissionReconcileValidator cell_admission_reconcile_validator;
 };
 
 /// Private no-effect result used to project a capability-command preview at a
@@ -193,6 +198,7 @@ struct CapabilityCommandPreviewResultDTO final {
 /// instances remain private single-participant subordinate mechanisms.
 class ResourceAddressedExecutionKernel final : public IAddressedOperationOwner,
                                                public IAddressedMotionPreviewOwner,
+                                               public IKernelCellAdmissionPort,
                                                private IStopControlWorkReceiver,
                                                private IStopStageAttemptCompletionReceiver,
                                                private IOperationControlEffectCompletionReceiver {
@@ -256,6 +262,16 @@ class ResourceAddressedExecutionKernel final : public IAddressedOperationOwner,
       const RuntimeScaleRequestDTO& request);
   [[nodiscard]] Result<RuntimeScaleStatusDTO> get_runtime_scale(
       const OperationId& operation_id) const;
+
+  [[nodiscard]] AuthoringAdmissionDTO GetAuthoringAdmission() const override;
+  [[nodiscard]] Result<AuthoringAdmissionDTO> UpdateCellAdmissionReadiness(
+      const CellAdmissionReadinessSnapshotDTO& snapshot) override;
+  [[nodiscard]] Result<CellAdmissionClaimDTO> AcquireCellAdmissionClaim(
+      const CellAdmissionClaimIntentDTO& intent) override;
+  [[nodiscard]] Result<AuthoringAdmissionDTO> ReleaseCellAdmissionClaim(
+      const CellAdmissionClaimReleaseDTO& release) override;
+  [[nodiscard]] Result<AuthoringAdmissionDTO> ReconcileCellAdmissionClaims(
+      const CellAdmissionReconcileDTO& reconcile) override;
 
   /// Read-only owner projection. Subordinate polling and state advancement are
   /// performed only by reconcile_subordinate_state(), never by this method.
@@ -440,6 +456,7 @@ class ResourceAddressedExecutionKernel final : public IAddressedOperationOwner,
   IClock& clock_;
   IOperationJournal& journal_;
   ResourceAddressedExecutionKernelConfig config_;
+  std::unique_ptr<KernelCellAdmissionOwner> cell_admission_owner_;
 
   // Serializes public Execute admission while permitting synchronous engine
   // callbacks to take state_mutex_. The subordinate execute call is required

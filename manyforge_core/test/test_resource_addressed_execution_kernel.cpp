@@ -1216,6 +1216,39 @@ class FakeOperationJournal final : public IOperationJournal {
     return Record(std::string("state:") + transition_reason, state);
   }
 
+  Result<std::uint64_t> RecordCellAdmissionClaimAcquired(
+      const RequestOwnerEpoch&, const CellAdmissionClaimDTO&) override {
+    if (cell_admission_acquire_hook) {
+      cell_admission_acquire_hook();
+    }
+    std::lock_guard lock(mutex);
+    calls.push_back("cell_admission_acquired");
+    return Result<std::uint64_t>::Ok(next_sequence++);
+  }
+
+  Result<std::uint64_t> RecordCellAdmissionClaimReleased(
+      const RequestOwnerEpoch&, const CellAdmissionClaimDTO&,
+      const CellAdmissionClaimReleaseDTO&, AdmissionGeneration) override {
+    std::lock_guard lock(mutex);
+    calls.push_back("cell_admission_released");
+    return Result<std::uint64_t>::Ok(next_sequence++);
+  }
+
+  Result<std::uint64_t> RecordCellAdmissionClaimsReconciled(
+      const RequestOwnerEpoch&, const CellAdmissionReconcileDTO&,
+      const CellAdmissionReconcileValidationDTO&, AdmissionGeneration) override {
+    std::lock_guard lock(mutex);
+    calls.push_back("cell_admission_reconciled");
+    return Result<std::uint64_t>::Ok(next_sequence++);
+  }
+
+  Result<std::uint64_t> RecordCellAdmissionGenerationAdvanced(
+      const RequestOwnerEpoch&, AdmissionGeneration, AdmissionGeneration) override {
+    std::lock_guard lock(mutex);
+    calls.push_back("cell_admission_generation_advanced");
+    return Result<std::uint64_t>::Ok(next_sequence++);
+  }
+
   Result<std::uint64_t> Record(std::string kind, const OperationStateDTO& state) {
     if (record_hook) {
       record_hook(kind);
@@ -1259,6 +1292,7 @@ class FakeOperationJournal final : public IOperationJournal {
   std::function<void()> operation_acceptance_hook;
   std::function<void()> control_acceptance_hook;
   std::function<void()> stop_acceptance_hook;
+  std::function<void()> cell_admission_acquire_hook;
   std::function<void(std::string_view)> record_hook;
   std::vector<StopId> projected_stop_acceptances;
   std::vector<StopId> projected_stop_terminals;
@@ -5985,7 +6019,8 @@ TEST(ResourceAddressedExecutionKernelTest,
   FakeParticipantEngine replacement_engine;
   FakeOperationJournal replacement_journal;
   replacement_journal.recovery = OperationJournalRecoveryDTO{
-      {}, {*recovered}, RequestOwnerEpoch("kernel.epoch.old"), {ResourceId("robot.joint_1")}};
+      {}, {*recovered}, RequestOwnerEpoch("kernel.epoch.old"), {ResourceId("robot.joint_1")},
+      AdmissionGeneration(0U), {}, {}, {}};
   ResourceAddressedExecutionKernel replacement(
       {registration(binding, replacement_engine)}, clock, replacement_journal,
       {RequestOwnerEpoch("kernel.epoch.new"), CellId("cell.test"), 8U});
@@ -6268,6 +6303,134 @@ TEST(ResourceAddressedExecutionKernelTest,
   }));
   EXPECT_EQ(engine.execute_calls, 0);
   EXPECT_EQ(engine.translate_stop_stage_calls.load(), 0);
+}
+
+void VerifyRecognizedFullStopDoesNotWaitForBlockedCellAdmissionJournalWrite(
+    const bool retain_active_resource) {
+  FakeClock clock;
+  FakeParticipantEngine engine;
+  FakeOperationJournal journal;
+  std::promise<void> claim_journal_entered_promise;
+  auto claim_journal_entered = claim_journal_entered_promise.get_future();
+  std::promise<void> release_claim_journal_promise;
+  const auto release_claim_journal = release_claim_journal_promise.get_future().share();
+  journal.cell_admission_acquire_hook = [&] {
+    claim_journal_entered_promise.set_value();
+    release_claim_journal.wait();
+  };
+  const auto binding =
+      make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular);
+  ResourceAddressedExecutionKernelConfig config{
+      RequestOwnerEpoch("kernel.epoch.1"), CellId("cell.test"), 16U};
+  config.cell_admission_settlement_validator =
+      [](const auto&, const auto&) { return Result<void>::Ok(); };
+  ResourceAddressedExecutionKernel kernel({registration(binding, engine)}, clock, journal,
+                                          std::move(config));
+  if (retain_active_resource) {
+    const auto executed = kernel.execute(motion_operation("request.active-before-claim"));
+    ASSERT_TRUE(executed.ok()) << executed.error().message;
+  }
+  const CellAdmissionReadinessSnapshotDTO ready{
+      true,
+      ProgramCycleStatusDTO{RequestOwnerEpoch("program.owner"), 1U,
+                            ProgramCycleStateDTO::kIdleAfterReset, std::nullopt, std::nullopt,
+                            std::nullopt},
+      true, true, true, 1U, 1U,
+      true, true, 0U, 0U, 0U};
+  ASSERT_TRUE(kernel.UpdateCellAdmissionReadiness(ready).ok());
+  const auto generation = kernel.GetAuthoringAdmission().admission_generation;
+  const CellAdmissionClaimIntentDTO claim{
+      CellAdmissionClaimKindDTO::kAuthoringMutation,
+      CellAdmissionOwnerRoleDTO::kAuthoringOwner,
+      RequestOwnerEpoch("authoring.owner.1"),
+      "document.transaction.1",
+      RequestId("request.cell-admission.blocked"),
+      ContentDigest(
+          "sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"),
+      generation,
+      {},
+      std::nullopt,
+      std::nullopt};
+  auto acquiring = std::async(std::launch::async,
+                              [&] { return kernel.AcquireCellAdmissionClaim(claim); });
+  const auto entered_status = claim_journal_entered.wait_for(std::chrono::seconds(10));
+  if (entered_status != std::future_status::ready) {
+    release_claim_journal_promise.set_value();
+    static_cast<void>(acquiring.get());
+    FAIL() << "cell-admission journal did not reach its blocking seam";
+  }
+
+  const FullStopIntentDTO stop{
+      PublicRequestContextDTO{RequestId("request.full-stop.independent"),
+                              RequestOwnerEpoch("kernel.epoch.1"), "test", std::nullopt},
+      StopGeneration(0U),
+      {}};
+  const auto accepted = kernel.full_stop(stop);
+  release_claim_journal_promise.set_value();
+  const auto acquired = acquiring.get();
+  ASSERT_TRUE(accepted.ok()) << accepted.error().message;
+  ASSERT_TRUE(acquired.ok()) << acquired.error().message;
+  EXPECT_EQ(accepted.value().resolution_reason, StopScopeResolutionReasonDTO::kExplicitFullStop);
+  EXPECT_EQ(accepted.value().affected_operation_revisions.empty(), !retain_active_resource);
+}
+
+TEST(ResourceAddressedExecutionKernelTest,
+     RecognizedFullStopDoesNotWaitForBlockedCellAdmissionJournalWrite) {
+  VerifyRecognizedFullStopDoesNotWaitForBlockedCellAdmissionJournalWrite(false);
+}
+
+TEST(ResourceAddressedExecutionKernelTest,
+     ActiveResourceFullStopDoesNotWaitForBlockedCellAdmissionJournalWrite) {
+  VerifyRecognizedFullStopDoesNotWaitForBlockedCellAdmissionJournalWrite(true);
+}
+
+TEST(ResourceAddressedExecutionKernelTest,
+     CellClaimAndOrdinaryAdmissionShareOneDeterministicKernelOrdering) {
+  FakeClock clock;
+  FakeParticipantEngine engine;
+  FakeOperationJournal journal;
+  std::promise<void> claim_linearized_promise;
+  auto claim_linearized = claim_linearized_promise.get_future();
+  std::promise<void> release_claim_promise;
+  auto release_claim = release_claim_promise.get_future().share();
+  journal.cell_admission_acquire_hook = [&] {
+    claim_linearized_promise.set_value();
+    release_claim.wait();
+  };
+  const auto binding =
+      make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular);
+  ResourceAddressedExecutionKernel kernel(
+      {registration(binding, engine)}, clock, journal,
+      {RequestOwnerEpoch("kernel.epoch.1"), CellId("cell.test"), 16U});
+  const CellAdmissionReadinessSnapshotDTO ready{
+      true,
+      ProgramCycleStatusDTO{RequestOwnerEpoch("program.owner"), 1U,
+                            ProgramCycleStateDTO::kIdleAfterReset, std::nullopt, std::nullopt,
+                            std::nullopt},
+      true, true, true, 1U, 1U, true, true, 0U, 0U, 0U};
+  ASSERT_TRUE(kernel.UpdateCellAdmissionReadiness(ready).ok());
+  const CellAdmissionClaimIntentDTO claim{
+      CellAdmissionClaimKindDTO::kAuthoringMutation,
+      CellAdmissionOwnerRoleDTO::kAuthoringOwner,
+      RequestOwnerEpoch("authoring.owner.1"),
+      "transaction.1",
+      RequestId("request.cell-ordering"),
+      ContentDigest(test_digest('9')),
+      kernel.GetAuthoringAdmission().admission_generation,
+      {},
+      std::nullopt,
+      std::nullopt};
+  auto acquiring = std::async(std::launch::async,
+                              [&] { return kernel.AcquireCellAdmissionClaim(claim); });
+  claim_linearized.wait();
+  auto executing = std::async(std::launch::async, [&] {
+    return kernel.execute(motion_operation("request.motion.cell-ordering"));
+  });
+  EXPECT_EQ(engine.execute_calls.load(), 0);
+  release_claim_promise.set_value();
+  ASSERT_TRUE(acquiring.get().ok());
+  ASSERT_TRUE(executing.get().ok());
+  EXPECT_EQ(engine.execute_calls.load(), 1);
 }
 
 TEST(ResourceAddressedExecutionKernelTest,
@@ -6629,7 +6792,11 @@ TEST(ResourceAddressedExecutionKernelTest,
           RuntimeScaleGeneration(0U)}},
       {},
       RequestOwnerEpoch("kernel.epoch.old"),
-      {ResourceId("robot.joint_1")}};
+      {ResourceId("robot.joint_1")},
+      AdmissionGeneration(0U),
+      {},
+      {},
+      {}};
 
   ResourceAddressedExecutionKernel kernel(
       {registration(binding, engine)}, clock, journal,
@@ -6703,7 +6870,11 @@ TEST(ResourceAddressedExecutionKernelTest,
       OperationJournalRecoveryDTO{{},
                                   {},
                                   RequestOwnerEpoch("kernel.epoch.old"),
-                                  {ResourceId("robot.finger"), ResourceId("robot.joint_1")}};
+                                  {ResourceId("robot.finger"), ResourceId("robot.joint_1")},
+                                  AdmissionGeneration(0U),
+                                  {},
+                                  {},
+                                  {}};
 
   {
     ResourceAddressedExecutionKernel kernel(
@@ -6746,7 +6917,8 @@ TEST(ResourceAddressedExecutionKernelTest,
   const auto configuration = route_configuration_for(source_registration, sibling);
   journal.recovery =
       OperationJournalRecoveryDTO{{}, {}, RequestOwnerEpoch("kernel.epoch.old"),
-                                  {ResourceId("robot.joint_1")}};
+                                  {ResourceId("robot.joint_1")}, AdmissionGeneration(0U), {},
+                                  {}, {}};
 
   ResourceAddressedExecutionKernel kernel(
       {unqualified_registration(source, engine), unqualified_registration(sibling, engine)}, clock,
@@ -6825,7 +6997,8 @@ TEST(ResourceAddressedExecutionKernelTest,
   ASSERT_TRUE(configuration.locally_valid());
 
   journal.recovery = OperationJournalRecoveryDTO{
-      {}, {}, RequestOwnerEpoch("kernel.epoch.old"), shared_resources};
+      {}, {}, RequestOwnerEpoch("kernel.epoch.old"), shared_resources,
+      AdmissionGeneration(0U), {}, {}, {}};
   ResourceAddressedExecutionKernel kernel(
       registrations, clock, journal,
       {RequestOwnerEpoch("kernel.epoch.new"), CellId("cell.test"), 16U});
@@ -6859,7 +7032,8 @@ TEST(ResourceAddressedExecutionKernelTest,
         const auto configuration = route_configuration_for(source_registration, sibling);
         journal.recovery =
             OperationJournalRecoveryDTO{{}, {}, RequestOwnerEpoch("kernel.epoch.old"),
-                                        {ResourceId("robot.joint_1")}};
+                                        {ResourceId("robot.joint_1")},
+                                        AdmissionGeneration(0U), {}, {}, {}};
         ResourceAddressedExecutionKernel kernel(
             {unqualified_registration(source, engine),
              unqualified_registration(sibling, engine)},

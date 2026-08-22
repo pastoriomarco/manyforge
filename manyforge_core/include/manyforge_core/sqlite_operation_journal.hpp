@@ -14,8 +14,8 @@
 namespace manyforge::core {
 
 inline constexpr std::string_view kOperationJournalSchemaId =
-    "manyforge.internal.execution.operation-journal.i8.v6";
-inline constexpr std::int64_t kOperationJournalSchemaVersion = 6;
+    "manyforge.internal.execution.operation-journal.o1.5.v9";
+inline constexpr std::int64_t kOperationJournalSchemaVersion = 9;
 inline constexpr std::int64_t kOperationJournalSqliteApplicationId = 0x4D46454A;
 inline constexpr std::string_view kOperationJournalFilename = "operation-journal.sqlite3";
 inline constexpr std::size_t kMaximumOperationJournalHistory = 4096U;
@@ -52,7 +52,8 @@ class SqliteOperationJournal final : public IOperationJournal {
  public:
   SqliteOperationJournal(std::filesystem::path database_path, CellId cell_id,
                          std::size_t history_capacity = kMaximumOperationJournalHistory,
-                         std::function<std::string()> wall_time_text = {});
+                         std::function<std::string()> wall_time_text = {},
+                         std::function<void(std::string_view)> critical_section_observer = {});
   ~SqliteOperationJournal() override;
 
   SqliteOperationJournal(const SqliteOperationJournal&) = delete;
@@ -100,6 +101,20 @@ class SqliteOperationJournal final : public IOperationJournal {
   [[nodiscard]] Result<std::uint64_t> RecordOperationState(
       const RequestOwnerEpoch& owner_epoch, const OperationStateDTO& state,
       const RuntimeScaleStatusDTO* scale_status, const char* transition_reason) override;
+
+  [[nodiscard]] Result<std::uint64_t> RecordCellAdmissionClaimAcquired(
+      const RequestOwnerEpoch& owner_epoch, const CellAdmissionClaimDTO& claim) override;
+  [[nodiscard]] Result<std::uint64_t> RecordCellAdmissionClaimReleased(
+      const RequestOwnerEpoch& owner_epoch, const CellAdmissionClaimDTO& claim,
+      const CellAdmissionClaimReleaseDTO& release,
+      AdmissionGeneration resulting_generation) override;
+  [[nodiscard]] Result<std::uint64_t> RecordCellAdmissionClaimsReconciled(
+      const RequestOwnerEpoch& owner_epoch, const CellAdmissionReconcileDTO& reconcile,
+      const CellAdmissionReconcileValidationDTO& validation,
+      AdmissionGeneration resulting_generation) override;
+  [[nodiscard]] Result<std::uint64_t> RecordCellAdmissionGenerationAdvanced(
+      const RequestOwnerEpoch& owner_epoch, AdmissionGeneration prior_generation,
+      AdmissionGeneration resulting_generation) override;
 
   /// Read-only, replay-safe projection. Reading never acknowledges, deletes,
   /// or changes operation ownership.

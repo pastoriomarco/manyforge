@@ -5,6 +5,7 @@
 #include <manyforge_core/emergency_stop_acceptance_reserve.hpp>
 #include <manyforge_core/stop_fault_recovery.hpp>
 #include <manyforge_core/stop_terminal_state.hpp>
+#include <manyforge_core/types/cell_admission.hpp>
 #include <manyforge_core/types/error_code.hpp>
 #include <manyforge_core/types/operation_runtime.hpp>
 #include <optional>
@@ -90,11 +91,55 @@ struct RecoveredStopJournalStateDTO final {
                          const RecoveredStopJournalStateDTO&) = default;
 };
 
+/// Trusted, internal reconciliation result.  The public reconcile DTO is only
+/// evidence input; this result is the exact authority consumed by Kernel and
+/// its mechanical journal.
+struct CellAdmissionReconcileSettlementAuthorizationDTO final {
+  CellAdmissionClaimDTO predecessor_claim;
+  CellAdmissionOwnerRoleDTO successor_owner_role{
+      CellAdmissionOwnerRoleDTO::kAuthoringOwner};
+  RequestOwnerEpoch successor_owner_epoch;
+  CellAdmissionSettlementKindDTO settlement_predicate{
+      CellAdmissionSettlementKindDTO::kReconciled};
+  ContentDigest reconciliation_evidence_digest;
+
+  friend bool operator==(const CellAdmissionReconcileSettlementAuthorizationDTO&,
+                         const CellAdmissionReconcileSettlementAuthorizationDTO&) = default;
+};
+
+struct CellAdmissionReconcileValidationDTO final {
+  std::vector<CellAdmissionCurrentOwnerEpochDTO> current_owner_epochs;
+  std::vector<CellAdmissionReconcileSettlementAuthorizationDTO> settlements;
+
+  friend bool operator==(const CellAdmissionReconcileValidationDTO&,
+                         const CellAdmissionReconcileValidationDTO&) = default;
+};
+
 struct OperationJournalRecoveryDTO final {
   std::vector<OperationStateDTO> historical_operations;
   std::vector<RecoveredStopJournalStateDTO> recovered_stops;
   std::optional<RequestOwnerEpoch> replaced_unclosed_owner_epoch;
   std::vector<ResourceId> unreconciled_resources;
+  AdmissionGeneration cell_admission_generation_high_water{0U};
+  struct RecoveredCellAdmissionClaimDTO final {
+    CellAdmissionClaimDTO claim;
+    std::optional<CellAdmissionClaimReleaseDTO> release;
+
+    friend bool operator==(const RecoveredCellAdmissionClaimDTO&,
+                           const RecoveredCellAdmissionClaimDTO&) = default;
+  };
+  std::vector<RecoveredCellAdmissionClaimDTO> recovered_cell_admission_claims;
+  struct RecoveredCellAdmissionMembershipDTO final {
+    CellAdmissionOwnerRoleDTO owner_role{CellAdmissionOwnerRoleDTO::kAuthoringOwner};
+    RequestOwnerEpoch owner_epoch;
+    RequestId request_id;
+    ContentDigest semantic_intent_digest;
+
+    friend bool operator==(const RecoveredCellAdmissionMembershipDTO&,
+                           const RecoveredCellAdmissionMembershipDTO&) = default;
+  };
+  std::vector<RecoveredCellAdmissionMembershipDTO> recovered_cell_admission_membership;
+  std::vector<CellAdmissionCurrentOwnerEpochDTO> recovered_cell_admission_current_owners;
 };
 
 /// Durable boundary owned by the resource-addressed Execution Kernel.
@@ -162,6 +207,36 @@ class IOperationJournal {
   [[nodiscard]] virtual Result<std::uint64_t> RecordOperationState(
       const RequestOwnerEpoch& owner_epoch, const OperationStateDTO& state,
       const RuntimeScaleStatusDTO* scale_status, const char* transition_reason) = 0;
+
+  [[nodiscard]] virtual Result<std::uint64_t> RecordCellAdmissionClaimAcquired(
+      const RequestOwnerEpoch&, const CellAdmissionClaimDTO&) {
+    return Result<std::uint64_t>::Err(
+        ErrorDTO{"operation_journal_cell_admission_unavailable",
+                 "the operation journal does not implement durable cell admission", {}});
+  }
+
+  [[nodiscard]] virtual Result<std::uint64_t> RecordCellAdmissionClaimReleased(
+      const RequestOwnerEpoch&, const CellAdmissionClaimDTO&,
+      const CellAdmissionClaimReleaseDTO&, AdmissionGeneration) {
+    return Result<std::uint64_t>::Err(
+        ErrorDTO{"operation_journal_cell_admission_unavailable",
+                 "the operation journal does not implement durable cell admission", {}});
+  }
+
+  [[nodiscard]] virtual Result<std::uint64_t> RecordCellAdmissionClaimsReconciled(
+      const RequestOwnerEpoch&, const CellAdmissionReconcileDTO&,
+      const CellAdmissionReconcileValidationDTO&, AdmissionGeneration) {
+    return Result<std::uint64_t>::Err(
+        ErrorDTO{"operation_journal_cell_admission_unavailable",
+                 "the operation journal does not implement durable cell admission", {}});
+  }
+
+  [[nodiscard]] virtual Result<std::uint64_t> RecordCellAdmissionGenerationAdvanced(
+      const RequestOwnerEpoch&, AdmissionGeneration, AdmissionGeneration) {
+    return Result<std::uint64_t>::Err(
+        ErrorDTO{"operation_journal_cell_admission_unavailable",
+                 "the operation journal does not implement durable cell admission", {}});
+  }
 };
 
 }  // namespace manyforge::core

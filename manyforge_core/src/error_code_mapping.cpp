@@ -12,6 +12,12 @@ ErrorCode error_code_from_dto(const ErrorDTO& error) {
   if (error.code == kErrorAmbiguousReference) {
     return ErrorCode::kAmbiguousReference;
   }
+  if (error.code == kErrorStaleGeneration) {
+    return ErrorCode::kStaleGeneration;
+  }
+  if (error.code == kErrorAuthoringNotReady) {
+    return ErrorCode::kAuthoringNotReady;
+  }
   if (error.code == kErrorValidationLimitsViolation) {
     return ErrorCode::kValidationLimitsViolation;
   }

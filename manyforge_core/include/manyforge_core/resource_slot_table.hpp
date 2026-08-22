@@ -263,7 +263,13 @@ class ResourceSlotTable final {
       std::optional<ResourceSlotState> next_state, OperationRevision next_operation_revision);
   void advance_generation_locked() noexcept;
 
+  // The admission mutex orders new operation/configuration admission with
+  // external durable fences. Slot bytes have a distinct lock so recognized
+  // Stop can inspect and fence the bounded table without waiting for an
+  // unrelated durable admission write. Kernel callers establish the required
+  // state/admission ordering before entering these data-only operations.
   std::shared_ptr<std::recursive_mutex> admission_mutex_;
+  mutable std::recursive_mutex data_mutex_;
   std::vector<ResourceSlotSnapshotDTO> slots_;
   std::vector<DomainActiveControlConfigurationDTO> active_control_configurations_;
   std::vector<DomainActiveControlConfigurationDTO>

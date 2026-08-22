@@ -12,6 +12,10 @@ TEST(ErrorCodeMappingTest, MapsPublicErrorDtoCodes) {
             ErrorCode::kMissingReference);
   EXPECT_EQ(error_code_from_dto(ErrorDTO{kErrorAmbiguousReference, "", {}}),
             ErrorCode::kAmbiguousReference);
+  EXPECT_EQ(error_code_from_dto(ErrorDTO{kErrorStaleGeneration, "", {}}),
+            ErrorCode::kStaleGeneration);
+  EXPECT_EQ(error_code_from_dto(ErrorDTO{kErrorAuthoringNotReady, "", {}}),
+            ErrorCode::kAuthoringNotReady);
   EXPECT_EQ(error_code_from_dto(ErrorDTO{kErrorValidationLimitsViolation, "", {}}),
             ErrorCode::kValidationLimitsViolation);
   EXPECT_EQ(error_code_from_dto(ErrorDTO{kErrorValidationCollision, "", {}}),

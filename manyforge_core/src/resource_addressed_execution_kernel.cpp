@@ -2235,7 +2235,9 @@ ResourceAddressedExecutionKernel::ResourceAddressedExecutionKernel(
       stop_projection_generations_(stop_projection_jobs_.size()) {
   if (config_.request_owner_epoch.empty() || config_.cell_id.empty() ||
       config_.request_replay_capacity == 0U ||
-      config_.request_replay_capacity > kMaxI6OperationReplayEntries) {
+      config_.request_replay_capacity > kMaxI6OperationReplayEntries ||
+      config_.cell_admission_claim_capacity == 0U ||
+      config_.cell_admission_claim_capacity > kMaximumCellAdmissionClaims) {
     throw std::invalid_argument(
         "addressed Kernel request-owner epoch, cell identity, or replay bound is invalid");
   }
@@ -2327,6 +2329,17 @@ ResourceAddressedExecutionKernel::ResourceAddressedExecutionKernel(
                              recovery.error().code + ": " + recovery.error().message);
   }
   historical_operations_ = std::move(recovery.value().historical_operations);
+  cell_admission_owner_ = std::make_unique<KernelCellAdmissionOwner>(
+      config_.request_owner_epoch,
+      std::min(config_.request_replay_capacity, config_.cell_admission_claim_capacity), clock_,
+      journal_,
+      std::move(recovery.value().recovered_cell_admission_claims),
+      recovery.value().cell_admission_generation_high_water,
+      config_.cell_admission_intervention_validator,
+      config_.cell_admission_settlement_validator,
+      config_.cell_admission_reconcile_validator,
+      std::move(recovery.value().recovered_cell_admission_membership),
+      std::move(recovery.value().recovered_cell_admission_current_owners));
   if (recovery.value().recovered_stops.size() > kMaximumResidentStopTerminalRecords) {
     throw std::runtime_error("recovered Stop terminal history exceeds its fixed bound");
   }
@@ -2539,7 +2552,8 @@ ResourceAddressedExecutionKernel::~ResourceAddressedExecutionKernel() {
     std::lock_guard state_lock(state_mutex_);
     orphan_reconciliation_complete = !motion_admission_unreconciled_;
   }
-  if (orphan_reconciliation_complete) {
+  if (orphan_reconciliation_complete && cell_admission_owner_ != nullptr &&
+      !cell_admission_owner_->has_unresolved_claims()) {
     try {
       static_cast<void>(journal_.CloseOwnerEpoch(config_.request_owner_epoch, clock_.now()));
     } catch (...) {
@@ -2548,6 +2562,34 @@ ResourceAddressedExecutionKernel::~ResourceAddressedExecutionKernel() {
   for (const auto& subscription : engine_subscriptions_) {
     subscription.engine->unsubscribe_events(subscription.handle);
   }
+}
+
+AuthoringAdmissionDTO ResourceAddressedExecutionKernel::GetAuthoringAdmission() const {
+  return cell_admission_owner_->GetAuthoringAdmission();
+}
+
+Result<AuthoringAdmissionDTO> ResourceAddressedExecutionKernel::UpdateCellAdmissionReadiness(
+    const CellAdmissionReadinessSnapshotDTO& snapshot) {
+  std::lock_guard admission_lock(*admission_mutex_);
+  return cell_admission_owner_->UpdateCellAdmissionReadiness(snapshot);
+}
+
+Result<CellAdmissionClaimDTO> ResourceAddressedExecutionKernel::AcquireCellAdmissionClaim(
+    const CellAdmissionClaimIntentDTO& intent) {
+  std::lock_guard admission_lock(*admission_mutex_);
+  return cell_admission_owner_->AcquireCellAdmissionClaim(intent);
+}
+
+Result<AuthoringAdmissionDTO> ResourceAddressedExecutionKernel::ReleaseCellAdmissionClaim(
+    const CellAdmissionClaimReleaseDTO& release) {
+  std::lock_guard admission_lock(*admission_mutex_);
+  return cell_admission_owner_->ReleaseCellAdmissionClaim(release);
+}
+
+Result<AuthoringAdmissionDTO> ResourceAddressedExecutionKernel::ReconcileCellAdmissionClaims(
+    const CellAdmissionReconcileDTO& reconcile) {
+  std::lock_guard admission_lock(*admission_mutex_);
+  return cell_admission_owner_->ReconcileCellAdmissionClaims(reconcile);
 }
 
 Result<void> ResourceAddressedExecutionKernel::reconfigure_runtime_participants(
@@ -2571,8 +2613,8 @@ ResourceAddressedExecutionKernel::stage_current_runtime_configuration_facts_unde
 
   try {
     std::lock_guard submit_lock(submission_mutex_);
-    std::lock_guard state_lock(state_mutex_);
     std::lock_guard admission_lock(*admission_mutex_);
+    std::lock_guard state_lock(state_mutex_);
     if (config_.operation_admission_gate->current_fenced_resources(scope.resources) !=
         scope.resources) {
       return reject<void>("candidate configuration staging is not covered by its Apply fence",
@@ -2799,8 +2841,8 @@ Result<void> ResourceAddressedExecutionKernel::reconfigure_runtime_participants_
   std::optional<ErrorDTO> table_error;
   std::unique_ptr<BoundedOperationControlExecutor> retired_control_executor;
   {
-    std::lock_guard state_lock(state_mutex_);
     std::lock_guard admission_lock(*admission_mutex_);
+    std::lock_guard state_lock(state_mutex_);
     table_route_publications.reserve(runtime_route_configuration_readbacks_.size());
     for (const auto& [domain_id, readback] : runtime_route_configuration_readbacks_) {
       if (changed_domains.contains(domain_id)) {
@@ -2988,8 +3030,8 @@ ResourceAddressedExecutionKernel::adopt_runtime_route_configuration_predecessor(
   }
   {
     std::lock_guard submit_lock(submission_mutex_);
-    std::lock_guard state_lock(state_mutex_);
     std::lock_guard admission_lock(*admission_mutex_);
+    std::lock_guard state_lock(state_mutex_);
     auto publications =
         route_publication_identities(runtime_route_configuration_readbacks_, &candidate);
     auto publication_inventory =
@@ -3062,8 +3104,8 @@ ResourceAddressedExecutionKernel::publish_runtime_route_configuration(
     }
   }
   {
-    std::lock_guard state_lock(state_mutex_);
     std::lock_guard admission_lock(*admission_mutex_);
+    std::lock_guard state_lock(state_mutex_);
     auto publications =
         route_publication_identities(runtime_route_configuration_readbacks_, &candidate);
     auto publication_inventory =
@@ -3913,6 +3955,10 @@ Result<OperationAcceptedDTO> ResourceAddressedExecutionKernel::execute(
     // This is the only Execute/Stop ordering section: publish the reserved
     // pending operation before any ordinary journal or provider call. A Stop
     // can now cancel/fence it without waiting for those calls.
+    // Acquire durable admission ordering before Kernel state. A pending
+    // authoring claim may delay new Execute, but it must not make Execute hold
+    // state while waiting and thereby delay recognized Stop.
+    std::lock_guard admission_lock(*admission_mutex_);
     std::lock_guard state_lock(state_mutex_);
     if (motion_admission_closed_) {
       return reject<OperationAcceptedDTO>(
@@ -4453,6 +4499,9 @@ ResourceAddressedExecutionKernel::execute_coordinated_motion_after_preflight(
   }
 
   {
+    // Match single-participant admission: ordering precedes Kernel state so a
+    // blocked durable claim cannot convoy recognized Stop.
+    std::lock_guard admission_lock(*admission_mutex_);
     std::lock_guard state_lock(state_mutex_);
     if (motion_admission_closed_) {
       return reject<OperationAcceptedDTO>(
@@ -5733,8 +5782,8 @@ Result<KernelDisableHandoffRuntimeSnapshotDTO>
 ResourceAddressedExecutionKernel::capture_disable_handoff_runtime_snapshot_impl(
     const DisableRuntimeExpectation& expectation) const {
   try {
-    std::lock_guard state_lock(state_mutex_);
     std::lock_guard admission_lock(*admission_mutex_);
+    std::lock_guard state_lock(state_mutex_);
     if (!stop_retained_bundle_id_.has_value() || !stop_graph_revision_.has_value()) {
       return reject<KernelDisableHandoffRuntimeSnapshotDTO>(
           "Kernel Disable admission has no current runtime identity",
@@ -6284,8 +6333,11 @@ Result<StopAcceptedDTO> ResourceAddressedExecutionKernel::accept_stop(
   std::optional<StopControlWorkToken> projection_token;
   bool handoff_work = false;
   {
+    // Stop recognition bypasses ordinary and cell-admission ordering. Runtime
+    // reconfiguration also joins state_mutex_, so this lock alone keeps the
+    // captured scope coherent without placing the emergency reserve behind a
+    // potentially blocked admission journal write.
     std::lock_guard state_lock(state_mutex_);
-    std::lock_guard admission_lock(*admission_mutex_);
     if (!cell_stop_deadline_budget_.has_value()) {
       return reject<StopAcceptedDTO>("Stop deadline referent is unavailable",
                                      "stop_deadline_budget_unavailable",
@@ -10035,11 +10087,11 @@ Result<void> ResourceAddressedExecutionKernel::release_prepared_dispatch_barrier
                        std::tie(right.owner.operation_id, right.owner.participant_id);
               });
     if (!undispatched_rows.empty()) {
+      std::lock_guard state_lock(state_mutex_);
       auto terminalized =
           resource_slots_->transition_batch(undispatched_rows, ResourceSlotState::kTerminal);
       auto released = terminalized.ok() ? resource_slots_->release_batch(undispatched_rows)
                                         : Result<void>::Err(terminalized.error());
-      std::lock_guard state_lock(state_mutex_);
       if (!released.ok()) {
         motion_admission_closed_ = true;
       } else if (auto* operation = find_active_operation_locked(operation_id);

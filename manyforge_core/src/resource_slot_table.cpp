@@ -147,7 +147,7 @@ Result<void> ResourceSlotTable::reserve(const ResourceSlotOwnerDTO& owner,
     return reject("resource reservation owner is invalid", "resource_owner_invalid",
                   ErrorCode::kInvalidRequest);
   }
-  std::lock_guard lock(*admission_mutex_);
+  std::lock_guard lock(data_mutex_);
   std::vector<std::size_t> indices;
   auto validation = validate_resource_set_locked(resources, indices);
   if (!validation.ok()) {
@@ -187,7 +187,7 @@ Result<void> ResourceSlotTable::reserve_batch(
                   "resource_reservation_not_canonical", ErrorCode::kInvalidRequest);
   }
 
-  std::lock_guard lock(*admission_mutex_);
+  std::lock_guard lock(data_mutex_);
   std::vector<std::pair<std::size_t, const ResourceSlotOwnerDTO*>> assignments;
   assignments.reserve(slots_.size());
   std::set<ResourceId> complete_resources;
@@ -242,7 +242,7 @@ Result<void> ResourceSlotTable::transition(const ResourceSlotOwnerDTO& owner,
     return reject("resource transition owner is invalid", "resource_owner_invalid",
                   ErrorCode::kInvalidRequest);
   }
-  std::lock_guard lock(*admission_mutex_);
+  std::lock_guard lock(data_mutex_);
   std::vector<std::size_t> indices;
   auto validation = validate_resource_set_locked(resources, indices);
   if (!validation.ok()) {
@@ -282,7 +282,7 @@ Result<void> ResourceSlotTable::transition_batch(
     return reject("coordinated resource transition owners are not canonical",
                   "resource_transition_batch_not_canonical", ErrorCode::kInvalidRequest);
   }
-  std::lock_guard lock(*admission_mutex_);
+  std::lock_guard lock(data_mutex_);
   std::vector<std::size_t> assignments;
   assignments.reserve(slots_.size());
   std::set<ResourceId> complete_resources;
@@ -337,7 +337,7 @@ Result<ResourceSlotOwnerDTO> ResourceSlotTable::revise_owner(
                  "resource owner revision must advance monotonically",
                  {{"reason", "resource_owner_revision_invalid"}}});
   }
-  std::lock_guard lock(*admission_mutex_);
+  std::lock_guard lock(data_mutex_);
   std::vector<std::size_t> indices;
   auto validation = validate_resource_set_locked(resources, indices);
   if (!validation.ok()) {
@@ -368,7 +368,7 @@ Result<ResourceSlotOwnerDTO> ResourceSlotTable::revise_owner(
 Result<std::vector<ResourceSlotOwnerDTO>> ResourceSlotTable::revise_owner_batch(
     const std::vector<ResourceSlotReservationOwnerDTO>& owners,
     OperationRevision next_operation_revision) {
-  std::lock_guard lock(*admission_mutex_);
+  std::lock_guard lock(data_mutex_);
   return revise_owner_batch_locked(owners, std::nullopt, next_operation_revision);
 }
 
@@ -463,7 +463,7 @@ Result<ResourceSlotOwnerDTO> ResourceSlotTable::transition_and_revise_owner(
                  "resource owner revision must advance monotonically",
                  {{"reason", "resource_owner_revision_invalid"}}});
   }
-  std::lock_guard lock(*admission_mutex_);
+  std::lock_guard lock(data_mutex_);
   std::vector<std::size_t> indices;
   auto validation = validate_resource_set_locked(resources, indices);
   if (!validation.ok()) {
@@ -501,7 +501,7 @@ Result<ResourceSlotOwnerDTO> ResourceSlotTable::transition_and_revise_owner(
 Result<std::vector<ResourceSlotOwnerDTO>> ResourceSlotTable::transition_and_revise_owner_batch(
     const std::vector<ResourceSlotReservationOwnerDTO>& owners, ResourceSlotState next_state,
     OperationRevision next_operation_revision) {
-  std::lock_guard lock(*admission_mutex_);
+  std::lock_guard lock(data_mutex_);
   return revise_owner_batch_locked(owners, next_state, next_operation_revision);
 }
 
@@ -573,7 +573,7 @@ Result<ResourceSlotStopFenceResultDTO> ResourceSlotTable::stop_fence_batch(
     }
   }
 
-  std::lock_guard lock(*admission_mutex_);
+  std::lock_guard lock(data_mutex_);
   if (request.expected_operation_resource_generation != operation_resource_generation_) {
     return reject_value<ResourceSlotStopFenceResultDTO>(
         "batch Stop fence names a stale operation-resource generation",
@@ -664,7 +664,7 @@ Result<ResourceSlotStopFenceResultDTO> ResourceSlotTable::stop_fence_batch(
 
 Result<void> ResourceSlotTable::release(const ResourceSlotOwnerDTO& owner,
                                         const std::vector<ResourceId>& resources) {
-  std::lock_guard lock(*admission_mutex_);
+  std::lock_guard lock(data_mutex_);
   std::vector<std::size_t> indices;
   auto validation = validate_resource_set_locked(resources, indices);
   if (!validation.ok()) {
@@ -705,7 +705,7 @@ Result<void> ResourceSlotTable::release_batch(
     return reject("coordinated resource release owners are not canonical",
                   "resource_release_batch_not_canonical", ErrorCode::kInvalidRequest);
   }
-  std::lock_guard lock(*admission_mutex_);
+  std::lock_guard lock(data_mutex_);
   std::vector<std::size_t> assignments;
   assignments.reserve(slots_.size());
   std::set<ResourceId> complete_resources;
@@ -753,7 +753,7 @@ Result<void> ResourceSlotTable::release_batch(
 
 Result<void> ResourceSlotTable::mark_unreconciled_external_or_orphan_goal(
     const std::vector<ResourceId>& resources) {
-  std::lock_guard lock(*admission_mutex_);
+  std::lock_guard lock(data_mutex_);
   std::vector<std::size_t> indices;
   auto validation = validate_resource_set_locked(resources, indices);
   if (!validation.ok()) {
@@ -779,7 +779,7 @@ Result<void> ResourceSlotTable::mark_unreconciled_external_or_orphan_goal(
 Result<std::uint64_t> ResourceSlotTable::reconcile_unreconciled_external_or_orphan_goal(
     const std::uint64_t expected_operation_resource_generation,
     const std::vector<ResourceId>& resources) {
-  std::lock_guard lock(*admission_mutex_);
+  std::lock_guard lock(data_mutex_);
   if (expected_operation_resource_generation != operation_resource_generation_) {
     return Result<std::uint64_t>::Err(
         ErrorDTO{std::string(to_string(ErrorCode::kInvalidStateTransition)),
@@ -837,7 +837,7 @@ Result<void> ResourceSlotTable::reconfigure_runtime_inventory(
                   "runtime_resource_inventory_noncanonical", ErrorCode::kInvalidRequest);
   }
 
-  std::lock_guard lock(*admission_mutex_);
+  std::lock_guard lock(data_mutex_);
   for (const auto& slot : slots_) {
     if (!std::binary_search(resources.begin(), resources.end(), slot.resource_id) &&
         (slot.state != ResourceSlotState::kFree || slot.owner.has_value())) {
@@ -898,7 +898,7 @@ Result<void> ResourceSlotTable::replace_route_publication_inventory(
                   "runtime_route_publication_inventory_noncanonical",
                   ErrorCode::kInvalidRequest);
   }
-  std::lock_guard lock(*admission_mutex_);
+  std::lock_guard lock(data_mutex_);
   auto generation = require_generation_available_locked();
   if (!generation.ok()) {
     return generation;
@@ -910,18 +910,18 @@ Result<void> ResourceSlotTable::replace_route_publication_inventory(
 }
 
 std::vector<ResourceSlotSnapshotDTO> ResourceSlotTable::snapshot() const {
-  std::lock_guard lock(*admission_mutex_);
+  std::lock_guard lock(data_mutex_);
   return slots_;
 }
 
 ResourceSlotTableSnapshotDTO ResourceSlotTable::coherent_snapshot() const {
-  std::lock_guard lock(*admission_mutex_);
+  std::lock_guard lock(data_mutex_);
   return ResourceSlotTableSnapshotDTO{operation_resource_generation_, slots_};
 }
 
 ResourceSlotAdmissionSnapshotDTO ResourceSlotTable::admission_snapshot(
     const std::vector<ResourceId>& affected_resources) const {
-  std::lock_guard lock(*admission_mutex_);
+  std::lock_guard lock(data_mutex_);
   std::set<ResourceId> affected;
   for (const auto& resource : affected_resources) {
     if (resource.empty() || !affected.insert(resource).second) {
@@ -958,7 +958,7 @@ ResourceSlotAdmissionSnapshotDTO ResourceSlotTable::admission_snapshot(
 }
 
 std::vector<OperationId> ResourceSlotTable::active_operation_ids() const {
-  std::lock_guard lock(*admission_mutex_);
+  std::lock_guard lock(data_mutex_);
   std::vector<OperationId> operations;
   operations.reserve(slots_.size());
   for (const auto& slot : slots_) {

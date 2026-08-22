@@ -42,6 +42,8 @@ add_library(manyforge_core
   src/component_lifecycle_admission.cpp
   src/component_lifecycle_coordinator.cpp
   src/cclc_open_request.cpp
+  src/cell_admission.cpp
+  src/kernel_cell_admission_owner.cpp
   src/component_lifecycle_journal_codec.cpp
   src/component_lifecycle_plan_catalog_codec.cpp
   src/component_lifecycle_plan_evaluator.cpp
@@ -537,12 +539,26 @@ if(BUILD_TESTING)
   gtest_discover_tests(test_resource_addressed_execution_kernel
     PROPERTIES TIMEOUT ${MANYFORGE_GTEST_TIMEOUT_SECONDS})
 
+  add_executable(test_kernel_cell_admission_owner
+    test/test_kernel_cell_admission_owner.cpp)
+  target_link_libraries(test_kernel_cell_admission_owner PRIVATE
+    manyforge_core GTest::gtest_main)
+  gtest_discover_tests(test_kernel_cell_admission_owner
+    PROPERTIES TIMEOUT ${MANYFORGE_GTEST_TIMEOUT_SECONDS})
+
   if(MANYFORGE_CORE_BUILD_SQLITE_OPERATION_JOURNAL)
     add_executable(test_sqlite_operation_journal
       test/test_sqlite_operation_journal.cpp)
     target_link_libraries(test_sqlite_operation_journal PRIVATE
       manyforge_core_sqlite_operation_journal GTest::gtest_main)
     gtest_discover_tests(test_sqlite_operation_journal
+      PROPERTIES TIMEOUT ${MANYFORGE_GTEST_TIMEOUT_SECONDS})
+
+    add_executable(test_kernel_cell_admission_sqlite
+      test/test_kernel_cell_admission_sqlite.cpp)
+    target_link_libraries(test_kernel_cell_admission_sqlite PRIVATE
+      manyforge_core_sqlite_operation_journal SQLite::SQLite3 GTest::gtest_main)
+    gtest_discover_tests(test_kernel_cell_admission_sqlite
       PROPERTIES TIMEOUT ${MANYFORGE_GTEST_TIMEOUT_SECONDS})
 
   endif()

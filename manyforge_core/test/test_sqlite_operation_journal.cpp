@@ -5,6 +5,7 @@
 #include <atomic>
 #include <cstdint>
 #include <filesystem>
+#include <future>
 #include <manyforge_core/sqlite_operation_journal.hpp>
 #include <manyforge_core/stop_journal_projection_codec.hpp>
 #include <manyforge_core/stop_scope_resolver.hpp>
@@ -1085,6 +1086,67 @@ TEST(SqliteOperationJournalTest,
   const auto ordinary =
       reopened.RecordOperationAccepted(epoch, command, Acceptance(command, state), state);
   ASSERT_TRUE(ordinary.ok()) << ordinary.error().message;
+}
+
+TEST(SqliteOperationJournalTest,
+     StopProjectionDoesNotWaitForOccupiedProductionJournalCriticalSection) {
+  ScopedTemporaryDirectory temporary;
+  const auto database = temporary.path() / std::string(kOperationJournalFilename);
+  const RequestOwnerEpoch epoch("execution-host.epoch.stop-contention");
+  const std::vector<ResourceId> inventory{ResourceId("robot.gripper")};
+  std::promise<void> entered_promise;
+  auto entered = entered_promise.get_future();
+  std::promise<void> release_promise;
+  auto release = release_promise.get_future().share();
+  SqliteOperationJournal journal(
+      database, CellId("cell.1"), 8U, {},
+      [&](const std::string_view operation) {
+        if (operation == "cell_admission_acquire") {
+          entered_promise.set_value();
+          release.wait();
+        }
+      });
+  auto recovery = journal.BeginOwnerEpoch(epoch, 1, 8U, inventory);
+  ASSERT_TRUE(recovery.ok());
+  const CellAdmissionClaimDTO claim{
+      CellAdmissionClaimIntentDTO{
+          CellAdmissionClaimKindDTO::kAuthoringMutation,
+          CellAdmissionOwnerRoleDTO::kAuthoringOwner,
+          RequestOwnerEpoch("authoring.owner.1"),
+          "transaction.1",
+          RequestId("request.cell-claim.1"),
+          Digest('e'),
+          recovery.value().cell_admission_generation_high_water,
+          {},
+          std::nullopt,
+          std::nullopt},
+      CellAdmissionClaimGeneration(1U),
+      recovery.value().cell_admission_generation_high_water,
+      2};
+  auto admission = std::async(std::launch::async, [&] {
+    return journal.RecordCellAdmissionClaimAcquired(epoch, claim);
+  });
+  entered.wait();
+
+  const FullStopIntentDTO intent{
+      PublicRequestContextDTO{RequestId("request.stop.contended"), epoch, "journal-test",
+                              std::nullopt},
+      StopGeneration(0U),
+      RequestAttributionDTO{},
+  };
+  const auto acceptance =
+      StopAcceptanceRecord(epoch, intent.request_context.request_id.value(),
+                           "stop:execution-host.epoch.stop-contention:1", 1U, 10);
+  const auto projected =
+      ProjectStopAccepted(journal, epoch, acceptance, EmergencyStopProjectedIntentDTO(intent),
+                          StopAffectedState({}, inventory));
+  release_promise.set_value();
+  const auto admission_result = admission.get();
+  ASSERT_EQ(projected.projection_state, EmergencyStopProjectionStateDTO::kFailed);
+  ASSERT_TRUE(projected.error.has_value());
+  EXPECT_EQ(projected.error->code, "operation_journal_stop_projection_unavailable");
+  EXPECT_EQ(projected.error->details.at("retryable"), "true");
+  EXPECT_TRUE(admission_result.ok());
 }
 
 TEST(SqliteOperationJournalTest, RejectsNoncanonicalAffectedStateWithoutAppendingProjection) {
