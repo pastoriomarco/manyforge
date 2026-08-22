@@ -160,4 +160,22 @@ describe('Manager Apply completion observation', () => {
       500,
     ]);
   });
+
+  it('rejects with a pre-aborted signal reason before observing Apply', async () => {
+    const request = requestFixture();
+    const controller = new AbortController();
+    const reason = new Error('Apply observation cancelled before start');
+    controller.abort(reason);
+    const apply = vi.fn(async () => pendingResponse());
+    const sleep = vi.fn(async () => {});
+
+    await expect(
+      completeManagerApply(request, apply, {
+        signal: controller.signal,
+        sleep,
+      }),
+    ).rejects.toBe(reason);
+    expect(apply).not.toHaveBeenCalled();
+    expect(sleep).not.toHaveBeenCalled();
+  });
 });

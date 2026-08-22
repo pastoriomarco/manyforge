@@ -93,6 +93,7 @@ export async function completeManagerApply(
   };
   if (options.signal?.aborted) {
     externalAbort();
+    throw options.signal.reason;
   } else {
     options.signal?.addEventListener('abort', externalAbort, { once: true });
   }
