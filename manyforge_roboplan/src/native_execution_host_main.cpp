@@ -83,6 +83,9 @@
 #include <vector>
 
 #include "kernel_apply_fence_rpc_internal.hpp"
+#include <manyforge_core/ports/ikernel_cell_admission_port.hpp>
+#include <manyforge_component_manager/kernel_cell_admission_rpc_internal.hpp>
+#include "cell_admission_command_codec.hpp"
 #include "managed_kernel_apply_fence_owner.hpp"
 #include "native_projection_rpc_internal.hpp"
 #include "product_backed_runtime_participant_resolver.hpp"
@@ -499,7 +502,7 @@ void SendManagedRuntimePacket(const int fd, const std::string_view bytes) {
   Require(
       !bytes.empty() &&
           bytes.size() <=
-              component_manager::detail::kMaximumNativeProjectionRpcPacketBytes,
+              component_manager::detail::kMaximumManagedRuntimeRpcPacketBytes,
       "managed runtime response is empty or oversized");
   pollfd descriptor{fd, POLLOUT | POLLHUP, 0};
   int ready = -1;
@@ -518,27 +521,28 @@ void SendManagedRuntimePacket(const int fd, const std::string_view bytes) {
 
 [[nodiscard]] std::optional<std::string>
 ReceiveManagedRuntimePacket(const int fd) {
-  char probe = '\0';
+  std::array<char,
+             component_manager::detail::kMaximumManagedRuntimeRpcPacketBytes>
+      buffer{};
+  iovec vector{buffer.data(), buffer.size()};
+  msghdr message{};
+  message.msg_iov = &vector;
+  message.msg_iovlen = 1U;
   ssize_t size = -1;
   do {
-    size = ::recv(fd, &probe, 1U, MSG_PEEK | MSG_TRUNC);
+    size = ::recvmsg(fd, &message, 0);
   } while (size < 0 && errno == EINTR);
   if (size == 0) {
     return std::nullopt;
   }
-  Require(
-      size > 0 &&
-          static_cast<std::size_t>(size) <=
-              component_manager::detail::kMaximumNativeProjectionRpcPacketBytes,
-      "managed runtime request is absent or oversized");
-  std::string bytes(static_cast<std::size_t>(size), '\0');
-  ssize_t received = -1;
-  do {
-    received = ::recv(fd, bytes.data(), bytes.size(), 0);
-  } while (received < 0 && errno == EINTR);
-  Require(received == size,
-          "managed runtime request changed while being received");
-  return bytes;
+  Require(size > 0, "managed runtime request is absent");
+  if ((message.msg_flags & MSG_TRUNC) != 0) {
+    // Consume and reject a foreign oversized packet without terminating the
+    // sole managed child. The ordinary malformed-request path returns one
+    // bounded failure packet to the caller.
+    return std::string("oversized-managed-runtime-request");
+  }
+  return std::string(buffer.data(), static_cast<std::size_t>(size));
 }
 
 using ManagedProjectionKey = std::pair<core::CapabilityProviderBindingId,
@@ -4197,6 +4201,7 @@ void InstallDirectSceneFrameResolver(ManagedProjectionRegistry &projections,
 struct ExecutionCompositionAccess final {
   mutable std::shared_mutex mutex;
   Composition *current{};
+  core::ResourceAddressedExecutionKernel *addressed_kernel{};
 };
 
 struct ManagedExecutionSurfaceControl final {
@@ -5735,6 +5740,8 @@ RunManagedRuntimeChild(const ManagedRuntimeChildConfig &config) {
               std::unique_lock execution_lock(execution_composition.mutex);
               active_managed_composition = std::move(built);
               execution_composition.current = active_managed_composition.get();
+              execution_composition.addressed_kernel =
+                  active_managed_composition->runtime->addressed_kernel.get();
               current_composition_building = false;
             }
           } catch (...) {
@@ -6043,6 +6050,7 @@ RunManagedRuntimeChild(const ManagedRuntimeChildConfig &config) {
             active_managed_composition = std::move(prepared);
           }
           execution_composition.current = active_managed_composition.get();
+          execution_composition.addressed_kernel = stable_addressed_kernel();
           installed_under_fence_composition_request = request;
           preparing_composition_request.reset();
         });
@@ -6202,6 +6210,48 @@ RunManagedRuntimeChild(const ManagedRuntimeChildConfig &config) {
           config.manager_channel_fd,
           component_manager::detail::EncodeKernelApplyFenceRpcResponse(
               response));
+      continue;
+    }
+    if (component_manager::detail::IsKernelCellAdmissionRpcPacket(request)) {
+      component_manager::detail::KernelCellAdmissionRpcResponse response =
+          core::ErrorDTO{"cell_admission_request_failed",
+                         "cell-admission request was not dispatched",
+                         {}};
+      std::string response_command = "cell_admission_get";
+      try {
+        const auto decoded =
+            component_manager::detail::DecodeKernelCellAdmissionRpcRequest(
+                request);
+        response_command = decoded.command;
+        std::lock_guard lock(managed_composition_mutex);
+        auto *const owner = stable_addressed_kernel();
+        Require(owner != nullptr, "stable Kernel is not installed");
+        response = component_manager::detail::DispatchKernelCellAdmissionRpc(
+            *owner, decoded);
+      } catch (const std::exception &error) {
+        response =
+            core::ErrorDTO{"cell_admission_request_failed", error.what(), {}};
+      } catch (...) {
+        response = core::ErrorDTO{"cell_admission_request_failed",
+                                  "cell-admission request failed",
+                                  {}};
+      }
+      std::string encoded_response;
+      try {
+        encoded_response =
+            component_manager::detail::EncodeKernelCellAdmissionRpcResponse(
+                response_command, response);
+      } catch (...) {
+        encoded_response =
+            component_manager::detail::EncodeKernelCellAdmissionRpcResponse(
+                response_command,
+                core::ErrorDTO{
+                    "cell_admission_response_oversized",
+                    "cell-admission response exceeds the bounded private "
+                    "transport",
+                    {}});
+      }
+      SendManagedRuntimePacket(config.manager_channel_fd, encoded_response);
       continue;
     }
     component_manager::detail::NativeProjectionRpcResponse response;
@@ -7333,34 +7383,76 @@ private:
         count = ::recvmsg(client.get(), &message, 0);
       } while (count < 0 && errno == EINTR);
       CanonicalValue response;
+      std::optional<std::string> cell_admission_command;
       if (count <= 0 || (message.msg_flags & MSG_TRUNC) != 0) {
         response =
             ErrorResponse("execution_command_invalid",
                           "execution command packet is empty or oversized");
       } else {
         try {
-          const auto command = DecodeCommand(
-              std::string_view(buffer.data(), static_cast<std::size_t>(count)));
+          const auto bytes =
+              std::string_view(buffer.data(), static_cast<std::size_t>(count));
+          for (const auto candidate :
+               {"cell_admission_get", "cell_admission_update_readiness",
+                "cell_admission_acquire", "cell_admission_release",
+                "cell_admission_reconcile"}) {
+            if (bytes.find(std::string("\"command\":\"") + candidate + "\"") !=
+                std::string_view::npos) {
+              cell_admission_command = candidate;
+              break;
+            }
+          }
+          const auto cell_admission =
+              detail::TryDecodeCellAdmissionCommand(bytes);
           std::shared_lock composition_lock(composition_access_.mutex);
-          if (composition_access_.current == nullptr) {
+          if (composition_access_.current == nullptr &&
+              !cell_admission.has_value()) {
             response = ErrorResponse(
                 "execution_owner_not_ready",
                 "the managed execution owner has no active physical product",
                 {{"owner_epoch", owner_epoch_.value()}});
+          } else if (cell_admission.has_value() && stop_only) {
+            response = detail::CellAdmissionResponseValue(
+                cell_admission->command,
+                core::ErrorDTO{
+                    "execution_control_command_unsupported",
+                    "the independent Stop control socket accepts only Stop",
+                    {}});
+          } else if (cell_admission.has_value()) {
+            auto *const owner = composition_access_.addressed_kernel;
+            Require(owner != nullptr,
+                    "stable addressed execution Kernel is not installed");
+            response = detail::CellAdmissionResponseValue(
+                cell_admission->command,
+                component_manager::detail::DispatchKernelCellAdmissionRpc(
+                    *owner, *cell_admission));
           } else {
+            const auto command = DecodeCommand(bytes);
             response = stop_only
                            ? ExecuteStop(command, *composition_access_.current)
                            : Execute(command, *composition_access_.current);
           }
         } catch (const std::exception &error) {
-          response = ErrorResponse("execution_command_invalid", error.what());
+          response = cell_admission_command.has_value()
+                         ? detail::CellAdmissionResponseValue(
+                               *cell_admission_command,
+                               core::ErrorDTO{"execution_command_invalid",
+                                              error.what(), {}})
+                         : ErrorResponse("execution_command_invalid",
+                                         error.what());
         }
       }
       auto bytes = content_identity::canonical_json(response);
       if (bytes.empty() || bytes.size() > kMaximumResponseBytes) {
-        bytes = content_identity::canonical_json(ErrorResponse(
+        const core::ErrorDTO error{
             "execution_command_response_oversized",
-            "execution owner result exceeds the bounded private transport"));
+            "execution owner result exceeds the bounded private transport",
+            {}};
+        bytes = content_identity::canonical_json(
+            cell_admission_command.has_value()
+                ? detail::CellAdmissionResponseValue(*cell_admission_command,
+                                                     error)
+                : ErrorResponse(error.code, error.message));
       }
       pollfd outbound{client.get(), POLLOUT, 0};
       int response_ready = -1;
@@ -7448,6 +7540,8 @@ public:
     AttachRetainedNativeCCLC(*composition_, config_, owner_epoch_,
                              *fence_owner_);
     composition_access_.current = composition_.get();
+    composition_access_.addressed_kernel =
+        composition_->runtime->addressed_kernel.get();
     command_surface_ = std::make_unique<ExecutionCommandSurface>(
         config_.execution_state_root, composition_access_, owner_epoch_);
   }

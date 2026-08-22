@@ -1,6 +1,7 @@
 #include "manyforge_component_manager/retained_native_runtime_unit_adapter.hpp"
 
 #include "kernel_apply_fence_rpc_internal.hpp"
+#include "manyforge_component_manager/kernel_cell_admission_rpc_internal.hpp"
 #include "native_projection_rpc_internal.hpp"
 #include "selected_runtime_composition_rpc_internal.hpp"
 
@@ -61,7 +62,9 @@ constexpr int kChildExecErrorFd = 4;
 constexpr int kChildExecutableFd = 5;
 constexpr int kChildPackageRootFd = 6;
 constexpr std::size_t kMaximumControlPacketBytes =
-    detail::kMaximumNativeProjectionRpcPacketBytes;
+    detail::kMaximumManagedRuntimeRpcPacketBytes;
+static_assert(detail::kMaximumNativeProjectionRpcPacketBytes <=
+              kMaximumControlPacketBytes);
 constexpr auto kExecTimeout = std::chrono::seconds(10);
 constexpr auto kReadyTimeout = std::chrono::seconds(10);
 constexpr auto kStatusTimeout = std::chrono::milliseconds(750);
@@ -329,10 +332,14 @@ ReceivePacket(const int fd, const std::chrono::milliseconds timeout) {
   if (!WaitForEvent(fd, POLLIN, timeout)) {
     return std::nullopt;
   }
-  char probe = '\0';
+  std::string bytes(kMaximumControlPacketBytes, '\0');
+  iovec vector{bytes.data(), bytes.size()};
+  msghdr message{};
+  message.msg_iov = &vector;
+  message.msg_iovlen = 1U;
   ssize_t count = -1;
   do {
-    count = ::recv(fd, &probe, 1U, MSG_PEEK | MSG_TRUNC);
+    count = ::recvmsg(fd, &message, 0);
   } while (count < 0 && errno == EINTR);
   if (count < 0) {
     Fail(ErrnoDetail("native runtime control read failed", errno));
@@ -340,20 +347,10 @@ ReceivePacket(const int fd, const std::chrono::milliseconds timeout) {
   if (count == 0) {
     Fail("native runtime child closed its private channel");
   }
-  if (static_cast<std::size_t>(count) > kMaximumControlPacketBytes) {
+  if ((message.msg_flags & MSG_TRUNC) != 0) {
     Fail("native runtime control response exceeds its byte bound");
   }
-  std::string bytes(static_cast<std::size_t>(count), '\0');
-  ssize_t received = -1;
-  do {
-    received = ::recv(fd, bytes.data(), bytes.size(), 0);
-  } while (received < 0 && errno == EINTR);
-  if (received != count) {
-    if (received < 0) {
-      Fail(ErrnoDetail("native runtime control read failed", errno));
-    }
-    Fail("native runtime control response changed while being received");
-  }
+  bytes.resize(static_cast<std::size_t>(count));
   return bytes;
 }
 
@@ -943,6 +940,44 @@ struct RetainedNativeRuntimeUnitAdapter::Impl final
       Fail("managed Kernel child returned the wrong fence response kind");
     }
     return *typed;
+  }
+
+  template <typename Response>
+  [[nodiscard]] manyforge::core::Result<Response>
+  KernelCellAdmissionCall(
+      const detail::KernelCellAdmissionRpcPacket &request) {
+    std::lock_guard lock(mutex);
+    if (children.size() != 1U) {
+      Fail("cell-admission request requires the sole managed native execution "
+           "child");
+    }
+    auto found = children.begin();
+    if (!ChildIsLive(found->second)) {
+      children.erase(found);
+      Fail("managed Kernel child exited before its cell-admission response");
+    }
+    const auto encoded = detail::EncodeKernelCellAdmissionRpcRequest(request);
+    SendPacket(found->second.channel.get(), encoded, kStatusTimeout);
+    const auto packet =
+        ReceivePacket(found->second.channel.get(), kStatusTimeout);
+    if (!packet.has_value()) {
+      Fail("managed Kernel cell-admission response timed out");
+    }
+    const auto response =
+        detail::DecodeKernelCellAdmissionRpcResponse(*packet);
+    if (response.command != request.command) {
+      Fail("managed Kernel child returned a foreign cell-admission command");
+    }
+    if (const auto *error =
+            std::get_if<manyforge::core::ErrorDTO>(&response.response)) {
+      return manyforge::core::Result<Response>::Err(*error);
+    }
+    const auto *typed = std::get_if<Response>(&response.response);
+    if (typed == nullptr) {
+      Fail("managed Kernel child returned the wrong cell-admission response "
+           "kind");
+    }
+    return manyforge::core::Result<Response>::Ok(*typed);
   }
 
   [[nodiscard]] ManagerSelectedRuntimeCompositionResultDTO
@@ -1622,6 +1657,50 @@ RetainedNativeRuntimeUnitAdapter::Release(
     const manyforge::core::ConfigurationFenceReleaseDTO &request) {
   return impl_->KernelFenceCall<manyforge::core::ConfigurationFenceReleasedDTO>(
       request);
+}
+
+manyforge::core::AuthoringAdmissionDTO
+RetainedNativeRuntimeUnitAdapter::GetAuthoringAdmission() const {
+  auto result = impl_->KernelCellAdmissionCall<
+      manyforge::core::AuthoringAdmissionDTO>(
+      {"cell_admission_get", std::monostate{}});
+  if (!result.ok()) {
+    Fail("managed Kernel cell-admission get failed [" + result.error().code +
+         "]: " + result.error().message);
+  }
+  return result.value();
+}
+
+manyforge::core::Result<manyforge::core::AuthoringAdmissionDTO>
+RetainedNativeRuntimeUnitAdapter::UpdateCellAdmissionReadiness(
+    const manyforge::core::CellAdmissionReadinessSnapshotDTO &snapshot) {
+  return impl_->KernelCellAdmissionCall<
+      manyforge::core::AuthoringAdmissionDTO>(
+      {"cell_admission_update_readiness", snapshot});
+}
+
+manyforge::core::Result<manyforge::core::CellAdmissionClaimDTO>
+RetainedNativeRuntimeUnitAdapter::AcquireCellAdmissionClaim(
+    const manyforge::core::CellAdmissionClaimIntentDTO &intent) {
+  return impl_->KernelCellAdmissionCall<
+      manyforge::core::CellAdmissionClaimDTO>(
+      {"cell_admission_acquire", intent});
+}
+
+manyforge::core::Result<manyforge::core::AuthoringAdmissionDTO>
+RetainedNativeRuntimeUnitAdapter::ReleaseCellAdmissionClaim(
+    const manyforge::core::CellAdmissionClaimReleaseDTO &release) {
+  return impl_->KernelCellAdmissionCall<
+      manyforge::core::AuthoringAdmissionDTO>(
+      {"cell_admission_release", release});
+}
+
+manyforge::core::Result<manyforge::core::AuthoringAdmissionDTO>
+RetainedNativeRuntimeUnitAdapter::ReconcileCellAdmissionClaims(
+    const manyforge::core::CellAdmissionReconcileDTO &reconcile) {
+  return impl_->KernelCellAdmissionCall<
+      manyforge::core::AuthoringAdmissionDTO>(
+      {"cell_admission_reconcile", reconcile});
 }
 
 manyforge::core::Result<

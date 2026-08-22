@@ -465,6 +465,21 @@ WaitForRegularFile(const std::filesystem::path &path,
   return false;
 }
 
+[[nodiscard]] std::optional<core::AuthoringAdmissionDTO>
+WaitForAuthoringAdmission(
+    component_manager::RetainedNativeRuntimeUnitAdapter &adapter,
+    const std::chrono::steady_clock::duration timeout) {
+  const auto deadline = std::chrono::steady_clock::now() + timeout;
+  while (std::chrono::steady_clock::now() < deadline) {
+    try {
+      return adapter.GetAuthoringAdmission();
+    } catch (const component_manager::RetainedNativeRuntimeUnitAdapterError &) {
+      std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+  }
+  return std::nullopt;
+}
+
 TEST(NativeExecutionRuntimeUnitAdmission,
      SelectsOnlyTheBuildOwnedInstalledTargetAndFixedArguments) {
   NativeFixture fixture;
@@ -1027,6 +1042,57 @@ TEST(RetainedNativeRuntimeUnitAdapter,
                              std::string(core::kOperationJournalFilename),
                          std::chrono::seconds(10)))
       << "the managed child did not compose the active physical product";
+  const auto observed_authoring_admission =
+      WaitForAuthoringAdmission(adapter, std::chrono::seconds(10));
+  ASSERT_TRUE(observed_authoring_admission.has_value());
+  const auto authoring_admission = *observed_authoring_admission;
+  EXPECT_GT(authoring_admission.admission_generation.value(), 0U);
+  EXPECT_EQ(adapter.GetAuthoringAdmission(), authoring_admission);
+  const core::CellAdmissionReadinessSnapshotDTO readiness{
+      true,
+      core::ProgramCycleStatusDTO{
+          core::RequestOwnerEpoch("adapter-program-runner"), 1U,
+          core::ProgramCycleStateDTO::kIdleAfterReset, std::nullopt,
+          std::nullopt, std::nullopt},
+      true, true, true, 2U, 2U, true, true, 0U, 0U, 0U};
+  const auto updated = adapter.UpdateCellAdmissionReadiness(readiness);
+  ASSERT_TRUE(updated.ok()) << updated.error().message;
+  const core::CellAdmissionClaimIntentDTO claim_intent{
+      core::CellAdmissionClaimKindDTO::kAuthoringMutation,
+      core::CellAdmissionOwnerRoleDTO::kAuthoringOwner,
+      core::RequestOwnerEpoch("adapter-authoring-owner"),
+      "adapter-authoring-transaction",
+      core::RequestId("adapter-authoring-request"),
+      core::ContentDigest(std::string(kIntentDigest)),
+      updated.value().admission_generation,
+      {},
+      std::nullopt,
+      std::nullopt};
+  const auto claimed = adapter.AcquireCellAdmissionClaim(claim_intent);
+  ASSERT_TRUE(claimed.ok()) << claimed.error().message;
+  const auto replayed = adapter.AcquireCellAdmissionClaim(claim_intent);
+  ASSERT_TRUE(replayed.ok()) << replayed.error().message;
+  EXPECT_EQ(replayed.value(), claimed.value());
+  auto stale_intent = claim_intent;
+  stale_intent.request_id = core::RequestId("adapter-authoring-stale");
+  const auto stale = adapter.AcquireCellAdmissionClaim(stale_intent);
+  ASSERT_FALSE(stale.ok());
+  EXPECT_EQ(stale.error().code, "stale_generation");
+  EXPECT_FALSE(stale.error().details.empty());
+  const auto released_claim = adapter.ReleaseCellAdmissionClaim(
+      {claim_intent.owner_role,
+       claim_intent.owner_epoch,
+       claim_intent.owner_transaction_id,
+       claim_intent.request_id,
+       claim_intent.request_payload_digest,
+       claimed.value().acquired_admission_generation,
+       claimed.value().claim_generation,
+       {core::CellAdmissionSettlementKindDTO::kOwnerCommit,
+        core::ContentDigest(std::string(kIntentDigest))}});
+  ASSERT_FALSE(released_claim.ok());
+  EXPECT_EQ(released_claim.error().code, "authoring_not_ready");
+  EXPECT_EQ(released_claim.error().details.at("reason"),
+            "settlement_validator_unavailable");
 
   const auto physical_scope = PhysicalConfigurationScope(fixture);
   const core::RuntimeEpoch manager_epoch(

@@ -377,6 +377,13 @@ target_link_libraries(manyforge_roboplan_managed_kernel_apply_fence
     manyforge::persistence
     SQLite::SQLite3)
 
+add_library(manyforge_roboplan_cell_admission_command_codec
+  src/cell_admission_command_codec.cpp)
+target_include_directories(manyforge_roboplan_cell_admission_command_codec
+  PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/src)
+target_link_libraries(manyforge_roboplan_cell_admission_command_codec
+  PUBLIC manyforge_component_manager manyforge::content_identity)
+
 # Selected composition root for the first complete addressed native path.
 # Its same-user Unix socket is a bounded private transport consumed by the
 # headless API; it is not a second public execution contract.
@@ -389,6 +396,7 @@ target_compile_definitions(manyforge_native_execution_host PRIVATE
   COAL_DISABLE_HPP_FCL_WARNINGS)
 target_link_libraries(manyforge_native_execution_host PRIVATE
   manyforge_roboplan_managed_kernel_apply_fence
+  manyforge_roboplan_cell_admission_command_codec
   manyforge_roboplan_native_cclc_runtime
   manyforge_roboplan_native_runtime
   manyforge_roboplan_process_candidate_client
@@ -419,6 +427,7 @@ if(MANYFORGE_BUILD_ROS2_CONTROL_RUNTIME)
     MANYFORGE_ROS2_CONTROL_EXECUTION_HOST=1)
   target_link_libraries(manyforge_ros2_control_execution_host PRIVATE
     manyforge_roboplan_managed_kernel_apply_fence
+    manyforge_roboplan_cell_admission_command_codec
     manyforge_roboplan_native_cclc_runtime
     manyforge_roboplan_ros2_control_runtime
     manyforge_roboplan_process_candidate_client
@@ -481,6 +490,7 @@ if(BUILD_TESTING)
     target_link_libraries(
       manyforge_native_execution_host_pick_place_fixture PRIVATE
       manyforge_roboplan_managed_kernel_apply_fence
+      manyforge_roboplan_cell_admission_command_codec
       manyforge_roboplan_native_cclc_runtime
       manyforge_roboplan_native_runtime
       manyforge_roboplan_process_candidate_client
@@ -506,6 +516,11 @@ if(BUILD_TESTING)
       test/test_native_runtime_support.cpp)
     target_link_libraries(test_native_runtime_support PRIVATE
       manyforge_roboplan_native_runtime_support GTest::gtest_main)
+
+    add_executable(test_cell_admission_command_codec
+      test/test_cell_admission_command_codec.cpp)
+    target_link_libraries(test_cell_admission_command_codec PRIVATE
+      manyforge_roboplan_cell_admission_command_codec GTest::gtest_main)
 
     # Bounded qualification-only evidence capture. It is deliberately not a
     # production target and supplies no planner, factory, scene, execution, or
@@ -1452,6 +1467,10 @@ if(BUILD_TESTING)
     # CTest execution. Register every RoboPlan GTest with the exact library
     # closure derived above instead of relying on inherited process state.
     gtest_discover_tests(test_native_runtime_support
+      PROPERTIES
+        ENVIRONMENT "LD_LIBRARY_PATH=${_LIB_PATHS}"
+        TIMEOUT ${MANYFORGE_GTEST_TIMEOUT_SECONDS})
+    gtest_discover_tests(test_cell_admission_command_codec
       PROPERTIES
         ENVIRONMENT "LD_LIBRARY_PATH=${_LIB_PATHS}"
         TIMEOUT ${MANYFORGE_GTEST_TIMEOUT_SECONDS})

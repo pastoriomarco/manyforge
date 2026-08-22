@@ -2040,6 +2040,63 @@ def test_first_complete_addressed_native_motion_path(tmp_path: Path) -> None:
         raw_api.close()
 
 
+def test_cell_admission_crosses_real_execution_seqpacket_surface(
+    tmp_path: Path,
+) -> None:
+    built_fixture = _required_path("MANYFORGE_I6_NATIVE_FIXTURE_ROOT")
+    fixture_root = tmp_path / "fixture"
+    shutil.copytree(built_fixture, fixture_root)
+    manifest = json.loads((fixture_root / "manifest.json").read_text("utf-8"))
+    execution_root = tmp_path / "execution"
+    staging_root = tmp_path / "staging"
+    execution_root.mkdir()
+    staging_root.mkdir()
+    process = _start_host(fixture_root, execution_root, staging_root, manifest)
+    client = ExecutionCommandClient(execution_root, timeout_seconds=5.0)
+    try:
+        get = {
+            "api_version": "manyforge.execution_command.v1",
+            "command": "cell_admission_get",
+        }
+        first = client._exchange(get)
+        replay = client._exchange(get)
+        assert replay == first
+        assert set(first) == {
+            "api_version",
+            "authoring_admission",
+            "command",
+            "ok",
+        }
+        assert first["command"] == "cell_admission_get"
+
+        malformed = client._exchange(
+            {
+                **get,
+                "unexpected": True,
+            }
+        )
+        assert malformed["ok"] is False
+        assert malformed["error"]["code"] == "execution_command_invalid"
+        assert process.poll() is None
+
+        stop_only = client._exchange_on(
+            get, execution_root / "execution-control.sock"
+        )
+        assert stop_only == {
+            "api_version": "manyforge.execution_command_response.v1",
+            "command": "cell_admission_get",
+            "error": {
+                "code": "execution_control_command_unsupported",
+                "details": {},
+                "message": "the independent Stop control socket accepts only Stop",
+            },
+            "ok": False,
+        }
+        assert process.poll() is None
+    finally:
+        _stop_host(process)
+
+
 def test_addressed_native_benchmark_preserves_historical_measurements(
     tmp_path: Path,
 ) -> None:

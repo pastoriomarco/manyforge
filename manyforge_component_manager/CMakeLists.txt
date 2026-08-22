@@ -195,6 +195,7 @@ add_library(manyforge_component_manager
   src/canonical_empty_bootstrap_coordinator.cpp
   src/durable_store_set.cpp
   src/kernel_apply_fence_rpc_internal.cpp
+  src/kernel_cell_admission_rpc_internal.cpp
   src/manager_apply_fence_coordinator.cpp
   src/manager_apply_fence_release_coordinator.cpp
   src/manager_apply_journal.cpp

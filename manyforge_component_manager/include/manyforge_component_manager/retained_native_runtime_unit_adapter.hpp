@@ -4,6 +4,7 @@
 #include <manyforge_component_manager/runtime_convergence.hpp>
 #include <manyforge_component_manager/selected_runtime_composition.hpp>
 #include <manyforge_core/ports/imanager_kernel_apply_fence_port.hpp>
+#include <manyforge_core/ports/ikernel_cell_admission_port.hpp>
 #include <manyforge_core/ports/iplanner_scene_projection.hpp>
 #include <memory>
 #include <stdexcept>
@@ -34,6 +35,7 @@ class RetainedNativeRuntimeUnitAdapter final
     : public IRuntimeUnitProcessPort,
       public IRuntimeUnitProgressPort,
       public manyforge::core::IManagerKernelApplyFencePort,
+      public manyforge::core::IKernelCellAdmissionPort,
       public manyforge::core::IPlannerSceneProjectionResolver,
       public IManagerSelectedRuntimeCompositionPort {
 public:
@@ -93,6 +95,22 @@ public:
       const override;
   [[nodiscard]] manyforge::core::ConfigurationFenceReleasedDTO Release(
       const manyforge::core::ConfigurationFenceReleaseDTO &request) override;
+  [[nodiscard]] manyforge::core::AuthoringAdmissionDTO
+  GetAuthoringAdmission() const override;
+  [[nodiscard]] manyforge::core::Result<manyforge::core::AuthoringAdmissionDTO>
+  UpdateCellAdmissionReadiness(
+      const manyforge::core::CellAdmissionReadinessSnapshotDTO &snapshot)
+      override;
+  [[nodiscard]]
+  manyforge::core::Result<manyforge::core::CellAdmissionClaimDTO>
+  AcquireCellAdmissionClaim(
+      const manyforge::core::CellAdmissionClaimIntentDTO &intent) override;
+  [[nodiscard]] manyforge::core::Result<manyforge::core::AuthoringAdmissionDTO>
+  ReleaseCellAdmissionClaim(
+      const manyforge::core::CellAdmissionClaimReleaseDTO &release) override;
+  [[nodiscard]] manyforge::core::Result<manyforge::core::AuthoringAdmissionDTO>
+  ReconcileCellAdmissionClaims(
+      const manyforge::core::CellAdmissionReconcileDTO &reconcile) override;
   [[nodiscard]] manyforge::core::Result<
       std::shared_ptr<manyforge::core::IPlannerSceneProjection>>
   ResolveProjection(const manyforge::core::ProjectionNativeRuntimeBindingDTO
