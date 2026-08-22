@@ -10,7 +10,9 @@
 
 namespace manyforge::core {
 
-using ManagerLossLocalSafeCallback = std::function<ContentDigest()>;
+using ManagerLossLocalSafeCallback =
+    std::function<ContentDigest(const ManagerLivenessLossIntentDTO&)>;
+using LegacyManagerLossLocalSafeCallback = std::function<ContentDigest()>;
 
 struct ManagerLivenessReceiverConfig final {
   CellId cell_id;
@@ -41,6 +43,11 @@ class ManagerLivenessReceiver final : public IManagerHeartbeatSink {
   ManagerLivenessReceiver(ManagerLivenessReceiverConfig config, IClock& clock,
                           IScheduler& scheduler,
                           ManagerLossLocalSafeCallback local_safe_callback,
+                          IManagerLivenessFailSafePort& fail_safe_port,
+                          IManagerLivenessObservationPort& observation_port);
+  ManagerLivenessReceiver(ManagerLivenessReceiverConfig config, IClock& clock,
+                          IScheduler& scheduler,
+                          LegacyManagerLossLocalSafeCallback local_safe_callback,
                           IManagerLivenessFailSafePort& fail_safe_port,
                           IManagerLivenessObservationPort& observation_port);
   ~ManagerLivenessReceiver();

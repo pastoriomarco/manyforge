@@ -29,6 +29,7 @@
 #include <manyforge_component_manager/durable_store_set.hpp>
 #include <manyforge_content_identity/content_identity.hpp>
 #include <manyforge_core/logical_scene_identity.hpp>
+#include <manyforge_core/manager_liveness_receiver.hpp>
 #include <manyforge_core/pick_place_planning_owner.hpp>
 #include <manyforge_core/runtime_participant_binding.hpp>
 #include <manyforge_core/types/native_projection_capability.hpp>
@@ -87,6 +88,7 @@
 #include <manyforge_component_manager/kernel_cell_admission_rpc_internal.hpp>
 #include "cell_admission_command_codec.hpp"
 #include "managed_kernel_apply_fence_owner.hpp"
+#include "manager_liveness_rpc_internal.hpp"
 #include "native_projection_rpc_internal.hpp"
 #include "product_backed_runtime_participant_resolver.hpp"
 #include "selected_runtime_composition_rpc_internal.hpp"
@@ -4208,6 +4210,8 @@ struct ExecutionCompositionAccess final {
 struct ManagedExecutionSurfaceControl final {
   std::filesystem::path state_root;
   ExecutionCompositionAccess *composition_access{};
+  component_manager::detail::ManagerLivenessCommandAdmission
+      *manager_liveness_admission{};
   core::RequestOwnerEpoch owner_epoch;
   std::mutex state_mutex;
   std::condition_variable state_changed;
@@ -4217,9 +4221,12 @@ struct ManagedExecutionSurfaceControl final {
   ManagedExecutionSurfaceControl(
       std::filesystem::path selected_state_root,
       ExecutionCompositionAccess *selected_composition_access,
+      component_manager::detail::ManagerLivenessCommandAdmission
+          *selected_manager_liveness_admission,
       core::RequestOwnerEpoch selected_owner_epoch)
       : state_root(std::move(selected_state_root)),
         composition_access(selected_composition_access),
+        manager_liveness_admission(selected_manager_liveness_admission),
         owner_epoch(std::move(selected_owner_epoch)) {}
 };
 
@@ -5615,9 +5622,19 @@ RunManagedRuntimeChild(const ManagedRuntimeChildConfig &config) {
   std::unique_ptr<core::SqliteOperationJournal> detached_operation_journal;
   std::unique_ptr<core::ResourceAddressedExecutionKernel>
       detached_addressed_kernel;
+  component_manager::detail::ManagerLivenessCommandAdmission
+      manager_liveness_admission;
+  component_manager::detail::ChildOwnedManagerLivenessReceiver
+      manager_liveness_receiver(
+          std::make_shared<WallClock>(),
+          std::make_unique<SimpleScheduler>(
+              SimpleSchedulerConfig::from_environment()));
+  std::optional<core::ManagerLivenessReceiverConfig>
+      manager_liveness_receiver_config;
+  std::set<std::pair<std::string, std::string>> retired_manager_epochs;
   ExecutionCompositionAccess execution_composition;
   ManagedExecutionSurfaceControl execution_surface_control(
-      config.staging_root, &execution_composition,
+      config.staging_root, &execution_composition, &manager_liveness_admission,
       core::RequestOwnerEpoch("kernel-owner-" + config.runtime_epoch));
   std::jthread execution_surface([&](const std::stop_token stop_token) {
     RunManagedExecutionCommandSurface(execution_surface_control, stop_token);
@@ -5661,10 +5678,32 @@ RunManagedRuntimeChild(const ManagedRuntimeChildConfig &config) {
     return nullptr;
   };
 
+  const auto stable_runtime = [&]() -> RetainedNativeRuntime* {
+    if (active_managed_composition != nullptr) {
+      return active_managed_composition->runtime.get();
+    }
+    return nullptr;
+  };
+
   const auto bind_disable_handoff_owner = [&] {
     auto *const owner = stable_addressed_kernel();
     if (owner != nullptr) {
       fence_owner.BindDisableHandoffKernel(*owner);
+    }
+  };
+
+  const auto await_manager_loss_containment = [&] {
+    if (manager_liveness_receiver.get() == nullptr) {
+      return;
+    }
+    while (g_stop_requested == 0 &&
+           manager_liveness_receiver.get()->status().state !=
+               core::ManagerLivenessStateDTO::kExpired) {
+      int waited = -1;
+      do {
+        waited = ::poll(nullptr, 0U, 25);
+      } while (waited < 0 && errno == EINTR && g_stop_requested == 0);
+      Require(waited >= 0, "Manager-loss containment wait failed");
     }
   };
 
@@ -6095,6 +6134,7 @@ RunManagedRuntimeChild(const ManagedRuntimeChildConfig &config) {
     }
     if ((descriptor.revents & POLLHUP) != 0 &&
         (descriptor.revents & POLLIN) == 0) {
+      await_manager_loss_containment();
       return 0;
     }
     Require((descriptor.revents & (POLLERR | POLLNVAL)) == 0,
@@ -6104,6 +6144,7 @@ RunManagedRuntimeChild(const ManagedRuntimeChildConfig &config) {
     }
     const auto packet = ReceiveManagedRuntimePacket(config.manager_channel_fd);
     if (!packet.has_value()) {
+      await_manager_loss_containment();
       return 0;
     }
     const std::string_view request(*packet);
@@ -6130,6 +6171,157 @@ RunManagedRuntimeChild(const ManagedRuntimeChildConfig &config) {
     if (request == "shutdown") {
       SendManagedRuntimePacket(config.manager_channel_fd, "shutdown-accepted");
       return 0;
+    }
+    if (component_manager::detail::IsManagerLivenessRpcPacket(request)) {
+      const auto decoded =
+          component_manager::detail::DecodeManagerLivenessRpcRequest(request);
+      const auto required = std::find_if(
+          decoded.required_set.required_receivers.begin(),
+          decoded.required_set.required_receivers.end(),
+          [&](const auto& row) {
+            return row.runtime_unit_id.value() == config.runtime_unit_id;
+          });
+      Require(required != decoded.required_set.required_receivers.end() &&
+                  decoded.receiver_runtime_unit_id == required->runtime_unit_id &&
+                  required->runtime_epoch.value() == config.runtime_epoch,
+              "Manager liveness request names a foreign receiver");
+      Require(decoded.policy ==
+                  deployment::native_execution_runtime_contract::
+                      manager_liveness_policy() &&
+                  required->runtime_policy_id ==
+                      decoded.policy.runtime_policy_id &&
+                  required->runtime_policy_revision ==
+                      decoded.policy.runtime_policy_revision,
+              "Manager liveness request differs from retained policy");
+      std::lock_guard lock(managed_composition_mutex);
+      auto* const runtime = stable_runtime();
+      auto* const kernel = stable_addressed_kernel();
+      if (runtime == nullptr || runtime->clock == nullptr ||
+          runtime->scheduler == nullptr || kernel == nullptr) {
+        const core::ManagerLivenessStatusDTO pending_status{
+            decoded.required_set.cell_id,
+            required->runtime_unit_id,
+            required->runtime_epoch,
+            decoded.required_set.manager_runtime_unit_id,
+            decoded.required_set.manager_runtime_epoch,
+            decoded.required_set.manager_owner_epoch,
+            decoded.policy.runtime_policy_id,
+            decoded.policy.runtime_policy_revision,
+            0U,
+            1U,
+            0,
+            core::ManagerLivenessStateDTO::kUnreconciled,
+            true,
+            std::nullopt};
+        SendManagedRuntimePacket(
+            config.manager_channel_fd,
+            component_manager::detail::EncodeManagerLivenessRpcResponse(
+                core::ManagerLivenessObservationDTO{
+                    pending_status,
+                    decoded.required_set.active_bundle_id,
+                    decoded.required_set.required_runtime_set_digest,
+                    core::ComputeManagerLivenessStatusDigest(
+                        pending_status)}));
+        continue;
+      }
+      Require(active_managed_composition->bundle->retained_bundle_id() ==
+                  decoded.required_set.active_bundle_id,
+              "Manager liveness request differs from active native bundle");
+      const core::ManagerLivenessReceiverConfig receiver_config{
+          decoded.required_set.cell_id,
+          required->runtime_unit_id,
+          required->runtime_epoch,
+          decoded.required_set.manager_runtime_unit_id,
+          decoded.required_set.manager_runtime_epoch,
+          decoded.required_set.manager_owner_epoch,
+          decoded.policy,
+          decoded.required_set.active_bundle_id,
+          decoded.required_set.required_runtime_set_digest};
+      if (manager_liveness_receiver.get() == nullptr) {
+        const auto installed =
+            kernel->ReplaceManagerLivenessRequiredSet(decoded.required_set);
+        Require(installed.ok(),
+                "Kernel rejected the exact Manager-liveness required set");
+        manager_liveness_receiver.Install(
+            receiver_config,
+            [&manager_liveness_admission](
+                const core::ManagerLivenessLossIntentDTO& intent) {
+              return manager_liveness_admission.CloseAndAttest(intent);
+            },
+            *kernel, *kernel);
+        manager_liveness_receiver_config = receiver_config;
+      } else {
+        Require(manager_liveness_receiver_config.has_value() &&
+                    manager_liveness_receiver_config->cell_id ==
+                        receiver_config.cell_id &&
+                    manager_liveness_receiver_config
+                            ->receiver_runtime_unit_id ==
+                        receiver_config.receiver_runtime_unit_id &&
+                    manager_liveness_receiver_config->receiver_runtime_epoch ==
+                        receiver_config.receiver_runtime_epoch &&
+                    manager_liveness_receiver_config->policy ==
+                        receiver_config.policy &&
+                    manager_liveness_receiver_config->active_bundle_id ==
+                        receiver_config.active_bundle_id &&
+                    manager_liveness_receiver_config
+                            ->required_runtime_set_digest ==
+                        receiver_config.required_runtime_set_digest,
+                "Manager liveness request changed immutable receiver evidence");
+        if (manager_liveness_receiver_config->manager_runtime_epoch !=
+                receiver_config.manager_runtime_epoch ||
+            manager_liveness_receiver_config->manager_owner_epoch !=
+                receiver_config.manager_owner_epoch) {
+          const auto candidate_epoch = std::pair{
+              receiver_config.manager_runtime_epoch.value(),
+              receiver_config.manager_owner_epoch.value()};
+          Require(!retired_manager_epochs.contains(candidate_epoch),
+                  "stale Manager epoch cannot replace the current Manager");
+          Require(retired_manager_epochs.size() < 64U,
+                  "Manager epoch replacement history is exhausted");
+          retired_manager_epochs.emplace(
+              manager_liveness_receiver_config->manager_runtime_epoch.value(),
+              manager_liveness_receiver_config->manager_owner_epoch.value());
+          const auto replaced =
+              manager_liveness_receiver.get()->BeginManagerEpochReplacement(
+                  receiver_config.manager_runtime_unit_id,
+                  receiver_config.manager_runtime_epoch,
+                  receiver_config.manager_owner_epoch);
+          Require(replaced.ok(),
+                  "Manager liveness epoch replacement was rejected");
+          manager_liveness_receiver_config->manager_runtime_unit_id =
+              receiver_config.manager_runtime_unit_id;
+          manager_liveness_receiver_config->manager_runtime_epoch =
+              receiver_config.manager_runtime_epoch;
+          manager_liveness_receiver_config->manager_owner_epoch =
+              receiver_config.manager_owner_epoch;
+        }
+      }
+      const auto admission_generation = manager_liveness_admission.generation();
+      const auto renewed =
+          manager_liveness_receiver.get()->Renew(decoded.heartbeat);
+      Require(renewed.ok(), "Manager heartbeat renewal was rejected");
+      if (decoded.reconciliation.has_value() &&
+          manager_liveness_receiver.get()->status().command_fenced) {
+        const auto reconciled = manager_liveness_receiver.get()
+                                    ->CompleteReconciliation(
+                                        *decoded.reconciliation);
+        Require(reconciled.ok(),
+                "Manager liveness reconciliation was rejected");
+      }
+      const auto status = manager_liveness_receiver.get()->status();
+      if (status.state == core::ManagerLivenessStateDTO::kCurrent &&
+          !status.command_fenced) {
+        manager_liveness_admission.OpenIfUnchanged(admission_generation);
+      }
+      const core::ManagerLivenessObservationDTO observation{
+          status, decoded.required_set.active_bundle_id,
+          decoded.required_set.required_runtime_set_digest,
+          core::ComputeManagerLivenessStatusDigest(status)};
+      SendManagedRuntimePacket(
+          config.manager_channel_fd,
+          component_manager::detail::EncodeManagerLivenessRpcResponse(
+              observation));
+      continue;
     }
     if (component_manager::detail::IsSelectedRuntimeCompositionRpcPacket(
             request)) {
@@ -6279,13 +6471,18 @@ class ExecutionCommandSurface final {
 public:
   ExecutionCommandSurface(std::filesystem::path state_root,
                           ExecutionCompositionAccess &composition_access,
+                          component_manager::detail::
+                              ManagerLivenessCommandAdmission&
+                                  manager_liveness_admission,
                           core::RequestOwnerEpoch owner_epoch)
       : owner_epoch_(std::move(owner_epoch)),
         direct_control_program_run_id_("direct-control-" +
                                        owner_epoch_.value()),
         direct_control_gripper_program_run_id_("direct-control-gripper-" +
                                                owner_epoch_.value()),
-        composition_access_(composition_access), host_lock_(state_root),
+        composition_access_(composition_access),
+        manager_liveness_admission_(manager_liveness_admission),
+        host_lock_(state_root),
         command_socket_(state_root, kSocketFileName),
         control_socket_(state_root, kControlSocketFileName) {}
 
@@ -6879,6 +7076,22 @@ private:
         command.kind == CommandKind::kFullStop ||
         command.kind == CommandKind::kMalformedStop) {
       return ExecuteStop(command, composition);
+    }
+    const bool read_only =
+        command.kind == CommandKind::kGetStopFault ||
+        command.kind == CommandKind::kRead ||
+        command.kind == CommandKind::kGetRuntimeScale ||
+        command.kind == CommandKind::kReadPickPlaceSequence;
+    const auto liveness_command =
+        read_only ? component_manager::detail::ManagerLivenessCommandClass::
+                        kReadOnly
+                  : component_manager::detail::ManagerLivenessCommandClass::
+                        kEffectful;
+    if (!manager_liveness_admission_.Allows(liveness_command)) {
+      return ErrorResponse(
+          "manager_liveness_not_current",
+          "ordinary execution command requires an exact current unfenced "
+          "Manager lease");
     }
     if (command.kind == CommandKind::kGetStopFault) {
       const auto offer = composition.runtime->addressed_kernel
@@ -7479,6 +7692,8 @@ private:
   core::ProgramRunId direct_control_program_run_id_;
   core::ProgramRunId direct_control_gripper_program_run_id_;
   ExecutionCompositionAccess &composition_access_;
+  component_manager::detail::ManagerLivenessCommandAdmission&
+      manager_liveness_admission_;
   HostLock host_lock_;
   CommandSocket command_socket_;
   CommandSocket control_socket_;
@@ -7494,10 +7709,12 @@ void RunManagedExecutionCommandSurface(
     const std::stop_token stop_token) noexcept {
   try {
     Require(control.composition_access != nullptr &&
+                control.manager_liveness_admission != nullptr &&
                 !control.owner_epoch.empty(),
             "managed execution command surface configuration is incomplete");
     ExecutionCommandSurface surface(
-        control.state_root, *control.composition_access, control.owner_epoch);
+        control.state_root, *control.composition_access,
+        *control.manager_liveness_admission, control.owner_epoch);
     {
       std::lock_guard lock(control.state_mutex);
       control.ready = true;
@@ -7544,8 +7761,14 @@ public:
     composition_access_.current = composition_.get();
     composition_access_.addressed_kernel =
         composition_->runtime->addressed_kernel.get();
+    // This legacy standalone owner has no Manager lease or liveness receiver.
+    // Explicitly keep only its private admission seam open; managed children
+    // use a separate, initially closed admission instance.
+    standalone_command_admission_.OpenIfUnchanged(
+        standalone_command_admission_.generation());
     command_surface_ = std::make_unique<ExecutionCommandSurface>(
-        config_.execution_state_root, composition_access_, owner_epoch_);
+        config_.execution_state_root, composition_access_,
+        standalone_command_admission_, owner_epoch_);
   }
 
   [[nodiscard]] int Run() { return command_surface_->Run(); }
@@ -7560,6 +7783,8 @@ private:
   std::unique_ptr<ManagedKernelApplyFenceOwner> fence_owner_;
   std::unique_ptr<Composition> composition_;
   ExecutionCompositionAccess composition_access_;
+  component_manager::detail::ManagerLivenessCommandAdmission
+      standalone_command_admission_;
   std::unique_ptr<ExecutionCommandSurface> command_surface_;
 };
 

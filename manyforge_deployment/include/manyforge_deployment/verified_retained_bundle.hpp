@@ -3,6 +3,7 @@
 #include <cstdint>
 #include <filesystem>
 #include <manyforge_core/types/kinematic_state_view.hpp>
+#include <manyforge_core/types/manager_liveness.hpp>
 #include <manyforge_core/types/projection_bootstrap.hpp>
 #include <manyforge_core/types/retained_product.hpp>
 #include <manyforge_core/types/strong_id.hpp>
@@ -309,6 +310,10 @@ class VerifiedRetainedRuntimeUnitProduct final {
   implementation_build_identity() const noexcept {
     return implementation_build_identity_;
   }
+  [[nodiscard]] const std::optional<core::ManagerLivenessPolicyDTO>&
+  manager_liveness_policy() const noexcept {
+    return manager_liveness_policy_;
+  }
 
  private:
   VerifiedRetainedRuntimeUnitProduct(
@@ -330,7 +335,8 @@ class VerifiedRetainedRuntimeUnitProduct final {
       std::string retrieval_contract_id,
       std::string retrieval_contract_revision,
       std::optional<VerifiedRuntimeImplementationBuildIdentity>
-          implementation_build_identity)
+          implementation_build_identity,
+      std::optional<core::ManagerLivenessPolicyDTO> manager_liveness_policy)
       : retained_bundle_id_(std::move(retained_bundle_id)),
         runtime_unit_id_(std::move(runtime_unit_id)),
         product_id_(std::move(product_id)),
@@ -355,7 +361,8 @@ class VerifiedRetainedRuntimeUnitProduct final {
         retrieval_contract_id_(std::move(retrieval_contract_id)),
         retrieval_contract_revision_(std::move(retrieval_contract_revision)),
         implementation_build_identity_(
-            std::move(implementation_build_identity)) {}
+            std::move(implementation_build_identity)),
+        manager_liveness_policy_(std::move(manager_liveness_policy)) {}
 
   core::RetainedBundleId retained_bundle_id_;
   core::RuntimeUnitId runtime_unit_id_;
@@ -379,6 +386,7 @@ class VerifiedRetainedRuntimeUnitProduct final {
   std::string retrieval_contract_revision_;
   std::optional<VerifiedRuntimeImplementationBuildIdentity>
       implementation_build_identity_;
+  std::optional<core::ManagerLivenessPolicyDTO> manager_liveness_policy_;
 
   friend std::optional<VerifiedRetainedRuntimeUnitProduct>
   verify_reference_runtime_unit_product(

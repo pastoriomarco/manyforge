@@ -1045,9 +1045,9 @@ TEST(RetainedNativeRuntimeUnitAdapter,
   const auto observed_authoring_admission =
       WaitForAuthoringAdmission(adapter, std::chrono::seconds(10));
   ASSERT_TRUE(observed_authoring_admission.has_value());
-  const auto authoring_admission = *observed_authoring_admission;
-  EXPECT_GT(authoring_admission.admission_generation.value(), 0U);
-  EXPECT_EQ(adapter.GetAuthoringAdmission(), authoring_admission);
+  EXPECT_FALSE(observed_authoring_admission->authoring_allowed);
+  EXPECT_GT(observed_authoring_admission->admission_generation.value(), 0U);
+  EXPECT_EQ(adapter.GetAuthoringAdmission(), *observed_authoring_admission);
   const core::CellAdmissionReadinessSnapshotDTO readiness{
       true,
       core::ProgramCycleStatusDTO{
@@ -1057,6 +1057,57 @@ TEST(RetainedNativeRuntimeUnitAdapter,
       true, 2U, 2U, true, true, 0U, 0U, 0U};
   const auto updated = adapter.UpdateCellAdmissionReadiness(readiness);
   ASSERT_TRUE(updated.ok()) << updated.error().message;
+  EXPECT_FALSE(updated.value().authoring_allowed);
+
+  const auto &liveness_policy = contract::manager_liveness_policy();
+  std::vector<core::RequiredManagerLivenessReceiverDTO> receivers{
+      {fixture.query->plan.runtime_unit_id, first_epoch,
+       liveness_policy.runtime_policy_id,
+       liveness_policy.runtime_policy_revision}};
+  const auto required_set_digest =
+      core::ComputeRequiredRuntimeSetDigest(receivers);
+  const core::RuntimeUnitId manager_runtime_unit_id(
+      "component-manager.native-adapter-test");
+  const core::RuntimeEpoch manager_runtime_epoch(
+      "manager-runtime.native-adapter-test");
+  const core::RequestOwnerEpoch manager_owner_epoch(
+      "manager-owner.native-adapter-test");
+  const core::ManagerLivenessRequiredSetDTO required_set{
+      fixture.bundle->value().cell_graph.cell_id,
+      fixture.bundle->retained_bundle_id(),
+      required_set_digest,
+      manager_runtime_unit_id,
+      manager_runtime_epoch,
+      manager_owner_epoch,
+      receivers};
+  const core::ManagerHeartbeatDTO heartbeat{
+      required_set.cell_id,
+      manager_runtime_unit_id,
+      manager_runtime_epoch,
+      manager_owner_epoch,
+      1U,
+      liveness_policy.runtime_policy_id,
+      liveness_policy.runtime_policy_revision};
+  const core::ManagerLivenessReconciliationAck reconciliation{
+      required_set.cell_id,
+      manager_runtime_unit_id,
+      manager_runtime_epoch,
+      manager_owner_epoch,
+      required_set.active_bundle_id,
+      required_set_digest,
+      core::ContentDigest(std::string(kIntentDigest))};
+  const auto liveness = adapter.RenewManagerLiveness(
+      {fixture.query->plan.runtime_unit_id, required_set, liveness_policy,
+       heartbeat, reconciliation});
+  EXPECT_EQ(liveness.active_bundle_id, required_set.active_bundle_id);
+  EXPECT_EQ(liveness.required_runtime_set_digest, required_set_digest);
+  EXPECT_EQ(liveness.status.state, core::ManagerLivenessStateDTO::kCurrent);
+  EXPECT_FALSE(liveness.status.command_fenced);
+
+  const auto authoring_admission = adapter.GetAuthoringAdmission();
+  ASSERT_TRUE(authoring_admission.authoring_allowed);
+  EXPECT_GT(authoring_admission.admission_generation,
+            updated.value().admission_generation);
   const core::CellAdmissionClaimIntentDTO claim_intent{
       core::CellAdmissionClaimKindDTO::kAuthoringMutation,
       core::CellAdmissionOwnerRoleDTO::kAuthoringOwner,
@@ -1064,7 +1115,7 @@ TEST(RetainedNativeRuntimeUnitAdapter,
       "adapter-authoring-transaction",
       core::RequestId("adapter-authoring-request"),
       core::ContentDigest(std::string(kIntentDigest)),
-      updated.value().admission_generation,
+      authoring_admission.admission_generation,
       {},
       std::nullopt,
       std::nullopt};

@@ -2757,7 +2757,11 @@ std::optional<VerifiedRetainedRuntimeUnitProduct> verify_runtime_unit_product(
       : ros2_control_execution
           ? detail::ros2_control_execution_runtime_retrieval_contract_revision()
           : detail::reference_runtime_retrieval_contract_revision(),
-      std::move(verified_implementation_build_identity));
+      std::move(verified_implementation_build_identity),
+      native_execution
+          ? std::optional<core::ManagerLivenessPolicyDTO>(
+                native_execution_runtime_contract::manager_liveness_policy())
+          : std::nullopt);
 }
 
 std::optional<VerifiedRetainedRuntimeUnitProduct>

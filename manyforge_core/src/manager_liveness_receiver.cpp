@@ -122,7 +122,7 @@ struct ManagerLivenessReceiver::State final {
   void SafeAndContain(const ManagerLivenessLossIntentDTO& intent) noexcept {
     std::optional<ContentDigest> evidence;
     try {
-      auto candidate = local_safe_callback();
+      auto candidate = local_safe_callback(intent);
       if (content_identity::is_sha256_digest(candidate.value())) {
         evidence = std::move(candidate);
       }
@@ -240,6 +240,17 @@ ManagerLivenessReceiver::ManagerLivenessReceiver(
       fail_safe_port, observation_port);
   state_->PublishNoThrow(state_->ObservationLocked());
 }
+
+ManagerLivenessReceiver::ManagerLivenessReceiver(
+    ManagerLivenessReceiverConfig config, IClock& clock, IScheduler& scheduler,
+    LegacyManagerLossLocalSafeCallback local_safe_callback,
+    IManagerLivenessFailSafePort& fail_safe_port,
+    IManagerLivenessObservationPort& observation_port)
+    : ManagerLivenessReceiver(
+          std::move(config), clock, scheduler,
+          [callback = std::move(local_safe_callback)](
+              const ManagerLivenessLossIntentDTO&) { return callback(); },
+          fail_safe_port, observation_port) {}
 
 ManagerLivenessReceiver::~ManagerLivenessReceiver() {
   ScheduleHandle handle{};

@@ -199,6 +199,7 @@ add_library(manyforge_component_manager
   src/manager_apply_fence_coordinator.cpp
   src/manager_apply_fence_release_coordinator.cpp
   src/manager_apply_journal.cpp
+  src/manager_liveness_rpc_internal.cpp
   src/manager_named_apply_coordinator.cpp
   src/manager_active_runtime_coordinator.cpp
   src/manager_runtime_convergence_coordinator.cpp
@@ -412,6 +413,18 @@ if(BUILD_TESTING)
     manyforge_component_manager
     GTest::gtest_main)
   gtest_discover_tests(test_selected_runtime_composition_rpc_internal
+    PROPERTIES TIMEOUT ${MANYFORGE_GTEST_TIMEOUT_SECONDS})
+
+  add_executable(test_manager_liveness_rpc_internal
+    test/test_manager_liveness_rpc_internal.cpp)
+  target_include_directories(
+    test_manager_liveness_rpc_internal PRIVATE
+    "${CMAKE_CURRENT_SOURCE_DIR}/src")
+  target_link_libraries(test_manager_liveness_rpc_internal PRIVATE
+    manyforge_component_manager
+    manyforge::content_identity
+    GTest::gtest_main)
+  gtest_discover_tests(test_manager_liveness_rpc_internal
     PROPERTIES TIMEOUT ${MANYFORGE_GTEST_TIMEOUT_SECONDS})
 
   add_executable(test_kernel_apply_fence_rpc_internal

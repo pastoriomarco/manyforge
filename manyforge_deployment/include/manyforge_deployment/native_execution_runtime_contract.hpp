@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstdint>
+#include <manyforge_core/types/manager_liveness.hpp>
 #include <manyforge_core/types/strong_id.hpp>
 #include <string>
 #include <string_view>
@@ -59,6 +60,10 @@ inline constexpr std::string_view kInstalledTargetId =
     "manyforge_native_execution_host";
 inline constexpr std::string_view kCandidateWorkerInstalledTargetId =
     "manyforge_roboplan_candidate_worker";
+inline constexpr std::string_view kManagerLivenessPolicyId =
+    "manyforge.retained_native_manager_liveness";
+inline constexpr std::string_view kManagerLivenessLocalSafeContractId =
+    "manyforge.native_execution.manager_loss_safe";
 
 /// Closed, typed projection of one verified retained native-runtime unit.
 ///
@@ -81,6 +86,14 @@ struct Configuration final {
 [[nodiscard]] Configuration
 require_configuration(const RetainedBundle &retained_bundle,
                       const core::RuntimeUnitId &runtime_unit_id);
+
+/// Build-owned closed policy embedded in every native runtime manifest.
+///
+/// The manifest artifact is part of the runtime product and therefore of the
+/// retained-bundle identity. Runtime consumers receive this typed value only
+/// after the exact manifest/product/bundle verification has succeeded.
+[[nodiscard]] const core::ManagerLivenessPolicyDTO&
+manager_liveness_policy();
 
 /// Revision embedded independently in the retained descriptor and installed
 /// host for installed-target integrity and provenance. Runtime compatibility

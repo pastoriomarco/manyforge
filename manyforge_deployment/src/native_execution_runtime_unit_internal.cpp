@@ -172,10 +172,14 @@ canonical_to_json_value(const CanonicalValue &value) {
 
 } // namespace
 
+[[nodiscard]] const core::ManagerLivenessPolicyDTO&
+manager_liveness_policy_value();
+
 CanonicalValue
 native_execution_runtime_manifest_projection(const core::RuntimeUnitDTO &unit) {
   const CanonicalValue configuration =
       require_qualified_runtime_configuration(unit.configuration);
+  const auto& liveness = manager_liveness_policy_value();
   return CanonicalValue(CanonicalValue::Object{
       {"api_version",
        CanonicalValue(std::string(kNativeExecutionRuntimeManifestApiVersion))},
@@ -183,6 +187,23 @@ native_execution_runtime_manifest_projection(const core::RuntimeUnitDTO &unit) {
       {"runtime_product_id", CanonicalValue(native_execution_runtime_product_id(
                                  unit.runtime_unit_id))},
       {"configuration", configuration},
+      {"manager_liveness_policy",
+       CanonicalValue(CanonicalValue::Object{
+           {"runtime_policy_id",
+            CanonicalValue(liveness.runtime_policy_id.value())},
+           {"runtime_policy_revision",
+            CanonicalValue(liveness.runtime_policy_revision.value())},
+           {"heartbeat_period_ns",
+            CanonicalValue(
+                static_cast<double>(liveness.heartbeat_period_ns))},
+           {"expiry_timeout_ns",
+            CanonicalValue(static_cast<double>(liveness.expiry_timeout_ns))},
+           {"local_safe_state_contract_id",
+            CanonicalValue(liveness.local_safe_state_contract_id.value())},
+           {"local_safe_state_contract_revision",
+            CanonicalValue(
+                liveness.local_safe_state_contract_revision.value())},
+       })},
       {"runtime_profile",
        CanonicalValue(CanonicalValue::Object{
            {"runtime_profile_id",
@@ -425,6 +446,25 @@ bool native_execution_runtime_configuration_is_qualified(
   }
 }
 
+const core::ManagerLivenessPolicyDTO& manager_liveness_policy_value() {
+  static const core::ManagerLivenessPolicyDTO policy{
+      core::RuntimePolicyId(std::string(
+          native_execution_runtime_contract::kManagerLivenessPolicyId)),
+      core::RuntimePolicyRevision(contract_revision(
+          "manager-liveness-policy",
+          "retained-native-v1;heartbeat-period-ns=250000000;"
+          "expiry-timeout-ns=1000000000;"
+          "local-safe=manyforge.native_execution.manager_loss_safe")),
+      250'000'000,
+      1'000'000'000,
+      core::ProductContractId(std::string(
+          native_execution_runtime_contract::kManagerLivenessLocalSafeContractId)),
+      core::ProductContractRevision(contract_revision(
+          "manager-loss-local-safe",
+          "native-kernel-direct-fail-safe;full-stop;loss-inhibit-v1"))};
+  return policy;
+}
+
 std::string native_execution_runtime_implementation_revision() {
   return contract_revision(
       "runtime-implementation",
@@ -434,7 +474,8 @@ std::string native_execution_runtime_implementation_revision() {
       "build-owned-candidate-worker;sha256-projection-content;"
       "atomic-resource-table-admission;"
       "resource-derived-active-configurations;"
-      "runtime-contract-offer-correlation-v2");
+      "runtime-contract-offer-correlation-v2;"
+      "retained-manager-liveness-receiver-v1");
 }
 
 std::string native_execution_runtime_process_adapter_revision() {
@@ -443,7 +484,7 @@ std::string native_execution_runtime_process_adapter_revision() {
       "manager-managed;installed-target;fixed-argv;direct-child-epoch;"
       "inherited-seqpacket-channel;same-user-direct-parent;"
       "command-fenced-readiness;runtime-contract-offer-digest-echo;"
-      "fixed-sibling-candidate-worker");
+      "fixed-sibling-candidate-worker;manager-liveness-rpc-v1");
 }
 
 std::string native_execution_runtime_retrieval_contract_revision() {
@@ -758,6 +799,10 @@ require_configuration(const RetainedBundle &retained_bundle,
 
 std::string implementation_revision() {
   return detail::native_execution_runtime_implementation_revision();
+}
+
+const core::ManagerLivenessPolicyDTO& manager_liveness_policy() {
+  return detail::manager_liveness_policy_value();
 }
 
 } // namespace manyforge::deployment::native_execution_runtime_contract

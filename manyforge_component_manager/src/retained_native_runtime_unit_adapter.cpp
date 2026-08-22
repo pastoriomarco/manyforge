@@ -1,6 +1,7 @@
 #include "manyforge_component_manager/retained_native_runtime_unit_adapter.hpp"
 
 #include "kernel_apply_fence_rpc_internal.hpp"
+#include "manager_liveness_rpc_internal.hpp"
 #include "manyforge_component_manager/kernel_cell_admission_rpc_internal.hpp"
 #include "native_projection_rpc_internal.hpp"
 #include "selected_runtime_composition_rpc_internal.hpp"
@@ -65,9 +66,12 @@ constexpr std::size_t kMaximumControlPacketBytes =
     detail::kMaximumManagedRuntimeRpcPacketBytes;
 static_assert(detail::kMaximumNativeProjectionRpcPacketBytes <=
               kMaximumControlPacketBytes);
+static_assert(detail::kMaximumManagerLivenessRpcPacketBytes <=
+              kMaximumControlPacketBytes);
 constexpr auto kExecTimeout = std::chrono::seconds(10);
 constexpr auto kReadyTimeout = std::chrono::seconds(10);
 constexpr auto kStatusTimeout = std::chrono::milliseconds(750);
+constexpr auto kManagerLivenessTimeout = std::chrono::milliseconds(750);
 // Cold candidate projection preparation may stage the complete immutable
 // planning/collision product. Keep that bounded independently from the short
 // steady-state status, fence, composition, and projection-query budget.
@@ -380,6 +384,70 @@ ReceivePacket(const int fd, const std::chrono::milliseconds timeout) {
   }
   bytes.resize(static_cast<std::size_t>(count));
   return bytes;
+}
+
+[[nodiscard]] std::string ReceiveReadyPacket(const int fd) {
+  std::string bytes(kMaximumControlPacketBytes, '\0');
+  iovec vector{bytes.data(), bytes.size()};
+  msghdr message{};
+  message.msg_iov = &vector;
+  message.msg_iovlen = 1U;
+  ssize_t count = -1;
+  do {
+    count = ::recvmsg(fd, &message, MSG_DONTWAIT);
+  } while (count < 0 && errno == EINTR);
+  if (count < 0) {
+    Fail(ErrnoDetail("native runtime control read failed", errno));
+  }
+  if (count == 0) {
+    Fail("native runtime child closed its private channel");
+  }
+  if ((message.msg_flags & MSG_TRUNC) != 0) {
+    Fail("native runtime control response exceeds its byte bound");
+  }
+  bytes.resize(static_cast<std::size_t>(count));
+  return bytes;
+}
+
+void WaitForAll(std::vector<pollfd>& descriptors, const short event,
+                const std::chrono::steady_clock::time_point deadline) {
+  std::vector<bool> ready(descriptors.size(), false);
+  std::size_t remaining = descriptors.size();
+  while (remaining != 0U) {
+    const auto now = std::chrono::steady_clock::now();
+    if (now >= deadline) {
+      Fail("native runtime liveness batch timed out");
+    }
+    const auto timeout = std::max<std::int64_t>(
+        1, std::chrono::duration_cast<std::chrono::milliseconds>(deadline - now)
+               .count());
+    for (std::size_t index = 0U; index < descriptors.size(); ++index) {
+      descriptors[index].events =
+          ready[index] ? 0 : static_cast<short>(event | POLLHUP);
+      descriptors[index].revents = 0;
+    }
+    int result = -1;
+    do {
+      result = ::poll(descriptors.data(), descriptors.size(),
+                      static_cast<int>(std::min<std::int64_t>(timeout, INT_MAX)));
+    } while (result < 0 && errno == EINTR);
+    if (result < 0) {
+      Fail(ErrnoDetail("native runtime liveness batch poll failed", errno));
+    }
+    if (result == 0) {
+      Fail("native runtime liveness batch timed out");
+    }
+    for (std::size_t index = 0U; index < descriptors.size(); ++index) {
+      const auto observed = descriptors[index].revents;
+      if ((observed & (POLLERR | POLLNVAL)) != 0) {
+        Fail("native runtime liveness batch channel became invalid");
+      }
+      if (!ready[index] && (observed & (event | POLLHUP)) != 0) {
+        ready[index] = true;
+        --remaining;
+      }
+    }
+  }
 }
 
 [[nodiscard]] std::uint64_t
@@ -1047,6 +1115,100 @@ struct RetainedNativeRuntimeUnitAdapter::Impl final
       Fail("managed runtime child returned foreign composition evidence");
     }
     return *result;
+  }
+
+  [[nodiscard]] manyforge::core::ManagerLivenessObservationDTO
+  RenewManagerLiveness(const ManagerLivenessTransportRequestDTO& request) {
+    auto responses = RenewManagerLivenessBatch({request});
+    return std::move(responses.front());
+  }
+
+  [[nodiscard]] std::vector<manyforge::core::ManagerLivenessObservationDTO>
+  RenewManagerLivenessBatch(
+      const std::vector<ManagerLivenessTransportRequestDTO>& requests) {
+    if (requests.empty() ||
+        requests.size() >
+            manyforge::core::kMaximumManagerLivenessReceivers) {
+      Fail("Manager-liveness batch has an invalid receiver count");
+    }
+    const auto& required_set = requests.front().required_set;
+    const auto& heartbeat = requests.front().heartbeat;
+    const auto& policy = requests.front().policy;
+    std::set<std::string> requested_receivers;
+    std::vector<std::string> encoded;
+    encoded.reserve(requests.size());
+    for (const auto& request : requests) {
+      if (!manyforge::core::ValidateManagerLivenessRequiredSet(
+               request.required_set)
+               .ok() ||
+          request.required_set != required_set ||
+          request.heartbeat != heartbeat || request.policy != policy ||
+          !requested_receivers.insert(
+                                  request.receiver_runtime_unit_id.value())
+               .second) {
+        Fail("Manager-liveness batch is not one exact required-set renewal");
+      }
+      encoded.push_back(detail::EncodeManagerLivenessRpcRequest(request));
+    }
+    if (requested_receivers.size() !=
+        required_set.required_receivers.size()) {
+      Fail("Manager-liveness batch does not cover the exact required set");
+    }
+
+    const detail::ManagerLivenessBatchDeadline deadline(
+        std::chrono::steady_clock::now(), kManagerLivenessTimeout);
+    if (!manyforge::core::ValidateManagerLivenessRequiredSet(
+             required_set)
+             .ok()) {
+      Fail("Manager-liveness request has an invalid required set");
+    }
+    std::lock_guard lock(mutex);
+    std::vector<Child*> targets;
+    std::vector<pollfd> descriptors;
+    targets.reserve(requests.size());
+    descriptors.reserve(requests.size());
+    for (const auto& request : requests) {
+      const auto expected = std::find_if(
+          required_set.required_receivers.begin(),
+          required_set.required_receivers.end(), [&](const auto& row) {
+            return row.runtime_unit_id == request.receiver_runtime_unit_id;
+          });
+      auto found = children.find(request.receiver_runtime_unit_id.value());
+      if (expected == required_set.required_receivers.end() ||
+          found == children.end() ||
+          found->second.runtime_epoch != expected->runtime_epoch) {
+        Fail(
+            "Manager-liveness request no longer names the current child epoch");
+      }
+      if (!ChildIsLive(found->second)) {
+        children.erase(found);
+        Fail("managed runtime child exited before its liveness response");
+      }
+      targets.push_back(&found->second);
+      descriptors.push_back({found->second.channel.get(), 0, 0});
+    }
+
+    WaitForAll(descriptors, POLLOUT, deadline.value());
+    for (std::size_t index = 0U; index < targets.size(); ++index) {
+      const auto count =
+          ::send(targets[index]->channel.get(), encoded[index].data(),
+                 encoded[index].size(), MSG_NOSIGNAL | MSG_DONTWAIT);
+      if (count != static_cast<ssize_t>(encoded[index].size())) {
+        Fail(count < 0
+                 ? ErrnoDetail("native runtime liveness batch write failed",
+                               errno)
+                 : "native runtime liveness batch packet was not sent "
+                   "atomically");
+      }
+    }
+    WaitForAll(descriptors, POLLIN, deadline.value());
+    std::vector<manyforge::core::ManagerLivenessObservationDTO> responses;
+    responses.reserve(targets.size());
+    for (const auto* target : targets) {
+      responses.push_back(detail::DecodeManagerLivenessRpcResponse(
+          ReceiveReadyPacket(target->channel.get())));
+    }
+    return responses;
   }
 
   void PrepareChildProjectionBindings(
@@ -1751,6 +1913,18 @@ ManagerSelectedRuntimeCompositionResultDTO
 RetainedNativeRuntimeUnitAdapter::InstallOrObserve(
     const ManagerSelectedRuntimeCompositionRequestDTO &request) {
   return impl_->InstallOrObserveRuntimeComposition(request);
+}
+
+manyforge::core::ManagerLivenessObservationDTO
+RetainedNativeRuntimeUnitAdapter::RenewManagerLiveness(
+    const ManagerLivenessTransportRequestDTO& request) {
+  return impl_->RenewManagerLiveness(request);
+}
+
+std::vector<manyforge::core::ManagerLivenessObservationDTO>
+RetainedNativeRuntimeUnitAdapter::RenewManagerLivenessBatch(
+    const std::vector<ManagerLivenessTransportRequestDTO>& requests) {
+  return impl_->RenewManagerLivenessBatch(requests);
 }
 
 } // namespace manyforge::component_manager

@@ -1452,6 +1452,17 @@ TEST(RetainedBundleMaterializer,
             detail::native_execution_runtime_launch_descriptor());
   const auto parsed_manifest =
       detail::parse_and_verify_native_execution_runtime_manifest(manifest);
+  const auto& retained_liveness =
+      native_execution_runtime_contract::manager_liveness_policy();
+  ASSERT_TRUE(core::ValidateManagerLivenessPolicy(retained_liveness).ok());
+  EXPECT_EQ(
+      string_member(member(parsed_manifest, "manager_liveness_policy"),
+                    "runtime_policy_id"),
+      retained_liveness.runtime_policy_id.value());
+  EXPECT_EQ(
+      string_member(member(parsed_manifest, "manager_liveness_policy"),
+                    "runtime_policy_revision"),
+      retained_liveness.runtime_policy_revision.value());
   EXPECT_EQ(
       canonical_json(member(parsed_manifest, "configuration")),
       R"({"collision_monitor_period_ms":50,"execution_tick_hz":100,"initial_joint_positions_rad":[0,0,1.57,0,0,0],"mode":"simulated","planner_rng_seed":12345})");
@@ -1477,6 +1488,13 @@ TEST(RetainedBundleMaterializer,
           changed_configuration, launch_descriptor, std::nullopt,
           bundle->value(), group.runtime_unit_id),
       RetainedBundleError);
+  const std::string changed_liveness = replace_once(
+      manifest, "\"heartbeat_period_ns\":250000000",
+      "\"heartbeat_period_ns\":250000001");
+  EXPECT_THROW(static_cast<void>(
+                   detail::parse_and_verify_native_execution_runtime_manifest(
+                       changed_liveness)),
+               RetainedBundleError);
 
   test::InMemoryCatalogArtifactStoreFixture second_catalog_store;
   test::InMemoryRawArtifactStoreFixture second_raw_store;

@@ -2,6 +2,7 @@
 
 #include <filesystem>
 #include <manyforge_component_manager/runtime_convergence.hpp>
+#include <manyforge_component_manager/manager_liveness_transport.hpp>
 #include <manyforge_component_manager/selected_runtime_composition.hpp>
 #include <manyforge_core/ports/imanager_kernel_apply_fence_port.hpp>
 #include <manyforge_core/ports/ikernel_cell_admission_port.hpp>
@@ -37,7 +38,8 @@ class RetainedNativeRuntimeUnitAdapter final
       public manyforge::core::IManagerKernelApplyFencePort,
       public manyforge::core::IKernelCellAdmissionPort,
       public manyforge::core::IPlannerSceneProjectionResolver,
-      public IManagerSelectedRuntimeCompositionPort {
+      public IManagerSelectedRuntimeCompositionPort,
+      public IManagerLivenessTransportPort {
 public:
   RetainedNativeRuntimeUnitAdapter(
       std::filesystem::path trusted_installed_target_root,
@@ -122,6 +124,14 @@ public:
                         &native_runtime_binding) const override;
   [[nodiscard]] ManagerSelectedRuntimeCompositionResultDTO InstallOrObserve(
       const ManagerSelectedRuntimeCompositionRequestDTO &request) override;
+  [[nodiscard]] manyforge::core::ManagerLivenessObservationDTO
+  RenewManagerLiveness(
+      const ManagerLivenessTransportRequestDTO& request) override;
+  [[nodiscard]]
+  std::vector<manyforge::core::ManagerLivenessObservationDTO>
+  RenewManagerLivenessBatch(
+      const std::vector<ManagerLivenessTransportRequestDTO>& requests)
+      override;
 
 private:
   struct Impl;

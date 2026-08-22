@@ -8,12 +8,14 @@
 #include <manyforge_component_manager/canonical_empty_bootstrap_coordinator.hpp>
 #include <manyforge_component_manager/durable_store_set.hpp>
 #include <manyforge_component_manager/manager_active_runtime_coordinator.hpp>
+#include <manyforge_component_manager/manager_liveness_transport.hpp>
 #include <manyforge_component_manager/manager_named_apply_coordinator.hpp>
 #include <manyforge_component_manager/manager_runtime_convergence_coordinator.hpp>
 #include <manyforge_component_manager/retained_native_runtime_unit_adapter.hpp>
 #include <manyforge_component_manager/retained_posix_runtime_unit_adapter.hpp>
 #include <manyforge_component_manager/runtime_unit_adapter_router.hpp>
 #include <manyforge_content_identity/canonical_value.hpp>
+#include <manyforge_content_identity/content_identity.hpp>
 #include <manyforge_deployment/artifact_codec.hpp>
 #include <manyforge_deployment/canonical_empty_admission.hpp>
 #include <manyforge_deployment/native_execution_runtime_contract.hpp>
@@ -47,6 +49,7 @@
 #include <map>
 #include <memory>
 #include <optional>
+#include <set>
 #include <stdexcept>
 #include <string>
 #include <string_view>
@@ -1626,8 +1629,177 @@ private:
 
     const auto scene_generation = PublishLogicalScene(observed_at);
     const auto scene_runtime_generation = PublishSceneRuntime(observed_at);
+    TryRenewNativeManagerLiveness(runtime, *active_bundle);
     return {manager.source_generation, scene_generation,
             scene_runtime_generation};
+  }
+
+  void TryRenewNativeManagerLiveness(
+      const component_manager::ManagerActiveRuntimeConvergenceResult& runtime,
+      const deployment::RetainedBundle& active_bundle) noexcept {
+    const auto now_ns = ElapsedNs();
+    if (!manager_liveness_retry_gate_.attempt_allowed(now_ns)) {
+      return;
+    }
+    try {
+      std::vector<core::RequiredManagerLivenessReceiverDTO> receivers;
+      receivers.reserve(runtime.plan.runtime_units.size());
+      const auto& retained_policy =
+          deployment::native_execution_runtime_contract::
+              manager_liveness_policy();
+      for (const auto& row : runtime.plan.runtime_units) {
+        if (row.process_adapter_contract_id !=
+            deployment::native_execution_runtime_contract::
+                kProcessAdapterContractId) {
+          continue;
+        }
+        const auto* observation =
+            runtime.observations.observation(row.runtime_unit_id.value());
+        if (observation == nullptr || observation->runtime_epoch().empty()) {
+          throw std::runtime_error(
+              "required native liveness receiver is not observable");
+        }
+        const auto product = deployment::verify_runtime_unit_product(
+            active_bundle, row.runtime_unit_id, artifact_source_);
+        if (!product.has_value() ||
+            product->retained_bundle_id() !=
+                active_bundle.retained_bundle_id() ||
+            product->product_identity() != row.product_identity ||
+            !product->manager_liveness_policy().has_value() ||
+            *product->manager_liveness_policy() != retained_policy) {
+          throw std::runtime_error(
+              "active native runtime has no exact retained liveness policy");
+        }
+        receivers.push_back(core::RequiredManagerLivenessReceiverDTO{
+            row.runtime_unit_id, core::RuntimeEpoch(observation->runtime_epoch()),
+            retained_policy.runtime_policy_id,
+            retained_policy.runtime_policy_revision});
+      }
+      if (receivers.empty()) {
+        return;
+      }
+      std::sort(receivers.begin(), receivers.end(),
+                [](const auto& left, const auto& right) {
+                  return std::tie(left.runtime_unit_id, left.runtime_epoch,
+                                  left.runtime_policy_id,
+                                  left.runtime_policy_revision) <
+                         std::tie(right.runtime_unit_id, right.runtime_epoch,
+                                  right.runtime_policy_id,
+                                  right.runtime_policy_revision);
+                });
+      const auto digest = core::ComputeRequiredRuntimeSetDigest(receivers);
+      const core::ManagerLivenessRequiredSetDTO required_set{
+          admission_.cell_id(),
+          active_bundle.retained_bundle_id(),
+          digest,
+          core::RuntimeUnitId("component-manager." +
+                              admission_.cell_id().value()),
+          manager_runtime_epoch_,
+          core::RequestOwnerEpoch(manager_owner_epoch_),
+          receivers};
+      if (!core::ValidateManagerLivenessRequiredSet(required_set).ok() ||
+          manager_heartbeat_sequence_ >=
+              core::kMaximumManagerLivenessCounter) {
+        throw std::runtime_error(
+            "Manager cannot mint the exact native liveness required set");
+      }
+      ++manager_heartbeat_sequence_;
+      const core::ManagerHeartbeatDTO heartbeat{
+          required_set.cell_id,
+          required_set.manager_runtime_unit_id,
+          required_set.manager_runtime_epoch,
+          required_set.manager_owner_epoch,
+          manager_heartbeat_sequence_,
+          retained_policy.runtime_policy_id,
+          retained_policy.runtime_policy_revision};
+      std::optional<core::ManagerLivenessReconciliationAck> reconciliation;
+      if (runtime.state ==
+          component_manager::ManagerActiveRuntimeConvergenceState::kConverged) {
+        std::string material("manyforge.manager-liveness-reconciliation.v1");
+        material.push_back('\0');
+        material.append(active_bundle.retained_bundle_id().value());
+        material.push_back('\0');
+        material.append(digest.value());
+        material.push_back('\0');
+        material.append(manager_runtime_epoch_.value());
+        material.push_back('\0');
+        material.append(manager_owner_epoch_);
+        for (const auto& observation :
+             runtime.observations.observations()) {
+          material.push_back('\0');
+          material.append(observation.runtime_unit_id());
+          material.push_back('\0');
+          material.append(observation.runtime_epoch());
+          material.push_back('\0');
+          material.append(
+              std::to_string(observation.source_report_sequence().value_or(0)));
+        }
+        reconciliation = core::ManagerLivenessReconciliationAck{
+            required_set.cell_id,
+            required_set.manager_runtime_unit_id,
+            required_set.manager_runtime_epoch,
+            required_set.manager_owner_epoch,
+            required_set.active_bundle_id,
+            required_set.required_runtime_set_digest,
+            core::ContentDigest(content_identity::sha256_digest(material))};
+      }
+      std::vector<component_manager::ManagerLivenessTransportRequestDTO>
+          requests;
+      requests.reserve(receivers.size());
+      for (const auto& receiver : receivers) {
+        requests.push_back(
+            {receiver.runtime_unit_id, required_set, retained_policy, heartbeat,
+             reconciliation});
+      }
+      const auto responses =
+          native_runtime_adapter_.RenewManagerLivenessBatch(requests);
+      if (responses.size() != receivers.size()) {
+        throw std::runtime_error(
+            "native liveness batch returned the wrong receiver count");
+      }
+      for (std::size_t index = 0U; index < receivers.size(); ++index) {
+        const auto& receiver = receivers[index];
+        const auto& response = responses[index];
+        if (response.active_bundle_id != required_set.active_bundle_id ||
+            response.required_runtime_set_digest != digest ||
+            response.status.receiver_runtime_unit_id !=
+                receiver.runtime_unit_id ||
+            response.status.receiver_runtime_epoch != receiver.runtime_epoch ||
+            response.status.manager_runtime_epoch != manager_runtime_epoch_ ||
+            response.status.manager_owner_epoch !=
+                core::RequestOwnerEpoch(manager_owner_epoch_) ||
+            response.status.runtime_policy_id != receiver.runtime_policy_id ||
+            response.status.runtime_policy_revision !=
+                receiver.runtime_policy_revision ||
+            response.status.last_accepted_heartbeat_sequence !=
+                manager_heartbeat_sequence_ ||
+            (reconciliation.has_value() &&
+             (response.status.state != core::ManagerLivenessStateDTO::kCurrent ||
+              response.status.command_fenced))) {
+          throw std::runtime_error(
+              "native liveness receiver returned foreign reconciliation "
+              "evidence");
+        }
+      }
+      manager_liveness_retry_gate_.RecordSuccess();
+    } catch (const std::exception& error) {
+      const auto failure_ns = ElapsedNs();
+      const auto expiry = static_cast<std::uint64_t>(
+          deployment::native_execution_runtime_contract::
+              manager_liveness_policy()
+                  .expiry_timeout_ns);
+      manager_liveness_retry_gate_.RecordFailure(failure_ns, expiry);
+      std::cerr << "Manager native liveness renewal remains fail-closed: "
+                << error.what() << '\n';
+    } catch (...) {
+      const auto failure_ns = ElapsedNs();
+      const auto expiry = static_cast<std::uint64_t>(
+          deployment::native_execution_runtime_contract::
+              manager_liveness_policy()
+                  .expiry_timeout_ns);
+      manager_liveness_retry_gate_.RecordFailure(failure_ns, expiry);
+      std::cerr << "Manager native liveness renewal remains fail-closed\n";
+    }
   }
 
   std::uint64_t PublishLogicalScene(const std::int64_t observed_at) {
@@ -2503,6 +2675,9 @@ private:
   std::string manager_owner_id_;
   std::string scene_owner_id_;
   std::string scene_runtime_owner_id_;
+  std::uint64_t manager_heartbeat_sequence_{};
+  component_manager::detail::ManagerLivenessRetryGate
+      manager_liveness_retry_gate_;
   std::map<std::string, PoseObserverSession> pose_observer_sessions_;
   std::map<PoseObservationKey, PoseObservationReplay> pose_observation_replays_;
   std::optional<std::vector<core::ProjectionNativeRuntimeBindingDTO>>
