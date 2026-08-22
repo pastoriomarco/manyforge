@@ -98,6 +98,7 @@ class ProgramRunTickHost:
         maximum_scheduled_runs: int = _MAX_SCHEDULED_RUNS,
         maximum_workers: int = 4,
         monotonic: Callable[[], float] = time.monotonic,
+        terminal_observer: Callable[[ProgramRunSnapshot], None] | None = None,
     ) -> None:
         if not isinstance(owner, ProgramRunOwner):
             raise TypeError("tick host requires one ProgramRunOwner")
@@ -121,11 +122,14 @@ class ProgramRunTickHost:
             raise ValueError("tick-worker bound is invalid")
         if not callable(monotonic):
             raise TypeError("monotonic clock must be callable")
+        if terminal_observer is not None and not callable(terminal_observer):
+            raise TypeError("terminal observer must be callable")
         self._owner = owner
         self._tick_interval_s = float(tick_interval_s)
         self._maximum_scheduled_runs = maximum_scheduled_runs
         self._maximum_workers = maximum_workers
         self._monotonic = monotonic
+        self._terminal_observer = terminal_observer
         self._scheduled: set[str] = set()
         self._inflight: dict[str, Future[ProgramRunSnapshot]] = {}
         self._condition = Condition(RLock())
@@ -250,11 +254,33 @@ class ProgramRunTickHost:
             with self._condition:
                 for program_run_id in remove:
                     self._scheduled.discard(program_run_id)
+        self._observe_terminals(snapshots)
         return tuple(snapshots)
+
+    def _observe_terminals(self, snapshots: list[ProgramRunSnapshot]) -> None:
+        observer = self._terminal_observer
+        if observer is None:
+            return
+        try:
+            for snapshot in snapshots:
+                if snapshot.state not in {
+                    ProgramRunState.RUNNING,
+                    ProgramRunState.STOPPING,
+                    ProgramRunState.FINALIZING,
+                }:
+                    observer(snapshot)
+        except Exception as error:
+            with self._condition:
+                self._worker_failure = error
+                self._condition.notify_all()
+            raise ProgramSchedulingError(
+                "Program terminal observer failed"
+            ) from error
 
     def _run(self) -> None:
         next_tick = self._monotonic()
         while True:
+            completed: list[ProgramRunSnapshot] = []
             with self._condition:
                 if self._shutdown:
                     return
@@ -274,29 +300,36 @@ class ProgramRunTickHost:
                         ProgramRunState.FINALIZING,
                     }:
                         self._scheduled.discard(program_run_id)
+                        completed.append(snapshot)
 
                 now = self._monotonic()
                 delay = next_tick - now
-                if not self._scheduled:
+                if completed:
+                    pass
+                elif not self._scheduled:
                     self._condition.wait()
-                    continue
-                if delay > 0.0:
+                elif delay > 0.0:
                     self._condition.wait(
                         timeout=delay
                     )
-                    continue
-                for program_run_id in sorted(self._scheduled):
-                    if program_run_id in self._inflight:
-                        continue
-                    future = self._executor.submit(
-                        self._owner.advance_once,
-                        program_run_id,
-                    )
-                    self._inflight[program_run_id] = future
-                    future.add_done_callback(
-                        lambda _future: self._notify_worker_completion()
-                    )
-                next_tick = now + self._tick_interval_s
+                else:
+                    for program_run_id in sorted(self._scheduled):
+                        if program_run_id in self._inflight:
+                            continue
+                        future = self._executor.submit(
+                            self._owner.advance_once,
+                            program_run_id,
+                        )
+                        self._inflight[program_run_id] = future
+                        future.add_done_callback(
+                            lambda _future: self._notify_worker_completion()
+                        )
+                    next_tick = now + self._tick_interval_s
+            if completed:
+                try:
+                    self._observe_terminals(completed)
+                except ProgramSchedulingError:
+                    return
 
     def _notify_worker_completion(self) -> None:
         with self._condition:

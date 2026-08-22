@@ -14,6 +14,7 @@ from manyforge_headless_api.models import (
     ProgramRunStopRequest,
 )
 
+from .models import ProgramCycleResetRequest
 from .runtime import ProgramRunnerError
 
 
@@ -39,15 +40,29 @@ class ProgramRunnerApplicationPort(Protocol):
         request: ProgramRunStopRequest,
     ) -> dict[str, Any]: ...
 
+    def reset_cycle(self, request: ProgramCycleResetRequest) -> dict[str, Any]: ...
+
+    def cycle_status(self) -> dict[str, Any]: ...
+
 
 def _status(code: str) -> int:
     if code.endswith("_not_found"):
         return 404
     if code.endswith("_stale") or code.endswith("_conflict") or code in {
+        "authoring_not_ready",
+        "program_cycle_reset_required",
         "program_run_already_active",
+        "program_run_draft_applied_mismatch",
+        "stale_generation",
     }:
         return 409
-    if "unavailable" in code or code.endswith("_ledger_full"):
+    if (
+        "unavailable" in code
+        or code.endswith("_unknown")
+        or code.endswith("_in_progress")
+        or code.endswith("_ledger_full")
+        or code == "program_cycle_reconciliation_required"
+    ):
         return 503
     if code.endswith("_invalid") or code.endswith("_failed"):
         return 400
@@ -125,6 +140,14 @@ def create_app(runtime: ProgramRunnerApplicationPort) -> FastAPI:
                 "Program-run identity in path and body must match",
             )
         return runtime.stop_run(program_run_id, request)
+
+    @app.post("/api/program/cycle/reset")
+    def reset_cycle(request: ProgramCycleResetRequest) -> dict[str, Any]:
+        return runtime.reset_cycle(request)
+
+    @app.get("/api/program/cycle/status")
+    def cycle_status() -> dict[str, Any]:
+        return runtime.cycle_status()
 
     return app
 

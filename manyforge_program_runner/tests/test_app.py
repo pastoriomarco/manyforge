@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from typing import Any
 
+import pytest
 from fastapi.testclient import TestClient
 
 from manyforge_headless_api.models import (
@@ -11,6 +12,7 @@ from manyforge_headless_api.models import (
     ProgramRunStopRequest,
 )
 from manyforge_program_runner.app import create_app
+from manyforge_program_runner.models import ProgramCycleResetRequest
 from manyforge_program_runner.runtime import ProgramRunnerError
 
 
@@ -103,6 +105,27 @@ class FakeRuntime:
         self.calls.append(("stop", (program_run_id, request)))
         return _snapshot(state="stopping")
 
+    def reset_cycle(self, request: ProgramCycleResetRequest) -> dict[str, Any]:
+        self.calls.append(("reset", request))
+        return {
+            "schema_version": "manyforge.program_cycle_reset_result.v1",
+            "program_run_id": request.program_run_id,
+            "reset_cycle_generation": request.expected_cycle_generation,
+            "idle_cycle_generation": request.expected_cycle_generation + 1,
+            "settlement_reference": request.settlement_evidence_digest,
+            "admission": {"admission_generation": 8},
+        }
+
+    def cycle_status(self) -> dict[str, Any]:
+        return {
+            "program_runner_owner_epoch": "program-runner.epoch.1",
+            "cycle_generation": 1,
+            "state": "idle_after_reset",
+            "program_run_id": None,
+            "cycle_claim_generation": None,
+            "terminal_or_settlement_reference": None,
+        }
+
 
 def _caller() -> dict[str, Any]:
     return {
@@ -110,6 +133,43 @@ def _caller() -> dict[str, Any]:
         "request_owner_epoch": "composer.epoch.1",
         "source_label": "operator_ui",
         "correlation_id": None,
+    }
+
+
+def test_reset_is_an_explicit_strict_cycle_transition() -> None:
+    runtime = FakeRuntime()
+    client = TestClient(create_app(runtime))
+    body = {
+        **_caller(),
+        "program_run_id": "program-run.1",
+        "expected_owner_epoch": "program-runner.epoch.1",
+        "expected_cycle_generation": 4,
+        "expected_claim_generation": 7,
+        "terminal_reference": _DIGEST_A,
+        "settlement_evidence_digest": _DIGEST_B,
+    }
+    with client:
+        response = client.post("/api/program/cycle/reset", json=body)
+    assert response.status_code == 200
+    assert response.json()["idle_cycle_generation"] == 5
+    assert runtime.calls[0][0] == "reset"
+    assert client.post(
+        "/api/program/cycle/reset", json={**body, "unexpected": True}
+    ).status_code == 422
+
+
+def test_cycle_status_exposes_only_program_runner_owned_facts() -> None:
+    client = TestClient(create_app(FakeRuntime()))
+    with client:
+        response = client.get("/api/program/cycle/status")
+    assert response.status_code == 200
+    assert set(response.json()) == {
+        "program_runner_owner_epoch",
+        "cycle_generation",
+        "state",
+        "program_run_id",
+        "cycle_claim_generation",
+        "terminal_or_settlement_reference",
     }
 
 
@@ -206,3 +266,32 @@ def test_private_surface_preserves_stable_owner_error_codes() -> None:
             "message": "unknown Program run missing",
         }
     }
+
+
+@pytest.mark.parametrize(
+    "code",
+    [
+        "authoring_not_ready",
+        "program_cycle_reset_required",
+        "program_run_draft_applied_mismatch",
+        "stale_generation",
+    ],
+)
+def test_program_start_preconditions_map_to_client_conflict(code: str) -> None:
+    class RejectingRuntime(FakeRuntime):
+        def start_run(self, request: ProgramRunStartRequest) -> dict[str, Any]:
+            raise ProgramRunnerError(code, "start precondition rejected")
+
+    client = TestClient(create_app(RejectingRuntime()))
+    with client:
+        response = client.post(
+            "/api/program/runs",
+            json={
+                **_caller(),
+                "scenario_id": "cell-pick",
+                "scenario_catalog_revision": _DIGEST_A,
+                "expected_applied_record_digest": _DIGEST_B,
+            },
+        )
+    assert response.status_code == 409
+    assert response.json()["detail"]["code"] == code

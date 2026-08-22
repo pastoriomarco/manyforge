@@ -835,6 +835,58 @@ def test_tick_host_advances_each_scheduled_run_and_removes_terminal_work() -> No
     host.shutdown()
 
 
+def test_tick_host_delivers_terminal_without_polling_or_blocking_stop() -> None:
+    owner, admission, _task, _scope, _events = _fixture(
+        initial_task_state=OwnerTaskState.SUCCEEDED
+    )
+    observer_entered = Event()
+    release_observer = Event()
+    observed: list[ProgramRunState] = []
+
+    def observe(snapshot) -> None:
+        observed.append(snapshot.state)
+        observer_entered.set()
+        assert release_observer.wait(timeout=2.0)
+
+    host = ProgramRunTickHost(owner, terminal_observer=observe)
+    started = host.start_run(admission)
+    advancing = Thread(target=host.advance_ready_once)
+    advancing.start()
+    assert observer_entered.wait(timeout=1.0)
+
+    stop_returned = Event()
+
+    def stop() -> None:
+        host.stop_run(started.capture.program_run_id)
+        stop_returned.set()
+
+    stopping = Thread(target=stop)
+    stopping.start()
+    assert stop_returned.wait(timeout=1.0)
+    release_observer.set()
+    advancing.join(timeout=1.0)
+    stopping.join(timeout=1.0)
+    assert observed == [ProgramRunState.SUCCEEDED]
+    host.shutdown()
+
+
+def test_tick_host_latches_terminal_observer_failure() -> None:
+    owner, admission, _task, _scope, _events = _fixture(
+        initial_task_state=OwnerTaskState.SUCCEEDED
+    )
+
+    def reject(_snapshot) -> None:
+        raise RuntimeError("journal unavailable")
+
+    host = ProgramRunTickHost(owner, terminal_observer=reject)
+    host.start_run(admission)
+    with pytest.raises(ProgramSchedulingError, match="observer failed"):
+        host.advance_ready_once()
+    with pytest.raises(ProgramSchedulingError, match="worker failed"):
+        host.schedule("another-run")
+    host.shutdown()
+
+
 def test_tick_host_cleans_an_admitted_run_if_bounded_scheduling_rejects_it() -> (
     None
 ):
