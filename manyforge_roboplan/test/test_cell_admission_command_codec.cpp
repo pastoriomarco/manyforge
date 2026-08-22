@@ -33,8 +33,6 @@ Value Readiness() {
       {"blocking_fault_count", Value(0.0)},
       {"deployment_converged", Value(true)},
       {"deployment_status_current", Value(true)},
-      {"manager_current", Value(true)},
-      {"manager_status_current", Value(true)},
       {"program_cycle_status", Value(nullptr)},
       {"program_cycle_status_current", Value(true)},
       {"required_component_current_compatible_ready_converged", Value(1.0)},
@@ -172,12 +170,21 @@ TEST(CellAdmissionCommandCodec, RejectsUnknownExtraTypeRangeEnumAndOversize) {
                std::invalid_argument);
   auto wrong_type = Readiness().as_object();
   for (auto &[key, value] : wrong_type)
-    if (key == "manager_current")
+    if (key == "program_cycle_status_current")
       value = Value("true");
   EXPECT_THROW(TryDecodeCellAdmissionCommand(ci::canonical_json(
                    Envelope("cell_admission_update_readiness",
                             Value(std::move(wrong_type))))),
                std::invalid_argument);
+  for (const auto *old_field :
+       {"manager_current", "manager_status_current"}) {
+    auto old_shape = Readiness().as_object();
+    old_shape.emplace_back(old_field, Value(true));
+    EXPECT_THROW(TryDecodeCellAdmissionCommand(ci::canonical_json(
+                     Envelope("cell_admission_update_readiness",
+                              Value(std::move(old_shape))))),
+                 std::invalid_argument);
+  }
   auto range = Readiness().as_object();
   for (auto &[key, value] : range)
     if (key == "required_component_total")

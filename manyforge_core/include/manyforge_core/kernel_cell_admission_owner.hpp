@@ -1,6 +1,7 @@
 #pragma once
 
 #include <functional>
+#include <manyforge_core/ports/i_manager_liveness_observation_port.hpp>
 #include <manyforge_core/ports/ikernel_cell_admission_port.hpp>
 #include <manyforge_core/ports/ioperation_journal.hpp>
 #include <manyforge_core/time/iclock.hpp>
@@ -22,7 +23,8 @@ using CellAdmissionReconcileValidator =
 /// The sole focused cell-admission ledger composed inside Kernel. Kernel takes
 /// its shared admission mutex before this state mutex; Stop recognition and
 /// forensic projection take neither in that order and retain their reserve.
-class KernelCellAdmissionOwner final : public IKernelCellAdmissionPort {
+class KernelCellAdmissionOwner final : public IKernelCellAdmissionPort,
+                                       public IManagerLivenessObservationPort {
  public:
   KernelCellAdmissionOwner(
       RequestOwnerEpoch kernel_owner_epoch, std::size_t capacity, IClock& clock,
@@ -34,7 +36,9 @@ class KernelCellAdmissionOwner final : public IKernelCellAdmissionPort {
       CellAdmissionReconcileValidator reconcile_validator = {},
       std::vector<OperationJournalRecoveryDTO::RecoveredCellAdmissionMembershipDTO>
           recovered_membership = {},
-      std::vector<CellAdmissionCurrentOwnerEpochDTO> recovered_current_owners = {});
+      std::vector<CellAdmissionCurrentOwnerEpochDTO> recovered_current_owners = {},
+      std::optional<ManagerLivenessRequiredSetDTO> manager_liveness_required_set =
+          std::nullopt);
 
   [[nodiscard]] AuthoringAdmissionDTO GetAuthoringAdmission() const override;
   [[nodiscard]] Result<AuthoringAdmissionDTO> UpdateCellAdmissionReadiness(
@@ -48,6 +52,12 @@ class KernelCellAdmissionOwner final : public IKernelCellAdmissionPort {
   [[nodiscard]] Result<CellAdmissionRecoveryReceiptDTO>
   GetCellAdmissionRecoveryReceipt(
       const CellAdmissionRecoveryReceiptQueryDTO& query) const override;
+  [[nodiscard]] Result<void> Publish(
+      const ManagerLivenessObservationDTO& observation) override;
+  [[nodiscard]] Result<AuthoringAdmissionDTO> ReplaceManagerLivenessRequiredSet(
+      const ManagerLivenessRequiredSetDTO& required_set);
+  [[nodiscard]] bool LatchManagerLivenessLoss(
+      const ManagerLivenessLossIntentDTO& intent) noexcept;
 
   [[nodiscard]] bool has_unresolved_claims() const;
 
@@ -65,6 +75,17 @@ class KernelCellAdmissionOwner final : public IKernelCellAdmissionPort {
   [[nodiscard]] const Entry* ParentCycleLocked(
       const CellAdmissionClaimIntentDTO& intent) const;
   [[nodiscard]] bool IsStaleOwnerLocked(const CellAdmissionClaimIntentDTO& intent) const;
+  [[nodiscard]] Result<void> AdvanceGenerationLocked();
+
+  struct ManagerLivenessRow final {
+    RequiredManagerLivenessReceiverDTO receiver;
+    std::uint64_t status_sequence{};
+    bool current_unfenced{};
+    bool direct_loss_inhibited{};
+    bool generation_advance_pending{};
+    std::uint64_t generation_pending_sequence{};
+    bool generation_pending_current{};
+  };
 
   RequestOwnerEpoch kernel_owner_epoch_;
   std::size_t capacity_;
@@ -74,7 +95,11 @@ class KernelCellAdmissionOwner final : public IKernelCellAdmissionPort {
   CellAdmissionSettlementValidator settlement_validator_;
   CellAdmissionReconcileValidator reconcile_validator_;
   mutable std::mutex mutex_;
+  mutable std::mutex liveness_transition_mutex_;
   CellAdmissionReadinessSnapshotDTO readiness_;
+  std::optional<ManagerLivenessRequiredSetDTO> manager_liveness_required_set_;
+  std::vector<ManagerLivenessRow> manager_liveness_rows_;
+  std::size_t manager_liveness_current_unfenced_count_{};
   AdmissionGeneration generation_{1U};
   CellAdmissionClaimGeneration next_claim_generation_{1U};
   std::size_t held_claim_count_{};

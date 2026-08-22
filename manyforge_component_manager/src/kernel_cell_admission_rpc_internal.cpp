@@ -245,8 +245,6 @@ void Readiness(Writer &w, const core::CellAdmissionReadinessSnapshotDTO &x) {
     Opt(w, v.terminal_or_settlement_reference,
         [](Writer &w, const auto &v) { S(w, v); });
   });
-  w.Bool(x.manager_status_current);
-  w.Bool(x.manager_current);
   w.Bool(x.required_component_status_current);
   w.U64(x.required_component_total);
   w.U64(x.required_component_current_compatible_ready_converged);
@@ -273,8 +271,6 @@ core::CellAdmissionReadinessSnapshotDTO Readiness(Reader &r) {
         Opt<core::ContentDigest>(
             r, [](Reader &r) { return S<core::ContentDigest>(r); })};
   });
-  x.manager_status_current = r.Bool();
-  x.manager_current = r.Bool();
   x.required_component_status_current = r.Bool();
   x.required_component_total = r.U32();
   x.required_component_current_compatible_ready_converged = r.U32();

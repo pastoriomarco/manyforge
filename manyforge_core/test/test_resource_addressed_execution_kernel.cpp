@@ -10,6 +10,7 @@
 #include <functional>
 #include <future>
 #include <iterator>
+#include <manyforge_core/manager_liveness_receiver.hpp>
 #include <manyforge_core/ports/imotion_preview.hpp>
 #include <manyforge_core/prepared_operation_participant_codec.hpp>
 #include <manyforge_core/prepared_participant_stop_plan_codec.hpp>
@@ -1244,6 +1245,9 @@ class FakeOperationJournal final : public IOperationJournal {
 
   Result<std::uint64_t> RecordCellAdmissionGenerationAdvanced(
       const RequestOwnerEpoch&, AdmissionGeneration, AdmissionGeneration) override {
+    if (cell_admission_generation_hook) {
+      cell_admission_generation_hook();
+    }
     std::lock_guard lock(mutex);
     calls.push_back("cell_admission_generation_advanced");
     return Result<std::uint64_t>::Ok(next_sequence++);
@@ -1293,6 +1297,7 @@ class FakeOperationJournal final : public IOperationJournal {
   std::function<void()> control_acceptance_hook;
   std::function<void()> stop_acceptance_hook;
   std::function<void()> cell_admission_acquire_hook;
+  std::function<void()> cell_admission_generation_hook;
   std::function<void(std::string_view)> record_hook;
   std::vector<StopId> projected_stop_acceptances;
   std::vector<StopId> projected_stop_terminals;
@@ -1395,6 +1400,17 @@ FakeOperationJournal default_journal;
 
 [[nodiscard]] std::string test_digest(const char digit) {
   return "sha256:" + std::string(64U, digit);
+}
+
+ManagerLivenessRequiredSetDTO EmptyManagerLivenessSet() {
+  ManagerLivenessRequiredSetDTO result{
+      CellId("cell.test"), RetainedBundleId("bundle.test"),
+      ContentDigest(test_digest('a')),
+      RuntimeUnitId("manager"), RuntimeEpoch("manager.epoch.1"),
+      RequestOwnerEpoch("manager.owner.1"), {}};
+  result.required_runtime_set_digest =
+      ComputeRequiredRuntimeSetDigest(result.required_receivers);
+  return result;
 }
 
 [[nodiscard]] ResolvedStopBasePlanDTO stop_base_plan_for(
@@ -6039,8 +6055,8 @@ TEST(ResourceAddressedExecutionKernelTest,
             ResourceSlotState::kUnreconciledExternalOrOrphanGoal);
 }
 
-TEST(ResourceAddressedExecutionKernelTest,
-     SurveillanceCheckpointFailureDegradesPersistenceAndRecoveryClearsOnlyAfterDurableCommit) {
+void VerifyStopFaultRecoveryMotionAdmission(
+    const bool latch_manager_liveness_loss) {
   FakeClock clock;
   clock.set(100);
   ManualScheduler scheduler;
@@ -6058,9 +6074,21 @@ TEST(ResourceAddressedExecutionKernelTest,
   const StopFaultRecoveryConfigurationExpectationDTO expected_configuration{
       control.control_domain_id, control.active_control_configuration_id,
       control.active_control_configuration_generation};
+  ManagerLivenessRequiredSetDTO liveness{
+      CellId("cell.test"),
+      RetainedBundleId("bundle.test"),
+      ContentDigest(test_digest('4')),
+      RuntimeUnitId("manager"),
+      RuntimeEpoch("manager.epoch.1"),
+      RequestOwnerEpoch("manager.owner.1"),
+      {{RuntimeUnitId("runtime.a"), RuntimeEpoch("runtime.a.epoch"),
+        RuntimePolicyId("policy.1"), RuntimePolicyRevision("1")}}};
+  liveness.required_runtime_set_digest =
+      ComputeRequiredRuntimeSetDigest(liveness.required_receivers);
 
   ResourceAddressedExecutionKernelConfig config{RequestOwnerEpoch("kernel.epoch.1"),
                                                 CellId("cell.test"), 32U};
+  config.manager_liveness_required_set = liveness;
   config.stop_surveillance =
       StopSurveillanceExecutionConfig{&scheduler, &observer, StopSurveillancePolicyDTO{10, 10, 8U}};
   config.stop_fault_recovery_facts_resolver =
@@ -6117,11 +6145,38 @@ TEST(ResourceAddressedExecutionKernelTest,
                                           clock, journal, std::move(config));
   const auto operation = kernel.execute(motion_operation("request.surveillance.execute"));
   ASSERT_TRUE(operation.ok()) << operation.error().message;
-  const auto stopped =
-      kernel.stop(stop_request("request.surveillance.stop", operation.value(), 1U));
-  ASSERT_TRUE(stopped.ok()) << stopped.error().message;
+  std::optional<StopAcceptedDTO> stopped;
+  if (latch_manager_liveness_loss) {
+    kernel.LatchAndContain(ManagerLivenessLossIntentDTO{
+        liveness.cell_id,
+        liveness.active_bundle_id,
+        liveness.required_runtime_set_digest,
+        liveness.required_receivers.front().runtime_unit_id,
+        liveness.required_receivers.front().runtime_epoch,
+        liveness.required_receivers.front().runtime_policy_id,
+        liveness.required_receivers.front().runtime_policy_revision,
+        liveness.manager_runtime_unit_id,
+        liveness.manager_runtime_epoch,
+        liveness.manager_owner_epoch,
+        1U,
+        ManagerLivenessLossKindDTO::kExpiry});
+    ASSERT_TRUE(wait_until([&] {
+      std::lock_guard lock(journal.mutex);
+      if (!journal.last_stop_accepted.has_value()) {
+        return false;
+      }
+      stopped = journal.last_stop_accepted;
+      return true;
+    }));
+  } else {
+    const auto accepted =
+        kernel.stop(stop_request("request.surveillance.stop", operation.value(), 1U));
+    ASSERT_TRUE(accepted.ok()) << accepted.error().message;
+    stopped = accepted.value();
+  }
+  ASSERT_TRUE(stopped.has_value());
   ASSERT_TRUE(wait_until([&] {
-    const auto status = kernel.get_stop_status(stopped.value().stop_id);
+    const auto status = kernel.get_stop_status(stopped->stop_id);
     return status.ok() && status.value().stop_certificate.has_value() &&
            status.value().terminal_projection.state == StopDurableProjectionStateDTO::kRecorded &&
            status.value().surveillance.has_value();
@@ -6135,7 +6190,7 @@ TEST(ResourceAddressedExecutionKernelTest,
   clock.set(110);
   scheduler.advance_to(110);
   ASSERT_TRUE(wait_until([&] {
-    const auto status = kernel.get_stop_status(stopped.value().stop_id);
+    const auto status = kernel.get_stop_status(stopped->stop_id);
     return journal.stop_surveillance_calls.load() == 1 && status.ok() &&
            status.value().surveillance_projection.state == StopDurableProjectionStateDTO::kFailed;
   }));
@@ -6153,7 +6208,7 @@ TEST(ResourceAddressedExecutionKernelTest,
   clock.set(120);
   scheduler.advance_to(120);
   ASSERT_TRUE(wait_until([&] {
-    const auto status = kernel.get_stop_status(stopped.value().stop_id);
+    const auto status = kernel.get_stop_status(stopped->stop_id);
     return journal.stop_surveillance_calls.load() >= 2 && status.ok() &&
            status.value().surveillance.has_value() &&
            status.value().surveillance->state ==
@@ -6165,7 +6220,7 @@ TEST(ResourceAddressedExecutionKernelTest,
   clock.set(100'000'120);
   scheduler.advance_to(100'000'120);
   ASSERT_TRUE(wait_until([&] {
-    const auto status = kernel.get_stop_status(stopped.value().stop_id);
+    const auto status = kernel.get_stop_status(stopped->stop_id);
     return journal.stop_surveillance_calls.load() >= 3 && status.ok() &&
            status.value().surveillance.has_value() &&
            status.value().surveillance->state ==
@@ -6244,9 +6299,32 @@ TEST(ResourceAddressedExecutionKernelTest,
 
   auto admitted_intent = motion_operation("request.surveillance.admitted");
   admitted_intent.program_binding_id = unaffected_binding.value().program_binding_id;
+  if (latch_manager_liveness_loss) {
+    const auto preview = kernel.begin_motion_preview_session(admitted_intent);
+    ASSERT_FALSE(preview.ok());
+    EXPECT_EQ(preview.error().details.at("reason"),
+              "motion_admission_closed");
+  }
   const auto admitted = kernel.execute(admitted_intent);
-  ASSERT_TRUE(admitted.ok()) << admitted.error().message;
-  EXPECT_EQ(unaffected_engine.execute_calls, 1);
+  if (latch_manager_liveness_loss) {
+    ASSERT_FALSE(admitted.ok());
+    EXPECT_EQ(admitted.error().details.at("reason"),
+              "motion_admission_closed");
+    EXPECT_EQ(unaffected_engine.execute_calls, 0);
+  } else {
+    ASSERT_TRUE(admitted.ok()) << admitted.error().message;
+    EXPECT_EQ(unaffected_engine.execute_calls, 1);
+  }
+}
+
+TEST(ResourceAddressedExecutionKernelTest,
+     SurveillanceCheckpointFailureDegradesPersistenceAndRecoveryClearsOnlyAfterDurableCommit) {
+  VerifyStopFaultRecoveryMotionAdmission(false);
+}
+
+TEST(ResourceAddressedExecutionKernelTest,
+     ManagerLossInhibitSurvivesOtherwiseValidStopFaultRecovery) {
+  VerifyStopFaultRecoveryMotionAdmission(true);
 }
 
 TEST(ResourceAddressedExecutionKernelTest,
@@ -6324,6 +6402,7 @@ void VerifyRecognizedFullStopDoesNotWaitForBlockedCellAdmissionJournalWrite(
       RequestOwnerEpoch("kernel.epoch.1"), CellId("cell.test"), 16U};
   config.cell_admission_settlement_validator =
       [](const auto&, const auto&) { return Result<void>::Ok(); };
+  config.manager_liveness_required_set = EmptyManagerLivenessSet();
   ResourceAddressedExecutionKernel kernel({registration(binding, engine)}, clock, journal,
                                           std::move(config));
   if (retain_active_resource) {
@@ -6335,7 +6414,7 @@ void VerifyRecognizedFullStopDoesNotWaitForBlockedCellAdmissionJournalWrite(
       ProgramCycleStatusDTO{RequestOwnerEpoch("program.owner"), 1U,
                             ProgramCycleStateDTO::kIdleAfterReset, std::nullopt, std::nullopt,
                             std::nullopt},
-      true, true, true, 1U, 1U,
+      true, 1U, 1U,
       true, true, 0U, 0U, 0U};
   ASSERT_TRUE(kernel.UpdateCellAdmissionReadiness(ready).ok());
   const auto generation = kernel.GetAuthoringAdmission().admission_generation;
@@ -6385,6 +6464,115 @@ TEST(ResourceAddressedExecutionKernelTest,
 }
 
 TEST(ResourceAddressedExecutionKernelTest,
+     ReceiverExpiryPreemptsBlockedUnfenceAndContainsActiveOperation) {
+  FakeClock clock;
+  ManualScheduler scheduler;
+  FakeParticipantEngine engine;
+  FakeOperationJournal journal;
+  const auto binding =
+      make_binding("arm", "arm", "execution.trajectory.execute",
+                   CoordinateKind::kAngular);
+  ManagerLivenessRequiredSetDTO liveness{
+      CellId("cell.test"),
+      RetainedBundleId("bundle.test"),
+      ContentDigest(test_digest('1')),
+      RuntimeUnitId("manager"),
+      RuntimeEpoch("manager.epoch.1"),
+      RequestOwnerEpoch("manager.owner.1"),
+      {{RuntimeUnitId("runtime.a"), RuntimeEpoch("runtime.a.epoch"),
+        RuntimePolicyId("policy.1"), RuntimePolicyRevision("1")}}};
+  liveness.required_runtime_set_digest =
+      ComputeRequiredRuntimeSetDigest(liveness.required_receivers);
+  ResourceAddressedExecutionKernelConfig config{
+      RequestOwnerEpoch("kernel.epoch.1"), CellId("cell.test"), 16U};
+  config.manager_liveness_required_set = liveness;
+  ResourceAddressedExecutionKernel kernel(
+      {registration(binding, engine)}, clock, journal, std::move(config));
+
+  const CellAdmissionReadinessSnapshotDTO ready{
+      true,
+      ProgramCycleStatusDTO{RequestOwnerEpoch("program.owner"), 1U,
+                            ProgramCycleStateDTO::kIdleAfterReset, std::nullopt,
+                            std::nullopt, std::nullopt},
+      true, 1U, 1U, true, true, 0U, 0U, 0U};
+  ASSERT_TRUE(kernel.UpdateCellAdmissionReadiness(ready).ok());
+  ManagerLivenessReceiver receiver(
+      ManagerLivenessReceiverConfig{
+          liveness.cell_id,
+          liveness.required_receivers.front().runtime_unit_id,
+          liveness.required_receivers.front().runtime_epoch,
+          liveness.manager_runtime_unit_id,
+          liveness.manager_runtime_epoch,
+          liveness.manager_owner_epoch,
+          ManagerLivenessPolicyDTO{
+              liveness.required_receivers.front().runtime_policy_id,
+              liveness.required_receivers.front().runtime_policy_revision,
+              10, 30, ProductContractId("safe.1"),
+              ProductContractRevision("1")},
+          liveness.active_bundle_id,
+          liveness.required_runtime_set_digest},
+      clock, scheduler,
+      []() -> ContentDigest {
+        throw std::runtime_error("injected local-safe failure");
+      },
+      kernel, kernel);
+  ASSERT_TRUE(receiver.Renew(ManagerHeartbeatDTO{
+      liveness.cell_id, liveness.manager_runtime_unit_id,
+      liveness.manager_runtime_epoch, liveness.manager_owner_epoch, 1U,
+      liveness.required_receivers.front().runtime_policy_id,
+      liveness.required_receivers.front().runtime_policy_revision}).ok());
+  const auto operation =
+      kernel.execute(motion_operation("request.manager-loss.active"));
+  ASSERT_TRUE(operation.ok()) << operation.error().message;
+
+  std::promise<void> publication_entered_promise;
+  auto publication_entered = publication_entered_promise.get_future();
+  std::promise<void> release_publication_promise;
+  auto release_publication = release_publication_promise.get_future().share();
+  journal.cell_admission_generation_hook = [&] {
+    publication_entered_promise.set_value();
+    release_publication.wait();
+  };
+  auto publishing = std::async(std::launch::async, [&] {
+    return receiver.CompleteReconciliation(
+        ManagerLivenessReconciliationAck{
+            liveness.cell_id, liveness.manager_runtime_unit_id,
+            liveness.manager_runtime_epoch, liveness.manager_owner_epoch,
+            liveness.active_bundle_id, liveness.required_runtime_set_digest,
+            ContentDigest(test_digest('7'))});
+  });
+  if (publication_entered.wait_for(std::chrono::seconds(10)) !=
+      std::future_status::ready) {
+    release_publication_promise.set_value();
+    static_cast<void>(publishing.get());
+    FAIL() << "Manager-liveness publication did not reach its blocking seam";
+  }
+
+  clock.set(30);
+  auto expiring = std::async(
+      std::launch::async, [&] { scheduler.advance_to(30); });
+  ASSERT_TRUE(wait_until([&] {
+    const auto state =
+        kernel.get_operation_state(operation.value().operation_id);
+    return state.ok() && state.value().state != OperationStateKind::kPrepared;
+  }));
+  EXPECT_EQ(receiver.status().state, ManagerLivenessStateDTO::kExpired);
+  EXPECT_FALSE(kernel.GetAuthoringAdmission().authoring_allowed);
+  release_publication_promise.set_value();
+  expiring.get();
+  const auto reconciliation = publishing.get();
+  ASSERT_FALSE(reconciliation.ok());
+  EXPECT_EQ(reconciliation.error().details.at("reason"),
+            "manager_liveness_reconciliation_superseded");
+  EXPECT_FALSE(kernel.GetAuthoringAdmission().authoring_allowed);
+  const auto contained =
+      kernel.get_operation_state(operation.value().operation_id);
+  ASSERT_TRUE(contained.ok()) << contained.error().message;
+  EXPECT_NE(contained.value().state, OperationStateKind::kPrepared);
+
+}
+
+TEST(ResourceAddressedExecutionKernelTest,
      CellClaimAndOrdinaryAdmissionShareOneDeterministicKernelOrdering) {
   FakeClock clock;
   FakeParticipantEngine engine;
@@ -6399,15 +6587,17 @@ TEST(ResourceAddressedExecutionKernelTest,
   };
   const auto binding =
       make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular);
+  ResourceAddressedExecutionKernelConfig config{
+      RequestOwnerEpoch("kernel.epoch.1"), CellId("cell.test"), 16U};
+  config.manager_liveness_required_set = EmptyManagerLivenessSet();
   ResourceAddressedExecutionKernel kernel(
-      {registration(binding, engine)}, clock, journal,
-      {RequestOwnerEpoch("kernel.epoch.1"), CellId("cell.test"), 16U});
+      {registration(binding, engine)}, clock, journal, std::move(config));
   const CellAdmissionReadinessSnapshotDTO ready{
       true,
       ProgramCycleStatusDTO{RequestOwnerEpoch("program.owner"), 1U,
                             ProgramCycleStateDTO::kIdleAfterReset, std::nullopt, std::nullopt,
                             std::nullopt},
-      true, true, true, 1U, 1U, true, true, 0U, 0U, 0U};
+      true, 1U, 1U, true, true, 0U, 0U, 0U};
   ASSERT_TRUE(kernel.UpdateCellAdmissionReadiness(ready).ok());
   const CellAdmissionClaimIntentDTO claim{
       CellAdmissionClaimKindDTO::kAuthoringMutation,

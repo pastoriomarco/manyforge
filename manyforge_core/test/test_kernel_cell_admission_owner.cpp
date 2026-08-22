@@ -99,7 +99,7 @@ CellAdmissionReadinessSnapshotDTO Ready() {
       ProgramCycleStatusDTO{RequestOwnerEpoch("program.owner"), 1U,
                             ProgramCycleStateDTO::kIdleAfterReset, std::nullopt, std::nullopt,
                             std::nullopt},
-      true, true, true, 2U, 2U,
+      true, 2U, 2U,
       true, true, 0U, 0U, 0U};
 }
 
@@ -167,6 +167,16 @@ ContentDigest Digest(char digit) {
   return ContentDigest("sha256:" + std::string(64U, digit));
 }
 
+ManagerLivenessRequiredSetDTO EmptyLivenessSet() {
+  ManagerLivenessRequiredSetDTO result{
+      CellId("cell.1"), RetainedBundleId("bundle.1"), ContentDigest(kDigest),
+      RuntimeUnitId("manager"), RuntimeEpoch("manager.epoch.1"),
+      RequestOwnerEpoch("manager.owner.1"), {}};
+  result.required_runtime_set_digest =
+      ComputeRequiredRuntimeSetDigest(result.required_receivers);
+  return result;
+}
+
 KernelCellAdmissionOwner Owner(FixedClock& clock, AdmissionJournal& journal,
                                std::size_t capacity = 16U) {
   return KernelCellAdmissionOwner(
@@ -177,7 +187,63 @@ KernelCellAdmissionOwner Owner(FixedClock& clock, AdmissionJournal& journal,
       [](const auto&, const auto& reconcile) {
         return Result<CellAdmissionReconcileValidationDTO>::Ok(
             {reconcile.current_owner_epochs, {}});
-      });
+      },
+      {}, {}, EmptyLivenessSet());
+}
+
+ManagerLivenessRequiredSetDTO LivenessSet(
+    std::vector<RequiredManagerLivenessReceiverDTO> receivers = {
+        {RuntimeUnitId("runtime.a"), RuntimeEpoch("runtime.a.epoch"),
+         RuntimePolicyId("policy.1"), RuntimePolicyRevision("1")},
+        {RuntimeUnitId("runtime.b"), RuntimeEpoch("runtime.b.epoch"),
+         RuntimePolicyId("policy.1"), RuntimePolicyRevision("1")}},
+    RuntimeEpoch manager_epoch = RuntimeEpoch("manager.epoch.1"),
+    RequestOwnerEpoch manager_owner = RequestOwnerEpoch("manager.owner.1")) {
+  ManagerLivenessRequiredSetDTO result{
+      CellId("cell.1"), RetainedBundleId("bundle.1"), ContentDigest(kDigest),
+      RuntimeUnitId("manager"), std::move(manager_epoch),
+      std::move(manager_owner), std::move(receivers)};
+  result.required_runtime_set_digest =
+      ComputeRequiredRuntimeSetDigest(result.required_receivers);
+  return result;
+}
+
+ManagerLivenessObservationDTO LivenessObservation(
+    const ManagerLivenessRequiredSetDTO& set, std::size_t receiver,
+    std::uint64_t sequence, ManagerLivenessStateDTO state,
+    bool fenced = false) {
+  ManagerLivenessStatusDTO status{
+      set.cell_id,
+      set.required_receivers.at(receiver).runtime_unit_id,
+      set.required_receivers.at(receiver).runtime_epoch,
+      set.manager_runtime_unit_id,
+      set.manager_runtime_epoch,
+      set.manager_owner_epoch,
+      set.required_receivers.at(receiver).runtime_policy_id,
+      set.required_receivers.at(receiver).runtime_policy_revision,
+      sequence,
+      sequence,
+      0,
+      state,
+      fenced,
+      std::nullopt};
+  return {status, set.active_bundle_id, set.required_runtime_set_digest,
+          ComputeManagerLivenessStatusDigest(status)};
+}
+
+KernelCellAdmissionOwner LivenessOwner(
+    FixedClock& clock, AdmissionJournal& journal,
+    const ManagerLivenessRequiredSetDTO& set) {
+  return KernelCellAdmissionOwner(
+      RequestOwnerEpoch("kernel.1"), 16U, clock, journal, {},
+      AdmissionGeneration(0U),
+      [](const auto&, const auto&) { return Result<void>::Ok(); },
+      [](const auto&, const auto&) { return Result<void>::Ok(); },
+      [](const auto&, const auto& reconcile) {
+        return Result<CellAdmissionReconcileValidationDTO>::Ok(
+            {reconcile.current_owner_epochs, {}});
+      },
+      {}, {}, set);
 }
 
 TEST(KernelCellAdmissionOwner, StartsFalseAndEveryReadinessInputFailsClosed) {
@@ -194,7 +260,7 @@ TEST(KernelCellAdmissionOwner, StartsFalseAndEveryReadinessInputFailsClosed) {
   EXPECT_EQ(owner.GetAuthoringAdmission().admission_generation, generation);
   EXPECT_EQ(journal.sequence.load(), durable_sequence);
 
-  for (int row = 0; row != 13; ++row) {
+  for (int row = 0; row != 11; ++row) {
     auto blocked = ready;
     switch (row) {
       case 0: blocked.program_cycle_status_current = false; break;
@@ -204,17 +270,15 @@ TEST(KernelCellAdmissionOwner, StartsFalseAndEveryReadinessInputFailsClosed) {
             ProgramCycleStateDTO::kTerminalAwaitingReset, ProgramRunId("run.1"),
             CellAdmissionClaimGeneration(1U), ContentDigest(kDigest)};
         break;
-      case 2: blocked.manager_status_current = false; break;
-      case 3: blocked.manager_current = false; break;
-      case 4: blocked.required_component_status_current = false; break;
-      case 5: blocked.required_component_total = 3U; break;
-      case 6: blocked.required_component_current_compatible_ready_converged = 1U; break;
-      case 7: blocked.deployment_status_current = false; break;
-      case 8: blocked.deployment_converged = false; break;
-      case 9: blocked.blocking_fault_count = 1U; break;
-      case 10: blocked.unresolved_owner_count = 1U; break;
-      case 11: blocked.unsettled_effect_count = 1U; break;
-      case 12:
+      case 2: blocked.required_component_status_current = false; break;
+      case 3: blocked.required_component_total = 3U; break;
+      case 4: blocked.required_component_current_compatible_ready_converged = 1U; break;
+      case 5: blocked.deployment_status_current = false; break;
+      case 6: blocked.deployment_converged = false; break;
+      case 7: blocked.blocking_fault_count = 1U; break;
+      case 8: blocked.unresolved_owner_count = 1U; break;
+      case 9: blocked.unsettled_effect_count = 1U; break;
+      case 10:
         blocked.program_cycle_status = ProgramCycleStatusDTO{
             RequestOwnerEpoch("program.owner"), 2U, ProgramCycleStateDTO::kRunning,
             ProgramRunId("run.1"), CellAdmissionClaimGeneration(1U), std::nullopt};
@@ -224,6 +288,219 @@ TEST(KernelCellAdmissionOwner, StartsFalseAndEveryReadinessInputFailsClosed) {
     EXPECT_FALSE(owner.GetAuthoringAdmission().authoring_allowed) << row;
     ASSERT_TRUE(owner.UpdateCellAdmissionReadiness(ready).ok());
   }
+}
+
+TEST(KernelCellAdmissionOwner,
+     UnconfiguredManagerLivenessNeverOpensAuthoring) {
+  FixedClock clock;
+  AdmissionJournal journal;
+  KernelCellAdmissionOwner owner(RequestOwnerEpoch("kernel.1"), 16U, clock,
+                                 journal, {});
+  ASSERT_TRUE(owner.UpdateCellAdmissionReadiness(Ready()).ok());
+  EXPECT_FALSE(owner.GetAuthoringAdmission().authoring_allowed);
+}
+
+TEST(KernelCellAdmissionOwner,
+     ManagerLivenessUsesExactBoundedSetAndAllCurrentUnfencedPredicate) {
+  FixedClock clock;
+  AdmissionJournal journal;
+  const auto set = LivenessSet();
+  auto owner = LivenessOwner(clock, journal, set);
+  ASSERT_TRUE(owner.UpdateCellAdmissionReadiness(Ready()).ok());
+  EXPECT_FALSE(owner.GetAuthoringAdmission().authoring_allowed);
+
+  const auto generation = owner.GetAuthoringAdmission().admission_generation;
+  ASSERT_TRUE(owner.Publish(LivenessObservation(
+      set, 0U, 1U, ManagerLivenessStateDTO::kCurrent)).ok());
+  EXPECT_GT(owner.GetAuthoringAdmission().admission_generation, generation);
+  EXPECT_FALSE(owner.GetAuthoringAdmission().authoring_allowed);
+  ASSERT_TRUE(owner.Publish(LivenessObservation(
+      set, 1U, 1U, ManagerLivenessStateDTO::kCurrent)).ok());
+  EXPECT_TRUE(owner.GetAuthoringAdmission().authoring_allowed);
+
+  EXPECT_FALSE(owner.Publish(LivenessObservation(
+      set, 1U, 1U, ManagerLivenessStateDTO::kCurrent)).ok());
+  auto fenced = LivenessObservation(
+      set, 1U, 2U, ManagerLivenessStateDTO::kCurrent, true);
+  ASSERT_TRUE(owner.Publish(fenced).ok());
+  EXPECT_FALSE(owner.GetAuthoringAdmission().authoring_allowed);
+  auto expired = LivenessObservation(
+      set, 1U, 3U, ManagerLivenessStateDTO::kExpired, true);
+  ASSERT_TRUE(owner.Publish(expired).ok());
+  EXPECT_FALSE(owner.GetAuthoringAdmission().authoring_allowed);
+  auto unreconciled = LivenessObservation(
+      set, 1U, 4U, ManagerLivenessStateDTO::kUnreconciled, true);
+  ASSERT_TRUE(owner.Publish(unreconciled).ok());
+  EXPECT_FALSE(owner.GetAuthoringAdmission().authoring_allowed);
+}
+
+TEST(KernelCellAdmissionOwner,
+     HealthyRenewalsDoNotChurnGenerationAndPredicateTransitionsAdvanceOnce) {
+  FixedClock clock;
+  AdmissionJournal journal;
+  const auto set = LivenessSet(
+      {{RuntimeUnitId("runtime.a"), RuntimeEpoch("runtime.a.epoch"),
+        RuntimePolicyId("policy.1"), RuntimePolicyRevision("1")}});
+  auto owner = LivenessOwner(clock, journal, set);
+  ASSERT_TRUE(owner.UpdateCellAdmissionReadiness(Ready()).ok());
+
+  ASSERT_TRUE(owner.Publish(LivenessObservation(
+      set, 0U, 1U, ManagerLivenessStateDTO::kCurrent)).ok());
+  const auto current_generation =
+      owner.GetAuthoringAdmission().admission_generation;
+  const auto current_journal_sequence = journal.sequence.load();
+  for (std::uint64_t sequence = 2U; sequence != 102U; ++sequence) {
+    ASSERT_TRUE(owner.Publish(LivenessObservation(
+        set, 0U, sequence, ManagerLivenessStateDTO::kCurrent)).ok());
+  }
+  EXPECT_EQ(owner.GetAuthoringAdmission().admission_generation,
+            current_generation);
+  EXPECT_EQ(journal.sequence.load(), current_journal_sequence);
+
+  ASSERT_TRUE(owner.Publish(LivenessObservation(
+      set, 0U, 102U, ManagerLivenessStateDTO::kExpired, true)).ok());
+  const auto expired_generation =
+      owner.GetAuthoringAdmission().admission_generation;
+  const auto expired_journal_sequence = journal.sequence.load();
+  EXPECT_EQ(expired_generation.value(), current_generation.value() + 1U);
+  EXPECT_EQ(expired_journal_sequence, current_journal_sequence + 1U);
+  ASSERT_TRUE(owner.Publish(LivenessObservation(
+      set, 0U, 103U, ManagerLivenessStateDTO::kExpired, true)).ok());
+  EXPECT_EQ(owner.GetAuthoringAdmission().admission_generation,
+            expired_generation);
+  EXPECT_EQ(journal.sequence.load(), expired_journal_sequence);
+
+  ASSERT_TRUE(owner.Publish(LivenessObservation(
+      set, 0U, 104U, ManagerLivenessStateDTO::kCurrent)).ok());
+  EXPECT_EQ(owner.GetAuthoringAdmission().admission_generation.value(),
+            expired_generation.value() + 1U);
+  EXPECT_EQ(journal.sequence.load(), expired_journal_sequence + 1U);
+}
+
+TEST(KernelCellAdmissionOwner,
+     ManagerLivenessRejectsForeignFactsAndReplacementClearsRows) {
+  FixedClock clock;
+  AdmissionJournal journal;
+  const auto set = LivenessSet();
+  auto owner = LivenessOwner(clock, journal, set);
+  ASSERT_TRUE(owner.UpdateCellAdmissionReadiness(Ready()).ok());
+  auto foreign = LivenessObservation(
+      set, 0U, 1U, ManagerLivenessStateDTO::kCurrent);
+  foreign.active_bundle_id = RetainedBundleId("foreign");
+  foreign.receiver_status_digest =
+      ComputeManagerLivenessStatusDigest(foreign.status);
+  EXPECT_FALSE(owner.Publish(foreign).ok());
+  foreign = LivenessObservation(
+      set, 0U, 1U, ManagerLivenessStateDTO::kCurrent);
+  foreign.required_runtime_set_digest = Digest('f');
+  EXPECT_FALSE(owner.Publish(foreign).ok());
+  auto wrong_epoch = LivenessObservation(
+      set, 0U, 1U, ManagerLivenessStateDTO::kCurrent);
+  wrong_epoch.status.receiver_runtime_epoch = RuntimeEpoch("foreign");
+  wrong_epoch.receiver_status_digest =
+      ComputeManagerLivenessStatusDigest(wrong_epoch.status);
+  EXPECT_FALSE(owner.Publish(wrong_epoch).ok());
+  auto wrong_policy = LivenessObservation(
+      set, 0U, 1U, ManagerLivenessStateDTO::kCurrent);
+  wrong_policy.status.runtime_policy_revision = RuntimePolicyRevision("2");
+  wrong_policy.receiver_status_digest =
+      ComputeManagerLivenessStatusDigest(wrong_policy.status);
+  EXPECT_FALSE(owner.Publish(wrong_policy).ok());
+
+  ASSERT_TRUE(owner.Publish(LivenessObservation(
+      set, 0U, 1U, ManagerLivenessStateDTO::kCurrent)).ok());
+  ASSERT_TRUE(owner.Publish(LivenessObservation(
+      set, 1U, 1U, ManagerLivenessStateDTO::kCurrent)).ok());
+  ASSERT_TRUE(owner.GetAuthoringAdmission().authoring_allowed);
+  auto replacement =
+      LivenessSet(set.required_receivers, RuntimeEpoch("manager.epoch.2"),
+                  RequestOwnerEpoch("manager.owner.2"));
+  const auto before = owner.GetAuthoringAdmission().admission_generation;
+  const auto replaced = owner.ReplaceManagerLivenessRequiredSet(replacement);
+  ASSERT_TRUE(replaced.ok());
+  EXPECT_FALSE(replaced.value().authoring_allowed);
+  EXPECT_GT(replaced.value().admission_generation, before);
+  EXPECT_FALSE(owner.Publish(LivenessObservation(
+      set, 0U, 2U, ManagerLivenessStateDTO::kCurrent)).ok());
+}
+
+TEST(KernelCellAdmissionOwner,
+     RequiredRuntimeDigestRotatesForEpochAndPolicyOnlyReplacement) {
+  const auto original = LivenessSet().required_receivers;
+  auto epoch_replaced = original;
+  epoch_replaced.front().runtime_epoch = RuntimeEpoch("runtime.a.epoch.2");
+  auto policy_replaced = original;
+  policy_replaced.front().runtime_policy_revision =
+      RuntimePolicyRevision("2");
+
+  EXPECT_NE(ComputeRequiredRuntimeSetDigest(original),
+            ComputeRequiredRuntimeSetDigest(epoch_replaced));
+  EXPECT_NE(ComputeRequiredRuntimeSetDigest(original),
+            ComputeRequiredRuntimeSetDigest(policy_replaced));
+}
+
+TEST(KernelCellAdmissionOwner,
+     DirectManagerLossImmediatelyInhibitsAndIsSequenceIdempotent) {
+  FixedClock clock;
+  AdmissionJournal journal;
+  const auto set = LivenessSet(
+      {{RuntimeUnitId("runtime.a"), RuntimeEpoch("runtime.a.epoch"),
+        RuntimePolicyId("policy.1"), RuntimePolicyRevision("1")}});
+  auto owner = LivenessOwner(clock, journal, set);
+  ASSERT_TRUE(owner.UpdateCellAdmissionReadiness(Ready()).ok());
+  ASSERT_TRUE(owner.Publish(LivenessObservation(
+      set, 0U, 1U, ManagerLivenessStateDTO::kCurrent)).ok());
+  ASSERT_TRUE(owner.GetAuthoringAdmission().authoring_allowed);
+  const ManagerLivenessLossIntentDTO loss{
+      set.cell_id,
+      set.active_bundle_id,
+      set.required_runtime_set_digest,
+      set.required_receivers.front().runtime_unit_id,
+      set.required_receivers.front().runtime_epoch,
+      set.required_receivers.front().runtime_policy_id,
+      set.required_receivers.front().runtime_policy_revision,
+      set.manager_runtime_unit_id,
+      set.manager_runtime_epoch,
+      set.manager_owner_epoch,
+      2U,
+      ManagerLivenessLossKindDTO::kExpiry};
+
+  EXPECT_TRUE(owner.LatchManagerLivenessLoss(loss));
+  EXPECT_FALSE(owner.GetAuthoringAdmission().authoring_allowed);
+  EXPECT_FALSE(owner.LatchManagerLivenessLoss(loss));
+  auto stale_unfence = LivenessObservation(
+      set, 0U, 2U, ManagerLivenessStateDTO::kCurrent);
+  EXPECT_FALSE(owner.Publish(stale_unfence).ok());
+  auto fenced = LivenessObservation(
+      set, 0U, 2U, ManagerLivenessStateDTO::kExpired, true);
+  EXPECT_TRUE(owner.Publish(fenced).ok());
+  EXPECT_FALSE(owner.GetAuthoringAdmission().authoring_allowed);
+}
+
+TEST(KernelCellAdmissionOwner, EmptyConfiguredManagerLivenessSetIsComplete) {
+  FixedClock clock;
+  AdmissionJournal journal;
+  const auto set = LivenessSet({});
+  auto owner = LivenessOwner(clock, journal, set);
+  ASSERT_TRUE(owner.UpdateCellAdmissionReadiness(Ready()).ok());
+  EXPECT_TRUE(owner.GetAuthoringAdmission().authoring_allowed);
+}
+
+TEST(KernelCellAdmissionOwner, ManagerLivenessRequiredSetIsBoundedAndCanonical) {
+  FixedClock clock;
+  AdmissionJournal journal;
+  auto duplicate = LivenessSet({
+      {RuntimeUnitId("runtime.a"), RuntimeEpoch("epoch.1"),
+       RuntimePolicyId("policy.1"), RuntimePolicyRevision("1")},
+      {RuntimeUnitId("runtime.a"), RuntimeEpoch("epoch.2"),
+       RuntimePolicyId("policy.1"), RuntimePolicyRevision("1")}});
+  EXPECT_THROW(LivenessOwner(clock, journal, duplicate), std::invalid_argument);
+  auto unsorted = LivenessSet({
+      {RuntimeUnitId("runtime.b"), RuntimeEpoch("epoch.1"),
+       RuntimePolicyId("policy.1"), RuntimePolicyRevision("1")},
+      {RuntimeUnitId("runtime.a"), RuntimeEpoch("epoch.2"),
+       RuntimePolicyId("policy.1"), RuntimePolicyRevision("1")}});
+  EXPECT_THROW(LivenessOwner(clock, journal, unsorted), std::invalid_argument);
 }
 
 TEST(KernelCellAdmissionOwner, ClosedFreshMatrixAndReplayReleaseFences) {
@@ -585,7 +862,8 @@ TEST(KernelCellAdmissionOwner,
                reconcile.current_owner_epochs.front().owner_epoch,
                CellAdmissionSettlementKindDTO::kReconciled,
                reconcile.reconciliation_evidence_digest}}});
-      });
+      },
+      {}, {}, EmptyLivenessSet());
   ASSERT_TRUE(owner.UpdateCellAdmissionReadiness(Ready()).ok());
   auto acquired = owner.AcquireCellAdmissionClaim(
       Intent(CellAdmissionClaimKindDTO::kAuthoringMutation,
@@ -645,7 +923,7 @@ TEST(KernelCellAdmissionOwner, ReleaseUsesImmutableAcquireGenerationNotCurrentGe
              owner.GetAuthoringAdmission().admission_generation));
   ASSERT_TRUE(claim.ok());
   auto changed = Ready();
-  changed.manager_current = false;
+  changed.deployment_converged = false;
   ASSERT_TRUE(owner.UpdateCellAdmissionReadiness(changed).ok());
   EXPECT_NE(owner.GetAuthoringAdmission().admission_generation,
             claim.value().acquired_admission_generation);

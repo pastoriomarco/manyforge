@@ -2339,7 +2339,8 @@ ResourceAddressedExecutionKernel::ResourceAddressedExecutionKernel(
       config_.cell_admission_settlement_validator,
       config_.cell_admission_reconcile_validator,
       std::move(recovery.value().recovered_cell_admission_membership),
-      std::move(recovery.value().recovered_cell_admission_current_owners));
+      std::move(recovery.value().recovered_cell_admission_current_owners),
+      config_.manager_liveness_required_set);
   if (recovery.value().recovered_stops.size() > kMaximumResidentStopTerminalRecords) {
     throw std::runtime_error("recovered Stop terminal history exceeds its fixed bound");
   }
@@ -2596,6 +2597,66 @@ Result<CellAdmissionRecoveryReceiptDTO>
 ResourceAddressedExecutionKernel::GetCellAdmissionRecoveryReceipt(
     const CellAdmissionRecoveryReceiptQueryDTO& query) const {
   return cell_admission_owner_->GetCellAdmissionRecoveryReceipt(query);
+}
+
+Result<void> ResourceAddressedExecutionKernel::Publish(
+    const ManagerLivenessObservationDTO& observation) {
+  // Deliberately bypasses the operation admission mutex: receiver-local
+  // containment and Stop acceptance must not wait on liveness publication.
+  return cell_admission_owner_->Publish(observation);
+}
+
+void ResourceAddressedExecutionKernel::LatchAndContain(
+    const ManagerLivenessLossIntentDTO& intent) noexcept {
+  try {
+    if (!cell_admission_owner_->LatchManagerLivenessLoss(intent)) {
+      return;
+    }
+    StopGeneration expected_stop_generation(0U);
+    {
+      std::lock_guard state_lock(state_mutex_);
+      // This is the execution-side fail-safe latch. It is not a second
+      // liveness timer or state owner and is deliberately set before Stop I/O.
+      manager_liveness_motion_inhibited_ = true;
+      motion_admission_closed_ = true;
+      expected_stop_generation = cell_stop_generation_;
+    }
+    const auto material =
+        config_.request_owner_epoch.value() + "\nmanager-liveness-loss\n" +
+        intent.cell_id.value() + "\n" +
+        intent.receiver_runtime_unit_id.value() + "\n" +
+        intent.receiver_runtime_epoch.value() + "\n" +
+        std::to_string(intent.receiver_status_sequence);
+    FullStopIntentDTO containment{
+        PublicRequestContextDTO{
+            RequestId(manyforge::content_identity::sha256_digest(material)),
+            config_.request_owner_epoch, "kernel.manager_liveness",
+            intent.receiver_runtime_unit_id.value()},
+        expected_stop_generation,
+        RequestAttributionDTO{RequestTransportDTO::kInternal,
+                              RequestAssuranceDTO::kUnverified,
+                              std::nullopt}};
+    auto stopped =
+        accept_stop(EmergencyStopProjectedIntentDTO{std::move(containment)});
+    if (!stopped.ok()) {
+      std::lock_guard state_lock(state_mutex_);
+      manager_liveness_motion_inhibited_ = true;
+      motion_admission_closed_ = true;
+    }
+  } catch (...) {
+    try {
+      std::lock_guard state_lock(state_mutex_);
+      manager_liveness_motion_inhibited_ = true;
+      motion_admission_closed_ = true;
+    } catch (...) {
+    }
+  }
+}
+
+Result<AuthoringAdmissionDTO>
+ResourceAddressedExecutionKernel::ReplaceManagerLivenessRequiredSet(
+    const ManagerLivenessRequiredSetDTO& required_set) {
+  return cell_admission_owner_->ReplaceManagerLivenessRequiredSet(required_set);
 }
 
 Result<void> ResourceAddressedExecutionKernel::reconfigure_runtime_participants(
@@ -6260,7 +6321,7 @@ Result<StopFaultRecoveryResultDTO> ResourceAddressedExecutionKernel::recover_sto
   // Orphan fences are resource-scoped and enforced by the slot table. A
   // successful durable fault clear removes the cell-wide Stop latch without
   // weakening any remaining orphan resource.
-  motion_admission_closed_ = false;
+  motion_admission_closed_ = manager_liveness_motion_inhibited_;
   return Result<StopFaultRecoveryResultDTO>::Ok(std::move(evaluated.value().result));
 }
 

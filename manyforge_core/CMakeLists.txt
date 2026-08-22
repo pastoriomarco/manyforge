@@ -44,6 +44,8 @@ add_library(manyforge_core
   src/cclc_open_request.cpp
   src/cell_admission.cpp
   src/kernel_cell_admission_owner.cpp
+  src/manager_liveness.cpp
+  src/manager_liveness_receiver.cpp
   src/component_lifecycle_journal_codec.cpp
   src/component_lifecycle_plan_catalog_codec.cpp
   src/component_lifecycle_plan_evaluator.cpp
@@ -544,6 +546,13 @@ if(BUILD_TESTING)
   target_link_libraries(test_kernel_cell_admission_owner PRIVATE
     manyforge_core GTest::gtest_main)
   gtest_discover_tests(test_kernel_cell_admission_owner
+    PROPERTIES TIMEOUT ${MANYFORGE_GTEST_TIMEOUT_SECONDS})
+
+  add_executable(test_manager_liveness_receiver
+    test/test_manager_liveness_receiver.cpp)
+  target_link_libraries(test_manager_liveness_receiver PRIVATE
+    manyforge_core GTest::gtest_main)
+  gtest_discover_tests(test_manager_liveness_receiver
     PROPERTIES TIMEOUT ${MANYFORGE_GTEST_TIMEOUT_SECONDS})
 
   if(MANYFORGE_CORE_BUILD_SQLITE_OPERATION_JOURNAL)

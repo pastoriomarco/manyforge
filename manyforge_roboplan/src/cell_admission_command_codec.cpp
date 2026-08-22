@@ -235,7 +235,7 @@ core::CellAdmissionClaimReleaseDTO Release(const Value &v) {
   return result;
 }
 core::CellAdmissionReadinessSnapshotDTO Readiness(const Value &v) {
-  Exact(v, 12U);
+  Exact(v, 10U);
   core::CellAdmissionReadinessSnapshotDTO result;
   result.program_cycle_status_current =
       Bool(v, "program_cycle_status_current");
@@ -267,8 +267,6 @@ core::CellAdmissionReadinessSnapshotDTO Readiness(const Value &v) {
                   return core::ContentDigest(n.as_string());
                 })};
       });
-  result.manager_status_current = Bool(v, "manager_status_current");
-  result.manager_current = Bool(v, "manager_current");
   result.required_component_status_current =
       Bool(v, "required_component_status_current");
   result.required_component_total = static_cast<std::uint32_t>(

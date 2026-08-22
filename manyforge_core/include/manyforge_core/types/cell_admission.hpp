@@ -268,8 +268,6 @@ struct ProgramCycleStatusDTO final {
 struct CellAdmissionReadinessSnapshotDTO final {
   bool program_cycle_status_current{};
   std::optional<ProgramCycleStatusDTO> program_cycle_status;
-  bool manager_status_current{};
-  bool manager_current{};
   bool required_component_status_current{};
   std::uint32_t required_component_total{};
   std::uint32_t required_component_current_compatible_ready_converged{};

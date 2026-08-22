@@ -75,7 +75,8 @@ KernelCellAdmissionOwner::KernelCellAdmissionOwner(
     CellAdmissionReconcileValidator reconcile_validator,
     std::vector<OperationJournalRecoveryDTO::RecoveredCellAdmissionMembershipDTO>
         recovered_membership,
-    std::vector<CellAdmissionCurrentOwnerEpochDTO> recovered_current_owners)
+    std::vector<CellAdmissionCurrentOwnerEpochDTO> recovered_current_owners,
+    std::optional<ManagerLivenessRequiredSetDTO> manager_liveness_required_set)
     : kernel_owner_epoch_(std::move(kernel_owner_epoch)),
       capacity_(capacity),
       clock_(clock),
@@ -83,6 +84,7 @@ KernelCellAdmissionOwner::KernelCellAdmissionOwner(
       intervention_validator_(std::move(intervention_validator)),
       settlement_validator_(std::move(settlement_validator)),
       reconcile_validator_(std::move(reconcile_validator)),
+      manager_liveness_required_set_(std::move(manager_liveness_required_set)),
       membership_(std::move(recovered_membership)),
       current_owners_(std::move(recovered_current_owners)) {
   if (kernel_owner_epoch_.empty() || capacity_ == 0U ||
@@ -104,6 +106,19 @@ KernelCellAdmissionOwner::KernelCellAdmissionOwner(
                    [](const auto& owner) { return owner.owner_epoch.empty(); });
   if (!owners_canonical) {
     throw std::runtime_error("durable cell-admission current-owner truth is invalid");
+  }
+  if (manager_liveness_required_set_.has_value()) {
+    if (!ValidateManagerLivenessRequiredSet(*manager_liveness_required_set_).ok()) {
+      throw std::invalid_argument(
+          "Kernel Manager-liveness required set is invalid");
+    }
+    manager_liveness_rows_.reserve(
+        manager_liveness_required_set_->required_receivers.size());
+    for (const auto& receiver :
+         manager_liveness_required_set_->required_receivers) {
+      manager_liveness_rows_.push_back(
+          {receiver, 0U, false, false, false, 0U, false});
+    }
   }
   for (std::size_t index = 0; index < membership_.size(); ++index) {
     const auto& member = membership_[index];
@@ -205,16 +220,36 @@ KernelCellAdmissionOwner::KernelCellAdmissionOwner(
 }
 
 bool KernelCellAdmissionOwner::BaseReadinessLocked() const noexcept {
+  const bool manager_liveness_current =
+      manager_liveness_required_set_.has_value() &&
+      manager_liveness_current_unfenced_count_ ==
+          manager_liveness_rows_.size();
   return readiness_.program_cycle_status_current &&
          readiness_.program_cycle_status.has_value() &&
          readiness_.program_cycle_status->state == ProgramCycleStateDTO::kIdleAfterReset &&
-         readiness_.manager_status_current && readiness_.manager_current &&
+         manager_liveness_current &&
          readiness_.required_component_status_current &&
          readiness_.required_component_total ==
              readiness_.required_component_current_compatible_ready_converged &&
          readiness_.deployment_status_current && readiness_.deployment_converged &&
          readiness_.blocking_fault_count == 0U && readiness_.unresolved_owner_count == 0U &&
          readiness_.unsettled_effect_count == 0U;
+}
+
+Result<void> KernelCellAdmissionOwner::AdvanceGenerationLocked() {
+  if (generation_.value() >= 9'007'199'254'740'991ULL) {
+    return Result<void>::Err(
+        ErrorDTO{"authoring_not_ready", "cell-authoring admission is not ready",
+                 {{"reason", "admission_generation_exhausted"}}});
+  }
+  const AdmissionGeneration next(generation_.value() + 1U);
+  auto recorded =
+      journal_.RecordCellAdmissionGenerationAdvanced(kernel_owner_epoch_, generation_, next);
+  if (!recorded.ok()) {
+    return Result<void>::Err(recorded.error());
+  }
+  generation_ = next;
+  return Result<void>::Ok();
 }
 
 AuthoringAdmissionDTO KernelCellAdmissionOwner::AdmissionLocked() const noexcept {
@@ -238,6 +273,7 @@ Result<AuthoringAdmissionDTO> KernelCellAdmissionOwner::UpdateCellAdmissionReadi
       !ValidateProgramCycleStatus(*snapshot.program_cycle_status).ok()) {
     return Reject<AuthoringAdmissionDTO>("invalid_request", "readiness_snapshot_invalid");
   }
+  std::lock_guard transition_lock(liveness_transition_mutex_);
   std::lock_guard lock(mutex_);
   if (readiness_ != snapshot) {
     if (generation_.value() >= 9'007'199'254'740'991ULL) {
@@ -253,6 +289,196 @@ Result<AuthoringAdmissionDTO> KernelCellAdmissionOwner::UpdateCellAdmissionReadi
     readiness_ = snapshot;
     generation_ = next;
   }
+  return Result<AuthoringAdmissionDTO>::Ok(AdmissionLocked());
+}
+
+Result<void> KernelCellAdmissionOwner::Publish(
+    const ManagerLivenessObservationDTO& observation) {
+  if (!ValidateManagerLivenessObservation(observation).ok()) {
+    return Reject<void>("invalid_request", "manager_liveness_observation_invalid");
+  }
+  std::lock_guard transition_lock(liveness_transition_mutex_);
+  std::unique_lock lock(mutex_);
+  if (!manager_liveness_required_set_.has_value()) {
+    return Reject<void>("invalid_request", "manager_liveness_set_not_configured");
+  }
+  const auto& expected = *manager_liveness_required_set_;
+  const auto& status = observation.status;
+  if (status.cell_id != expected.cell_id ||
+      observation.active_bundle_id != expected.active_bundle_id ||
+      observation.required_runtime_set_digest !=
+          expected.required_runtime_set_digest ||
+      status.manager_runtime_unit_id != expected.manager_runtime_unit_id ||
+      status.manager_runtime_epoch != expected.manager_runtime_epoch ||
+      status.manager_owner_epoch != expected.manager_owner_epoch) {
+    return Reject<void>("invalid_request", "manager_liveness_identity_mismatch");
+  }
+  const auto found = std::lower_bound(
+      manager_liveness_rows_.begin(), manager_liveness_rows_.end(),
+      status.receiver_runtime_unit_id,
+      [](const ManagerLivenessRow& row, const RuntimeUnitId& id) {
+        return row.receiver.runtime_unit_id < id;
+      });
+  if (found == manager_liveness_rows_.end() ||
+      found->receiver.runtime_unit_id != status.receiver_runtime_unit_id ||
+      found->receiver.runtime_epoch != status.receiver_runtime_epoch ||
+      found->receiver.runtime_policy_id != status.runtime_policy_id ||
+      found->receiver.runtime_policy_revision !=
+          status.runtime_policy_revision) {
+    return Reject<void>("invalid_request", "manager_liveness_receiver_foreign");
+  }
+  const bool retry_pending_fence =
+      status.receiver_status_sequence == found->status_sequence &&
+      found->generation_advance_pending && status.command_fenced;
+  if (status.receiver_status_sequence < found->status_sequence ||
+      (status.receiver_status_sequence == found->status_sequence &&
+       !retry_pending_fence)) {
+    return Reject<void>("invalid_request", "manager_liveness_status_not_strict");
+  }
+  const bool next_current =
+      status.state == ManagerLivenessStateDTO::kCurrent &&
+      !status.command_fenced;
+  if (next_current && found->direct_loss_inhibited) {
+    return Reject<void>("invalid_state_transition",
+                        "manager_liveness_loss_inhibited");
+  }
+  const auto token = status.receiver_status_sequence;
+  bool transition_required = retry_pending_fence;
+  if (!retry_pending_fence) {
+    found->status_sequence = token;
+    if (found->current_unfenced != next_current) {
+      transition_required = true;
+      found->generation_advance_pending = true;
+      found->generation_pending_sequence = token;
+      found->generation_pending_current = next_current;
+      if (!next_current) {
+        --manager_liveness_current_unfenced_count_;
+        found->current_unfenced = false;
+      }
+    } else if (found->generation_advance_pending) {
+      if (found->generation_pending_current == next_current) {
+        transition_required = true;
+        found->generation_pending_sequence = token;
+      } else {
+        found->generation_advance_pending = false;
+      }
+    }
+  }
+  if (!transition_required) {
+    return Result<void>::Ok();
+  }
+  if (generation_.value() >= kMaximumManagerLivenessCounter) {
+    return Reject<void>("authoring_not_ready",
+                        "admission_generation_exhausted");
+  }
+  const auto previous_generation = generation_;
+  const AdmissionGeneration next_generation(generation_.value() + 1U);
+  lock.unlock();
+  auto recorded = journal_.RecordCellAdmissionGenerationAdvanced(
+      kernel_owner_epoch_, previous_generation, next_generation);
+  lock.lock();
+  if (!recorded.ok()) {
+    return Result<void>::Err(recorded.error());
+  }
+  generation_ = next_generation;
+  const auto current = std::lower_bound(
+      manager_liveness_rows_.begin(), manager_liveness_rows_.end(),
+      status.receiver_runtime_unit_id,
+      [](const ManagerLivenessRow& row, const RuntimeUnitId& id) {
+        return row.receiver.runtime_unit_id < id;
+      });
+  if (current != manager_liveness_rows_.end() &&
+      current->receiver.runtime_unit_id == status.receiver_runtime_unit_id &&
+      current->generation_advance_pending &&
+      current->generation_pending_sequence == token) {
+    current->generation_advance_pending = false;
+    if (next_current && current->status_sequence == token &&
+        !current->direct_loss_inhibited && !current->current_unfenced) {
+      current->current_unfenced = true;
+      ++manager_liveness_current_unfenced_count_;
+    }
+  }
+  return Result<void>::Ok();
+}
+
+bool KernelCellAdmissionOwner::LatchManagerLivenessLoss(
+    const ManagerLivenessLossIntentDTO& intent) noexcept {
+  try {
+    if (!ValidateManagerLivenessLossIntent(intent).ok()) {
+      return false;
+    }
+    std::lock_guard lock(mutex_);
+    if (!manager_liveness_required_set_.has_value()) {
+      return false;
+    }
+    const auto& expected = *manager_liveness_required_set_;
+    if (intent.cell_id != expected.cell_id ||
+        intent.active_bundle_id != expected.active_bundle_id ||
+        intent.required_runtime_set_digest !=
+            expected.required_runtime_set_digest ||
+        intent.lost_manager_runtime_unit_id !=
+            expected.manager_runtime_unit_id ||
+        intent.lost_manager_runtime_epoch != expected.manager_runtime_epoch ||
+        intent.lost_manager_owner_epoch != expected.manager_owner_epoch) {
+      return false;
+    }
+    const auto found = std::lower_bound(
+        manager_liveness_rows_.begin(), manager_liveness_rows_.end(),
+        intent.receiver_runtime_unit_id,
+        [](const ManagerLivenessRow& row, const RuntimeUnitId& id) {
+          return row.receiver.runtime_unit_id < id;
+        });
+    if (found == manager_liveness_rows_.end() ||
+        found->receiver.runtime_unit_id != intent.receiver_runtime_unit_id ||
+        found->receiver.runtime_epoch != intent.receiver_runtime_epoch ||
+        found->receiver.runtime_policy_id != intent.runtime_policy_id ||
+        found->receiver.runtime_policy_revision !=
+            intent.runtime_policy_revision ||
+        intent.receiver_status_sequence <= found->status_sequence) {
+      return false;
+    }
+    found->status_sequence = intent.receiver_status_sequence;
+    found->direct_loss_inhibited = true;
+    if (found->current_unfenced) {
+      found->current_unfenced = false;
+      --manager_liveness_current_unfenced_count_;
+      found->generation_advance_pending = true;
+      found->generation_pending_sequence = intent.receiver_status_sequence;
+      found->generation_pending_current = false;
+    }
+    return true;
+  } catch (...) {
+    return false;
+  }
+}
+
+Result<AuthoringAdmissionDTO>
+KernelCellAdmissionOwner::ReplaceManagerLivenessRequiredSet(
+    const ManagerLivenessRequiredSetDTO& required_set) {
+  if (!ValidateManagerLivenessRequiredSet(required_set).ok()) {
+    return Reject<AuthoringAdmissionDTO>(
+        "invalid_request", "manager_liveness_required_set_invalid");
+  }
+  auto next_set = required_set;
+  std::vector<ManagerLivenessRow> next_rows;
+  next_rows.reserve(required_set.required_receivers.size());
+  for (const auto& receiver : required_set.required_receivers) {
+    next_rows.push_back(
+        {receiver, 0U, false, false, false, 0U, false});
+  }
+  std::lock_guard transition_lock(liveness_transition_mutex_);
+  std::lock_guard lock(mutex_);
+  if (manager_liveness_required_set_.has_value() &&
+      *manager_liveness_required_set_ == required_set) {
+    return Result<AuthoringAdmissionDTO>::Ok(AdmissionLocked());
+  }
+  auto advanced = AdvanceGenerationLocked();
+  if (!advanced.ok()) {
+    return Result<AuthoringAdmissionDTO>::Err(advanced.error());
+  }
+  manager_liveness_required_set_ = std::move(next_set);
+  manager_liveness_rows_ = std::move(next_rows);
+  manager_liveness_current_unfenced_count_ = 0U;
   return Result<AuthoringAdmissionDTO>::Ok(AdmissionLocked());
 }
 
@@ -302,6 +528,7 @@ bool KernelCellAdmissionOwner::IsStaleOwnerLocked(
 
 Result<CellAdmissionClaimDTO> KernelCellAdmissionOwner::AcquireCellAdmissionClaim(
     const CellAdmissionClaimIntentDTO& intent) {
+  std::lock_guard transition_lock(liveness_transition_mutex_);
   auto valid = ValidateCellAdmissionClaimIntent(intent);
   if (!valid.ok()) {
     return Result<CellAdmissionClaimDTO>::Err(valid.error());
@@ -446,6 +673,7 @@ Result<CellAdmissionClaimDTO> KernelCellAdmissionOwner::AcquireCellAdmissionClai
 
 Result<AuthoringAdmissionDTO> KernelCellAdmissionOwner::ReleaseCellAdmissionClaim(
     const CellAdmissionClaimReleaseDTO& release) {
+  std::lock_guard transition_lock(liveness_transition_mutex_);
   auto valid = ValidateCellAdmissionClaimRelease(release);
   if (!valid.ok()) {
     return Result<AuthoringAdmissionDTO>::Err(valid.error());
@@ -506,6 +734,7 @@ Result<AuthoringAdmissionDTO> KernelCellAdmissionOwner::ReleaseCellAdmissionClai
 
 Result<AuthoringAdmissionDTO> KernelCellAdmissionOwner::ReconcileCellAdmissionClaims(
     const CellAdmissionReconcileDTO& reconcile) {
+  std::lock_guard transition_lock(liveness_transition_mutex_);
   std::lock_guard lock(mutex_);
   const auto claims_canonical =
       std::is_sorted(reconcile.retained_claims.begin(), reconcile.retained_claims.end(),

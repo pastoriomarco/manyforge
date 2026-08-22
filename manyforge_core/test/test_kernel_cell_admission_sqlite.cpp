@@ -88,13 +88,23 @@ ContentDigest Digest(char digit) {
   return ContentDigest("sha256:" + std::string(64U, digit));
 }
 
+ManagerLivenessRequiredSetDTO EmptyLivenessSet() {
+  ManagerLivenessRequiredSetDTO result{
+      CellId("cell.1"), RetainedBundleId("bundle.1"), ContentDigest(kDigest),
+      RuntimeUnitId("manager"), RuntimeEpoch("manager.epoch.1"),
+      RequestOwnerEpoch("manager.owner.1"), {}};
+  result.required_runtime_set_digest =
+      ComputeRequiredRuntimeSetDigest(result.required_receivers);
+  return result;
+}
+
 CellAdmissionReadinessSnapshotDTO Ready() {
   return CellAdmissionReadinessSnapshotDTO{
       true,
       ProgramCycleStatusDTO{RequestOwnerEpoch("program.owner"), 1U,
                             ProgramCycleStateDTO::kIdleAfterReset, std::nullopt,
                             std::nullopt, std::nullopt},
-      true, true, true, 1U, 1U, true, true, 0U, 0U, 0U};
+      true, 1U, 1U, true, true, 0U, 0U, 0U};
 }
 
 CellAdmissionReconcileValidationDTO RetainAll(
@@ -488,7 +498,8 @@ TEST(KernelCellAdmissionSqlite,
     KernelCellAdmissionOwner owner(
         RequestOwnerEpoch("kernel.1"), 1U, clock, journal, {},
         recovery.value().cell_admission_generation_high_water, {},
-        [](const auto&, const auto&) { return Result<void>::Ok(); });
+        [](const auto&, const auto&) { return Result<void>::Ok(); }, {},
+        {}, {}, EmptyLivenessSet());
     ASSERT_TRUE(owner.UpdateCellAdmissionReadiness(Ready()).ok());
     for (std::size_t index = 0; index != 3U; ++index) {
       auto intent = Claim().intent;
@@ -528,7 +539,8 @@ TEST(KernelCellAdmissionSqlite,
       recovery.value().cell_admission_generation_high_water, {},
       [](const auto&, const auto&) { return Result<void>::Ok(); }, {},
       recovery.value().recovered_cell_admission_membership,
-      recovery.value().recovered_cell_admission_current_owners);
+      recovery.value().recovered_cell_admission_current_owners,
+      EmptyLivenessSet());
   const auto recovered = owner.GetCellAdmissionRecoveryReceipt(
       {latest->intent, *latest, Release(*latest)});
   ASSERT_TRUE(recovered.ok());
@@ -568,7 +580,7 @@ TEST(KernelCellAdmissionSqlite,
         ProgramCycleStatusDTO{RequestOwnerEpoch("program.owner"), 1U,
                               ProgramCycleStateDTO::kIdleAfterReset, std::nullopt,
                               std::nullopt, std::nullopt},
-        true, true, true, 1U, 1U, true, true, 0U, 0U, 0U};
+        true, 1U, 1U, true, true, 0U, 0U, 0U};
     ASSERT_TRUE(owner.UpdateCellAdmissionReadiness(ready).ok());
     predecessor_public = owner.GetAuthoringAdmission().admission_generation;
     ASSERT_TRUE(journal.CloseOwnerEpoch(RequestOwnerEpoch("kernel.1"), 2).ok());
@@ -658,7 +670,8 @@ TEST(KernelCellAdmissionSqlite,
     KernelCellAdmissionOwner owner(
         RequestOwnerEpoch("kernel.1"), 2U, clock, journal, {},
         recovery.value().cell_admission_generation_high_water, {},
-        [](const auto&, const auto&) { return Result<void>::Ok(); });
+        [](const auto&, const auto&) { return Result<void>::Ok(); }, {},
+        {}, {}, EmptyLivenessSet());
     ASSERT_TRUE(owner.UpdateCellAdmissionReadiness(Ready()).ok());
     auto intent = Claim().intent;
     intent.expected_admission_generation =
@@ -691,7 +704,8 @@ TEST(KernelCellAdmissionSqlite,
                  reconcile.reconciliation_evidence_digest}}});
         },
         recovery.value().recovered_cell_admission_membership,
-        recovery.value().recovered_cell_admission_current_owners);
+        recovery.value().recovered_cell_admission_current_owners,
+        EmptyLivenessSet());
 
     if (obsolete.has_value()) {
       const auto recovered = owner.GetCellAdmissionRecoveryReceipt(

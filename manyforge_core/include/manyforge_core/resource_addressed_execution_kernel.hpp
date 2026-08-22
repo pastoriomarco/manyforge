@@ -12,6 +12,7 @@
 #include <manyforge_core/orphan_resource_reconciliation.hpp>
 #include <manyforge_core/ports/iaddressed_motion_preview.hpp>
 #include <manyforge_core/ports/iaddressed_operation_owner.hpp>
+#include <manyforge_core/ports/i_manager_liveness_fail_safe_port.hpp>
 #include <manyforge_core/ports/icontrol_domain_execution_port.hpp>
 #include <manyforge_core/ports/ioperation_journal.hpp>
 #include <manyforge_core/ports/iresolved_participant_execution_engine.hpp>
@@ -181,6 +182,7 @@ struct ResourceAddressedExecutionKernelConfig final {
   CellAdmissionInterventionValidator cell_admission_intervention_validator;
   CellAdmissionSettlementValidator cell_admission_settlement_validator;
   CellAdmissionReconcileValidator cell_admission_reconcile_validator;
+  std::optional<ManagerLivenessRequiredSetDTO> manager_liveness_required_set;
 };
 
 /// Private no-effect result used to project a capability-command preview at a
@@ -199,6 +201,8 @@ struct CapabilityCommandPreviewResultDTO final {
 class ResourceAddressedExecutionKernel final : public IAddressedOperationOwner,
                                                public IAddressedMotionPreviewOwner,
                                                public IKernelCellAdmissionPort,
+                                               public IManagerLivenessObservationPort,
+                                               public IManagerLivenessFailSafePort,
                                                private IStopControlWorkReceiver,
                                                private IStopStageAttemptCompletionReceiver,
                                                private IOperationControlEffectCompletionReceiver {
@@ -275,6 +279,12 @@ class ResourceAddressedExecutionKernel final : public IAddressedOperationOwner,
   [[nodiscard]] Result<CellAdmissionRecoveryReceiptDTO>
   GetCellAdmissionRecoveryReceipt(
       const CellAdmissionRecoveryReceiptQueryDTO& query) const override;
+  [[nodiscard]] Result<void> Publish(
+      const ManagerLivenessObservationDTO& observation) override;
+  void LatchAndContain(
+      const ManagerLivenessLossIntentDTO& intent) noexcept override;
+  [[nodiscard]] Result<AuthoringAdmissionDTO> ReplaceManagerLivenessRequiredSet(
+      const ManagerLivenessRequiredSetDTO& required_set);
 
   /// Read-only owner projection. Subordinate polling and state advancement are
   /// performed only by reconcile_subordinate_state(), never by this method.
@@ -510,6 +520,7 @@ class ResourceAddressedExecutionKernel final : public IAddressedOperationOwner,
   StopGeneration cell_stop_generation_{0U};
   StopFaultLatchGeneration cell_stop_fault_latch_generation_{0U};
   std::optional<StopFaultLatchDTO> active_stop_fault_latch_;
+  bool manager_liveness_motion_inhibited_{};
   bool motion_admission_closed_{};
 };
 

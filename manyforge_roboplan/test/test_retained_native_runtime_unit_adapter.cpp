@@ -1054,7 +1054,7 @@ TEST(RetainedNativeRuntimeUnitAdapter,
           core::RequestOwnerEpoch("adapter-program-runner"), 1U,
           core::ProgramCycleStateDTO::kIdleAfterReset, std::nullopt,
           std::nullopt, std::nullopt},
-      true, true, true, 2U, 2U, true, true, 0U, 0U, 0U};
+      true, 2U, 2U, true, true, 0U, 0U, 0U};
   const auto updated = adapter.UpdateCellAdmissionReadiness(readiness);
   ASSERT_TRUE(updated.ok()) << updated.error().message;
   const core::CellAdmissionClaimIntentDTO claim_intent{
