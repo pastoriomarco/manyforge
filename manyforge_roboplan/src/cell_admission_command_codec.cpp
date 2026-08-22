@@ -16,7 +16,8 @@ namespace {
 
 using Value = ci::CanonicalValue;
 constexpr double kMaximumSafeInteger = 9'007'199'254'740'991.0;
-constexpr std::size_t kMaximumPacketBytes = 1024U * 1024U;
+constexpr std::size_t kMaximumPacketBytes =
+    core::kMaximumCellAdmissionJsonRequestBytes;
 
 [[noreturn]] void Fail(std::string message) {
   throw std::invalid_argument(std::move(message));
@@ -311,6 +312,18 @@ core::CellAdmissionReconcileDTO Reconcile(const Value &v) {
   }
   return result;
 }
+core::CellAdmissionRecoveryReceiptQueryDTO RecoveryQuery(const Value &v) {
+  Exact(v, 3U);
+  auto result = core::CellAdmissionRecoveryReceiptQueryDTO{
+      Intent(Member(v, "intent")),
+      Optional<core::CellAdmissionClaimDTO>(
+          v, "expected_claim", [](const Value &x) { return Claim(x); }),
+      Optional<core::CellAdmissionClaimReleaseDTO>(
+          v, "expected_release", [](const Value &x) { return Release(x); })};
+  Require(core::ValidateCellAdmissionRecoveryReceiptQuery(result).ok(),
+          "cell-admission recovery receipt query is invalid");
+  return result;
+}
 
 Value OptionalValue(const auto &v, auto encode) {
   return v.has_value() ? encode(*v) : Value(nullptr);
@@ -371,6 +384,68 @@ Value ClaimValue(const core::CellAdmissionClaimDTO &v) {
        Value(static_cast<double>(v.claim_generation.value()))},
       {"intent", IntentValue(v.intent)}});
 }
+Value ReleaseValue(const core::CellAdmissionClaimReleaseDTO &v) {
+  return Value(Value::Object{
+      {"acquired_admission_generation",
+       Value(static_cast<double>(v.acquired_admission_generation.value()))},
+      {"claim_generation",
+       Value(static_cast<double>(v.claim_generation.value()))},
+      {"owner_epoch", Value(v.owner_epoch.value())},
+      {"owner_role", Value(std::string(core::to_string(v.owner_role)))},
+      {"owner_transaction_id", Value(v.owner_transaction_id)},
+      {"request_id", Value(v.request_id.value())},
+      {"request_payload_digest", Value(v.request_payload_digest.value())},
+      {"settlement",
+       Value(Value::Object{
+           {"evidence_digest", Value(v.settlement.evidence_digest.value())},
+           {"settlement_kind",
+            Value(std::string(core::to_string(v.settlement.settlement_kind)))}})}});
+}
+Value OwnerEpochValue(const core::CellAdmissionCurrentOwnerEpochDTO &v) {
+  return Value(Value::Object{
+      {"owner_epoch", Value(v.owner_epoch.value())},
+      {"owner_role", Value(std::string(core::to_string(v.owner_role)))}});
+}
+Value ReconcileSettlementValue(
+    const core::CellAdmissionReconcileSettlementDTO &v) {
+  return Value(Value::Object{
+      {"predecessor_claim", ClaimValue(v.predecessor_claim)},
+      {"reconciliation_evidence_digest",
+       Value(v.reconciliation_evidence_digest.value())},
+      {"settlement_predicate",
+       Value(std::string(core::to_string(v.settlement_predicate)))},
+      {"successor_owner_epoch", Value(v.successor_owner_epoch.value())},
+      {"successor_owner_role",
+       Value(std::string(core::to_string(v.successor_owner_role)))}});
+}
+Value RecoveryReceiptValue(
+    const core::CellAdmissionRecoveryReceiptDTO &v) {
+  Require(core::ValidateCellAdmissionRecoveryReceipt(v).ok(),
+          "cell-admission recovery receipt is invalid");
+  Value::Array held;
+  for (const auto &claim : v.held_claims)
+    held.push_back(ClaimValue(claim));
+  Value::Array owners;
+  for (const auto &owner : v.current_owner_epochs)
+    owners.push_back(OwnerEpochValue(owner));
+  return Value(Value::Object{
+      {"admission_generation",
+       Value(static_cast<double>(v.admission_generation.value()))},
+      {"current_owner_epochs", Value(std::move(owners))},
+      {"held_claims", Value(std::move(held))},
+      {"kernel_owner_epoch", Value(v.kernel_owner_epoch.value())},
+      {"matched_claim",
+       OptionalValue(v.matched_claim,
+                     [](const auto &x) { return ClaimValue(x); })},
+      {"matched_reconcile_settlement",
+       OptionalValue(v.matched_reconcile_settlement, [](const auto &x) {
+         return ReconcileSettlementValue(x);
+       })},
+      {"matched_release",
+       OptionalValue(v.matched_release,
+                     [](const auto &x) { return ReleaseValue(x); })},
+      {"status", Value(std::string(core::to_string(v.status)))}});
+}
 Value AdmissionValue(const core::AuthoringAdmissionDTO &v) {
   return Value(Value::Object{
       {"admission_generation",
@@ -389,7 +464,8 @@ bool IsCommand(std::string_view v) {
   return v == "cell_admission_get" ||
          v == "cell_admission_update_readiness" ||
          v == "cell_admission_acquire" || v == "cell_admission_release" ||
-         v == "cell_admission_reconcile";
+         v == "cell_admission_reconcile" ||
+         v == "cell_admission_recovery_receipt";
 }
 } // namespace
 
@@ -424,6 +500,8 @@ TryDecodeCellAdmissionCommand(std::string_view bytes) {
     return cm::KernelCellAdmissionRpcPacket{command, Intent(request)};
   if (command == "cell_admission_release")
     return cm::KernelCellAdmissionRpcPacket{command, Release(request)};
+  if (command == "cell_admission_recovery_receipt")
+    return cm::KernelCellAdmissionRpcPacket{command, RecoveryQuery(request)};
   return cm::KernelCellAdmissionRpcPacket{command, Reconcile(request)};
 }
 
@@ -443,6 +521,10 @@ Value CellAdmissionResponseValue(
       {"ok", Value(true)}};
   if (const auto *claim = std::get_if<core::CellAdmissionClaimDTO>(&response))
     result.emplace_back("claim", ClaimValue(*claim));
+  else if (const auto *receipt =
+               std::get_if<core::CellAdmissionRecoveryReceiptDTO>(&response))
+    result.emplace_back("recovery_receipt",
+                        RecoveryReceiptValue(*receipt));
   else
     result.emplace_back(
         "authoring_admission",

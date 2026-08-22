@@ -84,6 +84,19 @@ CellAdmissionClaimReleaseDTO Release(const CellAdmissionClaimDTO& claim) {
           settlement, ContentDigest(kDigest)}};
 }
 
+ContentDigest Digest(char digit) {
+  return ContentDigest("sha256:" + std::string(64U, digit));
+}
+
+CellAdmissionReadinessSnapshotDTO Ready() {
+  return CellAdmissionReadinessSnapshotDTO{
+      true,
+      ProgramCycleStatusDTO{RequestOwnerEpoch("program.owner"), 1U,
+                            ProgramCycleStateDTO::kIdleAfterReset, std::nullopt,
+                            std::nullopt, std::nullopt},
+      true, true, true, 1U, 1U, true, true, 0U, 0U, 0U};
+}
+
 CellAdmissionReconcileValidationDTO RetainAll(
     const CellAdmissionReconcileDTO& reconcile) {
   return CellAdmissionReconcileValidationDTO{reconcile.current_owner_epochs, {}};
@@ -153,10 +166,30 @@ TEST(KernelCellAdmissionSqlite, AcquireAndReleaseCrashWindowsRehydrateExactTruth
     auto recovery = journal.BeginOwnerEpoch(RequestOwnerEpoch("kernel.3"), 4, 8U,
                                             {ResourceId("resource.1")});
     ASSERT_TRUE(recovery.ok());
-    EXPECT_TRUE(recovery.value().recovered_cell_admission_claims.empty());
+    ASSERT_EQ(recovery.value().recovered_cell_admission_claims.size(), 1U);
+    EXPECT_EQ(recovery.value().recovered_cell_admission_claims.front().claim, claim);
+    EXPECT_EQ(recovery.value().recovered_cell_admission_claims.front().release,
+              Release(claim));
+    EXPECT_FALSE(recovery.value()
+                     .recovered_cell_admission_claims.front()
+                     .reconcile_settlement.has_value());
     ASSERT_EQ(recovery.value().recovered_cell_admission_membership.size(), 1U);
     EXPECT_EQ(recovery.value().recovered_cell_admission_membership.front().request_id,
               claim.intent.request_id);
+    FixedClock clock;
+    KernelCellAdmissionOwner owner(
+        RequestOwnerEpoch("kernel.3"), 8U, clock, journal,
+        recovery.value().recovered_cell_admission_claims,
+        recovery.value().cell_admission_generation_high_water, {}, {}, {},
+        recovery.value().recovered_cell_admission_membership,
+        recovery.value().recovered_cell_admission_current_owners);
+    const auto receipt = owner.GetCellAdmissionRecoveryReceipt(
+        {claim.intent, claim, Release(claim)});
+    ASSERT_TRUE(receipt.ok());
+    EXPECT_EQ(receipt.value().status,
+              CellAdmissionRecoveryReceiptStatusDTO::kReleasedExact);
+    EXPECT_EQ(receipt.value().matched_release, Release(claim));
+    EXPECT_TRUE(receipt.value().held_claims.empty());
     EXPECT_TRUE(journal.CloseOwnerEpoch(RequestOwnerEpoch("kernel.3"), 5).ok());
   }
 }
@@ -313,6 +346,37 @@ TEST(KernelCellAdmissionSqlite, SuccessorEvidenceDurablySettlesExactPredecessorC
       RequestOwnerEpoch("kernel.2"), retained, Release(retained),
       AdmissionGeneration(settled_generation.value() + 1U));
   EXPECT_TRUE(retained_release.ok());
+  restarted.Close();
+
+  SqliteOperationJournal receipt_journal(database, CellId("cell.1"));
+  auto receipt_recovery = receipt_journal.BeginOwnerEpoch(
+      RequestOwnerEpoch("kernel.3"), 3, 4U, {ResourceId("resource.1")});
+  ASSERT_TRUE(receipt_recovery.ok());
+  FixedClock clock;
+  KernelCellAdmissionOwner receipt_owner(
+      RequestOwnerEpoch("kernel.3"), 4U, clock, receipt_journal,
+      receipt_recovery.value().recovered_cell_admission_claims,
+      receipt_recovery.value().cell_admission_generation_high_water, {}, {}, {},
+      receipt_recovery.value().recovered_cell_admission_membership,
+      receipt_recovery.value().recovered_cell_admission_current_owners);
+  const auto reconciled_receipt =
+      receipt_owner.GetCellAdmissionRecoveryReceipt(
+          {claim.intent, claim, std::nullopt});
+  ASSERT_TRUE(reconciled_receipt.ok());
+  EXPECT_EQ(reconciled_receipt.value().status,
+            CellAdmissionRecoveryReceiptStatusDTO::kReconciledExact);
+  ASSERT_TRUE(
+      reconciled_receipt.value().matched_reconcile_settlement.has_value());
+  EXPECT_EQ(reconciled_receipt.value()
+                .matched_reconcile_settlement->reconciliation_evidence_digest,
+            reconcile.reconciliation_evidence_digest);
+  const auto released_receipt =
+      receipt_owner.GetCellAdmissionRecoveryReceipt(
+          {retained.intent, retained, Release(retained)});
+  ASSERT_TRUE(released_receipt.ok());
+  EXPECT_EQ(released_receipt.value().status,
+            CellAdmissionRecoveryReceiptStatusDTO::kReleasedExact);
+  EXPECT_TRUE(released_receipt.value().held_claims.empty());
 }
 
 TEST(KernelCellAdmissionSqlite,
@@ -348,10 +412,16 @@ TEST(KernelCellAdmissionSqlite,
     unseen.intent.expected_admission_generation = AdmissionGeneration(3U);
     unseen.acquired_admission_generation = AdmissionGeneration(3U);
     unseen.claim_generation = CellAdmissionClaimGeneration(2U);
-    const auto full = journal.RecordCellAdmissionClaimAcquired(
+    const auto successor = journal.RecordCellAdmissionClaimAcquired(
         RequestOwnerEpoch("kernel.1"), unseen);
-    ASSERT_FALSE(full.ok());
-    EXPECT_EQ(full.error().code, "request_ledger_full");
+    ASSERT_TRUE(successor.ok());
+    ASSERT_EQ(CountRows(database, "cell_admission_request_membership"), 1);
+    ASSERT_EQ(CountRows(database, "cell_admission_claims"), 1);
+    ASSERT_TRUE(journal.RecordCellAdmissionClaimReleased(
+                           RequestOwnerEpoch("kernel.1"), unseen, Release(unseen),
+                           AdmissionGeneration(5U))
+                    .ok());
+    first_claim = unseen;
     ASSERT_TRUE(journal.CloseOwnerEpoch(RequestOwnerEpoch("kernel.1"), 2).ok());
   }
 
@@ -359,9 +429,13 @@ TEST(KernelCellAdmissionSqlite,
   auto recovery = replacement.BeginOwnerEpoch(RequestOwnerEpoch("kernel.2"), 3, 1U,
                                               {ResourceId("resource.1")});
   ASSERT_TRUE(recovery.ok());
-  EXPECT_TRUE(recovery.value().recovered_cell_admission_claims.empty());
-  EXPECT_EQ(recovery.value().cell_admission_generation_high_water,
-            AdmissionGeneration(4U));
+  ASSERT_EQ(recovery.value().recovered_cell_admission_claims.size(), 1U);
+  EXPECT_EQ(recovery.value().recovered_cell_admission_claims.front().claim,
+            first_claim);
+  EXPECT_EQ(recovery.value().recovered_cell_admission_claims.front().release,
+            Release(first_claim));
+  EXPECT_GT(recovery.value().cell_admission_generation_high_water,
+            first_claim.acquired_admission_generation);
   CellAdmissionReconcileDTO rotate{
       RequestOwnerEpoch("kernel.2"), {},
       {{CellAdmissionOwnerRoleDTO::kAuthoringOwner,
@@ -379,7 +453,8 @@ TEST(KernelCellAdmissionSqlite,
   fresh.intent.request_id = RequestId("request.2");
   fresh.intent.expected_admission_generation = rotated_generation;
   fresh.acquired_admission_generation = rotated_generation;
-  fresh.claim_generation = CellAdmissionClaimGeneration(2U);
+  fresh.claim_generation = CellAdmissionClaimGeneration(
+      first_claim.claim_generation.value() + 1U);
   EXPECT_TRUE(
       replacement.RecordCellAdmissionClaimAcquired(RequestOwnerEpoch("kernel.2"), fresh).ok());
   const auto stale_exact = replacement.RecordCellAdmissionClaimAcquired(
@@ -396,6 +471,82 @@ TEST(KernelCellAdmissionSqlite,
       replacement.RecordCellAdmissionClaimAcquired(RequestOwnerEpoch("kernel.2"), stale);
   ASSERT_FALSE(stale_result.ok());
   EXPECT_EQ(stale_result.error().code, "stale_request_owner_epoch");
+}
+
+TEST(KernelCellAdmissionSqlite,
+     SameOwnerCapacityPlusOneCyclesRetireReleasedResultAcrossRestart) {
+  TemporaryDirectory temporary;
+  const auto database =
+      temporary.path() / std::string(kOperationJournalFilename);
+  FixedClock clock;
+  std::optional<CellAdmissionClaimDTO> latest;
+  {
+    SqliteOperationJournal journal(database, CellId("cell.1"));
+    auto recovery = journal.BeginOwnerEpoch(
+        RequestOwnerEpoch("kernel.1"), 1, 1U, {ResourceId("resource.1")});
+    ASSERT_TRUE(recovery.ok());
+    KernelCellAdmissionOwner owner(
+        RequestOwnerEpoch("kernel.1"), 1U, clock, journal, {},
+        recovery.value().cell_admission_generation_high_water, {},
+        [](const auto&, const auto&) { return Result<void>::Ok(); });
+    ASSERT_TRUE(owner.UpdateCellAdmissionReadiness(Ready()).ok());
+    for (std::size_t index = 0; index != 3U; ++index) {
+      auto intent = Claim().intent;
+      intent.request_id = RequestId("cycle." + std::to_string(index));
+      intent.owner_transaction_id =
+          "transaction." + std::to_string(index);
+      intent.expected_admission_generation =
+          owner.GetAuthoringAdmission().admission_generation;
+      auto claim = owner.AcquireCellAdmissionClaim(intent);
+      ASSERT_TRUE(claim.ok());
+      if (latest.has_value()) {
+        const auto old = owner.GetCellAdmissionRecoveryReceipt(
+            {latest->intent, *latest, Release(*latest)});
+        ASSERT_TRUE(old.ok());
+        EXPECT_EQ(old.value().status,
+                  CellAdmissionRecoveryReceiptStatusDTO::kUnknown);
+      }
+      ASSERT_TRUE(
+          owner.ReleaseCellAdmissionClaim(Release(claim.value())).ok());
+      const auto exact = owner.GetCellAdmissionRecoveryReceipt(
+          {claim.value().intent, claim.value(), Release(claim.value())});
+      ASSERT_TRUE(exact.ok());
+      EXPECT_EQ(exact.value().status,
+                CellAdmissionRecoveryReceiptStatusDTO::kReleasedExact);
+      latest = claim.value();
+    }
+    ASSERT_TRUE(
+        journal.CloseOwnerEpoch(RequestOwnerEpoch("kernel.1"), 2).ok());
+  }
+  SqliteOperationJournal journal(database, CellId("cell.1"));
+  auto recovery = journal.BeginOwnerEpoch(
+      RequestOwnerEpoch("kernel.2"), 3, 1U, {ResourceId("resource.1")});
+  ASSERT_TRUE(recovery.ok());
+  KernelCellAdmissionOwner owner(
+      RequestOwnerEpoch("kernel.2"), 1U, clock, journal,
+      recovery.value().recovered_cell_admission_claims,
+      recovery.value().cell_admission_generation_high_water, {},
+      [](const auto&, const auto&) { return Result<void>::Ok(); }, {},
+      recovery.value().recovered_cell_admission_membership,
+      recovery.value().recovered_cell_admission_current_owners);
+  const auto recovered = owner.GetCellAdmissionRecoveryReceipt(
+      {latest->intent, *latest, Release(*latest)});
+  ASSERT_TRUE(recovered.ok());
+  EXPECT_EQ(recovered.value().status,
+            CellAdmissionRecoveryReceiptStatusDTO::kReleasedExact);
+  ASSERT_TRUE(owner.UpdateCellAdmissionReadiness(Ready()).ok());
+  auto successor_intent = Claim().intent;
+  successor_intent.request_id = RequestId("cycle.after.restart");
+  successor_intent.owner_transaction_id = "transaction.after.restart";
+  successor_intent.expected_admission_generation =
+      owner.GetAuthoringAdmission().admission_generation;
+  const auto successor = owner.AcquireCellAdmissionClaim(successor_intent);
+  ASSERT_TRUE(successor.ok());
+  const auto retired = owner.GetCellAdmissionRecoveryReceipt(
+      {latest->intent, *latest, Release(*latest)});
+  ASSERT_TRUE(retired.ok());
+  EXPECT_EQ(retired.value().status,
+            CellAdmissionRecoveryReceiptStatusDTO::kUnknown);
 }
 
 TEST(KernelCellAdmissionSqlite,
@@ -486,9 +637,111 @@ TEST(KernelCellAdmissionSqlite, RepeatedCleanOwnerRotationsKeepMembershipRowsBou
         CellAdmissionClaimGeneration(claim_generation.value() + 1U);
   }
   EXPECT_EQ(CountRows(database, "cell_admission_request_membership"), 1);
-  EXPECT_EQ(CountRows(database, "cell_admission_claims"), 0);
+  EXPECT_EQ(CountRows(database, "cell_admission_claims"), 1);
   EXPECT_EQ(CountRows(database, "cell_admission_current_owners"), 1);
   EXPECT_LE(CountRows(database, "cell_admission_reconciliations"), 1);
+}
+
+TEST(KernelCellAdmissionSqlite,
+     RepeatedCrashReplacementRetainsOnlyLatestReceiptAndHeldSuccessor) {
+  TemporaryDirectory temporary;
+  const auto database = temporary.path() / std::string(kOperationJournalFilename);
+  FixedClock clock;
+  auto predecessor = Claim();
+  std::optional<CellAdmissionClaimDTO> obsolete;
+
+  {
+    SqliteOperationJournal journal(database, CellId("cell.1"));
+    auto recovery = journal.BeginOwnerEpoch(RequestOwnerEpoch("kernel.1"), 10, 2U,
+                                            {ResourceId("resource.1")});
+    ASSERT_TRUE(recovery.ok());
+    KernelCellAdmissionOwner owner(
+        RequestOwnerEpoch("kernel.1"), 2U, clock, journal, {},
+        recovery.value().cell_admission_generation_high_water, {},
+        [](const auto&, const auto&) { return Result<void>::Ok(); });
+    ASSERT_TRUE(owner.UpdateCellAdmissionReadiness(Ready()).ok());
+    auto intent = Claim().intent;
+    intent.expected_admission_generation =
+        owner.GetAuthoringAdmission().admission_generation;
+    auto acquired = owner.AcquireCellAdmissionClaim(intent);
+    ASSERT_TRUE(acquired.ok());
+    predecessor = acquired.value();
+  }
+
+  for (std::uint64_t index = 2U; index <= 8U; ++index) {
+    const RequestOwnerEpoch kernel_epoch("kernel." + std::to_string(index));
+    const RequestOwnerEpoch successor_epoch("authoring.owner." +
+                                            std::to_string(index));
+    SqliteOperationJournal journal(database, CellId("cell.1"));
+    auto recovery = journal.BeginOwnerEpoch(
+        kernel_epoch, static_cast<std::int64_t>(index * 10U), 2U,
+        {ResourceId("resource.1")});
+    ASSERT_TRUE(recovery.ok()) << index;
+    KernelCellAdmissionOwner owner(
+        kernel_epoch, 2U, clock, journal,
+        recovery.value().recovered_cell_admission_claims,
+        recovery.value().cell_admission_generation_high_water, {},
+        [](const auto&, const auto&) { return Result<void>::Ok(); },
+        [](const auto& held, const auto& reconcile) {
+          return Result<CellAdmissionReconcileValidationDTO>::Ok(
+              {reconcile.current_owner_epochs,
+               {{held.front(), CellAdmissionOwnerRoleDTO::kAuthoringOwner,
+                 reconcile.current_owner_epochs.front().owner_epoch,
+                 CellAdmissionSettlementKindDTO::kReconciled,
+                 reconcile.reconciliation_evidence_digest}}});
+        },
+        recovery.value().recovered_cell_admission_membership,
+        recovery.value().recovered_cell_admission_current_owners);
+
+    if (obsolete.has_value()) {
+      const auto recovered = owner.GetCellAdmissionRecoveryReceipt(
+          {obsolete->intent, *obsolete, std::nullopt});
+      ASSERT_TRUE(recovered.ok());
+      EXPECT_EQ(recovered.value().status,
+                CellAdmissionRecoveryReceiptStatusDTO::kReconciledExact);
+    }
+    const auto held = owner.GetCellAdmissionRecoveryReceipt(
+        {predecessor.intent, predecessor, std::nullopt});
+    ASSERT_TRUE(held.ok());
+    EXPECT_EQ(held.value().status,
+              CellAdmissionRecoveryReceiptStatusDTO::kHeldExact);
+
+    ASSERT_TRUE(owner.UpdateCellAdmissionReadiness(Ready()).ok());
+    const CellAdmissionReconcileDTO reconcile{
+        kernel_epoch, {predecessor},
+        {{CellAdmissionOwnerRoleDTO::kAuthoringOwner, successor_epoch}},
+        Digest(static_cast<char>('0' + index))};
+    ASSERT_TRUE(owner.ReconcileCellAdmissionClaims(reconcile).ok()) << index;
+    if (obsolete.has_value()) {
+      const auto retired = owner.GetCellAdmissionRecoveryReceipt(
+          {obsolete->intent, *obsolete, std::nullopt});
+      ASSERT_TRUE(retired.ok());
+      EXPECT_EQ(retired.value().status,
+                CellAdmissionRecoveryReceiptStatusDTO::kUnknown);
+    }
+    const auto latest = owner.GetCellAdmissionRecoveryReceipt(
+        {predecessor.intent, predecessor, std::nullopt});
+    ASSERT_TRUE(latest.ok());
+    EXPECT_EQ(latest.value().status,
+              CellAdmissionRecoveryReceiptStatusDTO::kReconciledExact);
+
+    auto next_intent = Claim().intent;
+    next_intent.owner_epoch = successor_epoch;
+    next_intent.owner_transaction_id =
+        "document.transaction." + std::to_string(index);
+    next_intent.request_id = RequestId("request." + std::to_string(index));
+    next_intent.expected_admission_generation =
+        owner.GetAuthoringAdmission().admission_generation;
+    auto next = owner.AcquireCellAdmissionClaim(next_intent);
+    ASSERT_TRUE(next.ok()) << index;
+    obsolete = predecessor;
+    predecessor = next.value();
+  }
+
+  EXPECT_EQ(CountRows(database, "cell_admission_claims"), 2);
+  EXPECT_EQ(CountRows(database, "cell_admission_request_membership"), 2);
+  EXPECT_EQ(CountRows(database, "cell_admission_reconcile_settlements"), 1);
+  EXPECT_EQ(CountRows(database, "cell_admission_reconciliations"), 1);
 }
 
 }  // namespace

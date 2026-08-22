@@ -2,9 +2,12 @@
 
 #include <gtest/gtest.h>
 #include <manyforge_content_identity/content_identity.hpp>
+#include <sys/socket.h>
+#include <unistd.h>
 
 #include <algorithm>
 #include <array>
+#include <cerrno>
 #include <string>
 #include <variant>
 #include <vector>
@@ -74,6 +77,12 @@ Value Reconcile() {
       {"reconciliation_evidence_digest", Value(std::string(kDigest))},
       {"retained_claims", Value(Value::Array{})}});
 }
+Value RecoveryQuery() {
+  return Value(Value::Object{
+      {"expected_claim", Value(nullptr)},
+      {"expected_release", Value(nullptr)},
+      {"intent", Intent()}});
+}
 
 class RecordingKernel final : public core::IKernelCellAdmissionPort {
 public:
@@ -111,13 +120,26 @@ public:
     return core::Result<core::AuthoringAdmissionDTO>::Ok(
         {true, core::AdmissionGeneration(10U)});
   }
+  core::Result<core::CellAdmissionRecoveryReceiptDTO>
+  GetCellAdmissionRecoveryReceipt(
+      const core::CellAdmissionRecoveryReceiptQueryDTO &query) const override {
+    ++calls;
+    core::CellAdmissionClaimDTO claim{
+        query.intent, core::CellAdmissionClaimGeneration(3U),
+        query.intent.expected_admission_generation, 42};
+    return core::Result<core::CellAdmissionRecoveryReceiptDTO>::Ok(
+        {core::CellAdmissionRecoveryReceiptStatusDTO::kHeldExact,
+         core::RequestOwnerEpoch("kernel-1"), core::AdmissionGeneration(8U),
+         claim, std::nullopt, std::nullopt, {claim},
+         {{query.intent.owner_role, query.intent.owner_epoch}}});
+  }
   mutable std::size_t calls{};
   std::size_t acquire_calls{};
 };
 
-TEST(CellAdmissionCommandCodec, DecodesAllFiveStrictCommands) {
+TEST(CellAdmissionCommandCodec, DecodesAllSixStrictCommands) {
   RecordingKernel kernel;
-  const std::array<Value, 5> commands{
+  const std::array<Value, 6> commands{
       Value(Value::Object{
           {"api_version",
            Value(std::string(kCellAdmissionCommandApiVersion))},
@@ -125,7 +147,8 @@ TEST(CellAdmissionCommandCodec, DecodesAllFiveStrictCommands) {
       Envelope("cell_admission_update_readiness", Readiness()),
       Envelope("cell_admission_acquire", Intent()),
       Envelope("cell_admission_release", Release()),
-      Envelope("cell_admission_reconcile", Reconcile())};
+      Envelope("cell_admission_reconcile", Reconcile()),
+      Envelope("cell_admission_recovery_receipt", RecoveryQuery())};
   for (const auto &command : commands) {
     const auto decoded =
         TryDecodeCellAdmissionCommand(ci::canonical_json(command));
@@ -134,7 +157,7 @@ TEST(CellAdmissionCommandCodec, DecodesAllFiveStrictCommands) {
         cm::DispatchKernelCellAdmissionRpc(kernel, *decoded);
     EXPECT_FALSE(std::holds_alternative<core::ErrorDTO>(response));
   }
-  EXPECT_EQ(kernel.calls, 5U);
+  EXPECT_EQ(kernel.calls, 6U);
 }
 
 TEST(CellAdmissionCommandCodec, RejectsUnknownExtraTypeRangeEnumAndOversize) {
@@ -174,6 +197,14 @@ TEST(CellAdmissionCommandCodec, RejectsUnknownExtraTypeRangeEnumAndOversize) {
   EXPECT_THROW(TryDecodeCellAdmissionCommand(
                    std::string("{\"command\":\"cell_admission_") +
                    std::string(1024U * 1024U + 1U, 'x')),
+               std::invalid_argument);
+  auto incomplete_query = RecoveryQuery().as_object();
+  for (auto &[key, value] : incomplete_query)
+    if (key == "expected_release")
+      value = Release();
+  EXPECT_THROW(TryDecodeCellAdmissionCommand(ci::canonical_json(
+                   Envelope("cell_admission_recovery_receipt",
+                            Value(std::move(incomplete_query))))),
                std::invalid_argument);
 }
 
@@ -220,7 +251,8 @@ TEST(CellAdmissionCommandCodec, PrivateDtoAndResponseRoundTripsAreLossless) {
         Envelope("cell_admission_update_readiness", Readiness()),
         Envelope("cell_admission_acquire", Intent()),
         Envelope("cell_admission_release", Release()),
-        Envelope("cell_admission_reconcile", Reconcile())}) {
+        Envelope("cell_admission_reconcile", Reconcile()),
+        Envelope("cell_admission_recovery_receipt", RecoveryQuery())}) {
     const auto packet =
         *TryDecodeCellAdmissionCommand(ci::canonical_json(command));
     EXPECT_EQ(cm::DecodeKernelCellAdmissionRpcRequest(
@@ -234,6 +266,23 @@ TEST(CellAdmissionCommandCodec, PrivateDtoAndResponseRoundTripsAreLossless) {
   const auto decoded = cm::DecodeKernelCellAdmissionRpcResponse(bytes);
   EXPECT_EQ(decoded.command, "cell_admission_release");
   EXPECT_EQ(std::get<core::ErrorDTO>(decoded.response), error);
+
+  RecordingKernel kernel;
+  const auto query = *TryDecodeCellAdmissionCommand(ci::canonical_json(
+      Envelope("cell_admission_recovery_receipt", RecoveryQuery())));
+  const auto receipt =
+      cm::DispatchKernelCellAdmissionRpc(kernel, query);
+  const auto receipt_bytes = cm::EncodeKernelCellAdmissionRpcResponse(
+      query.command, receipt);
+  EXPECT_EQ(cm::DecodeKernelCellAdmissionRpcResponse(receipt_bytes).response,
+            receipt);
+  auto trailing_query = cm::EncodeKernelCellAdmissionRpcRequest(query);
+  trailing_query.push_back('\0');
+  EXPECT_THROW(cm::DecodeKernelCellAdmissionRpcRequest(trailing_query),
+               std::invalid_argument);
+  EXPECT_THROW(cm::EncodeKernelCellAdmissionRpcResponse(
+                   "cell_admission_release", receipt),
+               std::invalid_argument);
 }
 
 TEST(CellAdmissionCommandCodec, FreezesExactCommandSpecificJsonShapes) {
@@ -326,6 +375,126 @@ TEST(CellAdmissionCommandCodec,
       core::ResourceId(intent.scope.resources.back().value() + "r");
   EXPECT_THROW(cm::EncodeKernelCellAdmissionRpcRequest(claim_packet),
                std::invalid_argument);
+}
+
+TEST(CellAdmissionCommandCodec,
+     BothCodecsRejectEveryOversizedScopeIdentity) {
+  auto packet = *TryDecodeCellAdmissionCommand(ci::canonical_json(
+      Envelope("cell_admission_acquire", Intent())));
+  auto& intent =
+      std::get<core::CellAdmissionClaimIntentDTO>(packet.request);
+  const auto oversized =
+      std::string(core::kMaximumCellAdmissionIdentityBytes + 1U, 'x');
+  intent.scope.resources = {core::ResourceId(oversized)};
+  const auto binary_resource = cm::EncodeKernelCellAdmissionRpcRequest(packet);
+  EXPECT_THROW(cm::DecodeKernelCellAdmissionRpcRequest(binary_resource),
+               std::invalid_argument);
+  intent.scope.resources.clear();
+  intent.scope.configurations = {core::CellAdmissionConfigurationScopeDTO{
+      core::ControlDomainId(oversized),
+      core::ActiveControlConfigurationId("configuration"),
+      core::ActiveControlConfigurationGeneration(1U)}};
+  const auto binary_domain = cm::EncodeKernelCellAdmissionRpcRequest(packet);
+  EXPECT_THROW(cm::DecodeKernelCellAdmissionRpcRequest(binary_domain),
+               std::invalid_argument);
+  intent.scope.configurations.front().control_domain_id =
+      core::ControlDomainId("domain");
+  intent.scope.configurations.front().active_configuration_id =
+      core::ActiveControlConfigurationId(oversized);
+  const auto binary_configuration =
+      cm::EncodeKernelCellAdmissionRpcRequest(packet);
+  EXPECT_THROW(cm::DecodeKernelCellAdmissionRpcRequest(binary_configuration),
+               std::invalid_argument);
+
+  auto json_resource = Intent().as_object();
+  for (auto& [key, value] : json_resource) {
+    if (key == "scope") {
+      value = Value(Value::Object{
+          {"configurations", Value(Value::Array{})},
+          {"resources", Value(Value::Array{Value(oversized)})}});
+    }
+  }
+  EXPECT_THROW(TryDecodeCellAdmissionCommand(ci::canonical_json(
+                   Envelope("cell_admission_acquire",
+                            Value(std::move(json_resource))))),
+               std::invalid_argument);
+  auto json_configuration = Intent().as_object();
+  for (auto& [key, value] : json_configuration) {
+    if (key == "scope") {
+      value = Value(Value::Object{
+          {"configurations",
+           Value(Value::Array{Value(Value::Object{
+               {"active_configuration_generation", Value(1.0)},
+               {"active_configuration_id", Value(oversized)},
+               {"control_domain_id", Value("domain")}})})},
+          {"resources", Value(Value::Array{})}});
+    }
+  }
+  EXPECT_THROW(TryDecodeCellAdmissionCommand(ci::canonical_json(
+                   Envelope("cell_admission_acquire",
+                            Value(std::move(json_configuration))))),
+               std::invalid_argument);
+  auto json_domain = Intent().as_object();
+  for (auto& [key, value] : json_domain) {
+    if (key == "scope") {
+      value = Value(Value::Object{
+          {"configurations",
+           Value(Value::Array{Value(Value::Object{
+               {"active_configuration_generation", Value(1.0)},
+               {"active_configuration_id", Value("configuration")},
+               {"control_domain_id", Value(oversized)}})})},
+          {"resources", Value(Value::Array{})}});
+    }
+  }
+  EXPECT_THROW(TryDecodeCellAdmissionCommand(ci::canonical_json(
+                   Envelope("cell_admission_acquire",
+                            Value(std::move(json_domain))))),
+               std::invalid_argument);
+}
+
+TEST(CellAdmissionCommandCodec,
+     ConfiguredSeqpacketCarriesTheAdmittedAtomicCeiling) {
+  int descriptors[2]{-1, -1};
+  ASSERT_EQ(::socketpair(AF_UNIX, SOCK_SEQPACKET | SOCK_CLOEXEC, 0,
+                         descriptors),
+            0);
+  const int packet_bytes =
+      static_cast<int>(cm::kMaximumManagedRuntimeRpcPacketBytes);
+  for (const auto descriptor : descriptors) {
+    ASSERT_EQ(::setsockopt(descriptor, SOL_SOCKET, SO_SNDBUF, &packet_bytes,
+                           sizeof(packet_bytes)),
+              0);
+    ASSERT_EQ(::setsockopt(descriptor, SOL_SOCKET, SO_RCVBUF, &packet_bytes,
+                           sizeof(packet_bytes)),
+              0);
+    int configured = 0;
+    socklen_t configured_size = sizeof(configured);
+    ASSERT_EQ(::getsockopt(descriptor, SOL_SOCKET, SO_SNDBUF, &configured,
+                           &configured_size),
+              0);
+    ASSERT_GE(configured, packet_bytes);
+    configured = 0;
+    configured_size = sizeof(configured);
+    ASSERT_EQ(::getsockopt(descriptor, SOL_SOCKET, SO_RCVBUF, &configured,
+                           &configured_size),
+              0);
+    ASSERT_GE(configured, packet_bytes);
+  }
+  const std::string outbound(cm::kMaximumManagedRuntimeRpcPacketBytes, 'p');
+  ASSERT_EQ(::send(descriptors[0], outbound.data(), outbound.size(),
+                   MSG_NOSIGNAL),
+            static_cast<ssize_t>(outbound.size()));
+  std::string inbound(outbound.size(), '\0');
+  iovec vector{inbound.data(), inbound.size()};
+  msghdr message{};
+  message.msg_iov = &vector;
+  message.msg_iovlen = 1U;
+  ASSERT_EQ(::recvmsg(descriptors[1], &message, 0),
+            static_cast<ssize_t>(outbound.size()));
+  EXPECT_EQ(message.msg_flags & MSG_TRUNC, 0);
+  EXPECT_EQ(inbound, outbound);
+  ::close(descriptors[0]);
+  ::close(descriptors[1]);
 }
 
 } // namespace

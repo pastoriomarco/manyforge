@@ -244,6 +244,34 @@ private:
       0) {
     Fail(ErrnoDetail("could not create native runtime private channel", errno));
   }
+  const int packet_bytes =
+      static_cast<int>(detail::kMaximumManagedRuntimeRpcPacketBytes);
+  for (const auto descriptor : descriptors) {
+    if (::setsockopt(descriptor, SOL_SOCKET, SO_SNDBUF, &packet_bytes,
+                     sizeof(packet_bytes)) != 0 ||
+        ::setsockopt(descriptor, SOL_SOCKET, SO_RCVBUF, &packet_bytes,
+                     sizeof(packet_bytes)) != 0) {
+      const auto error = errno;
+      ::close(descriptors[0]);
+      ::close(descriptors[1]);
+      Fail(ErrnoDetail("could not configure native runtime packet buffers",
+                       error));
+    }
+    int send_bytes = 0;
+    int receive_bytes = 0;
+    socklen_t option_size = sizeof(int);
+    if (::getsockopt(descriptor, SOL_SOCKET, SO_SNDBUF, &send_bytes,
+                     &option_size) != 0 ||
+        option_size != sizeof(int) ||
+        ::getsockopt(descriptor, SOL_SOCKET, SO_RCVBUF, &receive_bytes,
+                     &option_size) != 0 ||
+        option_size != sizeof(int) || send_bytes < packet_bytes ||
+        receive_bytes < packet_bytes) {
+      ::close(descriptors[0]);
+      ::close(descriptors[1]);
+      Fail("native runtime packet buffers are below the atomic ceiling");
+    }
+  }
   return {UniqueFd(descriptors[0]), UniqueFd(descriptors[1])};
 }
 
@@ -1701,6 +1729,14 @@ RetainedNativeRuntimeUnitAdapter::ReconcileCellAdmissionClaims(
   return impl_->KernelCellAdmissionCall<
       manyforge::core::AuthoringAdmissionDTO>(
       {"cell_admission_reconcile", reconcile});
+}
+
+manyforge::core::Result<manyforge::core::CellAdmissionRecoveryReceiptDTO>
+RetainedNativeRuntimeUnitAdapter::GetCellAdmissionRecoveryReceipt(
+    const manyforge::core::CellAdmissionRecoveryReceiptQueryDTO &query) const {
+  return impl_->KernelCellAdmissionCall<
+      manyforge::core::CellAdmissionRecoveryReceiptDTO>(
+      {"cell_admission_recovery_receipt", query});
 }
 
 manyforge::core::Result<

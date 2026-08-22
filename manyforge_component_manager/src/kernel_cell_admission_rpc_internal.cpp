@@ -326,6 +326,85 @@ core::CellAdmissionReconcileDTO Reconcile(Reader &r) {
   return result;
 }
 
+void OwnerEpoch(Writer &w, const core::CellAdmissionCurrentOwnerEpochDTO &x) {
+  Enum(w, x.owner_role);
+  S(w, x.owner_epoch);
+}
+core::CellAdmissionCurrentOwnerEpochDTO OwnerEpoch(Reader &r) {
+  return {Enum<core::CellAdmissionOwnerRoleDTO>(r, 7U),
+          S<core::RequestOwnerEpoch>(r)};
+}
+void ReconcileSettlement(
+    Writer &w, const core::CellAdmissionReconcileSettlementDTO &x) {
+  Claim(w, x.predecessor_claim);
+  Enum(w, x.successor_owner_role);
+  S(w, x.successor_owner_epoch);
+  Enum(w, x.settlement_predicate);
+  S(w, x.reconciliation_evidence_digest);
+}
+core::CellAdmissionReconcileSettlementDTO ReconcileSettlement(Reader &r) {
+  return {Claim(r), Enum<core::CellAdmissionOwnerRoleDTO>(r, 7U),
+          S<core::RequestOwnerEpoch>(r),
+          Enum<core::CellAdmissionSettlementKindDTO>(r, 5U),
+          S<core::ContentDigest>(r)};
+}
+void RecoveryQuery(Writer &w,
+                   const core::CellAdmissionRecoveryReceiptQueryDTO &x) {
+  Intent(w, x.intent);
+  Opt(w, x.expected_claim,
+      [](Writer &w, const auto &v) { Claim(w, v); });
+  Opt(w, x.expected_release,
+      [](Writer &w, const auto &v) { Release(w, v); });
+}
+core::CellAdmissionRecoveryReceiptQueryDTO RecoveryQuery(Reader &r) {
+  auto result = core::CellAdmissionRecoveryReceiptQueryDTO{
+      Intent(r),
+      Opt<core::CellAdmissionClaimDTO>(
+          r, [](Reader &r) { return Claim(r); }),
+      Opt<core::CellAdmissionClaimReleaseDTO>(
+          r, [](Reader &r) { return Release(r); })};
+  if (!core::ValidateCellAdmissionRecoveryReceiptQuery(result).ok())
+    Fail("invalid recovery receipt query");
+  return result;
+}
+void RecoveryReceipt(Writer &w,
+                     const core::CellAdmissionRecoveryReceiptDTO &x) {
+  if (!core::ValidateCellAdmissionRecoveryReceipt(x).ok())
+    Fail("invalid recovery receipt");
+  Enum(w, x.status);
+  S(w, x.kernel_owner_epoch);
+  G(w, x.admission_generation);
+  Opt(w, x.matched_claim,
+      [](Writer &w, const auto &v) { Claim(w, v); });
+  Opt(w, x.matched_release,
+      [](Writer &w, const auto &v) { Release(w, v); });
+  Opt(w, x.matched_reconcile_settlement,
+      [](Writer &w, const auto &v) { ReconcileSettlement(w, v); });
+  Vec(w, x.held_claims,
+      [](Writer &w, const auto &v) { Claim(w, v); });
+  Vec(w, x.current_owner_epochs,
+      [](Writer &w, const auto &v) { OwnerEpoch(w, v); });
+}
+core::CellAdmissionRecoveryReceiptDTO RecoveryReceipt(Reader &r) {
+  auto result = core::CellAdmissionRecoveryReceiptDTO{
+      Enum<core::CellAdmissionRecoveryReceiptStatusDTO>(r, 5U),
+      S<core::RequestOwnerEpoch>(r),
+      G<core::AdmissionGeneration>(r),
+      Opt<core::CellAdmissionClaimDTO>(
+          r, [](Reader &r) { return Claim(r); }),
+      Opt<core::CellAdmissionClaimReleaseDTO>(
+          r, [](Reader &r) { return Release(r); }),
+      Opt<core::CellAdmissionReconcileSettlementDTO>(
+          r, [](Reader &r) { return ReconcileSettlement(r); }),
+      Vec<core::CellAdmissionClaimDTO>(
+          r, [](Reader &r) { return Claim(r); }),
+      Vec<core::CellAdmissionCurrentOwnerEpochDTO>(
+          r, [](Reader &r) { return OwnerEpoch(r); })};
+  if (!core::ValidateCellAdmissionRecoveryReceipt(result).ok())
+    Fail("invalid recovery receipt");
+  return result;
+}
+
 } // namespace
 
 bool IsKernelCellAdmissionRpcPacket(std::string_view b) noexcept {
@@ -356,6 +435,10 @@ DispatchKernelCellAdmissionRpc(core::IKernelCellAdmissionPort &kernel,
   if (request.command == "cell_admission_reconcile")
     return adopt(kernel.ReconcileCellAdmissionClaims(
         std::get<core::CellAdmissionReconcileDTO>(request.request)));
+  if (request.command == "cell_admission_recovery_receipt")
+    return adopt(kernel.GetCellAdmissionRecoveryReceipt(
+        std::get<core::CellAdmissionRecoveryReceiptQueryDTO>(
+            request.request)));
   Fail("unknown cell-admission command");
 }
 std::string
@@ -365,7 +448,10 @@ EncodeKernelCellAdmissionRpcRequest(const KernelCellAdmissionRpcPacket &x) {
   const bool acquire = x.command == "cell_admission_acquire";
   const bool release = x.command == "cell_admission_release";
   const bool reconcile = x.command == "cell_admission_reconcile";
-  if (!get && !readiness && !acquire && !release && !reconcile)
+  const bool recovery_receipt =
+      x.command == "cell_admission_recovery_receipt";
+  if (!get && !readiness && !acquire && !release && !reconcile &&
+      !recovery_receipt)
     Fail("unknown cell-admission command");
   if ((get && !std::holds_alternative<std::monostate>(x.request)) ||
       (readiness &&
@@ -377,7 +463,10 @@ EncodeKernelCellAdmissionRpcRequest(const KernelCellAdmissionRpcPacket &x) {
        !std::holds_alternative<core::CellAdmissionClaimReleaseDTO>(
            x.request)) ||
       (reconcile &&
-       !std::holds_alternative<core::CellAdmissionReconcileDTO>(x.request)))
+       !std::holds_alternative<core::CellAdmissionReconcileDTO>(x.request)) ||
+      (recovery_receipt &&
+       !std::holds_alternative<
+           core::CellAdmissionRecoveryReceiptQueryDTO>(x.request)))
     Fail("cell-admission command has the wrong request DTO");
   Writer w;
   w.out_.append(kMagic);
@@ -395,8 +484,11 @@ EncodeKernelCellAdmissionRpcRequest(const KernelCellAdmissionRpcPacket &x) {
           else if constexpr (std::is_same_v<T,
                                             core::CellAdmissionClaimReleaseDTO>)
             Release(w, v);
-          else
+          else if constexpr (std::is_same_v<
+                                 T, core::CellAdmissionReconcileDTO>)
             Reconcile(w, v);
+          else
+            RecoveryQuery(w, v);
         }
       },
       x.request);
@@ -423,6 +515,8 @@ DecodeKernelCellAdmissionRpcRequest(std::string_view b) {
     x = std::move(v);
   } else if (command == "cell_admission_reconcile")
     x = Reconcile(r);
+  else if (command == "cell_admission_recovery_receipt")
+    x = RecoveryQuery(r);
   else
     Fail("unknown cell-admission command");
   r.Finish();
@@ -435,13 +529,19 @@ EncodeKernelCellAdmissionRpcResponse(std::string_view command,
       command != "cell_admission_update_readiness" &&
       command != "cell_admission_acquire" &&
       command != "cell_admission_release" &&
-      command != "cell_admission_reconcile")
+      command != "cell_admission_reconcile" &&
+      command != "cell_admission_recovery_receipt")
     Fail("unknown response command");
   if (command == "cell_admission_acquire" &&
       !std::holds_alternative<core::CellAdmissionClaimDTO>(x) &&
       !std::holds_alternative<core::ErrorDTO>(x))
     Fail("acquire response has the wrong DTO");
+  if (command == "cell_admission_recovery_receipt" &&
+      !std::holds_alternative<core::CellAdmissionRecoveryReceiptDTO>(x) &&
+      !std::holds_alternative<core::ErrorDTO>(x))
+    Fail("recovery receipt response has the wrong DTO");
   if (command != "cell_admission_acquire" &&
+      command != "cell_admission_recovery_receipt" &&
       !std::holds_alternative<core::AuthoringAdmissionDTO>(x) &&
       !std::holds_alternative<core::ErrorDTO>(x))
     Fail("response has the wrong DTO");
@@ -458,6 +558,10 @@ EncodeKernelCellAdmissionRpcResponse(std::string_view command,
         } else if constexpr (std::is_same_v<T, core::CellAdmissionClaimDTO>) {
           w.Byte(1);
           Claim(w, v);
+        } else if constexpr (std::is_same_v<
+                                 T, core::CellAdmissionRecoveryReceiptDTO>) {
+          w.Byte(3);
+          RecoveryReceipt(w, v);
         } else {
           w.Byte(2);
           w.String(v.code);
@@ -482,7 +586,8 @@ DecodeKernelCellAdmissionRpcResponse(std::string_view b) {
       command != "cell_admission_update_readiness" &&
       command != "cell_admission_acquire" &&
       command != "cell_admission_release" &&
-      command != "cell_admission_reconcile")
+      command != "cell_admission_reconcile" &&
+      command != "cell_admission_recovery_receipt")
     Fail("unknown response command");
   auto tag = r.Byte();
   KernelCellAdmissionRpcResponse x;
@@ -502,7 +607,9 @@ DecodeKernelCellAdmissionRpcResponse(std::string_view b) {
         Fail("duplicate error detail");
     }
     x = e;
-  } else
+  } else if (tag == 3)
+    x = RecoveryReceipt(r);
+  else
     Fail("unknown response tag");
   if (const auto *claim = std::get_if<core::CellAdmissionClaimDTO>(&x);
       claim != nullptr &&

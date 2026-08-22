@@ -94,18 +94,8 @@ struct RecoveredStopJournalStateDTO final {
 /// Trusted, internal reconciliation result.  The public reconcile DTO is only
 /// evidence input; this result is the exact authority consumed by Kernel and
 /// its mechanical journal.
-struct CellAdmissionReconcileSettlementAuthorizationDTO final {
-  CellAdmissionClaimDTO predecessor_claim;
-  CellAdmissionOwnerRoleDTO successor_owner_role{
-      CellAdmissionOwnerRoleDTO::kAuthoringOwner};
-  RequestOwnerEpoch successor_owner_epoch;
-  CellAdmissionSettlementKindDTO settlement_predicate{
-      CellAdmissionSettlementKindDTO::kReconciled};
-  ContentDigest reconciliation_evidence_digest;
-
-  friend bool operator==(const CellAdmissionReconcileSettlementAuthorizationDTO&,
-                         const CellAdmissionReconcileSettlementAuthorizationDTO&) = default;
-};
+using CellAdmissionReconcileSettlementAuthorizationDTO =
+    CellAdmissionReconcileSettlementDTO;
 
 struct CellAdmissionReconcileValidationDTO final {
   std::vector<CellAdmissionCurrentOwnerEpochDTO> current_owner_epochs;
@@ -124,6 +114,7 @@ struct OperationJournalRecoveryDTO final {
   struct RecoveredCellAdmissionClaimDTO final {
     CellAdmissionClaimDTO claim;
     std::optional<CellAdmissionClaimReleaseDTO> release;
+    std::optional<CellAdmissionReconcileSettlementDTO> reconcile_settlement;
 
     friend bool operator==(const RecoveredCellAdmissionClaimDTO&,
                            const RecoveredCellAdmissionClaimDTO&) = default;

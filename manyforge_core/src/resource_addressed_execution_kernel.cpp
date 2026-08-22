@@ -2592,6 +2592,12 @@ Result<AuthoringAdmissionDTO> ResourceAddressedExecutionKernel::ReconcileCellAdm
   return cell_admission_owner_->ReconcileCellAdmissionClaims(reconcile);
 }
 
+Result<CellAdmissionRecoveryReceiptDTO>
+ResourceAddressedExecutionKernel::GetCellAdmissionRecoveryReceipt(
+    const CellAdmissionRecoveryReceiptQueryDTO& query) const {
+  return cell_admission_owner_->GetCellAdmissionRecoveryReceipt(query);
+}
+
 Result<void> ResourceAddressedExecutionKernel::reconfigure_runtime_participants(
     std::vector<RuntimeParticipantExecutionRegistration> registrations,
     RuntimeParticipantAdmissionResolver participant_resolver) {

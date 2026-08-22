@@ -2286,7 +2286,38 @@ void StoreOperationSnapshotMonotonic(sqlite3* database, const RequestOwnerEpoch&
   Require(!row.Step() && ValidateCellAdmissionClaimIntent(claim.intent).ok() &&
               (!release.has_value() || ValidateCellAdmissionClaimRelease(*release).ok()),
           "operation_journal_corrupt", "durable cell-admission claim is invalid");
-  return {std::move(claim), std::move(release)};
+  return {std::move(claim), std::move(release), std::nullopt};
+}
+
+[[nodiscard]] std::optional<CellAdmissionReconcileSettlementDTO>
+LoadCellReconcileSettlement(sqlite3* database,
+                            const CellAdmissionClaimDTO& claim) {
+  Statement row(
+      database,
+      "SELECT settlement.successor_owner_role,settlement.successor_owner_epoch,"
+      "settlement.settlement_predicate,settlement.evidence_digest "
+      "FROM cell_admission_reconcile_settlements settlement "
+      "JOIN cell_admission_claims claim "
+      "ON claim.reconciled_sequence=settlement.reconcile_sequence "
+      "AND claim.claim_generation=settlement.claim_generation "
+      "WHERE settlement.claim_generation=?");
+  row.Bind(1, static_cast<std::int64_t>(claim.claim_generation.value()));
+  if (!row.Step()) {
+    return std::nullopt;
+  }
+  CellAdmissionReconcileSettlementDTO result{
+      claim, CellOwnerRole(row.Text(0)), RequestOwnerEpoch(row.Text(1)),
+      CellSettlementKind(row.Text(2)), ContentDigest(row.Text(3))};
+  Require(!row.Step() &&
+              result.successor_owner_role == claim.intent.owner_role &&
+              result.successor_owner_epoch != claim.intent.owner_epoch &&
+              result.settlement_predicate ==
+                  CellAdmissionSettlementKindDTO::kReconciled &&
+              content_identity::is_sha256_digest(
+                  result.reconciliation_evidence_digest.value()),
+          "operation_journal_corrupt",
+          "durable cell-admission reconcile settlement is invalid");
+  return result;
 }
 
 }  // namespace
@@ -3083,18 +3114,36 @@ OperationJournalRecoveryDTO SqliteOperationJournal::Impl::BeginOwnerEpoch(
           "cell-admission replacement generation did not advance");
 
   if (prior_epoch_clean) {
+    Statement retire_stale_claims(
+        database_,
+        "DELETE FROM cell_admission_claims WHERE claim_generation IN ("
+        "SELECT membership.claim_generation "
+        "FROM cell_admission_request_membership membership "
+        "WHERE NOT EXISTS (SELECT 1 FROM cell_admission_current_owners current "
+        "WHERE current.owner_role=membership.owner_role "
+        "AND current.owner_epoch=membership.owner_epoch)) "
+        "AND release_owner_role IS NOT NULL");
+    Require(!retire_stale_claims.Step(), "operation_journal_corrupt",
+            "stale cell-admission claim retirement failed");
     Statement retire_stale_membership(
         database_,
         "DELETE FROM cell_admission_request_membership "
         "WHERE NOT EXISTS (SELECT 1 FROM cell_admission_current_owners current "
         "WHERE current.owner_role=cell_admission_request_membership.owner_role "
-        "AND current.owner_epoch=cell_admission_request_membership.owner_epoch)");
+        "AND current.owner_epoch=cell_admission_request_membership.owner_epoch) "
+        "AND claim_generation NOT IN ("
+        "SELECT claim_generation FROM cell_admission_claims)");
     Require(!retire_stale_membership.Step(), "operation_journal_corrupt",
             "stale cell-admission membership retirement failed");
     Statement compact_reconciliations(
         database_,
-        "DELETE FROM cell_admission_reconciliations WHERE kernel_owner_epoch<>?");
-    compact_reconciliations.Bind(1, owner_epoch.value());
+        "DELETE FROM cell_admission_reconciliations "
+        "WHERE reconcile_sequence<>("
+        "SELECT COALESCE(MAX(reconcile_sequence),0) "
+        "FROM cell_admission_reconciliations) "
+        "AND NOT EXISTS (SELECT 1 FROM cell_admission_reconcile_settlements settlement "
+        "WHERE settlement.reconcile_sequence="
+        "cell_admission_reconciliations.reconcile_sequence)");
     Require(!compact_reconciliations.Step(), "operation_journal_corrupt",
             "settled cell-admission reconciliation compaction failed");
   }
@@ -3351,12 +3400,14 @@ OperationJournalRecoveryDTO SqliteOperationJournal::Impl::BeginOwnerEpoch(
           "recovered Stop truth exceeds the fixed restart bound");
   Statement retained_claims(
       database_,
-      "SELECT claim_generation FROM cell_admission_claims "
-      "WHERE reconciled_sequence IS NULL ORDER BY claim_generation");
+      "SELECT claim_generation FROM cell_admission_claims ORDER BY claim_generation");
   while (retained_claims.Step()) {
-    recovery.recovered_cell_admission_claims.push_back(LoadCellClaim(
+    auto recovered = LoadCellClaim(
         database_, PositiveIdentifier(retained_claims.Integer(0),
-                                      "cell-admission claim generation")));
+                                      "cell-admission claim generation"));
+    recovered.reconcile_settlement =
+        LoadCellReconcileSettlement(database_, recovered.claim);
+    recovery.recovered_cell_admission_claims.push_back(std::move(recovered));
   }
   Require(recovery.recovered_cell_admission_claims.size() <= request_capacity,
           "operation_journal_history_full",
@@ -3804,7 +3855,8 @@ std::uint64_t SqliteOperationJournal::Impl::RecordCellAdmissionClaimAcquired(
     Require(same, "request_id_conflict",
             "cell-admission request reuses compact membership with different intent");
     Statement resident(database_,
-                       "SELECT COUNT(*) FROM cell_admission_claims WHERE claim_generation=?");
+                       "SELECT COUNT(*) FROM cell_admission_claims WHERE claim_generation=? "
+                       "AND release_owner_role IS NULL AND reconciled_sequence IS NULL");
     resident.Bind(1, static_cast<std::int64_t>(existing_generation));
     Require(resident.Step(), "operation_journal_corrupt",
             "cell-admission resident membership query returned no row");
@@ -3816,7 +3868,8 @@ std::uint64_t SqliteOperationJournal::Impl::RecordCellAdmissionClaimAcquired(
   }
   Statement replay(database_,
                    "SELECT claim_generation FROM cell_admission_claims "
-                   "WHERE owner_epoch=? AND request_id=?");
+                   "WHERE owner_epoch=? AND request_id=? "
+                   "AND release_owner_role IS NULL AND reconciled_sequence IS NULL");
   replay.Bind(1, claim.intent.owner_epoch.value());
   replay.Bind(2, claim.intent.request_id.value());
   if (replay.Step()) {
@@ -3830,6 +3883,25 @@ std::uint64_t SqliteOperationJournal::Impl::RecordCellAdmissionClaimAcquired(
     transaction.Commit();
     return existing_generation;
   }
+  Statement retire_membership(
+      database_,
+      "DELETE FROM cell_admission_request_membership WHERE claim_generation IN ("
+      "SELECT claim_generation FROM cell_admission_claims "
+      "WHERE owner_role=? AND owner_epoch=? "
+      "AND release_owner_role IS NOT NULL AND reconciled_sequence IS NULL)");
+  retire_membership.Bind(1, to_string(claim.intent.owner_role));
+  retire_membership.Bind(2, claim.intent.owner_epoch.value());
+  Require(!retire_membership.Step(), "operation_journal_corrupt",
+          "cell-admission released membership retirement returned a row");
+  Statement retire_claim(
+      database_,
+      "DELETE FROM cell_admission_claims "
+      "WHERE owner_role=? AND owner_epoch=? "
+      "AND release_owner_role IS NOT NULL AND reconciled_sequence IS NULL");
+  retire_claim.Bind(1, to_string(claim.intent.owner_role));
+  retire_claim.Bind(2, claim.intent.owner_epoch.value());
+  Require(!retire_claim.Step(), "operation_journal_corrupt",
+          "cell-admission released result retirement returned a row");
   Statement count(database_,
                   "SELECT COUNT(*),COALESCE(MAX(claim_generation),0) "
                   "FROM cell_admission_request_membership");
@@ -4064,13 +4136,6 @@ std::uint64_t SqliteOperationJournal::Impl::RecordCellAdmissionClaimReleased(
   Require(!advance.Step() && sqlite3_changes(database_) == 1,
           "operation_journal_record_invalid",
           "cell-admission release generation did not advance");
-  Statement compact(database_,
-                    "DELETE FROM cell_admission_claims WHERE claim_generation=? "
-                    "AND release_owner_role IS NOT NULL");
-  compact.Bind(1, static_cast<std::int64_t>(claim.claim_generation.value()));
-  Require(!compact.Step() && sqlite3_changes(database_) == 1,
-          "operation_journal_corrupt",
-          "cell-admission released result compaction failed");
   transaction.Commit();
   return claim.claim_generation.value();
 }
@@ -4315,13 +4380,6 @@ std::uint64_t SqliteOperationJournal::Impl::RecordCellAdmissionClaimsReconciled(
     Require(!settle.Step() && sqlite3_changes(database_) == 1,
             "operation_journal_corrupt",
             "cell-admission reconciliation did not settle exact predecessor");
-    Statement compact(
-        database_, "DELETE FROM cell_admission_claims WHERE claim_generation=?");
-    compact.Bind(1, static_cast<std::int64_t>(
-                        authorization.predecessor_claim.claim_generation.value()));
-    Require(!compact.Step() && sqlite3_changes(database_) == 1,
-            "operation_journal_corrupt",
-            "cell-admission reconciled result compaction failed");
   }
   for (const auto& current : validation.current_owner_epochs) {
     const auto prior = std::find_if(
@@ -4359,10 +4417,49 @@ std::uint64_t SqliteOperationJournal::Impl::RecordCellAdmissionClaimsReconciled(
       Require(unresolved.Step() && unresolved.Integer(0) == 0 && !unresolved.Step(),
               "operation_journal_owner_close_blocked",
               "unresolved claims block request-owner epoch rotation");
+      Statement compact_reconciled_membership(
+          database_,
+          "DELETE FROM cell_admission_request_membership "
+          "WHERE claim_generation IN ("
+          "SELECT claim_generation FROM cell_admission_reconcile_settlements "
+          "WHERE successor_owner_role=? AND successor_owner_epoch=?)");
+      compact_reconciled_membership.Bind(1, to_string(current.owner_role));
+      compact_reconciled_membership.Bind(2, prior->owner_epoch.value());
+      Require(!compact_reconciled_membership.Step(), "operation_journal_corrupt",
+              "obsolete reconciled cell-admission membership retirement failed");
+      Statement compact_reconciled_claims(
+          database_,
+          "DELETE FROM cell_admission_claims WHERE claim_generation IN ("
+          "SELECT claim_generation FROM cell_admission_reconcile_settlements "
+          "WHERE successor_owner_role=? AND successor_owner_epoch=?)");
+      compact_reconciled_claims.Bind(1, to_string(current.owner_role));
+      compact_reconciled_claims.Bind(2, prior->owner_epoch.value());
+      Require(!compact_reconciled_claims.Step(), "operation_journal_corrupt",
+              "obsolete reconciled cell-admission claim retirement failed");
+      Statement compact_reconcile_settlements(
+          database_,
+          "DELETE FROM cell_admission_reconcile_settlements "
+          "WHERE successor_owner_role=? AND successor_owner_epoch=?");
+      compact_reconcile_settlements.Bind(1, to_string(current.owner_role));
+      compact_reconcile_settlements.Bind(2, prior->owner_epoch.value());
+      Require(!compact_reconcile_settlements.Step(),
+              "operation_journal_corrupt",
+              "obsolete cell-admission reconcile settlement retirement failed");
+      Statement compact_claims(
+          database_,
+          "DELETE FROM cell_admission_claims "
+          "WHERE owner_role=? AND owner_epoch=? "
+          "AND release_owner_role IS NOT NULL");
+      compact_claims.Bind(1, to_string(current.owner_role));
+      compact_claims.Bind(2, prior->owner_epoch.value());
+      Require(!compact_claims.Step(), "operation_journal_corrupt",
+              "cell-admission stale claim retirement failed");
       Statement compact_namespace(
           database_,
           "DELETE FROM cell_admission_request_membership "
-          "WHERE owner_role=? AND owner_epoch=?");
+          "WHERE owner_role=? AND owner_epoch=? "
+          "AND claim_generation NOT IN ("
+          "SELECT claim_generation FROM cell_admission_claims)");
       compact_namespace.Bind(1, to_string(current.owner_role));
       compact_namespace.Bind(2, prior->owner_epoch.value());
       Require(!compact_namespace.Step(), "operation_journal_corrupt",
@@ -4380,6 +4477,16 @@ std::uint64_t SqliteOperationJournal::Impl::RecordCellAdmissionClaimsReconciled(
     Require(!publish_owner.Step(), "operation_journal_corrupt",
             "cell-admission current-owner publication failed");
   }
+  Statement compact_reconciliations(
+      database_,
+      "DELETE FROM cell_admission_reconciliations "
+      "WHERE reconcile_sequence<>? "
+      "AND NOT EXISTS (SELECT 1 FROM cell_admission_reconcile_settlements settlement "
+      "WHERE settlement.reconcile_sequence="
+      "cell_admission_reconciliations.reconcile_sequence)");
+  compact_reconciliations.Bind(1, static_cast<std::int64_t>(sequence));
+  Require(!compact_reconciliations.Step(), "operation_journal_corrupt",
+          "cell-admission stale reconciliation retirement failed");
   if (changed) {
     Statement advance(
         database_,

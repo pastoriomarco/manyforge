@@ -119,7 +119,8 @@ constexpr std::string_view kManagerResponseApiVersion =
     "manyforge.manager_command_response.v1";
 constexpr std::string_view kLockFileName = ".execution-host.lock";
 constexpr std::size_t kMaximumPacketBytes = 1024U * 1024U;
-constexpr std::size_t kMaximumResponseBytes = 4U * 1024U * 1024U;
+constexpr std::size_t kMaximumResponseBytes =
+    core::kMaximumCellAdmissionJsonResponseBytes;
 constexpr std::size_t kMaximumManagerResponseBytes = 512U * 1024U;
 constexpr std::size_t kMaximumIdentityBytes = 2048U;
 constexpr std::size_t kMaximumReasonBytes = 4096U;
@@ -7395,7 +7396,8 @@ private:
           for (const auto candidate :
                {"cell_admission_get", "cell_admission_update_readiness",
                 "cell_admission_acquire", "cell_admission_release",
-                "cell_admission_reconcile"}) {
+                "cell_admission_reconcile",
+                "cell_admission_recovery_receipt"}) {
             if (bytes.find(std::string("\"command\":\"") + candidate + "\"") !=
                 std::string_view::npos) {
               cell_admission_command = candidate;

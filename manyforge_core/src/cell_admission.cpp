@@ -24,6 +24,86 @@ template <typename Value>
   return content_identity::is_sha256_digest(value.value());
 }
 
+[[nodiscard]] std::size_t BinaryString(std::string_view value) {
+  return sizeof(std::uint64_t) + value.size();
+}
+
+[[nodiscard]] std::size_t BinaryIntent(
+    const CellAdmissionClaimIntentDTO& intent) {
+  std::size_t result =
+      3U * sizeof(std::uint64_t) +
+      BinaryString(intent.owner_epoch.value()) +
+      BinaryString(intent.owner_transaction_id) +
+      BinaryString(intent.request_id.value()) +
+      BinaryString(intent.request_payload_digest.value()) +
+      2U * sizeof(std::uint64_t);
+  for (const auto& resource : intent.scope.resources) {
+    result += BinaryString(resource.value());
+  }
+  for (const auto& configuration : intent.scope.configurations) {
+    result += BinaryString(configuration.control_domain_id.value()) +
+              BinaryString(configuration.active_configuration_id.value()) +
+              sizeof(std::uint64_t);
+  }
+  result += 2U;
+  if (intent.program_cycle_evidence.has_value()) {
+    result += BinaryString(
+                  intent.program_cycle_evidence->draft_program_revision.value()) +
+              BinaryString(
+                  intent.program_cycle_evidence->applied_program_revision.value());
+  }
+  if (intent.intervention_evidence.has_value()) {
+    const auto& evidence = *intent.intervention_evidence;
+    result += sizeof(std::uint64_t) +
+              BinaryString(evidence.offering_owner_epoch.value()) +
+              BinaryString(evidence.offer_transaction_id) +
+              BinaryString(evidence.offer_digest.value()) + 1U;
+    if (evidence.parent_program_cycle_claim_generation.has_value()) {
+      result += sizeof(std::uint64_t);
+    }
+  }
+  return result;
+}
+
+[[nodiscard]] std::size_t BinaryClaim(const CellAdmissionClaimDTO& claim) {
+  return BinaryIntent(claim.intent) + 3U * sizeof(std::uint64_t);
+}
+
+[[nodiscard]] std::size_t BinaryRelease(
+    const CellAdmissionClaimReleaseDTO& release) {
+  return 4U * sizeof(std::uint64_t) +
+         BinaryString(release.owner_epoch.value()) +
+         BinaryString(release.owner_transaction_id) +
+         BinaryString(release.request_id.value()) +
+         BinaryString(release.request_payload_digest.value()) +
+         BinaryString(release.settlement.evidence_digest.value());
+}
+
+[[nodiscard]] std::size_t BinaryOwner(
+    const CellAdmissionCurrentOwnerEpochDTO& owner) {
+  return sizeof(std::uint64_t) + BinaryString(owner.owner_epoch.value());
+}
+
+[[nodiscard]] std::size_t BinaryReconcileSettlement(
+    const CellAdmissionReconcileSettlementDTO& settlement) {
+  return BinaryClaim(settlement.predecessor_claim) +
+         2U * sizeof(std::uint64_t) +
+         BinaryString(settlement.successor_owner_epoch.value()) +
+         BinaryString(settlement.reconciliation_evidence_digest.value());
+}
+
+constexpr std::size_t kRecoveryCommandEnvelopeBinaryBytes =
+    5U + sizeof(std::uint64_t) +
+    std::string_view("cell_admission_recovery_receipt").size();
+constexpr std::size_t kJsonStructuralAllowanceBytes = 16U * 1024U;
+
+[[nodiscard]] std::size_t JsonUpperBound(std::size_t binary_bytes) {
+  // Any JSON string byte can expand to a six-byte \u00XX escape. Binary
+  // framing already charges eight bytes per scalar/collection; the fixed
+  // allowance covers every field name and both command envelopes.
+  return 6U * binary_bytes + kJsonStructuralAllowanceBytes;
+}
+
 [[nodiscard]] bool OwnerMatchesKind(CellAdmissionClaimKindDTO kind,
                                     CellAdmissionOwnerRoleDTO role) noexcept {
   switch (kind) {
@@ -144,13 +224,31 @@ std::string_view to_string(CellAdmissionSettlementKindDTO value) noexcept {
   return {};
 }
 
+std::string_view to_string(CellAdmissionRecoveryReceiptStatusDTO value) noexcept {
+  switch (value) {
+    case CellAdmissionRecoveryReceiptStatusDTO::kUnknown:
+      return "unknown";
+    case CellAdmissionRecoveryReceiptStatusDTO::kConflicting:
+      return "conflicting";
+    case CellAdmissionRecoveryReceiptStatusDTO::kHeldExact:
+      return "held_exact";
+    case CellAdmissionRecoveryReceiptStatusDTO::kReleasedExact:
+      return "released_exact";
+    case CellAdmissionRecoveryReceiptStatusDTO::kReconciledExact:
+      return "reconciled_exact";
+  }
+  return {};
+}
+
 Result<void> ValidateCellAdmissionScope(const CellAdmissionScopeDTO& scope) {
   if (scope.resources.size() > kMaximumCellAdmissionScopeEntries ||
       scope.configurations.size() > kMaximumCellAdmissionScopeEntries ||
       !std::is_sorted(scope.resources.begin(), scope.resources.end()) ||
       std::adjacent_find(scope.resources.begin(), scope.resources.end()) != scope.resources.end() ||
       std::any_of(scope.resources.begin(), scope.resources.end(),
-                  [](const auto& value) { return value.empty(); })) {
+                  [](const auto& value) {
+                    return !BoundedIdentity(value.value());
+                  })) {
     return Invalid<void>("resource_scope_not_canonical");
   }
   const auto less = [](const auto& left, const auto& right) {
@@ -163,7 +261,8 @@ Result<void> ValidateCellAdmissionScope(const CellAdmissionScopeDTO& scope) {
       std::adjacent_find(scope.configurations.begin(), scope.configurations.end()) !=
           scope.configurations.end() ||
       std::any_of(scope.configurations.begin(), scope.configurations.end(), [](const auto& row) {
-        return row.control_domain_id.empty() || row.active_configuration_id.empty() ||
+        return !BoundedIdentity(row.control_domain_id.value()) ||
+               !BoundedIdentity(row.active_configuration_id.value()) ||
                !row.active_configuration_generation.nonzero() ||
                row.active_configuration_generation.value() > kMaximumSafeCounter;
       })) {
@@ -225,6 +324,242 @@ Result<void> ValidateCellAdmissionClaimRelease(const CellAdmissionClaimReleaseDT
     return Invalid<void>("release_identity_invalid");
   }
   return Result<void>::Ok();
+}
+
+Result<void> ValidateCellAdmissionRecoveryReceiptQuery(
+    const CellAdmissionRecoveryReceiptQueryDTO& query) {
+  auto intent = ValidateCellAdmissionClaimIntent(query.intent);
+  if (!intent.ok()) {
+    return intent;
+  }
+  if (query.expected_claim.has_value()) {
+    const auto& claim = *query.expected_claim;
+    if (claim.intent != query.intent || !claim.claim_generation.nonzero() ||
+        !claim.acquired_admission_generation.nonzero() ||
+        claim.acquired_admission_generation !=
+            claim.intent.expected_admission_generation ||
+        claim.accepted_at_ns < 0) {
+      return Invalid<void>("recovery_expected_claim_invalid");
+    }
+  }
+  if (query.expected_release.has_value()) {
+    if (!query.expected_claim.has_value() ||
+        !ValidateCellAdmissionClaimRelease(*query.expected_release).ok()) {
+      return Invalid<void>("recovery_expected_release_invalid");
+    }
+    const auto& claim = *query.expected_claim;
+    const auto& release = *query.expected_release;
+    if (claim.intent.owner_role != release.owner_role ||
+        claim.intent.owner_epoch != release.owner_epoch ||
+        claim.intent.owner_transaction_id != release.owner_transaction_id ||
+        claim.intent.request_id != release.request_id ||
+        claim.intent.request_payload_digest != release.request_payload_digest ||
+        claim.acquired_admission_generation !=
+            release.acquired_admission_generation ||
+        claim.claim_generation != release.claim_generation) {
+      return Invalid<void>("recovery_expected_release_not_exact");
+    }
+  }
+  return Result<void>::Ok();
+}
+
+Result<void> ValidateCellAdmissionRecoveryReceipt(
+    const CellAdmissionRecoveryReceiptDTO& receipt) {
+  if (to_string(receipt.status).empty() || receipt.kernel_owner_epoch.empty() ||
+      !receipt.admission_generation.nonzero() ||
+      receipt.held_claims.size() > kMaximumCellAdmissionClaims ||
+      receipt.current_owner_epochs.size() > kMaximumCellAdmissionClaims ||
+      !std::is_sorted(receipt.held_claims.begin(), receipt.held_claims.end(),
+                      [](const auto& left, const auto& right) {
+                        return left.claim_generation < right.claim_generation;
+                      }) ||
+      std::adjacent_find(receipt.held_claims.begin(), receipt.held_claims.end(),
+                         [](const auto& left, const auto& right) {
+                           return left.claim_generation == right.claim_generation;
+                         }) != receipt.held_claims.end() ||
+      !std::is_sorted(receipt.current_owner_epochs.begin(),
+                      receipt.current_owner_epochs.end(),
+                      [](const auto& left, const auto& right) {
+                        return left.owner_role < right.owner_role;
+                      }) ||
+      std::adjacent_find(receipt.current_owner_epochs.begin(),
+                         receipt.current_owner_epochs.end(),
+                         [](const auto& left, const auto& right) {
+                           return left.owner_role == right.owner_role;
+                         }) != receipt.current_owner_epochs.end()) {
+    return Invalid<void>("recovery_receipt_inventory_invalid");
+  }
+  for (const auto& claim : receipt.held_claims) {
+    if (!ValidateCellAdmissionClaimIntent(claim.intent).ok() ||
+        !claim.claim_generation.nonzero() ||
+        !claim.acquired_admission_generation.nonzero() ||
+        claim.accepted_at_ns < 0) {
+      return Invalid<void>("recovery_receipt_held_claim_invalid");
+    }
+  }
+  if (std::any_of(receipt.current_owner_epochs.begin(),
+                  receipt.current_owner_epochs.end(), [](const auto& owner) {
+                    return to_string(owner.owner_role).empty() ||
+                           owner.owner_epoch.empty();
+                  })) {
+    return Invalid<void>("recovery_receipt_owner_invalid");
+  }
+  const bool exact =
+      receipt.status == CellAdmissionRecoveryReceiptStatusDTO::kHeldExact ||
+      receipt.status == CellAdmissionRecoveryReceiptStatusDTO::kReleasedExact ||
+      receipt.status == CellAdmissionRecoveryReceiptStatusDTO::kReconciledExact;
+  if (exact != receipt.matched_claim.has_value() ||
+      (receipt.status == CellAdmissionRecoveryReceiptStatusDTO::kReleasedExact) !=
+          receipt.matched_release.has_value() ||
+      (receipt.status ==
+       CellAdmissionRecoveryReceiptStatusDTO::kReconciledExact) !=
+          receipt.matched_reconcile_settlement.has_value() ||
+      (receipt.status == CellAdmissionRecoveryReceiptStatusDTO::kHeldExact &&
+       (receipt.matched_release.has_value() ||
+        receipt.matched_reconcile_settlement.has_value())) ||
+      (!exact && (receipt.matched_release.has_value() ||
+                  receipt.matched_reconcile_settlement.has_value()))) {
+    return Invalid<void>("recovery_receipt_status_shape_invalid");
+  }
+  if (receipt.matched_claim.has_value() &&
+      (!ValidateCellAdmissionClaimIntent(receipt.matched_claim->intent).ok() ||
+       !receipt.matched_claim->claim_generation.nonzero() ||
+       !receipt.matched_claim->acquired_admission_generation.nonzero() ||
+       receipt.matched_claim->accepted_at_ns < 0)) {
+    return Invalid<void>("recovery_receipt_claim_invalid");
+  }
+  if (receipt.matched_release.has_value() &&
+      !ValidateCellAdmissionClaimRelease(*receipt.matched_release).ok()) {
+    return Invalid<void>("recovery_receipt_release_invalid");
+  }
+  if (receipt.matched_claim.has_value()) {
+    const bool held_inventory_contains_match =
+        std::find(receipt.held_claims.begin(), receipt.held_claims.end(),
+                  *receipt.matched_claim) != receipt.held_claims.end();
+    if ((receipt.status == CellAdmissionRecoveryReceiptStatusDTO::kHeldExact) !=
+        held_inventory_contains_match) {
+      return Invalid<void>("recovery_receipt_held_inventory_mismatch");
+    }
+  }
+  if (receipt.matched_claim.has_value() && receipt.matched_release.has_value() &&
+      !ValidateCellAdmissionRecoveryReceiptQuery(
+           {receipt.matched_claim->intent,
+            receipt.matched_claim, receipt.matched_release})
+           .ok()) {
+    return Invalid<void>("recovery_receipt_release_not_exact");
+  }
+  if (receipt.matched_reconcile_settlement.has_value()) {
+    const auto& settlement = *receipt.matched_reconcile_settlement;
+    if (!receipt.matched_claim.has_value() ||
+        settlement.predecessor_claim != *receipt.matched_claim ||
+        settlement.successor_owner_role !=
+            settlement.predecessor_claim.intent.owner_role ||
+        settlement.successor_owner_epoch.empty() ||
+        settlement.successor_owner_epoch ==
+            settlement.predecessor_claim.intent.owner_epoch ||
+        settlement.settlement_predicate !=
+            CellAdmissionSettlementKindDTO::kReconciled ||
+        !Digest(settlement.reconciliation_evidence_digest)) {
+      return Invalid<void>("recovery_receipt_reconcile_invalid");
+    }
+  }
+  return Result<void>::Ok();
+}
+
+Result<CellAdmissionRecoveryFootprintDTO>
+ComputeCellAdmissionRecoveryFootprint(
+    const RequestOwnerEpoch& kernel_owner_epoch,
+    AdmissionGeneration admission_generation,
+    const std::vector<CellAdmissionRecoveryLedgerEntryDTO>& entries,
+    const std::vector<CellAdmissionCurrentOwnerEpochDTO>& current_owner_epochs) {
+  if (!BoundedIdentity(kernel_owner_epoch.value()) ||
+      !admission_generation.nonzero() ||
+      entries.size() > kMaximumCellAdmissionClaims ||
+      current_owner_epochs.size() > kMaximumCellAdmissionClaims) {
+    return Invalid<CellAdmissionRecoveryFootprintDTO>(
+        "recovery_footprint_input_invalid");
+  }
+  std::size_t held_inventory_binary = sizeof(std::uint64_t);
+  for (const auto& entry : entries) {
+    if (!ValidateCellAdmissionClaimIntent(entry.claim.intent).ok() ||
+        !entry.claim.claim_generation.nonzero() ||
+        !entry.claim.acquired_admission_generation.nonzero() ||
+        entry.claim.accepted_at_ns < 0 ||
+        (entry.release.has_value() &&
+         entry.reconcile_settlement.has_value()) ||
+        (entry.release.has_value() &&
+         (!ValidateCellAdmissionClaimRelease(*entry.release).ok() ||
+          entry.release->claim_generation != entry.claim.claim_generation)) ||
+        (entry.reconcile_settlement.has_value() &&
+         entry.reconcile_settlement->predecessor_claim != entry.claim)) {
+      return Invalid<CellAdmissionRecoveryFootprintDTO>(
+          "recovery_footprint_entry_invalid");
+    }
+    if (!entry.release.has_value() &&
+        !entry.reconcile_settlement.has_value()) {
+      held_inventory_binary += BinaryClaim(entry.claim);
+    }
+  }
+  std::size_t owner_inventory_binary = sizeof(std::uint64_t);
+  for (const auto& owner : current_owner_epochs) {
+    if (to_string(owner.owner_role).empty() ||
+        !BoundedIdentity(owner.owner_epoch.value())) {
+      return Invalid<CellAdmissionRecoveryFootprintDTO>(
+          "recovery_footprint_owner_invalid");
+    }
+    owner_inventory_binary += BinaryOwner(owner);
+  }
+
+  CellAdmissionRecoveryFootprintDTO result;
+  for (const auto& entry : entries) {
+    const auto claim_bytes = BinaryClaim(entry.claim);
+    const auto future_release_bytes =
+        4U * sizeof(std::uint64_t) +
+        BinaryString(entry.claim.intent.owner_epoch.value()) +
+        BinaryString(entry.claim.intent.owner_transaction_id) +
+        BinaryString(entry.claim.intent.request_id.value()) +
+        BinaryString(entry.claim.intent.request_payload_digest.value()) +
+        BinaryString(std::string_view(
+            "sha256:0000000000000000000000000000000000000000000000000000000000000000"));
+    const auto future_reconcile_bytes =
+        claim_bytes + 2U * sizeof(std::uint64_t) +
+        sizeof(std::uint64_t) + kMaximumCellAdmissionIdentityBytes +
+        BinaryString(std::string_view(
+            "sha256:0000000000000000000000000000000000000000000000000000000000000000"));
+    std::size_t query =
+        kRecoveryCommandEnvelopeBinaryBytes + BinaryIntent(entry.claim.intent) +
+        2U + claim_bytes;
+    if (entry.release.has_value()) {
+      query += BinaryRelease(*entry.release);
+    } else if (!entry.reconcile_settlement.has_value()) {
+      query += future_release_bytes;
+    }
+
+    std::size_t receipt =
+        kRecoveryCommandEnvelopeBinaryBytes + 1U + sizeof(std::uint64_t) +
+        BinaryString(kernel_owner_epoch.value()) + sizeof(std::uint64_t) +
+        3U + claim_bytes + held_inventory_binary + owner_inventory_binary;
+    if (entry.release.has_value()) {
+      receipt += BinaryRelease(*entry.release);
+    } else if (entry.reconcile_settlement.has_value()) {
+      receipt +=
+          BinaryReconcileSettlement(*entry.reconcile_settlement);
+    } else {
+      receipt =
+          std::max(receipt, receipt - claim_bytes + future_release_bytes);
+      receipt =
+          std::max(receipt, receipt - claim_bytes + future_reconcile_bytes);
+    }
+    result.maximum_binary_request_bytes =
+        std::max(result.maximum_binary_request_bytes, query);
+    result.maximum_binary_response_bytes =
+        std::max(result.maximum_binary_response_bytes, receipt);
+    result.maximum_json_request_bytes =
+        std::max(result.maximum_json_request_bytes, JsonUpperBound(query));
+    result.maximum_json_response_bytes =
+        std::max(result.maximum_json_response_bytes, JsonUpperBound(receipt));
+  }
+  return Result<CellAdmissionRecoveryFootprintDTO>::Ok(result);
 }
 
 Result<void> ValidateProgramCycleStatus(const ProgramCycleStatusDTO& status) {

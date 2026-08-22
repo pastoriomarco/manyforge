@@ -120,6 +120,8 @@ KernelCellAdmissionOwner::KernelCellAdmissionOwner(
   generation_ =
       AdmissionGeneration(std::max<std::uint64_t>(1U, recovered_generation_high_water.value()));
   entries_.reserve(capacity_);
+  membership_.reserve(capacity_);
+  current_owners_.reserve(7U);
   reconciliations_.reserve(capacity_);
   for (auto& recovered : recovery) {
     if (!ValidateCellAdmissionClaimIntent(recovered.claim.intent).ok() ||
@@ -140,8 +142,29 @@ KernelCellAdmissionOwner::KernelCellAdmissionOwner(
     next_claim_generation_ =
         CellAdmissionClaimGeneration(std::max(next_claim_generation_.value(),
                                               recovered.claim.claim_generation.value() + 1U));
-    entries_.push_back(Entry{std::move(recovered.claim), std::move(recovered.release)});
-    if (!entries_.back().release.has_value()) {
+    if (recovered.release.has_value() &&
+        recovered.reconcile_settlement.has_value()) {
+      throw std::runtime_error("durable cell-admission recovery is invalid");
+    }
+    if (recovered.reconcile_settlement.has_value() &&
+        (recovered.reconcile_settlement->predecessor_claim != recovered.claim ||
+         recovered.reconcile_settlement->successor_owner_role !=
+             recovered.claim.intent.owner_role ||
+         recovered.reconcile_settlement->successor_owner_epoch.empty() ||
+         recovered.reconcile_settlement->successor_owner_epoch ==
+             recovered.claim.intent.owner_epoch ||
+         recovered.reconcile_settlement->settlement_predicate !=
+             CellAdmissionSettlementKindDTO::kReconciled ||
+         !content_identity::is_sha256_digest(
+             recovered.reconcile_settlement
+                 ->reconciliation_evidence_digest.value()))) {
+      throw std::runtime_error("durable cell-admission recovery is invalid");
+    }
+    entries_.push_back(Entry{std::move(recovered.claim),
+                             std::move(recovered.release),
+                             std::move(recovered.reconcile_settlement)});
+    if (!entries_.back().release.has_value() &&
+        !entries_.back().reconcile_settlement.has_value()) {
       ++held_claim_count_;
     }
   }
@@ -166,6 +189,18 @@ KernelCellAdmissionOwner::KernelCellAdmissionOwner(
   }
   if (membership_.size() > capacity_) {
     throw std::runtime_error("durable cell-admission membership exceeds its bound");
+  }
+  std::vector<CellAdmissionRecoveryLedgerEntryDTO> footprint_entries;
+  footprint_entries.reserve(entries_.size());
+  for (const auto& entry : entries_) {
+    footprint_entries.push_back(
+        {entry.claim, entry.release, entry.reconcile_settlement});
+  }
+  const auto footprint = ComputeCellAdmissionRecoveryFootprint(
+      kernel_owner_epoch_, generation_, footprint_entries, current_owners_);
+  if (!footprint.ok() || !footprint.value().admitted()) {
+    throw std::runtime_error(
+        "durable cell-admission recovery footprint exceeds its bound");
   }
 }
 
@@ -233,7 +268,8 @@ const KernelCellAdmissionOwner::Entry* KernelCellAdmissionOwner::FindReplayLocke
 KernelCellAdmissionOwner::Entry* KernelCellAdmissionOwner::FindHeldLocked(
     CellAdmissionClaimGeneration generation) {
   const auto found = std::find_if(entries_.begin(), entries_.end(), [&](const auto& entry) {
-    return entry.claim.claim_generation == generation && !entry.release.has_value();
+    return entry.claim.claim_generation == generation &&
+           !entry.release.has_value() && !entry.reconcile_settlement.has_value();
   });
   return found == entries_.end() ? nullptr : &*found;
 }
@@ -248,6 +284,7 @@ const KernelCellAdmissionOwner::Entry* KernelCellAdmissionOwner::ParentCycleLock
       *intent.intervention_evidence->parent_program_cycle_claim_generation;
   const auto found = std::find_if(entries_.begin(), entries_.end(), [&](const auto& entry) {
     return !entry.release.has_value() &&
+           !entry.reconcile_settlement.has_value() &&
            entry.claim.claim_generation == generation &&
            entry.claim.intent.claim_kind == CellAdmissionClaimKindDTO::kProgramCycle;
   });
@@ -278,7 +315,7 @@ Result<CellAdmissionClaimDTO> KernelCellAdmissionOwner::AcquireCellAdmissionClai
     if (replay->claim.intent != intent) {
       return Reject<CellAdmissionClaimDTO>("request_id_conflict", "request_reuse_conflict");
     }
-    if (replay->release.has_value()) {
+    if (replay->release.has_value() || replay->reconcile_settlement.has_value()) {
       return Reject<CellAdmissionClaimDTO>("request_result_expired",
                                            "request_result_compacted");
     }
@@ -303,7 +340,15 @@ Result<CellAdmissionClaimDTO> KernelCellAdmissionOwner::AcquireCellAdmissionClai
   if (intent.expected_admission_generation != generation_) {
     return Reject<CellAdmissionClaimDTO>("stale_generation", "expected_generation_stale");
   }
-  if (membership_.size() >= capacity_) {
+  const auto retire_released = [&](const auto& entry) {
+    return entry.release.has_value() &&
+           entry.claim.intent.owner_role == intent.owner_role &&
+           entry.claim.intent.owner_epoch == intent.owner_epoch;
+  };
+  const auto retired_count =
+      static_cast<std::size_t>(std::count_if(entries_.begin(), entries_.end(),
+                                             retire_released));
+  if (membership_.size() - retired_count >= capacity_) {
     return Reject<CellAdmissionClaimDTO>("request_ledger_full", "claim_capacity_exhausted");
   }
 
@@ -332,11 +377,55 @@ Result<CellAdmissionClaimDTO> KernelCellAdmissionOwner::AcquireCellAdmissionClai
       next_claim_generation_.value() >= 9'007'199'254'740'991ULL) {
     return AuthoringNotReady<CellAdmissionClaimDTO>(generation_, "acceptance_time_invalid");
   }
+  std::vector<CellAdmissionRecoveryLedgerEntryDTO> footprint_entries;
+  footprint_entries.reserve(entries_.size() + 1U);
+  for (const auto& entry : entries_) {
+    if (!retire_released(entry)) {
+      footprint_entries.push_back(
+          {entry.claim, entry.release, entry.reconcile_settlement});
+    }
+  }
+  footprint_entries.push_back({claim, std::nullopt, std::nullopt});
+  auto footprint_owners = current_owners_;
+  if (std::none_of(footprint_owners.begin(), footprint_owners.end(),
+                   [&](const auto& owner) {
+                     return owner.owner_role == intent.owner_role;
+                   })) {
+    footprint_owners.push_back({intent.owner_role, intent.owner_epoch});
+  }
+  const auto footprint = ComputeCellAdmissionRecoveryFootprint(
+      kernel_owner_epoch_, AdmissionGeneration(generation_.value() + 1U),
+      footprint_entries, footprint_owners);
+  if (!footprint.ok() || !footprint.value().admitted()) {
+    return Reject<CellAdmissionClaimDTO>("invalid_request",
+                                         "recovery_footprint_exceeded");
+  }
+  std::vector<RequestId> retired_request_ids;
+  retired_request_ids.reserve(retired_count);
+  for (const auto& entry : entries_) {
+    if (retire_released(entry)) {
+      retired_request_ids.push_back(entry.claim.intent.request_id);
+    }
+  }
   auto recorded = journal_.RecordCellAdmissionClaimAcquired(kernel_owner_epoch_, claim);
   if (!recorded.ok()) {
     return Result<CellAdmissionClaimDTO>::Err(recorded.error());
   }
-  entries_.push_back(Entry{claim, std::nullopt});
+  entries_.erase(std::remove_if(entries_.begin(), entries_.end(),
+                                retire_released),
+                 entries_.end());
+  membership_.erase(
+      std::remove_if(membership_.begin(), membership_.end(),
+                     [&](const auto& member) {
+                       return member.owner_role == intent.owner_role &&
+                              member.owner_epoch == intent.owner_epoch &&
+                              std::find(retired_request_ids.begin(),
+                                        retired_request_ids.end(),
+                                        member.request_id) !=
+                                  retired_request_ids.end();
+                     }),
+      membership_.end());
+  entries_.push_back(Entry{claim, std::nullopt, std::nullopt});
   membership_.push_back({intent.owner_role, intent.owner_epoch, intent.request_id,
                          intent_digest.value()});
   if (std::none_of(current_owners_.begin(), current_owners_.end(), [&](const auto& owner) {
@@ -380,6 +469,7 @@ Result<AuthoringAdmissionDTO> KernelCellAdmissionOwner::ReleaseCellAdmissionClai
   if (entry->claim.intent.claim_kind == CellAdmissionClaimKindDTO::kProgramCycle &&
       std::any_of(entries_.begin(), entries_.end(), [&](const auto& candidate) {
         return !candidate.release.has_value() &&
+               !candidate.reconcile_settlement.has_value() &&
                candidate.claim.intent.claim_kind ==
                    CellAdmissionClaimKindDTO::kInterventionOrRecovery &&
                candidate.claim.intent.intervention_evidence.has_value() &&
@@ -471,13 +561,9 @@ Result<AuthoringAdmissionDTO> KernelCellAdmissionOwner::ReconcileCellAdmissionCl
     }
     return Result<AuthoringAdmissionDTO>::Ok(AdmissionLocked());
   }
-  if (reconciliations_.size() >= capacity_) {
-    return AuthoringNotReady<AuthoringAdmissionDTO>(generation_,
-                                                     "reconcile_history_full");
-  }
   std::vector<CellAdmissionClaimDTO> held;
   for (const auto& entry : entries_) {
-    if (!entry.release.has_value()) {
+    if (!entry.release.has_value() && !entry.reconcile_settlement.has_value()) {
       held.push_back(entry.claim);
     }
   }
@@ -568,19 +654,60 @@ Result<AuthoringAdmissionDTO> KernelCellAdmissionOwner::ReconcileCellAdmissionCl
                                                      "admission_generation_exhausted");
   }
   const AdmissionGeneration next(generation_.value() + (changed ? 1U : 0U));
+  std::vector<CellAdmissionRecoveryLedgerEntryDTO> footprint_entries;
+  footprint_entries.reserve(entries_.size());
+  for (const auto& entry : entries_) {
+    CellAdmissionRecoveryLedgerEntryDTO prospective{
+        entry.claim, entry.release, entry.reconcile_settlement};
+    const auto authorization =
+        std::find_if(authorizations.begin(), authorizations.end(),
+                     [&](const auto& candidate) {
+                       return candidate.predecessor_claim == entry.claim;
+                     });
+    if (authorization != authorizations.end()) {
+      prospective.reconcile_settlement = *authorization;
+    }
+    const auto current = std::find_if(
+        validation.value().current_owner_epochs.begin(),
+        validation.value().current_owner_epochs.end(),
+        [&](const auto& owner) {
+          return owner.owner_role == entry.claim.intent.owner_role;
+        });
+    const bool released_obsolete =
+        prospective.release.has_value() &&
+        current != validation.value().current_owner_epochs.end() &&
+        current->owner_epoch != prospective.claim.intent.owner_epoch;
+    const bool reconciled_obsolete =
+        prospective.reconcile_settlement.has_value() &&
+        current != validation.value().current_owner_epochs.end() &&
+        prospective.reconcile_settlement->successor_owner_epoch !=
+            current->owner_epoch;
+    if (!released_obsolete && !reconciled_obsolete) {
+      footprint_entries.push_back(std::move(prospective));
+    }
+  }
+  const auto footprint = ComputeCellAdmissionRecoveryFootprint(
+      kernel_owner_epoch_, next, footprint_entries,
+      validation.value().current_owner_epochs);
+  if (!footprint.ok() || !footprint.value().admitted()) {
+    return Reject<AuthoringAdmissionDTO>("invalid_request",
+                                         "recovery_footprint_exceeded");
+  }
   auto recorded = journal_.RecordCellAdmissionClaimsReconciled(
       kernel_owner_epoch_, reconcile, validation.value(), next);
   if (!recorded.ok()) {
     return Result<AuthoringAdmissionDTO>::Err(recorded.error());
   }
-  entries_.erase(
-      std::remove_if(entries_.begin(), entries_.end(), [&](const auto& entry) {
-        return std::any_of(authorizations.begin(), authorizations.end(),
-                           [&](const auto& authorization) {
-                             return authorization.predecessor_claim == entry.claim;
-                           });
-      }),
-      entries_.end());
+  for (auto& entry : entries_) {
+    const auto authorization =
+        std::find_if(authorizations.begin(), authorizations.end(),
+                     [&](const auto& candidate) {
+                       return candidate.predecessor_claim == entry.claim;
+                     });
+    if (authorization != authorizations.end()) {
+      entry.reconcile_settlement = *authorization;
+    }
+  }
   held_claim_count_ -= authorizations.size();
   current_owners_ = validation.value().current_owner_epochs;
   entries_.erase(
@@ -589,8 +716,17 @@ Result<AuthoringAdmissionDTO> KernelCellAdmissionOwner::ReconcileCellAdmissionCl
             current_owners_.begin(), current_owners_.end(), [&](const auto& owner) {
               return owner.owner_role == entry.claim.intent.owner_role;
             });
-        return entry.release.has_value() && current != current_owners_.end() &&
-               current->owner_epoch != entry.claim.intent.owner_epoch;
+        const bool released_obsolete =
+            entry.release.has_value() && current != current_owners_.end() &&
+            current->owner_epoch != entry.claim.intent.owner_epoch;
+        const bool reconciled_obsolete =
+            entry.reconcile_settlement.has_value() &&
+            current != current_owners_.end() &&
+            entry.reconcile_settlement->successor_owner_role ==
+                current->owner_role &&
+            entry.reconcile_settlement->successor_owner_epoch !=
+                current->owner_epoch;
+        return released_obsolete || reconciled_obsolete;
       }),
       entries_.end());
   membership_.erase(
@@ -602,16 +738,119 @@ Result<AuthoringAdmissionDTO> KernelCellAdmissionOwner::ReconcileCellAdmissionCl
         const bool unresolved = std::any_of(
             entries_.begin(), entries_.end(), [&](const auto& entry) {
               return !entry.release.has_value() &&
+                     !entry.reconcile_settlement.has_value() &&
+                     entry.claim.intent.owner_role == member.owner_role &&
+                     entry.claim.intent.owner_epoch == member.owner_epoch;
+            });
+        const bool reconciled = std::any_of(
+            entries_.begin(), entries_.end(), [&](const auto& entry) {
+              return entry.reconcile_settlement.has_value() &&
                      entry.claim.intent.owner_role == member.owner_role &&
                      entry.claim.intent.owner_epoch == member.owner_epoch;
             });
         return current != current_owners_.end() &&
-               current->owner_epoch != member.owner_epoch && !unresolved;
+               current->owner_epoch != member.owner_epoch && !unresolved &&
+               !reconciled;
       }),
       membership_.end());
+  reconciliations_.erase(
+      std::remove_if(
+          reconciliations_.begin(), reconciliations_.end(),
+          [&](const auto& recorded) {
+            return std::none_of(
+                recorded.second.settlements.begin(),
+                recorded.second.settlements.end(),
+                [&](const auto& settlement) {
+                  return std::any_of(
+                      entries_.begin(), entries_.end(), [&](const auto& entry) {
+                        return entry.reconcile_settlement.has_value() &&
+                               *entry.reconcile_settlement == settlement;
+                      });
+                });
+          }),
+      reconciliations_.end());
   generation_ = next;
   reconciliations_.emplace_back(reconcile, validation.value());
   return Result<AuthoringAdmissionDTO>::Ok(AdmissionLocked());
+}
+
+Result<CellAdmissionRecoveryReceiptDTO>
+KernelCellAdmissionOwner::GetCellAdmissionRecoveryReceipt(
+    const CellAdmissionRecoveryReceiptQueryDTO& query) const {
+  auto valid = ValidateCellAdmissionRecoveryReceiptQuery(query);
+  if (!valid.ok()) {
+    return Result<CellAdmissionRecoveryReceiptDTO>::Err(valid.error());
+  }
+  std::lock_guard lock(mutex_);
+  CellAdmissionRecoveryReceiptDTO receipt{
+      .status = CellAdmissionRecoveryReceiptStatusDTO::kUnknown,
+      .kernel_owner_epoch = kernel_owner_epoch_,
+      .admission_generation = generation_,
+      .matched_claim = std::nullopt,
+      .matched_release = std::nullopt,
+      .matched_reconcile_settlement = std::nullopt,
+      .held_claims = {},
+      .current_owner_epochs = {},
+  };
+  receipt.current_owner_epochs = current_owners_;
+  for (const auto& entry : entries_) {
+    if (!entry.release.has_value() && !entry.reconcile_settlement.has_value()) {
+      receipt.held_claims.push_back(entry.claim);
+    }
+  }
+  std::sort(receipt.held_claims.begin(), receipt.held_claims.end(),
+            [](const auto& left, const auto& right) {
+              return left.claim_generation < right.claim_generation;
+            });
+
+  const auto digest = CellAdmissionClaimIntentDigest(query.intent);
+  const auto member =
+      std::find_if(membership_.begin(), membership_.end(), [&](const auto& row) {
+        return row.owner_epoch == query.intent.owner_epoch &&
+               row.request_id == query.intent.request_id;
+      });
+  if (member == membership_.end()) {
+    receipt.status = CellAdmissionRecoveryReceiptStatusDTO::kUnknown;
+    return Result<CellAdmissionRecoveryReceiptDTO>::Ok(std::move(receipt));
+  }
+  if (!digest.ok() || member->owner_role != query.intent.owner_role ||
+      member->semantic_intent_digest != digest.value()) {
+    receipt.status = CellAdmissionRecoveryReceiptStatusDTO::kConflicting;
+    return Result<CellAdmissionRecoveryReceiptDTO>::Ok(std::move(receipt));
+  }
+  const auto entry =
+      std::find_if(entries_.begin(), entries_.end(), [&](const auto& row) {
+        return row.claim.intent.owner_epoch == query.intent.owner_epoch &&
+               row.claim.intent.request_id == query.intent.request_id;
+      });
+  if (entry == entries_.end()) {
+    receipt.status = CellAdmissionRecoveryReceiptStatusDTO::kUnknown;
+    return Result<CellAdmissionRecoveryReceiptDTO>::Ok(std::move(receipt));
+  }
+  if (entry->claim.intent != query.intent ||
+      (query.expected_claim.has_value() &&
+       *query.expected_claim != entry->claim) ||
+      (query.expected_release.has_value() && entry->release.has_value() &&
+       *query.expected_release != *entry->release)) {
+    receipt.status = CellAdmissionRecoveryReceiptStatusDTO::kConflicting;
+    return Result<CellAdmissionRecoveryReceiptDTO>::Ok(std::move(receipt));
+  }
+  receipt.matched_claim = entry->claim;
+  if (entry->reconcile_settlement.has_value()) {
+    if (query.expected_release.has_value()) {
+      receipt.status = CellAdmissionRecoveryReceiptStatusDTO::kConflicting;
+      receipt.matched_claim.reset();
+      return Result<CellAdmissionRecoveryReceiptDTO>::Ok(std::move(receipt));
+    }
+    receipt.status = CellAdmissionRecoveryReceiptStatusDTO::kReconciledExact;
+    receipt.matched_reconcile_settlement = entry->reconcile_settlement;
+  } else if (entry->release.has_value()) {
+    receipt.status = CellAdmissionRecoveryReceiptStatusDTO::kReleasedExact;
+    receipt.matched_release = entry->release;
+  } else {
+    receipt.status = CellAdmissionRecoveryReceiptStatusDTO::kHeldExact;
+  }
+  return Result<CellAdmissionRecoveryReceiptDTO>::Ok(std::move(receipt));
 }
 
 bool KernelCellAdmissionOwner::has_unresolved_claims() const {

@@ -10,7 +10,7 @@ namespace manyforge::component_manager::detail {
 
 /// One packet bound for every endpoint of the inherited Manager-child channel.
 inline constexpr std::size_t kMaximumManagedRuntimeRpcPacketBytes =
-    256U * 1024U;
+    manyforge::core::kMaximumCellAdmissionPrivateBinaryBytes;
 
 /// Private, same-host forwarding protocol for the native execution child.
 /// The command strings are deliberately part of the wire format: unlike an
@@ -21,7 +21,8 @@ using KernelCellAdmissionRpcRequest =
                  manyforge::core::CellAdmissionReadinessSnapshotDTO,
                  manyforge::core::CellAdmissionClaimIntentDTO,
                  manyforge::core::CellAdmissionClaimReleaseDTO,
-                 manyforge::core::CellAdmissionReconcileDTO>;
+                 manyforge::core::CellAdmissionReconcileDTO,
+                 manyforge::core::CellAdmissionRecoveryReceiptQueryDTO>;
 
 struct KernelCellAdmissionRpcPacket final {
   std::string command;
@@ -31,6 +32,7 @@ struct KernelCellAdmissionRpcPacket final {
 using KernelCellAdmissionRpcResponse =
     std::variant<manyforge::core::AuthoringAdmissionDTO,
                  manyforge::core::CellAdmissionClaimDTO,
+                 manyforge::core::CellAdmissionRecoveryReceiptDTO,
                  manyforge::core::ErrorDTO>;
 
 struct KernelCellAdmissionRpcResponsePacket final {

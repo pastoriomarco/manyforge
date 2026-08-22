@@ -17,6 +17,9 @@ class IKernelCellAdmissionPort {
       const CellAdmissionClaimReleaseDTO& release) = 0;
   [[nodiscard]] virtual Result<AuthoringAdmissionDTO> ReconcileCellAdmissionClaims(
       const CellAdmissionReconcileDTO& reconcile) = 0;
+  [[nodiscard]] virtual Result<CellAdmissionRecoveryReceiptDTO>
+  GetCellAdmissionRecoveryReceipt(
+      const CellAdmissionRecoveryReceiptQueryDTO& query) const = 0;
 };
 
 }  // namespace manyforge::core

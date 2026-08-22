@@ -14,6 +14,12 @@ namespace manyforge::core {
 inline constexpr std::size_t kMaximumCellAdmissionClaims = 4096U;
 inline constexpr std::size_t kMaximumCellAdmissionScopeEntries = 4096U;
 inline constexpr std::size_t kMaximumCellAdmissionIdentityBytes = 128U;
+inline constexpr std::size_t kMaximumCellAdmissionPrivateBinaryBytes =
+    256U * 1024U;
+inline constexpr std::size_t kMaximumCellAdmissionJsonRequestBytes =
+    1024U * 1024U;
+inline constexpr std::size_t kMaximumCellAdmissionJsonResponseBytes =
+    4U * 1024U * 1024U;
 
 enum class CellAdmissionClaimKindDTO {
   kProgramCycle,
@@ -52,10 +58,20 @@ enum class CellAdmissionSettlementKindDTO {
   kReconciled,
 };
 
+enum class CellAdmissionRecoveryReceiptStatusDTO {
+  kUnknown,
+  kConflicting,
+  kHeldExact,
+  kReleasedExact,
+  kReconciledExact,
+};
+
 [[nodiscard]] std::string_view to_string(CellAdmissionClaimKindDTO value) noexcept;
 [[nodiscard]] std::string_view to_string(CellAdmissionOwnerRoleDTO value) noexcept;
 [[nodiscard]] std::string_view to_string(ProgramCycleStateDTO value) noexcept;
 [[nodiscard]] std::string_view to_string(CellAdmissionSettlementKindDTO value) noexcept;
+[[nodiscard]] std::string_view to_string(
+    CellAdmissionRecoveryReceiptStatusDTO value) noexcept;
 
 struct CellAdmissionConfigurationScopeDTO final {
   ControlDomainId control_domain_id;
@@ -159,6 +175,76 @@ struct CellAdmissionReconcileDTO final {
                          const CellAdmissionReconcileDTO&) = default;
 };
 
+struct CellAdmissionReconcileSettlementDTO final {
+  CellAdmissionClaimDTO predecessor_claim;
+  CellAdmissionOwnerRoleDTO successor_owner_role{
+      CellAdmissionOwnerRoleDTO::kAuthoringOwner};
+  RequestOwnerEpoch successor_owner_epoch;
+  CellAdmissionSettlementKindDTO settlement_predicate{
+      CellAdmissionSettlementKindDTO::kReconciled};
+  ContentDigest reconciliation_evidence_digest;
+
+  friend bool operator==(const CellAdmissionReconcileSettlementDTO&,
+                         const CellAdmissionReconcileSettlementDTO&) = default;
+};
+
+/// Private recovery lookup. The complete intent is always required; the
+/// expected claim and Release identities are supplied once their caller has
+/// durably learned them.
+struct CellAdmissionRecoveryReceiptQueryDTO final {
+  CellAdmissionClaimIntentDTO intent;
+  std::optional<CellAdmissionClaimDTO> expected_claim;
+  std::optional<CellAdmissionClaimReleaseDTO> expected_release;
+
+  friend bool operator==(const CellAdmissionRecoveryReceiptQueryDTO&,
+                         const CellAdmissionRecoveryReceiptQueryDTO&) = default;
+};
+
+struct CellAdmissionRecoveryReceiptDTO final {
+  CellAdmissionRecoveryReceiptStatusDTO status{
+      CellAdmissionRecoveryReceiptStatusDTO::kUnknown};
+  RequestOwnerEpoch kernel_owner_epoch;
+  AdmissionGeneration admission_generation{0U};
+  std::optional<CellAdmissionClaimDTO> matched_claim;
+  std::optional<CellAdmissionClaimReleaseDTO> matched_release;
+  std::optional<CellAdmissionReconcileSettlementDTO> matched_reconcile_settlement;
+  std::vector<CellAdmissionClaimDTO> held_claims;
+  std::vector<CellAdmissionCurrentOwnerEpochDTO> current_owner_epochs;
+
+  friend bool operator==(const CellAdmissionRecoveryReceiptDTO&,
+                         const CellAdmissionRecoveryReceiptDTO&) = default;
+};
+
+struct CellAdmissionRecoveryLedgerEntryDTO final {
+  CellAdmissionClaimDTO claim;
+  std::optional<CellAdmissionClaimReleaseDTO> release;
+  std::optional<CellAdmissionReconcileSettlementDTO> reconcile_settlement;
+
+  friend bool operator==(const CellAdmissionRecoveryLedgerEntryDTO&,
+                         const CellAdmissionRecoveryLedgerEntryDTO&) = default;
+};
+
+struct CellAdmissionRecoveryFootprintDTO final {
+  std::size_t maximum_binary_request_bytes{};
+  std::size_t maximum_binary_response_bytes{};
+  std::size_t maximum_json_request_bytes{};
+  std::size_t maximum_json_response_bytes{};
+
+  [[nodiscard]] bool admitted() const noexcept {
+    return maximum_binary_request_bytes <=
+               kMaximumCellAdmissionPrivateBinaryBytes &&
+           maximum_binary_response_bytes <=
+               kMaximumCellAdmissionPrivateBinaryBytes &&
+           maximum_json_request_bytes <=
+               kMaximumCellAdmissionJsonRequestBytes &&
+           maximum_json_response_bytes <=
+               kMaximumCellAdmissionJsonResponseBytes;
+  }
+
+  friend bool operator==(const CellAdmissionRecoveryFootprintDTO&,
+                         const CellAdmissionRecoveryFootprintDTO&) = default;
+};
+
 struct AuthoringAdmissionDTO final {
   bool authoring_allowed{};
   AdmissionGeneration admission_generation{0U};
@@ -202,6 +288,16 @@ struct CellAdmissionReadinessSnapshotDTO final {
     const CellAdmissionClaimIntentDTO& intent);
 [[nodiscard]] Result<void> ValidateCellAdmissionClaimRelease(
     const CellAdmissionClaimReleaseDTO& release);
+[[nodiscard]] Result<void> ValidateCellAdmissionRecoveryReceiptQuery(
+    const CellAdmissionRecoveryReceiptQueryDTO& query);
+[[nodiscard]] Result<void> ValidateCellAdmissionRecoveryReceipt(
+    const CellAdmissionRecoveryReceiptDTO& receipt);
+[[nodiscard]] Result<CellAdmissionRecoveryFootprintDTO>
+ComputeCellAdmissionRecoveryFootprint(
+    const RequestOwnerEpoch& kernel_owner_epoch,
+    AdmissionGeneration admission_generation,
+    const std::vector<CellAdmissionRecoveryLedgerEntryDTO>& entries,
+    const std::vector<CellAdmissionCurrentOwnerEpochDTO>& current_owner_epochs);
 [[nodiscard]] Result<void> ValidateProgramCycleStatus(const ProgramCycleStatusDTO& status);
 [[nodiscard]] Result<ContentDigest> CellAdmissionClaimIntentDigest(
     const CellAdmissionClaimIntentDTO& intent);

@@ -112,6 +112,11 @@ public:
   ReconcileCellAdmissionClaims(
       const manyforge::core::CellAdmissionReconcileDTO &reconcile) override;
   [[nodiscard]] manyforge::core::Result<
+      manyforge::core::CellAdmissionRecoveryReceiptDTO>
+  GetCellAdmissionRecoveryReceipt(
+      const manyforge::core::CellAdmissionRecoveryReceiptQueryDTO &query)
+      const override;
+  [[nodiscard]] manyforge::core::Result<
       std::shared_ptr<manyforge::core::IPlannerSceneProjection>>
   ResolveProjection(const manyforge::core::ProjectionNativeRuntimeBindingDTO
                         &native_runtime_binding) const override;

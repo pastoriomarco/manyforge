@@ -272,6 +272,9 @@ class ResourceAddressedExecutionKernel final : public IAddressedOperationOwner,
       const CellAdmissionClaimReleaseDTO& release) override;
   [[nodiscard]] Result<AuthoringAdmissionDTO> ReconcileCellAdmissionClaims(
       const CellAdmissionReconcileDTO& reconcile) override;
+  [[nodiscard]] Result<CellAdmissionRecoveryReceiptDTO>
+  GetCellAdmissionRecoveryReceipt(
+      const CellAdmissionRecoveryReceiptQueryDTO& query) const override;
 
   /// Read-only owner projection. Subordinate polling and state advancement are
   /// performed only by reconcile_subordinate_state(), never by this method.

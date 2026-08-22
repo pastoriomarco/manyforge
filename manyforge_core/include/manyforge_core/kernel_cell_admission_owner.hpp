@@ -45,6 +45,9 @@ class KernelCellAdmissionOwner final : public IKernelCellAdmissionPort {
       const CellAdmissionClaimReleaseDTO& release) override;
   [[nodiscard]] Result<AuthoringAdmissionDTO> ReconcileCellAdmissionClaims(
       const CellAdmissionReconcileDTO& reconcile) override;
+  [[nodiscard]] Result<CellAdmissionRecoveryReceiptDTO>
+  GetCellAdmissionRecoveryReceipt(
+      const CellAdmissionRecoveryReceiptQueryDTO& query) const override;
 
   [[nodiscard]] bool has_unresolved_claims() const;
 
@@ -52,6 +55,7 @@ class KernelCellAdmissionOwner final : public IKernelCellAdmissionPort {
   struct Entry final {
     CellAdmissionClaimDTO claim;
     std::optional<CellAdmissionClaimReleaseDTO> release;
+    std::optional<CellAdmissionReconcileSettlementDTO> reconcile_settlement;
   };
 
   [[nodiscard]] AuthoringAdmissionDTO AdmissionLocked() const noexcept;
