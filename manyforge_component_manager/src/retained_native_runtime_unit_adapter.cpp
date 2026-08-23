@@ -59,9 +59,11 @@ using ProjectionBindingKey =
               manyforge::core::CapabilityProviderBindingRevision>;
 
 constexpr int kChildChannelFd = 3;
-constexpr int kChildExecErrorFd = 4;
-constexpr int kChildExecutableFd = 5;
+constexpr int kChildLivenessChannelFd = 4;
+constexpr int kChildExecErrorFd = 5;
 constexpr int kChildPackageRootFd = 6;
+constexpr int kChildExecutableFd = 7;
+constexpr int kChildHighestReservedFd = kChildExecutableFd;
 constexpr std::size_t kMaximumControlPacketBytes =
     detail::kMaximumManagedRuntimeRpcPacketBytes;
 static_assert(detail::kMaximumNativeProjectionRpcPacketBytes <=
@@ -616,6 +618,7 @@ SameChildProduct(const NativeExecutionRuntimeUnitAdmission &admission,
 }
 
 [[noreturn]] void EnterChild(const pid_t expected_parent, const int channel_fd,
+                             const int liveness_channel_fd,
                              const int error_fd, const int executable_fd,
                              const int package_root_fd,
                              char *const argv[]) noexcept {
@@ -626,16 +629,20 @@ SameChildProduct(const NativeExecutionRuntimeUnitAdmission &admission,
     ChildExit(error_fd, ECHILD);
   }
   const int channel_copy =
-      ::fcntl(channel_fd, F_DUPFD_CLOEXEC, kChildPackageRootFd + 1);
+      ::fcntl(channel_fd, F_DUPFD_CLOEXEC, kChildHighestReservedFd + 1);
+  const int liveness_channel_copy =
+      ::fcntl(liveness_channel_fd, F_DUPFD_CLOEXEC,
+              kChildHighestReservedFd + 1);
   const int error_copy =
-      ::fcntl(error_fd, F_DUPFD_CLOEXEC, kChildPackageRootFd + 1);
+      ::fcntl(error_fd, F_DUPFD_CLOEXEC, kChildHighestReservedFd + 1);
   const int executable_copy =
-      ::fcntl(executable_fd, F_DUPFD_CLOEXEC, kChildPackageRootFd + 1);
+      ::fcntl(executable_fd, F_DUPFD_CLOEXEC, kChildHighestReservedFd + 1);
   const int package_root_copy =
-      ::fcntl(package_root_fd, F_DUPFD_CLOEXEC, kChildPackageRootFd + 1);
-  if (channel_copy < 0 || error_copy < 0 || executable_copy < 0 ||
-      package_root_copy < 0 ||
+      ::fcntl(package_root_fd, F_DUPFD_CLOEXEC, kChildHighestReservedFd + 1);
+  if (channel_copy < 0 || liveness_channel_copy < 0 || error_copy < 0 ||
+      executable_copy < 0 || package_root_copy < 0 ||
       ::dup3(channel_copy, kChildChannelFd, 0) < 0 ||
+      ::dup3(liveness_channel_copy, kChildLivenessChannelFd, 0) < 0 ||
       ::dup3(error_copy, kChildExecErrorFd, O_CLOEXEC) < 0 ||
       ::dup3(executable_copy, kChildExecutableFd, O_CLOEXEC) < 0 ||
       ::dup3(package_root_copy, kChildPackageRootFd, 0) < 0) {
@@ -643,7 +650,7 @@ SameChildProduct(const NativeExecutionRuntimeUnitAdmission &admission,
   }
 #ifdef SYS_close_range
   const long closed =
-      ::syscall(SYS_close_range, kChildPackageRootFd + 1U, UINT_MAX, 0U);
+      ::syscall(SYS_close_range, kChildHighestReservedFd + 1U, UINT_MAX, 0U);
   if (closed != 0 && errno != ENOSYS) {
     ChildExit(kChildExecErrorFd, errno);
   }
@@ -652,7 +659,7 @@ SameChildProduct(const NativeExecutionRuntimeUnitAdmission &admission,
     const long maximum = ::sysconf(_SC_OPEN_MAX);
     const int upper =
         maximum > 0 && maximum < INT_MAX ? static_cast<int>(maximum) : 65536;
-    for (int descriptor = kChildPackageRootFd + 1; descriptor < upper;
+    for (int descriptor = kChildHighestReservedFd + 1; descriptor < upper;
          ++descriptor) {
       static_cast<void>(::close(descriptor));
     }
@@ -762,6 +769,22 @@ struct RetainedNativeRuntimeUnitAdapter::Impl final
     Child &operator=(Child &&) noexcept = default;
   };
 
+  struct LivenessEndpoint final {
+    pid_t pid;
+    RuntimeEpoch runtime_epoch;
+    UniqueFd channel;
+
+    LivenessEndpoint(pid_t child_pid, RuntimeEpoch child_epoch,
+                     UniqueFd child_channel)
+        : pid(child_pid), runtime_epoch(std::move(child_epoch)),
+          channel(std::move(child_channel)) {}
+
+    LivenessEndpoint(const LivenessEndpoint &) = delete;
+    LivenessEndpoint &operator=(const LivenessEndpoint &) = delete;
+    LivenessEndpoint(LivenessEndpoint &&) noexcept = default;
+    LivenessEndpoint &operator=(LivenessEndpoint &&) noexcept = default;
+  };
+
   Impl(std::filesystem::path trusted_installed_target_root,
        std::filesystem::path trusted_package_root,
        std::filesystem::path manager_state_root,
@@ -823,9 +846,19 @@ struct RetainedNativeRuntimeUnitAdapter::Impl final
   ~Impl() {
     std::lock_guard lock(mutex);
     for (auto &[runtime_id, child] : children) {
-      static_cast<void>(runtime_id);
+      EraseLivenessEndpoint(runtime_id);
       StopChildNoThrow(child);
     }
+  }
+
+  void EraseLivenessEndpoint(const std::string &runtime_id) {
+    std::lock_guard lock(liveness_mutex);
+    liveness_endpoints.erase(runtime_id);
+  }
+
+  void EraseChild(const std::map<std::string, Child>::iterator child) {
+    EraseLivenessEndpoint(child->first);
+    children.erase(child);
   }
 
   [[nodiscard]] std::pair<std::shared_ptr<const RetainedBundle>,
@@ -967,7 +1000,7 @@ struct RetainedNativeRuntimeUnitAdapter::Impl final
       Fail("native projection client binding is no longer admitted");
     }
     if (!ChildIsLive(found->second)) {
-      children.erase(found);
+      EraseChild(found);
       Fail("native projection child exited before its response");
     }
     auto response = ExchangeProjection(found->second, request);
@@ -997,7 +1030,7 @@ struct RetainedNativeRuntimeUnitAdapter::Impl final
       Fail("native projection client binding is no longer admitted");
     }
     if (!ChildIsLive(found->second)) {
-      children.erase(found);
+      EraseChild(found);
       Fail("native projection child exited before its response");
     }
     auto response = ExchangeProjectionRaw(found->second, request);
@@ -1021,7 +1054,7 @@ struct RetainedNativeRuntimeUnitAdapter::Impl final
     }
     auto found = children.begin();
     if (!ChildIsLive(found->second)) {
-      children.erase(found);
+      EraseChild(found);
       Fail("managed Kernel child exited before its fence response");
     }
     const auto encoded = detail::EncodeKernelApplyFenceRpcRequest(
@@ -1059,7 +1092,7 @@ struct RetainedNativeRuntimeUnitAdapter::Impl final
     }
     auto found = children.begin();
     if (!ChildIsLive(found->second)) {
-      children.erase(found);
+      EraseChild(found);
       return manyforge::core::Result<Response>::Err(
           {"kernel_owner_unavailable",
            "managed Kernel child exited before its cell-admission response",
@@ -1103,7 +1136,7 @@ struct RetainedNativeRuntimeUnitAdapter::Impl final
            "epoch");
     }
     if (!ChildIsLive(found->second)) {
-      children.erase(found);
+      EraseChild(found);
       Fail("managed runtime child exited before its composition response");
     }
     const auto encoded =
@@ -1176,15 +1209,17 @@ struct RetainedNativeRuntimeUnitAdapter::Impl final
     // Manager generation.  This adapter must atomically cover every requested
     // native child, while preserving the complete set in every native packet.
 
-    const detail::ManagerLivenessBatchDeadline deadline(
-        std::chrono::steady_clock::now(), kManagerLivenessTimeout);
     if (!manyforge::core::ValidateManagerLivenessRequiredSet(
              required_set)
              .ok()) {
       Fail("Manager-liveness request has an invalid required set");
     }
-    std::lock_guard lock(mutex);
-    std::vector<Child*> targets;
+    std::lock_guard lock(liveness_mutex);
+    // The response budget starts only once this batch owns the dedicated
+    // liveness channels. Ordinary control and Apply traffic cannot consume it.
+    const detail::ManagerLivenessBatchDeadline deadline(
+        std::chrono::steady_clock::now(), kManagerLivenessTimeout);
+    std::vector<LivenessEndpoint*> targets;
     std::vector<pollfd> descriptors;
     targets.reserve(requests.size());
     descriptors.reserve(requests.size());
@@ -1194,16 +1229,13 @@ struct RetainedNativeRuntimeUnitAdapter::Impl final
           required_set.required_receivers.end(), [&](const auto& row) {
             return row.runtime_unit_id == request.receiver_runtime_unit_id;
           });
-      auto found = children.find(request.receiver_runtime_unit_id.value());
+      auto found =
+          liveness_endpoints.find(request.receiver_runtime_unit_id.value());
       if (expected == required_set.required_receivers.end() ||
-          found == children.end() ||
+          found == liveness_endpoints.end() ||
           found->second.runtime_epoch != expected->runtime_epoch) {
         Fail(
             "Manager-liveness request no longer names the current child epoch");
-      }
-      if (!ChildIsLive(found->second)) {
-        children.erase(found);
-        Fail("managed runtime child exited before its liveness response");
       }
       targets.push_back(&found->second);
       descriptors.push_back({found->second.channel.get(), 0, 0});
@@ -1388,18 +1420,22 @@ struct RetainedNativeRuntimeUnitAdapter::Impl final
               const RetainedBundle &bundle) {
     auto target = OpenInstalledTarget(admission);
     auto channels = MakePacketPair();
+    auto liveness_channels = MakePacketPair();
     auto exec_pipe = MakePipe();
     SetNonBlocking(channels[0].get());
+    SetNonBlocking(liveness_channels[0].get());
     const RuntimeEpoch runtime_epoch("native-runtime-" + RandomHex());
     const auto launch_arguments =
         admission.launch_arguments(kChildChannelFd, runtime_epoch);
     std::vector<std::string> arguments;
-    arguments.reserve(launch_arguments.size() + 15U);
+    arguments.reserve(launch_arguments.size() + 17U);
     arguments.push_back(admission.installed_target_id());
     arguments.insert(arguments.end(), launch_arguments.begin(),
                      launch_arguments.end());
     arguments.emplace_back("--manyforge-managed-package-root-fd");
     arguments.push_back(std::to_string(kChildPackageRootFd));
+    arguments.emplace_back("--manyforge-managed-liveness-channel-fd");
+    arguments.push_back(std::to_string(kChildLivenessChannelFd));
     arguments.emplace_back("--manyforge-managed-manager-state-root");
     arguments.push_back(manager_state_root_path.string());
     arguments.emplace_back("--manyforge-managed-staging-root");
@@ -1440,11 +1476,13 @@ struct RetainedNativeRuntimeUnitAdapter::Impl final
       Fail(ErrnoDetail("could not fork native execution target", errno));
     }
     if (pid == 0) {
-      EnterChild(parent, channels[1].get(), exec_pipe[1].get(), target.get(),
-                 package_root_fd.get(), argv.data());
+      EnterChild(parent, channels[1].get(), liveness_channels[1].get(),
+                 exec_pipe[1].get(), target.get(), package_root_fd.get(),
+                 argv.data());
     }
 
     channels[1].Reset();
+    liveness_channels[1].Reset();
     exec_pipe[1].Reset();
     target.Reset();
     try {
@@ -1462,6 +1500,7 @@ struct RetainedNativeRuntimeUnitAdapter::Impl final
       }
     } catch (...) {
       channels[0].Reset();
+      liveness_channels[0].Reset();
       KillAndReap(pid);
       throw;
     }
@@ -1469,10 +1508,22 @@ struct RetainedNativeRuntimeUnitAdapter::Impl final
                 admission.product().product_identity().value(),
                 admission.product().configuration_identity().value(),
                 admission.runtime_contract_offer_digest(), {});
+    {
+      std::lock_guard lock(liveness_mutex);
+      const auto [_, inserted] = liveness_endpoints.emplace(
+          admission.product().runtime_unit_id().value(),
+          LivenessEndpoint(pid, runtime_epoch,
+                           std::move(liveness_channels[0])));
+      if (!inserted) {
+        StopChildNoThrow(child);
+        Fail("native runtime liveness endpoint insertion conflicted");
+      }
+    }
     try {
       PrepareChildProjectionBindings(child, bundle,
                                      admission.product().runtime_unit_id());
     } catch (...) {
+      EraseLivenessEndpoint(admission.product().runtime_unit_id().value());
       StopChildNoThrow(child);
       throw;
     }
@@ -1494,11 +1545,11 @@ struct RetainedNativeRuntimeUnitAdapter::Impl final
       if (ChildIsLive(found->second)) {
         Fail("live native runtime child differs from the selected product");
       }
-      children.erase(found);
+      EraseChild(found);
       return Presence(query, ProcessPresenceState::kAbsent);
     }
     if (!ChildIsLive(found->second)) {
-      children.erase(found);
+      EraseChild(found);
       return Presence(query, ProcessPresenceState::kAbsent);
     }
     return Presence(query, ProcessPresenceState::kPresent,
@@ -1518,19 +1569,22 @@ struct RetainedNativeRuntimeUnitAdapter::Impl final
         if (ChildIsLive(found->second)) {
           Fail("cannot replace a live native child with another product");
         }
-        children.erase(found);
+        EraseChild(found);
       } else if (ChildIsLive(found->second)) {
         PrepareChildProjectionBindings(found->second, *bundle,
                                        query.plan.runtime_unit_id);
         return Presence(query, ProcessPresenceState::kPresent,
                         found->second.runtime_epoch.value());
       } else {
-        children.erase(found);
+        EraseChild(found);
       }
     }
+    auto launched = LaunchChild(admission, *bundle);
     auto [inserted, unique] =
-        children.emplace(runtime_id, LaunchChild(admission, *bundle));
+        children.try_emplace(runtime_id, std::move(launched));
     if (!unique) {
+      EraseLivenessEndpoint(runtime_id);
+      StopChildNoThrow(launched);
       Fail("native runtime child registry insertion conflicted");
     }
     return Presence(query, ProcessPresenceState::kPresent,
@@ -1552,7 +1606,7 @@ struct RetainedNativeRuntimeUnitAdapter::Impl final
       Fail("native runtime stop query differs from the tracked child");
     }
     StopChild(found->second);
-    children.erase(found);
+    EraseChild(found);
     return Presence(query, ProcessPresenceState::kAbsent);
   }
 
@@ -1576,7 +1630,7 @@ struct RetainedNativeRuntimeUnitAdapter::Impl final
       Fail("native runtime progress query differs from the tracked child");
     }
     if (!ChildIsLive(found->second)) {
-      children.erase(found);
+      EraseChild(found);
       return std::nullopt;
     }
     SendPacket(found->second.channel.get(), "status", kStatusTimeout);
@@ -1632,8 +1686,10 @@ struct RetainedNativeRuntimeUnitAdapter::Impl final
   std::string observer_instance_id;
   UniqueFd target_root_fd;
   std::mutex mutex;
+  std::mutex liveness_mutex;
   std::uint64_t observation_sequence{};
   std::map<std::string, Child> children;
+  std::map<std::string, LivenessEndpoint> liveness_endpoints;
 };
 
 class RetainedNativeRuntimeUnitAdapter::Impl::ProjectionClient final
@@ -1805,7 +1861,7 @@ RetainedNativeRuntimeUnitAdapter::Impl::ResolveProjection(
       return missing("no exact Manager child owns the native runtime epoch");
     }
     if (!ChildIsLive(found->second)) {
-      children.erase(found);
+      EraseChild(found);
       return missing("the exact Manager child is no longer live");
     }
     const ProjectionBindingKey key{binding.provider_binding_id,

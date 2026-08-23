@@ -353,6 +353,11 @@ def test_callback_uses_exact_active_context_and_mutates_only_the_draft(
     assert result["result"]["draftRevision"] == 2
     assert state.draft_session.snapshot()["applied"] is False
     assert state.draft_session.snapshot()["saved"] is False
+    assert state.authoring_admission is not None
+    assert (
+        state.authoring_admission._journal.retained_workspace()
+        == state.draft_session.retained_state()
+    )
 
     stale = client.post(
         "/api/assistant/bridge/tools/scene_draft_add_object",

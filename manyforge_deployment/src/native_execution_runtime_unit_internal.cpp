@@ -475,16 +475,17 @@ std::string native_execution_runtime_implementation_revision() {
       "atomic-resource-table-admission;"
       "resource-derived-active-configurations;"
       "runtime-contract-offer-correlation-v2;"
-      "retained-manager-liveness-receiver-v1");
+      "retained-manager-liveness-receiver-v2;"
+      "isolated-manager-liveness-transport-v1");
 }
 
 std::string native_execution_runtime_process_adapter_revision() {
   return contract_revision(
       "process-adapter",
       "manager-managed;installed-target;fixed-argv;direct-child-epoch;"
-      "inherited-seqpacket-channel;same-user-direct-parent;"
+      "dual-inherited-seqpacket-channels;same-user-direct-parent;"
       "command-fenced-readiness;runtime-contract-offer-digest-echo;"
-      "fixed-sibling-candidate-worker;manager-liveness-rpc-v1");
+      "fixed-sibling-candidate-worker;isolated-manager-liveness-rpc-v1");
 }
 
 std::string native_execution_runtime_retrieval_contract_revision() {

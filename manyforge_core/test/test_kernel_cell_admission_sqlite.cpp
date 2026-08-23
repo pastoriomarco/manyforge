@@ -204,14 +204,128 @@ TEST(KernelCellAdmissionSqlite, AcquireAndReleaseCrashWindowsRehydrateExactTruth
   }
 }
 
+TEST(KernelCellAdmissionSqlite, UncleanKernelReplacementAllowsProvenEmptyLifecycleOwnerRotation) {
+  TemporaryDirectory temporary;
+  const auto database = temporary.path() / std::string(kOperationJournalFilename);
+  FixedClock clock;
+  auto predecessor = Claim();
+  {
+    SqliteOperationJournal journal(database, CellId("cell.1"));
+    auto recovery =
+        journal.BeginOwnerEpoch(RequestOwnerEpoch("kernel.1"), 1, 8U, {ResourceId("resource.1")});
+    ASSERT_TRUE(recovery.ok());
+    KernelCellAdmissionOwner owner(
+        RequestOwnerEpoch("kernel.1"), 8U, clock, journal, {},
+        recovery.value().cell_admission_generation_high_water, {},
+        [](const auto&, const auto&) { return Result<void>::Ok(); }, {}, {}, {},
+        EmptyLivenessSet());
+    ASSERT_TRUE(owner.UpdateCellAdmissionReadiness(Ready()).ok());
+    auto intent = Claim().intent;
+    intent.claim_kind = CellAdmissionClaimKindDTO::kComponentLifecycle;
+    intent.owner_role = CellAdmissionOwnerRoleDTO::kComponentLifecycleOwner;
+    intent.owner_epoch = RequestOwnerEpoch("cclc.owner.1");
+    intent.owner_transaction_id = "lifecycle.1";
+    intent.request_id = RequestId("lifecycle.request.1");
+    intent.expected_admission_generation = owner.GetAuthoringAdmission().admission_generation;
+    auto acquired = owner.AcquireCellAdmissionClaim(intent);
+    ASSERT_TRUE(acquired.ok());
+    predecessor = acquired.value();
+    ASSERT_TRUE(owner.ReleaseCellAdmissionClaim(Release(predecessor)).ok());
+  }
+
+  SqliteOperationJournal replacement(database, CellId("cell.1"));
+  auto recovery =
+      replacement.BeginOwnerEpoch(RequestOwnerEpoch("kernel.2"), 2, 8U, {ResourceId("resource.1")});
+  ASSERT_TRUE(recovery.ok());
+  KernelCellAdmissionOwner owner(
+      RequestOwnerEpoch("kernel.2"), 8U, clock, replacement,
+      recovery.value().recovered_cell_admission_claims,
+      recovery.value().cell_admission_generation_high_water, {},
+      [](const auto&, const auto&) { return Result<void>::Ok(); },
+      [](const auto&, const auto&, const auto& reconcile) {
+        return Result<CellAdmissionReconcileValidationDTO>::Ok(RetainAll(reconcile));
+      },
+      recovery.value().recovered_cell_admission_membership,
+      recovery.value().recovered_cell_admission_current_owners, EmptyLivenessSet());
+  const CellAdmissionReconcileDTO reconcile{
+      RequestOwnerEpoch("kernel.2"),
+      {},
+      {{CellAdmissionOwnerRoleDTO::kComponentLifecycleOwner, RequestOwnerEpoch("cclc.owner.2")}},
+      Digest('c')};
+  const auto rotated = owner.ReconcileCellAdmissionClaims(reconcile);
+  ASSERT_TRUE(rotated.ok()) << rotated.error().code << ": " << rotated.error().message;
+  const auto retired = owner.GetCellAdmissionRecoveryReceipt(
+      {predecessor.intent, predecessor, Release(predecessor)});
+  ASSERT_TRUE(retired.ok());
+  EXPECT_EQ(retired.value().status, CellAdmissionRecoveryReceiptStatusDTO::kUnknown);
+  EXPECT_EQ(retired.value().current_owner_epochs, reconcile.current_owner_epochs);
+}
+
+TEST(KernelCellAdmissionSqlite, UncleanKernelReplacementAllowsProvenEmptyAuthoringOwnerRotation) {
+  TemporaryDirectory temporary;
+  const auto database = temporary.path() / std::string(kOperationJournalFilename);
+  FixedClock clock;
+  auto predecessor = Claim();
+  {
+    SqliteOperationJournal journal(database, CellId("cell.1"));
+    auto recovery =
+        journal.BeginOwnerEpoch(RequestOwnerEpoch("kernel.1"), 1, 8U, {ResourceId("resource.1")});
+    ASSERT_TRUE(recovery.ok());
+    KernelCellAdmissionOwner owner(
+        RequestOwnerEpoch("kernel.1"), 8U, clock, journal, {},
+        recovery.value().cell_admission_generation_high_water, {},
+        [](const auto&, const auto&) { return Result<void>::Ok(); }, {}, {}, {},
+        EmptyLivenessSet());
+    ASSERT_TRUE(owner.UpdateCellAdmissionReadiness(Ready()).ok());
+    auto intent = Claim().intent;
+    intent.claim_kind = CellAdmissionClaimKindDTO::kAuthoringMutation;
+    intent.owner_role = CellAdmissionOwnerRoleDTO::kAuthoringOwner;
+    intent.owner_epoch = RequestOwnerEpoch("authoring.owner.1");
+    intent.owner_transaction_id = "authoring.1";
+    intent.request_id = RequestId("authoring.request.1");
+    intent.expected_admission_generation = owner.GetAuthoringAdmission().admission_generation;
+    auto acquired = owner.AcquireCellAdmissionClaim(intent);
+    ASSERT_TRUE(acquired.ok());
+    predecessor = acquired.value();
+    ASSERT_TRUE(owner.ReleaseCellAdmissionClaim(Release(predecessor)).ok());
+  }
+
+  SqliteOperationJournal replacement(database, CellId("cell.1"));
+  auto recovery =
+      replacement.BeginOwnerEpoch(RequestOwnerEpoch("kernel.2"), 2, 8U, {ResourceId("resource.1")});
+  ASSERT_TRUE(recovery.ok());
+  KernelCellAdmissionOwner owner(
+      RequestOwnerEpoch("kernel.2"), 8U, clock, replacement,
+      recovery.value().recovered_cell_admission_claims,
+      recovery.value().cell_admission_generation_high_water, {},
+      [](const auto&, const auto&) { return Result<void>::Ok(); },
+      [](const auto&, const auto&, const auto& reconcile) {
+        return Result<CellAdmissionReconcileValidationDTO>::Ok(RetainAll(reconcile));
+      },
+      recovery.value().recovered_cell_admission_membership,
+      recovery.value().recovered_cell_admission_current_owners, EmptyLivenessSet());
+  const CellAdmissionReconcileDTO reconcile{
+      RequestOwnerEpoch("kernel.2"),
+      {},
+      {{CellAdmissionOwnerRoleDTO::kAuthoringOwner, RequestOwnerEpoch("authoring.owner.2")}},
+      Digest('c')};
+  const auto rotated = owner.ReconcileCellAdmissionClaims(reconcile);
+  ASSERT_TRUE(rotated.ok()) << rotated.error().code << ": " << rotated.error().message;
+  const auto retired = owner.GetCellAdmissionRecoveryReceipt(
+      {predecessor.intent, predecessor, Release(predecessor)});
+  ASSERT_TRUE(retired.ok());
+  EXPECT_EQ(retired.value().status, CellAdmissionRecoveryReceiptStatusDTO::kUnknown);
+  EXPECT_EQ(retired.value().current_owner_epochs, reconcile.current_owner_epochs);
+}
+
 TEST(KernelCellAdmissionSqlite, ReplacementReconcileIsInventoryBoundAndReplaySafe) {
   TemporaryDirectory temporary;
   const auto database = temporary.path() / std::string(kOperationJournalFilename);
   const auto claim = Claim();
   SqliteOperationJournal journal(database, CellId("cell.1"));
-  ASSERT_TRUE(journal.BeginOwnerEpoch(RequestOwnerEpoch("kernel.1"), 1, 8U,
-                                      {ResourceId("resource.1")})
-                  .ok());
+  ASSERT_TRUE(
+      journal.BeginOwnerEpoch(RequestOwnerEpoch("kernel.1"), 1, 8U, {ResourceId("resource.1")})
+          .ok());
   ASSERT_TRUE(journal.RecordCellAdmissionClaimAcquired(RequestOwnerEpoch("kernel.1"), claim).ok());
   journal.Close();
 

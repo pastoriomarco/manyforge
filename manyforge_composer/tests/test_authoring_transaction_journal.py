@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor
+import sqlite3
+
 import pytest
 
 from manyforge_composer.backend.authoring_transaction_journal import (
@@ -128,6 +131,28 @@ def test_post_image_outcome_and_workspace_are_one_atomic_replay_unit(tmp_path) -
     assert restored.retained_workspace() == row.post_image
 
 
+def test_post_image_outcome_rolls_back_if_workspace_retention_fails(tmp_path) -> None:
+    journal = ComposerAuthoringTransactionJournal(tmp_path)
+    transaction = _record(journal)
+    journal._database.execute(
+        "CREATE TRIGGER reject_retained_workspace BEFORE INSERT ON "
+        "retained_workspace BEGIN SELECT RAISE(ABORT, 'injected failure'); END"
+    )
+
+    with pytest.raises(sqlite3.IntegrityError, match="injected failure"):
+        journal.record_effect_outcome(
+            transaction,
+            post_image={"draft_id": "draft.2", "revision": 4},
+            outcome={"kind": "mapping", "body": {"saved": True}},
+        )
+
+    restored = journal.lookup("browser.1", "request.1")
+    assert restored is not None
+    assert restored.post_image is None
+    assert restored.outcome is None
+    assert journal.retained_workspace() is None
+
+
 def test_pruning_reuses_completed_capacity_but_never_unresolved(tmp_path) -> None:
     journal = ComposerAuthoringTransactionJournal(tmp_path, maximum_transactions=2)
     first = _record(journal)
@@ -175,3 +200,31 @@ def test_owner_rotation_keeps_owner_epoch_table_bounded(tmp_path) -> None:
         journal = ComposerAuthoringTransactionJournal(tmp_path)
     count = journal._database.execute("SELECT count(*) FROM owner_epochs").fetchone()[0]
     assert count == 1
+
+
+def test_concurrent_requests_serialize_shared_sqlite_connection(tmp_path) -> None:
+    journal = ComposerAuthoringTransactionJournal(tmp_path)
+
+    def record(index: int) -> str:
+        request_owner_epoch = f"browser.{index}"
+        request_id = f"request.{index}"
+        transaction_id = owner_transaction_id(request_owner_epoch, request_id)
+        transaction = journal.record_intent(
+            request_owner_epoch=request_owner_epoch,
+            request_id=request_id,
+            operation_kind="save_draft",
+            payload_digest=f"sha256:{index:064x}",
+            draft_id="draft.1",
+            draft_revision=3,
+            admission_generation=7,
+            claim_intent=_intent(transaction_id),
+        )
+        journal.record(transaction, "acquire_attempted", True)
+        return transaction.owner_transaction_id
+
+    with ThreadPoolExecutor(max_workers=16) as executor:
+        transaction_ids = list(executor.map(record, range(64)))
+
+    assert len(set(transaction_ids)) == 64
+    assert len(journal.unresolved()) == 64
+    assert all(transaction.acquire_attempted for transaction in journal.unresolved())

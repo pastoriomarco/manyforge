@@ -7,6 +7,7 @@ import hashlib
 import json
 from pathlib import Path
 import sqlite3
+import threading
 import time
 import uuid
 from typing import Any, Mapping
@@ -83,9 +84,10 @@ class ComposerAuthoringTransactionJournal:
                 "Composer authoring state root must be a pre-existing directory",
             )
         self._capacity = maximum_transactions
+        self._lock = threading.RLock()
         self._database = sqlite3.connect(
             state_root / "composer-authoring-transactions.sqlite3",
-            isolation_level=None,
+            isolation_level="IMMEDIATE",
             check_same_thread=False,
         )
         try:
@@ -192,34 +194,37 @@ class ComposerAuthoringTransactionJournal:
     def lookup(
         self, request_owner_epoch: str, request_id: str
     ) -> AuthoringTransaction | None:
-        row = self._database.execute(
-            "SELECT request_owner_epoch,request_id,owner_transaction_id,"
-            "operation_kind,payload_digest,draft_id,draft_revision,"
-            "admission_generation,owner_epoch,claim_intent_json,"
-            "acquire_attempted,claim_json,effect_intent_json,outcome_json,"
-            "post_image_json,release_intent_json,release_receipt_json "
-            "FROM transactions WHERE request_owner_epoch=? AND request_id=?",
-            (request_owner_epoch, request_id),
-        ).fetchone()
-        return None if row is None else self._row(row)
+        with self._lock:
+            row = self._database.execute(
+                "SELECT request_owner_epoch,request_id,owner_transaction_id,"
+                "operation_kind,payload_digest,draft_id,draft_revision,"
+                "admission_generation,owner_epoch,claim_intent_json,"
+                "acquire_attempted,claim_json,effect_intent_json,outcome_json,"
+                "post_image_json,release_intent_json,release_receipt_json "
+                "FROM transactions WHERE request_owner_epoch=? AND request_id=?",
+                (request_owner_epoch, request_id),
+            ).fetchone()
+            return None if row is None else self._row(row)
 
     def unresolved(self) -> list[AuthoringTransaction]:
-        rows = self._database.execute(
-            "SELECT request_owner_epoch,request_id,owner_transaction_id,"
-            "operation_kind,payload_digest,draft_id,draft_revision,"
-            "admission_generation,owner_epoch,claim_intent_json,"
-            "acquire_attempted,claim_json,effect_intent_json,outcome_json,"
-            "post_image_json,release_intent_json,release_receipt_json "
-            "FROM transactions WHERE release_receipt_json IS NULL "
-            "ORDER BY rowid"
-        ).fetchall()
-        return [self._row(row) for row in rows]
+        with self._lock:
+            rows = self._database.execute(
+                "SELECT request_owner_epoch,request_id,owner_transaction_id,"
+                "operation_kind,payload_digest,draft_id,draft_revision,"
+                "admission_generation,owner_epoch,claim_intent_json,"
+                "acquire_attempted,claim_json,effect_intent_json,outcome_json,"
+                "post_image_json,release_intent_json,release_receipt_json "
+                "FROM transactions WHERE release_receipt_json IS NULL "
+                "ORDER BY rowid"
+            ).fetchall()
+            return [self._row(row) for row in rows]
 
     def retained_workspace(self) -> dict[str, Any] | None:
-        row = self._database.execute(
-            "SELECT post_image_json FROM retained_workspace WHERE singleton=1"
-        ).fetchone()
-        return None if row is None else self._decode(row[0])
+        with self._lock:
+            row = self._database.execute(
+                "SELECT post_image_json FROM retained_workspace WHERE singleton=1"
+            ).fetchone()
+            return None if row is None else self._decode(row[0])
 
     def record_intent(
         self,
@@ -233,66 +238,71 @@ class ComposerAuthoringTransactionJournal:
         admission_generation: int,
         claim_intent: Mapping[str, Any],
     ) -> AuthoringTransaction:
-        existing = self.lookup(request_owner_epoch, request_id)
-        transaction_id = owner_transaction_id(request_owner_epoch, request_id)
-        immutable = (
-            transaction_id,
-            operation_kind,
-            payload_digest,
-            draft_id,
-            draft_revision,
-            admission_generation,
-        )
-        if existing is not None:
-            if immutable != (
-                existing.owner_transaction_id,
-                existing.operation_kind,
-                existing.payload_digest,
-                existing.draft_id,
-                existing.draft_revision,
-                existing.admission_generation,
-            ):
-                raise AuthoringJournalError(
-                    "composer_authoring_request_id_conflict",
-                    "authoring request ID is bound to another exact intent",
-                )
-            return existing
-        count = self._database.execute("SELECT count(*) FROM transactions").fetchone()[0]
-        if count >= self._capacity:
-            with self._database:
-                self._database.execute(
-                    "DELETE FROM transactions WHERE rowid=("
-                    "SELECT rowid FROM transactions "
-                    "WHERE release_receipt_json IS NOT NULL ORDER BY rowid LIMIT 1)"
-                )
+        with self._lock:
+            existing = self.lookup(request_owner_epoch, request_id)
+            transaction_id = owner_transaction_id(request_owner_epoch, request_id)
+            immutable = (
+                transaction_id,
+                operation_kind,
+                payload_digest,
+                draft_id,
+                draft_revision,
+                admission_generation,
+            )
+            if existing is not None:
+                if immutable != (
+                    existing.owner_transaction_id,
+                    existing.operation_kind,
+                    existing.payload_digest,
+                    existing.draft_id,
+                    existing.draft_revision,
+                    existing.admission_generation,
+                ):
+                    raise AuthoringJournalError(
+                        "composer_authoring_request_id_conflict",
+                        "authoring request ID is bound to another exact intent",
+                    )
+                return existing
             count = self._database.execute(
                 "SELECT count(*) FROM transactions"
             ).fetchone()[0]
-        if count >= self._capacity:
-            raise AuthoringJournalError(
-                "composer_authoring_journal_full",
-                "bounded Composer authoring transaction journal is full",
+            if count >= self._capacity:
+                with self._database:
+                    self._database.execute(
+                        "DELETE FROM transactions WHERE rowid=("
+                        "SELECT rowid FROM transactions "
+                        "WHERE release_receipt_json IS NOT NULL ORDER BY rowid LIMIT 1)"
+                    )
+                count = self._database.execute(
+                    "SELECT count(*) FROM transactions"
+                ).fetchone()[0]
+            if count >= self._capacity:
+                raise AuthoringJournalError(
+                    "composer_authoring_journal_full",
+                    "bounded Composer authoring transaction journal is full",
+                )
+            with self._database:
+                self._database.execute(
+                    "INSERT INTO transactions(request_owner_epoch,request_id,"
+                    "owner_transaction_id,operation_kind,payload_digest,draft_id,"
+                    "draft_revision,admission_generation,owner_epoch,claim_intent_json)"
+                    " VALUES(?,?,?,?,?,?,?,?,?,?)",
+                    (
+                        request_owner_epoch,
+                        request_id,
+                        transaction_id,
+                        operation_kind,
+                        payload_digest,
+                        draft_id,
+                        draft_revision,
+                        admission_generation,
+                        self.owner_epoch,
+                        self._json(claim_intent),
+                    ),
+                )
+            return self.lookup(  # type: ignore[return-value]
+                request_owner_epoch, request_id
             )
-        with self._database:
-            self._database.execute(
-                "INSERT INTO transactions(request_owner_epoch,request_id,"
-                "owner_transaction_id,operation_kind,payload_digest,draft_id,"
-                "draft_revision,admission_generation,owner_epoch,claim_intent_json)"
-                " VALUES(?,?,?,?,?,?,?,?,?,?)",
-                (
-                    request_owner_epoch,
-                    request_id,
-                    transaction_id,
-                    operation_kind,
-                    payload_digest,
-                    draft_id,
-                    draft_revision,
-                    admission_generation,
-                    self.owner_epoch,
-                    self._json(claim_intent),
-                ),
-            )
-        return self.lookup(request_owner_epoch, request_id)  # type: ignore[return-value]
 
     def record(self, transaction: AuthoringTransaction, field: str, value: Mapping[str, Any] | bool) -> None:
         columns = {
@@ -319,26 +329,27 @@ class ComposerAuthoringTransactionJournal:
         )
         if field != "acquire_attempted":
             parameters += (encoded,)
-        with self._database:
-            changed = self._database.execute(
-                f"UPDATE transactions SET {field}=? WHERE request_owner_epoch=? "
-                f"AND request_id=? AND {predicate}",
-                parameters,
-            ).rowcount
-            if changed != 1:
-                raise AuthoringJournalError(
-                    "composer_authoring_journal_conflict",
-                    "authoring transaction receipt conflicts with durable state",
-                )
-            if field == "post_image_json":
-                self._database.execute(
-                    "INSERT INTO retained_workspace(singleton,post_image_json,"
-                    "owner_transaction_id) VALUES(1,?,?) "
-                    "ON CONFLICT(singleton) DO UPDATE SET "
-                    "post_image_json=excluded.post_image_json,"
-                    "owner_transaction_id=excluded.owner_transaction_id",
-                    (encoded, transaction.owner_transaction_id),
-                )
+        with self._lock:
+            with self._database:
+                changed = self._database.execute(
+                    f"UPDATE transactions SET {field}=? WHERE request_owner_epoch=? "
+                    f"AND request_id=? AND {predicate}",
+                    parameters,
+                ).rowcount
+                if changed != 1:
+                    raise AuthoringJournalError(
+                        "composer_authoring_journal_conflict",
+                        "authoring transaction receipt conflicts with durable state",
+                    )
+                if field == "post_image_json":
+                    self._database.execute(
+                        "INSERT INTO retained_workspace(singleton,post_image_json,"
+                        "owner_transaction_id) VALUES(1,?,?) "
+                        "ON CONFLICT(singleton) DO UPDATE SET "
+                        "post_image_json=excluded.post_image_json,"
+                        "owner_transaction_id=excluded.owner_transaction_id",
+                        (encoded, transaction.owner_transaction_id),
+                    )
 
     def record_effect_outcome(
         self,
@@ -351,34 +362,35 @@ class ComposerAuthoringTransactionJournal:
 
         encoded_post_image = self._json(post_image)
         encoded_outcome = self._json(outcome)
-        with self._database:
-            changed = self._database.execute(
-                "UPDATE transactions SET post_image_json=?,outcome_json=? "
-                "WHERE request_owner_epoch=? AND request_id=? AND "
-                "((post_image_json IS NULL AND outcome_json IS NULL) OR "
-                "(post_image_json=? AND outcome_json=?))",
-                (
-                    encoded_post_image,
-                    encoded_outcome,
-                    transaction.request_owner_epoch,
-                    transaction.request_id,
-                    encoded_post_image,
-                    encoded_outcome,
-                ),
-            ).rowcount
-            if changed != 1:
-                raise AuthoringJournalError(
-                    "composer_authoring_journal_conflict",
-                    "authoring effect outcome conflicts with durable state",
+        with self._lock:
+            with self._database:
+                changed = self._database.execute(
+                    "UPDATE transactions SET post_image_json=?,outcome_json=? "
+                    "WHERE request_owner_epoch=? AND request_id=? AND "
+                    "((post_image_json IS NULL AND outcome_json IS NULL) OR "
+                    "(post_image_json=? AND outcome_json=?))",
+                    (
+                        encoded_post_image,
+                        encoded_outcome,
+                        transaction.request_owner_epoch,
+                        transaction.request_id,
+                        encoded_post_image,
+                        encoded_outcome,
+                    ),
+                ).rowcount
+                if changed != 1:
+                    raise AuthoringJournalError(
+                        "composer_authoring_journal_conflict",
+                        "authoring effect outcome conflicts with durable state",
+                    )
+                self._database.execute(
+                    "INSERT INTO retained_workspace(singleton,post_image_json,"
+                    "owner_transaction_id) VALUES(1,?,?) "
+                    "ON CONFLICT(singleton) DO UPDATE SET "
+                    "post_image_json=excluded.post_image_json,"
+                    "owner_transaction_id=excluded.owner_transaction_id",
+                    (encoded_post_image, transaction.owner_transaction_id),
                 )
-            self._database.execute(
-                "INSERT INTO retained_workspace(singleton,post_image_json,"
-                "owner_transaction_id) VALUES(1,?,?) "
-                "ON CONFLICT(singleton) DO UPDATE SET "
-                "post_image_json=excluded.post_image_json,"
-                "owner_transaction_id=excluded.owner_transaction_id",
-                (encoded_post_image, transaction.owner_transaction_id),
-            )
 
 
 __all__ = [

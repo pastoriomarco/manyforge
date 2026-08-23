@@ -396,7 +396,7 @@ def create_assistant_draft_router(state: ComposerState) -> APIRouter:
                     draft_revision=body.expected_draft_revision,
                     payload=body.model_dump(mode="json", by_alias=True),
                     effect=mutate_draft,
-                    post_image=state.draft_session.snapshot,
+                    post_image=state.draft_session.retained_state,
                 )
                 next_snapshot = result["snapshot"]
                 mutation = result["mutation"]

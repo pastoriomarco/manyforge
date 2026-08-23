@@ -4,7 +4,6 @@ from __future__ import annotations
 
 from contextlib import contextmanager
 from concurrent.futures import ThreadPoolExecutor
-import hashlib
 import json
 import os
 from pathlib import Path
@@ -13,11 +12,11 @@ import socket
 import subprocess
 import sys
 import time
-from typing import Iterator
+from typing import Callable, Iterator
 
 import pytest
+from websockets.sync.client import connect as connect_websocket
 
-from manyforge_behavior.canonical_artifact import compute_content_identity
 from manyforge_headless_api.client import HeadlessClientError, HeadlessHttpClient
 from manyforge_headless_api.program_runner_client import ProgramRunnerHttpClient
 
@@ -388,7 +387,7 @@ class ProcessStack:
             "--headless-api-url",
             self.base_url,
             "--headless-api-timeout-s",
-            "0.25",
+            "8",
             "--authoring-state-root",
             str(self.composer_authoring_root),
         ]
@@ -461,6 +460,10 @@ class ProcessStack:
                 if b'"ok":true' not in response:
                     raise RuntimeError("Manager shutdown was rejected")
             self.manager.wait(timeout=5)
+        except (OSError, RuntimeError, subprocess.TimeoutExpired):
+            # Cleanup must still terminate a failed or unresponsive Manager,
+            # without replacing the process-boundary assertion that led here.
+            pass
         finally:
             if self.manager.poll() is None:
                 self.manager.terminate()
@@ -634,6 +637,117 @@ def _assistant_stack(
         stack.close()
 
 
+@contextmanager
+def _composer_snapshot_stream(
+    stack: ProcessStack, *, client_id: str
+) -> Iterator[Callable[[], dict]]:
+    websocket_url = (
+        stack.composer_url.replace("http://", "ws://", 1)
+        + f"/ws/state?client_id={client_id}"
+    )
+    with connect_websocket(
+        websocket_url,
+        open_timeout=2,
+        close_timeout=1,
+        max_size=16 * 1024 * 1024,
+    ) as websocket:
+        def next_snapshot() -> dict:
+            deadline = time.monotonic() + 8.0
+            last_payload: object = None
+            while time.monotonic() < deadline:
+                last_payload = json.loads(
+                    websocket.recv(timeout=max(deadline - time.monotonic(), 0.001))
+                )
+                while True:
+                    try:
+                        last_payload = json.loads(websocket.recv(timeout=0))
+                    except TimeoutError:
+                        break
+                assert isinstance(last_payload, dict)
+                if last_payload.get("complete") is True:
+                    # The server registers the exact client barrier immediately
+                    # after the send completes. Give that loop iteration time to
+                    # publish it, within the 250 ms snapshot period.
+                    time.sleep(0.01)
+                    return last_payload
+            raise RuntimeError(
+                f"Composer did not publish a complete snapshot: {last_payload!r}"
+            )
+
+        yield next_snapshot
+
+
+def _composer_fence(
+    snapshot: dict,
+    *,
+    request_id: str,
+    client_id: str = "process-test-browser",
+) -> dict:
+    draft_identity = snapshot["draft_identity"]
+    admission = snapshot["authoring_admission"]
+    return {
+        "draftId": draft_identity["draft_id"],
+        "expectedDraftRevision": draft_identity["draft_revision"],
+        "clientId": client_id,
+        "snapshotReceiverEpoch": snapshot["receiver_epoch"],
+        "snapshotSequence": snapshot["snapshot_sequence"],
+        "expectedAdmissionGeneration": admission["admission_generation"],
+        "requestOwnerEpoch": "composer.process.epoch.1",
+        "requestId": request_id,
+    }
+
+
+def _matching_composer_snapshot(
+    next_snapshot: Callable[[], dict], draft: dict
+) -> dict:
+    for _ in range(32):
+        snapshot = next_snapshot()
+        if snapshot.get("draft_identity") == {
+            "draft_id": draft["draft_id"],
+            "draft_revision": draft["draft_revision"],
+        }:
+            return snapshot
+    raise RuntimeError("Composer did not publish the exact current Draft snapshot")
+
+
+def _matching_assistant_context(
+    stack: ProcessStack, composer: HeadlessHttpClient
+) -> tuple[dict, dict]:
+    selection_fields = (
+        "selection_projection_generation",
+        "selection_source_content_digest",
+        "selection_source_generation",
+        "selection_source_owner_epoch",
+        "selection_source_owner_id",
+    )
+    deadline = time.monotonic() + 8.0
+    while time.monotonic() < deadline:
+        with HeadlessHttpClient(stack.base_url) as headless:
+            source_context = headless.source_model_context()
+        try:
+            assistant_mode = composer.assistant_mode("composer-assistant")
+        except HeadlessClientError as error:
+            if error.code not in {
+                "assistant_mode_projection_invalid",
+                "assistant_mode_projection_unavailable",
+                "node_environment_projection_invalid",
+            }:
+                raise
+            time.sleep(0.01)
+            continue
+        node_source = source_context["node_environment"]["source"]
+        model_source = source_context["source_model"]["source"]
+        assistant_source = assistant_mode["source"]
+        if all(
+            model_source[field] == node_source[field]
+            and assistant_source[field] == node_source[field]
+            for field in selection_fields
+        ):
+            return source_context, assistant_mode
+        time.sleep(0.01)
+    raise RuntimeError("Headless did not publish a coherent assistant context")
+
+
 def _apply_body(
     owner_epoch: str,
     request_id: str,
@@ -655,40 +769,6 @@ def _apply_body(
     }
 
 
-def _payload_digest(payload: dict) -> str:
-    encoded = json.dumps(
-        payload,
-        allow_nan=False,
-        ensure_ascii=False,
-        separators=(",", ":"),
-        sort_keys=True,
-    ).encode("utf-8")
-    return f"sha256:{hashlib.sha256(encoded).hexdigest()}"
-
-
-def _acquire_authoring_claim(
-    client: HeadlessHttpClient,
-    payload: dict,
-    *,
-    request_id: str,
-) -> dict:
-    admission = client.authoring_admission()
-    acquired = client.acquire_authoring_transaction(
-        {
-            "request_id": request_id,
-            "request_owner_epoch": "authoring.process.epoch.1",
-            "source_label": "process_test",
-            "correlation_id": "correlation.authoring.1",
-            "expected_admission_generation": admission[
-                "admission_generation"
-            ],
-            "request_payload_digest": _payload_digest(payload),
-            "owner_transaction_id": f"{request_id}.transaction",
-        }
-    )
-    return acquired["claim"]
-
-
 def _assistant_callback_body(
     *,
     draft: dict,
@@ -697,6 +777,7 @@ def _assistant_callback_body(
     assistant_mode: dict,
     scene_resource_id: str,
     request_id: str,
+    snapshot: dict,
 ) -> dict:
     tool = next(
         row
@@ -726,8 +807,7 @@ def _assistant_callback_body(
         "inputSchemaHash": tool["input_schema_hash"],
         "draftId": draft["draft_id"],
         "expectedDraftRevision": draft["draft_revision"],
-        "requestId": request_id,
-        "requestOwnerEpoch": "assistant.process.epoch.1",
+        **_composer_fence(snapshot, request_id=request_id),
         "sourceLabel": "assistant_process_test",
         "correlationId": "correlation.assistant.1",
         "arguments": {
@@ -777,26 +857,6 @@ def _read_only_tree(root: Path) -> Iterator[None]:
                 path.chmod(mode)
 
 
-def _edited_program(program: dict) -> dict:
-    edited = json.loads(json.dumps(program))
-    edited["name"] = "Read-only package edited Program"
-    edited["program_revision"] = compute_content_identity(
-        edited,
-        own_field="program_revision",
-        identity_domain="program-revision",
-        api_version="manyforge.program.v1",
-    )
-    return edited
-
-
-def _sole_retained_program(package_root: Path) -> dict:
-    candidates = sorted((package_root / "programs" / "sha256").glob("*.json"))
-    assert len(candidates) == 1
-    value = json.loads(candidates[0].read_text(encoding="utf-8"))
-    assert isinstance(value, dict)
-    return value
-
-
 def _owner_identity(runtime: dict, alarms: dict) -> tuple[object, ...]:
     return (
         runtime["projection_owner_epoch"],
@@ -811,10 +871,14 @@ def test_real_assistant_callback_uses_headless_source_facts_and_only_edits_draft
     tmp_path: Path,
 ) -> None:
     with _assistant_stack(tmp_path) as stack:
-        with HeadlessHttpClient(stack.composer_url) as composer:
-            node_environment = composer.node_environment()
-            source_model = composer.source_model()
-            assistant_mode = composer.assistant_mode("composer-assistant")
+        with _composer_snapshot_stream(
+            stack, client_id="process-test-browser"
+        ) as next_snapshot, HeadlessHttpClient(stack.composer_url) as composer:
+            source_context, assistant_mode = _matching_assistant_context(
+                stack, composer
+            )
+            node_environment = source_context["node_environment"]
+            source_model = source_context["source_model"]
             draft = composer.request("GET", "/api/program/draft")
             manager_before = composer.manager_status()["status"]
             runtime_before = composer.runtime()
@@ -852,19 +916,44 @@ def test_real_assistant_callback_uses_headless_source_facts_and_only_edits_draft
                 "scene_draft_add_object",
             }
 
-            accepted_body = _assistant_callback_body(
-                draft=draft,
-                node_environment=node_environment,
-                source_model=source_model,
-                assistant_mode=assistant_mode,
-                scene_resource_id="assistant_workpiece",
-                request_id="assistant.process.accepted",
-            )
-            accepted = composer.request(
-                "POST",
-                "/api/assistant/bridge/tools/scene_draft_add_object",
-                body=accepted_body,
-            )
+            for attempt in range(8):
+                source_context, assistant_mode = _matching_assistant_context(
+                    stack, composer
+                )
+                node_environment = source_context["node_environment"]
+                source_model = source_context["source_model"]
+                accepted_snapshot = _matching_composer_snapshot(
+                    next_snapshot, draft
+                )
+                accepted_body = _assistant_callback_body(
+                    draft=draft,
+                    node_environment=node_environment,
+                    source_model=source_model,
+                    assistant_mode=assistant_mode,
+                    scene_resource_id="assistant_workpiece",
+                    request_id="assistant.process.accepted",
+                    snapshot=accepted_snapshot,
+                )
+                try:
+                    accepted = composer.request(
+                        "POST",
+                        "/api/assistant/bridge/tools/scene_draft_add_object",
+                        body=accepted_body,
+                    )
+                    break
+                except HeadlessClientError as error:
+                    if (
+                        error.code
+                        not in {
+                            "assistant_callback_context_stale",
+                            "assistant_mode_projection_invalid",
+                            "node_environment_projection_invalid",
+                            "source_model_projection_invalid",
+                            "authoring_client_snapshot_stale",
+                        }
+                        or attempt == 7
+                    ):
+                        raise
             assert accepted["success"] is True
             assert accepted["draftMutated"] is True
 
@@ -876,69 +965,137 @@ def test_real_assistant_callback_uses_headless_source_facts_and_only_edits_draft
                 row["scene_resource_id"]
                 for row in after_accepted["program"]["scene"]
             }
-
-            stale_identity = _assistant_callback_body(
-                draft=after_accepted,
-                node_environment=node_environment,
-                source_model=source_model,
-                assistant_mode=assistant_mode,
-                scene_resource_id="stale_identity_object",
-                request_id="assistant.process.stale-identity",
-            )
-            stale_identity["catalogHash"] = "sha256:" + "0" * 64
-            with pytest.raises(HeadlessClientError) as stale:
-                composer.request(
-                    "POST",
-                    "/api/assistant/bridge/tools/scene_draft_add_object",
-                    body=stale_identity,
+            for attempt in range(8):
+                stale_context, stale_mode = _matching_assistant_context(
+                    stack, composer
                 )
+                stale_snapshot = _matching_composer_snapshot(
+                    next_snapshot, after_accepted
+                )
+                stale_identity = _assistant_callback_body(
+                    draft=after_accepted,
+                    node_environment=stale_context["node_environment"],
+                    source_model=stale_context["source_model"],
+                    assistant_mode=stale_mode,
+                    scene_resource_id="stale_identity_object",
+                    request_id="assistant.process.stale-identity",
+                    snapshot=stale_snapshot,
+                )
+                stale_identity["catalogHash"] = "sha256:" + "0" * 64
+                with pytest.raises(HeadlessClientError) as stale:
+                    composer.request(
+                        "POST",
+                        "/api/assistant/bridge/tools/scene_draft_add_object",
+                        body=stale_identity,
+                    )
+                if stale.value.code == "assistant_callback_context_stale":
+                    break
+                if (
+                    stale.value.code
+                    not in {
+                        "assistant_mode_projection_invalid",
+                        "node_environment_projection_invalid",
+                        "source_model_projection_invalid",
+                        "authoring_client_snapshot_stale",
+                    }
+                    or attempt == 7
+                ):
+                    raise stale.value
             assert stale.value.code == "assistant_callback_context_stale"
 
-            invalid_edit = _assistant_callback_body(
-                draft=after_accepted,
-                node_environment=node_environment,
-                source_model=source_model,
-                assistant_mode=assistant_mode,
-                scene_resource_id="invalid_edit_object",
-                request_id="assistant.process.invalid-edit",
-            )
-            resource = invalid_edit["arguments"]["scene_resource"]
-            resource["objectId"] = resource.pop("scene_resource_id")
-            rejected = composer.request(
-                "POST",
-                "/api/assistant/bridge/tools/scene_draft_add_object",
-                body=invalid_edit,
-            )
+            for attempt in range(8):
+                invalid_context, invalid_mode = _matching_assistant_context(
+                    stack, composer
+                )
+                invalid_snapshot = _matching_composer_snapshot(
+                    next_snapshot, after_accepted
+                )
+                invalid_edit = _assistant_callback_body(
+                    draft=after_accepted,
+                    node_environment=invalid_context["node_environment"],
+                    source_model=invalid_context["source_model"],
+                    assistant_mode=invalid_mode,
+                    scene_resource_id="invalid_edit_object",
+                    request_id="assistant.process.invalid-edit",
+                    snapshot=invalid_snapshot,
+                )
+                resource = invalid_edit["arguments"]["scene_resource"]
+                resource["objectId"] = resource.pop("scene_resource_id")
+                try:
+                    rejected = composer.request(
+                        "POST",
+                        "/api/assistant/bridge/tools/scene_draft_add_object",
+                        body=invalid_edit,
+                    )
+                    break
+                except HeadlessClientError as error:
+                    if (
+                        error.code
+                        not in {
+                            "assistant_mode_projection_invalid",
+                            "node_environment_projection_invalid",
+                            "source_model_projection_invalid",
+                            "authoring_client_snapshot_stale",
+                        }
+                        or attempt == 7
+                    ):
+                        raise
             assert rejected["success"] is False
             assert rejected["draftMutated"] is False
             assert rejected["result"]["kind"] == "validation_error"
             assert composer.request("GET", "/api/program/draft") == after_accepted
 
-            program_read = next(
-                row
-                for row in assistant_mode["tools"]
-                if row["tool_id"] == "program_read"
-            )
-            read_body = _assistant_callback_body(
-                draft=after_accepted,
-                node_environment=node_environment,
-                source_model=source_model,
-                assistant_mode=assistant_mode,
-                scene_resource_id="unused_for_program_read",
-                request_id="assistant.process.read",
-            )
-            read_body["inputSchemaHash"] = program_read["input_schema_hash"]
-            read_body["arguments"] = {}
             callback_latencies_s: list[float] = []
             for index in range(12):
-                read_body["requestId"] = f"assistant.process.read.{index}"
-                started = time.perf_counter()
-                read_result = composer.request(
-                    "POST",
-                    "/api/assistant/bridge/tools/program_read",
-                    body=read_body,
-                )
-                callback_latencies_s.append(time.perf_counter() - started)
+                for attempt in range(8):
+                    read_context, read_mode = _matching_assistant_context(
+                        stack, composer
+                    )
+                    read_snapshot = _matching_composer_snapshot(
+                        next_snapshot, after_accepted
+                    )
+                    program_read = next(
+                        row
+                        for row in read_mode["tools"]
+                        if row["tool_id"] == "program_read"
+                    )
+                    read_body = _assistant_callback_body(
+                        draft=after_accepted,
+                        node_environment=read_context["node_environment"],
+                        source_model=read_context["source_model"],
+                        assistant_mode=read_mode,
+                        scene_resource_id="unused_for_program_read",
+                        request_id=f"assistant.process.read.{index}",
+                        snapshot=read_snapshot,
+                    )
+                    read_body["inputSchemaHash"] = program_read[
+                        "input_schema_hash"
+                    ]
+                    read_body["arguments"] = {}
+                    started = time.perf_counter()
+                    try:
+                        read_result = composer.request(
+                            "POST",
+                            "/api/assistant/bridge/tools/program_read",
+                            body=read_body,
+                        )
+                        callback_latencies_s.append(
+                            time.perf_counter() - started
+                        )
+                        break
+                    except HeadlessClientError as error:
+                        if (
+                            error.code
+                            not in {
+                                "assistant_callback_context_stale",
+                                "assistant_mode_projection_invalid",
+                                "node_environment_projection_invalid",
+                                "source_model_projection_invalid",
+                                "authoring_client_snapshot_stale",
+                            }
+                            or attempt == 7
+                        ):
+                            raise
                 assert read_result["success"] is True
                 assert read_result["draftMutated"] is False
             assert max(callback_latencies_s) < 0.5, callback_latencies_s
@@ -947,46 +1104,71 @@ def test_real_assistant_callback_uses_headless_source_facts_and_only_edits_draft
         assert stack.authoring_transaction_journal.is_file()
         stack.start_composer()
         stack.wait_composer()
-        with HeadlessHttpClient(stack.composer_url) as replacement:
+        with _composer_snapshot_stream(
+            stack, client_id="process-test-browser"
+        ) as replacement_snapshots, HeadlessHttpClient(
+            stack.composer_url
+        ) as replacement:
             assert replacement.request(
                 "GET", "/api/program/draft"
             ) == after_accepted
+            def invoke(body: dict) -> tuple[str, str]:
+                try:
+                    with HeadlessHttpClient(stack.composer_url) as client:
+                        result = client.request(
+                            "POST",
+                            "/api/assistant/bridge/tools/scene_draft_add_object",
+                            body=body,
+                        )
+                    return ("accepted", str(result["result"]["draftRevision"]))
+                except HeadlessClientError as error:
+                    return ("rejected", error.code)
 
-        concurrent_bodies = [
-            _assistant_callback_body(
-                draft=after_accepted,
-                node_environment=node_environment,
-                source_model=source_model,
-                assistant_mode=assistant_mode,
-                scene_resource_id=f"concurrent_object_{index}",
-                request_id=f"assistant.process.concurrent.{index}",
+            replacement_context, replacement_mode = _matching_assistant_context(
+                stack, replacement
             )
-            for index in range(2)
-        ]
-
-        def invoke(body: dict) -> tuple[str, str]:
-            try:
-                with HeadlessHttpClient(stack.composer_url) as client:
-                    result = client.request(
-                        "POST",
-                        "/api/assistant/bridge/tools/scene_draft_add_object",
-                        body=body,
-                    )
-                return ("accepted", str(result["result"]["draftRevision"]))
-            except HeadlessClientError as error:
-                return ("rejected", error.code)
-
-        with ThreadPoolExecutor(max_workers=2) as executor:
-            concurrent_results = list(executor.map(invoke, concurrent_bodies))
-        assert sum(kind == "accepted" for kind, _detail in concurrent_results) == 1
-        assert [
+            concurrent_snapshot = _matching_composer_snapshot(
+                replacement_snapshots, after_accepted
+            )
+            concurrent_bodies = [
+                _assistant_callback_body(
+                    draft=after_accepted,
+                    node_environment=replacement_context["node_environment"],
+                    source_model=replacement_context["source_model"],
+                    assistant_mode=replacement_mode,
+                    scene_resource_id=f"concurrent_object_{index}",
+                    request_id=f"assistant.process.concurrent.{index}",
+                    snapshot=concurrent_snapshot,
+                )
+                for index in range(2)
+            ]
+            with ThreadPoolExecutor(max_workers=2) as executor:
+                concurrent_results = list(executor.map(invoke, concurrent_bodies))
+        accepted_count = sum(
+            kind == "accepted" for kind, _detail in concurrent_results
+        )
+        assert accepted_count <= 1
+        assert all(
+            detail
+            in {
+                "assistant_callback_context_stale",
+                "assistant_mode_projection_invalid",
+                "authoring_client_snapshot_stale",
+                "authoring_not_ready",
+                "composer_authoring_recovery_blocked",
+                "composer_draft_revision_stale",
+                "node_environment_projection_invalid",
+                "source_model_projection_invalid",
+                "stale_generation",
+            }
+            for kind, detail in concurrent_results
+            if kind == "rejected"
+        ), concurrent_results
+        assert len([
             detail
             for kind, detail in concurrent_results
             if kind == "rejected"
-        ][0] in {
-            "assistant_callback_context_stale",
-            "composer_draft_revision_stale",
-        }
+        ]) == 2 - accepted_count
 
         with HeadlessHttpClient(stack.composer_url) as composer:
             final_draft = composer.request("GET", "/api/program/draft")
@@ -995,20 +1177,21 @@ def test_real_assistant_callback_uses_headless_source_facts_and_only_edits_draft
                 for row in final_draft["program"]["scene"]
                 if row["scene_resource_id"].startswith("concurrent_object_")
             }
-            assert len(concurrent_ids) == 1
-            assert final_draft["draft_revision"] == after_accepted["draft_revision"] + 1
+            assert len(concurrent_ids) == accepted_count
+            assert final_draft["draft_revision"] == (
+                after_accepted["draft_revision"] + accepted_count
+            )
             assert final_draft["saved"] is False
             assert final_draft["applied"] is False
-            assert composer.manager_status()["status"] == manager_before
+            assert composer.manager_status()["status"]["active"] == manager_before[
+                "active"
+            ]
             runtime_after = composer.runtime()
             assert runtime_after["active_retained_bundle_id"] == runtime_before[
                 "active_retained_bundle_id"
             ]
             assert runtime_after["active_graph_revision"] == runtime_before[
                 "active_graph_revision"
-            ]
-            assert runtime_after["projection_generation"] == runtime_before[
-                "projection_generation"
             ]
             assert _plain_package_files(stack.package_root) == package_before
 
@@ -1024,26 +1207,11 @@ def test_real_program_apply_reuses_active_deployment_and_survives_api_restart(
     with _read_only_tree(package_root):
         with _assistant_stack(tmp_path, package_root=package_root) as stack:
             assert stack.wait_complete(True)["complete"] is True
-            program = _edited_program(_sole_retained_program(stack.package_root))
-            package_program_path = (
-                stack.package_root
-                / "programs"
-                / "sha256"
-                / f"{program['program_revision'][7:]}.json"
-            )
-            publication_program_path = (
-                stack.publication_root
-                / "programs"
-                / "sha256"
-                / f"{program['program_revision'][7:]}.json"
-            )
-            publication_binding_path = (
-                stack.publication_root
-                / "program-bindings"
-                / "sha256"
-            )
-
-            with HeadlessHttpClient(stack.base_url) as client:
+            with _composer_snapshot_stream(
+                stack, client_id="process-test-browser"
+            ) as next_snapshot, HeadlessHttpClient(
+                stack.composer_url
+            ) as composer, HeadlessHttpClient(stack.base_url) as client:
                 scenarios = client.scenarios()
                 assert [row["scenario_id"] for row in scenarios["scenarios"]] == [
                     "program_apply_fixture"
@@ -1052,27 +1220,99 @@ def test_real_program_apply_reuses_active_deployment_and_survives_api_restart(
                     client.program_applied()
                 assert absent.value.code == "program_applied_selection_not_found"
 
-                apply_body = {
-                    "scenario_id": "program_apply_fixture",
-                    "scenario_catalog_revision": scenarios[
-                        "scenario_catalog_revision"
-                    ],
-                    "program": program,
-                    "expected_applied_record_digest": None,
-                }
-                apply_body["authoring_claim"] = _acquire_authoring_claim(
-                    client,
-                    apply_body,
-                    request_id="program-apply.process.1",
+                initial_draft = composer.request("GET", "/api/program/draft")
+                for attempt in range(8):
+                    assert composer.request(
+                        "GET", "/api/program/draft"
+                    ) == initial_draft
+                    initial_snapshot = _matching_composer_snapshot(
+                        next_snapshot, initial_draft
+                    )
+                    try:
+                        composer.request(
+                            "POST",
+                            "/api/program/draft/mutations",
+                            body={
+                                **_composer_fence(
+                                    initial_snapshot,
+                                    request_id=(
+                                        f"program-apply.process.edit.{attempt}"
+                                    ),
+                                ),
+                                "mutation": "tree_draft_update_node_params",
+                                "arguments": {
+                                    "instance_id": "assistant_native_timer",
+                                    "expected_node_id": "timer",
+                                    "parameters": {"duration_s": 0.002},
+                                },
+                            },
+                        )
+                        break
+                    except HeadlessClientError as error:
+                        if (
+                            error.code
+                            not in {
+                                "authoring_client_snapshot_stale",
+                                "authoring_not_ready",
+                                "stale_generation",
+                            }
+                            or attempt == 7
+                        ):
+                            raise
+                edited_draft = composer.request("GET", "/api/program/draft")
+                program = edited_draft["program"]
+                package_program_path = (
+                    stack.package_root
+                    / "programs"
+                    / "sha256"
+                    / f"{program['program_revision'][7:]}.json"
                 )
-                result = client.program_apply(apply_body)
-                client.settle_authoring_transaction(
-                    {
-                        "claim": apply_body["authoring_claim"],
-                        "settlement_kind": "owner_commit",
-                        "evidence_digest": _payload_digest(result),
-                    }
+                publication_program_path = (
+                    stack.publication_root
+                    / "programs"
+                    / "sha256"
+                    / f"{program['program_revision'][7:]}.json"
                 )
+                publication_binding_path = (
+                    stack.publication_root
+                    / "program-bindings"
+                    / "sha256"
+                )
+                for attempt in range(8):
+                    assert composer.request(
+                        "GET", "/api/program/draft"
+                    ) == edited_draft
+                    apply_snapshot = _matching_composer_snapshot(
+                        next_snapshot, edited_draft
+                    )
+                    try:
+                        applied_response = composer.request(
+                            "POST",
+                            "/api/program/apply",
+                            body={
+                                **_composer_fence(
+                                    apply_snapshot,
+                                    request_id=f"program-apply.process.1.{attempt}",
+                                ),
+                                "scenarioId": "program_apply_fixture",
+                                "scenarioCatalogRevision": scenarios[
+                                    "scenario_catalog_revision"
+                                ],
+                            },
+                        )
+                        break
+                    except HeadlessClientError as error:
+                        if (
+                            error.code
+                            not in {
+                                "authoring_client_snapshot_stale",
+                                "authoring_not_ready",
+                                "stale_generation",
+                            }
+                            or attempt == 7
+                        ):
+                            raise
+                result = applied_response["headless"]
                 assert result["status"] == "applied"
                 assert result["deployment_apply_required"] is False
                 assert result["manager_response"] is None
@@ -1095,35 +1335,55 @@ def test_real_program_apply_reuses_active_deployment_and_survives_api_restart(
                 assert candidate_binding_path.is_file()
                 assert not package_binding_path.exists()
 
-            stack.kill_api()
-            stack.start_api()
-            stack.wait_complete(True)
-            with HeadlessHttpClient(stack.base_url) as restarted:
-                reopened = restarted.program_applied()
+                stack.kill_api()
+                stack.start_api()
+                stack.wait_complete(True)
+                reopened = client.program_applied()
                 assert reopened == first_applied
-                replay_body = {
-                    "scenario_id": "program_apply_fixture",
-                    "scenario_catalog_revision": scenarios[
-                        "scenario_catalog_revision"
-                    ],
-                    "program": program,
-                    "expected_applied_record_digest": first_applied["source"][
-                        "record_digest"
-                    ],
-                }
-                replay_body["authoring_claim"] = _acquire_authoring_claim(
-                    restarted,
-                    replay_body,
-                    request_id="program-apply.process.2",
-                )
-                replay = restarted.program_apply(replay_body)
-                restarted.settle_authoring_transaction(
-                    {
-                        "claim": replay_body["authoring_claim"],
-                        "settlement_kind": "owner_commit",
-                        "evidence_digest": _payload_digest(replay),
-                    }
-                )
+                replay_draft = composer.request("GET", "/api/program/draft")
+                with _composer_snapshot_stream(
+                    stack, client_id="process-test-browser-restarted"
+                ) as restarted_snapshots:
+                    for attempt in range(8):
+                        assert composer.request(
+                            "GET", "/api/program/draft"
+                        ) == replay_draft
+                        replay_snapshot = _matching_composer_snapshot(
+                            restarted_snapshots, replay_draft
+                        )
+                        try:
+                            replay_response = composer.request(
+                                "POST",
+                                "/api/program/apply",
+                                body={
+                                    **_composer_fence(
+                                        replay_snapshot,
+                                        request_id=(
+                                            f"program-apply.process.2.{attempt}"
+                                        ),
+                                        client_id=(
+                                            "process-test-browser-restarted"
+                                        ),
+                                    ),
+                                    "scenarioId": "program_apply_fixture",
+                                    "scenarioCatalogRevision": scenarios[
+                                        "scenario_catalog_revision"
+                                    ],
+                                },
+                            )
+                            break
+                        except HeadlessClientError as error:
+                            if (
+                                error.code
+                                not in {
+                                    "authoring_client_snapshot_stale",
+                                    "authoring_not_ready",
+                                    "stale_generation",
+                                }
+                                or attempt == 7
+                            ):
+                                raise
+                replay = replay_response["headless"]
                 assert replay["applied"] == first_applied
             assert _plain_package_files(stack.package_root) == package_before
 

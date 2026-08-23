@@ -478,6 +478,10 @@ TEST(NativeExecutionRuntimeUnitAdmission,
   EXPECT_EQ(admission->installed_target_id(), contract::kInstalledTargetId);
   EXPECT_EQ(admission->implementation_revision(),
             contract::implementation_revision());
+  EXPECT_EQ(admission->implementation_revision(),
+            "sha256:003f915c030a96347ca9f79ac4fe6fd8ead5baec3790e9b44377e1eaad6dc400");
+  EXPECT_EQ(fixture.query->plan.process_adapter_contract_revision,
+            "sha256:c5ee4ce0842e61b38da1c34e3979244896ae40461b5d6bb0fe3e1e81aac10186");
   EXPECT_EQ(admission->runtime_contract_offer_digest(),
             fixture.query->plan.runtime_contract_offer_digest.value());
   const core::RuntimeEpoch packet_epoch("native-runtime-test-epoch");
@@ -1130,7 +1134,7 @@ TEST(RetainedNativeRuntimeUnitAdapter,
   ASSERT_FALSE(released_claim.ok());
   EXPECT_EQ(released_claim.error().code, "authoring_not_ready");
   EXPECT_EQ(released_claim.error().details.at("reason"),
-            "settlement_validator_unavailable");
+            "settlement_not_proven");
 
   const auto physical_scope = PhysicalConfigurationScope(fixture);
   const core::RuntimeEpoch manager_epoch(

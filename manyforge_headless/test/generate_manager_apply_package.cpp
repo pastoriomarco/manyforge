@@ -234,6 +234,7 @@ struct ProgramPublication final {
       {"program_profile", deployment::CanonicalValue("composable-cell-v1")},
       {"program_revision",
        deployment::CanonicalValue(std::string(kZeroDigest))},
+      {"scene", deployment::CanonicalValue(deployment::CanonicalValue::Array{})},
       {"target_roles",
        deployment::CanonicalValue(deployment::CanonicalValue::Object{
            {"arm",

@@ -379,6 +379,7 @@ struct HostConfig final {
 
 struct ManagedRuntimeChildConfig final {
   int manager_channel_fd{-1};
+  int manager_liveness_channel_fd{-1};
   int package_root_fd{-1};
   std::filesystem::path package_root;
   std::filesystem::path manager_state_root;
@@ -440,6 +441,8 @@ ParseManagedRuntimeArguments(const int argc, char **argv) {
             "duplicate managed runtime option " + option);
     if (option == "--manyforge-managed-runtime-channel-fd") {
       config.manager_channel_fd = ParseFileDescriptor(value);
+    } else if (option == "--manyforge-managed-liveness-channel-fd") {
+      config.manager_liveness_channel_fd = ParseFileDescriptor(value);
     } else if (option == "--manyforge-managed-package-root-fd") {
       config.package_root_fd = ParseFileDescriptor(value);
     } else if (option == "--manyforge-managed-manager-state-root") {
@@ -473,8 +476,10 @@ ParseManagedRuntimeArguments(const int argc, char **argv) {
       Fail("unknown managed runtime option " + option);
     }
   }
-  Require(seen.size() >= 12U && seen.size() <= 15U &&
+  Require(seen.size() >= 13U && seen.size() <= 16U &&
               config.manager_channel_fd >= 0 &&
+              config.manager_liveness_channel_fd >= 0 &&
+              config.manager_liveness_channel_fd != config.manager_channel_fd &&
               config.package_root_fd == kManagedPackageRootFd &&
               config.program_cycle_journal.empty() ==
                   config.authoring_transaction_journal.empty(),
@@ -533,23 +538,29 @@ ParseManagedRuntimeArguments(const int argc, char **argv) {
   config.candidate_worker = ExistingRegularFile(
       std::move(config.candidate_worker), "managed candidate worker", true);
 
-  struct stat status {};
-  int socket_type = 0;
-  socklen_t socket_type_size = sizeof(socket_type);
-  ucred credentials{};
-  socklen_t credentials_size = sizeof(credentials);
-  Require(::fstat(config.manager_channel_fd, &status) == 0 &&
-              S_ISSOCK(status.st_mode) &&
-              ::getsockopt(config.manager_channel_fd, SOL_SOCKET, SO_TYPE,
-                           &socket_type, &socket_type_size) == 0 &&
-              socket_type_size == sizeof(socket_type) &&
-              socket_type == SOCK_SEQPACKET &&
-              ::getsockopt(config.manager_channel_fd, SOL_SOCKET, SO_PEERCRED,
-                           &credentials, &credentials_size) == 0 &&
-              credentials_size == sizeof(credentials) &&
-              credentials.uid == ::geteuid() && credentials.pid == ::getppid(),
-          "managed runtime channel is not the direct same-user parent "
-          "channel");
+  const auto require_parent_channel = [](const int descriptor,
+                                         const std::string_view label) {
+    struct stat status {};
+    int socket_type = 0;
+    socklen_t socket_type_size = sizeof(socket_type);
+    ucred credentials{};
+    socklen_t credentials_size = sizeof(credentials);
+    Require(::fstat(descriptor, &status) == 0 && S_ISSOCK(status.st_mode) &&
+                ::getsockopt(descriptor, SOL_SOCKET, SO_TYPE, &socket_type,
+                             &socket_type_size) == 0 &&
+                socket_type_size == sizeof(socket_type) &&
+                socket_type == SOCK_SEQPACKET &&
+                ::getsockopt(descriptor, SOL_SOCKET, SO_PEERCRED,
+                             &credentials, &credentials_size) == 0 &&
+                credentials_size == sizeof(credentials) &&
+                credentials.uid == ::geteuid() &&
+                credentials.pid == ::getppid(),
+            std::string(label) +
+                " is not the direct same-user parent channel");
+  };
+  require_parent_channel(config.manager_channel_fd, "managed runtime channel");
+  require_parent_channel(config.manager_liveness_channel_fd,
+                         "managed runtime liveness channel");
   return config;
 }
 
@@ -4973,16 +4984,13 @@ BuildProductComposition(CompositionBuildInput input) {
   const auto manager_apply_journal =
       input.manager_state_root /
       std::string(component_manager::kManagerApplyJournalFilename);
-  if (!input.program_cycle_journal.empty() &&
-      !input.authoring_transaction_journal.empty()) {
-    runtime_config.cell_admission_settlement_validator =
-        BuildOwnerSettlementValidator(
-            manager_apply_journal, input.logical_scene_database,
-            input.program_cycle_journal, input.authoring_transaction_journal,
-            input.execution_state_root /
-                std::string(core::kCCLCJournalFilename),
-            input.cell_id);
-  }
+  runtime_config.cell_admission_settlement_validator =
+      BuildOwnerSettlementValidator(
+          manager_apply_journal, input.logical_scene_database,
+          input.program_cycle_journal, input.authoring_transaction_journal,
+          input.execution_state_root /
+              std::string(core::kCCLCJournalFilename),
+          input.cell_id);
   runtime_config.cell_admission_reconcile_validator =
       BuildOwnerReconciliationValidator(
           input.program_cycle_journal, input.authoring_transaction_journal,
@@ -5881,23 +5889,21 @@ RunManagedRuntimeChild(const ManagedRuntimeChildConfig &config) {
           config.program_cycle_journal, config.authoring_transaction_journal,
           config.staging_root / std::string(core::kCCLCJournalFilename),
           core::CellId(config.cell_id));
-  if (!config.program_cycle_journal.empty() &&
-      !config.authoring_transaction_journal.empty()) {
-    bootstrap_kernel_config.cell_admission_settlement_validator =
-        BuildOwnerSettlementValidator(
-            config.manager_state_root /
-                std::string(
-                    component_manager::kManagerApplyJournalFilename),
-            config.logical_scene_database, config.program_cycle_journal,
-            config.authoring_transaction_journal,
-            config.staging_root / std::string(core::kCCLCJournalFilename),
-            core::CellId(config.cell_id));
-  }
+  bootstrap_kernel_config.cell_admission_settlement_validator =
+      BuildOwnerSettlementValidator(
+          config.manager_state_root /
+              std::string(
+                  component_manager::kManagerApplyJournalFilename),
+          config.logical_scene_database, config.program_cycle_journal,
+          config.authoring_transaction_journal,
+          config.staging_root / std::string(core::kCCLCJournalFilename),
+          core::CellId(config.cell_id));
   detached_addressed_kernel =
       std::make_unique<core::ResourceAddressedExecutionKernel>(
           std::vector<core::RuntimeParticipantExecutionRegistration>{},
           *detached_owner_clock, *detached_operation_journal,
           std::move(bootstrap_kernel_config));
+  auto *const stable_kernel_owner = detached_addressed_kernel.get();
   admission_gate.BindResourceTable(
       detached_addressed_kernel->resource_admission_table());
   fence_owner.BindDisableHandoffKernel(*detached_addressed_kernel);
@@ -5908,6 +5914,7 @@ RunManagedRuntimeChild(const ManagedRuntimeChildConfig &config) {
           std::make_shared<WallClock>(),
           std::make_unique<SimpleScheduler>(
               SimpleSchedulerConfig::from_environment()));
+  std::atomic<bool> manager_liveness_installed{false};
   std::optional<core::ManagerLivenessReceiverConfig>
       manager_liveness_receiver_config;
   std::optional<core::ActiveBundlePublicationGeneration>
@@ -5945,6 +5952,16 @@ RunManagedRuntimeChild(const ManagedRuntimeChildConfig &config) {
       installed_under_fence_composition_request;
   std::optional<component_manager::ManagerSelectedRuntimeCompositionRequestDTO>
       installed_composition_request;
+  std::atomic<std::shared_ptr<const component_manager::
+                                  ManagerSelectedRuntimeCompositionRequestDTO>>
+      installed_liveness_handoff;
+  const auto publish_installed_liveness_handoff = [&](const auto &request) {
+    installed_liveness_handoff.store(
+        std::make_shared<const component_manager::
+                             ManagerSelectedRuntimeCompositionRequestDTO>(
+            request),
+        std::memory_order_release);
+  };
   std::exception_ptr managed_composition_failure;
   std::jthread current_composition_builder;
   bool current_composition_builder_started = false;
@@ -5972,7 +5989,7 @@ RunManagedRuntimeChild(const ManagedRuntimeChildConfig &config) {
   };
 
   const auto await_manager_loss_containment = [&] {
-    if (manager_liveness_receiver.get() == nullptr) {
+    if (!manager_liveness_installed.load(std::memory_order_acquire)) {
       return;
     }
     while (g_stop_requested == 0 &&
@@ -6163,6 +6180,7 @@ RunManagedRuntimeChild(const ManagedRuntimeChildConfig &config) {
             if (successor_bundle->value()
                     .cell_graph.controllable_components.empty()) {
               installed_composition_request = request;
+              publish_installed_liveness_handoff(request);
               return {request,
                       component_manager::
                           ManagerSelectedRuntimeCompositionState::kInstalled};
@@ -6181,6 +6199,7 @@ RunManagedRuntimeChild(const ManagedRuntimeChildConfig &config) {
                   "recovered active composition differs from the published "
                   "Apply successor");
           installed_composition_request = request;
+          publish_installed_liveness_handoff(request);
           return {request,
                   component_manager::ManagerSelectedRuntimeCompositionState::
                       kInstalled};
@@ -6201,6 +6220,7 @@ RunManagedRuntimeChild(const ManagedRuntimeChildConfig &config) {
                 "installed runtime composition changed during fence "
                 "reconciliation");
         installed_composition_request = request;
+        publish_installed_liveness_handoff(request);
         installed_under_fence_composition_request.reset();
         preparing_composition_request.reset();
       }
@@ -6420,6 +6440,7 @@ RunManagedRuntimeChild(const ManagedRuntimeChildConfig &config) {
               "installed runtime composition changed before fence "
               "reconciliation completed");
       installed_composition_request = request;
+      publish_installed_liveness_handoff(request);
       installed_under_fence_composition_request.reset();
     }
     try_release_retired_composition();
@@ -6428,7 +6449,281 @@ RunManagedRuntimeChild(const ManagedRuntimeChildConfig &config) {
         component_manager::ManagerSelectedRuntimeCompositionState::kInstalled};
   };
 
+  const auto handle_manager_liveness = [&](const std::string_view packet) {
+    const auto decoded =
+        component_manager::detail::DecodeManagerLivenessRpcRequest(packet);
+    const auto required = std::find_if(
+        decoded.required_set.required_receivers.begin(),
+        decoded.required_set.required_receivers.end(), [&](const auto &row) {
+          return row.runtime_unit_id.value() == config.runtime_unit_id;
+        });
+    Require(required != decoded.required_set.required_receivers.end() &&
+                decoded.required_set.cell_id.value() == config.cell_id &&
+                decoded.receiver_runtime_unit_id == required->runtime_unit_id &&
+                required->runtime_epoch.value() == config.runtime_epoch,
+            "Manager liveness request names a foreign receiver");
+    Require(decoded.policy ==
+                    deployment::native_execution_runtime_contract::
+                        manager_liveness_policy() &&
+                required->runtime_policy_id ==
+                    decoded.policy.runtime_policy_id &&
+                required->runtime_policy_revision ==
+                    decoded.policy.runtime_policy_revision,
+            "Manager liveness request differs from retained policy");
+
+    const auto request_matches_publication = [&](const auto &publication) {
+      return publication.publication_generation ==
+                 decoded.active_publication_generation &&
+             publication.request.candidate_retained_bundle_id ==
+                 decoded.required_set.active_bundle_id &&
+             publication.request.candidate_graph_revision ==
+                 decoded.active_graph_revision &&
+             publication.durable_public_pointer_content_digest ==
+                 decoded.active_public_pointer_digest;
+    };
+    const auto require_durable_current_publication = [&]() {
+      auto publication = read_current_publication();
+      if (!request_matches_publication(publication) &&
+          decoded.active_publication_generation.value() <
+              publication.publication_generation.value()) {
+        return std::optional<core::ActiveBundlePublicationReceiptDTO>{};
+      }
+      Require(request_matches_publication(publication),
+              "Manager liveness request has foreign active-publication "
+              "identity");
+      return std::optional<core::ActiveBundlePublicationReceiptDTO>(
+          std::move(publication));
+    };
+
+    const core::ManagerLivenessReceiverConfig receiver_config{
+        decoded.required_set.cell_id,
+        required->runtime_unit_id,
+        required->runtime_epoch,
+        decoded.required_set.manager_runtime_unit_id,
+        decoded.required_set.manager_runtime_epoch,
+        decoded.required_set.manager_owner_epoch,
+        decoded.policy,
+        decoded.required_set.active_bundle_id,
+        decoded.required_set.required_runtime_set_digest};
+    if (manager_liveness_receiver.get() == nullptr) {
+      if (!require_durable_current_publication().has_value()) {
+        return component_manager::detail::EncodeManagerLivenessRpcRejection(
+            "superseded_active_publication");
+      }
+      const auto installed =
+          stable_kernel_owner->ReplaceManagerLivenessRequiredSet(
+              decoded.required_set);
+      Require(installed.ok(),
+              "Kernel rejected the exact Manager-liveness required set");
+      manager_liveness_receiver.Install(
+          receiver_config,
+          [&manager_liveness_admission](
+              const core::ManagerLivenessLossIntentDTO &intent) {
+            return manager_liveness_admission.CloseAndAttest(intent);
+          },
+          *stable_kernel_owner, *stable_kernel_owner);
+      manager_liveness_installed.store(true, std::memory_order_release);
+      manager_liveness_receiver_config = receiver_config;
+      manager_liveness_publication_generation =
+          decoded.active_publication_generation;
+      manager_liveness_public_pointer_digest =
+          decoded.active_public_pointer_digest;
+      manager_liveness_required_set = decoded.required_set;
+    } else {
+      Require(manager_liveness_receiver_config.has_value() &&
+                  manager_liveness_receiver_config->cell_id ==
+                      receiver_config.cell_id &&
+                  manager_liveness_receiver_config->receiver_runtime_unit_id ==
+                      receiver_config.receiver_runtime_unit_id &&
+                  manager_liveness_receiver_config->receiver_runtime_epoch ==
+                      receiver_config.receiver_runtime_epoch &&
+                  manager_liveness_receiver_config->policy ==
+                      receiver_config.policy &&
+                  manager_liveness_receiver_config->manager_runtime_unit_id ==
+                      receiver_config.manager_runtime_unit_id &&
+                  manager_liveness_publication_generation.has_value() &&
+                  manager_liveness_public_pointer_digest.has_value(),
+              "Manager liveness request changed immutable receiver evidence");
+      const bool publication_changed =
+          *manager_liveness_publication_generation !=
+              decoded.active_publication_generation ||
+          *manager_liveness_public_pointer_digest !=
+              decoded.active_public_pointer_digest;
+      Require(!publication_changed ||
+                  (manager_liveness_receiver_config->manager_runtime_epoch ==
+                       receiver_config.manager_runtime_epoch &&
+                   manager_liveness_receiver_config->manager_owner_epoch ==
+                       receiver_config.manager_owner_epoch),
+              "Manager liveness publication rebind changed Manager identity");
+      if (manager_liveness_receiver_config->manager_runtime_epoch !=
+              receiver_config.manager_runtime_epoch ||
+          manager_liveness_receiver_config->manager_owner_epoch !=
+              receiver_config.manager_owner_epoch) {
+        const auto candidate_epoch = std::pair{
+            receiver_config.manager_runtime_epoch.value(),
+            receiver_config.manager_owner_epoch.value()};
+        Require(!retired_manager_epochs.contains(candidate_epoch),
+                "stale Manager epoch cannot replace the current Manager");
+        Require(retired_manager_epochs.size() < 64U,
+                "Manager epoch replacement history is exhausted");
+        retired_manager_epochs.emplace(
+            manager_liveness_receiver_config->manager_runtime_epoch.value(),
+            manager_liveness_receiver_config->manager_owner_epoch.value());
+        const auto replaced =
+            manager_liveness_receiver.get()->BeginManagerEpochReplacement(
+                receiver_config.manager_runtime_unit_id,
+                receiver_config.manager_runtime_epoch,
+                receiver_config.manager_owner_epoch);
+        Require(replaced.ok(),
+                "Manager liveness epoch replacement was rejected");
+        manager_liveness_receiver_config->manager_runtime_unit_id =
+            receiver_config.manager_runtime_unit_id;
+        manager_liveness_receiver_config->manager_runtime_epoch =
+            receiver_config.manager_runtime_epoch;
+        manager_liveness_receiver_config->manager_owner_epoch =
+            receiver_config.manager_owner_epoch;
+      }
+      if (publication_changed) {
+        const auto current_publication = require_durable_current_publication();
+        if (!current_publication.has_value()) {
+          return component_manager::detail::EncodeManagerLivenessRpcRejection(
+              "superseded_active_publication");
+        }
+        const auto installed_request =
+            installed_liveness_handoff.load(std::memory_order_acquire);
+        const auto *const named =
+            std::get_if<core::NamedApplyPublicationTransactionDTO>(
+                &current_publication->request.transaction_ref);
+        Require(named != nullptr && installed_request != nullptr &&
+                    installed_request->apply_id == named->apply_id &&
+                    installed_request->apply_generation ==
+                        named->apply_generation &&
+                    installed_request->projection_stage_generation ==
+                        named->projection_stage_generation &&
+                    installed_request->candidate_projection_revision ==
+                        current_publication->request
+                            .candidate_projection_revision &&
+                    installed_request->runtime_unit_id ==
+                        required->runtime_unit_id &&
+                    installed_request->runtime_epoch == required->runtime_epoch &&
+                    installed_request->manager_runtime_epoch ==
+                        receiver_config.manager_runtime_epoch &&
+                    installed_request
+                                ->expected_predecessor_publication_generation
+                                .value() +
+                            1U ==
+                        current_publication->publication_generation.value(),
+                "Manager liveness successor lacks exact installed composition "
+                "evidence");
+        manager_liveness_admission.CloseForRequiredSetRebind();
+        const auto installed =
+            stable_kernel_owner->ReplaceManagerLivenessRequiredSet(
+                decoded.required_set);
+        Require(installed.ok(),
+                "Kernel rejected the successor Manager-liveness required set");
+        const auto rebound =
+            manager_liveness_receiver.get()->RebindRequiredSet(
+                receiver_config.active_bundle_id,
+                receiver_config.required_runtime_set_digest);
+        Require(rebound.ok(),
+                "Manager-liveness receiver rejected the successor required-set "
+                "rebind");
+        manager_liveness_receiver_config->active_bundle_id =
+            receiver_config.active_bundle_id;
+        manager_liveness_receiver_config->required_runtime_set_digest =
+            receiver_config.required_runtime_set_digest;
+        manager_liveness_required_set = decoded.required_set;
+        manager_liveness_publication_generation =
+            decoded.active_publication_generation;
+        manager_liveness_public_pointer_digest =
+            decoded.active_public_pointer_digest;
+      } else {
+        Require(manager_liveness_required_set.has_value() &&
+                    *manager_liveness_required_set == decoded.required_set &&
+                    manager_liveness_receiver_config->active_bundle_id ==
+                        receiver_config.active_bundle_id &&
+                    manager_liveness_receiver_config
+                            ->required_runtime_set_digest ==
+                        receiver_config.required_runtime_set_digest,
+                "Manager liveness request changed required-set identity "
+                "without a publication transition");
+      }
+    }
+    const auto admission_generation = manager_liveness_admission.generation();
+    const auto renewed =
+        manager_liveness_receiver.get()->Renew(decoded.heartbeat);
+    Require(renewed.ok(), "Manager heartbeat renewal was rejected");
+    if (decoded.reconciliation.has_value() &&
+        manager_liveness_receiver.get()->status().command_fenced) {
+      const auto reconciled =
+          manager_liveness_receiver.get()->CompleteReconciliation(
+              *decoded.reconciliation);
+      Require(reconciled.ok(),
+              "Manager liveness reconciliation was rejected");
+    }
+    const auto status = manager_liveness_receiver.get()->status();
+    if (status.state == core::ManagerLivenessStateDTO::kCurrent &&
+        !status.command_fenced) {
+      manager_liveness_admission.OpenIfUnchanged(admission_generation);
+    }
+    return component_manager::detail::EncodeManagerLivenessRpcResponse(
+        core::ManagerLivenessObservationDTO{
+            status, decoded.required_set.active_bundle_id,
+            decoded.required_set.required_runtime_set_digest,
+            core::ComputeManagerLivenessStatusDigest(status)});
+  };
+
+  std::mutex manager_liveness_failure_mutex;
+  std::exception_ptr manager_liveness_failure;
+  const auto rethrow_manager_liveness_failure = [&] {
+    std::lock_guard lock(manager_liveness_failure_mutex);
+    if (manager_liveness_failure != nullptr) {
+      std::rethrow_exception(manager_liveness_failure);
+    }
+  };
+  std::jthread manager_liveness_lane([&](const std::stop_token stop_token) {
+    try {
+      while (!stop_token.stop_requested()) {
+        pollfd descriptor{config.manager_liveness_channel_fd,
+                          POLLIN | POLLHUP, 0};
+        int ready = -1;
+        do {
+          ready = ::poll(&descriptor, 1U, 100);
+        } while (ready < 0 && errno == EINTR &&
+                 !stop_token.stop_requested());
+        Require(ready >= 0,
+                "poll managed runtime liveness channel failed");
+        if (ready == 0) {
+          continue;
+        }
+        if ((descriptor.revents & POLLHUP) != 0 &&
+            (descriptor.revents & POLLIN) == 0) {
+          return;
+        }
+        Require((descriptor.revents & (POLLERR | POLLNVAL)) == 0,
+                "managed runtime liveness channel became invalid");
+        const auto packet =
+            ReceiveManagedRuntimePacket(config.manager_liveness_channel_fd);
+        if (!packet.has_value()) {
+          return;
+        }
+        Require(component_manager::detail::IsManagerLivenessRpcPacket(*packet),
+                "dedicated Manager-liveness channel received another "
+                "protocol");
+        SendManagedRuntimePacket(config.manager_liveness_channel_fd,
+                                 handle_manager_liveness(*packet));
+      }
+    } catch (...) {
+      {
+        std::lock_guard lock(manager_liveness_failure_mutex);
+        manager_liveness_failure = std::current_exception();
+      }
+      static_cast<void>(::shutdown(config.manager_channel_fd, SHUT_RDWR));
+    }
+  });
+
   while (g_stop_requested == 0) {
+    rethrow_manager_liveness_failure();
     rethrow_composition_failure();
     try_start_current_composition();
     try_release_retired_composition();
@@ -6461,6 +6756,7 @@ RunManagedRuntimeChild(const ManagedRuntimeChildConfig &config) {
     }
     const auto packet = ReceiveManagedRuntimePacket(config.manager_channel_fd);
     if (!packet.has_value()) {
+      rethrow_manager_liveness_failure();
       await_manager_loss_containment();
       return 0;
     }
@@ -6490,260 +6786,8 @@ RunManagedRuntimeChild(const ManagedRuntimeChildConfig &config) {
       return 0;
     }
     if (component_manager::detail::IsManagerLivenessRpcPacket(request)) {
-      const auto decoded =
-          component_manager::detail::DecodeManagerLivenessRpcRequest(request);
-      const auto required = std::find_if(
-          decoded.required_set.required_receivers.begin(),
-          decoded.required_set.required_receivers.end(),
-          [&](const auto& row) {
-            return row.runtime_unit_id.value() == config.runtime_unit_id;
-          });
-      Require(required != decoded.required_set.required_receivers.end() &&
-                  decoded.required_set.cell_id.value() == config.cell_id &&
-                  decoded.receiver_runtime_unit_id == required->runtime_unit_id &&
-                  required->runtime_epoch.value() == config.runtime_epoch,
-              "Manager liveness request names a foreign receiver");
-      Require(decoded.policy ==
-                  deployment::native_execution_runtime_contract::
-                      manager_liveness_policy() &&
-                  required->runtime_policy_id ==
-                      decoded.policy.runtime_policy_id &&
-                  required->runtime_policy_revision ==
-                      decoded.policy.runtime_policy_revision,
-              "Manager liveness request differs from retained policy");
-      std::lock_guard lock(managed_composition_mutex);
-      auto* const kernel = stable_addressed_kernel();
-      if (kernel == nullptr) {
-        const core::ManagerLivenessStatusDTO pending_status{
-            decoded.required_set.cell_id,
-            required->runtime_unit_id,
-            required->runtime_epoch,
-            decoded.required_set.manager_runtime_unit_id,
-            decoded.required_set.manager_runtime_epoch,
-            decoded.required_set.manager_owner_epoch,
-            decoded.policy.runtime_policy_id,
-            decoded.policy.runtime_policy_revision,
-            0U,
-            1U,
-            0,
-            core::ManagerLivenessStateDTO::kUnreconciled,
-            true,
-            std::nullopt};
-        SendManagedRuntimePacket(
-            config.manager_channel_fd,
-            component_manager::detail::EncodeManagerLivenessRpcResponse(
-                core::ManagerLivenessObservationDTO{
-                    pending_status,
-                    decoded.required_set.active_bundle_id,
-                    decoded.required_set.required_runtime_set_digest,
-                    core::ComputeManagerLivenessStatusDigest(
-                        pending_status)}));
-        continue;
-      }
-      const auto current_publication = read_current_publication();
-      const bool request_is_current_publication =
-          current_publication.publication_generation ==
-              decoded.active_publication_generation &&
-          current_publication.request.candidate_retained_bundle_id ==
-              decoded.required_set.active_bundle_id &&
-          current_publication.request.candidate_graph_revision ==
-              decoded.active_graph_revision &&
-          current_publication.durable_public_pointer_content_digest ==
-              decoded.active_public_pointer_digest;
-      if (!request_is_current_publication &&
-          decoded.active_publication_generation.value() <
-              current_publication.publication_generation.value()) {
-        // Manager snapshots and the active-publication commit are independent
-        // durable reads. A renewal minted immediately before that commit may
-        // therefore arrive after it. It is stale and must not renew, install,
-        // or reconcile anything, but this expected race is not a child-fatal
-        // protocol violation—even when it precedes the first accepted renewal.
-        SendManagedRuntimePacket(
-            config.manager_channel_fd,
-            component_manager::detail::EncodeManagerLivenessRpcRejection(
-                "superseded_active_publication"));
-        continue;
-      }
-      Require(request_is_current_publication,
-              "Manager liveness request has foreign active-publication "
-              "identity");
-      const core::ManagerLivenessReceiverConfig receiver_config{
-          decoded.required_set.cell_id,
-          required->runtime_unit_id,
-          required->runtime_epoch,
-          decoded.required_set.manager_runtime_unit_id,
-          decoded.required_set.manager_runtime_epoch,
-          decoded.required_set.manager_owner_epoch,
-          decoded.policy,
-          decoded.required_set.active_bundle_id,
-          decoded.required_set.required_runtime_set_digest};
-      if (manager_liveness_receiver.get() == nullptr) {
-        const auto installed =
-            kernel->ReplaceManagerLivenessRequiredSet(decoded.required_set);
-        Require(installed.ok(),
-                "Kernel rejected the exact Manager-liveness required set");
-        manager_liveness_receiver.Install(
-            receiver_config,
-            [&manager_liveness_admission](
-                const core::ManagerLivenessLossIntentDTO& intent) {
-              return manager_liveness_admission.CloseAndAttest(intent);
-            },
-            *kernel, *kernel);
-        manager_liveness_receiver_config = receiver_config;
-        manager_liveness_publication_generation =
-            decoded.active_publication_generation;
-        manager_liveness_public_pointer_digest =
-            decoded.active_public_pointer_digest;
-        manager_liveness_required_set = decoded.required_set;
-      } else {
-        Require(manager_liveness_receiver_config.has_value() &&
-                    manager_liveness_receiver_config->cell_id ==
-                        receiver_config.cell_id &&
-                    manager_liveness_receiver_config
-                            ->receiver_runtime_unit_id ==
-                        receiver_config.receiver_runtime_unit_id &&
-                    manager_liveness_receiver_config->receiver_runtime_epoch ==
-                        receiver_config.receiver_runtime_epoch &&
-                    manager_liveness_receiver_config->policy ==
-                        receiver_config.policy &&
-                    manager_liveness_receiver_config
-                            ->manager_runtime_unit_id ==
-                        receiver_config.manager_runtime_unit_id &&
-                    manager_liveness_publication_generation.has_value() &&
-                    manager_liveness_public_pointer_digest.has_value(),
-                "Manager liveness request changed immutable receiver evidence");
-        const bool publication_changed =
-            *manager_liveness_publication_generation !=
-                decoded.active_publication_generation ||
-            *manager_liveness_public_pointer_digest !=
-                decoded.active_public_pointer_digest;
-        Require(!publication_changed ||
-                    (manager_liveness_receiver_config
-                             ->manager_runtime_epoch ==
-                         receiver_config.manager_runtime_epoch &&
-                     manager_liveness_receiver_config->manager_owner_epoch ==
-                         receiver_config.manager_owner_epoch),
-                "Manager liveness publication rebind changed Manager "
-                "identity");
-        if (manager_liveness_receiver_config->manager_runtime_epoch !=
-                receiver_config.manager_runtime_epoch ||
-            manager_liveness_receiver_config->manager_owner_epoch !=
-                receiver_config.manager_owner_epoch) {
-          const auto candidate_epoch = std::pair{
-              receiver_config.manager_runtime_epoch.value(),
-              receiver_config.manager_owner_epoch.value()};
-          Require(!retired_manager_epochs.contains(candidate_epoch),
-                  "stale Manager epoch cannot replace the current Manager");
-          Require(retired_manager_epochs.size() < 64U,
-                  "Manager epoch replacement history is exhausted");
-          retired_manager_epochs.emplace(
-              manager_liveness_receiver_config->manager_runtime_epoch.value(),
-              manager_liveness_receiver_config->manager_owner_epoch.value());
-          const auto replaced =
-              manager_liveness_receiver.get()->BeginManagerEpochReplacement(
-                  receiver_config.manager_runtime_unit_id,
-                  receiver_config.manager_runtime_epoch,
-                  receiver_config.manager_owner_epoch);
-          Require(replaced.ok(),
-                  "Manager liveness epoch replacement was rejected");
-          manager_liveness_receiver_config->manager_runtime_unit_id =
-              receiver_config.manager_runtime_unit_id;
-          manager_liveness_receiver_config->manager_runtime_epoch =
-              receiver_config.manager_runtime_epoch;
-          manager_liveness_receiver_config->manager_owner_epoch =
-              receiver_config.manager_owner_epoch;
-        }
-        if (publication_changed) {
-          const auto* const named =
-              std::get_if<core::NamedApplyPublicationTransactionDTO>(
-                  &current_publication.request.transaction_ref);
-          Require(named != nullptr &&
-                      installed_composition_request.has_value() &&
-                      installed_composition_request->apply_id ==
-                          named->apply_id &&
-                      installed_composition_request->apply_generation ==
-                          named->apply_generation &&
-                      installed_composition_request
-                              ->projection_stage_generation ==
-                          named->projection_stage_generation &&
-                      installed_composition_request
-                              ->candidate_projection_revision ==
-                          current_publication.request
-                              .candidate_projection_revision &&
-                      installed_composition_request->runtime_unit_id ==
-                          required->runtime_unit_id &&
-                      installed_composition_request->runtime_epoch ==
-                          required->runtime_epoch &&
-                      installed_composition_request->manager_runtime_epoch ==
-                          receiver_config.manager_runtime_epoch &&
-                      installed_composition_request
-                                  ->expected_predecessor_publication_generation
-                                  .value() +
-                              1U ==
-                          current_publication.publication_generation.value(),
-                  "Manager liveness successor lacks exact installed "
-                  "composition evidence");
-          manager_liveness_admission.CloseForRequiredSetRebind();
-          const auto installed =
-              kernel->ReplaceManagerLivenessRequiredSet(decoded.required_set);
-          Require(installed.ok(),
-                  "Kernel rejected the successor Manager-liveness required "
-                  "set");
-          const auto rebound =
-              manager_liveness_receiver.get()->RebindRequiredSet(
-                  receiver_config.active_bundle_id,
-                  receiver_config.required_runtime_set_digest);
-          Require(rebound.ok(),
-                  "Manager-liveness receiver rejected the successor "
-                  "required-set rebind");
-          manager_liveness_receiver_config->active_bundle_id =
-              receiver_config.active_bundle_id;
-          manager_liveness_receiver_config->required_runtime_set_digest =
-              receiver_config.required_runtime_set_digest;
-          manager_liveness_required_set = decoded.required_set;
-          manager_liveness_publication_generation =
-              decoded.active_publication_generation;
-          manager_liveness_public_pointer_digest =
-              decoded.active_public_pointer_digest;
-        } else {
-          Require(manager_liveness_required_set.has_value() &&
-                      *manager_liveness_required_set ==
-                          decoded.required_set &&
-                      manager_liveness_receiver_config->active_bundle_id ==
-                          receiver_config.active_bundle_id &&
-                      manager_liveness_receiver_config
-                              ->required_runtime_set_digest ==
-                          receiver_config.required_runtime_set_digest,
-                  "Manager liveness request changed required-set identity "
-                  "without a publication transition");
-        }
-      }
-      const auto admission_generation = manager_liveness_admission.generation();
-      const auto renewed =
-          manager_liveness_receiver.get()->Renew(decoded.heartbeat);
-      Require(renewed.ok(), "Manager heartbeat renewal was rejected");
-      if (decoded.reconciliation.has_value() &&
-          manager_liveness_receiver.get()->status().command_fenced) {
-        const auto reconciled = manager_liveness_receiver.get()
-                                    ->CompleteReconciliation(
-                                        *decoded.reconciliation);
-        Require(reconciled.ok(),
-                "Manager liveness reconciliation was rejected");
-      }
-      const auto status = manager_liveness_receiver.get()->status();
-      if (status.state == core::ManagerLivenessStateDTO::kCurrent &&
-          !status.command_fenced) {
-        manager_liveness_admission.OpenIfUnchanged(admission_generation);
-      }
-      const core::ManagerLivenessObservationDTO observation{
-          status, decoded.required_set.active_bundle_id,
-          decoded.required_set.required_runtime_set_digest,
-          core::ComputeManagerLivenessStatusDigest(status)};
-      SendManagedRuntimePacket(
-          config.manager_channel_fd,
-          component_manager::detail::EncodeManagerLivenessRpcResponse(
-              observation));
-      continue;
+      Fail("Manager-liveness protocol is forbidden on the ordinary managed "
+           "runtime channel");
     }
     if (component_manager::detail::IsSelectedRuntimeCompositionRpcPacket(
             request)) {

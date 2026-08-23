@@ -4403,10 +4403,6 @@ std::uint64_t SqliteOperationJournal::Impl::RecordCellAdmissionClaimsReconciled(
                        prior->owner_epoch &&
                    authorization.successor_owner_epoch == current.owner_epoch;
           });
-      Require(predecessor_clean || successor_settlement,
-              "operation_journal_owner_close_blocked",
-              "unclean owner replacement cannot retire request membership "
-              "without exact successor settlement");
       Statement unresolved(
           database_,
           "SELECT COUNT(*) FROM cell_admission_claims "
@@ -4417,6 +4413,22 @@ std::uint64_t SqliteOperationJournal::Impl::RecordCellAdmissionClaimsReconciled(
       Require(unresolved.Step() && unresolved.Integer(0) == 0 && !unresolved.Step(),
               "operation_journal_owner_close_blocked",
               "unresolved claims block request-owner epoch rotation");
+      // The CCLC and Composer validators independently prove that their exact
+      // successor journal epoch is active and that no owner-local transaction
+      // or physical effect remains unresolved. That proof can authorize an
+      // empty-claim rotation after an unclean Kernel-host epoch; every other
+      // request-owner role still requires a clean close or an exact held-claim
+      // successor settlement.
+      const bool empty_validated_rotation =
+          (current.owner_role ==
+               CellAdmissionOwnerRoleDTO::kComponentLifecycleOwner ||
+           current.owner_role == CellAdmissionOwnerRoleDTO::kAuthoringOwner) &&
+          validation.settlements.empty();
+      Require(predecessor_clean || successor_settlement ||
+                  empty_validated_rotation,
+              "operation_journal_owner_close_blocked",
+              "unclean owner replacement cannot retire request membership "
+              "without exact successor settlement");
       Statement compact_reconciled_membership(
           database_,
           "DELETE FROM cell_admission_request_membership "
