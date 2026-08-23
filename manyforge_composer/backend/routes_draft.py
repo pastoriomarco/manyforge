@@ -2,9 +2,13 @@
 
 from __future__ import annotations
 
+from copy import deepcopy
 from dataclasses import dataclass
+from contextvars import ContextVar
+from functools import wraps
 from pathlib import Path
 from typing import Any, NoReturn
+import uuid
 
 from fastapi import APIRouter, HTTPException
 from fastapi.responses import JSONResponse
@@ -37,6 +41,7 @@ from .program_artifacts import (
     save_program_artifact,
 )
 from .state import ComposerState
+from .authoring_admission import AuthoringMutationEnvelope
 
 
 _AUTHORING_MUTATIONS = frozenset(
@@ -88,6 +93,12 @@ _PROGRAM_FIELDS = _PROGRAM_REQUIRED_FIELDS | frozenset(
 )
 _POLICY_MUTATION = "program_draft_update_node_policies"
 _POLICY_MUTATION_API_VERSION = "manyforge.composer_draft_mutation.v1"
+_ACTIVE_AUTHORING_CLAIM: ContextVar[dict[str, Any] | None] = ContextVar(
+    "active_authoring_claim", default=None
+)
+_ACTIVE_EFFECT_INTENT: ContextVar[dict[str, Any] | None] = ContextVar(
+    "active_authoring_effect_intent", default=None
+)
 
 
 class _DraftFence(BaseModel):
@@ -99,6 +110,30 @@ class _DraftFence(BaseModel):
         ge=0,
         le=9_007_199_254_740_991,
     )
+    client_id: str = Field(alias="clientId", min_length=1, max_length=256)
+    snapshot_receiver_epoch: str = Field(
+        alias="snapshotReceiverEpoch", min_length=1, max_length=256
+    )
+    snapshot_sequence: int = Field(
+        alias="snapshotSequence", ge=1, le=9_007_199_254_740_991
+    )
+    expected_admission_generation: int = Field(
+        alias="expectedAdmissionGeneration", ge=1, le=9_007_199_254_740_991
+    )
+    request_owner_epoch: str = Field(
+        alias="requestOwnerEpoch", min_length=1, max_length=256
+    )
+    request_id: str = Field(alias="requestId", min_length=1, max_length=256)
+
+    def admission_envelope(self) -> AuthoringMutationEnvelope:
+        return AuthoringMutationEnvelope(
+            client_id=self.client_id,
+            snapshot_receiver_epoch=self.snapshot_receiver_epoch,
+            snapshot_sequence=self.snapshot_sequence,
+            expected_admission_generation=self.expected_admission_generation,
+            request_owner_epoch=self.request_owner_epoch,
+            request_id=self.request_id,
+        )
 
 
 class DraftMutationRequest(_DraftFence):
@@ -313,6 +348,7 @@ def _apply_program(
     scenario_id: str,
     scenario_catalog_revision: str,
     expected_applied_record_digest: str | None,
+    authoring_claim: dict[str, Any],
 ) -> dict[str, Any]:
     _require_apply_ready(program)
     if state.headless_client is None:
@@ -339,6 +375,7 @@ def _apply_program(
             "scenario_catalog_revision": scenario_catalog_revision,
             "program": candidate.to_dict(),
             "expected_applied_record_digest": expected_applied_record_digest,
+            "authoring_claim": authoring_claim,
         }
     )
     try:
@@ -378,6 +415,329 @@ def create_draft_router(state: ComposerState) -> APIRouter:
 
     router = APIRouter()
 
+    def retained_applied_context() -> dict[str, Any]:
+        context, reason = _applied_context(state)
+        if context is None:
+            return {"available": False, "reason": reason}
+        return {
+            "available": True,
+            "scenario_id": context.scenario_id,
+            "scenario_catalog_revision": context.scenario_catalog_revision,
+            "program_revision": context.program_revision,
+            "record_digest": context.record_digest,
+            "program_document": deepcopy(context.program_document),
+            "projection_document": deepcopy(context.projection_document),
+        }
+
+    def prepare_authoring_effect(
+        body: _DraftFence, operation_kind: str
+    ) -> dict[str, Any]:
+        state.draft_session.require_current(
+            draft_id=body.draft_id,
+            expected_revision=body.expected_draft_revision,
+        )
+        pre_state = state.draft_session.retained_state()
+        prepared: dict[str, Any] = {
+            "schema_version": "manyforge.composer_authoring_effect.v1",
+            "operation_kind": operation_kind,
+            "effect_class": "local",
+            "pre_state": pre_state,
+        }
+        if operation_kind == "mutate_draft":
+            assert isinstance(body, DraftMutationRequest)
+            if body.mutation not in _AUTHORING_MUTATIONS:
+                raise HTTPException(
+                    status_code=404,
+                    detail={
+                        "code": "composer_authoring_mutation_unsupported",
+                        "message": (
+                            "unsupported Program authoring mutation: "
+                            f"{body.mutation}"
+                        ),
+                    },
+                )
+            state.draft_session.preview_mutation(
+                tool_id=body.mutation,
+                arguments=body.arguments,
+                expected_revision=body.expected_draft_revision,
+                catalog=(
+                    state.node_catalog
+                    if body.mutation == _POLICY_MUTATION
+                    else _active_catalog(state)
+                ),
+                draft_id=body.draft_id,
+            )
+        elif operation_kind in {"new_draft", "open_draft"}:
+            state.draft_session.require_replace_allowed(
+                draft_id=body.draft_id,
+                expected_revision=body.expected_draft_revision,
+                discard_changes=body.confirm_discard,  # type: ignore[attr-defined]
+            )
+        elif operation_kind in {"save_draft", "save_draft_as"}:
+            target_path: str | None = None
+            overwrite = True
+            if isinstance(body, SaveDraftAsRequest):
+                target_path = normalize_program_save_path(body.path)
+            document = pre_state["program"]
+            if document is None:
+                raise DraftSessionError(
+                    "composer_draft_unavailable",
+                    "Composer has no loaded Program Draft",
+                    status_code=404,
+                )
+            if isinstance(body, SaveDraftAsRequest):
+                assert target_path is not None
+                try:
+                    candidate = Path(target_path).expanduser()
+                    resolved_candidate = str(
+                        candidate.parent.resolve() / candidate.name
+                    )
+                except (OSError, RuntimeError, ValueError):
+                    resolved_candidate = target_path
+                overwrite = (
+                    body.confirm_overwrite
+                    or resolved_candidate == pre_state["saved_path"]
+                )
+            else:
+                target_path = pre_state["saved_path"]
+                overwrite = True
+                if target_path is None:
+                    raise DraftSessionError(
+                        "composer_saved_path_unavailable",
+                        "Save requires an existing Program path; use Save As",
+                    )
+            post_state = deepcopy(pre_state)
+            post_state["saved_path"] = str(Path(target_path).resolve())
+            post_state["saved_program_revision"] = document["program_revision"]
+            post_state["saved_document"] = deepcopy(document)
+            prepared.update(
+                {
+                    "effect_class": "external",
+                    "external_kind": "save_program",
+                    "target_path": target_path,
+                    "overwrite": overwrite,
+                    "program_document": deepcopy(document),
+                    "post_state": post_state,
+                    "applied_context": retained_applied_context(),
+                }
+            )
+        elif operation_kind == "apply_draft":
+            document = pre_state["program"]
+            if document is None:
+                raise DraftSessionError(
+                    "composer_draft_unavailable",
+                    "Composer has no loaded Program Draft",
+                    status_code=404,
+                )
+            _require_apply_ready(
+                Program.from_dict(document, _active_catalog(state), path="<apply-intent>")
+            )
+            applied = retained_applied_context()
+            reason = applied.get("reason")
+            if (
+                applied["available"] is False
+                and isinstance(reason, dict)
+                and reason.get("code") != "program_applied_selection_not_found"
+            ):
+                raise DraftSessionError(
+                    reason["code"],
+                    reason["message"],
+                    status_code=(
+                        404
+                        if reason["code"]
+                        == "program_applied_selection_not_found"
+                        else 502
+                        if reason["code"]
+                        == "program_applied_selection_invalid"
+                        else 503
+                    ),
+                )
+            prepared.update(
+                {
+                    "effect_class": "external",
+                    "external_kind": "program_apply",
+                    "program_document": deepcopy(document),
+                    "scenario_id": body.scenario_id,  # type: ignore[attr-defined]
+                    "scenario_catalog_revision": body.scenario_catalog_revision,  # type: ignore[attr-defined]
+                    "expected_applied_record_digest": (
+                        applied.get("record_digest")
+                        if applied["available"] is True
+                        else None
+                    ),
+                    "applied_context": applied,
+                    "post_state": pre_state,
+                }
+            )
+        elif operation_kind == "load_program":
+            assert isinstance(body, LoadProgramRequest)
+            state.draft_session.require_replace_allowed(
+                draft_id=body.draft_id,
+                expected_revision=body.expected_draft_revision,
+                discard_changes=body.confirm_discard,
+            )
+            program, source_path = load_program_artifact(
+                body.path,
+                allowed_roots=state.allowed_fs_roots,
+                catalog=_active_catalog(state),
+            )
+            applied = retained_applied_context()
+            reason = applied.get("reason")
+            if (
+                applied["available"] is False
+                and isinstance(reason, dict)
+                and reason.get("code") != "program_applied_selection_not_found"
+            ):
+                raise DraftSessionError(
+                    reason["code"],
+                    reason["message"],
+                    status_code=(
+                        404
+                        if reason["code"]
+                        == "program_applied_selection_not_found"
+                        else 502
+                        if reason["code"]
+                        == "program_applied_selection_invalid"
+                        else 503
+                    ),
+                )
+            post_state = {
+                "schema_version": pre_state["schema_version"],
+                "draft_id": f"draft-{uuid.uuid4().hex}",
+                "draft_revision": 1,
+                "program": program.to_dict(),
+                "saved_path": source_path,
+                "saved_program_revision": program.program_revision,
+                "saved_document": program.to_dict(),
+            }
+            prepared.update(
+                {
+                    "effect_class": "external",
+                    "external_kind": "load_program",
+                    "program_document": program.to_dict(),
+                    "source_path": source_path,
+                    "scenario_id": body.scenario_id,
+                    "scenario_catalog_revision": body.scenario_catalog_revision,
+                    "expected_applied_record_digest": (
+                        applied.get("record_digest")
+                        if applied["available"] is True
+                        else None
+                    ),
+                    "applied_context": applied,
+                    "post_state": post_state,
+                }
+            )
+        elif operation_kind == "revert_draft":
+            saved = pre_state["saved_document"]
+            if saved is None:
+                raise DraftSessionError(
+                    "composer_saved_program_unavailable",
+                    "Composer has no retained Saved Program",
+                    status_code=404,
+                )
+            applied = retained_applied_context()
+            if applied["available"] is not True:
+                reason = applied.get("reason") or {
+                    "code": "program_applied_selection_invalid",
+                    "message": "Applied Program is absent",
+                }
+                raise DraftSessionError(
+                    reason["code"],
+                    reason["message"],
+                    status_code=(
+                        404
+                        if reason["code"]
+                        == "program_applied_selection_not_found"
+                        else 502
+                        if reason["code"]
+                        == "program_applied_selection_invalid"
+                        else 503
+                    ),
+                )
+            post_state = deepcopy(pre_state)
+            if pre_state["program"] != saved:
+                post_state["draft_revision"] += 1
+                post_state["program"] = deepcopy(saved)
+            prepared.update(
+                {
+                    "effect_class": "external",
+                    "external_kind": "revert_program",
+                    "program_document": deepcopy(saved),
+                    "scenario_id": applied["scenario_id"],
+                    "scenario_catalog_revision": applied[
+                        "scenario_catalog_revision"
+                    ],
+                    "expected_applied_record_digest": applied["record_digest"],
+                    "applied_context": applied,
+                    "post_state": post_state,
+                }
+            )
+        return prepared
+
+    def authoring_effect(
+        body: _DraftFence,
+        operation_kind: str,
+        effect,
+    ):
+        coordinator = state.authoring_admission
+        if coordinator is None:
+            raise HTTPException(
+                status_code=503,
+                detail={
+                    "code": "authoring_not_ready",
+                    "message": "authoritative authoring admission is unavailable",
+                },
+            )
+        prepared: dict[str, Any] = {}
+
+        def prepare() -> dict[str, Any]:
+            prepared.update(prepare_authoring_effect(body, operation_kind))
+            return prepared
+
+        def execute_effect(claim: dict[str, Any]):
+            token = _ACTIVE_AUTHORING_CLAIM.set(claim)
+            effect_token = _ACTIVE_EFFECT_INTENT.set(prepared)
+            try:
+                return effect(claim)
+            finally:
+                _ACTIVE_EFFECT_INTENT.reset(effect_token)
+                _ACTIVE_AUTHORING_CLAIM.reset(token)
+
+        try:
+            return coordinator.execute(
+                body.admission_envelope(),
+                operation_kind=operation_kind,
+                draft_id=body.draft_id,
+                draft_revision=body.expected_draft_revision,
+                payload=body.model_dump(mode="json", by_alias=True),
+                effect=execute_effect,
+                post_image=state.draft_session.retained_state,
+                prepare_effect=prepare,
+            )
+        except (DraftSessionError, ProgramArtifactError) as error:
+            _raise_workspace_error(error)
+
+    def authoring_gate(endpoint):
+        @wraps(endpoint)
+        def guarded(body):
+            def invoke(_claim: dict[str, Any]):
+                return endpoint(body)
+
+            return authoring_effect(body, endpoint.__name__, invoke)
+
+        return guarded
+
+    def active_authoring_claim() -> dict[str, Any]:
+        claim = _ACTIVE_AUTHORING_CLAIM.get()
+        if claim is None:
+            raise RuntimeError("authoring claim context is absent")
+        return claim
+
+    def active_effect_intent() -> dict[str, Any]:
+        intent = _ACTIVE_EFFECT_INTENT.get()
+        if intent is None:
+            raise RuntimeError("authoring effect intent context is absent")
+        return intent
+
     @router.get("/api/program/draft")
     def read_draft() -> dict[str, Any]:
         return state.draft_session.snapshot()
@@ -387,6 +747,7 @@ def create_draft_router(state: ComposerState) -> APIRouter:
         return _workspace(state)
 
     @router.post("/api/program/draft/mutations")
+    @authoring_gate
     def mutate_draft(body: DraftMutationRequest) -> dict[str, Any]:
         if body.mutation not in _AUTHORING_MUTATIONS:
             raise HTTPException(
@@ -436,6 +797,7 @@ def create_draft_router(state: ComposerState) -> APIRouter:
         }
 
     @router.post("/api/program/open-draft")
+    @authoring_gate
     def open_draft(body: OpenDraftRequest) -> dict[str, Any]:
         try:
             state.draft_session.require_replace_allowed(
@@ -460,6 +822,7 @@ def create_draft_router(state: ComposerState) -> APIRouter:
             _raise_workspace_error(error)
 
     @router.post("/api/program/new-draft")
+    @authoring_gate
     def new_draft(body: NewDraftRequest) -> dict[str, Any]:
         try:
             def applied_revision() -> str | None:
@@ -478,6 +841,7 @@ def create_draft_router(state: ComposerState) -> APIRouter:
             _raise_workspace_error(error)
 
     @router.post("/api/program/save")
+    @authoring_gate
     def save_draft(body: SaveDraftRequest) -> dict[str, Any]:
         try:
             state.draft_session.save_program(
@@ -496,6 +860,7 @@ def create_draft_router(state: ComposerState) -> APIRouter:
             _raise_workspace_error(error)
 
     @router.post("/api/program/save-as")
+    @authoring_gate
     def save_draft_as(body: SaveDraftAsRequest) -> dict[str, Any]:
         try:
             normalized = normalize_program_save_path(body.path)
@@ -522,6 +887,7 @@ def create_draft_router(state: ComposerState) -> APIRouter:
             _raise_workspace_error(error)
 
     @router.post("/api/program/apply")
+    @authoring_gate
     def apply_draft(body: ApplyDraftRequest) -> JSONResponse:
         try:
             def apply_current_program(program: Program) -> dict[str, Any]:
@@ -544,6 +910,7 @@ def create_draft_router(state: ComposerState) -> APIRouter:
                     expected_applied_record_digest=(
                         context.record_digest if context is not None else None
                     ),
+                    authoring_claim=active_authoring_claim(),
                 )
 
             result = state.draft_session.apply_current_program(
@@ -563,8 +930,10 @@ def create_draft_router(state: ComposerState) -> APIRouter:
             _raise_workspace_error(error)
 
     @router.post("/api/program/load")
+    @authoring_gate
     def load_program(body: LoadProgramRequest) -> JSONResponse:
         try:
+            prepared = active_effect_intent()
             context, reason = _applied_context(state)
             if (
                 reason is not None
@@ -585,6 +954,7 @@ def create_draft_router(state: ComposerState) -> APIRouter:
                     expected_applied_record_digest=(
                         context.record_digest if context is not None else None
                     ),
+                    authoring_claim=active_authoring_claim(),
                 )
                 if result.get("status") != "applied":
                     raise _ProgramApplyPending(result)
@@ -613,12 +983,16 @@ def create_draft_router(state: ComposerState) -> APIRouter:
                 current_applied_program_revision=(
                     context.program_revision if context is not None else None
                 ),
-                loader=lambda: load_program_artifact(
-                    body.path,
-                    allowed_roots=state.allowed_fs_roots,
-                    catalog=_active_catalog(state),
+                loader=lambda: (
+                    Program.from_dict(
+                        deepcopy(prepared["program_document"]),
+                        _active_catalog(state),
+                        path=prepared["source_path"],
+                    ),
+                    prepared["source_path"],
                 ),
                 applier=apply_loaded,
+                replacement_draft_id=prepared["post_state"]["draft_id"],
             )
             return JSONResponse(
                 status_code=200,
@@ -641,6 +1015,7 @@ def create_draft_router(state: ComposerState) -> APIRouter:
             _raise_workspace_error(error)
 
     @router.post("/api/program/discard")
+    @authoring_gate
     def discard_draft(body: DiscardDraftRequest) -> dict[str, Any]:
         try:
             def read_applied() -> Program:
@@ -695,6 +1070,7 @@ def create_draft_router(state: ComposerState) -> APIRouter:
             _raise_workspace_error(error)
 
     @router.post("/api/program/revert")
+    @authoring_gate
     def revert_draft(body: RevertDraftRequest) -> JSONResponse:
         try:
             def prepare_revert(
@@ -753,6 +1129,7 @@ def create_draft_router(state: ComposerState) -> APIRouter:
                     scenario_id=context.scenario_id,
                     scenario_catalog_revision=context.scenario_catalog_revision,
                     expected_applied_record_digest=context.record_digest,
+                    authoring_claim=active_authoring_claim(),
                 )
                 if result.get("status") != "applied":
                     return result

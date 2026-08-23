@@ -19,7 +19,7 @@ import { UnavailableBanner } from './components/UnavailableBanner';
 import { HeadlessRuntimeSurfaces } from './components/HeadlessRuntimeSurfaces';
 import { RobotControlPanelView } from './components/RobotControlPanel';
 import { DeploymentCompositionPanel } from './components/DeploymentCompositionPanel';
-import { useHeadlessStateSource } from './hooks/useHeadlessState';
+import { useHeadlessStateSource, useShellHeadlessState } from './hooks/useHeadlessState';
 import { useProgramWorkspace } from './hooks/useProgramWorkspace';
 import { useProgramRuntime } from './hooks/useProgramRuntime';
 import { useRobotControl } from './hooks/useRobotControl';
@@ -156,8 +156,13 @@ export default function App() {
   // The workbench owns one persistent viewer. Its own observer throttling
   // still controls demand rendering and latest-only data publication.
   const viewerActive = !commandsCollapsed;
-  const programController = useProgramWorkspace();
-  const programRuntime = useProgramRuntime(headlessEnabled);
+  const headlessSnapshot = useShellHeadlessState(headlessStateSource).snapshot;
+  const programController = useProgramWorkspace(headlessSnapshot);
+  const programRuntime = useProgramRuntime(
+    headlessEnabled,
+    headlessSnapshot,
+    programController.state.workspace,
+  );
   const robotControl = useRobotControl(headlessEnabled);
   const handleArtifactSelection = useCallback((
     kind: ArtifactKind,

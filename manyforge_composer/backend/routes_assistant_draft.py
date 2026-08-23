@@ -33,6 +33,7 @@ from .source_model_client import (
     read_active_source_model,
 )
 from .state import ComposerState
+from .authoring_admission import AuthoringMutationEnvelope
 
 
 _MAXIMUM_SAFE_INTEGER = 9_007_199_254_740_991
@@ -93,6 +94,21 @@ class AssistantDraftCallbackRequest(BaseModel):
     request_owner_epoch: str = Field(
         alias="requestOwnerEpoch", min_length=1, max_length=256
     )
+    client_id: str = Field(alias="clientId", min_length=1, max_length=256)
+    snapshot_receiver_epoch: str = Field(
+        alias="snapshotReceiverEpoch", min_length=1, max_length=256
+    )
+    snapshot_sequence: Annotated[
+        int, Field(alias="snapshotSequence", ge=1, le=_MAXIMUM_SAFE_INTEGER)
+    ]
+    expected_admission_generation: Annotated[
+        int,
+        Field(
+            alias="expectedAdmissionGeneration",
+            ge=1,
+            le=_MAXIMUM_SAFE_INTEGER,
+        ),
+    ]
     source_label: str = Field(alias="sourceLabel", min_length=1, max_length=256)
     correlation_id: str | None = Field(
         default=None,
@@ -342,15 +358,49 @@ def create_assistant_draft_router(state: ComposerState) -> APIRouter:
                 mutation = None
                 details = {"valid": True}
             else:
-                result = state.draft_session.mutate(
-                    tool_id=tool_id,
-                    arguments=body.arguments,
-                    expected_revision=body.expected_draft_revision,
-                    catalog=node_environment.catalog,
+                coordinator = state.authoring_admission
+                if coordinator is None:
+                    raise HTTPException(
+                        status_code=503,
+                        detail={
+                            "code": "authoring_not_ready",
+                            "message": "authoritative authoring admission is unavailable",
+                        },
+                    )
+                def mutate_draft(_claim: dict[str, Any]) -> dict[str, Any]:
+                    changed = state.draft_session.mutate(
+                        tool_id=tool_id,
+                        arguments=body.arguments,
+                        expected_revision=body.expected_draft_revision,
+                        catalog=node_environment.catalog,
+                    )
+                    return {
+                        "mutation": changed.mutation,
+                        "details": changed.details,
+                        "snapshot": changed.snapshot,
+                    }
+
+                result = coordinator.execute(
+                    AuthoringMutationEnvelope(
+                        client_id=body.client_id,
+                        snapshot_receiver_epoch=body.snapshot_receiver_epoch,
+                        snapshot_sequence=body.snapshot_sequence,
+                        expected_admission_generation=(
+                            body.expected_admission_generation
+                        ),
+                        request_owner_epoch=body.request_owner_epoch,
+                        request_id=body.request_id,
+                    ),
+                    operation_kind=f"assistant_{tool_id}",
+                    draft_id=body.draft_id,
+                    draft_revision=body.expected_draft_revision,
+                    payload=body.model_dump(mode="json", by_alias=True),
+                    effect=mutate_draft,
+                    post_image=state.draft_session.snapshot,
                 )
-                next_snapshot = result.snapshot
-                mutation = result.mutation
-                details = result.details
+                next_snapshot = result["snapshot"]
+                mutation = result["mutation"]
+                details = result["details"]
         except DraftSessionError as error:
             if error.code in {
                 "composer_draft_revision_stale",

@@ -2183,20 +2183,29 @@ void attach_retained_native_addressed_owner(
       }
       return facts;
     };
+    core::ResourceAddressedExecutionKernelConfig addressed_config{
+        std::move(config.request_owner_epoch), kernel_cell_id,
+        config.request_replay_capacity,
+        std::move(runtime->participant_resolver),
+        config.operation_admission_gate,
+        std::move(config.graph_revision),
+        std::move(config.cell_stop_deadline_budget),
+        core::kMaximumEmergencyStopCorrelationEntries, 0U, 0U,
+        std::move(stop_surveillance_config),
+        std::move(recovery_facts_resolver)};
+    addressed_config.cell_admission_claim_capacity = 1024U;
+    addressed_config.cell_admission_intervention_validator =
+        std::move(config.cell_admission_intervention_validator);
+    addressed_config.cell_admission_settlement_validator =
+        std::move(config.cell_admission_settlement_validator);
+    addressed_config.cell_admission_reconcile_validator =
+        std::move(config.cell_admission_reconcile_validator);
+    addressed_config.manager_liveness_required_set =
+        std::move(config.manager_liveness_required_set);
     runtime->addressed_kernel =
         std::make_unique<core::ResourceAddressedExecutionKernel>(
             runtime->participant_registrations, *runtime->clock,
-            *runtime->operation_journal,
-            core::ResourceAddressedExecutionKernelConfig{
-                std::move(config.request_owner_epoch), kernel_cell_id,
-                config.request_replay_capacity,
-                std::move(runtime->participant_resolver),
-                config.operation_admission_gate,
-                std::move(config.graph_revision),
-                std::move(config.cell_stop_deadline_budget),
-                core::kMaximumEmergencyStopCorrelationEntries, 0U, 0U,
-                std::move(stop_surveillance_config),
-                std::move(recovery_facts_resolver)});
+            *runtime->operation_journal, std::move(addressed_config));
     runtime->addressed_request_owner_epoch = kernel_request_owner_epoch;
     runtime->addressed_cell_id = kernel_cell_id;
   } catch (...) {
@@ -2223,7 +2232,11 @@ create_retained_native_runtime(RetainedNativeRuntimeInput input,
       config.request_replay_capacity,
       input.operation_admission_gate,
       input.motion_binding.value().graph_revision,
-      std::move(stop_budget)};
+      std::move(stop_budget),
+      std::move(config.cell_admission_intervention_validator),
+      std::move(config.cell_admission_settlement_validator),
+      std::move(config.cell_admission_reconcile_validator),
+      std::move(config.manager_liveness_required_set)};
   auto runtime = create_retained_native_runtime_participants(std::move(input),
                                                              std::move(config));
   attach_retained_native_addressed_owner(runtime, std::move(owner_config));

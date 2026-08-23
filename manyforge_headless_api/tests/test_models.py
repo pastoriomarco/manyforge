@@ -473,6 +473,7 @@ def test_apply_rejects_unknown_identity_and_noncanonical_busy_policy() -> None:
             "retained_bundle_id": "bundle.1",
         },
         "reject_if_affected_busy": False,
+        "expected_admission_generation": 7,
     }
     with pytest.raises(ValidationError) as captured:
         ManagerApplyRequest.model_validate(body)

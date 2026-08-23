@@ -536,7 +536,6 @@ TEST(ResourceSlotTableTest, AdmissionProjectionAcceptsCandidateOnlyResourcesAndR
 TEST(ResourceSlotTableTest, RejectsInvalidInventoryAtConstruction) {
   EXPECT_THROW(ResourceSlotTable({ResourceId("joint.1"), ResourceId("joint.1")}),
                std::invalid_argument);
-  EXPECT_THROW(ResourceSlotTable(std::vector<ResourceId>{}), std::invalid_argument);
   EXPECT_THROW(ResourceSlotTable(
                    {ResourceId("joint.1")},
                    {DomainActiveControlConfigurationDTO{ControlDomainId("domain.z"),
@@ -546,6 +545,17 @@ TEST(ResourceSlotTableTest, RejectsInvalidInventoryAtConstruction) {
                                                         ActiveControlConfigurationId("active.a"),
                                                         ActiveControlConfigurationGeneration(1U)}}),
                std::invalid_argument);
+}
+
+TEST(ResourceSlotTableTest, EmptyRuntimeInventoryCanBePopulatedAndEmptied) {
+  ResourceSlotTable table(std::vector<ResourceId>{});
+  EXPECT_TRUE(table.snapshot().empty());
+  ASSERT_TRUE(table.reconfigure_runtime_inventory(
+                       {ResourceId("joint.1")}, {}, {})
+                  .ok());
+  ASSERT_EQ(table.snapshot().size(), 1U);
+  ASSERT_TRUE(table.reconfigure_runtime_inventory({}, {}, {}).ok());
+  EXPECT_TRUE(table.snapshot().empty());
 }
 
 TEST(ResourceSlotTableTest, RevisesExactOwnerWithoutChangingSlotState) {

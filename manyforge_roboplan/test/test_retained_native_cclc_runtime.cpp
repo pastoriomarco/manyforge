@@ -425,8 +425,60 @@ private:
 };
 
 class KernelPorts final : public core::ICCLCKernelDisableHandoffPort,
-                          public core::ICCLCKernelRouteConfigurationFencePort {
+                          public core::ICCLCKernelRouteConfigurationFencePort,
+                          public core::IKernelCellAdmissionPort {
 public:
+  [[nodiscard]] core::AuthoringAdmissionDTO GetAuthoringAdmission()
+      const override {
+    return {true, core::AdmissionGeneration(7U)};
+  }
+  [[nodiscard]] core::Result<core::AuthoringAdmissionDTO>
+  UpdateCellAdmissionReadiness(
+      const core::CellAdmissionReadinessSnapshotDTO &) override {
+    return core::Result<core::AuthoringAdmissionDTO>::Ok(
+        GetAuthoringAdmission());
+  }
+  [[nodiscard]] core::Result<core::CellAdmissionClaimDTO>
+  AcquireCellAdmissionClaim(
+      const core::CellAdmissionClaimIntentDTO &intent) override {
+    claim_ = core::CellAdmissionClaimDTO{
+        intent, core::CellAdmissionClaimGeneration(1U),
+        intent.expected_admission_generation, 1'000};
+    last_claim_ = claim_;
+    return core::Result<core::CellAdmissionClaimDTO>::Ok(*claim_);
+  }
+  [[nodiscard]] core::Result<core::AuthoringAdmissionDTO>
+  ReleaseCellAdmissionClaim(
+      const core::CellAdmissionClaimReleaseDTO &release) override {
+    release_ = release;
+    claim_.reset();
+    return core::Result<core::AuthoringAdmissionDTO>::Ok(
+        GetAuthoringAdmission());
+  }
+  [[nodiscard]] core::Result<core::AuthoringAdmissionDTO>
+  ReconcileCellAdmissionClaims(
+      const core::CellAdmissionReconcileDTO &) override {
+    return core::Result<core::AuthoringAdmissionDTO>::Ok(
+        GetAuthoringAdmission());
+  }
+  [[nodiscard]] core::Result<core::CellAdmissionRecoveryReceiptDTO>
+  GetCellAdmissionRecoveryReceipt(
+      const core::CellAdmissionRecoveryReceiptQueryDTO &) const override {
+    return core::Result<core::CellAdmissionRecoveryReceiptDTO>::Ok(
+        {release_.has_value()
+             ? core::CellAdmissionRecoveryReceiptStatusDTO::kReleasedExact
+             : (claim_.has_value()
+                    ? core::CellAdmissionRecoveryReceiptStatusDTO::kHeldExact
+                    : core::CellAdmissionRecoveryReceiptStatusDTO::kUnknown),
+         core::RequestOwnerEpoch("kernel.1"),
+         core::AdmissionGeneration(7U),
+         last_claim_,
+         release_,
+         std::nullopt,
+         claim_.has_value() ? std::vector{*claim_}
+                            : std::vector<core::CellAdmissionClaimDTO>{},
+         {}});
+  }
   [[nodiscard]] core::Result<core::DisableHandoffAdmissionSnapshotDTO>
   ObserveDisableHandoffAdmission(
       const core::DisableHandoffAdmissionQueryDTO &) const override {
@@ -594,6 +646,9 @@ private:
 
   mutable std::mutex mutex_;
   std::optional<core::RouteConfigurationFenceAcceptedDTO> accepted_;
+  mutable std::optional<core::CellAdmissionClaimDTO> claim_;
+  mutable std::optional<core::CellAdmissionClaimDTO> last_claim_;
+  mutable std::optional<core::CellAdmissionClaimReleaseDTO> release_;
   core::RetainedBundleId active_bundle_id_{"unset"};
   core::GraphRevision active_graph_revision_{"unset"};
 };
@@ -1328,7 +1383,7 @@ TEST(RetainedNativeCCLCRuntime,
   auto composition = CreateRetainedNativeCCLCRuntime(
       config, bundle, publication_store, publication.value(), artifacts,
       catalogs, {{occurrence, brand_port}}, {runtime.binding}, kernel_ports,
-      kernel_ports, publication_owner, clock, scheduler);
+      kernel_ports, kernel_ports, publication_owner, clock, scheduler);
   ASSERT_TRUE(composition.ok()) << composition.error().message;
 
   core::ComponentLifecycleIntentDTO prepare{

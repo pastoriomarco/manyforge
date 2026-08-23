@@ -6,6 +6,7 @@
 #include <manyforge_core/ports/icclc_controller_lifecycle_port_resolver.hpp>
 #include <manyforge_core/ports/icclc_current_component_snapshot_source.hpp>
 #include <manyforge_core/ports/icclc_journal.hpp>
+#include <manyforge_core/ports/ikernel_cell_admission_port.hpp>
 #include <manyforge_core/ports/icclc_kernel_disable_handoff_port.hpp>
 #include <manyforge_core/ports/icclc_kernel_route_configuration_fence_port.hpp>
 #include <manyforge_core/ports/icclc_lifecycle_plan_catalog_source.hpp>
@@ -59,6 +60,7 @@ class ComponentLifecycleCoordinator final {
       const ICCLCBrandLifecyclePortResolver& lifecycle_port_resolver,
       ICCLCKernelDisableHandoffPort& kernel_disable_handoff_port, IClock& clock,
       IScheduler& scheduler,
+      IKernelCellAdmissionPort* kernel_cell_admission_port = nullptr,
       std::optional<ComponentLifecycleCoordinatorRouteServices> route_services = std::nullopt);
   ~ComponentLifecycleCoordinator();
 
@@ -85,6 +87,7 @@ class ComponentLifecycleCoordinator final {
       const RouteSelectionTransactionId& route_selection_transaction_id);
 
   [[nodiscard]] bool accepting_new_requests() const noexcept;
+  [[nodiscard]] RequestOwnerEpoch request_owner_epoch() const;
   void CloseAdmission() noexcept;
 
   /// Operational bounded drain. It does not advance semantic time.

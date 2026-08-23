@@ -136,12 +136,18 @@ def test_program_workspace_is_available_while_effectful_actions_need_headless() 
         json={
             "draftId": state.draft_session.draft_id,
             "expectedDraftRevision": state.draft_session.revision,
+            "clientId": "test-browser",
+            "snapshotReceiverEpoch": "composer-snapshot.test",
+            "snapshotSequence": 1,
+            "expectedAdmissionGeneration": 1,
+            "requestOwnerEpoch": "test-browser.epoch.1",
+            "requestId": "test-browser.request.1",
             "scenarioId": "cell-pick",
             "scenarioCatalogRevision": "sha256:" + "a" * 64,
         },
     )
     assert unavailable_apply.status_code == 503
-    assert unavailable_apply.json()["detail"]["code"] == ("program_apply_unavailable")
+    assert unavailable_apply.json()["detail"]["code"] == "authoring_not_ready"
 
 
 def test_composer_bounds_callback_bodies_without_narrowing_other_routes() -> None:
@@ -190,6 +196,7 @@ def test_program_lifecycle_mutations_reject_oversized_bodies_atomically(
 
     headless = FailOnHeadlessCall()
     state = ComposerState(headless_client=headless)  # type: ignore[arg-type]
+    headless.calls.clear()
     before = state.draft_session.workspace_snapshot()
     body_size = 1024 * 1024 + 1
     if streamed:

@@ -81,6 +81,9 @@ class _Client:
         self.lifecycle_statuses: dict[str, dict[str, Any]] = {}
         self.route_statuses: dict[str, dict[str, Any]] = {}
 
+    def cclc_owner_identity(self) -> dict[str, Any]:
+        return {"request_owner_epoch": "cclc-owner.epoch.1"}
+
     def cclc_component(self, component_id: str) -> dict[str, Any]:
         return {
             "controllable_component_id": component_id,
@@ -181,9 +184,7 @@ class _Client:
 
 def test_lifecycle_request_uses_fresh_snapshot_and_owner_terminal_truth() -> None:
     client = _Client()
-    port = CCLCProgramTaskPort(
-        client, request_owner_epoch="program-runner.epoch.1"
-    )
+    port = CCLCProgramTaskPort(client)
     port.bind(_context())
     identity = _identity("prepare")
     started = port.start(
@@ -195,7 +196,7 @@ def test_lifecycle_request_uses_fresh_snapshot_and_owner_terminal_truth() -> Non
     assert client.lifecycle_requests[0] == {
         "request_context": {
             "request_id": started.task_id,
-            "request_owner_epoch": "program-runner.epoch.1",
+            "request_owner_epoch": "cclc-owner.epoch.1",
             "source_label": "manyforge_behavior.program",
             "correlation_id": "attempt:prepare",
         },
@@ -238,9 +239,7 @@ def test_lifecycle_request_uses_fresh_snapshot_and_owner_terminal_truth() -> Non
 
 def test_route_request_copies_one_exact_retained_current_template() -> None:
     client = _Client()
-    port = CCLCProgramTaskPort(
-        client, request_owner_epoch="program-runner.epoch.1"
-    )
+    port = CCLCProgramTaskPort(client)
     port.bind(_context())
     identity = _identity("route")
     started = port.start(
@@ -268,9 +267,7 @@ def test_route_request_copies_one_exact_retained_current_template() -> None:
 
 def test_stale_context_and_unknown_route_fail_without_owner_submission() -> None:
     client = _Client()
-    port = CCLCProgramTaskPort(
-        client, request_owner_epoch="program-runner.epoch.1"
-    )
+    port = CCLCProgramTaskPort(client)
     port.bind(_context())
     original = client.cclc_component
     client.cclc_component = lambda component_id: {  # type: ignore[method-assign]

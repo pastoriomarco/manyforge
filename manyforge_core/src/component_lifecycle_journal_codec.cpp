@@ -364,6 +364,7 @@ void PutIntent(Writer& writer, const ComponentLifecycleIntentDTO& value, bool in
   if (include_attribution) {
     PutAttribution(writer, value.attribution);
   }
+  writer.Counter(value.expected_admission_generation);
 }
 
 [[nodiscard]] ComponentLifecycleIntentDTO GetIntent(Reader& reader) {
@@ -375,7 +376,8 @@ void PutIntent(Writer& writer, const ComponentLifecycleIntentDTO& value, bool in
       reader.Counter<ComponentLifecycleGeneration>(),
       reader.Vector<ExpectedControlDomainRevisionDTO>([&]() { return GetExpectedDomain(reader); }),
       reader.Optional<std::string>([&]() { return reader.String(); }),
-      GetAttribution(reader)};
+      GetAttribution(reader),
+      reader.Counter<AdmissionGeneration>()};
 }
 
 void PutAccepted(Writer& writer, const ComponentLifecycleAcceptedDTO& value) {

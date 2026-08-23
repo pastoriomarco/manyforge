@@ -61,6 +61,50 @@ class CallerAttributionRequest(StrictRequest):
         )
 
 
+class AuthoringMutationContext(CallerAttributionRequest):
+    """Exact owner-issued context carried by one authoring transaction."""
+
+    expected_admission_generation: Annotated[
+        int, Field(ge=1, le=9_007_199_254_740_991)
+    ]
+    request_payload_digest: Annotated[str, Field(pattern=SHA256_PATTERN)]
+    owner_transaction_id: str
+
+    @field_validator("owner_transaction_id")
+    @classmethod
+    def validate_transaction_identity(cls, value: str) -> str:
+        return _bounded_nfc(
+            value,
+            label="owner_transaction_id",
+            maximum_bytes=MAX_IDENTITY_BYTES,
+        )
+
+
+class AuthoringMutationSettlementRequest(StrictRequest):
+    """Settle exactly one previously issued authoring claim."""
+
+    claim: dict[str, Any]
+    settlement_kind: Literal["owner_commit", "proven_no_effect"]
+    evidence_digest: Annotated[str, Field(pattern=SHA256_PATTERN)]
+
+
+class AuthoringMutationRecoveryRequest(StrictRequest):
+    """Private Composer-owner lookup for one exact durable claim intent."""
+
+    intent: dict[str, Any]
+    expected_claim: dict[str, Any] | None
+    expected_release: dict[str, Any] | None
+
+
+class AuthoringOwnerReconciliationRequest(StrictRequest):
+    """Rotate only the Composer authoring-owner epoch after local recovery."""
+
+    kernel_owner_epoch: str
+    retained_claims: list[dict[str, Any]]
+    current_owner_epochs: list[dict[str, Any]]
+    reconciliation_evidence_digest: Annotated[str, Field(pattern=SHA256_PATTERN)]
+
+
 class AcknowledgeAlarmRequest(CallerAttributionRequest):
     activation_id: str
     expected_record_revision: Annotated[int, Field(ge=1, le=9_007_199_254_740_991)]
@@ -151,6 +195,10 @@ class ManagerApplyRequest(CallerAttributionRequest):
     deployment_revision: Annotated[str, Field(pattern=SHA256_PATTERN)]
     expected_current: ExpectedCurrentRequest
     reject_if_affected_busy: bool
+    expected_admission_generation: Annotated[
+        int | None, Field(ge=1, le=9_007_199_254_740_991)
+    ] = None
+    parent_authoring_claim: dict[str, Any] | None = None
 
     @field_validator("deployment_artifact_id")
     @classmethod
@@ -165,6 +213,13 @@ class ManagerApplyRequest(CallerAttributionRequest):
     def require_busy_rejection(self) -> "ManagerApplyRequest":
         if not self.reject_if_affected_busy:
             raise ValueError("reject_if_affected_busy must be true")
+        if (self.expected_admission_generation is None) == (
+            self.parent_authoring_claim is None
+        ):
+            raise ValueError(
+                "exactly one direct admission generation or parent authoring "
+                "claim is required"
+            )
         return self
 
 
@@ -179,6 +234,7 @@ class ProgramApplyRequest(StrictRequest):
         str | None,
         Field(pattern=SHA256_PATTERN),
     ] = None
+    authoring_claim: dict[str, Any]
 
     @model_validator(mode="after")
     def require_program_object(self) -> "ProgramApplyRequest":
@@ -198,6 +254,10 @@ class ProgramRunStartRequest(CallerAttributionRequest):
     expected_applied_record_digest: Annotated[
         str,
         Field(pattern=SHA256_PATTERN),
+    ]
+    draft_program_revision: Annotated[str, Field(pattern=SHA256_PATTERN)]
+    expected_admission_generation: Annotated[
+        int, Field(ge=1, le=9_007_199_254_740_991)
     ]
 
 
@@ -226,6 +286,26 @@ class ProgramRunStopRequest(CallerAttributionRequest):
             value,
             label="reason",
             maximum_bytes=MAX_PROGRAM_RUN_REASON_BYTES,
+        )
+
+
+class ProgramCycleResetRequest(CallerAttributionRequest):
+    program_run_id: str
+    expected_owner_epoch: str
+    expected_cycle_generation: Annotated[
+        int, Field(ge=1, le=9_007_199_254_740_991)
+    ]
+    expected_claim_generation: Annotated[
+        int, Field(ge=1, le=9_007_199_254_740_991)
+    ]
+    terminal_reference: Annotated[str, Field(pattern=SHA256_PATTERN)]
+    settlement_evidence_digest: Annotated[str, Field(pattern=SHA256_PATTERN)]
+
+    @field_validator("program_run_id", "expected_owner_epoch")
+    @classmethod
+    def validate_cycle_identity(cls, value: str, info) -> str:
+        return _bounded_nfc(
+            value, label=info.field_name, maximum_bytes=MAX_IDENTITY_BYTES
         )
 
 
@@ -974,6 +1054,9 @@ class SceneTransactionRequest(StrictRequest):
     request_context: CallerAttributionRequest
     expected_projection_revision: ProjectionRevisionRequest
     operation: SceneOperationRequest
+    expected_admission_generation: Annotated[
+        int | None, Field(ge=1, le=9_007_199_254_740_991)
+    ] = None
 
 
 class ActionSpanRequest(StrictRequest):
@@ -2069,6 +2152,9 @@ class ComponentLifecycleRequest(StrictRequest):
     ]
     reason: str | None = None
     confirmed: bool
+    expected_admission_generation: Annotated[
+        int, Field(ge=1, le=9_007_199_254_740_991)
+    ]
 
     @field_validator("controllable_component_id", "expected_graph_revision")
     @classmethod

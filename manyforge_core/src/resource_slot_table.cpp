@@ -81,8 +81,8 @@ ResourceSlotTable::ResourceSlotTable(
                                                   : std::make_shared<std::recursive_mutex>()),
       active_control_configurations_(std::move(active_control_configurations)),
       route_published_active_control_configurations_(active_control_configurations_) {
-  if (resources.empty() || resources.size() > kMaxKernelResourceSlots) {
-    throw std::invalid_argument("Kernel resource inventory is empty or exceeds its fixed bound");
+  if (resources.size() > kMaxKernelResourceSlots) {
+    throw std::invalid_argument("Kernel resource inventory exceeds its fixed bound");
   }
   std::sort(resources.begin(), resources.end());
   if (std::any_of(resources.begin(), resources.end(),

@@ -47,6 +47,7 @@ def _lifecycle_body() -> dict[str, Any]:
         ],
         "reason": "operator-confirmed",
         "confirmed": True,
+        "expected_admission_generation": 7,
     }
 
 
@@ -99,7 +100,8 @@ def test_composer_proxies_exact_component_and_lifecycle_requests() -> None:
     assert templates.json()["templates"] == []
     assert accepted.status_code == 200
     assert accepted.json()["replay_status"] == "request_id_conflict"
-    assert forwarded == [
+    cclc_forwarded = [row for row in forwarded if "/api/cclc/" in row[1]]
+    assert cclc_forwarded == [
         ("GET", "/api/cclc/components/component.arm", None),
         (
             "GET",

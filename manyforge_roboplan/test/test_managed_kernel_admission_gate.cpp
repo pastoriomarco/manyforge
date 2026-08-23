@@ -4,8 +4,10 @@
 
 #include <unistd.h>
 
+#include <chrono>
 #include <filesystem>
 #include <fstream>
+#include <future>
 #include <iterator>
 #include <manyforge_component_manager/active_bundle_publication_store.hpp>
 #include <manyforge_component_manager/durable_store_set.hpp>
@@ -21,6 +23,7 @@
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <thread>
 #include <vector>
 
 namespace {
@@ -951,6 +954,36 @@ TEST(ManagedKernelAdmissionGate,
   ASSERT_FALSE(blocked.ok());
   EXPECT_EQ(blocked.error().details.at("reason"), "configuration_fence_held");
   EXPECT_EQ(gate.Observe(scope).operation_resource_generation, 0U);
+}
+
+TEST(ManagedKernelAdmissionGate,
+     RuntimeCompositionPinsFenceWithoutHoldingResourceAdmissionMutex) {
+  ManagedKernelAdmissionGate gate;
+  const auto scope = AffectedScope();
+  const core::ConfigurationFenceId fence_id("fence.composition-pinned");
+  gate.RestoreFence(fence_id, scope);
+
+  std::promise<void> effect_entered;
+  std::promise<void> allow_effect_to_finish;
+  auto allow_effect = allow_effect_to_finish.get_future();
+  std::thread composition([&] {
+    gate.RunWithExactHeldFence(fence_id, scope, [&] {
+      effect_entered.set_value();
+      allow_effect.wait();
+    });
+  });
+  effect_entered.get_future().wait();
+
+  auto containment_admission = std::async(std::launch::async, [&] {
+    std::lock_guard lock(*gate.shared_admission_mutex());
+  });
+  EXPECT_EQ(containment_admission.wait_for(std::chrono::milliseconds(100)),
+            std::future_status::ready);
+  EXPECT_THROW(gate.ReleaseFence(fence_id, scope), std::runtime_error);
+
+  allow_effect_to_finish.set_value();
+  composition.join();
+  gate.ReleaseFence(fence_id, scope);
 }
 
 TEST(ManagedKernelAdmissionGate,

@@ -8,6 +8,7 @@
 #include <manyforge_core/ports/iplanner_scene_projection.hpp>
 #include <manyforge_core/ports/iscene_authority.hpp>
 #include <manyforge_core/ports/iscene_candidate_preview.hpp>
+#include <manyforge_core/ports/ikernel_cell_admission_port.hpp>
 #include <memory>
 #include <optional>
 #include <stdexcept>
@@ -197,6 +198,16 @@ public:
           &retained_bundle_source,
       const manyforge::core::IPlannerSceneProjectionResolver
           &projection_resolver);
+  CanonicalEmptySceneOwner(
+      std::filesystem::path database_path,
+      const manyforge::deployment::CanonicalEmptyRetainedBundleAdmission
+          &admission,
+      const manyforge::core::IActiveBundlePublicationReader &publication_reader,
+      const manyforge::deployment::IVerifiedRetainedBundleSource
+          &retained_bundle_source,
+      const manyforge::core::IPlannerSceneProjectionResolver
+          &projection_resolver,
+      manyforge::core::IKernelCellAdmissionPort &cell_admission);
   ~CanonicalEmptySceneOwner() override;
 
   CanonicalEmptySceneOwner(CanonicalEmptySceneOwner &&) noexcept;
@@ -255,6 +266,11 @@ public:
   ActiveProjectionHealth() const override;
 
   [[nodiscard]] CanonicalEmptySceneAccessStatus ReadAccessStatus() const;
+  /// Reconciles durable authored-scene admission claims after the exact
+  /// Kernel owner becomes reachable. Owner unavailability is returned as a
+  /// typed fail-closed result and never prevents read-only scene recovery.
+  [[nodiscard]] manyforge::core::Result<void>
+  ReconcileAuthoredSceneAdmissionClaims();
   [[nodiscard]] manyforge::core::SceneCommitResultDTO
   Commit(const manyforge::core::SceneTransactionRequestDTO &request) override;
   [[nodiscard]] manyforge::core::Result<manyforge::core::SceneCandidatePreviewDTO>
@@ -289,5 +305,15 @@ private:
   class Impl;
   std::unique_ptr<Impl> impl_;
 };
+
+/// Read-only native-Kernel settlement check for an exact authored-scene
+/// claim. It never initializes, migrates, locks, checkpoints, or mutates the
+/// scene owner database.
+[[nodiscard]] manyforge::core::Result<void>
+ValidateAuthoredSceneCellAdmissionSettlementReadOnly(
+    const std::filesystem::path &database_path,
+    const manyforge::core::CellId &cell_id,
+    const manyforge::core::CellAdmissionClaimDTO &claim,
+    const manyforge::core::CellAdmissionClaimReleaseDTO &release);
 
 } // namespace manyforge::scene

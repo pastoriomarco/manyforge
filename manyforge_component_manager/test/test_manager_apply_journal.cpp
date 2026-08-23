@@ -140,6 +140,8 @@ ManagerApplyIntentDTO Intent(std::string apply_id = "apply-1",
       },
       RetainedBundleId(std::move(candidate)),
       GraphRevision("candidate-graph"),
+      core::AdmissionGeneration(7U),
+      std::nullopt,
   };
 }
 
@@ -1310,7 +1312,8 @@ TEST(ManagerApplyJournal, UncommittedChildWriteDisappearsOnRecovery) {
         "source_label,correlation_id,predecessor_retained_bundle_id,"
         "predecessor_graph_revision,predecessor_scene_id,"
         "predecessor_scene_revision_id,predecessor_scene_content_hash,"
-        "candidate_retained_bundle_id,candidate_graph_revision,intent_digest"
+        "candidate_retained_bundle_id,candidate_graph_revision,"
+        "expected_admission_generation,parent_authoring_claim,intent_digest"
         ") VALUES ("
         "'apply-uncommitted',1,'request-uncommitted','owner-epoch-1',"
         "'child',NULL,'predecessor-bundle','predecessor-graph','" +
@@ -1318,7 +1321,7 @@ TEST(ManagerApplyJournal, UncommittedChildWriteDisappearsOnRecovery) {
         "',"
         "7,'" +
         std::string(kDigestOne) +
-        "','candidate-bundle','candidate-graph','sha256:"
+        "','candidate-bundle','candidate-graph',7,NULL,'sha256:"
         "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'"
         ");";
     if (sqlite3_exec(database, sql.c_str(), nullptr, nullptr, nullptr) !=

@@ -84,6 +84,27 @@ def test_client_forwards_one_canonical_addressed_request(tmp_path: Path) -> None
     ]
 
 
+def test_client_reads_the_cclc_owner_identity(tmp_path: Path) -> None:
+    observed: list[dict[str, Any]] = []
+
+    def handler(request: dict[str, Any]) -> bytes:
+        observed.append(request)
+        return rfc8785.dumps(
+            _response(
+                "owner_identity",
+                {"request_owner_epoch": "cclc-owner.test"},
+            )
+        )
+
+    thread = _serve_once(tmp_path, handler)
+    result = CCLCOpenRequestClient(tmp_path).owner_identity()
+    thread.join(timeout=2)
+    assert not thread.is_alive()
+    assert result == {"request_owner_epoch": "cclc-owner.test"}
+    assert observed[0]["command"] == "owner_identity"
+    assert observed[0]["payload"] == {}
+
+
 def test_client_rejects_owner_error_and_noncanonical_response(tmp_path: Path) -> None:
     def error_handler(request: dict[str, Any]) -> bytes:
         return rfc8785.dumps(
@@ -151,6 +172,7 @@ def _lifecycle_request(*, confirmed: bool) -> dict[str, Any]:
         ],
         "reason": "operator-confirmed",
         "confirmed": confirmed,
+        "expected_admission_generation": 7,
     }
 
 
@@ -160,6 +182,9 @@ class FakeCCLC:
 
     def component_snapshot(self, component_id: str) -> dict[str, Any]:
         return {"controllable_component_id": component_id}
+
+    def owner_identity(self) -> dict[str, Any]:
+        return {"request_owner_epoch": "cclc-owner.http-test"}
 
     def route_templates(self, component_id: str) -> dict[str, Any]:
         return {
@@ -183,9 +208,24 @@ class FakeCCLC:
         return None
 
 
+class FakeAdmission:
+    def acquire(self, intent: dict[str, Any]) -> dict[str, Any]:
+        return {
+            "intent": intent,
+            "claim_generation": 1,
+            "acquired_admission_generation": 7,
+            "accepted_at_ns": 1,
+        }
+
+    def release(self, _release: dict[str, Any]) -> dict[str, Any]:
+        return {"authoring_allowed": True, "admission_generation": 8}
+
+
 def test_http_lifecycle_route_is_thin_and_requires_confirmation() -> None:
     fake = FakeCCLC()
-    service = HeadlessService(object(), object())  # type: ignore[arg-type]
+    service = HeadlessService(  # type: ignore[arg-type]
+        object(), object(), cell_admission=FakeAdmission()
+    )
     client = TestClient(create_app(service=service, cclc=fake))
 
     rejected = client.post(
@@ -202,11 +242,15 @@ def test_http_lifecycle_route_is_thin_and_requires_confirmation() -> None:
     )
     assert accepted.status_code == 200
     assert accepted.json()["replay_status"] == "request_id_conflict"
+    assert fake.lifecycle[0]["expected_admission_generation"] == 7
     assert len(fake.lifecycle) == 1
     assert "confirmed" not in fake.lifecycle[0]
 
     snapshot = client.get("/api/cclc/components/component.arm")
     assert snapshot.json() == {"controllable_component_id": "component.arm"}
+    assert client.get("/api/cclc/owner").json() == {
+        "request_owner_epoch": "cclc-owner.http-test"
+    }
     templates = client.get(
         "/api/cclc/components/component.arm/route-templates"
     )

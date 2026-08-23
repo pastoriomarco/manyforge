@@ -52,6 +52,7 @@ CCLCRuntimeComposition::CreateAndStart(
     std::vector<core::ControllerLifecyclePortRegistrationDTO> controller_ports,
     std::vector<core::KinematicResourceSourceProjectionDTO> source_projections,
     core::ICCLCKernelDisableHandoffPort &kernel_disable_handoff_port,
+    core::IKernelCellAdmissionPort &kernel_cell_admission_port,
     core::ICCLCKernelRouteConfigurationFencePort &kernel_route_fence_port,
     IRouteConfigurationKernelPublicationOwner &kernel_publication_owner,
     core::IClock &clock, core::IScheduler &scheduler,
@@ -82,7 +83,8 @@ CCLCRuntimeComposition::CreateAndStart(
             std::move(controller_sources), std::move(brand_ports),
             std::move(controller_ports), std::move(source_projections),
             std::move(kernel_current_configuration_source),
-            kernel_disable_handoff_port, kernel_route_fence_port,
+            kernel_disable_handoff_port, kernel_cell_admission_port,
+            kernel_route_fence_port,
             kernel_publication_owner, clock, scheduler));
     auto started = result->coordinator_.Start();
     if (!started.ok()) {
@@ -137,6 +139,7 @@ CCLCRuntimeComposition::CCLCRuntimeComposition(
         const core::ControlDomainId &)>
         kernel_current_configuration_source,
     core::ICCLCKernelDisableHandoffPort &kernel_disable_handoff_port,
+    core::IKernelCellAdmissionPort &kernel_cell_admission_port,
     core::ICCLCKernelRouteConfigurationFencePort &kernel_route_fence_port,
     IRouteConfigurationKernelPublicationOwner &kernel_publication_owner,
     core::IClock &clock, core::IScheduler &scheduler)
@@ -164,7 +167,7 @@ CCLCRuntimeComposition::CCLCRuntimeComposition(
       coordinator_(config_.coordinator, journal_, domain_reservations_,
                    lifecycle_snapshot_source_, lifecycle_catalog_source,
                    port_registry_, kernel_disable_handoff_port, clock,
-                   scheduler,
+                   scheduler, &kernel_cell_admission_port,
                    core::ComponentLifecycleCoordinatorRouteServices{
                        &route_snapshot_source_, &port_registry_,
                        &kernel_route_fence_port, &route_publication_port_}),

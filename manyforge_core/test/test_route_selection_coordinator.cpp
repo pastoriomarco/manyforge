@@ -224,8 +224,37 @@ class UnusedBrandResolver final : public ICCLCBrandLifecyclePortResolver {
   }
 };
 
-class UnusedDisablePort final : public ICCLCKernelDisableHandoffPort {
+class UnusedDisablePort final : public ICCLCKernelDisableHandoffPort,
+                                public IKernelCellAdmissionPort {
  public:
+  AuthoringAdmissionDTO GetAuthoringAdmission() const override {
+    return {true, AdmissionGeneration(1U)};
+  }
+  Result<AuthoringAdmissionDTO> UpdateCellAdmissionReadiness(
+      const CellAdmissionReadinessSnapshotDTO&) override {
+    return Result<AuthoringAdmissionDTO>::Ok(GetAuthoringAdmission());
+  }
+  Result<CellAdmissionClaimDTO> AcquireCellAdmissionClaim(
+      const CellAdmissionClaimIntentDTO&) override {
+    return Result<CellAdmissionClaimDTO>::Err(
+        {"unexpected_claim", "route test has no lifecycle claim", {}});
+  }
+  Result<AuthoringAdmissionDTO> ReleaseCellAdmissionClaim(
+      const CellAdmissionClaimReleaseDTO&) override {
+    return Result<AuthoringAdmissionDTO>::Err(
+        {"unexpected_claim", "route test has no lifecycle claim", {}});
+  }
+  Result<AuthoringAdmissionDTO> ReconcileCellAdmissionClaims(
+      const CellAdmissionReconcileDTO&) override {
+    return Result<AuthoringAdmissionDTO>::Ok(GetAuthoringAdmission());
+  }
+  Result<CellAdmissionRecoveryReceiptDTO> GetCellAdmissionRecoveryReceipt(
+      const CellAdmissionRecoveryReceiptQueryDTO&) const override {
+    return Result<CellAdmissionRecoveryReceiptDTO>::Ok(
+        {CellAdmissionRecoveryReceiptStatusDTO::kUnknown,
+         RequestOwnerEpoch("kernel.1"), AdmissionGeneration(1U), std::nullopt,
+         std::nullopt, std::nullopt, {}, {}});
+  }
   [[nodiscard]] Result<DisableHandoffAdmissionSnapshotDTO> ObserveDisableHandoffAdmission(
       const DisableHandoffAdmissionQueryDTO&) const override {
     return Result<DisableHandoffAdmissionSnapshotDTO>::Err(
@@ -775,7 +804,7 @@ TEST(RouteSelectionCoordinator, CompletesSatisfiedRouteThroughDurablePublication
                                                             &route_fence, &publisher};
   ComponentLifecycleCoordinator coordinator(Config(), journal, reservations, component_snapshots,
                                             catalogs, brand_resolver, disable_port, clock,
-                                            scheduler, route_services);
+                                            scheduler, nullptr, route_services);
 
   ASSERT_TRUE(coordinator.Start().ok());
   const auto accepted = coordinator.SubmitRouteSelection(Intent());
@@ -833,7 +862,7 @@ TEST(RouteSelectionCoordinator,
                                                             &route_fence, &publisher};
   ComponentLifecycleCoordinator coordinator(Config(), journal, reservations, component_snapshots,
                                             catalogs, brand_resolver, disable_port, clock,
-                                            scheduler, route_services);
+                                            scheduler, nullptr, route_services);
 
   ASSERT_TRUE(coordinator.Start().ok());
   const auto accepted = coordinator.SubmitRouteSelection(Intent());
@@ -888,7 +917,7 @@ TEST(RouteSelectionCoordinator,
         &route_snapshots, &controller_resolver, &route_fence, &publisher};
     ComponentLifecycleCoordinator coordinator(
         Config(RequestOwnerEpoch("cclc-owner.1")), journal, reservations, component_snapshots,
-        catalogs, brand_resolver, disable_port, clock, scheduler, route_services);
+        catalogs, brand_resolver, disable_port, clock, scheduler, nullptr, route_services);
     ASSERT_TRUE(coordinator.Start().ok());
     const auto accepted =
         coordinator.SubmitRouteSelection(Intent(RequestOwnerEpoch("cclc-owner.1")));
@@ -913,7 +942,7 @@ TEST(RouteSelectionCoordinator,
         &route_snapshots, &controller_resolver, &route_fence, &publisher};
     ComponentLifecycleCoordinator coordinator(
         Config(RequestOwnerEpoch("cclc-owner.2")), journal, reservations, component_snapshots,
-        catalogs, brand_resolver, disable_port, clock, scheduler, route_services);
+        catalogs, brand_resolver, disable_port, clock, scheduler, nullptr, route_services);
     const auto started = coordinator.Start();
     ASSERT_TRUE(started.ok()) << started.error().code << ": " << started.error().message;
     ASSERT_TRUE(coordinator.DrainFor(std::chrono::seconds(2)));
@@ -959,7 +988,7 @@ TEST(RouteSelectionCoordinator,
         &route_snapshots, &controller_resolver, &route_fence, &publisher};
     ComponentLifecycleCoordinator coordinator(
         Config(RequestOwnerEpoch("cclc-owner.1")), journal, reservations, component_snapshots,
-        catalogs, brand_resolver, disable_port, clock, scheduler, route_services);
+        catalogs, brand_resolver, disable_port, clock, scheduler, nullptr, route_services);
     ASSERT_TRUE(coordinator.Start().ok());
     const auto accepted =
         coordinator.SubmitRouteSelection(Intent(RequestOwnerEpoch("cclc-owner.1")));
@@ -988,7 +1017,7 @@ TEST(RouteSelectionCoordinator,
         &route_snapshots, &controller_resolver, &route_fence, &publisher};
     ComponentLifecycleCoordinator coordinator(
         Config(RequestOwnerEpoch("cclc-owner.2")), journal, reservations, component_snapshots,
-        catalogs, brand_resolver, disable_port, clock, scheduler, route_services);
+        catalogs, brand_resolver, disable_port, clock, scheduler, nullptr, route_services);
     const auto started = coordinator.Start();
     ASSERT_FALSE(started.ok());
     EXPECT_EQ(started.error().code, "route_selection_recovery_current_configuration_mismatch");
@@ -1005,7 +1034,7 @@ TEST(RouteSelectionCoordinator,
         &route_snapshots, &controller_resolver, &route_fence, &publisher};
     ComponentLifecycleCoordinator coordinator(
         Config(RequestOwnerEpoch("cclc-owner.3")), journal, reservations, component_snapshots,
-        catalogs, brand_resolver, disable_port, clock, scheduler, route_services);
+        catalogs, brand_resolver, disable_port, clock, scheduler, nullptr, route_services);
     const auto started = coordinator.Start();
     ASSERT_TRUE(started.ok()) << started.error().code << ": " << started.error().message;
     ASSERT_TRUE(coordinator.DrainFor(std::chrono::seconds(2)));
@@ -1050,7 +1079,7 @@ TEST(RouteSelectionCoordinator,
                                                             &route_fence, &publisher};
   ComponentLifecycleCoordinator coordinator(
       Config(RequestOwnerEpoch("cclc-owner.2")), journal, reservations, component_snapshots,
-      catalogs, brand_resolver, disable_port, clock, scheduler, route_services);
+      catalogs, brand_resolver, disable_port, clock, scheduler, nullptr, route_services);
   const auto started = coordinator.Start();
   ASSERT_TRUE(started.ok()) << started.error().code << ": " << started.error().message;
   ASSERT_TRUE(coordinator.DrainFor(std::chrono::seconds(2)));

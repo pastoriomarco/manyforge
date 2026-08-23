@@ -47,6 +47,11 @@ struct RetainedNativeRuntimeConfig final {
   /// Process-owned monitoring policy. Public operation/caller payloads never
   /// select or override these cadences.
   std::optional<core::StopSurveillancePolicyDTO> stop_surveillance_policy;
+  core::CellAdmissionInterventionValidator cell_admission_intervention_validator;
+  core::CellAdmissionSettlementValidator cell_admission_settlement_validator;
+  core::CellAdmissionReconcileValidator cell_admission_reconcile_validator;
+  std::optional<core::ManagerLivenessRequiredSetDTO>
+      manager_liveness_required_set;
 };
 
 inline constexpr core::StopSurveillancePolicyDTO
@@ -60,6 +65,11 @@ struct RetainedNativeAddressedOwnerConfig final {
   core::IResourceOperationAdmissionGate *operation_admission_gate{};
   core::GraphRevision graph_revision;
   std::optional<core::StopDeadlineBudgetDTO> cell_stop_deadline_budget;
+  core::CellAdmissionInterventionValidator cell_admission_intervention_validator;
+  core::CellAdmissionSettlementValidator cell_admission_settlement_validator;
+  core::CellAdmissionReconcileValidator cell_admission_reconcile_validator;
+  std::optional<core::ManagerLivenessRequiredSetDTO>
+      manager_liveness_required_set;
 };
 
 using RetainedMotionBackendRouteRebinder =

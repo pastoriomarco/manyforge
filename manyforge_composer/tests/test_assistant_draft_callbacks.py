@@ -230,6 +230,40 @@ def _resource(identity: str = "workpiece") -> dict:
     }
 
 
+class _AdmissionHeadless:
+    def authoring_admission(self) -> dict:
+        return {"authoring_allowed": True, "admission_generation": 7}
+
+    def acquire_authoring_transaction(self, body: dict) -> dict:
+        return {
+            "claim": {
+                "intent": {
+                    "claim_kind": "authoring_mutation",
+                    "owner_role": "authoring_owner",
+                    **body,
+                },
+                "claim_generation": 1,
+                "acquired_admission_generation": 7,
+            }
+        }
+
+    def settle_authoring_transaction(self, _body: dict) -> dict:
+        return {"admission": {"admission_generation": 8}}
+
+    def recover_authoring_transaction(self, _body: dict) -> dict:
+        return {
+            "recovery_receipt": {
+                "status": "unknown",
+                "kernel_owner_epoch": "kernel.1",
+                "held_claims": [],
+                "current_owner_epochs": [],
+            }
+        }
+
+    def reconcile_authoring_owner(self, _body: dict) -> dict:
+        return {"admission": {"admission_generation": 7}}
+
+
 def _body(
     state: ComposerState,
     node_environment: VerifiedActiveNodeEnvironment,
@@ -238,6 +272,14 @@ def _body(
 ) -> dict:
     snapshot = state.draft_session.snapshot()
     mode = assistant_mode.payload
+    assert state.authoring_admission is not None
+    state.authoring_admission.publish_complete_snapshot(
+        client_id="assistant-client",
+        sequence=1,
+        admission_generation=7,
+        draft_id=snapshot["draft_id"],
+        draft_revision=snapshot["draft_revision"],
+    )
     return {
         "assistantMode": "composer-assistant",
         "retainedBundleId": "bundle.1",
@@ -257,13 +299,19 @@ def _body(
         "expectedDraftRevision": snapshot["draft_revision"],
         "requestId": "assistant.request.1",
         "requestOwnerEpoch": "assistant.epoch.1",
+        "clientId": "assistant-client",
+        "snapshotReceiverEpoch": state.authoring_admission.receiver_epoch,
+        "snapshotSequence": 1,
+        "expectedAdmissionGeneration": 7,
         "sourceLabel": "assistant_bridge",
         "correlationId": None,
         "arguments": {"scene_resource": _resource()},
     }
 
 
-def test_callback_uses_exact_active_context_and_mutates_only_the_draft(monkeypatch) -> None:
+def test_callback_uses_exact_active_context_and_mutates_only_the_draft(
+    monkeypatch, tmp_path
+) -> None:
     node_environment = _node_environment()
     source_model = _source_model(node_environment)
     assistant_mode = _assistant_mode(node_environment)
@@ -273,7 +321,8 @@ def test_callback_uses_exact_active_context_and_mutates_only_the_draft(monkeypat
         node_environment=environment,
         program=program,
         program_source_path=str(_PROGRAM_PATH),
-        headless_client=object(),  # type: ignore[arg-type]
+        headless_client=_AdmissionHeadless(),  # type: ignore[arg-type]
+        authoring_state_root=str(tmp_path),
     )
     from manyforge_composer.backend import routes_assistant_draft as route
 
@@ -313,7 +362,9 @@ def test_callback_uses_exact_active_context_and_mutates_only_the_draft(monkeypat
     assert stale.json()["detail"]["code"] == "assistant_callback_context_stale"
 
 
-def test_allowed_tool_schema_error_is_a_non_mutating_http_200_result(monkeypatch) -> None:
+def test_allowed_tool_schema_error_is_a_non_mutating_http_200_result(
+    monkeypatch, tmp_path
+) -> None:
     node_environment = _node_environment()
     source_model = _source_model(node_environment)
     assistant_mode = _assistant_mode(node_environment)
@@ -322,7 +373,8 @@ def test_allowed_tool_schema_error_is_a_non_mutating_http_200_result(monkeypatch
         node_environment=environment,
         program=Program(_PROGRAM_PATH, environment.catalog),
         program_source_path=str(_PROGRAM_PATH),
-        headless_client=object(),  # type: ignore[arg-type]
+        headless_client=_AdmissionHeadless(),  # type: ignore[arg-type]
+        authoring_state_root=str(tmp_path),
     )
     from manyforge_composer.backend import routes_assistant_draft as route
 
@@ -358,7 +410,9 @@ def test_allowed_tool_schema_error_is_a_non_mutating_http_200_result(monkeypatch
     assert state.draft_session.snapshot() == before
 
 
-def test_callback_reapplies_field_narrowing_before_draft_mutation(monkeypatch) -> None:
+def test_callback_reapplies_field_narrowing_before_draft_mutation(
+    monkeypatch, tmp_path
+) -> None:
     node_environment = _node_environment()
     source_model = _source_model(node_environment)
     assistant_mode = _assistant_mode(node_environment)
@@ -367,7 +421,8 @@ def test_callback_reapplies_field_narrowing_before_draft_mutation(monkeypatch) -
         node_environment=environment,
         program=Program(_PROGRAM_PATH, environment.catalog),
         program_source_path=str(_PROGRAM_PATH),
-        headless_client=object(),  # type: ignore[arg-type]
+        headless_client=_AdmissionHeadless(),  # type: ignore[arg-type]
+        authoring_state_root=str(tmp_path),
     )
     from manyforge_composer.backend import routes_assistant_draft as route
 
@@ -407,7 +462,7 @@ def test_callback_reapplies_field_narrowing_before_draft_mutation(monkeypatch) -
 
 
 def test_malformed_assistant_mode_is_rejected_before_projection_lookup(
-    monkeypatch,
+    monkeypatch, tmp_path
 ) -> None:
     node_environment = _node_environment()
     source_model = _source_model(node_environment)
@@ -417,7 +472,8 @@ def test_malformed_assistant_mode_is_rejected_before_projection_lookup(
         node_environment=environment,
         program=Program(_PROGRAM_PATH, environment.catalog),
         program_source_path=str(_PROGRAM_PATH),
-        headless_client=object(),  # type: ignore[arg-type]
+        headless_client=_AdmissionHeadless(),  # type: ignore[arg-type]
+        authoring_state_root=str(tmp_path),
     )
     from manyforge_composer.backend import routes_assistant_draft as route
 
@@ -444,7 +500,7 @@ def test_malformed_assistant_mode_is_rejected_before_projection_lookup(
 
 
 def test_callback_cannot_mutate_a_program_that_forbids_assistant_authoring(
-    monkeypatch,
+    monkeypatch, tmp_path
 ) -> None:
     node_environment = _node_environment()
     source_model = _source_model(node_environment)
@@ -454,7 +510,8 @@ def test_callback_cannot_mutate_a_program_that_forbids_assistant_authoring(
         node_environment=environment,
         program=Program(_ASSISTANT_FORBIDDEN_PROGRAM_PATH, environment.catalog),
         program_source_path=str(_ASSISTANT_FORBIDDEN_PROGRAM_PATH),
-        headless_client=object(),  # type: ignore[arg-type]
+        headless_client=_AdmissionHeadless(),  # type: ignore[arg-type]
+        authoring_state_root=str(tmp_path),
     )
     from manyforge_composer.backend import routes_assistant_draft as route
 

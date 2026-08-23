@@ -3034,7 +3034,7 @@ OperationJournalRecoveryDTO SqliteOperationJournal::Impl::BeginOwnerEpoch(
   Require(!owner_epoch.empty() && started_at_ns >= 0 &&
               static_cast<std::uint64_t>(started_at_ns) <= kMaximumSafeInteger &&
               request_capacity > 0U && request_capacity <= kMaximumRequestCapacity &&
-              !resource_inventory.empty() && resource_inventory.size() <= kMaxKernelResourceSlots,
+              resource_inventory.size() <= kMaxKernelResourceSlots,
           "operation_journal_owner_epoch_invalid",
           "operation journal owner epoch admission is invalid");
   const std::set<ResourceId> inventory(resource_inventory.begin(), resource_inventory.end());

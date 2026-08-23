@@ -7,6 +7,8 @@ import { ProgramRuntimePanel } from './ProgramRuntimePanel';
 
 function controller(
   state: ProgramRunStateName = 'running',
+  cycleState: ProgramRuntimeController['cycleState'] =
+    state === 'succeeded' ? 'terminal_awaiting_reset' : 'running',
 ): ProgramRuntimeController {
   return {
     state: {
@@ -103,6 +105,7 @@ function controller(
       pending: null,
       error: null,
     },
+    cycleState,
     active: ['running', 'intervention_required', 'stopping', 'finalizing']
       .includes(state),
     refresh: vi.fn(),
@@ -110,6 +113,7 @@ function controller(
     clearScenarioSelection: vi.fn(),
     run: vi.fn(),
     stop: vi.fn(),
+    reset: vi.fn(),
   };
 }
 
@@ -123,7 +127,7 @@ describe('Program runtime projection', () => {
     expect(markup).toContain('program-run.1');
     expect(markup).toContain('revision 4');
     expect(markup).toContain('next-pick');
-    expect(markup).toContain('Selection for the next Run');
+    expect(markup).not.toContain('Selection for the next Run');
     expect(markup).toContain('Captured run Program');
     expect(markup).toContain('immutable for this run');
     expect(markup).toContain('Stop Program');
@@ -131,16 +135,24 @@ describe('Program runtime projection', () => {
     expect(markup).toContain('never sends Stop implicitly');
   });
 
-  it('enables Run only after the owner-issued run is terminal', () => {
+  it('enables Run only after the terminal cycle has been reset to Idle', () => {
     const active = renderToStaticMarkup(
       <ProgramRuntimePanel enabled controller={controller()} />,
     );
     const terminal = renderToStaticMarkup(
       <ProgramRuntimePanel enabled controller={controller('succeeded')} />,
     );
+    const resetIdle = renderToStaticMarkup(
+      <ProgramRuntimePanel
+        enabled
+        controller={controller('succeeded', 'idle_after_reset')}
+      />,
+    );
 
     expect(active).toMatch(/disabled=""[^>]*>Run Applied Program/);
-    expect(terminal).not.toMatch(/disabled=""[^>]*>Run Applied Program/);
+    expect(terminal).toMatch(/disabled=""[^>]*>Run Applied Program/);
+    expect(terminal).toContain('Reset Program cycle');
+    expect(resetIdle).not.toMatch(/disabled=""[^>]*>Run Applied Program/);
   });
 
   it('never turns an unavailable or unknown owner fact into idle or zero work', () => {

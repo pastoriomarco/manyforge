@@ -29,6 +29,23 @@ _ROOT = Path(__file__).resolve().parents[2]
 _SOURCE_PROGRAM = _ROOT / "examples" / "pick_and_place_minimal.program.yaml"
 
 
+class _AuthoringPassThrough:
+    """Keep route-unit tests focused; the real gate has dedicated tests."""
+
+    receiver_epoch = "composer-snapshot.test"
+    mutation_ready = True
+
+    def execute(self, _envelope, *, effect, prepare_effect=None, **_kwargs):
+        if prepare_effect is not None:
+            prepare_effect()
+        return effect({})
+
+
+def _enable_authoring(state: ComposerState) -> ComposerState:
+    state.authoring_admission = _AuthoringPassThrough()  # type: ignore[assignment]
+    return state
+
+
 def _copy_program(tmp_path: Path, name: str = "fixture.program.yaml") -> Path:
     target = tmp_path / name
     shutil.copyfile(_SOURCE_PROGRAM, target)
@@ -43,7 +60,7 @@ def _client(
 ) -> TestClient:
     return TestClient(
         create_app(
-            ComposerState(),
+            _enable_authoring(ComposerState()),
             security=SecurityConfig(
                 allowed_fs_roots=allowed_fs_roots or [str(tmp_path)],
                 allowed_program_write_roots=allowed_program_write_roots,
@@ -57,6 +74,12 @@ def _fence(workspace: dict) -> dict:
     return {
         "draftId": workspace["draft"]["draftId"],
         "expectedDraftRevision": workspace["draft"]["draftRevision"],
+        "clientId": "test-browser",
+        "snapshotReceiverEpoch": "composer-snapshot.test",
+        "snapshotSequence": 1,
+        "expectedAdmissionGeneration": 1,
+        "requestOwnerEpoch": "test-browser.epoch.1",
+        "requestId": "test-browser.request.1",
     }
 
 
@@ -206,11 +229,10 @@ def test_node_policy_rejections_are_atomic_and_do_not_read_headless(
 
     headless = FailOnHeadlessCall()
     program = Program(source, build_node_environment().catalog)
-    state = ComposerState(
+    state = _enable_authoring(ComposerState(
         program=program,
         program_source_path=str(source),
-        headless_client=headless,  # type: ignore[arg-type]
-    )
+    ))
     before = state.draft_session.workspace_snapshot()
     client = TestClient(
         create_app(
@@ -301,10 +323,9 @@ def test_node_policy_success_with_imported_node_a_skills_is_closed_and_headless_
             raise AssertionError(f"unexpected headless call: {name}")
 
     headless = FailOnHeadlessCall()
-    state = ComposerState(
+    state = _enable_authoring(ComposerState(
         program=program,
-        headless_client=headless,  # type: ignore[arg-type]
-    )
+    ))
     client = TestClient(
         create_app(
             state,
@@ -332,8 +353,7 @@ def test_node_policy_success_with_imported_node_a_skills_is_closed_and_headless_
     response = client.post(
         "/api/program/draft/mutations",
         json={
-            "draftId": before["draft_id"],
-            "expectedDraftRevision": before["draft_revision"],
+            **_fence(workspace),
             "mutation": "program_draft_update_node_policies",
             "arguments": {
                 "expected_program_revision": before["program_revision"],
@@ -366,8 +386,7 @@ def test_node_policy_success_with_imported_node_a_skills_is_closed_and_headless_
     blocked_apply = client.post(
         "/api/program/apply",
         json={
-            "draftId": body["draft"]["draftId"],
-            "expectedDraftRevision": body["draft"]["draftRevision"],
+            **_fence({"draft": body["draft"]}),
             "scenarioId": "cell-pick",
             "scenarioCatalogRevision": "sha256:" + "7" * 64,
         },
@@ -391,6 +410,7 @@ def test_node_policy_success_with_imported_node_a_skills_is_closed_and_headless_
             scenario_id="cell-pick",
             scenario_catalog_revision="sha256:" + "7" * 64,
             expected_applied_record_digest=None,
+            authoring_claim={},
         )
     assert direct_apply.value.status_code == 409
     assert direct_apply.value.code == "composer_policy_skill_referent_unavailable"
@@ -489,10 +509,10 @@ def test_create_app_security_fallback_overrides_preseeded_write_roots(
     read_root.mkdir()
     preseeded_write_root.mkdir()
     source = _copy_program(read_root)
-    state = ComposerState(
+    state = _enable_authoring(ComposerState(
         allowed_fs_roots=[str(preseeded_write_root)],
         allowed_program_write_roots=[str(preseeded_write_root)],
-    )
+    ))
     client = TestClient(
         create_app(
             state,

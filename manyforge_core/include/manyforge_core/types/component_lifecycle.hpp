@@ -271,6 +271,7 @@ struct ComponentLifecycleIntentDTO final {
   std::vector<ExpectedControlDomainRevisionDTO> expected_control_domains;
   std::optional<std::string> reason;
   RequestAttributionDTO attribution{};
+  AdmissionGeneration expected_admission_generation{1U};
 
   [[nodiscard]] bool locally_valid() const noexcept;
   [[nodiscard]] bool replay_equal(const ComponentLifecycleIntentDTO& other) const noexcept;

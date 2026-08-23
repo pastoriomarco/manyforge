@@ -1,5 +1,6 @@
-#include "manyforge_headless/owner_publication.hpp"
+#include "manyforge_headless/cell_admission_readiness_reducer.hpp"
 #include "manyforge_headless/manager_package_generation.hpp"
+#include "manyforge_headless/owner_publication.hpp"
 #include "manyforge_headless/scene_runtime_pose_projector.hpp"
 #include "manyforge_headless/scene_runtime_state_owner.hpp"
 #include "manyforge_headless/source_snapshot.hpp"
@@ -39,8 +40,10 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <cerrno>
 #include <chrono>
+#include <condition_variable>
 #include <cstdint>
 #include <cstring>
 #include <filesystem>
@@ -48,12 +51,14 @@
 #include <limits>
 #include <map>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <set>
 #include <stdexcept>
 #include <string>
 #include <string_view>
 #include <system_error>
+#include <thread>
 #include <tuple>
 #include <utility>
 #include <variant>
@@ -81,6 +86,15 @@ constexpr std::string_view kSceneRuntimeSourceFileName =
     "scene-runtime-source.json";
 constexpr std::string_view kManagerSocketFileName = "manager-command.sock";
 constexpr std::string_view kManagerDaemonLockFileName = ".manager-daemon.lock";
+constexpr std::string_view kProgramRunnerLivenessApiVersion =
+    "manyforge.program_runner_liveness.v1";
+constexpr std::string_view kProgramRunnerLivenessPolicyId =
+    "manyforge.program-runner.manager-presence.v1";
+constexpr std::string_view kProgramRunnerLivenessPolicyRevision = "1";
+constexpr std::string_view kProgramRunnerLocalSafeStateContractId =
+    "manyforge.program-runner.manager-loss-containment.v1";
+constexpr std::string_view kProgramRunnerLocalSafeStateContractRevision = "1";
+constexpr std::size_t kMaximumProgramRunnerLivenessPacketBytes = 16U * 1024U;
 constexpr std::size_t kMaximumCommandBytes =
     2U * scene::kMaximumLogicalSceneTransactionBytes + 8U * 1024U;
 constexpr std::size_t kMaximumResponseBytes =
@@ -155,16 +169,21 @@ std::filesystem::path ExistingDirectory(std::filesystem::path path,
   return path;
 }
 
-std::filesystem::path DatabasePath(std::filesystem::path path) {
+std::filesystem::path ProspectiveDatabasePath(std::filesystem::path path,
+                                              const std::string_view label) {
   Require(!path.empty() && path.has_filename() && path.filename() != "." &&
               path.filename() != "..",
-          "logical-scene database path is invalid");
+          std::string(label) + " path is invalid");
   static_cast<void>(
-      ExistingDirectory(path.parent_path(), "logical-scene database parent"));
+      ExistingDirectory(path.parent_path(), std::string(label) + " parent"));
   const auto status = std::filesystem::symlink_status(path);
   Require(!std::filesystem::is_symlink(status),
-          "logical-scene database path cannot be a symlink");
+          std::string(label) + " path cannot be a symlink");
   return path;
+}
+
+std::filesystem::path DatabasePath(std::filesystem::path path) {
+  return ProspectiveDatabasePath(std::move(path), "logical-scene database");
 }
 
 std::filesystem::path InstalledTargetRoot() {
@@ -304,7 +323,10 @@ struct DaemonConfig final {
   std::filesystem::path manager_state_root;
   std::filesystem::path runtime_state_root;
   std::filesystem::path logical_scene_database;
+  std::filesystem::path program_cycle_journal;
+  std::filesystem::path authoring_transaction_journal;
   std::filesystem::path publication_root;
+  std::filesystem::path program_runner_liveness_socket;
   std::chrono::milliseconds reconciliation_period{250};
 };
 
@@ -367,6 +389,8 @@ struct ManagerCommand final {
   std::optional<core::DeploymentRevision> deployment_revision{};
   std::optional<core::RetainedBundleId> expected_current_retained_bundle_id{};
   std::optional<core::GraphRevision> expected_current_graph_revision{};
+  std::optional<core::AdmissionGeneration> expected_admission_generation{};
+  std::optional<core::CellAdmissionClaimDTO> parent_authoring_claim{};
   std::optional<core::ProjectionRevisionDTO> expected_scene_projection{};
   std::vector<core::SceneResourceId> scene_resource_ids{};
   std::optional<core::ResolvedSceneCandidatePreviewRequestDTO>
@@ -430,6 +454,296 @@ void RequireExactObjectSize(const CanonicalValue &value, const std::size_t size,
 }
 
 std::uint64_t RequiredUnsigned(const CanonicalValue &value,
+                               std::string_view label);
+std::uint64_t RequiredNonnegativeUnsigned(const CanonicalValue &value,
+                                          std::string_view label);
+
+struct ProgramRunnerLivenessIdentity final {
+  core::RuntimeUnitId runtime_unit_id;
+  core::RuntimeEpoch runtime_epoch;
+  core::ProgramCycleStatusDTO program_cycle_status;
+};
+
+struct ProgramRunnerLivenessRenewal final {
+  core::ManagerLivenessObservationDTO observation;
+  core::ProgramCycleStatusDTO program_cycle_status;
+};
+
+core::ProgramCycleStatusDTO
+RequiredProgramCycleStatus(const CanonicalValue &value) {
+  RequireExactObjectSize(value, 6U, "Program Runner cycle status");
+  const auto state_name = RequiredString(value, "state");
+  core::ProgramCycleStateDTO state;
+  if (state_name == "idle_after_reset") {
+    state = core::ProgramCycleStateDTO::kIdleAfterReset;
+  } else if (state_name == "starting") {
+    state = core::ProgramCycleStateDTO::kStarting;
+  } else if (state_name == "running") {
+    state = core::ProgramCycleStateDTO::kRunning;
+  } else if (state_name == "stopping") {
+    state = core::ProgramCycleStateDTO::kStopping;
+  } else if (state_name == "terminal_awaiting_reset") {
+    state = core::ProgramCycleStateDTO::kTerminalAwaitingReset;
+  } else {
+    Fail("Program Runner cycle status has an unsupported state");
+  }
+  const auto run_id = OptionalString(value, "program_run_id");
+  const auto claim_generation =
+      std::holds_alternative<std::nullptr_t>(
+          RequiredMember(value, "cycle_claim_generation").storage())
+          ? std::nullopt
+          : std::optional<core::CellAdmissionClaimGeneration>(
+                RequiredUnsigned(
+                    RequiredMember(value, "cycle_claim_generation"),
+                    "Program Runner cycle claim generation"));
+  const auto terminal =
+      OptionalString(value, "terminal_or_settlement_reference");
+  core::ProgramCycleStatusDTO result{
+      core::RequestOwnerEpoch(
+          RequiredString(value, "program_runner_owner_epoch")),
+      RequiredUnsigned(RequiredMember(value, "cycle_generation"),
+                       "Program Runner cycle generation"),
+      state,
+      run_id.has_value()
+          ? std::optional<core::ProgramRunId>(core::ProgramRunId(*run_id))
+          : std::nullopt,
+      claim_generation,
+      terminal.has_value()
+          ? std::optional<core::ContentDigest>(core::ContentDigest(*terminal))
+          : std::nullopt};
+  Require(core::ValidateProgramCycleStatus(result).ok(),
+          "Program Runner cycle status is malformed");
+  return result;
+}
+
+CanonicalValue ExchangeProgramRunnerLivenessPacket(
+    const std::filesystem::path &path, const CanonicalValue &request) {
+  const auto spelling = path.string();
+  Require(!spelling.empty() && spelling.size() < sizeof(sockaddr_un::sun_path),
+          "Program Runner liveness socket path is invalid");
+  struct stat path_status {};
+  Require(::lstat(path.c_str(), &path_status) == 0 &&
+              S_ISSOCK(path_status.st_mode) &&
+              path_status.st_uid == ::geteuid(),
+          "Program Runner liveness socket is not an exact same-user socket");
+  FileDescriptor connection(
+      ::socket(AF_UNIX, SOCK_SEQPACKET | SOCK_CLOEXEC | SOCK_NONBLOCK, 0));
+  if (!connection) {
+    FailErrno("create Program Runner liveness connection");
+  }
+  sockaddr_un address{};
+  address.sun_family = AF_UNIX;
+  std::memcpy(address.sun_path, spelling.c_str(), spelling.size() + 1U);
+  if (::connect(connection.get(), reinterpret_cast<sockaddr *>(&address),
+                sizeof(address)) != 0 &&
+      errno != EINPROGRESS) {
+    FailErrno("connect Program Runner liveness socket");
+  }
+  pollfd ready{connection.get(), POLLOUT, 0};
+  int polled = -1;
+  do {
+    polled = ::poll(&ready, 1, kClientReadTimeoutMilliseconds);
+  } while (polled < 0 && errno == EINTR);
+  Require(polled == 1 && (ready.revents & POLLOUT) != 0,
+          "Program Runner liveness connection timed out");
+  int socket_error = 0;
+  socklen_t socket_error_size = sizeof(socket_error);
+  Require(::getsockopt(connection.get(), SOL_SOCKET, SO_ERROR, &socket_error,
+                       &socket_error_size) == 0 &&
+              socket_error == 0,
+          "Program Runner liveness connection was rejected");
+  struct ucred peer {};
+  socklen_t peer_size = sizeof(peer);
+  Require(::getsockopt(connection.get(), SOL_SOCKET, SO_PEERCRED, &peer,
+                       &peer_size) == 0 &&
+              peer_size == sizeof(peer) && peer.uid == ::geteuid(),
+          "Program Runner liveness peer uid is foreign");
+
+  const auto encoded = content_identity::canonical_json(request);
+  Require(encoded.size() <= kMaximumProgramRunnerLivenessPacketBytes,
+          "Program Runner liveness request exceeds its byte bound");
+  const auto sent =
+      ::send(connection.get(), encoded.data(), encoded.size(), MSG_NOSIGNAL);
+  Require(sent == static_cast<ssize_t>(encoded.size()),
+          "Program Runner liveness request was not sent exactly");
+  ready = pollfd{connection.get(), POLLIN, 0};
+  do {
+    polled = ::poll(&ready, 1, kClientReadTimeoutMilliseconds);
+  } while (polled < 0 && errno == EINTR);
+  Require(polled == 1 && (ready.revents & POLLIN) != 0,
+          "Program Runner liveness acknowledgement timed out");
+  std::array<char, kMaximumProgramRunnerLivenessPacketBytes + 1U> response{};
+  iovec vector{response.data(), response.size()};
+  msghdr message{};
+  message.msg_iov = &vector;
+  message.msg_iovlen = 1U;
+  const auto received = ::recvmsg(connection.get(), &message, 0);
+  Require(received > 0 &&
+              received <= static_cast<ssize_t>(
+                              kMaximumProgramRunnerLivenessPacketBytes) &&
+              (message.msg_flags & MSG_TRUNC) == 0,
+          "Program Runner liveness acknowledgement is empty or oversized");
+  const std::string_view bytes(response.data(),
+                               static_cast<std::size_t>(received));
+  CanonicalValue decoded;
+  try {
+    decoded = content_identity::parse_canonical_json(
+        bytes, {kMaximumProgramRunnerLivenessPacketBytes, 4U, 64U});
+  } catch (const std::exception &error) {
+    Fail("Program Runner liveness acknowledgement is invalid: " +
+         std::string(error.what()));
+  }
+  return decoded;
+}
+
+ProgramRunnerLivenessIdentity ProbeProgramRunnerLiveness(
+    const std::filesystem::path &path, const core::CellId &cell_id) {
+  const auto response = ExchangeProgramRunnerLivenessPacket(
+      path, CanonicalValue(CanonicalValue::Object{
+                {"api_version",
+                 CanonicalValue(std::string(kProgramRunnerLivenessApiVersion))},
+                {"cell_id", CanonicalValue(cell_id.value())},
+                {"kind", CanonicalValue("probe")},
+            }));
+  RequireExactObjectSize(response, 10U, "Program Runner liveness probe");
+  Require(RequiredString(response, "api_version") ==
+                  kProgramRunnerLivenessApiVersion &&
+              RequiredString(response, "kind") == "probe_ack" &&
+              RequiredString(response, "cell_id") == cell_id.value() &&
+              RequiredString(response, "runtime_policy_id") ==
+                  kProgramRunnerLivenessPolicyId &&
+              RequiredString(response, "runtime_policy_revision") ==
+                  kProgramRunnerLivenessPolicyRevision &&
+              RequiredString(response, "local_safe_state_contract_id") ==
+                  kProgramRunnerLocalSafeStateContractId &&
+              RequiredString(response,
+                             "local_safe_state_contract_revision") ==
+                  kProgramRunnerLocalSafeStateContractRevision,
+          "Program Runner liveness probe returned a foreign identity");
+  return {
+      core::RuntimeUnitId(
+          RequiredString(response, "receiver_runtime_unit_id")),
+      core::RuntimeEpoch(RequiredString(response, "receiver_runtime_epoch")),
+      RequiredProgramCycleStatus(
+          RequiredMember(response, "program_cycle_status"))};
+}
+
+ProgramRunnerLivenessRenewal RenewProgramRunnerLiveness(
+    const std::filesystem::path &path,
+    const ProgramRunnerLivenessIdentity &receiver,
+    const core::ManagerLivenessRequiredSetDTO &required_set,
+    const std::uint64_t sequence,
+    const core::ContentDigest &reconciliation_digest) {
+  const auto response = ExchangeProgramRunnerLivenessPacket(
+      path, CanonicalValue(CanonicalValue::Object{
+                {"active_bundle_id",
+                 CanonicalValue(required_set.active_bundle_id.value())},
+                {"api_version",
+                 CanonicalValue(std::string(kProgramRunnerLivenessApiVersion))},
+                {"cell_id", CanonicalValue(required_set.cell_id.value())},
+                {"heartbeat_sequence",
+                 CanonicalValue(static_cast<double>(sequence))},
+                {"kind", CanonicalValue("heartbeat")},
+                {"manager_owner_epoch",
+                 CanonicalValue(required_set.manager_owner_epoch.value())},
+                {"manager_runtime_epoch",
+                 CanonicalValue(required_set.manager_runtime_epoch.value())},
+                {"manager_runtime_unit_id",
+                 CanonicalValue(required_set.manager_runtime_unit_id.value())},
+                {"receiver_runtime_epoch",
+                 CanonicalValue(receiver.runtime_epoch.value())},
+                {"receiver_runtime_unit_id",
+                 CanonicalValue(receiver.runtime_unit_id.value())},
+                {"reconciliation_digest",
+                 CanonicalValue(reconciliation_digest.value())},
+                {"required_runtime_set_digest",
+                 CanonicalValue(
+                     required_set.required_runtime_set_digest.value())},
+                {"runtime_policy_id",
+                 CanonicalValue(
+                     std::string(kProgramRunnerLivenessPolicyId))},
+                {"runtime_policy_revision",
+                 CanonicalValue(
+                     std::string(kProgramRunnerLivenessPolicyRevision))},
+            }));
+  RequireExactObjectSize(response, 23U, "Program Runner heartbeat ack");
+  const auto local_age = RequiredNonnegativeUnsigned(
+      RequiredMember(response, "local_heartbeat_age_ns"),
+      "Program Runner local heartbeat age");
+  const auto receiver_status_sequence = RequiredUnsigned(
+      RequiredMember(response, "receiver_status_sequence"),
+      "Program Runner receiver status sequence");
+  const auto fault_reference = OptionalString(response, "fault_reference");
+  Require(
+      RequiredString(response, "api_version") ==
+              kProgramRunnerLivenessApiVersion &&
+          RequiredString(response, "schema_version") ==
+              "manyforge.program_runner_liveness_status.v1" &&
+          RequiredString(response, "kind") == "heartbeat_ack" &&
+          RequiredString(response, "cell_id") ==
+              required_set.cell_id.value() &&
+          RequiredString(response, "active_bundle_id") ==
+              required_set.active_bundle_id.value() &&
+          RequiredString(response, "required_runtime_set_digest") ==
+              required_set.required_runtime_set_digest.value() &&
+          RequiredString(response, "receiver_runtime_unit_id") ==
+              receiver.runtime_unit_id.value() &&
+          RequiredString(response, "receiver_runtime_epoch") ==
+              receiver.runtime_epoch.value() &&
+          RequiredString(response, "manager_runtime_epoch") ==
+              required_set.manager_runtime_epoch.value() &&
+          RequiredString(response, "manager_runtime_unit_id") ==
+              required_set.manager_runtime_unit_id.value() &&
+          RequiredString(response, "manager_owner_epoch") ==
+              required_set.manager_owner_epoch.value() &&
+          RequiredString(response, "runtime_policy_id") ==
+              kProgramRunnerLivenessPolicyId &&
+          RequiredString(response, "runtime_policy_revision") ==
+              kProgramRunnerLivenessPolicyRevision &&
+          RequiredString(response, "local_safe_state_contract_id") ==
+              kProgramRunnerLocalSafeStateContractId &&
+          RequiredString(response, "local_safe_state_contract_revision") ==
+              kProgramRunnerLocalSafeStateContractRevision &&
+          RequiredUnsigned(
+              RequiredMember(response, "last_accepted_heartbeat_sequence"),
+              "Program Runner heartbeat sequence") == sequence &&
+          RequiredString(response, "state") == "current" &&
+          !RequiredBool(response, "command_fenced") &&
+          (!fault_reference.has_value() ||
+           (fault_reference->starts_with("sha256:") &&
+            fault_reference->size() == 71U)),
+      "Program Runner liveness acknowledgement is not exact");
+  core::ManagerLivenessObservationDTO observation{
+      {required_set.cell_id,
+       receiver.runtime_unit_id,
+       receiver.runtime_epoch,
+       required_set.manager_runtime_unit_id,
+       required_set.manager_runtime_epoch,
+       required_set.manager_owner_epoch,
+       core::RuntimePolicyId(std::string(kProgramRunnerLivenessPolicyId)),
+       core::RuntimePolicyRevision(
+           std::string(kProgramRunnerLivenessPolicyRevision)),
+       sequence,
+       receiver_status_sequence,
+       static_cast<std::int64_t>(local_age),
+       core::ManagerLivenessStateDTO::kCurrent,
+       false,
+       fault_reference.has_value()
+           ? std::optional<core::ContentDigest>(
+                 core::ContentDigest(*fault_reference))
+           : std::nullopt},
+      required_set.active_bundle_id,
+      required_set.required_runtime_set_digest,
+      core::ContentDigest(
+          RequiredString(response, "receiver_status_digest"))};
+  Require(core::ValidateManagerLivenessObservation(observation).ok(),
+          "Program Runner liveness observation is malformed");
+  return {std::move(observation),
+          RequiredProgramCycleStatus(
+              RequiredMember(response, "program_cycle_status"))};
+}
+
+std::uint64_t RequiredUnsigned(const CanonicalValue &value,
                                const std::string_view label) {
   constexpr auto kMaximumSafeInteger = 9007199254740991ULL;
   const auto *number = std::get_if<double>(&value.storage());
@@ -453,6 +767,64 @@ std::uint64_t RequiredNonnegativeUnsigned(const CanonicalValue &value,
   Require(static_cast<double>(result) == *number,
           std::string(label) + " must be integral");
   return result;
+}
+
+core::CellAdmissionClaimDTO
+RequiredParentAuthoringClaim(const CanonicalValue &value) {
+  RequireExactObjectSize(value, 4U, "parent authoring claim");
+  const auto &intent_value = RequiredMember(value, "intent");
+  RequireExactObjectSize(intent_value, 10U, "parent authoring claim intent");
+  Require(RequiredString(intent_value, "claim_kind") ==
+                  "authoring_mutation" &&
+              RequiredString(intent_value, "owner_role") ==
+                  "authoring_owner",
+          "parent claim is not an authoring-owner mutation claim");
+  const auto &program_cycle =
+      RequiredMember(intent_value, "program_cycle_evidence");
+  const auto &intervention =
+      RequiredMember(intent_value, "intervention_evidence");
+  Require(program_cycle.is_null() && intervention.is_null(),
+          "parent authoring claim carries unsupported nested evidence");
+  const auto &scope = RequiredMember(intent_value, "scope");
+  RequireExactObjectSize(scope, 2U, "parent authoring claim scope");
+  const auto *resources = std::get_if<CanonicalValue::Array>(
+      &RequiredMember(scope, "resources").storage());
+  const auto *configurations = std::get_if<CanonicalValue::Array>(
+      &RequiredMember(scope, "configurations").storage());
+  Require(resources != nullptr && resources->empty() &&
+              configurations != nullptr && configurations->empty(),
+          "parent authoring claim must have the cell-global empty scope");
+  const auto request_payload_digest =
+      RequiredString(intent_value, "request_payload_digest");
+  Require(core::IsExactLowercaseSha256Digest(request_payload_digest),
+          "parent authoring claim payload digest is invalid");
+  core::CellAdmissionClaimDTO claim{
+      {
+          core::CellAdmissionClaimKindDTO::kAuthoringMutation,
+          core::CellAdmissionOwnerRoleDTO::kAuthoringOwner,
+          core::RequestOwnerEpoch(RequiredString(intent_value, "owner_epoch")),
+          RequiredString(intent_value, "owner_transaction_id"),
+          core::RequestId(RequiredString(intent_value, "request_id")),
+          core::ContentDigest(request_payload_digest),
+          core::AdmissionGeneration(RequiredUnsigned(
+              RequiredMember(intent_value, "expected_admission_generation"),
+              "parent expected_admission_generation")),
+          {},
+          std::nullopt,
+          std::nullopt,
+      },
+      core::CellAdmissionClaimGeneration(RequiredUnsigned(
+          RequiredMember(value, "claim_generation"),
+          "parent claim_generation")),
+      core::AdmissionGeneration(RequiredUnsigned(
+          RequiredMember(value, "acquired_admission_generation"),
+          "parent acquired_admission_generation")),
+      static_cast<std::int64_t>(RequiredNonnegativeUnsigned(
+          RequiredMember(value, "accepted_at_ns"), "parent accepted_at_ns")),
+  };
+  Require(core::ValidateCellAdmissionClaimIntent(claim.intent).ok(),
+          "parent authoring claim is invalid");
+  return claim;
 }
 
 SceneRuntimeIdentity RequiredSceneRuntimeIdentity(const CanonicalValue &value) {
@@ -694,7 +1066,7 @@ ManagerCommand DecodeCommand(const std::string_view bytes) {
     return result;
   }
   Require(command == "apply", "command kind is unsupported");
-  RequireExactObjectSize(root, 10U, "Apply command");
+  RequireExactObjectSize(root, 11U, "Apply command");
   const auto request_id = RequiredString(root, "request_id");
   const auto request_owner_epoch = RequiredString(root, "request_owner_epoch");
   const auto source_label = RequiredString(root, "source_label");
@@ -712,6 +1084,8 @@ ManagerCommand DecodeCommand(const std::string_view bytes) {
       RequiredString(expected, "retained_bundle_id");
   Require(RequiredBool(root, "reject_if_affected_busy"),
           "Apply busy disposition must be reject_if_affected_busy");
+  const auto &admission_context = RequiredMember(root, "admission_context");
+  const auto admission_kind = RequiredString(admission_context, "kind");
   ManagerCommand result{
       CommandKind::kApply, request_id,   request_owner_epoch, source_label,
       correlation_id,      std::nullopt, std::nullopt,        std::nullopt,
@@ -723,6 +1097,21 @@ ManagerCommand DecodeCommand(const std::string_view bytes) {
       core::RetainedBundleId(expected_retained_bundle_id);
   result.expected_current_graph_revision =
       core::GraphRevision(expected_graph_revision);
+  if (admission_kind == "direct") {
+    RequireExactObjectSize(admission_context, 2U, "direct admission context");
+    result.expected_admission_generation = core::AdmissionGeneration(
+        RequiredUnsigned(
+            RequiredMember(admission_context,
+                           "expected_admission_generation"),
+            "expected_admission_generation"));
+  } else {
+    Require(admission_kind == "parent_authoring_claim",
+            "Apply admission context kind is unsupported");
+    RequireExactObjectSize(admission_context, 2U,
+                           "parent admission context");
+    result.parent_authoring_claim = RequiredParentAuthoringClaim(
+        RequiredMember(admission_context, "claim"));
+  }
   return result;
 }
 
@@ -1294,11 +1683,13 @@ public:
                                 kLaunchEnvironmentContract),
                 std::string(
                     deployment::ros2_control_execution_runtime_contract::
-                        kLaunchEnvironmentContract)}),
+                        kLaunchEnvironmentContract)},
+            config_.logical_scene_database, config_.program_cycle_journal,
+            config_.authoring_transaction_journal),
         stores_(config_.manager_state_root, admission_),
         scene_owner_(config_.logical_scene_database, admission_,
                      stores_.active_bundle_publication_store(), bundle_source_,
-                     native_runtime_adapter_),
+                     native_runtime_adapter_, native_runtime_adapter_),
         scene_runtime_pose_projector_(scene_owner_, admission_.cell_id()),
         plan_source_(stores_.active_bundle_publication_store(),
                      stores_.apply_journal(),
@@ -1321,6 +1712,7 @@ public:
             stores_.apply_journal(), plan_source_, bundle_source_,
             artifact_source_, stores_.active_bundle_publication_store(),
             scene_owner_, &scene_owner_, native_runtime_adapter_,
+            native_runtime_adapter_,
             native_runtime_adapter_, runtime_adapter_router_,
             runtime_adapter_router_, manager_runtime_epoch_, "linux",
             {std::string(deployment::native_execution_runtime_contract::
@@ -1357,31 +1749,40 @@ public:
 
   int Run() {
     CommandSocket command_socket(config_.manager_state_root);
-    while (g_stop_requested == 0) {
-      pollfd descriptor{command_socket.get(), POLLIN, 0};
-      int ready = -1;
-      do {
-        ready = ::poll(&descriptor, 1,
-                       static_cast<int>(config_.reconciliation_period.count()));
-      } while (ready < 0 && errno == EINTR && g_stop_requested == 0);
-      if (g_stop_requested != 0) {
-        break;
+    StartNativeManagerLivenessLane();
+    try {
+      while (g_stop_requested == 0) {
+        pollfd descriptor{command_socket.get(), POLLIN, 0};
+        int ready = -1;
+        do {
+          ready = ::poll(
+              &descriptor, 1,
+              static_cast<int>(config_.reconciliation_period.count()));
+        } while (ready < 0 && errno == EINTR && g_stop_requested == 0);
+        if (g_stop_requested != 0) {
+          break;
+        }
+        if (ready < 0) {
+          FailErrno("poll Manager command socket");
+        }
+        if (ready == 0) {
+          TryPeriodicReconcile();
+          continue;
+        }
+        if ((descriptor.revents & POLLIN) != 0 &&
+            HandleOneClient(command_socket)) {
+          StopNativeManagerLivenessLane();
+          return 0;
+        }
+        if ((descriptor.revents & (POLLERR | POLLHUP | POLLNVAL)) != 0) {
+          Fail("Manager command socket became unavailable");
+        }
       }
-      if (ready < 0) {
-        FailErrno("poll Manager command socket");
-      }
-      if (ready == 0) {
-        TryPeriodicReconcile();
-        continue;
-      }
-      if ((descriptor.revents & POLLIN) != 0 &&
-          HandleOneClient(command_socket)) {
-        return 0;
-      }
-      if ((descriptor.revents & (POLLERR | POLLHUP | POLLNVAL)) != 0) {
-        Fail("Manager command socket became unavailable");
-      }
+    } catch (...) {
+      StopNativeManagerLivenessLane();
+      throw;
     }
+    StopNativeManagerLivenessLane();
     return 0;
   }
 
@@ -1390,6 +1791,12 @@ private:
     std::uint64_t manager;
     std::uint64_t scene;
     std::uint64_t scene_runtime;
+  };
+
+  struct NativeManagerLivenessSnapshot final {
+    component_manager::ManagerActiveRuntimeConvergenceResult runtime;
+    std::shared_ptr<const deployment::RetainedBundle> active_bundle;
+    std::uint32_t unsettled_effect_count{};
   };
 
   struct PoseObserverSession final {
@@ -1424,6 +1831,19 @@ private:
         std::move(config.publication_root), "publication root");
     config.logical_scene_database =
         DatabasePath(std::move(config.logical_scene_database));
+    config.program_cycle_journal = ProspectiveDatabasePath(
+        std::move(config.program_cycle_journal), "Program-cycle journal");
+    config.authoring_transaction_journal = ProspectiveDatabasePath(
+        std::move(config.authoring_transaction_journal),
+        "Composer authoring transaction journal");
+    if (!config.program_runner_liveness_socket.empty()) {
+      Require(config.program_runner_liveness_socket.is_absolute() &&
+                  config.program_runner_liveness_socket.has_filename(),
+              "Program Runner liveness socket path must be absolute");
+      static_cast<void>(ExistingDirectory(
+          config.program_runner_liveness_socket.parent_path(),
+          "Program Runner liveness socket parent"));
+    }
     Require(config.reconciliation_period >= std::chrono::milliseconds(10) &&
                 config.reconciliation_period <= std::chrono::seconds(60),
             "reconciliation period must be between 10 ms and 60 s");
@@ -1548,6 +1968,14 @@ private:
     const auto runtime = active_runtime_.Reconcile();
     last_runtime_ = runtime;
     kernel_apply_available_ = HasConvergedKernelApplyOwner(runtime);
+    if (kernel_apply_available_ &&
+        !scene_admission_reconciled_.load(std::memory_order_acquire)) {
+      const auto reconciled =
+          scene_owner_.ReconcileAuthoredSceneAdmissionClaims();
+      if (reconciled.ok()) {
+        scene_admission_reconciled_.store(true, std::memory_order_release);
+      }
+    }
     const auto bundle_id =
         runtime.plan.active_publication.request.candidate_retained_bundle_id;
     const auto active_bundle = bundle_source_.get_verified(bundle_id);
@@ -1629,21 +2057,203 @@ private:
 
     const auto scene_generation = PublishLogicalScene(observed_at);
     const auto scene_runtime_generation = PublishSceneRuntime(observed_at);
-    TryRenewNativeManagerLiveness(runtime, *active_bundle);
+    const auto apply_inventory =
+        stores_.apply_journal().ReadStatusInventory();
+    const auto unsettled = static_cast<std::size_t>(std::count_if(
+        apply_inventory.begin(), apply_inventory.end(), [](const auto& status) {
+          return !status.terminal_outcome.has_value();
+        }));
+    Require(unsettled <= std::numeric_limits<std::uint32_t>::max(),
+            "unsettled Manager effect count exceeds readiness capacity");
+    PublishNativeManagerLivenessSnapshot(
+        {runtime, active_bundle, static_cast<std::uint32_t>(unsettled)});
     return {manager.source_generation, scene_generation,
             scene_runtime_generation};
   }
 
-  void TryRenewNativeManagerLiveness(
+  core::CellAdmissionReadinessSnapshotDTO BuildCellAdmissionReadiness(
       const component_manager::ManagerActiveRuntimeConvergenceResult& runtime,
-      const deployment::RetainedBundle& active_bundle) noexcept {
+      const core::ProgramCycleStatusDTO& program_cycle_status,
+      const std::uint32_t unsettled_effect_count,
+      const bool forced_closed) {
+    const auto component_total = runtime.plan.runtime_units.size();
+    Require(component_total <= std::numeric_limits<std::uint32_t>::max(),
+            "required runtime-unit count exceeds readiness capacity");
+    std::uint32_t ready = 0U;
+    std::uint32_t faults = 0U;
+    for (const auto& row : runtime.plan.runtime_units) {
+      const auto* observation =
+          runtime.observations.observation(row.runtime_unit_id.value());
+      Require(observation != nullptr,
+              "required runtime-unit observation is absent");
+      if (observation->converged()) {
+        ++ready;
+      }
+      if (observation->source_phase() ==
+              component_manager::RuntimeSourcePhase::kFaulted ||
+          observation->source_health() ==
+              component_manager::RuntimeSourceHealth::kFaulted) {
+        ++faults;
+      }
+    }
+    return ReduceManagerCellAdmissionReadiness({
+        !forced_closed,
+        program_cycle_status,
+        !forced_closed,
+        static_cast<std::uint32_t>(component_total),
+        ready,
+        !forced_closed,
+        runtime.state ==
+            component_manager::ManagerActiveRuntimeConvergenceState::kConverged,
+        faults,
+        scene_admission_reconciled_.load(std::memory_order_acquire) ? 0U : 1U,
+        unsettled_effect_count,
+    });
+  }
+
+  void SubmitCellAdmissionReadiness(
+      const core::CellAdmissionReadinessSnapshotDTO& snapshot) {
+    const auto updated =
+        native_runtime_adapter_.UpdateCellAdmissionReadiness(snapshot);
+    if (!updated.ok()) {
+      throw std::runtime_error(
+          "Kernel rejected Manager-owned cell-admission readiness: " +
+          updated.error().message);
+    }
+    last_submitted_readiness_ = snapshot;
+  }
+
+  void SubmitFailClosedReadiness(
+      const std::optional<core::ProgramCycleStatusDTO>& status =
+          std::nullopt) noexcept {
+    const auto current = status.has_value()
+                             ? status
+                             : (last_submitted_readiness_.has_value()
+                                    ? last_submitted_readiness_
+                                          ->program_cycle_status
+                                    : std::nullopt);
+    if (!current.has_value()) {
+      return;
+    }
+    auto closed = last_submitted_readiness_.value_or(
+        core::CellAdmissionReadinessSnapshotDTO{});
+    closed.program_cycle_status_current = false;
+    closed.program_cycle_status = *current;
+    closed.required_component_status_current = false;
+    closed.deployment_status_current = false;
+    try {
+      SubmitCellAdmissionReadiness(closed);
+    } catch (...) {
+      // Withhold renewal as well; Kernel liveness independently expires.
+    }
+  }
+
+  [[nodiscard]] static bool SameNativeManagerLivenessIdentity(
+      const NativeManagerLivenessSnapshot& left,
+      const NativeManagerLivenessSnapshot& right) {
+    if (left.active_bundle == nullptr || right.active_bundle == nullptr ||
+        left.runtime.plan.active_publication !=
+            right.runtime.plan.active_publication ||
+        left.active_bundle->retained_bundle_id() !=
+            right.active_bundle->retained_bundle_id() ||
+        left.runtime.state != right.runtime.state ||
+        left.runtime.plan.runtime_units.size() !=
+            right.runtime.plan.runtime_units.size()) {
+      return false;
+    }
+    for (const auto& row : left.runtime.plan.runtime_units) {
+      const auto right_row = std::find_if(
+          right.runtime.plan.runtime_units.begin(),
+          right.runtime.plan.runtime_units.end(), [&](const auto& candidate) {
+            return candidate.runtime_unit_id == row.runtime_unit_id &&
+                   candidate.process_adapter_contract_id ==
+                       row.process_adapter_contract_id &&
+                   candidate.product_identity == row.product_identity;
+          });
+      const auto* left_observation =
+          left.runtime.observations.observation(row.runtime_unit_id.value());
+      const auto* right_observation =
+          right.runtime.observations.observation(row.runtime_unit_id.value());
+      if (right_row == right.runtime.plan.runtime_units.end() ||
+          left_observation == nullptr || right_observation == nullptr ||
+          left_observation->runtime_epoch() !=
+              right_observation->runtime_epoch()) {
+        return false;
+      }
+    }
+    return true;
+  }
+
+  void PublishNativeManagerLivenessSnapshot(
+      NativeManagerLivenessSnapshot snapshot) {
+    if (config_.program_runner_liveness_socket.empty()) {
+      return;
+    }
+    bool wake = false;
+    {
+      std::lock_guard lock(manager_liveness_lane_mutex_);
+      wake = !manager_liveness_snapshot_.has_value() ||
+             !SameNativeManagerLivenessIdentity(
+                 *manager_liveness_snapshot_, snapshot);
+      manager_liveness_snapshot_ = std::move(snapshot);
+      manager_liveness_force_closed_ = false;
+      if (manager_liveness_superseded_publication_.has_value() &&
+          manager_liveness_snapshot_->runtime.plan.active_publication !=
+              *manager_liveness_superseded_publication_) {
+        manager_liveness_superseded_publication_.reset();
+      }
+      if (wake) {
+        ++manager_liveness_wake_generation_;
+      }
+    }
+    if (wake) {
+      manager_liveness_lane_condition_.notify_one();
+    }
+  }
+
+  void TrySubmitFailClosedReadiness() noexcept {
+    if (config_.program_runner_liveness_socket.empty()) {
+      return;
+    }
+    {
+      std::lock_guard lock(manager_liveness_lane_mutex_);
+      manager_liveness_force_closed_ = true;
+      ++manager_liveness_readiness_barrier_;
+      ++manager_liveness_wake_generation_;
+    }
+    manager_liveness_lane_condition_.notify_one();
+  }
+
+  void TryRenewNativeManagerLiveness(
+      const NativeManagerLivenessSnapshot& snapshot,
+      const bool forced_closed,
+      const std::uint64_t readiness_barrier) noexcept {
+    const auto& runtime = snapshot.runtime;
+    const auto& active_bundle = *snapshot.active_bundle;
     const auto now_ns = ElapsedNs();
     if (!manager_liveness_retry_gate_.attempt_allowed(now_ns)) {
       return;
     }
+    std::optional<core::ProgramCycleStatusDTO> probed_cycle_status;
     try {
-      std::vector<core::RequiredManagerLivenessReceiverDTO> receivers;
-      receivers.reserve(runtime.plan.runtime_units.size());
+      const auto runner = ProbeProgramRunnerLiveness(
+          config_.program_runner_liveness_socket, admission_.cell_id());
+      probed_cycle_status = runner.program_cycle_status;
+      const auto readiness =
+          BuildCellAdmissionReadiness(
+              runtime, *probed_cycle_status,
+              snapshot.unsettled_effect_count, forced_closed);
+      if (last_submitted_readiness_.has_value() &&
+          *last_submitted_readiness_ != readiness) {
+        // Close first so a later renewal/submission failure cannot leave the
+        // previous optimistic reduction installed.
+        SubmitFailClosedReadiness(probed_cycle_status);
+        Require(last_submitted_readiness_.has_value() &&
+                    !last_submitted_readiness_->program_cycle_status_current,
+                "Kernel could not be closed before a readiness transition");
+      }
+      std::vector<core::RequiredManagerLivenessReceiverDTO> native_receivers;
+      native_receivers.reserve(runtime.plan.runtime_units.size());
       const auto& retained_policy =
           deployment::native_execution_runtime_contract::
               manager_liveness_policy();
@@ -1670,14 +2280,17 @@ private:
           throw std::runtime_error(
               "active native runtime has no exact retained liveness policy");
         }
-        receivers.push_back(core::RequiredManagerLivenessReceiverDTO{
+        native_receivers.push_back(core::RequiredManagerLivenessReceiverDTO{
             row.runtime_unit_id, core::RuntimeEpoch(observation->runtime_epoch()),
             retained_policy.runtime_policy_id,
             retained_policy.runtime_policy_revision});
       }
-      if (receivers.empty()) {
-        return;
-      }
+      auto receivers = native_receivers;
+      receivers.push_back(core::RequiredManagerLivenessReceiverDTO{
+          runner.runtime_unit_id, runner.runtime_epoch,
+          core::RuntimePolicyId(std::string(kProgramRunnerLivenessPolicyId)),
+          core::RuntimePolicyRevision(
+              std::string(kProgramRunnerLivenessPolicyRevision))});
       std::sort(receivers.begin(), receivers.end(),
                 [](const auto& left, const auto& right) {
                   return std::tie(left.runtime_unit_id, left.runtime_epoch,
@@ -1745,20 +2358,27 @@ private:
       }
       std::vector<component_manager::ManagerLivenessTransportRequestDTO>
           requests;
-      requests.reserve(receivers.size());
-      for (const auto& receiver : receivers) {
+      requests.reserve(native_receivers.size());
+      for (const auto& receiver : native_receivers) {
         requests.push_back(
-            {receiver.runtime_unit_id, required_set, retained_policy, heartbeat,
-             reconciliation});
+            {receiver.runtime_unit_id,
+             runtime.plan.active_publication.publication_generation,
+             runtime.plan.active_publication.request.candidate_graph_revision,
+             runtime.plan.active_publication
+                 .durable_public_pointer_content_digest,
+             required_set, retained_policy, heartbeat, reconciliation});
       }
       const auto responses =
-          native_runtime_adapter_.RenewManagerLivenessBatch(requests);
-      if (responses.size() != receivers.size()) {
+          requests.empty()
+              ? std::vector<
+                    core::ManagerLivenessObservationDTO>{}
+              : native_runtime_adapter_.RenewManagerLivenessBatch(requests);
+      if (responses.size() != native_receivers.size()) {
         throw std::runtime_error(
             "native liveness batch returned the wrong receiver count");
       }
-      for (std::size_t index = 0U; index < receivers.size(); ++index) {
-        const auto& receiver = receivers[index];
+      for (std::size_t index = 0U; index < native_receivers.size(); ++index) {
+        const auto& receiver = native_receivers[index];
         const auto& response = responses[index];
         if (response.active_bundle_id != required_set.active_bundle_id ||
             response.required_runtime_set_digest != digest ||
@@ -1781,8 +2401,63 @@ private:
               "evidence");
         }
       }
+      if (!reconciliation.has_value()) {
+        throw std::runtime_error(
+            "Program Runner liveness requires converged reconciliation");
+      }
+      const auto runner_renewal = RenewProgramRunnerLiveness(
+          config_.program_runner_liveness_socket, runner, required_set,
+          manager_heartbeat_sequence_,
+          reconciliation->reconciliation_evidence_digest);
+      Require(runner_renewal.program_cycle_status == *probed_cycle_status,
+              "Program cycle changed across one Manager liveness renewal");
+      const auto published_runner =
+          native_runtime_adapter_.Publish(runner_renewal.observation);
+      if (!published_runner.ok()) {
+        throw std::runtime_error(
+            "Kernel rejected Program Runner liveness observation: " +
+            published_runner.error().message);
+      }
+      if (!last_submitted_readiness_.has_value() ||
+          *last_submitted_readiness_ != readiness) {
+        {
+          std::lock_guard lock(manager_liveness_lane_mutex_);
+          Require(forced_closed ||
+                      (readiness_barrier ==
+                           manager_liveness_readiness_barrier_ &&
+                       !manager_liveness_force_closed_),
+                  "Manager liveness snapshot changed during renewal");
+        }
+        SubmitCellAdmissionReadiness(readiness);
+      }
+      manager_liveness_retry_gate_.RecordSuccess();
+    } catch (const component_manager::
+                 ManagerLivenessPublicationSuperseded&) {
+      SubmitFailClosedReadiness(probed_cycle_status);
+      {
+        std::lock_guard lock(manager_liveness_lane_mutex_);
+        if (!manager_liveness_snapshot_.has_value() ||
+            !SameNativeManagerLivenessIdentity(
+                snapshot, *manager_liveness_snapshot_)) {
+          return;
+        }
+        manager_liveness_superseded_publication_ =
+            snapshot.runtime.plan.active_publication;
+      }
+      // Every native receiver rejected before renewal and the adapter drained
+      // the complete batch.  Preserve fail-closed readiness, but do not spend
+      // the lease-expiry retry budget on this expected publication race.
       manager_liveness_retry_gate_.RecordSuccess();
     } catch (const std::exception& error) {
+      SubmitFailClosedReadiness(probed_cycle_status);
+      {
+        std::lock_guard lock(manager_liveness_lane_mutex_);
+        if (manager_liveness_snapshot_.has_value() &&
+            !SameNativeManagerLivenessIdentity(
+                snapshot, *manager_liveness_snapshot_)) {
+          return;
+        }
+      }
       const auto failure_ns = ElapsedNs();
       const auto expiry = static_cast<std::uint64_t>(
           deployment::native_execution_runtime_contract::
@@ -1792,6 +2467,15 @@ private:
       std::cerr << "Manager native liveness renewal remains fail-closed: "
                 << error.what() << '\n';
     } catch (...) {
+      SubmitFailClosedReadiness(probed_cycle_status);
+      {
+        std::lock_guard lock(manager_liveness_lane_mutex_);
+        if (manager_liveness_snapshot_.has_value() &&
+            !SameNativeManagerLivenessIdentity(
+                snapshot, *manager_liveness_snapshot_)) {
+          return;
+        }
+      }
       const auto failure_ns = ElapsedNs();
       const auto expiry = static_cast<std::uint64_t>(
           deployment::native_execution_runtime_contract::
@@ -1799,6 +2483,73 @@ private:
                   .expiry_timeout_ns);
       manager_liveness_retry_gate_.RecordFailure(failure_ns, expiry);
       std::cerr << "Manager native liveness renewal remains fail-closed\n";
+    }
+  }
+
+  void StartNativeManagerLivenessLane() {
+    if (config_.program_runner_liveness_socket.empty()) {
+      return;
+    }
+    Require(!manager_liveness_lane_.joinable(),
+            "Manager liveness renewal lane is already running");
+    {
+      std::lock_guard lock(manager_liveness_lane_mutex_);
+      manager_liveness_lane_stop_ = false;
+    }
+    manager_liveness_lane_ =
+        std::thread([this] { RunNativeManagerLivenessLane(); });
+  }
+
+  void StopNativeManagerLivenessLane() noexcept {
+    if (!manager_liveness_lane_.joinable()) {
+      return;
+    }
+    {
+      std::lock_guard lock(manager_liveness_lane_mutex_);
+      manager_liveness_lane_stop_ = true;
+    }
+    manager_liveness_lane_condition_.notify_one();
+    manager_liveness_lane_.join();
+  }
+
+  void RunNativeManagerLivenessLane() noexcept {
+    const auto heartbeat_period = std::chrono::nanoseconds(
+        deployment::native_execution_runtime_contract::
+            manager_liveness_policy()
+                .heartbeat_period_ns);
+    std::unique_lock lock(manager_liveness_lane_mutex_);
+    while (!manager_liveness_lane_stop_) {
+      const auto snapshot = manager_liveness_snapshot_;
+      const auto superseded_publication =
+          manager_liveness_superseded_publication_;
+      const auto forced_closed = manager_liveness_force_closed_;
+      const auto readiness_barrier = manager_liveness_readiness_barrier_;
+      const auto wake_generation = manager_liveness_wake_generation_;
+      lock.unlock();
+      if (snapshot.has_value() &&
+          (!superseded_publication.has_value() ||
+           snapshot->runtime.plan.active_publication !=
+               *superseded_publication)) {
+        if (!manager_liveness_attempted_publication_.has_value() ||
+            *manager_liveness_attempted_publication_ !=
+                snapshot->runtime.plan.active_publication) {
+          // A durable successor is independent work.  Never carry a
+          // predecessor batch's retry delay across the publication boundary.
+          manager_liveness_retry_gate_.RecordSuccess();
+          manager_liveness_attempted_publication_ =
+              snapshot->runtime.plan.active_publication;
+        }
+        TryRenewNativeManagerLiveness(*snapshot, forced_closed,
+                                      readiness_barrier);
+      } else {
+        SubmitFailClosedReadiness();
+      }
+      lock.lock();
+      static_cast<void>(manager_liveness_lane_condition_.wait_for(
+          lock, heartbeat_period, [&] {
+            return manager_liveness_lane_stop_ ||
+                   manager_liveness_wake_generation_ != wake_generation;
+          }));
     }
   }
 
@@ -1846,13 +2597,16 @@ private:
       }
       static_cast<void>(ReconcileAndPublish());
     } catch (const ManagerPackageGenerationRestartRequired &error) {
+      TrySubmitFailClosedReadiness();
       PublishPackageRestartRequired();
       std::cerr << "Manager daemon package generation changed: "
                 << error.what() << '\n';
     } catch (const std::exception &error) {
+      TrySubmitFailClosedReadiness();
       std::cerr << "Manager daemon periodic reconciliation failed: "
                 << error.what() << '\n';
     } catch (...) {
+      TrySubmitFailClosedReadiness();
       std::cerr << "Manager daemon periodic reconciliation failed with an "
                    "unknown error\n";
     }
@@ -2224,6 +2978,8 @@ private:
               *command.expected_current_retained_bundle_id,
               *command.expected_current_graph_revision,
               candidate_retained_bundle_id,
+              command.expected_admission_generation,
+              command.parent_authoring_claim,
           });
           // Apply durability is authoritative. A source-publication failure is
           // logged and retried by the periodic strand; it cannot turn a
@@ -2231,6 +2987,7 @@ private:
           try {
             static_cast<void>(ReconcileAndPublish());
           } catch (const std::exception &error) {
+            TrySubmitFailClosedReadiness();
             std::cerr << "Manager daemon publication failed after durable "
                          "Apply: "
                       << error.what() << '\n';
@@ -2613,7 +3370,14 @@ private:
         return false;
       }
       case CommandKind::kReconcile: {
-        const auto generations = ReconcileAndPublish();
+        const auto generations = [this] {
+          try {
+            return ReconcileAndPublish();
+          } catch (...) {
+            TrySubmitFailClosedReadiness();
+            throw;
+          }
+        }();
         TrySendResponse(client.get(),
                         SuccessResponse("reconcile", generations.manager,
                                         generations.scene,
@@ -2661,6 +3425,7 @@ private:
   component_manager::RuntimeUnitAdapterRouter runtime_adapter_router_;
   component_manager::ManagerActiveRuntimeCoordinator active_runtime_;
   bool kernel_apply_available_{};
+  std::atomic<bool> scene_admission_reconciled_{false};
   std::optional<component_manager::ManagerActiveRuntimeConvergenceResult>
       last_runtime_;
   std::shared_ptr<const deployment::RetainedBundle> last_active_bundle_;
@@ -2675,9 +3440,23 @@ private:
   std::string manager_owner_id_;
   std::string scene_owner_id_;
   std::string scene_runtime_owner_id_;
+  std::mutex manager_liveness_lane_mutex_;
+  std::condition_variable manager_liveness_lane_condition_;
+  std::optional<NativeManagerLivenessSnapshot> manager_liveness_snapshot_;
+  std::uint64_t manager_liveness_readiness_barrier_{};
+  std::uint64_t manager_liveness_wake_generation_{};
+  bool manager_liveness_force_closed_{true};
+  bool manager_liveness_lane_stop_{};
+  std::thread manager_liveness_lane_;
   std::uint64_t manager_heartbeat_sequence_{};
   component_manager::detail::ManagerLivenessRetryGate
       manager_liveness_retry_gate_;
+  std::optional<core::ActiveBundlePublicationReceiptDTO>
+      manager_liveness_attempted_publication_;
+  std::optional<core::ActiveBundlePublicationReceiptDTO>
+      manager_liveness_superseded_publication_;
+  std::optional<core::CellAdmissionReadinessSnapshotDTO>
+      last_submitted_readiness_;
   std::map<std::string, PoseObserverSession> pose_observer_sessions_;
   std::map<PoseObservationKey, PoseObservationReplay> pose_observation_replays_;
   std::optional<std::vector<core::ProjectionNativeRuntimeBindingDTO>>
@@ -2705,7 +3484,10 @@ DaemonConfig ParseArguments(const int argc, char **argv) {
   bool manager = false;
   bool runtime = false;
   bool scene = false;
+  bool program_cycle = false;
+  bool authoring = false;
   bool publication = false;
+  bool program_runner_liveness = false;
   bool period = false;
   for (int index = 1; index < argc; index += 2) {
     Require(index + 1 < argc, "every option requires one value");
@@ -2726,9 +3508,19 @@ DaemonConfig ParseArguments(const int argc, char **argv) {
     } else if (option == "--logical-scene-database" && !scene) {
       config.logical_scene_database = value;
       scene = true;
+    } else if (option == "--program-cycle-journal" && !program_cycle) {
+      config.program_cycle_journal = value;
+      program_cycle = true;
+    } else if (option == "--authoring-transaction-journal" && !authoring) {
+      config.authoring_transaction_journal = value;
+      authoring = true;
     } else if (option == "--publication-root" && !publication) {
       config.publication_root = value;
       publication = true;
+    } else if (option == "--program-runner-liveness-socket" &&
+               !program_runner_liveness) {
+      config.program_runner_liveness_socket = value;
+      program_runner_liveness = true;
     } else if (option == "--reconciliation-period-ms" && !period) {
       config.reconciliation_period =
           std::chrono::milliseconds(ParsePeriod(value));
@@ -2737,9 +3529,11 @@ DaemonConfig ParseArguments(const int argc, char **argv) {
       Fail("unknown or duplicate option " + std::string(option));
     }
   }
-  Require(package && manager && runtime && scene && publication,
+  Require(package && manager && runtime && scene && program_cycle &&
+              authoring && publication,
           "--package-root, --manager-state-root, --runtime-state-root, "
-          "--logical-scene-database, and --publication-root are required");
+          "--logical-scene-database, --program-cycle-journal, "
+          "--authoring-transaction-journal, and --publication-root are required");
   return config;
 }
 

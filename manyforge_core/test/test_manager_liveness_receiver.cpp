@@ -324,6 +324,73 @@ TEST(ManagerLivenessReceiver, ReplacementRequiresExactRenewalAndAcknowledgement)
 }
 
 TEST(ManagerLivenessReceiver,
+     RequiredSetRebindCancelsReceiptAndRequiresFreshExactReconciliation) {
+  FakeClock clock;
+  ManualScheduler scheduler;
+  Observations observations;
+  FailSafes fail_safe;
+  unsigned safe_calls = 0U;
+  ManagerLivenessReceiver receiver(
+      Config(), clock, scheduler,
+      [&] {
+        ++safe_calls;
+        return Digest('b');
+      },
+      fail_safe, observations);
+  ASSERT_TRUE(receiver.Renew(Heartbeat(8U)).ok());
+  ASSERT_TRUE(receiver.CompleteReconciliation(Ack()).ok());
+  const auto predecessor_sequence = receiver.status().receiver_status_sequence;
+
+  ASSERT_TRUE(
+      receiver.RebindRequiredSet(RetainedBundleId("bundle.2"), Digest('d'))
+          .ok());
+  const auto rebound = receiver.observation();
+  EXPECT_EQ(rebound.active_bundle_id, RetainedBundleId("bundle.2"));
+  EXPECT_EQ(rebound.required_runtime_set_digest, Digest('d'));
+  EXPECT_EQ(rebound.status.state, ManagerLivenessStateDTO::kUnreconciled);
+  EXPECT_TRUE(rebound.status.command_fenced);
+  EXPECT_EQ(rebound.status.last_accepted_heartbeat_sequence, 0U);
+  EXPECT_GT(rebound.status.receiver_status_sequence, predecessor_sequence);
+  EXPECT_EQ(safe_calls, 0U);
+  EXPECT_TRUE(fail_safe.values.empty());
+
+  clock.set(30);
+  scheduler.advance_to(30);
+  EXPECT_EQ(safe_calls, 0U);
+  EXPECT_EQ(receiver.status().state, ManagerLivenessStateDTO::kUnreconciled);
+  EXPECT_FALSE(receiver.CompleteReconciliation(Ack()).ok());
+
+  ASSERT_TRUE(receiver.Renew(Heartbeat(1U)).ok());
+  auto successor_ack = Ack();
+  successor_ack.active_bundle_id = RetainedBundleId("bundle.2");
+  successor_ack.required_runtime_set_digest = Digest('d');
+  ASSERT_TRUE(receiver.CompleteReconciliation(successor_ack).ok());
+  EXPECT_FALSE(receiver.status().command_fenced);
+}
+
+TEST(ManagerLivenessReceiver,
+     ExpiredManagerEpochCannotBeResurrectedByRequiredSetRebind) {
+  FakeClock clock;
+  ManualScheduler scheduler;
+  Observations observations;
+  FailSafes fail_safe;
+  ManagerLivenessReceiver receiver(Config(), clock, scheduler,
+                                   [] { return Digest('b'); }, fail_safe,
+                                   observations);
+  ASSERT_TRUE(receiver.Renew(Heartbeat()).ok());
+  clock.set(30);
+  scheduler.advance_to(30);
+  ASSERT_EQ(receiver.status().state, ManagerLivenessStateDTO::kExpired);
+
+  const auto rebound =
+      receiver.RebindRequiredSet(RetainedBundleId("bundle.2"), Digest('d'));
+  ASSERT_FALSE(rebound.ok());
+  EXPECT_EQ(rebound.error().details.at("reason"), "manager_epoch_expired");
+  EXPECT_EQ(receiver.status().state, ManagerLivenessStateDTO::kExpired);
+  EXPECT_FALSE(receiver.Renew(Heartbeat(2U)).ok());
+}
+
+TEST(ManagerLivenessReceiver,
      ReplacementCancelFailureStaysFencedAndReturnsStableError) {
   FakeClock clock;
   CancelThrowingScheduler scheduler;

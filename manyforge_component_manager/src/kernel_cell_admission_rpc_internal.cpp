@@ -1,5 +1,7 @@
 #include <manyforge_component_manager/kernel_cell_admission_rpc_internal.hpp>
 
+#include "manager_liveness_rpc_internal.hpp"
+
 #include <bit>
 #include <cmath>
 #include <cstdint>
@@ -422,6 +424,12 @@ DispatchKernelCellAdmissionRpc(core::IKernelCellAdmissionPort &kernel,
   if (request.command == "cell_admission_update_readiness")
     return adopt(kernel.UpdateCellAdmissionReadiness(
         std::get<core::CellAdmissionReadinessSnapshotDTO>(request.request)));
+  if (request.command == "cell_admission_publish_liveness") {
+    const auto published = kernel.Publish(
+        std::get<core::ManagerLivenessObservationDTO>(request.request));
+    return published.ok() ? KernelCellAdmissionRpcResponse{std::monostate{}}
+                          : KernelCellAdmissionRpcResponse{published.error()};
+  }
   if (request.command == "cell_admission_acquire")
     return adopt(kernel.AcquireCellAdmissionClaim(
         std::get<core::CellAdmissionClaimIntentDTO>(request.request)));
@@ -441,17 +449,21 @@ std::string
 EncodeKernelCellAdmissionRpcRequest(const KernelCellAdmissionRpcPacket &x) {
   const bool get = x.command == "cell_admission_get";
   const bool readiness = x.command == "cell_admission_update_readiness";
+  const bool liveness = x.command == "cell_admission_publish_liveness";
   const bool acquire = x.command == "cell_admission_acquire";
   const bool release = x.command == "cell_admission_release";
   const bool reconcile = x.command == "cell_admission_reconcile";
   const bool recovery_receipt =
       x.command == "cell_admission_recovery_receipt";
-  if (!get && !readiness && !acquire && !release && !reconcile &&
+  if (!get && !readiness && !liveness && !acquire && !release && !reconcile &&
       !recovery_receipt)
     Fail("unknown cell-admission command");
   if ((get && !std::holds_alternative<std::monostate>(x.request)) ||
       (readiness &&
        !std::holds_alternative<core::CellAdmissionReadinessSnapshotDTO>(
+           x.request)) ||
+      (liveness &&
+       !std::holds_alternative<core::ManagerLivenessObservationDTO>(
            x.request)) ||
       (acquire &&
        !std::holds_alternative<core::CellAdmissionClaimIntentDTO>(x.request)) ||
@@ -474,6 +486,9 @@ EncodeKernelCellAdmissionRpcRequest(const KernelCellAdmissionRpcPacket &x) {
           if constexpr (std::is_same_v<T,
                                        core::CellAdmissionReadinessSnapshotDTO>)
             Readiness(w, v);
+          else if constexpr (
+              std::is_same_v<T, core::ManagerLivenessObservationDTO>)
+            w.String(EncodeManagerLivenessRpcResponse(v));
           else if constexpr (std::is_same_v<T,
                                             core::CellAdmissionClaimIntentDTO>)
             Intent(w, v);
@@ -499,6 +514,8 @@ DecodeKernelCellAdmissionRpcRequest(std::string_view b) {
     x = std::monostate{};
   else if (command == "cell_admission_update_readiness")
     x = Readiness(r);
+  else if (command == "cell_admission_publish_liveness")
+    x = DecodeManagerLivenessRpcResponse(r.String());
   else if (command == "cell_admission_acquire") {
     auto v = Intent(r);
     if (!core::ValidateCellAdmissionClaimIntent(v).ok())
@@ -523,6 +540,7 @@ EncodeKernelCellAdmissionRpcResponse(std::string_view command,
                                      const KernelCellAdmissionRpcResponse &x) {
   if (command != "cell_admission_get" &&
       command != "cell_admission_update_readiness" &&
+      command != "cell_admission_publish_liveness" &&
       command != "cell_admission_acquire" &&
       command != "cell_admission_release" &&
       command != "cell_admission_reconcile" &&
@@ -536,8 +554,13 @@ EncodeKernelCellAdmissionRpcResponse(std::string_view command,
       !std::holds_alternative<core::CellAdmissionRecoveryReceiptDTO>(x) &&
       !std::holds_alternative<core::ErrorDTO>(x))
     Fail("recovery receipt response has the wrong DTO");
+  if (command == "cell_admission_publish_liveness" &&
+      !std::holds_alternative<std::monostate>(x) &&
+      !std::holds_alternative<core::ErrorDTO>(x))
+    Fail("liveness publication response has the wrong DTO");
   if (command != "cell_admission_acquire" &&
       command != "cell_admission_recovery_receipt" &&
+      command != "cell_admission_publish_liveness" &&
       !std::holds_alternative<core::AuthoringAdmissionDTO>(x) &&
       !std::holds_alternative<core::ErrorDTO>(x))
     Fail("response has the wrong DTO");
@@ -547,7 +570,9 @@ EncodeKernelCellAdmissionRpcResponse(std::string_view command,
   std::visit(
       [&](const auto &v) {
         using T = std::decay_t<decltype(v)>;
-        if constexpr (std::is_same_v<T, core::AuthoringAdmissionDTO>) {
+        if constexpr (std::is_same_v<T, std::monostate>) {
+          w.Byte(4);
+        } else if constexpr (std::is_same_v<T, core::AuthoringAdmissionDTO>) {
           w.Byte(0);
           w.Bool(v.authoring_allowed);
           G(w, v.admission_generation);
@@ -580,6 +605,7 @@ DecodeKernelCellAdmissionRpcResponse(std::string_view b) {
   auto command = r.String();
   if (command != "cell_admission_get" &&
       command != "cell_admission_update_readiness" &&
+      command != "cell_admission_publish_liveness" &&
       command != "cell_admission_acquire" &&
       command != "cell_admission_release" &&
       command != "cell_admission_reconcile" &&
@@ -605,6 +631,8 @@ DecodeKernelCellAdmissionRpcResponse(std::string_view b) {
     x = e;
   } else if (tag == 3)
     x = RecoveryReceipt(r);
+  else if (tag == 4)
+    x = std::monostate{};
   else
     Fail("unknown response tag");
   if (const auto *claim = std::get_if<core::CellAdmissionClaimDTO>(&x);

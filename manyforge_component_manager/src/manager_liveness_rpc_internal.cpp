@@ -9,6 +9,12 @@
 #include <vector>
 
 namespace manyforge::component_manager::detail {
+
+ManagerLivenessRpcRejection::ManagerLivenessRpcRejection(std::string reason)
+    : std::invalid_argument("manager liveness RPC: request rejected: " +
+                            reason),
+      reason_(std::move(reason)) {}
+
 namespace {
 
 using namespace manyforge::core;
@@ -67,16 +73,18 @@ void RequireCoherent(const ManagerLivenessTransportRequestDTO& request) {
   const auto& set = request.required_set;
   const auto& beat = request.heartbeat;
   const auto& policy = request.policy;
-  const bool target_present =
+  const auto target_count =
+      std::count_if(set.required_receivers.begin(),
+                    set.required_receivers.end(), [&](const auto& row) {
+                      return row.runtime_unit_id ==
+                             request.receiver_runtime_unit_id;
+                    });
+  const bool target_policy_matches =
       std::any_of(set.required_receivers.begin(),
                   set.required_receivers.end(), [&](const auto& row) {
                     return row.runtime_unit_id ==
-                           request.receiver_runtime_unit_id;
-                  });
-  const bool policies_match =
-      std::all_of(set.required_receivers.begin(),
-                  set.required_receivers.end(), [&](const auto& row) {
-                    return row.runtime_policy_id ==
+                               request.receiver_runtime_unit_id &&
+                           row.runtime_policy_id ==
                                policy.runtime_policy_id &&
                            row.runtime_policy_revision ==
                                policy.runtime_policy_revision;
@@ -101,7 +109,7 @@ void RequireCoherent(const ManagerLivenessTransportRequestDTO& request) {
         manyforge::content_identity::is_sha256_digest(
             ack.reconciliation_evidence_digest.value());
   }
-  if (!target_present || !policies_match || !heartbeat_matches ||
+  if (target_count != 1U || !target_policy_matches || !heartbeat_matches ||
       !reconciliation_matches) {
     Fail("request identities are incoherent");
   }
@@ -120,7 +128,11 @@ std::string EncodeManagerLivenessRpcRequest(
   if (!ValidateManagerLivenessRequiredSet(request.required_set).ok() ||
       !ValidateManagerLivenessPolicy(request.policy).ok() ||
       !ValidateManagerHeartbeat(request.heartbeat).ok() ||
-      request.receiver_runtime_unit_id.empty()) {
+      request.receiver_runtime_unit_id.empty() ||
+      !request.active_publication_generation.nonzero() ||
+      request.active_graph_revision.empty() ||
+      !manyforge::content_identity::is_sha256_digest(
+          request.active_public_pointer_digest.value())) {
     Fail("request is invalid");
   }
   RequireCoherent(request);
@@ -128,7 +140,11 @@ std::string EncodeManagerLivenessRpcRequest(
   const auto& policy = request.policy;
   const auto& beat = request.heartbeat;
   std::ostringstream out;
-  out << kManagerLivenessRequestTag << ' ' << set.cell_id.value() << ' '
+  out << kManagerLivenessRequestTag << ' '
+      << request.active_publication_generation.value() << ' '
+      << request.active_graph_revision.value() << ' '
+      << request.active_public_pointer_digest.value() << ' '
+      << set.cell_id.value() << ' '
       << set.active_bundle_id.value() << ' '
       << set.required_runtime_set_digest.value() << ' '
       << set.manager_runtime_unit_id.value() << ' '
@@ -163,45 +179,50 @@ std::string EncodeManagerLivenessRpcRequest(
 ManagerLivenessTransportRequestDTO DecodeManagerLivenessRpcRequest(
     std::string_view bytes) {
   const auto f = Fields(bytes);
-  if (f.size() < 21U || f[0] != kManagerLivenessRequestTag) {
+  if (f.size() < 24U || f[0] != kManagerLivenessRequestTag) {
     Fail("wrong closed request shape");
   }
   for (std::size_t i = 1; i < f.size(); ++i) {
     CheckToken(f[i]);
   }
-  const auto receiver_count = Unsigned<std::size_t>(f[16]);
+  const auto receiver_count = Unsigned<std::size_t>(f[19]);
   if (receiver_count == 0U ||
       receiver_count > kMaximumManagerLivenessReceivers ||
-      f.size() != 17U + receiver_count * 4U) {
+      f.size() != 20U + receiver_count * 4U) {
     Fail("wrong required receiver count");
   }
   std::vector<RequiredManagerLivenessReceiverDTO> receivers;
   receivers.reserve(receiver_count);
   for (std::size_t index = 0; index < receiver_count; ++index) {
-    const auto offset = 17U + index * 4U;
+    const auto offset = 20U + index * 4U;
     receivers.push_back(
         {RuntimeUnitId(f[offset]), RuntimeEpoch(f[offset + 1U]),
          RuntimePolicyId(f[offset + 2U]),
          RuntimePolicyRevision(f[offset + 3U])});
   }
   ManagerLivenessRequiredSetDTO set{
-      CellId(f[1]), RetainedBundleId(f[2]), ContentDigest(f[3]),
-      RuntimeUnitId(f[4]), RuntimeEpoch(f[5]), RequestOwnerEpoch(f[6]),
+      CellId(f[4]), RetainedBundleId(f[5]), ContentDigest(f[6]),
+      RuntimeUnitId(f[7]), RuntimeEpoch(f[8]), RequestOwnerEpoch(f[9]),
       std::move(receivers)};
   ManagerLivenessPolicyDTO policy{
-      RuntimePolicyId(f[8]), RuntimePolicyRevision(f[9]), Signed(f[10]),
-      Signed(f[11]), ProductContractId(f[12]), ProductContractRevision(f[13])};
+      RuntimePolicyId(f[11]), RuntimePolicyRevision(f[12]), Signed(f[13]),
+      Signed(f[14]), ProductContractId(f[15]), ProductContractRevision(f[16])};
   ManagerHeartbeatDTO heartbeat{
-      CellId(f[1]), RuntimeUnitId(f[4]), RuntimeEpoch(f[5]),
-      RequestOwnerEpoch(f[6]), Unsigned<std::uint64_t>(f[14]),
-      RuntimePolicyId(f[8]), RuntimePolicyRevision(f[9])};
+      CellId(f[4]), RuntimeUnitId(f[7]), RuntimeEpoch(f[8]),
+      RequestOwnerEpoch(f[9]), Unsigned<std::uint64_t>(f[17]),
+      RuntimePolicyId(f[11]), RuntimePolicyRevision(f[12])};
   ManagerLivenessTransportRequestDTO result{
-      RuntimeUnitId(f[7]), set, policy, heartbeat, std::nullopt};
-  if (f[15] != "-") {
+      RuntimeUnitId(f[10]),
+      ActiveBundlePublicationGeneration(
+          Unsigned<std::uint64_t>(f[1])),
+      GraphRevision(f[2]),
+      ContentDigest(f[3]),
+      set, policy, heartbeat, std::nullopt};
+  if (f[18] != "-") {
     result.reconciliation = ManagerLivenessReconciliationAck{
         set.cell_id, set.manager_runtime_unit_id, set.manager_runtime_epoch,
         set.manager_owner_epoch, set.active_bundle_id,
-        set.required_runtime_set_digest, ContentDigest(f[15])};
+        set.required_runtime_set_digest, ContentDigest(f[18])};
   }
   if (!ValidateManagerLivenessRequiredSet(set).ok() ||
       !ValidateManagerLivenessPolicy(policy).ok() ||
@@ -242,6 +263,9 @@ std::string EncodeManagerLivenessRpcResponse(
 ManagerLivenessObservationDTO DecodeManagerLivenessRpcResponse(
     std::string_view bytes) {
   const auto f = Fields(bytes);
+  if (f.size() == 2U && f[0] == kManagerLivenessRejectionTag) {
+    throw ManagerLivenessRpcRejection(f[1]);
+  }
   if (f.size() != 18U || f[0] != kManagerLivenessResponseTag) {
     Fail("wrong closed response shape");
   }
@@ -266,6 +290,12 @@ ManagerLivenessObservationDTO DecodeManagerLivenessRpcResponse(
     Fail("decoded response is invalid");
   }
   return result;
+}
+
+std::string EncodeManagerLivenessRpcRejection(std::string_view reason) {
+  CheckToken(reason);
+  return std::string(kManagerLivenessRejectionTag) + " " +
+         std::string(reason);
 }
 
 }  // namespace manyforge::component_manager::detail

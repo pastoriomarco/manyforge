@@ -177,6 +177,19 @@ class ManagerCommandClient:
                 "request_id": request.request_id,
                 "request_owner_epoch": request.request_owner_epoch,
                 "source_label": request.source_label,
+                "admission_context": (
+                    {
+                        "kind": "direct",
+                        "expected_admission_generation": (
+                            request.expected_admission_generation
+                        ),
+                    }
+                    if request.parent_authoring_claim is None
+                    else {
+                        "kind": "parent_authoring_claim",
+                        "claim": request.parent_authoring_claim,
+                    }
+                ),
             }
         )
         if (

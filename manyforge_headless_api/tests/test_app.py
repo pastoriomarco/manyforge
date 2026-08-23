@@ -14,6 +14,7 @@ from manyforge_behavior.node_environment import build_node_environment
 from manyforge_behavior.program import Program
 
 from manyforge_headless_api.app import TrustedPrincipal, _error_status, create_app
+from manyforge_headless_api.cell_admission import CellAdmissionError
 from manyforge_headless_api.models import (
     ManagerApplyRequest,
     SceneResourcePoseQuery,
@@ -28,6 +29,72 @@ _BINDING_FIXTURE = (
     _ROOT
     / "manyforge_deployment/resources/program_binding_lite6_native.fixture.json"
 )
+_ADMISSION_GENERATION = 7
+_AUTHORING_DIGEST = "sha256:" + "e" * 64
+
+
+class FakeCellAdmission:
+    """Strict replay-only admission owner for thin Headless fixtures."""
+
+    def get(self) -> dict[str, Any]:
+        return {
+            "admission_generation": _ADMISSION_GENERATION,
+            "authoring_allowed": True,
+        }
+
+    def acquire(self, intent: dict[str, Any]) -> dict[str, Any]:
+        if set(intent) != {
+            "claim_kind",
+            "expected_admission_generation",
+            "intervention_evidence",
+            "owner_epoch",
+            "owner_role",
+            "owner_transaction_id",
+            "program_cycle_evidence",
+            "request_id",
+            "request_payload_digest",
+            "scope",
+        }:
+            raise CellAdmissionError(
+                "authoring_claim_invalid",
+                "fixture admission intent is not exact",
+            )
+        if (
+            intent["claim_kind"] != "authoring_mutation"
+            or intent["owner_role"] != "authoring_owner"
+            or intent["expected_admission_generation"] != _ADMISSION_GENERATION
+        ):
+            raise CellAdmissionError(
+                "stale_generation",
+                "fixture admission generation is stale",
+            )
+        return {
+            "intent": copy.deepcopy(intent),
+            "claim_generation": 11,
+            "acquired_admission_generation": _ADMISSION_GENERATION,
+            "accepted_at_ns": 1,
+        }
+
+
+def _authoring_claim(
+    *,
+    request_id: str = "authoring.1",
+    owner_transaction_id: str = "authoring-transaction.1",
+) -> dict[str, Any]:
+    return FakeCellAdmission().acquire(
+        {
+            "claim_kind": "authoring_mutation",
+            "owner_role": "authoring_owner",
+            "owner_epoch": "authoring-owner.epoch.1",
+            "owner_transaction_id": owner_transaction_id,
+            "request_id": request_id,
+            "request_payload_digest": _AUTHORING_DIGEST,
+            "expected_admission_generation": _ADMISSION_GENERATION,
+            "scope": {"resources": [], "configurations": []},
+            "program_cycle_evidence": None,
+            "intervention_evidence": None,
+        }
+    )
 
 
 @lru_cache(maxsize=1)
@@ -176,7 +243,7 @@ def test_full_native_applied_program_projection_is_accepted() -> None:
     core = FakeCore()
     projection = _applied_projection(_program_document())
     core.applied_program = copy.deepcopy(projection)
-    client = TestClient(create_app(service=HeadlessService(core, FakeManager())))
+    client = TestClient(create_app(service=_service(core, FakeManager())))
 
     response = client.get("/api/program/applied")
 
@@ -197,7 +264,7 @@ def test_scenario_program_selection_rejects_rehashed_malformed_binding() -> None
         api_version="manyforge.program_binding.v1",
     )
     core.scenario_selection_override = selection
-    client = TestClient(create_app(service=HeadlessService(core, FakeManager())))
+    client = TestClient(create_app(service=_service(core, FakeManager())))
 
     response = client.get("/api/scenarios/cell-pick/program-selection")
 
@@ -238,7 +305,7 @@ def test_applied_program_projection_rejects_missing_or_divergent_closure(
     projection = _applied_projection(_program_document())
     break_projection(projection)
     core.applied_program = projection
-    client = TestClient(create_app(service=HeadlessService(core, FakeManager())))
+    client = TestClient(create_app(service=_service(core, FakeManager())))
 
     response = client.get("/api/program/applied")
 
@@ -273,7 +340,7 @@ def test_applied_program_projection_rejects_malformed_exact_identity(
         target = target[field]
     target[path[-1]] = invalid_value
     core.applied_program = projection
-    client = TestClient(create_app(service=HeadlessService(core, FakeManager())))
+    client = TestClient(create_app(service=_service(core, FakeManager())))
 
     response = client.get("/api/program/applied")
 
@@ -289,7 +356,7 @@ def test_applied_program_projection_rejects_invalid_source_generation(
     projection = _applied_projection(_program_document())
     projection["source"]["source_generation"] = source_generation
     core.applied_program = projection
-    client = TestClient(create_app(service=HeadlessService(core, FakeManager())))
+    client = TestClient(create_app(service=_service(core, FakeManager())))
 
     response = client.get("/api/program/applied")
 
@@ -1038,11 +1105,28 @@ class FakeProgramRunner:
         self.calls.append(("close", None))
 
 
+def _service(
+    core: FakeCore,
+    manager: FakeManager,
+    execution: object | None = None,
+    program_runner: object | None = None,
+    cclc: object | None = None,
+) -> HeadlessService:
+    return HeadlessService(
+        core,
+        manager,
+        execution=execution,  # type: ignore[arg-type]
+        program_runner=program_runner,  # type: ignore[arg-type]
+        cell_admission=FakeCellAdmission(),
+        cclc=cclc,
+    )
+
+
 def _client(*, trusted: bool = False) -> tuple[TestClient, FakeCore, FakeManager]:
     core = FakeCore()
     manager = FakeManager()
     app = create_app(
-        service=HeadlessService(core, manager),
+        service=_service(core, manager),
         trusted_principal_adapter=FakeTrustedAdapter() if trusted else None,
     )
     return TestClient(app), core, manager
@@ -1208,6 +1292,7 @@ def test_program_apply_skips_unchanged_deployment_and_publishes_exact_program() 
                 "scenario_catalog_revision": "sha256:" + "6" * 64,
                 "program": program,
                 "expected_applied_record_digest": None,
+                "authoring_claim": _authoring_claim(),
             },
         )
         applied = client.get("/api/program/applied")
@@ -1253,7 +1338,7 @@ def test_program_apply_rejects_rehashed_malformed_applied_binding_result() -> No
         return result
 
     core.commit_program_apply = malformed_commit  # type: ignore[method-assign]
-    client = TestClient(create_app(service=HeadlessService(core, FakeManager())))
+    client = TestClient(create_app(service=_service(core, FakeManager())))
 
     response = client.post(
         "/api/program/apply",
@@ -1262,6 +1347,7 @@ def test_program_apply_rejects_rehashed_malformed_applied_binding_result() -> No
             "scenario_catalog_revision": "sha256:" + "6" * 64,
             "program": copy.deepcopy(_program_document()),
             "expected_applied_record_digest": None,
+            "authoring_claim": _authoring_claim(),
         },
     )
 
@@ -1277,7 +1363,7 @@ def test_program_apply_fences_published_full_stack_restart_before_prepare() -> N
         "unavailable_reason_code": "full_stack_restart_required",
     }
     manager = FakeManager()
-    client = TestClient(create_app(service=HeadlessService(core, manager)))
+    client = TestClient(create_app(service=_service(core, manager)))
 
     with client:
         response = client.post(
@@ -1287,6 +1373,7 @@ def test_program_apply_fences_published_full_stack_restart_before_prepare() -> N
                 "scenario_catalog_revision": "sha256:" + "6" * 64,
                 "program": _program_document(),
                 "expected_applied_record_digest": None,
+                "authoring_claim": _authoring_claim(),
             },
         )
 
@@ -1320,7 +1407,7 @@ def test_program_apply_fences_full_stack_restart_raced_by_preparation() -> None:
         prepare_then_publish_restart
     )
     manager = FakeManager()
-    client = TestClient(create_app(service=HeadlessService(core, manager)))
+    client = TestClient(create_app(service=_service(core, manager)))
 
     with client:
         response = client.post(
@@ -1330,6 +1417,7 @@ def test_program_apply_fences_full_stack_restart_raced_by_preparation() -> None:
                 "scenario_catalog_revision": "sha256:" + "6" * 64,
                 "program": _program_document(),
                 "expected_applied_record_digest": None,
+                "authoring_claim": _authoring_claim(),
             },
         )
 
@@ -1345,7 +1433,7 @@ def test_program_runner_surface_is_a_strict_thin_owner_projection() -> None:
     core = FakeCore()
     core.applied_program = _applied_for_program_run()
     app = create_app(
-        service=HeadlessService(
+        service=_service(
             core,
             FakeManager(),
             program_runner=runner,
@@ -1357,6 +1445,8 @@ def test_program_runner_surface_is_a_strict_thin_owner_projection() -> None:
         "scenario_id": "cell-pick",
         "scenario_catalog_revision": "sha256:" + "6" * 64,
         "expected_applied_record_digest": "sha256:" + "5" * 64,
+        "draft_program_revision": core.applied_program["program_revision"],
+        "expected_admission_generation": _ADMISSION_GENERATION,
     }
     stop_body = {
         **_caller(),
@@ -1402,7 +1492,7 @@ def test_program_run_start_rejects_stale_applied_or_divergent_runner() -> None:
     runner = FakeProgramRunner()
     client = TestClient(
         create_app(
-            service=HeadlessService(
+            service=_service(
                 core,
                 FakeManager(),
                 program_runner=runner,
@@ -1414,6 +1504,8 @@ def test_program_run_start_rejects_stale_applied_or_divergent_runner() -> None:
         "scenario_id": "cell-pick",
         "scenario_catalog_revision": "sha256:" + "6" * 64,
         "expected_applied_record_digest": "sha256:" + "5" * 64,
+        "draft_program_revision": core.applied_program["program_revision"],
+        "expected_admission_generation": _ADMISSION_GENERATION,
     }
 
     with client:
@@ -1456,7 +1548,7 @@ def test_program_only_apply_does_not_mutate_an_active_captured_run() -> None:
     )
     runner = FakeProgramRunner()
     app = create_app(
-        service=HeadlessService(
+        service=_service(
             core,
             FakeManager(),
             program_runner=runner,
@@ -1472,6 +1564,7 @@ def test_program_only_apply_does_not_mutate_an_active_captured_run() -> None:
                 "scenario_catalog_revision": "sha256:" + "6" * 64,
                 "program": _program_document(),
                 "expected_applied_record_digest": None,
+                "authoring_claim": _authoring_claim(),
             },
         )
 
@@ -1483,7 +1576,7 @@ def test_program_only_apply_does_not_mutate_an_active_captured_run() -> None:
 
 def test_program_model_attempt_is_validated_before_native_commit() -> None:
     core = FakeCore()
-    app = create_app(service=HeadlessService(core, FakeManager()))
+    app = create_app(service=_service(core, FakeManager()))
     client = TestClient(app)
     digest = "sha256:" + "a" * 64
     body = {
@@ -1553,12 +1646,13 @@ def test_program_apply_waits_for_manager_convergence_without_advancing_applied(
         "unavailable_reason_code": None,
     }
     manager = AcceptedProgramApplyManager()
-    client = TestClient(create_app(service=HeadlessService(core, manager)))
+    client = TestClient(create_app(service=_service(core, manager)))
     body = {
         "scenario_id": "cell-pick",
         "scenario_catalog_revision": "sha256:" + "6" * 64,
         "program": copy.deepcopy(_program_document()),
         "expected_applied_record_digest": None,
+        "authoring_claim": _authoring_claim(),
     }
 
     with client:
@@ -1578,6 +1672,10 @@ def test_program_apply_waits_for_manager_convergence_without_advancing_applied(
         (completed.json()["preparation"], None)
     ]
     assert len(manager.requests) == 1
+    assert manager.requests[0].parent_authoring_claim == body[
+        "authoring_claim"
+    ]
+    assert manager.requests[0].expected_admission_generation is None
     assert completed.status_code == 200
     assert completed.json()["status"] == "applied"
 
@@ -1598,7 +1696,7 @@ def test_program_apply_manager_rejection_preserves_prior_applied_selection() -> 
         "unavailable_reason_code": None,
     }
     manager = FakeManager()
-    client = TestClient(create_app(service=HeadlessService(core, manager)))
+    client = TestClient(create_app(service=_service(core, manager)))
 
     with client:
         rejected = client.post(
@@ -1610,6 +1708,7 @@ def test_program_apply_manager_rejection_preserves_prior_applied_selection() -> 
                 "expected_applied_record_digest": prior["source"][
                     "record_digest"
                 ],
+                "authoring_claim": _authoring_claim(),
             },
         )
         still_applied = client.get("/api/program/applied")
@@ -1617,6 +1716,8 @@ def test_program_apply_manager_rejection_preserves_prior_applied_selection() -> 
     assert rejected.status_code == 503
     assert rejected.json()["detail"]["code"] == "kernel_owner_unavailable"
     assert len(manager.requests) == 1
+    assert manager.requests[0].parent_authoring_claim == _authoring_claim()
+    assert manager.requests[0].expected_admission_generation is None
     assert core.program_commits == []
     assert still_applied.status_code == 200
     assert still_applied.json() == prior
@@ -1632,6 +1733,7 @@ def test_program_apply_rejects_invalid_program_before_native_preparation() -> No
                 "scenario_catalog_revision": "sha256:" + "6" * 64,
                 "program": {"api_version": "manyforge.program.v1"},
                 "expected_applied_record_digest": None,
+                "authoring_claim": _authoring_claim(),
             },
         )
     assert response.status_code == 400
@@ -1740,6 +1842,7 @@ def test_apply_is_forwarded_and_remains_typed_unavailable_before_i6() -> None:
                     "retained_bundle_id": "bundle.1",
                 },
                 "reject_if_affected_busy": True,
+                "expected_admission_generation": 7,
             },
         )
     assert response.status_code == 503
@@ -1763,6 +1866,7 @@ def _scene_body() -> dict[str, Any]:
                 "content_hash": "sha256:" + "a" * 64,
             },
         },
+        "expected_admission_generation": _ADMISSION_GENERATION,
         "operation": {
             "kind": "remove_object",
             "scene_resource_id": "part.1",
@@ -1937,7 +2041,7 @@ def test_streamed_request_body_bound_is_enforced_without_content_length() -> Non
 def test_recognized_malformed_stop_promotes_instead_of_returning_validation_error() -> None:
     execution = FakeExecution()
     app = create_app(
-        service=HeadlessService(FakeCore(), FakeManager(), execution)
+        service=_service(FakeCore(), FakeManager(), execution)
     )
     with TestClient(app) as client:
         response = client.post(
@@ -2057,7 +2161,7 @@ def test_openapi_contains_no_condition_mutation_route() -> None:
 def test_motion_preview_is_a_thin_non_effectful_execution_route() -> None:
     execution = FakeExecution()
     app = create_app(
-        service=HeadlessService(FakeCore(), FakeManager(), execution)
+        service=_service(FakeCore(), FakeManager(), execution)
     )
     body = {
         "request_context": {
@@ -2136,7 +2240,7 @@ def test_motion_preview_is_a_thin_non_effectful_execution_route() -> None:
 def test_capability_command_preview_is_a_thin_non_effectful_execution_route() -> None:
     execution = FakeExecution()
     app = create_app(
-        service=HeadlessService(FakeCore(), FakeManager(), execution)
+        service=_service(FakeCore(), FakeManager(), execution)
     )
     body = {
         "request_context": {
@@ -2224,7 +2328,7 @@ def test_execution_missing_reference_is_a_public_not_found() -> None:
             }
 
     app = create_app(
-        service=HeadlessService(FakeCore(), FakeManager(), MissingExecution())
+        service=_service(FakeCore(), FakeManager(), MissingExecution())
     )
     with TestClient(app) as client:
         response = client.get("/api/execution/operations/operation-retired")
@@ -2236,7 +2340,7 @@ def test_execution_missing_reference_is_a_public_not_found() -> None:
 def test_operation_controls_and_scale_are_thin_revision_fenced_routes() -> None:
     execution = FakeExecution()
     app = create_app(
-        service=HeadlessService(FakeCore(), FakeManager(), execution)
+        service=_service(FakeCore(), FakeManager(), execution)
     )
     context = {
         "request_id": "request.control.1",
@@ -2307,7 +2411,7 @@ def test_operation_controls_and_scale_are_thin_revision_fenced_routes() -> None:
 def test_full_stop_and_stop_fault_recovery_are_thin_owner_routes() -> None:
     execution = FakeExecution()
     app = create_app(
-        service=HeadlessService(FakeCore(), FakeManager(), execution)
+        service=_service(FakeCore(), FakeManager(), execution)
     )
     context = {
         "request_id": "request.full-stop.1",
@@ -2364,7 +2468,7 @@ def test_full_stop_and_stop_fault_recovery_are_thin_owner_routes() -> None:
 def test_execution_mutation_principal_can_only_come_from_trusted_adapter() -> None:
     execution = FakeExecution()
     app = create_app(
-        service=HeadlessService(FakeCore(), FakeManager(), execution),
+        service=_service(FakeCore(), FakeManager(), execution),
         trusted_principal_adapter=FakeTrustedAdapter(),
     )
     body = {
@@ -2406,7 +2510,7 @@ def test_execution_mutation_principal_can_only_come_from_trusted_adapter() -> No
 def test_operation_control_paths_accept_bounded_stop_and_promote_mixed_scope() -> None:
     execution = FakeExecution()
     app = create_app(
-        service=HeadlessService(FakeCore(), FakeManager(), execution)
+        service=_service(FakeCore(), FakeManager(), execution)
     )
     context = {
         "request_id": "request.control.1",
@@ -2503,7 +2607,7 @@ def test_alarm_owner_rejections_preserve_their_public_http_class(
         raise HeadlessApiError(code, "injected owner rejection")
 
     core.acknowledge_alarm = reject  # type: ignore[method-assign]
-    app = create_app(service=HeadlessService(core, FakeManager()))
+    app = create_app(service=_service(core, FakeManager()))
     with TestClient(app) as client:
         response = client.post(
             "/api/execution/alarms/condition-aaaaaaaaaaaaaaaaaaaaaaaa/acknowledge",

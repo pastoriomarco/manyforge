@@ -330,6 +330,41 @@ class HeadlessHttpClient:
     def runtime(self) -> dict[str, Any]:
         return self.request("GET", "/api/runtime")
 
+    def authoring_admission(self) -> dict[str, Any]:
+        return self.request("GET", "/api/cell/authoring-admission")
+
+    def acquire_authoring_transaction(
+        self, body: Mapping[str, Any]
+    ) -> dict[str, Any]:
+        return self.request(
+            "POST", "/api/program/authoring-transactions", body=body
+        )
+
+    def settle_authoring_transaction(
+        self, body: Mapping[str, Any]
+    ) -> dict[str, Any]:
+        return self.request(
+            "POST", "/api/program/authoring-transactions/settle", body=body
+        )
+
+    def recover_authoring_transaction(
+        self, body: Mapping[str, Any]
+    ) -> dict[str, Any]:
+        return self.request(
+            "POST",
+            "/api/program/authoring-transactions/recovery-receipt",
+            body=body,
+        )
+
+    def reconcile_authoring_owner(
+        self, body: Mapping[str, Any]
+    ) -> dict[str, Any]:
+        return self.request(
+            "POST",
+            "/api/program/authoring-transactions/reconcile-owner",
+            body=body,
+        )
+
     def health(self) -> dict[str, Any]:
         return self.request("GET", "/api/health")
 
@@ -354,6 +389,9 @@ class HeadlessHttpClient:
         return self.request(
             "GET", self._cclc_identity_path("/api/cclc/components", component_id)
         )
+
+    def cclc_owner_identity(self) -> dict[str, Any]:
+        return self.request("GET", "/api/cclc/owner")
 
     def cclc_route_templates(self, component_id: str) -> dict[str, Any]:
         return self.request(
@@ -449,6 +487,12 @@ class HeadlessHttpClient:
                 status_code=502,
             ) from error
         return result
+
+    def program_cycle_status(self) -> dict[str, Any]:
+        return self.request("GET", "/api/program/cycle/status")
+
+    def program_cycle_reset(self, body: Mapping[str, Any]) -> dict[str, Any]:
+        return self.request("POST", "/api/program/cycle/reset", body=body)
 
     def commit_program_model_attempt(
         self,

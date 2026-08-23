@@ -3,7 +3,7 @@
   Regenerate with:
     cd <repository-root>
     python3 scripts/regen-public-contracts.py structural-rest
-  Last regenerated: 2026-08-21 09:58:22 UTC
+  Last regenerated: 2026-08-23 10:27:05 UTC
   Generator source: scripts/regen-public-contracts.py:gen_rest_api
 -->
 
@@ -28,6 +28,7 @@ OpenAPI version: `3.1.0`. Title: `ManyForge Composer (replaceable client)`.
 | `GET` | `/api/cclc/components/{component_id}/route-templates` | headless-runtime-client | Cclc Route Templates |
 | `POST` | `/api/cclc/lifecycle/requests` | headless-runtime-client | Cclc Lifecycle Submit |
 | `GET` | `/api/cclc/lifecycle/transactions/{transaction_id}` | headless-runtime-client | Cclc Lifecycle Status |
+| `GET` | `/api/cclc/owner` | headless-runtime-client | Cclc Owner Identity |
 | `POST` | `/api/cclc/routes/requests` | headless-runtime-client | Cclc Route Submit |
 | `GET` | `/api/cclc/routes/transactions/{transaction_id}` | headless-runtime-client | Cclc Route Status |
 | `GET` | `/api/execution/alarms` | headless-runtime-client | Alarms |
@@ -67,6 +68,8 @@ OpenAPI version: `3.1.0`. Title: `ManyForge Composer (replaceable client)`.
 | `GET` | `/api/nodes/environment` | node-environment | Get Node Environment |
 | `GET` | `/api/program/applied` | headless-runtime-client | Program Applied |
 | `POST` | `/api/program/apply` | composer-draft | Apply Draft |
+| `POST` | `/api/program/cycle/reset` | headless-runtime-client | Program Cycle Reset |
+| `GET` | `/api/program/cycle/status` | headless-runtime-client | Program Cycle Status |
 | `POST` | `/api/program/discard` | composer-draft | Discard Draft |
 | `GET` | `/api/program/draft` | composer-draft | Read Draft |
 | `POST` | `/api/program/draft/mutations` | composer-draft | Mutate Draft |

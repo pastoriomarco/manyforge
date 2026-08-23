@@ -1467,6 +1467,11 @@ CanonicalValue Snapshot(const core::LogicalSceneSnapshotDTO &snapshot) {
 std::string EncodeRequest(const core::SceneTransactionRequestDTO &request) {
   return ci::canonical_json(CanonicalValue(CanonicalValue::Object{
       {"attribution", Attribution(request.attribution)},
+      {"expected_admission_generation",
+       request.expected_admission_generation.has_value()
+           ? CanonicalValue(static_cast<double>(
+                 request.expected_admission_generation->value()))
+           : CanonicalValue(nullptr)},
       {"expected_projection_revision",
        Projection(request.expected_projection_revision)},
       {"operation", RequestOperation(request.operation)},
@@ -1490,12 +1495,20 @@ core::SceneTransactionRequestDTO DecodeRequest(const std::string_view bytes) {
   if (ci::canonical_json(root) != bytes) {
     Fail("scene transaction request is not canonical JSON");
   }
-  ExactObject(root, 4U, "scene transaction request");
+  ExactObject(root, 5U, "scene transaction request");
+  std::optional<core::AdmissionGeneration> expected_admission_generation;
+  const auto &encoded_admission =
+      Member(root, "expected_admission_generation");
+  if (!encoded_admission.is_null()) {
+    expected_admission_generation = core::AdmissionGeneration(
+        DecodeUnsigned(encoded_admission, "expected_admission_generation"));
+  }
   core::SceneTransactionRequestDTO request{
       DecodeRequestContext(Member(root, "request_context")),
       DecodeAttribution(Member(root, "attribution")),
       DecodeProjection(Member(root, "expected_projection_revision")),
       DecodeRequestOperation(Member(root, "operation")),
+      expected_admission_generation,
   };
   if (!request.attribution.locally_valid() ||
       !request.expected_projection_revision.valid()) {

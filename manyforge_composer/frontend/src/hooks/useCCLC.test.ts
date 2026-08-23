@@ -84,9 +84,10 @@ afterEach(() => {
 });
 
 describe('CCLC request projection', () => {
-  it('targets the fresh execution-owner epoch and rejects torn projections', () => {
-    expect(cclcRequestOwnerEpoch(snapshot, execution)).toBe('kernel-owner.1');
-    expect(() => cclcRequestOwnerEpoch(snapshot, {
+  it('targets the CCLC owner epoch and rejects torn product projections', () => {
+    const owner = { requestOwnerEpoch: 'cclc-owner.1' };
+    expect(cclcRequestOwnerEpoch(owner, snapshot, execution)).toBe('cclc-owner.1');
+    expect(() => cclcRequestOwnerEpoch(owner, snapshot, {
       ...execution,
       graphRevision: 'graph.2',
     })).toThrow('projections are torn');

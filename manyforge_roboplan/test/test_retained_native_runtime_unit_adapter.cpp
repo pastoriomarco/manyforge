@@ -451,20 +451,6 @@ PhysicalConfigurationScope(const NativeFixture &fixture) {
   return scope;
 }
 
-[[nodiscard]] bool
-WaitForRegularFile(const std::filesystem::path &path,
-                   const std::chrono::steady_clock::duration timeout) {
-  const auto deadline = std::chrono::steady_clock::now() + timeout;
-  while (std::chrono::steady_clock::now() < deadline) {
-    std::error_code error;
-    if (std::filesystem::is_regular_file(path, error) && !error) {
-      return true;
-    }
-    std::this_thread::sleep_for(std::chrono::milliseconds(10));
-  }
-  return false;
-}
-
 [[nodiscard]] std::optional<core::AuthoringAdmissionDTO>
 WaitForAuthoringAdmission(
     component_manager::RetainedNativeRuntimeUnitAdapter &adapter,
@@ -538,7 +524,7 @@ TEST(NativeExecutionRuntimeUnitAdmission,
 }
 
 TEST(RetainedNativeRuntimeUnitAdapter,
-     DirectChildReportsClosedReadinessAndRestartMintsAnotherEpoch) {
+     DirectChildOwnsStableEmptyAdmissionBeforeApplyAndRestartMintsNewEpoch) {
   NativeFixture fixture;
   ASSERT_TRUE(fixture.product.has_value());
   EXPECT_FALSE(fixture.product->implementation_build_identity().has_value());
@@ -550,6 +536,9 @@ TEST(RetainedNativeRuntimeUnitAdapter,
   ASSERT_EQ(started.state(), component_manager::ProcessPresenceState::kPresent);
   ASSERT_FALSE(started.process_incarnation().empty());
   const core::RuntimeEpoch first_epoch(started.process_incarnation());
+  const auto empty_admission = adapter.GetAuthoringAdmission();
+  EXPECT_FALSE(empty_admission.authoring_allowed);
+  EXPECT_TRUE(empty_admission.admission_generation.nonzero());
 
   const auto first = adapter.ObserveProgress(*fixture.query, first_epoch);
   ASSERT_TRUE(first.has_value());
@@ -1037,11 +1026,6 @@ TEST(RetainedNativeRuntimeUnitAdapter,
             core::NativeProjectionBootstrapRebuildState::kRebuilt);
   EXPECT_TRUE(
       bootstrapped.resulting_health.healthy_for_target(initial_revision));
-  EXPECT_TRUE(
-      WaitForRegularFile(fixture.staging_root.path() /
-                             std::string(core::kOperationJournalFilename),
-                         std::chrono::seconds(10)))
-      << "the managed child did not compose the active physical product";
   const auto observed_authoring_admission =
       WaitForAuthoringAdmission(adapter, std::chrono::seconds(10));
   ASSERT_TRUE(observed_authoring_admission.has_value());
@@ -1097,8 +1081,11 @@ TEST(RetainedNativeRuntimeUnitAdapter,
       required_set_digest,
       core::ContentDigest(std::string(kIntentDigest))};
   const auto liveness = adapter.RenewManagerLiveness(
-      {fixture.query->plan.runtime_unit_id, required_set, liveness_policy,
-       heartbeat, reconciliation});
+      {fixture.query->plan.runtime_unit_id,
+       publication.publication_generation,
+       publication.request.candidate_graph_revision,
+       publication.durable_public_pointer_content_digest,
+       required_set, liveness_policy, heartbeat, reconciliation});
   EXPECT_EQ(liveness.active_bundle_id, required_set.active_bundle_id);
   EXPECT_EQ(liveness.required_runtime_set_digest, required_set_digest);
   EXPECT_EQ(liveness.status.state, core::ManagerLivenessStateDTO::kCurrent);
@@ -1161,6 +1148,17 @@ TEST(RetainedNativeRuntimeUnitAdapter,
   EXPECT_EQ(adapter.ObserveProcess(*fixture.query).process_incarnation(),
             first_epoch.value());
 
+  auto renewed_heartbeat = heartbeat;
+  renewed_heartbeat.heartbeat_sequence = 2U;
+  const auto renewed_liveness = adapter.RenewManagerLiveness(
+      {fixture.query->plan.runtime_unit_id,
+       publication.publication_generation,
+       publication.request.candidate_graph_revision,
+       publication.durable_public_pointer_content_digest,
+       required_set, liveness_policy, renewed_heartbeat, reconciliation});
+  ASSERT_EQ(renewed_liveness.status.state,
+            core::ManagerLivenessStateDTO::kCurrent);
+
   ASSERT_FALSE(fixture.bundle->value().cell_graph.control_bindings.empty());
   const auto &control_binding =
       fixture.bundle->value().cell_graph.control_bindings.front();
@@ -1170,18 +1168,32 @@ TEST(RetainedNativeRuntimeUnitAdapter,
   ASSERT_TRUE(retained_binding.ok()) << retained_binding.error().message;
   EXPECT_EQ(retained_binding.value(), (core::ProjectionLeaseBindingDTO{
                                           initial_revision, frame_lease_id}));
-  const auto frame =
-      resolved.value()->ResolveSceneFrame(core::SceneFrameResolutionQueryDTO{
-          core::TargetCarrierSceneFrameRefDTO{
-              control_binding.controllable_component_id,
-              control_binding.command_target_id, core::FrameRoleId("tcp")},
-          retained_binding.value()});
-  ASSERT_TRUE(frame.ok()) << frame.error().message;
-  ASSERT_TRUE(frame.value().valid());
-  EXPECT_EQ(frame.value().projection_binding, retained_binding.value());
+  const core::SceneFrameResolutionQueryDTO frame_query{
+      core::TargetCarrierSceneFrameRefDTO{
+          control_binding.controllable_component_id,
+          control_binding.command_target_id, core::FrameRoleId("tcp")},
+      retained_binding.value()};
+  std::optional<core::SceneFrameResolutionReceiptDTO> frame;
+  const auto frame_deadline =
+      std::chrono::steady_clock::now() + std::chrono::seconds(10);
+  while (std::chrono::steady_clock::now() < frame_deadline) {
+    const auto observed_frame = resolved.value()->ResolveSceneFrame(frame_query);
+    if (observed_frame.ok()) {
+      frame = observed_frame.value();
+      break;
+    }
+    ASSERT_EQ(observed_frame.error().details.at("reason"),
+              "native_scene_frame_lease_unavailable")
+        << observed_frame.error().message;
+    std::this_thread::sleep_for(std::chrono::milliseconds(10));
+  }
+  ASSERT_TRUE(frame.has_value())
+      << "the managed child did not install the exact active frame resolver";
+  ASSERT_TRUE(frame->valid());
+  EXPECT_EQ(frame->projection_binding, retained_binding.value());
   const auto *component_frame =
       std::get_if<core::ResolvedComponentModelFrameDTO>(
-          &frame.value().resolved_frame);
+          &frame->resolved_frame);
   ASSERT_NE(component_frame, nullptr);
   EXPECT_EQ(component_frame->controllable_component_id,
             control_binding.controllable_component_id);
@@ -1335,6 +1347,70 @@ TEST(RetainedNativeRuntimeUnitAdapter,
   EXPECT_TRUE(rebuilt.resulting_health.healthy_for_target(candidate_revision));
   EXPECT_EQ(adapter.EnsureStopped(*fixture.query).state(),
             component_manager::ProcessPresenceState::kAbsent);
+}
+
+TEST(RetainedNativeRuntimeUnitAdapter,
+     SupersededFirstLivenessRenewalIsRejectedWithoutKillingChild) {
+  NativeFixture fixture;
+  const auto predecessor = PublishActiveFixture(fixture);
+  auto adapter = MakeAdapter(fixture, MANYFORGE_NATIVE_EXECUTION_TARGET_ROOT);
+  const auto started = adapter.EnsureRunning(*fixture.query);
+  ASSERT_EQ(started.state(),
+            component_manager::ProcessPresenceState::kPresent);
+
+  component_manager::SqliteActiveBundlePublicationStore store(
+      fixture.staging_root.path() /
+          std::string(component_manager::kActiveBundlePublicationStoreFilename),
+      fixture.bundle->value().cell_graph.cell_id);
+  auto successor_projection =
+      predecessor.request.candidate_projection_revision;
+  ++successor_projection.scene_revision.revision_id;
+  const auto successor = store.PublishActiveBundle(
+      {core::NamedApplyPublicationTransactionDTO{
+           core::ApplyId("native-adapter-successor"),
+           core::ApplyGeneration(1U), core::ProjectionStageGeneration(1U)},
+       successor_projection, successor_projection.retained_bundle_id,
+       successor_projection.graph_revision, predecessor.publication_generation,
+       core::ContentDigest(std::string(kIntentDigest)),
+       core::ContentDigest(std::string(kIntentDigest))});
+  store.Close();
+  ASSERT_GT(successor.publication_generation,
+            predecessor.publication_generation);
+
+  const auto& policy = contract::manager_liveness_policy();
+  const core::RuntimeEpoch runtime_epoch(started.process_incarnation());
+  const std::vector<core::RequiredManagerLivenessReceiverDTO> receivers{
+      {fixture.query->plan.runtime_unit_id, runtime_epoch,
+       policy.runtime_policy_id, policy.runtime_policy_revision}};
+  const auto required_set_digest =
+      core::ComputeRequiredRuntimeSetDigest(receivers);
+  const core::RuntimeUnitId manager_id(
+      "component-manager.native-adapter-race-test");
+  const core::RuntimeEpoch manager_epoch(
+      "manager-runtime.native-adapter-race-test");
+  const core::RequestOwnerEpoch manager_owner(
+      "manager-owner.native-adapter-race-test");
+  const core::ManagerLivenessRequiredSetDTO required_set{
+      fixture.bundle->value().cell_graph.cell_id,
+      predecessor.request.candidate_retained_bundle_id,
+      required_set_digest, manager_id, manager_epoch, manager_owner, receivers};
+  const core::ManagerHeartbeatDTO heartbeat{
+      required_set.cell_id, manager_id, manager_epoch, manager_owner, 1U,
+      policy.runtime_policy_id, policy.runtime_policy_revision};
+
+  EXPECT_THROW(
+      static_cast<void>(adapter.RenewManagerLiveness(
+          {fixture.query->plan.runtime_unit_id,
+           predecessor.publication_generation,
+           predecessor.request.candidate_graph_revision,
+           predecessor.durable_public_pointer_content_digest, required_set,
+           policy, heartbeat, std::nullopt})),
+      component_manager::ManagerLivenessPublicationSuperseded);
+  const auto after = adapter.ObserveProcess(*fixture.query);
+  EXPECT_EQ(after.state(), component_manager::ProcessPresenceState::kPresent);
+  EXPECT_EQ(after.process_incarnation(), runtime_epoch.value());
+  ASSERT_TRUE(adapter.ObserveProgress(*fixture.query, runtime_epoch)
+                  .has_value());
 }
 
 TEST(RetainedNativeRuntimeUnitAdapter,

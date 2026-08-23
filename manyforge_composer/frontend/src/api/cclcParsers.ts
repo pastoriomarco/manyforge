@@ -2,6 +2,7 @@ import type {
   CCLCAdmission,
   CCLCComponentExpectation,
   CCLCComponentSnapshot,
+  CCLCOwnerIdentity,
   CCLCDesiredBindingRoute,
   CCLCDesiredConfiguration,
   CCLCExpectedActiveConfiguration,
@@ -132,6 +133,17 @@ function errorAt(value: unknown, path: string): void {
     textAt(key, `${path}.details key`);
     textAt(detail, `${path}.details.${key}`);
   });
+}
+
+export function parseCCLCOwnerIdentity(value: unknown): CCLCOwnerIdentity {
+  const row = objectAt(value, 'cclcOwner');
+  exact(row, ['request_owner_epoch'], 'cclcOwner');
+  return {
+    requestOwnerEpoch: textAt(
+      row.request_owner_epoch,
+      'cclcOwner.request_owner_epoch',
+    ),
+  };
 }
 
 function canonicalTextArrayAt(

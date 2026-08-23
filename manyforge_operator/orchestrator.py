@@ -270,6 +270,18 @@ class NativeLauncherConfig:
         return self.instance_root / "program-workspace"
 
     @property
+    def program_cycle_journal(self) -> Path:
+        return self.instance_root / "program-cycle.sqlite3"
+
+    @property
+    def authoring_state_root(self) -> Path:
+        return self.instance_root / "composer-authoring"
+
+    @property
+    def authoring_transaction_journal(self) -> Path:
+        return self.authoring_state_root / "composer-authoring-transactions.sqlite3"
+
+    @property
     def headless_url(self) -> str:
         return f"http://127.0.0.1:{SERVICE_PORTS['headless']}/"
 
@@ -306,6 +318,9 @@ def native_commands(config: NativeLauncherConfig) -> tuple[ProcessSpec, ...]:
     """Return the exact four native process specifications, without I/O."""
 
     package_env = {"MANYFORGE_FS_ROOTS": str(config.package_root)}
+    program_runner_liveness_socket = (
+        config.manager_state_root / "program-runner-liveness.sock"
+    )
     manager = ProcessSpec(
         "manager",
         tuple(
@@ -322,8 +337,14 @@ def native_commands(config: NativeLauncherConfig) -> tuple[ProcessSpec, ...]:
                 config.runtime_state_root,
                 "--logical-scene-database",
                 config.logical_scene_database,
+                "--program-cycle-journal",
+                config.program_cycle_journal,
+                "--authoring-transaction-journal",
+                config.authoring_transaction_journal,
                 "--publication-root",
                 config.publication_root,
+                "--program-runner-liveness-socket",
+                program_runner_liveness_socket,
                 "--reconciliation-period-ms",
                 config.reconciliation_period_ms,
             )
@@ -388,6 +409,14 @@ def native_commands(config: NativeLauncherConfig) -> tuple[ProcessSpec, ...]:
             f"program-runner.{config.instance_id}",
             "--headless-timeout-s",
             "30",
+            "--execution-state-root",
+            str(config.runtime_state_root),
+            "--cycle-journal-path",
+            str(config.program_cycle_journal),
+            "--manager-liveness-socket",
+            str(program_runner_liveness_socket),
+            "--cell-id",
+            config.cell_id,
     ]
     if config.simulation_control_config is not None:
         program_argv.extend(
@@ -411,6 +440,8 @@ def native_commands(config: NativeLauncherConfig) -> tuple[ProcessSpec, ...]:
         config.headless_url,
         "--headless-api-timeout-s",
         "30",
+        "--authoring-state-root",
+        str(config.authoring_state_root),
     )
     if config.composer_static_dir is not None:
         composer_argv += ("--static-dir", str(config.composer_static_dir))
@@ -1394,6 +1425,7 @@ class NativeLauncher:
                 self.config.manager_state_root,
                 self.config.runtime_state_root,
                 self.config.execution_state_root,
+                self.config.authoring_state_root,
             ):
                 path.mkdir(parents=True, exist_ok=True)
             self._write_live(configuration, LaunchInstanceState.STARTING)

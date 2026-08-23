@@ -5,6 +5,7 @@
 #include <cstdint>
 #include <manyforge_core/route_selection.hpp>
 #include <manyforge_core/types/cclc.hpp>
+#include <manyforge_core/types/cell_admission.hpp>
 #include <manyforge_core/types/component_lifecycle.hpp>
 #include <manyforge_core/types/error_code.hpp>
 #include <manyforge_core/types/strong_id.hpp>
@@ -171,6 +172,14 @@ struct CCLCJournalRecoveryDTO final {
   std::vector<RouteSelectionStatusDTO> interrupted_route_selections;
   std::vector<CCLCRouteEffectSequenceWatermarkDTO> route_effect_sequence_watermarks;
   std::vector<CCLCRouteEffectAttemptDTO> unresolved_route_effect_attempts;
+  struct LifecycleClaimRecovery final {
+    CellAdmissionClaimIntentDTO intent;
+    std::optional<CellAdmissionClaimDTO> claim;
+    std::optional<CellAdmissionClaimReleaseDTO> release_intent;
+    bool release_receipt_recorded{};
+    bool lifecycle_accepted{};
+  };
+  std::vector<LifecycleClaimRecovery> lifecycle_claims;
 
   [[nodiscard]] bool locally_valid() const noexcept;
 };
@@ -239,6 +248,66 @@ class ICCLCJournal : public ICCLCCurrentFactReader {
       const ComponentLifecycleAcceptedDTO& candidate_acceptance,
       const ComponentLifecycleStatusDTO& candidate_initial_status) = 0;
 
+  [[nodiscard]] virtual Result<void> RecordLifecycleClaimAttempt(
+      const RequestOwnerEpoch& active_owner_epoch,
+      const CellAdmissionClaimIntentDTO& intent) {
+    (void)active_owner_epoch;
+    (void)intent;
+    return Result<void>::Err(
+        {"component_lifecycle_claim_journal_unavailable",
+         "CCLC journal has no lifecycle claim persistence", {}});
+  }
+  [[nodiscard]] virtual Result<void> RecordLifecycleClaimAcquired(
+      const RequestOwnerEpoch& active_owner_epoch,
+      const CellAdmissionClaimDTO& claim) {
+    (void)active_owner_epoch;
+    (void)claim;
+    return Result<void>::Err(
+        {"component_lifecycle_claim_journal_unavailable",
+         "CCLC journal has no lifecycle claim persistence", {}});
+  }
+  [[nodiscard]] virtual Result<std::uint64_t>
+  RecordLifecycleTerminalAndClaimRelease(
+      const RequestOwnerEpoch& active_owner_epoch,
+      const ComponentLifecycleStatusDTO& status,
+      const CellAdmissionClaimReleaseDTO& release) {
+    (void)active_owner_epoch;
+    (void)status;
+    (void)release;
+    return Result<std::uint64_t>::Err(
+        {"component_lifecycle_claim_journal_unavailable",
+         "CCLC journal has no lifecycle claim persistence", {}});
+  }
+  [[nodiscard]] virtual Result<void> RecordLifecycleClaimReleaseReceipt(
+      const RequestOwnerEpoch& active_owner_epoch,
+      const CellAdmissionClaimReleaseDTO& release,
+      const CellAdmissionRecoveryReceiptDTO& receipt) {
+    (void)active_owner_epoch;
+    (void)release;
+    (void)receipt;
+    return Result<void>::Err(
+        {"component_lifecycle_claim_journal_unavailable",
+         "CCLC journal has no lifecycle claim persistence", {}});
+  }
+  [[nodiscard]] virtual Result<void> RecordUnacceptedLifecycleClaimRelease(
+      const RequestOwnerEpoch& active_owner_epoch,
+      const CellAdmissionClaimReleaseDTO& release) {
+    (void)active_owner_epoch;
+    (void)release;
+    return Result<void>::Err(
+        {"component_lifecycle_claim_journal_unavailable",
+         "CCLC journal has no unaccepted-claim recovery", {}});
+  }
+  [[nodiscard]] virtual Result<void> RecordLifecycleClaimNotAcquired(
+      const RequestOwnerEpoch& active_owner_epoch,
+      const CellAdmissionClaimIntentDTO& intent) {
+    (void)active_owner_epoch;
+    (void)intent;
+    return Result<void>::Err(
+        {"component_lifecycle_claim_journal_unavailable",
+         "CCLC journal has no acquire-attempt recovery", {}});
+  }
+
   /// Atomically persists one exact typed effect request and its successor
   /// owner status before CCLC invokes the external owner.
   [[nodiscard]] virtual Result<std::uint64_t> RecordEffectPrepared(
@@ -250,6 +319,20 @@ class ICCLCJournal : public ICCLCCurrentFactReader {
   [[nodiscard]] virtual Result<std::uint64_t> RecordEffectCompleted(
       const RequestOwnerEpoch& active_owner_epoch, const CCLCEffectAttemptDTO& completed_attempt,
       const ComponentLifecycleStatusDTO& successor_status) = 0;
+  [[nodiscard]] virtual Result<std::uint64_t>
+  RecordEffectCompletedAndLifecycleClaimRelease(
+      const RequestOwnerEpoch& active_owner_epoch,
+      const CCLCEffectAttemptDTO& completed_attempt,
+      const ComponentLifecycleStatusDTO& successor_status,
+      const CellAdmissionClaimReleaseDTO& release) {
+    (void)active_owner_epoch;
+    (void)completed_attempt;
+    (void)successor_status;
+    (void)release;
+    return Result<std::uint64_t>::Err(
+        {"component_lifecycle_claim_journal_unavailable",
+         "CCLC journal has no atomic terminal claim release", {}});
+  }
 
   /// Replaces one transaction status only when its sequence and owner-clock
   /// timestamps advance monotonically. The transaction identity, accepted

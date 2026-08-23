@@ -25,6 +25,7 @@ or constructed and never writes an error stub in place of a contract.
 from __future__ import annotations
 
 import sys
+import tempfile
 
 
 _UNAVAILABLE_REASON_CODE = "composable_cell_runtime_unavailable"
@@ -145,9 +146,15 @@ def gen_rest_api() -> str:
     # the configured thin-client superset without making a request or starting
     # a Headless process, so the reference does not silently omit optional
     # runtime-client routes.
-    spec = create_app(
-        ComposerState(headless_client=object()),  # type: ignore[arg-type]
-    ).openapi()
+    with tempfile.TemporaryDirectory(
+        prefix="manyforge-structural-contract-"
+    ) as authoring_state_root:
+        spec = create_app(
+            ComposerState(
+                headless_client=object(),  # type: ignore[arg-type]
+                authoring_state_root=authoring_state_root,
+            ),
+        ).openapi()
     body: list[str] = [
         _stamp("gen_rest_api", "structural-rest"),
         "# Composer REST API\n\n",

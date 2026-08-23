@@ -224,7 +224,8 @@ template <typename StrongCounter>
                                                            RequestAttributionDTO attribution) {
   exact_object(value,
                {"request_context", "controllable_component_id", "intent", "expected_graph_revision",
-                "expected_component_lifecycle_generation", "expected_control_domains"},
+                "expected_component_lifecycle_generation", "expected_control_domains",
+                "expected_admission_generation"},
                {"reason"}, "component lifecycle intent");
   std::vector<ExpectedControlDomainRevisionDTO> domains;
   const auto& encoded =
@@ -257,7 +258,10 @@ template <typename StrongCounter>
           "expected component lifecycle generation")),
       std::move(domains),
       std::move(reason),
-      std::move(attribution)};
+      std::move(attribution),
+      AdmissionGeneration(unsigned_integer(
+          member(value, "expected_admission_generation", "component lifecycle intent"),
+          "expected admission generation"))};
   if (!result.locally_valid()) {
     fail("component lifecycle intent is invalid");
   }
@@ -878,6 +882,11 @@ ComponentLifecycleCoordinatorOpenRequestPort::ComponentLifecycleCoordinatorOpenR
       current_component_source_(current_component_source),
       route_template_source_(route_template_source) {}
 
+RequestOwnerEpoch
+ComponentLifecycleCoordinatorOpenRequestPort::ReadRequestOwnerEpoch() const {
+  return coordinator_.request_owner_epoch();
+}
+
 Result<CCLCLifecycleRequestResultDTO> ComponentLifecycleCoordinatorOpenRequestPort::SubmitLifecycle(
     const ComponentLifecycleIntentDTO& intent) {
   return coordinator_.SubmitLifecycle(intent);
@@ -933,6 +942,18 @@ Result<std::string> ExecuteCanonicalCCLCOpenRequest(const std::string_view canon
     }
     command = text(member(root, "command", "CCLC open request"), "command");
     const auto& payload = member(root, "payload", "CCLC open request");
+
+    if (command == "owner_identity") {
+      exact_object(payload, {}, {}, "owner identity request");
+      const auto owner_epoch = port.ReadRequestOwnerEpoch();
+      if (owner_epoch.empty()) {
+        fail("CCLC owner identity is invalid");
+      }
+      return encode_response(response_value(
+          command,
+          CanonicalValue(CanonicalValue::Object{
+              {"request_owner_epoch", CanonicalValue(owner_epoch.value())}})));
+    }
 
     if (command == "component_snapshot") {
       exact_object(payload, {"controllable_component_id"}, {}, "component snapshot request");

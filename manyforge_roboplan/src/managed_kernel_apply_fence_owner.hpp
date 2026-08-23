@@ -1,5 +1,6 @@
 #pragma once
 
+#include <cstddef>
 #include <cstdint>
 #include <filesystem>
 #include <functional>
@@ -115,6 +116,7 @@ private:
   struct HeldFence final {
     manyforge::core::ConfigurationFenceId fence_id;
     manyforge::core::ConfigurationFenceScopeDTO scope;
+    std::size_t active_effect_count{};
   };
 
   std::shared_ptr<std::recursive_mutex> admission_mutex_;

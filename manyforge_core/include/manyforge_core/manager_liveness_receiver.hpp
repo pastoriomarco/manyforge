@@ -60,9 +60,17 @@ class ManagerLivenessReceiver final : public IManagerHeartbeatSink {
   [[nodiscard]] Result<void> BeginManagerEpochReplacement(
       RuntimeUnitId manager_runtime_unit_id, RuntimeEpoch manager_runtime_epoch,
       RequestOwnerEpoch manager_owner_epoch);
+  /// Atomically adopts the exact successor required-set identity without
+  /// changing this receiver or extending its predecessor receipt.  The caller
+  /// must already have closed command ingress and installed the complete set
+  /// in the Kernel.
+  [[nodiscard]] Result<void> RebindRequiredSet(
+      RetainedBundleId active_bundle_id,
+      ContentDigest required_runtime_set_digest);
   [[nodiscard]] Result<void> CompleteReconciliation(
       const ManagerLivenessReconciliationAck& acknowledgement);
   [[nodiscard]] ManagerLivenessStatusDTO status() const;
+  [[nodiscard]] ManagerLivenessObservationDTO observation() const;
 
  private:
   struct State;

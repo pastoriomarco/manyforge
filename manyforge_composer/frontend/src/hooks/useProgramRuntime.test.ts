@@ -2,11 +2,47 @@ import { readFileSync } from 'node:fs';
 
 import { describe, expect, it } from 'vitest';
 
-import type { ScenarioCatalogResponse } from '../types/api';
+import type {
+  AppliedProgramSelection,
+  ProgramRunStatus,
+  ProgramWorkspaceResponse,
+  ScenarioCatalogResponse,
+} from '../types/api';
+import type { ComposerHeadlessState } from '../types/headless';
 import {
+  buildProgramResetRequest,
+  buildProgramStartRequest,
   retainedScenarioSelection,
   scenarioSelectionAfterRequest,
 } from './useProgramRuntime';
+
+const digest = (character: string) => `sha256:${character.repeat(64)}`;
+
+function admissionFixtures() {
+  const applied = {
+    scenarioId: 'applied',
+    scenarioCatalogRevision: digest('a'),
+    programRevision: digest('b'),
+    recordDigest: digest('c'),
+  } as AppliedProgramSelection;
+  const workspace = {
+    draft: {
+      draftId: 'draft-1', draftRevision: 5, programLoaded: true,
+      programRevision: digest('b'),
+    },
+  } as ProgramWorkspaceResponse;
+  const snapshot = {
+    clientId: 'composer-browser.fixture',
+    authoringAdmission: { authoringAllowed: true, admissionGeneration: 9 },
+    programCycle: {
+      programRunnerOwnerEpoch: 'runner.epoch.1', cycleGeneration: 3,
+      state: 'idle_after_reset', programRunId: null,
+      cycleClaimGeneration: null, terminalOrSettlementReference: null,
+    },
+    draftIdentity: { draftId: 'draft-1', draftRevision: 5 },
+  } as ComposerHeadlessState;
+  return { applied, workspace, snapshot };
+}
 
 const catalog = {
   apiVersion: 'manyforge.scenario_catalog.v1',
@@ -57,5 +93,75 @@ describe('Program runtime idle selection', () => {
     const selected = scenarioSelectionAfterRequest(null, catalog, 'applied');
     expect(selected).toBe('applied');
     expect(scenarioSelectionAfterRequest(selected, catalog, null)).toBeNull();
+  });
+});
+
+describe('Program runtime authority requests', () => {
+  it('starts only from one complete Idle snapshot and carries exact fences', () => {
+    const { applied, workspace, snapshot } = admissionFixtures();
+    expect(buildProgramStartRequest(
+      applied, true, null, snapshot, workspace,
+      'composer-program-owner.fixture', 'program-run-start.fixture',
+    )).toEqual({
+      request_id: 'program-run-start.fixture',
+      request_owner_epoch: 'composer-program-owner.fixture',
+      source_label: 'operator_ui',
+      correlation_id: 'program-run-start.fixture',
+      scenario_id: 'applied',
+      scenario_catalog_revision: digest('a'),
+      expected_applied_record_digest: digest('c'),
+      draft_program_revision: digest('b'),
+      expected_admission_generation: 9,
+    });
+
+    expect(buildProgramStartRequest(
+      applied, true, null, null, workspace,
+      'composer-program-owner.fixture', 'program-run-start.fixture',
+    )).toBeNull();
+    expect(buildProgramStartRequest(
+      applied, true, null,
+      { ...snapshot, programCycle: { ...snapshot.programCycle, state: 'running' } },
+      workspace, 'composer-program-owner.fixture', 'program-run-start.fixture',
+    )).toBeNull();
+    expect(buildProgramStartRequest(
+      applied, true, null, snapshot,
+      { ...workspace, draft: { ...workspace.draft, draftRevision: 6 } },
+      'composer-program-owner.fixture', 'program-run-start.fixture',
+    )).toBeNull();
+  });
+
+  it('resets only the exact terminal cycle and reuses owner terminal evidence', () => {
+    const { snapshot } = admissionFixtures();
+    const terminalReference = digest('d');
+    const terminalSnapshot = {
+      ...snapshot,
+      programCycle: {
+        programRunnerOwnerEpoch: 'runner.epoch.1', cycleGeneration: 4,
+        state: 'terminal_awaiting_reset' as const,
+        programRunId: 'run-1', cycleClaimGeneration: 12,
+        terminalOrSettlementReference: terminalReference,
+      },
+    };
+    const run = {
+      capture: { programRunId: 'run-1' },
+    } as ProgramRunStatus;
+    expect(buildProgramResetRequest(
+      run, terminalSnapshot, 'composer-program-owner.fixture', 'reset.fixture',
+    )).toEqual({
+      request_id: 'reset.fixture',
+      request_owner_epoch: 'composer-program-owner.fixture',
+      source_label: 'operator_ui',
+      correlation_id: null,
+      program_run_id: 'run-1',
+      expected_owner_epoch: 'runner.epoch.1',
+      expected_cycle_generation: 4,
+      expected_claim_generation: 12,
+      terminal_reference: terminalReference,
+      settlement_evidence_digest: terminalReference,
+    });
+    expect(buildProgramResetRequest(
+      { capture: { programRunId: 'other' } } as ProgramRunStatus,
+      terminalSnapshot, 'composer-program-owner.fixture', 'reset.fixture',
+    )).toBeNull();
   });
 });

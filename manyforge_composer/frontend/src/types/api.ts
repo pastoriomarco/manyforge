@@ -752,6 +752,12 @@ export interface SceneTransactionResponse {
 export interface DraftFenceRequest {
   draftId: string;
   expectedDraftRevision: number;
+  clientId: string;
+  snapshotReceiverEpoch: string;
+  snapshotSequence: number;
+  expectedAdmissionGeneration: number;
+  requestOwnerEpoch: string;
+  requestId: string;
 }
 
 export interface ManagerApplyRequest {
@@ -865,6 +871,15 @@ export interface DraftMutationResponse {
   mutation: string;
   details: Record<string, JsonValue>;
   workspace: ProgramWorkspaceResponse;
+}
+
+export interface ProgramCycleResetResult {
+  schemaVersion: 'manyforge.program_cycle_reset_result.v1';
+  programRunId: string;
+  resetCycleGeneration: number;
+  idleCycleGeneration: number;
+  settlementReference: string;
+  admission: Record<string, JsonValue>;
 }
 
 export interface ProgramNodePolicyMutationResponse {

@@ -1,7 +1,7 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import nativeBindingFixture from '../../../../manyforge_deployment/resources/program_binding_lite6_native.fixture.json';
 import { ApiError, api, resolveStructuralAssetUrl } from './client';
-import type { ManagerApplyRequest } from '../types/api';
+import type { DraftFenceRequest, ManagerApplyRequest } from '../types/api';
 import type { OperatorAlarmRecord } from '../types/headless';
 
 afterEach(() => {
@@ -18,6 +18,19 @@ function response(
     statusText: options.statusText ?? 'OK',
     json: vi.fn().mockResolvedValue(payload),
   } as unknown as Response;
+}
+
+function draftFence(revision = 1): DraftFenceRequest {
+  return {
+    draftId: 'draft-1',
+    expectedDraftRevision: revision,
+    clientId: 'composer-browser.fixture',
+    snapshotReceiverEpoch: 'receiver.epoch.1',
+    snapshotSequence: 9,
+    expectedAdmissionGeneration: 4,
+    requestOwnerEpoch: 'composer-authoring-owner.fixture',
+    requestId: 'composer-authoring.fixture',
+  };
 }
 
 function workspaceFixture(): Record<string, unknown> {
@@ -292,7 +305,7 @@ describe('structural API client', () => {
     vi.stubGlobal('fetch', fetchMock);
 
     const result = await api.programWorkspace.mutate(
-      { draftId: 'draft-1', expectedDraftRevision: 1 },
+      draftFence(),
       'tree_draft_update_node_params',
       {
         instance_id: 'wait',
@@ -304,8 +317,7 @@ describe('structural API client', () => {
     const [url, options] = fetchMock.mock.calls[0] as [string, RequestInit];
     expect(url).toBe('/api/program/draft/mutations');
     expect(JSON.parse(String(options.body))).toEqual({
-      draftId: 'draft-1',
-      expectedDraftRevision: 1,
+      ...draftFence(),
       mutation: 'tree_draft_update_node_params',
       arguments: {
         instance_id: 'wait',
@@ -327,7 +339,7 @@ describe('structural API client', () => {
     vi.stubGlobal('fetch', fetchMock);
 
     const result = await api.programWorkspace.updateNodePolicies(
-      { draftId: 'draft-1', expectedDraftRevision: 1 },
+      draftFence(),
       `sha256:${'a'.repeat(64)}`,
       'wait',
       {
@@ -348,8 +360,7 @@ describe('structural API client', () => {
     expect(result.details.updatedInstanceId).toBe('wait');
     const [, options] = fetchMock.mock.calls[0] as [string, RequestInit];
     expect(JSON.parse(String(options.body))).toEqual({
-      draftId: 'draft-1',
-      expectedDraftRevision: 1,
+      ...draftFence(),
       mutation: 'program_draft_update_node_policies',
       arguments: {
         expected_program_revision: `sha256:${'a'.repeat(64)}`,
@@ -389,7 +400,7 @@ describe('structural API client', () => {
     vi.stubGlobal('fetch', fetchMock);
 
     await api.programWorkspace.apply(
-      { draftId: 'draft-1', expectedDraftRevision: 1 },
+      draftFence(),
       'cell-pick',
       `sha256:${'a'.repeat(64)}`,
     );
@@ -401,8 +412,7 @@ describe('structural API client', () => {
     ];
     expect(applyUrl).toBe('/api/program/apply');
     expect(JSON.parse(String(applyOptions.body))).toEqual({
-      draftId: 'draft-1',
-      expectedDraftRevision: 1,
+      ...draftFence(),
       scenarioId: 'cell-pick',
       scenarioCatalogRevision: `sha256:${'a'.repeat(64)}`,
     });
@@ -421,7 +431,7 @@ describe('structural API client', () => {
         workspace: workspaceFixture(),
       }));
     vi.stubGlobal('fetch', fetchMock);
-    const currentFence = { draftId: 'draft-1', expectedDraftRevision: 7 };
+    const currentFence = draftFence(7);
 
     await api.programWorkspace.newDraft(currentFence, true);
     await api.programWorkspace.discard(currentFence);

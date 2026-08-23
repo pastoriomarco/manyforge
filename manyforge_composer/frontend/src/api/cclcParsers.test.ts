@@ -3,6 +3,7 @@ import { describe, expect, it } from 'vitest';
 import {
   parseCCLCAdmission,
   parseCCLCComponentSnapshot,
+  parseCCLCOwnerIdentity,
   parseCCLCRouteTemplateSet,
   parseCCLCStatusEnvelope,
 } from './cclcParsers';
@@ -54,6 +55,15 @@ function lifecycleAcceptance(): Record<string, unknown> {
 }
 
 describe('CCLC closed response parsers', () => {
+  it('parses only the sole CCLC owner identity field', () => {
+    expect(parseCCLCOwnerIdentity({
+      request_owner_epoch: 'cclc-owner.1',
+    })).toEqual({ requestOwnerEpoch: 'cclc-owner.1' });
+    expect(() => parseCCLCOwnerIdentity({
+      request_owner_epoch: 'cclc-owner.1', extra: true,
+    })).toThrow('closed fields');
+  });
+
   it('projects one complete owner snapshot and rejects noncanonical scope', () => {
     const value = componentSnapshot();
     const parsed = parseCCLCComponentSnapshot(value);

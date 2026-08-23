@@ -1,4 +1,8 @@
 export type CCLCLifecycleIntent = 'prepare' | 'enable' | 'disable' | 'recover';
+
+export interface CCLCOwnerIdentity {
+  requestOwnerEpoch: string;
+}
 export type CCLCLifecycleState =
   | 'undeclared'
   | 'declared'

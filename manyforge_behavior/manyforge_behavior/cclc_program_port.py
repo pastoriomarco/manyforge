@@ -34,6 +34,8 @@ _LIFECYCLE_INTENTS = MappingProxyType(
 class CCLCProgramClient(Protocol):
     """Thin Headless client surface consumed by the Program owner."""
 
+    def cclc_owner_identity(self) -> dict[str, Any]: ...
+
     def cclc_component(self, component_id: str) -> dict[str, Any]: ...
 
     def cclc_route_templates(self, component_id: str) -> dict[str, Any]: ...
@@ -172,12 +174,12 @@ class CCLCProgramTaskPort:
         self,
         client: CCLCProgramClient,
         *,
-        request_owner_epoch: str,
         maximum_retained_tasks: int = _MAX_IDENTITIES,
     ) -> None:
         if not all(
             callable(getattr(client, method, None))
             for method in (
+                "cclc_owner_identity",
                 "cclc_component",
                 "cclc_route_templates",
                 "submit_component_lifecycle",
@@ -188,9 +190,6 @@ class CCLCProgramTaskPort:
         ):
             raise TypeError("client must expose the complete CCLC Headless surface")
         self._client = client
-        self._request_owner_epoch = _text(
-            request_owner_epoch, field="request_owner_epoch"
-        )
         if (
             type(maximum_retained_tasks) is not int
             or not 1 <= maximum_retained_tasks <= _MAX_IDENTITIES
@@ -505,7 +504,12 @@ class CCLCProgramTaskPort:
                 "component snapshot differs from the Applied Program context",
             )
         request_context = self._request_context(request_id, identity)
-        request_context["request_owner_epoch"] = self._request_owner_epoch
+        owner = _mapping(
+            self._client.cclc_owner_identity(), field="CCLC owner identity"
+        )
+        request_context["request_owner_epoch"] = _text(
+            owner.get("request_owner_epoch"), field="request_owner_epoch"
+        )
         body = {
             "request_context": request_context,
             "controllable_component_id": component_id,
@@ -591,7 +595,12 @@ class CCLCProgramTaskPort:
             )
         selected = matches[0]
         request_context = self._request_context(request_id, identity)
-        request_context["request_owner_epoch"] = self._request_owner_epoch
+        owner = _mapping(
+            self._client.cclc_owner_identity(), field="CCLC owner identity"
+        )
+        request_context["request_owner_epoch"] = _text(
+            owner.get("request_owner_epoch"), field="request_owner_epoch"
+        )
         body = {
             "request_context": request_context,
             "expected_retained_bundle_id": context.retained_bundle_id,

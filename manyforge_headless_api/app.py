@@ -24,10 +24,15 @@ from .models import (
     FullStopIntentRequest,
     HistorianReconcileRequest,
     ManagerApplyRequest,
+    AuthoringMutationContext,
+    AuthoringMutationRecoveryRequest,
+    AuthoringMutationSettlementRequest,
+    AuthoringOwnerReconciliationRequest,
     ProgramApplyRequest,
     ProgramModelAttemptRequest,
     ProgramRunStartRequest,
     ProgramRunStopRequest,
+    ProgramCycleResetRequest,
     OperationControlRequest,
     OperationIntentRequest,
     PickSequencePlanningRequest,
@@ -50,6 +55,7 @@ from .native import (
 )
 from .service import HeadlessService, TrustedAttribution
 from .program_runner_client import ProgramRunnerHttpClient
+from .cell_admission import CellAdmissionClient
 
 
 _REQUEST_ID_PATTERN = re.compile(r"[^A-Za-z0-9._-]")
@@ -244,6 +250,8 @@ def _error_status(code: str) -> int:
         "scene_projection_transition_in_progress",
         "program_run_admission_failed",
         "program_run_already_active",
+        "authoring_not_ready",
+        "program_run_draft_applied_mismatch",
     }:
         return 409
     if (
@@ -340,6 +348,11 @@ def create_app(
             manager,
             execution,
             program_runner=program_runner_client,
+            cell_admission=CellAdmissionClient(
+                config.execution_state_root,
+                timeout_seconds=config.execution_timeout_seconds,
+            ),
+            cclc=cclc,
         )
         event_execution = ExecutionCommandClient(
             config.execution_state_root,
@@ -351,6 +364,13 @@ def create_app(
             poll_seconds=config.execution_event_poll_milliseconds / 1_000.0,
         )
     assert service is not None
+    service_cclc = getattr(service, "cclc", None)
+    if cclc is None:
+        cclc = service_cclc
+    elif isinstance(service, HeadlessService) and service_cclc is None:
+        # Keep the service-owned lifecycle admission path and the thin route/
+        # projection paths on the same explicitly injected CCLC adapter.
+        service.cclc = cclc
 
     def cclc_port() -> CCLCOpenPort:
         if cclc is None:
@@ -464,6 +484,34 @@ def create_app(
     def runtime() -> dict[str, Any]:
         return service.runtime()
 
+    @app.get("/api/cell/authoring-admission")
+    def authoring_admission() -> dict[str, Any]:
+        return service.authoring_admission()
+
+    @app.post("/api/program/authoring-transactions")
+    def acquire_authoring_transaction(
+        body: AuthoringMutationContext,
+    ) -> dict[str, Any]:
+        return {"claim": service.acquire_authoring_mutation(body)}
+
+    @app.post("/api/program/authoring-transactions/settle")
+    def settle_authoring_transaction(
+        body: AuthoringMutationSettlementRequest,
+    ) -> dict[str, Any]:
+        return {"admission": service.settle_authoring_mutation(body)}
+
+    @app.post("/api/program/authoring-transactions/recovery-receipt")
+    def recover_authoring_transaction(
+        body: AuthoringMutationRecoveryRequest,
+    ) -> dict[str, Any]:
+        return {"recovery_receipt": service.recover_authoring_mutation(body)}
+
+    @app.post("/api/program/authoring-transactions/reconcile-owner")
+    def reconcile_authoring_owner(
+        body: AuthoringOwnerReconciliationRequest,
+    ) -> dict[str, Any]:
+        return {"admission": service.reconcile_authoring_owner(body)}
+
     @app.get("/api/manager/status")
     def manager_status() -> dict[str, Any]:
         return service.manager_status()
@@ -482,6 +530,10 @@ def create_app(
     ) -> dict[str, Any]:
         return cclc_port().component_snapshot(component_id)
 
+    @app.get("/api/cclc/owner")
+    def cclc_owner_identity() -> dict[str, Any]:
+        return cclc_port().owner_identity()
+
     @app.get("/api/cclc/components/{component_id}/route-templates")
     def cclc_route_templates(
         component_id: Annotated[str, Path(min_length=1, max_length=256)],
@@ -497,17 +549,13 @@ def create_app(
                 "cclc_confirmation_required",
                 "component lifecycle request requires explicit confirmation",
             )
-        return cclc_port().submit_lifecycle(
-            body.model_dump(
-                mode="json", exclude={"confirmed"}, exclude_none=True
-            )
-        )
+        return service.component_lifecycle_submit(body)
 
     @app.get("/api/cclc/lifecycle/transactions/{transaction_id}")
     def cclc_lifecycle_status(
         transaction_id: Annotated[str, Path(min_length=1, max_length=256)],
     ) -> dict[str, Any]:
-        return {"status": cclc_port().lifecycle_status(transaction_id)}
+        return {"status": service.component_lifecycle_status(transaction_id)}
 
     @app.post("/api/cclc/routes/requests")
     def cclc_route_submit(body: RouteSelectionRequest) -> dict[str, Any]:
@@ -605,6 +653,16 @@ def create_app(
                 "Program-run identity in the path and request body must match",
             )
         return service.program_run_stop(program_run_id, request)
+
+    @app.get("/api/program/cycle/status")
+    def program_cycle_status() -> dict[str, Any]:
+        return service.program_cycle_status()
+
+    @app.post("/api/program/cycle/reset")
+    def program_cycle_reset(
+        request: ProgramCycleResetRequest,
+    ) -> dict[str, Any]:
+        return service.program_cycle_reset(request)
 
     def viewer_asset_response(asset: ViewerModelAsset) -> Response:
         cache_control = (

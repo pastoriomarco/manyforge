@@ -368,7 +368,8 @@ require_headless_native_packages() {
     local package_metadata
     for package_metadata in \
         "$build/manager-apply-test-fixture/metadata.json" \
-        "$build/manager-apply-o1-4g-replacement-fixture/metadata.json"; do
+        "$build/manager-apply-o1-4g-replacement-fixture/metadata.json" \
+        "$build/assistant-native-test-fixture/metadata.json"; do
         if [[ ! -f "$package_metadata" ]]; then
             echo -e "${RED}  FAIL: Headless native package was not generated: ${package_metadata}${NC}"
             return 1
@@ -432,8 +433,12 @@ run_headless_python_tests() {
     fi
     if MANYFORGE_MANAGER_DAEMON="$build/manyforge_manager_daemon" \
         MANYFORGE_CANONICAL_EMPTY_PACKAGE_ROOT="$build/canonical-empty-test-package" \
-        MANYFORGE_ASSISTANT_AUTHORING_PACKAGE_ROOT="$build/assistant-authoring-test-fixture/retained-package" \
-        MANYFORGE_ASSISTANT_SOURCE_PUBLISHER="$build/manyforge_publish_headless_assistant_test_source" \
+        MANYFORGE_ASSISTANT_NATIVE_PACKAGE_ROOT="$build/assistant-native-test-fixture/retained-package" \
+        MANYFORGE_ASSISTANT_NATIVE_METADATA="$build/assistant-native-test-fixture/metadata.json" \
+        MANYFORGE_MANAGER_APPLY_PACKAGE_ROOT="$build/manager-apply-test-fixture/retained-package" \
+        MANYFORGE_MANAGER_APPLY_METADATA="$build/manager-apply-test-fixture/metadata.json" \
+        MANYFORGE_NATIVE_EXECUTION_HOST="$BUILD_DIR/roboplan/manyforge_native_execution_host" \
+        MANYFORGE_ROBOPLAN_CANDIDATE_WORKER="$BUILD_DIR/roboplan/manyforge_roboplan_candidate_worker" \
         pytest \
             manyforge_headless_api/tests/ \
             manyforge_headless_api/process_tests/ \

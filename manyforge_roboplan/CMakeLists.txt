@@ -378,11 +378,13 @@ target_link_libraries(manyforge_roboplan_managed_kernel_apply_fence
     SQLite::SQLite3)
 
 add_library(manyforge_roboplan_cell_admission_command_codec
-  src/cell_admission_command_codec.cpp)
+  src/cell_admission_command_codec.cpp
+  src/owner_settlement_readers.cpp)
 target_include_directories(manyforge_roboplan_cell_admission_command_codec
   PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/src)
 target_link_libraries(manyforge_roboplan_cell_admission_command_codec
-  PUBLIC manyforge_component_manager manyforge::content_identity)
+  PUBLIC manyforge_component_manager manyforge::content_identity
+  PRIVATE SQLite::SQLite3)
 
 # Selected composition root for the first complete addressed native path.
 # Its same-user Unix socket is a bounded private transport consumed by the
@@ -403,6 +405,7 @@ target_link_libraries(manyforge_native_execution_host PRIVATE
   manyforge_roboplan_retained_consumer
   manyforge_component_manager
   manyforge::content_identity
+  manyforge::scene
   manyforge::scene_value_codec
   manyforge_deployment
   manyforge::persistence
@@ -434,6 +437,7 @@ if(MANYFORGE_BUILD_ROS2_CONTROL_RUNTIME)
     manyforge_roboplan_retained_consumer
     manyforge_component_manager
     manyforge::content_identity
+    manyforge::scene
     manyforge::scene_value_codec
     manyforge_deployment
     manyforge::persistence
@@ -486,7 +490,8 @@ if(BUILD_TESTING)
     target_compile_definitions(
       manyforge_native_execution_host_pick_place_fixture PRIVATE
       COAL_DISABLE_HPP_FCL_WARNINGS
-      MANYFORGE_ENABLE_FOCUSED_PICK_PLACE_PLANNING_FIXTURE=1)
+      MANYFORGE_ENABLE_FOCUSED_PICK_PLACE_PLANNING_FIXTURE=1
+      MANYFORGE_ENABLE_STANDALONE_ADMISSION_FIXTURE=1)
     target_link_libraries(
       manyforge_native_execution_host_pick_place_fixture PRIVATE
       manyforge_roboplan_managed_kernel_apply_fence
@@ -497,6 +502,37 @@ if(BUILD_TESTING)
       manyforge_roboplan_retained_consumer
       manyforge_component_manager
       manyforge::content_identity
+      manyforge::scene
+      manyforge::scene_value_codec
+      manyforge_deployment
+      manyforge::persistence
+      SQLite::SQLite3
+      Threads::Threads)
+
+    # Compile-time-only standalone admission fixture. The installed native
+    # host remains fail-closed without Manager liveness; this target supplies
+    # deterministic Idle facts solely to exercise real CCLC claim mechanics.
+    add_executable(manyforge_native_execution_host_admission_fixture
+      src/product_backed_runtime_participant_resolver.cpp
+      src/native_execution_host_main.cpp)
+    target_include_directories(
+      manyforge_native_execution_host_admission_fixture PRIVATE
+      "${_MANYFORGE_REPOSITORY_SOURCE_ROOT}/manyforge_component_manager/src")
+    target_compile_definitions(
+      manyforge_native_execution_host_admission_fixture PRIVATE
+      COAL_DISABLE_HPP_FCL_WARNINGS
+      MANYFORGE_ENABLE_STANDALONE_ADMISSION_FIXTURE=1)
+    target_link_libraries(
+      manyforge_native_execution_host_admission_fixture PRIVATE
+      manyforge_roboplan_managed_kernel_apply_fence
+      manyforge_roboplan_cell_admission_command_codec
+      manyforge_roboplan_native_cclc_runtime
+      manyforge_roboplan_native_runtime
+      manyforge_roboplan_process_candidate_client
+      manyforge_roboplan_retained_consumer
+      manyforge_component_manager
+      manyforge::content_identity
+      manyforge::scene
       manyforge::scene_value_codec
       manyforge_deployment
       manyforge::persistence
@@ -521,6 +557,12 @@ if(BUILD_TESTING)
       test/test_cell_admission_command_codec.cpp)
     target_link_libraries(test_cell_admission_command_codec PRIVATE
       manyforge_roboplan_cell_admission_command_codec GTest::gtest_main)
+
+    add_executable(test_owner_settlement_readers
+      test/test_owner_settlement_readers.cpp)
+    target_link_libraries(test_owner_settlement_readers PRIVATE
+      manyforge_roboplan_cell_admission_command_codec GTest::gtest_main
+      SQLite::SQLite3)
 
     # Bounded qualification-only evidence capture. It is deliberately not a
     # production target and supplies no planner, factory, scene, execution, or
@@ -1474,6 +1516,10 @@ if(BUILD_TESTING)
       PROPERTIES
         ENVIRONMENT "LD_LIBRARY_PATH=${_LIB_PATHS}"
         TIMEOUT ${MANYFORGE_GTEST_TIMEOUT_SECONDS})
+    gtest_discover_tests(test_owner_settlement_readers
+      PROPERTIES
+        ENVIRONMENT "LD_LIBRARY_PATH=${_LIB_PATHS}"
+        TIMEOUT ${MANYFORGE_GTEST_TIMEOUT_SECONDS})
     gtest_discover_tests(test_roboplan_planning_qualification
       PROPERTIES
         ENVIRONMENT "LD_LIBRARY_PATH=${_LIB_PATHS}"
@@ -1583,7 +1629,7 @@ if(BUILD_TESTING)
       native_addressed_execution_process
       PROPERTIES
         ENVIRONMENT
-          "PYTHONPATH=${_MANYFORGE_WORKSPACE_ROOT}/manyforge_behavior:${_MANYFORGE_WORKSPACE_ROOT};LD_LIBRARY_PATH=${_LIB_PATHS};MANYFORGE_NATIVE_EXECUTION_HOST=$<TARGET_FILE:manyforge_native_execution_host>;MANYFORGE_NATIVE_PICK_PLACE_FIXTURE_HOST=$<TARGET_FILE:manyforge_native_execution_host_pick_place_fixture>;MANYFORGE_ROBOPLAN_CANDIDATE_WORKER=$<TARGET_FILE:manyforge_roboplan_candidate_worker>;MANYFORGE_ROBOPLAN_FAKE_WORKER=$<TARGET_FILE:fake_process_candidate_worker>;MANYFORGE_I6_NATIVE_FIXTURE_ROOT=${_MANYFORGE_L07_NATIVE_CCLC_FIXTURE_ROOT}"
+          "PYTHONPATH=${_MANYFORGE_WORKSPACE_ROOT}/manyforge_behavior:${_MANYFORGE_WORKSPACE_ROOT};LD_LIBRARY_PATH=${_LIB_PATHS};MANYFORGE_NATIVE_EXECUTION_HOST=$<TARGET_FILE:manyforge_native_execution_host_admission_fixture>;MANYFORGE_NATIVE_PRODUCTION_EXECUTION_HOST=$<TARGET_FILE:manyforge_native_execution_host>;MANYFORGE_NATIVE_PICK_PLACE_FIXTURE_HOST=$<TARGET_FILE:manyforge_native_execution_host_pick_place_fixture>;MANYFORGE_ROBOPLAN_CANDIDATE_WORKER=$<TARGET_FILE:manyforge_roboplan_candidate_worker>;MANYFORGE_ROBOPLAN_FAKE_WORKER=$<TARGET_FILE:fake_process_candidate_worker>;MANYFORGE_I6_NATIVE_FIXTURE_ROOT=${_MANYFORGE_L07_NATIVE_CCLC_FIXTURE_ROOT}"
         TIMEOUT 60)
 
   endif()

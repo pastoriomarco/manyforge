@@ -18,6 +18,20 @@ function state(
 ): ComposerHeadlessState {
   return {
     schemaVersion: 'manyforge.composer_headless_state.v1',
+    clientId: 'composer-browser.test',
+    complete: true,
+    authoringAdmission: { authoringAllowed: true, admissionGeneration: 1 },
+    programCycle: {
+      programRunnerOwnerEpoch: 'runner.epoch.1',
+      cycleGeneration: 1,
+      state: 'idle_after_reset',
+      programRunId: null,
+      cycleClaimGeneration: null,
+      terminalOrSettlementReference: null,
+    },
+    draftIdentity: { draftId: 'draft-1', draftRevision: 1 },
+    receiverEpoch: runtimeEpoch,
+    snapshotSequence: Math.max(1, runtimeGeneration),
     runtime: {
       schemaVersion: 'manyforge.headless_runtime_snapshot.v1',
       complete: true,
@@ -97,6 +111,7 @@ describe('Headless owner-frame admission', () => {
     expect(admitHeadlessState(current, state('runtime.epoch.1', 1)).reason)
       .toContain('regressed');
     const conflict = state('runtime.epoch.1', 2);
+    conflict.snapshotSequence = current.snapshotSequence + 1;
     conflict.runtime.complete = false;
     expect(admitHeadlessState(current, conflict).reason).toContain('conflicted');
     expect(admitHeadlessState(
@@ -104,6 +119,15 @@ describe('Headless owner-frame admission', () => {
       state('runtime.epoch.1', 3, 'alarms.epoch.1', 2),
     ).reason).toContain('alarm projection generation regressed');
   });
+
+  it('requires a strictly forward sequence within an epoch but accepts a fresh barrier',
+    () => {
+      const current = state('runtime.epoch.1', 2);
+      expect(admitHeadlessState(current, state('runtime.epoch.1', 2)).accepted)
+        .toBe(false);
+      expect(admitHeadlessState(current, state('runtime.epoch.2', 99)).accepted)
+        .toBe(true);
+    });
 });
 
 function wireState(generation: number): Record<string, unknown> {
@@ -119,6 +143,19 @@ function wireState(generation: number): Record<string, unknown> {
   };
   return {
     schema_version: 'manyforge.composer_headless_state.v1',
+    authoring_admission: { admission_generation: 1, authoring_allowed: true },
+    program_cycle: {
+      program_runner_owner_epoch: 'runner.epoch.1',
+      cycle_generation: 1,
+      state: 'idle_after_reset',
+      program_run_id: null,
+      cycle_claim_generation: null,
+      terminal_or_settlement_reference: null,
+    },
+    draft_identity: { draft_id: 'draft-1', draft_revision: 1 },
+    receiver_epoch: 'receiver.epoch.1',
+    snapshot_sequence: Math.max(1, generation + 1),
+    complete: true,
     runtime: {
       schema_version: 'manyforge.headless_runtime_snapshot.v1',
       complete: true,
@@ -159,6 +196,80 @@ afterEach(() => {
 });
 
 describe('HeadlessStateSource delivery scheduling', () => {
+  it('uses one stable fallback client identity for the socket and reconnects', () => {
+    vi.useFakeTimers();
+    const urls: string[] = [];
+    class FakeWebSocket {
+      onopen: (() => void) | null = null;
+      onmessage: ((message: MessageEvent) => void) | null = null;
+      onerror: (() => void) | null = null;
+      onclose: (() => void) | null = null;
+      constructor(url: string) { urls.push(url); }
+      close(): void {}
+    }
+    vi.stubGlobal('window', {
+      location: { href: 'http://composer.test/' },
+      requestAnimationFrame: vi.fn(), cancelAnimationFrame: vi.fn(),
+    });
+    vi.stubGlobal('localStorage', {
+      getItem: () => { throw new Error('storage unavailable'); },
+      setItem: () => { throw new Error('storage unavailable'); },
+    });
+    vi.stubGlobal('WebSocket', FakeWebSocket);
+
+    const source = new HeadlessStateSource();
+    source.setEnabled(true);
+    source.reconnect();
+    expect(urls).toHaveLength(2);
+    expect(new URL(urls[0]!).searchParams.get('client_id')).toBe(source.clientId);
+    expect(new URL(urls[1]!).searchParams.get('client_id')).toBe(source.clientId);
+    source.dispose();
+  });
+
+  it('publishes a newer authority barrier when owner projections are unchanged', () => {
+    vi.useFakeTimers();
+    const animationFrames: FrameRequestCallback[] = [];
+    class FakeWebSocket {
+      static instance: FakeWebSocket;
+      onopen: (() => void) | null = null;
+      onmessage: ((message: MessageEvent) => void) | null = null;
+      onerror: (() => void) | null = null;
+      onclose: (() => void) | null = null;
+      constructor(url: string) {
+        void url;
+        FakeWebSocket.instance = this;
+      }
+      close(): void {}
+      send(value: unknown): void {
+        this.onmessage?.({ data: JSON.stringify(value) } as MessageEvent);
+      }
+    }
+    vi.stubGlobal('window', {
+      location: { href: 'http://composer.test/' },
+      requestAnimationFrame: (callback: FrameRequestCallback) => {
+        animationFrames.push(callback); return animationFrames.length;
+      },
+      cancelAnimationFrame: vi.fn(),
+    });
+    vi.stubGlobal('WebSocket', FakeWebSocket);
+    const source = new HeadlessStateSource();
+    source.setEnabled(true);
+    const first = wireState(1);
+    const second = structuredClone(first);
+    second.snapshot_sequence = 3;
+    second.authoring_admission = {
+      admission_generation: 2, authoring_allowed: true,
+    };
+    FakeWebSocket.instance.send(first);
+    FakeWebSocket.instance.send(second);
+    expect(animationFrames).toHaveLength(1);
+    animationFrames[0]!(16);
+    expect(source.getViewerSnapshot().snapshot?.snapshotSequence).toBe(3);
+    expect(source.getViewerSnapshot().snapshot?.authoringAdmission.admissionGeneration)
+      .toBe(2);
+    source.dispose();
+  });
+
   it('keeps one socket and coalesces a 100-frame burst by delivery lane', () => {
     vi.useFakeTimers();
     const animationFrames: FrameRequestCallback[] = [];
@@ -217,21 +328,24 @@ describe('HeadlessStateSource delivery scheduling', () => {
         maxActiveSockets: 1,
       }),
     );
-    for (let generation = 0; generation < 100; generation += 1) {
+    const viewerBaseline = viewerNotifications;
+    const shellBaseline = shellNotifications;
+    for (let generation = 1; generation <= 100; generation += 1) {
       socket.sendFrame(wireState(generation));
     }
     expect(animationFrames).toHaveLength(1);
-    expect(viewerNotifications).toBe(0);
-    expect(shellNotifications).toBe(0);
+    expect(source.getViewerSnapshot().error).toBeNull();
+    expect(viewerNotifications).toBe(viewerBaseline);
+    expect(shellNotifications).toBe(shellBaseline);
 
     animationFrames[0]!(16);
-    expect(viewerNotifications).toBe(1);
-    expect(source.getViewerSnapshot().snapshot?.runtime.projectionGeneration).toBe(99);
+    expect(viewerNotifications).toBe(viewerBaseline + 1);
+    expect(source.getViewerSnapshot().snapshot?.runtime.projectionGeneration).toBe(100);
     vi.advanceTimersByTime(HEADLESS_SHELL_PUBLICATION_MS - 1);
-    expect(shellNotifications).toBe(0);
+    expect(shellNotifications).toBe(shellBaseline);
     vi.advanceTimersByTime(1);
-    expect(shellNotifications).toBe(1);
-    expect(source.getShellSnapshot().snapshot?.runtime.projectionGeneration).toBe(99);
+    expect(shellNotifications).toBe(shellBaseline + 1);
+    expect(source.getShellSnapshot().snapshot?.runtime.projectionGeneration).toBe(100);
     expect(FakeWebSocket.instances).toHaveLength(1);
     source.dispose();
     expect(getHeadlessStateQualificationSnapshot().activeSockets).toBe(0);

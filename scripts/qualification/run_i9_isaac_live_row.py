@@ -1205,7 +1205,7 @@ def _prepare_and_select_cclc_routes(
 
     execution = client.execution_status()
     execution_status = execution.get("status")
-    request_owner_epoch = (
+    execution_owner_epoch = (
         execution_status.get("owner_epoch")
         if isinstance(execution_status, dict)
         else None
@@ -1213,10 +1213,14 @@ def _prepare_and_select_cclc_routes(
     if (
         execution.get("ok") is not True
         or execution.get("command") != "status"
-        or not isinstance(request_owner_epoch, str)
-        or not request_owner_epoch
+        or not isinstance(execution_owner_epoch, str)
+        or not execution_owner_epoch
     ):
         raise LiveRowError("execution owner epoch is unavailable for CCLC startup")
+    cclc_owner = client.cclc_owner_identity()
+    request_owner_epoch = cclc_owner.get("request_owner_epoch")
+    if not isinstance(request_owner_epoch, str) or not request_owner_epoch:
+        raise LiveRowError("CCLC request owner epoch is unavailable")
 
     initial = client.cclc_component(spec.component_id)
     if (
@@ -1232,7 +1236,7 @@ def _prepare_and_select_cclc_routes(
     domain_ids = sorted(initial_bindings)
     external_readiness = _wait_for_ros2_control_lifecycle_readiness(
         client,
-        expected_owner_epoch=request_owner_epoch,
+        expected_owner_epoch=execution_owner_epoch,
         expected_domain_ids=domain_ids,
         timeout_s=timeout_s,
     )

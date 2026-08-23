@@ -22,7 +22,8 @@ using KernelCellAdmissionRpcRequest =
                  manyforge::core::CellAdmissionClaimIntentDTO,
                  manyforge::core::CellAdmissionClaimReleaseDTO,
                  manyforge::core::CellAdmissionReconcileDTO,
-                 manyforge::core::CellAdmissionRecoveryReceiptQueryDTO>;
+                 manyforge::core::CellAdmissionRecoveryReceiptQueryDTO,
+                 manyforge::core::ManagerLivenessObservationDTO>;
 
 struct KernelCellAdmissionRpcPacket final {
   std::string command;
@@ -30,7 +31,8 @@ struct KernelCellAdmissionRpcPacket final {
 };
 
 using KernelCellAdmissionRpcResponse =
-    std::variant<manyforge::core::AuthoringAdmissionDTO,
+    std::variant<std::monostate,
+                 manyforge::core::AuthoringAdmissionDTO,
                  manyforge::core::CellAdmissionClaimDTO,
                  manyforge::core::CellAdmissionRecoveryReceiptDTO,
                  manyforge::core::ErrorDTO>;

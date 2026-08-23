@@ -548,6 +548,59 @@ if(BUILD_TESTING)
     add_custom_target(manyforge_headless_test_manager_apply_package
       DEPENDS "${MANYFORGE_HEADLESS_TEST_MANAGER_APPLY_METADATA}")
 
+    set(
+      MANYFORGE_HEADLESS_TEST_ASSISTANT_NATIVE_FIXTURE_ROOT
+      "${CMAKE_CURRENT_BINARY_DIR}/assistant-native-test-fixture")
+    set(
+      MANYFORGE_HEADLESS_TEST_ASSISTANT_NATIVE_PACKAGE_ROOT
+      "${MANYFORGE_HEADLESS_TEST_ASSISTANT_NATIVE_FIXTURE_ROOT}/retained-package")
+    set(
+      MANYFORGE_HEADLESS_TEST_ASSISTANT_NATIVE_METADATA
+      "${MANYFORGE_HEADLESS_TEST_ASSISTANT_NATIVE_FIXTURE_ROOT}/metadata.json")
+    add_custom_command(
+      OUTPUT "${MANYFORGE_HEADLESS_TEST_ASSISTANT_NATIVE_METADATA}"
+      COMMAND
+        "${CMAKE_COMMAND}" -E remove_directory
+        "${MANYFORGE_HEADLESS_TEST_ASSISTANT_NATIVE_FIXTURE_ROOT}"
+      COMMAND
+        "${CMAKE_COMMAND}" -E make_directory
+        "${MANYFORGE_HEADLESS_TEST_ASSISTANT_NATIVE_FIXTURE_ROOT}"
+      COMMAND
+        "$<TARGET_FILE:manyforge_generate_headless_manager_apply_test_package>"
+        --package-root
+        "${MANYFORGE_HEADLESS_TEST_ASSISTANT_NATIVE_PACKAGE_ROOT}"
+        --metadata
+        "${MANYFORGE_HEADLESS_TEST_ASSISTANT_NATIVE_METADATA}"
+        --stop-implementation-build
+        "${_MANYFORGE_HEADLESS_TEST_NATIVE_STOP_IMPLEMENTATION_BUILD}"
+        --stop-installed-target
+        "${MANYFORGE_HEADLESS_TEST_NATIVE_EXECUTION_HOST}"
+        --stop-runner-contract
+        "${_MANYFORGE_HEADLESS_TEST_NATIVE_STOP_RUNNER_CONTRACT}"
+        --stop-runner-executable
+        "${_MANYFORGE_HEADLESS_TEST_NATIVE_STOP_RUNNER}"
+        --stop-implementation-evidence
+        "${_MANYFORGE_HEADLESS_TEST_NATIVE_STOP_IMPLEMENTATION_EVIDENCE}"
+        --stop-substitution-evidence
+        "${_MANYFORGE_HEADLESS_TEST_NATIVE_STOP_SUBSTITUTION_EVIDENCE}"
+        --profile assistant-native
+      DEPENDS
+        manyforge_generate_headless_manager_apply_test_package
+        "${MANYFORGE_HEADLESS_TEST_NATIVE_EXECUTION_HOST}"
+        "${MANYFORGE_HEADLESS_TEST_NATIVE_EXECUTION_WORKER}"
+        "${_MANYFORGE_HEADLESS_TEST_NATIVE_STOP_IMPLEMENTATION_BUILD}"
+        "${_MANYFORGE_HEADLESS_TEST_NATIVE_STOP_RUNNER_CONTRACT}"
+        "${_MANYFORGE_HEADLESS_TEST_NATIVE_STOP_IMPLEMENTATION_EVIDENCE}"
+        "${_MANYFORGE_HEADLESS_TEST_NATIVE_STOP_SUBSTITUTION_EVIDENCE}"
+        "${_MANYFORGE_HEADLESS_TEST_NATIVE_STOP_RUNNER}"
+        "${MANYFORGE_HEADLESS_TEST_LITE6_FIXTURE_ROOT}/model.urdf"
+        "${MANYFORGE_HEADLESS_TEST_LITE6_FIXTURE_ROOT}/model.srdf"
+        "${MANYFORGE_HEADLESS_TEST_ASSISTANT_INSTRUMENT_SOURCE}"
+        ${MANYFORGE_HEADLESS_TEST_LITE6_RESOURCE_INPUTS}
+      VERBATIM)
+    add_custom_target(manyforge_headless_test_assistant_native_package
+      DEPENDS "${MANYFORGE_HEADLESS_TEST_ASSISTANT_NATIVE_METADATA}")
+
     # O1.4g uses an independently qualified pick/place host to materialize a
     # second immutable package. The production qualification inputs are never
     # substituted for its exact replacement closure and evidence.
@@ -714,8 +767,12 @@ if(BUILD_TESTING)
     MANYFORGE_HEADLESS_TEST_MANAGER_DAEMON="$<TARGET_FILE:manyforge_manager_daemon>")
   if(MANYFORGE_HEADLESS_TEST_NATIVE_EXECUTION_HOST)
     add_dependencies(test_manager_daemon_process
-      manyforge_headless_test_manager_apply_package)
+      manyforge_headless_test_manager_apply_package
+      manyforge_headless_test_assistant_native_package)
     target_compile_definitions(test_manager_daemon_process PRIVATE
+      MANYFORGE_HEADLESS_TEST_PYTHON="${Python3_EXECUTABLE}"
+      MANYFORGE_HEADLESS_TEST_SOURCE_ROOT="${CMAKE_CURRENT_SOURCE_DIR}/.."
+      MANYFORGE_HEADLESS_TEST_PYTHON_MODULE_ROOT="${CMAKE_CURRENT_BINARY_DIR}"
       MANYFORGE_HEADLESS_TEST_MANAGER_APPLY_METADATA="${MANYFORGE_HEADLESS_TEST_MANAGER_APPLY_METADATA}"
       MANYFORGE_HEADLESS_TEST_MANAGER_APPLY_PACKAGE_ROOT="${MANYFORGE_HEADLESS_TEST_MANAGER_APPLY_PACKAGE_ROOT}"
       MANYFORGE_HEADLESS_TEST_MANAGER_APPLY_REPLACEMENT_METADATA="${MANYFORGE_HEADLESS_TEST_MANAGER_APPLY_REPLACEMENT_METADATA}"

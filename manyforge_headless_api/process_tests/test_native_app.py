@@ -74,6 +74,10 @@ def _start_manager(root: Path) -> subprocess.Popen[bytes]:
             str(runtime_state_root),
             "--logical-scene-database",
             str(root / "logical-scene.sqlite3"),
+            "--program-cycle-journal",
+            str(root / "program-cycle.sqlite3"),
+            "--authoring-transaction-journal",
+            str(root / "authoring-transactions.sqlite3"),
             "--publication-root",
             str(publication_root),
             "--reconciliation-period-ms",
@@ -106,7 +110,11 @@ def _start_manager(root: Path) -> subprocess.Popen[bytes]:
 def _stop_manager(process: subprocess.Popen[bytes]) -> None:
     if process.poll() is None:
         process.terminate()
-        process.wait(timeout=5)
+        try:
+            process.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            process.kill()
+            process.wait(timeout=5)
 
 
 def _wait_runtime(client: TestClient, *, complete: bool) -> dict:

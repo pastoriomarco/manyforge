@@ -1,4 +1,4 @@
--- ManyForge I4 typed named-Apply journal, version 7.
+-- ManyForge O1.5 typed named-Apply journal, version 9.
 --
 -- This schema stores immutable named-Apply intents, their exact generation-
 -- bound whole-Apply affected scopes, configuration-fence attempts, and
@@ -12,12 +12,12 @@
 -- It is deliberately not a mutable phase/event journal.
 
 PRAGMA application_id = 1296450128;
-PRAGMA user_version = 8;
+PRAGMA user_version = 9;
 
 CREATE TABLE IF NOT EXISTS apply_journal_metadata (
     singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
     schema_id TEXT NOT NULL,
-    schema_version INTEGER NOT NULL CHECK (schema_version = 8),
+    schema_version INTEGER NOT NULL CHECK (schema_version = 9),
     schema_artifact_digest TEXT NOT NULL,
     cell_id TEXT NOT NULL,
     maximum_apply_intents INTEGER NOT NULL
@@ -146,7 +146,20 @@ CREATE TABLE IF NOT EXISTS manager_apply_intents (
     predecessor_scene_content_hash TEXT NOT NULL,
     candidate_retained_bundle_id TEXT NOT NULL,
     candidate_graph_revision TEXT NOT NULL,
+    expected_admission_generation INTEGER
+        CHECK (
+            expected_admission_generation IS NULL
+            OR (
+                expected_admission_generation > 0
+                AND expected_admission_generation <= 9007199254740991
+            )
+        ),
+    parent_authoring_claim BLOB,
     intent_digest TEXT NOT NULL,
+    CHECK (
+        (expected_admission_generation IS NOT NULL)
+        <> (parent_authoring_claim IS NOT NULL)
+    ),
     PRIMARY KEY (apply_id, apply_generation),
     UNIQUE (request_owner_epoch, request_id),
     UNIQUE (apply_id, apply_generation, intent_digest)

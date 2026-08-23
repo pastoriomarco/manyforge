@@ -1,4 +1,4 @@
-"""Bounded WebSocket transport for unmodified headless owner snapshots."""
+"""Per-client complete snapshots over thin owner projections."""
 
 from __future__ import annotations
 
@@ -7,14 +7,20 @@ import json
 from typing import Any
 
 from fastapi import WebSocket, WebSocketDisconnect
-
 from manyforge_headless_api.client import HeadlessClientError, HeadlessHttpClient
+
+from .authoring_admission import AuthoringAdmissionCoordinator
+from .draft_session import ComposerDraftSession
 
 
 POLL_INTERVAL_SECONDS = 0.25
 SEND_TIMEOUT_SECONDS = 0.25
 ALARM_PAGE_LIMIT = 32
 MAXIMUM_MESSAGE_BYTES = 16 * 1024 * 1024
+
+
+class _ProjectionOversized(ValueError):
+    code = "headless_websocket_projection_oversized"
 
 
 def _encode(value: dict[str, Any]) -> str:
@@ -26,115 +32,96 @@ def _encode(value: dict[str, Any]) -> str:
         sort_keys=True,
     )
     if len(encoded.encode("utf-8")) > MAXIMUM_MESSAGE_BYTES:
-        raise ValueError("headless WebSocket projection exceeds its byte bound")
+        raise _ProjectionOversized(
+            "headless WebSocket projection exceeds its byte bound"
+        )
     return encoded
 
 
 async def serve_headless_state(
     websocket: WebSocket,
     client: HeadlessHttpClient,
+    *,
+    client_id: str,
+    admission: AuthoringAdmissionCoordinator,
+    draft_session: ComposerDraftSession,
 ) -> None:
-    """Poll immutable projections per connection; retain no runtime truth."""
+    """Publish a fresh complete barrier independently for one browser."""
 
     await websocket.accept()
-    previous_identity: tuple[object, ...] | None = None
+    sequence = 0
+    last_error_message: str | None = None
     try:
         while True:
             try:
-                runtime, alarms = await asyncio.gather(
+                if not admission.mutation_ready:
+                    raise ValueError("authoring recovery is not mutation-ready")
+                runtime, alarms, authoring, cycle = await asyncio.gather(
                     asyncio.to_thread(client.runtime),
                     asyncio.to_thread(
                         client.alarms,
                         limit=ALARM_PAGE_LIMIT,
                         ordering="attention_newest",
                     ),
+                    asyncio.to_thread(client.authoring_admission),
+                    asyncio.to_thread(client.program_cycle_status),
                 )
-                identity = (
-                    "snapshot",
-                    runtime.get("projection_owner_epoch"),
-                    runtime.get("projection_generation"),
-                    alarms.get("owner_epoch"),
-                    alarms.get("generation"),
-                    alarms.get("state_revision"),
-                )
-                if identity != previous_identity:
-                    payload = {
-                        "schema_version": "manyforge.composer_headless_state.v1",
-                        "runtime": runtime,
-                        "alarms": alarms,
-                    }
-                    try:
-                        encoded = _encode(payload)
-                    except ValueError:
-                        identity = (
-                            "error",
-                            "headless_websocket_projection_oversized",
-                        )
-                        encoded = _encode(
-                            {
-                                "schema_version": (
-                                    "manyforge.composer_headless_state.v1"
-                                ),
-                                "runtime": None,
-                                "alarms": None,
-                                "error": {
-                                    "code": (
-                                        "headless_websocket_projection_oversized"
-                                    ),
-                                    "message": (
-                                        "headless WebSocket projection exceeds "
-                                        "its byte bound"
-                                    ),
-                                },
-                            }
-                        )
-                    await asyncio.wait_for(
-                        websocket.send_text(encoded),
-                        timeout=SEND_TIMEOUT_SECONDS,
-                    )
-                    previous_identity = identity
-            except HeadlessClientError as error:
-                identity = ("error", error.code, str(error))
+                draft = draft_session.snapshot()
+                sequence += 1
                 payload = {
                     "schema_version": "manyforge.composer_headless_state.v1",
-                    "runtime": None,
-                    "alarms": None,
-                    "error": {"code": error.code, "message": str(error)},
+                    "runtime": runtime,
+                    "alarms": alarms,
+                    "authoring_admission": authoring,
+                    "program_cycle": cycle,
+                    "draft_identity": {
+                        "draft_id": draft["draft_id"],
+                        "draft_revision": draft["draft_revision"],
+                    },
+                    "receiver_epoch": admission.receiver_epoch,
+                    "snapshot_sequence": sequence,
+                    "complete": True,
                 }
-                if identity != previous_identity:
-                    try:
-                        encoded = _encode(payload)
-                    except ValueError:
-                        identity = (
-                            "error",
-                            "headless_websocket_error_projection_oversized",
-                        )
-                        encoded = _encode(
-                            {
-                                "schema_version": (
-                                    "manyforge.composer_headless_state.v1"
-                                ),
-                                "runtime": None,
-                                "alarms": None,
-                                "error": {
-                                    "code": (
-                                        "headless_websocket_error_projection_oversized"
-                                    ),
-                                    "message": (
-                                        "headless WebSocket error projection "
-                                        "exceeds its byte bound"
-                                    ),
-                                },
-                            }
-                        )
+                await asyncio.wait_for(
+                    websocket.send_text(_encode(payload)),
+                    timeout=SEND_TIMEOUT_SECONDS,
+                )
+                last_error_message = None
+                admission.publish_complete_snapshot(
+                    client_id=client_id,
+                    sequence=sequence,
+                    admission_generation=authoring["admission_generation"],
+                    draft_id=draft["draft_id"],
+                    draft_revision=draft["draft_revision"],
+                )
+            except (HeadlessClientError, KeyError, TypeError, ValueError) as error:
+                admission.disconnect(client_id)
+                error_message = _encode(
+                    {
+                        "schema_version": (
+                            "manyforge.composer_headless_state.v1"
+                        ),
+                        "runtime": None,
+                        "alarms": None,
+                        "error": {
+                            "code": getattr(
+                                error,
+                                "code",
+                                "headless_websocket_projection_invalid",
+                            ),
+                            "message": str(error),
+                        },
+                    }
+                )
+                if error_message != last_error_message:
                     await asyncio.wait_for(
-                        websocket.send_text(encoded),
+                        websocket.send_text(error_message),
                         timeout=SEND_TIMEOUT_SECONDS,
                     )
-                    previous_identity = identity
+                    last_error_message = error_message
             await asyncio.sleep(POLL_INTERVAL_SECONDS)
     except (WebSocketDisconnect, asyncio.TimeoutError):
-        return
+        admission.disconnect(client_id)
 
 
 __all__ = ["serve_headless_state"]

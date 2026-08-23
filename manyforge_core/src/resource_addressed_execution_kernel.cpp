@@ -461,8 +461,23 @@ select_disable_active_configurations(
 [[nodiscard]] StopStaticFacts derive_stop_static_facts(
     const std::vector<RuntimeParticipantExecutionRegistration>& registrations,
     const ResourceAddressedExecutionKernelConfig& config) {
-  std::optional<GraphRevision> graph_revision = config.graph_revision;
+  std::optional<GraphRevision> graph_revision =
+      registrations.empty() ? config.empty_runtime_graph_revision : config.graph_revision;
   std::optional<RetainedBundleId> retained_bundle_id;
+  if (registrations.empty()) {
+    if (config.empty_runtime_retained_bundle_id.has_value() !=
+        config.empty_runtime_graph_revision.has_value()) {
+      throw std::invalid_argument(
+          "empty runtime retained-bundle and graph identities must be supplied together");
+    }
+    if (config.empty_runtime_retained_bundle_id.has_value() &&
+        (config.empty_runtime_retained_bundle_id->empty() ||
+         config.empty_runtime_graph_revision->empty())) {
+      throw std::invalid_argument(
+          "empty runtime retained-bundle or graph identity is invalid");
+    }
+    retained_bundle_id = config.empty_runtime_retained_bundle_id;
+  }
   std::optional<StopDeadlineBudgetDTO> deadline_budget = config.cell_stop_deadline_budget;
   if (deadline_budget.has_value()) {
     deadline_budget->phases.clear();
@@ -2314,11 +2329,16 @@ ResourceAddressedExecutionKernel::ResourceAddressedExecutionKernel(
           prequalified_max_live_stop_participants_) {
     throw std::runtime_error("Stop-stage attempt isolation failed its admission prequalification");
   }
-  operation_control_executor_ = std::make_unique<BoundedOperationControlExecutor>(
-      distinct_execution_engines(registrations_),
-      static_cast<IOperationControlEffectCompletionReceiver&>(*this));
-  if (!operation_control_executor_->prequalified_ready()) {
-    throw std::runtime_error("operation-control isolation failed its admission prequalification");
+  auto operation_control_engines = distinct_execution_engines(registrations_);
+  if (!operation_control_engines.empty()) {
+    operation_control_executor_ =
+        std::make_unique<BoundedOperationControlExecutor>(
+            std::move(operation_control_engines),
+            static_cast<IOperationControlEffectCompletionReceiver&>(*this));
+    if (!operation_control_executor_->prequalified_ready()) {
+      throw std::runtime_error(
+          "operation-control isolation failed its admission prequalification");
+    }
   }
 
   auto recovery =

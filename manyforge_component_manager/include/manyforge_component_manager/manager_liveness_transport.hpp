@@ -3,6 +3,8 @@
 #include <manyforge_core/manager_liveness_receiver.hpp>
 #include <cstdint>
 #include <limits>
+#include <stdexcept>
+#include <string>
 #include <vector>
 
 namespace manyforge::component_manager {
@@ -40,11 +42,25 @@ class ManagerLivenessRetryGate final {
 
 }  // namespace detail
 
+/// The complete native receiver batch rejected a predecessor publication
+/// before accepting any heartbeat.  Callers may refresh the Manager snapshot
+/// immediately; this outcome carries no partial-renewal uncertainty.
+class ManagerLivenessPublicationSuperseded final : public std::runtime_error {
+ public:
+  ManagerLivenessPublicationSuperseded()
+      : std::runtime_error(
+            "Manager-liveness batch names a superseded active publication") {}
+};
+
 /// One exact Manager-to-runtime renewal transaction.  The required set and
 /// policy are repeated deliberately: the private child never consults ambient
 /// Manager state and can reject a changed bundle/set/policy before renewal.
 struct ManagerLivenessTransportRequestDTO final {
   manyforge::core::RuntimeUnitId receiver_runtime_unit_id;
+  manyforge::core::ActiveBundlePublicationGeneration
+      active_publication_generation;
+  manyforge::core::GraphRevision active_graph_revision;
+  manyforge::core::ContentDigest active_public_pointer_digest;
   manyforge::core::ManagerLivenessRequiredSetDTO required_set;
   manyforge::core::ManagerLivenessPolicyDTO policy;
   manyforge::core::ManagerHeartbeatDTO heartbeat;

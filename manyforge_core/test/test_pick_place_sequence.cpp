@@ -305,7 +305,8 @@ class FakeSceneOwner final : public ISceneAuthority {
               CarriedObjectAttachmentId("attachment"),
               SceneResourceId("part"), ControllableComponentId("robot.1"),
               CommandTargetId("arm"), FrameRoleId("tcp"),
-              {CollisionBodyRoleId("finger")}, {}}}};
+              {CollisionBodyRoleId("finger")}, {}},
+          std::nullopt}};
   return {"sequence.pick",
           std::move(plan),
           motion_operation("sequence.approach", "approach"),

@@ -73,8 +73,9 @@ describe('Program workspace lifecycle controls', () => {
     expect(source).toContain("'discard'");
     expect(source).toContain("'new'");
     expect(source).toContain("'revert'");
-    expect(source).toContain('api.programWorkspace.discard(fence(workspace))');
-    expect(source).toContain('api.programWorkspace.revert(fence(workspace))');
+    expect(source).toContain('api.programWorkspace.discard(requestFence)');
+    expect(source).toContain('api.programWorkspace.revert(requestFence)');
+    expect(source).toContain('snapshot.programCycle.state !== \'idle_after_reset\'');
     expect(source).not.toContain('const revert = useCallback((\\n    scenarioId');
     expect(source).toContain("type: 'request_failed'");
     expect(source).toContain(

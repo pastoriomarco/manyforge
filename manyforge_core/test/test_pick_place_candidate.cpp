@@ -700,7 +700,8 @@ class ReplacingPlanningSceneSynchronizer final : public IPlanningSceneSynchroniz
                                             carrier.command_target_id,
                                             carrier.frame_role_id,
                                             {CollisionBodyRoleId("collision-body-role:tool")},
-                                            {}}},
+                                            {}},
+              std::nullopt},
           std::nullopt},
       carrier,
       "pick.candidate"};
@@ -737,7 +738,8 @@ class ReplacingPlanningSceneSynchronizer final : public IPlanningSceneSynchroniz
                                      DetachCarriedObjectRequestDTO{
                                          CarriedObjectAttachmentId("attachment:workpiece"),
                                          CarriedObjectAttachmentRevision("attachment-revision:1"),
-                                         Pose3DTO{}, CellSceneFrameRefDTO{CellId("cell:test")}}},
+                                         Pose3DTO{}, CellSceneFrameRefDTO{CellId("cell:test")}},
+                                     std::nullopt},
           std::nullopt},
       carrier,
       "place.candidate"};

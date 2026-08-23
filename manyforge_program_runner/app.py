@@ -149,6 +149,16 @@ def create_app(runtime: ProgramRunnerApplicationPort) -> FastAPI:
     def cycle_status() -> dict[str, Any]:
         return runtime.cycle_status()
 
+    @app.get("/api/program/liveness/status")
+    def liveness_status() -> dict[str, Any]:
+        read = getattr(runtime, "liveness_status", None)
+        if not callable(read):
+            raise ProgramRunnerError(
+                "program_runner_manager_liveness_unavailable",
+                "Manager-presence liveness status is unavailable",
+            )
+        return read()
+
     return app
 
 

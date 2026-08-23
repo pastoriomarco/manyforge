@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from contextlib import contextmanager
 from concurrent.futures import ThreadPoolExecutor
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -65,11 +66,26 @@ class ProcessStack:
         ):
             path.mkdir()
         self.scene_database = root / "logical-scene.sqlite3"
+        self.program_cycle_journal = root / "program-cycle.sqlite3"
+        self.composer_authoring_root = root / "composer-authoring"
+        self.composer_authoring_root.mkdir()
+        self.authoring_transaction_journal = (
+            self.composer_authoring_root
+            / "composer-authoring-transactions.sqlite3"
+        )
+        self.program_runner_liveness_socket = (
+            root / "program-runner-liveness.sock"
+        )
         self.history_database = root / "history.sqlite3"
         self.manager_executable = _required_path("MANYFORGE_MANAGER_DAEMON")
         self.package_root = package_root or _required_path(
             "MANYFORGE_CANONICAL_EMPTY_PACKAGE_ROOT"
         )
+        self.manager_package_root = _required_path(
+            "MANYFORGE_CANONICAL_EMPTY_PACKAGE_ROOT"
+        )
+        self.manager_admission_filename: str | None = None
+        self.fixture_metadata: dict | None = None
         if not self.package_root.exists():
             raise RuntimeError(f"retained package root does not exist: {self.package_root}")
         self.cell_id = cell_id
@@ -90,24 +106,84 @@ class ProcessStack:
         self.composer: subprocess.Popen[bytes] | None = None
         self.log = (root / "process-stack.log").open("wb")
 
-    def start_manager(self) -> None:
+    def prepare_native_manager_fixture(
+        self,
+        *,
+        metadata_environment: str = "MANYFORGE_MANAGER_APPLY_METADATA",
+        package_environment: str = "MANYFORGE_MANAGER_APPLY_PACKAGE_ROOT",
+    ) -> None:
+        metadata_path = _required_path(metadata_environment)
+        metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+        assert isinstance(metadata, dict)
+        assert metadata["cell_id"] == self.cell_id
+        self.fixture_metadata = metadata
+        self.manager_admission_filename = metadata["admission_filename"]
+        assert isinstance(self.manager_admission_filename, str)
+        # A copied immutable fixture remains the selected Manager package.
+        # The environment path names its source metadata, not a second root.
+        _required_path(package_environment)
+        self.manager_package_root = self.package_root
+        assert (
+            self.manager_package_root / self.manager_admission_filename
+        ).is_file()
+
+        installed_root = self.root / "installed-targets"
+        installed_root.mkdir()
+        installed_sources = {
+            "manyforge_manager_daemon": self.manager_executable,
+            "manyforge_native_execution_host": _required_path(
+                "MANYFORGE_NATIVE_EXECUTION_HOST"
+            ),
+            "manyforge_roboplan_candidate_worker": _required_path(
+                "MANYFORGE_ROBOPLAN_CANDIDATE_WORKER"
+            ),
+        }
+        for installed_name, source in installed_sources.items():
+            assert source.is_file() and os.access(source, os.X_OK)
+            shutil.copy2(source, installed_root / installed_name)
+        self.manager_executable = installed_root / "manyforge_manager_daemon"
+
+    def start_manager(
+        self, *, publication_root: Path | None = None
+    ) -> None:
         assert self.manager is None
+        manager_publication_root = publication_root or self.publication_root
+        manager_publication_root.mkdir(exist_ok=True)
+        command = [
+            str(self.manager_executable),
+            "--package-root",
+            str(self.manager_package_root),
+            "--manager-state-root",
+            str(self.manager_root),
+            "--runtime-state-root",
+            str(self.runtime_root),
+            "--logical-scene-database",
+            str(self.scene_database),
+            "--program-cycle-journal",
+            str(self.program_cycle_journal),
+            "--authoring-transaction-journal",
+            str(self.authoring_transaction_journal),
+            "--publication-root",
+            str(manager_publication_root),
+            "--reconciliation-period-ms",
+            "20",
+        ]
+        if self.manager_admission_filename is not None:
+            command.extend(
+                (
+                    "--canonical-empty-admission-filename",
+                    self.manager_admission_filename,
+                )
+            )
+        if self.enable_program_runner:
+            command.extend(
+                (
+                    "--program-runner-liveness-socket",
+                    str(self.program_runner_liveness_socket),
+                )
+            )
         self.manager = subprocess.Popen(
-            [
-                str(self.manager_executable),
-                "--package-root",
-                str(self.package_root),
-                "--manager-state-root",
-                str(self.manager_root),
-                "--runtime-state-root",
-                str(self.runtime_root),
-                "--logical-scene-database",
-                str(self.scene_database),
-                "--publication-root",
-                str(self.publication_root),
-                "--reconciliation-period-ms",
-                "20",
-            ],
+            command,
             stdout=self.log,
             stderr=subprocess.STDOUT,
         )
@@ -136,7 +212,7 @@ class ProcessStack:
             "--manager-state-root",
             str(self.manager_root),
             "--execution-state-root",
-            str(self.execution_root),
+            str(self.runtime_root),
             "--cell-id",
             self.cell_id,
             "--owner-id",
@@ -174,6 +250,14 @@ class ProcessStack:
                 str(self.program_runner_port),
                 "--headless-url",
                 self.base_url,
+                "--execution-state-root",
+                str(self.runtime_root),
+                "--cycle-journal-path",
+                str(self.program_cycle_journal),
+                "--manager-liveness-socket",
+                str(self.program_runner_liveness_socket),
+                "--cell-id",
+                self.cell_id,
                 "--owner-id",
                 "program-runner.process-test",
                 "--headless-timeout-s",
@@ -241,19 +325,6 @@ class ProcessStack:
             f"runtime did not reach complete={expected}: {last_error}"
         )
 
-    def publish_assistant_source(self) -> None:
-        publisher = _required_path("MANYFORGE_ASSISTANT_SOURCE_PUBLISHER")
-        subprocess.run(
-            [
-                str(publisher),
-                "--publication-root",
-                str(self.publication_root),
-            ],
-            check=True,
-            capture_output=True,
-            timeout=10,
-        )
-
     def wait_manager_source(self, timeout_seconds: float = 8.0) -> dict:
         deadline = time.monotonic() + timeout_seconds
         last_error: Exception | None = None
@@ -271,6 +342,39 @@ class ProcessStack:
             time.sleep(0.01)
         raise RuntimeError(f"Manager source did not become available: {last_error}")
 
+    def wait_authoring_admission(
+        self,
+        timeout_seconds: float = 8.0,
+        *,
+        expected_allowed: bool | None = None,
+    ) -> dict:
+        deadline = time.monotonic() + timeout_seconds
+        last_error: Exception | None = None
+        while time.monotonic() < deadline:
+            for process, name in ((self.manager, "Manager"), (self.api, "API")):
+                if process is not None and process.poll() is not None:
+                    raise RuntimeError(f"{name} exited with {process.returncode}")
+            try:
+                with HeadlessHttpClient(
+                    self.base_url,
+                    timeout_seconds=0.25,
+                ) as client:
+                    admission = client.authoring_admission()
+                if (
+                    expected_allowed is None
+                    or admission.get("authoring_allowed") is expected_allowed
+                ):
+                    return admission
+                last_error = RuntimeError(
+                    f"last authoring admission was {admission!r}"
+                )
+            except HeadlessClientError as error:
+                last_error = error
+            time.sleep(0.01)
+        raise RuntimeError(
+            f"authoring admission did not become available: {last_error}"
+        )
+
     def start_composer(self) -> None:
         assert self.composer is None
         command = [
@@ -285,6 +389,8 @@ class ProcessStack:
             self.base_url,
             "--headless-api-timeout-s",
             "0.25",
+            "--authoring-state-root",
+            str(self.composer_authoring_root),
         ]
         if self.program_path is not None:
             command.extend(("--program-path", str(self.program_path)))
@@ -358,31 +464,40 @@ class ProcessStack:
         finally:
             if self.manager.poll() is None:
                 self.manager.terminate()
-                self.manager.wait(timeout=5)
+                try:
+                    self.manager.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    self.manager.kill()
+                    self.manager.wait(timeout=5)
             self.manager = None
+
+    @staticmethod
+    def _terminate(process: subprocess.Popen[bytes]) -> None:
+        if process.poll() is not None:
+            return
+        process.terminate()
+        try:
+            process.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            process.kill()
+            process.wait(timeout=5)
 
     def close(self) -> None:
         try:
-            if self.composer is not None and self.composer.poll() is None:
-                self.composer.terminate()
-                self.composer.wait(timeout=5)
+            if self.composer is not None:
+                self._terminate(self.composer)
             self.composer = None
         finally:
             try:
-                if (
-                    self.program_runner is not None
-                    and self.program_runner.poll() is None
-                ):
-                    self.program_runner.terminate()
-                    self.program_runner.wait(timeout=5)
+                if self.program_runner is not None:
+                    self._terminate(self.program_runner)
                 self.program_runner = None
             finally:
                 try:
                     self.private_shutdown_manager()
                 finally:
-                    if self.api is not None and self.api.poll() is None:
-                        self.api.terminate()
-                        self.api.wait(timeout=5)
+                    if self.api is not None:
+                        self._terminate(self.api)
                     self.api = None
                     self.log.close()
 
@@ -417,24 +532,101 @@ def _program_surface_stack(root: Path) -> Iterator[ProcessStack]:
 def _assistant_stack(
     root: Path, *, package_root: Path | None = None
 ) -> Iterator[ProcessStack]:
+    selected_package_root = package_root or _required_path(
+        "MANYFORGE_ASSISTANT_NATIVE_PACKAGE_ROOT"
+    )
+    retained_programs = sorted(
+        (selected_package_root / "programs" / "sha256").glob("*.json")
+    )
+    assert len(retained_programs) == 1
     stack = ProcessStack(
         root,
-        package_root=package_root
-        or _required_path("MANYFORGE_ASSISTANT_AUTHORING_PACKAGE_ROOT"),
-        cell_id="i6_two_lite6_controllable_cell",
-        program_path=Path(
-            "/workspace/examples/pick_and_place_ur10e_robotiq.program.yaml"
-        ),
+        package_root=selected_package_root,
+        cell_id="i6_lite6_arm_gripper_aggregate_cell",
+        program_path=retained_programs[0],
         freshness_milliseconds=120000,
+        enable_program_runner=True,
     )
     try:
-        # Operational Apply remains unavailable in N6. Publish one bounded,
-        # production-shaped Manager source from the independently verified
-        # test bundle so this test qualifies the real API/Composer authoring
-        # path without claiming a product deployment or runtime effect.
-        stack.publish_assistant_source()
+        stack.prepare_native_manager_fixture(
+            metadata_environment="MANYFORGE_ASSISTANT_NATIVE_METADATA",
+            package_environment="MANYFORGE_ASSISTANT_NATIVE_PACKAGE_ROOT",
+        )
+        assert stack.manager_package_root == stack.package_root
+        stack.start_manager()
+        stack.start_program_runner()
         stack.start_api()
-        stack.wait_manager_source()
+        initial = stack.wait_manager_source()
+        stack.wait_program_runner()
+        initial_admission = stack.wait_authoring_admission(expected_allowed=True)
+        assert stack.fixture_metadata is not None
+        metadata = stack.fixture_metadata
+        assert initial["status"]["active"]["retained_bundle_id"] == (
+            metadata["predecessor_retained_bundle_id"]
+        )
+        with HeadlessHttpClient(stack.base_url, timeout_seconds=20.0) as client:
+            apply_result = client.manager_apply(
+                {
+                    "request_id": "assistant-native.process.apply",
+                    "request_owner_epoch": initial["source"][
+                        "source_owner_epoch"
+                    ],
+                    "source_label": "assistant_native_process_test",
+                    "correlation_id": "assistant-native.process.apply",
+                    "deployment_artifact_id": metadata[
+                        "physical_deployment_artifact_id"
+                    ],
+                    "deployment_revision": metadata[
+                        "physical_deployment_revision"
+                    ],
+                    "expected_current": {
+                        "graph_revision": metadata[
+                            "predecessor_graph_revision"
+                        ],
+                        "retained_bundle_id": metadata[
+                            "predecessor_retained_bundle_id"
+                        ],
+                    },
+                    "reject_if_affected_busy": True,
+                    "expected_admission_generation": initial_admission[
+                        "admission_generation"
+                    ],
+                }
+            )
+            assert apply_result["ok"] is True
+        deadline = time.monotonic() + 20
+        while time.monotonic() < deadline:
+            active = stack.wait_manager_source()["status"]["active"]
+            if active["retained_bundle_id"] == metadata[
+                "physical_candidate_retained_bundle_id"
+            ]:
+                break
+            time.sleep(0.02)
+        else:
+            raise RuntimeError("assistant-native physical Apply did not converge")
+        admission = stack.wait_authoring_admission(expected_allowed=True)
+        assert admission["authoring_allowed"] is True
+        assert admission["admission_generation"] > 0
+        with HeadlessHttpClient(stack.base_url) as client:
+            with pytest.raises(HeadlessClientError) as stale:
+                client.acquire_authoring_transaction(
+                    {
+                        "request_id": "assistant-native.stale-generation",
+                        "request_owner_epoch": "assistant-native.stale.epoch",
+                        "source_label": "assistant_native_process_test",
+                        "correlation_id": "assistant-native.stale-generation",
+                        "expected_admission_generation": initial_admission[
+                            "admission_generation"
+                        ],
+                        "request_payload_digest": "sha256:" + "0" * 64,
+                        "owner_transaction_id": "assistant-native.stale",
+                    }
+                )
+            assert stale.value.code == "stale_generation"
+        assert (stack.runtime_root / "execution-command.sock").is_socket()
+        assert stack.authoring_transaction_journal.parent == (
+            stack.composer_authoring_root
+        )
         stack.start_composer()
         stack.wait_composer()
         yield stack
@@ -442,7 +634,11 @@ def _assistant_stack(
         stack.close()
 
 
-def _apply_body(owner_epoch: str, request_id: str) -> dict:
+def _apply_body(
+    owner_epoch: str,
+    request_id: str,
+    admission_generation: int,
+) -> dict:
     return {
         "request_id": request_id,
         "request_owner_epoch": owner_epoch,
@@ -455,7 +651,42 @@ def _apply_body(owner_epoch: str, request_id: str) -> dict:
             "retained_bundle_id": "current-bundle",
         },
         "reject_if_affected_busy": True,
+        "expected_admission_generation": admission_generation,
     }
+
+
+def _payload_digest(payload: dict) -> str:
+    encoded = json.dumps(
+        payload,
+        allow_nan=False,
+        ensure_ascii=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode("utf-8")
+    return f"sha256:{hashlib.sha256(encoded).hexdigest()}"
+
+
+def _acquire_authoring_claim(
+    client: HeadlessHttpClient,
+    payload: dict,
+    *,
+    request_id: str,
+) -> dict:
+    admission = client.authoring_admission()
+    acquired = client.acquire_authoring_transaction(
+        {
+            "request_id": request_id,
+            "request_owner_epoch": "authoring.process.epoch.1",
+            "source_label": "process_test",
+            "correlation_id": "correlation.authoring.1",
+            "expected_admission_generation": admission[
+                "admission_generation"
+            ],
+            "request_payload_digest": _payload_digest(payload),
+            "owner_transaction_id": f"{request_id}.transaction",
+        }
+    )
+    return acquired["claim"]
 
 
 def _assistant_callback_body(
@@ -588,13 +819,34 @@ def test_real_assistant_callback_uses_headless_source_facts_and_only_edits_draft
             manager_before = composer.manager_status()["status"]
             runtime_before = composer.runtime()
             package_before = _plain_package_files(stack.package_root)
+            assert stack.fixture_metadata is not None
+            active_bundle = stack.fixture_metadata[
+                "physical_candidate_retained_bundle_id"
+            ]
+            active_graph = stack.fixture_metadata["physical_graph_revision"]
+            scenarios = composer.scenarios()
 
             assert {
                 row["model_instance_id"] for row in source_model["occurrences"]
-            } == {"lite6_fixture_instance", "lite6_fixture_instance_2"}
+            } == {"lite6_fixture_instance"}
             assert {
                 row["component_id"] for row in source_model["targets"]
-            } == {"lite6_arm", "lite6_arm_2"}
+            } == {"lite6_arm"}
+            assert node_environment["retained_bundle_id"] == active_bundle
+            assert node_environment["graph_revision"] == active_graph
+            assert source_model["retained_bundle_id"] == active_bundle
+            assert source_model["graph_revision"] == active_graph
+            assert assistant_mode["retained_bundle_id"] == active_bundle
+            assert assistant_mode["graph_revision"] == active_graph
+            assert manager_before["active"]["retained_bundle_id"] == active_bundle
+            assert manager_before["active"]["graph_revision"] == active_graph
+            assert scenarios["scenarios"][0]["retained_bundle_id"] == active_bundle
+            assert scenarios["scenarios"][0]["program_binding_id"] == (
+                stack.fixture_metadata["program_binding_id"]
+            )
+            assert scenarios["scenario_catalog_revision"] == (
+                stack.fixture_metadata["scenario_catalog_revision"]
+            )
             assert {row["tool_id"] for row in assistant_mode["tools"]} == {
                 "program_read",
                 "scene_draft_add_object",
@@ -691,6 +943,15 @@ def test_real_assistant_callback_uses_headless_source_facts_and_only_edits_draft
                 assert read_result["draftMutated"] is False
             assert max(callback_latencies_s) < 0.5, callback_latencies_s
 
+        stack.kill_composer()
+        assert stack.authoring_transaction_journal.is_file()
+        stack.start_composer()
+        stack.wait_composer()
+        with HeadlessHttpClient(stack.composer_url) as replacement:
+            assert replacement.request(
+                "GET", "/api/program/draft"
+            ) == after_accepted
+
         concurrent_bodies = [
             _assistant_callback_body(
                 draft=after_accepted,
@@ -757,7 +1018,7 @@ def test_real_program_apply_reuses_active_deployment_and_survives_api_restart(
 ) -> None:
     package_root = tmp_path / "read-only-package"
     shutil.copytree(
-        _required_path("MANYFORGE_ASSISTANT_AUTHORING_PACKAGE_ROOT"), package_root
+        _required_path("MANYFORGE_ASSISTANT_NATIVE_PACKAGE_ROOT"), package_root
     )
     package_before = _plain_package_files(package_root)
     with _read_only_tree(package_root):
@@ -791,14 +1052,25 @@ def test_real_program_apply_reuses_active_deployment_and_survives_api_restart(
                     client.program_applied()
                 assert absent.value.code == "program_applied_selection_not_found"
 
-                result = client.program_apply(
+                apply_body = {
+                    "scenario_id": "program_apply_fixture",
+                    "scenario_catalog_revision": scenarios[
+                        "scenario_catalog_revision"
+                    ],
+                    "program": program,
+                    "expected_applied_record_digest": None,
+                }
+                apply_body["authoring_claim"] = _acquire_authoring_claim(
+                    client,
+                    apply_body,
+                    request_id="program-apply.process.1",
+                )
+                result = client.program_apply(apply_body)
+                client.settle_authoring_transaction(
                     {
-                        "scenario_id": "program_apply_fixture",
-                        "scenario_catalog_revision": scenarios[
-                            "scenario_catalog_revision"
-                        ],
-                        "program": program,
-                        "expected_applied_record_digest": None,
+                        "claim": apply_body["authoring_claim"],
+                        "settlement_kind": "owner_commit",
+                        "evidence_digest": _payload_digest(result),
                     }
                 )
                 assert result["status"] == "applied"
@@ -829,16 +1101,27 @@ def test_real_program_apply_reuses_active_deployment_and_survives_api_restart(
             with HeadlessHttpClient(stack.base_url) as restarted:
                 reopened = restarted.program_applied()
                 assert reopened == first_applied
-                replay = restarted.program_apply(
+                replay_body = {
+                    "scenario_id": "program_apply_fixture",
+                    "scenario_catalog_revision": scenarios[
+                        "scenario_catalog_revision"
+                    ],
+                    "program": program,
+                    "expected_applied_record_digest": first_applied["source"][
+                        "record_digest"
+                    ],
+                }
+                replay_body["authoring_claim"] = _acquire_authoring_claim(
+                    restarted,
+                    replay_body,
+                    request_id="program-apply.process.2",
+                )
+                replay = restarted.program_apply(replay_body)
+                restarted.settle_authoring_transaction(
                     {
-                        "scenario_id": "program_apply_fixture",
-                        "scenario_catalog_revision": scenarios[
-                            "scenario_catalog_revision"
-                        ],
-                        "program": program,
-                        "expected_applied_record_digest": first_applied["source"][
-                            "record_digest"
-                        ],
+                        "claim": replay_body["authoring_claim"],
+                        "settlement_kind": "owner_commit",
+                        "evidence_digest": _payload_digest(replay),
                     }
                 )
                 assert replay["applied"] == first_applied
@@ -923,7 +1206,13 @@ def test_manager_api_cli_and_replacements_preserve_headless_owners(
             )
 
             with pytest.raises(HeadlessClientError) as unavailable:
-                client.manager_apply(_apply_body(first_epoch, "request.1"))
+                client.manager_apply(
+                    _apply_body(
+                        first_epoch,
+                        "request.1",
+                        1,
+                    )
+                )
             assert unavailable.value.code == "kernel_owner_unavailable"
 
         stack.start_composer()
@@ -947,6 +1236,7 @@ def test_manager_api_cli_and_replacements_preserve_headless_owners(
             ]["retainedBundleId"] == environment["retained_bundle_id"]
 
         stack.kill_composer()
+        assert stack.authoring_transaction_journal.is_file()
         with HeadlessHttpClient(stack.base_url) as client:
             assert _owner_identity(
                 client.runtime(),
@@ -1019,7 +1309,7 @@ def test_manager_api_cli_and_replacements_preserve_headless_owners(
             env=os.environ.copy(),
         )
         assert apply_command.returncode == 69
-        assert "kernel_owner_unavailable" in apply_command.stderr
+        assert "execution_owner_unavailable" in apply_command.stderr
 
         stack.kill_manager()
         stale_runtime = stack.wait_complete(False, unavailable_section="manager")
@@ -1040,11 +1330,21 @@ def test_manager_api_cli_and_replacements_preserve_headless_owners(
             assert replacement_epoch != first_epoch
 
             with pytest.raises(HeadlessClientError) as stale:
-                client.manager_apply(_apply_body(first_epoch, "request.stale"))
+                client.manager_apply(
+                    _apply_body(
+                        first_epoch,
+                        "request.stale",
+                        1,
+                    )
+                )
             assert stale.value.code == "stale_request_owner_epoch"
 
             with pytest.raises(HeadlessClientError) as unavailable:
                 client.manager_apply(
-                    _apply_body(replacement_epoch, "request.replacement")
+                    _apply_body(
+                        replacement_epoch,
+                        "request.replacement",
+                        1,
+                    )
                 )
             assert unavailable.value.code == "kernel_owner_unavailable"

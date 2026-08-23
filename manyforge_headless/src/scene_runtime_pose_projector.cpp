@@ -501,6 +501,7 @@ SceneRuntimePoseProjector::Apply(
             evidence,
             false,
         },
+        std::nullopt,
     };
     committed = scene_authority_.Commit(request);
   } catch (const std::exception &error) {

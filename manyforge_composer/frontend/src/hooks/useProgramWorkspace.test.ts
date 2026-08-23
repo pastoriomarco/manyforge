@@ -8,6 +8,7 @@ import type {
   ProgramOperatorStopPolicy,
   ProgramWorkspaceResponse,
 } from '../types/api';
+import type { ComposerHeadlessState } from '../types/headless';
 
 const apiMock = vi.hoisted(() => ({
   programWorkspace: {
@@ -134,6 +135,7 @@ let latest: ReturnType<typeof useProgramWorkspace> | null = null;
 
 async function mountHarness(
   initial: Deferred<ProgramWorkspaceResponse>,
+  snapshot: ComposerHeadlessState | null = null,
 ) {
   const document = {
     nodeType: 9,
@@ -174,8 +176,8 @@ async function mountHarness(
 
   const { createRoot } = await import('react-dom/client');
   root = createRoot(makeNode('div') as unknown as Element);
-  function Harness() {
-    const controller = useProgramWorkspace();
+  function Harness({ currentSnapshot }: { currentSnapshot: ComposerHeadlessState | null }) {
+    const controller = useProgramWorkspace(currentSnapshot);
     useEffect(() => {
       latest = controller;
       return () => {
@@ -186,9 +188,81 @@ async function mountHarness(
   }
   apiMock.programWorkspace.get.mockReturnValueOnce(initial.promise);
   await act(async () => {
-    root?.render(createElement(Harness));
+    root?.render(createElement(Harness, { currentSnapshot: snapshot }));
   });
-  return initial;
+  return async (nextSnapshot: ComposerHeadlessState | null) => {
+    await act(async () => {
+      root?.render(createElement(Harness, { currentSnapshot: nextSnapshot }));
+    });
+  };
+}
+
+function authoringSnapshot(
+  current: ProgramWorkspaceResponse,
+): ComposerHeadlessState {
+  return {
+    schemaVersion: 'manyforge.composer_headless_state.v1',
+    clientId: 'composer-browser.fixture',
+    complete: true,
+    authoringAdmission: { authoringAllowed: true, admissionGeneration: 7 },
+    programCycle: {
+      programRunnerOwnerEpoch: 'program-runner.epoch.1',
+      cycleGeneration: 3,
+      state: 'idle_after_reset',
+      programRunId: null,
+      cycleClaimGeneration: null,
+      terminalOrSettlementReference: null,
+    },
+    draftIdentity: {
+      draftId: current.draft.draftId,
+      draftRevision: current.draft.draftRevision,
+    },
+    receiverEpoch: 'headless-receiver.epoch.1',
+    snapshotSequence: 11,
+    runtime: {
+      schemaVersion: 'manyforge.headless_runtime_snapshot.v1',
+      complete: true,
+      projectionGeneration: 1,
+      projectionOwnerEpoch: 'runtime.epoch.1',
+      projectionOwnerId: 'runtime.owner',
+      reasons: [],
+      unavailableSections: [],
+      sections: {
+        manager: {
+          available: true, freshness: 'fresh', knownGaps: [], payload: {},
+          sourceGeneration: 1, sourceOwnerEpoch: 'manager.epoch.1',
+          sourceOwnerId: 'manager.owner', receiverAgeNs: 1,
+        },
+        logicalScene: {
+          available: true, freshness: 'fresh', knownGaps: [], payload: {},
+          sourceGeneration: 1, sourceOwnerEpoch: 'scene.epoch.1',
+          sourceOwnerId: 'scene.owner', receiverAgeNs: 1,
+        },
+        sceneRuntime: {
+          available: true, freshness: 'fresh', knownGaps: [], payload: {},
+          sourceGeneration: 1, sourceOwnerEpoch: 'runtime.epoch.1',
+          sourceOwnerId: 'runtime.owner', receiverAgeNs: 1,
+        },
+      },
+    },
+    alarms: {
+      schemaVersion: 'manyforge.operator_alarm_snapshot.v2',
+      ownerId: 'alarm.owner',
+      ownerEpoch: 'alarm.epoch.1',
+      generation: 1,
+      stateRevision: 1,
+      reconciled: true,
+      healthState: 'healthy',
+      liveCount: 0,
+      unacknowledgedCount: 0,
+      activeCount: 0,
+      activeAcknowledgedCount: 0,
+      motionAttentionCount: 0,
+      unacknowledgedMembership: [],
+      alarms: [],
+      truncated: false,
+    },
+  };
 }
 
 afterEach(async () => {
@@ -208,7 +282,7 @@ describe('useProgramWorkspace Draft policy interaction', () => {
 
   it('shows a Draft-only result before one follow-up GET, then retains it on stale refresh', async () => {
     const initial = deferred<ProgramWorkspaceResponse>();
-    await mountHarness(initial);
+    await mountHarness(initial, authoringSnapshot(workspace(1)));
     await act(async () => initial.resolve(workspace(1)));
 
     const mutation = deferred<ProgramNodePolicyMutationResponse>();
@@ -246,7 +320,7 @@ describe('useProgramWorkspace Draft policy interaction', () => {
 
   it('sends exact fences and policy payload, including no-op and successful refresh', async () => {
     const initial = deferred<ProgramWorkspaceResponse>();
-    await mountHarness(initial);
+    await mountHarness(initial, authoringSnapshot(workspace(1)));
     await act(async () => initial.resolve(workspace(1)));
     const mutation = deferred<ProgramNodePolicyMutationResponse>();
     const refresh = deferred<ProgramWorkspaceResponse>();
@@ -261,7 +335,16 @@ describe('useProgramWorkspace Draft policy interaction', () => {
         operatorStopPolicy,
       );
       expect(apiMock.programWorkspace.updateNodePolicies).toHaveBeenCalledWith(
-        { draftId: 'draft-1', expectedDraftRevision: 1 },
+        expect.objectContaining({
+          draftId: 'draft-1',
+          expectedDraftRevision: 1,
+          clientId: 'composer-browser.fixture',
+          snapshotReceiverEpoch: 'headless-receiver.epoch.1',
+          snapshotSequence: 11,
+          expectedAdmissionGeneration: 7,
+          requestOwnerEpoch: expect.stringMatching(/^composer-authoring-owner\./),
+          requestId: expect.stringMatching(/^composer-authoring\./),
+        }),
         workspace(1).draft.programRevision,
         'root',
         modificationPolicy,
@@ -283,7 +366,7 @@ describe('useProgramWorkspace Draft policy interaction', () => {
 
   it('keeps the previous Draft workspace when the policy mutation is stale', async () => {
     const initial = deferred<ProgramWorkspaceResponse>();
-    await mountHarness(initial);
+    await mountHarness(initial, authoringSnapshot(workspace(1)));
     const original = workspace(1);
     await act(async () => initial.resolve(original));
     apiMock.programWorkspace.updateNodePolicies.mockRejectedValueOnce(
@@ -298,9 +381,38 @@ describe('useProgramWorkspace Draft policy interaction', () => {
         operatorStopPolicy,
       );
     });
-    expect(latest?.state.workspace).toBe(original);
+    expect(latest?.state.workspace).toStrictEqual(original);
     expect(latest?.state.workspace?.draft.draftRevision).toBe(1);
     expect(latest?.state.error).toContain('composer_program_revision_stale');
     expect(apiMock.programWorkspace.get).toHaveBeenCalledTimes(1);
+  });
+
+  it('uses the newest snapshot barrier after a rerender', async () => {
+    const initial = deferred<ProgramWorkspaceResponse>();
+    const first = authoringSnapshot(workspace(1));
+    const rerender = await mountHarness(initial, first);
+    await act(async () => initial.resolve(workspace(1)));
+    const next = {
+      ...first,
+      snapshotSequence: 12,
+      authoringAdmission: { authoringAllowed: true, admissionGeneration: 8 },
+    };
+    await rerender(next);
+    apiMock.programWorkspace.updateNodePolicies.mockReturnValueOnce(
+      new Promise<ProgramNodePolicyMutationResponse>(() => undefined),
+    );
+    await act(async () => {
+      latest?.updateNodePolicies(
+        'root', modificationPolicy, recoveryPolicy, operatorStopPolicy,
+      );
+    });
+    expect(apiMock.programWorkspace.updateNodePolicies).toHaveBeenCalledWith(
+      expect.objectContaining({
+        snapshotSequence: 12,
+        expectedAdmissionGeneration: 8,
+      }),
+      workspace(1).draft.programRevision,
+      'root', modificationPolicy, recoveryPolicy, operatorStopPolicy,
+    );
   });
 });

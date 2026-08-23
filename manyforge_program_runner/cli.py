@@ -26,7 +26,8 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--headless-url", default="http://127.0.0.1:9010")
     parser.add_argument("--execution-state-root", type=Path, required=True)
     parser.add_argument("--cycle-journal-path", type=Path, required=True)
-    parser.add_argument("--kernel-owner-epoch", required=True)
+    parser.add_argument("--manager-liveness-socket", type=Path)
+    parser.add_argument("--cell-id")
     parser.add_argument("--owner-id", default="program-runner")
     parser.add_argument("--headless-timeout-s", type=float, default=30.0)
     parser.add_argument("--tick-interval-ms", type=float, default=10.0)
@@ -48,11 +49,12 @@ def main(argv: Sequence[str] | None = None) -> int:
             headless_url=args.headless_url,
             execution_state_root=args.execution_state_root,
             cycle_journal_path=args.cycle_journal_path,
-            kernel_owner_epoch=args.kernel_owner_epoch,
             owner_id=args.owner_id,
             headless_timeout_seconds=args.headless_timeout_s,
             tick_interval_seconds=args.tick_interval_ms / 1_000.0,
             tick_workers=args.tick_workers,
+            manager_liveness_socket=args.manager_liveness_socket,
+            cell_id=args.cell_id,
         )
         model_transport = (
             None

@@ -101,13 +101,134 @@ FenceExpectation(const ManagerApplyIntentDTO &intent,
          intent.expected_active_projection_revision.graph_revision ==
              request.expected_current_graph_revision &&
          intent.candidate_retained_bundle_id ==
-             request.candidate_retained_bundle_id;
+             request.candidate_retained_bundle_id &&
+         intent.expected_admission_generation ==
+             request.expected_admission_generation &&
+         intent.parent_authoring_claim == request.parent_authoring_claim;
+}
+
+[[nodiscard]] core::CellAdmissionClaimIntentDTO
+DirectAdmissionIntent(const PersistedManagerApplyIntent &durable) {
+  const auto &intent = durable.intent;
+  Require(intent.expected_admission_generation.has_value(),
+          "direct Manager Apply lacks its admission generation");
+  core::CellAdmissionClaimIntentDTO claim{
+      core::CellAdmissionClaimKindDTO::kManagerApply,
+      core::CellAdmissionOwnerRoleDTO::kManager,
+      intent.request_context.request_owner_epoch,
+      intent.apply_id.value(),
+      intent.request_context.request_id,
+      durable.intent_digest,
+      *intent.expected_admission_generation,
+      {},
+      std::nullopt,
+      std::nullopt,
+  };
+  Require(core::ValidateCellAdmissionClaimIntent(claim).ok(),
+          "durable Manager Apply formed an invalid admission claim");
+  return claim;
+}
+
+[[nodiscard]] core::CellAdmissionClaimDTO RequireHeldAdmission(
+    const PersistedManagerApplyIntent &durable,
+    core::IKernelCellAdmissionPort &cell_admission) {
+  if (durable.intent.parent_authoring_claim.has_value()) {
+    const auto &parent = *durable.intent.parent_authoring_claim;
+    const auto receipt = cell_admission.GetCellAdmissionRecoveryReceipt(
+        {parent.intent, parent, std::nullopt});
+    if (!receipt.ok()) {
+      Fail("Kernel parent-claim lookup failed: " + receipt.error().message);
+    }
+    Require(receipt.value().status ==
+                    core::CellAdmissionRecoveryReceiptStatusDTO::kHeldExact &&
+                receipt.value().matched_claim == parent,
+            "Program Apply parent authoring claim is not held exactly");
+    return parent;
+  }
+
+  const auto intent = DirectAdmissionIntent(durable);
+  const auto receipt = cell_admission.GetCellAdmissionRecoveryReceipt(
+      {intent, std::nullopt, std::nullopt});
+  if (!receipt.ok()) {
+    Fail("Kernel Manager-claim lookup failed: " + receipt.error().message);
+  }
+  if (receipt.value().status ==
+          core::CellAdmissionRecoveryReceiptStatusDTO::kHeldExact &&
+      receipt.value().matched_claim.has_value()) {
+    return *receipt.value().matched_claim;
+  }
+  Require(receipt.value().status ==
+              core::CellAdmissionRecoveryReceiptStatusDTO::kUnknown,
+          "Manager Apply admission claim is conflicting or already settled");
+  const auto acquired = cell_admission.AcquireCellAdmissionClaim(intent);
+  if (!acquired.ok()) {
+    Fail("Kernel rejected Manager Apply admission: " +
+         acquired.error().message);
+  }
+  return acquired.value();
+}
+
+void ReleaseDirectAdmission(
+    const PersistedManagerApplyIntent &durable,
+    const PersistedManagerApplyTerminalOutcome &terminal,
+    core::IKernelCellAdmissionPort &cell_admission) {
+  if (durable.intent.parent_authoring_claim.has_value()) {
+    return;
+  }
+  const auto intent = DirectAdmissionIntent(durable);
+  const auto receipt = cell_admission.GetCellAdmissionRecoveryReceipt(
+      {intent, std::nullopt, std::nullopt});
+  if (!receipt.ok()) {
+    Fail("Kernel Manager-claim settlement lookup failed: " +
+         receipt.error().message);
+  }
+  if (receipt.value().status ==
+      core::CellAdmissionRecoveryReceiptStatusDTO::kReleasedExact) {
+    return;
+  }
+  Require(receipt.value().status ==
+                  core::CellAdmissionRecoveryReceiptStatusDTO::kHeldExact &&
+              receipt.value().matched_claim.has_value(),
+          "terminal Manager Apply has no exact held admission claim");
+  const auto &claim = *receipt.value().matched_claim;
+  const core::CellAdmissionClaimReleaseDTO release{
+      claim.intent.owner_role,
+      claim.intent.owner_epoch,
+      claim.intent.owner_transaction_id,
+      claim.intent.request_id,
+      claim.intent.request_payload_digest,
+      claim.acquired_admission_generation,
+      claim.claim_generation,
+      {core::CellAdmissionSettlementKindDTO::kTerminalEffectsSettled,
+       terminal.terminal_outcome_digest},
+  };
+  const auto released = cell_admission.ReleaseCellAdmissionClaim(release);
+  if (!released.ok()) {
+    const auto reason = released.error().details.find("reason");
+    Fail("Kernel rejected Manager Apply settlement: " +
+         released.error().message +
+         (reason == released.error().details.end()
+              ? std::string{}
+              : " [" + reason->second + "]"));
+  }
 }
 
 } // namespace
 
 bool ManagerNamedApplyRequestDTO::valid() const noexcept {
-  return !request_context.request_id.empty() &&
+  const bool direct = expected_admission_generation.has_value() &&
+                      expected_admission_generation->nonzero() &&
+                      !parent_authoring_claim.has_value();
+  const bool parent = !expected_admission_generation.has_value() &&
+                      parent_authoring_claim.has_value() &&
+                      core::ValidateCellAdmissionClaimIntent(
+                          parent_authoring_claim->intent)
+                          .ok() &&
+                      parent_authoring_claim->intent.claim_kind ==
+                          core::CellAdmissionClaimKindDTO::kAuthoringMutation &&
+                      parent_authoring_claim->intent.owner_role ==
+                          core::CellAdmissionOwnerRoleDTO::kAuthoringOwner;
+  return (direct || parent) && !request_context.request_id.empty() &&
          !request_context.request_owner_epoch.empty() &&
          !request_context.source_label.empty() &&
          (!request_context.correlation_id.has_value() ||
@@ -128,6 +249,7 @@ ManagerNamedApplyCoordinator::ManagerNamedApplyCoordinator(
     core::IManagerSceneProjectionHandoffPort &scene_owner,
     core::IManagerSceneProjectionBootstrapPort *bootstrap_scene_owner,
     core::IManagerKernelApplyFencePort &kernel_fence,
+    core::IKernelCellAdmissionPort &cell_admission,
     IManagerSelectedRuntimeCompositionPort &runtime_composition,
     IRuntimeUnitProcessPort &process_port,
     IRuntimeUnitProgressPort &progress_port,
@@ -137,7 +259,7 @@ ManagerNamedApplyCoordinator::ManagerNamedApplyCoordinator(
     RuntimePreStartGuard pre_start_guard)
     : apply_journal_(apply_journal), active_plan_source_(active_plan_source),
       retained_bundle_source_(retained_bundle_source),
-      kernel_fence_(kernel_fence),
+      kernel_fence_(kernel_fence), cell_admission_(cell_admission),
       manager_runtime_epoch_(std::move(manager_runtime_epoch)),
       apply_id_factory_(std::move(apply_id_factory)),
       fence_coordinator_(apply_journal_, kernel_fence_, manager_runtime_epoch_),
@@ -227,6 +349,8 @@ ManagerNamedApplyResult ManagerNamedApplyCoordinator::ApplyOrRecover(
       active_revision,
       candidate->retained_bundle_id(),
       candidate_value.cell_graph.graph_revision,
+      request.expected_admission_generation,
+      request.parent_authoring_claim,
   };
   Require(intent.valid(), "Manager could not construct a valid Apply intent");
   return Continue(intent, false);
@@ -237,6 +361,7 @@ ManagerNamedApplyCoordinator::Continue(const ManagerApplyIntentDTO &intent,
                                        const bool request_replayed) {
   Require(intent.valid() && intent.cell_id == apply_journal_.cell_id(),
           "durable Apply intent is invalid or belongs to another cell");
+  const auto durable_intent = apply_journal_.EnsureIntent(intent).record;
   const auto predecessor =
       LoadBundle(retained_bundle_source_,
                  intent.expected_active_projection_revision.retained_bundle_id,
@@ -248,10 +373,16 @@ ManagerNamedApplyCoordinator::Continue(const ManagerApplyIntentDTO &intent,
   if (const auto terminal = apply_journal_.ReadTerminalOutcome(
           intent.apply_id, intent.apply_generation);
       terminal.has_value()) {
+    ReleaseDirectAdmission(durable_intent, *terminal, cell_admission_);
     return {intent.apply_id, intent.apply_generation,
             ManagerNamedApplyResultState::kSucceeded, request_replayed,
             terminal->terminal_outcome};
   }
+
+  // The Apply intent is durable before this exact Kernel claim is acquired or
+  // validated. Every external phase below therefore has one restart-stable
+  // recovery identity and can never run outside the cell admission decision.
+  static_cast<void>(RequireHeldAdmission(durable_intent, cell_admission_));
 
   const auto finalized = apply_journal_.ReadSceneFinalized(
       intent.apply_id, intent.apply_generation);
@@ -260,6 +391,11 @@ ManagerNamedApplyCoordinator::Continue(const ManagerApplyIntentDTO &intent,
   if (finalized.has_value() || release_started.has_value()) {
     const auto release = fence_release_coordinator_.ReleaseOrRecover(
         intent.apply_id, intent.apply_generation);
+    const auto terminal = apply_journal_.ReadTerminalOutcome(
+        intent.apply_id, intent.apply_generation);
+    Require(terminal.has_value(),
+            "Manager Apply release completed without terminal evidence");
+    ReleaseDirectAdmission(durable_intent, *terminal, cell_admission_);
     return {intent.apply_id, intent.apply_generation,
             ManagerNamedApplyResultState::kSucceeded, request_replayed,
             release.durable_terminal_outcome.record.terminal_outcome};
@@ -321,6 +457,11 @@ ManagerNamedApplyCoordinator::Continue(const ManagerApplyIntentDTO &intent,
 
   const auto release = fence_release_coordinator_.ReleaseOrRecover(
       intent.apply_id, intent.apply_generation);
+  const auto terminal = apply_journal_.ReadTerminalOutcome(
+      intent.apply_id, intent.apply_generation);
+  Require(terminal.has_value(),
+          "Manager Apply release completed without terminal evidence");
+  ReleaseDirectAdmission(durable_intent, *terminal, cell_admission_);
   return {intent.apply_id, intent.apply_generation,
           ManagerNamedApplyResultState::kSucceeded, request_replayed,
           release.durable_terminal_outcome.record.terminal_outcome};

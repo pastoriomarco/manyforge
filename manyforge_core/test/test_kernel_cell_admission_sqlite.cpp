@@ -695,7 +695,7 @@ TEST(KernelCellAdmissionSqlite,
         recovery.value().recovered_cell_admission_claims,
         recovery.value().cell_admission_generation_high_water, {},
         [](const auto&, const auto&) { return Result<void>::Ok(); },
-        [](const auto& held, const auto& reconcile) {
+        [](const auto& held, const auto&, const auto& reconcile) {
           return Result<CellAdmissionReconcileValidationDTO>::Ok(
               {reconcile.current_owner_epochs,
                {{held.front(), CellAdmissionOwnerRoleDTO::kAuthoringOwner,

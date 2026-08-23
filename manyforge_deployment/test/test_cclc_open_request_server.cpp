@@ -57,7 +57,11 @@ private:
 };
 
 class RecordingOpenPort final : public core::ICCLCOpenRequestPort {
-public:
+ public:
+  core::RequestOwnerEpoch ReadRequestOwnerEpoch() const override {
+    return core::RequestOwnerEpoch("cclc-owner.server-test");
+  }
+
   [[nodiscard]] core::Result<core::CCLCLifecycleRequestResultDTO>
   SubmitLifecycle(const core::ComponentLifecycleIntentDTO &intent) override {
     {
@@ -156,6 +160,7 @@ private:
   const auto payload = CanonicalValue(CanonicalValue::Object{
       {"controllable_component_id", CanonicalValue("component.arm")},
       {"expected_component_lifecycle_generation", CanonicalValue(4.0)},
+      {"expected_admission_generation", CanonicalValue(7.0)},
       {"expected_control_domains",
        CanonicalValue(
            CanonicalValue::Array{CanonicalValue(CanonicalValue::Object{

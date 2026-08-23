@@ -79,6 +79,7 @@ def main() -> None:
     parser.add_argument("--program-path")
     parser.add_argument("--static-dir")
     parser.add_argument("--headless-api-url")
+    parser.add_argument("--authoring-state-root")
     parser.add_argument("--headless-api-timeout-s", type=float, default=2.0)
     parser.add_argument("--assistant-bridge-url")
     parser.add_argument("--assistant-request-timeout-s", type=float, default=10.0)
@@ -94,6 +95,8 @@ def main() -> None:
     headless_client = None
     assistant_client = None
     if args.headless_api_url is not None:
+        if args.authoring_state_root is None:
+            parser.error("--headless-api-url requires --authoring-state-root")
         from manyforge_headless_api.client import HeadlessHttpClient
 
         headless_client = HeadlessHttpClient(
@@ -117,6 +120,7 @@ def main() -> None:
             allowed_fs_roots=security.allowed_fs_roots,
             allowed_program_write_roots=security.allowed_program_write_roots,
             headless_client=headless_client,
+            authoring_state_root=args.authoring_state_root,
             assistant_client=assistant_client,
         )
         app = create_app(

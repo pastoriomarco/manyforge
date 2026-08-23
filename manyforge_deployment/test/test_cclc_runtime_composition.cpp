@@ -79,8 +79,48 @@ private:
 
 class UnusedKernelPorts final
     : public core::ICCLCKernelDisableHandoffPort,
-      public core::ICCLCKernelRouteConfigurationFencePort {
+      public core::ICCLCKernelRouteConfigurationFencePort,
+      public core::IKernelCellAdmissionPort {
 public:
+  [[nodiscard]] core::AuthoringAdmissionDTO GetAuthoringAdmission()
+      const override {
+    return {true, core::AdmissionGeneration(1U)};
+  }
+  [[nodiscard]] core::Result<core::AuthoringAdmissionDTO>
+  UpdateCellAdmissionReadiness(
+      const core::CellAdmissionReadinessSnapshotDTO &) override {
+    return core::Result<core::AuthoringAdmissionDTO>::Ok(
+        GetAuthoringAdmission());
+  }
+  [[nodiscard]] core::Result<core::CellAdmissionClaimDTO>
+  AcquireCellAdmissionClaim(
+      const core::CellAdmissionClaimIntentDTO &) override {
+    return core::Result<core::CellAdmissionClaimDTO>::Err(unsupported());
+  }
+  [[nodiscard]] core::Result<core::AuthoringAdmissionDTO>
+  ReleaseCellAdmissionClaim(
+      const core::CellAdmissionClaimReleaseDTO &) override {
+    return core::Result<core::AuthoringAdmissionDTO>::Err(unsupported());
+  }
+  [[nodiscard]] core::Result<core::AuthoringAdmissionDTO>
+  ReconcileCellAdmissionClaims(
+      const core::CellAdmissionReconcileDTO &) override {
+    return core::Result<core::AuthoringAdmissionDTO>::Ok(
+        GetAuthoringAdmission());
+  }
+  [[nodiscard]] core::Result<core::CellAdmissionRecoveryReceiptDTO>
+  GetCellAdmissionRecoveryReceipt(
+      const core::CellAdmissionRecoveryReceiptQueryDTO &) const override {
+    return core::Result<core::CellAdmissionRecoveryReceiptDTO>::Ok(
+        {core::CellAdmissionRecoveryReceiptStatusDTO::kUnknown,
+         core::RequestOwnerEpoch("kernel.1"),
+         core::AdmissionGeneration(1U),
+         std::nullopt,
+         std::nullopt,
+         std::nullopt,
+         {},
+         {}});
+  }
   [[nodiscard]] core::Result<core::DisableHandoffAdmissionSnapshotDTO>
   ObserveDisableHandoffAdmission(
       const core::DisableHandoffAdmissionQueryDTO &) const override {
@@ -282,7 +322,8 @@ TEST(CCLCRuntimeComposition,
                     "1"),
       retained.bundle, publication_reader, receipt, artifact_source,
       catalogs.value(), {}, controller_sources(*retained.bundle), {}, {}, {},
-      kernel_ports, kernel_ports, publication_owner, clock, scheduler);
+      kernel_ports, kernel_ports, kernel_ports, publication_owner, clock,
+      scheduler);
   ASSERT_TRUE(composition.ok()) << composition.error().message;
   EXPECT_TRUE(composition.value()->coordinator().accepting_new_requests());
   struct stat socket_status {};
@@ -333,7 +374,8 @@ TEST(CCLCRuntimeComposition,
                     "1"),
       retained.bundle, publication_reader, receipt, artifact_source,
       catalogs.value(), {}, controller_sources(*retained.bundle), {}, {}, {},
-      kernel_ports, kernel_ports, publication_owner, clock, scheduler);
+      kernel_ports, kernel_ports, kernel_ports, publication_owner, clock,
+      scheduler);
   EXPECT_FALSE(reused.ok());
 
   auto replacement = CCLCRuntimeComposition::CreateAndStart(
@@ -341,7 +383,8 @@ TEST(CCLCRuntimeComposition,
                     "2"),
       retained.bundle, publication_reader, receipt, artifact_source,
       catalogs.value(), {}, controller_sources(*retained.bundle), {}, {}, {},
-      kernel_ports, kernel_ports, publication_owner, clock, scheduler);
+      kernel_ports, kernel_ports, kernel_ports, publication_owner, clock,
+      scheduler);
   ASSERT_TRUE(replacement.ok()) << replacement.error().message;
 }
 
@@ -367,7 +410,7 @@ TEST(CCLCRuntimeComposition, RejectsMissingTrustedRootsWithoutCreatingThem) {
       std::move(config), retained.bundle, publication_reader, receipt,
       artifact_source, catalogs.value(), {},
       controller_sources(*retained.bundle), {}, {}, {}, kernel_ports,
-      kernel_ports, publication_owner, clock, scheduler);
+      kernel_ports, kernel_ports, publication_owner, clock, scheduler);
   EXPECT_FALSE(composition.ok());
   EXPECT_FALSE(std::filesystem::exists(missing_plan_root));
 }

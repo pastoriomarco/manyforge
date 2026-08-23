@@ -84,8 +84,26 @@ export interface OperatorAlarmSnapshot {
 
 export interface ComposerHeadlessState {
   schemaVersion: 'manyforge.composer_headless_state.v1';
+  clientId: string;
+  complete: true;
   runtime: HeadlessRuntimeSnapshot;
   alarms: OperatorAlarmSnapshot;
+  authoringAdmission: {
+    authoringAllowed: boolean;
+    admissionGeneration: number;
+  };
+  programCycle: {
+    programRunnerOwnerEpoch: string;
+    cycleGeneration: number;
+    state: 'idle_after_reset' | 'starting' | 'running' | 'stopping'
+      | 'terminal_awaiting_reset';
+    programRunId: string | null;
+    cycleClaimGeneration: number | null;
+    terminalOrSettlementReference: string | null;
+  };
+  draftIdentity: { draftId: string; draftRevision: number };
+  receiverEpoch: string;
+  snapshotSequence: number;
 }
 
 export interface HistorianEvent {

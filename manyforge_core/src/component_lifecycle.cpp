@@ -515,6 +515,7 @@ bool CCLCJournalRecoveryDTO::locally_valid() const noexcept {
       interrupted_route_selections.size() > kMaximumCCLCActiveTransactions ||
       route_effect_sequence_watermarks.size() > kMaximumCCLCActiveTransactions ||
       unresolved_route_effect_attempts.size() > kMaximumCCLCActiveTransactions ||
+      lifecycle_claims.size() > kMaximumCCLCActiveTransactions ||
       interrupted_transactions.size() + interrupted_route_selections.size() >
           kMaximumCCLCActiveTransactions ||
       !std::is_sorted(component_watermarks.begin(), component_watermarks.end(),
@@ -572,6 +573,18 @@ bool CCLCJournalRecoveryDTO::locally_valid() const noexcept {
                    std::tie(rhs.route_selection_transaction_generation, rhs.effect_sequence);
           })) {
     return false;
+  }
+  for (const auto& row : lifecycle_claims) {
+    if (!ValidateCellAdmissionClaimIntent(row.intent).ok() ||
+        (row.claim.has_value() &&
+         (!ValidateCellAdmissionClaimIntent(row.claim->intent).ok() ||
+          row.claim->intent != row.intent)) ||
+        (row.release_intent.has_value() &&
+         !ValidateCellAdmissionClaimRelease(*row.release_intent).ok()) ||
+        (row.release_receipt_recorded && !row.release_intent.has_value() &&
+         row.claim.has_value())) {
+      return false;
+    }
   }
 
   for (std::size_t index = 0U; index < component_watermarks.size(); ++index) {
@@ -826,6 +839,7 @@ bool ComponentLifecycleIntentDTO::locally_valid() const noexcept {
   if (!context_valid(request_context) || !bounded_identity(controllable_component_id) ||
       !known(intent) || !bounded_identity(expected_graph_revision) ||
       !expected_component_lifecycle_generation.nonzero() || expected_control_domains.empty() ||
+      !expected_admission_generation.nonzero() ||
       expected_control_domains.size() > kMaxLifecycleExpectedDomains ||
       (reason.has_value() && reason->size() > kMaxLifecycleReasonBytes) ||
       !attribution.locally_valid() ||
@@ -857,7 +871,8 @@ bool ComponentLifecycleIntentDTO::replay_equal(
          controllable_component_id == other.controllable_component_id && intent == other.intent &&
          expected_graph_revision == other.expected_graph_revision &&
          expected_component_lifecycle_generation == other.expected_component_lifecycle_generation &&
-         expected_control_domains == other.expected_control_domains && reason == other.reason;
+         expected_control_domains == other.expected_control_domains && reason == other.reason &&
+         expected_admission_generation == other.expected_admission_generation;
 }
 
 bool ComponentLifecycleAcceptedDTO::locally_valid() const noexcept {

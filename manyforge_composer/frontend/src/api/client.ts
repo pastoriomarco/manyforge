@@ -20,6 +20,7 @@ import {
   parseOperatorAlarmSnapshot,
   parseProgramWorkspaceResponse,
   parseProgramWorkspaceTransitionResponse,
+  parseProgramCycleResetResult,
   parseProgramNodePolicyMutationResponse,
   parseProgramRunIndex,
   parseProgramRunStatus,
@@ -36,6 +37,7 @@ import {
 import {
   parseCCLCAdmission,
   parseCCLCComponentSnapshot,
+  parseCCLCOwnerIdentity,
   parseCCLCRouteTemplateSet,
   parseCCLCStatusEnvelope,
 } from './cclcParsers';
@@ -56,6 +58,7 @@ import type {
   ManagerStatusProjection,
   ProgramWorkspaceResponse,
   ProgramWorkspaceTransitionResponse,
+  ProgramCycleResetResult,
   ProgramRunIndex,
   ProgramRunStatus,
   ProgramNodeModificationPolicy,
@@ -92,6 +95,7 @@ import type {
 import type {
   CCLCAdmission,
   CCLCComponentSnapshot,
+  CCLCOwnerIdentity,
   CCLCLifecycleRequestBody,
   CCLCRouteRequestBody,
   CCLCRouteTemplateSet,
@@ -230,6 +234,11 @@ export const api = {
       requestJson('/api/source-model', parseSourceModelProjection, signal),
   },
   cclc: {
+    owner: (signal?: AbortSignal): Promise<CCLCOwnerIdentity> => requestJson(
+      '/api/cclc/owner',
+      parseCCLCOwnerIdentity,
+      signal,
+    ),
     component: (
       componentId: string,
       signal?: AbortSignal,
@@ -527,6 +536,15 @@ export const api = {
     ): Promise<ProgramRunStatus> => requestJson(
       `/api/program/runs/${encodeURIComponent(programRunId)}/stop`,
       parseProgramRunStatus,
+      signal,
+      { method: 'POST', body: JSON.stringify(body) },
+    ),
+    resetCycle: (
+      body: Record<string, JsonValue>,
+      signal?: AbortSignal,
+    ): Promise<ProgramCycleResetResult> => requestJson(
+      '/api/program/cycle/reset',
+      parseProgramCycleResetResult,
       signal,
       { method: 'POST', body: JSON.stringify(body) },
     ),

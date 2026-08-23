@@ -42,6 +42,7 @@ import type {
   ProgramRunIndex,
   ProgramRunStateName,
   ProgramRunStatus,
+  ProgramCycleResetResult,
   ProgramValueSource,
   ProgramViewerMetadata,
   ProgramWorkspaceResponse,
@@ -75,6 +76,35 @@ import type {
   SourceModelTarget,
   Vector3Tuple,
 } from '../types/api';
+
+export function parseProgramCycleResetResult(value: unknown): ProgramCycleResetResult {
+  const record = objectAt(value, 'programCycleReset');
+  exactKeysAt(record, [
+    'schema_version', 'program_run_id', 'reset_cycle_generation',
+    'idle_cycle_generation', 'settlement_reference', 'admission',
+  ], 'programCycleReset');
+  const schemaVersion = stringAt(record.schema_version, 'programCycleReset.schema_version');
+  if (schemaVersion !== 'manyforge.program_cycle_reset_result.v1') {
+    return fail('programCycleReset.schema_version', 'the expected reset result schema');
+  }
+  return {
+    schemaVersion,
+    programRunId: stringAt(record.program_run_id, 'programCycleReset.program_run_id'),
+    resetCycleGeneration: positiveIntegerAt(
+      record.reset_cycle_generation,
+      'programCycleReset.reset_cycle_generation',
+    ),
+    idleCycleGeneration: positiveIntegerAt(
+      record.idle_cycle_generation,
+      'programCycleReset.idle_cycle_generation',
+    ),
+    settlementReference: digestAt(
+      record.settlement_reference,
+      'programCycleReset.settlement_reference',
+    ),
+    admission: objectAt(record.admission, 'programCycleReset.admission') as Record<string, JsonValue>,
+  };
+}
 import type {
   AlarmLifecycleState,
   AlarmMembership,
@@ -4180,8 +4210,13 @@ export function parseOperatorAlarmSnapshot(
 
 export function parseComposerHeadlessState(
   value: unknown,
-): ComposerHeadlessState {
+): Omit<ComposerHeadlessState, 'clientId'> {
   const record = objectAt(value, 'headlessState');
+  exactKeysAt(record, [
+    'schema_version', 'runtime', 'alarms', 'authoring_admission',
+    'program_cycle', 'draft_identity', 'receiver_epoch',
+    'snapshot_sequence', 'complete',
+  ], 'headlessState');
   const schemaVersion = stringAt(
     record.schema_version,
     'headlessState.schema_version',
@@ -4192,10 +4227,45 @@ export function parseComposerHeadlessState(
       'manyforge.composer_headless_state.v1',
     );
   }
+  const admission = objectAt(record.authoring_admission, 'headlessState.authoring_admission');
+  exactKeysAt(admission, ['admission_generation', 'authoring_allowed'], 'headlessState.authoring_admission');
+  const cycle = objectAt(record.program_cycle, 'headlessState.program_cycle');
+  exactKeysAt(cycle, [
+    'program_runner_owner_epoch', 'cycle_generation', 'state', 'program_run_id',
+    'cycle_claim_generation', 'terminal_or_settlement_reference',
+  ], 'headlessState.program_cycle');
+  const cycleState = stringAt(cycle.state, 'headlessState.program_cycle.state');
+  if (!['idle_after_reset', 'starting', 'running', 'stopping',
+    'terminal_awaiting_reset'].includes(cycleState)) {
+    return fail('headlessState.program_cycle.state', 'a supported Program cycle state');
+  }
+  const draft = objectAt(record.draft_identity, 'headlessState.draft_identity');
+  exactKeysAt(draft, ['draft_id', 'draft_revision'], 'headlessState.draft_identity');
+  const complete = booleanAt(record.complete, 'headlessState.complete');
+  if (!complete) return fail('headlessState.complete', 'true');
   return {
     schemaVersion,
+    complete: true,
     runtime: parseHeadlessRuntimeSnapshot(record.runtime),
     alarms: parseOperatorAlarmSnapshot(record.alarms),
+    authoringAdmission: {
+      authoringAllowed: booleanAt(admission.authoring_allowed, 'headlessState.authoring_admission.authoring_allowed'),
+      admissionGeneration: positiveIntegerAt(admission.admission_generation, 'headlessState.authoring_admission.admission_generation'),
+    },
+    programCycle: {
+      programRunnerOwnerEpoch: stringAt(cycle.program_runner_owner_epoch, 'headlessState.program_cycle.program_runner_owner_epoch'),
+      cycleGeneration: positiveIntegerAt(cycle.cycle_generation, 'headlessState.program_cycle.cycle_generation'),
+      state: cycleState as ComposerHeadlessState['programCycle']['state'],
+      programRunId: nullableStringAt(cycle.program_run_id, 'headlessState.program_cycle.program_run_id'),
+      cycleClaimGeneration: cycle.cycle_claim_generation === null ? null : positiveIntegerAt(cycle.cycle_claim_generation, 'headlessState.program_cycle.cycle_claim_generation'),
+      terminalOrSettlementReference: cycle.terminal_or_settlement_reference === null ? null : digestAt(cycle.terminal_or_settlement_reference, 'headlessState.program_cycle.terminal_or_settlement_reference'),
+    },
+    draftIdentity: {
+      draftId: stringAt(draft.draft_id, 'headlessState.draft_identity.draft_id'),
+      draftRevision: integerAt(draft.draft_revision, 'headlessState.draft_identity.draft_revision'),
+    },
+    receiverEpoch: stringAt(record.receiver_epoch, 'headlessState.receiver_epoch'),
+    snapshotSequence: positiveIntegerAt(record.snapshot_sequence, 'headlessState.snapshot_sequence'),
   };
 }
 

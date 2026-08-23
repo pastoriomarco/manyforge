@@ -8,6 +8,7 @@
 #include <manyforge_component_manager/scene_staging.hpp>
 #include <manyforge_component_manager/selected_bundle_transition.hpp>
 #include <manyforge_core/types/configuration_fence.hpp>
+#include <manyforge_core/types/cell_admission.hpp>
 #include <manyforge_core/types/projection_common.hpp>
 #include <memory>
 #include <optional>
@@ -19,8 +20,8 @@
 namespace manyforge::component_manager {
 
 inline constexpr std::string_view kManagerApplyJournalSchemaId =
-    "manyforge.internal.component-manager.apply-journal.i4.v8";
-inline constexpr std::int64_t kManagerApplyJournalSchemaVersion = 8;
+    "manyforge.internal.component-manager.apply-journal.o1.5.v9";
+inline constexpr std::int64_t kManagerApplyJournalSchemaVersion = 9;
 inline constexpr std::int64_t kManagerApplyJournalSqliteApplicationId =
     1296450128;
 inline constexpr std::size_t kMaximumManagerApplyIntents = 256U;
@@ -111,6 +112,10 @@ struct ManagerApplyIntentDTO final {
   manyforge::core::ProjectionRevisionDTO expected_active_projection_revision;
   manyforge::core::RetainedBundleId candidate_retained_bundle_id;
   manyforge::core::GraphRevision candidate_graph_revision;
+  std::optional<manyforge::core::AdmissionGeneration>
+      expected_admission_generation;
+  std::optional<manyforge::core::CellAdmissionClaimDTO>
+      parent_authoring_claim;
 
   [[nodiscard]] bool valid() const noexcept;
 
@@ -565,5 +570,15 @@ private:
   class Impl;
   std::unique_ptr<Impl> impl_;
 };
+
+/// Read-only native-Kernel settlement check for one exact Manager-owned cell
+/// claim. It opens the owner journal without initialization, locks, mutation,
+/// checkpointing, or durability side effects.
+[[nodiscard]] manyforge::core::Result<void>
+ValidateManagerApplyCellAdmissionSettlementReadOnly(
+    const std::filesystem::path &database_path,
+    const manyforge::core::CellId &cell_id,
+    const manyforge::core::CellAdmissionClaimDTO &claim,
+    const manyforge::core::CellAdmissionClaimReleaseDTO &release);
 
 } // namespace manyforge::component_manager

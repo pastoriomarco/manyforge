@@ -632,4 +632,20 @@ Result<ContentDigest> CellAdmissionClaimIntentDigest(const CellAdmissionClaimInt
       "cell-admission-claim-intent-digest", "1.0", value)));
 }
 
+Result<ContentDigest> CellAdmissionOwnerEpochReconciliationEvidenceDigest(
+    CellAdmissionOwnerRoleDTO owner_role,
+    const RequestOwnerEpoch& owner_epoch) {
+  if (to_string(owner_role).empty() ||
+      !BoundedIdentity(owner_epoch.value())) {
+    return Invalid<ContentDigest>(
+        "owner_epoch_reconciliation_identity_invalid");
+  }
+  const CanonicalValue value(CanonicalValue::Object{
+      {"owner_epoch", CanonicalValue(owner_epoch.value())},
+      {"owner_role", CanonicalValue(std::string(to_string(owner_role)))},
+  });
+  return Result<ContentDigest>::Ok(ContentDigest(content_identity::framed_sha256(
+      "cell-admission-owner-epoch-reconciliation-evidence", "1.0", value)));
+}
+
 }  // namespace manyforge::core

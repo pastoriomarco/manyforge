@@ -56,6 +56,7 @@ class ICCLCOpenRequestPort {
  public:
   virtual ~ICCLCOpenRequestPort() = default;
 
+  [[nodiscard]] virtual RequestOwnerEpoch ReadRequestOwnerEpoch() const = 0;
   [[nodiscard]] virtual Result<CCLCLifecycleRequestResultDTO> SubmitLifecycle(
       const ComponentLifecycleIntentDTO& intent) = 0;
   [[nodiscard]] virtual Result<std::optional<ComponentLifecycleStatusDTO>> LoadLifecycleStatus(
@@ -79,6 +80,7 @@ class ComponentLifecycleCoordinatorOpenRequestPort final : public ICCLCOpenReque
       const ICCLCCurrentComponentSnapshotSource& current_component_source,
       const ICCLCRouteSelectionTemplateSource& route_template_source) noexcept;
 
+  [[nodiscard]] RequestOwnerEpoch ReadRequestOwnerEpoch() const override;
   [[nodiscard]] Result<CCLCLifecycleRequestResultDTO> SubmitLifecycle(
       const ComponentLifecycleIntentDTO& intent) override;
   [[nodiscard]] Result<std::optional<ComponentLifecycleStatusDTO>> LoadLifecycleStatus(

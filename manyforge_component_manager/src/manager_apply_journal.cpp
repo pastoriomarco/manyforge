@@ -9,6 +9,7 @@
 #include <manyforge_core/runtime_contract_manifest_codec.hpp>
 
 #include "embedded_manager_apply_journal_schema.hpp"
+#include <manyforge_component_manager/kernel_cell_admission_rpc_internal.hpp>
 #include "sqlite_store_startup_internal.hpp"
 
 #if SQLITE_VERSION_NUMBER < 3037000
@@ -228,6 +229,13 @@ public:
           "bind SQLite integer");
   }
 
+  void BindBlob(const int index, const std::string_view value) {
+    Check(database_,
+          sqlite3_bind_blob(statement_, index, value.data(),
+                            static_cast<int>(value.size()), SQLITE_TRANSIENT),
+          "bind SQLite blob");
+  }
+
   void BindNull(const int index) {
     Check(database_, sqlite3_bind_null(statement_, index), "bind SQLite null");
   }
@@ -273,6 +281,32 @@ public:
           "stored Apply-journal integer column has an invalid SQLite type");
     }
     return sqlite3_column_int64(statement_, column);
+  }
+
+  [[nodiscard]] bool IsNull(const int column) const noexcept {
+    return sqlite3_column_type(statement_, column) == SQLITE_NULL;
+  }
+
+  [[nodiscard]] std::string Blob(const int column) const {
+    if (sqlite3_column_type(statement_, column) != SQLITE_BLOB) {
+      throw ManagerApplyJournalIntegrityError(
+          "stored Apply-journal blob column has an invalid SQLite type");
+    }
+    const auto *bytes = sqlite3_column_blob(statement_, column);
+    const auto size = sqlite3_column_bytes(statement_, column);
+    if (bytes == nullptr || size <= 0) {
+      throw ManagerApplyJournalIntegrityError(
+          "stored Apply-journal blob column is empty");
+    }
+    return {static_cast<const char *>(bytes), static_cast<std::size_t>(size)};
+  }
+
+  [[nodiscard]] std::optional<std::string>
+  OptionalBlob(const int column) const {
+    if (sqlite3_column_type(statement_, column) == SQLITE_NULL) {
+      return std::nullopt;
+    }
+    return Blob(column);
   }
 
 private:
@@ -495,8 +529,28 @@ void AppendField(std::string &record, const std::string_view name,
 struct EncodedIntent final {
   std::int64_t apply_generation;
   std::int64_t predecessor_scene_revision_id;
+  std::optional<std::int64_t> expected_admission_generation;
+  std::optional<std::string> parent_authoring_claim;
   std::string intent_digest;
 };
+
+std::string EncodeParentAuthoringClaim(
+    const core::CellAdmissionClaimDTO &claim) {
+  return detail::EncodeKernelCellAdmissionRpcResponse("acquire", claim);
+}
+
+core::CellAdmissionClaimDTO DecodeParentAuthoringClaim(
+    const std::string_view bytes) {
+  const auto packet = detail::DecodeKernelCellAdmissionRpcResponse(bytes);
+  const auto *claim =
+      std::get_if<core::CellAdmissionClaimDTO>(&packet.response);
+  if (packet.command != "acquire" || claim == nullptr ||
+      !core::ValidateCellAdmissionClaimIntent(claim->intent).ok()) {
+    throw ManagerApplyJournalIntegrityError(
+        "stored parent authoring claim is invalid");
+  }
+  return *claim;
+}
 
 EncodedIntent EncodeIntent(const ManagerApplyIntentDTO &intent) {
   if (!intent.valid()) {
@@ -537,6 +591,17 @@ EncodedIntent EncodeIntent(const ManagerApplyIntentDTO &intent) {
   const auto scene_revision = CheckedSigned(
       intent.expected_active_projection_revision.scene_revision.revision_id,
       "predecessor_scene_revision_id");
+  const auto expected_admission_generation =
+      intent.expected_admission_generation.has_value()
+          ? std::optional<std::int64_t>(CheckedSigned(
+                intent.expected_admission_generation->value(),
+                "expected_admission_generation"))
+          : std::nullopt;
+  const auto parent_authoring_claim =
+      intent.parent_authoring_claim.has_value()
+          ? std::optional<std::string>(
+                EncodeParentAuthoringClaim(*intent.parent_authoring_claim))
+          : std::nullopt;
 
   std::string record;
   AppendField(record, "domain", kDigestDomain);
@@ -569,7 +634,18 @@ EncodedIntent EncodeIntent(const ManagerApplyIntentDTO &intent) {
               intent.candidate_retained_bundle_id.value());
   AppendField(record, "candidate_graph_revision",
               intent.candidate_graph_revision.value());
-  return {generation, scene_revision, RawDigest(record)};
+  AppendField(record, "admission_context_kind",
+              expected_admission_generation.has_value()
+                  ? "direct"
+                  : "parent_authoring_claim");
+  AppendField(record, "expected_admission_generation",
+              expected_admission_generation.has_value()
+                  ? std::to_string(*expected_admission_generation)
+                  : "");
+  AppendField(record, "parent_authoring_claim",
+              parent_authoring_claim.value_or(""));
+  return {generation, scene_revision, expected_admission_generation,
+          parent_authoring_claim, RawDigest(record)};
 }
 
 std::int64_t CheckedNonnegativeSigned(const std::uint64_t value,
@@ -3116,7 +3192,19 @@ void PreflightApplyJournal(const std::filesystem::path &database_path,
 } // namespace
 
 bool ManagerApplyIntentDTO::valid() const noexcept {
-  return !request_context.request_id.empty() &&
+  const bool direct = expected_admission_generation.has_value() &&
+                      expected_admission_generation->nonzero() &&
+                      !parent_authoring_claim.has_value();
+  const bool parent = !expected_admission_generation.has_value() &&
+                      parent_authoring_claim.has_value() &&
+                      core::ValidateCellAdmissionClaimIntent(
+                          parent_authoring_claim->intent)
+                          .ok() &&
+                      parent_authoring_claim->intent.claim_kind ==
+                          core::CellAdmissionClaimKindDTO::kAuthoringMutation &&
+                      parent_authoring_claim->intent.owner_role ==
+                          core::CellAdmissionOwnerRoleDTO::kAuthoringOwner;
+  return (direct || parent) && !request_context.request_id.empty() &&
          !request_context.request_owner_epoch.empty() &&
          !request_context.source_label.empty() &&
          (!request_context.correlation_id.has_value() ||
@@ -3414,7 +3502,8 @@ public:
         "source_label,correlation_id,predecessor_retained_bundle_id,"
         "predecessor_graph_revision,predecessor_scene_id,"
         "predecessor_scene_revision_id,predecessor_scene_content_hash,"
-        "candidate_retained_bundle_id,candidate_graph_revision,intent_digest "
+        "candidate_retained_bundle_id,candidate_graph_revision,"
+        "expected_admission_generation,parent_authoring_claim,intent_digest "
         "FROM manager_apply_intents "
         "WHERE apply_id=? AND apply_generation=?");
     row.Bind(1, apply_id.value());
@@ -3435,7 +3524,18 @@ public:
     const auto predecessor_scene_content_hash = row.Text(10);
     const auto candidate_retained_bundle_id = row.Text(11);
     const auto candidate_graph_revision = row.Text(12);
-    const auto stored_digest = row.Text(13);
+    std::optional<core::AdmissionGeneration> expected_admission_generation;
+    if (!row.IsNull(13)) {
+      const auto stored_admission_generation = row.Integer(13);
+      if (stored_admission_generation <= 0) {
+        throw ManagerApplyJournalIntegrityError(
+            "stored Apply admission generation is invalid");
+      }
+      expected_admission_generation.emplace(
+          static_cast<std::uint64_t>(stored_admission_generation));
+    }
+    const auto parent_authoring_claim = row.OptionalBlob(14);
+    const auto stored_digest = row.Text(15);
     if (row.Step()) {
       throw ManagerApplyJournalIntegrityError(
           "Apply intent identity is not unique");
@@ -3466,6 +3566,11 @@ public:
         },
         RetainedBundleId(candidate_retained_bundle_id),
         GraphRevision(candidate_graph_revision),
+        expected_admission_generation,
+        parent_authoring_claim.has_value()
+            ? std::optional<core::CellAdmissionClaimDTO>(
+                  DecodeParentAuthoringClaim(*parent_authoring_claim))
+            : std::nullopt,
     };
     EncodedIntent encoded;
     try {
@@ -5504,8 +5609,9 @@ SqliteManagerApplyJournal::EnsureIntent(const ManagerApplyIntentDTO &intent) {
       "source_label,correlation_id,predecessor_retained_bundle_id,"
       "predecessor_graph_revision,predecessor_scene_id,"
       "predecessor_scene_revision_id,predecessor_scene_content_hash,"
-      "candidate_retained_bundle_id,candidate_graph_revision,intent_digest"
-      ") VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)");
+      "candidate_retained_bundle_id,candidate_graph_revision,"
+      "expected_admission_generation,parent_authoring_claim,intent_digest"
+      ") VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)");
   insert.Bind(1, intent.apply_id.value());
   insert.Bind(2, encoded.apply_generation);
   insert.Bind(3, intent.request_context.request_id.value());
@@ -5527,7 +5633,17 @@ SqliteManagerApplyJournal::EnsureIntent(const ManagerApplyIntentDTO &intent) {
                       .content_hash.value());
   insert.Bind(12, intent.candidate_retained_bundle_id.value());
   insert.Bind(13, intent.candidate_graph_revision.value());
-  insert.Bind(14, encoded.intent_digest);
+  if (encoded.expected_admission_generation.has_value()) {
+    insert.Bind(14, *encoded.expected_admission_generation);
+  } else {
+    insert.BindNull(14);
+  }
+  if (encoded.parent_authoring_claim.has_value()) {
+    insert.BindBlob(15, *encoded.parent_authoring_claim);
+  } else {
+    insert.BindNull(15);
+  }
+  insert.Bind(16, encoded.intent_digest);
   static_cast<void>(insert.Step());
 
   const auto stored =
@@ -7243,5 +7359,81 @@ SqliteManagerApplyJournal::VerifyIntegrity() const {
 }
 
 void SqliteManagerApplyJournal::Close() { impl_->Close(); }
+
+core::Result<void> ValidateManagerApplyCellAdmissionSettlementReadOnly(
+    const std::filesystem::path &database_path, const core::CellId &cell_id,
+    const core::CellAdmissionClaimDTO &claim,
+    const core::CellAdmissionClaimReleaseDTO &release) {
+  const auto rejected = [](std::string reason) {
+    return core::Result<void>::Err(core::ErrorDTO{
+        "invariant_violation",
+        "Manager Apply cell-admission settlement is not owner-proven",
+        {{"reason", std::move(reason)}}});
+  };
+  if (!core::ValidateCellAdmissionClaimIntent(claim.intent).ok() ||
+      claim.intent.claim_kind != core::CellAdmissionClaimKindDTO::kManagerApply ||
+      claim.intent.owner_role != core::CellAdmissionOwnerRoleDTO::kManager ||
+      release.owner_role != claim.intent.owner_role ||
+      release.owner_epoch != claim.intent.owner_epoch ||
+      release.owner_transaction_id != claim.intent.owner_transaction_id ||
+      release.request_id != claim.intent.request_id ||
+      release.request_payload_digest != claim.intent.request_payload_digest ||
+      release.acquired_admission_generation !=
+          claim.acquired_admission_generation ||
+      release.claim_generation != claim.claim_generation ||
+      release.settlement.settlement_kind !=
+          core::CellAdmissionSettlementKindDTO::kTerminalEffectsSettled) {
+    return rejected("manager_apply_release_identity_mismatch");
+  }
+
+  sqlite3 *database = nullptr;
+  const int flags = SQLITE_OPEN_READONLY | SQLITE_OPEN_FULLMUTEX |
+                    SQLITE_OPEN_NOFOLLOW;
+  const auto opened = sqlite3_open_v2(database_path.string().c_str(), &database,
+                                      flags, nullptr);
+  if (opened != SQLITE_OK) {
+    if (database != nullptr) {
+      sqlite3_close(database);
+    }
+    return rejected("manager_apply_journal_unavailable");
+  }
+  try {
+    Check(database, sqlite3_busy_timeout(database, kBusyTimeoutMilliseconds),
+          "configure read-only settlement timeout");
+    Exec(database, "PRAGMA query_only=ON");
+    Transaction snapshot(database, "BEGIN");
+    ValidateApplyJournalIdentityAndSchema(database, cell_id);
+    Statement row(
+        database,
+        "SELECT t.terminal_outcome_digest FROM manager_apply_intents i "
+        "JOIN manager_apply_terminal_outcomes t "
+        "ON t.apply_id=i.apply_id AND "
+        "t.apply_generation=i.apply_generation "
+        "WHERE i.apply_id=? AND i.request_owner_epoch=? AND i.request_id=? "
+        "AND i.intent_digest=? AND i.expected_admission_generation=? "
+        "AND i.parent_authoring_claim IS NULL");
+    row.Bind(1, claim.intent.owner_transaction_id);
+    row.Bind(2, claim.intent.owner_epoch.value());
+    row.Bind(3, claim.intent.request_id.value());
+    row.Bind(4, claim.intent.request_payload_digest.value());
+    row.Bind(5, CheckedSigned(claim.intent.expected_admission_generation.value(),
+                              "expected_admission_generation"));
+    const bool found = row.Step();
+    const auto digest = found ? std::optional<std::string>(row.Text(0))
+                              : std::nullopt;
+    const bool duplicate = found && row.Step();
+    snapshot.Commit();
+    sqlite3_close(database);
+    database = nullptr;
+    if (!digest.has_value() || duplicate ||
+        *digest != release.settlement.evidence_digest.value()) {
+      return rejected("manager_apply_terminal_evidence_mismatch");
+    }
+    return core::Result<void>::Ok();
+  } catch (const std::exception &) {
+    sqlite3_close(database);
+    return rejected("manager_apply_journal_read_failed");
+  }
+}
 
 } // namespace manyforge::component_manager

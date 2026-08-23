@@ -8,6 +8,7 @@
 #include <manyforge_component_manager/manager_scene_stage_coordinator.hpp>
 #include <manyforge_component_manager/manager_selected_bundle_transition_coordinator.hpp>
 #include <manyforge_component_manager/manager_selected_runtime_composition_coordinator.hpp>
+#include <manyforge_core/ports/ikernel_cell_admission_port.hpp>
 
 #include <functional>
 #include <mutex>
@@ -42,6 +43,10 @@ struct ManagerNamedApplyRequestDTO final {
   manyforge::core::RetainedBundleId expected_current_retained_bundle_id;
   manyforge::core::GraphRevision expected_current_graph_revision;
   manyforge::core::RetainedBundleId candidate_retained_bundle_id;
+  std::optional<manyforge::core::AdmissionGeneration>
+      expected_admission_generation;
+  std::optional<manyforge::core::CellAdmissionClaimDTO>
+      parent_authoring_claim;
 
   [[nodiscard]] bool valid() const noexcept;
 
@@ -86,6 +91,7 @@ public:
       manyforge::core::IManagerSceneProjectionBootstrapPort
           *bootstrap_scene_owner,
       manyforge::core::IManagerKernelApplyFencePort &kernel_fence,
+      manyforge::core::IKernelCellAdmissionPort &cell_admission,
       IManagerSelectedRuntimeCompositionPort &runtime_composition,
       IRuntimeUnitProcessPort &process_port,
       IRuntimeUnitProgressPort &progress_port,
@@ -118,6 +124,7 @@ private:
   const manyforge::deployment::IVerifiedRetainedBundleSource
       &retained_bundle_source_;
   manyforge::core::IManagerKernelApplyFencePort &kernel_fence_;
+  manyforge::core::IKernelCellAdmissionPort &cell_admission_;
   manyforge::core::RuntimeEpoch manager_runtime_epoch_;
   ApplyIdFactory apply_id_factory_;
   ManagerApplyFenceCoordinator fence_coordinator_;

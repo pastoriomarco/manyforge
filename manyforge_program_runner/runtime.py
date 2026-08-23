@@ -56,8 +56,16 @@ from manyforge_headless_api.program_model_transport import (
     HeadlessProgramModelAuditSink,
 )
 
-from .cell_admission import CellAdmissionClient, CellAdmissionError
+from manyforge_headless_api.cell_admission import (
+    CellAdmissionClient,
+    CellAdmissionError,
+    cell_admission_owner_epoch_reconciliation_evidence_digest,
+)
 from .cycle_journal import ProgramCycleJournal
+from .liveness import (
+    ProgramRunnerLivenessError,
+    ProgramRunnerLivenessReceiver,
+)
 from .models import ProgramCycleResetRequest, ProgramCycleStatusDTO
 
 
@@ -78,7 +86,6 @@ class ProgramRunnerConfig:
     headless_url: str
     execution_state_root: Path | None = None
     cycle_journal_path: Path | None = None
-    kernel_owner_epoch: str | None = None
     owner_id: str = "program-runner"
     owner_epoch: str | None = None
     headless_timeout_seconds: float = 30.0
@@ -86,6 +93,8 @@ class ProgramRunnerConfig:
     tick_workers: int = 4
     maximum_retained_runs: int = 4_096
     maximum_replay_records: int = _MAX_REPLAY_RECORDS
+    manager_liveness_socket: Path | None = None
+    cell_id: str | None = None
 
     def __post_init__(self) -> None:
         parsed = urlsplit(self.headless_url)
@@ -110,7 +119,7 @@ class ProgramRunnerConfig:
                 or len(value.encode("utf-8")) > 256
             ):
                 raise ValueError(f"{field_name} must be bounded non-empty text")
-        for field_name in ("owner_epoch", "kernel_owner_epoch"):
+        for field_name in ("owner_epoch",):
             value = getattr(self, field_name)
             if value is not None and (
                 not value
@@ -129,12 +138,9 @@ class ProgramRunnerConfig:
             if type(value) is not int or not 1 <= value <= 4_096:
                 raise ValueError(f"{field_name} must be in [1, 4096]")
         enabled = self.execution_state_root is not None
-        if enabled != (self.cycle_journal_path is not None) or enabled != (
-            self.kernel_owner_epoch is not None
-        ):
+        if enabled != (self.cycle_journal_path is not None):
             raise ValueError(
-                "execution-state root, cycle journal, and kernel owner epoch "
-                "must be configured together"
+                "execution-state root and cycle journal must be configured together"
             )
         if enabled and (
             not self.execution_state_root.is_absolute()
@@ -143,6 +149,13 @@ class ProgramRunnerConfig:
             raise ValueError(
                 "execution-state root and cycle journal must be stable absolute paths"
             )
+        liveness_enabled = self.manager_liveness_socket is not None
+        if liveness_enabled != (self.cell_id is not None):
+            raise ValueError(
+                "Manager liveness socket and cell identity must be configured together"
+            )
+        if liveness_enabled and not self.manager_liveness_socket.is_absolute():
+            raise ValueError("Manager liveness socket must be a stable absolute path")
 
 
 @dataclass(slots=True)
@@ -195,6 +208,20 @@ class ProgramRuntime:
                 maximum_requests=config.maximum_replay_records,
             )
         )
+        self._liveness: ProgramRunnerLivenessReceiver | None = None
+        if config.manager_liveness_socket is not None:
+            if self._journal is None:
+                raise ValueError("Manager liveness requires the durable cycle journal")
+            self._liveness = ProgramRunnerLivenessReceiver(
+                config.manager_liveness_socket,
+                cell_id=config.cell_id or "",
+                receiver_runtime_unit_id=self.owner_id,
+                receiver_runtime_epoch=self.owner_epoch,
+                retained=self._journal.liveness(),
+                on_expiry=self._contain_manager_loss,
+                on_reconciliation=self._reconcile_manager_liveness,
+                cycle_status=self._current_cycle_status_projection,
+            )
         self._owns_headless_client = headless_client is None
         self._headless = headless_client or HeadlessHttpClient(
             config.headless_url,
@@ -223,7 +250,6 @@ class ProgramRuntime:
         self._scene = HeadlessSceneProgramPort(self._headless)
         self._cclc = CCLCProgramTaskPort(
             self._headless,
-            request_owner_epoch=self.owner_epoch,
             maximum_retained_tasks=config.maximum_retained_runs,
         )
         self._assistant = (
@@ -283,6 +309,258 @@ class ProgramRuntime:
         self._stop_replay: dict[tuple[str, str], _EmergencyStopRecord] = {}
         self._started = False
         self._closed = False
+
+    def _require_manager_current(self) -> None:
+        if self._liveness is None:
+            return
+        try:
+            self._liveness.require_current()
+        except ProgramRunnerLivenessError as error:
+            raise ProgramRunnerError(
+                "program_runner_manager_liveness_unavailable", str(error)
+            ) from error
+
+    def _current_cycle_status_projection(self) -> dict[str, Any]:
+        """Project durable cycle facts without claiming current ownership.
+
+        The private liveness probe must remain available while a replacement
+        Runner is fenced, otherwise Manager cannot identify the receiver and
+        deliver the reconciliation heartbeat.  Manager treats this probe as
+        preflight only and publishes readiness after the heartbeat returns a
+        stable current status.
+        """
+        return self.cycle_status()
+
+    def _reconcile_manager_liveness(
+        self,
+        evidence_digest: str,
+        manager_runtime_epoch: str,
+        manager_owner_epoch: str,
+    ) -> None:
+        journal = self._journal
+        admission = self._admission
+        if journal is None or admission is None:
+            raise RuntimeError("Program-cycle recovery owner is unavailable")
+        with self._transition_lock:
+            # The receiver has already validated the Manager's exact
+            # reconciliation digest. Kernel owner rotation has its own
+            # domain-separated evidence.
+            del evidence_digest
+            retained = journal.liveness()
+            liveness_status = (
+                None if self._liveness is None else self._liveness.status()
+            )
+            fault_reference = (
+                None
+                if liveness_status is None
+                else liveness_status.get("fault_reference")
+            )
+            if (
+                not retained.expired
+                and isinstance(fault_reference, str)
+                and fault_reference
+            ):
+                cycle = journal.read()
+                journal.retain_liveness_loss(
+                    manager_runtime_epoch=(
+                        retained.manager_runtime_epoch or "unknown-manager"
+                    ),
+                    manager_owner_epoch=retained.manager_owner_epoch,
+                    fault_reference=fault_reference,
+                    expected_generation=cycle.cycle_generation,
+                )
+            cycle = journal.read()
+            if cycle.state not in {
+                "idle_after_reset",
+                "terminal_awaiting_reset",
+            }:
+                raise RuntimeError(
+                    "active Program cycle is not contained for reconciliation"
+                )
+            if cycle.acquisition_pending is not None:
+                raise RuntimeError(
+                    "unknown Program-cycle acquisition is unresolved"
+                )
+
+            if cycle.claim is None:
+                receipt = admission.recovery_inventory(
+                    owner_epoch=self.owner_epoch
+                )
+            else:
+                receipt = admission.recovery_receipt(
+                    {
+                        "intent": cycle.claim["intent"],
+                        "expected_claim": cycle.claim,
+                        "expected_release": cycle.release_intent,
+                    }
+                )
+            held = receipt.get("held_claims")
+            owners = receipt.get("current_owner_epochs")
+            if (
+                not isinstance(receipt.get("kernel_owner_epoch"), str)
+                or not isinstance(held, list)
+                or not isinstance(owners, list)
+            ):
+                raise RuntimeError("Kernel owner recovery inventory is invalid")
+            program_owners = [
+                owner
+                for owner in owners
+                if isinstance(owner, dict)
+                and owner.get("owner_role") == "program_runner"
+            ]
+            held_program_claims = [
+                claim
+                for claim in held
+                if isinstance(claim, dict)
+                and isinstance(claim.get("intent"), dict)
+                and claim["intent"].get("owner_role") == "program_runner"
+            ]
+            if not program_owners:
+                if (
+                    held_program_claims
+                    or cycle.owner_epoch != self.owner_epoch
+                    or cycle.claim is not None
+                    or cycle.state != "idle_after_reset"
+                    or cycle.reconciliation_required
+                ):
+                    raise RuntimeError(
+                        "absent Program Runner owner is not a clean bootstrap"
+                    )
+            elif len(program_owners) != 1:
+                raise RuntimeError("Kernel Program Runner owner is not exact")
+            elif program_owners[0].get("owner_epoch") == self.owner_epoch:
+                if cycle.owner_epoch != self.owner_epoch:
+                    raise RuntimeError(
+                        "local Program Runner successor is not durable"
+                    )
+                journal.reconcile_liveness(
+                    owner_epoch=self.owner_epoch,
+                    evidence_digest=(
+                        cell_admission_owner_epoch_reconciliation_evidence_digest(
+                            "program_runner", self.owner_epoch
+                        )
+                    ),
+                    require_terminal_release=False,
+                )
+            else:
+                predecessor = program_owners[0].get("owner_epoch")
+                if (
+                    not isinstance(predecessor, str)
+                    or not predecessor
+                    or cycle.owner_epoch not in {predecessor, self.owner_epoch}
+                    or held_program_claims
+                ):
+                    raise RuntimeError(
+                        "predecessor Program Runner ownership is unresolved"
+                    )
+                if cycle.state == "terminal_awaiting_reset":
+                    if (
+                        cycle.claim is None
+                        or cycle.release_intent is None
+                        or receipt.get("status") != "released_exact"
+                        or receipt.get("matched_claim") != cycle.claim
+                        or receipt.get("matched_release")
+                        != cycle.release_intent
+                    ):
+                        raise RuntimeError(
+                            "terminal predecessor release is not exactly recovered"
+                        )
+                elif cycle.claim is not None:
+                    raise RuntimeError(
+                        "idle predecessor retains a Program-cycle claim"
+                    )
+                reconciliation_digest = (
+                    cell_admission_owner_epoch_reconciliation_evidence_digest(
+                        "program_runner", self.owner_epoch
+                    )
+                )
+                journal.reconcile_liveness(
+                    owner_epoch=self.owner_epoch,
+                    evidence_digest=reconciliation_digest,
+                )
+                successor_owners = [
+                    (
+                        {
+                            "owner_role": "program_runner",
+                            "owner_epoch": self.owner_epoch,
+                        }
+                        if owner.get("owner_role") == "program_runner"
+                        else owner
+                    )
+                    for owner in owners
+                ]
+                admission.reconcile(
+                    {
+                        "kernel_owner_epoch": receipt["kernel_owner_epoch"],
+                        "retained_claims": held,
+                        "current_owner_epochs": successor_owners,
+                        "reconciliation_evidence_digest": (
+                            reconciliation_digest
+                        ),
+                    }
+                )
+            journal.retain_liveness_manager(
+                manager_runtime_epoch=manager_runtime_epoch,
+                manager_owner_epoch=manager_owner_epoch,
+            )
+
+    def _contain_manager_loss(self, fault_reference: str) -> str:
+        """Fence first, durably latch loss, then settle the current run."""
+        journal = self._journal
+        if journal is None:
+            return fault_reference
+        with self._transition_lock:
+            try:
+                cycle = journal.read()
+            except Exception:
+                cycle = None
+            try:
+                retained = journal.liveness()
+                if cycle is not None:
+                    journal.retain_liveness_loss(
+                        manager_runtime_epoch=(
+                            retained.manager_runtime_epoch or "unknown-manager"
+                        ),
+                        manager_owner_epoch=retained.manager_owner_epoch,
+                        fault_reference=fault_reference,
+                        expected_generation=cycle.cycle_generation,
+                    )
+            except Exception:
+                # Durable-state failure must not block the independent Stop
+                # path.  The receiver remains fenced and reconciliation cannot
+                # be proven until the journal is available again.
+                pass
+            run_ids: list[str] = []
+            if (
+                cycle is not None
+                and cycle.program_run_id is not None
+                and cycle.state
+                not in {"idle_after_reset", "terminal_awaiting_reset"}
+            ):
+                run_ids.append(cycle.program_run_id)
+            if not run_ids:
+                try:
+                    snapshots, _truncated = self._owner.list_snapshots(
+                        active_only=True,
+                        limit=self.config.maximum_retained_runs,
+                    )
+                    run_ids.extend(
+                        snapshot.capture.program_run_id for snapshot in snapshots
+                    )
+                except Exception:
+                    pass
+            for program_run_id in dict.fromkeys(run_ids):
+                try:
+                    snapshot = self._host.stop_run(
+                        program_run_id,
+                        reason="manager_presence_expired",
+                    )
+                    self._record_terminal_snapshot(snapshot.to_dict())
+                except Exception:
+                    # Reconciliation stays latched and Reset remains
+                    # unavailable whenever containment cannot be proven.
+                    pass
+        return fault_reference
 
     def _build_owner_availability(self) -> dict[str, AvailabilityFact]:
         resolver = build_executable_node_resolver(self._environment)
@@ -385,11 +663,6 @@ class ProgramRuntime:
     def cycle_status(self) -> dict[str, Any]:
         _admission, journal = self._require_cycle_owner()
         cycle = journal.read()
-        if cycle.reconciliation_required or cycle.owner_epoch != self.owner_epoch:
-            raise ProgramRunnerError(
-                "program_cycle_reconciliation_required",
-                "Program-cycle ownership requires authoritative reconciliation",
-            )
         if cycle.acquisition_pending is not None or (
             cycle.claim is None and cycle.state != "idle_after_reset"
         ):
@@ -398,7 +671,7 @@ class ProgramRuntime:
                 "the acquire response was lost before its exact claim was journaled",
             )
         status = ProgramCycleStatusDTO.model_validate({
-            "program_runner_owner_epoch": self.owner_epoch,
+            "program_runner_owner_epoch": cycle.owner_epoch,
             "cycle_generation": cycle.cycle_generation,
             "state": cycle.state,
             "program_run_id": cycle.program_run_id,
@@ -441,6 +714,8 @@ class ProgramRuntime:
         # process disappear.  Manager still needs the health and cycle-status
         # surfaces in order to diagnose and reconcile the retained claim.
         self._host.start()
+        if self._liveness is not None:
+            self._liveness.start()
         self._started = True
 
     def health(self) -> dict[str, Any]:
@@ -454,6 +729,14 @@ class ProgramRuntime:
             "assistant_snapshot_source_available": self._snapshot_source is not None,
             "simulation_control_available": self._simulation_control is not None,
         }
+
+    def liveness_status(self) -> dict[str, Any]:
+        if self._liveness is None:
+            raise ProgramRunnerError(
+                "program_runner_manager_liveness_unavailable",
+                "Manager-presence liveness is not configured for this fixture",
+            )
+        return self._liveness.status()
 
     def runs(self, *, active_only: bool, limit: int) -> dict[str, Any]:
         if self._closed:
@@ -540,7 +823,9 @@ class ProgramRuntime:
                 "program_runner_unavailable",
                 "Program runner is not started",
             )
+        self._require_manager_current()
         with self._transition_lock:
+            self._require_manager_current()
             admission_client, journal = self._require_cycle_owner()
             cycle = journal.read()
             if (
@@ -581,6 +866,11 @@ class ProgramRuntime:
                     )
                 owner_admission = admission_client.get()
                 generation = self._admission_generation(owner_admission)
+                if generation != request.expected_admission_generation:
+                    raise ProgramRunnerError(
+                        "stale_generation",
+                        "Run admission generation changed before claim acquisition",
+                    )
                 applied = self._headless.program_applied()
                 source = applied.get("source")
                 if (
@@ -598,7 +888,10 @@ class ProgramRuntime:
                 live = self._headless.scenario_program_selection(
                     request.scenario_id
                 )
-                if live.get("program_revision") != applied.get("program_revision"):
+                if (
+                    request.draft_program_revision
+                    != applied.get("program_revision")
+                ):
                     raise ProgramRunnerError(
                         "program_run_draft_applied_mismatch",
                         "Draft and Applied Program revisions differ",
@@ -617,7 +910,7 @@ class ProgramRuntime:
                     "expected_admission_generation": generation,
                     "scope": {"resources": [], "configurations": []},
                     "program_cycle_evidence": {
-                        "draft_program_revision": live["program_revision"],
+                        "draft_program_revision": request.draft_program_revision,
                         "applied_program_revision": applied["program_revision"],
                     },
                     "intervention_evidence": None,
@@ -882,7 +1175,9 @@ class ProgramRuntime:
             raise ProgramRunnerError(
                 "program_runner_unavailable", "Program runner is not started"
             )
+        self._require_manager_current()
         with self._transition_lock:
+            self._require_manager_current()
             admission, journal = self._require_cycle_owner()
             cycle = journal.read()
             try:
@@ -921,6 +1216,8 @@ class ProgramRuntime:
                 or cycle.owner_epoch != request.expected_owner_epoch
                 or cycle.program_run_id != request.program_run_id
                 or cycle.terminal_reference != request.terminal_reference
+                or request.settlement_evidence_digest
+                != request.terminal_reference
                 or claim is None
                 or claim.get("claim_generation")
                 != request.expected_claim_generation
@@ -957,12 +1254,24 @@ class ProgramRuntime:
             if (
                 cycle.reconciliation_required
                 or cycle.owner_epoch != self.owner_epoch
-                or intent["owner_epoch"] != self.owner_epoch
             ):
                 reject(
                     ProgramRunnerError(
                         "program_cycle_reconciliation_required",
                         "Reset cannot settle an unreconciled Program-cycle owner",
+                    )
+                )
+            try:
+                journal.remember_release_intent(
+                    expected_generation=cycle.cycle_generation,
+                    claim_generation=claim["claim_generation"],
+                    release=release,
+                )
+            except Exception as error:
+                reject(
+                    ProgramRunnerError(
+                        "program_cycle_journal_invalid",
+                        "Program-cycle release intent was not durably retained",
                     )
                 )
             try:
@@ -1028,6 +1337,11 @@ class ProgramRuntime:
             return
         self._closed = True
         errors: list[Exception] = []
+        if self._liveness is not None:
+            try:
+                self._liveness.close()
+            except Exception as error:
+                errors.append(error)
         if self._started:
             try:
                 # Deliberately does not submit Stop: runner loss cannot mutate

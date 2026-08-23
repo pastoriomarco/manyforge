@@ -14,6 +14,7 @@
 #include <string>
 #include <string_view>
 #include <system_error>
+#include <type_traits>
 #include <tuple>
 #include <utility>
 #include <vector>
@@ -101,6 +102,28 @@ CREATE TABLE lifecycle_transactions (
 ) STRICT;
 CREATE INDEX lifecycle_transaction_terminal_order
   ON lifecycle_transactions(terminal, terminal_sequence);
+CREATE TABLE cclc_lifecycle_cell_claims (
+  lifecycle_transaction_id TEXT PRIMARY KEY,
+  owner_epoch TEXT NOT NULL,
+  request_id TEXT NOT NULL,
+  request_payload_digest TEXT NOT NULL,
+  expected_admission_generation INTEGER NOT NULL,
+  claim_generation INTEGER,
+  acquired_admission_generation INTEGER,
+  accepted_at_ns INTEGER,
+  lifecycle_accepted INTEGER NOT NULL DEFAULT 0 CHECK(lifecycle_accepted IN (0,1)),
+  release_kind INTEGER,
+  release_evidence_digest TEXT,
+  release_receipt_recorded INTEGER NOT NULL DEFAULT 0
+    CHECK(release_receipt_recorded IN (0,1)),
+  CHECK ((claim_generation IS NULL AND acquired_admission_generation IS NULL
+          AND accepted_at_ns IS NULL) OR
+         (claim_generation IS NOT NULL AND acquired_admission_generation IS NOT NULL
+          AND accepted_at_ns IS NOT NULL)),
+  CHECK ((release_kind IS NULL AND release_evidence_digest IS NULL) OR
+         (release_kind IS NOT NULL AND release_evidence_digest IS NOT NULL)),
+  FOREIGN KEY(owner_epoch) REFERENCES cclc_owner_epochs(owner_epoch)
+) STRICT;
 CREATE TABLE cclc_effect_attempts (
   attempt_sequence INTEGER PRIMARY KEY AUTOINCREMENT,
   lifecycle_transaction_id TEXT NOT NULL,
@@ -231,7 +254,12 @@ void Require(bool condition, std::string code, std::string message) {
 template <typename Value>
 [[nodiscard]] Result<Value> AsResult(auto&& function) {
   try {
-    return Result<Value>::Ok(function());
+    if constexpr (std::is_void_v<Value>) {
+      function();
+      return Result<void>::Ok();
+    } else {
+      return Result<Value>::Ok(function());
+    }
   } catch (const JournalFailure& error) {
     return Result<Value>::Err(JournalError(error));
   } catch (const std::exception& error) {
@@ -509,6 +537,7 @@ using SchemaDefinition = std::tuple<std::string, std::string, std::string, std::
       "table:cclc_journal_metadata",
       "table:cclc_owner_epochs",
       "table:cclc_request_memberships",
+      "table:cclc_lifecycle_cell_claims",
       "table:cclc_lifecycle_transaction_identity_guards",
       "table:cclc_route_transaction_identity_guards",
       "table:lifecycle_component_watermarks",
@@ -1232,6 +1261,17 @@ class SqliteCCLCJournal::Impl final {
       const RequestOwnerEpoch& active_owner_epoch, const ComponentLifecycleIntentDTO& intent,
       const ComponentLifecycleAcceptedDTO& candidate_acceptance,
       const ComponentLifecycleStatusDTO& candidate_initial_status);
+  void RecordLifecycleClaimAttempt(const RequestOwnerEpoch&,
+                                   const CellAdmissionClaimIntentDTO&);
+  void RecordLifecycleClaimAcquired(const RequestOwnerEpoch&,
+                                    const CellAdmissionClaimDTO&);
+  void RecordLifecycleClaimReleaseReceipt(
+      const RequestOwnerEpoch&, const CellAdmissionClaimReleaseDTO&,
+      const CellAdmissionRecoveryReceiptDTO&);
+  void RecordUnacceptedLifecycleClaimRelease(
+      const RequestOwnerEpoch&, const CellAdmissionClaimReleaseDTO&);
+  void RecordLifecycleClaimNotAcquired(
+      const RequestOwnerEpoch&, const CellAdmissionClaimIntentDTO&);
 
   std::uint64_t RecordEffectPrepared(const RequestOwnerEpoch& active_owner_epoch,
                                      const CCLCEffectAttemptDTO& prepared_attempt,
@@ -1239,10 +1279,12 @@ class SqliteCCLCJournal::Impl final {
 
   std::uint64_t RecordEffectCompleted(const RequestOwnerEpoch& active_owner_epoch,
                                       const CCLCEffectAttemptDTO& completed_attempt,
-                                      const ComponentLifecycleStatusDTO& successor_status);
+                                      const ComponentLifecycleStatusDTO& successor_status,
+                                      const CellAdmissionClaimReleaseDTO* release = nullptr);
 
   std::uint64_t RecordLifecycleStatus(const RequestOwnerEpoch& active_owner_epoch,
-                                      const ComponentLifecycleStatusDTO& status);
+                                      const ComponentLifecycleStatusDTO& status,
+                                      const CellAdmissionClaimReleaseDTO* release = nullptr);
 
   std::optional<ComponentLifecycleStatusDTO> LoadRetainedLifecycleStatus(
       const LifecycleTransactionId& lifecycle_transaction_id);
@@ -2206,6 +2248,7 @@ CCLCJournalRecoveryDTO SqliteCCLCJournal::Impl::BeginOwnerEpoch(
       {},
       {},
       {},
+      {},
       {}};
 
   Statement watermarks(database_,
@@ -2309,6 +2352,58 @@ CCLCJournalRecoveryDTO SqliteCCLCJournal::Impl::BeginOwnerEpoch(
   while (route_attempts.Step()) {
     recovery.unresolved_route_effect_attempts.push_back(
         detail::DecodeCCLCRouteEffectAttempt(route_attempts.Blob(0)));
+  }
+  Statement lifecycle_claims(
+      database_,
+      "SELECT lifecycle_transaction_id,owner_epoch,request_id,"
+      "request_payload_digest,expected_admission_generation,claim_generation,"
+      "acquired_admission_generation,accepted_at_ns,release_kind,"
+      "release_evidence_digest,release_receipt_recorded,lifecycle_accepted "
+      "FROM cclc_lifecycle_cell_claims WHERE release_receipt_recorded=0 "
+      "ORDER BY rowid");
+  while (lifecycle_claims.Step()) {
+    CellAdmissionClaimIntentDTO intent{
+        CellAdmissionClaimKindDTO::kComponentLifecycle,
+        CellAdmissionOwnerRoleDTO::kComponentLifecycleOwner,
+        RequestOwnerEpoch(lifecycle_claims.Text(1)),
+        lifecycle_claims.Text(0),
+        RequestId(lifecycle_claims.Text(2)),
+        ContentDigest(lifecycle_claims.Text(3)),
+        AdmissionGeneration(Positive(lifecycle_claims.Integer(4),
+                                     "claim admission generation")),
+        {},
+        std::nullopt,
+        std::nullopt};
+    std::optional<CellAdmissionClaimDTO> claim;
+    if (!lifecycle_claims.IsNull(5)) {
+      claim = CellAdmissionClaimDTO{
+          intent,
+          CellAdmissionClaimGeneration(
+              Positive(lifecycle_claims.Integer(5), "claim generation")),
+          AdmissionGeneration(Positive(lifecycle_claims.Integer(6),
+                                       "acquired admission generation")),
+          lifecycle_claims.Integer(7)};
+    }
+    std::optional<CellAdmissionClaimReleaseDTO> release;
+    if (!lifecycle_claims.IsNull(8)) {
+      Require(claim.has_value(), "component_lifecycle_journal_corrupt",
+              "lifecycle release intent has no claim");
+      release = CellAdmissionClaimReleaseDTO{
+          intent.owner_role,
+          intent.owner_epoch,
+          intent.owner_transaction_id,
+          intent.request_id,
+          intent.request_payload_digest,
+          claim->acquired_admission_generation,
+          claim->claim_generation,
+          {static_cast<CellAdmissionSettlementKindDTO>(
+               lifecycle_claims.Integer(8)),
+           ContentDigest(lifecycle_claims.Text(9))}};
+    }
+    recovery.lifecycle_claims.push_back(
+        {std::move(intent), std::move(claim), std::move(release),
+         lifecycle_claims.Integer(10) == 1,
+         lifecycle_claims.Integer(11) == 1});
   }
   Require(recovery.locally_valid(), "component_lifecycle_journal_corrupt",
           "lifecycle journal recovery projection is invalid");
@@ -2422,6 +2517,75 @@ void SqliteCCLCJournal::Impl::RetainCurrentComponentLifecycleFact(
           "current component lifecycle fact replacement returned an unexpected row");
 }
 
+void SqliteCCLCJournal::Impl::RecordLifecycleClaimAttempt(
+    const RequestOwnerEpoch& active_owner_epoch,
+    const CellAdmissionClaimIntentDTO& intent) {
+  Require(ValidateCellAdmissionClaimIntent(intent).ok() &&
+              intent.owner_role == CellAdmissionOwnerRoleDTO::kComponentLifecycleOwner &&
+              intent.owner_epoch == active_owner_epoch,
+          "component_lifecycle_claim_invalid", "lifecycle claim intent is invalid");
+  std::lock_guard lock(mutex_);
+  RequireOpen();
+  Transaction transaction(database_);
+  Require(ActiveOwner(active_owner_epoch),
+          "component_lifecycle_journal_owner_epoch_stale",
+          "lifecycle claim writer does not own the active epoch");
+  Require(ScalarInteger(database_,
+                        "SELECT count(*) FROM cclc_lifecycle_cell_claims") <
+              static_cast<std::int64_t>(kMaximumCellAdmissionClaims),
+          "component_lifecycle_claim_capacity_exhausted",
+          "bounded lifecycle claim journal is full");
+  Statement insert(database_,
+                   "INSERT INTO cclc_lifecycle_cell_claims("
+                   "lifecycle_transaction_id,owner_epoch,request_id,"
+                   "request_payload_digest,expected_admission_generation)"
+                   " VALUES(?,?,?,?,?)");
+  insert.Bind(1, intent.owner_transaction_id);
+  insert.Bind(2, intent.owner_epoch.value());
+  insert.Bind(3, intent.request_id.value());
+  insert.Bind(4, intent.request_payload_digest.value());
+  insert.Bind(5, static_cast<std::int64_t>(
+                     intent.expected_admission_generation.value()));
+  Require(!insert.Step(), "component_lifecycle_claim_conflict",
+          "lifecycle claim attempt was already recorded");
+  transaction.Commit();
+}
+
+void SqliteCCLCJournal::Impl::RecordLifecycleClaimAcquired(
+    const RequestOwnerEpoch& active_owner_epoch,
+    const CellAdmissionClaimDTO& claim) {
+  Require(ValidateCellAdmissionClaimIntent(claim.intent).ok() &&
+              claim.intent.owner_role ==
+                  CellAdmissionOwnerRoleDTO::kComponentLifecycleOwner,
+          "component_lifecycle_claim_invalid", "lifecycle claim is invalid");
+  std::lock_guard lock(mutex_);
+  RequireOpen();
+  Transaction transaction(database_);
+  Require(ActiveOwner(active_owner_epoch),
+          "component_lifecycle_journal_owner_epoch_stale",
+          "lifecycle claim writer does not own the active epoch");
+  Statement update(database_,
+                   "UPDATE cclc_lifecycle_cell_claims SET claim_generation=?,"
+                   "acquired_admission_generation=?,accepted_at_ns=? "
+                   "WHERE lifecycle_transaction_id=? AND owner_epoch=? AND request_id=? "
+                   "AND request_payload_digest=? AND expected_admission_generation=? "
+                   "AND claim_generation IS NULL");
+  update.Bind(1, static_cast<std::int64_t>(claim.claim_generation.value()));
+  update.Bind(2, static_cast<std::int64_t>(
+                     claim.acquired_admission_generation.value()));
+  update.Bind(3, claim.accepted_at_ns);
+  update.Bind(4, claim.intent.owner_transaction_id);
+  update.Bind(5, claim.intent.owner_epoch.value());
+  update.Bind(6, claim.intent.request_id.value());
+  update.Bind(7, claim.intent.request_payload_digest.value());
+  update.Bind(8, static_cast<std::int64_t>(
+                     claim.intent.expected_admission_generation.value()));
+  Require(!update.Step() && sqlite3_changes(database_) == 1,
+          "component_lifecycle_claim_conflict",
+          "exact lifecycle claim does not match its durable attempt");
+  transaction.Commit();
+}
+
 CCLCLifecycleRequestResultDTO SqliteCCLCJournal::Impl::AcceptOrReplayLifecycle(
     const RequestOwnerEpoch& active_owner_epoch, const ComponentLifecycleIntentDTO& intent,
     const ComponentLifecycleAcceptedDTO& candidate_acceptance,
@@ -2454,6 +2618,20 @@ CCLCLifecycleRequestResultDTO SqliteCCLCJournal::Impl::AcceptOrReplayLifecycle(
           "component_lifecycle_journal_record_invalid",
           "unseen lifecycle acceptance candidate is invalid");
   const auto status_blob = detail::EncodeComponentLifecycleStatus(candidate_initial_status);
+  Statement bind_claim(
+      database_,
+      "UPDATE cclc_lifecycle_cell_claims SET lifecycle_accepted=1 "
+      "WHERE lifecycle_transaction_id=? AND owner_epoch=? AND request_id=? "
+      "AND expected_admission_generation=? AND claim_generation IS NOT NULL "
+      "AND lifecycle_accepted=0");
+  bind_claim.Bind(1, candidate_acceptance.lifecycle_transaction_id.value());
+  bind_claim.Bind(2, active_owner_epoch.value());
+  bind_claim.Bind(3, intent.request_context.request_id.value());
+  bind_claim.Bind(
+      4, static_cast<std::int64_t>(intent.expected_admission_generation.value()));
+  Require(!bind_claim.Step() && sqlite3_changes(database_) == 1,
+          "component_lifecycle_claim_missing",
+          "lifecycle acceptance has no exact durable Kernel claim");
 
   Statement capacity(database_,
                      "SELECT request_membership_capacity FROM cclc_owner_epochs "
@@ -3117,7 +3295,8 @@ std::uint64_t SqliteCCLCJournal::Impl::RecordEffectPrepared(
 
 std::uint64_t SqliteCCLCJournal::Impl::RecordEffectCompleted(
     const RequestOwnerEpoch& active_owner_epoch, const CCLCEffectAttemptDTO& completed_attempt,
-    const ComponentLifecycleStatusDTO& successor_status) {
+    const ComponentLifecycleStatusDTO& successor_status,
+    const CellAdmissionClaimReleaseDTO* release) {
   Require(!active_owner_epoch.empty() && completed_attempt.locally_valid() &&
               completed_attempt.state == CCLCEffectAttemptStateDTO::kCompleted &&
               successor_status.locally_valid() &&
@@ -3318,6 +3497,34 @@ std::uint64_t SqliteCCLCJournal::Impl::RecordEffectCompleted(
   Require(!update_status.Step() && sqlite3_changes(database_) == 1,
           "component_lifecycle_journal_corrupt",
           "completed CCLC effect status did not replace one transaction");
+  if (release != nullptr) {
+    Require(Terminal(successor_status) &&
+                ValidateCellAdmissionClaimRelease(*release).ok(),
+            "component_lifecycle_claim_release_invalid",
+            "completed terminal effect has an invalid claim release");
+    Statement retain_release(
+        database_,
+        "UPDATE cclc_lifecycle_cell_claims SET release_kind=?,"
+        "release_evidence_digest=? WHERE lifecycle_transaction_id=? "
+        "AND owner_epoch=? AND request_id=? AND request_payload_digest=? "
+        "AND claim_generation=? AND acquired_admission_generation=? "
+        "AND lifecycle_accepted=1 AND release_kind IS NULL");
+    retain_release.Bind(
+        1, static_cast<std::int64_t>(release->settlement.settlement_kind));
+    retain_release.Bind(2, release->settlement.evidence_digest.value());
+    retain_release.Bind(3, release->owner_transaction_id);
+    retain_release.Bind(4, release->owner_epoch.value());
+    retain_release.Bind(5, release->request_id.value());
+    retain_release.Bind(6, release->request_payload_digest.value());
+    retain_release.Bind(
+        7, static_cast<std::int64_t>(release->claim_generation.value()));
+    retain_release.Bind(
+        8, static_cast<std::int64_t>(
+               release->acquired_admission_generation.value()));
+    Require(!retain_release.Step() && sqlite3_changes(database_) == 1,
+            "component_lifecycle_claim_release_conflict",
+            "completed terminal effect has no exact held claim");
+  }
   RetainCurrentComponentLifecycleFact(successor_status);
   CompactTerminalResults();
   transaction.Commit();
@@ -3325,7 +3532,8 @@ std::uint64_t SqliteCCLCJournal::Impl::RecordEffectCompleted(
 }
 
 std::uint64_t SqliteCCLCJournal::Impl::RecordLifecycleStatus(
-    const RequestOwnerEpoch& active_owner_epoch, const ComponentLifecycleStatusDTO& status) {
+    const RequestOwnerEpoch& active_owner_epoch, const ComponentLifecycleStatusDTO& status,
+    const CellAdmissionClaimReleaseDTO* release) {
   Require(!active_owner_epoch.empty() && status.locally_valid() &&
               status.status_owner_epoch == active_owner_epoch &&
               FitsSqliteInteger(status.status_sequence),
@@ -3486,10 +3694,157 @@ std::uint64_t SqliteCCLCJournal::Impl::RecordLifecycleStatus(
   update.Bind(6, status.acceptance.lifecycle_transaction_id.value());
   Require(!update.Step() && sqlite3_changes(database_) == 1, "component_lifecycle_journal_corrupt",
           "lifecycle status update did not affect exactly one row");
+  if (release != nullptr) {
+    Require(Terminal(status) && ValidateCellAdmissionClaimRelease(*release).ok() &&
+                release->owner_transaction_id ==
+                    status.acceptance.lifecycle_transaction_id.value(),
+            "component_lifecycle_claim_release_invalid",
+            "terminal lifecycle claim release is invalid");
+    Statement retain_release(
+        database_,
+        "UPDATE cclc_lifecycle_cell_claims SET release_kind=?,"
+        "release_evidence_digest=? WHERE lifecycle_transaction_id=? "
+        "AND owner_epoch=? AND request_id=? AND request_payload_digest=? "
+        "AND claim_generation=? AND acquired_admission_generation=? "
+        "AND lifecycle_accepted=1 AND release_kind IS NULL");
+    retain_release.Bind(
+        1, static_cast<std::int64_t>(release->settlement.settlement_kind));
+    retain_release.Bind(2, release->settlement.evidence_digest.value());
+    retain_release.Bind(3, release->owner_transaction_id);
+    retain_release.Bind(4, release->owner_epoch.value());
+    retain_release.Bind(5, release->request_id.value());
+    retain_release.Bind(6, release->request_payload_digest.value());
+    retain_release.Bind(
+        7, static_cast<std::int64_t>(release->claim_generation.value()));
+    retain_release.Bind(
+        8, static_cast<std::int64_t>(
+               release->acquired_admission_generation.value()));
+    Require(!retain_release.Step() && sqlite3_changes(database_) == 1,
+            "component_lifecycle_claim_release_conflict",
+            "terminal lifecycle status has no exact held claim");
+  }
   RetainCurrentComponentLifecycleFact(status);
   CompactTerminalResults();
   transaction.Commit();
   return status.status_sequence;
+}
+
+void SqliteCCLCJournal::Impl::RecordLifecycleClaimReleaseReceipt(
+    const RequestOwnerEpoch& active_owner_epoch,
+    const CellAdmissionClaimReleaseDTO& release,
+    const CellAdmissionRecoveryReceiptDTO& receipt) {
+  const bool released_exact =
+      receipt.status ==
+          CellAdmissionRecoveryReceiptStatusDTO::kReleasedExact &&
+      receipt.matched_release == release;
+  const bool reconciled_exact =
+      receipt.status ==
+          CellAdmissionRecoveryReceiptStatusDTO::kReconciledExact &&
+      receipt.matched_claim.has_value() &&
+      receipt.matched_reconcile_settlement.has_value() &&
+      receipt.matched_reconcile_settlement->predecessor_claim ==
+          *receipt.matched_claim &&
+      receipt.matched_claim->intent.owner_role == release.owner_role &&
+      receipt.matched_claim->intent.owner_epoch == release.owner_epoch &&
+      receipt.matched_claim->intent.owner_transaction_id ==
+          release.owner_transaction_id &&
+      receipt.matched_claim->intent.request_id == release.request_id &&
+      receipt.matched_claim->intent.request_payload_digest ==
+          release.request_payload_digest &&
+      receipt.matched_claim->acquired_admission_generation ==
+          release.acquired_admission_generation &&
+      receipt.matched_claim->claim_generation == release.claim_generation;
+  Require(ValidateCellAdmissionClaimRelease(release).ok() &&
+              ValidateCellAdmissionRecoveryReceipt(receipt).ok() &&
+              (released_exact || reconciled_exact),
+          "component_lifecycle_claim_receipt_invalid",
+          "lifecycle release receipt is not exact");
+  std::lock_guard lock(mutex_);
+  RequireOpen();
+  Transaction transaction(database_);
+  Require(ActiveOwner(active_owner_epoch),
+          "component_lifecycle_journal_owner_epoch_stale",
+          "lifecycle claim receipt writer does not own the active epoch");
+  Statement update(
+      database_,
+      "UPDATE cclc_lifecycle_cell_claims SET release_receipt_recorded=1 "
+      "WHERE lifecycle_transaction_id=? AND owner_epoch=? AND request_id=? "
+      "AND release_kind=? AND release_evidence_digest=? "
+      "AND release_receipt_recorded=0");
+  update.Bind(1, release.owner_transaction_id);
+  update.Bind(2, release.owner_epoch.value());
+  update.Bind(3, release.request_id.value());
+  update.Bind(4,
+              static_cast<std::int64_t>(release.settlement.settlement_kind));
+  update.Bind(5, release.settlement.evidence_digest.value());
+  Require(!update.Step() && sqlite3_changes(database_) == 1,
+          "component_lifecycle_claim_receipt_conflict",
+          "lifecycle release receipt has no matching durable intent");
+  Statement erase_settled(
+      database_,
+      "DELETE FROM cclc_lifecycle_cell_claims WHERE lifecycle_transaction_id=? "
+      "AND release_receipt_recorded=1");
+  erase_settled.Bind(1, release.owner_transaction_id);
+  Require(!erase_settled.Step() && sqlite3_changes(database_) == 1,
+          "component_lifecycle_journal_corrupt",
+          "settled lifecycle claim retirement did not affect exactly one row");
+  transaction.Commit();
+}
+
+void SqliteCCLCJournal::Impl::RecordUnacceptedLifecycleClaimRelease(
+    const RequestOwnerEpoch& active_owner_epoch,
+    const CellAdmissionClaimReleaseDTO& release) {
+  Require(ValidateCellAdmissionClaimRelease(release).ok() &&
+              release.settlement.settlement_kind ==
+                  CellAdmissionSettlementKindDTO::kProvenNoEffect,
+          "component_lifecycle_claim_release_invalid",
+          "unaccepted lifecycle claim release is invalid");
+  std::lock_guard lock(mutex_);
+  RequireOpen();
+  Transaction transaction(database_);
+  Require(ActiveOwner(active_owner_epoch),
+          "component_lifecycle_journal_owner_epoch_stale",
+          "claim recovery writer does not own the active epoch");
+  Statement update(
+      database_,
+      "UPDATE cclc_lifecycle_cell_claims SET release_kind=?,"
+      "release_evidence_digest=? WHERE lifecycle_transaction_id=? "
+      "AND claim_generation=? AND acquired_admission_generation=? "
+      "AND lifecycle_accepted=0 AND release_kind IS NULL");
+  update.Bind(1,
+              static_cast<std::int64_t>(release.settlement.settlement_kind));
+  update.Bind(2, release.settlement.evidence_digest.value());
+  update.Bind(3, release.owner_transaction_id);
+  update.Bind(4,
+              static_cast<std::int64_t>(release.claim_generation.value()));
+  update.Bind(
+      5, static_cast<std::int64_t>(
+             release.acquired_admission_generation.value()));
+  Require(!update.Step() && sqlite3_changes(database_) == 1,
+          "component_lifecycle_claim_release_conflict",
+          "unaccepted lifecycle claim release has no exact claim");
+  transaction.Commit();
+}
+
+void SqliteCCLCJournal::Impl::RecordLifecycleClaimNotAcquired(
+    const RequestOwnerEpoch& active_owner_epoch,
+    const CellAdmissionClaimIntentDTO& intent) {
+  std::lock_guard lock(mutex_);
+  RequireOpen();
+  Transaction transaction(database_);
+  Require(ActiveOwner(active_owner_epoch),
+          "component_lifecycle_journal_owner_epoch_stale",
+          "claim recovery writer does not own the active epoch");
+  Statement update(
+      database_,
+      "DELETE FROM cclc_lifecycle_cell_claims "
+      "WHERE lifecycle_transaction_id=? AND claim_generation IS NULL "
+      "AND lifecycle_accepted=0 AND release_receipt_recorded=0");
+  update.Bind(1, intent.owner_transaction_id);
+  Require(!update.Step() && sqlite3_changes(database_) == 1,
+          "component_lifecycle_claim_receipt_conflict",
+          "not-acquired receipt has no exact durable attempt");
+  transaction.Commit();
 }
 
 std::optional<ComponentLifecycleStatusDTO> SqliteCCLCJournal::Impl::LoadRetainedLifecycleStatus(
@@ -4359,6 +4714,18 @@ void SqliteCCLCJournal::Impl::CompactTerminalResults(std::size_t prospective_ter
     Require(request_kind == "component_lifecycle" || request_kind == "route_selection",
             "component_lifecycle_journal_corrupt",
             "oldest terminal CCLC result has an invalid request kind");
+    if (request_kind == "component_lifecycle") {
+      Statement erase_claim(
+          database_,
+          "DELETE FROM cclc_lifecycle_cell_claims WHERE "
+          "lifecycle_transaction_id=(SELECT lifecycle_transaction_id FROM "
+          "lifecycle_transactions WHERE transaction_sequence=?) "
+          "AND release_receipt_recorded=1");
+      erase_claim.Bind(1, static_cast<std::int64_t>(sequence));
+      Require(!erase_claim.Step(),
+              "component_lifecycle_journal_corrupt",
+              "terminal lifecycle claim retirement returned a row");
+    }
     Statement erase(database_,
                     request_kind == "component_lifecycle"
                         ? "DELETE FROM lifecycle_transactions WHERE transaction_sequence=?"
@@ -4409,6 +4776,49 @@ Result<CCLCLifecycleRequestResultDTO> SqliteCCLCJournal::AcceptOrReplayLifecycle
   });
 }
 
+Result<void> SqliteCCLCJournal::RecordLifecycleClaimAttempt(
+    const RequestOwnerEpoch& owner, const CellAdmissionClaimIntentDTO& intent) {
+  return AsResult<void>(
+      [&]() { impl_->RecordLifecycleClaimAttempt(owner, intent); });
+}
+
+Result<void> SqliteCCLCJournal::RecordLifecycleClaimAcquired(
+    const RequestOwnerEpoch& owner, const CellAdmissionClaimDTO& claim) {
+  return AsResult<void>(
+      [&]() { impl_->RecordLifecycleClaimAcquired(owner, claim); });
+}
+
+Result<std::uint64_t>
+SqliteCCLCJournal::RecordLifecycleTerminalAndClaimRelease(
+    const RequestOwnerEpoch& owner, const ComponentLifecycleStatusDTO& status,
+    const CellAdmissionClaimReleaseDTO& release) {
+  return AsResult<std::uint64_t>(
+      [&]() { return impl_->RecordLifecycleStatus(owner, status, &release); });
+}
+
+Result<void> SqliteCCLCJournal::RecordLifecycleClaimReleaseReceipt(
+    const RequestOwnerEpoch& owner,
+    const CellAdmissionClaimReleaseDTO& release,
+    const CellAdmissionRecoveryReceiptDTO& receipt) {
+  return AsResult<void>([&]() {
+    impl_->RecordLifecycleClaimReleaseReceipt(owner, release, receipt);
+  });
+}
+
+Result<void> SqliteCCLCJournal::RecordUnacceptedLifecycleClaimRelease(
+    const RequestOwnerEpoch& owner,
+    const CellAdmissionClaimReleaseDTO& release) {
+  return AsResult<void>(
+      [&]() { impl_->RecordUnacceptedLifecycleClaimRelease(owner, release); });
+}
+
+Result<void> SqliteCCLCJournal::RecordLifecycleClaimNotAcquired(
+    const RequestOwnerEpoch& owner,
+    const CellAdmissionClaimIntentDTO& intent) {
+  return AsResult<void>(
+      [&]() { impl_->RecordLifecycleClaimNotAcquired(owner, intent); });
+}
+
 Result<std::uint64_t> SqliteCCLCJournal::RecordEffectPrepared(
     const RequestOwnerEpoch& active_owner_epoch, const CCLCEffectAttemptDTO& prepared_attempt,
     const ComponentLifecycleStatusDTO& successor_status) {
@@ -4422,6 +4832,18 @@ Result<std::uint64_t> SqliteCCLCJournal::RecordEffectCompleted(
     const ComponentLifecycleStatusDTO& successor_status) {
   return AsResult<std::uint64_t>([&]() {
     return impl_->RecordEffectCompleted(active_owner_epoch, completed_attempt, successor_status);
+  });
+}
+
+Result<std::uint64_t>
+SqliteCCLCJournal::RecordEffectCompletedAndLifecycleClaimRelease(
+    const RequestOwnerEpoch& owner,
+    const CCLCEffectAttemptDTO& completed_attempt,
+    const ComponentLifecycleStatusDTO& status,
+    const CellAdmissionClaimReleaseDTO& release) {
+  return AsResult<std::uint64_t>([&]() {
+    return impl_->RecordEffectCompleted(owner, completed_attempt, status,
+                                        &release);
   });
 }
 
@@ -4507,6 +4929,327 @@ SqliteCCLCJournal::LoadCurrentActiveControlConfiguration(const ControlDomainId& 
 
 void SqliteCCLCJournal::Close() {
   impl_->Close();
+}
+
+Result<void> ValidateLifecycleCellAdmissionSettlementReadOnly(
+    const std::filesystem::path& database_path, const CellId& cell_id,
+    const CellAdmissionClaimDTO& claim,
+    const CellAdmissionClaimReleaseDTO& release) {
+  return AsResult<void>([&]() {
+    Require(!database_path.empty() && !cell_id.empty() &&
+                ValidateCellAdmissionClaimIntent(claim.intent).ok() &&
+                claim.claim_generation.nonzero() &&
+                claim.acquired_admission_generation.nonzero() &&
+                ValidateCellAdmissionClaimRelease(release).ok() &&
+                claim.intent.claim_kind ==
+                    CellAdmissionClaimKindDTO::kComponentLifecycle &&
+                claim.intent.owner_role ==
+                    CellAdmissionOwnerRoleDTO::kComponentLifecycleOwner &&
+                release.owner_role == claim.intent.owner_role &&
+                release.owner_epoch == claim.intent.owner_epoch &&
+                release.owner_transaction_id ==
+                    claim.intent.owner_transaction_id &&
+                release.request_id == claim.intent.request_id &&
+                release.request_payload_digest ==
+                    claim.intent.request_payload_digest &&
+                release.acquired_admission_generation ==
+                    claim.acquired_admission_generation &&
+                release.claim_generation == claim.claim_generation,
+            "component_lifecycle_claim_settlement_invalid",
+            "lifecycle settlement does not identify one exact held claim");
+    sqlite3* raw = nullptr;
+    const auto path = database_path.string();
+    const int opened = sqlite3_open_v2(
+        path.c_str(), &raw,
+        SQLITE_OPEN_READONLY | SQLITE_OPEN_NOMUTEX | SQLITE_OPEN_NOFOLLOW,
+        nullptr);
+    if (opened != SQLITE_OK) {
+      const auto detail = SqliteDetail(raw, opened);
+      if (raw != nullptr) sqlite3_close(raw);
+      Fail("component_lifecycle_journal_storage_failure",
+           "open lifecycle settlement journal read-only: " + detail);
+    }
+    std::unique_ptr<sqlite3, decltype(&sqlite3_close)> database(raw,
+                                                               sqlite3_close);
+    Check(database.get(), sqlite3_busy_timeout(database.get(),
+                                               kBusyTimeoutMilliseconds),
+          "configure lifecycle settlement read timeout");
+    Exec(database.get(), "PRAGMA query_only=ON");
+    Statement application(database.get(), "PRAGMA application_id");
+    Require(application.Step() &&
+                application.Integer(0) == kCCLCJournalSqliteApplicationId &&
+                !application.Step(),
+            "component_lifecycle_journal_corrupt",
+            "lifecycle settlement journal application identity differs");
+    Statement metadata(
+        database.get(),
+        "SELECT schema_id,schema_version,cell_id FROM cclc_journal_metadata "
+        "WHERE singleton=1");
+    Require(metadata.Step() && metadata.Text(0) == kCCLCJournalSchemaId &&
+                metadata.Integer(1) == kCCLCJournalSchemaVersion &&
+                metadata.Text(2) == cell_id.value() && !metadata.Step(),
+            "component_lifecycle_journal_corrupt",
+            "lifecycle settlement journal metadata differs");
+    Statement row(
+        database.get(),
+        "SELECT c.owner_epoch,c.request_id,c.request_payload_digest,"
+        "c.expected_admission_generation,c.claim_generation,"
+        "c.acquired_admission_generation,c.accepted_at_ns,"
+        "c.lifecycle_accepted,c.release_kind,c.release_evidence_digest,"
+        "c.release_receipt_recorded,t.terminal,t.status_blob,"
+        "(SELECT count(*) FROM cclc_effect_attempts e WHERE "
+        "e.lifecycle_transaction_id=c.lifecycle_transaction_id AND "
+        "e.completed_attempt_blob IS NULL) "
+        "FROM cclc_lifecycle_cell_claims c JOIN lifecycle_transactions t "
+        "ON t.lifecycle_transaction_id=c.lifecycle_transaction_id "
+        "WHERE c.lifecycle_transaction_id=?");
+    row.Bind(1, claim.intent.owner_transaction_id);
+    Require(row.Step(), "component_lifecycle_claim_settlement_missing",
+            "lifecycle settlement has no exact owner record");
+    const auto status = detail::DecodeComponentLifecycleStatus(row.Blob(12));
+    Require(row.Text(0) == claim.intent.owner_epoch.value() &&
+                row.Text(1) == claim.intent.request_id.value() &&
+                row.Text(2) == claim.intent.request_payload_digest.value() &&
+                row.Integer(3) == static_cast<std::int64_t>(
+                                      claim.intent.expected_admission_generation.value()) &&
+                row.Integer(4) ==
+                    static_cast<std::int64_t>(claim.claim_generation.value()) &&
+                row.Integer(5) == static_cast<std::int64_t>(
+                                      claim.acquired_admission_generation.value()) &&
+                row.Integer(6) == claim.accepted_at_ns && row.Integer(7) == 1 &&
+                row.Integer(8) == static_cast<std::int64_t>(
+                                      release.settlement.settlement_kind) &&
+                row.Text(9) == release.settlement.evidence_digest.value() &&
+                row.Integer(10) == 0 && row.Integer(11) == 1 &&
+                row.Integer(13) == 0 && TerminalStatusIsQuiescent(status) &&
+                release.settlement.evidence_digest.value() ==
+                    detail::ComponentLifecycleStatusReleasePreconditionDigest(
+                        status) &&
+                !row.Step(),
+            "component_lifecycle_claim_settlement_invalid",
+            "lifecycle settlement is not proven by exact terminal owner evidence");
+  });
+}
+
+Result<CellAdmissionReconcileValidationDTO>
+ValidateLifecycleCellAdmissionReconciliationReadOnly(
+    const std::filesystem::path& database_path, const CellId& cell_id,
+    const std::vector<CellAdmissionClaimDTO>& held_claims,
+    const std::vector<CellAdmissionCurrentOwnerEpochDTO>& current_owner_epochs,
+    const CellAdmissionReconcileDTO& reconcile) {
+  return AsResult<CellAdmissionReconcileValidationDTO>([&]() {
+    const auto lifecycle_owner = std::find_if(
+        reconcile.current_owner_epochs.begin(),
+        reconcile.current_owner_epochs.end(), [](const auto& owner) {
+          return owner.owner_role ==
+                 CellAdmissionOwnerRoleDTO::kComponentLifecycleOwner;
+        });
+    const auto expected_evidence =
+        lifecycle_owner == reconcile.current_owner_epochs.end()
+            ? Result<ContentDigest>::Err(
+                  ErrorDTO{"invalid_request", "CCLC owner is absent", {}})
+            : CellAdmissionOwnerEpochReconciliationEvidenceDigest(
+                  lifecycle_owner->owner_role, lifecycle_owner->owner_epoch);
+    const bool owners_canonical =
+        std::is_sorted(
+            reconcile.current_owner_epochs.begin(),
+            reconcile.current_owner_epochs.end(),
+            [](const auto& left, const auto& right) {
+              return std::tie(left.owner_role, left.owner_epoch) <
+                     std::tie(right.owner_role, right.owner_epoch);
+            }) &&
+        std::adjacent_find(
+            reconcile.current_owner_epochs.begin(),
+            reconcile.current_owner_epochs.end(),
+            [](const auto& left, const auto& right) {
+              return left.owner_role == right.owner_role;
+            }) == reconcile.current_owner_epochs.end();
+    const bool claims_canonical =
+        std::is_sorted(
+            held_claims.begin(), held_claims.end(),
+            [](const auto& left, const auto& right) {
+              return left.claim_generation < right.claim_generation;
+            }) &&
+        std::adjacent_find(
+            held_claims.begin(), held_claims.end(),
+            [](const auto& left, const auto& right) {
+              return left.claim_generation == right.claim_generation;
+            }) == held_claims.end();
+    Require(!database_path.empty() && !cell_id.empty() &&
+                held_claims == reconcile.retained_claims &&
+                owners_canonical && claims_canonical &&
+                std::all_of(
+                    reconcile.current_owner_epochs.begin(),
+                    reconcile.current_owner_epochs.end(),
+                    [](const auto& owner) {
+                      return !to_string(owner.owner_role).empty() &&
+                             !owner.owner_epoch.empty();
+                    }) &&
+                lifecycle_owner != reconcile.current_owner_epochs.end() &&
+                !lifecycle_owner->owner_epoch.empty() &&
+                expected_evidence.ok() &&
+                reconcile.reconciliation_evidence_digest ==
+                    expected_evidence.value(),
+            "component_lifecycle_claim_reconciliation_invalid",
+            "lifecycle reconciliation identity or inventory is not exact");
+    for (const auto& owner : current_owner_epochs) {
+      if (owner.owner_role ==
+          CellAdmissionOwnerRoleDTO::kComponentLifecycleOwner) {
+        continue;
+      }
+      Require(std::find(reconcile.current_owner_epochs.begin(),
+                        reconcile.current_owner_epochs.end(), owner) !=
+                  reconcile.current_owner_epochs.end(),
+              "component_lifecycle_claim_reconciliation_unsupported",
+              "CCLC reconciliation omitted another current owner");
+    }
+    for (const auto& owner : reconcile.current_owner_epochs) {
+      if (owner.owner_role ==
+          CellAdmissionOwnerRoleDTO::kComponentLifecycleOwner) {
+        continue;
+      }
+      Require(std::find(current_owner_epochs.begin(),
+                        current_owner_epochs.end(), owner) !=
+                  current_owner_epochs.end(),
+              "component_lifecycle_claim_reconciliation_unsupported",
+              "CCLC evidence cannot install or replace another owner");
+    }
+
+    sqlite3* raw = nullptr;
+    const auto path = database_path.string();
+    const int opened = sqlite3_open_v2(
+        path.c_str(), &raw,
+        SQLITE_OPEN_READONLY | SQLITE_OPEN_NOMUTEX | SQLITE_OPEN_NOFOLLOW,
+        nullptr);
+    if (opened != SQLITE_OK) {
+      const auto detail = SqliteDetail(raw, opened);
+      if (raw != nullptr) sqlite3_close(raw);
+      Fail("component_lifecycle_journal_storage_failure",
+           "open lifecycle reconciliation journal read-only: " + detail);
+    }
+    std::unique_ptr<sqlite3, decltype(&sqlite3_close)> database(raw,
+                                                               sqlite3_close);
+    Check(database.get(), sqlite3_busy_timeout(database.get(),
+                                               kBusyTimeoutMilliseconds),
+          "configure lifecycle reconciliation read timeout");
+    Exec(database.get(), "PRAGMA query_only=ON");
+    Exec(database.get(), "BEGIN");
+    Statement application(database.get(), "PRAGMA application_id");
+    Require(application.Step() &&
+                application.Integer(0) == kCCLCJournalSqliteApplicationId &&
+                !application.Step(),
+            "component_lifecycle_journal_corrupt",
+            "lifecycle reconciliation journal application identity differs");
+    Statement metadata(
+        database.get(),
+        "SELECT schema_id,schema_version,cell_id FROM cclc_journal_metadata "
+        "WHERE singleton=1");
+    Require(metadata.Step() && metadata.Text(0) == kCCLCJournalSchemaId &&
+                metadata.Integer(1) == kCCLCJournalSchemaVersion &&
+                metadata.Text(2) == cell_id.value() && !metadata.Step(),
+            "component_lifecycle_journal_corrupt",
+            "lifecycle reconciliation journal metadata differs");
+    Statement active_owner(
+        database.get(),
+        "SELECT owner_epoch FROM cclc_owner_epochs WHERE active=1");
+    Require(active_owner.Step() &&
+                active_owner.Text(0) == lifecycle_owner->owner_epoch.value() &&
+                !active_owner.Step(),
+            "component_lifecycle_journal_owner_epoch_stale",
+            "lifecycle reconciliation successor is not the exact active owner");
+    Statement unresolved(
+        database.get(),
+        "SELECT "
+        "(SELECT count(*) FROM cclc_effect_attempts "
+        " WHERE completed_attempt_blob IS NULL),"
+        "(SELECT count(*) FROM cclc_route_effect_attempts "
+        " WHERE completed_attempt_blob IS NULL),"
+        "(SELECT count(*) FROM lifecycle_transactions "
+        " WHERE terminal=0),"
+        "(SELECT count(*) FROM route_selection_transactions "
+        " WHERE terminal=0)");
+    Require(unresolved.Step() && unresolved.Integer(0) == 0 &&
+                unresolved.Integer(1) == 0 && unresolved.Integer(2) == 0 &&
+                unresolved.Integer(3) == 0 && !unresolved.Step(),
+            "component_lifecycle_claim_reconciliation_unresolved",
+            "CCLC durable physical effects are unresolved");
+
+    CellAdmissionReconcileValidationDTO validation{
+        reconcile.current_owner_epochs, {}};
+    for (const auto& claim : held_claims) {
+      const auto current = std::find_if(
+          reconcile.current_owner_epochs.begin(),
+          reconcile.current_owner_epochs.end(), [&](const auto& owner) {
+            return owner.owner_role == claim.intent.owner_role;
+          });
+      Require(ValidateCellAdmissionClaimIntent(claim.intent).ok() &&
+                  claim.claim_generation.nonzero() &&
+                  claim.acquired_admission_generation.nonzero() &&
+                  claim.accepted_at_ns >= 0 &&
+                  current != reconcile.current_owner_epochs.end(),
+              "component_lifecycle_claim_reconciliation_invalid",
+              "held claim has no exact current owner membership");
+      if (claim.intent.owner_role !=
+          CellAdmissionOwnerRoleDTO::kComponentLifecycleOwner) {
+        Require(current->owner_epoch == claim.intent.owner_epoch,
+                "component_lifecycle_claim_reconciliation_unsupported",
+                "CCLC evidence cannot replace another durable owner");
+        continue;
+      }
+      if (current->owner_epoch == claim.intent.owner_epoch) {
+        continue;
+      }
+      Statement row(
+          database.get(),
+          "SELECT c.owner_epoch,c.request_id,c.request_payload_digest,"
+          "c.expected_admission_generation,c.claim_generation,"
+          "c.acquired_admission_generation,c.accepted_at_ns,"
+          "c.lifecycle_accepted,c.release_kind,c.release_evidence_digest,"
+          "c.release_receipt_recorded,t.terminal,t.status_blob,"
+          "(SELECT count(*) FROM cclc_effect_attempts e WHERE "
+          "e.lifecycle_transaction_id=c.lifecycle_transaction_id AND "
+          "e.completed_attempt_blob IS NULL) "
+          "FROM cclc_lifecycle_cell_claims c JOIN lifecycle_transactions t "
+          "ON t.lifecycle_transaction_id=c.lifecycle_transaction_id "
+          "WHERE c.lifecycle_transaction_id=?");
+      row.Bind(1, claim.intent.owner_transaction_id);
+      Require(row.Step() && !row.IsNull(8) && !row.IsNull(9),
+              "component_lifecycle_claim_reconciliation_missing",
+              "held lifecycle claim has no durable terminal settlement");
+      const auto settlement_kind =
+          static_cast<CellAdmissionSettlementKindDTO>(row.Integer(8));
+      const auto status = detail::DecodeComponentLifecycleStatus(row.Blob(12));
+      Require(row.Text(0) == claim.intent.owner_epoch.value() &&
+                  row.Text(1) == claim.intent.request_id.value() &&
+                  row.Text(2) == claim.intent.request_payload_digest.value() &&
+                  row.Integer(3) == static_cast<std::int64_t>(
+                                        claim.intent.expected_admission_generation.value()) &&
+                  row.Integer(4) == static_cast<std::int64_t>(
+                                        claim.claim_generation.value()) &&
+                  row.Integer(5) == static_cast<std::int64_t>(
+                                        claim.acquired_admission_generation.value()) &&
+                  row.Integer(6) == claim.accepted_at_ns &&
+                  row.Integer(7) == 1 &&
+                  (settlement_kind ==
+                       CellAdmissionSettlementKindDTO::kTerminalEffectsSettled ||
+                   settlement_kind ==
+                       CellAdmissionSettlementKindDTO::kProvenNoEffect) &&
+                  row.Integer(10) == 0 && row.Integer(11) == 1 &&
+                  row.Integer(13) == 0 && TerminalStatusIsQuiescent(status) &&
+                  row.Text(9) ==
+                      detail::ComponentLifecycleStatusReleasePreconditionDigest(
+                          status) &&
+                  !row.Step(),
+              "component_lifecycle_claim_reconciliation_invalid",
+              "held lifecycle settlement differs from durable owner facts");
+      validation.settlements.push_back(
+          {claim, current->owner_role, current->owner_epoch,
+           CellAdmissionSettlementKindDTO::kReconciled,
+           reconcile.reconciliation_evidence_digest});
+    }
+    Exec(database.get(), "COMMIT");
+    return validation;
+  });
 }
 
 }  // namespace manyforge::core

@@ -83,6 +83,20 @@ def test_native_commands_retain_four_owner_entrypoints(tmp_path: Path):
     )
     assert "--port 9010" in commands[1]
     assert "--port 9011" in commands[2]
+    expected_liveness = str(
+        config.manager_state_root / "program-runner-liveness.sock"
+    )
+    assert (
+        specs[0].argv[
+            specs[0].argv.index("--program-runner-liveness-socket") + 1
+        ]
+        == expected_liveness
+    )
+    assert (
+        specs[2].argv[specs[2].argv.index("--manager-liveness-socket") + 1]
+        == expected_liveness
+    )
+    assert specs[2].argv[specs[2].argv.index("--cell-id") + 1] == config.cell_id
     assert "--port 9000" in commands[3]
     assert all("--apply" not in spec.argv and "--run" not in spec.argv for spec in specs)
     assert all(

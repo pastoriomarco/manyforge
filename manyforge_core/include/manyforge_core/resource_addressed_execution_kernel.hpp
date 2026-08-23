@@ -178,6 +178,15 @@ struct ResourceAddressedExecutionKernelConfig final {
   /// Construction-fixed current-facts owner. It reads only owner-issued
   /// immutable facts; callers cannot supply recovery evidence.
   StopFaultRecoveryFactsResolver stop_fault_recovery_facts_resolver;
+  /// Exact retained descriptor identity used only when the Kernel is
+  /// bootstrapped with no runtime participants. It must be supplied together
+  /// with `empty_runtime_graph_revision`; participant-backed configurations
+  /// derive both identities from the verified registrations.
+  std::optional<RetainedBundleId> empty_runtime_retained_bundle_id;
+  /// Exact graph identity paired with `empty_runtime_retained_bundle_id` for
+  /// an empty-runtime bootstrap. It is never a constraint on later non-empty
+  /// participant reconfiguration.
+  std::optional<GraphRevision> empty_runtime_graph_revision;
   std::size_t cell_admission_claim_capacity{1024U};
   CellAdmissionInterventionValidator cell_admission_intervention_validator;
   CellAdmissionSettlementValidator cell_admission_settlement_validator;

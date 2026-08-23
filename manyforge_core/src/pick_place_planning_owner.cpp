@@ -348,7 +348,8 @@ struct ResolvedPickOffsetBases final {
           CarriedObjectAttachmentId("carried:" + intent.sequence_id),
           intent.selected_object_id, carrier_binding.controllable_component_id,
           carrier_binding.command_target_id, intent.carrier_frame_role_id,
-          std::move(roles), std::move(structural_revisions)}};
+          std::move(roles), std::move(structural_revisions)},
+      std::nullopt};
 }
 
 [[nodiscard]] SceneTransactionRequestDTO detach_request(
@@ -366,7 +367,8 @@ struct ResolvedPickOffsetBases final {
       DetachCarriedObjectRequestDTO{
           attachment.carried_object_attachment_id,
           attachment.carried_object_attachment_revision, Pose3DTO{},
-          ToSceneTransactionFrameRef(attachment.carrier_frame_ref)}};
+          ToSceneTransactionFrameRef(attachment.carrier_frame_ref)},
+      std::nullopt};
 }
 
 }  // namespace

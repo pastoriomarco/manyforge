@@ -39,6 +39,7 @@ CreateRetainedNativeCCLCRuntime(
     std::vector<core::BrandLifecyclePortRegistrationDTO> brand_ports,
     std::vector<core::RuntimeParticipantBinding> physical_bindings,
     core::ICCLCKernelDisableHandoffPort &kernel_disable_handoff_port,
+    core::IKernelCellAdmissionPort &kernel_cell_admission_port,
     core::ICCLCKernelRouteConfigurationFencePort &kernel_route_fence_port,
     deployment::IRouteConfigurationKernelPublicationOwner
         &kernel_publication_owner,
@@ -64,6 +65,7 @@ CreateRetainedNativeCCLCRuntime(
     std::vector<core::BrandLifecyclePortRegistrationDTO> brand_ports,
     RetainedNativeRuntime &runtime,
     core::ICCLCKernelDisableHandoffPort &kernel_disable_handoff_port,
+    core::IKernelCellAdmissionPort &kernel_cell_admission_port,
     core::ICCLCKernelRouteConfigurationFencePort &kernel_route_fence_port,
     RetainedExternallyManagedDomainSnapshotSource
         externally_managed_controller_snapshot_source = {});

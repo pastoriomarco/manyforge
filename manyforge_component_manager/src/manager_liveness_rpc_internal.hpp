@@ -12,10 +12,22 @@
 
 namespace manyforge::component_manager::detail {
 
+class ManagerLivenessRpcRejection final : public std::invalid_argument {
+ public:
+  explicit ManagerLivenessRpcRejection(std::string reason);
+
+  [[nodiscard]] const std::string& reason() const noexcept { return reason_; }
+
+ private:
+  std::string reason_;
+};
+
 inline constexpr std::string_view kManagerLivenessRequestTag =
     "manyforge.manager-liveness.request.v1";
 inline constexpr std::string_view kManagerLivenessResponseTag =
     "manyforge.manager-liveness.response.v1";
+inline constexpr std::string_view kManagerLivenessRejectionTag =
+    "manyforge.manager-liveness.rejected.v1";
 inline constexpr std::size_t kMaximumManagerLivenessRpcPacketBytes = 16U * 1024U;
 
 enum class ManagerLivenessCommandClass {
@@ -48,6 +60,12 @@ class ManagerLivenessCommandAdmission final {
 
   [[nodiscard]] bool Allows(const ManagerLivenessCommandClass command) const {
     return command != ManagerLivenessCommandClass::kEffectful || open();
+  }
+
+  void CloseForRequiredSetRebind() {
+    std::lock_guard lock(mutex_);
+    open_ = false;
+    ++generation_;
   }
 
   [[nodiscard]] manyforge::core::ContentDigest CloseAndAttest(
@@ -144,5 +162,7 @@ DecodeManagerLivenessRpcRequest(std::string_view bytes);
     const manyforge::core::ManagerLivenessObservationDTO& response);
 [[nodiscard]] manyforge::core::ManagerLivenessObservationDTO
 DecodeManagerLivenessRpcResponse(std::string_view bytes);
+[[nodiscard]] std::string EncodeManagerLivenessRpcRejection(
+    std::string_view reason);
 
 }  // namespace manyforge::component_manager::detail

@@ -19,7 +19,7 @@ export function ProgramRuntimePanel({
   enabled,
   controller,
 }: ProgramRuntimePanelProps) {
-  const { state, active, refresh, run, stop } = controller;
+  const { state, cycleState, refresh, run, stop, reset } = controller;
   const canStop = state.run?.state === 'running'
     || state.run?.state === 'intervention_required';
 
@@ -59,9 +59,7 @@ export function ProgramRuntimePanel({
             <strong>{state.applied?.programId ?? 'none'}</strong>
             <small>
               {state.applied
-                ? active
-                  ? `Selection for the next Run · ${shortIdentity(state.applied.programRevision)}`
-                  : `${state.applied.scenarioId} · ${shortIdentity(state.applied.programRevision)}`
+                ? `${state.applied.scenarioId} · ${shortIdentity(state.applied.programRevision)}`
                 : 'Apply a validated Draft before Run.'}
             </small>
             {state.applied && (
@@ -133,6 +131,15 @@ export function ProgramRuntimePanel({
           <span>{state.error}</span>
         </div>
       )}
+      {cycleState === 'terminal_awaiting_reset' && (
+        <button
+          type="button"
+          disabled={!enabled || state.pending !== null}
+          onClick={() => { void reset(); }}
+        >
+          {state.pending === 'reset' ? 'Resetting…' : 'Reset Program cycle'}
+        </button>
+      )}
 
       <div className="program-runtime-actions">
         <button
@@ -141,8 +148,8 @@ export function ProgramRuntimePanel({
             !enabled
             || !state.runnerAvailable
             || state.applied === null
-            || active
             || state.pending !== null
+            || cycleState !== 'idle_after_reset'
           }
           onClick={() => { void run(); }}
         >

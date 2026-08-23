@@ -123,6 +123,8 @@ ApplyIntent(const deployment::RetainedBundle &bundle) {
       },
       bundle.retained_bundle_id(),
       graph.graph_revision,
+      AdmissionGeneration(7U),
+      std::nullopt,
   };
 }
 
@@ -773,6 +775,86 @@ public:
   bool foreign_response{false};
   int calls{0};
   std::optional<ManagerSelectedRuntimeCompositionRequestDTO> last_request;
+};
+
+class ScriptedCellAdmissionPort final : public core::IKernelCellAdmissionPort {
+public:
+  [[nodiscard]] core::AuthoringAdmissionDTO
+  GetAuthoringAdmission() const override {
+    return {held_claim_.has_value() ? false : true,
+            core::AdmissionGeneration(generation_)};
+  }
+
+  [[nodiscard]] core::Result<core::AuthoringAdmissionDTO>
+  UpdateCellAdmissionReadiness(
+      const core::CellAdmissionReadinessSnapshotDTO &) override {
+    return core::Result<core::AuthoringAdmissionDTO>::Ok(
+        GetAuthoringAdmission());
+  }
+
+  [[nodiscard]] core::Result<core::CellAdmissionClaimDTO>
+  AcquireCellAdmissionClaim(
+      const core::CellAdmissionClaimIntentDTO &intent) override {
+    if (!held_claim_.has_value()) {
+      held_claim_ = core::CellAdmissionClaimDTO{
+          intent, core::CellAdmissionClaimGeneration(1U),
+          intent.expected_admission_generation, 1};
+      ++generation_;
+    }
+    return core::Result<core::CellAdmissionClaimDTO>::Ok(*held_claim_);
+  }
+
+  [[nodiscard]] core::Result<core::AuthoringAdmissionDTO>
+  ReleaseCellAdmissionClaim(
+      const core::CellAdmissionClaimReleaseDTO &release) override {
+    last_release = release;
+    released_claim_ = held_claim_;
+    held_claim_.reset();
+    ++generation_;
+    return core::Result<core::AuthoringAdmissionDTO>::Ok(
+        GetAuthoringAdmission());
+  }
+
+  [[nodiscard]] core::Result<core::AuthoringAdmissionDTO>
+  ReconcileCellAdmissionClaims(
+      const core::CellAdmissionReconcileDTO &) override {
+    return core::Result<core::AuthoringAdmissionDTO>::Ok(
+        GetAuthoringAdmission());
+  }
+
+  [[nodiscard]] core::Result<core::CellAdmissionRecoveryReceiptDTO>
+  GetCellAdmissionRecoveryReceipt(
+      const core::CellAdmissionRecoveryReceiptQueryDTO &query) const override {
+    core::CellAdmissionRecoveryReceiptDTO receipt{
+        core::CellAdmissionRecoveryReceiptStatusDTO::kUnknown,
+        core::RequestOwnerEpoch("kernel-owner.test"),
+        core::AdmissionGeneration(generation_),
+        std::nullopt,
+        std::nullopt,
+        std::nullopt,
+        {},
+        {},
+    };
+    if (held_claim_.has_value() && held_claim_->intent == query.intent) {
+      receipt.status =
+          core::CellAdmissionRecoveryReceiptStatusDTO::kHeldExact;
+      receipt.matched_claim = held_claim_;
+    } else if (released_claim_.has_value() &&
+               released_claim_->intent == query.intent) {
+      receipt.status =
+          core::CellAdmissionRecoveryReceiptStatusDTO::kReleasedExact;
+      receipt.matched_claim = released_claim_;
+    }
+    return core::Result<core::CellAdmissionRecoveryReceiptDTO>::Ok(
+        std::move(receipt));
+  }
+
+  std::optional<core::CellAdmissionClaimReleaseDTO> last_release;
+
+private:
+  std::uint64_t generation_{7U};
+  std::optional<core::CellAdmissionClaimDTO> held_claim_;
+  std::optional<core::CellAdmissionClaimDTO> released_claim_;
 };
 
 class ScriptedSceneOwner final : public IManagerSceneProjectionHandoffPort {
@@ -2071,10 +2153,12 @@ TEST(ManagerNamedApplyCoordinator,
   ScriptedSceneOwner scene_owner(independent_reader);
   AggregateFencePort kernel_fence(independent_reader, predecessor);
   ScriptedRuntimeCompositionPort runtime_composition;
+  ScriptedCellAdmissionPort cell_admission;
   ManagerNamedApplyCoordinator coordinator(
       journal, active_plan_source, *package.bundle_source,
       *package.artifact_source, publication_store, scene_owner, nullptr,
-      kernel_fence, runtime_composition, runtime_ports, runtime_ports,
+      kernel_fence, cell_admission, runtime_composition, runtime_ports,
+      runtime_ports,
       RuntimeEpoch("manager-runtime.aggregate.1"), "linux", {"posix.1-2017"},
       [] { return 1'000U; }, [] { return ApplyId("apply.aggregate.1"); });
   const ManagerNamedApplyRequestDTO request{
@@ -2084,6 +2168,8 @@ TEST(ManagerNamedApplyCoordinator,
       predecessor.request.candidate_retained_bundle_id,
       predecessor.request.candidate_graph_revision,
       package.bundle->retained_bundle_id(),
+      core::AdmissionGeneration(7U),
+      std::nullopt,
   };
 
   const auto applied = coordinator.ApplyOrRecover(request);
@@ -2094,6 +2180,14 @@ TEST(ManagerNamedApplyCoordinator,
   EXPECT_EQ(kernel_fence.observe_admission_calls, 1);
   EXPECT_EQ(kernel_fence.acquire_calls, 1);
   EXPECT_EQ(kernel_fence.release_calls, 1);
+  ASSERT_TRUE(cell_admission.last_release.has_value());
+  EXPECT_EQ(cell_admission.last_release->settlement.settlement_kind,
+            core::CellAdmissionSettlementKindDTO::kTerminalEffectsSettled);
+  const auto durable_terminal = journal.ReadTerminalOutcome(
+      ApplyId("apply.aggregate.1"), ApplyGeneration(1U));
+  ASSERT_TRUE(durable_terminal.has_value());
+  EXPECT_EQ(cell_admission.last_release->settlement.evidence_digest,
+            durable_terminal->terminal_outcome_digest);
   EXPECT_EQ(runtime_ports.ensure_calls, 1);
   EXPECT_EQ(scene_owner.stage_calls, 1);
   EXPECT_EQ(scene_owner.activation_calls, 1);

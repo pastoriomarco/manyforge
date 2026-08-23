@@ -7438,6 +7438,53 @@ TEST(ResourceAddressedExecutionKernelTest,
 }
 
 TEST(ResourceAddressedExecutionKernelTest,
+     EmptyRuntimeBootstrapOwnsCellAdmissionBeforeParticipantInstallation) {
+  FakeClock clock;
+  FakeOperationJournal journal;
+  FakeParticipantEngine engine;
+  ResourceAddressedExecutionKernelConfig config{
+      RequestOwnerEpoch("kernel.epoch.1"), CellId("cell.test"), 16U};
+  config.empty_runtime_retained_bundle_id =
+      RetainedBundleId(test_digest('6'));
+  config.empty_runtime_graph_revision = GraphRevision(test_digest('7'));
+  config.manager_liveness_required_set = EmptyManagerLivenessSet();
+  config.cell_admission_settlement_validator =
+      [](const auto&, const auto&) { return Result<void>::Ok(); };
+  ResourceAddressedExecutionKernel kernel({}, clock, journal,
+                                          std::move(config));
+
+  const CellAdmissionReadinessSnapshotDTO ready{
+      true,
+      ProgramCycleStatusDTO{RequestOwnerEpoch("program.owner"), 1U,
+                            ProgramCycleStateDTO::kIdleAfterReset,
+                            std::nullopt, std::nullopt, std::nullopt},
+      true, 1U, 1U, true, true, 0U, 0U, 0U};
+  ASSERT_TRUE(kernel.UpdateCellAdmissionReadiness(ready).ok());
+  EXPECT_TRUE(kernel.GetAuthoringAdmission().authoring_allowed);
+  EXPECT_TRUE(kernel.resource_snapshot().empty());
+
+  const auto successor = select_candidate_product(
+      make_binding("arm", "arm", "execution.trajectory.execute",
+                   CoordinateKind::kAngular));
+  const auto installed = kernel.reconfigure_runtime_participants(
+      {registration(successor, engine)});
+  ASSERT_TRUE(installed.ok()) << installed.error().message;
+  EXPECT_EQ(kernel.resource_snapshot().size(), 1U);
+
+  auto mixed_value = same_owner_control_binding_sibling(successor).value();
+  mixed_value.graph_revision = GraphRevision(test_digest('a'));
+  auto mixed = verify_runtime_participant_binding(std::move(mixed_value));
+  ASSERT_TRUE(mixed.ok()) << mixed.error().message;
+  const auto rejected = kernel.reconfigure_runtime_participants(
+      {registration(successor, engine), registration(mixed.value(), engine)});
+  ASSERT_FALSE(rejected.ok());
+  EXPECT_NE(rejected.error().message.find(
+                "runtime participants do not share one current graph revision"),
+            std::string::npos);
+  EXPECT_EQ(kernel.resource_snapshot().size(), 1U);
+}
+
+TEST(ResourceAddressedExecutionKernelTest,
      OwnerReplacementAdoptsDurableRoutePredecessorWithoutOpeningAdmission) {
   FakeClock clock;
   FakeParticipantEngine engine;

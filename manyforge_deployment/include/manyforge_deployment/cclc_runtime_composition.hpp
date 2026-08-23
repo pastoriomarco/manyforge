@@ -71,6 +71,7 @@ public:
       std::vector<core::KinematicResourceSourceProjectionDTO>
           source_projections,
       core::ICCLCKernelDisableHandoffPort &kernel_disable_handoff_port,
+      core::IKernelCellAdmissionPort &kernel_cell_admission_port,
       core::ICCLCKernelRouteConfigurationFencePort &kernel_route_fence_port,
       IRouteConfigurationKernelPublicationOwner &kernel_publication_owner,
       core::IClock &clock, core::IScheduler &scheduler,
@@ -117,6 +118,7 @@ private:
           const core::ControlDomainId &)>
           kernel_current_configuration_source,
       core::ICCLCKernelDisableHandoffPort &kernel_disable_handoff_port,
+      core::IKernelCellAdmissionPort &kernel_cell_admission_port,
       core::ICCLCKernelRouteConfigurationFencePort &kernel_route_fence_port,
       IRouteConfigurationKernelPublicationOwner &kernel_publication_owner,
       core::IClock &clock, core::IScheduler &scheduler);

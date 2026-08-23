@@ -184,7 +184,7 @@ KernelCellAdmissionOwner Owner(FixedClock& clock, AdmissionJournal& journal,
       AdmissionGeneration(0U),
       [](const auto&, const auto&) { return Result<void>::Ok(); },
       [](const auto&, const auto&) { return Result<void>::Ok(); },
-      [](const auto&, const auto& reconcile) {
+      [](const auto&, const auto&, const auto& reconcile) {
         return Result<CellAdmissionReconcileValidationDTO>::Ok(
             {reconcile.current_owner_epochs, {}});
       },
@@ -239,7 +239,7 @@ KernelCellAdmissionOwner LivenessOwner(
       AdmissionGeneration(0U),
       [](const auto&, const auto&) { return Result<void>::Ok(); },
       [](const auto&, const auto&) { return Result<void>::Ok(); },
-      [](const auto&, const auto& reconcile) {
+      [](const auto&, const auto&, const auto& reconcile) {
         return Result<CellAdmissionReconcileValidationDTO>::Ok(
             {reconcile.current_owner_epochs, {}});
       },
@@ -809,7 +809,7 @@ TEST(KernelCellAdmissionOwner,
       RequestOwnerEpoch("kernel.3"), 2U, clock, journal,
       {{first, std::nullopt, first_settlement}, {second, std::nullopt, std::nullopt}},
       AdmissionGeneration(9U), {}, {},
-      [&](const auto& held, const auto& reconcile) {
+      [&](const auto& held, const auto&, const auto& reconcile) {
         return Result<CellAdmissionReconcileValidationDTO>::Ok(
             {reconcile.current_owner_epochs,
              {{held.front(), CellAdmissionOwnerRoleDTO::kAuthoringOwner,
@@ -855,7 +855,7 @@ TEST(KernelCellAdmissionOwner,
       RequestOwnerEpoch("kernel.1"), 2U, clock, journal, {},
       AdmissionGeneration(1U), {},
       [](const auto&, const auto&) { return Result<void>::Ok(); },
-      [](const auto& held, const auto& reconcile) {
+      [](const auto& held, const auto&, const auto& reconcile) {
         return Result<CellAdmissionReconcileValidationDTO>::Ok(
             {reconcile.current_owner_epochs,
              {{held.front(), CellAdmissionOwnerRoleDTO::kAuthoringOwner,
@@ -955,7 +955,8 @@ TEST(KernelCellAdmissionOwner,
         RequestOwnerEpoch("kernel.2"), 4U, clock, journal, recovery,
         AdmissionGeneration(8U), {},
         [](const auto&, const auto&) { return Result<void>::Ok(); },
-        [&, authorize_first](const auto& held, const auto& reconcile) {
+        [&, authorize_first](const auto& held, const auto&,
+                             const auto& reconcile) {
           CellAdmissionReconcileValidationDTO validation{
               reconcile.current_owner_epochs, {}};
           if (authorize_first) {
@@ -1037,7 +1038,7 @@ TEST(KernelCellAdmissionOwner, SupportsMultipleExactReconciliationsInOneKernelEp
   KernelCellAdmissionOwner owner(
       RequestOwnerEpoch("kernel.2"), 4U, clock, journal,
       {{claim, std::nullopt, std::nullopt}}, AdmissionGeneration(8U), {}, {},
-      [&](const auto& held, const auto& reconcile) {
+      [&](const auto& held, const auto&, const auto& reconcile) {
         CellAdmissionReconcileValidationDTO validation{
             reconcile.current_owner_epochs, {}};
         if (reconcile.reconciliation_evidence_digest == ContentDigest(kDigestB)) {

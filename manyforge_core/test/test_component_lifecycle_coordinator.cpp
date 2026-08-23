@@ -24,8 +24,31 @@
 #include <system_error>
 #include <thread>
 
+#include "../src/component_lifecycle_journal_codec_internal.hpp"
+
 namespace manyforge::core {
 namespace {
+
+[[nodiscard]] Result<CellAdmissionClaimDTO> SeedLifecycleClaim(
+    SqliteCCLCJournal& journal, const RequestOwnerEpoch& owner,
+    const ComponentLifecycleIntentDTO& intent,
+    const ComponentLifecycleAcceptedDTO& acceptance) {
+  const CellAdmissionClaimIntentDTO claim_intent{
+      CellAdmissionClaimKindDTO::kComponentLifecycle,
+      CellAdmissionOwnerRoleDTO::kComponentLifecycleOwner, owner,
+      acceptance.lifecycle_transaction_id.value(), intent.request_context.request_id,
+      ContentDigest(detail::ComponentLifecycleSemanticIntentDigest(intent)),
+      AdmissionGeneration(1U), {}, std::nullopt, std::nullopt};
+  auto recorded = journal.RecordLifecycleClaimAttempt(owner, claim_intent);
+  if (!recorded.ok()) {
+    return Result<CellAdmissionClaimDTO>::Err(recorded.error());
+  }
+  CellAdmissionClaimDTO claim{claim_intent, CellAdmissionClaimGeneration(1U),
+                              AdmissionGeneration(1U), 0};
+  auto acquired = journal.RecordLifecycleClaimAcquired(owner, claim);
+  return acquired.ok() ? Result<CellAdmissionClaimDTO>::Ok(std::move(claim))
+                       : Result<CellAdmissionClaimDTO>::Err(acquired.error());
+}
 
 class ScopedTemporaryDirectory final {
  public:
@@ -563,7 +586,60 @@ class RoutedResolver final : public ICCLCBrandLifecyclePortResolver {
   std::vector<ResolvedLifecycleProviderOccurrenceDTO> providers_;
 };
 
-class UnusedKernelPort final : public ICCLCKernelDisableHandoffPort {
+class FakeCellAdmissionPort : public IKernelCellAdmissionPort {
+ public:
+  void RetainClaim(CellAdmissionClaimDTO claim) {
+    claim_ = std::move(claim);
+    last_claim_ = claim_;
+  }
+
+  AuthoringAdmissionDTO GetAuthoringAdmission() const override {
+    return {true, AdmissionGeneration(1U)};
+  }
+  Result<AuthoringAdmissionDTO> UpdateCellAdmissionReadiness(
+      const CellAdmissionReadinessSnapshotDTO&) override {
+    return Result<AuthoringAdmissionDTO>::Ok(GetAuthoringAdmission());
+  }
+  Result<CellAdmissionClaimDTO> AcquireCellAdmissionClaim(
+      const CellAdmissionClaimIntentDTO& intent) override {
+    claim_ = CellAdmissionClaimDTO{intent, CellAdmissionClaimGeneration(1U),
+                                   intent.expected_admission_generation, 1};
+    last_claim_ = claim_;
+    return Result<CellAdmissionClaimDTO>::Ok(*claim_);
+  }
+  Result<AuthoringAdmissionDTO> ReleaseCellAdmissionClaim(
+      const CellAdmissionClaimReleaseDTO& release) override {
+    release_ = release;
+    claim_.reset();
+    return Result<AuthoringAdmissionDTO>::Ok(GetAuthoringAdmission());
+  }
+  Result<AuthoringAdmissionDTO> ReconcileCellAdmissionClaims(
+      const CellAdmissionReconcileDTO&) override {
+    return Result<AuthoringAdmissionDTO>::Ok(GetAuthoringAdmission());
+  }
+  Result<CellAdmissionRecoveryReceiptDTO> GetCellAdmissionRecoveryReceipt(
+      const CellAdmissionRecoveryReceiptQueryDTO&) const override {
+    return Result<CellAdmissionRecoveryReceiptDTO>::Ok(
+        {release_.has_value()
+             ? CellAdmissionRecoveryReceiptStatusDTO::kReleasedExact
+             : (claim_.has_value()
+                    ? CellAdmissionRecoveryReceiptStatusDTO::kHeldExact
+                    : CellAdmissionRecoveryReceiptStatusDTO::kUnknown),
+         RequestOwnerEpoch("kernel.1"), AdmissionGeneration(1U), last_claim_,
+         release_, std::nullopt,
+         claim_.has_value() ? std::vector{*claim_}
+                            : std::vector<CellAdmissionClaimDTO>{},
+         {}});
+  }
+
+ private:
+  std::optional<CellAdmissionClaimDTO> claim_;
+  std::optional<CellAdmissionClaimDTO> last_claim_;
+  std::optional<CellAdmissionClaimReleaseDTO> release_;
+};
+
+class UnusedKernelPort final : public ICCLCKernelDisableHandoffPort,
+                               public FakeCellAdmissionPort {
  public:
   [[nodiscard]] Result<DisableHandoffAdmissionSnapshotDTO> ObserveDisableHandoffAdmission(
       const DisableHandoffAdmissionQueryDTO&) const override {
@@ -698,7 +774,8 @@ class BlockingScheduleReturnScheduler final : public IScheduler {
 
 enum class DisableHandoffProgress { kDirectReady, kStoppingThenReady };
 
-class FakeKernelDisablePort final : public ICCLCKernelDisableHandoffPort {
+class FakeKernelDisablePort final : public ICCLCKernelDisableHandoffPort,
+                                    public FakeCellAdmissionPort {
  public:
   explicit FakeKernelDisablePort(
       SqliteCCLCJournal& journal,
@@ -969,6 +1046,7 @@ class FakeKernelDisablePort final : public ICCLCKernelDisableHandoffPort {
 struct PreparedBrandRecoverySeed final {
   ComponentLifecycleAcceptedDTO acceptance;
   BrandLifecyclePrimitiveIntentDTO primitive;
+  CellAdmissionClaimDTO claim;
 };
 
 [[nodiscard]] BrandLifecyclePrimitiveIntentDTO RecoveryPrimitiveIntent(
@@ -1019,6 +1097,10 @@ struct PreparedBrandRecoverySeed final {
   if (!prepared.ok()) {
     throw std::runtime_error(prepared.error().code + ": " + prepared.error().message);
   }
+  auto claim = SeedLifecycleClaim(journal, owner, intent, prepared.value().acceptance);
+  if (!claim.ok()) {
+    throw std::runtime_error(claim.error().code + ": " + claim.error().message);
+  }
   const auto accepted = journal.AcceptOrReplayLifecycle(owner, intent, prepared.value().acceptance,
                                                         prepared.value().initial_status);
   if (!accepted.ok()) {
@@ -1036,7 +1118,7 @@ struct PreparedBrandRecoverySeed final {
   if (!retained.ok()) {
     throw std::runtime_error(retained.error().code + ": " + retained.error().message);
   }
-  return {prepared.value().acceptance, primitive};
+  return {prepared.value().acceptance, primitive, claim.value()};
 }
 
 [[nodiscard]] Result<DisableHandoffAdmissionSnapshotDTO> RecoveryDisableAdmission(
@@ -1928,6 +2010,9 @@ TEST(ComponentLifecycleCoordinator,
   const auto prepared = PrepareComponentLifecycleAdmission(
       intent, RecoveryAdmissionCandidate("recovery-no-effect.1", Snapshot(), {PrepareCatalog()}));
   ASSERT_TRUE(prepared.ok()) << prepared.error().code << ": " << prepared.error().message;
+  const auto seeded_claim =
+      SeedLifecycleClaim(journal, first_owner, intent, prepared.value().acceptance);
+  ASSERT_TRUE(seeded_claim.ok());
   ASSERT_TRUE(journal
                   .AcceptOrReplayLifecycle(first_owner, intent, prepared.value().acceptance,
                                            prepared.value().initial_status)
@@ -1940,6 +2025,7 @@ TEST(ComponentLifecycleCoordinator,
       journal, std::vector<ComponentLifecycleStateDTO>{ComponentLifecycleStateDTO::kPrepared});
   FakeResolver resolver(port);
   UnusedKernelPort kernel;
+  kernel.RetainClaim(seeded_claim.value());
   FakeClock clock;
   clock.set(500);
   ManualScheduler scheduler;
@@ -1978,6 +2064,9 @@ TEST(ComponentLifecycleCoordinator,
       intent,
       RecoveryAdmissionCandidate("recovery-prepared-brand.1", Snapshot(), {PrepareCatalog()}));
   ASSERT_TRUE(prepared.ok()) << prepared.error().code << ": " << prepared.error().message;
+  const auto seeded_claim =
+      SeedLifecycleClaim(journal, first_owner, intent, prepared.value().acceptance);
+  ASSERT_TRUE(seeded_claim.ok());
   ASSERT_TRUE(journal
                   .AcceptOrReplayLifecycle(first_owner, intent, prepared.value().acceptance,
                                            prepared.value().initial_status)
@@ -2004,6 +2093,7 @@ TEST(ComponentLifecycleCoordinator,
       DispatchMode::kKnownSuccess, 2U);
   FakeResolver resolver(port);
   UnusedKernelPort kernel;
+  kernel.RetainClaim(seeded_claim.value());
   FakeClock clock;
   clock.set(500);
   ManualScheduler scheduler;
@@ -2071,6 +2161,7 @@ TEST_P(RecoveredBrandClassificationTest, ClassifiesFreshEvidenceWithoutRedispatc
       DispatchMode::kKnownSuccess, 2U, GetParam().facts);
   FakeResolver resolver(port);
   UnusedKernelPort kernel;
+  kernel.RetainClaim(seed.claim);
   FakeClock clock;
   clock.set(500);
   ManualScheduler scheduler;
@@ -2146,6 +2237,7 @@ TEST(ComponentLifecycleCoordinator,
       std::vector<LifecycleFactDTO>{{LifecycleFactId("mode"), TokenFactValue("manual")}});
   FakeResolver resolver(port, catalog);
   UnusedKernelPort kernel;
+  kernel.RetainClaim(seed.claim);
   FakeClock clock;
   clock.set(500);
   ManualScheduler scheduler;
@@ -2186,12 +2278,16 @@ TEST(ComponentLifecycleCoordinator,
       intent, RecoveryAdmissionCandidate("recovery-ready-disable.1", snapshot, {DisableCatalog()},
                                          disable_admission.value()));
   ASSERT_TRUE(prepared.ok()) << prepared.error().code << ": " << prepared.error().message;
+  const auto seeded_claim =
+      SeedLifecycleClaim(journal, first_owner, intent, prepared.value().acceptance);
+  ASSERT_TRUE(seeded_claim.ok());
   ASSERT_TRUE(journal
                   .AcceptOrReplayLifecycle(first_owner, intent, prepared.value().acceptance,
                                            prepared.value().initial_status)
                   .ok());
 
   FakeKernelDisablePort kernel(journal);
+  kernel.RetainClaim(seeded_claim.value());
   const auto handoff_request =
       RecoveryDisableRequest(prepared.value().initial_status, disable_admission.value());
   ASSERT_TRUE(handoff_request.locally_valid());

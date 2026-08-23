@@ -1044,6 +1044,7 @@ TEST(CCLCJournalRecovery, RequiresOneExactPreparedEffectAtTheTransactionWatermar
       {},
       {},
       {},
+      {},
       {}};
   ASSERT_TRUE(recovery.locally_valid());
 
@@ -1070,6 +1071,7 @@ TEST(CCLCJournalRecovery, RejectsProviderMismatchAndBoundedCollectionOverflow) {
         status.acceptance.lifecycle_transaction_generation, 1U}},
       {prepared},
       0U,
+      {},
       {},
       {},
       {},

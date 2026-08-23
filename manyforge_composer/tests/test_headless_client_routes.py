@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import copy
 import json
+import tempfile
 from pathlib import Path
 from typing import Any, Iterator
 
@@ -94,6 +95,7 @@ def _scene_body(
                 "content_hash": "sha256:" + "a" * 64,
             },
         },
+        "expected_admission_generation": 7,
         "operation": {
             "kind": "remove_object",
             "scene_resource_id": scene_resource_id,
@@ -298,6 +300,62 @@ def headless_client() -> (
                     "source_owner_id": None,
                     "reason_code": "robot_readiness_owner_unavailable",
                 },
+            }
+        elif path == "/api/cell/authoring-admission":
+            payload = {
+                "authoring_allowed": True,
+                "admission_generation": 7,
+            }
+        elif path == "/api/program/authoring-transactions/recovery-receipt":
+            payload = {
+                "recovery_receipt": {
+                    "status": "unknown",
+                    "kernel_owner_epoch": "kernel.1",
+                    "held_claims": [],
+                    "current_owner_epochs": [],
+                }
+            }
+        elif path == "/api/program/authoring-transactions/reconcile-owner":
+            payload = {
+                "admission": {
+                    "authoring_allowed": True,
+                    "admission_generation": 7,
+                }
+            }
+        elif path == "/api/program/authoring-transactions":
+            intent = {
+                "claim_kind": "authoring_mutation",
+                "owner_role": "authoring_owner",
+                "owner_epoch": body["request_owner_epoch"],
+                "owner_transaction_id": body["owner_transaction_id"],
+                "request_id": body["request_id"],
+                "request_payload_digest": body["request_payload_digest"],
+                "expected_admission_generation": body[
+                    "expected_admission_generation"
+                ],
+                "scope": {"resources": [], "configurations": []},
+                "program_cycle_evidence": None,
+                "intervention_evidence": None,
+            }
+            payload = {
+                "claim": {
+                    "intent": intent,
+                    "claim_generation": 1,
+                    "acquired_admission_generation": 7,
+                    "accepted_at_ns": 1,
+                }
+            }
+        elif path == "/api/program/authoring-transactions/settle":
+            payload = {
+                "admission": {
+                    "authoring_allowed": True,
+                    "admission_generation": 8,
+                }
+            }
+        elif path == "/api/program/cycle/status":
+            payload = {
+                "schema_version": "manyforge.program_cycle_status.v1",
+                "state": "idle",
             }
         elif path == "/api/runtime":
             payload = _runtime()
@@ -621,8 +679,49 @@ def headless_client() -> (
         raw.close()
 
 
+class _ComposerTestClient(TestClient):
+    """Establish the same complete per-client barrier required of a browser."""
+
+    def __init__(
+        self, state: ComposerState, *args, security: SecurityConfig | None = None, **kwargs
+    ) -> None:
+        super().__init__(create_app(state, security=security), *args, **kwargs)
+        self._composer_state = state
+        self._authoring_sequence = 0
+
+    def post(self, url, *, json=None, **kwargs):  # type: ignore[override]
+        admission = self._composer_state.authoring_admission
+        if (
+            admission is not None
+            and isinstance(json, dict)
+            and "draftId" in json
+            and "expectedDraftRevision" in json
+        ):
+            self._authoring_sequence += 1
+            admission.publish_complete_snapshot(
+                client_id="test-browser",
+                sequence=self._authoring_sequence,
+                admission_generation=7,
+                draft_id=json["draftId"],
+                draft_revision=json["expectedDraftRevision"],
+            )
+            json = {
+                **json,
+                "clientId": "test-browser",
+                "snapshotReceiverEpoch": admission.receiver_epoch,
+                "snapshotSequence": self._authoring_sequence,
+                "expectedAdmissionGeneration": 7,
+                "requestOwnerEpoch": "test-browser.epoch.1",
+                "requestId": f"test-browser.request.{self._authoring_sequence}",
+            }
+        return super().post(url, json=json, **kwargs)
+
+
 def _composer(client: HeadlessHttpClient) -> TestClient:
-    return TestClient(create_app(ComposerState(headless_client=client)))
+    state_root = tempfile.mkdtemp(prefix="manyforge-composer-journal-")
+    return _ComposerTestClient(
+        ComposerState(headless_client=client, authoring_state_root=state_root)
+    )
 
 
 def _composer_with_program(client: HeadlessHttpClient) -> TestClient:
@@ -630,17 +729,29 @@ def _composer_with_program(client: HeadlessHttpClient) -> TestClient:
         program_path=str(_PROGRAM_PATH),
         allowed_fs_roots=[str(_ROOT / "examples")],
         headless_client=client,
+        authoring_state_root=tempfile.mkdtemp(
+            prefix="manyforge-composer-journal-"
+        ),
     )
-    return TestClient(
-        create_app(
-            state,
-            security=SecurityConfig(
-                allowed_fs_roots=[str(_ROOT / "examples")],
-            ),
+    return _ComposerTestClient(
+        state,
+        security=SecurityConfig(
+            allowed_fs_roots=[str(_ROOT / "examples")],
+        ),
+    )
+
+
+def _without_authoring_owner_calls(
+    requests: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    return [
+        request
+        for request in requests
+        if request["path"] != "/api/cell/authoring-admission"
+        and not request["path"].startswith(
+            "/api/program/authoring-transactions"
         )
-    )
-
-
+    ]
 def test_headless_http_client_rejects_rehashed_malformed_binding_ingress() -> None:
     program = {
         "program_id": "fixture",
@@ -870,7 +981,10 @@ def test_composer_projects_headless_reads_without_local_runtime_state(
         )
         assert composer.get("/api/execution/history").status_code == 200
 
-    assert all(item["method"] == "GET" for item in requests)
+    assert all(
+        item["method"] == "GET"
+        for item in _without_authoring_owner_calls(requests)
+    )
     alarm_request = next(
         item for item in requests if item["path"] == "/api/execution/alarms"
     )
@@ -915,6 +1029,7 @@ def test_composer_program_routes_are_strict_stateless_forwarders(
         "scenario_id": "cell-pick",
         "scenario_catalog_revision": digest_a,
         "expected_applied_record_digest": "sha256:" + "b" * 64,
+        "expected_admission_generation": 7,
     }
     stop = {
         "request_id": "request.program.2",
@@ -926,7 +1041,11 @@ def test_composer_program_routes_are_strict_stateless_forwarders(
         "reason": "operator stop",
     }
 
-    with _composer(client) as composer:
+    with _composer_with_program(client) as composer:
+        workspace = composer.get("/api/program/workspace").json()
+        start["draft_program_revision"] = workspace["draft"][
+            "programRevision"
+        ]
         assert composer.get("/api/scenarios").status_code == 200
         assert composer.get(
             "/api/program/runs?active_only=true&limit=1"
@@ -982,7 +1101,11 @@ def test_composer_forwards_only_strict_attributed_alarm_intent(
         )
         assert forged.status_code == 422
 
-    forwarded = next(item for item in requests if item["method"] == "POST")
+    forwarded = next(
+        item
+        for item in requests
+        if item["path"].endswith("/acknowledge")
+    )
     assert forwarded["body"] == body
     assert "trusted_principal_id" not in forwarded["body"]
 
@@ -1316,7 +1439,7 @@ def test_program_scene_and_viewer_draft_edits_have_no_runtime_effect(
     )
 
 
-def test_composer_keeps_draft_and_save_independent_of_an_active_run(
+def test_composer_rejects_draft_and_save_during_an_active_run(
     headless_client,
     tmp_path: Path,
 ) -> None:
@@ -1343,25 +1466,27 @@ def test_composer_keeps_draft_and_save_independent_of_an_active_run(
                 "runs": [_program_run_status()],
             }
 
+        def authoring_admission(self) -> dict[str, Any]:
+            return {"authoring_allowed": False, "admission_generation": 7}
+
     program_path = tmp_path / "active.program.yaml"
     program_path.write_bytes(_PROGRAM_PATH.read_bytes())
     state = ComposerState.from_paths(
         program_path=str(program_path),
         allowed_fs_roots=[str(tmp_path)],
         headless_client=ActiveRunnerClient(),  # type: ignore[arg-type]
+        authoring_state_root=str(tmp_path),
     )
     snapshot = state.draft_session.snapshot()
     body = {
         "draftId": snapshot["draft_id"],
         "expectedDraftRevision": snapshot["draft_revision"],
     }
-    client = TestClient(
-        create_app(
-            state,
-            security=SecurityConfig(
-                allowed_fs_roots=[str(tmp_path)],
-            ),
-        )
+    client = _ComposerTestClient(
+        state,
+        security=SecurityConfig(
+            allowed_fs_roots=[str(tmp_path)],
+        ),
     )
 
     with client:
@@ -1375,11 +1500,11 @@ def test_composer_keeps_draft_and_save_independent_of_an_active_run(
             },
         )
 
-    assert saved.status_code == 200, saved.text
-    assert mutated.status_code == 200, mutated.text
-    assert state.draft_session.snapshot()["draft_revision"] == (
-        snapshot["draft_revision"] + 1
-    )
+    assert saved.status_code == 409, saved.text
+    assert saved.json()["detail"]["code"] == "authoring_not_ready"
+    assert mutated.status_code == 409, mutated.text
+    assert mutated.json()["detail"]["code"] == "authoring_not_ready"
+    assert state.draft_session.snapshot()["draft_revision"] == snapshot["draft_revision"]
 
 
 def test_composer_program_apply_advances_only_headless_applied_identity(
@@ -1452,7 +1577,10 @@ def test_new_program_rotates_fenced_draft_without_disk_or_headless_mutation(
     assert replay.json()["detail"]["code"] == "composer_draft_id_stale"
     assert _PROGRAM_PATH.read_bytes() == disk_before
     assert all(
-        request["method"] == "GET" for request in requests[request_offset:]
+        request["method"] == "GET"
+        for request in _without_authoring_owner_calls(
+            requests[request_offset:]
+        )
     )
 
 
@@ -1602,7 +1730,9 @@ def test_program_discard_reads_owner_truth_without_runtime_mutation(
     assert no_op.json()["draft"]["draftRevision"] == discarded.json()["draft"][
         "draftRevision"
     ]
-    action_requests = requests[request_offset:]
+    action_requests = _without_authoring_owner_calls(
+        requests[request_offset:]
+    )
     assert all(request["method"] == "GET" for request in action_requests)
     assert {
         request["path"] for request in action_requests
@@ -1969,6 +2099,7 @@ def test_composer_preserves_headless_unavailability_code(
                     "retained_bundle_id": "bundle.1",
                 },
                 "reject_if_affected_busy": True,
+                "expected_admission_generation": 7,
             },
         )
     assert response.status_code == 503
@@ -2013,6 +2144,7 @@ def test_composer_preserves_manager_apply_success_receipt(
                     "retained_bundle_id": "bundle.2",
                 },
                 "reject_if_affected_busy": True,
+                "expected_admission_generation": 7,
             },
         )
 
@@ -2025,16 +2157,39 @@ def test_composer_websocket_streams_owner_snapshots_only(
 ) -> None:
     client, requests, _node_environment = headless_client
     with _composer(client) as composer:
-        with composer.websocket_connect("/ws/state") as websocket:
+        state = composer._composer_state
+        assert state.authoring_admission is not None
+        draft = state.draft_session.snapshot()
+        with composer.websocket_connect(
+            "/ws/state?client_id=test-browser"
+        ) as websocket:
             payload = websocket.receive_json()
             assert payload == {
                 "schema_version": "manyforge.composer_headless_state.v1",
                 "runtime": _runtime(),
                 "alarms": _alarms(),
+                "authoring_admission": {
+                    "authoring_allowed": True,
+                    "admission_generation": 7,
+                },
+                "program_cycle": {
+                    "schema_version": "manyforge.program_cycle_status.v1",
+                    "state": "idle",
+                },
+                "draft_identity": {
+                    "draft_id": draft["draft_id"],
+                    "draft_revision": draft["draft_revision"],
+                },
+                "receiver_epoch": state.authoring_admission.receiver_epoch,
+                "snapshot_sequence": 1,
+                "complete": True,
             }
-    assert {item["path"] for item in requests} == {
+    assert {
+        item["path"] for item in _without_authoring_owner_calls(requests)
+    } == {
         "/api/runtime",
         "/api/execution/alarms",
+        "/api/program/cycle/status",
     }
     alarm_request = next(
         item for item in requests if item["path"] == "/api/execution/alarms"
@@ -2074,10 +2229,34 @@ def test_composer_websocket_deduplicates_an_unchanged_owner_failure(
             assert ordering == "attention_newest"
             return {}
 
+        def authoring_admission(self) -> dict[str, Any]:
+            return {"authoring_allowed": True, "admission_generation": 7}
+
+        def program_cycle_status(self) -> dict[str, Any]:
+            return {"state": "idle"}
+
+    class Admission:
+        mutation_ready = True
+        receiver_epoch = "composer-snapshot.test"
+
+        def publish_complete_snapshot(self, **_kwargs) -> None:
+            return None
+
+        def disconnect(self, _client_id: str) -> None:
+            return None
+
     websocket = RecordingWebSocket()
     monkeypatch.setattr(headless_ws, "POLL_INTERVAL_SECONDS", 0)
 
-    asyncio.run(serve_headless_state(websocket, FailingClient()))  # type: ignore[arg-type]
+    asyncio.run(
+        serve_headless_state(
+            websocket,  # type: ignore[arg-type]
+            FailingClient(),  # type: ignore[arg-type]
+            client_id="test-browser",
+            admission=Admission(),  # type: ignore[arg-type]
+            draft_session=ComposerState().draft_session,
+        )
+    )
 
     assert websocket.accepted is True
     assert [json.loads(message) for message in websocket.messages] == [
@@ -2121,18 +2300,44 @@ def test_composer_websocket_reports_an_oversized_projection_once(
             assert ordering == "attention_newest"
             return _alarms()
 
+        def authoring_admission(self) -> dict[str, Any]:
+            return {"authoring_allowed": True, "admission_generation": 7}
+
+        def program_cycle_status(self) -> dict[str, Any]:
+            return {"state": "idle"}
+
+    class Admission:
+        mutation_ready = True
+        receiver_epoch = "composer-snapshot.test"
+
+        def publish_complete_snapshot(self, **_kwargs) -> None:
+            return None
+
+        def disconnect(self, _client_id: str) -> None:
+            return None
+
     original_encode = headless_ws._encode
 
     def fail_snapshot_only(value: dict[str, Any]) -> str:
         if value.get("runtime") is not None:
-            raise ValueError("injected oversized snapshot")
+            raise headless_ws._ProjectionOversized(
+                "headless WebSocket projection exceeds its byte bound"
+            )
         return original_encode(value)
 
     websocket = RecordingWebSocket()
     monkeypatch.setattr(headless_ws, "_encode", fail_snapshot_only)
     monkeypatch.setattr(headless_ws, "POLL_INTERVAL_SECONDS", 0)
 
-    asyncio.run(serve_headless_state(websocket, SnapshotClient()))  # type: ignore[arg-type]
+    asyncio.run(
+        serve_headless_state(
+            websocket,  # type: ignore[arg-type]
+            SnapshotClient(),  # type: ignore[arg-type]
+            client_id="test-browser",
+            admission=Admission(),  # type: ignore[arg-type]
+            draft_session=ComposerState().draft_session,
+        )
+    )
 
     assert [json.loads(message) for message in websocket.messages] == [
         {

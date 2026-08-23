@@ -771,7 +771,10 @@ struct RetainedNativeRuntimeUnitAdapter::Impl final
        const manyforge::deployment::IVerifiedRetainedProductArtifactSource
            &selected_artifact_source,
        std::string selected_operating_system,
-       std::vector<std::string> selected_launch_environment_contracts)
+       std::vector<std::string> selected_launch_environment_contracts,
+       std::filesystem::path logical_scene_database,
+       std::filesystem::path program_cycle_journal,
+       std::filesystem::path authoring_transaction_journal)
       : target_root_path(
             NormalizedPlainDirectory(std::move(trusted_installed_target_root),
                                      "trusted installed-target root")),
@@ -782,6 +785,10 @@ struct RetainedNativeRuntimeUnitAdapter::Impl final
             std::move(manager_state_root), "Manager state root")),
         staging_root_path(NormalizedPlainDirectory(
             std::move(private_staging_root), "private native staging root")),
+        logical_scene_database_path(std::move(logical_scene_database)),
+        program_cycle_journal_path(std::move(program_cycle_journal)),
+        authoring_transaction_journal_path(
+            std::move(authoring_transaction_journal)),
         bundle_source(selected_bundle_source),
         artifact_source(selected_artifact_source),
         operating_system(std::move(selected_operating_system)),
@@ -1044,13 +1051,19 @@ struct RetainedNativeRuntimeUnitAdapter::Impl final
       const detail::KernelCellAdmissionRpcPacket &request) {
     std::lock_guard lock(mutex);
     if (children.size() != 1U) {
-      Fail("cell-admission request requires the sole managed native execution "
-           "child");
+      return manyforge::core::Result<Response>::Err(
+          {"kernel_owner_unavailable",
+           "cell-admission request requires the sole managed native execution "
+           "child",
+           {{"reason", "native_execution_child_unavailable"}}});
     }
     auto found = children.begin();
     if (!ChildIsLive(found->second)) {
       children.erase(found);
-      Fail("managed Kernel child exited before its cell-admission response");
+      return manyforge::core::Result<Response>::Err(
+          {"kernel_owner_unavailable",
+           "managed Kernel child exited before its cell-admission response",
+           {{"reason", "native_execution_child_exited"}}});
     }
     const auto encoded = detail::EncodeKernelCellAdmissionRpcRequest(request);
     SendPacket(found->second.channel.get(), encoded, kStatusTimeout);
@@ -1134,6 +1147,11 @@ struct RetainedNativeRuntimeUnitAdapter::Impl final
     const auto& required_set = requests.front().required_set;
     const auto& heartbeat = requests.front().heartbeat;
     const auto& policy = requests.front().policy;
+    const auto publication_generation =
+        requests.front().active_publication_generation;
+    const auto graph_revision = requests.front().active_graph_revision;
+    const auto public_pointer_digest =
+        requests.front().active_public_pointer_digest;
     std::set<std::string> requested_receivers;
     std::vector<std::string> encoded;
     encoded.reserve(requests.size());
@@ -1143,6 +1161,9 @@ struct RetainedNativeRuntimeUnitAdapter::Impl final
                .ok() ||
           request.required_set != required_set ||
           request.heartbeat != heartbeat || request.policy != policy ||
+          request.active_publication_generation != publication_generation ||
+          request.active_graph_revision != graph_revision ||
+          request.active_public_pointer_digest != public_pointer_digest ||
           !requested_receivers.insert(
                                   request.receiver_runtime_unit_id.value())
                .second) {
@@ -1150,10 +1171,10 @@ struct RetainedNativeRuntimeUnitAdapter::Impl final
       }
       encoded.push_back(detail::EncodeManagerLivenessRpcRequest(request));
     }
-    if (requested_receivers.size() !=
-        required_set.required_receivers.size()) {
-      Fail("Manager-liveness batch does not cover the exact required set");
-    }
+    // The required set may also contain same-host external receivers (for
+    // example Program Runner) renewed by another strict transport in the same
+    // Manager generation.  This adapter must atomically cover every requested
+    // native child, while preserving the complete set in every native packet.
 
     const detail::ManagerLivenessBatchDeadline deadline(
         std::chrono::steady_clock::now(), kManagerLivenessTimeout);
@@ -1202,11 +1223,40 @@ struct RetainedNativeRuntimeUnitAdapter::Impl final
       }
     }
     WaitForAll(descriptors, POLLIN, deadline.value());
+    std::vector<std::string> packets;
+    packets.reserve(targets.size());
+    for (const auto* target : targets) {
+      packets.push_back(ReceiveReadyPacket(target->channel.get()));
+    }
     std::vector<manyforge::core::ManagerLivenessObservationDTO> responses;
     responses.reserve(targets.size());
-    for (const auto* target : targets) {
-      responses.push_back(detail::DecodeManagerLivenessRpcResponse(
-          ReceiveReadyPacket(target->channel.get())));
+    std::size_t superseded_count = 0U;
+    std::exception_ptr first_other_failure;
+    for (const auto& packet : packets) {
+      try {
+        responses.push_back(
+            detail::DecodeManagerLivenessRpcResponse(packet));
+      } catch (const detail::ManagerLivenessRpcRejection& rejection) {
+        if (rejection.reason() == "superseded_active_publication") {
+          ++superseded_count;
+        } else if (first_other_failure == nullptr) {
+          first_other_failure = std::current_exception();
+        }
+      } catch (...) {
+        if (first_other_failure == nullptr) {
+          first_other_failure = std::current_exception();
+        }
+      }
+    }
+    if (superseded_count == packets.size()) {
+      throw ManagerLivenessPublicationSuperseded();
+    }
+    if (superseded_count != 0U || first_other_failure != nullptr ||
+        responses.size() != packets.size()) {
+      if (first_other_failure != nullptr && superseded_count == 0U) {
+        std::rethrow_exception(first_other_failure);
+      }
+      Fail("Manager-liveness batch returned mixed renewal outcomes");
     }
     return responses;
   }
@@ -1344,7 +1394,7 @@ struct RetainedNativeRuntimeUnitAdapter::Impl final
     const auto launch_arguments =
         admission.launch_arguments(kChildChannelFd, runtime_epoch);
     std::vector<std::string> arguments;
-    arguments.reserve(launch_arguments.size() + 11U);
+    arguments.reserve(launch_arguments.size() + 15U);
     arguments.push_back(admission.installed_target_id());
     arguments.insert(arguments.end(), launch_arguments.begin(),
                      launch_arguments.end());
@@ -1360,6 +1410,23 @@ struct RetainedNativeRuntimeUnitAdapter::Impl final
          admission.candidate_worker_installed_target_id()).string());
     arguments.emplace_back("--manyforge-managed-cell-id");
     arguments.push_back(bundle.value().cell_graph.cell_id.value());
+    arguments.emplace_back("--manyforge-managed-retained-bundle-id");
+    arguments.push_back(bundle.retained_bundle_id().value());
+    arguments.emplace_back("--manyforge-managed-graph-revision");
+    arguments.push_back(bundle.value().cell_graph.graph_revision.value());
+    if (!logical_scene_database_path.empty()) {
+      arguments.emplace_back("--manyforge-managed-logical-scene-database");
+      arguments.push_back(logical_scene_database_path.string());
+    }
+    if (!program_cycle_journal_path.empty()) {
+      arguments.emplace_back("--manyforge-managed-program-cycle-journal");
+      arguments.push_back(program_cycle_journal_path.string());
+    }
+    if (!authoring_transaction_journal_path.empty()) {
+      arguments.emplace_back(
+          "--manyforge-managed-authoring-transaction-journal");
+      arguments.push_back(authoring_transaction_journal_path.string());
+    }
     std::vector<char *> argv;
     argv.reserve(arguments.size() + 1U);
     for (auto &argument : arguments) {
@@ -1554,6 +1621,9 @@ struct RetainedNativeRuntimeUnitAdapter::Impl final
   UniqueFd package_root_fd;
   std::filesystem::path manager_state_root_path;
   std::filesystem::path staging_root_path;
+  std::filesystem::path logical_scene_database_path;
+  std::filesystem::path program_cycle_journal_path;
+  std::filesystem::path authoring_transaction_journal_path;
   const manyforge::deployment::IVerifiedRetainedBundleSource &bundle_source;
   const manyforge::deployment::IVerifiedRetainedProductArtifactSource
       &artifact_source;
@@ -1758,13 +1828,18 @@ RetainedNativeRuntimeUnitAdapter::RetainedNativeRuntimeUnitAdapter(
     const manyforge::deployment::IVerifiedRetainedBundleSource &bundle_source,
     const manyforge::deployment::IVerifiedRetainedProductArtifactSource
         &artifact_source,
-    std::string operating_system, std::string launch_environment_contract)
+    std::string operating_system, std::string launch_environment_contract,
+    std::filesystem::path logical_scene_database,
+    std::filesystem::path program_cycle_journal,
+    std::filesystem::path authoring_transaction_journal)
     : RetainedNativeRuntimeUnitAdapter(
           std::move(trusted_installed_target_root),
           std::move(trusted_package_root), std::move(manager_state_root),
           std::move(private_staging_root), bundle_source, artifact_source,
           std::move(operating_system),
-          std::vector<std::string>{std::move(launch_environment_contract)}) {}
+          std::vector<std::string>{std::move(launch_environment_contract)},
+          std::move(logical_scene_database), std::move(program_cycle_journal),
+          std::move(authoring_transaction_journal)) {}
 
 RetainedNativeRuntimeUnitAdapter::RetainedNativeRuntimeUnitAdapter(
     std::filesystem::path trusted_installed_target_root,
@@ -1775,13 +1850,18 @@ RetainedNativeRuntimeUnitAdapter::RetainedNativeRuntimeUnitAdapter(
     const manyforge::deployment::IVerifiedRetainedProductArtifactSource
         &artifact_source,
     std::string operating_system,
-    std::vector<std::string> launch_environment_contracts)
+    std::vector<std::string> launch_environment_contracts,
+    std::filesystem::path logical_scene_database,
+    std::filesystem::path program_cycle_journal,
+    std::filesystem::path authoring_transaction_journal)
     : impl_(std::make_shared<Impl>(
           std::move(trusted_installed_target_root),
           std::move(trusted_package_root), std::move(manager_state_root),
           std::move(private_staging_root), bundle_source, artifact_source,
           std::move(operating_system),
-          std::move(launch_environment_contracts))) {}
+          std::move(launch_environment_contracts),
+          std::move(logical_scene_database), std::move(program_cycle_journal),
+          std::move(authoring_transaction_journal))) {}
 
 RetainedNativeRuntimeUnitAdapter::~RetainedNativeRuntimeUnitAdapter() = default;
 
@@ -1867,6 +1947,14 @@ RetainedNativeRuntimeUnitAdapter::UpdateCellAdmissionReadiness(
   return impl_->KernelCellAdmissionCall<
       manyforge::core::AuthoringAdmissionDTO>(
       {"cell_admission_update_readiness", snapshot});
+}
+
+manyforge::core::Result<void> RetainedNativeRuntimeUnitAdapter::Publish(
+    const manyforge::core::ManagerLivenessObservationDTO &observation) {
+  const auto result = impl_->KernelCellAdmissionCall<std::monostate>(
+      {"cell_admission_publish_liveness", observation});
+  return result.ok() ? manyforge::core::Result<void>::Ok()
+                     : manyforge::core::Result<void>::Err(result.error());
 }
 
 manyforge::core::Result<manyforge::core::CellAdmissionClaimDTO>

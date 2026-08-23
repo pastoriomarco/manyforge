@@ -1,8 +1,9 @@
-"""Strict runner-local wire client for Kernel cell admission."""
+"""Strict private wire client for the Kernel cell-admission owner."""
 
 from __future__ import annotations
 
 from collections.abc import Mapping
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -19,12 +20,14 @@ EXECUTION_COMMAND_VERSION: Final = "manyforge.execution_command.v1"
 EXECUTION_RESPONSE_VERSION: Final = "manyforge.execution_command_response.v1"
 MAXIMUM_PACKET_BYTES: Final = 1024 * 1024
 MAXIMUM_RESPONSE_BYTES: Final = 4 * 1024 * 1024
+_CONTENT_IDENTITY_PREFIX: Final = b"manyforge.content-identity.v1"
 _COMMANDS: Final = frozenset(
     {
         "cell_admission_get",
         "cell_admission_acquire",
         "cell_admission_release",
         "cell_admission_reconcile",
+        "cell_admission_recovery_receipt",
     }
 )
 _ERROR_RESPONSE_KEYS: Final = frozenset(
@@ -82,6 +85,21 @@ _RECONCILE_KEYS: Final = frozenset(
         "retained_claims",
     }
 )
+_RECOVERY_QUERY_KEYS: Final = frozenset(
+    {"expected_claim", "expected_release", "intent"}
+)
+_RECOVERY_RECEIPT_KEYS: Final = frozenset(
+    {
+        "admission_generation",
+        "current_owner_epochs",
+        "held_claims",
+        "kernel_owner_epoch",
+        "matched_claim",
+        "matched_reconcile_settlement",
+        "matched_release",
+        "status",
+    }
+)
 
 
 class CellAdmissionError(RuntimeError):
@@ -102,7 +120,7 @@ class CellAdmissionError(RuntimeError):
 
 
 class CellAdmissionClient:
-    """Runner-local strict client for the four admission commands it owns."""
+    """Strict bounded client for owner-specific admission integration."""
 
     def __init__(self, state_root: Path, *, timeout_seconds: float = 10.0) -> None:
         if timeout_seconds <= 0 or timeout_seconds > 30:
@@ -253,12 +271,29 @@ class CellAdmissionClient:
                 error["code"], error["message"], error["details"]
             )
         result_key = (
-            "claim" if command == "cell_admission_acquire" else "authoring_admission"
+            "claim"
+            if command == "cell_admission_acquire"
+            else (
+                "recovery_receipt"
+                if command == "cell_admission_recovery_receipt"
+                else "authoring_admission"
+            )
         )
         expected_keys = (
             _CLAIM_RESPONSE_KEYS
             if command == "cell_admission_acquire"
-            else _ADMISSION_RESPONSE_KEYS
+            else (
+                frozenset(
+                    {
+                        "api_version",
+                        "command",
+                        "ok",
+                        "recovery_receipt",
+                    }
+                )
+                if command == "cell_admission_recovery_receipt"
+                else _ADMISSION_RESPONSE_KEYS
+            )
         )
         if set(response) != expected_keys or not isinstance(
             response.get(result_key), dict
@@ -327,6 +362,85 @@ class CellAdmissionClient:
             self._call("cell_admission_reconcile", reconciliation)
         )
 
+    def recovery_receipt(self, query: Mapping[str, Any]) -> dict[str, Any]:
+        if set(query) != _RECOVERY_QUERY_KEYS:
+            raise ValueError("recovery query is not the exact A1 projection")
+        result = self._call("cell_admission_recovery_receipt", query)
+        if (
+            set(result) != _RECOVERY_RECEIPT_KEYS
+            or result.get("status")
+            not in {
+                "unknown",
+                "conflicting",
+                "held_exact",
+                "released_exact",
+                "reconciled_exact",
+            }
+            or not isinstance(result.get("kernel_owner_epoch"), str)
+            or not isinstance(result.get("held_claims"), list)
+            or not isinstance(result.get("current_owner_epochs"), list)
+        ):
+            raise CellAdmissionError(
+                "execution_command_response_invalid",
+                "native recovery receipt is malformed",
+                outcome_unknown=True,
+            )
+        return result
+
+    def recovery_inventory(
+        self, *, owner_epoch: str
+    ) -> dict[str, Any]:
+        """Obtain one exact Kernel inventory through an unknown Program probe."""
+        probe_digest = "sha256:" + hashlib.sha256(
+            rfc8785.dumps(
+                {
+                    "owner_epoch": owner_epoch,
+                    "probe": "program-runner-recovery-inventory",
+                }
+            )
+        ).hexdigest()
+        return self.recovery_receipt(
+            {
+                "intent": {
+                    "claim_kind": "program_cycle",
+                    "owner_role": "program_runner",
+                    "owner_epoch": owner_epoch,
+                    "owner_transaction_id": "program-runner-recovery-inventory",
+                    "request_id": "program-runner-recovery-inventory",
+                    "request_payload_digest": probe_digest,
+                    "expected_admission_generation": 1,
+                    "scope": {"resources": [], "configurations": []},
+                    "program_cycle_evidence": {
+                        "draft_program_revision": probe_digest,
+                        "applied_program_revision": probe_digest,
+                    },
+                    "intervention_evidence": None,
+                },
+                "expected_claim": None,
+                "expected_release": None,
+            }
+        )
+
+
+def cell_admission_owner_epoch_reconciliation_evidence_digest(
+    owner_role: str, owner_epoch: str
+) -> str:
+    """Mirror CellAdmissionOwnerEpochReconciliationEvidenceDigest framing."""
+    if not owner_role or not owner_epoch:
+        raise ValueError("owner reconciliation identity must be non-empty")
+    payload = rfc8785.dumps(
+        {"owner_epoch": owner_epoch, "owner_role": owner_role}
+    )
+    preimage = b"\0".join(
+        (
+            _CONTENT_IDENTITY_PREFIX,
+            b"cell-admission-owner-epoch-reconciliation-evidence",
+            b"1.0",
+            payload,
+        )
+    )
+    return "sha256:" + hashlib.sha256(preimage).hexdigest()
+
 
 def _unique_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
     result: dict[str, Any] = {}
@@ -342,4 +456,5 @@ __all__ = [
     "CellAdmissionError",
     "EXECUTION_COMMAND_VERSION",
     "EXECUTION_RESPONSE_VERSION",
+    "cell_admission_owner_epoch_reconciliation_evidence_digest",
 ]

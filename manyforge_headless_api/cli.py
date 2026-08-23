@@ -200,6 +200,22 @@ def _load_cclc_request(path: Path) -> dict[str, Any]:
     return value
 
 
+def _bind_cclc_owner(
+    client: HeadlessHttpClient, request: dict[str, Any]
+) -> dict[str, Any]:
+    context = request.get("request_context")
+    if not isinstance(context, dict):
+        raise ValueError("CCLC request file lacks request_context")
+    owner = client.cclc_owner_identity()
+    return {
+        **request,
+        "request_context": {
+            **context,
+            "request_owner_epoch": owner["request_owner_epoch"],
+        },
+    }
+
+
 def _request(args: argparse.Namespace) -> int:
     with HeadlessHttpClient(args.url) as client:
         if args.command == "health":
@@ -270,6 +286,7 @@ def _request(args: argparse.Namespace) -> int:
                 }
             )
         elif args.command == "apply":
+            admission = client.authoring_admission()
             value = client.manager_apply(
                 {
                     **_caller(args),
@@ -280,6 +297,9 @@ def _request(args: argparse.Namespace) -> int:
                         "retained_bundle_id": args.expected_retained_bundle_id,
                     },
                     "reject_if_affected_busy": True,
+                    "expected_admission_generation": admission[
+                        "admission_generation"
+                    ],
                 }
             )
         elif args.command == "cclc-component":
@@ -287,18 +307,28 @@ def _request(args: argparse.Namespace) -> int:
         elif args.command == "cclc-route-templates":
             value = client.cclc_route_templates(args.component_id)
         elif args.command == "cclc-lifecycle-submit":
+            admission = client.authoring_admission()
+            request = _bind_cclc_owner(
+                client, _load_cclc_request(args.request_file)
+            )
             value = client.submit_component_lifecycle(
                 {
-                    **_load_cclc_request(args.request_file),
+                    **request,
                     "confirmed": args.confirmed,
+                    "expected_admission_generation": admission[
+                        "admission_generation"
+                    ],
                 }
             )
         elif args.command == "cclc-lifecycle-status":
             value = client.component_lifecycle_status(args.transaction_id)
         elif args.command == "cclc-route-submit":
+            request = _bind_cclc_owner(
+                client, _load_cclc_request(args.request_file)
+            )
             value = client.submit_route_selection(
                 {
-                    **_load_cclc_request(args.request_file),
+                    **request,
                     "confirmed": args.confirmed,
                 }
             )

@@ -18,7 +18,9 @@ using CellAdmissionSettlementValidator =
                                const CellAdmissionClaimReleaseDTO&)>;
 using CellAdmissionReconcileValidator =
     std::function<Result<CellAdmissionReconcileValidationDTO>(
-        const std::vector<CellAdmissionClaimDTO>&, const CellAdmissionReconcileDTO&)>;
+        const std::vector<CellAdmissionClaimDTO>&,
+        const std::vector<CellAdmissionCurrentOwnerEpochDTO>&,
+        const CellAdmissionReconcileDTO&)>;
 
 /// The sole focused cell-admission ledger composed inside Kernel. Kernel takes
 /// its shared admission mutex before this state mutex; Stop recognition and

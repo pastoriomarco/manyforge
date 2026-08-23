@@ -2351,6 +2351,35 @@ TEST(RetainedBundleMaterializer,
                RetainedBundleError);
 }
 
+TEST(RetainedBundleMaterializer,
+     AggregateNativeAssistantProductRetainsOneRuntimeAndDraftProjection) {
+  const auto fixture =
+      test::make_lite6_native_cclc_assistant_product_retention_fixture(
+          test::kZeroDigest, test::kZeroDigest);
+  const test::Lite6ControllableCompilerInputArtifactSource input_source(
+      fixture);
+  test::InMemoryCatalogArtifactStoreFixture catalog_store;
+  test::InMemoryRawArtifactStoreFixture raw_store;
+
+  const auto bundle = detail::RetainedBundleMaterializer::materialize(
+      fixture.qualified,
+      detail::RetentionMaterializerTestAccess::make_context(), input_source,
+      fixture.structural_preparations(), catalog_store, raw_store);
+
+  ASSERT_NE(bundle, nullptr);
+  EXPECT_TRUE(verify_retained_bundle_identity(*bundle));
+  EXPECT_EQ(bundle->value().cell_graph.cell_id.value(),
+            "i6_lite6_arm_gripper_aggregate_cell");
+  EXPECT_EQ(bundle->value().cell_graph.runtime_units.size(), 1U);
+  EXPECT_EQ(bundle->value().compiled_products.runtime_unit_products.size(),
+            1U);
+  ASSERT_TRUE(bundle->value().assistant.has_value());
+  EXPECT_TRUE(fixture.qualified.compiler_ir()
+                  .applicability()
+                  .assistant_settings()
+                  .enabled());
+}
+
 TEST(ControlDomainControlVerifier,
      StoppableRowsRoundTripCloseAndRejectScopeTampering) {
   const auto fixture =

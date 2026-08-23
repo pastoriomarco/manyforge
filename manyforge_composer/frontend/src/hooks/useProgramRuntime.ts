@@ -4,16 +4,19 @@ import { ApiError, api } from '../api/client';
 import { errorMessage } from '../state/structuralResource';
 import type {
   AppliedProgramSelection,
+  JsonValue,
   ProgramRunStatus,
+  ProgramWorkspaceResponse,
   ScenarioCatalogResponse,
 } from '../types/api';
+import type { ComposerHeadlessState } from '../types/headless';
+import { browserStableIdentity } from './useHeadlessState';
 
 const PROGRAM_STATUS_POLL_MS = 500;
 const ACTIVE_STATES = new Set([
   'running',
   'intervention_required',
   'stopping',
-  'finalizing',
 ]);
 
 function identity(prefix: string): string {
@@ -29,7 +32,7 @@ interface ProgramRuntimeState {
   selectedScenarioId: string | null;
   runnerAvailable: boolean;
   loading: boolean;
-  pending: 'run' | 'stop' | null;
+  pending: 'run' | 'stop' | 'reset' | null;
   error: string | null;
 }
 
@@ -43,6 +46,66 @@ const INITIAL_STATE: ProgramRuntimeState = {
   pending: null,
   error: null,
 };
+
+export function buildProgramStartRequest(
+  applied: AppliedProgramSelection | null,
+  runnerAvailable: boolean,
+  pending: ProgramRuntimeState['pending'],
+  snapshot: ComposerHeadlessState | null,
+  workspace: ProgramWorkspaceResponse | null,
+  requestOwnerEpoch: string,
+  requestId: string,
+): Record<string, JsonValue> | null {
+  if (
+    applied === null || !runnerAvailable || pending !== null
+    || snapshot === null || !snapshot.authoringAdmission.authoringAllowed
+    || snapshot.programCycle.state !== 'idle_after_reset'
+    || workspace === null
+    || workspace.draft.draftId !== snapshot.draftIdentity.draftId
+    || workspace.draft.draftRevision !== snapshot.draftIdentity.draftRevision
+    || !workspace.draft.programLoaded
+    || workspace.draft.programRevision !== applied.programRevision
+  ) return null;
+  return {
+    request_id: requestId,
+    request_owner_epoch: requestOwnerEpoch,
+    source_label: 'operator_ui',
+    correlation_id: requestId,
+    scenario_id: applied.scenarioId,
+    scenario_catalog_revision: applied.scenarioCatalogRevision,
+    expected_applied_record_digest: applied.recordDigest,
+    draft_program_revision: workspace.draft.programRevision,
+    expected_admission_generation: snapshot.authoringAdmission.admissionGeneration,
+  };
+}
+
+export function buildProgramResetRequest(
+  run: ProgramRunStatus | null,
+  snapshot: ComposerHeadlessState | null,
+  requestOwnerEpoch: string,
+  requestId: string,
+): Record<string, JsonValue> | null {
+  const cycle = snapshot?.programCycle;
+  if (
+    run === null || cycle === undefined
+    || cycle.state !== 'terminal_awaiting_reset'
+    || cycle.programRunId === null || cycle.cycleClaimGeneration === null
+    || cycle.terminalOrSettlementReference === null
+    || run.capture.programRunId !== cycle.programRunId
+  ) return null;
+  return {
+    request_id: requestId,
+    request_owner_epoch: requestOwnerEpoch,
+    source_label: 'operator_ui',
+    correlation_id: null,
+    program_run_id: cycle.programRunId,
+    expected_owner_epoch: cycle.programRunnerOwnerEpoch,
+    expected_cycle_generation: cycle.cycleGeneration,
+    expected_claim_generation: cycle.cycleClaimGeneration,
+    terminal_reference: cycle.terminalOrSettlementReference,
+    settlement_evidence_digest: cycle.terminalOrSettlementReference,
+  };
+}
 
 export function retainedScenarioSelection(
   selectedScenarioId: string | null,
@@ -67,13 +130,20 @@ export function scenarioSelectionAfterRequest(
     : selectedScenarioId;
 }
 
-export function useProgramRuntime(enabled: boolean) {
+export function useProgramRuntime(
+  enabled: boolean,
+  snapshot: ComposerHeadlessState | null = null,
+  workspace: ProgramWorkspaceResponse | null = null,
+) {
   const [state, setState] = useState<ProgramRuntimeState>(INITIAL_STATE);
   const mounted = useRef(true);
   const refreshing = useRef(false);
   const observedRunId = useRef<string | null>(null);
   const observedOwnerEpoch = useRef<string | null>(null);
-  const callerEpoch = useRef(identity('composer-program-client'));
+  const callerEpoch = useRef(browserStableIdentity(
+    'manyforge.composer.program_request_owner_epoch',
+    'composer-program-owner',
+  ));
 
   const refresh = useCallback(async () => {
     if (!enabled || refreshing.current) return;
@@ -157,6 +227,7 @@ export function useProgramRuntime(enabled: boolean) {
           ),
           runnerAvailable,
           loading: false,
+          pending: null,
           error: errors.length > 0 ? [...new Set(errors)].join(' ') : null,
         };
       });
@@ -210,23 +281,15 @@ export function useProgramRuntime(enabled: boolean) {
   }, []);
 
   const run = useCallback(async () => {
-    if (
-      !state.applied
-      || !state.runnerAvailable
-      || state.pending !== null
-    ) return;
+    const requestId = identity('program-run-start');
+    const request = buildProgramStartRequest(
+      state.applied, state.runnerAvailable, state.pending, snapshot, workspace,
+      callerEpoch.current, requestId,
+    );
+    if (request === null) return;
     setState((current) => ({ ...current, pending: 'run', error: null }));
     try {
-      const requestId = identity('program-run-start');
-      const status = await api.programs.start({
-        request_id: requestId,
-        request_owner_epoch: callerEpoch.current,
-        source_label: 'operator_ui',
-        correlation_id: requestId,
-        scenario_id: state.applied.scenarioId,
-        scenario_catalog_revision: state.applied.scenarioCatalogRevision,
-        expected_applied_record_digest: state.applied.recordDigest,
-      });
+      const status = await api.programs.start(request);
       observedRunId.current = status.capture.programRunId;
       observedOwnerEpoch.current = status.ownerEpoch;
       if (mounted.current) {
@@ -241,7 +304,23 @@ export function useProgramRuntime(enabled: boolean) {
         }));
       }
     }
-  }, [state.applied, state.pending, state.runnerAvailable]);
+  }, [snapshot, state.applied, state.pending, state.runnerAvailable, workspace]);
+
+  const reset = useCallback(async () => {
+    const request = buildProgramResetRequest(
+      state.run, snapshot, callerEpoch.current, identity('program-cycle-reset'),
+    );
+    if (request === null) return;
+    setState((current) => ({ ...current, pending: 'reset', error: null }));
+    try {
+      await api.programs.resetCycle(request);
+      await refresh();
+    } catch (reason) {
+      if (mounted.current) setState((current) => ({
+        ...current, pending: null, error: errorMessage(reason, 'Program Reset was rejected.'),
+      }));
+    }
+  }, [refresh, snapshot, state.run]);
 
   const stop = useCallback(async () => {
     if (
@@ -285,12 +364,14 @@ export function useProgramRuntime(enabled: boolean) {
 
   return {
     state,
+    cycleState: snapshot?.programCycle?.state ?? null,
     active,
     refresh,
     selectScenario,
     clearScenarioSelection,
     run,
     stop,
+    reset,
   };
 }
 

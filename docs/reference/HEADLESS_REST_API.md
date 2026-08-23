@@ -3,7 +3,7 @@
   Regenerate with:
     cd <repository-root>
     python3 scripts/regen-public-contracts.py headless-rest
-  Last regenerated: 2026-08-14 03:00:49 UTC
+  Last regenerated: 2026-08-23 10:23:59 UTC
   Generator source: scripts/regen-public-contracts.py:gen_headless_rest_api
 -->
 
@@ -25,8 +25,10 @@ OpenAPI version: `3.1.0`. Title: `ManyForge Headless Runtime API`.
 | `GET` | `/api/cclc/components/{component_id}/route-templates` |  | Cclc Route Templates |
 | `POST` | `/api/cclc/lifecycle/requests` |  | Cclc Lifecycle Submit |
 | `GET` | `/api/cclc/lifecycle/transactions/{transaction_id}` |  | Cclc Lifecycle Status |
+| `GET` | `/api/cclc/owner` |  | Cclc Owner Identity |
 | `POST` | `/api/cclc/routes/requests` |  | Cclc Route Submit |
 | `GET` | `/api/cclc/routes/transactions/{transaction_id}` |  | Cclc Route Status |
+| `GET` | `/api/cell/authoring-admission` |  | Authoring Admission |
 | `GET` | `/api/execution/alarms` |  | Alarms |
 | `POST` | `/api/execution/alarms/acknowledge-all` |  | Acknowledge All |
 | `GET` | `/api/execution/alarms/metrics` |  | Alarm Metrics |
@@ -62,6 +64,12 @@ OpenAPI version: `3.1.0`. Title: `ManyForge Headless Runtime API`.
 | `GET` | `/api/node-environment` |  | Node Environment |
 | `GET` | `/api/program/applied` |  | Program Applied |
 | `POST` | `/api/program/apply` |  | Program Apply |
+| `POST` | `/api/program/authoring-transactions` |  | Acquire Authoring Transaction |
+| `POST` | `/api/program/authoring-transactions/reconcile-owner` |  | Reconcile Authoring Owner |
+| `POST` | `/api/program/authoring-transactions/recovery-receipt` |  | Recover Authoring Transaction |
+| `POST` | `/api/program/authoring-transactions/settle` |  | Settle Authoring Transaction |
+| `POST` | `/api/program/cycle/reset` |  | Program Cycle Reset |
+| `GET` | `/api/program/cycle/status` |  | Program Cycle Status |
 | `POST` | `/api/program/model-attempts` |  | Program Model Attempt |
 | `GET` | `/api/program/runs` |  | Program Runs |
 | `POST` | `/api/program/runs` |  | Program Run Start |

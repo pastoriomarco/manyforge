@@ -49,7 +49,10 @@ public:
       const manyforge::deployment::IVerifiedRetainedBundleSource &bundle_source,
       const manyforge::deployment::IVerifiedRetainedProductArtifactSource
           &artifact_source,
-      std::string operating_system, std::string launch_environment_contract);
+      std::string operating_system, std::string launch_environment_contract,
+      std::filesystem::path logical_scene_database = {},
+      std::filesystem::path program_cycle_journal = {},
+      std::filesystem::path authoring_transaction_journal = {});
   RetainedNativeRuntimeUnitAdapter(
       std::filesystem::path trusted_installed_target_root,
       std::filesystem::path trusted_package_root,
@@ -59,7 +62,10 @@ public:
       const manyforge::deployment::IVerifiedRetainedProductArtifactSource
           &artifact_source,
       std::string operating_system,
-      std::vector<std::string> launch_environment_contracts);
+      std::vector<std::string> launch_environment_contracts,
+      std::filesystem::path logical_scene_database = {},
+      std::filesystem::path program_cycle_journal = {},
+      std::filesystem::path authoring_transaction_journal = {});
   ~RetainedNativeRuntimeUnitAdapter() override;
 
   RetainedNativeRuntimeUnitAdapter(const RetainedNativeRuntimeUnitAdapter &) =
@@ -102,6 +108,9 @@ public:
   [[nodiscard]] manyforge::core::Result<manyforge::core::AuthoringAdmissionDTO>
   UpdateCellAdmissionReadiness(
       const manyforge::core::CellAdmissionReadinessSnapshotDTO &snapshot)
+      override;
+  [[nodiscard]] manyforge::core::Result<void> Publish(
+      const manyforge::core::ManagerLivenessObservationDTO &observation)
       override;
   [[nodiscard]]
   manyforge::core::Result<manyforge::core::CellAdmissionClaimDTO>

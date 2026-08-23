@@ -777,7 +777,8 @@ Result<AuthoringAdmissionDTO> KernelCellAdmissionOwner::ReconcileCellAdmissionCl
                                                        "reconcile_replay_conflict");
     }
     auto replay_validation =
-        reconcile_validator_(reconcile.retained_claims, reconcile);
+        reconcile_validator_(reconcile.retained_claims, current_owners_,
+                             reconcile);
     if (!replay_validation.ok() ||
         replay_validation.value() != replay->second) {
       return AuthoringNotReady<AuthoringAdmissionDTO>(generation_,
@@ -803,7 +804,7 @@ Result<AuthoringAdmissionDTO> KernelCellAdmissionOwner::ReconcileCellAdmissionCl
     return AuthoringNotReady<AuthoringAdmissionDTO>(generation_,
                                                      "reconcile_inventory_not_exact");
   }
-  auto validation = reconcile_validator_(held, reconcile);
+  auto validation = reconcile_validator_(held, current_owners_, reconcile);
   if (!validation.ok()) {
     return AuthoringNotReady<AuthoringAdmissionDTO>(generation_,
                                                      "reconcile_evidence_not_exact");

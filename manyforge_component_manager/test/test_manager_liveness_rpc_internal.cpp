@@ -31,6 +31,9 @@ ManagerLivenessTransportRequestDTO Request() {
       RuntimeUnitId("manager.1"), RuntimeEpoch("manager-epoch.1"),
       RequestOwnerEpoch("manager-owner.1"), std::move(receivers)};
   return {set.required_receivers.front().runtime_unit_id,
+          ActiveBundlePublicationGeneration(4U),
+          GraphRevision("graph.1"),
+          ContentDigest(std::string(kDigest)),
           set,
           policy,
           ManagerHeartbeatDTO{
@@ -122,6 +125,19 @@ TEST(ManagerLivenessCommandAdmission,
 }
 
 TEST(ManagerLivenessCommandAdmission,
+     RequiredSetRebindInvalidatesPredecessorOpenGeneration) {
+  ManagerLivenessCommandAdmission admission;
+  const auto predecessor = admission.generation();
+  admission.OpenIfUnchanged(predecessor);
+  ASSERT_TRUE(admission.open());
+
+  admission.CloseForRequiredSetRebind();
+  EXPECT_FALSE(admission.open());
+  admission.OpenIfUnchanged(predecessor);
+  EXPECT_FALSE(admission.open());
+}
+
+TEST(ManagerLivenessCommandAdmission,
      ExactLeaseOpensThenExpiryClosesBeforeExactlyOneContainment) {
   auto clock = std::make_shared<FakeClock>();
   auto scheduler = std::make_unique<ManualScheduler>();
@@ -206,13 +222,35 @@ TEST(ManagerLivenessCommandAdmission,
 }
 
 TEST(ManagerLivenessBatchPolicy,
-     TwoReceiversShareOneDeadlineAndFailureWithholdsFullExpiry) {
+     NativeSubsetCarriesFullCrossTransportSetAndFailureWithholdsFullExpiry) {
   std::array requests{Request(), Request()};
+  const auto& native_policy = requests[0].policy;
+  for (auto& request : requests) {
+    request.required_set.required_receivers.push_back(
+        {RuntimeUnitId("program-runner.external"),
+         RuntimeEpoch("program-runner.epoch"),
+         RuntimePolicyId("policy.program-runner"),
+         RuntimePolicyRevision("1")});
+    request.required_set.required_runtime_set_digest =
+        ComputeRequiredRuntimeSetDigest(
+            request.required_set.required_receivers);
+    request.reconciliation->required_runtime_set_digest =
+        request.required_set.required_runtime_set_digest;
+  }
   requests[1].receiver_runtime_unit_id =
-      requests[1].required_set.required_receivers.back().runtime_unit_id;
+      requests[1].required_set.required_receivers[1].runtime_unit_id;
   EXPECT_NO_THROW(EncodeManagerLivenessRpcRequest(requests[0]));
   EXPECT_NO_THROW(EncodeManagerLivenessRpcRequest(requests[1]));
   EXPECT_EQ(requests[0].required_set, requests[1].required_set);
+  ASSERT_EQ(requests[0].required_set.required_receivers.size(), 3U);
+  for (const auto& request : requests) {
+    EXPECT_EQ(request.policy, native_policy);
+    EXPECT_EQ(request.required_set.required_runtime_set_digest,
+              ComputeRequiredRuntimeSetDigest(
+                  request.required_set.required_receivers));
+    EXPECT_EQ(request.required_set.required_receivers.back().runtime_unit_id,
+              RuntimeUnitId("program-runner.external"));
+  }
 
   const auto started =
       ManagerLivenessBatchDeadline::Clock::time_point(std::chrono::nanoseconds(
@@ -289,6 +327,35 @@ TEST(ManagerLivenessRpcInternal,
 }
 
 TEST(ManagerLivenessRpcInternal,
+     HeterogeneousRequiredSetUsesOnlyNamedReceiverPolicy) {
+  auto request = Request();
+  auto& other_receiver = request.required_set.required_receivers.back();
+  other_receiver.runtime_policy_id =
+      RuntimePolicyId("policy.program-runner");
+  other_receiver.runtime_policy_revision = RuntimePolicyRevision("1");
+  request.required_set.required_runtime_set_digest =
+      ComputeRequiredRuntimeSetDigest(
+          request.required_set.required_receivers);
+  request.reconciliation->required_runtime_set_digest =
+      request.required_set.required_runtime_set_digest;
+
+  const auto decoded =
+      DecodeManagerLivenessRpcRequest(
+          EncodeManagerLivenessRpcRequest(request));
+  EXPECT_EQ(EncodeManagerLivenessRpcRequest(decoded),
+            EncodeManagerLivenessRpcRequest(request));
+
+  request.policy.runtime_policy_id = other_receiver.runtime_policy_id;
+  request.policy.runtime_policy_revision =
+      other_receiver.runtime_policy_revision;
+  request.heartbeat.runtime_policy_id = request.policy.runtime_policy_id;
+  request.heartbeat.runtime_policy_revision =
+      request.policy.runtime_policy_revision;
+  EXPECT_THROW(EncodeManagerLivenessRpcRequest(request),
+               std::invalid_argument);
+}
+
+TEST(ManagerLivenessRpcInternal,
      RejectsMissingDuplicateForeignDigestAndNonCanonicalSequence) {
   auto request = Request();
   auto malformed = EncodeManagerLivenessRpcRequest(request);
@@ -318,12 +385,28 @@ TEST(ManagerLivenessRpcInternal,
   request.receiver_runtime_unit_id = RuntimeUnitId("foreign.receiver");
   EXPECT_THROW(EncodeManagerLivenessRpcRequest(request),
                std::invalid_argument);
+  request = Request();
+  request.active_publication_generation =
+      ActiveBundlePublicationGeneration(0U);
+  EXPECT_THROW(EncodeManagerLivenessRpcRequest(request),
+               std::invalid_argument);
+  request = Request();
+  request.active_public_pointer_digest = ContentDigest("foreign");
+  EXPECT_THROW(EncodeManagerLivenessRpcRequest(request),
+               std::invalid_argument);
 
   EXPECT_FALSE(IsManagerLivenessRpcPacket(
       "manyforge.manager-liveness.response.v1 foreign"));
   EXPECT_THROW(DecodeManagerLivenessRpcResponse(
                    "manyforge.manager-liveness.response.v1 foreign"),
                std::invalid_argument);
+  try {
+    static_cast<void>(DecodeManagerLivenessRpcResponse(
+        EncodeManagerLivenessRpcRejection("superseded_active_publication")));
+    FAIL() << "expected typed Manager-liveness rejection";
+  } catch (const ManagerLivenessRpcRejection& rejection) {
+    EXPECT_EQ(rejection.reason(), "superseded_active_publication");
+  }
 }
 
 }  // namespace

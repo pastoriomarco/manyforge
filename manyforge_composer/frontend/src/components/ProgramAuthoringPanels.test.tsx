@@ -519,12 +519,14 @@ describe('Program authoring panels', () => {
         pending: null,
         error: null,
       },
+      cycleState: null,
       active: false,
       refresh: vi.fn(),
       selectScenario: vi.fn(),
       clearScenarioSelection: vi.fn(),
       run: vi.fn(),
       stop: vi.fn(),
+      reset: vi.fn(),
     } satisfies ProgramRuntimeController;
     const markup = renderToStaticMarkup(
       <ProgramWorkspace
@@ -667,12 +669,14 @@ describe('Program authoring panels', () => {
         pending: null,
         error: null,
       },
+      cycleState: 'idle_after_reset',
       active: false,
       refresh: vi.fn(),
       selectScenario: vi.fn(),
       clearScenarioSelection: vi.fn(),
       run: vi.fn(),
       stop: vi.fn(),
+      reset: vi.fn(),
     } satisfies ProgramRuntimeController;
     const markup = renderToStaticMarkup(
       <ProgramWorkspace

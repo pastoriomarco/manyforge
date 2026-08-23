@@ -38,6 +38,7 @@ def _request() -> ManagerApplyRequest:
                 "retained_bundle_id": "bundle.1",
             },
             "reject_if_affected_busy": True,
+            "expected_admission_generation": 7,
         }
     )
 
@@ -61,6 +62,7 @@ def _scene_request() -> SceneTransactionRequest:
                     "content_hash": "sha256:" + "a" * 64,
                 },
             },
+            "expected_admission_generation": 7,
             "operation": {
                 "kind": "remove_object",
                 "scene_resource_id": "part.1",
@@ -133,6 +135,7 @@ def test_manager_client_uses_one_canonical_bounded_seqpacket(tmp_path: Path) -> 
         "correlation_id",
         "deployment_artifact_id",
         "deployment_revision",
+        "admission_context",
         "expected_current",
         "reject_if_affected_busy",
         "request_id",
@@ -141,6 +144,10 @@ def test_manager_client_uses_one_canonical_bounded_seqpacket(tmp_path: Path) -> 
     }
     assert decoded["source_label"] == "test"
     assert decoded["correlation_id"] == "correlation.1"
+    assert decoded["admission_context"] == {
+        "kind": "direct",
+        "expected_admission_generation": 7,
+    }
 
 
 def test_manager_client_default_wait_covers_a_bounded_durable_mutation(

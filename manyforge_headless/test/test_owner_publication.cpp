@@ -222,6 +222,8 @@ component_manager::ManagerApplyIntentDTO ApplyIntent(
       ProjectionRevision(admission),
       admission.retained_bundle_id(),
       admission.graph_revision(),
+      core::AdmissionGeneration(7U),
+      std::nullopt,
   };
 }
 

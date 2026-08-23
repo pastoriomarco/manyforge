@@ -4,13 +4,14 @@
 #include <cstdint>
 #include <filesystem>
 #include <manyforge_core/ports/icclc_journal.hpp>
+#include <manyforge_core/ports/ioperation_journal.hpp>
 #include <memory>
 #include <string_view>
 
 namespace manyforge::core {
 
 inline constexpr std::string_view kCCLCJournalSchemaId = "manyforge.internal.cclc.journal.v5";
-inline constexpr std::int64_t kCCLCJournalSchemaVersion = 5;
+inline constexpr std::int64_t kCCLCJournalSchemaVersion = 6;
 inline constexpr std::int64_t kCCLCJournalSqliteApplicationId = 0x4D464C4A;
 inline constexpr std::string_view kCCLCJournalFilename = "cclc-journal.sqlite3";
 inline constexpr std::size_t kDefaultCCLCExactResultHistory = 128U;
@@ -45,6 +46,20 @@ class SqliteCCLCJournal final : public ICCLCJournal {
       const RequestOwnerEpoch& active_owner_epoch, const ComponentLifecycleIntentDTO& intent,
       const ComponentLifecycleAcceptedDTO& candidate_acceptance,
       const ComponentLifecycleStatusDTO& candidate_initial_status) override;
+  [[nodiscard]] Result<void> RecordLifecycleClaimAttempt(
+      const RequestOwnerEpoch&, const CellAdmissionClaimIntentDTO&) override;
+  [[nodiscard]] Result<void> RecordLifecycleClaimAcquired(
+      const RequestOwnerEpoch&, const CellAdmissionClaimDTO&) override;
+  [[nodiscard]] Result<std::uint64_t> RecordLifecycleTerminalAndClaimRelease(
+      const RequestOwnerEpoch&, const ComponentLifecycleStatusDTO&,
+      const CellAdmissionClaimReleaseDTO&) override;
+  [[nodiscard]] Result<void> RecordLifecycleClaimReleaseReceipt(
+      const RequestOwnerEpoch&, const CellAdmissionClaimReleaseDTO&,
+      const CellAdmissionRecoveryReceiptDTO&) override;
+  [[nodiscard]] Result<void> RecordUnacceptedLifecycleClaimRelease(
+      const RequestOwnerEpoch&, const CellAdmissionClaimReleaseDTO&) override;
+  [[nodiscard]] Result<void> RecordLifecycleClaimNotAcquired(
+      const RequestOwnerEpoch&, const CellAdmissionClaimIntentDTO&) override;
 
   [[nodiscard]] Result<std::uint64_t> RecordEffectPrepared(
       const RequestOwnerEpoch& active_owner_epoch, const CCLCEffectAttemptDTO& prepared_attempt,
@@ -53,6 +68,11 @@ class SqliteCCLCJournal final : public ICCLCJournal {
   [[nodiscard]] Result<std::uint64_t> RecordEffectCompleted(
       const RequestOwnerEpoch& active_owner_epoch, const CCLCEffectAttemptDTO& completed_attempt,
       const ComponentLifecycleStatusDTO& successor_status) override;
+  [[nodiscard]] Result<std::uint64_t>
+  RecordEffectCompletedAndLifecycleClaimRelease(
+      const RequestOwnerEpoch&, const CCLCEffectAttemptDTO&,
+      const ComponentLifecycleStatusDTO&,
+      const CellAdmissionClaimReleaseDTO&) override;
 
   [[nodiscard]] Result<std::uint64_t> RecordLifecycleStatus(
       const RequestOwnerEpoch& active_owner_epoch,
@@ -102,5 +122,21 @@ class SqliteCCLCJournal final : public ICCLCJournal {
   class Impl;
   std::unique_ptr<Impl> impl_;
 };
+
+/// Verify one exact lifecycle-owner settlement without initializing schema,
+/// acquiring a write transaction, checkpointing, or mutating the journal.
+[[nodiscard]] Result<void> ValidateLifecycleCellAdmissionSettlementReadOnly(
+    const std::filesystem::path& database_path, const CellId& cell_id,
+    const CellAdmissionClaimDTO& claim,
+    const CellAdmissionClaimReleaseDTO& release);
+
+/// Authorize only an exact active CCLC owner epoch and quiescent durable
+/// lifecycle claim settlements. The reader never performs recovery or repair.
+[[nodiscard]] Result<CellAdmissionReconcileValidationDTO>
+ValidateLifecycleCellAdmissionReconciliationReadOnly(
+    const std::filesystem::path& database_path, const CellId& cell_id,
+    const std::vector<CellAdmissionClaimDTO>& held_claims,
+    const std::vector<CellAdmissionCurrentOwnerEpochDTO>& current_owner_epochs,
+    const CellAdmissionReconcileDTO& reconcile);
 
 }  // namespace manyforge::core

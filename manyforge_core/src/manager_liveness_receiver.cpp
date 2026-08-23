@@ -410,6 +410,60 @@ Result<void> ManagerLivenessReceiver::BeginManagerEpochReplacement(
   return Result<void>::Ok();
 }
 
+Result<void> ManagerLivenessReceiver::RebindRequiredSet(
+    RetainedBundleId active_bundle_id,
+    ContentDigest required_runtime_set_digest) {
+  if (active_bundle_id.empty() ||
+      !content_identity::is_sha256_digest(required_runtime_set_digest.value())) {
+    return Rejected("required_set_rebind_identity_invalid");
+  }
+  std::optional<ManagerLivenessObservationDTO> observation;
+  ScheduleHandle old_handle{};
+  {
+    std::lock_guard lock(state_->mutex);
+    if (state_->destroyed) {
+      return Rejected("receiver_destroyed");
+    }
+    if (state_->status.state == ManagerLivenessStateDTO::kExpired) {
+      return Rejected("manager_epoch_expired");
+    }
+    if (state_->status.receiver_status_sequence >=
+        kMaximumManagerLivenessCounter) {
+      return Rejected("status_sequence_exhausted");
+    }
+    old_handle = state_->schedule_handle;
+    ++state_->schedule_generation;
+    state_->schedule_handle = 0U;
+    state_->has_receipt = false;
+    state_->last_receipt_time = 0;
+    state_->config.active_bundle_id = std::move(active_bundle_id);
+    state_->config.required_runtime_set_digest =
+        std::move(required_runtime_set_digest);
+    state_->status.last_accepted_heartbeat_sequence = 0U;
+    ++state_->status.receiver_status_sequence;
+    state_->status.local_receipt_age_ns = 0;
+    state_->status.state = ManagerLivenessStateDTO::kUnreconciled;
+    state_->status.command_fenced = true;
+    state_->status.fault_or_effect_reference.reset();
+    ++state_->reconciliation_generation;
+    state_->reconciliation_in_progress = false;
+    observation.emplace(state_->ObservationLocked());
+  }
+  bool cancellation_failed = false;
+  if (old_handle != 0U) {
+    try {
+      state_->scheduler->cancel(old_handle);
+    } catch (...) {
+      cancellation_failed = true;
+    }
+  }
+  auto published = state_->observation_port->Publish(*observation);
+  if (cancellation_failed) {
+    return WatchdogUnavailable();
+  }
+  return published;
+}
+
 Result<void> ManagerLivenessReceiver::CompleteReconciliation(
     const ManagerLivenessReconciliationAck& acknowledgement) {
   if (!content_identity::is_sha256_digest(
@@ -485,8 +539,12 @@ Result<void> ManagerLivenessReceiver::CompleteReconciliation(
 }
 
 ManagerLivenessStatusDTO ManagerLivenessReceiver::status() const {
+  return observation().status;
+}
+
+ManagerLivenessObservationDTO ManagerLivenessReceiver::observation() const {
   std::lock_guard lock(state_->mutex);
-  return state_->ObservationLocked().status;
+  return state_->ObservationLocked();
 }
 
 }  // namespace manyforge::core

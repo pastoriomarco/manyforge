@@ -4,6 +4,7 @@
 #include <cstdint>
 #include <memory>
 #include <manyforge_core/types/configuration_fence.hpp>
+#include <manyforge_core/types/cell_admission.hpp>
 #include <manyforge_core/types/logical_scene_snapshot.hpp>
 #include <manyforge_core/types/projection_common.hpp>
 #include <manyforge_core/types/scene_frame_resolution.hpp>
@@ -116,6 +117,7 @@ struct SceneTransactionRequestDTO final {
   RequestAttributionDTO attribution{};
   ProjectionRevisionDTO expected_projection_revision;
   SceneOperationRequestDTO operation;
+  std::optional<AdmissionGeneration> expected_admission_generation;
 };
 
 /// Owner-private, non-durable scene-successor request used by deterministic

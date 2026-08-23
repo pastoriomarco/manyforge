@@ -2354,7 +2354,11 @@ TEST(RetainedProductCrossConsumer,
       10'000'000,
       {0.0, 0.0, 1.57, 0.0, 0.0, 0.0},
       core::StopDeadlineBudgetDTO{1'000'000'000, 100'000'000, {}},
-      kMaintainedNativeStopSurveillancePolicy};
+      kMaintainedNativeStopSurveillancePolicy,
+      {},
+      {},
+      {},
+      {}};
   ManagedKernelAdmissionGate admission_gate;
   deployment::FilesystemCatalogArtifactStore runtime_policy_store(package_root);
   const auto runtime_policy = deployment::resolve_retained_runtime_policy(

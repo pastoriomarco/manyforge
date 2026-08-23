@@ -24,6 +24,7 @@ from manyforge_composer.backend.routes_headless import create_headless_router
 from manyforge_composer.backend.state import ComposerState
 from manyforge_headless_api.app import TrustedPrincipal, create_app
 from manyforge_headless_api.cclc import CCLCOpenRequestClient
+from manyforge_headless_api.cell_admission import CellAdmissionClient
 from manyforge_headless_api.client import HeadlessClientError, HeadlessHttpClient
 from manyforge_headless_api.execution import ExecutionCommandClient
 from manyforge_headless_api.models import (
@@ -170,11 +171,11 @@ def _expected_active_configuration(
 
 def _qualify_native_cclc_product(
     execution_root: Path,
-    owner_epoch: str,
 ) -> None:
     client = CCLCOpenRequestClient(execution_root, timeout_seconds=5.0)
+    admission = CellAdmissionClient(execution_root, timeout_seconds=5.0)
 
-    def context(request_id: str) -> dict[str, Any]:
+    def context(request_id: str, owner_epoch: str) -> dict[str, Any]:
         return {
             "request_id": request_id,
             "request_owner_epoch": owner_epoch,
@@ -182,7 +183,9 @@ def _qualify_native_cclc_product(
         }
 
     for intent_kind in ("prepare", "enable"):
+        owner_epoch = client.owner_identity()["request_owner_epoch"]
         snapshot = client.component_snapshot("lite6_arm")
+        admission_generation = admission.get()["admission_generation"]
         expected_domains = [
             {
                 "control_domain_id": domain["control_domain_id"],
@@ -207,7 +210,7 @@ def _qualify_native_cclc_product(
         result = client.submit_lifecycle(
             {
                 "request_context": context(
-                    f"process.lifecycle.{intent_kind}"
+                    f"process.lifecycle.{intent_kind}", owner_epoch
                 ),
                 "controllable_component_id": snapshot[
                     "controllable_component_id"
@@ -217,6 +220,7 @@ def _qualify_native_cclc_product(
                 "expected_component_lifecycle_generation": snapshot[
                     "component_lifecycle_generation"
                 ],
+                "expected_admission_generation": admission_generation,
                 "expected_control_domains": expected_domains,
             }
         )
@@ -231,18 +235,17 @@ def _qualify_native_cclc_product(
             label=intent_kind,
         )
 
-    _submit_native_cclc_routes(execution_root, owner_epoch)
+    _submit_native_cclc_routes(execution_root)
 
 
 def _submit_native_cclc_routes(
     execution_root: Path,
-    owner_epoch: str,
     *,
     request_prefix: str = "process.route",
 ) -> None:
     client = CCLCOpenRequestClient(execution_root, timeout_seconds=5.0)
 
-    def context(request_id: str) -> dict[str, Any]:
+    def context(request_id: str, owner_epoch: str) -> dict[str, Any]:
         return {
             "request_id": request_id,
             "request_owner_epoch": owner_epoch,
@@ -259,6 +262,7 @@ def _submit_native_cclc_routes(
             f"native CCLC product has an unexpected route set: {domain_ids}"
         )
     for domain_id in domain_ids:
+        owner_epoch = client.owner_identity()["request_owner_epoch"]
         template_set = client.route_templates("lite6_arm")
         template = next(
             row
@@ -268,7 +272,9 @@ def _submit_native_cclc_routes(
         )
         result = client.submit_route(
             {
-                "request_context": context(f"{request_prefix}.{domain_id}"),
+                "request_context": context(
+                    f"{request_prefix}.{domain_id}", owner_epoch
+                ),
                 "expected_retained_bundle_id": template_set[
                     "retained_bundle_id"
                 ],
@@ -394,7 +400,6 @@ def _start_host(
                     try:
                         _qualify_native_cclc_product(
                             execution_root,
-                            response["status"]["owner_epoch"],
                         )
                     except Exception as error:
                         _stop_host(process)
@@ -1011,6 +1016,40 @@ def _place_planning_request() -> dict[str, Any]:
             _planning_motion("place.retreat", _cartesian_path(0.2, 0.3)),
         ),
     }
+
+
+def test_production_standalone_cclc_remains_closed_without_manager_liveness(
+    tmp_path: Path,
+) -> None:
+    built_fixture = _required_path("MANYFORGE_I6_NATIVE_FIXTURE_ROOT")
+    fixture_root = tmp_path / "fixture"
+    shutil.copytree(built_fixture, fixture_root)
+    manifest = json.loads((fixture_root / "manifest.json").read_text("utf-8"))
+    execution_root = tmp_path / "execution"
+    staging_root = tmp_path / "staging"
+    execution_root.mkdir()
+    staging_root.mkdir()
+
+    process = _start_host(
+        fixture_root,
+        execution_root,
+        staging_root,
+        manifest,
+        host_environment="MANYFORGE_NATIVE_PRODUCTION_EXECUTION_HOST",
+        qualify_cclc=False,
+    )
+    try:
+        admission = CellAdmissionClient(
+            execution_root, timeout_seconds=5.0
+        ).get()
+        assert admission["authoring_allowed"] is False
+        before = _wait_for_cclc_component(execution_root)
+        with pytest.raises(HeadlessApiError) as rejected:
+            _qualify_native_cclc_product(execution_root)
+        assert rejected.value.code == "authoring_not_ready"
+        assert _wait_for_cclc_component(execution_root) == before
+    finally:
+        _stop_host(process)
 
 
 def test_reconciliation_gate_does_not_block_ordinary_accept_or_exact_read(
@@ -2372,6 +2411,9 @@ def test_planning_stop_and_active_host_replacement_are_bounded(
 
     try:
         first_epoch = headless.execution_status()["status"]["owner_epoch"]
+        cclc_owner_before_loss = CCLCOpenRequestClient(
+            execution_root, timeout_seconds=5.0
+        ).owner_identity()["request_owner_epoch"]
         cclc_before_loss = _wait_for_cclc_component(execution_root)
         planning_acceptance = _runner_submission(
             runner,
@@ -2516,7 +2558,7 @@ def test_planning_stop_and_active_host_replacement_are_bounded(
                 {
                     "request_context": {
                         "request_id": "process.route.stale-owner",
-                        "request_owner_epoch": first_epoch,
+                        "request_owner_epoch": cclc_owner_before_loss,
                         "source_label": "native-process-qualification",
                     },
                     "expected_retained_bundle_id": templates[
@@ -2536,7 +2578,6 @@ def test_planning_stop_and_active_host_replacement_are_bounded(
             )
         _submit_native_cclc_routes(
             execution_root,
-            restarted["owner_epoch"],
             request_prefix="process.route.after-child-sigkill",
         )
 

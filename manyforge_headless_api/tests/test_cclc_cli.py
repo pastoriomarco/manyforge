@@ -27,6 +27,14 @@ class FakeHeadlessClient:
         self.calls.append(("component", component_id))
         return {"controllable_component_id": component_id}
 
+    def cclc_owner_identity(self) -> dict[str, Any]:
+        self.calls.append(("owner_identity", None))
+        return {"request_owner_epoch": "cclc-owner.cli-test"}
+
+    def authoring_admission(self) -> dict[str, Any]:
+        self.calls.append(("authoring_admission", None))
+        return {"admission_generation": 7, "authoring_allowed": True}
+
     def cclc_route_templates(self, component_id: str) -> dict[str, Any]:
         self.calls.append(("templates", component_id))
         return {"controllable_component_id": component_id, "templates": []}
@@ -78,16 +86,21 @@ def test_cli_component_and_status_are_stateless_owner_reads(
 
 
 @pytest.mark.parametrize(
-    ("command", "method"),
+    ("command", "method", "submitted_fields"),
     [
-        ("cclc-lifecycle-submit", "lifecycle_submit"),
-        ("cclc-route-submit", "route_submit"),
+        (
+            "cclc-lifecycle-submit",
+            "lifecycle_submit",
+            {"expected_admission_generation": 7},
+        ),
+        ("cclc-route-submit", "route_submit", {}),
     ],
 )
-def test_cli_adds_only_explicit_confirmation_to_the_exact_request_file(
+def test_cli_adds_admission_only_to_lifecycle_and_preserves_route_selection(
     tmp_path: Path,
     command: str,
     method: str,
+    submitted_fields: dict[str, Any],
 ) -> None:
     request = {
         "request_context": {
@@ -101,11 +114,30 @@ def test_cli_adds_only_explicit_confirmation_to_the_exact_request_file(
     path.write_text(json.dumps(request), encoding="utf-8")
 
     assert cli.main([command, str(path), "--confirmed"]) == 0
-    assert FakeHeadlessClient.instances[-1].calls == [
-        (method, {**request, "confirmed": True})
-    ]
+    expected_calls = []
+    if command == "cclc-lifecycle-submit":
+        expected_calls.append(("authoring_admission", None))
+    expected_calls.append(("owner_identity", None))
+    expected_request = {
+        **request,
+        "request_context": {
+            **request["request_context"],
+            "request_owner_epoch": "cclc-owner.cli-test",
+        },
+    }
+    expected_calls.append(
+        (
+            method,
+            {**expected_request, **submitted_fields, "confirmed": True},
+        )
+    )
+    assert FakeHeadlessClient.instances[-1].calls == expected_calls
 
     request["confirmed"] = True
     path.write_text(json.dumps(request), encoding="utf-8")
     assert cli.main([command, str(path), "--confirmed"]) == 65
-    assert FakeHeadlessClient.instances[-1].calls == []
+    assert FakeHeadlessClient.instances[-1].calls == (
+        [("authoring_admission", None)]
+        if command == "cclc-lifecycle-submit"
+        else []
+    )

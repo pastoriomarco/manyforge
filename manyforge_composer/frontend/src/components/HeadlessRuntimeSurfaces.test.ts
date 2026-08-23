@@ -172,6 +172,20 @@ describe('headless Composer presentation adapters', () => {
     };
     const snapshot: ComposerHeadlessState = {
       schemaVersion: 'manyforge.composer_headless_state.v1',
+      clientId: 'composer-browser.fixture',
+      complete: true,
+      authoringAdmission: { authoringAllowed: true, admissionGeneration: 1 },
+      programCycle: {
+        programRunnerOwnerEpoch: 'runner.epoch.1',
+        cycleGeneration: 1,
+        state: 'idle_after_reset',
+        programRunId: null,
+        cycleClaimGeneration: null,
+        terminalOrSettlementReference: null,
+      },
+      draftIdentity: { draftId: 'draft-1', draftRevision: 1 },
+      receiverEpoch: 'receiver.epoch.1',
+      snapshotSequence: 1,
       runtime: {
         schemaVersion: 'manyforge.headless_runtime_snapshot.v1',
         complete: true,

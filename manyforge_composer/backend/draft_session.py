@@ -32,6 +32,7 @@ from manyforge_behavior.program import (
 
 _DRAFT_API_VERSION = "manyforge.composer_draft.v1"
 _WORKSPACE_API_VERSION = "manyforge.composer_program_workspace.v1"
+_RETAINED_STATE_API_VERSION = "manyforge.composer_retained_draft.v1"
 _PROGRAM_API_VERSION = "manyforge.program.v1"
 _MAXIMUM_DRAFT_REVISION = 9_007_199_254_740_991
 _ROOT_ALIAS = "@root"
@@ -690,6 +691,112 @@ class ComposerDraftSession:
         with self._lock:
             return self._program is not None
 
+    def retained_state(self) -> dict[str, Any]:
+        """Return the complete bounded local owner state needed after restart."""
+
+        with self._lock:
+            return {
+                "schema_version": _RETAINED_STATE_API_VERSION,
+                "draft_id": self._draft_id,
+                "draft_revision": self._revision,
+                "program": (
+                    self._program.to_dict() if self._program is not None else None
+                ),
+                "saved_path": self._saved_path,
+                "saved_program_revision": self._saved_program_revision,
+                "saved_document": deepcopy(self._saved_document),
+            }
+
+    def restore_retained_state(
+        self, state: dict[str, Any], catalog: NodeCatalog
+    ) -> None:
+        """Validate and atomically restore one journal-owned local post-image."""
+
+        expected_fields = {
+            "schema_version",
+            "draft_id",
+            "draft_revision",
+            "program",
+            "saved_path",
+            "saved_program_revision",
+            "saved_document",
+        }
+        if type(state) is not dict or set(state) != expected_fields:
+            _error(
+                "composer_retained_draft_invalid",
+                "retained Composer Draft has an invalid shape",
+                status_code=503,
+            )
+        draft_id = state["draft_id"]
+        revision = state["draft_revision"]
+        document = state["program"]
+        saved_path = state["saved_path"]
+        saved_revision = state["saved_program_revision"]
+        saved_document = state["saved_document"]
+        if (
+            state["schema_version"] != _RETAINED_STATE_API_VERSION
+            or type(draft_id) is not str
+            or not draft_id
+            or type(revision) is not int
+            or not 0 <= revision <= _MAXIMUM_DRAFT_REVISION
+            or (document is None) != (revision == 0)
+            or (saved_path is None)
+            != (saved_revision is None or saved_document is None)
+            or (saved_revision is None) != (saved_document is None)
+        ):
+            _error(
+                "composer_retained_draft_invalid",
+                "retained Composer Draft identities are inconsistent",
+                status_code=503,
+            )
+        program: Program | None = None
+        if document is not None:
+            try:
+                program = Program.from_dict(
+                    deepcopy(document), catalog, path="<composer-retained-draft>"
+                )
+            except ProgramValidationError as error:
+                _error(
+                    "composer_retained_draft_invalid",
+                    f"retained Composer Draft is invalid: {error}",
+                    status_code=503,
+                )
+        resolved_saved_path: str | None = None
+        if saved_document is not None:
+            try:
+                saved = Program.from_dict(
+                    deepcopy(saved_document),
+                    catalog,
+                    path="<composer-retained-saved-program>",
+                )
+            except ProgramValidationError as error:
+                _error(
+                    "composer_retained_draft_invalid",
+                    f"retained Saved Program is invalid: {error}",
+                    status_code=503,
+                )
+            if saved.program_revision != saved_revision or type(saved_path) is not str:
+                _error(
+                    "composer_retained_draft_invalid",
+                    "retained Saved Program identity is inconsistent",
+                    status_code=503,
+                )
+            try:
+                resolved_saved_path = str(Path(saved_path).resolve())
+            except (OSError, RuntimeError, ValueError) as error:
+                _error(
+                    "composer_retained_draft_invalid",
+                    f"retained Saved Program path is invalid: {error}",
+                    status_code=503,
+                )
+        with self._lock:
+            self._draft_id = draft_id
+            self._revision = revision
+            self._program = program
+            self._saved_path = resolved_saved_path
+            self._saved_program_revision = saved_revision
+            self._saved_document = deepcopy(saved_document)
+
     def snapshot(self) -> dict[str, Any]:
         with self._lock:
             return self._snapshot_locked()
@@ -875,6 +982,15 @@ class ComposerDraftSession:
                     status_code=409,
                 )
 
+    def require_current(self, *, draft_id: str, expected_revision: int) -> None:
+        """Reject a stale Draft fence without consulting another owner."""
+
+        with self._lock:
+            self._require_identity_locked(
+                draft_id=draft_id,
+                expected_revision=expected_revision,
+            )
+
     def replace_program(
         self,
         program: Program,
@@ -940,6 +1056,7 @@ class ComposerDraftSession:
         current_applied_program_revision: str | None,
         loader: Callable[[], tuple[Program, str]],
         applier: Callable[[Program], dict[str, Any]],
+        replacement_draft_id: str | None = None,
     ) -> tuple[dict[str, Any], dict[str, Any]]:
         """Run normative Load under one Draft fence; publish locally last."""
 
@@ -966,7 +1083,7 @@ class ComposerDraftSession:
                 )
             program, source_path = loader()
             result = applier(program)
-            self._draft_id = f"draft-{uuid.uuid4().hex}"
+            self._draft_id = replacement_draft_id or f"draft-{uuid.uuid4().hex}"
             self._program = program
             self._revision = 1
             self._saved_path = str(Path(source_path).resolve())
@@ -1306,6 +1423,27 @@ class ComposerDraftSession:
                 details=details,
                 snapshot=self._snapshot_locked(),
             )
+
+    def preview_mutation(
+        self,
+        *,
+        tool_id: str,
+        arguments: dict[str, Any],
+        expected_revision: int,
+        catalog: NodeCatalog,
+        draft_id: str | None = None,
+    ) -> DraftMutationResult:
+        """Validate one mutation against an isolated exact Draft snapshot."""
+
+        preview = ComposerDraftSession()
+        preview.restore_retained_state(self.retained_state(), catalog)
+        return preview.mutate(
+            tool_id=tool_id,
+            arguments=arguments,
+            expected_revision=expected_revision,
+            catalog=catalog,
+            draft_id=draft_id,
+        )
 
     def _edit(
         self,

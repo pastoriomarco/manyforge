@@ -189,6 +189,8 @@ def test_private_surface_projects_owner_facts_and_manages_lifecycle() -> None:
                 "scenario_id": "cell-pick",
                 "scenario_catalog_revision": _DIGEST_A,
                 "expected_applied_record_digest": _DIGEST_B,
+                "draft_program_revision": _DIGEST_B,
+                "expected_admission_generation": 7,
             },
         )
         read = client.get("/api/program/runs/program-run.1")
@@ -237,6 +239,8 @@ def test_private_surface_rejects_unknown_fields_and_path_body_mismatch() -> None
                 "scenario_id": "cell-pick",
                 "scenario_catalog_revision": _DIGEST_A,
                 "expected_applied_record_digest": _DIGEST_B,
+                "draft_program_revision": _DIGEST_B,
+                "expected_admission_generation": 7,
                 "invented": True,
             },
         )
@@ -291,6 +295,8 @@ def test_program_start_preconditions_map_to_client_conflict(code: str) -> None:
                 "scenario_id": "cell-pick",
                 "scenario_catalog_revision": _DIGEST_A,
                 "expected_applied_record_digest": _DIGEST_B,
+                "draft_program_revision": _DIGEST_B,
+                "expected_admission_generation": 7,
             },
         )
     assert response.status_code == 409

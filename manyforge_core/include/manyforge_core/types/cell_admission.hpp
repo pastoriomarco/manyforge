@@ -299,5 +299,9 @@ ComputeCellAdmissionRecoveryFootprint(
 [[nodiscard]] Result<void> ValidateProgramCycleStatus(const ProgramCycleStatusDTO& status);
 [[nodiscard]] Result<ContentDigest> CellAdmissionClaimIntentDigest(
     const CellAdmissionClaimIntentDTO& intent);
+[[nodiscard]] Result<ContentDigest>
+CellAdmissionOwnerEpochReconciliationEvidenceDigest(
+    CellAdmissionOwnerRoleDTO owner_role,
+    const RequestOwnerEpoch& owner_epoch);
 
 }  // namespace manyforge::core

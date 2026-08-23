@@ -57,6 +57,11 @@ export function admitHeadlessState(
   candidate: ComposerHeadlessState,
 ): HeadlessStateAdmission {
   if (current === null) return { accepted: true, reason: null };
+  if (candidate.receiverEpoch === current.receiverEpoch) {
+    if (candidate.snapshotSequence <= current.snapshotSequence) {
+      return { accepted: false, reason: 'Headless snapshot sequence regressed.' };
+    }
+  }
   const runtimeReason = monotonicOwnerSection(
     'Headless runtime projection',
     current.runtime.projectionOwnerId,
@@ -85,13 +90,40 @@ export function admitHeadlessState(
     : { accepted: false, reason: alarmReason };
 }
 
-function websocketUrl(): string {
+function websocketUrl(clientId: string): string {
   const resolved = new URL(
     resolveStructuralAssetUrl('/ws/state'),
     window.location.href,
   );
   resolved.protocol = resolved.protocol === 'https:' ? 'wss:' : 'ws:';
+  resolved.searchParams.set('client_id', clientId);
   return resolved.toString();
+}
+
+export function browserStableIdentity(storageKey: string, prefix: string): string {
+  const valid = (value: string | null): value is string =>
+    value !== null && new RegExp(`^${prefix}\\.[A-Za-z0-9_-]{8,256}$`).test(value);
+  try {
+    const stored = globalThis.localStorage?.getItem(storageKey);
+    if (valid(stored)) return stored;
+    const random = globalThis.crypto?.randomUUID?.()
+      ?? `${Date.now()}-${Math.random().toString(16).slice(2)}`;
+    const value = `${prefix}.${random}`;
+    globalThis.localStorage?.setItem(storageKey, value);
+    return value;
+  } catch {
+    const random = globalThis.crypto?.randomUUID?.()
+      ?? `${Date.now()}-${Math.random().toString(16).slice(2)}`;
+    return `${prefix}.${random}`;
+  }
+}
+
+function browserClientId(): string {
+  return browserStableIdentity('manyforge.composer.client_id', 'composer-browser');
+}
+
+export function headlessClientId(): string {
+  return browserClientId();
 }
 
 type Listener = () => void;
@@ -151,6 +183,7 @@ export class HeadlessStateSource {
   };
   private readonly shellListeners = new Set<Listener>();
   private readonly viewerListeners = new Set<Listener>();
+  readonly clientId = browserClientId();
 
   constructor() {
     headlessSourceRecords.add(this.qualificationRecord);
@@ -217,12 +250,14 @@ export class HeadlessStateSource {
       publishHeadlessQualification();
     }
     socket?.close(1000, reason);
+    this.latest = null;
+    this.publishImmediate(this.result());
   }
 
   private connect(): void {
     if (!this.enabled || this.disposed) return;
     const serial = ++this.serial;
-    const socket = new WebSocket(websocketUrl());
+    const socket = new WebSocket(websocketUrl(this.clientId));
     this.socket = socket;
     headlessSocketCreations += 1;
     publishHeadlessQualification();
@@ -256,22 +291,16 @@ export class HeadlessStateSource {
             return;
           }
         }
-        const candidate = parseComposerHeadlessState(raw);
+        const candidate = {
+          ...parseComposerHeadlessState(raw),
+          clientId: this.clientId,
+        };
         const admission = admitHeadlessState(this.latest, candidate);
         if (!admission.accepted) {
           this.publishError(admission.reason);
           socket.close(1002, 'non-monotonic headless projection');
           return;
         }
-        if (
-          this.latestError === null
-          && this.latest?.runtime.projectionOwnerEpoch
-            === candidate.runtime.projectionOwnerEpoch
-          && this.latest.runtime.projectionGeneration
-            === candidate.runtime.projectionGeneration
-          && this.latest.alarms.ownerEpoch === candidate.alarms.ownerEpoch
-          && this.latest.alarms.generation === candidate.alarms.generation
-        ) return;
         this.latest = candidate;
         this.latestError = null;
         this.scheduleViewer();
@@ -317,6 +346,7 @@ export class HeadlessStateSource {
 
   private publishError(error: string | null): void {
     this.latestError = error;
+    if (error !== null) this.latest = null;
     this.cancelPublications();
     this.publishImmediate(this.result());
   }

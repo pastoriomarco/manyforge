@@ -31,6 +31,7 @@
 #include <manyforge_core/logical_scene_identity.hpp>
 #include <manyforge_core/manager_liveness_receiver.hpp>
 #include <manyforge_core/pick_place_planning_owner.hpp>
+#include <manyforge_core/sqlite_cclc_journal.hpp>
 #include <manyforge_core/runtime_participant_binding.hpp>
 #include <manyforge_core/types/native_projection_capability.hpp>
 #include <manyforge_deployment/artifact_codec.hpp>
@@ -62,6 +63,7 @@
 #include <manyforge_roboplan/retained_planning_model_stage.hpp>
 #include <manyforge_roboplan/retained_scene_frame_resolver.hpp>
 #include <manyforge_scene/logical_scene_value_codec.hpp>
+#include <manyforge_scene/canonical_empty_scene_owner.hpp>
 #include <manyforge_scene/scene_transaction_codec.hpp>
 #include <map>
 #include <memory>
@@ -90,6 +92,7 @@
 #include "managed_kernel_apply_fence_owner.hpp"
 #include "manager_liveness_rpc_internal.hpp"
 #include "native_projection_rpc_internal.hpp"
+#include "owner_settlement_readers.hpp"
 #include "product_backed_runtime_participant_resolver.hpp"
 #include "selected_runtime_composition_rpc_internal.hpp"
 
@@ -379,9 +382,14 @@ struct ManagedRuntimeChildConfig final {
   int package_root_fd{-1};
   std::filesystem::path package_root;
   std::filesystem::path manager_state_root;
+  std::filesystem::path logical_scene_database;
+  std::filesystem::path program_cycle_journal;
+  std::filesystem::path authoring_transaction_journal;
   std::filesystem::path staging_root;
   std::filesystem::path candidate_worker;
   std::string cell_id;
+  core::RetainedBundleId retained_bundle_id{""};
+  core::GraphRevision graph_revision{""};
   std::string runtime_unit_id;
   std::string runtime_epoch;
   std::string product_identity;
@@ -436,12 +444,23 @@ ParseManagedRuntimeArguments(const int argc, char **argv) {
       config.package_root_fd = ParseFileDescriptor(value);
     } else if (option == "--manyforge-managed-manager-state-root") {
       config.manager_state_root = value;
+    } else if (option == "--manyforge-managed-logical-scene-database") {
+      config.logical_scene_database = value;
+    } else if (option == "--manyforge-managed-program-cycle-journal") {
+      config.program_cycle_journal = value;
+    } else if (option ==
+               "--manyforge-managed-authoring-transaction-journal") {
+      config.authoring_transaction_journal = value;
     } else if (option == "--manyforge-managed-staging-root") {
       config.staging_root = value;
     } else if (option == "--manyforge-managed-candidate-worker") {
       config.candidate_worker = value;
     } else if (option == "--manyforge-managed-cell-id") {
       config.cell_id = value;
+    } else if (option == "--manyforge-managed-retained-bundle-id") {
+      config.retained_bundle_id = core::RetainedBundleId(value);
+    } else if (option == "--manyforge-managed-graph-revision") {
+      config.graph_revision = core::GraphRevision(value);
     } else if (option == "--runtime-unit-id") {
       config.runtime_unit_id = value;
     } else if (option == "--runtime-epoch") {
@@ -454,13 +473,19 @@ ParseManagedRuntimeArguments(const int argc, char **argv) {
       Fail("unknown managed runtime option " + option);
     }
   }
-  Require(seen.size() == 10U && config.manager_channel_fd >= 0 &&
-              config.package_root_fd == kManagedPackageRootFd,
+  Require(seen.size() >= 12U && seen.size() <= 15U &&
+              config.manager_channel_fd >= 0 &&
+              config.package_root_fd == kManagedPackageRootFd &&
+              config.program_cycle_journal.empty() ==
+                  config.authoring_transaction_journal.empty(),
           "managed runtime invocation is incomplete");
   Require(IsPortableRuntimeIdentity(config.cell_id) &&
               IsPortableRuntimeIdentity(config.runtime_unit_id) &&
               IsPortableRuntimeIdentity(config.runtime_epoch),
           "managed runtime identity is invalid");
+  Require(!config.retained_bundle_id.empty() &&
+              !config.graph_revision.empty(),
+          "managed runtime retained descriptor is invalid");
   Require(core::IsExactLowercaseSha256Digest(config.product_identity) &&
               core::IsExactLowercaseSha256Digest(config.configuration_identity),
           "managed runtime retained identity is invalid");
@@ -476,6 +501,33 @@ ParseManagedRuntimeArguments(const int argc, char **argv) {
       std::to_string(config.package_root_fd);
   config.manager_state_root = ExistingDirectory(
       std::move(config.manager_state_root), "managed Manager state root");
+  if (!config.logical_scene_database.empty()) {
+    config.logical_scene_database = ExistingRegularFile(
+        std::move(config.logical_scene_database),
+        "managed logical-scene database", false);
+  }
+  const auto validate_future_database = [](std::filesystem::path path,
+                                           const std::string_view label) {
+    Require(!path.empty() && path.has_filename() && path.filename() != "." &&
+                path.filename() != "..",
+            std::string(label) + " path is invalid");
+    static_cast<void>(ExistingDirectory(path.parent_path(),
+                                        std::string(label) + " parent"));
+    std::error_code error;
+    const auto status = std::filesystem::symlink_status(path, error);
+    Require((!error || error == std::errc::no_such_file_or_directory) &&
+                !std::filesystem::is_symlink(status),
+            std::string(label) + " path is not a safe physical leaf");
+    return path;
+  };
+  if (!config.program_cycle_journal.empty()) {
+    config.program_cycle_journal = validate_future_database(
+        std::move(config.program_cycle_journal),
+        "managed Program-cycle journal");
+    config.authoring_transaction_journal = validate_future_database(
+        std::move(config.authoring_transaction_journal),
+        "managed Composer authoring transaction journal");
+  }
   config.staging_root = ExistingDirectory(std::move(config.staging_root),
                                           "managed native staging root");
   config.candidate_worker = ExistingRegularFile(
@@ -4258,8 +4310,135 @@ struct CompositionBuildInput final {
   bool attach_addressed_owner{true};
   std::shared_ptr<WallClock> shared_clock;
   std::filesystem::path manager_state_root;
+  std::filesystem::path logical_scene_database;
+  std::filesystem::path program_cycle_journal;
+  std::filesystem::path authoring_transaction_journal;
   std::shared_ptr<RetainedPlannerSceneProjection> planner_scene_projection;
 };
+
+[[nodiscard]] core::CellAdmissionSettlementValidator
+BuildOwnerSettlementValidator(
+    std::filesystem::path manager_apply_journal,
+    std::filesystem::path logical_scene_database,
+    std::filesystem::path program_cycle_journal,
+    std::filesystem::path authoring_transaction_journal,
+    std::filesystem::path lifecycle_journal, core::CellId cell_id) {
+  if (manager_apply_journal.empty() && logical_scene_database.empty() &&
+      program_cycle_journal.empty() &&
+      authoring_transaction_journal.empty() && lifecycle_journal.empty()) {
+    return {};
+  }
+  return [manager_apply_journal = std::move(manager_apply_journal),
+          logical_scene_database = std::move(logical_scene_database),
+          program_cycle_journal = std::move(program_cycle_journal),
+          authoring_transaction_journal =
+              std::move(authoring_transaction_journal),
+          lifecycle_journal = std::move(lifecycle_journal),
+          cell_id = std::move(cell_id)](
+             const core::CellAdmissionClaimDTO &claim,
+             const core::CellAdmissionClaimReleaseDTO &release) {
+    switch (claim.intent.claim_kind) {
+    case core::CellAdmissionClaimKindDTO::kProgramCycle:
+      return detail::ValidateProgramCycleSettlementReadOnly(
+          program_cycle_journal, claim, release);
+    case core::CellAdmissionClaimKindDTO::kAuthoringMutation:
+      return detail::ValidateAuthoringSettlementReadOnly(
+          authoring_transaction_journal, claim, release);
+    case core::CellAdmissionClaimKindDTO::kManagerApply:
+      return component_manager::
+          ValidateManagerApplyCellAdmissionSettlementReadOnly(
+              manager_apply_journal, cell_id, claim, release);
+    case core::CellAdmissionClaimKindDTO::kComponentLifecycle:
+      return core::ValidateLifecycleCellAdmissionSettlementReadOnly(
+          lifecycle_journal, cell_id, claim, release);
+    case core::CellAdmissionClaimKindDTO::kAuthoredScene:
+      return scene::ValidateAuthoredSceneCellAdmissionSettlementReadOnly(
+          logical_scene_database, cell_id, claim, release);
+    default:
+      return core::Result<void>::Err(core::ErrorDTO{
+          "invariant_violation",
+          "cell-admission owner settlement reader is unavailable",
+          {{"reason", "settlement_owner_reader_unavailable"}}});
+    }
+  };
+}
+
+[[nodiscard]] core::CellAdmissionReconcileValidator
+BuildOwnerReconciliationValidator(
+    std::filesystem::path program_cycle_journal,
+    std::filesystem::path authoring_transaction_journal,
+    std::filesystem::path lifecycle_journal, core::CellId cell_id) {
+  return [program_cycle_journal = std::move(program_cycle_journal),
+          authoring_transaction_journal =
+              std::move(authoring_transaction_journal),
+          lifecycle_journal = std::move(lifecycle_journal),
+          cell_id = std::move(cell_id)](
+             const std::vector<core::CellAdmissionClaimDTO>& held_claims,
+             const std::vector<core::CellAdmissionCurrentOwnerEpochDTO>&
+                 current_owner_epochs,
+             const core::CellAdmissionReconcileDTO& reconcile) {
+    std::optional<core::CellAdmissionOwnerRoleDTO> changed_role;
+    const auto note_changed_role = [&](const auto role) {
+      if (changed_role.has_value() && *changed_role != role) {
+        return core::Result<core::CellAdmissionReconcileValidationDTO>::Err(
+            core::ErrorDTO{
+                "invariant_violation",
+                "owner reconciliation may replace exactly one role",
+                {{"reason", "multiple_owner_role_reconciliation_unsupported"}}});
+      }
+      changed_role = role;
+      return core::Result<core::CellAdmissionReconcileValidationDTO>::Ok({});
+    };
+    for (const auto& current : current_owner_epochs) {
+      const auto requested = std::find_if(
+          reconcile.current_owner_epochs.begin(),
+          reconcile.current_owner_epochs.end(), [&](const auto& owner) {
+            return owner.owner_role == current.owner_role;
+          });
+      if (requested == reconcile.current_owner_epochs.end() ||
+          requested->owner_epoch != current.owner_epoch) {
+        const auto noted = note_changed_role(current.owner_role);
+        if (!noted.ok()) return noted;
+      }
+    }
+    for (const auto& requested : reconcile.current_owner_epochs) {
+      const auto current = std::find_if(
+          current_owner_epochs.begin(), current_owner_epochs.end(),
+          [&](const auto& owner) {
+            return owner.owner_role == requested.owner_role;
+          });
+      if (current == current_owner_epochs.end()) {
+        const auto noted = note_changed_role(requested.owner_role);
+        if (!noted.ok()) return noted;
+      }
+    }
+    if (!changed_role.has_value()) {
+      return core::Result<core::CellAdmissionReconcileValidationDTO>::Err(
+          core::ErrorDTO{"invariant_violation",
+                         "owner reconciliation has no supported replacement",
+                         {{"reason", "owner_role_reconciliation_unsupported"}}});
+    }
+    switch (*changed_role) {
+    case core::CellAdmissionOwnerRoleDTO::kProgramRunner:
+      return detail::ValidateProgramRunnerOwnerReconciliationReadOnly(
+          program_cycle_journal, held_claims, current_owner_epochs, reconcile);
+    case core::CellAdmissionOwnerRoleDTO::kAuthoringOwner:
+      return detail::ValidateAuthoringOwnerReconciliationReadOnly(
+          authoring_transaction_journal, held_claims, current_owner_epochs,
+          reconcile);
+    case core::CellAdmissionOwnerRoleDTO::kComponentLifecycleOwner:
+      return core::ValidateLifecycleCellAdmissionReconciliationReadOnly(
+          lifecycle_journal, cell_id, held_claims, current_owner_epochs,
+          reconcile);
+    default:
+      return core::Result<core::CellAdmissionReconcileValidationDTO>::Err(
+          core::ErrorDTO{
+              "invariant_violation",
+              "owner role has no durable reconciliation reader",
+              {{"reason", "owner_role_reconciliation_unsupported"}}});
+    }
+  };
+}
 
 [[nodiscard]] std::unique_ptr<Composition>
 BuildProductComposition(CompositionBuildInput input) {
@@ -4772,7 +4951,44 @@ BuildProductComposition(CompositionBuildInput input) {
       execution_tick_period_ns,
       retained_runtime_configuration.initial_joint_positions_rad,
       std::nullopt,
-      kMaintainedNativeStopSurveillancePolicy};
+      kMaintainedNativeStopSurveillancePolicy,
+      {},
+      {},
+      {},
+      {}};
+#if defined(MANYFORGE_ENABLE_STANDALONE_ADMISSION_FIXTURE)
+  const std::vector<core::RequiredManagerLivenessReceiverDTO>
+      fixture_receivers;
+  runtime_config.manager_liveness_required_set =
+      core::ManagerLivenessRequiredSetDTO{
+          input.cell_id,
+          input.bundle->retained_bundle_id(),
+          core::ComputeRequiredRuntimeSetDigest(fixture_receivers),
+          core::RuntimeUnitId("standalone-admission-fixture.manager"),
+          core::RuntimeEpoch("standalone-admission-fixture.manager-epoch"),
+          core::RequestOwnerEpoch(
+              "standalone-admission-fixture.manager-owner"),
+          fixture_receivers};
+#endif
+  const auto manager_apply_journal =
+      input.manager_state_root /
+      std::string(component_manager::kManagerApplyJournalFilename);
+  if (!input.program_cycle_journal.empty() &&
+      !input.authoring_transaction_journal.empty()) {
+    runtime_config.cell_admission_settlement_validator =
+        BuildOwnerSettlementValidator(
+            manager_apply_journal, input.logical_scene_database,
+            input.program_cycle_journal, input.authoring_transaction_journal,
+            input.execution_state_root /
+                std::string(core::kCCLCJournalFilename),
+            input.cell_id);
+  }
+  runtime_config.cell_admission_reconcile_validator =
+      BuildOwnerReconciliationValidator(
+          input.program_cycle_journal, input.authoring_transaction_journal,
+          input.execution_state_root /
+              std::string(core::kCCLCJournalFilename),
+          input.cell_id);
   auto runtime = input.attach_addressed_owner
                      ? create_retained_native_runtime(std::move(runtime_input),
                                                       std::move(runtime_config))
@@ -5007,6 +5223,9 @@ BuildComposition(const HostConfig &config,
       {},
       {},
       {},
+      {},
+      {},
+      {},
   });
 }
 
@@ -5051,7 +5270,6 @@ Ros2ControlCellSupervisorEpoch(const Composition &composition) {
 
 void AttachRetainedNativeCCLC(Composition &composition,
                               const HostConfig &config,
-                              const core::RequestOwnerEpoch &owner_epoch,
                               ManagedKernelApplyFenceOwner &fence_owner) {
   Require(composition.runtime != nullptr &&
               composition.runtime->addressed_kernel != nullptr &&
@@ -5154,7 +5372,8 @@ void AttachRetainedNativeCCLC(Composition &composition,
       config.execution_state_root,
       config.execution_state_root,
       core::CellId(config.cell_id),
-      {owner_epoch, 1024U, 2U, 2U, 10'000'000LL, 30'000'000'000LL,
+      {core::RequestOwnerEpoch(RandomToken("cclc-owner-")),
+       1024U, 2U, 2U, 10'000'000LL, 30'000'000'000LL,
        30'000'000'000LL}};
   auto cclc = CreateRetainedNativeCCLCRuntime(
       RetainedNativeCCLCRuntimeConfig{std::move(cclc_config), 1'000'000'000LL},
@@ -5162,7 +5381,7 @@ void AttachRetainedNativeCCLC(Composition &composition,
       std::move(active_publication.value()), *artifact_source,
       lifecycle_product.value()->catalog_source(),
       lifecycle_product.value()->brand_ports(), *composition.runtime,
-      fence_owner, fence_owner
+      fence_owner, *composition.runtime->addressed_kernel, fence_owner
 #if defined(MANYFORGE_ROS2_CONTROL_EXECUTION_HOST)
       , composition.ros2_control_runtime_handle->lifecycle_snapshot_source()
 #endif
@@ -5244,9 +5463,7 @@ void TryAttachManagedCCLC(Composition &composition,
   attachment_config.candidate_worker = config.candidate_worker;
   attachment_config.cell_id = config.cell_id;
   AttachRetainedNativeCCLC(
-      composition, attachment_config,
-      core::RequestOwnerEpoch("kernel-owner-" + config.runtime_epoch),
-      fence_owner);
+      composition, attachment_config, fence_owner);
 }
 
 [[nodiscard]] std::optional<CompositionBuildInput>
@@ -5384,6 +5601,9 @@ TryBuildCurrentManagedCompositionInput(
       true,
       {},
       config.manager_state_root,
+      config.logical_scene_database,
+      config.program_cycle_journal,
+      config.authoring_transaction_journal,
       std::move(planner_scene_projection),
   };
 }
@@ -5583,6 +5803,9 @@ LoadExactManagedCandidateBundle(
       false,
       std::move(shared_clock),
       config.manager_state_root,
+      config.logical_scene_database,
+      config.program_cycle_journal,
+      config.authoring_transaction_journal,
       std::move(planner_scene_projection),
   };
 }
@@ -5622,6 +5845,62 @@ RunManagedRuntimeChild(const ManagedRuntimeChildConfig &config) {
   std::unique_ptr<core::SqliteOperationJournal> detached_operation_journal;
   std::unique_ptr<core::ResourceAddressedExecutionKernel>
       detached_addressed_kernel;
+  const auto read_current_publication = [&] {
+    component_manager::SqliteActiveBundlePublicationStore publication_store(
+        config.manager_state_root /
+            std::string(
+                component_manager::kActiveBundlePublicationStoreFilename),
+        core::CellId(config.cell_id));
+    const auto integrity = publication_store.VerifyIntegrity();
+    Require(integrity.current_generation.nonzero(),
+            "managed active retained-bundle publication is absent");
+    auto publication = publication_store.ReadActiveBundlePublication(
+        integrity.current_generation);
+    publication_store.Close();
+    Require(publication.ok() && publication.value().valid(),
+            "managed active retained-bundle publication cannot be verified");
+    return std::move(publication.value());
+  };
+  detached_owner_clock = std::make_shared<WallClock>();
+  detached_operation_journal =
+      std::make_unique<core::SqliteOperationJournal>(
+          config.staging_root /
+              std::string(core::kOperationJournalFilename),
+          core::CellId(config.cell_id));
+  core::ResourceAddressedExecutionKernelConfig bootstrap_kernel_config{
+      core::RequestOwnerEpoch("kernel-owner-" + config.runtime_epoch),
+      core::CellId(config.cell_id), 1024U, {}, &admission_gate,
+      std::nullopt};
+  bootstrap_kernel_config.empty_runtime_retained_bundle_id =
+      config.retained_bundle_id;
+  bootstrap_kernel_config.empty_runtime_graph_revision =
+      config.graph_revision;
+  bootstrap_kernel_config.cell_admission_claim_capacity = 1024U;
+  bootstrap_kernel_config.cell_admission_reconcile_validator =
+      BuildOwnerReconciliationValidator(
+          config.program_cycle_journal, config.authoring_transaction_journal,
+          config.staging_root / std::string(core::kCCLCJournalFilename),
+          core::CellId(config.cell_id));
+  if (!config.program_cycle_journal.empty() &&
+      !config.authoring_transaction_journal.empty()) {
+    bootstrap_kernel_config.cell_admission_settlement_validator =
+        BuildOwnerSettlementValidator(
+            config.manager_state_root /
+                std::string(
+                    component_manager::kManagerApplyJournalFilename),
+            config.logical_scene_database, config.program_cycle_journal,
+            config.authoring_transaction_journal,
+            config.staging_root / std::string(core::kCCLCJournalFilename),
+            core::CellId(config.cell_id));
+  }
+  detached_addressed_kernel =
+      std::make_unique<core::ResourceAddressedExecutionKernel>(
+          std::vector<core::RuntimeParticipantExecutionRegistration>{},
+          *detached_owner_clock, *detached_operation_journal,
+          std::move(bootstrap_kernel_config));
+  admission_gate.BindResourceTable(
+      detached_addressed_kernel->resource_admission_table());
+  fence_owner.BindDisableHandoffKernel(*detached_addressed_kernel);
   component_manager::detail::ManagerLivenessCommandAdmission
       manager_liveness_admission;
   component_manager::detail::ChildOwnedManagerLivenessReceiver
@@ -5631,8 +5910,15 @@ RunManagedRuntimeChild(const ManagedRuntimeChildConfig &config) {
               SimpleSchedulerConfig::from_environment()));
   std::optional<core::ManagerLivenessReceiverConfig>
       manager_liveness_receiver_config;
+  std::optional<core::ActiveBundlePublicationGeneration>
+      manager_liveness_publication_generation;
+  std::optional<core::ContentDigest>
+      manager_liveness_public_pointer_digest;
+  std::optional<core::ManagerLivenessRequiredSetDTO>
+      manager_liveness_required_set;
   std::set<std::pair<std::string, std::string>> retired_manager_epochs;
   ExecutionCompositionAccess execution_composition;
+  execution_composition.addressed_kernel = detached_addressed_kernel.get();
   ManagedExecutionSurfaceControl execution_surface_control(
       config.staging_root, &execution_composition, &manager_liveness_admission,
       core::RequestOwnerEpoch("kernel-owner-" + config.runtime_epoch));
@@ -5674,13 +5960,6 @@ RunManagedRuntimeChild(const ManagedRuntimeChildConfig &config) {
     if (active_managed_composition != nullptr &&
         active_managed_composition->runtime->addressed_kernel != nullptr) {
       return active_managed_composition->runtime->addressed_kernel.get();
-    }
-    return nullptr;
-  };
-
-  const auto stable_runtime = [&]() -> RetainedNativeRuntime* {
-    if (active_managed_composition != nullptr) {
-      return active_managed_composition->runtime.get();
     }
     return nullptr;
   };
@@ -5763,6 +6042,8 @@ RunManagedRuntimeChild(const ManagedRuntimeChildConfig &config) {
           preparing_composition_request.has_value()) {
         return;
       }
+      input->attach_addressed_owner = false;
+      input->shared_clock = detached_owner_clock;
       current_composition_builder_started = true;
       current_composition_building = true;
     }
@@ -5771,13 +6052,31 @@ RunManagedRuntimeChild(const ManagedRuntimeChildConfig &config) {
           try {
             auto built = BuildProductComposition(std::move(input));
             InstallDirectSceneFrameResolver(projections, *built);
-            Require(built->runtime->addressed_kernel != nullptr,
-                    "current managed composition has no addressed Kernel");
-            fence_owner.BindDisableHandoffKernel(
-                *built->runtime->addressed_kernel);
             {
               std::lock_guard lock(managed_composition_mutex);
               std::unique_lock execution_lock(execution_composition.mutex);
+              Require(detached_addressed_kernel != nullptr &&
+                          detached_operation_journal != nullptr &&
+                          detached_owner_clock != nullptr &&
+                          built->runtime->addressed_kernel == nullptr &&
+                          built->runtime->clock == detached_owner_clock,
+                      "current managed composition duplicated the stable "
+                      "addressed owner");
+              auto reconfigured =
+                  detached_addressed_kernel->reconfigure_runtime_participants(
+                      built->runtime->participant_registrations,
+                      std::move(built->runtime->participant_resolver));
+              if (!reconfigured.ok()) {
+                Fail("stable Kernel rejected current runtime participants: " +
+                     reconfigured.error().message);
+              }
+              built->runtime->operation_journal =
+                  std::move(detached_operation_journal);
+              built->runtime->addressed_kernel =
+                  std::move(detached_addressed_kernel);
+              detached_owner_clock.reset();
+              fence_owner.BindDisableHandoffKernel(
+                  *built->runtime->addressed_kernel);
               active_managed_composition = std::move(built);
               execution_composition.current = active_managed_composition.get();
               execution_composition.addressed_kernel =
@@ -6038,7 +6337,25 @@ RunManagedRuntimeChild(const ManagedRuntimeChildConfig &config) {
                           std::string(core::kOperationJournalFilename),
                       1024U, &admission_gate,
                       prepared->runtime->motion_binding.value().graph_revision,
-                      prepared->runtime->cell_stop_deadline_budget});
+                      prepared->runtime->cell_stop_deadline_budget,
+                      {},
+                      BuildOwnerSettlementValidator(
+                          config.manager_state_root /
+                              std::string(component_manager::
+                                              kManagerApplyJournalFilename),
+                          config.logical_scene_database,
+                          config.program_cycle_journal,
+                          config.authoring_transaction_journal,
+                          config.staging_root /
+                              std::string(core::kCCLCJournalFilename),
+                          core::CellId(config.cell_id)),
+                      BuildOwnerReconciliationValidator(
+                          config.program_cycle_journal,
+                          config.authoring_transaction_journal,
+                          config.staging_root /
+                              std::string(core::kCCLCJournalFilename),
+                          core::CellId(config.cell_id)),
+                      {}});
               admission_gate.BindResourceTable(
                   prepared->runtime->addressed_kernel
                       ->resource_admission_table());
@@ -6182,6 +6499,7 @@ RunManagedRuntimeChild(const ManagedRuntimeChildConfig &config) {
             return row.runtime_unit_id.value() == config.runtime_unit_id;
           });
       Require(required != decoded.required_set.required_receivers.end() &&
+                  decoded.required_set.cell_id.value() == config.cell_id &&
                   decoded.receiver_runtime_unit_id == required->runtime_unit_id &&
                   required->runtime_epoch.value() == config.runtime_epoch,
               "Manager liveness request names a foreign receiver");
@@ -6194,10 +6512,8 @@ RunManagedRuntimeChild(const ManagedRuntimeChildConfig &config) {
                       decoded.policy.runtime_policy_revision,
               "Manager liveness request differs from retained policy");
       std::lock_guard lock(managed_composition_mutex);
-      auto* const runtime = stable_runtime();
       auto* const kernel = stable_addressed_kernel();
-      if (runtime == nullptr || runtime->clock == nullptr ||
-          runtime->scheduler == nullptr || kernel == nullptr) {
+      if (kernel == nullptr) {
         const core::ManagerLivenessStatusDTO pending_status{
             decoded.required_set.cell_id,
             required->runtime_unit_id,
@@ -6224,9 +6540,33 @@ RunManagedRuntimeChild(const ManagedRuntimeChildConfig &config) {
                         pending_status)}));
         continue;
       }
-      Require(active_managed_composition->bundle->retained_bundle_id() ==
-                  decoded.required_set.active_bundle_id,
-              "Manager liveness request differs from active native bundle");
+      const auto current_publication = read_current_publication();
+      const bool request_is_current_publication =
+          current_publication.publication_generation ==
+              decoded.active_publication_generation &&
+          current_publication.request.candidate_retained_bundle_id ==
+              decoded.required_set.active_bundle_id &&
+          current_publication.request.candidate_graph_revision ==
+              decoded.active_graph_revision &&
+          current_publication.durable_public_pointer_content_digest ==
+              decoded.active_public_pointer_digest;
+      if (!request_is_current_publication &&
+          decoded.active_publication_generation.value() <
+              current_publication.publication_generation.value()) {
+        // Manager snapshots and the active-publication commit are independent
+        // durable reads. A renewal minted immediately before that commit may
+        // therefore arrive after it. It is stale and must not renew, install,
+        // or reconcile anything, but this expected race is not a child-fatal
+        // protocol violation—even when it precedes the first accepted renewal.
+        SendManagedRuntimePacket(
+            config.manager_channel_fd,
+            component_manager::detail::EncodeManagerLivenessRpcRejection(
+                "superseded_active_publication"));
+        continue;
+      }
+      Require(request_is_current_publication,
+              "Manager liveness request has foreign active-publication "
+              "identity");
       const core::ManagerLivenessReceiverConfig receiver_config{
           decoded.required_set.cell_id,
           required->runtime_unit_id,
@@ -6250,6 +6590,11 @@ RunManagedRuntimeChild(const ManagedRuntimeChildConfig &config) {
             },
             *kernel, *kernel);
         manager_liveness_receiver_config = receiver_config;
+        manager_liveness_publication_generation =
+            decoded.active_publication_generation;
+        manager_liveness_public_pointer_digest =
+            decoded.active_public_pointer_digest;
+        manager_liveness_required_set = decoded.required_set;
       } else {
         Require(manager_liveness_receiver_config.has_value() &&
                     manager_liveness_receiver_config->cell_id ==
@@ -6261,12 +6606,25 @@ RunManagedRuntimeChild(const ManagedRuntimeChildConfig &config) {
                         receiver_config.receiver_runtime_epoch &&
                     manager_liveness_receiver_config->policy ==
                         receiver_config.policy &&
-                    manager_liveness_receiver_config->active_bundle_id ==
-                        receiver_config.active_bundle_id &&
                     manager_liveness_receiver_config
-                            ->required_runtime_set_digest ==
-                        receiver_config.required_runtime_set_digest,
+                            ->manager_runtime_unit_id ==
+                        receiver_config.manager_runtime_unit_id &&
+                    manager_liveness_publication_generation.has_value() &&
+                    manager_liveness_public_pointer_digest.has_value(),
                 "Manager liveness request changed immutable receiver evidence");
+        const bool publication_changed =
+            *manager_liveness_publication_generation !=
+                decoded.active_publication_generation ||
+            *manager_liveness_public_pointer_digest !=
+                decoded.active_public_pointer_digest;
+        Require(!publication_changed ||
+                    (manager_liveness_receiver_config
+                             ->manager_runtime_epoch ==
+                         receiver_config.manager_runtime_epoch &&
+                     manager_liveness_receiver_config->manager_owner_epoch ==
+                         receiver_config.manager_owner_epoch),
+                "Manager liveness publication rebind changed Manager "
+                "identity");
         if (manager_liveness_receiver_config->manager_runtime_epoch !=
                 receiver_config.manager_runtime_epoch ||
             manager_liveness_receiver_config->manager_owner_epoch !=
@@ -6294,6 +6652,70 @@ RunManagedRuntimeChild(const ManagedRuntimeChildConfig &config) {
               receiver_config.manager_runtime_epoch;
           manager_liveness_receiver_config->manager_owner_epoch =
               receiver_config.manager_owner_epoch;
+        }
+        if (publication_changed) {
+          const auto* const named =
+              std::get_if<core::NamedApplyPublicationTransactionDTO>(
+                  &current_publication.request.transaction_ref);
+          Require(named != nullptr &&
+                      installed_composition_request.has_value() &&
+                      installed_composition_request->apply_id ==
+                          named->apply_id &&
+                      installed_composition_request->apply_generation ==
+                          named->apply_generation &&
+                      installed_composition_request
+                              ->projection_stage_generation ==
+                          named->projection_stage_generation &&
+                      installed_composition_request
+                              ->candidate_projection_revision ==
+                          current_publication.request
+                              .candidate_projection_revision &&
+                      installed_composition_request->runtime_unit_id ==
+                          required->runtime_unit_id &&
+                      installed_composition_request->runtime_epoch ==
+                          required->runtime_epoch &&
+                      installed_composition_request->manager_runtime_epoch ==
+                          receiver_config.manager_runtime_epoch &&
+                      installed_composition_request
+                                  ->expected_predecessor_publication_generation
+                                  .value() +
+                              1U ==
+                          current_publication.publication_generation.value(),
+                  "Manager liveness successor lacks exact installed "
+                  "composition evidence");
+          manager_liveness_admission.CloseForRequiredSetRebind();
+          const auto installed =
+              kernel->ReplaceManagerLivenessRequiredSet(decoded.required_set);
+          Require(installed.ok(),
+                  "Kernel rejected the successor Manager-liveness required "
+                  "set");
+          const auto rebound =
+              manager_liveness_receiver.get()->RebindRequiredSet(
+                  receiver_config.active_bundle_id,
+                  receiver_config.required_runtime_set_digest);
+          Require(rebound.ok(),
+                  "Manager-liveness receiver rejected the successor "
+                  "required-set rebind");
+          manager_liveness_receiver_config->active_bundle_id =
+              receiver_config.active_bundle_id;
+          manager_liveness_receiver_config->required_runtime_set_digest =
+              receiver_config.required_runtime_set_digest;
+          manager_liveness_required_set = decoded.required_set;
+          manager_liveness_publication_generation =
+              decoded.active_publication_generation;
+          manager_liveness_public_pointer_digest =
+              decoded.active_public_pointer_digest;
+        } else {
+          Require(manager_liveness_required_set.has_value() &&
+                      *manager_liveness_required_set ==
+                          decoded.required_set &&
+                      manager_liveness_receiver_config->active_bundle_id ==
+                          receiver_config.active_bundle_id &&
+                      manager_liveness_receiver_config
+                              ->required_runtime_set_digest ==
+                          receiver_config.required_runtime_set_digest,
+                  "Manager liveness request changed required-set identity "
+                  "without a publication transition");
         }
       }
       const auto admission_generation = manager_liveness_admission.generation();
@@ -7756,8 +8178,22 @@ public:
         admission_gate_);
     fence_owner_->BindDisableHandoffKernel(
         *composition_->runtime->addressed_kernel);
-    AttachRetainedNativeCCLC(*composition_, config_, owner_epoch_,
-                             *fence_owner_);
+#if defined(MANYFORGE_ENABLE_STANDALONE_ADMISSION_FIXTURE)
+    const auto fixture_readiness =
+        composition_->runtime->addressed_kernel->UpdateCellAdmissionReadiness(
+            core::CellAdmissionReadinessSnapshotDTO{
+                true,
+                core::ProgramCycleStatusDTO{
+                    core::RequestOwnerEpoch(
+                        "standalone-admission-fixture.program-runner"),
+                    1U, core::ProgramCycleStateDTO::kIdleAfterReset,
+                    std::nullopt, std::nullopt, std::nullopt},
+                true, 0U, 0U, true, true, 0U, 0U, 0U});
+    Require(fixture_readiness.ok() &&
+                fixture_readiness.value().authoring_allowed,
+            "standalone admission fixture did not reach deterministic Idle");
+#endif
+    AttachRetainedNativeCCLC(*composition_, config_, *fence_owner_);
     composition_access_.current = composition_.get();
     composition_access_.addressed_kernel =
         composition_->runtime->addressed_kernel.get();

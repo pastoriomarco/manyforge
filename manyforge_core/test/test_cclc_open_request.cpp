@@ -29,6 +29,7 @@ using content_identity::CanonicalValue;
   return CanonicalValue(CanonicalValue::Object{
       {"controllable_component_id", CanonicalValue("component.arm")},
       {"expected_component_lifecycle_generation", CanonicalValue(4.0)},
+      {"expected_admission_generation", CanonicalValue(7.0)},
       {"expected_control_domains",
        CanonicalValue(CanonicalValue::Array{CanonicalValue(CanonicalValue::Object{
            {"control_domain_id", CanonicalValue("domain.arm")},
@@ -88,6 +89,10 @@ using content_identity::CanonicalValue;
 
 class FakeOpenPort final : public ICCLCOpenRequestPort {
  public:
+  RequestOwnerEpoch ReadRequestOwnerEpoch() const override {
+    return RequestOwnerEpoch("cclc-owner.test");
+  }
+
   Result<CCLCLifecycleRequestResultDTO> SubmitLifecycle(
       const ComponentLifecycleIntentDTO& intent) override {
     lifecycle_intent = intent;
@@ -135,6 +140,19 @@ class FakeOpenPort final : public ICCLCOpenRequestPort {
   mutable std::optional<ControllableComponentId> component_id_read;
   mutable std::optional<ControllableComponentId> route_template_component_id;
 };
+
+TEST(CCLCOpenRequest, ProjectsTheSoleRequestOwnerIdentity) {
+  FakeOpenPort port;
+  const auto result = ExecuteCanonicalCCLCOpenRequest(
+      Request("owner_identity", CanonicalValue(CanonicalValue::Object{})), port,
+      {RequestTransportDTO::kHttp, RequestAssuranceDTO::kUnverified,
+       std::nullopt});
+  ASSERT_TRUE(result.ok()) << result.error().message;
+  const auto response = content_identity::parse_canonical_json(result.value());
+  EXPECT_EQ(Member(Member(response, "result"), "request_owner_epoch")
+                .as_string(),
+            "cclc-owner.test");
+}
 
 TEST(CCLCOpenRequest, StampsTransportAttributionAndPreservesLifecycleReplayResult) {
   FakeOpenPort port;

@@ -65,6 +65,23 @@ def test_terminal_blocks_new_cycle_and_reset_replays_after_restart(tmp_path) -> 
         intent=reset_intent,
         cycle_generation=1,
     )
+    release = {
+        "owner_role": "program_runner",
+        "owner_epoch": "runner.epoch.1",
+        "owner_transaction_id": "program-cycle.1",
+        "request_id": "start.1",
+        "request_payload_digest": "sha256:" + "a" * 64,
+        "acquired_admission_generation": 6,
+        "claim_generation": 7,
+        "settlement": {
+            "settlement_kind": "explicit_reset",
+            "evidence_digest": "sha256:" + "b" * 64,
+        },
+    }
+    journal.remember_release_intent(
+        expected_generation=1, claim_generation=7, release=release
+    )
+    assert journal.read().release_intent == release
     result = {"idle_cycle_generation": 2}
     journal.publish_reset(
         expected_generation=1,
@@ -78,6 +95,7 @@ def test_terminal_blocks_new_cycle_and_reset_replays_after_restart(tmp_path) -> 
     restarted = ProgramCycleJournal(path, owner_epoch="runner.epoch.2")
     assert restarted.read().state == "idle_after_reset"
     assert restarted.read().cycle_generation == 2
+    assert restarted.read().release_intent is None
     replay = restarted.record_request(
         owner_epoch="caller.epoch.1",
         request_id="reset.1",

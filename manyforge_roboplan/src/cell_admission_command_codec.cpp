@@ -467,6 +467,20 @@ bool IsCommand(std::string_view v) {
 }
 } // namespace
 
+core::CellAdmissionClaimDTO DecodeCellAdmissionClaim(
+    const std::string_view bytes) {
+  Require(bytes.size() <= kMaximumPacketBytes,
+          "cell-admission claim JSON is oversized");
+  return Claim(ci::parse_canonical_json(bytes));
+}
+
+core::CellAdmissionClaimReleaseDTO DecodeCellAdmissionClaimRelease(
+    const std::string_view bytes) {
+  Require(bytes.size() <= kMaximumPacketBytes,
+          "cell-admission release JSON is oversized");
+  return Release(ci::parse_canonical_json(bytes));
+}
+
 std::optional<cm::KernelCellAdmissionRpcPacket>
 TryDecodeCellAdmissionCommand(std::string_view bytes) {
   if (bytes.find("\"command\":\"cell_admission_") == std::string_view::npos)

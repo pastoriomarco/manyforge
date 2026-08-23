@@ -27,6 +27,8 @@ _RESPONSE_FIELDS = frozenset(
 class CCLCOpenPort(Protocol):
     """Caller-neutral lifecycle/route surface; implementations own no truth."""
 
+    def owner_identity(self) -> dict[str, Any]: ...
+
     def component_snapshot(self, component_id: str) -> dict[str, Any]: ...
 
     def route_templates(self, component_id: str) -> dict[str, Any]: ...
@@ -201,6 +203,22 @@ class CCLCOpenRequestClient:
             raise HeadlessApiError(
                 "cclc_open_response_invalid",
                 f"{command} returned a null result",
+            )
+        return result
+
+    def owner_identity(self) -> dict[str, Any]:
+        result = self._require_object(
+            self._exchange("owner_identity", {}), command="owner_identity"
+        )
+        if (
+            set(result) != {"request_owner_epoch"}
+            or not isinstance(result.get("request_owner_epoch"), str)
+            or not result["request_owner_epoch"]
+            or len(result["request_owner_epoch"].encode("utf-8")) > 256
+        ):
+            raise HeadlessApiError(
+                "cclc_open_response_identity_mismatch",
+                "CCLC owner identity is invalid",
             )
         return result
 

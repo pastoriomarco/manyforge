@@ -6,6 +6,7 @@
 #include <cstdint>
 #include <filesystem>
 #include <manyforge_core/sqlite_cclc_journal.hpp>
+#include <optional>
 #include <stdexcept>
 #include <string>
 #include <system_error>
@@ -16,6 +17,27 @@
 
 namespace manyforge::core {
 namespace {
+
+[[nodiscard]] Result<CellAdmissionClaimDTO> SeedLifecycleClaim(
+    SqliteCCLCJournal& journal, const RequestOwnerEpoch& owner,
+    const ComponentLifecycleIntentDTO& intent,
+    const ComponentLifecycleAcceptedDTO& acceptance) {
+  const CellAdmissionClaimIntentDTO claim_intent{
+      CellAdmissionClaimKindDTO::kComponentLifecycle,
+      CellAdmissionOwnerRoleDTO::kComponentLifecycleOwner, owner,
+      acceptance.lifecycle_transaction_id.value(), intent.request_context.request_id,
+      ContentDigest(detail::ComponentLifecycleSemanticIntentDigest(intent)),
+      intent.expected_admission_generation, {}, std::nullopt, std::nullopt};
+  auto recorded = journal.RecordLifecycleClaimAttempt(owner, claim_intent);
+  if (!recorded.ok()) {
+    return Result<CellAdmissionClaimDTO>::Err(recorded.error());
+  }
+  CellAdmissionClaimDTO claim{claim_intent, CellAdmissionClaimGeneration(1U),
+                              AdmissionGeneration(1U), 0};
+  auto acquired = journal.RecordLifecycleClaimAcquired(owner, claim);
+  return acquired.ok() ? Result<CellAdmissionClaimDTO>::Ok(std::move(claim))
+                       : Result<CellAdmissionClaimDTO>::Err(acquired.error());
+}
 
 class ScopedTemporaryDirectory final {
  public:
@@ -522,6 +544,9 @@ class ScopedTemporaryDirectory final {
   const auto intent = DisableIntent("request.1", owner, 3U);
   const auto acceptance = Acceptance(intent, 1U, "transaction.1");
   auto status = InitialUnresolvedDisableStatus(intent, acceptance);
+  if (!SeedLifecycleClaim(journal, owner, intent, acceptance).ok()) {
+    throw std::runtime_error("failed to seed lifecycle claim");
+  }
   const auto accepted = journal.AcceptOrReplayLifecycle(owner, intent, acceptance, status);
   if (!accepted.ok()) {
     throw std::runtime_error(accepted.error().code + ": " + accepted.error().message);
@@ -1434,6 +1459,7 @@ TEST(SqliteCCLCJournal, ReplaysBeforeCapacityAndIgnoresOnlyAttribution) {
   const auto first_intent = Intent("request.1", owner, 3U);
   const auto first_acceptance = Acceptance(first_intent, 1U, "transaction.1");
   const auto first_status = InitialStatus(first_intent, first_acceptance);
+  ASSERT_TRUE(SeedLifecycleClaim(journal, owner, first_intent, first_acceptance).ok());
   const auto accepted =
       journal.AcceptOrReplayLifecycle(owner, first_intent, first_acceptance, first_status);
   ASSERT_TRUE(accepted.ok()) << accepted.error().message;
@@ -1472,6 +1498,7 @@ TEST(SqliteCCLCJournal, ReplaysBeforeCapacityAndIgnoresOnlyAttribution) {
 
   const auto second_intent = Intent("request.2", owner, 4U);
   const auto second_acceptance = Acceptance(second_intent, 2U, "transaction.2");
+  ASSERT_TRUE(SeedLifecycleClaim(journal, owner, second_intent, second_acceptance).ok());
   const auto full = journal.AcceptOrReplayLifecycle(
       owner, second_intent, second_acceptance, InitialStatus(second_intent, second_acceptance));
   ASSERT_TRUE(full.ok());
@@ -1486,6 +1513,7 @@ TEST(SqliteCCLCJournal, EnforcesDurableTransactionAndComponentWatermarks) {
 
   const auto first = Intent("request.1", owner, 3U);
   const auto first_acceptance = Acceptance(first, 1U, "transaction.1");
+  ASSERT_TRUE(SeedLifecycleClaim(journal, owner, first, first_acceptance).ok());
   ASSERT_TRUE(journal
                   .AcceptOrReplayLifecycle(owner, first, first_acceptance,
                                            InitialStatus(first, first_acceptance))
@@ -1493,6 +1521,7 @@ TEST(SqliteCCLCJournal, EnforcesDurableTransactionAndComponentWatermarks) {
 
   const auto stale = Intent("request.2", owner, 3U);
   const auto stale_acceptance = Acceptance(stale, 2U, "transaction.2");
+  ASSERT_TRUE(SeedLifecycleClaim(journal, owner, stale, stale_acceptance).ok());
   const auto stale_result = journal.AcceptOrReplayLifecycle(owner, stale, stale_acceptance,
                                                             InitialStatus(stale, stale_acceptance));
   ASSERT_FALSE(stale_result.ok());
@@ -1500,14 +1529,20 @@ TEST(SqliteCCLCJournal, EnforcesDurableTransactionAndComponentWatermarks) {
 
   const auto current = Intent("request.3", owner, 4U);
   const auto skipped = Acceptance(current, 3U, "transaction.3");
+  ASSERT_TRUE(SeedLifecycleClaim(journal, owner, current, skipped).ok());
   const auto skipped_result =
       journal.AcceptOrReplayLifecycle(owner, current, skipped, InitialStatus(current, skipped));
   ASSERT_FALSE(skipped_result.ok());
   EXPECT_EQ(skipped_result.error().code, "component_lifecycle_journal_generation_conflict");
 
-  const auto next = Acceptance(current, 2U, "transaction.2");
+  const auto accepted_current = Intent("request.4", owner, 4U);
+  const auto next = Acceptance(accepted_current, 2U, "transaction.4");
+  ASSERT_TRUE(SeedLifecycleClaim(journal, owner, accepted_current, next).ok());
   ASSERT_TRUE(
-      journal.AcceptOrReplayLifecycle(owner, current, next, InitialStatus(current, next)).ok());
+      journal
+          .AcceptOrReplayLifecycle(owner, accepted_current, next,
+                                   InitialStatus(accepted_current, next))
+          .ok());
 }
 
 TEST(SqliteCCLCJournal, CurrentComponentFactSurvivesTerminalCompactionAndReopen) {
@@ -1527,6 +1562,7 @@ TEST(SqliteCCLCJournal, CurrentComponentFactSurvivesTerminalCompactionAndReopen)
     const auto first = Intent("request.1", owner, 3U);
     const auto first_acceptance = Acceptance(first, 1U, "transaction.1");
     auto first_status = InitialStatus(first, first_acceptance);
+    ASSERT_TRUE(SeedLifecycleClaim(journal, owner, first, first_acceptance).ok());
     ASSERT_TRUE(journal.AcceptOrReplayLifecycle(owner, first, first_acceptance, first_status).ok());
     auto current = journal.LoadCurrentComponentLifecycleFact(first.controllable_component_id);
     ASSERT_TRUE(current.ok());
@@ -1540,6 +1576,7 @@ TEST(SqliteCCLCJournal, CurrentComponentFactSurvivesTerminalCompactionAndReopen)
     const auto second = Intent("request.2", owner, 4U);
     const auto second_acceptance = Acceptance(second, 2U, "transaction.2");
     auto second_status = InitialStatus(second, second_acceptance);
+    ASSERT_TRUE(SeedLifecycleClaim(journal, owner, second, second_acceptance).ok());
     second_status.previous_state = ComponentLifecycleStateDTO::kPrepared;
     second_status.current_state = ComponentLifecycleStateDTO::kPrepared;
     second_status.domains.front().previous_state = ComponentLifecycleStateDTO::kPrepared;
@@ -1585,6 +1622,7 @@ TEST(SqliteCCLCJournal, UnresolvedContainmentRetainsGenerationWithoutInventingSt
   const auto intent = DisableIntent("request.1", owner, 3U);
   const auto acceptance = Acceptance(intent, 1U, "transaction.1");
   const auto status = InitialUnresolvedDisableStatus(intent, acceptance);
+  ASSERT_TRUE(SeedLifecycleClaim(journal, owner, intent, acceptance).ok());
   ASSERT_TRUE(journal.AcceptOrReplayLifecycle(owner, intent, acceptance, status).ok());
 
   const auto current = journal.LoadCurrentComponentLifecycleFact(intent.controllable_component_id);
@@ -1602,6 +1640,7 @@ TEST(SqliteCCLCJournal, StaleDisableUsesTheImmediateDurableSuccessorAndReplaysFi
   const auto first = Intent("request.1", owner, 3U);
   const auto first_acceptance = Acceptance(first, 1U, "transaction.1");
   const auto first_status = InitialStatus(first, first_acceptance);
+  ASSERT_TRUE(SeedLifecycleClaim(journal, owner, first, first_acceptance).ok());
   ASSERT_TRUE(journal.AcceptOrReplayLifecycle(owner, first, first_acceptance, first_status).ok());
 
   const auto stale_disable = DisableIntent("request.2", owner, 3U);
@@ -1609,6 +1648,7 @@ TEST(SqliteCCLCJournal, StaleDisableUsesTheImmediateDurableSuccessorAndReplaysFi
   stale_disable_acceptance.component_lifecycle_generation = ComponentLifecycleGeneration(5U);
   const auto stale_disable_status = InitialDisableStatus(stale_disable, stale_disable_acceptance);
   ASSERT_TRUE(stale_disable_status.locally_valid());
+  ASSERT_TRUE(SeedLifecycleClaim(journal, owner, stale_disable, stale_disable_acceptance).ok());
   const auto accepted = journal.AcceptOrReplayLifecycle(
       owner, stale_disable, stale_disable_acceptance, stale_disable_status);
   ASSERT_TRUE(accepted.ok()) << accepted.error().message;
@@ -1622,6 +1662,7 @@ TEST(SqliteCCLCJournal, StaleDisableUsesTheImmediateDurableSuccessorAndReplaysFi
 
   const auto stale_again = DisableIntent("request.3", owner, 3U);
   auto regressed = Acceptance(stale_again, 3U, "transaction.3");
+  ASSERT_TRUE(SeedLifecycleClaim(journal, owner, stale_again, regressed).ok());
   const auto regressed_result = journal.AcceptOrReplayLifecycle(
       owner, stale_again, regressed, InitialDisableStatus(stale_again, regressed));
   ASSERT_FALSE(regressed_result.ok());
@@ -1636,6 +1677,7 @@ TEST(SqliteCCLCJournal, StaleDisableUsesTheImmediateDurableSuccessorAndReplaysFi
   const auto ahead = DisableIntent("request.4", owner, 6U);
   auto ahead_acceptance = Acceptance(ahead, 3U, "transaction.4");
   ahead_acceptance.component_lifecycle_generation = ComponentLifecycleGeneration(7U);
+  ASSERT_TRUE(SeedLifecycleClaim(journal, owner, ahead, ahead_acceptance).ok());
   const auto ahead_result = journal.AcceptOrReplayLifecycle(
       owner, ahead, ahead_acceptance, InitialDisableStatus(ahead, ahead_acceptance));
   ASSERT_FALSE(ahead_result.ok());
@@ -1659,10 +1701,12 @@ TEST(SqliteCCLCJournal, ResolvedDisableSeedsAnAbsentWatermarkFromItsSelectedPred
   acceptance.component_lifecycle_generation = ComponentLifecycleGeneration(8U);
   const auto status = InitialDisableStatus(stale_disable, acceptance);
   ASSERT_TRUE(status.locally_valid());
+  ASSERT_TRUE(SeedLifecycleClaim(journal, owner, stale_disable, acceptance).ok());
   ASSERT_TRUE(journal.AcceptOrReplayLifecycle(owner, stale_disable, acceptance, status).ok());
 
   const auto current = Intent("request.2", owner, 8U);
   const auto current_acceptance = Acceptance(current, 2U, "transaction.2");
+  ASSERT_TRUE(SeedLifecycleClaim(journal, owner, current, current_acceptance).ok());
   ASSERT_TRUE(journal
                   .AcceptOrReplayLifecycle(owner, current, current_acceptance,
                                            InitialStatus(current, current_acceptance))
@@ -1680,6 +1724,7 @@ TEST(SqliteCCLCJournal, UnresolvedFullStopSeedsAnAbsentWatermarkOnlyFromExpectat
   gap.component_lifecycle_generation = ComponentLifecycleGeneration(5U);
   const auto gap_status = InitialUnresolvedDisableStatus(unresolved, gap);
   ASSERT_TRUE(gap_status.locally_valid());
+  ASSERT_TRUE(SeedLifecycleClaim(journal, owner, unresolved, gap).ok());
   const auto gap_result = journal.AcceptOrReplayLifecycle(owner, unresolved, gap, gap_status);
   ASSERT_FALSE(gap_result.ok());
   EXPECT_EQ(gap_result.error().code, "component_lifecycle_journal_generation_conflict");
@@ -1698,6 +1743,7 @@ TEST(SqliteCCLCJournal, PersistsAttemptBeforeEffectAndProjectsOnlyItsExactResult
   const auto lifecycle_intent = Intent("request.1", owner, 3U);
   const auto acceptance = Acceptance(lifecycle_intent, 1U, "transaction.1");
   auto status = InitialStatus(lifecycle_intent, acceptance);
+  ASSERT_TRUE(SeedLifecycleClaim(journal, owner, lifecycle_intent, acceptance).ok());
   ASSERT_TRUE(journal.AcceptOrReplayLifecycle(owner, lifecycle_intent, acceptance, status).ok());
 
   const auto primitive = PrimitiveIntent(status);
@@ -1755,6 +1801,7 @@ TEST(SqliteCCLCJournal, ReplacementRecoversPreparedAttemptAsPossibleEffectWithou
     const auto lifecycle_intent = Intent("request.1", first_owner, 3U);
     const auto acceptance = Acceptance(lifecycle_intent, 1U, "transaction.1");
     auto initial = InitialStatus(lifecycle_intent, acceptance);
+    EXPECT_TRUE(SeedLifecycleClaim(first, first_owner, lifecycle_intent, acceptance).ok());
     EXPECT_TRUE(
         first.AcceptOrReplayLifecycle(first_owner, lifecycle_intent, acceptance, initial).ok());
     initial = PreparedEffectStatus(initial);
@@ -1820,6 +1867,7 @@ TEST(SqliteCCLCJournal, DisableHandoffPreparedAndCompletedStateAdvanceAtomically
   const auto acceptance = Acceptance(lifecycle_intent, 1U, "transaction.1");
   auto status = InitialDisableStatus(lifecycle_intent, acceptance);
   ASSERT_TRUE(status.locally_valid());
+  ASSERT_TRUE(SeedLifecycleClaim(journal, owner, lifecycle_intent, acceptance).ok());
   ASSERT_TRUE(journal.AcceptOrReplayLifecycle(owner, lifecycle_intent, acceptance, status).ok());
 
   const auto request = DisableRequest(status);
@@ -1898,6 +1946,7 @@ TEST(SqliteCCLCJournal, CompletedDisableHandoffRejectsOmissionsAndAcceptsFullWid
   const auto lifecycle_intent = DisableIntent("request.1", owner, 3U);
   const auto lifecycle_acceptance = Acceptance(lifecycle_intent, 1U, "transaction.1");
   auto status = InitialDisableStatus(lifecycle_intent, lifecycle_acceptance);
+  ASSERT_TRUE(SeedLifecycleClaim(journal, owner, lifecycle_intent, lifecycle_acceptance).ok());
   ASSERT_TRUE(
       journal.AcceptOrReplayLifecycle(owner, lifecycle_intent, lifecycle_acceptance, status).ok());
 
@@ -1947,6 +1996,7 @@ TEST(SqliteCCLCJournal, PromotedFullDisableHandoffCannotNarrowItsPreparedScope) 
   const auto lifecycle_intent = DisableIntent("request.1", owner, 3U);
   const auto lifecycle_acceptance = Acceptance(lifecycle_intent, 1U, "transaction.1");
   auto status = InitialDisableStatus(lifecycle_intent, lifecycle_acceptance);
+  ASSERT_TRUE(SeedLifecycleClaim(journal, owner, lifecycle_intent, lifecycle_acceptance).ok());
   ASSERT_TRUE(
       journal.AcceptOrReplayLifecycle(owner, lifecycle_intent, lifecycle_acceptance, status).ok());
 
@@ -2079,6 +2129,7 @@ TEST(SqliteCCLCJournal, DisableFenceReleaseAndTerminalStatusCommitAtomicallyAndS
     const auto lifecycle_intent = DisableIntent("request.1", owner, 3U);
     const auto acceptance = Acceptance(lifecycle_intent, 1U, "transaction.1");
     auto status = InitialDisableStatus(lifecycle_intent, acceptance);
+    ASSERT_TRUE(SeedLifecycleClaim(journal, owner, lifecycle_intent, acceptance).ok());
     ASSERT_TRUE(journal.AcceptOrReplayLifecycle(owner, lifecycle_intent, acceptance, status).ok());
 
     const auto handoff_request = DisableRequest(status);
@@ -2202,6 +2253,7 @@ TEST(SqliteCCLCJournal, ReplacementRecoversPreparedFenceReleaseAndCommitsExactLa
     const auto lifecycle_intent = DisableIntent("request.1", first_owner, 3U);
     const auto acceptance = Acceptance(lifecycle_intent, 1U, "transaction.1");
     auto status = InitialDisableStatus(lifecycle_intent, acceptance);
+    ASSERT_TRUE(SeedLifecycleClaim(journal, first_owner, lifecycle_intent, acceptance).ok());
     ASSERT_TRUE(
         journal.AcceptOrReplayLifecycle(first_owner, lifecycle_intent, acceptance, status).ok());
     const auto handoff_request = DisableRequest(status);
@@ -2284,6 +2336,7 @@ TEST(SqliteCCLCJournal, ProvenNoEffectHandoffUsesAFreshKernelEpochSuccessorWitho
   const auto lifecycle_intent = DisableIntent("request.1", owner, 3U);
   const auto acceptance = Acceptance(lifecycle_intent, 1U, "transaction.1");
   auto status = InitialDisableStatus(lifecycle_intent, acceptance);
+  ASSERT_TRUE(SeedLifecycleClaim(journal, owner, lifecycle_intent, acceptance).ok());
   ASSERT_TRUE(journal.AcceptOrReplayLifecycle(owner, lifecycle_intent, acceptance, status).ok());
 
   const auto first_request =
@@ -2333,6 +2386,7 @@ TEST(SqliteCCLCJournal, ProvenHeldFenceUsesAFreshKernelEpochSuccessorWithoutClai
   const auto lifecycle_intent = DisableIntent("request.1", owner, 3U);
   const auto acceptance = Acceptance(lifecycle_intent, 1U, "transaction.1");
   auto status = InitialDisableStatus(lifecycle_intent, acceptance);
+  ASSERT_TRUE(SeedLifecycleClaim(journal, owner, lifecycle_intent, acceptance).ok());
   ASSERT_TRUE(journal.AcceptOrReplayLifecycle(owner, lifecycle_intent, acceptance, status).ok());
   const auto handoff_request = DisableRequest(status);
   const auto handoff_acceptance = DisableAcceptance(handoff_request);
@@ -2407,6 +2461,7 @@ TEST(SqliteCCLCJournal, RejectsDomainEffectRegressionAndDroppedReconciliationEvi
   const auto lifecycle_intent = Intent("request.1", owner, 3U);
   const auto acceptance = Acceptance(lifecycle_intent, 1U, "transaction.1");
   auto status = InitialStatus(lifecycle_intent, acceptance);
+  ASSERT_TRUE(SeedLifecycleClaim(journal, owner, lifecycle_intent, acceptance).ok());
   ASSERT_TRUE(journal.AcceptOrReplayLifecycle(owner, lifecycle_intent, acceptance, status).ok());
 
   status.status_sequence += 1U;
@@ -2502,6 +2557,7 @@ TEST(SqliteCCLCJournal, ExactReplayPrecedesTheBoundedActiveTransactionCapacityCh
         Intent("request." + std::to_string(index + 1U), owner, 3U + index);
     const auto acceptance =
         Acceptance(lifecycle_intent, index + 1U, "transaction." + std::to_string(index + 1U));
+    ASSERT_TRUE(SeedLifecycleClaim(journal, owner, lifecycle_intent, acceptance).ok());
     const auto accepted = journal.AcceptOrReplayLifecycle(
         owner, lifecycle_intent, acceptance, InitialStatus(lifecycle_intent, acceptance));
     ASSERT_TRUE(accepted.ok()) << accepted.error().message;
@@ -2516,6 +2572,7 @@ TEST(SqliteCCLCJournal, ExactReplayPrecedesTheBoundedActiveTransactionCapacityCh
       Intent("request.overflow", owner, 3U + kMaximumCCLCActiveTransactions);
   const auto overflow_acceptance =
       Acceptance(overflow_intent, kMaximumCCLCActiveTransactions + 1U, "transaction.overflow");
+  ASSERT_TRUE(SeedLifecycleClaim(journal, owner, overflow_intent, overflow_acceptance).ok());
   const auto overflow =
       journal.AcceptOrReplayLifecycle(owner, overflow_intent, overflow_acceptance,
                                       InitialStatus(overflow_intent, overflow_acceptance));
@@ -2542,6 +2599,7 @@ TEST(SqliteCCLCJournal, CompactsTerminalResultToNonExecutingMembershipTombstone)
   const auto first = Intent("request.1", owner, 3U);
   const auto first_acceptance = Acceptance(first, 1U, "transaction.1");
   auto first_status = InitialStatus(first, first_acceptance);
+  ASSERT_TRUE(SeedLifecycleClaim(journal, owner, first, first_acceptance).ok());
   ASSERT_TRUE(journal.AcceptOrReplayLifecycle(owner, first, first_acceptance, first_status).ok());
   first_status = TerminalSuccess(first_status, 2U);
   ASSERT_TRUE(journal.RecordLifecycleStatus(owner, first_status).ok());
@@ -2549,6 +2607,7 @@ TEST(SqliteCCLCJournal, CompactsTerminalResultToNonExecutingMembershipTombstone)
   const auto second = Intent("request.2", owner, 4U);
   const auto second_acceptance = Acceptance(second, 2U, "transaction.2");
   auto second_status = InitialStatus(second, second_acceptance);
+  ASSERT_TRUE(SeedLifecycleClaim(journal, owner, second, second_acceptance).ok());
   ASSERT_TRUE(
       journal.AcceptOrReplayLifecycle(owner, second, second_acceptance, second_status).ok());
   second_status = TerminalSuccess(second_status, 2U);
@@ -2582,6 +2641,8 @@ TEST(SqliteCCLCJournal, ReplacementRecoversZeroAndCompletedEffectSequenceWaterma
     const auto without_effect = Intent("request.1", first_owner, 3U);
     const auto without_effect_acceptance = Acceptance(without_effect, 1U, "transaction.1");
     ASSERT_TRUE(
+        SeedLifecycleClaim(first, first_owner, without_effect, without_effect_acceptance).ok());
+    ASSERT_TRUE(
         first
             .AcceptOrReplayLifecycle(first_owner, without_effect, without_effect_acceptance,
                                      InitialStatus(without_effect, without_effect_acceptance))
@@ -2590,6 +2651,7 @@ TEST(SqliteCCLCJournal, ReplacementRecoversZeroAndCompletedEffectSequenceWaterma
     const auto with_effect = Intent("request.2", first_owner, 4U);
     const auto with_effect_acceptance = Acceptance(with_effect, 2U, "transaction.2");
     auto status = InitialStatus(with_effect, with_effect_acceptance);
+    ASSERT_TRUE(SeedLifecycleClaim(first, first_owner, with_effect, with_effect_acceptance).ok());
     ASSERT_TRUE(
         first.AcceptOrReplayLifecycle(first_owner, with_effect, with_effect_acceptance, status)
             .ok());
@@ -2624,6 +2686,7 @@ TEST(SqliteCCLCJournal, ReplacementTerminalizesNoPreparedEffectAsKnownNoEffect) 
   {
     SqliteCCLCJournal first(path, CellId("cell.1"), 8U);
     ASSERT_TRUE(first.BeginOwnerEpoch(first_owner, 1, 8U).ok());
+    ASSERT_TRUE(SeedLifecycleClaim(first, first_owner, intent, acceptance).ok());
     ASSERT_TRUE(first
                     .AcceptOrReplayLifecycle(first_owner, intent, acceptance,
                                              InitialStatus(intent, acceptance))
@@ -2671,6 +2734,7 @@ TEST(SqliteCCLCJournal, ReplacementCannotTerminalizeUnresolvedPreparedEffect) {
     SqliteCCLCJournal first(path, CellId("cell.1"), 8U);
     ASSERT_TRUE(first.BeginOwnerEpoch(first_owner, 1, 8U).ok());
     auto status = InitialStatus(intent, acceptance);
+    ASSERT_TRUE(SeedLifecycleClaim(first, first_owner, intent, acceptance).ok());
     ASSERT_TRUE(first.AcceptOrReplayLifecycle(first_owner, intent, acceptance, status).ok());
     const auto primitive = PrimitiveIntent(status);
     status = PreparedEffectStatus(status);
@@ -2702,6 +2766,7 @@ TEST(SqliteCCLCJournal, EffectIdentityIsScopedByTransactionAcrossOwnerEpochs) {
   const auto first = Intent("request.shared", first_owner, 3U);
   const auto first_acceptance = Acceptance(first, 1U, "transaction.1");
   auto first_status = InitialStatus(first, first_acceptance);
+  ASSERT_TRUE(SeedLifecycleClaim(journal, first_owner, first, first_acceptance).ok());
   ASSERT_TRUE(
       journal.AcceptOrReplayLifecycle(first_owner, first, first_acceptance, first_status).ok());
   const auto first_primitive = PrimitiveIntent(first_status, "attempt.shared");
@@ -2722,6 +2787,8 @@ TEST(SqliteCCLCJournal, EffectIdentityIsScopedByTransactionAcrossOwnerEpochs) {
   const auto keeps_namespace = Intent("request.pending", first_owner, 4U);
   const auto keeps_namespace_acceptance = Acceptance(keeps_namespace, 2U, "transaction.pending");
   ASSERT_TRUE(
+      SeedLifecycleClaim(journal, first_owner, keeps_namespace, keeps_namespace_acceptance).ok());
+  ASSERT_TRUE(
       journal
           .AcceptOrReplayLifecycle(first_owner, keeps_namespace, keeps_namespace_acceptance,
                                    InitialStatus(keeps_namespace, keeps_namespace_acceptance))
@@ -2732,6 +2799,7 @@ TEST(SqliteCCLCJournal, EffectIdentityIsScopedByTransactionAcrossOwnerEpochs) {
   const auto second = Intent("request.shared", second_owner, 5U);
   const auto second_acceptance = Acceptance(second, 3U, "transaction.2");
   auto second_status = InitialStatus(second, second_acceptance);
+  ASSERT_TRUE(SeedLifecycleClaim(journal, second_owner, second, second_acceptance).ok());
   ASSERT_TRUE(
       journal.AcceptOrReplayLifecycle(second_owner, second, second_acceptance, second_status).ok());
   const auto second_primitive = PrimitiveIntent(second_status, "attempt.shared");
@@ -2750,10 +2818,12 @@ TEST(SqliteCCLCJournal, CompactsByDurableTerminalOrderNotAcceptanceOrder) {
   const auto first = Intent("request.1", owner, 3U);
   const auto first_acceptance = Acceptance(first, 1U, "transaction.1");
   auto first_status = InitialStatus(first, first_acceptance);
+  ASSERT_TRUE(SeedLifecycleClaim(journal, owner, first, first_acceptance).ok());
   ASSERT_TRUE(journal.AcceptOrReplayLifecycle(owner, first, first_acceptance, first_status).ok());
   const auto second = Intent("request.2", owner, 4U);
   const auto second_acceptance = Acceptance(second, 2U, "transaction.2");
   auto second_status = InitialStatus(second, second_acceptance);
+  ASSERT_TRUE(SeedLifecycleClaim(journal, owner, second, second_acceptance).ok());
   ASSERT_TRUE(
       journal.AcceptOrReplayLifecycle(owner, second, second_acceptance, second_status).ok());
 
@@ -2778,6 +2848,7 @@ TEST(SqliteCCLCJournal, CompactsTerminalResultAtConfiguredBytePressure) {
   const auto intent = Intent("request.1", owner, 3U);
   const auto acceptance = Acceptance(intent, 1U, "transaction.1");
   auto status = InitialStatus(intent, acceptance);
+  ASSERT_TRUE(SeedLifecycleClaim(journal, owner, intent, acceptance).ok());
   ASSERT_TRUE(journal.AcceptOrReplayLifecycle(owner, intent, acceptance, status).ok());
   ASSERT_TRUE(journal.RecordLifecycleStatus(owner, TerminalSuccess(status, 2U)).ok());
   const auto retained = journal.LoadRetainedLifecycleStatus(acceptance.lifecycle_transaction_id);
@@ -2798,6 +2869,7 @@ TEST(SqliteCCLCJournal, RejectsSemanticColumnCorruptionOnReopen) {
     ASSERT_TRUE(journal.BeginOwnerEpoch(owner, 1, 8U).ok());
     const auto intent = Intent("request.1", owner, 3U);
     const auto acceptance = Acceptance(intent, 1U, "transaction.1");
+    ASSERT_TRUE(SeedLifecycleClaim(journal, owner, intent, acceptance).ok());
     ASSERT_TRUE(
         journal
             .AcceptOrReplayLifecycle(owner, intent, acceptance, InitialStatus(intent, acceptance))
@@ -2827,6 +2899,7 @@ TEST(SqliteCCLCJournal, RejectsStaleCurrentComponentFactOnReopen) {
     ASSERT_TRUE(journal.BeginOwnerEpoch(owner, 1, 8U).ok());
     const auto intent = Intent("request.1", owner, 3U);
     const auto acceptance = Acceptance(intent, 1U, "transaction.1");
+    ASSERT_TRUE(SeedLifecycleClaim(journal, owner, intent, acceptance).ok());
     ASSERT_TRUE(
         journal
             .AcceptOrReplayLifecycle(owner, intent, acceptance, InitialStatus(intent, acceptance))
@@ -2858,6 +2931,7 @@ TEST(SqliteCCLCJournal, RejectsStatusThatDropsCompletedEffectEvidence) {
     const auto intent = Intent("request.1", owner, 3U);
     const auto acceptance = Acceptance(intent, 1U, "transaction.1");
     auto status = InitialStatus(intent, acceptance);
+    ASSERT_TRUE(SeedLifecycleClaim(journal, owner, intent, acceptance).ok());
     ASSERT_TRUE(journal.AcceptOrReplayLifecycle(owner, intent, acceptance, status).ok());
     const auto primitive = PrimitiveIntent(status);
     prepared_status = PreparedEffectStatus(status);
@@ -2927,9 +3001,36 @@ TEST(SqliteCCLCJournal, QuiescentRotationRetiresMembershipButKeepsEpochReuseGuar
     const auto first = Intent("request.shared", first_owner, 3U);
     const auto first_acceptance = Acceptance(first, 1U, "transaction.1");
     auto first_status = InitialStatus(first, first_acceptance);
+    const auto first_claim =
+        SeedLifecycleClaim(journal, first_owner, first, first_acceptance);
+    ASSERT_TRUE(first_claim.ok());
     ASSERT_TRUE(
         journal.AcceptOrReplayLifecycle(first_owner, first, first_acceptance, first_status).ok());
-    ASSERT_TRUE(journal.RecordLifecycleStatus(first_owner, TerminalSuccess(first_status, 2U)).ok());
+    const CellAdmissionClaimReleaseDTO release{
+        first_claim.value().intent.owner_role,
+        first_claim.value().intent.owner_epoch,
+        first_claim.value().intent.owner_transaction_id,
+        first_claim.value().intent.request_id,
+        first_claim.value().intent.request_payload_digest,
+        first_claim.value().acquired_admission_generation,
+        first_claim.value().claim_generation,
+        {CellAdmissionSettlementKindDTO::kTerminalEffectsSettled,
+         first_claim.value().intent.request_payload_digest}};
+    ASSERT_TRUE(journal
+                    .RecordLifecycleTerminalAndClaimRelease(
+                        first_owner, TerminalSuccess(first_status, 2U), release)
+                    .ok());
+    const CellAdmissionRecoveryReceiptDTO receipt{
+        CellAdmissionRecoveryReceiptStatusDTO::kReleasedExact,
+        RequestOwnerEpoch("kernel.1"),
+        AdmissionGeneration(2U),
+        first_claim.value(),
+        release,
+        std::nullopt,
+        {},
+        {}};
+    ASSERT_TRUE(
+        journal.RecordLifecycleClaimReleaseReceipt(first_owner, release, receipt).ok());
 
     const RequestOwnerEpoch second_owner("owner.2");
     const auto recovery = journal.BeginOwnerEpoch(second_owner, 500, 8U);
@@ -2937,14 +3038,17 @@ TEST(SqliteCCLCJournal, QuiescentRotationRetiresMembershipButKeepsEpochReuseGuar
     EXPECT_TRUE(recovery.value().interrupted_transactions.empty());
     const auto second = Intent("request.shared", second_owner, 4U);
     const auto reused_identity = Acceptance(second, 2U, "transaction.1");
+    ASSERT_TRUE(SeedLifecycleClaim(journal, second_owner, second, reused_identity).ok());
     const auto rejected = journal.AcceptOrReplayLifecycle(second_owner, second, reused_identity,
                                                           InitialStatus(second, reused_identity));
     ASSERT_FALSE(rejected.ok());
     EXPECT_EQ(rejected.error().code, "component_lifecycle_journal_transaction_identity_reused");
-    const auto second_acceptance = Acceptance(second, 2U, "transaction.2");
+    const auto fresh = Intent("request.fresh", second_owner, 4U);
+    const auto second_acceptance = Acceptance(fresh, 2U, "transaction.2");
+    ASSERT_TRUE(SeedLifecycleClaim(journal, second_owner, fresh, second_acceptance).ok());
     ASSERT_TRUE(journal
-                    .AcceptOrReplayLifecycle(second_owner, second, second_acceptance,
-                                             InitialStatus(second, second_acceptance))
+                    .AcceptOrReplayLifecycle(second_owner, fresh, second_acceptance,
+                                             InitialStatus(fresh, second_acceptance))
                     .ok());
     journal.Close();
   }
@@ -2985,6 +3089,7 @@ TEST(SqliteCCLCJournal, BoundsTheDurableComponentWatermarkSet) {
     const auto acceptance =
         Acceptance(intent, index + 1U, "transaction." + std::to_string(index + 1U));
     auto status = InitialStatus(intent, acceptance);
+    ASSERT_TRUE(SeedLifecycleClaim(journal, owner, intent, acceptance).ok());
     ASSERT_TRUE(journal.AcceptOrReplayLifecycle(owner, intent, acceptance, status).ok());
     ASSERT_TRUE(journal.RecordLifecycleStatus(owner, TerminalSuccess(status, 2U)).ok());
   }
@@ -2993,6 +3098,7 @@ TEST(SqliteCCLCJournal, BoundsTheDurableComponentWatermarkSet) {
   overflow.controllable_component_id = ControllableComponentId("component.overflow");
   const auto overflow_acceptance =
       Acceptance(overflow, kMaximumCCLCComponentWatermarks + 1U, "transaction.overflow");
+  ASSERT_TRUE(SeedLifecycleClaim(journal, owner, overflow, overflow_acceptance).ok());
   const auto result = journal.AcceptOrReplayLifecycle(owner, overflow, overflow_acceptance,
                                                       InitialStatus(overflow, overflow_acceptance));
   ASSERT_FALSE(result.ok());
@@ -3012,6 +3118,125 @@ TEST(SqliteCCLCJournal, NeverReusesOwnerEpochOrChangesJournalIdentity) {
   }
   EXPECT_THROW((SqliteCCLCJournal(path, CellId("other-cell"), 8U)), std::runtime_error);
   EXPECT_THROW((SqliteCCLCJournal(path, CellId("cell.1"), 9U)), std::runtime_error);
+}
+
+TEST(SqliteCCLCJournal,
+     ReadOnlyReconciliationAcceptsExactEmptyLifecycleOwnerRotationAndReplay) {
+  ScopedTemporaryDirectory temporary;
+  const auto path = JournalPath(temporary);
+  const RequestOwnerEpoch owner("owner.1");
+  SqliteCCLCJournal journal(path, CellId("cell.1"), 8U);
+  ASSERT_TRUE(journal.BeginOwnerEpoch(owner, 1, 8U).ok());
+  const auto evidence =
+      CellAdmissionOwnerEpochReconciliationEvidenceDigest(
+          CellAdmissionOwnerRoleDTO::kComponentLifecycleOwner, owner);
+  ASSERT_TRUE(evidence.ok());
+  const std::vector<CellAdmissionCurrentOwnerEpochDTO> predecessor_owners{
+      {CellAdmissionOwnerRoleDTO::kProgramRunner,
+       RequestOwnerEpoch("program.owner.1")}};
+  const CellAdmissionReconcileDTO reconcile{
+      RequestOwnerEpoch("kernel.1"),
+      {},
+      {{CellAdmissionOwnerRoleDTO::kProgramRunner,
+        RequestOwnerEpoch("program.owner.1")},
+       {CellAdmissionOwnerRoleDTO::kComponentLifecycleOwner, owner}},
+      evidence.value()};
+
+  const auto first = ValidateLifecycleCellAdmissionReconciliationReadOnly(
+      path, CellId("cell.1"), {}, predecessor_owners, reconcile);
+  ASSERT_TRUE(first.ok()) << first.error().message;
+  EXPECT_EQ(first.value().current_owner_epochs,
+            reconcile.current_owner_epochs);
+  EXPECT_TRUE(first.value().settlements.empty());
+  const auto replay = ValidateLifecycleCellAdmissionReconciliationReadOnly(
+      path, CellId("cell.1"), {}, reconcile.current_owner_epochs, reconcile);
+  ASSERT_TRUE(replay.ok()) << replay.error().message;
+  EXPECT_EQ(replay.value(), first.value());
+  auto foreign_membership = reconcile;
+  foreign_membership.current_owner_epochs.front().owner_epoch =
+      RequestOwnerEpoch("program.owner.2");
+  EXPECT_FALSE(ValidateLifecycleCellAdmissionReconciliationReadOnly(
+                   path, CellId("cell.1"), {}, predecessor_owners,
+                   foreign_membership)
+                   .ok());
+}
+
+TEST(SqliteCCLCJournal,
+     ReadOnlyReconciliationRejectsMissingCorruptAndChangedEvidence) {
+  ScopedTemporaryDirectory temporary;
+  const auto path = JournalPath(temporary);
+  const RequestOwnerEpoch owner("owner.1");
+  SqliteCCLCJournal journal(path, CellId("cell.1"), 8U);
+  ASSERT_TRUE(journal.BeginOwnerEpoch(owner, 1, 8U).ok());
+  const auto evidence =
+      CellAdmissionOwnerEpochReconciliationEvidenceDigest(
+          CellAdmissionOwnerRoleDTO::kComponentLifecycleOwner, owner);
+  ASSERT_TRUE(evidence.ok());
+  CellAdmissionReconcileDTO reconcile{
+      RequestOwnerEpoch("kernel.1"),
+      {},
+      {{CellAdmissionOwnerRoleDTO::kComponentLifecycleOwner, owner}},
+      evidence.value()};
+
+  EXPECT_FALSE(ValidateLifecycleCellAdmissionReconciliationReadOnly(
+                   temporary.path() / "missing.sqlite3", CellId("cell.1"), {},
+                   {}, reconcile)
+                   .ok());
+  auto changed = reconcile;
+  changed.reconciliation_evidence_digest =
+      ContentDigest(
+          "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
+  EXPECT_FALSE(ValidateLifecycleCellAdmissionReconciliationReadOnly(
+                   path, CellId("cell.1"), {}, {}, changed)
+                   .ok());
+  EXPECT_FALSE(ValidateLifecycleCellAdmissionReconciliationReadOnly(
+                   path, CellId("other-cell"), {}, {}, reconcile)
+                   .ok());
+}
+
+TEST(SqliteCCLCJournal,
+     ReadOnlyReconciliationRejectsHeldLifecycleClaimWithUnresolvedEffect) {
+  ScopedTemporaryDirectory temporary;
+  const auto path = JournalPath(temporary);
+  const RequestOwnerEpoch predecessor("owner.1");
+  std::optional<CellAdmissionClaimDTO> claim;
+  {
+    SqliteCCLCJournal first(path, CellId("cell.1"), 8U);
+    ASSERT_TRUE(first.BeginOwnerEpoch(predecessor, 1, 8U).ok());
+    const auto intent = Intent("request.1", predecessor, 3U);
+    const auto acceptance = Acceptance(intent, 1U, "transaction.1");
+    auto status = InitialStatus(intent, acceptance);
+    const auto seeded =
+        SeedLifecycleClaim(first, predecessor, intent, acceptance);
+    ASSERT_TRUE(seeded.ok());
+    claim = seeded.value();
+    ASSERT_TRUE(
+        first.AcceptOrReplayLifecycle(predecessor, intent, acceptance, status)
+            .ok());
+    const auto primitive = PrimitiveIntent(status);
+    status = PreparedEffectStatus(status);
+    ASSERT_TRUE(first
+                    .RecordEffectPrepared(
+                        predecessor, PreparedPrimitiveEffect(primitive), status)
+                    .ok());
+  }
+  const RequestOwnerEpoch successor("owner.2");
+  SqliteCCLCJournal replacement(path, CellId("cell.1"), 8U);
+  ASSERT_TRUE(replacement.BeginOwnerEpoch(successor, 500, 8U).ok());
+  const auto evidence =
+      CellAdmissionOwnerEpochReconciliationEvidenceDigest(
+          CellAdmissionOwnerRoleDTO::kComponentLifecycleOwner, successor);
+  ASSERT_TRUE(evidence.ok());
+  const CellAdmissionReconcileDTO reconcile{
+      RequestOwnerEpoch("kernel.1"),
+      {*claim},
+      {{CellAdmissionOwnerRoleDTO::kComponentLifecycleOwner, successor}},
+      evidence.value()};
+  const std::vector<CellAdmissionCurrentOwnerEpochDTO> current_owners{
+      {CellAdmissionOwnerRoleDTO::kComponentLifecycleOwner, predecessor}};
+  EXPECT_FALSE(ValidateLifecycleCellAdmissionReconciliationReadOnly(
+                   path, CellId("cell.1"), {*claim}, current_owners, reconcile)
+                   .ok());
 }
 
 }  // namespace

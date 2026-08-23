@@ -6,7 +6,7 @@ from copy import deepcopy
 from dataclasses import dataclass
 from functools import lru_cache
 import hashlib
-from threading import RLock
+import json
 from typing import Any, Sequence
 
 from manyforge_behavior.catalog import (
@@ -27,10 +27,15 @@ from .models import (
     AcknowledgeAllAlarmsRequest,
     HistorianReconcileRequest,
     ManagerApplyRequest,
+    AuthoringMutationContext,
+    AuthoringMutationRecoveryRequest,
+    AuthoringMutationSettlementRequest,
+    AuthoringOwnerReconciliationRequest,
     ProgramApplyRequest,
     ProgramModelAttemptRequest,
     ProgramRunStartRequest,
     ProgramRunStopRequest,
+    ProgramCycleResetRequest,
     FullStopIntentRequest,
     OperationControlRequest,
     OperationIntentRequest,
@@ -42,6 +47,7 @@ from .models import (
     StopIntentRequest,
     StopFaultRecoveryIntentRequest,
 )
+from .cell_admission import CellAdmissionError
 from .native import HeadlessApiError, HeadlessCorePort, ViewerModelAsset
 from .program_runner_client import ProgramRunnerClientError, ProgramRunnerPort
 from .program_binding_transport import ProgramBindingTransportError
@@ -112,15 +118,196 @@ class HeadlessService:
         manager: ManagerPort,
         execution: ExecutionPort | None = None,
         program_runner: ProgramRunnerPort | None = None,
+        cell_admission: Any | None = None,
+        cclc: Any | None = None,
     ) -> None:
         self.core = core
         self.manager = manager
         self.execution = execution
         self.program_runner = program_runner
-        # Serialize the standard Program Apply and Run admission surfaces.
-        # This is a request-ordering fence, not a runtime state owner; the
-        # runner and native owners still publish every authoritative fact.
-        self._program_transition_lock = RLock()
+        self.cell_admission = cell_admission
+        self.cclc = cclc
+
+    def _cell_admission(self) -> Any:
+        if self.cell_admission is None:
+            raise HeadlessApiError(
+                "authoring_not_ready",
+                "Kernel cell-admission owner is not configured",
+            )
+        return self.cell_admission
+
+    @staticmethod
+    def _admission_error(error: CellAdmissionError) -> HeadlessApiError:
+        return HeadlessApiError(error.code, str(error))
+
+    def authoring_admission(self) -> dict[str, Any]:
+        try:
+            return self._cell_admission().get()
+        except CellAdmissionError as error:
+            raise self._admission_error(error) from error
+
+    def acquire_authoring_mutation(
+        self, request: AuthoringMutationContext
+    ) -> dict[str, Any]:
+        intent = {
+            "claim_kind": "authoring_mutation",
+            "owner_role": "authoring_owner",
+            "owner_epoch": request.request_owner_epoch,
+            "owner_transaction_id": request.owner_transaction_id,
+            "request_id": request.request_id,
+            "request_payload_digest": request.request_payload_digest,
+            "expected_admission_generation": request.expected_admission_generation,
+            "scope": {"resources": [], "configurations": []},
+            "program_cycle_evidence": None,
+            "intervention_evidence": None,
+        }
+        try:
+            return self._cell_admission().acquire(intent)
+        except CellAdmissionError as error:
+            raise self._admission_error(error) from error
+
+    def settle_authoring_mutation(
+        self, request: AuthoringMutationSettlementRequest
+    ) -> dict[str, Any]:
+        claim = request.claim
+        intent = claim.get("intent") if isinstance(claim, dict) else None
+        if (
+            not isinstance(intent, dict)
+            or intent.get("claim_kind") != "authoring_mutation"
+            or intent.get("owner_role") != "authoring_owner"
+        ):
+            raise HeadlessApiError(
+                "authoring_claim_invalid",
+                "settlement does not identify an authoring claim",
+            )
+        release = {
+            "owner_role": intent["owner_role"],
+            "owner_epoch": intent["owner_epoch"],
+            "owner_transaction_id": intent["owner_transaction_id"],
+            "request_id": intent["request_id"],
+            "request_payload_digest": intent["request_payload_digest"],
+            "acquired_admission_generation": claim.get(
+                "acquired_admission_generation"
+            ),
+            "claim_generation": claim.get("claim_generation"),
+            "settlement": {
+                "settlement_kind": request.settlement_kind,
+                "evidence_digest": request.evidence_digest,
+            },
+        }
+        try:
+            return self._cell_admission().release(release)
+        except CellAdmissionError as error:
+            raise self._admission_error(error) from error
+
+    def recover_authoring_mutation(
+        self, request: AuthoringMutationRecoveryRequest
+    ) -> dict[str, Any]:
+        intent = request.intent
+        if (
+            intent.get("claim_kind") != "authoring_mutation"
+            or intent.get("owner_role") != "authoring_owner"
+        ):
+            raise HeadlessApiError(
+                "authoring_claim_invalid",
+                "recovery query does not identify a Composer authoring claim",
+            )
+        try:
+            return self._cell_admission().recovery_receipt(
+                request.model_dump(mode="json")
+            )
+        except CellAdmissionError as error:
+            raise self._admission_error(error) from error
+
+    def reconcile_authoring_owner(
+        self, request: AuthoringOwnerReconciliationRequest
+    ) -> dict[str, Any]:
+        owners = request.current_owner_epochs
+        authoring = [
+            item
+            for item in owners
+            if item.get("owner_role") == "authoring_owner"
+        ]
+        if len(authoring) != 1:
+            raise HeadlessApiError(
+                "authoring_reconciliation_invalid",
+                "reconciliation must name exactly one authoring owner epoch",
+            )
+        try:
+            return self._cell_admission().reconcile(
+                request.model_dump(mode="json")
+            )
+        except CellAdmissionError as error:
+            raise self._admission_error(error) from error
+
+    @staticmethod
+    def _request_digest(value: dict[str, Any]) -> str:
+        encoded = json.dumps(
+            value,
+            allow_nan=False,
+            ensure_ascii=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        ).encode("utf-8")
+        return f"sha256:{hashlib.sha256(encoded).hexdigest()}"
+
+    def _acquire_owner_claim(
+        self,
+        *,
+        claim_kind: str,
+        owner_role: str,
+        owner_epoch: str,
+        owner_transaction_id: str,
+        request_id: str,
+        expected_generation: int,
+        payload: dict[str, Any],
+    ) -> dict[str, Any]:
+        intent = {
+            "claim_kind": claim_kind,
+            "owner_role": owner_role,
+            "owner_epoch": owner_epoch,
+            "owner_transaction_id": owner_transaction_id,
+            "request_id": request_id,
+            "request_payload_digest": self._request_digest(payload),
+            "expected_admission_generation": expected_generation,
+            "scope": {"resources": [], "configurations": []},
+            "program_cycle_evidence": None,
+            "intervention_evidence": None,
+        }
+        try:
+            return self._cell_admission().acquire(intent)
+        except CellAdmissionError as error:
+            raise self._admission_error(error) from error
+
+    def _release_owner_claim(
+        self,
+        claim: dict[str, Any],
+        *,
+        committed: bool,
+        result: dict[str, Any],
+    ) -> None:
+        intent = claim["intent"]
+        release = {
+            "owner_role": intent["owner_role"],
+            "owner_epoch": intent["owner_epoch"],
+            "owner_transaction_id": intent["owner_transaction_id"],
+            "request_id": intent["request_id"],
+            "request_payload_digest": intent["request_payload_digest"],
+            "acquired_admission_generation": claim[
+                "acquired_admission_generation"
+            ],
+            "claim_generation": claim["claim_generation"],
+            "settlement": {
+                "settlement_kind": (
+                    "owner_commit" if committed else "proven_no_effect"
+                ),
+                "evidence_digest": self._request_digest(result),
+            },
+        }
+        try:
+            self._cell_admission().release(release)
+        except CellAdmissionError as error:
+            raise self._admission_error(error) from error
 
     def _execution(self) -> ExecutionPort:
         if self.execution is None:
@@ -726,49 +913,53 @@ class HeadlessService:
         self,
         request: ProgramRunStartRequest,
     ) -> dict[str, Any]:
-        with self._program_transition_lock:
-            applied = self.program_applied()
-            source = applied.get("source")
-            if (
-                not isinstance(source, dict)
-                or source.get("record_digest")
-                != request.expected_applied_record_digest
-                or applied.get("scenario_id") != request.scenario_id
-                or applied.get("scenario_catalog_revision")
-                != request.scenario_catalog_revision
-            ):
-                raise HeadlessApiError(
-                    "program_run_applied_selection_stale",
-                    "Applied Program changed before Run admission",
+        applied = self.program_applied()
+        source = applied.get("source")
+        if (
+            not isinstance(source, dict)
+            or source.get("record_digest")
+            != request.expected_applied_record_digest
+            or applied.get("scenario_id") != request.scenario_id
+            or applied.get("scenario_catalog_revision")
+            != request.scenario_catalog_revision
+        ):
+            raise HeadlessApiError(
+                "program_run_applied_selection_stale",
+                "Applied Program changed before Run admission",
+            )
+        if applied.get("program_revision") != request.draft_program_revision:
+            raise HeadlessApiError(
+                "program_run_draft_applied_mismatch",
+                "authoritative Draft and Applied Program revisions differ",
+            )
+        try:
+            projection = self._program_runner().start_run(
+                request.model_dump(mode="json")
+            )
+        except ProgramRunnerClientError as error:
+            raise self._runner_error(error) from error
+        snapshot = self._validate_program_run_snapshot(projection)
+        capture = snapshot["capture"]
+        if (
+            any(
+                capture[capture_field] != applied.get(applied_field)
+                for capture_field, applied_field in (
+                    ("scenario_id", "scenario_id"),
+                    ("scenario_catalog_revision", "scenario_catalog_revision"),
+                    ("program_id", "program_id"),
+                    ("program_revision", "program_revision"),
+                    ("program_binding_id", "program_binding_id"),
+                    ("retained_bundle_id", "retained_bundle_id"),
+                    ("graph_revision", "graph_revision"),
+                    ("node_environment_digest", "node_environment_digest"),
                 )
-            try:
-                projection = self._program_runner().start_run(
-                    request.model_dump(mode="json")
-                )
-            except ProgramRunnerClientError as error:
-                raise self._runner_error(error) from error
-            snapshot = self._validate_program_run_snapshot(projection)
-            capture = snapshot["capture"]
-            if (
-                any(
-                    capture[capture_field] != applied.get(applied_field)
-                    for capture_field, applied_field in (
-                        ("scenario_id", "scenario_id"),
-                        ("scenario_catalog_revision", "scenario_catalog_revision"),
-                        ("program_id", "program_id"),
-                        ("program_revision", "program_revision"),
-                        ("program_binding_id", "program_binding_id"),
-                        ("retained_bundle_id", "retained_bundle_id"),
-                        ("graph_revision", "graph_revision"),
-                        ("node_environment_digest", "node_environment_digest"),
-                    )
-                )
-            ):
-                raise HeadlessApiError(
-                    "program_runner_response_invalid",
-                    "Program runner started another Applied Program selection",
-                )
-            return snapshot
+            )
+        ):
+            raise HeadlessApiError(
+                "program_runner_response_invalid",
+                "Program runner started another Applied Program selection",
+            )
+        return snapshot
 
     def program_run_read(self, program_run_id: str) -> dict[str, Any]:
         try:
@@ -797,6 +988,43 @@ class HeadlessService:
             expected_program_run_id=program_run_id,
             expected_owner_epoch=request.expected_owner_epoch,
         )
+
+    def program_cycle_status(self) -> dict[str, Any]:
+        try:
+            return self._program_runner().cycle_status()
+        except ProgramRunnerClientError as error:
+            raise self._runner_error(error) from error
+
+    def program_cycle_reset(
+        self, request: ProgramCycleResetRequest
+    ) -> dict[str, Any]:
+        try:
+            return self._program_runner().reset_cycle(
+                request.model_dump(mode="json")
+            )
+        except ProgramRunnerClientError as error:
+            raise self._runner_error(error) from error
+
+    def component_lifecycle_submit(
+        self, request: Any
+    ) -> dict[str, Any]:
+        if self.cclc is None:
+            raise HeadlessApiError(
+                "cclc_open_unavailable", "CCLC owner is not configured"
+            )
+        payload = request.model_dump(
+            mode="json", exclude={"confirmed"}, exclude_none=True
+        )
+        return self.cclc.submit_lifecycle(payload)
+
+    def component_lifecycle_status(
+        self, transaction_id: str
+    ) -> dict[str, Any] | None:
+        if self.cclc is None:
+            raise HeadlessApiError(
+                "cclc_open_unavailable", "CCLC owner is not configured"
+            )
+        return self.cclc.lifecycle_status(transaction_id)
 
     def _program_apply_manager_selection(
         self,
@@ -840,12 +1068,32 @@ class HeadlessService:
             )
 
     def program_apply(self, request: ProgramApplyRequest) -> dict[str, Any]:
-        with self._program_transition_lock:
-            # An admitted run has already captured its immutable Applied
-            # Program and Binding. Program-only Apply can therefore publish a
-            # later selection without changing that run. A deployment-changing
-            # Apply remains protected by the Manager's affected-busy fence.
-            return self._program_apply(request)
+        claim = request.authoring_claim
+        intent = claim.get("intent") if isinstance(claim, dict) else None
+        if (
+            not isinstance(intent, dict)
+            or intent.get("claim_kind") != "authoring_mutation"
+            or intent.get("owner_role") != "authoring_owner"
+        ):
+            raise HeadlessApiError(
+                "authoring_not_ready",
+                "Program Apply requires an exact held authoring claim",
+            )
+        try:
+            replay = self._cell_admission().acquire(intent)
+        except CellAdmissionError as error:
+            raise self._admission_error(error) from error
+        except (KeyError, TypeError, ValueError) as error:
+            raise HeadlessApiError(
+                "authoring_claim_invalid",
+                "Program Apply authoring claim is malformed",
+            ) from error
+        if replay != claim:
+            raise HeadlessApiError(
+                "stale_generation",
+                "Program Apply authoring claim is no longer exact",
+            )
+        return self._program_apply(request)
 
     def _program_apply(self, request: ProgramApplyRequest) -> dict[str, Any]:
         """Prepare, converge only a differing deployment, then CAS Applied."""
@@ -929,6 +1177,7 @@ class HeadlessService:
                         "graph_revision": active["graph_revision"],
                     },
                     reject_if_affected_busy=True,
+                    parent_authoring_claim=request.authoring_claim,
                 )
             )
             if manager_response.get("ok") is not True:
@@ -1233,6 +1482,19 @@ class HeadlessService:
         request: SceneTransactionRequest,
         attribution: TrustedAttribution,
     ) -> dict[str, Any]:
+        authored = request.operation.kind in {
+            "add_object",
+            "upsert_object",
+            "remove_object",
+            "update_object_pose",
+            "set_collision_policy",
+        }
+        if authored:
+            if request.expected_admission_generation is None:
+                raise HeadlessApiError(
+                    "authoring_not_ready",
+                    "authored-scene mutation requires admission generation",
+                )
         return self.manager.commit_scene_transaction(
             request,
             trusted_principal_id=attribution.principal_id,

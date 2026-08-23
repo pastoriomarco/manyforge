@@ -3,6 +3,7 @@ import { useCallback, useEffect, useState } from 'react';
 import { api } from '../api/client';
 import type {
   CCLCComponentSnapshot,
+  CCLCOwnerIdentity,
   CCLCLifecycleIntent,
   CCLCLifecycleRequestBody,
   CCLCRequestContext,
@@ -61,6 +62,7 @@ function requestContext(
 }
 
 export function cclcRequestOwnerEpoch(
+  owner: CCLCOwnerIdentity,
   snapshot: CCLCComponentSnapshot,
   execution: ExecutionOwnerStatus,
 ): string {
@@ -70,7 +72,7 @@ export function cclcRequestOwnerEpoch(
   ) {
     throw new Error('CCLC component and execution-owner projections are torn');
   }
-  return execution.ownerEpoch;
+  return owner.requestOwnerEpoch;
 }
 
 export function lifecycleSupportsRouteSelection(
@@ -161,11 +163,12 @@ export function useCCLC(enabled: boolean): CCLCController {
     if (!enabled) throw new Error('CCLC client is unavailable');
     const identity = componentId.trim();
     if (!identity) throw new Error('Enter a component identity first');
-    const [nextSnapshot, execution] = await Promise.all([
+    const [owner, nextSnapshot, execution] = await Promise.all([
+      api.cclc.owner(signal),
       api.cclc.component(identity, signal),
       api.execution.status(signal),
     ]);
-    const ownerEpoch = cclcRequestOwnerEpoch(nextSnapshot, execution);
+    const ownerEpoch = cclcRequestOwnerEpoch(owner, nextSnapshot, execution);
     let nextTemplates: CCLCRouteTemplateSet = {
       componentId: nextSnapshot.componentId,
       retainedBundleId: nextSnapshot.retainedBundleId,

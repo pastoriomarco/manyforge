@@ -26,6 +26,7 @@ from manyforge_headless_api.models import (
     StopFaultRecoveryIntentRequest,
     ProgramRunStartRequest,
     ProgramRunStopRequest,
+    ProgramCycleResetRequest,
 )
 
 from .node_environment_client import (
@@ -122,6 +123,10 @@ def create_headless_router(
     ) -> dict[str, Any]:
         return _call(lambda: client.cclc_component(component_id))
 
+    @router.get("/api/cclc/owner")
+    def cclc_owner_identity() -> dict[str, Any]:
+        return _call(client.cclc_owner_identity)
+
     @router.get("/api/cclc/components/{component_id}/route-templates")
     def cclc_route_templates(
         component_id: Annotated[str, Path(min_length=1, max_length=256)],
@@ -195,8 +200,27 @@ def create_headless_router(
 
     @router.post("/api/program/runs")
     def program_run_start(body: ProgramRunStartRequest) -> dict[str, Any]:
+        draft = state.draft_session.snapshot()
+        if draft.get("program_revision") != body.draft_program_revision:
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "code": "program_run_draft_applied_mismatch",
+                    "message": "Run does not identify the current authoritative Draft",
+                },
+            )
         return _call(
             lambda: client.program_run_start(body.model_dump(mode="json"))
+        )
+
+    @router.get("/api/program/cycle/status")
+    def program_cycle_status() -> dict[str, Any]:
+        return _call(client.program_cycle_status)
+
+    @router.post("/api/program/cycle/reset")
+    def program_cycle_reset(body: ProgramCycleResetRequest) -> dict[str, Any]:
+        return _call(
+            lambda: client.program_cycle_reset(body.model_dump(mode="json"))
         )
 
     @router.get("/api/program/runs/{program_run_id}")

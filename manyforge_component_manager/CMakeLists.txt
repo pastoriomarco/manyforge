@@ -427,6 +427,17 @@ if(BUILD_TESTING)
   gtest_discover_tests(test_manager_liveness_rpc_internal
     PROPERTIES TIMEOUT ${MANYFORGE_GTEST_TIMEOUT_SECONDS})
 
+  add_executable(test_kernel_cell_admission_rpc_internal
+    test/test_kernel_cell_admission_rpc_internal.cpp)
+  target_include_directories(
+    test_kernel_cell_admission_rpc_internal PRIVATE
+    "${CMAKE_CURRENT_SOURCE_DIR}/src")
+  target_link_libraries(test_kernel_cell_admission_rpc_internal PRIVATE
+    manyforge_component_manager
+    GTest::gtest_main)
+  gtest_discover_tests(test_kernel_cell_admission_rpc_internal
+    PROPERTIES TIMEOUT ${MANYFORGE_GTEST_TIMEOUT_SECONDS})
+
   add_executable(test_kernel_apply_fence_rpc_internal
     test/test_kernel_apply_fence_rpc_internal.cpp)
   target_include_directories(

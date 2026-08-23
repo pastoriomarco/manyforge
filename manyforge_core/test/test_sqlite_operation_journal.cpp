@@ -379,6 +379,18 @@ class ScopedTemporaryDirectory final {
   return checkpoint;
 }
 
+TEST(SqliteOperationJournalTest,
+     EmptyRuntimeOwnerEpochCanStartAndCloseWithoutResourceRows) {
+  ScopedTemporaryDirectory directory;
+  SqliteOperationJournal journal(directory.path() / "operation.sqlite3",
+                                 CellId("cell.test"));
+  const RequestOwnerEpoch epoch("execution-host.empty.1");
+  const auto recovery = journal.BeginOwnerEpoch(epoch, 1, 8U, {});
+  ASSERT_TRUE(recovery.ok()) << recovery.error().message;
+  EXPECT_TRUE(recovery.value().unreconciled_resources.empty());
+  EXPECT_TRUE(journal.CloseOwnerEpoch(epoch, 2).ok());
+}
+
 TEST(SqliteOperationJournalTest, StopTerminalProjectionIsAtomicReplaySafeAndRecoveredAfterRestart) {
   ScopedTemporaryDirectory temporary;
   const auto database = temporary.path() / std::string(kOperationJournalFilename);

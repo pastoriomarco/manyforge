@@ -2501,8 +2501,7 @@ make_lite6_controllable_retention_fixture(
     std::string_view gripper_lifecycle_semantic_digest = {},
     bool ros2_control_execution = false) {
   namespace fixture_detail = lite6_controllable_fixture_detail;
-  if (aggregate_gripper &&
-      (chained || assistant_enabled || instance_count != 1U)) {
+  if (aggregate_gripper && (chained || instance_count != 1U)) {
     throw std::logic_error(
         "Lite6 aggregate fixture currently selects one direct native "
         "component");
@@ -2802,6 +2801,15 @@ make_lite6_native_cclc_product_retention_fixture(
     std::string_view gripper_lifecycle_semantic_digest) {
   return make_lite6_controllable_retention_fixture(
       false, false, 1U, true, true, {}, false, true, "resource", false,
+      arm_lifecycle_semantic_digest, gripper_lifecycle_semantic_digest);
+}
+
+[[nodiscard]] inline Lite6ControllableRetentionFixture
+make_lite6_native_cclc_assistant_product_retention_fixture(
+    std::string_view arm_lifecycle_semantic_digest,
+    std::string_view gripper_lifecycle_semantic_digest) {
+  return make_lite6_controllable_retention_fixture(
+      false, true, 1U, true, true, {}, true, true, "resource", false,
       arm_lifecycle_semantic_digest, gripper_lifecycle_semantic_digest);
 }
 

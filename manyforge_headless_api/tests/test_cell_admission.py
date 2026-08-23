@@ -1,4 +1,4 @@
-"""Strict runner-local admission wire validation."""
+"""Strict Headless owner-adapter admission wire validation."""
 
 from __future__ import annotations
 
@@ -7,8 +7,8 @@ from typing import Any
 
 import pytest
 
-from manyforge_program_runner import cell_admission
-from manyforge_program_runner.cell_admission import (
+from manyforge_headless_api import cell_admission
+from manyforge_headless_api.cell_admission import (
     CellAdmissionClient,
     CellAdmissionError,
 )
@@ -16,7 +16,7 @@ from manyforge_program_runner.cell_admission import (
 
 def test_client_has_no_headless_import_or_readiness_writer() -> None:
     source = inspect.getsource(cell_admission)
-    assert "manyforge_headless" not in source
+    assert "manyforge_program_runner" not in source
     assert "cell_admission_update_readiness" not in source
     assert not hasattr(CellAdmissionClient, "update_readiness")
 

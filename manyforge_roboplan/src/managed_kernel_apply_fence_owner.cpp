@@ -932,6 +932,8 @@ void ManagedKernelAdmissionGate::WidenDisableFenceDurably(
       });
   Require(found != held_fences_.end(),
           "Disable-fence widening does not name the exact held fence");
+  Require(found->active_effect_count == 0U,
+          "Disable-fence widening conflicts with an active guarded effect");
   Require(std::none_of(held_fences_.begin(), held_fences_.end(),
                        [&](const auto &held) {
                          return &held != &*found &&
@@ -969,6 +971,8 @@ void ManagedKernelAdmissionGate::ReleaseDisableFenceDurably(
       });
   Require(found != held_fences_.end(),
           "Disable-fence release does not name the exact held fence");
+  Require(found->active_effect_count == 0U,
+          "Disable-fence release conflicts with an active guarded effect");
   const auto table = resource_table_.lock();
   Require(table != nullptr || !resource_table_was_bound_,
           "the bound Kernel resource table is no longer available");
@@ -1018,6 +1022,8 @@ void ManagedKernelAdmissionGate::ReleaseFence(
       });
   Require(found != held_fences_.end(),
           "released fence is not held by the admission gate");
+  Require(found->active_effect_count == 0U,
+          "released fence still guards a runtime-composition effect");
   held_fences_.erase(found);
 }
 
@@ -1027,14 +1033,37 @@ void ManagedKernelAdmissionGate::RunWithExactHeldFence(
     const std::function<void()> &effect) {
   Require(!fence_id.empty() && scope.valid() && static_cast<bool>(effect),
           "fenced runtime-composition effect is invalid");
-  std::lock_guard lock(*admission_mutex_);
-  const auto found = std::find_if(
-      held_fences_.begin(), held_fences_.end(), [&](const auto &held) {
-        return held.fence_id == fence_id && held.scope == scope;
-      });
-  Require(found != held_fences_.end(),
-          "runtime composition does not name the exact held fence");
-  effect();
+  {
+    std::lock_guard lock(*admission_mutex_);
+    const auto found = std::find_if(
+        held_fences_.begin(), held_fences_.end(), [&](const auto &held) {
+          return held.fence_id == fence_id && held.scope == scope;
+        });
+    Require(found != held_fences_.end(),
+            "runtime composition does not name the exact held fence");
+    Require(found->active_effect_count <
+                std::numeric_limits<std::size_t>::max(),
+            "runtime-composition fence guard count overflowed");
+    ++found->active_effect_count;
+  }
+  const auto release_guard = [&] {
+    std::lock_guard lock(*admission_mutex_);
+    const auto found = std::find_if(
+        held_fences_.begin(), held_fences_.end(), [&](const auto &held) {
+          return held.fence_id == fence_id && held.scope == scope;
+        });
+    Require(found != held_fences_.end() &&
+                found->active_effect_count != 0U,
+            "runtime-composition fence guard was lost");
+    --found->active_effect_count;
+  };
+  try {
+    effect();
+  } catch (...) {
+    release_guard();
+    throw;
+  }
+  release_guard();
 }
 
 class ManagedKernelApplyFenceOwner::Impl final {

@@ -41,6 +41,10 @@ class ProgramRunnerPort(Protocol):
         body: Mapping[str, Any],
     ) -> dict[str, Any]: ...
 
+    def cycle_status(self) -> dict[str, Any]: ...
+
+    def reset_cycle(self, body: Mapping[str, Any]) -> dict[str, Any]: ...
+
     def close(self) -> None: ...
 
 
@@ -189,6 +193,12 @@ class ProgramRunnerHttpClient:
             f"{self._run_path(program_run_id)}/stop",
             body=body,
         )
+
+    def cycle_status(self) -> dict[str, Any]:
+        return self._request("GET", "/api/program/cycle/status")
+
+    def reset_cycle(self, body: Mapping[str, Any]) -> dict[str, Any]:
+        return self._request("POST", "/api/program/cycle/reset", body=body)
 
     def close(self) -> None:
         if self._owns_client:

@@ -146,6 +146,8 @@ ApplyIntent(std::string apply_id = "apply-1",
       },
       bundle.retained_bundle_id(),
       graph.graph_revision,
+      AdmissionGeneration(7U),
+      std::nullopt,
   };
 }
 
