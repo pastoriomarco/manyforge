@@ -268,6 +268,15 @@ def create_headless_router(
     def manager_apply(body: ManagerApplyRequest) -> dict[str, Any]:
         return _call(lambda: client.manager_apply(body.model_dump()))
 
+    @router.get("/api/manager/apply/status")
+    def manager_apply_status(
+        apply_id: Annotated[str, Query(min_length=1, max_length=256)],
+        apply_generation: Annotated[int, Query(ge=1, le=_MAXIMUM_SAFE_INTEGER)],
+    ) -> dict[str, Any]:
+        return _call(
+            lambda: client.manager_apply_status(apply_id, apply_generation)
+        )
+
     @router.get("/api/execution/status")
     def execution_status() -> dict[str, Any]:
         return _call(client.execution_status)

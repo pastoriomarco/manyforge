@@ -47,6 +47,11 @@ def test_terminal_blocks_new_cycle_and_reset_replays_after_restart(tmp_path) -> 
         expected_states=("starting",),
         state="terminal_awaiting_reset",
         capture_identities={"program_run_id": "run.1"},
+        run_snapshot={
+            "run_revision": 3,
+            "state": "succeeded",
+            "capture": {"program_run_id": "run.1"},
+        },
         terminal_reference="sha256:" + "b" * 64,
     )
     assert journal.read().state == "terminal_awaiting_reset"
@@ -96,6 +101,11 @@ def test_terminal_blocks_new_cycle_and_reset_replays_after_restart(tmp_path) -> 
     assert restarted.read().state == "idle_after_reset"
     assert restarted.read().cycle_generation == 2
     assert restarted.read().release_intent is None
+    assert restarted.read_run_snapshot("run.1") == {
+        "run_revision": 3,
+        "state": "succeeded",
+        "capture": {"program_run_id": "run.1"},
+    }
     replay = restarted.record_request(
         owner_epoch="caller.epoch.1",
         request_id="reset.1",
@@ -289,6 +299,11 @@ def test_terminal_observation_is_exact_idempotent_and_race_safe(tmp_path) -> Non
         claim={"claim_generation": 1},
     )
     reference = "sha256:" + "c" * 64
+    snapshot = {
+        "run_revision": 2,
+        "state": "succeeded",
+        "capture": {"program_run_id": "run.1"},
+    }
     barrier = Barrier(3)
     errors: list[BaseException] = []
 
@@ -299,6 +314,7 @@ def test_terminal_observation_is_exact_idempotent_and_race_safe(tmp_path) -> Non
                 expected_generation=1,
                 program_run_id="run.1",
                 terminal_reference=reference,
+                snapshot=snapshot,
             )
         except BaseException as error:
             errors.append(error)
@@ -319,6 +335,7 @@ def test_terminal_observation_is_exact_idempotent_and_race_safe(tmp_path) -> Non
             expected_generation=1,
             program_run_id="run.1",
             terminal_reference="sha256:" + "d" * 64,
+            snapshot=snapshot,
         )
     assert journal.read() == terminal
     journal.close()

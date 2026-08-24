@@ -19,15 +19,9 @@ def _remote(tmp_path: Path) -> RemoteNativeConfig:
     return RemoteNativeConfig(
         source_root="/mnt/nova_ssd/codex-manyforge/runners/manyforge",
         manager_executable="/opt/manyforge/bin/manyforge_manager_daemon",
-        package_root="/mnt/nova_ssd/codex-manyforge/builds/current/package",
+        install_root="/mnt/nova_ssd/codex-manyforge/builds/current/package",
         node_catalog_path="/opt/manyforge/share/node_catalog.yaml",
         alarm_catalog_path="/opt/manyforge/share/alarm_catalog.yaml",
-        publication_root="/mnt/nova_ssd/codex-manyforge/runners/state/publication",
-        manager_state_root="/mnt/nova_ssd/codex-manyforge/runners/state/manager",
-        runtime_state_root="/mnt/nova_ssd/codex-manyforge/runners/state/runtime",
-        execution_state_root="/mnt/nova_ssd/codex-manyforge/runners/state/execution",
-        logical_scene_database="/mnt/nova_ssd/codex-manyforge/runners/state/scene.sqlite3",
-        historian_database_path="/mnt/nova_ssd/codex-manyforge/runners/state/history.sqlite3",
         state_root="/mnt/nova_ssd/codex-manyforge/runners/state/operator",
         simulation_control_config="/mnt/nova_ssd/codex-manyforge/runners/manyforge/manyforge_ros_bringup/config/isaac_program_simulation_site.json",
         ros_environment_script="/mnt/nova_ssd/codex-manyforge/runners/manyforge/config/ros/isaac_i9.env.sh",
@@ -230,4 +224,4 @@ def test_cleanup_accepts_dead_simulator_and_records_unverified_stop(
 
 
 def test_cli_unknown_stop_is_a_failure(tmp_path: Path):
-    assert main(["--state-root", str(tmp_path / "state"), "stop"]) == 70
+    assert main(["--state-root", str(tmp_path / "state"), "stop"]) == 66

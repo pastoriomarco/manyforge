@@ -31,6 +31,7 @@ def _snapshot(*, state: str = "running") -> dict[str, Any]:
         "capture": {
             "schema_version": "manyforge.program_run_capture.v1",
             "program_run_id": "program-run.1",
+            "applied_record_digest": _DIGEST_C,
             "scenario_id": "cell-pick",
             "scenario_catalog_revision": _DIGEST_A,
             "program_id": "pick",
@@ -39,6 +40,8 @@ def _snapshot(*, state: str = "running") -> dict[str, Any]:
             "retained_bundle_id": _DIGEST_A,
             "graph_revision": _DIGEST_B,
             "node_environment_digest": _DIGEST_C,
+            "node_policy_digest": _DIGEST_A,
+            "node_policies": [],
             "owner_identities": [
                 {
                     "owner_role": "program_runner",

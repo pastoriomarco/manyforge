@@ -48,12 +48,14 @@ class HeadlessApiError(RuntimeError):
 
 @dataclass(frozen=True, slots=True)
 class HeadlessApiConfig:
-    publication_root: Path
-    package_root: Path
+    projection_root: Path
+    install_root: Path
+    artifact_root: Path
+    program_selection_state_root: Path
     node_catalog_path: Path
     alarm_catalog_path: Path
     historian_database_path: Path
-    manager_state_root: Path
+    manager_run_root: Path
     execution_state_root: Path
     cell_id: str
     cclc_state_root: Path | None = None
@@ -182,6 +184,8 @@ class HeadlessCorePort(Protocol):
         self,
         preparation: dict[str, Any],
         expected_applied_record_digest: str | None,
+        request_owner_epoch: str,
+        request_id: str,
     ) -> dict[str, Any]: ...
 
     def applied_program_selection(self) -> dict[str, Any]: ...
@@ -296,8 +300,10 @@ class NativeHeadlessCore:
             ) from exc
         try:
             self._native = manyforge_headless_py.HeadlessApiCore(
-                str(config.publication_root),
-                str(config.package_root),
+                str(config.projection_root),
+                str(config.install_root),
+                str(config.artifact_root),
+                str(config.program_selection_state_root),
                 str(config.node_catalog_path),
                 str(config.alarm_catalog_path),
                 str(config.historian_database_path),
@@ -578,6 +584,8 @@ class NativeHeadlessCore:
         self,
         preparation: dict[str, Any],
         expected_applied_record_digest: str | None,
+        request_owner_epoch: str,
+        request_id: str,
     ) -> dict[str, Any]:
         return self._require_object(
             self._invoke(
@@ -587,6 +595,8 @@ class NativeHeadlessCore:
                     label="Program Apply preparation",
                 ),
                 expected_applied_record_digest,
+                request_owner_epoch,
+                request_id,
             ),
             method="commit_program_apply",
         )

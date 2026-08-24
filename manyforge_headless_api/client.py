@@ -609,6 +609,23 @@ class HeadlessHttpClient:
     def manager_apply(self, body: Mapping[str, Any]) -> dict[str, Any]:
         return self.request("POST", "/api/manager/apply", body=body)
 
+    def manager_apply_status(
+        self, apply_id: str, apply_generation: int
+    ) -> dict[str, Any]:
+        if (
+            not isinstance(apply_id, str)
+            or not apply_id
+            or len(apply_id.encode("utf-8")) > 256
+            or type(apply_generation) is not int
+            or not 1 <= apply_generation <= 9_007_199_254_740_991
+        ):
+            raise ValueError("Manager Apply identity is invalid")
+        return self.request(
+            "GET",
+            "/api/manager/apply/status",
+            params=(("apply_id", apply_id), ("apply_generation", apply_generation)),
+        )
+
     def execution_status(self) -> dict[str, Any]:
         return self.request("GET", "/api/execution/status")
 

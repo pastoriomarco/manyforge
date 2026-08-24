@@ -208,6 +208,36 @@ def test_manager_client_rejects_a_response_for_another_request(
     assert captured.value.code == "manager_command_response_identity_mismatch"
 
 
+def test_manager_client_observes_apply_without_replaying_submission(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    client = ManagerCommandClient(tmp_path)
+    commands: list[dict[str, object]] = []
+
+    def exchange(command: dict[str, object]) -> dict[str, object]:
+        commands.append(command)
+        return {
+            "api_version": "manyforge.manager_command_response.v1",
+            "apply_generation": 3,
+            "apply_id": "apply.3",
+            "candidate_projection_revision": None,
+            "error": None,
+            "ok": True,
+            "state": "pending",
+        }
+
+    monkeypatch.setattr(client, "_exchange", exchange)
+    response = client.observe_apply("apply.3", 3)
+
+    assert response["state"] == "pending"
+    assert commands == [{
+        "api_version": "manyforge.manager_command.v1",
+        "apply_generation": 3,
+        "apply_id": "apply.3",
+        "command": "apply_status",
+    }]
+
+
 def test_scene_client_stamps_attribution_and_uses_one_canonical_packet(
     tmp_path: Path,
 ) -> None:

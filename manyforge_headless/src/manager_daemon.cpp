@@ -317,21 +317,23 @@ private:
 };
 
 struct DaemonConfig final {
-  std::filesystem::path package_root;
+  std::filesystem::path install_root;
   std::filesystem::path canonical_empty_admission_filename{
       "canonical-empty-admission.json"};
   std::filesystem::path manager_state_root;
+  std::filesystem::path manager_run_root;
   std::filesystem::path runtime_state_root;
   std::filesystem::path logical_scene_database;
   std::filesystem::path program_cycle_journal;
   std::filesystem::path authoring_transaction_journal;
-  std::filesystem::path publication_root;
+  std::filesystem::path projection_root;
   std::filesystem::path program_runner_liveness_socket;
   std::chrono::milliseconds reconciliation_period{250};
 };
 
 enum class CommandKind {
   kApply,
+  kApplyStatus,
   kSceneCommit,
   kSceneOwnerRead,
   kSceneCandidatePreview,
@@ -356,6 +358,7 @@ enum class CommandKind {
   case CommandKind::kReconcile:
     return true;
   case CommandKind::kSceneOwnerRead:
+  case CommandKind::kApplyStatus:
   case CommandKind::kScenePoseQuery:
   case CommandKind::kSceneRuntimeOwnerRead:
   case CommandKind::kShutdownRuntime:
@@ -406,6 +409,8 @@ struct ManagerCommand final {
   std::optional<bool> pose_eligible{};
   std::optional<CanonicalValue> pose_payload{};
   std::vector<PoseObserverBinding> pose_observer_bindings{};
+  std::optional<core::ApplyId> apply_id{};
+  std::optional<core::ApplyGeneration> apply_generation{};
 };
 
 const CanonicalValue &RequiredMember(const CanonicalValue &root,
@@ -1065,6 +1070,14 @@ ManagerCommand DecodeCommand(const std::string_view bytes) {
         RequiredMember(root, "expected_projection_revision"));
     return result;
   }
+  if (command == "apply_status") {
+    RequireExactObjectSize(root, 4U, "Apply status command");
+    ManagerCommand result{.kind = CommandKind::kApplyStatus};
+    result.apply_id = core::ApplyId(RequiredString(root, "apply_id"));
+    result.apply_generation = core::ApplyGeneration(RequiredUnsigned(
+        RequiredMember(root, "apply_generation"), "apply_generation"));
+    return result;
+  }
   Require(command == "apply", "command kind is unsupported");
   RequireExactObjectSize(root, 11U, "Apply command");
   const auto request_id = RequiredString(root, "request_id");
@@ -1546,6 +1559,28 @@ ApplyResponse(const ManagerCommand &command,
   });
 }
 
+CanonicalValue ApplyStatusResponse(
+    const core::ApplyId &apply_id,
+    const core::ApplyGeneration apply_generation,
+    const std::optional<component_manager::PersistedManagerApplyTerminalOutcome>
+        &terminal) {
+  return CanonicalValue(CanonicalValue::Object{
+      {"api_version",
+       CanonicalValue(std::string(kManagerCommandResponseApiVersion))},
+      {"apply_generation",
+       Unsigned(apply_generation.value(), "Apply generation")},
+      {"apply_id", CanonicalValue(apply_id.value())},
+      {"candidate_projection_revision",
+       terminal.has_value()
+           ? ProjectionRevision(
+                 terminal->terminal_outcome.candidate_projection_revision)
+           : CanonicalValue(nullptr)},
+      {"error", CanonicalValue(nullptr)},
+      {"ok", CanonicalValue(true)},
+      {"state", CanonicalValue(terminal.has_value() ? "succeeded" : "pending")},
+  });
+}
+
 CanonicalValue
 SuccessResponse(const std::string_view operation,
                 const std::optional<std::uint64_t> manager_gen,
@@ -1662,10 +1697,10 @@ public:
       : config_(ValidateConfig(std::move(config))),
         started_at_(std::chrono::steady_clock::now()),
         package_generation_(
-            config_.package_root,
+            config_.install_root,
             deployment::build_qualified_runtime_contract_registry()
                 .package_manifest_set()),
-        daemon_lock_(config_.manager_state_root),
+        daemon_lock_(config_.manager_run_root),
         admission_(deployment::FilesystemCanonicalEmptyRetainedBundleSource(
                        package_generation_.descriptor_bound_root(),
                        config_.canonical_empty_admission_filename)
@@ -1676,7 +1711,8 @@ public:
                           "maintained"),
         native_runtime_adapter_(
             InstalledTargetRoot(), package_generation_.descriptor_bound_root(),
-            config_.manager_state_root, config_.runtime_state_root,
+            config_.manager_state_root, config_.manager_run_root,
+            config_.runtime_state_root,
             bundle_source_, artifact_source_, "linux",
             std::vector<std::string>{
                 std::string(deployment::native_execution_runtime_contract::
@@ -1726,11 +1762,11 @@ public:
         scene_runtime_owner_(
             [] { return HostMonotonicNs(); },
             [] { return RandomToken("scene-init-"); }),
-        manager_channel_(config_.publication_root,
+        manager_channel_(config_.projection_root,
                          std::string(kManagerSourceFileName)),
-        scene_channel_(config_.publication_root,
+        scene_channel_(config_.projection_root,
                        std::string(kLogicalSceneSourceFileName)),
-        scene_runtime_channel_(config_.publication_root,
+        scene_runtime_channel_(config_.projection_root,
                                std::string(kSceneRuntimeSourceFileName)),
         manager_owner_epoch_(RandomToken("manager-")),
         scene_runtime_owner_epoch_(RandomToken("scene-runtime-")),
@@ -1748,7 +1784,7 @@ public:
   }
 
   int Run() {
-    CommandSocket command_socket(config_.manager_state_root);
+    CommandSocket command_socket(config_.manager_run_root);
     StartNativeManagerLivenessLane();
     try {
       while (g_stop_requested == 0) {
@@ -1816,19 +1852,21 @@ private:
   };
 
   static DaemonConfig ValidateConfig(DaemonConfig config) {
-    config.package_root =
-        ExistingDirectory(std::move(config.package_root), "package root");
-    std::error_code package_root_error;
-    config.package_root =
-        std::filesystem::canonical(config.package_root, package_root_error);
-    Require(!package_root_error && config.package_root.is_absolute(),
-            "package root could not be canonicalized");
+    config.install_root =
+        ExistingDirectory(std::move(config.install_root), "install root");
+    std::error_code install_root_error;
+    config.install_root =
+        std::filesystem::canonical(config.install_root, install_root_error);
+    Require(!install_root_error && config.install_root.is_absolute(),
+            "install root could not be canonicalized");
     config.manager_state_root = ExistingDirectory(
         std::move(config.manager_state_root), "Manager state root");
+    config.manager_run_root = ExistingDirectory(
+        std::move(config.manager_run_root), "Manager run root");
     config.runtime_state_root = ExistingDirectory(
         std::move(config.runtime_state_root), "runtime state root");
-    config.publication_root = ExistingDirectory(
-        std::move(config.publication_root), "publication root");
+    config.projection_root = ExistingDirectory(
+        std::move(config.projection_root), "projection root");
     config.logical_scene_database =
         DatabasePath(std::move(config.logical_scene_database));
     config.program_cycle_journal = ProspectiveDatabasePath(
@@ -3010,6 +3048,26 @@ private:
         }
         return false;
       }
+      case CommandKind::kApplyStatus: {
+        Require(command.apply_id.has_value() &&
+                    command.apply_generation.has_value(),
+                "decoded Apply status command lacks its durable identity");
+        const auto intent = stores_.apply_journal().ReadIntent(
+            *command.apply_id, *command.apply_generation);
+        if (!intent.has_value()) {
+          TrySendResponse(client.get(),
+                          ErrorResponse("apply_status_not_found",
+                                        "Manager Apply identity is unknown"));
+          return false;
+        }
+        const auto terminal = stores_.apply_journal().ReadTerminalOutcome(
+            *command.apply_id, *command.apply_generation);
+        TrySendResponse(client.get(),
+                        ApplyStatusResponse(*command.apply_id,
+                                            *command.apply_generation,
+                                            terminal));
+        return false;
+      }
       case CommandKind::kSceneCommit: {
         Require(command.scene_transaction.has_value(),
                 "decoded scene command lacks its transaction");
@@ -3479,29 +3537,33 @@ std::uint64_t ParsePeriod(const std::string_view value) {
 
 DaemonConfig ParseArguments(const int argc, char **argv) {
   DaemonConfig config;
-  bool package = false;
+  bool install = false;
   bool admission = false;
   bool manager = false;
+  bool manager_run = false;
   bool runtime = false;
   bool scene = false;
   bool program_cycle = false;
   bool authoring = false;
-  bool publication = false;
+  bool projection = false;
   bool program_runner_liveness = false;
   bool period = false;
   for (int index = 1; index < argc; index += 2) {
     Require(index + 1 < argc, "every option requires one value");
     const std::string_view option(argv[index]);
     const std::string value(argv[index + 1]);
-    if (option == "--package-root" && !package) {
-      config.package_root = value;
-      package = true;
+    if (option == "--install-root" && !install) {
+      config.install_root = value;
+      install = true;
     } else if (option == "--canonical-empty-admission-filename" && !admission) {
       config.canonical_empty_admission_filename = value;
       admission = true;
     } else if (option == "--manager-state-root" && !manager) {
       config.manager_state_root = value;
       manager = true;
+    } else if (option == "--manager-run-root" && !manager_run) {
+      config.manager_run_root = value;
+      manager_run = true;
     } else if (option == "--runtime-state-root" && !runtime) {
       config.runtime_state_root = value;
       runtime = true;
@@ -3514,9 +3576,9 @@ DaemonConfig ParseArguments(const int argc, char **argv) {
     } else if (option == "--authoring-transaction-journal" && !authoring) {
       config.authoring_transaction_journal = value;
       authoring = true;
-    } else if (option == "--publication-root" && !publication) {
-      config.publication_root = value;
-      publication = true;
+    } else if (option == "--projection-root" && !projection) {
+      config.projection_root = value;
+      projection = true;
     } else if (option == "--program-runner-liveness-socket" &&
                !program_runner_liveness) {
       config.program_runner_liveness_socket = value;
@@ -3529,11 +3591,12 @@ DaemonConfig ParseArguments(const int argc, char **argv) {
       Fail("unknown or duplicate option " + std::string(option));
     }
   }
-  Require(package && manager && runtime && scene && program_cycle &&
-              authoring && publication,
-          "--package-root, --manager-state-root, --runtime-state-root, "
+  Require(install && manager && manager_run && runtime && scene &&
+              program_cycle && authoring && projection,
+          "--install-root, --manager-state-root, --manager-run-root, "
+          "--runtime-state-root, "
           "--logical-scene-database, --program-cycle-journal, "
-          "--authoring-transaction-journal, and --publication-root are required");
+          "--authoring-transaction-journal, and --projection-root are required");
   return config;
 }
 

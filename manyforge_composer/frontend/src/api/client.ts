@@ -9,6 +9,7 @@ import {
   parseHistorianPage,
   parseExecutionOwnerStatus,
   parseManagerApplyResponse,
+  parseManagerApplyStatusResponse,
   parseManagerDiffProjection,
   parseManagerGraphProjection,
   parseManagerStatusProjection,
@@ -52,6 +53,7 @@ import type {
   HealthResponse,
   JsonValue,
   ManagerApplyResponse,
+  ManagerApplyStatusResponse,
   NodeEnvironmentResponse,
   ManagerDiffProjection,
   ManagerGraphProjection,
@@ -582,6 +584,27 @@ export const api = {
       },
       signal,
       { method: 'POST', body: JSON.stringify(request) },
+    ),
+    applyStatus: (
+      applyId: string,
+      applyGeneration: number,
+      signal?: AbortSignal,
+    ): Promise<ManagerApplyStatusResponse> => requestJson(
+      `/api/manager/apply/status?${new URLSearchParams({
+        apply_id: applyId,
+        apply_generation: String(applyGeneration),
+      }).toString()}`,
+      (value) => {
+        const response = parseManagerApplyStatusResponse(value);
+        if (
+          response.applyId !== applyId
+          || response.applyGeneration !== applyGeneration
+        ) {
+          throw new Error('Manager Apply status changed durable identity');
+        }
+        return response;
+      },
+      signal,
     ),
   },
   files: {

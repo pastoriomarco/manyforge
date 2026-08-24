@@ -642,8 +642,55 @@ class AuthoringAdmissionCoordinator:
             )
             self._journal.record(transaction, "release_receipt_json", receipt)
             return result
-        except HTTPException:
-            # HTTP status cannot prove no effect after acquire/effect intent.
+        except HTTPException as error:
+            transaction = self._journal.lookup(
+                envelope.request_owner_epoch, envelope.request_id
+            )
+            if (
+                transaction is not None
+                and transaction.claim is not None
+                and transaction.effect_intent is None
+                and transaction.outcome is None
+            ):
+                try:
+                    self._journal.record(
+                        transaction,
+                        "outcome_json",
+                        self._recovered_no_effect_outcome(transaction),
+                    )
+                    transaction = self._journal.lookup(
+                        envelope.request_owner_epoch, envelope.request_id
+                    )
+                    assert transaction is not None
+                    release = self._release(transaction, "proven_no_effect")
+                    self._journal.record(
+                        transaction, "release_intent_json", release
+                    )
+                    receipt = self._client.settle_authoring_transaction(
+                        {
+                            "claim": transaction.claim,
+                            "settlement_kind": "proven_no_effect",
+                            "evidence_digest": release["evidence_digest"],
+                        }
+                    )
+                    self._journal.record(
+                        transaction, "release_receipt_json", receipt
+                    )
+                    raise error
+                except HTTPException:
+                    raise
+                except (AuthoringJournalError, HeadlessClientError) as recovery_error:
+                    self._ready = False
+                    self._blocked_reason = str(recovery_error)
+                    raise self._unavailable(
+                        getattr(
+                            recovery_error,
+                            "code",
+                            "composer_authoring_unavailable",
+                        ),
+                        str(recovery_error),
+                    ) from recovery_error
+            # An HTTP status after effect intent cannot prove no effect.
             self._ready = False
             self._blocked_reason = (
                 "authoring effect outcome requires durable recovery"

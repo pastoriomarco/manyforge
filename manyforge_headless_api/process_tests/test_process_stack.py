@@ -54,14 +54,20 @@ class ProcessStack:
     ) -> None:
         self.root = root
         self.manager_root = root / "manager"
+        self.manager_run_root = root / "manager-run"
         self.execution_root = root / "execution"
         self.runtime_root = root / "runtime"
         self.publication_root = root / "publications"
+        self.artifact_root = root / "artifacts"
+        self.program_selection_state_root = root / "program-selection-state"
         for path in (
             self.manager_root,
+            self.manager_run_root,
             self.execution_root,
             self.runtime_root,
             self.publication_root,
+            self.artifact_root,
+            self.program_selection_state_root,
         ):
             path.mkdir()
         self.scene_database = root / "logical-scene.sqlite3"
@@ -73,7 +79,7 @@ class ProcessStack:
             / "composer-authoring-transactions.sqlite3"
         )
         self.program_runner_liveness_socket = (
-            root / "program-runner-liveness.sock"
+            self.manager_run_root / "program-runner-liveness.sock"
         )
         self.history_database = root / "history.sqlite3"
         self.manager_executable = _required_path("MANYFORGE_MANAGER_DAEMON")
@@ -150,10 +156,12 @@ class ProcessStack:
         manager_publication_root.mkdir(exist_ok=True)
         command = [
             str(self.manager_executable),
-            "--package-root",
+            "--install-root",
             str(self.manager_package_root),
             "--manager-state-root",
             str(self.manager_root),
+            "--manager-run-root",
+            str(self.manager_run_root),
             "--runtime-state-root",
             str(self.runtime_root),
             "--logical-scene-database",
@@ -162,7 +170,7 @@ class ProcessStack:
             str(self.program_cycle_journal),
             "--authoring-transaction-journal",
             str(self.authoring_transaction_journal),
-            "--publication-root",
+            "--projection-root",
             str(manager_publication_root),
             "--reconciliation-period-ms",
             "20",
@@ -198,18 +206,22 @@ class ProcessStack:
             "127.0.0.1",
             "--port",
             str(self.port),
-            "--publication-root",
+            "--projection-root",
             str(self.publication_root),
-            "--package-root",
+            "--install-root",
             str(self.package_root),
+            "--artifact-root",
+            str(self.artifact_root),
+            "--program-selection-state-root",
+            str(self.program_selection_state_root),
             "--node-catalog-path",
             str(NODE_CATALOG),
             "--alarm-catalog-path",
             str(CATALOG),
             "--historian-database-path",
             str(self.history_database),
-            "--manager-state-root",
-            str(self.manager_root),
+            "--manager-run-root",
+            str(self.manager_run_root),
             "--execution-state-root",
             str(self.runtime_root),
             "--cell-id",
@@ -454,7 +466,9 @@ class ProcessStack:
         try:
             with socket.socket(socket.AF_UNIX, socket.SOCK_SEQPACKET) as client:
                 client.settimeout(1.0)
-                client.connect(str(self.manager_root / "manager-command.sock"))
+                client.connect(
+                    str(self.manager_run_root / "manager-command.sock")
+                )
                 client.sendall(request)
                 response = client.recv(16 * 1024)
                 if b'"ok":true' not in response:
@@ -1268,13 +1282,13 @@ def test_real_program_apply_reuses_active_deployment_and_survives_api_restart(
                     / f"{program['program_revision'][7:]}.json"
                 )
                 publication_program_path = (
-                    stack.publication_root
+                    stack.artifact_root
                     / "programs"
                     / "sha256"
                     / f"{program['program_revision'][7:]}.json"
                 )
                 publication_binding_path = (
-                    stack.publication_root
+                    stack.artifact_root
                     / "program-bindings"
                     / "sha256"
                 )
@@ -1384,7 +1398,25 @@ def test_real_program_apply_reuses_active_deployment_and_survives_api_restart(
                             ):
                                 raise
                 replay = replay_response["headless"]
-                assert replay["applied"] == first_applied
+                replay_applied = replay["applied"]
+                assert {
+                    key: value
+                    for key, value in replay_applied.items()
+                    if key != "source"
+                } == {
+                    key: value
+                    for key, value in first_applied.items()
+                    if key != "source"
+                }
+                assert replay_applied["source"] == {
+                    **first_applied["source"],
+                    "source_owner_epoch": replay_applied["source"][
+                        "source_owner_epoch"
+                    ],
+                }
+                assert replay_applied["source"]["source_owner_epoch"] != (
+                    first_applied["source"]["source_owner_epoch"]
+                )
             assert _plain_package_files(stack.package_root) == package_before
 
 

@@ -19,6 +19,7 @@ import type {
   ManagerApplyAvailability,
   ManagerApplyReplayStatus,
   ManagerApplyResponse,
+  ManagerApplyStatusResponse,
   ManagerDiffProjection,
   ManagerGraphProjection,
   ManagerRuntimeProjection,
@@ -1686,6 +1687,75 @@ export function parseManagerApplyResponse(value: unknown): ManagerApplyResponse 
   };
 }
 
+export function parseManagerApplyStatusResponse(
+  value: unknown,
+): ManagerApplyStatusResponse {
+  const record = objectAt(value, 'managerApplyStatus');
+  exactKeysAt(
+    record,
+    [
+      'api_version',
+      'apply_generation',
+      'apply_id',
+      'candidate_projection_revision',
+      'error',
+      'ok',
+      'state',
+    ],
+    'managerApplyStatus',
+  );
+  const apiVersion = stringAt(
+    record.api_version,
+    'managerApplyStatus.api_version',
+  );
+  if (apiVersion !== 'manyforge.manager_command_response.v1') {
+    return fail(
+      'managerApplyStatus.api_version',
+      'manyforge.manager_command_response.v1',
+    );
+  }
+  if (!booleanAt(record.ok, 'managerApplyStatus.ok') || record.error !== null) {
+    return fail('managerApplyStatus', 'one accepted read-only status');
+  }
+  const state = stringAt(record.state, 'managerApplyStatus.state');
+  if (state !== 'pending' && state !== 'succeeded') {
+    return fail('managerApplyStatus.state', 'pending or succeeded');
+  }
+  const base = {
+    apiVersion: 'manyforge.manager_command_response.v1' as const,
+    applyGeneration: positiveIntegerAt(
+      record.apply_generation,
+      'managerApplyStatus.apply_generation',
+    ),
+    applyId: stringAt(record.apply_id, 'managerApplyStatus.apply_id'),
+    error: null,
+    ok: true as const,
+  };
+  if (state === 'pending') {
+    if (record.candidate_projection_revision !== null) {
+      return fail(
+        'managerApplyStatus.candidate_projection_revision',
+        'null while pending',
+      );
+    }
+    return { ...base, candidateProjectionRevision: null, state };
+  }
+  if (record.candidate_projection_revision === null) {
+    return fail(
+      'managerApplyStatus.candidate_projection_revision',
+      'a projection revision after success',
+    );
+  }
+  return {
+    ...base,
+    candidateProjectionRevision: parseProjectionRevision(
+      record.candidate_projection_revision,
+      'managerApplyStatus.candidate_projection_revision',
+    ),
+    state,
+  };
+}
+
 function parseProgramDraftProjection(
   value: unknown,
   path: string,
@@ -2142,8 +2212,11 @@ export function parseProgramRunStatus(value: unknown): ProgramRunStatus {
   exactKeysAt(
     capture,
     [
+      'applied_record_digest',
       'graph_revision',
       'node_environment_digest',
+      'node_policies',
+      'node_policy_digest',
       'owner_identities',
       'program_binding_id',
       'program_id',
@@ -2173,6 +2246,14 @@ export function parseProgramRunStatus(value: unknown): ProgramRunStatus {
       ownerEpoch: stringAt(owner.owner_epoch, `${ownerPath}.owner_epoch`),
     };
   });
+  const nodePolicies = boundedArrayAt(
+    capture.node_policies,
+    `${path}.capture.node_policies`,
+    100_000,
+  ).map((value, index) => jsonValueAt(
+    value,
+    `${path}.capture.node_policies[${index}]`,
+  ));
   const ownerRoles = ownerIdentities.map((owner) => owner.ownerRole);
   if (
     !ownerRoles.includes('program_runner')
@@ -2218,6 +2299,10 @@ export function parseProgramRunStatus(value: unknown): ProgramRunStatus {
     state,
     capture: {
       programRunId: stringAt(capture.program_run_id, `${path}.capture.program_run_id`),
+      appliedRecordDigest: digestAt(
+        capture.applied_record_digest,
+        `${path}.capture.applied_record_digest`,
+      ),
       scenarioId: stringAt(capture.scenario_id, `${path}.capture.scenario_id`),
       scenarioCatalogRevision: digestAt(
         capture.scenario_catalog_revision,
@@ -2243,6 +2328,11 @@ export function parseProgramRunStatus(value: unknown): ProgramRunStatus {
       nodeEnvironmentDigest: digestAt(
         capture.node_environment_digest,
         `${path}.capture.node_environment_digest`,
+      ),
+      nodePolicies,
+      nodePolicyDigest: digestAt(
+        capture.node_policy_digest,
+        `${path}.capture.node_policy_digest`,
       ),
       ownerIdentities,
     },

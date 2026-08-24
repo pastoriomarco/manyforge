@@ -218,6 +218,9 @@ export function DeploymentCompositionPanel({
       const completion = await completeManagerApply(
         request,
         (exactRequest, signal) => api.manager.apply(exactRequest, signal),
+        (applyId, applyGeneration, signal) => (
+          api.manager.applyStatus(applyId, applyGeneration, signal)
+        ),
         { signal: controller.signal },
       );
       if (!mountedRef.current || controller.signal.aborted) return;

@@ -206,6 +206,7 @@ class ProgramRuntime:
                 config.cycle_journal_path,
                 owner_epoch=self.owner_epoch,
                 maximum_requests=config.maximum_replay_records,
+                maximum_retained_runs=config.maximum_retained_runs,
             )
         )
         self._liveness: ProgramRunnerLivenessReceiver | None = None
@@ -744,19 +745,43 @@ class ProgramRuntime:
                 "program_runner_unavailable",
                 "Program runner is closed",
             )
-        snapshots, truncated = self._owner.list_snapshots(
+        snapshots, live_truncated = self._owner.list_snapshots(
             active_only=active_only,
             limit=limit,
         )
+        values = [snapshot.to_dict() for snapshot in snapshots]
         for snapshot in snapshots:
-            self._record_terminal_snapshot(snapshot.to_dict())
+            value = snapshot.to_dict()
+            if self._journal is not None:
+                self._journal.retain_run_snapshot(value)
+            self._record_terminal_snapshot(value)
+        history_truncated = False
+        if not active_only and self._journal is not None:
+            history, history_truncated = self._journal.list_run_snapshots(
+                limit=self.config.maximum_retained_runs
+            )
+            resident = {
+                value["capture"]["program_run_id"]
+                for value in values
+                if isinstance(value.get("capture"), dict)
+            }
+            values.extend(
+                value
+                for value in history
+                if value["capture"]["program_run_id"] not in resident
+                and value.get("state") in {"stopped", "succeeded", "failed"}
+            )
+            values.sort(key=lambda value: value["capture"]["program_run_id"])
+            if len(values) > limit:
+                values = values[:limit]
+                history_truncated = True
         return {
             "schema_version": PROGRAM_RUN_INDEX_VERSION,
             "owner_id": self.owner_id,
             "owner_epoch": self.owner_epoch,
             "active_only": active_only,
-            "truncated": truncated,
-            "runs": [snapshot.to_dict() for snapshot in snapshots],
+            "truncated": live_truncated or history_truncated,
+            "runs": values,
         }
 
     def _record_terminal_snapshot(self, snapshot: Any) -> None:
@@ -813,6 +838,7 @@ class ProgramRuntime:
                 expected_generation=cycle.cycle_generation,
                 program_run_id=program_run_id,
                 terminal_reference=reference,
+                snapshot=value,
             )
 
     def start_run(self, request: ProgramRunStartRequest) -> dict[str, Any]:
@@ -864,6 +890,12 @@ class ProgramRuntime:
                         "program_cycle_reset_required",
                         "Program cycle is not Idle after an explicit Reset",
                     )
+                try:
+                    journal.require_run_history_capacity()
+                except OverflowError as error:
+                    raise ProgramRunnerError(
+                        "program_run_history_full", str(error)
+                    ) from error
                 owner_admission = admission_client.get()
                 generation = self._admission_generation(owner_admission)
                 if generation != request.expected_admission_generation:
@@ -989,21 +1021,26 @@ class ProgramRuntime:
                         "program_run_capture_invalid",
                         "Program owner omitted immutable capture identities",
                     )
-                identities = {
-                    key: capture[key]
-                    for key in (
-                        "program_run_id",
-                        "scenario_id",
-                        "scenario_catalog_revision",
-                        "program_id",
-                        "program_revision",
-                        "program_binding_id",
-                        "retained_bundle_id",
-                        "graph_revision",
-                        "node_environment_digest",
+                identity_fields = (
+                    "program_run_id",
+                    "applied_record_digest",
+                    "scenario_id",
+                    "scenario_catalog_revision",
+                    "program_id",
+                    "program_revision",
+                    "program_binding_id",
+                    "retained_bundle_id",
+                    "graph_revision",
+                    "node_environment_digest",
+                    "node_policies",
+                    "node_policy_digest",
+                )
+                if any(key not in capture for key in identity_fields):
+                    raise ProgramRunnerError(
+                        "program_run_capture_invalid",
+                        "Program owner omitted required immutable run evidence",
                     )
-                    if key in capture
-                }
+                identities = {key: capture[key] for key in identity_fields}
                 with self._terminal_observation_lock:
                     journal.transition(
                         expected_generation=cycle.cycle_generation,
@@ -1011,6 +1048,7 @@ class ProgramRuntime:
                         state="running",
                         program_run_id=snapshot.capture.program_run_id,
                         capture_identities=identities,
+                        run_snapshot=result,
                     )
                     pending_terminal = self._pending_terminal_snapshots.pop(
                         snapshot.capture.program_run_id,
@@ -1064,9 +1102,15 @@ class ProgramRuntime:
             )
         try:
             result = self._owner.read(program_run_id).to_dict()
+            if self._journal is not None:
+                self._journal.retain_run_snapshot(result)
             self._record_terminal_snapshot(result)
             return result
         except ProgramRunOwnerError as error:
+            if self._journal is not None:
+                retained = self._journal.read_run_snapshot(program_run_id)
+                if retained is not None:
+                    return retained
             raise ProgramRunnerError(
                 "program_run_not_found",
                 str(error),
@@ -1145,6 +1189,7 @@ class ProgramRuntime:
             # It must neither gate the owner call nor turn success into failure.
             try:
                 _admission, journal = self._require_cycle_owner()
+                journal.retain_run_snapshot(result)
                 cycle = journal.read()
                 if result.get("state") in {"stopped", "succeeded", "failed"}:
                     self._record_terminal_snapshot(result)

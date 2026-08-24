@@ -132,8 +132,10 @@ private:
 };
 
 struct HeadlessApiCoreConfig final {
-  std::filesystem::path publication_root;
-  std::filesystem::path package_root;
+  std::filesystem::path projection_root;
+  std::filesystem::path install_root;
+  std::filesystem::path artifact_root;
+  std::filesystem::path program_selection_state_root;
   std::filesystem::path node_catalog_path;
   std::filesystem::path alarm_catalog_path;
   std::filesystem::path historian_database_path;
@@ -183,7 +185,8 @@ public:
                       std::string_view canonical_program_bytes);
   [[nodiscard]] manyforge::content_identity::CanonicalValue CommitProgramApply(
       std::string_view canonical_preparation_bytes,
-      const std::optional<std::string> &expected_applied_record_digest);
+      const std::optional<std::string> &expected_applied_record_digest,
+      std::string_view request_owner_epoch, std::string_view request_id);
   [[nodiscard]] manyforge::content_identity::CanonicalValue
   AppliedProgramSelection();
   [[nodiscard]] ViewerModelAsset ViewerModelUrdf();
@@ -314,7 +317,7 @@ private:
       retained_bundle_source_;
   manyforge::deployment::FilesystemScenarioApplyCandidateSource
       scenario_catalog_source_;
-  ProgramApplyOwner program_apply_owner_;
+  ProgramSelectionOwner program_selection_owner_;
   ActiveNodeEnvironmentProjection node_environment_projection_;
   ActiveSourceModelProjection source_model_projection_;
   manyforge::deployment::FilesystemVerifiedRetainedViewerModelSource

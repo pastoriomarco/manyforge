@@ -9,6 +9,8 @@ import hashlib
 import json
 from typing import Any, Sequence
 
+import rfc8785
+
 from manyforge_behavior.catalog import (
     CatalogValidationError,
     NodeCatalog,
@@ -723,8 +725,11 @@ class HeadlessService:
             "tree_status",
         }
         capture_fields = {
+            "applied_record_digest",
             "graph_revision",
             "node_environment_digest",
+            "node_policies",
+            "node_policy_digest",
             "owner_identities",
             "program_binding_id",
             "program_id",
@@ -744,6 +749,17 @@ class HeadlessService:
         owner_identities = (
             capture.get("owner_identities") if isinstance(capture, dict) else None
         )
+        node_policies = (
+            capture.get("node_policies") if isinstance(capture, dict) else None
+        )
+        try:
+            calculated_policy_digest = (
+                "sha256:" + hashlib.sha256(rfc8785.dumps(node_policies)).hexdigest()
+                if isinstance(node_policies, list)
+                else None
+            )
+        except (rfc8785.CanonicalizationError, TypeError, ValueError):
+            calculated_policy_digest = None
         if (
             set(projection) != expected_fields
             or projection.get("schema_version") != PROGRAM_RUN_STATUS_VERSION
@@ -778,14 +794,19 @@ class HeadlessService:
             or any(
                 not _sha256_identity(capture.get(field_name))
                 for field_name in (
+                    "applied_record_digest",
                     "scenario_catalog_revision",
                     "program_revision",
                     "program_binding_id",
                     "retained_bundle_id",
                     "graph_revision",
                     "node_environment_digest",
+                    "node_policy_digest",
                 )
             )
+            or not isinstance(node_policies, list)
+            or len(node_policies) > 100_000
+            or calculated_policy_digest != capture.get("node_policy_digest")
             or not isinstance(owner_identities, list)
             or not 1 <= len(owner_identities) <= 4_096
         ):
@@ -892,7 +913,11 @@ class HeadlessService:
                 )
             self._validate_program_run_snapshot(
                 row,
-                expected_owner_epoch=owner_epoch,
+                expected_owner_epoch=(
+                    owner_epoch
+                    if row.get("state") in _ACTIVE_PROGRAM_RUN_STATES
+                    else None
+                ),
             )
             program_run_ids.append(row["capture"]["program_run_id"])
             if row["owner_id"] != owner_id or (
@@ -940,8 +965,14 @@ class HeadlessService:
             raise self._runner_error(error) from error
         snapshot = self._validate_program_run_snapshot(projection)
         capture = snapshot["capture"]
+        binding = applied.get("program_binding")
+        applied_node_policies = (
+            binding.get("node_policies") if isinstance(binding, dict) else None
+        )
         if (
-            any(
+            capture["applied_record_digest"] != source.get("record_digest")
+            or capture["node_policies"] != applied_node_policies
+            or any(
                 capture[capture_field] != applied.get(applied_field)
                 for capture_field, applied_field in (
                     ("scenario_id", "scenario_id"),
@@ -1220,9 +1251,17 @@ class HeadlessService:
                 ) from error
             return result
 
+        claim_intent = request.authoring_claim.get("intent")
+        if not isinstance(claim_intent, dict):
+            raise HeadlessApiError(
+                "authoring_claim_invalid",
+                "Program Apply authoring claim has no request identity",
+            )
         applied = self.core.commit_program_apply(
             preparation,
             request.expected_applied_record_digest,
+            str(claim_intent.get("owner_epoch", "")),
+            str(claim_intent.get("request_id", "")),
         )
         result = {
             "schema_version": PROGRAM_APPLY_RESULT_VERSION,
@@ -1476,6 +1515,11 @@ class HeadlessService:
 
     def manager_apply(self, request: ManagerApplyRequest) -> dict[str, Any]:
         return self.manager.apply(request)
+
+    def manager_apply_status(
+        self, apply_id: str, apply_generation: int
+    ) -> dict[str, Any]:
+        return self.manager.observe_apply(apply_id, apply_generation)
 
     def scene_commit(
         self,

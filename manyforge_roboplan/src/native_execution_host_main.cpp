@@ -368,6 +368,7 @@ private:
 struct HostConfig final {
   std::filesystem::path package_root;
   std::filesystem::path manager_state_root;
+  std::filesystem::path manager_run_root;
   std::filesystem::path execution_state_root;
   std::filesystem::path staging_root;
   std::filesystem::path candidate_worker;
@@ -383,6 +384,7 @@ struct ManagedRuntimeChildConfig final {
   int package_root_fd{-1};
   std::filesystem::path package_root;
   std::filesystem::path manager_state_root;
+  std::filesystem::path manager_run_root;
   std::filesystem::path logical_scene_database;
   std::filesystem::path program_cycle_journal;
   std::filesystem::path authoring_transaction_journal;
@@ -447,6 +449,8 @@ ParseManagedRuntimeArguments(const int argc, char **argv) {
       config.package_root_fd = ParseFileDescriptor(value);
     } else if (option == "--manyforge-managed-manager-state-root") {
       config.manager_state_root = value;
+    } else if (option == "--manyforge-managed-manager-run-root") {
+      config.manager_run_root = value;
     } else if (option == "--manyforge-managed-logical-scene-database") {
       config.logical_scene_database = value;
     } else if (option == "--manyforge-managed-program-cycle-journal") {
@@ -476,7 +480,7 @@ ParseManagedRuntimeArguments(const int argc, char **argv) {
       Fail("unknown managed runtime option " + option);
     }
   }
-  Require(seen.size() >= 13U && seen.size() <= 16U &&
+  Require(seen.size() >= 14U && seen.size() <= 17U &&
               config.manager_channel_fd >= 0 &&
               config.manager_liveness_channel_fd >= 0 &&
               config.manager_liveness_channel_fd != config.manager_channel_fd &&
@@ -506,6 +510,8 @@ ParseManagedRuntimeArguments(const int argc, char **argv) {
       std::to_string(config.package_root_fd);
   config.manager_state_root = ExistingDirectory(
       std::move(config.manager_state_root), "managed Manager state root");
+  config.manager_run_root = ExistingDirectory(
+      std::move(config.manager_run_root), "managed Manager run root");
   if (!config.logical_scene_database.empty()) {
     config.logical_scene_database = ExistingRegularFile(
         std::move(config.logical_scene_database),
@@ -3414,13 +3420,13 @@ DecodeProjectionRevision(const CanonicalValue &value) {
 }
 
 [[nodiscard]] CanonicalValue
-ExchangeManagerCommand(const std::filesystem::path &manager_state_root,
+ExchangeManagerCommand(const std::filesystem::path &manager_run_root,
                        CanonicalValue command) {
   const auto bytes = content_identity::canonical_json(command);
   Require(!bytes.empty() && bytes.size() <= kMaximumPacketBytes,
           "Manager scene request is empty or oversized");
   const auto socket_path =
-      manager_state_root / std::string(kManagerSocketFileName);
+      manager_run_root / std::string(kManagerSocketFileName);
   const auto spelling = socket_path.string();
   Require(spelling.size() < sizeof(sockaddr_un::sun_path),
           "Manager command socket path is too long");
@@ -3581,14 +3587,14 @@ struct ManagerSceneRead final {
 class ManagerSceneAuthorityProxy final : public core::ISceneAuthority,
                                          public core::ISceneCandidatePreview {
 public:
-  explicit ManagerSceneAuthorityProxy(std::filesystem::path manager_state_root)
-      : manager_state_root_(std::move(manager_state_root)) {}
+  explicit ManagerSceneAuthorityProxy(std::filesystem::path manager_run_root)
+      : manager_run_root_(std::move(manager_run_root)) {}
 
   [[nodiscard]] core::SceneCommitResultDTO
   Commit(const core::SceneTransactionRequestDTO &request) override {
     const auto encoded = scene::EncodeCanonicalSceneTransactionRequest(request);
     const auto response = ExchangeManagerCommand(
-        manager_state_root_,
+        manager_run_root_,
         CanonicalValue(CanonicalValue::Object{
             {"api_version",
              CanonicalValue(std::string(kManagerCommandApiVersion))},
@@ -3659,7 +3665,7 @@ public:
     const auto encoded =
         scene::EncodeResolvedSceneCandidatePreviewRequest(request);
     const auto response = ExchangeManagerCommand(
-        manager_state_root_,
+        manager_run_root_,
         CanonicalValue(CanonicalValue::Object{
             {"api_version",
              CanonicalValue(std::string(kManagerCommandApiVersion))},
@@ -3733,7 +3739,7 @@ public:
             "scene resource identity is invalid");
     const auto current = Read();
     const auto response = ExchangeManagerCommand(
-        manager_state_root_,
+        manager_run_root_,
         CanonicalValue(CanonicalValue::Object{
             {"api_version",
              CanonicalValue(std::string(kManagerCommandApiVersion))},
@@ -3784,7 +3790,7 @@ public:
 private:
   [[nodiscard]] ManagerSceneRead Read() const {
     const auto response = ExchangeManagerCommand(
-        manager_state_root_,
+        manager_run_root_,
         CanonicalValue(CanonicalValue::Object{
             {"api_version",
              CanonicalValue(std::string(kManagerCommandApiVersion))},
@@ -3806,7 +3812,7 @@ private:
             std::move(projection), std::move(snapshot)};
   }
 
-  std::filesystem::path manager_state_root_;
+  std::filesystem::path manager_run_root_;
 };
 
 /// Process-local, non-authoritative join from fresh planning admission to the
@@ -3817,19 +3823,19 @@ class ManagerPlanningSceneSynchronizer final
     : public core::IPlanningSceneSynchronizer {
 public:
   ManagerPlanningSceneSynchronizer(
-      std::filesystem::path manager_state_root,
+      std::filesystem::path manager_run_root,
       core::RetainedBundleId retained_bundle_id,
       core::GraphRevision graph_revision,
       const core::ActiveBundlePublicationGeneration publication_generation,
       std::shared_ptr<core::ICollisionWorldSnapshotPublisher>
           collision_publisher)
-      : manager_state_root_(std::move(manager_state_root)),
+      : manager_run_root_(std::move(manager_run_root)),
         retained_bundle_id_(std::move(retained_bundle_id)),
         graph_revision_(std::move(graph_revision)),
         publication_generation_(publication_generation),
         collision_publisher_(std::move(collision_publisher)) {
     Require(
-        !manager_state_root_.empty() &&
+        !manager_run_root_.empty() &&
             core::IsExactLowercaseSha256Digest(retained_bundle_id_.value()) &&
             core::IsExactLowercaseSha256Digest(graph_revision_.value()) &&
             publication_generation_.nonzero() &&
@@ -3857,7 +3863,7 @@ public:
         const auto predecessor =
             current->projection_binding.projection_revision;
         const auto response = ExchangeManagerCommand(
-            manager_state_root_,
+            manager_run_root_,
             CanonicalValue(CanonicalValue::Object{
                 {"api_version",
                  CanonicalValue(std::string(kManagerCommandApiVersion))},
@@ -3965,7 +3971,7 @@ private:
             "Manager scene-runtime latch identity changed");
   }
 
-  std::filesystem::path manager_state_root_;
+  std::filesystem::path manager_run_root_;
   core::RetainedBundleId retained_bundle_id_;
   core::GraphRevision graph_revision_;
   core::ActiveBundlePublicationGeneration publication_generation_;
@@ -4321,6 +4327,7 @@ struct CompositionBuildInput final {
   bool attach_addressed_owner{true};
   std::shared_ptr<WallClock> shared_clock;
   std::filesystem::path manager_state_root;
+  std::filesystem::path manager_run_root;
   std::filesystem::path logical_scene_database;
   std::filesystem::path program_cycle_journal;
   std::filesystem::path authoring_transaction_journal;
@@ -4468,7 +4475,7 @@ BuildProductComposition(CompositionBuildInput input) {
               (input.status_program == nullptr) ==
                   (input.status_program_binding == nullptr) &&
               (input.planner_scene_projection == nullptr ||
-               !input.manager_state_root.empty()),
+               !input.manager_run_root.empty()),
           "native physical composition inputs do not share one active "
           "product");
   const auto &products = input.bundle->value().compiled_products;
@@ -4860,7 +4867,7 @@ BuildProductComposition(CompositionBuildInput input) {
   if (input.planner_scene_projection != nullptr) {
     runtime_input.planning_scene_synchronizer =
         std::make_shared<ManagerPlanningSceneSynchronizer>(
-            input.manager_state_root, input.bundle->retained_bundle_id(),
+            input.manager_run_root, input.bundle->retained_bundle_id(),
             input.bundle->value().cell_graph.graph_revision,
             input.publication_generation, publisher);
   }
@@ -5050,7 +5057,7 @@ BuildProductComposition(CompositionBuildInput input) {
   if (composition->planner_scene_projection != nullptr) {
     composition->scene_authority_proxy =
         std::make_shared<ManagerSceneAuthorityProxy>(
-            std::move(input.manager_state_root));
+            std::move(input.manager_run_root));
   }
 #if defined(MANYFORGE_ENABLE_FOCUSED_PICK_PLACE_PLANNING_FIXTURE)
   auto fixture = process_fixture::MakeFocusedPickPlacePlanningFixture();
@@ -5228,6 +5235,7 @@ BuildComposition(const HostConfig &config,
       core::TargetRoleId(config.motion_target_role_id),
       core::TargetRoleId(config.gripper_target_role_id),
       true,
+      {},
       {},
       {},
       {},
@@ -5609,6 +5617,7 @@ TryBuildCurrentManagedCompositionInput(
       true,
       {},
       config.manager_state_root,
+      config.manager_run_root,
       config.logical_scene_database,
       config.program_cycle_journal,
       config.authoring_transaction_journal,
@@ -5811,6 +5820,7 @@ LoadExactManagedCandidateBundle(
       false,
       std::move(shared_clock),
       config.manager_state_root,
+      config.manager_run_root,
       config.logical_scene_database,
       config.program_cycle_journal,
       config.authoring_transaction_journal,

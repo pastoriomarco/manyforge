@@ -303,6 +303,7 @@ MakeAdapter(NativeFixture &fixture, const std::filesystem::path &target_root) {
   return component_manager::RetainedNativeRuntimeUnitAdapter(
       target_root, fixture.root / "retained-package",
       fixture.staging_root.path(), fixture.staging_root.path(),
+      fixture.staging_root.path(),
       fixture.bundle_source, fixture.artifact_source,
       std::string(contract::kOperatingSystem),
       std::string(contract::kLaunchEnvironmentContract));
@@ -604,6 +605,7 @@ TEST(RetainedNativeRuntimeUnitAdapter,
   auto adapter = component_manager::RetainedNativeRuntimeUnitAdapter(
       MANYFORGE_NATIVE_EXECUTION_TARGET_ROOT, descriptor_root,
       fixture.staging_root.path(), fixture.staging_root.path(),
+      fixture.staging_root.path(),
       fixture.bundle_source, fixture.artifact_source,
       std::string(contract::kOperatingSystem),
       std::string(contract::kLaunchEnvironmentContract));

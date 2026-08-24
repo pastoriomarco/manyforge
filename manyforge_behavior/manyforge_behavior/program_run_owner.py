@@ -82,6 +82,7 @@ class ProgramRunAdmission:
     """One exact verified scenario closure admitted before tree construction."""
 
     scenario_id: str
+    applied_record_digest: str
     scenario_catalog_revision: str
     program: Program
     environment: NodeEnvironment
@@ -98,6 +99,7 @@ class ProgramRunAdmission:
     def __post_init__(self) -> None:
         _text(self.scenario_id, field="scenario_id", maximum_bytes=128)
         for field_name in (
+            "applied_record_digest",
             "scenario_catalog_revision",
             "program_binding_id",
             "retained_bundle_id",
@@ -438,6 +440,7 @@ class ProgramRunOwner:
         )
         capture = ProgramRunCapture(
             program_run_id=program_run_id,
+            applied_record_digest=admission.applied_record_digest,
             scenario_id=admission.scenario_id,
             scenario_catalog_revision=admission.scenario_catalog_revision,
             program_id=admission.program.program_id,
@@ -455,6 +458,7 @@ class ProgramRunOwner:
         initialization_started = False
         port_context = ProgramRunPortContext(
             program_run_id=capture.program_run_id,
+            applied_record_digest=capture.applied_record_digest,
             scenario_id=capture.scenario_id,
             scenario_catalog_revision=capture.scenario_catalog_revision,
             program_id=capture.program_id,
@@ -828,6 +832,7 @@ def build_program_run_admission(
     if not isinstance(selection, Mapping):
         raise TypeError("scenario Program selection must be a mapping")
     expected_fields = {
+        "applied_record_digest",
         "assistant_projection",
         "assistant_mode",
         "deployment_artifact_id",
@@ -994,6 +999,10 @@ def build_program_run_admission(
     )
     return ProgramRunAdmission(
         scenario_id=scenario_id,
+        applied_record_digest=_digest(
+            selection.get("applied_record_digest"),
+            field="applied_record_digest",
+        ),
         scenario_catalog_revision=scenario_catalog_revision,
         program=program,
         environment=environment,
@@ -1076,6 +1085,7 @@ def build_applied_program_run_admission(
             "live scenario selection has no exact owner identities"
         )
     normalized_selection = {
+        "applied_record_digest": source["record_digest"],
         "assistant_projection": deepcopy(
             live_scenario_selection.get("assistant_projection")
         ),

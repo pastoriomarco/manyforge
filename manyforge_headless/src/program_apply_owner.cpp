@@ -20,6 +20,8 @@ namespace deployment = manyforge::deployment;
 
 constexpr std::string_view kPreparationIdentityDomain =
     "manyforge-program-apply-preparation";
+constexpr std::string_view kAppliedRecordIdentityDomain =
+    "manyforge-applied-program-record";
 
 [[noreturn]] void Fail(std::string code, std::string message) {
   throw ProgramApplyError(std::move(code), std::move(message));
@@ -60,6 +62,19 @@ void Require(const bool condition, std::string code, std::string message) {
           "Program Apply field " + std::string(name) +
               " must be non-empty text");
   return *value;
+}
+
+[[nodiscard]] std::uint64_t Unsigned(const CanonicalValue &root,
+                                     const std::string_view name,
+                                     const std::string_view code) {
+  const auto *value =
+      std::get_if<double>(&Member(root, name, code).storage());
+  Require(value != nullptr && *value >= 1.0 &&
+              *value <= 9007199254740991.0 &&
+              static_cast<double>(static_cast<std::uint64_t>(*value)) == *value,
+          std::string(code), "Program selection field " + std::string(name) +
+                                 " must be a positive safe integer");
+  return static_cast<std::uint64_t>(*value);
 }
 
 struct Preparation final {
@@ -242,6 +257,85 @@ AssignmentFrom(const deployment::ProgramBinding &binding) {
   return std::move(*model_map);
 }
 
+template <typename Function>
+void ForEachProduct(const core::RetainedCompiledProductsDTO &products,
+                    Function function) {
+  function(products.planning_collision_model);
+  if (products.viewer_model.has_value()) {
+    function(*products.viewer_model);
+  }
+  for (const auto &group : products.control_domain_products) {
+    for (const auto &product : group.products) {
+      function(product);
+    }
+  }
+  for (const auto &product : products.symbol_role_maps) {
+    function(product);
+  }
+  for (const auto &group : products.runtime_unit_products) {
+    for (const auto &product : group.products) {
+      function(product);
+    }
+  }
+}
+
+[[nodiscard]] std::string AppliedRecordDigest(const CanonicalValue &record) {
+  return content_identity::framed_sha256(
+      kAppliedRecordIdentityDomain, kAppliedProgramSelectionSchemaVersion,
+      record);
+}
+
+[[nodiscard]] CanonicalValue OwnerStateValue(
+    const CanonicalValue &record, const std::string &record_digest,
+    const std::uint64_t generation, const std::string_view request_owner_epoch,
+    const std::string_view request_id) {
+  return CanonicalValue(CanonicalValue::Object{
+      {"applied_generation", CanonicalValue(static_cast<double>(generation))},
+      {"applied_record", record},
+      {"applied_record_digest", CanonicalValue(record_digest)},
+      {"outcome", CanonicalValue("applied")},
+      {"request_id", CanonicalValue(std::string(request_id))},
+      {"request_owner_epoch",
+       CanonicalValue(std::string(request_owner_epoch))},
+      {"schema_version",
+       CanonicalValue(std::string(kProgramSelectionOwnerStateSchemaVersion))},
+  });
+}
+
+struct DecodedOwnerState final {
+  std::uint64_t generation;
+  CanonicalValue record;
+  std::string record_digest;
+  std::string request_owner_epoch;
+  std::string request_id;
+};
+
+[[nodiscard]] DecodedOwnerState DecodeOwnerState(const CanonicalValue &value) {
+  constexpr std::string_view code = "program_applied_selection_invalid";
+  Require(value.is_object() && value.as_object().size() == 7U,
+          std::string(code),
+          "Program selection owner state must be one exact closed object");
+  Require(Text(value, "schema_version", code) ==
+              kProgramSelectionOwnerStateSchemaVersion &&
+              Text(value, "outcome", code) == "applied",
+          std::string(code),
+          "Program selection owner state version or outcome is invalid");
+  DecodedOwnerState result{
+      Unsigned(value, "applied_generation", code),
+      Member(value, "applied_record", code),
+      Text(value, "applied_record_digest", code),
+      Text(value, "request_owner_epoch", code),
+      Text(value, "request_id", code),
+  };
+  Require(content_identity::is_sha256_digest(result.record_digest) &&
+              AppliedRecordDigest(result.record) == result.record_digest,
+          std::string(code),
+          "Program selection owner state has a divergent record digest");
+  static_cast<void>(DecodePreparationValue(
+      result.record, kAppliedProgramSelectionSchemaVersion, code));
+  return result;
+}
+
 [[nodiscard]] std::string
 AssistantModeText(const deployment::ScenarioAssistantMode mode) {
   switch (mode) {
@@ -256,44 +350,28 @@ AssistantModeText(const deployment::ScenarioAssistantMode mode) {
        "Applied Program has an invalid assistant mode");
 }
 
-void RequireScenario(const Preparation &prepared,
-                     const deployment::ScenarioProgramSelection &scenario) {
-  Require(
-      scenario.scenario_id == prepared.scenario_id &&
-          scenario.scenario_catalog_revision ==
-              prepared.scenario_catalog_revision &&
-          scenario.deployment_artifact_id == prepared.deployment_artifact_id &&
-          scenario.deployment_revision == prepared.deployment_revision &&
-          scenario.retained_bundle_id == prepared.retained_bundle_id &&
-          scenario.graph_revision == prepared.graph_revision &&
-          scenario.node_environment_digest ==
-              prepared.node_environment_digest &&
-          scenario.program_binding_id == prepared.baseline_program_binding_id &&
-          AssistantModeText(scenario.assistant_mode) ==
-              prepared.assistant_mode &&
-          scenario.typed_parameter_overrides ==
-              prepared.typed_parameter_overrides,
-      "program_apply_preparation_stale",
-      "Program Apply preparation no longer names the exact scenario "
-      "occurrence");
-}
-
 } // namespace
 
 ProgramApplyError::ProgramApplyError(std::string code, std::string message)
     : std::runtime_error(std::move(message)), code_(std::move(code)) {}
 
-ProgramApplyOwner::ProgramApplyOwner(std::filesystem::path package_root,
-                                     std::filesystem::path publication_root,
-                                     std::string owner_id,
-                                     std::string owner_epoch)
-    : scenario_source_(package_root, "maintained"),
-      bundle_source_(package_root), model_map_source_(package_root),
-      catalog_source_(package_root), baseline_binding_source_(package_root),
-      program_repository_(publication_root),
-      binding_repository_(publication_root),
-      publication_(std::move(publication_root),
-                   std::string(kAppliedProgramSelectionSourceFile)),
+ProgramSelectionOwner::ProgramSelectionOwner(
+    std::filesystem::path install_root, std::filesystem::path artifact_root,
+    std::filesystem::path owner_state_root,
+    std::filesystem::path projection_root, std::string owner_id,
+    std::string owner_epoch)
+    : scenario_source_(install_root, "maintained"),
+      bundle_source_(install_root), model_map_source_(install_root),
+      catalog_source_(install_root), raw_artifact_source_(install_root),
+      baseline_binding_source_(install_root),
+      raw_artifact_store_(artifact_root), catalog_store_(artifact_root),
+      bundle_repository_(artifact_root), program_repository_(artifact_root),
+      binding_repository_(artifact_root), artifact_bundle_source_(artifact_root),
+      artifact_model_map_source_(artifact_root),
+      owner_state_(std::move(owner_state_root),
+                   std::string(kProgramSelectionOwnerStateFile)),
+      projection_(std::move(projection_root),
+                  std::string(kAppliedProgramSelectionSourceFile)),
       source_owner_id_(std::move(owner_id)),
       source_owner_epoch_(std::move(owner_epoch)) {
   Require(!source_owner_id_.empty() && !source_owner_epoch_.empty(),
@@ -301,7 +379,7 @@ ProgramApplyOwner::ProgramApplyOwner(std::filesystem::path package_root,
           "Program Apply source-owner identities are required");
 }
 
-CanonicalValue ProgramApplyOwner::Prepare(
+CanonicalValue ProgramSelectionOwner::Prepare(
     const std::string_view scenario_id,
     const std::string_view expected_scenario_catalog_revision,
     const std::string_view canonical_program_bytes) {
@@ -369,14 +447,76 @@ CanonicalValue ProgramApplyOwner::Prepare(
             "program_apply_compilation_invalid",
             "Program Apply compiler returned a divergent Program Binding");
 
-    static_cast<void>(program_repository_.put_if_absent(program, *bundle));
+    // Import the complete immutable deployment closure before either Program
+    // artifact. The source side is get-only and pinned to install_root; every
+    // destination write is no-replace and quota checked. A failure here can
+    // leave only unreachable immutable values and cannot advance Applied.
+    for (const auto &record : bundle->value().catalogs.records) {
+      std::visit(
+          [&](const auto &reference) {
+            const auto bytes = catalog_source_.get_verified(
+                reference.content_addressed_store_key,
+                reference.content_digest);
+            Require(bytes.has_value(), "program_apply_bundle_invalid",
+                    "Program Apply catalog closure is unavailable");
+            static_cast<void>(catalog_store_.put_if_absent(
+                reference.content_addressed_store_key,
+                reference.content_digest, *bytes));
+          },
+          record);
+    }
+    const auto copy_raw = [&](const auto &reference) {
+      const auto bytes = raw_artifact_source_.get_verified(
+          reference.content_addressed_store_key, reference.content_digest,
+          reference.byte_size);
+      Require(bytes.has_value(), "program_apply_bundle_invalid",
+              "Program Apply raw-artifact closure is unavailable");
+      const auto stored = raw_artifact_store_.put_if_absent(*bytes);
+      Require(stored.content_addressed_store_key ==
+                  reference.content_addressed_store_key &&
+                  stored.content_digest == reference.content_digest &&
+                  stored.byte_size == reference.byte_size,
+              "program_apply_repository_invalid",
+              "Program Apply raw artifact reopened under another identity");
+    };
+    for (const auto &schema : bundle->value().catalogs.schema_artifacts) {
+      const auto bytes = raw_artifact_source_.get_verified(
+          schema.content_addressed_store_key, schema.content_digest);
+      Require(bytes.has_value(), "program_apply_bundle_invalid",
+              "Program Apply schema-artifact closure is unavailable");
+      const auto stored = raw_artifact_store_.put_if_absent(*bytes);
+      Require(stored.content_addressed_store_key ==
+                  schema.content_addressed_store_key &&
+                  stored.content_digest == schema.content_digest,
+              "program_apply_repository_invalid",
+              "Program Apply schema artifact reopened under another identity");
+    }
+    ForEachProduct(bundle->value().compiled_products,
+                   [&](const core::RetainedProductDTO &product) {
+                     for (const auto &artifact : product.artifact_refs) {
+                       copy_raw(artifact);
+                     }
+                   });
+    static_cast<void>(bundle_repository_.put_if_absent(bundle));
+    const auto artifact_bundle =
+        artifact_bundle_source_.get_verified(bundle->retained_bundle_id());
+    Require(artifact_bundle != nullptr,
+            "program_apply_repository_invalid",
+            "Program Apply retained closure did not reopen exactly");
+    auto artifact_model_map =
+        LoadModelMap(*artifact_bundle, artifact_model_map_source_);
+    static_cast<void>(binding_repository_.put_if_absent(
+        baseline, *artifact_bundle, artifact_model_map));
     static_cast<void>(
-        binding_repository_.put_if_absent(binding, *bundle, model_map));
+        program_repository_.put_if_absent(program, *artifact_bundle));
+    static_cast<void>(
+        binding_repository_.put_if_absent(binding, *artifact_bundle,
+                                          artifact_model_map));
     const auto reopened_program = program_repository_.get_verified(
         program->value().program_id, program->value().program_revision,
-        *bundle);
+        *artifact_bundle);
     const auto reopened_binding = binding_repository_.get_verified(
-        binding->program_binding_id(), *bundle, model_map);
+        binding->program_binding_id(), *artifact_bundle, artifact_model_map);
     Require(reopened_program != nullptr && reopened_binding != nullptr &&
                 reopened_program->canonical_program_bytes() ==
                     program->canonical_program_bytes() &&
@@ -411,9 +551,11 @@ CanonicalValue ProgramApplyOwner::Prepare(
   }
 }
 
-CanonicalValue ProgramApplyOwner::Commit(
+CanonicalValue ProgramSelectionOwner::Commit(
     const std::string_view canonical_preparation_bytes,
     const std::optional<std::string> &expected_applied_record_digest,
+    const std::string_view request_owner_epoch,
+    const std::string_view request_id,
     const std::string_view active_retained_bundle_id,
     const std::string_view active_graph_revision,
     const std::int64_t observed_at_ns) {
@@ -421,7 +563,8 @@ CanonicalValue ProgramApplyOwner::Commit(
   try {
     const auto prepared = DecodePreparation(canonical_preparation_bytes);
     Require(content_identity::is_sha256_digest(active_retained_bundle_id) &&
-                content_identity::is_sha256_digest(active_graph_revision),
+                content_identity::is_sha256_digest(active_graph_revision) &&
+                !request_owner_epoch.empty() && !request_id.empty(),
             "program_apply_active_selection_invalid",
             "Program Apply active Manager identity is invalid");
     Require(prepared.retained_bundle_id.value() == active_retained_bundle_id &&
@@ -438,22 +581,35 @@ CanonicalValue ProgramApplyOwner::Commit(
 
     const CanonicalValue candidate =
         PreparationValue(prepared, kAppliedProgramSelectionSchemaVersion);
-    const auto current = publication_.Read();
-    if (current.has_value() && current->payload == candidate) {
+    const auto candidate_digest = AppliedRecordDigest(candidate);
+    const auto current_snapshot = owner_state_.Read();
+    const auto current = current_snapshot.has_value()
+                             ? std::optional<DecodedOwnerState>(
+                                   DecodeOwnerState(current_snapshot->payload))
+                             : std::nullopt;
+
+    Require(current.has_value() == expected_applied_record_digest.has_value() &&
+                (!current.has_value() ||
+                 current->record_digest == *expected_applied_record_digest),
+            "program_apply_selection_stale",
+            "Program Apply expected another current Applied selection");
+    if (current.has_value() &&
+        current->request_owner_epoch == request_owner_epoch &&
+        current->request_id == request_id) {
+      Require(current->record_digest == candidate_digest,
+              "program_apply_request_conflict",
+              "Program Apply request identity was reused for another intent");
       return ReadAppliedLocked();
     }
 
-    const auto scenario =
-        scenario_source_.LoadExactProgramSelection(prepared.scenario_id);
-    RequireScenario(prepared, scenario);
     const auto bundle =
-        bundle_source_.get_verified(prepared.retained_bundle_id);
+        artifact_bundle_source_.get_verified(prepared.retained_bundle_id);
     Require(bundle != nullptr && bundle->value().cell_graph.graph_revision ==
                                      prepared.graph_revision,
             "program_apply_bundle_invalid",
             "Program Apply target bundle is absent or divergent");
-    auto model_map = LoadModelMap(*bundle, model_map_source_);
-    const auto baseline = baseline_binding_source_.get_verified(
+    auto model_map = LoadModelMap(*bundle, artifact_model_map_source_);
+    const auto baseline = binding_repository_.get_verified(
         prepared.baseline_program_binding_id, *bundle, model_map);
     const auto program = program_repository_.get_verified(
         prepared.program_id, prepared.program_revision, *bundle);
@@ -468,29 +624,43 @@ CanonicalValue ProgramApplyOwner::Commit(
             "program_apply_preparation_invalid",
             "Program Apply prepared immutable closure is divergent");
 
-    Require(current.has_value() == expected_applied_record_digest.has_value() &&
-                (!current.has_value() ||
-                 current->record_digest == *expected_applied_record_digest),
-            "program_apply_selection_stale",
-            "Program Apply expected another current Applied selection");
-
+    const auto generation =
+        current.has_value() && current->record_digest == candidate_digest
+            ? current->generation
+            : (current.has_value() ? current->generation + 1U : 1U);
+    Require(generation <= 9007199254740991ULL,
+            "program_apply_selection_exhausted",
+            "Program selection generation is exhausted");
+    const auto owner_value =
+        OwnerStateValue(candidate, candidate_digest, generation,
+                        request_owner_epoch, request_id);
     try {
-      const auto published =
-          publication_.Publish("program_selection", source_owner_id_,
-                               source_owner_epoch_, observed_at_ns, candidate);
-      Require(published.payload == candidate,
+      const auto published = owner_state_.Publish(
+          "program_selection", source_owner_id_, source_owner_epoch_,
+          observed_at_ns, owner_value);
+      Require(published.payload == owner_value,
               "program_apply_publication_failed",
-              "Program Apply publication selected divergent content");
+              "Program Apply owner transaction selected divergent content");
     } catch (const SourceSnapshotError &) {
       // An error after atomic rename (for example directory fsync failure) can
       // make the syscall result ambiguous. Resolve that ambiguity immediately:
       // exact candidate means success; any other readable value means the
       // prior selection remains authoritative.
-      const auto after = publication_.Read();
-      if (!after.has_value() || after->payload != candidate) {
+      const auto after = owner_state_.Read();
+      if (!after.has_value() || after->payload != owner_value) {
         throw;
       }
     }
+    // Projection is explicitly rebuildable and never participates in the
+    // authoritative commit. A failed write is repaired by the next read.
+    try {
+      static_cast<void>(projection_.Publish(
+          "program_selection", source_owner_id_, source_owner_epoch_,
+          observed_at_ns, candidate));
+    } catch (const SourceSnapshotError &) {
+    }
+    applied_cache_.reset();
+    applied_cache_record_digest_.clear();
     return ReadAppliedLocked();
   } catch (const ProgramApplyError &) {
     throw;
@@ -500,33 +670,43 @@ CanonicalValue ProgramApplyOwner::Commit(
   }
 }
 
-CanonicalValue ProgramApplyOwner::ReadApplied() {
+CanonicalValue ProgramSelectionOwner::ReadApplied() {
   std::lock_guard lock(mutex_);
   return ReadAppliedLocked();
 }
 
-CanonicalValue ProgramApplyOwner::ReadAppliedLocked() {
+CanonicalValue ProgramSelectionOwner::ReadAppliedLocked() {
   try {
-    const auto current = publication_.Read();
-    Require(current.has_value(), "program_applied_selection_not_found",
+    const auto current_snapshot = owner_state_.Read();
+    Require(current_snapshot.has_value(), "program_applied_selection_not_found",
             "no Program has been authoritatively Applied");
+    Require(current_snapshot->source_owner_kind == "program_selection" &&
+                current_snapshot->source_owner_id == source_owner_id_,
+            "program_applied_selection_invalid",
+            "Applied Program owner state belongs to another owner");
+    const auto current = DecodeOwnerState(current_snapshot->payload);
+    try {
+      const auto projected = projection_.Read();
+      if (!projected.has_value() || projected->payload != current.record) {
+        static_cast<void>(projection_.Publish(
+            "program_selection", source_owner_id_, source_owner_epoch_, 0,
+            current.record));
+      }
+    } catch (const SourceSnapshotError &) {
+    }
     if (applied_cache_.has_value() &&
-        applied_cache_record_digest_ == current->record_digest) {
+        applied_cache_record_digest_ == current.record_digest) {
       return *applied_cache_;
     }
-    Require(current->source_owner_kind == "program_selection" &&
-                current->source_owner_id == source_owner_id_,
-            "program_applied_selection_invalid",
-            "Applied Program publication belongs to another owner");
     const auto prepared = DecodePreparationValue(
-        current->payload, kAppliedProgramSelectionSchemaVersion,
+        current.record, kAppliedProgramSelectionSchemaVersion,
         "program_applied_selection_invalid");
     const auto bundle =
-        bundle_source_.get_verified(prepared.retained_bundle_id);
+        artifact_bundle_source_.get_verified(prepared.retained_bundle_id);
     Require(bundle != nullptr, "program_applied_selection_invalid",
             "Applied Program retained bundle is unavailable");
-    auto model_map = LoadModelMap(*bundle, model_map_source_);
-    const auto baseline = baseline_binding_source_.get_verified(
+    auto model_map = LoadModelMap(*bundle, artifact_model_map_source_);
+    const auto baseline = binding_repository_.get_verified(
         prepared.baseline_program_binding_id, *bundle, model_map);
     const auto program = program_repository_.get_verified(
         prepared.program_id, prepared.program_revision, *bundle);
@@ -569,18 +749,19 @@ CanonicalValue ProgramApplyOwner::ReadAppliedLocked() {
          CanonicalValue(std::string(kAppliedProgramSelectionSchemaVersion))},
         {"source",
          CanonicalValue(CanonicalValue::Object{
-             {"record_digest", CanonicalValue(current->record_digest)},
+             {"record_digest", CanonicalValue(current.record_digest)},
              {"semantic_content_digest",
-              CanonicalValue(current->semantic_content_digest)},
+              CanonicalValue(current.record_digest)},
              {"source_generation",
-              CanonicalValue(static_cast<double>(current->source_generation))},
+              CanonicalValue(static_cast<double>(current.generation))},
              {"source_owner_epoch",
-              CanonicalValue(current->source_owner_epoch)},
-             {"source_owner_id", CanonicalValue(current->source_owner_id)},
+              CanonicalValue(current_snapshot->source_owner_epoch)},
+             {"source_owner_id",
+              CanonicalValue(current_snapshot->source_owner_id)},
          })},
         {"typed_parameter_overrides", prepared.typed_parameter_overrides},
     });
-    applied_cache_record_digest_ = current->record_digest;
+    applied_cache_record_digest_ = current.record_digest;
     applied_cache_ = result;
     return result;
   } catch (const ProgramApplyError &) {

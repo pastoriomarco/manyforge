@@ -23,6 +23,7 @@ _D = "sha256:" + "d" * 64
 def _context() -> ProgramRunPortContext:
     return ProgramRunPortContext(
         program_run_id="run.1",
+        applied_record_digest="sha256:" + "9" * 64,
         scenario_id="scenario.1",
         scenario_catalog_revision=_A,
         program_id="program.1",

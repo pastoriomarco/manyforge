@@ -34,7 +34,7 @@ def _parser() -> argparse.ArgumentParser:
     start.add_argument("--profile", choices=[item.value for item in LaunchProfile], default="native")
     start.add_argument("--source-root", type=Path, required=True)
     start.add_argument("--manager-executable", type=Path)
-    start.add_argument("--package-root", type=Path)
+    start.add_argument("--install-root", type=Path)
     start.add_argument("--node-catalog-path", type=Path)
     start.add_argument("--alarm-catalog-path", type=Path)
     start.add_argument("--composer-static-dir", type=Path)
@@ -44,12 +44,6 @@ def _parser() -> argparse.ArgumentParser:
         default="canonical-empty-admission.json",
     )
     start.add_argument("--cell-id", default="native")
-    start.add_argument("--publication-root", type=Path)
-    start.add_argument("--manager-state-root", type=Path)
-    start.add_argument("--runtime-state-root", type=Path)
-    start.add_argument("--execution-state-root", type=Path)
-    start.add_argument("--logical-scene-database", type=Path)
-    start.add_argument("--historian-database-path", type=Path)
     start.add_argument("--package-aggregate-sha256")
     start.add_argument("--compiler-build-manifest-sha256")
     start.add_argument("--node-environment-sha256")
@@ -69,15 +63,9 @@ def _parser() -> argparse.ArgumentParser:
     start.add_argument("--remote-target", default=DEFAULT_RUNTIME_HOST)
     start.add_argument("--remote-source-root")
     start.add_argument("--remote-manager-executable")
-    start.add_argument("--remote-package-root")
+    start.add_argument("--remote-install-root")
     start.add_argument("--remote-node-catalog-path")
     start.add_argument("--remote-alarm-catalog-path")
-    start.add_argument("--remote-publication-root")
-    start.add_argument("--remote-manager-state-root")
-    start.add_argument("--remote-runtime-state-root")
-    start.add_argument("--remote-execution-state-root")
-    start.add_argument("--remote-logical-scene-database")
-    start.add_argument("--remote-historian-database-path")
     start.add_argument("--remote-state-root")
     start.add_argument("--remote-composer-static-dir")
     start.add_argument("--remote-simulation-control-config")
@@ -117,15 +105,9 @@ def _result(
 def _config(args: argparse.Namespace) -> NativeLauncherConfig:
     required = (
         "manager_executable",
-        "package_root",
+        "install_root",
         "node_catalog_path",
         "alarm_catalog_path",
-        "publication_root",
-        "manager_state_root",
-        "runtime_state_root",
-        "execution_state_root",
-        "logical_scene_database",
-        "historian_database_path",
         "package_aggregate_sha256",
         "compiler_build_manifest_sha256",
         "node_environment_sha256",
@@ -136,19 +118,13 @@ def _config(args: argparse.Namespace) -> NativeLauncherConfig:
     return NativeLauncherConfig(
         source_root=args.source_root,
         manager_executable=args.manager_executable,
-        package_root=args.package_root,
+        install_root=args.install_root,
         node_catalog_path=args.node_catalog_path,
         alarm_catalog_path=args.alarm_catalog_path,
         composer_static_dir=args.composer_static_dir,
         simulation_control_config=args.simulation_control_config,
         canonical_empty_admission_filename=args.canonical_empty_admission_filename,
         cell_id=args.cell_id,
-        publication_root=args.publication_root,
-        manager_state_root=args.manager_state_root,
-        runtime_state_root=args.runtime_state_root,
-        execution_state_root=args.execution_state_root,
-        logical_scene_database=args.logical_scene_database,
-        historian_database_path=args.historian_database_path,
         state_root=args.state_root,
         advertised_host=args.advertised_host or "localhost",
         instance_id=args.instance_id,
@@ -171,15 +147,9 @@ def _isaac_config(args: argparse.Namespace) -> IsaacLauncherConfig:
         "world_path",
         "remote_source_root",
         "remote_manager_executable",
-        "remote_package_root",
+        "remote_install_root",
         "remote_node_catalog_path",
         "remote_alarm_catalog_path",
-        "remote_publication_root",
-        "remote_manager_state_root",
-        "remote_runtime_state_root",
-        "remote_execution_state_root",
-        "remote_logical_scene_database",
-        "remote_historian_database_path",
         "remote_state_root",
         "remote_simulation_control_config",
         "remote_ros_environment_script",
@@ -198,15 +168,9 @@ def _isaac_config(args: argparse.Namespace) -> IsaacLauncherConfig:
         target=args.remote_target,
         source_root=args.remote_source_root,
         manager_executable=args.remote_manager_executable,
-        package_root=args.remote_package_root,
+        install_root=args.remote_install_root,
         node_catalog_path=args.remote_node_catalog_path,
         alarm_catalog_path=args.remote_alarm_catalog_path,
-        publication_root=args.remote_publication_root,
-        manager_state_root=args.remote_manager_state_root,
-        runtime_state_root=args.remote_runtime_state_root,
-        execution_state_root=args.remote_execution_state_root,
-        logical_scene_database=args.remote_logical_scene_database,
-        historian_database_path=args.remote_historian_database_path,
         state_root=args.remote_state_root,
         composer_static_dir=args.remote_composer_static_dir or "",
         simulation_control_config=args.remote_simulation_control_config,
@@ -245,7 +209,11 @@ def _isaac_config(args: argparse.Namespace) -> IsaacLauncherConfig:
 
 
 def _persisted_profile(state_root: Path, instance_id: str) -> LaunchProfile | None:
-    record = state_root.absolute() / instance_id / "launch_instance.json"
+    instance_root = state_root.absolute() / instance_id
+    if (instance_root / ".manyforge-cell-layout.json").is_file():
+        record = instance_root / "state" / "operator" / "launch_instance.json"
+    else:
+        record = instance_root / "launch_instance.json"
     if not record.is_file():
         return None
     try:

@@ -2279,6 +2279,41 @@ FilesystemVerifiedCatalogArtifactSource::get_verified(
       expected_digest, expected_size, maximum_single_payload_bytes_);
 }
 
+FilesystemVerifiedRawArtifactSource::FilesystemVerifiedRawArtifactSource(
+    std::filesystem::path trusted_root,
+    const std::uint64_t maximum_single_payload_bytes)
+    : trusted_root_(posix::normalize_existing_plain_root(
+          trusted_root, kPosixErrors, kTrustedRootMessages)),
+      maximum_single_payload_bytes_(maximum_single_payload_bytes) {
+  if (maximum_single_payload_bytes_ == 0U) {
+    throw std::invalid_argument(
+        "read-only raw-artifact byte bound is invalid");
+  }
+  (void)require_read_only_retention_paths(trusted_root_);
+}
+
+std::optional<std::string> FilesystemVerifiedRawArtifactSource::get_verified(
+    const core::ContentAddressedStoreKey &key,
+    const core::ContentDigest &expected_digest,
+    const std::optional<std::uint64_t> expected_size) const {
+  if (expected_size.has_value() &&
+      *expected_size > maximum_single_payload_bytes_) {
+    throw std::invalid_argument(
+        "read-only raw-artifact size exceeds its configured bound");
+  }
+  const auto current_root = require_unchanged_trusted_root(
+      trusted_root_, "read-only raw-artifact");
+  const auto paths = require_read_only_retention_paths(current_root);
+  const auto bytes = read_verified_raw_reference(
+      paths.raw_data, key, expected_digest, expected_size,
+      "selected raw-artifact reference");
+  if (bytes.size() > maximum_single_payload_bytes_) {
+    throw std::invalid_argument(
+        "read-only raw-artifact content exceeds its configured bound");
+  }
+  return bytes;
+}
+
 FilesystemVerifiedProgramSource::FilesystemVerifiedProgramSource(
     std::filesystem::path trusted_package_root,
     const std::uint64_t maximum_single_program_bytes)

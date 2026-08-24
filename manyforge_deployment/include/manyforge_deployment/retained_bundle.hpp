@@ -162,6 +162,28 @@ public:
                std::uint64_t expected_size) const = 0;
 };
 
+/// Get-only raw-artifact capability below one immutable qualified root.
+/// Construction and reads never create, lock, enumerate, sync, or publish
+/// content. This is the deliberate import side of a runtime artifact-store
+/// transaction; it is not a mutable package-store adapter.
+class FilesystemVerifiedRawArtifactSource final {
+public:
+  explicit FilesystemVerifiedRawArtifactSource(
+      std::filesystem::path trusted_root,
+      std::uint64_t maximum_single_payload_bytes =
+          kMaxDurableRetainedBlobBytes);
+
+  [[nodiscard]] std::optional<std::string>
+  get_verified(const core::ContentAddressedStoreKey &key,
+               const core::ContentDigest &expected_digest,
+               std::optional<std::uint64_t> expected_size =
+                   std::nullopt) const;
+
+private:
+  std::filesystem::path trusted_root_;
+  std::uint64_t maximum_single_payload_bytes_;
+};
+
 /// Durable immutable raw-artifact CAS.
 ///
 /// Blobs are published under their digest-derived key only after a

@@ -11,6 +11,7 @@ from types import MappingProxyType
 from typing import Any, Final
 
 import py_trees
+import rfc8785
 
 from manyforge_behavior.executable_node_resolver import (
     NodeAdapterBuildContext,
@@ -85,6 +86,7 @@ class ProgramRunCapture:
     """Verified identities captured before one Program run is constructed."""
 
     program_run_id: str
+    applied_record_digest: str
     scenario_id: str
     scenario_catalog_revision: str
     program_id: str
@@ -95,6 +97,7 @@ class ProgramRunCapture:
     node_environment_digest: str
     owner_identities: tuple[ProgramRunOwnerIdentity, ...]
     node_policies: tuple[ProgramNodePolicy, ...] = ()
+    node_policy_digest: str = field(init=False)
     _node_policy_lookup: Mapping[str, ProgramNodePolicy] = field(
         init=False,
         repr=False,
@@ -106,6 +109,7 @@ class ProgramRunCapture:
         _require_text(self.scenario_id, field="scenario_id", maximum_bytes=128)
         _require_text(self.program_id, field="program_id")
         for field_name in (
+            "applied_record_digest",
             "scenario_catalog_revision",
             "program_revision",
             "program_binding_id",
@@ -164,11 +168,20 @@ class ProgramRunCapture:
                 {policy.instance_id: policy for policy in self.node_policies}
             ),
         )
+        policy_bytes = rfc8785.dumps(
+            [policy.to_dict() for policy in self.node_policies]
+        )
+        object.__setattr__(
+            self,
+            "node_policy_digest",
+            "sha256:" + sha256(policy_bytes).hexdigest(),
+        )
 
     def to_dict(self) -> dict[str, Any]:
         return {
             "schema_version": PROGRAM_RUN_CAPTURE_API,
             "program_run_id": self.program_run_id,
+            "applied_record_digest": self.applied_record_digest,
             "scenario_id": self.scenario_id,
             "scenario_catalog_revision": self.scenario_catalog_revision,
             "program_id": self.program_id,
@@ -177,6 +190,8 @@ class ProgramRunCapture:
             "retained_bundle_id": self.retained_bundle_id,
             "graph_revision": self.graph_revision,
             "node_environment_digest": self.node_environment_digest,
+            "node_policies": [policy.to_dict() for policy in self.node_policies],
+            "node_policy_digest": self.node_policy_digest,
             "owner_identities": [
                 identity.to_dict() for identity in self.owner_identities
             ],

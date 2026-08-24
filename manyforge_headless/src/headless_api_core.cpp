@@ -59,13 +59,15 @@ void Require(const bool condition, const std::string &code,
 }
 
 HeadlessApiCoreConfig ValidateConfig(HeadlessApiCoreConfig config) {
-  Require(!config.publication_root.empty() && !config.package_root.empty() &&
+  Require(!config.projection_root.empty() && !config.install_root.empty() &&
+              !config.artifact_root.empty() &&
+              !config.program_selection_state_root.empty() &&
               !config.node_catalog_path.empty() &&
               !config.alarm_catalog_path.empty() &&
               !config.historian_database_path.empty(),
           "headless_api_configuration_invalid",
-          "publication, package, node-catalog, alarm-catalog, and historian "
-          "paths are required");
+          "projection, install, artifact, Program-selection state, node-"
+          "catalog, alarm-catalog, and historian paths are required");
   Require(!config.cell_id.empty() && !config.owner_id.empty() &&
               !config.owner_epoch.empty(),
           "headless_api_configuration_invalid",
@@ -447,13 +449,13 @@ HeadlessApiCore::HeadlessApiCore(HeadlessApiCoreConfig config,
       owner_lock_(std::make_unique<HeadlessApiOwnerLock>(
           config_.historian_database_path)),
       package_root_descriptor_(
-          std::make_unique<PackageRootDescriptor>(config_.package_root)),
+          std::make_unique<PackageRootDescriptor>(config_.install_root)),
       retained_bundle_source_(package_root_descriptor_->root()),
       scenario_catalog_source_(package_root_descriptor_->root(), "maintained"),
-      program_apply_owner_(package_root_descriptor_->root(),
-                           config_.publication_root,
-                           config_.owner_id + ".program-selection",
-                           config_.owner_epoch),
+      program_selection_owner_(
+          package_root_descriptor_->root(), config_.artifact_root,
+          config_.program_selection_state_root, config_.projection_root,
+          config_.owner_id + ".program-selection", config_.owner_epoch),
       // This reader validates the final path component with symlink_status;
       // "." keeps that component directory-valued while traversal remains
       // anchored through the retained procfd root.
@@ -464,7 +466,7 @@ HeadlessApiCore::HeadlessApiCore(HeadlessApiCoreConfig config,
       history_store_(std::make_shared<SqliteEventHistoryStore>(
           config_.historian_database_path, config_.historian_record_retention)),
       historian_(history_store_, config_.historian_queue_capacity),
-      runtime_aggregator_(config_.publication_root, config_.cell_id,
+      runtime_aggregator_(config_.projection_root, config_.cell_id,
                           config_.owner_id + ".projection", config_.owner_epoch,
                           config_.freshness_policy, clocks_.wall_time_ns,
                           clocks_.monotonic_time_ns),
@@ -670,13 +672,15 @@ CanonicalValue HeadlessApiCore::PrepareProgramApply(
     const std::string_view canonical_program_bytes) {
   std::lock_guard lock(mutex_);
   Require(!shutdown_, "headless_api_closed", "headless API core is closed");
-  return program_apply_owner_.Prepare(
+  return program_selection_owner_.Prepare(
       scenario_id, expected_scenario_catalog_revision, canonical_program_bytes);
 }
 
 CanonicalValue HeadlessApiCore::CommitProgramApply(
     const std::string_view canonical_preparation_bytes,
-    const std::optional<std::string> &expected_applied_record_digest) {
+    const std::optional<std::string> &expected_applied_record_digest,
+    const std::string_view request_owner_epoch,
+    const std::string_view request_id) {
   std::lock_guard lock(mutex_);
   Require(!shutdown_, "headless_api_closed", "headless API core is closed");
   const auto runtime = RefreshLocked();
@@ -692,8 +696,9 @@ CanonicalValue HeadlessApiCore::CommitProgramApply(
           RequiredBool(RequiredMember(manager_payload, "runtime"), "converged"),
       "program_apply_deployment_not_active",
       "Program Apply commit requires one converged Manager selection");
-  return program_apply_owner_.Commit(
+  return program_selection_owner_.Commit(
       canonical_preparation_bytes, expected_applied_record_digest,
+      request_owner_epoch, request_id,
       RequiredString(active, "retained_bundle_id"),
       RequiredString(active, "graph_revision"), clocks_.monotonic_time_ns());
 }
@@ -701,7 +706,7 @@ CanonicalValue HeadlessApiCore::CommitProgramApply(
 CanonicalValue HeadlessApiCore::AppliedProgramSelection() {
   std::lock_guard lock(mutex_);
   Require(!shutdown_, "headless_api_closed", "headless API core is closed");
-  const auto selection = program_apply_owner_.ReadApplied();
+  const auto selection = program_selection_owner_.ReadApplied();
   const auto runtime = RefreshLocked();
   const auto &manager_section = RequiredSection(runtime.root, "manager");
   Require(SectionFresh(manager_section),

@@ -531,24 +531,36 @@ def _run_native_benchmark_move(
     assert isinstance(projection, dict), terminal
     assert projection["state"] == "completed", terminal
 
-    released = client.acknowledge_completed(
-        OperationControlRequest.model_validate(
-            {
-                "request_context": {
-                    "request_id": f"ack-{request_id}",
-                    "request_owner_epoch": status["owner_epoch"],
-                    "source_label": "n7_b_native_benchmark",
-                    "correlation_id": "n7-b-historical-benchmark",
-                },
-                "operation_id": operation_id,
-                "expected_operation_revision": projection[
-                    "operation_revision"
-                ],
-                "reason": "release completed N7 benchmark operation",
-            }
-        ),
-        trusted_principal_id=None,
+    acknowledgment = OperationControlRequest.model_validate(
+        {
+            "request_context": {
+                "request_id": f"ack-{request_id}",
+                "request_owner_epoch": status["owner_epoch"],
+                "source_label": "n7_b_native_benchmark",
+                "correlation_id": "n7-b-historical-benchmark",
+            },
+            "operation_id": operation_id,
+            "expected_operation_revision": projection["operation_revision"],
+            "reason": "release completed N7 benchmark operation",
+        }
     )
+    settlement_deadline = time.monotonic() + 5.0
+    while True:
+        released = client.acknowledge_completed(
+            acknowledgment,
+            trusted_principal_id=None,
+        )
+        if released.get("ok") is True:
+            break
+        error = released.get("error")
+        details = error.get("details") if isinstance(error, dict) else None
+        if (
+            not isinstance(details, dict)
+            or details.get("reason") != "operation_effect_in_flight"
+            or time.monotonic() >= settlement_deadline
+        ):
+            break
+        time.sleep(0.005)
     assert released["ok"] is True, released
     return elapsed_seconds
 

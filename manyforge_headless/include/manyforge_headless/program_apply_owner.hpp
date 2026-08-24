@@ -25,6 +25,10 @@ inline constexpr std::string_view kAppliedProgramSelectionSchemaVersion =
     "manyforge.applied_program_selection.v1";
 inline constexpr std::string_view kAppliedProgramSelectionSourceFile =
     "applied-program-source.json";
+inline constexpr std::string_view kProgramSelectionOwnerStateFile =
+    "program-selection-owner.json";
+inline constexpr std::string_view kProgramSelectionOwnerStateSchemaVersion =
+    "manyforge.program_selection_owner_state.v1";
 
 class ProgramApplyError final : public std::runtime_error {
 public:
@@ -48,15 +52,17 @@ private:
 /// the prior Applied pointer intact; an error after atomic rename is resolved
 /// by reading the selected record and is returned as success only when it is
 /// the exact candidate.
-class ProgramApplyOwner final {
+class ProgramSelectionOwner final {
 public:
-  ProgramApplyOwner(std::filesystem::path package_root,
-                    std::filesystem::path publication_root,
-                    std::string owner_id, std::string owner_epoch);
-  ~ProgramApplyOwner() = default;
+  ProgramSelectionOwner(std::filesystem::path install_root,
+                        std::filesystem::path artifact_root,
+                        std::filesystem::path owner_state_root,
+                        std::filesystem::path projection_root,
+                        std::string owner_id, std::string owner_epoch);
+  ~ProgramSelectionOwner() = default;
 
-  ProgramApplyOwner(const ProgramApplyOwner &) = delete;
-  ProgramApplyOwner &operator=(const ProgramApplyOwner &) = delete;
+  ProgramSelectionOwner(const ProgramSelectionOwner &) = delete;
+  ProgramSelectionOwner &operator=(const ProgramSelectionOwner &) = delete;
 
   [[nodiscard]] manyforge::content_identity::CanonicalValue
   Prepare(std::string_view scenario_id,
@@ -66,6 +72,7 @@ public:
   [[nodiscard]] manyforge::content_identity::CanonicalValue
   Commit(std::string_view canonical_preparation_bytes,
          const std::optional<std::string> &expected_applied_record_digest,
+         std::string_view request_owner_epoch, std::string_view request_id,
          std::string_view active_retained_bundle_id,
          std::string_view active_graph_revision, std::int64_t observed_at_ns);
 
@@ -84,11 +91,21 @@ private:
       model_map_source_;
   manyforge::deployment::FilesystemVerifiedCatalogArtifactSource
       catalog_source_;
+  manyforge::deployment::FilesystemVerifiedRawArtifactSource
+      raw_artifact_source_;
   manyforge::deployment::FilesystemVerifiedProgramBindingSource
       baseline_binding_source_;
+  manyforge::deployment::FilesystemRawArtifactStore raw_artifact_store_;
+  manyforge::deployment::FilesystemCatalogArtifactStore catalog_store_;
+  manyforge::deployment::FilesystemRetainedBundleRepository bundle_repository_;
   manyforge::deployment::FilesystemProgramRepository program_repository_;
   manyforge::deployment::FilesystemProgramBindingRepository binding_repository_;
-  AtomicSourceSnapshotChannel publication_;
+  manyforge::deployment::FilesystemVerifiedRetainedBundleSource
+      artifact_bundle_source_;
+  manyforge::deployment::FilesystemVerifiedRetainedModelMapSource
+      artifact_model_map_source_;
+  AtomicSourceSnapshotChannel owner_state_;
+  AtomicSourceSnapshotChannel projection_;
   std::string source_owner_id_;
   std::string source_owner_epoch_;
   std::optional<manyforge::content_identity::CanonicalValue> applied_cache_;

@@ -326,7 +326,7 @@ def create_app(
         assert config is not None
         core = NativeHeadlessCore(config)
         manager = ManagerCommandClient(
-            config.manager_state_root,
+            config.manager_run_root,
             timeout_seconds=config.manager_timeout_seconds,
         )
         execution = ExecutionCommandClient(
@@ -738,6 +738,23 @@ def create_app(
             raise HeadlessApiError(
                 "manager_command_response_invalid",
                 "Manager rejection has no stable error code",
+            )
+        return JSONResponse(status_code=_error_status(code), content=response)
+
+    @app.get("/api/manager/apply/status")
+    def manager_apply_status(
+        apply_id: Annotated[str, Query(min_length=1, max_length=256)],
+        apply_generation: Annotated[int, Query(ge=1, le=9_007_199_254_740_991)],
+    ) -> JSONResponse:
+        response = service.manager_apply_status(apply_id, apply_generation)
+        if response.get("ok") is True:
+            return JSONResponse(status_code=200, content=response)
+        error = response.get("error")
+        code = error.get("code") if isinstance(error, dict) else None
+        if not isinstance(code, str) or not code:
+            raise HeadlessApiError(
+                "manager_command_response_invalid",
+                "Manager Apply status rejection has no stable error code",
             )
         return JSONResponse(status_code=_error_status(code), content=response)
 

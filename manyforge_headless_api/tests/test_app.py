@@ -550,7 +550,11 @@ class FakeCore:
         self,
         preparation: dict[str, Any],
         expected_applied_record_digest: str | None,
+        request_owner_epoch: str,
+        request_id: str,
     ) -> dict[str, Any]:
+        assert request_owner_epoch
+        assert request_id
         self.program_commits.append(
             (copy.deepcopy(preparation), expected_applied_record_digest)
         )
@@ -717,6 +721,7 @@ class FakeManager:
         self.requests: list[ManagerApplyRequest] = []
         self.scene_requests: list[tuple[SceneTransactionRequest, str | None]] = []
         self.scene_pose_requests: list[SceneResourcePoseQuery] = []
+        self.apply_observations: list[tuple[str, int]] = []
 
     def apply(self, request: ManagerApplyRequest) -> dict[str, Any]:
         self.requests.append(request)
@@ -729,6 +734,18 @@ class FakeManager:
             },
             "request_id": request.request_id,
             "request_owner_epoch": request.request_owner_epoch,
+        }
+
+    def observe_apply(self, apply_id: str, apply_generation: int) -> dict[str, Any]:
+        self.apply_observations.append((apply_id, apply_generation))
+        return {
+            "api_version": "manyforge.manager_command_response.v1",
+            "apply_generation": apply_generation,
+            "apply_id": apply_id,
+            "candidate_projection_revision": None,
+            "error": None,
+            "ok": True,
+            "state": "pending",
         }
 
     def commit_scene_transaction(
@@ -1034,6 +1051,7 @@ def _program_run_snapshot(*, state: str = "running") -> dict[str, Any]:
         "capture": {
             "schema_version": "manyforge.program_run_capture.v1",
             "program_run_id": "program-run.1",
+            "applied_record_digest": "sha256:" + "5" * 64,
             "scenario_id": "cell-pick",
             "scenario_catalog_revision": "sha256:" + "6" * 64,
             "program_id": program["program_id"],
@@ -1044,6 +1062,8 @@ def _program_run_snapshot(*, state: str = "running") -> dict[str, Any]:
             "node_environment_digest": binding["node_environment"][
                 "environment_digest"
             ],
+            "node_policy_digest": "sha256:4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945",
+            "node_policies": [],
             "owner_identities": [
                 {
                     "owner_role": "program_runner",
@@ -1322,8 +1342,15 @@ def test_program_apply_rejects_rehashed_malformed_applied_binding_result() -> No
     def malformed_commit(
         preparation: dict[str, Any],
         expected_applied_record_digest: str | None,
+        request_owner_epoch: str,
+        request_id: str,
     ) -> dict[str, Any]:
-        result = original_commit(preparation, expected_applied_record_digest)
+        result = original_commit(
+            preparation,
+            expected_applied_record_digest,
+            request_owner_epoch,
+            request_id,
+        )
         binding = result["program_binding"]
         binding["target_role_bindings"][0]["frame_role_bindings"][0][
             "unknown"
@@ -1848,6 +1875,19 @@ def test_apply_is_forwarded_and_remains_typed_unavailable_before_i6() -> None:
     assert response.status_code == 503
     assert response.json()["error"]["code"] == "kernel_owner_unavailable"
     assert manager.requests[0].source_label == "operator_ui"
+
+
+def test_apply_status_is_a_read_only_durable_identity_observation() -> None:
+    client, _core, manager = _client()
+    with client:
+        response = client.get(
+            "/api/manager/apply/status",
+            params={"apply_id": "apply/7", "apply_generation": 7},
+        )
+
+    assert response.status_code == 200
+    assert response.json()["state"] == "pending"
+    assert manager.apply_observations == [("apply/7", 7)]
 
 
 def _scene_body() -> dict[str, Any]:

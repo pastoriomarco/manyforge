@@ -17,6 +17,7 @@ import {
   parseNodeEnvironmentResponse,
   parseLogicalSceneProjection,
   parseManagerApplyResponse,
+  parseManagerApplyStatusResponse,
   parseProgramWorkspaceResponse,
   parseProgramNodePolicyMutationResponse,
   parseProgramWorkspaceTransitionResponse,
@@ -442,6 +443,7 @@ describe('Program product projections', () => {
       capture: {
         schema_version: 'manyforge.program_run_capture.v1',
         program_run_id: 'program-run.1',
+        applied_record_digest: digestC,
         scenario_id: 'cell-pick',
         scenario_catalog_revision: digestA,
         program_id: 'pick',
@@ -450,6 +452,8 @@ describe('Program product projections', () => {
         retained_bundle_id: digestA,
         graph_revision: digestB,
         node_environment_digest: digestC,
+        node_policy_digest: digestA,
+        node_policies: [],
         owner_identities: [{
           owner_role: 'program_runner',
           owner_id: 'program-runner.cell-a',
@@ -1151,6 +1155,20 @@ describe('headless projection parsers', () => {
     }
     expect(succeeded.candidateProjectionRevision.scene_revision.revision_id)
       .toBe(2);
+  });
+
+  it('parses an exact read-only Manager Apply status without submit identity', () => {
+    const status = parseManagerApplyStatusResponse({
+      api_version: 'manyforge.manager_command_response.v1',
+      apply_generation: 2,
+      apply_id: 'apply-2',
+      candidate_projection_revision: null,
+      error: null,
+      ok: true,
+      state: 'pending',
+    });
+    expect(status.state).toBe('pending');
+    expect(status.applyId).toBe('apply-2');
   });
 
   it('rejects obsolete, extra-field, and inconsistent Manager Apply receipts', () => {

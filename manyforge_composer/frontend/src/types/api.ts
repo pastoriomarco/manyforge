@@ -365,6 +365,7 @@ export interface ProgramRunOwnerIdentity {
 
 export interface ProgramRunCapture {
   programRunId: string;
+  appliedRecordDigest: string;
   scenarioId: string;
   scenarioCatalogRevision: string;
   programId: string;
@@ -373,6 +374,8 @@ export interface ProgramRunCapture {
   retainedBundleId: string;
   graphRevision: string;
   nodeEnvironmentDigest: string;
+  nodePolicies: JsonValue[];
+  nodePolicyDigest: string;
   ownerIdentities: ProgramRunOwnerIdentity[];
 }
 
@@ -866,6 +869,10 @@ export interface ManagerApplySucceededResponse {
 export type ManagerApplyResponse =
   | ManagerApplyPendingResponse
   | ManagerApplySucceededResponse;
+
+export type ManagerApplyStatusResponse =
+  | Omit<ManagerApplyPendingResponse, 'replayStatus' | 'requestId' | 'requestOwnerEpoch'>
+  | Omit<ManagerApplySucceededResponse, 'replayStatus' | 'requestId' | 'requestOwnerEpoch'>;
 
 export interface DraftMutationResponse {
   mutation: string;

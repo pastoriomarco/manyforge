@@ -615,6 +615,32 @@ describe('headless intent client', () => {
     );
   });
 
+  it('observes Manager Apply through the read-only durable identity route', async () => {
+    const payload = managerApplyFixture({
+      request_id: 'request-manager-1',
+      request_owner_epoch: 'owner.epoch.1',
+      source_label: 'composer_ui',
+      correlation_id: null,
+      deployment_artifact_id: 'artifact-1',
+      deployment_revision: 'rev-2',
+      expected_current: { graph_revision: 'graph-9', retained_bundle_id: 'bundle-9' },
+      reject_if_affected_busy: true,
+    });
+    delete payload.replay_status;
+    delete payload.request_id;
+    delete payload.request_owner_epoch;
+    const fetchMock = vi.fn().mockResolvedValue(response(payload));
+    vi.stubGlobal('fetch', fetchMock);
+
+    const observed = await api.manager.applyStatus('apply-1', 1);
+
+    expect(observed.state).toBe('succeeded');
+    expect(fetchMock.mock.calls[0]?.[0]).toBe(
+      '/api/manager/apply/status?apply_id=apply-1&apply_generation=1',
+    );
+    expect((fetchMock.mock.calls[0]?.[1] as RequestInit).method).toBe('GET');
+  });
+
   it('submits one exact alarm activation without a caller-supplied principal', async () => {
     const fetchMock = vi.fn().mockResolvedValue(response({ acknowledged: true }));
     vi.stubGlobal('fetch', fetchMock);

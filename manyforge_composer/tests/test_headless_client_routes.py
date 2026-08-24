@@ -116,6 +116,7 @@ def _program_run_status(*, state: str = "running") -> dict[str, Any]:
         "capture": {
             "schema_version": "manyforge.program_run_capture.v1",
             "program_run_id": "program-run.1",
+            "applied_record_digest": digest_c,
             "scenario_id": "cell-pick",
             "scenario_catalog_revision": digest_a,
             "program_id": "pick",
@@ -124,6 +125,8 @@ def _program_run_status(*, state: str = "running") -> dict[str, Any]:
             "retained_bundle_id": digest_a,
             "graph_revision": digest_b,
             "node_environment_digest": digest_c,
+            "node_policies": [],
+            "node_policy_digest": "sha256:4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945",
             "owner_identities": [
                 {
                     "owner_role": "program_runner",

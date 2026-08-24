@@ -20,18 +20,24 @@ NODE_CATALOG = Path("/workspace/manyforge_behavior/resources/node_catalog.yaml")
 
 def _config(root: Path, owner_epoch: str) -> HeadlessApiConfig:
     publication_root = root / "publications"
-    manager_state_root = root / "manager"
+    artifact_root = root / "artifacts"
+    program_selection_state_root = root / "program-selection-state"
+    manager_run_root = root / "manager-run"
     execution_state_root = root / "execution"
     publication_root.mkdir(exist_ok=True)
-    manager_state_root.mkdir(exist_ok=True)
+    artifact_root.mkdir(exist_ok=True)
+    program_selection_state_root.mkdir(exist_ok=True)
+    manager_run_root.mkdir(exist_ok=True)
     execution_state_root.mkdir(exist_ok=True)
     return HeadlessApiConfig(
-        publication_root=publication_root,
-        package_root=Path(os.environ["MANYFORGE_CANONICAL_EMPTY_PACKAGE_ROOT"]),
+        projection_root=publication_root,
+        install_root=Path(os.environ["MANYFORGE_CANONICAL_EMPTY_PACKAGE_ROOT"]),
+        artifact_root=artifact_root,
+        program_selection_state_root=program_selection_state_root,
         node_catalog_path=NODE_CATALOG,
         alarm_catalog_path=CATALOG,
         historian_database_path=root / "history.sqlite3",
-        manager_state_root=manager_state_root,
+        manager_run_root=manager_run_root,
         execution_state_root=execution_state_root,
         cell_id="c1_build_authority_cell",
         resource_ids=("resource.arm.a",),
@@ -60,16 +66,24 @@ def _acknowledgement(alarm: dict, owner_epoch: str, request_id: str) -> dict:
 def _start_manager(root: Path) -> subprocess.Popen[bytes]:
     publication_root = root / "publications"
     manager_state_root = root / "manager"
+    manager_run_root = root / "manager-run"
     runtime_state_root = root / "runtime"
-    for path in (publication_root, manager_state_root, runtime_state_root):
+    for path in (
+        publication_root,
+        manager_state_root,
+        manager_run_root,
+        runtime_state_root,
+    ):
         path.mkdir(exist_ok=True)
     process = subprocess.Popen(
         [
             os.environ["MANYFORGE_MANAGER_DAEMON"],
-            "--package-root",
+            "--install-root",
             os.environ["MANYFORGE_CANONICAL_EMPTY_PACKAGE_ROOT"],
             "--manager-state-root",
             str(manager_state_root),
+            "--manager-run-root",
+            str(manager_run_root),
             "--runtime-state-root",
             str(runtime_state_root),
             "--logical-scene-database",
@@ -78,7 +92,7 @@ def _start_manager(root: Path) -> subprocess.Popen[bytes]:
             str(root / "program-cycle.sqlite3"),
             "--authoring-transaction-journal",
             str(root / "authoring-transactions.sqlite3"),
-            "--publication-root",
+            "--projection-root",
             str(publication_root),
             "--reconciliation-period-ms",
             "20",
@@ -90,7 +104,7 @@ def _start_manager(root: Path) -> subprocess.Popen[bytes]:
         publication_root / "manager-source.json",
         publication_root / "logical-scene-source.json",
         publication_root / "scene-runtime-source.json",
-        manager_state_root / "manager-command.sock",
+        manager_run_root / "manager-command.sock",
     }
     deadline = time.monotonic() + 5.0
     while time.monotonic() < deadline:

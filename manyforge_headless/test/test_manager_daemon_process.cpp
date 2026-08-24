@@ -196,6 +196,7 @@ public:
     }
     root_ = created;
     std::filesystem::create_directory(manager_root());
+    std::filesystem::create_directory(manager_run_root());
     std::filesystem::create_directory(runtime_root());
     std::filesystem::create_directory(publication_root());
   }
@@ -211,6 +212,9 @@ public:
   [[nodiscard]] std::filesystem::path runtime_root() const {
     return root_ / "runtime";
   }
+  [[nodiscard]] std::filesystem::path manager_run_root() const {
+    return root_ / "manager-run";
+  }
   [[nodiscard]] std::filesystem::path publication_root() const {
     return root_ / "publications";
   }
@@ -224,7 +228,7 @@ public:
     return root_ / "authoring-transactions.sqlite3";
   }
   [[nodiscard]] std::filesystem::path socket_path() const {
-    return manager_root() / "manager-command.sock";
+    return manager_run_root() / "manager-command.sock";
   }
   [[nodiscard]] std::filesystem::path startup_stderr() const {
     return root_ / "manager-startup.stderr";
@@ -234,7 +238,7 @@ public:
   }
   [[nodiscard]] std::filesystem::path program_runner_liveness_socket_path()
       const {
-    return root_ / "program-runner-liveness.sock";
+    return manager_run_root() / "program-runner-liveness.sock";
   }
   [[nodiscard]] std::filesystem::path program_runner_log_path() const {
     return root_ / "program-runner-process.stderr";
@@ -266,6 +270,7 @@ public:
       std::string executable = MANYFORGE_HEADLESS_TEST_MANAGER_DAEMON,
       std::string program_runner_liveness_socket = {}) {
     const auto manager_root = directory.manager_root().string();
+    const auto manager_run_root = directory.manager_run_root().string();
     const auto runtime_root = directory.runtime_root().string();
     const auto scene_database = directory.scene_database().string();
     const auto program_cycle_journal =
@@ -287,27 +292,29 @@ public:
       }
       static_cast<void>(::close(stderr_fd));
       if (program_runner_liveness_socket.empty()) {
-        ::execl(executable.c_str(), executable.c_str(), "--package-root",
+        ::execl(executable.c_str(), executable.c_str(), "--install-root",
                 package_root.c_str(), "--canonical-empty-admission-filename",
                 admission_filename.c_str(), "--manager-state-root",
-                manager_root.c_str(), "--runtime-state-root",
+                manager_root.c_str(), "--manager-run-root",
+                manager_run_root.c_str(), "--runtime-state-root",
                 runtime_root.c_str(), "--logical-scene-database",
                 scene_database.c_str(), "--program-cycle-journal",
                 program_cycle_journal.c_str(),
                 "--authoring-transaction-journal",
-                authoring_transaction_journal.c_str(), "--publication-root",
+                authoring_transaction_journal.c_str(), "--projection-root",
                 publication_root.c_str(), "--reconciliation-period-ms", "10",
                 static_cast<char *>(nullptr));
       } else {
-        ::execl(executable.c_str(), executable.c_str(), "--package-root",
+        ::execl(executable.c_str(), executable.c_str(), "--install-root",
                 package_root.c_str(), "--canonical-empty-admission-filename",
                 admission_filename.c_str(), "--manager-state-root",
-                manager_root.c_str(), "--runtime-state-root",
+                manager_root.c_str(), "--manager-run-root",
+                manager_run_root.c_str(), "--runtime-state-root",
                 runtime_root.c_str(), "--logical-scene-database",
                 scene_database.c_str(), "--program-cycle-journal",
                 program_cycle_journal.c_str(),
                 "--authoring-transaction-journal",
-                authoring_transaction_journal.c_str(), "--publication-root",
+                authoring_transaction_journal.c_str(), "--projection-root",
                 publication_root.c_str(), "--program-runner-liveness-socket",
                 program_runner_liveness_socket.c_str(),
                 "--reconciliation-period-ms", "10",
@@ -821,7 +828,7 @@ AuthoringAdmissionProjection ReadAuthoringAdmissionProjection(
   return {*allowed, static_cast<std::uint64_t>(generation)};
 }
 
-AuthoringAdmissionProjection WaitForAuthoringAdmission(
+[[maybe_unused]] AuthoringAdmissionProjection WaitForAuthoringAdmission(
     const DaemonDirectory &directory,
     const std::chrono::seconds timeout = std::chrono::seconds(10)) {
   const auto deadline = std::chrono::steady_clock::now() + timeout;
@@ -868,6 +875,31 @@ std::string ApplyRequest(
          "\"request_owner_epoch\":\"" +
          std::string(manager_owner_epoch) +
          "\",\"source_label\":\"manager-process-test\"}";
+}
+
+[[maybe_unused]] std::string ApplyStatusRequest(
+    const std::string_view submission_response) {
+  using content_identity::CanonicalValue;
+  const auto response =
+      deployment::parse_strict_json_model_yaml(submission_response).root();
+  const auto *apply_id = std::get_if<std::string>(
+      &RequiredMember(response, "apply_id").storage());
+  const auto generation =
+      RequiredMember(response, "apply_generation").as_number();
+  if (apply_id == nullptr || apply_id->empty() || generation < 1.0 ||
+      generation > 9007199254740991.0 ||
+      static_cast<double>(static_cast<std::uint64_t>(generation)) !=
+          generation) {
+    throw std::runtime_error("Manager Apply submission receipt is invalid");
+  }
+  return content_identity::canonical_json(CanonicalValue(
+      CanonicalValue::Object{
+          {"api_version",
+           CanonicalValue(std::string("manyforge.manager_command.v1"))},
+          {"apply_generation", CanonicalValue(generation)},
+          {"apply_id", CanonicalValue(*apply_id)},
+          {"command", CanonicalValue(std::string("apply_status"))},
+      }));
 }
 
 std::string SceneAddRequest(
@@ -1847,13 +1879,15 @@ TEST(ManagerDaemonProcess,
         fixture_a.predecessor_graph_revision,
         fixture_a.predecessor_retained_bundle_id,
         "manager-o1-4g-replacement-a.1");
-    auto applied = SendCommand(directory_a.socket_path(), request);
+    const auto submitted = SendCommand(directory_a.socket_path(), request);
+    const auto status_request = ApplyStatusRequest(submitted);
+    auto applied = submitted;
     const auto apply_deadline =
         std::chrono::steady_clock::now() + std::chrono::seconds(20);
     while (applied.find("\"state\":\"succeeded\"") == std::string::npos &&
            std::chrono::steady_clock::now() < apply_deadline) {
       std::this_thread::sleep_for(std::chrono::milliseconds(10));
-      applied = SendCommand(directory_a.socket_path(), request);
+      applied = SendCommand(directory_a.socket_path(), status_request);
     }
     ASSERT_NE(applied.find("\"state\":\"succeeded\""), std::string::npos)
         << applied;
@@ -1936,13 +1970,15 @@ TEST(ManagerDaemonProcess,
         fixture_b.predecessor_graph_revision,
         fixture_b.predecessor_retained_bundle_id,
         "manager-o1-4g-replacement-b.1");
-    auto applied = SendCommand(directory_b.socket_path(), request);
+    const auto submitted = SendCommand(directory_b.socket_path(), request);
+    const auto status_request = ApplyStatusRequest(submitted);
+    auto applied = submitted;
     const auto apply_deadline =
         std::chrono::steady_clock::now() + std::chrono::seconds(20);
     while (applied.find("\"state\":\"succeeded\"") == std::string::npos &&
            std::chrono::steady_clock::now() < apply_deadline) {
       std::this_thread::sleep_for(std::chrono::milliseconds(10));
-      applied = SendCommand(directory_b.socket_path(), request);
+      applied = SendCommand(directory_b.socket_path(), status_request);
     }
     ASSERT_NE(applied.find("\"state\":\"succeeded\""), std::string::npos)
         << applied;
@@ -2027,7 +2063,9 @@ TEST(ManagerDaemonProcess,
         fixture.deployment_revision, fixture.predecessor_graph_revision,
         fixture.predecessor_retained_bundle_id, "manager-runtime-only-apply.1");
 
-    auto applied = SendCommand(directory.socket_path(), request);
+    const auto submitted = SendCommand(directory.socket_path(), request);
+    const auto status_request = ApplyStatusRequest(submitted);
+    auto applied = submitted;
     EXPECT_NE(applied.find("\"ok\":true"), std::string::npos);
     EXPECT_NE(applied.find("\"replay_status\":\"accepted_new\""),
               std::string::npos);
@@ -2036,7 +2074,7 @@ TEST(ManagerDaemonProcess,
     while (applied.find("\"state\":\"succeeded\"") == std::string::npos &&
            std::chrono::steady_clock::now() < apply_deadline) {
       std::this_thread::sleep_for(std::chrono::milliseconds(10));
-      applied = SendCommand(directory.socket_path(), request);
+      applied = SendCommand(directory.socket_path(), status_request);
     }
     SCOPED_TRACE(applied);
     EXPECT_NE(applied.find("\"state\":\"succeeded\""), std::string::npos);
@@ -2164,13 +2202,16 @@ TEST(ManagerDaemonProcess,
         fixture.predecessor_retained_bundle_id,
         "manager-physical-recovery-apply.1");
 
-    auto applied = SendCommand(directory.socket_path(), apply_request);
+    const auto submitted =
+        SendCommand(directory.socket_path(), apply_request);
+    const auto status_request = ApplyStatusRequest(submitted);
+    auto applied = submitted;
     const auto apply_deadline =
         std::chrono::steady_clock::now() + std::chrono::seconds(20);
     while (applied.find("\"state\":\"succeeded\"") == std::string::npos &&
            std::chrono::steady_clock::now() < apply_deadline) {
       std::this_thread::sleep_for(std::chrono::milliseconds(10));
-      applied = SendCommand(directory.socket_path(), apply_request);
+      applied = SendCommand(directory.socket_path(), status_request);
     }
     ASSERT_NE(applied.find("\"state\":\"succeeded\""), std::string::npos)
         << applied;

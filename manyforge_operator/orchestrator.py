@@ -59,6 +59,7 @@ from .package_aggregate import (
     PackageAggregateUnavailable,
     package_aggregate_sha256,
 )
+from .cell_layout import CellInstanceLayout, CellLayoutError
 
 
 STATUS_ENVELOPE_SCHEMA = "manyforge.native_operator_instance.v1"
@@ -102,15 +103,9 @@ class NativeLauncherConfig:
 
     source_root: Path
     manager_executable: Path
-    package_root: Path
+    install_root: Path
     node_catalog_path: Path
     alarm_catalog_path: Path
-    publication_root: Path
-    manager_state_root: Path
-    runtime_state_root: Path
-    execution_state_root: Path
-    logical_scene_database: Path
-    historian_database_path: Path
     composer_static_dir: Path | None = None
     simulation_control_config: Path | None = None
     canonical_empty_admission_filename: str = "canonical-empty-admission.json"
@@ -133,15 +128,9 @@ class NativeLauncherConfig:
         path_fields = (
             "source_root",
             "manager_executable",
-            "package_root",
+            "install_root",
             "node_catalog_path",
             "alarm_catalog_path",
-            "publication_root",
-            "manager_state_root",
-            "runtime_state_root",
-            "execution_state_root",
-            "logical_scene_database",
-            "historian_database_path",
             "state_root",
         )
         for name in path_fields:
@@ -203,7 +192,7 @@ class NativeLauncherConfig:
         for name, root in (
             ("source_root", str(self.source_root)),
             ("examples_root", str(self.source_root / "examples")),
-            ("package_root", str(self.package_root)),
+            ("install_root", str(self.install_root)),
             ("program_workspace", str(self.program_workspace)),
         ):
             if "\x00" in root or "," in root or root != root.strip():
@@ -220,18 +209,18 @@ class NativeLauncherConfig:
         if not resolved_examples_root.is_dir():
             raise ValueError("examples_root must resolve to a directory")
         try:
-            resolved_package_root = self.package_root.resolve(strict=False)
+            resolved_package_root = self.install_root.resolve(strict=False)
             resolved_program_workspace = self.program_workspace.resolve(strict=False)
         except (OSError, RuntimeError) as error:
             raise ValueError(
-                "package_root and program_workspace must be resolvable"
+                "install_root and program_workspace must be resolvable"
             ) from error
         if (
             resolved_package_root == resolved_program_workspace
             or resolved_package_root in resolved_program_workspace.parents
             or resolved_program_workspace in resolved_package_root.parents
         ):
-            raise ValueError("package_root and program_workspace must be disjoint")
+            raise ValueError("install_root and program_workspace must be disjoint")
         if (
             not self.cell_id
             or "/" in self.cell_id
@@ -267,15 +256,51 @@ class NativeLauncherConfig:
 
     @property
     def program_workspace(self) -> Path:
-        return self.instance_root / "program-workspace"
+        return self.authoring_state_root / "program-workspace"
 
     @property
     def program_cycle_journal(self) -> Path:
-        return self.instance_root / "program-cycle.sqlite3"
+        return self.program_runner_state_root / "program-cycle.sqlite3"
+
+    @property
+    def artifact_root(self) -> Path:
+        return self.instance_root / "artifacts"
+
+    @property
+    def projection_root(self) -> Path:
+        return self.instance_root / "projections"
+
+    @property
+    def manager_state_root(self) -> Path:
+        return self.instance_root / "state" / "manager"
+
+    @property
+    def manager_run_root(self) -> Path:
+        return self.instance_root / "run" / "manager"
+
+    @property
+    def runtime_state_root(self) -> Path:
+        return self.instance_root / "state" / "execution-host"
+
+    @property
+    def program_runner_state_root(self) -> Path:
+        return self.instance_root / "state" / "program-runner"
+
+    @property
+    def program_selection_state_root(self) -> Path:
+        return self.instance_root / "state" / "program-selection"
+
+    @property
+    def logical_scene_database(self) -> Path:
+        return self.instance_root / "state" / "logical-scene" / "scene.sqlite3"
+
+    @property
+    def historian_database_path(self) -> Path:
+        return self.instance_root / "state" / "alarm-history" / "history.sqlite3"
 
     @property
     def authoring_state_root(self) -> Path:
-        return self.instance_root / "composer-authoring"
+        return self.instance_root / "state" / "composer-authoring"
 
     @property
     def authoring_transaction_journal(self) -> Path:
@@ -317,9 +342,9 @@ class _ManagedProcess:
 def native_commands(config: NativeLauncherConfig) -> tuple[ProcessSpec, ...]:
     """Return the exact four native process specifications, without I/O."""
 
-    package_env = {"MANYFORGE_FS_ROOTS": str(config.package_root)}
+    package_env = {"MANYFORGE_FS_ROOTS": str(config.install_root)}
     program_runner_liveness_socket = (
-        config.manager_state_root / "program-runner-liveness.sock"
+        config.manager_run_root / "program-runner-liveness.sock"
     )
     manager = ProcessSpec(
         "manager",
@@ -327,12 +352,14 @@ def native_commands(config: NativeLauncherConfig) -> tuple[ProcessSpec, ...]:
             str(item)
             for item in (
                 config.manager_executable,
-                "--package-root",
-                config.package_root,
+                "--install-root",
+                config.install_root,
                 "--canonical-empty-admission-filename",
                 config.canonical_empty_admission_filename,
                 "--manager-state-root",
                 config.manager_state_root,
+                "--manager-run-root",
+                config.manager_run_root,
                 "--runtime-state-root",
                 config.runtime_state_root,
                 "--logical-scene-database",
@@ -341,8 +368,8 @@ def native_commands(config: NativeLauncherConfig) -> tuple[ProcessSpec, ...]:
                 config.program_cycle_journal,
                 "--authoring-transaction-journal",
                 config.authoring_transaction_journal,
-                "--publication-root",
-                config.publication_root,
+                "--projection-root",
+                config.projection_root,
                 "--program-runner-liveness-socket",
                 program_runner_liveness_socket,
                 "--reconciliation-period-ms",
@@ -363,18 +390,22 @@ def native_commands(config: NativeLauncherConfig) -> tuple[ProcessSpec, ...]:
             SERVICE_BIND_HOSTS["headless"],
             "--port",
             str(SERVICE_PORTS["headless"]),
-            "--publication-root",
-            str(config.publication_root),
-            "--package-root",
-            str(config.package_root),
+            "--projection-root",
+            str(config.projection_root),
+            "--install-root",
+            str(config.install_root),
+            "--artifact-root",
+            str(config.artifact_root),
+            "--program-selection-state-root",
+            str(config.program_selection_state_root),
             "--node-catalog-path",
             str(config.node_catalog_path),
             "--alarm-catalog-path",
             str(config.alarm_catalog_path),
             "--historian-database-path",
             str(config.historian_database_path),
-            "--manager-state-root",
-            str(config.manager_state_root),
+            "--manager-run-root",
+            str(config.manager_run_root),
             "--execution-state-root",
             # The native profile uses Manager's managed execution host.  Its
             # command and CCLC surfaces are intentionally published under the
@@ -451,7 +482,7 @@ def native_commands(config: NativeLauncherConfig) -> tuple[ProcessSpec, ...]:
         {
             "MANYFORGE_FS_ROOTS": (
                 f"{config.source_root / 'examples'},"
-                f"{config.package_root},{config.program_workspace}"
+                f"{config.install_root},{config.program_workspace}"
             ),
             "MANYFORGE_PROGRAM_WRITE_ROOTS": str(config.program_workspace),
         },
@@ -591,7 +622,7 @@ def _configuration(config: NativeLauncherConfig) -> LaunchConfiguration:
         package_aggregate_sha256=config.package_aggregate_sha256,
         compiler_build_manifest_sha256=config.compiler_build_manifest_sha256,
         node_environment_sha256=config.node_environment_sha256,
-        install_root=str(config.package_root),
+        install_root=str(config.install_root),
     )
     endpoints = [
         ServiceEndpoint(
@@ -629,11 +660,19 @@ def _configuration(config: NativeLauncherConfig) -> LaunchConfiguration:
 
 
 class _StateStore:
-    def __init__(self, config: NativeLauncherConfig) -> None:
-        self.root = config.instance_root
+    def __init__(
+        self,
+        config: NativeLauncherConfig,
+        *,
+        root: Path | None = None,
+        lock_root: Path | None = None,
+    ) -> None:
+        self.root = root or config.instance_root
         self.root.mkdir(parents=True, exist_ok=True)
         self.record_path = self.root / "launch_instance.json"
-        self.lock_path = self.root / "instance.lock"
+        selected_lock_root = lock_root or self.root
+        selected_lock_root.mkdir(parents=True, exist_ok=True)
+        self.lock_path = selected_lock_root / "instance.lock"
 
     @contextmanager
     def lock(self) -> Iterator[None]:
@@ -739,7 +778,7 @@ class NativeLauncher:
         self.config = config
         try:
             observed_package_aggregate = package_aggregate_sha256(
-                config.package_root
+                config.install_root
             )
         except PackageAggregateUnavailable as error:
             raise LauncherError(
@@ -753,7 +792,22 @@ class NativeLauncher:
                 "observed package aggregate does not match the expected digest",
                 exit_code=71,
             )
-        self.store = _StateStore(config)
+        try:
+            self.layout = CellInstanceLayout.open_or_create(
+                cell_id=config.cell_id,
+                cell_root=config.instance_root,
+                install_root=config.install_root,
+            )
+            self.layout.validate()
+        except CellLayoutError as error:
+            raise LauncherError(
+                "cell_layout_invalid", str(error), exit_code=71
+            ) from error
+        self.store = _StateStore(
+            config,
+            root=config.instance_root / "state" / "operator",
+            lock_root=config.instance_root / "run" / "operator",
+        )
         self._managed: dict[str, _ManagedProcess] = {}
         self.last_start_idempotent = False
         self.last_stop_already_stopped = False
@@ -770,8 +824,23 @@ class NativeLauncher:
         ):
             raise LauncherError("invalid_instance_id", "instance id is invalid", exit_code=64)
         root = Path(state_root).absolute() / instance_id
-        root.mkdir(parents=True, exist_ok=True)
+        if (
+            not root.is_dir()
+            or root.is_symlink()
+            or not (root / ".manyforge-cell-layout.json").is_file()
+        ):
+            raise LauncherError(
+                "cell_layout_unavailable",
+                "status/stop requires one existing launcher-created cell layout",
+                exit_code=66,
+            )
         launcher = cls.__new__(cls)
+        try:
+            launcher.layout = CellInstanceLayout.open_existing(root)
+        except CellLayoutError as error:
+            raise LauncherError(
+                "cell_layout_invalid", str(error), exit_code=71
+            ) from error
         launcher.config = SimpleNamespace(
             state_root=Path(state_root).absolute(),
             instance_id=instance_id,
@@ -779,14 +848,15 @@ class NativeLauncher:
             headless_url="http://127.0.0.1:9010/",
             program_runner_url="http://127.0.0.1:9011/",
             composer_url="http://localhost:9000/",
-            manager_state_root=root / "manager",
+            manager_state_root=root / "state" / "manager",
+            manager_run_root=root / "run" / "manager",
             readiness_timeout_seconds=DEFAULT_TIMEOUT_SECONDS,
             poll_interval_seconds=DEFAULT_POLL_SECONDS,
         )
         launcher.store = object.__new__(_StateStore)
-        launcher.store.root = root
-        launcher.store.record_path = root / "launch_instance.json"
-        launcher.store.lock_path = root / "instance.lock"
+        launcher.store.root = root / "state" / "operator"
+        launcher.store.record_path = launcher.store.root / "launch_instance.json"
+        launcher.store.lock_path = root / "run" / "operator" / "instance.lock"
         launcher._managed = {}
         launcher.last_start_idempotent = False
         launcher.last_stop_already_stopped = False
@@ -813,7 +883,7 @@ class NativeLauncher:
             },
             "paths": {
                 "source_root": str(self.config.source_root),
-                "package_root": str(self.config.package_root),
+                "install_root": str(self.config.install_root),
                 "program_workspace": str(self.config.program_workspace),
                 "manager_executable": str(self.config.manager_executable),
                 "node_catalog_path": str(self.config.node_catalog_path),
@@ -821,8 +891,8 @@ class NativeLauncher:
                 "logical_scene_database": str(self.config.logical_scene_database),
                 "historian_database_path": str(self.config.historian_database_path),
                 "manager_state_root": str(self.config.manager_state_root),
+                "manager_run_root": str(self.config.manager_run_root),
                 "runtime_state_root": str(self.config.runtime_state_root),
-                "execution_state_root": str(self.config.execution_state_root),
                 "simulation_control_config": (
                     str(self.config.simulation_control_config)
                     if self.config.simulation_control_config is not None
@@ -854,13 +924,13 @@ class NativeLauncher:
         directory = getattr(os, "O_DIRECTORY", 0)
         try:
             instance_fd = os.open(
-                self.config.instance_root,
+                self.config.authoring_state_root,
                 os.O_RDONLY | directory | no_follow,
             )
         except OSError as error:
             raise LauncherError(
                 "program_workspace_invalid",
-                f"instance root cannot safely contain the Program workspace: {error}",
+                f"authoring state root cannot safely contain the Program workspace: {error}",
                 exit_code=70,
             ) from error
         try:
@@ -1051,8 +1121,9 @@ class NativeLauncher:
         ]
 
     def _spawn(self, spec: ProcessSpec) -> _ManagedProcess:
-        self.store.root.joinpath("logs").mkdir(parents=True, exist_ok=True)
-        log_path = self.store.root / "logs" / f"{spec.component_id}.log"
+        log_root = self.config.instance_root / "run" / "operator" / "logs"
+        log_root.mkdir(parents=True, exist_ok=True)
+        log_path = log_root / f"{spec.component_id}.log"
         log = log_path.open("ab")
         try:
             environment = os.environ.copy()
@@ -1280,6 +1351,10 @@ class NativeLauncher:
         self.last_start_idempotent = False
         if not self.config.instance_id:
             raise LauncherError("invalid_instance_id", "instance id is empty", exit_code=64)
+        try:
+            self.layout.validate()
+        except CellLayoutError as error:
+            raise LauncherError("cell_layout_invalid", str(error), exit_code=71) from error
         with self.store.lock():
             configuration = _configuration(self.config)
             self._prepare_program_workspace()
@@ -1348,14 +1423,14 @@ class NativeLauncher:
                         self.store.write(stopping, mechanical)
                         paths = mechanical.get("paths")
                         manager_root = (
-                            Path(paths["manager_state_root"])
+                            Path(paths["manager_run_root"])
                             if isinstance(paths, dict)
-                            and isinstance(paths.get("manager_state_root"), str)
-                            else self.config.manager_state_root
+                            and isinstance(paths.get("manager_run_root"), str)
+                            else self.config.manager_run_root
                         )
                         clean = self._cleanup_authenticated(
                             processes,
-                            manager_state_root=manager_root,
+                            manager_run_root=manager_root,
                         )
                         observations = self._resource_observations(resources)
                         if not clean or any(
@@ -1419,15 +1494,6 @@ class NativeLauncher:
                         status=old_status,
                     )
             self._port_available()
-            self.config.instance_root.mkdir(parents=True, exist_ok=True)
-            for path in (
-                self.config.publication_root,
-                self.config.manager_state_root,
-                self.config.runtime_state_root,
-                self.config.execution_state_root,
-                self.config.authoring_state_root,
-            ):
-                path.mkdir(parents=True, exist_ok=True)
             self._write_live(configuration, LaunchInstanceState.STARTING)
             try:
                 for spec in native_commands(self.config):
@@ -1499,6 +1565,10 @@ class NativeLauncher:
                 ) from error
 
     def status(self) -> LaunchInstanceStatus | None:
+        try:
+            self.layout.validate()
+        except CellLayoutError as error:
+            raise LauncherError("cell_layout_invalid", str(error), exit_code=71) from error
         with self.store.lock():
             existing = self.store.read()
             if existing is None:
@@ -1527,7 +1597,7 @@ class NativeLauncher:
         self,
         process_records: Mapping[str, Mapping[str, Any]] | None = None,
         *,
-        manager_state_root: Path | None = None,
+        manager_run_root: Path | None = None,
     ) -> bool:
         processes = (
             dict(process_records)
@@ -1536,7 +1606,7 @@ class NativeLauncher:
         )
         manager = processes.get("manager")
         if manager is not None and _safe_process_is_authenticated(manager):
-            socket_path = (manager_state_root or self.config.manager_state_root) / "manager-command.sock"
+            socket_path = (manager_run_root or self.config.manager_run_root) / "manager-command.sock"
             try:
                 with socket.socket(socket.AF_UNIX, socket.SOCK_SEQPACKET) as client:
                     client.settimeout(2.0)
@@ -1573,6 +1643,10 @@ class NativeLauncher:
 
     def stop(self) -> LaunchInstanceStatus | None:
         self.last_stop_already_stopped = False
+        try:
+            self.layout.validate()
+        except CellLayoutError as error:
+            raise LauncherError("cell_layout_invalid", str(error), exit_code=71) from error
         with self.store.lock():
             existing = self.store.read()
             if existing is None:
@@ -1614,8 +1688,8 @@ class NativeLauncher:
             self.store.write(stopping, mechanical)
             clean = self._cleanup_authenticated(
                 processes,
-                manager_state_root=Path(
-                    mechanical["paths"]["manager_state_root"]
+                manager_run_root=Path(
+                    mechanical["paths"]["manager_run_root"]
                 ),
             )
             observations = [

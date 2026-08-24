@@ -274,6 +274,7 @@ def _capture(program: Program, *, binding_id: str = _DIGEST_A) -> ProgramRunCapt
     environment = build_node_environment()
     return ProgramRunCapture(
         program_run_id="run.test",
+        applied_record_digest="sha256:" + "9" * 64,
         scenario_id="scenario.test",
         scenario_catalog_revision=_DIGEST_A,
         program_id=program.program_id,

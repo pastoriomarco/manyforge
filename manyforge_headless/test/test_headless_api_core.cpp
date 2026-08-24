@@ -47,6 +47,8 @@ public:
     }
     path_ = created;
     std::filesystem::create_directory(publications());
+    std::filesystem::create_directory(artifacts());
+    std::filesystem::create_directory(program_selection_state());
   }
 
   ~TemporaryDirectory() {
@@ -59,6 +61,12 @@ public:
   }
   [[nodiscard]] std::filesystem::path publications() const {
     return path_ / "publications";
+  }
+  [[nodiscard]] std::filesystem::path artifacts() const {
+    return path_ / "artifacts";
+  }
+  [[nodiscard]] std::filesystem::path program_selection_state() const {
+    return path_ / "program-selection-state";
   }
   [[nodiscard]] std::filesystem::path history() const {
     return path_ / "history.sqlite3";
@@ -116,6 +124,8 @@ Config(const TemporaryDirectory &directory, std::string owner_epoch,
   return {
       directory.publications(),
       std::move(package_root),
+      directory.artifacts(),
+      directory.program_selection_state(),
       MANYFORGE_HEADLESS_TEST_NODE_CATALOG,
       MANYFORGE_HEADLESS_TEST_ALARM_CATALOG,
       directory.history(),
@@ -863,7 +873,8 @@ TEST(HeadlessApiCore,
       selection.scenario_id, selection.scenario_catalog_revision.value(),
       content_identity::canonical_json(selection.normalized_program_root));
   const auto applied = core.CommitProgramApply(
-      content_identity::canonical_json(prepared), std::nullopt);
+      content_identity::canonical_json(prepared), std::nullopt,
+      "authoring.epoch.1", "request.1");
   EXPECT_EQ(Text(applied, "program_revision"),
             selection.program_revision.value());
   EXPECT_EQ(core.AppliedProgramSelection(), applied);

@@ -2,29 +2,29 @@ import { describe, expect, it, vi } from 'vitest';
 
 import {
   completeManagerApply,
+  observePendingManagerApply,
 } from './managerApplyCompletion';
 import type {
+  ManagerApplyPendingResponse,
   ManagerApplyRequest,
-  ManagerApplyResponse,
+  ManagerApplyStatusResponse,
 } from '../types/api';
 
-function requestFixture(): ManagerApplyRequest {
-  return {
-    request_id: 'request-1',
-    request_owner_epoch: 'manager-owner-1',
-    source_label: 'composer_ui',
-    correlation_id: null,
-    deployment_artifact_id: 'deployment-1',
-    deployment_revision: 'sha256:' + 'a'.repeat(64),
-    expected_current: {
-      graph_revision: 'sha256:' + 'b'.repeat(64),
-      retained_bundle_id: 'sha256:' + 'c'.repeat(64),
-    },
-    reject_if_affected_busy: true,
-  };
-}
+const request: ManagerApplyRequest = {
+  request_id: 'request-1',
+  request_owner_epoch: 'manager-owner-1',
+  source_label: 'composer_ui',
+  correlation_id: null,
+  deployment_artifact_id: 'deployment-1',
+  deployment_revision: 'sha256:' + 'a'.repeat(64),
+  expected_current: {
+    graph_revision: 'sha256:' + 'b'.repeat(64),
+    retained_bundle_id: 'sha256:' + 'c'.repeat(64),
+  },
+  reject_if_affected_busy: true,
+};
 
-function pendingResponse(): ManagerApplyResponse {
+function pending(): ManagerApplyPendingResponse {
   return {
     apiVersion: 'manyforge.manager_command_response.v1',
     applyGeneration: 1,
@@ -32,150 +32,136 @@ function pendingResponse(): ManagerApplyResponse {
     candidateProjectionRevision: null,
     error: null,
     ok: true,
-    replayStatus: 'replayed_exact',
-    requestId: 'request-1',
-    requestOwnerEpoch: 'manager-owner-1',
+    replayStatus: 'accepted_new',
+    requestId: request.request_id,
+    requestOwnerEpoch: request.request_owner_epoch,
     state: 'pending',
   };
 }
 
-function succeededResponse(): ManagerApplyResponse {
-  return {
-    ...pendingResponse(),
-    candidateProjectionRevision: {
-      retained_bundle_id: 'sha256:' + 'd'.repeat(64),
-      graph_revision: 'sha256:' + 'e'.repeat(64),
-      scene_revision: {
-        scene_id: 'sha256:' + 'f'.repeat(64),
-        revision_id: 2,
-        content_hash: 'sha256:' + '1'.repeat(64),
-      },
-    },
-    state: 'succeeded',
-  };
+function status(state: 'pending' | 'succeeded'): ManagerApplyStatusResponse {
+  return state === 'pending'
+    ? {
+        apiVersion: 'manyforge.manager_command_response.v1',
+        applyGeneration: 1,
+        applyId: 'apply-1',
+        candidateProjectionRevision: null,
+        error: null,
+        ok: true,
+        state,
+      }
+    : {
+        apiVersion: 'manyforge.manager_command_response.v1',
+        applyGeneration: 1,
+        applyId: 'apply-1',
+        candidateProjectionRevision: {
+          retained_bundle_id: 'sha256:' + 'd'.repeat(64),
+          graph_revision: 'sha256:' + 'e'.repeat(64),
+          scene_revision: {
+            scene_id: 'sha256:' + 'f'.repeat(64),
+            revision_id: 2,
+            content_hash: 'sha256:' + '1'.repeat(64),
+          },
+        },
+        error: null,
+        ok: true,
+        state,
+      };
 }
 
-describe('Manager Apply completion observation', () => {
-  it('replays one byte-equivalent request until durable success', async () => {
-    const request = requestFixture();
+describe('Manager Apply durable observation', () => {
+  it('submits once and observes the durable identity until success', async () => {
     let now = 0;
-    const seen: ManagerApplyRequest[] = [];
-    const apply = vi.fn(async (body: ManagerApplyRequest) => {
-      seen.push(body);
-      return seen.length < 3 ? pendingResponse() : succeededResponse();
-    });
-    const sleep = vi.fn(async (delayMs: number) => {
-      now += delayMs;
-    });
-
-    const result = await completeManagerApply(request, apply, {
+    const submit = vi.fn(async () => pending());
+    const observe = vi
+      .fn<(_: string, __: number) => Promise<ManagerApplyStatusResponse>>()
+      .mockResolvedValueOnce(status('pending'))
+      .mockResolvedValueOnce(status('succeeded'));
+    const result = await completeManagerApply(request, submit, observe, {
       now: () => now,
-      sleep,
+      sleep: async (duration) => { now += duration; },
       overallTimeoutMs: 4_000,
-      replayIntervalMs: 1_000,
+      observationIntervalMs: 1_000,
+    });
+    expect(result.state).toBe('succeeded');
+    expect(submit).toHaveBeenCalledTimes(1);
+    expect(observe).toHaveBeenCalledTimes(2);
+    expect(observe).toHaveBeenCalledWith('apply-1', 1, undefined);
+  });
+
+  it('times out pending without resubmission or no-effect inference', async () => {
+    let now = 0;
+    const submit = vi.fn(async () => pending());
+    const observe = vi.fn(async () => status('pending'));
+    const result = await completeManagerApply(request, submit, observe, {
+      now: () => now,
+      sleep: async (duration) => { now += duration; },
+      overallTimeoutMs: 2_500,
+      observationIntervalMs: 1_000,
+    });
+    expect(result.state).toBe('pending_timeout');
+    expect(submit).toHaveBeenCalledTimes(1);
+    expect(observe).toHaveBeenCalledTimes(2);
+  });
+
+  it('pre-abort dispatches neither submit nor observation', async () => {
+    const controller = new AbortController();
+    const reason = new Error('local observer closed');
+    controller.abort(reason);
+    const submit = vi.fn(async () => pending());
+    const observe = vi.fn(async () => status('pending'));
+    await expect(
+      completeManagerApply(request, submit, observe, {
+        signal: controller.signal,
+      }),
+    ).rejects.toBe(reason);
+    expect(submit).not.toHaveBeenCalled();
+    expect(observe).not.toHaveBeenCalled();
+  });
+
+  it('abort during delay stops only the local observer', async () => {
+    const controller = new AbortController();
+    const submit = vi.fn(async () => pending());
+    const observe = vi.fn(async () => status('pending'));
+    await expect(
+      completeManagerApply(request, submit, observe, {
+        signal: controller.signal,
+        sleep: async () => {
+          controller.abort(new Error('unmounted'));
+          throw controller.signal.reason;
+        },
+      }),
+    ).rejects.toThrow('unmounted');
+    expect(submit).toHaveBeenCalledTimes(1);
+    expect(observe).not.toHaveBeenCalled();
+  });
+
+  it('reconnects from a durable receipt using observation only', async () => {
+    let now = 0;
+    const observe = vi.fn(async () => status('succeeded'));
+    const result = await observePendingManagerApply(pending(), observe, {
+      now: () => now,
+      sleep: async (duration) => { now += duration; },
     });
 
     expect(result.state).toBe('succeeded');
-    expect(apply).toHaveBeenCalledTimes(3);
-    expect(seen.every((body) => body === request)).toBe(true);
-    expect(seen.map((body) => JSON.stringify(body))).toEqual([
-      JSON.stringify(request),
-      JSON.stringify(request),
-      JSON.stringify(request),
-    ]);
-    expect(sleep).toHaveBeenCalledTimes(2);
+    expect(observe).toHaveBeenCalledTimes(1);
+    expect(observe).toHaveBeenCalledWith('apply-1', 1, undefined);
   });
 
-  it('fails closed when a pending replay changes the durable Apply identity', async () => {
-    const request = requestFixture();
-    let now = 0;
-    let calls = 0;
-    const apply = vi.fn(async () => {
-      calls += 1;
-      return calls === 1
-        ? pendingResponse()
-        : { ...pendingResponse(), applyId: 'apply-2' };
-    });
-    const sleep = vi.fn(async (delayMs: number) => {
-      now += delayMs;
-    });
-
-    await expect(
-      completeManagerApply(request, apply, {
-        now: () => now,
-        sleep,
-        overallTimeoutMs: 2_000,
-        replayIntervalMs: 1_000,
-      }),
-    ).rejects.toThrow('durable Apply identity or generation');
-    expect(apply).toHaveBeenCalledTimes(2);
-  });
-
-  it('fails closed when terminal success changes the durable Apply generation', async () => {
-    const request = requestFixture();
-    let now = 0;
-    let calls = 0;
-    const apply = vi.fn(async () => {
-      calls += 1;
-      return calls === 1
-        ? pendingResponse()
-        : { ...succeededResponse(), applyGeneration: 2 };
-    });
-    const sleep = vi.fn(async (delayMs: number) => {
-      now += delayMs;
-    });
-
-    await expect(
-      completeManagerApply(request, apply, {
-        now: () => now,
-        sleep,
-        overallTimeoutMs: 2_000,
-        replayIntervalMs: 1_000,
-      }),
-    ).rejects.toThrow('durable Apply identity or generation');
-    expect(apply).toHaveBeenCalledTimes(2);
-  });
-
-  it('returns a bounded pending result without claiming success', async () => {
-    const request = requestFixture();
-    let now = 0;
-    const apply = vi.fn(async () => pendingResponse());
-    const sleep = vi.fn(async (delayMs: number) => {
-      now += delayMs;
-    });
-
-    const result = await completeManagerApply(request, apply, {
-      now: () => now,
-      sleep,
-      overallTimeoutMs: 2_500,
-      replayIntervalMs: 1_000,
-    });
-
-    expect(result.state).toBe('pending_timeout');
-    expect(result.response.state).toBe('pending');
-    expect(apply.mock.calls.length).toBeLessThanOrEqual(3);
-    expect(sleep.mock.calls.map(([delayMs]) => delayMs)).toEqual([
-      1_000,
-      1_000,
-      500,
-    ]);
-  });
-
-  it('rejects with a pre-aborted signal reason before observing Apply', async () => {
-    const request = requestFixture();
+  it('abort during status transport does not resubmit', async () => {
     const controller = new AbortController();
-    const reason = new Error('Apply observation cancelled before start');
-    controller.abort(reason);
-    const apply = vi.fn(async () => pendingResponse());
-    const sleep = vi.fn(async () => {});
-
-    await expect(
-      completeManagerApply(request, apply, {
-        signal: controller.signal,
-        sleep,
-      }),
-    ).rejects.toBe(reason);
-    expect(apply).not.toHaveBeenCalled();
-    expect(sleep).not.toHaveBeenCalled();
+    const submit = vi.fn(async () => pending());
+    const observe = vi.fn(async () => {
+      const reason = new Error('observer disconnected');
+      controller.abort(reason);
+      throw reason;
+    });
+    await expect(completeManagerApply(request, submit, observe, {
+      signal: controller.signal,
+      sleep: async () => undefined,
+    })).rejects.toThrow('observer disconnected');
+    expect(submit).toHaveBeenCalledTimes(1);
+    expect(observe).toHaveBeenCalledTimes(1);
   });
 });

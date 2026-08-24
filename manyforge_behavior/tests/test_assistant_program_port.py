@@ -159,6 +159,7 @@ def _context(
 ) -> ProgramRunPortContext:
     return ProgramRunPortContext(
         program_run_id="program-run-1",
+        applied_record_digest="sha256:" + "9" * 64,
         scenario_id="scenario-1",
         scenario_catalog_revision=_DIGEST_A,
         program_id=program.program_id,

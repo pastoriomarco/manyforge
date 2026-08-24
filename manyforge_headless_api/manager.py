@@ -52,6 +52,10 @@ _SCENE_UPDATE_STATUSES = {"geometry_changed", "freshness_only", "no_op"}
 class ManagerPort(Protocol):
     def apply(self, request: ManagerApplyRequest) -> dict[str, Any]: ...
 
+    def observe_apply(
+        self, apply_id: str, apply_generation: int
+    ) -> dict[str, Any]: ...
+
     def commit_scene_transaction(
         self,
         request: SceneTransactionRequest,
@@ -199,6 +203,84 @@ class ManagerCommandClient:
             raise HeadlessApiError(
                 "manager_command_response_identity_mismatch",
                 "Manager Apply response does not match the submitted request",
+            )
+        return response
+
+    def observe_apply(
+        self, apply_id: str, apply_generation: int
+    ) -> dict[str, Any]:
+        if (
+            not isinstance(apply_id, str)
+            or not apply_id
+            or len(apply_id.encode("utf-8")) > 256
+            or type(apply_generation) is not int
+            or not 1 <= apply_generation <= _MAXIMUM_SAFE_INTEGER
+        ):
+            raise HeadlessApiError(
+                "manager_apply_status_invalid",
+                "Manager Apply status requires one bounded durable identity",
+            )
+        response = self._exchange(
+            {
+                "api_version": MANAGER_COMMAND_VERSION,
+                "apply_generation": apply_generation,
+                "apply_id": apply_id,
+                "command": "apply_status",
+            }
+        )
+        if response.get("ok") is False:
+            error = response.get("error")
+            if (
+                set(response) != {"api_version", "error", "ok"}
+                or not isinstance(error, dict)
+                or set(error) != {"code", "message"}
+                or not all(
+                    isinstance(error.get(name), str) and error[name]
+                    for name in ("code", "message")
+                )
+            ):
+                raise HeadlessApiError(
+                    "manager_command_response_invalid",
+                    "Manager Apply status rejection is malformed",
+                )
+            return response
+        expected = {
+            "api_version",
+            "apply_generation",
+            "apply_id",
+            "candidate_projection_revision",
+            "error",
+            "ok",
+            "state",
+        }
+        state = response.get("state")
+        candidate = response.get("candidate_projection_revision")
+        if (
+            set(response) != expected
+            or response.get("error") is not None
+            or state not in {"pending", "succeeded"}
+            or (state == "pending" and candidate is not None)
+            or (state == "succeeded" and not isinstance(candidate, dict))
+        ):
+            raise HeadlessApiError(
+                "manager_command_response_invalid",
+                "Manager Apply status response is malformed",
+            )
+        if isinstance(candidate, dict):
+            try:
+                ProjectionRevisionRequest.model_validate(candidate)
+            except (TypeError, ValueError) as error:
+                raise HeadlessApiError(
+                    "manager_command_response_invalid",
+                    "Manager Apply status projection is malformed",
+                ) from error
+        if (
+            response.get("apply_id") != apply_id
+            or response.get("apply_generation") != apply_generation
+        ):
+            raise HeadlessApiError(
+                "manager_command_response_identity_mismatch",
+                "Manager Apply status names another durable operation",
             )
         return response
 

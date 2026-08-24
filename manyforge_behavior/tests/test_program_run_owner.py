@@ -361,6 +361,7 @@ def _fixture(
     )
     admission = ProgramRunAdmission(
         scenario_id="ur5-pick-place",
+        applied_record_digest="sha256:" + "9" * 64,
         scenario_catalog_revision=_DIGEST_A,
         program=program,
         environment=environment,
@@ -498,7 +499,7 @@ def test_start_captures_exact_nondefault_policy_and_immutable_lookup() -> None:
         },
         "operator_stop_policy": "hold",
     }
-    assert "node_policies" not in started.capture.to_dict()
+    assert started.capture.to_dict()["node_policies"] == [policy.to_dict()]
     with pytest.raises(TypeError):
         started.capture.node_policy_by_instance_id[program.tree.instance_id] = policy
     with pytest.raises(TypeError):
@@ -1102,6 +1103,7 @@ def _scenario_selection(admission: ProgramRunAdmission) -> dict[str, Any]:
     environment = admission.environment
     return {
         "schema_version": "manyforge.scenario_program_selection.v2",
+        "applied_record_digest": admission.applied_record_digest,
         "scenario_id": admission.scenario_id,
         "scenario_catalog_revision": admission.scenario_catalog_revision,
         "deployment_artifact_id": "cell_a",
@@ -1183,6 +1185,7 @@ def test_applied_program_join_uses_applied_content_and_fresh_owner_facts() -> No
         for key, value in live.items()
         if key
         not in {
+            "applied_record_digest",
             "assistant_projection",
             "owner_identities",
             "schema_version",

@@ -130,6 +130,7 @@ class _Transport:
 def _context() -> ProgramRunPortContext:
     return ProgramRunPortContext(
         program_run_id="program-run.1",
+        applied_record_digest="sha256:" + "9" * 64,
         scenario_id="lite6_pick_and_place",
         scenario_catalog_revision=_DIGEST_A,
         program_id="lite6_program",
@@ -825,6 +826,7 @@ def _scene_context() -> ProgramRunPortContext:
     ]
     return ProgramRunPortContext(
         program_run_id=value.program_run_id,
+        applied_record_digest=value.applied_record_digest,
         scenario_id=value.scenario_id,
         scenario_catalog_revision=value.scenario_catalog_revision,
         program_id=value.program_id,
@@ -1246,6 +1248,7 @@ def test_three_production_context_ports_rollback_as_one_before_dispatch() -> Non
     base = _scene_context()
     context = ProgramRunPortContext(
         program_run_id=base.program_run_id,
+        applied_record_digest=base.applied_record_digest,
         scenario_id=base.scenario_id,
         scenario_catalog_revision=base.scenario_catalog_revision,
         program_id=base.program_id,

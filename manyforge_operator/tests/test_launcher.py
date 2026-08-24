@@ -48,15 +48,9 @@ def _config(tmp_path: Path) -> NativeLauncherConfig:
     return NativeLauncherConfig(
         source_root=source,
         manager_executable=manager,
-        package_root=package,
+        install_root=package,
         node_catalog_path=node,
         alarm_catalog_path=alarm,
-        publication_root=tmp_path / "publication",
-        manager_state_root=tmp_path / "manager-state",
-        runtime_state_root=tmp_path / "runtime-state",
-        execution_state_root=tmp_path / "execution-state",
-        logical_scene_database=tmp_path / "scene.sqlite3",
-        historian_database_path=tmp_path / "history.sqlite3",
         state_root=tmp_path / "operator-state",
         package_aggregate_sha256=package_aggregate_sha256(package),
         compiler_build_manifest_sha256="b" * 64,
@@ -84,7 +78,7 @@ def test_native_commands_retain_four_owner_entrypoints(tmp_path: Path):
     assert "--port 9010" in commands[1]
     assert "--port 9011" in commands[2]
     expected_liveness = str(
-        config.manager_state_root / "program-runner-liveness.sock"
+        config.manager_run_root / "program-runner-liveness.sock"
     )
     assert (
         specs[0].argv[
@@ -100,13 +94,13 @@ def test_native_commands_retain_four_owner_entrypoints(tmp_path: Path):
     assert "--port 9000" in commands[3]
     assert all("--apply" not in spec.argv and "--run" not in spec.argv for spec in specs)
     assert all(
-        spec.environment["MANYFORGE_FS_ROOTS"] == str(config.package_root)
+        spec.environment["MANYFORGE_FS_ROOTS"] == str(config.install_root)
         for spec in specs[:3]
     )
     assert specs[3].environment == {
         "MANYFORGE_FS_ROOTS": (
             f"{config.source_root / 'examples'},"
-            f"{config.package_root},{config.program_workspace}"
+            f"{config.install_root},{config.program_workspace}"
         ),
         "MANYFORGE_PROGRAM_WRITE_ROOTS": str(config.program_workspace),
     }
@@ -141,8 +135,8 @@ def test_native_ordered_roots_make_examples_the_default_browse_root(
 @pytest.mark.parametrize(
     "field,value",
     [
-        ("package_root", "package,extra"),
-        ("package_root", "package "),
+        ("install_root", "package,extra"),
+        ("install_root", "package "),
         ("state_root", "operator,state"),
         ("instance_id", "native,extra"),
     ],
@@ -232,12 +226,18 @@ def test_native_configuration_rejects_overlapping_composer_roots_without_mutatio
     config = _config(tmp_path)
     state_root = tmp_path / "prospective-state"
     instance_id = "native"
-    prospective_workspace = state_root / instance_id / "program-workspace"
-    package_root = config.package_root
+    prospective_workspace = (
+        state_root / instance_id / "state" / "composer-authoring" /
+        "program-workspace"
+    )
+    package_root = config.install_root
 
     if relationship == "workspace-inside-package":
         state_root = package_root / "operator-state"
-        prospective_workspace = state_root / instance_id / "program-workspace"
+        prospective_workspace = (
+            state_root / instance_id / "state" / "composer-authoring" /
+            "program-workspace"
+        )
     else:
         prospective_workspace.mkdir(parents=True)
         if relationship == "package-inside-workspace":
@@ -263,7 +263,7 @@ def test_native_configuration_rejects_overlapping_composer_roots_without_mutatio
     with pytest.raises(ValueError, match="must be disjoint"):
         replace(
             config,
-            package_root=package_root,
+            install_root=package_root,
             state_root=state_root,
             instance_id=instance_id,
             package_aggregate_sha256=package_before,
@@ -324,16 +324,16 @@ def test_start_records_and_preserves_the_instance_program_workspace(
             },
         )()
 
-    def cleanup(process_records=None, *, manager_state_root=None):
+    def cleanup(process_records=None, *, manager_run_root=None):
         assert process_records is not None
-        assert manager_state_root == config.manager_state_root
+        assert manager_run_root == config.manager_run_root
         assert {int(item["pid"]) for item in process_records.values()} == active_pids
         active_pids.clear()
         return True
 
     monkeypatch.setattr(launcher, "_spawn", spawn)
     monkeypatch.setattr(launcher, "_cleanup_authenticated", cleanup)
-    package_before = package_aggregate_sha256(config.package_root)
+    package_before = package_aggregate_sha256(config.install_root)
 
     first = launcher.start()
     assert first.state is LaunchInstanceState.READY
@@ -375,7 +375,7 @@ def test_start_records_and_preserves_the_instance_program_workspace(
     assert saved.read_text(encoding="utf-8") == (
         "schema_version: manyforge.program.v1\n"
     )
-    assert package_aggregate_sha256(config.package_root) == package_before
+    assert package_aggregate_sha256(config.install_root) == package_before
 
 
 @pytest.mark.parametrize("conflict", ["file", "symlink"])
@@ -453,21 +453,15 @@ def test_native_commands_pass_explicit_composer_static_dir(tmp_path: Path):
 def test_native_configuration_requires_explicit_artifact_digests(tmp_path: Path):
     valid = _config(tmp_path)
     assert valid.package_aggregate_sha256 == package_aggregate_sha256(
-        valid.package_root
+        valid.install_root
     )
     with pytest.raises(ValueError, match="package_aggregate_sha256"):
         NativeLauncherConfig(
             source_root=valid.source_root,
             manager_executable=valid.manager_executable,
-            package_root=valid.package_root,
+            install_root=valid.install_root,
             node_catalog_path=valid.node_catalog_path,
             alarm_catalog_path=valid.alarm_catalog_path,
-            publication_root=valid.publication_root,
-            manager_state_root=valid.manager_state_root,
-            runtime_state_root=valid.runtime_state_root,
-            execution_state_root=valid.execution_state_root,
-            logical_scene_database=valid.logical_scene_database,
-            historian_database_path=valid.historian_database_path,
             state_root=valid.state_root,
             compiler_build_manifest_sha256=valid.compiler_build_manifest_sha256,
             node_environment_sha256=valid.node_environment_sha256,

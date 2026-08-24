@@ -56,6 +56,7 @@ class ProgramRunPortContext:
     """Immutable Applied Program/Binding coordinates used by client ports."""
 
     program_run_id: str
+    applied_record_digest: str
     scenario_id: str
     scenario_catalog_revision: str
     program_id: str
@@ -78,6 +79,7 @@ class ProgramRunPortContext:
             if len(value.encode("utf-8")) > 512:
                 raise ValueError(f"{field_name} exceeds the client-port bound")
         for field_name in (
+            "applied_record_digest",
             "scenario_catalog_revision",
             "program_revision",
             "program_binding_id",

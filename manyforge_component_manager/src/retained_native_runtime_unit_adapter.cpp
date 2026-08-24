@@ -788,6 +788,7 @@ struct RetainedNativeRuntimeUnitAdapter::Impl final
   Impl(std::filesystem::path trusted_installed_target_root,
        std::filesystem::path trusted_package_root,
        std::filesystem::path manager_state_root,
+       std::filesystem::path manager_run_root,
        std::filesystem::path private_staging_root,
        const manyforge::deployment::IVerifiedRetainedBundleSource
            &selected_bundle_source,
@@ -806,6 +807,8 @@ struct RetainedNativeRuntimeUnitAdapter::Impl final
         package_root_fd(OpenPinnedPackageRoot(package_root_path)),
         manager_state_root_path(NormalizedPlainDirectory(
             std::move(manager_state_root), "Manager state root")),
+        manager_run_root_path(NormalizedPlainDirectory(
+            std::move(manager_run_root), "Manager run root")),
         staging_root_path(NormalizedPlainDirectory(
             std::move(private_staging_root), "private native staging root")),
         logical_scene_database_path(std::move(logical_scene_database)),
@@ -1428,7 +1431,7 @@ struct RetainedNativeRuntimeUnitAdapter::Impl final
     const auto launch_arguments =
         admission.launch_arguments(kChildChannelFd, runtime_epoch);
     std::vector<std::string> arguments;
-    arguments.reserve(launch_arguments.size() + 17U);
+    arguments.reserve(launch_arguments.size() + 25U);
     arguments.push_back(admission.installed_target_id());
     arguments.insert(arguments.end(), launch_arguments.begin(),
                      launch_arguments.end());
@@ -1438,6 +1441,8 @@ struct RetainedNativeRuntimeUnitAdapter::Impl final
     arguments.push_back(std::to_string(kChildLivenessChannelFd));
     arguments.emplace_back("--manyforge-managed-manager-state-root");
     arguments.push_back(manager_state_root_path.string());
+    arguments.emplace_back("--manyforge-managed-manager-run-root");
+    arguments.push_back(manager_run_root_path.string());
     arguments.emplace_back("--manyforge-managed-staging-root");
     arguments.push_back(staging_root_path.string());
     arguments.emplace_back("--manyforge-managed-candidate-worker");
@@ -1674,6 +1679,7 @@ struct RetainedNativeRuntimeUnitAdapter::Impl final
   std::filesystem::path package_root_path;
   UniqueFd package_root_fd;
   std::filesystem::path manager_state_root_path;
+  std::filesystem::path manager_run_root_path;
   std::filesystem::path staging_root_path;
   std::filesystem::path logical_scene_database_path;
   std::filesystem::path program_cycle_journal_path;
@@ -1880,6 +1886,7 @@ RetainedNativeRuntimeUnitAdapter::RetainedNativeRuntimeUnitAdapter(
     std::filesystem::path trusted_installed_target_root,
     std::filesystem::path trusted_package_root,
     std::filesystem::path manager_state_root,
+    std::filesystem::path manager_run_root,
     std::filesystem::path private_staging_root,
     const manyforge::deployment::IVerifiedRetainedBundleSource &bundle_source,
     const manyforge::deployment::IVerifiedRetainedProductArtifactSource
@@ -1891,7 +1898,8 @@ RetainedNativeRuntimeUnitAdapter::RetainedNativeRuntimeUnitAdapter(
     : RetainedNativeRuntimeUnitAdapter(
           std::move(trusted_installed_target_root),
           std::move(trusted_package_root), std::move(manager_state_root),
-          std::move(private_staging_root), bundle_source, artifact_source,
+          std::move(manager_run_root), std::move(private_staging_root),
+          bundle_source, artifact_source,
           std::move(operating_system),
           std::vector<std::string>{std::move(launch_environment_contract)},
           std::move(logical_scene_database), std::move(program_cycle_journal),
@@ -1901,6 +1909,7 @@ RetainedNativeRuntimeUnitAdapter::RetainedNativeRuntimeUnitAdapter(
     std::filesystem::path trusted_installed_target_root,
     std::filesystem::path trusted_package_root,
     std::filesystem::path manager_state_root,
+    std::filesystem::path manager_run_root,
     std::filesystem::path private_staging_root,
     const manyforge::deployment::IVerifiedRetainedBundleSource &bundle_source,
     const manyforge::deployment::IVerifiedRetainedProductArtifactSource
@@ -1913,7 +1922,8 @@ RetainedNativeRuntimeUnitAdapter::RetainedNativeRuntimeUnitAdapter(
     : impl_(std::make_shared<Impl>(
           std::move(trusted_installed_target_root),
           std::move(trusted_package_root), std::move(manager_state_root),
-          std::move(private_staging_root), bundle_source, artifact_source,
+          std::move(manager_run_root), std::move(private_staging_root),
+          bundle_source, artifact_source,
           std::move(operating_system),
           std::move(launch_environment_contracts),
           std::move(logical_scene_database), std::move(program_cycle_journal),

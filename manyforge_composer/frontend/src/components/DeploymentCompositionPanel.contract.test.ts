@@ -13,6 +13,7 @@ describe('DeploymentCompositionPanel Apply contract', () => {
     expect(source).toContain('Manager accepted Apply');
     expect(source).toContain('remains pending after bounded observation');
     expect(source).toContain('api.manager.apply(exactRequest, signal)');
+    expect(source).toContain('api.manager.applyStatus(applyId, applyGeneration, signal)');
     expect(source).not.toContain('api.programRun');
     expect(source).not.toContain('/api/program/runs');
   });

@@ -14,7 +14,7 @@ from typing import Any, Final, Iterator
 from .liveness import RetainedLiveness
 
 
-SCHEMA_VERSION: Final = 1
+SCHEMA_VERSION: Final = 2
 STATES: Final = frozenset(
     {
         "idle_after_reset",
@@ -58,10 +58,14 @@ class ProgramCycleJournal:
         *,
         owner_epoch: str,
         maximum_requests: int = 4_096,
+        maximum_retained_runs: int = 4_096,
     ) -> None:
         if not 1 <= maximum_requests <= 4_096:
             raise ValueError("maximum_requests must be in [1, 4096]")
         self._maximum_requests = maximum_requests
+        if not 1 <= maximum_retained_runs <= 4_096:
+            raise ValueError("maximum_retained_runs must be in [1, 4096]")
+        self._maximum_retained_runs = maximum_retained_runs
         self._lock = RLock()
         path.parent.mkdir(parents=True, exist_ok=True)
         self._database = sqlite3.connect(
@@ -74,7 +78,7 @@ class ProgramCycleJournal:
             """
             CREATE TABLE IF NOT EXISTS program_cycle_metadata (
               singleton INTEGER PRIMARY KEY CHECK(singleton=1),
-              schema_version INTEGER NOT NULL CHECK(schema_version=1)
+              schema_version INTEGER NOT NULL CHECK(schema_version=2)
             );
             CREATE TABLE IF NOT EXISTS program_cycle (
               singleton INTEGER PRIMARY KEY CHECK(singleton=1),
@@ -112,6 +116,12 @@ class ProgramCycleJournal:
             );
             INSERT OR IGNORE INTO program_runner_liveness
             VALUES(1,NULL,NULL,0,NULL);
+            CREATE TABLE IF NOT EXISTS program_run_history (
+              program_run_id TEXT PRIMARY KEY,
+              run_revision INTEGER NOT NULL CHECK(run_revision>0),
+              snapshot_json TEXT NOT NULL,
+              terminal INTEGER NOT NULL CHECK(terminal IN (0,1))
+            );
             """
         )
         columns = {
@@ -137,6 +147,11 @@ class ProgramCycleJournal:
                 "INSERT OR IGNORE INTO program_cycle_metadata VALUES(1,?)",
                 (SCHEMA_VERSION,),
             )
+            metadata = self._database.execute(
+                "SELECT schema_version FROM program_cycle_metadata WHERE singleton=1"
+            ).fetchone()
+            if metadata != (SCHEMA_VERSION,):
+                raise RuntimeError("Program-cycle journal schema is unsupported")
             created = self._database.execute(
                 """
                 INSERT OR IGNORE INTO program_cycle
@@ -418,6 +433,7 @@ class ProgramCycleJournal:
         program_run_id: str | None = None,
         claim: Mapping[str, Any] | None = None,
         capture_identities: Mapping[str, Any] | None = None,
+        run_snapshot: Mapping[str, Any] | None = None,
         terminal_reference: str | None = None,
         reconciliation_required: bool = False,
     ) -> None:
@@ -451,6 +467,90 @@ class ProgramCycleJournal:
             ).rowcount
             if changed != 1:
                 raise RuntimeError("Program-cycle transition is stale")
+            if run_snapshot is not None:
+                self._retain_run_snapshot_locked(run_snapshot)
+
+    @staticmethod
+    def _run_snapshot_identity(snapshot: Mapping[str, Any]) -> tuple[str, int]:
+        capture = snapshot.get("capture")
+        program_run_id = (
+            capture.get("program_run_id") if isinstance(capture, Mapping) else None
+        )
+        revision = snapshot.get("run_revision")
+        if (
+            not isinstance(program_run_id, str)
+            or not program_run_id
+            or type(revision) is not int
+            or revision < 1
+        ):
+            raise ValueError("Program-run history snapshot has invalid identity")
+        return program_run_id, revision
+
+    def _retain_run_snapshot_locked(self, snapshot: Mapping[str, Any]) -> None:
+        program_run_id, revision = self._run_snapshot_identity(snapshot)
+        encoded = self._dump(snapshot)
+        assert encoded is not None
+        terminal = snapshot.get("state") in {"stopped", "succeeded", "failed"}
+        existing = self._database.execute(
+            "SELECT run_revision,snapshot_json,terminal FROM program_run_history "
+            "WHERE program_run_id=?",
+            (program_run_id,),
+        ).fetchone()
+        if existing is None:
+            count = self._database.execute(
+                "SELECT COUNT(*) FROM program_run_history"
+            ).fetchone()
+            if count is None or count[0] >= self._maximum_retained_runs:
+                raise OverflowError("Program-run durable history is full")
+            self._database.execute(
+                "INSERT INTO program_run_history VALUES(?,?,?,?)",
+                (program_run_id, revision, encoded, int(terminal)),
+            )
+            return
+        if existing[2] and encoded != existing[1]:
+            raise RuntimeError("terminal Program-run history is immutable")
+        if revision < existing[0] or (
+            revision == existing[0] and encoded != existing[1]
+        ):
+            raise RuntimeError("Program-run history revision is divergent")
+        if revision > existing[0]:
+            self._database.execute(
+                "UPDATE program_run_history SET run_revision=?,snapshot_json=?,terminal=? "
+                "WHERE program_run_id=?",
+                (revision, encoded, int(terminal), program_run_id),
+            )
+
+    def retain_run_snapshot(self, snapshot: Mapping[str, Any]) -> None:
+        with self._transaction():
+            self._retain_run_snapshot_locked(snapshot)
+
+    def require_run_history_capacity(self) -> None:
+        with self._lock:
+            count = self._database.execute(
+                "SELECT COUNT(*) FROM program_run_history"
+            ).fetchone()
+        if count is None or count[0] >= self._maximum_retained_runs:
+            raise OverflowError("Program-run durable history is full")
+
+    def read_run_snapshot(self, program_run_id: str) -> dict[str, Any] | None:
+        with self._lock:
+            row = self._database.execute(
+                "SELECT snapshot_json FROM program_run_history WHERE program_run_id=?",
+                (program_run_id,),
+            ).fetchone()
+        return None if row is None else self._load(row[0])
+
+    def list_run_snapshots(self, *, limit: int) -> tuple[list[dict[str, Any]], bool]:
+        if type(limit) is not int or not 1 <= limit <= self._maximum_retained_runs:
+            raise ValueError("Program-run history limit is invalid")
+        with self._lock:
+            rows = self._database.execute(
+                "SELECT snapshot_json FROM program_run_history "
+                "ORDER BY program_run_id LIMIT ?",
+                (limit + 1,),
+            ).fetchall()
+        values = [self._load(row[0]) for row in rows[:limit]]
+        return [value for value in values if value is not None], len(rows) > limit
 
     def observe_terminal(
         self,
@@ -458,6 +558,7 @@ class ProgramCycleJournal:
         expected_generation: int,
         program_run_id: str,
         terminal_reference: str,
+        snapshot: Mapping[str, Any],
     ) -> bool:
         """Record one exact terminal fact, idempotently across observer races."""
         with self._transaction():
@@ -475,9 +576,11 @@ class ProgramCycleJournal:
             if state == "terminal_awaiting_reset":
                 if current_reference != terminal_reference:
                     raise RuntimeError("terminal Program-cycle evidence conflicts")
+                self._retain_run_snapshot_locked(snapshot)
                 return False
             if state not in {"running", "stopping"}:
                 return False
+            self._retain_run_snapshot_locked(snapshot)
             changed = self._database.execute(
                 """
                 UPDATE program_cycle

@@ -276,6 +276,37 @@ def test_disconnected_client_does_not_block_another_current_client(tmp_path) -> 
     assert len(headless.settlements) == 1
 
 
+def test_snapshot_rotation_after_claim_releases_proven_no_effect(tmp_path) -> None:
+    headless = _Headless()
+    coordinator = AuthoringAdmissionCoordinator(headless, tmp_path)  # type: ignore[arg-type]
+    coordinator.recover()
+    _publish(coordinator, "client-a")
+    effects: list[str] = []
+    acquire = headless.acquire_authoring_transaction
+
+    def acquire_while_snapshot_rotates(body: dict[str, Any]) -> dict[str, Any]:
+        result = acquire(body)
+        _publish(coordinator, "client-a", sequence=2)
+        return result
+
+    headless.acquire_authoring_transaction = acquire_while_snapshot_rotates  # type: ignore[method-assign]
+    with pytest.raises(HTTPException) as stale:
+        coordinator.execute(
+            _envelope(coordinator, "client-a"),
+            operation_kind="save_draft",
+            draft_id="draft.1",
+            draft_revision=3,
+            payload={"operation": "save"},
+            effect=lambda _claim: effects.append("save"),
+            post_image=lambda: {},
+        )
+
+    assert stale.value.detail["code"] == "authoring_client_snapshot_stale"
+    assert effects == []
+    assert coordinator.mutation_ready
+    assert headless.settlements[0]["settlement_kind"] == "proven_no_effect"
+
+
 def test_successor_recovers_lost_acquire_only_from_exact_claim(tmp_path) -> None:
     transaction, claim = _durable_transaction(tmp_path)
     headless = _RecoveryHeadless(

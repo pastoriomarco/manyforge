@@ -162,7 +162,9 @@ AlarmSnapshotOrdering ParseOrdering(const std::string_view ordering) {
 
 class HeadlessApiBridge final {
 public:
-  HeadlessApiBridge(std::string publication_root, std::string package_root,
+  HeadlessApiBridge(std::string projection_root, std::string install_root,
+                    std::string artifact_root,
+                    std::string program_selection_state_root,
                     std::string node_catalog_path,
                     std::string alarm_catalog_path,
                     std::string historian_database_path, std::string cell_id,
@@ -173,8 +175,10 @@ public:
                     const std::size_t historian_record_retention,
                     const std::size_t mutation_replay_capacity)
       : core_(std::make_unique<HeadlessApiCore>(HeadlessApiCoreConfig{
-            std::move(publication_root),
-            std::move(package_root),
+            std::move(projection_root),
+            std::move(install_root),
+            std::move(artifact_root),
+            std::move(program_selection_state_root),
             std::move(node_catalog_path),
             std::move(alarm_catalog_path),
             std::move(historian_database_path),
@@ -240,15 +244,19 @@ public:
 
   std::string CommitProgramApply(
       std::string canonical_preparation_json,
-      std::optional<std::string> expected_applied_record_digest) {
+      std::optional<std::string> expected_applied_record_digest,
+      std::string request_owner_epoch, std::string request_id) {
     py::gil_scoped_release release;
     return Invoke(
         [this,
          canonical_preparation_json = std::move(canonical_preparation_json),
          expected_applied_record_digest =
-             std::move(expected_applied_record_digest)]() {
+             std::move(expected_applied_record_digest),
+         request_owner_epoch = std::move(request_owner_epoch),
+         request_id = std::move(request_id)]() {
           return core_->CommitProgramApply(canonical_preparation_json,
-                                           expected_applied_record_digest);
+                                           expected_applied_record_digest,
+                                           request_owner_epoch, request_id);
         });
   }
 
@@ -507,10 +515,13 @@ PYBIND11_MODULE(manyforge_headless_py, module) {
       "Thin binding over the C++ ManyForge headless runtime API core";
   py::class_<HeadlessApiBridge>(module, "HeadlessApiCore")
       .def(py::init<std::string, std::string, std::string, std::string,
-                    std::string, std::string, std::vector<std::string>,
-                    std::string, std::optional<std::string>, std::uint64_t,
-                    std::size_t, std::size_t, std::size_t>(),
-           py::arg("publication_root"), py::arg("package_root"),
+                    std::string, std::string, std::string, std::string,
+                    std::vector<std::string>, std::string,
+                    std::optional<std::string>, std::uint64_t, std::size_t,
+                    std::size_t, std::size_t>(),
+           py::arg("projection_root"), py::arg("install_root"),
+           py::arg("artifact_root"),
+           py::arg("program_selection_state_root"),
            py::arg("node_catalog_path"), py::arg("alarm_catalog_path"),
            py::arg("historian_database_path"), py::arg("cell_id"),
            py::arg("resource_ids"), py::arg("owner_id"),
@@ -533,7 +544,8 @@ PYBIND11_MODULE(manyforge_headless_py, module) {
            py::arg("canonical_program_json"))
       .def("commit_program_apply", &HeadlessApiBridge::CommitProgramApply,
            py::arg("canonical_preparation_json"),
-           py::arg("expected_applied_record_digest") = std::nullopt)
+           py::arg("expected_applied_record_digest"),
+           py::arg("request_owner_epoch"), py::arg("request_id"))
       .def("applied_program_selection",
            &HeadlessApiBridge::AppliedProgramSelection)
       .def("viewer_model_urdf", &HeadlessApiBridge::ViewerModelUrdf)

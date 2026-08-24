@@ -137,15 +137,9 @@ class RemoteNativeConfig:
     target: str = DEFAULT_RUNTIME_HOST
     source_root: str = "/mnt/nova_ssd/codex-manyforge/runners/manyforge"
     manager_executable: str = ""
-    package_root: str = ""
+    install_root: str = ""
     node_catalog_path: str = ""
     alarm_catalog_path: str = ""
-    publication_root: str = ""
-    manager_state_root: str = ""
-    runtime_state_root: str = ""
-    execution_state_root: str = ""
-    logical_scene_database: str = ""
-    historian_database_path: str = ""
     state_root: str = ""
     composer_static_dir: str = ""
     canonical_empty_admission_filename: str = "canonical-empty-admission.json"
@@ -166,15 +160,9 @@ class RemoteNativeConfig:
         required_paths = (
             "source_root",
             "manager_executable",
-            "package_root",
+            "install_root",
             "node_catalog_path",
             "alarm_catalog_path",
-            "publication_root",
-            "manager_state_root",
-            "runtime_state_root",
-            "execution_state_root",
-            "logical_scene_database",
-            "historian_database_path",
             "state_root",
             "simulation_control_config",
             "bridge_state_root",
@@ -667,15 +655,9 @@ class IsaacLauncher:
                 *global_args, "start", "--profile", "native",
                 "--source-root", remote.source_root,
                 "--manager-executable", remote.manager_executable,
-                "--package-root", remote.package_root,
+                "--install-root", remote.install_root,
                 "--node-catalog-path", remote.node_catalog_path,
                 "--alarm-catalog-path", remote.alarm_catalog_path,
-                "--publication-root", remote.publication_root,
-                "--manager-state-root", remote.manager_state_root,
-                "--runtime-state-root", remote.runtime_state_root,
-                "--execution-state-root", remote.execution_state_root,
-                "--logical-scene-database", remote.logical_scene_database,
-                "--historian-database-path", remote.historian_database_path,
                 "--canonical-empty-admission-filename", remote.canonical_empty_admission_filename,
                 "--cell-id", remote.cell_id,
                 "--advertised-host", remote.advertised_host,
@@ -731,7 +713,7 @@ class IsaacLauncher:
                 package_aggregate_sha256=remote.package_aggregate_sha256,
                 compiler_build_manifest_sha256=remote.compiler_build_manifest_sha256,
                 node_environment_sha256=remote.node_environment_sha256,
-                install_root=remote.package_root,
+                install_root=remote.install_root,
             ),
             RuntimeArtifactIdentity(
                 host_id="simulator", kind=ArtifactKind.MOUNTED_INSTALL,

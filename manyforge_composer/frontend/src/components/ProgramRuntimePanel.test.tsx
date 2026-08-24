@@ -80,6 +80,7 @@ function controller(
         state,
         capture: {
           programRunId: 'program-run.1',
+          appliedRecordDigest: `sha256:${'d'.repeat(64)}`,
           scenarioId: 'cell-pick',
           scenarioCatalogRevision: `sha256:${'a'.repeat(64)}`,
           programId: 'pick',
@@ -88,6 +89,8 @@ function controller(
           retainedBundleId: `sha256:${'a'.repeat(64)}`,
           graphRevision: `sha256:${'b'.repeat(64)}`,
           nodeEnvironmentDigest: `sha256:${'c'.repeat(64)}`,
+          nodePolicies: [],
+          nodePolicyDigest: 'sha256:4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945',
           ownerIdentities: [{
             ownerRole: 'program_runner',
             ownerId: 'program-runner.cell-a',

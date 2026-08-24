@@ -47,12 +47,16 @@ def _parser() -> argparse.ArgumentParser:
     serve = subcommands.add_parser("serve", help="start the independent H0 API")
     serve.add_argument("--host", default="127.0.0.1")
     serve.add_argument("--port", type=int, default=9010)
-    serve.add_argument("--publication-root", type=Path, required=True)
-    serve.add_argument("--package-root", type=Path, required=True)
+    serve.add_argument("--projection-root", type=Path, required=True)
+    serve.add_argument("--install-root", type=Path, required=True)
+    serve.add_argument("--artifact-root", type=Path, required=True)
+    serve.add_argument(
+        "--program-selection-state-root", type=Path, required=True
+    )
     serve.add_argument("--node-catalog-path", type=Path, required=True)
     serve.add_argument("--alarm-catalog-path", type=Path, required=True)
     serve.add_argument("--historian-database-path", type=Path, required=True)
-    serve.add_argument("--manager-state-root", type=Path, required=True)
+    serve.add_argument("--manager-run-root", type=Path, required=True)
     serve.add_argument("--execution-state-root", type=Path, required=True)
     serve.add_argument("--cclc-state-root", type=Path)
     serve.add_argument("--cell-id", required=True)
@@ -165,12 +169,14 @@ def _caller(args: argparse.Namespace) -> dict[str, Any]:
 
 def _serve(args: argparse.Namespace) -> int:
     config = HeadlessApiConfig(
-        publication_root=args.publication_root,
-        package_root=args.package_root,
+        projection_root=args.projection_root,
+        install_root=args.install_root,
+        artifact_root=args.artifact_root,
+        program_selection_state_root=args.program_selection_state_root,
         node_catalog_path=args.node_catalog_path,
         alarm_catalog_path=args.alarm_catalog_path,
         historian_database_path=args.historian_database_path,
-        manager_state_root=args.manager_state_root,
+        manager_run_root=args.manager_run_root,
         execution_state_root=args.execution_state_root,
         cclc_state_root=args.cclc_state_root,
         cell_id=args.cell_id,
