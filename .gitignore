@@ -29,3 +29,4 @@ qualification/
 
 # Bridge per-tool audit log (state-dir by default; never commit)
 manyforge_assistant_bridge/audit.log*
+.manyforge-dev/

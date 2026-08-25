@@ -215,6 +215,8 @@ class HeadlessCorePort(Protocol):
 
     def scenario_program_selection(self, scenario_id: str) -> dict[str, Any]: ...
 
+    def scenario_load_selection(self, scenario_id: str) -> dict[str, Any]: ...
+
     def prepare_program_apply(
         self,
         scenario_id: str,
@@ -599,6 +601,12 @@ class NativeHeadlessCore:
         return self._require_object(
             self._invoke("scenario_program_selection", scenario_id),
             method="scenario_program_selection",
+        )
+
+    def scenario_load_selection(self, scenario_id: str) -> dict[str, Any]:
+        return self._require_object(
+            self._invoke("scenario_load_selection", scenario_id),
+            method="scenario_load_selection",
         )
 
     @staticmethod

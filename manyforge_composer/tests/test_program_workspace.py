@@ -627,7 +627,10 @@ def test_routes_reject_unsupported_mutation_malformed_body_and_unavailable_load(
     )
     assert malformed.status_code == 422
     legacy_load = client.post("/api/program/load", json={})
-    assert legacy_load.status_code == 422
+    assert legacy_load.status_code == 410
+    assert legacy_load.json()["detail"]["code"] == (
+        "program_load_removed_use_scenario_load"
+    )
     invalid_save_as = client.post(
         "/api/program/save-as",
         json={**_fence(workspace), "path": "/", "confirmOverwrite": False},

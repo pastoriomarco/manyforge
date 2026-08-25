@@ -465,6 +465,30 @@ class HeadlessHttpClient:
             ) from error
         return projection
 
+    def scenario_load_selection(self, scenario_id: str) -> dict[str, Any]:
+        if (
+            not isinstance(scenario_id, str)
+            or not scenario_id
+            or len(scenario_id.encode("utf-8")) > 128
+        ):
+            raise ValueError("scenario_id is invalid")
+        projection = self.request(
+            "GET",
+            f"/api/scenarios/{quote(scenario_id, safe='')}/load-selection",
+        )
+        try:
+            validate_scenario_program_selection(
+                projection,
+                scenario_id=scenario_id,
+                label="scenario_load_selection",
+            )
+        except (ProgramBindingTransportError, TypeError, ValueError) as error:
+            raise HeadlessClientError(
+                "scenario_program_selection_invalid",
+                "headless API returned an invalid Scenario Load selection",
+            ) from error
+        return projection
+
     def program_applied(self) -> dict[str, Any]:
         projection = self.request("GET", "/api/program/applied")
         try:

@@ -468,6 +468,45 @@ describe('structural API client', () => {
       (fetchMock.mock.calls[2]?.[1] as RequestInit).body,
     ))).toEqual(currentFence);
   });
+
+  it('loads a complete Scenario without a Program file path', async () => {
+    const fetchMock = vi.fn().mockResolvedValueOnce(response({
+      status: 'loaded',
+      headless: {
+        managerApply: null,
+        programApply: null,
+        scenario: {
+          deployment_artifact_id: 'lite6_lite_gripper_pick_and_place',
+          deployment_revision: `sha256:${'d'.repeat(64)}`,
+          graph_revision: `sha256:${'e'.repeat(64)}`,
+          program_binding_id: `sha256:${'f'.repeat(64)}`,
+          program_id: 'lite6_lite_gripper_pick_and_place',
+          program_revision: `sha256:${'a'.repeat(64)}`,
+          retained_bundle_id: `sha256:${'b'.repeat(64)}`,
+          scenario_catalog_revision: `sha256:${'c'.repeat(64)}`,
+          scenario_id: 'lite6_pick_and_place',
+        },
+      },
+      workspace: workspaceFixture(),
+    }));
+    vi.stubGlobal('fetch', fetchMock);
+
+    await api.programWorkspace.loadScenario(
+      draftFence(),
+      'lite6_pick_and_place',
+      `sha256:${'c'.repeat(64)}`,
+      true,
+    );
+
+    const [url, options] = fetchMock.mock.calls[0] as [string, RequestInit];
+    expect(url).toBe('/api/scenarios/load');
+    expect(JSON.parse(String(options.body))).toEqual({
+      ...draftFence(),
+      scenarioId: 'lite6_pick_and_place',
+      scenarioCatalogRevision: `sha256:${'c'.repeat(64)}`,
+      confirmDiscard: true,
+    });
+  });
 });
 
 describe('resolveStructuralAssetUrl', () => {

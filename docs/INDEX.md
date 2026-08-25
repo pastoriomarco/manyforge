@@ -1,11 +1,12 @@
 # ManyForge Runtime Documentation Index
 
 This index covers documentation that travels with the implementation
-repository: current structural inspection plus historical install, operation,
-and integration references. **The maintained ManyForge-only native product path
-is restored through its explicit Manager, Headless, Program-runner, and thin
-Composer entrypoints; no packaged or historical aggregate product bring-up is
-currently supported.** When a lane is restored, its public operator
+repository: the current simulated native development workbench plus historical
+install, operation, and integration references. **The maintained
+ManyForge-only native product path is restored through its explicit Manager,
+Headless, Program-runner, and thin Composer entrypoints; no installed package
+or historical aggregate product bring-up is currently supported.** When a lane
+is restored, its public operator
 documentation must remain self-contained here. Maintainers can also follow the
 "Development / spec references" section at the bottom.
 
@@ -36,7 +37,7 @@ branch/commit workflow).
 
 | Task                                          | Start here                                                                                                                                                                                                                            |
 | --------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Start the structural Composer shell           | `../scripts/compose-dev.sh`; catalog/files/URDF/health only                                                                                                                                                                           |
+| Start the current development workbench       | [`operations/DEVELOPMENT_WORKBENCH.md`](operations/DEVELOPMENT_WORKBENCH.md); maintained qualified package, simulated native execution, HMR-enabled frontend                                                                         |
 | Study former stack workflows                  | [`operations/LAUNCHER_QUICKSTART.md`](operations/LAUNCHER_QUICKSTART.md), marked historical                                                                                                                                           |
 | Study historical runtime diagnosis            | [`operations/TROUBLESHOOTING.md`](operations/TROUBLESHOOTING.md) and [`operations/OBSERVABILITY.md`](operations/OBSERVABILITY.md)                                                                                                     |
 | Study historical stop/recovery controls       | [`operations/STOP_PROFILES.md`](operations/STOP_PROFILES.md)                                                                                                                                                                          |
@@ -47,6 +48,11 @@ branch/commit workflow).
 | Integrate the current headless API            | Generated [`reference/HEADLESS_REST_API.md`](reference/HEADLESS_REST_API.md); bounded addressed execution/preview and the maintained native Program path are current, while packaged/Isaac/real product readiness remains unavailable |
 
 ## Historical operator runbooks (`docs/operations/`)
+
+The current development-only runbook is
+[`operations/DEVELOPMENT_WORKBENCH.md`](operations/DEVELOPMENT_WORKBENCH.md).
+It is intentionally separate from installed operator startup, which remains a
+later product gate.
 
 These runbooks preserve workflow and qualification intent for later
 restoration. They do not describe currently available products, and their

@@ -334,12 +334,8 @@ GET /api/scene/urdf/manifest
 Smoke-test script for a new robot:
 
 ```bash
-# 1) Load
-curl -sX POST http://localhost:9000/api/program/load \
-  -H 'Content-Type: application/json' \
-  -d '{"path":"/workspace/examples/<scenario>.program.yaml",
-       "deploymentPath":"/workspace/examples/<scenario>.deployment.yaml",
-       "forceDiscardOverrides": true}'
+# 1) Load the retained Scenario through Composer's Load Scenario action.
+#    Program-only Open is an editor action and does not activate a Deployment.
 
 # 2) Commandable joints (should equal SRDF planning group)
 curl -s http://localhost:9000/api/scene/state \

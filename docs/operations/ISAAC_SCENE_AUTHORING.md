@@ -171,8 +171,10 @@ cd ${MANYFORGE_REPO_ROOT}
 ./scripts/launch.sh   # interactive wizard; pick the isaac-sim lane
 ```
 
-Once Composer is up, load your program (`POST /api/program/load` or
-through the UI). Confirm three things:
+Once Composer is up, use **Load Scenario** in the UI for the retained Scenario
+that binds this Program and Deployment. Use **Open** only when intentionally
+editing a Program without changing the current backend Scenario. Confirm three
+things:
 
 1. **`/api/scene/state` reports each object** with the right pose and
    non-error `mesh_asset_status`.

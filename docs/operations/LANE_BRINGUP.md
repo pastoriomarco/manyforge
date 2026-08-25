@@ -282,16 +282,11 @@ until curl -sf http://127.0.0.1:9000/api/health | grep -q '"status":"ok"'; do sl
 echo "composer ready"
 ```
 
-**Load the scenario program** (a fresh composer starts with `program: none`). This
-is REQUIRED for the openclaw provisioner and the `/api/assistant/modes/composer-assistant`
-manifest endpoint — both 404 without a loaded program. (The smoke runner loads a
-program per case, so the direct/hermes *smoke* works without this, but load it anyway
-for a sane initial state matching `launch.sh --scenario`.)
+**Load the retained Scenario.** Use Composer's Load Scenario action so the
+exact Deployment converges before its bound Program is Applied. Program-only
+Open is intentionally editor-only and is not a substitute for lane activation.
 
 ```bash
-curl -sf -X POST http://127.0.0.1:9000/api/program/load \
-  -H 'Content-Type: application/json' \
-  --data-binary '{"path":"/workspace/examples/pick_and_place_ur10e_robotiq.program.yaml","deploymentPath":"/workspace/examples/assistant_modes_scene_authoring.deployment.yaml","forceDiscardOverrides":true}'
 # verify the manifest endpoint now answers:
 curl -sf http://127.0.0.1:9000/api/assistant/modes/composer-assistant | python3 -c 'import sys,json;print("catalogHash",json.load(sys.stdin)["catalogHash"][:16])'
 ```

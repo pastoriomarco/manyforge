@@ -163,7 +163,7 @@ def test_composer_bounds_callback_bodies_without_narrowing_other_routes() -> Non
     assert response.json()["detail"]["code"] == ("composer_request_body_oversized")
 
     retained_route = client.post(
-        "/api/program/load",
+        "/api/scenarios/load",
         content=b"x" * (1024 * 1024 + 1),
         headers={"content-type": "application/json"},
     )

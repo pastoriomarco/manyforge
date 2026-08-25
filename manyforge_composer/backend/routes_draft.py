@@ -8,7 +8,6 @@ from contextvars import ContextVar
 from functools import wraps
 from pathlib import Path
 from typing import Any, NoReturn
-import uuid
 
 from fastapi import APIRouter, HTTPException
 from fastapi.responses import JSONResponse
@@ -99,9 +98,6 @@ _POLICY_MUTATION_API_VERSION = "manyforge.composer_draft_mutation.v1"
 _ACTIVE_AUTHORING_CLAIM: ContextVar[dict[str, Any] | None] = ContextVar(
     "active_authoring_claim", default=None
 )
-_ACTIVE_EFFECT_INTENT: ContextVar[dict[str, Any] | None] = ContextVar(
-    "active_authoring_effect_intent", default=None
-)
 
 
 class _DraftFence(BaseModel):
@@ -183,8 +179,7 @@ class RevertDraftRequest(_DraftFence):
     pass
 
 
-class LoadProgramRequest(ApplyDraftRequest):
-    path: str = Field(min_length=1, max_length=4096)
+class LoadScenarioRequest(ApplyDraftRequest):
     confirm_discard: bool = Field(default=False, alias="confirmDiscard")
 
 
@@ -556,64 +551,6 @@ def create_draft_router(state: ComposerState) -> APIRouter:
                     "post_state": pre_state,
                 }
             )
-        elif operation_kind == "load_program":
-            assert isinstance(body, LoadProgramRequest)
-            state.draft_session.require_replace_allowed(
-                draft_id=body.draft_id,
-                expected_revision=body.expected_draft_revision,
-                discard_changes=body.confirm_discard,
-            )
-            program, source_path = load_program_artifact(
-                body.path,
-                allowed_roots=state.allowed_fs_roots,
-                catalog=_active_catalog(state),
-            )
-            applied = retained_applied_context()
-            reason = applied.get("reason")
-            if (
-                applied["available"] is False
-                and isinstance(reason, dict)
-                and reason.get("code") != "program_applied_selection_not_found"
-            ):
-                raise DraftSessionError(
-                    reason["code"],
-                    reason["message"],
-                    status_code=(
-                        404
-                        if reason["code"]
-                        == "program_applied_selection_not_found"
-                        else 502
-                        if reason["code"]
-                        == "program_applied_selection_invalid"
-                        else 503
-                    ),
-                )
-            post_state = {
-                "schema_version": pre_state["schema_version"],
-                "draft_id": f"draft-{uuid.uuid4().hex}",
-                "draft_revision": 1,
-                "program": program.to_dict(),
-                "saved_path": source_path,
-                "saved_program_revision": program.program_revision,
-                "saved_document": program.to_dict(),
-            }
-            prepared.update(
-                {
-                    "effect_class": "external",
-                    "external_kind": "load_program",
-                    "program_document": program.to_dict(),
-                    "source_path": source_path,
-                    "scenario_id": body.scenario_id,
-                    "scenario_catalog_revision": body.scenario_catalog_revision,
-                    "expected_applied_record_digest": (
-                        applied.get("record_digest")
-                        if applied["available"] is True
-                        else None
-                    ),
-                    "applied_context": applied,
-                    "post_state": post_state,
-                }
-            )
         elif operation_kind == "revert_draft":
             saved = pre_state["saved_document"]
             if saved is None:
@@ -683,11 +620,9 @@ def create_draft_router(state: ComposerState) -> APIRouter:
 
         def execute_effect(claim: dict[str, Any]):
             token = _ACTIVE_AUTHORING_CLAIM.set(claim)
-            effect_token = _ACTIVE_EFFECT_INTENT.set(prepared)
             try:
                 return effect(claim)
             finally:
-                _ACTIVE_EFFECT_INTENT.reset(effect_token)
                 _ACTIVE_AUTHORING_CLAIM.reset(token)
 
         try:
@@ -719,12 +654,6 @@ def create_draft_router(state: ComposerState) -> APIRouter:
         if claim is None:
             raise RuntimeError("authoring claim context is absent")
         return claim
-
-    def active_effect_intent() -> dict[str, Any]:
-        intent = _ACTIVE_EFFECT_INTENT.get()
-        if intent is None:
-            raise RuntimeError("authoring effect intent context is absent")
-        return intent
 
     @router.get("/api/program/draft")
     def read_draft() -> dict[str, Any]:
@@ -917,79 +846,31 @@ def create_draft_router(state: ComposerState) -> APIRouter:
         except Exception as error:
             _raise_workspace_error(error)
 
-    @router.post("/api/program/load")
-    @authoring_gate
-    def load_program(body: LoadProgramRequest) -> JSONResponse:
+    @router.post("/api/scenarios/load")
+    def load_scenario(body: LoadScenarioRequest) -> JSONResponse:
         try:
-            prepared = active_effect_intent()
-            context, reason = _applied_context(state)
-            if (
-                reason is not None
-                and reason["code"] != "program_applied_selection_not_found"
-            ):
-                raise DraftSessionError(
-                    reason["code"],
-                    reason["message"],
-                    status_code=503,
-                )
-
-            def apply_loaded(program: Program) -> dict[str, Any]:
-                result = _apply_program(
-                    state,
-                    program=program,
-                    scenario_id=body.scenario_id,
-                    scenario_catalog_revision=body.scenario_catalog_revision,
-                    expected_applied_record_digest=(
-                        context.record_digest if context is not None else None
-                    ),
-                    authoring_claim=active_authoring_claim(),
-                )
-                selected, selected_reason = _applied_context(state)
-                applied = result["applied"]
-                if (
-                    selected_reason is not None
-                    or selected is None
-                    or selected.program_document != program.to_dict()
-                    or selected.projection_document != applied
-                    or selected.record_digest
-                    != applied["source"]["record_digest"]
-                ):
-                    raise DraftSessionError(
-                        "program_apply_selection_stale",
-                        "Applied Program changed before Load could commit its "
-                        "local Draft and Saved identities",
-                        status_code=409,
-                    )
-                return result
-
-            result, _snapshot = state.draft_session.load_and_apply_program(
-                draft_id=body.draft_id,
-                expected_revision=body.expected_draft_revision,
-                discard_changes=body.confirm_discard,
-                current_applied_program_revision=(
-                    context.program_revision if context is not None else None
-                ),
-                loader=lambda: (
-                    Program.from_dict(
-                        deepcopy(prepared["program_document"]),
-                        _active_catalog(state),
-                        path=prepared["source_path"],
-                    ),
-                    prepared["source_path"],
-                ),
-                applier=apply_loaded,
-                replacement_draft_id=prepared["post_state"]["draft_id"],
+            result = state.load_scenario(
+                body.admission_envelope(),
+                scenario_id=body.scenario_id,
+                expected_catalog_revision=body.scenario_catalog_revision,
+                confirm_discard=body.confirm_discard,
             )
-            return JSONResponse(
-                status_code=200,
-                content={
-                    "status": "loaded",
-                    "headless": result,
-                    "workspace": _workspace(state),
-                },
-            )
+            return JSONResponse(status_code=200, content=result)
         except Exception as error:
             _raise_workspace_error(error)
+
+    @router.post("/api/program/load")
+    def removed_program_load() -> None:
+        raise HTTPException(
+            status_code=410,
+            detail={
+                "code": "program_load_removed_use_scenario_load",
+                "message": (
+                    "Program-only Load was removed; use Open for editor-only "
+                    "documents or Load Scenario for Deployment and Program activation"
+                ),
+            },
+        )
 
     @router.post("/api/program/discard")
     @authoring_gate

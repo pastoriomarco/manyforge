@@ -74,7 +74,6 @@ OpenAPI version: `3.1.0`. Title: `ManyForge Composer (replaceable client)`.
 | `POST` | `/api/program/discard` | composer-draft | Discard Draft |
 | `GET` | `/api/program/draft` | composer-draft | Read Draft |
 | `POST` | `/api/program/draft/mutations` | composer-draft | Mutate Draft |
-| `POST` | `/api/program/load` | composer-draft | Load Program |
 | `POST` | `/api/program/new-draft` | composer-draft | New Draft |
 | `POST` | `/api/program/open-draft` | composer-draft | Open Draft |
 | `POST` | `/api/program/revert` | composer-draft | Revert Draft |
@@ -87,6 +86,8 @@ OpenAPI version: `3.1.0`. Title: `ManyForge Composer (replaceable client)`.
 | `GET` | `/api/program/workspace` | composer-draft | Read Workspace |
 | `GET` | `/api/runtime` | headless-runtime-client | Runtime |
 | `GET` | `/api/scenarios` | headless-runtime-client | Scenarios |
+| `GET` | `/api/scenarios/current` | composer-draft | Derive Current Scenario |
+| `POST` | `/api/scenarios/load` | composer-draft | Load Scenario |
 | `GET` | `/api/scene` | headless-runtime-client | Scene |
 | `GET` | `/api/scene/object-meshes/resolve` | headless-scene-mesh-client | Resolve Scene Object Mesh |
 | `GET` | `/api/scene/object-meshes/{asset_hash}.glb` | headless-scene-mesh-client | Get Scene Object Mesh |

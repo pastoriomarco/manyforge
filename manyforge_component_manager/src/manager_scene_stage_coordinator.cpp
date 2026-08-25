@@ -420,7 +420,11 @@ ManagerSceneStageResult ManagerSceneStageCoordinator::StageOrRecover(
     }
     throw ManagerSceneStageEffectUncertainError(
         "scene owner returned uncertain, malformed, or foreign Stage "
-        "evidence",
+        "evidence" +
+            (result.error.has_value()
+                 ? " [" + result.error->code + "]: " +
+                       result.error->message
+                 : std::string{}),
         recovery_query, std::nullopt, result);
   }
 

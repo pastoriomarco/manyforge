@@ -39,7 +39,7 @@ function actionTitle(action: ProgramAction): string {
     case 'apply': return 'Apply Program Draft';
     case 'revert': return 'Revert Program to Saved';
     case 'discard': return 'Discard Draft Changes';
-    case 'load': return 'Load and Apply Program';
+    case 'load': return 'Load Scenario';
   }
 }
 
@@ -57,7 +57,7 @@ export function ProgramDocumentControls({
     apply: applyDraft,
     discard,
     revert,
-    load: loadProgram,
+    loadScenario,
   } = controller;
   const [action, setAction] = useState<ProgramAction | null>(null);
   const [settingsOpen, setSettingsOpen] = useState(false);
@@ -169,11 +169,11 @@ export function ProgramDocumentControls({
           <button type="button" disabled={authoringBusy || workspace === null} onClick={(event) => beginAction('open', event)}>Open</button>
           <button type="button" disabled={authoringBusy || !program || !workspace?.saved.available} onClick={save}>Save</button>
           <button type="button" disabled={authoringBusy || !program} onClick={(event) => beginAction('save_as', event)}>Save As</button>
-          <button type="button" disabled={authoringBusy || !program} onClick={(event) => beginAction('load', event)}>Load</button>
+          <button type="button" disabled={authoringBusy || workspace === null} onClick={(event) => beginAction('load', event)}>Load</button>
           <span className="header-action-divider" aria-hidden="true" />
           <button type="button" disabled={authoringBusy || !workspace?.applied.available} onClick={(event) => beginAction('discard', event)}>Discard</button>
           <button type="button" disabled={authoringBusy || !workspace?.saved.available || !workspace?.applied.available} onClick={(event) => beginAction('revert', event)}>Revert</button>
-          <button className="primary-action" type="button" disabled={authoringBusy || !program} onClick={(event) => beginAction('apply', event)}>Apply</button>
+          <button className="primary-action" type="button" disabled={authoringBusy || !program || workspace?.applied.matchesDraft === true} onClick={(event) => beginAction('apply', event)}>Apply</button>
         </div>
       </div>
 
@@ -260,9 +260,6 @@ export function ProgramDocumentControls({
 
         {(action === 'apply' || action === 'load') && (
           <div className="program-document-dialog">
-            {action === 'load' && (
-              <ArtifactBrowser lockedKind="program" onSelectionChange={chooseArtifact} />
-            )}
             <div className="program-dialog-copy">
               <label className="program-save-as-path">
                 Qualified scenario
@@ -282,11 +279,10 @@ export function ProgramDocumentControls({
                   ))}
                 </select>
               </label>
-              <p>
-                Program Apply requires this scenario&apos;s deployment already active
-                and converged. Program Apply never changes the deployment.
-              </p>
-              {!workspace?.applicability.applyReady && (
+              <p>{action === 'load'
+                ? 'Load activates this Scenario’s exact Deployment, waits for convergence, then Applies its bound Program. It completes as one backend-owned operation.'
+                : 'Program Apply requires this scenario’s deployment already active and converged. Program Apply never changes the deployment.'}</p>
+              {action === 'apply' && !workspace?.applicability.applyReady && (
                 <div className="program-apply-blocked" role="alert">
                   <strong>Draft is not Apply-ready.</strong>
                   {affectedPolicyInstanceSummary && <span>Affected nodes: {affectedPolicyInstanceSummary}.</span>}
@@ -306,18 +302,18 @@ export function ProgramDocumentControls({
                   authoringBusy
                   || selectedScenario === null
                   || (action === 'apply' && (!program || !workspace?.applicability.applyReady))
-                  || (action === 'load' && (selectedProgramPath === null || (replaceNeedsConfirmation && !confirmDiscard)))
+                  || (action === 'load' && replaceNeedsConfirmation && !confirmDiscard)
                 }
                 onClick={() => {
                   if (!selectedScenario || !scenarioCatalog) return;
                   if (action === 'apply') {
                     complete(() => applyDraft(selectedScenario.scenarioId, scenarioCatalog.scenarioCatalogRevision));
-                  } else if (selectedProgramPath) {
-                    complete(() => loadProgram(selectedProgramPath, selectedScenario.scenarioId, scenarioCatalog.scenarioCatalogRevision, confirmDiscard));
+                  } else {
+                    complete(() => loadScenario(selectedScenario.scenarioId, scenarioCatalog.scenarioCatalogRevision, confirmDiscard));
                   }
                 }}
               >
-                {action === 'apply' ? 'Apply Draft' : 'Load and Apply'}
+                {action === 'apply' ? 'Apply Draft' : 'Load Scenario'}
               </button>
             </div>
           </div>

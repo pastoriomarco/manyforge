@@ -182,6 +182,13 @@ def create_headless_router(
     def scenarios() -> dict[str, Any]:
         return _call(client.scenarios)
 
+    @router.get("/api/scenarios/current")
+    def current_scenario() -> dict[str, Any]:
+        try:
+            return state.current_scenario()
+        except HeadlessClientError as error:
+            raise _translate(error) from error
+
     @router.get("/api/program/applied")
     def program_applied() -> dict[str, Any]:
         return _call(client.program_applied)

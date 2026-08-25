@@ -145,6 +145,29 @@ ManagerApplyIntentDTO Intent(std::string apply_id = "apply-1",
   };
 }
 
+ManagerApplyIntentDTO ParentClaimIntent() {
+  auto intent = Intent();
+  intent.expected_admission_generation.reset();
+  intent.parent_authoring_claim = core::CellAdmissionClaimDTO{
+      {
+          core::CellAdmissionClaimKindDTO::kAuthoringMutation,
+          core::CellAdmissionOwnerRoleDTO::kAuthoringOwner,
+          RequestOwnerEpoch("composer-owner-1"),
+          "composer-transaction-1",
+          RequestId("composer-request-1"),
+          ContentDigest(std::string(kDigestTwo)),
+          core::AdmissionGeneration(7U),
+          {},
+          std::nullopt,
+          std::nullopt,
+      },
+      core::CellAdmissionClaimGeneration(3U),
+      core::AdmissionGeneration(7U),
+      42,
+  };
+  return intent;
+}
+
 ApplyConfigurationFenceIntentDTO FenceIntent() {
   return {
       Intent().request_context,
@@ -1230,6 +1253,25 @@ TEST(ManagerApplyJournal, PersistsExactIntentAndReplaysAcrossRestart) {
   EXPECT_EQ(report.apply_intent_count, 1);
   EXPECT_EQ(report.distinct_apply_id_count, 1);
   EXPECT_EQ(report.distinct_request_identity_count, 1);
+}
+
+TEST(ManagerApplyJournal, PersistsExactParentAuthoringClaimAcrossRestart) {
+  TemporaryDirectory directory;
+  const auto path = directory.path() / "parent-claim-apply.sqlite3";
+  const auto intent = ParentClaimIntent();
+  {
+    SqliteManagerApplyJournal journal(path, CellId("cell-1"));
+    const auto inserted = journal.EnsureIntent(intent);
+    ASSERT_TRUE(inserted.inserted);
+    EXPECT_EQ(inserted.record.intent, intent);
+  }
+
+  SqliteManagerApplyJournal reopened(path, CellId("cell-1"));
+  const auto record =
+      reopened.ReadIntent(ApplyId("apply-1"), ApplyGeneration(1U));
+  ASSERT_TRUE(record.has_value());
+  EXPECT_EQ(record->intent, intent);
+  EXPECT_EQ(reopened.VerifyIntegrity().apply_intent_count, 1);
 }
 
 TEST(ManagerApplyJournal,

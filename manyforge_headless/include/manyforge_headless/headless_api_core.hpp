@@ -180,6 +180,8 @@ public:
   [[nodiscard]] manyforge::content_identity::CanonicalValue
   ScenarioProgramSelection(std::string_view scenario_id);
   [[nodiscard]] manyforge::content_identity::CanonicalValue
+  ScenarioLoadSelection(std::string_view scenario_id);
+  [[nodiscard]] manyforge::content_identity::CanonicalValue
   PrepareProgramApply(std::string_view scenario_id,
                       std::string_view expected_scenario_catalog_revision,
                       std::string_view canonical_program_bytes);

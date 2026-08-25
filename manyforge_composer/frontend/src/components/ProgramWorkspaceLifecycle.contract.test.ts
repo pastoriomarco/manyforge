@@ -135,16 +135,16 @@ describe('Program workspace lifecycle controls', () => {
     expect(result.message).toContain('Apply completed');
   });
 
-  it('presents deployment selection as a separate Program Apply prerequisite', () => {
+  it('keeps Program Apply separate while Load activates a complete Scenario', () => {
     const source = readFileSync(
       new URL('./ProgramDocumentControls.tsx', import.meta.url),
       'utf8',
     );
-    expect(source).toContain(
-      "Program Apply requires this scenario&apos;s deployment already",
-    );
+    expect(source).toContain('Program Apply requires this scenario’s deployment');
     expect(source).toContain('Program Apply never changes the deployment.');
-    expect(source).toContain('Program Apply never changes the deployment.');
+    expect(source).toContain('Load activates this Scenario’s exact Deployment');
+    expect(source).toContain('loadScenario(selectedScenario.scenarioId');
+    expect(source).not.toContain('Load and Apply Program');
   });
 
   it('reflects backend idle admission instead of silently dropping UI actions', () => {

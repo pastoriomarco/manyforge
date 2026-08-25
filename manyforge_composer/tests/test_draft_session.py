@@ -247,13 +247,12 @@ def test_saved_document_lifecycle_never_deepcopies_program_graph(
     assert session._saved_document == retained_initial
 
     loaded = _program(metadata={"selection": "loaded"})
-    session.load_and_apply_program(
+    session.replace_program(
+        loaded,
+        source_path=str(tmp_path / "loaded.program.yaml"),
         draft_id=session.draft_id,
         expected_revision=session.revision,
         discard_changes=True,
-        current_applied_program_revision=initial.program_revision,
-        loader=lambda: (loaded, str(tmp_path / "loaded.program.yaml")),
-        applier=lambda _program: {"status": "applied"},
     )
     session.save_program(
         draft_id=session.draft_id,

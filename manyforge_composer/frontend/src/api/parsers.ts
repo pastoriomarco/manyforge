@@ -2574,6 +2574,50 @@ function parseProgramApplyResult(
   return record;
 }
 
+function parseScenarioLoadResult(
+  value: unknown,
+  path: string,
+): Record<string, JsonValue> {
+  const record = jsonRecordAt(value, path);
+  exactKeysAt(record, ['managerApply', 'programApply', 'scenario'], path);
+  const scenario = jsonRecordAt(record.scenario, `${path}.scenario`);
+  exactKeysAt(
+    scenario,
+    [
+      'deployment_artifact_id',
+      'deployment_revision',
+      'graph_revision',
+      'program_binding_id',
+      'program_id',
+      'program_revision',
+      'retained_bundle_id',
+      'scenario_catalog_revision',
+      'scenario_id',
+    ],
+    `${path}.scenario`,
+  );
+  stringAt(scenario.deployment_artifact_id, `${path}.scenario.deployment_artifact_id`);
+  stringAt(scenario.program_id, `${path}.scenario.program_id`);
+  stringAt(scenario.scenario_id, `${path}.scenario.scenario_id`);
+  for (const field of [
+    'deployment_revision',
+    'graph_revision',
+    'program_binding_id',
+    'program_revision',
+    'retained_bundle_id',
+    'scenario_catalog_revision',
+  ]) {
+    digestAt(scenario[field], `${path}.scenario.${field}`);
+  }
+  if (record.managerApply !== null) {
+    jsonRecordAt(record.managerApply, `${path}.managerApply`);
+  }
+  if (record.programApply !== null) {
+    parseProgramApplyResult(record.programApply, `${path}.programApply`);
+  }
+  return record;
+}
+
 export function parseProgramWorkspaceTransitionResponse(
   value: unknown,
 ): ProgramWorkspaceTransitionResponse {
@@ -2594,7 +2638,9 @@ export function parseProgramWorkspaceTransitionResponse(
     }
     headless = null;
   } else {
-    headless = parseProgramApplyResult(record.headless, `${path}.headless`);
+    headless = status === 'loaded'
+      ? parseScenarioLoadResult(record.headless, `${path}.headless`)
+      : parseProgramApplyResult(record.headless, `${path}.headless`);
   }
   return {
     status: status as ProgramWorkspaceTransitionResponse['status'],

@@ -169,6 +169,44 @@ CanonicalValue OptionalStringValue(const std::optional<std::string> &value) {
   return value.has_value() ? CanonicalValue(*value) : CanonicalValue(nullptr);
 }
 
+CanonicalValue ScenarioSelectionProjection(
+    const deployment::ScenarioProgramSelection &selection,
+    CanonicalValue owner_identities) {
+  return CanonicalValue(CanonicalValue::Object{
+      {"assistant_projection", selection.normalized_assistant_projection},
+      {"assistant_mode",
+       CanonicalValue(selection.assistant_mode ==
+                              deployment::ScenarioAssistantMode::kRequired
+                          ? "required"
+                      : selection.assistant_mode ==
+                              deployment::ScenarioAssistantMode::kOptional
+                          ? "optional"
+                          : "forbidden")},
+      {"deployment_artifact_id",
+       CanonicalValue(selection.deployment_artifact_id.value())},
+      {"deployment_revision",
+       CanonicalValue(selection.deployment_revision.value())},
+      {"graph_revision", CanonicalValue(selection.graph_revision.value())},
+      {"node_environment_digest",
+       CanonicalValue(selection.node_environment_digest.value())},
+      {"owner_identities", std::move(owner_identities)},
+      {"program", selection.normalized_program_root},
+      {"program_binding", selection.normalized_program_binding_root},
+      {"program_binding_id",
+       CanonicalValue(selection.program_binding_id.value())},
+      {"program_id", CanonicalValue(selection.program_id.value())},
+      {"program_revision", CanonicalValue(selection.program_revision.value())},
+      {"retained_bundle_id",
+       CanonicalValue(selection.retained_bundle_id.value())},
+      {"scenario_catalog_revision",
+       CanonicalValue(selection.scenario_catalog_revision.value())},
+      {"scenario_id", CanonicalValue(selection.scenario_id)},
+      {"schema_version",
+       CanonicalValue(std::string(kScenarioProgramSelectionSchemaVersion))},
+      {"typed_parameter_overrides", selection.typed_parameter_overrides},
+  });
+}
+
 CanonicalValue Number(const std::uint64_t value, const std::string_view label) {
   Require(value <= kMaximumSafeInteger, "headless_value_invalid",
           std::string(label) + " exceeds the I-JSON safe integer range");
@@ -621,49 +659,35 @@ HeadlessApiCore::ScenarioProgramSelection(const std::string_view scenario_id) {
         {"owner_role", CanonicalValue(std::string(role))},
     });
   };
-  return CanonicalValue(CanonicalValue::Object{
-      {"assistant_projection", selection.normalized_assistant_projection},
-      {"assistant_mode",
-       CanonicalValue(selection.assistant_mode ==
-                              deployment::ScenarioAssistantMode::kRequired
-                          ? "required"
-                      : selection.assistant_mode ==
-                              deployment::ScenarioAssistantMode::kOptional
-                          ? "optional"
-                          : "forbidden")},
-      {"deployment_artifact_id",
-       CanonicalValue(selection.deployment_artifact_id.value())},
-      {"deployment_revision",
-       CanonicalValue(selection.deployment_revision.value())},
-      {"graph_revision", CanonicalValue(selection.graph_revision.value())},
-      {"node_environment_digest",
-       CanonicalValue(selection.node_environment_digest.value())},
-      {"owner_identities",
-       CanonicalValue(CanonicalValue::Array{
-           CanonicalValue(CanonicalValue::Object{
-               {"owner_epoch", CanonicalValue(config_.owner_epoch)},
-               {"owner_id", CanonicalValue(config_.owner_id)},
-               {"owner_role", CanonicalValue("headless_projection")},
-           }),
-           owner_identity("manager", manager_section),
-           owner_identity("scene_runtime", scene_runtime_section),
-           owner_identity("scene_transactions", logical_scene_section),
-       })},
-      {"program", selection.normalized_program_root},
-      {"program_binding", selection.normalized_program_binding_root},
-      {"program_binding_id",
-       CanonicalValue(selection.program_binding_id.value())},
-      {"program_id", CanonicalValue(selection.program_id.value())},
-      {"program_revision", CanonicalValue(selection.program_revision.value())},
-      {"retained_bundle_id",
-       CanonicalValue(selection.retained_bundle_id.value())},
-      {"scenario_catalog_revision",
-       CanonicalValue(selection.scenario_catalog_revision.value())},
-      {"scenario_id", CanonicalValue(selection.scenario_id)},
-      {"schema_version",
-       CanonicalValue(std::string(kScenarioProgramSelectionSchemaVersion))},
-      {"typed_parameter_overrides", selection.typed_parameter_overrides},
-  });
+  return ScenarioSelectionProjection(
+      selection,
+      CanonicalValue(CanonicalValue::Array{
+          CanonicalValue(CanonicalValue::Object{
+              {"owner_epoch", CanonicalValue(config_.owner_epoch)},
+              {"owner_id", CanonicalValue(config_.owner_id)},
+              {"owner_role", CanonicalValue("headless_projection")},
+          }),
+          owner_identity("manager", manager_section),
+          owner_identity("scene_runtime", scene_runtime_section),
+          owner_identity("scene_transactions", logical_scene_section),
+      }));
+}
+
+CanonicalValue
+HeadlessApiCore::ScenarioLoadSelection(const std::string_view scenario_id) {
+  std::lock_guard lock(mutex_);
+  Require(!shutdown_, "headless_api_closed", "headless API core is closed");
+  try {
+    return ScenarioSelectionProjection(
+        scenario_catalog_source_.LoadExactProgramSelection(scenario_id),
+        CanonicalValue(CanonicalValue::Array{}));
+  } catch (const deployment::ScenarioApplyCandidateError &error) {
+    CoreFail("scenario_program_selection_unavailable", error.what());
+  } catch (const deployment::ScenarioCatalogError &error) {
+    CoreFail("scenario_program_selection_unavailable", error.what());
+  } catch (const std::exception &error) {
+    CoreFail("scenario_program_selection_invalid", error.what());
+  }
 }
 
 CanonicalValue HeadlessApiCore::PrepareProgramApply(

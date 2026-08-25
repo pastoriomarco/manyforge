@@ -664,6 +664,26 @@ class HeadlessService:
             ) from error
         return projection
 
+    def scenario_load_selection(self, scenario_id: str) -> dict[str, Any]:
+        projection = self.core.scenario_load_selection(scenario_id)
+        if not isinstance(projection, dict):
+            raise HeadlessApiError(
+                "scenario_program_selection_invalid",
+                "native core returned an unsupported Scenario Load selection",
+            )
+        try:
+            validate_scenario_program_selection(
+                projection,
+                scenario_id=scenario_id,
+                label="scenario_load_selection",
+            )
+        except (ProgramBindingTransportError, TypeError, ValueError) as error:
+            raise HeadlessApiError(
+                "scenario_program_selection_invalid",
+                "native core returned an unsupported Scenario Load selection",
+            ) from error
+        return projection
+
     def program_applied(self) -> dict[str, Any]:
         projection = self.core.applied_program_selection()
         if not isinstance(projection, dict):

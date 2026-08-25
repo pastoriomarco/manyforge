@@ -82,6 +82,13 @@ def main() -> None:
     parser.add_argument("--authoring-state-root")
     parser.add_argument("--headless-api-timeout-s", type=float, default=2.0)
     parser.add_argument("--assistant-bridge-url")
+    parser.add_argument(
+        "--startup-scenario",
+        help=(
+            "explicitly Load one complete launcher-selected Scenario before "
+            "serving; intended for the supported development entrypoint"
+        ),
+    )
     parser.add_argument("--assistant-request-timeout-s", type=float, default=10.0)
     parser.add_argument(
         "--log-level",
@@ -123,6 +130,8 @@ def main() -> None:
             authoring_state_root=args.authoring_state_root,
             assistant_client=assistant_client,
         )
+        if args.startup_scenario is not None:
+            state.load_startup_scenario(args.startup_scenario)
         app = create_app(
             state,
             static_dir=args.static_dir,

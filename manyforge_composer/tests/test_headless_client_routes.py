@@ -1613,13 +1613,11 @@ def test_new_program_dirty_confirmation_precedes_owner_and_catalog_reads(
     assert requests[request_offset:] == []
 
 
-def test_normative_load_publishes_draft_and_saved_only_after_apply(
-    headless_client,
-) -> None:
-    client, requests, _node_environment = headless_client
+def test_program_only_load_route_is_removed(headless_client) -> None:
+    client, _requests, _node_environment = headless_client
     with _composer_with_program(client) as composer:
         before = composer.get("/api/program/workspace").json()
-        loaded = composer.post(
+        rejected = composer.post(
             "/api/program/load",
             json={
                 "draftId": before["draft"]["draftId"],
@@ -1630,41 +1628,11 @@ def test_normative_load_publishes_draft_and_saved_only_after_apply(
                 "confirmDiscard": True,
             },
         )
-
-    assert loaded.status_code == 200, loaded.text
-    workspace = loaded.json()["workspace"]
-    assert workspace["draft"]["draftId"] != before["draft"]["draftId"]
-    assert workspace["saved"]["path"] == str(_LOAD_PROGRAM_PATH.resolve())
-    assert workspace["saved"]["matchesDraft"] is True
-    assert workspace["applied"]["matchesDraft"] is True
-    forwarded = [
-        request for request in requests if request["path"] == "/api/program/apply"
-    ]
-    assert len(forwarded) == 1
-
-
-def test_load_rejects_inactive_deployment_and_preserves_prior_workspace(
-    headless_client,
-) -> None:
-    client, _requests, _node_environment = headless_client
-    with _composer_with_program(client) as composer:
-        before = composer.get("/api/program/workspace").json()
-        rejected = composer.post(
-            "/api/program/load",
-            json={
-                "draftId": before["draft"]["draftId"],
-                "expectedDraftRevision": before["draft"]["draftRevision"],
-                "scenarioId": "pending-scenario",
-                "scenarioCatalogRevision": "sha256:" + "7" * 64,
-                "path": str(_LOAD_PROGRAM_PATH),
-                "confirmDiscard": True,
-            },
-        )
         after = composer.get("/api/program/workspace").json()
 
-    assert rejected.status_code == 409
+    assert rejected.status_code == 410
     assert rejected.json()["detail"]["code"] == (
-        "program_apply_deployment_not_active"
+        "program_load_removed_use_scenario_load"
     )
     assert after == before
 

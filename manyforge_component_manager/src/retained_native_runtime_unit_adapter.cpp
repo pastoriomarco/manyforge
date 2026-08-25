@@ -74,9 +74,10 @@ constexpr auto kExecTimeout = std::chrono::seconds(10);
 constexpr auto kReadyTimeout = std::chrono::seconds(10);
 constexpr auto kStatusTimeout = std::chrono::milliseconds(750);
 constexpr auto kManagerLivenessTimeout = std::chrono::milliseconds(750);
-// Cold candidate projection preparation may stage the complete immutable
-// planning/collision product. Keep that bounded independently from the short
-// steady-state status, fence, composition, and projection-query budget.
+// Cold projection preparation and the first candidate Stage may materialize
+// the complete immutable planning/collision product. Keep those effects
+// bounded independently from the short steady-state status, fence,
+// composition, and projection-query budget.
 constexpr auto kProjectionPreparationTimeout = std::chrono::seconds(10);
 constexpr auto kGracefulStopTimeout = std::chrono::seconds(2);
 constexpr auto kTermStopTimeout = std::chrono::seconds(1);
@@ -92,11 +93,11 @@ constexpr auto kTermStopTimeout = std::chrono::seconds(1);
 
 [[nodiscard]] std::string DigestRegularFile(const int fd,
                                             const std::uint64_t byte_size) {
-  EVP_MD_CTX* raw_context = EVP_MD_CTX_new();
+  EVP_MD_CTX *raw_context = EVP_MD_CTX_new();
   if (raw_context == nullptr) {
     Fail("could not allocate installed-target digest context");
   }
-  const auto free_context = [](EVP_MD_CTX* context) {
+  const auto free_context = [](EVP_MD_CTX *context) {
     EVP_MD_CTX_free(context);
   };
   std::unique_ptr<EVP_MD_CTX, decltype(free_context)> context(raw_context,
@@ -112,8 +113,7 @@ constexpr auto kTermStopTimeout = std::chrono::seconds(1);
         std::min<std::uint64_t>(remaining, buffer.size()));
     ssize_t count = -1;
     do {
-      count = ::pread(fd, buffer.data(), requested,
-                      static_cast<off_t>(offset));
+      count = ::pread(fd, buffer.data(), requested, static_cast<off_t>(offset));
     } while (count < 0 && errno == EINTR);
     if (count <= 0) {
       if (count < 0) {
@@ -153,8 +153,8 @@ DescriptorMintedRootFd(const std::filesystem::path &path) {
     return std::nullopt;
   }
   unsigned int value = 0U;
-  const auto parsed = std::from_chars(
-      text.data() + prefix.size(), text.data() + text.size(), value);
+  const auto parsed = std::from_chars(text.data() + prefix.size(),
+                                      text.data() + text.size(), value);
   if (parsed.ec != std::errc{} || parsed.ptr != text.data() + text.size() ||
       value == 0U || value > static_cast<unsigned int>(INT_MAX)) {
     return std::nullopt;
@@ -207,11 +207,11 @@ void RequirePrivateDirectory(const std::filesystem::path &path,
   struct stat after {};
   const bool valid =
       descriptor >= 0 && ::fstat(descriptor, &opened) == 0 &&
-      ::lstat(path.c_str(), &after) == 0 &&
-      opened.st_dev == before.st_dev && opened.st_ino == before.st_ino &&
-      after.st_dev == before.st_dev && after.st_ino == before.st_ino &&
-      S_ISDIR(opened.st_mode) && S_ISDIR(after.st_mode) &&
-      opened.st_uid == ::geteuid() && after.st_uid == ::geteuid() &&
+      ::lstat(path.c_str(), &after) == 0 && opened.st_dev == before.st_dev &&
+      opened.st_ino == before.st_ino && after.st_dev == before.st_dev &&
+      after.st_ino == before.st_ino && S_ISDIR(opened.st_mode) &&
+      S_ISDIR(after.st_mode) && opened.st_uid == ::geteuid() &&
+      after.st_uid == ::geteuid() &&
       (opened.st_mode & (S_IWGRP | S_IWOTH)) == 0 &&
       (after.st_mode & (S_IWGRP | S_IWOTH)) == 0 &&
       (opened.st_mode & (S_IRUSR | S_IWUSR | S_IXUSR)) ==
@@ -237,9 +237,9 @@ void RequireDisjointDirectories(const std::filesystem::path &left,
   if (error) {
     Fail("native execution state/run capability is unavailable");
   }
-  const auto mismatch = std::mismatch(
-      canonical_left.begin(), canonical_left.end(), canonical_right.begin(),
-      canonical_right.end());
+  const auto mismatch =
+      std::mismatch(canonical_left.begin(), canonical_left.end(),
+                    canonical_right.begin(), canonical_right.end());
   if (mismatch.first == canonical_left.end() ||
       mismatch.second == canonical_right.end()) {
     Fail("native execution state/run capabilities must be disjoint directory "
@@ -263,9 +263,9 @@ void RequirePathOutsideDirectory(const std::filesystem::path &path,
   if (error) {
     Fail("native disposable run capability is unavailable");
   }
-  const auto mismatch = std::mismatch(
-      canonical_directory.begin(), canonical_directory.end(),
-      canonical_path.begin(), canonical_path.end());
+  const auto mismatch =
+      std::mismatch(canonical_directory.begin(), canonical_directory.end(),
+                    canonical_path.begin(), canonical_path.end());
   if (mismatch.first == canonical_directory.end()) {
     Fail("native durable paths must be outside disposable run storage");
   }
@@ -300,8 +300,8 @@ private:
   int fd_{-1};
 };
 
-[[nodiscard]] UniqueFd OpenPinnedPackageRoot(
-    const std::filesystem::path &path) {
+[[nodiscard]] UniqueFd
+OpenPinnedPackageRoot(const std::filesystem::path &path) {
   if (const auto descriptor = DescriptorMintedRootFd(path);
       descriptor.has_value()) {
     struct stat status {};
@@ -491,7 +491,7 @@ ReceivePacket(const int fd, const std::chrono::milliseconds timeout) {
   return bytes;
 }
 
-void WaitForAll(std::vector<pollfd>& descriptors, const short event,
+void WaitForAll(std::vector<pollfd> &descriptors, const short event,
                 const std::chrono::steady_clock::time_point deadline) {
   std::vector<bool> ready(descriptors.size(), false);
   std::size_t remaining = descriptors.size();
@@ -510,8 +510,9 @@ void WaitForAll(std::vector<pollfd>& descriptors, const short event,
     }
     int result = -1;
     do {
-      result = ::poll(descriptors.data(), descriptors.size(),
-                      static_cast<int>(std::min<std::int64_t>(timeout, INT_MAX)));
+      result =
+          ::poll(descriptors.data(), descriptors.size(),
+                 static_cast<int>(std::min<std::int64_t>(timeout, INT_MAX)));
     } while (result < 0 && errno == EINTR);
     if (result < 0) {
       Fail(ErrnoDetail("native runtime liveness batch poll failed", errno));
@@ -610,12 +611,12 @@ void VerifyAdmissionMatchesQuery(
   const auto &product = admission.product();
   const auto &plan = query.plan;
   const auto &runtime_unit = FindRuntimeUnit(bundle, plan.runtime_unit_id);
-  const auto requirement = std::find_if(
-      bundle.value().runtime_contract_requirements.begin(),
-      bundle.value().runtime_contract_requirements.end(),
-      [&](const auto &candidate) {
-        return candidate.runtime_unit_id == plan.runtime_unit_id;
-      });
+  const auto requirement =
+      std::find_if(bundle.value().runtime_contract_requirements.begin(),
+                   bundle.value().runtime_contract_requirements.end(),
+                   [&](const auto &candidate) {
+                     return candidate.runtime_unit_id == plan.runtime_unit_id;
+                   });
   const std::vector<manyforge::core::RuntimeRoleId> roles{
       manyforge::core::RuntimeRoleId(std::string(product.runtime_role_id()))};
   if (bundle.retained_bundle_id() != query.candidate_retained_bundle_id ||
@@ -698,9 +699,8 @@ SameChildProduct(const NativeExecutionRuntimeUnitAdmission &admission,
 }
 
 [[noreturn]] void EnterChild(const pid_t expected_parent, const int channel_fd,
-                             const int liveness_channel_fd,
-                             const int error_fd, const int executable_fd,
-                             const int package_root_fd,
+                             const int liveness_channel_fd, const int error_fd,
+                             const int executable_fd, const int package_root_fd,
                              char *const argv[]) noexcept {
   if (::prctl(PR_SET_PDEATHSIG, SIGTERM) != 0) {
     ChildExit(error_fd, errno);
@@ -710,9 +710,8 @@ SameChildProduct(const NativeExecutionRuntimeUnitAdmission &admission,
   }
   const int channel_copy =
       ::fcntl(channel_fd, F_DUPFD_CLOEXEC, kChildHighestReservedFd + 1);
-  const int liveness_channel_copy =
-      ::fcntl(liveness_channel_fd, F_DUPFD_CLOEXEC,
-              kChildHighestReservedFd + 1);
+  const int liveness_channel_copy = ::fcntl(
+      liveness_channel_fd, F_DUPFD_CLOEXEC, kChildHighestReservedFd + 1);
   const int error_copy =
       ::fcntl(error_fd, F_DUPFD_CLOEXEC, kChildHighestReservedFd + 1);
   const int executable_copy =
@@ -997,10 +996,10 @@ struct RetainedNativeRuntimeUnitAdapter::Impl final
   }
 
   [[nodiscard]] UniqueFd OpenInstalledTarget(
-      const NativeExecutionRuntimeUnitAdmission& admission) const {
-    const int fd = ::openat(target_root_fd.get(),
-                            admission.installed_target_id().c_str(),
-                            O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
+      const NativeExecutionRuntimeUnitAdmission &admission) const {
+    const int fd =
+        ::openat(target_root_fd.get(), admission.installed_target_id().c_str(),
+                 O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
     if (fd < 0) {
       Fail(ErrnoDetail("could not open fixed native execution target", errno));
     }
@@ -1010,7 +1009,7 @@ struct RetainedNativeRuntimeUnitAdapter::Impl final
         (status.st_mode & (S_IWGRP | S_IWOTH)) != 0) {
       Fail("fixed native execution target is not one protected regular file");
     }
-    const auto& build_identity =
+    const auto &build_identity =
         admission.product().implementation_build_identity();
     if (build_identity.has_value()) {
       if (build_identity->installed_target_id !=
@@ -1018,8 +1017,8 @@ struct RetainedNativeRuntimeUnitAdapter::Impl final
           status.st_size <= 0 ||
           static_cast<std::uint64_t>(status.st_size) !=
               build_identity->installed_target_byte_size ||
-          DigestRegularFile(
-              target.get(), build_identity->installed_target_byte_size) !=
+          DigestRegularFile(target.get(),
+                            build_identity->installed_target_byte_size) !=
               build_identity->installed_target_content_digest.value()) {
         Fail("fixed native execution target differs from its retained "
              "implementation build identity");
@@ -1066,11 +1065,9 @@ struct RetainedNativeRuntimeUnitAdapter::Impl final
     Fail("native runtime child observation returned a foreign PID");
   }
 
-  [[nodiscard]] detail::NativeProjectionRpcResponse
-  ExchangeProjectionRaw(Child &child,
-                        const detail::NativeProjectionRpcRequest &request,
-                        const std::chrono::milliseconds timeout =
-                            kStatusTimeout) {
+  [[nodiscard]] detail::NativeProjectionRpcResponse ExchangeProjectionRaw(
+      Child &child, const detail::NativeProjectionRpcRequest &request,
+      const std::chrono::milliseconds timeout = kStatusTimeout) {
     const auto encoded = detail::EncodeNativeProjectionRpcRequest(request);
     SendPacket(child.channel.get(), encoded, timeout);
     const auto packet = ReceivePacket(child.channel.get(), timeout);
@@ -1084,8 +1081,7 @@ struct RetainedNativeRuntimeUnitAdapter::Impl final
   [[nodiscard]] detail::NativeProjectionRpcResponse
   ExchangeProjection(Child &child,
                      const detail::NativeProjectionRpcRequest &request,
-                     const std::chrono::milliseconds timeout =
-                         kStatusTimeout) {
+                     const std::chrono::milliseconds timeout = kStatusTimeout) {
     auto response = ExchangeProjectionRaw(child, request, timeout);
     if (const auto *failure =
             std::get_if<detail::NativeProjectionRpcFailure>(&response)) {
@@ -1098,7 +1094,8 @@ struct RetainedNativeRuntimeUnitAdapter::Impl final
   template <typename Response>
   [[nodiscard]] Response ProjectionCall(
       const manyforge::core::ProjectionNativeRuntimeBindingDTO &binding,
-      detail::NativeProjectionRpcRequest request) {
+      detail::NativeProjectionRpcRequest request,
+      const std::chrono::milliseconds timeout = kStatusTimeout) {
     if (!binding.valid()) {
       Fail("native projection request binding is invalid");
     }
@@ -1117,7 +1114,7 @@ struct RetainedNativeRuntimeUnitAdapter::Impl final
       EraseChild(found);
       Fail("native projection child exited before its response");
     }
-    auto response = ExchangeProjection(found->second, request);
+    auto response = ExchangeProjection(found->second, request, timeout);
     const auto *typed = std::get_if<Response>(&response);
     if (typed == nullptr) {
       Fail("native projection child returned the wrong response kind");
@@ -1194,8 +1191,7 @@ struct RetainedNativeRuntimeUnitAdapter::Impl final
 
   template <typename Response>
   [[nodiscard]] manyforge::core::Result<Response>
-  KernelCellAdmissionCall(
-      const detail::KernelCellAdmissionRpcPacket &request) {
+  KernelCellAdmissionCall(const detail::KernelCellAdmissionRpcPacket &request) {
     std::lock_guard lock(mutex);
     if (children.size() != 1U) {
       return manyforge::core::Result<Response>::Err(
@@ -1219,8 +1215,7 @@ struct RetainedNativeRuntimeUnitAdapter::Impl final
     if (!packet.has_value()) {
       Fail("managed Kernel cell-admission response timed out");
     }
-    const auto response =
-        detail::DecodeKernelCellAdmissionRpcResponse(*packet);
+    const auto response = detail::DecodeKernelCellAdmissionRpcResponse(*packet);
     if (response.command != request.command) {
       Fail("managed Kernel child returned a foreign cell-admission command");
     }
@@ -1278,22 +1273,21 @@ struct RetainedNativeRuntimeUnitAdapter::Impl final
   }
 
   [[nodiscard]] manyforge::core::ManagerLivenessObservationDTO
-  RenewManagerLiveness(const ManagerLivenessTransportRequestDTO& request) {
+  RenewManagerLiveness(const ManagerLivenessTransportRequestDTO &request) {
     auto responses = RenewManagerLivenessBatch({request});
     return std::move(responses.front());
   }
 
   [[nodiscard]] std::vector<manyforge::core::ManagerLivenessObservationDTO>
   RenewManagerLivenessBatch(
-      const std::vector<ManagerLivenessTransportRequestDTO>& requests) {
+      const std::vector<ManagerLivenessTransportRequestDTO> &requests) {
     if (requests.empty() ||
-        requests.size() >
-            manyforge::core::kMaximumManagerLivenessReceivers) {
+        requests.size() > manyforge::core::kMaximumManagerLivenessReceivers) {
       Fail("Manager-liveness batch has an invalid receiver count");
     }
-    const auto& required_set = requests.front().required_set;
-    const auto& heartbeat = requests.front().heartbeat;
-    const auto& policy = requests.front().policy;
+    const auto &required_set = requests.front().required_set;
+    const auto &heartbeat = requests.front().heartbeat;
+    const auto &policy = requests.front().policy;
     const auto publication_generation =
         requests.front().active_publication_generation;
     const auto graph_revision = requests.front().active_graph_revision;
@@ -1302,7 +1296,7 @@ struct RetainedNativeRuntimeUnitAdapter::Impl final
     std::set<std::string> requested_receivers;
     std::vector<std::string> encoded;
     encoded.reserve(requests.size());
-    for (const auto& request : requests) {
+    for (const auto &request : requests) {
       if (!manyforge::core::ValidateManagerLivenessRequiredSet(
                request.required_set)
                .ok() ||
@@ -1311,8 +1305,7 @@ struct RetainedNativeRuntimeUnitAdapter::Impl final
           request.active_publication_generation != publication_generation ||
           request.active_graph_revision != graph_revision ||
           request.active_public_pointer_digest != public_pointer_digest ||
-          !requested_receivers.insert(
-                                  request.receiver_runtime_unit_id.value())
+          !requested_receivers.insert(request.receiver_runtime_unit_id.value())
                .second) {
         Fail("Manager-liveness batch is not one exact required-set renewal");
       }
@@ -1323,8 +1316,7 @@ struct RetainedNativeRuntimeUnitAdapter::Impl final
     // Manager generation.  This adapter must atomically cover every requested
     // native child, while preserving the complete set in every native packet.
 
-    if (!manyforge::core::ValidateManagerLivenessRequiredSet(
-             required_set)
+    if (!manyforge::core::ValidateManagerLivenessRequiredSet(required_set)
              .ok()) {
       Fail("Manager-liveness request has an invalid required set");
     }
@@ -1333,14 +1325,14 @@ struct RetainedNativeRuntimeUnitAdapter::Impl final
     // liveness channels. Ordinary control and Apply traffic cannot consume it.
     const detail::ManagerLivenessBatchDeadline deadline(
         std::chrono::steady_clock::now(), kManagerLivenessTimeout);
-    std::vector<LivenessEndpoint*> targets;
+    std::vector<LivenessEndpoint *> targets;
     std::vector<pollfd> descriptors;
     targets.reserve(requests.size());
     descriptors.reserve(requests.size());
-    for (const auto& request : requests) {
+    for (const auto &request : requests) {
       const auto expected = std::find_if(
           required_set.required_receivers.begin(),
-          required_set.required_receivers.end(), [&](const auto& row) {
+          required_set.required_receivers.end(), [&](const auto &row) {
             return row.runtime_unit_id == request.receiver_runtime_unit_id;
           });
       auto found =
@@ -1371,18 +1363,17 @@ struct RetainedNativeRuntimeUnitAdapter::Impl final
     WaitForAll(descriptors, POLLIN, deadline.value());
     std::vector<std::string> packets;
     packets.reserve(targets.size());
-    for (const auto* target : targets) {
+    for (const auto *target : targets) {
       packets.push_back(ReceiveReadyPacket(target->channel.get()));
     }
     std::vector<manyforge::core::ManagerLivenessObservationDTO> responses;
     responses.reserve(targets.size());
     std::size_t superseded_count = 0U;
     std::exception_ptr first_other_failure;
-    for (const auto& packet : packets) {
+    for (const auto &packet : packets) {
       try {
-        responses.push_back(
-            detail::DecodeManagerLivenessRpcResponse(packet));
-      } catch (const detail::ManagerLivenessRpcRejection& rejection) {
+        responses.push_back(detail::DecodeManagerLivenessRpcResponse(packet));
+      } catch (const detail::ManagerLivenessRpcRejection &rejection) {
         if (rejection.reason() == "superseded_active_publication") {
           ++superseded_count;
         } else if (first_other_failure == nullptr) {
@@ -1405,6 +1396,45 @@ struct RetainedNativeRuntimeUnitAdapter::Impl final
       Fail("Manager-liveness batch returned mixed renewal outcomes");
     }
     return responses;
+  }
+
+  template <typename Response>
+  [[nodiscard]] manyforge::core::Result<Response>
+  KernelLivenessLaneCall(const detail::KernelCellAdmissionRpcPacket &request) {
+    // Readiness and liveness form one ordered fail-closed control stream.
+    // Keep it independent from projection and authoring calls: those may
+    // legitimately take longer than the Manager lease renewal interval.
+    std::lock_guard lock(liveness_mutex);
+    if (liveness_endpoints.size() != 1U) {
+      return manyforge::core::Result<Response>::Err(
+          {"kernel_owner_unavailable",
+           "Manager liveness/readiness requires the sole managed native "
+           "execution child",
+           {{"reason", "native_execution_child_unavailable"}}});
+    }
+    auto &endpoint = liveness_endpoints.begin()->second;
+    const auto encoded = detail::EncodeKernelCellAdmissionRpcRequest(request);
+    SendPacket(endpoint.channel.get(), encoded, kManagerLivenessTimeout);
+    const auto packet =
+        ReceivePacket(endpoint.channel.get(), kManagerLivenessTimeout);
+    if (!packet.has_value()) {
+      Fail("managed Kernel liveness/readiness response timed out");
+    }
+    const auto response = detail::DecodeKernelCellAdmissionRpcResponse(*packet);
+    if (response.command != request.command) {
+      Fail("managed Kernel child returned a foreign liveness/readiness "
+           "command");
+    }
+    if (const auto *error =
+            std::get_if<manyforge::core::ErrorDTO>(&response.response)) {
+      return manyforge::core::Result<Response>::Err(*error);
+    }
+    const auto *typed = std::get_if<Response>(&response.response);
+    if (typed == nullptr) {
+      Fail("managed Kernel child returned the wrong liveness/readiness "
+           "response kind");
+    }
+    return manyforge::core::Result<Response>::Ok(*typed);
   }
 
   void PrepareChildProjectionBindings(
@@ -1560,8 +1590,8 @@ struct RetainedNativeRuntimeUnitAdapter::Impl final
     arguments.push_back(execution_run_root_path.string());
     arguments.emplace_back("--manyforge-managed-candidate-worker");
     arguments.push_back(
-        (target_root_path /
-         admission.candidate_worker_installed_target_id()).string());
+        (target_root_path / admission.candidate_worker_installed_target_id())
+            .string());
     arguments.emplace_back("--manyforge-managed-cell-id");
     arguments.push_back(bundle.value().cell_graph.cell_id.value());
     arguments.emplace_back("--manyforge-managed-retained-bundle-id");
@@ -1896,7 +1926,9 @@ public:
       const manyforge::core::NativeProjectionStageDTO &request) override {
     return adapter_
         ->ProjectionCall<manyforge::core::NativeProjectionStageResultDTO>(
-            binding_, request);
+            binding_, request,
+            std::chrono::duration_cast<std::chrono::milliseconds>(
+                kProjectionPreparationTimeout));
   }
 
   manyforge::core::NativeProjectionActivationResultDTO ActivateStagedProjection(
@@ -2014,8 +2046,7 @@ RetainedNativeRuntimeUnitAdapter::RetainedNativeRuntimeUnitAdapter(
           std::move(trusted_installed_target_root),
           std::move(trusted_package_root), std::move(manager_state_root),
           std::move(manager_run_root), std::move(execution_state_root),
-          std::move(execution_run_root),
-          bundle_source, artifact_source,
+          std::move(execution_run_root), bundle_source, artifact_source,
           std::move(operating_system),
           std::vector<std::string>{std::move(launch_environment_contract)},
           std::move(logical_scene_database), std::move(program_cycle_journal),
@@ -2040,10 +2071,8 @@ RetainedNativeRuntimeUnitAdapter::RetainedNativeRuntimeUnitAdapter(
           std::move(trusted_installed_target_root),
           std::move(trusted_package_root), std::move(manager_state_root),
           std::move(manager_run_root), std::move(execution_state_root),
-          std::move(execution_run_root),
-          bundle_source, artifact_source,
-          std::move(operating_system),
-          std::move(launch_environment_contracts),
+          std::move(execution_run_root), bundle_source, artifact_source,
+          std::move(operating_system), std::move(launch_environment_contracts),
           std::move(logical_scene_database), std::move(program_cycle_journal),
           std::move(authoring_transaction_journal))) {}
 
@@ -2115,9 +2144,9 @@ RetainedNativeRuntimeUnitAdapter::Release(
 
 manyforge::core::AuthoringAdmissionDTO
 RetainedNativeRuntimeUnitAdapter::GetAuthoringAdmission() const {
-  auto result = impl_->KernelCellAdmissionCall<
-      manyforge::core::AuthoringAdmissionDTO>(
-      {"cell_admission_get", std::monostate{}});
+  auto result =
+      impl_->KernelCellAdmissionCall<manyforge::core::AuthoringAdmissionDTO>(
+          {"cell_admission_get", std::monostate{}});
   if (!result.ok()) {
     Fail("managed Kernel cell-admission get failed [" + result.error().code +
          "]: " + result.error().message);
@@ -2128,14 +2157,17 @@ RetainedNativeRuntimeUnitAdapter::GetAuthoringAdmission() const {
 manyforge::core::Result<manyforge::core::AuthoringAdmissionDTO>
 RetainedNativeRuntimeUnitAdapter::UpdateCellAdmissionReadiness(
     const manyforge::core::CellAdmissionReadinessSnapshotDTO &snapshot) {
-  return impl_->KernelCellAdmissionCall<
-      manyforge::core::AuthoringAdmissionDTO>(
+  return impl_->KernelLivenessLaneCall<manyforge::core::AuthoringAdmissionDTO>(
       {"cell_admission_update_readiness", snapshot});
 }
 
 manyforge::core::Result<void> RetainedNativeRuntimeUnitAdapter::Publish(
     const manyforge::core::ManagerLivenessObservationDTO &observation) {
-  const auto result = impl_->KernelCellAdmissionCall<std::monostate>(
+  if (!manyforge::core::ValidateManagerLivenessObservation(observation).ok()) {
+    return manyforge::core::Result<void>::Err(
+        {"invalid_request", "Manager-liveness observation is invalid", {}});
+  }
+  const auto result = impl_->KernelLivenessLaneCall<std::monostate>(
       {"cell_admission_publish_liveness", observation});
   return result.ok() ? manyforge::core::Result<void>::Ok()
                      : manyforge::core::Result<void>::Err(result.error());
@@ -2144,24 +2176,21 @@ manyforge::core::Result<void> RetainedNativeRuntimeUnitAdapter::Publish(
 manyforge::core::Result<manyforge::core::CellAdmissionClaimDTO>
 RetainedNativeRuntimeUnitAdapter::AcquireCellAdmissionClaim(
     const manyforge::core::CellAdmissionClaimIntentDTO &intent) {
-  return impl_->KernelCellAdmissionCall<
-      manyforge::core::CellAdmissionClaimDTO>(
+  return impl_->KernelCellAdmissionCall<manyforge::core::CellAdmissionClaimDTO>(
       {"cell_admission_acquire", intent});
 }
 
 manyforge::core::Result<manyforge::core::AuthoringAdmissionDTO>
 RetainedNativeRuntimeUnitAdapter::ReleaseCellAdmissionClaim(
     const manyforge::core::CellAdmissionClaimReleaseDTO &release) {
-  return impl_->KernelCellAdmissionCall<
-      manyforge::core::AuthoringAdmissionDTO>(
+  return impl_->KernelCellAdmissionCall<manyforge::core::AuthoringAdmissionDTO>(
       {"cell_admission_release", release});
 }
 
 manyforge::core::Result<manyforge::core::AuthoringAdmissionDTO>
 RetainedNativeRuntimeUnitAdapter::ReconcileCellAdmissionClaims(
     const manyforge::core::CellAdmissionReconcileDTO &reconcile) {
-  return impl_->KernelCellAdmissionCall<
-      manyforge::core::AuthoringAdmissionDTO>(
+  return impl_->KernelCellAdmissionCall<manyforge::core::AuthoringAdmissionDTO>(
       {"cell_admission_reconcile", reconcile});
 }
 
@@ -2189,13 +2218,13 @@ RetainedNativeRuntimeUnitAdapter::InstallOrObserve(
 
 manyforge::core::ManagerLivenessObservationDTO
 RetainedNativeRuntimeUnitAdapter::RenewManagerLiveness(
-    const ManagerLivenessTransportRequestDTO& request) {
+    const ManagerLivenessTransportRequestDTO &request) {
   return impl_->RenewManagerLiveness(request);
 }
 
 std::vector<manyforge::core::ManagerLivenessObservationDTO>
 RetainedNativeRuntimeUnitAdapter::RenewManagerLivenessBatch(
-    const std::vector<ManagerLivenessTransportRequestDTO>& requests) {
+    const std::vector<ManagerLivenessTransportRequestDTO> &requests) {
   return impl_->RenewManagerLivenessBatch(requests);
 }
 

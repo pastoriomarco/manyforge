@@ -64,7 +64,7 @@ external-agent, and real-robot product lanes are not yet available.
 
 | You want to…                                        | Start here                                                                                                                                 |
 | --------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------ |
-| Start the retained structural Composer shell        | `./scripts/compose-dev.sh`; supply the independent current owners for runtime operations                                                    |
+| Start the current development workbench             | [`docs/operations/DEVELOPMENT_WORKBENCH.md`](docs/operations/DEVELOPMENT_WORKBENCH.md)                                                      |
 | Study historical operator workflows                 | [`docs/INDEX.md`](docs/INDEX.md) → runbooks, each marked as restoration input                                                              |
 | Understand architecture and authority boundaries    | [`docs/reference/ARCHITECTURE.md`](docs/reference/ARCHITECTURE.md)                                                                         |
 | Inspect current REST or historical client contracts | [`docs/INDEX.md`](docs/INDEX.md) → structural REST and historical interaction references                                                   |
@@ -107,19 +107,27 @@ docker compose run --rm dev bash
 ./scripts/test-all.sh retained
 ```
 
-**Inspecting structural Composer content?** Start its development shell:
+**Working on the current Composer UI?** Start the complete simulated native
+development workbench:
 
 ```bash
-./scripts/compose-dev.sh
+MANYFORGE_DEV_QUALIFIED_BUILD_ROOT=/path/to/qualified/build \
+  ./scripts/compose-dev.sh start --scenario lite6_pick_and_place
 ```
 
-This provides catalog, sandboxed files, deployment/URDF inspection, health,
-the Composer-owned strict Program Draft/Saved workspace, and retained
-observation/manual-control clients. The standalone structural shell does not
-configure Headless or the Program runner; its Program Apply/Run clients become
-available only when those independent processes are supplied. `scripts/launch.sh`
-and runtime-specific suite selectors return
-`composable_cell_runtime_unavailable` before product-lane effects.
+The build-root setting is needed only when importing the maintained package
+and matching native products into a fresh
+image-keyed development cache. Later starts use `./scripts/compose-dev.sh start
+--scenario lite6_pick_and_place`; `status` and `stop` are separate commands. The launcher
+incrementally builds only stale Manager/Headless production targets against the
+matching workbench ABI, starts their owners in order,
+establishes the exact active Deployment and Applied Program/Binding, and serves
+Vite HMR at `http://localhost:3000`. It does not run tests, sanitizers,
+qualification, package generation, or proof generation. The
+selected workbench lane is simulated and cannot authorize physical execution.
+See the
+[`development workbench runbook`](docs/operations/DEVELOPMENT_WORKBENCH.md).
+Installed product launch and distribution remain later gates.
 
 **Restoring or designing the new robot-import workflow?** See
 [`docs/operations/ADDING_A_ROBOT.md`](docs/operations/ADDING_A_ROBOT.md) —

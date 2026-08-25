@@ -536,7 +536,8 @@ struct EncodedIntent final {
 
 std::string EncodeParentAuthoringClaim(
     const core::CellAdmissionClaimDTO &claim) {
-  return detail::EncodeKernelCellAdmissionRpcResponse("acquire", claim);
+  return detail::EncodeKernelCellAdmissionRpcResponse(
+      "cell_admission_acquire", claim);
 }
 
 core::CellAdmissionClaimDTO DecodeParentAuthoringClaim(
@@ -544,7 +545,7 @@ core::CellAdmissionClaimDTO DecodeParentAuthoringClaim(
   const auto packet = detail::DecodeKernelCellAdmissionRpcResponse(bytes);
   const auto *claim =
       std::get_if<core::CellAdmissionClaimDTO>(&packet.response);
-  if (packet.command != "acquire" || claim == nullptr ||
+  if (packet.command != "cell_admission_acquire" || claim == nullptr ||
       !core::ValidateCellAdmissionClaimIntent(claim->intent).ok()) {
     throw ManagerApplyJournalIntegrityError(
         "stored parent authoring claim is invalid");

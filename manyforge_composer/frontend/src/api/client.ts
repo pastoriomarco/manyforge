@@ -471,22 +471,20 @@ export const api = {
         body: JSON.stringify(fence),
       },
     ),
-    load: (
+    loadScenario: (
       fence: DraftFenceRequest,
-      path: string,
       scenarioId: string,
       scenarioCatalogRevision: string,
       confirmDiscard: boolean,
       signal?: AbortSignal,
     ): Promise<ProgramWorkspaceTransitionResponse> => requestJson(
-      '/api/program/load',
+      '/api/scenarios/load',
       parseProgramWorkspaceTransitionResponse,
       signal,
       {
         method: 'POST',
         body: JSON.stringify({
           ...fence,
-          path,
           scenarioId,
           scenarioCatalogRevision,
           confirmDiscard,

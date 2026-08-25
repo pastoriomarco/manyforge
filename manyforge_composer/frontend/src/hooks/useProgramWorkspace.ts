@@ -84,7 +84,7 @@ export function programWorkspaceTransitionResult(
   if (action === 'load' && response.status === 'loaded') {
     return {
       workspace: response.workspace,
-      message: 'Load completed; Draft, Saved, and Applied now match the loaded Program.',
+      message: 'Scenario loaded; its Deployment is converged and its Program is Applied.',
       transitionStatus: response.status,
     };
   }
@@ -319,8 +319,7 @@ export function useProgramWorkspace(snapshot: ComposerHeadlessState | null = nul
     );
   }, [requireWorkspace, run, snapshot]);
 
-  const load = useCallback((
-    path: string,
+  const loadScenario = useCallback((
     scenarioId: string,
     scenarioCatalogRevision: string,
     confirmDiscard: boolean,
@@ -331,9 +330,8 @@ export function useProgramWorkspace(snapshot: ComposerHeadlessState | null = nul
     if (!requestFence) return;
     void run(
       'load',
-      () => api.programWorkspace.load(
+      () => api.programWorkspace.loadScenario(
         requestFence,
-        path,
         scenarioId,
         scenarioCatalogRevision,
         confirmDiscard,
@@ -425,7 +423,7 @@ export function useProgramWorkspace(snapshot: ComposerHeadlessState | null = nul
     apply,
     discard,
     revert,
-    load,
+    loadScenario,
     updateNodePolicies,
     clearFeedback: () => dispatch({ type: 'clear_feedback' }),
   };

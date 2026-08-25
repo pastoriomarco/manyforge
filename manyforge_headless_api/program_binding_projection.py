@@ -239,6 +239,35 @@ def validate_applied_program_selection(
     return value
 
 
+def applied_program_matches_scenario_selection(
+    applied: dict[str, Any], selection: dict[str, Any]
+) -> bool:
+    """Return exact owner-projection correspondence without inferring compatibility."""
+
+    fields = (
+        "assistant_mode",
+        "scenario_id",
+        "scenario_catalog_revision",
+        "deployment_artifact_id",
+        "deployment_revision",
+        "retained_bundle_id",
+        "graph_revision",
+        "node_environment_digest",
+        "program_id",
+        "program_revision",
+        "program_binding_id",
+        "typed_parameter_overrides",
+        "program",
+        "program_binding",
+    )
+    return all(
+        field in applied
+        and field in selection
+        and applied[field] == selection[field]
+        for field in fields
+    )
+
+
 def validate_program_apply_result(
     value: object,
     *,

@@ -909,6 +909,16 @@ public:
         ProjectionApplyStageResultState::kStaged,
         std::nullopt,
     };
+    if (return_uncertain_stage_result) {
+      const ErrorDTO error{"native_projection_stage_uncertain",
+                           "native projection response timed out", {}};
+      staged_result_->state =
+          ProjectionApplyStageResultState::kFailedProjectionUncertain;
+      staged_result_->transition_evidence->state =
+          ProjectionTransitionEvidenceState::kUncertain;
+      staged_result_->transition_evidence->error = error;
+      staged_result_->error = error;
+    }
     if (throw_after_stage_effect) {
       throw std::runtime_error("simulated lost scene Stage response");
     }
@@ -1129,6 +1139,7 @@ public:
   }
 
   bool throw_after_stage_effect{false};
+  bool return_uncertain_stage_result{false};
   bool throw_after_activation_effect{false};
   bool throw_after_finalize_effect{false};
   bool throw_status{false};
@@ -1679,6 +1690,31 @@ TEST(ManagerSceneStageCoordinator,
   EXPECT_TRUE(recovered.durable_scene_staged.inserted);
   EXPECT_EQ(scene_owner.stage_calls, 1);
   EXPECT_EQ(scene_owner.status_calls, 2);
+}
+
+TEST(ManagerSceneStageCoordinator,
+     UncertainStagePreservesTheOwnerDiagnosticForRecovery) {
+  ScopedPackageRoot root;
+  CoordinatorFixture fixture(root.path());
+  ASSERT_EQ(fixture.Run().state,
+            ManagerRuntimeConvergenceResultState::kStagedReady);
+  ScriptedSceneOwner scene_owner(fixture.independent_reader);
+  scene_owner.return_uncertain_stage_result = true;
+  ManagerSceneStageCoordinator coordinator(fixture.journal,
+                                           *fixture.package.bundle_source,
+                                           fixture.publication, scene_owner);
+
+  try {
+    static_cast<void>(
+        coordinator.StageOrRecover(ApplyId("apply-1"), ApplyGeneration(1U)));
+    FAIL() << "expected uncertain Stage evidence";
+  } catch (const ManagerSceneStageEffectUncertainError &error) {
+    EXPECT_NE(std::string(error.what()).find("native_projection_stage_uncertain"),
+              std::string::npos);
+    EXPECT_NE(std::string(error.what()).find("response timed out"),
+              std::string::npos);
+    ASSERT_TRUE(error.observed_stage_result().has_value());
+  }
 }
 
 TEST(ManagerSceneStageCoordinator,

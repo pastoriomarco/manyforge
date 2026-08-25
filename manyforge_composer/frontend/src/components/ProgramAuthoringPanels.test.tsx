@@ -510,7 +510,7 @@ describe('Program authoring panels', () => {
       apply: vi.fn(),
       discard: vi.fn(),
       revert: vi.fn(),
-      load: vi.fn(),
+      loadScenario: vi.fn(),
       updateNodePolicies: vi.fn(),
       clearFeedback: vi.fn(),
     } satisfies ProgramWorkspaceController;
@@ -650,7 +650,7 @@ describe('Program authoring panels', () => {
       apply: vi.fn(),
       discard: vi.fn(),
       revert: vi.fn(),
-      load: vi.fn(),
+      loadScenario: vi.fn(),
       updateNodePolicies: vi.fn(),
       clearFeedback: vi.fn(),
     } satisfies ProgramWorkspaceController;

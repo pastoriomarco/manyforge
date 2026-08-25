@@ -114,23 +114,22 @@ private:
           std::istreambuf_iterator<char>()};
 }
 
-[[nodiscard]] std::filesystem::path InstallNativeTestTargets(
-    const std::filesystem::path &source,
-    const std::filesystem::path &candidate_worker_source,
-    const std::filesystem::path &target_root) {
+[[nodiscard]] std::filesystem::path
+InstallNativeTestTargets(const std::filesystem::path &source,
+                         const std::filesystem::path &candidate_worker_source,
+                         const std::filesystem::path &target_root) {
   const auto target = target_root / std::string(contract::kInstalledTargetId);
   const auto candidate_worker =
       target_root / std::string(contract::kCandidateWorkerInstalledTargetId);
   if (!std::filesystem::copy_file(source, target,
                                   std::filesystem::copy_options::none) ||
-      !std::filesystem::copy_file(
-          candidate_worker_source, candidate_worker,
-          std::filesystem::copy_options::none)) {
+      !std::filesystem::copy_file(candidate_worker_source, candidate_worker,
+                                  std::filesystem::copy_options::none)) {
     throw std::runtime_error("could not install native adapter test targets");
   }
-  std::filesystem::permissions(
-      target, std::filesystem::status(source).permissions(),
-      std::filesystem::perm_options::replace);
+  std::filesystem::permissions(target,
+                               std::filesystem::status(source).permissions(),
+                               std::filesystem::perm_options::replace);
   std::filesystem::permissions(
       candidate_worker,
       std::filesystem::status(candidate_worker_source).permissions(),
@@ -175,12 +174,12 @@ struct NativeFixture final {
       throw std::runtime_error(
           "native adapter fixture has no exact native runtime product");
     }
-    const auto requirement = std::find_if(
-        bundle->value().runtime_contract_requirements.begin(),
-        bundle->value().runtime_contract_requirements.end(),
-        [&](const auto &candidate) {
-          return candidate.runtime_unit_id == unit.runtime_unit_id;
-        });
+    const auto requirement =
+        std::find_if(bundle->value().runtime_contract_requirements.begin(),
+                     bundle->value().runtime_contract_requirements.end(),
+                     [&](const auto &candidate) {
+                       return candidate.runtime_unit_id == unit.runtime_unit_id;
+                     });
     const auto *qualified =
         deployment::build_qualified_runtime_contract_registry().find(
             unit.runtime_profile_id, unit.runtime_profile_revision,
@@ -483,19 +482,20 @@ TEST(NativeExecutionRuntimeUnitAdmission,
   EXPECT_EQ(admission->implementation_revision(),
             contract::implementation_revision());
   EXPECT_EQ(admission->implementation_revision(),
-            "sha256:003f915c030a96347ca9f79ac4fe6fd8ead5baec3790e9b44377e1eaad6dc400");
+            "sha256:"
+            "003f915c030a96347ca9f79ac4fe6fd8ead5baec3790e9b44377e1eaad6dc400");
   EXPECT_EQ(fixture.query->plan.process_adapter_contract_revision,
-            "sha256:c5ee4ce0842e61b38da1c34e3979244896ae40461b5d6bb0fe3e1e81aac10186");
+            "sha256:"
+            "c5ee4ce0842e61b38da1c34e3979244896ae40461b5d6bb0fe3e1e81aac10186");
   EXPECT_EQ(admission->runtime_contract_offer_digest(),
             fixture.query->plan.runtime_contract_offer_digest.value());
   const core::RuntimeEpoch packet_epoch("native-runtime-test-epoch");
   const auto ready_packet = admission->expected_ready_packet(packet_epoch);
   const auto status_packet =
       admission->expected_status_packet(packet_epoch, 1U);
-  EXPECT_TRUE(ready_packet.starts_with(
-      "manyforge.native-execution-ready.v2 "));
-  EXPECT_TRUE(status_packet.starts_with(
-      "manyforge.native-execution-status.v2 "));
+  EXPECT_TRUE(ready_packet.starts_with("manyforge.native-execution-ready.v2 "));
+  EXPECT_TRUE(
+      status_packet.starts_with("manyforge.native-execution-status.v2 "));
   EXPECT_NE(ready_packet.find(admission->runtime_contract_offer_digest()),
             std::string::npos);
   EXPECT_NE(status_packet.find(admission->runtime_contract_offer_digest()),
@@ -504,8 +504,7 @@ TEST(NativeExecutionRuntimeUnitAdmission,
             std::string::npos);
   EXPECT_EQ(status_packet.find(admission->implementation_revision()),
             std::string::npos);
-  const auto arguments = admission->launch_arguments(
-      3, packet_epoch);
+  const auto arguments = admission->launch_arguments(3, packet_epoch);
   ASSERT_EQ(arguments.size(), 10U);
   EXPECT_EQ(arguments.front(), "--manyforge-managed-runtime-channel-fd");
   EXPECT_EQ(arguments[1], "3");
@@ -540,9 +539,8 @@ TEST(RetainedNativeRuntimeUnitAdapter,
   EXPECT_THROW(
       static_cast<void>(component_manager::RetainedNativeRuntimeUnitAdapter(
           MANYFORGE_NATIVE_EXECUTION_TARGET_ROOT,
-          fixture.root / "retained-package",
-          fixture.manager_state_root.path(), nested_run_root,
-          fixture.execution_state_root.path(),
+          fixture.root / "retained-package", fixture.manager_state_root.path(),
+          nested_run_root, fixture.execution_state_root.path(),
           fixture.execution_run_root.path(), fixture.bundle_source,
           fixture.artifact_source, std::string(contract::kOperatingSystem),
           std::string(contract::kLaunchEnvironmentContract))),
@@ -551,9 +549,8 @@ TEST(RetainedNativeRuntimeUnitAdapter,
   EXPECT_THROW(
       static_cast<void>(component_manager::RetainedNativeRuntimeUnitAdapter(
           MANYFORGE_NATIVE_EXECUTION_TARGET_ROOT,
-          fixture.root / "retained-package",
-          fixture.manager_state_root.path(), fixture.manager_run_root.path(),
-          fixture.execution_state_root.path(),
+          fixture.root / "retained-package", fixture.manager_state_root.path(),
+          fixture.manager_run_root.path(), fixture.execution_state_root.path(),
           fixture.execution_run_root.path(), fixture.bundle_source,
           fixture.artifact_source, std::string(contract::kOperatingSystem),
           std::string(contract::kLaunchEnvironmentContract),
@@ -632,9 +629,8 @@ TEST(RetainedNativeRuntimeUnitAdapter,
   const int package_descriptor =
       ::open(mutable_root.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC);
   ASSERT_GE(package_descriptor, 0);
-  const auto descriptor_root =
-      std::filesystem::path("/proc/self/fd") /
-      std::to_string(package_descriptor);
+  const auto descriptor_root = std::filesystem::path("/proc/self/fd") /
+                               std::to_string(package_descriptor);
   auto adapter = component_manager::RetainedNativeRuntimeUnitAdapter(
       MANYFORGE_NATIVE_EXECUTION_TARGET_ROOT, descriptor_root,
       fixture.manager_state_root.path(), fixture.manager_run_root.path(),
@@ -648,8 +644,7 @@ TEST(RetainedNativeRuntimeUnitAdapter,
   ASSERT_TRUE(std::filesystem::create_directory(mutable_root));
 
   const auto started = adapter.EnsureRunning(*fixture.query);
-  ASSERT_EQ(started.state(),
-            component_manager::ProcessPresenceState::kPresent);
+  ASSERT_EQ(started.state(), component_manager::ProcessPresenceState::kPresent);
   const core::RuntimeEpoch epoch(started.process_incarnation());
   const auto progress = adapter.ObserveProgress(*fixture.query, epoch);
   ASSERT_TRUE(progress.has_value());
@@ -720,8 +715,7 @@ TEST(
 TEST(RetainedNativeRuntimeUnitAdapter,
      DistinctQualifiedNativePackagesReplaceOnlyAfterCleanStop) {
   NativeFixture package_a(MANYFORGE_I7_BUILD_IDENTIFIED_NATIVE_FIXTURE_ROOT);
-  NativeFixture package_b(
-      MANYFORGE_O1_4G_REPLACEMENT_NATIVE_FIXTURE_ROOT);
+  NativeFixture package_b(MANYFORGE_O1_4G_REPLACEMENT_NATIVE_FIXTURE_ROOT);
   ASSERT_TRUE(package_a.product.has_value());
   ASSERT_TRUE(package_b.product.has_value());
   ASSERT_TRUE(package_a.product->implementation_build_identity().has_value());
@@ -757,8 +751,7 @@ TEST(RetainedNativeRuntimeUnitAdapter,
       deployment::build_qualified_runtime_contract_registry()
           .package_manifest_set();
   ASSERT_FALSE(qualified_manifest_set.offers.empty());
-  EXPECT_EQ(qualified_a->offer(),
-            qualified_manifest_set.offers.front());
+  EXPECT_EQ(qualified_a->offer(), qualified_manifest_set.offers.front());
   EXPECT_EQ(package_a.query->plan.runtime_contract_offer_digest,
             package_b.query->plan.runtime_contract_offer_digest);
   ASSERT_TRUE(component_manager::VerifyNativeExecutionRuntimeUnitForHost(
@@ -780,11 +773,10 @@ TEST(RetainedNativeRuntimeUnitAdapter,
   const auto target_a = InstallNativeTestTargets(
       std::filesystem::path(MANYFORGE_NATIVE_EXECUTION_TARGET_ROOT) /
           std::string(contract::kInstalledTargetId),
-      candidate_worker_source,
-      target_root_a.path());
-  const auto target_b = InstallNativeTestTargets(
-      MANYFORGE_NATIVE_PICK_PLACE_EXECUTION_TARGET, candidate_worker_source,
-      target_root_b.path());
+      candidate_worker_source, target_root_a.path());
+  const auto target_b =
+      InstallNativeTestTargets(MANYFORGE_NATIVE_PICK_PLACE_EXECUTION_TARGET,
+                               candidate_worker_source, target_root_b.path());
   const auto executable_digest_a =
       content_identity::sha256_digest(ReadFile(target_a));
   const auto executable_digest_b =
@@ -808,9 +800,10 @@ TEST(RetainedNativeRuntimeUnitAdapter,
     const auto started_a = adapter_a.EnsureRunning(*package_a.query);
     ASSERT_EQ(started_a.state(),
               component_manager::ProcessPresenceState::kPresent);
-    ASSERT_TRUE(adapter_a.ObserveProgress(
-        *package_a.query,
-        core::RuntimeEpoch(started_a.process_incarnation()))
+    ASSERT_TRUE(adapter_a
+                    .ObserveProgress(
+                        *package_a.query,
+                        core::RuntimeEpoch(started_a.process_incarnation()))
                     .has_value());
     EXPECT_EQ(adapter_a.EnsureStopped(*package_a.query).state(),
               component_manager::ProcessPresenceState::kAbsent);
@@ -824,8 +817,8 @@ TEST(RetainedNativeRuntimeUnitAdapter,
     ASSERT_EQ(first_b.state(),
               component_manager::ProcessPresenceState::kPresent);
     const core::RuntimeEpoch first_epoch(first_b.process_incarnation());
-    ASSERT_TRUE(adapter_b.ObserveProgress(*package_b.query, first_epoch)
-                    .has_value());
+    ASSERT_TRUE(
+        adapter_b.ObserveProgress(*package_b.query, first_epoch).has_value());
     EXPECT_EQ(adapter_b.EnsureStopped(*package_b.query).state(),
               component_manager::ProcessPresenceState::kAbsent);
     EXPECT_EQ(adapter_b.ObserveProcess(*package_b.query).state(),
@@ -835,10 +828,11 @@ TEST(RetainedNativeRuntimeUnitAdapter,
     ASSERT_EQ(second_b.state(),
               component_manager::ProcessPresenceState::kPresent);
     EXPECT_NE(second_b.process_incarnation(), first_epoch.value());
-    ASSERT_TRUE(adapter_b.ObserveProgress(
-        *package_b.query,
-        core::RuntimeEpoch(second_b.process_incarnation()))
-                    .has_value());
+    ASSERT_TRUE(
+        adapter_b
+            .ObserveProgress(*package_b.query,
+                             core::RuntimeEpoch(second_b.process_incarnation()))
+            .has_value());
     EXPECT_EQ(adapter_b.EnsureStopped(*package_b.query).state(),
               component_manager::ProcessPresenceState::kAbsent);
     EXPECT_EQ(adapter_b.ObserveProcess(*package_b.query).state(),
@@ -1077,16 +1071,32 @@ TEST(RetainedNativeRuntimeUnitAdapter,
           core::RequestOwnerEpoch("adapter-program-runner"), 1U,
           core::ProgramCycleStateDTO::kIdleAfterReset, std::nullopt,
           std::nullopt, std::nullopt},
-      true, 2U, 2U, true, true, 0U, 0U, 0U};
+      true,
+      2U,
+      2U,
+      true,
+      true,
+      0U,
+      0U,
+      0U};
   const auto updated = adapter.UpdateCellAdmissionReadiness(readiness);
   ASSERT_TRUE(updated.ok()) << updated.error().message;
   EXPECT_FALSE(updated.value().authoring_allowed);
 
   const auto &liveness_policy = contract::manager_liveness_policy();
+  const core::RuntimeUnitId program_runner_id(
+      "program-runner.native-adapter-test");
+  const core::RuntimeEpoch program_runner_epoch(
+      "program-runner-epoch.native-adapter-test");
+  const core::RuntimePolicyId program_runner_policy_id(
+      "manyforge.program-runner.manager-presence.v1");
+  const core::RuntimePolicyRevision program_runner_policy_revision("1");
   std::vector<core::RequiredManagerLivenessReceiverDTO> receivers{
       {fixture.query->plan.runtime_unit_id, first_epoch,
        liveness_policy.runtime_policy_id,
-       liveness_policy.runtime_policy_revision}};
+       liveness_policy.runtime_policy_revision},
+      {program_runner_id, program_runner_epoch, program_runner_policy_id,
+       program_runner_policy_revision}};
   const auto required_set_digest =
       core::ComputeRequiredRuntimeSetDigest(receivers);
   const core::RuntimeUnitId manager_runtime_unit_id(
@@ -1120,15 +1130,36 @@ TEST(RetainedNativeRuntimeUnitAdapter,
       required_set_digest,
       core::ContentDigest(std::string(kIntentDigest))};
   const auto liveness = adapter.RenewManagerLiveness(
-      {fixture.query->plan.runtime_unit_id,
-       publication.publication_generation,
+      {fixture.query->plan.runtime_unit_id, publication.publication_generation,
        publication.request.candidate_graph_revision,
-       publication.durable_public_pointer_content_digest,
-       required_set, liveness_policy, heartbeat, reconciliation});
+       publication.durable_public_pointer_content_digest, required_set,
+       liveness_policy, heartbeat, reconciliation});
   EXPECT_EQ(liveness.active_bundle_id, required_set.active_bundle_id);
   EXPECT_EQ(liveness.required_runtime_set_digest, required_set_digest);
   EXPECT_EQ(liveness.status.state, core::ManagerLivenessStateDTO::kCurrent);
   EXPECT_FALSE(liveness.status.command_fenced);
+
+  EXPECT_FALSE(adapter.GetAuthoringAdmission().authoring_allowed);
+  core::ManagerLivenessStatusDTO program_runner_status{
+      required_set.cell_id,
+      program_runner_id,
+      program_runner_epoch,
+      manager_runtime_unit_id,
+      manager_runtime_epoch,
+      manager_owner_epoch,
+      program_runner_policy_id,
+      program_runner_policy_revision,
+      1U,
+      1U,
+      0,
+      core::ManagerLivenessStateDTO::kCurrent,
+      false,
+      std::nullopt};
+  const core::ManagerLivenessObservationDTO program_runner_observation{
+      program_runner_status, required_set.active_bundle_id, required_set_digest,
+      core::ComputeManagerLivenessStatusDigest(program_runner_status)};
+  const auto published = adapter.Publish(program_runner_observation);
+  ASSERT_TRUE(published.ok()) << published.error().message;
 
   const auto authoring_admission = adapter.GetAuthoringAdmission();
   ASSERT_TRUE(authoring_admission.authoring_allowed);
@@ -1190,11 +1221,10 @@ TEST(RetainedNativeRuntimeUnitAdapter,
   auto renewed_heartbeat = heartbeat;
   renewed_heartbeat.heartbeat_sequence = 2U;
   const auto renewed_liveness = adapter.RenewManagerLiveness(
-      {fixture.query->plan.runtime_unit_id,
-       publication.publication_generation,
+      {fixture.query->plan.runtime_unit_id, publication.publication_generation,
        publication.request.candidate_graph_revision,
-       publication.durable_public_pointer_content_digest,
-       required_set, liveness_policy, renewed_heartbeat, reconciliation});
+       publication.durable_public_pointer_content_digest, required_set,
+       liveness_policy, renewed_heartbeat, reconciliation});
   ASSERT_EQ(renewed_liveness.status.state,
             core::ManagerLivenessStateDTO::kCurrent);
 
@@ -1216,7 +1246,8 @@ TEST(RetainedNativeRuntimeUnitAdapter,
   const auto frame_deadline =
       std::chrono::steady_clock::now() + std::chrono::seconds(10);
   while (std::chrono::steady_clock::now() < frame_deadline) {
-    const auto observed_frame = resolved.value()->ResolveSceneFrame(frame_query);
+    const auto observed_frame =
+        resolved.value()->ResolveSceneFrame(frame_query);
     if (observed_frame.ok()) {
       frame = observed_frame.value();
       break;
@@ -1231,8 +1262,7 @@ TEST(RetainedNativeRuntimeUnitAdapter,
   ASSERT_TRUE(frame->valid());
   EXPECT_EQ(frame->projection_binding, retained_binding.value());
   const auto *component_frame =
-      std::get_if<core::ResolvedComponentModelFrameDTO>(
-          &frame->resolved_frame);
+      std::get_if<core::ResolvedComponentModelFrameDTO>(&frame->resolved_frame);
   ASSERT_NE(component_frame, nullptr);
   EXPECT_EQ(component_frame->controllable_component_id,
             control_binding.controllable_component_id);
@@ -1394,20 +1424,18 @@ TEST(RetainedNativeRuntimeUnitAdapter,
   const auto predecessor = PublishActiveFixture(fixture);
   auto adapter = MakeAdapter(fixture, MANYFORGE_NATIVE_EXECUTION_TARGET_ROOT);
   const auto started = adapter.EnsureRunning(*fixture.query);
-  ASSERT_EQ(started.state(),
-            component_manager::ProcessPresenceState::kPresent);
+  ASSERT_EQ(started.state(), component_manager::ProcessPresenceState::kPresent);
 
   component_manager::SqliteActiveBundlePublicationStore store(
       fixture.manager_state_root.path() /
           std::string(component_manager::kActiveBundlePublicationStoreFilename),
       fixture.bundle->value().cell_graph.cell_id);
-  auto successor_projection =
-      predecessor.request.candidate_projection_revision;
+  auto successor_projection = predecessor.request.candidate_projection_revision;
   ++successor_projection.scene_revision.revision_id;
   const auto successor = store.PublishActiveBundle(
       {core::NamedApplyPublicationTransactionDTO{
-           core::ApplyId("native-adapter-successor"),
-           core::ApplyGeneration(1U), core::ProjectionStageGeneration(1U)},
+           core::ApplyId("native-adapter-successor"), core::ApplyGeneration(1U),
+           core::ProjectionStageGeneration(1U)},
        successor_projection, successor_projection.retained_bundle_id,
        successor_projection.graph_revision, predecessor.publication_generation,
        core::ContentDigest(std::string(kIntentDigest)),
@@ -1416,7 +1444,7 @@ TEST(RetainedNativeRuntimeUnitAdapter,
   ASSERT_GT(successor.publication_generation,
             predecessor.publication_generation);
 
-  const auto& policy = contract::manager_liveness_policy();
+  const auto &policy = contract::manager_liveness_policy();
   const core::RuntimeEpoch runtime_epoch(started.process_incarnation());
   const std::vector<core::RequiredManagerLivenessReceiverDTO> receivers{
       {fixture.query->plan.runtime_unit_id, runtime_epoch,
@@ -1432,24 +1460,31 @@ TEST(RetainedNativeRuntimeUnitAdapter,
   const core::ManagerLivenessRequiredSetDTO required_set{
       fixture.bundle->value().cell_graph.cell_id,
       predecessor.request.candidate_retained_bundle_id,
-      required_set_digest, manager_id, manager_epoch, manager_owner, receivers};
-  const core::ManagerHeartbeatDTO heartbeat{
-      required_set.cell_id, manager_id, manager_epoch, manager_owner, 1U,
-      policy.runtime_policy_id, policy.runtime_policy_revision};
+      required_set_digest,
+      manager_id,
+      manager_epoch,
+      manager_owner,
+      receivers};
+  const core::ManagerHeartbeatDTO heartbeat{required_set.cell_id,
+                                            manager_id,
+                                            manager_epoch,
+                                            manager_owner,
+                                            1U,
+                                            policy.runtime_policy_id,
+                                            policy.runtime_policy_revision};
 
-  EXPECT_THROW(
-      static_cast<void>(adapter.RenewManagerLiveness(
-          {fixture.query->plan.runtime_unit_id,
-           predecessor.publication_generation,
-           predecessor.request.candidate_graph_revision,
-           predecessor.durable_public_pointer_content_digest, required_set,
-           policy, heartbeat, std::nullopt})),
-      component_manager::ManagerLivenessPublicationSuperseded);
+  EXPECT_THROW(static_cast<void>(adapter.RenewManagerLiveness(
+                   {fixture.query->plan.runtime_unit_id,
+                    predecessor.publication_generation,
+                    predecessor.request.candidate_graph_revision,
+                    predecessor.durable_public_pointer_content_digest,
+                    required_set, policy, heartbeat, std::nullopt})),
+               component_manager::ManagerLivenessPublicationSuperseded);
   const auto after = adapter.ObserveProcess(*fixture.query);
   EXPECT_EQ(after.state(), component_manager::ProcessPresenceState::kPresent);
   EXPECT_EQ(after.process_incarnation(), runtime_epoch.value());
-  ASSERT_TRUE(adapter.ObserveProgress(*fixture.query, runtime_epoch)
-                  .has_value());
+  ASSERT_TRUE(
+      adapter.ObserveProgress(*fixture.query, runtime_epoch).has_value());
 }
 
 TEST(RetainedNativeRuntimeUnitAdapter,

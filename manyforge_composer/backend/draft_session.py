@@ -1047,52 +1047,6 @@ class ComposerDraftSession:
                 )
             return applier(self._program)
 
-    def load_and_apply_program(
-        self,
-        *,
-        draft_id: str,
-        expected_revision: int,
-        discard_changes: bool,
-        current_applied_program_revision: str | None,
-        loader: Callable[[], tuple[Program, str]],
-        applier: Callable[[Program], dict[str, Any]],
-        replacement_draft_id: str | None = None,
-    ) -> tuple[dict[str, Any], dict[str, Any]]:
-        """Run normative Load under one Draft fence; publish locally last."""
-
-        with self._lock:
-            self._require_identity_locked(
-                draft_id=draft_id,
-                expected_revision=expected_revision,
-            )
-            has_unapplied_changes = (
-                self._program is not None
-                and self._program.program_revision
-                != current_applied_program_revision
-            )
-            if (
-                self._program is not None
-                and (not self._matches_saved_locked() or has_unapplied_changes)
-                and not discard_changes
-            ):
-                _error(
-                    "composer_draft_discard_confirmation_required",
-                    "loading another Program would discard unsaved or unapplied "
-                    "Draft changes",
-                    status_code=409,
-                )
-            program, source_path = loader()
-            result = applier(program)
-            self._draft_id = replacement_draft_id or f"draft-{uuid.uuid4().hex}"
-            self._program = program
-            self._revision = 1
-            self._saved_path = str(Path(source_path).resolve())
-            self._saved_program_revision = program.program_revision
-            self._saved_document = program.to_dict()
-            return result, self._workspace_snapshot_locked(
-                applied_program_revision=program.program_revision,
-            )
-
     def save_program(
         self,
         *,

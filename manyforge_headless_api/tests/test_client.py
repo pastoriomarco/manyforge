@@ -332,7 +332,7 @@ def test_client_uses_exact_program_selection_and_run_routes() -> None:
 
     def handler(request: httpx.Request) -> httpx.Response:
         requests.append(request)
-        if request.url.path.endswith("/program-selection"):
+        if request.url.path.endswith(("/program-selection", "/load-selection")):
             payload = _client_scenario_selection()
         elif request.url.path == "/api/program/applied":
             payload = _client_applied()
@@ -347,6 +347,7 @@ def test_client_uses_exact_program_selection_and_run_routes() -> None:
     client = HeadlessHttpClient("http://unused.test", client=raw)
     try:
         client.scenario_program_selection("cell-pick")
+        client.scenario_load_selection("cell-pick")
         client.program_applied()
         client.program_runs(active_only=True, limit=7)
         client.program_run_start({"request_id": "request.1"})
@@ -360,18 +361,19 @@ def test_client_uses_exact_program_selection_and_run_routes() -> None:
 
     assert [request.url.path for request in requests] == [
         "/api/scenarios/cell-pick/program-selection",
+        "/api/scenarios/cell-pick/load-selection",
         "/api/program/applied",
         "/api/program/runs",
         "/api/program/runs",
         "/api/program/runs/program run:1",
         "/api/program/runs/program run:1/stop",
     ]
-    assert dict(requests[2].url.params) == {
+    assert dict(requests[3].url.params) == {
         "active_only": "true",
         "limit": "7",
     }
-    assert json.loads(requests[3].read()) == {"request_id": "request.1"}
-    assert json.loads(requests[5].read()) == {"request_id": "request.2"}
+    assert json.loads(requests[4].read()) == {"request_id": "request.1"}
+    assert json.loads(requests[6].read()) == {"request_id": "request.2"}
 
 
 def test_client_rejects_rehashed_malformed_scenario_binding() -> None:

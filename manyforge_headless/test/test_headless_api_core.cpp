@@ -866,6 +866,10 @@ TEST(HeadlessApiCore,
   auto config = Config(directory, "api.epoch.1", package);
   config.cell_id = cell_id;
   HeadlessApiCore core(std::move(config), Clocks());
+  const auto load_selection = core.ScenarioLoadSelection(selection.scenario_id);
+  EXPECT_EQ(Text(load_selection, "program_binding_id"),
+            selection.program_binding_id.value());
+  EXPECT_TRUE(Array(load_selection, "owner_identities").empty());
   EXPECT_FALSE(
       std::get<bool>(Member(core.RuntimeSnapshot(), "complete").storage()));
 

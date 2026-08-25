@@ -208,10 +208,10 @@ def create_app(
         "/api/program/apply",
         "/api/program/new-draft",
         "/api/program/discard",
-        "/api/program/load",
         "/api/program/revert",
         "/api/program/runs",
         "/api/program/save",
+        "/api/scenarios/load",
     ):
         app.add_middleware(
             ComposerRequestBodyLimitMiddleware,

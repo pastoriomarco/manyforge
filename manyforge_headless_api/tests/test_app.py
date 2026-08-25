@@ -272,6 +272,16 @@ def test_scenario_program_selection_rejects_rehashed_malformed_binding() -> None
     assert response.json()["detail"]["code"] == "scenario_program_selection_invalid"
 
 
+def test_scenario_load_selection_uses_effect_free_package_projection() -> None:
+    core = FakeCore()
+    client = TestClient(create_app(service=_service(core, FakeManager())))
+
+    response = client.get("/api/scenarios/cell-pick/load-selection")
+
+    assert response.status_code == 200
+    assert response.json() == _scenario_selection()
+
+
 @pytest.mark.parametrize(
     "break_projection",
     [
@@ -520,6 +530,11 @@ class FakeCore:
         }
 
     def scenario_program_selection(self, scenario_id: str) -> dict[str, Any]:
+        if self.scenario_selection_override is not None:
+            return copy.deepcopy(self.scenario_selection_override)
+        return _scenario_selection(scenario_id=scenario_id)
+
+    def scenario_load_selection(self, scenario_id: str) -> dict[str, Any]:
         if self.scenario_selection_override is not None:
             return copy.deepcopy(self.scenario_selection_override)
         return _scenario_selection(scenario_id=scenario_id)
