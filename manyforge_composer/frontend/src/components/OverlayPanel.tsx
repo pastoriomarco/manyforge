@@ -1,4 +1,5 @@
 import {
+  useCallback,
   useEffect,
   useRef,
   type MouseEvent,
@@ -30,25 +31,24 @@ export function OverlayPanel({
   children,
 }: OverlayPanelProps) {
   const closeButton = useRef<HTMLButtonElement>(null);
+  const close = useCallback(() => {
+    onClose();
+    window.requestAnimationFrame(() => returnFocusRef?.current?.focus());
+  }, [onClose, returnFocusRef]);
 
   useEffect(() => {
     if (!open) return undefined;
     const handleKeyDown = (event: KeyboardEvent) => {
       if (event.key !== 'Escape') return;
       event.preventDefault();
-      onClose();
+      close();
     };
     document.addEventListener('keydown', handleKeyDown);
     window.requestAnimationFrame(() => closeButton.current?.focus());
     return () => document.removeEventListener('keydown', handleKeyDown);
-  }, [onClose, open]);
+  }, [close, open]);
 
   if (!open) return null;
-
-  const close = () => {
-    onClose();
-    window.requestAnimationFrame(() => returnFocusRef?.current?.focus());
-  };
   const dismissOutside = (event: MouseEvent<HTMLDivElement>) => {
     if (event.target === event.currentTarget) close();
   };

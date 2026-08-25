@@ -117,6 +117,7 @@ export function useProgramWorkspace(snapshot: ComposerHeadlessState | null = nul
     && snapshot.draftIdentity.draftRevision === state.workspace.draft.draftRevision
     && snapshot.authoringAdmission.authoringAllowed
     && snapshot.programCycle.state === 'idle_after_reset';
+  const admissionObserved = snapshot !== null;
 
   const readWorkspace = useCallback((requestGeneration: number) => {
     if (
@@ -414,6 +415,7 @@ export function useProgramWorkspace(snapshot: ComposerHeadlessState | null = nul
   return {
     state,
     mutationAvailable,
+    admissionObserved,
     refresh,
     mutate,
     newDraft,

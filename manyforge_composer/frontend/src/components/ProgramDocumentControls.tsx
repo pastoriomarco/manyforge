@@ -60,11 +60,13 @@ export function ProgramDocumentControls({
     load: loadProgram,
   } = controller;
   const [action, setAction] = useState<ProgramAction | null>(null);
+  const [settingsOpen, setSettingsOpen] = useState(false);
   const [selectedProgramPath, setSelectedProgramPath] = useState<string | null>(null);
   const [confirmDiscard, setConfirmDiscard] = useState(false);
   const [confirmOverwrite, setConfirmOverwrite] = useState(false);
   const [saveAsPath, setSaveAsPath] = useState('');
   const returnFocus = useRef<HTMLElement | null>(null);
+  const settingsButton = useRef<HTMLButtonElement>(null);
   const workspace = state.workspace;
   const program = workspace?.draft.program ?? null;
   const busy = state.status === 'loading'
@@ -128,6 +130,7 @@ export function ProgramDocumentControls({
           <strong title={workspace?.saved.path ?? program?.description ?? programName}>
             {programName}
           </strong>
+          <span className="document-identity-divider" aria-hidden="true" />
           <span
             className={`document-state state-${draftState}`}
             title={`Draft ${shortRevision(workspace?.draft.programRevision ?? null)} · ID ${workspace?.draft.draftId ?? 'unavailable'} · edit ${workspace?.draft.draftRevision ?? 0}`}
@@ -146,6 +149,19 @@ export function ProgramDocumentControls({
           >
             {appliedState}
           </span>
+          <span className="document-identity-divider document-settings-divider" aria-hidden="true" />
+          <button
+            ref={settingsButton}
+            type="button"
+            className="icon-button program-settings-button"
+            aria-label="Program-wide settings"
+            title="Program-wide settings"
+            disabled={program === null}
+            onClick={() => setSettingsOpen(true)}
+          >
+            ⚙
+          </button>
+          <span className="document-identity-divider document-settings-divider" aria-hidden="true" />
         </div>
 
         <div className="program-document-actions">
@@ -160,6 +176,30 @@ export function ProgramDocumentControls({
           <button className="primary-action" type="button" disabled={authoringBusy || !program} onClick={(event) => beginAction('apply', event)}>Apply</button>
         </div>
       </div>
+
+      <OverlayPanel
+        open={settingsOpen}
+        title="Program settings"
+        titleId="program-settings-title"
+        kind="info"
+        onClose={() => setSettingsOpen(false)}
+        returnFocusRef={settingsButton}
+      >
+        {program && (
+          <div className="program-settings-summary">
+            <p>Current Program-wide Draft facts. Editing remains unavailable in this surface.</p>
+            <dl>
+              <div><dt>Program ID</dt><dd><code>{program.program_id}</code></dd></div>
+              <div><dt>Profile</dt><dd><code>{program.program_profile}</code></dd></div>
+              <div><dt>Description</dt><dd>{program.description || 'Not provided'}</dd></div>
+              <div><dt>Catalog version</dt><dd><code>{program.catalog.content_version}</code></dd></div>
+              <div><dt>Component roles</dt><dd>{Object.keys(program.component_roles).length}</dd></div>
+              <div><dt>Target roles</dt><dd>{Object.keys(program.target_roles).length}</dd></div>
+              <div><dt>Compatibility fields</dt><dd>{Object.keys(program.compatibility ?? {}).length}</dd></div>
+            </dl>
+          </div>
+        )}
+      </OverlayPanel>
 
       <OverlayPanel
         open={action !== null}

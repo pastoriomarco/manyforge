@@ -84,7 +84,7 @@ interface ProgramTreeCanvasProps {
   environment: NodeEnvironmentResponse | null;
   selectedId: string | null;
   busy: boolean;
-  onSelect: (instanceId: string) => void;
+  onSelect: (instanceId: string | null) => void;
   onMutate: (mutation: string, args: Record<string, JsonValue>) => void;
   onStageInsert?: (request: ProgramInsertionRequest) => void;
 }
@@ -135,6 +135,7 @@ function ProgramStatusEdge({
 
 const NODE_TYPES: NodeTypes = { programNode: ProgramFlowNode };
 const EDGE_TYPES: EdgeTypes = { statusEdge: ProgramStatusEdge };
+type CanvasMessageKind = 'info' | 'error';
 
 export function ProgramTreeCanvas({
   root,
@@ -152,9 +153,20 @@ export function ProgramTreeCanvas({
   >({});
   const [focusedNodeId, setFocusedNodeId] = useState<string | null>(null);
   const [canvasMessage, setCanvasMessage] = useState<string | null>(null);
+  const [canvasMessageKind, setCanvasMessageKind] = useState<CanvasMessageKind>('info');
   const flowInstance = useRef<ReactFlowInstance<ProgramFlowNode, ProgramFlowEdge> | null>(null);
   const nodeElements = useRef<Record<string, HTMLDivElement | null>>({});
   const dropRequestId = useRef(0);
+  const showCanvasMessage = useCallback((message: string, kind: CanvasMessageKind) => {
+    setCanvasMessageKind(kind);
+    setCanvasMessage(message);
+  }, []);
+  const clearCanvasMessage = useCallback(() => setCanvasMessage(null), []);
+  useEffect(() => {
+    if (canvasMessage === null || canvasMessageKind !== 'info') return undefined;
+    const timeout = window.setTimeout(clearCanvasMessage, 4_000);
+    return () => window.clearTimeout(timeout);
+  }, [canvasMessage, canvasMessageKind, clearCanvasMessage]);
   const flat = useMemo(() => flattenProgramTree(root), [root]);
   const catalog = useMemo(
     () => new Map(catalogEntries.map((entry) => [entry.id, entry])),
@@ -249,7 +261,7 @@ export function ProgramTreeCanvas({
       selectedRow.node.instance_id,
     );
     if (validationError) {
-      setCanvasMessage(validationError);
+      showCanvasMessage(validationError, 'error');
       return;
     }
     const mutation = programDeleteMutation(
@@ -257,7 +269,7 @@ export function ProgramTreeCanvas({
       selectedRow.parentId === null,
     );
     if (mutation) onMutate(mutation.mutation, mutation.args);
-  }, [authoringDisabled, edges, laidOut, onMutate, selectedRow]);
+  }, [authoringDisabled, edges, laidOut, onMutate, selectedRow, showCanvasMessage]);
 
   const onNodeDelete = useCallback((
     event: KeyboardEvent<HTMLDivElement>,
@@ -382,7 +394,7 @@ export function ProgramTreeCanvas({
 
   const onConnect = useCallback((connection: Connection) => {
     if (authoringDisabled) {
-      setCanvasMessage('Draft editing is unavailable while the owner is busy or portable authoring is gated.');
+      showCanvasMessage('Draft editing is unavailable while the owner is busy or portable authoring is gated.', 'error');
       return;
     }
     const result = authoringMoveIntent(
@@ -392,17 +404,17 @@ export function ProgramTreeCanvas({
       connection.target,
     );
     if (result.error || !result.intent) {
-      setCanvasMessage(result.error ?? 'That connection is not valid.');
+      showCanvasMessage(result.error ?? 'That connection is not valid.', 'error');
       return;
     }
-    setCanvasMessage(null);
+    clearCanvasMessage();
     const mutation = programMoveMutation(
       result.intent.instance_id,
       result.intent.new_parent_instance_id,
       result.intent.index,
     );
     onMutate(mutation.mutation, mutation.args);
-  }, [authoringDisabled, edges, laidOut, onMutate]);
+  }, [authoringDisabled, clearCanvasMessage, edges, laidOut, onMutate, showCanvasMessage]);
 
   const onDragOver = useCallback((event: DragEvent) => {
     if (authoringDisabled) return;
@@ -424,7 +436,7 @@ export function ProgramTreeCanvas({
       && point.y <= node.position.y + NODE_HEIGHT
     ));
     if (!target) {
-      setCanvasMessage('Drop a palette node on a concrete tree node to choose its insertion target.');
+      showCanvasMessage('Drop a palette node on a concrete tree node to choose its insertion target.', 'error');
       return;
     }
     const staged = stageProgramCanvasDrop(
@@ -435,13 +447,13 @@ export function ProgramTreeCanvas({
       dropRequestId.current + 1,
     );
     if (!staged.request) {
-      setCanvasMessage(staged.error ?? 'That drop cannot be staged.');
+      showCanvasMessage(staged.error ?? 'That drop cannot be staged.', 'error');
       return;
     }
     onSelect(target.id);
     dropRequestId.current = staged.request.requestId;
     onStageInsert?.(staged.request);
-    setCanvasMessage('Insertion staged. Review the instance ID and parameters, then choose Add to Draft.');
+    showCanvasMessage('Insertion staged. Review the instance ID and parameters, then choose Add to Draft.', 'info');
   }, [
     authoringDisabled,
     catalogEntries,
@@ -449,6 +461,7 @@ export function ProgramTreeCanvas({
     onSelect,
     onStageInsert,
     root,
+    showCanvasMessage,
   ]);
 
   const fitView = useCallback(() => {
@@ -456,9 +469,9 @@ export function ProgramTreeCanvas({
   }, []);
   const autoLayout = useCallback(() => {
     setPresentationPositions({});
-    setCanvasMessage('Deterministic layout refreshed. Dragged positions are presentation-only.');
+    showCanvasMessage('Layout refreshed. Dragged positions affect only this view.', 'info');
     requestAnimationFrame(fitView);
-  }, [fitView]);
+  }, [fitView, showCanvasMessage]);
 
   useEffect(() => {
     if (!flowInstance.current) return;
@@ -535,6 +548,10 @@ export function ProgramTreeCanvas({
           edgeTypes={EDGE_TYPES}
           onNodesChange={onNodesChange}
           onConnect={onConnect}
+          onPaneClick={() => {
+            setFocusedNodeId(null);
+            onSelect(null);
+          }}
           onDragOver={onDragOver}
           onDrop={onDrop}
           onInit={(instance) => {
@@ -624,7 +641,20 @@ export function ProgramTreeCanvas({
           </div>
         )}
         {canvasMessage && (
-          <p className="program-inline-message program-canvas-message">{canvasMessage}</p>
+          <div
+            className={`program-inline-message program-canvas-message message-${canvasMessageKind}`}
+            role={canvasMessageKind === 'error' ? 'alert' : 'status'}
+          >
+            <span>{canvasMessage}</span>
+            <button
+              type="button"
+              className="icon-button"
+              aria-label="Dismiss canvas message"
+              onClick={clearCanvasMessage}
+            >
+              ×
+            </button>
+          </div>
         )}
       </div>
       <span className="sr-only" aria-live="polite">

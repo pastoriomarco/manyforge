@@ -1,4 +1,5 @@
-import { useEffect, useMemo, useState } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
+import type { CSSProperties } from 'react';
 
 import type { ProgramRuntimeController } from '../hooks/useProgramRuntime';
 import type { ProgramWorkspaceController } from '../hooks/useProgramWorkspace';
@@ -9,10 +10,27 @@ import type {
 } from '../types/api';
 import { flattenProgramTree } from '../utils/programAuthoring';
 import type { ProgramInsertionRequest } from '../utils/programCanvasInteraction';
+import { PaneDivider } from './PaneDivider';
 import { ProgramDeclarationsEditor } from './ProgramDeclarationsEditor';
+import {
+  ProgramDeclarationsNavigator,
+  type ProgramDeclarationSelection,
+} from './ProgramDeclarationsNavigator';
 import { ProgramNodePalette } from './ProgramNodePalette';
 import { ProgramPropertyEditor } from './ProgramPropertyEditor';
 import { ProgramTreeCanvas } from './ProgramTreeCanvas';
+
+const PROGRAM_TOOL_MIN = 160;
+const PROGRAM_TOOL_MAX = 360;
+const PROGRAM_INSPECTOR_MIN = 240;
+const PROGRAM_INSPECTOR_MAX = 480;
+const PROGRAM_CANVAS_MIN = 216;
+const PROGRAM_DIVIDER_WIDTH = 7;
+const PROGRAM_COLLAPSED_RAIL_WIDTH = 38;
+
+function clamp(value: number, min: number, max: number): number {
+  return Math.min(Math.max(value, min), max);
+}
 
 interface ProgramWorkspaceProps {
   controller: ProgramWorkspaceController;
@@ -34,6 +52,7 @@ export function ProgramWorkspace({
   const {
     state,
     mutationAvailable,
+    admissionObserved,
     refresh,
     mutate,
     updateNodePolicies,
@@ -43,7 +62,18 @@ export function ProgramWorkspace({
   const [insertionRequest, setInsertionRequest] = useState<ProgramInsertionRequest | null>(null);
   const [paletteCollapsed, setPaletteCollapsed] = useState(false);
   const [inspectorCollapsed, setInspectorCollapsed] = useState(false);
-  const [inspectorView, setInspectorView] = useState<'properties' | 'declarations'>('properties');
+  const [toolView, setToolView] = useState<'nodes' | 'params'>('nodes');
+  const [declarationSelection, setDeclarationSelection] = useState<ProgramDeclarationSelection | null>(null);
+  const [paletteWidth, setPaletteWidth] = useState(216);
+  const [inspectorWidth, setInspectorWidth] = useState(288);
+  const [authoringWidth, setAuthoringWidth] = useState(856);
+  const authoringGrid = useRef<HTMLDivElement>(null);
+  const paletteCollapseButton = useRef<HTMLButtonElement>(null);
+  const paletteRail = useRef<HTMLButtonElement>(null);
+  const inspectorCollapseButton = useRef<HTMLButtonElement>(null);
+  const inspectorRail = useRef<HTMLButtonElement>(null);
+  const previousPaletteCollapsed = useRef(false);
+  const previousInspectorCollapsed = useRef(false);
   const workspace = state.workspace;
   const program = workspace?.draft.program ?? null;
   const busy = state.status === 'loading'
@@ -73,10 +103,56 @@ export function ProgramWorkspace({
       setSelectedNodeId(null);
       return;
     }
-    if (!selectedNodeId || !validNodeIds.has(selectedNodeId)) {
-      setSelectedNodeId(program.tree.instance_id);
+    if (selectedNodeId && !validNodeIds.has(selectedNodeId)) {
+      setSelectedNodeId(null);
     }
   }, [program, selectedNodeId, validNodeIds]);
+  useEffect(() => {
+    if (paletteCollapsed) paletteRail.current?.focus();
+    else if (previousPaletteCollapsed.current) paletteCollapseButton.current?.focus();
+    previousPaletteCollapsed.current = paletteCollapsed;
+  }, [paletteCollapsed]);
+  useEffect(() => {
+    if (inspectorCollapsed) inspectorRail.current?.focus();
+    else if (previousInspectorCollapsed.current) inspectorCollapseButton.current?.focus();
+    previousInspectorCollapsed.current = inspectorCollapsed;
+  }, [inspectorCollapsed]);
+  useEffect(() => {
+    const element = authoringGrid.current;
+    if (element === null) return undefined;
+    const update = () => setAuthoringWidth(element.clientWidth);
+    update();
+    const observer = new ResizeObserver(update);
+    observer.observe(element);
+    return () => observer.disconnect();
+  }, []);
+
+  const inspectorReservation = inspectorCollapsed
+    ? PROGRAM_COLLAPSED_RAIL_WIDTH
+    : inspectorWidth + PROGRAM_DIVIDER_WIDTH;
+  const paletteReservation = paletteCollapsed
+    ? PROGRAM_COLLAPSED_RAIL_WIDTH
+    : paletteWidth + PROGRAM_DIVIDER_WIDTH;
+  const paletteWidthMax = Math.max(
+    PROGRAM_TOOL_MIN,
+    Math.min(
+      PROGRAM_TOOL_MAX,
+      authoringWidth - inspectorReservation - PROGRAM_CANVAS_MIN - PROGRAM_DIVIDER_WIDTH,
+    ),
+  );
+  const inspectorWidthMax = Math.max(
+    PROGRAM_INSPECTOR_MIN,
+    Math.min(
+      PROGRAM_INSPECTOR_MAX,
+      authoringWidth - paletteReservation - PROGRAM_CANVAS_MIN - PROGRAM_DIVIDER_WIDTH,
+    ),
+  );
+  useEffect(() => {
+    setPaletteWidth((current) => clamp(current, PROGRAM_TOOL_MIN, paletteWidthMax));
+  }, [paletteWidthMax]);
+  useEffect(() => {
+    setInspectorWidth((current) => clamp(current, PROGRAM_INSPECTOR_MIN, inspectorWidthMax));
+  }, [inspectorWidthMax]);
 
   const gridClassName = [
     'program-authoring-grid',
@@ -84,6 +160,13 @@ export function ProgramWorkspace({
     paletteCollapsed ? 'palette-collapsed' : '',
     inspectorCollapsed ? 'inspector-collapsed' : '',
   ].filter(Boolean).join(' ');
+  const gridStyle = {
+    '--program-tool-width': `${paletteWidth}px`,
+    '--program-inspector-width': `${inspectorWidth}px`,
+  } as CSSProperties;
+  let inspectorTitle = '';
+  if (toolView === 'params') inspectorTitle = 'Declaration';
+  else if (selectedNodeId !== null) inspectorTitle = 'Properties';
 
   return (
     <section className="panel program-workspace" aria-label="Program authoring workspace">
@@ -114,7 +197,7 @@ export function ProgramWorkspace({
             <span>Draft inspection remains available; backend-owned authoring actions stay disabled until Idle.</span>
           </div>
         )}
-        {!runtime.active && workspace !== null && !mutationAvailable && (
+        {!runtime.active && workspace !== null && admissionObserved && !mutationAvailable && (
           <div className="program-workspace-notice" role="status">
             <strong>Authoring unavailable.</strong>
             <span>Waiting for current backend Idle admission and the matching Draft revision.</span>
@@ -149,17 +232,18 @@ export function ProgramWorkspace({
         )}
       </div>
 
-      <div className={gridClassName}>
+      <div ref={authoringGrid} className={gridClassName} style={gridStyle}>
         {paletteCollapsed ? (
           <button
+            ref={paletteRail}
             type="button"
             className="program-side-rail program-side-rail-left"
             aria-label="Expand node palette"
             onClick={() => setPaletteCollapsed(false)}
           >
-            <span aria-hidden="true">›</span><span>Nodes</span>
+            <span aria-hidden="true">›</span><span>{toolView === 'nodes' ? 'Nodes' : 'Params'}</span>
           </button>
-        ) : program ? (
+        ) : program && toolView === 'nodes' ? (
           <ProgramNodePalette
             root={program.tree}
             catalogEntries={catalogEntries}
@@ -171,18 +255,60 @@ export function ProgramWorkspace({
             dropRequest={insertionRequest}
             onDropRequestHandled={() => setInsertionRequest(null)}
             onCollapse={() => setPaletteCollapsed(true)}
+            collapseButtonRef={paletteCollapseButton}
+            onViewChange={setToolView}
           />
+        ) : program ? (
+          <section className="program-palette" aria-label="Program declaration navigation">
+            <header className="program-subpanel-header">
+              <div className="program-tool-tabs" aria-label="Program tools">
+                <button type="button" aria-pressed="false" onClick={() => setToolView('nodes')}>Nodes</button>
+                <button type="button" className="active" aria-pressed="true">Params</button>
+              </div>
+              <button
+                ref={paletteCollapseButton}
+                type="button"
+                className="icon-button"
+                aria-label="Collapse Program tools"
+                onClick={() => setPaletteCollapsed(true)}
+              >
+                ‹
+              </button>
+            </header>
+            <ProgramDeclarationsNavigator
+              root={program.tree}
+              parameters={program.parameters ?? []}
+              namespaces={program.blackboard?.namespaces ?? []}
+              keys={program.blackboard?.keys ?? []}
+              selected={declarationSelection}
+              onSelect={setDeclarationSelection}
+            />
+          </section>
         ) : (
           <section className="program-palette" aria-label="Node palette">
             <header className="program-subpanel-header">
-              <h3>Nodes</h3>
-              <button type="button" className="icon-button" aria-label="Collapse node palette" onClick={() => setPaletteCollapsed(true)}>‹</button>
+              <div className="program-tool-tabs" aria-label="Program tools">
+                <button type="button" className={toolView === 'nodes' ? 'active' : ''} aria-pressed={toolView === 'nodes'} onClick={() => setToolView('nodes')}>Nodes</button>
+                <button type="button" className={toolView === 'params' ? 'active' : ''} aria-pressed={toolView === 'params'} onClick={() => setToolView('params')}>Params</button>
+              </div>
+              <button ref={paletteCollapseButton} type="button" className="icon-button" aria-label="Collapse node palette" onClick={() => setPaletteCollapsed(true)}>‹</button>
             </header>
             <div className="program-empty-guidance">
               <strong>Open a Draft to use the palette</strong>
               <span>Use Open in the persistent header.</span>
             </div>
           </section>
+        )}
+
+        {!paletteCollapsed && (
+          <PaneDivider
+            label="Program tools"
+            className="program-pane-divider"
+            value={paletteWidth}
+            min={PROGRAM_TOOL_MIN}
+            max={paletteWidthMax}
+            onChange={setPaletteWidth}
+          />
         )}
 
         {program ? (
@@ -206,8 +332,21 @@ export function ProgramWorkspace({
           </section>
         )}
 
+        {!inspectorCollapsed && (
+          <PaneDivider
+            label="Program inspector"
+            className="program-pane-divider"
+            value={inspectorWidth}
+            min={PROGRAM_INSPECTOR_MIN}
+            max={inspectorWidthMax}
+            direction={-1}
+            onChange={setInspectorWidth}
+          />
+        )}
+
         {inspectorCollapsed ? (
           <button
+            ref={inspectorRail}
             type="button"
             className="program-side-rail program-side-rail-right"
             aria-label="Expand Program inspector"
@@ -218,23 +357,9 @@ export function ProgramWorkspace({
         ) : (
           <aside className="program-inspector" aria-label="Program inspector">
             <div className="program-inspector-tabs">
+              <strong>{inspectorTitle}</strong>
               <button
-                type="button"
-                className={inspectorView === 'properties' ? 'active' : ''}
-                aria-pressed={inspectorView === 'properties'}
-                onClick={() => setInspectorView('properties')}
-              >
-                Properties
-              </button>
-              <button
-                type="button"
-                className={inspectorView === 'declarations' ? 'active' : ''}
-                aria-pressed={inspectorView === 'declarations'}
-                onClick={() => setInspectorView('declarations')}
-              >
-                Declarations
-              </button>
-              <button
+                ref={inspectorCollapseButton}
                 type="button"
                 className="icon-button"
                 aria-label="Collapse Program inspector"
@@ -250,7 +375,9 @@ export function ProgramWorkspace({
                   <strong>Select a node to inspect properties</strong>
                   <span>Properties and declarations appear after a Draft is open.</span>
                 </div>
-              ) : inspectorView === 'properties' ? (
+              ) : toolView === 'nodes' && selectedNodeId === null ? (
+                <div className="program-inspector-empty" aria-label="No tree node selected" />
+              ) : toolView === 'nodes' ? (
                 <ProgramPropertyEditor
                   embedded
                   root={program.tree}
@@ -265,6 +392,8 @@ export function ProgramWorkspace({
               ) : (
                 <ProgramDeclarationsEditor
                   embedded
+                  selection={declarationSelection}
+                  showNavigation={false}
                   root={program.tree}
                   parameters={program.parameters ?? []}
                   namespaces={program.blackboard?.namespaces ?? []}

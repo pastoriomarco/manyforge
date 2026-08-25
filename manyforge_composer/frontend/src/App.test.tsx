@@ -12,29 +12,28 @@ describe('Composer shell continuity', () => {
     const elapsedMs = performance.now() - started;
 
     const workspace = markup.indexOf('aria-label="Program authoring workspace"');
-    const commands = markup.indexOf('aria-label="Viewer and operations rail"');
+    const commands = markup.indexOf('aria-label="3D viewer and live controls"');
     const viewer = markup.indexOf('id="viewer-title"');
-    const sceneAuthoring = markup.indexOf('id="scene-authoring-title"');
     const runtime = markup.indexOf('id="program-runtime-title"');
 
     expect(markup).toContain('aria-label="ManyForge Composer"');
     expect(markup).toContain('aria-label="Workbench sections"');
     expect(markup).toContain('>Program</button>');
+    expect(markup).toContain('>Scene</button>');
     expect(markup).toContain('>Deployment</button>');
     expect(markup).toContain('aria-label="Program document controls"');
     expect(markup).toContain('class="runtime-status-overlay"');
     expect(workspace).toBeGreaterThan(0);
     expect(commands).toBeGreaterThan(workspace);
     expect(viewer).toBeGreaterThan(commands);
-    expect(sceneAuthoring).toBeGreaterThan(viewer);
-    expect(runtime).toBeGreaterThan(sceneAuthoring);
+    expect(runtime).toBeGreaterThan(viewer);
     expect(markup).toContain('Runtime, alarms, and history');
     expect(markup).not.toContain('Catalog and artifact library');
     expect(markup).not.toContain('Artifacts · Program / Deployment');
     expect(markup).not.toContain('Headless runtime truth is connected');
     expect(markup).not.toContain('class="app-footer"');
     expect(markup.match(/class="runtime-status-overlay"/g)).toHaveLength(1);
-    expect(markup.match(/role="separator"/g)).toHaveLength(1);
+    expect(markup.match(/role="separator"/g)).toHaveLength(3);
     expect(elapsedMs).toBeLessThan(2000);
   });
 
@@ -50,9 +49,24 @@ describe('Composer shell continuity', () => {
       new URL('./components/SceneAuthoringWorkspace.tsx', import.meta.url),
       'utf8',
     );
+    const treeSource = readFileSync(
+      new URL('./components/ProgramTreeCanvas.tsx', import.meta.url),
+      'utf8',
+    );
+    const dividerSource = readFileSync(
+      new URL('./components/PaneDivider.tsx', import.meta.url),
+      'utf8',
+    );
+    const overlaySource = readFileSync(
+      new URL('./components/OverlayPanel.tsx', import.meta.url),
+      'utf8',
+    );
 
-    expect(markup).toContain('aria-label="Collapse viewer and operations pane"');
-    expect(markup).toContain('aria-label="Expand Operations pane"');
+    expect(markup).not.toContain('aria-label="Collapse viewer and operations pane"');
+    expect(markup).not.toContain('aria-label="Expand Operations pane"');
+    expect(markup).toContain('aria-label="Resize viewer and live controls pane"');
+    expect(markup).toContain('aria-label="Resize Program tools pane"');
+    expect(markup).toContain('aria-label="Resize Program inspector pane"');
     expect(markup).toContain('aria-label="Collapse node palette"');
     expect(markup).toContain('aria-label="Collapse Program inspector"');
     expect(css).toContain('.program-inspector-scroll');
@@ -61,17 +75,25 @@ describe('Composer shell continuity', () => {
     expect(css).toMatch(/\.program-tree-react-flow\s*\{[\s\S]*?height: 100%;[\s\S]*?min-height: 0;/);
     expect(css).toMatch(/\.program-inspector-scroll\s*\{[\s\S]*?overflow-y: auto;/);
     expect(css).toMatch(/\.workbench-workspace,\s*\n\.workbench-pane\s*\{[\s\S]*?overflow: hidden;/);
-    expect(source).toContain('role="separator"');
-    expect(source).toContain('setPointerCapture');
-    expect(source).toContain("event.key === 'ArrowLeft'");
-    expect(source).toContain("event.key === 'ArrowRight'");
-    expect(source).toContain("event.key === 'Home'");
-    expect(source).toContain("event.key === 'End'");
-    expect(source).toContain('target.current?.focus()');
+    expect(source).toContain('<PaneDivider');
+    expect(dividerSource).toContain('role="separator"');
+    expect(dividerSource).toContain('setPointerCapture');
+    expect(dividerSource).toContain("event.key === 'ArrowLeft'");
+    expect(dividerSource).toContain("event.key === 'ArrowRight'");
+    expect(dividerSource).toContain("event.key === 'Home'");
+    expect(dividerSource).toContain("event.key === 'End'");
+    expect(overlaySource).toContain("event.key !== 'Escape'");
+    expect(overlaySource).toContain('returnFocusRef?.current?.focus()');
+    expect(overlaySource).toMatch(/event\.preventDefault\(\);\s*close\(\);/);
+    expect(treeSource).toContain("canvasMessageKind !== 'info'");
+    expect(treeSource).toContain('window.setTimeout(clearCanvasMessage, 4_000)');
+    expect(treeSource).toContain('aria-label="Dismiss canvas message"');
     expect(source.match(/<SceneAuthoringWorkspace/g)).toHaveLength(1);
     expect(source.match(/useHeadlessStateSource\(headlessEnabled\)/g)).toHaveLength(1);
     expect(sceneSource.match(/<StructuralViewer/g)).toHaveLength(1);
-    expect(workspaceSource).toContain("'declarations'");
+    expect(sceneSource).toContain('createPortal(editorSurface, editorTarget)');
+    expect(workspaceSource).toContain("'params'");
+    expect(workspaceSource).toContain('<ProgramDeclarationsNavigator');
     expect(workspaceSource).toContain('<ProgramDeclarationsEditor');
     expect(source).not.toContain('<CatalogPanel');
     expect(source).not.toContain('<ArtifactBrowser');

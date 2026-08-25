@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import type { Ref } from 'react';
 
 import type {
   CatalogEntry,
@@ -43,6 +44,8 @@ interface ProgramNodePaletteProps {
   dropRequest?: ProgramInsertionRequest | null;
   onDropRequestHandled?: () => void;
   onCollapse?: () => void;
+  collapseButtonRef?: Ref<HTMLButtonElement>;
+  onViewChange?: (view: 'nodes' | 'params') => void;
 }
 
 function executionNote(
@@ -110,6 +113,8 @@ export function ProgramNodePalette({
   dropRequest = null,
   onDropRequestHandled,
   onCollapse,
+  collapseButtonRef,
+  onViewChange,
 }: ProgramNodePaletteProps) {
   const [query, setQuery] = useState('');
   const [stagedId, setStagedId] = useState<string | null>(null);
@@ -246,7 +251,10 @@ export function ProgramNodePalette({
     <section className="program-palette" aria-labelledby="program-palette-title">
       <header className="program-subpanel-header">
         <div className="program-subpanel-title">
-          <h3 id="program-palette-title">Nodes</h3>
+          <div id="program-palette-title" className="program-tool-tabs" aria-label="Program tools">
+            <button type="button" className="active" aria-pressed="true">Nodes</button>
+            <button type="button" aria-pressed="false" onClick={() => onViewChange?.('params')}>Params</button>
+          </div>
           <button
             ref={infoButton}
             type="button"
@@ -260,6 +268,7 @@ export function ProgramNodePalette({
         </div>
         {onCollapse && (
           <button
+            ref={collapseButtonRef}
             type="button"
             className="icon-button"
             aria-label="Collapse node palette"

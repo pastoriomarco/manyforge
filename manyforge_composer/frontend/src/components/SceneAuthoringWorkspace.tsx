@@ -1,4 +1,5 @@
 import { useEffect, useMemo, useState } from 'react';
+import { createPortal } from 'react-dom';
 
 import { api } from '../api/client';
 import { useShellHeadlessState, useViewerHeadlessState } from '../hooks/useHeadlessState';
@@ -36,6 +37,7 @@ import type { Pose3Value } from '../types/robotControl';
 import { StructuralViewer } from './StructuralViewer';
 
 interface SceneAuthoringWorkspaceProps {
+  editorTarget: HTMLElement | null;
   enabled: boolean;
   environment: StructuralResourceState<NodeEnvironmentResponse>;
   headlessStateSource: HeadlessStateSource;
@@ -644,6 +646,7 @@ function SceneViewerBridge({
 }
 
 export function SceneAuthoringWorkspace({
+  editorTarget,
   enabled,
   environment,
   headlessStateSource,
@@ -826,9 +829,7 @@ export function SceneAuthoringWorkspace({
     }
   };
 
-  return (
-    <>
-      {viewerSurface}
+  const editorSurface = (
       <section className="panel scene-authoring-workspace" aria-labelledby="scene-authoring-title">
         <header className="panel-header">
           <div>
@@ -1042,7 +1043,12 @@ export function SceneAuthoringWorkspace({
           )}
         </div>
       </section>
+  );
 
+  return (
+    <>
+      {viewerSurface}
+      {editorTarget === null ? null : createPortal(editorSurface, editorTarget)}
     </>
   );
 }

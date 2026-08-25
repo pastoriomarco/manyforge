@@ -3440,11 +3440,13 @@ code {
 }
 
 .app-header {
+  position: relative;
   display: grid;
-  grid-template-columns: auto auto minmax(0, 1fr) auto;
+  grid-template-columns: auto minmax(0, 1fr) auto auto;
   min-height: 2.8rem;
   max-height: 2.8rem;
-  gap: 0.55rem;
+  align-items: center;
+  gap: 0.45rem;
   padding: 0.3rem 0.55rem;
   margin: 0;
   border-bottom: 1px solid #29404d;
@@ -3456,6 +3458,8 @@ code {
   align-items: center;
   gap: 0.42rem;
   white-space: nowrap;
+  padding-right: 0.65rem;
+  border-right: 1px solid #29404d;
 }
 
 .app-identity .brand-mark {
@@ -3473,7 +3477,6 @@ code {
 .program-document-actions,
 .program-document-identity,
 .program-document-controls,
-.active-workspace-title,
 .program-subpanel-title,
 .runtime-status-actions,
 .program-dialog-actions {
@@ -3483,6 +3486,10 @@ code {
 }
 
 .workspace-switcher {
+  position: absolute;
+  z-index: 4;
+  left: 50%;
+  transform: translateX(-50%);
   gap: 0.15rem;
   padding: 0.15rem;
   border: 1px solid #29404d;
@@ -3507,15 +3514,16 @@ code {
 }
 
 .program-document-controls {
-  justify-content: space-between;
-  gap: 0.55rem;
-  overflow: hidden;
+  display: contents;
 }
 
 .program-document-identity {
+  grid-column: 2;
   flex: 0 1 auto;
   gap: 0.28rem;
   overflow: hidden;
+  padding-left: 0.15rem;
+  padding-right: 0.65rem;
 }
 
 .program-document-identity > strong {
@@ -3525,6 +3533,60 @@ code {
   font-size: 0.78rem;
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+
+.program-settings-button {
+  width: 1.55rem;
+  height: 1.55rem;
+  flex: 0 0 auto;
+  padding: 0;
+  font-size: 0.78rem;
+}
+
+.document-settings-divider {
+  margin-inline: 0.08rem;
+}
+
+.document-identity-divider {
+  width: 1px;
+  height: 1.25rem;
+  flex: 0 0 auto;
+  margin-inline: 0.16rem;
+  background: #29404d;
+}
+
+.program-settings-summary {
+  display: grid;
+  gap: 0.75rem;
+}
+
+.program-settings-summary > p {
+  margin: 0;
+  color: #8fa4af;
+  font-size: 0.72rem;
+}
+
+.program-settings-summary dl {
+  margin: 0;
+}
+
+.program-settings-summary dl > div {
+  display: grid;
+  grid-template-columns: 8rem minmax(0, 1fr);
+  gap: 0.75rem;
+  padding: 0.45rem 0;
+  border-bottom: 1px solid #203542;
+  font-size: 0.72rem;
+}
+
+.program-settings-summary dt {
+  color: #839aa6;
+}
+
+.program-settings-summary dd {
+  min-width: 0;
+  margin: 0;
+  overflow-wrap: anywhere;
 }
 
 .document-state {
@@ -3554,8 +3616,11 @@ code {
 }
 
 .program-document-actions {
+  grid-column: 3;
   flex: 0 0 auto;
   gap: 0.05rem;
+  padding-left: 0.5rem;
+  border-left: 1px solid #29404d;
 }
 
 .program-document-actions .primary-action,
@@ -3570,37 +3635,11 @@ code {
   background: #29404d;
 }
 
-.active-workspace-title {
-  gap: 0.55rem;
-  overflow: hidden;
-}
-
-.active-workspace-title strong,
-.active-workspace-title span {
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-
-.active-workspace-title strong {
-  font-size: 0.78rem;
-}
-
-.active-workspace-title span {
-  color: #7f95a2;
-  font-size: 0.65rem;
-}
-
-.workbench,
-.workbench.commands-collapsed {
-  grid-template-columns: minmax(0, 1fr) 0.45rem minmax(0, var(--commands-width));
+.workbench {
+  grid-template-columns: minmax(0, 1fr) 0.45rem minmax(0, var(--viewer-width));
   flex: 1 1 auto;
   min-height: 0;
   gap: 0;
-}
-
-.workbench.commands-collapsed {
-  grid-template-columns: minmax(0, 1fr) 2.5rem;
 }
 
 .workbench-workspace,
@@ -3646,10 +3685,47 @@ code {
   height: 1.8rem;
 }
 
-.visual-operations-stack {
+.viewer-slot {
+  flex: 3 1 0;
+  min-height: 18rem;
+  overflow: hidden;
+}
+
+.viewer-slot > .viewer-panel {
+  display: flex;
+  height: 100%;
+  min-height: 0;
+  flex-direction: column;
+  border: 0;
+  border-radius: 0;
+}
+
+.viewer-slot > .viewer-panel .viewer-header {
+  flex: 0 0 auto;
+  align-items: flex-start;
+  flex-direction: column;
+  gap: 0.45rem;
+  padding: 0.65rem 1rem;
+}
+
+.viewer-slot > .viewer-panel .viewer-controls {
+  width: 100%;
+}
+
+.viewer-slot > .viewer-panel .viewer-stage,
+.viewer-slot > .viewer-panel .viewer-fallback-stage {
   flex: 1 1 auto;
+  height: auto;
+  min-height: 12rem;
+}
+
+.live-controls-scroll {
+  flex: 1 1 auto;
+  max-height: 42%;
   min-height: 0;
   overflow-y: auto;
+  border-top: 1px solid #29404d;
+  background: #08151e;
 }
 
 .workbench-pane > .panel,
@@ -3703,7 +3779,7 @@ code {
 .program-authoring-grid,
 .program-authoring-empty {
   display: grid;
-  grid-template-columns: 13.5rem minmax(0, 1fr) 18rem;
+  grid-template-columns: var(--program-tool-width) 0.4rem minmax(13.5rem, 1fr) 0.4rem var(--program-inspector-width);
   flex: 1 1 auto;
   height: 100%;
   min-height: 0;
@@ -3712,15 +3788,22 @@ code {
 }
 
 .program-authoring-grid.palette-collapsed {
-  grid-template-columns: 2.35rem minmax(0, 1fr) 18rem;
+  grid-template-columns: 2.35rem minmax(13.5rem, 1fr) 0.4rem var(--program-inspector-width);
 }
 
 .program-authoring-grid.inspector-collapsed {
-  grid-template-columns: 13.5rem minmax(0, 1fr) 2.35rem;
+  grid-template-columns: var(--program-tool-width) 0.4rem minmax(13.5rem, 1fr) 2.35rem;
 }
 
 .program-authoring-grid.palette-collapsed.inspector-collapsed {
   grid-template-columns: 2.35rem minmax(0, 1fr) 2.35rem;
+}
+
+.program-pane-divider {
+  width: auto;
+  height: 100%;
+  min-height: 0;
+  border-width: 0 1px;
 }
 
 .program-palette,
@@ -3770,6 +3853,29 @@ code {
   gap: 0.3rem;
 }
 
+.program-tool-tabs {
+  display: flex;
+  min-width: 0;
+  align-items: stretch;
+  gap: 0.05rem;
+}
+
+.program-tool-tabs button {
+  min-height: 1.75rem;
+  padding: 0.22rem 0.42rem;
+  border: 0;
+  border-bottom: 2px solid transparent;
+  border-radius: 0;
+  color: #8096a2;
+  background: transparent;
+  font-size: 0.66rem;
+}
+
+.program-tool-tabs button.active {
+  border-bottom-color: #64cae8;
+  color: #dff4f8;
+}
+
 .icon-button,
 .program-subpanel-header .icon-button,
 .program-inspector-tabs .icon-button,
@@ -3783,6 +3889,12 @@ code {
 
 .program-inspector-tabs {
   justify-content: flex-start;
+}
+
+.program-inspector-tabs > strong {
+  padding-left: 0.25rem;
+  color: #dff4f8;
+  font-size: 0.68rem;
 }
 
 .program-inspector-tabs button:not(.icon-button) {
@@ -3945,10 +4057,29 @@ code {
   left: 50%;
   max-width: min(34rem, calc(100% - 8rem));
   transform: translateX(-50%);
-  padding: 0.35rem 0.5rem;
-  border: 1px solid #80574c;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.55rem;
+  padding: 0.3rem 0.34rem 0.3rem 0.55rem;
+  border: 1px solid #396475;
   border-radius: 0.4rem;
-  background: rgb(43 27 26 / 94%);
+  color: #b8d8e2;
+  background: rgb(12 38 49 / 95%);
+  box-shadow: 0 0.45rem 1.15rem rgb(0 0 0 / 24%);
+}
+
+.program-canvas-message.message-error {
+  border-color: #80574c;
+  color: #e2b3a4;
+  background: rgb(43 27 26 / 95%);
+}
+
+.program-canvas-message .icon-button {
+  width: 1.45rem;
+  height: 1.45rem;
+  border-color: transparent;
+  background: transparent;
 }
 
 .canvas-view-controls {
@@ -3975,10 +4106,83 @@ code {
   overflow-y: auto;
 }
 
+.program-inspector-empty {
+  min-height: 100%;
+}
+
 .program-inspector-scroll .program-property-list,
 .program-inspector-scroll .program-declaration-list {
   max-height: none;
   overflow: visible;
+}
+
+.program-declaration-navigator {
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow-y: auto;
+  padding: 0.3rem;
+}
+
+.program-declaration-navigator section + section {
+  margin-top: 0.55rem;
+}
+
+.program-declaration-navigator h4 {
+  position: sticky;
+  z-index: 1;
+  top: 0;
+  margin: 0;
+  padding: 0.28rem 0.32rem;
+  color: #6fb6c9;
+  background: #0a1720;
+  font-size: 0.58rem;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+
+.program-declaration-navigator p {
+  margin: 0;
+  padding: 0.35rem;
+  color: #728995;
+  font-size: 0.62rem;
+}
+
+.program-declaration-navigator button {
+  display: grid;
+  width: 100%;
+  min-height: 2.2rem;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 0.35rem;
+  padding: 0.3rem 0.38rem;
+  border-color: transparent;
+  border-radius: 0.28rem;
+  text-align: left;
+  background: transparent;
+}
+
+.program-declaration-navigator button.active {
+  border-color: #335566;
+  background: #15313d;
+}
+
+.program-declaration-navigator button span,
+.program-declaration-navigator button strong,
+.program-declaration-navigator button small {
+  display: block;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.program-declaration-navigator button strong {
+  font-size: 0.67rem;
+}
+
+.program-declaration-navigator button small {
+  color: #758c98;
+  font-size: 0.56rem;
 }
 
 .program-property-list {
@@ -4029,6 +4233,10 @@ code {
   position: static;
   z-index: auto;
   justify-self: end;
+  grid-column: 4;
+  margin-left: 0.05rem;
+  padding-left: 0.55rem;
+  border-left: 1px solid #29404d;
 }
 
 .runtime-status-button {
@@ -4287,20 +4495,20 @@ code {
   overflow-y: auto;
 }
 
+.scene-workspace-host {
+  height: 100%;
+  min-height: 0;
+  overflow: hidden;
+}
+
+.scene-workspace-host > .scene-authoring-workspace {
+  height: 100%;
+  overflow-y: auto;
+  border: 0;
+  border-radius: 0;
+}
+
 @media (max-width: 90rem) {
-  .program-authoring-grid,
-  .program-authoring-empty {
-    grid-template-columns: 12rem minmax(0, 1fr) 16rem;
-  }
-
-  .program-authoring-grid.palette-collapsed {
-    grid-template-columns: 2.35rem minmax(0, 1fr) 16rem;
-  }
-
-  .program-authoring-grid.inspector-collapsed {
-    grid-template-columns: 12rem minmax(0, 1fr) 2.35rem;
-  }
-
   .program-document-actions button {
     padding-inline: 0.34rem;
   }
@@ -4316,25 +4524,7 @@ code {
     display: none;
   }
 
-  .workbench,
-  .workbench.commands-collapsed {
-    display: grid;
-    height: auto;
-    min-height: 0;
-    grid-template-columns: minmax(0, 1fr) 2.5rem;
-    grid-template-rows: minmax(0, 1fr);
-  }
-
-  .workbench:not(.commands-collapsed) {
-    grid-template-columns: minmax(0, 1fr) minmax(21rem, 42vw);
-  }
-
-  .workbench:not(.commands-collapsed) .pane-divider {
-    display: none;
-  }
-
-  .program-authoring-grid,
-  .program-authoring-empty {
-    grid-template-columns: 10rem minmax(0, 1fr) 14rem;
+  .workbench {
+    grid-template-columns: minmax(0, 1fr) 0.4rem minmax(0, var(--viewer-width));
   }
 }

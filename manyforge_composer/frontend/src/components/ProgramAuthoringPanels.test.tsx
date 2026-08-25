@@ -463,6 +463,7 @@ describe('Program authoring panels', () => {
   it('keeps the complete authoring geometry when no Draft is open', () => {
     const controller = {
       mutationAvailable: true,
+      admissionObserved: true,
       state: {
         status: 'ready',
         requestGeneration: 1,
@@ -559,7 +560,9 @@ describe('Program authoring panels', () => {
     expect(markup).toContain('No Program Draft is open');
     expect(markup).toContain('Select a node to inspect properties');
     expect(markup).toContain('Properties');
-    expect(markup).toContain('Declarations');
+    expect(markup).toContain('Params');
+    expect(markup).toContain('Resize Program tools pane');
+    expect(markup).toContain('Resize Program inspector pane');
     expect(markup).not.toContain('Program actions ·');
     expect(markup).not.toContain('program-tree-node');
   });
@@ -626,6 +629,7 @@ describe('Program authoring panels', () => {
     };
     const controller = {
       mutationAvailable: true,
+      admissionObserved: true,
       state: {
         status: 'ready',
         requestGeneration: 1,

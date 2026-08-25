@@ -159,6 +159,9 @@ describe('Program workspace lifecycle controls', () => {
     expect(workspaceSource).toContain(
       'busy || authoringUnavailable || !mutationAvailable',
     );
+    expect(workspaceSource).toContain(
+      'workspace !== null && admissionObserved && !mutationAvailable',
+    );
     expect(workspaceSource).toContain('Waiting for current backend Idle admission');
     expect(controlsSource).toContain('busy || !mutationAvailable');
     expect(workspaceSource).not.toContain('affect only later runs');

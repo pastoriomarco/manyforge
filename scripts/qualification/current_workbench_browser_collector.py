@@ -46,6 +46,8 @@ class _Observation:
     operations_collapsed: bool
     viewer_present: bool
     wireframe_unchecked: bool
+    active_workspace: str
+    active_workspace_present: bool
 
 
 def _keys(value: object, expected: set[str], label: str) -> dict[str, Any]:
@@ -212,6 +214,8 @@ def _validate_observation(value: object) -> _Observation:
             "operationsCollapsed",
             "viewerPresent",
             "wireframeUnchecked",
+            "activeWorkspace",
+            "activeWorkspacePresent",
         },
         "browser observation",
     )
@@ -222,9 +226,12 @@ def _validate_observation(value: object) -> _Observation:
         "operationsCollapsed",
         "viewerPresent",
         "wireframeUnchecked",
+        "activeWorkspacePresent",
     ):
         if not isinstance(result[key], bool):
             raise CollectorError(f"{key} is not boolean")
+    if result["activeWorkspace"] not in {"program", "scene", "deployment"}:
+        raise CollectorError("activeWorkspace is unsupported")
     return _Observation(
         qualification=qualification,
         connected=result["connected"],
@@ -232,6 +239,8 @@ def _validate_observation(value: object) -> _Observation:
         operations_collapsed=result["operationsCollapsed"],
         viewer_present=result["viewerPresent"],
         wireframe_unchecked=result["wireframeUnchecked"],
+        active_workspace=result["activeWorkspace"],
+        active_workspace_present=result["activeWorkspacePresent"],
     )
 
 
@@ -357,18 +366,34 @@ OBSERVATION_SCRIPT = f"""return (() => {{
   const shell = document.querySelector('.workbench');
   const operations = document.querySelector('.workbench-commands');
   const pane = operations?.querySelector('.workbench-pane');
+  const activeWorkspace = document.querySelector('.workspace-switcher [data-workspace][aria-pressed="true"]')?.dataset.workspace ?? null;
+  const activeWorkspacePresent = activeWorkspace === 'program'
+    ? document.querySelector('[aria-label="Program authoring workspace"]') !== null
+    : activeWorkspace === 'scene'
+      ? document.querySelector('.scene-workspace-host > .scene-authoring-workspace') !== null
+      : activeWorkspace === 'deployment'
+        ? document.querySelector('.deployment-workspace') !== null
+        : false;
   return {{
     qualification: q === undefined ? null : q.snapshot(),
     connected: document.querySelector('.runtime-status-button[data-backend-connected="true"]') !== null,
     operationsPanePresent: operations !== null && pane !== null,
     operationsCollapsed: shell?.classList.contains('commands-collapsed') === true,
     viewerPresent: pane?.querySelector('.viewer-panel') !== null,
-    wireframeUnchecked: document.querySelector('.viewer-controls input[type="checkbox"]')?.checked === false
+    wireframeUnchecked: document.querySelector('.viewer-controls input[type="checkbox"]')?.checked === false,
+    activeWorkspace,
+    activeWorkspacePresent
   }};
 }})();"""
 TAKE_SCRIPT = f"return window.{QUALIFICATION_GLOBAL}?.take() ?? null;"
-COLLAPSE_SCRIPT = "return (() => { const node = document.querySelector('[aria-label=\"Collapse viewer and operations pane\"]'); if (!node) return false; node.click(); return true; })();"
-EXPAND_SCRIPT = "return (() => { const node = document.querySelector('[aria-label=\"Expand Operations pane\"]'); if (!node) return false; node.click(); return true; })();"
+
+
+def _select_workspace_script(workspace: str) -> str:
+    return (
+        "return (() => { const node = document.querySelector("
+        f"'[data-workspace=\"{workspace}\"]'"
+        "); if (!node) return false; node.click(); return true; })();"
+    )
 
 
 def _execute(driver: RawWebDriver, script: str) -> Any:
@@ -420,6 +445,7 @@ def _require_ready(observation: _Observation) -> None:
         or not observation.operations_pane_present
         or observation.operations_collapsed
         or not observation.viewer_present
+        or not observation.active_workspace_present
     ):
         raise CollectorError("Composer workbench is not connected with its viewer/operations pane available")
     if not observation.wireframe_unchecked:
@@ -569,6 +595,7 @@ def collect_current_workbench(
                 and item.operations_pane_present
                 and not item.operations_collapsed
                 and item.viewer_present
+                and item.active_workspace == "program"
             ),
             "connected workbench viewer and operations pane",
             timeout_s,
@@ -594,43 +621,29 @@ def collect_current_workbench(
         ):
             raise CollectorError("viewer produced no bounded geometry/render work")
 
-        if _execute(driver, COLLAPSE_SCRIPT) is not True:
-            raise CollectorError("viewer/operations collapse command returned unsupported response")
-        inactive = _wait(driver, lambda item: (
-            item.operations_collapsed
-            and item.viewer_present
-            and item.qualification["status"]["canvasCount"] == 0
-            and item.qualification["status"]["viewerActive"] is False
-            and item.qualification["status"]["headless"]["activeSockets"] == 1
-            and item.qualification["status"]["headless"]["maxActiveSockets"] == 1
-        ), "inactive viewer demand with shell socket retained", timeout_s)
-        # Discard the transition/unmount window.  Collapsing the pane can leave
-        # one final demand frame in the window that observed inactivity.
-        _take(driver)
-        time.sleep(POLL_INTERVAL_S)
-        inactive_window = _take(driver)
-        if (
-            inactive_window["status"]["viewerActive"] is not False
-            or inactive_window["status"]["canvasCount"] != 0
-            or inactive_window["performance"]["renderedFrames"] != 0
-        ):
-            raise CollectorError("inactive viewer continued to render")
-        if _execute(driver, EXPAND_SCRIPT) is not True:
-            raise CollectorError("viewer/operations expand command returned unsupported response")
-        returned = _wait(
-            driver,
-            _viewer_ready,
-            "returned single viewer Canvas and shell socket",
-            timeout_s,
-        )
-        _require_ready(returned)
-        returned_topology = _topology(returned)
-        if (
-            returned_topology["sourceCount"] != initial["sourceCount"]
-            or returned_topology["socketCreations"] != initial["socketCreations"]
-            or returned_topology["canvasCount"] != 1
-        ):
-            raise CollectorError("viewer presentation changed HeadlessStateSource topology")
+        workspace_topology: dict[str, dict[str, Any]] = {}
+        for workspace in ("scene", "deployment", "program"):
+            if _execute(driver, _select_workspace_script(workspace)) is not True:
+                raise CollectorError(f"{workspace} workspace selection is unavailable")
+            selected = _wait(
+                driver,
+                lambda item, expected=workspace: (
+                    _viewer_ready(item) and item.active_workspace == expected
+                ),
+                f"persistent viewer in {workspace} workspace",
+                timeout_s,
+            )
+            _require_ready(selected)
+            topology = _topology(selected)
+            if (
+                topology["sourceCount"] != initial["sourceCount"]
+                or topology["socketCreations"] != initial["socketCreations"]
+                or topology["canvasCount"] != 1
+            ):
+                raise CollectorError(
+                    f"{workspace} selection changed viewer/HeadlessStateSource topology"
+                )
+            workspace_topology[workspace] = topology
 
         driver.command("POST", "/url", {"url": target_url})
         _wait(
@@ -692,8 +705,7 @@ def collect_current_workbench(
             "screenshotSha256": screenshot_sha256,
             "topology": {
                 "initial": initial,
-                "inactive": _topology(inactive),
-                "returned": returned_topology,
+                "workspaces": workspace_topology,
                 "reload": reload_topology,
             },
             "warmupSampleCount": WARMUP_SAMPLE_COUNT,
@@ -702,7 +714,7 @@ def collect_current_workbench(
             "reloadPerformance": final_performance,
             "longTasks": long_tasks,
             "claims": [
-                "focused-idle native viewer-active/inactive presentation demand",
+                "focused-idle persistent viewer across Program/Scene/Deployment",
                 "one Canvas and one shared shell HeadlessStateSource socket",
                 "solid rendering, bounded browser timings, and reload topology",
             ],

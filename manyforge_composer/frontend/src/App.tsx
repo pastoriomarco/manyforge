@@ -1,21 +1,16 @@
-import { useCallback, useMemo, useRef, useState } from 'react';
-import type {
-  CSSProperties,
-  KeyboardEvent as ReactKeyboardEvent,
-  PointerEvent as ReactPointerEvent,
-  RefObject,
-} from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import type { CSSProperties } from 'react';
 
 import { ApiError, api } from './api/client';
 import { AssistantOverlay } from './components/AssistantOverlay';
 import { CCLCPanel } from './components/CCLCPanel';
-import { CollapsedRail } from './components/CollapsedRail';
 import { DeploymentCompositionPanel } from './components/DeploymentCompositionPanel';
 import {
   HeadlessRuntimeSurfaces,
   runtimeStatusView,
 } from './components/HeadlessRuntimeSurfaces';
 import { ProgramDocumentControls } from './components/ProgramDocumentControls';
+import { PaneDivider } from './components/PaneDivider';
 import { ProgramRuntimePanel } from './components/ProgramRuntimePanel';
 import { ProgramWorkspace } from './components/ProgramWorkspace';
 import { RobotControlPanelView } from './components/RobotControlPanel';
@@ -34,104 +29,26 @@ function isNotFound(error: unknown): boolean {
   return error instanceof ApiError && error.status === 404;
 }
 
-const COMMANDS_WIDTH_MIN = 420;
-const COMMANDS_WIDTH_MAX = 720;
+const VIEWER_WIDTH_MIN = 420;
+const AUTHORING_WIDTH_MIN = 632;
+const WORKBENCH_DIVIDER_WIDTH = 8;
+const VIEWER_WIDTH_MAX_FRACTION = 2 / 3;
 
 function clamp(value: number, min: number, max: number): number {
   return Math.min(Math.max(value, min), max);
 }
 
-interface WorkbenchDividerProps {
-  label: string;
-  value: number;
-  min: number;
-  max: number;
-  direction: 1 | -1;
-  onChange: (value: number) => void;
-}
-
-function WorkbenchDivider({
-  label,
-  value,
-  min,
-  max,
-  direction,
-  onChange,
-}: WorkbenchDividerProps) {
-  const pointer = useRef<{ id: number; startX: number; startValue: number } | null>(null);
-
-  const handlePointerDown = (event: ReactPointerEvent<HTMLDivElement>) => {
-    event.preventDefault();
-    event.currentTarget.setPointerCapture(event.pointerId);
-    pointer.current = {
-      id: event.pointerId,
-      startX: event.clientX,
-      startValue: value,
-    };
-  };
-  const handlePointerMove = (event: ReactPointerEvent<HTMLDivElement>) => {
-    const active = pointer.current;
-    if (active === null || active.id !== event.pointerId) return;
-    onChange(clamp(
-      active.startValue + direction * (event.clientX - active.startX),
-      min,
-      max,
-    ));
-  };
-  const finishPointer = (event: ReactPointerEvent<HTMLDivElement>) => {
-    if (pointer.current?.id !== event.pointerId) return;
-    if (event.currentTarget.hasPointerCapture(event.pointerId)) {
-      event.currentTarget.releasePointerCapture(event.pointerId);
-    }
-    pointer.current = null;
-  };
-  const handleKeyDown = (event: ReactKeyboardEvent<HTMLDivElement>) => {
-    const step = event.shiftKey ? 50 : 10;
-    const next = event.key === 'ArrowLeft'
-      ? value - direction * step
-      : event.key === 'ArrowRight'
-        ? value + direction * step
-        : event.key === 'Home'
-          ? min
-          : event.key === 'End'
-            ? max
-            : null;
-    if (next === null) return;
-    event.preventDefault();
-    onChange(clamp(next, min, max));
-  };
-
-  return (
-    <div
-      className="pane-divider"
-      role="separator"
-      tabIndex={0}
-      aria-label={`Resize ${label} pane`}
-      aria-orientation="vertical"
-      aria-valuemin={min}
-      aria-valuemax={max}
-      aria-valuenow={value}
-      aria-valuetext={`${value} pixels`}
-      title={`Resize ${label} pane`}
-      onPointerDown={handlePointerDown}
-      onPointerMove={handlePointerMove}
-      onPointerUp={finishPointer}
-      onPointerCancel={finishPointer}
-      onLostPointerCapture={() => {
-        pointer.current = null;
-      }}
-      onKeyDown={handleKeyDown}
-    />
-  );
-}
-
 export default function App() {
-  const [activeWorkspace, setActiveWorkspace] = useState<'program' | 'deployment'>('program');
-  const [commandsWidth, setCommandsWidth] = useState(520);
-  const [commandsCollapsed, setCommandsCollapsed] = useState(false);
+  const [activeWorkspace, setActiveWorkspace] = useState<'program' | 'scene' | 'deployment'>('program');
+  const [viewerWidth, setViewerWidth] = useState(() => (
+    typeof window === 'undefined' ? 640 : Math.round(window.innerWidth * 0.4)
+  ));
+  const [workbenchWidth, setWorkbenchWidth] = useState(() => (
+    typeof window === 'undefined' ? 1440 : window.innerWidth
+  ));
+  const [sceneEditorTarget, setSceneEditorTarget] = useState<HTMLElement | null>(null);
   const [runtimeDetailsOpen, setRuntimeDetailsOpen] = useState(false);
-  const commandsCollapse = useRef<HTMLButtonElement>(null);
-  const commandsRail = useRef<HTMLButtonElement>(null);
+  const workbench = useRef<HTMLDivElement>(null);
   const [health, retryHealth] = useStructuralResource(api.health.get, {
     failureMessage: 'Could not read the Composer structural boundary.',
   });
@@ -165,15 +82,30 @@ export default function App() {
     () => headlessSnapshot === null ? null : runtimeStatusView(headlessSnapshot.runtime),
     [headlessSnapshot],
   );
-  const focusAfterLayout = (target: RefObject<HTMLButtonElement | null>) => {
-    window.requestAnimationFrame(() => target.current?.focus());
-  };
+  const viewerWidthMax = Math.max(
+    VIEWER_WIDTH_MIN,
+    Math.min(
+      Math.floor(workbenchWidth * VIEWER_WIDTH_MAX_FRACTION),
+      workbenchWidth - AUTHORING_WIDTH_MIN - WORKBENCH_DIVIDER_WIDTH,
+    ),
+  );
+  const viewerWidthMin = Math.min(VIEWER_WIDTH_MIN, viewerWidthMax);
   const layoutStyle = {
-    '--commands-width': `${commandsWidth}px`,
+    '--viewer-width': `${viewerWidth}px`,
   } as CSSProperties;
-  const viewerActive = !commandsCollapsed;
+  useEffect(() => {
+    const element = workbench.current;
+    if (element === null) return undefined;
+    const update = () => setWorkbenchWidth(element.clientWidth);
+    update();
+    const observer = new ResizeObserver(update);
+    observer.observe(element);
+    return () => observer.disconnect();
+  }, []);
+  useEffect(() => {
+    setViewerWidth((current) => clamp(current, viewerWidthMin, viewerWidthMax));
+  }, [viewerWidthMax, viewerWidthMin]);
   const openRuntimeDetails = useCallback(() => {
-    setCommandsCollapsed(false);
     setRuntimeDetailsOpen(true);
     window.requestAnimationFrame(() => {
       document.getElementById('runtime-observability')?.scrollIntoView({
@@ -207,6 +139,7 @@ export default function App() {
         <nav className="workspace-switcher" aria-label="Workbench sections">
           <button
             type="button"
+            data-workspace="program"
             className={activeWorkspace === 'program' ? 'active' : ''}
             aria-pressed={activeWorkspace === 'program'}
             onClick={() => setActiveWorkspace('program')}
@@ -215,6 +148,16 @@ export default function App() {
           </button>
           <button
             type="button"
+            data-workspace="scene"
+            className={activeWorkspace === 'scene' ? 'active' : ''}
+            aria-pressed={activeWorkspace === 'scene'}
+            onClick={() => setActiveWorkspace('scene')}
+          >
+            Scene
+          </button>
+          <button
+            type="button"
+            data-workspace="deployment"
             className={activeWorkspace === 'deployment' ? 'active' : ''}
             aria-pressed={activeWorkspace === 'deployment'}
             onClick={() => setActiveWorkspace('deployment')}
@@ -222,17 +165,10 @@ export default function App() {
             Deployment
           </button>
         </nav>
-        {activeWorkspace === 'program' ? (
-          <ProgramDocumentControls
-            controller={programController}
-            runtime={programRuntime}
-          />
-        ) : (
-          <div className="active-workspace-title">
-            <strong>Deployment composition</strong>
-            <span>Manager-owned desired and active graph</span>
-          </div>
-        )}
+        <ProgramDocumentControls
+          controller={programController}
+          runtime={programRuntime}
+        />
         <RuntimeStatusOverlay
           status={runtimeView}
           backendConnected={connectedProjection}
@@ -247,7 +183,8 @@ export default function App() {
       </header>
 
       <div
-        className={`workbench${commandsCollapsed ? ' commands-collapsed' : ''}`}
+        ref={workbench}
+        className="workbench"
         style={layoutStyle}
       >
         <section className="workbench-workspace">
@@ -260,6 +197,12 @@ export default function App() {
               onRetryCatalog={retryCatalog}
               onRetryEnvironment={retryNodeEnvironment}
             />
+          ) : activeWorkspace === 'scene' ? (
+            <div
+              ref={setSceneEditorTarget}
+              className="scene-workspace-host"
+              aria-label="Scene authoring workspace"
+            />
           ) : (
             <div className="deployment-workspace">
               <DeploymentCompositionPanel enabled={headlessEnabled} />
@@ -267,55 +210,31 @@ export default function App() {
           )}
         </section>
 
-        {!commandsCollapsed && (
-          <WorkbenchDivider
-            label="Operations"
-            value={commandsWidth}
-            min={COMMANDS_WIDTH_MIN}
-            max={COMMANDS_WIDTH_MAX}
-            direction={-1}
-            onChange={setCommandsWidth}
-          />
-        )}
+        <PaneDivider
+          label="viewer and live controls"
+          value={viewerWidth}
+          min={viewerWidthMin}
+          max={viewerWidthMax}
+          direction={-1}
+          onChange={setViewerWidth}
+        />
 
-        <aside className="workbench-commands" aria-label="Viewer and operations rail">
-          <div className="collapsed-rail-slot" hidden={!commandsCollapsed}>
-            <CollapsedRail
-              label="Operations"
-              side="right"
-              buttonRef={commandsRail}
-              onExpand={() => {
-                setCommandsCollapsed(false);
-                focusAfterLayout(commandsCollapse);
-              }}
-            />
-          </div>
-          <div className="workbench-pane" hidden={commandsCollapsed}>
-            <div className="pane-toolbar">
-              <strong>Viewer / operations</strong>
-              <button
-                type="button"
-                ref={commandsCollapse}
-                aria-label="Collapse viewer and operations pane"
-                onClick={() => {
-                  setCommandsCollapsed(true);
-                  focusAfterLayout(commandsRail);
-                }}
-              >
-                ›
-              </button>
-            </div>
-            <div className="visual-operations-stack">
+        <aside className="workbench-commands" aria-label="3D viewer and live controls">
+          <div className="workbench-pane">
+            <div className="viewer-slot">
               <SceneAuthoringWorkspace
                 enabled={headlessEnabled}
+                editorTarget={sceneEditorTarget}
                 environment={nodeEnvironment}
                 headlessStateSource={headlessStateSource}
                 manifest={manifest}
                 onRetryManifest={retryManifest}
                 programController={programController}
                 robotControl={robotControl}
-                viewerActive={viewerActive}
+                viewerActive
               />
+            </div>
+            <div className="live-controls-scroll">
               <ProgramRuntimePanel
                 enabled={headlessEnabled}
                 controller={programRuntime}

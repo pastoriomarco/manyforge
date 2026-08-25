@@ -88,15 +88,13 @@ def _snapshot(
 class _FakeDriver:
     instances: list["_FakeDriver"] = []
     long_tasks = False
-    inactive_take_frames: list[int] = []
 
     def __init__(self, endpoint: str, timeout_s: float = 5.0) -> None:
         self.endpoint = endpoint
         self.timeout_s = timeout_s
         self.session_id: str | None = None
-        self.operations_collapsed = False
+        self.active_workspace = "program"
         self.viewport = (1280, 720)
-        self.inactive_take_frames = list(self.__class__.inactive_take_frames)
         self.deleted = False
         self.commands: list[str] = []
         self.scripts: list[str] = []
@@ -121,7 +119,7 @@ class _FakeDriver:
     def command(self, method: str, path: str, payload: dict[str, Any] | None = None) -> Any:
         self.commands.append(path)
         if path == "/url":
-            self.operations_collapsed = False
+            self.active_workspace = "program"
             return None
         if path == "/window/rect":
             assert payload is not None
@@ -139,7 +137,7 @@ class _FakeDriver:
             self.scripts.append(script)
             if script == collector.OBSERVATION_SCRIPT:
                 snapshot = _snapshot(
-                    active=not self.operations_collapsed,
+                    active=True,
                     long_tasks=self.long_tasks,
                     viewport=self.viewport,
                 )
@@ -147,25 +145,23 @@ class _FakeDriver:
                     "qualification": snapshot,
                     "connected": True,
                     "operationsPanePresent": True,
-                    "operationsCollapsed": self.operations_collapsed,
+                    "operationsCollapsed": False,
                     "viewerPresent": True,
                     "wireframeUnchecked": True,
+                    "activeWorkspace": self.active_workspace,
+                    "activeWorkspacePresent": True,
                 }
             if script == collector.TAKE_SCRIPT:
                 snapshot = _snapshot(
-                    active=not self.operations_collapsed,
+                    active=True,
                     long_tasks=self.long_tasks,
                     viewport=self.viewport,
                 )
-                if self.operations_collapsed and self.inactive_take_frames:
-                    snapshot["performance"]["renderedFrames"] = self.inactive_take_frames.pop(0)
                 return snapshot
-            if script == collector.COLLAPSE_SCRIPT:
-                self.operations_collapsed = True
-                return True
-            if script == collector.EXPAND_SCRIPT:
-                self.operations_collapsed = False
-                return True
+            for workspace in ("program", "scene", "deployment"):
+                if script == collector._select_workspace_script(workspace):
+                    self.active_workspace = workspace
+                    return True
         raise AssertionError(f"unexpected WebDriver command: {method} {path}")
 
     def delete_session(self) -> None:
@@ -189,12 +185,14 @@ def test_collector_cleans_up_exact_session_on_success_and_uses_exact_opt_in() ->
     assert f"{collector.QUALIFICATION_QUERY_KEY}=1" == result["optIn"]
     assert result["topology"]["initial"]["canvasCount"] == 1
     assert result["topology"]["initial"]["socketPath"] == "/ws/state"
-    assert result["topology"]["inactive"]["canvasCount"] == 0
-    assert result["topology"]["inactive"]["activeSockets"] == 1
-    assert result["topology"]["returned"]["canvasCount"] == 1
+    assert set(result["topology"]["workspaces"]) == {"program", "scene", "deployment"}
+    assert all(
+        topology["canvasCount"] == 1
+        for topology in result["topology"]["workspaces"].values()
+    )
     assert result["topology"]["reload"]["maxActiveSockets"] == 1
-    assert driver.scripts.count(collector.COLLAPSE_SCRIPT) == 1
-    assert driver.scripts.count(collector.EXPAND_SCRIPT) == 1
+    for workspace in ("program", "scene", "deployment"):
+        assert driver.scripts.count(collector._select_workspace_script(workspace)) == 1
     assert result["longTasks"] == {"supported": False, "count": None}
 
 
@@ -249,24 +247,25 @@ def test_collector_rejects_incomplete_or_unbounded_viewport(
         )
 
 
-def test_inactive_transition_frame_is_discarded_but_post_transition_frame_fails(
+def test_workspace_switch_fails_if_it_reconstructs_the_shared_source(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    class TransitionFrameDriver(_FakeDriver):
-        inactive_take_frames = [1, 0]
+    class ReconstructingDriver(_FakeDriver):
+        def command(self, method: str, path: str, payload: dict[str, Any] | None = None) -> Any:
+            value = super().command(method, path, payload)
+            if (
+                path == "/execute/sync"
+                and str((payload or {}).get("script")) == collector.OBSERVATION_SCRIPT
+                and self.active_workspace == "scene"
+            ):
+                assert isinstance(value, dict)
+                value["qualification"]["status"]["headless"]["socketCreations"] = 2
+            return value
 
-    monkeypatch.setattr(collector, "RawWebDriver", TransitionFrameDriver)
-    result = collector.collect_current_workbench("http://webdriver.test", "http://composer.test/")
-    assert result["topology"]["inactive"]["canvasCount"] == 0
-    assert TransitionFrameDriver.instances[-1].deleted is True
-
-    class PostTransitionFrameDriver(_FakeDriver):
-        inactive_take_frames = [1, 1]
-
-    monkeypatch.setattr(collector, "RawWebDriver", PostTransitionFrameDriver)
-    with pytest.raises(collector.CollectorError, match="continued to render"):
+    monkeypatch.setattr(collector, "RawWebDriver", ReconstructingDriver)
+    with pytest.raises(collector.CollectorError, match="changed viewer/HeadlessStateSource"):
         collector.collect_current_workbench("http://webdriver.test", "http://composer.test/")
-    assert PostTransitionFrameDriver.instances[-1].deleted is True
+    assert ReconstructingDriver.instances[-1].deleted is True
 
 
 def test_collector_cleans_up_exact_session_when_navigation_fails() -> None:
@@ -300,6 +299,8 @@ def test_exact_opt_in_replaces_old_value_and_rejects_malformed_duplicate_state()
                 "operationsCollapsed": False,
                 "viewerPresent": True,
                 "wireframeUnchecked": True,
+                "activeWorkspace": "program",
+                "activeWorkspacePresent": True,
             }
         )
     with pytest.raises(collector.CollectorError):
@@ -325,6 +326,8 @@ def test_duplicate_canvas_or_socket_fails_closed() -> None:
             "operationsCollapsed": False,
             "viewerPresent": True,
             "wireframeUnchecked": True,
+            "activeWorkspace": "program",
+            "activeWorkspacePresent": True,
         }
     )
     status = observation.qualification["status"]
@@ -351,6 +354,8 @@ def test_polling_is_bounded() -> None:
                 "operationsCollapsed": False,
                 "viewerPresent": True,
                 "wireframeUnchecked": True,
+                "activeWorkspace": "program",
+                "activeWorkspacePresent": True,
             }
         )
 

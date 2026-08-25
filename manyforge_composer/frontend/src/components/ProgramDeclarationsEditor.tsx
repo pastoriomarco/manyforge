@@ -1,4 +1,4 @@
-import { useMemo, useState } from 'react';
+import { useEffect, useMemo, useState } from 'react';
 
 import type {
   BlackboardFieldDeclaration,
@@ -12,6 +12,7 @@ import {
   collectBlackboardUsages,
   collectProgramParameterUsages,
 } from '../utils/programAuthoring';
+import type { ProgramDeclarationSelection } from './ProgramDeclarationsNavigator';
 
 const PROGRAM_TYPES = [
   'bool',
@@ -29,6 +30,8 @@ const PROGRAM_TYPES = [
 
 interface ProgramDeclarationsEditorProps {
   embedded?: boolean;
+  selection?: ProgramDeclarationSelection | null;
+  showNavigation?: boolean;
   root: ProgramTreeNode;
   parameters: ProgramParameterDeclaration[];
   namespaces: BlackboardNamespaceDeclaration[];
@@ -49,6 +52,8 @@ function parseJson(text: string, label: string): JsonValue {
 
 export function ProgramDeclarationsEditor({
   embedded = false,
+  selection = null,
+  showNavigation = true,
   root,
   parameters,
   namespaces,
@@ -142,6 +147,23 @@ export function ProgramDeclarationsEditor({
     setError(null);
   };
 
+  useEffect(() => {
+    if (selection?.kind === 'parameter') {
+      const parameter = parameters.find((row) => row.parameter_id === selection.id);
+      if (parameter) editParameter(parameter);
+    } else if (selection?.kind === 'namespace') {
+      const namespace = namespaces.find((row) => row.namespace_id === selection.id);
+      if (namespace) {
+        setNamespaceId(namespace.namespace_id);
+        setNamespaceDescription(namespace.description ?? '');
+        setError(null);
+      }
+    } else if (selection?.kind === 'key') {
+      const key = keys.find((row) => row.key === selection.id);
+      if (key) editKey(key);
+    }
+  }, [keys, namespaces, parameters, selection]);
+
   const saveKey = () => {
     try {
       const parsedFields = parseJson(fieldsText, 'Fields');
@@ -191,7 +213,7 @@ export function ProgramDeclarationsEditor({
       <div className="program-declaration-columns">
         <section>
           <h4>Program parameters</h4>
-          <ul className="program-declaration-list">
+          {showNavigation && <ul className="program-declaration-list">
             {parameters.map((parameter) => {
               const usages = parameterUsages[parameter.parameter_id] ?? [];
               return (
@@ -217,7 +239,7 @@ export function ProgramDeclarationsEditor({
                 </li>
               );
             })}
-          </ul>
+          </ul>}
           <div className="program-declaration-form">
             <label>Parameter ID<input value={parameterId} onChange={(event) => setParameterId(event.target.value)} /></label>
             <label>Type<select value={parameterType} onChange={(event) => setParameterType(event.target.value)}>{PROGRAM_TYPES.map((type) => <option key={type}>{type}</option>)}</select></label>
@@ -231,7 +253,7 @@ export function ProgramDeclarationsEditor({
 
         <section>
           <h4>Blackboard namespaces</h4>
-          <ul className="program-declaration-list compact">
+          {showNavigation && <ul className="program-declaration-list compact">
             {namespaces.map((namespace) => {
               const childKeys = keys.filter((key) => key.key.startsWith(`${namespace.namespace_id}.`));
               return (
@@ -252,7 +274,7 @@ export function ProgramDeclarationsEditor({
                 </li>
               );
             })}
-          </ul>
+          </ul>}
           <div className="program-declaration-form compact">
             <label>Namespace ID<input value={namespaceId} onChange={(event) => setNamespaceId(event.target.value)} /></label>
             <label>Description<input value={namespaceDescription} onChange={(event) => setNamespaceDescription(event.target.value)} /></label>
@@ -260,7 +282,7 @@ export function ProgramDeclarationsEditor({
           </div>
 
           <h4>Blackboard keys</h4>
-          <ul className="program-declaration-list">
+          {showNavigation && <ul className="program-declaration-list">
             {keys.map((key) => {
               const usages = blackboardUsages[key.key] ?? [];
               return (
@@ -284,7 +306,7 @@ export function ProgramDeclarationsEditor({
                 </li>
               );
             })}
-          </ul>
+          </ul>}
           <div className="program-declaration-form">
             <label>Fully-qualified key<input value={keyName} onChange={(event) => setKeyName(event.target.value)} placeholder="namespace.key" /></label>
             <label>Type<input value={keyType} onChange={(event) => setKeyType(event.target.value)} /></label>
