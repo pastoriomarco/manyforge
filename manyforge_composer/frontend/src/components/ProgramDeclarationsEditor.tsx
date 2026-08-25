@@ -28,6 +28,7 @@ const PROGRAM_TYPES = [
 ];
 
 interface ProgramDeclarationsEditorProps {
+  embedded?: boolean;
   root: ProgramTreeNode;
   parameters: ProgramParameterDeclaration[];
   namespaces: BlackboardNamespaceDeclaration[];
@@ -47,6 +48,7 @@ function parseJson(text: string, label: string): JsonValue {
 }
 
 export function ProgramDeclarationsEditor({
+  embedded = false,
   root,
   parameters,
   namespaces,
@@ -173,13 +175,19 @@ export function ProgramDeclarationsEditor({
   };
 
   return (
-    <section className="program-declarations" aria-labelledby="program-declarations-title">
-      <header className="program-subpanel-header">
-        <div>
-          <p className="eyebrow">Portable explicit sources</p>
-          <h3 id="program-declarations-title">Declarations</h3>
-        </div>
-      </header>
+    <section
+      className="program-declarations"
+      aria-label={embedded ? 'Program declarations' : undefined}
+      aria-labelledby={embedded ? undefined : 'program-declarations-title'}
+    >
+      {!embedded && (
+        <header className="program-subpanel-header">
+          <div>
+            <p className="eyebrow">Portable explicit sources</p>
+            <h3 id="program-declarations-title">Declarations</h3>
+          </div>
+        </header>
+      )}
       <div className="program-declaration-columns">
         <section>
           <h4>Program parameters</h4>

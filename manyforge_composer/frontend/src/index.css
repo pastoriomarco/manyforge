@@ -732,6 +732,11 @@ code {
   min-height: 0;
 }
 
+.workbench-workspace {
+  container-name: program-workspace;
+  container-type: inline-size;
+}
+
 .workbench [hidden] {
   display: none;
 }
@@ -3127,6 +3132,51 @@ code {
   text-align: center;
 }
 
+@container program-workspace (max-width: 54rem) {
+  .program-authoring-grid {
+    grid-template-columns: minmax(10rem, 0.7fr) minmax(18rem, 1.3fr);
+  }
+
+  .program-properties {
+    grid-column: 1 / -1;
+    border-top: 1px solid #203542;
+  }
+}
+
+@container program-workspace (max-width: 38rem) {
+  .program-identity-strip {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  .program-identity-strip > div:nth-child(2) {
+    border-right: 0;
+  }
+
+  .program-identity-strip > div:last-child {
+    grid-column: 1 / -1;
+    border-top: 1px solid #203542;
+  }
+}
+
+@container program-workspace (max-width: 28rem) {
+  .program-identity-strip,
+  .program-authoring-grid {
+    grid-template-columns: 1fr;
+  }
+
+  .program-identity-strip > div,
+  .program-palette,
+  .program-tree-surface {
+    border-right: 0;
+    border-bottom: 1px solid #203542;
+  }
+
+  .program-identity-strip > div:last-child,
+  .program-properties {
+    grid-column: auto;
+  }
+}
+
 @media (max-width: 96rem) {
   .program-actions-popover {
     position: static;
@@ -3377,5 +3427,914 @@ code {
 
   .path-browser .quiet-button {
     grid-column: 1 / -1;
+  }
+}
+
+/* O1.5-UI1: compact, backend-reflecting workbench composition. */
+.app-shell {
+  width: 100%;
+  height: 100vh;
+  padding: 0;
+  margin: 0;
+  overflow: hidden;
+}
+
+.app-header {
+  display: grid;
+  grid-template-columns: auto auto minmax(0, 1fr) auto;
+  min-height: 2.8rem;
+  max-height: 2.8rem;
+  gap: 0.55rem;
+  padding: 0.3rem 0.55rem;
+  margin: 0;
+  border-bottom: 1px solid #29404d;
+  background: rgb(7 18 27 / 96%);
+}
+
+.app-identity {
+  display: flex;
+  align-items: center;
+  gap: 0.42rem;
+  white-space: nowrap;
+}
+
+.app-identity .brand-mark {
+  width: 1.8rem;
+  height: 1.8rem;
+  border-radius: 0.42rem;
+  font-size: 0.62rem;
+}
+
+.app-identity strong {
+  font-size: 0.8rem;
+}
+
+.workspace-switcher,
+.program-document-actions,
+.program-document-identity,
+.program-document-controls,
+.active-workspace-title,
+.program-subpanel-title,
+.runtime-status-actions,
+.program-dialog-actions {
+  display: flex;
+  min-width: 0;
+  align-items: center;
+}
+
+.workspace-switcher {
+  gap: 0.15rem;
+  padding: 0.15rem;
+  border: 1px solid #29404d;
+  border-radius: 0.45rem;
+  background: #091720;
+}
+
+.workspace-switcher button,
+.program-document-actions button {
+  min-height: 1.9rem;
+  padding: 0.28rem 0.48rem;
+  border-color: transparent;
+  background: transparent;
+  font-size: 0.68rem;
+  white-space: nowrap;
+}
+
+.workspace-switcher button.active {
+  border-color: #436373;
+  color: #e5f7fb;
+  background: #17313d;
+}
+
+.program-document-controls {
+  justify-content: space-between;
+  gap: 0.55rem;
+  overflow: hidden;
+}
+
+.program-document-identity {
+  flex: 0 1 auto;
+  gap: 0.28rem;
+  overflow: hidden;
+}
+
+.program-document-identity > strong {
+  max-width: min(19rem, 22vw);
+  overflow: hidden;
+  color: #edf5f8;
+  font-size: 0.78rem;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.document-state {
+  flex: 0 0 auto;
+  padding: 0.14rem 0.34rem;
+  border: 1px solid #39505c;
+  border-radius: 999px;
+  color: #8ea4af;
+  background: #0b1922;
+  font-size: 0.57rem;
+  letter-spacing: 0.03em;
+  text-transform: uppercase;
+}
+
+.document-state.state-modified,
+.document-state.state-different,
+.document-state.state-unavailable,
+.document-state.state-unsaved {
+  border-color: #725d3b;
+  color: #d9b97b;
+}
+
+.document-state.state-saved,
+.document-state.state-applied {
+  border-color: #397760;
+  color: #87d0b2;
+}
+
+.program-document-actions {
+  flex: 0 0 auto;
+  gap: 0.05rem;
+}
+
+.program-document-actions .primary-action,
+.workspace-switcher .active {
+  border-color: #3e7180;
+}
+
+.header-action-divider {
+  width: 1px;
+  height: 1.25rem;
+  margin-inline: 0.18rem;
+  background: #29404d;
+}
+
+.active-workspace-title {
+  gap: 0.55rem;
+  overflow: hidden;
+}
+
+.active-workspace-title strong,
+.active-workspace-title span {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.active-workspace-title strong {
+  font-size: 0.78rem;
+}
+
+.active-workspace-title span {
+  color: #7f95a2;
+  font-size: 0.65rem;
+}
+
+.workbench,
+.workbench.commands-collapsed {
+  grid-template-columns: minmax(0, 1fr) 0.45rem minmax(0, var(--commands-width));
+  flex: 1 1 auto;
+  min-height: 0;
+  gap: 0;
+}
+
+.workbench.commands-collapsed {
+  grid-template-columns: minmax(0, 1fr) 2.5rem;
+}
+
+.workbench-workspace,
+.workbench-pane {
+  height: 100%;
+  min-height: 0;
+  overflow: hidden;
+  border: 0;
+  border-radius: 0;
+  scrollbar-gutter: auto;
+}
+
+.workbench-workspace {
+  container: none;
+}
+
+.workbench-commands,
+.workbench-commands .workbench-pane {
+  min-width: 0;
+  min-height: 0;
+}
+
+.workbench-commands .workbench-pane {
+  display: flex;
+  flex-direction: column;
+  border-left: 1px solid #29404d;
+}
+
+.pane-divider {
+  border-width: 0 1px;
+  border-radius: 0;
+}
+
+.pane-toolbar {
+  position: static;
+  min-height: 2.45rem;
+  padding: 0.28rem 0.45rem;
+  box-shadow: none;
+}
+
+.pane-toolbar button {
+  width: 1.8rem;
+  height: 1.8rem;
+}
+
+.visual-operations-stack {
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow-y: auto;
+}
+
+.workbench-pane > .panel,
+.workbench-workspace .panel,
+.scene-authoring-workspace,
+.program-workspace {
+  margin: 0;
+}
+
+.program-workspace {
+  display: flex;
+  height: 100%;
+  min-height: 0;
+  flex-direction: column;
+  overflow: hidden;
+  border: 0;
+  border-radius: 0;
+}
+
+.program-workspace-notices {
+  position: absolute;
+  z-index: 22;
+  top: 3.05rem;
+  left: 50%;
+  width: min(38rem, calc(100% - 3rem));
+  transform: translateX(-50%);
+  pointer-events: none;
+}
+
+.program-workspace-notice {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.6rem;
+  margin-top: 0.3rem;
+  padding: 0.4rem 0.55rem;
+  border: 1px solid #395867;
+  border-radius: 0.42rem;
+  color: #a9bbc4;
+  background: rgb(9 24 33 / 95%);
+  box-shadow: 0 0.55rem 1.2rem rgb(0 0 0 / 28%);
+  font-size: 0.66rem;
+  pointer-events: auto;
+}
+
+.program-workspace-notice button {
+  flex: 0 0 auto;
+  padding: 0.24rem 0.4rem;
+}
+
+.program-authoring-grid,
+.program-authoring-empty {
+  display: grid;
+  grid-template-columns: 13.5rem minmax(0, 1fr) 18rem;
+  flex: 1 1 auto;
+  height: 100%;
+  min-height: 0;
+  overflow: hidden;
+  border: 0;
+}
+
+.program-authoring-grid.palette-collapsed {
+  grid-template-columns: 2.35rem minmax(0, 1fr) 18rem;
+}
+
+.program-authoring-grid.inspector-collapsed {
+  grid-template-columns: 13.5rem minmax(0, 1fr) 2.35rem;
+}
+
+.program-authoring-grid.palette-collapsed.inspector-collapsed {
+  grid-template-columns: 2.35rem minmax(0, 1fr) 2.35rem;
+}
+
+.program-palette,
+.program-tree-surface,
+.program-inspector,
+.program-properties,
+.program-declarations {
+  min-width: 0;
+  min-height: 0;
+  background: #0a1720;
+}
+
+.program-palette,
+.program-inspector {
+  display: flex;
+  height: 100%;
+  flex-direction: column;
+  overflow: hidden;
+}
+
+.program-palette,
+.program-tree-surface {
+  border-right: 1px solid #203542;
+}
+
+.program-inspector {
+  border-left: 1px solid #203542;
+}
+
+.program-subpanel-header,
+.program-inspector-tabs {
+  display: flex;
+  min-height: 2.4rem;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.35rem;
+  padding: 0.28rem 0.42rem;
+  border-bottom: 1px solid #203542;
+  background: #0d1c25;
+}
+
+.program-subpanel-header h3 {
+  font-size: 0.78rem;
+}
+
+.program-subpanel-title {
+  gap: 0.3rem;
+}
+
+.icon-button,
+.program-subpanel-header .icon-button,
+.program-inspector-tabs .icon-button,
+.node-info-button {
+  width: 1.65rem;
+  height: 1.65rem;
+  flex: 0 0 auto;
+  padding: 0;
+  border-radius: 0.38rem;
+}
+
+.program-inspector-tabs {
+  justify-content: flex-start;
+}
+
+.program-inspector-tabs button:not(.icon-button) {
+  align-self: stretch;
+  padding: 0.24rem 0.5rem;
+  border: 0;
+  border-bottom: 2px solid transparent;
+  border-radius: 0;
+  color: #8096a2;
+  background: transparent;
+  font-size: 0.67rem;
+}
+
+.program-inspector-tabs button.active {
+  border-bottom-color: #64cae8;
+  color: #dff4f8;
+}
+
+.program-inspector-tabs .icon-button {
+  margin-left: auto;
+  border: 1px solid #385061;
+}
+
+.program-filter {
+  padding: 0.38rem 0.42rem;
+}
+
+.program-filter input {
+  min-height: 1.85rem;
+  padding: 0.35rem 0.45rem;
+  font-size: 0.66rem;
+}
+
+.program-palette-list {
+  flex: 1 1 auto;
+  max-height: none;
+  min-height: 0;
+  overflow-y: auto;
+  padding: 0.22rem;
+}
+
+.program-palette-list section + section {
+  margin-top: 0.35rem;
+}
+
+.program-palette-list h4 {
+  position: sticky;
+  z-index: 2;
+  top: 0;
+  margin: 0;
+  padding: 0.28rem 0.35rem 0.18rem;
+  background: #0a1720;
+  font-size: 0.58rem;
+}
+
+.node-palette-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 1.65rem;
+  align-items: center;
+  gap: 0.08rem;
+}
+
+.node-palette-item {
+  min-height: 2.35rem;
+  gap: 0.35rem;
+  padding: 0.28rem 0.32rem;
+  border-radius: 0.25rem;
+}
+
+.node-palette-icon {
+  margin-top: 0;
+  font-size: 0.58rem;
+}
+
+.node-palette-copy strong {
+  font-size: 0.7rem;
+}
+
+.node-palette-copy small {
+  font-size: 0.57rem;
+}
+
+.node-palette-copy .node-palette-availability {
+  margin-top: 0.08rem;
+}
+
+.node-info-button {
+  border-color: transparent;
+  color: #7fa2b1;
+  background: transparent;
+  font-family: Georgia, serif;
+  font-size: 0.75rem;
+  font-weight: 700;
+}
+
+.program-staging-card {
+  flex: 0 0 auto;
+  max-height: 52%;
+  overflow-y: auto;
+  padding: 0.48rem;
+}
+
+.program-tree-surface {
+  position: relative;
+  display: flex;
+  height: 100%;
+  min-height: 0;
+  flex-direction: column;
+  overflow: hidden;
+}
+
+.program-tree-react-flow {
+  flex: 1 1 auto;
+  width: 100%;
+  height: 100%;
+  min-height: 0;
+}
+
+.program-canvas-toolbar {
+  display: flex;
+  align-items: center;
+  gap: 0.25rem;
+  position: absolute;
+  z-index: 12;
+  top: 0.45rem;
+  right: 0.45rem;
+}
+
+.program-canvas-help {
+  border-color: #405764;
+  color: #9cb6c1;
+  background: rgb(8 19 28 / 88%);
+}
+
+.program-tree-react-flow .program-tree-actions {
+  position: absolute;
+  z-index: 12;
+  right: 0.45rem;
+  bottom: 0.45rem;
+  width: auto;
+  max-width: calc(100% - 4rem);
+  padding: 0.25rem;
+  border: 1px solid #405764;
+  border-radius: 0.42rem;
+  background: rgb(8 19 28 / 92%);
+  box-shadow: 0 0.7rem 1.5rem rgb(0 0 0 / 22%);
+}
+
+.program-tree-react-flow .program-tree-actions button,
+.program-tree-react-flow .program-tree-actions select {
+  min-height: 1.75rem;
+  padding-block: 0.22rem;
+  font-size: 0.63rem;
+}
+
+.program-canvas-message {
+  position: absolute;
+  z-index: 12;
+  bottom: 0.45rem;
+  left: 50%;
+  max-width: min(34rem, calc(100% - 8rem));
+  transform: translateX(-50%);
+  padding: 0.35rem 0.5rem;
+  border: 1px solid #80574c;
+  border-radius: 0.4rem;
+  background: rgb(43 27 26 / 94%);
+}
+
+.canvas-view-controls {
+  padding: 0.18rem;
+  border-radius: 0.4rem;
+}
+
+.canvas-view-controls button {
+  width: 1.7rem;
+  height: 1.7rem;
+}
+
+.canvas-view-controls select {
+  min-width: 5.5rem;
+  height: 1.7rem;
+  margin: 0;
+  padding: 0.1rem 1.5rem 0.1rem 0.35rem;
+  font-size: 0.65rem;
+}
+
+.program-inspector-scroll {
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow-y: auto;
+}
+
+.program-inspector-scroll .program-property-list,
+.program-inspector-scroll .program-declaration-list {
+  max-height: none;
+  overflow: visible;
+}
+
+.program-property-list {
+  padding: 0.5rem;
+}
+
+.program-policy-editor {
+  margin-inline: 0.5rem;
+}
+
+.program-declaration-columns {
+  grid-template-columns: 1fr;
+  gap: 0.65rem;
+  padding: 0.55rem;
+}
+
+.program-side-rail {
+  display: flex;
+  height: 100%;
+  min-height: 0;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 0.7rem;
+  padding: 0;
+  border: 0;
+  border-radius: 0;
+  color: #8ba3af;
+  background: #0d1c25;
+}
+
+.program-side-rail span:last-child {
+  writing-mode: vertical-rl;
+  transform: rotate(180deg);
+  font-size: 0.62rem;
+  font-weight: 700;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+}
+
+.program-tree-empty,
+.program-empty-guidance {
+  min-height: 0;
+  height: 100%;
+}
+
+.runtime-status-overlay {
+  position: static;
+  z-index: auto;
+  justify-self: end;
+}
+
+.runtime-status-button {
+  display: inline-flex;
+  width: auto;
+  height: 2rem;
+  min-width: 4.3rem;
+  align-items: center;
+  justify-content: center;
+  gap: 0.34rem;
+  padding: 0.25rem 0.48rem;
+  border-radius: 0.45rem;
+  font-size: 0.65rem;
+}
+
+.runtime-status-dot {
+  width: 0.46rem;
+  height: 0.46rem;
+  border-radius: 999px;
+  background: currentcolor;
+  box-shadow: 0 0 0 0.18rem rgb(255 255 255 / 8%);
+}
+
+.runtime-status-count {
+  display: grid;
+  min-width: 1rem;
+  height: 1rem;
+  place-items: center;
+  border-radius: 999px;
+  color: #f8e7df;
+  background: #7f3b32;
+  font-size: 0.55rem;
+}
+
+.overlay-scrim {
+  position: fixed;
+  z-index: 100;
+  inset: 0;
+  display: grid;
+  place-items: center;
+  padding: 1rem;
+  background: rgb(1 8 13 / 67%);
+  backdrop-filter: blur(0.12rem);
+}
+
+.overlay-panel {
+  display: flex;
+  width: min(56rem, calc(100vw - 2rem));
+  max-height: min(46rem, calc(100vh - 2rem));
+  min-height: 0;
+  flex-direction: column;
+  overflow: hidden;
+  border: 1px solid #426171;
+  border-radius: 0.6rem;
+  color: #dbe8ee;
+  background: #0a1720;
+  box-shadow: 0 1.2rem 4rem rgb(0 0 0 / 55%);
+}
+
+.overlay-info .overlay-panel {
+  width: min(38rem, calc(100vw - 2rem));
+}
+
+.overlay-status {
+  place-items: start end;
+  padding-top: 3.15rem;
+}
+
+.overlay-status .overlay-panel {
+  width: min(32rem, calc(100vw - 2rem));
+}
+
+.overlay-panel-header {
+  display: flex;
+  min-height: 2.6rem;
+  flex: 0 0 auto;
+  align-items: center;
+  justify-content: space-between;
+  gap: 1rem;
+  padding: 0.42rem 0.55rem 0.42rem 0.75rem;
+  border-bottom: 1px solid #29404d;
+  background: #10232d;
+}
+
+.overlay-panel-header h2 {
+  margin: 0;
+  font-size: 0.86rem;
+}
+
+.overlay-panel-body {
+  min-height: 0;
+  overflow: auto;
+  padding: 0.75rem;
+}
+
+.program-document-dialog,
+.program-dialog-copy,
+.runtime-status-summary,
+.runtime-components,
+.node-information,
+.node-schema-list {
+  display: grid;
+  gap: 0.65rem;
+}
+
+.program-document-dialog .artifact-browser-panel {
+  max-height: min(31rem, 58vh);
+  overflow: auto;
+}
+
+.program-dialog-actions,
+.runtime-status-actions {
+  justify-content: flex-end;
+  gap: 0.5rem;
+}
+
+.program-dialog-copy p,
+.runtime-status-message,
+.node-information p {
+  margin: 0;
+  color: #9fb1bb;
+  font-size: 0.72rem;
+  line-height: 1.5;
+}
+
+.program-save-as-path,
+.program-confirmation {
+  display: grid;
+  gap: 0.35rem;
+  color: #9fb1bb;
+  font-size: 0.7rem;
+}
+
+.program-confirmation {
+  grid-template-columns: auto minmax(0, 1fr);
+  align-items: center;
+}
+
+.program-apply-blocked {
+  display: grid;
+  gap: 0.25rem;
+  padding: 0.55rem;
+  border: 1px solid #80574c;
+  border-radius: 0.4rem;
+  color: #d6a99d;
+  background: #2b1b1a;
+  font-size: 0.68rem;
+}
+
+.runtime-status-summary {
+  grid-template-columns: auto minmax(0, 1fr);
+  align-items: center;
+}
+
+.runtime-status-summary strong,
+.runtime-status-summary small,
+.runtime-components strong,
+.runtime-components small {
+  display: block;
+}
+
+.runtime-status-summary small,
+.runtime-components small {
+  margin-top: 0.15rem;
+  color: #8299a5;
+  font-size: 0.66rem;
+}
+
+.runtime-status-facts,
+.runtime-capabilities {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.35rem;
+}
+
+.runtime-status-facts span,
+.runtime-capabilities > span {
+  padding: 0.2rem 0.38rem;
+  border: 1px solid #324c59;
+  border-radius: 999px;
+  color: #9bb0bb;
+  font-size: 0.6rem;
+}
+
+.runtime-components > div {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 0.5rem;
+  padding: 0.42rem 0;
+  border-bottom: 1px solid #203542;
+}
+
+.runtime-components code {
+  font-size: 0.62rem;
+}
+
+.catalog-information dl,
+.node-information dl {
+  margin: 0;
+}
+
+.catalog-information dl > div,
+.node-information dl > div {
+  display: grid;
+  grid-template-columns: 8rem minmax(0, 1fr);
+  gap: 0.6rem;
+  padding: 0.35rem 0;
+  border-bottom: 1px solid #203542;
+  font-size: 0.68rem;
+}
+
+.catalog-information dd,
+.node-information dd {
+  min-width: 0;
+  margin: 0;
+  overflow-wrap: anywhere;
+}
+
+.catalog-information dt,
+.node-information dt {
+  color: #839aa6;
+}
+
+.node-information h3 {
+  margin: 0.3rem 0 0;
+  font-size: 0.78rem;
+}
+
+.node-schema-list section {
+  display: grid;
+  gap: 0.25rem;
+  padding: 0.5rem;
+  border: 1px solid #29404d;
+  border-radius: 0.4rem;
+}
+
+.node-schema-list span {
+  color: #8299a5;
+  font-size: 0.64rem;
+}
+
+.node-schema-list pre {
+  max-height: 14rem;
+  overflow: auto;
+  margin: 0.25rem 0 0;
+  padding: 0.5rem;
+  border-radius: 0.3rem;
+  color: #b8dfe8;
+  background: #061019;
+  font-size: 0.62rem;
+}
+
+.deployment-workspace {
+  height: 100%;
+  overflow-y: auto;
+}
+
+@media (max-width: 90rem) {
+  .program-authoring-grid,
+  .program-authoring-empty {
+    grid-template-columns: 12rem minmax(0, 1fr) 16rem;
+  }
+
+  .program-authoring-grid.palette-collapsed {
+    grid-template-columns: 2.35rem minmax(0, 1fr) 16rem;
+  }
+
+  .program-authoring-grid.inspector-collapsed {
+    grid-template-columns: 12rem minmax(0, 1fr) 2.35rem;
+  }
+
+  .program-document-actions button {
+    padding-inline: 0.34rem;
+  }
+}
+
+@media (max-width: 68rem) {
+  .app-header {
+    grid-template-columns: auto auto minmax(0, 1fr) auto;
+    overflow-x: auto;
+  }
+
+  .program-document-identity .document-state {
+    display: none;
+  }
+
+  .workbench,
+  .workbench.commands-collapsed {
+    display: grid;
+    height: auto;
+    min-height: 0;
+    grid-template-columns: minmax(0, 1fr) 2.5rem;
+    grid-template-rows: minmax(0, 1fr);
+  }
+
+  .workbench:not(.commands-collapsed) {
+    grid-template-columns: minmax(0, 1fr) minmax(21rem, 42vw);
+  }
+
+  .workbench:not(.commands-collapsed) .pane-divider {
+    display: none;
+  }
+
+  .program-authoring-grid,
+  .program-authoring-empty {
+    grid-template-columns: 10rem minmax(0, 1fr) 14rem;
   }
 }

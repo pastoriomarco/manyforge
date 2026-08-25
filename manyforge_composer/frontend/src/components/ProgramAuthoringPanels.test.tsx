@@ -1,3 +1,5 @@
+import { readFileSync } from 'node:fs';
+
 import { renderToStaticMarkup } from 'react-dom/server';
 import { describe, expect, it, vi } from 'vitest';
 
@@ -11,6 +13,7 @@ import type {
   ProgramWorkspaceResponse,
 } from '../types/api';
 import { ProgramDeclarationsEditor } from './ProgramDeclarationsEditor';
+import { ProgramDocumentControls } from './ProgramDocumentControls';
 import { ProgramNodePalette } from './ProgramNodePalette';
 import {
   buildProgramParameterMutation,
@@ -239,6 +242,7 @@ describe('Program authoring panels', () => {
       <ProgramNodePalette
         root={tree}
         catalogEntries={[sequence, timer]}
+        catalogIdentity={null}
         environment={environment}
         selectedId="root_sequence"
         busy={false}
@@ -545,7 +549,6 @@ describe('Program authoring panels', () => {
           },
         }}
         environment={{ status: 'ready', data: environment }}
-        selectedProgramPath={null}
         onRetryCatalog={vi.fn()}
         onRetryEnvironment={vi.fn()}
       />,
@@ -555,13 +558,13 @@ describe('Program authoring panels', () => {
     expect(markup).toContain('Open a Draft to use the palette');
     expect(markup).toContain('No Program Draft is open');
     expect(markup).toContain('Select a node to inspect properties');
-    expect(markup).toContain(
-      'Program actions · New · Open · Save As · Apply · Revert · Discard · Load',
-    );
+    expect(markup).toContain('Properties');
+    expect(markup).toContain('Declarations');
+    expect(markup).not.toContain('Program actions ·');
     expect(markup).not.toContain('program-tree-node');
   });
 
-  it('disables only global Apply for an imported skill on another node', () => {
+  it('keeps editing available and gates the final Apply for an imported skill', () => {
     const blockedTree: ProgramTreeNode = {
       ...tree,
       children: [{
@@ -681,32 +684,37 @@ describe('Program authoring panels', () => {
       reset: vi.fn(),
     } satisfies ProgramRuntimeController;
     const markup = renderToStaticMarkup(
-      <ProgramWorkspace
-        controller={controller}
-        runtime={runtime}
-        catalog={{
-          status: 'ready',
-          data: {
-            apiVersion: 'manyforge.node_catalog.v2',
-            contentVersion: 'fixture',
-            catalogId: 'catalog',
-            entries: [sequence, timer],
-            catalogDigest: 'sha256:catalog',
-            environmentDigest: environment.environmentDigest,
-          },
-        }}
-        environment={{ status: 'ready', data: environment }}
-        selectedProgramPath={null}
-        onRetryCatalog={vi.fn()}
-        onRetryEnvironment={vi.fn()}
-      />,
+      <div>
+        <ProgramDocumentControls controller={controller} runtime={runtime} />
+        <ProgramWorkspace
+          controller={controller}
+          runtime={runtime}
+          catalog={{
+            status: 'ready',
+            data: {
+              apiVersion: 'manyforge.node_catalog.v2',
+              contentVersion: 'fixture',
+              catalogId: 'catalog',
+              entries: [sequence, timer],
+              catalogDigest: 'sha256:catalog',
+              environmentDigest: environment.environmentDigest,
+            },
+          }}
+          environment={{ status: 'ready', data: environment }}
+          onRetryCatalog={vi.fn()}
+          onRetryEnvironment={vi.fn()}
+        />
+      </div>,
+    );
+    const controlsSource = readFileSync(
+      new URL('./ProgramDocumentControls.tsx', import.meta.url),
+      'utf8',
     );
 
-    expect(markup).toMatch(/<button type="button" disabled="">Apply Draft<\/button>/);
-    expect(markup).toContain('Affected node instances: settle.');
-    expect(markup).toContain(
-      'Allowed recovery skills are unavailable: each skill requires an exact revision-qualified retained referent. Leave Allowed skills empty.',
-    );
+    expect(markup).toContain('>Apply</button>');
     expect(markup).toContain('Save');
+    expect(controlsSource).toContain('!workspace?.applicability.applyReady');
+    expect(controlsSource).toContain('Affected nodes:');
+    expect(controlsSource).toContain('workspace?.applicability.unavailableReason?.message');
   });
 });

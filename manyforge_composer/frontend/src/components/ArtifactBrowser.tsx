@@ -13,14 +13,20 @@ type BrowserState =
   | { status: 'error'; message: string };
 
 interface ArtifactBrowserProps {
+  initialKind?: ArtifactKind;
+  lockedKind?: ArtifactKind;
   onSelectionChange?: (
     kind: ArtifactKind,
     entry: FileBrowserEntry | null,
   ) => void;
 }
 
-export function ArtifactBrowser({ onSelectionChange }: ArtifactBrowserProps) {
-  const [kind, setKind] = useState<ArtifactKind>('deployment');
+export function ArtifactBrowser({
+  initialKind = 'deployment',
+  lockedKind,
+  onSelectionChange,
+}: ArtifactBrowserProps) {
+  const [kind, setKind] = useState<ArtifactKind>(lockedKind ?? initialKind);
   const [browsePath, setBrowsePath] = useState<string | undefined>(undefined);
   const [pathInput, setPathInput] = useState('');
   const [selected, setSelected] = useState<FileBrowserEntry | null>(null);
@@ -79,24 +85,26 @@ export function ArtifactBrowser({ onSelectionChange }: ArtifactBrowserProps) {
           <p className="eyebrow">Server-sandboxed read only</p>
           <h2 id="artifact-title">Artifact browser</h2>
         </div>
-        <div className="segmented-control" aria-label="Artifact kind">
-          {(['deployment', 'program'] as const).map((value) => (
-            <button
-              key={value}
-              type="button"
-              className={kind === value ? 'active' : ''}
-              aria-pressed={kind === value}
-              onClick={() => {
-                setKind(value);
-                setBrowsePath(undefined);
-                setSelected(null);
-                onSelectionChange?.(value, null);
-              }}
-            >
-              {value}
-            </button>
-          ))}
-        </div>
+        {lockedKind === undefined ? (
+          <div className="segmented-control" aria-label="Artifact kind">
+            {(['deployment', 'program'] as const).map((value) => (
+              <button
+                key={value}
+                type="button"
+                className={kind === value ? 'active' : ''}
+                aria-pressed={kind === value}
+                onClick={() => {
+                  setKind(value);
+                  setBrowsePath(undefined);
+                  setSelected(null);
+                  onSelectionChange?.(value, null);
+                }}
+              >
+                {value}
+              </button>
+            ))}
+          </div>
+        ) : <span className="status-pill">{lockedKind}</span>}
       </header>
 
       <p className="panel-intro">

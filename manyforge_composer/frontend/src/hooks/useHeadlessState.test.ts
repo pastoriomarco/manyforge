@@ -15,6 +15,7 @@ function state(
   runtimeGeneration: number,
   alarmEpoch = 'alarms.epoch.1',
   alarmGeneration = 3,
+  alarmStateRevision = alarmGeneration,
 ): ComposerHeadlessState {
   return {
     schemaVersion: 'manyforge.composer_headless_state.v1',
@@ -78,7 +79,7 @@ function state(
       ownerId: 'alarm.owner',
       ownerEpoch: alarmEpoch,
       generation: alarmGeneration,
-      stateRevision: alarmGeneration,
+      stateRevision: alarmStateRevision,
       reconciled: true,
       healthState: 'healthy',
       liveCount: 0,
@@ -94,7 +95,7 @@ function state(
 }
 
 describe('Headless owner-frame admission', () => {
-  it('accepts monotonic generations and replacement epochs', () => {
+  it('accepts forward stream frames and a replacement receiver epoch', () => {
     expect(admitHeadlessState(null, state('runtime.epoch.1', 2)).accepted).toBe(true);
     expect(admitHeadlessState(
       state('runtime.epoch.1', 2),
@@ -106,18 +107,14 @@ describe('Headless owner-frame admission', () => {
     ).accepted).toBe(true);
   });
 
-  it('rejects regressions and same-generation conflicts', () => {
-    const current = state('runtime.epoch.1', 2);
-    expect(admitHeadlessState(current, state('runtime.epoch.1', 1)).reason)
-      .toContain('regressed');
-    const conflict = state('runtime.epoch.1', 2);
-    conflict.snapshotSequence = current.snapshotSequence + 1;
-    conflict.runtime.complete = false;
-    expect(admitHeadlessState(current, conflict).reason).toContain('conflicted');
-    expect(admitHeadlessState(
-      state('runtime.epoch.1', 2, 'alarms.epoch.1', 3),
-      state('runtime.epoch.1', 3, 'alarms.epoch.1', 2),
-    ).reason).toContain('alarm projection generation regressed');
+  it('does not duplicate nested owner-generation adjudication in the browser', () => {
+    const current = state('receiver.epoch.1', 2, 'alarms.epoch.1', 6, 290);
+    const candidate = state('receiver.epoch.1', 1, 'alarms.epoch.1', 5, 291);
+    candidate.snapshotSequence = current.snapshotSequence + 1;
+    expect(admitHeadlessState(current, candidate)).toEqual({
+      accepted: true,
+      reason: null,
+    });
   });
 
   it('requires a strictly forward sequence within an epoch but accepts a fresh barrier',

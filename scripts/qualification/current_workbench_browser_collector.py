@@ -7,9 +7,12 @@ and always deletes that exact session before returning.
 from __future__ import annotations
 
 import argparse
+import base64
 from dataclasses import dataclass
+import hashlib
 import json
 import math
+from pathlib import Path
 import sys
 import time
 from typing import Any, Callable
@@ -23,6 +26,8 @@ QUALIFICATION_GLOBAL = "manyforgeViewerQualification"
 QUALIFICATION_SCHEMA = "manyforge.viewer.qualification.v1"
 RESULT_SCHEMA = "manyforge.viewer.qualification.result.v1"
 MAX_RESPONSE_BYTES = 1_000_000
+MAX_SCREENSHOT_BYTES = 32 * 1024 * 1024
+MAX_SCREENSHOT_RESPONSE_BYTES = (MAX_SCREENSHOT_BYTES * 4 // 3) + 4096
 POLL_INTERVAL_S = 0.05
 WAIT_TIMEOUT_S = 20.0
 WARMUP_SAMPLE_COUNT = 3
@@ -246,6 +251,8 @@ class RawWebDriver:
         method: str,
         path: str,
         payload: dict[str, Any] | None = None,
+        *,
+        max_response_bytes: int = MAX_RESPONSE_BYTES,
     ) -> Any:
         body = None if payload is None else json.dumps(payload, separators=(",", ":")).encode()
         request = Request(
@@ -256,10 +263,10 @@ class RawWebDriver:
         )
         try:
             with urlopen(request, timeout=self.timeout_s) as response:
-                raw = response.read(MAX_RESPONSE_BYTES + 1)
+                raw = response.read(max_response_bytes + 1)
         except (HTTPError, URLError, TimeoutError, OSError) as error:
             raise CollectorError(f"WebDriver {method} {path} failed") from error
-        if len(raw) > MAX_RESPONSE_BYTES:
+        if len(raw) > max_response_bytes:
             raise CollectorError("WebDriver response is oversized")
         try:
             decoded = json.loads(raw.decode("utf-8"))
@@ -293,16 +300,56 @@ class RawWebDriver:
         self.session_id = session_id
         return session_id
 
-    def command(self, method: str, path: str, payload: dict[str, Any] | None = None) -> Any:
+    def command(
+        self,
+        method: str,
+        path: str,
+        payload: dict[str, Any] | None = None,
+        *,
+        max_response_bytes: int = MAX_RESPONSE_BYTES,
+    ) -> Any:
         if self.session_id is None:
             raise CollectorError("WebDriver session is not active")
-        return self._request(method, f"/session/{quote(self.session_id, safe='')}{path}", payload)
+        return self._request(
+            method,
+            f"/session/{quote(self.session_id, safe='')}{path}",
+            payload,
+            max_response_bytes=max_response_bytes,
+        )
 
     def delete_session(self) -> None:
         session_id = self.session_id
         self.session_id = None
         if session_id is not None:
             self._request("DELETE", f"/session/{quote(session_id, safe='')}")
+
+    def set_window_rect(self, width: int, height: int) -> None:
+        value = self.command(
+            "POST",
+            "/window/rect",
+            {"width": width, "height": height},
+        )
+        if not isinstance(value, dict):
+            raise CollectorError("WebDriver window rectangle response is malformed")
+
+    def screenshot_png(self) -> bytes:
+        value = self.command(
+            "GET",
+            "/screenshot",
+            max_response_bytes=MAX_SCREENSHOT_RESPONSE_BYTES,
+        )
+        if not isinstance(value, str):
+            raise CollectorError("WebDriver screenshot response is malformed")
+        try:
+            screenshot = base64.b64decode(value, validate=True)
+        except (ValueError, TypeError) as error:
+            raise CollectorError("WebDriver screenshot is not valid base64") from error
+        if (
+            not screenshot.startswith(b"\x89PNG\r\n\x1a\n")
+            or len(screenshot) > MAX_SCREENSHOT_BYTES
+        ):
+            raise CollectorError("WebDriver screenshot is not a bounded PNG")
+        return screenshot
 
 
 OBSERVATION_SCRIPT = f"""return (() => {{
@@ -312,7 +359,7 @@ OBSERVATION_SCRIPT = f"""return (() => {{
   const pane = operations?.querySelector('.workbench-pane');
   return {{
     qualification: q === undefined ? null : q.snapshot(),
-    connected: document.querySelector('.header-boundary')?.textContent?.includes('Headless owner connected') === true,
+    connected: document.querySelector('.runtime-status-button[data-backend-connected="true"]') !== null,
     operationsPanePresent: operations !== null && pane !== null,
     operationsCollapsed: shell?.classList.contains('commands-collapsed') === true,
     viewerPresent: pane?.querySelector('.viewer-panel') !== null,
@@ -494,14 +541,25 @@ def collect_current_workbench(
     composer_url: str,
     *,
     timeout_s: float = WAIT_TIMEOUT_S,
+    viewport_width: int | None = None,
+    viewport_height: int | None = None,
+    screenshot_path: Path | None = None,
 ) -> dict[str, Any]:
     """Collect one bounded native focused-idle common-workbench result."""
+    if (viewport_width is None) != (viewport_height is None):
+        raise CollectorError("viewport width and height must be supplied together")
+    if viewport_width is not None and not 320 <= viewport_width <= 7680:
+        raise CollectorError("viewport width must be between 320 and 7680 pixels")
+    if viewport_height is not None and not 320 <= viewport_height <= 4320:
+        raise CollectorError("viewport height must be between 320 and 4320 pixels")
     driver = RawWebDriver(
         geckodriver_endpoint,
         timeout_s=min(5.0, max(0.1, timeout_s)),
     )
     try:
         driver.create_session()
+        if viewport_width is not None and viewport_height is not None:
+            driver.set_window_rect(viewport_width, viewport_height)
         target_url = _url_with_opt_in(composer_url)
         driver.command("POST", "/url", {"url": target_url})
         _wait(
@@ -601,6 +659,17 @@ def collect_current_workbench(
         final_performance = _combine_windows([_validate_qualification(
             _execute(driver, TAKE_SCRIPT)
         )])
+        viewport = reloaded.qualification["status"]["viewport"]
+        if viewport_width is not None and viewport["width"] != viewport_width:
+            raise CollectorError(
+                "browser viewport width does not match the requested qualification width"
+            )
+        screenshot_sha256 = None
+        if screenshot_path is not None:
+            screenshot = driver.screenshot_png()
+            screenshot_path.parent.mkdir(parents=True, exist_ok=True)
+            screenshot_path.write_bytes(screenshot)
+            screenshot_sha256 = hashlib.sha256(screenshot).hexdigest()
         long_tasks = {
             "supported": active_performance["longTaskSupported"],
             "count": active_performance["longTasks"]
@@ -614,7 +683,13 @@ def collect_current_workbench(
             "optIn": f"{QUALIFICATION_QUERY_KEY}=1",
             "browser": reloaded.qualification["status"]["browser"],
             "renderer": reloaded.qualification["status"]["renderer"],
-            "viewport": reloaded.qualification["status"]["viewport"],
+            "viewport": viewport,
+            "requestedViewport": (
+                {"width": viewport_width, "height": viewport_height}
+                if viewport_width is not None and viewport_height is not None
+                else None
+            ),
+            "screenshotSha256": screenshot_sha256,
             "topology": {
                 "initial": initial,
                 "inactive": _topology(inactive),
@@ -654,6 +729,9 @@ def _parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--composer-url", dest="composer_option")
     parser.add_argument("--timeout-s", type=float, default=WAIT_TIMEOUT_S)
+    parser.add_argument("--viewport-width", type=int)
+    parser.add_argument("--viewport-height", type=int)
+    parser.add_argument("--screenshot", type=Path)
     return parser
 
 
@@ -664,7 +742,14 @@ def main(argv: list[str] | None = None) -> int:
     if endpoint is None or composer is None:
         raise SystemExit("geckodriver endpoint and Composer URL are required")
     try:
-        result = collect_current_workbench(endpoint, composer, timeout_s=arguments.timeout_s)
+        result = collect_current_workbench(
+            endpoint,
+            composer,
+            timeout_s=arguments.timeout_s,
+            viewport_width=arguments.viewport_width,
+            viewport_height=arguments.viewport_height,
+            screenshot_path=arguments.screenshot,
+        )
     except CollectorError as error:
         print(json.dumps({"schemaVersion": RESULT_SCHEMA, "success": False, "error": str(error)}))
         return 1

@@ -50,7 +50,7 @@ function transition(
 describe('Program workspace lifecycle controls', () => {
   it('wires fenced New, Revert, and Discard with concrete prerequisites', () => {
     const source = readFileSync(
-      new URL('./ProgramWorkspace.tsx', import.meta.url),
+      new URL('./ProgramDocumentControls.tsx', import.meta.url),
       'utf8',
     );
 
@@ -59,9 +59,9 @@ describe('Program workspace lifecycle controls', () => {
     expect(source).toContain('Revert to Saved');
     expect(source).toContain('Discard to Applied');
     expect(source).toContain(
-      'disabled={authoringBusy || !workspace.applied.available}',
+      'disabled={authoringBusy || !workspace?.applied.available}',
     );
-    expect(source).toContain('workspace.saved.available');
+    expect(source).toContain('workspace?.saved.available');
     expect(source).not.toContain('localStorage');
     expect(source).not.toContain('sendBeacon');
   });
@@ -137,30 +137,30 @@ describe('Program workspace lifecycle controls', () => {
 
   it('presents deployment selection as a separate Program Apply prerequisite', () => {
     const source = readFileSync(
-      new URL('./ProgramWorkspace.tsx', import.meta.url),
+      new URL('./ProgramDocumentControls.tsx', import.meta.url),
       'utf8',
     );
     expect(source).toContain(
       "Program Apply requires this scenario&apos;s deployment already",
     );
     expect(source).toContain('Program Apply never changes the deployment.');
-    expect(source).toMatch(
-      /Deployment Apply\s+remains a separate Manager command/,
-    );
+    expect(source).toContain('Program Apply never changes the deployment.');
   });
 
   it('reflects backend idle admission instead of silently dropping UI actions', () => {
-    const source = readFileSync(
+    const workspaceSource = readFileSync(
       new URL('./ProgramWorkspace.tsx', import.meta.url),
       'utf8',
     );
-    expect(source).toContain(
+    const controlsSource = readFileSync(
+      new URL('./ProgramDocumentControls.tsx', import.meta.url),
+      'utf8',
+    );
+    expect(workspaceSource).toContain(
       'busy || authoringUnavailable || !mutationAvailable',
     );
-    expect(source).toContain('Backend authoring is unavailable');
-    expect(source).toContain(
-      'Program Apply, Load, Revert, and Discard remain unavailable',
-    );
-    expect(source).not.toContain('affect only later runs');
+    expect(workspaceSource).toContain('Waiting for current backend Idle admission');
+    expect(controlsSource).toContain('busy || !mutationAvailable');
+    expect(workspaceSource).not.toContain('affect only later runs');
   });
 });

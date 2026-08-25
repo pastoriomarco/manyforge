@@ -1,4 +1,6 @@
-import { useMemo, useState } from 'react';
+import { useCallback, useMemo, useRef, useState } from 'react';
+
+import { OverlayPanel } from './OverlayPanel';
 
 export interface RuntimeComponentView {
   id: string;
@@ -29,8 +31,14 @@ function compactSummaryLabel(readiness: string, summaryLabel: string): string {
 
 interface RuntimeStatusOverlayProps {
   status: RuntimeStatusView | null;
+  backendConnected: boolean;
   error?: string | null;
-  panelObscured?: boolean;
+  connectionLabel: string;
+  connectionDetail: string;
+  unacknowledgedAlarms?: number;
+  activeAcknowledgedAlarms?: number;
+  onOpenDetails?: () => void;
+  onRetry?: () => void;
 }
 
 /**
@@ -39,71 +47,107 @@ interface RuntimeStatusOverlayProps {
  */
 export function RuntimeStatusOverlay({
   status,
+  backendConnected,
   error = null,
-  panelObscured = false,
+  connectionLabel,
+  connectionDetail,
+  unacknowledgedAlarms = 0,
+  activeAcknowledgedAlarms = 0,
+  onOpenDetails,
+  onRetry,
 }: RuntimeStatusOverlayProps) {
   const [open, setOpen] = useState(false);
+  const trigger = useRef<HTMLButtonElement>(null);
   const readiness = status?.readiness ?? (error ? 'offline' : 'waiting');
   const summaryLabel = status?.summaryLabel ?? (error ? 'Offline' : 'Waiting');
+  const alarmCount = unacknowledgedAlarms + activeAcknowledgedAlarms;
   const sortedComponents = useMemo(
     () => [...(status?.components ?? [])].sort((left, right) =>
       left.label.localeCompare(right.label)),
     [status],
   );
+  const close = useCallback(() => setOpen(false), []);
   return (
-    <div className={`runtime-status-overlay${panelObscured ? ' panel-obscured' : ''}`}>
-      {!open && (
-        <button
-          type="button"
-          className={`runtime-status-button readiness-${readiness}`}
-          onClick={() => setOpen(true)}
-          title={status?.userMessage || error || 'Runtime status unavailable'}
-        >
-          {compactSummaryLabel(readiness, summaryLabel)}
-        </button>
-      )}
-      {open && (
-        <section className="runtime-status-panel" aria-labelledby="runtime-status-title">
-          <header>
-            <div>
-              <p className="eyebrow">Headless projection</p>
-              <h2 id="runtime-status-title">{summaryLabel}</h2>
-              <small>
-                {status
-                  ? `${status.profileLabel} · ${status.authorityLabel}`
-                  : 'Status unavailable'}
-              </small>
+    <div className="runtime-status-overlay">
+      <button
+        ref={trigger}
+        type="button"
+        className={`runtime-status-button readiness-${readiness}`}
+        onClick={() => setOpen(true)}
+        title={status?.userMessage || error || connectionDetail}
+        aria-haspopup="dialog"
+        aria-expanded={open}
+        data-backend-connected={backendConnected}
+      >
+        <span className="runtime-status-dot" aria-hidden="true" />
+        <span>{compactSummaryLabel(readiness, summaryLabel)}</span>
+        {alarmCount > 0 && <span className="runtime-status-count">{alarmCount}</span>}
+      </button>
+      <OverlayPanel
+        open={open}
+        title={summaryLabel}
+        titleId="runtime-status-title"
+        kind="status"
+        onClose={close}
+        returnFocusRef={trigger}
+      >
+        <div className="runtime-status-summary">
+          <span className={`component-dot status-${readiness}`} aria-hidden="true" />
+          <div>
+            <strong>{connectionLabel}</strong>
+            <small>{connectionDetail}</small>
+          </div>
+        </div>
+        {error && <p className="error-state" role="alert">{error}</p>}
+        {!error && status && (
+          <>
+            <p className="runtime-status-message">{status.userMessage}</p>
+            <div className="runtime-status-facts">
+              <span>{status.profileLabel}</span>
+              <span>{status.authorityLabel}</span>
+              <span>{unacknowledgedAlarms} acknowledgement required</span>
+              <span>{activeAcknowledgedAlarms} active acknowledged</span>
             </div>
-            <button type="button" onClick={() => setOpen(false)}>Close</button>
-          </header>
-          {error && <p className="error-state" role="alert">{error}</p>}
-          {!error && status && (
-            <>
-              <p>{status.userMessage}</p>
-              <div className="runtime-capabilities">
-                {status.capabilities.length === 0
-                  ? <span className="muted">No qualified runtime capabilities.</span>
-                  : status.capabilities.map((capability) => (
-                    <span key={capability}>{capability}</span>
-                  ))}
-              </div>
-              <div className="runtime-components">
-                {sortedComponents.map((component) => (
-                  <div key={component.id}>
-                    <span className={`component-dot status-${component.status}`} />
-                    <span>
-                      <strong>{component.label}</strong>
-                      <small>{component.detail || component.requiredFor?.join(', ') || 'optional'}</small>
-                    </span>
-                    <code>{component.status}</code>
-                  </div>
+            <div className="runtime-capabilities">
+              {status.capabilities.length === 0
+                ? <span className="muted">No qualified runtime capabilities.</span>
+                : status.capabilities.map((capability) => (
+                  <span key={capability}>{capability}</span>
                 ))}
-              </div>
-            </>
+            </div>
+            <div className="runtime-components">
+              {sortedComponents.map((component) => (
+                <div key={component.id}>
+                  <span className={`component-dot status-${component.status}`} />
+                  <span>
+                    <strong>{component.label}</strong>
+                    <small>{component.detail || component.requiredFor?.join(', ') || 'optional'}</small>
+                  </span>
+                  <code>{component.status}</code>
+                </div>
+              ))}
+            </div>
+          </>
+        )}
+        {!error && !status && (
+          <p className="muted">Waiting for the backend status projection.</p>
+        )}
+        <div className="runtime-status-actions">
+          {onRetry && <button type="button" onClick={onRetry}>Retry health</button>}
+          {onOpenDetails && (
+            <button
+              type="button"
+              className="primary-action"
+              onClick={() => {
+                close();
+                onOpenDetails();
+              }}
+            >
+              Runtime details and history
+            </button>
           )}
-          {!error && !status && <p className="muted">Waiting for a qualified status projection.</p>}
-        </section>
-      )}
+        </div>
+      </OverlayPanel>
     </div>
   );
 }

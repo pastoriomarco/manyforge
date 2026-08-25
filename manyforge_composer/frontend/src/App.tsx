@@ -1,4 +1,4 @@
-import { useCallback, useRef, useState } from 'react';
+import { useCallback, useMemo, useRef, useState } from 'react';
 import type {
   CSSProperties,
   KeyboardEvent as ReactKeyboardEvent,
@@ -7,32 +7,34 @@ import type {
 } from 'react';
 
 import { ApiError, api } from './api/client';
-import { ArtifactBrowser } from './components/ArtifactBrowser';
 import { AssistantOverlay } from './components/AssistantOverlay';
-import { CatalogPanel } from './components/CatalogPanel';
 import { CCLCPanel } from './components/CCLCPanel';
 import { CollapsedRail } from './components/CollapsedRail';
+import { DeploymentCompositionPanel } from './components/DeploymentCompositionPanel';
+import {
+  HeadlessRuntimeSurfaces,
+  runtimeStatusView,
+} from './components/HeadlessRuntimeSurfaces';
+import { ProgramDocumentControls } from './components/ProgramDocumentControls';
 import { ProgramRuntimePanel } from './components/ProgramRuntimePanel';
 import { ProgramWorkspace } from './components/ProgramWorkspace';
-import { SceneAuthoringWorkspace } from './components/SceneAuthoringWorkspace';
-import { UnavailableBanner } from './components/UnavailableBanner';
-import { HeadlessRuntimeSurfaces } from './components/HeadlessRuntimeSurfaces';
 import { RobotControlPanelView } from './components/RobotControlPanel';
-import { DeploymentCompositionPanel } from './components/DeploymentCompositionPanel';
-import { useHeadlessStateSource, useShellHeadlessState } from './hooks/useHeadlessState';
-import { useProgramWorkspace } from './hooks/useProgramWorkspace';
+import { RuntimeStatusOverlay } from './components/RuntimeStatusOverlay';
+import { SceneAuthoringWorkspace } from './components/SceneAuthoringWorkspace';
+import {
+  useHeadlessStateSource,
+  useShellHeadlessState,
+} from './hooks/useHeadlessState';
 import { useProgramRuntime } from './hooks/useProgramRuntime';
+import { useProgramWorkspace } from './hooks/useProgramWorkspace';
 import { useRobotControl } from './hooks/useRobotControl';
 import { useStructuralResource } from './state/structuralResource';
-import type { ArtifactKind, FileBrowserEntry } from './types/api';
 
 function isNotFound(error: unknown): boolean {
   return error instanceof ApiError && error.status === 404;
 }
 
-const NAVIGATION_WIDTH_MIN = 220;
-const NAVIGATION_WIDTH_MAX = 420;
-const COMMANDS_WIDTH_MIN = 480;
+const COMMANDS_WIDTH_MIN = 420;
 const COMMANDS_WIDTH_MAX = 720;
 
 function clamp(value: number, min: number, max: number): number {
@@ -124,13 +126,10 @@ function WorkbenchDivider({
 }
 
 export default function App() {
-  const [selectedProgramPath, setSelectedProgramPath] = useState<string | null>(null);
-  const [navigationWidth, setNavigationWidth] = useState(320);
+  const [activeWorkspace, setActiveWorkspace] = useState<'program' | 'deployment'>('program');
   const [commandsWidth, setCommandsWidth] = useState(520);
-  const [navigationCollapsed, setNavigationCollapsed] = useState(false);
   const [commandsCollapsed, setCommandsCollapsed] = useState(false);
-  const navigationCollapse = useRef<HTMLButtonElement>(null);
-  const navigationRail = useRef<HTMLButtonElement>(null);
+  const [runtimeDetailsOpen, setRuntimeDetailsOpen] = useState(false);
   const commandsCollapse = useRef<HTMLButtonElement>(null);
   const commandsRail = useRef<HTMLButtonElement>(null);
   const [health, retryHealth] = useStructuralResource(api.health.get, {
@@ -153,10 +152,8 @@ export default function App() {
   const assistantEnabled = headlessEnabled
     && health.data.components.assistant_bridge === 'configured';
   const headlessStateSource = useHeadlessStateSource(headlessEnabled);
-  // The workbench owns one persistent viewer. Its own observer throttling
-  // still controls demand rendering and latest-only data publication.
-  const viewerActive = !commandsCollapsed;
-  const headlessSnapshot = useShellHeadlessState(headlessStateSource).snapshot;
+  const headlessState = useShellHeadlessState(headlessStateSource);
+  const headlessSnapshot = headlessState.snapshot;
   const programController = useProgramWorkspace(headlessSnapshot);
   const programRuntime = useProgramRuntime(
     headlessEnabled,
@@ -164,108 +161,110 @@ export default function App() {
     programController.state.workspace,
   );
   const robotControl = useRobotControl(headlessEnabled);
-  const handleArtifactSelection = useCallback((
-    kind: ArtifactKind,
-    entry: FileBrowserEntry | null,
-  ) => {
-    setSelectedProgramPath(kind === 'program' ? entry?.path ?? null : null);
-  }, []);
+  const runtimeView = useMemo(
+    () => headlessSnapshot === null ? null : runtimeStatusView(headlessSnapshot.runtime),
+    [headlessSnapshot],
+  );
   const focusAfterLayout = (target: RefObject<HTMLButtonElement | null>) => {
     window.requestAnimationFrame(() => target.current?.focus());
   };
   const layoutStyle = {
-    '--navigation-width': `${navigationWidth}px`,
     '--commands-width': `${commandsWidth}px`,
   } as CSSProperties;
+  const viewerActive = !commandsCollapsed;
+  const openRuntimeDetails = useCallback(() => {
+    setCommandsCollapsed(false);
+    setRuntimeDetailsOpen(true);
+    window.requestAnimationFrame(() => {
+      document.getElementById('runtime-observability')?.scrollIntoView({
+        block: 'nearest',
+      });
+    });
+  }, []);
+
+  const connectedProjection = headlessEnabled
+    && headlessSnapshot !== null
+    && headlessState.error === null;
+  const connectionLabel = connectedProjection
+    ? 'Headless owner connected'
+    : headlessEnabled ? 'Headless projection unavailable' : 'Runtime unavailable';
+  const connectionDetail = connectedProjection
+    ? `Receiver ${headlessSnapshot.receiverEpoch} · snapshot ${headlessSnapshot.snapshotSequence}`
+    : headlessState.error
+      ?? (health.status === 'error' || health.status === 'absent'
+        ? health.message
+        : health.status === 'ready'
+          ? health.data.runtimeAvailability?.message ?? 'Structural Composer mode'
+          : 'Reading backend status…');
 
   return (
     <main className="app-shell">
       <header className="app-header">
-        <div className="brand-mark" aria-hidden="true">MF</div>
-        <div>
-          <p className="eyebrow">ManyForge Composer</p>
-          <p className="app-title">Composable cell workbench</p>
+        <div className="app-identity" aria-label="ManyForge Composer">
+          <span className="brand-mark" aria-hidden="true">MF</span>
+          <strong>ManyForge</strong>
         </div>
-        <div className="header-boundary">
-          <span
-            className={`boundary-dot${headlessEnabled ? ' boundary-dot-connected' : ''}`}
-            aria-hidden="true"
-          />
-          {headlessEnabled ? 'Headless owner connected' : 'Structural mode'}
-        </div>
-      </header>
-
-      <UnavailableBanner health={health} onRetry={retryHealth} />
-
-      <div
-        className={[
-          'workbench',
-          navigationCollapsed ? 'navigation-collapsed' : '',
-          commandsCollapsed ? 'commands-collapsed' : '',
-        ].filter(Boolean).join(' ')}
-        style={layoutStyle}
-      >
-        <aside className="workbench-navigation" aria-label="Catalog and artifact library">
-          <div className="collapsed-rail-slot" hidden={!navigationCollapsed}>
-            <CollapsedRail
-              label="Library"
-              side="left"
-              buttonRef={navigationRail}
-              onExpand={() => {
-                setNavigationCollapsed(false);
-                focusAfterLayout(navigationCollapse);
-              }}
-            />
-          </div>
-          <div className="workbench-pane" hidden={navigationCollapsed}>
-            <div className="pane-toolbar">
-              <strong>Library</strong>
-              <button
-                type="button"
-                ref={navigationCollapse}
-                aria-label="Collapse library pane"
-                onClick={() => {
-                  setNavigationCollapsed(true);
-                  focusAfterLayout(navigationRail);
-                }}
-              >
-                ‹
-              </button>
-            </div>
-            {/* Catalog is first so the node palette is useful at startup. */}
-            <CatalogPanel catalog={catalog} onRetry={retryCatalog} />
-            <details className="workbench-disclosure" open>
-              <summary>Artifacts · Program / Deployment</summary>
-              <ArtifactBrowser onSelectionChange={handleArtifactSelection} />
-            </details>
-            <details className="workbench-disclosure">
-              <summary>Deployment composition</summary>
-              <DeploymentCompositionPanel enabled={headlessEnabled} />
-            </details>
-          </div>
-        </aside>
-
-        {!navigationCollapsed && (
-          <WorkbenchDivider
-            label="Library"
-            value={navigationWidth}
-            min={NAVIGATION_WIDTH_MIN}
-            max={NAVIGATION_WIDTH_MAX}
-            direction={1}
-            onChange={setNavigationWidth}
-          />
-        )}
-
-        <section className="workbench-workspace" aria-label="Program authoring workspace">
-          <ProgramWorkspace
+        <nav className="workspace-switcher" aria-label="Workbench sections">
+          <button
+            type="button"
+            className={activeWorkspace === 'program' ? 'active' : ''}
+            aria-pressed={activeWorkspace === 'program'}
+            onClick={() => setActiveWorkspace('program')}
+          >
+            Program
+          </button>
+          <button
+            type="button"
+            className={activeWorkspace === 'deployment' ? 'active' : ''}
+            aria-pressed={activeWorkspace === 'deployment'}
+            onClick={() => setActiveWorkspace('deployment')}
+          >
+            Deployment
+          </button>
+        </nav>
+        {activeWorkspace === 'program' ? (
+          <ProgramDocumentControls
             controller={programController}
             runtime={programRuntime}
-            catalog={catalog}
-            environment={nodeEnvironment}
-            selectedProgramPath={selectedProgramPath}
-            onRetryCatalog={retryCatalog}
-            onRetryEnvironment={retryNodeEnvironment}
           />
+        ) : (
+          <div className="active-workspace-title">
+            <strong>Deployment composition</strong>
+            <span>Manager-owned desired and active graph</span>
+          </div>
+        )}
+        <RuntimeStatusOverlay
+          status={runtimeView}
+          backendConnected={connectedProjection}
+          error={headlessState.error}
+          connectionLabel={connectionLabel}
+          connectionDetail={connectionDetail}
+          unacknowledgedAlarms={headlessSnapshot?.alarms.unacknowledgedCount ?? 0}
+          activeAcknowledgedAlarms={headlessSnapshot?.alarms.activeAcknowledgedCount ?? 0}
+          onRetry={retryHealth}
+          onOpenDetails={openRuntimeDetails}
+        />
+      </header>
+
+      <div
+        className={`workbench${commandsCollapsed ? ' commands-collapsed' : ''}`}
+        style={layoutStyle}
+      >
+        <section className="workbench-workspace">
+          {activeWorkspace === 'program' ? (
+            <ProgramWorkspace
+              controller={programController}
+              runtime={programRuntime}
+              catalog={catalog}
+              environment={nodeEnvironment}
+              onRetryCatalog={retryCatalog}
+              onRetryEnvironment={retryNodeEnvironment}
+            />
+          ) : (
+            <div className="deployment-workspace">
+              <DeploymentCompositionPanel enabled={headlessEnabled} />
+            </div>
+          )}
         </section>
 
         {!commandsCollapsed && (
@@ -332,7 +331,12 @@ export default function App() {
                 <summary>Component lifecycle / CCLC</summary>
                 <CCLCPanel enabled={headlessEnabled} />
               </details>
-              <details className="workbench-disclosure">
+              <details
+                id="runtime-observability"
+                className="workbench-disclosure"
+                open={runtimeDetailsOpen}
+                onToggle={(event) => setRuntimeDetailsOpen(event.currentTarget.open)}
+              >
                 <summary>Runtime, alarms, and history</summary>
                 <HeadlessRuntimeSurfaces
                   enabled={headlessEnabled}
@@ -351,12 +355,6 @@ export default function App() {
           </div>
         </aside>
       </div>
-
-      <footer className="app-footer">
-        Composer owns local drafts and presentation only. Runtime state,
-        validation, execution, scene, lifecycle, and Stop remain headless-owner
-        responsibilities.
-      </footer>
     </main>
   );
 }

@@ -26,6 +26,7 @@ import {
 import { ProgramPolicyEditor } from './ProgramPolicyEditor';
 
 interface ProgramPropertyEditorProps {
+  embedded?: boolean;
   root: ProgramTreeNode;
   selectedId: string | null;
   catalogEntries: CatalogEntry[];
@@ -192,6 +193,7 @@ function ScalarLiteralEditor({
 }
 
 export function ProgramPropertyEditor({
+  embedded = false,
   root,
   selectedId,
   catalogEntries,
@@ -214,13 +216,19 @@ export function ProgramPropertyEditor({
 
   if (!selected || !entry) {
     return (
-      <section className="program-properties" aria-labelledby="program-properties-title">
-        <header className="program-subpanel-header">
-          <div>
-            <p className="eyebrow">Exact catalog schema</p>
-            <h3 id="program-properties-title">Properties</h3>
-          </div>
-        </header>
+      <section
+        className="program-properties"
+        aria-label={embedded ? 'Node properties' : undefined}
+        aria-labelledby={embedded ? undefined : 'program-properties-title'}
+      >
+        {!embedded && (
+          <header className="program-subpanel-header">
+            <div>
+              <p className="eyebrow">Exact catalog schema</p>
+              <h3 id="program-properties-title">Properties</h3>
+            </div>
+          </header>
+        )}
         <div className="panel-state">Select one Program node to edit it.</div>
       </section>
     );
@@ -287,14 +295,20 @@ export function ProgramPropertyEditor({
   };
 
   return (
-    <section className="program-properties" aria-labelledby="program-properties-title">
-      <header className="program-subpanel-header">
-        <div>
-          <p className="eyebrow">Exact catalog schema</p>
-          <h3 id="program-properties-title">Properties</h3>
-        </div>
-        <code>{selected.instance_id}</code>
-      </header>
+    <section
+      className="program-properties"
+      aria-label={embedded ? `Properties for ${selected.instance_id}` : undefined}
+      aria-labelledby={embedded ? undefined : 'program-properties-title'}
+    >
+      {!embedded && (
+        <header className="program-subpanel-header">
+          <div>
+            <p className="eyebrow">Exact catalog schema</p>
+            <h3 id="program-properties-title">Properties</h3>
+          </div>
+          <code>{selected.instance_id}</code>
+        </header>
+      )}
       <div className="program-property-list">
         <div className="program-node-identity">
           <span>{entry.name}</span>

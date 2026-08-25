@@ -1,7 +1,10 @@
 from __future__ import annotations
 
+import base64
+import hashlib
 import json
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
 from threading import Thread
 from typing import Any
 
@@ -10,6 +13,7 @@ import pytest
 from scripts.qualification import current_workbench_browser_collector as collector
 
 _REAL_RAW_WEBDRIVER = collector.RawWebDriver
+_PNG = b"\x89PNG\r\n\x1a\nfixture"
 
 
 def _performance(*, active: bool = True, long_tasks: bool = False) -> dict[str, Any]:
@@ -34,7 +38,12 @@ def _performance(*, active: bool = True, long_tasks: bool = False) -> dict[str, 
     }
 
 
-def _snapshot(*, active: bool = True, long_tasks: bool = False) -> dict[str, Any]:
+def _snapshot(
+    *,
+    active: bool = True,
+    long_tasks: bool = False,
+    viewport: tuple[int, int] = (1280, 720),
+) -> dict[str, Any]:
     status = {
         "schemaVersion": collector.QUALIFICATION_SCHEMA,
         "viewerActive": active,
@@ -55,7 +64,11 @@ def _snapshot(*, active: bool = True, long_tasks: bool = False) -> dict[str, Any
             else None
         ),
         "browser": {"userAgent": "Fake Firefox", "platform": "test"},
-        "viewport": {"width": 1280, "height": 720, "devicePixelRatio": 1.0},
+        "viewport": {
+            "width": viewport[0],
+            "height": viewport[1],
+            "devicePixelRatio": 1.0,
+        },
         "headless": {
             "socketPath": "/ws/state",
             "sourceCount": 1,
@@ -82,6 +95,7 @@ class _FakeDriver:
         self.timeout_s = timeout_s
         self.session_id: str | None = None
         self.operations_collapsed = False
+        self.viewport = (1280, 720)
         self.inactive_take_frames = list(self.__class__.inactive_take_frames)
         self.deleted = False
         self.commands: list[str] = []
@@ -92,11 +106,34 @@ class _FakeDriver:
         self.session_id = "exact-session"
         return self.session_id
 
+    def set_window_rect(self, width: int, height: int) -> None:
+        self.command(
+            "POST",
+            "/window/rect",
+            {"width": width, "height": height},
+        )
+
+    def screenshot_png(self) -> bytes:
+        encoded = self.command("GET", "/screenshot")
+        assert isinstance(encoded, str)
+        return base64.b64decode(encoded)
+
     def command(self, method: str, path: str, payload: dict[str, Any] | None = None) -> Any:
         self.commands.append(path)
         if path == "/url":
             self.operations_collapsed = False
             return None
+        if path == "/window/rect":
+            assert payload is not None
+            self.viewport = (int(payload["width"]), int(payload["height"]))
+            return {
+                "x": 0,
+                "y": 0,
+                "width": self.viewport[0],
+                "height": self.viewport[1],
+            }
+        if path == "/screenshot":
+            return base64.b64encode(_PNG).decode("ascii")
         if path == "/execute/sync":
             script = str((payload or {}).get("script"))
             self.scripts.append(script)
@@ -104,6 +141,7 @@ class _FakeDriver:
                 snapshot = _snapshot(
                     active=not self.operations_collapsed,
                     long_tasks=self.long_tasks,
+                    viewport=self.viewport,
                 )
                 return {
                     "qualification": snapshot,
@@ -117,6 +155,7 @@ class _FakeDriver:
                 snapshot = _snapshot(
                     active=not self.operations_collapsed,
                     long_tasks=self.long_tasks,
+                    viewport=self.viewport,
                 )
                 if self.operations_collapsed and self.inactive_take_frames:
                     snapshot["performance"]["renderedFrames"] = self.inactive_take_frames.pop(0)
@@ -157,6 +196,57 @@ def test_collector_cleans_up_exact_session_on_success_and_uses_exact_opt_in() ->
     assert driver.scripts.count(collector.COLLAPSE_SCRIPT) == 1
     assert driver.scripts.count(collector.EXPAND_SCRIPT) == 1
     assert result["longTasks"] == {"supported": False, "count": None}
+
+
+def test_live_observation_uses_the_single_integrated_runtime_status_entry() -> None:
+    assert '.runtime-status-button[data-backend-connected="true"]' in collector.OBSERVATION_SCRIPT
+    assert ".header-boundary" not in collector.OBSERVATION_SCRIPT
+
+
+def test_collector_sets_and_proves_viewport_and_writes_bounded_screenshot(
+    tmp_path: Path,
+) -> None:
+    screenshot = tmp_path / "ui1-1920.png"
+    result = collector.collect_current_workbench(
+        "http://webdriver.test",
+        "http://composer.test/",
+        viewport_width=1920,
+        viewport_height=1080,
+        screenshot_path=screenshot,
+    )
+
+    assert result["requestedViewport"] == {"width": 1920, "height": 1080}
+    assert result["viewport"] == {
+        "width": 1920,
+        "height": 1080,
+        "devicePixelRatio": 1.0,
+    }
+    assert result["screenshotSha256"] == hashlib.sha256(_PNG).hexdigest()
+    assert screenshot.read_bytes() == _PNG
+    assert "/window/rect" in _FakeDriver.instances[0].commands
+    assert "/screenshot" in _FakeDriver.instances[0].commands
+
+
+@pytest.mark.parametrize(
+    ("width", "height", "message"),
+    [
+        (1920, None, "supplied together"),
+        (319, 900, "viewport width"),
+        (1440, 319, "viewport height"),
+    ],
+)
+def test_collector_rejects_incomplete_or_unbounded_viewport(
+    width: int | None,
+    height: int | None,
+    message: str,
+) -> None:
+    with pytest.raises(collector.CollectorError, match=message):
+        collector.collect_current_workbench(
+            "http://webdriver.test",
+            "http://composer.test/",
+            viewport_width=width,
+            viewport_height=height,
+        )
 
 
 def test_inactive_transition_frame_is_discarded_but_post_transition_frame_fails(

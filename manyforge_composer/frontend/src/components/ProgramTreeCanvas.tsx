@@ -487,27 +487,8 @@ export function ProgramTreeCanvas({
   };
 
   return (
-    <section className="program-tree-surface" aria-labelledby="program-tree-title">
-      <header className="program-subpanel-header">
-        <div>
-          <p className="eyebrow">Validated Program v1 topology</p>
-          <h3 id="program-tree-title">Tree canvas</h3>
-        </div>
-        <CanvasViewControls
-          edgeStyle={view.edgeStyle}
-          layoutDirection={view.layoutDirection}
-          onEdgeStyleChange={(edgeStyle) => dispatchView({
-            type: 'set_edge_style',
-            edgeStyle,
-          })}
-          onLayoutDirectionChange={(layoutDirection) => dispatchView({
-            type: 'set_layout_direction',
-            layoutDirection,
-          })}
-          onAutoLayout={autoLayout}
-          onFitView={fitView}
-        />
-      </header>
+    <section className="program-tree-surface" aria-label="Program tree canvas">
+      <h3 className="sr-only">Program tree canvas</h3>
 
       <div
         className="program-tree-react-flow"
@@ -523,6 +504,30 @@ export function ProgramTreeCanvas({
           if (intent?.type === 'delete') event.stopPropagation();
         }}
       >
+        <div className="program-canvas-toolbar">
+          <CanvasViewControls
+            edgeStyle={view.edgeStyle}
+            layoutDirection={view.layoutDirection}
+            onEdgeStyleChange={(edgeStyle) => dispatchView({
+              type: 'set_edge_style',
+              edgeStyle,
+            })}
+            onLayoutDirectionChange={(layoutDirection) => dispatchView({
+              type: 'set_layout_direction',
+              layoutDirection,
+            })}
+            onAutoLayout={autoLayout}
+            onFitView={fitView}
+          />
+          <button
+            type="button"
+            className="icon-button program-canvas-help"
+            aria-label="Program canvas keyboard help"
+            title="Focus a node, use arrow keys to navigate, Enter or Space to select, and Delete or Backspace to remove a selected non-root node."
+          >
+            ?
+          </button>
+        </div>
         <ReactFlow
           nodes={graphNodes}
           edges={graphEdges}
@@ -552,21 +557,11 @@ export function ProgramTreeCanvas({
           <Background color="#29404d" gap={24} />
           <Controls showInteractive />
         </ReactFlow>
-      </div>
-
-      <p className="program-canvas-shortcuts">
-        Focus a node, use arrow keys to navigate, Enter or Space to select,
-        and Delete/Backspace to remove a selected non-root node.
-      </p>
-
-      <div className="program-tree-actions">
-        <span>
-          {selectedRow
-            ? `Selected ${selectedRow.node.instance_id}`
-            : 'Select one node to edit its properties or topology.'}
-        </span>
         {selectedRow && selectedRow.parentId !== null && (
-          <>
+          <div
+            className="program-tree-actions"
+            aria-label={`Topology actions for ${selectedRow.node.instance_id}`}
+          >
             <button
               type="button"
               disabled={authoringDisabled || selectedRow.index === 0}
@@ -626,10 +621,12 @@ export function ProgramTreeCanvas({
             >
               Delete
             </button>
-          </>
+          </div>
+        )}
+        {canvasMessage && (
+          <p className="program-inline-message program-canvas-message">{canvasMessage}</p>
         )}
       </div>
-      {canvasMessage && <p className="program-inline-message">{canvasMessage}</p>}
       <span className="sr-only" aria-live="polite">
         Canvas bounds {positions.size} nodes, {graphWidth} by {graphHeight} pixels.
       </span>

@@ -24,7 +24,6 @@ import type {
   ExecutionHistoryEventView,
   HistoryAlarmPhase,
 } from './ExecutionHistoryPanel';
-import { RuntimeStatusOverlay } from './RuntimeStatusOverlay';
 import type { RuntimeStatusView } from './RuntimeStatusOverlay';
 
 
@@ -172,10 +171,6 @@ export function HeadlessRuntimeSurfacesView({
   const [historyLoading, setHistoryLoading] = useState(false);
   const [historyError, setHistoryError] = useState<string | null>(null);
   const [historyEvents, setHistoryEvents] = useState<ExecutionHistoryEventView[]>([]);
-  const runtimeView = useMemo(
-    () => snapshot === null ? null : runtimeStatusView(snapshot.runtime),
-    [snapshot],
-  );
   const attention = useMemo(
     () => attentionAlarmsNewestFirst(snapshot?.alarms.alarms ?? []),
     [snapshot],
@@ -274,11 +269,6 @@ export function HeadlessRuntimeSurfacesView({
   if (!enabled) return null;
   return (
     <>
-      <RuntimeStatusOverlay
-        status={runtimeView}
-        error={error}
-        panelObscured={panels.length > 0}
-      />
       <aside className="operator-alarm-stack" aria-label="Operator alarms">
         {panels.map((alarm) => (
           <OperatorAlarmPanel

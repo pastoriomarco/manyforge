@@ -1,7 +1,7 @@
 import { useEffect, useMemo, useState } from 'react';
 
-import type { ProgramWorkspaceController } from '../hooks/useProgramWorkspace';
 import type { ProgramRuntimeController } from '../hooks/useProgramRuntime';
+import type { ProgramWorkspaceController } from '../hooks/useProgramWorkspace';
 import type { StructuralResourceState } from '../state/structuralResource';
 import type {
   CatalogResponse,
@@ -19,61 +19,8 @@ interface ProgramWorkspaceProps {
   runtime: ProgramRuntimeController;
   catalog: StructuralResourceState<CatalogResponse>;
   environment: StructuralResourceState<NodeEnvironmentResponse>;
-  selectedProgramPath: string | null;
   onRetryCatalog: () => void;
   onRetryEnvironment: () => void;
-}
-
-function shortRevision(revision: string | null): string {
-  if (!revision) return 'none';
-  return revision.length > 22 ? `${revision.slice(0, 18)}…` : revision;
-}
-
-function EmptyAuthoringSurface() {
-  return (
-    <div className="program-authoring-grid program-authoring-empty" aria-label="Empty Program authoring surface">
-      <section
-        className="program-palette"
-        aria-labelledby="empty-palette-title"
-        aria-disabled="true"
-      >
-        <header className="program-subpanel-header">
-          <div>
-            <p className="eyebrow">Node catalog</p>
-            <h3 id="empty-palette-title">Authoring palette</h3>
-          </div>
-        </header>
-        <div className="program-empty-guidance">
-          <strong>Open a Draft to use the palette</strong>
-          <span>Catalog entries remain available in the Library at left.</span>
-        </div>
-      </section>
-      <section className="program-tree-surface" aria-labelledby="empty-tree-title">
-        <header className="program-subpanel-header">
-          <div>
-            <p className="eyebrow">Program graph</p>
-            <h3 id="empty-tree-title">Tree canvas</h3>
-          </div>
-        </header>
-        <div className="program-tree-scroll program-tree-empty">
-          <strong>No Program Draft is open</strong>
-          <span>Select an artifact in the Library, then choose Open as Draft.</span>
-        </div>
-      </section>
-      <section className="program-properties" aria-labelledby="empty-properties-title">
-        <header className="program-subpanel-header">
-          <div>
-            <p className="eyebrow">Selection</p>
-            <h3 id="empty-properties-title">Properties</h3>
-          </div>
-        </header>
-        <div className="program-empty-guidance">
-          <strong>Select a node to inspect properties</strong>
-          <span>Properties become editable after a Draft and node are selected.</span>
-        </div>
-      </section>
-    </div>
-  );
 }
 
 export function ProgramWorkspace({
@@ -81,7 +28,6 @@ export function ProgramWorkspace({
   runtime,
   catalog,
   environment,
-  selectedProgramPath,
   onRetryCatalog,
   onRetryEnvironment,
 }: ProgramWorkspaceProps) {
@@ -90,27 +36,25 @@ export function ProgramWorkspace({
     mutationAvailable,
     refresh,
     mutate,
-    newDraft,
-    openDraft,
-    save,
-    saveAs,
-    apply: applyDraft,
-    discard,
-    revert,
-    load: loadProgram,
     updateNodePolicies,
     clearFeedback,
   } = controller;
   const [selectedNodeId, setSelectedNodeId] = useState<string | null>(null);
   const [insertionRequest, setInsertionRequest] = useState<ProgramInsertionRequest | null>(null);
-  const [confirmDiscard, setConfirmDiscard] = useState(false);
-  const [confirmOverwrite, setConfirmOverwrite] = useState(false);
-  const [saveAsPath, setSaveAsPath] = useState('');
+  const [paletteCollapsed, setPaletteCollapsed] = useState(false);
+  const [inspectorCollapsed, setInspectorCollapsed] = useState(false);
+  const [inspectorView, setInspectorView] = useState<'properties' | 'declarations'>('properties');
   const workspace = state.workspace;
   const program = workspace?.draft.program ?? null;
   const busy = state.status === 'loading'
     || (state.status === 'ready' && state.pendingAction !== null);
   const catalogEntries = catalog.status === 'ready' ? catalog.data.entries : [];
+  const catalogIdentity = catalog.status === 'ready' ? {
+    catalogId: catalog.data.catalogId,
+    contentVersion: catalog.data.contentVersion,
+    catalogDigest: catalog.data.catalogDigest,
+    environmentDigest: catalog.data.environmentDigest,
+  } : null;
   const nodeEnvironment = environment.status === 'ready' ? environment.data : null;
   const environmentAligned = catalog.status === 'ready'
     && environment.status === 'ready'
@@ -118,22 +62,6 @@ export function ProgramWorkspace({
   const authoringUnavailable = nodeEnvironment !== null
     && !nodeEnvironment.portableAuthoringAvailable;
   const authoringBusy = busy || authoringUnavailable || !mutationAvailable;
-  const scenarioCatalog = runtime.state.catalog;
-  const selectedScenario = scenarioCatalog?.scenarios.find(
-    (row) => row.scenarioId === runtime.state.selectedScenarioId,
-  ) ?? null;
-  const replaceNeedsConfirmation = workspace?.hasUnsavedChanges === true
-    || workspace?.hasUnappliedChanges === true;
-  const ownerComparisonRefreshing = state.comparisonStatus === 'refreshing';
-  const ownerComparisonStale = state.comparisonStatus === 'stale';
-  const affectedPolicyInstances = workspace?.applicability.affectedInstanceIds ?? [];
-  const affectedPolicyInstanceSummary = affectedPolicyInstances.length <= 20
-    ? affectedPolicyInstances.join(', ')
-    : `${affectedPolicyInstances.slice(0, 20).join(', ')}, and ${affectedPolicyInstances.length - 20} more`;
-
-  useEffect(() => {
-    if (workspace?.saved.path) setSaveAsPath(workspace.saved.path);
-  }, [workspace?.saved.path]);
 
   const validNodeIds = useMemo(
     () => new Set(program ? flattenProgramTree(program.tree)
@@ -150,365 +78,181 @@ export function ProgramWorkspace({
     }
   }, [program, selectedNodeId, validNodeIds]);
 
+  const gridClassName = [
+    'program-authoring-grid',
+    program ? '' : 'program-authoring-empty',
+    paletteCollapsed ? 'palette-collapsed' : '',
+    inspectorCollapsed ? 'inspector-collapsed' : '',
+  ].filter(Boolean).join(' ');
+
   return (
-    <section className="panel program-workspace" aria-labelledby="program-workspace-title">
-      <header className="panel-header program-workspace-header">
-        <div>
-          <p className="eyebrow">Composer-owned authoring</p>
-          <h2 id="program-workspace-title">Program workspace</h2>
-        </div>
-        <div className="program-workspace-header-actions">
-          <button type="button" className="quiet-button" disabled={busy} onClick={refresh}>
-            Refresh Draft
-          </button>
+    <section className="panel program-workspace" aria-label="Program authoring workspace">
+      <div className="program-workspace-notices">
+        {state.status === 'loading' && workspace === null && (
+          <div className="program-workspace-notice" role="status">
+            Reading the Program workspace…
+          </div>
+        )}
+        {state.status === 'error' && workspace === null && (
+          <div className="program-workspace-notice error-state" role="alert">
+            <span><strong>Program workspace unavailable.</strong> {state.error}</span>
+            <button type="button" onClick={refresh}>Retry workspace</button>
+          </div>
+        )}
+        {(state.message || state.error || state.refreshWarning) && workspace !== null && (
+          <div
+            className={`program-workspace-notice${state.error || state.refreshWarning ? ' error-state' : ''}`}
+            role={state.error || state.refreshWarning ? 'alert' : 'status'}
+          >
+            <span>{state.error ?? state.refreshWarning ?? state.message}</span>
+            <button type="button" className="text-button" onClick={clearFeedback}>Dismiss</button>
+          </div>
+        )}
+        {runtime.active && (
+          <div className="program-workspace-notice" role="status">
+            <strong>Run active.</strong>
+            <span>Draft inspection remains available; backend-owned authoring actions stay disabled until Idle.</span>
+          </div>
+        )}
+        {!runtime.active && workspace !== null && !mutationAvailable && (
+          <div className="program-workspace-notice" role="status">
+            <strong>Authoring unavailable.</strong>
+            <span>Waiting for current backend Idle admission and the matching Draft revision.</span>
+          </div>
+        )}
+        {catalog.status !== 'ready' && (
+          <div className="program-workspace-notice error-state" role="alert">
+            <span><strong>Node catalog unavailable.</strong> {catalog.status === 'error' || catalog.status === 'absent' ? catalog.message : 'Loading…'}</span>
+            <button type="button" onClick={onRetryCatalog}>Retry catalog</button>
+          </div>
+        )}
+        {environment.status !== 'ready' && (
+          <div className="program-workspace-notice error-state" role="alert">
+            <span><strong>Authoring availability unavailable.</strong> {environment.status === 'error' || environment.status === 'absent' ? environment.message : 'Loading…'}</span>
+            <button type="button" onClick={onRetryEnvironment}>Retry environment</button>
+          </div>
+        )}
+        {catalog.status === 'ready' && environment.status === 'ready' && !environmentAligned && (
+          <div className="program-workspace-notice error-state" role="alert">
+            <span><strong>Catalog identity mismatch.</strong> Editing remains disabled.</span>
+            <button type="button" onClick={onRetryCatalog}>Retry catalog</button>
+            <button type="button" onClick={onRetryEnvironment}>Retry environment</button>
+          </div>
+        )}
+        {environmentAligned && nodeEnvironment && authoringUnavailable && (
+          <div className="program-workspace-notice error-state" role="alert">
+            <span>
+              <strong>Program mutations unavailable.</strong>{' '}
+              {nodeEnvironment.reasonCodes.join(', ') || 'Portable authoring is not available.'}
+            </span>
+          </div>
+        )}
+      </div>
+
+      <div className={gridClassName}>
+        {paletteCollapsed ? (
           <button
             type="button"
-            disabled={authoringBusy || !program || !workspace?.saved.available}
-            onClick={save}
+            className="program-side-rail program-side-rail-left"
+            aria-label="Expand node palette"
+            onClick={() => setPaletteCollapsed(false)}
           >
-            Save
+            <span aria-hidden="true">›</span><span>Nodes</span>
           </button>
-        </div>
-      </header>
-
-      {state.status === 'loading' && workspace === null && (
-        <div className="panel-state" role="status">Reading the Program workspace…</div>
-      )}
-      {state.status === 'error' && workspace === null && (
-        <div className="panel-state error-state" role="alert">
-          <strong>Program workspace unavailable</strong>
-          <span>{state.error}</span>
-          <button type="button" onClick={refresh}>Retry workspace</button>
-        </div>
-      )}
-
-      {workspace && (
-        <>
-          <div className="program-identity-strip">
-            <div className={workspace.hasUnsavedChanges ? 'identity-dirty' : 'identity-current'}>
-              <span>Draft</span>
-              <strong>{workspace.draft.programLoaded ? shortRevision(workspace.draft.programRevision) : 'empty'}</strong>
-              <small>ID {workspace.draft.draftId} · edit {workspace.draft.draftRevision}</small>
+        ) : program ? (
+          <ProgramNodePalette
+            root={program.tree}
+            catalogEntries={catalogEntries}
+            catalogIdentity={catalogIdentity}
+            environment={nodeEnvironment}
+            selectedId={selectedNodeId}
+            busy={authoringBusy}
+            onMutate={mutate}
+            dropRequest={insertionRequest}
+            onDropRequestHandled={() => setInsertionRequest(null)}
+            onCollapse={() => setPaletteCollapsed(true)}
+          />
+        ) : (
+          <section className="program-palette" aria-label="Node palette">
+            <header className="program-subpanel-header">
+              <h3>Nodes</h3>
+              <button type="button" className="icon-button" aria-label="Collapse node palette" onClick={() => setPaletteCollapsed(true)}>‹</button>
+            </header>
+            <div className="program-empty-guidance">
+              <strong>Open a Draft to use the palette</strong>
+              <span>Use Open in the persistent header.</span>
             </div>
-            <div className={`${workspace.saved.matchesDraft ? 'identity-current' : 'identity-dirty'}${ownerComparisonRefreshing || ownerComparisonStale ? ' identity-refreshing' : ''}`}>
-              <span>Saved</span>
-              <strong>{workspace.saved.available ? shortRevision(workspace.saved.programRevision) : 'not saved'}</strong>
-              <small>
-                {ownerComparisonRefreshing
-                  ? 'Prior owner observation; refreshing comparison…'
-                  : ownerComparisonStale
-                  ? 'Prior Saved observation; Draft comparison refresh failed.'
-                  : workspace.saved.path ?? 'Use Save As to choose a path'}
-              </small>
-            </div>
-            <div className={`${workspace.applied.available ? 'identity-current' : 'identity-unavailable'}${ownerComparisonRefreshing || ownerComparisonStale ? ' identity-refreshing' : ''}`}>
-              <span>Applied</span>
-              <strong>
-                {workspace.applied.available
-                  ? shortRevision(workspace.applied.programRevision)
-                  : 'Unavailable'}
-              </strong>
-              <small>
-                {ownerComparisonRefreshing
-                  ? 'Prior owner observation; refreshing comparison…'
-                  : ownerComparisonStale
-                  ? 'Prior Applied observation; Draft comparison refresh failed.'
-                  : workspace.applied.available
-                  ? workspace.applied.matchesDraft
-                    ? 'Matches the current Draft.'
-                    : 'Owner selection differs from Draft.'
-                  : workspace.applied.unavailableReason?.message
-                    ?? 'No owner-issued Applied identity.'}
-              </small>
-            </div>
-          </div>
+          </section>
+        )}
 
-          <details className="program-actions-disclosure">
-            <summary>Program actions · New · Open · Save As · Apply · Revert · Discard · Load</summary>
-            <div className="program-actions-popover">
-              <div className="program-artifact-actions program-apply-actions">
-                <label className="program-save-as-path">
-                  Qualified scenario
-                  <select
-                    aria-label="Qualified scenario"
-                    value={runtime.state.selectedScenarioId ?? ''}
-                    disabled={busy || scenarioCatalog === null}
-                    onChange={(event) => {
-                      const scenarioId = event.target.value;
-                      if (scenarioId === '') {
-                        runtime.clearScenarioSelection();
-                      } else {
-                        runtime.selectScenario(scenarioId);
-                      }
-                    }}
-                  >
-                    <option value="">Select a scenario</option>
-                    {scenarioCatalog?.scenarios.map((row) => (
-                      <option key={row.scenarioId} value={row.scenarioId}>
-                        {row.description
-                          ? `${row.scenarioId} — ${row.description}`
-                          : row.scenarioId}
-                      </option>
-                    ))}
-                  </select>
-                </label>
-                <button
-                  type="button"
-                  disabled={
-                    authoringBusy
-                    || !program
-                    || selectedScenario === null
-                    || !workspace.applicability.applyReady
-                  }
-                  onClick={() => {
-                    if (!selectedScenario || !scenarioCatalog) return;
-                    applyDraft(
-                      selectedScenario.scenarioId,
-                      scenarioCatalog.scenarioCatalogRevision,
-                    );
-                  }}
-                >
-                  {state.status === 'ready' && state.pendingAction === 'apply'
-                    ? 'Applying…'
-                    : 'Apply Draft'}
-                </button>
-                {program && !workspace.applicability.applyReady && (
-                  <div className="program-apply-blocked" role="alert">
-                    <strong>Draft is not Apply-ready.</strong>
-                    <span>
-                      Affected node instances: {affectedPolicyInstanceSummary}.
-                    </span>
-                    <span>
-                      {workspace.applicability.unavailableReason?.message}
-                    </span>
-                  </div>
-                )}
-                <button
-                  type="button"
-                  disabled={authoringBusy || (replaceNeedsConfirmation && !confirmDiscard)}
-                  onClick={() => {
-                    newDraft(confirmDiscard);
-                    setConfirmDiscard(false);
-                  }}
-                >
-                  {state.status === 'ready' && state.pendingAction === 'new'
-                    ? 'Creating…'
-                    : 'New Program'}
-                </button>
-                <button
-                  type="button"
-                  disabled={
-                    authoringBusy
-                    || !workspace.saved.available
-                    || !workspace.applied.available
-                  }
-                  onClick={revert}
-                >
-                  {state.status === 'ready' && state.pendingAction === 'revert'
-                    ? 'Reverting…'
-                    : 'Revert to Saved'}
-                </button>
-                <button
-                  type="button"
-                  disabled={authoringBusy || !workspace.applied.available}
-                  onClick={discard}
-                >
-                  {state.status === 'ready' && state.pendingAction === 'discard'
-                    ? 'Discarding…'
-                    : 'Discard to Applied'}
-                </button>
-                <button
-                  type="button"
-                  disabled={
-                    authoringBusy
-                    || selectedProgramPath === null
-                    || selectedScenario === null
-                    || (replaceNeedsConfirmation && !confirmDiscard)
-                  }
-                  onClick={() => {
-                    if (!selectedProgramPath || !selectedScenario || !scenarioCatalog) return;
-                    loadProgram(
-                      selectedProgramPath,
-                      selectedScenario.scenarioId,
-                      scenarioCatalog.scenarioCatalogRevision,
-                      confirmDiscard,
-                    );
-                    setConfirmDiscard(false);
-                  }}
-                >
-                  Load and Apply
-                </button>
-                <small>
-                  Program Apply requires this scenario&apos;s deployment already
-                  active and converged; use Deployment composition first when
-                  it is not. Program Apply never changes the deployment. Load
-                  validates and applies the selected artifact before replacing
-                  Draft and Saved. New creates an unsaved Draft without a
-                  runtime effect. Revert uses the current Applied selection;
-                  Discard reads Applied and changes Draft only.
-                </small>
-              </div>
+        {program ? (
+          <ProgramTreeCanvas
+            root={program.tree}
+            catalogEntries={catalogEntries}
+            environment={nodeEnvironment}
+            selectedId={selectedNodeId}
+            busy={authoringBusy}
+            onSelect={setSelectedNodeId}
+            onMutate={mutate}
+            onStageInsert={(request) => {
+              setSelectedNodeId(request.targetId);
+              setInsertionRequest(request);
+            }}
+          />
+        ) : (
+          <section className="program-tree-surface program-tree-empty" aria-label="Program tree canvas">
+            <strong>No Program Draft is open</strong>
+            <span>Choose New or Open in the persistent header.</span>
+          </section>
+        )}
 
-              <div className="program-artifact-actions">
-                <div>
-                  <span>Artifact-browser selection</span>
-                  <code>{selectedProgramPath ?? 'Select a Program artifact below'}</code>
+        {inspectorCollapsed ? (
+          <button
+            type="button"
+            className="program-side-rail program-side-rail-right"
+            aria-label="Expand Program inspector"
+            onClick={() => setInspectorCollapsed(false)}
+          >
+            <span aria-hidden="true">‹</span><span>Inspector</span>
+          </button>
+        ) : (
+          <aside className="program-inspector" aria-label="Program inspector">
+            <div className="program-inspector-tabs">
+              <button
+                type="button"
+                className={inspectorView === 'properties' ? 'active' : ''}
+                aria-pressed={inspectorView === 'properties'}
+                onClick={() => setInspectorView('properties')}
+              >
+                Properties
+              </button>
+              <button
+                type="button"
+                className={inspectorView === 'declarations' ? 'active' : ''}
+                aria-pressed={inspectorView === 'declarations'}
+                onClick={() => setInspectorView('declarations')}
+              >
+                Declarations
+              </button>
+              <button
+                type="button"
+                className="icon-button"
+                aria-label="Collapse Program inspector"
+                title="Collapse Program inspector"
+                onClick={() => setInspectorCollapsed(true)}
+              >
+                ›
+              </button>
+            </div>
+            <div className="program-inspector-scroll">
+              {!program ? (
+                <div className="program-empty-guidance">
+                  <strong>Select a node to inspect properties</strong>
+                  <span>Properties and declarations appear after a Draft is open.</span>
                 </div>
-                <label className="program-confirmation">
-                  <input
-                    type="checkbox"
-                    checked={confirmDiscard}
-                    onChange={(event) => setConfirmDiscard(event.target.checked)}
-                  />
-                  Allow discarding unsaved or unapplied Draft changes
-                </label>
-                <button
-                  type="button"
-                  disabled={
-                    authoringBusy
-                    || selectedProgramPath === null
-                    || (workspace.hasUnsavedChanges && !confirmDiscard)
-                  }
-                  onClick={() => {
-                    if (!selectedProgramPath) return;
-                    openDraft(selectedProgramPath, confirmDiscard);
-                    setConfirmDiscard(false);
-                  }}
-                >
-                  Open as Draft
-                </button>
-                <label className="program-save-as-path">
-                  Save As path
-                  <input
-                    value={saveAsPath}
-                    onChange={(event) => setSaveAsPath(event.target.value)}
-                    placeholder="Path inside an approved Program root"
-                  />
-                </label>
-                <label className="program-confirmation">
-                  <input
-                    type="checkbox"
-                    checked={confirmOverwrite}
-                    onChange={(event) => setConfirmOverwrite(event.target.checked)}
-                  />
-                  Allow replacing an existing file
-                </label>
-                <button
-                  type="button"
-                  disabled={authoringBusy || !program || !saveAsPath.trim()}
-                  onClick={() => {
-                    saveAs(saveAsPath.trim(), confirmOverwrite);
-                    setConfirmOverwrite(false);
-                  }}
-                >
-                  Save As
-                </button>
-              </div>
-            </div>
-          </details>
-
-          {(state.message || state.error || state.refreshWarning) && (
-            <div
-              className={`program-feedback${state.error || state.refreshWarning ? ' error-state' : ''}`}
-              role={state.error || state.refreshWarning ? 'alert' : 'status'}
-            >
-              <span>{state.error ?? state.refreshWarning ?? state.message}</span>
-              <button type="button" className="text-button" onClick={clearFeedback}>Dismiss</button>
-            </div>
-          )}
-
-          {runtime.active && (
-            <div className="panel-state" role="status">
-              <strong>Run mode is active</strong>
-              <span>
-                This run keeps its captured Program and Binding. Draft, Save,
-                Program Apply, Load, Revert, and Discard remain unavailable
-                until the backend returns the cell to Idle. Deployment Apply
-                remains a separate Manager command.
-              </span>
-            </div>
-          )}
-
-          {!runtime.active && !mutationAvailable && (
-            <div className="panel-state" role="status">
-              <strong>Backend authoring is unavailable</strong>
-              <span>
-                Authoring controls remain disabled until the backend reports
-                one current idle admission and matching Draft revision.
-              </span>
-            </div>
-          )}
-
-          {catalog.status !== 'ready' && (
-            <div className="panel-state error-state">
-              <strong>Exact node catalog unavailable</strong>
-              <span>{catalog.status === 'error' || catalog.status === 'absent' ? catalog.message : 'Loading catalog…'}</span>
-              <button type="button" onClick={onRetryCatalog}>Retry catalog</button>
-            </div>
-          )}
-          {environment.status !== 'ready' && (
-            <div className="panel-state error-state">
-              <strong>Node authoring availability unavailable</strong>
-              <span>{environment.status === 'error' || environment.status === 'absent' ? environment.message : 'Loading node environment…'}</span>
-              <button type="button" onClick={onRetryEnvironment}>Retry environment</button>
-            </div>
-          )}
-          {catalog.status === 'ready'
-            && environment.status === 'ready'
-            && !environmentAligned && (
-              <div className="panel-state error-state" role="alert">
-                <strong>Catalog and node environment identities disagree</strong>
-                <span>
-                  Authoring stays disabled until both reads describe the same
-                  immutable environment.
-                </span>
-                <div className="program-workspace-header-actions">
-                  <button type="button" onClick={onRetryCatalog}>Retry catalog</button>
-                  <button type="button" onClick={onRetryEnvironment}>Retry environment</button>
-                </div>
-              </div>
-            )}
-          {environmentAligned && nodeEnvironment && authoringUnavailable && (
-            <div className="panel-state error-state" role="alert">
-              <strong>Program mutations are unavailable</strong>
-              <span>
-                {nodeEnvironment.reasonCodes.length > 0
-                  ? `Reason: ${nodeEnvironment.reasonCodes.join(', ')}.`
-                  : 'The active node environment does not permit portable authoring.'}
-                {nodeEnvironment.restorationGates.length > 0
-                  ? ` Restore at ${nodeEnvironment.restorationGates.join(', ')}.`
-                  : ''}
-              </span>
-              <span>Draft inspection and read-only selection remain available.</span>
-            </div>
-          )}
-          {program && (
-            <>
-              <div className="program-authoring-grid">
-                <ProgramNodePalette
-                  root={program.tree}
-                  catalogEntries={catalogEntries}
-                  environment={nodeEnvironment}
-                  selectedId={selectedNodeId}
-                  busy={authoringBusy}
-                  onMutate={mutate}
-                  dropRequest={insertionRequest}
-                  onDropRequestHandled={() => setInsertionRequest(null)}
-                />
-                <ProgramTreeCanvas
-                  root={program.tree}
-                  catalogEntries={catalogEntries}
-                  environment={nodeEnvironment}
-                  selectedId={selectedNodeId}
-                  busy={authoringBusy}
-                  onSelect={setSelectedNodeId}
-                  onMutate={mutate}
-                  onStageInsert={(request) => {
-                    setSelectedNodeId(request.targetId);
-                    setInsertionRequest(request);
-                  }}
-                />
+              ) : inspectorView === 'properties' ? (
                 <ProgramPropertyEditor
+                  embedded
                   root={program.tree}
                   selectedId={selectedNodeId}
                   catalogEntries={catalogEntries}
@@ -518,20 +262,21 @@ export function ProgramWorkspace({
                   onMutate={mutate}
                   onUpdateNodePolicies={updateNodePolicies}
                 />
-              </div>
-              <ProgramDeclarationsEditor
-                root={program.tree}
-                parameters={program.parameters ?? []}
-                namespaces={program.blackboard?.namespaces ?? []}
-                keys={program.blackboard?.keys ?? []}
-                busy={authoringBusy}
-                onMutate={mutate}
-              />
-            </>
-          )}
-        </>
-      )}
-      {(!workspace || !program) && <EmptyAuthoringSurface />}
+              ) : (
+                <ProgramDeclarationsEditor
+                  embedded
+                  root={program.tree}
+                  parameters={program.parameters ?? []}
+                  namespaces={program.blackboard?.namespaces ?? []}
+                  keys={program.blackboard?.keys ?? []}
+                  busy={authoringBusy}
+                  onMutate={mutate}
+                />
+              )}
+            </div>
+          </aside>
+        )}
+      </div>
     </section>
   );
 }

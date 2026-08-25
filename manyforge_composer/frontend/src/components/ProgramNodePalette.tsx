@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 
 import type {
   CatalogEntry,
@@ -23,16 +23,26 @@ import {
   validProgramInsertionPlacements,
 } from '../utils/programCanvasInteraction';
 import { NodePaletteItem } from './NodePaletteItem';
+import { OverlayPanel } from './OverlayPanel';
+
+interface ProgramCatalogIdentity {
+  catalogId: string;
+  contentVersion: string;
+  catalogDigest: string;
+  environmentDigest: string;
+}
 
 interface ProgramNodePaletteProps {
   root: ProgramTreeNode;
   catalogEntries: CatalogEntry[];
+  catalogIdentity: ProgramCatalogIdentity | null;
   environment: NodeEnvironmentResponse | null;
   selectedId: string | null;
   busy: boolean;
   onMutate: (mutation: string, args: Record<string, JsonValue>) => void;
   dropRequest?: ProgramInsertionRequest | null;
   onDropRequestHandled?: () => void;
+  onCollapse?: () => void;
 }
 
 function executionNote(
@@ -92,12 +102,14 @@ function parseParameterObject(
 export function ProgramNodePalette({
   root,
   catalogEntries,
+  catalogIdentity,
   environment,
   selectedId,
   busy,
   onMutate,
   dropRequest = null,
   onDropRequestHandled,
+  onCollapse,
 }: ProgramNodePaletteProps) {
   const [query, setQuery] = useState('');
   const [stagedId, setStagedId] = useState<string | null>(null);
@@ -106,6 +118,9 @@ export function ProgramNodePalette({
   const [stagedTargetId, setStagedTargetId] = useState<string | null>(null);
   const [parameterText, setParameterText] = useState('{}');
   const [error, setError] = useState<string | null>(null);
+  const [infoOpen, setInfoOpen] = useState(false);
+  const infoButton = useRef<HTMLButtonElement>(null);
+  const closeInfo = useCallback(() => setInfoOpen(false), []);
   const flat = useMemo(() => flattenProgramTree(root), [root]);
   const selected = flat.find((row) => row.node.instance_id === selectedId) ?? null;
   const stagedTarget = stagedTargetId === null
@@ -230,19 +245,60 @@ export function ProgramNodePalette({
   return (
     <section className="program-palette" aria-labelledby="program-palette-title">
       <header className="program-subpanel-header">
-        <div>
-          <p className="eyebrow">Active v2 environment</p>
-          <h3 id="program-palette-title">Node palette</h3>
+        <div className="program-subpanel-title">
+          <h3 id="program-palette-title">Nodes</h3>
+          <button
+            ref={infoButton}
+            type="button"
+            className="icon-button"
+            aria-label="Node catalog information"
+            title="Node catalog information"
+            onClick={() => setInfoOpen(true)}
+          >
+            i
+          </button>
         </div>
-        <span className="count-badge">{filtered.length}</span>
+        {onCollapse && (
+          <button
+            type="button"
+            className="icon-button"
+            aria-label="Collapse node palette"
+            title="Collapse node palette"
+            onClick={onCollapse}
+          >
+            ‹
+          </button>
+        )}
       </header>
+      <OverlayPanel
+        open={infoOpen}
+        title="Node catalog"
+        titleId="program-catalog-information-title"
+        kind="info"
+        onClose={closeInfo}
+        returnFocusRef={infoButton}
+      >
+        <div className="catalog-information">
+          <p>
+            Immutable compiler declarations for Program authoring. Runtime and
+            implementation availability remain owner-issued facts.
+          </p>
+          <dl>
+            <div><dt>Entries</dt><dd>{catalogEntries.length}</dd></div>
+            <div><dt>Catalog ID</dt><dd><code>{catalogIdentity?.catalogId ?? 'unavailable'}</code></dd></div>
+            <div><dt>Content version</dt><dd><code>{catalogIdentity?.contentVersion ?? 'unavailable'}</code></dd></div>
+            <div><dt>Catalog digest</dt><dd><code>{catalogIdentity?.catalogDigest ?? 'unavailable'}</code></dd></div>
+            <div><dt>Environment digest</dt><dd><code>{catalogIdentity?.environmentDigest ?? 'unavailable'}</code></dd></div>
+          </dl>
+        </div>
+      </OverlayPanel>
       <label className="program-filter">
-        <span>Find a node</span>
+        <span className="sr-only">Find a node</span>
         <input
           type="search"
           value={query}
           onChange={(event) => setQuery(event.target.value)}
-          placeholder="Name, ID, category, or tag"
+          placeholder="Find a node"
         />
       </label>
       <div className="program-palette-list">

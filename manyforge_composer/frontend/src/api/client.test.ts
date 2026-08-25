@@ -271,6 +271,24 @@ describe('structural API client', () => {
     expect(result.entries[0]?.selectable).toBe(true);
   });
 
+  it('lets the backend select its configured default artifact root', async () => {
+    const fetchMock = vi.fn().mockResolvedValue(response({
+      currentPath: '/configured/artifacts',
+      parentPath: null,
+      roots: ['/configured/artifacts'],
+      entries: [],
+    }));
+    vi.stubGlobal('fetch', fetchMock);
+
+    const result = await api.files.browse('deployment');
+
+    expect(fetchMock).toHaveBeenCalledWith(
+      '/api/files/browse?kind=deployment',
+      expect.objectContaining({ method: 'GET' }),
+    );
+    expect(result.currentPath).toBe('/configured/artifacts');
+  });
+
   it('preserves typed HTTP status and backend detail', async () => {
     vi.stubGlobal('fetch', vi.fn().mockResolvedValue(response(
       { detail: 'No URDF available for the active deployment' },

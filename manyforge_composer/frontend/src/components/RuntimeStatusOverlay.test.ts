@@ -9,7 +9,10 @@ describe('runtime status presentation shell', () => {
   it('renders unavailable state without inventing readiness', () => {
     const html = renderToStaticMarkup(createElement(RuntimeStatusOverlay, {
       status: null,
+      backendConnected: false,
       error: 'Headless status is not qualified.',
+      connectionLabel: 'Headless projection unavailable',
+      connectionDetail: 'Headless status is not qualified.',
     }));
     expect(html).toContain('readiness-offline');
     expect(html).toContain('Headless status is not qualified.');
@@ -26,6 +29,9 @@ describe('runtime status presentation shell', () => {
         capabilities: ['render'],
         components: [],
       },
+      backendConnected: true,
+      connectionLabel: 'Headless owner connected',
+      connectionDetail: 'Current projection',
     }));
     expect(html).toContain('readiness-degraded');
     expect(html).toContain('Warn');
