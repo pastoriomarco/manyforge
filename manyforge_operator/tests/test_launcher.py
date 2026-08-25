@@ -12,6 +12,7 @@ from manyforge_composer.backend.app import create_app
 from manyforge_composer.backend.security import SecurityConfig
 from manyforge_composer.backend.state import ComposerState
 from manyforge_operator import LaunchProfile, LaunchInstanceState, ResourcePresence
+from manyforge_operator.cell_layout import CellInstanceLayout
 from manyforge_operator.orchestrator import (
     LauncherError,
     NativeLauncher,
@@ -71,9 +72,15 @@ def test_native_commands_retain_four_owner_entrypoints(tmp_path: Path):
     assert "--canonical-empty-admission-filename canonical-empty-admission.json" in commands[0]
     assert "--cell-id native" in commands[1]
     assert "--manager-timeout-s 60.0" in commands[1]
-    assert "--execution-state-root" in specs[1].argv
-    assert specs[1].argv[specs[1].argv.index("--execution-state-root") + 1] == str(
-        config.runtime_state_root
+    assert "--execution-run-root" in specs[1].argv
+    assert specs[1].argv[specs[1].argv.index("--execution-run-root") + 1] == str(
+        config.execution_run_root
+    )
+    assert specs[0].argv[specs[0].argv.index("--execution-state-root") + 1] == str(
+        config.execution_state_root
+    )
+    assert specs[0].argv[specs[0].argv.index("--execution-run-root") + 1] == str(
+        config.execution_run_root
     )
     assert "--port 9010" in commands[1]
     assert "--port 9011" in commands[2]
@@ -133,21 +140,21 @@ def test_native_ordered_roots_make_examples_the_default_browse_root(
 
 
 @pytest.mark.parametrize(
-    "field,value",
+    "field,value,expected_error",
     [
-        ("install_root", "package,extra"),
-        ("install_root", "package "),
-        ("state_root", "operator,state"),
-        ("instance_id", "native,extra"),
+        ("install_root", "package,extra", "MANYFORGE_FS_ROOTS"),
+        ("install_root", "package ", "MANYFORGE_FS_ROOTS"),
+        ("state_root", "operator,state", "MANYFORGE_FS_ROOTS"),
+        ("instance_id", "native,extra", "path-safe"),
     ],
 )
 def test_native_configuration_rejects_ambiguous_composer_roots_before_effects(
-    tmp_path: Path, field: str, value: str
+    tmp_path: Path, field: str, value: str, expected_error: str
 ):
     config = _config(tmp_path)
     replacement = value if field == "instance_id" else tmp_path / value
 
-    with pytest.raises(ValueError, match="MANYFORGE_FS_ROOTS"):
+    with pytest.raises(ValueError, match=expected_error):
         replace(config, **{field: replacement})
 
 
@@ -470,7 +477,15 @@ def test_native_configuration_requires_explicit_artifact_digests(tmp_path: Path)
 
 def test_atomic_state_store_round_trip(tmp_path: Path, configuration_factory):
     config = _config(tmp_path)
-    store = _StateStore(config)
+    CellInstanceLayout.open_or_create(
+        cell_id=config.cell_id,
+        cell_root=config.instance_root,
+        install_root=config.install_root,
+    )
+    store = _StateStore(
+        root=config.instance_root / "state" / "operator",
+        lock_root=config.instance_root / "run" / "operator",
+    )
     from manyforge_operator.tests.conftest import make_status
 
     status = make_status(configuration_factory(), state=LaunchInstanceState.STARTING, with_resources=False)
@@ -483,6 +498,125 @@ def test_atomic_state_store_round_trip(tmp_path: Path, configuration_factory):
     store.record_path.write_text("{\"partial\":", encoding="utf-8")
     with store.lock(), pytest.raises(Exception):
         store.read()
+
+
+def test_state_store_never_repairs_a_missing_marked_layout_child(
+    tmp_path: Path,
+) -> None:
+    config = _config(tmp_path)
+    CellInstanceLayout.open_or_create(
+        cell_id=config.cell_id,
+        cell_root=config.instance_root,
+        install_root=config.install_root,
+    )
+    operator_state = config.instance_root / "state" / "operator"
+    operator_state.rmdir()
+
+    with pytest.raises(LauncherError, match="operator state root is unavailable"):
+        _StateStore(
+            root=operator_state,
+            lock_root=config.instance_root / "run" / "operator",
+        )
+
+    assert not operator_state.exists()
+
+
+def test_state_store_rejects_a_replaced_root_without_using_it(
+    tmp_path: Path,
+) -> None:
+    config = _config(tmp_path)
+    CellInstanceLayout.open_or_create(
+        cell_id=config.cell_id,
+        cell_root=config.instance_root,
+        install_root=config.install_root,
+    )
+    operator_state = config.instance_root / "state" / "operator"
+    store = _StateStore(
+        root=operator_state,
+        lock_root=config.instance_root / "run" / "operator",
+    )
+    detached = config.instance_root / "state" / "operator.detached"
+    operator_state.rename(detached)
+    operator_state.mkdir(mode=0o700)
+
+    with pytest.raises(LauncherError) as raised:
+        store.read()
+
+    assert raised.value.code == "cell_layout_invalid"
+    assert not (operator_state / "launch_instance.json").exists()
+
+
+def test_state_store_rejects_a_symlink_status_record_without_following_it(
+    tmp_path: Path,
+) -> None:
+    config = _config(tmp_path)
+    CellInstanceLayout.open_or_create(
+        cell_id=config.cell_id,
+        cell_root=config.instance_root,
+        install_root=config.install_root,
+    )
+    store = _StateStore(
+        root=config.instance_root / "state" / "operator",
+        lock_root=config.instance_root / "run" / "operator",
+    )
+    outside = tmp_path / "outside.json"
+    outside.write_text("unchanged\n", encoding="utf-8")
+    store.record_path.symlink_to(outside)
+
+    with pytest.raises(LauncherError) as raised:
+        store.read()
+
+    assert raised.value.code == "status_record_invalid"
+    assert outside.read_text(encoding="utf-8") == "unchanged\n"
+
+
+def test_state_store_lock_never_recreates_a_missing_typed_run_root(
+    tmp_path: Path,
+) -> None:
+    config = _config(tmp_path)
+    CellInstanceLayout.open_or_create(
+        cell_id=config.cell_id,
+        cell_root=config.instance_root,
+        install_root=config.install_root,
+    )
+    run_root = config.instance_root / "run" / "operator"
+    store = _StateStore(
+        root=config.instance_root / "state" / "operator",
+        lock_root=run_root,
+    )
+    run_root.rmdir()
+
+    with pytest.raises(LauncherError) as raised:
+        with store.lock():
+            pass
+
+    assert raised.value.code == "cell_layout_invalid"
+    assert not run_root.exists()
+
+
+def test_state_store_log_creation_rejects_a_symlink_directory(
+    tmp_path: Path,
+) -> None:
+    config = _config(tmp_path)
+    CellInstanceLayout.open_or_create(
+        cell_id=config.cell_id,
+        cell_root=config.instance_root,
+        install_root=config.install_root,
+    )
+    run_root = config.instance_root / "run" / "operator"
+    store = _StateStore(
+        root=config.instance_root / "state" / "operator",
+        lock_root=run_root,
+    )
+    outside = tmp_path / "outside-logs"
+    outside.mkdir()
+    (run_root / "logs").symlink_to(outside, target_is_directory=True)
+
+    with pytest.raises(LauncherError) as raised:
+        store.open_log("manager.log")
+
+    assert raised.value.code == "log_path_invalid"
+    assert list(outside.iterdir()) == []
 
 
 def test_proc_observation_authenticates_current_process():

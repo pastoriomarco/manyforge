@@ -34,6 +34,7 @@
 #include <mutex>
 #include <optional>
 #include <set>
+#include <stop_token>
 #include <string_view>
 #include <utility>
 #include <vector>
@@ -80,15 +81,25 @@ using RuntimeParticipantAdmissionResolver =
 using StopFaultRecoveryFactsResolver =
     std::function<Result<StopFaultRecoveryFactsDTO>(const StopStatusDTO&, std::int64_t)>;
 
-/// One construction-fixed post-terminal observation owner. The scheduler and
-/// observer are non-owning and must outlive the addressed Kernel. Absence is
+/// One construction-fixed post-terminal observation owner. The observer is
+/// non-owning and must outlive the addressed Kernel. Absence is
 /// reserved for explicitly Stop-surveillance-unqualified compositions; such a
 /// composition can contain a Stop but can never claim late-quiescence or clear
 /// a fault that requires it.
 struct StopSurveillanceExecutionConfig final {
-  IScheduler* scheduler{};
   IStopSurveillanceObservationPort* observer{};
   StopSurveillancePolicyDTO policy;
+};
+
+/// Atomic read-only projection of one retained operation. `resident` is the
+/// exact Kernel-owned distinction between the active set and retained history;
+/// separate admission and recovery projections retain their own authority.
+struct OperationReadProjectionDTO final {
+  OperationStateDTO operation;
+  bool resident{};
+
+  friend bool operator==(const OperationReadProjectionDTO&,
+                         const OperationReadProjectionDTO&) = default;
 };
 
 /// One coherent, read-only projection of the current addressed execution
@@ -218,7 +229,8 @@ class ResourceAddressedExecutionKernel final : public IAddressedOperationOwner,
  public:
   ResourceAddressedExecutionKernel(
       std::vector<RuntimeParticipantExecutionRegistration> registrations, IClock& clock,
-      IOperationJournal& journal, ResourceAddressedExecutionKernelConfig config);
+      IScheduler& scheduler, IOperationJournal& journal,
+      ResourceAddressedExecutionKernelConfig config);
   ~ResourceAddressedExecutionKernel();
 
   ResourceAddressedExecutionKernel(const ResourceAddressedExecutionKernel&) = delete;
@@ -299,6 +311,11 @@ class ResourceAddressedExecutionKernel final : public IAddressedOperationOwner,
   /// performed only by reconcile_subordinate_state(), never by this method.
   [[nodiscard]] Result<OperationStateDTO> get_operation_state(
       const OperationId& operation_id) const override;
+
+  /// Read-only owner projection that atomically distinguishes an active
+  /// resident operation from retained history.
+  [[nodiscard]] Result<OperationReadProjectionDTO> get_operation_projection(
+      const OperationId& operation_id) const;
 
   /// NRT owner-scheduler reconciliation point. This closes event-loss windows
   /// and advances capability-command completion without making public reads
@@ -453,7 +470,7 @@ class ResourceAddressedExecutionKernel final : public IAddressedOperationOwner,
   void StageAttemptCompleted(StopStageAttemptHandle handle) noexcept override;
   void OperationControlEffectCompleted(BoundedOperationControlExecutor& executor,
                                        OperationControlEffectHandle handle) noexcept override;
-  void ProjectStop(StopControlWorkToken token) noexcept;
+  void ProjectStop(StopControlWorkToken token, std::stop_token cancellation) noexcept;
   void RunStopSurveillance(StopCertificateId certificate_id,
                            std::uint64_t schedule_generation) noexcept;
   void ScheduleStopSurveillance(StopCertificateId certificate_id,
@@ -476,6 +493,7 @@ class ResourceAddressedExecutionKernel final : public IAddressedOperationOwner,
       runtime_route_configuration_readbacks_;
   std::set<ControlDomainId> runtime_route_configuration_publication_required_;
   IClock& clock_;
+  IScheduler& scheduler_;
   IOperationJournal& journal_;
   ResourceAddressedExecutionKernelConfig config_;
   std::unique_ptr<KernelCellAdmissionOwner> cell_admission_owner_;

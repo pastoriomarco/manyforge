@@ -267,6 +267,7 @@ export type OperationStateName =
 export interface OperationObservation {
   operationId: string;
   operationRevision: number;
+  resident: boolean;
   state: OperationStateName;
   progress: number;
   activeStopId: string | null;

@@ -8,6 +8,7 @@ eligibility, and a bounded canonical observation payload.
 
 from __future__ import annotations
 
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 import json
 import math
@@ -16,7 +17,7 @@ from pathlib import Path
 import socket
 import stat
 import struct
-from typing import Any, Mapping
+from typing import Any, Iterator, Mapping
 import unicodedata
 
 import rfc8785
@@ -258,7 +259,7 @@ class ManagerSceneRuntimeClient:
 
     def __init__(
         self,
-        state_root: Path,
+        run_root: Path,
         *,
         timeout_s: float = DEFAULT_TIMEOUT_S,
     ) -> None:
@@ -270,10 +271,10 @@ class ManagerSceneRuntimeClient:
             or timeout_s > 5.0
         ):
             raise ValueError("timeout_s must be finite and in (0, 5]")
-        self._state_root = Path(state_root)
-        self._socket_path = self._state_root / MANAGER_SOCKET_FILE
-        root = self._validate_root()
-        self._root_identity = (root.st_dev, root.st_ino)
+        self._run_root = Path(run_root)
+        self._socket_path = self._run_root / MANAGER_SOCKET_FILE
+        with self._open_root(expected_identity=None) as (_descriptor, root):
+            self._root_identity = (root.st_dev, root.st_ino)
         if len(os.fsencode(self._socket_path)) >= 104:
             raise SceneRuntimeManagerError(
                 "manager_scene_runtime_transport_invalid",
@@ -577,49 +578,108 @@ class ManagerSceneRuntimeClient:
             scene_update_status=update_status,
         )
 
-    def _validate_root(self) -> os.stat_result:
+    @contextmanager
+    def _open_root(
+        self,
+        *,
+        expected_identity: tuple[int, int] | None,
+    ) -> Iterator[tuple[int, os.stat_result]]:
         try:
-            metadata = self._state_root.lstat()
-        except OSError as exc:
-            raise SceneRuntimeManagerError(
-                "manager_scene_runtime_transport_invalid",
-                "Manager state root is unavailable",
-            ) from exc
-        if (
-            not stat.S_ISDIR(metadata.st_mode)
-            or stat.S_ISLNK(metadata.st_mode)
-            or metadata.st_uid != os.geteuid()
-        ):
-            raise SceneRuntimeManagerError(
-                "manager_scene_runtime_transport_invalid",
-                "Manager state root is not one real same-user directory",
+            before = self._run_root.lstat()
+            canonical = self._run_root.resolve(strict=True)
+            descriptor = os.open(
+                self._run_root,
+                os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW,
             )
-        return metadata
+        except (OSError, RuntimeError) as exc:
+            raise SceneRuntimeManagerError(
+                "manager_scene_runtime_transport_invalid",
+                "Manager run root is unavailable",
+            ) from exc
+        try:
+            try:
+                opened = os.fstat(descriptor)
+                after = self._run_root.lstat()
+            except OSError as exc:
+                raise SceneRuntimeManagerError(
+                    "manager_scene_runtime_transport_invalid",
+                    "Manager run root changed while opening",
+                ) from exc
+            identity = (before.st_dev, before.st_ino)
+            required = stat.S_IRUSR | stat.S_IWUSR | stat.S_IXUSR
+            if (
+                expected_identity is not None
+                and identity != expected_identity
+            ):
+                raise SceneRuntimeManagerError(
+                    "manager_scene_runtime_transport_invalid",
+                    "Manager run root identity changed",
+                )
+            if (
+                not self._run_root.is_absolute()
+                or canonical != self._run_root
+                or any(
+                    not stat.S_ISDIR(metadata.st_mode)
+                    or metadata.st_uid != os.geteuid()
+                    or metadata.st_mode & (stat.S_IWGRP | stat.S_IWOTH)
+                    or metadata.st_mode & required != required
+                    or (metadata.st_dev, metadata.st_ino) != identity
+                    for metadata in (before, opened, after)
+                )
+            ):
+                raise SceneRuntimeManagerError(
+                    "manager_scene_runtime_transport_invalid",
+                    "Manager run root is not one safe real same-user directory",
+                )
+            yield descriptor, opened
+            try:
+                final = self._run_root.lstat()
+            except OSError as exc:
+                raise SceneRuntimeManagerError(
+                    "manager_scene_runtime_transport_invalid",
+                    "Manager run root changed during use",
+                ) from exc
+            if (
+                not stat.S_ISDIR(final.st_mode)
+                or final.st_uid != os.geteuid()
+                or final.st_mode & (stat.S_IWGRP | stat.S_IWOTH)
+                or final.st_mode & required != required
+                or (final.st_dev, final.st_ino) != identity
+            ):
+                raise SceneRuntimeManagerError(
+                    "manager_scene_runtime_transport_invalid",
+                    "Manager run root changed during use",
+                )
+        finally:
+            os.close(descriptor)
 
-    def _validate_endpoint(self) -> None:
-        root = self._validate_root()
-        if (root.st_dev, root.st_ino) != self._root_identity:
-            raise SceneRuntimeManagerError(
-                "manager_scene_runtime_transport_invalid",
-                "Manager state root identity changed",
-            )
-        try:
-            metadata = self._socket_path.lstat()
-        except OSError as exc:
-            raise SceneRuntimeManagerError(
-                "manager_scene_runtime_unavailable",
-                "Manager command socket is unavailable",
-            ) from exc
-        if (
-            not stat.S_ISSOCK(metadata.st_mode)
-            or stat.S_ISLNK(metadata.st_mode)
-            or metadata.st_uid != os.geteuid()
-            or stat.S_IMODE(metadata.st_mode) != 0o600
-        ):
-            raise SceneRuntimeManagerError(
-                "manager_scene_runtime_transport_invalid",
-                "Manager command endpoint is not the exact same-user socket",
-            )
+    @contextmanager
+    def _socket_address(self) -> Iterator[str]:
+        with self._open_root(
+            expected_identity=self._root_identity
+        ) as (descriptor, _root):
+            try:
+                metadata = os.stat(
+                    MANAGER_SOCKET_FILE,
+                    dir_fd=descriptor,
+                    follow_symlinks=False,
+                )
+            except OSError as exc:
+                raise SceneRuntimeManagerError(
+                    "manager_scene_runtime_unavailable",
+                    "Manager command socket is unavailable",
+                ) from exc
+            if (
+                not stat.S_ISSOCK(metadata.st_mode)
+                or metadata.st_uid != os.geteuid()
+                or metadata.st_nlink != 1
+                or stat.S_IMODE(metadata.st_mode) != 0o600
+            ):
+                raise SceneRuntimeManagerError(
+                    "manager_scene_runtime_transport_invalid",
+                    "Manager command endpoint is not the exact same-user socket",
+                )
+            yield f"/proc/self/fd/{descriptor}/{MANAGER_SOCKET_FILE}"
 
     def _exchange(self, command: dict[str, Any]) -> dict[str, Any]:
         try:
@@ -634,28 +694,32 @@ class ManagerSceneRuntimeClient:
                 "manager_scene_runtime_request_invalid",
                 "Manager scene-runtime request exceeds its byte bound",
             )
-        self._validate_endpoint()
         try:
-            with socket.socket(socket.AF_UNIX, socket.SOCK_SEQPACKET) as channel:
-                channel.settimeout(self._timeout_s)
-                channel.connect(str(self._socket_path))
-                credentials = channel.getsockopt(
-                    socket.SOL_SOCKET,
-                    socket.SO_PEERCRED,
-                    struct.calcsize("3i"),
-                )
-                _pid, peer_uid, _gid = struct.unpack("3i", credentials)
-                if peer_uid != os.geteuid():
-                    raise SceneRuntimeManagerError(
-                        "manager_scene_runtime_transport_invalid",
-                        "Manager command peer is not same-user",
+            with self._socket_address() as socket_address:
+                with socket.socket(
+                    socket.AF_UNIX, socket.SOCK_SEQPACKET
+                ) as channel:
+                    channel.settimeout(self._timeout_s)
+                    channel.connect(socket_address)
+                    credentials = channel.getsockopt(
+                        socket.SOL_SOCKET,
+                        socket.SO_PEERCRED,
+                        struct.calcsize("3i"),
                     )
-                sent = channel.send(request)
-                if sent != len(request):
-                    raise OSError("short Manager scene-runtime request send")
-                payload, _ancillary, flags, _address = channel.recvmsg(
-                    MAX_MANAGER_RESPONSE_BYTES + 1
-                )
+                    _pid, peer_uid, _gid = struct.unpack("3i", credentials)
+                    if peer_uid != os.geteuid():
+                        raise SceneRuntimeManagerError(
+                            "manager_scene_runtime_transport_invalid",
+                            "Manager command peer is not same-user",
+                        )
+                    sent = channel.send(request)
+                    if sent != len(request):
+                        raise OSError(
+                            "short Manager scene-runtime request send"
+                        )
+                    payload, _ancillary, flags, _address = channel.recvmsg(
+                        MAX_MANAGER_RESPONSE_BYTES + 1
+                    )
         except SceneRuntimeManagerError:
             raise
         except (OSError, TimeoutError) as exc:

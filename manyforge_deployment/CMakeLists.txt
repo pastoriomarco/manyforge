@@ -1063,7 +1063,8 @@ if(BUILD_TESTING)
       --workspace-root "${_MANYFORGE_WORKSPACE_ROOT}"
       --revision-tool "$<TARGET_FILE:manyforge_deployment_revision>")
   set_tests_properties(
-    MaintainedDeploymentOccurrenceSources PROPERTIES TIMEOUT 60)
+    MaintainedDeploymentOccurrenceSources
+    PROPERTIES TIMEOUT ${MANYFORGE_GTEST_TIMEOUT_SECONDS})
 
   function(manyforge_try_public_header result_variable source_file)
     unset(${result_variable} CACHE)

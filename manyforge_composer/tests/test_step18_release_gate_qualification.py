@@ -1815,10 +1815,24 @@ def test_step18_producer_hygiene_rejects_unattested_ignored_source(
 
 def test_step18_hygiene_walker_revalidates_root_directory_and_binding(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     repo = tmp_path / "source"
     _write(repo / "producer/one.py", "one\n")
     _write(repo / "producer/two.py", "two\n")
+    # Directory size and timestamp changes are filesystem-specific hints, not
+    # a reliable inventory check. Keep identity fields only so this test proves
+    # that the walker detects the added name independently of those hints.
+    monkeypatch.setattr(
+        _VERIFY,
+        "_metadata_signature",
+        lambda metadata: (
+            metadata.st_dev,
+            metadata.st_ino,
+            metadata.st_mode,
+            metadata.st_nlink,
+        ),
+    )
     binding = _VERIFY._open_absolute_directory(  # noqa: SLF001
         repo,
         "test hygiene repository",

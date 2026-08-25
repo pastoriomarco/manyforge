@@ -13,6 +13,7 @@ import httpx
 
 from manyforge_assistant_bridge.bridge import BridgeConfig, BridgeService, create_app
 from manyforge_assistant_bridge.catalog import (
+    canonical_json,
     framed_digest,
     raw_digest,
     resolve_catalog,
@@ -202,6 +203,7 @@ def _request(projection: dict[str, Any]) -> dict[str, Any]:
         "composerDraft": {
             "draftId": "draft.1",
             "expectedDraftRevision": 1,
+            "expectedAdmissionGeneration": 7,
             "programLoaded": True,
             "programRevision": 1,
             "program": {"api_version": "manyforge.program.v1"},
@@ -316,6 +318,9 @@ def test_bridge_verifies_projection_and_runs_only_draft_callback(tmp_path: Path)
                 "requestOwnerEpoch": callback_body["requestOwnerEpoch"],
                 "sourceLabel": callback_body["sourceLabel"],
                 "correlationId": callback_body["correlationId"],
+                "nextAdmissionGeneration": callback_body[
+                    "expectedAdmissionGeneration"
+                ],
                 "result": {"kind": "composer_draft_read", "draftRevision": 1},
             },
             request=request,
@@ -335,6 +340,14 @@ def test_bridge_verifies_projection_and_runs_only_draft_callback(tmp_path: Path)
     assert status["response"]["mutated"] is False
     assert callback_bodies[0]["catalogHash"] == projection["catalog_hash"]
     assert callback_bodies[0]["requestedTools"] == []
+    assert callback_bodies[0]["expectedAdmissionGeneration"] == 7
+    assert {
+        "clientId",
+        "snapshotReceiverEpoch",
+        "snapshotSequence",
+    }.isdisjoint(callback_bodies[0])
+    assert callback_bodies[0]["requestId"].startswith("assistant.callback.")
+    assert callback_bodies[0]["requestId"] != "request.1"
     assert upstream_calls == 2
     assert upstream_bodies[0]["max_tokens"] == 512
     assert upstream_bodies[0]["tool_choice"] == "auto"
@@ -344,6 +357,170 @@ def test_bridge_verifies_projection_and_runs_only_draft_callback(tmp_path: Path)
     assert all(type(row["timestampNs"]) is int for row in audit)
     assert all(row["timestampNs"] > 9_007_199_254_740_991 for row in audit)
     assert "message" not in audit[-1]
+
+
+def test_bridge_assigns_one_composer_idempotency_key_per_mutating_tool_call(
+    tmp_path: Path,
+) -> None:
+    projection = _projection()
+    schema = {"additionalProperties": False, "properties": {}, "type": "object"}
+    _append_projection_tool(
+        projection,
+        {
+            "description": "Add one authored scene object.",
+            "effect": "composer_draft_mutating",
+            "input_schema": schema,
+            "input_schema_hash": raw_digest(schema),
+            "tool_id": "scene_draft_add_object",
+        },
+    )
+    upstream_calls = 0
+    callback_bodies: list[dict[str, Any]] = []
+
+    async def upstream(request: httpx.Request) -> httpx.Response:
+        nonlocal upstream_calls
+        upstream_calls += 1
+        if upstream_calls == 1:
+            message = {
+                "content": "",
+                "tool_calls": [
+                    {
+                        "id": f"call.{index}",
+                        "type": "function",
+                        "function": {
+                            "name": "scene_draft_add_object",
+                            "arguments": "{}",
+                        },
+                    }
+                    for index in range(2)
+                ],
+            }
+        else:
+            message = {"content": "Both Draft edits completed."}
+        return httpx.Response(
+            200,
+            json={"choices": [{"message": message}]},
+            request=request,
+        )
+
+    async def composer(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content)
+        callback_bodies.append(body)
+        next_revision = body["expectedDraftRevision"] + 1
+        return httpx.Response(
+            200,
+            json={
+                "success": True,
+                "mutated": True,
+                "draftMutated": True,
+                "requestId": body["requestId"],
+                "requestOwnerEpoch": body["requestOwnerEpoch"],
+                "sourceLabel": body["sourceLabel"],
+                "correlationId": body["correlationId"],
+                "nextAdmissionGeneration": (
+                    body["expectedAdmissionGeneration"] + 2
+                ),
+                "result": {
+                    "kind": "composer_draft_mutation",
+                    "draftRevision": next_revision,
+                },
+            },
+            request=request,
+        )
+
+    service = _service(
+        tmp_path,
+        projection,
+        upstream_handler=upstream,
+        composer_handler=composer,
+    )
+    with TestClient(create_app(service.config, service=service)) as client:
+        assert client.post(
+            "/v1/manyforge/assistant", json=_request(projection)
+        ).status_code == 202
+        status = _terminal(client, "request.1")
+
+    assert status["state"] == "completed"
+    assert status["response"]["requestId"] == "request.1"
+    assert status["response"]["draftMutated"] is True
+    assert [body["expectedDraftRevision"] for body in callback_bodies] == [1, 2]
+    assert [
+        body["expectedAdmissionGeneration"] for body in callback_bodies
+    ] == [7, 9]
+    callback_ids = [body["requestId"] for body in callback_bodies]
+    expected_ids = [
+        "assistant.callback."
+        + hashlib.sha256(
+            canonical_json(
+                {
+                    "provider_request_id": "request.1",
+                    "request_owner_epoch": "composer.page.1",
+                    "turn": 1,
+                    "upstream_tool_call_id": f"call.{index}",
+                    "tool_position": index,
+                }
+            )
+        ).hexdigest()
+        for index in range(2)
+    ]
+    assert callback_ids == expected_ids
+
+
+def test_callback_transport_uncertainty_stops_before_another_model_turn(
+    tmp_path: Path,
+) -> None:
+    projection = _projection()
+    upstream_calls = 0
+    callback_calls = 0
+
+    async def upstream(request: httpx.Request) -> httpx.Response:
+        nonlocal upstream_calls
+        upstream_calls += 1
+        return httpx.Response(
+            200,
+            json={
+                "choices": [
+                    {
+                        "message": {
+                            "content": "",
+                            "tool_calls": [
+                                {
+                                    "id": "call.uncertain",
+                                    "type": "function",
+                                    "function": {
+                                        "name": "program_read",
+                                        "arguments": "{}",
+                                    },
+                                }
+                            ],
+                        }
+                    }
+                ]
+            },
+            request=request,
+        )
+
+    async def composer(request: httpx.Request) -> httpx.Response:
+        nonlocal callback_calls
+        callback_calls += 1
+        raise httpx.ReadTimeout("callback response was lost", request=request)
+
+    service = _service(
+        tmp_path,
+        projection,
+        upstream_handler=upstream,
+        composer_handler=composer,
+    )
+    with TestClient(create_app(service.config, service=service)) as client:
+        assert client.post(
+            "/v1/manyforge/assistant", json=_request(projection)
+        ).status_code == 202
+        status = _terminal(client, "request.1")
+
+    assert status["state"] == "failed"
+    assert status["error"]["code"] == "assistant_callback_timeout"
+    assert upstream_calls == 1
+    assert callback_calls == 1
 
 
 def test_inspect_isaac_scene_uses_only_filtered_headless_scene_truth(
@@ -663,6 +840,9 @@ def test_bridge_bounds_repeated_tool_failures_as_clarification(tmp_path: Path) -
                 "requestOwnerEpoch": body["requestOwnerEpoch"],
                 "sourceLabel": body["sourceLabel"],
                 "correlationId": body["correlationId"],
+                "nextAdmissionGeneration": body[
+                    "expectedAdmissionGeneration"
+                ],
                 "result": {
                     "kind": "validation_error",
                     "message": "Draft is unavailable",

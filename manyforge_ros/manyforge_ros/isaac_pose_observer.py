@@ -518,14 +518,14 @@ class ObservationDispatcher:
     def for_manager_root(
         cls,
         *,
-        manager_state_root: Path,
+        manager_run_root: Path,
         config: IsaacPoseObserverSiteConfig,
         event_callback: Callable[[ObservationDispatchEvent], None] | None = None,
         timeout_s: float = 2.0,
     ) -> ObservationDispatcher:
         return cls(
             client=ManagerSceneRuntimeClient(
-                manager_state_root,
+                manager_run_root,
                 timeout_s=timeout_s,
             ),
             expected_cell_id=config.cell_id,

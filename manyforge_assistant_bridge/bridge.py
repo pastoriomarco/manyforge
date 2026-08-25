@@ -58,6 +58,7 @@ MAXIMUM_UPSTREAM_RESPONSE_BYTES: Final = 8 * 1024 * 1024
 MAXIMUM_CALLBACK_RESPONSE_BYTES: Final = 8 * 1024 * 1024
 MAXIMUM_MODEL_TEXT_BYTES: Final = 65_536
 MAXIMUM_TOOL_CALLS_PER_TURN: Final = 64
+MAXIMUM_SAFE_INTEGER: Final = 9_007_199_254_740_991
 _REQUEST_ID_PATTERN: Final = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:-]*$")
 _COMPOSER_TOOL_EFFECTS: Final = frozenset(
     {"composer_draft_mutating"}
@@ -407,11 +408,32 @@ class _VerifiedRequest:
 
 @dataclass(frozen=True, slots=True)
 class _ToolCall:
+    position: int
     call_id: str
     tool_id: str
     arguments: dict[str, Any]
     raw_arguments_hash: str
     descriptor: dict[str, Any]
+
+
+def _composer_callback_request_id(
+    request: ProviderRequest,
+    *,
+    turn: int,
+    call: _ToolCall,
+) -> str:
+    """Return one stable Composer idempotency key per exact model tool call."""
+
+    material = canonical_json(
+        {
+            "provider_request_id": request.request_id,
+            "request_owner_epoch": request.request_owner_epoch,
+            "turn": turn,
+            "upstream_tool_call_id": call.call_id,
+            "tool_position": call.position,
+        }
+    )
+    return "assistant.callback." + hashlib.sha256(material).hexdigest()
 
 
 class BridgeService:
@@ -626,6 +648,9 @@ class BridgeService:
         completed: list[dict[str, Any]] = []
         draft_mutated = False
         draft_revision = request.composer_draft.expected_draft_revision
+        admission_generation = (
+            request.composer_draft.expected_admission_generation
+        )
         failure_counts: dict[str, int] = {}
 
         for turn in range(1, self.config.maximum_turns + 1):
@@ -751,18 +776,8 @@ class BridgeService:
                     raise asyncio.CancelledError
                 try:
                     self._validate_arguments(call)
-                    result = await self._execute_callback(
-                        request=request,
-                        verified=verified,
-                        call=call,
-                        expected_draft_revision=draft_revision,
-                    )
                 except BridgeRunError as error:
-                    if error.code in {
-                        "assistant_callback_context_stale",
-                        "assistant_projection_stale",
-                        "assistant_projection_unavailable",
-                    }:
+                    if error.code != "assistant_tool_arguments_invalid":
                         raise
                     result = {
                         "success": False,
@@ -774,6 +789,20 @@ class BridgeService:
                             "detail": {"code": error.code},
                         },
                     }
+                else:
+                    result = await self._execute_callback(
+                        request=request,
+                        verified=verified,
+                        call=call,
+                        expected_draft_revision=draft_revision,
+                        expected_admission_generation=admission_generation,
+                        turn=turn,
+                    )
+                next_admission_generation = result.get(
+                    "nextAdmissionGeneration"
+                )
+                if type(next_admission_generation) is int:
+                    admission_generation = next_admission_generation
                 mutated = result.get("draftMutated") is True
                 draft_mutated = draft_mutated or mutated
                 result_payload = result.get("result")
@@ -803,8 +832,14 @@ class BridgeService:
                 )
                 if status == "failed":
                     signature = hashlib.sha256(
-                        (call.tool_id + "\0" + call.raw_arguments_hash + "\0" + tool_message).encode(
-                            "utf-8"
+                        canonical_json(
+                            {
+                                "arguments_hash": call.raw_arguments_hash,
+                                "draft_mutated": mutated,
+                                "result": result_payload,
+                                "success": result.get("success"),
+                                "tool_id": call.tool_id,
+                            }
                         )
                     ).hexdigest()
                     failure_counts[signature] = failure_counts.get(signature, 0) + 1
@@ -1018,6 +1053,7 @@ class BridgeService:
             )
             calls.append(
                 _ToolCall(
+                    position=index,
                     call_id=call_id,
                     tool_id=name,
                     arguments=arguments,
@@ -1065,6 +1101,8 @@ class BridgeService:
         verified: _VerifiedRequest,
         call: _ToolCall,
         expected_draft_revision: int,
+        expected_admission_generation: int,
+        turn: int,
     ) -> dict[str, Any]:
         effect = call.descriptor["effect"]
         if effect == "read_only" and call.tool_id not in _COMPOSER_READ_TOOLS:
@@ -1075,6 +1113,11 @@ class BridgeService:
             )
         context = request.composer_draft
         projection = verified.active_projection
+        callback_request_id = _composer_callback_request_id(
+            request,
+            turn=turn,
+            call=call,
+        )
         body = {
             "assistantMode": request.assistant_mode,
             "retainedBundleId": projection["retained_bundle_id"],
@@ -1090,7 +1133,8 @@ class BridgeService:
             "fieldPolicy": deepcopy(request.field_policy),
             "draftId": context.draft_id,
             "expectedDraftRevision": expected_draft_revision,
-            "requestId": request.request_id,
+            "expectedAdmissionGeneration": expected_admission_generation,
+            "requestId": callback_request_id,
             "requestOwnerEpoch": request.request_owner_epoch,
             "sourceLabel": request.source_label,
             "correlationId": request.correlation_id,
@@ -1145,6 +1189,7 @@ class BridgeService:
             "requestOwnerEpoch",
             "sourceLabel",
             "correlationId",
+            "nextAdmissionGeneration",
             "result",
         }
         if set(result) != expected_fields or any(
@@ -1156,7 +1201,7 @@ class BridgeService:
                 "Composer callback returned an unsupported result shape",
             )
         for field, expected in (
-            ("requestId", request.request_id),
+            ("requestId", callback_request_id),
             ("requestOwnerEpoch", request.request_owner_epoch),
             ("sourceLabel", request.source_label),
             ("correlationId", request.correlation_id),
@@ -1170,6 +1215,23 @@ class BridgeService:
             raise BridgeRunError(
                 "assistant_callback_invalid",
                 "Composer callback result detail must be an object",
+            )
+        next_generation = result["nextAdmissionGeneration"]
+        if (
+            type(next_generation) is not int
+            or not 1 <= next_generation <= MAXIMUM_SAFE_INTEGER
+            or (
+                result["mutated"] is True
+                and next_generation <= expected_admission_generation
+            )
+            or (
+                result["mutated"] is False
+                and next_generation != expected_admission_generation
+            )
+        ):
+            raise BridgeRunError(
+                "assistant_callback_invalid",
+                "Composer callback returned an invalid admission generation",
             )
         if result["success"] is False and (
             result["mutated"] is not False or result["draftMutated"] is not False

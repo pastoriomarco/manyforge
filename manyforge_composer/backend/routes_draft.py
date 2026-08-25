@@ -41,7 +41,10 @@ from .program_artifacts import (
     save_program_artifact,
 )
 from .state import ComposerState
-from .authoring_admission import AuthoringMutationEnvelope
+from .authoring_admission import (
+    BrowserAuthoringMutationEnvelope,
+    headless_client_http_exception,
+)
 
 
 _AUTHORING_MUTATIONS = frozenset(
@@ -125,8 +128,8 @@ class _DraftFence(BaseModel):
     )
     request_id: str = Field(alias="requestId", min_length=1, max_length=256)
 
-    def admission_envelope(self) -> AuthoringMutationEnvelope:
-        return AuthoringMutationEnvelope(
+    def admission_envelope(self) -> BrowserAuthoringMutationEnvelope:
+        return BrowserAuthoringMutationEnvelope(
             client_id=self.client_id,
             snapshot_receiver_epoch=self.snapshot_receiver_epoch,
             snapshot_sequence=self.snapshot_sequence,
@@ -185,12 +188,6 @@ class LoadProgramRequest(ApplyDraftRequest):
     confirm_discard: bool = Field(default=False, alias="confirmDiscard")
 
 
-class _ProgramApplyPending(RuntimeError):
-    def __init__(self, result: dict[str, Any]) -> None:
-        super().__init__("Program Apply is waiting for deployment convergence")
-        self.result = result
-
-
 @dataclass(frozen=True, slots=True)
 class _AppliedContext:
     scenario_id: str
@@ -217,10 +214,7 @@ def _raise_workspace_error(error: Exception) -> NoReturn:
             detail={"code": error.code, "message": str(error)},
         ) from error
     if isinstance(error, HeadlessClientError):
-        raise HTTPException(
-            status_code=error.status_code or 503,
-            detail={"code": error.code, "message": str(error)},
-        ) from error
+        raise headless_client_http_exception(error) from error
     raise error
 
 
@@ -389,18 +383,12 @@ def _apply_program(
     status = result.get("status")
     applied = result.get("applied")
     if (
-        result.get("schema_version") != "manyforge.program_apply_result.v1"
-        or status not in {"applied", "pending_deployment"}
-        or (status == "pending_deployment" and applied is not None)
-        or (
-            status == "applied"
-            and (
-                not isinstance(applied, dict)
-                or applied.get("program_revision") != candidate.program_revision
-                or not isinstance(applied.get("source"), dict)
-                or not isinstance(applied["source"].get("record_digest"), str)
-            )
-        )
+        result.get("schema_version") != "manyforge.program_apply_result.v2"
+        or status != "applied"
+        or not isinstance(applied, dict)
+        or applied.get("program_revision") != candidate.program_revision
+        or not isinstance(applied.get("source"), dict)
+        or not isinstance(applied["source"].get("record_digest"), str)
     ):
         raise DraftSessionError(
             "program_apply_response_invalid",
@@ -919,9 +907,9 @@ def create_draft_router(state: ComposerState) -> APIRouter:
                 applier=apply_current_program,
             )
             return JSONResponse(
-                status_code=200 if result.get("status") == "applied" else 202,
+                status_code=200,
                 content={
-                    "status": result.get("status"),
+                    "status": "applied",
                     "headless": result,
                     "workspace": _workspace(state),
                 },
@@ -956,8 +944,6 @@ def create_draft_router(state: ComposerState) -> APIRouter:
                     ),
                     authoring_claim=active_authoring_claim(),
                 )
-                if result.get("status") != "applied":
-                    raise _ProgramApplyPending(result)
                 selected, selected_reason = _applied_context(state)
                 applied = result["applied"]
                 if (
@@ -999,15 +985,6 @@ def create_draft_router(state: ComposerState) -> APIRouter:
                 content={
                     "status": "loaded",
                     "headless": result,
-                    "workspace": _workspace(state),
-                },
-            )
-        except _ProgramApplyPending as pending:
-            return JSONResponse(
-                status_code=202,
-                content={
-                    "status": "pending_deployment",
-                    "headless": pending.result,
                     "workspace": _workspace(state),
                 },
             )
@@ -1131,8 +1108,6 @@ def create_draft_router(state: ComposerState) -> APIRouter:
                     expected_applied_record_digest=context.record_digest,
                     authoring_claim=active_authoring_claim(),
                 )
-                if result.get("status") != "applied":
-                    return result
                 selected, selected_reason = _applied_context(state)
                 receipt = result["applied"]
                 if (
@@ -1158,19 +1133,12 @@ def create_draft_router(state: ComposerState) -> APIRouter:
                 prepare=prepare_revert,
                 applier=apply_saved,
             )
-            status = (
-                "reverted"
-                if result is None or result.get("status") == "applied"
-                else "pending_deployment"
-            )
             return JSONResponse(
-                status_code=200 if status == "reverted" else 202,
+                status_code=200,
                 content={
-                    "status": status,
+                    "status": "reverted",
                     "headless": result,
-                    "workspace": (
-                        _snapshot if status == "reverted" else _workspace(state)
-                    ),
+                    "workspace": _snapshot,
                 },
             )
         except Exception as error:

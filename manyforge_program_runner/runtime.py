@@ -84,7 +84,7 @@ class ProgramRunnerError(RuntimeError):
 @dataclass(frozen=True, slots=True)
 class ProgramRunnerConfig:
     headless_url: str
-    execution_state_root: Path | None = None
+    execution_run_root: Path | None = None
     cycle_journal_path: Path | None = None
     owner_id: str = "program-runner"
     owner_epoch: str | None = None
@@ -137,18 +137,33 @@ class ProgramRunnerConfig:
             value = getattr(self, field_name)
             if type(value) is not int or not 1 <= value <= 4_096:
                 raise ValueError(f"{field_name} must be in [1, 4096]")
-        enabled = self.execution_state_root is not None
+        enabled = self.execution_run_root is not None
         if enabled != (self.cycle_journal_path is not None):
             raise ValueError(
-                "execution-state root and cycle journal must be configured together"
+                "execution run root and cycle journal must be configured together"
             )
         if enabled and (
-            not self.execution_state_root.is_absolute()
+            not self.execution_run_root.is_absolute()
             or not self.cycle_journal_path.is_absolute()
         ):
             raise ValueError(
-                "execution-state root and cycle journal must be stable absolute paths"
+                "execution run root and cycle journal must be stable absolute paths"
             )
+        if enabled:
+            try:
+                execution_run_root = self.execution_run_root.resolve(strict=False)
+                cycle_journal_path = self.cycle_journal_path.resolve(strict=False)
+            except (OSError, RuntimeError) as error:
+                raise ValueError(
+                    "execution run root and cycle journal must be resolvable"
+                ) from error
+            if (
+                cycle_journal_path == execution_run_root
+                or execution_run_root in cycle_journal_path.parents
+            ):
+                raise ValueError(
+                    "cycle journal must be outside disposable execution run storage"
+                )
         liveness_enabled = self.manager_liveness_socket is not None
         if liveness_enabled != (self.cell_id is not None):
             raise ValueError(
@@ -193,9 +208,9 @@ class ProgramRuntime:
         self.owner_epoch = config.owner_epoch or f"program-runner-{uuid4().hex}"
         self._admission = admission_client or (
             None
-            if config.execution_state_root is None
+            if config.execution_run_root is None
             else CellAdmissionClient(
-                config.execution_state_root,
+                config.execution_run_root,
                 timeout_seconds=min(config.headless_timeout_seconds, 30.0),
             )
         )
@@ -750,11 +765,6 @@ class ProgramRuntime:
             limit=limit,
         )
         values = [snapshot.to_dict() for snapshot in snapshots]
-        for snapshot in snapshots:
-            value = snapshot.to_dict()
-            if self._journal is not None:
-                self._journal.retain_run_snapshot(value)
-            self._record_terminal_snapshot(value)
         history_truncated = False
         if not active_only and self._journal is not None:
             history, history_truncated = self._journal.list_run_snapshots(
@@ -1101,11 +1111,7 @@ class ProgramRuntime:
                 "Program runner is closed",
             )
         try:
-            result = self._owner.read(program_run_id).to_dict()
-            if self._journal is not None:
-                self._journal.retain_run_snapshot(result)
-            self._record_terminal_snapshot(result)
-            return result
+            return self._owner.read(program_run_id).to_dict()
         except ProgramRunOwnerError as error:
             if self._journal is not None:
                 retained = self._journal.read_run_snapshot(program_run_id)

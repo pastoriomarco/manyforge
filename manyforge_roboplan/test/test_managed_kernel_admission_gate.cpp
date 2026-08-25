@@ -16,6 +16,7 @@
 #include <manyforge_core/route_fence_record_codec_internal.hpp>
 #include <manyforge_core/sqlite_operation_journal.hpp>
 #include <manyforge_core/time/fake_clock.hpp>
+#include <manyforge_core/time/manual_scheduler.hpp>
 #include <manyforge_deployment/artifact_codec.hpp>
 #include <manyforge_deployment/verified_retained_bundle.hpp>
 #include <memory>
@@ -834,6 +835,7 @@ TEST(ManagedKernelDisableFenceOwner,
   const auto owner_epoch = config.request_owner_epoch;
   core::FakeClock clock;
   clock.set(1000);
+  core::ManualScheduler scheduler;
   core::SqliteOperationJournal journal(
       fixture.state_root.path() / "operation-journal.sqlite3",
       fixture.bundle->value().cell_graph.cell_id, 32U);
@@ -841,7 +843,7 @@ TEST(ManagedKernelDisableFenceOwner,
       binding, std::nullopt, {}, core::MotionInterruptNodeCategory::kGeneric,
       &engine, nullptr};
   core::ResourceAddressedExecutionKernel kernel(
-      {std::move(registration)}, clock, journal,
+      {std::move(registration)}, clock, scheduler, journal,
       core::ResourceAddressedExecutionKernelConfig{
           owner_epoch,
           fixture.bundle->value().cell_graph.cell_id,

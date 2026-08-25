@@ -4200,14 +4200,16 @@ void ExecutionKernel::arm_runtime_collision_lookahead(
     std::uint64_t execution_id, std::uint64_t execution_generation,
     std::shared_ptr<const TrajectoryDTO> collision_trajectory, const std::string& contact_policy_id,
     const CollisionWorldLeaseInventory& admission_inventory) {
-  const auto lookahead = runtime_collision_lookahead_session_.load(std::memory_order_acquire);
-  if (!lookahead) {
-    return;
-  }
-
   bool invalid_authority = false;
   {
     std::lock_guard<std::mutex> lock(runtime_collision_protection_mutex_);
+    // Select the session under the same authority lock as the arm decision.
+    // Teardown retires the session under this lock, so copying it beforehand
+    // could let a dispatch arm a session after retirement had begun.
+    const auto lookahead = runtime_collision_lookahead_session_.load(std::memory_order_acquire);
+    if (!lookahead) {
+      return;
+    }
     const auto state = sm_.status().state;
     if (!runtime_collision_protection_.active ||
         runtime_collision_protection_.execution_id != execution_id ||

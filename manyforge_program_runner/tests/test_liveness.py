@@ -172,6 +172,7 @@ def test_start_refuses_to_replace_active_same_user_listener(tmp_path: Path):
     path = tmp_path / "runner.sock"
     active = socket.socket(socket.AF_UNIX, socket.SOCK_SEQPACKET)
     active.bind(str(path))
+    path.chmod(0o600)
     active.listen(1)
     receiver, _clock, _losses, _reconciliations = _receiver(tmp_path)
     try:
@@ -188,6 +189,7 @@ def test_start_recovers_same_user_stale_socket_inode(tmp_path: Path):
     path = tmp_path / "runner.sock"
     crashed = socket.socket(socket.AF_UNIX, socket.SOCK_SEQPACKET)
     crashed.bind(str(path))
+    path.chmod(0o600)
     crashed.close()
 
     receiver, _clock, _losses, _reconciliations = _receiver(tmp_path)
@@ -212,6 +214,40 @@ def test_start_recovers_same_user_stale_socket_inode(tmp_path: Path):
             connection.close()
     finally:
         receiver.close()
+
+
+def test_listener_pins_run_root_and_cleans_its_original_socket(
+    tmp_path: Path,
+):
+    run_root = tmp_path / "run"
+    run_root.mkdir(mode=0o700)
+    receiver, _clock, _losses, _reconciliations = _receiver(run_root)
+    receiver.start()
+    retained_root = tmp_path / "retained-run"
+    run_root.rename(retained_root)
+    run_root.mkdir(mode=0o700)
+
+    receiver.close()
+
+    assert not (retained_root / "runner.sock").exists()
+    assert not (run_root / "runner.sock").exists()
+
+
+def test_start_rejects_unsafe_or_noncanonical_run_root(tmp_path: Path):
+    unsafe = tmp_path / "unsafe"
+    unsafe.mkdir(mode=0o700)
+    unsafe.chmod(0o720)
+    receiver, _clock, _losses, _reconciliations = _receiver(unsafe)
+    with pytest.raises(ProgramRunnerLivenessError, match="unsafe"):
+        receiver.start()
+
+    real = tmp_path / "real"
+    real.mkdir(mode=0o700)
+    alias = tmp_path / "alias"
+    alias.symlink_to(real, target_is_directory=True)
+    receiver, _clock, _losses, _reconciliations = _receiver(alias)
+    with pytest.raises(ProgramRunnerLivenessError, match="unsafe"):
+        receiver.start()
 
 
 def test_noncanonical_and_open_packets_are_rejected(tmp_path: Path):

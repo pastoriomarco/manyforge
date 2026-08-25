@@ -4,9 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import math
-import os
 import socket
-import stat
 import threading
 from pathlib import Path
 from typing import Any, Protocol
@@ -26,6 +24,10 @@ from .models import (
     StopIntentRequest,
 )
 from .native import HeadlessApiError, HeadlessCorePort, strict_json_object
+from .private_transport import (
+    PinnedRunRoot,
+    PrivateTransportCapabilityError,
+)
 
 
 EXECUTION_SOCKET_FILE = "execution-command.sock"
@@ -275,27 +277,21 @@ def _canonical_json(value: dict[str, Any]) -> bytes:
 class ExecutionCommandClient:
     """Forward intents and observations without caching execution truth."""
 
-    def __init__(self, state_root: Path, *, timeout_seconds: float = 10.0) -> None:
+    def __init__(self, run_root: Path, *, timeout_seconds: float = 10.0) -> None:
         if timeout_seconds <= 0 or timeout_seconds > 30:
             raise ValueError("execution timeout must be in (0, 30] seconds")
-        self._socket_path = state_root / EXECUTION_SOCKET_FILE
-        self._control_socket_path = state_root / EXECUTION_CONTROL_SOCKET_FILE
-        self._timeout_seconds = timeout_seconds
-
-    @staticmethod
-    def _validate_socket(socket_path: Path) -> None:
         try:
-            metadata = socket_path.lstat()
-        except FileNotFoundError as exc:
+            self._run_root = PinnedRunRoot(run_root)
+        except PrivateTransportCapabilityError as error:
             raise HeadlessApiError(
                 "execution_owner_unavailable",
-                "native execution command socket is absent",
-            ) from exc
-        if not stat.S_ISSOCK(metadata.st_mode) or metadata.st_uid != os.geteuid():
-            raise HeadlessApiError(
-                "execution_owner_unavailable",
-                "native execution path is not the expected same-user socket",
-            )
+                f"native execution run capability is invalid: {error}",
+            ) from error
+        self._socket_path = self._run_root.path / EXECUTION_SOCKET_FILE
+        self._control_socket_path = (
+            self._run_root.path / EXECUTION_CONTROL_SOCKET_FILE
+        )
+        self._timeout_seconds = timeout_seconds
 
     def _exchange_on(
         self, command: dict[str, Any], socket_path: Path
@@ -306,27 +302,34 @@ class ExecutionCommandClient:
                 "execution_command_oversized",
                 "execution command exceeds its byte bound",
             )
-        self._validate_socket(socket_path)
         try:
-            with socket.socket(socket.AF_UNIX, socket.SOCK_SEQPACKET) as client:
-                client.setsockopt(
-                    socket.SOL_SOCKET,
-                    socket.SO_RCVBUF,
-                    MAX_EXECUTION_RESPONSE_BYTES,
-                )
-                client.settimeout(self._timeout_seconds)
-                client.connect(str(socket_path))
-                sent = client.send(encoded)
-                if sent != len(encoded):
-                    raise HeadlessApiError(
-                        "execution_command_transport_failure",
-                        "execution command packet was truncated",
+            with self._run_root.socket_address(
+                socket_path.name
+            ) as socket_address:
+                with socket.socket(socket.AF_UNIX, socket.SOCK_SEQPACKET) as client:
+                    client.setsockopt(
+                        socket.SOL_SOCKET,
+                        socket.SO_RCVBUF,
+                        MAX_EXECUTION_RESPONSE_BYTES,
                     )
-                payload, _ancillary, flags, _address = client.recvmsg(
-                    MAX_EXECUTION_RESPONSE_BYTES
-                )
+                    client.settimeout(self._timeout_seconds)
+                    client.connect(socket_address)
+                    sent = client.send(encoded)
+                    if sent != len(encoded):
+                        raise HeadlessApiError(
+                            "execution_command_transport_failure",
+                            "execution command packet was truncated",
+                        )
+                    payload, _ancillary, flags, _address = client.recvmsg(
+                        MAX_EXECUTION_RESPONSE_BYTES
+                    )
         except HeadlessApiError:
             raise
+        except PrivateTransportCapabilityError as exc:
+            raise HeadlessApiError(
+                "execution_owner_unavailable",
+                f"native execution command socket is unavailable: {exc}",
+            ) from exc
         except (OSError, TimeoutError) as exc:
             raise HeadlessApiError(
                 "execution_owner_unavailable",
@@ -817,6 +820,13 @@ class ExecutionCommandClient:
             raise HeadlessApiError(
                 "execution_command_response_identity_mismatch",
                 "execution observation does not match the requested operation",
+            )
+        if response.get("ok") is True and type(
+            response.get("resident")
+        ) is not bool:
+            raise HeadlessApiError(
+                "execution_command_response_invalid",
+                "execution observation has no exact residency projection",
             )
         return response
 

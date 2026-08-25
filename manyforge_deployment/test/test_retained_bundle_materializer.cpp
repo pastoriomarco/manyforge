@@ -1454,7 +1454,6 @@ TEST(RetainedBundleMaterializer,
       detail::parse_and_verify_native_execution_runtime_manifest(manifest);
   const auto& retained_liveness =
       native_execution_runtime_contract::manager_liveness_policy();
-  ASSERT_TRUE(core::ValidateManagerLivenessPolicy(retained_liveness).ok());
   EXPECT_EQ(
       string_member(member(parsed_manifest, "manager_liveness_policy"),
                     "runtime_policy_id"),
@@ -2354,8 +2353,7 @@ TEST(RetainedBundleMaterializer,
 TEST(RetainedBundleMaterializer,
      AggregateNativeAssistantProductRetainsOneRuntimeAndDraftProjection) {
   const auto fixture =
-      test::make_lite6_native_cclc_assistant_product_retention_fixture(
-          test::kZeroDigest, test::kZeroDigest);
+      test::make_lite6_native_motion_arm_gripper_aggregate_assistant_retention_fixture();
   const test::Lite6ControllableCompilerInputArtifactSource input_source(
       fixture);
   test::InMemoryCatalogArtifactStoreFixture catalog_store;

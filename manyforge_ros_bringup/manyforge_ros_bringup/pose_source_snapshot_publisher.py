@@ -66,12 +66,12 @@ SimulationClientFactory = Callable[[Node, float], Any]
 
 
 def _default_dispatcher_factory(
-    manager_state_root: Path,
+    manager_run_root: Path,
     config: IsaacPoseObserverSiteConfig,
     callback: Callable[[ObservationDispatchEvent], None],
 ) -> ObservationDispatcher:
     return ObservationDispatcher.for_manager_root(
-        manager_state_root=manager_state_root,
+        manager_run_root=manager_run_root,
         config=config,
         event_callback=callback,
     )
@@ -88,7 +88,7 @@ class PoseSourceSnapshotPublisher(Node):
         self,
         *,
         site_config_path: Path | None = None,
-        manager_state_root: Path | None = None,
+        manager_run_root: Path | None = None,
         dispatcher_factory: DispatcherFactory = _default_dispatcher_factory,
         simulation_client_factory: SimulationClientFactory = (
             _default_simulation_client_factory
@@ -97,7 +97,7 @@ class PoseSourceSnapshotPublisher(Node):
     ) -> None:
         super().__init__("manyforge_pose_source_snapshot_publisher", context=context)
         self.declare_parameter("site_config_path", "")
-        self.declare_parameter("manager_state_root", "")
+        self.declare_parameter("manager_run_root", "")
         self.declare_parameter("manager_timeout_s", 2.0)
         self.declare_parameter("simulation_service_timeout_s", 2.0)
         self.declare_parameter("retry_log_period_s", 5.0)
@@ -108,9 +108,9 @@ class PoseSourceSnapshotPublisher(Node):
             else _required_path_parameter(self, "site_config_path")
         )
         configured_manager_root = (
-            Path(manager_state_root)
-            if manager_state_root is not None
-            else _required_path_parameter(self, "manager_state_root")
+            Path(manager_run_root)
+            if manager_run_root is not None
+            else _required_path_parameter(self, "manager_run_root")
         )
         self._config = load_isaac_pose_observer_site_config(configured_site_path)
         self._manager_timeout_s = _bounded_parameter(
@@ -127,7 +127,7 @@ class PoseSourceSnapshotPublisher(Node):
         )
         if dispatcher_factory is _default_dispatcher_factory:
             self._dispatcher = ObservationDispatcher.for_manager_root(
-                manager_state_root=configured_manager_root,
+                manager_run_root=configured_manager_root,
                 config=self._config,
                 event_callback=self._on_dispatch_event,
                 timeout_s=self._manager_timeout_s,

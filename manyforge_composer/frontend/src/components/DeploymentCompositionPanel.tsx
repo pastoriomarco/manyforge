@@ -1,10 +1,9 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 
 import { api } from '../api/client';
-import { completeManagerApply } from '../api/managerApplyCompletion';
 import type {
   ManagerApplyRequest,
-  ManagerApplySucceededResponse,
+  ManagerApplyResponse,
   ManagerDiffProjection,
   ManagerGraphProjection,
   ManagerStatusProjection,
@@ -86,10 +85,12 @@ function previewValidation(
   return null;
 }
 
-function applySuccessMessage(response: ManagerApplySucceededResponse): string {
-  return 'Manager Apply ' + shortIdentity(response.applyId)
-    + ' succeeded at generation ' + response.applyGeneration
-    + '; projections were refreshed.';
+function applyReceiptMessage(response: ManagerApplyResponse): string {
+  const identity = 'Manager Apply ' + shortIdentity(response.applyId)
+    + ' at generation ' + response.applyGeneration;
+  return response.state === 'succeeded'
+    ? identity + ' succeeded; the authoritative projections were refreshed.'
+    : identity + ' was accepted. Manager owns its continuation and the Apply inventory below reflects its progress.';
 }
 
 export function DeploymentCompositionPanel({
@@ -193,7 +194,12 @@ export function DeploymentCompositionPanel({
   };
 
   const apply = async () => {
-    if (!readModel || !selectedScenario || !canApply) return;
+    if (
+      !readModel
+      || !selectedScenario
+      || !canApply
+      || applyControllerRef.current !== null
+    ) return;
     const ownerEpoch = readModel.status.source.sourceOwnerEpoch;
     if (ownerEpoch === null) return;
     const request: ManagerApplyRequest = {
@@ -215,29 +221,18 @@ export function DeploymentCompositionPanel({
     setError(null);
     setFeedback(null);
     try {
-      const completion = await completeManagerApply(
-        request,
-        (exactRequest, signal) => api.manager.apply(exactRequest, signal),
-        (applyId, applyGeneration, signal) => (
-          api.manager.applyStatus(applyId, applyGeneration, signal)
-        ),
-        { signal: controller.signal },
-      );
+      const response = await api.manager.apply(request, controller.signal);
       if (!mountedRef.current || controller.signal.aborted) return;
-      if (completion.state === 'succeeded') {
-        setFeedback(applySuccessMessage(completion.response));
-      } else {
-        setFeedback(
-          'Manager accepted Apply ' + shortIdentity(completion.response.applyId)
-          + ', but the durable Apply remains pending after bounded observation. '
-          + 'Projections can be refreshed to observe completion.',
-        );
-      }
+      setFeedback(applyReceiptMessage(response));
       setPreviewedScenarioId(null);
       refresh();
     } catch (reason: unknown) {
       if (!mountedRef.current || controller.signal.aborted) return;
       setError(errorMessage(reason));
+      // A lost HTTP response is not evidence that Manager rejected the
+      // command. Re-read only the authoritative projection; never resubmit or
+      // infer completion in this browser.
+      refresh();
     } finally {
       if (applyControllerRef.current === controller) {
         applyControllerRef.current = null;
@@ -370,6 +365,31 @@ export function DeploymentCompositionPanel({
               Manager Apply is unavailable: {readModel.status.status.apply.unavailableReasonCode ?? 'unknown reason'}.
             </p>
           )}
+          <div className="program-declaration-form compact">
+            <h3>Manager Apply inventory</h3>
+            {readModel.status.status.apply.records.length === 0 ? (
+              <p className="panel-intro">No Manager Apply has been recorded.</p>
+            ) : (
+              <ol className="program-history-list">
+                {[...readModel.status.status.apply.records]
+                  .sort((left, right) => (
+                    right.applyGeneration - left.applyGeneration
+                    || right.applyId.localeCompare(left.applyId)
+                  ))
+                  .map((record) => (
+                    <li key={record.applyId + ':' + record.applyGeneration}>
+                      <strong>{shortIdentity(record.applyId)}</strong>
+                      {' · generation ' + record.applyGeneration}
+                      {' · ' + (record.terminalState ?? record.phase)}
+                      <small>
+                        {' request ' + shortIdentity(record.request.requestId)}
+                        {' · target ' + shortIdentity(record.candidateRetainedBundleId)}
+                      </small>
+                    </li>
+                  ))}
+              </ol>
+            )}
+          </div>
           <p className="panel-intro">
             Program Run and manual control remain explicit owner-issued actions
             in the execution panels below.

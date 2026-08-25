@@ -162,6 +162,31 @@ def test_execution_client_accepts_only_paired_null_stop_projection_identity(
     assert unattributed.value.code == "execution_command_response_invalid"
 
 
+def test_execution_client_requires_backend_residency_projection(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    client = ExecutionCommandClient(tmp_path)
+    response = {
+        "api_version": "manyforge.execution_command_response.v1",
+        "command": "read",
+        "ok": True,
+        "operation": {"operation_id": "operation.1"},
+        "resident": True,
+    }
+    monkeypatch.setattr(client, "_exchange", lambda _command: response)
+    assert client.read("operation.1")["resident"] is True
+
+    response.pop("resident")
+    with pytest.raises(HeadlessApiError) as missing:
+        client.read("operation.1")
+    assert missing.value.code == "execution_command_response_invalid"
+
+    response["resident"] = 1
+    with pytest.raises(HeadlessApiError) as non_boolean:
+        client.read("operation.1")
+    assert non_boolean.value.code == "execution_command_response_invalid"
+
+
 def test_execution_client_projects_scoped_full_and_fault_recovery_commands(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:

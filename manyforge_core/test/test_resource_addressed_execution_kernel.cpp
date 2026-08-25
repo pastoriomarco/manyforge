@@ -33,6 +33,8 @@ namespace {
 
 using namespace manyforge::core;
 
+constexpr TimePoint kStopProjectionRetryDelayNs = 20'000'000;
+
 template <typename Predicate>
 bool wait_until(Predicate&& predicate,
                 std::chrono::milliseconds timeout = std::chrono::milliseconds(10000)) {
@@ -245,15 +247,13 @@ class FakeParticipantEngine final : public IResolvedParticipantExecutionEngine,
       ResolvedPreparedCapabilityCommandExecutionRequestDTO request) override {
     ++prepare_command_calls;
     Trace("engine:prepare_command");
-    last_prepared_command_request = std::move(request);
-    if (!last_prepared_command_request->participant) {
+    if (!request.participant) {
       return Result<std::uint64_t>::Err(
           ErrorDTO{std::string(to_string(ErrorCode::kInvalidRequest)),
                    "fake command preparation has no participant",
                    {{"reason", "prepared_command_participant_missing"}}});
     }
-    auto private_validation =
-        validate_gripper_command(last_prepared_command_request->command_request);
+    auto private_validation = validate_gripper_command(request.command_request);
     if (!private_validation.ok()) {
       return Result<std::uint64_t>::Err(private_validation.error());
     }
@@ -263,26 +263,29 @@ class FakeParticipantEngine final : public IResolvedParticipantExecutionEngine,
     if (prepare_command_failure.has_value()) {
       return Result<std::uint64_t>::Err(*prepare_command_failure);
     }
-    auto prepared = MakePrepareParticipantResult(*last_prepared_command_request->participant,
+    auto prepared = MakePrepareParticipantResult(*request.participant,
                                                  PrepareParticipantResultStateDTO::kPrepared);
     if (!prepared.ok()) {
       return Result<std::uint64_t>::Err(prepared.error());
     }
-    prepared_command_snapshot = ResolvedPreparedCapabilityCommandSnapshotDTO{
-        next_execution_id,
-        ResolvedPreparedCapabilityCommandStateDTO::kPrepared,
-        last_prepared_command_request->participant,
-        std::move(prepared.value()),
-        std::nullopt,
-        std::nullopt,
-        std::nullopt,
-        std::nullopt};
-    return Result<std::uint64_t>::Ok(next_execution_id);
+    const auto preparation_id = next_execution_id;
+    auto snapshot = ResolvedPreparedCapabilityCommandSnapshotDTO{
+        next_execution_id,   ResolvedPreparedCapabilityCommandStateDTO::kPrepared,
+        request.participant, std::move(prepared.value()),
+        std::nullopt,        std::nullopt,
+        std::nullopt,        std::nullopt};
+    {
+      std::lock_guard lock(prepared_command_mutex_);
+      last_prepared_command_request = std::move(request);
+      prepared_command_snapshot = std::move(snapshot);
+    }
+    return Result<std::uint64_t>::Ok(preparation_id);
   }
 
   Result<ResolvedPreparedCapabilityCommandSnapshotDTO> ObservePreparedCapabilityCommand(
       std::uint64_t preparation_id) const override {
     ++observe_prepared_command_calls;
+    std::lock_guard lock(prepared_command_mutex_);
     if (!prepared_command_snapshot.has_value() ||
         prepared_command_snapshot->preparation_id != preparation_id) {
       return Result<ResolvedPreparedCapabilityCommandSnapshotDTO>::Err(
@@ -302,6 +305,7 @@ class FakeParticipantEngine final : public IResolvedParticipantExecutionEngine,
     if (dispatch_prepared_command_hook) {
       dispatch_prepared_command_hook();
     }
+    std::lock_guard lock(prepared_command_mutex_);
     if (!prepared_command_snapshot.has_value() || !prepared_command_snapshot->participant ||
         prepared_command_snapshot->preparation_id != preparation_id ||
         prepared_command_snapshot->participant->prepared_contract_digest !=
@@ -337,6 +341,7 @@ class FakeParticipantEngine final : public IResolvedParticipantExecutionEngine,
   Result<void> CancelPreparedCapabilityCommand(std::uint64_t preparation_id) override {
     ++cancel_prepared_command_calls;
     Trace("engine:cancel_prepared_command");
+    std::lock_guard lock(prepared_command_mutex_);
     if (!prepared_command_snapshot.has_value() ||
         prepared_command_snapshot->preparation_id != preparation_id) {
       return Result<void>::Err(ErrorDTO{std::string(to_string(ErrorCode::kMissingReference)),
@@ -493,6 +498,9 @@ class FakeParticipantEngine final : public IResolvedParticipantExecutionEngine,
                                                       std::optional<std::uint64_t>) override {
     ++acknowledge_calls;
     Trace("engine:acknowledge_completed");
+    if (acknowledge_effect_hook) {
+      acknowledge_effect_hook();
+    }
     if (next_acknowledge_result.accepted) {
       emit_transition(get_status().state, ExecutionState::kIdle);
     }
@@ -751,6 +759,7 @@ class FakeParticipantEngine final : public IResolvedParticipantExecutionEngine,
   ExecutionStatus status{};
   mutable std::mutex status_mutex_;
   mutable std::mutex prepared_motion_mutex_;
+  mutable std::mutex prepared_command_mutex_;
   std::optional<KernelEvent> event_during_execute;
   bool defer_prepare_completion{};
   bool defer_resume_prepare_completion{};
@@ -759,6 +768,7 @@ class FakeParticipantEngine final : public IResolvedParticipantExecutionEngine,
   std::optional<ErrorDTO> prepared_dispatch_event_error;
   std::function<void()> pause_effect_hook;
   std::function<void()> pause_return_hook;
+  std::function<void()> acknowledge_effect_hook;
   std::function<void()> resume_return_hook;
   std::function<void()> prepare_command_hook;
   std::function<void()> dispatch_prepared_command_hook;
@@ -1072,6 +1082,20 @@ class FakeParticipantEngine final : public IResolvedParticipantExecutionEngine,
   std::map<std::uint64_t, EventCallback> callbacks;
 };
 
+class RejectingScheduler final : public IScheduler {
+ public:
+  ScheduleHandle schedule(TimePoint, std::function<void()>, SchedulerPriority priority) override {
+    last_priority.store(static_cast<int>(priority), std::memory_order_release);
+    schedule_calls.fetch_add(1, std::memory_order_release);
+    throw std::runtime_error("test scheduler rejected callback");
+  }
+
+  void cancel(ScheduleHandle) override {}
+
+  std::atomic_int schedule_calls{};
+  std::atomic_int last_priority{-1};
+};
+
 class FakeOperationJournal final : public IOperationJournal {
  public:
   Result<OperationJournalRecoveryDTO> BeginOwnerEpoch(const RequestOwnerEpoch&, std::int64_t,
@@ -1120,6 +1144,16 @@ class FakeOperationJournal final : public IOperationJournal {
     last_stop_accepted = accepted;
     last_stop_affected_state = affected_state;
     projected_stop_acceptances.push_back(accepted.stop_id);
+    if (retryable_stop_acceptance_failures > 0U) {
+      --retryable_stop_acceptance_failures;
+      ++stop_acceptance_calls;
+      return EmergencyStopAcceptanceProjectionResultDTO{
+          EmergencyStopProjectionStateDTO::kFailed, std::nullopt,
+          ErrorDTO{
+              "operation_journal_stop_projection_unavailable",
+              "Stop acceptance projection cannot wait for the operation journal",
+              {{"reason", "operation_journal_critical_section_occupied"}, {"retryable", "true"}}}};
+    }
     if (fail_next_kind == "stop_accepted") {
       fail_next_kind.reset();
       ++stop_acceptance_calls;
@@ -1145,6 +1179,15 @@ class FakeOperationJournal final : public IOperationJournal {
     last_stop_fault_latch = fault_latch;
     projected_stop_terminals.push_back(certificate.stop_id);
     ++stop_terminal_calls;
+    if (retryable_stop_terminal_failures > 0U) {
+      --retryable_stop_terminal_failures;
+      return StopForensicProjectionResultDTO{
+          StopForensicProjectionStateDTO::kFailed, std::nullopt,
+          ErrorDTO{
+              "operation_journal_stop_projection_unavailable",
+              "Stop terminal projection cannot wait for the operation journal",
+              {{"reason", "operation_journal_critical_section_occupied"}, {"retryable", "true"}}}};
+    }
     if (fail_next_kind == "stop_terminal") {
       fail_next_kind.reset();
       return StopForensicProjectionResultDTO{StopForensicProjectionStateDTO::kFailed, std::nullopt,
@@ -1165,6 +1208,15 @@ class FakeOperationJournal final : public IOperationJournal {
     last_stop_fault_latch = fault_latch;
     last_stop_surveillance_projected_at_ns = projected_at_ns;
     ++stop_surveillance_calls;
+    if (retryable_stop_surveillance_failures > 0U) {
+      --retryable_stop_surveillance_failures;
+      return StopForensicProjectionResultDTO{
+          StopForensicProjectionStateDTO::kFailed, std::nullopt,
+          ErrorDTO{
+              "operation_journal_stop_projection_unavailable",
+              "Stop surveillance projection cannot wait for the operation journal",
+              {{"reason", "operation_journal_critical_section_occupied"}, {"retryable", "true"}}}};
+    }
     if (fail_next_kind == "stop_surveillance_checkpoint") {
       fail_next_kind.reset();
       return StopForensicProjectionResultDTO{StopForensicProjectionStateDTO::kFailed, std::nullopt,
@@ -1276,6 +1328,9 @@ class FakeOperationJournal final : public IOperationJournal {
 
   OperationJournalRecoveryDTO recovery;
   std::optional<std::string> fail_next_kind;
+  std::size_t retryable_stop_acceptance_failures{};
+  std::size_t retryable_stop_terminal_failures{};
+  std::size_t retryable_stop_surveillance_failures{};
   std::vector<std::string> calls;
   std::atomic<int> stop_acceptance_calls{};
   std::atomic<int> stop_terminal_calls{};
@@ -2142,13 +2197,14 @@ ManagerLivenessRequiredSetDTO EmptyManagerLivenessSet() {
 
 TEST(ResourceAddressedExecutionKernelTest, ResolvesPortableMotionAndReservesExactResource) {
   FakeClock clock;
+  ManualScheduler scheduler;
   clock.set(1234);
   FakeParticipantEngine engine;
   ResourceAddressedExecutionKernel kernel(
       {registration(
           make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular),
           engine)},
-      clock, default_journal,
+      clock, scheduler, default_journal,
       ResourceAddressedExecutionKernelConfig{RequestOwnerEpoch("kernel.epoch.1"),
                                              CellId("cell.test"), 8U});
 
@@ -2188,13 +2244,14 @@ TEST(ResourceAddressedExecutionKernelTest, ResolvesPortableMotionAndReservesExac
 TEST(ResourceAddressedExecutionKernelTest,
      PreparedMotionDoesNotDispatchUntilTheExactPreparationCompletes) {
   FakeClock clock;
+  ManualScheduler scheduler;
   FakeParticipantEngine engine;
   engine.defer_prepare_completion = true;
   ResourceAddressedExecutionKernel kernel(
       {registration(
           make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular),
           engine)},
-      clock, default_journal,
+      clock, scheduler, default_journal,
       ResourceAddressedExecutionKernelConfig{RequestOwnerEpoch("kernel.epoch.1"),
                                              CellId("cell.test"), 8U});
 
@@ -2222,6 +2279,7 @@ TEST(ResourceAddressedExecutionKernelTest,
 TEST(ResourceAddressedExecutionKernelTest,
      PreparationFailureIsDurableAndCannotDispatchPhysicalMotion) {
   FakeClock clock;
+  ManualScheduler scheduler;
   FakeParticipantEngine engine;
   engine.prepare_failure = ErrorDTO{std::string(to_string(ErrorCode::kExecutionRejected)),
                                     "injected preparation failure",
@@ -2230,7 +2288,7 @@ TEST(ResourceAddressedExecutionKernelTest,
       {registration(
           make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular),
           engine)},
-      clock, default_journal,
+      clock, scheduler, default_journal,
       ResourceAddressedExecutionKernelConfig{RequestOwnerEpoch("kernel.epoch.1"),
                                              CellId("cell.test"), 8U});
 
@@ -2252,13 +2310,14 @@ TEST(ResourceAddressedExecutionKernelTest,
 TEST(ResourceAddressedExecutionKernelTest,
      StopCancelsHeldPreparationWithoutDispatchingAStopStageOrMotion) {
   FakeClock clock;
+  ManualScheduler scheduler;
   FakeParticipantEngine engine;
   engine.defer_prepare_completion = true;
   ResourceAddressedExecutionKernel kernel(
       {registration(
           make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular),
           engine)},
-      clock, default_journal,
+      clock, scheduler, default_journal,
       ResourceAddressedExecutionKernelConfig{RequestOwnerEpoch("kernel.epoch.1"),
                                              CellId("cell.test"), 8U});
 
@@ -2294,6 +2353,7 @@ TEST(ResourceAddressedExecutionKernelTest,
 TEST(ResourceAddressedExecutionKernelTest,
      CoordinatedMotionPreparesEveryParticipantBeforeDeterministicDispatch) {
   FakeClock clock;
+  ManualScheduler scheduler;
   FakeParticipantEngine first_engine;
   FakeParticipantEngine second_engine;
   std::vector<std::string> timeline;
@@ -2303,7 +2363,7 @@ TEST(ResourceAddressedExecutionKernelTest,
       make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular);
   const auto second = coordinated_occurrence(first, "2");
   ResourceAddressedExecutionKernel kernel(
-      {registration(first, first_engine), registration(second, second_engine)}, clock,
+      {registration(first, first_engine), registration(second, second_engine)}, clock, scheduler,
       default_journal, {RequestOwnerEpoch("kernel.epoch.1"), CellId("cell.test"), 16U});
 
   const auto accepted =
@@ -2332,6 +2392,7 @@ TEST(ResourceAddressedExecutionKernelTest,
 TEST(ResourceAddressedExecutionKernelTest,
      CoordinatedMotionHoldsEveryDispatchUntilTheLastPreparationCompletes) {
   FakeClock clock;
+  ManualScheduler scheduler;
   FakeParticipantEngine first_engine;
   FakeParticipantEngine second_engine;
   second_engine.defer_prepare_completion = true;
@@ -2339,7 +2400,7 @@ TEST(ResourceAddressedExecutionKernelTest,
       make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular);
   const auto second = coordinated_occurrence(first, "2");
   ResourceAddressedExecutionKernel kernel(
-      {registration(first, first_engine), registration(second, second_engine)}, clock,
+      {registration(first, first_engine), registration(second, second_engine)}, clock, scheduler,
       default_journal, {RequestOwnerEpoch("kernel.epoch.1"), CellId("cell.test"), 16U});
 
   const auto accepted =
@@ -2365,6 +2426,7 @@ TEST(ResourceAddressedExecutionKernelTest,
 TEST(ResourceAddressedExecutionKernelTest,
      CoordinatedPreparationFailureCancelsPeersAndAtomicallyReleasesEveryReservation) {
   FakeClock clock;
+  ManualScheduler scheduler;
   FakeParticipantEngine first_engine;
   FakeParticipantEngine second_engine;
   second_engine.prepare_failure = ErrorDTO{std::string(to_string(ErrorCode::kExecutionRejected)),
@@ -2374,7 +2436,7 @@ TEST(ResourceAddressedExecutionKernelTest,
       make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular);
   const auto second = coordinated_occurrence(first, "2");
   ResourceAddressedExecutionKernel kernel(
-      {registration(first, first_engine), registration(second, second_engine)}, clock,
+      {registration(first, first_engine), registration(second, second_engine)}, clock, scheduler,
       default_journal, {RequestOwnerEpoch("kernel.epoch.1"), CellId("cell.test"), 16U});
 
   const auto accepted =
@@ -2398,6 +2460,7 @@ TEST(ResourceAddressedExecutionKernelTest,
 TEST(ResourceAddressedExecutionKernelTest,
      StopDuringCoordinatedPrepareBarrierCancelsAllParticipantsWithoutPhysicalDispatch) {
   FakeClock clock;
+  ManualScheduler scheduler;
   FakeParticipantEngine first_engine;
   FakeParticipantEngine second_engine;
   second_engine.defer_prepare_completion = true;
@@ -2405,7 +2468,7 @@ TEST(ResourceAddressedExecutionKernelTest,
       make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular);
   const auto second = coordinated_occurrence(first, "2");
   ResourceAddressedExecutionKernel kernel(
-      {registration(first, first_engine), registration(second, second_engine)}, clock,
+      {registration(first, first_engine), registration(second, second_engine)}, clock, scheduler,
       default_journal, {RequestOwnerEpoch("kernel.epoch.1"), CellId("cell.test"), 16U});
 
   const auto accepted =
@@ -2443,13 +2506,14 @@ TEST(ResourceAddressedExecutionKernelTest,
 TEST(ResourceAddressedExecutionKernelTest,
      RuntimeCollisionUsesTheAddressedStopOwnerAndDeclaredCoordinatedScopeExactlyOnce) {
   FakeClock clock;
+  ManualScheduler scheduler;
   FakeParticipantEngine first_engine;
   FakeParticipantEngine second_engine;
   const auto first =
       make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular);
   const auto second = coordinated_occurrence(first, "2");
   ResourceAddressedExecutionKernel kernel(
-      {registration(first, first_engine), registration(second, second_engine)}, clock,
+      {registration(first, first_engine), registration(second, second_engine)}, clock, scheduler,
       default_journal, {RequestOwnerEpoch("kernel.epoch.1"), CellId("cell.test"), 16U});
 
   const auto accepted =
@@ -2503,12 +2567,13 @@ TEST(ResourceAddressedExecutionKernelTest,
 TEST(ResourceAddressedExecutionKernelTest,
      StopCertificateReusesBackendPublishedTerminalResourceState) {
   FakeClock clock;
+  ManualScheduler scheduler;
   FakeParticipantEngine engine;
   ResourceAddressedExecutionKernel kernel(
       {registration(
           make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular),
           engine)},
-      clock, default_journal,
+      clock, scheduler, default_journal,
       {RequestOwnerEpoch("kernel.epoch.1"), CellId("cell.test"), 16U});
 
   const auto accepted =
@@ -2559,11 +2624,12 @@ TEST(ResourceAddressedExecutionKernelTest,
 TEST(ResourceAddressedExecutionKernelTest,
      StopResolverPrefersDirectPathWhenSupportingProviderIsCoLocated) {
   FakeClock clock;
+  ManualScheduler scheduler;
   FakeParticipantEngine engine;
   const auto binding = with_colocated_supporting_capability(
       make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular));
   ResourceAddressedExecutionKernel kernel(
-      {registration(binding, engine)}, clock, default_journal,
+      {registration(binding, engine)}, clock, scheduler, default_journal,
       {RequestOwnerEpoch("kernel.epoch.1"), CellId("cell.test"), 16U});
 
   const auto accepted =
@@ -2616,6 +2682,7 @@ TEST(ResourceAddressedExecutionKernelTest,
 TEST(ResourceAddressedExecutionKernelTest,
      CoordinatedOverlapRejectsBeforePrepareAndLeavesTheResourceTableUnchanged) {
   FakeClock clock;
+  ManualScheduler scheduler;
   FakeParticipantEngine first_engine;
   FakeParticipantEngine second_engine;
   const auto first =
@@ -2626,7 +2693,7 @@ TEST(ResourceAddressedExecutionKernelTest,
   auto overlapping = verify_runtime_participant_binding(std::move(overlapping_value));
   ASSERT_TRUE(overlapping.ok()) << overlapping.error().message;
   ResourceAddressedExecutionKernel kernel(
-      {registration(first, first_engine), registration(overlapping.value(), second_engine)}, clock,
+      {registration(first, first_engine), registration(overlapping.value(), second_engine)}, clock, scheduler,
       default_journal, {RequestOwnerEpoch("kernel.epoch.1"), CellId("cell.test"), 16U});
 
   const auto rejected =
@@ -2642,6 +2709,7 @@ TEST(ResourceAddressedExecutionKernelTest,
 TEST(ResourceAddressedExecutionKernelTest,
      PartialDispatchStopsOnlyReleasedParticipantsAndCancelsTheUnreleasedRemainder) {
   FakeClock clock;
+  ManualScheduler scheduler;
   FakeParticipantEngine first_engine;
   FakeParticipantEngine second_engine;
   FakeParticipantEngine third_engine;
@@ -2657,7 +2725,7 @@ TEST(ResourceAddressedExecutionKernelTest,
   ResourceAddressedExecutionKernel kernel(
       {registration(first, first_engine), registration(second, second_engine),
        registration(third, third_engine)},
-      clock, journal, {RequestOwnerEpoch("kernel.epoch.1"), CellId("cell.test"), 16U});
+      clock, scheduler, journal, {RequestOwnerEpoch("kernel.epoch.1"), CellId("cell.test"), 16U});
 
   const auto accepted =
       kernel.execute(coordinated_motion_operation("request.motion.coordinated.partial", 3U));
@@ -2713,6 +2781,7 @@ TEST(ResourceAddressedExecutionKernelTest,
 TEST(ResourceAddressedExecutionKernelTest,
      BlockedPartialDispatchJournalCannotDelayEmergencyContainment) {
   FakeClock clock;
+  ManualScheduler scheduler;
   FakeParticipantEngine first_engine;
   FakeParticipantEngine second_engine;
   FakeParticipantEngine third_engine;
@@ -2738,7 +2807,7 @@ TEST(ResourceAddressedExecutionKernelTest,
   ResourceAddressedExecutionKernel kernel(
       {registration(first, first_engine), registration(second, second_engine),
        registration(third, third_engine)},
-      clock, journal, {RequestOwnerEpoch("kernel.epoch.1"), CellId("cell.test"), 16U});
+      clock, scheduler, journal, {RequestOwnerEpoch("kernel.epoch.1"), CellId("cell.test"), 16U});
 
   auto executing = std::async(std::launch::async, [&] {
     return kernel.execute(
@@ -2764,6 +2833,7 @@ TEST(ResourceAddressedExecutionKernelTest,
 TEST(ResourceAddressedExecutionKernelTest,
      CoordinatedCapabilityCommandsPrepareAllBeforeDeterministicDispatch) {
   FakeClock clock;
+  ManualScheduler scheduler;
   FakeParticipantEngine first_engine;
   FakeParticipantEngine second_engine;
   std::vector<std::string> timeline;
@@ -2776,7 +2846,7 @@ TEST(ResourceAddressedExecutionKernelTest,
                                   CoordinateKind::kLinear, schema);
   const auto second = coordinated_occurrence(first, "2");
   ResourceAddressedExecutionKernel kernel(
-      {registration(first, first_engine), registration(second, second_engine)}, clock,
+      {registration(first, first_engine), registration(second, second_engine)}, clock, scheduler,
       default_journal, {RequestOwnerEpoch("kernel.epoch.1"), CellId("cell.test"), 16U});
 
   const auto accepted =
@@ -2808,6 +2878,7 @@ TEST(ResourceAddressedExecutionKernelTest,
 TEST(ResourceAddressedExecutionKernelTest,
      CoordinatedCommandPreparationFailureCancelsPreparedPeersAndReleasesAllResources) {
   FakeClock clock;
+  ManualScheduler scheduler;
   FakeParticipantEngine first_engine;
   FakeParticipantEngine second_engine;
   second_engine.prepare_command_failure =
@@ -2821,7 +2892,7 @@ TEST(ResourceAddressedExecutionKernelTest,
                                   CoordinateKind::kLinear, schema);
   const auto second = coordinated_occurrence(first, "2");
   ResourceAddressedExecutionKernel kernel(
-      {registration(first, first_engine), registration(second, second_engine)}, clock,
+      {registration(first, first_engine), registration(second, second_engine)}, clock, scheduler,
       default_journal, {RequestOwnerEpoch("kernel.epoch.1"), CellId("cell.test"), 16U});
 
   const auto accepted =
@@ -2845,6 +2916,7 @@ TEST(ResourceAddressedExecutionKernelTest,
 TEST(ResourceAddressedExecutionKernelTest,
      MixedCoordinatedOperationHoldsMotionUntilCommandPreparationCompletes) {
   FakeClock clock;
+  ManualScheduler scheduler;
   FakeParticipantEngine motion_engine;
   FakeParticipantEngine command_engine;
   std::vector<std::string> timeline;
@@ -2866,7 +2938,7 @@ TEST(ResourceAddressedExecutionKernelTest,
                                            CoordinateKind::kLinear, schema);
   const auto command = coordinated_occurrence(command_source, "2");
   ResourceAddressedExecutionKernel kernel(
-      {registration(motion, motion_engine), registration(command, command_engine)}, clock,
+      {registration(motion, motion_engine), registration(command, command_engine)}, clock, scheduler,
       default_journal, {RequestOwnerEpoch("kernel.epoch.1"), CellId("cell.test"), 16U});
 
   auto executing = std::async(std::launch::async, [&] {
@@ -2897,6 +2969,7 @@ TEST(ResourceAddressedExecutionKernelTest,
 TEST(ResourceAddressedExecutionKernelTest,
      StopDuringCoordinatedCommandPreparationCancelsEveryPreparationWithoutDispatch) {
   FakeClock clock;
+  ManualScheduler scheduler;
   FakeParticipantEngine first_engine;
   FakeParticipantEngine second_engine;
   std::promise<void> second_prepare_entered;
@@ -2913,7 +2986,7 @@ TEST(ResourceAddressedExecutionKernelTest,
                                   CoordinateKind::kLinear, schema);
   const auto second = coordinated_occurrence(first, "2");
   ResourceAddressedExecutionKernel kernel(
-      {registration(first, first_engine), registration(second, second_engine)}, clock,
+      {registration(first, first_engine), registration(second, second_engine)}, clock, scheduler,
       default_journal, {RequestOwnerEpoch("kernel.epoch.1"), CellId("cell.test"), 16U});
 
   auto executing = std::async(std::launch::async, [&] {
@@ -2963,6 +3036,7 @@ TEST(ResourceAddressedExecutionKernelTest,
 TEST(ResourceAddressedExecutionKernelTest,
      PartialCapabilityCommandDispatchStopsAttemptedAndCancelsUnreleasedParticipants) {
   FakeClock clock;
+  ManualScheduler scheduler;
   FakeParticipantEngine first_engine;
   FakeParticipantEngine second_engine;
   FakeParticipantEngine third_engine;
@@ -2981,7 +3055,7 @@ TEST(ResourceAddressedExecutionKernelTest,
   ResourceAddressedExecutionKernel kernel(
       {registration(first, first_engine), registration(second, second_engine),
        registration(third, third_engine)},
-      clock, default_journal, {RequestOwnerEpoch("kernel.epoch.1"), CellId("cell.test"), 16U});
+      clock, scheduler, default_journal, {RequestOwnerEpoch("kernel.epoch.1"), CellId("cell.test"), 16U});
 
   const auto accepted =
       kernel.execute(coordinated_command_operation("request.command.coordinated.partial", 3U));
@@ -3016,12 +3090,13 @@ TEST(ResourceAddressedExecutionKernelTest,
 TEST(ResourceAddressedExecutionKernelTest,
      DisableHandoffRuntimeSnapshotResolvesExactStaleAndConservativeFullScopes) {
   FakeClock clock;
+  ManualScheduler scheduler;
   clock.set(1234);
   FakeParticipantEngine engine;
   const auto binding =
       make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular);
   ResourceAddressedExecutionKernel kernel(
-      {registration(binding, engine)}, clock, default_journal,
+      {registration(binding, engine)}, clock, scheduler, default_journal,
       ResourceAddressedExecutionKernelConfig{RequestOwnerEpoch("kernel.epoch.1"),
                                              CellId("cell.test"), 8U});
 
@@ -3102,6 +3177,7 @@ TEST(ResourceAddressedExecutionKernelTest,
 TEST(ResourceAddressedExecutionKernelTest,
      RetainsUnqualifiedRegistrationForObservationButRefusesMotionAdmission) {
   FakeClock clock;
+  ManualScheduler scheduler;
   FakeParticipantEngine engine;
   const auto binding =
       make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular);
@@ -3109,7 +3185,7 @@ TEST(ResourceAddressedExecutionKernelTest,
   unqualified.stop_execution_port = nullptr;
 
   ResourceAddressedExecutionKernel kernel(
-      {std::move(unqualified)}, clock, default_journal,
+      {std::move(unqualified)}, clock, scheduler, default_journal,
       ResourceAddressedExecutionKernelConfig{
           RequestOwnerEpoch("kernel.epoch.1"),
           CellId("cell.test"),
@@ -3130,6 +3206,7 @@ TEST(ResourceAddressedExecutionKernelTest,
 TEST(ResourceAddressedExecutionKernelTest,
      RefusesMotionWhenStopReadinessExistsButRuntimePolicyIsUnqualified) {
   FakeClock clock;
+  ManualScheduler scheduler;
   FakeParticipantEngine engine;
   const auto binding =
       make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular);
@@ -3137,7 +3214,7 @@ TEST(ResourceAddressedExecutionKernelTest,
   unqualified.runtime_policy.reset();
 
   ResourceAddressedExecutionKernel kernel(
-      {std::move(unqualified)}, clock, default_journal,
+      {std::move(unqualified)}, clock, scheduler, default_journal,
       ResourceAddressedExecutionKernelConfig{RequestOwnerEpoch("kernel.epoch.1"),
                                              CellId("cell.test"), 8U});
 
@@ -3152,6 +3229,7 @@ TEST(ResourceAddressedExecutionKernelTest,
 TEST(ResourceAddressedExecutionKernelTest,
      DisjointSameTypeBindingsRunConcurrentlyOnTheirExactPhysicalEngines) {
   FakeClock clock;
+  ManualScheduler scheduler;
   FakeParticipantEngine first_engine;
   FakeParticipantEngine second_engine;
   const auto first_binding =
@@ -3159,7 +3237,7 @@ TEST(ResourceAddressedExecutionKernelTest,
   const auto second_binding = second_same_type_occurrence(first_binding);
   ResourceAddressedExecutionKernel kernel(
       {registration(first_binding, first_engine), registration(second_binding, second_engine)},
-      clock, default_journal, {RequestOwnerEpoch("kernel.epoch.1"), CellId("cell.test"), 8U});
+      clock, scheduler, default_journal, {RequestOwnerEpoch("kernel.epoch.1"), CellId("cell.test"), 8U});
 
   const auto first = kernel.execute(motion_operation("request.robot.1"));
   ASSERT_TRUE(first.ok()) << first.error().message;
@@ -3226,6 +3304,7 @@ TEST(ResourceAddressedExecutionKernelTest,
 TEST(ResourceAddressedExecutionKernelTest,
      OverlappingOperationIsRejectedAtomicallyWithoutDisturbingResidentOwner) {
   FakeClock clock;
+  ManualScheduler scheduler;
   FakeParticipantEngine first_engine;
   FakeParticipantEngine second_engine;
   const auto first_binding =
@@ -3233,7 +3312,7 @@ TEST(ResourceAddressedExecutionKernelTest,
   const auto overlapping_binding = second_occurrence_sharing_first_resource(first_binding);
   ResourceAddressedExecutionKernel kernel(
       {registration(first_binding, first_engine), registration(overlapping_binding, second_engine)},
-      clock, default_journal, {RequestOwnerEpoch("kernel.epoch.1"), CellId("cell.test"), 8U});
+      clock, scheduler, default_journal, {RequestOwnerEpoch("kernel.epoch.1"), CellId("cell.test"), 8U});
 
   const auto first = kernel.execute(motion_operation("request.overlap.first"));
   ASSERT_TRUE(first.ok()) << first.error().message;
@@ -3258,12 +3337,13 @@ TEST(ResourceAddressedExecutionKernelTest,
 TEST(ResourceAddressedExecutionKernelTest,
      OneSingleParticipantEngineCannotOwnTwoResidentOperations) {
   FakeClock clock;
+  ManualScheduler scheduler;
   FakeParticipantEngine engine;
   const auto first_binding =
       make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular);
   const auto second_binding = second_same_type_occurrence(first_binding);
   ResourceAddressedExecutionKernel kernel(
-      {registration(first_binding, engine), registration(second_binding, engine)}, clock,
+      {registration(first_binding, engine), registration(second_binding, engine)}, clock, scheduler,
       default_journal, {RequestOwnerEpoch("kernel.epoch.1"), CellId("cell.test"), 8U});
 
   const auto first = kernel.execute(motion_operation("request.shared-engine.first"));
@@ -3292,12 +3372,13 @@ TEST(ResourceAddressedExecutionKernelTest,
 TEST(ResourceAddressedExecutionKernelTest,
      LatePriorExecutionEventCannotAttachToANewOperationDuringDispatch) {
   FakeClock clock;
+  ManualScheduler scheduler;
   FakeParticipantEngine engine;
   ResourceAddressedExecutionKernel kernel(
       {registration(
           make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular),
           engine)},
-      clock, default_journal, {RequestOwnerEpoch("kernel.epoch.1"), CellId("cell.test"), 8U});
+      clock, scheduler, default_journal, {RequestOwnerEpoch("kernel.epoch.1"), CellId("cell.test"), 8U});
 
   const auto first = kernel.execute(motion_operation("request.late-event.first"));
   ASSERT_TRUE(first.ok()) << first.error().message;
@@ -3330,6 +3411,7 @@ TEST(ResourceAddressedExecutionKernelTest,
 TEST(ResourceAddressedExecutionKernelTest,
      ControlsStopAndRuntimeScaleRemainScopedToTheNamedDisjointOperation) {
   FakeClock clock;
+  ManualScheduler scheduler;
   FakeParticipantEngine first_engine;
   FakeParticipantEngine second_engine;
   const auto first_binding =
@@ -3337,7 +3419,7 @@ TEST(ResourceAddressedExecutionKernelTest,
   const auto second_binding = second_same_type_occurrence(first_binding);
   ResourceAddressedExecutionKernel kernel(
       {registration(first_binding, first_engine), registration(second_binding, second_engine)},
-      clock, default_journal, {RequestOwnerEpoch("kernel.epoch.1"), CellId("cell.test"), 16U});
+      clock, scheduler, default_journal, {RequestOwnerEpoch("kernel.epoch.1"), CellId("cell.test"), 16U});
 
   const auto first = kernel.execute(motion_operation("request.scoped.first"));
   ASSERT_TRUE(first.ok()) << first.error().message;
@@ -3385,6 +3467,7 @@ TEST(ResourceAddressedExecutionKernelTest, BlockedControlOnOneOperationCannotDel
   using namespace std::chrono_literals;
 
   FakeClock clock;
+  ManualScheduler scheduler;
   FakeParticipantEngine first_engine;
   FakeParticipantEngine second_engine;
   const auto first_binding =
@@ -3392,7 +3475,7 @@ TEST(ResourceAddressedExecutionKernelTest, BlockedControlOnOneOperationCannotDel
   const auto second_binding = second_same_type_occurrence(first_binding);
   ResourceAddressedExecutionKernel kernel(
       {registration(first_binding, first_engine), registration(second_binding, second_engine)},
-      clock, default_journal, {RequestOwnerEpoch("kernel.epoch.1"), CellId("cell.test"), 16U});
+      clock, scheduler, default_journal, {RequestOwnerEpoch("kernel.epoch.1"), CellId("cell.test"), 16U});
 
   const auto first = kernel.execute(motion_operation("request.concurrent-control.first"));
   ASSERT_TRUE(first.ok()) << first.error().message;
@@ -3443,12 +3526,13 @@ TEST(ResourceAddressedExecutionKernelTest, BlockedControlOnOneOperationCannotDel
 TEST(ResourceAddressedExecutionKernelTest,
      AcceptedStopRetainsTerminalAuthorityOverLateNaturalCompletion) {
   FakeClock clock;
+  ManualScheduler scheduler;
   FakeParticipantEngine engine;
   ResourceAddressedExecutionKernel kernel(
       {registration(
           make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular),
           engine)},
-      clock, default_journal, {RequestOwnerEpoch("kernel.epoch.1"), CellId("cell.test"), 8U});
+      clock, scheduler, default_journal, {RequestOwnerEpoch("kernel.epoch.1"), CellId("cell.test"), 8U});
   const auto operation = kernel.execute(motion_operation("request.stop-terminal-owner"));
   ASSERT_TRUE(operation.ok()) << operation.error().message;
   engine.emit_transition(ExecutionState::kPlanning, ExecutionState::kExecuting);
@@ -3488,13 +3572,14 @@ TEST(ResourceAddressedExecutionKernelTest,
 
 TEST(ResourceAddressedExecutionKernelTest, UsesOneInjectedGateForTheActualSlotTableReservation) {
   FakeClock clock;
+  ManualScheduler scheduler;
   FakeParticipantEngine engine;
   FakeResourceAdmissionGate gate;
   ResourceAddressedExecutionKernel kernel(
       {registration(
           make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular),
           engine)},
-      clock, default_journal,
+      clock, scheduler, default_journal,
       ResourceAddressedExecutionKernelConfig{
           RequestOwnerEpoch("kernel.epoch.1"), CellId("cell.test"), 8U, {}, &gate});
 
@@ -3529,12 +3614,13 @@ TEST(ResourceAddressedExecutionKernelTest, UsesOneInjectedGateForTheActualSlotTa
 TEST(ResourceAddressedExecutionKernelTest,
      StagesUnreadyCandidateConfigurationFactsOnlyUnderTheInjectedApplyFence) {
   FakeClock clock;
+  ManualScheduler scheduler;
   FakeParticipantEngine engine;
   FakeResourceAdmissionGate gate;
   const auto binding =
       make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular);
   ResourceAddressedExecutionKernel kernel(
-      {unqualified_registration(binding, engine)}, clock, default_journal,
+      {unqualified_registration(binding, engine)}, clock, scheduler, default_journal,
       ResourceAddressedExecutionKernelConfig{
           RequestOwnerEpoch("kernel.epoch.1"), CellId("cell.test"), 8U, {}, &gate});
   const auto& path = *binding.value().control_path;
@@ -3572,6 +3658,7 @@ TEST(ResourceAddressedExecutionKernelTest,
 TEST(ResourceAddressedExecutionKernelTest,
      ProductBackedResolverAdmitsAnExactProgramBindingOnPinnedPhysicalEngine) {
   FakeClock clock;
+  ManualScheduler scheduler;
   clock.set(1234);
   FakeParticipantEngine engine;
   const auto physical =
@@ -3589,7 +3676,7 @@ TEST(ResourceAddressedExecutionKernelTest,
   intent.program_binding_id = ProgramBindingId(test_digest('5'));
   std::size_t resolver_calls = 0U;
   ResourceAddressedExecutionKernel kernel(
-      {registration(physical, engine)}, clock, default_journal,
+      {registration(physical, engine)}, clock, scheduler, default_journal,
       ResourceAddressedExecutionKernelConfig{
           RequestOwnerEpoch("kernel.epoch.1"), CellId("cell.test"), 8U,
           [&](const OperationIntentDTO&,
@@ -3611,6 +3698,7 @@ TEST(ResourceAddressedExecutionKernelTest,
 TEST(ResourceAddressedExecutionKernelTest,
      ResolvesProgramContactGraspAndSelectedRuntimeObjectBeforeSubordinateCall) {
   FakeClock clock;
+  ManualScheduler scheduler;
   FakeParticipantEngine engine;
   ResourceAddressedExecutionKernel kernel(
       {registration(
@@ -3619,7 +3707,7 @@ TEST(ResourceAddressedExecutionKernelTest,
                        "sha256:0f6cb2fda7e1d05f20a5867203b84c0e0427440f4b11657941a907c2e2a23dce",
                        true),
           engine)},
-      clock, default_journal, {RequestOwnerEpoch("kernel.epoch.1"), CellId("cell.test"), 8U});
+      clock, scheduler, default_journal, {RequestOwnerEpoch("kernel.epoch.1"), CellId("cell.test"), 8U});
   auto intent = motion_operation();
   auto& motion = std::get<MotionParticipantIntentDTO>(intent.participants.front().payload);
   motion.contact_policy_id = ContactPolicyId("selected_object_grasp");
@@ -3641,6 +3729,7 @@ TEST(ResourceAddressedExecutionKernelTest,
 TEST(ResourceAddressedExecutionKernelTest,
      PreviewSessionUsesTheExecutionBuilderWithoutDispatchOrJournalEffects) {
   FakeClock clock;
+  ManualScheduler scheduler;
   clock.set(1234);
   FakeParticipantEngine engine;
   FakeOperationJournal journal;
@@ -3651,7 +3740,7 @@ TEST(ResourceAddressedExecutionKernelTest,
                        "sha256:0f6cb2fda7e1d05f20a5867203b84c0e0427440f4b11657941a907c2e2a23dce",
                        true),
           engine)},
-      clock, journal, {RequestOwnerEpoch("kernel.epoch.1"), CellId("cell.test"), 8U});
+      clock, scheduler, journal, {RequestOwnerEpoch("kernel.epoch.1"), CellId("cell.test"), 8U});
   auto intent = motion_operation("request.preview.1");
   auto& motion = std::get<MotionParticipantIntentDTO>(intent.participants.front().payload);
   motion.contact_policy_id = ContactPolicyId("selected_object_grasp");
@@ -3676,6 +3765,7 @@ TEST(ResourceAddressedExecutionKernelTest,
 TEST(ResourceAddressedExecutionKernelTest,
      PreviewSessionAllowsMotionSpecificPlannerProvidersOnOnePinnedParticipant) {
   FakeClock clock;
+  ManualScheduler scheduler;
   FakeParticipantEngine engine;
   FakeOperationJournal journal;
   const auto physical =
@@ -3683,7 +3773,7 @@ TEST(ResourceAddressedExecutionKernelTest,
   const auto pose = with_planner_capability(physical, "planning.motion.pose_goal");
   const auto cartesian = with_planner_capability(physical, "planning.motion.cartesian_path");
   ResourceAddressedExecutionKernel kernel(
-      {registration(pose, engine)}, clock, journal,
+      {registration(pose, engine)}, clock, scheduler, journal,
       ResourceAddressedExecutionKernelConfig{
           RequestOwnerEpoch("kernel.epoch.1"), CellId("cell.test"), 8U,
           [&](const OperationIntentDTO& operation,
@@ -3719,6 +3809,7 @@ TEST(ResourceAddressedExecutionKernelTest,
 TEST(ResourceAddressedExecutionKernelTest,
      PreviewSessionRejectsAPlannerResolutionThatChangesThePinnedEngine) {
   FakeClock clock;
+  ManualScheduler scheduler;
   FakeParticipantEngine primary_engine;
   FakeParticipantEngine other_engine;
   FakeOperationJournal journal;
@@ -3732,7 +3823,7 @@ TEST(ResourceAddressedExecutionKernelTest,
                        CommandSchemaId(std::string(kGripperPositionCommandSchemaId)),
                        CommandSchemaRevision(std::string(kGripperPositionCommandSchemaRevision))});
   ResourceAddressedExecutionKernel kernel(
-      {registration(pose, primary_engine), registration(unrelated, other_engine)}, clock, journal,
+      {registration(pose, primary_engine), registration(unrelated, other_engine)}, clock, scheduler, journal,
       ResourceAddressedExecutionKernelConfig{
           RequestOwnerEpoch("kernel.epoch.1"), CellId("cell.test"), 8U,
           [&](const OperationIntentDTO& operation,
@@ -3768,13 +3859,14 @@ TEST(ResourceAddressedExecutionKernelTest,
 TEST(ResourceAddressedExecutionKernelTest,
      PreviewSessionRejectsAStaleOwnerBeforePrivateResolution) {
   FakeClock clock;
+  ManualScheduler scheduler;
   FakeParticipantEngine engine;
   FakeOperationJournal journal;
   ResourceAddressedExecutionKernel kernel(
       {registration(
           make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular),
           engine)},
-      clock, journal, {RequestOwnerEpoch("kernel.epoch.1"), CellId("cell.test"), 8U});
+      clock, scheduler, journal, {RequestOwnerEpoch("kernel.epoch.1"), CellId("cell.test"), 8U});
   auto intent = motion_operation("request.preview.stale");
   intent.request_context.request_owner_epoch = RequestOwnerEpoch("kernel.epoch.old");
 
@@ -3789,6 +3881,7 @@ TEST(ResourceAddressedExecutionKernelTest,
 TEST(ResourceAddressedExecutionKernelTest,
      RejectsProgramContactGraspWithoutItsRuntimeObjectBeforeEffect) {
   FakeClock clock;
+  ManualScheduler scheduler;
   FakeParticipantEngine engine;
   ResourceAddressedExecutionKernel kernel(
       {registration(
@@ -3797,7 +3890,7 @@ TEST(ResourceAddressedExecutionKernelTest,
                        "sha256:0f6cb2fda7e1d05f20a5867203b84c0e0427440f4b11657941a907c2e2a23dce",
                        true),
           engine)},
-      clock, default_journal, {RequestOwnerEpoch("kernel.epoch.1"), CellId("cell.test"), 8U});
+      clock, scheduler, default_journal, {RequestOwnerEpoch("kernel.epoch.1"), CellId("cell.test"), 8U});
   auto intent = motion_operation();
   std::get<MotionParticipantIntentDTO>(intent.participants.front().payload).contact_policy_id =
       ContactPolicyId("selected_object_grasp");
@@ -3810,12 +3903,13 @@ TEST(ResourceAddressedExecutionKernelTest,
 
 TEST(ResourceAddressedExecutionKernelTest, RejectsResourceRoleSpellingUsedAsASourceJointName) {
   FakeClock clock;
+  ManualScheduler scheduler;
   FakeParticipantEngine engine;
   ResourceAddressedExecutionKernel kernel(
       {registration(
           make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular),
           engine)},
-      clock, default_journal, {RequestOwnerEpoch("kernel.epoch.1"), CellId("cell.test"), 8U});
+      clock, scheduler, default_journal, {RequestOwnerEpoch("kernel.epoch.1"), CellId("cell.test"), 8U});
   auto intent = motion_operation();
   auto& motion = std::get<MotionParticipantIntentDTO>(intent.participants.front().payload);
   std::get<JointGoalDTO>(motion.motion).joint_names = {"arm_joints"};
@@ -3828,6 +3922,7 @@ TEST(ResourceAddressedExecutionKernelTest, RejectsResourceRoleSpellingUsedAsASou
 
 TEST(ResourceAddressedExecutionKernelTest, RejectsStalePlannerCapabilityRevision) {
   FakeClock clock;
+  ManualScheduler scheduler;
   FakeParticipantEngine engine;
   ResourceAddressedExecutionKernel kernel(
       {registration(
@@ -3835,7 +3930,7 @@ TEST(ResourceAddressedExecutionKernelTest, RejectsStalePlannerCapabilityRevision
                        std::nullopt, false,
                        "sha256:1111111111111111111111111111111111111111111111111111111111111111"),
           engine)},
-      clock, default_journal, {RequestOwnerEpoch("kernel.epoch.1"), CellId("cell.test"), 8U});
+      clock, scheduler, default_journal, {RequestOwnerEpoch("kernel.epoch.1"), CellId("cell.test"), 8U});
 
   const auto result = kernel.execute(motion_operation());
   ASSERT_FALSE(result.ok());
@@ -3845,12 +3940,13 @@ TEST(ResourceAddressedExecutionKernelTest, RejectsStalePlannerCapabilityRevision
 
 TEST(ResourceAddressedExecutionKernelTest, PreservesAuthoredSourceJointOrderingDuringResolution) {
   FakeClock clock;
+  ManualScheduler scheduler;
   FakeParticipantEngine engine;
   ResourceAddressedExecutionKernel kernel(
       {registration(make_binding("arm", "arm", "execution.trajectory.execute",
                                  CoordinateKind::kAngular, std::nullopt, true),
                     engine)},
-      clock, default_journal, {RequestOwnerEpoch("kernel.epoch.1"), CellId("cell.test"), 8U});
+      clock, scheduler, default_journal, {RequestOwnerEpoch("kernel.epoch.1"), CellId("cell.test"), 8U});
   auto intent = motion_operation();
   auto& motion = std::get<MotionParticipantIntentDTO>(intent.participants.front().payload);
   motion.motion = JointGoalDTO{{"joint_2", "joint_1"}, {0.4, -0.2}};
@@ -3872,12 +3968,13 @@ TEST(ResourceAddressedExecutionKernelTest, PreservesAuthoredSourceJointOrderingD
 TEST(ResourceAddressedExecutionKernelTest,
      ResolvesAValidSourceJointSubsetWithoutRoleCardinalityCoupling) {
   FakeClock clock;
+  ManualScheduler scheduler;
   FakeParticipantEngine engine;
   ResourceAddressedExecutionKernel kernel(
       {registration(make_binding("arm", "arm", "execution.trajectory.execute",
                                  CoordinateKind::kAngular, std::nullopt, true),
                     engine)},
-      clock, default_journal, {RequestOwnerEpoch("kernel.epoch.1"), CellId("cell.test"), 8U});
+      clock, scheduler, default_journal, {RequestOwnerEpoch("kernel.epoch.1"), CellId("cell.test"), 8U});
   auto intent = motion_operation();
   auto& motion = std::get<MotionParticipantIntentDTO>(intent.participants.front().payload);
   motion.motion = JointGoalDTO{{"joint_2"}, {0.4}};
@@ -3895,12 +3992,13 @@ TEST(ResourceAddressedExecutionKernelTest,
 TEST(ResourceAddressedExecutionKernelTest,
      ExactReplayDoesNotRepeatSubordinateExecutionAndConflictFails) {
   FakeClock clock;
+  ManualScheduler scheduler;
   FakeParticipantEngine engine;
   ResourceAddressedExecutionKernel kernel(
       {registration(
           make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular),
           engine)},
-      clock, default_journal, {RequestOwnerEpoch("kernel.epoch.1"), CellId("cell.test"), 8U});
+      clock, scheduler, default_journal, {RequestOwnerEpoch("kernel.epoch.1"), CellId("cell.test"), 8U});
   const auto intent = motion_operation();
 
   const auto first = kernel.execute(intent);
@@ -3923,12 +4021,13 @@ TEST(ResourceAddressedExecutionKernelTest,
 
 TEST(ResourceAddressedExecutionKernelTest, SubordinateEventsAdvanceExactSlotsAndOperationState) {
   FakeClock clock;
+  ManualScheduler scheduler;
   FakeParticipantEngine engine;
   ResourceAddressedExecutionKernel kernel(
       {registration(
           make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular),
           engine)},
-      clock, default_journal, {RequestOwnerEpoch("kernel.epoch.1"), CellId("cell.test"), 8U});
+      clock, scheduler, default_journal, {RequestOwnerEpoch("kernel.epoch.1"), CellId("cell.test"), 8U});
   const auto accepted = kernel.execute(motion_operation());
   ASSERT_TRUE(accepted.ok()) << accepted.error().message;
 
@@ -3958,12 +4057,13 @@ TEST(ResourceAddressedExecutionKernelTest, SubordinateEventsAdvanceExactSlotsAnd
 TEST(ResourceAddressedExecutionKernelTest,
      PreservesTheExactErrorRaisedBeforeASeparateTerminalTransition) {
   FakeClock clock;
+  ManualScheduler scheduler;
   FakeParticipantEngine engine;
   ResourceAddressedExecutionKernel kernel(
       {registration(
           make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular),
           engine)},
-      clock, default_journal, {RequestOwnerEpoch("kernel.epoch.1"), CellId("cell.test"), 8U});
+      clock, scheduler, default_journal, {RequestOwnerEpoch("kernel.epoch.1"), CellId("cell.test"), 8U});
   const auto accepted = kernel.execute(motion_operation());
   ASSERT_TRUE(accepted.ok()) << accepted.error().message;
 
@@ -3980,12 +4080,13 @@ TEST(ResourceAddressedExecutionKernelTest,
 TEST(ResourceAddressedExecutionKernelTest,
      DoesNotAttachARecoveredSubordinateErrorToSuccessfulCompletion) {
   FakeClock clock;
+  ManualScheduler scheduler;
   FakeParticipantEngine engine;
   ResourceAddressedExecutionKernel kernel(
       {registration(
           make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular),
           engine)},
-      clock, default_journal, {RequestOwnerEpoch("kernel.epoch.1"), CellId("cell.test"), 8U});
+      clock, scheduler, default_journal, {RequestOwnerEpoch("kernel.epoch.1"), CellId("cell.test"), 8U});
   const auto accepted = kernel.execute(motion_operation());
   ASSERT_TRUE(accepted.ok()) << accepted.error().message;
 
@@ -4001,12 +4102,13 @@ TEST(ResourceAddressedExecutionKernelTest,
 
 TEST(ResourceAddressedExecutionKernelTest, RejectsStaleEpochBeforeResolutionOrSubordinateEffect) {
   FakeClock clock;
+  ManualScheduler scheduler;
   FakeParticipantEngine engine;
   ResourceAddressedExecutionKernel kernel(
       {registration(
           make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular),
           engine)},
-      clock, default_journal, {RequestOwnerEpoch("kernel.epoch.1"), CellId("cell.test"), 8U});
+      clock, scheduler, default_journal, {RequestOwnerEpoch("kernel.epoch.1"), CellId("cell.test"), 8U});
   auto intent = motion_operation();
   intent.request_context.request_owner_epoch = RequestOwnerEpoch("kernel.epoch.old");
 
@@ -4020,6 +4122,7 @@ TEST(ResourceAddressedExecutionKernelTest, RejectsStaleEpochBeforeResolutionOrSu
 TEST(ResourceAddressedExecutionKernelTest,
      LinearGripperCommandUsesResolvedTargetAndReconcilesCompletion) {
   FakeClock clock;
+  ManualScheduler scheduler;
   FakeParticipantEngine engine;
   const ProgramCommandSchemaRefDTO schema{
       CommandSchemaId(std::string(kGripperPositionCommandSchemaId)),
@@ -4028,7 +4131,7 @@ TEST(ResourceAddressedExecutionKernelTest,
       {registration(make_binding("gripper", "gripper.target", "tool.gripper.command",
                                  CoordinateKind::kLinear, schema),
                     engine)},
-      clock, default_journal, {RequestOwnerEpoch("kernel.epoch.1"), CellId("cell.test"), 8U});
+      clock, scheduler, default_journal, {RequestOwnerEpoch("kernel.epoch.1"), CellId("cell.test"), 8U});
 
   const auto accepted = kernel.execute(command_operation());
   ASSERT_TRUE(accepted.ok()) << accepted.error().message;
@@ -4070,6 +4173,7 @@ TEST(ResourceAddressedExecutionKernelTest,
 TEST(ResourceAddressedExecutionKernelTest,
      ReconciliationSkipsCapabilityCommandWhilePreparedDispatchEffectIsInFlight) {
   FakeClock clock;
+  ManualScheduler scheduler;
   FakeParticipantEngine engine;
   engine.gripper_status.state = GripperCommandState::kIdle;
   std::promise<void> dispatch_entered;
@@ -4086,7 +4190,7 @@ TEST(ResourceAddressedExecutionKernelTest,
       {registration(make_binding("gripper", "gripper.target", "tool.gripper.command",
                                  CoordinateKind::kLinear, schema),
                     engine)},
-      clock, default_journal, {RequestOwnerEpoch("kernel.epoch.1"), CellId("cell.test"), 8U});
+      clock, scheduler, default_journal, {RequestOwnerEpoch("kernel.epoch.1"), CellId("cell.test"), 8U});
 
   auto executing =
       std::async(std::launch::async, [&] { return kernel.execute(command_operation()); });
@@ -4126,6 +4230,7 @@ TEST(ResourceAddressedExecutionKernelTest,
 TEST(ResourceAddressedExecutionKernelTest,
      StopDuringCapabilityCommandPrepareCancelsWithoutDispatchOrStopStage) {
   FakeClock clock;
+  ManualScheduler scheduler;
   FakeParticipantEngine engine;
   const ProgramCommandSchemaRefDTO schema{
       CommandSchemaId(std::string(kGripperPositionCommandSchemaId)),
@@ -4141,7 +4246,7 @@ TEST(ResourceAddressedExecutionKernelTest,
       {registration(make_binding("gripper", "gripper.target", "tool.gripper.command",
                                  CoordinateKind::kLinear, schema),
                     engine)},
-      clock, default_journal, {RequestOwnerEpoch("kernel.epoch.1"), CellId("cell.test"), 8U});
+      clock, scheduler, default_journal, {RequestOwnerEpoch("kernel.epoch.1"), CellId("cell.test"), 8U});
 
   auto executing =
       std::async(std::launch::async, [&] { return kernel.execute(command_operation()); });
@@ -4182,6 +4287,7 @@ TEST(ResourceAddressedExecutionKernelTest,
 TEST(ResourceAddressedExecutionKernelTest,
      CapabilityCommandPreviewValidatesWithoutReservationJournalOrDispatch) {
   FakeClock clock;
+  ManualScheduler scheduler;
   FakeParticipantEngine engine;
   engine.gripper_status.state = GripperCommandState::kIdle;
   const ProgramCommandSchemaRefDTO schema{
@@ -4192,7 +4298,7 @@ TEST(ResourceAddressedExecutionKernelTest,
       {registration(make_binding("gripper", "gripper.target", "tool.gripper.command",
                                  CoordinateKind::kLinear, schema),
                     engine)},
-      clock, journal, {RequestOwnerEpoch("kernel.epoch.1"), CellId("cell.test"), 8U});
+      clock, scheduler, journal, {RequestOwnerEpoch("kernel.epoch.1"), CellId("cell.test"), 8U});
 
   const auto preview = kernel.preview_capability_command(command_operation());
   ASSERT_TRUE(preview.ok()) << preview.error().message;
@@ -4209,6 +4315,7 @@ TEST(ResourceAddressedExecutionKernelTest,
 
 TEST(ResourceAddressedExecutionKernelTest, CapabilityCommandPreviewRejectsBusyTargetWithoutEffect) {
   FakeClock clock;
+  ManualScheduler scheduler;
   FakeParticipantEngine engine;
   const ProgramCommandSchemaRefDTO schema{
       CommandSchemaId(std::string(kGripperPositionCommandSchemaId)),
@@ -4218,7 +4325,7 @@ TEST(ResourceAddressedExecutionKernelTest, CapabilityCommandPreviewRejectsBusyTa
       {registration(make_binding("gripper", "gripper.target", "tool.gripper.command",
                                  CoordinateKind::kLinear, schema),
                     engine)},
-      clock, journal, {RequestOwnerEpoch("kernel.epoch.1"), CellId("cell.test"), 8U});
+      clock, scheduler, journal, {RequestOwnerEpoch("kernel.epoch.1"), CellId("cell.test"), 8U});
 
   const auto preview = kernel.preview_capability_command(command_operation());
   ASSERT_FALSE(preview.ok());
@@ -4232,6 +4339,7 @@ TEST(ResourceAddressedExecutionKernelTest, CapabilityCommandPreviewRejectsBusyTa
 TEST(ResourceAddressedExecutionKernelTest,
      GripperValidationPrecedesAcceptanceAndScopedStopResetUseCommandLifecycle) {
   FakeClock clock;
+  ManualScheduler scheduler;
   const ProgramCommandSchemaRefDTO schema{
       CommandSchemaId(std::string(kGripperPositionCommandSchemaId)),
       CommandSchemaRevision(std::string(kGripperPositionCommandSchemaRevision))};
@@ -4244,7 +4352,7 @@ TEST(ResourceAddressedExecutionKernelTest,
       {registration(make_binding("gripper", "gripper.target", "tool.gripper.command",
                                  CoordinateKind::kLinear, schema),
                     rejected_engine)},
-      clock, rejected_journal, {RequestOwnerEpoch("kernel.epoch.1"), CellId("cell.test"), 8U});
+      clock, scheduler, rejected_journal, {RequestOwnerEpoch("kernel.epoch.1"), CellId("cell.test"), 8U});
   const auto rejected = rejected_kernel.execute(command_operation());
   ASSERT_FALSE(rejected.ok());
   EXPECT_EQ(rejected.error().code, "gripper_position_limit_violation");
@@ -4259,7 +4367,7 @@ TEST(ResourceAddressedExecutionKernelTest,
       {registration(make_binding("gripper", "gripper.target", "tool.gripper.command",
                                  CoordinateKind::kLinear, schema),
                     engine)},
-      clock, journal, {RequestOwnerEpoch("kernel.epoch.1"), CellId("cell.test"), 16U});
+      clock, scheduler, journal, {RequestOwnerEpoch("kernel.epoch.1"), CellId("cell.test"), 16U});
   const auto accepted = kernel.execute(command_operation());
   ASSERT_TRUE(accepted.ok()) << accepted.error().message;
 
@@ -4293,14 +4401,78 @@ TEST(ResourceAddressedExecutionKernelTest,
 }
 
 TEST(ResourceAddressedExecutionKernelTest,
-     OperationControlsAdvanceRevisionAndAcknowledgeReleasesResources) {
+     OperationProjectionReportsResidencyUntilAcknowledgementEffectsFinish) {
+  using namespace std::chrono_literals;
+
   FakeClock clock;
+  ManualScheduler scheduler;
   FakeParticipantEngine engine;
   ResourceAddressedExecutionKernel kernel(
       {registration(
           make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular),
           engine)},
-      clock, default_journal, {RequestOwnerEpoch("kernel.epoch.1"), CellId("cell.test"), 16U});
+      clock, scheduler, default_journal,
+      {RequestOwnerEpoch("kernel.epoch.1"), CellId("cell.test"), 16U});
+  const auto executed = kernel.execute(motion_operation("request.settlement.first"));
+  ASSERT_TRUE(executed.ok()) << executed.error().message;
+  engine.emit_transition(ExecutionState::kPlanning, ExecutionState::kCompleted);
+
+  std::promise<void> acknowledgement_entered_promise;
+  auto acknowledgement_entered = acknowledgement_entered_promise.get_future();
+  std::promise<void> release_acknowledgement_promise;
+  auto release_acknowledgement = release_acknowledgement_promise.get_future().share();
+  engine.acknowledge_effect_hook = [&] {
+    acknowledgement_entered_promise.set_value();
+    release_acknowledgement.wait();
+  };
+
+  const auto acknowledged =
+      kernel.acknowledge_completed(control_request("request.settlement.ack", executed.value(), 1U));
+  if (!acknowledged.ok()) {
+    release_acknowledgement_promise.set_value();
+    FAIL() << acknowledged.error().message;
+  }
+  if (acknowledgement_entered.wait_for(1s) != std::future_status::ready) {
+    release_acknowledgement_promise.set_value();
+    FAIL() << "the injected acknowledgement effect did not start";
+  }
+
+  const auto resident = kernel.get_operation_projection(executed.value().operation_id);
+  const auto overlapping = kernel.execute(motion_operation("request.settlement.too-early"));
+  release_acknowledgement_promise.set_value();
+
+  ASSERT_TRUE(resident.ok()) << resident.error().message;
+  EXPECT_TRUE(resident.value().resident);
+  ASSERT_FALSE(overlapping.ok());
+  EXPECT_EQ(overlapping.error().details.at("reason"), "participant_engine_busy");
+  ASSERT_TRUE(wait_until([&] {
+    const auto projection = kernel.get_operation_projection(executed.value().operation_id);
+    return projection.ok() && !projection.value().resident;
+  }));
+  const auto historical = kernel.get_operation_projection(executed.value().operation_id);
+  ASSERT_TRUE(historical.ok()) << historical.error().message;
+  EXPECT_FALSE(historical.value().resident);
+  EXPECT_EQ(historical.value().operation.state, OperationStateKind::kCompleted);
+  EXPECT_EQ(historical.value().operation.operation_revision,
+            acknowledged.value().operation_revision_after_acceptance);
+
+  engine.next_execution_id = 42U;
+  engine.next_execute_result = Result<std::uint64_t>::Ok(42U);
+  const auto next = kernel.execute(motion_operation("request.settlement.next"));
+  ASSERT_TRUE(next.ok()) << next.error().message;
+}
+
+TEST(ResourceAddressedExecutionKernelTest,
+     OperationControlsAdvanceRevisionAndAcknowledgeReleasesResources) {
+  FakeClock clock;
+  ManualScheduler scheduler;
+  FakeParticipantEngine engine;
+  ResourceAddressedExecutionKernel kernel(
+      {registration(
+          make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular),
+          engine)},
+      clock, scheduler, default_journal,
+      {RequestOwnerEpoch("kernel.epoch.1"), CellId("cell.test"), 16U});
   const auto executed = kernel.execute(motion_operation());
   ASSERT_TRUE(executed.ok()) << executed.error().message;
   engine.emit_transition(ExecutionState::kValidating, ExecutionState::kExecuting);
@@ -4371,12 +4543,13 @@ TEST(ResourceAddressedExecutionKernelTest,
 TEST(ResourceAddressedExecutionKernelTest,
      ResetSettlesFailedOperationAndRejectsStaleRevisionWithoutEffect) {
   FakeClock clock;
+  ManualScheduler scheduler;
   FakeParticipantEngine engine;
   ResourceAddressedExecutionKernel kernel(
       {registration(
           make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular),
           engine)},
-      clock, default_journal, {RequestOwnerEpoch("kernel.epoch.1"), CellId("cell.test"), 16U});
+      clock, scheduler, default_journal, {RequestOwnerEpoch("kernel.epoch.1"), CellId("cell.test"), 16U});
   const auto executed = kernel.execute(motion_operation());
   ASSERT_TRUE(executed.ok()) << executed.error().message;
   engine.emit_transition(ExecutionState::kPlanning, ExecutionState::kFailed,
@@ -4399,12 +4572,13 @@ TEST(ResourceAddressedExecutionKernelTest,
 TEST(ResourceAddressedExecutionKernelTest,
      StopDuringPreparedResumeCancelsTheNewGoalAndContainsThePriorPausedGoal) {
   FakeClock clock;
+  ManualScheduler scheduler;
   FakeParticipantEngine engine;
   ResourceAddressedExecutionKernel kernel(
       {registration(
           make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular),
           engine)},
-      clock, default_journal, {RequestOwnerEpoch("kernel.epoch.1"), CellId("cell.test"), 16U});
+      clock, scheduler, default_journal, {RequestOwnerEpoch("kernel.epoch.1"), CellId("cell.test"), 16U});
   const auto executed = kernel.execute(motion_operation("request.resume.stop.execute"));
   ASSERT_TRUE(executed.ok()) << executed.error().message;
   engine.emit_transition(ExecutionState::kValidating, ExecutionState::kExecuting);
@@ -4483,12 +4657,13 @@ TEST(ResourceAddressedExecutionKernelTest,
 TEST(ResourceAddressedExecutionKernelTest,
      ResetOfExecutingMotionUsesOneScopedStopThenCertifiedLocalRetirement) {
   FakeClock clock;
+  ManualScheduler scheduler;
   FakeParticipantEngine engine;
   ResourceAddressedExecutionKernel kernel(
       {registration(
           make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular),
           engine)},
-      clock, default_journal, {RequestOwnerEpoch("kernel.epoch.1"), CellId("cell.test"), 16U});
+      clock, scheduler, default_journal, {RequestOwnerEpoch("kernel.epoch.1"), CellId("cell.test"), 16U});
   const auto executed = kernel.execute(motion_operation("request.reset.executing"));
   ASSERT_TRUE(executed.ok()) << executed.error().message;
   engine.emit_transition(ExecutionState::kValidating, ExecutionState::kExecuting);
@@ -4514,12 +4689,13 @@ TEST(ResourceAddressedExecutionKernelTest,
 TEST(ResourceAddressedExecutionKernelTest,
      PreparedResumeFailureTriggersOneScopedContainmentWithoutLegacyResume) {
   FakeClock clock;
+  ManualScheduler scheduler;
   FakeParticipantEngine engine;
   ResourceAddressedExecutionKernel kernel(
       {registration(
           make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular),
           engine)},
-      clock, default_journal, {RequestOwnerEpoch("kernel.epoch.1"), CellId("cell.test"), 16U});
+      clock, scheduler, default_journal, {RequestOwnerEpoch("kernel.epoch.1"), CellId("cell.test"), 16U});
   const auto executed = kernel.execute(motion_operation("request.resume.failure.execute"));
   ASSERT_TRUE(executed.ok()) << executed.error().message;
   engine.emit_transition(ExecutionState::kValidating, ExecutionState::kExecuting);
@@ -4566,6 +4742,7 @@ TEST(ResourceAddressedExecutionKernelTest,
 TEST(ResourceAddressedExecutionKernelTest,
      PartialPreparedResumeDispatchContainsReleasedGoalsAndCancelsTheRemainder) {
   FakeClock clock;
+  ManualScheduler scheduler;
   FakeParticipantEngine first_engine;
   FakeParticipantEngine second_engine;
   FakeParticipantEngine third_engine;
@@ -4580,7 +4757,7 @@ TEST(ResourceAddressedExecutionKernelTest,
   ResourceAddressedExecutionKernel kernel(
       {registration(first, first_engine), registration(second, second_engine),
        registration(third, third_engine)},
-      clock, default_journal, {RequestOwnerEpoch("kernel.epoch.1"), CellId("cell.test"), 24U});
+      clock, scheduler, default_journal, {RequestOwnerEpoch("kernel.epoch.1"), CellId("cell.test"), 24U});
   const auto executed =
       kernel.execute(coordinated_motion_operation("request.resume.partial.execute", 3U));
   ASSERT_TRUE(executed.ok()) << executed.error().message;
@@ -4646,12 +4823,13 @@ TEST(ResourceAddressedExecutionKernelTest,
 TEST(ResourceAddressedExecutionKernelTest,
      PreparedResumeInvalidDispatchHandleEventTriggersScopedContainment) {
   FakeClock clock;
+  ManualScheduler scheduler;
   FakeParticipantEngine engine;
   ResourceAddressedExecutionKernel kernel(
       {registration(
           make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular),
           engine)},
-      clock, default_journal, {RequestOwnerEpoch("kernel.epoch.1"), CellId("cell.test"), 16U});
+      clock, scheduler, default_journal, {RequestOwnerEpoch("kernel.epoch.1"), CellId("cell.test"), 16U});
   const auto executed = kernel.execute(motion_operation("request.resume.handle.execute"));
   ASSERT_TRUE(executed.ok()) << executed.error().message;
   engine.emit_transition(ExecutionState::kValidating, ExecutionState::kExecuting);
@@ -4698,6 +4876,7 @@ TEST(ResourceAddressedExecutionKernelTest,
 TEST(ResourceAddressedExecutionKernelTest,
      CoordinatedPauseResumeAndStopRetainOneAtomicOwnerRevision) {
   FakeClock clock;
+  ManualScheduler scheduler;
   FakeParticipantEngine first_engine;
   FakeParticipantEngine second_engine;
   std::atomic<int> pause_returns{};
@@ -4710,7 +4889,7 @@ TEST(ResourceAddressedExecutionKernelTest,
       make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular);
   const auto second = coordinated_occurrence(first, "2");
   ResourceAddressedExecutionKernel kernel(
-      {registration(first, first_engine), registration(second, second_engine)}, clock,
+      {registration(first, first_engine), registration(second, second_engine)}, clock, scheduler,
       default_journal, {RequestOwnerEpoch("kernel.epoch.1"), CellId("cell.test"), 16U});
 
   const auto executed =
@@ -4783,6 +4962,7 @@ TEST(ResourceAddressedExecutionKernelTest,
 TEST(ResourceAddressedExecutionKernelTest,
      CoordinatedPauseFailureContainsEveryLiveParticipantAndPreservesFailureTruth) {
   FakeClock clock;
+  ManualScheduler scheduler;
   FakeParticipantEngine first_engine;
   FakeParticipantEngine second_engine;
   second_engine.next_pause_result =
@@ -4793,7 +4973,7 @@ TEST(ResourceAddressedExecutionKernelTest,
       make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular);
   const auto second = coordinated_occurrence(first, "2");
   ResourceAddressedExecutionKernel kernel(
-      {registration(first, first_engine), registration(second, second_engine)}, clock,
+      {registration(first, first_engine), registration(second, second_engine)}, clock, scheduler,
       default_journal, {RequestOwnerEpoch("kernel.epoch.1"), CellId("cell.test"), 16U});
 
   const auto executed =
@@ -4830,13 +5010,14 @@ TEST(ResourceAddressedExecutionKernelTest,
 TEST(ResourceAddressedExecutionKernelTest,
      CoordinatedResetUsesOneStopEnvelopeThenRetiresEveryDispatchedParticipant) {
   FakeClock clock;
+  ManualScheduler scheduler;
   FakeParticipantEngine first_engine;
   FakeParticipantEngine second_engine;
   const auto first =
       make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular);
   const auto second = coordinated_occurrence(first, "2");
   ResourceAddressedExecutionKernel kernel(
-      {registration(first, first_engine), registration(second, second_engine)}, clock,
+      {registration(first, first_engine), registration(second, second_engine)}, clock, scheduler,
       default_journal, {RequestOwnerEpoch("kernel.epoch.1"), CellId("cell.test"), 16U});
 
   const auto executed =
@@ -4869,6 +5050,7 @@ TEST(ResourceAddressedExecutionKernelTest,
 TEST(ResourceAddressedExecutionKernelTest,
      MixedCompletedParticipantsAcknowledgeWithoutCommandBackendEffect) {
   FakeClock clock;
+  ManualScheduler scheduler;
   FakeParticipantEngine motion_engine;
   FakeParticipantEngine command_engine;
   const auto motion =
@@ -4880,7 +5062,7 @@ TEST(ResourceAddressedExecutionKernelTest,
                                            CoordinateKind::kLinear, schema);
   const auto command = coordinated_occurrence(command_source, "2");
   ResourceAddressedExecutionKernel kernel(
-      {registration(motion, motion_engine), registration(command, command_engine)}, clock,
+      {registration(motion, motion_engine), registration(command, command_engine)}, clock, scheduler,
       default_journal, {RequestOwnerEpoch("kernel.epoch.1"), CellId("cell.test"), 16U});
 
   const auto executed =
@@ -4913,6 +5095,7 @@ TEST(ResourceAddressedExecutionKernelTest,
 TEST(ResourceAddressedExecutionKernelTest,
      BlockedControlJournalCannotDelayOverlappingEmergencyStop) {
   FakeClock clock;
+  ManualScheduler scheduler;
   FakeParticipantEngine engine;
   FakeOperationJournal journal;
   std::promise<void> journal_entered;
@@ -4926,7 +5109,7 @@ TEST(ResourceAddressedExecutionKernelTest,
       {registration(
           make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular),
           engine)},
-      clock, journal, {RequestOwnerEpoch("kernel.epoch.1"), CellId("cell.test"), 16U});
+      clock, scheduler, journal, {RequestOwnerEpoch("kernel.epoch.1"), CellId("cell.test"), 16U});
   const auto executed = kernel.execute(motion_operation("request.control.blocked-journal"));
   ASSERT_TRUE(executed.ok()) << executed.error().message;
   engine.emit_transition(ExecutionState::kPlanning, ExecutionState::kExecuting);
@@ -4957,13 +5140,14 @@ TEST(ResourceAddressedExecutionKernelTest,
 TEST(ResourceAddressedExecutionKernelTest,
      MalformedOperationControlFailsBeforeJournalOrParticipantEffect) {
   FakeClock clock;
+  ManualScheduler scheduler;
   FakeParticipantEngine engine;
   FakeOperationJournal journal;
   ResourceAddressedExecutionKernel kernel(
       {registration(
           make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular),
           engine)},
-      clock, journal, {RequestOwnerEpoch("kernel.epoch.1"), CellId("cell.test"), 16U});
+      clock, scheduler, journal, {RequestOwnerEpoch("kernel.epoch.1"), CellId("cell.test"), 16U});
   const auto executed = kernel.execute(motion_operation("request.control.malformed"));
   ASSERT_TRUE(executed.ok()) << executed.error().message;
   engine.emit_transition(ExecutionState::kPlanning, ExecutionState::kExecuting);
@@ -4986,13 +5170,14 @@ TEST(ResourceAddressedExecutionKernelTest,
 TEST(ResourceAddressedExecutionKernelTest,
      InitializesScalingAtomicallyWithTheExactResolvedExecutionBinding) {
   FakeClock clock;
+  ManualScheduler scheduler;
   clock.set(1234);
   FakeParticipantEngine engine;
   ResourceAddressedExecutionKernel kernel(
       {registration(
           make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular),
           engine)},
-      clock, default_journal, {RequestOwnerEpoch("kernel.epoch.1"), CellId("cell.test"), 16U});
+      clock, scheduler, default_journal, {RequestOwnerEpoch("kernel.epoch.1"), CellId("cell.test"), 16U});
 
   const auto executed = kernel.execute(motion_operation());
   ASSERT_TRUE(executed.ok()) << executed.error().message;
@@ -5028,13 +5213,14 @@ TEST(ResourceAddressedExecutionKernelTest,
 TEST(ResourceAddressedExecutionKernelTest,
      RuntimeScaleIsGenerationFencedReplaySafeAndZeroIsNotStop) {
   FakeClock clock;
+  ManualScheduler scheduler;
   clock.set(10);
   FakeParticipantEngine engine;
   ResourceAddressedExecutionKernel kernel(
       {registration(
           make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular),
           engine)},
-      clock, default_journal, {RequestOwnerEpoch("kernel.epoch.1"), CellId("cell.test"), 32U});
+      clock, scheduler, default_journal, {RequestOwnerEpoch("kernel.epoch.1"), CellId("cell.test"), 32U});
   const auto executed = kernel.execute(motion_operation());
   ASSERT_TRUE(executed.ok()) << executed.error().message;
   engine.emit_transition(ExecutionState::kValidating, ExecutionState::kExecuting);
@@ -5090,6 +5276,7 @@ TEST(ResourceAddressedExecutionKernelTest,
 TEST(ResourceAddressedExecutionKernelTest,
      ScopedStopAdvancesOwnerAtomicallyAndNeverRepeatsItsEffect) {
   FakeClock clock;
+  ManualScheduler scheduler;
   clock.set(100);
   FakeParticipantEngine engine;
   std::promise<void> stage_entered_promise;
@@ -5104,7 +5291,7 @@ TEST(ResourceAddressedExecutionKernelTest,
       {registration(
           make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular),
           engine)},
-      clock, default_journal, {RequestOwnerEpoch("kernel.epoch.1"), CellId("cell.test"), 32U});
+      clock, scheduler, default_journal, {RequestOwnerEpoch("kernel.epoch.1"), CellId("cell.test"), 32U});
   const auto executed = kernel.execute(motion_operation());
   ASSERT_TRUE(executed.ok()) << executed.error().message;
   engine.emit_transition(ExecutionState::kValidating, ExecutionState::kExecuting);
@@ -5180,6 +5367,7 @@ TEST(ResourceAddressedExecutionKernelTest,
 TEST(ResourceAddressedExecutionKernelTest,
      AcceptedStopSurfacesSubordinateRejectionAsInterventionRequired) {
   FakeClock clock;
+  ManualScheduler scheduler;
   FakeParticipantEngine engine;
   engine.next_stop_result =
       StopResultDTO{false, ErrorDTO{std::string(to_string(ErrorCode::kExecutionRejected)),
@@ -5189,7 +5377,7 @@ TEST(ResourceAddressedExecutionKernelTest,
       {registration(
           make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular),
           engine)},
-      clock, default_journal, {RequestOwnerEpoch("kernel.epoch.1"), CellId("cell.test"), 16U});
+      clock, scheduler, default_journal, {RequestOwnerEpoch("kernel.epoch.1"), CellId("cell.test"), 16U});
   const auto executed = kernel.execute(motion_operation());
   ASSERT_TRUE(executed.ok()) << executed.error().message;
   engine.emit_transition(ExecutionState::kValidating, ExecutionState::kExecuting);
@@ -5220,6 +5408,7 @@ TEST(ResourceAddressedExecutionKernelTest,
 TEST(ResourceAddressedExecutionKernelTest,
      BlockedNominalStageCannotDelayPreparedStrongerStageWatchdog) {
   FakeClock clock;
+  ManualScheduler scheduler;
   FakeParticipantEngine engine;
   std::promise<void> nominal_entered_promise;
   auto nominal_entered = nominal_entered_promise.get_future();
@@ -5236,7 +5425,7 @@ TEST(ResourceAddressedExecutionKernelTest,
       {registration(
           make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular),
           engine)},
-      clock, default_journal, {RequestOwnerEpoch("kernel.epoch.1"), CellId("cell.test"), 8U});
+      clock, scheduler, default_journal, {RequestOwnerEpoch("kernel.epoch.1"), CellId("cell.test"), 8U});
   const auto operation = kernel.execute(motion_operation("request.blocked-stage.execute"));
   ASSERT_TRUE(operation.ok()) << operation.error().message;
   const auto stopped =
@@ -5272,6 +5461,7 @@ TEST(ResourceAddressedExecutionKernelTest,
 TEST(ResourceAddressedExecutionKernelTest,
      ConcurrentDisjointStopsMintUniqueMonotonicCellIdentities) {
   FakeClock clock;
+  ManualScheduler scheduler;
   clock.set(500);
   FakeParticipantEngine first_engine;
   FakeParticipantEngine second_engine;
@@ -5281,7 +5471,7 @@ TEST(ResourceAddressedExecutionKernelTest,
   const auto second_binding = second_same_type_occurrence(first_binding);
   ResourceAddressedExecutionKernel kernel(
       {registration(first_binding, first_engine), registration(second_binding, second_engine)},
-      clock, journal, {RequestOwnerEpoch("kernel.epoch.1"), CellId("cell.test"), 32U});
+      clock, scheduler, journal, {RequestOwnerEpoch("kernel.epoch.1"), CellId("cell.test"), 32U});
 
   const auto first = kernel.execute(motion_operation("request.concurrent-stop.first.execute"));
   ASSERT_TRUE(first.ok()) << first.error().message;
@@ -5316,6 +5506,7 @@ TEST(ResourceAddressedExecutionKernelTest,
 TEST(ResourceAddressedExecutionKernelTest,
      RecognizedMalformedIngressPromotesToFullAndProjectsExactAdapterTruth) {
   FakeClock clock;
+  ManualScheduler scheduler;
   clock.set(100);
   FakeParticipantEngine engine;
   FakeOperationJournal journal;
@@ -5323,7 +5514,7 @@ TEST(ResourceAddressedExecutionKernelTest,
       {registration(
           make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular),
           engine)},
-      clock, journal, {RequestOwnerEpoch("kernel.epoch.1"), CellId("cell.test"), 16U});
+      clock, scheduler, journal, {RequestOwnerEpoch("kernel.epoch.1"), CellId("cell.test"), 16U});
   const auto operation = kernel.execute(motion_operation("request.malformed-stop.execute"));
   ASSERT_TRUE(operation.ok()) << operation.error().message;
 
@@ -5362,6 +5553,7 @@ TEST(ResourceAddressedExecutionKernelTest,
 TEST(ResourceAddressedExecutionKernelTest,
      ExplicitFullAggregatesOneResidentStopAndFreshScopeWithoutRefenceOrRedispatch) {
   FakeClock clock;
+  ManualScheduler scheduler;
   clock.set(100);
   FakeParticipantEngine first_engine;
   FakeParticipantEngine second_engine;
@@ -5371,7 +5563,7 @@ TEST(ResourceAddressedExecutionKernelTest,
   const auto second_binding = second_same_type_occurrence(first_binding);
   ResourceAddressedExecutionKernel kernel(
       {registration(first_binding, first_engine), registration(second_binding, second_engine)},
-      clock, journal, {RequestOwnerEpoch("kernel.epoch.1"), CellId("cell.test"), 32U});
+      clock, scheduler, journal, {RequestOwnerEpoch("kernel.epoch.1"), CellId("cell.test"), 32U});
   const auto first = kernel.execute(motion_operation("request.aggregate.first.execute"));
   ASSERT_TRUE(first.ok()) << first.error().message;
   auto second_intent = motion_operation("request.aggregate.second.execute");
@@ -5476,6 +5668,7 @@ TEST(ResourceAddressedExecutionKernelTest,
 TEST(ResourceAddressedExecutionKernelTest,
      OrdinaryScopeCrossingResidentAndFreshWorkPromotesToOneFullAggregate) {
   FakeClock clock;
+  ManualScheduler scheduler;
   clock.set(100);
   FakeParticipantEngine first_engine;
   FakeParticipantEngine second_engine;
@@ -5485,7 +5678,7 @@ TEST(ResourceAddressedExecutionKernelTest,
   const auto second_binding = second_same_type_occurrence(first_binding);
   ResourceAddressedExecutionKernel kernel(
       {registration(first_binding, first_engine), registration(second_binding, second_engine)},
-      clock, journal, {RequestOwnerEpoch("kernel.epoch.1"), CellId("cell.test"), 32U});
+      clock, scheduler, journal, {RequestOwnerEpoch("kernel.epoch.1"), CellId("cell.test"), 32U});
   const auto first = kernel.execute(motion_operation("request.aggregate-ordinary.first.execute"));
   ASSERT_TRUE(first.ok()) << first.error().message;
   auto second_intent = motion_operation("request.aggregate-ordinary.second.execute");
@@ -5545,6 +5738,7 @@ TEST(ResourceAddressedExecutionKernelTest,
 TEST(ResourceAddressedExecutionKernelTest,
      FullAggregateRetainsTwoResidentStopsAndNeverRepeatsEitherStage) {
   FakeClock clock;
+  ManualScheduler scheduler;
   clock.set(100);
   FakeParticipantEngine first_engine;
   FakeParticipantEngine second_engine;
@@ -5554,7 +5748,7 @@ TEST(ResourceAddressedExecutionKernelTest,
   const auto second_binding = second_same_type_occurrence(first_binding);
   ResourceAddressedExecutionKernel kernel(
       {registration(first_binding, first_engine), registration(second_binding, second_engine)},
-      clock, journal, {RequestOwnerEpoch("kernel.epoch.1"), CellId("cell.test"), 32U});
+      clock, scheduler, journal, {RequestOwnerEpoch("kernel.epoch.1"), CellId("cell.test"), 32U});
   const auto first = kernel.execute(motion_operation("request.aggregate-two.first.execute"));
   ASSERT_TRUE(first.ok()) << first.error().message;
   auto second_intent = motion_operation("request.aggregate-two.second.execute");
@@ -5623,6 +5817,7 @@ TEST(ResourceAddressedExecutionKernelTest,
 TEST(ResourceAddressedExecutionKernelTest,
      CorrelationExhaustionCoalescesFreshScopeWithResidentPredecessorTruth) {
   FakeClock clock;
+  ManualScheduler scheduler;
   clock.set(100);
   FakeParticipantEngine first_engine;
   FakeParticipantEngine second_engine;
@@ -5632,7 +5827,7 @@ TEST(ResourceAddressedExecutionKernelTest,
   const auto second_binding = second_same_type_occurrence(first_binding);
   ResourceAddressedExecutionKernel kernel(
       {registration(first_binding, first_engine), registration(second_binding, second_engine)},
-      clock, journal,
+      clock, scheduler, journal,
       ResourceAddressedExecutionKernelConfig{RequestOwnerEpoch("kernel.epoch.1"),
                                              CellId("cell.test"),
                                              32U,
@@ -5688,6 +5883,7 @@ TEST(ResourceAddressedExecutionKernelTest,
 TEST(ResourceAddressedExecutionKernelTest,
      TerminalHandoffReusesCorrelationSlotDespiteTerminalJournalFailure) {
   FakeClock clock;
+  ManualScheduler scheduler;
   FakeParticipantEngine first_engine;
   FakeParticipantEngine second_engine;
   FakeOperationJournal journal;
@@ -5696,7 +5892,7 @@ TEST(ResourceAddressedExecutionKernelTest,
   const auto second_binding = second_same_type_occurrence(first_binding);
   ResourceAddressedExecutionKernel kernel(
       {registration(first_binding, first_engine), registration(second_binding, second_engine)},
-      clock, journal,
+      clock, scheduler, journal,
       ResourceAddressedExecutionKernelConfig{RequestOwnerEpoch("kernel.epoch.1"),
                                              CellId("cell.test"),
                                              32U,
@@ -5739,6 +5935,7 @@ TEST(ResourceAddressedExecutionKernelTest,
 TEST(ResourceAddressedExecutionKernelTest,
      SlowAcceptanceProjectionCannotBeOverwrittenWhenItsEmergencySlotIsReused) {
   FakeClock clock;
+  ManualScheduler scheduler;
   FakeParticipantEngine first_engine;
   FakeParticipantEngine second_engine;
   FakeOperationJournal journal;
@@ -5759,7 +5956,7 @@ TEST(ResourceAddressedExecutionKernelTest,
   const auto second_binding = second_same_type_occurrence(first_binding);
   ResourceAddressedExecutionKernel kernel(
       {registration(first_binding, first_engine), registration(second_binding, second_engine)},
-      clock, journal,
+      clock, scheduler, journal,
       ResourceAddressedExecutionKernelConfig{RequestOwnerEpoch("kernel.epoch.1"),
                                              CellId("cell.test"),
                                              32U,
@@ -5824,6 +6021,7 @@ TEST(ResourceAddressedExecutionKernelTest,
 TEST(ResourceAddressedExecutionKernelTest,
      ProjectionPoolExhaustionCannotTerminateOrPinAnAlreadyAcceptedStop) {
   FakeClock clock;
+  ManualScheduler scheduler;
   FakeParticipantEngine first_engine;
   FakeParticipantEngine second_engine;
   FakeOperationJournal journal;
@@ -5844,7 +6042,7 @@ TEST(ResourceAddressedExecutionKernelTest,
   const auto second_binding = second_same_type_occurrence(first_binding);
   ResourceAddressedExecutionKernel kernel(
       {registration(first_binding, first_engine), registration(second_binding, second_engine)},
-      clock, journal,
+      clock, scheduler, journal,
       ResourceAddressedExecutionKernelConfig{RequestOwnerEpoch("kernel.epoch.1"),
                                              CellId("cell.test"),
                                              8U,
@@ -5914,6 +6112,7 @@ TEST(ResourceAddressedExecutionKernelTest,
 TEST(ResourceAddressedExecutionKernelTest,
      StopBypassesOrdinaryLedgerCapacityAndProjectionFailureCannotUndoContainment) {
   FakeClock clock;
+  ManualScheduler scheduler;
   FakeParticipantEngine first_engine;
   FakeParticipantEngine second_engine;
   FakeOperationJournal journal;
@@ -5922,7 +6121,7 @@ TEST(ResourceAddressedExecutionKernelTest,
   const auto second_binding = second_same_type_occurrence(first_binding);
   ResourceAddressedExecutionKernel kernel(
       {registration(first_binding, first_engine), registration(second_binding, second_engine)},
-      clock, journal, {RequestOwnerEpoch("kernel.epoch.1"), CellId("cell.test"), 1U});
+      clock, scheduler, journal, {RequestOwnerEpoch("kernel.epoch.1"), CellId("cell.test"), 1U});
   const auto first = kernel.execute(motion_operation("request.stop-journal.first.execute"));
   ASSERT_TRUE(first.ok()) << first.error().message;
   journal.fail_next_kind = "stop_accepted";
@@ -5963,8 +6162,156 @@ TEST(ResourceAddressedExecutionKernelTest,
 }
 
 TEST(ResourceAddressedExecutionKernelTest,
+     RetryableAcceptanceProjectionContentionProgressesWithoutAClientCommand) {
+  FakeClock clock;
+  ManualScheduler scheduler;
+  FakeParticipantEngine engine;
+  FakeOperationJournal journal;
+  journal.retryable_stop_acceptance_failures = 1U;
+  ResourceAddressedExecutionKernel kernel(
+      {registration(
+          make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular),
+          engine)},
+      clock, scheduler, journal, {RequestOwnerEpoch("kernel.epoch.1"), CellId("cell.test"), 8U});
+  const auto operation = kernel.execute(motion_operation("request.acceptance-retry.execute"));
+  ASSERT_TRUE(operation.ok()) << operation.error().message;
+  const auto stopped =
+      kernel.stop(stop_request("request.acceptance-retry.stop", operation.value(), 1U));
+  ASSERT_TRUE(stopped.ok()) << stopped.error().message;
+
+  ASSERT_TRUE(wait_until([&] {
+    return journal.stop_acceptance_calls.load() == 1 &&
+           scheduler.pending_count(SchedulerPriority::Background) == 1U;
+  }));
+  EXPECT_EQ(scheduler.last_priority(), SchedulerPriority::Background);
+  clock.set(kStopProjectionRetryDelayNs);
+  scheduler.advance_to(clock.now(), SchedulerPriority::Background);
+  ASSERT_TRUE(wait_until([&] {
+    const auto status = kernel.get_stop_status(stopped.value().stop_id);
+    return status.ok() &&
+           status.value().acceptance_projection.state == StopDurableProjectionStateDTO::kRecorded &&
+           status.value().terminal_projection.state == StopDurableProjectionStateDTO::kRecorded;
+  }));
+  EXPECT_EQ(journal.stop_acceptance_calls.load(), 2);
+  EXPECT_EQ(journal.stop_terminal_calls.load(), 1);
+  EXPECT_EQ(engine.stop_calls.load(), 1);
+}
+
+TEST(ResourceAddressedExecutionKernelTest,
+     RetryableTerminalProjectionContentionProgressesWithoutAClientCommand) {
+  FakeClock clock;
+  ManualScheduler scheduler;
+  FakeParticipantEngine engine;
+  FakeOperationJournal journal;
+  journal.retryable_stop_terminal_failures = 1U;
+  ResourceAddressedExecutionKernel kernel(
+      {registration(
+          make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular),
+          engine)},
+      clock, scheduler, journal, {RequestOwnerEpoch("kernel.epoch.1"), CellId("cell.test"), 8U});
+  const auto operation = kernel.execute(motion_operation("request.terminal-retry.execute"));
+  ASSERT_TRUE(operation.ok()) << operation.error().message;
+  const auto stopped =
+      kernel.stop(stop_request("request.terminal-retry.stop", operation.value(), 1U));
+  ASSERT_TRUE(stopped.ok()) << stopped.error().message;
+
+  ASSERT_TRUE(wait_until([&] {
+    return journal.stop_terminal_calls.load() == 1 &&
+           scheduler.pending_count(SchedulerPriority::Background) == 1U;
+  }));
+  EXPECT_EQ(scheduler.last_priority(), SchedulerPriority::Background);
+  clock.set(kStopProjectionRetryDelayNs);
+  scheduler.advance_to(clock.now(), SchedulerPriority::Background);
+  ASSERT_TRUE(wait_until([&] {
+    const auto status = kernel.get_stop_status(stopped.value().stop_id);
+    return status.ok() &&
+           status.value().terminal_projection.state == StopDurableProjectionStateDTO::kRecorded;
+  }));
+  EXPECT_EQ(journal.stop_terminal_calls.load(), 2);
+  EXPECT_EQ(engine.stop_calls.load(), 1);
+}
+
+TEST(ResourceAddressedExecutionKernelTest,
+     RetryableTerminalProjectionExhaustionIsBoundedAndFailsClosed) {
+  FakeClock clock;
+  ManualScheduler scheduler;
+  FakeParticipantEngine engine;
+  FakeOperationJournal journal;
+  journal.retryable_stop_terminal_failures = 100U;
+  ResourceAddressedExecutionKernel kernel(
+      {registration(
+          make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular),
+          engine)},
+      clock, scheduler, journal, {RequestOwnerEpoch("kernel.epoch.1"), CellId("cell.test"), 8U});
+  const auto operation = kernel.execute(motion_operation("request.terminal-exhaust.execute"));
+  ASSERT_TRUE(operation.ok()) << operation.error().message;
+  const auto stopped =
+      kernel.stop(stop_request("request.terminal-exhaust.stop", operation.value(), 1U));
+  ASSERT_TRUE(stopped.ok()) << stopped.error().message;
+
+  for (std::int64_t attempt = 1; attempt < 10; ++attempt) {
+    ASSERT_TRUE(wait_until([&] {
+      return journal.stop_terminal_calls.load() == attempt &&
+             scheduler.pending_count(SchedulerPriority::Background) == 1U;
+    }));
+    clock.set(attempt * kStopProjectionRetryDelayNs);
+    scheduler.advance_to(clock.now(), SchedulerPriority::Background);
+  }
+  ASSERT_TRUE(wait_until([&] {
+    const auto status = kernel.get_stop_status(stopped.value().stop_id);
+    return status.ok() &&
+           status.value().terminal_projection.state == StopDurableProjectionStateDTO::kFailed;
+  }));
+  const auto status = kernel.get_stop_status(stopped.value().stop_id);
+  ASSERT_TRUE(status.ok()) << status.error().message;
+  ASSERT_TRUE(status.value().terminal_projection.retry_generation.has_value());
+  EXPECT_EQ(*status.value().terminal_projection.retry_generation, 10U);
+  EXPECT_EQ(journal.stop_terminal_calls.load(), 10);
+  ASSERT_TRUE(status.value().fault_latch.has_value());
+  EXPECT_TRUE(status.value().fault_latch->persistence_degraded);
+  EXPECT_EQ(engine.stop_calls.load(), 1);
+}
+
+TEST(ResourceAddressedExecutionKernelTest,
+     RetryableTerminalProjectionFailsClosedWhenRetrySchedulingIsUnavailable) {
+  FakeClock clock;
+  RejectingScheduler scheduler;
+  FakeParticipantEngine engine;
+  FakeOperationJournal journal;
+  journal.retryable_stop_terminal_failures = 1U;
+  ResourceAddressedExecutionKernel kernel(
+      {registration(
+          make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular),
+          engine)},
+      clock, scheduler, journal, {RequestOwnerEpoch("kernel.epoch.1"), CellId("cell.test"), 8U});
+  const auto operation = kernel.execute(motion_operation("request.retry-schedule.execute"));
+  ASSERT_TRUE(operation.ok()) << operation.error().message;
+  const auto stopped =
+      kernel.stop(stop_request("request.retry-schedule.stop", operation.value(), 1U));
+  ASSERT_TRUE(stopped.ok()) << stopped.error().message;
+
+  ASSERT_TRUE(wait_until([&] {
+    const auto status = kernel.get_stop_status(stopped.value().stop_id);
+    return status.ok() &&
+           status.value().terminal_projection.state == StopDurableProjectionStateDTO::kFailed;
+  }));
+  const auto status = kernel.get_stop_status(stopped.value().stop_id);
+  ASSERT_TRUE(status.ok()) << status.error().message;
+  ASSERT_TRUE(status.value().terminal_projection.retry_generation.has_value());
+  EXPECT_EQ(*status.value().terminal_projection.retry_generation, 1U);
+  EXPECT_EQ(journal.stop_terminal_calls.load(), 1);
+  EXPECT_EQ(scheduler.schedule_calls.load(std::memory_order_acquire), 1);
+  EXPECT_EQ(scheduler.last_priority.load(std::memory_order_acquire),
+            static_cast<int>(SchedulerPriority::Background));
+  ASSERT_TRUE(status.value().fault_latch.has_value());
+  EXPECT_TRUE(status.value().fault_latch->persistence_degraded);
+  EXPECT_EQ(engine.stop_calls.load(), 1);
+}
+
+TEST(ResourceAddressedExecutionKernelTest,
      TerminalProjectionFailureRetainsCertificateAndLatchesPersistenceFault) {
   FakeClock clock;
+  ManualScheduler scheduler;
   FakeParticipantEngine engine;
   FakeOperationJournal journal;
   journal.fail_next_kind = "stop_terminal";
@@ -5972,7 +6319,7 @@ TEST(ResourceAddressedExecutionKernelTest,
       {registration(
           make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular),
           engine)},
-      clock, journal, {RequestOwnerEpoch("kernel.epoch.1"), CellId("cell.test"), 8U});
+      clock, scheduler, journal, {RequestOwnerEpoch("kernel.epoch.1"), CellId("cell.test"), 8U});
   const auto operation = kernel.execute(motion_operation("request.terminal-projection.execute"));
   ASSERT_TRUE(operation.ok()) << operation.error().message;
   const auto stopped =
@@ -6000,6 +6347,7 @@ TEST(ResourceAddressedExecutionKernelTest,
 TEST(ResourceAddressedExecutionKernelTest,
      ReplacementAdoptsProjectedTerminalCertificateWithoutRedispatch) {
   FakeClock clock;
+  ManualScheduler scheduler;
   const auto binding =
       make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular);
   std::optional<RecoveredStopJournalStateDTO> recovered;
@@ -6007,7 +6355,7 @@ TEST(ResourceAddressedExecutionKernelTest,
     FakeParticipantEngine predecessor_engine;
     FakeOperationJournal predecessor_journal;
     ResourceAddressedExecutionKernel predecessor(
-        {registration(binding, predecessor_engine)}, clock, predecessor_journal,
+        {registration(binding, predecessor_engine)}, clock, scheduler, predecessor_journal,
         {RequestOwnerEpoch("kernel.epoch.old"), CellId("cell.test"), 8U});
     auto intent = motion_operation("request.recovered-stop.execute");
     intent.request_context.request_owner_epoch = RequestOwnerEpoch("kernel.epoch.old");
@@ -6038,7 +6386,7 @@ TEST(ResourceAddressedExecutionKernelTest,
       {}, {*recovered}, RequestOwnerEpoch("kernel.epoch.old"), {ResourceId("robot.joint_1")},
       AdmissionGeneration(0U), {}, {}, {}};
   ResourceAddressedExecutionKernel replacement(
-      {registration(binding, replacement_engine)}, clock, replacement_journal,
+      {registration(binding, replacement_engine)}, clock, scheduler, replacement_journal,
       {RequestOwnerEpoch("kernel.epoch.new"), CellId("cell.test"), 8U});
   const auto status = replacement.get_stop_status(recovered->accepted.stop_id);
   ASSERT_TRUE(status.ok()) << status.error().message;
@@ -6058,8 +6406,8 @@ TEST(ResourceAddressedExecutionKernelTest,
 void VerifyStopFaultRecoveryMotionAdmission(
     const bool latch_manager_liveness_loss) {
   FakeClock clock;
-  clock.set(100);
   ManualScheduler scheduler;
+  clock.set(100);
   FakeStopSurveillanceObserver observer;
   FakeParticipantEngine stopped_engine;
   FakeParticipantEngine unaffected_engine;
@@ -6090,7 +6438,7 @@ void VerifyStopFaultRecoveryMotionAdmission(
                                                 CellId("cell.test"), 32U};
   config.manager_liveness_required_set = liveness;
   config.stop_surveillance =
-      StopSurveillanceExecutionConfig{&scheduler, &observer, StopSurveillancePolicyDTO{10, 10, 8U}};
+      StopSurveillanceExecutionConfig{&observer, StopSurveillancePolicyDTO{10, 10, 8U}};
   config.stop_fault_recovery_facts_resolver =
       [expected_configuration](
           const StopStatusDTO& status,
@@ -6142,7 +6490,7 @@ void VerifyStopFaultRecoveryMotionAdmission(
 
   ResourceAddressedExecutionKernel kernel({registration(stopped_binding, stopped_engine),
                                            registration(unaffected_binding, unaffected_engine)},
-                                          clock, journal, std::move(config));
+                                          clock, scheduler, journal, std::move(config));
   const auto operation = kernel.execute(motion_operation("request.surveillance.execute"));
   ASSERT_TRUE(operation.ok()) << operation.error().message;
   std::optional<StopAcceptedDTO> stopped;
@@ -6205,23 +6553,40 @@ void VerifyStopFaultRecoveryMotionAdmission(
   EXPECT_EQ(latch->recovery_status, StopFaultRecoveryStatusDTO::kWaitingForDurableRecord);
 
   observer.evidence_state = StopEvidenceItemStateDTO::kSatisfied;
+  {
+    std::lock_guard lock(journal.mutex);
+    journal.retryable_stop_surveillance_failures = 1U;
+  }
   clock.set(120);
   scheduler.advance_to(120);
   ASSERT_TRUE(wait_until([&] {
+    return journal.stop_surveillance_calls.load() == 2 &&
+           scheduler.pending_count(SchedulerPriority::Background) == 1U;
+  }));
+  EXPECT_EQ(scheduler.last_priority(), SchedulerPriority::Background);
+  clock.set(120 + kStopProjectionRetryDelayNs);
+  scheduler.advance_to(clock.now(), SchedulerPriority::Background);
+  ASSERT_TRUE(wait_until([&] {
     const auto status = kernel.get_stop_status(stopped->stop_id);
-    return journal.stop_surveillance_calls.load() >= 2 && status.ok() &&
+    return journal.stop_surveillance_calls.load() >= 3 && status.ok() &&
            status.value().surveillance.has_value() &&
            status.value().surveillance->state ==
                StopPostTerminalSurveillanceStateDTO::kMonitoring &&
            status.value().surveillance_projection.state == StopDurableProjectionStateDTO::kRecorded;
   }));
+  {
+    std::lock_guard lock(journal.mutex);
+    EXPECT_EQ(journal.stop_surveillance_calls.load(), 3);
+    ASSERT_TRUE(journal.last_stop_surveillance_projected_at_ns.has_value());
+    EXPECT_EQ(*journal.last_stop_surveillance_projected_at_ns, 120);
+  }
   // The retained evidence contract requires 100 ms of continuous rest. A
   // first satisfied sample cannot collapse that dwell into one observation.
   clock.set(100'000'120);
   scheduler.advance_to(100'000'120);
   ASSERT_TRUE(wait_until([&] {
     const auto status = kernel.get_stop_status(stopped->stop_id);
-    return journal.stop_surveillance_calls.load() >= 3 && status.ok() &&
+    return journal.stop_surveillance_calls.load() >= 4 && status.ok() &&
            status.value().surveillance.has_value() &&
            status.value().surveillance->state ==
                StopPostTerminalSurveillanceStateDTO::kQuiescenceObserved &&
@@ -6330,6 +6695,7 @@ TEST(ResourceAddressedExecutionKernelTest,
 TEST(ResourceAddressedExecutionKernelTest,
      StopCancelsAReservedOperationWhileItsOrdinaryJournalIsBlockedWithoutDispatch) {
   FakeClock clock;
+  ManualScheduler scheduler;
   FakeParticipantEngine engine;
   FakeOperationJournal journal;
   std::promise<void> journal_entered_promise;
@@ -6343,7 +6709,7 @@ TEST(ResourceAddressedExecutionKernelTest,
   const auto binding =
       make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular);
   ResourceAddressedExecutionKernel kernel(
-      {registration(binding, engine)}, clock, journal,
+      {registration(binding, engine)}, clock, scheduler, journal,
       {RequestOwnerEpoch("kernel.epoch.1"), CellId("cell.test"), 16U});
 
   auto execution = std::async(std::launch::async, [&] {
@@ -6386,6 +6752,7 @@ TEST(ResourceAddressedExecutionKernelTest,
 void VerifyRecognizedFullStopDoesNotWaitForBlockedCellAdmissionJournalWrite(
     const bool retain_active_resource) {
   FakeClock clock;
+  ManualScheduler scheduler;
   FakeParticipantEngine engine;
   FakeOperationJournal journal;
   std::promise<void> claim_journal_entered_promise;
@@ -6403,7 +6770,7 @@ void VerifyRecognizedFullStopDoesNotWaitForBlockedCellAdmissionJournalWrite(
   config.cell_admission_settlement_validator =
       [](const auto&, const auto&) { return Result<void>::Ok(); };
   config.manager_liveness_required_set = EmptyManagerLivenessSet();
-  ResourceAddressedExecutionKernel kernel({registration(binding, engine)}, clock, journal,
+  ResourceAddressedExecutionKernel kernel({registration(binding, engine)}, clock, scheduler, journal,
                                           std::move(config));
   if (retain_active_resource) {
     const auto executed = kernel.execute(motion_operation("request.active-before-claim"));
@@ -6487,7 +6854,7 @@ TEST(ResourceAddressedExecutionKernelTest,
       RequestOwnerEpoch("kernel.epoch.1"), CellId("cell.test"), 16U};
   config.manager_liveness_required_set = liveness;
   ResourceAddressedExecutionKernel kernel(
-      {registration(binding, engine)}, clock, journal, std::move(config));
+      {registration(binding, engine)}, clock, scheduler, journal, std::move(config));
 
   const CellAdmissionReadinessSnapshotDTO ready{
       true,
@@ -6575,6 +6942,7 @@ TEST(ResourceAddressedExecutionKernelTest,
 TEST(ResourceAddressedExecutionKernelTest,
      CellClaimAndOrdinaryAdmissionShareOneDeterministicKernelOrdering) {
   FakeClock clock;
+  ManualScheduler scheduler;
   FakeParticipantEngine engine;
   FakeOperationJournal journal;
   std::promise<void> claim_linearized_promise;
@@ -6591,7 +6959,7 @@ TEST(ResourceAddressedExecutionKernelTest,
       RequestOwnerEpoch("kernel.epoch.1"), CellId("cell.test"), 16U};
   config.manager_liveness_required_set = EmptyManagerLivenessSet();
   ResourceAddressedExecutionKernel kernel(
-      {registration(binding, engine)}, clock, journal, std::move(config));
+      {registration(binding, engine)}, clock, scheduler, journal, std::move(config));
   const CellAdmissionReadinessSnapshotDTO ready{
       true,
       ProgramCycleStatusDTO{RequestOwnerEpoch("program.owner"), 1U,
@@ -6626,6 +6994,7 @@ TEST(ResourceAddressedExecutionKernelTest,
 TEST(ResourceAddressedExecutionKernelTest,
      BlockedDisjointOrdinaryJournalCannotDelayAnActiveOperationsStopStage) {
   FakeClock clock;
+  ManualScheduler scheduler;
   FakeParticipantEngine first_engine;
   FakeParticipantEngine second_engine;
   FakeOperationJournal journal;
@@ -6634,7 +7003,7 @@ TEST(ResourceAddressedExecutionKernelTest,
   const auto second_binding = second_same_type_occurrence(first_binding);
   ResourceAddressedExecutionKernel kernel(
       {registration(first_binding, first_engine), registration(second_binding, second_engine)},
-      clock, journal, {RequestOwnerEpoch("kernel.epoch.1"), CellId("cell.test"), 16U});
+      clock, scheduler, journal, {RequestOwnerEpoch("kernel.epoch.1"), CellId("cell.test"), 16U});
   const auto first = kernel.execute(motion_operation("request.blocked-disjoint.first.execute"));
   ASSERT_TRUE(first.ok()) << first.error().message;
 
@@ -6673,6 +7042,7 @@ TEST(ResourceAddressedExecutionKernelTest,
 TEST(ResourceAddressedExecutionKernelTest,
      OrdinaryRequestIdReusePromotesStopToFullWithoutExtendingTheDeadline) {
   FakeClock clock;
+  ManualScheduler scheduler;
   clock.set(1000);
   FakeParticipantEngine first_engine;
   FakeParticipantEngine second_engine;
@@ -6682,7 +7052,7 @@ TEST(ResourceAddressedExecutionKernelTest,
   const auto second_binding = second_same_type_occurrence(first_binding);
   ResourceAddressedExecutionKernel kernel(
       {registration(first_binding, first_engine), registration(second_binding, second_engine)},
-      clock, journal, {RequestOwnerEpoch("kernel.epoch.1"), CellId("cell.test"), 32U});
+      clock, scheduler, journal, {RequestOwnerEpoch("kernel.epoch.1"), CellId("cell.test"), 32U});
   const auto first = kernel.execute(motion_operation("request.reused-for-stop"));
   ASSERT_TRUE(first.ok()) << first.error().message;
   auto second_intent = motion_operation("request.reused-for-stop.second");
@@ -6703,12 +7073,13 @@ TEST(ResourceAddressedExecutionKernelTest,
 TEST(ResourceAddressedExecutionKernelTest,
      QualifiedScaleFailureAndMechanismMismatchRemainVisibleAfterAcceptance) {
   FakeClock clock;
+  ManualScheduler scheduler;
   FakeParticipantEngine engine;
   ResourceAddressedExecutionKernel kernel(
       {registration(
           make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular),
           engine)},
-      clock, default_journal, {RequestOwnerEpoch("kernel.epoch.1"), CellId("cell.test"), 16U});
+      clock, scheduler, default_journal, {RequestOwnerEpoch("kernel.epoch.1"), CellId("cell.test"), 16U});
   const auto executed = kernel.execute(motion_operation());
   ASSERT_TRUE(executed.ok()) << executed.error().message;
   engine.emit_transition(ExecutionState::kValidating, ExecutionState::kExecuting);
@@ -6733,7 +7104,7 @@ TEST(ResourceAddressedExecutionKernelTest,
       {registration(
           make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular),
           unsupported_engine)},
-      clock, default_journal, {RequestOwnerEpoch("kernel.epoch.1"), CellId("cell.test"), 16U});
+      clock, scheduler, default_journal, {RequestOwnerEpoch("kernel.epoch.1"), CellId("cell.test"), 16U});
   auto unsupported_intent = motion_operation("request.motion.unsupported");
   const auto unsupported = unsupported_kernel.execute(unsupported_intent);
   ASSERT_TRUE(unsupported.ok()) << unsupported.error().message;
@@ -6751,12 +7122,13 @@ TEST(ResourceAddressedExecutionKernelTest,
 TEST(ResourceAddressedExecutionKernelTest,
      DirectControlSpanIsRetainedAndOversizedInputFailsBeforeEffect) {
   FakeClock clock;
+  ManualScheduler scheduler;
   FakeParticipantEngine engine;
   ResourceAddressedExecutionKernel kernel(
       {registration(
           make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular),
           engine)},
-      clock, default_journal, {RequestOwnerEpoch("kernel.epoch.1"), CellId("cell.test"), 16U});
+      clock, scheduler, default_journal, {RequestOwnerEpoch("kernel.epoch.1"), CellId("cell.test"), 16U});
   auto direct = motion_operation("request.direct.1");
   direct.participants.front().action_span =
       ActionSpanDTO{ActionSource::kDirectControl, "direct/session.1", "run.1", "", "", ""};
@@ -6784,6 +7156,7 @@ TEST(ResourceAddressedExecutionKernelTest,
 TEST(ResourceAddressedExecutionKernelTest,
      DurableAcceptancePrecedesEffectsAndWriteFailurePreventsDispatch) {
   FakeClock clock;
+  ManualScheduler scheduler;
   FakeParticipantEngine engine;
   FakeOperationJournal journal;
   std::vector<std::string> timeline;
@@ -6796,7 +7169,7 @@ TEST(ResourceAddressedExecutionKernelTest,
       {registration(
           make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular),
           engine)},
-      clock, journal, {RequestOwnerEpoch("kernel.epoch.1"), CellId("cell.test"), 16U});
+      clock, scheduler, journal, {RequestOwnerEpoch("kernel.epoch.1"), CellId("cell.test"), 16U});
   {
     std::lock_guard lock(timeline_mutex);
     timeline.clear();
@@ -6821,7 +7194,7 @@ TEST(ResourceAddressedExecutionKernelTest,
       {registration(
           make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular),
           rejected_engine)},
-      clock, failing_journal,
+      clock, scheduler, failing_journal,
       {RequestOwnerEpoch("kernel.epoch.failure"), CellId("cell.test"), 16U});
   auto rejected_intent = motion_operation("request.motion.failure");
   rejected_intent.request_context.request_owner_epoch = RequestOwnerEpoch("kernel.epoch.failure");
@@ -6835,6 +7208,7 @@ TEST(ResourceAddressedExecutionKernelTest,
 TEST(ResourceAddressedExecutionKernelTest,
      ScaleStopAndRejectedControlRemainDurableBeforeTheirEffects) {
   FakeClock clock;
+  ManualScheduler scheduler;
   FakeParticipantEngine engine;
   FakeOperationJournal journal;
   std::vector<std::string> timeline;
@@ -6847,7 +7221,7 @@ TEST(ResourceAddressedExecutionKernelTest,
       {registration(
           make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular),
           engine)},
-      clock, journal, {RequestOwnerEpoch("kernel.epoch.1"), CellId("cell.test"), 32U});
+      clock, scheduler, journal, {RequestOwnerEpoch("kernel.epoch.1"), CellId("cell.test"), 32U});
   const auto executed = kernel.execute(motion_operation());
   ASSERT_TRUE(executed.ok()) << executed.error().message;
   engine.emit_transition(ExecutionState::kValidating, ExecutionState::kExecuting);
@@ -6920,7 +7294,7 @@ TEST(ResourceAddressedExecutionKernelTest,
       {registration(
           make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular),
           stop_engine)},
-      clock, stop_journal, {RequestOwnerEpoch("kernel.epoch.1"), CellId("cell.test"), 16U});
+      clock, scheduler, stop_journal, {RequestOwnerEpoch("kernel.epoch.1"), CellId("cell.test"), 16U});
   const auto stop_execution = stop_kernel.execute(motion_operation("request.motion.stop-order"));
   ASSERT_TRUE(stop_execution.ok()) << stop_execution.error().message;
   stop_engine.emit_transition(ExecutionState::kValidating, ExecutionState::kExecuting);
@@ -6936,6 +7310,7 @@ TEST(ResourceAddressedExecutionKernelTest,
 TEST(ResourceAddressedExecutionKernelTest,
      ReplacementRecoveryPublishesHistoryAndDoesNotResumeOrStopOrphanWork) {
   FakeClock clock;
+  ManualScheduler scheduler;
   FakeParticipantEngine engine;
   FakeOperationJournal journal;
   const auto binding =
@@ -6989,7 +7364,7 @@ TEST(ResourceAddressedExecutionKernelTest,
       {}};
 
   ResourceAddressedExecutionKernel kernel(
-      {registration(binding, engine)}, clock, journal,
+      {registration(binding, engine)}, clock, scheduler, journal,
       {RequestOwnerEpoch("kernel.epoch.new"), CellId("cell.test"), 16U});
   const auto historical = kernel.get_operation_state(old_operation);
   ASSERT_TRUE(historical.ok()) << historical.error().message;
@@ -7046,6 +7421,7 @@ TEST(ResourceAddressedExecutionKernelTest,
 TEST(ResourceAddressedExecutionKernelTest,
      ReplacementRecoveryReopensOnlyAReconciledResourceSubsetAndSkipsCleanClose) {
   FakeClock clock;
+  ManualScheduler scheduler;
   FakeParticipantEngine motion_engine;
   FakeParticipantEngine gripper_engine;
   FakeOperationJournal journal;
@@ -7068,7 +7444,7 @@ TEST(ResourceAddressedExecutionKernelTest,
 
   {
     ResourceAddressedExecutionKernel kernel(
-        {registration(motion, motion_engine), registration(gripper, gripper_engine)}, clock,
+        {registration(motion, motion_engine), registration(gripper, gripper_engine)}, clock, scheduler,
         journal, {RequestOwnerEpoch("kernel.epoch.1"), CellId("cell.test"), 16U});
     const auto snapshot = kernel.resource_table_snapshot();
     auto facts =
@@ -7098,6 +7474,7 @@ TEST(ResourceAddressedExecutionKernelTest,
 TEST(ResourceAddressedExecutionKernelTest,
      OrphanRecoveryAcceptsEveryRoutedBindingOfOnePhysicalResourceOwner) {
   FakeClock clock;
+  ManualScheduler scheduler;
   FakeParticipantEngine engine;
   FakeOperationJournal journal;
   const auto source =
@@ -7111,7 +7488,7 @@ TEST(ResourceAddressedExecutionKernelTest,
                                   {}, {}};
 
   ResourceAddressedExecutionKernel kernel(
-      {unqualified_registration(source, engine), unqualified_registration(sibling, engine)}, clock,
+      {unqualified_registration(source, engine), unqualified_registration(sibling, engine)}, clock, scheduler,
       journal, {RequestOwnerEpoch("kernel.epoch.new"), CellId("cell.test"), 16U});
   const auto adopted = kernel.adopt_runtime_route_configuration_predecessor(
       configuration,
@@ -7136,6 +7513,7 @@ TEST(ResourceAddressedExecutionKernelTest,
   constexpr std::size_t kSharedResourceCount = 32U;
 
   FakeClock clock;
+  ManualScheduler scheduler;
   FakeParticipantEngine engine;
   FakeOperationJournal journal;
   auto source_value =
@@ -7190,7 +7568,7 @@ TEST(ResourceAddressedExecutionKernelTest,
       {}, {}, RequestOwnerEpoch("kernel.epoch.old"), shared_resources,
       AdmissionGeneration(0U), {}, {}, {}};
   ResourceAddressedExecutionKernel kernel(
-      registrations, clock, journal,
+      registrations, clock, scheduler, journal,
       {RequestOwnerEpoch("kernel.epoch.new"), CellId("cell.test"), 16U});
   const auto adopted =
       kernel.adopt_runtime_route_configuration_predecessor(configuration, registrations);
@@ -7214,6 +7592,7 @@ TEST(ResourceAddressedExecutionKernelTest,
   const auto exercise_rejection =
       [](RuntimeParticipantBinding sibling, bool install_wrong_route, bool remove_fact_source) {
         FakeClock clock;
+        ManualScheduler scheduler;
         FakeParticipantEngine engine;
         FakeOperationJournal journal;
         const auto source =
@@ -7227,7 +7606,7 @@ TEST(ResourceAddressedExecutionKernelTest,
         ResourceAddressedExecutionKernel kernel(
             {unqualified_registration(source, engine),
              unqualified_registration(sibling, engine)},
-            clock, journal,
+            clock, scheduler, journal,
             {RequestOwnerEpoch("kernel.epoch.new"), CellId("cell.test"), 16U});
         const auto adopted = kernel.adopt_runtime_route_configuration_predecessor(
             configuration,
@@ -7292,6 +7671,7 @@ TEST(ResourceAddressedExecutionKernelTest,
 TEST(ResourceAddressedExecutionKernelTest,
      ReconfigurationPreservesActiveEngineThenSelectsCandidateProduct) {
   FakeClock clock;
+  ManualScheduler scheduler;
   FakeParticipantEngine predecessor_engine;
   FakeParticipantEngine candidate_engine;
   FakeOperationJournal journal;
@@ -7299,7 +7679,7 @@ TEST(ResourceAddressedExecutionKernelTest,
       make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular);
   const auto candidate_binding = select_candidate_product(predecessor_binding);
   ResourceAddressedExecutionKernel kernel(
-      {registration(predecessor_binding, predecessor_engine)}, clock, journal,
+      {registration(predecessor_binding, predecessor_engine)}, clock, scheduler, journal,
       {RequestOwnerEpoch("kernel.epoch.1"), CellId("cell.test"), 16U});
 
   const auto predecessor = kernel.execute(motion_operation("request.motion.predecessor"));
@@ -7344,6 +7724,7 @@ TEST(ResourceAddressedExecutionKernelTest,
 TEST(ResourceAddressedExecutionKernelTest,
      GenericReconfigurationRequiresExactRoutePublicationBeforeAdmission) {
   FakeClock clock;
+  ManualScheduler scheduler;
   FakeParticipantEngine predecessor_engine;
   FakeParticipantEngine candidate_engine;
   FakeOperationJournal journal;
@@ -7351,7 +7732,7 @@ TEST(ResourceAddressedExecutionKernelTest,
       make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular);
   const auto candidate_binding = select_candidate_product(predecessor_binding);
   ResourceAddressedExecutionKernel kernel(
-      {registration(predecessor_binding, predecessor_engine)}, clock, journal,
+      {registration(predecessor_binding, predecessor_engine)}, clock, scheduler, journal,
       {RequestOwnerEpoch("kernel.epoch.1"), CellId("cell.test"), 16U});
   const auto candidate_registration = registration(candidate_binding, candidate_engine);
 
@@ -7397,12 +7778,13 @@ TEST(ResourceAddressedExecutionKernelTest,
 TEST(ResourceAddressedExecutionKernelTest,
      UnqualifiedBootstrapRemainsClosedUntilExactRouteReadinessPublication) {
   FakeClock clock;
+  ManualScheduler scheduler;
   FakeParticipantEngine engine;
   FakeOperationJournal journal;
   const auto binding =
       make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular);
   ResourceAddressedExecutionKernel kernel(
-      {unqualified_registration(binding, engine)}, clock, journal,
+      {unqualified_registration(binding, engine)}, clock, scheduler, journal,
       ResourceAddressedExecutionKernelConfig{RequestOwnerEpoch("kernel.epoch.1"),
                                              CellId("cell.test"),
                                              16U,
@@ -7440,6 +7822,7 @@ TEST(ResourceAddressedExecutionKernelTest,
 TEST(ResourceAddressedExecutionKernelTest,
      EmptyRuntimeBootstrapOwnsCellAdmissionBeforeParticipantInstallation) {
   FakeClock clock;
+  ManualScheduler scheduler;
   FakeOperationJournal journal;
   FakeParticipantEngine engine;
   ResourceAddressedExecutionKernelConfig config{
@@ -7450,7 +7833,7 @@ TEST(ResourceAddressedExecutionKernelTest,
   config.manager_liveness_required_set = EmptyManagerLivenessSet();
   config.cell_admission_settlement_validator =
       [](const auto&, const auto&) { return Result<void>::Ok(); };
-  ResourceAddressedExecutionKernel kernel({}, clock, journal,
+  ResourceAddressedExecutionKernel kernel({}, clock, scheduler, journal,
                                           std::move(config));
 
   const CellAdmissionReadinessSnapshotDTO ready{
@@ -7487,6 +7870,7 @@ TEST(ResourceAddressedExecutionKernelTest,
 TEST(ResourceAddressedExecutionKernelTest,
      OwnerReplacementAdoptsDurableRoutePredecessorWithoutOpeningAdmission) {
   FakeClock clock;
+  ManualScheduler scheduler;
   FakeParticipantEngine engine;
   FakeOperationJournal journal;
   const auto predecessor_binding =
@@ -7507,7 +7891,7 @@ TEST(ResourceAddressedExecutionKernelTest,
   ASSERT_TRUE(current_binding.ok()) << current_binding.error().message;
 
   ResourceAddressedExecutionKernel kernel(
-      {unqualified_registration(current_binding.value(), engine)}, clock, journal,
+      {unqualified_registration(current_binding.value(), engine)}, clock, scheduler, journal,
       ResourceAddressedExecutionKernelConfig{RequestOwnerEpoch("kernel.epoch.2"),
                                              CellId("cell.test"), 16U});
   const auto adopted = kernel.adopt_runtime_route_configuration_predecessor(
@@ -7548,6 +7932,7 @@ TEST(ResourceAddressedExecutionKernelTest,
 TEST(ResourceAddressedExecutionKernelTest,
      FailedReconfigurationRollsBackCandidateSubscriptionAndSelection) {
   FakeClock clock;
+  ManualScheduler scheduler;
   FakeParticipantEngine predecessor_engine;
   FakeParticipantEngine candidate_engine;
   FakeOperationJournal journal;
@@ -7559,7 +7944,7 @@ TEST(ResourceAddressedExecutionKernelTest,
   auto sealed_candidate = verify_runtime_participant_binding(std::move(candidate_value));
   ASSERT_TRUE(sealed_candidate.ok()) << sealed_candidate.error().message;
   ResourceAddressedExecutionKernel kernel(
-      {registration(predecessor_binding, predecessor_engine)}, clock, journal,
+      {registration(predecessor_binding, predecessor_engine)}, clock, scheduler, journal,
       {RequestOwnerEpoch("kernel.epoch.1"), CellId("cell.test"), 16U});
   const auto predecessor = kernel.execute(motion_operation("request.motion.predecessor"));
   ASSERT_TRUE(predecessor.ok()) << predecessor.error().message;
@@ -7577,12 +7962,13 @@ TEST(ResourceAddressedExecutionKernelTest,
 TEST(ResourceAddressedExecutionKernelTest,
      QuiescentReconfigurationToEmptyRetiresCommandsAndTheOldEngine) {
   FakeClock clock;
+  ManualScheduler scheduler;
   FakeParticipantEngine predecessor_engine;
   FakeOperationJournal journal;
   const auto predecessor_binding =
       make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular);
   ResourceAddressedExecutionKernel kernel(
-      {registration(predecessor_binding, predecessor_engine)}, clock, journal,
+      {registration(predecessor_binding, predecessor_engine)}, clock, scheduler, journal,
       {RequestOwnerEpoch("kernel.epoch.1"), CellId("cell.test"), 16U});
 
   const auto reconfigured = kernel.reconfigure_runtime_participants({});

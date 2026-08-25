@@ -150,10 +150,8 @@ prepare_cmake_metadata "${MODULE_BUILD}"
 /usr/bin/cmake \
   -G Ninja \
   -DCMAKE_BUILD_TYPE=Release \
-  -DBUILD_TESTING=OFF \
   -DCMAKE_EXPORT_COMPILE_COMMANDS=ON \
   --graphviz="${MODULE_BUILD}/manyforge-i2-target-graph.dot" \
-  -DPython_EXECUTABLE=/usr/local/bin/python3 \
   -Dpybind11_DIR=/usr/local/lib/python3.12/site-packages/pybind11/share/cmake/pybind11 \
   -DMANYFORGE_CORE_DIR="${CORE_BUILD}" \
   -DMANYFORGE_CORE_INCLUDE_DIR="${REPO_ROOT}/manyforge_core/include" \

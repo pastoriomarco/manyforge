@@ -97,7 +97,7 @@ def test_ros_joint_state_adapter_forwards_good_and_unknown_manager_intents(
     try:
         publisher = pose_source_snapshot_publisher.PoseSourceSnapshotPublisher(
             site_config_path=config_path,
-            manager_state_root=tmp_path,
+            manager_run_root=tmp_path,
             dispatcher_factory=lambda _root, _config, _callback: dispatcher,
         )
         source = Node("manyforge_pose_observer_joint_test_source")
@@ -161,7 +161,7 @@ def test_simulation_auxiliary_node_uses_the_entrypoint_private_context(
                 _REPOSITORY_ROOT
                 / "manyforge_ros_bringup/config/isaac_ur10e_light.pose_observer.json"
             ),
-            manager_state_root=tmp_path,
+            manager_run_root=tmp_path,
             dispatcher_factory=lambda _root, _config, _callback: dispatcher,
             simulation_client_factory=lambda node, _timeout_s: node,
             context=context,
@@ -203,7 +203,7 @@ def test_simulation_capture_waits_for_attached_private_executor_spin(
                 _REPOSITORY_ROOT
                 / "manyforge_ros_bringup/config/isaac_ur10e_light.pose_observer.json"
             ),
-            manager_state_root=tmp_path,
+            manager_run_root=tmp_path,
             dispatcher_factory=lambda _root, _config, _callback: dispatcher,
             simulation_client_factory=lambda _node, _timeout_s: _SimulationClient(),
             context=context,

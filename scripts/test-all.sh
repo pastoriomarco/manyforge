@@ -307,7 +307,10 @@ PY
     if [[ -f "${pinocchio_prefix}/include/boost/version.hpp" ]]; then
         boost_root="$pinocchio_prefix"
     fi
-    mkdir -p "$build"
+    mkdir -p "$build/.cmake/api/v1/query"
+    printf '{}\n' > "$build/.cmake/api/v1/query/codemodel-v2"
+    printf '{}\n' > "$build/.cmake/api/v1/query/cmakeFiles-v1"
+    printf '{}\n' > "$build/.cmake/api/v1/query/toolchains-v1"
     cd "$build"
     if ! CMAKE_PREFIX_PATH="/usr/local:${pinocchio_prefix}:${CMAKE_PREFIX_PATH:-}" \
         BOOST_ROOT="$boost_root" \
@@ -315,7 +318,7 @@ PY
         BOOST_LIBRARYDIR="${boost_root:+${boost_root}/lib}" \
         cmake "$WORKSPACE/manyforge_roboplan" -DCMAKE_BUILD_TYPE=Release \
         -DBUILD_TESTING=ON \
-        -DMANYFORGE_GTEST_TIMEOUT_SECONDS="$CTEST_TEST_TIMEOUT_S" 2>&1 | tail -3; then
+        -DMANYFORGE_GTEST_TIMEOUT_SECONDS="$CTEST_TEST_TIMEOUT_S"; then
         echo -e "${RED}  FAIL: RoboPlan producer configure failed${NC}"
         return 1
     fi
@@ -327,7 +330,9 @@ build_headless_roboplan_producer_closure() {
     if [[ "$ROBOPLAN_HEADLESS_PRODUCER_BUILD" == "$build" ]]; then
         return
     fi
-    configure_roboplan_build
+    if ! configure_roboplan_build; then
+        return 1
+    fi
     local producer_targets=(
         manyforge_native_execution_host
         manyforge_native_execution_host_pick_place_fixture
@@ -336,7 +341,7 @@ build_headless_roboplan_producer_closure() {
         manyforge_run_native_stop_o1_4g_replacement_qualification
     )
     if ! cmake --build "$build" --parallel "$BUILD_PARALLEL_LEVEL" \
-        --target "${producer_targets[@]}" 2>&1 | tail -5; then
+        --target "${producer_targets[@]}" -- -k; then
         echo -e "${RED}  FAIL: RoboPlan producer closure build failed${NC}"
         return 1
     fi
@@ -381,8 +386,15 @@ require_headless_native_packages() {
 run_roboplan_tests() {
     section "C++ retained RoboPlan product-consumer tests"
     local build="$BUILD_DIR/roboplan"
-    configure_roboplan_build
-    cmake --build "$build" --parallel "$BUILD_PARALLEL_LEVEL" 2>&1 | tail -5
+    if ! configure_roboplan_build; then
+        FAIL=$((FAIL + 1))
+        return
+    fi
+    if ! cmake --build "$build" --parallel "$BUILD_PARALLEL_LEVEL" -- -k; then
+        echo -e "${RED}  FAIL: RoboPlan producer build failed${NC}"
+        FAIL=$((FAIL + 1))
+        return
+    fi
     if ! require_ctest_tests "manyforge_roboplan"; then
         FAIL=$((FAIL + 1))
     elif ctest --output-on-failure --timeout "$CTEST_TEST_TIMEOUT_S"; then
@@ -494,6 +506,7 @@ run_python_tests() {
         tests/test_public_contract_entrypoint_reconciliation.py \
         tests/test_qualification_wrapper_entrypoints.py \
         tests/test_ros_qualification_helpers.py \
+        tests/test_grouped_gtest_runner.py \
         tests/test_test_all_script_contract.py \
         -v; then
         PASS=$((PASS + 1))

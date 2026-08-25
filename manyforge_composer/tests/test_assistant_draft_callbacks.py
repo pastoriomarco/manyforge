@@ -231,10 +231,21 @@ def _resource(identity: str = "workpiece") -> dict:
 
 
 class _AdmissionHeadless:
+    def __init__(self) -> None:
+        self.claims: list[dict] = []
+        self.settlements: list[dict] = []
+        self.generation = 7
+
     def authoring_admission(self) -> dict:
-        return {"authoring_allowed": True, "admission_generation": 7}
+        return {
+            "authoring_allowed": True,
+            "admission_generation": self.generation,
+        }
 
     def acquire_authoring_transaction(self, body: dict) -> dict:
+        self.claims.append(deepcopy(body))
+        acquired_generation = self.generation
+        self.generation += 1
         return {
             "claim": {
                 "intent": {
@@ -243,12 +254,19 @@ class _AdmissionHeadless:
                     **body,
                 },
                 "claim_generation": 1,
-                "acquired_admission_generation": 7,
+                "acquired_admission_generation": acquired_generation,
             }
         }
 
     def settle_authoring_transaction(self, _body: dict) -> dict:
-        return {"admission": {"admission_generation": 8}}
+        self.settlements.append(deepcopy(_body))
+        self.generation += 1
+        return {
+            "admission": {
+                "authoring_allowed": True,
+                "admission_generation": self.generation,
+            }
+        }
 
     def recover_authoring_transaction(self, _body: dict) -> dict:
         return {
@@ -272,14 +290,6 @@ def _body(
 ) -> dict:
     snapshot = state.draft_session.snapshot()
     mode = assistant_mode.payload
-    assert state.authoring_admission is not None
-    state.authoring_admission.publish_complete_snapshot(
-        client_id="assistant-client",
-        sequence=1,
-        admission_generation=7,
-        draft_id=snapshot["draft_id"],
-        draft_revision=snapshot["draft_revision"],
-    )
     return {
         "assistantMode": "composer-assistant",
         "retainedBundleId": "bundle.1",
@@ -299,9 +309,6 @@ def _body(
         "expectedDraftRevision": snapshot["draft_revision"],
         "requestId": "assistant.request.1",
         "requestOwnerEpoch": "assistant.epoch.1",
-        "clientId": "assistant-client",
-        "snapshotReceiverEpoch": state.authoring_admission.receiver_epoch,
-        "snapshotSequence": 1,
         "expectedAdmissionGeneration": 7,
         "sourceLabel": "assistant_bridge",
         "correlationId": None,
@@ -326,7 +333,14 @@ def test_callback_uses_exact_active_context_and_mutates_only_the_draft(
     )
     from manyforge_composer.backend import routes_assistant_draft as route
 
-    monkeypatch.setattr(route, "read_active_node_environment", lambda _state: node_environment)
+    projection_reads = 0
+
+    def read_node_environment(_state):
+        nonlocal projection_reads
+        projection_reads += 1
+        return node_environment
+
+    monkeypatch.setattr(route, "read_active_node_environment", read_node_environment)
     monkeypatch.setattr(
         route,
         "read_active_source_model",
@@ -350,21 +364,60 @@ def test_callback_uses_exact_active_context_and_mutates_only_the_draft(
     assert result["success"] is True
     assert result["mutated"] is True
     assert result["draftMutated"] is True
+    assert result["nextAdmissionGeneration"] == 9
     assert result["result"]["draftRevision"] == 2
+    assert projection_reads == 2
     assert state.draft_session.snapshot()["applied"] is False
     assert state.draft_session.snapshot()["saved"] is False
     assert state.authoring_admission is not None
+    assert state.authoring_admission._snapshots == {}
     assert (
         state.authoring_admission._journal.retained_workspace()
         == state.draft_session.retained_state()
     )
 
-    stale = client.post(
+    second_body = deepcopy(body)
+    second_body["expectedDraftRevision"] = 2
+    second_body["expectedAdmissionGeneration"] = result[
+        "nextAdmissionGeneration"
+    ]
+    second_body["requestId"] = "assistant.request.2"
+    second_body["arguments"]["scene_resource"][
+        "scene_resource_id"
+    ] = "second-workpiece"
+    second = client.post(
+        "/api/assistant/bridge/tools/scene_draft_add_object",
+        json=second_body,
+    )
+    assert second.status_code == 200
+    assert second.json()["result"]["draftRevision"] == 3
+    assert second.json()["nextAdmissionGeneration"] == 11
+
+    def unexpected_projection_read(_state):
+        raise AssertionError("exact callback replay consulted mutable projections")
+
+    monkeypatch.setattr(
+        route, "read_active_node_environment", unexpected_projection_read
+    )
+    replay = client.post(
         "/api/assistant/bridge/tools/scene_draft_add_object",
         json=body,
     )
-    assert stale.status_code == 409
-    assert stale.json()["detail"]["code"] == "assistant_callback_context_stale"
+    assert replay.status_code == 200
+    assert replay.json() == result
+    assert len(state.headless_client.claims) == 2
+    assert len(state.headless_client.settlements) == 2
+
+    conflicting = deepcopy(body)
+    conflicting["arguments"]["scene_resource"]["scene_resource_id"] = "other"
+    conflict = client.post(
+        "/api/assistant/bridge/tools/scene_draft_add_object",
+        json=conflicting,
+    )
+    assert conflict.status_code == 503
+    assert conflict.json()["detail"]["code"] == (
+        "composer_authoring_request_id_conflict"
+    )
 
 
 def test_allowed_tool_schema_error_is_a_non_mutating_http_200_result(
@@ -410,9 +463,11 @@ def test_allowed_tool_schema_error_is_a_non_mutating_http_200_result(
     assert result["success"] is False
     assert result["mutated"] is False
     assert result["draftMutated"] is False
+    assert result["nextAdmissionGeneration"] == 7
     assert result["result"]["kind"] == "validation_error"
     assert result["result"]["httpStatus"] == 400
     assert state.draft_session.snapshot() == before
+    assert state.headless_client.claims == []
 
 
 def test_callback_reapplies_field_narrowing_before_draft_mutation(

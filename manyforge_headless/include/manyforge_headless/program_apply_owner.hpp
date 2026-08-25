@@ -23,12 +23,11 @@ inline constexpr std::string_view kProgramApplyPreparationSchemaVersion =
     "manyforge.program_apply_preparation.v1";
 inline constexpr std::string_view kAppliedProgramSelectionSchemaVersion =
     "manyforge.applied_program_selection.v1";
-inline constexpr std::string_view kAppliedProgramSelectionSourceFile =
-    "applied-program-source.json";
 inline constexpr std::string_view kProgramSelectionOwnerStateFile =
     "program-selection-owner.json";
 inline constexpr std::string_view kProgramSelectionOwnerStateSchemaVersion =
-    "manyforge.program_selection_owner_state.v1";
+    "manyforge.program_selection_owner_state.v2";
+inline constexpr std::size_t kMaximumProgramApplyRequestLedgerEntries = 4096U;
 
 class ProgramApplyError final : public std::runtime_error {
 public:
@@ -57,7 +56,6 @@ public:
   ProgramSelectionOwner(std::filesystem::path install_root,
                         std::filesystem::path artifact_root,
                         std::filesystem::path owner_state_root,
-                        std::filesystem::path projection_root,
                         std::string owner_id, std::string owner_epoch);
   ~ProgramSelectionOwner() = default;
 
@@ -67,7 +65,9 @@ public:
   [[nodiscard]] manyforge::content_identity::CanonicalValue
   Prepare(std::string_view scenario_id,
           std::string_view expected_scenario_catalog_revision,
-          std::string_view canonical_program_bytes);
+          std::string_view canonical_program_bytes,
+          std::string_view active_retained_bundle_id,
+          std::string_view active_graph_revision);
 
   [[nodiscard]] manyforge::content_identity::CanonicalValue
   Commit(std::string_view canonical_preparation_bytes,
@@ -76,6 +76,19 @@ public:
          std::string_view active_retained_bundle_id,
          std::string_view active_graph_revision, std::int64_t observed_at_ns);
 
+  [[nodiscard]] std::optional<manyforge::content_identity::CanonicalValue>
+  Replay(std::string_view canonical_preparation_bytes,
+         const std::optional<std::string> &expected_applied_record_digest,
+         std::string_view request_owner_epoch, std::string_view request_id);
+
+  [[nodiscard]] std::optional<manyforge::content_identity::CanonicalValue>
+  ReplayRequest(
+      std::string_view scenario_id,
+      std::string_view scenario_catalog_revision, std::string_view program_id,
+      std::string_view program_revision,
+      const std::optional<std::string> &expected_applied_record_digest,
+      std::string_view request_owner_epoch, std::string_view request_id);
+
   /// Return the independently reverified durable Applied selection. Absence is
   /// reported with `program_applied_selection_not_found` rather than by
   /// fabricating a default/current Program.
@@ -83,6 +96,15 @@ public:
 
 private:
   [[nodiscard]] manyforge::content_identity::CanonicalValue ReadAppliedLocked();
+  [[nodiscard]] manyforge::content_identity::CanonicalValue BuildAppliedLocked(
+      const manyforge::content_identity::CanonicalValue &record,
+      std::string_view record_digest, std::uint64_t generation,
+      std::string_view selection_source_owner_id,
+      std::string_view selection_source_owner_epoch);
+  [[nodiscard]] std::optional<manyforge::content_identity::CanonicalValue>
+  ReplayResultLocked(std::string_view intent_digest,
+                     std::string_view request_owner_epoch,
+                     std::string_view request_id);
 
   manyforge::deployment::FilesystemScenarioApplyCandidateSource
       scenario_source_;
@@ -105,7 +127,6 @@ private:
   manyforge::deployment::FilesystemVerifiedRetainedModelMapSource
       artifact_model_map_source_;
   AtomicSourceSnapshotChannel owner_state_;
-  AtomicSourceSnapshotChannel projection_;
   std::string source_owner_id_;
   std::string source_owner_epoch_;
   std::optional<manyforge::content_identity::CanonicalValue> applied_cache_;

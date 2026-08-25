@@ -97,6 +97,7 @@ RUN pip install --no-cache-dir --upgrade pip setuptools && \
         fastapi==0.135.3 \
         "uvicorn[standard]==0.44.0" \
         httpx==0.28.1 \
+        httpx2==2.12.0 \
         websockets==16.0 \
         mcp==1.27.0 \
     && pip check \

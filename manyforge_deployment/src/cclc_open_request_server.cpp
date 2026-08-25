@@ -116,10 +116,10 @@ private:
 
 class CCLCOpenRequestUnixServer::Impl final {
 public:
-  Impl(std::filesystem::path state_root, core::ICCLCOpenRequestPort &port,
+  Impl(std::filesystem::path run_root, core::ICCLCOpenRequestPort &port,
        const core::RequestTransportDTO transport)
-      : state_root_(std::move(state_root)),
-        socket_path_(state_root_ /
+      : run_root_(std::move(run_root)),
+        socket_path_(run_root_ /
                      std::string(transport == core::RequestTransportDTO::kHttp
                                      ? kCCLCOpenRequestSocketFilename
                                      : kCCLCOpenRequestRosSocketFilename)),
@@ -130,10 +130,10 @@ public:
           "CCLC open transport must be exactly HTTP or ROS");
     }
     struct stat root_status {};
-    if (::lstat(state_root_.c_str(), &root_status) != 0 ||
+    if (::lstat(run_root_.c_str(), &root_status) != 0 ||
         !S_ISDIR(root_status.st_mode) || S_ISLNK(root_status.st_mode)) {
       throw std::invalid_argument(
-          "CCLC transport state root is not a pre-existing real directory");
+          "CCLC transport run root is not a pre-existing real directory");
     }
     const auto spelling = socket_path_.string();
     if (spelling.size() >= sizeof(sockaddr_un::sun_path)) {
@@ -279,7 +279,7 @@ private:
                              response.value().size(), MSG_NOSIGNAL));
   }
 
-  std::filesystem::path state_root_;
+  std::filesystem::path run_root_;
   std::filesystem::path socket_path_;
   core::ICCLCOpenRequestPort &port_;
   core::RequestTransportDTO transport_;
@@ -292,14 +292,14 @@ private:
 
 core::Result<std::unique_ptr<CCLCOpenRequestUnixServer>>
 CCLCOpenRequestUnixServer::CreateAndStart(
-    const std::filesystem::path &trusted_state_root,
+    const std::filesystem::path &trusted_run_root,
     core::ICCLCOpenRequestPort &port,
     const core::RequestTransportDTO transport) {
   try {
     return core::Result<std::unique_ptr<CCLCOpenRequestUnixServer>>::Ok(
         std::unique_ptr<CCLCOpenRequestUnixServer>(
             new CCLCOpenRequestUnixServer(
-                std::make_unique<Impl>(trusted_state_root, port, transport))));
+                std::make_unique<Impl>(trusted_run_root, port, transport))));
   } catch (const std::exception &exception) {
     return core::Result<std::unique_ptr<CCLCOpenRequestUnixServer>>::Err(
         server_error("construction_failed", exception.what()));

@@ -24,7 +24,7 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=9011)
     parser.add_argument("--headless-url", default="http://127.0.0.1:9010")
-    parser.add_argument("--execution-state-root", type=Path, required=True)
+    parser.add_argument("--execution-run-root", type=Path, required=True)
     parser.add_argument("--cycle-journal-path", type=Path, required=True)
     parser.add_argument("--manager-liveness-socket", type=Path)
     parser.add_argument("--cell-id")
@@ -47,7 +47,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     try:
         config = ProgramRunnerConfig(
             headless_url=args.headless_url,
-            execution_state_root=args.execution_state_root,
+            execution_run_root=args.execution_run_root,
             cycle_journal_path=args.cycle_journal_path,
             owner_id=args.owner_id,
             headless_timeout_seconds=args.headless_timeout_s,

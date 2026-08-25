@@ -233,7 +233,10 @@ struct NativeFixture final {
   }
 
   std::filesystem::path root;
-  ScopedTemporaryRoot staging_root;
+  ScopedTemporaryRoot manager_state_root;
+  ScopedTemporaryRoot manager_run_root;
+  ScopedTemporaryRoot execution_state_root;
+  ScopedTemporaryRoot execution_run_root;
   deployment::FilesystemVerifiedRetainedBundleSource bundle_source;
   deployment::FilesystemVerifiedRetainedProductArtifactSource artifact_source;
   std::shared_ptr<const deployment::RetainedBundle> bundle;
@@ -302,8 +305,8 @@ MakeActivePlan(const component_manager::RuntimeUnitConvergenceQueryDTO &query) {
 MakeAdapter(NativeFixture &fixture, const std::filesystem::path &target_root) {
   return component_manager::RetainedNativeRuntimeUnitAdapter(
       target_root, fixture.root / "retained-package",
-      fixture.staging_root.path(), fixture.staging_root.path(),
-      fixture.staging_root.path(),
+      fixture.manager_state_root.path(), fixture.manager_run_root.path(),
+      fixture.execution_state_root.path(), fixture.execution_run_root.path(),
       fixture.bundle_source, fixture.artifact_source,
       std::string(contract::kOperatingSystem),
       std::string(contract::kLaunchEnvironmentContract));
@@ -312,7 +315,7 @@ MakeAdapter(NativeFixture &fixture, const std::filesystem::path &target_root) {
 [[nodiscard]] core::ActiveBundlePublicationReceiptDTO
 PublishActiveFixture(NativeFixture &fixture) {
   component_manager::SqliteActiveBundlePublicationStore store(
-      fixture.staging_root.path() /
+      fixture.manager_state_root.path() /
           std::string(component_manager::kActiveBundlePublicationStoreFilename),
       fixture.bundle->value().cell_graph.cell_id);
   const core::ContentDigest digest{std::string(kIntentDigest)};
@@ -529,6 +532,36 @@ TEST(NativeExecutionRuntimeUnitAdmission,
 }
 
 TEST(RetainedNativeRuntimeUnitAdapter,
+     RejectsNestedStateAndRunCapabilityTreesBeforeLaunch) {
+  NativeFixture fixture;
+  const auto nested_run_root = fixture.manager_state_root.path() / "run";
+  ASSERT_TRUE(std::filesystem::create_directory(nested_run_root));
+
+  EXPECT_THROW(
+      static_cast<void>(component_manager::RetainedNativeRuntimeUnitAdapter(
+          MANYFORGE_NATIVE_EXECUTION_TARGET_ROOT,
+          fixture.root / "retained-package",
+          fixture.manager_state_root.path(), nested_run_root,
+          fixture.execution_state_root.path(),
+          fixture.execution_run_root.path(), fixture.bundle_source,
+          fixture.artifact_source, std::string(contract::kOperatingSystem),
+          std::string(contract::kLaunchEnvironmentContract))),
+      std::runtime_error);
+
+  EXPECT_THROW(
+      static_cast<void>(component_manager::RetainedNativeRuntimeUnitAdapter(
+          MANYFORGE_NATIVE_EXECUTION_TARGET_ROOT,
+          fixture.root / "retained-package",
+          fixture.manager_state_root.path(), fixture.manager_run_root.path(),
+          fixture.execution_state_root.path(),
+          fixture.execution_run_root.path(), fixture.bundle_source,
+          fixture.artifact_source, std::string(contract::kOperatingSystem),
+          std::string(contract::kLaunchEnvironmentContract),
+          fixture.execution_run_root.path() / "logical-scene.sqlite3")),
+      std::runtime_error);
+}
+
+TEST(RetainedNativeRuntimeUnitAdapter,
      DirectChildOwnsStableEmptyAdmissionBeforeApplyAndRestartMintsNewEpoch) {
   NativeFixture fixture;
   ASSERT_TRUE(fixture.product.has_value());
@@ -604,8 +637,8 @@ TEST(RetainedNativeRuntimeUnitAdapter,
       std::to_string(package_descriptor);
   auto adapter = component_manager::RetainedNativeRuntimeUnitAdapter(
       MANYFORGE_NATIVE_EXECUTION_TARGET_ROOT, descriptor_root,
-      fixture.staging_root.path(), fixture.staging_root.path(),
-      fixture.staging_root.path(),
+      fixture.manager_state_root.path(), fixture.manager_run_root.path(),
+      fixture.execution_state_root.path(), fixture.execution_run_root.path(),
       fixture.bundle_source, fixture.artifact_source,
       std::string(contract::kOperatingSystem),
       std::string(contract::kLaunchEnvironmentContract));
@@ -1365,7 +1398,7 @@ TEST(RetainedNativeRuntimeUnitAdapter,
             component_manager::ProcessPresenceState::kPresent);
 
   component_manager::SqliteActiveBundlePublicationStore store(
-      fixture.staging_root.path() /
+      fixture.manager_state_root.path() /
           std::string(component_manager::kActiveBundlePublicationStoreFilename),
       fixture.bundle->value().cell_graph.cell_id);
   auto successor_projection =

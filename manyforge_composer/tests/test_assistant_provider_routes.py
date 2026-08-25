@@ -44,6 +44,21 @@ class RecordingProvider:
         return self._status(request_id, "cancelled")
 
 
+class AdmissionHeadless:
+    def authoring_admission(self) -> dict[str, Any]:
+        return {"authoring_allowed": True, "admission_generation": 7}
+
+    def recover_authoring_transaction(self, _body: dict[str, Any]) -> dict[str, Any]:
+        return {
+            "recovery_receipt": {
+                "status": "unknown",
+                "kernel_owner_epoch": "kernel.1",
+                "held_claims": [],
+                "current_owner_epochs": [],
+            }
+        }
+
+
 def _mode() -> dict[str, Any]:
     return {
         "mode": "composer-assistant",
@@ -75,13 +90,14 @@ def _mode() -> dict[str, Any]:
 
 
 def test_composer_forwards_exact_owner_context_without_owning_request_state(
-    monkeypatch,
+    monkeypatch, tmp_path,
 ) -> None:
     from manyforge_composer.backend import routes_assistant
 
     provider = RecordingProvider()
     state = ComposerState(
-        headless_client=object(),  # type: ignore[arg-type]
+        headless_client=AdmissionHeadless(),  # type: ignore[arg-type]
+        authoring_state_root=str(tmp_path),
         assistant_client=provider,  # type: ignore[arg-type]
     )
     node = SimpleNamespace(
@@ -134,6 +150,7 @@ def test_composer_forwards_exact_owner_context_without_owning_request_state(
     assert forwarded["modeProjection"] == mode.payload
     assert forwarded["composerDraft"]["draftId"] == state.draft_session.draft_id
     assert forwarded["composerDraft"]["programLoaded"] is False
+    assert forwarded["composerDraft"]["expectedAdmissionGeneration"] == 7
     assert set(forwarded["resolvedCatalog"]) == {
         "catalogHash",
         "grantPolicy",

@@ -156,9 +156,9 @@ describe('Program workspace request fencing', () => {
     expect(succeeded.pendingAction).toBeNull();
   });
 
-  it('clears Revert pending action with the owner-returned pending workspace', () => {
+  it('clears Revert action with the owner-returned completed workspace', () => {
     const previous = workspace('draft-before-revert', 7);
-    const ownerPending = workspace('owner-pending-revert', 8);
+    const ownerReverted = workspace('owner-reverted', 8);
     const started = programWorkspaceReducer({
       ...INITIAL_PROGRAM_WORKSPACE_STATE,
       status: 'ready',
@@ -169,20 +169,19 @@ describe('Program workspace request fencing', () => {
       generation: 9,
       action: 'revert',
     });
-    const pending = programWorkspaceReducer(started, {
+    const reverted = programWorkspaceReducer(started, {
       type: 'request_succeeded',
       generation: 9,
-      workspace: ownerPending,
-      message: 'Revert is pending deployment; Draft and Saved were not replaced.',
-      transitionStatus: 'pending_deployment',
+      workspace: ownerReverted,
+      message: 'Revert completed through authoritative Apply; Draft now matches Saved.',
+      transitionStatus: 'reverted',
     });
 
-    expect(pending.status).toBe('ready');
-    expect(pending.pendingAction).toBeNull();
-    expect(pending.workspace).toBe(ownerPending);
-    expect(pending.transitionStatus).toBe('pending_deployment');
-    expect(pending.message).toContain('were not replaced');
-    expect(pending.message).not.toContain('Draft now matches Saved');
+    expect(reverted.status).toBe('ready');
+    expect(reverted.pendingAction).toBeNull();
+    expect(reverted.workspace).toBe(ownerReverted);
+    expect(reverted.transitionStatus).toBe('reverted');
+    expect(reverted.message).toContain('Draft now matches Saved');
   });
 
   it('shows the closed Draft mutation before refreshing owner observations', () => {

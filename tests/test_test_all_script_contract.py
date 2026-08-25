@@ -102,6 +102,7 @@ def test_reduced_aggregate_has_an_explicit_retained_selector() -> None:
     assert "-p no:cacheprovider" in source
     assert "tests/test_public_contract_entrypoint_reconciliation.py" in source
     assert "tests/test_qualification_wrapper_entrypoints.py" in source
+    assert "tests/test_grouped_gtest_runner.py" in source
     assert retained_body.count("run_roboplan_tests") == 1
 
 
@@ -161,15 +162,32 @@ def test_collision_lookup_perf_successor_is_docker_only_and_executable() -> None
 
 def test_roboplan_suite_qualifies_only_the_retained_product_consumer() -> None:
     source = _TEST_ALL.read_text(encoding="utf-8")
+    configure = source.split("configure_roboplan_build() {", 1)[1].split(
+        "build_headless_roboplan_producer_closure() {", 1
+    )[0]
+    producer = source.split("build_headless_roboplan_producer_closure() {", 1)[
+        1
+    ].split("require_headless_native_packages() {", 1)[0]
     body = source.split("run_roboplan_tests() {", 1)[1].split(
         "run_headless_cpp_tests() {", 1
     )[0]
 
+    assert configure.index("codemodel-v2") < configure.index('cmake "$WORKSPACE')
+    assert configure.index("cmakeFiles-v1") < configure.index('cmake "$WORKSPACE')
+    assert configure.index("toolchains-v1") < configure.index('cmake "$WORKSPACE')
+    assert "tail -" not in configure
+    assert "--target \"${producer_targets[@]}\" -- -k" in producer
+    assert "tail -" not in producer
     assert "C++ retained RoboPlan product-consumer tests" in body
     assert "MANYFORGE_ENABLE_ROS2_CONTROL" not in body
     assert "manyforge_roboplan_py" not in body
     assert "manyforge_roboplan/python" not in body
     assert "configure_roboplan_build" in body
+    assert 'cmake --build "$build" --parallel "$BUILD_PARALLEL_LEVEL" -- -k' in body
+    assert "tail -" not in body
+    assert body.index("if ! cmake --build") < body.index(
+        'require_ctest_tests "manyforge_roboplan"'
+    )
     assert body.count("ctest --output-on-failure") == 1
 
 
@@ -592,6 +610,8 @@ def test_i9_isaac_launcher_enforces_the_recorded_topology_and_owner_split() -> N
     assert "simulation_interfaces" in source
     assert 'runtime_namespace:=${runtime_namespace}' in source
     assert 'command_gate_owner_namespace:=${runtime_namespace}' in source
+    assert 'manager_run_root:=${MANYFORGE_MANAGER_RUN_ROOT}' in source
+    assert "MANYFORGE_MANAGER_STATE_ROOT" not in source
     assert "MANYFORGE_ISAAC_COMPONENT_ID" in source
     for forbidden in (
         "isaac_demo_supervisor",

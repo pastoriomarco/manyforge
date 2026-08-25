@@ -7160,6 +7160,13 @@ public:
   Impl(std::filesystem::path database_path,
        const deployment::CanonicalEmptyRetainedBundleAdmission &admission,
        const core::IActiveBundlePublicationReader &publication_reader,
+       core::IKernelCellAdmissionPort &cell_admission)
+      : Impl(std::move(database_path), AuthorityFromAdmission(admission),
+             publication_reader, nullptr, nullptr, &cell_admission) {}
+
+  Impl(std::filesystem::path database_path,
+       const deployment::CanonicalEmptyRetainedBundleAdmission &admission,
+       const core::IActiveBundlePublicationReader &publication_reader,
        const deployment::IVerifiedRetainedBundleSource &retained_bundle_source)
       : Impl(std::move(database_path), AuthorityFromAdmission(admission),
              publication_reader, &retained_bundle_source, nullptr, nullptr) {}
@@ -7478,6 +7485,14 @@ CanonicalEmptySceneOwner::CanonicalEmptySceneOwner(
     const core::IActiveBundlePublicationReader &publication_reader)
     : impl_(std::make_unique<Impl>(std::move(database_path), admission,
                                    publication_reader)) {}
+
+CanonicalEmptySceneOwner::CanonicalEmptySceneOwner(
+    std::filesystem::path database_path,
+    const deployment::CanonicalEmptyRetainedBundleAdmission &admission,
+    const core::IActiveBundlePublicationReader &publication_reader,
+    core::IKernelCellAdmissionPort &cell_admission)
+    : impl_(std::make_unique<Impl>(std::move(database_path), admission,
+                                   publication_reader, cell_admission)) {}
 
 CanonicalEmptySceneOwner::CanonicalEmptySceneOwner(
     std::filesystem::path database_path,
@@ -9726,11 +9741,10 @@ CanonicalEmptySceneOwner::Commit(const SceneTransactionRequestDTO &request) {
 
   const bool authored_mutation = IsAuthoredSceneMutation(request);
   if (authored_mutation &&
-      (!request.expected_admission_generation.has_value() ||
-       impl_->cell_admission_ == nullptr)) {
+      !request.expected_admission_generation.has_value()) {
     return reject(core::RequestReplayStatusDTO::kAcceptedNew,
                   "authoring_not_ready",
-                  "authored scene mutation requires owner-local admission");
+                  "authored scene mutation requires an admission generation");
   }
   if (!authored_mutation && request.expected_admission_generation.has_value()) {
     return reject(core::RequestReplayStatusDTO::kAcceptedNew,
@@ -9808,6 +9822,12 @@ CanonicalEmptySceneOwner::Commit(const SceneTransactionRequestDTO &request) {
       }
       return ResultFromStoredOutcome(
           database, *existing, core::RequestReplayStatusDTO::kReplayedExact);
+    }
+    if (authored_mutation && impl_->cell_admission_ == nullptr) {
+      return reject(core::RequestReplayStatusDTO::kAcceptedNew,
+                    "authoring_not_ready",
+                    "new authored scene mutation requires owner-local "
+                    "admission");
     }
     const auto access = AccessStatus(observed_state);
     if (!access.scene_writes_open) {

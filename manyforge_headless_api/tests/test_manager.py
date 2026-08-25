@@ -93,6 +93,7 @@ def test_manager_client_uses_one_canonical_bounded_seqpacket(tmp_path: Path) -> 
     socket_path = tmp_path / "manager-command.sock"
     server = socket.socket(socket.AF_UNIX, socket.SOCK_SEQPACKET)
     server.bind(str(socket_path))
+    socket_path.chmod(0o600)
     server.listen(1)
     received: list[bytes] = []
     finished = threading.Event()
@@ -156,6 +157,7 @@ def test_manager_client_default_wait_covers_a_bounded_durable_mutation(
     socket_path = tmp_path / "manager-command.sock"
     server = socket.socket(socket.AF_UNIX, socket.SOCK_SEQPACKET)
     server.bind(str(socket_path))
+    socket_path.chmod(0o600)
     server.listen(1)
 
     def serve() -> None:
@@ -245,6 +247,7 @@ def test_scene_client_stamps_attribution_and_uses_one_canonical_packet(
     socket_path = tmp_path / "manager-command.sock"
     server = socket.socket(socket.AF_UNIX, socket.SOCK_SEQPACKET)
     server.bind(str(socket_path))
+    socket_path.chmod(0o600)
     server.listen(1)
     received: list[bytes] = []
 

@@ -8,11 +8,15 @@ import json
 import os
 from pathlib import Path
 import socket
-import stat
 import struct
 from typing import Any, Final
 
 import rfc8785
+
+from .private_transport import (
+    PinnedRunRoot,
+    PrivateTransportCapabilityError,
+)
 
 
 EXECUTION_SOCKET_FILE: Final = "execution-command.sock"
@@ -122,10 +126,16 @@ class CellAdmissionError(RuntimeError):
 class CellAdmissionClient:
     """Strict bounded client for owner-specific admission integration."""
 
-    def __init__(self, state_root: Path, *, timeout_seconds: float = 10.0) -> None:
+    def __init__(self, run_root: Path, *, timeout_seconds: float = 10.0) -> None:
         if timeout_seconds <= 0 or timeout_seconds > 30:
             raise ValueError("execution timeout must be in (0, 30] seconds")
-        self._socket_path = state_root / EXECUTION_SOCKET_FILE
+        try:
+            self._run_root = PinnedRunRoot(run_root)
+        except PrivateTransportCapabilityError as error:
+            raise CellAdmissionError(
+                "execution_owner_unavailable",
+                f"native execution run capability is invalid: {error}",
+            ) from error
         self._timeout_seconds = timeout_seconds
 
     @staticmethod
@@ -177,31 +187,35 @@ class CellAdmissionClient:
                 "cell-admission command exceeds its byte bound",
             )
         try:
-            metadata = self._socket_path.lstat()
-            if (
-                not stat.S_ISSOCK(metadata.st_mode)
-                or metadata.st_uid != os.geteuid()
-            ):
-                raise OSError("path is not the expected same-user socket")
-            with socket.socket(socket.AF_UNIX, socket.SOCK_SEQPACKET) as client:
-                client.settimeout(self._timeout_seconds)
-                client.setsockopt(
-                    socket.SOL_SOCKET, socket.SO_RCVBUF, MAXIMUM_RESPONSE_BYTES
-                )
-                client.connect(str(self._socket_path))
-                if hasattr(socket, "SO_PEERCRED"):
-                    credentials = client.getsockopt(
-                        socket.SOL_SOCKET, socket.SO_PEERCRED, 12
+            with self._run_root.socket_address(
+                EXECUTION_SOCKET_FILE
+            ) as socket_address:
+                with socket.socket(socket.AF_UNIX, socket.SOCK_SEQPACKET) as client:
+                    client.settimeout(self._timeout_seconds)
+                    client.setsockopt(
+                        socket.SOL_SOCKET,
+                        socket.SO_RCVBUF,
+                        MAXIMUM_RESPONSE_BYTES,
                     )
-                    _pid, peer_uid, _gid = struct.unpack("3i", credentials)
-                    if peer_uid != os.geteuid():
-                        raise OSError("peer is not owned by the current user")
-                if client.send(encoded) != len(encoded):
-                    raise OSError("command packet was truncated")
-                payload, _ancillary, flags, _address = client.recvmsg(
-                    MAXIMUM_RESPONSE_BYTES
-                )
-        except (FileNotFoundError, OSError, TimeoutError) as error:
+                    client.connect(socket_address)
+                    if hasattr(socket, "SO_PEERCRED"):
+                        credentials = client.getsockopt(
+                            socket.SOL_SOCKET, socket.SO_PEERCRED, 12
+                        )
+                        _pid, peer_uid, _gid = struct.unpack("3i", credentials)
+                        if peer_uid != os.geteuid():
+                            raise OSError("peer is not owned by the current user")
+                    if client.send(encoded) != len(encoded):
+                        raise OSError("command packet was truncated")
+                    payload, _ancillary, flags, _address = client.recvmsg(
+                        MAXIMUM_RESPONSE_BYTES
+                    )
+        except (
+            PrivateTransportCapabilityError,
+            FileNotFoundError,
+            OSError,
+            TimeoutError,
+        ) as error:
             raise CellAdmissionError(
                 "execution_owner_unavailable",
                 f"native execution transport failed: {error}",

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import json
+import math
 from pathlib import Path
 from threading import RLock
 import time
@@ -30,11 +31,41 @@ _MAX_CLIENTS = 1024
 _FRESH_SECONDS = 2.0
 
 
+def headless_client_http_exception(error: HeadlessClientError) -> HTTPException:
+    """Project one parsed Headless HTTP failure without changing its meaning."""
+
+    return HTTPException(
+        status_code=error.status_code or 503,
+        detail={"code": error.code, "message": str(error)},
+    )
+
+
+def _headless_proves_no_effect(error: HeadlessClientError) -> bool:
+    """Accept no-effect proof only from one parsed authoritative response."""
+
+    return (
+        error.status_code is not None
+        and error.response is not None
+        and error.details.get("effect_disposition") == "proven_no_effect"
+    )
+
+
 @dataclass(frozen=True, slots=True)
-class AuthoringMutationEnvelope:
+class BrowserAuthoringMutationEnvelope:
+    """One browser mutation fenced by its current complete GUI snapshot."""
+
     client_id: str
     snapshot_receiver_epoch: str
     snapshot_sequence: int
+    expected_admission_generation: int
+    request_owner_epoch: str
+    request_id: str
+
+
+@dataclass(frozen=True, slots=True)
+class BackendAuthoringMutationEnvelope:
+    """One backend mutation fenced by Kernel admission, never browser state."""
+
     expected_admission_generation: int
     request_owner_epoch: str
     request_id: str
@@ -236,6 +267,8 @@ class AuthoringAdmissionCoordinator:
         self, transaction: AuthoringTransaction, receipt: Mapping[str, Any]
     ) -> None:
         status = receipt.get("status")
+        if transaction.outcome is not None:
+            self._validate_transaction_outcome(transaction)
         if status == "conflicting":
             raise AuthoringJournalError(
                 "composer_authoring_recovery_conflict",
@@ -283,7 +316,10 @@ class AuthoringAdmissionCoordinator:
             self._journal.record(
                 transaction,
                 "release_receipt_json",
-                {"disposition": "proven_not_acquired"},
+                {
+                    "disposition": "proven_not_acquired",
+                    "admission_generation": receipt.get("admission_generation"),
+                },
             )
             return
         if status not in {"held_exact", "released_exact", "reconciled_exact"}:
@@ -307,11 +343,19 @@ class AuthoringAdmissionCoordinator:
             self._journal.record(
                 transaction,
                 "release_receipt_json",
-                {"disposition": status, "recovered": True},
+                {
+                    "disposition": status,
+                    "recovered": True,
+                    "admission_generation": receipt.get("admission_generation"),
+                },
             )
             return
 
-        settlement = "owner_commit"
+        settlement = (
+            str(transaction.outcome["settlement_kind"])
+            if transaction.outcome is not None
+            else "owner_commit"
+        )
         if transaction.outcome is None:
             recovered_effect = None
             external_effect = (
@@ -322,9 +366,26 @@ class AuthoringAdmissionCoordinator:
                 external_effect
                 and self._recover_effect is not None
             ):
-                recovered_effect = self._recover_effect(
-                    transaction, transaction.claim
-                )
+                try:
+                    recovered_effect = self._recover_effect(
+                        transaction, transaction.claim
+                    )
+                except HeadlessClientError as error:
+                    if not _headless_proves_no_effect(error):
+                        raise
+                    settlement = "proven_no_effect"
+                    self._journal.record(
+                        transaction,
+                        "outcome_json",
+                        self._stored_http_exception(
+                            headless_client_http_exception(error)
+                        ),
+                    )
+                    transaction = self._journal.lookup(
+                        transaction.request_owner_epoch,
+                        transaction.request_id,
+                    )
+                    assert transaction is not None
             if recovered_effect is not None:
                 result, post_image = recovered_effect
                 self._journal.record_effect_outcome(
@@ -349,7 +410,7 @@ class AuthoringAdmissionCoordinator:
                     transaction.request_owner_epoch, transaction.request_id
                 )
                 assert transaction is not None
-            else:
+            elif settlement != "proven_no_effect":
                 raise AuthoringJournalError(
                     "composer_authoring_effect_unprovable",
                     f"{transaction.operation_kind} recovery lacks exact post-image evidence",
@@ -390,6 +451,7 @@ class AuthoringAdmissionCoordinator:
     ) -> dict[str, Any]:
         return {
             "kind": "json_response",
+            "settlement_kind": "proven_no_effect",
             "status_code": 503,
             "body": {
                 "detail": {
@@ -440,7 +502,7 @@ class AuthoringAdmissionCoordinator:
 
     def _require_snapshot(
         self,
-        envelope: AuthoringMutationEnvelope,
+        envelope: BrowserAuthoringMutationEnvelope,
         *,
         draft_id: str,
         draft_revision: int,
@@ -471,25 +533,203 @@ class AuthoringAdmissionCoordinator:
                 },
             )
 
-    @staticmethod
-    def _stored_result(result: Any) -> dict[str, Any]:
-        if isinstance(result, JSONResponse):
-            return {
-                "kind": "json_response",
-                "status_code": result.status_code,
-                "body": json.loads(result.body),
-            }
-        if isinstance(result, dict):
-            return {"kind": "mapping", "body": result}
-        raise AuthoringJournalError(
-            "composer_authoring_result_invalid",
-            "authoring owner result is not replayable JSON",
+    def _require_mutation_source(
+        self,
+        envelope: BrowserAuthoringMutationEnvelope | BackendAuthoringMutationEnvelope,
+        *,
+        draft_id: str,
+        draft_revision: int,
+    ) -> None:
+        if isinstance(envelope, BrowserAuthoringMutationEnvelope):
+            self._require_snapshot(
+                envelope,
+                draft_id=draft_id,
+                draft_revision=draft_revision,
+            )
+            return
+        if not self._ready:
+            raise self._unavailable(
+                "composer_authoring_recovery_blocked",
+                self._blocked_reason or "authoring recovery is blocked",
+            )
+
+    def completed_admission_generation(
+        self,
+        envelope: BrowserAuthoringMutationEnvelope
+        | BackendAuthoringMutationEnvelope,
+    ) -> int:
+        """Return the exact post-settlement generation for a completed request."""
+
+        transaction = self._journal.lookup(
+            envelope.request_owner_epoch, envelope.request_id
+        )
+        receipt = (
+            transaction.release_receipt
+            if transaction is not None and transaction.complete
+            else None
+        )
+        admission = receipt.get("admission") if isinstance(receipt, dict) else None
+        generation = (
+            admission.get("admission_generation")
+            if isinstance(admission, dict)
+            else receipt.get("admission_generation")
+            if isinstance(receipt, dict)
+            else None
+        )
+        if type(generation) is int and 1 <= generation <= 9_007_199_254_740_991:
+            return generation
+        self._ready = False
+        self._blocked_reason = (
+            "completed authoring transaction omitted its admission generation"
+        )
+        raise self._unavailable(
+            "composer_authoring_outcome_invalid",
+            self._blocked_reason,
         )
 
     @staticmethod
+    def _stored_result(result: Any) -> dict[str, Any]:
+        if isinstance(result, JSONResponse):
+            stored = {
+                "kind": "json_response",
+                "settlement_kind": "owner_commit",
+                "status_code": result.status_code,
+                "body": json.loads(result.body),
+            }
+        elif isinstance(result, dict):
+            stored = {
+                "kind": "mapping",
+                "settlement_kind": "owner_commit",
+                "body": result,
+            }
+        else:
+            raise AuthoringJournalError(
+                "composer_authoring_result_invalid",
+                "authoring owner result is not replayable JSON",
+            )
+        AuthoringAdmissionCoordinator._validate_outcome(stored)
+        return stored
+
+    @staticmethod
+    def _stored_http_exception(error: HTTPException) -> dict[str, Any]:
+        stored = {
+            "kind": "http_exception",
+            "settlement_kind": "proven_no_effect",
+            "status_code": error.status_code,
+            "detail": error.detail,
+            "headers": (
+                None if error.headers is None else dict(error.headers)
+            ),
+        }
+        AuthoringAdmissionCoordinator._validate_outcome(stored)
+        return stored
+
+    @staticmethod
+    def _is_exact_json(value: Any) -> bool:
+        if value is None or isinstance(value, (str, bool)):
+            return True
+        if type(value) is int:
+            return True
+        if type(value) is float:
+            return math.isfinite(value)
+        if isinstance(value, list):
+            return all(
+                AuthoringAdmissionCoordinator._is_exact_json(item)
+                for item in value
+            )
+        if isinstance(value, dict):
+            return all(
+                isinstance(key, str)
+                and AuthoringAdmissionCoordinator._is_exact_json(item)
+                for key, item in value.items()
+            )
+        return False
+
+    @staticmethod
+    def _validate_outcome(outcome: Mapping[str, Any]) -> None:
+        kind = outcome.get("kind")
+        status = outcome.get("status_code")
+        settlement = outcome.get("settlement_kind")
+        common_valid = settlement in {"owner_commit", "proven_no_effect"}
+        if kind == "mapping":
+            valid = (
+                set(outcome) == {"kind", "settlement_kind", "body"}
+                and settlement == "owner_commit"
+                and isinstance(outcome.get("body"), dict)
+            )
+        elif kind == "json_response":
+            valid = (
+                set(outcome)
+                == {"kind", "settlement_kind", "status_code", "body"}
+                and common_valid
+                and type(status) is int
+                and 100 <= status <= 599
+            )
+        elif kind == "http_exception":
+            headers = outcome.get("headers")
+            valid = (
+                set(outcome)
+                == {
+                    "kind",
+                    "settlement_kind",
+                    "status_code",
+                    "detail",
+                    "headers",
+                }
+                and settlement == "proven_no_effect"
+                and type(status) is int
+                and 100 <= status <= 599
+                and (
+                    headers is None
+                    or (
+                        isinstance(headers, dict)
+                        and all(
+                            isinstance(key, str) and isinstance(value, str)
+                            for key, value in headers.items()
+                        )
+                    )
+                )
+            )
+        else:
+            valid = False
+        if not valid or not AuthoringAdmissionCoordinator._is_exact_json(
+            dict(outcome)
+        ):
+            raise AuthoringJournalError(
+                "composer_authoring_outcome_invalid",
+                "durable authoring outcome is not one exact supported HTTP result",
+            )
+
+    @staticmethod
+    def _validate_transaction_outcome(
+        transaction: AuthoringTransaction,
+    ) -> None:
+        if transaction.outcome is None:
+            raise AuthoringJournalError(
+                "composer_authoring_outcome_invalid",
+                "authoring transaction has no durable outcome",
+            )
+        AuthoringAdmissionCoordinator._validate_outcome(transaction.outcome)
+        committed = transaction.outcome["settlement_kind"] == "owner_commit"
+        if committed != (transaction.post_image is not None):
+            raise AuthoringJournalError(
+                "composer_authoring_outcome_invalid",
+                "durable authoring outcome and post-image disagree",
+            )
+
+    @staticmethod
     def _replay(outcome: Mapping[str, Any]) -> Any:
+        AuthoringAdmissionCoordinator._validate_outcome(outcome)
+        kind = outcome["kind"]
+        if kind == "http_exception":
+            headers = outcome.get("headers")
+            raise HTTPException(
+                status_code=int(outcome["status_code"]),
+                detail=outcome.get("detail"),
+                headers=(dict(headers) if isinstance(headers, Mapping) else None),
+            )
         body = outcome.get("body")
-        if outcome.get("kind") == "json_response":
+        if kind == "json_response":
             return JSONResponse(status_code=int(outcome["status_code"]), content=body)
         return body
 
@@ -497,6 +737,13 @@ class AuthoringAdmissionCoordinator:
     def _release(
         transaction: AuthoringTransaction, settlement_kind: str
     ) -> dict[str, Any]:
+        AuthoringAdmissionCoordinator._validate_transaction_outcome(transaction)
+        assert transaction.outcome is not None
+        if transaction.outcome["settlement_kind"] != settlement_kind:
+            raise AuthoringJournalError(
+                "composer_authoring_outcome_invalid",
+                "authoring settlement contradicts its durable outcome",
+            )
         return {
             "settlement_kind": settlement_kind,
             "evidence_digest": canonical_digest(
@@ -510,7 +757,7 @@ class AuthoringAdmissionCoordinator:
 
     def execute(
         self,
-        envelope: AuthoringMutationEnvelope,
+        envelope: BrowserAuthoringMutationEnvelope | BackendAuthoringMutationEnvelope,
         *,
         operation_kind: str,
         draft_id: str,
@@ -519,26 +766,41 @@ class AuthoringAdmissionCoordinator:
         effect: Callable[[dict[str, Any]], _T],
         post_image: Callable[[], Mapping[str, Any]],
         prepare_effect: Callable[[], Mapping[str, Any]] | None = None,
+        validate_under_claim: Callable[[dict[str, Any]], None] | None = None,
     ) -> _T:
-        self._require_snapshot(
-            envelope, draft_id=draft_id, draft_revision=draft_revision
-        )
         payload_digest = canonical_digest(payload)
         replay = self._journal.lookup(
             envelope.request_owner_epoch, envelope.request_id
         )
         if replay is not None:
-            if replay.payload_digest != payload_digest or replay.operation_kind != operation_kind:
+            if (
+                replay.payload_digest != payload_digest
+                or replay.operation_kind != operation_kind
+                or replay.draft_id != draft_id
+                or replay.draft_revision != draft_revision
+                or replay.admission_generation
+                != envelope.expected_admission_generation
+            ):
                 raise self._unavailable(
                     "composer_authoring_request_id_conflict",
                     "authoring request ID is bound to another operation",
                 )
             if replay.complete and replay.outcome is not None:
-                return self._replay(replay.outcome)
+                try:
+                    self._validate_transaction_outcome(replay)
+                    return self._replay(replay.outcome)
+                except AuthoringJournalError as error:
+                    self._ready = False
+                    self._blocked_reason = str(error)
+                    raise self._unavailable(error.code, str(error)) from error
             raise self._unavailable(
                 "composer_authoring_recovery_blocked",
                 "the exact authoring request has an unresolved durable outcome",
             )
+
+        self._require_mutation_source(
+            envelope, draft_id=draft_id, draft_revision=draft_revision
+        )
 
         prepared_effect = (
             dict(prepare_effect())
@@ -614,9 +876,11 @@ class AuthoringAdmissionCoordinator:
                 envelope.request_owner_epoch, envelope.request_id
             )
             assert transaction is not None
-            self._require_snapshot(
+            self._require_mutation_source(
                 envelope, draft_id=draft_id, draft_revision=draft_revision
             )
+            if validate_under_claim is not None:
+                validate_under_claim(claim)
             self._journal.record(
                 transaction,
                 "effect_intent_json",
@@ -646,17 +910,28 @@ class AuthoringAdmissionCoordinator:
             transaction = self._journal.lookup(
                 envelope.request_owner_epoch, envelope.request_id
             )
+            headless_error = (
+                error.__cause__
+                if isinstance(error.__cause__, HeadlessClientError)
+                else None
+            )
             if (
                 transaction is not None
                 and transaction.claim is not None
-                and transaction.effect_intent is None
                 and transaction.outcome is None
+                and (
+                    transaction.effect_intent is None
+                    or (
+                        headless_error is not None
+                        and _headless_proves_no_effect(headless_error)
+                    )
+                )
             ):
                 try:
                     self._journal.record(
                         transaction,
                         "outcome_json",
-                        self._recovered_no_effect_outcome(transaction),
+                        self._stored_http_exception(error),
                     )
                     transaction = self._journal.lookup(
                         envelope.request_owner_epoch, envelope.request_id
@@ -711,4 +986,9 @@ class AuthoringAdmissionCoordinator:
             raise
 
 
-__all__ = ["AuthoringAdmissionCoordinator", "AuthoringMutationEnvelope"]
+__all__ = [
+    "AuthoringAdmissionCoordinator",
+    "BrowserAuthoringMutationEnvelope",
+    "BackendAuthoringMutationEnvelope",
+    "headless_client_http_exception",
+]

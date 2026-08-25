@@ -3,12 +3,13 @@
 from __future__ import annotations
 
 from copy import deepcopy
-from threading import Event, Thread
+from threading import Barrier, Event, Thread
 from types import SimpleNamespace
 from typing import Any
 
 import pytest
 
+from manyforge_behavior.program_run_owner import ProgramRunOwnerError
 from manyforge_headless_api.models import (
     ProgramRunStartRequest,
     ProgramRunStopRequest,
@@ -157,6 +158,16 @@ class _Owner:
     def read(self, program_run_id: str) -> _Snapshot:
         self.reads += 1
         return self.rows[program_run_id]
+
+
+class _ObservationOwner(_Owner):
+    def read(self, program_run_id: str) -> _Snapshot:
+        try:
+            return super().read(program_run_id)
+        except KeyError as error:
+            raise ProgramRunOwnerError(
+                f"Program run {program_run_id} is not resident"
+            ) from error
 
 
 class _Host:
@@ -312,11 +323,13 @@ def _reconcile_runtime(
     )
     admission = _Admission()
     admission.inventory = deepcopy(inventory)
+    execution_run_root = tmp_path / "execution-run"
+    execution_run_root.mkdir(exist_ok=True)
     runtime = ProgramRuntime(
         ProgramRunnerConfig(
             headless_url="http://headless.test",
             owner_epoch=runtime_owner_epoch,
-            execution_state_root=tmp_path,
+            execution_run_root=execution_run_root,
             cycle_journal_path=tmp_path / "cycle.sqlite3",
         ),
         headless_client=_Headless(),  # type: ignore[arg-type]
@@ -563,25 +576,117 @@ def _start_request(*, request_id: str = "request.start.1") -> ProgramRunStartReq
 
 
 def test_config_pairs_execution_root_exactly_with_cycle_journal(tmp_path) -> None:
-    journal = tmp_path / "cycle.sqlite3"
+    execution_run_root = tmp_path / "execution-run"
+    execution_run_root.mkdir()
+    journal = tmp_path / "state" / "cycle.sqlite3"
     config = ProgramRunnerConfig(
         headless_url="http://headless.test",
-        execution_state_root=tmp_path,
+        execution_run_root=execution_run_root,
         cycle_journal_path=journal,
     )
-    assert config.execution_state_root == tmp_path
+    assert config.execution_run_root == execution_run_root
     assert config.cycle_journal_path == journal
 
     with pytest.raises(ValueError, match="configured together"):
         ProgramRunnerConfig(
             headless_url="http://headless.test",
-            execution_state_root=tmp_path,
+            execution_run_root=execution_run_root,
         )
     with pytest.raises(ValueError, match="configured together"):
         ProgramRunnerConfig(
             headless_url="http://headless.test",
             cycle_journal_path=journal,
         )
+    with pytest.raises(ValueError, match="outside disposable"):
+        ProgramRunnerConfig(
+            headless_url="http://headless.test",
+            execution_run_root=execution_run_root,
+            cycle_journal_path=execution_run_root / "cycle.sqlite3",
+        )
+
+
+def test_repeated_concurrent_run_observation_is_strictly_read_only(
+    tmp_path,
+) -> None:
+    journal = ProgramCycleJournal(
+        tmp_path / "cycle.sqlite3", owner_epoch="runner.observation"
+    )
+    history = _Snapshot(
+        "run.history",
+        owner_id="program-runner.test",
+        owner_epoch="runner.observation",
+        state="succeeded",
+        revision=3,
+    )
+    journal.retain_run_snapshot(history.to_dict())
+    owner = _ObservationOwner()
+    owner.rows["run.live"] = _Snapshot(
+        "run.live",
+        owner_id="program-runner.test",
+        owner_epoch="runner.observation",
+        state="running",
+        revision=2,
+    )
+    owner.rows["run.resident-terminal"] = _Snapshot(
+        "run.resident-terminal",
+        owner_id="program-runner.test",
+        owner_epoch="runner.observation",
+        state="stopped",
+        revision=4,
+    )
+    runtime = ProgramRuntime(
+        ProgramRunnerConfig(
+            headless_url="http://headless.test",
+            owner_id="program-runner.test",
+            owner_epoch="runner.observation",
+        ),
+        headless_client=_Headless(),  # type: ignore[arg-type]
+        cycle_journal=journal,
+    )
+    runtime._owner = owner  # type: ignore[assignment]  # noqa: SLF001
+    retain_calls: list[dict[str, Any]] = []
+
+    def forbidden_retention(snapshot: dict[str, Any]) -> None:
+        retain_calls.append(snapshot)
+        raise AssertionError("a Program-run GET attempted durable retention")
+
+    journal.retain_run_snapshot = forbidden_retention  # type: ignore[method-assign]
+    changes_before = journal._database.total_changes  # noqa: SLF001
+    barrier = Barrier(5)
+    errors: list[BaseException] = []
+
+    def observe() -> None:
+        barrier.wait()
+        try:
+            for _ in range(20):
+                all_runs = runtime.runs(active_only=False, limit=10)
+                assert {
+                    value["capture"]["program_run_id"]
+                    for value in all_runs["runs"]
+                } == {
+                    "run.history",
+                    "run.live",
+                    "run.resident-terminal",
+                }
+                assert runtime.runs(active_only=True, limit=10)["runs"][0][
+                    "capture"
+                ]["program_run_id"] == "run.live"
+                assert runtime.read_run("run.live")["state"] == "running"
+                assert runtime.read_run("run.history")["state"] == "succeeded"
+        except BaseException as error:
+            errors.append(error)
+
+    threads = [Thread(target=observe) for _ in range(4)]
+    for thread in threads:
+        thread.start()
+    barrier.wait()
+    for thread in threads:
+        thread.join()
+
+    assert errors == []
+    assert retain_calls == []
+    assert journal._database.total_changes == changes_before  # noqa: SLF001
+    runtime.shutdown()
 
 
 def test_runtime_replays_exact_requests_and_keeps_one_active_product_run(
@@ -754,11 +859,13 @@ def test_replacement_owner_remains_fail_closed_for_later_reconciliation_owner(
     assert replacement.read().owner_epoch == "runner.old"
     assert replacement.read().reconciliation_required is True
     admission = _Admission()
+    execution_run_root = tmp_path / "execution-run"
+    execution_run_root.mkdir()
     runtime = ProgramRuntime(
         ProgramRunnerConfig(
             headless_url="http://headless.test",
             owner_epoch="runner.new",
-            execution_state_root=tmp_path,
+            execution_run_root=execution_run_root,
             cycle_journal_path=path,
         ),
         headless_client=_Headless(),  # type: ignore[arg-type]
@@ -834,11 +941,13 @@ def test_restart_retries_containment_after_durable_loss_crash_window(
             owner_epoch="runner.new",
             evidence_digest=_DIGEST_A,
         )
+    execution_run_root = tmp_path / "execution-run"
+    execution_run_root.mkdir()
     runtime = ProgramRuntime(
         ProgramRunnerConfig(
             headless_url="http://headless.test",
             owner_epoch="runner.new",
-            execution_state_root=tmp_path,
+            execution_run_root=execution_run_root,
             cycle_journal_path=path,
             manager_liveness_socket=tmp_path / "runner.sock",
             cell_id="cell",

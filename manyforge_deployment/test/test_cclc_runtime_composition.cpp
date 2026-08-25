@@ -248,11 +248,11 @@ publication(const RetainedBundle &bundle) {
 configuration(const std::filesystem::path &root, const core::CellId &cell_id,
               std::string owner_suffix) {
   const auto state_root = root / "state";
-  const auto plan_root = root / "plans";
+  const auto run_root = root / "run";
   std::filesystem::create_directory(state_root);
-  std::filesystem::create_directory(plan_root);
+  std::filesystem::create_directory(run_root);
   return {state_root,
-          plan_root,
+          run_root,
           cell_id,
           {core::RequestOwnerEpoch("cclc-owner." + owner_suffix), 128U, 1U, 1U,
            1'000'000LL, 30'000'000'000LL, 30'000'000'000LL}};
@@ -404,15 +404,109 @@ TEST(CCLCRuntimeComposition, RejectsMissingTrustedRootsWithoutCreatingThem) {
 
   auto config = configuration(
       root.path(), retained.bundle->value().cell_graph.cell_id, "missing");
-  const auto missing_plan_root = root.path() / "absent-plan-root";
-  config.resolved_stop_plan_root = missing_plan_root;
+  const auto missing_run_root = root.path() / "absent-run-root";
+  config.run_root = missing_run_root;
   auto composition = CCLCRuntimeComposition::CreateAndStart(
       std::move(config), retained.bundle, publication_reader, receipt,
       artifact_source, catalogs.value(), {},
       controller_sources(*retained.bundle), {}, {}, {}, kernel_ports,
       kernel_ports, kernel_ports, publication_owner, clock, scheduler);
   EXPECT_FALSE(composition.ok());
-  EXPECT_FALSE(std::filesystem::exists(missing_plan_root));
+  EXPECT_FALSE(std::filesystem::exists(missing_run_root));
+}
+
+TEST(CCLCRuntimeComposition, RejectsAliasedStateAndRunCapabilities) {
+  ScopedTrustedRoot root;
+  const auto retained =
+      test::materialize_lite6_retained_consumer_fixture(root.path());
+  const auto receipt = publication(*retained.bundle);
+  ActivePublicationReader publication_reader(receipt);
+  FilesystemVerifiedRetainedProductArtifactSource artifact_source(root.path());
+  auto catalogs = core::BuildOwnedLifecyclePlanCatalogSource::Make({});
+  ASSERT_TRUE(catalogs.ok());
+  UnusedKernelPorts kernel_ports;
+  UnusedKernelPublicationOwner publication_owner;
+  core::FakeClock clock;
+  core::ManualScheduler scheduler;
+  auto config = configuration(
+      root.path(), retained.bundle->value().cell_graph.cell_id, "aliased");
+  config.run_root = config.state_root / ".";
+
+  auto composition = CCLCRuntimeComposition::CreateAndStart(
+      std::move(config), retained.bundle, publication_reader, receipt,
+      artifact_source, catalogs.value(), {},
+      controller_sources(*retained.bundle), {}, {}, {}, kernel_ports,
+      kernel_ports, kernel_ports, publication_owner, clock, scheduler);
+  EXPECT_FALSE(composition.ok());
+}
+
+TEST(CCLCRuntimeComposition, RejectsNestedStateAndRunCapabilities) {
+  ScopedTrustedRoot root;
+  const auto retained =
+      test::materialize_lite6_retained_consumer_fixture(root.path());
+  const auto receipt = publication(*retained.bundle);
+  ActivePublicationReader publication_reader(receipt);
+  FilesystemVerifiedRetainedProductArtifactSource artifact_source(root.path());
+  auto catalogs = core::BuildOwnedLifecyclePlanCatalogSource::Make({});
+  ASSERT_TRUE(catalogs.ok());
+  UnusedKernelPorts kernel_ports;
+  UnusedKernelPublicationOwner publication_owner;
+  core::FakeClock clock;
+  core::ManualScheduler scheduler;
+  auto config = configuration(
+      root.path(), retained.bundle->value().cell_graph.cell_id, "nested");
+  config.run_root = config.state_root / "disposable";
+  ASSERT_TRUE(std::filesystem::create_directory(config.run_root));
+
+  auto composition = CCLCRuntimeComposition::CreateAndStart(
+      std::move(config), retained.bundle, publication_reader, receipt,
+      artifact_source, catalogs.value(), {},
+      controller_sources(*retained.bundle), {}, {}, {}, kernel_ports,
+      kernel_ports, kernel_ports, publication_owner, clock, scheduler);
+  EXPECT_FALSE(composition.ok());
+}
+
+TEST(CCLCRuntimeComposition,
+     RejectsSymlinkedOrUnsafeTrustedRootsBeforeStateMutation) {
+  for (const bool symlinked : {false, true}) {
+    ScopedTrustedRoot root;
+    const auto retained =
+        test::materialize_lite6_retained_consumer_fixture(root.path());
+    const auto receipt = publication(*retained.bundle);
+    ActivePublicationReader publication_reader(receipt);
+    FilesystemVerifiedRetainedProductArtifactSource artifact_source(
+        root.path());
+    auto catalogs = core::BuildOwnedLifecyclePlanCatalogSource::Make({});
+    ASSERT_TRUE(catalogs.ok());
+    UnusedKernelPorts kernel_ports;
+    UnusedKernelPublicationOwner publication_owner;
+    core::FakeClock clock;
+    core::ManualScheduler scheduler;
+    auto config = configuration(
+        root.path(), retained.bundle->value().cell_graph.cell_id,
+        symlinked ? "symlinked" : "unsafe-mode");
+    const auto state_root = config.state_root;
+    const auto real_run_root = config.run_root;
+    if (symlinked) {
+      const auto run_link = root.path() / "run-link";
+      std::filesystem::create_directory_symlink(real_run_root, run_link);
+      config.run_root = run_link;
+    } else {
+      std::filesystem::permissions(
+          real_run_root, std::filesystem::perms::owner_all |
+                             std::filesystem::perms::group_write,
+          std::filesystem::perm_options::replace);
+    }
+
+    auto composition = CCLCRuntimeComposition::CreateAndStart(
+        std::move(config), retained.bundle, publication_reader, receipt,
+        artifact_source, catalogs.value(), {},
+        controller_sources(*retained.bundle), {}, {}, {}, kernel_ports,
+        kernel_ports, kernel_ports, publication_owner, clock, scheduler);
+    EXPECT_FALSE(composition.ok());
+    EXPECT_TRUE(std::filesystem::is_empty(state_root));
+    EXPECT_TRUE(std::filesystem::is_empty(real_run_root));
+  }
 }
 
 } // namespace

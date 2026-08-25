@@ -416,14 +416,12 @@ def headless_client() -> (
                 and body["expected_applied_record_digest"] is not None
             ):
                 return httpx.Response(
-                    202,
+                    409,
                     json={
-                        "schema_version": "manyforge.program_apply_result.v1",
-                        "status": "pending_deployment",
-                        "deployment_apply_required": True,
-                        "preparation": {},
-                        "manager_response": {"ok": True},
-                        "applied": None,
+                        "detail": {
+                            "code": "program_apply_deployment_not_active",
+                            "message": "select the deployment explicitly first",
+                        }
                     },
                     request=request,
                 )
@@ -459,11 +457,9 @@ def headless_client() -> (
                 return httpx.Response(
                     200,
                     json={
-                        "schema_version": "manyforge.program_apply_result.v1",
+                        "schema_version": "manyforge.program_apply_result.v2",
                         "status": "applied",
-                        "deployment_apply_required": False,
                         "preparation": {},
-                        "manager_response": None,
                         "applied": {
                             "assistant_mode": "forbidden",
                             "baseline_program_binding_id": "sha256:" + "3" * 64,
@@ -547,11 +543,9 @@ def headless_client() -> (
                 else committed_program
             )
             payload = {
-                "schema_version": "manyforge.program_apply_result.v1",
+                "schema_version": "manyforge.program_apply_result.v2",
                 "status": "applied",
-                "deployment_apply_required": False,
                 "preparation": {},
-                "manager_response": None,
                 "applied": committed_program,
             }
         elif path == "/api/assistant/modes":
@@ -841,11 +835,9 @@ def test_headless_http_client_maps_non_string_provenance_kind_to_stable_apply_er
         "typed_parameter_overrides": {},
     }
     result = {
-        "schema_version": "manyforge.program_apply_result.v1",
+        "schema_version": "manyforge.program_apply_result.v2",
         "status": "applied",
-        "deployment_apply_required": False,
         "preparation": {},
-        "manager_response": None,
         "applied": applied,
     }
 
@@ -909,11 +901,9 @@ def test_headless_http_client_rejects_rehashed_malformed_apply_binding() -> None
         "typed_parameter_overrides": {},
     }
     result = {
-        "schema_version": "manyforge.program_apply_result.v1",
+        "schema_version": "manyforge.program_apply_result.v2",
         "status": "applied",
-        "deployment_apply_required": False,
         "preparation": {},
-        "manager_response": None,
         "applied": applied,
     }
 
@@ -1653,13 +1643,13 @@ def test_normative_load_publishes_draft_and_saved_only_after_apply(
     assert len(forwarded) == 1
 
 
-def test_pending_normative_load_preserves_the_prior_workspace(
+def test_load_rejects_inactive_deployment_and_preserves_prior_workspace(
     headless_client,
 ) -> None:
     client, _requests, _node_environment = headless_client
     with _composer_with_program(client) as composer:
         before = composer.get("/api/program/workspace").json()
-        pending = composer.post(
+        rejected = composer.post(
             "/api/program/load",
             json={
                 "draftId": before["draft"]["draftId"],
@@ -1672,9 +1662,10 @@ def test_pending_normative_load_preserves_the_prior_workspace(
         )
         after = composer.get("/api/program/workspace").json()
 
-    assert pending.status_code == 202
-    assert pending.json()["status"] == "pending_deployment"
-    assert pending.json()["workspace"] == before
+    assert rejected.status_code == 409
+    assert rejected.json()["detail"]["code"] == (
+        "program_apply_deployment_not_active"
+    )
     assert after == before
 
 
@@ -1802,7 +1793,11 @@ def test_program_revert_without_applied_selection_has_no_effect(
 @pytest.mark.parametrize(
     ("scenario_id", "expected_status", "expected_code"),
     [
-        ("revert-pending", 202, None),
+        (
+            "revert-pending",
+            409,
+            "program_apply_deployment_not_active",
+        ),
         ("revert-rejected", 409, "program_apply_compare_and_swap_failed"),
         ("revert-malformed", 502, "program_apply_response_invalid"),
         ("revert-raced", 409, "program_apply_selection_stale"),
@@ -1882,10 +1877,7 @@ def test_program_revert_failure_preserves_draft_saved_and_active_run(
         ]
 
     assert response.status_code == expected_status
-    if expected_code is None:
-        assert response.json()["status"] == "pending_deployment"
-    else:
-        assert response.json()["detail"]["code"] == expected_code
+    assert response.json()["detail"]["code"] == expected_code
     assert after["draft"] == dirty["draft"]
     assert after["saved"] == dirty["saved"]
     assert _PROGRAM_PATH.read_bytes() == disk_before
@@ -2198,6 +2190,62 @@ def test_composer_websocket_streams_owner_snapshots_only(
         item for item in requests if item["path"] == "/api/execution/alarms"
     )
     assert alarm_request["query"] == "limit=32&ordering=attention_newest"
+
+
+def test_composer_websocket_registers_barrier_before_client_observation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class Admission:
+        mutation_ready = True
+        receiver_epoch = "composer-snapshot.test"
+
+        def __init__(self) -> None:
+            self.published = False
+            self.disconnected = False
+
+        def publish_complete_snapshot(self, **_kwargs) -> None:
+            self.published = True
+
+        def disconnect(self, _client_id: str) -> None:
+            self.disconnected = True
+
+    admission = Admission()
+
+    class RecordingWebSocket:
+        async def accept(self) -> None:
+            return None
+
+        async def send_text(self, _message: str) -> None:
+            assert admission.published is True
+            raise WebSocketDisconnect()
+
+    class SnapshotClient:
+        def runtime(self) -> dict[str, Any]:
+            return _runtime()
+
+        def alarms(self, *, limit: int, ordering: str) -> dict[str, Any]:
+            assert limit == 32
+            assert ordering == "attention_newest"
+            return _alarms()
+
+        def authoring_admission(self) -> dict[str, Any]:
+            return {"authoring_allowed": True, "admission_generation": 7}
+
+        def program_cycle_status(self) -> dict[str, Any]:
+            return {"state": "idle"}
+
+    monkeypatch.setattr(headless_ws, "POLL_INTERVAL_SECONDS", 0)
+    asyncio.run(
+        serve_headless_state(
+            RecordingWebSocket(),  # type: ignore[arg-type]
+            SnapshotClient(),  # type: ignore[arg-type]
+            client_id="test-browser",
+            admission=admission,  # type: ignore[arg-type]
+            draft_session=ComposerState().draft_session,
+        )
+    )
+
+    assert admission.disconnected is True
 
 
 def test_composer_websocket_deduplicates_an_unchanged_owner_failure(

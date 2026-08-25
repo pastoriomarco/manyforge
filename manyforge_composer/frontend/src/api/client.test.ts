@@ -100,11 +100,9 @@ function appliedResultFixture(): Record<string, unknown> {
   binding.graph_revision = digestC;
   (binding.node_environment as Record<string, unknown>).environment_digest = digestA;
   return {
-    schema_version: 'manyforge.program_apply_result.v1',
+    schema_version: 'manyforge.program_apply_result.v2',
     status: 'applied',
-    deployment_apply_required: false,
     preparation: {},
-    manager_response: null,
     applied: {
       assistant_mode: 'forbidden',
       baseline_program_binding_id: digestA,

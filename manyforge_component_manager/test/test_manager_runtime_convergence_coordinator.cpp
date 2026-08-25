@@ -1542,8 +1542,10 @@ TEST(ManagerApplyRuntimeConvergenceCoordinator,
      ConcreteRetainedProcessReachesDurableStagedReadyWithoutEpochReplacement) {
   ScopedPackageRoot root;
   auto package = MaterializeRuntimePackage(root.path());
-  const auto runtime_root = root.path() / "manager-private-runtime";
-  ASSERT_TRUE(std::filesystem::create_directory(runtime_root));
+  const auto runtime_state_root = root.path() / "execution-state";
+  const auto runtime_run_root = root.path() / "execution-run";
+  ASSERT_TRUE(std::filesystem::create_directory(runtime_state_root));
+  ASSERT_TRUE(std::filesystem::create_directory(runtime_run_root));
   const auto apply_intent = ApplyIntent(*package.bundle);
   SqliteManagerApplyJournal journal(root.path() / "concrete-apply.sqlite3",
                                     package.bundle->value().cell_graph.cell_id);
@@ -1552,8 +1554,8 @@ TEST(ManagerApplyRuntimeConvergenceCoordinator,
   ManagerApplyFenceCoordinator fence_coordinator(
       journal, kernel, RuntimeEpoch("manager-runtime-1"));
   RetainedPosixRuntimeUnitAdapter runtime_adapter(
-      runtime_root, *package.bundle_source, *package.artifact_source, "linux",
-      "posix.1-2017");
+      runtime_state_root, runtime_run_root, *package.bundle_source,
+      *package.artifact_source, "linux", "posix.1-2017");
   std::uint64_t now_ns = 1'000U;
   ManagerApplyRuntimeConvergenceCoordinator coordinator(
       fence_coordinator, journal, publication, *package.artifact_source,

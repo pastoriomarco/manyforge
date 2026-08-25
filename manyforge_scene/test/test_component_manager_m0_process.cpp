@@ -94,7 +94,8 @@ public:
                           package_root(),
                           std::filesystem::copy_options::recursive);
     std::filesystem::create_directory(manager_root());
-    std::filesystem::create_directory(runtime_root());
+    std::filesystem::create_directory(execution_state_root());
+    std::filesystem::create_directory(execution_run_root());
   }
 
   ~M0Directory() {
@@ -108,8 +109,11 @@ public:
   [[nodiscard]] std::filesystem::path manager_root() const {
     return root_ / "manager";
   }
-  [[nodiscard]] std::filesystem::path runtime_root() const {
-    return root_ / "runtime";
+  [[nodiscard]] std::filesystem::path execution_state_root() const {
+    return root_ / "execution-state";
+  }
+  [[nodiscard]] std::filesystem::path execution_run_root() const {
+    return root_ / "execution-run";
   }
   [[nodiscard]] std::filesystem::path scene_path() const {
     return root_ / "logical-scene.sqlite3";
@@ -182,6 +186,8 @@ ApplyIntent(const deployment::CanonicalEmptyRetainedBundleAdmission &admission,
       predecessor.request.candidate_projection_revision,
       candidate.retained_bundle_id(),
       candidate.value().cell_graph.graph_revision,
+      core::AdmissionGeneration(1U),
+      std::nullopt,
   };
   if (!intent.valid()) {
     throw std::runtime_error("M0 fixture produced an invalid Apply intent");
@@ -546,8 +552,8 @@ TEST(ComponentManagerM0Process,
         stores.apply_journal(), kernel,
         core::RuntimeEpoch("m0-manager-runtime-start"));
     component_manager::RetainedPosixRuntimeUnitAdapter adapter(
-        directory.runtime_root(), bundle_source, artifact_source, "linux",
-        "posix.1-2017");
+        directory.execution_state_root(), directory.execution_run_root(),
+        bundle_source, artifact_source, "linux", "posix.1-2017");
     std::uint64_t now = 1'000U;
     component_manager::ManagerApplyRuntimeConvergenceCoordinator convergence(
         fence, stores.apply_journal(), stores.active_bundle_publication_store(),
@@ -595,8 +601,8 @@ TEST(ComponentManagerM0Process,
         stores.apply_journal(), kernel,
         core::RuntimeEpoch("m0-manager-runtime-recovery"));
     component_manager::RetainedPosixRuntimeUnitAdapter adapter(
-        directory.runtime_root(), bundle_source, artifact_source, "linux",
-        "posix.1-2017");
+        directory.execution_state_root(), directory.execution_run_root(),
+        bundle_source, artifact_source, "linux", "posix.1-2017");
     std::uint64_t now = 2'000U;
     component_manager::ManagerApplyRuntimeConvergenceCoordinator convergence(
         fence, stores.apply_journal(), stores.active_bundle_publication_store(),
@@ -674,8 +680,8 @@ TEST(ComponentManagerM0Process,
     component_manager::DurableManagerActiveRuntimePlanSource plan_source(
         stores.active_bundle_publication_store(), stores.apply_journal());
     component_manager::RetainedPosixRuntimeUnitAdapter adapter(
-        directory.runtime_root(), bundle_source, artifact_source, "linux",
-        "posix.1-2017");
+        directory.execution_state_root(), directory.execution_run_root(),
+        bundle_source, artifact_source, "linux", "posix.1-2017");
     std::uint64_t now = 3'000U;
     component_manager::ManagerActiveRuntimeCoordinator active(
         plan_source, adapter, adapter, [&now] { return ++now; });
@@ -683,7 +689,7 @@ TEST(ComponentManagerM0Process,
   });
   EXPECT_EQ(active_epoch, first_epoch);
 
-  const auto crashed_pids = ReadRuntimePids(directory.runtime_root());
+  const auto crashed_pids = ReadRuntimePids(directory.execution_state_root());
   ASSERT_EQ(::kill(crashed_pids.at("pid"), SIGKILL), 0);
   WaitForProcessPairToExit(crashed_pids);
 
@@ -698,8 +704,8 @@ TEST(ComponentManagerM0Process,
     component_manager::DurableManagerActiveRuntimePlanSource plan_source(
         stores.active_bundle_publication_store(), stores.apply_journal());
     component_manager::RetainedPosixRuntimeUnitAdapter adapter(
-        directory.runtime_root(), bundle_source, artifact_source, "linux",
-        "posix.1-2017");
+        directory.execution_state_root(), directory.execution_run_root(),
+        bundle_source, artifact_source, "linux", "posix.1-2017");
     std::uint64_t now = 4'000U;
     component_manager::ManagerActiveRuntimeCoordinator active(
         plan_source, adapter, adapter, [&now] { return ++now; });
@@ -719,8 +725,8 @@ TEST(ComponentManagerM0Process,
         component_manager::DurableManagerActiveRuntimePlanSource plan_source(
             stores.active_bundle_publication_store(), stores.apply_journal());
         component_manager::RetainedPosixRuntimeUnitAdapter adapter(
-            directory.runtime_root(), bundle_source, artifact_source, "linux",
-            "posix.1-2017");
+            directory.execution_state_root(), directory.execution_run_root(),
+            bundle_source, artifact_source, "linux", "posix.1-2017");
         std::uint64_t now = 5'000U;
         component_manager::ManagerActiveRuntimeCoordinator active(
             plan_source, adapter, adapter, [&now] { return ++now; });
@@ -745,8 +751,8 @@ TEST(ComponentManagerM0Process,
     component_manager::DurableManagerActiveRuntimePlanSource plan_source(
         stores.active_bundle_publication_store(), stores.apply_journal());
     component_manager::RetainedPosixRuntimeUnitAdapter adapter(
-        directory.runtime_root(), bundle_source, artifact_source, "linux",
-        "posix.1-2017");
+        directory.execution_state_root(), directory.execution_run_root(),
+        bundle_source, artifact_source, "linux", "posix.1-2017");
     std::uint64_t now = 6'000U;
     component_manager::ManagerActiveRuntimeCoordinator active(
         plan_source, adapter, adapter, [&now] { return ++now; });
@@ -758,7 +764,7 @@ TEST(ComponentManagerM0Process,
 
   bool final_state_exists = false;
   for (const auto &entry : std::filesystem::recursive_directory_iterator(
-           directory.runtime_root())) {
+           directory.execution_state_root())) {
     final_state_exists =
         final_state_exists || entry.path().filename() == "process.state";
   }

@@ -317,6 +317,8 @@ TEST(CanonicalEmptySceneManagerIntegration,
         accepted.accepted_target.canonical_empty_target,
         admission.retained_bundle_id(),
         admission.graph_revision(),
+        core::AdmissionGeneration(1U),
+        std::nullopt,
     };
     auto &journal = stores.apply_journal();
     const auto durable_intent = journal.EnsureIntent(intent);

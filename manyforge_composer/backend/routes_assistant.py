@@ -6,6 +6,7 @@ from typing import Annotated, Any
 import unicodedata
 
 from fastapi import APIRouter, HTTPException, Path
+from manyforge_headless_api.client import HeadlessClientError
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from .assistant_catalog_narrowing import (
@@ -31,6 +32,7 @@ from .state import ComposerState
 
 
 _PROVIDER_REQUEST_VERSION = "manyforge.assistant.provider_request.v1"
+_MAXIMUM_SAFE_INTEGER = 9_007_199_254_740_991
 
 
 class AssistantConversationRequest(BaseModel):
@@ -110,6 +112,31 @@ def _require_matching_status(status: dict[str, Any], body: dict[str, Any]) -> No
             )
 
 
+def _current_admission_generation(state: ComposerState) -> int:
+    if state.headless_client is None:
+        raise HTTPException(
+            status_code=503,
+            detail={
+                "code": "assistant_request_unavailable",
+                "message": "assistant authoring requires Headless admission",
+            },
+        )
+    try:
+        admission = state.headless_client.authoring_admission()
+    except HeadlessClientError as error:
+        raise _error(error) from error
+    generation = admission.get("admission_generation")
+    if type(generation) is not int or not 1 <= generation <= _MAXIMUM_SAFE_INTEGER:
+        raise HTTPException(
+            status_code=502,
+            detail={
+                "code": "assistant_owner_response_invalid",
+                "message": "Headless omitted a valid authoring admission generation",
+            },
+        )
+    return generation
+
+
 def create_assistant_router(state: ComposerState) -> APIRouter:
     if state.assistant_client is None:
         raise ValueError("assistant client is required for assistant routes")
@@ -148,6 +175,7 @@ def create_assistant_router(state: ComposerState) -> APIRouter:
             raise _error(error) from error
 
         draft = state.draft_session.snapshot()
+        admission_generation = _current_admission_generation(state)
         mode = assistant_mode.payload
         payload = {
             "schemaVersion": _PROVIDER_REQUEST_VERSION,
@@ -165,6 +193,7 @@ def create_assistant_router(state: ComposerState) -> APIRouter:
             "composerDraft": {
                 "draftId": draft["draft_id"],
                 "expectedDraftRevision": draft["draft_revision"],
+                "expectedAdmissionGeneration": admission_generation,
                 "programLoaded": draft["program_loaded"],
                 "programRevision": draft["program_revision"],
                 "program": draft["program"],

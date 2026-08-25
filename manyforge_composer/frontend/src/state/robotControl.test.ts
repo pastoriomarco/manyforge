@@ -373,6 +373,7 @@ describe('addressed Robot Control state', () => {
       operation: {
         operationId: 'operation-1',
         operationRevision: 8,
+        resident: true,
         state: 'completed',
         progress: 1,
         activeStopId: null,

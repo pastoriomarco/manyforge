@@ -87,6 +87,7 @@ export function ProgramWorkspace({
 }: ProgramWorkspaceProps) {
   const {
     state,
+    mutationAvailable,
     refresh,
     mutate,
     newDraft,
@@ -116,7 +117,7 @@ export function ProgramWorkspace({
     && catalog.data.environmentDigest === environment.data.environmentDigest;
   const authoringUnavailable = nodeEnvironment !== null
     && !nodeEnvironment.portableAuthoringAvailable;
-  const authoringBusy = busy || authoringUnavailable;
+  const authoringBusy = busy || authoringUnavailable || !mutationAvailable;
   const scenarioCatalog = runtime.state.catalog;
   const selectedScenario = scenarioCatalog?.scenarios.find(
     (row) => row.scenarioId === runtime.state.selectedScenarioId,
@@ -162,7 +163,7 @@ export function ProgramWorkspace({
           </button>
           <button
             type="button"
-            disabled={busy || !program || !workspace?.saved.available}
+            disabled={authoringBusy || !program || !workspace?.saved.available}
             onClick={save}
           >
             Save
@@ -254,7 +255,7 @@ export function ProgramWorkspace({
                 <button
                   type="button"
                   disabled={
-                    busy
+                    authoringBusy
                     || !program
                     || selectedScenario === null
                     || !workspace.applicability.applyReady
@@ -284,7 +285,7 @@ export function ProgramWorkspace({
                 )}
                 <button
                   type="button"
-                  disabled={busy || (replaceNeedsConfirmation && !confirmDiscard)}
+                  disabled={authoringBusy || (replaceNeedsConfirmation && !confirmDiscard)}
                   onClick={() => {
                     newDraft(confirmDiscard);
                     setConfirmDiscard(false);
@@ -297,7 +298,7 @@ export function ProgramWorkspace({
                 <button
                   type="button"
                   disabled={
-                    busy
+                    authoringBusy
                     || !workspace.saved.available
                     || !workspace.applied.available
                   }
@@ -309,7 +310,7 @@ export function ProgramWorkspace({
                 </button>
                 <button
                   type="button"
-                  disabled={busy || !workspace.applied.available}
+                  disabled={authoringBusy || !workspace.applied.available}
                   onClick={discard}
                 >
                   {state.status === 'ready' && state.pendingAction === 'discard'
@@ -319,7 +320,7 @@ export function ProgramWorkspace({
                 <button
                   type="button"
                   disabled={
-                    busy
+                    authoringBusy
                     || selectedProgramPath === null
                     || selectedScenario === null
                     || (replaceNeedsConfirmation && !confirmDiscard)
@@ -338,10 +339,13 @@ export function ProgramWorkspace({
                   Load and Apply
                 </button>
                 <small>
-                  Apply changes runtime only. Load validates and applies the selected
-                  artifact before replacing Draft and Saved. New creates an unsaved
-                  Draft without a runtime effect. Revert uses the current Applied
-                  selection; Discard reads Applied and changes Draft only.
+                  Program Apply requires this scenario&apos;s deployment already
+                  active and converged; use Deployment composition first when
+                  it is not. Program Apply never changes the deployment. Load
+                  validates and applies the selected artifact before replacing
+                  Draft and Saved. New creates an unsaved Draft without a
+                  runtime effect. Revert uses the current Applied selection;
+                  Discard reads Applied and changes Draft only.
                 </small>
               </div>
 
@@ -361,7 +365,7 @@ export function ProgramWorkspace({
                 <button
                   type="button"
                   disabled={
-                    busy
+                    authoringBusy
                     || selectedProgramPath === null
                     || (workspace.hasUnsavedChanges && !confirmDiscard)
                   }
@@ -391,7 +395,7 @@ export function ProgramWorkspace({
                 </label>
                 <button
                   type="button"
-                  disabled={busy || !program || !saveAsPath.trim()}
+                  disabled={authoringBusy || !program || !saveAsPath.trim()}
                   onClick={() => {
                     saveAs(saveAsPath.trim(), confirmOverwrite);
                     setConfirmOverwrite(false);
@@ -418,8 +422,19 @@ export function ProgramWorkspace({
               <strong>Run mode is active</strong>
               <span>
                 This run keeps its captured Program and Binding. Draft, Save,
-                Apply, and Load affect only later runs unless the Manager
-                rejects an affected deployment change as busy.
+                Program Apply, Load, Revert, and Discard remain unavailable
+                until the backend returns the cell to Idle. Deployment Apply
+                remains a separate Manager command.
+              </span>
+            </div>
+          )}
+
+          {!runtime.active && !mutationAvailable && (
+            <div className="panel-state" role="status">
+              <strong>Backend authoring is unavailable</strong>
+              <span>
+                Authoring controls remain disabled until the backend reports
+                one current idle admission and matching Draft revision.
               </span>
             </div>
           )}
@@ -464,7 +479,7 @@ export function ProgramWorkspace({
                   ? ` Restore at ${nodeEnvironment.restorationGates.join(', ')}.`
                   : ''}
               </span>
-              <span>Draft inspection, Open as Draft, and Save remain available.</span>
+              <span>Draft inspection and read-only selection remain available.</span>
             </div>
           )}
           {program && (

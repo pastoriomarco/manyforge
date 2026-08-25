@@ -5,8 +5,10 @@ from __future__ import annotations
 from dataclasses import dataclass
 import hashlib
 import json
+import os
 from pathlib import Path
 import sqlite3
+import stat
 import threading
 import time
 import uuid
@@ -16,6 +18,13 @@ from typing import Any, Mapping
 _SCHEMA_VERSION = 1
 _MAXIMUM_TRANSACTIONS = 1024
 _DOMAIN = b"manyforge.composer.authoring-transaction.v1\0"
+_DATABASE_NAME = "composer-authoring-transactions.sqlite3"
+_DATABASE_LEAVES = (
+    _DATABASE_NAME,
+    f"{_DATABASE_NAME}-journal",
+    f"{_DATABASE_NAME}-wal",
+    f"{_DATABASE_NAME}-shm",
+)
 
 
 class AuthoringJournalError(RuntimeError):
@@ -77,28 +86,262 @@ class ComposerAuthoringTransactionJournal:
     ) -> None:
         if not 1 <= maximum_transactions <= _MAXIMUM_TRANSACTIONS:
             raise ValueError("authoring journal capacity is invalid")
-        state_root = state_root.resolve()
-        if not state_root.is_dir():
-            raise AuthoringJournalError(
-                "composer_authoring_state_root_invalid",
-                "Composer authoring state root must be a pre-existing directory",
-            )
         self._capacity = maximum_transactions
         self._lock = threading.RLock()
-        self._database = sqlite3.connect(
-            state_root / "composer-authoring-transactions.sqlite3",
-            isolation_level="IMMEDIATE",
-            check_same_thread=False,
-        )
+        self._state_root = Path(state_root)
+        self._root_descriptor = self._open_state_root(self._state_root)
         try:
+            self._root_identity = self._identity(os.fstat(self._root_descriptor))
+            self._database_identity = self._prepare_database_leaf()
+            self._database = sqlite3.connect(
+                f"file:/proc/self/fd/{self._root_descriptor}/{_DATABASE_NAME}?mode=rw",
+                uri=True,
+                isolation_level="IMMEDIATE",
+                check_same_thread=False,
+            )
+            self._validate_storage()
             self._database.execute("PRAGMA journal_mode=WAL")
             self._database.execute("PRAGMA synchronous=FULL")
             self._database.execute("PRAGMA foreign_keys=ON")
             self._initialize()
             self.owner_epoch = self._begin_owner_epoch()
+            self._validate_storage()
         except Exception:
-            self._database.close()
+            database = getattr(self, "_database", None)
+            if database is not None:
+                database.close()
+            os.close(self._root_descriptor)
+            self._root_descriptor = -1
             raise
+
+    @staticmethod
+    def _identity(metadata: os.stat_result) -> tuple[int, int]:
+        return metadata.st_dev, metadata.st_ino
+
+    @staticmethod
+    def _safe_directory(metadata: os.stat_result) -> bool:
+        required = stat.S_IRUSR | stat.S_IWUSR | stat.S_IXUSR
+        return (
+            stat.S_ISDIR(metadata.st_mode)
+            and metadata.st_uid == os.geteuid()
+            and not metadata.st_mode & (stat.S_IWGRP | stat.S_IWOTH)
+            and metadata.st_mode & required == required
+        )
+
+    @staticmethod
+    def _safe_database_file(metadata: os.stat_result) -> bool:
+        return (
+            stat.S_ISREG(metadata.st_mode)
+            and metadata.st_uid == os.geteuid()
+            and metadata.st_nlink == 1
+            and metadata.st_mode & 0o777 == 0o600
+        )
+
+    @classmethod
+    def _open_state_root(cls, state_root: Path) -> int:
+        try:
+            before = state_root.lstat()
+            canonical = state_root.resolve(strict=True)
+            descriptor = os.open(
+                state_root,
+                os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW,
+            )
+        except (OSError, RuntimeError) as error:
+            raise AuthoringJournalError(
+                "composer_authoring_state_root_invalid",
+                f"Composer authoring state root is unavailable: {error}",
+            ) from error
+        try:
+            opened = os.fstat(descriptor)
+            after = state_root.lstat()
+            identity = cls._identity(before)
+            if (
+                not state_root.is_absolute()
+                or canonical != state_root
+                or any(
+                    not cls._safe_directory(metadata)
+                    or cls._identity(metadata) != identity
+                    for metadata in (before, opened, after)
+                )
+            ):
+                raise AuthoringJournalError(
+                    "composer_authoring_state_root_invalid",
+                    "Composer authoring state root is not one safe canonical "
+                    "directory capability",
+                )
+            return descriptor
+        except Exception:
+            os.close(descriptor)
+            raise
+
+    def _prepare_database_leaf(self) -> tuple[int, int]:
+        try:
+            before = os.stat(
+                _DATABASE_NAME,
+                dir_fd=self._root_descriptor,
+                follow_symlinks=False,
+            )
+        except FileNotFoundError:
+            orphaned_sidecars: list[str] = []
+            for leaf in _DATABASE_LEAVES[1:]:
+                try:
+                    os.stat(
+                        leaf,
+                        dir_fd=self._root_descriptor,
+                        follow_symlinks=False,
+                    )
+                except FileNotFoundError:
+                    continue
+                except OSError as error:
+                    raise AuthoringJournalError(
+                        "composer_authoring_journal_invalid",
+                        "Composer authoring journal absence cannot be verified: "
+                        f"{error}",
+                    ) from error
+                orphaned_sidecars.append(leaf)
+            if orphaned_sidecars:
+                raise AuthoringJournalError(
+                    "composer_authoring_journal_invalid",
+                    "Composer authoring journal main database is absent but "
+                    "orphan sidecars remain: " + ", ".join(orphaned_sidecars),
+                )
+            try:
+                descriptor = os.open(
+                    _DATABASE_NAME,
+                    os.O_RDWR
+                    | os.O_CREAT
+                    | os.O_EXCL
+                    | os.O_CLOEXEC
+                    | os.O_NOFOLLOW,
+                    0o600,
+                    dir_fd=self._root_descriptor,
+                )
+            except OSError as error:
+                raise AuthoringJournalError(
+                    "composer_authoring_journal_invalid",
+                    f"Composer authoring journal cannot be reserved: {error}",
+                ) from error
+            try:
+                os.fchmod(descriptor, 0o600)
+                os.fsync(descriptor)
+                before = os.fstat(descriptor)
+                if not self._safe_database_file(before):
+                    raise AuthoringJournalError(
+                        "composer_authoring_journal_invalid",
+                        "new Composer authoring journal leaf is unsafe",
+                    )
+            finally:
+                os.close(descriptor)
+            os.fsync(self._root_descriptor)
+        except OSError as error:
+            raise AuthoringJournalError(
+                "composer_authoring_journal_invalid",
+                f"Composer authoring journal cannot be inspected: {error}",
+            ) from error
+        if not self._safe_database_file(before):
+            raise AuthoringJournalError(
+                "composer_authoring_journal_invalid",
+                "Composer authoring journal type, owner, link count, or mode is unsafe",
+            )
+        identity = self._identity(before)
+        try:
+            descriptor = os.open(
+                _DATABASE_NAME,
+                os.O_RDWR | os.O_CLOEXEC | os.O_NOFOLLOW,
+                dir_fd=self._root_descriptor,
+            )
+            try:
+                opened = os.fstat(descriptor)
+                after = os.stat(
+                    _DATABASE_NAME,
+                    dir_fd=self._root_descriptor,
+                    follow_symlinks=False,
+                )
+                if any(
+                    not self._safe_database_file(metadata)
+                    or self._identity(metadata) != identity
+                    for metadata in (opened, after)
+                ):
+                    raise AuthoringJournalError(
+                        "composer_authoring_journal_invalid",
+                        "Composer authoring journal changed while opening",
+                    )
+            finally:
+                os.close(descriptor)
+            for leaf in _DATABASE_LEAVES[1:]:
+                self._validate_optional_leaf(leaf)
+        except OSError as error:
+            raise AuthoringJournalError(
+                "composer_authoring_journal_invalid",
+                f"Composer authoring journal cannot be opened safely: {error}",
+            ) from error
+        return identity
+
+    def _validate_optional_leaf(self, leaf: str) -> None:
+        try:
+            metadata = os.stat(
+                leaf,
+                dir_fd=self._root_descriptor,
+                follow_symlinks=False,
+            )
+        except FileNotFoundError:
+            return
+        if not self._safe_database_file(metadata):
+            raise AuthoringJournalError(
+                "composer_authoring_journal_invalid",
+                f"Composer authoring journal sidecar is unsafe: {leaf}",
+            )
+
+    def _validate_storage(self) -> None:
+        if self._root_descriptor < 0:
+            raise AuthoringJournalError(
+                "composer_authoring_journal_closed",
+                "Composer authoring journal is closed",
+            )
+        try:
+            opened_root = os.fstat(self._root_descriptor)
+            current_root = self._state_root.lstat()
+            current_database = os.stat(
+                _DATABASE_NAME,
+                dir_fd=self._root_descriptor,
+                follow_symlinks=False,
+            )
+        except OSError as error:
+            raise AuthoringJournalError(
+                "composer_authoring_journal_invalid",
+                f"Composer authoring journal storage is unavailable: {error}",
+            ) from error
+        if (
+            any(
+                not self._safe_directory(metadata)
+                or self._identity(metadata) != self._root_identity
+                for metadata in (opened_root, current_root)
+            )
+            or not self._safe_database_file(current_database)
+            or self._identity(current_database) != self._database_identity
+        ):
+            raise AuthoringJournalError(
+                "composer_authoring_journal_invalid",
+                "Composer authoring journal storage capability was replaced or changed",
+            )
+        for leaf in _DATABASE_LEAVES[1:]:
+            self._validate_optional_leaf(leaf)
+
+    def close(self) -> None:
+        with self._lock:
+            if self._root_descriptor < 0:
+                return
+            database = getattr(self, "_database", None)
+            if database is not None:
+                database.close()
+            os.close(self._root_descriptor)
+            self._root_descriptor = -1
+
+    def __del__(self) -> None:
+        try:
+            self.close()
+        except Exception:
+            pass
 
     def _initialize(self) -> None:
         version = self._database.execute("PRAGMA user_version").fetchone()[0]
@@ -195,6 +438,7 @@ class ComposerAuthoringTransactionJournal:
         self, request_owner_epoch: str, request_id: str
     ) -> AuthoringTransaction | None:
         with self._lock:
+            self._validate_storage()
             row = self._database.execute(
                 "SELECT request_owner_epoch,request_id,owner_transaction_id,"
                 "operation_kind,payload_digest,draft_id,draft_revision,"
@@ -208,6 +452,7 @@ class ComposerAuthoringTransactionJournal:
 
     def unresolved(self) -> list[AuthoringTransaction]:
         with self._lock:
+            self._validate_storage()
             rows = self._database.execute(
                 "SELECT request_owner_epoch,request_id,owner_transaction_id,"
                 "operation_kind,payload_digest,draft_id,draft_revision,"
@@ -221,6 +466,7 @@ class ComposerAuthoringTransactionJournal:
 
     def retained_workspace(self) -> dict[str, Any] | None:
         with self._lock:
+            self._validate_storage()
             row = self._database.execute(
                 "SELECT post_image_json FROM retained_workspace WHERE singleton=1"
             ).fetchone()
@@ -239,6 +485,7 @@ class ComposerAuthoringTransactionJournal:
         claim_intent: Mapping[str, Any],
     ) -> AuthoringTransaction:
         with self._lock:
+            self._validate_storage()
             existing = self.lookup(request_owner_epoch, request_id)
             transaction_id = owner_transaction_id(request_owner_epoch, request_id)
             immutable = (
@@ -330,6 +577,7 @@ class ComposerAuthoringTransactionJournal:
         if field != "acquire_attempted":
             parameters += (encoded,)
         with self._lock:
+            self._validate_storage()
             with self._database:
                 changed = self._database.execute(
                     f"UPDATE transactions SET {field}=? WHERE request_owner_epoch=? "
@@ -363,6 +611,7 @@ class ComposerAuthoringTransactionJournal:
         encoded_post_image = self._json(post_image)
         encoded_outcome = self._json(outcome)
         with self._lock:
+            self._validate_storage()
             with self._database:
                 changed = self._database.execute(
                     "UPDATE transactions SET post_image_json=?,outcome_json=? "

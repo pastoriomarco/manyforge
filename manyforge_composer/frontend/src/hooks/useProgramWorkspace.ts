@@ -72,14 +72,6 @@ export function programWorkspaceTransitionResult(
   action: 'apply' | 'load' | 'revert',
   response: ProgramWorkspaceTransitionResponse,
 ): ProgramWorkspaceRunResult {
-  if (response.status === 'pending_deployment') {
-    const message = action === 'revert'
-      ? 'Revert is pending deployment; Draft and Saved were not replaced.'
-      : action === 'load'
-        ? 'Load is pending deployment; Draft, Saved, and Applied were not replaced.'
-        : 'Apply is pending deployment; Applied was not replaced.';
-    return { workspace: response.workspace, message, transitionStatus: response.status };
-  }
   if (action === 'revert' && response.status === 'reverted') {
     return {
       workspace: response.workspace,
@@ -119,6 +111,12 @@ export function useProgramWorkspace(snapshot: ComposerHeadlessState | null = nul
     'manyforge.composer.request_owner_epoch',
     'composer-authoring-owner',
   ));
+  const mutationAvailable = state.workspace !== null
+    && snapshot !== null
+    && snapshot.draftIdentity.draftId === state.workspace.draft.draftId
+    && snapshot.draftIdentity.draftRevision === state.workspace.draft.draftRevision
+    && snapshot.authoringAdmission.authoringAllowed
+    && snapshot.programCycle.state === 'idle_after_reset';
 
   const readWorkspace = useCallback((requestGeneration: number) => {
     if (
@@ -415,6 +413,7 @@ export function useProgramWorkspace(snapshot: ComposerHeadlessState | null = nul
 
   return {
     state,
+    mutationAvailable,
     refresh,
     mutate,
     newDraft,

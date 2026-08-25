@@ -72,10 +72,10 @@ def generate_launch_description() -> LaunchDescription:
                 ),
             ),
             DeclareLaunchArgument(
-                "manager_state_root",
+                "manager_run_root",
                 default_value="",
                 description=(
-                    "Absolute Manager state root. Required exactly when the "
+                    "Absolute Manager run root. Required exactly when the "
                     "pose observer is enabled."
                 ),
             ),
@@ -246,13 +246,13 @@ def _launch_setup(context, *_, **__) -> list[object]:
         LaunchConfiguration("pose_observer_site_config").perform(context),
         name="pose_observer_site_config",
     )
-    manager_state_root = _optional_absolute_path(
-        LaunchConfiguration("manager_state_root").perform(context),
-        name="manager_state_root",
+    manager_run_root = _optional_absolute_path(
+        LaunchConfiguration("manager_run_root").perform(context),
+        name="manager_run_root",
     )
-    if bool(pose_observer_site_config) != bool(manager_state_root):
+    if bool(pose_observer_site_config) != bool(manager_run_root):
         raise ValueError(
-            "pose_observer_site_config and manager_state_root must be "
+            "pose_observer_site_config and manager_run_root must be "
             "configured together"
         )
     required_topics = sorted(
@@ -593,7 +593,7 @@ def _launch_setup(context, *_, **__) -> list[object]:
                 parameters=[
                     {
                         "site_config_path": pose_observer_site_config,
-                        "manager_state_root": manager_state_root,
+                        "manager_run_root": manager_run_root,
                         "manager_timeout_s": _bounded_float(
                             LaunchConfiguration(
                                 "pose_observer_manager_timeout_s"

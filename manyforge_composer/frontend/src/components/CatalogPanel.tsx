@@ -7,6 +7,8 @@ interface CatalogPanelProps {
   onRetry: () => void;
 }
 
+const EMPTY_CATALOG_ENTRIES: readonly CatalogEntry[] = [];
+
 function shortDigest(digest: string): string {
   return digest.length > 22 ? `${digest.slice(0, 18)}…` : digest;
 }
@@ -88,7 +90,7 @@ export function CatalogPanel({ catalog, onRetry }: CatalogPanelProps) {
   const [category, setCategory] = useState('all');
   const [selectedId, setSelectedId] = useState<string | null>(null);
 
-  const entries = catalog.status === 'ready' ? catalog.data.entries : [];
+  const entries = catalog.status === 'ready' ? catalog.data.entries : EMPTY_CATALOG_ENTRIES;
   const categories = useMemo(
     () => [...new Set(entries.map((entry) => entry.category))].sort(),
     [entries],

@@ -21,15 +21,15 @@ from .cclc_open_request_transport import (
 class CCLCOpenRequestNode(Node):
     """Bounded request/status service with no client-side transaction state."""
 
-    def __init__(self, *, state_root: Path | None = None) -> None:
+    def __init__(self, *, run_root: Path | None = None) -> None:
         super().__init__("manyforge_cclc_open_request")
-        if state_root is None:
-            self.declare_parameter("state_root", "")
-            configured = self.get_parameter("state_root").value
+        if run_root is None:
+            self.declare_parameter("run_root", "")
+            configured = self.get_parameter("run_root").value
             if not isinstance(configured, str) or not configured:
-                raise RuntimeError("state_root must name the active CCLC state root")
-            state_root = Path(configured)
-        self._client = CCLCOpenUnixClient(state_root)
+                raise RuntimeError("run_root must name the active CCLC run root")
+            run_root = Path(configured)
+        self._client = CCLCOpenUnixClient(run_root)
         self._service = self.create_service(
             CCLCOpenRequest,
             "~/open_request",

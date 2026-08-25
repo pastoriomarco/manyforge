@@ -20,13 +20,13 @@ namespace manyforge::deployment {
 
 /// Stable construction policy for one production CCLC owner epoch.
 ///
-/// The state and plan roots are trusted, pre-existing deployment-owned
-/// directories. Product-specific adapter instances and build-owned lifecycle
-/// catalogs are injected explicitly; this composition performs no discovery,
-/// default selection, or adapter construction.
+/// The durable state and disposable run roots are trusted, pre-existing
+/// deployment-owned directories. Product-specific adapter instances and
+/// build-owned lifecycle catalogs are injected explicitly; this composition
+/// performs no discovery, default selection, or adapter construction.
 struct CCLCRuntimeCompositionConfig final {
   std::filesystem::path state_root;
-  std::filesystem::path resolved_stop_plan_root;
+  std::filesystem::path run_root;
   core::CellId cell_id;
   core::ComponentLifecycleCoordinatorConfig coordinator;
   std::size_t exact_result_history_capacity{
@@ -41,6 +41,7 @@ struct CCLCRuntimeCompositionConfig final {
       core::kMaximumResolvedStopBasePlanEncodedBytes};
 
   [[nodiscard]] bool locally_valid() const noexcept;
+  [[nodiscard]] bool trusted_roots_valid() const noexcept;
 };
 
 /// Complete L0.4 production lifetime join for one exact retained bundle.

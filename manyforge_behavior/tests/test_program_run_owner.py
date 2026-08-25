@@ -770,7 +770,11 @@ def test_terminal_cleanup_is_retryable_before_the_run_claims_completion() -> Non
     assert first.reason_code == "program_run_cleanup_failed"
     assert context_port.unbound == ["program-run-1"]
 
-    completed = owner.read(started.capture.program_run_id)
+    observed = owner.read(started.capture.program_run_id)
+    assert observed.state is ProgramRunState.FINALIZING
+    assert initialization_port.released == ["program-run-1"]
+
+    completed = owner.advance_once(started.capture.program_run_id)
     assert completed.state is ProgramRunState.SUCCEEDED
     assert completed.reason_code is None
     assert initialization_port.released == ["program-run-1", "program-run-1"]
@@ -987,7 +991,9 @@ def test_stop_reaches_kernel_scope_before_tree_invalidation_and_waits_for_proof(
     still_stopping = owner.read(started.capture.program_run_id)
     assert still_stopping.state is ProgramRunState.STOPPING
     scope.state = ProgramRunScopeState.SETTLED
-    stopped = owner.read(started.capture.program_run_id)
+    still_observed = owner.read(started.capture.program_run_id)
+    assert still_observed.state is ProgramRunState.STOPPING
+    stopped = owner.advance_once(started.capture.program_run_id)
     assert stopped.state is ProgramRunState.STOPPED
     assert stopped.active_operation_count == 0
 
@@ -1051,7 +1057,10 @@ def test_failure_is_not_relabelled_as_stopped_while_kernel_work_settles() -> Non
     assert repeated.state is ProgramRunState.STOPPING
 
     scope.state = ProgramRunScopeState.SETTLED
-    failed = owner.read(started.capture.program_run_id)
+    assert owner.read(started.capture.program_run_id).state is (
+        ProgramRunState.STOPPING
+    )
+    failed = owner.advance_once(started.capture.program_run_id)
     assert failed.state is ProgramRunState.FAILED
     assert failed.reason_code == "program_terminal_scope_not_settled"
 
@@ -1069,7 +1078,10 @@ def test_unknown_kernel_scope_never_reports_stopped_and_recovers_cleanly() -> No
     assert unknown.reason_code == "kernel_scope_unknown"
 
     scope.state = ProgramRunScopeState.SETTLED
-    stopped = owner.read(started.capture.program_run_id)
+    assert owner.read(started.capture.program_run_id).state is (
+        ProgramRunState.STOPPING
+    )
+    stopped = owner.advance_once(started.capture.program_run_id)
     assert stopped.state is ProgramRunState.STOPPED
     assert stopped.active_operation_count == 0
     assert stopped.reason_code is None

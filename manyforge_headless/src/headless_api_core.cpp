@@ -454,7 +454,7 @@ HeadlessApiCore::HeadlessApiCore(HeadlessApiCoreConfig config,
       scenario_catalog_source_(package_root_descriptor_->root(), "maintained"),
       program_selection_owner_(
           package_root_descriptor_->root(), config_.artifact_root,
-          config_.program_selection_state_root, config_.projection_root,
+          config_.program_selection_state_root,
           config_.owner_id + ".program-selection", config_.owner_epoch),
       // This reader validates the final path component with symlink_status;
       // "." keeps that component directory-valued while traversal remains
@@ -672,8 +672,23 @@ CanonicalValue HeadlessApiCore::PrepareProgramApply(
     const std::string_view canonical_program_bytes) {
   std::lock_guard lock(mutex_);
   Require(!shutdown_, "headless_api_closed", "headless API core is closed");
+  const auto runtime = RefreshLocked();
+  const auto &manager_section = RequiredSection(runtime.root, "manager");
+  Require(SectionFresh(manager_section), "program_apply_deployment_not_active",
+          "Program Apply preparation requires a fresh Manager owner");
+  const auto &manager_payload = RequiredMember(manager_section, "payload");
+  Require(manager_payload.is_object(), "program_apply_deployment_not_active",
+          "Program Apply preparation requires an active Manager selection");
+  const auto &active = RequiredMember(manager_payload, "active");
+  Require(
+      RequiredBool(manager_payload, "manager_ready") &&
+          RequiredBool(RequiredMember(manager_payload, "runtime"), "converged"),
+      "program_apply_deployment_not_active",
+      "Program Apply preparation requires one converged Manager selection");
   return program_selection_owner_.Prepare(
-      scenario_id, expected_scenario_catalog_revision, canonical_program_bytes);
+      scenario_id, expected_scenario_catalog_revision, canonical_program_bytes,
+      RequiredString(active, "retained_bundle_id"),
+      RequiredString(active, "graph_revision"));
 }
 
 CanonicalValue HeadlessApiCore::CommitProgramApply(
@@ -683,6 +698,12 @@ CanonicalValue HeadlessApiCore::CommitProgramApply(
     const std::string_view request_id) {
   std::lock_guard lock(mutex_);
   Require(!shutdown_, "headless_api_closed", "headless API core is closed");
+  if (auto replay = program_selection_owner_.Replay(
+          canonical_preparation_bytes, expected_applied_record_digest,
+          request_owner_epoch, request_id);
+      replay.has_value()) {
+    return *replay;
+  }
   const auto runtime = RefreshLocked();
   const auto &manager_section = RequiredSection(runtime.root, "manager");
   Require(SectionFresh(manager_section), "program_apply_deployment_not_active",
@@ -701,6 +722,21 @@ CanonicalValue HeadlessApiCore::CommitProgramApply(
       request_owner_epoch, request_id,
       RequiredString(active, "retained_bundle_id"),
       RequiredString(active, "graph_revision"), clocks_.monotonic_time_ns());
+}
+
+CanonicalValue HeadlessApiCore::ReplayProgramApply(
+    const std::string_view scenario_id,
+    const std::string_view scenario_catalog_revision,
+    const std::string_view program_id, const std::string_view program_revision,
+    const std::optional<std::string> &expected_applied_record_digest,
+    const std::string_view request_owner_epoch,
+    const std::string_view request_id) {
+  std::lock_guard lock(mutex_);
+  Require(!shutdown_, "headless_api_closed", "headless API core is closed");
+  auto replay = program_selection_owner_.ReplayRequest(
+      scenario_id, scenario_catalog_revision, program_id, program_revision,
+      expected_applied_record_digest, request_owner_epoch, request_id);
+  return replay.has_value() ? std::move(*replay) : CanonicalValue(nullptr);
 }
 
 CanonicalValue HeadlessApiCore::AppliedProgramSelection() {

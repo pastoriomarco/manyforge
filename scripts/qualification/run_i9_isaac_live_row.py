@@ -30,6 +30,7 @@ from urllib.request import urlopen
 
 from manyforge_behavior.canonical_artifact import load_strict_json_yaml
 from manyforge_headless_api.client import HeadlessClientError, HeadlessHttpClient
+from manyforge_operator.cell_layout import CellInstanceLayout, CellLayoutError
 
 from run_i9_assistant_snapshot_probe import run_probe as run_snapshot_probe
 from run_i9_isaac_matrix import (
@@ -2532,27 +2533,46 @@ def _process_commands(
     api_port: int,
     runner_port: int,
     composer_port: int | None,
-    manager_root: Path,
-    runtime_root: Path,
-    publication_root: Path,
+    layout: CellInstanceLayout,
 ) -> dict[str, list[str]]:
     api_url = f"http://127.0.0.1:{api_port}"
     runner_url = f"http://127.0.0.1:{runner_port}"
+    manager_state_root = layout.owner_state_root("manager")
+    manager_run_root = layout.run_root / "manager"
+    execution_state_root = layout.owner_state_root("execution-host")
+    execution_run_root = layout.run_root / "execution-host"
+    program_runner_state_root = layout.owner_state_root("program-runner")
+    program_selection_state_root = layout.owner_state_root("program-selection")
+    authoring_state_root = layout.owner_state_root("composer-authoring")
+    program_cycle_journal = program_runner_state_root / "program-cycle.sqlite3"
+    program_runner_liveness_socket = (
+        manager_run_root / "program-runner-liveness.sock"
+    )
     commands = {
         "manager": [
             str(config.installed_root / "manyforge_manager_daemon"),
-            "--package-root",
+            "--install-root",
             str(config.package_root),
             "--canonical-empty-admission-filename",
             config.spec.admission_filename,
             "--manager-state-root",
-            str(manager_root),
-            "--runtime-state-root",
-            str(runtime_root),
+            str(manager_state_root),
+            "--manager-run-root",
+            str(manager_run_root),
+            "--execution-state-root",
+            str(execution_state_root),
+            "--execution-run-root",
+            str(execution_run_root),
             "--logical-scene-database",
-            str(config.run_root / "logical-scene.sqlite3"),
-            "--publication-root",
-            str(publication_root),
+            str(layout.owner_state_root("logical-scene") / "scene.sqlite3"),
+            "--program-cycle-journal",
+            str(program_cycle_journal),
+            "--authoring-transaction-journal",
+            str(authoring_state_root / "composer-authoring-transactions.sqlite3"),
+            "--projection-root",
+            str(layout.projection_root),
+            "--program-runner-liveness-socket",
+            str(program_runner_liveness_socket),
             "--reconciliation-period-ms",
             "20",
         ],
@@ -2570,6 +2590,14 @@ def _process_commands(
             f"program-runner.{config.spec.scenario_id}",
             "--headless-timeout-s",
             "10",
+            "--execution-run-root",
+            str(execution_run_root),
+            "--cycle-journal-path",
+            str(program_cycle_journal),
+            "--manager-liveness-socket",
+            str(program_runner_liveness_socket),
+            "--cell-id",
+            config.spec.cell_id,
             "--simulation-control-config",
             str(
                 config.source_root
@@ -2585,20 +2613,26 @@ def _process_commands(
             "127.0.0.1",
             "--port",
             str(api_port),
-            "--publication-root",
-            str(publication_root),
-            "--package-root",
+            "--projection-root",
+            str(layout.projection_root),
+            "--install-root",
             str(config.package_root),
+            "--artifact-root",
+            str(layout.artifact_root),
+            "--program-selection-state-root",
+            str(program_selection_state_root),
             "--node-catalog-path",
             str(config.node_catalog),
             "--alarm-catalog-path",
             str(config.alarm_catalog),
             "--historian-database-path",
-            str(config.run_root / "history.sqlite3"),
-            "--manager-state-root",
-            str(manager_root),
-            "--execution-state-root",
-            str(runtime_root),
+            str(
+                layout.owner_state_root("alarm-history") / "history.sqlite3"
+            ),
+            "--manager-run-root",
+            str(manager_run_root),
+            "--execution-run-root",
+            str(execution_run_root),
             "--cell-id",
             config.spec.cell_id,
             "--owner-id",
@@ -2626,7 +2660,7 @@ def _process_commands(
             "scene_service_timeout_s:="
             + str(min(config.startup_timeout_s, 120.0)),
             "controller_manager_lock_memory:=false",
-            f"manager_state_root:={manager_root}",
+            f"manager_run_root:={manager_run_root}",
             "pose_observer_site_config:="
             + str(
                 config.source_root
@@ -2656,6 +2690,8 @@ def _process_commands(
             api_url,
             "--headless-api-timeout-s",
             "15",
+            "--authoring-state-root",
+            str(authoring_state_root),
         ]
     return commands
 
@@ -2727,6 +2763,7 @@ def _run_foundationpose_recovery(
     ros_command: Sequence[str],
     environment: Mapping[str, str],
     processes: list[ManagedProcess],
+    process_log_root: Path,
 ) -> tuple[ManagedProcess, dict[str, Any], dict[str, Any], RecoveryEvidence]:
     with HeadlessHttpClient(api_url, timeout_seconds=15.0) as client:
         try:
@@ -2775,7 +2812,7 @@ def _run_foundationpose_recovery(
             "ros-rejoin",
             ros_command,
             environment=environment,
-            run_root=config.run_root,
+            run_root=process_log_root,
         )
         processes.append(replacement)
         barrier = _wait_for_barrier(
@@ -2857,11 +2894,12 @@ def _run_foundationpose_recovery(
 def run_live_row(config: LiveConfig) -> dict[str, Any]:
     validate_config(config)
     started = time.monotonic()
-    for directory in ("manager", "runtime", "publications"):
-        (config.run_root / directory).mkdir()
-    manager_root = config.run_root / "manager"
-    runtime_root = config.run_root / "runtime"
-    publication_root = config.run_root / "publications"
+    layout = CellInstanceLayout.open_or_create(
+        cell_id=config.spec.cell_id,
+        cell_root=config.run_root,
+        install_root=config.package_root,
+    )
+    process_log_root = layout.run_root / "operator"
     api_port = _free_port()
     runner_port = _free_port()
     composer_port = config.composer_port
@@ -2870,9 +2908,7 @@ def run_live_row(config: LiveConfig) -> dict[str, Any]:
         api_port=api_port,
         runner_port=runner_port,
         composer_port=composer_port,
-        manager_root=manager_root,
-        runtime_root=runtime_root,
-        publication_root=publication_root,
+        layout=layout,
     )
     environment = dict(os.environ)
     environment["ROS2CLI_NO_DAEMON"] = "1"
@@ -2887,21 +2923,21 @@ def run_live_row(config: LiveConfig) -> dict[str, Any]:
             "manager",
             commands["manager"],
             environment=environment,
-            run_root=config.run_root,
+            run_root=process_log_root,
         )
         processes.append(manager)
         program = _start_process(
             "program",
             commands["program"],
             environment=environment,
-            run_root=config.run_root,
+            run_root=process_log_root,
         )
         processes.append(program)
         headless = _start_process(
             "headless",
             commands["headless"],
             environment=environment,
-            run_root=config.run_root,
+            run_root=process_log_root,
         )
         processes.append(headless)
         api_url = f"http://127.0.0.1:{api_port}"
@@ -2918,7 +2954,7 @@ def run_live_row(config: LiveConfig) -> dict[str, Any]:
                 "composer",
                 commands["composer"],
                 environment=environment,
-                run_root=config.run_root,
+                run_root=process_log_root,
             )
             processes.append(composer)
             composer_url = f"http://127.0.0.1:{composer_port}"
@@ -2926,7 +2962,10 @@ def run_live_row(config: LiveConfig) -> dict[str, Any]:
                 composer_url, composer, timeout_s=config.startup_timeout_s
             )
         ros = _start_process(
-            "ros", commands["ros"], environment=environment, run_root=config.run_root
+            "ros",
+            commands["ros"],
+            environment=environment,
+            run_root=process_log_root,
         )
         processes.append(ros)
         barrier = _wait_for_barrier(
@@ -2952,6 +2991,7 @@ def run_live_row(config: LiveConfig) -> dict[str, Any]:
                 ros_command=commands["ros"],
                 environment=environment,
                 processes=processes,
+                process_log_root=process_log_root,
             )
         before_control = _simulation_snapshot(config.spec)
         program_definition = load_strict_json_yaml(
@@ -3130,6 +3170,7 @@ def run_live_row(config: LiveConfig) -> dict[str, Any]:
             "details": details,
             "elapsed_s": round(time.monotonic() - started, 3),
         }
+        layout.validate()
         return validate_row(row)
     finally:
         if simulation_services_ready and not simulation_stopped:
@@ -3190,7 +3231,13 @@ def main(argv: Sequence[str] | None = None) -> int:
     )
     try:
         row = run_live_row(config)
-    except (LiveRowError, QualificationError, HeadlessClientError, OSError) as error:
+    except (
+        CellLayoutError,
+        LiveRowError,
+        QualificationError,
+        HeadlessClientError,
+        OSError,
+    ) as error:
         print(f"I9 live row failed: {error}", file=sys.stderr)
         return 2
     print(json.dumps(row, separators=(",", ":"), sort_keys=True))

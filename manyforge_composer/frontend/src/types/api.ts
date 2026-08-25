@@ -404,8 +404,7 @@ export interface ProgramRunIndex {
 export type ProgramWorkspaceTransitionStatus =
   | 'applied'
   | 'loaded'
-  | 'reverted'
-  | 'pending_deployment';
+  | 'reverted';
 
 export interface ProgramWorkspaceTransitionResponse {
   status: ProgramWorkspaceTransitionStatus;
@@ -797,9 +796,61 @@ export interface ManagerActiveProjection {
   publication: Record<string, JsonValue>;
 }
 
+export type ManagerApplyPhase =
+  | 'intent_persisted'
+  | 'scope_persisted'
+  | 'fence_acquire_pending'
+  | 'fence_held'
+  | 'runtime_convergence_pending'
+  | 'runtime_staged_ready'
+  | 'scene_stage_pending'
+  | 'scene_staged'
+  | 'activation_selected'
+  | 'scene_activated'
+  | 'private_materialized'
+  | 'command_surfaces_retired'
+  | 'active_bundle_published'
+  | 'scene_finalized'
+  | 'fence_release_pending'
+  | 'fence_released'
+  | 'terminal';
+
+export interface ManagerApplyRecord {
+  applyGeneration: number;
+  applyId: string;
+  candidateGraphRevision: string;
+  candidateRetainedBundleId: string;
+  committed: boolean;
+  expectedActiveProjectionRevision: ProjectionRevision;
+  fence: {
+    acceptanceDigest: string | null;
+    configurationFenceGeneration: number | null;
+    configurationFenceId: string | null;
+    fenceAttemptDigest: string | null;
+    scope: Record<string, JsonValue> | null;
+    state:
+      | 'not_requested'
+      | 'scope_persisted'
+      | 'acquire_pending'
+      | 'held'
+      | 'release_pending'
+      | 'released';
+  };
+  incomplete: boolean;
+  intentDigest: string;
+  phase: ManagerApplyPhase;
+  request: {
+    correlationId: string | null;
+    requestId: string;
+    requestOwnerEpoch: string;
+    sourceLabel: string;
+  };
+  terminalState: 'succeeded' | null;
+}
+
 export interface ManagerApplyAvailability {
   mutationAvailable: boolean;
-  records: JsonValue[];
+  records: ManagerApplyRecord[];
   unavailableReasonCode: string | null;
 }
 

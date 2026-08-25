@@ -25,10 +25,12 @@ public:
 /// Concrete closed adapter for the one I3-qualified retained POSIX reference
 /// runtime product.
 ///
-/// The constructor accepts one trusted, existing Manager-private runtime root
-/// and read-only verified retained-product sources. Runtime calls accept only
-/// the exact durable convergence query: no executable, path, arguments,
-/// environment, working directory, or status payload is caller-selectable.
+/// The constructor accepts disjoint trusted, existing execution state and run
+/// roots plus read-only verified retained-product sources. Durable controller
+/// and process identities live only in state; locks, sockets, and verified
+/// launch material live only in run. Runtime calls accept only the exact
+/// durable convergence query: no executable, path, arguments, environment,
+/// working directory, or status payload is caller-selectable.
 ///
 /// The implementation is Linux/POSIX-specific. It atomically materializes the
 /// independently verified script, persists the private controller and runtime
@@ -43,7 +45,8 @@ class RetainedPosixRuntimeUnitAdapter final : public IRuntimeUnitProcessPort,
                                               public IRuntimeUnitProgressPort {
 public:
   RetainedPosixRuntimeUnitAdapter(
-      std::filesystem::path trusted_runtime_root,
+      std::filesystem::path trusted_state_root,
+      std::filesystem::path trusted_run_root,
       const manyforge::deployment::IVerifiedRetainedBundleSource &bundle_source,
       const manyforge::deployment::IVerifiedRetainedProductArtifactSource
           &artifact_source,

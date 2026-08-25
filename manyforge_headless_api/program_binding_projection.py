@@ -65,8 +65,6 @@ _APPLIED_SOURCE_FIELDS = frozenset(
 _APPLY_RESULT_FIELDS = frozenset(
     {
         "applied",
-        "deployment_apply_required",
-        "manager_response",
         "preparation",
         "schema_version",
         "status",
@@ -250,23 +248,15 @@ def validate_program_apply_result(
 
     if not isinstance(value, dict) or set(value) != _APPLY_RESULT_FIELDS:
         _fail(label, "the closed Program Apply result record")
-    if value.get("schema_version") != "manyforge.program_apply_result.v1":
-        _fail(f"{label}.schema_version", "manyforge.program_apply_result.v1")
+    if value.get("schema_version") != "manyforge.program_apply_result.v2":
+        _fail(f"{label}.schema_version", "manyforge.program_apply_result.v2")
     status = value.get("status")
-    if status not in {"applied", "pending_deployment"}:
-        _fail(f"{label}.status", "applied or pending_deployment")
-    if not isinstance(value.get("deployment_apply_required"), bool):
-        _fail(f"{label}.deployment_apply_required", "a boolean")
+    if status != "applied":
+        _fail(f"{label}.status", "applied")
     if not isinstance(value.get("preparation"), dict):
         _fail(f"{label}.preparation", "an object")
-    manager_response = value.get("manager_response")
-    if manager_response is not None and not isinstance(manager_response, dict):
-        _fail(f"{label}.manager_response", "an object or null")
     applied = value.get("applied")
-    if status == "pending_deployment":
-        if applied is not None:
-            _fail(f"{label}.applied", "null for pending deployment")
-    elif not isinstance(applied, dict):
+    if not isinstance(applied, dict):
         _fail(f"{label}.applied", "a complete Applied Program selection")
     else:
         validate_applied_program_selection(applied, label=f"{label}.applied")

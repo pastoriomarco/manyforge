@@ -82,11 +82,12 @@ async def serve_headless_state(
                     "snapshot_sequence": sequence,
                     "complete": True,
                 }
-                await asyncio.wait_for(
-                    websocket.send_text(_encode(payload)),
-                    timeout=SEND_TIMEOUT_SECONDS,
-                )
-                last_error_message = None
+                encoded = _encode(payload)
+                # Publish the server-owned barrier before the bytes can be
+                # observed by the client.  If transport delivery then fails,
+                # the outer failure path removes the barrier.  This keeps an
+                # immediate mutation deterministic without making the browser
+                # an authority or relying on a scheduling delay.
                 admission.publish_complete_snapshot(
                     client_id=client_id,
                     sequence=sequence,
@@ -94,6 +95,11 @@ async def serve_headless_state(
                     draft_id=draft["draft_id"],
                     draft_revision=draft["draft_revision"],
                 )
+                await asyncio.wait_for(
+                    websocket.send_text(encoded),
+                    timeout=SEND_TIMEOUT_SECONDS,
+                )
+                last_error_message = None
             except (HeadlessClientError, KeyError, TypeError, ValueError) as error:
                 admission.disconnect(client_id)
                 error_message = _encode(
@@ -121,6 +127,8 @@ async def serve_headless_state(
                     last_error_message = error_message
             await asyncio.sleep(POLL_INTERVAL_SECONDS)
     except (WebSocketDisconnect, asyncio.TimeoutError):
+        pass
+    finally:
         admission.disconnect(client_id)
 
 

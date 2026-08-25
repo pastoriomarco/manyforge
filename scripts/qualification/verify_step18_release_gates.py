@@ -940,6 +940,22 @@ def _iter_hygiene_files(
     allowed_symlinks: list[_AllowedHygieneSymlink] = []
     scanned_regular_paths: set[str] = set()
 
+    def directory_names(descriptor: int, prefix: str) -> tuple[str, ...]:
+        names: list[str] = []
+        with os.scandir(descriptor) as entries:
+            for entry in entries:
+                if time.monotonic_ns() > budget["deadline_ns"]:
+                    raise ValidationError(
+                        "hygiene source exceeds the wall-time bound"
+                    )
+                names.append(entry.name)
+                if len(names) > MAX_HYGIENE_DIRECTORY_ENTRIES:
+                    raise ValidationError(
+                        "hygiene directory exceeds the entry bound: "
+                        f"{prefix or '.'}"
+                    )
+        return tuple(sorted(names))
+
     def visit(
         descriptor: int,
         prefix: str,
@@ -958,16 +974,9 @@ def _iter_hygiene_files(
             raise ValidationError(
                 f"hygiene directory binding changed: {prefix or '.'}"
             )
-        names: list[str] = []
         try:
-            with os.scandir(descriptor) as entries:
-                for entry in entries:
-                    names.append(entry.name)
-                    if len(names) > MAX_HYGIENE_DIRECTORY_ENTRIES:
-                        raise ValidationError(
-                            f"hygiene directory exceeds the entry bound: {prefix or '.'}"
-                        )
-            for name in sorted(names):
+            names = directory_names(descriptor, prefix)
+            for name in names:
                 if time.monotonic_ns() > budget["deadline_ns"]:
                     raise ValidationError("hygiene source exceeds the wall-time bound")
                 if name in ("", ".", "..") or "\0" in name:
@@ -1098,6 +1107,10 @@ def _iter_hygiene_files(
                 payload = _read_tree_file(descriptor, name, relative, budget)
                 scanned_regular_paths.add(relative)
                 yield relative, payload
+            if directory_names(descriptor, prefix) != names:
+                raise ValidationError(
+                    f"hygiene directory changed during traversal: {prefix or '.'}"
+                )
         except OSError as error:
             raise ValidationError(
                 f"cannot traverse hygiene directory {prefix or '.'}: {error}"

@@ -509,14 +509,8 @@ class ProgramRunOwner:
                 self._starting_run_ids.discard(program_run_id)
 
     def read(self, program_run_id: str) -> ProgramRunSnapshot:
-        with self._lock:
-            entry = self._entry(program_run_id)
-            stopping = entry.state is ProgramRunState.STOPPING
-            finalizing = entry.state is ProgramRunState.FINALIZING
-        if stopping:
-            return self.reconcile_stop(program_run_id)
-        if finalizing:
-            return self._reconcile_finalizing(program_run_id)
+        """Return the current owner projection without advancing lifecycle."""
+
         with self._lock:
             return self._snapshot(self._entry(program_run_id))
 
@@ -528,10 +522,10 @@ class ProgramRunOwner:
     ) -> tuple[tuple[ProgramRunSnapshot, ...], bool]:
         """Return one bounded owner-issued index without downstream reads.
 
-        Exact ``read`` remains responsible for reconciling a stopping or
-        finalizing run.  Enumeration intentionally takes only the local owner
-        lock, so a slow Kernel observation cannot delay discovery of other
-        runs or the independent Stop path.
+        The explicit tick/advance path reconciles a stopping or finalizing
+        run. Enumeration and exact ``read`` intentionally take only the local
+        owner lock, so a slow Kernel observation cannot delay discovery of
+        other runs or the independent Stop path.
         """
 
         if type(active_only) is not bool:

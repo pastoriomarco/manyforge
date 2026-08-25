@@ -15,13 +15,13 @@ inline constexpr std::string_view kCCLCOpenRequestRosSocketFilename =
 /// Bounded same-user SOCK_SEQPACKET adapter for the headless HTTP owner.
 ///
 /// The server stamps every request as unverified HTTP ingress, owns no CCLC
-/// state, and never interprets lifecycle or route policy. The trusted state
+/// state, and never interprets lifecycle or route policy. The trusted run
 /// root and semantic port must outlive the server. Destruction closes ingress,
 /// drains the worker, and removes only the exact socket inode it created.
 class CCLCOpenRequestUnixServer final {
 public:
   [[nodiscard]] static core::Result<std::unique_ptr<CCLCOpenRequestUnixServer>>
-  CreateAndStart(const std::filesystem::path &trusted_state_root,
+  CreateAndStart(const std::filesystem::path &trusted_run_root,
                  core::ICCLCOpenRequestPort &port,
                  core::RequestTransportDTO transport);
 

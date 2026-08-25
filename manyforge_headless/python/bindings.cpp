@@ -242,6 +242,28 @@ public:
         });
   }
 
+  std::string ReplayProgramApply(
+      std::string scenario_id, std::string scenario_catalog_revision,
+      std::string program_id, std::string program_revision,
+      std::optional<std::string> expected_applied_record_digest,
+      std::string request_owner_epoch, std::string request_id) {
+    py::gil_scoped_release release;
+    return Invoke(
+        [this, scenario_id = std::move(scenario_id),
+         scenario_catalog_revision = std::move(scenario_catalog_revision),
+         program_id = std::move(program_id),
+         program_revision = std::move(program_revision),
+         expected_applied_record_digest =
+             std::move(expected_applied_record_digest),
+         request_owner_epoch = std::move(request_owner_epoch),
+         request_id = std::move(request_id)]() {
+          return core_->ReplayProgramApply(
+              scenario_id, scenario_catalog_revision, program_id,
+              program_revision, expected_applied_record_digest,
+              request_owner_epoch, request_id);
+        });
+  }
+
   std::string CommitProgramApply(
       std::string canonical_preparation_json,
       std::optional<std::string> expected_applied_record_digest,
@@ -542,6 +564,11 @@ PYBIND11_MODULE(manyforge_headless_py, module) {
       .def("prepare_program_apply", &HeadlessApiBridge::PrepareProgramApply,
            py::arg("scenario_id"), py::arg("scenario_catalog_revision"),
            py::arg("canonical_program_json"))
+      .def("replay_program_apply", &HeadlessApiBridge::ReplayProgramApply,
+           py::arg("scenario_id"), py::arg("scenario_catalog_revision"),
+           py::arg("program_id"), py::arg("program_revision"),
+           py::arg("expected_applied_record_digest"),
+           py::arg("request_owner_epoch"), py::arg("request_id"))
       .def("commit_program_apply", &HeadlessApiBridge::CommitProgramApply,
            py::arg("canonical_preparation_json"),
            py::arg("expected_applied_record_digest"),

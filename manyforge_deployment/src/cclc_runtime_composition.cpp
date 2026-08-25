@@ -1,8 +1,14 @@
 #include <manyforge_deployment/cclc_runtime_composition.hpp>
 
+#include <fcntl.h>
+#include <sys/stat.h>
+#include <unistd.h>
+
+#include <algorithm>
 #include <exception>
 #include <limits>
 #include <string>
+#include <system_error>
 #include <utility>
 
 namespace manyforge::deployment {
@@ -15,10 +21,71 @@ namespace {
           {{"reason", std::move(reason)}}};
 }
 
+[[nodiscard]] bool trusted_existing_directory(
+    const std::filesystem::path &path) noexcept {
+  if (!path.is_absolute() || path.lexically_normal() != path) {
+    return false;
+  }
+  std::error_code error;
+  if (std::filesystem::canonical(path, error) != path || error) {
+    return false;
+  }
+  struct stat before {};
+  if (::lstat(path.c_str(), &before) != 0 || !S_ISDIR(before.st_mode) ||
+      S_ISLNK(before.st_mode) || before.st_uid != ::geteuid() ||
+      (before.st_mode & (S_IWGRP | S_IWOTH)) != 0 ||
+      (before.st_mode & (S_IRUSR | S_IWUSR | S_IXUSR)) !=
+          (S_IRUSR | S_IWUSR | S_IXUSR)) {
+    return false;
+  }
+  const int descriptor =
+      ::open(path.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW);
+  if (descriptor < 0) {
+    return false;
+  }
+  struct stat opened {};
+  struct stat after {};
+  const bool valid =
+      ::fstat(descriptor, &opened) == 0 &&
+      ::lstat(path.c_str(), &after) == 0 &&
+      opened.st_dev == before.st_dev && opened.st_ino == before.st_ino &&
+      after.st_dev == before.st_dev && after.st_ino == before.st_ino &&
+      S_ISDIR(opened.st_mode) && S_ISDIR(after.st_mode) &&
+      opened.st_uid == ::geteuid() && after.st_uid == ::geteuid() &&
+      (opened.st_mode & (S_IWGRP | S_IWOTH)) == 0 &&
+      (after.st_mode & (S_IWGRP | S_IWOTH)) == 0 &&
+      (opened.st_mode & (S_IRUSR | S_IWUSR | S_IXUSR)) ==
+          (S_IRUSR | S_IWUSR | S_IXUSR) &&
+      (after.st_mode & (S_IRUSR | S_IWUSR | S_IXUSR)) ==
+          (S_IRUSR | S_IWUSR | S_IXUSR);
+  static_cast<void>(::close(descriptor));
+  return valid;
+}
+
+[[nodiscard]] bool disjoint_existing_directories(
+    const std::filesystem::path &state_root,
+    const std::filesystem::path &run_root) noexcept {
+  std::error_code error;
+  const auto canonical_state = std::filesystem::canonical(state_root, error);
+  if (error) {
+    return false;
+  }
+  const auto canonical_run = std::filesystem::canonical(run_root, error);
+  if (error) {
+    return false;
+  }
+  const auto mismatch = std::mismatch(
+      canonical_state.begin(), canonical_state.end(), canonical_run.begin(),
+      canonical_run.end());
+  return mismatch.first != canonical_state.end() &&
+         mismatch.second != canonical_run.end();
+}
+
 } // namespace
 
 bool CCLCRuntimeCompositionConfig::locally_valid() const noexcept {
-  return !state_root.empty() && !resolved_stop_plan_root.empty() &&
+  return !state_root.empty() && !run_root.empty() &&
+         state_root != run_root &&
          !cell_id.empty() && coordinator.locally_valid() &&
          exact_result_history_capacity > 0U &&
          exact_result_history_capacity <=
@@ -35,6 +102,12 @@ bool CCLCRuntimeCompositionConfig::locally_valid() const noexcept {
              core::kMaximumResolvedStopBasePlanEncodedBytes &&
          maximum_single_resolved_stop_plan_bytes <=
              maximum_resolved_stop_plan_bytes;
+}
+
+bool CCLCRuntimeCompositionConfig::trusted_roots_valid() const noexcept {
+  return locally_valid() && trusted_existing_directory(state_root) &&
+         trusted_existing_directory(run_root) &&
+         disjoint_existing_directories(state_root, run_root);
 }
 
 core::Result<std::unique_ptr<CCLCRuntimeComposition>>
@@ -60,7 +133,8 @@ CCLCRuntimeComposition::CreateAndStart(
         std::optional<core::ActiveControlConfigurationDTO>>(
         const core::ControlDomainId &)>
         kernel_current_configuration_source) {
-  if (!config.locally_valid() || retained_bundle == nullptr ||
+  if (!config.trusted_roots_valid() ||
+      retained_bundle == nullptr ||
       !expected_active_publication.valid() ||
       expected_active_publication.request.candidate_retained_bundle_id !=
           retained_bundle->retained_bundle_id() ||
@@ -92,7 +166,7 @@ CCLCRuntimeComposition::CreateAndStart(
           started.error());
     }
     auto http_server = CCLCOpenRequestUnixServer::CreateAndStart(
-        result->config_.state_root, result->open_request_port_,
+        result->config_.run_root, result->open_request_port_,
         core::RequestTransportDTO::kHttp);
     if (!http_server.ok()) {
       result->coordinator_.CloseAdmission();
@@ -101,7 +175,7 @@ CCLCRuntimeComposition::CreateAndStart(
     }
     result->http_open_request_server_ = std::move(http_server.value());
     auto ros_server = CCLCOpenRequestUnixServer::CreateAndStart(
-        result->config_.state_root, result->open_request_port_,
+        result->config_.run_root, result->open_request_port_,
         core::RequestTransportDTO::kRos);
     if (!ros_server.ok()) {
       result->coordinator_.CloseAdmission();
@@ -148,7 +222,7 @@ CCLCRuntimeComposition::CCLCRuntimeComposition(
                config_.cell_id, config_.exact_result_history_capacity,
                config_.terminal_result_bytes_capacity),
       port_registry_(std::move(brand_ports), std::move(controller_ports)),
-      plan_repository_(config_.resolved_stop_plan_root,
+      plan_repository_(config_.run_root,
                        config_.maximum_resolved_stop_plan_count,
                        config_.maximum_resolved_stop_plan_bytes,
                        config_.maximum_single_resolved_stop_plan_bytes),

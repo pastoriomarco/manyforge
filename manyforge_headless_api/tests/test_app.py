@@ -423,6 +423,9 @@ class FakeCore:
         self.manager_payload = _manager_payload()
         self.program_preparations: list[dict[str, Any]] = []
         self.program_commits: list[tuple[dict[str, Any], str | None]] = []
+        self.program_replays: dict[
+            tuple[str, str], tuple[tuple[object, ...], dict[str, Any]]
+        ] = {}
         self.applied_program: dict[str, Any] | None = None
         self.program_target_bundle = "bundle.1"
         self.program_target_graph = "graph.1"
@@ -527,6 +530,15 @@ class FakeCore:
         scenario_catalog_revision: str,
         program: dict[str, Any],
     ) -> dict[str, Any]:
+        active = self.manager_payload["active"]
+        if (
+            active["retained_bundle_id"] != self.program_target_bundle
+            or active["graph_revision"] != self.program_target_graph
+        ):
+            raise HeadlessApiError(
+                "program_apply_deployment_not_active",
+                "Program Apply target is not the active deployment",
+            )
         self.program_preparations.append(copy.deepcopy(program))
         return {
             "schema_version": "manyforge.program_apply_preparation.v1",
@@ -545,6 +557,33 @@ class FakeCore:
             "typed_parameter_overrides": {},
             "preparation_digest": "sha256:" + "4" * 64,
         }
+
+    def replay_program_apply(
+        self,
+        scenario_id: str,
+        scenario_catalog_revision: str,
+        program_id: str,
+        program_revision: str,
+        expected_applied_record_digest: str | None,
+        request_owner_epoch: str,
+        request_id: str,
+    ) -> dict[str, Any] | None:
+        retained = self.program_replays.get((request_owner_epoch, request_id))
+        if retained is None:
+            return None
+        semantic = (
+            scenario_id,
+            scenario_catalog_revision,
+            program_id,
+            program_revision,
+            expected_applied_record_digest,
+        )
+        if retained[0] != semantic:
+            raise HeadlessApiError(
+                "program_apply_request_conflict",
+                "Program Apply request identity was reused",
+            )
+        return copy.deepcopy(retained[1])
 
     def commit_program_apply(
         self,
@@ -566,6 +605,20 @@ class FakeCore:
             record_digest=record_digest,
             retained_bundle_id=preparation["retained_bundle_id"],
             graph_revision=preparation["graph_revision"],
+        )
+        semantic = (
+            preparation["scenario_id"],
+            preparation["scenario_catalog_revision"],
+            preparation["program_id"],
+            preparation["program_revision"],
+            expected_applied_record_digest,
+        )
+        self.program_replays[(request_owner_epoch, request_id)] = (
+            semantic,
+            {
+                "preparation": copy.deepcopy(preparation),
+                "applied": copy.deepcopy(self.applied_program),
+            },
         )
         return copy.deepcopy(self.applied_program)
 
@@ -800,18 +853,6 @@ class FakeManager:
         }
 
 
-class AcceptedProgramApplyManager(FakeManager):
-    def apply(self, request: ManagerApplyRequest) -> dict[str, Any]:
-        self.requests.append(request)
-        return {
-            "api_version": "manyforge.manager_command_response.v1",
-            "ok": True,
-            "error": None,
-            "request_id": request.request_id,
-            "request_owner_epoch": request.request_owner_epoch,
-        }
-
-
 class FakeExecution:
     def __init__(self) -> None:
         self.requests: list[tuple[str, object]] = []
@@ -865,6 +906,7 @@ class FakeExecution:
             "ok": True,
             "command": "read",
             "operation": {"operation_id": operation_id},
+            "resident": True,
         }
 
     def plan_pick(
@@ -1303,24 +1345,31 @@ def test_program_apply_skips_unchanged_deployment_and_publishes_exact_program() 
     )
     core.manager_payload["active"]["graph_revision"] = core.program_target_graph
     program = copy.deepcopy(_program_document())
+    body = {
+        "scenario_id": "cell-pick",
+        "scenario_catalog_revision": "sha256:" + "6" * 64,
+        "program": program,
+        "expected_applied_record_digest": None,
+        "authoring_claim": _authoring_claim(),
+    }
     with client:
         absent = client.get("/api/program/applied")
-        response = client.post(
-            "/api/program/apply",
-            json={
-                "scenario_id": "cell-pick",
-                "scenario_catalog_revision": "sha256:" + "6" * 64,
-                "program": program,
-                "expected_applied_record_digest": None,
-                "authoring_claim": _authoring_claim(),
-            },
-        )
+        response = client.post("/api/program/apply", json=body)
+        core.manager_payload["manager_ready"] = False
+        replayed = client.post("/api/program/apply", json=body)
         applied = client.get("/api/program/applied")
 
     assert absent.status_code == 404
     assert response.status_code == 200
+    assert replayed.status_code == 200
+    assert replayed.json() == response.json()
     assert response.json()["status"] == "applied"
-    assert response.json()["deployment_apply_required"] is False
+    assert set(response.json()) == {
+        "applied",
+        "preparation",
+        "schema_version",
+        "status",
+    }
     assert manager.requests == []
     assert core.program_preparations == [program]
     assert len(core.program_commits) == 1
@@ -1380,6 +1429,79 @@ def test_program_apply_rejects_rehashed_malformed_applied_binding_result() -> No
 
     assert response.status_code == 502
     assert response.json()["detail"]["code"] == "program_apply_response_invalid"
+    assert "effect_disposition" not in response.json()["detail"]["details"]
+
+
+def test_program_apply_recovers_exact_commit_before_returning_failure() -> None:
+    core = FakeCore()
+    core.program_target_bundle = "sha256:" + "b" * 64
+    core.program_target_graph = "sha256:" + "c" * 64
+    core.manager_payload["active"]["retained_bundle_id"] = (
+        core.program_target_bundle
+    )
+    core.manager_payload["active"]["graph_revision"] = core.program_target_graph
+    original_commit = core.commit_program_apply
+
+    def commit_then_lose_result(*args, **kwargs):
+        original_commit(*args, **kwargs)
+        raise HeadlessApiError(
+            "program_apply_commit_failed",
+            "fixture lost the direct commit result",
+        )
+
+    core.commit_program_apply = commit_then_lose_result  # type: ignore[method-assign]
+    client = TestClient(create_app(service=_service(core, FakeManager())))
+
+    response = client.post(
+        "/api/program/apply",
+        json={
+            "scenario_id": "cell-pick",
+            "scenario_catalog_revision": "sha256:" + "6" * 64,
+            "program": copy.deepcopy(_program_document()),
+            "expected_applied_record_digest": None,
+            "authoring_claim": _authoring_claim(),
+        },
+    )
+
+    assert response.status_code == 200
+    assert response.json()["status"] == "applied"
+    assert len(core.program_commits) == 1
+
+
+def test_program_apply_commit_rejection_carries_owner_no_effect_proof() -> None:
+    core = FakeCore()
+    core.program_target_bundle = "sha256:" + "b" * 64
+    core.program_target_graph = "sha256:" + "c" * 64
+    core.manager_payload["active"]["retained_bundle_id"] = (
+        core.program_target_bundle
+    )
+    core.manager_payload["active"]["graph_revision"] = core.program_target_graph
+
+    def reject_commit(*_args, **_kwargs):
+        raise HeadlessApiError(
+            "program_apply_selection_stale",
+            "fixture rejected the selection before publication",
+        )
+
+    core.commit_program_apply = reject_commit  # type: ignore[method-assign]
+    client = TestClient(create_app(service=_service(core, FakeManager())))
+
+    response = client.post(
+        "/api/program/apply",
+        json={
+            "scenario_id": "cell-pick",
+            "scenario_catalog_revision": "sha256:" + "6" * 64,
+            "program": copy.deepcopy(_program_document()),
+            "expected_applied_record_digest": None,
+            "authoring_claim": _authoring_claim(),
+        },
+    )
+
+    assert response.status_code == 409
+    assert response.json()["detail"]["details"] == {
+        "effect_disposition": "proven_no_effect"
+    }
+    assert core.applied_program is None
 
 
 def test_program_apply_fences_published_full_stack_restart_before_prepare() -> None:
@@ -1662,17 +1784,12 @@ def test_program_model_attempt_is_validated_before_native_commit() -> None:
     assert core.model_attempts == [body]
 
 
-def test_program_apply_waits_for_manager_convergence_without_advancing_applied(
+def test_program_apply_rejects_inactive_target_without_artifacts_or_manager_apply(
 ) -> None:
     core = FakeCore()
     core.program_target_bundle = "sha256:" + "b" * 64
     core.program_target_graph = "sha256:" + "c" * 64
-    core.manager_payload["apply"] = {
-        "mutation_available": True,
-        "records": [],
-        "unavailable_reason_code": None,
-    }
-    manager = AcceptedProgramApplyManager()
+    manager = FakeManager()
     client = TestClient(create_app(service=_service(core, manager)))
     body = {
         "scenario_id": "cell-pick",
@@ -1683,31 +1800,22 @@ def test_program_apply_waits_for_manager_convergence_without_advancing_applied(
     }
 
     with client:
-        pending = client.post("/api/program/apply", json=body)
+        rejected = client.post("/api/program/apply", json=body)
         assert client.get("/api/program/applied").status_code == 404
-        core.manager_payload["active"]["retained_bundle_id"] = (
-            core.program_target_bundle
-        )
-        core.manager_payload["active"]["graph_revision"] = (
-            core.program_target_graph
-        )
-        completed = client.post("/api/program/apply", json=body)
 
-    assert pending.status_code == 202
-    assert pending.json()["status"] == "pending_deployment"
-    assert core.program_commits == [
-        (completed.json()["preparation"], None)
-    ]
-    assert len(manager.requests) == 1
-    assert manager.requests[0].parent_authoring_claim == body[
-        "authoring_claim"
-    ]
-    assert manager.requests[0].expected_admission_generation is None
-    assert completed.status_code == 200
-    assert completed.json()["status"] == "applied"
+    assert rejected.status_code == 409
+    assert rejected.json()["detail"]["code"] == (
+        "program_apply_deployment_not_active"
+    )
+    assert rejected.json()["detail"]["details"] == {
+        "effect_disposition": "proven_no_effect"
+    }
+    assert core.program_preparations == []
+    assert core.program_commits == []
+    assert manager.requests == []
 
 
-def test_program_apply_manager_rejection_preserves_prior_applied_selection() -> None:
+def test_program_apply_inactive_target_preserves_prior_applied_selection() -> None:
     core = FakeCore()
     prior = _applied_projection(
         _program_document(),
@@ -1717,11 +1825,6 @@ def test_program_apply_manager_rejection_preserves_prior_applied_selection() -> 
     core.applied_program = copy.deepcopy(prior)
     core.program_target_bundle = "sha256:" + "b" * 64
     core.program_target_graph = "sha256:" + "c" * 64
-    core.manager_payload["apply"] = {
-        "mutation_available": True,
-        "records": [],
-        "unavailable_reason_code": None,
-    }
     manager = FakeManager()
     client = TestClient(create_app(service=_service(core, manager)))
 
@@ -1740,11 +1843,12 @@ def test_program_apply_manager_rejection_preserves_prior_applied_selection() -> 
         )
         still_applied = client.get("/api/program/applied")
 
-    assert rejected.status_code == 503
-    assert rejected.json()["detail"]["code"] == "kernel_owner_unavailable"
-    assert len(manager.requests) == 1
-    assert manager.requests[0].parent_authoring_claim == _authoring_claim()
-    assert manager.requests[0].expected_admission_generation is None
+    assert rejected.status_code == 409
+    assert rejected.json()["detail"]["code"] == (
+        "program_apply_deployment_not_active"
+    )
+    assert manager.requests == []
+    assert core.program_preparations == []
     assert core.program_commits == []
     assert still_applied.status_code == 200
     assert still_applied.json() == prior
@@ -1765,6 +1869,9 @@ def test_program_apply_rejects_invalid_program_before_native_preparation() -> No
         )
     assert response.status_code == 400
     assert response.json()["detail"]["code"] == "program_apply_program_invalid"
+    assert response.json()["detail"]["details"] == {
+        "effect_disposition": "proven_no_effect"
+    }
     assert core.program_preparations == []
 
 

@@ -17,6 +17,8 @@ import type {
   AppliedProgramSelection,
   ManagerActiveProjection,
   ManagerApplyAvailability,
+  ManagerApplyPhase,
+  ManagerApplyRecord,
   ManagerApplyReplayStatus,
   ManagerApplyResponse,
   ManagerApplyStatusResponse,
@@ -1431,12 +1433,169 @@ function parseManagerApplyAvailability(
       path + '.mutation_available',
     ),
     records: boundedArrayAt(record.records, path + '.records', 4096).map(
-      (item, index) => jsonValueAt(item, path + '.records[' + index + ']'),
+      (item, index) => parseManagerApplyRecord(
+        item,
+        path + '.records[' + index + ']',
+      ),
     ),
     unavailableReasonCode: nullableStringAt(
       record.unavailable_reason_code,
       path + '.unavailable_reason_code',
     ),
+  };
+}
+
+const MANAGER_APPLY_PHASES = new Set<ManagerApplyPhase>([
+  'intent_persisted',
+  'scope_persisted',
+  'fence_acquire_pending',
+  'fence_held',
+  'runtime_convergence_pending',
+  'runtime_staged_ready',
+  'scene_stage_pending',
+  'scene_staged',
+  'activation_selected',
+  'scene_activated',
+  'private_materialized',
+  'command_surfaces_retired',
+  'active_bundle_published',
+  'scene_finalized',
+  'fence_release_pending',
+  'fence_released',
+  'terminal',
+]);
+
+const MANAGER_FENCE_STATES = new Set<ManagerApplyRecord['fence']['state']>([
+  'not_requested',
+  'scope_persisted',
+  'acquire_pending',
+  'held',
+  'release_pending',
+  'released',
+]);
+
+function parseManagerApplyRecord(
+  value: unknown,
+  path: string,
+): ManagerApplyRecord {
+  const record = objectAt(value, path);
+  exactKeysAt(
+    record,
+    [
+      'apply_generation',
+      'apply_id',
+      'candidate_graph_revision',
+      'candidate_retained_bundle_id',
+      'committed',
+      'expected_active_projection_revision',
+      'fence',
+      'incomplete',
+      'intent_digest',
+      'phase',
+      'request',
+      'terminal_state',
+    ],
+    path,
+  );
+  const phase = stringAt(record.phase, path + '.phase');
+  if (!MANAGER_APPLY_PHASES.has(phase as ManagerApplyPhase)) {
+    return fail(path + '.phase', 'a supported Manager Apply phase');
+  }
+  const fence = objectAt(record.fence, path + '.fence');
+  exactKeysAt(
+    fence,
+    [
+      'acceptance_digest',
+      'configuration_fence_generation',
+      'configuration_fence_id',
+      'fence_attempt_digest',
+      'scope',
+      'state',
+    ],
+    path + '.fence',
+  );
+  const fenceState = stringAt(fence.state, path + '.fence.state');
+  if (
+    !MANAGER_FENCE_STATES.has(
+      fenceState as ManagerApplyRecord['fence']['state'],
+    )
+  ) {
+    return fail(path + '.fence.state', 'a supported Manager fence state');
+  }
+  const fenceGeneration = fence.configuration_fence_generation === null
+    ? null
+    : positiveIntegerAt(
+        fence.configuration_fence_generation,
+        path + '.fence.configuration_fence_generation',
+      );
+  const scope = fence.scope === null
+    ? null
+    : jsonRecordAt(fence.scope, path + '.fence.scope');
+  const request = objectAt(record.request, path + '.request');
+  exactKeysAt(
+    request,
+    ['correlation_id', 'request_id', 'request_owner_epoch', 'source_label'],
+    path + '.request',
+  );
+  const terminalState = nullableStringAt(
+    record.terminal_state,
+    path + '.terminal_state',
+  );
+  if (terminalState !== null && terminalState !== 'succeeded') {
+    return fail(path + '.terminal_state', 'succeeded or null');
+  }
+  return {
+    applyGeneration: positiveIntegerAt(
+      record.apply_generation,
+      path + '.apply_generation',
+    ),
+    applyId: stringAt(record.apply_id, path + '.apply_id'),
+    candidateGraphRevision: stringAt(
+      record.candidate_graph_revision,
+      path + '.candidate_graph_revision',
+    ),
+    candidateRetainedBundleId: stringAt(
+      record.candidate_retained_bundle_id,
+      path + '.candidate_retained_bundle_id',
+    ),
+    committed: booleanAt(record.committed, path + '.committed'),
+    expectedActiveProjectionRevision: parseProjectionRevision(
+      record.expected_active_projection_revision,
+      path + '.expected_active_projection_revision',
+    ),
+    fence: {
+      acceptanceDigest: nullableStringAt(
+        fence.acceptance_digest,
+        path + '.fence.acceptance_digest',
+      ),
+      configurationFenceGeneration: fenceGeneration,
+      configurationFenceId: nullableStringAt(
+        fence.configuration_fence_id,
+        path + '.fence.configuration_fence_id',
+      ),
+      fenceAttemptDigest: nullableStringAt(
+        fence.fence_attempt_digest,
+        path + '.fence.fence_attempt_digest',
+      ),
+      scope,
+      state: fenceState as ManagerApplyRecord['fence']['state'],
+    },
+    incomplete: booleanAt(record.incomplete, path + '.incomplete'),
+    intentDigest: stringAt(record.intent_digest, path + '.intent_digest'),
+    phase: phase as ManagerApplyPhase,
+    request: {
+      correlationId: nullableStringAt(
+        request.correlation_id,
+        path + '.request.correlation_id',
+      ),
+      requestId: stringAt(request.request_id, path + '.request.request_id'),
+      requestOwnerEpoch: stringAt(
+        request.request_owner_epoch,
+        path + '.request.request_owner_epoch',
+      ),
+      sourceLabel: stringAt(request.source_label, path + '.request.source_label'),
+    },
+    terminalState,
   };
 }
 
@@ -2391,8 +2550,6 @@ function parseProgramApplyResult(
     record,
     [
       'applied',
-      'deployment_apply_required',
-      'manager_response',
       'preparation',
       'schema_version',
       'status',
@@ -2401,37 +2558,19 @@ function parseProgramApplyResult(
   );
   if (
     stringAt(record.schema_version, `${path}.schema_version`)
-    !== 'manyforge.program_apply_result.v1'
+    !== 'manyforge.program_apply_result.v2'
   ) {
     return fail(
       `${path}.schema_version`,
-      'manyforge.program_apply_result.v1',
+      'manyforge.program_apply_result.v2',
     );
   }
   const status = stringAt(record.status, `${path}.status`);
-  if (status !== 'applied' && status !== 'pending_deployment') {
-    return fail(`${path}.status`, 'applied or pending_deployment');
+  if (status !== 'applied') {
+    return fail(`${path}.status`, 'applied');
   }
-  booleanAt(
-    record.deployment_apply_required,
-    `${path}.deployment_apply_required`,
-  );
   jsonRecordAt(record.preparation, `${path}.preparation`);
-  if (
-    record.manager_response !== null
-    && (record.manager_response === undefined
-      || typeof record.manager_response !== 'object'
-      || Array.isArray(record.manager_response))
-  ) {
-    return fail(`${path}.manager_response`, 'an object or null');
-  }
-  if (status === 'pending_deployment') {
-    if (record.applied !== null) {
-      return fail(`${path}.applied`, 'null for pending deployment');
-    }
-  } else {
-    parseAppliedProgramSelection(record.applied);
-  }
+  parseAppliedProgramSelection(record.applied);
   return record;
 }
 
@@ -2442,10 +2581,10 @@ export function parseProgramWorkspaceTransitionResponse(
   const record = objectAt(value, path);
   exactKeysAt(record, ['headless', 'status', 'workspace'], path);
   const status = stringAt(record.status, `${path}.status`);
-  if (!['applied', 'loaded', 'reverted', 'pending_deployment'].includes(status)) {
+  if (!['applied', 'loaded', 'reverted'].includes(status)) {
     return fail(
       `${path}.status`,
-      'applied, loaded, reverted, or pending_deployment',
+      'applied, loaded, or reverted',
     );
   }
   let headless: Record<string, JsonValue> | null;
@@ -5367,6 +5506,10 @@ export function parseOperationObservation(value: unknown): OperationObservation 
       'operationObservation.operation.operation_id',
     ),
     operationRevision: revision,
+    resident: booleanAt(
+      envelope.resident,
+      'operationObservation.resident',
+    ),
     state: stateValue,
     progress,
     activeStopId: nullableStringAt(

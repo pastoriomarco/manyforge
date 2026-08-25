@@ -42,7 +42,7 @@ def test_ros_callback_returns_only_the_exact_owner_response(tmp_path: Path) -> N
     thread = threading.Thread(target=serve)
     thread.start()
     rclpy.init()
-    node = CCLCOpenRequestNode(state_root=tmp_path)
+    node = CCLCOpenRequestNode(run_root=tmp_path)
     try:
         request = CCLCOpenRequest.Request()
         request.canonical_request_json = request_json

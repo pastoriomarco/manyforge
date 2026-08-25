@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import Annotated, Any
+from typing import Annotated, Any, NoReturn
 import unicodedata
 
 from fastapi import APIRouter, HTTPException, Path
@@ -33,7 +33,7 @@ from .source_model_client import (
     read_active_source_model,
 )
 from .state import ComposerState
-from .authoring_admission import AuthoringMutationEnvelope
+from .authoring_admission import BackendAuthoringMutationEnvelope
 
 
 _MAXIMUM_SAFE_INTEGER = 9_007_199_254_740_991
@@ -94,13 +94,6 @@ class AssistantDraftCallbackRequest(BaseModel):
     request_owner_epoch: str = Field(
         alias="requestOwnerEpoch", min_length=1, max_length=256
     )
-    client_id: str = Field(alias="clientId", min_length=1, max_length=256)
-    snapshot_receiver_epoch: str = Field(
-        alias="snapshotReceiverEpoch", min_length=1, max_length=256
-    )
-    snapshot_sequence: Annotated[
-        int, Field(alias="snapshotSequence", ge=1, le=_MAXIMUM_SAFE_INTEGER)
-    ]
     expected_admission_generation: Annotated[
         int,
         Field(
@@ -163,6 +156,7 @@ def _validation_result(
             "requestOwnerEpoch": body.request_owner_epoch,
             "sourceLabel": body.source_label,
             "correlationId": body.correlation_id,
+            "nextAdmissionGeneration": body.expected_admission_generation,
             "result": {
                 "kind": "validation_error",
                 "httpStatus": status_code,
@@ -184,19 +178,23 @@ def _require_equal(received: Any, expected: Any, *, field: str) -> None:
         )
 
 
+class _CallbackValidationResult(Exception):
+    def __init__(self, response: JSONResponse) -> None:
+        super().__init__("assistant callback validation failed without an effect")
+        self.response = response
+
+
 def create_assistant_draft_router(state: ComposerState) -> APIRouter:
     """Bind exact active projection context to Draft-only callback effects."""
 
     router = APIRouter()
 
-    @router.post("/api/assistant/bridge/tools/{tool_id}")
-    def invoke_draft_tool(
-        tool_id: Annotated[
-            str,
-            Path(min_length=1, max_length=256, pattern=r"^[a-z][a-z0-9_]*$"),
-        ],
+    def active_context(
+        tool_id: str,
         body: AssistantDraftCallbackRequest,
-    ) -> JSONResponse:
+        *,
+        validation_as_result: bool,
+    ):
         try:
             node_environment = read_active_node_environment(state)
             source_model = read_active_source_model(
@@ -222,7 +220,11 @@ def create_assistant_draft_router(state: ComposerState) -> APIRouter:
         mode_payload = assistant_mode.payload
         mode_source = mode_payload["source"]
         for received, expected, field in (
-            (body.retained_bundle_id, node_payload["retained_bundle_id"], "retainedBundleId"),
+            (
+                body.retained_bundle_id,
+                node_payload["retained_bundle_id"],
+                "retainedBundleId",
+            ),
             (body.graph_revision, node_payload["graph_revision"], "graphRevision"),
             (
                 body.node_environment_digest,
@@ -268,7 +270,11 @@ def create_assistant_draft_router(state: ComposerState) -> APIRouter:
                     "message": str(error),
                 },
             ) from error
-        _require_equal(body.catalog_hash, resolved_catalog["catalogHash"], field="catalogHash")
+        _require_equal(
+            body.catalog_hash,
+            resolved_catalog["catalogHash"],
+            field="catalogHash",
+        )
         resolved_tools = {
             row["tool_id"]: row for row in resolved_catalog["tools"]
         }
@@ -303,7 +309,9 @@ def create_assistant_draft_router(state: ComposerState) -> APIRouter:
                     status_code=503,
                     detail={
                         "code": "assistant_callback_tool_unavailable",
-                        "message": "selected Draft callback has no Composer implementation",
+                        "message": (
+                            "selected Draft callback has no Composer implementation"
+                        ),
                     },
                 )
         elif not (effect == "read_only" and tool_id in _DRAFT_READ_TOOLS):
@@ -311,7 +319,9 @@ def create_assistant_draft_router(state: ComposerState) -> APIRouter:
                 status_code=400,
                 detail={
                     "code": "assistant_callback_effect_rejected",
-                    "message": "tool effect is not owned by the Composer Draft callback",
+                    "message": (
+                        "tool effect is not owned by the Composer Draft callback"
+                    ),
                 },
             )
 
@@ -341,66 +351,224 @@ def create_assistant_draft_router(state: ComposerState) -> APIRouter:
         try:
             validate_callback_arguments(body.arguments, tool["input_schema"])
         except CallbackSchemaValidationError as error:
-            return _validation_result(
-                body,
+            if validation_as_result:
+                raise _CallbackValidationResult(
+                    _validation_result(
+                        body,
+                        status_code=400,
+                        message=str(error),
+                        detail={"path": error.path, "message": error.message},
+                    )
+                ) from error
+            raise HTTPException(
                 status_code=400,
-                message=str(error),
-                detail={"path": error.path, "message": error.message},
-            )
+                detail={
+                    "code": "assistant_callback_arguments_invalid",
+                    "message": str(error),
+                },
+            ) from error
+        return node_environment, effect, snapshot
 
-        try:
-            if tool_id == "program_read":
-                next_snapshot = snapshot
-                mutation = None
-                details: dict[str, Any] = {"program": snapshot["program"]}
-            elif tool_id == "program_validate":
-                next_snapshot = state.draft_session.validate(node_environment.catalog)
-                mutation = None
-                details = {"valid": True}
-            else:
-                coordinator = state.authoring_admission
-                if coordinator is None:
+    def draft_error(
+        body: AssistantDraftCallbackRequest,
+        error: DraftSessionError,
+        *,
+        validation_as_result: bool,
+    ) -> NoReturn:
+        if error.code in {
+            "composer_draft_revision_stale",
+            "composer_draft_unavailable",
+        } or not validation_as_result:
+            raise _http_error(error) from error
+        raise _CallbackValidationResult(
+            _validation_result(
+                body,
+                status_code=error.status_code,
+                message=str(error),
+                detail=error.detail,
+            )
+        ) from error
+
+    def callback_response(
+        body: AssistantDraftCallbackRequest,
+        *,
+        next_snapshot: dict[str, Any],
+        mutation: str | None,
+        details: dict[str, Any],
+        next_admission_generation: int,
+    ) -> JSONResponse:
+        mutated = mutation is not None
+        return JSONResponse(
+            status_code=200,
+            content={
+                "success": True,
+                "mutated": mutated,
+                "draftMutated": mutated,
+                "requestId": body.request_id,
+                "requestOwnerEpoch": body.request_owner_epoch,
+                "sourceLabel": body.source_label,
+                "correlationId": body.correlation_id,
+                "nextAdmissionGeneration": next_admission_generation,
+                "result": {
+                    "kind": (
+                        "composer_draft_mutation"
+                        if mutated
+                        else "composer_draft_read"
+                    ),
+                    "mutation": mutation,
+                    "details": details,
+                    "draftId": next_snapshot["draft_id"],
+                    "draftRevision": next_snapshot["draft_revision"],
+                    "programRevision": next_snapshot["program_revision"],
+                },
+            },
+        )
+
+    @router.post("/api/assistant/bridge/tools/{tool_id}")
+    def invoke_draft_tool(
+        tool_id: Annotated[
+            str,
+            Path(min_length=1, max_length=256, pattern=r"^[a-z][a-z0-9_]*$"),
+        ],
+        body: AssistantDraftCallbackRequest,
+    ) -> JSONResponse:
+        if tool_id in SUPPORTED_DRAFT_MUTATIONS:
+            coordinator = state.authoring_admission
+            if coordinator is None:
+                raise HTTPException(
+                    status_code=503,
+                    detail={
+                        "code": "authoring_not_ready",
+                        "message": "authoritative authoring admission is unavailable",
+                    },
+                )
+            validated_catalog = None
+
+            def validate_mutation_context(
+                *,
+                validation_as_result: bool,
+                include_preview: bool,
+            ):
+                node_environment, effect, _snapshot = active_context(
+                    tool_id,
+                    body,
+                    validation_as_result=validation_as_result,
+                )
+                if effect != "composer_draft_mutating":
                     raise HTTPException(
-                        status_code=503,
+                        status_code=400,
                         detail={
-                            "code": "authoring_not_ready",
-                            "message": "authoritative authoring admission is unavailable",
+                            "code": "assistant_callback_effect_rejected",
+                            "message": "callback is not a Composer Draft mutation",
                         },
                     )
-                def mutate_draft(_claim: dict[str, Any]) -> dict[str, Any]:
-                    changed = state.draft_session.mutate(
-                        tool_id=tool_id,
-                        arguments=body.arguments,
-                        expected_revision=body.expected_draft_revision,
-                        catalog=node_environment.catalog,
-                    )
-                    return {
-                        "mutation": changed.mutation,
-                        "details": changed.details,
-                        "snapshot": changed.snapshot,
-                    }
+                if include_preview:
+                    try:
+                        state.draft_session.preview_mutation(
+                            tool_id=tool_id,
+                            arguments=body.arguments,
+                            expected_revision=body.expected_draft_revision,
+                            catalog=node_environment.catalog,
+                            draft_id=body.draft_id,
+                        )
+                    except DraftSessionError as error:
+                        draft_error(
+                            body,
+                            error,
+                            validation_as_result=validation_as_result,
+                        )
+                return node_environment.catalog
 
+            def prepare_effect() -> dict[str, Any]:
+                validate_mutation_context(
+                    validation_as_result=True,
+                    include_preview=True,
+                )
+                return {
+                    "schema_version": "manyforge.composer_authoring_effect.v1",
+                    "operation_kind": f"assistant_{tool_id}",
+                    "effect_class": "local",
+                    "pre_state": state.draft_session.retained_state(),
+                }
+
+            def validate_under_claim(_claim: dict[str, Any]) -> None:
+                nonlocal validated_catalog
+                validated_catalog = validate_mutation_context(
+                    validation_as_result=False,
+                    include_preview=False,
+                )
+
+            def mutate_draft(_claim: dict[str, Any]) -> dict[str, Any]:
+                if validated_catalog is None:
+                    raise RuntimeError("assistant mutation validation was not retained")
+                changed = state.draft_session.mutate(
+                    tool_id=tool_id,
+                    arguments=body.arguments,
+                    expected_revision=body.expected_draft_revision,
+                    catalog=validated_catalog,
+                    draft_id=body.draft_id,
+                )
+                return {
+                    "mutation": changed.mutation,
+                    "details": changed.details,
+                    "snapshot": changed.snapshot,
+                }
+
+            envelope = BackendAuthoringMutationEnvelope(
+                expected_admission_generation=body.expected_admission_generation,
+                request_owner_epoch=body.request_owner_epoch,
+                request_id=body.request_id,
+            )
+            try:
                 result = coordinator.execute(
-                    AuthoringMutationEnvelope(
-                        client_id=body.client_id,
-                        snapshot_receiver_epoch=body.snapshot_receiver_epoch,
-                        snapshot_sequence=body.snapshot_sequence,
-                        expected_admission_generation=(
-                            body.expected_admission_generation
-                        ),
-                        request_owner_epoch=body.request_owner_epoch,
-                        request_id=body.request_id,
-                    ),
+                    envelope,
                     operation_kind=f"assistant_{tool_id}",
                     draft_id=body.draft_id,
                     draft_revision=body.expected_draft_revision,
                     payload=body.model_dump(mode="json", by_alias=True),
                     effect=mutate_draft,
                     post_image=state.draft_session.retained_state,
+                    prepare_effect=prepare_effect,
+                    validate_under_claim=validate_under_claim,
                 )
-                next_snapshot = result["snapshot"]
-                mutation = result["mutation"]
-                details = result["details"]
+            except _CallbackValidationResult as result_error:
+                return result_error.response
+            except DraftSessionError as error:
+                raise _http_error(error) from error
+            return callback_response(
+                body,
+                next_snapshot=result["snapshot"],
+                mutation=result["mutation"],
+                details=result["details"],
+                next_admission_generation=(
+                    coordinator.completed_admission_generation(envelope)
+                ),
+            )
+
+        try:
+            node_environment, _effect, snapshot = active_context(
+                tool_id,
+                body,
+                validation_as_result=True,
+            )
+            if tool_id == "program_read":
+                next_snapshot = snapshot
+                details: dict[str, Any] = {"program": snapshot["program"]}
+            elif tool_id == "program_validate":
+                next_snapshot = state.draft_session.validate(
+                    node_environment.catalog
+                )
+                details = {"valid": True}
+            else:
+                raise HTTPException(
+                    status_code=400,
+                    detail={
+                        "code": "assistant_callback_effect_rejected",
+                        "message": "callback is not one supported Draft read",
+                    },
+                )
+        except _CallbackValidationResult as result_error:
+            return result_error.response
         except DraftSessionError as error:
             if error.code in {
                 "composer_draft_revision_stale",
@@ -413,29 +581,12 @@ def create_assistant_draft_router(state: ComposerState) -> APIRouter:
                 message=str(error),
                 detail=error.detail,
             )
-
-        mutated = mutation is not None
-        return JSONResponse(
-            status_code=200,
-            content={
-                "success": True,
-                "mutated": mutated,
-                "draftMutated": mutated,
-                "requestId": body.request_id,
-                "requestOwnerEpoch": body.request_owner_epoch,
-                "sourceLabel": body.source_label,
-                "correlationId": body.correlation_id,
-                "result": {
-                    "kind": (
-                        "composer_draft_mutation" if mutated else "composer_draft_read"
-                    ),
-                    "mutation": mutation,
-                    "details": details,
-                    "draftId": next_snapshot["draft_id"],
-                    "draftRevision": next_snapshot["draft_revision"],
-                    "programRevision": next_snapshot["program_revision"],
-                },
-            },
+        return callback_response(
+            body,
+            next_snapshot=next_snapshot,
+            mutation=None,
+            details=details,
+            next_admission_generation=body.expected_admission_generation,
         )
 
     return router

@@ -877,6 +877,31 @@ TEST(HeadlessApiCore,
       "authoring.epoch.1", "request.1");
   EXPECT_EQ(Text(applied, "program_revision"),
             selection.program_revision.value());
+
+  const auto manager_source = directory.publications() / "manager-source.json";
+  const auto withheld_manager =
+      directory.publications() / "manager-source.withheld";
+  std::filesystem::rename(manager_source, withheld_manager);
+  const auto replay = core.ReplayProgramApply(
+      selection.scenario_id, selection.scenario_catalog_revision.value(),
+      selection.program_id.value(), selection.program_revision.value(),
+      std::nullopt, "authoring.epoch.1", "request.1");
+  EXPECT_EQ(Member(replay, "preparation"), prepared);
+  EXPECT_EQ(Member(replay, "applied"), applied);
+  EXPECT_EQ(core.CommitProgramApply(content_identity::canonical_json(prepared),
+                                    std::nullopt, "authoring.epoch.1",
+                                    "request.1"),
+            applied);
+  try {
+    static_cast<void>(core.CommitProgramApply(
+        content_identity::canonical_json(prepared),
+        Text(Member(applied, "source"), "record_digest"),
+        "authoring.epoch.1", "request.2"));
+    FAIL() << "a new Program Apply committed without a fresh Manager";
+  } catch (const OperatorAlarmError &error) {
+    EXPECT_EQ(error.code(), "program_apply_deployment_not_active");
+  }
+  std::filesystem::rename(withheld_manager, manager_source);
   EXPECT_EQ(core.AppliedProgramSelection(), applied);
 
   AtomicSourceSnapshotChannel scene(directory.publications(),

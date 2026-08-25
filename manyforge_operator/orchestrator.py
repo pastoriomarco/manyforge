@@ -24,7 +24,7 @@ import subprocess
 import sys
 import time
 from types import SimpleNamespace
-from typing import Any, Iterator, Mapping, Sequence
+from typing import Any, BinaryIO, Iterator, Mapping, Sequence
 from urllib.error import URLError
 from urllib.request import Request, urlopen
 
@@ -59,10 +59,15 @@ from .package_aggregate import (
     PackageAggregateUnavailable,
     package_aggregate_sha256,
 )
-from .cell_layout import CellInstanceLayout, CellLayoutError
+from .cell_layout import (
+    CellInstanceLayout,
+    CellLayoutError,
+    portable_path_identity,
+)
 
 
 STATUS_ENVELOPE_SCHEMA = "manyforge.native_operator_instance.v1"
+STATUS_RECORD_MAX_BYTES = 4 * 1024 * 1024
 DEFAULT_STATE_ROOT = Path(".manyforge-var/operator")
 DEFAULT_TIMEOUT_SECONDS = 60.0
 DEFAULT_POLL_SECONDS = 0.25
@@ -182,12 +187,7 @@ class NativeLauncherConfig:
             character.isspace() for character in self.advertised_host
         ):
             raise ValueError("advertised_host must be one bounded host reference")
-        if (
-            not self.instance_id
-            or self.instance_id in {".", ".."}
-            or "/" in self.instance_id
-            or "\\" in self.instance_id
-        ):
+        if not portable_path_identity(self.instance_id):
             raise ValueError("instance_id must be one path-safe non-empty identifier")
         for name, root in (
             ("source_root", str(self.source_root)),
@@ -221,12 +221,7 @@ class NativeLauncherConfig:
             or resolved_program_workspace in resolved_package_root.parents
         ):
             raise ValueError("install_root and program_workspace must be disjoint")
-        if (
-            not self.cell_id
-            or "/" in self.cell_id
-            or "\\" in self.cell_id
-            or any(character.isspace() for character in self.cell_id)
-        ):
+        if not portable_path_identity(self.cell_id):
             raise ValueError("cell_id must be one path-safe non-empty identifier")
         for name in (
             "package_aggregate_sha256",
@@ -279,8 +274,12 @@ class NativeLauncherConfig:
         return self.instance_root / "run" / "manager"
 
     @property
-    def runtime_state_root(self) -> Path:
+    def execution_state_root(self) -> Path:
         return self.instance_root / "state" / "execution-host"
+
+    @property
+    def execution_run_root(self) -> Path:
+        return self.instance_root / "run" / "execution-host"
 
     @property
     def program_runner_state_root(self) -> Path:
@@ -360,8 +359,10 @@ def native_commands(config: NativeLauncherConfig) -> tuple[ProcessSpec, ...]:
                 config.manager_state_root,
                 "--manager-run-root",
                 config.manager_run_root,
-                "--runtime-state-root",
-                config.runtime_state_root,
+                "--execution-state-root",
+                config.execution_state_root,
+                "--execution-run-root",
+                config.execution_run_root,
                 "--logical-scene-database",
                 config.logical_scene_database,
                 "--program-cycle-journal",
@@ -406,12 +407,8 @@ def native_commands(config: NativeLauncherConfig) -> tuple[ProcessSpec, ...]:
             str(config.historian_database_path),
             "--manager-run-root",
             str(config.manager_run_root),
-            "--execution-state-root",
-            # The native profile uses Manager's managed execution host.  Its
-            # command and CCLC surfaces are intentionally published under the
-            # Manager-provided staging/runtime root, not the standalone-host
-            # execution root.
-            str(config.runtime_state_root),
+            "--execution-run-root",
+            str(config.execution_run_root),
             "--cell-id",
             config.cell_id,
             "--owner-id",
@@ -440,8 +437,8 @@ def native_commands(config: NativeLauncherConfig) -> tuple[ProcessSpec, ...]:
             f"program-runner.{config.instance_id}",
             "--headless-timeout-s",
             "30",
-            "--execution-state-root",
-            str(config.runtime_state_root),
+            "--execution-run-root",
+            str(config.execution_run_root),
             "--cycle-journal-path",
             str(config.program_cycle_journal),
             "--manager-liveness-socket",
@@ -662,32 +659,268 @@ def _configuration(config: NativeLauncherConfig) -> LaunchConfiguration:
 class _StateStore:
     def __init__(
         self,
-        config: NativeLauncherConfig,
         *,
-        root: Path | None = None,
-        lock_root: Path | None = None,
+        root: Path,
+        lock_root: Path,
     ) -> None:
-        self.root = root or config.instance_root
-        self.root.mkdir(parents=True, exist_ok=True)
+        self.root = Path(root)
+        self.lock_root = Path(lock_root)
+        identities: dict[str, tuple[int, int]] = {}
+        for label, selected in (
+            ("operator state root", self.root),
+            ("operator run root", self.lock_root),
+        ):
+            identities[label] = self._directory_identity(selected, label=label)
+        self._root_identity = identities["operator state root"]
+        self._lock_root_identity = identities["operator run root"]
         self.record_path = self.root / "launch_instance.json"
-        selected_lock_root = lock_root or self.root
-        selected_lock_root.mkdir(parents=True, exist_ok=True)
-        self.lock_path = selected_lock_root / "instance.lock"
+        self.lock_path = self.lock_root / "instance.lock"
+
+    @staticmethod
+    def _directory_identity(path: Path, *, label: str) -> tuple[int, int]:
+        try:
+            before = path.lstat()
+            canonical = path.resolve(strict=True)
+            descriptor = os.open(
+                path,
+                os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW,
+            )
+        except (OSError, RuntimeError) as error:
+            raise LauncherError(
+                "cell_layout_invalid",
+                f"{label} is unavailable: {error}",
+                exit_code=71,
+            ) from error
+        try:
+            opened = os.fstat(descriptor)
+            after = path.lstat()
+            identity = (before.st_dev, before.st_ino)
+            required = stat.S_IRUSR | stat.S_IWUSR | stat.S_IXUSR
+            if (
+                canonical != path
+                or any(
+                    not stat.S_ISDIR(metadata.st_mode)
+                    or metadata.st_uid != os.geteuid()
+                    or metadata.st_mode & (stat.S_IWGRP | stat.S_IWOTH)
+                    or metadata.st_mode & required != required
+                    or (metadata.st_dev, metadata.st_ino) != identity
+                    for metadata in (before, opened, after)
+                )
+            ):
+                raise LauncherError(
+                    "cell_layout_invalid",
+                    f"{label} is not one safe retained layout capability",
+                    exit_code=71,
+                )
+            return identity
+        except OSError as error:
+            raise LauncherError(
+                "cell_layout_invalid",
+                f"{label} changed while opening: {error}",
+                exit_code=71,
+            ) from error
+        finally:
+            os.close(descriptor)
+
+    @staticmethod
+    @contextmanager
+    def _open_directory(
+        path: Path,
+        *,
+        expected_identity: tuple[int, int],
+        label: str,
+    ) -> Iterator[int]:
+        observed = _StateStore._directory_identity(path, label=label)
+        if observed != expected_identity:
+            raise LauncherError(
+                "cell_layout_invalid",
+                f"{label} was replaced",
+                exit_code=71,
+            )
+        try:
+            descriptor = os.open(
+                path,
+                os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW,
+            )
+        except OSError as error:
+            raise LauncherError(
+                "cell_layout_invalid",
+                f"{label} cannot be opened: {error}",
+                exit_code=71,
+            ) from error
+        try:
+            opened = os.fstat(descriptor)
+            if (opened.st_dev, opened.st_ino) != expected_identity:
+                raise LauncherError(
+                    "cell_layout_invalid",
+                    f"{label} changed while opening",
+                    exit_code=71,
+                )
+            yield descriptor
+            if _StateStore._directory_identity(path, label=label) != expected_identity:
+                raise LauncherError(
+                    "cell_layout_invalid",
+                    f"{label} changed during use",
+                    exit_code=71,
+                )
+        finally:
+            os.close(descriptor)
+
+    @staticmethod
+    def _safe_file(
+        metadata: os.stat_result,
+        *,
+        maximum_bytes: int | None = None,
+    ) -> bool:
+        return (
+            stat.S_ISREG(metadata.st_mode)
+            and metadata.st_uid == os.geteuid()
+            and metadata.st_nlink == 1
+            and not metadata.st_mode & (stat.S_IWGRP | stat.S_IWOTH)
+            and metadata.st_mode & (stat.S_IRUSR | stat.S_IWUSR)
+            == (stat.S_IRUSR | stat.S_IWUSR)
+            and (maximum_bytes is None or metadata.st_size <= maximum_bytes)
+        )
 
     @contextmanager
     def lock(self) -> Iterator[None]:
-        with self.lock_path.open("a+b") as stream:
-            fcntl.flock(stream.fileno(), fcntl.LOCK_EX)
+        with self._open_directory(
+            self.lock_root,
+            expected_identity=self._lock_root_identity,
+            label="operator run root",
+        ) as root_descriptor:
             try:
-                yield
+                descriptor = os.open(
+                    "instance.lock",
+                    os.O_RDWR
+                    | os.O_CREAT
+                    | os.O_CLOEXEC
+                    | os.O_NOFOLLOW,
+                    0o600,
+                    dir_fd=root_descriptor,
+                )
+            except OSError as error:
+                raise LauncherError(
+                    "cell_layout_invalid",
+                    f"operator lock cannot be opened safely: {error}",
+                    exit_code=71,
+            ) from error
+            try:
+                opened = os.fstat(descriptor)
+                if not self._safe_file(opened):
+                    raise LauncherError(
+                        "cell_layout_invalid",
+                        "operator lock is not one safe owner-held file",
+                        exit_code=71,
+                    )
+                fcntl.flock(descriptor, fcntl.LOCK_EX)
+                current = os.stat(
+                    "instance.lock",
+                    dir_fd=root_descriptor,
+                    follow_symlinks=False,
+                )
+                if (current.st_dev, current.st_ino) != (
+                    opened.st_dev,
+                    opened.st_ino,
+                ) or not self._safe_file(current):
+                    raise LauncherError(
+                        "cell_layout_invalid",
+                        "operator lock changed while acquiring it",
+                        exit_code=71,
+                    )
+                try:
+                    yield
+                finally:
+                    current = os.stat(
+                        "instance.lock",
+                        dir_fd=root_descriptor,
+                        follow_symlinks=False,
+                    )
+                    if (current.st_dev, current.st_ino) != (
+                        opened.st_dev,
+                        opened.st_ino,
+                    ) or not self._safe_file(current):
+                        raise LauncherError(
+                            "cell_layout_invalid",
+                            "operator lock changed while held",
+                            exit_code=71,
+                        )
+                    fcntl.flock(descriptor, fcntl.LOCK_UN)
             finally:
-                fcntl.flock(stream.fileno(), fcntl.LOCK_UN)
+                os.close(descriptor)
 
     def read(self) -> tuple[LaunchInstanceStatus, dict[str, Any]] | None:
-        if not self.record_path.exists():
-            return None
         try:
-            envelope = json.loads(self.record_path.read_text(encoding="utf-8"))
+            with self._open_directory(
+                self.root,
+                expected_identity=self._root_identity,
+                label="operator state root",
+            ) as root_descriptor:
+                try:
+                    before = os.stat(
+                        "launch_instance.json",
+                        dir_fd=root_descriptor,
+                        follow_symlinks=False,
+                    )
+                except FileNotFoundError:
+                    return None
+                if not self._safe_file(
+                    before,
+                    maximum_bytes=STATUS_RECORD_MAX_BYTES,
+                ):
+                    raise ValueError(
+                        "status record type, owner, mode, or size is unsafe"
+                    )
+                descriptor = os.open(
+                    "launch_instance.json",
+                    os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW,
+                    dir_fd=root_descriptor,
+                )
+                try:
+                    opened = os.fstat(descriptor)
+                    if (
+                        (opened.st_dev, opened.st_ino)
+                        != (before.st_dev, before.st_ino)
+                        or not self._safe_file(
+                            opened,
+                            maximum_bytes=STATUS_RECORD_MAX_BYTES,
+                        )
+                    ):
+                        raise ValueError("status record changed while opening")
+                    chunks: list[bytes] = []
+                    total = 0
+                    while True:
+                        chunk = os.read(
+                            descriptor,
+                            min(64 * 1024, STATUS_RECORD_MAX_BYTES + 1 - total),
+                        )
+                        if not chunk:
+                            break
+                        chunks.append(chunk)
+                        total += len(chunk)
+                        if total > STATUS_RECORD_MAX_BYTES:
+                            raise ValueError("status record is oversized")
+                    after_file = os.fstat(descriptor)
+                    after_path = os.stat(
+                        "launch_instance.json",
+                        dir_fd=root_descriptor,
+                        follow_symlinks=False,
+                    )
+                    identity = (before.st_dev, before.st_ino)
+                    if (
+                        (after_file.st_dev, after_file.st_ino) != identity
+                        or (after_path.st_dev, after_path.st_ino) != identity
+                        or after_file.st_size != total
+                        or after_path.st_size != total
+                        or not self._safe_file(
+                            after_path,
+                            maximum_bytes=STATUS_RECORD_MAX_BYTES,
+                        )
+                    ):
+                        raise ValueError("status record changed while reading")
+                finally:
+                    os.close(descriptor)
+            envelope = json.loads(b"".join(chunks).decode("utf-8"))
             if envelope.get("schema_version") != STATUS_ENVELOPE_SCHEMA:
                 raise ValueError("unexpected status envelope schema")
             status = LaunchInstanceStatus.model_validate_json(
@@ -697,6 +930,8 @@ class _StateStore:
             if not isinstance(mechanical, dict):
                 raise ValueError("mechanical status must be an object")
             return status, mechanical
+        except LauncherError:
+            raise
         except Exception as error:
             raise LauncherError("status_record_invalid", str(error), exit_code=70) from error
 
@@ -706,18 +941,213 @@ class _StateStore:
             "status": status.model_dump(mode="json"),
             "mechanical": dict(mechanical),
         }
-        temporary = self.root / f".launch_instance.{os.getpid()}.tmp"
-        with temporary.open("w", encoding="utf-8") as stream:
-            json.dump(envelope, stream, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
-            stream.write("\n")
-            stream.flush()
-            os.fsync(stream.fileno())
-        os.replace(temporary, self.record_path)
-        directory_fd = os.open(self.root, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
-        try:
-            os.fsync(directory_fd)
-        finally:
-            os.close(directory_fd)
+        encoded = (
+            json.dumps(
+                envelope,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+            + "\n"
+        ).encode("utf-8")
+        if len(encoded) > STATUS_RECORD_MAX_BYTES:
+            raise LauncherError(
+                "status_record_invalid",
+                "status record exceeds its durable bound",
+                exit_code=70,
+            )
+        temporary_name = f".launch_instance.{os.getpid()}.tmp"
+        with self._open_directory(
+            self.root,
+            expected_identity=self._root_identity,
+            label="operator state root",
+        ) as root_descriptor:
+            try:
+                existing = os.stat(
+                    "launch_instance.json",
+                    dir_fd=root_descriptor,
+                    follow_symlinks=False,
+                )
+            except FileNotFoundError:
+                existing = None
+            if existing is not None and not self._safe_file(
+                existing,
+                maximum_bytes=STATUS_RECORD_MAX_BYTES,
+            ):
+                raise LauncherError(
+                    "status_record_invalid",
+                    "existing status record is unsafe",
+                    exit_code=70,
+                )
+            try:
+                descriptor = os.open(
+                    temporary_name,
+                    os.O_WRONLY
+                    | os.O_CREAT
+                    | os.O_EXCL
+                    | os.O_CLOEXEC
+                    | os.O_NOFOLLOW,
+                    0o600,
+                    dir_fd=root_descriptor,
+                )
+            except OSError as error:
+                raise LauncherError(
+                    "status_record_invalid",
+                    f"status record cannot be reserved: {error}",
+                    exit_code=70,
+                ) from error
+            replaced = False
+            try:
+                os.fchmod(descriptor, 0o600)
+                remaining = memoryview(encoded)
+                while remaining:
+                    written = os.write(descriptor, remaining)
+                    if written <= 0:
+                        raise LauncherError(
+                            "status_record_invalid",
+                            "status record write stalled",
+                            exit_code=70,
+                        )
+                    remaining = remaining[written:]
+                os.fsync(descriptor)
+                written_metadata = os.fstat(descriptor)
+                if (
+                    not self._safe_file(
+                        written_metadata,
+                        maximum_bytes=STATUS_RECORD_MAX_BYTES,
+                    )
+                    or written_metadata.st_size != len(encoded)
+                ):
+                    raise LauncherError(
+                        "status_record_invalid",
+                        "new status record is unsafe",
+                        exit_code=70,
+                    )
+                os.replace(
+                    temporary_name,
+                    "launch_instance.json",
+                    src_dir_fd=root_descriptor,
+                    dst_dir_fd=root_descriptor,
+                )
+                replaced = True
+                current = os.stat(
+                    "launch_instance.json",
+                    dir_fd=root_descriptor,
+                    follow_symlinks=False,
+                )
+                if (current.st_dev, current.st_ino) != (
+                    written_metadata.st_dev,
+                    written_metadata.st_ino,
+                ) or not self._safe_file(
+                    current,
+                    maximum_bytes=STATUS_RECORD_MAX_BYTES,
+                ):
+                    raise LauncherError(
+                        "status_record_invalid",
+                        "status record changed during publication",
+                        exit_code=70,
+                    )
+                os.fsync(root_descriptor)
+            finally:
+                os.close(descriptor)
+                if not replaced:
+                    try:
+                        os.unlink(temporary_name, dir_fd=root_descriptor)
+                    except FileNotFoundError:
+                        pass
+
+    def open_log(self, filename: str) -> tuple[BinaryIO, Path]:
+        if not portable_path_identity(filename):
+            raise LauncherError(
+                "log_path_invalid",
+                "log filename is not one path-safe identity",
+                exit_code=70,
+            )
+        with self._open_directory(
+            self.lock_root,
+            expected_identity=self._lock_root_identity,
+            label="operator run root",
+        ) as root_descriptor:
+            try:
+                os.mkdir("logs", mode=0o700, dir_fd=root_descriptor)
+            except FileExistsError:
+                pass
+            try:
+                before = os.stat(
+                    "logs",
+                    dir_fd=root_descriptor,
+                    follow_symlinks=False,
+                )
+                logs_descriptor = os.open(
+                    "logs",
+                    os.O_RDONLY
+                    | os.O_DIRECTORY
+                    | os.O_CLOEXEC
+                    | os.O_NOFOLLOW,
+                    dir_fd=root_descriptor,
+                )
+            except OSError as error:
+                raise LauncherError(
+                    "log_path_invalid",
+                    f"operator log root cannot be opened safely: {error}",
+                    exit_code=70,
+                ) from error
+            try:
+                opened = os.fstat(logs_descriptor)
+                required = stat.S_IRUSR | stat.S_IWUSR | stat.S_IXUSR
+                if (
+                    not stat.S_ISDIR(before.st_mode)
+                    or not stat.S_ISDIR(opened.st_mode)
+                    or before.st_uid != os.geteuid()
+                    or opened.st_uid != os.geteuid()
+                    or before.st_mode & (stat.S_IWGRP | stat.S_IWOTH)
+                    or opened.st_mode & (stat.S_IWGRP | stat.S_IWOTH)
+                    or before.st_mode & required != required
+                    or opened.st_mode & required != required
+                    or (before.st_dev, before.st_ino)
+                    != (opened.st_dev, opened.st_ino)
+                ):
+                    raise LauncherError(
+                        "log_path_invalid",
+                        "operator log root is unsafe",
+                        exit_code=70,
+                    )
+                descriptor = os.open(
+                    filename,
+                    os.O_WRONLY
+                    | os.O_APPEND
+                    | os.O_CREAT
+                    | os.O_CLOEXEC
+                    | os.O_NOFOLLOW,
+                    0o600,
+                    dir_fd=logs_descriptor,
+                )
+                metadata = os.fstat(descriptor)
+                current = os.stat(
+                    filename,
+                    dir_fd=logs_descriptor,
+                    follow_symlinks=False,
+                )
+                if (
+                    not self._safe_file(metadata)
+                    or not self._safe_file(current)
+                    or (metadata.st_dev, metadata.st_ino)
+                    != (current.st_dev, current.st_ino)
+                ):
+                    os.close(descriptor)
+                    raise LauncherError(
+                        "log_path_invalid",
+                        "operator log is not one safe owner-held file",
+                        exit_code=70,
+                    )
+                try:
+                    stream = os.fdopen(descriptor, "ab")
+                except Exception:
+                    os.close(descriptor)
+                    raise
+                return stream, self.lock_root / "logs" / filename
+            finally:
+                os.close(logs_descriptor)
 
 
 def _status(
@@ -804,7 +1234,6 @@ class NativeLauncher:
                 "cell_layout_invalid", str(error), exit_code=71
             ) from error
         self.store = _StateStore(
-            config,
             root=config.instance_root / "state" / "operator",
             lock_root=config.instance_root / "run" / "operator",
         )
@@ -816,12 +1245,7 @@ class NativeLauncher:
     def from_state_root(cls, state_root: Path, instance_id: str) -> "NativeLauncher":
         """Open an existing record for status/stop without start inputs."""
 
-        if (
-            not instance_id
-            or instance_id in {".", ".."}
-            or "/" in instance_id
-            or "\\" in instance_id
-        ):
+        if not portable_path_identity(instance_id):
             raise LauncherError("invalid_instance_id", "instance id is invalid", exit_code=64)
         root = Path(state_root).absolute() / instance_id
         if (
@@ -853,10 +1277,10 @@ class NativeLauncher:
             readiness_timeout_seconds=DEFAULT_TIMEOUT_SECONDS,
             poll_interval_seconds=DEFAULT_POLL_SECONDS,
         )
-        launcher.store = object.__new__(_StateStore)
-        launcher.store.root = root / "state" / "operator"
-        launcher.store.record_path = launcher.store.root / "launch_instance.json"
-        launcher.store.lock_path = root / "run" / "operator" / "instance.lock"
+        launcher.store = _StateStore(
+            root=root / "state" / "operator",
+            lock_root=root / "run" / "operator",
+        )
         launcher._managed = {}
         launcher.last_start_idempotent = False
         launcher.last_stop_already_stopped = False
@@ -892,7 +1316,8 @@ class NativeLauncher:
                 "historian_database_path": str(self.config.historian_database_path),
                 "manager_state_root": str(self.config.manager_state_root),
                 "manager_run_root": str(self.config.manager_run_root),
-                "runtime_state_root": str(self.config.runtime_state_root),
+                "execution_state_root": str(self.config.execution_state_root),
+                "execution_run_root": str(self.config.execution_run_root),
                 "simulation_control_config": (
                     str(self.config.simulation_control_config)
                     if self.config.simulation_control_config is not None
@@ -920,12 +1345,18 @@ class NativeLauncher:
     def _prepare_program_workspace(self) -> None:
         """Create or validate the one instance-owned Composer write root."""
 
-        no_follow = getattr(os, "O_NOFOLLOW", 0)
-        directory = getattr(os, "O_DIRECTORY", 0)
+        root = self.config.authoring_state_root
+        required = stat.S_IRUSR | stat.S_IWUSR | stat.S_IXUSR
         try:
+            before_root = root.lstat()
+            if root.resolve(strict=True) != root:
+                raise OSError("authoring state root is not canonical")
             instance_fd = os.open(
-                self.config.authoring_state_root,
-                os.O_RDONLY | directory | no_follow,
+                root,
+                os.O_RDONLY
+                | os.O_DIRECTORY
+                | os.O_CLOEXEC
+                | os.O_NOFOLLOW,
             )
         except OSError as error:
             raise LauncherError(
@@ -934,39 +1365,85 @@ class NativeLauncher:
                 exit_code=70,
             ) from error
         try:
+            opened_root = os.fstat(instance_fd)
+            root_identity = (before_root.st_dev, before_root.st_ino)
+            if any(
+                not stat.S_ISDIR(metadata.st_mode)
+                or metadata.st_uid != os.geteuid()
+                or metadata.st_mode & (stat.S_IWGRP | stat.S_IWOTH)
+                or metadata.st_mode & required != required
+                or (metadata.st_dev, metadata.st_ino) != root_identity
+                for metadata in (before_root, opened_root)
+            ):
+                raise LauncherError(
+                    "program_workspace_invalid",
+                    "authoring state root is not one safe retained capability",
+                    exit_code=70,
+                )
             try:
-                os.mkdir("program-workspace", dir_fd=instance_fd)
+                os.mkdir("program-workspace", mode=0o700, dir_fd=instance_fd)
             except FileExistsError:
                 pass
-            workspace_stat = os.stat(
+            before_workspace = os.stat(
                 "program-workspace",
                 dir_fd=instance_fd,
                 follow_symlinks=False,
             )
-            if not stat.S_ISDIR(workspace_stat.st_mode):
-                raise LauncherError(
-                    "program_workspace_invalid",
-                    "Program workspace exists but is not a physical directory",
-                    exit_code=70,
-                )
-            if not os.access(
-                "program-workspace",
-                os.W_OK | os.X_OK,
-                dir_fd=instance_fd,
-                effective_ids=True,
-                follow_symlinks=False,
+            if (
+                not stat.S_ISDIR(before_workspace.st_mode)
+                or before_workspace.st_uid != os.geteuid()
+                or before_workspace.st_mode & (stat.S_IWGRP | stat.S_IWOTH)
+                or before_workspace.st_mode & required != required
             ):
                 raise LauncherError(
                     "program_workspace_invalid",
-                    "Program workspace is not writable by the operator",
+                    "Program workspace is not one safe owner-held directory",
                     exit_code=70,
                 )
             workspace_fd = os.open(
                 "program-workspace",
-                os.O_RDONLY | directory | no_follow,
+                os.O_RDONLY
+                | os.O_DIRECTORY
+                | os.O_CLOEXEC
+                | os.O_NOFOLLOW,
                 dir_fd=instance_fd,
             )
-            os.close(workspace_fd)
+            try:
+                opened_workspace = os.fstat(workspace_fd)
+                after_workspace = os.stat(
+                    "program-workspace",
+                    dir_fd=instance_fd,
+                    follow_symlinks=False,
+                )
+                workspace_identity = (
+                    before_workspace.st_dev,
+                    before_workspace.st_ino,
+                )
+                if any(
+                    not stat.S_ISDIR(metadata.st_mode)
+                    or metadata.st_uid != os.geteuid()
+                    or metadata.st_mode & (stat.S_IWGRP | stat.S_IWOTH)
+                    or metadata.st_mode & required != required
+                    or (metadata.st_dev, metadata.st_ino) != workspace_identity
+                    for metadata in (opened_workspace, after_workspace)
+                ):
+                    raise LauncherError(
+                        "program_workspace_invalid",
+                        "Program workspace changed while opening",
+                        exit_code=70,
+                    )
+            finally:
+                os.close(workspace_fd)
+            after_root = root.lstat()
+            if (
+                (after_root.st_dev, after_root.st_ino) != root_identity
+                or root.resolve(strict=True) != root
+            ):
+                raise LauncherError(
+                    "program_workspace_invalid",
+                    "authoring state root changed while preparing the workspace",
+                    exit_code=70,
+                )
         except LauncherError:
             raise
         except OSError as error:
@@ -1121,10 +1598,7 @@ class NativeLauncher:
         ]
 
     def _spawn(self, spec: ProcessSpec) -> _ManagedProcess:
-        log_root = self.config.instance_root / "run" / "operator" / "logs"
-        log_root.mkdir(parents=True, exist_ok=True)
-        log_path = log_root / f"{spec.component_id}.log"
-        log = log_path.open("ab")
+        log, log_path = self.store.open_log(f"{spec.component_id}.log")
         try:
             environment = os.environ.copy()
             environment.update(spec.environment)

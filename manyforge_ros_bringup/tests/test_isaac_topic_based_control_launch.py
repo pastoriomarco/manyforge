@@ -79,7 +79,7 @@ def test_launch_declares_exact_world_and_has_no_retired_semantic_owner() -> None
         "additional_required_topics",
         "command_gate_owner_node",
         "command_gate_owner_namespace",
-        "manager_state_root",
+        "manager_run_root",
         "pose_observer_site_config",
         "pointcloud_topic",
         "pointcloud_cell_id",
@@ -220,7 +220,7 @@ def test_launch_releases_exact_pose_observer_only_after_scene_barrier(
     context.launch_configurations["pose_observer_site_config"] = (
         "/opt/manyforge/isaac-ur10e-light.pose-observer.json"
     )
-    context.launch_configurations["manager_state_root"] = "/run/manyforge"
+    context.launch_configurations["manager_run_root"] = "/run/manyforge"
     actions = module._launch_setup(context)
     registration = actions[1]
     event_handler = getattr(
@@ -239,7 +239,7 @@ def test_launch_releases_exact_pose_observer_only_after_scene_barrier(
     )
     assert getattr(observer, "_ExecuteLocal__on_exit") is not None
 
-    for missing_name in ("pose_observer_site_config", "manager_state_root"):
+    for missing_name in ("pose_observer_site_config", "manager_run_root"):
         invalid = _launch_context(module, profile="ur10e")
         invalid.launch_configurations[missing_name] = "/configured/value"
         with pytest.raises(ValueError, match="configured together"):

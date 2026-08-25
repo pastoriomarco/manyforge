@@ -519,12 +519,11 @@ class IsaacLauncher:
 
     @staticmethod
     def _make_store(config: IsaacLauncherConfig) -> _StateStore:
-        store = _StateStore.__new__(_StateStore)
-        store.root = config.instance_root
-        store.root.mkdir(parents=True, exist_ok=True)
-        store.record_path = config.instance_root / "launch_instance.json"
-        store.lock_path = config.instance_root / "instance.lock"
-        return store
+        config.instance_root.mkdir(parents=True, exist_ok=True)
+        return _StateStore(
+            root=config.instance_root,
+            lock_root=config.instance_root,
+        )
 
     @classmethod
     def from_state_root(cls, state_root: Path, instance_id: str) -> "IsaacLauncher":
@@ -532,10 +531,7 @@ class IsaacLauncher:
             raise LauncherError("invalid_instance_id", "instance id is invalid", exit_code=64)
         root = Path(state_root).absolute() / instance_id
         root.mkdir(parents=True, exist_ok=True)
-        store = _StateStore.__new__(_StateStore)
-        store.root = root
-        store.record_path = root / "launch_instance.json"
-        store.lock_path = root / "instance.lock"
+        store = _StateStore(root=root, lock_root=root)
         launcher = cls.__new__(cls)
         launcher.store = store
         launcher.config = None

@@ -24,10 +24,6 @@ using content_identity::CanonicalValue;
 
 constexpr std::string_view kMarkerApiVersion =
     "manyforge.manager_state_marker.v1";
-constexpr std::string_view kManagerDaemonLockFilename =
-    ".manager-daemon.lock";
-constexpr std::string_view kManagerCommandSocketFilename =
-    "manager-command.sock";
 constexpr std::string_view kMarkerTemporaryFilename =
     ".manager-state-marker.json.tmp";
 
@@ -125,9 +121,7 @@ constexpr std::string_view kMarkerTemporaryFilename =
 
 [[nodiscard]] bool IsRecognizedManagerEntry(
     const std::string_view filename) {
-  if (filename == kManagerStateMarkerFilename ||
-      filename == kManagerDaemonLockFilename ||
-      filename == kManagerCommandSocketFilename) {
+  if (filename == kManagerStateMarkerFilename) {
     return true;
   }
   const std::string names[]{
@@ -151,23 +145,7 @@ constexpr std::string_view kMarkerTemporaryFilename =
   if (error) {
     ThrowMarkerIntegrity("cannot enumerate Manager state root");
   }
-  for (const auto& entry : entries) {
-    const auto filename = entry.path().filename().string();
-    if (filename == kManagerDaemonLockFilename) {
-      // ManagerDaemon owns this outer lock and may create it before this
-      // store-set composition root. It is not durable Manager state.
-      std::error_code status_error;
-      const auto status =
-          std::filesystem::symlink_status(entry.path(), status_error);
-      if (status_error || std::filesystem::is_symlink(status) ||
-          !std::filesystem::is_regular_file(status)) {
-        return true;
-      }
-      continue;
-    }
-    return true;
-  }
-  return false;
+  return entries != std::filesystem::directory_iterator{};
 }
 
 void VerifyNoUnknownManifestNativeEntries(

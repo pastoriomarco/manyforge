@@ -157,7 +157,7 @@ exact_graph_binding(const core::RuntimeParticipantBindingDTO &physical,
     }
 
     core::FilesystemResolvedStopBasePlanRepository repository(
-        config.resolved_stop_plan_root, config.maximum_resolved_stop_plan_count,
+        config.run_root, config.maximum_resolved_stop_plan_count,
         config.maximum_resolved_stop_plan_bytes,
         config.maximum_single_resolved_stop_plan_bytes);
     for (const auto &domain : facts.value().domains) {
@@ -631,6 +631,12 @@ CreateRetainedNativeCCLCRuntime(
         kernel_current_configuration_source,
     RetainedExternallyManagedDomainSnapshotSource
         externally_managed_controller_snapshot_source) {
+  if (!config.composition.trusted_roots_valid()) {
+    return reject<std::unique_ptr<deployment::CCLCRuntimeComposition>>(
+        "native_cclc_storage_capabilities_invalid",
+        "native CCLC requires disjoint, pre-existing durable state and "
+        "disposable run roots");
+  }
   if (retained_bundle == nullptr) {
     return reject<std::unique_ptr<deployment::CCLCRuntimeComposition>>(
         "native_cclc_retained_bundle_missing",
@@ -673,6 +679,12 @@ CreateRetainedNativeCCLCRuntime(
     core::ICCLCKernelRouteConfigurationFencePort &kernel_route_fence_port,
     RetainedExternallyManagedDomainSnapshotSource
         externally_managed_controller_snapshot_source) {
+  if (!config.composition.trusted_roots_valid()) {
+    return reject<std::unique_ptr<deployment::CCLCRuntimeComposition>>(
+        "native_cclc_storage_capabilities_invalid",
+        "native CCLC requires disjoint, pre-existing durable state and "
+        "disposable run roots");
+  }
   if (retained_bundle == nullptr || runtime.clock == nullptr ||
       runtime.scheduler == nullptr || runtime.addressed_kernel == nullptr) {
     return reject<std::unique_ptr<deployment::CCLCRuntimeComposition>>(

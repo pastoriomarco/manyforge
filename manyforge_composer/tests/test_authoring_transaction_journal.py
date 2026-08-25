@@ -3,6 +3,9 @@
 from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor
+import gc
+import os
+from pathlib import Path
 import sqlite3
 
 import pytest
@@ -87,14 +90,28 @@ def test_capacity_is_bounded_before_new_intent(tmp_path) -> None:
             ("acquire_attempted", True),
             ("claim_json", {"claim": 1}),
             ("effect_intent_json", {"operation_kind": "save_draft"}),
-            ("outcome_json", {"kind": "mapping", "body": {}}),
+            (
+                "outcome_json",
+                {
+                    "kind": "mapping",
+                    "settlement_kind": "owner_commit",
+                    "body": {},
+                },
+            ),
             ("post_image_json", {"draft_id": "draft.1"}),
         ),
         (
             ("acquire_attempted", True),
             ("claim_json", {"claim": 1}),
             ("effect_intent_json", {"operation_kind": "save_draft"}),
-            ("outcome_json", {"kind": "mapping", "body": {}}),
+            (
+                "outcome_json",
+                {
+                    "kind": "mapping",
+                    "settlement_kind": "owner_commit",
+                    "body": {},
+                },
+            ),
             ("post_image_json", {"draft_id": "draft.1"}),
             ("release_intent_json", {"settlement_kind": "owner_commit"}),
         ),
@@ -121,13 +138,21 @@ def test_post_image_outcome_and_workspace_are_one_atomic_replay_unit(tmp_path) -
     journal.record_effect_outcome(
         transaction,
         post_image={"draft_id": "draft.2", "revision": 4},
-        outcome={"kind": "mapping", "body": {"saved": True}},
+        outcome={
+            "kind": "mapping",
+            "settlement_kind": "owner_commit",
+            "body": {"saved": True},
+        },
     )
     restored = ComposerAuthoringTransactionJournal(tmp_path)
     row = restored.lookup("browser.1", "request.1")
     assert row is not None
     assert row.post_image == {"draft_id": "draft.2", "revision": 4}
-    assert row.outcome == {"kind": "mapping", "body": {"saved": True}}
+    assert row.outcome == {
+        "kind": "mapping",
+        "settlement_kind": "owner_commit",
+        "body": {"saved": True},
+    }
     assert restored.retained_workspace() == row.post_image
 
 
@@ -143,7 +168,11 @@ def test_post_image_outcome_rolls_back_if_workspace_retention_fails(tmp_path) ->
         journal.record_effect_outcome(
             transaction,
             post_image={"draft_id": "draft.2", "revision": 4},
-            outcome={"kind": "mapping", "body": {"saved": True}},
+            outcome={
+                "kind": "mapping",
+                "settlement_kind": "owner_commit",
+                "body": {"saved": True},
+            },
         )
 
     restored = journal.lookup("browser.1", "request.1")
@@ -228,3 +257,102 @@ def test_concurrent_requests_serialize_shared_sqlite_connection(tmp_path) -> Non
     assert len(set(transaction_ids)) == 64
     assert len(journal.unresolved()) == 64
     assert all(transaction.acquire_attempted for transaction in journal.unresolved())
+
+
+def test_state_root_must_be_one_canonical_non_symlink_capability(tmp_path) -> None:
+    state_root = tmp_path / "state"
+    state_root.mkdir(mode=0o700)
+    alias = tmp_path / "state-alias"
+    alias.symlink_to(state_root, target_is_directory=True)
+
+    with pytest.raises(AuthoringJournalError) as symlinked:
+        ComposerAuthoringTransactionJournal(alias)
+    assert symlinked.value.code == "composer_authoring_state_root_invalid"
+
+    relative = Path(os.path.relpath(state_root, Path.cwd()))
+    with pytest.raises(AuthoringJournalError) as noncanonical:
+        ComposerAuthoringTransactionJournal(relative)
+    assert noncanonical.value.code == "composer_authoring_state_root_invalid"
+    assert list(state_root.iterdir()) == []
+
+
+@pytest.mark.parametrize("leaf_kind", ["symlink", "hardlink"])
+def test_unsafe_existing_database_leaf_is_rejected_without_mutation(
+    tmp_path, leaf_kind: str
+) -> None:
+    state_root = tmp_path / "state"
+    state_root.mkdir(mode=0o700)
+    external = tmp_path / "external.sqlite3"
+    external.write_bytes(b"external")
+    external.chmod(0o600)
+    database = state_root / "composer-authoring-transactions.sqlite3"
+    if leaf_kind == "symlink":
+        database.symlink_to(external)
+    else:
+        os.link(external, database)
+    before = external.read_bytes()
+
+    with pytest.raises(AuthoringJournalError) as unsafe:
+        ComposerAuthoringTransactionJournal(state_root)
+    assert unsafe.value.code == "composer_authoring_journal_invalid"
+    assert external.read_bytes() == before
+
+
+@pytest.mark.parametrize("suffix", ["-journal", "-wal", "-shm"])
+def test_absent_database_rejects_orphan_sidecar_without_mutation(
+    tmp_path: Path,
+    suffix: str,
+) -> None:
+    state_root = tmp_path / "state"
+    state_root.mkdir(mode=0o700)
+    sidecar = state_root / f"composer-authoring-transactions.sqlite3{suffix}"
+    sidecar.write_bytes(b"orphaned durable state\n")
+    sidecar.chmod(0o600)
+    before = (sidecar.read_bytes(), sidecar.stat())
+
+    with pytest.raises(AuthoringJournalError) as orphaned:
+        ComposerAuthoringTransactionJournal(state_root)
+
+    assert orphaned.value.code == "composer_authoring_journal_invalid"
+    assert not (state_root / "composer-authoring-transactions.sqlite3").exists()
+    assert sidecar.read_bytes() == before[0]
+    after = sidecar.stat()
+    assert (after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns) == (
+        before[1].st_dev,
+        before[1].st_ino,
+        before[1].st_size,
+        before[1].st_mtime_ns,
+    )
+
+
+def test_failed_construction_does_not_leak_the_state_root_descriptor(
+    tmp_path: Path,
+) -> None:
+    state_root = tmp_path / "state"
+    state_root.mkdir(mode=0o700)
+    external = tmp_path / "external.sqlite3"
+    external.write_bytes(b"unsafe external state\n")
+    database = state_root / "composer-authoring-transactions.sqlite3"
+    database.symlink_to(external)
+    before = len(os.listdir("/proc/self/fd"))
+
+    for _ in range(32):
+        with pytest.raises(AuthoringJournalError):
+            ComposerAuthoringTransactionJournal(state_root)
+    gc.collect()
+
+    assert len(os.listdir("/proc/self/fd")) <= before + 1
+
+
+def test_replaced_state_root_is_rejected_before_the_next_transaction(tmp_path) -> None:
+    state_root = tmp_path / "state"
+    state_root.mkdir(mode=0o700)
+    journal = ComposerAuthoringTransactionJournal(state_root)
+    retained = tmp_path / "retained-state"
+    state_root.rename(retained)
+    state_root.mkdir(mode=0o700)
+
+    with pytest.raises(AuthoringJournalError) as replaced:
+        journal.lookup("browser.1", "request.1")
+    assert replaced.value.code == "composer_authoring_journal_invalid"
+    assert list(state_root.iterdir()) == []

@@ -187,6 +187,12 @@ public:
       const manyforge::deployment::CanonicalEmptyRetainedBundleAdmission
           &admission,
       const manyforge::core::IActiveBundlePublicationReader &publication_reader,
+      manyforge::core::IKernelCellAdmissionPort &cell_admission);
+  CanonicalEmptySceneOwner(
+      std::filesystem::path database_path,
+      const manyforge::deployment::CanonicalEmptyRetainedBundleAdmission
+          &admission,
+      const manyforge::core::IActiveBundlePublicationReader &publication_reader,
       const manyforge::deployment::IVerifiedRetainedBundleSource
           &retained_bundle_source);
   CanonicalEmptySceneOwner(

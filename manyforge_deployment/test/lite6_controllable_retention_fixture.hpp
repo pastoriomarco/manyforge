@@ -2845,6 +2845,12 @@ make_lite6_native_motion_arm_gripper_aggregate_retention_fixture() {
                                                    true);
 }
 
+[[nodiscard]] inline Lite6ControllableRetentionFixture
+make_lite6_native_motion_arm_gripper_aggregate_assistant_retention_fixture() {
+  return make_lite6_controllable_retention_fixture(
+      false, true, 1U, true, true, {}, true);
+}
+
 class Lite6ControllableCompilerInputArtifactSource final
     : public detail::ICompilerInputArtifactSource {
 public:

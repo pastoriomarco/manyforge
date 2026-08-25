@@ -56,9 +56,8 @@ class HeadlessApiConfig:
     alarm_catalog_path: Path
     historian_database_path: Path
     manager_run_root: Path
-    execution_state_root: Path
+    execution_run_root: Path
     cell_id: str
-    cclc_state_root: Path | None = None
     resource_ids: tuple[str, ...] = ()
     owner_id: str = "headless-api"
     # Deterministic override for in-process qualification only. Production
@@ -81,6 +80,49 @@ class HeadlessApiConfig:
     program_runner_timeout_seconds: float = 30.0
 
     def __post_init__(self) -> None:
+        path_values = (
+            self.projection_root,
+            self.install_root,
+            self.artifact_root,
+            self.program_selection_state_root,
+            self.node_catalog_path,
+            self.alarm_catalog_path,
+            self.historian_database_path,
+            self.manager_run_root,
+            self.execution_run_root,
+        )
+        if any(not value.is_absolute() for value in path_values):
+            raise ValueError("Headless filesystem capabilities must be absolute")
+        try:
+            manager_run = self.manager_run_root.resolve(strict=False)
+            execution_run = self.execution_run_root.resolve(strict=False)
+        except (OSError, RuntimeError) as error:
+            raise ValueError("Headless run capabilities cannot be resolved") from error
+        if (
+            manager_run == execution_run
+            or manager_run in execution_run.parents
+            or execution_run in manager_run.parents
+        ):
+            raise ValueError(
+                "manager_run_root and execution_run_root must be disjoint trees"
+            )
+        durable_paths = path_values[:-2]
+        for durable_path in durable_paths:
+            try:
+                resolved = durable_path.resolve(strict=False)
+            except (OSError, RuntimeError) as error:
+                raise ValueError(
+                    "Headless durable capabilities cannot be resolved"
+                ) from error
+            if any(
+                resolved == run_root
+                or run_root in resolved.parents
+                or resolved in run_root.parents
+                for run_root in (manager_run, execution_run)
+            ):
+                raise ValueError(
+                    "durable Headless paths must be outside disposable run roots"
+                )
         for label, value in (("cell_id", self.cell_id), ("owner_id", self.owner_id)):
             if (
                 not value
@@ -179,6 +221,17 @@ class HeadlessCorePort(Protocol):
         scenario_catalog_revision: str,
         program: dict[str, Any],
     ) -> dict[str, Any]: ...
+
+    def replay_program_apply(
+        self,
+        scenario_id: str,
+        scenario_catalog_revision: str,
+        program_id: str,
+        program_revision: str,
+        expected_applied_record_digest: str | None,
+        request_owner_epoch: str,
+        request_id: str,
+    ) -> dict[str, Any] | None: ...
 
     def commit_program_apply(
         self,
@@ -579,6 +632,30 @@ class NativeHeadlessCore:
             ),
             method="prepare_program_apply",
         )
+
+    def replay_program_apply(
+        self,
+        scenario_id: str,
+        scenario_catalog_revision: str,
+        program_id: str,
+        program_revision: str,
+        expected_applied_record_digest: str | None,
+        request_owner_epoch: str,
+        request_id: str,
+    ) -> dict[str, Any] | None:
+        value = self._invoke(
+            "replay_program_apply",
+            scenario_id,
+            scenario_catalog_revision,
+            program_id,
+            program_revision,
+            expected_applied_record_digest,
+            request_owner_epoch,
+            request_id,
+        )
+        if value is None:
+            return None
+        return self._require_object(value, method="replay_program_apply")
 
     def commit_program_apply(
         self,

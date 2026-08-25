@@ -1296,8 +1296,12 @@ class ComposerDraftSession:
                     status_code=503,
                 )
             result = applier(validated_saved, applied_context)
-            if result.get("status") != "applied":
-                return result, self._workspace_snapshot_locked()
+            if not isinstance(result, dict) or result.get("status") != "applied":
+                _error(
+                    "program_apply_response_invalid",
+                    "Program Apply did not return one completed Applied result",
+                    status_code=502,
+                )
             if not draft_matches_saved:
                 self._program = validated_saved
                 self._revision += 1

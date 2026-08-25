@@ -55,16 +55,16 @@ class ProcessStack:
         self.root = root
         self.manager_root = root / "manager"
         self.manager_run_root = root / "manager-run"
-        self.execution_root = root / "execution"
-        self.runtime_root = root / "runtime"
+        self.execution_state_root = root / "execution-state"
+        self.execution_run_root = root / "execution-run"
         self.publication_root = root / "publications"
         self.artifact_root = root / "artifacts"
         self.program_selection_state_root = root / "program-selection-state"
         for path in (
             self.manager_root,
             self.manager_run_root,
-            self.execution_root,
-            self.runtime_root,
+            self.execution_state_root,
+            self.execution_run_root,
             self.publication_root,
             self.artifact_root,
             self.program_selection_state_root,
@@ -162,8 +162,10 @@ class ProcessStack:
             str(self.manager_root),
             "--manager-run-root",
             str(self.manager_run_root),
-            "--runtime-state-root",
-            str(self.runtime_root),
+            "--execution-state-root",
+            str(self.execution_state_root),
+            "--execution-run-root",
+            str(self.execution_run_root),
             "--logical-scene-database",
             str(self.scene_database),
             "--program-cycle-journal",
@@ -222,8 +224,8 @@ class ProcessStack:
             str(self.history_database),
             "--manager-run-root",
             str(self.manager_run_root),
-            "--execution-state-root",
-            str(self.runtime_root),
+            "--execution-run-root",
+            str(self.execution_run_root),
             "--cell-id",
             self.cell_id,
             "--owner-id",
@@ -261,8 +263,8 @@ class ProcessStack:
                 str(self.program_runner_port),
                 "--headless-url",
                 self.base_url,
-                "--execution-state-root",
-                str(self.runtime_root),
+                "--execution-run-root",
+                str(self.execution_run_root),
                 "--cycle-journal-path",
                 str(self.program_cycle_journal),
                 "--manager-liveness-socket",
@@ -640,7 +642,7 @@ def _assistant_stack(
                     }
                 )
             assert stale.value.code == "stale_generation"
-        assert (stack.runtime_root / "execution-command.sock").is_socket()
+        assert (stack.execution_run_root / "execution-command.sock").is_socket()
         assert stack.authoring_transaction_journal.parent == (
             stack.composer_authoring_root
         )
@@ -791,7 +793,7 @@ def _assistant_callback_body(
     assistant_mode: dict,
     scene_resource_id: str,
     request_id: str,
-    snapshot: dict,
+    admission_generation: int,
 ) -> dict:
     tool = next(
         row
@@ -821,7 +823,9 @@ def _assistant_callback_body(
         "inputSchemaHash": tool["input_schema_hash"],
         "draftId": draft["draft_id"],
         "expectedDraftRevision": draft["draft_revision"],
-        **_composer_fence(snapshot, request_id=request_id),
+        "expectedAdmissionGeneration": admission_generation,
+        "requestOwnerEpoch": "composer.process.epoch.1",
+        "requestId": request_id,
         "sourceLabel": "assistant_process_test",
         "correlationId": "correlation.assistant.1",
         "arguments": {
@@ -839,6 +843,14 @@ def _assistant_callback_body(
             }
         },
     }
+
+
+def _current_authoring_generation(client: HeadlessHttpClient) -> int:
+    admission = client.authoring_admission()
+    generation = admission.get("admission_generation")
+    assert admission.get("authoring_allowed") is True
+    assert type(generation) is int and generation >= 1
+    return generation
 
 
 def _plain_package_files(root: Path) -> dict[str, tuple[bytes, int, int]]:
@@ -885,9 +897,10 @@ def test_real_assistant_callback_uses_headless_source_facts_and_only_edits_draft
     tmp_path: Path,
 ) -> None:
     with _assistant_stack(tmp_path) as stack:
-        with _composer_snapshot_stream(
-            stack, client_id="process-test-browser"
-        ) as next_snapshot, HeadlessHttpClient(stack.composer_url) as composer:
+        with (
+            HeadlessHttpClient(stack.composer_url) as composer,
+            HeadlessHttpClient(stack.base_url) as headless,
+        ):
             source_context, assistant_mode = _matching_assistant_context(
                 stack, composer
             )
@@ -930,24 +943,28 @@ def test_real_assistant_callback_uses_headless_source_facts_and_only_edits_draft
                 "scene_draft_add_object",
             }
 
+            # A refreshed owner projection or admission generation changes the
+            # exact payload, so every new attempt needs a new idempotency key.
             for attempt in range(8):
                 source_context, assistant_mode = _matching_assistant_context(
                     stack, composer
                 )
                 node_environment = source_context["node_environment"]
                 source_model = source_context["source_model"]
-                accepted_snapshot = _matching_composer_snapshot(
-                    next_snapshot, draft
-                )
                 accepted_body = _assistant_callback_body(
                     draft=draft,
                     node_environment=node_environment,
                     source_model=source_model,
                     assistant_mode=assistant_mode,
                     scene_resource_id="assistant_workpiece",
-                    request_id="assistant.process.accepted",
-                    snapshot=accepted_snapshot,
+                    request_id=f"assistant.process.accepted.{attempt}",
+                    admission_generation=_current_authoring_generation(headless),
                 )
+                assert {
+                    "clientId",
+                    "snapshotReceiverEpoch",
+                    "snapshotSequence",
+                }.isdisjoint(accepted_body)
                 try:
                     accepted = composer.request(
                         "POST",
@@ -963,13 +980,16 @@ def test_real_assistant_callback_uses_headless_source_facts_and_only_edits_draft
                             "assistant_mode_projection_invalid",
                             "node_environment_projection_invalid",
                             "source_model_projection_invalid",
-                            "authoring_client_snapshot_stale",
+                            "stale_generation",
                         }
                         or attempt == 7
                     ):
                         raise
             assert accepted["success"] is True
             assert accepted["draftMutated"] is True
+            assert accepted["nextAdmissionGeneration"] > accepted_body[
+                "expectedAdmissionGeneration"
+            ]
 
             after_accepted = composer.request("GET", "/api/program/draft")
             assert after_accepted["draft_revision"] == draft["draft_revision"] + 1
@@ -983,17 +1003,14 @@ def test_real_assistant_callback_uses_headless_source_facts_and_only_edits_draft
                 stale_context, stale_mode = _matching_assistant_context(
                     stack, composer
                 )
-                stale_snapshot = _matching_composer_snapshot(
-                    next_snapshot, after_accepted
-                )
                 stale_identity = _assistant_callback_body(
                     draft=after_accepted,
                     node_environment=stale_context["node_environment"],
                     source_model=stale_context["source_model"],
                     assistant_mode=stale_mode,
                     scene_resource_id="stale_identity_object",
-                    request_id="assistant.process.stale-identity",
-                    snapshot=stale_snapshot,
+                    request_id=f"assistant.process.stale-identity.{attempt}",
+                    admission_generation=_current_authoring_generation(headless),
                 )
                 stale_identity["catalogHash"] = "sha256:" + "0" * 64
                 with pytest.raises(HeadlessClientError) as stale:
@@ -1010,7 +1027,7 @@ def test_real_assistant_callback_uses_headless_source_facts_and_only_edits_draft
                         "assistant_mode_projection_invalid",
                         "node_environment_projection_invalid",
                         "source_model_projection_invalid",
-                        "authoring_client_snapshot_stale",
+                        "stale_generation",
                     }
                     or attempt == 7
                 ):
@@ -1021,17 +1038,14 @@ def test_real_assistant_callback_uses_headless_source_facts_and_only_edits_draft
                 invalid_context, invalid_mode = _matching_assistant_context(
                     stack, composer
                 )
-                invalid_snapshot = _matching_composer_snapshot(
-                    next_snapshot, after_accepted
-                )
                 invalid_edit = _assistant_callback_body(
                     draft=after_accepted,
                     node_environment=invalid_context["node_environment"],
                     source_model=invalid_context["source_model"],
                     assistant_mode=invalid_mode,
                     scene_resource_id="invalid_edit_object",
-                    request_id="assistant.process.invalid-edit",
-                    snapshot=invalid_snapshot,
+                    request_id=f"assistant.process.invalid-edit.{attempt}",
+                    admission_generation=_current_authoring_generation(headless),
                 )
                 resource = invalid_edit["arguments"]["scene_resource"]
                 resource["objectId"] = resource.pop("scene_resource_id")
@@ -1049,13 +1063,16 @@ def test_real_assistant_callback_uses_headless_source_facts_and_only_edits_draft
                             "assistant_mode_projection_invalid",
                             "node_environment_projection_invalid",
                             "source_model_projection_invalid",
-                            "authoring_client_snapshot_stale",
+                            "stale_generation",
                         }
                         or attempt == 7
                     ):
                         raise
             assert rejected["success"] is False
             assert rejected["draftMutated"] is False
+            assert rejected["nextAdmissionGeneration"] == invalid_edit[
+                "expectedAdmissionGeneration"
+            ]
             assert rejected["result"]["kind"] == "validation_error"
             assert composer.request("GET", "/api/program/draft") == after_accepted
 
@@ -1064,9 +1081,6 @@ def test_real_assistant_callback_uses_headless_source_facts_and_only_edits_draft
                 for attempt in range(8):
                     read_context, read_mode = _matching_assistant_context(
                         stack, composer
-                    )
-                    read_snapshot = _matching_composer_snapshot(
-                        next_snapshot, after_accepted
                     )
                     program_read = next(
                         row
@@ -1079,8 +1093,8 @@ def test_real_assistant_callback_uses_headless_source_facts_and_only_edits_draft
                         source_model=read_context["source_model"],
                         assistant_mode=read_mode,
                         scene_resource_id="unused_for_program_read",
-                        request_id=f"assistant.process.read.{index}",
-                        snapshot=read_snapshot,
+                        request_id=f"assistant.process.read.{index}.{attempt}",
+                        admission_generation=_current_authoring_generation(headless),
                     )
                     read_body["inputSchemaHash"] = program_read[
                         "input_schema_hash"
@@ -1105,24 +1119,26 @@ def test_real_assistant_callback_uses_headless_source_facts_and_only_edits_draft
                                 "assistant_mode_projection_invalid",
                                 "node_environment_projection_invalid",
                                 "source_model_projection_invalid",
-                                "authoring_client_snapshot_stale",
+                                "stale_generation",
                             }
                             or attempt == 7
                         ):
                             raise
                 assert read_result["success"] is True
                 assert read_result["draftMutated"] is False
+                assert read_result["nextAdmissionGeneration"] == read_body[
+                    "expectedAdmissionGeneration"
+                ]
             assert max(callback_latencies_s) < 0.5, callback_latencies_s
 
         stack.kill_composer()
         assert stack.authoring_transaction_journal.is_file()
         stack.start_composer()
         stack.wait_composer()
-        with _composer_snapshot_stream(
-            stack, client_id="process-test-browser"
-        ) as replacement_snapshots, HeadlessHttpClient(
-            stack.composer_url
-        ) as replacement:
+        with (
+            HeadlessHttpClient(stack.composer_url) as replacement,
+            HeadlessHttpClient(stack.base_url) as headless,
+        ):
             assert replacement.request(
                 "GET", "/api/program/draft"
             ) == after_accepted
@@ -1141,9 +1157,7 @@ def test_real_assistant_callback_uses_headless_source_facts_and_only_edits_draft
             replacement_context, replacement_mode = _matching_assistant_context(
                 stack, replacement
             )
-            concurrent_snapshot = _matching_composer_snapshot(
-                replacement_snapshots, after_accepted
-            )
+            concurrent_generation = _current_authoring_generation(headless)
             concurrent_bodies = [
                 _assistant_callback_body(
                     draft=after_accepted,
@@ -1152,7 +1166,7 @@ def test_real_assistant_callback_uses_headless_source_facts_and_only_edits_draft
                     assistant_mode=replacement_mode,
                     scene_resource_id=f"concurrent_object_{index}",
                     request_id=f"assistant.process.concurrent.{index}",
-                    snapshot=concurrent_snapshot,
+                    admission_generation=concurrent_generation,
                 )
                 for index in range(2)
             ]
@@ -1167,7 +1181,6 @@ def test_real_assistant_callback_uses_headless_source_facts_and_only_edits_draft
             in {
                 "assistant_callback_context_stale",
                 "assistant_mode_projection_invalid",
-                "authoring_client_snapshot_stale",
                 "authoring_not_ready",
                 "composer_authoring_recovery_blocked",
                 "composer_draft_revision_stale",
@@ -1328,8 +1341,12 @@ def test_real_program_apply_reuses_active_deployment_and_survives_api_restart(
                             raise
                 result = applied_response["headless"]
                 assert result["status"] == "applied"
-                assert result["deployment_apply_required"] is False
-                assert result["manager_response"] is None
+                assert set(result) == {
+                    "applied",
+                    "preparation",
+                    "schema_version",
+                    "status",
+                }
                 assert result["applied"]["program_revision"] == program[
                     "program_revision"
                 ]

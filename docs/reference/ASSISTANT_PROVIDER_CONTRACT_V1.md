@@ -46,8 +46,18 @@ closed request contains:
   `requestedTools`, and narrowing-only `fieldPolicy`;
 - forwarded proof input: the complete `modeProjection` and exact
   `resolvedCatalog` (`catalogHash`, `grantPolicy`, `nodes`, `skills`, `tools`);
-- Composer context: `composerDraft` with Draft identity/revision, optional
-  Program snapshot, and the node-environment/source-model projection digests.
+- Composer context: `composerDraft` with Draft identity/revision, the current
+  Kernel `expectedAdmissionGeneration`, optional Program snapshot, and the
+  node-environment/source-model projection digests.
+
+Composer captures that backend admission generation when it accepts the
+assistant request. Every mutating callback rechecks it through the normal
+authoring transaction owner. Browser snapshot fields are deliberately absent:
+the GUI is a disposable presentation client, so its disconnect or snapshot
+expiry cannot become assistant authority or interrupt accepted backend work.
+Each Composer callback returns its exact durable `nextAdmissionGeneration`.
+The bridge chains that backend-issued value for a later mutation in the same
+assistant request; read-only or rejected callbacks leave it unchanged.
 
 Forwarded projection/catalog content is not trusted by itself. Before every
 model turn, the bridge independently reads the active mode and node environment
@@ -89,6 +99,11 @@ explicit new-ID retry; there is no silent retry.
 - Known callback arguments are validated against the exact schema hash before
   execution. Composer independently re-verifies the active projection,
   narrowing, schema hash, Draft ID, and expected Draft revision.
+- Each Composer callback uses a deterministic idempotency identity derived
+  from the provider request owner/identity, model turn, upstream call identity,
+  and call position. Composer replays an exact durable outcome before
+  consulting mutable Draft/admission context; changed intent under the same
+  identity conflicts.
 - Draft, node, skill, and tool-result content is untrusted model data, never an
   instruction source. Only the bridge-owned system rules and exact retained
   instrument contract grant model actions.

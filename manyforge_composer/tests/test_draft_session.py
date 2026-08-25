@@ -354,17 +354,36 @@ def test_revert_failure_stale_fences_and_exhaustion_are_atomic() -> None:
     )
     before = deepcopy(session.workspace_snapshot())
 
-    result, _snapshot = session.revert_saved_after_apply(
-        draft_id=session.draft_id,
-        expected_revision=session.revision,
-        prepare=lambda document: (
-            Program.from_dict(document, build_node_environment().catalog),
-            _program(metadata={"selection": "applied"}),
-            "current",
-        ),
-        applier=lambda _program, _context: {"status": "pending_deployment"},
-    )
-    assert result["status"] == "pending_deployment"
+    with pytest.raises(DraftSessionError) as malformed:
+        session.revert_saved_after_apply(
+            draft_id=session.draft_id,
+            expected_revision=session.revision,
+            prepare=lambda document: (
+                Program.from_dict(document, build_node_environment().catalog),
+                _program(metadata={"selection": "applied"}),
+                "current",
+            ),
+            applier=lambda _program, _context: {"status": "pending_deployment"},
+        )
+    assert malformed.value.code == "program_apply_response_invalid"
+    assert session.workspace_snapshot() == before
+
+    with pytest.raises(DraftSessionError, match="deployment is not active"):
+        session.revert_saved_after_apply(
+            draft_id=session.draft_id,
+            expected_revision=session.revision,
+            prepare=lambda document: (
+                Program.from_dict(document, build_node_environment().catalog),
+                _program(metadata={"selection": "applied"}),
+                "current",
+            ),
+            applier=lambda _program, _context: (_ for _ in ()).throw(
+                DraftSessionError(
+                    "program_apply_deployment_not_active",
+                    "deployment is not active",
+                )
+            ),
+        )
     assert session.workspace_snapshot() == before
 
     with pytest.raises(DraftSessionError) as stale:

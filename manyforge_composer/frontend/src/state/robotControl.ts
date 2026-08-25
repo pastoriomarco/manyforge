@@ -487,6 +487,7 @@ export function robotControlReducer(
         operation: {
           operationId: action.acceptance.operationId,
           operationRevision: action.acceptance.operationRevision,
+          resident: true,
           state: 'queued',
           progress: 0,
           activeStopId: null,

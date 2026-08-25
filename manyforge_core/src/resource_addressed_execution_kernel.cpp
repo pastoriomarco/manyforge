@@ -1595,6 +1595,46 @@ namespace {
 
 constexpr std::uint64_t kMaximumKernelJsonInteger = 9'007'199'254'740'991ULL;
 constexpr std::size_t kMaximumResidentStopTerminalRecords = 64U;
+// Recognized Stop authority is already linearized, and containment never
+// depends on this sole non-critical projection worker. The injected scheduler
+// wakes its existing worker after a short bounded delay when a concurrent
+// ordinary journal transaction still owns the journal critical section. This
+// preserves causal ordering without a second retry owner or queue.
+constexpr std::uint64_t kMaximumStopJournalProjectionAttempts = 10U;
+constexpr auto kStopJournalProjectionRetryDelay = std::chrono::milliseconds(20);
+constexpr TimePoint kStopJournalProjectionRetryDelayNs =
+    std::chrono::duration_cast<std::chrono::nanoseconds>(kStopJournalProjectionRetryDelay).count();
+
+[[nodiscard]] bool retryable_stop_journal_projection_error(
+    const std::optional<ErrorDTO>& error) noexcept {
+  if (!error.has_value()) {
+    return false;
+  }
+  const auto retryable = error->details.find("retryable");
+  return retryable != error->details.end() && retryable->second == "true";
+}
+
+template <typename Projection>
+struct StopJournalProjectionAttempt final {
+  Projection result;
+  std::uint64_t attempts{};
+};
+
+template <typename Project, typename AwaitRetry>
+[[nodiscard]] auto project_stop_journal_with_bounded_retry(Project&& project,
+                                                           AwaitRetry&& await_retry) {
+  auto result = project();
+  std::uint64_t attempts = 1U;
+  while (attempts < kMaximumStopJournalProjectionAttempts &&
+         retryable_stop_journal_projection_error(result.error)) {
+    if (!await_retry()) {
+      break;
+    }
+    result = project();
+    ++attempts;
+  }
+  return StopJournalProjectionAttempt<decltype(result)>{std::move(result), attempts};
+}
 
 [[nodiscard]] std::int64_t checked_deadline(std::int64_t now, std::int64_t duration) noexcept {
   if (now < 0 || duration <= 0 || now > kMaximumStopDurationNs - duration) {
@@ -1985,15 +2025,47 @@ constexpr std::size_t kMaximumResidentStopTerminalRecords = 64U;
 }  // namespace
 
 class ResourceAddressedExecutionKernel::StopProjectionWorker final {
+  class RetryGate;
+
  public:
-  StopProjectionWorker(const std::size_t capacity, ResourceAddressedExecutionKernel& owner)
+  StopProjectionWorker(const std::size_t capacity, ResourceAddressedExecutionKernel& owner,
+                       IClock& clock, IScheduler& scheduler)
       : capacity_(capacity),
         owner_(owner),
+        clock_(clock),
+        scheduler_(scheduler),
+        retry_gate_(std::make_shared<RetryGate>()),
         requested_(std::make_unique<std::atomic_uint64_t[]>(capacity)),
         delivered_(std::make_unique<std::atomic_uint64_t[]>(capacity)),
         worker_([this](std::stop_token token) noexcept { Run(token); }) {
     while (!ready_.load(std::memory_order_acquire)) {
       ready_.wait(false, std::memory_order_acquire);
+    }
+  }
+
+  [[nodiscard]] bool AwaitRetry(const std::stop_token cancellation) noexcept {
+    try {
+      const auto now = clock_.now();
+      if (now < 0 ||
+          now > std::numeric_limits<TimePoint>::max() - kStopJournalProjectionRetryDelayNs) {
+        return false;
+      }
+      const auto gate = retry_gate_;
+      const auto generation = gate->Begin();
+      if (generation == 0U) {
+        return false;
+      }
+      try {
+        static_cast<void>(scheduler_.schedule(
+            now + kStopJournalProjectionRetryDelayNs,
+            [gate, generation] { gate->Complete(generation); }, SchedulerPriority::Background));
+      } catch (...) {
+        gate->Complete(generation);
+        return false;
+      }
+      return gate->Wait(generation, cancellation);
+    } catch (...) {
+      return false;
     }
   }
 
@@ -2060,6 +2132,45 @@ class ResourceAddressedExecutionKernel::StopProjectionWorker final {
   }
 
  private:
+  class RetryGate final {
+   public:
+    [[nodiscard]] std::uint64_t Begin() {
+      std::lock_guard lock(mutex_);
+      if (next_generation_ == std::numeric_limits<std::uint64_t>::max()) {
+        return 0U;
+      }
+      return ++next_generation_;
+    }
+
+    void Complete(const std::uint64_t generation) noexcept {
+      try {
+        {
+          std::lock_guard lock(mutex_);
+          completed_generation_ = std::max(completed_generation_, generation);
+        }
+        changed_.notify_all();
+      } catch (...) {
+      }
+    }
+
+    [[nodiscard]] bool Wait(const std::uint64_t generation,
+                            const std::stop_token cancellation) noexcept {
+      try {
+        std::unique_lock lock(mutex_);
+        return changed_.wait(lock, cancellation,
+                             [&] { return completed_generation_ >= generation; });
+      } catch (...) {
+        return false;
+      }
+    }
+
+   private:
+    std::mutex mutex_;
+    std::condition_variable_any changed_;
+    std::uint64_t next_generation_{};
+    std::uint64_t completed_generation_{};
+  };
+
   void Wake() noexcept {
     wake_sequence_.fetch_add(1U, std::memory_order_release);
     wake_sequence_.notify_one();
@@ -2083,7 +2194,7 @@ class ResourceAddressedExecutionKernel::StopProjectionWorker final {
         }
         callback_in_flight_.store(true, std::memory_order_release);
         owner_.ProjectStop(
-            StopControlWorkToken{static_cast<StopControlSlotIndex>(index), requested});
+            StopControlWorkToken{static_cast<StopControlSlotIndex>(index), requested}, stop_token);
         callback_in_flight_.store(false, std::memory_order_release);
         delivered_[index].store(requested, std::memory_order_release);
         progressed = true;
@@ -2107,6 +2218,9 @@ class ResourceAddressedExecutionKernel::StopProjectionWorker final {
 
   std::size_t capacity_{};
   ResourceAddressedExecutionKernel& owner_;
+  IClock& clock_;
+  IScheduler& scheduler_;
+  std::shared_ptr<RetryGate> retry_gate_;
   std::unique_ptr<std::atomic_uint64_t[]> requested_;
   std::unique_ptr<std::atomic_uint64_t[]> delivered_;
   std::atomic_bool accepting_{true};
@@ -2228,7 +2342,8 @@ struct ResourceAddressedExecutionKernel::EngineSubscription final {
 
 ResourceAddressedExecutionKernel::ResourceAddressedExecutionKernel(
     std::vector<RuntimeParticipantExecutionRegistration> registrations, IClock& clock,
-    IOperationJournal& journal, ResourceAddressedExecutionKernelConfig config)
+    IScheduler& scheduler, IOperationJournal& journal,
+    ResourceAddressedExecutionKernelConfig config)
     : registry_(extract_bindings(registrations)),
       admission_mutex_(config.operation_admission_gate != nullptr
                            ? config.operation_admission_gate->shared_admission_mutex()
@@ -2238,6 +2353,7 @@ ResourceAddressedExecutionKernel::ResourceAddressedExecutionKernel(
           extract_published_active_control_configurations(registrations), admission_mutex_)),
       registrations_(std::move(registrations)),
       clock_(clock),
+      scheduler_(scheduler),
       journal_(journal),
       config_(std::move(config)),
       emergency_stop_reserve_(config_.emergency_stop_correlation_capacity),
@@ -2269,8 +2385,7 @@ ResourceAddressedExecutionKernel::ResourceAddressedExecutionKernel(
   }
   if (config_.stop_surveillance.has_value()) {
     const auto& surveillance = *config_.stop_surveillance;
-    if (surveillance.scheduler == nullptr || surveillance.observer == nullptr ||
-        surveillance.policy.sample_cadence_ns <= 0 ||
+    if (surveillance.observer == nullptr || surveillance.policy.sample_cadence_ns <= 0 ||
         surveillance.policy.checkpoint_interval_ns < surveillance.policy.sample_cadence_ns ||
         surveillance.policy.retained_checkpoint_limit == 0U ||
         surveillance.policy.retained_checkpoint_limit > kMaximumStopSurveillanceCheckpoints) {
@@ -2301,7 +2416,8 @@ ResourceAddressedExecutionKernel::ResourceAddressedExecutionKernel(
     stop_projection_jobs_[index] = std::make_unique<StopProjectionJob>();
   }
   stop_projection_worker_ =
-      std::make_unique<StopProjectionWorker>(stop_projection_jobs_.size(), *this);
+      std::make_unique<StopProjectionWorker>(stop_projection_jobs_.size(), *this, clock_,
+                                             scheduler_);
   stop_control_executor_ = std::make_unique<BoundedStopControlExecutor>(
       emergency_stop_reserve_.correlation_capacity() + 1U, clock_,
       static_cast<IStopControlWorkReceiver&>(*this));
@@ -2518,14 +2634,13 @@ ResourceAddressedExecutionKernel::~ResourceAddressedExecutionKernel() {
     }
     for (const auto handle : surveillance_handles) {
       try {
-        config_.stop_surveillance->scheduler->cancel(handle);
+        scheduler_.cancel(handle);
       } catch (...) {
         std::terminate();
       }
     }
     try {
-      if (!config_.stop_surveillance->scheduler->drain_for(SchedulerPriority::Monitoring,
-                                                           std::chrono::seconds(5))) {
+      if (!scheduler_.drain_for(SchedulerPriority::Monitoring, std::chrono::seconds(5))) {
         std::terminate();
       }
     } catch (...) {
@@ -5655,7 +5770,7 @@ void ResourceAddressedExecutionKernel::ScheduleStopSurveillance(
 
   std::optional<ScheduleHandle> handle;
   try {
-    handle = config_.stop_surveillance->scheduler->schedule(
+    handle = scheduler_.schedule(
         deadline_ns,
         [this, certificate_id, generation] { RunStopSurveillance(certificate_id, generation); },
         SchedulerPriority::Monitoring);
@@ -5693,7 +5808,7 @@ void ResourceAddressedExecutionKernel::ScheduleStopSurveillance(
   }
   if (cancel_late_handle) {
     try {
-      config_.stop_surveillance->scheduler->cancel(*handle);
+      scheduler_.cancel(*handle);
     } catch (...) {
       std::terminate();
     }
@@ -7170,7 +7285,8 @@ Result<StopAcceptedDTO> ResourceAddressedExecutionKernel::accept_stop(
   return Result<StopAcceptedDTO>::Ok(std::move(*accepted));
 }
 
-void ResourceAddressedExecutionKernel::ProjectStop(const StopControlWorkToken token) noexcept {
+void ResourceAddressedExecutionKernel::ProjectStop(const StopControlWorkToken token,
+                                                   const std::stop_token cancellation) noexcept {
   StopProjectionJob job;
   try {
     {
@@ -7229,9 +7345,13 @@ void ResourceAddressedExecutionKernel::ProjectStop(const StopControlWorkToken to
         active_stop_fault_latch_ = job.terminal_fault_latch;
         motion_admission_closed_ = true;
       }
-      auto projected =
-          journal_.RecordStopTerminal(config_.request_owner_epoch, *job.terminal_status,
-                                      *job.terminal_certificate, job.terminal_fault_latch);
+      auto projection_attempt = project_stop_journal_with_bounded_retry(
+          [&] {
+            return journal_.RecordStopTerminal(config_.request_owner_epoch, *job.terminal_status,
+                                               *job.terminal_certificate, job.terminal_fault_latch);
+          },
+          [&] { return stop_projection_worker_->AwaitRetry(cancellation); });
+      auto projected = std::move(projection_attempt.result);
       if (operation_state_projection_error.has_value() &&
           projected.state == StopForensicProjectionStateDTO::kRecorded) {
         projected = StopForensicProjectionResultDTO{StopForensicProjectionStateDTO::kFailed,
@@ -7275,8 +7395,8 @@ void ResourceAddressedExecutionKernel::ProjectStop(const StopControlWorkToken to
             projected.error.value_or(ErrorDTO{"operation_journal_stop_terminal_projection_failed",
                                               "Stop terminal forensic projection failed",
                                               {}});
-        (*record)->status.terminal_projection =
-            StopDurableProjectionStatusDTO{StopDurableProjectionStateDTO::kFailed, failure, 1U};
+        (*record)->status.terminal_projection = StopDurableProjectionStatusDTO{
+            StopDurableProjectionStateDTO::kFailed, failure, projection_attempt.attempts};
         if (!(*record)->fault_latch.has_value() && stop_retained_bundle_id_.has_value() &&
             stop_graph_revision_.has_value() &&
             cell_stop_fault_latch_generation_.value() < kMaximumKernelJsonInteger) {
@@ -7285,13 +7405,14 @@ void ResourceAddressedExecutionKernel::ProjectStop(const StopControlWorkToken to
           (*record)->fault_latch = persistence_fault_latch(
               config_.cell_id, config_.request_owner_epoch, *stop_retained_bundle_id_,
               *stop_graph_revision_, (*record)->certificate, cell_stop_fault_latch_generation_,
-              StopDurableProjectionStatusDTO{StopDurableProjectionStateDTO::kFailed, failure, 1U});
+              StopDurableProjectionStatusDTO{StopDurableProjectionStateDTO::kFailed, failure,
+                                             projection_attempt.attempts});
           (*record)->status.fault_latch = (*record)->fault_latch;
           active_stop_fault_latch_ = (*record)->fault_latch;
         }
         if ((*record)->fault_latch.has_value()) {
-          (*record)->fault_latch->terminal_projection =
-              StopDurableProjectionStatusDTO{StopDurableProjectionStateDTO::kFailed, failure, 1U};
+          (*record)->fault_latch->terminal_projection = StopDurableProjectionStatusDTO{
+              StopDurableProjectionStateDTO::kFailed, failure, projection_attempt.attempts};
           (*record)->status.fault_latch = (*record)->fault_latch;
           if (active_stop_fault_latch_.has_value() &&
               active_stop_fault_latch_->latch_id == (*record)->fault_latch->latch_id) {
@@ -7308,9 +7429,15 @@ void ResourceAddressedExecutionKernel::ProjectStop(const StopControlWorkToken to
         motion_admission_closed_ = true;
         return;
       }
-      const auto projected = journal_.RecordStopSurveillanceCheckpoint(
-          config_.request_owner_epoch, *job.surveillance_checkpoint, *job.surveillance_fault_latch,
-          clock_.now());
+      const auto projected_at_ns = clock_.now();
+      auto projection_attempt = project_stop_journal_with_bounded_retry(
+          [&] {
+            return journal_.RecordStopSurveillanceCheckpoint(
+                config_.request_owner_epoch, *job.surveillance_checkpoint,
+                *job.surveillance_fault_latch, projected_at_ns);
+          },
+          [&] { return stop_projection_worker_->AwaitRetry(cancellation); });
+      const auto& projected = projection_attempt.result;
       std::lock_guard state_lock(state_mutex_);
       const auto record = std::find_if(
           stop_terminal_history_.begin(), stop_terminal_history_.end(), [&](const auto& candidate) {
@@ -7337,8 +7464,8 @@ void ResourceAddressedExecutionKernel::ProjectStop(const StopControlWorkToken to
             ErrorDTO{"operation_journal_stop_surveillance_projection_failed",
                      "Stop surveillance checkpoint projection failed",
                      {}});
-        checkpoint_status =
-            StopDurableProjectionStatusDTO{StopDurableProjectionStateDTO::kFailed, failure, 1U};
+        checkpoint_status = StopDurableProjectionStatusDTO{StopDurableProjectionStateDTO::kFailed,
+                                                           failure, projection_attempt.attempts};
         motion_admission_closed_ = true;
         if ((*record)->fault_latch.has_value()) {
           auto& latch = *(*record)->fault_latch;
@@ -7381,9 +7508,13 @@ void ResourceAddressedExecutionKernel::ProjectStop(const StopControlWorkToken to
       return;
     }
 
-    const auto projected =
-        journal_.RecordStopAccepted(config_.request_owner_epoch, *job.acceptance, *job.intent,
-                                    *job.accepted, *job.affected_state);
+    auto projection_attempt = project_stop_journal_with_bounded_retry(
+        [&] {
+          return journal_.RecordStopAccepted(config_.request_owner_epoch, *job.acceptance,
+                                             *job.intent, *job.accepted, *job.affected_state);
+        },
+        [&] { return stop_projection_worker_->AwaitRetry(cancellation); });
+    const auto& projected = projection_attempt.result;
     const auto state = projected.projection_state == EmergencyStopProjectionStateDTO::kRecorded
                            ? EmergencyStopProjectionStateDTO::kRecorded
                            : EmergencyStopProjectionStateDTO::kFailed;
@@ -7396,7 +7527,7 @@ void ResourceAddressedExecutionKernel::ProjectStop(const StopControlWorkToken to
                   projected.error.value_or(ErrorDTO{"operation_journal_stop_projection_failed",
                                                     "Stop acceptance forensic projection failed",
                                                     {}}),
-                  1U};
+                  projection_attempt.attempts};
     const bool marked =
         emergency_stop_reserve_.mark_projection(job.acceptance->stop_id.value(), state);
     std::optional<StopControlWorkToken> terminal_projection;
@@ -9116,23 +9247,33 @@ Result<RuntimeScaleStatusDTO> ResourceAddressedExecutionKernel::get_runtime_scal
 
 Result<OperationStateDTO> ResourceAddressedExecutionKernel::get_operation_state(
     const OperationId& operation_id) const {
+  auto projection = get_operation_projection(operation_id);
+  if (!projection.ok()) {
+    return Result<OperationStateDTO>::Err(std::move(projection.error()));
+  }
+  return Result<OperationStateDTO>::Ok(std::move(projection.value().operation));
+}
+
+Result<OperationReadProjectionDTO> ResourceAddressedExecutionKernel::get_operation_projection(
+    const OperationId& operation_id) const {
   if (operation_id.empty()) {
-    return reject<OperationStateDTO>("operation identity is empty", "operation_id_empty",
-                                     ErrorCode::kInvalidRequest);
+    return reject<OperationReadProjectionDTO>("operation identity is empty", "operation_id_empty",
+                                              ErrorCode::kInvalidRequest);
   }
   std::lock_guard state_lock(state_mutex_);
   const auto* active_operation = find_active_operation_locked(operation_id);
   if (active_operation != nullptr) {
-    return Result<OperationStateDTO>::Ok(active_operation->state);
+    return Result<OperationReadProjectionDTO>::Ok(
+        OperationReadProjectionDTO{active_operation->state, true});
   }
   const auto historical = std::find_if(
       historical_operations_.begin(), historical_operations_.end(),
       [&](const OperationStateDTO& state) { return state.operation_id == operation_id; });
   if (historical != historical_operations_.end()) {
-    return Result<OperationStateDTO>::Ok(*historical);
+    return Result<OperationReadProjectionDTO>::Ok(OperationReadProjectionDTO{*historical, false});
   }
-  return reject<OperationStateDTO>("operation is not resident or retained",
-                                   "operation_not_resident", ErrorCode::kMissingReference);
+  return reject<OperationReadProjectionDTO>("operation is not resident or retained",
+                                            "operation_not_resident", ErrorCode::kMissingReference);
 }
 
 Result<void> ResourceAddressedExecutionKernel::fail_coordinated_pre_dispatch(

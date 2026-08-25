@@ -6,13 +6,17 @@ from typing import Any
 
 import pytest
 from fastapi import HTTPException
+from manyforge_headless_api.client import HeadlessClientError
 
 from manyforge_composer.backend.authoring_admission import (
     AuthoringAdmissionCoordinator,
-    AuthoringMutationEnvelope,
+    BackendAuthoringMutationEnvelope,
+    BrowserAuthoringMutationEnvelope,
+    headless_client_http_exception,
 )
 from manyforge_composer.backend.authoring_transaction_journal import (
     ComposerAuthoringTransactionJournal,
+    canonical_digest,
     owner_transaction_id,
 )
 
@@ -136,8 +140,8 @@ def _envelope(
     *,
     sequence: int = 1,
     generation: int = 7,
-) -> AuthoringMutationEnvelope:
-    return AuthoringMutationEnvelope(
+) -> BrowserAuthoringMutationEnvelope:
+    return BrowserAuthoringMutationEnvelope(
         client_id=client_id,
         snapshot_receiver_epoch=coordinator.receiver_epoch,
         snapshot_sequence=sequence,
@@ -159,6 +163,35 @@ def _publish(
         admission_generation=7,
         draft_id="draft.1",
         draft_revision=3,
+    )
+
+
+def _backend_envelope(
+    *,
+    request_id: str = "assistant.request.1",
+    generation: int = 7,
+) -> BackendAuthoringMutationEnvelope:
+    return BackendAuthoringMutationEnvelope(
+        expected_admission_generation=generation,
+        request_owner_epoch="assistant.epoch.1",
+        request_id=request_id,
+    )
+
+
+def _owner_proven_no_effect_error() -> HeadlessClientError:
+    response = {
+        "detail": {
+            "code": "program_apply_deployment_not_active",
+            "details": {"effect_disposition": "proven_no_effect"},
+            "message": "the deployment is not active",
+        }
+    }
+    return HeadlessClientError(
+        "program_apply_deployment_not_active",
+        "the deployment is not active",
+        409,
+        details={"effect_disposition": "proven_no_effect"},
+        response=response,
     )
 
 
@@ -276,6 +309,67 @@ def test_disconnected_client_does_not_block_another_current_client(tmp_path) -> 
     assert len(headless.settlements) == 1
 
 
+def test_backend_mutation_uses_kernel_admission_without_browser_state(tmp_path) -> None:
+    headless = _Headless()
+    coordinator = AuthoringAdmissionCoordinator(headless, tmp_path)  # type: ignore[arg-type]
+    coordinator.recover()
+
+    # A disconnected browser is presentation state only and cannot gate a
+    # backend-owned assistant mutation.
+    _publish(coordinator, "browser-a")
+    coordinator.disconnect("browser-a")
+    result = coordinator.execute(
+        _backend_envelope(),
+        operation_kind="assistant_scene_draft_add_object",
+        draft_id="draft.1",
+        draft_revision=3,
+        payload={"operation": "assistant edit"},
+        effect=lambda _claim: {"status": "committed"},
+        post_image=lambda: {"draft_id": "draft.1", "revision": 4},
+    )
+
+    assert result == {"status": "committed"}
+    assert len(headless.claims) == 1
+    assert len(headless.settlements) == 1
+    assert coordinator.completed_admission_generation(_backend_envelope()) == 8
+
+
+def test_backend_validation_under_claim_precedes_effect_intent(tmp_path) -> None:
+    headless = _Headless()
+    coordinator = AuthoringAdmissionCoordinator(headless, tmp_path)  # type: ignore[arg-type]
+    coordinator.recover()
+    envelope = _backend_envelope(request_id="assistant.request.rejected")
+    effects: list[str] = []
+
+    def reject_under_claim(_claim: dict[str, Any]) -> None:
+        raise HTTPException(
+            status_code=409,
+            detail={"code": "assistant_callback_context_stale"},
+        )
+
+    with pytest.raises(HTTPException) as rejected:
+        coordinator.execute(
+            envelope,
+            operation_kind="assistant_scene_draft_add_object",
+            draft_id="draft.1",
+            draft_revision=3,
+            payload={"operation": "assistant edit"},
+            effect=lambda _claim: effects.append("effect"),
+            post_image=lambda: {"draft_id": "draft.1", "revision": 4},
+            validate_under_claim=reject_under_claim,
+        )
+
+    assert rejected.value.detail["code"] == "assistant_callback_context_stale"
+    assert effects == []
+    transaction = coordinator._journal.lookup(
+        envelope.request_owner_epoch, envelope.request_id
+    )
+    assert transaction is not None
+    assert transaction.effect_intent is None
+    assert transaction.complete
+    assert headless.settlements[-1]["settlement_kind"] == "proven_no_effect"
+
+
 def test_snapshot_rotation_after_claim_releases_proven_no_effect(tmp_path) -> None:
     headless = _Headless()
     coordinator = AuthoringAdmissionCoordinator(headless, tmp_path)  # type: ignore[arg-type]
@@ -290,9 +384,10 @@ def test_snapshot_rotation_after_claim_releases_proven_no_effect(tmp_path) -> No
         return result
 
     headless.acquire_authoring_transaction = acquire_while_snapshot_rotates  # type: ignore[method-assign]
+    envelope = _envelope(coordinator, "client-a")
     with pytest.raises(HTTPException) as stale:
         coordinator.execute(
-            _envelope(coordinator, "client-a"),
+            envelope,
             operation_kind="save_draft",
             draft_id="draft.1",
             draft_revision=3,
@@ -305,6 +400,172 @@ def test_snapshot_rotation_after_claim_releases_proven_no_effect(tmp_path) -> No
     assert effects == []
     assert coordinator.mutation_ready
     assert headless.settlements[0]["settlement_kind"] == "proven_no_effect"
+
+    # The exact completed request is a durable owner outcome. It must replay
+    # before consulting the now-rotated (and here disconnected) browser
+    # snapshot, without acquiring or settling a second Kernel claim.
+    coordinator.disconnect("client-a")
+    claims = len(headless.claims)
+    settlements = len(headless.settlements)
+    with pytest.raises(HTTPException) as replayed:
+        coordinator.execute(
+            envelope,
+            operation_kind="save_draft",
+            draft_id="draft.1",
+            draft_revision=3,
+            payload={"operation": "save"},
+            effect=lambda _claim: effects.append("save"),
+            post_image=lambda: {},
+        )
+    assert replayed.value.status_code == stale.value.status_code
+    assert replayed.value.detail == stale.value.detail
+    assert replayed.value.headers == stale.value.headers
+    assert effects == []
+    assert len(headless.claims) == claims
+    assert len(headless.settlements) == settlements
+
+    with pytest.raises(HTTPException) as conflict:
+        coordinator.execute(
+            envelope,
+            operation_kind="save_draft",
+            draft_id="draft.1",
+            draft_revision=3,
+            payload={"operation": "different"},
+            effect=lambda _claim: None,
+            post_image=lambda: {},
+        )
+    assert conflict.value.detail["code"] == "composer_authoring_request_id_conflict"
+
+
+def test_owner_proven_external_rejection_settles_and_replays_exactly(
+    tmp_path,
+) -> None:
+    headless = _Headless()
+    coordinator = AuthoringAdmissionCoordinator(headless, tmp_path)  # type: ignore[arg-type]
+    coordinator.recover()
+    _publish(coordinator, "client-a")
+    envelope = _envelope(coordinator, "client-a")
+
+    def reject(_claim):
+        error = _owner_proven_no_effect_error()
+        raise headless_client_http_exception(error) from error
+
+    with pytest.raises(HTTPException) as rejected:
+        coordinator.execute(
+            envelope,
+            operation_kind="apply_draft",
+            draft_id="draft.1",
+            draft_revision=3,
+            payload={"operation": "apply"},
+            effect=reject,
+            post_image=lambda: {},
+            prepare_effect=lambda: {
+                "effect_class": "external",
+                "external_kind": "program_apply",
+            },
+        )
+
+    assert rejected.value.status_code == 409
+    assert rejected.value.detail == {
+        "code": "program_apply_deployment_not_active",
+        "message": "the deployment is not active",
+    }
+    assert coordinator.mutation_ready
+    assert headless.settlements[-1]["settlement_kind"] == "proven_no_effect"
+
+    coordinator.disconnect("client-a")
+    with pytest.raises(HTTPException) as replayed:
+        coordinator.execute(
+            envelope,
+            operation_kind="apply_draft",
+            draft_id="draft.1",
+            draft_revision=3,
+            payload={"operation": "apply"},
+            effect=lambda _claim: pytest.fail("exact replay reran the effect"),
+            post_image=lambda: {},
+        )
+    assert replayed.value.status_code == rejected.value.status_code
+    assert replayed.value.detail == rejected.value.detail
+
+
+def test_unproven_external_rejection_remains_recovery_blocked(tmp_path) -> None:
+    headless = _Headless()
+    coordinator = AuthoringAdmissionCoordinator(headless, tmp_path)  # type: ignore[arg-type]
+    coordinator.recover()
+    _publish(coordinator, "client-a")
+
+    def reject(_claim):
+        error = HeadlessClientError(
+            "headless_http_unavailable",
+            "the response was lost",
+        )
+        raise headless_client_http_exception(error) from error
+
+    with pytest.raises(HTTPException):
+        coordinator.execute(
+            _envelope(coordinator, "client-a"),
+            operation_kind="apply_draft",
+            draft_id="draft.1",
+            draft_revision=3,
+            payload={"operation": "apply"},
+            effect=reject,
+            post_image=lambda: {},
+            prepare_effect=lambda: {
+                "effect_class": "external",
+                "external_kind": "program_apply",
+            },
+        )
+
+    assert not coordinator.mutation_ready
+    assert headless.settlements == []
+
+
+def test_completed_replay_rejects_unknown_durable_outcome_without_effect(
+    tmp_path,
+) -> None:
+    headless = _Headless()
+    coordinator = AuthoringAdmissionCoordinator(headless, tmp_path)  # type: ignore[arg-type]
+    coordinator.recover()
+    envelope = _envelope(coordinator, "client-a")
+    payload = {"operation": "save"}
+    transaction = coordinator._journal.record_intent(
+        request_owner_epoch=envelope.request_owner_epoch,
+        request_id=envelope.request_id,
+        operation_kind="save_draft",
+        payload_digest=canonical_digest(payload),
+        draft_id="draft.1",
+        draft_revision=3,
+        admission_generation=7,
+        claim_intent={"owner_transaction_id": "corrupt.fixture"},
+    )
+    coordinator._journal.record(
+        transaction,
+        "outcome_json",
+        {"kind": "unsupported", "body": {"saved": True}},
+    )
+    coordinator._journal.record(
+        transaction,
+        "release_receipt_json",
+        {"disposition": "released.fixture"},
+    )
+    effects: list[str] = []
+
+    with pytest.raises(HTTPException) as rejected:
+        coordinator.execute(
+            envelope,
+            operation_kind="save_draft",
+            draft_id="draft.1",
+            draft_revision=3,
+            payload=payload,
+            effect=lambda _claim: effects.append("save"),
+            post_image=lambda: {},
+        )
+
+    assert rejected.value.status_code == 503
+    assert rejected.value.detail["code"] == "composer_authoring_outcome_invalid"
+    assert effects == []
+    assert headless.claims == []
+    assert headless.settlements == []
 
 
 def test_successor_recovers_lost_acquire_only_from_exact_claim(tmp_path) -> None:
@@ -337,7 +598,11 @@ def test_successor_restores_completed_local_post_image_before_opening(tmp_path) 
     journal.record_effect_outcome(
         transaction,
         post_image={"draft_id": "draft.2", "revision": 4},
-        outcome={"kind": "mapping", "body": {"ok": True}},
+        outcome={
+            "kind": "mapping",
+            "settlement_kind": "owner_commit",
+            "body": {"ok": True},
+        },
     )
     journal.record(transaction, "release_intent_json", {"settlement_kind": "owner_commit"})
     restored: list[dict[str, Any]] = []
@@ -385,21 +650,99 @@ def test_successor_replays_external_recovery_callback_exactly(tmp_path) -> None:
     )
     assert row is not None and row.outcome == {
         "kind": "mapping",
+        "settlement_kind": "owner_commit",
         "body": {"status": "replayed"},
     }
+
+
+def test_successor_settles_owner_proven_external_no_effect(tmp_path) -> None:
+    transaction, claim = _durable_transaction(tmp_path, effect_class="external")
+    headless = _RecoveryHeadless(_startup_receipt(status="held_exact", claim=claim))
+
+    def recover(_transaction, _claim):
+        raise _owner_proven_no_effect_error()
+
+    coordinator = AuthoringAdmissionCoordinator(
+        headless,
+        tmp_path,
+        recover_effect=recover,
+    )
+    coordinator.recover()
+
+    assert coordinator.mutation_ready
+    assert headless.settlements[0]["settlement_kind"] == "proven_no_effect"
+    row = coordinator._journal.lookup(
+        transaction.request_owner_epoch, transaction.request_id
+    )
+    assert row is not None and row.outcome == {
+        "kind": "http_exception",
+        "settlement_kind": "proven_no_effect",
+        "status_code": 409,
+        "detail": {
+            "code": "program_apply_deployment_not_active",
+            "message": "the deployment is not active",
+        },
+        "headers": None,
+    }
+
+
+def test_successor_uses_durable_no_effect_disposition_before_release_intent(
+    tmp_path,
+) -> None:
+    transaction, claim = _durable_transaction(tmp_path, effect_class="external")
+    journal = ComposerAuthoringTransactionJournal(tmp_path)
+    journal.record(
+        transaction,
+        "outcome_json",
+        {
+            "kind": "http_exception",
+            "settlement_kind": "proven_no_effect",
+            "status_code": 409,
+            "detail": {
+                "code": "program_apply_deployment_not_active",
+                "message": "the deployment is not active",
+            },
+            "headers": None,
+        },
+    )
+    headless = _RecoveryHeadless(_startup_receipt(status="held_exact", claim=claim))
+    coordinator = AuthoringAdmissionCoordinator(
+        headless,
+        tmp_path,
+        recover_effect=lambda *_args: pytest.fail(
+            "durable no-effect outcome reran recovery"
+        ),
+    )
+
+    coordinator.recover()
+
+    assert coordinator.mutation_ready
+    assert headless.settlements[0]["settlement_kind"] == "proven_no_effect"
 
 
 def test_successor_rejects_mismatched_release_receipt(tmp_path) -> None:
     transaction, claim = _durable_transaction(tmp_path)
     journal = ComposerAuthoringTransactionJournal(tmp_path)
-    journal.record(transaction, "outcome_json", {"kind": "mapping", "body": {}})
+    journal.record_effect_outcome(
+        transaction,
+        post_image={"draft_id": "draft.1", "revision": 3},
+        outcome={
+            "kind": "mapping",
+            "settlement_kind": "owner_commit",
+            "body": {},
+        },
+    )
     journal.record(transaction, "release_intent_json", {"settlement_kind": "owner_commit"})
     receipt = _startup_receipt(
         status="released_exact",
         claim=claim,
         matched_release={"settlement_kind": "different"},
     )
-    coordinator = AuthoringAdmissionCoordinator(_RecoveryHeadless(receipt), tmp_path)
+    coordinator = AuthoringAdmissionCoordinator(
+        _RecoveryHeadless(receipt),
+        tmp_path,
+        restore_post_image=lambda _image: None,
+    )
     coordinator.recover()
     assert not coordinator.mutation_ready
 
@@ -407,14 +750,26 @@ def test_successor_rejects_mismatched_release_receipt(tmp_path) -> None:
 def test_successor_retires_unresolved_release_from_exact_reconciliation(tmp_path) -> None:
     transaction, claim = _durable_transaction(tmp_path)
     journal = ComposerAuthoringTransactionJournal(tmp_path)
-    journal.record(transaction, "outcome_json", {"kind": "mapping", "body": {}})
+    journal.record_effect_outcome(
+        transaction,
+        post_image={"draft_id": "draft.1", "revision": 3},
+        outcome={
+            "kind": "mapping",
+            "settlement_kind": "owner_commit",
+            "body": {},
+        },
+    )
     journal.record(transaction, "release_intent_json", {"settlement_kind": "owner_commit"})
     receipt = _startup_receipt(
         status="reconciled_exact",
         claim=claim,
         matched_reconcile_settlement={"predecessor_claim": claim},
     )
-    coordinator = AuthoringAdmissionCoordinator(_RecoveryHeadless(receipt), tmp_path)
+    coordinator = AuthoringAdmissionCoordinator(
+        _RecoveryHeadless(receipt),
+        tmp_path,
+        restore_post_image=lambda _image: None,
+    )
     coordinator.recover()
     assert coordinator.mutation_ready
     assert coordinator._journal.unresolved() == []
@@ -425,7 +780,15 @@ def test_successor_rejects_mismatched_reconciliation_predecessor_claim(
 ) -> None:
     transaction, claim = _durable_transaction(tmp_path)
     journal = ComposerAuthoringTransactionJournal(tmp_path)
-    journal.record(transaction, "outcome_json", {"kind": "mapping", "body": {}})
+    journal.record_effect_outcome(
+        transaction,
+        post_image={"draft_id": "draft.1", "revision": 3},
+        outcome={
+            "kind": "mapping",
+            "settlement_kind": "owner_commit",
+            "body": {},
+        },
+    )
     journal.record(transaction, "release_intent_json", {"settlement_kind": "owner_commit"})
     receipt = _startup_receipt(
         status="reconciled_exact",
@@ -434,6 +797,10 @@ def test_successor_rejects_mismatched_reconciliation_predecessor_claim(
             "predecessor_claim": {**claim, "claim_generation": 99}
         },
     )
-    coordinator = AuthoringAdmissionCoordinator(_RecoveryHeadless(receipt), tmp_path)
+    coordinator = AuthoringAdmissionCoordinator(
+        _RecoveryHeadless(receipt),
+        tmp_path,
+        restore_post_image=lambda _image: None,
+    )
     coordinator.recover()
     assert not coordinator.mutation_ready

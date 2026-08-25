@@ -3,11 +3,15 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
-from contextlib import contextmanager
+from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass
 import json
+import os
 from pathlib import Path
 import sqlite3
+import stat
+import tempfile
+import unicodedata
 from threading import RLock
 from typing import Any, Final, Iterator
 
@@ -15,6 +19,110 @@ from .liveness import RetainedLiveness
 
 
 SCHEMA_VERSION: Final = 2
+_REQUIRED_TABLE_SHAPES: Final[
+    dict[str, tuple[tuple[str, str, int, int], ...]]
+] = {
+    "program_cycle_metadata": (
+        ("singleton", "INTEGER", 0, 1),
+        ("schema_version", "INTEGER", 1, 0),
+    ),
+    "program_cycle": (
+        ("singleton", "INTEGER", 0, 1),
+        ("cycle_generation", "INTEGER", 1, 0),
+        ("state", "TEXT", 1, 0),
+        ("owner_epoch", "TEXT", 1, 0),
+        ("program_run_id", "TEXT", 0, 0),
+        ("claim_json", "TEXT", 0, 0),
+        ("capture_identities_json", "TEXT", 0, 0),
+        ("terminal_reference", "TEXT", 0, 0),
+        ("release_intent_json", "TEXT", 0, 0),
+        ("reset_result_json", "TEXT", 0, 0),
+        ("reconciliation_required", "INTEGER", 1, 0),
+        ("acquisition_pending_json", "TEXT", 0, 0),
+        ("reconciliation_evidence_digest", "TEXT", 0, 0),
+    ),
+    "program_cycle_requests": (
+        ("request_owner_epoch", "TEXT", 1, 1),
+        ("request_id", "TEXT", 1, 2),
+        ("request_kind", "TEXT", 1, 0),
+        ("intent_json", "TEXT", 1, 0),
+        ("cycle_generation", "INTEGER", 1, 0),
+        ("result_json", "TEXT", 0, 0),
+        ("error_json", "TEXT", 0, 0),
+    ),
+    "program_runner_liveness": (
+        ("singleton", "INTEGER", 0, 1),
+        ("manager_runtime_epoch", "TEXT", 0, 0),
+        ("manager_owner_epoch", "TEXT", 0, 0),
+        ("predecessor_expired", "INTEGER", 1, 0),
+        ("fault_reference", "TEXT", 0, 0),
+    ),
+    "program_run_history": (
+        ("program_run_id", "TEXT", 0, 1),
+        ("run_revision", "INTEGER", 1, 0),
+        ("snapshot_json", "TEXT", 1, 0),
+        ("terminal", "INTEGER", 1, 0),
+    ),
+}
+_REQUIRED_TABLE_SQL: Final[dict[str, str]] = {
+    "program_cycle_metadata": f"""
+        CREATE TABLE program_cycle_metadata (
+          singleton INTEGER PRIMARY KEY CHECK(singleton=1),
+          schema_version INTEGER NOT NULL CHECK(schema_version={SCHEMA_VERSION})
+        )
+    """,
+    "program_cycle": """
+        CREATE TABLE program_cycle (
+          singleton INTEGER PRIMARY KEY CHECK(singleton=1),
+          cycle_generation INTEGER NOT NULL CHECK(cycle_generation>0),
+          state TEXT NOT NULL,
+          owner_epoch TEXT NOT NULL,
+          program_run_id TEXT,
+          claim_json TEXT,
+          capture_identities_json TEXT,
+          terminal_reference TEXT,
+          release_intent_json TEXT,
+          reset_result_json TEXT,
+          reconciliation_required INTEGER NOT NULL
+            CHECK(reconciliation_required IN (0,1)),
+          acquisition_pending_json TEXT,
+          reconciliation_evidence_digest TEXT
+        )
+    """,
+    "program_cycle_requests": """
+        CREATE TABLE program_cycle_requests (
+          request_owner_epoch TEXT NOT NULL,
+          request_id TEXT NOT NULL,
+          request_kind TEXT NOT NULL,
+          intent_json TEXT NOT NULL,
+          cycle_generation INTEGER NOT NULL,
+          result_json TEXT,
+          error_json TEXT,
+          PRIMARY KEY(request_owner_epoch, request_id)
+        )
+    """,
+    "program_runner_liveness": """
+        CREATE TABLE program_runner_liveness (
+          singleton INTEGER PRIMARY KEY CHECK(singleton=1),
+          manager_runtime_epoch TEXT,
+          manager_owner_epoch TEXT,
+          predecessor_expired INTEGER NOT NULL
+            CHECK(predecessor_expired IN (0,1)),
+          fault_reference TEXT
+        )
+    """,
+    "program_run_history": """
+        CREATE TABLE program_run_history (
+          program_run_id TEXT PRIMARY KEY,
+          run_revision INTEGER NOT NULL CHECK(run_revision>0),
+          snapshot_json TEXT NOT NULL,
+          terminal INTEGER NOT NULL CHECK(terminal IN (0,1))
+        )
+    """,
+}
+_SCHEMA_SQL: Final = ";\n".join(
+    statement.strip() for statement in _REQUIRED_TABLE_SQL.values()
+) + ";"
 STATES: Final = frozenset(
     {
         "idle_after_reset",
@@ -24,6 +132,55 @@ STATES: Final = frozenset(
         "terminal_awaiting_reset",
     }
 )
+_REQUEST_KINDS: Final = frozenset({"start", "reset"})
+_TERMINAL_RUN_STATES: Final = frozenset({"stopped", "succeeded", "failed"})
+
+
+def _normalized_sql(value: str) -> str:
+    return " ".join(value.split())
+
+
+def _bounded_identity(value: object) -> bool:
+    return (
+        isinstance(value, str)
+        and bool(value)
+        and unicodedata.normalize("NFC", value) == value
+        and len(value.encode("utf-8")) <= 256
+    )
+
+
+def _strict_object(value: str | None, *, required: bool = False) -> dict[str, Any] | None:
+    if value is None:
+        if required:
+            raise RuntimeError("Program-cycle journal JSON value is absent")
+        return None
+
+    def reject_constant(constant: str) -> None:
+        raise ValueError(f"non-finite JSON value {constant}")
+
+    def object_without_duplicates(
+        pairs: list[tuple[str, Any]],
+    ) -> dict[str, Any]:
+        result: dict[str, Any] = {}
+        for key, item in pairs:
+            if key in result:
+                raise ValueError(f"duplicate JSON key {key}")
+            result[key] = item
+        return result
+
+    try:
+        decoded = json.loads(
+            value,
+            parse_constant=reject_constant,
+            object_pairs_hook=object_without_duplicates,
+        )
+    except (TypeError, ValueError) as error:
+        raise RuntimeError(
+            f"Program-cycle journal contains invalid JSON: {error}"
+        ) from error
+    if not isinstance(decoded, dict):
+        raise RuntimeError("Program-cycle journal JSON value is not an object")
+    return decoded
 
 
 @dataclass(frozen=True, slots=True)
@@ -52,6 +209,532 @@ class RequestRecord:
 class ProgramCycleJournal:
     """One-row cycle state plus immutable, durable request replay."""
 
+    @staticmethod
+    @contextmanager
+    def _trusted_parent(path: Path) -> Iterator[int]:
+        """Pin one pre-existing owner-held directory without repairing it."""
+
+        parent = path.parent
+        try:
+            if parent.resolve(strict=True) != parent:
+                raise RuntimeError(
+                    "Program-cycle journal parent must be one canonical directory"
+                )
+            before = parent.lstat()
+        except (OSError, RuntimeError) as error:
+            raise RuntimeError(
+                f"Program-cycle journal parent cannot be inspected: {error}"
+            ) from error
+        required_owner_access = stat.S_IRUSR | stat.S_IWUSR | stat.S_IXUSR
+        if (
+            not stat.S_ISDIR(before.st_mode)
+            or before.st_uid != os.geteuid()
+            or before.st_mode & (stat.S_IWGRP | stat.S_IWOTH)
+            or before.st_mode & required_owner_access != required_owner_access
+        ):
+            raise RuntimeError(
+                "Program-cycle journal parent is not one safe owner-held directory"
+            )
+        try:
+            descriptor = os.open(
+                parent,
+                os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW,
+            )
+        except OSError as error:
+            raise RuntimeError(
+                f"Program-cycle journal parent cannot be opened: {error}"
+            ) from error
+        try:
+            opened = os.fstat(descriptor)
+            if (
+                (opened.st_dev, opened.st_ino) != (before.st_dev, before.st_ino)
+                or not stat.S_ISDIR(opened.st_mode)
+                or opened.st_uid != os.geteuid()
+                or opened.st_mode & (stat.S_IWGRP | stat.S_IWOTH)
+                or opened.st_mode & required_owner_access
+                != required_owner_access
+            ):
+                raise RuntimeError(
+                    "Program-cycle journal parent changed while opening"
+                )
+            yield descriptor
+            after = parent.lstat()
+            if (
+                (after.st_dev, after.st_ino) != (before.st_dev, before.st_ino)
+                or not stat.S_ISDIR(after.st_mode)
+                or after.st_uid != os.geteuid()
+                or after.st_mode & (stat.S_IWGRP | stat.S_IWOTH)
+                or after.st_mode & required_owner_access
+                != required_owner_access
+            ):
+                raise RuntimeError(
+                    "Program-cycle journal parent changed during open"
+                )
+        except OSError as error:
+            raise RuntimeError(
+                f"Program-cycle journal parent changed during open: {error}"
+            ) from error
+        finally:
+            os.close(descriptor)
+
+    @staticmethod
+    def _sidecar_metadata(
+        parent_descriptor: int,
+        name: str,
+        *,
+        label: str,
+    ) -> os.stat_result | None:
+        try:
+            metadata = os.stat(
+                name,
+                dir_fd=parent_descriptor,
+                follow_symlinks=False,
+            )
+        except FileNotFoundError:
+            return None
+        except OSError as error:
+            raise RuntimeError(
+                f"Program-cycle journal {label} cannot be inspected: {error}"
+            ) from error
+        if (
+            not stat.S_ISREG(metadata.st_mode)
+            or metadata.st_uid != os.geteuid()
+            or metadata.st_nlink != 1
+            or metadata.st_mode & (stat.S_IWGRP | stat.S_IWOTH)
+            or metadata.st_mode & (stat.S_IRUSR | stat.S_IWUSR)
+            != (stat.S_IRUSR | stat.S_IWUSR)
+        ):
+            raise RuntimeError(
+                f"Program-cycle journal {label} is not one safe owner-held file"
+            )
+        return metadata
+
+    @staticmethod
+    def _copy_open_file(source: int, destination: Path) -> None:
+        destination_descriptor = os.open(
+            destination,
+            os.O_WRONLY
+            | os.O_CREAT
+            | os.O_EXCL
+            | os.O_CLOEXEC
+            | os.O_NOFOLLOW,
+            0o600,
+        )
+        try:
+            os.lseek(source, 0, os.SEEK_SET)
+            while True:
+                chunk = os.read(source, 1024 * 1024)
+                if not chunk:
+                    break
+                remaining = memoryview(chunk)
+                while remaining:
+                    written = os.write(destination_descriptor, remaining)
+                    if written <= 0:
+                        raise RuntimeError(
+                            "Program-cycle journal snapshot write stalled"
+                        )
+                    remaining = remaining[written:]
+        finally:
+            os.close(destination_descriptor)
+
+    @staticmethod
+    @contextmanager
+    def _read_only_snapshot(
+        path: Path,
+        *,
+        parent_descriptor: int,
+        main_metadata: os.stat_result,
+    ) -> Iterator[str]:
+        """Expose the logical database without mutating its live files."""
+
+        rollback_name = f"{path.name}-journal"
+        try:
+            os.stat(
+                rollback_name,
+                dir_fd=parent_descriptor,
+                follow_symlinks=False,
+            )
+        except FileNotFoundError:
+            pass
+        except OSError as error:
+            raise RuntimeError(
+                "Program-cycle rollback journal cannot be inspected: "
+                f"{error}"
+            ) from error
+        else:
+            raise RuntimeError(
+                "Program-cycle journal has an unsupported rollback sidecar"
+            )
+
+        wal_name = f"{path.name}-wal"
+        shm_name = f"{path.name}-shm"
+        wal_metadata = ProgramCycleJournal._sidecar_metadata(
+            parent_descriptor,
+            wal_name,
+            label="WAL sidecar",
+        )
+        shm_metadata = ProgramCycleJournal._sidecar_metadata(
+            parent_descriptor,
+            shm_name,
+            label="shared-memory sidecar",
+        )
+        if wal_metadata is None and shm_metadata is not None:
+            raise RuntimeError(
+                "Program-cycle journal has shared memory without a WAL"
+            )
+
+        main_descriptor = -1
+        wal_descriptor = -1
+        try:
+            main_descriptor = os.open(
+                path.name,
+                os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW,
+                dir_fd=parent_descriptor,
+            )
+            opened_main = os.fstat(main_descriptor)
+            if (
+                (opened_main.st_dev, opened_main.st_ino)
+                != (main_metadata.st_dev, main_metadata.st_ino)
+                or (opened_main.st_size, opened_main.st_mtime_ns)
+                != (main_metadata.st_size, main_metadata.st_mtime_ns)
+            ):
+                raise RuntimeError(
+                    "Program-cycle journal changed before snapshot"
+                )
+            opened_wal: os.stat_result | None = None
+            if wal_metadata is not None:
+                wal_descriptor = os.open(
+                    wal_name,
+                    os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW,
+                    dir_fd=parent_descriptor,
+                )
+                opened_wal = os.fstat(wal_descriptor)
+                if (
+                    (opened_wal.st_dev, opened_wal.st_ino)
+                    != (wal_metadata.st_dev, wal_metadata.st_ino)
+                    or (opened_wal.st_size, opened_wal.st_mtime_ns)
+                    != (wal_metadata.st_size, wal_metadata.st_mtime_ns)
+                ):
+                    raise RuntimeError(
+                        "Program-cycle journal WAL changed before snapshot"
+                    )
+            with tempfile.TemporaryDirectory(
+                prefix="manyforge-cycle-preflight-"
+            ) as temporary_root:
+                snapshot = Path(temporary_root) / path.name
+                ProgramCycleJournal._copy_open_file(main_descriptor, snapshot)
+                if wal_descriptor >= 0:
+                    ProgramCycleJournal._copy_open_file(
+                        wal_descriptor,
+                        Path(f"{snapshot}-wal"),
+                    )
+                after_main = os.fstat(main_descriptor)
+                after_wal = (
+                    os.fstat(wal_descriptor) if wal_descriptor >= 0 else None
+                )
+                current_main = ProgramCycleJournal._sidecar_metadata(
+                    parent_descriptor,
+                    path.name,
+                    label="database",
+                )
+                current_wal = ProgramCycleJournal._sidecar_metadata(
+                    parent_descriptor,
+                    wal_name,
+                    label="WAL sidecar",
+                )
+                current_shm = ProgramCycleJournal._sidecar_metadata(
+                    parent_descriptor,
+                    shm_name,
+                    label="shared-memory sidecar",
+                )
+                try:
+                    os.stat(
+                        rollback_name,
+                        dir_fd=parent_descriptor,
+                        follow_symlinks=False,
+                    )
+                except FileNotFoundError:
+                    rollback_appeared = False
+                except OSError as error:
+                    raise RuntimeError(
+                        "Program-cycle rollback journal changed during snapshot: "
+                        f"{error}"
+                    ) from error
+                else:
+                    rollback_appeared = True
+                if (
+                    rollback_appeared
+                    or current_main is None
+                    or (after_main.st_dev, after_main.st_ino, after_main.st_size,
+                        after_main.st_mtime_ns)
+                    != (main_metadata.st_dev, main_metadata.st_ino,
+                        main_metadata.st_size, main_metadata.st_mtime_ns)
+                    or (current_main.st_dev, current_main.st_ino,
+                        current_main.st_size, current_main.st_mtime_ns)
+                    != (main_metadata.st_dev, main_metadata.st_ino,
+                        main_metadata.st_size, main_metadata.st_mtime_ns)
+                    or ((current_wal is None) != (wal_metadata is None))
+                    or (
+                        current_wal is not None
+                        and wal_metadata is not None
+                        and after_wal is not None
+                        and (
+                            (after_wal.st_dev, after_wal.st_ino,
+                             after_wal.st_size, after_wal.st_mtime_ns)
+                            != (wal_metadata.st_dev, wal_metadata.st_ino,
+                                wal_metadata.st_size, wal_metadata.st_mtime_ns)
+                            or (current_wal.st_dev, current_wal.st_ino,
+                                current_wal.st_size, current_wal.st_mtime_ns)
+                            != (wal_metadata.st_dev, wal_metadata.st_ino,
+                                wal_metadata.st_size, wal_metadata.st_mtime_ns)
+                        )
+                    )
+                    or (
+                        (current_shm is None) != (shm_metadata is None)
+                        or (
+                            current_shm is not None
+                            and shm_metadata is not None
+                            and (current_shm.st_dev, current_shm.st_ino)
+                            != (shm_metadata.st_dev, shm_metadata.st_ino)
+                        )
+                    )
+                ):
+                    raise RuntimeError(
+                        "Program-cycle journal changed while snapshotting"
+                    )
+                suffix = "?mode=ro" if wal_metadata is not None else "?mode=ro&immutable=1"
+                yield f"{snapshot.as_uri()}{suffix}"
+        except OSError as error:
+            raise RuntimeError(
+                f"Program-cycle journal cannot be snapshotted: {error}"
+            ) from error
+        finally:
+            if wal_descriptor >= 0:
+                os.close(wal_descriptor)
+            if main_descriptor >= 0:
+                os.close(main_descriptor)
+
+    @staticmethod
+    def _preflight_existing(
+        path: Path,
+        *,
+        parent_descriptor: int,
+    ) -> tuple[int, int]:
+        """Validate existing durable state through a strictly read-only handle."""
+
+        try:
+            metadata = os.stat(
+                path.name,
+                dir_fd=parent_descriptor,
+                follow_symlinks=False,
+            )
+        except OSError as error:
+            raise RuntimeError(
+                f"Program-cycle journal cannot be inspected: {error}"
+            ) from error
+        if (
+            not stat.S_ISREG(metadata.st_mode)
+            or metadata.st_uid != os.geteuid()
+            or metadata.st_nlink != 1
+            or metadata.st_mode & (stat.S_IWGRP | stat.S_IWOTH)
+            or metadata.st_mode & (stat.S_IRUSR | stat.S_IWUSR)
+            != (stat.S_IRUSR | stat.S_IWUSR)
+        ):
+            raise RuntimeError(
+                "Program-cycle journal is not one safe owner-held regular file"
+            )
+        database: sqlite3.Connection | None = None
+        snapshot_stack = ExitStack()
+        try:
+            snapshot_uri = snapshot_stack.enter_context(
+                ProgramCycleJournal._read_only_snapshot(
+                    path,
+                    parent_descriptor=parent_descriptor,
+                    main_metadata=metadata,
+                )
+            )
+            try:
+                database = sqlite3.connect(
+                    snapshot_uri,
+                    uri=True,
+                    timeout=10.0,
+                    isolation_level=None,
+                    check_same_thread=False,
+                )
+            except (OSError, sqlite3.Error, ValueError) as error:
+                raise RuntimeError(
+                    "Program-cycle journal cannot be opened read-only: "
+                    f"{error}"
+                ) from error
+            database.execute("PRAGMA query_only=ON")
+            check = database.execute("PRAGMA quick_check").fetchall()
+            if check != [("ok",)]:
+                raise RuntimeError("Program-cycle journal integrity check failed")
+            tables = {
+                row[0]
+                for row in database.execute(
+                    "SELECT name FROM sqlite_schema WHERE type='table'"
+                )
+            }
+            expected_tables = set(_REQUIRED_TABLE_SHAPES)
+            if tables != expected_tables:
+                raise RuntimeError(
+                    "Program-cycle journal schema has unsupported tables"
+                )
+            schema_rows = {
+                row[0]: row[1]
+                for row in database.execute(
+                    "SELECT name,sql FROM sqlite_schema WHERE type='table'"
+                )
+            }
+            for table, expected_shape in _REQUIRED_TABLE_SHAPES.items():
+                rows = database.execute(f"PRAGMA table_info({table})").fetchall()
+                shape = tuple(
+                    (row[1], str(row[2]).upper(), row[3], row[5])
+                    for row in rows
+                )
+                schema_sql = schema_rows.get(table)
+                if (
+                    shape != expected_shape
+                    or any(row[4] is not None for row in rows)
+                    or not isinstance(schema_sql, str)
+                    or _normalized_sql(schema_sql)
+                    != _normalized_sql(_REQUIRED_TABLE_SQL[table])
+                ):
+                    raise RuntimeError(
+                        f"Program-cycle journal table {table} has unsupported shape"
+                    )
+            unsupported_objects = database.execute(
+                "SELECT type,name FROM sqlite_schema "
+                "WHERE type IN ('view','trigger') "
+                "OR (type='index' AND sql IS NOT NULL)"
+            ).fetchall()
+            if unsupported_objects:
+                raise RuntimeError(
+                    "Program-cycle journal schema has unsupported objects"
+                )
+            metadata_rows = database.execute(
+                "SELECT singleton,schema_version FROM program_cycle_metadata"
+            ).fetchall()
+            if metadata_rows != [(1, SCHEMA_VERSION)]:
+                raise RuntimeError("Program-cycle journal schema is unsupported")
+            cycle_rows = database.execute("SELECT * FROM program_cycle").fetchall()
+            if (
+                len(cycle_rows) != 1
+                or cycle_rows[0][0] != 1
+                or type(cycle_rows[0][1]) is not int
+                or cycle_rows[0][1] < 1
+                or cycle_rows[0][2] not in STATES
+                or not _bounded_identity(cycle_rows[0][3])
+                or (
+                    cycle_rows[0][4] is not None
+                    and not _bounded_identity(cycle_rows[0][4])
+                )
+                or type(cycle_rows[0][10]) is not int
+                or cycle_rows[0][10] not in {0, 1}
+                or any(
+                    value is not None and not isinstance(value, str)
+                    for value in (cycle_rows[0][7], cycle_rows[0][12])
+                )
+            ):
+                raise RuntimeError("Program-cycle journal owner row is corrupt")
+            for index in (5, 6, 8, 9, 11):
+                _strict_object(cycle_rows[0][index])
+
+            request_count = 0
+            for request in database.execute(
+                "SELECT request_owner_epoch,request_id,request_kind,intent_json,"
+                "cycle_generation,result_json,error_json "
+                "FROM program_cycle_requests"
+            ):
+                request_count += 1
+                if (
+                    request_count > 4_096
+                    or not _bounded_identity(request[0])
+                    or not _bounded_identity(request[1])
+                    or request[2] not in _REQUEST_KINDS
+                    or type(request[4]) is not int
+                    or request[4] < 1
+                    or (request[5] is not None and request[6] is not None)
+                ):
+                    raise RuntimeError(
+                        "Program-cycle request ledger is corrupt"
+                    )
+                _strict_object(request[3], required=True)
+                _strict_object(request[5])
+                _strict_object(request[6])
+
+            liveness_rows = database.execute(
+                "SELECT singleton,manager_runtime_epoch,manager_owner_epoch,"
+                "predecessor_expired,fault_reference "
+                "FROM program_runner_liveness"
+            ).fetchall()
+            if (
+                len(liveness_rows) != 1
+                or liveness_rows[0][0] != 1
+                or any(
+                    value is not None and not _bounded_identity(value)
+                    for value in liveness_rows[0][1:3]
+                )
+                or type(liveness_rows[0][3]) is not int
+                or liveness_rows[0][3] not in {0, 1}
+                or (
+                    liveness_rows[0][4] is not None
+                    and not isinstance(liveness_rows[0][4], str)
+                )
+            ):
+                raise RuntimeError("Program-cycle liveness row is corrupt")
+
+            history_count = 0
+            for history in database.execute(
+                "SELECT program_run_id,run_revision,snapshot_json,terminal "
+                "FROM program_run_history"
+            ):
+                history_count += 1
+                snapshot = _strict_object(history[2], required=True)
+                capture = snapshot.get("capture") if snapshot is not None else None
+                if (
+                    history_count > 4_096
+                    or not _bounded_identity(history[0])
+                    or type(history[1]) is not int
+                    or history[1] < 1
+                    or type(history[3]) is not int
+                    or history[3] not in {0, 1}
+                    or not isinstance(capture, dict)
+                    or capture.get("program_run_id") != history[0]
+                    or snapshot.get("run_revision") != history[1]
+                    or (snapshot.get("state") in _TERMINAL_RUN_STATES)
+                    != bool(history[3])
+                ):
+                    raise RuntimeError("Program-run history row is corrupt")
+            after = os.stat(
+                path.name,
+                dir_fd=parent_descriptor,
+                follow_symlinks=False,
+            )
+            if (
+                (after.st_dev, after.st_ino)
+                != (metadata.st_dev, metadata.st_ino)
+                or not stat.S_ISREG(after.st_mode)
+                or after.st_uid != os.geteuid()
+                or after.st_nlink != 1
+                or after.st_mode & (stat.S_IWGRP | stat.S_IWOTH)
+                or after.st_mode & (stat.S_IRUSR | stat.S_IWUSR)
+                != (stat.S_IRUSR | stat.S_IWUSR)
+            ):
+                raise RuntimeError(
+                    "Program-cycle journal changed during read-only preflight"
+                )
+        except sqlite3.Error as error:
+            raise RuntimeError(
+                f"Program-cycle journal read-only preflight failed: {error}"
+            ) from error
+        finally:
+            if database is not None:
+                database.close()
+            snapshot_stack.close()
+        return metadata.st_dev, metadata.st_ino
+
     def __init__(
         self,
         path: Path,
@@ -66,124 +749,285 @@ class ProgramCycleJournal:
         if not 1 <= maximum_retained_runs <= 4_096:
             raise ValueError("maximum_retained_runs must be in [1, 4096]")
         self._maximum_retained_runs = maximum_retained_runs
+        if (
+            not owner_epoch
+            or unicodedata.normalize("NFC", owner_epoch) != owner_epoch
+            or len(owner_epoch.encode("utf-8")) > 256
+        ):
+            raise ValueError("owner_epoch must be bounded non-empty NFC text")
         self._lock = RLock()
-        path.parent.mkdir(parents=True, exist_ok=True)
-        self._database = sqlite3.connect(
-            path, timeout=10.0, isolation_level=None, check_same_thread=False
-        )
-        self._database.execute("PRAGMA foreign_keys=ON")
-        self._database.execute("PRAGMA journal_mode=WAL")
-        self._database.execute("PRAGMA synchronous=FULL")
-        self._database.executescript(
-            """
-            CREATE TABLE IF NOT EXISTS program_cycle_metadata (
-              singleton INTEGER PRIMARY KEY CHECK(singleton=1),
-              schema_version INTEGER NOT NULL CHECK(schema_version=2)
-            );
-            CREATE TABLE IF NOT EXISTS program_cycle (
-              singleton INTEGER PRIMARY KEY CHECK(singleton=1),
-              cycle_generation INTEGER NOT NULL CHECK(cycle_generation>0),
-              state TEXT NOT NULL,
-              owner_epoch TEXT NOT NULL,
-              program_run_id TEXT,
-              claim_json TEXT,
-              capture_identities_json TEXT,
-              terminal_reference TEXT,
-              release_intent_json TEXT,
-              reset_result_json TEXT,
-              reconciliation_required INTEGER NOT NULL
-                CHECK(reconciliation_required IN (0,1)),
-              acquisition_pending_json TEXT,
-              reconciliation_evidence_digest TEXT
-            );
-            CREATE TABLE IF NOT EXISTS program_cycle_requests (
-              request_owner_epoch TEXT NOT NULL,
-              request_id TEXT NOT NULL,
-              request_kind TEXT NOT NULL,
-              intent_json TEXT NOT NULL,
-              cycle_generation INTEGER NOT NULL,
-              result_json TEXT,
-              error_json TEXT,
-              PRIMARY KEY(request_owner_epoch, request_id)
-            );
-            CREATE TABLE IF NOT EXISTS program_runner_liveness (
-              singleton INTEGER PRIMARY KEY CHECK(singleton=1),
-              manager_runtime_epoch TEXT,
-              manager_owner_epoch TEXT,
-              predecessor_expired INTEGER NOT NULL
-                CHECK(predecessor_expired IN (0,1)),
-              fault_reference TEXT
-            );
-            INSERT OR IGNORE INTO program_runner_liveness
-            VALUES(1,NULL,NULL,0,NULL);
-            CREATE TABLE IF NOT EXISTS program_run_history (
-              program_run_id TEXT PRIMARY KEY,
-              run_revision INTEGER NOT NULL CHECK(run_revision>0),
-              snapshot_json TEXT NOT NULL,
-              terminal INTEGER NOT NULL CHECK(terminal IN (0,1))
-            );
-            """
-        )
-        columns = {
-            row[1]
-            for row in self._database.execute(
-                "PRAGMA table_info(program_cycle_requests)"
-            )
-        }
-        if "error_json" not in columns:
-            self._database.execute(
-                "ALTER TABLE program_cycle_requests ADD COLUMN error_json TEXT"
-            )
-        cycle_columns = {
-            row[1]
-            for row in self._database.execute("PRAGMA table_info(program_cycle)")
-        }
-        if "release_intent_json" not in cycle_columns:
-            self._database.execute(
-                "ALTER TABLE program_cycle ADD COLUMN release_intent_json TEXT"
-            )
-        with self._transaction():
-            self._database.execute(
-                "INSERT OR IGNORE INTO program_cycle_metadata VALUES(1,?)",
-                (SCHEMA_VERSION,),
-            )
-            metadata = self._database.execute(
-                "SELECT schema_version FROM program_cycle_metadata WHERE singleton=1"
-            ).fetchone()
-            if metadata != (SCHEMA_VERSION,):
-                raise RuntimeError("Program-cycle journal schema is unsupported")
-            created = self._database.execute(
-                """
-                INSERT OR IGNORE INTO program_cycle
-                (singleton,cycle_generation,state,owner_epoch,program_run_id,
-                 claim_json,capture_identities_json,terminal_reference,
-                 reset_result_json,reconciliation_required,
-                 acquisition_pending_json,reconciliation_evidence_digest,
-                 release_intent_json)
-                VALUES(1,1,'idle_after_reset',?,NULL,NULL,NULL,NULL,NULL,0,NULL,NULL,NULL)
-                """,
-                (owner_epoch,),
-            ).rowcount == 1
-            row = self.read()
-            if not created and (
-                row.state != "idle_after_reset"
-                or row.claim is not None
-                or row.acquisition_pending is not None
-            ):
-                self._database.execute(
-                    """
-                    UPDATE program_cycle SET reconciliation_required=1
-                    WHERE singleton=1
-                    """
-                )
+        path = Path(path)
+        if not path.is_absolute() or path.name in {"", ".", ".."}:
+            raise ValueError("Program-cycle journal path must be an absolute file")
+        database: sqlite3.Connection | None = None
+        parent_capability = -1
+        parent_identity: tuple[int, int] | None = None
+        try:
+            with self._trusted_parent(path) as parent_descriptor:
+                parent_metadata = os.fstat(parent_descriptor)
+                parent_identity = (parent_metadata.st_dev, parent_metadata.st_ino)
+                try:
+                    os.stat(
+                        path.name,
+                        dir_fd=parent_descriptor,
+                        follow_symlinks=False,
+                    )
+                    exists = True
+                except FileNotFoundError:
+                    exists = False
+                except OSError as error:
+                    raise RuntimeError(
+                        f"Program-cycle journal cannot be inspected: {error}"
+                    ) from error
+                new_database = not exists
+                expected_identity: tuple[int, int]
+                if exists:
+                    expected_identity = self._preflight_existing(
+                        path,
+                        parent_descriptor=parent_descriptor,
+                    )
+                else:
+                    orphaned_sidecars: list[str] = []
+                    for suffix in ("-journal", "-wal", "-shm"):
+                        sidecar_name = f"{path.name}{suffix}"
+                        try:
+                            os.stat(
+                                sidecar_name,
+                                dir_fd=parent_descriptor,
+                                follow_symlinks=False,
+                            )
+                        except FileNotFoundError:
+                            continue
+                        except OSError as error:
+                            raise RuntimeError(
+                                "Program-cycle journal absence cannot be "
+                                f"verified: {error}"
+                            ) from error
+                        orphaned_sidecars.append(sidecar_name)
+                    if orphaned_sidecars:
+                        raise RuntimeError(
+                            "Program-cycle journal main database is absent but "
+                            "orphan sidecars remain: "
+                            + ", ".join(orphaned_sidecars)
+                        )
+                    try:
+                        descriptor = os.open(
+                            path.name,
+                            os.O_RDWR
+                            | os.O_CREAT
+                            | os.O_EXCL
+                            | os.O_CLOEXEC
+                            | os.O_NOFOLLOW,
+                            0o600,
+                            dir_fd=parent_descriptor,
+                        )
+                    except OSError as error:
+                        raise RuntimeError(
+                            f"Program-cycle journal cannot be reserved: {error}"
+                        ) from error
+                    try:
+                        os.fchmod(descriptor, 0o600)
+                        os.fsync(descriptor)
+                        reserved = os.fstat(descriptor)
+                        expected_identity = (reserved.st_dev, reserved.st_ino)
+                    finally:
+                        os.close(descriptor)
+                    os.fsync(parent_descriptor)
+                try:
+                    current = os.stat(
+                        path.name,
+                        dir_fd=parent_descriptor,
+                        follow_symlinks=False,
+                    )
+                except OSError as error:
+                    raise RuntimeError(
+                        f"Program-cycle journal changed after preflight: {error}"
+                    ) from error
+                if (
+                    (current.st_dev, current.st_ino) != expected_identity
+                    or not stat.S_ISREG(current.st_mode)
+                    or current.st_uid != os.geteuid()
+                    or current.st_nlink != 1
+                    or current.st_mode & (stat.S_IWGRP | stat.S_IWOTH)
+                    or current.st_mode & (stat.S_IRUSR | stat.S_IWUSR)
+                    != (stat.S_IRUSR | stat.S_IWUSR)
+                ):
+                    raise RuntimeError(
+                        "Program-cycle journal changed after preflight"
+                    )
+                try:
+                    parent_capability = os.dup(parent_descriptor)
+                    descriptor_path = (
+                        Path("/proc/self/fd") / str(parent_capability) / path.name
+                    )
+                    database = sqlite3.connect(
+                        f"{descriptor_path.as_uri()}?mode=rw",
+                        uri=True,
+                        timeout=10.0,
+                        isolation_level=None,
+                        check_same_thread=False,
+                    )
+                except (OSError, sqlite3.Error, ValueError) as error:
+                    raise RuntimeError(
+                        f"Program-cycle journal cannot be opened: {error}"
+                    ) from error
+                try:
+                    current = os.stat(
+                        path.name,
+                        dir_fd=parent_descriptor,
+                        follow_symlinks=False,
+                    )
+                except OSError as error:
+                    raise RuntimeError(
+                        "Program-cycle journal changed while opening for use: "
+                        f"{error}"
+                    ) from error
+                if (
+                    (current.st_dev, current.st_ino) != expected_identity
+                    or not stat.S_ISREG(current.st_mode)
+                    or current.st_uid != os.geteuid()
+                    or current.st_nlink != 1
+                    or current.st_mode & (stat.S_IWGRP | stat.S_IWOTH)
+                    or current.st_mode & (stat.S_IRUSR | stat.S_IWUSR)
+                    != (stat.S_IRUSR | stat.S_IWUSR)
+                ):
+                    raise RuntimeError(
+                        "Program-cycle journal changed while opening for use"
+                    )
+        except BaseException:
+            if database is not None:
+                database.close()
+            if parent_capability >= 0:
+                os.close(parent_capability)
+            raise
+        if database is None or parent_capability < 0 or parent_identity is None:
+            raise RuntimeError("Program-cycle journal did not open")
+        self._path = path
+        self._parent_descriptor = parent_capability
+        self._parent_identity = parent_identity
+        self._database_identity = expected_identity
+        self._database = database
+        try:
+            self._database.execute("PRAGMA foreign_keys=ON")
+            self._database.execute("PRAGMA journal_mode=WAL")
+            self._database.execute("PRAGMA synchronous=FULL")
+            if new_database:
+                self._database.executescript(_SCHEMA_SQL)
+            with self._transaction():
+                if new_database:
+                    self._database.execute(
+                        "INSERT INTO program_cycle_metadata VALUES(1,?)",
+                        (SCHEMA_VERSION,),
+                    )
+                    self._database.execute(
+                        "INSERT INTO program_runner_liveness "
+                        "VALUES(1,NULL,NULL,0,NULL)"
+                    )
+                    self._database.execute(
+                        """
+                        INSERT INTO program_cycle
+                        (singleton,cycle_generation,state,owner_epoch,program_run_id,
+                         claim_json,capture_identities_json,terminal_reference,
+                         reset_result_json,reconciliation_required,
+                         acquisition_pending_json,reconciliation_evidence_digest,
+                         release_intent_json)
+                        VALUES(1,1,'idle_after_reset',?,NULL,NULL,NULL,NULL,NULL,0,NULL,NULL,NULL)
+                        """,
+                        (owner_epoch,),
+                    )
                 row = self.read()
-            if row.owner_epoch != owner_epoch:
-                self._database.execute(
-                    """
-                    UPDATE program_cycle SET reconciliation_required=1
-                    WHERE singleton=1
-                    """
-                )
+                if not new_database and (
+                    row.state != "idle_after_reset"
+                    or row.claim is not None
+                    or row.acquisition_pending is not None
+                ):
+                    self._database.execute(
+                        """
+                        UPDATE program_cycle SET reconciliation_required=1
+                        WHERE singleton=1
+                        """
+                    )
+                    row = self.read()
+                if row.owner_epoch != owner_epoch:
+                    self._database.execute(
+                        """
+                        UPDATE program_cycle SET reconciliation_required=1
+                        WHERE singleton=1
+                        """
+                    )
+        except BaseException:
+            self._database.close()
+            os.close(self._parent_descriptor)
+            self._parent_descriptor = -1
+            raise
+
+    @staticmethod
+    def _safe_parent(metadata: os.stat_result) -> bool:
+        required = stat.S_IRUSR | stat.S_IWUSR | stat.S_IXUSR
+        return (
+            stat.S_ISDIR(metadata.st_mode)
+            and metadata.st_uid == os.geteuid()
+            and not metadata.st_mode & (stat.S_IWGRP | stat.S_IWOTH)
+            and metadata.st_mode & required == required
+        )
+
+    @staticmethod
+    def _safe_database(metadata: os.stat_result) -> bool:
+        return (
+            stat.S_ISREG(metadata.st_mode)
+            and metadata.st_uid == os.geteuid()
+            and metadata.st_nlink == 1
+            and not metadata.st_mode & (stat.S_IWGRP | stat.S_IWOTH)
+            and metadata.st_mode & (stat.S_IRUSR | stat.S_IWUSR)
+            == (stat.S_IRUSR | stat.S_IWUSR)
+        )
+
+    def _validate_storage(self) -> None:
+        if self._parent_descriptor < 0:
+            raise RuntimeError("Program-cycle journal is closed")
+        try:
+            opened_parent = os.fstat(self._parent_descriptor)
+            current_parent = self._path.parent.lstat()
+            current_database = os.stat(
+                self._path.name,
+                dir_fd=self._parent_descriptor,
+                follow_symlinks=False,
+            )
+        except OSError as error:
+            raise RuntimeError(
+                f"Program-cycle journal storage is unavailable: {error}"
+            ) from error
+        if (
+            any(
+                not self._safe_parent(metadata)
+                or (metadata.st_dev, metadata.st_ino) != self._parent_identity
+                for metadata in (opened_parent, current_parent)
+            )
+            or not self._safe_database(current_database)
+            or (current_database.st_dev, current_database.st_ino)
+            != self._database_identity
+        ):
+            raise RuntimeError(
+                "Program-cycle journal storage capability was replaced or changed"
+            )
+        rollback = self._sidecar_metadata(
+            self._parent_descriptor,
+            f"{self._path.name}-journal",
+            label="rollback sidecar",
+        )
+        if rollback is not None:
+            raise RuntimeError(
+                "Program-cycle journal has an unsupported rollback sidecar"
+            )
+        for suffix, label in (
+            ("-wal", "WAL sidecar"),
+            ("-shm", "shared-memory sidecar"),
+        ):
+            self._sidecar_metadata(
+                self._parent_descriptor,
+                f"{self._path.name}{suffix}",
+                label=label,
+            )
 
     def begin_acquire(
         self,
@@ -267,6 +1111,7 @@ class ProgramCycleJournal:
     @contextmanager
     def _transaction(self) -> Iterator[None]:
         with self._lock:
+            self._validate_storage()
             self._database.execute("BEGIN IMMEDIATE")
             try:
                 yield
@@ -277,18 +1122,25 @@ class ProgramCycleJournal:
 
     @staticmethod
     def _load(value: str | None) -> dict[str, Any] | None:
-        return None if value is None else json.loads(value)
+        return _strict_object(value)
 
     @staticmethod
     def _dump(value: Mapping[str, Any] | None) -> str | None:
         return (
             None
             if value is None
-            else json.dumps(dict(value), sort_keys=True, separators=(",", ":"))
+            else json.dumps(
+                dict(value),
+                allow_nan=False,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            )
         )
 
     def read(self) -> CycleRecord:
         with self._lock:
+            self._validate_storage()
             row = self._database.execute(
                 """
                 SELECT cycle_generation,state,owner_epoch,program_run_id,claim_json,
@@ -526,6 +1378,7 @@ class ProgramCycleJournal:
 
     def require_run_history_capacity(self) -> None:
         with self._lock:
+            self._validate_storage()
             count = self._database.execute(
                 "SELECT COUNT(*) FROM program_run_history"
             ).fetchone()
@@ -534,6 +1387,7 @@ class ProgramCycleJournal:
 
     def read_run_snapshot(self, program_run_id: str) -> dict[str, Any] | None:
         with self._lock:
+            self._validate_storage()
             row = self._database.execute(
                 "SELECT snapshot_json FROM program_run_history WHERE program_run_id=?",
                 (program_run_id,),
@@ -544,6 +1398,7 @@ class ProgramCycleJournal:
         if type(limit) is not int or not 1 <= limit <= self._maximum_retained_runs:
             raise ValueError("Program-run history limit is invalid")
         with self._lock:
+            self._validate_storage()
             rows = self._database.execute(
                 "SELECT snapshot_json FROM program_run_history "
                 "ORDER BY program_run_id LIMIT ?",
@@ -642,6 +1497,7 @@ class ProgramCycleJournal:
     def liveness(self) -> RetainedLiveness:
         """Read only durable identities/evidence, never a deadline or age."""
         with self._lock:
+            self._validate_storage()
             row = self._database.execute(
                 """
                 SELECT manager_runtime_epoch,manager_owner_epoch,
@@ -811,7 +1667,11 @@ class ProgramCycleJournal:
 
     def close(self) -> None:
         with self._lock:
+            if self._parent_descriptor < 0:
+                return
             self._database.close()
+            os.close(self._parent_descriptor)
+            self._parent_descriptor = -1
 
 
 __all__ = [

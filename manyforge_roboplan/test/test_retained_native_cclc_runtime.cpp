@@ -1171,7 +1171,7 @@ public:
       kernel_ = std::make_unique<core::ResourceAddressedExecutionKernel>(
           std::vector<core::RuntimeParticipantExecutionRegistration>{
               registration},
-          clock_, *journal_,
+          clock_, scheduler_, *journal_,
           core::ResourceAddressedExecutionKernelConfig{
               core::RequestOwnerEpoch("kernel.native.readiness.1"),
               cell_id_,
@@ -1226,6 +1226,7 @@ private:
   core::CellId cell_id_;
   core::FakeClock &clock_;
   core::RuntimePolicyDTO runtime_policy_;
+  core::ManualScheduler scheduler_;
   mutable std::mutex mutex_;
   std::vector<deployment::VerifiedRouteReadinessParticipant> participants_;
   AdmissionEngine engine_;

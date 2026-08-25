@@ -169,13 +169,85 @@ std::filesystem::path ExistingDirectory(std::filesystem::path path,
   return path;
 }
 
+std::filesystem::path ExistingPrivateDirectory(std::filesystem::path path,
+                                               const std::string_view label) {
+  Require(path.is_absolute(),
+          std::string(label) + " must be an absolute directory capability");
+  Require(path.lexically_normal() == path,
+          std::string(label) + " must use its canonical lexical spelling");
+  std::error_code error;
+  Require(std::filesystem::canonical(path, error) == path && !error,
+          std::string(label) + " must be one canonical directory capability");
+  struct stat before {};
+  Require(::lstat(path.c_str(), &before) == 0 && S_ISDIR(before.st_mode) &&
+              !S_ISLNK(before.st_mode),
+          std::string(label) + " must be one plain directory");
+  const int descriptor =
+      ::open(path.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW);
+  struct stat opened {};
+  struct stat after {};
+  const bool valid =
+      descriptor >= 0 && ::fstat(descriptor, &opened) == 0 &&
+      ::lstat(path.c_str(), &after) == 0 &&
+      opened.st_dev == before.st_dev && opened.st_ino == before.st_ino &&
+      after.st_dev == before.st_dev && after.st_ino == before.st_ino &&
+      S_ISDIR(opened.st_mode) && S_ISDIR(after.st_mode) &&
+      opened.st_uid == ::geteuid() && after.st_uid == ::geteuid() &&
+      (opened.st_mode & (S_IWGRP | S_IWOTH)) == 0 &&
+      (after.st_mode & (S_IWGRP | S_IWOTH)) == 0 &&
+      (opened.st_mode & (S_IRUSR | S_IWUSR | S_IXUSR)) ==
+          (S_IRUSR | S_IWUSR | S_IXUSR) &&
+      (after.st_mode & (S_IRUSR | S_IWUSR | S_IXUSR)) ==
+          (S_IRUSR | S_IWUSR | S_IXUSR);
+  if (descriptor >= 0) {
+    static_cast<void>(::close(descriptor));
+  }
+  Require(valid, std::string(label) + " identity, owner, or mode is unsafe");
+  return path;
+}
+
+void RequireDisjointDirectories(const std::filesystem::path &left,
+                                const std::filesystem::path &right,
+                                const std::string_view labels) {
+  std::error_code error;
+  const auto canonical_left = std::filesystem::canonical(left, error);
+  Require(!error, std::string(labels) + " left directory is unavailable");
+  const auto canonical_right = std::filesystem::canonical(right, error);
+  Require(!error, std::string(labels) + " right directory is unavailable");
+  const auto mismatch = std::mismatch(
+      canonical_left.begin(), canonical_left.end(), canonical_right.begin(),
+      canonical_right.end());
+  Require(mismatch.first != canonical_left.end() &&
+              mismatch.second != canonical_right.end(),
+          std::string(labels) + " must be disjoint directory trees");
+}
+
+void RequirePathOutsideDirectory(const std::filesystem::path &path,
+                                 const std::filesystem::path &directory,
+                                 const std::string_view labels) {
+  std::error_code error;
+  const auto canonical_parent =
+      std::filesystem::canonical(path.parent_path(), error);
+  Require(!error, std::string(labels) + " parent is unavailable");
+  const auto canonical_path = canonical_parent / path.filename();
+  const auto canonical_directory = std::filesystem::canonical(directory, error);
+  Require(!error, std::string(labels) + " directory is unavailable");
+  const auto mismatch = std::mismatch(
+      canonical_directory.begin(), canonical_directory.end(),
+      canonical_path.begin(), canonical_path.end());
+  Require(mismatch.first != canonical_directory.end() &&
+              mismatch.second != canonical_path.end(),
+          std::string(labels) +
+              " must be disjoint from disposable run storage");
+}
+
 std::filesystem::path ProspectiveDatabasePath(std::filesystem::path path,
                                               const std::string_view label) {
   Require(!path.empty() && path.has_filename() && path.filename() != "." &&
               path.filename() != "..",
           std::string(label) + " path is invalid");
-  static_cast<void>(
-      ExistingDirectory(path.parent_path(), std::string(label) + " parent"));
+  static_cast<void>(ExistingPrivateDirectory(
+      path.parent_path(), std::string(label) + " parent"));
   const auto status = std::filesystem::symlink_status(path);
   Require(!std::filesystem::is_symlink(status),
           std::string(label) + " path cannot be a symlink");
@@ -322,7 +394,8 @@ struct DaemonConfig final {
       "canonical-empty-admission.json"};
   std::filesystem::path manager_state_root;
   std::filesystem::path manager_run_root;
-  std::filesystem::path runtime_state_root;
+  std::filesystem::path execution_state_root;
+  std::filesystem::path execution_run_root;
   std::filesystem::path logical_scene_database;
   std::filesystem::path program_cycle_journal;
   std::filesystem::path authoring_transaction_journal;
@@ -1712,7 +1785,7 @@ public:
         native_runtime_adapter_(
             InstalledTargetRoot(), package_generation_.descriptor_bound_root(),
             config_.manager_state_root, config_.manager_run_root,
-            config_.runtime_state_root,
+            config_.execution_state_root, config_.execution_run_root,
             bundle_source_, artifact_source_, "linux",
             std::vector<std::string>{
                 std::string(deployment::native_execution_runtime_contract::
@@ -1730,7 +1803,8 @@ public:
         plan_source_(stores_.active_bundle_publication_store(),
                      stores_.apply_journal(),
                      BuildBootstrapRuntimePlan(admission_, artifact_source_)),
-        reference_runtime_adapter_(config_.runtime_state_root, bundle_source_,
+        reference_runtime_adapter_(config_.execution_state_root,
+                                   config_.execution_run_root, bundle_source_,
                                    artifact_source_, "linux", "posix.1-2017"),
         runtime_adapter_router_(
             {{std::string(
@@ -1859,13 +1933,28 @@ private:
         std::filesystem::canonical(config.install_root, install_root_error);
     Require(!install_root_error && config.install_root.is_absolute(),
             "install root could not be canonicalized");
-    config.manager_state_root = ExistingDirectory(
+    config.manager_state_root = ExistingPrivateDirectory(
         std::move(config.manager_state_root), "Manager state root");
-    config.manager_run_root = ExistingDirectory(
+    config.manager_run_root = ExistingPrivateDirectory(
         std::move(config.manager_run_root), "Manager run root");
-    config.runtime_state_root = ExistingDirectory(
-        std::move(config.runtime_state_root), "runtime state root");
-    config.projection_root = ExistingDirectory(
+    config.execution_state_root = ExistingPrivateDirectory(
+        std::move(config.execution_state_root), "execution state root");
+    config.execution_run_root = ExistingPrivateDirectory(
+        std::move(config.execution_run_root), "execution run root");
+    const std::array<const std::filesystem::path *, 4U> typed_roots{
+        &config.manager_state_root, &config.manager_run_root,
+        &config.execution_state_root, &config.execution_run_root};
+    for (std::size_t left = 0U; left < typed_roots.size(); ++left) {
+      for (std::size_t right = left + 1U; right < typed_roots.size(); ++right) {
+        RequireDisjointDirectories(*typed_roots[left], *typed_roots[right],
+                                   "Manager state/run capabilities");
+      }
+    }
+    for (const auto *typed_root : typed_roots) {
+      RequireDisjointDirectories(config.install_root, *typed_root,
+                                 "install/runtime capabilities");
+    }
+    config.projection_root = ExistingPrivateDirectory(
         std::move(config.projection_root), "projection root");
     config.logical_scene_database =
         DatabasePath(std::move(config.logical_scene_database));
@@ -1874,6 +1963,17 @@ private:
     config.authoring_transaction_journal = ProspectiveDatabasePath(
         std::move(config.authoring_transaction_journal),
         "Composer authoring transaction journal");
+    const std::array<const std::filesystem::path *, 4U> durable_paths{
+        &config.logical_scene_database, &config.program_cycle_journal,
+        &config.authoring_transaction_journal, &config.projection_root};
+    const std::array<const std::filesystem::path *, 2U> run_roots{
+        &config.manager_run_root, &config.execution_run_root};
+    for (const auto *durable_path : durable_paths) {
+      for (const auto *run_root : run_roots) {
+        RequirePathOutsideDirectory(*durable_path, *run_root,
+                                    "Manager durable path/run capability");
+      }
+    }
     if (!config.program_runner_liveness_socket.empty()) {
       Require(config.program_runner_liveness_socket.is_absolute() &&
                   config.program_runner_liveness_socket.has_filename(),
@@ -1881,6 +1981,13 @@ private:
       static_cast<void>(ExistingDirectory(
           config.program_runner_liveness_socket.parent_path(),
           "Program Runner liveness socket parent"));
+      std::error_code error;
+      Require(std::filesystem::equivalent(
+                  config.program_runner_liveness_socket.parent_path(),
+                  config.manager_run_root, error) &&
+                  !error,
+              "Program Runner liveness socket must belong to the Manager run "
+              "capability");
     }
     Require(config.reconciliation_period >= std::chrono::milliseconds(10) &&
                 config.reconciliation_period <= std::chrono::seconds(60),
@@ -3541,7 +3648,8 @@ DaemonConfig ParseArguments(const int argc, char **argv) {
   bool admission = false;
   bool manager = false;
   bool manager_run = false;
-  bool runtime = false;
+  bool execution_state = false;
+  bool execution_run = false;
   bool scene = false;
   bool program_cycle = false;
   bool authoring = false;
@@ -3564,9 +3672,12 @@ DaemonConfig ParseArguments(const int argc, char **argv) {
     } else if (option == "--manager-run-root" && !manager_run) {
       config.manager_run_root = value;
       manager_run = true;
-    } else if (option == "--runtime-state-root" && !runtime) {
-      config.runtime_state_root = value;
-      runtime = true;
+    } else if (option == "--execution-state-root" && !execution_state) {
+      config.execution_state_root = value;
+      execution_state = true;
+    } else if (option == "--execution-run-root" && !execution_run) {
+      config.execution_run_root = value;
+      execution_run = true;
     } else if (option == "--logical-scene-database" && !scene) {
       config.logical_scene_database = value;
       scene = true;
@@ -3591,10 +3702,11 @@ DaemonConfig ParseArguments(const int argc, char **argv) {
       Fail("unknown or duplicate option " + std::string(option));
     }
   }
-  Require(install && manager && manager_run && runtime && scene &&
+  Require(install && manager && manager_run && execution_state &&
+              execution_run && scene &&
               program_cycle && authoring && projection,
           "--install-root, --manager-state-root, --manager-run-root, "
-          "--runtime-state-root, "
+          "--execution-state-root, --execution-run-root, "
           "--logical-scene-database, --program-cycle-journal, "
           "--authoring-transaction-journal, and --projection-root are required");
   return config;

@@ -164,6 +164,174 @@ ContentDigest Digest(const char digit) {
   return ContentDigest("sha256:" + std::string(64U, digit));
 }
 
+class TestCellAdmissionPort final : public core::IKernelCellAdmissionPort {
+public:
+  [[nodiscard]] core::AuthoringAdmissionDTO
+  GetAuthoringAdmission() const override {
+    std::lock_guard lock(mutex_);
+    return {!held_index_.has_value(), core::AdmissionGeneration(1U)};
+  }
+
+  void ProveHeldClaimHadNoEffect() {
+    std::lock_guard lock(mutex_);
+    if (!held_index_.has_value()) {
+      throw std::logic_error("scene test admission has no held claim");
+    }
+    auto &entry = entries_[*held_index_];
+    const auto &claim = entry.claim;
+    entry.release = core::CellAdmissionClaimReleaseDTO{
+        claim.intent.owner_role,
+        claim.intent.owner_epoch,
+        claim.intent.owner_transaction_id,
+        claim.intent.request_id,
+        claim.intent.request_payload_digest,
+        claim.acquired_admission_generation,
+        claim.claim_generation,
+        {core::CellAdmissionSettlementKindDTO::kProvenNoEffect,
+         claim.intent.request_payload_digest},
+    };
+    held_index_.reset();
+  }
+
+  [[nodiscard]] core::Result<core::AuthoringAdmissionDTO>
+  UpdateCellAdmissionReadiness(
+      const core::CellAdmissionReadinessSnapshotDTO &) override {
+    return core::Result<core::AuthoringAdmissionDTO>::Ok(
+        GetAuthoringAdmission());
+  }
+
+  [[nodiscard]] core::Result<core::CellAdmissionClaimDTO>
+  AcquireCellAdmissionClaim(
+      const core::CellAdmissionClaimIntentDTO &intent) override {
+    std::lock_guard lock(mutex_);
+    if (intent.expected_admission_generation !=
+        core::AdmissionGeneration(1U)) {
+      return core::Result<core::CellAdmissionClaimDTO>::Err(
+          ErrorDTO{"test_admission_generation_mismatch",
+                   "scene test expected admission generation 1", {}});
+    }
+    for (std::size_t index = 0U; index < entries_.size(); ++index) {
+      if (entries_[index].claim.intent != intent) {
+        continue;
+      }
+      if (!entries_[index].release.has_value() && held_index_ == index) {
+        return core::Result<core::CellAdmissionClaimDTO>::Ok(
+            entries_[index].claim);
+      }
+      return core::Result<core::CellAdmissionClaimDTO>::Err(
+          ErrorDTO{"test_admission_already_settled",
+                   "scene test admission intent is already settled", {}});
+    }
+    if (held_index_.has_value()) {
+      return core::Result<core::CellAdmissionClaimDTO>::Err(
+          ErrorDTO{"test_admission_busy",
+                   "scene test admission already holds another claim", {}});
+    }
+    entries_.push_back({core::CellAdmissionClaimDTO{
+                            intent,
+                            core::CellAdmissionClaimGeneration(
+                                next_claim_generation_++),
+                            core::AdmissionGeneration(1U),
+                            1},
+                        std::nullopt});
+    held_index_ = entries_.size() - 1U;
+    return core::Result<core::CellAdmissionClaimDTO>::Ok(
+        entries_.back().claim);
+  }
+
+  [[nodiscard]] core::Result<core::AuthoringAdmissionDTO>
+  ReleaseCellAdmissionClaim(
+      const core::CellAdmissionClaimReleaseDTO &release) override {
+    std::lock_guard lock(mutex_);
+    if (!held_index_.has_value()) {
+      return core::Result<core::AuthoringAdmissionDTO>::Err(
+          ErrorDTO{"test_admission_not_held",
+                   "scene test admission has no held claim", {}});
+    }
+    auto &entry = entries_[*held_index_];
+    const auto &claim = entry.claim;
+    if (release.owner_role != claim.intent.owner_role ||
+        release.owner_epoch != claim.intent.owner_epoch ||
+        release.owner_transaction_id != claim.intent.owner_transaction_id ||
+        release.request_id != claim.intent.request_id ||
+        release.request_payload_digest !=
+            claim.intent.request_payload_digest ||
+        release.acquired_admission_generation !=
+            claim.acquired_admission_generation ||
+        release.claim_generation != claim.claim_generation) {
+      return core::Result<core::AuthoringAdmissionDTO>::Err(
+          ErrorDTO{"test_admission_release_mismatch",
+                   "scene test admission release does not match its claim",
+                   {}});
+    }
+    entry.release = release;
+    held_index_.reset();
+    return core::Result<core::AuthoringAdmissionDTO>::Ok(
+        {true, core::AdmissionGeneration(1U)});
+  }
+
+  [[nodiscard]] core::Result<core::AuthoringAdmissionDTO>
+  ReconcileCellAdmissionClaims(
+      const core::CellAdmissionReconcileDTO &) override {
+    return core::Result<core::AuthoringAdmissionDTO>::Ok(
+        GetAuthoringAdmission());
+  }
+
+  [[nodiscard]] core::Result<core::CellAdmissionRecoveryReceiptDTO>
+  GetCellAdmissionRecoveryReceipt(
+      const core::CellAdmissionRecoveryReceiptQueryDTO &query) const override {
+    std::lock_guard lock(mutex_);
+    core::CellAdmissionRecoveryReceiptDTO receipt{
+        core::CellAdmissionRecoveryReceiptStatusDTO::kUnknown,
+        RequestOwnerEpoch("kernel-owner.scene-test"),
+        core::AdmissionGeneration(1U),
+        std::nullopt,
+        std::nullopt,
+        std::nullopt,
+        {},
+        {},
+    };
+    for (auto iterator = entries_.rbegin(); iterator != entries_.rend();
+         ++iterator) {
+      if (iterator->claim.intent != query.intent) {
+        continue;
+      }
+      if ((query.expected_claim.has_value() &&
+           query.expected_claim != iterator->claim) ||
+          (query.expected_release.has_value() &&
+           query.expected_release != iterator->release)) {
+        receipt.status =
+            core::CellAdmissionRecoveryReceiptStatusDTO::kConflicting;
+        return core::Result<core::CellAdmissionRecoveryReceiptDTO>::Ok(
+            std::move(receipt));
+      }
+      receipt.matched_claim = iterator->claim;
+      receipt.matched_release = iterator->release;
+      receipt.status =
+          iterator->release.has_value()
+              ? core::CellAdmissionRecoveryReceiptStatusDTO::kReleasedExact
+              : core::CellAdmissionRecoveryReceiptStatusDTO::kHeldExact;
+      break;
+    }
+    if (held_index_.has_value()) {
+      receipt.held_claims.push_back(entries_[*held_index_].claim);
+    }
+    return core::Result<core::CellAdmissionRecoveryReceiptDTO>::Ok(
+        std::move(receipt));
+  }
+
+private:
+  struct Entry final {
+    core::CellAdmissionClaimDTO claim;
+    std::optional<core::CellAdmissionClaimReleaseDTO> release;
+  };
+
+  mutable std::mutex mutex_;
+  std::vector<Entry> entries_;
+  std::optional<std::size_t> held_index_;
+  std::uint64_t next_claim_generation_{1U};
+};
+
 class ControlledPublicationReader final
     : public IActiveBundlePublicationReader {
 public:
@@ -1583,6 +1751,7 @@ AddBoxRequest(const ProjectionRevisionDTO &expected, const CellId &cell_id,
           core::CellSceneFrameRefDTO{cell_id},
           std::move(support_contacts),
       },
+      core::AdmissionGeneration(1U),
   };
 }
 
@@ -1693,6 +1862,7 @@ TEST(LogicalSceneTransactionCodec,
           core::SceneResourceId("scene-box"),
           core::ControllableComponentId("component.1"),
           core::CommandTargetId("arm")},
+      std::nullopt,
   };
   const auto detach_bytes = logical_scene_codec_internal::EncodeRequest(detach);
   const auto decoded_detach =
@@ -1708,8 +1878,9 @@ TEST(CanonicalEmptySceneOwner, UpsertCreatesReplacesAndRecognizesAnExactNoOp) {
   TemporaryDirectory directory("scene-upsert");
   const auto admission = LoadAdmission();
   ControlledPublicationReader publication_reader;
+  TestCellAdmissionPort cell_admission;
   CanonicalEmptySceneOwner owner(directory.path() / "logical-scene.sqlite3",
-                                 admission, publication_reader);
+                                 admission, publication_reader, cell_admission);
   auto active = FinalizeCanonicalBootstrap(owner, publication_reader, admission)
                     .canonical_empty_target;
 
@@ -1796,11 +1967,12 @@ TEST(CanonicalEmptySceneOwner,
   const auto database_path = directory.path() / "logical-scene.sqlite3";
   const auto admission = LoadAdmission();
   ControlledPublicationReader publication_reader;
+  TestCellAdmissionPort cell_admission;
   ProjectionRevisionDTO committed_projection;
   std::optional<core::SceneTransactionRequestDTO> request;
   {
     CanonicalEmptySceneOwner owner(database_path, admission,
-                                   publication_reader);
+                                   publication_reader, cell_admission);
     const auto accepted =
         FinalizeCanonicalBootstrap(owner, publication_reader, admission);
     request =
@@ -1887,12 +2059,14 @@ TEST(CanonicalEmptySceneOwner,
   const auto database_path = directory.path() / "logical-scene.sqlite3";
   const auto admission = LoadAdmission();
   ControlledPublicationReader publication_reader;
-  CanonicalEmptySceneOwner first(database_path, admission, publication_reader);
+  TestCellAdmissionPort cell_admission;
+  CanonicalEmptySceneOwner first(database_path, admission, publication_reader,
+                                 cell_admission);
   const auto initial =
       FinalizeCanonicalBootstrap(first, publication_reader, admission)
           .canonical_empty_target;
   CanonicalEmptySceneOwner second(database_path, admission,
-                                  publication_reader);
+                                  publication_reader, cell_admission);
 
   // Warm both process-local views before either connection advances the scene.
   EXPECT_EQ(first.CurrentProjectionRevision(), initial);
@@ -1937,10 +2111,11 @@ TEST(CanonicalEmptySceneOwner,
   const auto database_path = directory.path() / "logical-scene.sqlite3";
   const auto admission = LoadAdmission();
   ControlledPublicationReader publication_reader;
+  TestCellAdmissionPort cell_admission;
   ProjectionRevisionDTO projection;
   {
     CanonicalEmptySceneOwner owner(database_path, admission,
-                                   publication_reader);
+                                   publication_reader, cell_admission);
     projection =
         FinalizeCanonicalBootstrap(owner, publication_reader, admission)
             .canonical_empty_target;
@@ -1996,6 +2171,7 @@ TEST(CanonicalEmptySceneOwner,
         {},
         projection,
         core::RemoveObjectRequestDTO{core::SceneResourceId("support-a")},
+        core::AdmissionGeneration(1U),
     };
     const auto removal = owner.Commit(remove_support);
     ASSERT_FALSE(removal.success);
@@ -2057,8 +2233,9 @@ TEST(CanonicalEmptySceneOwner, CommitsTheClosedPortableCollisionShapeSet) {
   TemporaryDirectory directory("scene-shape-set");
   const auto admission = LoadAdmission();
   ControlledPublicationReader publication_reader;
+  TestCellAdmissionPort cell_admission;
   CanonicalEmptySceneOwner owner(directory.path() / "logical-scene.sqlite3",
-                                 admission, publication_reader);
+                                 admission, publication_reader, cell_admission);
   const auto accepted =
       FinalizeCanonicalBootstrap(owner, publication_reader, admission);
   auto projection = accepted.canonical_empty_target;
@@ -2923,6 +3100,7 @@ TEST(CanonicalEmptySceneOwner,
   auto native_projections = MakeFakeProjections(native_bindings);
   FakePlannerSceneProjectionResolver resolver(
       ProjectionClients(native_projections));
+  TestCellAdmissionPort cell_admission;
   std::optional<ProjectionRevisionDTO> projection;
   RequestOwnerEpoch original_epoch(std::string{});
   RequestOwnerEpoch rotated_epoch(std::string{});
@@ -2931,7 +3109,7 @@ TEST(CanonicalEmptySceneOwner,
   steady_commit_duration_ns.reserve(kMaximumLogicalSceneTransactions - 2U);
   {
     CanonicalEmptySceneOwner owner(database_path, admission, publication_reader,
-                                   bundle_source, resolver);
+                                   bundle_source, resolver, cell_admission);
     projection = FinalizeNativeCandidate(
         owner, publication_reader, admission, *candidate.bundle,
         native_bindings, "apply-native-sustained-history");
@@ -2955,7 +3133,8 @@ TEST(CanonicalEmptySceneOwner,
           core::UpdateObjectPoseRequestDTO{
               core::SceneResourceId("scene-box"), pose.value(),
               core::CellSceneFrameRefDTO{admission.cell_id()}, std::nullopt,
-              false}};
+              false},
+          core::AdmissionGeneration(1U)};
       const auto started = std::chrono::steady_clock::now();
       const auto committed = owner.Commit(request);
       steady_commit_duration_ns.push_back(
@@ -2979,7 +3158,8 @@ TEST(CanonicalEmptySceneOwner,
         core::UpdateObjectPoseRequestDTO{
             core::SceneResourceId("scene-box"), pose.value(),
             core::CellSceneFrameRefDTO{admission.cell_id()}, std::nullopt,
-            false}};
+            false},
+        core::AdmissionGeneration(1U)};
     const auto failed = owner.Commit(closed_failure);
     ASSERT_FALSE(failed.success);
     EXPECT_EQ(failed.projection_status,
@@ -2994,7 +3174,8 @@ TEST(CanonicalEmptySceneOwner,
         core::UpdateObjectPoseRequestDTO{
             core::SceneResourceId("scene-box"), pose.value(),
             core::CellSceneFrameRefDTO{admission.cell_id()}, std::nullopt,
-            false}};
+            false},
+        core::AdmissionGeneration(1U)};
     const auto rotated = owner.Commit(*most_recent_request);
     ASSERT_FALSE(rotated.success);
     EXPECT_EQ(rotated.replay_status,
@@ -3074,9 +3255,10 @@ TEST(CanonicalEmptySceneOwner,
   deployment::FilesystemVerifiedRetainedBundleSource bundle_source(package_root);
   auto original = MakeFakeProjections(original_bindings);
   FakePlannerSceneProjectionResolver resolver(ProjectionClients(original));
+  TestCellAdmissionPort cell_admission;
   const auto database_path = directory.path() / "logical-scene.sqlite3";
   CanonicalEmptySceneOwner owner(database_path, admission, publication_reader,
-                                 bundle_source, resolver);
+                                 bundle_source, resolver, cell_admission);
   const auto active = FinalizeNativeCandidate(
       owner, publication_reader, admission, *candidate.bundle,
       original_bindings, "apply-native-runtime-recovery");
@@ -3447,9 +3629,10 @@ TEST(
       package_root);
   auto original = MakeFakeProjections(original_bindings);
   FakePlannerSceneProjectionResolver resolver(ProjectionClients(original));
+  TestCellAdmissionPort cell_admission;
   const auto database_path = directory.path() / "logical-scene.sqlite3";
   CanonicalEmptySceneOwner owner(database_path, admission, publication_reader,
-                                 bundle_source, resolver);
+                                 bundle_source, resolver, cell_admission);
   const auto active = FinalizeNativeCandidate(
       owner, publication_reader, admission, *candidate.bundle,
       original_bindings, "apply-native-transaction-host-loss");
@@ -3507,6 +3690,7 @@ TEST(
   for (const auto &projection : replacement) {
     EXPECT_EQ(projection->calls(), 0U);
   }
+  cell_admission.ProveHeldClaimHadNoEffect();
   auto retry = failed_request;
   retry.request_context.request_id =
       core::RequestId("scene-request-after-host-loss-recovery");
@@ -3536,9 +3720,10 @@ TEST(CanonicalEmptySceneOwner,
       MANYFORGE_SCENE_TEST_CANONICAL_EMPTY_PACKAGE_ROOT);
   FakePlannerSceneProjection projection("resolution-gate");
   FakePlannerSceneProjectionResolver projection_resolver(projection);
+  TestCellAdmissionPort cell_admission;
   CanonicalEmptySceneOwner owner(directory.path() / "logical-scene.sqlite3",
                                  admission, publication_reader, bundle_source,
-                                 projection_resolver);
+                                 projection_resolver, cell_admission);
   const auto accepted =
       FinalizeCanonicalBootstrap(owner, publication_reader, admission);
   projection.Reset(accepted.canonical_empty_target,
@@ -3584,6 +3769,7 @@ TEST(CanonicalEmptySceneOwner,
           {},
           {},
       },
+      std::nullopt,
   };
   const auto attach_unavailable = owner.Commit(attach);
   ASSERT_FALSE(attach_unavailable.success);
@@ -3603,6 +3789,7 @@ TEST(CanonicalEmptySceneOwner,
       core::SetCollisionPolicyRequestDTO{
           policy,
           owner.LogicalSnapshot()->configured_collision_policy.revision},
+      core::AdmissionGeneration(1U),
   };
   const auto policy_unavailable = owner.Commit(derived_policy);
   ASSERT_FALSE(policy_unavailable.success);
@@ -3644,9 +3831,10 @@ TEST(CanonicalEmptySceneOwner,
   }
   auto &projection = *projections.front();
   FakePlannerSceneProjectionResolver projection_resolver(projection_clients);
+  TestCellAdmissionPort cell_admission;
   CanonicalEmptySceneOwner owner(directory.path() / "logical-scene.sqlite3",
                                  admission, publication_reader, bundle_source,
-                                 projection_resolver);
+                                 projection_resolver, cell_admission);
   auto active = FinalizeNativeCandidate(
       owner, publication_reader, admission, *candidate.bundle,
       native_bindings, "apply-frame-resolution-native");
@@ -3701,6 +3889,7 @@ TEST(CanonicalEmptySceneOwner,
           {core::CollisionBodyRoleId("finger")},
           {structural_revision},
       },
+      std::nullopt,
   };
   const auto integrity_before_preview = owner.VerifyIntegrity();
   const auto projection_calls_before_preview = projection.calls();
@@ -3827,6 +4016,7 @@ TEST(CanonicalEmptySceneOwner,
           attachment.scene_resource_id,
           attachment.controllable_component_id,
           attachment.command_target_id},
+      std::nullopt,
   };
   const auto detached_current = owner.Commit(detach_current);
   ASSERT_TRUE(detached_current.success)
@@ -3868,6 +4058,7 @@ TEST(CanonicalEmptySceneOwner,
               core::ModelInstanceId("fixture.1"),
               core::FrameRoleId("origin")},
       },
+      std::nullopt,
   };
   const auto detached = owner.Commit(detach);
   ASSERT_TRUE(detached.success)
@@ -3966,9 +4157,10 @@ TEST(CanonicalEmptySceneOwner,
   auto projections = MakeFakeProjections(native_bindings);
   FakePlannerSceneProjectionResolver projection_resolver(
       ProjectionClients(projections));
+  TestCellAdmissionPort cell_admission;
   CanonicalEmptySceneOwner owner(directory.path() / "logical-scene.sqlite3",
                                  admission, publication_reader, bundle_source,
-                                 projection_resolver);
+                                 projection_resolver, cell_admission);
   const auto active = FinalizeNativeCandidate(
       owner, publication_reader, admission, *candidate.bundle,
       native_bindings, "apply-policy-resolution-native");
@@ -3985,6 +4177,7 @@ TEST(CanonicalEmptySceneOwner,
           configured,
           owner.LogicalSnapshot()->configured_collision_policy.revision,
       },
+      core::AdmissionGeneration(1U),
   };
   const auto result = owner.Commit(request);
   ASSERT_TRUE(result.success);
@@ -4008,8 +4201,9 @@ TEST(CanonicalEmptySceneOwner,
   TemporaryDirectory directory;
   const auto admission = LoadAdmission();
   ControlledPublicationReader publication_reader;
+  TestCellAdmissionPort cell_admission;
   CanonicalEmptySceneOwner owner(directory.path() / "logical-scene.sqlite3",
-                                 admission, publication_reader);
+                                 admission, publication_reader, cell_admission);
   const auto accepted =
       FinalizeCanonicalBootstrap(owner, publication_reader, admission);
   const auto added = owner.Commit(
@@ -4031,6 +4225,7 @@ TEST(CanonicalEmptySceneOwner,
       {},
       projection,
       core::RemoveObjectRequestDTO{core::SceneResourceId("missing-object")},
+      core::AdmissionGeneration(1U),
   };
   const auto missing_result = owner.Commit(missing_remove);
   ASSERT_FALSE(missing_result.success);
@@ -4050,6 +4245,7 @@ TEST(CanonicalEmptySceneOwner,
           std::nullopt,
           false,
       },
+      core::AdmissionGeneration(1U),
   };
   const auto unchanged = owner.Commit(no_op);
   ASSERT_TRUE(unchanged.success);
@@ -4081,6 +4277,7 @@ TEST(CanonicalEmptySceneOwner,
           evidence,
           false,
       },
+      std::nullopt,
   };
   const auto refreshed = owner.Commit(freshness);
   ASSERT_TRUE(refreshed.success)
@@ -4110,6 +4307,7 @@ TEST(CanonicalEmptySceneOwner,
           stale_evidence,
           false,
       },
+      std::nullopt,
   };
   const auto stale_provider_result = owner.Commit(stale_provider);
   ASSERT_FALSE(stale_provider_result.success);
@@ -4138,6 +4336,7 @@ TEST(CanonicalEmptySceneOwner,
           next_evidence,
           false,
       },
+      std::nullopt,
   };
   const auto moved = owner.Commit(geometry);
   ASSERT_TRUE(moved.success);
@@ -4159,6 +4358,7 @@ TEST(CanonicalEmptySceneOwner,
           policy,
           snapshot->configured_collision_policy.revision,
       },
+      core::AdmissionGeneration(1U),
   };
   const auto policy_result = owner.Commit(policy_update);
   ASSERT_TRUE(policy_result.success);
@@ -4208,9 +4408,10 @@ TEST(CanonicalEmptySceneOwner,
     auto projections = MakeFakeProjections(native_bindings);
     FakePlannerSceneProjectionResolver projection_resolver(
         ProjectionClients(projections));
+    TestCellAdmissionPort cell_admission;
     CanonicalEmptySceneOwner owner(directory.path() / "logical-scene.sqlite3",
                                    admission, publication_reader, bundle_source,
-                                   projection_resolver);
+                                   projection_resolver, cell_admission);
     const auto active = FinalizeNativeCandidate(
         owner, publication_reader, admission, *candidate.bundle,
         native_bindings, "apply-native-commit");
@@ -4240,9 +4441,10 @@ TEST(CanonicalEmptySceneOwner,
     auto projections = MakeFakeProjections(native_bindings);
     FakePlannerSceneProjectionResolver projection_resolver(
         ProjectionClients(projections));
+    TestCellAdmissionPort cell_admission;
     CanonicalEmptySceneOwner owner(directory.path() / "logical-scene.sqlite3",
                                    admission, publication_reader, bundle_source,
-                                   projection_resolver);
+                                   projection_resolver, cell_admission);
     const auto active = FinalizeNativeCandidate(
         owner, publication_reader, admission, *candidate.bundle,
         native_bindings, "apply-native-rollback");
@@ -4271,9 +4473,10 @@ TEST(CanonicalEmptySceneOwner,
     auto projections = MakeFakeProjections(native_bindings);
     FakePlannerSceneProjectionResolver projection_resolver(
         ProjectionClients(projections));
+    TestCellAdmissionPort cell_admission;
     CanonicalEmptySceneOwner owner(directory.path() / "logical-scene.sqlite3",
                                    admission, publication_reader, bundle_source,
-                                   projection_resolver);
+                                   projection_resolver, cell_admission);
     const auto active = FinalizeNativeCandidate(
         owner, publication_reader, admission, *candidate.bundle,
         native_bindings, "apply-native-uncertain");
@@ -4298,9 +4501,11 @@ TEST(CanonicalEmptySceneOwner,
     auto projections = MakeFakeProjections(two_robot_native_bindings);
     FakePlannerSceneProjectionResolver projection_resolver(
         ProjectionClients(projections));
+    TestCellAdmissionPort cell_admission;
     CanonicalEmptySceneOwner owner(
         directory.path() / "logical-scene.sqlite3", admission,
-        publication_reader, bundle_source, projection_resolver);
+        publication_reader, bundle_source, projection_resolver,
+        cell_admission);
     const auto active = FinalizeNativeCandidate(
         owner, publication_reader, admission, *two_robot_candidate.bundle,
         two_robot_native_bindings, "apply-native-partial");
@@ -4328,9 +4533,11 @@ TEST(CanonicalEmptySceneOwner,
     auto projections = MakeFakeProjections(two_robot_native_bindings);
     FakePlannerSceneProjectionResolver projection_resolver(
         ProjectionClients(projections));
+    TestCellAdmissionPort cell_admission;
     CanonicalEmptySceneOwner owner(
         directory.path() / "logical-scene.sqlite3", admission,
-        publication_reader, bundle_source, projection_resolver);
+        publication_reader, bundle_source, projection_resolver,
+        cell_admission);
     const auto active = FinalizeNativeCandidate(
         owner, publication_reader, admission, *two_robot_candidate.bundle,
         two_robot_native_bindings, "apply-frame-multi-projection-errors");
@@ -4388,11 +4595,12 @@ TEST(CanonicalEmptySceneOwner,
     TemporaryDirectory directory("scene-zero-native-recovery");
     const auto database_path = directory.path() / "logical-scene.sqlite3";
     ControlledPublicationReader publication_reader;
+    TestCellAdmissionPort cell_admission;
     std::optional<core::SceneTransactionRequestDTO> request;
     ProjectionRevisionDTO committed_projection;
     {
       CanonicalEmptySceneOwner owner(database_path, admission,
-                                     publication_reader);
+                                     publication_reader, cell_admission);
       const auto accepted =
           FinalizeCanonicalBootstrap(owner, publication_reader, admission);
       request =
@@ -4441,10 +4649,11 @@ TEST(CanonicalEmptySceneOwner,
     auto projections = MakeFakeProjections(native_bindings);
     FakePlannerSceneProjectionResolver projection_resolver(
         ProjectionClients(projections));
+    TestCellAdmissionPort cell_admission;
     {
       CanonicalEmptySceneOwner owner(database_path, native_admission,
                                      publication_reader, bundle_source,
-                                     projection_resolver);
+                                     projection_resolver, cell_admission);
       const auto active = FinalizeNativeCandidate(
           owner, publication_reader, native_admission, *candidate.bundle,
           native_bindings, "apply-native-recovery");
@@ -4497,10 +4706,14 @@ TEST(CanonicalEmptySceneOwner,
   ControlledPublicationReader publication_reader;
   deployment::FilesystemVerifiedRetainedBundleSource bundle_source(
       MANYFORGE_SCENE_TEST_CANONICAL_EMPTY_PACKAGE_ROOT);
+  FakePlannerSceneProjectionResolver projection_resolver(
+      std::vector<FakePlannerSceneProjection *>{});
+  TestCellAdmissionPort cell_admission;
   ProjectionRevisionDTO final_projection;
   {
     CanonicalEmptySceneOwner owner(database_path, admission, publication_reader,
-                                   bundle_source);
+                                   bundle_source, projection_resolver,
+                                   cell_admission);
     const auto accepted =
         FinalizeCanonicalBootstrap(owner, publication_reader, admission);
     const auto added = owner.Commit(
@@ -4528,6 +4741,7 @@ TEST(CanonicalEmptySceneOwner,
         {},
         finalized.candidate_projection_revision,
         core::RemoveObjectRequestDTO{core::SceneResourceId("scene-box")},
+        core::AdmissionGeneration(1U),
     };
     const auto removed = owner.Commit(remove);
     ASSERT_TRUE(removed.success);

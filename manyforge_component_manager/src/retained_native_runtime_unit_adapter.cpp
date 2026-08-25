@@ -165,14 +165,13 @@ DescriptorMintedRootFd(const std::filesystem::path &path) {
 [[nodiscard]] std::filesystem::path
 NormalizedPlainDirectory(std::filesystem::path path,
                          const std::string_view label) {
-  if (path.empty()) {
-    Fail(std::string(label) + " is empty");
+  if (!path.is_absolute()) {
+    Fail(std::string(label) + " must be an absolute directory capability");
+  }
+  if (path.lexically_normal() != path) {
+    Fail(std::string(label) + " must use its canonical lexical spelling");
   }
   std::error_code error;
-  path = std::filesystem::absolute(path, error).lexically_normal();
-  if (error) {
-    Fail(std::string(label) + " could not be resolved: " + error.message());
-  }
   const auto status = std::filesystem::symlink_status(path, error);
   if (!error) {
     struct stat descriptor_status {};
@@ -188,7 +187,88 @@ NormalizedPlainDirectory(std::filesystem::path path,
       std::filesystem::is_symlink(status)) {
     Fail(std::string(label) + " is not one existing plain directory");
   }
+  const auto canonical = std::filesystem::canonical(path, error);
+  if (error || canonical != path) {
+    Fail(std::string(label) + " is not one canonical directory capability");
+  }
   return path;
+}
+
+void RequirePrivateDirectory(const std::filesystem::path &path,
+                             const std::string_view label) {
+  struct stat before {};
+  if (::lstat(path.c_str(), &before) != 0 || !S_ISDIR(before.st_mode) ||
+      S_ISLNK(before.st_mode)) {
+    Fail(std::string(label) + " is not one plain directory");
+  }
+  const int descriptor =
+      ::open(path.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW);
+  struct stat opened {};
+  struct stat after {};
+  const bool valid =
+      descriptor >= 0 && ::fstat(descriptor, &opened) == 0 &&
+      ::lstat(path.c_str(), &after) == 0 &&
+      opened.st_dev == before.st_dev && opened.st_ino == before.st_ino &&
+      after.st_dev == before.st_dev && after.st_ino == before.st_ino &&
+      S_ISDIR(opened.st_mode) && S_ISDIR(after.st_mode) &&
+      opened.st_uid == ::geteuid() && after.st_uid == ::geteuid() &&
+      (opened.st_mode & (S_IWGRP | S_IWOTH)) == 0 &&
+      (after.st_mode & (S_IWGRP | S_IWOTH)) == 0 &&
+      (opened.st_mode & (S_IRUSR | S_IWUSR | S_IXUSR)) ==
+          (S_IRUSR | S_IWUSR | S_IXUSR) &&
+      (after.st_mode & (S_IRUSR | S_IWUSR | S_IXUSR)) ==
+          (S_IRUSR | S_IWUSR | S_IXUSR);
+  if (descriptor >= 0) {
+    static_cast<void>(::close(descriptor));
+  }
+  if (!valid) {
+    Fail(std::string(label) + " identity, owner, or mode is unsafe");
+  }
+}
+
+void RequireDisjointDirectories(const std::filesystem::path &left,
+                                const std::filesystem::path &right) {
+  std::error_code error;
+  const auto canonical_left = std::filesystem::canonical(left, error);
+  if (error) {
+    Fail("native execution state/run capability is unavailable");
+  }
+  const auto canonical_right = std::filesystem::canonical(right, error);
+  if (error) {
+    Fail("native execution state/run capability is unavailable");
+  }
+  const auto mismatch = std::mismatch(
+      canonical_left.begin(), canonical_left.end(), canonical_right.begin(),
+      canonical_right.end());
+  if (mismatch.first == canonical_left.end() ||
+      mismatch.second == canonical_right.end()) {
+    Fail("native execution state/run capabilities must be disjoint directory "
+         "trees");
+  }
+}
+
+void RequirePathOutsideDirectory(const std::filesystem::path &path,
+                                 const std::filesystem::path &directory) {
+  if (path.empty()) {
+    return;
+  }
+  std::error_code error;
+  const auto canonical_parent =
+      std::filesystem::canonical(path.parent_path(), error);
+  if (error) {
+    Fail("native durable path parent is unavailable");
+  }
+  const auto canonical_path = canonical_parent / path.filename();
+  const auto canonical_directory = std::filesystem::canonical(directory, error);
+  if (error) {
+    Fail("native disposable run capability is unavailable");
+  }
+  const auto mismatch = std::mismatch(
+      canonical_directory.begin(), canonical_directory.end(),
+      canonical_path.begin(), canonical_path.end());
+  if (mismatch.first == canonical_directory.end()) {
+    Fail("native durable paths must be outside disposable run storage");
+  }
 }
 
 class UniqueFd final {
@@ -789,7 +869,8 @@ struct RetainedNativeRuntimeUnitAdapter::Impl final
        std::filesystem::path trusted_package_root,
        std::filesystem::path manager_state_root,
        std::filesystem::path manager_run_root,
-       std::filesystem::path private_staging_root,
+       std::filesystem::path execution_state_root,
+       std::filesystem::path execution_run_root,
        const manyforge::deployment::IVerifiedRetainedBundleSource
            &selected_bundle_source,
        const manyforge::deployment::IVerifiedRetainedProductArtifactSource
@@ -809,8 +890,10 @@ struct RetainedNativeRuntimeUnitAdapter::Impl final
             std::move(manager_state_root), "Manager state root")),
         manager_run_root_path(NormalizedPlainDirectory(
             std::move(manager_run_root), "Manager run root")),
-        staging_root_path(NormalizedPlainDirectory(
-            std::move(private_staging_root), "private native staging root")),
+        execution_state_root_path(NormalizedPlainDirectory(
+            std::move(execution_state_root), "native execution state root")),
+        execution_run_root_path(NormalizedPlainDirectory(
+            std::move(execution_run_root), "native execution run root")),
         logical_scene_database_path(std::move(logical_scene_database)),
         program_cycle_journal_path(std::move(program_cycle_journal)),
         authoring_transaction_journal_path(
@@ -821,6 +904,34 @@ struct RetainedNativeRuntimeUnitAdapter::Impl final
         launch_environment_contracts(
             std::move(selected_launch_environment_contracts)),
         observer_instance_id("native-observer-" + RandomHex()) {
+    const std::array<const std::filesystem::path *, 4U> typed_roots{
+        &manager_state_root_path, &manager_run_root_path,
+        &execution_state_root_path, &execution_run_root_path};
+    RequirePrivateDirectory(manager_state_root_path, "Manager state root");
+    RequirePrivateDirectory(manager_run_root_path, "Manager run root");
+    RequirePrivateDirectory(execution_state_root_path,
+                            "native execution state root");
+    RequirePrivateDirectory(execution_run_root_path,
+                            "native execution run root");
+    for (std::size_t left = 0U; left < typed_roots.size(); ++left) {
+      for (std::size_t right = left + 1U; right < typed_roots.size(); ++right) {
+        RequireDisjointDirectories(*typed_roots[left], *typed_roots[right]);
+      }
+    }
+    for (const auto *typed_root : typed_roots) {
+      RequireDisjointDirectories(target_root_path, *typed_root);
+      RequireDisjointDirectories(package_root_path, *typed_root);
+    }
+    const std::array<const std::filesystem::path *, 3U> durable_paths{
+        &logical_scene_database_path, &program_cycle_journal_path,
+        &authoring_transaction_journal_path};
+    const std::array<const std::filesystem::path *, 2U> run_roots{
+        &manager_run_root_path, &execution_run_root_path};
+    for (const auto *durable_path : durable_paths) {
+      for (const auto *run_root : run_roots) {
+        RequirePathOutsideDirectory(*durable_path, *run_root);
+      }
+    }
     std::sort(launch_environment_contracts.begin(),
               launch_environment_contracts.end());
     if (operating_system.empty() || launch_environment_contracts.empty() ||
@@ -1443,8 +1554,10 @@ struct RetainedNativeRuntimeUnitAdapter::Impl final
     arguments.push_back(manager_state_root_path.string());
     arguments.emplace_back("--manyforge-managed-manager-run-root");
     arguments.push_back(manager_run_root_path.string());
-    arguments.emplace_back("--manyforge-managed-staging-root");
-    arguments.push_back(staging_root_path.string());
+    arguments.emplace_back("--manyforge-managed-execution-state-root");
+    arguments.push_back(execution_state_root_path.string());
+    arguments.emplace_back("--manyforge-managed-execution-run-root");
+    arguments.push_back(execution_run_root_path.string());
     arguments.emplace_back("--manyforge-managed-candidate-worker");
     arguments.push_back(
         (target_root_path /
@@ -1680,7 +1793,8 @@ struct RetainedNativeRuntimeUnitAdapter::Impl final
   UniqueFd package_root_fd;
   std::filesystem::path manager_state_root_path;
   std::filesystem::path manager_run_root_path;
-  std::filesystem::path staging_root_path;
+  std::filesystem::path execution_state_root_path;
+  std::filesystem::path execution_run_root_path;
   std::filesystem::path logical_scene_database_path;
   std::filesystem::path program_cycle_journal_path;
   std::filesystem::path authoring_transaction_journal_path;
@@ -1887,7 +2001,8 @@ RetainedNativeRuntimeUnitAdapter::RetainedNativeRuntimeUnitAdapter(
     std::filesystem::path trusted_package_root,
     std::filesystem::path manager_state_root,
     std::filesystem::path manager_run_root,
-    std::filesystem::path private_staging_root,
+    std::filesystem::path execution_state_root,
+    std::filesystem::path execution_run_root,
     const manyforge::deployment::IVerifiedRetainedBundleSource &bundle_source,
     const manyforge::deployment::IVerifiedRetainedProductArtifactSource
         &artifact_source,
@@ -1898,7 +2013,8 @@ RetainedNativeRuntimeUnitAdapter::RetainedNativeRuntimeUnitAdapter(
     : RetainedNativeRuntimeUnitAdapter(
           std::move(trusted_installed_target_root),
           std::move(trusted_package_root), std::move(manager_state_root),
-          std::move(manager_run_root), std::move(private_staging_root),
+          std::move(manager_run_root), std::move(execution_state_root),
+          std::move(execution_run_root),
           bundle_source, artifact_source,
           std::move(operating_system),
           std::vector<std::string>{std::move(launch_environment_contract)},
@@ -1910,7 +2026,8 @@ RetainedNativeRuntimeUnitAdapter::RetainedNativeRuntimeUnitAdapter(
     std::filesystem::path trusted_package_root,
     std::filesystem::path manager_state_root,
     std::filesystem::path manager_run_root,
-    std::filesystem::path private_staging_root,
+    std::filesystem::path execution_state_root,
+    std::filesystem::path execution_run_root,
     const manyforge::deployment::IVerifiedRetainedBundleSource &bundle_source,
     const manyforge::deployment::IVerifiedRetainedProductArtifactSource
         &artifact_source,
@@ -1922,7 +2039,8 @@ RetainedNativeRuntimeUnitAdapter::RetainedNativeRuntimeUnitAdapter(
     : impl_(std::make_shared<Impl>(
           std::move(trusted_installed_target_root),
           std::move(trusted_package_root), std::move(manager_state_root),
-          std::move(manager_run_root), std::move(private_staging_root),
+          std::move(manager_run_root), std::move(execution_state_root),
+          std::move(execution_run_root),
           bundle_source, artifact_source,
           std::move(operating_system),
           std::move(launch_environment_contracts),

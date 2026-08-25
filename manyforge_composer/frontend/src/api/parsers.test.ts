@@ -13,6 +13,7 @@ import {
   parseManagerGraphProjection,
   parseManagerStatusProjection,
   parseOperatorAlarmSnapshot,
+  parseOperationObservation,
   parseMotionPreviewResponse,
   parseNodeEnvironmentResponse,
   parseLogicalSceneProjection,
@@ -269,6 +270,35 @@ function projectionRevisionFixture(revision = 1): Record<string, unknown> {
       revision_id: revision,
       content_hash: `sha256:${'c'.repeat(64)}`,
     },
+  };
+}
+
+function managerApplyRecordFixture(): Record<string, unknown> {
+  return {
+    apply_generation: 3,
+    apply_id: 'apply-3',
+    candidate_graph_revision: 'graph-2',
+    candidate_retained_bundle_id: 'bundle-2',
+    committed: false,
+    expected_active_projection_revision: projectionRevisionFixture(),
+    fence: {
+      acceptance_digest: `sha256:${'d'.repeat(64)}`,
+      configuration_fence_generation: 2,
+      configuration_fence_id: 'fence-2',
+      fence_attempt_digest: `sha256:${'e'.repeat(64)}`,
+      scope: { configurations: ['configuration-1'], resources: ['resource-1'] },
+      state: 'held',
+    },
+    incomplete: true,
+    intent_digest: `sha256:${'f'.repeat(64)}`,
+    phase: 'fence_held',
+    request: {
+      correlation_id: null,
+      request_id: 'request-3',
+      request_owner_epoch: 'browser-epoch-3',
+      source_label: 'composer_ui',
+    },
+    terminal_state: null,
   };
 }
 
@@ -622,11 +652,9 @@ describe('Program product projections', () => {
       typed_parameter_overrides: {},
     };
     const headless = {
-      schema_version: 'manyforge.program_apply_result.v1',
+      schema_version: 'manyforge.program_apply_result.v2',
       status: 'applied',
-      deployment_apply_required: false,
       preparation: {},
-      manager_response: null,
       applied,
     };
     const response = parseProgramWorkspaceTransitionResponse({
@@ -637,18 +665,16 @@ describe('Program product projections', () => {
 
     expect(response.status).toBe('applied');
     expect(response.workspace.draft.programLoaded).toBe(true);
-    expect(parseProgramWorkspaceTransitionResponse({
+    expect(() => parseProgramWorkspaceTransitionResponse({
       status: 'pending_deployment',
       headless: {
-        schema_version: 'manyforge.program_apply_result.v1',
+        schema_version: 'manyforge.program_apply_result.v2',
         status: 'pending_deployment',
-        deployment_apply_required: true,
         preparation: {},
-        manager_response: null,
         applied: null,
       },
       workspace: workspaceFixture(),
-    }).status).toBe('pending_deployment');
+    })).toThrow(/closed record|status/);
     expect(parseProgramWorkspaceTransitionResponse({
       status: 'reverted',
       headless: null,
@@ -1277,7 +1303,7 @@ describe('headless projection parsers', () => {
       source_owner_epoch: 'manager.epoch.1',
       source_owner_id: 'component-manager.cell-a',
     };
-    const status = parseManagerStatusProjection({
+    const statusWire = {
       schema_version: 'manyforge.manager_status_projection.v1',
       source,
       status: {
@@ -1290,7 +1316,7 @@ describe('headless projection parsers', () => {
         },
         apply: {
           mutation_available: true,
-          records: [],
+          records: [managerApplyRecordFixture()],
           unavailable_reason_code: null,
         },
         cell_id: 'cell-a',
@@ -1301,7 +1327,8 @@ describe('headless projection parsers', () => {
           observed_units: [],
         },
       },
-    });
+    };
+    const status = parseManagerStatusProjection(statusWire);
     const graph = parseManagerGraphProjection({
       schema_version: 'manyforge.manager_graph_projection.v1',
       source,
@@ -1318,8 +1345,17 @@ describe('headless projection parsers', () => {
     });
 
     expect(status.status.active.graphRevision).toBe('graph.1');
+    expect(status.status.apply.records[0]?.request.requestId).toBe('request-3');
+    expect(status.status.apply.records[0]?.phase).toBe('fence_held');
     expect(graph.retainedBundleId).toBe('bundle.1');
     expect(diff.converged).toBe(true);
+
+    const malformed = managerApplyRecordFixture();
+    malformed.phase = 'browser_waiting';
+    statusWire.status.apply.records = [malformed];
+    expect(() => parseManagerStatusProjection(statusWire)).toThrow(
+      'a supported Manager Apply phase',
+    );
   });
 
   it('accepts exact runtime and four-state alarm snapshots', () => {
@@ -1377,6 +1413,27 @@ describe('addressed Robot Control parsers', () => {
     revision_id: 3,
     content_hash: 'sha256:scene',
   };
+
+  it('requires the backend-owned operation residency fact', () => {
+    const response = {
+      ok: true,
+      command: 'read',
+      resident: true,
+      operation: {
+        operation_id: 'operation-1',
+        operation_revision: 4,
+        state: 'completed',
+        participants: [{ progress: 1, terminal_error: null }],
+        active_stop_id: null,
+        active_stop_generation: null,
+      },
+    };
+    expect(parseOperationObservation(response).resident).toBe(true);
+
+    const missing = structuredClone(response) as Record<string, unknown>;
+    delete missing.resident;
+    expect(() => parseOperationObservation(missing)).toThrow();
+  });
 
   it('accepts source-local limits and exactly one matching observation', () => {
     const response = {

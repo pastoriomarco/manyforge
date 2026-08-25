@@ -4,6 +4,7 @@ import json
 import os
 from pathlib import Path
 import socket
+import stat
 import threading
 
 import pytest
@@ -400,6 +401,46 @@ def test_client_rejects_wrong_endpoint_and_response_identity(
     assert crossed.value.code == (
         "manager_scene_runtime_response_identity_mismatch"
     )
+
+
+def test_client_rejects_unsafe_or_replaced_manager_run_root(
+    tmp_path: Path,
+) -> None:
+    unsafe = tmp_path / "unsafe"
+    unsafe.mkdir(mode=0o700)
+    unsafe.chmod(0o720)
+    with pytest.raises(SceneRuntimeManagerError, match="safe real"):
+        ManagerSceneRuntimeClient(unsafe)
+
+    run_root = tmp_path / "run"
+    run_root.mkdir(mode=0o700)
+    client = ManagerSceneRuntimeClient(run_root)
+    run_root.rename(tmp_path / "retained-run")
+    run_root.mkdir(mode=0o700)
+    with pytest.raises(SceneRuntimeManagerError, match="identity changed"):
+        client.read_owner()
+
+
+def test_client_pins_manager_run_root_through_socket_use(
+    tmp_path: Path,
+) -> None:
+    run_root = tmp_path / "run"
+    run_root.mkdir(mode=0o700)
+    socket_path = run_root / "manager-command.sock"
+    listener = socket.socket(socket.AF_UNIX, socket.SOCK_SEQPACKET)
+    listener.bind(str(socket_path))
+    socket_path.chmod(0o600)
+    client = ManagerSceneRuntimeClient(run_root)
+
+    try:
+        with pytest.raises(SceneRuntimeManagerError, match="changed during use"):
+            with client._socket_address() as address:  # noqa: SLF001
+                retained_root = tmp_path / "retained-run"
+                run_root.rename(retained_root)
+                run_root.mkdir(mode=0o700)
+                assert stat.S_ISSOCK(os.stat(address).st_mode)
+    finally:
+        listener.close()
 
 
 def test_observation_intent_and_sequence_are_strict_and_bounded(

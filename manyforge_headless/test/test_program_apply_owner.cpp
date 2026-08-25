@@ -1,6 +1,8 @@
 #include <gtest/gtest.h>
 
 #include <cstdint>
+#include <barrier>
+#include <exception>
 #include <filesystem>
 #include <fstream>
 #include <iterator>
@@ -8,6 +10,7 @@
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <thread>
 #include <utility>
 #include <variant>
 #include <vector>
@@ -50,7 +53,6 @@ public:
       throw std::runtime_error("Program Apply test mkdtemp failed");
     }
     root_ = created;
-    std::filesystem::create_directory(publications());
     std::filesystem::create_directory(artifacts());
     std::filesystem::create_directory(owner_state());
     std::filesystem::copy(MANYFORGE_HEADLESS_TEST_ASSISTANT_PACKAGE_ROOT,
@@ -64,9 +66,6 @@ public:
 
   [[nodiscard]] std::filesystem::path package() const {
     return root_ / "package";
-  }
-  [[nodiscard]] std::filesystem::path publications() const {
-    return root_ / "publications";
   }
   [[nodiscard]] std::filesystem::path artifacts() const {
     return root_ / "artifacts";
@@ -248,6 +247,50 @@ Baseline(const std::filesystem::path &package) {
       .LoadExactProgramSelection("program_apply_fixture");
 }
 
+[[nodiscard]] CanonicalValue PrepareCandidate(
+    ProgramSelectionOwner &owner,
+    const deployment::ScenarioProgramSelection &selection,
+    const std::string_view canonical_program_bytes) {
+  return owner.Prepare(
+      selection.scenario_id, selection.scenario_catalog_revision.value(),
+      canonical_program_bytes, selection.retained_bundle_id.value(),
+      selection.graph_revision.value());
+}
+
+[[nodiscard]] CanonicalValue WithForeignLedgerOwner(
+    const CanonicalValue &owner_state) {
+  auto state_members = owner_state.as_object();
+  for (auto &[state_field, state_value] : state_members) {
+    if (state_field != "requests") {
+      continue;
+    }
+    auto requests = state_value.as_array();
+    auto request_members = requests.front().as_object();
+    for (auto &[request_field, request_value] : request_members) {
+      if (request_field == "selection_source_owner_id") {
+        request_value = CanonicalValue("foreign.program-selection");
+      }
+    }
+    requests.front() = CanonicalValue(std::move(request_members));
+    state_value = CanonicalValue(std::move(requests));
+  }
+  return CanonicalValue(std::move(state_members));
+}
+
+void ReplaceOwnerState(const std::filesystem::path &directory,
+                       const std::string_view owner_id,
+                       const std::string_view owner_epoch,
+                       CanonicalValue payload) {
+  const auto replacement = SourceSnapshotCodec::Create(
+      "program_selection", std::string(owner_id), std::string(owner_epoch),
+      1U, 20, std::move(payload));
+  std::ofstream stream(directory / kProgramSelectionOwnerStateFile,
+                       std::ios::binary | std::ios::trunc);
+  ASSERT_TRUE(stream);
+  stream << SourceSnapshotCodec::Encode(replacement);
+  ASSERT_TRUE(stream);
+}
+
 TEST(ProgramSelectionOwnerTest,
      PreparesCommitsReplaysAndReopensOneExactAppliedSelection) {
   TemporaryDirectory directory;
@@ -255,16 +298,15 @@ TEST(ProgramSelectionOwnerTest,
   const auto package_before = PackageFiles(directory.package());
   ProgramSelectionOwner owner(
       directory.package(), directory.artifacts(), directory.owner_state(),
-      directory.publications(), "headless-api.test.program-selection",
-      "epoch.1");
-  CanonicalValue replay;
+      "headless-api.test.program-selection", "epoch.1");
+  CanonicalValue first_outcome;
+  CanonicalValue second_outcome;
   std::string preparation_bytes;
   std::string first_record;
   {
     ScopedReadOnlyTree package_read_only(directory.package());
-    const auto prepared = owner.Prepare(
-        baseline.scenario_id, baseline.scenario_catalog_revision.value(),
-        CandidateProgram(baseline, "Changed Program"));
+    const auto prepared = PrepareCandidate(
+        owner, baseline, CandidateProgram(baseline, "Changed Program"));
 
     EXPECT_EQ(Text(prepared, "schema_version"),
               kProgramApplyPreparationSchemaVersion);
@@ -301,17 +343,17 @@ TEST(ProgramSelectionOwnerTest,
     const auto &source = Member(applied, "source");
     first_record = Text(source, "record_digest");
 
-    replay = owner.Commit(preparation_bytes, first_record,
-                          "authoring.epoch.1", "request.1",
-                          baseline.retained_bundle_id.value(),
-                          baseline.graph_revision.value(), 11);
-    EXPECT_EQ(Text(Member(replay, "source"), "record_digest"), first_record);
-    const auto conflicting = owner.Prepare(
-        baseline.scenario_id, baseline.scenario_catalog_revision.value(),
-        CandidateProgram(baseline, "Conflicting replay"));
+    first_outcome = owner.Commit(
+        preparation_bytes, std::nullopt, "authoring.epoch.1", "request.1",
+        baseline.retained_bundle_id.value(), baseline.graph_revision.value(),
+        11);
+    EXPECT_EQ(Text(Member(first_outcome, "source"), "record_digest"),
+              first_record);
+    const auto conflicting = PrepareCandidate(
+        owner, baseline, CandidateProgram(baseline, "Conflicting replay"));
     try {
       static_cast<void>(owner.Commit(
-          content_identity::canonical_json(conflicting), first_record,
+          content_identity::canonical_json(conflicting), std::nullopt,
           "authoring.epoch.1", "request.1",
           baseline.retained_bundle_id.value(), baseline.graph_revision.value(),
           12));
@@ -319,30 +361,167 @@ TEST(ProgramSelectionOwnerTest,
     } catch (const ProgramApplyError &error) {
       EXPECT_EQ(error.code(), "program_apply_request_conflict");
     }
-    EXPECT_EQ(owner.ReadApplied(), replay);
+
+    const auto second = PrepareCandidate(
+        owner, baseline, CandidateProgram(baseline, "Later Program"));
+    second_outcome = owner.Commit(
+        content_identity::canonical_json(second), first_record,
+        "authoring.epoch.1", "request.2",
+        baseline.retained_bundle_id.value(), baseline.graph_revision.value(),
+        13);
+    EXPECT_NE(Text(Member(second_outcome, "source"), "record_digest"),
+              first_record);
+    EXPECT_EQ(owner.Commit(preparation_bytes, std::nullopt,
+                           "authoring.epoch.1", "request.1",
+                           baseline.retained_bundle_id.value(),
+                           baseline.graph_revision.value(), 14),
+              first_outcome);
+    EXPECT_EQ(owner.ReadApplied(), second_outcome);
     EXPECT_EQ(PackageFiles(directory.package()), package_before);
   }
 
   ASSERT_TRUE(std::filesystem::remove(directory.package() /
                                       "maintained.scenario-catalog.yaml"));
-  ASSERT_TRUE(std::filesystem::remove(
-      directory.publications() /
-      std::string(kAppliedProgramSelectionSourceFile)));
   const auto package_after_catalog_removal = PackageFiles(directory.package());
   ProgramSelectionOwner restarted(
       directory.package(), directory.artifacts(), directory.owner_state(),
-      directory.publications(), "headless-api.test.program-selection",
-      "epoch.2");
-  EXPECT_EQ(restarted.ReadApplied(), replay);
-  EXPECT_TRUE(std::filesystem::is_regular_file(
-      directory.publications() /
-      std::string(kAppliedProgramSelectionSourceFile)));
-  EXPECT_EQ(restarted.Commit(preparation_bytes, first_record,
+      "headless-api.test.program-selection", "epoch.2");
+  EXPECT_EQ(restarted.ReadApplied(), second_outcome);
+  EXPECT_EQ(restarted.Commit(preparation_bytes, std::nullopt,
                              "authoring.epoch.1", "request.1",
                              baseline.retained_bundle_id.value(),
                              baseline.graph_revision.value(), 12),
-            replay);
+            first_outcome);
+  EXPECT_EQ(restarted.ReadApplied(), second_outcome);
   EXPECT_EQ(PackageFiles(directory.package()), package_after_catalog_removal);
+}
+
+TEST(ProgramSelectionOwnerTest,
+     ConcurrentExactRequestCommitsOnceAndReturnsOneOutcome) {
+  TemporaryDirectory directory;
+  const auto baseline = Baseline(directory.package());
+  ProgramSelectionOwner owner(
+      directory.package(), directory.artifacts(), directory.owner_state(),
+      "headless-api.test.program-selection", "epoch.1");
+  const auto preparation = content_identity::canonical_json(PrepareCandidate(
+      owner, baseline, CandidateProgram(baseline, "Concurrent Program")));
+  std::barrier gate(3);
+  CanonicalValue outcomes[2];
+  std::exception_ptr errors[2];
+  const auto invoke = [&](const std::size_t index) {
+    gate.arrive_and_wait();
+    try {
+      outcomes[index] = owner.Commit(
+          preparation, std::nullopt, "authoring.concurrent", "request.same",
+          baseline.retained_bundle_id.value(), baseline.graph_revision.value(),
+          static_cast<std::int64_t>(20U + index));
+    } catch (...) {
+      errors[index] = std::current_exception();
+    }
+  };
+  std::thread first(invoke, 0U);
+  std::thread second(invoke, 1U);
+  gate.arrive_and_wait();
+  first.join();
+  second.join();
+
+  EXPECT_EQ(errors[0], nullptr);
+  EXPECT_EQ(errors[1], nullptr);
+  EXPECT_EQ(outcomes[0], outcomes[1]);
+  EXPECT_EQ(owner.ReadApplied(), outcomes[0]);
+}
+
+TEST(ProgramSelectionOwnerTest,
+     CommitRejectsForeignOuterOrLedgerOwnerBeforeResolvingReplay) {
+  for (const std::string_view corruption :
+       {"outer-id", "outer-epoch", "ledger-id"}) {
+    TemporaryDirectory directory;
+    const auto baseline = Baseline(directory.package());
+    constexpr std::string_view owner_id =
+        "headless-api.test.program-selection";
+    ProgramSelectionOwner owner(directory.package(), directory.artifacts(),
+                                directory.owner_state(), std::string(owner_id),
+                                "epoch.1");
+    const auto preparation = content_identity::canonical_json(PrepareCandidate(
+        owner, baseline, CandidateProgram(baseline, "Owned Program")));
+    static_cast<void>(owner.Commit(
+        preparation, std::nullopt, "authoring.epoch.1", "request.1",
+        baseline.retained_bundle_id.value(), baseline.graph_revision.value(),
+        10));
+
+    AtomicSourceSnapshotChannel channel(
+        directory.owner_state(), std::string(kProgramSelectionOwnerStateFile));
+    const auto published = channel.Read();
+    ASSERT_TRUE(published.has_value());
+    ReplaceOwnerState(
+        directory.owner_state(),
+        corruption == "outer-id" ? "foreign.program-selection" : owner_id,
+        corruption == "outer-epoch" ? "foreign.epoch"
+                                      : published->source_owner_epoch,
+        corruption == "ledger-id"
+            ? WithForeignLedgerOwner(published->payload)
+            : published->payload);
+    const auto before = PackageFiles(directory.owner_state());
+
+    try {
+      static_cast<void>(owner.Commit(
+          preparation, std::nullopt, "authoring.epoch.1", "request.1",
+          baseline.retained_bundle_id.value(), baseline.graph_revision.value(),
+          21));
+      FAIL() << "Program Apply replayed state attributed to another owner";
+    } catch (const ProgramApplyError &error) {
+      EXPECT_EQ(error.code(), "program_applied_selection_invalid");
+    }
+    EXPECT_EQ(PackageFiles(directory.owner_state()), before);
+  }
+}
+
+TEST(ProgramSelectionOwnerTest,
+     RequestOwnerLedgerRotatesOnlyAfterValidatedNewEpochCommit) {
+  TemporaryDirectory directory;
+  const auto baseline = Baseline(directory.package());
+  ProgramSelectionOwner owner(
+      directory.package(), directory.artifacts(), directory.owner_state(),
+      "headless-api.test.program-selection", "epoch.1");
+  const auto first_preparation = content_identity::canonical_json(
+      PrepareCandidate(owner, baseline,
+                       CandidateProgram(baseline, "First owner Program")));
+  const auto first = owner.Commit(
+      first_preparation, std::nullopt, "authoring.owner.1", "request.1",
+      baseline.retained_bundle_id.value(), baseline.graph_revision.value(), 10);
+  const auto first_record = Text(Member(first, "source"), "record_digest");
+  const auto replacement_preparation = content_identity::canonical_json(
+      PrepareCandidate(owner, baseline,
+                       CandidateProgram(baseline, "Replacement owner Program")));
+
+  try {
+    static_cast<void>(owner.Commit(
+        replacement_preparation, "sha256:" + std::string(64U, 'f'),
+        "authoring.owner.2", "request.2",
+        baseline.retained_bundle_id.value(), baseline.graph_revision.value(), 20));
+    FAIL() << "Program Apply accepted a stale replacement-owner request";
+  } catch (const ProgramApplyError &error) {
+    EXPECT_EQ(error.code(), "program_apply_selection_stale");
+  }
+  EXPECT_EQ(owner.Commit(first_preparation, std::nullopt,
+                         "authoring.owner.1", "request.1",
+                         baseline.retained_bundle_id.value(),
+                         baseline.graph_revision.value(), 21),
+            first);
+
+  const auto replacement = owner.Commit(
+      replacement_preparation, first_record, "authoring.owner.2", "request.2",
+      baseline.retained_bundle_id.value(), baseline.graph_revision.value(), 30);
+  EXPECT_EQ(owner.ReadApplied(), replacement);
+  try {
+    static_cast<void>(owner.Commit(
+        first_preparation, std::nullopt, "authoring.owner.1", "request.1",
+        baseline.retained_bundle_id.value(), baseline.graph_revision.value(), 31));
+    FAIL() << "Program Apply retained a superseded request-owner ledger";
+  } catch (const ProgramApplyError &error) {
+    EXPECT_EQ(error.code(), "program_apply_selection_stale");
+  }
+  EXPECT_EQ(owner.ReadApplied(), replacement);
 }
 
 TEST(ProgramSelectionOwnerTest,
@@ -351,11 +530,9 @@ TEST(ProgramSelectionOwnerTest,
   const auto baseline = Baseline(directory.package());
   ProgramSelectionOwner owner(
       directory.package(), directory.artifacts(), directory.owner_state(),
-      directory.publications(), "headless-api.test.program-selection",
-      "epoch.1");
-  const auto first = owner.Prepare(baseline.scenario_id,
-                                   baseline.scenario_catalog_revision.value(),
-                                   CandidateProgram(baseline, "First Program"));
+      "headless-api.test.program-selection", "epoch.1");
+  const auto first = PrepareCandidate(
+      owner, baseline, CandidateProgram(baseline, "First Program"));
   const auto first_applied = owner.Commit(
       content_identity::canonical_json(first), std::nullopt,
       "authoring.epoch.1", "request.1",
@@ -363,14 +540,17 @@ TEST(ProgramSelectionOwnerTest,
   const auto first_record =
       Text(Member(first_applied, "source"), "record_digest");
 
-  EXPECT_THROW(owner.Prepare(baseline.scenario_id,
-                             baseline.scenario_catalog_revision.value(), "{}"),
+  EXPECT_THROW(owner.Prepare(
+                   baseline.scenario_id,
+                   baseline.scenario_catalog_revision.value(), "{}",
+                   baseline.retained_bundle_id.value(),
+                   baseline.graph_revision.value()),
                ProgramApplyError);
   EXPECT_EQ(Text(Member(owner.ReadApplied(), "source"), "record_digest"),
             first_record);
 
-  const auto owner_state_failure = owner.Prepare(
-      baseline.scenario_id, baseline.scenario_catalog_revision.value(),
+  const auto owner_state_failure = PrepareCandidate(
+      owner, baseline,
       CandidateProgram(baseline, "Owner State Failure Program"));
   {
     ScopedBlockedDirectory blocked_owner_state(directory.owner_state());
@@ -384,8 +564,8 @@ TEST(ProgramSelectionOwnerTest,
   EXPECT_EQ(Text(Member(owner.ReadApplied(), "source"), "record_digest"),
             first_record);
 
-  const auto second = owner.Prepare(
-      baseline.scenario_id, baseline.scenario_catalog_revision.value(),
+  const auto second = PrepareCandidate(
+      owner, baseline,
       CandidateProgram(baseline, "Second Program"));
   EXPECT_THROW(owner.Commit(content_identity::canonical_json(second),
                             first_record, "authoring.epoch.1", "request.2",
@@ -403,9 +583,8 @@ TEST(ProgramSelectionOwnerTest,
       Text(Member(second_applied, "source"), "record_digest");
   EXPECT_NE(second_record, first_record);
 
-  const auto third = owner.Prepare(baseline.scenario_id,
-                                   baseline.scenario_catalog_revision.value(),
-                                   CandidateProgram(baseline, "Third Program"));
+  const auto third = PrepareCandidate(
+      owner, baseline, CandidateProgram(baseline, "Third Program"));
   EXPECT_THROW(owner.Commit(content_identity::canonical_json(third),
                             first_record, "authoring.epoch.1", "request.3",
                             baseline.retained_bundle_id.value(),
@@ -421,10 +600,9 @@ TEST(ProgramSelectionOwnerTest,
   const auto baseline = Baseline(directory.package());
   ProgramSelectionOwner owner(
       directory.package(), directory.artifacts(), directory.owner_state(),
-      directory.publications(), "headless-api.test.program-selection",
-      "epoch.1");
-  const auto admissible = owner.Prepare(
-      baseline.scenario_id, baseline.scenario_catalog_revision.value(),
+      "headless-api.test.program-selection", "epoch.1");
+  const auto admissible = PrepareCandidate(
+      owner, baseline,
       CandidateProgram(baseline, "Changed compatible metadata",
                        CompatibilityChange::kAdmissible));
   EXPECT_NE(Text(admissible, "program_revision"),
@@ -433,8 +611,8 @@ TEST(ProgramSelectionOwnerTest,
   for (const auto mismatch : {CompatibilityChange::kWrongLane,
                               CompatibilityChange::kMissingRequirement}) {
     try {
-      static_cast<void>(owner.Prepare(
-          baseline.scenario_id, baseline.scenario_catalog_revision.value(),
+      static_cast<void>(PrepareCandidate(
+          owner, baseline,
           CandidateProgram(baseline, "Incompatible metadata", mismatch)));
       FAIL() << "Program Apply accepted deployment-incompatible metadata";
     } catch (const ProgramApplyError &error) {
@@ -444,15 +622,14 @@ TEST(ProgramSelectionOwnerTest,
 }
 
 TEST(ProgramSelectionOwnerTest,
-     RepositoryAndPublicationFailuresPreservePriorAppliedSelection) {
+     RepositoryFailurePreservesPriorAppliedSelection) {
   TemporaryDirectory directory;
   const auto baseline = Baseline(directory.package());
   ProgramSelectionOwner owner(
       directory.package(), directory.artifacts(), directory.owner_state(),
-      directory.publications(), "headless-api.test.program-selection",
-      "epoch.1");
-  const auto first = owner.Prepare(
-      baseline.scenario_id, baseline.scenario_catalog_revision.value(),
+      "headless-api.test.program-selection", "epoch.1");
+  const auto first = PrepareCandidate(
+      owner, baseline,
       CandidateProgram(baseline, "Prior Applied Program"));
   const auto first_applied = owner.Commit(
       content_identity::canonical_json(first), std::nullopt,
@@ -465,8 +642,8 @@ TEST(ProgramSelectionOwnerTest,
     ScopedBlockedDirectory blocked_program_repository(
         directory.artifacts() / "programs" / "sha256");
     try {
-      static_cast<void>(owner.Prepare(
-          baseline.scenario_id, baseline.scenario_catalog_revision.value(),
+      static_cast<void>(PrepareCandidate(
+          owner, baseline,
           CandidateProgram(baseline, "Repository Failure Program")));
       FAIL() << "Program Apply prepared through a blocked repository";
     } catch (const ProgramApplyError &error) {
@@ -476,20 +653,6 @@ TEST(ProgramSelectionOwnerTest,
   EXPECT_EQ(Text(Member(owner.ReadApplied(), "source"), "record_digest"),
             first_record);
 
-  const auto second = owner.Prepare(
-      baseline.scenario_id, baseline.scenario_catalog_revision.value(),
-      CandidateProgram(baseline, "Publication Failure Program"));
-  {
-    ScopedBlockedDirectory blocked_publication(directory.publications());
-    const auto applied = owner.Commit(
-        content_identity::canonical_json(second), first_record,
-        "authoring.epoch.1", "request.3",
-        baseline.retained_bundle_id.value(), baseline.graph_revision.value(),
-        20);
-    EXPECT_NE(Text(Member(applied, "source"), "record_digest"), first_record);
-  }
-  EXPECT_NE(Text(Member(owner.ReadApplied(), "source"), "record_digest"),
-            first_record);
 }
 
 TEST(ProgramSelectionOwnerTest,
@@ -518,11 +681,10 @@ TEST(ProgramSelectionOwnerTest,
     const auto package_before = PackageFiles(directory.package());
     ProgramSelectionOwner owner(
         directory.package(), directory.artifacts(), directory.owner_state(),
-        directory.publications(), "headless-api.test.program-selection",
-        "epoch.1");
+        "headless-api.test.program-selection", "epoch.1");
     try {
-      static_cast<void>(owner.Prepare(
-          baseline.scenario_id, baseline.scenario_catalog_revision.value(),
+      static_cast<void>(PrepareCandidate(
+          owner, baseline,
           CandidateProgram(baseline, "Baseline source must be package-only")));
       FAIL() << "Program Apply accepted an unavailable package baseline";
     } catch (const ProgramApplyError &error) {
@@ -539,10 +701,9 @@ TEST(ProgramSelectionOwnerTest,
     const auto baseline = Baseline(directory.package());
     ProgramSelectionOwner owner(
         directory.package(), directory.artifacts(), directory.owner_state(),
-        directory.publications(), "headless-api.test.program-selection",
-        "epoch.1");
-    const auto prepared = owner.Prepare(
-        baseline.scenario_id, baseline.scenario_catalog_revision.value(),
+        "headless-api.test.program-selection", "epoch.1");
+    const auto prepared = PrepareCandidate(
+        owner, baseline,
         CandidateProgram(baseline, remove_program ? "Binding Only"
                                                   : "Program Only"));
     const auto missing = RepositoryEntry(
@@ -564,8 +725,8 @@ TEST(ProgramSelectionOwnerTest,
     }
     EXPECT_THROW(owner.ReadApplied(), ProgramApplyError);
 
-    const auto repaired = owner.Prepare(
-        baseline.scenario_id, baseline.scenario_catalog_revision.value(),
+    const auto repaired = PrepareCandidate(
+        owner, baseline,
         CandidateProgram(baseline, remove_program ? "Binding Only"
                                                   : "Program Only"));
     EXPECT_NO_THROW(static_cast<void>(owner.Commit(

@@ -3,15 +3,17 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
-import os
 from pathlib import Path
 import socket
-import stat
 from typing import Any, Protocol
 
 import rfc8785
 
 from .native import HeadlessApiError, strict_json_object
+from .private_transport import (
+    PinnedRunRoot,
+    PrivateTransportCapabilityError,
+)
 
 
 CCLC_SOCKET_FILE = "cclc-command.sock"
@@ -61,25 +63,17 @@ def _canonical_json(
 class CCLCOpenRequestClient:
     """Forward exact requests without caching, reducing, or replaying CCLC state."""
 
-    def __init__(self, state_root: Path, *, timeout_seconds: float = 5.0) -> None:
+    def __init__(self, run_root: Path, *, timeout_seconds: float = 5.0) -> None:
         if not 0 < timeout_seconds <= 30:
             raise ValueError("CCLC timeout must be in (0, 30] seconds")
-        self._socket_path = state_root / CCLC_SOCKET_FILE
-        self._timeout_seconds = timeout_seconds
-
-    def _validate_socket(self) -> None:
         try:
-            metadata = self._socket_path.lstat()
-        except FileNotFoundError as exc:
+            self._run_root = PinnedRunRoot(run_root)
+        except PrivateTransportCapabilityError as error:
             raise HeadlessApiError(
                 "cclc_owner_unavailable",
-                "CCLC command socket is absent",
-            ) from exc
-        if not stat.S_ISSOCK(metadata.st_mode) or metadata.st_uid != os.geteuid():
-            raise HeadlessApiError(
-                "cclc_owner_unavailable",
-                "CCLC command path is not the expected same-user socket",
-            )
+                f"CCLC run capability is invalid: {error}",
+            ) from error
+        self._timeout_seconds = timeout_seconds
 
     def _exchange(
         self, command: str, payload: Mapping[str, Any]
@@ -99,27 +93,34 @@ class CCLCOpenRequestClient:
                 "cclc_open_request_oversized",
                 "CCLC request exceeds its byte bound",
             )
-        self._validate_socket()
         try:
-            with socket.socket(socket.AF_UNIX, socket.SOCK_SEQPACKET) as client:
-                client.setsockopt(
-                    socket.SOL_SOCKET,
-                    socket.SO_RCVBUF,
-                    MAX_CCLC_RESPONSE_BYTES,
-                )
-                client.settimeout(self._timeout_seconds)
-                client.connect(str(self._socket_path))
-                sent = client.send(encoded)
-                if sent != len(encoded):
-                    raise HeadlessApiError(
-                        "cclc_open_transport_failure",
-                        "CCLC request packet was truncated",
+            with self._run_root.socket_address(
+                CCLC_SOCKET_FILE
+            ) as socket_address:
+                with socket.socket(socket.AF_UNIX, socket.SOCK_SEQPACKET) as client:
+                    client.setsockopt(
+                        socket.SOL_SOCKET,
+                        socket.SO_RCVBUF,
+                        MAX_CCLC_RESPONSE_BYTES,
                     )
-                response_bytes, _ancillary, flags, _address = client.recvmsg(
-                    MAX_CCLC_RESPONSE_BYTES
-                )
+                    client.settimeout(self._timeout_seconds)
+                    client.connect(socket_address)
+                    sent = client.send(encoded)
+                    if sent != len(encoded):
+                        raise HeadlessApiError(
+                            "cclc_open_transport_failure",
+                            "CCLC request packet was truncated",
+                        )
+                    response_bytes, _ancillary, flags, _address = client.recvmsg(
+                        MAX_CCLC_RESPONSE_BYTES
+                    )
         except HeadlessApiError:
             raise
+        except PrivateTransportCapabilityError as exc:
+            raise HeadlessApiError(
+                "cclc_owner_unavailable",
+                f"CCLC command socket is unavailable: {exc}",
+            ) from exc
         except (OSError, TimeoutError) as exc:
             raise HeadlessApiError(
                 "cclc_owner_unavailable",

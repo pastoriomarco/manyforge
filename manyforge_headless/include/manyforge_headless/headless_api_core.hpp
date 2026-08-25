@@ -183,6 +183,12 @@ public:
   PrepareProgramApply(std::string_view scenario_id,
                       std::string_view expected_scenario_catalog_revision,
                       std::string_view canonical_program_bytes);
+  [[nodiscard]] manyforge::content_identity::CanonicalValue ReplayProgramApply(
+      std::string_view scenario_id,
+      std::string_view scenario_catalog_revision, std::string_view program_id,
+      std::string_view program_revision,
+      const std::optional<std::string> &expected_applied_record_digest,
+      std::string_view request_owner_epoch, std::string_view request_id);
   [[nodiscard]] manyforge::content_identity::CanonicalValue CommitProgramApply(
       std::string_view canonical_preparation_bytes,
       const std::optional<std::string> &expected_applied_record_digest,

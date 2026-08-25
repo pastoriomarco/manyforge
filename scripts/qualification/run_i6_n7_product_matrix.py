@@ -24,10 +24,12 @@ from urllib.request import Request, urlopen
 
 from manyforge_behavior.canonical_artifact import load_strict_json_yaml
 from manyforge_headless_api.client import HeadlessClientError, HeadlessHttpClient
+from manyforge_operator.cell_layout import CellInstanceLayout
+from websockets.sync.client import connect
 
-WORKSPACE = Path(os.environ.get("MANYFORGE_ROOT", "/workspace"))
-PACKAGE = Path(os.environ["N7_MATRIX_PACKAGE"])
-INSTALLED = Path(os.environ["N7_MATRIX_INSTALLED"])
+WORKSPACE = Path(os.environ.get("MANYFORGE_ROOT", "/workspace")).resolve()
+PACKAGE = Path(os.environ["N7_MATRIX_PACKAGE"]).resolve()
+INSTALLED = Path(os.environ["N7_MATRIX_INSTALLED"]).resolve()
 NODE_CATALOG = WORKSPACE / "manyforge_behavior/resources/node_catalog.yaml"
 ALARM_CATALOG = Path(
     WORKSPACE / "manyforge_headless/resources/operator-alarm-catalog.v1.yaml"
@@ -240,6 +242,193 @@ def stop(process: subprocess.Popen[bytes] | None) -> None:
         process.wait(timeout=5)
 
 
+def _process_commands(
+    *,
+    scenario_id: str,
+    cell_id: str,
+    admission_filename: str,
+    model_config: Path,
+    api_port: int,
+    runner_port: int,
+    composer_port: int,
+    layout: CellInstanceLayout,
+) -> dict[str, list[str]]:
+    api_url = f"http://127.0.0.1:{api_port}"
+    manager_state_root = layout.owner_state_root("manager")
+    manager_run_root = layout.run_root / "manager"
+    execution_state_root = layout.owner_state_root("execution-host")
+    execution_run_root = layout.run_root / "execution-host"
+    program_cycle_journal = (
+        layout.owner_state_root("program-runner") / "program-cycle.sqlite3"
+    )
+    authoring_state_root = layout.owner_state_root("composer-authoring")
+    program_runner_liveness_socket = (
+        manager_run_root / "program-runner-liveness.sock"
+    )
+    return {
+        "manager": [
+            str(INSTALLED / "manyforge_manager_daemon"),
+            "--install-root",
+            str(PACKAGE),
+            "--canonical-empty-admission-filename",
+            admission_filename,
+            "--manager-state-root",
+            str(manager_state_root),
+            "--manager-run-root",
+            str(manager_run_root),
+            "--execution-state-root",
+            str(execution_state_root),
+            "--execution-run-root",
+            str(execution_run_root),
+            "--logical-scene-database",
+            str(layout.owner_state_root("logical-scene") / "scene.sqlite3"),
+            "--program-cycle-journal",
+            str(program_cycle_journal),
+            "--authoring-transaction-journal",
+            str(authoring_state_root / "composer-authoring-transactions.sqlite3"),
+            "--projection-root",
+            str(layout.projection_root),
+            "--program-runner-liveness-socket",
+            str(program_runner_liveness_socket),
+            "--reconciliation-period-ms",
+            "20",
+        ],
+        "program": [
+            sys.executable,
+            "-m",
+            "manyforge_program_runner",
+            "--host",
+            "127.0.0.1",
+            "--port",
+            str(runner_port),
+            "--headless-url",
+            api_url,
+            "--owner-id",
+            f"program-runner.{scenario_id}",
+            "--headless-timeout-s",
+            "10",
+            "--execution-run-root",
+            str(execution_run_root),
+            "--cycle-journal-path",
+            str(program_cycle_journal),
+            "--manager-liveness-socket",
+            str(program_runner_liveness_socket),
+            "--cell-id",
+            cell_id,
+            "--model-endpoint-config",
+            str(model_config),
+        ],
+        "headless": [
+            sys.executable,
+            "-m",
+            "manyforge_headless_api",
+            "serve",
+            "--host",
+            "127.0.0.1",
+            "--port",
+            str(api_port),
+            "--projection-root",
+            str(layout.projection_root),
+            "--install-root",
+            str(PACKAGE),
+            "--artifact-root",
+            str(layout.artifact_root),
+            "--program-selection-state-root",
+            str(layout.owner_state_root("program-selection")),
+            "--node-catalog-path",
+            str(NODE_CATALOG),
+            "--alarm-catalog-path",
+            str(ALARM_CATALOG),
+            "--historian-database-path",
+            str(layout.owner_state_root("alarm-history") / "history.sqlite3"),
+            "--manager-run-root",
+            str(manager_run_root),
+            "--execution-run-root",
+            str(execution_run_root),
+            "--cell-id",
+            cell_id,
+            "--owner-id",
+            f"headless-api.{scenario_id}",
+            "--freshness-ms",
+            "120000",
+            "--manager-timeout-s",
+            "5",
+            "--program-runner-url",
+            f"http://127.0.0.1:{runner_port}",
+            "--program-runner-timeout-s",
+            "10",
+        ],
+        "composer": [
+            sys.executable,
+            "-m",
+            "manyforge_composer",
+            "--host",
+            "127.0.0.1",
+            "--port",
+            str(composer_port),
+            "--program-path",
+            str(PACKAGE / PROGRAM_FILES[scenario_id]),
+            "--headless-api-url",
+            api_url,
+            "--headless-api-timeout-s",
+            "15",
+            "--authoring-state-root",
+            str(authoring_state_root),
+        ],
+    }
+
+
+def _authoring_apply_body(
+    *,
+    workspace: dict[str, object],
+    snapshot: dict[str, object],
+    client_id: str,
+    scenario_id: str,
+    scenario_catalog_revision: str,
+) -> dict[str, object]:
+    draft = workspace.get("draft")
+    admission = snapshot.get("authoring_admission")
+    cycle = snapshot.get("program_cycle")
+    snapshot_draft = snapshot.get("draft_identity")
+    receiver_epoch = snapshot.get("receiver_epoch")
+    sequence = snapshot.get("snapshot_sequence")
+    if (
+        workspace.get("schemaVersion")
+        != "manyforge.composer_program_workspace.v1"
+        or snapshot.get("schema_version")
+        != "manyforge.composer_headless_state.v1"
+        or not client_id
+        or not isinstance(draft, dict)
+        or not isinstance(admission, dict)
+        or not isinstance(cycle, dict)
+        or not isinstance(snapshot_draft, dict)
+        or snapshot.get("complete") is not True
+        or admission.get("authoring_allowed") is not True
+        or cycle.get("state") != "idle_after_reset"
+        or snapshot_draft.get("draft_id") != draft.get("draftId")
+        or snapshot_draft.get("draft_revision") != draft.get("draftRevision")
+        or not isinstance(receiver_epoch, str)
+        or not receiver_epoch
+        or type(sequence) is not int
+        or sequence < 1
+        or type(admission.get("admission_generation")) is not int
+        or admission["admission_generation"] < 1
+    ):
+        raise RuntimeError("Composer did not publish one Apply-ready snapshot")
+    return {
+        "draftId": draft["draftId"],
+        "expectedDraftRevision": draft["draftRevision"],
+        "clientId": client_id,
+        "snapshotReceiverEpoch": receiver_epoch,
+        "snapshotSequence": sequence,
+        "expectedAdmissionGeneration": admission["admission_generation"],
+        "requestOwnerEpoch": "n7-product-matrix.authoring",
+        "requestId": f"n7.apply.{scenario_id}",
+        "scenarioCatalogRevision": scenario_catalog_revision,
+        "scenarioId": scenario_id,
+    }
+
+
 def qualify_scenario(
     scenario_id: str,
     cell_id: str,
@@ -249,110 +438,48 @@ def qualify_scenario(
 ) -> dict[str, object]:
     started_at = time.monotonic()
     with tempfile.TemporaryDirectory(prefix=f"n7-{scenario_id}-") as raw_root:
-        root = Path(raw_root)
-        manager_root = root / "manager"
-        runtime_root = root / "runtime"
-        publication_root = root / "publications"
-        for directory in (
-            manager_root,
-            runtime_root,
-            publication_root,
-        ):
-            directory.mkdir()
-        log_path = root / "stack.log"
+        root = Path(raw_root).resolve()
+        layout = CellInstanceLayout.open_or_create(
+            cell_id=cell_id,
+            cell_root=root,
+            install_root=PACKAGE,
+        )
+        log_path = layout.run_root / "operator" / "stack.log"
         log = log_path.open("wb")
         manager: subprocess.Popen[bytes] | None = None
         api: subprocess.Popen[bytes] | None = None
         runner: subprocess.Popen[bytes] | None = None
         composer: subprocess.Popen[bytes] | None = None
         try:
-            manager = subprocess.Popen(
-                [
-                    str(INSTALLED / "manyforge_manager_daemon"),
-                    "--package-root",
-                    str(PACKAGE),
-                    "--canonical-empty-admission-filename",
-                    admission_filename,
-                    "--manager-state-root",
-                    str(manager_root),
-                    "--runtime-state-root",
-                    str(runtime_root),
-                    "--logical-scene-database",
-                    str(root / "logical-scene.sqlite3"),
-                    "--publication-root",
-                    str(publication_root),
-                    "--reconciliation-period-ms",
-                    "20",
-                ],
-                stdout=log,
-                stderr=subprocess.STDOUT,
-            )
             api_port = free_port()
             runner_port = free_port()
             composer_port = free_port()
+            commands = _process_commands(
+                scenario_id=scenario_id,
+                cell_id=cell_id,
+                admission_filename=admission_filename,
+                model_config=model_config,
+                api_port=api_port,
+                runner_port=runner_port,
+                composer_port=composer_port,
+                layout=layout,
+            )
             api_url = f"http://127.0.0.1:{api_port}"
-            runner_url = f"http://127.0.0.1:{runner_port}"
             composer_url = f"http://127.0.0.1:{composer_port}"
             environment = os.environ.copy()
+            manager = subprocess.Popen(
+                commands["manager"],
+                stdout=log,
+                stderr=subprocess.STDOUT,
+            )
             runner = subprocess.Popen(
-                [
-                    sys.executable,
-                    "-m",
-                    "manyforge_program_runner",
-                    "--host",
-                    "127.0.0.1",
-                    "--port",
-                    str(runner_port),
-                    "--headless-url",
-                    api_url,
-                    "--owner-id",
-                    f"program-runner.{scenario_id}",
-                    "--headless-timeout-s",
-                    "10",
-                    "--model-endpoint-config",
-                    str(model_config),
-                ],
+                commands["program"],
                 stdout=log,
                 stderr=subprocess.STDOUT,
                 env=environment,
             )
             api = subprocess.Popen(
-                [
-                    sys.executable,
-                    "-m",
-                    "manyforge_headless_api",
-                    "serve",
-                    "--host",
-                    "127.0.0.1",
-                    "--port",
-                    str(api_port),
-                    "--publication-root",
-                    str(publication_root),
-                    "--package-root",
-                    str(PACKAGE),
-                    "--node-catalog-path",
-                    str(NODE_CATALOG),
-                    "--alarm-catalog-path",
-                    str(ALARM_CATALOG),
-                    "--historian-database-path",
-                    str(root / "history.sqlite3"),
-                    "--manager-state-root",
-                    str(manager_root),
-                    "--execution-state-root",
-                    str(runtime_root),
-                    "--cell-id",
-                    cell_id,
-                    "--owner-id",
-                    f"headless-api.{scenario_id}",
-                    "--freshness-ms",
-                    "120000",
-                    "--manager-timeout-s",
-                    "5",
-                    "--program-runner-url",
-                    runner_url,
-                    "--program-runner-timeout-s",
-                    "10",
-                ],
+                commands["headless"],
                 stdout=log,
                 stderr=subprocess.STDOUT,
                 env=environment,
@@ -362,21 +489,7 @@ def qualify_scenario(
             composer_environment["MANYFORGE_API_TOKEN"] = "ignored-legacy-token"
             composer_environment["MANYFORGE_FS_ROOTS"] = str(PACKAGE)
             composer = subprocess.Popen(
-                [
-                    sys.executable,
-                    "-m",
-                    "manyforge_composer",
-                    "--host",
-                    "127.0.0.1",
-                    "--port",
-                    str(composer_port),
-                    "--program-path",
-                    str(PACKAGE / PROGRAM_FILES[scenario_id]),
-                    "--headless-api-url",
-                    api_url,
-                    "--headless-api-timeout-s",
-                    "15",
-                ],
+                commands["composer"],
                 stdout=log,
                 stderr=subprocess.STDOUT,
                 env=composer_environment,
@@ -395,34 +508,50 @@ def qualify_scenario(
                     "GET",
                     "/api/program/workspace",
                 )
-                draft = workspace.get("draft")
-                if not isinstance(draft, dict):
-                    raise RuntimeError("Composer workspace has no Draft")
-                apply_body: dict[str, object] = {
-                    "draftId": draft["draftId"],
-                    "expectedDraftRevision": draft["draftRevision"],
-                    "scenarioCatalogRevision": catalog["scenario_catalog_revision"],
-                    "scenarioId": scenario_id,
-                }
-                apply_deadline = time.monotonic() + 35.0
-                while True:
+                browser_client_id = f"n7-product-matrix.{scenario_id}"
+                with connect(
+                    f"ws://127.0.0.1:{composer_port}/ws/state"
+                    f"?client_id={browser_client_id}",
+                    open_timeout=5.0,
+                    close_timeout=1.0,
+                    max_size=16 * 1024 * 1024,
+                    proxy=None,
+                ) as state_socket:
+                    raw_snapshot = state_socket.recv(timeout=5.0)
+                    if not isinstance(raw_snapshot, str):
+                        raise RuntimeError("Composer state snapshot is not text")
+                    snapshot_bytes = raw_snapshot.encode("utf-8")
+                    if len(snapshot_bytes) > 16 * 1024 * 1024:
+                        raise RuntimeError("Composer state snapshot is oversized")
+                    headless_snapshot = json.loads(snapshot_bytes)
+                    if not isinstance(headless_snapshot, dict):
+                        raise RuntimeError("Composer state snapshot is not an object")
+                    apply_body = _authoring_apply_body(
+                        workspace=workspace,
+                        snapshot=headless_snapshot,
+                        client_id=browser_client_id,
+                        scenario_id=scenario_id,
+                        scenario_catalog_revision=catalog[
+                            "scenario_catalog_revision"
+                        ],
+                    )
                     composer_apply = composer_json(
                         composer_url,
                         "POST",
                         "/api/program/apply",
                         apply_body,
                     )
-                    applied_result = composer_apply.get("headless")
-                    if not isinstance(applied_result, dict):
-                        raise RuntimeError("Composer Apply omitted Headless result")
-                    if applied_result.get("status") == "applied":
-                        applied = applied_result["applied"]
-                        break
-                    if time.monotonic() >= apply_deadline:
-                        raise RuntimeError(
-                            f"Program Apply did not converge: {applied_result}"
-                        )
-                    time.sleep(0.02)
+                applied_result = composer_apply.get("headless")
+                if (
+                    composer_apply.get("status") != "applied"
+                    or not isinstance(applied_result, dict)
+                    or applied_result.get("status") != "applied"
+                    or not isinstance(applied_result.get("applied"), dict)
+                ):
+                    raise RuntimeError(
+                        f"Composer Apply returned a divergent result: {composer_apply}"
+                    )
+                applied = applied_result["applied"]
                 selection = client.scenario_program_selection(scenario_id)
                 if selection["program"] != program:
                     raise RuntimeError("applied scenario selected another Program")
@@ -479,6 +608,7 @@ def qualify_scenario(
                 raise RuntimeError(
                     f"{scenario_id} failed for the wrong reason: {snapshot}"
                 )
+            layout.validate()
             return {
                 "elapsed_s": round(time.monotonic() - started_at, 3),
                 "reason_code": snapshot["reason_code"],

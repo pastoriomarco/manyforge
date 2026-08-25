@@ -773,7 +773,12 @@ RetainedObservedStateChannelConfig select_retained_state_channel_config(
 std::shared_ptr<RetainedNativeRuntime>
 create_retained_native_runtime_participants(
     RetainedNativeRuntimeInput input, RetainedNativeRuntimeConfig config,
-    std::shared_ptr<WallClock> shared_clock) {
+    std::shared_ptr<WallClock> shared_clock,
+    std::shared_ptr<SimpleScheduler> shared_scheduler) {
+  if ((shared_clock == nullptr) != (shared_scheduler == nullptr)) {
+    throw std::invalid_argument(
+        "native runtime clock and scheduler capabilities must be supplied together");
+  }
   if (!input.scene || !input.scene_mutex || !input.state_projector ||
       !input.collision_publisher || !input.planner ||
       !input.collision_shared_model || !input.reference_resolver_factory ||
@@ -934,7 +939,9 @@ create_retained_native_runtime_participants(
   runtime->clock = shared_clock != nullptr ? std::move(shared_clock)
                                            : std::make_shared<WallClock>();
   runtime->scheduler =
-      std::make_unique<SimpleScheduler>(std::move(config.scheduler));
+      shared_scheduler != nullptr
+          ? std::move(shared_scheduler)
+          : std::make_shared<SimpleScheduler>(std::move(config.scheduler));
   runtime->cache = std::make_unique<core::TrajectoryCache>(config.cache);
   runtime->planner = std::move(input.planner);
 
@@ -2084,6 +2091,7 @@ void attach_retained_native_addressed_owner(
     const std::shared_ptr<RetainedNativeRuntime> &runtime,
     RetainedNativeAddressedOwnerConfig config) {
   if (runtime == nullptr || runtime->clock == nullptr ||
+      runtime->scheduler == nullptr ||
       runtime->participant_registrations.empty() ||
       runtime->participant_engine == nullptr ||
       runtime->operation_journal != nullptr ||
@@ -2119,7 +2127,7 @@ void attach_retained_native_addressed_owner(
             runtime->clock.get());
     if (runtime->stop_surveillance_policy.has_value()) {
       stop_surveillance_config = core::StopSurveillanceExecutionConfig{
-          runtime->scheduler.get(), runtime->stop_surveillance_owner.get(),
+          runtime->stop_surveillance_owner.get(),
           *runtime->stop_surveillance_policy};
     }
     auto *const runtime_owner = runtime.get();
@@ -2205,7 +2213,8 @@ void attach_retained_native_addressed_owner(
     runtime->addressed_kernel =
         std::make_unique<core::ResourceAddressedExecutionKernel>(
             runtime->participant_registrations, *runtime->clock,
-            *runtime->operation_journal, std::move(addressed_config));
+            *runtime->scheduler, *runtime->operation_journal,
+            std::move(addressed_config));
     runtime->addressed_request_owner_epoch = kernel_request_owner_epoch;
     runtime->addressed_cell_id = kernel_cell_id;
   } catch (...) {

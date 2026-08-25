@@ -1119,6 +1119,9 @@ def test_cclc_startup_uses_fresh_owner_templates_and_full_binding_sets(
                 },
             }
 
+        def cclc_owner_identity(self):
+            return {"request_owner_epoch": "kernel-owner.runtime.1"}
+
         def cclc_component(self, component_id):
             assert component_id == scenario.component_id
             return {
@@ -1291,16 +1294,56 @@ def test_process_commands_bind_exact_component_world_and_pose_config(
         static_dir=source,
         startup_timeout_s=180.0,
         run_timeout_s=300.0,
-        composer_port=None,
+        composer_port=9000,
+    )
+    layout = live.CellInstanceLayout.open_or_create(
+        cell_id=scenario.cell_id,
+        cell_root=run,
+        install_root=package,
     )
     commands = live._process_commands(  # noqa: SLF001
         config,
         api_port=9010,
         runner_port=9020,
-        composer_port=None,
-        manager_root=run / "manager",
-        runtime_root=run / "runtime",
-        publication_root=run / "publications",
+        composer_port=9000,
+        layout=layout,
+    )
+
+    def value(arguments: list[str], option: str) -> str:
+        return arguments[arguments.index(option) + 1]
+
+    manager = commands["manager"]
+    assert "--runtime-state-root" not in manager
+    assert "--publication-root" not in manager
+    assert "--package-root" not in manager
+    for option in (
+        "--install-root",
+        "--manager-state-root",
+        "--manager-run-root",
+        "--execution-state-root",
+        "--execution-run-root",
+        "--program-cycle-journal",
+        "--authoring-transaction-journal",
+        "--projection-root",
+        "--program-runner-liveness-socket",
+    ):
+        assert manager.count(option) == 1
+    program = commands["program"]
+    for option in (
+        "--execution-run-root",
+        "--cycle-journal-path",
+        "--manager-liveness-socket",
+        "--cell-id",
+    ):
+        assert program.count(option) == 1
+    assert value(manager, "--execution-run-root") == value(
+        program, "--execution-run-root"
+    )
+    assert value(manager, "--program-cycle-journal") == value(
+        program, "--cycle-journal-path"
+    )
+    assert value(manager, "--program-runner-liveness-socket") == value(
+        program, "--manager-liveness-socket"
     )
     ros = commands["ros"]
     assert f"runtime_namespace:=/manyforge/{scenario.component_id}" in ros
@@ -1308,15 +1351,41 @@ def test_process_commands_bind_exact_component_world_and_pose_config(
     assert f"expected_world_name:={scenario.world_name}" in ros
     assert "scene_service_timeout_s:=120.0" in ros
     assert "additional_required_topics:=/tf" in ros
+    assert f"manager_run_root:={layout.run_root / 'manager'}" in ros
+    assert not any(item.startswith("manager_state_root:=") for item in ros)
     assert not any("DemoSupervisor" in item for item in ros)
     headless = commands["headless"]
     timeout_index = headless.index("--manager-timeout-s")
     assert headless[timeout_index + 1] == "12.0"
+    assert "--publication-root" not in headless
+    assert "--package-root" not in headless
+    assert "--manager-state-root" not in headless
+    assert "--execution-state-root" not in headless
+    for option in (
+        "--projection-root",
+        "--install-root",
+        "--artifact-root",
+        "--program-selection-state-root",
+        "--manager-run-root",
+        "--execution-run-root",
+    ):
+        assert headless.count(option) == 1
+    assert value(manager, "--manager-run-root") == value(
+        headless, "--manager-run-root"
+    )
+    assert value(manager, "--execution-run-root") == value(
+        headless, "--execution-run-root"
+    )
     assert tuple(
         headless[index + 1]
         for index, argument in enumerate(headless)
         if argument == "--resource-id"
     ) == scenario.runtime_resource_ids
+    assert commands["composer"].count("--authoring-state-root") == 1
+    assert value(manager, "--authoring-transaction-journal") == str(
+        Path(value(commands["composer"], "--authoring-state-root"))
+        / "composer-authoring-transactions.sqlite3"
+    )
 
 
 def test_recovery_evidence_requires_new_provider_epoch_and_bounded_outage(

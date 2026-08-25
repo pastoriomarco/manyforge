@@ -2,12 +2,239 @@
 
 from __future__ import annotations
 
+import os
+from pathlib import Path
 import sqlite3
 from threading import Barrier, Thread
 
 import pytest
 
 from manyforge_program_runner.cycle_journal import ProgramCycleJournal
+
+
+def _file_identity(
+    path: Path,
+) -> tuple[bytes, int, int, int, int, int, set[str]]:
+    metadata = path.stat()
+    return (
+        path.read_bytes(),
+        metadata.st_dev,
+        metadata.st_ino,
+        metadata.st_mode,
+        metadata.st_size,
+        metadata.st_mtime_ns,
+        {entry.name for entry in path.parent.iterdir()},
+    )
+
+
+def _database_file_identities(path: Path) -> dict[str, tuple[bytes, int, int, int, int]]:
+    result: dict[str, tuple[bytes, int, int, int, int]] = {}
+    for candidate in (path, Path(f"{path}-wal"), Path(f"{path}-shm")):
+        try:
+            metadata = candidate.lstat()
+        except FileNotFoundError:
+            continue
+        result[candidate.name] = (
+            candidate.read_bytes(),
+            metadata.st_dev,
+            metadata.st_ino,
+            metadata.st_mode,
+            metadata.st_mtime_ns,
+        )
+    return result
+
+
+@pytest.mark.parametrize(
+    "kind",
+    [
+        "malformed",
+        "old_schema",
+        "extra_table",
+        "weakened_constraint",
+        "malformed_row",
+    ],
+)
+def test_existing_unsupported_database_is_rejected_without_mutation(
+    tmp_path: Path, kind: str
+) -> None:
+    path = tmp_path / "cycle.sqlite3"
+    if kind == "malformed":
+        path.write_bytes(b"not-a-sqlite-database\n")
+    else:
+        journal = ProgramCycleJournal(path, owner_epoch="runner.old")
+        journal.close()
+        database = sqlite3.connect(path)
+        if kind == "old_schema":
+            database.execute("PRAGMA ignore_check_constraints=ON")
+            database.execute(
+                "UPDATE program_cycle_metadata SET schema_version=1 WHERE singleton=1"
+            )
+        elif kind == "extra_table":
+            database.execute("CREATE TABLE unsupported_old_state(value TEXT)")
+        elif kind == "weakened_constraint":
+            database.execute("PRAGMA writable_schema=ON")
+            database.execute(
+                "UPDATE sqlite_schema SET sql=replace(sql,"
+                "' CHECK(schema_version=2)','') "
+                "WHERE name='program_cycle_metadata'"
+            )
+            database.execute("PRAGMA writable_schema=OFF")
+        else:
+            database.execute(
+                "INSERT INTO program_cycle_requests VALUES(?,?,?,?,?,NULL,NULL)",
+                ("caller", "broken", "start", "{", 1),
+            )
+        database.commit()
+        database.close()
+    os.utime(path, ns=(path.stat().st_atime_ns, 1_700_000_000_000_000_000))
+    before = _file_identity(path)
+
+    with pytest.raises(RuntimeError):
+        ProgramCycleJournal(path, owner_epoch="runner.new")
+
+    assert _file_identity(path) == before
+
+
+def test_absent_database_creates_only_current_schema_under_existing_parent(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "new" / "nested" / "cycle.sqlite3"
+    path.parent.mkdir(parents=True)
+
+    journal = ProgramCycleJournal(path, owner_epoch="runner.current")
+    journal.close()
+
+    assert path.is_file()
+    database = sqlite3.connect(f"{path.as_uri()}?mode=ro", uri=True)
+    try:
+        assert database.execute(
+            "SELECT schema_version FROM program_cycle_metadata WHERE singleton=1"
+        ).fetchone() == (2,)
+        assert {
+            row[0]
+            for row in database.execute(
+                "SELECT name FROM sqlite_schema WHERE type='table'"
+            )
+        } == {
+            "program_cycle_metadata",
+            "program_cycle",
+            "program_cycle_requests",
+            "program_runner_liveness",
+            "program_run_history",
+        }
+    finally:
+        database.close()
+
+
+def test_absent_database_never_repairs_a_missing_parent(tmp_path: Path) -> None:
+    path = tmp_path / "missing" / "nested" / "cycle.sqlite3"
+    assert not path.parent.exists()
+
+    with pytest.raises(RuntimeError, match="parent cannot be inspected"):
+        ProgramCycleJournal(path, owner_epoch="runner.current")
+
+    assert not (tmp_path / "missing").exists()
+
+
+@pytest.mark.parametrize("suffix", ["-journal", "-wal", "-shm"])
+def test_absent_database_rejects_orphan_sidecar_without_mutation(
+    tmp_path: Path,
+    suffix: str,
+) -> None:
+    path = tmp_path / "cycle.sqlite3"
+    sidecar = Path(f"{path}{suffix}")
+    sidecar.write_bytes(b"orphaned durable state\n")
+    sidecar.chmod(0o600)
+    before = _file_identity(sidecar)
+
+    with pytest.raises(RuntimeError, match="orphan sidecars remain"):
+        ProgramCycleJournal(path, owner_epoch="runner.current")
+
+    assert not path.exists()
+    assert _file_identity(sidecar) == before
+
+
+def test_existing_hard_linked_database_is_rejected_without_mutation(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "cycle.sqlite3"
+    journal = ProgramCycleJournal(path, owner_epoch="runner.old")
+    journal.close()
+    os.link(path, tmp_path / "cycle-alias.sqlite3")
+    before = _file_identity(path)
+
+    with pytest.raises(RuntimeError, match="owner-held regular file"):
+        ProgramCycleJournal(path, owner_epoch="runner.new")
+
+    assert _file_identity(path) == before
+
+
+def test_replaced_parent_capability_is_rejected_before_next_operation(
+    tmp_path: Path,
+) -> None:
+    state_root = tmp_path / "state"
+    state_root.mkdir(mode=0o700)
+    path = state_root / "cycle.sqlite3"
+    journal = ProgramCycleJournal(path, owner_epoch="runner.old")
+    retained = tmp_path / "retained-state"
+    state_root.rename(retained)
+    state_root.mkdir(mode=0o700)
+
+    with pytest.raises(RuntimeError, match="replaced or changed"):
+        journal.read()
+
+    assert list(state_root.iterdir()) == []
+    journal.close()
+
+
+def test_runtime_rejects_an_unexpected_rollback_sidecar(tmp_path: Path) -> None:
+    path = tmp_path / "cycle.sqlite3"
+    journal = ProgramCycleJournal(path, owner_epoch="runner.old")
+    rollback = Path(f"{path}-journal")
+    rollback.write_bytes(b"unexpected rollback state")
+    rollback.chmod(0o600)
+
+    with pytest.raises(RuntimeError, match="unsupported rollback sidecar"):
+        journal.read()
+
+    journal.close()
+
+
+def test_read_only_preflight_sees_crash_left_wal_without_mutating_it(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "cycle.sqlite3"
+    journal = ProgramCycleJournal(path, owner_epoch="runner.old")
+    journal.close()
+
+    reader = sqlite3.connect(path, isolation_level=None)
+    try:
+        reader.execute("BEGIN")
+        assert reader.execute(
+            "SELECT schema_version FROM program_cycle_metadata"
+        ).fetchone() == (2,)
+        writer = sqlite3.connect(path, isolation_level=None)
+        try:
+            writer.execute("PRAGMA wal_autocheckpoint=0")
+            writer.execute("PRAGMA ignore_check_constraints=ON")
+            writer.execute("BEGIN IMMEDIATE")
+            writer.execute(
+                "UPDATE program_cycle_metadata SET schema_version=1 "
+                "WHERE singleton=1"
+            )
+            writer.execute("COMMIT")
+        finally:
+            writer.close()
+
+        assert Path(f"{path}-wal").is_file()
+        before = _database_file_identities(path)
+
+        with pytest.raises(RuntimeError, match="schema is unsupported"):
+            ProgramCycleJournal(path, owner_epoch="runner.new")
+
+        assert _database_file_identities(path) == before
+    finally:
+        reader.close()
 
 
 def test_terminal_blocks_new_cycle_and_reset_replays_after_restart(tmp_path) -> None:

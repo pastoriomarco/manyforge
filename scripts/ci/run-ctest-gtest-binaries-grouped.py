@@ -8,7 +8,9 @@ groups the exact enabled filters by executable, and verifies that each grouped
 process ran the same number of cases that CTest registered. Non-GTest CTest
 entries remain owned by CTest and are executed individually with their exact
 registered name; they are never mistaken for malformed GTest filters or
-silently omitted.
+silently omitted. Independent binary and ordinary-test failures are collected
+before the runner returns nonzero so one expensive sanitizer build exposes the
+widest practical diagnostic batch.
 """
 
 from __future__ import annotations
@@ -227,6 +229,7 @@ def run_isolated_fallback(
     total_ran = 0
     total_passed = 0
     total_skipped = 0
+    failures: list[str] = []
     for isolated_index, test_filter in enumerate(group.enabled_filters, start=1):
         command = [
             group.binary,
@@ -246,19 +249,26 @@ def run_isolated_fallback(
             flush=True,
         )
         if has_sanitizer_finding(status, output):
-            raise RuntimeError(
+            failures.append(
                 f"sanitizer finding in isolated GTest: {test_filter}"
             )
-        if status != 0 or ran != 1 or passed + skipped != 1:
-            raise RuntimeError(f"isolated GTest execution failed: {test_filter}")
+        elif status != 0 or ran != 1 or passed + skipped != 1:
+            failures.append(f"isolated GTest execution failed: {test_filter}")
         total_ran += ran
         total_passed += passed
         total_skipped += skipped
+    fallback_status = int(bool(failures))
     print(
-        f"GROUP_FALLBACK_RESULT index={index} status=0 ran={total_ran} "
+        f"GROUP_FALLBACK_RESULT index={index} status={fallback_status} "
+        f"ran={total_ran} "
         f"passed={total_passed} skipped={total_skipped} binary={group.binary}",
         flush=True,
     )
+    if failures:
+        raise RuntimeError(
+            f"{len(failures)} isolated GTest execution failure(s): "
+            + "; ".join(failures)
+        )
     return total_ran, total_passed, total_skipped
 
 
@@ -375,10 +385,15 @@ def main() -> int:
     total_skipped = 0
     executed_binaries = 0
     fallback_binaries = 0
+    failures: list[tuple[str, str, str]] = []
     for index, group in enumerate(groups.values(), start=1):
-        ran, passed, skipped, used_fallback = run_group(index, group)
         if group.enabled_filters:
             executed_binaries += 1
+        try:
+            ran, passed, skipped, used_fallback = run_group(index, group)
+        except (OSError, RuntimeError, subprocess.SubprocessError) as error:
+            failures.append(("gtest_binary", group.binary, str(error)))
+            continue
         if used_fallback:
             fallback_binaries += 1
         total_ran += ran
@@ -386,9 +401,13 @@ def main() -> int:
         total_skipped += skipped
 
     for index, test in enumerate(ordinary_tests, start=1):
-        ran, passed, skipped = run_ordinary_test(index, test, build_dir)
         if not test.disabled:
             executed_binaries += 1
+        try:
+            ran, passed, skipped = run_ordinary_test(index, test, build_dir)
+        except (OSError, RuntimeError, subprocess.SubprocessError) as error:
+            failures.append(("ordinary_ctest", test.name, str(error)))
+            continue
         total_ran += ran
         total_passed += passed
         total_skipped += skipped
@@ -400,12 +419,23 @@ def main() -> int:
         f"skipped={total_skipped} fallback_binaries={fallback_binaries}",
         flush=True,
     )
-    return 0
+    if failures:
+        for index, (kind, identity, detail) in enumerate(failures, start=1):
+            print(
+                f"{args.summary_prefix}_FAILURE index={index} kind={kind} "
+                f"identity={json.dumps(identity)} detail={json.dumps(detail)}",
+                flush=True,
+            )
+        print(
+            f"{args.summary_prefix}_FAILURE_SUMMARY failures={len(failures)}",
+            flush=True,
+        )
+    return int(bool(failures))
 
 
 if __name__ == "__main__":
     try:
         raise SystemExit(main())
-    except (RuntimeError, subprocess.SubprocessError, ValueError) as error:
+    except (OSError, RuntimeError, subprocess.SubprocessError, ValueError) as error:
         print(f"grouped GTest runner failed: {error}", file=sys.stderr)
         raise SystemExit(1)

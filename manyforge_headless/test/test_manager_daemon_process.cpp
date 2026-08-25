@@ -197,7 +197,8 @@ public:
     root_ = created;
     std::filesystem::create_directory(manager_root());
     std::filesystem::create_directory(manager_run_root());
-    std::filesystem::create_directory(runtime_root());
+    std::filesystem::create_directory(execution_state_root());
+    std::filesystem::create_directory(execution_run_root());
     std::filesystem::create_directory(publication_root());
   }
 
@@ -209,8 +210,11 @@ public:
   [[nodiscard]] std::filesystem::path manager_root() const {
     return root_ / "manager";
   }
-  [[nodiscard]] std::filesystem::path runtime_root() const {
-    return root_ / "runtime";
+  [[nodiscard]] std::filesystem::path execution_state_root() const {
+    return root_ / "execution-state";
+  }
+  [[nodiscard]] std::filesystem::path execution_run_root() const {
+    return root_ / "execution-run";
   }
   [[nodiscard]] std::filesystem::path manager_run_root() const {
     return root_ / "manager-run";
@@ -234,7 +238,7 @@ public:
     return root_ / "manager-startup.stderr";
   }
   [[nodiscard]] std::filesystem::path execution_socket_path() const {
-    return runtime_root() / "execution-command.sock";
+    return execution_run_root() / "execution-command.sock";
   }
   [[nodiscard]] std::filesystem::path program_runner_liveness_socket_path()
       const {
@@ -268,16 +272,21 @@ public:
           MANYFORGE_HEADLESS_TEST_CANONICAL_EMPTY_PACKAGE_ROOT,
       std::string admission_filename = "canonical-empty-admission.json",
       std::string executable = MANYFORGE_HEADLESS_TEST_MANAGER_DAEMON,
-      std::string program_runner_liveness_socket = {}) {
+      std::string program_runner_liveness_socket = {},
+      std::string projection_root = {}) {
     const auto manager_root = directory.manager_root().string();
     const auto manager_run_root = directory.manager_run_root().string();
-    const auto runtime_root = directory.runtime_root().string();
+    const auto execution_state_root =
+        directory.execution_state_root().string();
+    const auto execution_run_root = directory.execution_run_root().string();
     const auto scene_database = directory.scene_database().string();
     const auto program_cycle_journal =
         directory.program_cycle_journal().string();
     const auto authoring_transaction_journal =
         directory.authoring_transaction_journal().string();
-    const auto publication_root = directory.publication_root().string();
+    const auto publication_root = projection_root.empty()
+                                      ? directory.publication_root().string()
+                                      : projection_root;
     const auto startup_stderr = directory.startup_stderr().string();
     pid_ = ::fork();
     if (pid_ < 0) {
@@ -296,8 +305,9 @@ public:
                 package_root.c_str(), "--canonical-empty-admission-filename",
                 admission_filename.c_str(), "--manager-state-root",
                 manager_root.c_str(), "--manager-run-root",
-                manager_run_root.c_str(), "--runtime-state-root",
-                runtime_root.c_str(), "--logical-scene-database",
+                manager_run_root.c_str(), "--execution-state-root",
+                execution_state_root.c_str(), "--execution-run-root",
+                execution_run_root.c_str(), "--logical-scene-database",
                 scene_database.c_str(), "--program-cycle-journal",
                 program_cycle_journal.c_str(),
                 "--authoring-transaction-journal",
@@ -309,8 +319,9 @@ public:
                 package_root.c_str(), "--canonical-empty-admission-filename",
                 admission_filename.c_str(), "--manager-state-root",
                 manager_root.c_str(), "--manager-run-root",
-                manager_run_root.c_str(), "--runtime-state-root",
-                runtime_root.c_str(), "--logical-scene-database",
+                manager_run_root.c_str(), "--execution-state-root",
+                execution_state_root.c_str(), "--execution-run-root",
+                execution_run_root.c_str(), "--logical-scene-database",
                 scene_database.c_str(), "--program-cycle-journal",
                 program_cycle_journal.c_str(),
                 "--authoring-transaction-journal",
@@ -413,7 +424,7 @@ public:
                        const std::string &cell_id)
       : socket_path_(directory.program_runner_liveness_socket_path()),
         log_path_(directory.program_runner_log_path()) {
-    const auto runtime_root = directory.runtime_root().string();
+    const auto execution_run_root = directory.execution_run_root().string();
     const auto journal = directory.program_cycle_journal().string();
     const auto socket = socket_path_.string();
     pid_ = ::fork();
@@ -446,7 +457,7 @@ public:
               MANYFORGE_HEADLESS_TEST_PYTHON, "-m",
               "manyforge_program_runner", "--host", "127.0.0.1", "--port",
               "0", "--headless-url", "http://127.0.0.1:1",
-              "--execution-state-root", runtime_root.c_str(),
+              "--execution-run-root", execution_run_root.c_str(),
               "--cycle-journal-path", journal.c_str(),
               "--manager-liveness-socket", socket.c_str(), "--cell-id",
               cell_id.c_str(), "--owner-id",
@@ -1192,6 +1203,23 @@ TEST(ManagerDaemonProcess,
   EXPECT_TRUE(std::filesystem::exists(
       clean.manager_root() /
       std::string(component_manager::kManagerStateMarkerFilename)));
+}
+
+TEST(ManagerDaemonProcess,
+     RejectsDisposableRunRootNestedInsideDurableProjectionRoot) {
+  DaemonDirectory directory;
+  ManagerProcess manager(
+      directory, MANYFORGE_HEADLESS_TEST_CANONICAL_EMPTY_PACKAGE_ROOT,
+      "canonical-empty-admission.json", MANYFORGE_HEADLESS_TEST_MANAGER_DAEMON,
+      {}, directory.publication_root().parent_path().string());
+  const auto status = manager.Wait();
+  ASSERT_TRUE(WIFEXITED(status));
+  EXPECT_NE(WEXITSTATUS(status), 0);
+  EXPECT_NE(ReadStartupStderr(directory).find(
+                "must be disjoint from disposable run storage"),
+            std::string::npos);
+  EXPECT_FALSE(std::filesystem::exists(directory.socket_path()));
+  EXPECT_FALSE(std::filesystem::exists(directory.execution_socket_path()));
 }
 
 TEST(ManagerDaemonProcess,
@@ -2063,21 +2091,31 @@ TEST(ManagerDaemonProcess,
         fixture.deployment_revision, fixture.predecessor_graph_revision,
         fixture.predecessor_retained_bundle_id, "manager-runtime-only-apply.1");
 
-    const auto submitted = SendCommand(directory.socket_path(), request);
-    const auto status_request = ApplyStatusRequest(submitted);
-    auto applied = submitted;
-    EXPECT_NE(applied.find("\"ok\":true"), std::string::npos);
-    EXPECT_NE(applied.find("\"replay_status\":\"accepted_new\""),
-              std::string::npos);
+    // Model a browser disappearing after the kernel accepted its packet but
+    // before it received any HTTP/RPC receipt. Manager must finish without
+    // that client, and a replacement observer must reconstruct the result
+    // from the authoritative inventory alone.
+    SendCommandAndDisconnect(directory.socket_path(), request);
+    std::string applied;
     const auto apply_deadline =
         std::chrono::steady_clock::now() + std::chrono::seconds(10);
-    while (applied.find("\"state\":\"succeeded\"") == std::string::npos &&
-           std::chrono::steady_clock::now() < apply_deadline) {
+    while (std::chrono::steady_clock::now() < apply_deadline) {
+      const auto observed = manager_source.Read();
+      if (observed.has_value()) {
+        applied = content_identity::canonical_json(observed->payload);
+        if (applied.find(
+                R"("request_id":"manager-runtime-only-apply.1")") !=
+                std::string::npos &&
+            applied.find(R"("terminal_state":"succeeded")") !=
+                std::string::npos) {
+          break;
+        }
+      }
       std::this_thread::sleep_for(std::chrono::milliseconds(10));
-      applied = SendCommand(directory.socket_path(), status_request);
     }
     SCOPED_TRACE(applied);
-    EXPECT_NE(applied.find("\"state\":\"succeeded\""), std::string::npos);
+    EXPECT_NE(applied.find(R"("terminal_state":"succeeded")"),
+              std::string::npos);
     EXPECT_NE(applied.find(fixture.candidate_retained_bundle_id),
               std::string::npos);
     const auto execution_status = wait_execution_response();
@@ -2140,9 +2178,16 @@ TEST(ManagerDaemonProcess,
   const auto scene_runtime_recovered = scene_runtime_source.Read();
   ASSERT_TRUE(recovered.has_value());
   ASSERT_TRUE(scene_runtime_recovered.has_value());
+  const auto recovered_manager_bytes =
+      content_identity::canonical_json(recovered->payload);
   EXPECT_NE(recovered->source_owner_epoch, first_manager_epoch);
-  EXPECT_NE(content_identity::canonical_json(recovered->payload)
-                .find(fixture.candidate_retained_bundle_id),
+  EXPECT_NE(recovered_manager_bytes.find(fixture.candidate_retained_bundle_id),
+            std::string::npos);
+  EXPECT_NE(recovered_manager_bytes.find(
+                R"("request_id":"manager-runtime-only-apply.1")"),
+            std::string::npos);
+  EXPECT_NE(recovered_manager_bytes.find(
+                R"("incomplete":false,"intent_digest":)"),
             std::string::npos);
   EXPECT_NE(content_identity::canonical_json(scene_runtime_recovered->payload)
                 .find(fixture.candidate_retained_bundle_id),

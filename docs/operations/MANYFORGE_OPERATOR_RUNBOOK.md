@@ -139,12 +139,6 @@ PACKAGE_ROOT=/absolute/path/to/package-root
 NODE_CATALOG=/absolute/path/to/node_catalog.yaml
 ALARM_CATALOG=/absolute/path/to/alarm_catalog.yaml
 COMPOSER_STATIC_DIR=/absolute/path/to/composer-dist
-PUBLICATION_ROOT=/absolute/path/to/publication
-MANAGER_STATE=/absolute/path/to/manager-state
-RUNTIME_STATE=/absolute/path/to/runtime-state
-EXECUTION_STATE=/absolute/path/to/execution-state
-SCENE_DB=/absolute/path/to/logical-scene.sqlite
-HISTORIAN_DB=/absolute/path/to/historian.sqlite
 PACKAGE_SHA256=<package-aggregate-sha256>
 COMPILER_SHA256=<compiler-build-manifest-sha256>
 NODE_ENV_SHA256=<node-environment-sha256>
@@ -157,16 +151,11 @@ python3 -m manyforge_operator \
   --state-root "$STATE_ROOT" --instance-id "$INSTANCE_ID" --json \
   start --profile native \
   --source-root "$MANYFORGE_ROOT" --manager-executable "$MANAGER" \
-  --package-root "$PACKAGE_ROOT" --node-catalog-path "$NODE_CATALOG" \
+  --install-root "$PACKAGE_ROOT" --node-catalog-path "$NODE_CATALOG" \
   --alarm-catalog-path "$ALARM_CATALOG" \
   --composer-static-dir "$COMPOSER_STATIC_DIR" \
   --canonical-empty-admission-filename "$ADMISSION_FILENAME" \
   --cell-id "$CELL_ID" \
-  --publication-root "$PUBLICATION_ROOT" \
-  --manager-state-root "$MANAGER_STATE" --runtime-state-root "$RUNTIME_STATE" \
-  --execution-state-root "$EXECUTION_STATE" \
-  --logical-scene-database "$SCENE_DB" \
-  --historian-database-path "$HISTORIAN_DB" \
   --package-aggregate-sha256 "$PACKAGE_SHA256" \
   --compiler-build-manifest-sha256 "$COMPILER_SHA256" \
   --node-environment-sha256 "$NODE_ENV_SHA256" \
@@ -180,6 +169,14 @@ python3 -m manyforge_operator \
 
 `--readiness-timeout-s`, `--poll-interval-s`, and
 `--reconciliation-period-ms` are shown with their current defaults.
+The operator creates and validates one strict cell layout at
+`$STATE_ROOT/$INSTANCE_ID`. Durable Manager, execution, Program-selection,
+Program-runner, scene, historian, Composer-authoring, and operator state lives
+under its `state/` subtree. Sockets, locks, native planning stages, and other
+rebuildable process material live under its separate `run/` subtree. Artifact
+and projection roots are also launcher-owned. These are deliberately not
+independent CLI inputs: a marked layout is validation-only on reopen and the
+launcher will not repair, merge, or reinterpret caller-assembled roots.
 `start` waits for owner-issued readiness and leaves the stack idle. It does
 not select a scenario, Apply a graph, or Run a Program. A compatible running
 instance returns `already_running`; an incompatible instance is not adopted.
@@ -323,16 +320,11 @@ python3 -m manyforge_operator \
   --remote-target tndlux@192.168.1.68 \
   --remote-source-root /mnt/nova_ssd/codex-manyforge/runners/manyforge \
   --remote-manager-executable /mnt/nova_ssd/codex-manyforge/builds/current/package/bin/manyforge_manager_daemon \
-  --remote-package-root /mnt/nova_ssd/codex-manyforge/builds/current/package \
+  --remote-install-root /mnt/nova_ssd/codex-manyforge/builds/current/package \
   --remote-node-catalog-path /mnt/nova_ssd/codex-manyforge/builds/current/package/share/node_catalog.yaml \
   --remote-alarm-catalog-path /mnt/nova_ssd/codex-manyforge/builds/current/package/share/alarm_catalog.yaml \
-  --remote-publication-root /mnt/nova_ssd/codex-manyforge/runners/state/publication \
-  --remote-manager-state-root /mnt/nova_ssd/codex-manyforge/runners/state/manager \
-  --remote-runtime-state-root /mnt/nova_ssd/codex-manyforge/runners/state/runtime \
-  --remote-execution-state-root /mnt/nova_ssd/codex-manyforge/runners/state/execution \
-  --remote-logical-scene-database /mnt/nova_ssd/codex-manyforge/runners/state/scene.sqlite3 \
-  --remote-historian-database-path /mnt/nova_ssd/codex-manyforge/runners/state/history.sqlite3 \
-  --remote-state-root /mnt/nova_ssd/codex-manyforge/runners/state/operator \
+  --remote-state-root /mnt/nova_ssd/codex-manyforge/runners/cells \
+  --remote-bridge-state-root /mnt/nova_ssd/codex-manyforge/runners/isaac-bridge \
   --remote-simulation-control-config /mnt/nova_ssd/codex-manyforge/runners/manyforge/manyforge_ros_bringup/config/isaac_program_simulation_site.json \
   --remote-ros-setup-script /opt/ros/jazzy/setup.bash \
   --remote-ros-environment-script /mnt/nova_ssd/codex-manyforge/runners/manyforge/config/ros/isaac_i9.env.sh \

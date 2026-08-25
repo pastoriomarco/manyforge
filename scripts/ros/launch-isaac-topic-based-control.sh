@@ -104,15 +104,15 @@ if [[ -n "${ISAAC_ADDITIONAL_REQUIRED_TOPICS:-}" ]]; then
         "additional_required_topics:=${ISAAC_ADDITIONAL_REQUIRED_TOPICS}"
     )
 fi
-if [[ -n "${MANYFORGE_MANAGER_STATE_ROOT:-}" || \
+if [[ -n "${MANYFORGE_MANAGER_RUN_ROOT:-}" || \
       -n "${ISAAC_POSE_OBSERVER_SITE_CONFIG:-}" ]]; then
-    if [[ -z "${MANYFORGE_MANAGER_STATE_ROOT:-}" || \
+    if [[ -z "${MANYFORGE_MANAGER_RUN_ROOT:-}" || \
           -z "${ISAAC_POSE_OBSERVER_SITE_CONFIG:-}" ]]; then
-        printf 'MANYFORGE_MANAGER_STATE_ROOT and ISAAC_POSE_OBSERVER_SITE_CONFIG must be set together.\n' >&2
+        printf 'MANYFORGE_MANAGER_RUN_ROOT and ISAAC_POSE_OBSERVER_SITE_CONFIG must be set together.\n' >&2
         exit 2
     fi
     launch_arguments+=(
-        "manager_state_root:=${MANYFORGE_MANAGER_STATE_ROOT}"
+        "manager_run_root:=${MANYFORGE_MANAGER_RUN_ROOT}"
         "pose_observer_site_config:=${ISAAC_POSE_OBSERVER_SITE_CONFIG}"
     )
 fi

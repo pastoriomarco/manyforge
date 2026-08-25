@@ -59,7 +59,7 @@ class ProgramRunnerLivenessReceiver:
         cycle_status: Callable[[], Mapping[str, Any]],
         monotonic_ns: Callable[[], int] = time.monotonic_ns,
     ) -> None:
-        if not path.is_absolute():
+        if not path.is_absolute() or path.name in {"", ".", ".."}:
             raise ValueError("Program Runner liveness socket must be absolute")
         self._path = path
         self._cell_id = cell_id
@@ -74,6 +74,8 @@ class ProgramRunnerLivenessReceiver:
         self._stop = Event()
         self._listener: socket.socket | None = None
         self._listener_identity: tuple[int, int] | None = None
+        self._run_root_fd: int | None = None
+        self._run_root_identity: tuple[int, int] | None = None
         self._server_thread: Thread | None = None
         self._watchdog_thread: Thread | None = None
         self._manager_runtime_epoch = retained.manager_runtime_epoch
@@ -87,113 +89,243 @@ class ProgramRunnerLivenessReceiver:
         self._fault_reference = retained.fault_reference
         self._predecessor_expired = retained.expired
 
-    def start(self) -> None:
-        self._path.parent.mkdir(parents=True, exist_ok=True)
-        try:
-            existing = self._path.lstat()
-        except FileNotFoundError:
-            pass
-        else:
-            if (
-                not stat.S_ISSOCK(existing.st_mode)
-                or existing.st_uid != os.geteuid()
-            ):
-                raise ProgramRunnerLivenessError(
-                    "liveness path exists and is not an owned socket"
-                )
-            identity = (existing.st_dev, existing.st_ino)
-            probe = socket.socket(
-                socket.AF_UNIX, socket.SOCK_SEQPACKET | socket.SOCK_CLOEXEC
-            )
-            probe.settimeout(0.2)
-            try:
-                probe.connect(str(self._path))
-            except OSError as error:
-                if error.errno != errno.ECONNREFUSED:
-                    raise ProgramRunnerLivenessError(
-                        "liveness socket state is ambiguous"
-                    ) from error
-            else:
-                raise ProgramRunnerLivenessError(
-                    "liveness socket already has an active listener"
-                )
-            finally:
-                probe.close()
-            try:
-                current = self._path.lstat()
-            except FileNotFoundError as error:
-                raise ProgramRunnerLivenessError(
-                    "liveness socket changed during stale-path recovery"
-                ) from error
-            if (
-                (current.st_dev, current.st_ino) != identity
-                or not stat.S_ISSOCK(current.st_mode)
-                or current.st_uid != os.geteuid()
-            ):
-                raise ProgramRunnerLivenessError(
-                    "liveness socket changed during stale-path recovery"
-                )
-            self._path.unlink()
-        listener = socket.socket(
-            socket.AF_UNIX, socket.SOCK_SEQPACKET | socket.SOCK_CLOEXEC
+    @staticmethod
+    def _safe_run_root(metadata: os.stat_result) -> bool:
+        required = stat.S_IRUSR | stat.S_IWUSR | stat.S_IXUSR
+        return (
+            stat.S_ISDIR(metadata.st_mode)
+            and metadata.st_uid == os.geteuid()
+            and not metadata.st_mode & (stat.S_IWGRP | stat.S_IWOTH)
+            and metadata.st_mode & required == required
         )
+
+    def _open_run_root(self) -> int:
+        root = self._path.parent
+        try:
+            before = root.lstat()
+            canonical = root.resolve(strict=True)
+            descriptor = os.open(
+                root,
+                os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW,
+            )
+        except (OSError, RuntimeError) as error:
+            raise ProgramRunnerLivenessError(
+                "liveness run capability is unavailable or unsafe"
+            ) from error
+        try:
+            opened = os.fstat(descriptor)
+            after = root.lstat()
+        except OSError as error:
+            os.close(descriptor)
+            raise ProgramRunnerLivenessError(
+                "liveness run capability changed while opening"
+            ) from error
+        identity = (before.st_dev, before.st_ino)
+        if (
+            canonical != root
+            or any(
+                not self._safe_run_root(metadata)
+                or (metadata.st_dev, metadata.st_ino) != identity
+                for metadata in (before, opened, after)
+            )
+        ):
+            os.close(descriptor)
+            raise ProgramRunnerLivenessError(
+                "liveness run capability type, owner, mode, or identity is unsafe"
+            )
+        return descriptor
+
+    def _validate_run_root(self, descriptor: int) -> None:
+        try:
+            opened = os.fstat(descriptor)
+            current = self._path.parent.lstat()
+        except OSError as error:
+            raise ProgramRunnerLivenessError(
+                "liveness run capability was replaced"
+            ) from error
+        identity = self._run_root_identity
+        if (
+            identity is None
+            or not self._safe_run_root(opened)
+            or not self._safe_run_root(current)
+            or (opened.st_dev, opened.st_ino) != identity
+            or (current.st_dev, current.st_ino) != identity
+        ):
+            raise ProgramRunnerLivenessError(
+                "liveness run capability was replaced"
+            )
+
+    def _endpoint_status(self, descriptor: int) -> os.stat_result:
+        return os.stat(
+            self._path.name,
+            dir_fd=descriptor,
+            follow_symlinks=False,
+        )
+
+    def _remove_endpoint(
+        self,
+        descriptor: int,
+        identity: tuple[int, int] | None,
+    ) -> None:
+        if identity is None:
+            return
+        try:
+            current = self._endpoint_status(descriptor)
+        except FileNotFoundError:
+            return
+        if (
+            (current.st_dev, current.st_ino) == identity
+            and stat.S_ISSOCK(current.st_mode)
+            and current.st_uid == os.geteuid()
+        ):
+            os.unlink(self._path.name, dir_fd=descriptor)
+
+    def start(self) -> None:
+        if (
+            self._run_root_fd is not None
+            or self._listener is not None
+            or self._stop.is_set()
+        ):
+            raise ProgramRunnerLivenessError(
+                "liveness receiver cannot be started more than once"
+            )
+        descriptor = self._open_run_root()
+        self._run_root_fd = descriptor
+        opened = os.fstat(descriptor)
+        self._run_root_identity = (opened.st_dev, opened.st_ino)
+        socket_address = f"/proc/self/fd/{descriptor}/{self._path.name}"
+        if len(os.fsencode(socket_address)) >= 104:
+            os.close(descriptor)
+            self._run_root_fd = None
+            self._run_root_identity = None
+            raise ProgramRunnerLivenessError(
+                "liveness socket path exceeds the AF_UNIX bound"
+            )
+        listener: socket.socket | None = None
         bound_identity: tuple[int, int] | None = None
         try:
-            listener.bind(str(self._path))
-            bound = self._path.lstat()
+            try:
+                existing = self._endpoint_status(descriptor)
+            except FileNotFoundError:
+                existing = None
+            if existing is not None:
+                if (
+                    not stat.S_ISSOCK(existing.st_mode)
+                    or existing.st_uid != os.geteuid()
+                    or existing.st_nlink != 1
+                    or stat.S_IMODE(existing.st_mode) != 0o600
+                ):
+                    raise ProgramRunnerLivenessError(
+                        "liveness path exists and is not the exact owned socket"
+                    )
+                identity = (existing.st_dev, existing.st_ino)
+                probe = socket.socket(
+                    socket.AF_UNIX,
+                    socket.SOCK_SEQPACKET | socket.SOCK_CLOEXEC,
+                )
+                probe.settimeout(0.2)
+                try:
+                    probe.connect(socket_address)
+                except OSError as error:
+                    if error.errno != errno.ECONNREFUSED:
+                        raise ProgramRunnerLivenessError(
+                            "liveness socket state is ambiguous"
+                        ) from error
+                else:
+                    raise ProgramRunnerLivenessError(
+                        "liveness socket already has an active listener"
+                    )
+                finally:
+                    probe.close()
+                try:
+                    current = self._endpoint_status(descriptor)
+                except FileNotFoundError as error:
+                    raise ProgramRunnerLivenessError(
+                        "liveness socket changed during stale-path recovery"
+                    ) from error
+                if (
+                    (current.st_dev, current.st_ino) != identity
+                    or not stat.S_ISSOCK(current.st_mode)
+                    or current.st_uid != os.geteuid()
+                    or current.st_nlink != 1
+                    or stat.S_IMODE(current.st_mode) != 0o600
+                ):
+                    raise ProgramRunnerLivenessError(
+                        "liveness socket changed during stale-path recovery"
+                    )
+                os.unlink(self._path.name, dir_fd=descriptor)
+
+            listener = socket.socket(
+                socket.AF_UNIX,
+                socket.SOCK_SEQPACKET | socket.SOCK_CLOEXEC,
+            )
+            listener.bind(socket_address)
+            bound = self._endpoint_status(descriptor)
             bound_identity = (bound.st_dev, bound.st_ino)
-            os.chmod(self._path, 0o600)
-            current = self._path.lstat()
-            if (current.st_dev, current.st_ino) != bound_identity:
+            os.chmod(self._path.name, 0o600, dir_fd=descriptor)
+            current = self._endpoint_status(descriptor)
+            if (
+                (current.st_dev, current.st_ino) != bound_identity
+                or not stat.S_ISSOCK(current.st_mode)
+                or current.st_uid != os.geteuid()
+                or current.st_nlink != 1
+                or stat.S_IMODE(current.st_mode) != 0o600
+            ):
                 raise ProgramRunnerLivenessError(
                     "liveness socket changed while binding"
                 )
+            self._validate_run_root(descriptor)
             self._listener_identity = bound_identity
             listener.listen(8)
             listener.setblocking(False)
+            # Reserve the unique listener identity before retrying retained
+            # containment, but do not accept reconciliation until that retry
+            # has completed.
+            if self._predecessor_expired:
+                reference = self._fault_reference
+                if reference is None:
+                    material = (
+                        "manyforge.program-runner.manager-loss.v1\0"
+                        + (self._manager_runtime_epoch or "unknown")
+                        + "\0"
+                        + self._runtime_epoch
+                    )
+                    reference = (
+                        "sha256:"
+                        + hashlib.sha256(material.encode()).hexdigest()
+                    )
+                try:
+                    reference = self._on_expiry(reference)
+                except Exception:
+                    pass
+                with self._lock:
+                    self._fault_reference = reference
+            self._listener = listener
+            self._server_thread = Thread(
+                target=self._serve,
+                name="program-runner-liveness",
+                daemon=True,
+            )
+            self._watchdog_thread = Thread(
+                target=self._watchdog,
+                name="program-runner-watchdog",
+                daemon=True,
+            )
+            self._server_thread.start()
+            self._watchdog_thread.start()
         except BaseException:
-            listener.close()
-            try:
-                current = self._path.lstat()
-                if (
-                    bound_identity is not None
-                    and (current.st_dev, current.st_ino) == bound_identity
-                    and stat.S_ISSOCK(current.st_mode)
-                ):
-                    self._path.unlink()
-            except FileNotFoundError:
-                pass
+            self._stop.set()
+            if listener is not None:
+                listener.close()
+            for thread in (self._server_thread, self._watchdog_thread):
+                if thread is not None and thread.is_alive():
+                    thread.join(timeout=2.0)
+            self._remove_endpoint(descriptor, bound_identity)
+            os.close(descriptor)
+            self._run_root_fd = None
+            self._run_root_identity = None
+            self._listener = None
             raise
-        # Reserve the unique listener identity before retrying retained
-        # containment, but do not start the serving thread (and therefore
-        # cannot accept reconciliation) until that retry has completed.
-        if self._predecessor_expired:
-            reference = self._fault_reference
-            if reference is None:
-                material = (
-                    "manyforge.program-runner.manager-loss.v1\0"
-                    + (self._manager_runtime_epoch or "unknown")
-                    + "\0"
-                    + self._runtime_epoch
-                )
-                reference = (
-                    "sha256:" + hashlib.sha256(material.encode()).hexdigest()
-                )
-            try:
-                reference = self._on_expiry(reference)
-            except Exception:
-                pass
-            with self._lock:
-                self._fault_reference = reference
-        self._listener = listener
-        self._server_thread = Thread(
-            target=self._serve, name="program-runner-liveness", daemon=True
-        )
-        self._watchdog_thread = Thread(
-            target=self._watchdog, name="program-runner-watchdog", daemon=True
-        )
-        self._server_thread.start()
-        self._watchdog_thread.start()
 
     def close(self) -> None:
         self._stop.set()
@@ -203,13 +335,15 @@ class ProgramRunnerLivenessReceiver:
         for thread in (self._server_thread, self._watchdog_thread):
             if thread is not None:
                 thread.join(timeout=2.0)
-        try:
-            current = self._path.lstat()
-            identity = (current.st_dev, current.st_ino)
-            if identity == self._listener_identity and stat.S_ISSOCK(current.st_mode):
-                self._path.unlink()
-        except FileNotFoundError:
-            pass
+        descriptor = self._run_root_fd
+        if descriptor is not None:
+            try:
+                self._remove_endpoint(descriptor, self._listener_identity)
+            finally:
+                os.close(descriptor)
+                self._run_root_fd = None
+                self._run_root_identity = None
+        self._listener = None
 
     def require_current(self) -> None:
         with self._lock:

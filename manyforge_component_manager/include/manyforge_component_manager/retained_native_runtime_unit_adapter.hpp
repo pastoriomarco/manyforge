@@ -46,7 +46,8 @@ public:
       std::filesystem::path trusted_package_root,
       std::filesystem::path manager_state_root,
       std::filesystem::path manager_run_root,
-      std::filesystem::path private_staging_root,
+      std::filesystem::path execution_state_root,
+      std::filesystem::path execution_run_root,
       const manyforge::deployment::IVerifiedRetainedBundleSource &bundle_source,
       const manyforge::deployment::IVerifiedRetainedProductArtifactSource
           &artifact_source,
@@ -59,7 +60,8 @@ public:
       std::filesystem::path trusted_package_root,
       std::filesystem::path manager_state_root,
       std::filesystem::path manager_run_root,
-      std::filesystem::path private_staging_root,
+      std::filesystem::path execution_state_root,
+      std::filesystem::path execution_run_root,
       const manyforge::deployment::IVerifiedRetainedBundleSource &bundle_source,
       const manyforge::deployment::IVerifiedRetainedProductArtifactSource
           &artifact_source,

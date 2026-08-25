@@ -3,10 +3,8 @@
 from __future__ import annotations
 
 import math
-import os
 from pathlib import Path
 import socket
-import stat
 from typing import Any, Protocol
 import unicodedata
 
@@ -23,6 +21,10 @@ from .native import (
     HeadlessApiError,
     MAX_MANAGER_COMMAND_TIMEOUT_SECONDS,
     strict_json_object,
+)
+from .private_transport import (
+    PinnedRunRoot,
+    PrivateTransportCapabilityError,
 )
 
 
@@ -84,7 +86,7 @@ class ManagerCommandClient:
 
     def __init__(
         self,
-        state_root: Path,
+        run_root: Path,
         *,
         timeout_seconds: float = DEFAULT_MANAGER_COMMAND_TIMEOUT_SECONDS,
     ) -> None:
@@ -93,22 +95,14 @@ class ManagerCommandClient:
             or timeout_seconds > MAX_MANAGER_COMMAND_TIMEOUT_SECONDS
         ):
             raise ValueError("Manager timeout must be in (0, 60] seconds")
-        self._socket_path = state_root / MANAGER_SOCKET_FILE
-        self._timeout_seconds = timeout_seconds
-
-    def _validate_socket(self) -> None:
         try:
-            metadata = self._socket_path.lstat()
-        except FileNotFoundError as exc:
+            self._run_root = PinnedRunRoot(run_root)
+        except PrivateTransportCapabilityError as error:
             raise HeadlessApiError(
                 "manager_command_unavailable",
-                "Manager command socket is absent",
-            ) from exc
-        if not stat.S_ISSOCK(metadata.st_mode) or metadata.st_uid != os.geteuid():
-            raise HeadlessApiError(
-                "manager_command_unavailable",
-                "Manager command path is not the expected same-user socket",
-            )
+                f"Manager run capability is invalid: {error}",
+            ) from error
+        self._timeout_seconds = timeout_seconds
 
     def _exchange(self, command: dict[str, Any]) -> dict[str, Any]:
         encoded = _canonical_json(command)
@@ -117,22 +111,29 @@ class ManagerCommandClient:
                 "manager_command_oversized",
                 "Manager command exceeds its byte bound",
             )
-        self._validate_socket()
         try:
-            with socket.socket(socket.AF_UNIX, socket.SOCK_SEQPACKET) as client:
-                client.settimeout(self._timeout_seconds)
-                client.connect(str(self._socket_path))
-                sent = client.send(encoded)
-                if sent != len(encoded):
-                    raise HeadlessApiError(
-                        "manager_command_transport_failure",
-                        "Manager command packet was truncated",
+            with self._run_root.socket_address(
+                MANAGER_SOCKET_FILE
+            ) as socket_address:
+                with socket.socket(socket.AF_UNIX, socket.SOCK_SEQPACKET) as client:
+                    client.settimeout(self._timeout_seconds)
+                    client.connect(socket_address)
+                    sent = client.send(encoded)
+                    if sent != len(encoded):
+                        raise HeadlessApiError(
+                            "manager_command_transport_failure",
+                            "Manager command packet was truncated",
+                        )
+                    payload, _ancillary, flags, _address = client.recvmsg(
+                        MAX_MANAGER_RESPONSE_BYTES
                     )
-                payload, _ancillary, flags, _address = client.recvmsg(
-                    MAX_MANAGER_RESPONSE_BYTES
-                )
         except HeadlessApiError:
             raise
+        except PrivateTransportCapabilityError as exc:
+            raise HeadlessApiError(
+                "manager_command_unavailable",
+                f"Manager command socket is unavailable: {exc}",
+            ) from exc
         except (OSError, TimeoutError) as exc:
             raise HeadlessApiError(
                 "manager_command_unavailable",

@@ -95,6 +95,65 @@ private:
   int fd_{-1};
 };
 
+[[nodiscard]] std::filesystem::path
+NormalizedTrustedDirectory(std::filesystem::path path,
+                           const std::string_view label) {
+  if (!path.is_absolute()) {
+    Fail(std::string(label) + " must be an absolute directory capability");
+  }
+  if (path.lexically_normal() != path) {
+    Fail(std::string(label) + " must use its canonical lexical spelling");
+  }
+  std::error_code error;
+  const auto status = std::filesystem::symlink_status(path, error);
+  if (error || !std::filesystem::is_directory(status) ||
+      std::filesystem::is_symlink(status)) {
+    Fail(std::string(label) + " is not one existing plain directory");
+  }
+  const auto canonical = std::filesystem::canonical(path, error);
+  if (error || canonical != path) {
+    Fail(std::string(label) + " is not one canonical directory capability");
+  }
+  return path;
+}
+
+[[nodiscard]] UniqueFd OpenTrustedDirectory(
+    const std::filesystem::path &path, const std::string_view label) {
+  struct stat before {};
+  if (::lstat(path.c_str(), &before) != 0 || !S_ISDIR(before.st_mode) ||
+      S_ISLNK(before.st_mode)) {
+    Fail(std::string(label) + " is not one plain directory");
+  }
+  UniqueFd descriptor(
+      ::open(path.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW));
+  struct stat opened {};
+  struct stat after {};
+  if (!descriptor || ::fstat(descriptor.get(), &opened) != 0 ||
+      ::lstat(path.c_str(), &after) != 0 ||
+      opened.st_dev != before.st_dev || opened.st_ino != before.st_ino ||
+      after.st_dev != before.st_dev || after.st_ino != before.st_ino ||
+      !S_ISDIR(opened.st_mode) || !S_ISDIR(after.st_mode) ||
+      opened.st_uid != ::geteuid() || after.st_uid != ::geteuid() ||
+      (opened.st_mode & (S_IWGRP | S_IWOTH)) != 0 ||
+      (after.st_mode & (S_IWGRP | S_IWOTH)) != 0 ||
+      (opened.st_mode & (S_IRUSR | S_IWUSR | S_IXUSR)) !=
+          (S_IRUSR | S_IWUSR | S_IXUSR) ||
+      (after.st_mode & (S_IRUSR | S_IWUSR | S_IXUSR)) !=
+          (S_IRUSR | S_IWUSR | S_IXUSR)) {
+    Fail(std::string(label) + " identity, owner, or mode is unsafe");
+  }
+  return descriptor;
+}
+
+void RequireDisjointDirectoryTrees(const std::filesystem::path &left,
+                                   const std::filesystem::path &right) {
+  const auto mismatch = std::mismatch(left.begin(), left.end(), right.begin(),
+                                      right.end());
+  if (mismatch.first == left.end() || mismatch.second == right.end()) {
+    Fail("retained POSIX state and run capabilities must be disjoint trees");
+  }
+}
+
 void SetNonBlocking(const int fd) {
   const int flags = ::fcntl(fd, F_GETFL);
   if (flags < 0 || ::fcntl(fd, F_SETFL, flags | O_NONBLOCK) != 0) {
@@ -569,29 +628,63 @@ private:
   UniqueFd lock_;
 };
 
-[[nodiscard]] SlotLock AcquireSlot(const int root_fd,
-                                   const std::string &slot_name,
-                                   const bool create) {
+[[nodiscard]] std::optional<UniqueFd>
+OpenSlotDirectory(const int root_fd, const std::string &slot_name,
+                  const bool create) {
+  bool created = false;
   int directory_fd = ::openat(root_fd, slot_name.c_str(),
                               O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW);
   if (directory_fd < 0 && errno == ENOENT && create) {
-    if (::mkdirat(root_fd, slot_name.c_str(), 0700) != 0 && errno != EEXIST) {
+    if (::mkdirat(root_fd, slot_name.c_str(), 0700) == 0) {
+      created = true;
+    } else if (errno != EEXIST) {
       Fail(ErrnoDetail("could not create runtime adapter slot", errno));
     }
     directory_fd = ::openat(root_fd, slot_name.c_str(),
                             O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW);
   }
+  if (directory_fd < 0 && errno == ENOENT) {
+    return std::nullopt;
+  }
   if (directory_fd < 0) {
     Fail(ErrnoDetail("could not open runtime adapter slot", errno));
   }
   UniqueFd directory(directory_fd);
+  struct stat status {};
+  if (::fstat(directory.get(), &status) != 0 || !S_ISDIR(status.st_mode) ||
+      status.st_uid != ::geteuid() ||
+      (status.st_mode & (S_IWGRP | S_IWOTH)) != 0 ||
+      (status.st_mode & (S_IRUSR | S_IWUSR | S_IXUSR)) !=
+          (S_IRUSR | S_IWUSR | S_IXUSR)) {
+    Fail("runtime adapter slot type, owner, or mode is unsafe");
+  }
+  if (created && ::fsync(root_fd) != 0) {
+    Fail(ErrnoDetail("could not retain runtime adapter slot", errno));
+  }
+  return std::optional<UniqueFd>(std::move(directory));
+}
+
+[[nodiscard]] SlotLock AcquireSlot(const int root_fd,
+                                   const std::string &slot_name,
+                                   const bool create) {
+  auto directory = OpenSlotDirectory(root_fd, slot_name, create);
+  if (!directory.has_value()) {
+    Fail("runtime adapter slot is absent");
+  }
   const int lock_flags =
       O_RDWR | O_CLOEXEC | O_NOFOLLOW | (create ? O_CREAT : 0);
-  const int lock_fd = ::openat(directory.get(), "lock", lock_flags, 0600);
+  const int lock_fd =
+      ::openat(directory->get(), "lock", lock_flags, 0600);
   if (lock_fd < 0) {
     Fail(ErrnoDetail("could not open runtime adapter slot lock", errno));
   }
   UniqueFd lock(lock_fd);
+  struct stat lock_status {};
+  if (::fstat(lock.get(), &lock_status) != 0 ||
+      !S_ISREG(lock_status.st_mode) || lock_status.st_uid != ::geteuid() ||
+      lock_status.st_nlink != 1 || (lock_status.st_mode & 0777) != 0600) {
+    Fail("runtime adapter slot lock type, owner, or mode is unsafe");
+  }
   const auto deadline = std::chrono::steady_clock::now() + kSlotLockTimeout;
   for (;;) {
     if (::flock(lock.get(), LOCK_EX | LOCK_NB) == 0) {
@@ -605,12 +698,12 @@ private:
     }
     std::this_thread::sleep_for(std::chrono::milliseconds(5));
   }
-  return SlotLock(std::move(directory), std::move(lock));
+  return SlotLock(std::move(*directory), std::move(lock));
 }
 
 [[nodiscard]] std::optional<std::string>
 ReadFileAt(const int directory_fd, const std::string_view name,
-           const std::size_t maximum_bytes) {
+           const std::size_t maximum_bytes, const mode_t expected_mode) {
   const int raw_fd = ::openat(directory_fd, std::string(name).c_str(),
                               O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
   if (raw_fd < 0) {
@@ -621,8 +714,11 @@ ReadFileAt(const int directory_fd, const std::string_view name,
   }
   const UniqueFd fd(raw_fd);
   struct stat status {};
-  if (::fstat(fd.get(), &status) != 0 || !S_ISREG(status.st_mode)) {
-    Fail("runtime adapter state is not a regular file");
+  if (::fstat(fd.get(), &status) != 0 || !S_ISREG(status.st_mode) ||
+      status.st_uid != ::geteuid() || status.st_nlink != 1 ||
+      (status.st_mode & 0777) != expected_mode || status.st_size < 0 ||
+      static_cast<std::uint64_t>(status.st_size) > maximum_bytes) {
+    Fail("runtime adapter file type, owner, mode, or size is invalid");
   }
   std::string result;
   std::array<char, 1024U> buffer{};
@@ -641,6 +737,20 @@ ReadFileAt(const int directory_fd, const std::string_view name,
     if (result.size() > maximum_bytes) {
       Fail("runtime adapter state exceeds its byte bound");
     }
+  }
+  struct stat after_fd {};
+  struct stat after_path {};
+  if (::fstat(fd.get(), &after_fd) != 0 ||
+      ::fstatat(directory_fd, std::string(name).c_str(), &after_path,
+                AT_SYMLINK_NOFOLLOW) != 0 ||
+      after_fd.st_dev != status.st_dev || after_fd.st_ino != status.st_ino ||
+      after_path.st_dev != status.st_dev ||
+      after_path.st_ino != status.st_ino ||
+      after_fd.st_size != status.st_size || after_path.st_size != status.st_size ||
+      !S_ISREG(after_path.st_mode) || after_path.st_uid != ::geteuid() ||
+      after_path.st_nlink != 1 ||
+      (after_path.st_mode & 0777) != expected_mode) {
+    Fail("runtime adapter file changed while reading");
   }
   return result;
 }
@@ -707,35 +817,80 @@ void AtomicWriteAt(const int directory_fd, const std::string_view final_name,
   }
 }
 
-void MaterializeLaunchable(const int directory_fd,
-                           const ReferenceRuntimeUnitAdmission &admission) {
+[[nodiscard]] UniqueFd OpenVerifiedLaunchable(
+    const int directory_fd,
+    const ReferenceRuntimeUnitAdmission &admission) {
+  const int raw_fd =
+      ::openat(directory_fd, "launchable", O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
+  if (raw_fd < 0) {
+    Fail(ErrnoDetail("could not open materialized runtime launchable", errno));
+  }
+  UniqueFd fd(raw_fd);
+  struct stat before {};
+  if (::fstat(fd.get(), &before) != 0 || !S_ISREG(before.st_mode) ||
+      before.st_uid != ::geteuid() || before.st_nlink != 1 ||
+      (before.st_mode & 0777) != 0500 || before.st_size < 0 ||
+      static_cast<std::uint64_t>(before.st_size) !=
+          admission.launchable_bytes().size()) {
+    Fail("materialized runtime launchable has invalid identity or permissions");
+  }
+  std::string bytes;
+  bytes.reserve(admission.launchable_bytes().size());
+  std::array<char, 1024U> buffer{};
+  for (;;) {
+    const auto count = ::read(fd.get(), buffer.data(), buffer.size());
+    if (count < 0 && errno == EINTR) {
+      continue;
+    }
+    if (count < 0) {
+      Fail(ErrnoDetail("could not read materialized runtime launchable", errno));
+    }
+    if (count == 0) {
+      break;
+    }
+    bytes.append(buffer.data(), static_cast<std::size_t>(count));
+    if (bytes.size() > admission.launchable_bytes().size()) {
+      Fail("materialized runtime launchable exceeds its verified byte bound");
+    }
+  }
+  struct stat after_fd {};
+  struct stat after_path {};
+  if (bytes != admission.launchable_bytes() ||
+      ::fstat(fd.get(), &after_fd) != 0 ||
+      ::fstatat(directory_fd, "launchable", &after_path,
+                AT_SYMLINK_NOFOLLOW) != 0 ||
+      after_fd.st_dev != before.st_dev || after_fd.st_ino != before.st_ino ||
+      after_path.st_dev != before.st_dev ||
+      after_path.st_ino != before.st_ino ||
+      after_fd.st_size != before.st_size ||
+      after_path.st_size != before.st_size ||
+      !S_ISREG(after_path.st_mode) || after_path.st_uid != ::geteuid() ||
+      after_path.st_nlink != 1 || (after_path.st_mode & 0777) != 0500) {
+    Fail("materialized runtime launchable changed while being pinned");
+  }
+  return fd;
+}
+
+[[nodiscard]] UniqueFd MaterializeLaunchable(
+    const int directory_fd,
+    const ReferenceRuntimeUnitAdmission &admission) {
   const auto existing = ReadFileAt(directory_fd, "launchable",
-                                   admission.launchable_bytes().size());
+                                   admission.launchable_bytes().size(), 0500);
   if (existing.has_value()) {
     if (*existing != admission.launchable_bytes()) {
       Fail("materialized runtime launchable conflicts with verified retained "
            "bytes");
     }
-    const int raw_fd =
-        ::openat(directory_fd, "launchable", O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
-    if (raw_fd < 0) {
-      Fail(ErrnoDetail("could not reopen materialized runtime launchable",
-                       errno));
-    }
-    const UniqueFd fd(raw_fd);
-    struct stat status {};
-    if (::fstat(fd.get(), &status) != 0 || !S_ISREG(status.st_mode) ||
-        (status.st_mode & 0777) != 0500) {
-      Fail("materialized runtime launchable has invalid type or permissions");
-    }
-    return;
+  } else {
+    AtomicWriteAt(directory_fd, "launchable", admission.launchable_bytes(),
+                  0500);
   }
-  AtomicWriteAt(directory_fd, "launchable", admission.launchable_bytes(), 0500);
+  return OpenVerifiedLaunchable(directory_fd, admission);
 }
 
 [[nodiscard]] std::optional<ProcessState> ReadState(const int directory_fd) {
   const auto bytes =
-      ReadFileAt(directory_fd, "process.state", kMaximumStateBytes);
+      ReadFileAt(directory_fd, "process.state", kMaximumStateBytes, 0600);
   if (!bytes.has_value()) {
     return std::nullopt;
   }
@@ -1084,7 +1239,7 @@ void ReapOwnedChildIfExited(const pid_t child) noexcept {
 
 [[noreturn]] void RunController(const int listener_fd, const int bootstrap_fd,
                                 const int bootstrap_lock_fd,
-                                const std::filesystem::path &launch_path,
+                                const int launchable_fd,
                                 std::vector<std::string> arguments,
                                 const std::string status_command,
                                 const std::string shutdown_command) {
@@ -1096,6 +1251,7 @@ void ReapOwnedChildIfExited(const pid_t child) noexcept {
     // prevents its normal explicit unlock, a replacement cannot observe a
     // state-less slot while either unreleased process still exists.
     UniqueFd bootstrap_lock(bootstrap_lock_fd);
+    UniqueFd launchable(launchable_fd);
     auto standard_input = MakePipe();
     auto standard_output = MakePipe();
     auto gate = MakeSocketPair();
@@ -1143,8 +1299,8 @@ void ReapOwnedChildIfExited(const pid_t child) noexcept {
       standard_output[1].Reset();
       gate[0].Reset();
       bootstrap_lock.Reset();
-      const int result =
-          ::execve(launch_path.c_str(), argv.data(), environment.data());
+      const int result = ::fexecve(launchable.get(), argv.data(),
+                                   environment.data());
       (void)result;
       ::_exit(127);
     }
@@ -1152,6 +1308,7 @@ void ReapOwnedChildIfExited(const pid_t child) noexcept {
     standard_input[0].Reset();
     standard_output[1].Reset();
     gate[0].Reset();
+    launchable.Reset();
     const auto observed = ReadProcObservation(child);
     if (!observed.has_value() || observed->state == 'Z' ||
         observed->state == 'X' || observed->start_ticks == 0U) {
@@ -1244,25 +1401,29 @@ void ReapOwnedChildIfExited(const pid_t child) noexcept {
 
 [[noreturn]] void EnterControllerProcess(
     const int listener_fd, const int bootstrap_fd, const int bootstrap_lock_fd,
-    const std::filesystem::path &launch_path,
+    const int launchable_fd,
     std::vector<std::string> arguments, std::string status_command,
     std::string shutdown_command) {
   const int listener_copy = ::fcntl(listener_fd, F_DUPFD_CLOEXEC, 10);
   const int bootstrap_copy = ::fcntl(bootstrap_fd, F_DUPFD_CLOEXEC, 10);
   const int bootstrap_lock_copy =
       ::fcntl(bootstrap_lock_fd, F_DUPFD_CLOEXEC, 10);
-  if (listener_copy < 0 || bootstrap_copy < 0 || bootstrap_lock_copy < 0) {
+  const int launchable_copy =
+      ::fcntl(launchable_fd, F_DUPFD_CLOEXEC, 10);
+  if (listener_copy < 0 || bootstrap_copy < 0 || bootstrap_lock_copy < 0 ||
+      launchable_copy < 0) {
     ::_exit(125);
   }
   const int null_io = ::open("/dev/null", O_RDWR | O_CLOEXEC);
   if (null_io < 0 || ::dup2(null_io, STDIN_FILENO) < 0 ||
       ::dup2(null_io, STDOUT_FILENO) < 0 ||
       ::dup2(null_io, STDERR_FILENO) < 0 || ::dup2(listener_copy, 3) < 0 ||
-      ::dup2(bootstrap_copy, 4) < 0 || ::dup2(bootstrap_lock_copy, 5) < 0) {
+      ::dup2(bootstrap_copy, 4) < 0 || ::dup2(bootstrap_lock_copy, 5) < 0 ||
+      ::dup2(launchable_copy, 6) < 0) {
     ::_exit(125);
   }
 #ifdef SYS_close_range
-  const long close_range_result = ::syscall(SYS_close_range, 6U, UINT_MAX, 0U);
+  const long close_range_result = ::syscall(SYS_close_range, 7U, UINT_MAX, 0U);
   if (close_range_result != 0 && errno != ENOSYS) {
     ::_exit(125);
   }
@@ -1271,13 +1432,13 @@ void ReapOwnedChildIfExited(const pid_t child) noexcept {
     const long maximum = ::sysconf(_SC_OPEN_MAX);
     const int upper =
         maximum > 0 && maximum < INT_MAX ? static_cast<int>(maximum) : 65536;
-    for (int descriptor = 6; descriptor < upper; ++descriptor) {
+    for (int descriptor = 7; descriptor < upper; ++descriptor) {
       static_cast<void>(::close(descriptor));
     }
 #ifdef SYS_close_range
   }
 #endif
-  RunController(3, 4, 5, launch_path, std::move(arguments),
+  RunController(3, 4, 5, 6, std::move(arguments),
                 std::move(status_command), std::move(shutdown_command));
 }
 
@@ -1307,31 +1468,29 @@ SourceSequenceFromStatusLine(const std::string &line,
 
 struct RetainedPosixRuntimeUnitAdapter::Impl final {
   Impl(
-      std::filesystem::path trusted_runtime_root,
+      std::filesystem::path trusted_state_root,
+      std::filesystem::path trusted_run_root,
       const manyforge::deployment::IVerifiedRetainedBundleSource &bundle_source,
       const manyforge::deployment::IVerifiedRetainedProductArtifactSource
           &artifact_source,
       std::string operating_system, std::string shell_contract)
-      : root_path(std::move(trusted_runtime_root)),
+      : state_root_path(NormalizedTrustedDirectory(
+            std::move(trusted_state_root), "retained POSIX state root")),
+        run_root_path(NormalizedTrustedDirectory(
+            std::move(trusted_run_root), "retained POSIX run root")),
         bundle_source(bundle_source), artifact_source(artifact_source),
         operating_system(std::move(operating_system)),
         shell_contract(std::move(shell_contract)), boot_id(HostBootId()),
         observer_instance_id("posix-observer-" + RandomHex()) {
-    if (!root_path.is_absolute() || this->operating_system.empty() ||
-        this->shell_contract.empty()) {
+    if (this->operating_system.empty() || this->shell_contract.empty()) {
       throw std::invalid_argument(
           "retained POSIX adapter construction input is invalid");
     }
-    const int fd = ::open(root_path.c_str(),
-                          O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW);
-    if (fd < 0) {
-      Fail(ErrnoDetail("could not open trusted runtime root", errno));
-    }
-    root_fd.Reset(fd);
-    struct stat status {};
-    if (::fstat(root_fd.get(), &status) != 0 || !S_ISDIR(status.st_mode)) {
-      Fail("trusted runtime root is not a directory");
-    }
+    RequireDisjointDirectoryTrees(state_root_path, run_root_path);
+    state_root_fd =
+        OpenTrustedDirectory(state_root_path, "retained POSIX state root");
+    run_root_fd =
+        OpenTrustedDirectory(run_root_path, "retained POSIX run root");
   }
 
   ~Impl() = default;
@@ -1374,9 +1533,9 @@ struct RetainedPosixRuntimeUnitAdapter::Impl final {
   }
 
   [[nodiscard]] std::optional<ProcessState>
-  CurrentState(const int directory_fd,
+  CurrentState(const int state_directory_fd,
                const RuntimeUnitConvergenceQueryDTO &query) {
-    auto state = ReadState(directory_fd);
+    auto state = ReadState(state_directory_fd);
     if (!state.has_value()) {
       return std::nullopt;
     }
@@ -1385,7 +1544,8 @@ struct RetainedPosixRuntimeUnitAdapter::Impl final {
   }
 
   [[nodiscard]] ProcessPresenceState
-  DurablePresence(const ProcessState &state, const int directory_fd) const {
+  DurablePresence(const ProcessState &state,
+                  const int run_directory_fd) const {
     if (state.boot_id != boot_id) {
       return ProcessPresenceState::kAbsent;
     }
@@ -1394,8 +1554,8 @@ struct RetainedPosixRuntimeUnitAdapter::Impl final {
     if (!runtime_live && !controller_live) {
       return ProcessPresenceState::kAbsent;
     }
-    if (runtime_live && controller_live &&
-        ControlSocketMatches(directory_fd, state)) {
+    if (runtime_live && controller_live && run_directory_fd >= 0 &&
+        ControlSocketMatches(run_directory_fd, state)) {
       return ProcessPresenceState::kPresent;
     }
     return ProcessPresenceState::kUnknown;
@@ -1403,12 +1563,13 @@ struct RetainedPosixRuntimeUnitAdapter::Impl final {
 
   [[nodiscard]] ProcessPresenceObservation
   ObserveLocked(const RuntimeUnitConvergenceQueryDTO &query,
-                const int directory_fd) {
-    const auto state = CurrentState(directory_fd, query);
+                const int state_directory_fd,
+                const int run_directory_fd) {
+    const auto state = CurrentState(state_directory_fd, query);
     if (!state.has_value()) {
       return Presence(query, ProcessPresenceState::kAbsent);
     }
-    const auto presence = DurablePresence(*state, directory_fd);
+    const auto presence = DurablePresence(*state, run_directory_fd);
     return Presence(query, presence,
                     presence == ProcessPresenceState::kPresent
                         ? state->runtime_epoch.value()
@@ -1420,28 +1581,36 @@ struct RetainedPosixRuntimeUnitAdapter::Impl final {
     static_cast<void>(Admission(query));
     const std::string slot_name = SlotName(query);
     std::lock_guard lock(mutex);
-    const int probe = ::openat(root_fd.get(), slot_name.c_str(),
-                               O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW);
-    if (probe < 0) {
-      if (errno == ENOENT) {
-        return Presence(query, ProcessPresenceState::kAbsent);
-      }
-      Fail(ErrnoDetail("could not inspect runtime adapter slot", errno));
+    auto state_slot =
+        OpenSlotDirectory(state_root_fd.get(), slot_name, false);
+    auto run_probe = OpenSlotDirectory(run_root_fd.get(), slot_name, false);
+    if (!run_probe.has_value()) {
+      return state_slot.has_value()
+                 ? ObserveLocked(query, state_slot->get(), -1)
+                 : Presence(query, ProcessPresenceState::kAbsent);
     }
-    UniqueFd probe_fd(probe);
     const int lock_probe =
-        ::openat(probe_fd.get(), "lock", O_RDWR | O_CLOEXEC | O_NOFOLLOW);
+        ::openat(run_probe->get(), "lock", O_RDWR | O_CLOEXEC | O_NOFOLLOW);
     if (lock_probe < 0 && errno == ENOENT) {
-      return Presence(query, ProcessPresenceState::kUnknown);
+      return state_slot.has_value()
+                 ? ObserveLocked(query, state_slot->get(), -1)
+                 : Presence(query, ProcessPresenceState::kUnknown);
     }
     if (lock_probe < 0) {
       Fail(ErrnoDetail("could not inspect runtime adapter slot lock", errno));
     }
     UniqueFd probe_lock(lock_probe);
     probe_lock.Reset();
-    probe_fd.Reset();
-    auto slot = AcquireSlot(root_fd.get(), slot_name, false);
-    return ObserveLocked(query, slot.directory_fd());
+    run_probe.reset();
+    auto run_slot = AcquireSlot(run_root_fd.get(), slot_name, false);
+    if (!state_slot.has_value()) {
+      state_slot =
+          OpenSlotDirectory(state_root_fd.get(), slot_name, false);
+    }
+    if (!state_slot.has_value()) {
+      return Presence(query, ProcessPresenceState::kAbsent);
+    }
+    return ObserveLocked(query, state_slot->get(), run_slot.directory_fd());
   }
 
   [[nodiscard]] ProcessPresenceObservation
@@ -1450,12 +1619,18 @@ struct RetainedPosixRuntimeUnitAdapter::Impl final {
     (void)bundle;
     const std::string slot_name = SlotName(query);
     std::lock_guard lock(mutex);
-    auto slot = AcquireSlot(root_fd.get(), slot_name, true);
-    RemoveStaleTemporaryAt(slot.directory_fd(), ".process.state.tmp");
-    MaterializeLaunchable(slot.directory_fd(), admission);
-    auto current = CurrentState(slot.directory_fd(), query);
+    auto run_slot = AcquireSlot(run_root_fd.get(), slot_name, true);
+    auto state_slot = OpenSlotDirectory(state_root_fd.get(), slot_name, true);
+    if (!state_slot.has_value()) {
+      Fail("runtime adapter durable state slot could not be created");
+    }
+    RemoveStaleTemporaryAt(state_slot->get(), ".process.state.tmp");
+    auto launchable =
+        MaterializeLaunchable(run_slot.directory_fd(), admission);
+    auto current = CurrentState(state_slot->get(), query);
     if (current.has_value()) {
-      const auto presence = DurablePresence(*current, slot.directory_fd());
+      const auto presence =
+          DurablePresence(*current, run_slot.directory_fd());
       if (presence == ProcessPresenceState::kPresent) {
         return Presence(query, ProcessPresenceState::kPresent,
                         current->runtime_epoch.value());
@@ -1464,32 +1639,33 @@ struct RetainedPosixRuntimeUnitAdapter::Impl final {
         Fail("runtime controller/process state is not safely absent");
       }
       ReapOwnedChildIfExited(current->controller_pid);
-      RemoveState(slot.directory_fd());
+      RemoveState(state_slot->get());
     }
-    RemoveControlSocket(slot.directory_fd());
+    RemoveControlSocket(run_slot.directory_fd());
 
     const RuntimeEpoch runtime_epoch("runtime-" + RandomHex());
     const auto launch_arguments = admission.launch_arguments(runtime_epoch);
     const std::filesystem::path launch_path =
-        root_path / slot_name / "launchable";
+        run_root_path / slot_name / "launchable";
     std::vector<std::string> arguments;
     arguments.reserve(launch_arguments.size() + 1U);
     arguments.push_back(launch_path.string());
     arguments.insert(arguments.end(), launch_arguments.begin(),
                      launch_arguments.end());
-    auto listener = CreateControlListener(slot.directory_fd());
+    auto listener = CreateControlListener(run_slot.directory_fd());
     auto bootstrap = MakeSeqPacketPair();
     const pid_t controller = ::fork();
     if (controller < 0) {
       const int fork_error = errno;
       listener.fd.Reset();
-      RemoveControlSocket(slot.directory_fd());
+      RemoveControlSocket(run_slot.directory_fd());
       Fail(ErrnoDetail("could not fork retained runtime controller",
                        fork_error));
     }
     if (controller == 0) {
       EnterControllerProcess(listener.fd.get(), bootstrap[0].get(),
-                             slot.lock_fd(), launch_path, std::move(arguments),
+                             run_slot.lock_fd(), launchable.get(),
+                             std::move(arguments),
                              std::string(admission.status_command()),
                              std::string(admission.shutdown_command()));
     }
@@ -1532,7 +1708,7 @@ struct RetainedPosixRuntimeUnitAdapter::Impl final {
           listener.identity.inode,
           runtime_epoch,
       };
-      AtomicWriteAt(slot.directory_fd(), "process.state", EncodeState(state),
+      AtomicWriteAt(state_slot->get(), "process.state", EncodeState(state),
                     0600);
       state_written = true;
       SendPacketNoSignal(bootstrap[1].get(), "release");
@@ -1547,13 +1723,13 @@ struct RetainedPosixRuntimeUnitAdapter::Impl final {
       ReapOwnedChildIfExited(controller);
       if (state_written && !released) {
         try {
-          RemoveState(slot.directory_fd());
+          RemoveState(state_slot->get());
         } catch (...) {
         }
       }
       if (!released) {
         try {
-          RemoveControlSocket(slot.directory_fd());
+          RemoveControlSocket(run_slot.directory_fd());
         } catch (...) {
         }
       }
@@ -1566,30 +1742,44 @@ struct RetainedPosixRuntimeUnitAdapter::Impl final {
     static_cast<void>(Admission(query));
     const std::string slot_name = SlotName(query);
     std::lock_guard lock(mutex);
-    const int probe = ::openat(root_fd.get(), slot_name.c_str(),
-                               O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW);
-    if (probe < 0) {
-      if (errno == ENOENT) {
+    auto state_slot =
+        OpenSlotDirectory(state_root_fd.get(), slot_name, false);
+    auto run_probe = OpenSlotDirectory(run_root_fd.get(), slot_name, false);
+    if (!run_probe.has_value()) {
+      if (!state_slot.has_value()) {
         return Presence(query, ProcessPresenceState::kAbsent);
       }
-      Fail(ErrnoDetail("could not inspect runtime stop slot", errno));
+      const auto state = CurrentState(state_slot->get(), query);
+      if (!state.has_value()) {
+        return Presence(query, ProcessPresenceState::kAbsent);
+      }
+      if (DurablePresence(*state, -1) != ProcessPresenceState::kAbsent) {
+        Fail("runtime controller/process is live without its run capability");
+      }
+      ReapOwnedChildIfExited(state->controller_pid);
+      RemoveState(state_slot->get());
+      return Presence(query, ProcessPresenceState::kAbsent);
     }
-    UniqueFd probe_fd(probe);
-    probe_fd.Reset();
-    auto slot = AcquireSlot(root_fd.get(), slot_name, false);
-    const auto state = CurrentState(slot.directory_fd(), query);
+    run_probe.reset();
+    auto run_slot = AcquireSlot(run_root_fd.get(), slot_name, false);
+    if (!state_slot.has_value()) {
+      RemoveControlSocket(run_slot.directory_fd());
+      return Presence(query, ProcessPresenceState::kAbsent);
+    }
+    const auto state = CurrentState(state_slot->get(), query);
     if (!state.has_value()) {
-      RemoveControlSocket(slot.directory_fd());
+      RemoveControlSocket(run_slot.directory_fd());
       return Presence(query, ProcessPresenceState::kAbsent);
     }
 
     auto runtime_live = RuntimeProcessIsLive(*state, boot_id);
     auto controller_live = ControllerProcessIsLive(*state, boot_id);
     if (runtime_live && controller_live &&
-        ControlSocketMatches(slot.directory_fd(), *state)) {
+        ControlSocketMatches(run_slot.directory_fd(), *state)) {
       bool request_uncertain = false;
       try {
-        auto connection = ConnectControlSocket(slot.directory_fd(), *state);
+        auto connection =
+            ConnectControlSocket(run_slot.directory_fd(), *state);
         SendPacketNoSignal(connection.get(), "shutdown");
         const auto acknowledgement = ReceivePacket(
             connection.get(), 64U,
@@ -1620,8 +1810,8 @@ struct RetainedPosixRuntimeUnitAdapter::Impl final {
       Fail("runtime controller/process is not safely stopped");
     }
     ReapOwnedChildIfExited(state->controller_pid);
-    RemoveState(slot.directory_fd());
-    RemoveControlSocket(slot.directory_fd());
+    RemoveState(state_slot->get());
+    RemoveControlSocket(run_slot.directory_fd());
     return Presence(query, ProcessPresenceState::kAbsent);
   }
 
@@ -1635,24 +1825,21 @@ struct RetainedPosixRuntimeUnitAdapter::Impl final {
     }
     const std::string slot_name = SlotName(query);
     std::lock_guard lock(mutex);
-    const int probe = ::openat(root_fd.get(), slot_name.c_str(),
-                               O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW);
-    if (probe < 0) {
-      if (errno == ENOENT) {
-        return std::nullopt;
-      }
-      Fail(ErrnoDetail("could not inspect runtime progress slot", errno));
+    auto state_slot =
+        OpenSlotDirectory(state_root_fd.get(), slot_name, false);
+    auto run_probe = OpenSlotDirectory(run_root_fd.get(), slot_name, false);
+    if (!state_slot.has_value() || !run_probe.has_value()) {
+      return std::nullopt;
     }
-    UniqueFd probe_fd(probe);
-    probe_fd.Reset();
-    auto slot = AcquireSlot(root_fd.get(), slot_name, false);
-    const auto state = CurrentState(slot.directory_fd(), query);
+    run_probe.reset();
+    auto run_slot = AcquireSlot(run_root_fd.get(), slot_name, false);
+    const auto state = CurrentState(state_slot->get(), query);
     if (!state.has_value() || state->runtime_epoch != runtime_epoch ||
-        DurablePresence(*state, slot.directory_fd()) !=
+        DurablePresence(*state, run_slot.directory_fd()) !=
             ProcessPresenceState::kPresent) {
       return std::nullopt;
     }
-    auto connection = ConnectControlSocket(slot.directory_fd(), *state);
+    auto connection = ConnectControlSocket(run_slot.directory_fd(), *state);
     SendPacketNoSignal(connection.get(), "status");
     const auto line = ReceivePacket(
         connection.get(), kMaximumControlPacketBytes,
@@ -1672,7 +1859,8 @@ struct RetainedPosixRuntimeUnitAdapter::Impl final {
         admission.runtime_contract_offer_digest());
   }
 
-  std::filesystem::path root_path;
+  std::filesystem::path state_root_path;
+  std::filesystem::path run_root_path;
   const manyforge::deployment::IVerifiedRetainedBundleSource &bundle_source;
   const manyforge::deployment::IVerifiedRetainedProductArtifactSource
       &artifact_source;
@@ -1680,20 +1868,23 @@ struct RetainedPosixRuntimeUnitAdapter::Impl final {
   std::string shell_contract;
   std::string boot_id;
   std::string observer_instance_id;
-  UniqueFd root_fd;
+  UniqueFd state_root_fd;
+  UniqueFd run_root_fd;
   std::mutex mutex;
   std::uint64_t observation_sequence{};
 };
 
 RetainedPosixRuntimeUnitAdapter::RetainedPosixRuntimeUnitAdapter(
-    std::filesystem::path trusted_runtime_root,
+    std::filesystem::path trusted_state_root,
+    std::filesystem::path trusted_run_root,
     const manyforge::deployment::IVerifiedRetainedBundleSource &bundle_source,
     const manyforge::deployment::IVerifiedRetainedProductArtifactSource
         &artifact_source,
     std::string operating_system, std::string shell_contract)
     : impl_(std::make_unique<Impl>(
-          std::move(trusted_runtime_root), bundle_source, artifact_source,
-          std::move(operating_system), std::move(shell_contract))) {}
+          std::move(trusted_state_root), std::move(trusted_run_root),
+          bundle_source, artifact_source, std::move(operating_system),
+          std::move(shell_contract))) {}
 
 RetainedPosixRuntimeUnitAdapter::~RetainedPosixRuntimeUnitAdapter() = default;
 

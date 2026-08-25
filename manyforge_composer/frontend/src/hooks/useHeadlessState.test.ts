@@ -196,7 +196,7 @@ afterEach(() => {
 });
 
 describe('HeadlessStateSource delivery scheduling', () => {
-  it('uses one stable fallback client identity for the socket and reconnects', () => {
+  it('uses one distinct transient client identity for each connection', () => {
     vi.useFakeTimers();
     const urls: string[] = [];
     class FakeWebSocket {
@@ -211,18 +211,17 @@ describe('HeadlessStateSource delivery scheduling', () => {
       location: { href: 'http://composer.test/' },
       requestAnimationFrame: vi.fn(), cancelAnimationFrame: vi.fn(),
     });
-    vi.stubGlobal('localStorage', {
-      getItem: () => { throw new Error('storage unavailable'); },
-      setItem: () => { throw new Error('storage unavailable'); },
-    });
     vi.stubGlobal('WebSocket', FakeWebSocket);
 
     const source = new HeadlessStateSource();
     source.setEnabled(true);
     source.reconnect();
     expect(urls).toHaveLength(2);
-    expect(new URL(urls[0]!).searchParams.get('client_id')).toBe(source.clientId);
-    expect(new URL(urls[1]!).searchParams.get('client_id')).toBe(source.clientId);
+    const firstClient = new URL(urls[0]!).searchParams.get('client_id');
+    const secondClient = new URL(urls[1]!).searchParams.get('client_id');
+    expect(firstClient).toMatch(/^composer-browser\./);
+    expect(secondClient).toMatch(/^composer-browser\./);
+    expect(secondClient).not.toBe(firstClient);
     source.dispose();
   });
 

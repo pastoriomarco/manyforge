@@ -1,9 +1,11 @@
 #include "manyforge_headless/program_apply_owner.hpp"
 
 #include <algorithm>
+#include <cstddef>
 #include <set>
 #include <utility>
 #include <variant>
+#include <vector>
 
 #include <manyforge_content_identity/content_identity.hpp>
 #include <manyforge_core/types/program_contract.hpp>
@@ -22,6 +24,11 @@ constexpr std::string_view kPreparationIdentityDomain =
     "manyforge-program-apply-preparation";
 constexpr std::string_view kAppliedRecordIdentityDomain =
     "manyforge-applied-program-record";
+constexpr std::string_view kRequestIntentIdentityDomain =
+    "manyforge-program-apply-request-intent";
+constexpr std::string_view kRequestIntentSchemaVersion =
+    "manyforge.program_apply_request_intent.v1";
+constexpr std::size_t kMaximumOwnerStatePayloadBytes = 12U * 1024U * 1024U;
 
 [[noreturn]] void Fail(std::string code, std::string message) {
   throw ProgramApplyError(std::move(code), std::move(message));
@@ -285,16 +292,78 @@ void ForEachProduct(const core::RetainedCompiledProductsDTO &products,
       record);
 }
 
+[[nodiscard]] std::string RequestIntentDigest(
+    const std::string_view scenario_id,
+    const std::string_view scenario_catalog_revision,
+    const std::string_view program_id, const std::string_view program_revision,
+    const std::optional<std::string> &expected_applied_record_digest) {
+  return content_identity::framed_sha256(
+      kRequestIntentIdentityDomain, kRequestIntentSchemaVersion,
+      CanonicalValue(CanonicalValue::Object{
+          {"expected_applied_record_digest",
+           expected_applied_record_digest.has_value()
+               ? CanonicalValue(*expected_applied_record_digest)
+               : CanonicalValue(nullptr)},
+          {"program_id", CanonicalValue(std::string(program_id))},
+          {"program_revision", CanonicalValue(std::string(program_revision))},
+          {"scenario_catalog_revision",
+           CanonicalValue(std::string(scenario_catalog_revision))},
+          {"scenario_id", CanonicalValue(std::string(scenario_id))},
+      }));
+}
+
+[[nodiscard]] std::string RequestIntentDigest(
+    const CanonicalValue &candidate,
+    const std::optional<std::string> &expected_applied_record_digest) {
+  constexpr std::string_view code = "program_apply_preparation_invalid";
+  return RequestIntentDigest(
+      Text(candidate, "scenario_id", code),
+      Text(candidate, "scenario_catalog_revision", code),
+      Text(candidate, "program_id", code),
+      Text(candidate, "program_revision", code),
+      expected_applied_record_digest);
+}
+
+struct RequestLedgerEntry final {
+  std::string request_id;
+  std::string intent_digest;
+  std::uint64_t generation;
+  CanonicalValue record;
+  std::string record_digest;
+  std::string selection_source_owner_id;
+  std::string selection_source_owner_epoch;
+};
+
+[[nodiscard]] CanonicalValue LedgerEntryValue(
+    const RequestLedgerEntry &entry) {
+  return CanonicalValue(CanonicalValue::Object{
+      {"applied_generation",
+       CanonicalValue(static_cast<double>(entry.generation))},
+      {"applied_record", entry.record},
+      {"applied_record_digest", CanonicalValue(entry.record_digest)},
+      {"intent_digest", CanonicalValue(entry.intent_digest)},
+      {"request_id", CanonicalValue(entry.request_id)},
+      {"selection_source_owner_epoch",
+       CanonicalValue(entry.selection_source_owner_epoch)},
+      {"selection_source_owner_id",
+       CanonicalValue(entry.selection_source_owner_id)},
+  });
+}
+
 [[nodiscard]] CanonicalValue OwnerStateValue(
     const CanonicalValue &record, const std::string &record_digest,
     const std::uint64_t generation, const std::string_view request_owner_epoch,
-    const std::string_view request_id) {
+    const std::vector<RequestLedgerEntry> &requests) {
+  CanonicalValue::Array request_values;
+  request_values.reserve(requests.size());
+  for (const auto &request : requests) {
+    request_values.push_back(LedgerEntryValue(request));
+  }
   return CanonicalValue(CanonicalValue::Object{
       {"applied_generation", CanonicalValue(static_cast<double>(generation))},
       {"applied_record", record},
       {"applied_record_digest", CanonicalValue(record_digest)},
-      {"outcome", CanonicalValue("applied")},
-      {"request_id", CanonicalValue(std::string(request_id))},
+      {"requests", CanonicalValue(std::move(request_values))},
       {"request_owner_epoch",
        CanonicalValue(std::string(request_owner_epoch))},
       {"schema_version",
@@ -307,33 +376,111 @@ struct DecodedOwnerState final {
   CanonicalValue record;
   std::string record_digest;
   std::string request_owner_epoch;
-  std::string request_id;
+  std::vector<RequestLedgerEntry> requests;
 };
 
-[[nodiscard]] DecodedOwnerState DecodeOwnerState(const CanonicalValue &value) {
+[[nodiscard]] bool IsBoundedIdentityText(const std::string_view value) {
+  return !value.empty() && value.size() <= kMaximumSourceOwnerIdentifierBytes &&
+         content_identity::is_utf8_nfc(value);
+}
+
+[[nodiscard]] RequestLedgerEntry
+DecodeLedgerEntry(const CanonicalValue &value) {
   constexpr std::string_view code = "program_applied_selection_invalid";
   Require(value.is_object() && value.as_object().size() == 7U,
           std::string(code),
+          "Program Apply request ledger entry must be one exact closed object");
+  RequestLedgerEntry result{
+      Text(value, "request_id", code),
+      Text(value, "intent_digest", code),
+      Unsigned(value, "applied_generation", code),
+      Member(value, "applied_record", code),
+      Text(value, "applied_record_digest", code),
+      Text(value, "selection_source_owner_id", code),
+      Text(value, "selection_source_owner_epoch", code),
+  };
+  Require(IsBoundedIdentityText(result.request_id) &&
+              content_identity::is_sha256_digest(result.intent_digest) &&
+              content_identity::is_sha256_digest(result.record_digest) &&
+              AppliedRecordDigest(result.record) == result.record_digest &&
+              IsBoundedIdentityText(result.selection_source_owner_id) &&
+              IsBoundedIdentityText(result.selection_source_owner_epoch),
+          std::string(code),
+          "Program Apply request ledger entry has an invalid identity");
+  static_cast<void>(DecodePreparationValue(
+      result.record, kAppliedProgramSelectionSchemaVersion, code));
+  return result;
+}
+
+[[nodiscard]] DecodedOwnerState DecodeOwnerState(const CanonicalValue &value) {
+  constexpr std::string_view code = "program_applied_selection_invalid";
+  Require(value.is_object() && value.as_object().size() == 6U,
+          std::string(code),
           "Program selection owner state must be one exact closed object");
   Require(Text(value, "schema_version", code) ==
-              kProgramSelectionOwnerStateSchemaVersion &&
-              Text(value, "outcome", code) == "applied",
+              kProgramSelectionOwnerStateSchemaVersion,
           std::string(code),
-          "Program selection owner state version or outcome is invalid");
+          "Program selection owner state version is invalid");
+  const auto &request_values = Member(value, "requests", code);
+  Require(request_values.is_array() && !request_values.as_array().empty() &&
+              request_values.as_array().size() <=
+                  kMaximumProgramApplyRequestLedgerEntries,
+          std::string(code),
+          "Program selection request ledger size is invalid");
   DecodedOwnerState result{
       Unsigned(value, "applied_generation", code),
       Member(value, "applied_record", code),
       Text(value, "applied_record_digest", code),
       Text(value, "request_owner_epoch", code),
-      Text(value, "request_id", code),
+      {},
   };
+  Require(IsBoundedIdentityText(result.request_owner_epoch), std::string(code),
+          "Program selection request owner epoch is invalid");
+  result.requests.reserve(request_values.as_array().size());
+  std::set<std::string> request_ids;
+  const RequestLedgerEntry *previous = nullptr;
+  for (const auto &request_value : request_values.as_array()) {
+    auto request = DecodeLedgerEntry(request_value);
+    Require(request_ids.insert(request.request_id).second, std::string(code),
+            "Program selection request ledger contains a duplicate request ID");
+    Require(request.generation <= result.generation &&
+                (previous == nullptr ||
+                 (request.generation == previous->generation &&
+                  request.record_digest == previous->record_digest) ||
+                 (request.generation == previous->generation + 1U &&
+                  request.record_digest != previous->record_digest)),
+            std::string(code),
+            "Program selection request ledger generations are inconsistent");
+    result.requests.push_back(std::move(request));
+    previous = &result.requests.back();
+  }
   Require(content_identity::is_sha256_digest(result.record_digest) &&
               AppliedRecordDigest(result.record) == result.record_digest,
           std::string(code),
           "Program selection owner state has a divergent record digest");
   static_cast<void>(DecodePreparationValue(
       result.record, kAppliedProgramSelectionSchemaVersion, code));
+  const auto &latest = result.requests.back();
+  Require(latest.generation == result.generation &&
+              latest.record_digest == result.record_digest &&
+              latest.record == result.record,
+          std::string(code),
+          "Program selection request ledger does not end at current Applied");
   return result;
+}
+
+void RequireLedgerOwner(const DecodedOwnerState &state,
+                        const std::string_view source_owner_id,
+                        const std::string_view source_owner_epoch) {
+  Require(std::all_of(state.requests.begin(), state.requests.end(),
+                      [&](const RequestLedgerEntry &entry) {
+                        return entry.selection_source_owner_id ==
+                               source_owner_id;
+                      }) &&
+              state.requests.back().selection_source_owner_epoch ==
+                  source_owner_epoch,
+          "program_applied_selection_invalid",
+          "Program selection request ledger and outer owner disagree");
 }
 
 [[nodiscard]] std::string
@@ -357,8 +504,7 @@ ProgramApplyError::ProgramApplyError(std::string code, std::string message)
 
 ProgramSelectionOwner::ProgramSelectionOwner(
     std::filesystem::path install_root, std::filesystem::path artifact_root,
-    std::filesystem::path owner_state_root,
-    std::filesystem::path projection_root, std::string owner_id,
+    std::filesystem::path owner_state_root, std::string owner_id,
     std::string owner_epoch)
     : scenario_source_(install_root, "maintained"),
       bundle_source_(install_root), model_map_source_(install_root),
@@ -370,11 +516,10 @@ ProgramSelectionOwner::ProgramSelectionOwner(
       artifact_model_map_source_(artifact_root),
       owner_state_(std::move(owner_state_root),
                    std::string(kProgramSelectionOwnerStateFile)),
-      projection_(std::move(projection_root),
-                  std::string(kAppliedProgramSelectionSourceFile)),
       source_owner_id_(std::move(owner_id)),
       source_owner_epoch_(std::move(owner_epoch)) {
-  Require(!source_owner_id_.empty() && !source_owner_epoch_.empty(),
+  Require(IsBoundedIdentityText(source_owner_id_) &&
+              IsBoundedIdentityText(source_owner_epoch_),
           "program_apply_configuration_invalid",
           "Program Apply source-owner identities are required");
 }
@@ -382,19 +527,28 @@ ProgramSelectionOwner::ProgramSelectionOwner(
 CanonicalValue ProgramSelectionOwner::Prepare(
     const std::string_view scenario_id,
     const std::string_view expected_scenario_catalog_revision,
-    const std::string_view canonical_program_bytes) {
+    const std::string_view canonical_program_bytes,
+    const std::string_view active_retained_bundle_id,
+    const std::string_view active_graph_revision) {
   std::lock_guard lock(mutex_);
   try {
     Require(
-        content_identity::is_sha256_digest(expected_scenario_catalog_revision),
+        content_identity::is_sha256_digest(expected_scenario_catalog_revision) &&
+            content_identity::is_sha256_digest(active_retained_bundle_id) &&
+            content_identity::is_sha256_digest(active_graph_revision),
         "program_apply_request_invalid",
-        "expected scenario-catalog revision is invalid");
+        "Program Apply expected or active identity is invalid");
     const auto scenario =
         scenario_source_.LoadExactProgramSelection(scenario_id);
     Require(scenario.scenario_catalog_revision.value() ==
                 expected_scenario_catalog_revision,
             "program_apply_scenario_catalog_stale",
             "Program Apply targets a stale scenario-catalog revision");
+    Require(scenario.retained_bundle_id.value() == active_retained_bundle_id &&
+                scenario.graph_revision.value() == active_graph_revision,
+            "program_apply_deployment_not_active",
+            "Program Apply target deployment is not the fresh active Manager "
+            "selection");
     const auto bundle =
         bundle_source_.get_verified(scenario.retained_bundle_id);
     Require(bundle != nullptr, "program_apply_bundle_invalid",
@@ -564,14 +718,10 @@ CanonicalValue ProgramSelectionOwner::Commit(
     const auto prepared = DecodePreparation(canonical_preparation_bytes);
     Require(content_identity::is_sha256_digest(active_retained_bundle_id) &&
                 content_identity::is_sha256_digest(active_graph_revision) &&
-                !request_owner_epoch.empty() && !request_id.empty(),
+                IsBoundedIdentityText(request_owner_epoch) &&
+                IsBoundedIdentityText(request_id),
             "program_apply_active_selection_invalid",
             "Program Apply active Manager identity is invalid");
-    Require(prepared.retained_bundle_id.value() == active_retained_bundle_id &&
-                prepared.graph_revision.value() == active_graph_revision,
-            "program_apply_deployment_not_active",
-            "Program Apply target deployment is not the fresh active Manager "
-            "selection");
     if (expected_applied_record_digest.has_value()) {
       Require(
           content_identity::is_sha256_digest(*expected_applied_record_digest),
@@ -582,25 +732,42 @@ CanonicalValue ProgramSelectionOwner::Commit(
     const CanonicalValue candidate =
         PreparationValue(prepared, kAppliedProgramSelectionSchemaVersion);
     const auto candidate_digest = AppliedRecordDigest(candidate);
+    const auto intent_digest =
+        RequestIntentDigest(candidate, expected_applied_record_digest);
+    if (auto replay = ReplayResultLocked(intent_digest, request_owner_epoch,
+                                         request_id);
+        replay.has_value()) {
+      return Member(*replay, "applied", "program_applied_selection_invalid");
+    }
     const auto current_snapshot = owner_state_.Read();
-    const auto current = current_snapshot.has_value()
-                             ? std::optional<DecodedOwnerState>(
-                                   DecodeOwnerState(current_snapshot->payload))
-                             : std::nullopt;
+    std::optional<DecodedOwnerState> current;
+    if (current_snapshot.has_value()) {
+      Require(current_snapshot->source_owner_kind == "program_selection" &&
+                  current_snapshot->source_owner_id == source_owner_id_,
+              "program_applied_selection_invalid",
+              "Applied Program owner state belongs to another owner");
+      current = DecodeOwnerState(current_snapshot->payload);
+      RequireLedgerOwner(*current, current_snapshot->source_owner_id,
+                         current_snapshot->source_owner_epoch);
+    }
 
+    Require(prepared.retained_bundle_id.value() == active_retained_bundle_id &&
+                prepared.graph_revision.value() == active_graph_revision,
+            "program_apply_deployment_not_active",
+            "Program Apply target deployment is not the fresh active Manager "
+            "selection");
     Require(current.has_value() == expected_applied_record_digest.has_value() &&
                 (!current.has_value() ||
                  current->record_digest == *expected_applied_record_digest),
             "program_apply_selection_stale",
             "Program Apply expected another current Applied selection");
-    if (current.has_value() &&
-        current->request_owner_epoch == request_owner_epoch &&
-        current->request_id == request_id) {
-      Require(current->record_digest == candidate_digest,
-              "program_apply_request_conflict",
-              "Program Apply request identity was reused for another intent");
-      return ReadAppliedLocked();
-    }
+    Require(!current.has_value() ||
+                current->request_owner_epoch != request_owner_epoch ||
+                current->requests.size() <
+                    kMaximumProgramApplyRequestLedgerEntries,
+            "program_apply_request_ledger_exhausted",
+            "Program Apply request ledger is exhausted for this authoring "
+            "owner epoch");
 
     const auto bundle =
         artifact_bundle_source_.get_verified(prepared.retained_bundle_id);
@@ -631,9 +798,26 @@ CanonicalValue ProgramSelectionOwner::Commit(
     Require(generation <= 9007199254740991ULL,
             "program_apply_selection_exhausted",
             "Program selection generation is exhausted");
-    const auto owner_value =
-        OwnerStateValue(candidate, candidate_digest, generation,
-                        request_owner_epoch, request_id);
+    std::vector<RequestLedgerEntry> requests;
+    if (current.has_value() &&
+        current->request_owner_epoch == request_owner_epoch) {
+      requests = current->requests;
+    }
+    requests.push_back(RequestLedgerEntry{
+        std::string(request_id),
+        intent_digest,
+        generation,
+        candidate,
+        candidate_digest,
+        source_owner_id_,
+        source_owner_epoch_,
+    });
+    const auto owner_value = OwnerStateValue(
+        candidate, candidate_digest, generation, request_owner_epoch, requests);
+    Require(content_identity::canonical_json(owner_value).size() <=
+                kMaximumOwnerStatePayloadBytes,
+            "program_apply_request_ledger_exhausted",
+            "Program Apply request ledger has reached its durable byte bound");
     try {
       const auto published = owner_state_.Publish(
           "program_selection", source_owner_id_, source_owner_epoch_,
@@ -651,14 +835,6 @@ CanonicalValue ProgramSelectionOwner::Commit(
         throw;
       }
     }
-    // Projection is explicitly rebuildable and never participates in the
-    // authoritative commit. A failed write is repaired by the next read.
-    try {
-      static_cast<void>(projection_.Publish(
-          "program_selection", source_owner_id_, source_owner_epoch_,
-          observed_at_ns, candidate));
-    } catch (const SourceSnapshotError &) {
-    }
     applied_cache_.reset();
     applied_cache_record_digest_.clear();
     return ReadAppliedLocked();
@@ -668,6 +844,117 @@ CanonicalValue ProgramSelectionOwner::Commit(
     Fail("program_apply_commit_failed",
          "Program Apply commit failed: " + std::string(error.what()));
   }
+}
+
+std::optional<CanonicalValue> ProgramSelectionOwner::Replay(
+    const std::string_view canonical_preparation_bytes,
+    const std::optional<std::string> &expected_applied_record_digest,
+    const std::string_view request_owner_epoch,
+    const std::string_view request_id) {
+  std::lock_guard lock(mutex_);
+  try {
+    Require(IsBoundedIdentityText(request_owner_epoch) &&
+                IsBoundedIdentityText(request_id),
+            "program_apply_active_selection_invalid",
+            "Program Apply request identity is invalid");
+    if (expected_applied_record_digest.has_value()) {
+      Require(content_identity::is_sha256_digest(
+                  *expected_applied_record_digest),
+              "program_apply_expected_selection_invalid",
+              "expected Applied record digest is invalid");
+    }
+    const auto prepared = DecodePreparation(canonical_preparation_bytes);
+    const CanonicalValue candidate =
+        PreparationValue(prepared, kAppliedProgramSelectionSchemaVersion);
+    auto replay = ReplayResultLocked(
+        RequestIntentDigest(candidate, expected_applied_record_digest),
+        request_owner_epoch, request_id);
+    if (!replay.has_value()) {
+      return std::nullopt;
+    }
+    return Member(*replay, "applied", "program_applied_selection_invalid");
+  } catch (const ProgramApplyError &) {
+    throw;
+  } catch (const std::exception &error) {
+    Fail("program_apply_replay_failed",
+         "Program Apply replay failed: " + std::string(error.what()));
+  }
+}
+
+std::optional<CanonicalValue> ProgramSelectionOwner::ReplayRequest(
+    const std::string_view scenario_id,
+    const std::string_view scenario_catalog_revision,
+    const std::string_view program_id, const std::string_view program_revision,
+    const std::optional<std::string> &expected_applied_record_digest,
+    const std::string_view request_owner_epoch,
+    const std::string_view request_id) {
+  std::lock_guard lock(mutex_);
+  try {
+    Require(IsIdentifier(scenario_id) && IsIdentifier(program_id) &&
+                content_identity::is_sha256_digest(
+                    scenario_catalog_revision) &&
+                content_identity::is_sha256_digest(program_revision) &&
+                IsBoundedIdentityText(request_owner_epoch) &&
+                IsBoundedIdentityText(request_id) &&
+                (!expected_applied_record_digest.has_value() ||
+                 content_identity::is_sha256_digest(
+                     *expected_applied_record_digest)),
+            "program_apply_request_invalid",
+            "Program Apply replay identity is invalid");
+    return ReplayResultLocked(
+        RequestIntentDigest(scenario_id, scenario_catalog_revision, program_id,
+                            program_revision,
+                            expected_applied_record_digest),
+        request_owner_epoch, request_id);
+  } catch (const ProgramApplyError &) {
+    throw;
+  } catch (const std::exception &error) {
+    Fail("program_apply_replay_failed",
+         "Program Apply replay failed: " + std::string(error.what()));
+  }
+}
+
+std::optional<CanonicalValue> ProgramSelectionOwner::ReplayResultLocked(
+    const std::string_view intent_digest,
+    const std::string_view request_owner_epoch,
+    const std::string_view request_id) {
+  const auto current_snapshot = owner_state_.Read();
+  if (!current_snapshot.has_value()) {
+    return std::nullopt;
+  }
+  Require(current_snapshot->source_owner_kind == "program_selection" &&
+              current_snapshot->source_owner_id == source_owner_id_,
+          "program_applied_selection_invalid",
+          "Applied Program owner state belongs to another owner");
+  const auto current = DecodeOwnerState(current_snapshot->payload);
+  RequireLedgerOwner(current, current_snapshot->source_owner_id,
+                     current_snapshot->source_owner_epoch);
+  if (current.request_owner_epoch != request_owner_epoch) {
+    return std::nullopt;
+  }
+  const auto replay = std::find_if(
+      current.requests.begin(), current.requests.end(),
+      [&](const RequestLedgerEntry &entry) {
+        return entry.request_id == request_id;
+      });
+  if (replay == current.requests.end()) {
+    return std::nullopt;
+  }
+  Require(replay->intent_digest == intent_digest,
+          "program_apply_request_conflict",
+          "Program Apply request identity was reused for another intent");
+  const auto preparation = DecodePreparationValue(
+      replay->record, kAppliedProgramSelectionSchemaVersion,
+      "program_applied_selection_invalid");
+  return CanonicalValue(CanonicalValue::Object{
+      {"applied",
+       BuildAppliedLocked(replay->record, replay->record_digest,
+                          replay->generation,
+                          replay->selection_source_owner_id,
+                          replay->selection_source_owner_epoch)},
+      {"preparation",
+       PreparationValue(preparation, kProgramApplyPreparationSchemaVersion)},
+  });
 }
 
 CanonicalValue ProgramSelectionOwner::ReadApplied() {
@@ -685,21 +972,41 @@ CanonicalValue ProgramSelectionOwner::ReadAppliedLocked() {
             "program_applied_selection_invalid",
             "Applied Program owner state belongs to another owner");
     const auto current = DecodeOwnerState(current_snapshot->payload);
-    try {
-      const auto projected = projection_.Read();
-      if (!projected.has_value() || projected->payload != current.record) {
-        static_cast<void>(projection_.Publish(
-            "program_selection", source_owner_id_, source_owner_epoch_, 0,
-            current.record));
-      }
-    } catch (const SourceSnapshotError &) {
-    }
+    RequireLedgerOwner(current, current_snapshot->source_owner_id,
+                       current_snapshot->source_owner_epoch);
     if (applied_cache_.has_value() &&
         applied_cache_record_digest_ == current.record_digest) {
       return *applied_cache_;
     }
+    auto result = BuildAppliedLocked(
+        current.record, current.record_digest, current.generation,
+        current_snapshot->source_owner_id, current_snapshot->source_owner_epoch);
+    applied_cache_record_digest_ = current.record_digest;
+    applied_cache_ = result;
+    return result;
+  } catch (const ProgramApplyError &) {
+    throw;
+  } catch (const std::exception &error) {
+    Fail("program_applied_selection_invalid",
+         "Applied Program selection is invalid: " + std::string(error.what()));
+  }
+}
+
+CanonicalValue ProgramSelectionOwner::BuildAppliedLocked(
+    const CanonicalValue &record, const std::string_view record_digest,
+    const std::uint64_t generation,
+    const std::string_view selection_source_owner_id,
+    const std::string_view selection_source_owner_epoch) {
+  try {
+    Require(content_identity::is_sha256_digest(record_digest) &&
+                AppliedRecordDigest(record) == record_digest &&
+                generation >= 1U && generation <= 9007199254740991ULL &&
+                IsBoundedIdentityText(selection_source_owner_id) &&
+                IsBoundedIdentityText(selection_source_owner_epoch),
+            "program_applied_selection_invalid",
+            "Applied Program replay identity is invalid");
     const auto prepared = DecodePreparationValue(
-        current.record, kAppliedProgramSelectionSchemaVersion,
+        record, kAppliedProgramSelectionSchemaVersion,
         "program_applied_selection_invalid");
     const auto bundle =
         artifact_bundle_source_.get_verified(prepared.retained_bundle_id);
@@ -721,7 +1028,7 @@ CanonicalValue ProgramSelectionOwner::ReadAppliedLocked() {
             "program_applied_selection_invalid",
             "Applied Program immutable closure is unavailable or divergent");
 
-    CanonicalValue result(CanonicalValue::Object{
+    return CanonicalValue(CanonicalValue::Object{
         {"assistant_mode", CanonicalValue(prepared.assistant_mode)},
         {"baseline_program_binding_id",
          CanonicalValue(prepared.baseline_program_binding_id.value())},
@@ -749,21 +1056,18 @@ CanonicalValue ProgramSelectionOwner::ReadAppliedLocked() {
          CanonicalValue(std::string(kAppliedProgramSelectionSchemaVersion))},
         {"source",
          CanonicalValue(CanonicalValue::Object{
-             {"record_digest", CanonicalValue(current.record_digest)},
+             {"record_digest", CanonicalValue(std::string(record_digest))},
              {"semantic_content_digest",
-              CanonicalValue(current.record_digest)},
+              CanonicalValue(std::string(record_digest))},
              {"source_generation",
-              CanonicalValue(static_cast<double>(current.generation))},
+              CanonicalValue(static_cast<double>(generation))},
              {"source_owner_epoch",
-              CanonicalValue(current_snapshot->source_owner_epoch)},
+              CanonicalValue(std::string(selection_source_owner_epoch))},
              {"source_owner_id",
-              CanonicalValue(current_snapshot->source_owner_id)},
+              CanonicalValue(std::string(selection_source_owner_id))},
          })},
         {"typed_parameter_overrides", prepared.typed_parameter_overrides},
     });
-    applied_cache_record_digest_ = current.record_digest;
-    applied_cache_ = result;
-    return result;
   } catch (const ProgramApplyError &) {
     throw;
   } catch (const std::exception &error) {

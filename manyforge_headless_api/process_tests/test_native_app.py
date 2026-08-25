@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from dataclasses import replace
 from pathlib import Path
 import os
 import subprocess
@@ -9,6 +10,7 @@ import sys
 import time
 
 from fastapi.testclient import TestClient
+import pytest
 
 from manyforge_headless_api.app import create_app
 from manyforge_headless_api.native import HeadlessApiConfig
@@ -23,12 +25,12 @@ def _config(root: Path, owner_epoch: str) -> HeadlessApiConfig:
     artifact_root = root / "artifacts"
     program_selection_state_root = root / "program-selection-state"
     manager_run_root = root / "manager-run"
-    execution_state_root = root / "execution"
+    execution_run_root = root / "execution-run"
     publication_root.mkdir(exist_ok=True)
     artifact_root.mkdir(exist_ok=True)
     program_selection_state_root.mkdir(exist_ok=True)
     manager_run_root.mkdir(exist_ok=True)
-    execution_state_root.mkdir(exist_ok=True)
+    execution_run_root.mkdir(exist_ok=True)
     return HeadlessApiConfig(
         projection_root=publication_root,
         install_root=Path(os.environ["MANYFORGE_CANONICAL_EMPTY_PACKAGE_ROOT"]),
@@ -38,7 +40,7 @@ def _config(root: Path, owner_epoch: str) -> HeadlessApiConfig:
         alarm_catalog_path=CATALOG,
         historian_database_path=root / "history.sqlite3",
         manager_run_root=manager_run_root,
-        execution_state_root=execution_state_root,
+        execution_run_root=execution_run_root,
         cell_id="c1_build_authority_cell",
         resource_ids=("resource.arm.a",),
         owner_id="headless-api.test",
@@ -48,6 +50,25 @@ def _config(root: Path, owner_epoch: str) -> HeadlessApiConfig:
         historian_record_retention=100,
         mutation_replay_capacity=32,
     )
+
+
+def test_config_rejects_nested_run_and_durable_capabilities(
+    tmp_path: Path,
+) -> None:
+    config = _config(tmp_path, "headless-config-test.epoch")
+    nested_execution_run = config.manager_run_root / "execution"
+    nested_execution_run.mkdir()
+    with pytest.raises(ValueError, match="disjoint trees"):
+        replace(config, execution_run_root=nested_execution_run)
+
+    with pytest.raises(ValueError, match="durable Headless paths"):
+        replace(
+            config,
+            historian_database_path=config.execution_run_root / "history.sqlite3",
+        )
+
+    with pytest.raises(ValueError, match="durable Headless paths"):
+        replace(config, projection_root=tmp_path)
 
 
 def _acknowledgement(alarm: dict, owner_epoch: str, request_id: str) -> dict:
@@ -67,12 +88,14 @@ def _start_manager(root: Path) -> subprocess.Popen[bytes]:
     publication_root = root / "publications"
     manager_state_root = root / "manager"
     manager_run_root = root / "manager-run"
-    runtime_state_root = root / "runtime"
+    execution_state_root = root / "execution-state"
+    execution_run_root = root / "execution-run"
     for path in (
         publication_root,
         manager_state_root,
         manager_run_root,
-        runtime_state_root,
+        execution_state_root,
+        execution_run_root,
     ):
         path.mkdir(exist_ok=True)
     process = subprocess.Popen(
@@ -84,8 +107,10 @@ def _start_manager(root: Path) -> subprocess.Popen[bytes]:
             str(manager_state_root),
             "--manager-run-root",
             str(manager_run_root),
-            "--runtime-state-root",
-            str(runtime_state_root),
+            "--execution-state-root",
+            str(execution_state_root),
+            "--execution-run-root",
+            str(execution_run_root),
             "--logical-scene-database",
             str(root / "logical-scene.sqlite3"),
             "--program-cycle-journal",

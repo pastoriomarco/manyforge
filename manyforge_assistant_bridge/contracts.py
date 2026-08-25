@@ -40,6 +40,10 @@ class ComposerDraftContext(_ClosedModel):
         int,
         Field(alias="expectedDraftRevision", ge=0, le=_MAXIMUM_SAFE_INTEGER),
     ]
+    expected_admission_generation: Annotated[
+        int,
+        Field(alias="expectedAdmissionGeneration", ge=1, le=_MAXIMUM_SAFE_INTEGER),
+    ]
     program_loaded: bool = Field(alias="programLoaded")
     program_revision: Annotated[
         int | None,

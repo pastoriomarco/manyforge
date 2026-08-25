@@ -58,7 +58,9 @@ describe('Program workspace lifecycle controls', () => {
     expect(source).toContain('newDraft(confirmDiscard)');
     expect(source).toContain('Revert to Saved');
     expect(source).toContain('Discard to Applied');
-    expect(source).toContain('disabled={busy || !workspace.applied.available}');
+    expect(source).toContain(
+      'disabled={authoringBusy || !workspace.applied.available}',
+    );
     expect(source).toContain('workspace.saved.available');
     expect(source).not.toContain('localStorage');
     expect(source).not.toContain('sendBeacon');
@@ -79,11 +81,9 @@ describe('Program workspace lifecycle controls', () => {
     expect(source).not.toContain('const revert = useCallback((\\n    scenarioId');
     expect(source).toContain("type: 'request_failed'");
     expect(source).toContain(
-      'Revert is pending deployment; Draft and Saved were not replaced.',
+      'Revert completed through authoritative Apply; Draft now matches Saved.',
     );
-    expect(source).not.toContain(
-      'Saved Program reverted through authoritative Apply; Draft now matches Saved.',
-    );
+    expect(source).not.toContain('pending deployment');
   });
 
   it('links to exact Applied JSON without rendering the full documents', () => {
@@ -98,22 +98,12 @@ describe('Program workspace lifecycle controls', () => {
   });
 
   it('preserves Revert status truth and the exact owner-returned workspace', () => {
-    const pendingWorkspace = workspace('owner-pending', 8);
-    const pending = programWorkspaceTransitionResult(
-      'revert',
-      transition('pending_deployment', pendingWorkspace),
-    );
     const revertedWorkspace = workspace('owner-reverted', 9);
     const reverted = programWorkspaceTransitionResult(
       'revert',
       transition('reverted', revertedWorkspace),
     );
 
-    expect(pending.workspace).toBe(pendingWorkspace);
-    expect(pending.transitionStatus).toBe('pending_deployment');
-    expect(pending.message).toContain('pending deployment');
-    expect(pending.message).toContain('Draft and Saved were not replaced');
-    expect(pending.message).not.toContain('Draft now matches Saved');
     expect(reverted.workspace).toBe(revertedWorkspace);
     expect(reverted.transitionStatus).toBe('reverted');
     expect(reverted.message).toContain('Draft now matches Saved');
@@ -133,18 +123,44 @@ describe('Program workspace lifecycle controls', () => {
     expect(result.message).not.toContain('through authoritative Apply');
   });
 
-  it('does not flatten Apply pending into an applied-success claim', () => {
-    const ownerWorkspace = workspace('apply-pending', 11);
+  it('reports Apply only after the backend completed it', () => {
+    const ownerWorkspace = workspace('apply-complete', 11);
     const result = programWorkspaceTransitionResult(
       'apply',
-      transition('pending_deployment', ownerWorkspace),
+      transition('applied', ownerWorkspace),
     );
 
     expect(result.workspace).toBe(ownerWorkspace);
-    expect(result.transitionStatus).toBe('pending_deployment');
-    expect(result.message).toBe(
-      'Apply is pending deployment; Applied was not replaced.',
+    expect(result.transitionStatus).toBe('applied');
+    expect(result.message).toContain('Apply completed');
+  });
+
+  it('presents deployment selection as a separate Program Apply prerequisite', () => {
+    const source = readFileSync(
+      new URL('./ProgramWorkspace.tsx', import.meta.url),
+      'utf8',
     );
-    expect(result.message).not.toContain('Apply completed');
+    expect(source).toContain(
+      "Program Apply requires this scenario&apos;s deployment already",
+    );
+    expect(source).toContain('Program Apply never changes the deployment.');
+    expect(source).toMatch(
+      /Deployment Apply\s+remains a separate Manager command/,
+    );
+  });
+
+  it('reflects backend idle admission instead of silently dropping UI actions', () => {
+    const source = readFileSync(
+      new URL('./ProgramWorkspace.tsx', import.meta.url),
+      'utf8',
+    );
+    expect(source).toContain(
+      'busy || authoringUnavailable || !mutationAvailable',
+    );
+    expect(source).toContain('Backend authoring is unavailable');
+    expect(source).toContain(
+      'Program Apply, Load, Revert, and Discard remain unavailable',
+    );
+    expect(source).not.toContain('affect only later runs');
   });
 });

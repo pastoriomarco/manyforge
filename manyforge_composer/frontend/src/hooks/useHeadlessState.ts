@@ -119,11 +119,9 @@ export function browserStableIdentity(storageKey: string, prefix: string): strin
 }
 
 function browserClientId(): string {
-  return browserStableIdentity('manyforge.composer.client_id', 'composer-browser');
-}
-
-export function headlessClientId(): string {
-  return browserClientId();
+  const random = globalThis.crypto?.randomUUID?.()
+    ?? `${Date.now()}-${Math.random().toString(16).slice(2)}`;
+  return `composer-browser.${random}`;
 }
 
 type Listener = () => void;
@@ -183,8 +181,6 @@ export class HeadlessStateSource {
   };
   private readonly shellListeners = new Set<Listener>();
   private readonly viewerListeners = new Set<Listener>();
-  readonly clientId = browserClientId();
-
   constructor() {
     headlessSourceRecords.add(this.qualificationRecord);
     publishHeadlessQualification();
@@ -257,7 +253,8 @@ export class HeadlessStateSource {
   private connect(): void {
     if (!this.enabled || this.disposed) return;
     const serial = ++this.serial;
-    const socket = new WebSocket(websocketUrl(this.clientId));
+    const clientId = browserClientId();
+    const socket = new WebSocket(websocketUrl(clientId));
     this.socket = socket;
     headlessSocketCreations += 1;
     publishHeadlessQualification();
@@ -293,7 +290,7 @@ export class HeadlessStateSource {
         }
         const candidate = {
           ...parseComposerHeadlessState(raw),
-          clientId: this.clientId,
+          clientId,
         };
         const admission = admitHeadlessState(this.latest, candidate);
         if (!admission.accepted) {

@@ -234,6 +234,80 @@ ExistingDirectory(std::filesystem::path path, std::string_view label) {
 }
 
 [[nodiscard]] std::filesystem::path
+ExistingPrivateDirectory(std::filesystem::path path,
+                         const std::string_view label) {
+  Require(path.is_absolute(),
+          std::string(label) + " must be an absolute directory capability");
+  Require(path.lexically_normal() == path,
+          std::string(label) + " must use its canonical lexical spelling");
+  std::error_code error;
+  Require(std::filesystem::canonical(path, error) == path && !error,
+          std::string(label) + " must be one canonical directory capability");
+  struct stat before {};
+  Require(::lstat(path.c_str(), &before) == 0 && S_ISDIR(before.st_mode) &&
+              !S_ISLNK(before.st_mode),
+          std::string(label) + " must be one plain directory");
+  const int descriptor =
+      ::open(path.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW);
+  struct stat opened {};
+  struct stat after {};
+  const bool valid =
+      descriptor >= 0 && ::fstat(descriptor, &opened) == 0 &&
+      ::lstat(path.c_str(), &after) == 0 &&
+      opened.st_dev == before.st_dev && opened.st_ino == before.st_ino &&
+      after.st_dev == before.st_dev && after.st_ino == before.st_ino &&
+      S_ISDIR(opened.st_mode) && S_ISDIR(after.st_mode) &&
+      opened.st_uid == ::geteuid() && after.st_uid == ::geteuid() &&
+      (opened.st_mode & (S_IWGRP | S_IWOTH)) == 0 &&
+      (after.st_mode & (S_IWGRP | S_IWOTH)) == 0 &&
+      (opened.st_mode & (S_IRUSR | S_IWUSR | S_IXUSR)) ==
+          (S_IRUSR | S_IWUSR | S_IXUSR) &&
+      (after.st_mode & (S_IRUSR | S_IWUSR | S_IXUSR)) ==
+          (S_IRUSR | S_IWUSR | S_IXUSR);
+  if (descriptor >= 0) {
+    static_cast<void>(::close(descriptor));
+  }
+  Require(valid, std::string(label) + " identity, owner, or mode is unsafe");
+  return path;
+}
+
+void RequireDisjointDirectories(const std::filesystem::path &left,
+                                const std::filesystem::path &right,
+                                const std::string_view labels) {
+  std::error_code error;
+  const auto canonical_left = std::filesystem::canonical(left, error);
+  Require(!error, std::string(labels) + " left directory is unavailable");
+  const auto canonical_right = std::filesystem::canonical(right, error);
+  Require(!error, std::string(labels) + " right directory is unavailable");
+  const auto mismatch = std::mismatch(
+      canonical_left.begin(), canonical_left.end(), canonical_right.begin(),
+      canonical_right.end());
+  Require(mismatch.first != canonical_left.end() &&
+              mismatch.second != canonical_right.end(),
+          std::string(labels) + " must be disjoint directory trees");
+}
+
+void RequirePathOutsideDirectory(const std::filesystem::path &path,
+                                 const std::filesystem::path &directory,
+                                 const std::string_view labels) {
+  if (path.empty()) {
+    return;
+  }
+  std::error_code error;
+  const auto canonical_parent =
+      std::filesystem::canonical(path.parent_path(), error);
+  Require(!error, std::string(labels) + " parent is unavailable");
+  const auto canonical_path = canonical_parent / path.filename();
+  const auto canonical_directory = std::filesystem::canonical(directory, error);
+  Require(!error, std::string(labels) + " directory is unavailable");
+  const auto mismatch = std::mismatch(
+      canonical_directory.begin(), canonical_directory.end(),
+      canonical_path.begin(), canonical_path.end());
+  Require(mismatch.first != canonical_directory.end(),
+          std::string(labels) + " must be outside disposable run storage");
+}
+
+[[nodiscard]] std::filesystem::path
 ExistingRegularFile(std::filesystem::path path, std::string_view label,
                     bool executable) {
   Require(!path.empty(), std::string(label) + " cannot be empty");
@@ -275,8 +349,8 @@ ExistingRegularFile(std::filesystem::path path, std::string_view label,
 
 class HostLock final {
 public:
-  explicit HostLock(const std::filesystem::path &state_root) {
-    const auto path = state_root / std::string(kLockFileName);
+  explicit HostLock(const std::filesystem::path &run_root) {
+    const auto path = run_root / std::string(kLockFileName);
     descriptor_ = FileDescriptor(
         ::open(path.c_str(), O_RDWR | O_CREAT | O_CLOEXEC | O_NOFOLLOW,
                S_IRUSR | S_IWUSR));
@@ -291,7 +365,7 @@ public:
             "execution-host lock is not a regular file");
     if (::flock(descriptor_.get(), LOCK_EX | LOCK_NB) != 0) {
       if (errno == EWOULDBLOCK || errno == EAGAIN) {
-        Fail("another execution host already owns this state root");
+        Fail("another execution host already owns this run root");
       }
       FailErrno("acquire execution-host lock");
     }
@@ -303,9 +377,9 @@ private:
 
 class CommandSocket final {
 public:
-  CommandSocket(const std::filesystem::path &state_root,
+  CommandSocket(const std::filesystem::path &run_root,
                 std::string_view socket_file_name)
-      : path_(state_root / std::string(socket_file_name)) {
+      : path_(run_root / std::string(socket_file_name)) {
     const auto spelling = path_.string();
     Require(spelling.size() < sizeof(sockaddr_un::sun_path),
             "execution command socket path is too long");
@@ -370,7 +444,7 @@ struct HostConfig final {
   std::filesystem::path manager_state_root;
   std::filesystem::path manager_run_root;
   std::filesystem::path execution_state_root;
-  std::filesystem::path staging_root;
+  std::filesystem::path execution_run_root;
   std::filesystem::path candidate_worker;
   std::string cell_id;
   std::string program_binding_id;
@@ -388,7 +462,8 @@ struct ManagedRuntimeChildConfig final {
   std::filesystem::path logical_scene_database;
   std::filesystem::path program_cycle_journal;
   std::filesystem::path authoring_transaction_journal;
-  std::filesystem::path staging_root;
+  std::filesystem::path execution_state_root;
+  std::filesystem::path execution_run_root;
   std::filesystem::path candidate_worker;
   std::string cell_id;
   core::RetainedBundleId retained_bundle_id{""};
@@ -458,8 +533,10 @@ ParseManagedRuntimeArguments(const int argc, char **argv) {
     } else if (option ==
                "--manyforge-managed-authoring-transaction-journal") {
       config.authoring_transaction_journal = value;
-    } else if (option == "--manyforge-managed-staging-root") {
-      config.staging_root = value;
+    } else if (option == "--manyforge-managed-execution-state-root") {
+      config.execution_state_root = value;
+    } else if (option == "--manyforge-managed-execution-run-root") {
+      config.execution_run_root = value;
     } else if (option == "--manyforge-managed-candidate-worker") {
       config.candidate_worker = value;
     } else if (option == "--manyforge-managed-cell-id") {
@@ -480,7 +557,7 @@ ParseManagedRuntimeArguments(const int argc, char **argv) {
       Fail("unknown managed runtime option " + option);
     }
   }
-  Require(seen.size() >= 14U && seen.size() <= 17U &&
+  Require(seen.size() >= 15U && seen.size() <= 18U &&
               config.manager_channel_fd >= 0 &&
               config.manager_liveness_channel_fd >= 0 &&
               config.manager_liveness_channel_fd != config.manager_channel_fd &&
@@ -508,9 +585,9 @@ ParseManagedRuntimeArguments(const int argc, char **argv) {
   config.package_root =
       std::filesystem::path("/proc/self/fd") /
       std::to_string(config.package_root_fd);
-  config.manager_state_root = ExistingDirectory(
+  config.manager_state_root = ExistingPrivateDirectory(
       std::move(config.manager_state_root), "managed Manager state root");
-  config.manager_run_root = ExistingDirectory(
+  config.manager_run_root = ExistingPrivateDirectory(
       std::move(config.manager_run_root), "managed Manager run root");
   if (!config.logical_scene_database.empty()) {
     config.logical_scene_database = ExistingRegularFile(
@@ -522,8 +599,8 @@ ParseManagedRuntimeArguments(const int argc, char **argv) {
     Require(!path.empty() && path.has_filename() && path.filename() != "." &&
                 path.filename() != "..",
             std::string(label) + " path is invalid");
-    static_cast<void>(ExistingDirectory(path.parent_path(),
-                                        std::string(label) + " parent"));
+    static_cast<void>(ExistingPrivateDirectory(
+        path.parent_path(), std::string(label) + " parent"));
     std::error_code error;
     const auto status = std::filesystem::symlink_status(path, error);
     Require((!error || error == std::errc::no_such_file_or_directory) &&
@@ -539,8 +616,34 @@ ParseManagedRuntimeArguments(const int argc, char **argv) {
         std::move(config.authoring_transaction_journal),
         "managed Composer authoring transaction journal");
   }
-  config.staging_root = ExistingDirectory(std::move(config.staging_root),
-                                          "managed native staging root");
+  config.execution_state_root = ExistingPrivateDirectory(
+      std::move(config.execution_state_root), "managed execution state root");
+  config.execution_run_root = ExistingPrivateDirectory(
+      std::move(config.execution_run_root), "managed execution run root");
+  const std::array<const std::filesystem::path *, 4U> typed_roots{
+      &config.manager_state_root, &config.manager_run_root,
+      &config.execution_state_root, &config.execution_run_root};
+  for (std::size_t left = 0U; left < typed_roots.size(); ++left) {
+    for (std::size_t right = left + 1U; right < typed_roots.size(); ++right) {
+      RequireDisjointDirectories(*typed_roots[left], *typed_roots[right],
+                                 "managed state/run capabilities");
+    }
+  }
+  for (const auto *typed_root : typed_roots) {
+    RequireDisjointDirectories(config.package_root, *typed_root,
+                               "managed install/runtime capabilities");
+  }
+  const std::array<const std::filesystem::path *, 3U> durable_paths{
+      &config.logical_scene_database, &config.program_cycle_journal,
+      &config.authoring_transaction_journal};
+  const std::array<const std::filesystem::path *, 2U> run_roots{
+      &config.manager_run_root, &config.execution_run_root};
+  for (const auto *durable_path : durable_paths) {
+    for (const auto *run_root : run_roots) {
+      RequirePathOutsideDirectory(*durable_path, *run_root,
+                                  "managed durable path/run capability");
+    }
+  }
   config.candidate_worker = ExistingRegularFile(
       std::move(config.candidate_worker), "managed candidate worker", true);
 
@@ -995,7 +1098,7 @@ private:
     Require(planning_model.has_value(),
             "native projection retained planning model is absent or invalid");
     auto stage = RetainedPlanningModelStage::create_verified(
-        *planning_model, config_.staging_root);
+        *planning_model, config_.execution_run_root);
     auto package_paths = stage.package_paths();
     package_paths.insert(package_paths.begin(), config_.package_root);
     auto shared_model = collision::ManyForgeCollisionEngine::load_shared_model(
@@ -4277,7 +4380,7 @@ struct ExecutionCompositionAccess final {
 };
 
 struct ManagedExecutionSurfaceControl final {
-  std::filesystem::path state_root;
+  std::filesystem::path run_root;
   ExecutionCompositionAccess *composition_access{};
   component_manager::detail::ManagerLivenessCommandAdmission
       *manager_liveness_admission{};
@@ -4288,12 +4391,12 @@ struct ManagedExecutionSurfaceControl final {
   std::exception_ptr failure;
 
   ManagedExecutionSurfaceControl(
-      std::filesystem::path selected_state_root,
+      std::filesystem::path selected_run_root,
       ExecutionCompositionAccess *selected_composition_access,
       component_manager::detail::ManagerLivenessCommandAdmission
           *selected_manager_liveness_admission,
       core::RequestOwnerEpoch selected_owner_epoch)
-      : state_root(std::move(selected_state_root)),
+      : run_root(std::move(selected_run_root)),
         composition_access(selected_composition_access),
         manager_liveness_admission(selected_manager_liveness_admission),
         owner_epoch(std::move(selected_owner_epoch)) {}
@@ -4305,7 +4408,7 @@ void RunManagedExecutionCommandSurface(ManagedExecutionSurfaceControl &control,
 struct CompositionBuildInput final {
   std::filesystem::path package_root;
   std::filesystem::path execution_state_root;
-  std::filesystem::path staging_root;
+  std::filesystem::path execution_run_root;
   std::filesystem::path candidate_worker;
   core::CellId cell_id;
   core::RequestOwnerEpoch owner_epoch;
@@ -4326,6 +4429,7 @@ struct CompositionBuildInput final {
   core::TargetRoleId status_gripper_target_role_id;
   bool attach_addressed_owner{true};
   std::shared_ptr<WallClock> shared_clock;
+  std::shared_ptr<SimpleScheduler> shared_scheduler;
   std::filesystem::path manager_state_root;
   std::filesystem::path manager_run_root;
   std::filesystem::path logical_scene_database;
@@ -4702,8 +4806,8 @@ BuildProductComposition(CompositionBuildInput input) {
           products.planning_collision_model.product_id});
   Require(retained_model.has_value(),
           "active retained planning model is absent or invalid");
-  auto stage = RetainedPlanningModelStage::create_verified(*retained_model,
-                                                           input.staging_root);
+  auto stage = RetainedPlanningModelStage::create_verified(
+      *retained_model, input.execution_run_root);
   auto scene = std::make_shared<roboplan::Scene>(
       "manyforge_i6_native_execution_host",
       std::string(stage.loader_urdf_bytes()), std::string(stage.srdf_bytes()),
@@ -5009,7 +5113,8 @@ BuildProductComposition(CompositionBuildInput input) {
                                                       std::move(runtime_config))
                      : create_retained_native_runtime_participants(
                            std::move(runtime_input), std::move(runtime_config),
-                           std::move(input.shared_clock));
+                           std::move(input.shared_clock),
+                           std::move(input.shared_scheduler));
   auto direct_scene_frame_resolver =
       std::dynamic_pointer_cast<RetainedSceneFrameResolver>(
           runtime->reference_resolver);
@@ -5215,7 +5320,7 @@ BuildComposition(const HostConfig &config,
   return BuildProductComposition(CompositionBuildInput{
       config.package_root,
       config.execution_state_root,
-      config.staging_root,
+      config.execution_run_root,
       config.candidate_worker,
       core::CellId(config.cell_id),
       owner_epoch,
@@ -5235,6 +5340,7 @@ BuildComposition(const HostConfig &config,
       core::TargetRoleId(config.motion_target_role_id),
       core::TargetRoleId(config.gripper_target_role_id),
       true,
+      {},
       {},
       {},
       {},
@@ -5386,7 +5492,7 @@ void AttachRetainedNativeCCLC(Composition &composition,
 
   deployment::CCLCRuntimeCompositionConfig cclc_config{
       config.execution_state_root,
-      config.execution_state_root,
+      config.execution_run_root,
       core::CellId(config.cell_id),
       {core::RequestOwnerEpoch(RandomToken("cclc-owner-")),
        1024U, 2U, 2U, 10'000'000LL, 30'000'000'000LL,
@@ -5474,8 +5580,8 @@ void TryAttachManagedCCLC(Composition &composition,
   HostConfig attachment_config;
   attachment_config.package_root = config.package_root;
   attachment_config.manager_state_root = config.manager_state_root;
-  attachment_config.execution_state_root = config.staging_root;
-  attachment_config.staging_root = config.staging_root;
+  attachment_config.execution_state_root = config.execution_state_root;
+  attachment_config.execution_run_root = config.execution_run_root;
   attachment_config.candidate_worker = config.candidate_worker;
   attachment_config.cell_id = config.cell_id;
   AttachRetainedNativeCCLC(
@@ -5594,8 +5700,8 @@ TryBuildCurrentManagedCompositionInput(
   auto planner_scene_projection = projection;
   return CompositionBuildInput{
       config.package_root,
-      config.staging_root,
-      config.staging_root,
+      config.execution_state_root,
+      config.execution_run_root,
       config.candidate_worker,
       core::CellId(config.cell_id),
       core::RequestOwnerEpoch("kernel-owner-" + config.runtime_epoch),
@@ -5615,6 +5721,7 @@ TryBuildCurrentManagedCompositionInput(
       core::TargetRoleId(std::string(deployment::kDirectControlTargetRoleId)),
       core::TargetRoleId(std::string(deployment::kDirectControlTargetRoleId)),
       true,
+      {},
       {},
       config.manager_state_root,
       config.manager_run_root,
@@ -5709,7 +5816,8 @@ LoadExactManagedCandidateBundle(
     ManagedKernelAdmissionGate &admission_gate,
     const component_manager::ManagerSelectedRuntimeCompositionRequestDTO
         &request,
-    std::shared_ptr<WallClock> shared_clock) {
+    std::shared_ptr<WallClock> shared_clock,
+    std::shared_ptr<SimpleScheduler> shared_scheduler) {
   auto bundle = LoadExactManagedCandidateBundle(config, request);
   component_manager::SqliteActiveBundlePublicationStore publication_store(
       config.manager_state_root /
@@ -5797,8 +5905,8 @@ LoadExactManagedCandidateBundle(
   auto planner_scene_projection = projection;
   return CompositionBuildInput{
       config.package_root,
-      config.staging_root,
-      config.staging_root,
+      config.execution_state_root,
+      config.execution_run_root,
       config.candidate_worker,
       core::CellId(config.cell_id),
       core::RequestOwnerEpoch("kernel-owner-" + config.runtime_epoch),
@@ -5819,6 +5927,7 @@ LoadExactManagedCandidateBundle(
       core::TargetRoleId(std::string(deployment::kDirectControlTargetRoleId)),
       false,
       std::move(shared_clock),
+      std::move(shared_scheduler),
       config.manager_state_root,
       config.manager_run_root,
       config.logical_scene_database,
@@ -5839,7 +5948,7 @@ RunManagedRuntimeChild(const ManagedRuntimeChildConfig &config) {
   ManagedKernelAdmissionGate admission_gate;
   ManagedKernelApplyFenceOwner fence_owner(
       ManagedKernelApplyFenceOwnerConfig{
-          config.staging_root / "kernel-apply-fence.sqlite3",
+          config.execution_state_root / "kernel-apply-fence.sqlite3",
           config.manager_state_root,
           config.package_root,
           core::CellId(config.cell_id),
@@ -5860,6 +5969,7 @@ RunManagedRuntimeChild(const ManagedRuntimeChildConfig &config) {
   std::unique_ptr<Composition> prepared_managed_composition;
   bool prepared_managed_composition_is_empty = false;
   std::shared_ptr<WallClock> detached_owner_clock;
+  std::shared_ptr<SimpleScheduler> detached_owner_scheduler;
   std::unique_ptr<core::SqliteOperationJournal> detached_operation_journal;
   std::unique_ptr<core::ResourceAddressedExecutionKernel>
       detached_addressed_kernel;
@@ -5880,9 +5990,11 @@ RunManagedRuntimeChild(const ManagedRuntimeChildConfig &config) {
     return std::move(publication.value());
   };
   detached_owner_clock = std::make_shared<WallClock>();
+  detached_owner_scheduler = std::make_shared<SimpleScheduler>(
+      SimpleSchedulerConfig::from_environment());
   detached_operation_journal =
       std::make_unique<core::SqliteOperationJournal>(
-          config.staging_root /
+          config.execution_state_root /
               std::string(core::kOperationJournalFilename),
           core::CellId(config.cell_id));
   core::ResourceAddressedExecutionKernelConfig bootstrap_kernel_config{
@@ -5897,7 +6009,8 @@ RunManagedRuntimeChild(const ManagedRuntimeChildConfig &config) {
   bootstrap_kernel_config.cell_admission_reconcile_validator =
       BuildOwnerReconciliationValidator(
           config.program_cycle_journal, config.authoring_transaction_journal,
-          config.staging_root / std::string(core::kCCLCJournalFilename),
+          config.execution_state_root /
+              std::string(core::kCCLCJournalFilename),
           core::CellId(config.cell_id));
   bootstrap_kernel_config.cell_admission_settlement_validator =
       BuildOwnerSettlementValidator(
@@ -5906,12 +6019,14 @@ RunManagedRuntimeChild(const ManagedRuntimeChildConfig &config) {
                   component_manager::kManagerApplyJournalFilename),
           config.logical_scene_database, config.program_cycle_journal,
           config.authoring_transaction_journal,
-          config.staging_root / std::string(core::kCCLCJournalFilename),
+          config.execution_state_root /
+              std::string(core::kCCLCJournalFilename),
           core::CellId(config.cell_id));
   detached_addressed_kernel =
       std::make_unique<core::ResourceAddressedExecutionKernel>(
           std::vector<core::RuntimeParticipantExecutionRegistration>{},
-          *detached_owner_clock, *detached_operation_journal,
+          *detached_owner_clock, *detached_owner_scheduler,
+          *detached_operation_journal,
           std::move(bootstrap_kernel_config));
   auto *const stable_kernel_owner = detached_addressed_kernel.get();
   admission_gate.BindResourceTable(
@@ -5937,7 +6052,8 @@ RunManagedRuntimeChild(const ManagedRuntimeChildConfig &config) {
   ExecutionCompositionAccess execution_composition;
   execution_composition.addressed_kernel = detached_addressed_kernel.get();
   ManagedExecutionSurfaceControl execution_surface_control(
-      config.staging_root, &execution_composition, &manager_liveness_admission,
+      config.execution_run_root, &execution_composition,
+      &manager_liveness_admission,
       core::RequestOwnerEpoch("kernel-owner-" + config.runtime_epoch));
   std::jthread execution_surface([&](const std::stop_token stop_token) {
     RunManagedExecutionCommandSurface(execution_surface_control, stop_token);
@@ -6071,6 +6187,7 @@ RunManagedRuntimeChild(const ManagedRuntimeChildConfig &config) {
       }
       input->attach_addressed_owner = false;
       input->shared_clock = detached_owner_clock;
+      input->shared_scheduler = detached_owner_scheduler;
       current_composition_builder_started = true;
       current_composition_building = true;
     }
@@ -6085,8 +6202,10 @@ RunManagedRuntimeChild(const ManagedRuntimeChildConfig &config) {
               Require(detached_addressed_kernel != nullptr &&
                           detached_operation_journal != nullptr &&
                           detached_owner_clock != nullptr &&
+                          detached_owner_scheduler != nullptr &&
                           built->runtime->addressed_kernel == nullptr &&
-                          built->runtime->clock == detached_owner_clock,
+                          built->runtime->clock == detached_owner_clock &&
+                          built->runtime->scheduler == detached_owner_scheduler,
                       "current managed composition duplicated the stable "
                       "addressed owner");
               auto reconfigured =
@@ -6102,6 +6221,7 @@ RunManagedRuntimeChild(const ManagedRuntimeChildConfig &config) {
               built->runtime->addressed_kernel =
                   std::move(detached_addressed_kernel);
               detached_owner_clock.reset();
+              detached_owner_scheduler.reset();
               fence_owner.BindDisableHandoffKernel(
                   *built->runtime->addressed_kernel);
               active_managed_composition = std::move(built);
@@ -6243,6 +6363,7 @@ RunManagedRuntimeChild(const ManagedRuntimeChildConfig &config) {
     bool prepared_is_empty = false;
     bool start_builder = false;
     std::shared_ptr<WallClock> shared_clock;
+    std::shared_ptr<SimpleScheduler> shared_scheduler;
     {
       std::lock_guard lock(managed_composition_mutex);
       if (managed_composition_failure != nullptr) {
@@ -6263,19 +6384,22 @@ RunManagedRuntimeChild(const ManagedRuntimeChildConfig &config) {
         start_builder = true;
         if (active_managed_composition != nullptr) {
           shared_clock = active_managed_composition->runtime->clock;
+          shared_scheduler = active_managed_composition->runtime->scheduler;
         } else if (detached_addressed_kernel != nullptr) {
           shared_clock = detached_owner_clock;
+          shared_scheduler = detached_owner_scheduler;
         }
       }
     }
 
     if (start_builder) {
       managed_composition_builder = std::jthread(
-          [&, request, shared_clock = std::move(shared_clock)]() mutable {
+          [&, request, shared_clock = std::move(shared_clock),
+           shared_scheduler = std::move(shared_scheduler)]() mutable {
             try {
               auto input = BuildManagedCompositionInput(
                   config, projections, admission_gate, request,
-                  std::move(shared_clock));
+                  std::move(shared_clock), std::move(shared_scheduler));
               auto built = input.has_value()
                                ? BuildProductComposition(std::move(*input))
                                : std::unique_ptr<Composition>{};
@@ -6327,7 +6451,8 @@ RunManagedRuntimeChild(const ManagedRuntimeChildConfig &config) {
               DetachRetainedCCLC(*active_managed_composition);
               Require(detached_addressed_kernel == nullptr &&
                           detached_operation_journal == nullptr &&
-                          detached_owner_clock == nullptr,
+                          detached_owner_clock == nullptr &&
+                          detached_owner_scheduler == nullptr,
                       "stable addressed owner is duplicated");
               auto &stable_runtime = *active_managed_composition->runtime;
               auto reconfigured = stable_runtime.addressed_kernel
@@ -6337,6 +6462,7 @@ RunManagedRuntimeChild(const ManagedRuntimeChildConfig &config) {
                      reconfigured.error().message);
               }
               detached_owner_clock = stable_runtime.clock;
+              detached_owner_scheduler = stable_runtime.scheduler;
               detached_operation_journal =
                   std::move(stable_runtime.operation_journal);
               detached_addressed_kernel =
@@ -6363,7 +6489,7 @@ RunManagedRuntimeChild(const ManagedRuntimeChildConfig &config) {
                       core::RequestOwnerEpoch("kernel-owner-" +
                                               config.runtime_epoch),
                       core::CellId(config.cell_id),
-                      config.staging_root /
+                      config.execution_state_root /
                           std::string(core::kOperationJournalFilename),
                       1024U, &admission_gate,
                       prepared->runtime->motion_binding.value().graph_revision,
@@ -6376,13 +6502,13 @@ RunManagedRuntimeChild(const ManagedRuntimeChildConfig &config) {
                           config.logical_scene_database,
                           config.program_cycle_journal,
                           config.authoring_transaction_journal,
-                          config.staging_root /
+                          config.execution_state_root /
                               std::string(core::kCCLCJournalFilename),
                           core::CellId(config.cell_id)),
                       BuildOwnerReconciliationValidator(
                           config.program_cycle_journal,
                           config.authoring_transaction_journal,
-                          config.staging_root /
+                          config.execution_state_root /
                               std::string(core::kCCLCJournalFilename),
                           core::CellId(config.cell_id)),
                       {}});
@@ -6404,6 +6530,11 @@ RunManagedRuntimeChild(const ManagedRuntimeChildConfig &config) {
               }
               if (active_managed_composition != nullptr) {
                 auto &stable_runtime = *active_managed_composition->runtime;
+                Require(prepared->runtime->clock == stable_runtime.clock &&
+                            prepared->runtime->scheduler ==
+                                stable_runtime.scheduler,
+                        "prepared runtime crossed the stable Kernel time "
+                        "capabilities");
                 prepared->runtime->operation_journal =
                     std::move(stable_runtime.operation_journal);
                 prepared->runtime->addressed_kernel =
@@ -6413,13 +6544,17 @@ RunManagedRuntimeChild(const ManagedRuntimeChildConfig &config) {
               } else {
                 Require(detached_operation_journal != nullptr &&
                             detached_owner_clock != nullptr &&
-                            prepared->runtime->clock == detached_owner_clock,
+                            detached_owner_scheduler != nullptr &&
+                            prepared->runtime->clock == detached_owner_clock &&
+                            prepared->runtime->scheduler ==
+                                detached_owner_scheduler,
                         "detached addressed owner is incomplete");
                 prepared->runtime->operation_journal =
                     std::move(detached_operation_journal);
                 prepared->runtime->addressed_kernel =
                     std::move(detached_addressed_kernel);
                 detached_owner_clock.reset();
+                detached_owner_scheduler.reset();
               }
             }
             auto staged =
@@ -6945,7 +7080,7 @@ RunManagedRuntimeChild(const ManagedRuntimeChildConfig &config) {
 
 class ExecutionCommandSurface final {
 public:
-  ExecutionCommandSurface(std::filesystem::path state_root,
+  ExecutionCommandSurface(std::filesystem::path run_root,
                           ExecutionCompositionAccess &composition_access,
                           component_manager::detail::
                               ManagerLivenessCommandAdmission&
@@ -6958,9 +7093,9 @@ public:
                                                owner_epoch_.value()),
         composition_access_(composition_access),
         manager_liveness_admission_(manager_liveness_admission),
-        host_lock_(state_root),
-        command_socket_(state_root, kSocketFileName),
-        control_socket_(state_root, kControlSocketFileName) {}
+        host_lock_(run_root),
+        command_socket_(run_root, kSocketFileName),
+        control_socket_(run_root, kControlSocketFileName) {}
 
   int Run(const std::stop_token stop_token = {}) {
     std::jthread control_thread(
@@ -7615,13 +7750,13 @@ private:
       });
     }
     if (command.kind == CommandKind::kRead) {
-      const auto state =
-          composition.runtime->addressed_kernel->get_operation_state(
+      const auto projection =
+          composition.runtime->addressed_kernel->get_operation_projection(
               *command.operation_id);
-      if (!state.ok()) {
+      if (!projection.ok()) {
         return CanonicalValue(CanonicalValue::Object{
             {"api_version", CanonicalValue(std::string(kResponseApiVersion))},
-            {"error", ErrorValue(state.error())},
+            {"error", ErrorValue(projection.error())},
             {"ok", CanonicalValue(false)},
         });
       }
@@ -7629,7 +7764,8 @@ private:
           {"api_version", CanonicalValue(std::string(kResponseApiVersion))},
           {"command", CanonicalValue("read")},
           {"ok", CanonicalValue(true)},
-          {"operation", OperationStateValue(state.value())},
+          {"operation", OperationStateValue(projection.value().operation)},
+          {"resident", CanonicalValue(projection.value().resident)},
       });
     }
     const auto reconcile_error = LastReconcileError();
@@ -8189,7 +8325,7 @@ void RunManagedExecutionCommandSurface(
                 !control.owner_epoch.empty(),
             "managed execution command surface configuration is incomplete");
     ExecutionCommandSurface surface(
-        control.state_root, *control.composition_access,
+        control.run_root, *control.composition_access,
         *control.manager_liveness_admission, control.owner_epoch);
     {
       std::lock_guard lock(control.state_mutex);
@@ -8257,7 +8393,7 @@ public:
     standalone_command_admission_.OpenIfUnchanged(
         standalone_command_admission_.generation());
     command_surface_ = std::make_unique<ExecutionCommandSurface>(
-        config_.execution_state_root, composition_access_,
+        config_.execution_run_root, composition_access_,
         standalone_command_admission_, owner_epoch_);
   }
 
@@ -8292,8 +8428,8 @@ private:
       config.manager_state_root = value;
     } else if (option == "--execution-state-root") {
       config.execution_state_root = value;
-    } else if (option == "--staging-root") {
-      config.staging_root = value;
+    } else if (option == "--execution-run-root") {
+      config.execution_run_root = value;
     } else if (option == "--program-binding-id") {
       config.program_binding_id = value;
     } else if (option == "--motion-target-role-id") {
@@ -8309,18 +8445,33 @@ private:
     }
   }
   Require(seen.size() == 9U,
-          "package, Manager state, execution state, staging, Program Binding, "
+          "package, Manager state, execution state/run, Program Binding, "
           "motion/gripper target roles, candidate worker, and "
           "cell options "
           "are required");
   config.package_root =
       ExistingDirectory(std::move(config.package_root), "package root");
-  config.manager_state_root = ExistingDirectory(
+  config.manager_state_root = ExistingPrivateDirectory(
       std::move(config.manager_state_root), "Manager state root");
-  config.execution_state_root = ExistingDirectory(
+  config.execution_state_root = ExistingPrivateDirectory(
       std::move(config.execution_state_root), "execution state root");
-  config.staging_root =
-      ExistingDirectory(std::move(config.staging_root), "staging root");
+  config.execution_run_root = ExistingPrivateDirectory(
+      std::move(config.execution_run_root), "execution run root");
+  RequireDisjointDirectories(config.manager_state_root,
+                             config.execution_state_root,
+                             "standalone durable state capabilities");
+  RequireDisjointDirectories(
+      config.manager_state_root, config.execution_run_root,
+      "standalone Manager-state/execution-run capabilities");
+  RequireDisjointDirectories(config.execution_state_root,
+                             config.execution_run_root,
+                             "standalone execution state/run capabilities");
+  RequireDisjointDirectories(config.package_root, config.manager_state_root,
+                             "standalone install/Manager-state capabilities");
+  RequireDisjointDirectories(config.package_root, config.execution_state_root,
+                             "standalone install/execution-state capabilities");
+  RequireDisjointDirectories(config.package_root, config.execution_run_root,
+                             "standalone install/execution-run capabilities");
   config.candidate_worker = ExistingRegularFile(
       std::move(config.candidate_worker), "candidate worker", true);
   Require(!config.cell_id.empty() &&

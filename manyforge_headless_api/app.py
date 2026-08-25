@@ -330,12 +330,12 @@ def create_app(
             timeout_seconds=config.manager_timeout_seconds,
         )
         execution = ExecutionCommandClient(
-            config.execution_state_root,
+            config.execution_run_root,
             timeout_seconds=config.execution_timeout_seconds,
         )
         if cclc is None:
             cclc = CCLCOpenRequestClient(
-                config.cclc_state_root or config.execution_state_root,
+                config.execution_run_root,
                 timeout_seconds=config.cclc_timeout_seconds,
             )
         if config.program_runner_url is not None:
@@ -349,13 +349,13 @@ def create_app(
             execution,
             program_runner=program_runner_client,
             cell_admission=CellAdmissionClient(
-                config.execution_state_root,
+                config.execution_run_root,
                 timeout_seconds=config.execution_timeout_seconds,
             ),
             cclc=cclc,
         )
         event_execution = ExecutionCommandClient(
-            config.execution_state_root,
+            config.execution_run_root,
             timeout_seconds=min(config.execution_timeout_seconds, 1.0),
         )
         event_pump = ExecutionEventPump(
@@ -609,15 +609,12 @@ def create_app(
     def program_apply(request: ProgramApplyRequest) -> JSONResponse:
         response = service.program_apply(request)
         status = response.get("status")
-        if status not in {"applied", "pending_deployment"}:
+        if status != "applied":
             raise HeadlessApiError(
                 "program_apply_response_invalid",
                 "Program Apply returned an unsupported status",
             )
-        return JSONResponse(
-            status_code=200 if status == "applied" else 202,
-            content=response,
-        )
+        return JSONResponse(status_code=200, content=response)
 
     @app.post("/api/program/model-attempts")
     def program_model_attempt(

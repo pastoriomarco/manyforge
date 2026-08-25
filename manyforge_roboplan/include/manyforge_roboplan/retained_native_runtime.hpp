@@ -208,7 +208,7 @@ struct RetainedNativeRuntime final
   std::shared_ptr<RetainedObservedStateChannel> gripper_state_channel;
 
   std::shared_ptr<WallClock> clock;
-  std::unique_ptr<SimpleScheduler> scheduler;
+  std::shared_ptr<SimpleScheduler> scheduler;
   std::unique_ptr<core::TrajectoryCache> cache;
   std::unique_ptr<RoboPlanPlannerBackend> planner;
   std::shared_ptr<core::IReferencePoseResolver> reference_resolver;
@@ -270,12 +270,14 @@ private:
 
 /// Assemble only the product-specific subordinate participant runtime. This
 /// is the preparation boundary for a fenced Apply: it opens no operation
-/// journal and creates no addressed Kernel owner. A supplied clock keeps a
-/// later candidate attached to the same stable owner lifetime.
+/// journal and creates no addressed Kernel owner. Supplied time capabilities
+/// keep a later candidate attached to the same stable owner lifetime and role-
+/// isolated process scheduler.
 [[nodiscard]] std::shared_ptr<RetainedNativeRuntime>
 create_retained_native_runtime_participants(
     RetainedNativeRuntimeInput input, RetainedNativeRuntimeConfig config,
-    std::shared_ptr<WallClock> shared_clock = {});
+    std::shared_ptr<WallClock> shared_clock = {},
+    std::shared_ptr<SimpleScheduler> shared_scheduler = {});
 
 /// Attach the sole stable addressed owner to one prepared participant set.
 /// The owner config is process-selected, not supplied by a Program or caller.

@@ -191,7 +191,7 @@ class ComposerState:
             }
         )
         validate_program_apply_result(result)
-        if result.get("status") not in {"applied", "pending_deployment"}:
+        if result.get("status") != "applied":
             raise AuthoringJournalError(
                 "composer_authoring_recovery_invalid",
                 "Program Apply recovery returned an unsupported status",
@@ -297,45 +297,33 @@ class ComposerState:
                 if isinstance(applied, dict)
                 else None
             )
-            if result.get("status") == "applied":
-                self._restore_authoring_post_image(post_state)
-            else:
-                post_state = deepcopy(intent["pre_state"])
-                prior = intent.get("applied_context", {})
-                applied_revision = (
-                    prior.get("program_revision")
-                    if prior.get("available") is True
-                    else None
-                )
+            self._restore_authoring_post_image(post_state)
             workspace = self._recovery_workspace(
                 applied_program_revision=applied_revision
             )
             if kind == "program_apply":
-                status = result["status"]
                 response = JSONResponse(
-                    status_code=200 if status == "applied" else 202,
+                    status_code=200,
                     content={
-                        "status": status,
+                        "status": "applied",
                         "headless": result,
                         "workspace": workspace,
                     },
                 )
             elif kind == "load_program":
-                loaded = result.get("status") == "applied"
                 response = JSONResponse(
-                    status_code=200 if loaded else 202,
+                    status_code=200,
                     content={
-                        "status": "loaded" if loaded else "pending_deployment",
+                        "status": "loaded",
                         "headless": result,
                         "workspace": workspace,
                     },
                 )
             else:
-                reverted = result.get("status") == "applied"
                 response = JSONResponse(
-                    status_code=200 if reverted else 202,
+                    status_code=200,
                     content={
-                        "status": "reverted" if reverted else "pending_deployment",
+                        "status": "reverted",
                         "headless": result,
                         "workspace": workspace,
                     },

@@ -458,6 +458,7 @@ describe('Program authoring panels', () => {
 
   it('keeps the complete authoring geometry when no Draft is open', () => {
     const controller = {
+      mutationAvailable: true,
       state: {
         status: 'ready',
         requestGeneration: 1,
@@ -621,6 +622,7 @@ describe('Program authoring panels', () => {
       hasUnappliedChanges: null,
     };
     const controller = {
+      mutationAvailable: true,
       state: {
         status: 'ready',
         requestGeneration: 1,

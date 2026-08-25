@@ -1,4 +1,5 @@
 #include <gtest/gtest.h>
+
 #include <manyforge_core/time/manual_scheduler.hpp>
 
 namespace manyforge::core {
@@ -98,6 +99,23 @@ TEST(ManualSchedulerTest, CancelOneOfTwoSameDeadline) {
   sched.cancel(h2);
   sched.advance_to(100);
   EXPECT_EQ(count, 1);
+}
+
+TEST(ManualSchedulerTest, PriorityAdvanceLeavesOtherDueLanesPending) {
+  ManualScheduler sched;
+  std::vector<SchedulerPriority> fired;
+  sched.schedule(
+      100, [&] { fired.push_back(SchedulerPriority::Monitoring); }, SchedulerPriority::Monitoring);
+  sched.schedule(
+      100, [&] { fired.push_back(SchedulerPriority::Background); }, SchedulerPriority::Background);
+
+  sched.advance_to(100, SchedulerPriority::Background);
+  ASSERT_EQ(fired.size(), 1U);
+  EXPECT_EQ(fired.front(), SchedulerPriority::Background);
+
+  sched.advance_to(100, SchedulerPriority::Monitoring);
+  ASSERT_EQ(fired.size(), 2U);
+  EXPECT_EQ(fired.back(), SchedulerPriority::Monitoring);
 }
 
 }  // namespace manyforge::core

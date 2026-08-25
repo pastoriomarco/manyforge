@@ -170,10 +170,10 @@ def _expected_active_configuration(
 
 
 def _qualify_native_cclc_product(
-    execution_root: Path,
+    execution_run_root: Path,
 ) -> None:
-    client = CCLCOpenRequestClient(execution_root, timeout_seconds=5.0)
-    admission = CellAdmissionClient(execution_root, timeout_seconds=5.0)
+    client = CCLCOpenRequestClient(execution_run_root, timeout_seconds=5.0)
+    admission = CellAdmissionClient(execution_run_root, timeout_seconds=5.0)
 
     def context(request_id: str, owner_epoch: str) -> dict[str, Any]:
         return {
@@ -235,15 +235,15 @@ def _qualify_native_cclc_product(
             label=intent_kind,
         )
 
-    _submit_native_cclc_routes(execution_root)
+    _submit_native_cclc_routes(execution_run_root)
 
 
 def _submit_native_cclc_routes(
-    execution_root: Path,
+    execution_run_root: Path,
     *,
     request_prefix: str = "process.route",
 ) -> None:
-    client = CCLCOpenRequestClient(execution_root, timeout_seconds=5.0)
+    client = CCLCOpenRequestClient(execution_run_root, timeout_seconds=5.0)
 
     def context(request_id: str, owner_epoch: str) -> dict[str, Any]:
         return {
@@ -311,8 +311,8 @@ def _submit_native_cclc_routes(
         )
 
 
-def _wait_for_cclc_component(execution_root: Path) -> dict[str, Any]:
-    client = CCLCOpenRequestClient(execution_root, timeout_seconds=1.0)
+def _wait_for_cclc_component(execution_run_root: Path) -> dict[str, Any]:
+    client = CCLCOpenRequestClient(execution_run_root, timeout_seconds=1.0)
     deadline = time.monotonic() + 10.0
     last_error = ""
     while time.monotonic() < deadline:
@@ -326,8 +326,8 @@ def _wait_for_cclc_component(execution_root: Path) -> dict[str, Any]:
 
 def _start_host(
     fixture_root: Path,
-    execution_root: Path,
-    staging_root: Path,
+    execution_state_root: Path,
+    execution_run_root: Path,
     manifest: dict[str, Any],
     *,
     candidate_worker: Path | None = None,
@@ -361,9 +361,9 @@ def _start_host(
             "--manager-state-root",
             str(fixture_root / "manager-state"),
             "--execution-state-root",
-            str(execution_root),
-            "--staging-root",
-            str(staging_root),
+            str(execution_state_root),
+            "--execution-run-root",
+            str(execution_run_root),
             "--program-binding-id",
             manifest["program_binding_id"],
             "--motion-target-role-id",
@@ -382,7 +382,7 @@ def _start_host(
         stderr=subprocess.PIPE,
         env=environment,
     )
-    client = ExecutionCommandClient(execution_root, timeout_seconds=2.0)
+    client = ExecutionCommandClient(execution_run_root, timeout_seconds=2.0)
     deadline = time.monotonic() + 10.0
     last_error = ""
     while time.monotonic() < deadline:
@@ -399,7 +399,7 @@ def _start_host(
                 if manifest.get("cclc_product") is True and qualify_cclc:
                     try:
                         _qualify_native_cclc_product(
-                            execution_root,
+                            execution_run_root,
                         )
                     except Exception as error:
                         _stop_host(process)
@@ -562,6 +562,23 @@ def _run_native_benchmark_move(
             break
         time.sleep(0.005)
     assert released["ok"] is True, released
+
+    # Control acceptance is asynchronous. Keep retirement outside the
+    # historical timing sample, but do not start another sample until the
+    # Kernel's authoritative projection confirms the operation is no longer
+    # resident. Admission and recovery remain separate backend facts.
+    residency_projection: dict[str, Any] = {}
+    residency_deadline = time.monotonic() + 5.0
+    while True:
+        residency_projection = client.read(operation_id)
+        if residency_projection.get("resident") is False:
+            break
+        if time.monotonic() >= residency_deadline:
+            raise AssertionError(
+                "native execution remained resident after acknowledgement: "
+                f"{residency_projection}"
+            )
+        time.sleep(0.005)
     return elapsed_seconds
 
 
@@ -1037,29 +1054,29 @@ def test_production_standalone_cclc_remains_closed_without_manager_liveness(
     fixture_root = tmp_path / "fixture"
     shutil.copytree(built_fixture, fixture_root)
     manifest = json.loads((fixture_root / "manifest.json").read_text("utf-8"))
-    execution_root = tmp_path / "execution"
-    staging_root = tmp_path / "staging"
-    execution_root.mkdir()
-    staging_root.mkdir()
+    execution_state_root = tmp_path / "execution-state"
+    execution_run_root = tmp_path / "execution-run"
+    execution_state_root.mkdir()
+    execution_run_root.mkdir()
 
     process = _start_host(
         fixture_root,
-        execution_root,
-        staging_root,
+        execution_state_root,
+        execution_run_root,
         manifest,
         host_environment="MANYFORGE_NATIVE_PRODUCTION_EXECUTION_HOST",
         qualify_cclc=False,
     )
     try:
         admission = CellAdmissionClient(
-            execution_root, timeout_seconds=5.0
+            execution_run_root, timeout_seconds=5.0
         ).get()
         assert admission["authoring_allowed"] is False
-        before = _wait_for_cclc_component(execution_root)
+        before = _wait_for_cclc_component(execution_run_root)
         with pytest.raises(HeadlessApiError) as rejected:
-            _qualify_native_cclc_product(execution_root)
+            _qualify_native_cclc_product(execution_run_root)
         assert rejected.value.code == "authoring_not_ready"
-        assert _wait_for_cclc_component(execution_root) == before
+        assert _wait_for_cclc_component(execution_run_root) == before
     finally:
         _stop_host(process)
 
@@ -1071,23 +1088,23 @@ def test_reconciliation_gate_does_not_block_ordinary_accept_or_exact_read(
     fixture_root = tmp_path / "fixture"
     shutil.copytree(built_fixture, fixture_root)
     manifest = json.loads((fixture_root / "manifest.json").read_text("utf-8"))
-    execution_root = tmp_path / "execution"
-    staging_root = tmp_path / "staging"
+    execution_state_root = tmp_path / "execution-state"
+    execution_run_root = tmp_path / "execution-run"
     reconciliation_marker = tmp_path / "reconciliation-entered"
     reconciliation_gate = tmp_path / "release-reconciliation"
-    execution_root.mkdir()
-    staging_root.mkdir()
+    execution_state_root.mkdir()
+    execution_run_root.mkdir()
 
     process = _start_host(
         fixture_root,
-        execution_root,
-        staging_root,
+        execution_state_root,
+        execution_run_root,
         manifest,
         host_environment="MANYFORGE_NATIVE_PICK_PLACE_FIXTURE_HOST",
         reconciliation_test_marker=reconciliation_marker,
         reconciliation_test_gate=reconciliation_gate,
     )
-    native = ExecutionCommandClient(execution_root, timeout_seconds=0.5)
+    native = ExecutionCommandClient(execution_run_root, timeout_seconds=0.5)
     raw_api = TestClient(
         create_app(
             service=HeadlessService(
@@ -1138,18 +1155,18 @@ def test_reconciliation_exception_uses_caught_host_failure_path(
     fixture_root = tmp_path / "fixture"
     shutil.copytree(built_fixture, fixture_root)
     manifest = json.loads((fixture_root / "manifest.json").read_text("utf-8"))
-    execution_root = tmp_path / "execution"
-    staging_root = tmp_path / "staging"
+    execution_state_root = tmp_path / "execution-state"
+    execution_run_root = tmp_path / "execution-run"
     reconciliation_marker = tmp_path / "reconciliation-entered"
     reconciliation_gate = tmp_path / "release-reconciliation"
     injected_failure = "fixture injected reconciliation failure"
-    execution_root.mkdir()
-    staging_root.mkdir()
+    execution_state_root.mkdir()
+    execution_run_root.mkdir()
 
     process = _start_host(
         fixture_root,
-        execution_root,
-        staging_root,
+        execution_state_root,
+        execution_run_root,
         manifest,
         host_environment="MANYFORGE_NATIVE_PICK_PLACE_FIXTURE_HOST",
         reconciliation_test_marker=reconciliation_marker,
@@ -1171,8 +1188,8 @@ def test_reconciliation_exception_uses_caught_host_failure_path(
 
         assert stderr == f"{injected_failure}\n"
         assert process.poll() == 70
-        assert not (execution_root / "execution-command.sock").exists()
-        assert not (execution_root / "execution-control.sock").exists()
+        assert not (execution_run_root / "execution-command.sock").exists()
+        assert not (execution_run_root / "execution-control.sock").exists()
     finally:
         _stop_host(process)
 
@@ -1184,19 +1201,19 @@ def test_pick_place_planning_crosses_real_cpp_owner_and_thin_clients(
     fixture_root = tmp_path / "fixture"
     shutil.copytree(built_fixture, fixture_root)
     manifest = json.loads((fixture_root / "manifest.json").read_text("utf-8"))
-    execution_root = tmp_path / "execution"
-    staging_root = tmp_path / "staging"
-    execution_root.mkdir()
-    staging_root.mkdir()
+    execution_state_root = tmp_path / "execution-state"
+    execution_run_root = tmp_path / "execution-run"
+    execution_state_root.mkdir()
+    execution_run_root.mkdir()
 
     process = _start_host(
         fixture_root,
-        execution_root,
-        staging_root,
+        execution_state_root,
+        execution_run_root,
         manifest,
         host_environment="MANYFORGE_NATIVE_PICK_PLACE_FIXTURE_HOST",
     )
-    native = ExecutionCommandClient(execution_root, timeout_seconds=10.0)
+    native = ExecutionCommandClient(execution_run_root, timeout_seconds=10.0)
     raw_api = TestClient(
         create_app(
             service=HeadlessService(
@@ -1324,20 +1341,20 @@ def test_first_complete_addressed_native_motion_path(tmp_path: Path) -> None:
         "joint5",
         "joint6",
     ]
-    execution_root = tmp_path / "execution"
-    staging_root = tmp_path / "staging"
-    execution_root.mkdir()
-    staging_root.mkdir()
+    execution_state_root = tmp_path / "execution-state"
+    execution_run_root = tmp_path / "execution-run"
+    execution_state_root.mkdir()
+    execution_run_root.mkdir()
 
     process = _start_host(
-        fixture_root, execution_root, staging_root, manifest
+        fixture_root, execution_state_root, execution_run_root, manifest
     )
     raw_api = TestClient(
         create_app(
             service=HeadlessService(
                 UnusedCore(),  # type: ignore[arg-type]
                 UnusedManager(),  # type: ignore[arg-type]
-                ExecutionCommandClient(execution_root, timeout_seconds=10.0),
+                ExecutionCommandClient(execution_run_root, timeout_seconds=10.0),
             ),
             trusted_principal_adapter=FixedTrustedPrincipalAdapter(),
         )
@@ -1447,7 +1464,7 @@ def test_first_complete_addressed_native_motion_path(tmp_path: Path) -> None:
             direct_gripper["resource"]["max_position"]
         )
 
-        native = ExecutionCommandClient(execution_root, timeout_seconds=2.0)
+        native = ExecutionCommandClient(execution_run_root, timeout_seconds=2.0)
         before_preview_events = native.events(first_status["owner_epoch"], 0)[
             "events"
         ]
@@ -1941,7 +1958,7 @@ def test_first_complete_addressed_native_motion_path(tmp_path: Path) -> None:
         assert stopped["state"] == "stopped"
         assert stopped["active_stop_id"] == stop_accepted["accepted"]["stop_id"]
         with sqlite3.connect(
-            execution_root / "operation-journal.sqlite3"
+            execution_state_root / "operation-journal.sqlite3"
         ) as database:
             durable_stop = database.execute(
                 "SELECT sequence,payload_json FROM journal_records "
@@ -2033,7 +2050,7 @@ def test_first_complete_addressed_native_motion_path(tmp_path: Path) -> None:
         ]
 
         with sqlite3.connect(
-            execution_root / "operation-journal.sqlite3"
+            execution_state_root / "operation-journal.sqlite3"
         ) as database:
             malformed_row = database.execute(
                 "SELECT payload_json FROM journal_records WHERE request_id=? "
@@ -2063,7 +2080,7 @@ def test_first_complete_addressed_native_motion_path(tmp_path: Path) -> None:
         assert recovered_result["latch"]["state"] == "cleared"
         assert headless.stop_fault()["stop_fault"] is None
         with sqlite3.connect(
-            execution_root / "operation-journal.sqlite3"
+            execution_state_root / "operation-journal.sqlite3"
         ) as database:
             clear_rows = database.execute(
                 "SELECT payload_json FROM journal_records "
@@ -2089,10 +2106,32 @@ def test_first_complete_addressed_native_motion_path(tmp_path: Path) -> None:
             "sequence"
         ]
 
-        _stop_host(process)
-        process = _start_host(
-            fixture_root, execution_root, staging_root, manifest
+        durable_journal = execution_state_root / "operation-journal.sqlite3"
+        durable_identity = (
+            durable_journal.stat().st_dev,
+            durable_journal.stat().st_ino,
         )
+        run_root_identity = (
+            execution_run_root.stat().st_dev,
+            execution_run_root.stat().st_ino,
+        )
+        _stop_host(process)
+        assert (
+            execution_run_root.stat().st_dev,
+            execution_run_root.stat().st_ino,
+        ) == run_root_identity
+        assert not (execution_run_root / "execution-command.sock").exists()
+        process = _start_host(
+            fixture_root, execution_state_root, execution_run_root, manifest
+        )
+        assert (durable_journal.stat().st_dev, durable_journal.stat().st_ino) == (
+            durable_identity
+        )
+        assert (
+            execution_run_root.stat().st_dev,
+            execution_run_root.stat().st_ino,
+        ) == run_root_identity
+        assert (execution_run_root / "execution-command.sock").is_socket()
         restarted = headless.execution_status()["status"]
         assert restarted["owner_epoch"] != first_status["owner_epoch"]
         with pytest.raises(HeadlessClientError) as stale:
@@ -2114,12 +2153,12 @@ def test_cell_admission_crosses_real_execution_seqpacket_surface(
     fixture_root = tmp_path / "fixture"
     shutil.copytree(built_fixture, fixture_root)
     manifest = json.loads((fixture_root / "manifest.json").read_text("utf-8"))
-    execution_root = tmp_path / "execution"
-    staging_root = tmp_path / "staging"
-    execution_root.mkdir()
-    staging_root.mkdir()
-    process = _start_host(fixture_root, execution_root, staging_root, manifest)
-    client = ExecutionCommandClient(execution_root, timeout_seconds=5.0)
+    execution_state_root = tmp_path / "execution-state"
+    execution_run_root = tmp_path / "execution-run"
+    execution_state_root.mkdir()
+    execution_run_root.mkdir()
+    process = _start_host(fixture_root, execution_state_root, execution_run_root, manifest)
+    client = ExecutionCommandClient(execution_run_root, timeout_seconds=5.0)
     try:
         get = {
             "api_version": "manyforge.execution_command.v1",
@@ -2147,7 +2186,7 @@ def test_cell_admission_crosses_real_execution_seqpacket_surface(
         assert process.poll() is None
 
         stop_only = client._exchange_on(
-            get, execution_root / "execution-control.sock"
+            get, execution_run_root / "execution-control.sock"
         )
         assert stop_only == {
             "api_version": "manyforge.execution_command_response.v1",
@@ -2173,14 +2212,14 @@ def test_addressed_native_benchmark_preserves_historical_measurements(
     fixture_root = tmp_path / "fixture"
     shutil.copytree(built_fixture, fixture_root)
     manifest = json.loads((fixture_root / "manifest.json").read_text("utf-8"))
-    execution_root = tmp_path / "execution"
-    staging_root = tmp_path / "staging"
-    execution_root.mkdir()
-    staging_root.mkdir()
+    execution_state_root = tmp_path / "execution-state"
+    execution_run_root = tmp_path / "execution-run"
+    execution_state_root.mkdir()
+    execution_run_root.mkdir()
     process = _start_host(
-        fixture_root, execution_root, staging_root, manifest
+        fixture_root, execution_state_root, execution_run_root, manifest
     )
-    native = ExecutionCommandClient(execution_root, timeout_seconds=5.0)
+    native = ExecutionCommandClient(execution_run_root, timeout_seconds=5.0)
 
     goal_a = [0.1, -0.5, 0.5, -0.5, -0.5, 0.0]
     goal_b = [0.3, -0.8, 0.8, -0.3, -0.8, 0.1]
@@ -2301,20 +2340,20 @@ def test_slow_preview_cannot_delay_the_standard_stop_path(tmp_path: Path) -> Non
     fixture_root = tmp_path / "fixture"
     shutil.copytree(built_fixture, fixture_root)
     manifest = json.loads((fixture_root / "manifest.json").read_text("utf-8"))
-    execution_root = tmp_path / "execution"
-    staging_root = tmp_path / "staging"
-    execution_root.mkdir()
-    staging_root.mkdir()
+    execution_state_root = tmp_path / "execution-state"
+    execution_run_root = tmp_path / "execution-run"
+    execution_state_root.mkdir()
+    execution_run_root.mkdir()
     marker = tmp_path / "blocked-preview-worker"
     process = _start_host(
         fixture_root,
-        execution_root,
-        staging_root,
+        execution_state_root,
+        execution_run_root,
         manifest,
         candidate_worker=_required_path("MANYFORGE_ROBOPLAN_FAKE_WORKER"),
         fake_worker_marker=marker,
     )
-    execution = ExecutionCommandClient(execution_root, timeout_seconds=3.0)
+    execution = ExecutionCommandClient(execution_run_root, timeout_seconds=3.0)
     app = create_app(
         service=HeadlessService(
             UnusedCore(),  # type: ignore[arg-type]
@@ -2408,17 +2447,17 @@ def test_planning_stop_and_active_host_replacement_are_bounded(
     fixture_root = tmp_path / "fixture"
     shutil.copytree(built_fixture, fixture_root)
     manifest = json.loads((fixture_root / "manifest.json").read_text("utf-8"))
-    execution_root = tmp_path / "execution"
-    staging_root = tmp_path / "staging"
-    execution_root.mkdir()
-    staging_root.mkdir()
+    execution_state_root = tmp_path / "execution-state"
+    execution_run_root = tmp_path / "execution-run"
+    execution_state_root.mkdir()
+    execution_run_root.mkdir()
     marker = tmp_path / "fake-worker-generation"
     fake_worker = _required_path("MANYFORGE_ROBOPLAN_FAKE_WORKER")
 
     process = _start_host(
         fixture_root,
-        execution_root,
-        staging_root,
+        execution_state_root,
+        execution_run_root,
         manifest,
         candidate_worker=fake_worker,
         fake_worker_marker=marker,
@@ -2428,7 +2467,7 @@ def test_planning_stop_and_active_host_replacement_are_bounded(
             service=HeadlessService(
                 UnusedCore(),  # type: ignore[arg-type]
                 UnusedManager(),  # type: ignore[arg-type]
-                ExecutionCommandClient(execution_root, timeout_seconds=10.0),
+                ExecutionCommandClient(execution_run_root, timeout_seconds=10.0),
             ),
             trusted_principal_adapter=FixedTrustedPrincipalAdapter(),
         )
@@ -2440,9 +2479,9 @@ def test_planning_stop_and_active_host_replacement_are_bounded(
     try:
         first_epoch = headless.execution_status()["status"]["owner_epoch"]
         cclc_owner_before_loss = CCLCOpenRequestClient(
-            execution_root, timeout_seconds=5.0
+            execution_run_root, timeout_seconds=5.0
         ).owner_identity()["request_owner_epoch"]
-        cclc_before_loss = _wait_for_cclc_component(execution_root)
+        cclc_before_loss = _wait_for_cclc_component(execution_run_root)
         planning_acceptance = _runner_submission(
             runner,
             request_id="planning-stop-operation",
@@ -2505,8 +2544,8 @@ def test_planning_stop_and_active_host_replacement_are_bounded(
 
         process = _start_host(
             fixture_root,
-            execution_root,
-            staging_root,
+            execution_state_root,
+            execution_run_root,
             manifest,
             candidate_worker=fake_worker,
             fake_worker_marker=marker,
@@ -2514,7 +2553,7 @@ def test_planning_stop_and_active_host_replacement_are_bounded(
         )
         restarted = headless.execution_status()["status"]
         assert restarted["owner_epoch"] != first_epoch
-        cclc_after_loss = _wait_for_cclc_component(execution_root)
+        cclc_after_loss = _wait_for_cclc_component(execution_run_root)
         assert cclc_after_loss["component_lifecycle_state"] == "active"
         assert (
             cclc_after_loss["component_lifecycle_generation"]
@@ -2564,7 +2603,7 @@ def test_planning_stop_and_active_host_replacement_are_bounded(
             "unreconciled_external_or_orphan_goal"
         )
 
-        native = ExecutionCommandClient(execution_root, timeout_seconds=2.0)
+        native = ExecutionCommandClient(execution_run_root, timeout_seconds=2.0)
         page = native.events(restarted["owner_epoch"], 0)
         assert [event["record_kind"] for event in page["events"]] == [
             "host_replaced"
@@ -2578,7 +2617,7 @@ def test_planning_stop_and_active_host_replacement_are_bounded(
         # Recovery retained lifecycle and route truth without replaying either
         # lifecycle intent. The prior request epoch remains fenced, while one
         # explicit fresh complete-domain route transaction is accepted.
-        cclc = CCLCOpenRequestClient(execution_root, timeout_seconds=5.0)
+        cclc = CCLCOpenRequestClient(execution_run_root, timeout_seconds=5.0)
         templates = cclc.route_templates("lite6_arm")
         stale_template = templates["templates"][0]
         with pytest.raises(HeadlessApiError):
@@ -2605,7 +2644,7 @@ def test_planning_stop_and_active_host_replacement_are_bounded(
                 }
             )
         _submit_native_cclc_routes(
-            execution_root,
+            execution_run_root,
             request_prefix="process.route.after-child-sigkill",
         )
 
@@ -2665,20 +2704,20 @@ def test_active_gripper_host_replacement_reconciles_and_reopens_inventory(
     fixture_root = tmp_path / "fixture"
     shutil.copytree(built_fixture, fixture_root)
     manifest = json.loads((fixture_root / "manifest.json").read_text("utf-8"))
-    execution_root = tmp_path / "execution"
-    staging_root = tmp_path / "staging"
-    execution_root.mkdir()
-    staging_root.mkdir()
+    execution_state_root = tmp_path / "execution-state"
+    execution_run_root = tmp_path / "execution-run"
+    execution_state_root.mkdir()
+    execution_run_root.mkdir()
 
     process = _start_host(
-        fixture_root, execution_root, staging_root, manifest
+        fixture_root, execution_state_root, execution_run_root, manifest
     )
     raw_api = TestClient(
         create_app(
             service=HeadlessService(
                 UnusedCore(),  # type: ignore[arg-type]
                 UnusedManager(),  # type: ignore[arg-type]
-                ExecutionCommandClient(execution_root, timeout_seconds=10.0),
+                ExecutionCommandClient(execution_run_root, timeout_seconds=10.0),
             ),
             trusted_principal_adapter=FixedTrustedPrincipalAdapter(),
         )
@@ -2705,8 +2744,8 @@ def test_active_gripper_host_replacement_reconciles_and_reopens_inventory(
 
         process = _start_host(
             fixture_root,
-            execution_root,
-            staging_root,
+            execution_state_root,
+            execution_run_root,
             manifest,
         )
         restarted = headless.execution_status()["status"]
