@@ -124,6 +124,9 @@ export function ProgramNodePalette({
   const [parameterText, setParameterText] = useState('{}');
   const [error, setError] = useState<string | null>(null);
   const [infoOpen, setInfoOpen] = useState(false);
+  const [collapsedCategories, setCollapsedCategories] = useState<Set<string>>(
+    () => new Set(),
+  );
   const infoButton = useRef<HTMLButtonElement>(null);
   const closeInfo = useCallback(() => setInfoOpen(false), []);
   const flat = useMemo(() => flattenProgramTree(root), [root]);
@@ -246,6 +249,11 @@ export function ProgramNodePalette({
     setStagedTargetId(null);
     setError(null);
   };
+  const closeStaging = useCallback(() => {
+    setStagedId(null);
+    setStagedTargetId(null);
+    setError(null);
+  }, []);
 
   return (
     <section className="program-palette" aria-labelledby="program-palette-title">
@@ -311,10 +319,26 @@ export function ProgramNodePalette({
         />
       </label>
       <div className="program-palette-list">
-        {grouped.map(([category, entries]) => (
+        {grouped.map(([category, entries]) => {
+          const collapsed = collapsedCategories.has(category);
+          return (
           <section key={category}>
-            <h4>{category}</h4>
-            {entries.map((entry) => (
+            <button
+              type="button"
+              className="program-palette-category"
+              aria-expanded={!collapsed}
+              onClick={() => setCollapsedCategories((current) => {
+                const next = new Set(current);
+                if (next.has(category)) next.delete(category);
+                else next.add(category);
+                return next;
+              })}
+            >
+              <span aria-hidden="true">{collapsed ? '›' : '⌄'}</span>
+              <strong>{category}</strong>
+              <small>{entries.length}</small>
+            </button>
+            {!collapsed && entries.map((entry) => (
               <NodePaletteItem
                 key={entry.id}
                 entry={entry}
@@ -325,23 +349,19 @@ export function ProgramNodePalette({
               />
             ))}
           </section>
-        ))}
+          );
+        })}
       </div>
 
+      {error && !staged && <p className="program-form-error palette-error" role="alert">{error}</p>}
+      <OverlayPanel
+        open={staged !== null}
+        title={staged ? `Add ${staged.name}` : 'Add node'}
+        titleId="program-node-staging-title"
+        onClose={closeStaging}
+      >
       {staged && (
         <div className="program-staging-card">
-          <div className="program-staging-heading">
-            <strong>Add {staged.name}</strong>
-            <button
-              type="button"
-              onClick={() => {
-                setStagedId(null);
-                setStagedTargetId(null);
-              }}
-            >
-              Cancel
-            </button>
-          </div>
           <p>
             Complete the node locally; it enters the Draft only after the exact
             catalog schema can validate it.
@@ -380,6 +400,7 @@ export function ProgramNodePalette({
           <button type="button" disabled={busy || !stagedTarget} onClick={commit}>Add to Draft</button>
         </div>
       )}
+      </OverlayPanel>
     </section>
   );
 }

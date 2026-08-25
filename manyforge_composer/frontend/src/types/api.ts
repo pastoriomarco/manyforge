@@ -330,6 +330,25 @@ export interface ScenarioCatalogResponse {
   scenarios: ScenarioCatalogEntry[];
 }
 
+export interface CurrentScenarioSelection {
+  scenarioId: string;
+  scenarioCatalogRevision: string;
+  deploymentArtifactId: string;
+  deploymentRevision: string;
+  retainedBundleId: string;
+  graphRevision: string;
+  programId: string;
+  programRevision: string;
+  programBindingId: string;
+}
+
+export interface CurrentScenarioResponse {
+  schemaVersion: 'manyforge.current_scenario.v1';
+  ready: boolean;
+  currentScenario: CurrentScenarioSelection | null;
+  unavailableReasons: string[];
+}
+
 export interface AppliedProgramSelection {
   schemaVersion: 'manyforge.applied_program_selection.v1';
   scenarioId: string;
@@ -754,9 +773,6 @@ export interface SceneTransactionResponse {
 export interface DraftFenceRequest {
   draftId: string;
   expectedDraftRevision: number;
-  clientId: string;
-  snapshotReceiverEpoch: string;
-  snapshotSequence: number;
   expectedAdmissionGeneration: number;
   requestOwnerEpoch: string;
   requestId: string;

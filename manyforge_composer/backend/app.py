@@ -491,18 +491,12 @@ def create_app(
 
         @app.websocket("/ws/state")
         async def headless_state_websocket(websocket: WebSocket) -> None:
-            client_id = websocket.query_params.get("client_id", "")
-            if (
-                not client_id
-                or len(client_id.encode("utf-8")) > 256
-                or state.authoring_admission is None
-            ):
+            if state.authoring_admission is None:
                 await websocket.close(code=1008)
                 return
             await serve_headless_state(
                 websocket,
                 state.headless_client,
-                client_id=client_id,
                 admission=state.authoring_admission,
                 draft_session=state.draft_session,
             )

@@ -1,4 +1,4 @@
-"""Focused fail-closed tests for Composer's per-client authoring barrier."""
+"""Focused fail-closed tests for Composer's durable authoring owner."""
 
 from __future__ import annotations
 
@@ -10,8 +10,7 @@ from manyforge_headless_api.client import HeadlessClientError
 
 from manyforge_composer.backend.authoring_admission import (
     AuthoringAdmissionCoordinator,
-    BackendAuthoringMutationEnvelope,
-    BrowserAuthoringMutationEnvelope,
+    AuthoringMutationEnvelope,
     headless_client_http_exception,
 )
 from manyforge_composer.backend.authoring_transaction_journal import (
@@ -135,34 +134,15 @@ def _startup_receipt(*, status="unknown", claim=None, **extra):
 
 
 def _envelope(
-    coordinator: AuthoringAdmissionCoordinator,
+    _coordinator: AuthoringAdmissionCoordinator,
     client_id: str,
     *,
-    sequence: int = 1,
     generation: int = 7,
-) -> BrowserAuthoringMutationEnvelope:
-    return BrowserAuthoringMutationEnvelope(
-        client_id=client_id,
-        snapshot_receiver_epoch=coordinator.receiver_epoch,
-        snapshot_sequence=sequence,
+) -> AuthoringMutationEnvelope:
+    return AuthoringMutationEnvelope(
         expected_admission_generation=generation,
         request_owner_epoch=f"{client_id}.epoch.1",
         request_id=f"{client_id}.request.1",
-    )
-
-
-def _publish(
-    coordinator: AuthoringAdmissionCoordinator,
-    client_id: str,
-    *,
-    sequence: int = 1,
-) -> None:
-    coordinator.publish_complete_snapshot(
-        client_id=client_id,
-        sequence=sequence,
-        admission_generation=7,
-        draft_id="draft.1",
-        draft_revision=3,
     )
 
 
@@ -170,8 +150,8 @@ def _backend_envelope(
     *,
     request_id: str = "assistant.request.1",
     generation: int = 7,
-) -> BackendAuthoringMutationEnvelope:
-    return BackendAuthoringMutationEnvelope(
+) -> AuthoringMutationEnvelope:
+    return AuthoringMutationEnvelope(
         expected_admission_generation=generation,
         request_owner_epoch="assistant.epoch.1",
         request_id=request_id,
@@ -195,25 +175,12 @@ def _owner_proven_no_effect_error() -> HeadlessClientError:
     )
 
 
-def test_pre_snapshot_and_stale_generation_have_no_effect(tmp_path) -> None:
+def test_stale_backend_generation_has_no_effect(tmp_path) -> None:
     headless = _Headless()
     coordinator = AuthoringAdmissionCoordinator(headless, tmp_path)  # type: ignore[arg-type]
     coordinator.recover()
     effects: list[str] = []
 
-    with pytest.raises(HTTPException) as missing:
-        coordinator.execute(
-            _envelope(coordinator, "client-a"),
-            operation_kind="save_draft",
-            draft_id="draft.1",
-            draft_revision=3,
-            payload={"operation": "save"},
-            effect=lambda _claim: effects.append("save"),
-            post_image=lambda: {},
-        )
-    assert missing.value.detail["code"] == "authoring_client_snapshot_stale"
-
-    _publish(coordinator, "client-a")
     headless.generation = 8
     with pytest.raises(HTTPException) as stale:
         coordinator.execute(
@@ -277,25 +244,20 @@ def test_absent_owner_with_predecessor_claim_fails_closed(tmp_path) -> None:
     assert not coordinator.mutation_ready
 
 
-def test_disconnected_client_does_not_block_another_current_client(tmp_path) -> None:
+def test_request_owners_are_independent_of_browser_transport(tmp_path) -> None:
     headless = _Headless()
     coordinator = AuthoringAdmissionCoordinator(headless, tmp_path)  # type: ignore[arg-type]
     coordinator.recover()
-    _publish(coordinator, "client-a")
-    _publish(coordinator, "client-b")
-    coordinator.disconnect("client-a")
-
-    with pytest.raises(HTTPException):
-        coordinator.execute(
-            _envelope(coordinator, "client-a"),
-            operation_kind="new_draft",
-            draft_id="draft.1",
-            draft_revision=3,
-            payload={"operation": "new"},
-            effect=lambda _claim: None,
-            post_image=lambda: {},
-        )
-    result = coordinator.execute(
+    first = coordinator.execute(
+        _envelope(coordinator, "client-a"),
+        operation_kind="new_draft",
+        draft_id="draft.1",
+        draft_revision=3,
+        payload={"operation": "new-a"},
+        effect=lambda _claim: {"status": "committed-a"},
+        post_image=lambda: {"draft_id": "draft.2"},
+    )
+    second = coordinator.execute(
         _envelope(coordinator, "client-b"),
         operation_kind="new_draft",
         draft_id="draft.1",
@@ -304,9 +266,10 @@ def test_disconnected_client_does_not_block_another_current_client(tmp_path) -> 
         effect=lambda _claim: {"status": "committed"},
         post_image=lambda: {"draft_id": "draft.2"},
     )
-    assert result == {"status": "committed"}
-    assert len(headless.claims) == 1
-    assert len(headless.settlements) == 1
+    assert first == {"status": "committed-a"}
+    assert second == {"status": "committed"}
+    assert len(headless.claims) == 2
+    assert len(headless.settlements) == 2
 
 
 def test_backend_mutation_uses_kernel_admission_without_browser_state(tmp_path) -> None:
@@ -314,10 +277,7 @@ def test_backend_mutation_uses_kernel_admission_without_browser_state(tmp_path) 
     coordinator = AuthoringAdmissionCoordinator(headless, tmp_path)  # type: ignore[arg-type]
     coordinator.recover()
 
-    # A disconnected browser is presentation state only and cannot gate a
-    # backend-owned assistant mutation.
-    _publish(coordinator, "browser-a")
-    coordinator.disconnect("browser-a")
+    # Browser presentation state is deliberately absent from this owner path.
     result = coordinator.execute(
         _backend_envelope(),
         operation_kind="assistant_scene_draft_add_object",
@@ -370,57 +330,42 @@ def test_backend_validation_under_claim_precedes_effect_intent(tmp_path) -> None
     assert headless.settlements[-1]["settlement_kind"] == "proven_no_effect"
 
 
-def test_snapshot_rotation_after_claim_releases_proven_no_effect(tmp_path) -> None:
+def test_transport_independent_commit_replays_without_second_claim(tmp_path) -> None:
     headless = _Headless()
     coordinator = AuthoringAdmissionCoordinator(headless, tmp_path)  # type: ignore[arg-type]
     coordinator.recover()
-    _publish(coordinator, "client-a")
     effects: list[str] = []
-    acquire = headless.acquire_authoring_transaction
-
-    def acquire_while_snapshot_rotates(body: dict[str, Any]) -> dict[str, Any]:
-        result = acquire(body)
-        _publish(coordinator, "client-a", sequence=2)
-        return result
-
-    headless.acquire_authoring_transaction = acquire_while_snapshot_rotates  # type: ignore[method-assign]
     envelope = _envelope(coordinator, "client-a")
-    with pytest.raises(HTTPException) as stale:
-        coordinator.execute(
-            envelope,
-            operation_kind="save_draft",
-            draft_id="draft.1",
-            draft_revision=3,
-            payload={"operation": "save"},
-            effect=lambda _claim: effects.append("save"),
-            post_image=lambda: {},
-        )
+    result = coordinator.execute(
+        envelope,
+        operation_kind="save_draft",
+        draft_id="draft.1",
+        draft_revision=3,
+        payload={"operation": "save"},
+        effect=lambda _claim: effects.append("save") or {"saved": True},
+        post_image=lambda: {"draft_id": "draft.1", "revision": 3},
+    )
 
-    assert stale.value.detail["code"] == "authoring_client_snapshot_stale"
-    assert effects == []
+    assert result == {"saved": True}
+    assert effects == ["save"]
     assert coordinator.mutation_ready
-    assert headless.settlements[0]["settlement_kind"] == "proven_no_effect"
+    assert headless.settlements[0]["settlement_kind"] == "owner_commit"
 
     # The exact completed request is a durable owner outcome. It must replay
-    # before consulting the now-rotated (and here disconnected) browser
-    # snapshot, without acquiring or settling a second Kernel claim.
-    coordinator.disconnect("client-a")
+    # without acquiring or settling a second Kernel claim.
     claims = len(headless.claims)
     settlements = len(headless.settlements)
-    with pytest.raises(HTTPException) as replayed:
-        coordinator.execute(
-            envelope,
-            operation_kind="save_draft",
-            draft_id="draft.1",
-            draft_revision=3,
-            payload={"operation": "save"},
-            effect=lambda _claim: effects.append("save"),
-            post_image=lambda: {},
-        )
-    assert replayed.value.status_code == stale.value.status_code
-    assert replayed.value.detail == stale.value.detail
-    assert replayed.value.headers == stale.value.headers
-    assert effects == []
+    replayed = coordinator.execute(
+        envelope,
+        operation_kind="save_draft",
+        draft_id="draft.1",
+        draft_revision=3,
+        payload={"operation": "save"},
+        effect=lambda _claim: effects.append("save"),
+        post_image=lambda: {},
+    )
+    assert replayed == result
+    assert effects == ["save"]
     assert len(headless.claims) == claims
     assert len(headless.settlements) == settlements
 
@@ -443,7 +388,6 @@ def test_owner_proven_external_rejection_settles_and_replays_exactly(
     headless = _Headless()
     coordinator = AuthoringAdmissionCoordinator(headless, tmp_path)  # type: ignore[arg-type]
     coordinator.recover()
-    _publish(coordinator, "client-a")
     envelope = _envelope(coordinator, "client-a")
 
     def reject(_claim):
@@ -473,7 +417,6 @@ def test_owner_proven_external_rejection_settles_and_replays_exactly(
     assert coordinator.mutation_ready
     assert headless.settlements[-1]["settlement_kind"] == "proven_no_effect"
 
-    coordinator.disconnect("client-a")
     with pytest.raises(HTTPException) as replayed:
         coordinator.execute(
             envelope,
@@ -492,7 +435,6 @@ def test_unproven_external_rejection_remains_recovery_blocked(tmp_path) -> None:
     headless = _Headless()
     coordinator = AuthoringAdmissionCoordinator(headless, tmp_path)  # type: ignore[arg-type]
     coordinator.recover()
-    _publish(coordinator, "client-a")
 
     def reject(_claim):
         error = HeadlessClientError(

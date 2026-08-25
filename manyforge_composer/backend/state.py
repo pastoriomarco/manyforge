@@ -32,8 +32,7 @@ from .draft_session import (
 )
 from .authoring_admission import (
     AuthoringAdmissionCoordinator,
-    BackendAuthoringMutationEnvelope,
-    BrowserAuthoringMutationEnvelope,
+    AuthoringMutationEnvelope,
 )
 from .authoring_transaction_journal import (
     AuthoringJournalError,
@@ -604,7 +603,7 @@ class ComposerState:
 
     def load_scenario(
         self,
-        envelope: BrowserAuthoringMutationEnvelope | BackendAuthoringMutationEnvelope,
+        envelope: AuthoringMutationEnvelope,
         *,
         scenario_id: str,
         expected_catalog_revision: str | None,
@@ -665,7 +664,7 @@ class ComposerState:
             )
         request_id = "development-load-scenario-" + uuid.uuid4().hex
         return self.load_scenario(
-            BackendAuthoringMutationEnvelope(
+            AuthoringMutationEnvelope(
                 expected_admission_generation=generation,
                 request_owner_epoch=self.authoring_admission.owner_epoch,
                 request_id=request_id,

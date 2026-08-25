@@ -4,8 +4,8 @@
 
 #include <algorithm>
 #include <cmath>
+#include <condition_variable>
 #include <exception>
-#include <thread>
 
 namespace manyforge::core {
 
@@ -299,9 +299,18 @@ bool is_command_authoritative_stop_snapshot(const ExecutionSnapshot& snapshot) {
 MeasuredRestWaitResult wait_for_measured_rest_after_confirmed_stop(
     IExecutionBackend& backend,
     double settle_velocity_threshold_rad_s,
-    std::chrono::steady_clock::time_point deadline,
+    TimePoint deadline,
+    IClock& clock,
+    IScheduler& scheduler,
     std::stop_token stop_token,
     std::function<bool()> abort_requested) {
+  struct PollWaitState final {
+    std::mutex mutex;
+    std::condition_variable ready;
+    bool timer_fired = false;
+    bool cancellation_requested = false;
+  };
+
   MeasuredRestWaitResult result;
   while (true) {
     if (abort_requested && abort_requested()) {
@@ -330,20 +339,44 @@ MeasuredRestWaitResult wait_for_measured_rest_after_confirmed_stop(
       result.timed_out = true;
       return result;
     }
-    const auto now = std::chrono::steady_clock::now();
+    const auto now = clock.now();
     if (now >= deadline) {
       result.timed_out = true;
       return result;
     }
-    const auto remaining = deadline - now;
-    const auto sleep_for =
-        std::min(std::chrono::milliseconds(10),
-                 std::chrono::duration_cast<std::chrono::milliseconds>(
-                     remaining));
-    std::this_thread::sleep_for(
-        sleep_for > std::chrono::milliseconds(0)
-            ? sleep_for
-            : std::chrono::milliseconds(1));
+
+    const auto wake_deadline =
+        deadline - now > kExecutionPollNs ? now + kExecutionPollNs : deadline;
+    auto wait_state = std::make_shared<PollWaitState>();
+    std::stop_callback cancellation(stop_token, [wait_state]() {
+      {
+        std::lock_guard lock(wait_state->mutex);
+        wait_state->cancellation_requested = true;
+      }
+      wait_state->ready.notify_all();
+    });
+    const auto wake_handle = scheduler.schedule(
+        wake_deadline,
+        [wait_state]() {
+          {
+            std::lock_guard lock(wait_state->mutex);
+            wait_state->timer_fired = true;
+          }
+          wait_state->ready.notify_all();
+        },
+        SchedulerPriority::StopControl);
+
+    bool timer_fired = false;
+    {
+      std::unique_lock lock(wait_state->mutex);
+      wait_state->ready.wait(lock, [&wait_state]() {
+        return wait_state->timer_fired || wait_state->cancellation_requested;
+      });
+      timer_fired = wait_state->timer_fired;
+    }
+    if (!timer_fired) {
+      scheduler.cancel(wake_handle);
+    }
   }
 }
 

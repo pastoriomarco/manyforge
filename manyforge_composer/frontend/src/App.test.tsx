@@ -112,7 +112,7 @@ describe('Composer shell continuity', () => {
     expect(appSource).toContain('<DeploymentCompositionPanel');
     expect(appSource).toContain('<RuntimeStatusOverlay');
     expect(controlsSource).toContain('<ArtifactBrowser lockedKind="program"');
-    expect(controlsSource).toContain('Program Apply never changes the deployment.');
+    expect(controlsSource).toContain('It never selects or changes Deployment.');
     expect(controlsSource).not.toContain('Update Draft');
   });
 });

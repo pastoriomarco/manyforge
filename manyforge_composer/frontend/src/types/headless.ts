@@ -84,7 +84,6 @@ export interface OperatorAlarmSnapshot {
 
 export interface ComposerHeadlessState {
   schemaVersion: 'manyforge.composer_headless_state.v1';
-  clientId: string;
   complete: true;
   runtime: HeadlessRuntimeSnapshot;
   alarms: OperatorAlarmSnapshot;

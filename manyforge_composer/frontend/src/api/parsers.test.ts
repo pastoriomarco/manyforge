@@ -5,6 +5,7 @@ import {
   parseAppliedProgramSelection,
   parseCapabilityCommandPreviewResponse,
   parseCatalogResponse,
+  parseCurrentScenarioResponse,
   parseExecutionOwnerStatus,
   parseHealthResponse,
   parseHeadlessRuntimeSnapshot,
@@ -543,6 +544,29 @@ describe('Program product projections', () => {
     const applied = parseAppliedProgramSelection(appliedInput);
 
     expect(catalog.scenarios[0].description).toBe('Pick one object');
+    const current = parseCurrentScenarioResponse({
+      schema_version: 'manyforge.current_scenario.v1',
+      ready: true,
+      current_scenario: {
+        scenario_id: 'cell-pick',
+        scenario_catalog_revision: digestA,
+        deployment_artifact_id: 'cell-a',
+        deployment_revision: digestB,
+        retained_bundle_id: digestC,
+        graph_revision: digestB,
+        program_id: 'fixture',
+        program_revision: digestA,
+        program_binding_id: digestC,
+      },
+      unavailable_reasons: [],
+    });
+    expect(current.currentScenario?.scenarioId).toBe('cell-pick');
+    expect(() => parseCurrentScenarioResponse({
+      schema_version: 'manyforge.current_scenario.v1',
+      ready: false,
+      current_scenario: null,
+      unavailable_reasons: [],
+    })).toThrow(/unavailable reasons exactly when no current Scenario exists/);
     expect(applied.recordDigest).toBe(digestC);
     expect(applied.sourceOwnerEpoch).toBe('headless.epoch.1');
     expect(applied.program.program_id).toBe('fixture');

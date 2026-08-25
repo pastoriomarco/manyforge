@@ -59,8 +59,9 @@ describe('Program workspace lifecycle controls', () => {
     expect(source).toContain('Revert to Saved');
     expect(source).toContain('Discard to Applied');
     expect(source).toContain(
-      'disabled={authoringBusy || !workspace?.applied.available}',
+      'disabled={authoringBusy || workspace?.hasUnappliedChanges !== true}',
     );
+    expect(source).toContain('disabled={authoringBusy || !hasAppliedUnsavedChanges}');
     expect(source).toContain('workspace?.saved.available');
     expect(source).not.toContain('localStorage');
     expect(source).not.toContain('sendBeacon');
@@ -140,10 +141,12 @@ describe('Program workspace lifecycle controls', () => {
       new URL('./ProgramDocumentControls.tsx', import.meta.url),
       'utf8',
     );
-    expect(source).toContain('Program Apply requires this scenario’s deployment');
-    expect(source).toContain('Program Apply never changes the deployment.');
+    expect(source).toContain('Apply replaces only the Program in this exact current Scenario.');
+    expect(source).toContain('It never selects or changes Deployment.');
     expect(source).toContain('Load activates this Scenario’s exact Deployment');
     expect(source).toContain('loadScenario(selectedScenario.scenarioId');
+    expect(source).toContain('currentScenarioProjection?.currentScenario');
+    expect(source).not.toContain('applyDraft(selectedScenario');
     expect(source).not.toContain('Load and Apply Program');
   });
 
@@ -160,9 +163,9 @@ describe('Program workspace lifecycle controls', () => {
       'busy || authoringUnavailable || !mutationAvailable',
     );
     expect(workspaceSource).toContain(
-      'workspace !== null && admissionObserved && !mutationAvailable',
+      'workspace !== null && !mutationAvailable',
     );
-    expect(workspaceSource).toContain('Waiting for current backend Idle admission');
+    expect(workspaceSource).toContain('{mutationUnavailableReason}');
     expect(controlsSource).toContain('busy || !mutationAvailable');
     expect(workspaceSource).not.toContain('affect only later runs');
   });

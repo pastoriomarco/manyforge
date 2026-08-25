@@ -48,7 +48,12 @@ export function ProgramDeclarationsNavigator({
   return (
     <nav className="program-declaration-navigator" aria-label="Program declarations">
       <section>
-        <h4>Parameters</h4>
+        <div className="program-declaration-heading">
+          <h4>Parameters</h4>
+          <button type="button" onClick={() => onSelect({ kind: 'parameter', id: '' })}>
+            New
+          </button>
+        </div>
         {parameters.length === 0 && <p>No parameters</p>}
         {parameters.map((parameter) => (
           <button
@@ -63,7 +68,12 @@ export function ProgramDeclarationsNavigator({
         ))}
       </section>
       <section>
-        <h4>Namespaces</h4>
+        <div className="program-declaration-heading">
+          <h4>Namespaces</h4>
+          <button type="button" onClick={() => onSelect({ kind: 'namespace', id: '' })}>
+            New
+          </button>
+        </div>
         {namespaces.length === 0 && <p>No namespaces</p>}
         {namespaces.map((namespace) => (
           <button
@@ -78,7 +88,12 @@ export function ProgramDeclarationsNavigator({
         ))}
       </section>
       <section>
-        <h4>Blackboard keys</h4>
+        <div className="program-declaration-heading">
+          <h4>Blackboard keys</h4>
+          <button type="button" onClick={() => onSelect({ kind: 'key', id: '' })}>
+            New
+          </button>
+        </div>
         {keys.length === 0 && <p>No keys</p>}
         {keys.map((key) => (
           <button

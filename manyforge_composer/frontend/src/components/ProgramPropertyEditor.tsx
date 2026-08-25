@@ -311,9 +311,19 @@ export function ProgramPropertyEditor({
       )}
       <div className="program-property-list">
         <div className="program-node-identity">
-          <span>{entry.name}</span>
-          <code>{selected.node_id}</code>
+          <span><strong>{entry.name}</strong><small>{entry.kind} · {entry.category}</small></span>
+          <span><code>{selected.node_id}</code><small>Profile {entry.minProgramProfile ?? 'portable'}</small></span>
         </div>
+        {entry.requiredCapabilities.length > 0 && (
+          <details className="program-node-capabilities">
+            <summary>{entry.requiredCapabilities.length} required capability binding(s)</summary>
+            {entry.requiredCapabilities.map((requirement) => (
+              <p key={`${requirement.capabilityId}:${requirement.scope}`}>
+                <code>{requirement.capabilityId}</code> · {requirement.scope}
+              </p>
+            ))}
+          </details>
+        )}
         {entry.parameters.length === 0 && (
           <p className="muted">This node has no authored parameters.</p>
         )}

@@ -21,6 +21,11 @@ export interface HeadlessStateAdmission {
   reason: string | null;
 }
 
+export interface RuntimeFrameIdentity {
+  ownerEpoch: string;
+  generation: number;
+}
+
 export function admitHeadlessState(
   current: ComposerHeadlessState | null,
   candidate: ComposerHeadlessState,
@@ -34,13 +39,12 @@ export function admitHeadlessState(
   return { accepted: true, reason: null };
 }
 
-function websocketUrl(clientId: string): string {
+function websocketUrl(): string {
   const resolved = new URL(
     resolveStructuralAssetUrl('/ws/state'),
     window.location.href,
   );
   resolved.protocol = resolved.protocol === 'https:' ? 'wss:' : 'ws:';
-  resolved.searchParams.set('client_id', clientId);
   return resolved.toString();
 }
 
@@ -62,10 +66,98 @@ export function browserStableIdentity(storageKey: string, prefix: string): strin
   }
 }
 
-function browserClientId(): string {
-  const random = globalThis.crypto?.randomUUID?.()
-    ?? `${Date.now()}-${Math.random().toString(16).slice(2)}`;
-  return `composer-browser.${random}`;
+export function sameHeadlessProjection(
+  current: ComposerHeadlessState | null,
+  candidate: ComposerHeadlessState,
+): boolean {
+  if (current === null) return false;
+  return current.receiverEpoch === candidate.receiverEpoch
+    && current.runtime.projectionOwnerEpoch === candidate.runtime.projectionOwnerEpoch
+    && current.runtime.projectionOwnerId === candidate.runtime.projectionOwnerId
+    && current.runtime.complete === candidate.runtime.complete
+    && sameStrings(current.runtime.reasons, candidate.runtime.reasons)
+    && sameStrings(
+      current.runtime.unavailableSections,
+      candidate.runtime.unavailableSections,
+    )
+    && sameSourceSection(
+      current.runtime.sections.manager,
+      candidate.runtime.sections.manager,
+      false,
+    )
+    && sameSourceSection(
+      current.runtime.sections.logicalScene,
+      candidate.runtime.sections.logicalScene,
+      true,
+    )
+    && sameSourceSection(
+      current.runtime.sections.sceneRuntime,
+      candidate.runtime.sections.sceneRuntime,
+      true,
+    )
+    && current.alarms.ownerEpoch === candidate.alarms.ownerEpoch
+    && current.alarms.generation === candidate.alarms.generation
+    && current.alarms.stateRevision === candidate.alarms.stateRevision
+    && current.authoringAdmission.authoringAllowed
+      === candidate.authoringAdmission.authoringAllowed
+    && current.authoringAdmission.admissionGeneration
+      === candidate.authoringAdmission.admissionGeneration
+    && current.programCycle.programRunnerOwnerEpoch
+      === candidate.programCycle.programRunnerOwnerEpoch
+    && current.programCycle.cycleGeneration === candidate.programCycle.cycleGeneration
+    && current.programCycle.state === candidate.programCycle.state
+    && current.programCycle.programRunId === candidate.programCycle.programRunId
+    && current.programCycle.cycleClaimGeneration
+      === candidate.programCycle.cycleClaimGeneration
+    && current.programCycle.terminalOrSettlementReference
+      === candidate.programCycle.terminalOrSettlementReference
+    && current.draftIdentity.draftId === candidate.draftIdentity.draftId
+    && current.draftIdentity.draftRevision === candidate.draftIdentity.draftRevision;
+}
+
+function sameStrings(current: string[], candidate: string[]): boolean {
+  return current.length === candidate.length
+    && current.every((value, index) => value === candidate[index]);
+}
+
+function sameSourceSection(
+  current: ComposerHeadlessState['runtime']['sections']['manager'],
+  candidate: ComposerHeadlessState['runtime']['sections']['manager'],
+  includeSourceGeneration: boolean,
+): boolean {
+  return current.available === candidate.available
+    && current.freshness === candidate.freshness
+    && sameStrings(current.knownGaps, candidate.knownGaps)
+    && current.sourceOwnerEpoch === candidate.sourceOwnerEpoch
+    && current.sourceOwnerId === candidate.sourceOwnerId
+    && (!includeSourceGeneration
+      || current.sourceGeneration === candidate.sourceGeneration);
+}
+
+export function sameViewerProjection(
+  current: ComposerHeadlessState | null,
+  candidate: ComposerHeadlessState,
+): boolean {
+  if (current === null) return false;
+  return current.receiverEpoch === candidate.receiverEpoch
+    && current.runtime.projectionOwnerEpoch === candidate.runtime.projectionOwnerEpoch
+    && current.runtime.projectionOwnerId === candidate.runtime.projectionOwnerId
+    && current.runtime.complete === candidate.runtime.complete
+    && sameStrings(current.runtime.reasons, candidate.runtime.reasons)
+    && sameStrings(
+      current.runtime.unavailableSections,
+      candidate.runtime.unavailableSections,
+    )
+    && sameSourceSection(
+      current.runtime.sections.logicalScene,
+      candidate.runtime.sections.logicalScene,
+      true,
+    )
+    && sameSourceSection(
+      current.runtime.sections.sceneRuntime,
+      candidate.runtime.sections.sceneRuntime,
+      true,
+    );
 }
 
 type Listener = () => void;
@@ -115,6 +207,8 @@ export class HeadlessStateSource {
   private shellTimer: ReturnType<typeof setTimeout> | null = null;
   private viewerFrame: number | ReturnType<typeof setTimeout> | null = null;
   private latest: ComposerHeadlessState | null = null;
+  private presentedViewer: ComposerHeadlessState | null = null;
+  private presentedFrame: RuntimeFrameIdentity | null = null;
   private latestError: string | null = null;
   private shellResult: HeadlessStateResult;
   private viewerResult: HeadlessStateResult;
@@ -144,6 +238,22 @@ export class HeadlessStateSource {
 
   readonly getShellSnapshot = () => this.shellResult;
   readonly getViewerSnapshot = () => this.viewerResult;
+  readonly getPresentedRuntimeFrame = (): RuntimeFrameIdentity | null =>
+    this.presentedFrame === null ? null : { ...this.presentedFrame };
+
+  readonly markViewerPresented = (snapshot: ComposerHeadlessState | null): void => {
+    if (snapshot === null || !snapshot.runtime.complete) {
+      this.presentedViewer = null;
+      this.presentedFrame = null;
+      return;
+    }
+    this.presentedViewer = snapshot;
+    this.presentedFrame = {
+      ownerEpoch: snapshot.runtime.projectionOwnerEpoch,
+      generation: snapshot.runtime.projectionGeneration,
+    };
+    this.advancePresentedFrame(this.latest);
+  };
 
   setEnabled(enabled: boolean): void {
     if (this.disposed || enabled === this.enabled) return;
@@ -152,6 +262,8 @@ export class HeadlessStateSource {
     this.stopConnection('Composer headless source disabled');
     this.cancelPublications();
     this.latest = null;
+    this.presentedViewer = null;
+    this.presentedFrame = null;
     this.latestError = null;
     if (enabled) {
       this.connect();
@@ -191,14 +303,15 @@ export class HeadlessStateSource {
     }
     socket?.close(1000, reason);
     this.latest = null;
+    this.presentedViewer = null;
+    this.presentedFrame = null;
     this.publishImmediate(this.result());
   }
 
   private connect(): void {
     if (!this.enabled || this.disposed) return;
     const serial = ++this.serial;
-    const clientId = browserClientId();
-    const socket = new WebSocket(websocketUrl(clientId));
+    const socket = new WebSocket(websocketUrl());
     this.socket = socket;
     headlessSocketCreations += 1;
     publishHeadlessQualification();
@@ -232,20 +345,20 @@ export class HeadlessStateSource {
             return;
           }
         }
-        const candidate = {
-          ...parseComposerHeadlessState(raw),
-          clientId,
-        };
+        const candidate = parseComposerHeadlessState(raw);
         const admission = admitHeadlessState(this.latest, candidate);
         if (!admission.accepted) {
           this.publishError(admission.reason);
           socket.close(1002, 'non-monotonic headless projection');
           return;
         }
+        const shellChanged = !sameHeadlessProjection(this.latest, candidate);
+        const viewerChanged = !sameViewerProjection(this.latest, candidate);
         this.latest = candidate;
         this.latestError = null;
-        this.scheduleViewer();
-        this.scheduleShell();
+        this.advancePresentedFrame(candidate);
+        if (viewerChanged) this.scheduleViewer();
+        if (shellChanged) this.scheduleShell();
       } catch (reason) {
         this.publishError(
           reason instanceof Error
@@ -285,9 +398,26 @@ export class HeadlessStateSource {
     };
   }
 
+  private advancePresentedFrame(candidate: ComposerHeadlessState | null): void {
+    if (
+      candidate === null
+      || this.presentedViewer === null
+      || !candidate.runtime.complete
+      || !sameViewerProjection(this.presentedViewer, candidate)
+    ) return;
+    this.presentedFrame = {
+      ownerEpoch: candidate.runtime.projectionOwnerEpoch,
+      generation: candidate.runtime.projectionGeneration,
+    };
+  }
+
   private publishError(error: string | null): void {
     this.latestError = error;
-    if (error !== null) this.latest = null;
+    if (error !== null) {
+      this.latest = null;
+      this.presentedViewer = null;
+      this.presentedFrame = null;
+    }
     this.cancelPublications();
     this.publishImmediate(this.result());
   }

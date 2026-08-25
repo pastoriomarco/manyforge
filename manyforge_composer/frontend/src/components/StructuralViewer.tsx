@@ -101,6 +101,10 @@ interface StructuralViewerProps {
     ownerEpoch: string;
     generation: number;
   };
+  readViewerFrameIdentity?: () => {
+    ownerEpoch: string;
+    generation: number;
+  } | null;
   pointCloudCellId?: string;
   viewer?: ProgramViewerMetadata;
 }
@@ -882,9 +886,11 @@ function CandidateTcpGhost({
 
 function BoundSnapshotResponder({
   frameIdentity,
+  readFrameIdentity,
   applyLatestFrame,
 }: {
   frameIdentity: NonNullable<StructuralViewerProps['viewerFrameIdentity']>;
+  readFrameIdentity: NonNullable<StructuralViewerProps['readViewerFrameIdentity']>;
   applyLatestFrame: () => void;
 }) {
   const current = useRef(frameIdentity);
@@ -897,13 +903,13 @@ function BoundSnapshotResponder({
   ): Promise<{ ownerEpoch: string; generation: number } | null> => {
     const deadline = performance.now() + timeoutMs;
     while (performance.now() <= deadline) {
-      const observed = current.current;
+      const observed = readFrameIdentity() ?? current.current;
       if (observed.ownerEpoch !== required.ownerEpoch) return null;
       if (observed.generation >= required.generation) return observed;
       await new Promise((resolve) => setTimeout(resolve, 10));
     }
     return null;
-  }, []);
+  }, [readFrameIdentity]);
   return (
     <SnapshotResponder
       subscribe={subscribeSnapshotObserver}
@@ -1071,6 +1077,7 @@ function ViewerCanvas({
   runtimePresentation,
   sceneOwnerIdentity,
   viewerFrameIdentity,
+  readViewerFrameIdentity,
   pointCloudFrame,
   viewer,
   initialCameraPresentation,
@@ -1091,6 +1098,7 @@ function ViewerCanvas({
   runtimePresentation: RuntimeScenePresentation | undefined;
   sceneOwnerIdentity: StructuralViewerProps['sceneOwnerIdentity'];
   viewerFrameIdentity: StructuralViewerProps['viewerFrameIdentity'];
+  readViewerFrameIdentity: StructuralViewerProps['readViewerFrameIdentity'];
   pointCloudFrame: PointCloudFrame | null;
   viewer: ProgramViewerMetadata | undefined;
   initialCameraPresentation: RetainedCameraPresentation;
@@ -1122,6 +1130,10 @@ function ViewerCanvas({
   const applyLatestFrame = useCallback(() => {
     for (const apply of latestFrameAppliers) apply();
   }, [latestFrameAppliers]);
+  const readPresentedFrame = useCallback(
+    () => readViewerFrameIdentity?.() ?? viewerFrameIdentity ?? null,
+    [readViewerFrameIdentity, viewerFrameIdentity],
+  );
 
   useEffect(() => {
     setViewerQualificationCanvasMounted(true);
@@ -1274,6 +1286,7 @@ function ViewerCanvas({
       {viewerFrameIdentity !== undefined && (
         <BoundSnapshotResponder
           frameIdentity={viewerFrameIdentity}
+          readFrameIdentity={readPresentedFrame}
           applyLatestFrame={applyLatestFrame}
         />
       )}
@@ -1294,6 +1307,7 @@ function StructuralViewerContent({
   runtimePresentation,
   sceneOwnerIdentity,
   viewerFrameIdentity,
+  readViewerFrameIdentity,
   pointCloudCellId,
   viewer,
 }: StructuralViewerProps) {
@@ -1479,6 +1493,7 @@ function StructuralViewerContent({
               runtimePresentation={runtimePresentation}
               sceneOwnerIdentity={sceneOwnerIdentity}
               viewerFrameIdentity={viewerFrameIdentity}
+              readViewerFrameIdentity={readViewerFrameIdentity}
               pointCloudFrame={pointCloud.frame}
               viewer={viewer}
               initialCameraPresentation={cameraPresentation}

@@ -4,6 +4,7 @@ import { ApiError, api } from '../api/client';
 import { errorMessage } from '../state/structuralResource';
 import type {
   AppliedProgramSelection,
+  CurrentScenarioResponse,
   JsonValue,
   ProgramRunStatus,
   ProgramWorkspaceResponse,
@@ -28,6 +29,7 @@ function identity(prefix: string): string {
 interface ProgramRuntimeState {
   catalog: ScenarioCatalogResponse | null;
   applied: AppliedProgramSelection | null;
+  currentScenario: CurrentScenarioResponse | null;
   run: ProgramRunStatus | null;
   selectedScenarioId: string | null;
   runnerAvailable: boolean;
@@ -39,6 +41,7 @@ interface ProgramRuntimeState {
 const INITIAL_STATE: ProgramRuntimeState = {
   catalog: null,
   applied: null,
+  currentScenario: null,
   run: null,
   selectedScenarioId: null,
   runnerAvailable: false,
@@ -46,6 +49,35 @@ const INITIAL_STATE: ProgramRuntimeState = {
   pending: null,
   error: null,
 };
+
+function currentScenarioKey(value: CurrentScenarioResponse | null): string {
+  const scenario = value?.currentScenario ?? null;
+  return value === null
+    ? 'none'
+    : `${value.ready}:${value.unavailableReasons.join(',')}:${scenario === null
+      ? 'none'
+      : [
+        scenario.scenarioId,
+        scenario.scenarioCatalogRevision,
+        scenario.deploymentRevision,
+        scenario.retainedBundleId,
+        scenario.graphRevision,
+        scenario.programRevision,
+        scenario.programBindingId,
+      ].join(':')}`;
+}
+
+function appliedKey(value: AppliedProgramSelection | null): string {
+  return value === null
+    ? 'none'
+    : `${value.sourceOwnerEpoch}:${value.sourceGeneration}:${value.recordDigest}`;
+}
+
+function runKey(value: ProgramRunStatus | null): string {
+  return value === null
+    ? 'none'
+    : `${value.ownerEpoch}:${value.capture.programRunId}:${value.runRevision}`;
+}
 
 export function buildProgramStartRequest(
   applied: AppliedProgramSelection | null,
@@ -138,6 +170,7 @@ export function useProgramRuntime(
   const [state, setState] = useState<ProgramRuntimeState>(INITIAL_STATE);
   const mounted = useRef(true);
   const refreshing = useRef(false);
+  const catalogCache = useRef<ScenarioCatalogResponse | null>(null);
   const observedRunId = useRef<string | null>(null);
   const observedOwnerEpoch = useRef<string | null>(null);
   const callerEpoch = useRef(browserStableIdentity(
@@ -149,22 +182,38 @@ export function useProgramRuntime(
     if (!enabled || refreshing.current) return;
     refreshing.current = true;
     try {
-      const [catalogResult, appliedResult, indexResult] = await Promise.allSettled([
-        api.programs.scenarios(),
+      const [currentScenarioResult, appliedResult, indexResult] = await Promise.allSettled([
+        api.programs.currentScenario(),
         api.programs.applied(),
         api.programs.runs(true, 1),
       ]);
       if (!mounted.current) return;
 
       const errors: string[] = [];
-      const catalog = catalogResult.status === 'fulfilled'
-        ? catalogResult.value
+      const currentScenario = currentScenarioResult.status === 'fulfilled'
+        ? currentScenarioResult.value
         : null;
-      if (catalogResult.status === 'rejected') {
+      if (currentScenarioResult.status === 'rejected') {
         errors.push(errorMessage(
-          catalogResult.reason,
-          'Scenario catalog unavailable.',
+          currentScenarioResult.reason,
+          'Current Scenario projection unavailable.',
         ));
+      }
+
+      const observedCatalogRevision = currentScenario?.currentScenario
+        ?.scenarioCatalogRevision ?? null;
+      let catalog = catalogCache.current;
+      if (
+        catalog === null
+        || (observedCatalogRevision !== null
+          && catalog.scenarioCatalogRevision !== observedCatalogRevision)
+      ) {
+        try {
+          catalog = await api.programs.scenarios();
+          catalogCache.current = catalog;
+        } catch (reason) {
+          errors.push(errorMessage(reason, 'Scenario catalog unavailable.'));
+        }
       }
 
       let applied: AppliedProgramSelection | null = null;
@@ -214,9 +263,10 @@ export function useProgramRuntime(
 
       setState((current) => {
         const nextCatalog = catalog ?? current.catalog;
-        return {
+        const next = {
           ...current,
           catalog: nextCatalog,
+          currentScenario,
           applied,
           run,
           // Owner-issued Applied state is a projection, not operator intent.
@@ -230,6 +280,19 @@ export function useProgramRuntime(
           pending: null,
           error: errors.length > 0 ? [...new Set(errors)].join(' ') : null,
         };
+        return current.catalog?.scenarioCatalogRevision
+            === next.catalog?.scenarioCatalogRevision
+          && currentScenarioKey(current.currentScenario)
+            === currentScenarioKey(next.currentScenario)
+          && appliedKey(current.applied) === appliedKey(next.applied)
+          && runKey(current.run) === runKey(next.run)
+          && current.selectedScenarioId === next.selectedScenarioId
+          && current.runnerAvailable === next.runnerAvailable
+          && current.loading === next.loading
+          && current.pending === next.pending
+          && current.error === next.error
+          ? current
+          : next;
       });
     } finally {
       refreshing.current = false;
@@ -242,6 +305,7 @@ export function useProgramRuntime(
       setState(INITIAL_STATE);
       observedRunId.current = null;
       observedOwnerEpoch.current = null;
+      catalogCache.current = null;
       return () => {
         mounted.current = false;
       };

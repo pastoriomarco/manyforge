@@ -1,5 +1,5 @@
-import type { KeyboardEvent, Ref } from 'react';
-import { Handle, Position } from '@xyflow/react';
+import { useLayoutEffect, type KeyboardEvent, type Ref } from 'react';
+import { Handle, Position, useUpdateNodeInternals } from '@xyflow/react';
 import type {
   LayoutDirection,
   NodePresentationStatus,
@@ -63,12 +63,19 @@ export function BtNode({
   elementRef,
 }: BtNodeProps) {
   const connections = btNodeConnectionAvailability(node);
+  const updateNodeInternals = useUpdateNodeInternals();
   const targetConnectable = node.isRoot === true ? false : true;
   const glyph = node.kind === 'composite'
     ? '◆'
     : node.kind === 'decorator'
       ? '◇'
       : '•';
+  useLayoutEffect(() => {
+    const frame = window.requestAnimationFrame(() => {
+      updateNodeInternals(node.id);
+    });
+    return () => window.cancelAnimationFrame(frame);
+  }, [node.childrenMax, node.id, node.layoutDirection, updateNodeInternals]);
   return (
     <div
       ref={elementRef}
@@ -102,7 +109,7 @@ export function BtNode({
     >
       <Handle
         type="target"
-        position={node.layoutDirection === 'vertical' ? Position.Top : Position.Left}
+        position={node.layoutDirection === 'vertical' ? Position.Left : Position.Top}
         isConnectable={targetConnectable}
         className={`bt-node-react-flow-handle${targetConnectable ? '' : ' disabled'}`}
         aria-label={`Connect ${node.label} as child`}
@@ -116,7 +123,7 @@ export function BtNode({
       {node.childrenMax !== 0 && (
         <Handle
           type="source"
-          position={node.layoutDirection === 'vertical' ? Position.Bottom : Position.Right}
+          position={node.layoutDirection === 'vertical' ? Position.Right : Position.Bottom}
           isConnectable={connections.sourceConnectable}
           className={`bt-node-react-flow-handle${connections.sourceConnectable ? '' : ' disabled'}`}
           aria-label={`Connect ${node.label} as parent`}

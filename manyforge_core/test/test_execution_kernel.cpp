@@ -12,6 +12,7 @@
 #include <manyforge_core/cache/trajectory_cache_intent.hpp>
 #include <manyforge_core/execution_interrupt_support.hpp>
 #include <manyforge_core/execution_kernel.hpp>
+#include <manyforge_core/execution_stop_support.hpp>
 #include <manyforge_core/logical_scene_identity.hpp>
 #include <manyforge_core/testing/addressed_request_fixtures.hpp>
 #include <manyforge_core/time/fake_clock.hpp>
@@ -1739,9 +1740,13 @@ class ThreadSafeManualScheduler final : public IScheduler {
  public:
   ScheduleHandle schedule(TimePoint deadline, std::function<void()> callback,
                           SchedulerPriority /*priority*/ = SchedulerPriority::Lifecycle) override {
-    std::lock_guard<std::mutex> lock(mu_);
-    ScheduleHandle handle = next_handle_++;
-    pending_.emplace(deadline, std::make_pair(handle, std::move(callback)));
+    ScheduleHandle handle = 0;
+    {
+      std::lock_guard<std::mutex> lock(mu_);
+      handle = next_handle_++;
+      pending_.emplace(deadline, std::make_pair(handle, std::move(callback)));
+    }
+    pending_changed_.notify_all();
     return handle;
   }
 
@@ -1779,8 +1784,15 @@ class ThreadSafeManualScheduler final : public IScheduler {
     return pending_.size();
   }
 
+  bool wait_for_pending_deadline(TimePoint deadline,
+                                 std::chrono::milliseconds timeout = std::chrono::seconds(2)) {
+    std::unique_lock<std::mutex> lock(mu_);
+    return pending_changed_.wait_for(lock, timeout, [&]() { return pending_.contains(deadline); });
+  }
+
  private:
   mutable std::mutex mu_;
+  std::condition_variable pending_changed_;
   std::multimap<TimePoint, std::pair<ScheduleHandle, std::function<void()>>> pending_;
   uint64_t next_handle_ = 1;
 };
@@ -7836,12 +7848,11 @@ TEST_F(ExecutionKernelTest, Stop_OperatorConfirmedStopWaitsForMeasuredSettleLag)
   EXPECT_TRUE(stop_dto.accepted);
   ASSERT_TRUE(controlled_execution.wait_until_controlled_stop_count(1));
 
-  std::thread settle_thread([&controlled_execution]() {
-    std::this_thread::sleep_for(std::chrono::milliseconds(30));
-    controlled_execution.set_snapshot_velocities({0.0, 0.0});
-  });
+  ASSERT_TRUE(local_scheduler.wait_for_pending_deadline(kExecutionPollNs));
+  controlled_execution.set_snapshot_velocities({0.0, 0.0});
+  local_clock.advance(kExecutionPollNs);
+  local_scheduler.advance_to(local_clock.now());
   const bool reached_stopped = wait_for_state(local_kernel, ExecutionState::kStopped);
-  settle_thread.join();
   ASSERT_TRUE(reached_stopped);
 
   EXPECT_EQ(controlled_execution.stop_attempt_count_value(), 0)
@@ -7923,6 +7934,10 @@ TEST_F(ExecutionKernelTest, Stop_OperatorConfirmedButMeasuredNotAtRestRequiresIn
   auto stop_dto = local_kernel.stop();
   EXPECT_TRUE(stop_dto.accepted);
   ASSERT_TRUE(controlled_execution.wait_until_controlled_stop_count(1));
+  ASSERT_TRUE(local_scheduler.wait_for_pending_deadline(kExecutionPollNs));
+  local_clock.advance(
+      effective_controlled_stop_deadline_ns(op_profile, config.complete_move_on_signal_timeout_ns));
+  local_scheduler.advance_to(local_clock.now());
   ASSERT_TRUE(wait_for_state(local_kernel, ExecutionState::kInterventionRequired));
 
   EXPECT_EQ(controlled_execution.stop_attempt_count_value(), 0)
@@ -12615,8 +12630,8 @@ TEST_F(ExecutionKernelTest,
   controlled_execution.next_post_stop_joint_velocities_rad_s =
       std::vector<double>{0.5, 0.0};  // 0.5 rad/s >> settle threshold
 
-  FakeClock local_clock;
-  ManualScheduler local_scheduler;
+  ThreadSafeFakeClock local_clock;
+  ThreadSafeManualScheduler local_scheduler;
   TrajectoryCache local_cache{CacheConfig{10}};
   MockCollisionWorldPublisher local_publisher;
   auto local_engine = std::make_shared<MockCollisionEngine>();
@@ -12639,6 +12654,10 @@ TEST_F(ExecutionKernelTest,
   ASSERT_TRUE(wait_for_state(local_kernel, ExecutionState::kExecuting));
   auto trip = make_probe_sample("probe", 2, local_clock.now(), true);
   ASSERT_TRUE(local_kernel.publish_fast_interrupt_signal(trip).latched);
+  ASSERT_TRUE(local_scheduler.wait_for_pending_deadline(kExecutionPollNs));
+  local_clock.advance(effective_controlled_stop_deadline_ns(
+      *scope.stop_profile, ExecutionKernelConfig{}.complete_move_on_signal_timeout_ns));
+  local_scheduler.advance_to(local_clock.now());
   ASSERT_TRUE(local_kernel.wait_for_completion(2'000'000'000));
   EXPECT_EQ(local_kernel.get_status().state, ExecutionState::kInterventionRequired);
 

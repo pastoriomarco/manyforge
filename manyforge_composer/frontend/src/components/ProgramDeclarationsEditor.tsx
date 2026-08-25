@@ -4,15 +4,21 @@ import type {
   BlackboardFieldDeclaration,
   BlackboardKeyDeclaration,
   BlackboardNamespaceDeclaration,
+  CatalogEntry,
   JsonValue,
   ProgramParameterDeclaration,
   ProgramTreeNode,
 } from '../types/api';
 import {
+  collectProgramBindingCandidates,
   collectBlackboardUsages,
   collectProgramParameterUsages,
+  flattenProgramTree,
+  resolveProgramParameterLiteralValue,
 } from '../utils/programAuthoring';
+import { firstCatalogParameterValidationMessage } from '../utils/catalogParameterValidation';
 import type { ProgramDeclarationSelection } from './ProgramDeclarationsNavigator';
+import { buildProgramParameterMutation } from './ProgramPropertyEditor';
 
 const PROGRAM_TYPES = [
   'bool',
@@ -36,8 +42,10 @@ interface ProgramDeclarationsEditorProps {
   parameters: ProgramParameterDeclaration[];
   namespaces: BlackboardNamespaceDeclaration[];
   keys: BlackboardKeyDeclaration[];
+  catalogEntries?: CatalogEntry[];
   busy: boolean;
   onMutate: (mutation: string, args: Record<string, JsonValue>) => void;
+  onSelectNode?: (instanceId: string) => void;
 }
 
 function parseJson(text: string, label: string): JsonValue {
@@ -58,8 +66,10 @@ export function ProgramDeclarationsEditor({
   parameters,
   namespaces,
   keys,
+  catalogEntries = [],
   busy,
   onMutate,
+  onSelectNode,
 }: ProgramDeclarationsEditorProps) {
   const parameterUsages = useMemo(() => collectProgramParameterUsages(root), [root]);
   const blackboardUsages = useMemo(() => collectBlackboardUsages(root), [root]);
@@ -78,6 +88,26 @@ export function ProgramDeclarationsEditor({
   const [fieldsText, setFieldsText] = useState('[]');
   const [keyDescription, setKeyDescription] = useState('');
   const [error, setError] = useState<string | null>(null);
+  const flat = useMemo(() => flattenProgramTree(root), [root]);
+  const catalog = useMemo(
+    () => new Map(catalogEntries.map((entry) => [entry.id, entry])),
+    [catalogEntries],
+  );
+  const selectedParameter = selection?.kind === 'parameter'
+    ? parameters.find((row) => row.parameter_id === selection.id) ?? null
+    : null;
+  const selectedNamespace = selection?.kind === 'namespace'
+    ? namespaces.find((row) => row.namespace_id === selection.id) ?? null
+    : null;
+  const selectedKey = selection?.kind === 'key'
+    ? keys.find((row) => row.key === selection.id) ?? null
+    : null;
+  const bindingCandidates = useMemo(
+    () => selectedParameter
+      ? collectProgramBindingCandidates(root, catalogEntries, selectedParameter)
+      : [],
+    [catalogEntries, root, selectedParameter],
+  );
 
   const editParameter = (parameter: ProgramParameterDeclaration) => {
     setParameterId(parameter.parameter_id);
@@ -151,16 +181,38 @@ export function ProgramDeclarationsEditor({
     if (selection?.kind === 'parameter') {
       const parameter = parameters.find((row) => row.parameter_id === selection.id);
       if (parameter) editParameter(parameter);
+      else {
+        setParameterId('');
+        setParameterType('float64');
+        setDefaultText('0');
+        setConstraintsText('{}');
+        setMutability('before_run');
+        setParameterDescription('');
+        setError(null);
+      }
     } else if (selection?.kind === 'namespace') {
       const namespace = namespaces.find((row) => row.namespace_id === selection.id);
       if (namespace) {
         setNamespaceId(namespace.namespace_id);
         setNamespaceDescription(namespace.description ?? '');
         setError(null);
+      } else {
+        setNamespaceId('');
+        setNamespaceDescription('');
+        setError(null);
       }
     } else if (selection?.kind === 'key') {
       const key = keys.find((row) => row.key === selection.id);
       if (key) editKey(key);
+      else {
+        setKeyName('');
+        setKeyType('bool');
+        setKeyAccess('read_write');
+        setKeyPersistence('run');
+        setFieldsText('[]');
+        setKeyDescription('');
+        setError(null);
+      }
     }
   }, [keys, namespaces, parameters, selection]);
 
@@ -196,6 +248,52 @@ export function ProgramDeclarationsEditor({
     }
   };
 
+  const bindParameter = (nodeId: string, fieldName: string) => {
+    if (!selectedParameter) return;
+    const node = flat.find((row) => row.node.instance_id === nodeId)?.node;
+    if (!node) return;
+    const request = buildProgramParameterMutation(node, fieldName, {
+      kind: 'source',
+      source: {
+        kind: 'program_parameter',
+        reference: selectedParameter.parameter_id,
+      },
+    });
+    onMutate(request.mutation, request.args);
+    onSelectNode?.(nodeId);
+  };
+
+  const unbindUsage = (nodeId: string, fieldName: string) => {
+    const node = flat.find((row) => row.node.instance_id === nodeId)?.node;
+    const entry = node ? catalog.get(node.node_id) : undefined;
+    const field = entry?.parameters.find((parameter) => parameter.id === fieldName);
+    if (!node || !field) {
+      setError('That declaration usage is not present in the current catalog revision.');
+      return;
+    }
+    const fallback = resolveProgramParameterLiteralValue(
+      node.value_sources?.[fieldName],
+      node.parameters[fieldName],
+      field.hasDefault ? field.default as JsonValue : undefined,
+      parameters,
+    );
+    const validation = fallback === undefined
+      ? field.required ? `${fieldName}: a required field has no valid literal fallback.` : null
+      : firstCatalogParameterValidationMessage(field, fallback);
+    if (validation) {
+      setError(validation);
+      return;
+    }
+    const request = buildProgramParameterMutation(
+      node,
+      fieldName,
+      fallback === undefined ? { kind: 'clear' } : { kind: 'literal', value: fallback },
+    );
+    onMutate(request.mutation, request.args);
+    onSelectNode?.(nodeId);
+    setError(null);
+  };
+
   return (
     <section
       className="program-declarations"
@@ -210,8 +308,14 @@ export function ProgramDeclarationsEditor({
           </div>
         </header>
       )}
-      <div className="program-declaration-columns">
-        <section>
+      {!showNavigation && selection === null && (
+        <div className="program-empty-guidance">
+          <strong>Select a declaration</strong>
+          <span>Choose an existing source or New in the Params navigator.</span>
+        </div>
+      )}
+      <div className={`program-declaration-columns${showNavigation ? '' : ' contextual'}`}>
+        {(showNavigation || selection?.kind === 'parameter') && <section>
           <h4>Program parameters</h4>
           {showNavigation && <ul className="program-declaration-list">
             {parameters.map((parameter) => {
@@ -248,11 +352,56 @@ export function ProgramDeclarationsEditor({
             <label>Constraints (strict JSON)<textarea rows={3} value={constraintsText} onChange={(event) => setConstraintsText(event.target.value)} spellCheck={false} /></label>
             <label>Description<input value={parameterDescription} onChange={(event) => setParameterDescription(event.target.value)} /></label>
             <button type="button" disabled={busy} onClick={saveParameter}>Add or replace parameter</button>
+            {!showNavigation && selectedParameter && (
+              <button
+                type="button"
+                className="danger-button"
+                disabled={busy || (parameterUsages[selectedParameter.parameter_id] ?? []).length > 0}
+                onClick={() => onMutate('program_draft_remove_parameters', {
+                  parameter_ids: [selectedParameter.parameter_id],
+                })}
+              >
+                Remove parameter
+              </button>
+            )}
           </div>
-        </section>
+          {!showNavigation && selectedParameter && (
+            <div className="program-declaration-usage">
+              <h4>Bindings</h4>
+              {(parameterUsages[selectedParameter.parameter_id] ?? []).length === 0
+                ? <p>This parameter is not used by a tree node.</p>
+                : (parameterUsages[selectedParameter.parameter_id] ?? []).map((usage) => (
+                  <div key={`${usage.nodeId}:${usage.fieldName}`}>
+                    <button type="button" onClick={() => onSelectNode?.(usage.nodeId)}>
+                      {usage.nodeLabel}.{usage.fieldName}
+                    </button>
+                    <button type="button" disabled={busy} onClick={() => unbindUsage(usage.nodeId, usage.fieldName)}>
+                      Use literal
+                    </button>
+                  </div>
+                ))}
+              {bindingCandidates.length > 0 && (
+                <>
+                  <h4>Compatible fields</h4>
+                  {bindingCandidates.map((candidate) => (
+                    <div key={`${candidate.nodeId}:${candidate.fieldName}`}>
+                      <button type="button" onClick={() => onSelectNode?.(candidate.nodeId)}>
+                        {candidate.nodeLabel}.{candidate.fieldName}
+                      </button>
+                      <button type="button" disabled={busy} onClick={() => bindParameter(candidate.nodeId, candidate.fieldName)}>
+                        Bind
+                      </button>
+                    </div>
+                  ))}
+                </>
+              )}
+            </div>
+          )}
+        </section>}
 
-        <section>
-          <h4>Blackboard namespaces</h4>
+        {(showNavigation || selection?.kind === 'namespace' || selection?.kind === 'key') && <section>
+          {(showNavigation || selection?.kind === 'namespace') && <>
+          <h4>Blackboard namespace</h4>
           {showNavigation && <ul className="program-declaration-list compact">
             {namespaces.map((namespace) => {
               const childKeys = keys.filter((key) => key.key.startsWith(`${namespace.namespace_id}.`));
@@ -279,8 +428,27 @@ export function ProgramDeclarationsEditor({
             <label>Namespace ID<input value={namespaceId} onChange={(event) => setNamespaceId(event.target.value)} /></label>
             <label>Description<input value={namespaceDescription} onChange={(event) => setNamespaceDescription(event.target.value)} /></label>
             <button type="button" disabled={busy} onClick={saveNamespace}>Add or replace namespace</button>
+            {!showNavigation && selectedNamespace && (
+              <button
+                type="button"
+                className="danger-button"
+                disabled={busy || keys.some((key) => key.key.startsWith(`${selectedNamespace.namespace_id}.`))}
+                onClick={() => onMutate('blackboard_draft_remove_namespaces', {
+                  namespace_ids: [selectedNamespace.namespace_id],
+                })}
+              >
+                Remove namespace
+              </button>
+            )}
           </div>
+          {!showNavigation && selectedNamespace && (
+            <p className="program-policy-help">
+              {keys.filter((key) => key.key.startsWith(`${selectedNamespace.namespace_id}.`)).length} declared key(s) use this namespace.
+            </p>
+          )}
+          </>}
 
+          {(showNavigation || selection?.kind === 'key') && <>
           <h4>Blackboard keys</h4>
           {showNavigation && <ul className="program-declaration-list">
             {keys.map((key) => {
@@ -315,8 +483,38 @@ export function ProgramDeclarationsEditor({
             <label>Fields (strict JSON array)<textarea rows={3} value={fieldsText} onChange={(event) => setFieldsText(event.target.value)} spellCheck={false} /></label>
             <label>Description<input value={keyDescription} onChange={(event) => setKeyDescription(event.target.value)} /></label>
             <button type="button" disabled={busy} onClick={saveKey}>Add or replace key</button>
+            {!showNavigation && selectedKey && (
+              <button
+                type="button"
+                className="danger-button"
+                disabled={busy || (blackboardUsages[selectedKey.key] ?? []).length > 0}
+                onClick={() => onMutate('blackboard_draft_remove_keys', {
+                  keys: [selectedKey.key],
+                })}
+              >
+                Remove key
+              </button>
+            )}
           </div>
-        </section>
+          {!showNavigation && selectedKey && (
+            <div className="program-declaration-usage">
+              <h4>Bindings</h4>
+              {(blackboardUsages[selectedKey.key] ?? []).length === 0
+                ? <p>This key is not used by a tree node.</p>
+                : (blackboardUsages[selectedKey.key] ?? []).map((usage) => (
+                  <div key={`${usage.nodeId}:${usage.fieldName}:${usage.field ?? ''}`}>
+                    <button type="button" onClick={() => onSelectNode?.(usage.nodeId)}>
+                      {usage.nodeLabel}.{usage.fieldName}
+                    </button>
+                    <button type="button" disabled={busy} onClick={() => unbindUsage(usage.nodeId, usage.fieldName)}>
+                      Use literal
+                    </button>
+                  </div>
+                ))}
+            </div>
+          )}
+          </>}
+        </section>}
       </div>
       {error && <p className="program-form-error declaration-error" role="alert">{error}</p>}
     </section>

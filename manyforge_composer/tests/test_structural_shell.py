@@ -136,14 +136,9 @@ def test_program_workspace_is_available_while_effectful_actions_need_headless() 
         json={
             "draftId": state.draft_session.draft_id,
             "expectedDraftRevision": state.draft_session.revision,
-            "clientId": "test-browser",
-            "snapshotReceiverEpoch": "composer-snapshot.test",
-            "snapshotSequence": 1,
             "expectedAdmissionGeneration": 1,
             "requestOwnerEpoch": "test-browser.epoch.1",
             "requestId": "test-browser.request.1",
-            "scenarioId": "cell-pick",
-            "scenarioCatalogRevision": "sha256:" + "a" * 64,
         },
     )
     assert unavailable_apply.status_code == 503

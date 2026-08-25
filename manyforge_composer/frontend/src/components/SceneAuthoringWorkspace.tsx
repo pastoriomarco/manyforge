@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from 'react';
+import { memo, useEffect, useLayoutEffect, useMemo, useState } from 'react';
 import { createPortal } from 'react-dom';
 
 import { api } from '../api/client';
@@ -555,7 +555,7 @@ function SourceOccurrencePanel({
   );
 }
 
-function SceneViewerBridge({
+const SceneViewerBridge = memo(function SceneViewerBridge({
   active,
   source,
   sourceValue,
@@ -618,6 +618,9 @@ function SceneViewerBridge({
     sourceValue,
     manifest.status === 'ready' ? manifest.data : null,
   );
+  useLayoutEffect(() => {
+    source.markViewerPresented(headlessState.snapshot);
+  }, [headlessState.snapshot, source]);
   return (
     <StructuralViewer
       viewerActive={active}
@@ -639,11 +642,12 @@ function SceneViewerBridge({
         ownerEpoch: headlessState.snapshot.runtime.projectionOwnerEpoch,
         generation: headlessState.snapshot.runtime.projectionGeneration,
       } : undefined}
+      readViewerFrameIdentity={source.getPresentedRuntimeFrame}
       pointCloudCellId={facts?.logicalScene.snapshot?.cell_id}
       viewer={viewer}
     />
   );
-}
+});
 
 export function SceneAuthoringWorkspace({
   editorTarget,

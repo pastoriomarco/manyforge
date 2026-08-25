@@ -56,6 +56,7 @@ SUPPORTED_DRAFT_MUTATIONS = (
     "tree_draft_wrap_node",
 )
 OPERATOR_DRAFT_MUTATIONS = (
+    "program_draft_update_settings",
     "program_draft_update_node_policies",
     "viewer_draft_replace",
 )
@@ -1429,6 +1430,7 @@ class ComposerDraftSession:
             "tree_draft_wrap_node": self._tree_wrap,
             "program_draft_upsert_parameters": self._parameters_upsert,
             "program_draft_remove_parameters": self._parameters_remove,
+            "program_draft_update_settings": self._program_settings_update,
             _NODE_POLICY_MUTATION: self._node_policies_update,
             "blackboard_draft_upsert_namespaces": self._namespaces_upsert,
             "blackboard_draft_remove_namespaces": self._namespaces_remove,
@@ -1444,6 +1446,44 @@ class ComposerDraftSession:
             )
         details = handler(document, arguments, catalog)
         return tool_id, details
+
+    @staticmethod
+    def _program_settings_update(
+        document: dict[str, Any],
+        arguments: dict[str, Any],
+        _catalog: NodeCatalog,
+    ) -> dict[str, Any]:
+        required = {"name", "description", "program_profile", "compatibility"}
+        if set(arguments) != required:
+            _error(
+                "draft_arguments_invalid",
+                "program_draft_update_settings requires exactly name, description, "
+                "program_profile, and compatibility",
+            )
+        name = arguments["name"]
+        description = arguments["description"]
+        program_profile = arguments["program_profile"]
+        compatibility = arguments["compatibility"]
+        if type(name) is not str or not name.strip():
+            _error("draft_arguments_invalid", "Program name must be non-empty text")
+        if type(description) is not str:
+            _error("draft_arguments_invalid", "Program description must be text")
+        if type(program_profile) is not str:
+            _error("draft_arguments_invalid", "Program profile must be text")
+        if type(compatibility) is not dict:
+            _error("draft_arguments_invalid", "Program compatibility must be an object")
+
+        document["name"] = name.strip()
+        document["program_profile"] = program_profile
+        if description.strip():
+            document["description"] = description.strip()
+        else:
+            document.pop("description", None)
+        if compatibility:
+            document["compatibility"] = deepcopy(compatibility)
+        else:
+            document.pop("compatibility", None)
+        return {"updated": True}
 
     @staticmethod
     def _node_policies_update(

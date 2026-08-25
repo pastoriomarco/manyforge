@@ -278,6 +278,7 @@ def headless_client() -> (
     # source-model route must consume only the coherent context above.
     source_model["source"]["selection_projection_generation"] = 5
     applied_program: dict[str, Any] | None = None
+    scenario_cas_apply_counts: dict[str, int] = {}
 
     def handler(request: httpx.Request) -> httpx.Response:
         nonlocal applied_program
@@ -363,11 +364,43 @@ def headless_client() -> (
         elif path == "/api/runtime":
             payload = _runtime()
         elif path == "/api/manager/status":
-            payload = {"schema_version": "manyforge.manager_status_projection.v1"}
+            payload = {
+                "schema_version": "manyforge.manager_status_projection.v1",
+                "source": {
+                    "available": True,
+                    "freshness": "fresh",
+                    "known_gaps": [],
+                    "source_owner_epoch": "manager.epoch.1",
+                },
+                "status": {
+                    "manager_ready": True,
+                    "active": {
+                        "retained_bundle_id": (
+                            applied_program["retained_bundle_id"]
+                            if applied_program is not None
+                            else "sha256:" + "4" * 64
+                        ),
+                        "graph_revision": (
+                            applied_program["graph_revision"]
+                            if applied_program is not None
+                            else "sha256:" + "5" * 64
+                        ),
+                    },
+                    "runtime": {"converged": True},
+                },
+            }
         elif path == "/api/manager/graph":
             payload = {"schema_version": "manyforge.manager_graph_projection.v1"}
         elif path == "/api/manager/diff":
-            payload = {"schema_version": "manyforge.manager_diff_projection.v1"}
+            payload = {
+                "schema_version": "manyforge.manager_diff_projection.v1",
+                "source": {
+                    "available": True,
+                    "freshness": "fresh",
+                    "known_gaps": [],
+                },
+                "converged": True,
+            }
         elif path == "/api/node-environment":
             payload = node_environment
         elif path == "/api/source-model":
@@ -409,11 +442,49 @@ def headless_client() -> (
                     request=request,
                 )
             payload = applied_program
+        elif path.startswith("/api/scenarios/") and path.endswith(
+            "/program-selection"
+        ):
+            scenario_id = path.split("/")[-2]
+            if applied_program is None or applied_program["scenario_id"] != scenario_id:
+                return httpx.Response(404, json={"detail": "unknown"}, request=request)
+            payload = {
+                "assistant_mode": applied_program["assistant_mode"],
+                "assistant_projection": None,
+                "deployment_artifact_id": applied_program[
+                    "deployment_artifact_id"
+                ],
+                "deployment_revision": applied_program["deployment_revision"],
+                "graph_revision": applied_program["graph_revision"],
+                "node_environment_digest": applied_program[
+                    "node_environment_digest"
+                ],
+                "owner_identities": [],
+                "program": applied_program["program"],
+                "program_binding": applied_program["program_binding"],
+                "program_binding_id": applied_program["program_binding_id"],
+                "program_id": applied_program["program_id"],
+                "program_revision": applied_program["program_revision"],
+                "retained_bundle_id": applied_program["retained_bundle_id"],
+                "scenario_catalog_revision": applied_program[
+                    "scenario_catalog_revision"
+                ],
+                "scenario_id": scenario_id,
+                "schema_version": "manyforge.scenario_program_selection.v2",
+                "typed_parameter_overrides": applied_program[
+                    "typed_parameter_overrides"
+                ],
+            }
         elif path == "/api/program/apply":
             assert isinstance(body, dict)
-            if body["scenario_id"] == "pending-scenario" or (
+            cas_attempt = scenario_cas_apply_counts.get(body["scenario_id"], 0)
+            if (
+                body["scenario_id"] == "pending-scenario"
+                and body["expected_applied_record_digest"] is not None
+            ) or (
                 body["scenario_id"] == "revert-pending"
                 and body["expected_applied_record_digest"] is not None
+                and cas_attempt >= 1
             ):
                 return httpx.Response(
                     409,
@@ -428,6 +499,7 @@ def headless_client() -> (
             if (
                 body["scenario_id"] in {"rejected-scenario", "revert-rejected"}
                 and body["expected_applied_record_digest"] is not None
+                and cas_attempt >= 1
             ):
                 return httpx.Response(
                     409,
@@ -442,6 +514,7 @@ def headless_client() -> (
             if (
                 body["scenario_id"] in {"malformed-scenario", "revert-malformed"}
                 and body["expected_applied_record_digest"] is not None
+                and cas_attempt >= 1
             ):
                 malformed_program = body["program"]
                 malformed_binding = _binding_for_program(malformed_program)
@@ -539,9 +612,12 @@ def headless_client() -> (
                 if (
                     body["scenario_id"] == "revert-raced"
                     and body["expected_applied_record_digest"] is not None
+                    and cas_attempt >= 1
                 )
                 else committed_program
             )
+            if body["expected_applied_record_digest"] is not None:
+                scenario_cas_apply_counts[body["scenario_id"]] = cas_attempt + 1
             payload = {
                 "schema_version": "manyforge.program_apply_result.v2",
                 "status": "applied",
@@ -677,7 +753,7 @@ def headless_client() -> (
 
 
 class _ComposerTestClient(TestClient):
-    """Establish the same complete per-client barrier required of a browser."""
+    """Add the backend-owned admission and durable request fence."""
 
     def __init__(
         self, state: ComposerState, *args, security: SecurityConfig | None = None, **kwargs
@@ -695,18 +771,8 @@ class _ComposerTestClient(TestClient):
             and "expectedDraftRevision" in json
         ):
             self._authoring_sequence += 1
-            admission.publish_complete_snapshot(
-                client_id="test-browser",
-                sequence=self._authoring_sequence,
-                admission_generation=7,
-                draft_id=json["draftId"],
-                draft_revision=json["expectedDraftRevision"],
-            )
             json = {
                 **json,
-                "clientId": "test-browser",
-                "snapshotReceiverEpoch": admission.receiver_epoch,
-                "snapshotSequence": self._authoring_sequence,
                 "expectedAdmissionGeneration": 7,
                 "requestOwnerEpoch": "test-browser.epoch.1",
                 "requestId": f"test-browser.request.{self._authoring_sequence}",
@@ -735,6 +801,25 @@ def _composer_with_program(client: HeadlessHttpClient) -> TestClient:
         security=SecurityConfig(
             allowed_fs_roots=[str(_ROOT / "examples")],
         ),
+    )
+
+
+def _seed_applied_program(
+    client: HeadlessHttpClient,
+    program: dict[str, Any],
+    *,
+    scenario_id: str = "cell-pick",
+) -> dict[str, Any]:
+    """Establish owner truth before exercising Composer's Program-only Apply."""
+
+    return client.program_apply(
+        {
+            "scenario_id": scenario_id,
+            "scenario_catalog_revision": "sha256:" + "7" * 64,
+            "program": program,
+            "expected_applied_record_digest": None,
+            "authoring_claim": {},
+        }
     )
 
 
@@ -1506,31 +1591,49 @@ def test_composer_program_apply_advances_only_headless_applied_identity(
     client, requests, _node_environment = headless_client
     with _composer_with_program(client) as composer:
         before = composer.get("/api/program/workspace").json()
-        response = composer.post(
-            "/api/program/apply",
+        _seed_applied_program(client, before["draft"]["program"])
+        before = composer.get("/api/program/workspace").json()
+        dirty = composer.post(
+            "/api/program/draft/mutations",
             json={
                 "draftId": before["draft"]["draftId"],
                 "expectedDraftRevision": before["draft"]["draftRevision"],
-                "scenarioId": "cell-pick",
-                "scenarioCatalogRevision": "sha256:" + "7" * 64,
+                "mutation": "tree_draft_update_node_params",
+                "arguments": {
+                    "instance_id": "move_to_pick",
+                    "expected_node_id": "motion.move_to_joint_target",
+                    "parameters": {"planning_timeout_s": 3.0},
+                },
+            },
+        ).json()["workspace"]
+        request_offset = len(requests)
+        response = composer.post(
+            "/api/program/apply",
+            json={
+                "draftId": dirty["draft"]["draftId"],
+                "expectedDraftRevision": dirty["draft"]["draftRevision"],
             },
         )
 
     assert response.status_code == 200, response.text
     workspace = response.json()["workspace"]
-    assert workspace["draft"] == before["draft"]
-    assert workspace["saved"] == before["saved"]
+    assert workspace["draft"] == dirty["draft"]
+    assert workspace["saved"] == dirty["saved"]
     assert workspace["applied"]["available"] is True
     assert workspace["applied"]["matchesDraft"] is True
     assert workspace["hasUnappliedChanges"] is False
     forwarded = [
-        request for request in requests if request["path"] == "/api/program/apply"
+        request for request in requests[request_offset:]
+        if request["path"] == "/api/program/apply"
     ]
     assert len(forwarded) == 1
     assert forwarded[0]["body"]["program"]["program_revision"] == (
-        before["draft"]["programRevision"]
+        dirty["draft"]["programRevision"]
     )
-    assert forwarded[0]["body"]["expected_applied_record_digest"] is None
+    assert forwarded[0]["body"]["scenario_id"] == "cell-pick"
+    assert forwarded[0]["body"]["expected_applied_record_digest"] == (
+        "sha256:" + "6" * 64
+    )
 
 
 def test_new_program_rotates_fenced_draft_without_disk_or_headless_mutation(
@@ -1643,15 +1746,8 @@ def test_program_discard_reads_owner_truth_without_runtime_mutation(
     client, requests, _node_environment = headless_client
     with _composer_with_program(client) as composer:
         initial = composer.get("/api/program/workspace").json()
-        applied = composer.post(
-            "/api/program/apply",
-            json={
-                "draftId": initial["draft"]["draftId"],
-                "expectedDraftRevision": initial["draft"]["draftRevision"],
-                "scenarioId": "cell-pick",
-                "scenarioCatalogRevision": "sha256:" + "7" * 64,
-            },
-        ).json()["workspace"]
+        _seed_applied_program(client, initial["draft"]["program"])
+        applied = composer.get("/api/program/workspace").json()
         dirty = composer.post(
             "/api/program/draft/mutations",
             json={
@@ -1781,6 +1877,12 @@ def test_program_revert_failure_preserves_draft_saved_and_active_run(
     disk_before = _PROGRAM_PATH.read_bytes()
     with _composer_with_program(client) as composer:
         before = composer.get("/api/program/workspace").json()
+        _seed_applied_program(
+            client,
+            before["draft"]["program"],
+            scenario_id=scenario_id,
+        )
+        before = composer.get("/api/program/workspace").json()
         dirty = composer.post(
             "/api/program/draft/mutations",
             json={
@@ -1799,8 +1901,6 @@ def test_program_revert_failure_preserves_draft_saved_and_active_run(
             json={
                 "draftId": dirty["draft"]["draftId"],
                 "expectedDraftRevision": dirty["draft"]["draftRevision"],
-                "scenarioId": scenario_id,
-                "scenarioCatalogRevision": "sha256:" + "7" * 64,
             },
         ).json()["workspace"]
         assert dirty["applied"]["programRevision"] != dirty["saved"][
@@ -1873,6 +1973,8 @@ def test_program_revert_rejects_malformed_binding_without_effect_or_apply(
     client, requests, _node_environment = headless_client
     with _composer_with_program(client) as composer:
         saved = composer.get("/api/program/workspace").json()
+        _seed_applied_program(client, saved["draft"]["program"])
+        saved = composer.get("/api/program/workspace").json()
         dirty = composer.post(
             "/api/program/draft/mutations",
             json={
@@ -1891,8 +1993,6 @@ def test_program_revert_rejects_malformed_binding_without_effect_or_apply(
             json={
                 "draftId": dirty["draft"]["draftId"],
                 "expectedDraftRevision": dirty["draft"]["draftRevision"],
-                "scenarioId": "cell-pick",
-                "scenarioCatalogRevision": "sha256:" + "7" * 64,
             },
         ).json()
         before = applied_response["workspace"]
@@ -1943,6 +2043,8 @@ def test_program_revert_applies_exact_saved_content_and_preserves_run_capture(
     client, requests, _node_environment = headless_client
     with _composer_with_program(client) as composer:
         saved = composer.get("/api/program/workspace").json()
+        _seed_applied_program(client, saved["draft"]["program"])
+        saved = composer.get("/api/program/workspace").json()
         dirty = composer.post(
             "/api/program/draft/mutations",
             json={
@@ -1961,8 +2063,6 @@ def test_program_revert_applies_exact_saved_content_and_preserves_run_capture(
             json={
                 "draftId": dirty["draft"]["draftId"],
                 "expectedDraftRevision": dirty["draft"]["draftRevision"],
-                "scenarioId": "cell-pick",
-                "scenarioCatalogRevision": "sha256:" + "7" * 64,
             },
         ).json()["workspace"]
         assert dirty["applied"]["programRevision"] != dirty["saved"][
@@ -2123,9 +2223,7 @@ def test_composer_websocket_streams_owner_snapshots_only(
         state = composer._composer_state
         assert state.authoring_admission is not None
         draft = state.draft_session.snapshot()
-        with composer.websocket_connect(
-            "/ws/state?client_id=test-browser"
-        ) as websocket:
+        with composer.websocket_connect("/ws/state") as websocket:
             payload = websocket.receive_json()
             assert payload == {
                 "schema_version": "manyforge.composer_headless_state.v1",
@@ -2160,7 +2258,7 @@ def test_composer_websocket_streams_owner_snapshots_only(
     assert alarm_request["query"] == "limit=32&ordering=attention_newest"
 
 
-def test_composer_websocket_registers_barrier_before_client_observation(
+def test_composer_websocket_stream_is_read_only_transport(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     class Admission:
@@ -2168,14 +2266,7 @@ def test_composer_websocket_registers_barrier_before_client_observation(
         receiver_epoch = "composer-snapshot.test"
 
         def __init__(self) -> None:
-            self.published = False
-            self.disconnected = False
-
-        def publish_complete_snapshot(self, **_kwargs) -> None:
-            self.published = True
-
-        def disconnect(self, _client_id: str) -> None:
-            self.disconnected = True
+            self.sent = False
 
     admission = Admission()
 
@@ -2183,8 +2274,9 @@ def test_composer_websocket_registers_barrier_before_client_observation(
         async def accept(self) -> None:
             return None
 
-        async def send_text(self, _message: str) -> None:
-            assert admission.published is True
+        async def send_text(self, message: str) -> None:
+            assert json.loads(message)["complete"] is True
+            admission.sent = True
             raise WebSocketDisconnect()
 
     class SnapshotClient:
@@ -2207,13 +2299,65 @@ def test_composer_websocket_registers_barrier_before_client_observation(
         serve_headless_state(
             RecordingWebSocket(),  # type: ignore[arg-type]
             SnapshotClient(),  # type: ignore[arg-type]
-            client_id="test-browser",
             admission=admission,  # type: ignore[arg-type]
             draft_session=ComposerState().draft_session,
         )
     )
 
-    assert admission.disconnected is True
+    assert admission.sent is True
+
+
+def test_composer_websocket_skips_unchanged_owner_revisions(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class RecordingWebSocket:
+        def __init__(self) -> None:
+            self.messages: list[str] = []
+
+        async def accept(self) -> None:
+            return None
+
+        async def send_text(self, message: str) -> None:
+            self.messages.append(message)
+
+    class SnapshotClient:
+        def __init__(self) -> None:
+            self.polls = 0
+
+        def runtime(self) -> dict[str, Any]:
+            self.polls += 1
+            if self.polls == 3:
+                raise WebSocketDisconnect()
+            return _runtime()
+
+        def alarms(self, *, limit: int, ordering: str) -> dict[str, Any]:
+            assert limit == 32
+            assert ordering == "attention_newest"
+            return _alarms()
+
+        def authoring_admission(self) -> dict[str, Any]:
+            return {"authoring_allowed": True, "admission_generation": 7}
+
+        def program_cycle_status(self) -> dict[str, Any]:
+            return {"state": "idle"}
+
+    class Admission:
+        mutation_ready = True
+        receiver_epoch = "composer-snapshot.test"
+
+    websocket = RecordingWebSocket()
+    monkeypatch.setattr(headless_ws, "POLL_INTERVAL_SECONDS", 0)
+    asyncio.run(
+        serve_headless_state(
+            websocket,  # type: ignore[arg-type]
+            SnapshotClient(),  # type: ignore[arg-type]
+            admission=Admission(),  # type: ignore[arg-type]
+            draft_session=ComposerState().draft_session,
+        )
+    )
+
+    assert len(websocket.messages) == 1
+    assert json.loads(websocket.messages[0])["snapshot_sequence"] == 1
 
 
 def test_composer_websocket_deduplicates_an_unchanged_owner_failure(
@@ -2258,12 +2402,6 @@ def test_composer_websocket_deduplicates_an_unchanged_owner_failure(
         mutation_ready = True
         receiver_epoch = "composer-snapshot.test"
 
-        def publish_complete_snapshot(self, **_kwargs) -> None:
-            return None
-
-        def disconnect(self, _client_id: str) -> None:
-            return None
-
     websocket = RecordingWebSocket()
     monkeypatch.setattr(headless_ws, "POLL_INTERVAL_SECONDS", 0)
 
@@ -2271,7 +2409,6 @@ def test_composer_websocket_deduplicates_an_unchanged_owner_failure(
         serve_headless_state(
             websocket,  # type: ignore[arg-type]
             FailingClient(),  # type: ignore[arg-type]
-            client_id="test-browser",
             admission=Admission(),  # type: ignore[arg-type]
             draft_session=ComposerState().draft_session,
         )
@@ -2329,12 +2466,6 @@ def test_composer_websocket_reports_an_oversized_projection_once(
         mutation_ready = True
         receiver_epoch = "composer-snapshot.test"
 
-        def publish_complete_snapshot(self, **_kwargs) -> None:
-            return None
-
-        def disconnect(self, _client_id: str) -> None:
-            return None
-
     original_encode = headless_ws._encode
 
     def fail_snapshot_only(value: dict[str, Any]) -> str:
@@ -2352,7 +2483,6 @@ def test_composer_websocket_reports_an_oversized_projection_once(
         serve_headless_state(
             websocket,  # type: ignore[arg-type]
             SnapshotClient(),  # type: ignore[arg-type]
-            client_id="test-browser",
             admission=Admission(),  # type: ignore[arg-type]
             draft_session=ComposerState().draft_session,
         )

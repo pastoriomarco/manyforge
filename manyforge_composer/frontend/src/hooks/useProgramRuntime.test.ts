@@ -32,7 +32,6 @@ function admissionFixtures() {
     },
   } as ProgramWorkspaceResponse;
   const snapshot = {
-    clientId: 'composer-browser.fixture',
     authoringAdmission: { authoringAllowed: true, admissionGeneration: 9 },
     programCycle: {
       programRunnerOwnerEpoch: 'runner.epoch.1', cycleGeneration: 3,
@@ -82,6 +81,7 @@ describe('Program runtime idle selection', () => {
     );
     expect(refresh).not.toContain('api.programs.start');
     expect(refresh).not.toContain('applyDraft');
+    expect(refresh).toContain('api.programs.currentScenario()');
   });
 
   it('retains only a still-available explicit operator selection', () => {

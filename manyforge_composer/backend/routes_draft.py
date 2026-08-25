@@ -41,7 +41,7 @@ from .program_artifacts import (
 )
 from .state import ComposerState
 from .authoring_admission import (
-    BrowserAuthoringMutationEnvelope,
+    AuthoringMutationEnvelope,
     headless_client_http_exception,
 )
 
@@ -98,6 +98,9 @@ _POLICY_MUTATION_API_VERSION = "manyforge.composer_draft_mutation.v1"
 _ACTIVE_AUTHORING_CLAIM: ContextVar[dict[str, Any] | None] = ContextVar(
     "active_authoring_claim", default=None
 )
+_ACTIVE_AUTHORING_EFFECT: ContextVar[dict[str, Any] | None] = ContextVar(
+    "active_authoring_effect", default=None
+)
 
 
 class _DraftFence(BaseModel):
@@ -109,13 +112,6 @@ class _DraftFence(BaseModel):
         ge=0,
         le=9_007_199_254_740_991,
     )
-    client_id: str = Field(alias="clientId", min_length=1, max_length=256)
-    snapshot_receiver_epoch: str = Field(
-        alias="snapshotReceiverEpoch", min_length=1, max_length=256
-    )
-    snapshot_sequence: int = Field(
-        alias="snapshotSequence", ge=1, le=9_007_199_254_740_991
-    )
     expected_admission_generation: int = Field(
         alias="expectedAdmissionGeneration", ge=1, le=9_007_199_254_740_991
     )
@@ -124,11 +120,8 @@ class _DraftFence(BaseModel):
     )
     request_id: str = Field(alias="requestId", min_length=1, max_length=256)
 
-    def admission_envelope(self) -> BrowserAuthoringMutationEnvelope:
-        return BrowserAuthoringMutationEnvelope(
-            client_id=self.client_id,
-            snapshot_receiver_epoch=self.snapshot_receiver_epoch,
-            snapshot_sequence=self.snapshot_sequence,
+    def admission_envelope(self) -> AuthoringMutationEnvelope:
+        return AuthoringMutationEnvelope(
             expected_admission_generation=self.expected_admission_generation,
             request_owner_epoch=self.request_owner_epoch,
             request_id=self.request_id,
@@ -159,16 +152,7 @@ class SaveDraftAsRequest(_DraftFence):
 
 
 class ApplyDraftRequest(_DraftFence):
-    scenario_id: str = Field(
-        alias="scenarioId",
-        min_length=1,
-        max_length=128,
-        pattern=r"^[a-z][a-z0-9_.-]*$",
-    )
-    scenario_catalog_revision: str = Field(
-        alias="scenarioCatalogRevision",
-        pattern=r"^sha256:[0-9a-f]{64}$",
-    )
+    pass
 
 
 class DiscardDraftRequest(_DraftFence):
@@ -179,7 +163,17 @@ class RevertDraftRequest(_DraftFence):
     pass
 
 
-class LoadScenarioRequest(ApplyDraftRequest):
+class LoadScenarioRequest(_DraftFence):
+    scenario_id: str = Field(
+        alias="scenarioId",
+        min_length=1,
+        max_length=128,
+        pattern=r"^[a-z][a-z0-9_.-]*$",
+    )
+    scenario_catalog_revision: str = Field(
+        alias="scenarioCatalogRevision",
+        pattern=r"^sha256:[0-9a-f]{64}$",
+    )
     confirm_discard: bool = Field(default=False, alias="confirmDiscard")
 
 
@@ -515,38 +509,58 @@ def create_draft_router(state: ComposerState) -> APIRouter:
             _require_apply_ready(
                 Program.from_dict(document, _active_catalog(state), path="<apply-intent>")
             )
-            applied = retained_applied_context()
-            reason = applied.get("reason")
-            if (
-                applied["available"] is False
-                and isinstance(reason, dict)
-                and reason.get("code") != "program_applied_selection_not_found"
+            try:
+                current_projection = state.current_scenario()
+            except HeadlessClientError as error:
+                raise headless_client_http_exception(error) from error
+            current = current_projection.get("current_scenario")
+            if current_projection.get("ready") is not True or not isinstance(
+                current, dict
             ):
+                raise DraftSessionError(
+                    "program_current_scenario_unavailable",
+                    "Program Apply requires one exact current active Scenario; "
+                    "use Load Scenario first",
+                    status_code=409,
+                    detail={
+                        "unavailableReasons": current_projection.get(
+                            "unavailable_reasons", []
+                        )
+                    },
+                )
+            applied = retained_applied_context()
+            if applied["available"] is not True:
+                reason = applied.get("reason") or {
+                    "code": "program_applied_selection_invalid",
+                    "message": "Applied Program is absent",
+                }
                 raise DraftSessionError(
                     reason["code"],
                     reason["message"],
-                    status_code=(
-                        404
-                        if reason["code"]
-                        == "program_applied_selection_not_found"
-                        else 502
-                        if reason["code"]
-                        == "program_applied_selection_invalid"
-                        else 503
-                    ),
+                    status_code=502,
+                )
+            if (
+                current.get("scenario_id") != applied.get("scenario_id")
+                or current.get("scenario_catalog_revision")
+                != applied.get("scenario_catalog_revision")
+                or current.get("program_revision")
+                != applied.get("program_revision")
+            ):
+                raise DraftSessionError(
+                    "program_current_scenario_inconsistent",
+                    "current Scenario and Applied Program projections disagree",
+                    status_code=409,
                 )
             prepared.update(
                 {
                     "effect_class": "external",
                     "external_kind": "program_apply",
                     "program_document": deepcopy(document),
-                    "scenario_id": body.scenario_id,  # type: ignore[attr-defined]
-                    "scenario_catalog_revision": body.scenario_catalog_revision,  # type: ignore[attr-defined]
-                    "expected_applied_record_digest": (
-                        applied.get("record_digest")
-                        if applied["available"] is True
-                        else None
-                    ),
+                    "scenario_id": current["scenario_id"],
+                    "scenario_catalog_revision": current[
+                        "scenario_catalog_revision"
+                    ],
+                    "expected_applied_record_digest": applied["record_digest"],
                     "applied_context": applied,
                     "post_state": pre_state,
                 }
@@ -619,11 +633,13 @@ def create_draft_router(state: ComposerState) -> APIRouter:
             return prepared
 
         def execute_effect(claim: dict[str, Any]):
-            token = _ACTIVE_AUTHORING_CLAIM.set(claim)
+            claim_token = _ACTIVE_AUTHORING_CLAIM.set(claim)
+            effect_token = _ACTIVE_AUTHORING_EFFECT.set(prepared)
             try:
                 return effect(claim)
             finally:
-                _ACTIVE_AUTHORING_CLAIM.reset(token)
+                _ACTIVE_AUTHORING_EFFECT.reset(effect_token)
+                _ACTIVE_AUTHORING_CLAIM.reset(claim_token)
 
         try:
             return coordinator.execute(
@@ -654,6 +670,12 @@ def create_draft_router(state: ComposerState) -> APIRouter:
         if claim is None:
             raise RuntimeError("authoring claim context is absent")
         return claim
+
+    def active_authoring_effect() -> dict[str, Any]:
+        effect = _ACTIVE_AUTHORING_EFFECT.get()
+        if effect is None:
+            raise RuntimeError("authoring effect context is absent")
+        return effect
 
     @router.get("/api/program/draft")
     def read_draft() -> dict[str, Any]:
@@ -807,26 +829,20 @@ def create_draft_router(state: ComposerState) -> APIRouter:
     @authoring_gate
     def apply_draft(body: ApplyDraftRequest) -> JSONResponse:
         try:
+            prepared = active_authoring_effect()
+
             def apply_current_program(program: Program) -> dict[str, Any]:
                 _require_apply_ready(program)
-                context, reason = _applied_context(state)
-                if (
-                    reason is not None
-                    and reason["code"] != "program_applied_selection_not_found"
-                ):
-                    raise DraftSessionError(
-                        reason["code"],
-                        reason["message"],
-                        status_code=503,
-                    )
                 return _apply_program(
                     state,
                     program=program,
-                    scenario_id=body.scenario_id,
-                    scenario_catalog_revision=body.scenario_catalog_revision,
-                    expected_applied_record_digest=(
-                        context.record_digest if context is not None else None
-                    ),
+                    scenario_id=prepared["scenario_id"],
+                    scenario_catalog_revision=prepared[
+                        "scenario_catalog_revision"
+                    ],
+                    expected_applied_record_digest=prepared[
+                        "expected_applied_record_digest"
+                    ],
                     authoring_claim=active_authoring_claim(),
                 )
 

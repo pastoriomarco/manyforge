@@ -7,6 +7,8 @@ import {
   HeadlessStateSource,
   admitHeadlessState,
   getHeadlessStateQualificationSnapshot,
+  sameHeadlessProjection,
+  sameViewerProjection,
   useHeadlessStateSource,
 } from './useHeadlessState';
 
@@ -19,7 +21,6 @@ function state(
 ): ComposerHeadlessState {
   return {
     schemaVersion: 'manyforge.composer_headless_state.v1',
-    clientId: 'composer-browser.test',
     complete: true,
     authoringAdmission: { authoringAllowed: true, admissionGeneration: 1 },
     programCycle: {
@@ -95,6 +96,33 @@ function state(
 }
 
 describe('Headless owner-frame admission', () => {
+  it('treats transport-only sequence updates as the same UI projection', () => {
+    const current = state('receiver.epoch.1', 2);
+    const next = structuredClone(current);
+    next.snapshotSequence += 1;
+    expect(sameHeadlessProjection(current, next)).toBe(true);
+    next.draftIdentity.draftRevision += 1;
+    expect(sameHeadlessProjection(current, next)).toBe(false);
+  });
+
+  it('does not publish Manager observation heartbeats as UI or viewer changes', () => {
+    const current = state('receiver.epoch.1', 2);
+    const heartbeat = structuredClone(current);
+    heartbeat.snapshotSequence += 1;
+    heartbeat.runtime.projectionGeneration += 1;
+    heartbeat.runtime.sections.manager.sourceGeneration =
+      (heartbeat.runtime.sections.manager.sourceGeneration ?? 0) + 1;
+    heartbeat.runtime.sections.manager.receiverAgeNs =
+      (heartbeat.runtime.sections.manager.receiverAgeNs ?? 0) + 1;
+    expect(sameHeadlessProjection(current, heartbeat)).toBe(true);
+    expect(sameViewerProjection(current, heartbeat)).toBe(true);
+
+    heartbeat.runtime.sections.logicalScene.sourceGeneration =
+      (heartbeat.runtime.sections.logicalScene.sourceGeneration ?? 0) + 1;
+    expect(sameHeadlessProjection(current, heartbeat)).toBe(false);
+    expect(sameViewerProjection(current, heartbeat)).toBe(false);
+  });
+
   it('accepts forward stream frames and a replacement receiver epoch', () => {
     expect(admitHeadlessState(null, state('runtime.epoch.1', 2)).accepted).toBe(true);
     expect(admitHeadlessState(
@@ -193,7 +221,7 @@ afterEach(() => {
 });
 
 describe('HeadlessStateSource delivery scheduling', () => {
-  it('uses one distinct transient client identity for each connection', () => {
+  it('uses one read-only state endpoint without a client authority identity', () => {
     vi.useFakeTimers();
     const urls: string[] = [];
     class FakeWebSocket {
@@ -214,15 +242,13 @@ describe('HeadlessStateSource delivery scheduling', () => {
     source.setEnabled(true);
     source.reconnect();
     expect(urls).toHaveLength(2);
-    const firstClient = new URL(urls[0]!).searchParams.get('client_id');
-    const secondClient = new URL(urls[1]!).searchParams.get('client_id');
-    expect(firstClient).toMatch(/^composer-browser\./);
-    expect(secondClient).toMatch(/^composer-browser\./);
-    expect(secondClient).not.toBe(firstClient);
+    expect(new URL(urls[0]!).pathname).toBe('/ws/state');
+    expect(new URL(urls[0]!).search).toBe('');
+    expect(urls[1]).toBe(urls[0]);
     source.dispose();
   });
 
-  it('publishes a newer authority barrier when owner projections are unchanged', () => {
+  it('publishes admission changes to the shell without waking the viewer', () => {
     vi.useFakeTimers();
     const animationFrames: FrameRequestCallback[] = [];
     class FakeWebSocket {
@@ -257,12 +283,86 @@ describe('HeadlessStateSource delivery scheduling', () => {
       admission_generation: 2, authoring_allowed: true,
     };
     FakeWebSocket.instance.send(first);
-    FakeWebSocket.instance.send(second);
     expect(animationFrames).toHaveLength(1);
     animationFrames[0]!(16);
-    expect(source.getViewerSnapshot().snapshot?.snapshotSequence).toBe(3);
-    expect(source.getViewerSnapshot().snapshot?.authoringAdmission.admissionGeneration)
+    vi.advanceTimersByTime(HEADLESS_SHELL_PUBLICATION_MS);
+    const viewerBaseline = source.getViewerSnapshot();
+    FakeWebSocket.instance.send(second);
+    expect(animationFrames).toHaveLength(1);
+    vi.advanceTimersByTime(HEADLESS_SHELL_PUBLICATION_MS);
+    expect(source.getViewerSnapshot()).toBe(viewerBaseline);
+    expect(source.getShellSnapshot().snapshot?.snapshotSequence).toBe(3);
+    expect(source.getShellSnapshot().snapshot?.authoringAdmission.admissionGeneration)
       .toBe(2);
+    source.dispose();
+  });
+
+  it('advances exact capture identity across visually equivalent heartbeats', () => {
+    vi.useFakeTimers();
+    const animationFrames: FrameRequestCallback[] = [];
+    class FakeWebSocket {
+      static instance: FakeWebSocket;
+      onopen: (() => void) | null = null;
+      onmessage: ((message: MessageEvent) => void) | null = null;
+      onerror: (() => void) | null = null;
+      onclose: (() => void) | null = null;
+      constructor(url: string) { void url; FakeWebSocket.instance = this; }
+      close(): void {}
+      send(value: unknown): void {
+        this.onmessage?.({ data: JSON.stringify(value) } as MessageEvent);
+      }
+    }
+    vi.stubGlobal('window', {
+      location: { href: 'http://composer.test/' },
+      requestAnimationFrame: (callback: FrameRequestCallback) => {
+        animationFrames.push(callback); return animationFrames.length;
+      },
+      cancelAnimationFrame: vi.fn(),
+    });
+    vi.stubGlobal('WebSocket', FakeWebSocket);
+
+    const source = new HeadlessStateSource();
+    source.setEnabled(true);
+    const first = wireState(1);
+    FakeWebSocket.instance.send(first);
+    animationFrames[0]!(16);
+    const presented = source.getViewerSnapshot().snapshot;
+    source.markViewerPresented(presented);
+    expect(source.getPresentedRuntimeFrame()).toEqual({
+      ownerEpoch: 'runtime.epoch.1', generation: 1,
+    });
+
+    const heartbeat = structuredClone(first);
+    heartbeat.snapshot_sequence = 3;
+    const heartbeatRuntime = heartbeat.runtime as Record<string, unknown>;
+    heartbeatRuntime.projection_generation = 2;
+    const sections = heartbeatRuntime.sections as Record<string, Record<string, unknown>>;
+    sections.manager = { ...sections.manager, source_generation: 2 };
+    FakeWebSocket.instance.send(heartbeat);
+    expect(animationFrames).toHaveLength(1);
+    expect(source.getPresentedRuntimeFrame()).toEqual({
+      ownerEpoch: 'runtime.epoch.1', generation: 2,
+    });
+
+    const sceneChange = structuredClone(heartbeat);
+    sceneChange.snapshot_sequence = 4;
+    const sceneRuntime = sceneChange.runtime as Record<string, unknown>;
+    sceneRuntime.projection_generation = 3;
+    const sceneSections = sceneRuntime.sections as Record<
+      string, Record<string, unknown>
+    >;
+    sceneSections.logical_scene = {
+      ...sceneSections.logical_scene,
+      source_generation: 2,
+    };
+    FakeWebSocket.instance.send(sceneChange);
+    expect(animationFrames).toHaveLength(2);
+    expect(source.getPresentedRuntimeFrame()?.generation).toBe(2);
+    animationFrames[1]!(32);
+    source.markViewerPresented(source.getViewerSnapshot().snapshot);
+    expect(source.getPresentedRuntimeFrame()).toEqual({
+      ownerEpoch: 'runtime.epoch.1', generation: 3,
+    });
     source.dispose();
   });
 

@@ -1,4 +1,4 @@
-"""Per-client barrier plus durable Composer authoring transaction owner."""
+"""Durable Composer authoring transaction owner."""
 
 from __future__ import annotations
 
@@ -6,8 +6,6 @@ from dataclasses import dataclass
 import json
 import math
 from pathlib import Path
-from threading import RLock
-import time
 from typing import Any, Callable, Mapping, TypeVar
 import uuid
 
@@ -27,8 +25,6 @@ from .authoring_transaction_journal import (
 )
 
 _T = TypeVar("_T")
-_MAX_CLIENTS = 1024
-_FRESH_SECONDS = 2.0
 
 
 def headless_client_http_exception(error: HeadlessClientError) -> HTTPException:
@@ -51,34 +47,12 @@ def _headless_proves_no_effect(error: HeadlessClientError) -> bool:
 
 
 @dataclass(frozen=True, slots=True)
-class BrowserAuthoringMutationEnvelope:
-    """One browser mutation fenced by its current complete GUI snapshot."""
-
-    client_id: str
-    snapshot_receiver_epoch: str
-    snapshot_sequence: int
-    expected_admission_generation: int
-    request_owner_epoch: str
-    request_id: str
-
-
-@dataclass(frozen=True, slots=True)
-class BackendAuthoringMutationEnvelope:
-    """One backend mutation fenced by Kernel admission, never browser state."""
+class AuthoringMutationEnvelope:
+    """One mutation fenced by backend admission and durable request identity."""
 
     expected_admission_generation: int
     request_owner_epoch: str
     request_id: str
-
-
-@dataclass(slots=True)
-class _ClientSnapshot:
-    receiver_epoch: str
-    sequence: int
-    admission_generation: int
-    draft_id: str
-    draft_revision: int
-    observed_at: float
 
 
 class AuthoringAdmissionCoordinator:
@@ -102,8 +76,6 @@ class AuthoringAdmissionCoordinator:
         self._recover_effect = recover_effect
         self.owner_epoch = self._journal.owner_epoch
         self.receiver_epoch = f"composer-snapshot-{uuid.uuid4().hex}"
-        self._lock = RLock()
-        self._snapshots: dict[str, _ClientSnapshot] = {}
         self._ready = False
         self._blocked_reason: str | None = "authoring recovery has not run"
 
@@ -465,88 +437,7 @@ class AuthoringAdmissionCoordinator:
             },
         }
 
-    def publish_complete_snapshot(
-        self,
-        *,
-        client_id: str,
-        sequence: int,
-        admission_generation: int,
-        draft_id: str,
-        draft_revision: int,
-    ) -> None:
-        if not self._ready:
-            raise ValueError(self._blocked_reason or "authoring recovery is blocked")
-        if not client_id or sequence < 1:
-            raise ValueError("snapshot identity is invalid")
-        with self._lock:
-            previous = self._snapshots.get(client_id)
-            if previous is not None and sequence <= previous.sequence:
-                raise ValueError("snapshot sequence must increase")
-            if previous is None and len(self._snapshots) >= _MAX_CLIENTS:
-                oldest = min(
-                    self._snapshots, key=lambda key: self._snapshots[key].observed_at
-                )
-                del self._snapshots[oldest]
-            self._snapshots[client_id] = _ClientSnapshot(
-                receiver_epoch=self.receiver_epoch,
-                sequence=sequence,
-                admission_generation=admission_generation,
-                draft_id=draft_id,
-                draft_revision=draft_revision,
-                observed_at=time.monotonic(),
-            )
-
-    def disconnect(self, client_id: str) -> None:
-        with self._lock:
-            self._snapshots.pop(client_id, None)
-
-    def _require_snapshot(
-        self,
-        envelope: BrowserAuthoringMutationEnvelope,
-        *,
-        draft_id: str,
-        draft_revision: int,
-    ) -> None:
-        if not self._ready:
-            raise self._unavailable(
-                "composer_authoring_recovery_blocked",
-                self._blocked_reason or "authoring recovery is blocked",
-            )
-        with self._lock:
-            snapshot = self._snapshots.get(envelope.client_id)
-            valid = (
-                snapshot is not None
-                and snapshot.receiver_epoch == envelope.snapshot_receiver_epoch
-                and snapshot.sequence == envelope.snapshot_sequence
-                and snapshot.admission_generation
-                == envelope.expected_admission_generation
-                and snapshot.draft_id == draft_id
-                and snapshot.draft_revision == draft_revision
-                and time.monotonic() - snapshot.observed_at <= _FRESH_SECONDS
-            )
-        if not valid:
-            raise HTTPException(
-                status_code=409,
-                detail={
-                    "code": "authoring_client_snapshot_stale",
-                    "message": "authoring requires one complete current client snapshot",
-                },
-            )
-
-    def _require_mutation_source(
-        self,
-        envelope: BrowserAuthoringMutationEnvelope | BackendAuthoringMutationEnvelope,
-        *,
-        draft_id: str,
-        draft_revision: int,
-    ) -> None:
-        if isinstance(envelope, BrowserAuthoringMutationEnvelope):
-            self._require_snapshot(
-                envelope,
-                draft_id=draft_id,
-                draft_revision=draft_revision,
-            )
-            return
+    def _require_mutation_ready(self) -> None:
         if not self._ready:
             raise self._unavailable(
                 "composer_authoring_recovery_blocked",
@@ -555,8 +446,7 @@ class AuthoringAdmissionCoordinator:
 
     def completed_admission_generation(
         self,
-        envelope: BrowserAuthoringMutationEnvelope
-        | BackendAuthoringMutationEnvelope,
+        envelope: AuthoringMutationEnvelope,
     ) -> int:
         """Return the exact post-settlement generation for a completed request."""
 
@@ -757,7 +647,7 @@ class AuthoringAdmissionCoordinator:
 
     def execute(
         self,
-        envelope: BrowserAuthoringMutationEnvelope | BackendAuthoringMutationEnvelope,
+        envelope: AuthoringMutationEnvelope,
         *,
         operation_kind: str,
         draft_id: str,
@@ -798,9 +688,7 @@ class AuthoringAdmissionCoordinator:
                 "the exact authoring request has an unresolved durable outcome",
             )
 
-        self._require_mutation_source(
-            envelope, draft_id=draft_id, draft_revision=draft_revision
-        )
+        self._require_mutation_ready()
 
         prepared_effect = (
             dict(prepare_effect())
@@ -876,9 +764,10 @@ class AuthoringAdmissionCoordinator:
                 envelope.request_owner_epoch, envelope.request_id
             )
             assert transaction is not None
-            self._require_mutation_source(
-                envelope, draft_id=draft_id, draft_revision=draft_revision
-            )
+            # The browser is presentation only. Recheck backend-owned
+            # readiness after acquiring the exact durable claim; Draft and
+            # Scenario identities are validated by the operation under it.
+            self._require_mutation_ready()
             if validate_under_claim is not None:
                 validate_under_claim(claim)
             self._journal.record(
@@ -988,7 +877,6 @@ class AuthoringAdmissionCoordinator:
 
 __all__ = [
     "AuthoringAdmissionCoordinator",
-    "BrowserAuthoringMutationEnvelope",
-    "BackendAuthoringMutationEnvelope",
+    "AuthoringMutationEnvelope",
     "headless_client_http_exception",
 ]

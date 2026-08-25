@@ -2,6 +2,7 @@
 
 #include <manyforge_core/ports/iexecution_backend.hpp>
 #include <manyforge_core/time/iclock.hpp>
+#include <manyforge_core/time/ischeduler.hpp>
 #include <manyforge_core/types/error_code.hpp>
 #include <manyforge_core/types/execution_result.hpp>
 #include <manyforge_core/types/execution_status.hpp>
@@ -93,7 +94,9 @@ bool is_command_authoritative_stop_snapshot(
 MeasuredRestWaitResult wait_for_measured_rest_after_confirmed_stop(
     IExecutionBackend& backend,
     double settle_velocity_threshold_rad_s,
-    std::chrono::steady_clock::time_point deadline,
+    TimePoint deadline,
+    IClock& clock,
+    IScheduler& scheduler,
     std::stop_token stop_token,
     std::function<bool()> abort_requested = {});
 bool operator_controlled_stop_allowed(ExecutionState state);

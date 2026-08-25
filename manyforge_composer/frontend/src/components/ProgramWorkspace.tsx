@@ -52,7 +52,7 @@ export function ProgramWorkspace({
   const {
     state,
     mutationAvailable,
-    admissionObserved,
+    mutationUnavailableReason,
     refresh,
     mutate,
     updateNodePolicies,
@@ -107,6 +107,21 @@ export function ProgramWorkspace({
       setSelectedNodeId(null);
     }
   }, [program, selectedNodeId, validNodeIds]);
+  useEffect(() => {
+    if (!program || declarationSelection === null) return;
+    const exists = declarationSelection.kind === 'parameter'
+      ? (program.parameters ?? []).some(
+        (row) => row.parameter_id === declarationSelection.id,
+      )
+      : declarationSelection.kind === 'namespace'
+        ? (program.blackboard?.namespaces ?? []).some(
+          (row) => row.namespace_id === declarationSelection.id,
+        )
+        : (program.blackboard?.keys ?? []).some(
+          (row) => row.key === declarationSelection.id,
+        );
+    if (declarationSelection.id && !exists) setDeclarationSelection(null);
+  }, [declarationSelection, program]);
   useEffect(() => {
     if (paletteCollapsed) paletteRail.current?.focus();
     else if (previousPaletteCollapsed.current) paletteCollapseButton.current?.focus();
@@ -197,10 +212,10 @@ export function ProgramWorkspace({
             <span>Draft inspection remains available; backend-owned authoring actions stay disabled until Idle.</span>
           </div>
         )}
-        {!runtime.active && workspace !== null && admissionObserved && !mutationAvailable && (
+        {!runtime.active && workspace !== null && !mutationAvailable && (
           <div className="program-workspace-notice" role="status">
             <strong>Authoring unavailable.</strong>
-            <span>Waiting for current backend Idle admission and the matching Draft revision.</span>
+            <span>{mutationUnavailableReason}</span>
           </div>
         )}
         {catalog.status !== 'ready' && (
@@ -398,8 +413,10 @@ export function ProgramWorkspace({
                   parameters={program.parameters ?? []}
                   namespaces={program.blackboard?.namespaces ?? []}
                   keys={program.blackboard?.keys ?? []}
+                  catalogEntries={catalogEntries}
                   busy={authoringBusy}
                   onMutate={mutate}
+                  onSelectNode={setSelectedNodeId}
                 />
               )}
             </div>

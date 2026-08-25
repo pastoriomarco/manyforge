@@ -202,7 +202,6 @@ function authoringSnapshot(
 ): ComposerHeadlessState {
   return {
     schemaVersion: 'manyforge.composer_headless_state.v1',
-    clientId: 'composer-browser.fixture',
     complete: true,
     authoringAdmission: { authoringAllowed: true, admissionGeneration: 7 },
     programCycle: {
@@ -280,6 +279,22 @@ describe('useProgramWorkspace Draft policy interaction', () => {
     vi.stubGlobal('IS_REACT_ACT_ENVIRONMENT', true);
   });
 
+  it('coalesces one workspace read for a newer backend Draft identity', async () => {
+    const initial = deferred<ProgramWorkspaceResponse>();
+    const rerender = await mountHarness(initial, authoringSnapshot(workspace(1)));
+    await act(async () => initial.resolve(workspace(1)));
+    const resynchronized = deferred<ProgramWorkspaceResponse>();
+    apiMock.programWorkspace.get.mockReturnValueOnce(resynchronized.promise);
+
+    await rerender(authoringSnapshot(workspace(2)));
+    await rerender(authoringSnapshot(workspace(2)));
+    expect(apiMock.programWorkspace.get).toHaveBeenCalledTimes(2);
+
+    await act(async () => resynchronized.resolve(workspace(2)));
+    expect(latest?.state.workspace?.draft.draftRevision).toBe(2);
+    expect(latest?.state.pendingAction).toBeNull();
+  });
+
   it('shows a Draft-only result before one follow-up GET, then retains it on stale refresh', async () => {
     const initial = deferred<ProgramWorkspaceResponse>();
     await mountHarness(initial, authoringSnapshot(workspace(1)));
@@ -338,9 +353,6 @@ describe('useProgramWorkspace Draft policy interaction', () => {
         expect.objectContaining({
           draftId: 'draft-1',
           expectedDraftRevision: 1,
-          clientId: 'composer-browser.fixture',
-          snapshotReceiverEpoch: 'headless-receiver.epoch.1',
-          snapshotSequence: 11,
           expectedAdmissionGeneration: 7,
           requestOwnerEpoch: expect.stringMatching(/^composer-authoring-owner\./),
           requestId: expect.stringMatching(/^composer-authoring\./),
@@ -387,7 +399,7 @@ describe('useProgramWorkspace Draft policy interaction', () => {
     expect(apiMock.programWorkspace.get).toHaveBeenCalledTimes(1);
   });
 
-  it('uses the newest snapshot barrier after a rerender', async () => {
+  it('uses the newest backend admission generation after a rerender', async () => {
     const initial = deferred<ProgramWorkspaceResponse>();
     const first = authoringSnapshot(workspace(1));
     const rerender = await mountHarness(initial, first);
@@ -408,7 +420,6 @@ describe('useProgramWorkspace Draft policy interaction', () => {
     });
     expect(apiMock.programWorkspace.updateNodePolicies).toHaveBeenCalledWith(
       expect.objectContaining({
-        snapshotSequence: 12,
         expectedAdmissionGeneration: 8,
       }),
       workspace(1).draft.programRevision,

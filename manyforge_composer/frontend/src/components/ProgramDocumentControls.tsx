@@ -11,6 +11,7 @@ import type { ProgramWorkspaceController } from '../hooks/useProgramWorkspace';
 import type { ArtifactKind, FileBrowserEntry } from '../types/api';
 import { ArtifactBrowser } from './ArtifactBrowser';
 import { OverlayPanel } from './OverlayPanel';
+import { ProgramSettingsEditor } from './ProgramSettingsEditor';
 
 type ProgramAction =
   | 'new'
@@ -50,6 +51,7 @@ export function ProgramDocumentControls({
   const {
     state,
     mutationAvailable,
+    mutationUnavailableReason,
     newDraft,
     openDraft,
     save,
@@ -72,13 +74,26 @@ export function ProgramDocumentControls({
   const busy = state.status === 'loading'
     || (state.status === 'ready' && state.pendingAction !== null);
   const authoringBusy = busy || !mutationAvailable;
+  const authoringBlockReason = busy
+    ? 'Another Program operation is in progress.'
+    : mutationUnavailableReason;
   const replaceNeedsConfirmation = workspace?.hasUnsavedChanges === true
     || workspace?.hasUnappliedChanges === true;
   const scenarioCatalog = runtime.state.catalog;
   const selectedScenario = scenarioCatalog?.scenarios.find(
     (row) => row.scenarioId === runtime.state.selectedScenarioId,
   ) ?? null;
+  const currentScenarioProjection = runtime.state.currentScenario;
+  const currentScenario = currentScenarioProjection?.currentScenario ?? null;
+  const currentScenarioUnavailable = currentScenarioProjection === null
+    ? 'Current Scenario is still being read from the backend.'
+    : currentScenarioProjection.unavailableReasons.length > 0
+      ? currentScenarioProjection.unavailableReasons.join(', ').replaceAll('_', ' ')
+      : 'No exact current Scenario exists.';
   const affectedPolicyInstances = workspace?.applicability.affectedInstanceIds ?? [];
+  const hasAppliedUnsavedChanges = workspace?.saved.available === true
+    && workspace.applied.available
+    && workspace.saved.programRevision !== workspace.applied.programRevision;
   const affectedPolicyInstanceSummary = affectedPolicyInstances.length <= 12
     ? affectedPolicyInstances.join(', ')
     : `${affectedPolicyInstances.slice(0, 12).join(', ')}, and ${affectedPolicyInstances.length - 12} more`;
@@ -86,6 +101,16 @@ export function ProgramDocumentControls({
   useEffect(() => {
     if (workspace?.saved.path) setSaveAsPath(workspace.saved.path);
   }, [workspace?.saved.path]);
+
+  useEffect(() => {
+    if (!workspace?.hasUnsavedChanges && !workspace?.hasUnappliedChanges) return undefined;
+    const protectDirtyDraft = (event: BeforeUnloadEvent) => {
+      event.preventDefault();
+      event.returnValue = '';
+    };
+    window.addEventListener('beforeunload', protectDirtyDraft);
+    return () => window.removeEventListener('beforeunload', protectDirtyDraft);
+  }, [workspace?.hasUnappliedChanges, workspace?.hasUnsavedChanges]);
 
   const closeAction = useCallback(() => {
     setAction(null);
@@ -165,15 +190,34 @@ export function ProgramDocumentControls({
         </div>
 
         <div className="program-document-actions">
-          <button type="button" disabled={authoringBusy || workspace === null} onClick={(event) => beginAction('new', event)}>New</button>
-          <button type="button" disabled={authoringBusy || workspace === null} onClick={(event) => beginAction('open', event)}>Open</button>
-          <button type="button" disabled={authoringBusy || !program || !workspace?.saved.available} onClick={save}>Save</button>
-          <button type="button" disabled={authoringBusy || !program} onClick={(event) => beginAction('save_as', event)}>Save As</button>
-          <button type="button" disabled={authoringBusy || workspace === null} onClick={(event) => beginAction('load', event)}>Load</button>
+          <button type="button" disabled={authoringBusy || workspace === null} title={authoringBlockReason ?? 'Create a new local Program Draft.'} onClick={(event) => beginAction('new', event)}>New</button>
+          <button type="button" disabled={authoringBusy || workspace === null} title={authoringBlockReason ?? 'Open a Program as the local Draft without changing the active Scenario.'} onClick={(event) => beginAction('open', event)}>Open</button>
+          <button type="button" disabled={authoringBusy || !program || !workspace?.saved.available || !workspace.hasUnsavedChanges} title={authoringBlockReason ?? (!workspace?.hasUnsavedChanges ? 'Draft already matches Saved.' : 'Save the current Draft.')} onClick={save}>Save</button>
+          <button type="button" disabled={authoringBusy || !program} title={authoringBlockReason ?? 'Save the current Draft to another Program file.'} onClick={(event) => beginAction('save_as', event)}>Save As</button>
+          <button type="button" disabled={authoringBusy || workspace === null || scenarioCatalog === null} title={authoringBlockReason ?? (scenarioCatalog === null ? 'Scenario catalog is still loading or unavailable.' : 'Load a complete Scenario: Deployment, Binding, and Program.')} onClick={(event) => beginAction('load', event)}>Load</button>
           <span className="header-action-divider" aria-hidden="true" />
-          <button type="button" disabled={authoringBusy || !workspace?.applied.available} onClick={(event) => beginAction('discard', event)}>Discard</button>
-          <button type="button" disabled={authoringBusy || !workspace?.saved.available || !workspace?.applied.available} onClick={(event) => beginAction('revert', event)}>Revert</button>
-          <button className="primary-action" type="button" disabled={authoringBusy || !program || workspace?.applied.matchesDraft === true} onClick={(event) => beginAction('apply', event)}>Apply</button>
+          <button type="button" disabled={authoringBusy || workspace?.hasUnappliedChanges !== true} title={authoringBlockReason ?? (workspace?.hasUnappliedChanges !== true ? 'Draft already matches Applied.' : 'Discard Draft edits and return to Applied.')} onClick={(event) => beginAction('discard', event)}>Discard</button>
+          <button type="button" disabled={authoringBusy || !hasAppliedUnsavedChanges} title={authoringBlockReason ?? (!hasAppliedUnsavedChanges ? 'Applied already matches Saved.' : 'Restore Applied and Draft to Saved.')} onClick={(event) => beginAction('revert', event)}>Revert</button>
+          <button
+            className="primary-action"
+            type="button"
+            disabled={
+              authoringBusy
+              || !program
+              || !workspace?.applicability.applyReady
+              || workspace?.applied.matchesDraft === true
+              || currentScenario === null
+            }
+            title={currentScenario === null
+              ? `Load a Scenario before Program Apply. ${currentScenarioUnavailable}`
+              : authoringBlockReason
+                ?? (workspace?.applied.matchesDraft === true
+                  ? 'Draft already matches Applied.'
+                  : 'Apply this Draft to the current active Scenario without changing Deployment.')}
+            onClick={(event) => beginAction('apply', event)}
+          >
+            Apply
+          </button>
         </div>
       </div>
 
@@ -186,18 +230,12 @@ export function ProgramDocumentControls({
         returnFocusRef={settingsButton}
       >
         {program && (
-          <div className="program-settings-summary">
-            <p>Current Program-wide Draft facts. Editing remains unavailable in this surface.</p>
-            <dl>
-              <div><dt>Program ID</dt><dd><code>{program.program_id}</code></dd></div>
-              <div><dt>Profile</dt><dd><code>{program.program_profile}</code></dd></div>
-              <div><dt>Description</dt><dd>{program.description || 'Not provided'}</dd></div>
-              <div><dt>Catalog version</dt><dd><code>{program.catalog.content_version}</code></dd></div>
-              <div><dt>Component roles</dt><dd>{Object.keys(program.component_roles).length}</dd></div>
-              <div><dt>Target roles</dt><dd>{Object.keys(program.target_roles).length}</dd></div>
-              <div><dt>Compatibility fields</dt><dd>{Object.keys(program.compatibility ?? {}).length}</dd></div>
-            </dl>
-          </div>
+          <ProgramSettingsEditor
+            program={program}
+            busy={authoringBusy}
+            runtime={runtime}
+            onMutate={controller.mutate}
+          />
         )}
       </OverlayPanel>
 
@@ -225,15 +263,19 @@ export function ProgramDocumentControls({
 
         {action === 'open' && (
           <div className="program-document-dialog">
+            <p className="program-dialog-context">
+              Open changes only the editable Draft. The current active Scenario
+              {currentScenario ? ` (${currentScenario.scenarioId})` : ''} and its Deployment remain unchanged.
+            </p>
             <ArtifactBrowser lockedKind="program" onSelectionChange={chooseArtifact} />
             <div className="program-dialog-actions">
-              {workspace?.hasUnsavedChanges && (
+              {replaceNeedsConfirmation && (
                 <label className="program-confirmation">
                   <input type="checkbox" checked={confirmDiscard} onChange={(event) => setConfirmDiscard(event.target.checked)} />
-                  Discard unsaved Draft changes
+                  Replace the current unsaved or unapplied Draft
                 </label>
               )}
-              <button type="button" className="primary-action" disabled={authoringBusy || selectedProgramPath === null || (workspace?.hasUnsavedChanges === true && !confirmDiscard)} onClick={() => {
+              <button type="button" className="primary-action" disabled={authoringBusy || selectedProgramPath === null || (replaceNeedsConfirmation && !confirmDiscard)} onClick={() => {
                 if (selectedProgramPath) complete(() => openDraft(selectedProgramPath, confirmDiscard));
               }}>
                 Open as Draft
@@ -258,7 +300,50 @@ export function ProgramDocumentControls({
           </div>
         )}
 
-        {(action === 'apply' || action === 'load') && (
+        {action === 'apply' && (
+          <div className="program-dialog-copy">
+            {currentScenario ? (
+              <div className="program-current-scenario" aria-label="Current Program Apply target">
+                <strong>{currentScenario.scenarioId}</strong>
+                <span>Deployment {currentScenario.deploymentArtifactId} · {shortRevision(currentScenario.deploymentRevision)}</span>
+                <span>Binding {shortRevision(currentScenario.programBindingId)}</span>
+              </div>
+            ) : (
+              <div className="program-apply-blocked" role="alert">
+                <strong>No exact current Scenario.</strong>
+                <span>{currentScenarioUnavailable}</span>
+                <span>Use Load Scenario to activate a complete Program, Deployment, and Binding.</span>
+              </div>
+            )}
+            <p>
+              Apply replaces only the Program in this exact current Scenario.
+              It never selects or changes Deployment.
+            </p>
+            {!workspace?.applicability.applyReady && (
+              <div className="program-apply-blocked" role="alert">
+                <strong>Draft is not Apply-ready.</strong>
+                {affectedPolicyInstanceSummary && <span>Affected nodes: {affectedPolicyInstanceSummary}.</span>}
+                <span>{workspace?.applicability.unavailableReason?.message}</span>
+              </div>
+            )}
+            <button
+              type="button"
+              className="primary-action"
+              disabled={
+                authoringBusy
+                || currentScenario === null
+                || !program
+                || !workspace?.applicability.applyReady
+                || workspace?.applied.matchesDraft === true
+              }
+              onClick={() => complete(applyDraft)}
+            >
+              Apply Draft to {currentScenario?.scenarioId ?? 'current Scenario'}
+            </button>
+          </div>
+        )}
+
+        {action === 'load' && (
           <div className="program-document-dialog">
             <div className="program-dialog-copy">
               <label className="program-save-as-path">
@@ -279,17 +364,8 @@ export function ProgramDocumentControls({
                   ))}
                 </select>
               </label>
-              <p>{action === 'load'
-                ? 'Load activates this Scenario’s exact Deployment, waits for convergence, then Applies its bound Program. It completes as one backend-owned operation.'
-                : 'Program Apply requires this scenario’s deployment already active and converged. Program Apply never changes the deployment.'}</p>
-              {action === 'apply' && !workspace?.applicability.applyReady && (
-                <div className="program-apply-blocked" role="alert">
-                  <strong>Draft is not Apply-ready.</strong>
-                  {affectedPolicyInstanceSummary && <span>Affected nodes: {affectedPolicyInstanceSummary}.</span>}
-                  <span>{workspace?.applicability.unavailableReason?.message}</span>
-                </div>
-              )}
-              {action === 'load' && replaceNeedsConfirmation && (
+              <p>Load activates this Scenario’s exact Deployment, waits for convergence, then Applies its bound Program. It completes as one backend-owned operation.</p>
+              {replaceNeedsConfirmation && (
                 <label className="program-confirmation">
                   <input type="checkbox" checked={confirmDiscard} onChange={(event) => setConfirmDiscard(event.target.checked)} />
                   Discard current unsaved or unapplied Draft changes
@@ -301,19 +377,14 @@ export function ProgramDocumentControls({
                 disabled={
                   authoringBusy
                   || selectedScenario === null
-                  || (action === 'apply' && (!program || !workspace?.applicability.applyReady))
-                  || (action === 'load' && replaceNeedsConfirmation && !confirmDiscard)
+                  || (replaceNeedsConfirmation && !confirmDiscard)
                 }
                 onClick={() => {
                   if (!selectedScenario || !scenarioCatalog) return;
-                  if (action === 'apply') {
-                    complete(() => applyDraft(selectedScenario.scenarioId, scenarioCatalog.scenarioCatalogRevision));
-                  } else {
-                    complete(() => loadScenario(selectedScenario.scenarioId, scenarioCatalog.scenarioCatalogRevision, confirmDiscard));
-                  }
+                  complete(() => loadScenario(selectedScenario.scenarioId, scenarioCatalog.scenarioCatalogRevision, confirmDiscard));
                 }}
               >
-                {action === 'apply' ? 'Apply Draft' : 'Load Scenario'}
+                Load Scenario
               </button>
             </div>
           </div>
@@ -322,7 +393,7 @@ export function ProgramDocumentControls({
         {action === 'discard' && (
           <div className="program-dialog-copy">
             <p>Replace the local Draft with the current backend-issued Applied Program.</p>
-            <button type="button" className="primary-action" disabled={authoringBusy || !workspace?.applied.available} onClick={() => complete(discard)}>
+            <button type="button" className="primary-action" disabled={authoringBusy || workspace?.hasUnappliedChanges !== true} onClick={() => complete(discard)}>
               Discard to Applied
             </button>
           </div>
@@ -331,7 +402,7 @@ export function ProgramDocumentControls({
         {action === 'revert' && (
           <div className="program-dialog-copy">
             <p>Restore Saved through the authoritative Apply path, then replace the Draft with that exact result.</p>
-            <button type="button" className="primary-action" disabled={authoringBusy || !workspace?.saved.available || !workspace?.applied.available} onClick={() => complete(revert)}>
+            <button type="button" className="primary-action" disabled={authoringBusy || !hasAppliedUnsavedChanges} onClick={() => complete(revert)}>
               Revert to Saved
             </button>
           </div>

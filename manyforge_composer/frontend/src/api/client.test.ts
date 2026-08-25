@@ -24,9 +24,6 @@ function draftFence(revision = 1): DraftFenceRequest {
   return {
     draftId: 'draft-1',
     expectedDraftRevision: revision,
-    clientId: 'composer-browser.fixture',
-    snapshotReceiverEpoch: 'receiver.epoch.1',
-    snapshotSequence: 9,
     expectedAdmissionGeneration: 4,
     requestOwnerEpoch: 'composer-authoring-owner.fixture',
     requestId: 'composer-authoring.fixture',
@@ -415,11 +412,7 @@ describe('structural API client', () => {
       }));
     vi.stubGlobal('fetch', fetchMock);
 
-    await api.programWorkspace.apply(
-      draftFence(),
-      'cell-pick',
-      `sha256:${'a'.repeat(64)}`,
-    );
+    await api.programWorkspace.apply(draftFence());
     await api.programs.runs(true, 1);
 
     const [applyUrl, applyOptions] = fetchMock.mock.calls[0] as [
@@ -429,8 +422,6 @@ describe('structural API client', () => {
     expect(applyUrl).toBe('/api/program/apply');
     expect(JSON.parse(String(applyOptions.body))).toEqual({
       ...draftFence(),
-      scenarioId: 'cell-pick',
-      scenarioCatalogRevision: `sha256:${'a'.repeat(64)}`,
     });
     expect(fetchMock.mock.calls[1]?.[0]).toBe(
       '/api/program/runs?active_only=true&limit=1',

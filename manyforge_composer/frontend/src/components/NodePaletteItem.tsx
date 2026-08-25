@@ -97,6 +97,20 @@ export function NodePaletteItem({
             <div><dt>Owner API</dt><dd><code>{entry.execution.ownerApi}</code></dd></div>
             <div><dt>Execution</dt><dd>{entry.execution.blocking ? 'blocking' : 'non-blocking'} · {entry.execution.cancellable ? 'cancellable' : 'not cancellable'}</dd></div>
             <div><dt>Minimum profile</dt><dd>{entry.minProgramProfile ?? 'none'}</dd></div>
+            <div>
+              <dt>Required capabilities</dt>
+              <dd>
+                {entry.requiredCapabilities.length === 0
+                  ? 'none'
+                  : entry.requiredCapabilities.map((requirement) => (
+                    <span key={`${requirement.capabilityId}:${requirement.scope}`} className="node-capability-requirement">
+                      <code>{requirement.capabilityId}</code> · {requirement.scope}
+                      {requirement.targetParameter ? ` · target ${requirement.targetParameter}` : ''}
+                      {requirement.componentParameter ? ` · component ${requirement.componentParameter}` : ''}
+                    </span>
+                  ))}
+              </dd>
+            </div>
             <div><dt>Tags</dt><dd>{entry.tags.join(', ') || 'none'}</dd></div>
           </dl>
           <h3>Parameters ({entry.parameters.length})</h3>

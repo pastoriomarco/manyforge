@@ -13,6 +13,7 @@ function controller(
   return {
     state: {
       catalog: null,
+      currentScenario: null,
       applied: {
         schemaVersion: 'manyforge.applied_program_selection.v1',
         scenarioId: 'cell-pick',

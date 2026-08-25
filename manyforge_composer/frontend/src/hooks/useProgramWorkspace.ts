@@ -46,9 +46,6 @@ function fence(
   return {
     draftId: workspace.draft.draftId,
     expectedDraftRevision: workspace.draft.draftRevision,
-    clientId: snapshot.clientId,
-    snapshotReceiverEpoch: snapshot.receiverEpoch,
-    snapshotSequence: snapshot.snapshotSequence,
     expectedAdmissionGeneration: snapshot.authoringAdmission.admissionGeneration,
     requestOwnerEpoch,
     requestId: identity('composer-authoring'),
@@ -107,6 +104,7 @@ export function useProgramWorkspace(snapshot: ComposerHeadlessState | null = nul
   const mounted = useRef(true);
   const workspaceRead = useRef<Promise<ProgramWorkspaceResponse> | null>(null);
   const workspaceReadGeneration = useRef<number | null>(null);
+  const requestedSnapshotIdentity = useRef<string | null>(null);
   const requestOwnerEpoch = useRef(browserStableIdentity(
     'manyforge.composer.request_owner_epoch',
     'composer-authoring-owner',
@@ -117,6 +115,18 @@ export function useProgramWorkspace(snapshot: ComposerHeadlessState | null = nul
     && snapshot.draftIdentity.draftRevision === state.workspace.draft.draftRevision
     && snapshot.authoringAdmission.authoringAllowed
     && snapshot.programCycle.state === 'idle_after_reset';
+  const mutationUnavailableReason = state.workspace === null
+    ? 'Program workspace is not loaded.'
+    : snapshot === null
+      ? 'Backend status is disconnected or has not arrived.'
+      : snapshot.draftIdentity.draftId !== state.workspace.draft.draftId
+        || snapshot.draftIdentity.draftRevision !== state.workspace.draft.draftRevision
+        ? 'The displayed Draft is still synchronizing with the backend.'
+        : snapshot.programCycle.state !== 'idle_after_reset'
+          ? `Program execution is ${snapshot.programCycle.state.replaceAll('_', ' ')}; authoring requires Idle.`
+          : !snapshot.authoringAdmission.authoringAllowed
+            ? 'The backend has not admitted authoring; execution must be Idle and required components healthy.'
+            : null;
   const admissionObserved = snapshot !== null;
 
   const readWorkspace = useCallback((requestGeneration: number) => {
@@ -188,6 +198,22 @@ export function useProgramWorkspace(snapshot: ComposerHeadlessState | null = nul
       mounted.current = false;
     };
   }, [refresh]);
+
+  useEffect(() => {
+    if (snapshot === null || state.workspace === null) return;
+    const displayed = state.workspace.draft;
+    const observed = snapshot.draftIdentity;
+    const backendHasNewerDraft = displayed.draftId !== observed.draftId
+      || observed.draftRevision > displayed.draftRevision;
+    if (!backendHasNewerDraft) {
+      requestedSnapshotIdentity.current = null;
+      return;
+    }
+    const identityKey = `${observed.draftId}:${observed.draftRevision}`;
+    if (requestedSnapshotIdentity.current === identityKey) return;
+    requestedSnapshotIdentity.current = identityKey;
+    void refresh();
+  }, [refresh, snapshot, state.workspace]);
 
   const requireWorkspace = useCallback((): ProgramWorkspaceResponse | null =>
     state.workspace, [state.workspace]);
@@ -274,21 +300,15 @@ export function useProgramWorkspace(snapshot: ComposerHeadlessState | null = nul
     );
   }, [requireWorkspace, run, snapshot]);
 
-  const apply = useCallback((
-    scenarioId: string,
-    scenarioCatalogRevision: string,
-  ) => {
+  const apply = useCallback(() => {
     const workspace = requireWorkspace();
     const requestFence = workspace
       ? fence(workspace, snapshot, requestOwnerEpoch.current) : null;
     if (!requestFence) return;
     void run(
       'apply',
-      () => api.programWorkspace.apply(
-        requestFence,
-        scenarioId,
-        scenarioCatalogRevision,
-      ).then((response) => programWorkspaceTransitionResult('apply', response)),
+      () => api.programWorkspace.apply(requestFence)
+        .then((response) => programWorkspaceTransitionResult('apply', response)),
     );
   }, [requireWorkspace, run, snapshot]);
 
@@ -413,6 +433,7 @@ export function useProgramWorkspace(snapshot: ComposerHeadlessState | null = nul
   return {
     state,
     mutationAvailable,
+    mutationUnavailableReason,
     admissionObserved,
     refresh,
     mutate,

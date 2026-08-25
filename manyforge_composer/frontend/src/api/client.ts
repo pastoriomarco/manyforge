@@ -21,6 +21,7 @@ import {
   parseOperatorAlarmSnapshot,
   parseProgramWorkspaceResponse,
   parseProgramWorkspaceTransitionResponse,
+  parseCurrentScenarioResponse,
   parseProgramCycleResetResult,
   parseProgramNodePolicyMutationResponse,
   parseProgramRunIndex,
@@ -60,6 +61,7 @@ import type {
   ManagerStatusProjection,
   ProgramWorkspaceResponse,
   ProgramWorkspaceTransitionResponse,
+  CurrentScenarioResponse,
   ProgramCycleResetResult,
   ProgramRunIndex,
   ProgramRunStatus,
@@ -421,8 +423,6 @@ export const api = {
     ),
     apply: (
       fence: DraftFenceRequest,
-      scenarioId: string,
-      scenarioCatalogRevision: string,
       signal?: AbortSignal,
     ): Promise<ProgramWorkspaceTransitionResponse> => requestJson(
       '/api/program/apply',
@@ -430,11 +430,7 @@ export const api = {
       signal,
       {
         method: 'POST',
-        body: JSON.stringify({
-          ...fence,
-          scenarioId,
-          scenarioCatalogRevision,
-        }),
+        body: JSON.stringify(fence),
       },
     ),
     discard: (
@@ -495,6 +491,8 @@ export const api = {
   programs: {
     scenarios: (signal?: AbortSignal): Promise<ScenarioCatalogResponse> =>
       requestJson('/api/scenarios', parseScenarioCatalogResponse, signal),
+    currentScenario: (signal?: AbortSignal): Promise<CurrentScenarioResponse> =>
+      requestJson('/api/scenarios/current', parseCurrentScenarioResponse, signal),
     applied: (signal?: AbortSignal): Promise<AppliedProgramSelection> =>
       requestJson('/api/program/applied', parseAppliedProgramSelection, signal),
     runs: (

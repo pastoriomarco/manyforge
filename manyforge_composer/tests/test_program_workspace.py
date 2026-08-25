@@ -74,9 +74,6 @@ def _fence(workspace: dict) -> dict:
     return {
         "draftId": workspace["draft"]["draftId"],
         "expectedDraftRevision": workspace["draft"]["draftRevision"],
-        "clientId": "test-browser",
-        "snapshotReceiverEpoch": "composer-snapshot.test",
-        "snapshotSequence": 1,
         "expectedAdmissionGeneration": 1,
         "requestOwnerEpoch": "test-browser.epoch.1",
         "requestId": "test-browser.request.1",
@@ -209,6 +206,48 @@ def test_node_policy_mutation_is_closed_draft_only_and_revision_fenced(
     assert stale.status_code == 409
     assert stale.json()["detail"]["code"] == "composer_program_revision_stale"
     assert client.get("/api/program/workspace").json()["draft"] == body["draft"]
+
+
+def test_program_settings_mutation_is_validated_and_draft_only(
+    tmp_path: Path,
+) -> None:
+    source = _copy_program(tmp_path)
+    original_bytes = source.read_bytes()
+    client = _client(tmp_path)
+    empty = client.get("/api/program/workspace").json()
+    opened = client.post(
+        "/api/program/open-draft",
+        json={**_fence(empty), "path": str(source)},
+    ).json()
+
+    response = client.post(
+        "/api/program/draft/mutations",
+        json={
+            **_fence(opened),
+            "mutation": "program_draft_update_settings",
+            "arguments": {
+                "name": "Portable pick",
+                "description": "Edited only in the Composer Draft.",
+                "program_profile": "composable-cell-v1",
+                "compatibility": {
+                    "lanes": ["manyforge-only", "real-robot"],
+                    "assistant": "optional",
+                    "requires": ["scene.mutable"],
+                    "tags": ["pick"],
+                },
+            },
+        },
+    )
+
+    assert response.status_code == 200, response.text
+    workspace = response.json()["workspace"]
+    assert workspace["draft"]["program"]["name"] == "Portable pick"
+    assert workspace["draft"]["program"]["compatibility"]["lanes"] == [
+        "manyforge-only",
+        "real-robot",
+    ]
+    assert workspace["hasUnsavedChanges"] is True
+    assert source.read_bytes() == original_bytes
 
 
 @pytest.mark.parametrize("invalid", ["skills", "instance_id"])
@@ -387,8 +426,6 @@ def test_node_policy_success_with_imported_node_a_skills_is_closed_and_headless_
         "/api/program/apply",
         json={
             **_fence({"draft": body["draft"]}),
-            "scenarioId": "cell-pick",
-            "scenarioCatalogRevision": "sha256:" + "7" * 64,
         },
     )
     assert blocked_apply.status_code == 409

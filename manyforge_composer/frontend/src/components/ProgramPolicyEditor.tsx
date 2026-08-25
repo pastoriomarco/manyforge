@@ -249,12 +249,11 @@ export function ProgramPolicyEditor({
             <p className="eyebrow">Authored policy</p>
             <h4 id={fieldId(id, 'title')}>Node policy</h4>
           </div>
-          <code>C1</code>
         </div>
         <p className="program-policy-note">
           Effective canonical defaults are shown when fields are omitted. Defaults
           are saved by omission. These values are authored for future Run behavior;
-          they are not currently applied to the runtime. Update Draft changes only
+          they are not currently applied to the runtime. Saving policy changes only
           this Draft. Save persists independently; global Apply makes the validated
           Draft the live runtime Program. A Run already started keeps its captured policy.
         </p>
@@ -429,17 +428,6 @@ export function ProgramPolicyEditor({
           />
         </label>
 
-        <label className="program-policy-field" htmlFor={fieldId(id, 'allowed_skills')}>
-          Allowed skills
-          <input
-            id={fieldId(id, 'allowed_skills')}
-            value=""
-            disabled
-            readOnly
-            placeholder="Unavailable in C1"
-            aria-describedby={fieldId(id, 'skills-help')}
-          />
-        </label>
         <p id={fieldId(id, 'skills-help')} className="program-policy-help">
           {ALLOWED_SKILLS_UNAVAILABLE_MESSAGE}
         </p>
@@ -483,11 +471,11 @@ export function ProgramPolicyEditor({
           type="submit"
           disabled={busy || Object.keys(errors).length > 0}
         >
-          {busy ? 'Updating Draft…' : 'Update Draft'}
+          {busy ? 'Saving node policy…' : 'Save node policy to Draft'}
         </button>
         {Object.keys(errors).length > 0 && (
           <span className="program-policy-blocked" role="status">
-            Resolve the field guidance before updating this Draft.
+            Resolve the field guidance before saving this policy.
           </span>
         )}
       </div>

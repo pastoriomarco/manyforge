@@ -5,6 +5,10 @@ import {
 } from './composerStore';
 
 describe('composer view reducer', () => {
+  it('starts with vertically stacked node bands', () => {
+    expect(INITIAL_COMPOSER_VIEW_STATE.layoutDirection).toBe('vertical');
+  });
+
   it('retains local graph presentation preferences', () => {
     const horizontal = composerViewReducer(INITIAL_COMPOSER_VIEW_STATE, {
       type: 'set_layout_direction',

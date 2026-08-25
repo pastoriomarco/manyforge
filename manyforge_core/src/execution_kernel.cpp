@@ -1286,10 +1286,10 @@ void ExecutionKernel::run_operator_stop_worker(
         SchedulerPriority::StopControl);
   }
 
-  const auto stop_wall_start = std::chrono::steady_clock::now();
-  const auto stop_wall_deadline =
-      effective_deadline_ns > 0 ? stop_wall_start + std::chrono::nanoseconds(effective_deadline_ns)
-                                : stop_wall_start;
+  const auto stop_settle_start_ns = clock_.now();
+  const auto stop_settle_deadline_ns = effective_deadline_ns > 0
+                                           ? stop_settle_start_ns + effective_deadline_ns
+                                           : stop_settle_start_ns;
   auto controlled_result =
       execution_backend_.execute_controlled_stop(profile, controlled_stop_source->get_token());
   fail_closed_invalid_controlled_stop_result(profile, controlled_result);
@@ -1315,7 +1315,8 @@ void ExecutionKernel::run_operator_stop_worker(
   if (controlled_ok && !stop_path_collision_details.has_value()) {
     const double threshold = kDefaultSettleVelocityThresholdRadS;
     const auto settle_result = wait_for_measured_rest_after_confirmed_stop(
-        execution_backend_, threshold, stop_wall_deadline, stop_token, [this]() {
+        execution_backend_, threshold, stop_settle_deadline_ns, clock_, scheduler_, stop_token,
+        [this]() {
           return operator_stop_path_collision_detected_.load(std::memory_order_acquire);
         });
     settle_signal_observed = settle_result.settle_signal_available;
@@ -3319,10 +3320,10 @@ void ExecutionKernel::handle_motion_trip_latch(const ExecuteRequestDTO& request,
   }
 
   const auto call_start_ns = clock_.now();
-  const auto stop_wall_start = std::chrono::steady_clock::now();
-  const auto stop_wall_deadline =
-      effective_deadline_ns > 0 ? stop_wall_start + std::chrono::nanoseconds(effective_deadline_ns)
-                                : stop_wall_start;
+  const auto stop_settle_start_ns = clock_.now();
+  const auto stop_settle_deadline_ns = effective_deadline_ns > 0
+                                           ? stop_settle_start_ns + effective_deadline_ns
+                                           : stop_settle_start_ns;
   auto stop_result =
       execution_backend_.execute_controlled_stop(profile, trip_stop_source.get_token());
   fail_closed_invalid_controlled_stop_result(profile, stop_result);
@@ -3588,8 +3589,8 @@ void ExecutionKernel::handle_motion_trip_latch(const ExecuteRequestDTO& request,
   }
   const double settle_velocity_threshold_rad_s = kDefaultSettleVelocityThresholdRadS;
   const auto settle_result = wait_for_measured_rest_after_confirmed_stop(
-      execution_backend_, settle_velocity_threshold_rad_s, stop_wall_deadline,
-      trip_stop_source.get_token());
+      execution_backend_, settle_velocity_threshold_rad_s, stop_settle_deadline_ns, clock_,
+      scheduler_, trip_stop_source.get_token());
   if (settle_result.settle_signal_available && !settle_result.at_rest) {
     std::map<std::string, std::string> details{
         {"hard_stop_transitioned", "false"},

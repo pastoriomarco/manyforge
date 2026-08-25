@@ -439,6 +439,13 @@ if(BUILD_TESTING)
   gtest_discover_tests(test_stop_intent
     PROPERTIES TIMEOUT ${MANYFORGE_GTEST_TIMEOUT_SECONDS})
 
+  add_executable(test_execution_stop_support
+    test/test_execution_stop_support.cpp)
+  target_link_libraries(test_execution_stop_support PRIVATE
+    manyforge_core GTest::gtest_main)
+  gtest_discover_tests(test_execution_stop_support
+    PROPERTIES TIMEOUT ${MANYFORGE_GTEST_TIMEOUT_SECONDS})
+
   add_executable(test_stop_scope_resolver
     test/test_stop_scope_resolver.cpp)
   target_link_libraries(test_stop_scope_resolver PRIVATE

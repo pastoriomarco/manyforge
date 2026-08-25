@@ -33,7 +33,7 @@ from .source_model_client import (
     read_active_source_model,
 )
 from .state import ComposerState
-from .authoring_admission import BackendAuthoringMutationEnvelope
+from .authoring_admission import AuthoringMutationEnvelope
 
 
 _MAXIMUM_SAFE_INTEGER = 9_007_199_254_740_991
@@ -514,7 +514,7 @@ def create_assistant_draft_router(state: ComposerState) -> APIRouter:
                     "snapshot": changed.snapshot,
                 }
 
-            envelope = BackendAuthoringMutationEnvelope(
+            envelope = AuthoringMutationEnvelope(
                 expected_admission_generation=body.expected_admission_generation,
                 request_owner_epoch=body.request_owner_epoch,
                 request_id=body.request_id,

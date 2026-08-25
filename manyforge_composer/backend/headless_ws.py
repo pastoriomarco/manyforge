@@ -1,4 +1,4 @@
-"""Per-client complete snapshots over thin owner projections."""
+"""Complete read-only snapshots over thin owner projections."""
 
 from __future__ import annotations
 
@@ -38,19 +38,47 @@ def _encode(value: dict[str, Any]) -> str:
     return encoded
 
 
+def _projection_key(
+    runtime: dict[str, Any],
+    alarms: dict[str, Any],
+    authoring: dict[str, Any],
+    cycle: dict[str, Any],
+    draft: dict[str, Any],
+) -> tuple[Any, ...]:
+    """Return the owner revisions that can change the browser projection."""
+
+    return (
+        runtime.get("projection_owner_epoch"),
+        runtime.get("projection_generation"),
+        alarms.get("owner_epoch"),
+        alarms.get("generation"),
+        alarms.get("state_revision"),
+        authoring.get("authoring_allowed"),
+        authoring.get("admission_generation"),
+        cycle.get("program_runner_owner_epoch"),
+        cycle.get("cycle_generation"),
+        cycle.get("state"),
+        cycle.get("program_run_id"),
+        cycle.get("cycle_claim_generation"),
+        cycle.get("terminal_or_settlement_reference"),
+        draft.get("draft_id"),
+        draft.get("draft_revision"),
+    )
+
+
 async def serve_headless_state(
     websocket: WebSocket,
     client: HeadlessHttpClient,
     *,
-    client_id: str,
     admission: AuthoringAdmissionCoordinator,
     draft_session: ComposerDraftSession,
 ) -> None:
-    """Publish a fresh complete barrier independently for one browser."""
+    """Publish fresh owner projections independently for one browser."""
 
     await websocket.accept()
     sequence = 0
     last_error_message: str | None = None
+    last_projection_key: tuple[Any, ...] | None = None
     try:
         while True:
             try:
@@ -67,6 +95,12 @@ async def serve_headless_state(
                     asyncio.to_thread(client.program_cycle_status),
                 )
                 draft = draft_session.snapshot()
+                projection_key = _projection_key(
+                    runtime, alarms, authoring, cycle, draft
+                )
+                if projection_key == last_projection_key:
+                    await asyncio.sleep(POLL_INTERVAL_SECONDS)
+                    continue
                 sequence += 1
                 payload = {
                     "schema_version": "manyforge.composer_headless_state.v1",
@@ -83,25 +117,14 @@ async def serve_headless_state(
                     "complete": True,
                 }
                 encoded = _encode(payload)
-                # Publish the server-owned barrier before the bytes can be
-                # observed by the client.  If transport delivery then fails,
-                # the outer failure path removes the barrier.  This keeps an
-                # immediate mutation deterministic without making the browser
-                # an authority or relying on a scheduling delay.
-                admission.publish_complete_snapshot(
-                    client_id=client_id,
-                    sequence=sequence,
-                    admission_generation=authoring["admission_generation"],
-                    draft_id=draft["draft_id"],
-                    draft_revision=draft["draft_revision"],
-                )
                 await asyncio.wait_for(
                     websocket.send_text(encoded),
                     timeout=SEND_TIMEOUT_SECONDS,
                 )
+                last_projection_key = projection_key
                 last_error_message = None
             except (HeadlessClientError, KeyError, TypeError, ValueError) as error:
-                admission.disconnect(client_id)
+                last_projection_key = None
                 error_message = _encode(
                     {
                         "schema_version": (
@@ -128,8 +151,6 @@ async def serve_headless_state(
             await asyncio.sleep(POLL_INTERVAL_SECONDS)
     except (WebSocketDisconnect, asyncio.TimeoutError):
         pass
-    finally:
-        admission.disconnect(client_id)
 
 
 __all__ = ["serve_headless_state"]

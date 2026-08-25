@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import importlib.util
 from pathlib import Path
+import socket
 from types import SimpleNamespace
 from typing import Any
 
@@ -115,28 +116,49 @@ def test_status_command_reads_the_current_scenario_without_package_mutation(
     assert "another-native-scenario" in capsys.readouterr().out
 
 
-def test_incremental_build_names_only_the_required_products(
+def test_existing_cache_snapshots_exact_native_closure_before_ui_start(
     monkeypatch: Any, tmp_path: Path
 ) -> None:
-    commands: list[tuple[str, ...]] = []
-    build = tmp_path / "headless"
-    monkeypatch.setattr(dev_workbench, "HEADLESS_BUILD", build)
+    scenario_root = tmp_path / "maintained-scenario-package"
+    package_root = scenario_root / "retained-package"
+    package_root.mkdir(parents=True)
+    qualified_manager = scenario_root / "manyforge_manager_daemon"
+    qualified_headless_root = scenario_root / "headless-python"
+    built_manager = tmp_path / "build/manyforge_manager_daemon"
+    built_extension = tmp_path / "build/manyforge_headless_py.fixture.so"
+    native_host = scenario_root / "manyforge_native_execution_host"
+    candidate_worker = scenario_root / "manyforge_roboplan_candidate_worker"
+    built_manager.parent.mkdir(parents=True)
+    for path, content in (
+        (built_manager, b"qualified-manager"),
+        (built_extension, b"qualified-headless-extension"),
+        (native_host, b"native-host"),
+        (candidate_worker, b"candidate-worker"),
+    ):
+        path.write_bytes(content)
+        path.chmod(0o755)
+
+    monkeypatch.setattr(dev_workbench, "SCENARIO_ROOT", scenario_root)
+    monkeypatch.setattr(dev_workbench, "PACKAGE_ROOT", package_root)
     monkeypatch.setattr(
-        dev_workbench,
-        "_run",
-        lambda command, **_kwargs: commands.append(tuple(command)),
+        dev_workbench, "QUALIFIED_MANAGER_BINARY", qualified_manager
+    )
+    monkeypatch.setattr(
+        dev_workbench, "QUALIFIED_HEADLESS_ROOT", qualified_headless_root
+    )
+    monkeypatch.setattr(dev_workbench, "HEADLESS_BUILD", built_manager.parent)
+    monkeypatch.setattr(dev_workbench, "MANAGER_BINARY", built_manager)
+    monkeypatch.setattr(dev_workbench, "NATIVE_EXECUTION_HOST", native_host)
+    monkeypatch.setattr(
+        dev_workbench, "NATIVE_CANDIDATE_WORKER", candidate_worker
     )
 
-    dev_workbench._configure_and_build("Release")
+    dev_workbench._import_package()
 
-    joined = "\n".join(" ".join(command) for command in commands)
-    assert "manyforge_manager_daemon" in joined
-    assert "manyforge_headless_py" in joined
-    assert all(
-        word not in joined
-        for word in ("ctest", "sanitizer", "qualification", "proof")
-    )
-    assert "-k 0" in joined
+    assert qualified_manager.read_bytes() == b"qualified-manager"
+    assert (
+        qualified_headless_root / built_extension.name
+    ).read_bytes() == b"qualified-headless-extension"
 
 
 def test_startup_requires_the_existing_manager_baseline_to_be_fully_converged() -> None:
@@ -169,6 +191,33 @@ def test_startup_requires_the_existing_manager_baseline_to_be_fully_converged() 
         {**status, "status": {**status["status"], "manager_ready": False}},
         diff,
     ) is False
+
+
+def test_stale_socket_cleanup_removes_only_the_named_socket(tmp_path: Path) -> None:
+    socket_path = tmp_path / "manager-command.sock"
+    listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    try:
+        listener.bind(str(socket_path))
+
+        dev_workbench._remove_stale_socket(socket_path, "Manager command socket")
+
+        assert not socket_path.exists()
+    finally:
+        listener.close()
+
+
+def test_stale_socket_cleanup_rejects_non_socket_state(tmp_path: Path) -> None:
+    state_path = tmp_path / "manager-command.sock"
+    state_path.write_text("persistent state", encoding="utf-8")
+
+    try:
+        dev_workbench._remove_stale_socket(state_path, "Manager command socket")
+    except dev_workbench.WorkbenchError as error:
+        assert str(error) == f"Manager command socket is not a socket: {state_path}"
+    else:
+        raise AssertionError("non-socket state was removed")
+
+    assert state_path.read_text(encoding="utf-8") == "persistent state"
 
 
 def test_launcher_pins_the_image_and_separates_its_cache() -> None:

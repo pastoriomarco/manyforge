@@ -5,6 +5,7 @@ import type {
   CatalogEntry,
   CatalogParameter,
   CatalogResponse,
+  CurrentScenarioResponse,
   DraftMutationResponse,
   ProgramDraftProjection,
   ProgramDraftApplicability,
@@ -2196,6 +2197,90 @@ export function parseScenarioCatalogResponse(value: unknown): ScenarioCatalogRes
       'scenarioCatalog.scenario_catalog_revision',
     ),
     scenarios,
+  };
+}
+
+export function parseCurrentScenarioResponse(value: unknown): CurrentScenarioResponse {
+  const path = 'currentScenario';
+  const record = objectAt(value, path);
+  exactKeysAt(
+    record,
+    ['schema_version', 'ready', 'current_scenario', 'unavailable_reasons'],
+    path,
+  );
+  const schemaVersion = stringAt(record.schema_version, `${path}.schema_version`);
+  if (schemaVersion !== 'manyforge.current_scenario.v1') {
+    return fail(`${path}.schema_version`, 'the supported current-Scenario version');
+  }
+  const ready = booleanAt(record.ready, `${path}.ready`);
+  const unavailableReasons = stringArrayAt(
+    record.unavailable_reasons,
+    `${path}.unavailable_reasons`,
+  );
+  const current = record.current_scenario === null
+    ? null
+    : objectAt(record.current_scenario, `${path}.current_scenario`);
+  if (ready !== (current !== null)) {
+    return fail(path, 'a current Scenario exactly when ready');
+  }
+  if (ready !== (unavailableReasons.length === 0)) {
+    return fail(path, 'unavailable reasons exactly when no current Scenario exists');
+  }
+  if (current === null) {
+    return {
+      schemaVersion: 'manyforge.current_scenario.v1',
+      ready,
+      currentScenario: null,
+      unavailableReasons,
+    };
+  }
+  exactKeysAt(current, [
+    'scenario_id',
+    'scenario_catalog_revision',
+    'deployment_artifact_id',
+    'deployment_revision',
+    'retained_bundle_id',
+    'graph_revision',
+    'program_id',
+    'program_revision',
+    'program_binding_id',
+  ], `${path}.current_scenario`);
+  return {
+    schemaVersion: 'manyforge.current_scenario.v1',
+    ready,
+    currentScenario: {
+      scenarioId: stringAt(current.scenario_id, `${path}.current_scenario.scenario_id`),
+      scenarioCatalogRevision: digestAt(
+        current.scenario_catalog_revision,
+        `${path}.current_scenario.scenario_catalog_revision`,
+      ),
+      deploymentArtifactId: stringAt(
+        current.deployment_artifact_id,
+        `${path}.current_scenario.deployment_artifact_id`,
+      ),
+      deploymentRevision: digestAt(
+        current.deployment_revision,
+        `${path}.current_scenario.deployment_revision`,
+      ),
+      retainedBundleId: digestAt(
+        current.retained_bundle_id,
+        `${path}.current_scenario.retained_bundle_id`,
+      ),
+      graphRevision: digestAt(
+        current.graph_revision,
+        `${path}.current_scenario.graph_revision`,
+      ),
+      programId: stringAt(current.program_id, `${path}.current_scenario.program_id`),
+      programRevision: digestAt(
+        current.program_revision,
+        `${path}.current_scenario.program_revision`,
+      ),
+      programBindingId: digestAt(
+        current.program_binding_id,
+        `${path}.current_scenario.program_binding_id`,
+      ),
+    },
+    unavailableReasons,
   };
 }
 
@@ -4485,7 +4570,7 @@ export function parseOperatorAlarmSnapshot(
 
 export function parseComposerHeadlessState(
   value: unknown,
-): Omit<ComposerHeadlessState, 'clientId'> {
+): ComposerHeadlessState {
   const record = objectAt(value, 'headlessState');
   exactKeysAt(record, [
     'schema_version', 'runtime', 'alarms', 'authoring_admission',

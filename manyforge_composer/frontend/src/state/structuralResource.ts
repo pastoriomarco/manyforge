@@ -1,4 +1,4 @@
-import { useEffect, useReducer, useState } from 'react';
+import { useCallback, useEffect, useReducer, useState } from 'react';
 
 export type StructuralResourceState<T> =
   | { status: 'loading' }
@@ -105,5 +105,9 @@ export function useStructuralResource<T>(
     reloadToken,
   ]);
 
-  return [state, () => setReloadToken((current) => current + 1)];
+  const retry = useCallback(() => {
+    setReloadToken((current) => current + 1);
+  }, []);
+
+  return [state, retry];
 }

@@ -463,6 +463,7 @@ describe('Program authoring panels', () => {
   it('keeps the complete authoring geometry when no Draft is open', () => {
     const controller = {
       mutationAvailable: true,
+      mutationUnavailableReason: null,
       admissionObserved: true,
       state: {
         status: 'ready',
@@ -518,6 +519,7 @@ describe('Program authoring panels', () => {
       state: {
         catalog: null,
         applied: null,
+        currentScenario: null,
         run: null,
         selectedScenarioId: null,
         runnerAvailable: false,
@@ -629,6 +631,7 @@ describe('Program authoring panels', () => {
     };
     const controller = {
       mutationAvailable: true,
+      mutationUnavailableReason: null,
       admissionObserved: true,
       state: {
         status: 'ready',
@@ -671,6 +674,7 @@ describe('Program authoring panels', () => {
           }],
         },
         applied: null,
+        currentScenario: null,
         run: null,
         selectedScenarioId: 'qualified',
         runnerAvailable: true,
@@ -720,5 +724,12 @@ describe('Program authoring panels', () => {
     expect(controlsSource).toContain('!workspace?.applicability.applyReady');
     expect(controlsSource).toContain('Affected nodes:');
     expect(controlsSource).toContain('workspace?.applicability.unavailableReason?.message');
+    const settingsSource = readFileSync(
+      new URL('./ProgramSettingsEditor.tsx', import.meta.url),
+      'utf8',
+    );
+    expect(settingsSource).toContain(
+      'currentScenario.programBindingId === appliedBinding.program_binding_id',
+    );
   });
 });
