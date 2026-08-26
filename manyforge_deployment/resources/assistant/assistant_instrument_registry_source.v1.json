@@ -7619,7 +7619,7 @@
       "tool_id": "tree_draft_change_node_kind"
     },
     {
-      "description": "Delete one non-root Draft subtree.",
+      "description": "Delete one Draft node, detaching its direct children as retained roots.",
       "effect": "composer_draft_mutating",
       "input_schema": {
         "additionalProperties": false,

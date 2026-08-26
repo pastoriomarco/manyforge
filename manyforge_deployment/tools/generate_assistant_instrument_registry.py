@@ -1115,7 +1115,7 @@ def _tools(catalog: NodeCatalog) -> list[dict[str, Any]]:
         _tool(
             "tree_draft_delete_node",
             "composer_draft_mutating",
-            "Delete one non-root Draft subtree.",
+            "Delete one Draft node, detaching its direct children as retained roots.",
             _object(
                 {"instance_id": copy.deepcopy(IDENTIFIER)},
                 required=("instance_id",),

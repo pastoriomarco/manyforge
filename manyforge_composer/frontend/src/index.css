@@ -2648,15 +2648,13 @@ code {
 
 .program-specialized-editor,
 .program-variant-editor,
-.program-waypoint,
-.program-joint-target {
+.program-waypoint {
   display: grid;
   gap: 0.55rem;
 }
 
 .program-specialized-editor label,
-.program-variant-editor label,
-.program-joint-target label {
+.program-variant-editor label {
   display: grid;
   gap: 0.25rem;
   color: #91a8b3;
@@ -2664,12 +2662,99 @@ code {
 }
 
 .program-vector-editor,
-.program-waypoint,
-.program-joint-target {
+.program-waypoint {
   margin: 0;
   padding: 0.55rem;
   border: 1px solid #294652;
   border-radius: 0.4rem;
+}
+
+.program-joint-target-list {
+  display: grid;
+  gap: 0;
+  min-width: 0;
+  margin: 0;
+  padding: 0;
+  border: 0;
+}
+
+.program-joint-target-list > legend {
+  padding: 0;
+  color: #b9cbd3;
+  font-size: 0.72rem;
+  font-weight: 680;
+}
+
+.program-joint-target-list > .program-form-hint {
+  margin: 0.3rem 0 0.5rem;
+  line-height: 1.4;
+}
+
+.program-joint-target-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(6.5rem, 0.75fr);
+  align-items: center;
+  gap: 0.55rem;
+  min-width: 0;
+  padding: 0.45rem 0;
+  border-top: 1px solid #203743;
+}
+
+.program-joint-target-choice {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr);
+  align-items: center;
+  gap: 0.4rem;
+  min-width: 0;
+  color: #b8cad2;
+  font-size: 0.68rem;
+}
+
+.program-joint-target-choice input {
+  margin: 0;
+  accent-color: #5fc0d8;
+}
+
+.program-joint-target-choice code {
+  min-width: 0;
+  overflow-wrap: anywhere;
+  color: #c4dce5;
+}
+
+.program-joint-target-choice span {
+  grid-column: 2;
+  color: #dc8a80;
+  font-size: 0.58rem;
+}
+
+.program-joint-target-position {
+  display: grid;
+  min-width: 0;
+  gap: 0.2rem;
+  color: #78919d;
+  font-size: 0.6rem;
+}
+
+.program-joint-target-position input {
+  width: 100%;
+  min-width: 0;
+}
+
+.program-joint-target-row.unselected .program-joint-target-position input:disabled {
+  color: transparent;
+  background: #09151c;
+}
+
+.program-joint-target-row.unavailable {
+  border-left: 2px solid #c96f67;
+  padding-left: 0.4rem;
+}
+
+.program-joint-inventory-unavailable {
+  margin: 0 0 0.5rem;
+  color: #d0a477;
+  font-size: 0.62rem;
+  line-height: 1.4;
 }
 
 .program-vector-editor legend,
@@ -4739,6 +4824,10 @@ code {
   box-shadow: 0 1.2rem 4rem rgb(0 0 0 / 55%);
 }
 
+.overlay-panel.overlay-panel-compact {
+  width: min(25rem, calc(100vw - 2rem));
+}
+
 .overlay-info .overlay-panel {
   width: min(38rem, calc(100vw - 2rem));
 }
@@ -4805,6 +4894,19 @@ code {
   line-height: 1.5;
 }
 
+.program-compact-confirmation {
+  justify-items: end;
+}
+
+.program-compact-confirmation p {
+  justify-self: stretch;
+}
+
+.program-compact-confirmation .primary-action {
+  width: auto;
+  padding: 0.38rem 0.7rem;
+}
+
 .program-settings-editor,
 .program-settings-section {
   display: grid;
@@ -4866,21 +4968,11 @@ code {
   font-size: 0.65rem;
 }
 
-.program-binding-projection p,
-.program-current-scenario {
+.program-binding-projection p {
   margin: 0;
   color: #91a7b2;
   font-size: 0.68rem;
   line-height: 1.45;
-}
-
-.program-current-scenario {
-  display: grid;
-  gap: 0.2rem;
-  padding: 0.55rem;
-  border: 1px solid #365665;
-  border-radius: 0.4rem;
-  background: #10232d;
 }
 
 .program-save-as-path,

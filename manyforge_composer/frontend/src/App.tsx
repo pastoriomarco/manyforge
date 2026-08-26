@@ -73,6 +73,11 @@ export default function App() {
   );
   const headlessEnabled = health.status === 'ready'
     && health.data.mode === 'headless_client';
+  const [sourceModel, retrySourceModel] = useStructuralResource(api.sourceModel.get, {
+    enabled: headlessEnabled,
+    disabledMessage: 'Source-model facts require a connected headless owner.',
+    failureMessage: 'Could not read the verified active source-model projection.',
+  });
   const assistantEnabled = headlessEnabled
     && health.data.components.assistant_bridge === 'configured';
   const headlessStateSource = useHeadlessStateSource(headlessEnabled);
@@ -212,6 +217,7 @@ export default function App() {
               runtime={programRuntime}
               catalog={catalog}
               environment={nodeEnvironment}
+              sourceModel={sourceModel}
               onRetryCatalog={retryCatalog}
               onRetryEnvironment={retryNodeEnvironment}
               onInvalidEditChange={setProgramInvalidEdit}
@@ -245,14 +251,15 @@ export default function App() {
           <div className="workbench-pane">
             <div className="viewer-slot">
               <SceneAuthoringWorkspace
-                enabled={headlessEnabled}
                 editorTarget={sceneEditorTarget}
                 environment={nodeEnvironment}
                 headlessStateSource={headlessStateSource}
                 manifest={manifest}
                 onRetryManifest={retryManifest}
+                onRetrySourceModel={retrySourceModel}
                 programController={programController}
                 robotControl={robotControl}
+                sourceModel={sourceModel}
                 viewerActive
               />
             </div>

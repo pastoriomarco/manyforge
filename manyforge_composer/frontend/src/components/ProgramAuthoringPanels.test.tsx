@@ -23,6 +23,7 @@ import {
 } from './ProgramPropertyEditor';
 import { ProgramTreeCanvas } from './ProgramTreeCanvas';
 import { ProgramWorkspace } from './ProgramWorkspace';
+import { ProgramSchemaValueEditor } from './property/ProgramSchemaValueEditor';
 
 const sequence: CatalogEntry = {
   id: 'sequence',
@@ -406,6 +407,57 @@ describe('Program authoring panels', () => {
     expect(markup).not.toContain('data-editor="gripper-coordinate"');
   });
 
+  it('renders source joints as checked sparse positions plus empty disabled choices', () => {
+    const markup = renderToStaticMarkup(
+      <ProgramSchemaValueEditor
+        schema={{
+          type: 'array',
+          minItems: 1,
+          maxItems: 6,
+          items: {
+            type: 'object',
+            additionalProperties: false,
+            required: ['joint_name', 'position_rad'],
+            properties: {
+              joint_name: {
+                type: 'string',
+                'x-manyforge-semantic-type': 'source_joint',
+              },
+              position_rad: { type: 'number' },
+            },
+          },
+        }}
+        value={[
+          { joint_name: 'joint3', position_rad: 0.75 },
+          { joint_name: 'joint1', position_rad: 0 },
+        ]}
+        disabled={false}
+        context={{
+          entry: timer,
+          node: tree.children[0]!,
+          parameterId: 'goal',
+          program: authoringProgram([tree]),
+          sourceJointInventory: {
+            jointNames: ['joint1', 'joint2', 'joint3'],
+            targetRole: 'arm',
+            unavailableReason: null,
+          },
+        }}
+        onCommit={vi.fn()}
+      />,
+    );
+
+    expect(markup.match(/type="checkbox"/g)).toHaveLength(3);
+    expect(markup).toContain('<code>joint3</code>');
+    expect(markup).toContain('<code>joint2</code>');
+    expect(markup).toContain('value="0.75"');
+    expect(markup).toContain('aria-label="joint2 target position in radians"');
+    expect(markup).toContain('disabled=""');
+    expect(markup).not.toContain('Add joint');
+    expect(markup).not.toContain('Remove joint');
+    expect(markup).not.toContain('Joint name');
+  });
+
   it('does not offer an empty Literal transition for a required blackboard binding', () => {
     const requiredTree: ProgramTreeNode = {
       node_id: 'timer',
@@ -581,6 +633,7 @@ describe('Program authoring panels', () => {
           },
         }}
         environment={{ status: 'ready', data: environment }}
+        sourceModel={{ status: 'loading' }}
         onRetryCatalog={vi.fn()}
         onRetryEnvironment={vi.fn()}
       />,
@@ -753,6 +806,7 @@ describe('Program authoring panels', () => {
             },
           }}
           environment={{ status: 'ready', data: environment }}
+          sourceModel={{ status: 'loading' }}
           onRetryCatalog={vi.fn()}
           onRetryEnvironment={vi.fn()}
         />
@@ -768,6 +822,14 @@ describe('Program authoring panels', () => {
     expect(controlsSource).toContain('!workspace?.applicability.applyReady');
     expect(controlsSource).toContain('Affected nodes:');
     expect(controlsSource).toContain('workspace?.applicability.unavailableReason?.message');
+    expect(controlsSource).toContain(
+      "compact={action === 'apply' || action === 'discard' || action === 'revert'}",
+    );
+    expect(controlsSource).toContain('Apply this Program Draft to');
+    expect(controlsSource).toContain('Its Deployment will not change.');
+    expect(controlsSource).toContain('Replace the Applied Program and Draft with the Saved Program?');
+    expect(controlsSource).not.toContain('className="program-current-scenario"');
+    expect(controlsSource).toContain('Your Saved Program will not change.');
     const settingsSource = readFileSync(
       new URL('./ProgramSettingsEditor.tsx', import.meta.url),
       'utf8',

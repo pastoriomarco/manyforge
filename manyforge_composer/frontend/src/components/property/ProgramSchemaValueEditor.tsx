@@ -15,6 +15,7 @@ import {
   programSemanticExpectedType,
   type ProgramSemanticCreateTarget,
 } from '../../utils/programAuthoring';
+import type { ProgramSourceJointInventory } from '../../utils/programSourceJoints';
 import { DraftTextInput, DraftTextarea } from '../common/DraftInputs';
 import {
   ProgramSpecializedEditor,
@@ -26,6 +27,7 @@ export interface ProgramSchemaValueEditorContext {
   node: ProgramTreeNode;
   parameterId: string;
   program: ProgramAuthoringDocument;
+  sourceJointInventory?: ProgramSourceJointInventory | null;
   onCreateReference?: (
     target: ProgramSemanticCreateTarget,
     expectedType: string | null,
@@ -521,6 +523,7 @@ export function ProgramSchemaValueEditor(props: ProgramSchemaValueEditorProps) {
         schema={schema}
         value={value ?? defaultValue(schema)}
         disabled={disabled}
+        sourceJointInventory={props.context.sourceJointInventory}
         onCommit={onCommit}
         onInvalidChange={onInvalidChange}
       />

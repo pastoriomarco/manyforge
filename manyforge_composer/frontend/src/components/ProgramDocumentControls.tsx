@@ -43,9 +43,9 @@ function actionTitle(action: ProgramAction): string {
     case 'new': return 'New Program';
     case 'open': return 'Open Program as Draft';
     case 'save_as': return 'Save Program As';
-    case 'apply': return 'Apply Program Draft';
-    case 'revert': return 'Revert Program to Saved';
-    case 'discard': return 'Discard Draft Changes';
+    case 'apply': return 'Apply Draft?';
+    case 'revert': return 'Revert to Saved?';
+    case 'discard': return 'Discard Draft changes?';
     case 'load': return 'Load Scenario';
   }
 }
@@ -277,6 +277,7 @@ export function ProgramDocumentControls({
         open={action !== null}
         title={action === null ? 'Program action' : actionTitle(action)}
         titleId="program-action-dialog-title"
+        compact={action === 'apply' || action === 'discard' || action === 'revert'}
         onClose={closeAction}
         returnFocusRef={returnFocus}
       >
@@ -335,13 +336,12 @@ export function ProgramDocumentControls({
         )}
 
         {action === 'apply' && (
-          <div className="program-dialog-copy">
+          <div className="program-dialog-copy program-compact-confirmation">
             {currentScenario ? (
-              <div className="program-current-scenario" aria-label="Current Program Apply target">
-                <strong>{currentScenario.scenarioId}</strong>
-                <span>Deployment {currentScenario.deploymentArtifactId} · {shortRevision(currentScenario.deploymentRevision)}</span>
-                <span>Binding {shortRevision(currentScenario.programBindingId)}</span>
-              </div>
+              <p>
+                Apply this Program Draft to <strong>{currentScenario.scenarioId}</strong>?
+                {' '}Its Deployment will not change.
+              </p>
             ) : (
               <div className="program-apply-blocked" role="alert">
                 <strong>No exact current Scenario.</strong>
@@ -349,10 +349,6 @@ export function ProgramDocumentControls({
                 <span>Use Load Scenario to activate a complete Program, Deployment, and Binding.</span>
               </div>
             )}
-            <p>
-              Apply replaces only the Program in this exact current Scenario.
-              It never selects or changes Deployment.
-            </p>
             {!workspace?.applicability.applyReady && (
               <div className="program-apply-blocked" role="alert">
                 <strong>Draft is not Apply-ready.</strong>
@@ -372,7 +368,7 @@ export function ProgramDocumentControls({
               }
               onClick={() => complete(applyDraft)}
             >
-              Apply Draft to {currentScenario?.scenarioId ?? 'current Scenario'}
+              Apply Draft
             </button>
           </div>
         )}
@@ -425,17 +421,17 @@ export function ProgramDocumentControls({
         )}
 
         {action === 'discard' && (
-          <div className="program-dialog-copy">
-            <p>Replace the local Draft with the current backend-issued Applied Program.</p>
+          <div className="program-dialog-copy program-compact-confirmation">
+            <p>The editor will return to the Applied Program. Your Saved Program will not change.</p>
             <button type="button" className="primary-action" disabled={authoringBusy || workspace?.hasUnappliedChanges !== true} onClick={() => complete(discard)}>
-              Discard to Applied
+              Discard changes
             </button>
           </div>
         )}
 
         {action === 'revert' && (
-          <div className="program-dialog-copy">
-            <p>Restore Saved through the authoritative Apply path, then replace the Draft with that exact result.</p>
+          <div className="program-dialog-copy program-compact-confirmation">
+            <p>Replace the Applied Program and Draft with the Saved Program?</p>
             <button type="button" className="primary-action" disabled={authoringBusy || !hasAppliedUnsavedChanges} onClick={() => complete(revert)}>
               Revert to Saved
             </button>

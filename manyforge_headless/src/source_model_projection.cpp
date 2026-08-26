@@ -341,15 +341,17 @@ std::set<std::pair<std::string, std::string>> CommandableCoordinates(
     const deployment::VerifiedRetainedModelMap& model_map,
     const deployment::CompositionTargetResolution& target) {
   std::set<std::pair<std::string, std::string>> result;
-  const auto* binding =
-      model_map.find_binding(target.controllable_component_id, target.command_target_id);
-  if (binding == nullptr) {
-    return result;
-  }
-  for (const auto& resource : binding->resources) {
-    for (const auto& coordinate : resource.coordinates) {
-      if (!coordinate.derived_mimic) {
-        result.emplace(coordinate.model_instance_id.value(), coordinate.source_joint_name);
+  for (const auto& binding : model_map.control_bindings()) {
+    if (binding.controllable_component_id != target.controllable_component_id ||
+        binding.command_target_id != target.command_target_id) {
+      continue;
+    }
+    for (const auto& resource : binding.resources) {
+      for (const auto& coordinate : resource.coordinates) {
+        if (!coordinate.derived_mimic) {
+          result.emplace(coordinate.model_instance_id.value(),
+                         coordinate.source_joint_name);
+        }
       }
     }
   }

@@ -325,4 +325,48 @@ describe('Program tree canvas presentation actions', () => {
       },
     });
   });
+
+  it('keeps topology attachment and deletion available for a detached root', () => {
+    const detached: ProgramTreeNode = {
+      node_id: 'timer',
+      instance_id: 'detached',
+      parameters: {},
+      children: [],
+    };
+    const markup = renderToStaticMarkup(
+      <ProgramTreeCanvas
+        roots={[tree, detached]}
+        retainedPositions={{}}
+        catalogEntries={[sequence, timer]}
+        environment={environment}
+        selectedId="detached"
+        invalidNodeIds={new Set(['detached'])}
+        busy={false}
+        onSelect={vi.fn()}
+        onMutate={vi.fn()}
+      />,
+    );
+
+    expect(markup).toContain('aria-label="Topology actions for detached"');
+    expect(markup).toContain('>Parent<select');
+    expect(markup).toContain('<option value="root">root</option>');
+    expect(markup).toMatch(/disabled="">Move earlier<\/button>/);
+    expect(markup).toMatch(/disabled="">Move later<\/button>/);
+    expect(markup).toContain('class="danger-button">Delete</button>');
+
+    const noAlternativeParentMarkup = renderToStaticMarkup(
+      <ProgramTreeCanvas
+        roots={[tree]}
+        retainedPositions={{}}
+        catalogEntries={[sequence, timer]}
+        environment={environment}
+        selectedId="settle"
+        invalidNodeIds={new Set()}
+        busy={false}
+        onSelect={vi.fn()}
+        onMutate={vi.fn()}
+      />,
+    );
+    expect(noAlternativeParentMarkup).toContain('>Reparent<select disabled=""');
+  });
 });

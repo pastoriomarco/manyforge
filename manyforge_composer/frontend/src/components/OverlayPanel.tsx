@@ -12,6 +12,7 @@ interface OverlayPanelProps {
   title: string;
   titleId: string;
   kind?: 'dialog' | 'info' | 'status';
+  compact?: boolean;
   onClose: () => void;
   returnFocusRef?: RefObject<HTMLElement | null>;
   children: ReactNode;
@@ -26,6 +27,7 @@ export function OverlayPanel({
   title,
   titleId,
   kind = 'dialog',
+  compact = false,
   onClose,
   returnFocusRef,
   children,
@@ -60,7 +62,7 @@ export function OverlayPanel({
       role="presentation"
     >
       <section
-        className="overlay-panel"
+        className={`overlay-panel${compact ? ' overlay-panel-compact' : ''}`}
         role="dialog"
         aria-modal={kind === 'dialog'}
         aria-labelledby={titleId}

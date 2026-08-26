@@ -1013,6 +1013,105 @@ def test_tree_rename_is_atomic_and_moves_position_identity() -> None:
     assert session.snapshot() == before
 
 
+def test_tree_delete_removes_only_the_node_and_detaches_direct_children() -> None:
+    root_session = ComposerDraftSession(_program())
+    _mutate(
+        root_session,
+        "tree_draft_update_positions",
+        {
+            "positions": {
+                "main_sequence": {"x": 40.0, "y": 100.0},
+                "move_to_pick": {"x": 320.0, "y": 80.0},
+                "remove_table": {"x": 320.0, "y": 180.0},
+            }
+        },
+    )
+    deleted_root = _mutate(
+        root_session,
+        "tree_draft_delete_node",
+        {"instance_id": "main_sequence"},
+    )
+    assert deleted_root.details == {
+        "deleted_instance_id": "main_sequence",
+        "detached_child_instance_ids": ["move_to_pick", "remove_table"],
+    }
+    assert [
+        node["instance_id"]
+        for node in deleted_root.snapshot["authoring"]["forest"]
+    ] == ["move_to_pick", "remove_table"]
+    assert "main_sequence" not in deleted_root.snapshot["authoring"]["positions"]
+    assert deleted_root.snapshot["authoring"]["positions"]["move_to_pick"] == {
+        "x": 320.0,
+        "y": 80.0,
+    }
+
+    nested_session = ComposerDraftSession(_program())
+    _mutate(
+        nested_session,
+        "tree_draft_insert_node",
+        {
+            "parent_instance_id": "main_sequence",
+            "node": {
+                "node_id": "fallback",
+                "instance_id": "delete_parent",
+                "parameters": {},
+                "children": [
+                    {
+                        "node_id": "sequence",
+                        "instance_id": "detached_sequence",
+                        "parameters": {},
+                        "children": [
+                            {
+                                "node_id": "timer",
+                                "instance_id": "retained_grandchild",
+                                "parameters": {"duration_s": 0.1},
+                                "children": [],
+                            }
+                        ],
+                    },
+                    {
+                        "node_id": "timer",
+                        "instance_id": "detached_timer",
+                        "parameters": {"duration_s": 0.2},
+                        "children": [],
+                    },
+                ],
+            },
+        },
+    )
+    _mutate(
+        nested_session,
+        "tree_draft_update_positions",
+        {
+            "positions": {
+                "delete_parent": {"x": 300.0, "y": 280.0},
+                "detached_sequence": {"x": 520.0, "y": 240.0},
+                "retained_grandchild": {"x": 740.0, "y": 240.0},
+                "detached_timer": {"x": 520.0, "y": 340.0},
+            }
+        },
+    )
+    deleted_nested = _mutate(
+        nested_session,
+        "tree_draft_delete_node",
+        {"instance_id": "delete_parent"},
+    )
+    forest = deleted_nested.snapshot["authoring"]["forest"]
+    assert [node["instance_id"] for node in forest] == [
+        "main_sequence",
+        "detached_sequence",
+        "detached_timer",
+    ]
+    assert forest[1]["children"][0]["instance_id"] == "retained_grandchild"
+    assert "delete_parent" not in deleted_nested.snapshot["authoring"]["positions"]
+    for instance_id in (
+        "detached_sequence",
+        "retained_grandchild",
+        "detached_timer",
+    ):
+        assert instance_id in deleted_nested.snapshot["authoring"]["positions"]
+
+
 def test_program_role_requirements_replace_through_one_operator_mutation() -> None:
     session = ComposerDraftSession(_program())
     before = session.snapshot()

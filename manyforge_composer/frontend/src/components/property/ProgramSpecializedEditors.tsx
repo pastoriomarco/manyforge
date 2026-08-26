@@ -3,6 +3,7 @@ import {
   useCallback,
   useContext,
   useEffect,
+  useMemo,
   useRef,
   useState,
   type ReactNode,
@@ -10,6 +11,7 @@ import {
 
 import type { CatalogJsonSchema, JsonValue } from '../../types/api';
 import { firstCatalogSchemaValidationMessage } from '../../utils/catalogSchema';
+import type { ProgramSourceJointInventory } from '../../utils/programSourceJoints';
 import { DraftTextInput } from '../common/DraftInputs';
 
 type JsonObject = Record<string, JsonValue>;
@@ -480,147 +482,237 @@ function MotionReferenceEditor({
   );
 }
 
+export interface JointTargetEditorRow {
+  jointName: string;
+  positionText: string;
+  selected: boolean;
+  available: boolean;
+}
+
+export function jointTargetEditorRows(
+  availableJointNames: string[],
+  value: JsonValue[],
+): JointTargetEditorRow[] {
+  const available = new Set(availableJointNames);
+  const selected = new Set<string>();
+  const rows = value.map((item) => {
+    const target = objectValue(item);
+    const jointName = String(target.joint_name);
+    selected.add(jointName);
+    return {
+      jointName,
+      positionText: String(target.position_rad),
+      selected: true,
+      available: available.has(jointName),
+    };
+  });
+  for (const jointName of availableJointNames) {
+    if (selected.has(jointName)) continue;
+    rows.push({ jointName, positionText: '', selected: false, available: true });
+  }
+  return rows;
+}
+
+export function toggleJointTargetRow(
+  rows: JointTargetEditorRow[],
+  jointName: string,
+  selected: boolean,
+  availableJointNames: string[],
+): JointTargetEditorRow[] {
+  const changed = rows.find((row) => row.jointName === jointName);
+  if (changed === undefined) return rows;
+  const remaining = rows.filter((row) => row.jointName !== jointName);
+  const next = { ...changed, selected, positionText: '' };
+  if (selected) {
+    const firstUnselected = remaining.findIndex((row) => !row.selected);
+    if (firstUnselected < 0) return [...remaining, next];
+    return [
+      ...remaining.slice(0, firstUnselected),
+      next,
+      ...remaining.slice(firstUnselected),
+    ];
+  }
+  const availableOrder = new Map(
+    availableJointNames.map((name, index) => [name, index]),
+  );
+  const selectedRows = remaining.filter((row) => row.selected);
+  const unselectedRows = [
+    ...remaining.filter((row) => !row.selected),
+    next,
+  ].sort((left, right) => (
+    (availableOrder.get(left.jointName) ?? Number.POSITIVE_INFINITY)
+    - (availableOrder.get(right.jointName) ?? Number.POSITIVE_INFINITY)
+  ));
+  return [...selectedRows, ...unselectedRows];
+}
+
+export function jointTargetTransitionMessage(
+  schema: CatalogJsonSchema,
+  rows: JointTargetEditorRow[],
+): string | null {
+  const selected = rows.filter((row) => row.selected);
+  if (selected.length < (schema.minItems ?? 0)) {
+    return `Select at least ${schema.minItems ?? 0} joint${schema.minItems === 1 ? '' : 's'}.`;
+  }
+  if (selected.length > (schema.maxItems ?? Number.POSITIVE_INFINITY)) {
+    return `Select no more than ${schema.maxItems} joints.`;
+  }
+  for (const row of selected) {
+    if (!row.positionText.trim()) return `Enter a target position for ${row.jointName}.`;
+    if (!Number.isFinite(Number(row.positionText))) {
+      return `${row.jointName} must have a finite target position.`;
+    }
+  }
+  return firstCatalogSchemaValidationMessage(
+    schema,
+    selected.map((row) => ({
+      joint_name: row.jointName,
+      position_rad: Number(row.positionText),
+    })),
+    'joint_targets',
+  );
+}
+
+export function completeJointTargetTransition(
+  schema: CatalogJsonSchema,
+  rows: JointTargetEditorRow[],
+): JsonValue[] | undefined {
+  if (jointTargetTransitionMessage(schema, rows) !== null) return undefined;
+  return rows.filter((row) => row.selected).map((row) => ({
+    joint_name: row.jointName,
+    position_rad: Number(row.positionText),
+  }));
+}
+
+function JointTargetPositionInput({
+  jointName,
+  value,
+  disabled,
+  onCommit,
+}: {
+  jointName: string;
+  value: string;
+  disabled: boolean;
+  onCommit: (value: string) => void;
+}) {
+  const reportInvalid = useSpecializedInvalidReporter();
+  return (
+    <DraftTextInput
+      type="number"
+      step="any"
+      value={value}
+      disabled={disabled}
+      aria-label={`${jointName} target position in radians`}
+      placeholder={disabled ? '' : 'Required'}
+      validate={(text) => text.trim() !== '' && Number.isFinite(Number(text))
+        ? null
+        : `${jointName} must have a finite target position.`}
+      onInvalidChange={reportInvalid}
+      onCommit={onCommit}
+    />
+  );
+}
+
 function JointTargetListEditor({
   schema,
   value,
   disabled,
+  sourceJointInventory,
   onCommit,
 }: {
   schema: CatalogJsonSchema;
   value: JsonValue[];
   disabled: boolean;
+  sourceJointInventory?: ProgramSourceJointInventory | null;
   onCommit: (value: JsonValue) => void;
 }) {
-  const [stagedJointName, setStagedJointName] = useState<string | null>(null);
-  const [stagedPosition, setStagedPosition] = useState<number | undefined>();
-  const commitRow = (index: number, patch: JsonObject) => {
-    const next = [...value];
-    next[index] = { ...objectValue(next[index]), ...patch };
-    onCommit(next);
+  const reportInvalid = useSpecializedInvalidReporter();
+  const availableJointNames = useMemo(
+    () => sourceJointInventory?.jointNames ?? [],
+    [sourceJointInventory],
+  );
+  const inventoryAvailable = sourceJointInventory?.unavailableReason === null;
+  const [rows, setRows] = useState<JointTargetEditorRow[]>(() =>
+    jointTargetEditorRows(availableJointNames, value));
+  useEffect(() => {
+    setRows(jointTargetEditorRows(availableJointNames, value));
+    reportInvalid(null);
+  }, [availableJointNames, reportInvalid, value]);
+
+  const stage = (nextRows: JointTargetEditorRow[]) => {
+    setRows(nextRows);
+    const message = jointTargetTransitionMessage(schema, nextRows);
+    reportInvalid(message);
+    if (message !== null) return;
+    const next = completeJointTargetTransition(schema, nextRows);
+    if (next !== undefined && JSON.stringify(next) !== JSON.stringify(value)) onCommit(next);
   };
+  const selectedCount = rows.filter((row) => row.selected).length;
+  const maximumSelected = selectedCount >= (schema.maxItems ?? Number.POSITIVE_INFINITY);
+
   return (
-    <div className="program-specialized-editor" data-editor="joint-target-list">
-      {value.map((row, index) => {
-        const target = objectValue(row);
+    <fieldset className="program-joint-target-list" data-editor="joint-target-list">
+      <legend>Joint goal</legend>
+      <p className="program-form-hint">
+        Select the joints to command and enter each target position in radians.
+        Selected joints retain their authored order; a newly selected joint is added last.
+      </p>
+      {sourceJointInventory?.unavailableReason && (
+        <p className="program-joint-inventory-unavailable" role="status">
+          {sourceJointInventory.unavailableReason}
+          {' '}Existing values remain visible and removable, but new joint selection is unavailable.
+        </p>
+      )}
+      {rows.map((row) => {
+        const unavailableCurrent = inventoryAvailable && !row.available;
+        const selectionDisabled = disabled
+          || (!row.selected && (!inventoryAvailable || maximumSelected));
         return (
-          <div className="program-joint-target" key={`${index}-${String(target.joint_name)}`}>
-            <label>
-              Joint name
-              <DraftTextInput
-                value={typeof target.joint_name === 'string' ? target.joint_name : ''}
-                disabled={disabled}
-                aria-label={`Joint ${index + 1} name`}
-                onCommit={(jointName) => commitRow(index, { joint_name: jointName })}
+          <div
+            className={`program-joint-target-row ${row.selected ? 'selected' : 'unselected'}${unavailableCurrent ? ' unavailable' : ''}`}
+            key={row.jointName}
+          >
+            <label className="program-joint-target-choice">
+              <input
+                type="checkbox"
+                checked={row.selected}
+                disabled={selectionDisabled}
+                aria-label={`Include ${row.jointName} in joint goal`}
+                title={!row.selected && maximumSelected
+                  ? `This goal accepts at most ${schema.maxItems} joints.`
+                  : undefined}
+                onChange={(event) => {
+                  stage(toggleJointTargetRow(
+                    rows,
+                    row.jointName,
+                    event.target.checked,
+                    availableJointNames,
+                  ));
+                }}
+              />
+              <code>{row.jointName}</code>
+              {unavailableCurrent && <span>not commandable by this target</span>}
+            </label>
+            <label className="program-joint-target-position">
+              <span>Position (rad)</span>
+              <JointTargetPositionInput
+                jointName={row.jointName}
+                value={row.selected ? row.positionText : ''}
+                disabled={disabled || !row.selected}
+                onCommit={(positionText) => stage(rows.map((candidate) =>
+                  candidate.jointName === row.jointName
+                    ? { ...candidate, positionText }
+                    : candidate))}
               />
             </label>
-            <NumberField
-              label={`Joint ${index + 1} position (rad)`}
-              value={typeof target.position_rad === 'number' ? target.position_rad : 0}
-              disabled={disabled}
-              onCommit={(position) => commitRow(index, { position_rad: position })}
-            />
-            <button
-              type="button"
-              className="text-button"
-              disabled={disabled || value.length <= (schema.minItems ?? 0)}
-              onClick={() => onCommit(value.filter((_, rowIndex) => rowIndex !== index))}
-            >
-              Remove joint
-            </button>
           </div>
         );
       })}
-      {stagedJointName !== null && (
-        <div className="program-joint-target">
-          <label>
-            New joint name
-            <DraftTextInput
-              value={stagedJointName}
-              disabled={disabled}
-              aria-label="New joint name"
-              onCommit={(jointName) => {
-                setStagedJointName(jointName);
-                const next = completeJointAdditionTransition(
-                  schema,
-                  value,
-                  jointName,
-                  stagedPosition,
-                );
-                if (next) {
-                  onCommit(next);
-                  setStagedJointName(null);
-                  setStagedPosition(undefined);
-                }
-              }}
-            />
-          </label>
-          <NumberField
-            label="New joint position (rad)"
-            value={stagedPosition ?? 0}
-            disabled={disabled}
-            onCommit={(position) => {
-              setStagedPosition(position);
-              const next = completeJointAdditionTransition(
-                schema,
-                value,
-                stagedJointName,
-                position,
-              );
-              if (next) {
-                onCommit(next);
-                setStagedJointName(null);
-                setStagedPosition(undefined);
-              }
-            }}
-          />
-          <p className="program-form-hint">
-            Enter a source-local joint name and position before this row is saved.
-          </p>
-          <button
-            type="button"
-            className="text-button"
-            disabled={disabled}
-            onClick={() => {
-              setStagedJointName(null);
-              setStagedPosition(undefined);
-            }}
-          >
-            Cancel joint
-          </button>
-        </div>
+      {rows.length === 0 && (
+        <p className="program-form-hint">No commandable source joints are available.</p>
       )}
-      <button
-        type="button"
-        className="text-button"
-        disabled={
-          disabled
-          || stagedJointName !== null
-          || value.length >= (schema.maxItems ?? Number.POSITIVE_INFINITY)
-        }
-        onClick={() => setStagedJointName('')}
-      >
-        Add joint
-      </button>
-    </div>
+    </fieldset>
   );
-}
-
-export function completeJointAdditionTransition(
-  schema: CatalogJsonSchema,
-  value: JsonValue[],
-  jointName: string,
-  position: number | undefined,
-): JsonValue[] | undefined {
-  const trimmedName = jointName.trim();
-  if (!trimmedName || position === undefined || !Number.isFinite(position)) return undefined;
-  const row: JsonObject = { joint_name: trimmedName, position_rad: position };
-  if (firstCatalogSchemaValidationMessage(schema.items ?? {}, row, 'joint_target')) {
-    return undefined;
-  }
-  const candidate = [...value, row];
-  return firstCatalogSchemaValidationMessage(schema, candidate, 'joint_targets')
-    ? undefined
-    : candidate;
 }
 
 function CartesianPathEditor({
@@ -778,12 +870,14 @@ export function ProgramSpecializedEditor({
   schema,
   value,
   disabled,
+  sourceJointInventory,
   onCommit,
   onInvalidChange,
 }: {
   schema: CatalogJsonSchema;
   value: JsonValue;
   disabled: boolean;
+  sourceJointInventory?: ProgramSourceJointInventory | null;
   onCommit: (value: JsonValue) => void;
   onInvalidChange?: (message: string | null) => void;
 }) {
@@ -808,7 +902,15 @@ export function ProgramSpecializedEditor({
   const kind = specializedKind(schema);
   let content: ReactNode = null;
   if (kind === 'joint-target-list') {
-    content = <JointTargetListEditor schema={schema} value={value as JsonValue[]} disabled={disabled} onCommit={onCommit} />;
+    content = (
+      <JointTargetListEditor
+        schema={schema}
+        value={value as JsonValue[]}
+        disabled={disabled}
+        sourceJointInventory={sourceJointInventory}
+        onCommit={onCommit}
+      />
+    );
   } else if (kind === 'cartesian-path') {
     content = <CartesianPathEditor schema={schema} value={value as JsonValue[]} disabled={disabled} onCommit={onCommit} />;
   } else if (kind === 'motion-pose') {

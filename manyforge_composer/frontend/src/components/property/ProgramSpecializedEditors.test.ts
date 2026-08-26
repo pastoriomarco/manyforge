@@ -4,11 +4,14 @@ import type { CatalogJsonSchema } from '../../types/api';
 import {
   completeCoordinateKindTransition,
   completeFrameReferenceTransition,
-  completeJointAdditionTransition,
+  completeJointTargetTransition,
   completeMotionPoseFrameAddTransition,
   completeMotionPoseFrameRemoveTransition,
   completeMotionReferenceTransition,
   completeOrientationTransition,
+  jointTargetEditorRows,
+  jointTargetTransitionMessage,
+  toggleJointTargetRow,
 } from './ProgramSpecializedEditors';
 
 const frameReferenceSchema: CatalogJsonSchema = {
@@ -272,46 +275,65 @@ describe('Program specialized editor transitions', () => {
     )).toBeUndefined();
   });
 
-  it('stages joint addition without mutating existing rows until the row is complete', () => {
-    const existing = [{ joint_name: 'joint_a', position_rad: 0.2 }];
-    expect(completeJointAdditionTransition(
-      jointTargetSchema,
-      existing,
-      '',
-      0,
-    )).toBeUndefined();
-    expect(completeJointAdditionTransition(
-      jointTargetSchema,
-      existing,
-      'joint_b',
-      undefined,
-    )).toBeUndefined();
-    expect(completeJointAdditionTransition(
-      jointTargetSchema,
-      existing,
-      'joint_b',
-      9,
-    )).toBeUndefined();
-    expect(completeJointAdditionTransition(
-      jointTargetSchema,
-      existing,
-      ' joint_b ',
-      -0.4,
-    )).toEqual([
-      ...existing,
+  it('shows every commandable joint and preserves sparse authored order', () => {
+    const rows = jointTargetEditorRows(
+      ['joint_a', 'joint_b', 'joint_c'],
+      [
+        { joint_name: 'joint_c', position_rad: 0.2 },
+        { joint_name: 'joint_a', position_rad: -0.1 },
+      ],
+    );
+    expect(rows).toEqual([
+      { jointName: 'joint_c', positionText: '0.2', selected: true, available: true },
+      { jointName: 'joint_a', positionText: '-0.1', selected: true, available: true },
+      { jointName: 'joint_b', positionText: '', selected: false, available: true },
+    ]);
+
+    const selected = toggleJointTargetRow(rows, 'joint_b', true, [
+      'joint_a', 'joint_b', 'joint_c',
+    ]);
+    expect(selected.map((row) => [row.jointName, row.selected, row.positionText])).toEqual([
+      ['joint_c', true, '0.2'],
+      ['joint_a', true, '-0.1'],
+      ['joint_b', true, ''],
+    ]);
+    expect(jointTargetTransitionMessage(jointTargetSchema, selected)).toBe(
+      'Enter a target position for joint_b.',
+    );
+    expect(completeJointTargetTransition(jointTargetSchema, selected)).toBeUndefined();
+
+    const completed = selected.map((row) => row.jointName === 'joint_b'
+      ? { ...row, positionText: '-0.4' }
+      : row);
+    expect(completeJointTargetTransition(jointTargetSchema, completed)).toEqual([
+      { joint_name: 'joint_c', position_rad: 0.2 },
+      { joint_name: 'joint_a', position_rad: -0.1 },
       { joint_name: 'joint_b', position_rad: -0.4 },
     ]);
-    expect(existing).toEqual([{ joint_name: 'joint_a', position_rad: 0.2 }]);
-    expect(completeJointAdditionTransition(
-      jointTargetSchema,
-      [
-        ...existing,
-        { joint_name: 'joint_b', position_rad: 0 },
-        { joint_name: 'joint_c', position_rad: 0 },
-      ],
-      'joint_d',
-      0,
-    )).toBeUndefined();
+
+    const removed = toggleJointTargetRow(completed, 'joint_a', false, [
+      'joint_a', 'joint_b', 'joint_c',
+    ]);
+    expect(completeJointTargetTransition(jointTargetSchema, removed)).toEqual([
+      { joint_name: 'joint_c', position_rad: 0.2 },
+      { joint_name: 'joint_b', position_rad: -0.4 },
+    ]);
+    expect(removed.at(-1)).toEqual({
+      jointName: 'joint_a', positionText: '', selected: false, available: true,
+    });
+  });
+
+  it('retains an unavailable authored joint visibly and rejects an empty goal', () => {
+    expect(jointTargetEditorRows(
+      ['joint_a'],
+      [{ joint_name: 'legacy_joint', position_rad: 0.3 }],
+    )).toEqual([
+      { jointName: 'legacy_joint', positionText: '0.3', selected: true, available: false },
+      { jointName: 'joint_a', positionText: '', selected: false, available: true },
+    ]);
+    expect(jointTargetTransitionMessage(jointTargetSchema, [
+      { jointName: 'joint_a', positionText: '', selected: false, available: true },
+    ])).toBe('Select at least 1 joint.');
   });
 
   it('replaces coordinate kind and omits the stale incompatible coordinate', () => {

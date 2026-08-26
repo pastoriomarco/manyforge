@@ -657,7 +657,7 @@ export function ProgramTreeCanvas({
     );
   }, [applyLayout, dispatchView, layoutNodes, view.layoutDirection]);
 
-  const parentOptions = selectedRow === null || selectedRow.parentId === null
+  const parentOptions = selectedRow === null
     ? []
     : flat.filter((candidate) =>
       candidate.node.instance_id !== selectedRow.node.instance_id
@@ -785,30 +785,46 @@ export function ProgramTreeCanvas({
           <Background color="#29404d" gap={24} />
           <Controls showInteractive />
         </ReactFlow>
-        {selectedRow && selectedRow.parentId !== null && (
+        {selectedRow && (
           <div
             className="program-tree-actions"
             aria-label={`Topology actions for ${selectedRow.node.instance_id}`}
           >
             <button
               type="button"
-              disabled={authoringDisabled || selectedRow.index === 0}
-              onClick={() => void moveSelected(selectedRow.parentId as string, selectedRow.index - 1)}
+              disabled={
+                authoringDisabled
+                || selectedRow.parentId === null
+                || selectedRow.index === 0
+              }
+              onClick={() => {
+                if (selectedRow.parentId !== null) {
+                  void moveSelected(selectedRow.parentId, selectedRow.index - 1);
+                }
+              }}
             >
               Move earlier
             </button>
             <button
               type="button"
-              disabled={authoringDisabled || selectedRow.index >= (
-                flat.find((row) => row.node.instance_id === selectedRow.parentId)
-                  ?.node.children.length ?? 1
-              ) - 1}
-              onClick={() => void moveSelected(selectedRow.parentId as string, selectedRow.index + 1)}
+              disabled={
+                authoringDisabled
+                || selectedRow.parentId === null
+                || selectedRow.index >= (
+                  flat.find((row) => row.node.instance_id === selectedRow.parentId)
+                    ?.node.children.length ?? 1
+                ) - 1
+              }
+              onClick={() => {
+                if (selectedRow.parentId !== null) {
+                  void moveSelected(selectedRow.parentId, selectedRow.index + 1);
+                }
+              }}
             >
               Move later
             </button>
             <label className="inline-select-label">
-              Reparent
+              {selectedRow.parentId === null ? 'Parent' : 'Reparent'}
               <select
                 value=""
                 disabled={authoringDisabled || parentOptions.length === 0}

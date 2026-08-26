@@ -60,7 +60,8 @@ describe('Program workspace lifecycle controls', () => {
     expect(source).toContain('New Program');
     expect(source).toContain('newDraft(confirmDiscard)');
     expect(source).toContain('Revert to Saved');
-    expect(source).toContain('Discard to Applied');
+    expect(source).toContain('Discard changes');
+    expect(source).toContain('return to the Applied Program');
     expect(source).toContain(
       'disabled={authoringBusy || workspace?.hasUnappliedChanges !== true}',
     );
@@ -144,8 +145,8 @@ describe('Program workspace lifecycle controls', () => {
       new URL('./ProgramDocumentControls.tsx', import.meta.url),
       'utf8',
     );
-    expect(source).toContain('Apply replaces only the Program in this exact current Scenario.');
-    expect(source).toContain('It never selects or changes Deployment.');
+    expect(source).toContain('Apply this Program Draft to');
+    expect(source).toContain('Its Deployment will not change.');
     expect(source).toContain('Load activates this Scenario’s exact Deployment');
     expect(source).toContain('loadScenario(selectedScenario.scenarioId');
     expect(source).toContain('currentScenarioProjection?.currentScenario');

@@ -1806,10 +1806,22 @@ class ComposerDraftSession:
         )
         if index is None:
             _error("draft_node_not_found", "the Draft node has no retained position")
+        root_index = next(
+            root_index
+            for root_index, root in enumerate(tree)
+            if _contains_instance(root, node["instance_id"])
+        )
+        direct_children = node["children"]
         (tree if parent is None else parent["children"]).pop(index)
-        for instance_id in _tree_ids([node]):
-            document["positions"].pop(instance_id, None)
-        return {"deleted_instance_id": node["instance_id"]}
+        detached_index = root_index if parent is None else root_index + 1
+        tree[detached_index:detached_index] = direct_children
+        document["positions"].pop(node["instance_id"], None)
+        return {
+            "deleted_instance_id": node["instance_id"],
+            "detached_child_instance_ids": [
+                child["instance_id"] for child in direct_children
+            ],
+        }
 
     def _tree_move(
         self, document: dict[str, Any], arguments: dict[str, Any], _catalog: NodeCatalog

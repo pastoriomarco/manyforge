@@ -15,7 +15,6 @@ import {
 } from '../state/sceneAuthoring';
 import { runtimeScenePresentation } from '../state/runtimeScenePresentation';
 import type { StructuralResourceState } from '../state/structuralResource';
-import { useStructuralResource } from '../state/structuralResource';
 import {
   programViewerMetadata,
   viewerPresentationDraftFromProgram,
@@ -39,13 +38,14 @@ import { StructuralViewer } from './StructuralViewer';
 
 interface SceneAuthoringWorkspaceProps {
   editorTarget: HTMLElement | null;
-  enabled: boolean;
   environment: StructuralResourceState<NodeEnvironmentResponse>;
   headlessStateSource: HeadlessStateSource;
   manifest: StructuralResourceState<SceneUrdfManifest>;
   onRetryManifest: () => void;
+  onRetrySourceModel: () => void;
   programController: ProgramWorkspaceController;
   robotControl: RobotControlController;
+  sourceModel: StructuralResourceState<SourceModelProjection>;
   viewerActive: boolean;
 }
 
@@ -656,21 +656,17 @@ const SceneViewerBridge = memo(function SceneViewerBridge({
 
 export function SceneAuthoringWorkspace({
   editorTarget,
-  enabled,
   environment,
   headlessStateSource,
   manifest,
   onRetryManifest,
+  onRetrySourceModel,
   programController,
   robotControl,
+  sourceModel,
   viewerActive,
 }: SceneAuthoringWorkspaceProps) {
   const headlessState = useShellHeadlessState(headlessStateSource);
-  const [sourceModel, retrySourceModel] = useStructuralResource(api.sourceModel.get, {
-    enabled,
-    disabledMessage: 'Source-model facts require a connected headless owner.',
-    failureMessage: 'Could not read the verified active source-model projection.',
-  });
   const programWorkspace = programController.state.workspace;
   const program = programWorkspace?.draft.authoring ?? null;
   const draftRevision = programWorkspace?.draft.draftRevision ?? 0;
@@ -846,7 +842,7 @@ export function SceneAuthoringWorkspace({
             <p className="eyebrow">Draft authoring + owner projection</p>
             <h2 id="scene-authoring-title">Scene and viewer workspace</h2>
           </div>
-          <button type="button" className="quiet-button" onClick={retrySourceModel}>
+          <button type="button" className="quiet-button" onClick={onRetrySourceModel}>
             Refresh source facts
           </button>
         </header>

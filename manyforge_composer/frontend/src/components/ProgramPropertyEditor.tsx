@@ -2,6 +2,7 @@ import { useEffect, useMemo, useState } from 'react';
 
 import type {
   BlackboardKeyDeclaration,
+  AppliedProgramSelection,
   CatalogEntry,
   CatalogParameter,
   DraftMutationResponse,
@@ -14,6 +15,7 @@ import type {
   ProgramParameterDeclaration,
   ProgramTreeNode,
   ProgramValueSource,
+  SourceModelProjection,
 } from '../types/api';
 import { firstCatalogParameterValidationMessage } from '../utils/catalogParameterValidation';
 import {
@@ -22,6 +24,9 @@ import {
   programDiagnosticNodeId,
   resolveProgramParameterLiteralValue,
 } from '../utils/programAuthoring';
+import {
+  programSourceJointInventory,
+} from '../utils/programSourceJoints';
 import { DraftTextInput, DraftTextarea } from './common/DraftInputs';
 import {
   ProgramSchemaValueEditor,
@@ -35,6 +40,9 @@ interface ProgramPropertyEditorProps {
   selectedId: string | null;
   catalogEntries: CatalogEntry[];
   program: ProgramAuthoringDocument;
+  appliedProgram?: AppliedProgramSelection | null;
+  sourceModel?: SourceModelProjection | null;
+  sourceModelUnavailableReason?: string | null;
   busy: boolean;
   onMutate: (
     mutation: string,
@@ -146,6 +154,9 @@ export function ProgramPropertyEditor({
   selectedId,
   catalogEntries,
   program,
+  appliedProgram = null,
+  sourceModel = null,
+  sourceModelUnavailableReason = null,
   busy,
   onMutate,
   onCreateReference,
@@ -170,6 +181,22 @@ export function ProgramPropertyEditor({
   const selectedDiagnostics = useMemo(() => diagnostics.filter((diagnostic) =>
     programDiagnosticNodeId(roots, diagnostic.path) === selectedId,
   ), [diagnostics, roots, selectedId]);
+  const sourceJointInventory = useMemo(() => selected === null
+    ? null
+    : programSourceJointInventory(
+      program,
+      selected,
+      appliedProgram,
+      sourceModel,
+      sourceModelUnavailableReason
+        ?? 'The active source-model projection is unavailable.',
+    ), [
+      appliedProgram,
+      program,
+      selected,
+      sourceModel,
+      sourceModelUnavailableReason,
+    ]);
   useEffect(() => {
     setErrors({});
     setDiscardEpoch((current) => current + 1);
@@ -528,6 +555,7 @@ export function ProgramPropertyEditor({
                       node: selected,
                       parameterId: parameter.id,
                       program,
+                      sourceJointInventory,
                       onCreateReference,
                     }}
                     path={parameter.id}

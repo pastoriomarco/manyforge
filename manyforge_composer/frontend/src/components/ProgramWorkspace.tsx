@@ -7,6 +7,7 @@ import type { StructuralResourceState } from '../state/structuralResource';
 import type {
   CatalogResponse,
   NodeEnvironmentResponse,
+  SourceModelProjection,
 } from '../types/api';
 import {
   flattenProgramForest,
@@ -56,6 +57,7 @@ interface ProgramWorkspaceProps {
   runtime: ProgramRuntimeController;
   catalog: StructuralResourceState<CatalogResponse>;
   environment: StructuralResourceState<NodeEnvironmentResponse>;
+  sourceModel: StructuralResourceState<SourceModelProjection>;
   onRetryCatalog: () => void;
   onRetryEnvironment: () => void;
   onInvalidEditChange?: (invalid: boolean) => void;
@@ -73,6 +75,7 @@ export function ProgramWorkspace({
   runtime,
   catalog,
   environment,
+  sourceModel,
   onRetryCatalog,
   onRetryEnvironment,
   onInvalidEditChange,
@@ -583,6 +586,13 @@ export function ProgramWorkspace({
                   selectedId={selectedNodeId}
                   catalogEntries={catalogEntries}
                   program={authoring}
+                  appliedProgram={runtime.state.applied}
+                  sourceModel={sourceModel.status === 'ready' ? sourceModel.data : null}
+                  sourceModelUnavailableReason={sourceModel.status === 'loading'
+                    ? 'Reading commandable joints from the active source model.'
+                    : sourceModel.status === 'ready'
+                      ? null
+                      : sourceModel.message}
                   busy={authoringBusy}
                   onMutate={mutate}
                   onCreateReference={(target, expectedType, expectedAccess, source) => {

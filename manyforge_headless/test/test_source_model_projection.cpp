@@ -52,6 +52,9 @@ TEST(SourceModelProjection, RetainedBundleProjectsSourceLocalOccurrenceAndTarget
   EXPECT_NE(bytes.find("\"source_link_names\":["), std::string::npos);
   EXPECT_NE(bytes.find("\"link_base\""), std::string::npos);
   EXPECT_NE(bytes.find("\"source_group_name\":\"lite6\""), std::string::npos);
+  EXPECT_NE(bytes.find("\"commandable_source_joint_names\":[\"joint1\",\"joint2\","
+                       "\"joint3\",\"joint4\",\"joint5\",\"joint6\"]"),
+            std::string::npos);
   EXPECT_NE(bytes.find("\"source_group_state_name\":\"home\""), std::string::npos);
   EXPECT_NE(bytes.find("\"source_end_effector_name\":\"lite_gripper\""), std::string::npos);
   EXPECT_NE(bytes.find("\"source_parent_link_name\":\"link_tcp\""), std::string::npos);
