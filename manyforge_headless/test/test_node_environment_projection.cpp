@@ -104,13 +104,14 @@ TEST(NodeEnvironmentProjection,
   const auto admission = LoadAdmission();
   const ActiveNodeEnvironmentProjection projection(
       MANYFORGE_HEADLESS_TEST_CANONICAL_EMPTY_PACKAGE_ROOT,
-      MANYFORGE_HEADLESS_TEST_NODE_CATALOG);
+      MANYFORGE_HEADLESS_TEST_NODE_CATALOG,
+      MANYFORGE_HEADLESS_TEST_NODE_ENVIRONMENT_MANIFEST);
 
   const auto available = projection.Project(admission.retained_bundle(), true);
   const auto bytes = content_identity::canonical_json(available);
   EXPECT_NE(
       bytes.find(
-          "\"schema_version\":\"manyforge.node_environment_projection.v1\""),
+          "\"schema_version\":\"manyforge.node_environment_projection.v2\""),
       std::string::npos);
   EXPECT_NE(bytes.find("\"portable_authoring_available\":true"),
             std::string::npos);
@@ -140,6 +141,7 @@ TEST(NodeEnvironmentProjection,
   EXPECT_NE(bytes.find(admission.retained_bundle_id().value()),
             std::string::npos);
   EXPECT_NE(bytes.find(admission.graph_revision().value()), std::string::npos);
+  EXPECT_NE(bytes.find("\"package_environment\":"), std::string::npos);
 
   const auto unavailable = content_identity::canonical_json(
       projection.Project(admission.retained_bundle(), false));
@@ -158,7 +160,8 @@ TEST(NodeEnvironmentProjection, RejectsATamperedCatalogBeforePublication) {
 
   EXPECT_THROW(
       ActiveNodeEnvironmentProjection(
-          MANYFORGE_HEADLESS_TEST_CANONICAL_EMPTY_PACKAGE_ROOT, catalog_path),
+          MANYFORGE_HEADLESS_TEST_CANONICAL_EMPTY_PACKAGE_ROOT, catalog_path,
+          MANYFORGE_HEADLESS_TEST_NODE_ENVIRONMENT_MANIFEST),
       NodeEnvironmentProjectionError);
 }
 
@@ -170,7 +173,22 @@ TEST(NodeEnvironmentProjection, RejectsASymlinkedCatalogInput) {
 
   EXPECT_THROW(
       ActiveNodeEnvironmentProjection(
-          MANYFORGE_HEADLESS_TEST_CANONICAL_EMPTY_PACKAGE_ROOT, catalog_path),
+          MANYFORGE_HEADLESS_TEST_CANONICAL_EMPTY_PACKAGE_ROOT, catalog_path,
+          MANYFORGE_HEADLESS_TEST_NODE_ENVIRONMENT_MANIFEST),
+      NodeEnvironmentProjectionError);
+}
+
+TEST(NodeEnvironmentProjection, RejectsATamperedCurrentManifest) {
+  TemporaryDirectory directory;
+  auto manifest = Read(MANYFORGE_HEADLESS_TEST_NODE_ENVIRONMENT_MANIFEST);
+  ReplaceOnce(manifest, "manyforge_builtin", "manyforge_builtim");
+  const auto manifest_path = directory.path() / "node-environment.yaml";
+  Write(manifest_path, manifest);
+
+  EXPECT_THROW(
+      ActiveNodeEnvironmentProjection(
+          MANYFORGE_HEADLESS_TEST_CANONICAL_EMPTY_PACKAGE_ROOT,
+          MANYFORGE_HEADLESS_TEST_NODE_CATALOG, manifest_path),
       NodeEnvironmentProjectionError);
 }
 
@@ -188,7 +206,8 @@ TEST(NodeEnvironmentProjection, RejectsATamperedRetainedManifest) {
   Write(manifest_path, manifest);
 
   const ActiveNodeEnvironmentProjection projection(
-      package_root, MANYFORGE_HEADLESS_TEST_NODE_CATALOG);
+      package_root, MANYFORGE_HEADLESS_TEST_NODE_CATALOG,
+      MANYFORGE_HEADLESS_TEST_NODE_ENVIRONMENT_MANIFEST);
   EXPECT_THROW(projection.Project(admission.retained_bundle(), true),
                NodeEnvironmentProjectionError);
 }

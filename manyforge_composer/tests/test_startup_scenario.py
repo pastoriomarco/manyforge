@@ -42,8 +42,12 @@ def _selection(program: dict[str, Any]) -> dict[str, Any]:
 
 
 def _applied(selection: dict[str, Any]) -> dict[str, Any]:
+    compiled_binding_id = "sha256:" + "9" * 64
     return {
         **deepcopy(selection),
+        "baseline_program_binding_id": selection["program_binding_id"],
+        "program_binding_id": compiled_binding_id,
+        "program_binding": {"program_binding_id": compiled_binding_id},
         "source": {"record_digest": "sha256:" + "7" * 64},
     }
 

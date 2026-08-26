@@ -110,7 +110,7 @@ def _sized_context_payload(size: int, *, native: bool = False) -> bytes:
     prefix += (
         b'{"schema_version":"manyforge.source_model_context.v1",'
         b'"node_environment":{"schema_version":"manyforge.'
-        b'node_environment_projection.v1"},'
+        b'node_environment_projection.v2"},'
         b'"source_model":{"schema_version":"manyforge.source_model_projection.v1",'
         b'"padding":"'
     )
@@ -160,7 +160,7 @@ def test_client_uses_the_dedicated_node_environment_route() -> None:
         requests.append(request)
         return httpx.Response(
             200,
-            json={"schema_version": "manyforge.node_environment_projection.v1"},
+            json={"schema_version": "manyforge.node_environment_projection.v2"},
             request=request,
         )
 
@@ -170,7 +170,7 @@ def test_client_uses_the_dedicated_node_environment_route() -> None:
     )
     client = HeadlessHttpClient("http://unused.test", client=raw)
     try:
-        assert client.node_environment()["schema_version"].endswith("projection.v1")
+        assert client.node_environment()["schema_version"].endswith("projection.v2")
     finally:
         raw.close()
     assert [request.url.path for request in requests] == ["/api/node-environment"]

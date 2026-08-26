@@ -442,6 +442,9 @@ class FakeCore:
         self.model_attempts: list[dict[str, Any]] = []
         self.source_model_context_override: dict[str, Any] | None = None
         self.scenario_selection_override: dict[str, Any] | None = None
+        self.node_environment_digest = (
+            "sha256:c626ce50efeece59bf8ef77a3ef5e93919767ad57215bd26099c85a00643fd0f"
+        )
 
     def runtime_snapshot(self) -> dict[str, Any]:
         return {
@@ -467,9 +470,10 @@ class FakeCore:
 
     def node_environment_projection(self) -> dict[str, Any]:
         return {
-            "schema_version": "manyforge.node_environment_projection.v1",
+            "schema_version": "manyforge.node_environment_projection.v2",
             "retained_bundle_id": "bundle.1",
             "graph_revision": "graph.1",
+            "environment_digest": self.node_environment_digest,
             "source": {
                 "available": True,
                 "freshness": "fresh",
@@ -1147,9 +1151,23 @@ def _applied_for_program_run() -> dict[str, Any]:
 
 
 class FakeProgramRunner:
-    def __init__(self, *, active: bool = True) -> None:
+    def __init__(
+        self,
+        *,
+        active: bool = True,
+        node_environment_digest: str | None = None,
+    ) -> None:
         self.active = active
+        self.node_environment_digest = node_environment_digest
         self.calls: list[tuple[str, Any]] = []
+
+    def _snapshot(self, *, state: str = "running") -> dict[str, Any]:
+        snapshot = _program_run_snapshot(state=state)
+        if self.node_environment_digest is not None:
+            snapshot["capture"]["node_environment_digest"] = (
+                self.node_environment_digest
+            )
+        return snapshot
 
     def runs(self, *, active_only: bool, limit: int) -> dict[str, Any]:
         self.calls.append(("runs", (active_only, limit)))
@@ -1159,16 +1177,16 @@ class FakeProgramRunner:
             "owner_epoch": "program-runner.epoch.1",
             "active_only": active_only,
             "truncated": False,
-            "runs": [_program_run_snapshot()] if self.active else [],
+            "runs": [self._snapshot()] if self.active else [],
         }
 
     def start_run(self, body: dict[str, Any]) -> dict[str, Any]:
         self.calls.append(("start", copy.deepcopy(body)))
-        return _program_run_snapshot()
+        return self._snapshot()
 
     def read_run(self, program_run_id: str) -> dict[str, Any]:
         self.calls.append(("read", program_run_id))
-        return _program_run_snapshot()
+        return self._snapshot()
 
     def stop_run(
         self,
@@ -1176,7 +1194,7 @@ class FakeProgramRunner:
         body: dict[str, Any],
     ) -> dict[str, Any]:
         self.calls.append(("stop", (program_run_id, copy.deepcopy(body))))
-        return _program_run_snapshot(state="stopping")
+        return self._snapshot(state="stopping")
 
     def close(self) -> None:
         self.calls.append(("close", None))
@@ -1263,7 +1281,7 @@ def test_runtime_manager_scene_alarm_history_and_health_are_thin_reads() -> None
         context = client.get("/api/source-model-context").json()
         assert context["schema_version"] == "manyforge.source_model_context.v1"
         assert context["node_environment"]["schema_version"] == (
-            "manyforge.node_environment_projection.v1"
+            "manyforge.node_environment_projection.v2"
         )
         assert context["source_model"]["schema_version"] == (
             "manyforge.source_model_projection.v1"
@@ -1648,6 +1666,34 @@ def test_program_runner_surface_is_a_strict_thin_owner_projection() -> None:
         "read",
         "stop",
     ]
+
+
+def test_program_run_captures_current_environment_not_package_provenance() -> None:
+    current_environment = "sha256:" + "e" * 64
+    core = FakeCore()
+    core.applied_program = _applied_for_program_run()
+    core.node_environment_digest = current_environment
+    runner = FakeProgramRunner(node_environment_digest=current_environment)
+    client = TestClient(
+        create_app(service=_service(core, FakeManager(), program_runner=runner))
+    )
+    source = core.applied_program["source"]
+    request = {
+        **_caller(),
+        "scenario_id": "cell-pick",
+        "scenario_catalog_revision": "sha256:" + "6" * 64,
+        "expected_applied_record_digest": source["record_digest"],
+        "draft_program_revision": core.applied_program["program_revision"],
+        "expected_admission_generation": _ADMISSION_GENERATION,
+    }
+
+    response = client.post("/api/program/runs", json=request)
+
+    assert response.status_code == 200
+    assert response.json()["capture"]["node_environment_digest"] == (
+        current_environment
+    )
+    assert current_environment != core.applied_program["node_environment_digest"]
 
 
 def test_program_run_start_rejects_stale_applied_or_divergent_runner() -> None:

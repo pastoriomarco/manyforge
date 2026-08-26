@@ -34,7 +34,9 @@ struct ContentIdentitySpec final {
 
 /// Computes a spec-210 content identity from an exact schema-qualified root.
 ///
-/// The caller is responsible for proving the complete schema precondition.
+/// The caller is responsible for proving either the complete semantic schema
+/// or a read-only provenance envelope whose remaining canonical fields are
+/// deliberately opaque and never interpreted as authority.
 /// A document root must contain an `api_version` string matching the spec. A
 /// nested-record root must omit `api_version`; its parent document-family tag
 /// is supplied by the spec and still participates in the preimage. Both
@@ -43,7 +45,8 @@ struct ContentIdentitySpec final {
 [[nodiscard]] std::string compute_content_identity(const CanonicalValue& normalized_root,
                                                    const ContentIdentitySpec& spec);
 
-/// Verifies the declared own field after the same exact-schema precondition.
+/// Verifies the declared own field after the same schema/provenance-envelope
+/// precondition.
 ///
 /// Structural/precondition violations throw CanonicalValueError. A
 /// well-formed but non-matching declared digest returns false.

@@ -137,13 +137,11 @@ prepare_cmake_metadata "${DEPLOYMENT_BUILD}"
   -S "${REPO_ROOT}/manyforge_deployment" \
   -B "${DEPLOYMENT_BUILD}"
 /usr/bin/ninja -C "${DEPLOYMENT_BUILD}" -j "${PARALLEL}" -d keeprsp \
-  manyforge_build_qualified_admission_profile \
   manyforge_content_identity \
   manyforge_deployment \
   manyforge_deployment_admission \
   manyforge_deployment_canonical_package_generator \
   manyforge_deployment_verification_core \
-  manyforge_emit_build_qualified_admission_profile \
   manyforge_generate_canonical_empty_package
 
 prepare_cmake_metadata "${MODULE_BUILD}"

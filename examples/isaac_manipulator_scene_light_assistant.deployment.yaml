@@ -69,6 +69,7 @@
             "tree_draft_delete_node",
             "tree_draft_insert_node",
             "tree_draft_move_node",
+            "tree_draft_rename_node",
             "tree_draft_replace_subtree",
             "tree_draft_update_node_params",
             "tree_draft_wrap_node"
@@ -1243,7 +1244,7 @@
     ]
   },
   "deployment_artifact_id": "isaac_manipulator_scene_light_assistant",
-  "deployment_revision": "sha256:b2ef2e720200323960e475d9ef9616f2aede460a1930d39d07083c8b60121776",
+  "deployment_revision": "sha256:0f223cca88f147513b3c3a80e4372d93a3c3c926c5f2777ff88fc8c1cca218a6",
   "description": "Retained Isaac UR10e light-scene deployment with the ROS 2 control execution product and the finite assistant scene-authoring overlay; simulator mutation remains operator-approved.",
   "desired_control_configurations": [
     {

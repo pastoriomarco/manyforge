@@ -44,7 +44,7 @@ endforeach()
 
 foreach(required_symbol IN ITEMS
     "FilesystemCanonicalEmptyRetainedBundleSource::load_verified"
-    "verify_build_qualified_admission_profile"
+    "verify_package_admission_profile"
     "FilesystemVerifiedRetainedBundleSource::get_verified")
   string(FIND "${symbols}" "${required_symbol}" found)
   if(found EQUAL -1)

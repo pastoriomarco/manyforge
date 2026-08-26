@@ -821,7 +821,7 @@ def build_program_run_admission(
     owner_availability: Mapping[str, AvailabilityFact],
     additional_owner_identities: tuple[ProgramRunOwnerIdentity, ...] = (),
 ) -> ProgramRunAdmission:
-    """Join one native exact selection to the packaged Python runner."""
+    """Join one exact package selection to a compatible Python runner."""
 
     if not isinstance(selection, Mapping):
         raise TypeError("scenario Program selection must be a mapping")
@@ -888,10 +888,6 @@ def build_program_run_admission(
         selection.get("node_environment_digest"),
         field="node_environment_digest",
     )
-    if node_environment_digest != environment.environment_digest:
-        raise ProgramRunOwnerError(
-            "selected node environment differs from the packaged runner"
-        )
 
     program_value = selection.get("program")
     binding_value = selection.get("program_binding")
@@ -921,6 +917,24 @@ def build_program_run_admission(
     )
     program_id = _text(selection.get("program_id"), field="program_id")
     binding_environment = binding_value.get("node_environment")
+    if not isinstance(binding_environment, dict) or set(binding_environment) != {
+        "catalog_id",
+        "content_version",
+        "catalog_digest",
+        "environment_digest",
+    }:
+        raise ProgramRunOwnerError(
+            "scenario Program Binding has an invalid node environment"
+        )
+    if (
+        binding_environment.get("catalog_id")
+        != environment.manifest.catalog_id
+        or binding_environment.get("content_version")
+        != environment.manifest.catalog_content_version
+    ):
+        raise ProgramRunOwnerError(
+            "scenario Program catalog contract is unsupported by this runner"
+        )
     if (
         program.program_id != program_id
         or program.program_revision != program_revision
@@ -929,7 +943,6 @@ def build_program_run_admission(
         or binding_value.get("program_revision") != program_revision
         or binding_value.get("retained_bundle_id") != retained_bundle_id
         or binding_value.get("graph_revision") != graph_revision
-        or not isinstance(binding_environment, dict)
         or binding_environment.get("environment_digest") != node_environment_digest
     ):
         raise ProgramRunOwnerError(

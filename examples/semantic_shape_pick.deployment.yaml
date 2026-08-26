@@ -85,6 +85,7 @@
             "tree_draft_delete_node",
             "tree_draft_insert_node",
             "tree_draft_move_node",
+            "tree_draft_rename_node",
             "tree_draft_replace_subtree",
             "tree_draft_update_node_params",
             "tree_draft_wrap_node"
@@ -1233,7 +1234,7 @@
     ]
   },
   "deployment_artifact_id": "ur5_roboplan_local_semantic_shape_pick",
-  "deployment_revision": "sha256:2e82570d32991c6ac1cee265a17e1b5257daee733da3e49c11df936e14ab07bc",
+  "deployment_revision": "sha256:a7b6cedbada371e7765b50234dae9162c7ecd08716398d782e0b7cb9a4584829",
   "description": "Local deployment for the semantic object-selection demo. A model selects one backend-authoritative scene object from a deterministic manifest plus an auxiliary viewer snapshot, and the backend computes the actual pick sequence deterministically from backend scene state.",
   "desired_control_configurations": [
     {

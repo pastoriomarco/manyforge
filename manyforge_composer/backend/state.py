@@ -20,6 +20,7 @@ from fastapi.responses import JSONResponse
 from manyforge_behavior.node_environment import NodeEnvironment, build_node_environment
 from manyforge_behavior.program import Program, ProgramValidationError
 from manyforge_headless_api.program_binding_projection import (
+    applied_program_belongs_to_scenario,
     applied_program_matches_scenario_selection,
     validate_program_apply_result,
 )
@@ -319,7 +320,7 @@ class ComposerState:
             except HeadlessClientError:
                 reasons.append("scenario_selection_unavailable")
             else:
-                if not applied_program_matches_scenario_selection(
+                if not applied_program_belongs_to_scenario(
                     applied, selection
                 ):
                     reasons.append("applied_program_selection_mismatch")
@@ -330,11 +331,11 @@ class ComposerState:
                 selection,
             ):
                 reasons.append("deployment_not_active_and_converged")
-        current = (
-            {field: selection[field] for field in _CURRENT_SCENARIO_FIELDS}
-            if selection is not None and not reasons
-            else None
-        )
+        current = None
+        if selection is not None and applied is not None and not reasons:
+            current = {field: selection[field] for field in _CURRENT_SCENARIO_FIELDS}
+            for field in ("program_id", "program_revision", "program_binding_id"):
+                current[field] = applied[field]
         return {
             "schema_version": "manyforge.current_scenario.v1",
             "ready": current is not None,

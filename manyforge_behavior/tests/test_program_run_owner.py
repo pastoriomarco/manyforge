@@ -1147,6 +1147,9 @@ def _scenario_selection(admission: ProgramRunAdmission) -> dict[str, Any]:
                 policy.to_dict() for policy in admission.node_policies
             ],
             "node_environment": {
+                "catalog_id": environment.manifest.catalog_id,
+                "content_version": environment.manifest.catalog_content_version,
+                "catalog_digest": environment.manifest.catalog_digest,
                 "environment_digest": environment.environment_digest,
             },
         },
@@ -1185,6 +1188,55 @@ def test_native_selection_join_rejects_a_catalog_change_before_construction() ->
         assert "catalog changed" in str(error)
     else:
         raise AssertionError("stale scenario-catalog revision was admitted")
+
+
+def test_native_selection_join_accepts_compatible_producer_environment() -> None:
+    _owner, admission, _task, _scope, _events = _fixture(
+        initial_task_state=OwnerTaskState.SUCCEEDED
+    )
+    selection = _scenario_selection(admission)
+    producer_environment = "sha256:" + "8" * 64
+    selection["node_environment_digest"] = producer_environment
+    selection["program_binding"]["node_environment"].update(
+        {
+            "catalog_digest": "sha256:" + "9" * 64,
+            "environment_digest": producer_environment,
+        }
+    )
+
+    joined = build_program_run_admission(
+        selection,
+        expected_scenario_id=admission.scenario_id,
+        expected_scenario_catalog_revision=admission.scenario_catalog_revision,
+        environment=admission.environment,
+        owner_availability=admission.readiness.owner_by_port,
+    )
+
+    assert joined.environment.environment_digest == (
+        admission.environment.environment_digest
+    )
+    assert joined.program_binding["node_environment"]["environment_digest"] == (
+        producer_environment
+    )
+
+
+def test_native_selection_join_rejects_unsupported_catalog_contract() -> None:
+    _owner, admission, _task, _scope, _events = _fixture(
+        initial_task_state=OwnerTaskState.SUCCEEDED
+    )
+    selection = _scenario_selection(admission)
+    selection["program_binding"]["node_environment"]["content_version"] = "0.9.0"
+
+    with pytest.raises(ProgramRunOwnerError, match="catalog contract is unsupported"):
+        build_program_run_admission(
+            selection,
+            expected_scenario_id=admission.scenario_id,
+            expected_scenario_catalog_revision=(
+                admission.scenario_catalog_revision
+            ),
+            environment=admission.environment,
+            owner_availability=admission.readiness.owner_by_port,
+        )
 
 
 def test_applied_program_join_uses_applied_content_and_fresh_owner_facts() -> None:

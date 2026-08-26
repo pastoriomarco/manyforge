@@ -116,22 +116,15 @@ def test_status_command_reads_the_current_scenario_without_package_mutation(
     assert "another-native-scenario" in capsys.readouterr().out
 
 
-def test_existing_cache_snapshots_exact_native_closure_before_ui_start(
+def test_existing_package_cache_does_not_snapshot_backend_binaries(
     monkeypatch: Any, tmp_path: Path
 ) -> None:
     scenario_root = tmp_path / "maintained-scenario-package"
     package_root = scenario_root / "retained-package"
     package_root.mkdir(parents=True)
-    qualified_manager = scenario_root / "manyforge_manager_daemon"
-    qualified_headless_root = scenario_root / "headless-python"
-    built_manager = tmp_path / "build/manyforge_manager_daemon"
-    built_extension = tmp_path / "build/manyforge_headless_py.fixture.so"
     native_host = scenario_root / "manyforge_native_execution_host"
     candidate_worker = scenario_root / "manyforge_roboplan_candidate_worker"
-    built_manager.parent.mkdir(parents=True)
     for path, content in (
-        (built_manager, b"qualified-manager"),
-        (built_extension, b"qualified-headless-extension"),
         (native_host, b"native-host"),
         (candidate_worker, b"candidate-worker"),
     ):
@@ -140,14 +133,6 @@ def test_existing_cache_snapshots_exact_native_closure_before_ui_start(
 
     monkeypatch.setattr(dev_workbench, "SCENARIO_ROOT", scenario_root)
     monkeypatch.setattr(dev_workbench, "PACKAGE_ROOT", package_root)
-    monkeypatch.setattr(
-        dev_workbench, "QUALIFIED_MANAGER_BINARY", qualified_manager
-    )
-    monkeypatch.setattr(
-        dev_workbench, "QUALIFIED_HEADLESS_ROOT", qualified_headless_root
-    )
-    monkeypatch.setattr(dev_workbench, "HEADLESS_BUILD", built_manager.parent)
-    monkeypatch.setattr(dev_workbench, "MANAGER_BINARY", built_manager)
     monkeypatch.setattr(dev_workbench, "NATIVE_EXECUTION_HOST", native_host)
     monkeypatch.setattr(
         dev_workbench, "NATIVE_CANDIDATE_WORKER", candidate_worker
@@ -155,10 +140,51 @@ def test_existing_cache_snapshots_exact_native_closure_before_ui_start(
 
     dev_workbench._import_package()
 
-    assert qualified_manager.read_bytes() == b"qualified-manager"
-    assert (
-        qualified_headless_root / built_extension.name
-    ).read_bytes() == b"qualified-headless-extension"
+    assert not (scenario_root / "manyforge_manager_daemon").exists()
+    assert not (scenario_root / "headless-python").exists()
+
+
+def test_backend_build_uses_current_source_and_only_production_targets(
+    monkeypatch: Any, tmp_path: Path
+) -> None:
+    build = tmp_path / "headless"
+    manager = build / "manyforge_manager_daemon"
+    extension = build / "manyforge_headless_py.fixture.so"
+    observed: list[tuple[str, ...]] = []
+
+    def run(command: tuple[str, ...], **_kwargs: Any) -> None:
+        observed.append(command)
+        if command[0] == "cmake" and command[1] == "--build":
+            manager.parent.mkdir(parents=True, exist_ok=True)
+            manager.write_bytes(b"manager")
+            manager.chmod(0o755)
+            extension.write_bytes(b"headless")
+
+    monkeypatch.setattr(dev_workbench, "HEADLESS_BUILD", build)
+    monkeypatch.setattr(dev_workbench, "MANAGER_BINARY", manager)
+    monkeypatch.setattr(dev_workbench, "_run", run)
+    monkeypatch.setattr(
+        dev_workbench.subprocess,
+        "run",
+        lambda *_args, **_kwargs: SimpleNamespace(
+            returncode=0, stdout="/pybind11/cmake\n"
+        ),
+    )
+    monkeypatch.setenv("MANYFORGE_DEV_BUILD_JOBS", "3")
+
+    assert dev_workbench._ensure_current_backend() == extension
+
+    assert len(observed) == 2
+    assert "-DBUILD_TESTING=OFF" in observed[0]
+    assert observed[1][-5:] == (
+        "manyforge_manager_daemon",
+        "manyforge_headless_py",
+        "--",
+        "-k",
+        "0",
+    )
+    assert "--parallel" in observed[1]
+    assert observed[1][observed[1].index("--parallel") + 1] == "3"
 
 
 def test_startup_requires_the_existing_manager_baseline_to_be_fully_converged() -> None:

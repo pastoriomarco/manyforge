@@ -137,6 +137,7 @@ struct HeadlessApiCoreConfig final {
   std::filesystem::path artifact_root;
   std::filesystem::path program_selection_state_root;
   std::filesystem::path node_catalog_path;
+  std::filesystem::path node_environment_manifest_path;
   std::filesystem::path alarm_catalog_path;
   std::filesystem::path historian_database_path;
   std::string cell_id;

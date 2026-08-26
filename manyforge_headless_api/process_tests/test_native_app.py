@@ -18,6 +18,9 @@ from manyforge_headless_api.native import HeadlessApiConfig
 
 CATALOG = Path("/workspace/manyforge_headless/resources/operator-alarm-catalog.v1.yaml")
 NODE_CATALOG = Path("/workspace/manyforge_behavior/resources/node_catalog.yaml")
+NODE_ENVIRONMENT_MANIFEST = Path(
+    "/workspace/manyforge_behavior/resources/node_environment_manifest.yaml"
+)
 
 
 def _config(root: Path, owner_epoch: str) -> HeadlessApiConfig:
@@ -37,6 +40,7 @@ def _config(root: Path, owner_epoch: str) -> HeadlessApiConfig:
         artifact_root=artifact_root,
         program_selection_state_root=program_selection_state_root,
         node_catalog_path=NODE_CATALOG,
+        node_environment_manifest_path=NODE_ENVIRONMENT_MANIFEST,
         alarm_catalog_path=CATALOG,
         historian_database_path=root / "history.sqlite3",
         manager_run_root=manager_run_root,

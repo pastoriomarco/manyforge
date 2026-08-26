@@ -239,10 +239,10 @@ def validate_applied_program_selection(
     return value
 
 
-def applied_program_matches_scenario_selection(
+def applied_program_belongs_to_scenario(
     applied: dict[str, Any], selection: dict[str, Any]
 ) -> bool:
-    """Return exact owner-projection correspondence without inferring compatibility."""
+    """Return exact Scenario anchoring across Program-only Apply."""
 
     fields = (
         "assistant_mode",
@@ -253,18 +253,26 @@ def applied_program_matches_scenario_selection(
         "retained_bundle_id",
         "graph_revision",
         "node_environment_digest",
-        "program_id",
-        "program_revision",
-        "program_binding_id",
         "typed_parameter_overrides",
-        "program",
-        "program_binding",
     )
-    return all(
+    return applied.get("baseline_program_binding_id") == selection.get(
+        "program_binding_id"
+    ) and all(
         field in applied
         and field in selection
         and applied[field] == selection[field]
         for field in fields
+    )
+
+
+def applied_program_matches_scenario_selection(
+    applied: dict[str, Any], selection: dict[str, Any]
+) -> bool:
+    """Return exact Load correspondence with the Scenario's selected Program."""
+
+    return applied_program_belongs_to_scenario(applied, selection) and all(
+        applied.get(field) == selection.get(field)
+        for field in ("program_id", "program_revision", "program")
     )
 
 

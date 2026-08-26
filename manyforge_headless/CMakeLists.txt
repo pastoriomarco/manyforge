@@ -675,7 +675,8 @@ if(BUILD_TESTING)
     MANYFORGE_HEADLESS_TEST_ALARM_CATALOG="${CMAKE_CURRENT_SOURCE_DIR}/resources/operator-alarm-catalog.v1.yaml"
     MANYFORGE_HEADLESS_TEST_ASSISTANT_PACKAGE_ROOT="${MANYFORGE_HEADLESS_TEST_ASSISTANT_PACKAGE_ROOT}"
     MANYFORGE_HEADLESS_TEST_CANONICAL_EMPTY_PACKAGE_ROOT="${MANYFORGE_HEADLESS_TEST_CANONICAL_EMPTY_PACKAGE_ROOT}"
-    MANYFORGE_HEADLESS_TEST_NODE_CATALOG="${CMAKE_CURRENT_SOURCE_DIR}/../manyforge_behavior/resources/node_catalog.yaml")
+    MANYFORGE_HEADLESS_TEST_NODE_CATALOG="${CMAKE_CURRENT_SOURCE_DIR}/../manyforge_behavior/resources/node_catalog.yaml"
+    MANYFORGE_HEADLESS_TEST_NODE_ENVIRONMENT_MANIFEST="${CMAKE_CURRENT_SOURCE_DIR}/../manyforge_behavior/resources/node_environment_manifest.yaml")
   target_link_libraries(test_headless_api_core PRIVATE
     manyforge_event_historian
     manyforge::deployment
@@ -717,7 +718,8 @@ if(BUILD_TESTING)
     manyforge_headless_test_canonical_empty_package)
   target_compile_definitions(test_node_environment_projection PRIVATE
     MANYFORGE_HEADLESS_TEST_CANONICAL_EMPTY_PACKAGE_ROOT="${MANYFORGE_HEADLESS_TEST_CANONICAL_EMPTY_PACKAGE_ROOT}"
-    MANYFORGE_HEADLESS_TEST_NODE_CATALOG="${CMAKE_CURRENT_SOURCE_DIR}/../manyforge_behavior/resources/node_catalog.yaml")
+    MANYFORGE_HEADLESS_TEST_NODE_CATALOG="${CMAKE_CURRENT_SOURCE_DIR}/../manyforge_behavior/resources/node_catalog.yaml"
+    MANYFORGE_HEADLESS_TEST_NODE_ENVIRONMENT_MANIFEST="${CMAKE_CURRENT_SOURCE_DIR}/../manyforge_behavior/resources/node_environment_manifest.yaml")
   target_link_libraries(test_node_environment_projection PRIVATE
     manyforge_node_environment_projection
     manyforge::deployment_admission

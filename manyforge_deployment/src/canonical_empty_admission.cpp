@@ -13,7 +13,6 @@
 #include <utility>
 #include <vector>
 
-#include "build_qualified_admission_profile_internal.hpp"
 #include "canonical_empty_admission_internal.hpp"
 #include "content_identity_internal.hpp"
 #include "embedded_canonical_empty_deployment.hpp"
@@ -22,6 +21,7 @@
 #include "manyforge_deployment/deployment_artifact_codec.hpp"
 #include "manyforge_deployment/native_execution_runtime_contract.hpp"
 #include "manyforge_deployment/ros2_control_execution_runtime_contract.hpp"
+#include "package_admission_profile_internal.hpp"
 #include "posix_durability_internal.hpp"
 
 namespace manyforge::deployment {
@@ -344,7 +344,7 @@ void require_bundle_matches_authorities(
       value.provenance.compiler_contract_digest != compiler_contract_digest ||
       value.provenance.compiler_build_digest != compiler_build_digest) {
     fail("canonical-empty retained bundle differs from its fixed source or "
-         "current build authority");
+         "package manifest closure");
   }
   if (record == nullptr) {
     return;
@@ -389,7 +389,7 @@ void require_bundle_matches_record_and_authorities(
       record.compiler_build_digest !=
           value.provenance.compiler_build_digest.value()) {
     fail("canonical-empty admission record or retained bundle differs from "
-         "the current build authority");
+         "the package manifest closure");
   }
 }
 
@@ -545,8 +545,11 @@ FilesystemCanonicalEmptyRetainedBundleSource::load_verified() const {
         record.cell_id == kCanonicalCellId &&
         record.deployment_artifact_id == kCanonicalDeploymentArtifactId;
 
-    const detail::BuildQualifiedAdmissionProfileAuthority profile =
-        detail::verify_build_qualified_admission_profile(current_root);
+    const detail::PackageAdmissionProfile profile =
+        detail::verify_package_admission_profile(
+            current_root, core::ContentDigest(record.environment_digest),
+            core::ContentDigest(record.compiler_contract_digest),
+            core::ContentDigest(record.compiler_build_digest));
     FilesystemVerifiedRetainedBundleSource bundle_source(current_root);
     const auto bundle = bundle_source.get_verified(
         core::RetainedBundleId(record.retained_bundle_id));
@@ -554,8 +557,14 @@ FilesystemCanonicalEmptyRetainedBundleSource::load_verified() const {
       fail("canonical-empty retained bundle is missing");
     }
     require_bundle_matches_record_and_authorities(
-        *bundle, profile.node_environment(), profile.compiler_contract_digest(),
+        *bundle, bundle->value().catalogs.node_environment,
+        profile.compiler_contract_digest(),
         profile.compiler_build_digest(), record);
+    if (bundle->value().catalogs.node_environment.environment_digest !=
+        profile.environment_digest()) {
+      fail("canonical-empty retained bundle differs from its package "
+           "environment manifest");
+    }
     if (fixed_golden) {
       const RevisionVerifiedDeploymentArtifact deployment =
           load_fixed_deployment();
@@ -567,7 +576,7 @@ FilesystemCanonicalEmptyRetainedBundleSource::load_verified() const {
              "deployment");
       }
       require_bundle_matches_authorities(
-          *bundle, deployment, profile.node_environment(),
+          *bundle, deployment, bundle->value().catalogs.node_environment,
           profile.compiler_contract_digest(), profile.compiler_build_digest(),
           &record);
     }

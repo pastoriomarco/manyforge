@@ -69,6 +69,7 @@
             "tree_draft_delete_node",
             "tree_draft_insert_node",
             "tree_draft_move_node",
+            "tree_draft_rename_node",
             "tree_draft_replace_subtree",
             "tree_draft_update_node_params",
             "tree_draft_wrap_node"
@@ -1204,7 +1205,7 @@
     ]
   },
   "deployment_artifact_id": "ur10e_robotiq_assistant_modes_scene_authoring",
-  "deployment_revision": "sha256:545593e3b608b29236c114f722440cc1cf7dfed822d6a094ecde892bc82f9b4c",
+  "deployment_revision": "sha256:1951816264e0047b032efafeb87385cd9535723e93f1a42278b34304281ad5bf",
   "description": "Local deployment fixture for assistant-mode catalog plumbing on the UR10e + Robotiq 2F-140 preview stack. It keeps the deterministic scene-authoring provider enabled while declaring the finite tools visible to query and composer-assistant requests.",
   "desired_control_configurations": [
     {

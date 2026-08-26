@@ -1563,7 +1563,7 @@ def test_manager_api_cli_and_replacements_preserve_headless_owners(
         cli_reads = {
             "health": "manyforge.headless_health.v1",
             "manager-graph": "manyforge.manager_graph_projection.v1",
-            "node-environment": "manyforge.node_environment_projection.v1",
+            "node-environment": "manyforge.node_environment_projection.v2",
             "source-model": "manyforge.source_model_projection.v1",
             "scene": "manyforge.scene_projection.v1",
             "alarms": "manyforge.operator_alarm_snapshot.v2",

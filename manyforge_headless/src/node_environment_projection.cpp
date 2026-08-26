@@ -470,13 +470,23 @@ CanonicalValue Availability(const std::vector<RegistryRow> &registry,
 
 struct ActiveNodeEnvironmentProjection::Storage final {
   explicit Storage(std::filesystem::path package,
-                   std::filesystem::path catalog_path)
+                   std::filesystem::path catalog_path,
+                   std::filesystem::path environment_manifest_path)
       : package_root(std::move(package)), catalog(LoadStrictFile(catalog_path)),
-        catalog_identity(VerifyCatalog(catalog)) {
+        catalog_identity(VerifyCatalog(catalog)),
+        current_manifest(LoadStrictFile(environment_manifest_path)),
+        current_identity(VerifyManifest(current_manifest)) {
     const auto status = std::filesystem::symlink_status(package_root);
     Require(std::filesystem::is_directory(status) &&
                 !std::filesystem::is_symlink(status),
             "package root must be one existing non-symlink directory");
+    Require(current_identity.catalog.catalog_id == catalog_identity.catalog_id &&
+                current_identity.catalog.content_version ==
+                    catalog_identity.content_version &&
+                content_identity::digest_equal(
+                    current_identity.catalog.catalog_digest,
+                    catalog_identity.catalog_digest),
+            "current node environment manifest and catalog disagree");
   }
 
   const CanonicalValue &Manifest(const std::string &environment_digest) const {
@@ -511,14 +521,18 @@ struct ActiveNodeEnvironmentProjection::Storage final {
   std::filesystem::path package_root;
   CanonicalValue catalog;
   CatalogIdentity catalog_identity;
+  CanonicalValue current_manifest;
+  ManifestIdentity current_identity;
   mutable std::mutex mutex;
   mutable std::map<std::string, CanonicalValue> manifests;
 };
 
 ActiveNodeEnvironmentProjection::ActiveNodeEnvironmentProjection(
-    std::filesystem::path package_root, std::filesystem::path node_catalog_path)
+    std::filesystem::path package_root, std::filesystem::path node_catalog_path,
+    std::filesystem::path node_environment_manifest_path)
     : storage_(std::make_unique<Storage>(std::move(package_root),
-                                         std::move(node_catalog_path))) {}
+                                         std::move(node_catalog_path),
+                                         std::move(node_environment_manifest_path))) {}
 
 ActiveNodeEnvironmentProjection::~ActiveNodeEnvironmentProjection() = default;
 
@@ -528,13 +542,6 @@ CanonicalValue ActiveNodeEnvironmentProjection::Project(
   Require(manyforge::deployment::verify_retained_bundle_identity(active_bundle),
           "active retained bundle failed identity verification");
   const auto &environment = active_bundle.value().catalogs.node_environment;
-  Require(environment.catalog_id == storage_->catalog_identity.catalog_id &&
-              environment.content_version ==
-                  storage_->catalog_identity.content_version &&
-              content_identity::digest_equal(
-                  environment.catalog_digest.value(),
-                  storage_->catalog_identity.catalog_digest),
-          "active retained bundle and packaged node catalog disagree");
   const auto &manifest =
       storage_->Manifest(environment.environment_digest.value());
   const auto manifest_identity = VerifyManifest(manifest);
@@ -548,18 +555,28 @@ CanonicalValue ActiveNodeEnvironmentProjection::Project(
 
   return CanonicalValue(CanonicalValue::Object{
       {"availability",
-       Availability(manifest_identity.registry,
+       Availability(storage_->current_identity.registry,
                     storage_->catalog_identity.owner_neutral_node_ids,
                     manager_runtime_converged)},
       {"catalog", storage_->catalog},
-      {"catalog_digest", CanonicalValue(environment.catalog_digest.value())},
-      {"catalog_id", CanonicalValue(environment.catalog_id)},
-      {"content_version", CanonicalValue(environment.content_version)},
+      {"catalog_digest",
+       CanonicalValue(storage_->catalog_identity.catalog_digest)},
+      {"catalog_id", CanonicalValue(storage_->catalog_identity.catalog_id)},
+      {"content_version",
+       CanonicalValue(storage_->catalog_identity.content_version)},
       {"environment_digest",
-       CanonicalValue(environment.environment_digest.value())},
+       CanonicalValue(storage_->current_identity.environment_digest)},
       {"graph_revision",
        CanonicalValue(active_bundle.value().cell_graph.graph_revision.value())},
-      {"manifest", manifest},
+      {"manifest", storage_->current_manifest},
+      {"package_environment",
+       CanonicalValue(CanonicalValue::Object{
+           {"catalog_digest", CanonicalValue(environment.catalog_digest.value())},
+           {"catalog_id", CanonicalValue(environment.catalog_id)},
+           {"content_version", CanonicalValue(environment.content_version)},
+           {"environment_digest",
+            CanonicalValue(environment.environment_digest.value())},
+       })},
       {"retained_bundle_id",
        CanonicalValue(active_bundle.retained_bundle_id().value())},
       {"schema_version",

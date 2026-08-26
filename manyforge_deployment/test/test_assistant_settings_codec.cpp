@@ -359,6 +359,7 @@ TEST(AssistantSettingsCodec,
                                            "tree_draft_delete_node",
                                            "tree_draft_insert_node",
                                            "tree_draft_move_node",
+                                           "tree_draft_rename_node",
                                            "tree_draft_replace_subtree",
                                            "tree_draft_update_node_params",
                                            "tree_draft_wrap_node"}));
@@ -370,7 +371,7 @@ TEST(AssistantSettingsCodec,
           "program_validate", "scene_inspect", "skills_read", "status_read"}));
   EXPECT_EQ(proposals, (std::vector<std::string>{"propose_scene_object_nodes",
                                                  "propose_scene_objects"}));
-  EXPECT_EQ(draft_mutations.size(), 17U);
+  EXPECT_EQ(draft_mutations.size(), 18U);
 
   std::vector<std::string> node_ids;
   for (const auto& node : registry.value().nodes) {

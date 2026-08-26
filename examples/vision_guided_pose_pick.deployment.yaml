@@ -88,6 +88,7 @@
             "tree_draft_delete_node",
             "tree_draft_insert_node",
             "tree_draft_move_node",
+            "tree_draft_rename_node",
             "tree_draft_replace_subtree",
             "tree_draft_update_node_params",
             "tree_draft_wrap_node"
@@ -1230,7 +1231,7 @@
     ]
   },
   "deployment_artifact_id": "ur5_roboplan_local_vision_guided_pose_pick",
-  "deployment_revision": "sha256:fd7f927883776fb759e837988483febf0f82b825e91ca301ceea0a0abf656f0a",
+  "deployment_revision": "sha256:a30469778a521d3bc3fde80ca71407bcc425ab8028786c55bab626c1f647adfc",
   "description": "Local deployment for the vision-guided pose-pick example. It requires one connected native viewer snapshot source so assistant.query_model can attach a live scene snapshot.",
   "desired_control_configurations": [
     {

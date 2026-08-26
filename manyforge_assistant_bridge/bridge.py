@@ -537,7 +537,7 @@ class BridgeService:
         source = node_environment.get("source")
         if (
             node_environment.get("schema_version")
-            != "manyforge.node_environment_projection.v1"
+            != "manyforge.node_environment_projection.v2"
             or type(source) is not dict
             or source.get("available") is not True
             or source.get("freshness") != "fresh"
@@ -553,13 +553,22 @@ class BridgeService:
                     "assistant_projection_stale",
                     "assistant mode and node environment select different bundles",
                 )
+        package_environment = node_environment.get("package_environment")
+        if type(package_environment) is not dict:
+            raise BridgeRunError(
+                "assistant_projection_unavailable",
+                "active node environment omits package provenance",
+            )
         for field in (
             "catalog_digest",
             "catalog_id",
             "content_version",
             "environment_digest",
         ):
-            if node_environment.get(field) != projection["node_environment"][field]:
+            if (
+                package_environment.get(field)
+                != projection["node_environment"][field]
+            ):
                 raise BridgeRunError(
                     "assistant_projection_stale",
                     "assistant mode and node environment identities disagree",

@@ -16,7 +16,7 @@ SCHEMAS = {
     "/api/manager/status": "manyforge.manager_status_projection.v1",
     "/api/manager/graph": "manyforge.manager_graph_projection.v1",
     "/api/manager/diff": "manyforge.manager_diff_projection.v1",
-    "/api/node-environment": "manyforge.node_environment_projection.v1",
+    "/api/node-environment": "manyforge.node_environment_projection.v2",
     "/api/source-model": "manyforge.source_model_projection.v1",
     "/api/scene": "manyforge.scene_projection.v1",
     "/api/execution/alarms": "manyforge.operator_alarm_snapshot.v2",
@@ -50,7 +50,7 @@ def test_read_client_exposes_only_the_closed_h0_observation_set() -> None:
     try:
         assert reader.invoke("runtime")["schema_version"].endswith("snapshot.v1")
         assert reader.invoke("node_environment")["schema_version"].endswith(
-            "projection.v1"
+            "projection.v2"
         )
         assert reader.invoke("source_model")["schema_version"].endswith(
             "projection.v1"

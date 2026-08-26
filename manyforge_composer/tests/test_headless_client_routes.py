@@ -154,13 +154,19 @@ def headless_client() -> (
         for item in build_executable_node_resolver(environment).dispositions
     }
     node_environment = {
-        "schema_version": "manyforge.node_environment_projection.v1",
+        "schema_version": "manyforge.node_environment_projection.v2",
         "retained_bundle_id": "bundle.1",
         "graph_revision": "graph.1",
         "catalog_id": manifest.catalog_id,
         "content_version": manifest.catalog_content_version,
         "catalog_digest": manifest.catalog_digest,
         "environment_digest": manifest.environment_digest,
+        "package_environment": {
+            "catalog_id": manifest.catalog_id,
+            "content_version": manifest.catalog_content_version,
+            "catalog_digest": manifest.catalog_digest,
+            "environment_digest": manifest.environment_digest,
+        },
         "catalog": environment.catalog.raw_data,
         "manifest": manifest.to_dict(),
         "availability": {
@@ -278,6 +284,7 @@ def headless_client() -> (
     # source-model route must consume only the coherent context above.
     source_model["source"]["selection_projection_generation"] = 5
     applied_program: dict[str, Any] | None = None
+    scenario_selections: dict[str, dict[str, Any]] = {}
     scenario_cas_apply_counts: dict[str, int] = {}
 
     def handler(request: httpx.Request) -> httpx.Response:
@@ -446,35 +453,10 @@ def headless_client() -> (
             "/program-selection"
         ):
             scenario_id = path.split("/")[-2]
-            if applied_program is None or applied_program["scenario_id"] != scenario_id:
+            selection = scenario_selections.get(scenario_id)
+            if selection is None:
                 return httpx.Response(404, json={"detail": "unknown"}, request=request)
-            payload = {
-                "assistant_mode": applied_program["assistant_mode"],
-                "assistant_projection": None,
-                "deployment_artifact_id": applied_program[
-                    "deployment_artifact_id"
-                ],
-                "deployment_revision": applied_program["deployment_revision"],
-                "graph_revision": applied_program["graph_revision"],
-                "node_environment_digest": applied_program[
-                    "node_environment_digest"
-                ],
-                "owner_identities": [],
-                "program": applied_program["program"],
-                "program_binding": applied_program["program_binding"],
-                "program_binding_id": applied_program["program_binding_id"],
-                "program_id": applied_program["program_id"],
-                "program_revision": applied_program["program_revision"],
-                "retained_bundle_id": applied_program["retained_bundle_id"],
-                "scenario_catalog_revision": applied_program[
-                    "scenario_catalog_revision"
-                ],
-                "scenario_id": scenario_id,
-                "schema_version": "manyforge.scenario_program_selection.v2",
-                "typed_parameter_overrides": applied_program[
-                    "typed_parameter_overrides"
-                ],
-            }
+            payload = copy.deepcopy(selection)
         elif path == "/api/program/apply":
             assert isinstance(body, dict)
             cas_attempt = scenario_cas_apply_counts.get(body["scenario_id"], 0)
@@ -535,7 +517,9 @@ def headless_client() -> (
                         "preparation": {},
                         "applied": {
                             "assistant_mode": "forbidden",
-                            "baseline_program_binding_id": "sha256:" + "3" * 64,
+                            "baseline_program_binding_id": scenario_selections[
+                                body["scenario_id"]
+                            ]["program_binding_id"],
                             "deployment_artifact_id": "cell_a",
                             "deployment_revision": "sha256:" + "1" * 64,
                             "graph_revision": malformed_binding["graph_revision"],
@@ -577,9 +561,35 @@ def headless_client() -> (
             previous_applied_program = applied_program
             program = body["program"]
             binding = _binding_for_program(program)
+            baseline = scenario_selections.get(body["scenario_id"])
+            if baseline is None:
+                baseline = {
+                    "assistant_mode": "forbidden",
+                    "assistant_projection": None,
+                    "deployment_artifact_id": "cell_a",
+                    "deployment_revision": "sha256:" + "1" * 64,
+                    "graph_revision": "sha256:" + "5" * 64,
+                    "node_environment_digest": binding["node_environment"][
+                        "environment_digest"
+                    ],
+                    "owner_identities": [],
+                    "program": copy.deepcopy(program),
+                    "program_binding": copy.deepcopy(binding),
+                    "program_binding_id": binding["program_binding_id"],
+                    "program_id": program["program_id"],
+                    "program_revision": program["program_revision"],
+                    "retained_bundle_id": "sha256:" + "4" * 64,
+                    "scenario_catalog_revision": body[
+                        "scenario_catalog_revision"
+                    ],
+                    "scenario_id": body["scenario_id"],
+                    "schema_version": "manyforge.scenario_program_selection.v2",
+                    "typed_parameter_overrides": {},
+                }
+                scenario_selections[body["scenario_id"]] = baseline
             committed_program = {
                 "assistant_mode": "forbidden",
-                "baseline_program_binding_id": "sha256:" + "3" * 64,
+                "baseline_program_binding_id": baseline["program_binding_id"],
                 "deployment_artifact_id": "cell_a",
                 "deployment_revision": "sha256:" + "1" * 64,
                 "graph_revision": "sha256:" + "5" * 64,

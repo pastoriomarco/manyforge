@@ -54,6 +54,9 @@ def _parser() -> argparse.ArgumentParser:
         "--program-selection-state-root", type=Path, required=True
     )
     serve.add_argument("--node-catalog-path", type=Path, required=True)
+    serve.add_argument(
+        "--node-environment-manifest-path", type=Path, required=True
+    )
     serve.add_argument("--alarm-catalog-path", type=Path, required=True)
     serve.add_argument("--historian-database-path", type=Path, required=True)
     serve.add_argument("--manager-run-root", type=Path, required=True)
@@ -173,6 +176,7 @@ def _serve(args: argparse.Namespace) -> int:
         artifact_root=args.artifact_root,
         program_selection_state_root=args.program_selection_state_root,
         node_catalog_path=args.node_catalog_path,
+        node_environment_manifest_path=args.node_environment_manifest_path,
         alarm_catalog_path=args.alarm_catalog_path,
         historian_database_path=args.historian_database_path,
         manager_run_root=args.manager_run_root,

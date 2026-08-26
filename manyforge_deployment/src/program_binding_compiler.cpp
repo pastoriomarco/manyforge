@@ -1040,16 +1040,13 @@ compile_program_binding_contract(
     }
     normalize_role_assignment(program_contract, role_assignment);
 
-    const auto current = detail::BuildQualifiedRetentionAuthority::qualify();
-    if (current.node_environment() != bundle.catalogs.node_environment ||
-        current.compiler_contract_digest() !=
-            bundle.provenance.compiler_contract_digest ||
-        current.compiler_build_digest() !=
-            bundle.provenance.compiler_build_digest) {
-      fail("binding compiler build differs from the selected retained bundle");
-    }
     const QualifiedCatalogClosure catalog = load_qualified_catalog_closure(
         bundle, catalog_artifact_store);
+
+    // Strictly compiling the package-owned catalog closure proves this
+    // compiler understands the selected contracts. Producer build/source
+    // identities are retained provenance, not compatibility requirements.
+    const auto current = detail::BuildQualifiedRetentionAuthority::qualify();
 
     std::map<std::pair<std::string, std::string>, QualifiedComponentType>
         component_types;

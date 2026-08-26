@@ -63,11 +63,13 @@ HeadlessApiCoreConfig ValidateConfig(HeadlessApiCoreConfig config) {
               !config.artifact_root.empty() &&
               !config.program_selection_state_root.empty() &&
               !config.node_catalog_path.empty() &&
+              !config.node_environment_manifest_path.empty() &&
               !config.alarm_catalog_path.empty() &&
               !config.historian_database_path.empty(),
           "headless_api_configuration_invalid",
           "projection, install, artifact, Program-selection state, node-"
-          "catalog, alarm-catalog, and historian paths are required");
+          "catalog, node-environment manifest, alarm-catalog, and historian "
+          "paths are required");
   Require(!config.cell_id.empty() && !config.owner_id.empty() &&
               !config.owner_epoch.empty(),
           "headless_api_configuration_invalid",
@@ -498,7 +500,8 @@ HeadlessApiCore::HeadlessApiCore(HeadlessApiCoreConfig config,
       // "." keeps that component directory-valued while traversal remains
       // anchored through the retained procfd root.
       node_environment_projection_(package_root_descriptor_->root() / ".",
-                                   config_.node_catalog_path),
+                                   config_.node_catalog_path,
+                                   config_.node_environment_manifest_path),
       source_model_projection_(package_root_descriptor_->root()),
       viewer_model_source_(package_root_descriptor_->root()),
       history_store_(std::make_shared<SqliteEventHistoryStore>(
@@ -642,7 +645,9 @@ HeadlessApiCore::ScenarioProgramSelection(const std::string_view scenario_id) {
           "scenario Program selection names another active deployment");
 
   const auto environment = NodeEnvironmentProjectionLocked(runtime);
-  Require(RequiredString(environment, "environment_digest") ==
+  const auto &package_environment =
+      RequiredMember(environment, "package_environment");
+  Require(RequiredString(package_environment, "environment_digest") ==
                   selection.node_environment_digest.value() &&
               RequiredString(environment, "retained_bundle_id") ==
                   selection.retained_bundle_id.value() &&
@@ -787,7 +792,9 @@ CanonicalValue HeadlessApiCore::AppliedProgramSelection() {
           "the last Applied Program does not belong to the fresh active "
           "Manager selection");
   const auto environment = NodeEnvironmentProjectionLocked(runtime);
-  Require(RequiredString(environment, "environment_digest") ==
+  const auto &package_environment =
+      RequiredMember(environment, "package_environment");
+  Require(RequiredString(package_environment, "environment_digest") ==
               RequiredString(selection, "node_environment_digest"),
           "program_applied_selection_invalid",
           "Applied Program and active node environment disagree");

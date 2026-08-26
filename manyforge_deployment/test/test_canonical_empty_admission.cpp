@@ -841,7 +841,7 @@ TEST_F(CanonicalEmptyAdmissionPackageTest,
 }
 
 TEST_F(CanonicalEmptyAdmissionPackageTest,
-       AValidButHistoricalManifestCannotReplaceTheCurrentBuildManifest) {
+       HistoricalManifestCannotBeCrossSplicedIntoTheSelectedBundle) {
   auto package = fresh_copy("historical-manifest");
   CanonicalValue admission =
       parse_file(admission_path(package->path()));

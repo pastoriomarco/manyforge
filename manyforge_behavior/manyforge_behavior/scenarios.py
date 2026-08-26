@@ -133,9 +133,6 @@ class NativeScenarioArtifactClosureVerifier:
     def verify(self, closure: ScenarioArtifactClosure, /) -> VerifiedScenarioMetadata:
         if not isinstance(closure, ScenarioArtifactClosure):
             raise TypeError("native scenario verifier requires one artifact closure")
-        if closure.node_environment_digest != self._node_environment.environment_digest:
-            raise ValueError("scenario closure selects another node environment")
-
         try:
             overrides = json.loads(closure.typed_parameter_overrides_json)
         except (TypeError, ValueError) as exc:
@@ -151,6 +148,11 @@ class NativeScenarioArtifactClosureVerifier:
         )
         from manyforge_behavior.program import Program
 
+        # The native verifier below cross-binds the exact package environment.
+        # Loading the Program with this runner's current catalog independently
+        # proves that every used node and parameter remains executable here;
+        # whole environment digests also contain source provenance and are not
+        # a compatibility contract.
         program = Program(
             closure.program_path,
             catalog=self._node_environment.catalog,
@@ -533,6 +535,15 @@ def _scenario_from_row(
         raise ScenarioDiscoveryError(
             f"{row_path}: Program Binding graph revision is stale"
         )
+    binding_environment = binding.value.get("node_environment")
+    if type(binding_environment) is not dict:
+        raise ScenarioDiscoveryError(
+            f"{row_path}: Program Binding has no node environment"
+        )
+    package_environment_digest = _require_digest(
+        binding_environment.get("environment_digest"),
+        path=f"{binding.path}.node_environment.environment_digest",
+    )
 
     program_id = _require_id(
         binding.value.get("program_id"), path=f"{binding.path}.program_id"
@@ -578,7 +589,7 @@ def _scenario_from_row(
         graph_revision=graph_revision,
         program_id=program_id,
         program_revision=program_revision,
-        node_environment_digest=node_environment.environment_digest,
+        node_environment_digest=package_environment_digest,
         assistant_mode=assistant_mode,
         typed_parameter_overrides_json=overrides_json,
     )

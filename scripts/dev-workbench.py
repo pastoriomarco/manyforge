@@ -37,12 +37,13 @@ STATE_ROOT = Path("/tmp/manyforge-state")
 HEADLESS_BUILD = BUILD_ROOT / "headless"
 SCENARIO_ROOT = CACHE_ROOT / "maintained-scenario-package"
 PACKAGE_ROOT = SCENARIO_ROOT / "retained-package"
-QUALIFIED_MANAGER_BINARY = SCENARIO_ROOT / "manyforge_manager_daemon"
-QUALIFIED_HEADLESS_ROOT = SCENARIO_ROOT / "headless-python"
 NATIVE_EXECUTION_HOST = SCENARIO_ROOT / "manyforge_native_execution_host"
 NATIVE_CANDIDATE_WORKER = SCENARIO_ROOT / "manyforge_roboplan_candidate_worker"
 MANAGER_BINARY = HEADLESS_BUILD / "manyforge_manager_daemon"
 NODE_CATALOG = WORKSPACE / "manyforge_behavior/resources/node_catalog.yaml"
+NODE_ENVIRONMENT_MANIFEST = (
+    WORKSPACE / "manyforge_behavior/resources/node_environment_manifest.yaml"
+)
 ALARM_CATALOG = (
     WORKSPACE / "manyforge_headless/resources/operator-alarm-catalog.v1.yaml"
 )
@@ -71,62 +72,19 @@ def _qualified_root() -> Path:
 
 
 def _import_package() -> None:
-    """Import an already-qualified maintained package without regenerating it."""
+    """Import one qualified package and its exact package-owned executables."""
 
-    cached_extensions = sorted(QUALIFIED_HEADLESS_ROOT.glob("manyforge_headless_py*.so"))
     if (
         PACKAGE_ROOT.is_dir()
-        and QUALIFIED_MANAGER_BINARY.is_file()
-        and len(cached_extensions) == 1
         and NATIVE_EXECUTION_HOST.is_file()
         and NATIVE_CANDIDATE_WORKER.is_file()
     ):
         return
-    if (
-        PACKAGE_ROOT.is_dir()
-        and NATIVE_EXECUTION_HOST.is_file()
-        and NATIVE_CANDIDATE_WORKER.is_file()
-        and (not QUALIFIED_MANAGER_BINARY.exists() or not cached_extensions)
-    ):
-        # Migrate an older D0 cache before any later development build can
-        # replace its exact package-qualified native closure. Manager and
-        # Headless still independently verify the retained package when used;
-        # this adds no trust path.
-        legacy_extensions = sorted(HEADLESS_BUILD.glob("manyforge_headless_py*.so"))
-        if not QUALIFIED_MANAGER_BINARY.exists() and MANAGER_BINARY.is_file():
-            temporary_manager = SCENARIO_ROOT / f"manager.import-{os.getpid()}"
-            shutil.copy2(MANAGER_BINARY, temporary_manager)
-            temporary_manager.replace(QUALIFIED_MANAGER_BINARY)
-        if not cached_extensions and len(legacy_extensions) == 1:
-            QUALIFIED_HEADLESS_ROOT.mkdir(parents=True, exist_ok=True)
-            temporary_extension = QUALIFIED_HEADLESS_ROOT / (
-                f"headless.import-{os.getpid()}.so"
-            )
-            shutil.copy2(legacy_extensions[0], temporary_extension)
-            temporary_extension.replace(
-                QUALIFIED_HEADLESS_ROOT / legacy_extensions[0].name
-            )
-        cached_extensions = sorted(
-            QUALIFIED_HEADLESS_ROOT.glob("manyforge_headless_py*.so")
-        )
-        if QUALIFIED_MANAGER_BINARY.is_file() and len(cached_extensions) == 1:
-            return
     qualified = _qualified_root()
     source_package = qualified / "maintained-package"
-    source_manager = qualified / "headless/manyforge_manager_daemon"
-    source_extensions = sorted(
-        (qualified / "headless").glob("manyforge_headless_py*.so")
-    )
-    if len(source_extensions) != 1:
-        raise WorkbenchError(
-            "qualified Headless Python extension is absent or ambiguous"
-        )
-    source_extension = source_extensions[0]
     source_native = qualified / "native-install/manyforge_native_execution_host"
     source_worker = qualified / "native-install/manyforge_roboplan_candidate_worker"
     for path, label in (
-        (source_manager, "qualified Manager"),
-        (source_extension, "qualified Headless Python extension"),
         (source_native, "qualified native execution host"),
         (source_worker, "qualified candidate worker"),
     ):
@@ -145,18 +103,75 @@ def _import_package() -> None:
     temporary.mkdir(parents=True)
     try:
         shutil.copytree(source_package, temporary / "retained-package")
-        shutil.copy2(source_manager, temporary / QUALIFIED_MANAGER_BINARY.name)
-        (temporary / QUALIFIED_HEADLESS_ROOT.name).mkdir()
-        shutil.copy2(
-            source_extension,
-            temporary / QUALIFIED_HEADLESS_ROOT.name / source_extension.name,
-        )
         shutil.copy2(source_native, temporary / NATIVE_EXECUTION_HOST.name)
         shutil.copy2(source_worker, temporary / NATIVE_CANDIDATE_WORKER.name)
         temporary.replace(SCENARIO_ROOT)
     except Exception:
         shutil.rmtree(temporary, ignore_errors=True)
         raise
+
+
+def _ensure_current_backend() -> Path:
+    """Build only the stale current Manager/Headless production closure."""
+
+    cache = HEADLESS_BUILD / "CMakeCache.txt"
+    if not cache.is_file():
+        completed = subprocess.run(
+            (
+                sys.executable,
+                "-c",
+                "import pybind11; print(pybind11.get_cmake_dir())",
+            ),
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        pybind11_dir = completed.stdout.strip()
+        if completed.returncode != 0 or not pybind11_dir:
+            raise WorkbenchError("cannot resolve the development pybind11 CMake package")
+        _run(
+            (
+                "cmake",
+                "-G",
+                "Ninja",
+                "-S",
+                str(WORKSPACE / "manyforge_headless"),
+                "-B",
+                str(HEADLESS_BUILD),
+                "-DCMAKE_BUILD_TYPE=RelWithDebInfo",
+                "-DBUILD_TESTING=OFF",
+                "-DMANYFORGE_HEADLESS_BUILD_PYTHON=ON",
+                f"-Dpybind11_DIR={pybind11_dir}",
+            )
+        )
+    jobs = os.environ.get("MANYFORGE_DEV_BUILD_JOBS", "").strip()
+    if not jobs:
+        jobs = str(max(1, os.cpu_count() or 1))
+    if not jobs.isdecimal() or int(jobs) < 1:
+        raise WorkbenchError("MANYFORGE_DEV_BUILD_JOBS must be a positive integer")
+    _run(
+        (
+            "cmake",
+            "--build",
+            str(HEADLESS_BUILD),
+            "--parallel",
+            jobs,
+            "--target",
+            "manyforge_manager_daemon",
+            "manyforge_headless_py",
+            "--",
+            "-k",
+            "0",
+        )
+    )
+    _regular_file(MANAGER_BINARY, "current Manager", executable=True)
+    extensions = sorted(HEADLESS_BUILD.glob("manyforge_headless_py*.so"))
+    if len(extensions) != 1:
+        raise WorkbenchError(
+            "current Headless Python extension is absent or ambiguous"
+        )
+    _regular_file(extensions[0], "current Headless Python extension")
+    return extensions[0]
 
 
 def _regular_file(path: Path, label: str, *, executable: bool = False) -> None:
@@ -442,32 +457,26 @@ class Workbench:
                     f"required development port {port} is already in use"
                 )
         _import_package()
+        current_headless_extension = _ensure_current_backend()
         self.metadata = _load_scenario(self.scenario_id)
         _regular_file(
-            QUALIFIED_MANAGER_BINARY,
-            "package-qualified Manager executable",
+            MANAGER_BINARY,
+            "current Manager executable",
             executable=True,
         )
-        qualified_extensions = sorted(
-            QUALIFIED_HEADLESS_ROOT.glob("manyforge_headless_py*.so")
-        )
-        if len(qualified_extensions) != 1:
-            raise WorkbenchError(
-                "package-qualified Headless Python extension is absent or ambiguous"
-            )
         _regular_file(
-            qualified_extensions[0],
-            "package-qualified Headless Python extension",
+            current_headless_extension,
+            "current Headless Python extension",
         )
         os.environ["PYTHONPATH"] = (
-            f"{QUALIFIED_HEADLESS_ROOT}:{os.environ.get('PYTHONPATH', '')}"
+            f"{HEADLESS_BUILD}:{os.environ.get('PYTHONPATH', '')}"
         )
         _ensure_frontend_dependencies()
         paths = self._paths()
         installed = STATE_ROOT / "installed-targets"
         installed.mkdir(parents=True, exist_ok=True)
         manager = installed / "manyforge_manager_daemon"
-        shutil.copy2(QUALIFIED_MANAGER_BINARY, manager)
+        shutil.copy2(MANAGER_BINARY, manager)
         _regular_file(manager, "installed Manager", executable=True)
         for source in (NATIVE_EXECUTION_HOST, NATIVE_CANDIDATE_WORKER):
             target = installed / source.name
@@ -529,6 +538,8 @@ class Workbench:
                 "--artifact-root", str(paths["artifacts"]),
                 "--program-selection-state-root", str(paths["program_selection"]),
                 "--node-catalog-path", str(NODE_CATALOG),
+                "--node-environment-manifest-path",
+                str(NODE_ENVIRONMENT_MANIFEST),
                 "--alarm-catalog-path", str(ALARM_CATALOG),
                 "--historian-database-path", str(STATE_ROOT / "history.sqlite3"),
                 "--manager-run-root", str(paths["manager_run"]),

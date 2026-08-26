@@ -365,8 +365,9 @@ def verify_active_assistant_mode(
         {"catalog_digest", "catalog_id", "content_version", "environment_digest"},
         "node_environment",
     )
+    package_environment = node_environment.payload["package_environment"]
     for field in environment:
-        expected = node_environment.payload[field]
+        expected = package_environment[field]
         if environment[field] != expected:
             raise _invalid("assistant mode node environment identities disagree")
 

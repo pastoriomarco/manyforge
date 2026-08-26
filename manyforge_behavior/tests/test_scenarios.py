@@ -88,6 +88,7 @@ def _write_exact_closure(
     *,
     scenario_id: str = "cell-pick",
     alias: str = "pick",
+    package_environment_digest: str | None = None,
 ) -> dict[str, str]:
     deployment_revision = "sha256:" + "a" * 64
     program_revision = "sha256:" + "b" * 64
@@ -149,7 +150,10 @@ def _write_exact_closure(
                 "catalog_id": environment.manifest.catalog_id,
                 "content_version": environment.manifest.catalog_content_version,
                 "catalog_digest": environment.manifest.catalog_digest,
-                "environment_digest": environment.manifest.environment_digest,
+                "environment_digest": (
+                    package_environment_digest
+                    or environment.manifest.environment_digest
+                ),
             },
         },
         own_field="program_binding_id",
@@ -198,6 +202,9 @@ def _write_exact_closure(
         "program_binding_id": program_binding_id,
         "bundle_path": str(bundle_path.resolve()),
         "binding_path": str(binding_path.resolve()),
+        "node_environment_digest": (
+            package_environment_digest or environment.environment_digest
+        ),
     }
 
 
@@ -205,7 +212,11 @@ def test_exact_v1_scenario_closure_is_discovered_and_verified(
     tmp_path: Path,
 ) -> None:
     environment = build_node_environment()
-    expected = _write_exact_closure(tmp_path, environment)
+    expected = _write_exact_closure(
+        tmp_path,
+        environment,
+        package_environment_digest="sha256:" + "9" * 64,
+    )
     verifier = _RecordingQualifiedVerifier()
 
     catalog = discover_scenarios(
@@ -235,7 +246,7 @@ def test_exact_v1_scenario_closure_is_discovered_and_verified(
     assert closure.scenario_catalog_revision == expected["scenario_catalog_revision"]
     assert str(closure.retained_bundle_path) == expected["bundle_path"]
     assert str(closure.program_binding_path) == expected["binding_path"]
-    assert closure.node_environment_digest == environment.environment_digest
+    assert closure.node_environment_digest == expected["node_environment_digest"]
 
 
 def test_native_verifier_adapter_reuses_program_values_and_forwards_exact_closure(
@@ -273,7 +284,7 @@ def test_native_verifier_adapter_reuses_program_values_and_forwards_exact_closur
         graph_revision="sha256:" + "5" * 64,
         program_id="pick_and_place_demo",
         program_revision="sha256:" + "6" * 64,
-        node_environment_digest=environment.environment_digest,
+        node_environment_digest="sha256:" + "9" * 64,
         assistant_mode="forbidden",
         typed_parameter_overrides_json='{"velocity_scale":0.6}',
     )

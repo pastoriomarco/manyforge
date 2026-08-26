@@ -166,10 +166,11 @@ class _Headless(HeadlessHttpClient):
     def node_environment(self) -> dict[str, Any]:
         mode = self.projection
         return {
-            "schema_version": "manyforge.node_environment_projection.v1",
+            "schema_version": "manyforge.node_environment_projection.v2",
             "retained_bundle_id": mode["retained_bundle_id"],
             "graph_revision": mode["graph_revision"],
             **mode["node_environment"],
+            "package_environment": deepcopy(mode["node_environment"]),
             "source": {
                 "available": True,
                 "freshness": "fresh",

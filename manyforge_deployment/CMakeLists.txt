@@ -821,9 +821,9 @@ if(MANYFORGE_BUILD_CCLC_RUNTIME_COMPOSITION)
     PROPERTIES POSITION_INDEPENDENT_CODE ON)
 endif()
 
-# Full offline compiler and writer surface. Admission is intentionally not a
-# dependency: the build-profile emitter must be able to link this target
-# before the admission reader's generated profile exists.
+# Full offline compiler and writer surface. The read-only admission target is
+# defined separately below; producer manifests remain content-addressed
+# provenance and are not interpreted as current-reader compatibility profiles.
 add_library(manyforge_deployment
   src/build_manifest.cpp
   src/stop_qualification_authority.cpp
@@ -861,16 +861,6 @@ target_link_libraries(manyforge_deployment PUBLIC
   manyforge_deployment_verification_core)
 set_target_properties(
   manyforge_deployment PROPERTIES POSITION_INDEPENDENT_CODE ON)
-
-add_executable(
-  manyforge_emit_build_qualified_admission_profile
-  tools/emit_build_qualified_admission_profile.cpp)
-target_include_directories(
-  manyforge_emit_build_qualified_admission_profile PRIVATE
-  "${CMAKE_CURRENT_SOURCE_DIR}/src")
-target_link_libraries(
-  manyforge_emit_build_qualified_admission_profile PRIVATE
-  manyforge::deployment)
 
 add_executable(
   manyforge_program_revision
@@ -912,43 +902,12 @@ target_link_libraries(
   manyforge_maintained_deployment_occurrences PRIVATE
   manyforge::deployment)
 
-set(
-  MANYFORGE_BUILD_QUALIFIED_ADMISSION_PROFILE_HEADER
-  "${CMAKE_CURRENT_BINARY_DIR}/generated/build_qualified_admission_profile_generated.hpp")
-add_custom_command(
-  OUTPUT "${MANYFORGE_BUILD_QUALIFIED_ADMISSION_PROFILE_HEADER}"
-  COMMAND
-    "${CMAKE_COMMAND}" -E make_directory
-    "${CMAKE_CURRENT_BINARY_DIR}/generated"
-  COMMAND
-    "$<TARGET_FILE:manyforge_emit_build_qualified_admission_profile>"
-    --output
-    "${MANYFORGE_BUILD_QUALIFIED_ADMISSION_PROFILE_HEADER}"
-  DEPENDS
-    manyforge_emit_build_qualified_admission_profile
-    # Reconfiguration can change the embedded compiler/build identity without
-    # changing a source or recipe timestamp.  Bind profile regeneration to the
-    # configure-time evidence so a rebuilt provider cannot retain a stale
-    # admission profile.
-    "${CMAKE_CURRENT_BINARY_DIR}/generated/embedded_build_evidence.hpp"
-    ${MANYFORGE_COMPILER_SOURCE_INPUTS}
-    ${MANYFORGE_COMPILER_RECIPE_INPUTS}
-  COMMENT "Generating exact build-qualified admission profile"
-  VERBATIM)
-add_custom_target(
-  manyforge_build_qualified_admission_profile
-  DEPENDS "${MANYFORGE_BUILD_QUALIFIED_ADMISSION_PROFILE_HEADER}")
-
 add_library(manyforge_deployment_admission
-  src/build_qualified_admission_profile.cpp
   src/canonical_empty_admission.cpp
-  "${MANYFORGE_BUILD_QUALIFIED_ADMISSION_PROFILE_HEADER}"
+  src/package_admission_profile.cpp
 )
 add_library(
   manyforge::deployment_admission ALIAS manyforge_deployment_admission)
-add_dependencies(
-  manyforge_deployment_admission
-  manyforge_build_qualified_admission_profile)
 target_include_directories(manyforge_deployment_admission PUBLIC
   ${MANYFORGE_DEPLOYMENT_PUBLIC_INCLUDE_DIRECTORIES})
 target_include_directories(manyforge_deployment_admission PRIVATE
@@ -1838,21 +1797,18 @@ if(BUILD_TESTING)
     PROPERTIES TIMEOUT ${MANYFORGE_GTEST_TIMEOUT_SECONDS})
 
   add_executable(
-    test_build_qualified_admission_profile
-    test/test_build_qualified_admission_profile.cpp)
-  add_dependencies(
-    test_build_qualified_admission_profile
-    manyforge_build_qualified_admission_profile)
+    test_package_admission_profile
+    test/test_package_admission_profile.cpp)
   target_include_directories(
-    test_build_qualified_admission_profile PRIVATE
-    "${CMAKE_CURRENT_SOURCE_DIR}/src"
-    "${CMAKE_CURRENT_BINARY_DIR}/generated")
+    test_package_admission_profile PRIVATE
+    "${CMAKE_CURRENT_SOURCE_DIR}/src")
   target_link_libraries(
-    test_build_qualified_admission_profile PRIVATE
+    test_package_admission_profile PRIVATE
+    manyforge_deployment
     manyforge_deployment_admission
     GTest::gtest_main)
   gtest_discover_tests(
-    test_build_qualified_admission_profile
+    test_package_admission_profile
     PROPERTIES TIMEOUT ${MANYFORGE_GTEST_TIMEOUT_SECONDS})
 
   add_test(
@@ -1863,16 +1819,6 @@ if(BUILD_TESTING)
       "-DMANYFORGE_TEST_ROOT=${CMAKE_CURRENT_BINARY_DIR}/canonical_empty_cli_package"
       -P
       "${CMAKE_CURRENT_SOURCE_DIR}/test/canonical_empty_generator_cli.cmake")
-
-  add_test(
-    NAME BuildQualifiedAdmissionProfileIsDeterministic
-    COMMAND
-      "${CMAKE_COMMAND}"
-      "-DMANYFORGE_PROFILE_EMITTER=$<TARGET_FILE:manyforge_emit_build_qualified_admission_profile>"
-      "-DMANYFORGE_GENERATED_PROFILE=${MANYFORGE_BUILD_QUALIFIED_ADMISSION_PROFILE_HEADER}"
-      "-DMANYFORGE_TEST_ROOT=${CMAKE_CURRENT_BINARY_DIR}/profile_determinism"
-      -P
-      "${CMAKE_CURRENT_SOURCE_DIR}/test/build_qualified_admission_profile_determinism.cmake")
 
   add_executable(test_runtime_policy_codec
     test/test_runtime_policy_codec.cpp)

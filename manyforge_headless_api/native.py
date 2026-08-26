@@ -53,6 +53,7 @@ class HeadlessApiConfig:
     artifact_root: Path
     program_selection_state_root: Path
     node_catalog_path: Path
+    node_environment_manifest_path: Path
     alarm_catalog_path: Path
     historian_database_path: Path
     manager_run_root: Path
@@ -86,6 +87,7 @@ class HeadlessApiConfig:
             self.artifact_root,
             self.program_selection_state_root,
             self.node_catalog_path,
+            self.node_environment_manifest_path,
             self.alarm_catalog_path,
             self.historian_database_path,
             self.manager_run_root,
@@ -360,6 +362,7 @@ class NativeHeadlessCore:
                 str(config.artifact_root),
                 str(config.program_selection_state_root),
                 str(config.node_catalog_path),
+                str(config.node_environment_manifest_path),
                 str(config.alarm_catalog_path),
                 str(config.historian_database_path),
                 config.cell_id,

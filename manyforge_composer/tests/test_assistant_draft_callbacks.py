@@ -97,6 +97,12 @@ def _node_environment() -> VerifiedActiveNodeEnvironment:
             "content_version": manifest.catalog_content_version,
             "catalog_digest": manifest.catalog_digest,
             "environment_digest": manifest.environment_digest,
+            "package_environment": {
+                "catalog_id": manifest.catalog_id,
+                "content_version": manifest.catalog_content_version,
+                "catalog_digest": manifest.catalog_digest,
+                "environment_digest": manifest.environment_digest,
+            },
             "source": _selection_source(
                 content_digest=_NODE_PROJECTION_DIGEST,
                 owner_kind="node_environment_projection",
@@ -187,12 +193,7 @@ def _assistant_mode(
                 "tool_call_family": "openai_chat_tools",
             },
         },
-        "node_environment": {
-            "catalog_digest": environment["catalog_digest"],
-            "catalog_id": environment["catalog_id"],
-            "content_version": environment["content_version"],
-            "environment_digest": environment["environment_digest"],
-        },
+        "node_environment": dict(environment["package_environment"]),
         "nodes": [],
         "provider": {
             "provider_alias": "assistant_provider",

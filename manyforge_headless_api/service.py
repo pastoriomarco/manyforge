@@ -587,7 +587,7 @@ class HeadlessService:
         source = projection.get("source")
         if (
             projection.get("schema_version")
-            != "manyforge.node_environment_projection.v1"
+            != "manyforge.node_environment_projection.v2"
             or not isinstance(source, dict)
         ):
             raise HeadlessApiError(
@@ -620,7 +620,7 @@ class HeadlessService:
             or not isinstance(context.get("node_environment"), dict)
             or not isinstance(context.get("source_model"), dict)
             or context["node_environment"].get("schema_version")
-            != "manyforge.node_environment_projection.v1"
+            != "manyforge.node_environment_projection.v2"
             or context["source_model"].get("schema_version")
             != "manyforge.source_model_projection.v1"
         ):
@@ -986,12 +986,15 @@ class HeadlessService:
         snapshot = self._validate_program_run_snapshot(projection)
         capture = snapshot["capture"]
         binding = applied.get("program_binding")
+        current_environment = self.node_environment()
         applied_node_policies = (
             binding.get("node_policies") if isinstance(binding, dict) else None
         )
         if (
             capture["applied_record_digest"] != source.get("record_digest")
             or capture["node_policies"] != applied_node_policies
+            or capture["node_environment_digest"]
+            != current_environment.get("environment_digest")
             or any(
                 capture[capture_field] != applied.get(applied_field)
                 for capture_field, applied_field in (
@@ -1002,7 +1005,6 @@ class HeadlessService:
                     ("program_binding_id", "program_binding_id"),
                     ("retained_bundle_id", "retained_bundle_id"),
                     ("graph_revision", "graph_revision"),
-                    ("node_environment_digest", "node_environment_digest"),
                 )
             )
         ):

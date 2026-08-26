@@ -17,7 +17,7 @@ if TYPE_CHECKING:
     from .state import ComposerState
 
 
-_PROJECTION_VERSION = "manyforge.node_environment_projection.v1"
+_PROJECTION_VERSION = "manyforge.node_environment_projection.v2"
 _PROJECTION_FIELDS = {
     "availability",
     "catalog",
@@ -27,6 +27,7 @@ _PROJECTION_FIELDS = {
     "environment_digest",
     "graph_revision",
     "manifest",
+    "package_environment",
     "retained_bundle_id",
     "schema_version",
     "source",
@@ -99,6 +100,17 @@ def _text(value: Any, label: str) -> str:
     if not isinstance(value, str) or not value or value != value.strip():
         raise _invalid(f"{label} must be a non-empty canonical string")
     return value
+
+
+def _digest(value: Any, label: str) -> str:
+    text = _text(value, label)
+    if (
+        len(text) != 71
+        or not text.startswith("sha256:")
+        or any(character not in "0123456789abcdef" for character in text[7:])
+    ):
+        raise _invalid(f"{label} must be a lowercase SHA-256 digest")
+    return text
 
 
 def _text_list(value: Any, label: str) -> list[str]:
@@ -280,6 +292,27 @@ def verify_active_node_environment(
         or projection["environment_digest"] != local_manifest.environment_digest
     ):
         raise _invalid("active node environment identities disagree")
+    package_environment = _object(
+        projection["package_environment"], "package node environment"
+    )
+    _closed(
+        package_environment,
+        {"catalog_digest", "catalog_id", "content_version", "environment_digest"},
+        "package node environment",
+    )
+    _text(package_environment["catalog_id"], "package_environment.catalog_id")
+    _text(
+        package_environment["content_version"],
+        "package_environment.content_version",
+    )
+    _digest(
+        package_environment["catalog_digest"],
+        "package_environment.catalog_digest",
+    )
+    _digest(
+        package_environment["environment_digest"],
+        "package_environment.environment_digest",
+    )
     _text(projection["retained_bundle_id"], "retained_bundle_id")
     _text(projection["graph_revision"], "graph_revision")
     _validate_availability(projection["availability"], local_environment)
