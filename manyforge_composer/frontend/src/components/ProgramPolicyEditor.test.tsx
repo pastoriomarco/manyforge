@@ -37,7 +37,7 @@ describe('ProgramPolicyEditor', () => {
     });
     expect(form.operator_stop_policy).toBe('inherit');
     expect(markup).toContain('Defaults are saved by omission.');
-    expect(markup).toContain('Save node policy to Draft');
+    expect(markup).not.toContain('Save node policy to Draft');
     expect(markup).toContain('Allowed recovery skills are unavailable: each skill requires an exact revision-qualified retained referent. Leave Allowed skills empty.');
     expect(markup).not.toContain('>Apply<');
   });
@@ -61,7 +61,7 @@ describe('ProgramPolicyEditor', () => {
     expect(markup).toContain('Imported authored Allowed skills (legacy.skill)');
     expect(markup).toContain('blocking applicability error');
     expect(markup).not.toContain('id="policy-settle-allowed_skills"');
-    expect(markup).toMatch(/<button type="submit" disabled="">Save node policy to Draft<\/button>/);
+    expect(markup).toContain('aria-invalid="true"');
     expect(markup).not.toContain('Apply-ready');
   });
 

@@ -2,9 +2,9 @@ import { act, createElement, useEffect, type ReactNode } from 'react';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import type {
+  DraftMutationResponse,
   ProgramNodeModificationPolicy,
   ProgramNodeRecoveryPolicy,
-  ProgramNodePolicyMutationResponse,
   ProgramOperatorStopPolicy,
   ProgramWorkspaceResponse,
 } from '../types/api';
@@ -13,7 +13,7 @@ import type { ComposerHeadlessState } from '../types/headless';
 const apiMock = vi.hoisted(() => ({
   programWorkspace: {
     get: vi.fn(),
-    updateNodePolicies: vi.fn(),
+    mutate: vi.fn(),
   },
 }));
 
@@ -56,13 +56,27 @@ function workspace(
     },
   };
   return {
-    schemaVersion: 'manyforge.composer_program_workspace.v1',
+    schemaVersion: 'manyforge.composer_program_workspace.v2',
     draft: {
       draftId: 'draft-1',
       draftRevision,
       programLoaded: true,
+      authoring: {
+        schema_version: 'manyforge.composer_authoring_forest.v1',
+        api_version: program.api_version,
+        program_id: program.program_id,
+        program_profile: program.program_profile,
+        name: program.name,
+        catalog: program.catalog,
+        component_roles: program.component_roles,
+        target_roles: program.target_roles,
+        forest: [program.tree],
+        positions: {},
+      },
+      candidateAvailable: true,
       programRevision,
       program,
+      diagnostics: [],
     },
     applicability: {
       applyReady: true,
@@ -295,15 +309,12 @@ describe('useProgramWorkspace Draft policy interaction', () => {
     expect(latest?.state.pendingAction).toBeNull();
   });
 
-  it('shows a Draft-only result before one follow-up GET, then retains it on stale refresh', async () => {
+  it('uses the ordinary Draft mutation path for node policies', async () => {
     const initial = deferred<ProgramWorkspaceResponse>();
     await mountHarness(initial, authoringSnapshot(workspace(1)));
     await act(async () => initial.resolve(workspace(1)));
-
-    const mutation = deferred<ProgramNodePolicyMutationResponse>();
-    const refresh = deferred<ProgramWorkspaceResponse>();
-    apiMock.programWorkspace.updateNodePolicies.mockReturnValueOnce(mutation.promise);
-    apiMock.programWorkspace.get.mockReturnValueOnce(refresh.promise);
+    const mutation = deferred<DraftMutationResponse>();
+    apiMock.programWorkspace.mutate.mockReturnValueOnce(mutation.promise);
 
     await act(async () => {
       latest?.updateNodePolicies(
@@ -312,44 +323,7 @@ describe('useProgramWorkspace Draft policy interaction', () => {
         recoveryPolicy,
         operatorStopPolicy,
       );
-    });
-    await act(async () => mutation.resolve({
-      schemaVersion: 'manyforge.composer_draft_mutation.v1',
-      mutation: 'program_draft_update_node_policies',
-      details: { updatedInstanceId: 'root' },
-      draft: workspace(2).draft,
-    }));
-
-    expect(latest?.state.workspace?.draft.draftRevision).toBe(2);
-    expect(latest?.state.pendingAction).toBe('refresh');
-    expect(apiMock.programWorkspace.get).toHaveBeenCalledTimes(2);
-
-    await act(async () => refresh.reject(new Error('owner unavailable')));
-    expect(latest?.state.workspace?.draft.draftRevision).toBe(2);
-    expect(latest?.state.refreshWarning).toBe(
-      'Draft updated; workspace status refresh failed. Your Draft change remains; retry refresh.',
-    );
-    expect(latest?.state.comparisonStatus).toBe('stale');
-    expect(latest?.state.pendingAction).toBeNull();
-  });
-
-  it('sends exact fences and policy payload, including no-op and successful refresh', async () => {
-    const initial = deferred<ProgramWorkspaceResponse>();
-    await mountHarness(initial, authoringSnapshot(workspace(1)));
-    await act(async () => initial.resolve(workspace(1)));
-    const mutation = deferred<ProgramNodePolicyMutationResponse>();
-    const refresh = deferred<ProgramWorkspaceResponse>();
-    apiMock.programWorkspace.updateNodePolicies.mockReturnValueOnce(mutation.promise);
-    apiMock.programWorkspace.get.mockReturnValueOnce(refresh.promise);
-
-    await act(async () => {
-      latest?.updateNodePolicies(
-        'root',
-        modificationPolicy,
-        recoveryPolicy,
-        operatorStopPolicy,
-      );
-      expect(apiMock.programWorkspace.updateNodePolicies).toHaveBeenCalledWith(
+      expect(apiMock.programWorkspace.mutate).toHaveBeenCalledWith(
         expect.objectContaining({
           draftId: 'draft-1',
           expectedDraftRevision: 1,
@@ -357,73 +331,21 @@ describe('useProgramWorkspace Draft policy interaction', () => {
           requestOwnerEpoch: expect.stringMatching(/^composer-authoring-owner\./),
           requestId: expect.stringMatching(/^composer-authoring\./),
         }),
-        workspace(1).draft.programRevision,
-        'root',
-        modificationPolicy,
-        recoveryPolicy,
-        operatorStopPolicy,
+        'program_draft_update_node_policies',
+        {
+          instance_id: 'root',
+          modification_policy: modificationPolicy,
+          recovery_policy: recoveryPolicy,
+          operator_stop_policy: operatorStopPolicy,
+        },
       );
     });
     await act(async () => mutation.resolve({
-      schemaVersion: 'manyforge.composer_draft_mutation.v1',
       mutation: 'program_draft_update_node_policies',
-      details: { updatedInstanceId: 'root' },
-      draft: workspace(1).draft,
+      details: { updated_instance_id: 'root' },
+      workspace: workspace(2),
     }));
-    expect(latest?.state.message).toContain('no-op');
-    await act(async () => refresh.resolve(workspace(1)));
-    expect(latest?.state.comparisonStatus).toBe('observed');
-    expect(latest?.state.refreshWarning).toBeNull();
-  });
-
-  it('keeps the previous Draft workspace when the policy mutation is stale', async () => {
-    const initial = deferred<ProgramWorkspaceResponse>();
-    await mountHarness(initial, authoringSnapshot(workspace(1)));
-    const original = workspace(1);
-    await act(async () => initial.resolve(original));
-    apiMock.programWorkspace.updateNodePolicies.mockRejectedValueOnce(
-      new Error('composer_program_revision_stale'),
-    );
-
-    await act(async () => {
-      latest?.updateNodePolicies(
-        'root',
-        modificationPolicy,
-        recoveryPolicy,
-        operatorStopPolicy,
-      );
-    });
-    expect(latest?.state.workspace).toStrictEqual(original);
-    expect(latest?.state.workspace?.draft.draftRevision).toBe(1);
-    expect(latest?.state.error).toContain('composer_program_revision_stale');
-    expect(apiMock.programWorkspace.get).toHaveBeenCalledTimes(1);
-  });
-
-  it('uses the newest backend admission generation after a rerender', async () => {
-    const initial = deferred<ProgramWorkspaceResponse>();
-    const first = authoringSnapshot(workspace(1));
-    const rerender = await mountHarness(initial, first);
-    await act(async () => initial.resolve(workspace(1)));
-    const next = {
-      ...first,
-      snapshotSequence: 12,
-      authoringAdmission: { authoringAllowed: true, admissionGeneration: 8 },
-    };
-    await rerender(next);
-    apiMock.programWorkspace.updateNodePolicies.mockReturnValueOnce(
-      new Promise<ProgramNodePolicyMutationResponse>(() => undefined),
-    );
-    await act(async () => {
-      latest?.updateNodePolicies(
-        'root', modificationPolicy, recoveryPolicy, operatorStopPolicy,
-      );
-    });
-    expect(apiMock.programWorkspace.updateNodePolicies).toHaveBeenCalledWith(
-      expect.objectContaining({
-        expectedAdmissionGeneration: 8,
-      }),
-      workspace(1).draft.programRevision,
-      'root', modificationPolicy, recoveryPolicy, operatorStopPolicy,
-    );
+    expect(latest?.state.workspace?.draft.draftRevision).toBe(2);
+    expect(latest?.state.pendingAction).toBeNull();
   });
 });

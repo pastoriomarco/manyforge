@@ -48,6 +48,7 @@ export default function App() {
   ));
   const [sceneEditorTarget, setSceneEditorTarget] = useState<HTMLElement | null>(null);
   const [runtimeDetailsOpen, setRuntimeDetailsOpen] = useState(false);
+  const [programInvalidEdit, setProgramInvalidEdit] = useState(false);
   const workbench = useRef<HTMLDivElement>(null);
   const [health, retryHealth] = useStructuralResource(api.health.get, {
     failureMessage: 'Could not read the Composer structural boundary.',
@@ -151,6 +152,8 @@ export default function App() {
             data-workspace="scene"
             className={activeWorkspace === 'scene' ? 'active' : ''}
             aria-pressed={activeWorkspace === 'scene'}
+            disabled={programInvalidEdit}
+            title={programInvalidEdit ? 'Review or discard the invalid Program field edit first.' : undefined}
             onClick={() => setActiveWorkspace('scene')}
           >
             Scene
@@ -160,6 +163,8 @@ export default function App() {
             data-workspace="deployment"
             className={activeWorkspace === 'deployment' ? 'active' : ''}
             aria-pressed={activeWorkspace === 'deployment'}
+            disabled={programInvalidEdit}
+            title={programInvalidEdit ? 'Review or discard the invalid Program field edit first.' : undefined}
             onClick={() => setActiveWorkspace('deployment')}
           >
             Deployment
@@ -168,6 +173,7 @@ export default function App() {
         <ProgramDocumentControls
           controller={programController}
           runtime={programRuntime}
+          localInvalidEdit={programInvalidEdit}
         />
         <RuntimeStatusOverlay
           status={runtimeView}
@@ -196,6 +202,7 @@ export default function App() {
               environment={nodeEnvironment}
               onRetryCatalog={retryCatalog}
               onRetryEnvironment={retryNodeEnvironment}
+              onInvalidEditChange={setProgramInvalidEdit}
             />
           ) : activeWorkspace === 'scene' ? (
             <div

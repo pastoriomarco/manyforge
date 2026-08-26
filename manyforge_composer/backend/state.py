@@ -34,6 +34,7 @@ from .authoring_admission import (
     AuthoringAdmissionCoordinator,
     AuthoringMutationEnvelope,
 )
+from .authoring_forest import from_program
 from .authoring_transaction_journal import (
     AuthoringJournalError,
     AuthoringTransaction,
@@ -345,6 +346,7 @@ class ComposerState:
         self,
         selection: dict[str, Any],
         pre_state: dict[str, Any],
+        program: Program,
     ) -> dict[str, Any]:
         document = deepcopy(selection["program"])
         if pre_state["program"] == document:
@@ -367,7 +369,9 @@ class ComposerState:
                     ).removeprefix("sha256:")[:24]
                 ),
                 "draft_revision": 1,
+                "authoring": from_program(program),
                 "program": document,
+                "diagnostics": [],
                 "saved_path": None,
                 "saved_program_revision": None,
                 "saved_document": None,
@@ -514,7 +518,7 @@ class ComposerState:
                     "reject_if_affected_busy": True,
                 }
             ),
-            "post_state": self._scenario_post_state(selection, pre_state),
+            "post_state": self._scenario_post_state(selection, pre_state, program),
         }
 
     def _execute_scenario_load(

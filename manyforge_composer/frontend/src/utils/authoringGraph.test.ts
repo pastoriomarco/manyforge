@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import {
   authoringMoveIntent,
-  buildAuthoringTree,
+  authoringSiblingInsertionIndex,
   layoutAuthoringGraph,
   validateAuthoringConnection,
   validateAuthoringDeletion,
@@ -68,7 +68,51 @@ describe('authoring graph mechanics', () => {
     )).toContain('already exists');
   });
 
-  it('rejects reparent and delete before violating the old parent minimum', () => {
+  it('maps either displayed ordering axis to one explicit sibling slot', () => {
+    const orderedNodes: AuthoringGraphNode[] = [
+      { id: 'root', label: 'Root', position: { x: 0, y: 100 } },
+      { id: 'first', label: 'First', position: { x: 200, y: 0 } },
+      { id: 'middle', label: 'Middle', position: { x: 200, y: 100 } },
+      { id: 'last', label: 'Last', position: { x: 200, y: 200 } },
+      { id: 'detached', label: 'Detached', position: { x: 200, y: 50 } },
+    ];
+    const orderedEdges = [
+      { source: 'root', target: 'first' },
+      { source: 'root', target: 'middle' },
+      { source: 'root', target: 'last' },
+    ];
+
+    expect(authoringSiblingInsertionIndex(
+      orderedNodes.map((node) => node.id === 'last'
+        ? { ...node, position: { x: 200, y: 25 } }
+        : node),
+      orderedEdges,
+      'root',
+      'last',
+      'horizontal',
+    )).toBe(1);
+    expect(authoringSiblingInsertionIndex(
+      orderedNodes,
+      orderedEdges,
+      'root',
+      'detached',
+      'horizontal',
+    )).toBe(1);
+
+    const verticalNodes = orderedNodes.map((node) => ({
+      ...node,
+      position: { x: node.position.y, y: node.position.x },
+    }));
+    expect(authoringSiblingInsertionIndex(
+      verticalNodes,
+      orderedEdges,
+      'root',
+      'detached',
+      'vertical',
+    )).toBe(1);
+  });
+
+  it('allows temporarily incomplete parents while retaining a valid forest', () => {
     const cardinalNodes: AuthoringGraphNode[] = [
       { id: 'root', label: 'Root', position: { x: 0, y: 0 }, childrenMin: 1, childrenMax: -1 },
       { id: 'required-parent', label: 'Required parent', position: { x: 0, y: 100 }, childrenMin: 1, childrenMax: -1 },
@@ -87,17 +131,20 @@ describe('authoring graph mechanics', () => {
       'other',
       'required',
     )).toEqual({
-      intent: null,
-      error: "Node 'Required parent' requires at least 1 child",
+      intent: {
+        instance_id: 'required',
+        new_parent_instance_id: 'other',
+        index: 0,
+      },
+      error: null,
     });
     expect(validateAuthoringDeletion(
       cardinalNodes,
-      cardinalEdges,
       'required',
-    )).toBe("Node 'Required parent' requires at least 1 child");
+    )).toBeNull();
   });
 
-  it('rejects unknown, root, capacity, leaf, and multiparent connections', () => {
+  it('rejects unknown, capacity, leaf, and multiparent connections', () => {
     const bounded = nodes.map((node) => ({
       ...node,
       childrenMax: node.id === 'root' ? 2 : node.id === 'left' ? 0 : 1,
@@ -112,7 +159,7 @@ describe('authoring graph mechanics', () => {
       [],
       'other',
       'root',
-    )).toContain('Root node');
+    )).toBeNull();
     expect(validateAuthoringConnection(
       [...bounded, { id: 'new', label: 'New', position: { x: 400, y: 100 } }],
       edges,
@@ -126,29 +173,6 @@ describe('authoring graph mechanics', () => {
       'other',
       'left',
     )).toContain('multiple parents');
-  });
-
-  it('builds one ordered, connected tree from canvas geometry', () => {
-    expect(buildAuthoringTree(nodes, edges, 'vertical')).toEqual({
-      tree: {
-        id: 'root',
-        children: [
-          { id: 'left', children: [] },
-          { id: 'right', children: [] },
-        ],
-      },
-      error: null,
-    });
-  });
-
-  it('rejects dangling, multi-parent, and disconnected graphs', () => {
-    expect(
-      buildAuthoringTree(nodes, [...edges, { source: 'missing', target: 'right' }], 'vertical').error,
-    ).toContain('dangling');
-    expect(
-      buildAuthoringTree(nodes, [...edges, { source: 'left', target: 'right' }], 'vertical').error,
-    ).toContain('multiple parents');
-    expect(buildAuthoringTree(nodes, [], 'vertical').error).toContain('found 3');
   });
 
   it('lays out children without overlap in either direction', () => {

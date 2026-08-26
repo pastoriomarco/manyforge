@@ -95,15 +95,17 @@ const environment: NodeEnvironmentResponse = {
 };
 
 describe('Program tree canvas presentation actions', () => {
-  it('keeps pan, zoom, fit, layout, edge style, and selection off the Draft mutation path', () => {
+  it('keeps transient pan, zoom, fit, edge style, and selection off the Draft mutation path', () => {
     const onMutate = vi.fn();
     const onSelect = vi.fn();
     renderToStaticMarkup(
       <ProgramTreeCanvas
-        root={tree}
+        roots={[tree]}
+        retainedPositions={{}}
         catalogEntries={[sequence, timer]}
         environment={environment}
         selectedId="settle"
+        invalidNodeIds={new Set()}
         busy={false}
         onSelect={onSelect}
         onMutate={onMutate}
@@ -118,6 +120,7 @@ describe('Program tree canvas presentation actions', () => {
       panOnDrag: boolean;
       zoomOnScroll: boolean;
       zoomOnPinch: boolean;
+      zoomOnDoubleClick: boolean;
       onInit: (instance: { fitView: (options?: unknown) => void }) => void;
       onNodesChange: (changes: unknown[]) => void;
     };
@@ -154,9 +157,169 @@ describe('Program tree canvas presentation actions', () => {
     expect(flow.panOnDrag).toBe(true);
     expect(flow.zoomOnScroll).toBe(true);
     expect(flow.zoomOnPinch).toBe(true);
+    expect(flow.zoomOnDoubleClick).toBe(false);
     expect(onSelect).toHaveBeenCalledWith('settle');
     expect(fitView).toHaveBeenCalled();
     expect(animationFrame).toHaveBeenCalled();
-    expect(onMutate).not.toHaveBeenCalled();
+    expect(onMutate).toHaveBeenCalledTimes(1);
+    expect(onMutate).toHaveBeenCalledWith(
+      'tree_draft_update_positions',
+      { positions: expect.any(Object) },
+    );
+  });
+
+  it('issues one owner mutation for drop, connect, disconnect, and drag-end gestures', () => {
+    const detached: ProgramTreeNode = {
+      node_id: 'timer',
+      instance_id: 'detached',
+      parameters: {},
+      children: [],
+    };
+    const onMutate = vi.fn();
+    const onSelect = vi.fn();
+    renderToStaticMarkup(
+      <ProgramTreeCanvas
+        roots={[tree, detached]}
+        retainedPositions={{}}
+        catalogEntries={[sequence, timer]}
+        environment={environment}
+        selectedId={null}
+        invalidNodeIds={new Set(['detached'])}
+        busy={false}
+        onSelect={onSelect}
+        onMutate={onMutate}
+      />,
+    );
+    const flow = captured.flow as {
+      nodes: Array<{
+        id: string;
+        position: { x: number; y: number };
+        data: { presentation: { invalid?: boolean } };
+      }>;
+      onInit: (instance: {
+        fitView: (options?: unknown) => void;
+        screenToFlowPosition: (point: { x: number; y: number }) => { x: number; y: number };
+      }) => void;
+      onDrop: (event: Record<string, unknown>) => void;
+      onConnect: (connection: { source: string; target: string }) => void;
+      onEdgesDelete: (edges: Array<{ source: string; target: string }>) => void;
+      onEdgeDoubleClick: (
+        event: { preventDefault: () => void; stopPropagation: () => void },
+        edge: { source: string; target: string },
+      ) => void;
+      onNodeDragStop: (event: unknown, node: { id: string; position: { x: number; y: number } }) => void;
+    };
+    flow.onInit({
+      fitView: vi.fn(),
+      screenToFlowPosition: (point) => point,
+    });
+    flow.onDrop({
+      preventDefault: vi.fn(),
+      clientX: 30,
+      clientY: 40,
+      dataTransfer: {
+        getData: (format: string) => format === 'application/manyforge-node' ? 'timer' : '',
+      },
+    });
+    flow.onConnect({ source: 'root', target: 'detached' });
+    flow.onEdgesDelete([{ source: 'root', target: 'settle' }]);
+    flow.onNodeDragStop(null, { id: 'settle', position: { x: 50, y: 60 } });
+
+    const settlePosition = flow.nodes.find((node) => node.id === 'settle')?.position;
+    const allPositions = Object.fromEntries(
+      flow.nodes.map((node) => [node.id, node.position]),
+    );
+    expect(settlePosition).toBeDefined();
+    expect(flow.nodes.find((node) => node.id === 'detached')?.data.presentation.invalid).toBe(true);
+    expect(onMutate.mock.calls).toEqual([
+      ['tree_draft_insert_node', {
+        index: 2,
+        node: {
+          node_id: 'timer',
+          instance_id: 'timer',
+          parameters: {},
+          children: [],
+        },
+        position: { x: 30, y: 40 },
+      }],
+      ['tree_draft_move_node', {
+        instance_id: 'detached',
+        new_parent_instance_id: 'root',
+        index: 1,
+        positions: allPositions,
+      }],
+      ['tree_draft_move_node', {
+        instance_id: 'settle',
+        new_parent_instance_id: null,
+        index: 2,
+        positions: allPositions,
+      }],
+      ['tree_draft_update_positions', {
+        positions: { settle: { x: 50, y: 60 } },
+      }],
+    ]);
+
+    onMutate.mockClear();
+    const edgeEvent = { preventDefault: vi.fn(), stopPropagation: vi.fn() };
+    flow.onEdgeDoubleClick(edgeEvent, { source: 'root', target: 'settle' });
+    expect(edgeEvent.preventDefault).toHaveBeenCalledOnce();
+    expect(edgeEvent.stopPropagation).toHaveBeenCalledOnce();
+    expect(onMutate).toHaveBeenCalledWith('tree_draft_move_node', {
+      instance_id: 'settle',
+      new_parent_instance_id: null,
+      index: 2,
+      positions: allPositions,
+    });
+  });
+
+  it('turns a sibling drag into one explicit semantic reorder while retaining its layout', () => {
+    const orderedTree: ProgramTreeNode = {
+      ...tree,
+      children: ['first', 'middle', 'last'].map((instanceId) => ({
+        node_id: 'timer',
+        instance_id: instanceId,
+        parameters: {},
+        children: [],
+      })),
+    };
+    const retainedPositions = {
+      root: { x: 40, y: 120 },
+      first: { x: 340, y: 0 },
+      middle: { x: 340, y: 120 },
+      last: { x: 340, y: 240 },
+    };
+    const onMutate = vi.fn();
+    renderToStaticMarkup(
+      <ProgramTreeCanvas
+        roots={[orderedTree]}
+        retainedPositions={retainedPositions}
+        catalogEntries={[sequence, timer]}
+        environment={environment}
+        selectedId={null}
+        invalidNodeIds={new Set()}
+        busy={false}
+        onSelect={vi.fn()}
+        onMutate={onMutate}
+      />,
+    );
+    const flow = captured.flow as {
+      onNodeDragStop: (
+        event: unknown,
+        node: { id: string; position: { x: number; y: number } },
+      ) => void;
+    };
+
+    flow.onNodeDragStop(null, { id: 'last', position: { x: 340, y: 50 } });
+
+    expect(onMutate).toHaveBeenCalledOnce();
+    expect(onMutate).toHaveBeenCalledWith('tree_draft_move_node', {
+      instance_id: 'last',
+      new_parent_instance_id: 'root',
+      index: 1,
+      positions: {
+        ...retainedPositions,
+        last: { x: 340, y: 50 },
+      },
+    });
   });
 });

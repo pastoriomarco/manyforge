@@ -15,11 +15,15 @@ type DraftTextInputProps = Omit<
 > & {
   value: string | number | null | undefined;
   onCommit: (value: string) => void;
+  validate?: (value: string) => string | null;
+  onInvalidChange?: (message: string | null) => void;
 };
 
 export function DraftTextInput({
   value,
   onCommit,
+  validate,
+  onInvalidChange,
   onBlur,
   onFocus,
   onKeyDown,
@@ -28,20 +32,35 @@ export function DraftTextInput({
   const normalizedValue = formatDraftValue(value);
   const [draft, setDraft] = useState(normalizedValue);
   const [focused, setFocused] = useState(false);
+  const [invalidMessage, setInvalidMessage] = useState<string | null>(null);
   const skipNextCommit = useRef(false);
 
   useEffect(() => {
-    if (!focused) setDraft(normalizedValue);
-  }, [focused, normalizedValue]);
+    if (!focused && invalidMessage === null) setDraft(normalizedValue);
+  }, [focused, invalidMessage, normalizedValue]);
 
+  const validateDraft = useCallback(() => {
+    const message = validate?.(draft) ?? null;
+    setInvalidMessage(message);
+    onInvalidChange?.(message);
+    return message;
+  }, [draft, onInvalidChange, validate]);
   const commit = useCallback(() => {
-    if (draft !== normalizedValue) onCommit(draft);
-  }, [draft, normalizedValue, onCommit]);
-  const reset = useCallback(() => setDraft(normalizedValue), [normalizedValue]);
+    const message = validateDraft();
+    if (message === null && draft !== normalizedValue) onCommit(draft);
+  }, [draft, normalizedValue, onCommit, validateDraft]);
+  const reset = useCallback(() => {
+    setDraft(normalizedValue);
+    setInvalidMessage(null);
+    onInvalidChange?.(null);
+  }, [normalizedValue, onInvalidChange]);
 
   return (
     <input
       {...props}
+      className={`${props.className ?? ''}${invalidMessage ? ' draft-input-invalid' : ''}`.trim()}
+      aria-invalid={invalidMessage ? true : props['aria-invalid']}
+      title={invalidMessage ?? props.title}
       value={draft}
       onFocus={(event) => {
         setFocused(true);
@@ -55,6 +74,12 @@ export function DraftTextInput({
         onBlur?.(event);
       }}
       onKeyDown={(event: KeyboardEvent<HTMLInputElement>) => {
+        if (event.key === 'Enter' || event.key === 'Tab') {
+          if (validateDraft() !== null) {
+            event.preventDefault();
+            return;
+          }
+        }
         if (event.key === 'Enter') {
           event.preventDefault();
           event.currentTarget.blur();
@@ -79,11 +104,15 @@ type DraftTextareaProps = Omit<
 > & {
   value: string | number | null | undefined;
   onCommit: (value: string) => void;
+  validate?: (value: string) => string | null;
+  onInvalidChange?: (message: string | null) => void;
 };
 
 export function DraftTextarea({
   value,
   onCommit,
+  validate,
+  onInvalidChange,
   onBlur,
   onFocus,
   onKeyDown,
@@ -92,20 +121,35 @@ export function DraftTextarea({
   const normalizedValue = formatDraftValue(value);
   const [draft, setDraft] = useState(normalizedValue);
   const [focused, setFocused] = useState(false);
+  const [invalidMessage, setInvalidMessage] = useState<string | null>(null);
   const skipNextCommit = useRef(false);
 
   useEffect(() => {
-    if (!focused) setDraft(normalizedValue);
-  }, [focused, normalizedValue]);
+    if (!focused && invalidMessage === null) setDraft(normalizedValue);
+  }, [focused, invalidMessage, normalizedValue]);
 
+  const validateDraft = useCallback(() => {
+    const message = validate?.(draft) ?? null;
+    setInvalidMessage(message);
+    onInvalidChange?.(message);
+    return message;
+  }, [draft, onInvalidChange, validate]);
   const commit = useCallback(() => {
-    if (draft !== normalizedValue) onCommit(draft);
-  }, [draft, normalizedValue, onCommit]);
-  const reset = useCallback(() => setDraft(normalizedValue), [normalizedValue]);
+    const message = validateDraft();
+    if (message === null && draft !== normalizedValue) onCommit(draft);
+  }, [draft, normalizedValue, onCommit, validateDraft]);
+  const reset = useCallback(() => {
+    setDraft(normalizedValue);
+    setInvalidMessage(null);
+    onInvalidChange?.(null);
+  }, [normalizedValue, onInvalidChange]);
 
   return (
     <textarea
       {...props}
+      className={`${props.className ?? ''}${invalidMessage ? ' draft-input-invalid' : ''}`.trim()}
+      aria-invalid={invalidMessage ? true : props['aria-invalid']}
+      title={invalidMessage ?? props.title}
       value={draft}
       onFocus={(event) => {
         setFocused(true);
@@ -119,7 +163,15 @@ export function DraftTextarea({
         onBlur?.(event);
       }}
       onKeyDown={(event: KeyboardEvent<HTMLTextAreaElement>) => {
+        if (event.key === 'Tab' && validateDraft() !== null) {
+          event.preventDefault();
+          return;
+        }
         if ((event.ctrlKey || event.metaKey) && event.key === 'Enter') {
+          if (validateDraft() !== null) {
+            event.preventDefault();
+            return;
+          }
           event.preventDefault();
           event.currentTarget.blur();
           return;

@@ -10,6 +10,7 @@ import {
   collectProgramBindingCandidates,
   collectProgramParameterUsages,
   nextProgramInstanceId,
+  programDiagnosticNodeId,
   resolveProgramParameterLiteralValue,
 } from './programAuthoring';
 
@@ -188,5 +189,21 @@ describe('Program parameter binding continuity', () => {
     expect(nextProgramInstanceId('motion.move', ['motion.move', 'motion.move_2'])).toBe(
       'motion.move_3',
     );
+  });
+
+  it('projects backend diagnostic paths onto retained node identities', () => {
+    const root = tree({
+      children: [{
+        node_id: 'move',
+        instance_id: 'child',
+        parameters: {},
+        children: [],
+      }],
+    });
+    expect(programDiagnosticNodeId(
+      [root],
+      'forest[0].children[0].parameters.velocity_scale',
+    )).toBe('child');
+    expect(programDiagnosticNodeId([root], 'program.compatibility')).toBeNull();
   });
 });

@@ -23,6 +23,7 @@ export interface BtNodePresentation {
   selected: boolean;
   layoutDirection: LayoutDirection;
   executionAvailable?: boolean;
+  invalid?: boolean;
 }
 
 export function btNodeConnectionAvailability(node: Pick<
@@ -64,7 +65,7 @@ export function BtNode({
 }: BtNodeProps) {
   const connections = btNodeConnectionAvailability(node);
   const updateNodeInternals = useUpdateNodeInternals();
-  const targetConnectable = node.isRoot === true ? false : true;
+  const targetConnectable = connections.targetConnectable;
   const glyph = node.kind === 'composite'
     ? '◆'
     : node.kind === 'decorator'
@@ -79,16 +80,18 @@ export function BtNode({
   return (
     <div
       ref={elementRef}
-      className={`bt-node category-${node.category} status-${node.status}${node.selected ? ' selected' : ''}`}
+      className={`bt-node category-${node.category} status-${node.status}${node.invalid ? ' invalid' : ''}${node.selected ? ' selected' : ''}`}
       data-node-id={node.id}
       data-layout-direction={node.layoutDirection}
       role="button"
       tabIndex={0}
       aria-pressed={node.selected}
       aria-label={`${node.label} Program node`}
-      title={node.executionAvailable
-        ? 'Execution implementation available'
-        : 'Authorable here; execution remains unavailable at its restoration gate'}
+      title={node.invalid
+        ? 'This node has incomplete or invalid authored fields.'
+        : node.executionAvailable
+          ? 'Execution implementation available'
+          : 'Authorable here; execution remains unavailable at its restoration gate'}
       onClick={() => onSelect?.(node.id)}
       onFocus={() => onFocus?.(node.id)}
       onKeyDown={(event) => {

@@ -5,7 +5,7 @@ from __future__ import annotations
 from typing import Annotated, Any, Literal
 import unicodedata
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 
 PROVIDER_REQUEST_VERSION = "manyforge.assistant.provider_request.v1"
@@ -45,11 +45,11 @@ class ComposerDraftContext(_ClosedModel):
         Field(alias="expectedAdmissionGeneration", ge=1, le=_MAXIMUM_SAFE_INTEGER),
     ]
     program_loaded: bool = Field(alias="programLoaded")
-    program_revision: Annotated[
-        int | None,
-        Field(alias="programRevision", ge=0, le=_MAXIMUM_SAFE_INTEGER),
-    ] = None
+    authoring: dict[str, Any] | None
+    candidate_available: bool = Field(alias="candidateAvailable")
+    program_revision: Annotated[str | None, Field(alias="programRevision", pattern=_DIGEST)] = None
     program: dict[str, Any] | None
+    diagnostics: Annotated[list[dict[str, Any]], Field(max_length=100_000)]
     node_environment_digest: Annotated[
         str, Field(alias="nodeEnvironmentDigest", pattern=_DIGEST)
     ]
@@ -64,6 +64,24 @@ class ComposerDraftContext(_ClosedModel):
     @classmethod
     def canonical_draft_id(cls, value: str) -> str:
         return _canonical_text(value, "draftId")
+
+    @model_validator(mode="after")
+    def consistent_authoring_candidate(self) -> "ComposerDraftContext":
+        if self.program_loaded != (self.authoring is not None):
+            raise ValueError("programLoaded must identify the authoring Draft")
+        candidate_present = self.program is not None and self.program_revision is not None
+        if self.candidate_available != candidate_present:
+            raise ValueError("candidateAvailable must identify one complete Program candidate")
+        if (self.program is None) != (self.program_revision is None):
+            raise ValueError("Program candidate identity is incomplete")
+        if self.program is not None:
+            if self.program.get("program_revision") != self.program_revision:
+                raise ValueError("Program candidate revision is inconsistent")
+            if self.diagnostics:
+                raise ValueError("a complete Program candidate cannot have diagnostics")
+        elif self.program_loaded and not self.diagnostics:
+            raise ValueError("an incomplete authoring Draft requires diagnostics")
+        return self
 
 
 class ProviderRequest(_ClosedModel):

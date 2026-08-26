@@ -195,8 +195,11 @@ def create_assistant_router(state: ComposerState) -> APIRouter:
                 "expectedDraftRevision": draft["draft_revision"],
                 "expectedAdmissionGeneration": admission_generation,
                 "programLoaded": draft["program_loaded"],
+                "authoring": draft["authoring"],
+                "candidateAvailable": draft["candidate_available"],
                 "programRevision": draft["program_revision"],
                 "program": draft["program"],
+                "diagnostics": draft["diagnostics"],
                 "nodeEnvironmentDigest": node_environment.payload[
                     "environment_digest"
                 ],

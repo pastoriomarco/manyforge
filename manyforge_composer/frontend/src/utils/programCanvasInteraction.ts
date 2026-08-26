@@ -1,18 +1,8 @@
 import type {
   CatalogEntry,
   JsonValue,
-  ProgramTreeNode,
 } from '../types/api';
-import { flattenProgramTree } from './programAuthoring';
-
-export type ProgramInsertionPlacement = 'child' | 'sibling' | 'wrapper';
-
-export interface ProgramInsertionRequest {
-  requestId: number;
-  catalogId: string;
-  targetId: string;
-  placement: ProgramInsertionPlacement;
-}
+import { catalogDefaultParameters, nextProgramInstanceId } from './programAuthoring';
 
 export interface ProgramPaletteActivation {
   catalogId: string;
@@ -37,49 +27,6 @@ export function readProgramPaletteDrag(
   return getData(PROGRAM_NODE_DRAG_MIME) || getData('text/plain');
 }
 
-/**
- * Return only placements that can be staged against the immutable Draft
- * projection. This intentionally does not issue a mutation; the palette uses
- * the same result for click and canvas-drop insertion.
- */
-export function validProgramInsertionPlacements(
-  root: ProgramTreeNode,
-  entries: CatalogEntry[],
-  targetId: string | null,
-  stagedEntry: CatalogEntry,
-): ProgramInsertionPlacement[] {
-  if (!targetId) return [];
-  const flat = flattenProgramTree(root);
-  const target = flat.find(({ node }) => node.instance_id === targetId);
-  if (!target) return [];
-  const catalog = new Map(entries.map((entry) => [entry.id, entry]));
-  const targetEntry = catalog.get(target.node.node_id);
-  const childCapacity = targetEntry !== undefined
-    && targetEntry.childrenMax !== 0
-    && (
-      targetEntry.childrenMax < 0
-      || target.node.children.length < targetEntry.childrenMax
-    );
-  const result: ProgramInsertionPlacement[] = [];
-  if (childCapacity && stagedEntry.childrenMin === 0) result.push('child');
-  if (target.parentId !== null && stagedEntry.childrenMin === 0) result.push('sibling');
-  if (
-    stagedEntry.childrenMin <= 1
-    && stagedEntry.childrenMax !== 0
-    && (stagedEntry.childrenMax < 0 || stagedEntry.childrenMax >= 1)
-  ) {
-    result.push('wrapper');
-  }
-  return result;
-}
-
-export interface ProgramInsertionNode extends Record<string, JsonValue> {
-  node_id: string;
-  instance_id: string;
-  parameters: Record<string, JsonValue>;
-  children: [];
-}
-
 export type ProgramDraftMutation = {
   mutation:
     | 'tree_draft_insert_node'
@@ -89,48 +36,33 @@ export type ProgramDraftMutation = {
   args: Record<string, JsonValue>;
 };
 
-export function programInsertionMutation(
-  targetId: string,
-  placement: ProgramInsertionPlacement,
-  childCount: number,
-  node: ProgramInsertionNode,
+export function programDetachedInsertionMutation(
+  entry: CatalogEntry,
+  existingInstanceIds: string[],
+  index: number,
+  position?: { x: number; y: number },
 ): ProgramDraftMutation {
-  if (placement === 'wrapper') {
-    return {
-      mutation: 'tree_draft_wrap_node',
-      args: {
-        target_instance_id: targetId,
-        wrapper: {
-          node_id: node.node_id,
-          instance_id: node.instance_id,
-          parameters: node.parameters,
-        },
-      },
-    };
-  }
-  if (placement === 'child') {
-    return {
-      mutation: 'tree_draft_insert_node',
-      args: {
-        parent_instance_id: targetId,
-        index: childCount,
-        node,
-      },
-    };
-  }
+  const instanceId = nextProgramInstanceId(entry.id, existingInstanceIds);
   return {
     mutation: 'tree_draft_insert_node',
     args: {
-      after_instance_id: targetId,
-      node,
+      index,
+      node: {
+        node_id: entry.id,
+        instance_id: instanceId,
+        parameters: catalogDefaultParameters(entry),
+        children: [],
+      },
+      ...(position === undefined ? {} : { position }),
     },
   };
 }
 
 export function programMoveMutation(
   instanceId: string,
-  newParentInstanceId: string,
+  newParentInstanceId: string | null,
   index: number,
+  positions?: Record<string, { x: number; y: number }>,
 ): ProgramDraftMutation {
   return {
     mutation: 'tree_draft_move_node',
@@ -138,60 +70,17 @@ export function programMoveMutation(
       instance_id: instanceId,
       new_parent_instance_id: newParentInstanceId,
       index,
+      ...(positions === undefined ? {} : { positions }),
     },
   };
 }
 
 export function programDeleteMutation(
   instanceId: string,
-  isRoot: boolean,
-): ProgramDraftMutation | null {
-  if (isRoot) return null;
+): ProgramDraftMutation {
   return {
     mutation: 'tree_draft_delete_node',
     args: { instance_id: instanceId },
-  };
-}
-
-export interface ProgramCanvasDropResult {
-  request: ProgramInsertionRequest | null;
-  error: string | null;
-}
-
-export function stageProgramCanvasDrop(
-  root: ProgramTreeNode,
-  catalogEntries: CatalogEntry[],
-  catalogId: string,
-  targetId: string,
-  requestId: number,
-): ProgramCanvasDropResult {
-  const entry = catalogEntries.find((candidate) => candidate.id === catalogId);
-  if (!entry) {
-    return {
-      request: null,
-      error: `Unknown catalog entry '${catalogId}'.`,
-    };
-  }
-  const placement = validProgramInsertionPlacements(
-    root,
-    catalogEntries,
-    targetId,
-    entry,
-  )[0];
-  if (!placement) {
-    return {
-      request: null,
-      error: `No schema-valid insertion placement is available relative to '${targetId}'.`,
-    };
-  }
-  return {
-    request: {
-      requestId,
-      catalogId,
-      targetId,
-      placement,
-    },
-    error: null,
   };
 }
 

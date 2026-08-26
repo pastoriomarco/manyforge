@@ -279,12 +279,31 @@ export interface ProgramDocument {
   tree: ProgramTreeNode;
 }
 
+export type ProgramAuthoringDocument = Omit<
+  ProgramDocument,
+  'program_revision' | 'tree'
+> & {
+  schema_version: 'manyforge.composer_authoring_forest.v1';
+  forest: ProgramTreeNode[];
+  positions: Record<string, { x: number; y: number }>;
+};
+
+export interface ProgramAuthoringDiagnostic {
+  code: string;
+  path: string;
+  message: string;
+  severity: 'error';
+}
+
 export interface ProgramDraftProjection {
   draftId: string;
   draftRevision: number;
   programLoaded: boolean;
+  authoring: ProgramAuthoringDocument | null;
+  candidateAvailable: boolean;
   programRevision: string | null;
   program: ProgramDocument | null;
+  diagnostics: ProgramAuthoringDiagnostic[];
 }
 
 export interface ProgramDraftApplicability {
@@ -294,7 +313,7 @@ export interface ProgramDraftApplicability {
 }
 
 export interface ProgramWorkspaceResponse {
-  schemaVersion: 'manyforge.composer_program_workspace.v1';
+  schemaVersion: 'manyforge.composer_program_workspace.v2';
   draft: ProgramDraftProjection;
   applicability: ProgramDraftApplicability;
   saved: {
@@ -954,23 +973,6 @@ export interface ProgramCycleResetResult {
   idleCycleGeneration: number;
   settlementReference: string;
   admission: Record<string, JsonValue>;
-}
-
-export interface ProgramNodePolicyMutationResponse {
-  schemaVersion: 'manyforge.composer_draft_mutation.v1';
-  mutation: 'program_draft_update_node_policies';
-  details: {
-    updatedInstanceId: string;
-  };
-  draft: ProgramDraftProjection;
-}
-
-export interface ProgramNodePolicyMutationArguments {
-  expected_program_revision: string;
-  instance_id: string;
-  modification_policy: ProgramNodeModificationPolicy;
-  recovery_policy: ProgramNodeRecoveryPolicy;
-  operator_stop_policy: ProgramOperatorStopPolicy;
 }
 
 export type Vector3Tuple = [number, number, number];

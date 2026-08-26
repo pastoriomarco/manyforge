@@ -25,6 +25,7 @@ type ProgramAction =
 interface ProgramDocumentControlsProps {
   controller: ProgramWorkspaceController;
   runtime: ProgramRuntimeController;
+  localInvalidEdit?: boolean;
 }
 
 function shortRevision(revision: string | null): string {
@@ -47,6 +48,7 @@ function actionTitle(action: ProgramAction): string {
 export function ProgramDocumentControls({
   controller,
   runtime,
+  localInvalidEdit = false,
 }: ProgramDocumentControlsProps) {
   const {
     state,
@@ -63,6 +65,7 @@ export function ProgramDocumentControls({
   } = controller;
   const [action, setAction] = useState<ProgramAction | null>(null);
   const [settingsOpen, setSettingsOpen] = useState(false);
+  const [settingsInvalid, setSettingsInvalid] = useState(false);
   const [selectedProgramPath, setSelectedProgramPath] = useState<string | null>(null);
   const [confirmDiscard, setConfirmDiscard] = useState(false);
   const [confirmOverwrite, setConfirmOverwrite] = useState(false);
@@ -71,10 +74,15 @@ export function ProgramDocumentControls({
   const settingsButton = useRef<HTMLButtonElement>(null);
   const workspace = state.workspace;
   const program = workspace?.draft.program ?? null;
+  const authoring = workspace?.draft.authoring ?? null;
+  const incompleteReason = workspace?.draft.diagnostics[0]?.message
+    ?? 'Complete the authoring Draft before Save or Apply.';
   const busy = state.status === 'loading'
     || (state.status === 'ready' && state.pendingAction !== null);
-  const authoringBusy = busy || !mutationAvailable;
-  const authoringBlockReason = busy
+  const authoringBusy = busy || !mutationAvailable || localInvalidEdit;
+  const authoringBlockReason = localInvalidEdit
+    ? 'Review or discard the invalid local field edit first.'
+    : busy
     ? 'Another Program operation is in progress.'
     : mutationUnavailableReason;
   const replaceNeedsConfirmation = workspace?.hasUnsavedChanges === true
@@ -139,8 +147,10 @@ export function ProgramDocumentControls({
     closeAction();
   };
 
-  const programName = program?.name ?? 'No Program';
-  const draftState = workspace?.hasUnsavedChanges ? 'modified' : 'draft';
+  const programName = authoring?.name ?? 'No Program';
+  const draftState = authoring !== null && program === null
+    ? 'incomplete'
+    : workspace?.hasUnsavedChanges ? 'modified' : 'draft';
   const savedState = workspace?.saved.available
     ? workspace.saved.matchesDraft ? 'saved' : 'different'
     : 'unsaved';
@@ -152,13 +162,15 @@ export function ProgramDocumentControls({
     <>
       <div className="program-document-controls" aria-label="Program document controls">
         <div className="program-document-identity">
-          <strong title={workspace?.saved.path ?? program?.description ?? programName}>
+          <strong title={workspace?.saved.path ?? authoring?.description ?? programName}>
             {programName}
           </strong>
           <span className="document-identity-divider" aria-hidden="true" />
           <span
             className={`document-state state-${draftState}`}
-            title={`Draft ${shortRevision(workspace?.draft.programRevision ?? null)} · ID ${workspace?.draft.draftId ?? 'unavailable'} · edit ${workspace?.draft.draftRevision ?? 0}`}
+            title={program === null && authoring !== null
+              ? `${workspace?.draft.diagnostics.length ?? 0} issue(s) · ${incompleteReason}`
+              : `Draft ${shortRevision(workspace?.draft.programRevision ?? null)} · ID ${workspace?.draft.draftId ?? 'unavailable'} · edit ${workspace?.draft.draftRevision ?? 0}`}
           >
             {draftState}
           </span>
@@ -181,7 +193,7 @@ export function ProgramDocumentControls({
             className="icon-button program-settings-button"
             aria-label="Program-wide settings"
             title="Program-wide settings"
-            disabled={program === null}
+            disabled={authoring === null}
             onClick={() => setSettingsOpen(true)}
           >
             ⚙
@@ -192,8 +204,8 @@ export function ProgramDocumentControls({
         <div className="program-document-actions">
           <button type="button" disabled={authoringBusy || workspace === null} title={authoringBlockReason ?? 'Create a new local Program Draft.'} onClick={(event) => beginAction('new', event)}>New</button>
           <button type="button" disabled={authoringBusy || workspace === null} title={authoringBlockReason ?? 'Open a Program as the local Draft without changing the active Scenario.'} onClick={(event) => beginAction('open', event)}>Open</button>
-          <button type="button" disabled={authoringBusy || !program || !workspace?.saved.available || !workspace.hasUnsavedChanges} title={authoringBlockReason ?? (!workspace?.hasUnsavedChanges ? 'Draft already matches Saved.' : 'Save the current Draft.')} onClick={save}>Save</button>
-          <button type="button" disabled={authoringBusy || !program} title={authoringBlockReason ?? 'Save the current Draft to another Program file.'} onClick={(event) => beginAction('save_as', event)}>Save As</button>
+          <button type="button" disabled={authoringBusy || !program || !workspace?.saved.available || !workspace.hasUnsavedChanges} title={authoringBlockReason ?? (!program ? incompleteReason : !workspace?.hasUnsavedChanges ? 'Draft already matches Saved.' : 'Save the current Draft.')} onClick={save}>Save</button>
+          <button type="button" disabled={authoringBusy || !program} title={authoringBlockReason ?? (!program ? incompleteReason : 'Save the current Draft to another Program file.')} onClick={(event) => beginAction('save_as', event)}>Save As</button>
           <button type="button" disabled={authoringBusy || workspace === null || scenarioCatalog === null} title={authoringBlockReason ?? (scenarioCatalog === null ? 'Scenario catalog is still loading or unavailable.' : 'Load a complete Scenario: Deployment, Binding, and Program.')} onClick={(event) => beginAction('load', event)}>Load</button>
           <span className="header-action-divider" aria-hidden="true" />
           <button type="button" disabled={authoringBusy || workspace?.hasUnappliedChanges !== true} title={authoringBlockReason ?? (workspace?.hasUnappliedChanges !== true ? 'Draft already matches Applied.' : 'Discard Draft edits and return to Applied.')} onClick={(event) => beginAction('discard', event)}>Discard</button>
@@ -211,7 +223,9 @@ export function ProgramDocumentControls({
             title={currentScenario === null
               ? `Load a Scenario before Program Apply. ${currentScenarioUnavailable}`
               : authoringBlockReason
-                ?? (workspace?.applied.matchesDraft === true
+                ?? (!program
+                  ? incompleteReason
+                  : workspace?.applied.matchesDraft === true
                   ? 'Draft already matches Applied.'
                   : 'Apply this Draft to the current active Scenario without changing Deployment.')}
             onClick={(event) => beginAction('apply', event)}
@@ -226,15 +240,20 @@ export function ProgramDocumentControls({
         title="Program settings"
         titleId="program-settings-title"
         kind="info"
-        onClose={() => setSettingsOpen(false)}
+        onClose={() => {
+          if (!settingsInvalid) setSettingsOpen(false);
+        }}
         returnFocusRef={settingsButton}
       >
-        {program && (
+        {authoring && (
           <ProgramSettingsEditor
-            program={program}
+            program={authoring}
+            candidateRevision={workspace?.draft.programRevision ?? null}
             busy={authoringBusy}
             runtime={runtime}
             onMutate={controller.mutate}
+            onInvalidChange={setSettingsInvalid}
+            diagnostics={workspace?.draft.diagnostics ?? []}
           />
         )}
       </OverlayPanel>

@@ -28,6 +28,13 @@ export interface AuthoringGraphNode {
   childrenMax?: number;
 }
 
+interface AuthoringGraphPositionNode {
+  id: string;
+  position: { x: number; y: number };
+  width?: number;
+  height?: number;
+}
+
 export function validateAuthoringConnection(
   nodes: AuthoringGraphNode[],
   edges: AuthoringGraphEdge[],
@@ -76,54 +83,23 @@ export function validateAuthoringConnection(
     seen.add(nodeId);
     stack.push(...(adjacency.get(nodeId) ?? []));
   }
-  if (targetParents.length === 0) {
-    return `Root node '${target.label}' cannot be reparented`;
-  }
-  const currentParentId = targetParents[0]?.source;
-  if (currentParentId && currentParentId !== sourceId) {
-    const currentParent = nodeMap.get(currentParentId);
-    const currentChildCount = edges.filter(
-      (edge) => edge.source === currentParentId,
-    ).length;
-    if (
-      currentParent
-      && currentParent.childrenMin !== undefined
-      && currentChildCount - 1 < currentParent.childrenMin
-    ) {
-      return `Node '${currentParent.label}' requires at least ${currentParent.childrenMin} child${currentParent.childrenMin === 1 ? '' : 'ren'}`;
-    }
-  }
   return null;
 }
 
 export function validateAuthoringDeletion(
   nodes: AuthoringGraphNode[],
-  edges: AuthoringGraphEdge[],
   targetId: string | null | undefined,
 ): string | null {
   if (!targetId) return 'Deletion must name a tree node';
   const nodeMap = new Map(nodes.map((node) => [node.id, node]));
   const target = nodeMap.get(targetId);
   if (!target) return 'Deletion references an unknown node';
-  const parents = edges.filter((edge) => edge.target === targetId);
-  if (parents.length === 0) return `Root node '${target.label}' cannot be deleted`;
-  if (parents.length !== 1) return `Node '${target.label}' does not have one exact parent`;
-  const parentId = parents[0]?.source;
-  const parent = parentId ? nodeMap.get(parentId) : undefined;
-  if (!parent) return `Node '${target.label}' references an unknown parent`;
-  const childCount = edges.filter((edge) => edge.source === parentId).length;
-  if (
-    parent.childrenMin !== undefined
-    && childCount - 1 < parent.childrenMin
-  ) {
-    return `Node '${parent.label}' requires at least ${parent.childrenMin} child${parent.childrenMin === 1 ? '' : 'ren'}`;
-  }
   return null;
 }
 
 export interface AuthoringMoveIntent {
   instance_id: string;
-  new_parent_instance_id: string;
+  new_parent_instance_id: string | null;
   index: number;
 }
 
@@ -162,22 +138,13 @@ export interface AuthoringGraphEdge {
   target: string;
 }
 
-export interface AuthoringTreeNode {
-  id: string;
-  children: AuthoringTreeNode[];
-}
-
-export type AuthoringTreeBuildResult =
-  | { tree: AuthoringTreeNode; error: null }
-  | { tree: null; error: string };
-
-function nodeWidth(node: AuthoringGraphNode): number {
+function nodeWidth(node: AuthoringGraphPositionNode): number {
   return typeof node.width === 'number' && Number.isFinite(node.width)
     ? node.width
     : DEFAULT_NODE_WIDTH;
 }
 
-function nodeHeight(node: AuthoringGraphNode): number {
+function nodeHeight(node: AuthoringGraphPositionNode): number {
   return typeof node.height === 'number' && Number.isFinite(node.height)
     ? node.height
     : DEFAULT_NODE_HEIGHT;
@@ -192,12 +159,52 @@ function depthSize(node: AuthoringGraphNode, direction: LayoutDirection): number
 }
 
 function primaryCoordinate(
-  node: AuthoringGraphNode,
+  node: AuthoringGraphPositionNode,
   direction: LayoutDirection,
 ): number {
   return direction === 'vertical'
     ? node.position.x + nodeWidth(node) / 2
     : node.position.y + nodeHeight(node) / 2;
+}
+
+/**
+ * Map one displayed subtree root to its insertion slot among a parent's
+ * children. Coordinates remain presentation metadata: the caller uses this
+ * result to issue one explicit, revision-fenced owner reorder on gesture end.
+ */
+export function authoringSiblingInsertionIndex(
+  nodes: AuthoringGraphPositionNode[],
+  edges: AuthoringGraphEdge[],
+  parentId: string,
+  targetId: string,
+  orderingDirection: LayoutDirection,
+): number | null {
+  const nodeMap = new Map(nodes.map((node) => [node.id, node]));
+  const target = nodeMap.get(targetId);
+  if (!nodeMap.has(parentId) || !target) return null;
+  const siblings: Array<{ node: AuthoringGraphPositionNode; order: number }> = [];
+  for (const [order, edge] of edges.entries()) {
+    if (edge.source !== parentId || edge.target === targetId) continue;
+    const sibling = nodeMap.get(edge.target);
+    if (!sibling) return null;
+    siblings.push({ node: sibling, order });
+  }
+  siblings.sort((left, right) => {
+    const difference = primaryCoordinate(
+      left.node,
+      orderingDirection,
+    ) - primaryCoordinate(
+      right.node,
+      orderingDirection,
+    );
+    return difference || left.order - right.order;
+  });
+  const targetCoordinate = primaryCoordinate(target, orderingDirection);
+  const index = siblings.findIndex(({ node }) => targetCoordinate <= primaryCoordinate(
+    node,
+    orderingDirection,
+  ));
+  return index < 0 ? siblings.length : index;
 }
 
 function positionFromCenters(
@@ -253,66 +260,6 @@ function graphRelations(
   return { nodeMap, childrenMap, parentMap, error: null };
 }
 
-/**
- * Validate and order the behavior-tree topology without serializing an old
- * Program DTO. I6 reconnects this tree identity to the qualified artifact.
- */
-export function buildAuthoringTree(
-  nodes: AuthoringGraphNode[],
-  edges: AuthoringGraphEdge[],
-  direction: LayoutDirection,
-): AuthoringTreeBuildResult {
-  if (nodes.length === 0) return { tree: null, error: 'Draft tree is empty' };
-  const relations = graphRelations(nodes, edges);
-  if (relations.error) return { tree: null, error: relations.error };
-  const { nodeMap, childrenMap, parentMap } = relations;
-  const roots = nodes.filter((node) => !parentMap.has(node.id));
-  if (roots.length !== 1) {
-    return {
-      tree: null,
-      error: `Draft tree must contain exactly one root node; found ${roots.length}`,
-    };
-  }
-
-  const visited = new Set<string>();
-  const visiting = new Set<string>();
-  const build = (nodeId: string): AuthoringTreeNode => {
-    const node = nodeMap.get(nodeId);
-    if (!node) throw new Error('Draft tree contains dangling edges');
-    if (visiting.has(nodeId)) throw new Error(`Cycle detected at node '${node.label}'`);
-    if (visited.has(nodeId)) {
-      throw new Error(`Node '${node.label}' is referenced more than once`);
-    }
-    visiting.add(nodeId);
-    visited.add(nodeId);
-    const children = [...(childrenMap.get(nodeId) ?? [])].sort((left, right) => {
-      const leftNode = nodeMap.get(left);
-      const rightNode = nodeMap.get(right);
-      if (!leftNode || !rightNode) return 0;
-      return primaryCoordinate(leftNode, direction) - primaryCoordinate(rightNode, direction);
-    });
-    const result = { id: node.id, children: children.map(build) };
-    visiting.delete(nodeId);
-    return result;
-  };
-
-  try {
-    const tree = build(roots[0].id);
-    if (visited.size !== nodes.length) {
-      return {
-        tree: null,
-        error: 'Draft tree must be fully connected; disconnected nodes are present',
-      };
-    }
-    return { tree, error: null };
-  } catch (error) {
-    return {
-      tree: null,
-      error: error instanceof Error ? error.message : 'Draft tree is invalid',
-    };
-  }
-}
-
 /** Deterministic subtree-span layout retained independently of React Flow. */
 export function layoutAuthoringGraph(
   nodes: AuthoringGraphNode[],
@@ -333,8 +280,8 @@ export function layoutAuthoringGraph(
         - primaryCoordinate(rightNode, orderingDirection);
     });
   }
-  const root = nodes.find((node) => !parentMap.has(node.id));
-  if (!root) return nodes;
+  const roots = nodes.filter((node) => !parentMap.has(node.id));
+  if (roots.length === 0) return nodes;
 
   const spanCache = new Map<string, number>();
   const measureSpan = (nodeId: string): number => {
@@ -352,7 +299,7 @@ export function layoutAuthoringGraph(
     spanCache.set(nodeId, span);
     return span;
   };
-  measureSpan(root.id);
+  roots.forEach((root) => measureSpan(root.id));
 
   const positions = new Map<string, { x: number; y: number }>();
   const rootCenter = ROOT_LAYOUT_CENTER[direction];
@@ -383,7 +330,16 @@ export function layoutAuthoringGraph(
       cursor += childSpan + PRIMARY_GAP[direction];
     }
   };
-  place(root.id, rootCenter.primary, rootCenter.depth);
+  const forestSpan = roots.reduce(
+    (sum, root, index) => sum + measureSpan(root.id) + (index > 0 ? PRIMARY_GAP[direction] : 0),
+    0,
+  );
+  let cursor = rootCenter.primary - forestSpan / 2;
+  for (const root of roots) {
+    const span = measureSpan(root.id);
+    place(root.id, cursor + span / 2, rootCenter.depth);
+    cursor += span + PRIMARY_GAP[direction];
+  }
 
   return nodes.map((node) => ({
     ...node,

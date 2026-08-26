@@ -23,7 +23,6 @@ import {
   parseProgramWorkspaceTransitionResponse,
   parseCurrentScenarioResponse,
   parseProgramCycleResetResult,
-  parseProgramNodePolicyMutationResponse,
   parseProgramRunIndex,
   parseProgramRunStatus,
   parseScenarioCatalogResponse,
@@ -65,10 +64,6 @@ import type {
   ProgramCycleResetResult,
   ProgramRunIndex,
   ProgramRunStatus,
-  ProgramNodeModificationPolicy,
-  ProgramNodePolicyMutationResponse,
-  ProgramNodeRecoveryPolicy,
-  ProgramOperatorStopPolicy,
   ScenarioCatalogResponse,
   SceneTransactionRequest,
   SceneTransactionResponse,
@@ -355,33 +350,6 @@ export const api = {
       {
         method: 'POST',
         body: JSON.stringify({ ...fence, mutation, arguments: args }),
-      },
-    ),
-    updateNodePolicies: (
-      fence: DraftFenceRequest,
-      expectedProgramRevision: string,
-      instanceId: string,
-      modificationPolicy: ProgramNodeModificationPolicy,
-      recoveryPolicy: ProgramNodeRecoveryPolicy,
-      operatorStopPolicy: ProgramOperatorStopPolicy,
-      signal?: AbortSignal,
-    ): Promise<ProgramNodePolicyMutationResponse> => requestJson(
-      '/api/program/draft/mutations',
-      parseProgramNodePolicyMutationResponse,
-      signal,
-      {
-        method: 'POST',
-        body: JSON.stringify({
-          ...fence,
-          mutation: 'program_draft_update_node_policies',
-          arguments: {
-            expected_program_revision: expectedProgramRevision,
-            instance_id: instanceId,
-            modification_policy: modificationPolicy,
-            recovery_policy: recoveryPolicy,
-            operator_stop_policy: operatorStopPolicy,
-          },
-        }),
       },
     ),
     openDraft: (

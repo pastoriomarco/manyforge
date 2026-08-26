@@ -26,6 +26,7 @@ import type {
   LogicalSceneObject,
   LogicalScenePose,
   NodeEnvironmentResponse,
+  ProgramAuthoringDocument,
   ProgramDocument,
   ProgramSceneResource,
   ProgramViewerMetadata,
@@ -56,7 +57,7 @@ function requestId(): string {
 }
 
 function programRoleIds(
-  program: ProgramDocument | null,
+  program: ProgramDocument | ProgramAuthoringDocument | null,
   field: 'required_frame_roles' | 'required_resource_roles',
 ): string[] {
   if (program === null) return [];
@@ -107,10 +108,12 @@ function defaultResource(existingIds: Set<string>): ProgramSceneResource {
 
 function ProgramSceneEditor({
   program,
+  draftRevision,
   busy,
   mutate,
 }: {
-  program: ProgramDocument;
+  program: ProgramAuthoringDocument;
+  draftRevision: number;
   busy: boolean;
   mutate: ProgramWorkspaceController['mutate'];
 }) {
@@ -125,7 +128,7 @@ function ProgramSceneEditor({
       ?? null;
     setSelectedId(next?.scene_resource_id ?? null);
     setStaged(next);
-  }, [program.program_revision, resources, selectedId]);
+  }, [draftRevision, resources, selectedId]);
 
   const dirty = staged !== null && selected !== null
     && JSON.stringify(staged) !== JSON.stringify(selected);
@@ -365,17 +368,19 @@ function ProgramSceneEditor({
 
 function ViewerMetadataEditor({
   program,
+  draftRevision,
   busy,
   mutate,
 }: {
-  program: ProgramDocument;
+  program: ProgramAuthoringDocument;
+  draftRevision: number;
   busy: boolean;
   mutate: ProgramWorkspaceController['mutate'];
 }) {
   const [draft, setDraft] = useState(() => viewerPresentationDraftFromProgram(program.viewer));
   useEffect(() => {
     setDraft(viewerPresentationDraftFromProgram(program.viewer));
-  }, [program.program_revision, program.viewer]);
+  }, [draftRevision, program.viewer]);
   const exact = programViewerMetadata(draft);
   const dirty = JSON.stringify(exact) !== JSON.stringify(
     programViewerMetadata(viewerPresentationDraftFromProgram(program.viewer)),
@@ -577,7 +582,7 @@ const SceneViewerBridge = memo(function SceneViewerBridge({
   environmentValue: NodeEnvironmentResponse | null;
   manifest: StructuralResourceState<SceneUrdfManifest>;
   onRetry: () => void;
-  program: ProgramDocument | null;
+  program: ProgramDocument | ProgramAuthoringDocument | null;
   viewer: ProgramViewerMetadata | undefined;
   selectedObjectId: string | null;
   livePose: LogicalScenePose | null;
@@ -667,7 +672,8 @@ export function SceneAuthoringWorkspace({
     failureMessage: 'Could not read the verified active source-model projection.',
   });
   const programWorkspace = programController.state.workspace;
-  const program = programWorkspace?.draft.program ?? null;
+  const program = programWorkspace?.draft.authoring ?? null;
+  const draftRevision = programWorkspace?.draft.draftRevision ?? 0;
   const environmentValue = environment.status === 'ready' ? environment.data : null;
   const sourceValue = sourceModel.status === 'ready' ? sourceModel.data : null;
   const factsResult = useMemo(
@@ -870,8 +876,8 @@ export function SceneAuthoringWorkspace({
         )}
         {program !== null && (
           <div className="scene-authoring-grid">
-            <ProgramSceneEditor program={program} busy={busyDraft} mutate={programController.mutate} />
-            <ViewerMetadataEditor program={program} busy={busyDraft} mutate={programController.mutate} />
+            <ProgramSceneEditor program={program} draftRevision={draftRevision} busy={busyDraft} mutate={programController.mutate} />
+            <ViewerMetadataEditor program={program} draftRevision={draftRevision} busy={busyDraft} mutate={programController.mutate} />
           </div>
         )}
 

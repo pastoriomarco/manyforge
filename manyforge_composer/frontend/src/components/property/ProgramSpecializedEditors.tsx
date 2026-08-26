@@ -1,10 +1,29 @@
-import { useEffect, useState } from 'react';
+import {
+  createContext,
+  useCallback,
+  useContext,
+  useEffect,
+  useRef,
+  useState,
+  type ReactNode,
+} from 'react';
 
 import type { CatalogJsonSchema, JsonValue } from '../../types/api';
 import { firstCatalogSchemaValidationMessage } from '../../utils/catalogSchema';
 import { DraftTextInput } from '../common/DraftInputs';
 
 type JsonObject = Record<string, JsonValue>;
+type SpecializedInvalidReporter = (token: symbol, message: string | null) => void;
+const SpecializedInvalidContext = createContext<SpecializedInvalidReporter>(() => undefined);
+
+function useSpecializedInvalidReporter() {
+  const report = useContext(SpecializedInvalidContext);
+  const token = useRef(Symbol('specialized-field'));
+  useEffect(() => () => report(token.current, null), [report]);
+  return useCallback((message: string | null) => {
+    report(token.current, message);
+  }, [report]);
+}
 
 function objectValue(value: JsonValue): JsonObject {
   return value as JsonObject;
@@ -38,6 +57,7 @@ function NumberField({
   disabled: boolean;
   onCommit: (value: number) => void;
 }) {
+  const reportInvalid = useSpecializedInvalidReporter();
   return (
     <label className="program-specialized-number">
       <span>{label}</span>
@@ -47,6 +67,10 @@ function NumberField({
         value={value}
         disabled={disabled}
         aria-label={label}
+        validate={(text) => text.trim() !== '' && Number.isFinite(Number(text))
+          ? null
+          : `${label} must be a finite number.`}
+        onInvalidChange={reportInvalid}
         onCommit={(text) => {
           const parsed = Number(text);
           if (Number.isFinite(parsed)) onCommit(parsed);
@@ -189,6 +213,7 @@ function FrameReferenceEditor({
   disabled: boolean;
   onCommit: (value: JsonValue) => void;
 }) {
+  const reportInvalid = useSpecializedInvalidReporter();
   const currentKind = typeof value.kind === 'string' ? value.kind : '';
   const [draft, setDraft] = useState<Record<string, string>>(() =>
     Object.fromEntries(Object.entries(value).filter((row): row is [string, string] =>
@@ -197,12 +222,14 @@ function FrameReferenceEditor({
   useEffect(() => {
     setDraft(Object.fromEntries(Object.entries(value).filter((row): row is [string, string] =>
       typeof row[1] === 'string')));
-  }, [value]);
+    reportInvalid(null);
+  }, [reportInvalid, value]);
 
   const kind = draft.kind ?? currentKind;
   const stage = (next: Record<string, string>) => {
     setDraft(next);
     const complete = completeFrameReferenceTransition(schema, next.kind, next);
+    reportInvalid(complete ? null : 'Complete every required frame role.');
     if (complete) onCommit(complete);
   };
 
@@ -384,6 +411,7 @@ function MotionReferenceEditor({
   disabled: boolean;
   onCommit: (value: JsonValue) => void;
 }) {
+  const reportInvalid = useSpecializedInvalidReporter();
   const currentType = typeof value.type === 'string' ? value.type : '';
   const [draftType, setDraftType] = useState(currentType);
   const [draftField, setDraftField] = useState('');
@@ -391,7 +419,8 @@ function MotionReferenceEditor({
     setDraftType(currentType);
     const field = MOTION_REFERENCE_FIELDS[currentType];
     setDraftField(field && typeof value[field] === 'string' ? value[field] as string : '');
-  }, [currentType, value]);
+    reportInvalid(null);
+  }, [currentType, reportInvalid, value]);
   const field = MOTION_REFERENCE_FIELDS[draftType];
   return (
     <div className="program-variant-editor" data-editor="motion-reference">
@@ -409,6 +438,7 @@ function MotionReferenceEditor({
             setDraftType(nextType);
             setDraftField('');
             const complete = completeMotionReferenceTransition(schema, nextType);
+            reportInvalid(complete ? null : 'Enter the required reference for this variant.');
             if (complete) onCommit(complete);
           }}
         >
@@ -427,6 +457,7 @@ function MotionReferenceEditor({
             onCommit={(text) => {
               setDraftField(text);
               const complete = completeMotionReferenceTransition(schema, draftType, text);
+              reportInvalid(complete ? null : 'Enter the required reference for this variant.');
               if (complete) onCommit(complete);
             }}
           />
@@ -748,27 +779,48 @@ export function ProgramSpecializedEditor({
   value,
   disabled,
   onCommit,
+  onInvalidChange,
 }: {
   schema: CatalogJsonSchema;
   value: JsonValue;
   disabled: boolean;
   onCommit: (value: JsonValue) => void;
+  onInvalidChange?: (message: string | null) => void;
 }) {
+  const [invalid, setInvalid] = useState<Map<symbol, string>>(() => new Map());
+  const reportInvalid = useCallback<SpecializedInvalidReporter>((token, message) => {
+    setInvalid((current) => {
+      const next = new Map(current);
+      if (message === null) next.delete(token);
+      else next.set(token, message);
+      return next;
+    });
+  }, []);
+  const firstInvalid = invalid.values().next().value ?? null;
+  const invalidChange = useRef(onInvalidChange);
+  useEffect(() => {
+    invalidChange.current = onInvalidChange;
+  }, [onInvalidChange]);
+  useEffect(() => {
+    invalidChange.current?.(firstInvalid);
+  }, [firstInvalid]);
+  useEffect(() => () => invalidChange.current?.(null), []);
   const kind = specializedKind(schema);
+  let content: ReactNode = null;
   if (kind === 'joint-target-list') {
-    return <JointTargetListEditor schema={schema} value={value as JsonValue[]} disabled={disabled} onCommit={onCommit} />;
+    content = <JointTargetListEditor schema={schema} value={value as JsonValue[]} disabled={disabled} onCommit={onCommit} />;
+  } else if (kind === 'cartesian-path') {
+    content = <CartesianPathEditor schema={schema} value={value as JsonValue[]} disabled={disabled} onCommit={onCommit} />;
+  } else if (kind === 'motion-pose') {
+    content = <MotionPoseEditor schema={schema} value={objectValue(value)} disabled={disabled} onCommit={onCommit} />;
+  } else if (kind === 'motion-reference') {
+    content = <MotionReferenceEditor schema={schema} value={objectValue(value)} disabled={disabled} onCommit={onCommit} />;
+  } else if (kind === 'coordinate') {
+    content = <CoordinateEditor schema={schema} value={objectValue(value)} disabled={disabled} onCommit={onCommit} />;
   }
-  if (kind === 'cartesian-path') {
-    return <CartesianPathEditor schema={schema} value={value as JsonValue[]} disabled={disabled} onCommit={onCommit} />;
-  }
-  if (kind === 'motion-pose') {
-    return <MotionPoseEditor schema={schema} value={objectValue(value)} disabled={disabled} onCommit={onCommit} />;
-  }
-  if (kind === 'motion-reference') {
-    return <MotionReferenceEditor schema={schema} value={objectValue(value)} disabled={disabled} onCommit={onCommit} />;
-  }
-  if (kind === 'coordinate') {
-    return <CoordinateEditor schema={schema} value={objectValue(value)} disabled={disabled} onCommit={onCommit} />;
-  }
-  return null;
+  return (
+    <SpecializedInvalidContext.Provider value={reportInvalid}>
+      {content}
+    </SpecializedInvalidContext.Provider>
+  );
 }

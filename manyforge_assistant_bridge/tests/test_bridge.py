@@ -205,8 +205,14 @@ def _request(projection: dict[str, Any]) -> dict[str, Any]:
             "expectedDraftRevision": 1,
             "expectedAdmissionGeneration": 7,
             "programLoaded": True,
-            "programRevision": 1,
-            "program": {"api_version": "manyforge.program.v1"},
+            "authoring": {"schema_version": "manyforge.composer_authoring_forest.v1"},
+            "candidateAvailable": True,
+            "programRevision": "sha256:" + "8" * 64,
+            "program": {
+                "api_version": "manyforge.program.v1",
+                "program_revision": "sha256:" + "8" * 64,
+            },
+            "diagnostics": [],
             "nodeEnvironmentDigest": projection["node_environment"][
                 "environment_digest"
             ],

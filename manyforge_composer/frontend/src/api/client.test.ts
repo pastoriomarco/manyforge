@@ -32,32 +32,44 @@ function draftFence(revision = 1): DraftFenceRequest {
 
 function workspaceFixture(): Record<string, unknown> {
   const revision = `sha256:${'a'.repeat(64)}`;
+  const tree = {
+    node_id: 'timer',
+    instance_id: 'wait',
+    parameters: { duration_s: 0.5 },
+    children: [],
+  };
+  const programFields = {
+    api_version: 'manyforge.program.v1',
+    program_id: 'fixture',
+    program_profile: 'composable-cell-v1',
+    name: 'Fixture',
+    catalog: {
+      api_version: 'manyforge.node_catalog.v2',
+      content_version: '1.1.0',
+    },
+    component_roles: {},
+    target_roles: {},
+  };
   return {
-    schemaVersion: 'manyforge.composer_program_workspace.v1',
+    schemaVersion: 'manyforge.composer_program_workspace.v2',
     draft: {
       draftId: 'draft-1',
       draftRevision: 1,
       programLoaded: true,
+      authoring: {
+        schema_version: 'manyforge.composer_authoring_forest.v1',
+        ...programFields,
+        forest: [tree],
+        positions: {},
+      },
+      candidateAvailable: true,
       programRevision: revision,
       program: {
-        api_version: 'manyforge.program.v1',
-        program_id: 'fixture',
+        ...programFields,
         program_revision: revision,
-        program_profile: 'composable-cell-v1',
-        name: 'Fixture',
-        catalog: {
-          api_version: 'manyforge.node_catalog.v2',
-          content_version: '1.1.0',
-        },
-        component_roles: {},
-        target_roles: {},
-        tree: {
-          node_id: 'timer',
-          instance_id: 'wait',
-          parameters: { duration_s: 0.5 },
-          children: [],
-        },
+        tree,
       },
+      diagnostics: [],
     },
     applicability: {
       applyReady: true,
@@ -339,60 +351,6 @@ describe('structural API client', () => {
       },
     });
     expect(result.workspace.saved.matchesDraft).toBe(true);
-  });
-
-  it('submits the closed revision-fenced node-policy mutation', async () => {
-    const workspace = workspaceFixture();
-    const fetchMock = vi.fn().mockResolvedValue(response({
-      schemaVersion: 'manyforge.composer_draft_mutation.v1',
-      mutation: 'program_draft_update_node_policies',
-      details: { updated_instance_id: 'wait' },
-      draft: workspace.draft,
-    }));
-    vi.stubGlobal('fetch', fetchMock);
-
-    const result = await api.programWorkspace.updateNodePolicies(
-      draftFence(),
-      `sha256:${'a'.repeat(64)}`,
-      'wait',
-      {
-        runtime_override: 'human_approval',
-        persistent_edit: 'human_approval',
-        intervention_delegate: 'human_only',
-      },
-      {
-        allow_intervention: true,
-        allowed_recovery_actions: ['intervention'],
-        max_retries: 2,
-        allowed_skills: [],
-        persistence_ceiling: 'draft_patch',
-      },
-      'hold',
-    );
-
-    expect(result.details.updatedInstanceId).toBe('wait');
-    const [, options] = fetchMock.mock.calls[0] as [string, RequestInit];
-    expect(JSON.parse(String(options.body))).toEqual({
-      ...draftFence(),
-      mutation: 'program_draft_update_node_policies',
-      arguments: {
-        expected_program_revision: `sha256:${'a'.repeat(64)}`,
-        instance_id: 'wait',
-        modification_policy: {
-          runtime_override: 'human_approval',
-          persistent_edit: 'human_approval',
-          intervention_delegate: 'human_only',
-        },
-        recovery_policy: {
-          allow_intervention: true,
-          allowed_recovery_actions: ['intervention'],
-          max_retries: 2,
-          allowed_skills: [],
-          persistence_ceiling: 'draft_patch',
-        },
-        operator_stop_policy: 'hold',
-      },
-    });
   });
 
   it('forwards Apply and bounded runner reads without client-owned state', async () => {

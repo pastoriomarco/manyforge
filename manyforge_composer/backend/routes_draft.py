@@ -29,6 +29,7 @@ from .draft_session import (
     OPERATOR_DRAFT_MUTATIONS,
     draft_applicability,
 )
+from .authoring_forest import from_program
 from .node_environment_client import (
     ActiveNodeEnvironmentProjectionError,
     read_active_node_environment,
@@ -63,6 +64,7 @@ _AUTHORING_MUTATIONS = frozenset(
         "tree_draft_insert_node",
         "tree_draft_move_node",
         "tree_draft_replace_subtree",
+        "tree_draft_update_positions",
         "tree_draft_update_node_params",
         "tree_draft_wrap_node",
         *OPERATOR_DRAFT_MUTATIONS,
@@ -93,8 +95,6 @@ _PROGRAM_FIELDS = _PROGRAM_REQUIRED_FIELDS | frozenset(
         "viewer",
     }
 )
-_POLICY_MUTATION = "program_draft_update_node_policies"
-_POLICY_MUTATION_API_VERSION = "manyforge.composer_draft_mutation.v1"
 _ACTIVE_AUTHORING_CLAIM: ContextVar[dict[str, Any] | None] = ContextVar(
     "active_authoring_claim", default=None
 )
@@ -437,11 +437,7 @@ def create_draft_router(state: ComposerState) -> APIRouter:
                 tool_id=body.mutation,
                 arguments=body.arguments,
                 expected_revision=body.expected_draft_revision,
-                catalog=(
-                    state.node_catalog
-                    if body.mutation == _POLICY_MUTATION
-                    else _active_catalog(state)
-                ),
+                catalog=state.node_catalog,
                 draft_id=body.draft_id,
             )
         elif operation_kind in {"new_draft", "open_draft"}:
@@ -458,9 +454,10 @@ def create_draft_router(state: ComposerState) -> APIRouter:
             document = pre_state["program"]
             if document is None:
                 raise DraftSessionError(
-                    "composer_draft_unavailable",
-                    "Composer has no loaded Program Draft",
-                    status_code=404,
+                    "composer_authoring_draft_incomplete",
+                    "Composer Draft has no strict Program candidate",
+                    status_code=409,
+                    detail={"diagnostics": pre_state["diagnostics"]},
                 )
             if isinstance(body, SaveDraftAsRequest):
                 assert target_path is not None
@@ -502,9 +499,10 @@ def create_draft_router(state: ComposerState) -> APIRouter:
             document = pre_state["program"]
             if document is None:
                 raise DraftSessionError(
-                    "composer_draft_unavailable",
-                    "Composer has no loaded Program Draft",
-                    status_code=404,
+                    "composer_authoring_draft_incomplete",
+                    "Composer Draft has no strict Program candidate",
+                    status_code=409,
+                    detail={"diagnostics": pre_state["diagnostics"]},
                 )
             _require_apply_ready(
                 Program.from_dict(document, _active_catalog(state), path="<apply-intent>")
@@ -595,7 +593,15 @@ def create_draft_router(state: ComposerState) -> APIRouter:
             post_state = deepcopy(pre_state)
             if pre_state["program"] != saved:
                 post_state["draft_revision"] += 1
+                post_state["authoring"] = from_program(
+                    Program.from_dict(
+                        deepcopy(saved),
+                        _active_catalog(state),
+                        path="<revert-intent>",
+                    )
+                )
                 post_state["program"] = deepcopy(saved)
+                post_state["diagnostics"] = []
             prepared.update(
                 {
                     "effect_class": "external",
@@ -703,32 +709,14 @@ def create_draft_router(state: ComposerState) -> APIRouter:
                 tool_id=body.mutation,
                 arguments=body.arguments,
                 expected_revision=body.expected_draft_revision,
-                # Policy authoring is Draft-only.  In particular, do not
-                # turn this mutation into a Headless/runtime read merely to
-                # validate an unchanged Program catalog.
-                catalog=(
-                    state.node_catalog
-                    if body.mutation == "program_draft_update_node_policies"
-                    else _active_catalog(state)
-                ),
+                # Draft validation uses the immutable build-qualified catalog.
+                # Owner truth is rechecked only at consequential Save/Apply
+                # boundaries, not through one headless round-trip per edit.
+                catalog=state.node_catalog,
                 draft_id=body.draft_id,
             )
         except Exception as error:
             _raise_workspace_error(error)
-        if body.mutation == _POLICY_MUTATION:
-            draft = result.snapshot
-            return {
-                "schemaVersion": _POLICY_MUTATION_API_VERSION,
-                "mutation": result.mutation,
-                "details": result.details,
-                "draft": {
-                    "draftId": draft["draft_id"],
-                    "draftRevision": draft["draft_revision"],
-                    "programLoaded": draft["program_loaded"],
-                    "programRevision": draft["program_revision"],
-                    "program": draft["program"],
-                },
-            }
         return {
             "mutation": result.mutation,
             "details": result.details,

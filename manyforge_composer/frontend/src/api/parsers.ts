@@ -29,11 +29,11 @@ import type {
   ManagerSourceMetadata,
   ManagerStatusProjection,
   ProgramDocument,
+  ProgramAuthoringDocument,
   ProgramInterventionDelegate,
   ProgramModificationPolicyValue,
   ProgramNodeModificationPolicy,
   ProgramNodeRecoveryPolicy,
-  ProgramNodePolicyMutationResponse,
   ProgramParameterDeclaration,
   ProgramOperatorStopPolicy,
   ProgramPersistenceCeiling,
@@ -1331,6 +1331,100 @@ export function parseProgramDocument(value: unknown, path = 'program'): ProgramD
   return result;
 }
 
+function parseProgramAuthoringDocument(
+  value: unknown,
+  path: string,
+): ProgramAuthoringDocument {
+  const record = objectAt(value, path);
+  allowedKeysAt(
+    record,
+    [
+      'schema_version',
+      'api_version',
+      'program_id',
+      'program_profile',
+      'name',
+      'catalog',
+      'component_roles',
+      'target_roles',
+      'forest',
+      'positions',
+    ],
+    [
+      'description',
+      'compatibility',
+      'viewer',
+      'scene',
+      'parameters',
+      'blackboard',
+      'contact_policies',
+    ],
+    path,
+  );
+  const schemaVersion = stringAt(record.schema_version, `${path}.schema_version`);
+  if (schemaVersion !== 'manyforge.composer_authoring_forest.v1') {
+    return fail(`${path}.schema_version`, 'manyforge.composer_authoring_forest.v1');
+  }
+  const forest = boundedArrayAt(record.forest, `${path}.forest`, 100_000).map(
+    (node, index) => parseProgramTreeNode(node, `${path}.forest[${index}]`),
+  );
+  const syntheticRoot = forest[0] ?? {
+    node_id: 'composer.placeholder',
+    instance_id: 'composer_placeholder',
+    parameters: {},
+    children: [],
+  };
+  const strictShape = Object.fromEntries(
+    Object.entries(record).filter(([key]) => ![
+      'schema_version',
+      'forest',
+      'positions',
+    ].includes(key)),
+  );
+  const parsed = parseProgramDocument(
+    {
+      ...strictShape,
+      program_revision: `sha256:${'0'.repeat(64)}`,
+      tree: syntheticRoot,
+    },
+    `${path}.programFields`,
+  );
+  const positionsRecord = objectAt(record.positions, `${path}.positions`);
+  const nodeIds = new Set<string>();
+  const pending = [...forest];
+  while (pending.length > 0) {
+    const node = pending.pop()!;
+    if (nodeIds.has(node.instance_id)) {
+      return fail(`${path}.forest`, 'unique node instance IDs');
+    }
+    nodeIds.add(node.instance_id);
+    pending.push(...node.children);
+  }
+  const positions: Record<string, { x: number; y: number }> = {};
+  for (const [instanceId, value] of Object.entries(positionsRecord)) {
+    if (!nodeIds.has(instanceId)) {
+      return fail(`${path}.positions.${instanceId}`, 'a retained authoring node');
+    }
+    const position = objectAt(value, `${path}.positions.${instanceId}`);
+    exactKeysAt(position, ['x', 'y'], `${path}.positions.${instanceId}`);
+    const x = numberAt(position.x, `${path}.positions.${instanceId}.x`);
+    const y = numberAt(position.y, `${path}.positions.${instanceId}.y`);
+    if (Math.abs(x) > 10_000_000 || Math.abs(y) > 10_000_000) {
+      return fail(`${path}.positions.${instanceId}`, 'a bounded canvas position');
+    }
+    positions[instanceId] = { x, y };
+  }
+  const { program_revision, tree, ...programFields } = parsed;
+  void program_revision;
+  void tree;
+  return {
+    ...programFields,
+    schema_version: schemaVersion,
+    forest,
+    positions,
+  };
+}
+
 function parseRuntimeAvailability(value: unknown, path: string) {
   const record = objectAt(value, path);
   exactKeysAt(record, ['code', 'message', 'restorationGates'], path);
@@ -1923,10 +2017,26 @@ function parseProgramDraftProjection(
   const draft = objectAt(value, path);
   exactKeysAt(
     draft,
-    ['draftId', 'draftRevision', 'programLoaded', 'programRevision', 'program'],
+    [
+      'draftId',
+      'draftRevision',
+      'programLoaded',
+      'authoring',
+      'candidateAvailable',
+      'programRevision',
+      'program',
+      'diagnostics',
+    ],
     path,
   );
   const programLoaded = booleanAt(draft.programLoaded, `${path}.programLoaded`);
+  const authoring = draft.authoring === null
+    ? null
+    : parseProgramAuthoringDocument(draft.authoring, `${path}.authoring`);
+  const candidateAvailable = booleanAt(
+    draft.candidateAvailable,
+    `${path}.candidateAvailable`,
+  );
   const program = draft.program === null
     ? null
     : parseProgramDocument(draft.program, `${path}.program`);
@@ -1934,7 +2044,30 @@ function parseProgramDraftProjection(
     draft.programRevision,
     `${path}.programRevision`,
   );
-  if (programLoaded !== (program !== null) || (program?.program_revision ?? null) !== programRevision) {
+  const diagnostics = boundedArrayAt(
+    draft.diagnostics,
+    `${path}.diagnostics`,
+    100_000,
+  ).map((value, index) => {
+    const diagnosticPath = `${path}.diagnostics[${index}]`;
+    const record = objectAt(value, diagnosticPath);
+    exactKeysAt(record, ['code', 'path', 'message', 'severity'], diagnosticPath);
+    const severity = stringAt(record.severity, `${diagnosticPath}.severity`);
+    if (severity !== 'error') return fail(`${diagnosticPath}.severity`, 'error');
+    return {
+      code: stringAt(record.code, `${diagnosticPath}.code`),
+      path: stringAt(record.path, `${diagnosticPath}.path`),
+      message: stringAt(record.message, `${diagnosticPath}.message`),
+      severity: severity as 'error',
+    };
+  });
+  if (
+    programLoaded !== (authoring !== null)
+    || candidateAvailable !== (program !== null)
+    || (program?.program_revision ?? null) !== programRevision
+    || (candidateAvailable && diagnostics.length !== 0)
+    || (programLoaded && !candidateAvailable && diagnostics.length === 0)
+  ) {
     return fail(path, 'internally consistent Program identity');
   }
   const draftId = stringAt(draft.draftId, `${path}.draftId`);
@@ -1945,8 +2078,11 @@ function parseProgramDraftProjection(
     draftId,
     draftRevision: integerAt(draft.draftRevision, `${path}.draftRevision`),
     programLoaded,
+    authoring,
+    candidateAvailable,
     programRevision,
     program,
+    diagnostics,
   };
 }
 
@@ -1975,11 +2111,11 @@ function parseProgramDraftApplicability(
     ? null
     : parseRuntimeAvailability(record.unavailableReason, `${path}.unavailableReason`);
   const applyReady = booleanAt(record.applyReady, `${path}.applyReady`);
-  if (applyReady !== (affectedInstanceIds.length === 0)) {
-    return fail(path, 'an Apply-ready state matching affected instances');
+  if (applyReady === (unavailableReason !== null)) {
+    return fail(path, 'an exact Apply-ready availability reason');
   }
-  if ((unavailableReason !== null) !== (affectedInstanceIds.length > 0)) {
-    return fail(path, 'an exact unavailable reason for affected instances');
+  if (applyReady && affectedInstanceIds.length > 0) {
+    return fail(path, 'no affected instances while Apply-ready');
   }
   return { applyReady, affectedInstanceIds, unavailableReason };
 }
@@ -2000,7 +2136,7 @@ export function parseProgramWorkspaceResponse(value: unknown): ProgramWorkspaceR
     'programWorkspace',
   );
   const schemaVersion = stringAt(record.schemaVersion, 'programWorkspace.schemaVersion');
-  if (schemaVersion !== 'manyforge.composer_program_workspace.v1') {
+  if (schemaVersion !== 'manyforge.composer_program_workspace.v2') {
     return fail('programWorkspace.schemaVersion', 'the supported workspace version');
   }
   const draft = parseProgramDraftProjection(record.draft, 'programWorkspace.draft');
@@ -4046,37 +4182,6 @@ export function parseDraftMutationResponse(value: unknown): DraftMutationRespons
   };
 }
 
-export function parseProgramNodePolicyMutationResponse(
-  value: unknown,
-): ProgramNodePolicyMutationResponse {
-  const path = 'programNodePolicyMutation';
-  const record = objectAt(value, path);
-  exactKeysAt(record, ['schemaVersion', 'mutation', 'details', 'draft'], path);
-  const schemaVersion = stringAt(record.schemaVersion, `${path}.schemaVersion`);
-  if (schemaVersion !== 'manyforge.composer_draft_mutation.v1') {
-    return fail(`${path}.schemaVersion`, 'manyforge.composer_draft_mutation.v1');
-  }
-  const mutation = stringAt(record.mutation, `${path}.mutation`);
-  if (mutation !== 'program_draft_update_node_policies') {
-    return fail(
-      `${path}.mutation`,
-      'program_draft_update_node_policies',
-    );
-  }
-  const details = objectAt(record.details, `${path}.details`);
-  exactKeysAt(details, ['updated_instance_id'], `${path}.details`);
-  const updatedInstanceId = policyIdAt(
-    details.updated_instance_id,
-    `${path}.details.updated_instance_id`,
-  );
-  return {
-    schemaVersion,
-    mutation,
-    details: { updatedInstanceId },
-    draft: parseProgramDraftProjection(record.draft, `${path}.draft`),
-  };
-}
-
 function parseFileBrowserEntry(value: unknown, path: string): FileBrowserEntry {
   const record = objectAt(value, path);
   const entryType = stringAt(record.entryType, `${path}.entryType`);
@@ -4644,7 +4749,7 @@ function parseHistorianEvent(value: unknown, path: string): HistorianEvent {
     eventId: stringAt(record.event_id, `${path}.event_id`),
     component: stringAt(record.component, `${path}.component`),
     eventType: stringAt(record.event_type, `${path}.event_type`),
-    severity: stringAt(record.severity, `${path}.severity`),
+    severity: stringAt(record.severity, `${path}.severity`) as 'error',
     occurredAtNs: integerAt(record.occurred_at_ns, `${path}.occurred_at_ns`),
     occurredAtWall: stringAt(
       record.occurred_at_wall,

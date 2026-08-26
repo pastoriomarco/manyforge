@@ -21,7 +21,6 @@ import {
   parseManagerApplyResponse,
   parseManagerApplyStatusResponse,
   parseProgramWorkspaceResponse,
-  parseProgramNodePolicyMutationResponse,
   parseProgramWorkspaceTransitionResponse,
   parseProgramRunIndex,
   parseProgramRunStatus,
@@ -67,14 +66,26 @@ function programFixture(): Record<string, unknown> {
 
 function workspaceFixture(): Record<string, unknown> {
   const program = programFixture();
+  const programFields = { ...program };
+  const tree = programFields.tree;
+  delete programFields.program_revision;
+  delete programFields.tree;
   return {
-    schemaVersion: 'manyforge.composer_program_workspace.v1',
+    schemaVersion: 'manyforge.composer_program_workspace.v2',
     draft: {
       draftId: 'draft-1',
       draftRevision: 2,
       programLoaded: true,
+      authoring: {
+        schema_version: 'manyforge.composer_authoring_forest.v1',
+        ...programFields,
+        forest: [tree],
+        positions: {},
+      },
+      candidateAvailable: true,
       programRevision: program.program_revision,
       program,
+      diagnostics: [],
     },
     applicability: {
       applyReady: true,
@@ -903,47 +914,38 @@ describe('Program workspace parsers', () => {
     expect(parsed.draft.program?.tree.recovery_policy?.allowed_skills)
       .toEqual(['legacy.inspect']);
     expect(parsed.applicability.affectedInstanceIds).toEqual(['wait']);
-    const mutation = parseProgramNodePolicyMutationResponse({
-      schemaVersion: 'manyforge.composer_draft_mutation.v1',
-      mutation: 'program_draft_update_node_policies',
-      details: { updated_instance_id: 'update-b' },
-      draft: fixture.draft,
-    });
-    expect(mutation.details.updatedInstanceId).toBe('update-b');
-    expect(mutation.draft.program?.tree.recovery_policy?.allowed_skills)
-      .toEqual(['legacy.inspect']);
   });
 
-  it('parses only the closed Draft-only node-policy response', () => {
-    const workspace = workspaceFixture();
-    const draft = workspace.draft as Record<string, unknown>;
-    const response = {
-      schemaVersion: 'manyforge.composer_draft_mutation.v1',
-      mutation: 'program_draft_update_node_policies',
-      details: { updated_instance_id: 'wait' },
-      draft,
+  it('accepts an incomplete retained forest without inventing a Program candidate', () => {
+    const fixture = workspaceFixture();
+    const draft = fixture.draft as Record<string, unknown>;
+    const authoring = draft.authoring as Record<string, unknown>;
+    authoring.forest = [];
+    draft.candidateAvailable = false;
+    draft.programRevision = null;
+    draft.program = null;
+    draft.diagnostics = [{
+      code: 'authoring_forest_root_count',
+      path: 'forest',
+      message: 'Program requires exactly one root; found 0.',
+      severity: 'error',
+    }];
+    (fixture.saved as Record<string, unknown>).matchesDraft = false;
+    fixture.hasUnsavedChanges = true;
+    fixture.applicability = {
+      applyReady: false,
+      affectedInstanceIds: [],
+      unavailableReason: {
+        code: 'composer_authoring_draft_incomplete',
+        message: 'Program requires exactly one root; found 0.',
+        restorationGates: [],
+      },
     };
-    const parsed = parseProgramNodePolicyMutationResponse(response);
-    expect(parsed).toEqual({
-      schemaVersion: response.schemaVersion,
-      mutation: response.mutation,
-      details: { updatedInstanceId: 'wait' },
-      draft: workspace.draft,
-    });
 
-    const malformed = [
-      { schemaVersion: 'manyforge.composer_program_workspace.v1' },
-      { mutation: 'tree_draft_update_node_params' },
-      { details: { updated_instance_id: 'wait', extra: true } },
-      { draft: { ...draft, saved: false } },
-      { extra: true },
-    ];
-    for (const change of malformed) {
-      expect(() => parseProgramNodePolicyMutationResponse({
-        ...response,
-        ...change,
-      })).toThrow();
-    }
+    const parsed = parseProgramWorkspaceResponse(fixture);
+    expect(parsed.draft.authoring?.forest).toEqual([]);
+    expect(parsed.draft.program).toBeNull();
+    expect(parsed.draft.diagnostics[0]?.code).toBe('authoring_forest_root_count');
   });
 
   it('rejects inconsistent or historical Program binding shapes', () => {

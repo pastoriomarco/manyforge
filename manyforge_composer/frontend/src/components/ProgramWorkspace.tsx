@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import type { CSSProperties } from 'react';
 
 import type { ProgramRuntimeController } from '../hooks/useProgramRuntime';
@@ -8,8 +8,10 @@ import type {
   CatalogResponse,
   NodeEnvironmentResponse,
 } from '../types/api';
-import { flattenProgramTree } from '../utils/programAuthoring';
-import type { ProgramInsertionRequest } from '../utils/programCanvasInteraction';
+import {
+  flattenProgramForest,
+  programDiagnosticNodeId,
+} from '../utils/programAuthoring';
 import { PaneDivider } from './PaneDivider';
 import { ProgramDeclarationsEditor } from './ProgramDeclarationsEditor';
 import {
@@ -39,6 +41,7 @@ interface ProgramWorkspaceProps {
   environment: StructuralResourceState<NodeEnvironmentResponse>;
   onRetryCatalog: () => void;
   onRetryEnvironment: () => void;
+  onInvalidEditChange?: (invalid: boolean) => void;
 }
 
 export function ProgramWorkspace({
@@ -48,6 +51,7 @@ export function ProgramWorkspace({
   environment,
   onRetryCatalog,
   onRetryEnvironment,
+  onInvalidEditChange,
 }: ProgramWorkspaceProps) {
   const {
     state,
@@ -59,11 +63,11 @@ export function ProgramWorkspace({
     clearFeedback,
   } = controller;
   const [selectedNodeId, setSelectedNodeId] = useState<string | null>(null);
-  const [insertionRequest, setInsertionRequest] = useState<ProgramInsertionRequest | null>(null);
   const [paletteCollapsed, setPaletteCollapsed] = useState(false);
   const [inspectorCollapsed, setInspectorCollapsed] = useState(false);
   const [toolView, setToolView] = useState<'nodes' | 'params'>('nodes');
   const [declarationSelection, setDeclarationSelection] = useState<ProgramDeclarationSelection | null>(null);
+  const [invalidLocalEdit, setInvalidLocalEdit] = useState(false);
   const [paletteWidth, setPaletteWidth] = useState(216);
   const [inspectorWidth, setInspectorWidth] = useState(288);
   const [authoringWidth, setAuthoringWidth] = useState(856);
@@ -75,7 +79,11 @@ export function ProgramWorkspace({
   const previousPaletteCollapsed = useRef(false);
   const previousInspectorCollapsed = useRef(false);
   const workspace = state.workspace;
-  const program = workspace?.draft.program ?? null;
+  const authoring = workspace?.draft.authoring ?? null;
+  const diagnostics = useMemo(
+    () => workspace?.draft.diagnostics ?? [],
+    [workspace?.draft.diagnostics],
+  );
   const busy = state.status === 'loading'
     || (state.status === 'ready' && state.pendingAction !== null);
   const catalogEntries = catalog.status === 'ready' ? catalog.data.entries : [];
@@ -92,36 +100,62 @@ export function ProgramWorkspace({
   const authoringUnavailable = nodeEnvironment !== null
     && !nodeEnvironment.portableAuthoringAvailable;
   const authoringBusy = busy || authoringUnavailable || !mutationAvailable;
+  const selectNode = useCallback((instanceId: string | null) => {
+    if (invalidLocalEdit && instanceId !== selectedNodeId) return;
+    setSelectedNodeId(instanceId);
+  }, [invalidLocalEdit, selectedNodeId]);
+  const changeToolView = useCallback((view: 'nodes' | 'params') => {
+    if (invalidLocalEdit && view !== toolView) return;
+    setToolView(view);
+  }, [invalidLocalEdit, toolView]);
+  const selectDeclaration = useCallback((selection: ProgramDeclarationSelection) => {
+    if (
+      invalidLocalEdit
+      && (selection.kind !== declarationSelection?.kind || selection.id !== declarationSelection.id)
+    ) return;
+    setDeclarationSelection(selection);
+  }, [declarationSelection, invalidLocalEdit]);
+  useEffect(() => {
+    onInvalidEditChange?.(invalidLocalEdit);
+    return () => onInvalidEditChange?.(false);
+  }, [invalidLocalEdit, onInvalidEditChange]);
 
   const validNodeIds = useMemo(
-    () => new Set(program ? flattenProgramTree(program.tree)
+    () => new Set(authoring ? flattenProgramForest(authoring.forest)
       .map(({ node }) => node.instance_id) : []),
-    [program],
+    [authoring],
   );
+  const invalidNodeIds = useMemo(() => new Set(
+    authoring === null
+      ? []
+      : diagnostics.map((diagnostic) =>
+        programDiagnosticNodeId(authoring.forest, diagnostic.path))
+        .filter((instanceId): instanceId is string => instanceId !== null),
+  ), [authoring, diagnostics]);
   useEffect(() => {
-    if (!program) {
+    if (!authoring) {
       setSelectedNodeId(null);
       return;
     }
     if (selectedNodeId && !validNodeIds.has(selectedNodeId)) {
       setSelectedNodeId(null);
     }
-  }, [program, selectedNodeId, validNodeIds]);
+  }, [authoring, selectedNodeId, validNodeIds]);
   useEffect(() => {
-    if (!program || declarationSelection === null) return;
+    if (!authoring || declarationSelection === null) return;
     const exists = declarationSelection.kind === 'parameter'
-      ? (program.parameters ?? []).some(
+      ? (authoring.parameters ?? []).some(
         (row) => row.parameter_id === declarationSelection.id,
       )
       : declarationSelection.kind === 'namespace'
-        ? (program.blackboard?.namespaces ?? []).some(
+        ? (authoring.blackboard?.namespaces ?? []).some(
           (row) => row.namespace_id === declarationSelection.id,
         )
-        : (program.blackboard?.keys ?? []).some(
+        : (authoring.blackboard?.keys ?? []).some(
           (row) => row.key === declarationSelection.id,
         );
     if (declarationSelection.id && !exists) setDeclarationSelection(null);
-  }, [declarationSelection, program]);
+  }, [authoring, declarationSelection]);
   useEffect(() => {
     if (paletteCollapsed) paletteRail.current?.focus();
     else if (previousPaletteCollapsed.current) paletteCollapseButton.current?.focus();
@@ -171,7 +205,7 @@ export function ProgramWorkspace({
 
   const gridClassName = [
     'program-authoring-grid',
-    program ? '' : 'program-authoring-empty',
+    authoring ? '' : 'program-authoring-empty',
     paletteCollapsed ? 'palette-collapsed' : '',
     inspectorCollapsed ? 'inspector-collapsed' : '',
   ].filter(Boolean).join(' ');
@@ -197,12 +231,12 @@ export function ProgramWorkspace({
             <button type="button" onClick={refresh}>Retry workspace</button>
           </div>
         )}
-        {(state.message || state.error || state.refreshWarning) && workspace !== null && (
+        {(state.message || state.error) && workspace !== null && (
           <div
-            className={`program-workspace-notice${state.error || state.refreshWarning ? ' error-state' : ''}`}
-            role={state.error || state.refreshWarning ? 'alert' : 'status'}
+            className={`program-workspace-notice${state.error ? ' error-state' : ''}`}
+            role={state.error ? 'alert' : 'status'}
           >
-            <span>{state.error ?? state.refreshWarning ?? state.message}</span>
+            <span>{state.error ?? state.message}</span>
             <button type="button" className="text-button" onClick={clearFeedback}>Dismiss</button>
           </div>
         )}
@@ -258,26 +292,23 @@ export function ProgramWorkspace({
           >
             <span aria-hidden="true">›</span><span>{toolView === 'nodes' ? 'Nodes' : 'Params'}</span>
           </button>
-        ) : program && toolView === 'nodes' ? (
+        ) : authoring && toolView === 'nodes' ? (
           <ProgramNodePalette
-            root={program.tree}
+            roots={authoring.forest}
             catalogEntries={catalogEntries}
             catalogIdentity={catalogIdentity}
             environment={nodeEnvironment}
-            selectedId={selectedNodeId}
             busy={authoringBusy}
             onMutate={mutate}
-            dropRequest={insertionRequest}
-            onDropRequestHandled={() => setInsertionRequest(null)}
             onCollapse={() => setPaletteCollapsed(true)}
             collapseButtonRef={paletteCollapseButton}
-            onViewChange={setToolView}
+            onViewChange={changeToolView}
           />
-        ) : program ? (
+        ) : authoring ? (
           <section className="program-palette" aria-label="Program declaration navigation">
             <header className="program-subpanel-header">
               <div className="program-tool-tabs" aria-label="Program tools">
-                <button type="button" aria-pressed="false" onClick={() => setToolView('nodes')}>Nodes</button>
+                <button type="button" aria-pressed="false" onClick={() => changeToolView('nodes')}>Nodes</button>
                 <button type="button" className="active" aria-pressed="true">Params</button>
               </div>
               <button
@@ -291,20 +322,20 @@ export function ProgramWorkspace({
               </button>
             </header>
             <ProgramDeclarationsNavigator
-              root={program.tree}
-              parameters={program.parameters ?? []}
-              namespaces={program.blackboard?.namespaces ?? []}
-              keys={program.blackboard?.keys ?? []}
+              roots={authoring.forest}
+              parameters={authoring.parameters ?? []}
+              namespaces={authoring.blackboard?.namespaces ?? []}
+              keys={authoring.blackboard?.keys ?? []}
               selected={declarationSelection}
-              onSelect={setDeclarationSelection}
+              onSelect={selectDeclaration}
             />
           </section>
         ) : (
           <section className="program-palette" aria-label="Node palette">
             <header className="program-subpanel-header">
               <div className="program-tool-tabs" aria-label="Program tools">
-                <button type="button" className={toolView === 'nodes' ? 'active' : ''} aria-pressed={toolView === 'nodes'} onClick={() => setToolView('nodes')}>Nodes</button>
-                <button type="button" className={toolView === 'params' ? 'active' : ''} aria-pressed={toolView === 'params'} onClick={() => setToolView('params')}>Params</button>
+                <button type="button" className={toolView === 'nodes' ? 'active' : ''} aria-pressed={toolView === 'nodes'} onClick={() => changeToolView('nodes')}>Nodes</button>
+                <button type="button" className={toolView === 'params' ? 'active' : ''} aria-pressed={toolView === 'params'} onClick={() => changeToolView('params')}>Params</button>
               </div>
               <button ref={paletteCollapseButton} type="button" className="icon-button" aria-label="Collapse node palette" onClick={() => setPaletteCollapsed(true)}>‹</button>
             </header>
@@ -326,19 +357,18 @@ export function ProgramWorkspace({
           />
         )}
 
-        {program ? (
+        {authoring ? (
           <ProgramTreeCanvas
-            root={program.tree}
+            key={workspace?.draft.draftId}
+            roots={authoring.forest}
+            retainedPositions={authoring.positions}
             catalogEntries={catalogEntries}
             environment={nodeEnvironment}
             selectedId={selectedNodeId}
+            invalidNodeIds={invalidNodeIds}
             busy={authoringBusy}
-            onSelect={setSelectedNodeId}
+            onSelect={selectNode}
             onMutate={mutate}
-            onStageInsert={(request) => {
-              setSelectedNodeId(request.targetId);
-              setInsertionRequest(request);
-            }}
           />
         ) : (
           <section className="program-tree-surface program-tree-empty" aria-label="Program tree canvas">
@@ -379,13 +409,14 @@ export function ProgramWorkspace({
                 className="icon-button"
                 aria-label="Collapse Program inspector"
                 title="Collapse Program inspector"
+                disabled={invalidLocalEdit}
                 onClick={() => setInspectorCollapsed(true)}
               >
                 ›
               </button>
             </div>
             <div className="program-inspector-scroll">
-              {!program ? (
+              {!authoring ? (
                 <div className="program-empty-guidance">
                   <strong>Select a node to inspect properties</strong>
                   <span>Properties and declarations appear after a Draft is open.</span>
@@ -395,28 +426,32 @@ export function ProgramWorkspace({
               ) : toolView === 'nodes' ? (
                 <ProgramPropertyEditor
                   embedded
-                  root={program.tree}
+                  roots={authoring.forest}
                   selectedId={selectedNodeId}
                   catalogEntries={catalogEntries}
-                  programParameters={program.parameters ?? []}
-                  blackboardKeys={program.blackboard?.keys ?? []}
+                  programParameters={authoring.parameters ?? []}
+                  blackboardKeys={authoring.blackboard?.keys ?? []}
                   busy={authoringBusy}
                   onMutate={mutate}
                   onUpdateNodePolicies={updateNodePolicies}
+                  onInvalidEditChange={setInvalidLocalEdit}
+                  diagnostics={diagnostics}
                 />
               ) : (
                 <ProgramDeclarationsEditor
                   embedded
                   selection={declarationSelection}
                   showNavigation={false}
-                  root={program.tree}
-                  parameters={program.parameters ?? []}
-                  namespaces={program.blackboard?.namespaces ?? []}
-                  keys={program.blackboard?.keys ?? []}
+                  roots={authoring.forest}
+                  parameters={authoring.parameters ?? []}
+                  namespaces={authoring.blackboard?.namespaces ?? []}
+                  keys={authoring.blackboard?.keys ?? []}
                   catalogEntries={catalogEntries}
                   busy={authoringBusy}
                   onMutate={mutate}
-                  onSelectNode={setSelectedNodeId}
+                  onSelectNode={selectNode}
+                  onInvalidEditChange={setInvalidLocalEdit}
+                  diagnostics={diagnostics}
                 />
               )}
             </div>

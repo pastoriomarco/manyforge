@@ -1,10 +1,11 @@
-import { useMemo, useState } from 'react';
+import { useEffect, useMemo, useState } from 'react';
 
 import type {
   BlackboardKeyDeclaration,
   CatalogEntry,
   CatalogParameter,
   JsonValue,
+  ProgramAuthoringDiagnostic,
   ProgramNodeModificationPolicy,
   ProgramNodeRecoveryPolicy,
   ProgramOperatorStopPolicy,
@@ -15,7 +16,8 @@ import type {
 import { firstCatalogParameterValidationMessage } from '../utils/catalogParameterValidation';
 import {
   catalogFieldAcceptsValueSource,
-  flattenProgramTree,
+  flattenProgramForest,
+  programDiagnosticNodeId,
   resolveProgramParameterLiteralValue,
 } from '../utils/programAuthoring';
 import { DraftTextInput, DraftTextarea } from './common/DraftInputs';
@@ -27,7 +29,7 @@ import { ProgramPolicyEditor } from './ProgramPolicyEditor';
 
 interface ProgramPropertyEditorProps {
   embedded?: boolean;
-  root: ProgramTreeNode;
+  roots: ProgramTreeNode[];
   selectedId: string | null;
   catalogEntries: CatalogEntry[];
   programParameters: ProgramParameterDeclaration[];
@@ -40,6 +42,8 @@ interface ProgramPropertyEditorProps {
     recoveryPolicy: ProgramNodeRecoveryPolicy,
     operatorStopPolicy: ProgramOperatorStopPolicy,
   ) => void;
+  onInvalidEditChange?: (invalid: boolean) => void;
+  diagnostics?: ProgramAuthoringDiagnostic[];
 }
 
 interface SourceChoice {
@@ -135,11 +139,13 @@ function ScalarLiteralEditor({
   value,
   disabled,
   onCommit,
+  onInvalidChange,
 }: {
   parameter: CatalogParameter;
   value: JsonValue | undefined;
   disabled: boolean;
   onCommit: (value: JsonValue) => void;
+  onInvalidChange: (message: string | null) => void;
 }) {
   if (parameter.schema.enum) {
     const encoded = value === undefined ? '' : JSON.stringify(value);
@@ -177,6 +183,11 @@ function ScalarLiteralEditor({
         step={parameter.schema.type === 'integer' ? 1 : 'any'}
         value={typeof value === 'number' ? value : ''}
         disabled={disabled}
+        validate={(text) => firstCatalogParameterValidationMessage(
+          parameter,
+          text.trim() === '' ? Number.NaN : Number(text),
+        )}
+        onInvalidChange={onInvalidChange}
         onCommit={(text) => onCommit(
           text.trim() === '' ? Number.NaN : Number(text),
         )}
@@ -187,6 +198,8 @@ function ScalarLiteralEditor({
     <DraftTextInput
       value={typeof value === 'string' ? value : ''}
       disabled={disabled}
+      validate={(text) => firstCatalogParameterValidationMessage(parameter, text)}
+      onInvalidChange={onInvalidChange}
       onCommit={(text) => onCommit(text)}
     />
   );
@@ -194,7 +207,7 @@ function ScalarLiteralEditor({
 
 export function ProgramPropertyEditor({
   embedded = false,
-  root,
+  roots,
   selectedId,
   catalogEntries,
   programParameters,
@@ -202,17 +215,31 @@ export function ProgramPropertyEditor({
   busy,
   onMutate,
   onUpdateNodePolicies,
+  onInvalidEditChange,
+  diagnostics = [],
 }: ProgramPropertyEditorProps) {
   const [errors, setErrors] = useState<Record<string, string>>({});
+  const [discardEpoch, setDiscardEpoch] = useState(0);
   const selected = useMemo(
-    () => flattenProgramTree(root).find(
+    () => flattenProgramForest(roots).find(
       ({ node }) => node.instance_id === selectedId,
     )?.node ?? null,
-    [root, selectedId],
+    [roots, selectedId],
   );
   const entry = selected
     ? catalogEntries.find((candidate) => candidate.id === selected.node_id) ?? null
     : null;
+  const selectedDiagnostics = useMemo(() => diagnostics.filter((diagnostic) =>
+    programDiagnosticNodeId(roots, diagnostic.path) === selectedId,
+  ), [diagnostics, roots, selectedId]);
+  useEffect(() => {
+    setErrors({});
+    setDiscardEpoch((current) => current + 1);
+  }, [selectedId]);
+  useEffect(() => {
+    onInvalidEditChange?.(Object.keys(errors).length > 0);
+    return () => onInvalidEditChange?.(false);
+  }, [errors, onInvalidEditChange]);
 
   if (!selected || !entry) {
     return (
@@ -309,6 +336,46 @@ export function ProgramPropertyEditor({
           <code>{selected.instance_id}</code>
         </header>
       )}
+      {Object.keys(errors).length > 0 && (
+        <div className="program-invalid-edit-strip" role="alert">
+          <span>One field has an invalid local edit.</span>
+          <button
+            type="button"
+            onClick={() => {
+              const first = Object.keys(errors)[0];
+              const field = first === '_policy'
+                ? document.querySelector('.program-policy-editor [aria-invalid="true"]')
+                : document.getElementById(`property-${selected.instance_id}-${first}`);
+              const control = (field?.matches('input, textarea, select')
+                ? field
+                : field?.querySelector('input, textarea, select')) as HTMLElement | null;
+              control?.focus();
+            }}
+          >
+            Review
+          </button>
+          <button
+            type="button"
+            onClick={() => {
+              setErrors({});
+              setDiscardEpoch((current) => current + 1);
+            }}
+          >
+            Discard edit
+          </button>
+        </div>
+      )}
+      {selectedDiagnostics.length > 0 && (
+        <div className="program-authoring-diagnostics" role="status">
+          <strong>Complete this node</strong>
+          {selectedDiagnostics.slice(0, 6).map((diagnostic) => (
+            <span key={`${diagnostic.code}:${diagnostic.path}`}>{diagnostic.message}</span>
+          ))}
+          {selectedDiagnostics.length > 6 && (
+            <span>{selectedDiagnostics.length - 6} more issue(s)</span>
+          )}
+        </div>
+      )}
       <div className="program-property-list">
         <div className="program-node-identity">
           <span><strong>{entry.name}</strong><small>{entry.kind} · {entry.category}</small></span>
@@ -363,8 +430,15 @@ export function ProgramPropertyEditor({
           const currentSourceIsOffCatalog = source !== undefined
             && !choices.some((choice) =>
               JSON.stringify(choice.source) === JSON.stringify(source));
+          const backendDiagnostic = selectedDiagnostics.find((diagnostic) =>
+            diagnostic.path.endsWith(`.parameters.${parameter.id}`)
+            || diagnostic.path.endsWith(`.value_sources.${parameter.id}`));
           return (
-            <div className="program-property" key={parameter.id}>
+            <div
+              className={`program-property${backendDiagnostic ? ' backend-invalid' : ''}`}
+              title={backendDiagnostic?.message}
+              key={`${parameter.id}:${discardEpoch}`}
+            >
               <div className="program-property-heading">
                 <label htmlFor={`property-${selected.instance_id}-${parameter.id}`}>
                   {parameter.id}
@@ -417,6 +491,22 @@ export function ProgramPropertyEditor({
                     disabled={busy}
                     spellCheck={false}
                     aria-label={`${parameter.id} strict JSON repair`}
+                    validate={(text) => {
+                      try {
+                        return firstCatalogParameterValidationMessage(
+                          parameter,
+                          JSON.parse(text) as JsonValue,
+                        );
+                      } catch (error) {
+                        return error instanceof Error ? error.message : 'Value must be strict JSON.';
+                      }
+                    }}
+                    onInvalidChange={(message) => setErrors((current) => {
+                      const next = { ...current };
+                      if (message) next[parameter.id] = message;
+                      else delete next[parameter.id];
+                      return next;
+                    })}
                     onCommit={(text) => {
                       try {
                         commitLiteral(parameter, JSON.parse(text) as JsonValue);
@@ -437,6 +527,12 @@ export function ProgramPropertyEditor({
                   value={literal}
                   disabled={busy}
                   onCommit={(value) => commitLiteral(parameter, value)}
+                  onInvalidChange={(message) => setErrors((current) => {
+                    const next = { ...current };
+                    if (message) next[parameter.id] = message;
+                    else delete next[parameter.id];
+                    return next;
+                  })}
                 />
               ) : complex ? (
                 <DraftTextarea
@@ -445,6 +541,22 @@ export function ProgramPropertyEditor({
                   value={literal === undefined ? '' : JSON.stringify(literal, null, 2)}
                   disabled={busy}
                   spellCheck={false}
+                  validate={(text) => {
+                    try {
+                      return firstCatalogParameterValidationMessage(
+                        parameter,
+                        JSON.parse(text) as JsonValue,
+                      );
+                    } catch (error) {
+                      return error instanceof Error ? error.message : 'Value must be strict JSON.';
+                    }
+                  }}
+                  onInvalidChange={(message) => setErrors((current) => {
+                    const next = { ...current };
+                    if (message) next[parameter.id] = message;
+                    else delete next[parameter.id];
+                    return next;
+                  })}
                   onCommit={(text) => {
                     try {
                       commitLiteral(parameter, JSON.parse(text) as JsonValue);
@@ -465,11 +577,14 @@ export function ProgramPropertyEditor({
                     value={literal}
                     disabled={busy}
                     onCommit={(value) => commitLiteral(parameter, value)}
+                    onInvalidChange={(message) => setErrors((current) => {
+                      const next = { ...current };
+                      if (message) next[parameter.id] = message;
+                      else delete next[parameter.id];
+                      return next;
+                    })}
                   />
                 </div>
-              )}
-              {errors[parameter.id] && (
-                <p className="program-form-error" role="alert">{errors[parameter.id]}</p>
               )}
               {!source && (!parameter.required || parameter.hasDefault) && (
                 <button
@@ -486,9 +601,16 @@ export function ProgramPropertyEditor({
         })}
       </div>
       <ProgramPolicyEditor
+        key={`${selected.instance_id}:${discardEpoch}`}
         node={selected}
         busy={busy}
         onUpdate={onUpdateNodePolicies}
+        onInvalidChange={(message) => setErrors((current) => {
+          const next = { ...current };
+          if (message) next._policy = message;
+          else delete next._policy;
+          return next;
+        })}
       />
     </section>
   );

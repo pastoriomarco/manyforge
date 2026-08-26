@@ -37,6 +37,10 @@ export interface BlackboardUsage extends ProgramParameterUsage {
 }
 
 export function flattenProgramTree(root: ProgramTreeNode): FlatProgramNode[] {
+  return flattenProgramForest([root]);
+}
+
+export function flattenProgramForest(roots: ProgramTreeNode[]): FlatProgramNode[] {
   const result: FlatProgramNode[] = [];
   const visit = (
     node: ProgramTreeNode,
@@ -49,8 +53,36 @@ export function flattenProgramTree(root: ProgramTreeNode): FlatProgramNode[] {
       visit(child, node.instance_id, childIndex, depth + 1),
     );
   };
-  visit(root, null, 0, 0);
+  roots.forEach((root, index) => visit(root, null, index, 0));
   return result;
+}
+
+/** Resolve one backend diagnostic path to its retained node, without deriving validity. */
+export function programDiagnosticNodeId(
+  roots: ProgramTreeNode[],
+  path: string,
+): string | null {
+  const rootMatch = /^forest\[(\d+)]/.exec(path);
+  if (!rootMatch) return null;
+  let node = roots[Number(rootMatch[1])];
+  if (!node) return null;
+  let remainder = path.slice(rootMatch[0].length);
+  while (remainder.startsWith('.children[')) {
+    const childMatch = /^\.children\[(\d+)]/.exec(remainder);
+    if (!childMatch) return null;
+    node = node.children[Number(childMatch[1])];
+    if (!node) return null;
+    remainder = remainder.slice(childMatch[0].length);
+  }
+  return node.instance_id;
+}
+
+function flattenProgramSource(
+  source: ProgramTreeNode | ProgramTreeNode[],
+): FlatProgramNode[] {
+  return Array.isArray(source)
+    ? flattenProgramForest(source)
+    : flattenProgramTree(source);
 }
 
 export function nextProgramInstanceId(
@@ -120,13 +152,13 @@ export function catalogFieldAcceptsValueSource(
 }
 
 export function collectProgramBindingCandidates(
-  root: ProgramTreeNode,
+  root: ProgramTreeNode | ProgramTreeNode[],
   entries: CatalogEntry[],
   parameter: ProgramParameterDeclaration,
 ): ProgramBindingCandidate[] {
   const catalog = new Map(entries.map((entry) => [entry.id, entry]));
   const candidates: ProgramBindingCandidate[] = [];
-  for (const { node } of flattenProgramTree(root)) {
+  for (const { node } of flattenProgramSource(root)) {
     const entry = catalog.get(node.node_id);
     if (!entry) continue;
     const selectors = selectorParameterIds(entry);
@@ -154,10 +186,10 @@ export function collectProgramBindingCandidates(
 }
 
 export function collectProgramParameterUsages(
-  root: ProgramTreeNode,
+  root: ProgramTreeNode | ProgramTreeNode[],
 ): Record<string, ProgramParameterUsage[]> {
   const usages = new Map<string, ProgramParameterUsage[]>();
-  for (const { node } of flattenProgramTree(root)) {
+  for (const { node } of flattenProgramSource(root)) {
     for (const [fieldName, source] of Object.entries(node.value_sources ?? {})) {
       if (source.kind !== 'program_parameter') continue;
       usages.set(source.reference, [
@@ -183,10 +215,10 @@ export function collectProgramParameterUsages(
 }
 
 export function collectBlackboardUsages(
-  root: ProgramTreeNode,
+  root: ProgramTreeNode | ProgramTreeNode[],
 ): Record<string, BlackboardUsage[]> {
   const usages = new Map<string, BlackboardUsage[]>();
-  for (const { node } of flattenProgramTree(root)) {
+  for (const { node } of flattenProgramSource(root)) {
     for (const [fieldName, source] of Object.entries(node.value_sources ?? {})) {
       if (source.kind !== 'blackboard_key' && source.kind !== 'blackboard_field') {
         continue;

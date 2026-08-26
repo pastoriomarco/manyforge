@@ -231,6 +231,11 @@ button:disabled {
   border-color: #df7169;
 }
 
+.bt-node.invalid {
+  border-color: #d86f66;
+  box-shadow: 0 0 0 1px rgb(216 111 102 / 35%);
+}
+
 .bt-node.selected {
   outline: 2px solid #e6f6fa;
   outline-offset: 0.2rem;
@@ -2373,6 +2378,63 @@ code {
   padding: 0 0.75rem 0.55rem;
 }
 
+.draft-input-invalid,
+.program-policy-editor [aria-invalid="true"] {
+  border-color: #d86f66 !important;
+  color: #f1a099 !important;
+  box-shadow: 0 0 0 1px rgb(216 111 102 / 35%);
+}
+
+.program-declaration-form.has-invalid-edit [aria-invalid="true"] {
+  border-color: #d86f66;
+  color: #f1a099;
+}
+
+.program-declaration-form.has-backend-diagnostic {
+  border-left: 2px solid #d86f66;
+}
+
+.program-invalid-edit-strip {
+  position: sticky;
+  z-index: 4;
+  top: 0;
+  display: flex;
+  align-items: center;
+  gap: 0.4rem;
+  padding: 0.5rem 0.65rem;
+  border-bottom: 1px solid #8a4f49;
+  color: #f1a099;
+  background: #281b1b;
+  font-size: 0.68rem;
+}
+
+.program-invalid-edit-strip span {
+  flex: 1 1 auto;
+}
+
+.program-invalid-edit-strip button {
+  padding: 0.28rem 0.45rem;
+  font-size: 0.65rem;
+}
+
+.program-authoring-diagnostics {
+  display: grid;
+  gap: 0.2rem;
+  padding: 0.55rem 0.7rem;
+  border-bottom: 1px solid #704943;
+  color: #e4b0a8;
+  background: #20191b;
+  font-size: 0.68rem;
+}
+
+.program-property.backend-invalid {
+  border-left: 2px solid #d86f66;
+}
+
+.program-settings-section.backend-invalid {
+  border-left: 2px solid #d86f66;
+}
+
 .program-property-list {
   max-height: 42rem;
   overflow-y: auto;
@@ -3628,6 +3690,7 @@ code {
 }
 
 .document-state.state-modified,
+.document-state.state-incomplete,
 .document-state.state-different,
 .document-state.state-unavailable,
 .document-state.state-unsaved {

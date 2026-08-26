@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 
-import type { CatalogEntry, ProgramTreeNode } from '../types/api';
+import type { CatalogEntry } from '../types/api';
 import {
   authoringMoveIntent,
   type AuthoringGraphEdge,
@@ -9,14 +9,11 @@ import {
 import {
   programCanvasKeyIntent,
   programDeleteMutation,
-  programInsertionMutation,
+  programDetachedInsertionMutation,
   programMoveMutation,
   programPaletteClickIntent,
   programPaletteDragData,
   readProgramPaletteDrag,
-  stageProgramCanvasDrop,
-  validProgramInsertionPlacements,
-  type ProgramInsertionNode,
 } from './programCanvasInteraction';
 
 const leaf: CatalogEntry = {
@@ -40,27 +37,6 @@ const leaf: CatalogEntry = {
   eventFamily: null,
 };
 
-const sequence: CatalogEntry = {
-  ...leaf,
-  id: 'sequence',
-  name: 'Sequence',
-  kind: 'composite',
-  childrenMin: 1,
-  childrenMax: -1,
-};
-
-const root: ProgramTreeNode = {
-  node_id: 'sequence',
-  instance_id: 'root',
-  parameters: {},
-  children: [{
-    node_id: 'move',
-    instance_id: 'child',
-    parameters: {},
-    children: [],
-  }],
-};
-
 const graphNodes: AuthoringGraphNode[] = [
   { id: 'root', label: 'Root', position: { x: 0, y: 0 }, childrenMax: 3 },
   { id: 'left', label: 'Left', position: { x: 0, y: 100 }, childrenMax: 0 },
@@ -74,13 +50,6 @@ const graphEdges: AuthoringGraphEdge[] = [
   { source: 'right', target: 'leaf' },
 ];
 
-const insertionNode: ProgramInsertionNode = {
-  node_id: 'move',
-  instance_id: 'move_2',
-  parameters: {},
-  children: [],
-};
-
 describe('Program canvas interaction intents', () => {
   it('maps one native palette activation and preserves drag transfer metadata', () => {
     expect(programPaletteClickIntent(leaf)).toEqual({ catalogId: 'move' });
@@ -93,59 +62,25 @@ describe('Program canvas interaction intents', () => {
     ))).toBe('move');
   });
 
-  it('stages a drop without producing a Draft mutation', () => {
-    const staged = stageProgramCanvasDrop(
-      root,
-      [sequence, leaf],
-      'move',
-      'root',
-      7,
-    );
-    expect(staged).toEqual({
-      request: {
-        requestId: 7,
-        catalogId: 'move',
-        targetId: 'root',
-        placement: 'child',
-      },
-      error: null,
-    });
-    expect(staged).not.toHaveProperty('mutation');
-  });
-
-  it('allows an unbounded non-leaf wrapper placement', () => {
-    expect(validProgramInsertionPlacements(
-      root,
-      [sequence, leaf],
-      'child',
-      sequence,
-    )).toContain('wrapper');
-  });
-
-  it('maps explicit insertion confirmation exactly once for each placement', () => {
-    expect(programInsertionMutation('root', 'child', 1, insertionNode)).toEqual({
+  it('maps palette activation or free-space drop to one detached-node mutation', () => {
+    expect(programDetachedInsertionMutation(leaf, ['move'], 2)).toEqual({
       mutation: 'tree_draft_insert_node',
       args: {
-        parent_instance_id: 'root',
-        index: 1,
-        node: insertionNode,
-      },
-    });
-    expect(programInsertionMutation('child', 'sibling', 0, insertionNode)).toEqual({
-      mutation: 'tree_draft_insert_node',
-      args: { after_instance_id: 'child', node: insertionNode },
-    });
-    expect(programInsertionMutation('child', 'wrapper', 0, insertionNode)).toEqual({
-      mutation: 'tree_draft_wrap_node',
-      args: {
-        target_instance_id: 'child',
-        wrapper: {
+        index: 2,
+        node: {
           node_id: 'move',
           instance_id: 'move_2',
           parameters: {},
+          children: [],
         },
       },
     });
+    expect(programDetachedInsertionMutation(
+      leaf,
+      [],
+      0,
+      { x: 12, y: 34 },
+    ).args.position).toEqual({ x: 12, y: 34 });
   });
 
   it('maps a valid connection to one exact atomic move', () => {
@@ -206,11 +141,29 @@ describe('Program canvas interaction intents', () => {
         index: 2,
       },
     });
-    expect(programDeleteMutation('leaf', false)).toEqual({
+    expect(programMoveMutation('leaf', null, 2, {
+      root: { x: 20, y: 40 },
+      leaf: { x: 80, y: 120 },
+    })).toEqual({
+      mutation: 'tree_draft_move_node',
+      args: {
+        instance_id: 'leaf',
+        new_parent_instance_id: null,
+        index: 2,
+        positions: {
+          root: { x: 20, y: 40 },
+          leaf: { x: 80, y: 120 },
+        },
+      },
+    });
+    expect(programDeleteMutation('leaf')).toEqual({
       mutation: 'tree_draft_delete_node',
       args: { instance_id: 'leaf' },
     });
-    expect(programDeleteMutation('root', true)).toBeNull();
+    expect(programDeleteMutation('root')).toEqual({
+      mutation: 'tree_draft_delete_node',
+      args: { instance_id: 'root' },
+    });
   });
 
   it('ignores destructive keyboard commands in form controls', () => {

@@ -78,7 +78,6 @@ def _node_policy_arguments(
     instance_id: str = "move_to_pick",
 ) -> dict:
     return {
-        "expected_program_revision": session.snapshot()["program_revision"],
         "instance_id": instance_id,
         "modification_policy": {
             "runtime_override": "human_approval",
@@ -101,7 +100,7 @@ def test_session_is_an_unsaved_unapplied_in_memory_draft() -> None:
 
     snapshot = session.snapshot()
 
-    assert snapshot["schema_version"] == "manyforge.composer_draft.v1"
+    assert snapshot["schema_version"] == "manyforge.composer_draft.v2"
     assert snapshot["draft_id"].startswith("draft-")
     assert snapshot["draft_revision"] == 1
     assert snapshot["program_loaded"] is True
@@ -115,7 +114,7 @@ def test_workspace_distinguishes_saved_draft_from_unavailable_applied() -> None:
 
     workspace = session.workspace_snapshot()
 
-    assert workspace["schemaVersion"] == "manyforge.composer_program_workspace.v1"
+    assert workspace["schemaVersion"] == "manyforge.composer_program_workspace.v2"
     assert workspace["saved"] == {
         "available": True,
         "matchesDraft": True,
@@ -289,6 +288,11 @@ def test_discard_and_revert_use_exact_independent_owner_snapshots() -> None:
     applied_program = _program(metadata={"selection": "applied"})
     session = ComposerDraftSession(saved_program, source_path=str(_PROGRAM_PATH))
     original_saved = deepcopy(saved_program.to_dict())
+    _mutate(
+        session,
+        "tree_draft_update_positions",
+        {"positions": {"move_to_pick": {"x": 320.0, "y": 180.0}}},
+    )
 
     discarded = session.discard_to_applied(
         draft_id=session.draft_id,
@@ -296,6 +300,7 @@ def test_discard_and_revert_use_exact_independent_owner_snapshots() -> None:
         reader=lambda: applied_program,
     )
     assert discarded["draft"]["program"] == applied_program.to_dict()
+    assert discarded["draft"]["authoring"]["positions"] == {}
     assert discarded["saved"]["programRevision"] == saved_program.program_revision
     assert discarded["saved"]["path"] == str(_PROGRAM_PATH.resolve())
     discarded_revision = session.revision
@@ -425,7 +430,7 @@ def test_revert_failure_stale_fences_and_exhaustion_are_atomic() -> None:
     assert effects == ["read", "read"]
 
 
-def test_new_draft_is_fresh_minimal_valid_and_clears_saved_identity() -> None:
+def test_new_draft_is_fresh_empty_authoring_and_clears_saved_identity() -> None:
     catalog = build_node_environment().catalog
     session = ComposerDraftSession(_program(), source_path=str(_PROGRAM_PATH))
     before = session.workspace_snapshot(
@@ -440,16 +445,18 @@ def test_new_draft_is_fresh_minimal_valid_and_clears_saved_identity() -> None:
         catalog_reader=lambda: catalog,
     )
 
-    document = created["draft"]["program"]
-    assert Program.from_dict(document, catalog).to_dict() == document
-    assert document["program_id"].startswith("program-")
-    assert len(document["program_id"]) == len("program-") + 32
-    assert document["tree"] == {
-        "node_id": "logic.check_bool",
-        "instance_id": "root",
-        "parameters": {"actual_value": True, "expected_value": True},
-        "children": [],
-    }
+    authoring = created["draft"]["authoring"]
+    assert created["draft"]["program"] is None
+    assert created["draft"]["candidateAvailable"] is False
+    assert authoring["program_id"].startswith("program-")
+    assert len(authoring["program_id"]) == len("program-") + 32
+    assert authoring["forest"] == []
+    assert created["draft"]["diagnostics"] == [{
+        "code": "authoring_forest_root_count",
+        "path": "forest",
+        "message": "Program requires exactly one root; found 0.",
+        "severity": "error",
+    }]
     assert created["draft"]["draftId"] != before["draft"]["draftId"]
     assert created["draft"]["draftRevision"] == 1
     assert created["saved"]["available"] is False
@@ -462,8 +469,9 @@ def test_new_draft_is_fresh_minimal_valid_and_clears_saved_identity() -> None:
         applied_revision_reader=lambda: pytest.fail("confirmed replacement"),
         catalog_reader=lambda: catalog,
     )
-    assert second["draft"]["program"]["program_id"] != document["program_id"]
-    assert second["draft"]["programRevision"] != document["program_revision"]
+    assert second["draft"]["authoring"]["program_id"] != authoring["program_id"]
+    assert second["draft"]["program"] is None
+    assert second["draft"]["programRevision"] is None
 
     with pytest.raises(DraftSessionError) as replay:
         session.new_draft(
@@ -526,27 +534,31 @@ def test_successful_edit_reidentifies_and_atomically_swaps_the_program() -> None
     ]
 
 
-def test_invalid_candidate_and_stale_revision_leave_the_draft_unchanged() -> None:
+def test_incomplete_candidate_is_retained_and_stale_revision_is_atomic() -> None:
     session = ComposerDraftSession(_program())
-    before = deepcopy(session.snapshot())
-
-    with pytest.raises(DraftSessionError, match="scene resource"):
-        _mutate(
-            session,
-            "scene_draft_remove_objects",
-            {"scene_resource_ids": ["table"]},
-        )
-    assert session.snapshot() == before
+    incomplete = _mutate(
+        session,
+        "scene_draft_remove_objects",
+        {"scene_resource_ids": ["table"]},
+    )
+    assert incomplete.snapshot["program"] is None
+    assert incomplete.snapshot["candidate_available"] is False
+    assert incomplete.snapshot["authoring"]["scene"] == []
+    assert any(
+        diagnostic["code"] == "authoring_program_invalid"
+        for diagnostic in incomplete.snapshot["diagnostics"]
+    )
+    before_stale = deepcopy(session.snapshot())
     with pytest.raises(DraftSessionError) as stale:
         session.mutate(
             tool_id="scene_draft_add_object",
             arguments={"scene_resource": _box_resource("workpiece")},
-            expected_revision=0,
+            expected_revision=1,
             catalog=build_node_environment().catalog,
         )
     assert stale.value.code == "composer_draft_revision_stale"
     assert stale.value.status_code == 409
-    assert session.snapshot() == before
+    assert session.snapshot() == before_stale
 
 
 def test_node_policy_mutation_round_trips_nondefaults_and_reidentifies() -> None:
@@ -683,18 +695,18 @@ def test_node_policy_noop_is_allowed_at_revision_exhaustion() -> None:
     assert result.snapshot == before
 
 
-def test_node_policy_mutation_fences_and_instance_identity_are_atomic() -> None:
+def test_node_policy_mutation_uses_the_draft_fence_and_instance_identity_atomically() -> None:
     session = ComposerDraftSession(_program())
     arguments = _node_policy_arguments(session)
     before = deepcopy(session.snapshot())
 
-    with pytest.raises(DraftSessionError) as stale_program:
+    with pytest.raises(DraftSessionError) as unexpected_fence:
         _mutate(
             session,
             "program_draft_update_node_policies",
             {**arguments, "expected_program_revision": "sha256:" + "f" * 64},
         )
-    assert stale_program.value.code == "composer_program_revision_stale"
+    assert unexpected_fence.value.code == "draft_arguments_invalid"
     assert session.snapshot() == before
 
     with pytest.raises(DraftSessionError) as unknown:
@@ -939,6 +951,175 @@ def test_tree_edits_use_instance_ids_and_the_explicit_root_alias() -> None:
     assert [child["instance_id"] for child in root["children"]] == [
         "main_sequence"
     ]
+
+
+def test_authoring_forest_retains_incomplete_topology_until_it_derives_a_program() -> None:
+    catalog = build_node_environment().catalog
+    session = ComposerDraftSession(_program(), source_path=str(_PROGRAM_PATH))
+    before_revision = session.snapshot()["program_revision"]
+
+    detached = _mutate(
+        session,
+        "tree_draft_insert_node",
+        {
+            "node": {
+                "node_id": "timer",
+                "instance_id": "detached_timer",
+                "parameters": {"duration_s": 0.2},
+                "children": [],
+            },
+            "position": {"x": 120.0, "y": 240.0},
+        },
+    )
+
+    assert detached.snapshot["candidate_available"] is False
+    assert detached.snapshot["program"] is None
+    assert [node["instance_id"] for node in detached.snapshot["authoring"]["forest"]] == [
+        "main_sequence",
+        "detached_timer",
+    ]
+    assert detached.snapshot["authoring"]["positions"]["detached_timer"] == {
+        "x": 120.0,
+        "y": 240.0,
+    }
+    assert detached.snapshot["diagnostics"][0]["code"] == "authoring_forest_root_count"
+    retained = session.retained_state()
+    restored = ComposerDraftSession()
+    restored.restore_retained_state(retained, catalog)
+    assert restored.snapshot() == session.snapshot()
+
+    with pytest.raises(DraftSessionError) as incomplete_save:
+        session.save_program(
+            draft_id=session.draft_id,
+            expected_revision=session.revision,
+            target_path=None,
+            writer=lambda _program, path: path,
+        )
+    assert incomplete_save.value.code == "composer_authoring_draft_incomplete"
+
+    attached = _mutate(
+        session,
+        "tree_draft_move_node",
+        {
+            "instance_id": "detached_timer",
+            "new_parent_instance_id": "main_sequence",
+            "index": 2,
+        },
+    )
+    assert attached.snapshot["candidate_available"] is True
+    assert attached.snapshot["program"] is not None
+    assert attached.snapshot["program_revision"] != before_revision
+    assert attached.snapshot["diagnostics"] == []
+
+
+def test_authoring_forest_rejects_invalid_values_but_allows_missing_required_fields() -> None:
+    session = ComposerDraftSession(_program())
+    before = session.snapshot()
+    with pytest.raises(DraftSessionError) as invalid:
+        _mutate(
+            session,
+            "tree_draft_insert_node",
+            {
+                "node": {
+                    "node_id": "timer",
+                    "instance_id": "invalid_timer",
+                    "parameters": {"duration_s": "slow"},
+                    "children": [],
+                }
+            },
+        )
+    assert invalid.value.code == "composer_authoring_field_invalid"
+    assert session.snapshot() == before
+
+    incomplete = _mutate(
+        session,
+        "tree_draft_insert_node",
+        {
+            "node": {
+                "node_id": "motion.move_to_joint_target",
+                "instance_id": "missing_fields",
+                "parameters": {},
+                "children": [],
+            }
+        },
+    )
+    assert incomplete.snapshot["candidate_available"] is False
+    assert any(
+        diagnostic["code"] == "authoring_parameter_required"
+        for diagnostic in incomplete.snapshot["diagnostics"]
+    )
+
+
+def test_authoring_position_edit_advances_only_the_draft_identity() -> None:
+    session = ComposerDraftSession(_program())
+    before = session.snapshot()
+    changed = _mutate(
+        session,
+        "tree_draft_update_positions",
+        {"positions": {"main_sequence": {"x": 50.0, "y": 75.0}}},
+    )
+    assert changed.snapshot["draft_revision"] == before["draft_revision"] + 1
+    assert changed.snapshot["program_revision"] == before["program_revision"]
+    assert changed.snapshot["authoring"]["positions"]["main_sequence"] == {
+        "x": 50.0,
+        "y": 75.0,
+    }
+
+
+def test_authoring_detach_atomically_retains_the_presented_layout() -> None:
+    session = ComposerDraftSession(_program())
+    changed = _mutate(
+        session,
+        "tree_draft_move_node",
+        {
+            "instance_id": "move_to_pick",
+            "new_parent_instance_id": None,
+            "index": 1,
+            "positions": {
+                "main_sequence": {"x": 40.0, "y": 90.0},
+                "move_to_pick": {"x": 320.0, "y": 180.0},
+            },
+        },
+    )
+
+    assert changed.snapshot["authoring"]["positions"]["main_sequence"] == {
+        "x": 40.0,
+        "y": 90.0,
+    }
+    assert changed.snapshot["authoring"]["positions"]["move_to_pick"] == {
+        "x": 320.0,
+        "y": 180.0,
+    }
+    assert [
+        node["instance_id"] for node in changed.snapshot["authoring"]["forest"]
+    ] == ["main_sequence", "move_to_pick"]
+
+
+def test_authoring_same_parent_reorder_is_semantic_and_retains_the_presented_layout() -> None:
+    session = ComposerDraftSession(_program())
+    changed = _mutate(
+        session,
+        "tree_draft_move_node",
+        {
+            "instance_id": "remove_table",
+            "new_parent_instance_id": "main_sequence",
+            "index": 0,
+            "positions": {
+                "move_to_pick": {"x": 320.0, "y": 180.0},
+                "remove_table": {"x": 320.0, "y": 90.0},
+            },
+        },
+    )
+
+    root = changed.snapshot["authoring"]["forest"][0]
+    assert [child["instance_id"] for child in root["children"]] == [
+        "remove_table",
+        "move_to_pick",
+    ]
+    assert changed.snapshot["authoring"]["positions"]["remove_table"] == {
+        "x": 320.0,
+        "y": 90.0,
+    }
 
 
 def test_tree_pose_patch_preserves_frame_and_position_and_resolves_orientation() -> None:

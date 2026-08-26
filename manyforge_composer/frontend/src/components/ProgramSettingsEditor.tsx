@@ -1,16 +1,23 @@
-import { useEffect, useMemo, useState } from 'react';
+import { useEffect, useMemo, useState, type KeyboardEvent } from 'react';
 
 import type { ProgramRuntimeController } from '../hooks/useProgramRuntime';
-import type { JsonValue, ProgramDocument } from '../types/api';
+import type {
+  JsonValue,
+  ProgramAuthoringDiagnostic,
+  ProgramAuthoringDocument,
+} from '../types/api';
 
 const LANES = ['manyforge-only', 'isaac-sim', 'real-robot'] as const;
 const PORTABLE_ID = /^[a-z][a-z0-9_.-]*$/;
 
 interface ProgramSettingsEditorProps {
-  program: ProgramDocument;
+  program: ProgramAuthoringDocument;
+  candidateRevision: string | null;
   busy: boolean;
   runtime: ProgramRuntimeController;
   onMutate: (mutation: string, args: Record<string, JsonValue>) => void;
+  onInvalidChange?: (invalid: boolean) => void;
+  diagnostics?: ProgramAuthoringDiagnostic[];
 }
 
 function stringList(value: JsonValue | undefined): string[] {
@@ -29,7 +36,7 @@ function parseIdentifierList(value: string, label: string): string[] {
   return entries;
 }
 
-function initialCompatibility(program: ProgramDocument) {
+function initialCompatibility(program: ProgramAuthoringDocument) {
   const compatibility = program.compatibility ?? {};
   return {
     lanes: stringList(compatibility.lanes),
@@ -43,29 +50,39 @@ function initialCompatibility(program: ProgramDocument) {
 
 export function ProgramSettingsEditor({
   program,
+  candidateRevision,
   busy,
   runtime,
   onMutate,
+  onInvalidChange,
+  diagnostics = [],
 }: ProgramSettingsEditorProps) {
   const [name, setName] = useState(program.name);
   const [description, setDescription] = useState(program.description ?? '');
   const [compatibility, setCompatibility] = useState(() => initialCompatibility(program));
   const [error, setError] = useState<string | null>(null);
+  const [errorTarget, setErrorTarget] = useState('program-settings-name');
 
   useEffect(() => {
     setName(program.name);
     setDescription(program.description ?? '');
     setCompatibility(initialCompatibility(program));
     setError(null);
+    setErrorTarget('program-settings-name');
   }, [program]);
+  useEffect(() => {
+    onInvalidChange?.(error !== null);
+    return () => onInvalidChange?.(false);
+  }, [error, onInvalidChange]);
 
   const currentScenario = runtime.state.currentScenario?.currentScenario ?? null;
   const appliedBinding = runtime.state.applied?.programBinding ?? null;
   const exactBinding = currentScenario !== null
     && appliedBinding !== null
-    && currentScenario.programRevision === program.program_revision
+    && candidateRevision !== null
+    && currentScenario.programRevision === candidateRevision
     && currentScenario.programBindingId === appliedBinding.program_binding_id
-    && appliedBinding.program_revision === program.program_revision
+    && appliedBinding.program_revision === candidateRevision
     ? appliedBinding
     : null;
   const original = useMemo(() => initialCompatibility(program), [program]);
@@ -75,8 +92,17 @@ export function ProgramSettingsEditor({
     || compatibility.assistant !== original.assistant
     || compatibility.requires !== original.requires
     || compatibility.tags !== original.tags;
+  const settingsDiagnostics = diagnostics.filter((diagnostic) =>
+    diagnostic.path.startsWith('program')
+    && !diagnostic.path.startsWith('program.parameters')
+    && !diagnostic.path.startsWith('program.blackboard'));
+  const compatibilityDiagnostic = settingsDiagnostics.find((diagnostic) =>
+    diagnostic.path.startsWith('program.compatibility'));
+  const identityDiagnostic = settingsDiagnostics.find((diagnostic) =>
+    !diagnostic.path.startsWith('program.compatibility'));
 
   const submit = () => {
+    if (busy || !dirty) return;
     try {
       if (!name.trim()) throw new Error('Program name is required.');
       const lanes = LANES.filter((lane) => compatibility.lanes.includes(lane));
@@ -95,7 +121,34 @@ export function ProgramSettingsEditor({
       });
       setError(null);
     } catch (caught) {
-      setError(caught instanceof Error ? caught.message : 'Program settings are invalid.');
+      const message = caught instanceof Error ? caught.message : 'Program settings are invalid.';
+      setError(message);
+      setErrorTarget(
+        message.startsWith('Requirements')
+          ? 'program-settings-requires'
+          : message.startsWith('Tags')
+            ? 'program-settings-tags'
+            : 'program-settings-name',
+      );
+    }
+  };
+  const guardInvalidTab = (event: KeyboardEvent<HTMLFormElement>) => {
+    if (event.key !== 'Tab') return;
+    try {
+      if (!name.trim()) throw new Error('Program name is required.');
+      parseIdentifierList(compatibility.requires, 'Requirements');
+      parseIdentifierList(compatibility.tags, 'Tags');
+    } catch (caught) {
+      const message = caught instanceof Error ? caught.message : 'Program settings are invalid.';
+      const target = message.startsWith('Requirements')
+        ? 'program-settings-requires'
+        : message.startsWith('Tags')
+          ? 'program-settings-tags'
+          : 'program-settings-name';
+      event.preventDefault();
+      setError(message);
+      setErrorTarget(target);
+      document.getElementById(target)?.focus();
     }
   };
 
@@ -103,8 +156,36 @@ export function ProgramSettingsEditor({
     <form className="program-settings-editor" onSubmit={(event) => {
       event.preventDefault();
       submit();
-    }}>
-      <section className="program-settings-section">
+    }} onKeyDown={guardInvalidTab} onBlur={submit}>
+      {error && (
+        <div className="program-invalid-edit-strip" role="alert">
+          <span>{error}</span>
+          <button type="button" onClick={() => document.getElementById(errorTarget)?.focus()}>
+            Review
+          </button>
+          <button
+            type="button"
+            onClick={() => {
+              setName(program.name);
+              setDescription(program.description ?? '');
+              setCompatibility(initialCompatibility(program));
+              setError(null);
+              setErrorTarget('program-settings-name');
+            }}
+          >
+            Discard edit
+          </button>
+        </div>
+      )}
+      {settingsDiagnostics.length > 0 && (
+        <div className="program-authoring-diagnostics" role="status">
+          <strong>Complete Program settings</strong>
+          {settingsDiagnostics.slice(0, 6).map((diagnostic) => (
+            <span key={`${diagnostic.code}:${diagnostic.path}`}>{diagnostic.message}</span>
+          ))}
+        </div>
+      )}
+      <section className={`program-settings-section${identityDiagnostic ? ' backend-invalid' : ''}`} title={identityDiagnostic?.message}>
         <h3>Identity and profile</h3>
         <dl className="program-settings-facts">
           <div><dt>Program ID</dt><dd><code>{program.program_id}</code></dd></div>
@@ -113,7 +194,7 @@ export function ProgramSettingsEditor({
         </dl>
         <label>
           Program name
-          <input value={name} disabled={busy} onChange={(event) => setName(event.target.value)} />
+          <input id="program-settings-name" value={name} disabled={busy} aria-invalid={error !== null && errorTarget === 'program-settings-name'} title={errorTarget === 'program-settings-name' ? error ?? undefined : undefined} onChange={(event) => setName(event.target.value)} />
         </label>
         <label>
           Description
@@ -121,7 +202,7 @@ export function ProgramSettingsEditor({
         </label>
       </section>
 
-      <section className="program-settings-section">
+      <section className={`program-settings-section${compatibilityDiagnostic ? ' backend-invalid' : ''}`} title={compatibilityDiagnostic?.message}>
         <h3>Portable compatibility</h3>
         <fieldset className="program-settings-lanes">
           <legend>Supported lanes</legend>
@@ -161,8 +242,11 @@ export function ProgramSettingsEditor({
         <label>
           Portable semantic requirements
           <input
+            id="program-settings-requires"
             value={compatibility.requires}
             disabled={busy}
+            aria-invalid={error !== null && errorTarget === 'program-settings-requires'}
+            title={errorTarget === 'program-settings-requires' ? error ?? undefined : undefined}
             placeholder="requirement.one, requirement.two"
             onChange={(event) => setCompatibility((current) => ({
               ...current,
@@ -173,8 +257,11 @@ export function ProgramSettingsEditor({
         <label>
           Discovery tags
           <input
+            id="program-settings-tags"
             value={compatibility.tags}
             disabled={busy}
+            aria-invalid={error !== null && errorTarget === 'program-settings-tags'}
+            title={errorTarget === 'program-settings-tags' ? error ?? undefined : undefined}
             placeholder="pick, inspection"
             onChange={(event) => setCompatibility((current) => ({
               ...current,
@@ -201,10 +288,6 @@ export function ProgramSettingsEditor({
         )}
       </section>
 
-      {error && <p className="program-form-error" role="alert">{error}</p>}
-      <button type="submit" className="primary-action" disabled={busy || !dirty}>
-        Save Program settings to Draft
-      </button>
     </form>
   );
 }

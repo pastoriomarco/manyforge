@@ -10,13 +10,16 @@ import { programWorkspaceTransitionResult } from '../hooks/useProgramWorkspace';
 
 function workspace(draftId: string, revision: number): ProgramWorkspaceResponse {
   return {
-    schemaVersion: 'manyforge.composer_program_workspace.v1',
+    schemaVersion: 'manyforge.composer_program_workspace.v2',
     draft: {
       draftId,
       draftRevision: revision,
       programLoaded: false,
+      authoring: null,
+      candidateAvailable: false,
       programRevision: null,
       program: null,
+      diagnostics: [],
     },
     applicability: {
       applyReady: true,

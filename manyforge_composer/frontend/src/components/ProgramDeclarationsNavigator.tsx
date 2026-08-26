@@ -17,7 +17,7 @@ export type ProgramDeclarationSelection =
   | { kind: 'key'; id: string };
 
 interface ProgramDeclarationsNavigatorProps {
-  root: ProgramTreeNode;
+  roots: ProgramTreeNode[];
   parameters: ProgramParameterDeclaration[];
   namespaces: BlackboardNamespaceDeclaration[];
   keys: BlackboardKeyDeclaration[];
@@ -35,15 +35,15 @@ function selectedClass(
 
 /** Compact declaration navigation; editing remains in the contextual inspector. */
 export function ProgramDeclarationsNavigator({
-  root,
+  roots,
   parameters,
   namespaces,
   keys,
   selected,
   onSelect,
 }: ProgramDeclarationsNavigatorProps) {
-  const parameterUsages = useMemo(() => collectProgramParameterUsages(root), [root]);
-  const blackboardUsages = useMemo(() => collectBlackboardUsages(root), [root]);
+  const parameterUsages = useMemo(() => collectProgramParameterUsages(roots), [roots]);
+  const blackboardUsages = useMemo(() => collectBlackboardUsages(roots), [roots]);
 
   return (
     <nav className="program-declaration-navigator" aria-label="Program declarations">

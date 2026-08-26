@@ -419,7 +419,9 @@ def create_assistant_draft_router(state: ComposerState) -> APIRouter:
                     "details": details,
                     "draftId": next_snapshot["draft_id"],
                     "draftRevision": next_snapshot["draft_revision"],
+                    "candidateAvailable": next_snapshot["candidate_available"],
                     "programRevision": next_snapshot["program_revision"],
+                    "diagnostics": next_snapshot["diagnostics"],
                 },
             },
         )

@@ -240,11 +240,10 @@ describe('Program authoring panels', () => {
   it('keeps catalog authoring available while execution is separately gated', () => {
     const markup = renderToStaticMarkup(
       <ProgramNodePalette
-        root={tree}
+        roots={[tree]}
         catalogEntries={[sequence, timer]}
         catalogIdentity={null}
         environment={environment}
-        selectedId="root_sequence"
         busy={false}
         onMutate={vi.fn()}
       />,
@@ -259,16 +258,18 @@ describe('Program authoring panels', () => {
     const markup = renderToStaticMarkup(
       <div>
         <ProgramTreeCanvas
-          root={tree}
+          roots={[tree]}
+          retainedPositions={{}}
           catalogEntries={[sequence, timer]}
           environment={environment}
           selectedId="settle"
+          invalidNodeIds={new Set()}
           busy={false}
           onSelect={vi.fn()}
           onMutate={vi.fn()}
         />
         <ProgramPropertyEditor
-          root={tree}
+          roots={[tree]}
           selectedId="settle"
           catalogEntries={[sequence, timer]}
           programParameters={[parameter]}
@@ -361,7 +362,7 @@ describe('Program authoring panels', () => {
 
     const markup = renderToStaticMarkup(
       <ProgramPropertyEditor
-        root={invalidTree}
+        roots={[invalidTree]}
         selectedId="invalid"
         catalogEntries={[variantSchemas]}
         programParameters={[]}
@@ -393,7 +394,7 @@ describe('Program authoring panels', () => {
     };
     const markup = renderToStaticMarkup(
       <ProgramPropertyEditor
-        root={requiredTree}
+        roots={[requiredTree]}
         selectedId="required-source"
         catalogEntries={[timer]}
         programParameters={[]}
@@ -418,7 +419,7 @@ describe('Program authoring panels', () => {
   it('reports declaration usage and prevents deleting a referenced parameter', () => {
     const markup = renderToStaticMarkup(
       <ProgramDeclarationsEditor
-        root={tree}
+        roots={[tree]}
         parameters={[parameter]}
         namespaces={[]}
         keys={[]}
@@ -445,10 +446,12 @@ describe('Program authoring panels', () => {
     const started = performance.now();
     const markup = renderToStaticMarkup(
       <ProgramTreeCanvas
-        root={broadTree}
+        roots={[broadTree]}
+        retainedPositions={{}}
         catalogEntries={[sequence, timer]}
         environment={environment}
         selectedId="timer_511"
+        invalidNodeIds={new Set()}
         busy={false}
         onSelect={vi.fn()}
         onMutate={vi.fn()}
@@ -470,13 +473,16 @@ describe('Program authoring panels', () => {
         requestGeneration: 1,
         pendingAction: null,
         workspace: {
-          schemaVersion: 'manyforge.composer_program_workspace.v1',
+          schemaVersion: 'manyforge.composer_program_workspace.v2',
           draft: {
             draftId: 'empty-draft',
             draftRevision: 0,
             programLoaded: false,
+            authoring: null,
+            candidateAvailable: false,
             programRevision: null,
             program: null,
+            diagnostics: [],
           },
           applicability: {
             applyReady: true,
@@ -584,11 +590,27 @@ describe('Program authoring panels', () => {
       }],
     };
     const blockedWorkspace: ProgramWorkspaceResponse = {
-      schemaVersion: 'manyforge.composer_program_workspace.v1',
+      schemaVersion: 'manyforge.composer_program_workspace.v2',
       draft: {
         draftId: 'draft-blocked',
         draftRevision: 2,
         programLoaded: true,
+        authoring: {
+          schema_version: 'manyforge.composer_authoring_forest.v1',
+          api_version: 'manyforge.program.v1',
+          program_id: 'program-blocked',
+          program_profile: 'composable-cell-v1',
+          name: 'Blocked',
+          catalog: {
+            api_version: 'manyforge.node_catalog.v2',
+            content_version: 'fixture',
+          },
+          component_roles: {},
+          target_roles: {},
+          forest: [blockedTree],
+          positions: {},
+        },
+        candidateAvailable: true,
         programRevision: `sha256:${'a'.repeat(64)}`,
         program: {
           api_version: 'manyforge.program.v1',
@@ -604,6 +626,7 @@ describe('Program authoring panels', () => {
           target_roles: {},
           tree: blockedTree,
         },
+        diagnostics: [],
       },
       applicability: {
         applyReady: false,
@@ -641,8 +664,6 @@ describe('Program authoring panels', () => {
         message: null,
         transitionStatus: null,
         error: null,
-        comparisonStatus: 'observed',
-        refreshWarning: null,
       },
       refresh: vi.fn(),
       mutate: vi.fn(),

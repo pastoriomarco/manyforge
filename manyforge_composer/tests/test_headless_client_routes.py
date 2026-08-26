@@ -1665,8 +1665,13 @@ def test_new_program_rotates_fenced_draft_without_disk_or_headless_mutation(
     workspace = created.json()
     assert workspace["draft"]["draftId"] != before["draft"]["draftId"]
     assert workspace["draft"]["draftRevision"] == 1
-    assert workspace["draft"]["program"]["name"] == "Untitled Program"
-    assert workspace["draft"]["program"]["tree"]["node_id"] == "logic.check_bool"
+    assert workspace["draft"]["program"] is None
+    assert workspace["draft"]["candidateAvailable"] is False
+    assert workspace["draft"]["authoring"]["name"] == "Untitled Program"
+    assert workspace["draft"]["authoring"]["forest"] == []
+    assert workspace["draft"]["diagnostics"][0]["code"] == (
+        "authoring_forest_root_count"
+    )
     assert workspace["saved"]["available"] is False
     assert workspace["saved"]["path"] is None
     assert replay.status_code == 409

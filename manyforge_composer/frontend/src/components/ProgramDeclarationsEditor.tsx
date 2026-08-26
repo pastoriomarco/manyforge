@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from 'react';
+import { useCallback, useEffect, useMemo, useState, type KeyboardEvent } from 'react';
 
 import type {
   BlackboardFieldDeclaration,
@@ -6,6 +6,7 @@ import type {
   BlackboardNamespaceDeclaration,
   CatalogEntry,
   JsonValue,
+  ProgramAuthoringDiagnostic,
   ProgramParameterDeclaration,
   ProgramTreeNode,
 } from '../types/api';
@@ -13,7 +14,7 @@ import {
   collectProgramBindingCandidates,
   collectBlackboardUsages,
   collectProgramParameterUsages,
-  flattenProgramTree,
+  flattenProgramForest,
   resolveProgramParameterLiteralValue,
 } from '../utils/programAuthoring';
 import { firstCatalogParameterValidationMessage } from '../utils/catalogParameterValidation';
@@ -38,7 +39,7 @@ interface ProgramDeclarationsEditorProps {
   embedded?: boolean;
   selection?: ProgramDeclarationSelection | null;
   showNavigation?: boolean;
-  root: ProgramTreeNode;
+  roots: ProgramTreeNode[];
   parameters: ProgramParameterDeclaration[];
   namespaces: BlackboardNamespaceDeclaration[];
   keys: BlackboardKeyDeclaration[];
@@ -46,6 +47,8 @@ interface ProgramDeclarationsEditorProps {
   busy: boolean;
   onMutate: (mutation: string, args: Record<string, JsonValue>) => void;
   onSelectNode?: (instanceId: string) => void;
+  onInvalidEditChange?: (invalid: boolean) => void;
+  diagnostics?: ProgramAuthoringDiagnostic[];
 }
 
 function parseJson(text: string, label: string): JsonValue {
@@ -62,7 +65,7 @@ export function ProgramDeclarationsEditor({
   embedded = false,
   selection = null,
   showNavigation = true,
-  root,
+  roots,
   parameters,
   namespaces,
   keys,
@@ -70,9 +73,11 @@ export function ProgramDeclarationsEditor({
   busy,
   onMutate,
   onSelectNode,
+  onInvalidEditChange,
+  diagnostics = [],
 }: ProgramDeclarationsEditorProps) {
-  const parameterUsages = useMemo(() => collectProgramParameterUsages(root), [root]);
-  const blackboardUsages = useMemo(() => collectBlackboardUsages(root), [root]);
+  const parameterUsages = useMemo(() => collectProgramParameterUsages(roots), [roots]);
+  const blackboardUsages = useMemo(() => collectBlackboardUsages(roots), [roots]);
   const [parameterId, setParameterId] = useState('');
   const [parameterType, setParameterType] = useState('float64');
   const [defaultText, setDefaultText] = useState('0');
@@ -88,7 +93,16 @@ export function ProgramDeclarationsEditor({
   const [fieldsText, setFieldsText] = useState('[]');
   const [keyDescription, setKeyDescription] = useState('');
   const [error, setError] = useState<string | null>(null);
-  const flat = useMemo(() => flattenProgramTree(root), [root]);
+  const [errorTarget, setErrorTarget] = useState<string | null>(null);
+  const clearError = useCallback(() => {
+    setError(null);
+    setErrorTarget(null);
+  }, []);
+  const reportError = (message: string, target: string | null = null) => {
+    setError(message);
+    setErrorTarget(target);
+  };
+  const flat = useMemo(() => flattenProgramForest(roots), [roots]);
   const catalog = useMemo(
     () => new Map(catalogEntries.map((entry) => [entry.id, entry])),
     [catalogEntries],
@@ -102,24 +116,128 @@ export function ProgramDeclarationsEditor({
   const selectedKey = selection?.kind === 'key'
     ? keys.find((row) => row.key === selection.id) ?? null
     : null;
+  const selectedDiagnosticPrefix = selection?.kind === 'parameter'
+    ? `program.parameters[${parameters.findIndex((row) => row.parameter_id === selection.id)}]`
+    : selection?.kind === 'namespace'
+      ? `program.blackboard.namespaces[${namespaces.findIndex((row) => row.namespace_id === selection.id)}]`
+      : selection?.kind === 'key'
+        ? `program.blackboard.keys[${keys.findIndex((row) => row.key === selection.id)}]`
+        : null;
+  const selectedDiagnostics = selectedDiagnosticPrefix === null
+    ? []
+    : diagnostics.filter((diagnostic) => diagnostic.path.startsWith(selectedDiagnosticPrefix));
+  const parameterDirty = selectedParameter !== null && (
+    parameterId !== selectedParameter.parameter_id
+    || parameterType !== selectedParameter.type
+    || defaultText !== JSON.stringify(selectedParameter.default, null, 2)
+    || constraintsText !== JSON.stringify(selectedParameter.constraints ?? {}, null, 2)
+    || mutability !== selectedParameter.runtime_mutability
+    || parameterDescription !== (selectedParameter.description ?? '')
+  );
+  const namespaceDirty = selectedNamespace !== null && (
+    namespaceId !== selectedNamespace.namespace_id
+    || namespaceDescription !== (selectedNamespace.description ?? '')
+  );
+  const keyDirty = selectedKey !== null && (
+    keyName !== selectedKey.key
+    || keyType !== selectedKey.type
+    || keyAccess !== selectedKey.access
+    || keyPersistence !== selectedKey.persistence
+    || fieldsText !== JSON.stringify(selectedKey.fields ?? [], null, 2)
+    || keyDescription !== (selectedKey.description ?? '')
+  );
+  const parameterIssue = (): { message: string; target: string } | null => {
+    try {
+      parseJson(defaultText, 'Default');
+      const constraints = parseJson(constraintsText, 'Constraints');
+      if (constraints === null || typeof constraints !== 'object' || Array.isArray(constraints)) {
+        return { message: 'Constraints must be one JSON object.', target: 'program-parameter-constraints' };
+      }
+      if (!parameterId.trim()) {
+        return { message: 'Parameter ID is required.', target: 'program-parameter-id' };
+      }
+      return null;
+    } catch (caught) {
+      const message = caught instanceof Error ? caught.message : 'Parameter is invalid.';
+      return {
+        message,
+        target: message.startsWith('Default')
+          ? 'program-parameter-default'
+          : 'program-parameter-constraints',
+      };
+    }
+  };
+  const namespaceIssue = () => namespaceId.trim()
+    ? null
+    : { message: 'Namespace ID is required.', target: 'program-namespace-id' };
+  const keyIssue = (): { message: string; target: string } | null => {
+    try {
+      const fields = parseJson(fieldsText, 'Fields');
+      if (!Array.isArray(fields)) {
+        return { message: 'Fields must be a JSON array.', target: 'program-key-fields' };
+      }
+      if (fields.some((field) =>
+        field === null
+        || typeof field !== 'object'
+        || Array.isArray(field)
+        || typeof (field as Record<string, unknown>).field !== 'string'
+        || typeof (field as Record<string, unknown>).type !== 'string'
+      )) {
+        return {
+          message: 'Every field must contain string field and type values.',
+          target: 'program-key-fields',
+        };
+      }
+      if (!keyName.trim()) {
+        return { message: 'Blackboard key is required.', target: 'program-key-name' };
+      }
+      return null;
+    } catch (caught) {
+      return {
+        message: caught instanceof Error ? caught.message : 'Blackboard key is invalid.',
+        target: 'program-key-fields',
+      };
+    }
+  };
+  const guardCommitKey = (
+    event: KeyboardEvent<HTMLDivElement>,
+    issue: { message: string; target: string } | null,
+  ) => {
+    const target = event.target as HTMLElement;
+    const enterCommit = event.key === 'Enter' && (
+      target.tagName === 'INPUT'
+      || ((event.ctrlKey || event.metaKey) && target.tagName === 'TEXTAREA')
+    );
+    if (event.key !== 'Tab' && !enterCommit) return;
+    if (issue) {
+      event.preventDefault();
+      reportError(issue.message, issue.target);
+      return;
+    }
+    if (enterCommit) {
+      event.preventDefault();
+      target.blur();
+    }
+  };
   const bindingCandidates = useMemo(
     () => selectedParameter
-      ? collectProgramBindingCandidates(root, catalogEntries, selectedParameter)
+      ? collectProgramBindingCandidates(roots, catalogEntries, selectedParameter)
       : [],
-    [catalogEntries, root, selectedParameter],
+    [catalogEntries, roots, selectedParameter],
   );
 
-  const editParameter = (parameter: ProgramParameterDeclaration) => {
+  const editParameter = useCallback((parameter: ProgramParameterDeclaration) => {
     setParameterId(parameter.parameter_id);
     setParameterType(parameter.type);
     setDefaultText(JSON.stringify(parameter.default, null, 2));
     setConstraintsText(JSON.stringify(parameter.constraints ?? {}, null, 2));
     setMutability(parameter.runtime_mutability);
     setParameterDescription(parameter.description ?? '');
-    setError(null);
-  };
+    clearError();
+  }, [clearError]);
 
-  const saveParameter = () => {
+  const saveParameter = (clearAfterSave = true) => {
+    if (!clearAfterSave && selectedParameter && !parameterDirty) return;
     try {
       const defaultValue = parseJson(defaultText, 'Default');
       const constraints = parseJson(constraintsText, 'Constraints');
@@ -140,17 +258,26 @@ export function ProgramDeclarationsEditor({
       onMutate('program_draft_upsert_parameters', {
         parameters: [declaration] as unknown as JsonValue,
       });
-      setParameterId('');
-      setError(null);
+      if (clearAfterSave) setParameterId('');
+      clearError();
     } catch (caught) {
-      setError(caught instanceof Error ? caught.message : 'Parameter is invalid.');
+      const message = caught instanceof Error ? caught.message : 'Parameter is invalid.';
+      reportError(
+        message,
+        message.startsWith('Default')
+          ? 'program-parameter-default'
+          : message.startsWith('Constraints')
+            ? 'program-parameter-constraints'
+            : 'program-parameter-id',
+      );
     }
   };
 
-  const saveNamespace = () => {
+  const saveNamespace = (clearAfterSave = true) => {
+    if (!clearAfterSave && selectedNamespace && !namespaceDirty) return;
     const id = namespaceId.trim();
     if (!id) {
-      setError('Namespace ID is required.');
+      reportError('Namespace ID is required.', 'program-namespace-id');
       return;
     }
     const declaration: BlackboardNamespaceDeclaration = {
@@ -163,19 +290,19 @@ export function ProgramDeclarationsEditor({
     onMutate('blackboard_draft_upsert_namespaces', {
       namespaces: [declaration] as unknown as JsonValue,
     });
-    setNamespaceId('');
-    setError(null);
+    if (clearAfterSave) setNamespaceId('');
+    clearError();
   };
 
-  const editKey = (key: BlackboardKeyDeclaration) => {
+  const editKey = useCallback((key: BlackboardKeyDeclaration) => {
     setKeyName(key.key);
     setKeyType(key.type);
     setKeyAccess(key.access);
     setKeyPersistence(key.persistence);
     setFieldsText(JSON.stringify(key.fields ?? [], null, 2));
     setKeyDescription(key.description ?? '');
-    setError(null);
-  };
+    clearError();
+  }, [clearError]);
 
   useEffect(() => {
     if (selection?.kind === 'parameter') {
@@ -188,18 +315,18 @@ export function ProgramDeclarationsEditor({
         setConstraintsText('{}');
         setMutability('before_run');
         setParameterDescription('');
-        setError(null);
+        clearError();
       }
     } else if (selection?.kind === 'namespace') {
       const namespace = namespaces.find((row) => row.namespace_id === selection.id);
       if (namespace) {
         setNamespaceId(namespace.namespace_id);
         setNamespaceDescription(namespace.description ?? '');
-        setError(null);
+        clearError();
       } else {
         setNamespaceId('');
         setNamespaceDescription('');
-        setError(null);
+        clearError();
       }
     } else if (selection?.kind === 'key') {
       const key = keys.find((row) => row.key === selection.id);
@@ -211,12 +338,13 @@ export function ProgramDeclarationsEditor({
         setKeyPersistence('run');
         setFieldsText('[]');
         setKeyDescription('');
-        setError(null);
+        clearError();
       }
     }
-  }, [keys, namespaces, parameters, selection]);
+  }, [clearError, editKey, editParameter, keys, namespaces, parameters, selection]);
 
-  const saveKey = () => {
+  const saveKey = (clearAfterSave = true) => {
+    if (!clearAfterSave && selectedKey && !keyDirty) return;
     try {
       const parsedFields = parseJson(fieldsText, 'Fields');
       if (!Array.isArray(parsedFields)) throw new Error('Fields must be a JSON array.');
@@ -241,12 +369,21 @@ export function ProgramDeclarationsEditor({
       onMutate('blackboard_draft_upsert_keys', {
         keys: [declaration] as unknown as JsonValue,
       });
-      setKeyName('');
-      setError(null);
+      if (clearAfterSave) setKeyName('');
+      clearError();
     } catch (caught) {
-      setError(caught instanceof Error ? caught.message : 'Blackboard key is invalid.');
+      const message = caught instanceof Error ? caught.message : 'Blackboard key is invalid.';
+      reportError(
+        message,
+        message.startsWith('Fields') ? 'program-key-fields' : 'program-key-name',
+      );
     }
   };
+
+  useEffect(() => {
+    onInvalidEditChange?.(error !== null);
+    return () => onInvalidEditChange?.(false);
+  }, [error, onInvalidEditChange]);
 
   const bindParameter = (nodeId: string, fieldName: string) => {
     if (!selectedParameter) return;
@@ -268,7 +405,7 @@ export function ProgramDeclarationsEditor({
     const entry = node ? catalog.get(node.node_id) : undefined;
     const field = entry?.parameters.find((parameter) => parameter.id === fieldName);
     if (!node || !field) {
-      setError('That declaration usage is not present in the current catalog revision.');
+      reportError('That declaration usage is not present in the current catalog revision.');
       return;
     }
     const fallback = resolveProgramParameterLiteralValue(
@@ -281,7 +418,7 @@ export function ProgramDeclarationsEditor({
       ? field.required ? `${fieldName}: a required field has no valid literal fallback.` : null
       : firstCatalogParameterValidationMessage(field, fallback);
     if (validation) {
-      setError(validation);
+      reportError(validation);
       return;
     }
     const request = buildProgramParameterMutation(
@@ -291,7 +428,22 @@ export function ProgramDeclarationsEditor({
     );
     onMutate(request.mutation, request.args);
     onSelectNode?.(nodeId);
-    setError(null);
+    clearError();
+  };
+
+  const discardInvalidEdit = () => {
+    if (selectedParameter) editParameter(selectedParameter);
+    else if (selectedNamespace) {
+      setNamespaceId(selectedNamespace.namespace_id);
+      setNamespaceDescription(selectedNamespace.description ?? '');
+      clearError();
+    } else if (selectedKey) editKey(selectedKey);
+    else {
+      setParameterId('');
+      setNamespaceId('');
+      setKeyName('');
+      clearError();
+    }
   };
 
   return (
@@ -312,6 +464,28 @@ export function ProgramDeclarationsEditor({
         <div className="program-empty-guidance">
           <strong>Select a declaration</strong>
           <span>Choose an existing source or New in the Params navigator.</span>
+        </div>
+      )}
+      {error && (
+        <div className="program-invalid-edit-strip" role="alert">
+          <span>{error}</span>
+          <button
+            type="button"
+            onClick={() => document.querySelector<HTMLElement>(
+              '.program-declaration-form.has-invalid-edit [aria-invalid="true"]',
+            )?.focus()}
+          >
+            Review
+          </button>
+          <button type="button" onClick={discardInvalidEdit}>Discard edit</button>
+        </div>
+      )}
+      {selectedDiagnostics.length > 0 && (
+        <div className="program-authoring-diagnostics" role="status">
+          <strong>Complete this declaration</strong>
+          {selectedDiagnostics.slice(0, 6).map((diagnostic) => (
+            <span key={`${diagnostic.code}:${diagnostic.path}`}>{diagnostic.message}</span>
+          ))}
         </div>
       )}
       <div className={`program-declaration-columns${showNavigation ? '' : ' contextual'}`}>
@@ -344,14 +518,16 @@ export function ProgramDeclarationsEditor({
               );
             })}
           </ul>}
-          <div className="program-declaration-form">
-            <label>Parameter ID<input value={parameterId} onChange={(event) => setParameterId(event.target.value)} /></label>
+          <div className={`program-declaration-form${error && selection?.kind === 'parameter' ? ' has-invalid-edit' : ''}${selectedDiagnostics.length > 0 && selection?.kind === 'parameter' ? ' has-backend-diagnostic' : ''}`} onKeyDown={(event) => guardCommitKey(event, parameterIssue())} onBlur={() => {
+            if (selectedParameter && !busy) saveParameter(false);
+          }}>
+            <label>Parameter ID<input id="program-parameter-id" value={parameterId} aria-invalid={errorTarget === 'program-parameter-id'} title={errorTarget === 'program-parameter-id' ? error ?? undefined : undefined} onChange={(event) => setParameterId(event.target.value)} /></label>
             <label>Type<select value={parameterType} onChange={(event) => setParameterType(event.target.value)}>{PROGRAM_TYPES.map((type) => <option key={type}>{type}</option>)}</select></label>
             <label>Runtime mutability<select value={mutability} onChange={(event) => setMutability(event.target.value as typeof mutability)}><option value="immutable">immutable</option><option value="before_run">before run</option><option value="between_operations">between operations</option></select></label>
-            <label>Default (strict JSON)<textarea rows={3} value={defaultText} onChange={(event) => setDefaultText(event.target.value)} spellCheck={false} /></label>
-            <label>Constraints (strict JSON)<textarea rows={3} value={constraintsText} onChange={(event) => setConstraintsText(event.target.value)} spellCheck={false} /></label>
+            <label>Default (strict JSON)<textarea id="program-parameter-default" rows={3} value={defaultText} aria-invalid={errorTarget === 'program-parameter-default'} title={errorTarget === 'program-parameter-default' ? error ?? undefined : undefined} onChange={(event) => setDefaultText(event.target.value)} spellCheck={false} /></label>
+            <label>Constraints (strict JSON)<textarea id="program-parameter-constraints" rows={3} value={constraintsText} aria-invalid={errorTarget === 'program-parameter-constraints'} title={errorTarget === 'program-parameter-constraints' ? error ?? undefined : undefined} onChange={(event) => setConstraintsText(event.target.value)} spellCheck={false} /></label>
             <label>Description<input value={parameterDescription} onChange={(event) => setParameterDescription(event.target.value)} /></label>
-            <button type="button" disabled={busy} onClick={saveParameter}>Add or replace parameter</button>
+            {!selectedParameter && <button type="button" disabled={busy} onClick={() => saveParameter()}>Add parameter</button>}
             {!showNavigation && selectedParameter && (
               <button
                 type="button"
@@ -424,10 +600,12 @@ export function ProgramDeclarationsEditor({
               );
             })}
           </ul>}
-          <div className="program-declaration-form compact">
-            <label>Namespace ID<input value={namespaceId} onChange={(event) => setNamespaceId(event.target.value)} /></label>
+          <div className={`program-declaration-form compact${error && selection?.kind === 'namespace' ? ' has-invalid-edit' : ''}${selectedDiagnostics.length > 0 && selection?.kind === 'namespace' ? ' has-backend-diagnostic' : ''}`} onKeyDown={(event) => guardCommitKey(event, namespaceIssue())} onBlur={() => {
+            if (selectedNamespace && !busy) saveNamespace(false);
+          }}>
+            <label>Namespace ID<input id="program-namespace-id" value={namespaceId} aria-invalid={errorTarget === 'program-namespace-id'} title={errorTarget === 'program-namespace-id' ? error ?? undefined : undefined} onChange={(event) => setNamespaceId(event.target.value)} /></label>
             <label>Description<input value={namespaceDescription} onChange={(event) => setNamespaceDescription(event.target.value)} /></label>
-            <button type="button" disabled={busy} onClick={saveNamespace}>Add or replace namespace</button>
+            {!selectedNamespace && <button type="button" disabled={busy} onClick={() => saveNamespace()}>Add namespace</button>}
             {!showNavigation && selectedNamespace && (
               <button
                 type="button"
@@ -475,14 +653,16 @@ export function ProgramDeclarationsEditor({
               );
             })}
           </ul>}
-          <div className="program-declaration-form">
-            <label>Fully-qualified key<input value={keyName} onChange={(event) => setKeyName(event.target.value)} placeholder="namespace.key" /></label>
+          <div className={`program-declaration-form${error && selection?.kind === 'key' ? ' has-invalid-edit' : ''}${selectedDiagnostics.length > 0 && selection?.kind === 'key' ? ' has-backend-diagnostic' : ''}`} onKeyDown={(event) => guardCommitKey(event, keyIssue())} onBlur={() => {
+            if (selectedKey && !busy) saveKey(false);
+          }}>
+            <label>Fully-qualified key<input id="program-key-name" value={keyName} aria-invalid={errorTarget === 'program-key-name'} title={errorTarget === 'program-key-name' ? error ?? undefined : undefined} onChange={(event) => setKeyName(event.target.value)} placeholder="namespace.key" /></label>
             <label>Type<input value={keyType} onChange={(event) => setKeyType(event.target.value)} /></label>
             <label>Access<select value={keyAccess} onChange={(event) => setKeyAccess(event.target.value as typeof keyAccess)}><option value="read">read</option><option value="write">write</option><option value="read_write">read/write</option></select></label>
             <label>Persistence<select value={keyPersistence} onChange={(event) => setKeyPersistence(event.target.value as typeof keyPersistence)}><option value="node">node</option><option value="run">run</option><option value="persistent">persistent</option></select></label>
-            <label>Fields (strict JSON array)<textarea rows={3} value={fieldsText} onChange={(event) => setFieldsText(event.target.value)} spellCheck={false} /></label>
+            <label>Fields (strict JSON array)<textarea id="program-key-fields" rows={3} value={fieldsText} aria-invalid={errorTarget === 'program-key-fields'} title={errorTarget === 'program-key-fields' ? error ?? undefined : undefined} onChange={(event) => setFieldsText(event.target.value)} spellCheck={false} /></label>
             <label>Description<input value={keyDescription} onChange={(event) => setKeyDescription(event.target.value)} /></label>
-            <button type="button" disabled={busy} onClick={saveKey}>Add or replace key</button>
+            {!selectedKey && <button type="button" disabled={busy} onClick={() => saveKey()}>Add key</button>}
             {!showNavigation && selectedKey && (
               <button
                 type="button"
@@ -516,7 +696,6 @@ export function ProgramDeclarationsEditor({
           </>}
         </section>}
       </div>
-      {error && <p className="program-form-error declaration-error" role="alert">{error}</p>}
     </section>
   );
 }

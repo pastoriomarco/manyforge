@@ -150,6 +150,9 @@ def test_composer_forwards_exact_owner_context_without_owning_request_state(
     assert forwarded["modeProjection"] == mode.payload
     assert forwarded["composerDraft"]["draftId"] == state.draft_session.draft_id
     assert forwarded["composerDraft"]["programLoaded"] is False
+    assert forwarded["composerDraft"]["authoring"] is None
+    assert forwarded["composerDraft"]["candidateAvailable"] is False
+    assert forwarded["composerDraft"]["diagnostics"] == []
     assert forwarded["composerDraft"]["expectedAdmissionGeneration"] == 7
     assert set(forwarded["resolvedCatalog"]) == {
         "catalogHash",

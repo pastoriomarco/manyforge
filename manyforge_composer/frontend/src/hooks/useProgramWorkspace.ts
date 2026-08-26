@@ -5,7 +5,6 @@ import { errorMessage } from '../state/structuralResource';
 import {
   INITIAL_PROGRAM_WORKSPACE_STATE,
   programWorkspaceReducer,
-  replaceProgramWorkspaceDraft,
   type ProgramWorkspaceActionName,
 } from '../state/programWorkspace';
 import type {
@@ -14,15 +13,11 @@ import type {
   ProgramNodeRecoveryPolicy,
   ProgramOperatorStopPolicy,
   ProgramWorkspaceResponse,
-  ProgramNodePolicyMutationResponse,
   ProgramWorkspaceTransitionResponse,
   ProgramWorkspaceTransitionStatus,
 } from '../types/api';
 import type { ComposerHeadlessState } from '../types/headless';
 import { browserStableIdentity } from './useHeadlessState';
-
-const POLICY_REFRESH_FAILURE =
-  'Draft updated; workspace status refresh failed. Your Draft change remains; retry refresh.';
 
 function identity(prefix: string): string {
   const random = globalThis.crypto?.randomUUID?.()
@@ -228,7 +223,7 @@ export function useProgramWorkspace(snapshot: ComposerHeadlessState | null = nul
     void run(
       'mutate',
       () => api.programWorkspace.mutate(requestFence, mutation, args)
-        .then((response) => workspaceResult(response.workspace, 'Draft updated.')),
+        .then((response) => workspaceResult(response.workspace, null)),
     );
   }, [requireWorkspace, run, snapshot]);
 
@@ -365,70 +360,13 @@ export function useProgramWorkspace(snapshot: ComposerHeadlessState | null = nul
     recoveryPolicy: ProgramNodeRecoveryPolicy,
     operatorStopPolicy: ProgramOperatorStopPolicy,
   ) => {
-    const workspace = requireWorkspace();
-    const expectedProgramRevision = workspace?.draft.programRevision;
-    const requestFence = workspace
-      ? fence(workspace, snapshot, requestOwnerEpoch.current) : null;
-    if (!workspace || !workspace.draft.programLoaded || !expectedProgramRevision || !requestFence) return;
-
-    const current = generation.current + 1;
-    generation.current = current;
-    dispatch({ type: 'request_started', generation: current, action: 'update_policies' });
-    void (async () => {
-      let response: ProgramNodePolicyMutationResponse;
-      try {
-        response = await api.programWorkspace.updateNodePolicies(
-          requestFence,
-          expectedProgramRevision,
-          instanceId,
-          modificationPolicy,
-          recoveryPolicy,
-          operatorStopPolicy,
-        );
-      } catch (error: unknown) {
-        if (mounted.current && generation.current === current) {
-          dispatch({
-            type: 'request_failed',
-            generation: current,
-            error: `${errorMessage(error, 'Draft policy update failed.')} Refresh workspace before retrying.`,
-          });
-        }
-        return;
-      }
-      if (!mounted.current || generation.current !== current) return;
-
-      const revisionMessage = response.draft.draftRevision === workspace.draft.draftRevision
-        ? `Draft policy unchanged; Draft revision ${response.draft.draftRevision} (no-op).`
-        : `Draft updated; Draft revision ${response.draft.draftRevision}.`;
-      dispatch({
-        type: 'policy_mutation_succeeded',
-        generation: current,
-        workspace: replaceProgramWorkspaceDraft(workspace, response.draft),
-        message: `${revisionMessage} Workspace owner status is refreshing.`,
-      });
-
-      try {
-        const refreshed = await readWorkspace(current);
-        if (mounted.current && generation.current === current) {
-          dispatch({
-            type: 'request_succeeded',
-            generation: current,
-            workspace: refreshed,
-            message: revisionMessage,
-            transitionStatus: null,
-          });
-        }
-      } catch {
-        if (mounted.current && generation.current === current) {
-          dispatch({
-            type: 'workspace_refresh_failed',
-            generation: current,
-            warning: POLICY_REFRESH_FAILURE,
-          });
-        }
-      }
-    })();
-  }, [readWorkspace, requireWorkspace, snapshot]);
+    mutate('program_draft_update_node_policies', {
+      instance_id: instanceId,
+      modification_policy: modificationPolicy as unknown as JsonValue,
+      recovery_policy: recoveryPolicy as unknown as JsonValue,
+      operator_stop_policy: operatorStopPolicy,
+    });
+  }, [mutate]);
 
   return {
     state,

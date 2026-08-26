@@ -35,6 +35,7 @@ import type {
 } from '../types/api';
 import {
   authoringMoveIntent,
+  authoringSiblingInsertionIndex,
   type AuthoringGraphEdge,
   type AuthoringGraphNode,
   layoutAuthoringGraph,
@@ -42,16 +43,15 @@ import {
   validateAuthoringDeletion,
 } from '../utils/authoringGraph';
 import {
-  flattenProgramTree,
+  flattenProgramForest,
 } from '../utils/programAuthoring';
 import {
   isProgramCanvasFormTarget,
   programCanvasKeyIntent,
   programDeleteMutation,
+  programDetachedInsertionMutation,
   programMoveMutation,
   readProgramPaletteDrag,
-  stageProgramCanvasDrop,
-  type ProgramInsertionRequest,
 } from '../utils/programCanvasInteraction';
 import { BtNode, type BtNodePresentation } from './BtNode';
 import { CanvasViewControls } from './CanvasViewControls';
@@ -81,14 +81,15 @@ type ProgramFlowEdge = Edge<ProgramFlowEdgeData, 'statusEdge'>;
 type ProgramEdgeStyle = 'smoothstep' | 'simplebezier' | 'default' | 'straight' | 'step';
 
 interface ProgramTreeCanvasProps {
-  root: ProgramTreeNode;
+  roots: ProgramTreeNode[];
+  retainedPositions: Record<string, { x: number; y: number }>;
   catalogEntries: CatalogEntry[];
   environment: NodeEnvironmentResponse | null;
   selectedId: string | null;
+  invalidNodeIds: ReadonlySet<string>;
   busy: boolean;
   onSelect: (instanceId: string | null) => void;
   onMutate: (mutation: string, args: Record<string, JsonValue>) => void;
-  onStageInsert?: (request: ProgramInsertionRequest) => void;
 }
 
 function ProgramFlowNode({ data, selected }: NodeProps<ProgramFlowNode>) {
@@ -146,14 +147,15 @@ const EDGE_TYPES: EdgeTypes = { statusEdge: ProgramStatusEdge };
 type CanvasMessageKind = 'info' | 'error';
 
 export function ProgramTreeCanvas({
-  root,
+  roots,
+  retainedPositions,
   catalogEntries,
   environment,
   selectedId,
+  invalidNodeIds,
   busy,
   onSelect,
   onMutate,
-  onStageInsert,
 }: ProgramTreeCanvasProps) {
   const [view, dispatchView] = useComposerViewState();
   const [presentationPositions, setPresentationPositions] = useState<
@@ -167,7 +169,6 @@ export function ProgramTreeCanvas({
   const [canvasMessageKind, setCanvasMessageKind] = useState<CanvasMessageKind>('info');
   const flowInstance = useRef<ReactFlowInstance<ProgramFlowNode, ProgramFlowEdge> | null>(null);
   const nodeElements = useRef<Record<string, HTMLDivElement | null>>({});
-  const dropRequestId = useRef(0);
   const pendingPositionChanges = useRef<Record<string, XYPosition>>({});
   const positionFrame = useRef<number | null>(null);
   const showCanvasMessage = useCallback((message: string, kind: CanvasMessageKind) => {
@@ -188,7 +189,7 @@ export function ProgramTreeCanvas({
       globalThis.cancelAnimationFrame(positionFrame.current);
     }
   }, []);
-  const flat = useMemo(() => flattenProgramTree(root), [root]);
+  const flat = useMemo(() => flattenProgramForest(roots), [roots]);
   const catalog = useMemo(
     () => new Map(catalogEntries.map((entry) => [entry.id, entry])),
     [catalogEntries],
@@ -214,10 +215,10 @@ export function ProgramTreeCanvas({
       .map((row) => ({ source: row.parentId as string, target: row.node.instance_id })),
     [flat],
   );
+  const graphDirection = view.layoutDirection === 'vertical'
+    ? 'horizontal'
+    : 'vertical';
   const laidOut = useMemo(() => {
-    const graphDirection = view.layoutDirection === 'vertical'
-      ? 'horizontal'
-      : 'vertical';
     const seeds: AuthoringGraphNode[] = flat.map((row, order) => ({
       id: row.node.instance_id,
       label: row.node.instance_id,
@@ -244,7 +245,7 @@ export function ProgramTreeCanvas({
         y: node.position.y - minY + STAGE_PADDING,
       },
     }));
-  }, [catalog, edges, flat, view.layoutDirection]);
+  }, [catalog, edges, flat, graphDirection]);
   const topologyKey = useMemo(
     () => flat.map((row) => [
       row.node.instance_id,
@@ -258,9 +259,7 @@ export function ProgramTreeCanvas({
   const authoringDisabled = busy || environment?.portableAuthoringAvailable !== true;
 
   useEffect(() => {
-    // Positions are disposable presentation state. A changed owner topology
-    // always starts from the same deterministic projection.
-    setPresentationPositions({});
+    setPresentationPositions(retainedPositions);
     setNodeMeasurements((current) => {
       const retainedIds = new Set(flat.map((row) => row.node.instance_id));
       const retained = Object.fromEntries(
@@ -270,7 +269,7 @@ export function ProgramTreeCanvas({
         ? current
         : retained;
     });
-  }, [flat, topologyKey, view.layoutDirection]);
+  }, [flat, retainedPositions, topologyKey, view.layoutDirection]);
 
   const registerElement = useCallback((id: string, element: HTMLDivElement | null) => {
     nodeElements.current[id] = element;
@@ -284,25 +283,20 @@ export function ProgramTreeCanvas({
       ||
       authoringDisabled
       || selectedRow === null
-      || selectedRow.parentId === null
     ) return;
     event?.preventDefault();
     event?.stopPropagation();
     const validationError = validateAuthoringDeletion(
       laidOut,
-      edges,
       selectedRow.node.instance_id,
     );
     if (validationError) {
       showCanvasMessage(validationError, 'error');
       return;
     }
-    const mutation = programDeleteMutation(
-      selectedRow.node.instance_id,
-      selectedRow.parentId === null,
-    );
-    if (mutation) onMutate(mutation.mutation, mutation.args);
-  }, [authoringDisabled, edges, laidOut, onMutate, selectedRow, showCanvasMessage]);
+    const mutation = programDeleteMutation(selectedRow.node.instance_id);
+    onMutate(mutation.mutation, mutation.args);
+  }, [authoringDisabled, laidOut, onMutate, selectedRow, showCanvasMessage]);
 
   const onNodeDelete = useCallback((
     event: KeyboardEvent<HTMLDivElement>,
@@ -336,7 +330,7 @@ export function ProgramTreeCanvas({
       return {
         id: node.id,
         type: 'programNode',
-        position: presentationPositions[node.id] ?? node.position,
+        position: presentationPositions[node.id] ?? retainedPositions[node.id] ?? node.position,
         draggable: true,
         selectable: false,
         width: NODE_WIDTH,
@@ -359,6 +353,7 @@ export function ProgramTreeCanvas({
             selected: selectedId === node.id,
             layoutDirection: view.layoutDirection,
             executionAvailable: nodeAvailability?.execution ?? false,
+            invalid: invalidNodeIds.has(node.id),
           },
           onSelect,
           onFocus: setFocusedNodeId,
@@ -373,11 +368,13 @@ export function ProgramTreeCanvas({
       catalog,
       flatById,
       laidOut,
+      invalidNodeIds,
       onNodeNavigate,
       onNodeDelete,
       onSelect,
       nodeMeasurements,
       presentationPositions,
+      retainedPositions,
       registerElement,
       selectedId,
       view.layoutDirection,
@@ -462,34 +459,36 @@ export function ProgramTreeCanvas({
     delete pendingPositionChanges.current[node.id];
     setPresentationPositions((current) => ({ ...current, [node.id]: node.position }));
     if (authoringDisabled) return;
-    const center = {
-      x: node.position.x + NODE_WIDTH / 2,
-      y: node.position.y + NODE_HEIGHT / 2,
-    };
-    const target = graphNodes.find((candidate) => (
-      candidate.id !== node.id
-      && center.x >= candidate.position.x
-      && center.x <= candidate.position.x + NODE_WIDTH
-      && center.y >= candidate.position.y
-      && center.y <= candidate.position.y + NODE_HEIGHT
-    ));
-    if (!target) return;
-    const result = authoringMoveIntent(laidOut, edges, target.id, node.id);
-    if (result.error || !result.intent) {
-      showCanvasMessage(result.error ?? 'That structural drop is not valid.', 'error');
-      return;
+    const row = flatById.get(node.id);
+    const nextPositions = new Map(positions);
+    nextPositions.set(node.id, node.position);
+    if (row?.parentId !== null && row?.parentId !== undefined) {
+      const displayedNodes = graphNodes.map((candidate) => ({
+        ...candidate,
+        position: nextPositions.get(candidate.id) ?? candidate.position,
+      }));
+      const index = authoringSiblingInsertionIndex(
+        displayedNodes,
+        edges,
+        row.parentId,
+        node.id,
+        graphDirection,
+      );
+      if (index !== null && index !== row.index) {
+        const mutation = programMoveMutation(
+          node.id,
+          row.parentId,
+          index,
+          Object.fromEntries(nextPositions),
+        );
+        onMutate(mutation.mutation, mutation.args);
+        return;
+      }
     }
-    const mutation = programMoveMutation(
-      result.intent.instance_id,
-      result.intent.new_parent_instance_id,
-      result.intent.index,
-    );
-    onMutate(mutation.mutation, mutation.args);
-    showCanvasMessage(
-      `Moving ${node.id} under ${target.id}. The owner response will refresh the tree.`,
-      'info',
-    );
-  }, [authoringDisabled, edges, graphNodes, laidOut, onMutate, showCanvasMessage]);
+    onMutate('tree_draft_update_positions', {
+      positions: { [node.id]: { x: node.position.x, y: node.position.y } },
+    });
+  }, [authoringDisabled, edges, flatById, graphDirection, graphNodes, onMutate, positions]);
 
   const onConnect = useCallback((connection: Connection) => {
     if (authoringDisabled) {
@@ -507,13 +506,45 @@ export function ProgramTreeCanvas({
       return;
     }
     clearCanvasMessage();
+    const parentId = result.intent.new_parent_instance_id;
+    const index = parentId === null
+      ? result.intent.index
+      : authoringSiblingInsertionIndex(
+        graphNodes,
+        edges,
+        parentId,
+        result.intent.instance_id,
+        graphDirection,
+      ) ?? result.intent.index;
     const mutation = programMoveMutation(
       result.intent.instance_id,
-      result.intent.new_parent_instance_id,
-      result.intent.index,
+      parentId,
+      index,
+      Object.fromEntries(positions),
     );
     onMutate(mutation.mutation, mutation.args);
-  }, [authoringDisabled, clearCanvasMessage, edges, laidOut, onMutate, showCanvasMessage]);
+  }, [
+    authoringDisabled,
+    clearCanvasMessage,
+    edges,
+    graphDirection,
+    graphNodes,
+    laidOut,
+    onMutate,
+    positions,
+    showCanvasMessage,
+  ]);
+
+  const detachEdge = useCallback((edge: ProgramFlowEdge) => {
+    if (authoringDisabled) return;
+    const mutation = programMoveMutation(
+      edge.target,
+      null,
+      roots.length,
+      Object.fromEntries(positions),
+    );
+    onMutate(mutation.mutation, mutation.args);
+  }, [authoringDisabled, onMutate, positions, roots.length]);
 
   const onDragOver = useCallback((event: DragEvent) => {
     if (authoringDisabled) return;
@@ -528,38 +559,31 @@ export function ProgramTreeCanvas({
     const flow = flowInstance.current;
     if (!catalogId || !flow) return;
     const point = flow.screenToFlowPosition({ x: event.clientX, y: event.clientY });
-    const target = graphNodes.find((node) => (
-      point.x >= node.position.x
-      && point.x <= node.position.x + NODE_WIDTH
-      && point.y >= node.position.y
-      && point.y <= node.position.y + NODE_HEIGHT
-    ));
-    if (!target) {
-      showCanvasMessage('Drop a palette node on a concrete tree node to choose its insertion target.', 'error');
+    const entry = catalogEntries.find((candidate) => candidate.id === catalogId);
+    if (!entry) {
+      showCanvasMessage(`Unknown catalog entry '${catalogId}'.`, 'error');
       return;
     }
-    const staged = stageProgramCanvasDrop(
-      root,
-      catalogEntries,
-      catalogId,
-      target.id,
-      dropRequestId.current + 1,
+    const mutation = programDetachedInsertionMutation(
+      entry,
+      flat.map((row) => row.node.instance_id),
+      roots.length,
+      point,
     );
-    if (!staged.request) {
-      showCanvasMessage(staged.error ?? 'That drop cannot be staged.', 'error');
-      return;
-    }
-    onSelect(target.id);
-    dropRequestId.current = staged.request.requestId;
-    onStageInsert?.(staged.request);
-    showCanvasMessage('Insertion staged. Review the instance ID and parameters, then choose Add to Draft.', 'info');
+    onMutate(mutation.mutation, mutation.args);
+    const instanceId = String(
+      (mutation.args.node as Record<string, JsonValue>).instance_id,
+    );
+    onSelect(instanceId);
+    clearCanvasMessage();
   }, [
     authoringDisabled,
     catalogEntries,
-    graphNodes,
+    clearCanvasMessage,
+    flat,
+    onMutate,
     onSelect,
-    onStageInsert,
-    root,
+    roots.length,
     showCanvasMessage,
   ]);
 
@@ -567,15 +591,16 @@ export function ProgramTreeCanvas({
     flowInstance.current?.fitView({ padding: 0.2, duration: 180 });
   }, []);
   const autoLayout = useCallback(() => {
-    setPresentationPositions({});
-    showCanvasMessage('Layout refreshed. Dragged positions affect only this view.', 'info');
+    const nextPositions = Object.fromEntries(
+      laidOut.map((node) => [node.id, node.position]),
+    );
+    setPresentationPositions(nextPositions);
+    if (!authoringDisabled) {
+      onMutate('tree_draft_update_positions', { positions: nextPositions });
+    }
+    showCanvasMessage('Layout refreshed.', 'info');
     requestAnimationFrame(fitView);
-  }, [fitView, showCanvasMessage]);
-
-  useEffect(() => {
-    if (!flowInstance.current) return;
-    requestAnimationFrame(fitView);
-  }, [fitView, topologyKey, view.layoutDirection]);
+  }, [authoringDisabled, fitView, laidOut, onMutate, showCanvasMessage]);
 
   const parentOptions = selectedRow === null || selectedRow.parentId === null
     ? []
@@ -620,7 +645,7 @@ export function ProgramTreeCanvas({
           type="button"
           className="icon-button program-canvas-help"
           aria-label="Program canvas keyboard help"
-          title="Focus a node, use arrow keys to navigate, Enter or Space to select, and Delete or Backspace to remove a selected non-root node."
+          title="Focus a node, use arrow keys to navigate, Enter or Space to select, and Delete or Backspace to remove it. Double-click a link, or select it and press Delete, to detach it."
         >
           ?
         </button>
@@ -648,6 +673,15 @@ export function ProgramTreeCanvas({
           onNodesChange={onNodesChange}
           onNodeDragStop={onNodeDragStop}
           onConnect={onConnect}
+          onEdgesDelete={(deletedEdges) => {
+            const edge = deletedEdges[0];
+            if (edge) detachEdge(edge);
+          }}
+          onEdgeDoubleClick={(event, edge) => {
+            event.preventDefault();
+            event.stopPropagation();
+            detachEdge(edge);
+          }}
           onPaneClick={() => {
             setFocusedNodeId(null);
             onSelect(null);
@@ -662,12 +696,14 @@ export function ProgramTreeCanvas({
           nodesConnectable={!authoringDisabled}
           elementsSelectable
           nodesFocusable={false}
-          deleteKeyCode={null}
+          deleteKeyCode={['Backspace', 'Delete']}
+          multiSelectionKeyCode={null}
           minZoom={0.1}
           maxZoom={2}
           panOnDrag
           zoomOnScroll
           zoomOnPinch
+          zoomOnDoubleClick={false}
           fitView
           proOptions={{ hideAttribution: true }}
         >

@@ -10,10 +10,6 @@ import threading
 import uuid
 from typing import Any, Callable, NoReturn
 
-from manyforge_behavior.canonical_artifact import (
-    StrictArtifactError,
-    compute_content_identity,
-)
 from manyforge_behavior.catalog import NodeCatalog
 from manyforge_behavior.geometry import (
     GeometryError,
@@ -29,11 +25,18 @@ from manyforge_behavior.program import (
     merge_param_patch,
 )
 
+from .authoring_forest import (
+    AUTHORING_FOREST_VERSION,
+    AuthoringForestError,
+    derive_candidate,
+    empty_authoring,
+    from_program,
+)
 
-_DRAFT_API_VERSION = "manyforge.composer_draft.v1"
-_WORKSPACE_API_VERSION = "manyforge.composer_program_workspace.v1"
-_RETAINED_STATE_API_VERSION = "manyforge.composer_retained_draft.v1"
-_PROGRAM_API_VERSION = "manyforge.program.v1"
+
+_DRAFT_API_VERSION = "manyforge.composer_draft.v2"
+_WORKSPACE_API_VERSION = "manyforge.composer_program_workspace.v2"
+_RETAINED_STATE_API_VERSION = "manyforge.composer_retained_draft.v2"
 _MAXIMUM_DRAFT_REVISION = 9_007_199_254_740_991
 _ROOT_ALIAS = "@root"
 SUPPORTED_DRAFT_MUTATIONS = (
@@ -61,7 +64,6 @@ OPERATOR_DRAFT_MUTATIONS = (
     "viewer_draft_replace",
 )
 _NODE_POLICY_MUTATION = "program_draft_update_node_policies"
-_PROGRAM_REVISION_PATTERN = re.compile(r"^sha256:[0-9a-f]{64}$")
 _PORTABLE_ID_PATTERN = re.compile(r"^[a-z][a-z0-9_.-]*$")
 _PORTABLE_ID_MAX_BYTES = 128
 _SKILL_REFERENT_UNAVAILABLE_MESSAGE = (
@@ -187,24 +189,17 @@ def _error(
     )
 
 
-def _identified(document: dict[str, Any]) -> dict[str, Any]:
-    candidate = deepcopy(document)
-    candidate["program_revision"] = compute_content_identity(
-        candidate,
-        own_field="program_revision",
-        identity_domain="program-revision",
-        api_version=_PROGRAM_API_VERSION,
-    )
-    return candidate
-
-
 def _tree_ref(
-    root: dict[str, Any],
+    roots: list[dict[str, Any]],
     instance_id: str,
 ) -> tuple[dict[str, Any], dict[str, Any] | None, int | None] | None:
-    target = root.get("instance_id") if instance_id == _ROOT_ALIAS else instance_id
+    target = (
+        roots[0].get("instance_id")
+        if instance_id == _ROOT_ALIAS and len(roots) == 1
+        else instance_id
+    )
     pending: list[tuple[dict[str, Any], dict[str, Any] | None, int | None]] = [
-        (root, None, None)
+        (root, None, index) for index, root in reversed(list(enumerate(roots)))
     ]
     while pending:
         node, parent, index = pending.pop()
@@ -219,9 +214,9 @@ def _tree_ref(
     return None
 
 
-def _tree_ids(root: dict[str, Any]) -> list[str]:
+def _tree_ids(roots: list[dict[str, Any]]) -> list[str]:
     result: list[str] = []
-    pending = [root]
+    pending = list(reversed(roots))
     while pending:
         node = pending.pop()
         instance_id = node.get("instance_id")
@@ -236,7 +231,7 @@ def _tree_ids(root: dict[str, Any]) -> list[str]:
 
 
 def _lookup(
-    tree: dict[str, Any],
+    tree: list[dict[str, Any]],
     instance_id: str,
     *,
     label: str,
@@ -257,7 +252,7 @@ def _lookup(
 
 
 def _lookup_exact_instance(
-    tree: dict[str, Any],
+    tree: list[dict[str, Any]],
     instance_id: str,
 ) -> dict[str, Any]:
     """Resolve one authored instance, without accepting the root alias."""
@@ -274,7 +269,7 @@ def _lookup_exact_instance(
             status_code=409,
         )
     matches: list[dict[str, Any]] = []
-    pending = [tree]
+    pending = list(reversed(tree))
     while pending:
         node = pending.pop()
         if node.get("instance_id") == instance_id:
@@ -304,9 +299,8 @@ def _lookup_exact_instance(
 
 def _node_policy_arguments(
     arguments: dict[str, Any],
-) -> tuple[str, str, dict[str, str], dict[str, Any], str]:
+) -> tuple[str, dict[str, str], dict[str, Any], str]:
     expected_fields = {
-        "expected_program_revision",
         "instance_id",
         "modification_policy",
         "recovery_policy",
@@ -319,15 +313,6 @@ def _node_policy_arguments(
             f"{sorted(expected_fields)}",
         )
 
-    expected_program_revision = arguments["expected_program_revision"]
-    if (
-        type(expected_program_revision) is not str
-        or _PROGRAM_REVISION_PATTERN.fullmatch(expected_program_revision) is None
-    ):
-        _error(
-            "draft_arguments_invalid",
-            "expected_program_revision must be an exact SHA-256 identity",
-        )
     instance_id = arguments["instance_id"]
     if (
         type(instance_id) is not str
@@ -428,6 +413,33 @@ def _node_policy_arguments(
             "recovery_policy.persistence_ceiling is invalid",
         )
 
+    action_set = set(actions)
+    if recovery["allow_intervention"] != ("intervention" in action_set):
+        _error(
+            "composer_draft_validation_failed",
+            "recovery_policy.allow_intervention must match the intervention action",
+        )
+    if "runtime_override" in action_set and modification["runtime_override"] == "forbidden":
+        _error(
+            "composer_draft_validation_failed",
+            "runtime_override recovery requires permitted runtime override modification",
+        )
+    if persistence == "runtime_override" and modification["runtime_override"] == "forbidden":
+        _error(
+            "composer_draft_validation_failed",
+            "runtime_override persistence requires permitted runtime override modification",
+        )
+    if persistence == "draft_patch" and modification["persistent_edit"] == "forbidden":
+        _error(
+            "composer_draft_validation_failed",
+            "draft_patch persistence requires permitted persistent edit modification",
+        )
+    if recovery != _DEFAULT_RECOVERY_POLICY and not action_set:
+        _error(
+            "composer_draft_validation_failed",
+            "non-default recovery policy requires at least one recovery action",
+        )
+
     operator_stop = arguments["operator_stop_policy"]
     if (
         type(operator_stop) is not str
@@ -438,7 +450,6 @@ def _node_policy_arguments(
             "operator_stop_policy must be inherit, hold, or continue",
         )
     return (
-        expected_program_revision,
         instance_id,
         deepcopy(modification),
         deepcopy(recovery),
@@ -457,7 +468,7 @@ def _insert_index(arguments: dict[str, Any], child_count: int) -> int:
 
 
 def _contains_instance(root: dict[str, Any], instance_id: str) -> bool:
-    return _tree_ref(root, instance_id) is not None
+    return _tree_ref([root], instance_id) is not None
 
 
 def _absolute_orientation(pose: dict[str, Any]) -> list[float]:
@@ -653,7 +664,7 @@ def _merge_pose_authoring_patch(
 
 
 class ComposerDraftSession:
-    """Own exactly one validated in-memory Program Draft."""
+    """Own one retained authoring forest and its optional strict Program."""
 
     def __init__(
         self,
@@ -668,7 +679,9 @@ class ComposerDraftSession:
         )
         self._lock = threading.RLock()
         self._draft_id = f"draft-{uuid.uuid4().hex}"
+        self._authoring = from_program(program) if program is not None else None
         self._program = program
+        self._diagnostics: list[dict[str, str]] = []
         self._revision = 1 if program is not None else 0
         self._saved_path = resolved_source
         self._saved_program_revision = (
@@ -690,7 +703,7 @@ class ComposerDraftSession:
     @property
     def program_loaded(self) -> bool:
         with self._lock:
-            return self._program is not None
+            return self._authoring is not None
 
     def retained_state(self) -> dict[str, Any]:
         """Return the complete bounded local owner state needed after restart."""
@@ -700,9 +713,11 @@ class ComposerDraftSession:
                 "schema_version": _RETAINED_STATE_API_VERSION,
                 "draft_id": self._draft_id,
                 "draft_revision": self._revision,
+                "authoring": deepcopy(self._authoring),
                 "program": (
                     self._program.to_dict() if self._program is not None else None
                 ),
+                "diagnostics": deepcopy(self._diagnostics),
                 "saved_path": self._saved_path,
                 "saved_program_revision": self._saved_program_revision,
                 "saved_document": deepcopy(self._saved_document),
@@ -717,7 +732,9 @@ class ComposerDraftSession:
             "schema_version",
             "draft_id",
             "draft_revision",
+            "authoring",
             "program",
+            "diagnostics",
             "saved_path",
             "saved_program_revision",
             "saved_document",
@@ -730,7 +747,9 @@ class ComposerDraftSession:
             )
         draft_id = state["draft_id"]
         revision = state["draft_revision"]
+        authoring = state["authoring"]
         document = state["program"]
+        diagnostics = state["diagnostics"]
         saved_path = state["saved_path"]
         saved_revision = state["saved_program_revision"]
         saved_document = state["saved_document"]
@@ -740,7 +759,8 @@ class ComposerDraftSession:
             or not draft_id
             or type(revision) is not int
             or not 0 <= revision <= _MAXIMUM_DRAFT_REVISION
-            or (document is None) != (revision == 0)
+            or (authoring is None) != (revision == 0)
+            or type(diagnostics) is not list
             or (saved_path is None)
             != (saved_revision is None or saved_document is None)
             or (saved_revision is None) != (saved_document is None)
@@ -751,17 +771,33 @@ class ComposerDraftSession:
                 status_code=503,
             )
         program: Program | None = None
-        if document is not None:
+        normalized_diagnostics: list[dict[str, str]] = []
+        if authoring is not None:
             try:
-                program = Program.from_dict(
-                    deepcopy(document), catalog, path="<composer-retained-draft>"
+                program, normalized_diagnostics = derive_candidate(
+                    deepcopy(authoring), catalog
                 )
-            except ProgramValidationError as error:
+            except AuthoringForestError as error:
                 _error(
                     "composer_retained_draft_invalid",
-                    f"retained Composer Draft is invalid: {error}",
+                    f"retained Composer authoring forest is invalid: {error}",
                     status_code=503,
                 )
+            if (
+                (program.to_dict() if program is not None else None) != document
+                or normalized_diagnostics != diagnostics
+            ):
+                _error(
+                    "composer_retained_draft_invalid",
+                    "retained Composer candidate or diagnostics are inconsistent",
+                    status_code=503,
+                )
+        elif document is not None or diagnostics:
+            _error(
+                "composer_retained_draft_invalid",
+                "empty retained Composer Draft has candidate state",
+                status_code=503,
+            )
         resolved_saved_path: str | None = None
         if saved_document is not None:
             try:
@@ -793,7 +829,9 @@ class ComposerDraftSession:
         with self._lock:
             self._draft_id = draft_id
             self._revision = revision
+            self._authoring = deepcopy(authoring)
             self._program = program
+            self._diagnostics = normalized_diagnostics
             self._saved_path = resolved_saved_path
             self._saved_program_revision = saved_revision
             self._saved_document = deepcopy(saved_document)
@@ -817,23 +855,34 @@ class ComposerDraftSession:
             )
 
     def validate(self, catalog: NodeCatalog) -> dict[str, Any]:
-        """Revalidate the complete Draft against one exact active catalog."""
+        """Revalidate the authoring source and project diagnostics/candidate."""
 
         with self._lock:
-            if self._program is None:
+            if self._authoring is None:
                 _error(
                     "composer_draft_unavailable",
                     "Composer has no loaded Program Draft",
                     status_code=404,
                 )
-            document = self._program.to_dict()
             try:
-                Program.from_dict(document, catalog, path="<composer-draft>")
-            except ProgramValidationError as error:
+                candidate, diagnostics = derive_candidate(
+                    deepcopy(self._authoring), catalog
+                )
+            except AuthoringForestError as error:
                 _error(
                     "composer_draft_validation_failed",
                     str(error),
-                    detail=str(error),
+                    detail=error.detail,
+                )
+            if (
+                (candidate.to_dict() if candidate is not None else None)
+                != (self._program.to_dict() if self._program is not None else None)
+                or diagnostics != self._diagnostics
+            ):
+                _error(
+                    "composer_draft_validation_failed",
+                    "Composer Draft candidate projection is inconsistent",
+                    status_code=503,
                 )
             return self._snapshot_locked()
 
@@ -844,18 +893,22 @@ class ComposerDraftSession:
             "schema_version": _DRAFT_API_VERSION,
             "draft_id": self._draft_id,
             "draft_revision": self._revision,
-            "program_loaded": program is not None,
+            "program_loaded": self._authoring is not None,
+            "authoring": deepcopy(self._authoring),
+            "candidate_available": program is not None,
             "program_revision": (
                 program.program_revision if program is not None else None
             ),
             "program": program.to_dict() if program is not None else None,
+            "diagnostics": deepcopy(self._diagnostics),
             "saved": matches_saved,
             "applied": False,
         }
 
     def _matches_saved_locked(self) -> bool:
         return (
-            self._program is not None
+            self._authoring is not None
+            and self._program is not None
             and self._saved_program_revision is not None
             and self._program.program_revision == self._saved_program_revision
         )
@@ -869,11 +922,23 @@ class ComposerDraftSession:
         program = self._program
         matches_saved = self._matches_saved_locked()
         program_document = program.to_dict() if program is not None else None
-        applicability = draft_applicability(program_document) if program_document is not None else {
-            "applyReady": True,
-            "affectedInstanceIds": [],
-            "unavailableReason": None,
-        }
+        applicability = (
+            draft_applicability(program_document)
+            if program_document is not None
+            else {
+                "applyReady": False,
+                "affectedInstanceIds": [],
+                "unavailableReason": {
+                    "code": "composer_authoring_draft_incomplete",
+                    "message": (
+                        self._diagnostics[0]["message"]
+                        if self._diagnostics
+                        else "Program Draft has no strict candidate"
+                    ),
+                    "restorationGates": [],
+                },
+            }
+        )
         applied_available = applied_program_revision is not None
         matches_applied = (
             program is not None
@@ -892,11 +957,14 @@ class ComposerDraftSession:
             "draft": {
                 "draftId": self._draft_id,
                 "draftRevision": self._revision,
-                "programLoaded": program is not None,
+                "programLoaded": self._authoring is not None,
+                "authoring": deepcopy(self._authoring),
+                "candidateAvailable": program is not None,
                 "programRevision": (
                     program.program_revision if program is not None else None
                 ),
                 "program": program_document,
+                "diagnostics": deepcopy(self._diagnostics),
             },
             "applicability": applicability,
             "saved": {
@@ -911,9 +979,9 @@ class ComposerDraftSession:
                 "programRevision": applied_program_revision,
                 "unavailableReason": None if applied_available else unavailable_reason,
             },
-            "hasUnsavedChanges": program is not None and not matches_saved,
+            "hasUnsavedChanges": self._authoring is not None and not matches_saved,
             "hasUnappliedChanges": (
-                program is not None and not matches_applied
+                self._authoring is not None and not matches_applied
                 if applied_available
                 else None
             ),
@@ -973,7 +1041,7 @@ class ComposerDraftSession:
                 expected_revision=expected_revision,
             )
             if (
-                self._program is not None
+                self._authoring is not None
                 and not self._matches_saved_locked()
                 and not discard_changes
             ):
@@ -1009,7 +1077,7 @@ class ComposerDraftSession:
                 expected_revision=expected_revision,
             )
             if (
-                self._program is not None
+                self._authoring is not None
                 and not self._matches_saved_locked()
                 and not discard_changes
             ):
@@ -1019,7 +1087,9 @@ class ComposerDraftSession:
                     status_code=409,
                 )
             self._draft_id = f"draft-{uuid.uuid4().hex}"
+            self._authoring = from_program(program)
             self._program = program
+            self._diagnostics = []
             self._revision = 1
             self._saved_path = str(Path(source_path).resolve())
             self._saved_program_revision = program.program_revision
@@ -1042,9 +1112,10 @@ class ComposerDraftSession:
             )
             if self._program is None:
                 _error(
-                    "composer_draft_unavailable",
-                    "Composer has no loaded Program Draft",
-                    status_code=404,
+                    "composer_authoring_draft_incomplete",
+                    "Composer Draft has no strict Program candidate",
+                    status_code=409,
+                    detail={"diagnostics": deepcopy(self._diagnostics)},
                 )
             return applier(self._program)
 
@@ -1065,9 +1136,10 @@ class ComposerDraftSession:
             )
             if self._program is None:
                 _error(
-                    "composer_draft_unavailable",
-                    "Composer has no loaded Program Draft",
-                    status_code=404,
+                    "composer_authoring_draft_incomplete",
+                    "Composer Draft has no strict Program candidate",
+                    status_code=409,
+                    detail={"diagnostics": deepcopy(self._diagnostics)},
                 )
             selected_path = target_path or self._saved_path
             if selected_path is None:
@@ -1090,7 +1162,7 @@ class ComposerDraftSession:
         applied_revision_reader: Callable[[], str | None],
         catalog_reader: Callable[[], NodeCatalog],
     ) -> dict[str, Any]:
-        """Create one fresh, validated minimal Program under the old fence."""
+        """Create one fresh retained empty authoring forest under the old fence."""
 
         with self._lock:
             self._require_identity_locked(
@@ -1098,7 +1170,7 @@ class ComposerDraftSession:
                 expected_revision=expected_revision,
             )
             if (
-                self._program is not None
+                self._authoring is not None
                 and not self._matches_saved_locked()
                 and not confirm_discard
             ):
@@ -1108,10 +1180,13 @@ class ComposerDraftSession:
                     status_code=409,
                 )
             if (
-                self._program is not None
+                self._authoring is not None
                 and not confirm_discard
                 and (applied_revision := applied_revision_reader()) is not None
-                and self._program.program_revision != applied_revision
+                and (
+                    self._program is None
+                    or self._program.program_revision != applied_revision
+                )
             ):
                 _error(
                     "composer_draft_discard_confirmation_required",
@@ -1120,46 +1195,14 @@ class ComposerDraftSession:
                 )
 
             catalog = catalog_reader()
-            document = _identified(
-                {
-                    "api_version": _PROGRAM_API_VERSION,
-                    "program_id": f"program-{uuid.uuid4().hex}",
-                    "program_revision": "sha256:" + ("0" * 64),
-                    "program_profile": "composable-cell-v1",
-                    "name": "Untitled Program",
-                    "catalog": {
-                        "api_version": catalog.api_version,
-                        "content_version": catalog.content_version,
-                    },
-                    "component_roles": {"component": {}},
-                    "target_roles": {},
-                    "tree": {
-                        "node_id": "logic.check_bool",
-                        "instance_id": "root",
-                        "parameters": {
-                            "actual_value": True,
-                            "expected_value": True,
-                        },
-                        "children": [],
-                    },
-                }
-            )
-            try:
-                program = Program.from_dict(
-                    document,
-                    catalog,
-                    path="<composer-new-program>",
-                )
-            except ProgramValidationError as error:
-                _error(
-                    "composer_new_program_validation_failed",
-                    str(error),
-                    status_code=503,
-                    detail=str(error),
-                )
+            authoring = empty_authoring(catalog)
+            program, diagnostics = derive_candidate(authoring, catalog)
+            assert program is None
 
             self._draft_id = f"draft-{uuid.uuid4().hex}"
+            self._authoring = authoring
             self._program = program
+            self._diagnostics = diagnostics
             self._revision = 1
             self._saved_path = None
             self._saved_program_revision = None
@@ -1184,6 +1227,7 @@ class ComposerDraftSession:
             if (
                 self._program is not None
                 and self._program.to_dict() == applied.to_dict()
+                and self._authoring == from_program(applied)
             ):
                 return self._workspace_snapshot_locked(
                     applied_program_revision=applied.program_revision,
@@ -1194,7 +1238,9 @@ class ComposerDraftSession:
                     "Composer Draft revision is exhausted",
                     status_code=503,
                 )
+            self._authoring = from_program(applied)
             self._program = applied
+            self._diagnostics = []
             self._revision += 1
             return self._workspace_snapshot_locked(
                 applied_program_revision=applied.program_revision,
@@ -1223,9 +1269,11 @@ class ComposerDraftSession:
                 )
             saved_document = deepcopy(self._saved_document)
             validated_saved, applied, applied_context = prepare(saved_document)
+            saved_authoring = from_program(validated_saved)
             draft_matches_saved = (
                 self._program is not None
                 and self._program.to_dict() == saved_document
+                and self._authoring == saved_authoring
             )
             applied_matches_saved = applied.to_dict() == saved_document
             if applied_matches_saved:
@@ -1236,7 +1284,9 @@ class ComposerDraftSession:
                             "Composer Draft revision is exhausted",
                             status_code=503,
                         )
+                    self._authoring = saved_authoring
                     self._program = validated_saved
+                    self._diagnostics = []
                     self._revision += 1
                 return None, self._workspace_snapshot_locked(
                     applied_program_revision=validated_saved.program_revision,
@@ -1258,7 +1308,9 @@ class ComposerDraftSession:
                     status_code=502,
                 )
             if not draft_matches_saved:
+                self._authoring = saved_authoring
                 self._program = validated_saved
+                self._diagnostics = []
                 self._revision += 1
             return result, self._workspace_snapshot_locked(
                 applied_program_revision=validated_saved.program_revision,
@@ -1276,7 +1328,7 @@ class ComposerDraftSession:
         if type(arguments) is not dict:
             _error("draft_arguments_invalid", "callback arguments must be an object")
         with self._lock:
-            if self._program is None:
+            if self._authoring is None:
                 _error(
                     "composer_draft_unavailable",
                     "Composer has no loaded Program Draft",
@@ -1303,29 +1355,7 @@ class ComposerDraftSession:
                         "receivedDraftRevision": expected_revision,
                     },
                 )
-            if tool_id == _NODE_POLICY_MUTATION:
-                expected_program_revision = arguments.get("expected_program_revision")
-                if (
-                    type(expected_program_revision) is not str
-                    or _PROGRAM_REVISION_PATTERN.fullmatch(expected_program_revision)
-                    is None
-                ):
-                    _error(
-                        "draft_arguments_invalid",
-                        "expected_program_revision must be an exact SHA-256 identity",
-                    )
-                if expected_program_revision != self._program.program_revision:
-                    _error(
-                        "composer_program_revision_stale",
-                        "request Program revision is stale",
-                        status_code=409,
-                        detail={
-                            "message": "request Program revision is stale",
-                            "expectedProgramRevision": self._program.program_revision,
-                            "receivedProgramRevision": expected_program_revision,
-                        },
-                    )
-            document = self._program.to_dict()
+            document = deepcopy(self._authoring)
             try:
                 mutation, details = self._edit(
                     document,
@@ -1341,29 +1371,14 @@ class ComposerDraftSession:
                     f"Draft mutation arguments are invalid for {tool_id}: {error}",
                 )
             try:
-                identified = _identified(document)
-            except (StrictArtifactError, TypeError, ValueError) as error:
+                candidate, diagnostics = derive_candidate(document, catalog)
+            except AuthoringForestError as error:
                 _error(
-                    "composer_draft_validation_failed",
+                    error.code,
                     str(error),
-                    detail=str(error),
+                    detail=error.detail,
                 )
-            try:
-                candidate = Program.from_dict(
-                    identified,
-                    catalog,
-                    path="<composer-draft>",
-                )
-            except ProgramValidationError as error:
-                _error(
-                    "composer_draft_validation_failed",
-                    str(error),
-                    detail=str(error),
-                )
-            if (
-                tool_id == _NODE_POLICY_MUTATION
-                and candidate.to_dict() == self._program.to_dict()
-            ):
+            if document == self._authoring:
                 return DraftMutationResult(
                     mutation=mutation,
                     details=details,
@@ -1375,7 +1390,9 @@ class ComposerDraftSession:
                     "Composer Draft revision is exhausted",
                     status_code=503,
                 )
+            self._authoring = document
             self._program = candidate
+            self._diagnostics = diagnostics
             self._revision += 1
             return DraftMutationResult(
                 mutation=mutation,
@@ -1425,6 +1442,7 @@ class ComposerDraftSession:
             "tree_draft_update_node_params": self._tree_update,
             "tree_draft_delete_node": self._tree_delete,
             "tree_draft_move_node": self._tree_move,
+            "tree_draft_update_positions": self._tree_update_positions,
             "tree_draft_replace_subtree": self._tree_replace,
             "tree_draft_change_node_kind": self._tree_change_kind,
             "tree_draft_wrap_node": self._tree_wrap,
@@ -1492,13 +1510,12 @@ class ComposerDraftSession:
         _catalog: NodeCatalog,
     ) -> dict[str, Any]:
         (
-            _expected_program_revision,
             instance_id,
             modification,
             recovery,
             operator_stop,
         ) = _node_policy_arguments(arguments)
-        node = _lookup_exact_instance(document["tree"], instance_id)
+        node = _lookup_exact_instance(document["forest"], instance_id)
         if modification == _DEFAULT_MODIFICATION_POLICY:
             node.pop("modification_policy", None)
         else:
@@ -1545,6 +1562,13 @@ class ComposerDraftSession:
                 "draft_scene_resource_exists",
                 f"Draft scene resource already exists: {identity}",
                 status_code=409,
+            )
+        try:
+            _absolute_orientation(resource.get("pose", {}))
+        except DraftSessionError as error:
+            _error(
+                "composer_draft_validation_failed",
+                f"new scene resource requires a valid absolute orientation: {error}",
             )
         scene.append(resource)
         scene.sort(key=lambda item: item["scene_resource_id"])
@@ -1599,6 +1623,14 @@ class ComposerDraftSession:
                 )
             seen.add(identity)
             existing = by_id.get(identity)
+            if existing is None:
+                try:
+                    _absolute_orientation(raw.get("pose", {}))
+                except DraftSessionError as error:
+                    _error(
+                        "composer_draft_validation_failed",
+                        f"new scene resource requires a valid absolute orientation: {error}",
+                    )
             resource = _resolve_relative_orientation(
                 raw,
                 scene=scene,
@@ -1636,11 +1668,11 @@ class ComposerDraftSession:
         return {"removed": list(identities)}
 
     @staticmethod
-    def _tree(document: dict[str, Any]) -> dict[str, Any]:
-        tree = document.get("tree")
-        if type(tree) is not dict:
-            _error("composer_draft_invalid", "Program Draft tree is not an object")
-        return tree
+    def _tree(document: dict[str, Any]) -> list[dict[str, Any]]:
+        forest = document.get("forest")
+        if type(forest) is not list:
+            _error("composer_draft_invalid", "Program Draft forest is not a list")
+        return forest
 
     def _tree_insert(
         self, document: dict[str, Any], arguments: dict[str, Any], _catalog: NodeCatalog
@@ -1655,29 +1687,37 @@ class ComposerDraftSession:
             )
         parent_id = arguments.get("parent_instance_id")
         index: int
+        parent: dict[str, Any] | None
         if parent_id is not None:
             parent = _lookup(tree, parent_id, label="parent_instance_id")[0]
             children = parent["children"]
             index = _insert_index(arguments, len(children))
-        else:
+        elif arguments.get("before_instance_id") is not None or arguments.get("after_instance_id") is not None:
             before = arguments.get("before_instance_id")
             after = arguments.get("after_instance_id")
             sibling_id = before if before is not None else after
             _sibling, parent, sibling_index = _lookup(
                 tree, sibling_id, label="sibling instance"
             )
-            if parent is None or sibling_index is None:
+            if sibling_index is None:
                 _error(
                     "draft_insert_position_invalid",
-                    "cannot insert before or after the Draft root",
+                    "sibling insertion position is unavailable",
                 )
-            children = parent["children"]
+            children = tree if parent is None else parent["children"]
             index = sibling_index if before is not None else sibling_index + 1
+        else:
+            parent = None
+            children = tree
+            index = _insert_index(arguments, len(children))
         children.insert(index, node)
+        position = arguments.get("position")
+        if position is not None:
+            document["positions"][node["instance_id"]] = deepcopy(position)
         return {
             "inserted_instance_id": node["instance_id"],
             "index": index,
-            "parent_instance_id": parent["instance_id"],
+            "parent_instance_id": parent["instance_id"] if parent is not None else None,
         }
 
     def _tree_update(
@@ -1731,9 +1771,11 @@ class ComposerDraftSession:
         node, parent, index = _lookup(
             tree, arguments["instance_id"], label="instance_id"
         )
-        if parent is None or index is None:
-            _error("draft_root_edit_invalid", "the Draft root cannot be deleted")
-        parent["children"].pop(index)
+        if index is None:
+            _error("draft_node_not_found", "the Draft node has no retained position")
+        (tree if parent is None else parent["children"]).pop(index)
+        for instance_id in _tree_ids([node]):
+            document["positions"].pop(instance_id, None)
         return {"deleted_instance_id": node["instance_id"]}
 
     def _tree_move(
@@ -1743,25 +1785,31 @@ class ComposerDraftSession:
         node, old_parent, old_index = _lookup(
             tree, arguments["instance_id"], label="instance_id"
         )
-        if old_parent is None or old_index is None:
-            _error("draft_root_edit_invalid", "the Draft root cannot be moved")
-        new_parent = _lookup(
-            tree,
-            arguments["new_parent_instance_id"],
-            label="new_parent_instance_id",
-        )[0]
-        if _contains_instance(node, new_parent["instance_id"]):
+        if old_index is None:
+            _error("draft_node_not_found", "the Draft node has no retained position")
+        new_parent_id = arguments.get("new_parent_instance_id")
+        new_parent = (
+            _lookup(tree, new_parent_id, label="new_parent_instance_id")[0]
+            if new_parent_id is not None
+            else None
+        )
+        if new_parent is not None and _contains_instance(node, new_parent["instance_id"]):
             _error(
                 "draft_tree_cycle_invalid",
                 "a Draft node cannot move under itself or a descendant",
             )
-        old_parent["children"].pop(old_index)
-        children = new_parent["children"]
+        (tree if old_parent is None else old_parent["children"]).pop(old_index)
+        children = tree if new_parent is None else new_parent["children"]
         index = _insert_index(arguments, len(children))
         children.insert(index, node)
+        positions = arguments.get("positions")
+        if positions is not None:
+            document["positions"].update(deepcopy(positions))
         return {
             "moved_instance_id": node["instance_id"],
-            "new_parent_instance_id": new_parent["instance_id"],
+            "new_parent_instance_id": (
+                new_parent["instance_id"] if new_parent is not None else None
+            ),
             "index": index,
         }
 
@@ -1769,15 +1817,20 @@ class ComposerDraftSession:
         self, document: dict[str, Any], arguments: dict[str, Any], _catalog: NodeCatalog
     ) -> dict[str, Any]:
         tree = self._tree(document)
-        _node, parent, index = _lookup(
+        old_node, parent, index = _lookup(
             tree, arguments["instance_id"], label="instance_id"
         )
         subtree = deepcopy(arguments["subtree"])
         if parent is None:
-            document["tree"] = subtree
+            assert index is not None
+            tree[index] = subtree
         else:
             assert index is not None
             parent["children"][index] = subtree
+        retained_ids = set(_tree_ids([subtree]))
+        for instance_id in _tree_ids([old_node]):
+            if instance_id not in retained_ids:
+                document["positions"].pop(instance_id, None)
         return {"replacement_instance_id": subtree["instance_id"]}
 
     def _tree_change_kind(
@@ -1870,7 +1923,8 @@ class ComposerDraftSession:
             )
         wrapper["children"] = [target]
         if parent is None:
-            document["tree"] = wrapper
+            assert index is not None
+            tree[index] = wrapper
         else:
             assert index is not None
             parent["children"][index] = wrapper
@@ -1878,6 +1932,20 @@ class ComposerDraftSession:
             "target_instance_id": target["instance_id"],
             "wrapper_instance_id": wrapper["instance_id"],
         }
+
+    @staticmethod
+    def _tree_update_positions(
+        document: dict[str, Any],
+        arguments: dict[str, Any],
+        _catalog: NodeCatalog,
+    ) -> dict[str, Any]:
+        if set(arguments) != {"positions"} or type(arguments["positions"]) is not dict:
+            _error(
+                "draft_arguments_invalid",
+                "tree_draft_update_positions requires one positions object",
+            )
+        document["positions"].update(deepcopy(arguments["positions"]))
+        return {"updated_instance_ids": sorted(arguments["positions"])}
 
     @staticmethod
     def _upsert_rows(

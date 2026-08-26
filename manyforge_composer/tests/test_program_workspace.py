@@ -149,9 +149,7 @@ def test_node_policy_mutation_is_closed_draft_only_and_revision_fenced(
         "/api/program/open-draft",
         json={**_fence(empty), "path": str(source)},
     ).json()
-    program_revision = opened["draft"]["programRevision"]
     arguments = {
-        "expected_program_revision": program_revision,
         "instance_id": "move_to_pick",
         "modification_policy": {
             "runtime_override": "human_approval",
@@ -178,24 +176,17 @@ def test_node_policy_mutation_is_closed_draft_only_and_revision_fenced(
     )
     assert response.status_code == 200
     body = response.json()
-    assert set(body) == {"schemaVersion", "mutation", "details", "draft"}
-    assert body["schemaVersion"] == "manyforge.composer_draft_mutation.v1"
+    assert set(body) == {"mutation", "details", "workspace"}
     assert body["mutation"] == "program_draft_update_node_policies"
     assert body["details"] == {"updated_instance_id": "move_to_pick"}
-    assert set(body["draft"]) == {
-        "draftId",
-        "draftRevision",
-        "programLoaded",
-        "programRevision",
-        "program",
-    }
-    assert body["draft"]["draftRevision"] == opened["draft"]["draftRevision"] + 1
+    draft = body["workspace"]["draft"]
+    assert draft["draftRevision"] == opened["draft"]["draftRevision"] + 1
     assert source.read_bytes() == original_bytes
 
     stale = client.post(
         "/api/program/draft/mutations",
         json={
-            **_fence({"draft": body["draft"]}),
+            **_fence({"draft": draft}),
             "mutation": "program_draft_update_node_policies",
             "arguments": {
                 **arguments,
@@ -203,9 +194,9 @@ def test_node_policy_mutation_is_closed_draft_only_and_revision_fenced(
             },
         },
     )
-    assert stale.status_code == 409
-    assert stale.json()["detail"]["code"] == "composer_program_revision_stale"
-    assert client.get("/api/program/workspace").json()["draft"] == body["draft"]
+    assert stale.status_code == 400
+    assert stale.json()["detail"]["code"] == "draft_arguments_invalid"
+    assert client.get("/api/program/workspace").json()["draft"] == draft
 
 
 def test_program_settings_mutation_is_validated_and_draft_only(
@@ -283,7 +274,6 @@ def test_node_policy_rejections_are_atomic_and_do_not_read_headless(
         )
     )
     arguments = {
-        "expected_program_revision": before["draft"]["programRevision"],
         "instance_id": "move_to_pick",
         "modification_policy": {
             "runtime_override": "human_approval",
@@ -395,7 +385,6 @@ def test_node_policy_success_with_imported_node_a_skills_is_closed_and_headless_
             **_fence(workspace),
             "mutation": "program_draft_update_node_policies",
             "arguments": {
-                "expected_program_revision": before["program_revision"],
                 "instance_id": "remove_table",
                 "modification_policy": {
                     "runtime_override": "forbidden",
@@ -416,16 +405,16 @@ def test_node_policy_success_with_imported_node_a_skills_is_closed_and_headless_
 
     assert response.status_code == 200
     body = response.json()
-    assert set(body) == {"schemaVersion", "mutation", "details", "draft"}
-    assert body["draft"]["program"]["tree"]["children"][0][
+    assert set(body) == {"mutation", "details", "workspace"}
+    assert body["workspace"]["draft"]["program"]["tree"]["children"][0][
         "recovery_policy"
     ]["allowed_skills"] == ["legacy.inspect"]
-    assert body["draft"]["draftRevision"] == before["draft_revision"] + 1
+    assert body["workspace"]["draft"]["draftRevision"] == before["draft_revision"] + 1
 
     blocked_apply = client.post(
         "/api/program/apply",
         json={
-            **_fence({"draft": body["draft"]}),
+            **_fence(body["workspace"]),
         },
     )
     assert blocked_apply.status_code == 409

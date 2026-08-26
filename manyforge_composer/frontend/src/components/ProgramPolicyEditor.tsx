@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
 
 import type {
   ProgramModificationPolicyValue,
@@ -141,13 +141,13 @@ export function validateProgramPolicy(
     setError(errors, 'recovery_policy.max_retries', 'Max retries must be an integer from 0 to 255.');
   }
   if (recovery.allowed_skills.length > 0) {
-    setError(
-      errors,
-      'recovery_policy.allowed_skills',
-      hasIntervention
-        ? ALLOWED_SKILLS_UNAVAILABLE_MESSAGE
-        : `Allowed skills require the Intervention recovery action. ${ALLOWED_SKILLS_UNAVAILABLE_MESSAGE}`,
-    );
+    const message = hasIntervention
+      ? ALLOWED_SKILLS_UNAVAILABLE_MESSAGE
+      : `Allowed skills require the Intervention recovery action. ${ALLOWED_SKILLS_UNAVAILABLE_MESSAGE}`;
+    setError(errors, 'recovery_policy.allowed_skills', message);
+    // Imported skills have no editable C1 control. Mark their nearest visible
+    // recovery control so the invalid retained value cannot be visually hidden.
+    setError(errors, 'recovery_policy.allowed_recovery_actions', message);
   }
   return errors;
 }
@@ -164,7 +164,7 @@ function FieldError({
   message: string | undefined;
 }) {
   if (!message) return null;
-  return <p id={id} className="program-form-error" role="alert">{message}</p>;
+  return <span id={id} className="sr-only" role="alert">{message}</span>;
 }
 
 function selectOptions<T extends string>(options: Array<[T, string]>) {
@@ -180,12 +180,14 @@ interface ProgramPolicyEditorProps {
     recoveryPolicy: ProgramNodeRecoveryPolicy,
     operatorStopPolicy: ProgramOperatorStopPolicy,
   ) => void;
+  onInvalidChange?: (message: string | null) => void;
 }
 
 export function ProgramPolicyEditor({
   node,
   busy,
   onUpdate,
+  onInvalidChange,
 }: ProgramPolicyEditorProps) {
   const [form, setForm] = useState<ProgramPolicyForm>(() => effectiveProgramPolicy(node));
 
@@ -194,6 +196,30 @@ export function ProgramPolicyEditor({
   }, [node]);
 
   const errors = useMemo(() => validateProgramPolicy(form), [form]);
+  const original = useMemo(() => effectiveProgramPolicy(node), [node]);
+  const dirty = JSON.stringify(form) !== JSON.stringify(original);
+  const firstError = Object.values(errors)[0] ?? null;
+  const invalidChange = useRef(onInvalidChange);
+  useEffect(() => {
+    invalidChange.current = onInvalidChange;
+  }, [onInvalidChange]);
+  useEffect(() => {
+    invalidChange.current?.(firstError);
+  }, [firstError]);
+  useEffect(() => () => invalidChange.current?.(null), []);
+  const commit = () => {
+    if (busy || !dirty || Object.keys(errors).length > 0) return;
+    onUpdate(
+      node.instance_id,
+      { ...form.modification_policy },
+      {
+        ...form.recovery_policy,
+        allowed_recovery_actions: [...form.recovery_policy.allowed_recovery_actions],
+        allowed_skills: [...form.recovery_policy.allowed_skills],
+      },
+      form.operator_stop_policy,
+    );
+  };
   const id = node.instance_id;
   const updateModification = (
     field: keyof ProgramNodeModificationPolicy,
@@ -227,21 +253,10 @@ export function ProgramPolicyEditor({
     <section className="program-policy-editor" aria-labelledby={fieldId(id, 'title')}>
       <form
         className="program-policy-form"
+        onBlur={commit}
         onSubmit={(event) => {
           event.preventDefault();
-          if (Object.keys(errors).length > 0) return;
-          onUpdate(
-            id,
-            { ...form.modification_policy },
-            {
-              ...form.recovery_policy,
-              allowed_recovery_actions: [
-                ...form.recovery_policy.allowed_recovery_actions,
-              ],
-              allowed_skills: [...form.recovery_policy.allowed_skills],
-            },
-            form.operator_stop_policy,
-          );
+          commit();
         }}
       >
         <div className="program-policy-heading">
@@ -268,6 +283,7 @@ export function ProgramPolicyEditor({
             disabled={busy}
             aria-invalid={errors['modification_policy.runtime_override'] !== undefined}
             aria-describedby={describedBy('modification_policy.runtime_override')}
+            title={errors['modification_policy.runtime_override']}
             onChange={(event) => updateModification(
               'runtime_override',
               event.target.value as ProgramModificationPolicyValue,
@@ -292,6 +308,7 @@ export function ProgramPolicyEditor({
             disabled={busy}
             aria-invalid={errors['modification_policy.persistent_edit'] !== undefined}
             aria-describedby={describedBy('modification_policy.persistent_edit')}
+            title={errors['modification_policy.persistent_edit']}
             onChange={(event) => updateModification(
               'persistent_edit',
               event.target.value as ProgramModificationPolicyValue,
@@ -339,6 +356,7 @@ export function ProgramPolicyEditor({
             disabled={busy}
             aria-invalid={errors['recovery_policy.allow_intervention'] !== undefined}
             aria-describedby={describedBy('recovery_policy.allow_intervention')}
+            title={errors['recovery_policy.allow_intervention']}
             onChange={(event) => updateRecovery('allow_intervention', event.target.checked)}
           />
           Allow intervention
@@ -361,6 +379,7 @@ export function ProgramPolicyEditor({
                   disabled={busy}
                   aria-invalid={errors['recovery_policy.allowed_recovery_actions'] !== undefined}
                   aria-describedby={describedBy('recovery_policy.allowed_recovery_actions')}
+                  title={errors['recovery_policy.allowed_recovery_actions']}
                   onChange={(event) => {
                     const actions = new Set(form.recovery_policy.allowed_recovery_actions);
                     if (event.target.checked) actions.add(action);
@@ -393,6 +412,7 @@ export function ProgramPolicyEditor({
             disabled={busy}
             aria-invalid={errors['recovery_policy.max_retries'] !== undefined}
             aria-describedby={describedBy('recovery_policy.max_retries')}
+            title={errors['recovery_policy.max_retries']}
             onChange={(event) => updateRecovery(
               'max_retries',
               event.target.value.trim() === '' ? Number.NaN : Number(event.target.value),
@@ -411,6 +431,7 @@ export function ProgramPolicyEditor({
             disabled={busy}
             aria-invalid={errors['recovery_policy.persistence_ceiling'] !== undefined}
             aria-describedby={describedBy('recovery_policy.persistence_ceiling')}
+            title={errors['recovery_policy.persistence_ceiling']}
             onChange={(event) => updateRecovery(
               'persistence_ceiling',
               event.target.value as ProgramPersistenceCeiling,
@@ -466,19 +487,6 @@ export function ProgramPolicyEditor({
         </p>
       </fieldset>
 
-      <div className="program-policy-actions-row">
-        <button
-          type="submit"
-          disabled={busy || Object.keys(errors).length > 0}
-        >
-          {busy ? 'Saving node policy…' : 'Save node policy to Draft'}
-        </button>
-        {Object.keys(errors).length > 0 && (
-          <span className="program-policy-blocked" role="status">
-            Resolve the field guidance before saving this policy.
-          </span>
-        )}
-      </div>
       </form>
     </section>
   );
