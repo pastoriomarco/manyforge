@@ -95,7 +95,7 @@ const environment: NodeEnvironmentResponse = {
 };
 
 describe('Program tree canvas presentation actions', () => {
-  it('keeps transient pan, zoom, fit, edge style, and selection off the Draft mutation path', () => {
+  it('keeps view-only gestures local and aligns exactly once when layout direction changes', () => {
     const onMutate = vi.fn();
     const onSelect = vi.fn();
     renderToStaticMarkup(
@@ -161,11 +161,14 @@ describe('Program tree canvas presentation actions', () => {
     expect(onSelect).toHaveBeenCalledWith('settle');
     expect(fitView).toHaveBeenCalled();
     expect(animationFrame).toHaveBeenCalled();
-    expect(onMutate).toHaveBeenCalledTimes(1);
-    expect(onMutate).toHaveBeenCalledWith(
+    expect(onMutate).toHaveBeenCalledTimes(2);
+    expect(onMutate.mock.calls.map(([mutation]) => mutation)).toEqual([
       'tree_draft_update_positions',
-      { positions: expect.any(Object) },
-    );
+      'tree_draft_update_positions',
+    ]);
+    expect(onMutate.mock.calls[0]?.[1]).toEqual({ positions: expect.any(Object) });
+    expect(onMutate.mock.calls[1]?.[1]).toEqual({ positions: expect.any(Object) });
+    expect(onMutate.mock.calls[1]?.[1]).not.toEqual(onMutate.mock.calls[0]?.[1]);
   });
 
   it('issues one owner mutation for drop, connect, disconnect, and drag-end gestures', () => {

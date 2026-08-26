@@ -953,6 +953,101 @@ def test_tree_edits_use_instance_ids_and_the_explicit_root_alias() -> None:
     ]
 
 
+def test_tree_rename_is_atomic_and_moves_position_identity() -> None:
+    catalog = build_node_environment().catalog
+    session = ComposerDraftSession(_program())
+    _mutate(
+        session,
+        "tree_draft_update_positions",
+        {"positions": {"move_to_pick": {"x": 42.0, "y": 84.0}}},
+    )
+
+    renamed = _mutate(
+        session,
+        "tree_draft_rename_node",
+        {
+            "instance_id": "move_to_pick",
+            "new_instance_id": "move_to_pick_safely",
+        },
+    )
+
+    assert renamed.details == {
+        "previous_instance_id": "move_to_pick",
+        "renamed_instance_id": "move_to_pick_safely",
+    }
+    authoring = renamed.snapshot["authoring"]
+    assert "move_to_pick" not in authoring["positions"]
+    assert authoring["positions"]["move_to_pick_safely"] == {"x": 42.0, "y": 84.0}
+    assert renamed.snapshot["program"]["tree"]["children"][0]["instance_id"] == (
+        "move_to_pick_safely"
+    )
+
+    retained = session.retained_state()
+    restored = ComposerDraftSession()
+    restored.restore_retained_state(retained, catalog)
+    assert restored.snapshot() == session.snapshot()
+
+    before = session.snapshot()
+    with pytest.raises(DraftSessionError) as duplicate:
+        _mutate(
+            session,
+            "tree_draft_rename_node",
+            {
+                "instance_id": "move_to_pick_safely",
+                "new_instance_id": "main_sequence",
+            },
+        )
+    assert duplicate.value.code == "draft_node_exists"
+    assert session.snapshot() == before
+
+    with pytest.raises(DraftSessionError) as invalid:
+        _mutate(
+            session,
+            "tree_draft_rename_node",
+            {
+                "instance_id": "move_to_pick_safely",
+                "new_instance_id": "Not portable",
+            },
+        )
+    assert invalid.value.code == "draft_arguments_invalid"
+    assert session.snapshot() == before
+
+
+def test_program_role_requirements_replace_through_one_operator_mutation() -> None:
+    session = ComposerDraftSession(_program())
+    before = session.snapshot()
+    component_roles = deepcopy(before["authoring"]["component_roles"])
+    component_roles["inspection_tool"] = {
+        "required_component_type_tags": ["camera"]
+    }
+
+    replaced = _mutate(
+        session,
+        "program_draft_replace_roles",
+        {
+            "component_roles": component_roles,
+            "target_roles": before["authoring"]["target_roles"],
+        },
+    )
+
+    assert replaced.mutation in OPERATOR_DRAFT_MUTATIONS
+    assert replaced.details["component_role_count"] == len(component_roles)
+    assert replaced.snapshot["authoring"]["component_roles"] == {
+        key: component_roles[key] for key in sorted(component_roles)
+    }
+    assert replaced.snapshot["program"] is not None
+
+    retained = session.snapshot()
+    with pytest.raises(DraftSessionError) as invalid:
+        _mutate(
+            session,
+            "program_draft_replace_roles",
+            {"component_roles": [], "target_roles": {}},
+        )
+    assert invalid.value.code == "draft_arguments_invalid"
+    assert session.snapshot() == retained
+
+
 def test_authoring_forest_retains_incomplete_topology_until_it_derives_a_program() -> None:
     catalog = build_node_environment().catalog
     session = ComposerDraftSession(_program(), source_path=str(_PROGRAM_PATH))
@@ -1298,9 +1393,16 @@ def test_every_generated_draft_mutation_has_a_valid_atomic_path() -> None:
         },
     )
     invoke(
-        "tree_draft_replace_subtree",
+        "tree_draft_rename_node",
         {
             "instance_id": "assistant_timer",
+            "new_instance_id": "assistant_timer_renamed",
+        },
+    )
+    invoke(
+        "tree_draft_replace_subtree",
+        {
+            "instance_id": "assistant_timer_renamed",
             "subtree": {
                 "node_id": "timer",
                 "instance_id": "assistant_timer_replaced",

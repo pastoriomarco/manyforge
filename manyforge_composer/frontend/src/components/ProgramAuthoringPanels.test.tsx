@@ -6,8 +6,10 @@ import { describe, expect, it, vi } from 'vitest';
 import type { ProgramRuntimeController } from '../hooks/useProgramRuntime';
 import type { ProgramWorkspaceController } from '../hooks/useProgramWorkspace';
 import type {
+  BlackboardKeyDeclaration,
   CatalogEntry,
   NodeEnvironmentResponse,
+  ProgramAuthoringDocument,
   ProgramParameterDeclaration,
   ProgramTreeNode,
   ProgramWorkspaceResponse,
@@ -102,6 +104,30 @@ const environment: NodeEnvironmentResponse = {
   restorationGates: ['N7'],
   active: null,
 };
+
+function authoringProgram(
+  roots: ProgramTreeNode[],
+  parameters: ProgramParameterDeclaration[] = [],
+  keys: BlackboardKeyDeclaration[] = [],
+): ProgramAuthoringDocument {
+  return {
+    api_version: 'manyforge.program.v1',
+    program_id: 'test_program',
+    program_profile: 'composable-cell-v1',
+    name: 'Test Program',
+    catalog: {
+      api_version: 'manyforge.node_catalog.v2',
+      content_version: '1.1.0',
+    },
+    component_roles: { robot: {} },
+    target_roles: {},
+    parameters,
+    blackboard: { namespaces: [], keys },
+    schema_version: 'manyforge.composer_authoring_forest.v1',
+    forest: roots,
+    positions: {},
+  };
+}
 
 describe('Program authoring panels', () => {
   const mutationNode: ProgramTreeNode = {
@@ -272,8 +298,7 @@ describe('Program authoring panels', () => {
           roots={[tree]}
           selectedId="settle"
           catalogEntries={[sequence, timer]}
-          programParameters={[parameter]}
-          blackboardKeys={[]}
+          program={authoringProgram([tree], [parameter])}
           busy={false}
           onMutate={vi.fn()}
           onUpdateNodePolicies={vi.fn()}
@@ -365,8 +390,7 @@ describe('Program authoring panels', () => {
         roots={[invalidTree]}
         selectedId="invalid"
         catalogEntries={[variantSchemas]}
-        programParameters={[]}
-        blackboardKeys={[]}
+        program={authoringProgram([invalidTree])}
         busy={false}
         onMutate={vi.fn()}
         onUpdateNodePolicies={vi.fn()}
@@ -397,13 +421,12 @@ describe('Program authoring panels', () => {
         roots={[requiredTree]}
         selectedId="required-source"
         catalogEntries={[timer]}
-        programParameters={[]}
-        blackboardKeys={[{
+        program={authoringProgram([requiredTree], [], [{
           key: 'duration',
           type: 'float64',
           access: 'read',
           persistence: 'run',
-        }]}
+        }])}
         busy={false}
         onMutate={vi.fn()}
         onUpdateNodePolicies={vi.fn()}

@@ -138,6 +138,31 @@ export interface AuthoringGraphEdge {
   target: string;
 }
 
+/** Project one accepted sibling button move onto the deterministic layout seed order. */
+export function authoringReorderedIds(
+  rows: Array<{ id: string; parentId: string | null }>,
+  parentId: string,
+  selectedId: string,
+  index: number,
+): string[] | null {
+  const orderedIds = rows.map((row) => row.id);
+  const siblingIds = rows
+    .filter((row) => row.parentId === parentId)
+    .map((row) => row.id);
+  const currentIndex = siblingIds.indexOf(selectedId);
+  if (currentIndex < 0 || index < 0 || index >= siblingIds.length) return null;
+  const nextSiblingIds = [...siblingIds];
+  nextSiblingIds.splice(currentIndex, 1);
+  nextSiblingIds.splice(index, 0, selectedId);
+  const siblingSlots = siblingIds
+    .map((id) => orderedIds.indexOf(id))
+    .sort((left, right) => left - right);
+  siblingSlots.forEach((slot, siblingIndex) => {
+    orderedIds[slot] = nextSiblingIds[siblingIndex] as string;
+  });
+  return orderedIds;
+}
+
 function nodeWidth(node: AuthoringGraphPositionNode): number {
   return typeof node.width === 'number' && Number.isFinite(node.width)
     ? node.width

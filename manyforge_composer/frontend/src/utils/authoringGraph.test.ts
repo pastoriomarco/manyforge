@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import {
   authoringMoveIntent,
+  authoringReorderedIds,
   authoringSiblingInsertionIndex,
   layoutAuthoringGraph,
   validateAuthoringConnection,
@@ -112,6 +113,18 @@ describe('authoring graph mechanics', () => {
     )).toBe(1);
   });
 
+  it('projects button sibling order without moving unrelated nodes', () => {
+    expect(authoringReorderedIds([
+      { id: 'root', parentId: null },
+      { id: 'first', parentId: 'root' },
+      { id: 'nested', parentId: 'first' },
+      { id: 'middle', parentId: 'root' },
+      { id: 'last', parentId: 'root' },
+    ], 'root', 'last', 1)).toEqual([
+      'root', 'first', 'nested', 'last', 'middle',
+    ]);
+  });
+
   it('allows temporarily incomplete parents while retaining a valid forest', () => {
     const cardinalNodes: AuthoringGraphNode[] = [
       { id: 'root', label: 'Root', position: { x: 0, y: 0 }, childrenMin: 1, childrenMax: -1 },
@@ -188,5 +201,23 @@ describe('authoring graph mechanics', () => {
     expect(horizontal.find((node) => node.id === 'left')?.position.x).toBeGreaterThan(
       horizontal.find((node) => node.id === 'root')?.position.x ?? Infinity,
     );
+  });
+
+  it('uses measured node bounds on both layout axes', () => {
+    const measured: AuthoringGraphNode[] = [
+      { id: 'root', label: 'Root', width: 250, height: 96, position: { x: 0, y: 0 } },
+      { id: 'left', label: 'Left', width: 140, height: 70, position: { x: 0, y: 100 } },
+      { id: 'right', label: 'Right', width: 310, height: 120, position: { x: 300, y: 100 } },
+    ];
+    for (const direction of ['vertical', 'horizontal'] as const) {
+      const layout = layoutAuthoringGraph(measured, edges, direction);
+      const left = layout.find((node) => node.id === 'left')!;
+      const right = layout.find((node) => node.id === 'right')!;
+      if (direction === 'vertical') {
+        expect(left.position.x + (left.width ?? 0)).toBeLessThan(right.position.x);
+      } else {
+        expect(left.position.y + (left.height ?? 0)).toBeLessThan(right.position.y);
+      }
+    }
   });
 });

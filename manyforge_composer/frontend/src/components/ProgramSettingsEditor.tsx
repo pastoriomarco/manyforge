@@ -3,6 +3,7 @@ import { useEffect, useMemo, useState, type KeyboardEvent } from 'react';
 import type { ProgramRuntimeController } from '../hooks/useProgramRuntime';
 import type {
   JsonValue,
+  DraftMutationResponse,
   ProgramAuthoringDiagnostic,
   ProgramAuthoringDocument,
 } from '../types/api';
@@ -15,8 +16,12 @@ interface ProgramSettingsEditorProps {
   candidateRevision: string | null;
   busy: boolean;
   runtime: ProgramRuntimeController;
-  onMutate: (mutation: string, args: Record<string, JsonValue>) => void;
+  onMutate: (
+    mutation: string,
+    args: Record<string, JsonValue>,
+  ) => Promise<DraftMutationResponse | null> | DraftMutationResponse | null | void;
   onInvalidChange?: (invalid: boolean) => void;
+  onRoleCreated?: (kind: 'component_role' | 'target_role', id: string) => void;
   diagnostics?: ProgramAuthoringDiagnostic[];
 }
 
@@ -55,6 +60,7 @@ export function ProgramSettingsEditor({
   runtime,
   onMutate,
   onInvalidChange,
+  onRoleCreated,
   diagnostics = [],
 }: ProgramSettingsEditorProps) {
   const [name, setName] = useState(program.name);
@@ -62,6 +68,17 @@ export function ProgramSettingsEditor({
   const [compatibility, setCompatibility] = useState(() => initialCompatibility(program));
   const [error, setError] = useState<string | null>(null);
   const [errorTarget, setErrorTarget] = useState('program-settings-name');
+  const [componentRoleId, setComponentRoleId] = useState('');
+  const [componentTypeTags, setComponentTypeTags] = useState('');
+  const [componentModelRoles, setComponentModelRoles] = useState('');
+  const [componentAttachments, setComponentAttachments] = useState('');
+  const [targetRoleId, setTargetRoleId] = useState('');
+  const [targetComponentRole, setTargetComponentRole] = useState('');
+  const [targetCapabilities, setTargetCapabilities] = useState('');
+  const [targetFrameRoles, setTargetFrameRoles] = useState('');
+  const [targetResourceRoles, setTargetResourceRoles] = useState('');
+  const [targetCollisionRoles, setTargetCollisionRoles] = useState('');
+  const [targetModelRoles, setTargetModelRoles] = useState('');
 
   useEffect(() => {
     setName(program.name);
@@ -69,6 +86,17 @@ export function ProgramSettingsEditor({
     setCompatibility(initialCompatibility(program));
     setError(null);
     setErrorTarget('program-settings-name');
+    setComponentRoleId('');
+    setComponentTypeTags('');
+    setComponentModelRoles('');
+    setComponentAttachments('');
+    setTargetRoleId('');
+    setTargetComponentRole(Object.keys(program.component_roles)[0] ?? '');
+    setTargetCapabilities('');
+    setTargetFrameRoles('');
+    setTargetResourceRoles('');
+    setTargetCollisionRoles('');
+    setTargetModelRoles('');
   }, [program]);
   useEffect(() => {
     onInvalidChange?.(error !== null);
@@ -151,6 +179,93 @@ export function ProgramSettingsEditor({
       document.getElementById(target)?.focus();
     }
   };
+  const replaceRoles = (
+    componentRoles: Record<string, JsonValue>,
+    targetRoles: Record<string, JsonValue>,
+  ) => Promise.resolve(onMutate('program_draft_replace_roles', {
+    component_roles: componentRoles,
+    target_roles: targetRoles,
+  }));
+  const addComponentRole = () => {
+    try {
+      const roleId = componentRoleId.trim();
+      if (!PORTABLE_ID.test(roleId)) throw new Error('Component role needs a portable ID.');
+      if (program.component_roles[roleId] !== undefined) {
+        throw new Error(`Component role '${roleId}' already exists.`);
+      }
+      const typeTags = parseIdentifierList(componentTypeTags, 'Component type tags');
+      const modelRoles = parseIdentifierList(componentModelRoles, 'Component model roles');
+      const attachments = parseIdentifierList(componentAttachments, 'Attachment interfaces');
+      const role: Record<string, JsonValue> = {};
+      if (typeTags.length) role.required_component_type_tags = typeTags;
+      if (modelRoles.length) role.required_model_roles = modelRoles;
+      if (attachments.length) role.required_attachment_interfaces = attachments;
+      void replaceRoles(
+        { ...program.component_roles, [roleId]: role },
+        program.target_roles,
+      ).then((response) => {
+        if (!response) return;
+        onRoleCreated?.('component_role', roleId);
+        setComponentRoleId('');
+        setComponentTypeTags('');
+        setComponentModelRoles('');
+        setComponentAttachments('');
+        setTargetComponentRole(roleId);
+      });
+      setError(null);
+    } catch (caught) {
+      setError(caught instanceof Error ? caught.message : 'Component role is invalid.');
+      setErrorTarget('program-component-role-id');
+    }
+  };
+  const addTargetRole = () => {
+    try {
+      const roleId = targetRoleId.trim();
+      if (!PORTABLE_ID.test(roleId)) throw new Error('Target role needs a portable ID.');
+      if (program.target_roles[roleId] !== undefined) {
+        throw new Error(`Target role '${roleId}' already exists.`);
+      }
+      if (!targetComponentRole || program.component_roles[targetComponentRole] === undefined) {
+        throw new Error('Target role must select a declared component role.');
+      }
+      const capabilities = parseIdentifierList(targetCapabilities, 'Target capabilities');
+      if (capabilities.length === 0) throw new Error('Target role needs at least one capability.');
+      const role: Record<string, JsonValue> = {
+        component_role: targetComponentRole,
+        required_capabilities: capabilities.map((capabilityId) => ({
+          capability_id: capabilityId,
+          parameters: {},
+          disposition: 'required',
+        })),
+      };
+      const optionalLists = {
+        required_frame_roles: parseIdentifierList(targetFrameRoles, 'Frame roles'),
+        required_resource_roles: parseIdentifierList(targetResourceRoles, 'Resource roles'),
+        required_collision_body_roles: parseIdentifierList(targetCollisionRoles, 'Collision-body roles'),
+        required_model_roles: parseIdentifierList(targetModelRoles, 'Target model roles'),
+      };
+      for (const [name, values] of Object.entries(optionalLists)) {
+        if (values.length) role[name] = values;
+      }
+      void replaceRoles(
+        program.component_roles,
+        { ...program.target_roles, [roleId]: role },
+      ).then((response) => {
+        if (!response) return;
+        onRoleCreated?.('target_role', roleId);
+        setTargetRoleId('');
+        setTargetCapabilities('');
+        setTargetFrameRoles('');
+        setTargetResourceRoles('');
+        setTargetCollisionRoles('');
+        setTargetModelRoles('');
+      });
+      setError(null);
+    } catch (caught) {
+      setError(caught instanceof Error ? caught.message : 'Target role is invalid.');
+      setErrorTarget('program-target-role-id');
+    }
+  };
 
   return (
     <form className="program-settings-editor" onSubmit={(event) => {
@@ -169,6 +284,17 @@ export function ProgramSettingsEditor({
               setName(program.name);
               setDescription(program.description ?? '');
               setCompatibility(initialCompatibility(program));
+              setComponentRoleId('');
+              setComponentTypeTags('');
+              setComponentModelRoles('');
+              setComponentAttachments('');
+              setTargetRoleId('');
+              setTargetComponentRole(Object.keys(program.component_roles)[0] ?? '');
+              setTargetCapabilities('');
+              setTargetFrameRoles('');
+              setTargetResourceRoles('');
+              setTargetCollisionRoles('');
+              setTargetModelRoles('');
               setError(null);
               setErrorTarget('program-settings-name');
             }}
@@ -286,6 +412,45 @@ export function ProgramSettingsEditor({
             Program settings do not infer compatibility in the browser.
           </p>
         )}
+      </section>
+
+      <section className="program-settings-section program-role-requirements">
+        <h3>Portable component and target roles</h3>
+        <p>
+          Node selectors use these logical requirements. Deployment Binding chooses
+          implementations later; this Program does not name live components.
+        </p>
+        <dl className="program-settings-facts">
+          {Object.keys(program.component_roles).map((role) => (
+            <div key={`component:${role}`}><dt>Component role</dt><dd><code>{role}</code></dd></div>
+          ))}
+          {Object.keys(program.target_roles).map((role) => (
+            <div key={`target:${role}`}><dt>Target role</dt><dd><code>{role}</code></dd></div>
+          ))}
+        </dl>
+        <details>
+          <summary>Create component role</summary>
+          <div className="program-role-create-form">
+            <label>Role ID<input id="program-component-role-id" value={componentRoleId} disabled={busy} onChange={(event) => setComponentRoleId(event.target.value)} /></label>
+            <label>Required component type tags<input value={componentTypeTags} disabled={busy} placeholder="articulated-arm, gripper" onChange={(event) => setComponentTypeTags(event.target.value)} /></label>
+            <label>Required model roles<input value={componentModelRoles} disabled={busy} placeholder="arm_model" onChange={(event) => setComponentModelRoles(event.target.value)} /></label>
+            <label>Required attachment interfaces<input value={componentAttachments} disabled={busy} onChange={(event) => setComponentAttachments(event.target.value)} /></label>
+            <button type="button" disabled={busy || !componentRoleId.trim()} onClick={addComponentRole}>Create component role</button>
+          </div>
+        </details>
+        <details>
+          <summary>Create target role</summary>
+          <div className="program-role-create-form">
+            <label>Role ID<input id="program-target-role-id" value={targetRoleId} disabled={busy} onChange={(event) => setTargetRoleId(event.target.value)} /></label>
+            <label>Component role<select value={targetComponentRole} disabled={busy} onChange={(event) => setTargetComponentRole(event.target.value)}><option value="" disabled>Select component role</option>{Object.keys(program.component_roles).map((role) => <option key={role}>{role}</option>)}</select></label>
+            <label>Required capabilities<input value={targetCapabilities} disabled={busy} placeholder="planning.motion.pose_goal" onChange={(event) => setTargetCapabilities(event.target.value)} /></label>
+            <label>Frame roles<input value={targetFrameRoles} disabled={busy} placeholder="base, tcp" onChange={(event) => setTargetFrameRoles(event.target.value)} /></label>
+            <label>Resource roles<input value={targetResourceRoles} disabled={busy} onChange={(event) => setTargetResourceRoles(event.target.value)} /></label>
+            <label>Collision-body roles<input value={targetCollisionRoles} disabled={busy} onChange={(event) => setTargetCollisionRoles(event.target.value)} /></label>
+            <label>Model roles<input value={targetModelRoles} disabled={busy} onChange={(event) => setTargetModelRoles(event.target.value)} /></label>
+            <button type="button" disabled={busy || !targetRoleId.trim()} onClick={addTargetRole}>Create target role</button>
+          </div>
+        </details>
       </section>
 
     </form>

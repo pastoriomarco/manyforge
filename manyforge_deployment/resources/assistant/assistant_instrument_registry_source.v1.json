@@ -7335,6 +7335,7 @@
                     "properties": {
                       "carrier_frame_role": {
                         "type": "string",
+                        "x-manyforge-semantic-scope-parameter": "target_role",
                         "x-manyforge-semantic-type": "frame_role"
                       },
                       "scene_resource_id": {
@@ -7348,6 +7349,7 @@
                       "touch_body_roles": {
                         "items": {
                           "type": "string",
+                          "x-manyforge-semantic-scope-parameter": "target_role",
                           "x-manyforge-semantic-type": "collision_body_role"
                         },
                         "maxItems": 256,
@@ -9828,6 +9830,7 @@
                     "properties": {
                       "carrier_frame_role": {
                         "type": "string",
+                        "x-manyforge-semantic-scope-parameter": "target_role",
                         "x-manyforge-semantic-type": "frame_role"
                       },
                       "scene_resource_id": {
@@ -9841,6 +9844,7 @@
                       "touch_body_roles": {
                         "items": {
                           "type": "string",
+                          "x-manyforge-semantic-scope-parameter": "target_role",
                           "x-manyforge-semantic-type": "collision_body_role"
                         },
                         "maxItems": 256,
@@ -11849,6 +11853,31 @@
         "type": "object"
       },
       "tool_id": "tree_draft_move_node"
+    },
+    {
+      "description": "Rename one Draft node's canonical instance identity atomically.",
+      "effect": "composer_draft_mutating",
+      "input_schema": {
+        "additionalProperties": false,
+        "properties": {
+          "instance_id": {
+            "maxLength": 256,
+            "pattern": "^[a-z][a-z0-9_.-]*$",
+            "type": "string"
+          },
+          "new_instance_id": {
+            "maxLength": 256,
+            "pattern": "^[a-z][a-z0-9_.-]*$",
+            "type": "string"
+          }
+        },
+        "required": [
+          "instance_id",
+          "new_instance_id"
+        ],
+        "type": "object"
+      },
+      "tool_id": "tree_draft_rename_node"
     },
     {
       "description": "Atomically replace one Draft subtree with an exact v2 subtree.",
@@ -14043,6 +14072,7 @@
                     "properties": {
                       "carrier_frame_role": {
                         "type": "string",
+                        "x-manyforge-semantic-scope-parameter": "target_role",
                         "x-manyforge-semantic-type": "frame_role"
                       },
                       "scene_resource_id": {
@@ -14056,6 +14086,7 @@
                       "touch_body_roles": {
                         "items": {
                           "type": "string",
+                          "x-manyforge-semantic-scope-parameter": "target_role",
                           "x-manyforge-semantic-type": "collision_body_role"
                         },
                         "maxItems": 256,
@@ -19719,6 +19750,7 @@
                 "properties": {
                   "carrier_frame_role": {
                     "type": "string",
+                    "x-manyforge-semantic-scope-parameter": "target_role",
                     "x-manyforge-semantic-type": "frame_role"
                   },
                   "scene_resource_id": {
@@ -19732,6 +19764,7 @@
                   "touch_body_roles": {
                     "items": {
                       "type": "string",
+                      "x-manyforge-semantic-scope-parameter": "target_role",
                       "x-manyforge-semantic-type": "collision_body_role"
                     },
                     "maxItems": 256,

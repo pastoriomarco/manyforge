@@ -56,7 +56,13 @@ export function CanvasViewControls({
           title="Fit complete tree in canvas"
           aria-label="Fit complete tree in canvas"
         >
-          <span aria-hidden="true">⌗</span>
+          <svg
+            className="canvas-fit-icon"
+            viewBox="0 0 16 16"
+            aria-hidden="true"
+          >
+            <path d="M6 3H3v3M10 3h3v3M3 10v3h3M13 10v3h-3" />
+          </svg>
         </button>
       )}
       <select

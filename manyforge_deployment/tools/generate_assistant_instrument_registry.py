@@ -86,6 +86,7 @@ COMPOSER_TOOL_IDS = (
     "tree_draft_delete_node",
     "tree_draft_insert_node",
     "tree_draft_move_node",
+    "tree_draft_rename_node",
     "tree_draft_replace_subtree",
     "tree_draft_update_node_params",
     "tree_draft_wrap_node",
@@ -1137,6 +1138,18 @@ def _tools(catalog: NodeCatalog) -> list[dict[str, Any]]:
                     "index": {"type": "integer", "minimum": 0, "maximum": MAX_ITEMS},
                 },
                 required=("instance_id", "new_parent_instance_id"),
+            ),
+        ),
+        _tool(
+            "tree_draft_rename_node",
+            "composer_draft_mutating",
+            "Rename one Draft node's canonical instance identity atomically.",
+            _object(
+                {
+                    "instance_id": copy.deepcopy(IDENTIFIER),
+                    "new_instance_id": copy.deepcopy(IDENTIFIER),
+                },
+                required=("instance_id", "new_instance_id"),
             ),
         ),
         _tool(

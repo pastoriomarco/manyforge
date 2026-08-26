@@ -8,6 +8,7 @@ import {
   type ProgramWorkspaceActionName,
 } from '../state/programWorkspace';
 import type {
+  DraftMutationResponse,
   JsonValue,
   ProgramNodeModificationPolicy,
   ProgramNodeRecoveryPolicy,
@@ -154,7 +155,7 @@ export function useProgramWorkspace(snapshot: ComposerHeadlessState | null = nul
   const run = useCallback(async (
     action: ProgramWorkspaceActionName,
     request: () => Promise<ProgramWorkspaceRunResult>,
-  ) => {
+  ): Promise<ProgramWorkspaceRunResult | null> => {
     const current = generation.current + 1;
     generation.current = current;
     dispatch({ type: 'request_started', generation: current, action });
@@ -169,6 +170,7 @@ export function useProgramWorkspace(snapshot: ComposerHeadlessState | null = nul
           transitionStatus: result.transitionStatus,
         });
       }
+      return result;
     } catch (error: unknown) {
       if (mounted.current) {
         dispatch({
@@ -177,6 +179,7 @@ export function useProgramWorkspace(snapshot: ComposerHeadlessState | null = nul
           error: errorMessage(error, 'Program workspace request failed.'),
         });
       }
+      return null;
     }
   }, []);
 
@@ -213,18 +216,22 @@ export function useProgramWorkspace(snapshot: ComposerHeadlessState | null = nul
   const requireWorkspace = useCallback((): ProgramWorkspaceResponse | null =>
     state.workspace, [state.workspace]);
 
-  const mutate = useCallback((
+  const mutate = useCallback(async (
     mutation: string,
     args: Record<string, JsonValue>,
-  ) => {
+  ): Promise<DraftMutationResponse | null> => {
     const workspace = requireWorkspace();
     const requestFence = fence(workspace, snapshot, requestOwnerEpoch.current);
-    if (!requestFence) return;
-    void run(
+    if (!requestFence) return null;
+    let response: DraftMutationResponse | null = null;
+    const result = await run(
       'mutate',
-      () => api.programWorkspace.mutate(requestFence, mutation, args)
-        .then((response) => workspaceResult(response.workspace, null)),
+      async () => {
+        response = await api.programWorkspace.mutate(requestFence, mutation, args);
+        return workspaceResult(response.workspace, null);
+      },
     );
+    return result === null ? null : response;
   }, [requireWorkspace, run, snapshot]);
 
   const openDraft = useCallback((path: string, confirmDiscard: boolean) => {

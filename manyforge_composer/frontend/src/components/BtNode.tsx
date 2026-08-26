@@ -76,7 +76,14 @@ export function BtNode({
       updateNodeInternals(node.id);
     });
     return () => window.cancelAnimationFrame(frame);
-  }, [node.childrenMax, node.id, node.layoutDirection, updateNodeInternals]);
+  }, [
+    node.catalogId,
+    node.childrenMax,
+    node.id,
+    node.label,
+    node.layoutDirection,
+    updateNodeInternals,
+  ]);
   return (
     <div
       ref={elementRef}

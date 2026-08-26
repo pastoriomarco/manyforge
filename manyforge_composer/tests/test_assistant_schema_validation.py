@@ -50,7 +50,7 @@ def test_draft_owner_tool_set_is_exactly_the_generated_callback_set() -> None:
     generated = set(draft_tools)
 
     assert generated == set(SUPPORTED_DRAFT_MUTATIONS)
-    assert len(generated) == 17
+    assert len(generated) == 18
     assert all(
         "force_discard_overrides"
         not in json.dumps(row["input_schema"], sort_keys=True)

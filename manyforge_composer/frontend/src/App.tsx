@@ -49,6 +49,12 @@ export default function App() {
   const [sceneEditorTarget, setSceneEditorTarget] = useState<HTMLElement | null>(null);
   const [runtimeDetailsOpen, setRuntimeDetailsOpen] = useState(false);
   const [programInvalidEdit, setProgramInvalidEdit] = useState(false);
+  const [programSettingsRequest, setProgramSettingsRequest] = useState(0);
+  const [programRequirementCreated, setProgramRequirementCreated] = useState<{
+    sequence: number;
+    id: string;
+    kind: 'component_role' | 'target_role';
+  } | null>(null);
   const workbench = useRef<HTMLDivElement>(null);
   const [health, retryHealth] = useStructuralResource(api.health.get, {
     failureMessage: 'Could not read the Composer structural boundary.',
@@ -174,6 +180,12 @@ export default function App() {
           controller={programController}
           runtime={programRuntime}
           localInvalidEdit={programInvalidEdit}
+          settingsRequest={programSettingsRequest}
+          onProgramRequirementCreated={(kind, id) => setProgramRequirementCreated((current) => ({
+            sequence: (current?.sequence ?? 0) + 1,
+            kind,
+            id,
+          }))}
         />
         <RuntimeStatusOverlay
           status={runtimeView}
@@ -203,6 +215,9 @@ export default function App() {
               onRetryCatalog={retryCatalog}
               onRetryEnvironment={retryNodeEnvironment}
               onInvalidEditChange={setProgramInvalidEdit}
+              onOpenScene={() => setActiveWorkspace('scene')}
+              onOpenProgramSettings={() => setProgramSettingsRequest((current) => current + 1)}
+              programRequirementCreated={programRequirementCreated}
             />
           ) : activeWorkspace === 'scene' ? (
             <div

@@ -85,9 +85,9 @@ describe('Composer shell continuity', () => {
     expect(overlaySource).toContain("event.key !== 'Escape'");
     expect(overlaySource).toContain('returnFocusRef?.current?.focus()');
     expect(overlaySource).toMatch(/event\.preventDefault\(\);\s*close\(\);/);
-    expect(treeSource).toContain("canvasMessageKind !== 'info'");
-    expect(treeSource).toContain('window.setTimeout(clearCanvasMessage, 4_000)');
-    expect(treeSource).toContain('aria-label="Dismiss canvas message"');
+    expect(treeSource).toContain('<ProgramNoticeRail');
+    expect(workspaceSource).toContain('PROGRAM_INFO_NOTICE_TIMEOUT_MS = 4_000');
+    expect(workspaceSource).toContain('onDismissAllNotices={dismissAllNotices}');
     expect(source.match(/<SceneAuthoringWorkspace/g)).toHaveLength(1);
     expect(source.match(/useHeadlessStateSource\(headlessEnabled\)/g)).toHaveLength(1);
     expect(sceneSource.match(/<StructuralViewer/g)).toHaveLength(1);

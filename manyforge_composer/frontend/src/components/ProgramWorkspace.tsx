@@ -19,7 +19,11 @@ import {
   type ProgramDeclarationSelection,
 } from './ProgramDeclarationsNavigator';
 import { ProgramNodePalette } from './ProgramNodePalette';
-import { ProgramPropertyEditor } from './ProgramPropertyEditor';
+import type { ProgramNotice, ProgramNoticeInput } from './ProgramNoticeRail';
+import {
+  buildProgramParameterMutation,
+  ProgramPropertyEditor,
+} from './ProgramPropertyEditor';
 import { ProgramTreeCanvas } from './ProgramTreeCanvas';
 
 const PROGRAM_TOOL_MIN = 160;
@@ -29,9 +33,22 @@ const PROGRAM_INSPECTOR_MAX = 480;
 const PROGRAM_CANVAS_MIN = 216;
 const PROGRAM_DIVIDER_WIDTH = 7;
 const PROGRAM_COLLAPSED_RAIL_WIDTH = 38;
+export const PROGRAM_INFO_NOTICE_TIMEOUT_MS = 4_000;
 
 function clamp(value: number, min: number, max: number): number {
   return Math.min(Math.max(value, min), max);
+}
+
+export function mergeProgramNotice(
+  current: ProgramNotice[],
+  notice: ProgramNotice,
+  limit = 8,
+): ProgramNotice[] {
+  const existing = current.some((row) => row.key === notice.key);
+  const next = existing
+    ? current.map((row) => row.key === notice.key ? notice : row)
+    : [...current, notice];
+  return next.slice(-limit);
 }
 
 interface ProgramWorkspaceProps {
@@ -42,6 +59,13 @@ interface ProgramWorkspaceProps {
   onRetryCatalog: () => void;
   onRetryEnvironment: () => void;
   onInvalidEditChange?: (invalid: boolean) => void;
+  onOpenScene?: () => void;
+  onOpenProgramSettings?: () => void;
+  programRequirementCreated?: {
+    sequence: number;
+    id: string;
+    kind: 'component_role' | 'target_role';
+  } | null;
 }
 
 export function ProgramWorkspace({
@@ -52,6 +76,9 @@ export function ProgramWorkspace({
   onRetryCatalog,
   onRetryEnvironment,
   onInvalidEditChange,
+  onOpenScene,
+  onOpenProgramSettings,
+  programRequirementCreated = null,
 }: ProgramWorkspaceProps) {
   const {
     state,
@@ -67,10 +94,27 @@ export function ProgramWorkspace({
   const [inspectorCollapsed, setInspectorCollapsed] = useState(false);
   const [toolView, setToolView] = useState<'nodes' | 'params'>('nodes');
   const [declarationSelection, setDeclarationSelection] = useState<ProgramDeclarationSelection | null>(null);
+  const [declarationPrefill, setDeclarationPrefill] = useState<{
+    expectedType: string | null;
+    expectedAccess: 'read' | 'write' | 'read_write' | null;
+  } | null>(null);
+  const [pendingReference, setPendingReference] = useState<{
+    nodeId: string;
+    parameterId: string;
+    semanticType: string;
+    target: 'blackboard_key' | 'program_parameter' | 'program_requirements';
+    createdId: string | null;
+    applying: boolean;
+  } | null>(null);
   const [invalidLocalEdit, setInvalidLocalEdit] = useState(false);
   const [paletteWidth, setPaletteWidth] = useState(216);
   const [inspectorWidth, setInspectorWidth] = useState(288);
   const [authoringWidth, setAuthoringWidth] = useState(856);
+  const [notices, setNotices] = useState<ProgramNotice[]>([]);
+  const noticeSequence = useRef(0);
+  const noticeIdsByKey = useRef(new Map<string, string>());
+  const noticeTimeouts = useRef(new Map<string, number>());
+  const observedRequirementSequence = useRef(0);
   const authoringGrid = useRef<HTMLDivElement>(null);
   const paletteCollapseButton = useRef<HTMLButtonElement>(null);
   const paletteRail = useRef<HTMLButtonElement>(null);
@@ -78,6 +122,60 @@ export function ProgramWorkspace({
   const inspectorRail = useRef<HTMLButtonElement>(null);
   const previousPaletteCollapsed = useRef(false);
   const previousInspectorCollapsed = useRef(false);
+  const dismissNotice = useCallback((id: string) => {
+    const timeout = noticeTimeouts.current.get(id);
+    if (timeout !== undefined) window.clearTimeout(timeout);
+    noticeTimeouts.current.delete(id);
+    setNotices((current) => {
+      const removed = current.find((notice) => notice.id === id);
+      if (removed) noticeIdsByKey.current.delete(removed.key);
+      return current.filter((notice) => notice.id !== id);
+    });
+  }, []);
+  const reportNotice = useCallback((input: ProgramNoticeInput) => {
+    const kind = input.kind ?? 'info';
+    const noticeId = noticeIdsByKey.current.get(input.key)
+      ?? `program-notice-${++noticeSequence.current}`;
+    noticeIdsByKey.current.set(input.key, noticeId);
+    setNotices((current) => {
+      const notice: ProgramNotice = {
+        id: noticeId,
+        key: input.key,
+        kind,
+        message: input.message,
+        dismissible: input.dismissible ?? true,
+      };
+      const bounded = mergeProgramNotice(current, notice);
+      const retainedIds = new Set(bounded.map((row) => row.id));
+      for (const [key, id] of noticeIdsByKey.current) {
+        if (!retainedIds.has(id)) noticeIdsByKey.current.delete(key);
+      }
+      return bounded;
+    });
+    const previousTimeout = noticeTimeouts.current.get(noticeId);
+    if (previousTimeout !== undefined) window.clearTimeout(previousTimeout);
+    if (kind === 'info') {
+      const timeout = window.setTimeout(
+        () => dismissNotice(noticeId),
+        PROGRAM_INFO_NOTICE_TIMEOUT_MS,
+      );
+      noticeTimeouts.current.set(noticeId, timeout);
+    }
+  }, [dismissNotice]);
+  const dismissAllNotices = useCallback(() => {
+    for (const timeout of noticeTimeouts.current.values()) window.clearTimeout(timeout);
+    noticeTimeouts.current.clear();
+    setNotices((current) => {
+      const retained = current.filter((notice) => !notice.dismissible);
+      noticeIdsByKey.current = new Map(retained.map((notice) => [notice.key, notice.id]));
+      return retained;
+    });
+    clearFeedback();
+  }, [clearFeedback]);
+  useEffect(() => () => {
+    for (const timeout of noticeTimeouts.current.values()) window.clearTimeout(timeout);
+    noticeTimeouts.current.clear();
+  }, []);
   const workspace = state.workspace;
   const authoring = workspace?.draft.authoring ?? null;
   const diagnostics = useMemo(
@@ -119,6 +217,15 @@ export function ProgramWorkspace({
     onInvalidEditChange?.(invalidLocalEdit);
     return () => onInvalidEditChange?.(false);
   }, [invalidLocalEdit, onInvalidEditChange]);
+  useEffect(() => {
+    const message = state.error ?? state.message;
+    if (!message || workspace === null) return;
+    reportNotice({
+      key: state.error ? `workspace-error:${message}` : `workspace-message:${message}`,
+      message,
+      kind: state.error ? 'error' : 'info',
+    });
+  }, [reportNotice, state.error, state.message, workspace]);
 
   const validNodeIds = useMemo(
     () => new Set(authoring ? flattenProgramForest(authoring.forest)
@@ -156,6 +263,52 @@ export function ProgramWorkspace({
         );
     if (declarationSelection.id && !exists) setDeclarationSelection(null);
   }, [authoring, declarationSelection]);
+  useEffect(() => {
+    if (
+      programRequirementCreated === null
+      || programRequirementCreated.sequence === observedRequirementSequence.current
+    ) return;
+    observedRequirementSequence.current = programRequirementCreated.sequence;
+    setPendingReference((current) => current?.target === 'program_requirements'
+      && current.semanticType === programRequirementCreated.kind
+      ? { ...current, createdId: programRequirementCreated.id, applying: false }
+      : current);
+  }, [programRequirementCreated]);
+  useEffect(() => {
+    if (
+      pendingReference === null
+      || pendingReference.createdId === null
+      || pendingReference.applying
+      || authoring === null
+      || !mutationAvailable
+    ) return;
+    const node = flattenProgramForest(authoring.forest).find(
+      (row) => row.node.instance_id === pendingReference.nodeId,
+    )?.node;
+    const declarationExists = pendingReference.target === 'blackboard_key'
+      ? (authoring.blackboard?.keys ?? []).some((row) => row.key === pendingReference.createdId)
+      : pendingReference.target === 'program_parameter'
+        ? (authoring.parameters ?? []).some(
+          (row) => row.parameter_id === pendingReference.createdId,
+        )
+        : pendingReference.semanticType === 'component_role'
+          ? authoring.component_roles[pendingReference.createdId] !== undefined
+          : authoring.target_roles[pendingReference.createdId] !== undefined;
+    if (!node || !declarationExists) return;
+    const request = buildProgramParameterMutation(node, pendingReference.parameterId, {
+      kind: 'literal',
+      value: pendingReference.createdId,
+    });
+    setPendingReference((current) => current === null ? null : { ...current, applying: true });
+    void mutate(request.mutation, request.args).then((response) => {
+      if (response !== null) {
+        setToolView('nodes');
+        setSelectedNodeId(pendingReference.nodeId);
+      }
+      setPendingReference(null);
+      setDeclarationPrefill(null);
+    });
+  }, [authoring, mutate, mutationAvailable, pendingReference]);
   useEffect(() => {
     if (paletteCollapsed) paletteRail.current?.focus();
     else if (previousPaletteCollapsed.current) paletteCollapseButton.current?.focus();
@@ -229,15 +382,6 @@ export function ProgramWorkspace({
           <div className="program-workspace-notice error-state" role="alert">
             <span><strong>Program workspace unavailable.</strong> {state.error}</span>
             <button type="button" onClick={refresh}>Retry workspace</button>
-          </div>
-        )}
-        {(state.message || state.error) && workspace !== null && (
-          <div
-            className={`program-workspace-notice${state.error ? ' error-state' : ''}`}
-            role={state.error ? 'alert' : 'status'}
-          >
-            <span>{state.error ?? state.message}</span>
-            <button type="button" className="text-button" onClick={clearFeedback}>Dismiss</button>
           </div>
         )}
         {runtime.active && (
@@ -369,6 +513,15 @@ export function ProgramWorkspace({
             busy={authoringBusy}
             onSelect={selectNode}
             onMutate={mutate}
+            notices={notices}
+            onNotice={reportNotice}
+            onDismissNotice={(id) => {
+              const ownerFeedback = notices.find((notice) => notice.id === id)
+                ?.key.startsWith('workspace-') === true;
+              dismissNotice(id);
+              if (ownerFeedback) clearFeedback();
+            }}
+            onDismissAllNotices={dismissAllNotices}
           />
         ) : (
           <section className="program-tree-surface program-tree-empty" aria-label="Program tree canvas">
@@ -429,10 +582,38 @@ export function ProgramWorkspace({
                   roots={authoring.forest}
                   selectedId={selectedNodeId}
                   catalogEntries={catalogEntries}
-                  programParameters={authoring.parameters ?? []}
-                  blackboardKeys={authoring.blackboard?.keys ?? []}
+                  program={authoring}
                   busy={authoringBusy}
                   onMutate={mutate}
+                  onCreateReference={(target, expectedType, expectedAccess, source) => {
+                    if (target === 'scene_resource') {
+                      onOpenScene?.();
+                    } else if (target === 'program_requirements') {
+                      setPendingReference({
+                        ...source,
+                        target,
+                        createdId: null,
+                        applying: false,
+                      });
+                      onOpenProgramSettings?.();
+                    } else {
+                      setPendingReference({
+                        ...source,
+                        target,
+                        createdId: null,
+                        applying: false,
+                      });
+                      setDeclarationPrefill({ expectedType, expectedAccess });
+                      setToolView('params');
+                      setDeclarationSelection({
+                        kind: target === 'blackboard_key' ? 'key' : 'parameter',
+                        id: '',
+                      });
+                    }
+                  }}
+                  onRenamed={(previousId, renamedId) => {
+                    if (selectedNodeId === previousId) setSelectedNodeId(renamedId);
+                  }}
                   onUpdateNodePolicies={updateNodePolicies}
                   onInvalidEditChange={setInvalidLocalEdit}
                   diagnostics={diagnostics}
@@ -447,9 +628,18 @@ export function ProgramWorkspace({
                   namespaces={authoring.blackboard?.namespaces ?? []}
                   keys={authoring.blackboard?.keys ?? []}
                   catalogEntries={catalogEntries}
+                  creationExpectedType={declarationPrefill?.expectedType ?? null}
+                  creationExpectedAccess={declarationPrefill?.expectedAccess ?? null}
                   busy={authoringBusy}
                   onMutate={mutate}
                   onSelectNode={selectNode}
+                  onCreated={(selection) => {
+                    setPendingReference((current) => current === null ? null : {
+                      ...current,
+                      createdId: selection.id,
+                      applying: false,
+                    });
+                  }}
                   onInvalidEditChange={setInvalidLocalEdit}
                   diagnostics={diagnostics}
                 />

@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 from dataclasses import dataclass, field
 from types import MappingProxyType
 from typing import Any, Mapping
@@ -37,6 +38,7 @@ _ALLOWED_INLINE_SCHEMA_KEYS = {
     "resolves_to",
     "requires_current_value",
     "semantic_type",
+    "semantic_scope_parameter",
 }
 _NUMERIC_CONSTRAINT_KEYS = {
     "min_inclusive",
@@ -49,12 +51,20 @@ _SEMANTIC_TYPES = {
     "collision_body_role",
     "component_role",
     "frame_role",
+    "model_role",
     "parameter_ref",
     "resource_role",
     "scene_resource",
     "source_joint",
     "target_role",
 }
+_SCOPED_SEMANTIC_TYPES = {
+    "collision_body_role",
+    "frame_role",
+    "model_role",
+    "resource_role",
+}
+_PORTABLE_ID_RE = re.compile(r"^[a-z][a-z0-9_.-]*$")
 
 
 def _strip_schema_descriptions(value: Any, *, in_properties_map: bool = False) -> Any:
@@ -140,6 +150,7 @@ class CatalogSchema:
     resolves_to: str | None = None
     requires_current_value: bool = False
     semantic_type: str | None = None
+    semantic_scope_parameter: str | None = None
 
     def is_ref(self) -> bool:
         return self.ref is not None
@@ -356,6 +367,20 @@ def parse_schema(raw_schema: Any, *, path: str) -> CatalogSchema:
                 f"{path}.semantic_type requires type=string"
             )
 
+    semantic_scope_parameter = raw_schema.get("semantic_scope_parameter")
+    if semantic_scope_parameter is not None:
+        if (
+            not isinstance(semantic_scope_parameter, str)
+            or _PORTABLE_ID_RE.fullmatch(semantic_scope_parameter) is None
+        ):
+            raise CatalogSchemaError(
+                f"{path}.semantic_scope_parameter must be a portable parameter ID"
+            )
+        if semantic_type not in _SCOPED_SEMANTIC_TYPES:
+            raise CatalogSchemaError(
+                f"{path}.semantic_scope_parameter requires a scoped role semantic_type"
+            )
+
     return CatalogSchema(
         schema_type=str(schema_type),
         description=_optional_string(raw_schema, "description", path),
@@ -376,6 +401,7 @@ def parse_schema(raw_schema: Any, *, path: str) -> CatalogSchema:
         resolves_to=resolves_to,
         requires_current_value=requires_current_value,
         semantic_type=semantic_type,
+        semantic_scope_parameter=semantic_scope_parameter,
     )
 
 
@@ -706,6 +732,10 @@ def _to_json_schema(schema: CatalogSchema, registry: CatalogSchemaRegistry) -> d
     _apply_numeric_json_constraints(result, schema)
     if schema.semantic_type is not None:
         result["x-manyforge-semantic-type"] = schema.semantic_type
+    if schema.semantic_scope_parameter is not None:
+        result["x-manyforge-semantic-scope-parameter"] = (
+            schema.semantic_scope_parameter
+        )
     return result
 
 

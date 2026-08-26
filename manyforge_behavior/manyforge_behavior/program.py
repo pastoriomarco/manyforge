@@ -2689,6 +2689,7 @@ def _validate_semantic_value(
     *,
     path: str,
     context: _ProgramValidationContext,
+    node_parameters: Mapping[str, Any],
 ) -> None:
     concrete = context.catalog.schema_registry.resolve(schema)
     semantic_type = concrete.semantic_type
@@ -2726,13 +2727,30 @@ def _validate_semantic_value(
                     "collision_body_role": "required_collision_body_roles",
                     "model_role": "required_model_roles",
                 }[semantic_type]
-                if not any(
-                    identity in target.get(role_field, ())
-                    for target in context.target_roles.values()
-                ):
+                scope_parameter = concrete.semantic_scope_parameter
+                if scope_parameter is None:
+                    accepted = any(
+                        identity in target.get(role_field, ())
+                        for target in context.target_roles.values()
+                    )
+                    scope_description = "any target role"
+                else:
+                    scope_value = node_parameters.get(scope_parameter)
+                    if type(scope_value) is not str:
+                        _program_error(
+                            path,
+                            f"cannot resolve semantic scope from {scope_parameter!r}",
+                        )
+                    scoped_target = context.target_roles.get(scope_value)
+                    accepted = scoped_target is not None and identity in scoped_target.get(
+                        role_field,
+                        (),
+                    )
+                    scope_description = f"target role {scope_value!r}"
+                if not accepted:
                     _program_error(
                         path,
-                        f"does not name a {semantic_type} required by any target role",
+                        f"does not name a {semantic_type} required by {scope_description}",
                     )
     if concrete.schema_type == "object" and type(value) is dict:
         for name, nested in value.items():
@@ -2745,6 +2763,7 @@ def _validate_semantic_value(
                     nested,
                     path=f"{path}.{name}",
                     context=context,
+                    node_parameters=node_parameters,
                 )
         orientation = value.get("orientation")
         if orientation is not None:
@@ -2771,6 +2790,7 @@ def _validate_semantic_value(
                 item,
                 path=f"{path}[{index}]",
                 context=context,
+                node_parameters=node_parameters,
             )
             item_schema = context.catalog.schema_registry.resolve(concrete.items)
             if (
@@ -3164,6 +3184,12 @@ def _validate_program_tree(
     selector_parameters = (
         condition_parameters | target_parameters | component_parameters
     )
+    effective_parameters = {
+        parameter_id: catalog_parameter.default
+        for parameter_id, catalog_parameter in catalog_parameters.items()
+        if catalog_parameter.has_default
+    }
+    effective_parameters.update(parameters)
 
     for parameter_id, catalog_parameter in catalog_parameters.items():
         supplied_literal = parameter_id in parameters
@@ -3196,6 +3222,7 @@ def _validate_program_tree(
                 parameters[parameter_id],
                 path=f"{path}.parameters.{parameter_id}",
                 context=context,
+                node_parameters=effective_parameters,
             )
             _validate_nested_value_sources(
                 catalog_parameter.schema,

@@ -26,6 +26,11 @@ interface ProgramDocumentControlsProps {
   controller: ProgramWorkspaceController;
   runtime: ProgramRuntimeController;
   localInvalidEdit?: boolean;
+  settingsRequest?: number;
+  onProgramRequirementCreated?: (
+    kind: 'component_role' | 'target_role',
+    id: string,
+  ) => void;
 }
 
 function shortRevision(revision: string | null): string {
@@ -49,6 +54,8 @@ export function ProgramDocumentControls({
   controller,
   runtime,
   localInvalidEdit = false,
+  settingsRequest = 0,
+  onProgramRequirementCreated,
 }: ProgramDocumentControlsProps) {
   const {
     state,
@@ -72,6 +79,7 @@ export function ProgramDocumentControls({
   const [saveAsPath, setSaveAsPath] = useState('');
   const returnFocus = useRef<HTMLElement | null>(null);
   const settingsButton = useRef<HTMLButtonElement>(null);
+  const observedSettingsRequest = useRef(settingsRequest);
   const workspace = state.workspace;
   const program = workspace?.draft.program ?? null;
   const authoring = workspace?.draft.authoring ?? null;
@@ -109,6 +117,12 @@ export function ProgramDocumentControls({
   useEffect(() => {
     if (workspace?.saved.path) setSaveAsPath(workspace.saved.path);
   }, [workspace?.saved.path]);
+
+  useEffect(() => {
+    if (settingsRequest === observedSettingsRequest.current) return;
+    observedSettingsRequest.current = settingsRequest;
+    if (authoring !== null) setSettingsOpen(true);
+  }, [authoring, settingsRequest]);
 
   useEffect(() => {
     if (!workspace?.hasUnsavedChanges && !workspace?.hasUnappliedChanges) return undefined;
@@ -253,6 +267,7 @@ export function ProgramDocumentControls({
             runtime={runtime}
             onMutate={controller.mutate}
             onInvalidChange={setSettingsInvalid}
+            onRoleCreated={onProgramRequirementCreated}
             diagnostics={workspace?.draft.diagnostics ?? []}
           />
         )}

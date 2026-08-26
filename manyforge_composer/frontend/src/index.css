@@ -4399,6 +4399,289 @@ code {
   border-left: 1px solid #29404d;
 }
 
+/* UI2-SE: one measured canvas and one compact chrome/notice contract. */
+.program-tree-react-flow {
+  --program-canvas-control-height: 2.05rem;
+}
+
+.program-tree-react-flow .bt-node {
+  width: max-content;
+  min-width: 9.75rem;
+  max-width: 18rem;
+  min-height: 4.35rem;
+  box-sizing: border-box;
+}
+
+.program-tree-react-flow .bt-node strong,
+.program-tree-react-flow .bt-node small {
+  max-width: 100%;
+  overflow-wrap: anywhere;
+  white-space: normal;
+}
+
+.program-canvas-topbar {
+  position: absolute;
+  z-index: 12;
+  top: 0.45rem;
+  right: 0.45rem;
+  bottom: 3.55rem;
+  left: 0.45rem;
+  display: grid;
+  grid-template-columns: var(--program-canvas-control-height) minmax(0, 1fr) auto;
+  align-items: start;
+  gap: 0.4rem;
+  pointer-events: none;
+}
+
+.program-canvas-topbar > * {
+  pointer-events: auto;
+}
+
+.program-canvas-toolbar,
+.program-canvas-help {
+  position: static;
+}
+
+.program-canvas-help {
+  grid-column: 1;
+}
+
+.program-notice-rail {
+  grid-column: 2;
+}
+
+.program-canvas-toolbar {
+  grid-column: 3;
+}
+
+.program-canvas-help {
+  width: var(--program-canvas-control-height);
+  height: var(--program-canvas-control-height);
+}
+
+.program-canvas-toolbar .canvas-view-controls {
+  height: var(--program-canvas-control-height);
+  box-sizing: border-box;
+}
+
+.program-canvas-toolbar .canvas-view-controls button,
+.program-canvas-toolbar .canvas-view-controls select {
+  height: calc(var(--program-canvas-control-height) - 0.48rem);
+  min-height: calc(var(--program-canvas-control-height) - 0.48rem);
+  box-sizing: border-box;
+}
+
+.program-canvas-toolbar .canvas-view-controls button {
+  display: grid;
+  place-items: center;
+  line-height: 1;
+}
+
+.program-canvas-toolbar .canvas-fit-icon {
+  width: 0.92rem;
+  height: 0.92rem;
+  fill: none;
+  stroke: currentColor;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+  stroke-width: 1.5;
+}
+
+.program-notice-rail {
+  min-width: 0;
+  max-height: 100%;
+  overflow: hidden;
+  border: 1px solid #396475;
+  border-radius: 0.4rem;
+  color: #c2dce4;
+  background: rgb(12 38 49 / 50%);
+}
+
+.program-notice-rail.has-error {
+  border-color: #80574c;
+  color: #f0bbb0;
+  background: rgb(43 27 26 / 50%);
+}
+
+.program-notice-summary {
+  display: flex;
+  height: calc(var(--program-canvas-control-height) - 2px);
+  min-width: 0;
+  align-items: center;
+  gap: 0.25rem;
+  padding: 0 0.3rem 0 0.55rem;
+  box-sizing: border-box;
+  font-size: 0.66rem;
+}
+
+.program-notice-summary-text {
+  min-width: 0;
+  flex: 1 1 auto;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.program-notice-summary button,
+.program-notice-item button {
+  flex: 0 0 auto;
+  min-height: 1.45rem;
+  padding: 0.12rem 0.34rem;
+  border-color: transparent;
+  background: rgb(7 18 26 / 52%);
+  font-size: 0.62rem;
+}
+
+.program-notice-list {
+  display: grid;
+  max-height: calc(100% - var(--program-canvas-control-height));
+  overflow-y: auto;
+  border-top: 1px solid rgb(75 111 126 / 55%);
+}
+
+.program-notice-item {
+  display: flex;
+  align-items: start;
+  justify-content: space-between;
+  gap: 0.5rem;
+  padding: 0.42rem 0.5rem;
+  background: rgb(7 21 29 / 82%);
+  font-size: 0.66rem;
+}
+
+.program-notice-item + .program-notice-item {
+  border-top: 1px solid rgb(75 111 126 / 35%);
+}
+
+.program-notice-item.notice-error {
+  color: #f0bbb0;
+}
+
+.program-tree-react-flow .program-tree-actions {
+  display: flex;
+  height: var(--program-canvas-control-height);
+  min-height: var(--program-canvas-control-height);
+  max-height: var(--program-canvas-control-height);
+  max-width: calc(100% - 0.9rem);
+  align-items: center;
+  flex-wrap: nowrap;
+  overflow-x: auto;
+  overflow-y: hidden;
+  padding: 0.18rem;
+  border-radius: 0.4rem;
+  box-sizing: border-box;
+  white-space: nowrap;
+}
+
+.program-tree-react-flow .program-tree-actions button,
+.program-tree-react-flow .program-tree-actions select {
+  height: calc(var(--program-canvas-control-height) - 0.48rem);
+  min-height: calc(var(--program-canvas-control-height) - 0.48rem);
+  margin: 0;
+  box-sizing: border-box;
+}
+
+.program-tree-react-flow .program-tree-actions .inline-select-label {
+  display: inline-flex;
+  align-items: center;
+  flex: 0 0 auto;
+  gap: 0.35rem;
+}
+
+.program-node-identity {
+  display: grid;
+  gap: 0.55rem;
+}
+
+.program-node-identity > span,
+.program-node-identity > span:last-child {
+  justify-items: start;
+  text-align: left;
+}
+
+.program-node-name-row {
+  display: grid;
+  gap: 0.25rem;
+}
+
+.program-schema-list,
+.program-schema-object,
+.program-schema-map {
+  min-width: 0;
+  padding: 0.45rem;
+  border: 1px solid #294552;
+  border-radius: 0.4rem;
+}
+
+.program-schema-list-rows,
+.program-schema-list-row,
+.program-schema-object,
+.program-schema-object-field,
+.program-schema-map-row {
+  display: grid;
+  min-width: 0;
+  gap: 0.45rem;
+}
+
+.program-schema-list-row + .program-schema-list-row,
+.program-schema-map-row + .program-schema-map-row {
+  padding-top: 0.5rem;
+  border-top: 1px solid #203542;
+}
+
+.program-schema-row-actions,
+.program-schema-map-add {
+  display: flex;
+  min-width: 0;
+  gap: 0.35rem;
+}
+
+.program-schema-map-add input {
+  min-width: 0;
+  flex: 1 1 auto;
+}
+
+.program-role-requirements > p {
+  margin: 0;
+  color: #91a7b2;
+  font-size: 0.68rem;
+  line-height: 1.45;
+}
+
+.program-role-create-form {
+  display: grid;
+  gap: 0.55rem;
+  padding-top: 0.55rem;
+}
+
+.program-role-create-form label {
+  display: grid;
+  gap: 0.28rem;
+  color: #94a9b4;
+  font-size: 0.68rem;
+}
+
+.program-blackboard-fields {
+  display: grid;
+  min-width: 0;
+  gap: 0.45rem;
+  padding: 0.5rem;
+  border: 1px solid #294552;
+  border-radius: 0.4rem;
+}
+
+.program-blackboard-fields > div {
+  display: flex;
+  flex-wrap: wrap;
+  min-width: 0;
+  gap: 0.3rem;
+}
+
+.program-blackboard-fields input {
+  min-width: 0;
+  flex: 1 1 6rem;
+}
+
 .runtime-status-button {
   display: inline-flex;
   width: auto;

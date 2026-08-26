@@ -8,7 +8,7 @@
 api_version: manyforge.node_catalog.v2
 content_version: 1.1.0
 catalog_id: manyforge_builtin
-catalog_digest: sha256:41f95ac4449ab61aac6e1648c7429a667ea09679f94e12ace502bed59d622fdf
+catalog_digest: sha256:1dbe03c29ef0f0195ff31204df5b8613c2c064821848c8baa269dd6a8b640dca
 
 schema_types:
   coordinate_position:
@@ -1298,14 +1298,20 @@ entries:
         schema: {type: string, semantic_type: target_role}
       - id: carrier_frame_role
         required: true
-        schema: {type: string, semantic_type: frame_role}
+        schema:
+          type: string
+          semantic_type: frame_role
+          semantic_scope_parameter: target_role
       - id: touch_body_roles
         required: true
         schema:
           type: array
           min_items: 1
           max_items: 256
-          items: {type: string, semantic_type: collision_body_role}
+          items:
+            type: string
+            semantic_type: collision_body_role
+            semantic_scope_parameter: target_role
     required_capabilities:
       - capability_id: scene.edit.attach_detach
         scope: cell_global

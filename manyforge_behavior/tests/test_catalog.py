@@ -24,7 +24,7 @@ from manyforge_behavior.node_registry import build_node_registry
 
 CATALOG_PATH = Path(__file__).parent.parent / "resources" / "node_catalog.yaml"
 EXPECTED_CATALOG_DIGEST = (
-    "sha256:41f95ac4449ab61aac6e1648c7429a667ea09679f94e12ace502bed59d622fdf"
+    "sha256:1dbe03c29ef0f0195ff31204df5b8613c2c064821848c8baa269dd6a8b640dca"
 )
 
 
@@ -156,6 +156,45 @@ def test_catalog_schema_retains_semantic_role_and_validates_defaults() -> None:
         {"shoulder_pan_joint": {"max_velocity_rad_s": 0.0}},
         registry=catalog.schema_registry,
     )
+
+
+def test_catalog_projects_declared_semantic_scope_for_fields_and_array_items() -> None:
+    catalog = NodeCatalog(CATALOG_PATH)
+    attach = catalog.get("scene.attach_carried_object")
+    parameters = {parameter.id: parameter for parameter in attach.parameters}
+
+    carrier_schema = catalog.schema_registry.to_json_schema(
+        parameters["carrier_frame_role"].schema
+    )
+    touch_schema = catalog.schema_registry.to_json_schema(
+        parameters["touch_body_roles"].schema
+    )
+
+    assert carrier_schema["x-manyforge-semantic-scope-parameter"] == "target_role"
+    assert touch_schema["items"]["x-manyforge-semantic-scope-parameter"] == (
+        "target_role"
+    )
+
+
+def test_recomputed_catalog_rejects_unknown_semantic_scope_parameter(
+    tmp_path: Path,
+) -> None:
+    def mutate(data: dict[str, object]) -> None:
+        attach = next(
+            entry
+            for entry in data["entries"]
+            if entry["id"] == "scene.attach_carried_object"
+        )
+        carrier = next(
+            parameter
+            for parameter in attach["parameters"]
+            if parameter["id"] == "carrier_frame_role"
+        )
+        carrier["schema"]["semantic_scope_parameter"] = "missing_target"
+
+    path = _write_recomputed(tmp_path, mutate)
+    with pytest.raises(CatalogValidationError, match="semantic scope references unknown"):
+        NodeCatalog(path)
 
 
 def test_translation_catalog_preserves_assistant_and_cpp_pick_place_contracts() -> None:

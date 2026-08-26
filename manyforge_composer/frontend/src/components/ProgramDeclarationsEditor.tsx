@@ -5,6 +5,7 @@ import type {
   BlackboardKeyDeclaration,
   BlackboardNamespaceDeclaration,
   CatalogEntry,
+  DraftMutationResponse,
   JsonValue,
   ProgramAuthoringDiagnostic,
   ProgramParameterDeclaration,
@@ -45,8 +46,14 @@ interface ProgramDeclarationsEditorProps {
   keys: BlackboardKeyDeclaration[];
   catalogEntries?: CatalogEntry[];
   busy: boolean;
-  onMutate: (mutation: string, args: Record<string, JsonValue>) => void;
+  creationExpectedType?: string | null;
+  creationExpectedAccess?: 'read' | 'write' | 'read_write' | null;
+  onMutate: (
+    mutation: string,
+    args: Record<string, JsonValue>,
+  ) => Promise<DraftMutationResponse | null> | DraftMutationResponse | null | void;
   onSelectNode?: (instanceId: string) => void;
+  onCreated?: (selection: ProgramDeclarationSelection) => void;
   onInvalidEditChange?: (invalid: boolean) => void;
   diagnostics?: ProgramAuthoringDiagnostic[];
 }
@@ -70,9 +77,12 @@ export function ProgramDeclarationsEditor({
   namespaces,
   keys,
   catalogEntries = [],
+  creationExpectedType = null,
+  creationExpectedAccess = null,
   busy,
   onMutate,
   onSelectNode,
+  onCreated,
   onInvalidEditChange,
   diagnostics = [],
 }: ProgramDeclarationsEditorProps) {
@@ -90,7 +100,7 @@ export function ProgramDeclarationsEditor({
   const [keyType, setKeyType] = useState('bool');
   const [keyAccess, setKeyAccess] = useState<'read' | 'write' | 'read_write'>('read_write');
   const [keyPersistence, setKeyPersistence] = useState<'node' | 'run' | 'persistent'>('run');
-  const [fieldsText, setFieldsText] = useState('[]');
+  const [fields, setFields] = useState<BlackboardFieldDeclaration[]>([]);
   const [keyDescription, setKeyDescription] = useState('');
   const [error, setError] = useState<string | null>(null);
   const [errorTarget, setErrorTarget] = useState<string | null>(null);
@@ -143,7 +153,7 @@ export function ProgramDeclarationsEditor({
     || keyType !== selectedKey.type
     || keyAccess !== selectedKey.access
     || keyPersistence !== selectedKey.persistence
-    || fieldsText !== JSON.stringify(selectedKey.fields ?? [], null, 2)
+    || JSON.stringify(fields) !== JSON.stringify(selectedKey.fields ?? [])
     || keyDescription !== (selectedKey.description ?? '')
   );
   const parameterIssue = (): { message: string; target: string } | null => {
@@ -171,33 +181,19 @@ export function ProgramDeclarationsEditor({
     ? null
     : { message: 'Namespace ID is required.', target: 'program-namespace-id' };
   const keyIssue = (): { message: string; target: string } | null => {
-    try {
-      const fields = parseJson(fieldsText, 'Fields');
-      if (!Array.isArray(fields)) {
-        return { message: 'Fields must be a JSON array.', target: 'program-key-fields' };
-      }
-      if (fields.some((field) =>
-        field === null
-        || typeof field !== 'object'
-        || Array.isArray(field)
-        || typeof (field as Record<string, unknown>).field !== 'string'
-        || typeof (field as Record<string, unknown>).type !== 'string'
-      )) {
-        return {
-          message: 'Every field must contain string field and type values.',
-          target: 'program-key-fields',
-        };
-      }
-      if (!keyName.trim()) {
-        return { message: 'Blackboard key is required.', target: 'program-key-name' };
-      }
-      return null;
-    } catch (caught) {
+    if (fields.some((field) => !field.field.trim() || !field.type.trim())) {
       return {
-        message: caught instanceof Error ? caught.message : 'Blackboard key is invalid.',
+        message: 'Every blackboard field needs a field ID and type.',
         target: 'program-key-fields',
       };
     }
+    if (new Set(fields.map((field) => field.field.trim())).size !== fields.length) {
+      return { message: 'Blackboard field IDs must be unique.', target: 'program-key-fields' };
+    }
+    if (!keyName.trim()) {
+      return { message: 'Blackboard key is required.', target: 'program-key-name' };
+    }
+    return null;
   };
   const guardCommitKey = (
     event: KeyboardEvent<HTMLDivElement>,
@@ -255,10 +251,14 @@ export function ProgramDeclarationsEditor({
           : {}),
       };
       if (!declaration.parameter_id) throw new Error('Parameter ID is required.');
-      onMutate('program_draft_upsert_parameters', {
+      void Promise.resolve(onMutate('program_draft_upsert_parameters', {
         parameters: [declaration] as unknown as JsonValue,
+      })).then((response) => {
+        if (response && clearAfterSave) {
+          onCreated?.({ kind: 'parameter', id: declaration.parameter_id });
+          setParameterId('');
+        }
       });
-      if (clearAfterSave) setParameterId('');
       clearError();
     } catch (caught) {
       const message = caught instanceof Error ? caught.message : 'Parameter is invalid.';
@@ -299,7 +299,7 @@ export function ProgramDeclarationsEditor({
     setKeyType(key.type);
     setKeyAccess(key.access);
     setKeyPersistence(key.persistence);
-    setFieldsText(JSON.stringify(key.fields ?? [], null, 2));
+    setFields(key.fields ?? []);
     setKeyDescription(key.description ?? '');
     clearError();
   }, [clearError]);
@@ -310,8 +310,8 @@ export function ProgramDeclarationsEditor({
       if (parameter) editParameter(parameter);
       else {
         setParameterId('');
-        setParameterType('float64');
-        setDefaultText('0');
+        setParameterType(creationExpectedType ?? 'float64');
+        setDefaultText(creationExpectedType === 'bool' ? 'false' : creationExpectedType === 'string' ? '""' : '0');
         setConstraintsText('{}');
         setMutability('before_run');
         setParameterDescription('');
@@ -333,30 +333,31 @@ export function ProgramDeclarationsEditor({
       if (key) editKey(key);
       else {
         setKeyName('');
-        setKeyType('bool');
-        setKeyAccess('read_write');
+        setKeyType(creationExpectedType ?? 'bool');
+        setKeyAccess(creationExpectedAccess ?? 'read_write');
         setKeyPersistence('run');
-        setFieldsText('[]');
+        setFields([]);
         setKeyDescription('');
         clearError();
       }
     }
-  }, [clearError, editKey, editParameter, keys, namespaces, parameters, selection]);
+  }, [
+    clearError,
+    creationExpectedAccess,
+    creationExpectedType,
+    editKey,
+    editParameter,
+    keys,
+    namespaces,
+    parameters,
+    selection,
+  ]);
 
   const saveKey = (clearAfterSave = true) => {
     if (!clearAfterSave && selectedKey && !keyDirty) return;
     try {
-      const parsedFields = parseJson(fieldsText, 'Fields');
-      if (!Array.isArray(parsedFields)) throw new Error('Fields must be a JSON array.');
-      const fields = parsedFields as unknown as BlackboardFieldDeclaration[];
-      if (fields.some((field) =>
-        field === null
-        || typeof field !== 'object'
-        || typeof field.field !== 'string'
-        || typeof field.type !== 'string'
-      )) {
-        throw new Error('Every field must contain string field and type values.');
-      }
+      const issue = keyIssue();
+      if (issue) throw new Error(issue.message);
       const declaration: BlackboardKeyDeclaration = {
         key: keyName.trim(),
         type: keyType,
@@ -366,16 +367,22 @@ export function ProgramDeclarationsEditor({
         ...(keyDescription.trim() ? { description: keyDescription.trim() } : {}),
       };
       if (!declaration.key) throw new Error('Blackboard key is required.');
-      onMutate('blackboard_draft_upsert_keys', {
+      void Promise.resolve(onMutate('blackboard_draft_upsert_keys', {
         keys: [declaration] as unknown as JsonValue,
+      })).then((response) => {
+        if (response && clearAfterSave) {
+          onCreated?.({ kind: 'key', id: declaration.key });
+          setKeyName('');
+        }
       });
-      if (clearAfterSave) setKeyName('');
       clearError();
     } catch (caught) {
       const message = caught instanceof Error ? caught.message : 'Blackboard key is invalid.';
       reportError(
         message,
-        message.startsWith('Fields') ? 'program-key-fields' : 'program-key-name',
+        message.toLowerCase().includes('field')
+          ? 'program-key-fields'
+          : 'program-key-name',
       );
     }
   };
@@ -660,7 +667,27 @@ export function ProgramDeclarationsEditor({
             <label>Type<input value={keyType} onChange={(event) => setKeyType(event.target.value)} /></label>
             <label>Access<select value={keyAccess} onChange={(event) => setKeyAccess(event.target.value as typeof keyAccess)}><option value="read">read</option><option value="write">write</option><option value="read_write">read/write</option></select></label>
             <label>Persistence<select value={keyPersistence} onChange={(event) => setKeyPersistence(event.target.value as typeof keyPersistence)}><option value="node">node</option><option value="run">run</option><option value="persistent">persistent</option></select></label>
-            <label>Fields (strict JSON array)<textarea id="program-key-fields" rows={3} value={fieldsText} aria-invalid={errorTarget === 'program-key-fields'} title={errorTarget === 'program-key-fields' ? error ?? undefined : undefined} onChange={(event) => setFieldsText(event.target.value)} spellCheck={false} /></label>
+            <fieldset id="program-key-fields" className="program-blackboard-fields" title={errorTarget === 'program-key-fields' ? error ?? undefined : undefined}>
+              <legend>Structured fields</legend>
+              {fields.map((field, index) => (
+                <div key={`${index}:${field.field}`}>
+                  <input aria-label={`Blackboard field ${index + 1} ID`} aria-invalid={errorTarget === 'program-key-fields'} value={field.field} disabled={busy} placeholder="field_id" onChange={(event) => setFields((current) => current.map((row, rowIndex) => rowIndex === index ? { ...row, field: event.target.value } : row))} />
+                  <input aria-label={`Blackboard field ${index + 1} type`} value={field.type} disabled={busy} placeholder="type" onChange={(event) => setFields((current) => current.map((row, rowIndex) => rowIndex === index ? { ...row, type: event.target.value } : row))} />
+                  <button type="button" disabled={busy || index === 0} onClick={() => setFields((current) => {
+                    const next = [...current];
+                    [next[index - 1], next[index]] = [next[index], next[index - 1]];
+                    return next;
+                  })}>Earlier</button>
+                  <button type="button" disabled={busy || index === fields.length - 1} onClick={() => setFields((current) => {
+                    const next = [...current];
+                    [next[index], next[index + 1]] = [next[index + 1], next[index]];
+                    return next;
+                  })}>Later</button>
+                  <button type="button" className="text-button" disabled={busy} onClick={() => setFields((current) => current.filter((_row, rowIndex) => rowIndex !== index))}>Remove</button>
+                </div>
+              ))}
+              <button type="button" className="text-button" disabled={busy} onClick={() => setFields((current) => [...current, { field: '', type: 'string' }])}>Add field</button>
+            </fieldset>
             <label>Description<input value={keyDescription} onChange={(event) => setKeyDescription(event.target.value)} /></label>
             {!selectedKey && <button type="button" disabled={busy} onClick={() => saveKey()}>Add key</button>}
             {!showNavigation && selectedKey && (

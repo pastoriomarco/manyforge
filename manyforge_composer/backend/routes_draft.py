@@ -63,6 +63,7 @@ _AUTHORING_MUTATIONS = frozenset(
         "tree_draft_delete_node",
         "tree_draft_insert_node",
         "tree_draft_move_node",
+        "tree_draft_rename_node",
         "tree_draft_replace_subtree",
         "tree_draft_update_positions",
         "tree_draft_update_node_params",

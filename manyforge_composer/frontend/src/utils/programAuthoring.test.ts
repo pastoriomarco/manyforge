@@ -3,6 +3,7 @@ import { describe, expect, it } from 'vitest';
 import type {
   CatalogEntry,
   CatalogParameter,
+  ProgramAuthoringDocument,
   ProgramParameterDeclaration,
   ProgramTreeNode,
 } from '../types/api';
@@ -11,6 +12,9 @@ import {
   collectProgramParameterUsages,
   nextProgramInstanceId,
   programDiagnosticNodeId,
+  programSemanticChoices,
+  programSemanticExpectedAccess,
+  programSemanticExpectedType,
   resolveProgramParameterLiteralValue,
 } from './programAuthoring';
 
@@ -205,5 +209,78 @@ describe('Program parameter binding continuity', () => {
       'forest[0].children[0].parameters.velocity_scale',
     )).toBe('child');
     expect(programDiagnosticNodeId([root], 'program.compatibility')).toBeNull();
+  });
+
+  it('derives compatible semantic choices from only the current Draft and declared scope', () => {
+    const semanticEntry: CatalogEntry = {
+      ...entry,
+      parameters: [
+        parameter('target_role', 'string', 'target_role'),
+        {
+          ...parameter('touch_body_roles', 'array'),
+          schema: {
+            type: 'array',
+            items: {
+              type: 'string',
+              'x-manyforge-semantic-type': 'collision_body_role',
+              'x-manyforge-semantic-scope-parameter': 'target_role',
+            },
+          },
+        },
+        parameter('output_key', 'string', 'blackboard_key'),
+      ],
+      blackboard: {
+        reads: [],
+        writes: [{ keyParameter: 'output_key', valueType: 'scene_selection_result' }],
+      },
+    };
+    const selected = tree({ parameters: { target_role: 'gripper' } });
+    const program: ProgramAuthoringDocument = {
+      api_version: 'manyforge.program.v1',
+      program_id: 'semantic_test',
+      program_profile: 'composable-cell-v1',
+      name: 'Semantic test',
+      catalog: {
+        api_version: 'manyforge.node_catalog.v2',
+        content_version: '1.1.0',
+      },
+      component_roles: { robot: {}, tool: {} },
+      target_roles: {
+        arm: { required_collision_body_roles: ['arm_collision'] },
+        gripper: { required_collision_body_roles: ['finger', 'gripper_collision'] },
+      },
+      blackboard: {
+        namespaces: [],
+        keys: [
+          { key: 'selection', type: 'scene_selection_result', access: 'read_write', persistence: 'run' },
+          { key: 'input_only', type: 'scene_selection_result', access: 'read', persistence: 'run' },
+          { key: 'wrong_type', type: 'bool', access: 'read_write', persistence: 'run' },
+        ],
+      },
+      schema_version: 'manyforge.composer_authoring_forest.v1',
+      forest: [selected],
+      positions: {},
+    };
+
+    expect(programSemanticChoices(
+      semanticEntry.parameters[1]!.schema.items!,
+      selected,
+      semanticEntry,
+      'touch_body_roles',
+      program,
+    ).map((choice) => choice.value)).toEqual(['finger', 'gripper_collision']);
+    expect(programSemanticChoices(
+      semanticEntry.parameters[2]!.schema,
+      selected,
+      semanticEntry,
+      'output_key',
+      program,
+    ).map((choice) => choice.value)).toEqual(['selection']);
+    expect(programSemanticExpectedType(
+      semanticEntry,
+      'output_key',
+      'blackboard_key',
+    )).toBe('scene_selection_result');
+    expect(programSemanticExpectedAccess(semanticEntry, 'output_key')).toBe('write');
   });
 });

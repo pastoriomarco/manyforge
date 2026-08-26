@@ -600,6 +600,32 @@ def test_contact_selector_must_resolve_to_one_declared_target() -> None:
         Program.from_dict(_identified(document), catalog)
 
 
+@pytest.mark.parametrize(
+    ("field_name", "invalid_value"),
+    (
+        ("carrier_frame_role", "base"),
+        ("touch_body_roles", ["arm_collision"]),
+    ),
+)
+def test_carried_object_roles_are_scoped_to_selected_target(
+    field_name: str,
+    invalid_value: object,
+) -> None:
+    catalog = _catalog()
+    document = load_strict_json_yaml(
+        _ROOT / "examples/lite6_lite_gripper_pick_and_place.program.yaml"
+    )
+    attach = next(
+        child
+        for child in document["tree"]["children"]
+        if child["node_id"] == "scene.attach_carried_object"
+    )
+    attach["parameters"][field_name] = invalid_value
+
+    with pytest.raises(ProgramValidationError, match="required by target role 'gripper'"):
+        Program.from_dict(_identified(document), catalog)
+
+
 def test_pure_tree_helpers_remain_available_during_the_port() -> None:
     tree = tree_node_from_dict(
         {

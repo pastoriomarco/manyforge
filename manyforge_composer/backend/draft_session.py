@@ -54,11 +54,13 @@ SUPPORTED_DRAFT_MUTATIONS = (
     "tree_draft_delete_node",
     "tree_draft_insert_node",
     "tree_draft_move_node",
+    "tree_draft_rename_node",
     "tree_draft_replace_subtree",
     "tree_draft_update_node_params",
     "tree_draft_wrap_node",
 )
 OPERATOR_DRAFT_MUTATIONS = (
+    "program_draft_replace_roles",
     "program_draft_update_settings",
     "program_draft_update_node_policies",
     "viewer_draft_replace",
@@ -1442,12 +1444,14 @@ class ComposerDraftSession:
             "tree_draft_update_node_params": self._tree_update,
             "tree_draft_delete_node": self._tree_delete,
             "tree_draft_move_node": self._tree_move,
+            "tree_draft_rename_node": self._tree_rename,
             "tree_draft_update_positions": self._tree_update_positions,
             "tree_draft_replace_subtree": self._tree_replace,
             "tree_draft_change_node_kind": self._tree_change_kind,
             "tree_draft_wrap_node": self._tree_wrap,
             "program_draft_upsert_parameters": self._parameters_upsert,
             "program_draft_remove_parameters": self._parameters_remove,
+            "program_draft_replace_roles": self._program_roles_replace,
             "program_draft_update_settings": self._program_settings_update,
             _NODE_POLICY_MUTATION: self._node_policies_update,
             "blackboard_draft_upsert_namespaces": self._namespaces_upsert,
@@ -1464,6 +1468,35 @@ class ComposerDraftSession:
             )
         details = handler(document, arguments, catalog)
         return tool_id, details
+
+    @staticmethod
+    def _program_roles_replace(
+        document: dict[str, Any],
+        arguments: dict[str, Any],
+        _catalog: NodeCatalog,
+    ) -> dict[str, Any]:
+        if set(arguments) != {"component_roles", "target_roles"}:
+            _error(
+                "draft_arguments_invalid",
+                "program_draft_replace_roles requires exactly component_roles and target_roles",
+            )
+        component_roles = arguments["component_roles"]
+        target_roles = arguments["target_roles"]
+        if type(component_roles) is not dict or type(target_roles) is not dict:
+            _error(
+                "draft_arguments_invalid",
+                "Program component_roles and target_roles must be objects",
+            )
+        document["component_roles"] = {
+            key: deepcopy(component_roles[key]) for key in sorted(component_roles)
+        }
+        document["target_roles"] = {
+            key: deepcopy(target_roles[key]) for key in sorted(target_roles)
+        }
+        return {
+            "component_role_count": len(component_roles),
+            "target_role_count": len(target_roles),
+        }
 
     @staticmethod
     def _program_settings_update(
@@ -1811,6 +1844,49 @@ class ComposerDraftSession:
                 new_parent["instance_id"] if new_parent is not None else None
             ),
             "index": index,
+        }
+
+    def _tree_rename(
+        self,
+        document: dict[str, Any],
+        arguments: dict[str, Any],
+        _catalog: NodeCatalog,
+    ) -> dict[str, Any]:
+        if set(arguments) != {"instance_id", "new_instance_id"}:
+            _error(
+                "draft_arguments_invalid",
+                "tree_draft_rename_node requires exactly instance_id and "
+                "new_instance_id",
+            )
+        previous = arguments["instance_id"]
+        replacement = arguments["new_instance_id"]
+        tree = self._tree(document)
+        node = _lookup_exact_instance(tree, previous)
+        if (
+            type(replacement) is not str
+            or replacement == _ROOT_ALIAS
+            or _PORTABLE_ID_PATTERN.fullmatch(replacement) is None
+            or len(replacement.encode("utf-8")) > _PORTABLE_ID_MAX_BYTES
+        ):
+            _error(
+                "draft_arguments_invalid",
+                "new_instance_id must be a portable lower-case ID of at most 128 bytes",
+                status_code=409,
+            )
+        if replacement != previous and _tree_ref(tree, replacement) is not None:
+            _error(
+                "draft_node_exists",
+                f"Draft node already exists: {replacement}",
+                status_code=409,
+            )
+        if replacement != previous:
+            node["instance_id"] = replacement
+            position = document["positions"].pop(previous, None)
+            if position is not None:
+                document["positions"][replacement] = position
+        return {
+            "previous_instance_id": previous,
+            "renamed_instance_id": replacement,
         }
 
     def _tree_replace(

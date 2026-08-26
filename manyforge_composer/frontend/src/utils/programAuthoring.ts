@@ -1,7 +1,9 @@
 import type {
+  BlackboardKeyDeclaration,
   CatalogEntry,
   CatalogJsonSchema,
   JsonValue,
+  ProgramAuthoringDocument,
   ProgramParameterDeclaration,
   ProgramTreeNode,
   ProgramValueSource,
@@ -34,6 +36,164 @@ export interface ProgramParameterUsage {
 
 export interface BlackboardUsage extends ProgramParameterUsage {
   field: string | null;
+}
+
+export interface ProgramSemanticChoice {
+  value: string;
+  label: string;
+  group?: string;
+}
+
+export type ProgramSemanticCreateTarget =
+  | 'blackboard_key'
+  | 'program_parameter'
+  | 'program_requirements'
+  | 'scene_resource';
+
+function jsonRecord(value: JsonValue | undefined): Record<string, JsonValue> | null {
+  return value !== null && typeof value === 'object' && !Array.isArray(value)
+    ? value
+    : null;
+}
+
+function compatibleBlackboardKeys(
+  entry: CatalogEntry,
+  parameterId: string,
+  keys: BlackboardKeyDeclaration[],
+): BlackboardKeyDeclaration[] {
+  const reads = entry.blackboard.reads.filter(
+    (binding) => binding.keyParameter === parameterId,
+  );
+  const writes = entry.blackboard.writes.filter(
+    (binding) => binding.keyParameter === parameterId,
+  );
+  const expectedTypes = new Set([...reads, ...writes].map((binding) => binding.valueType));
+  return keys.filter((key) => (
+    (expectedTypes.size === 0 || expectedTypes.has(key.type))
+    && (reads.length === 0 || key.access !== 'write')
+    && (writes.length === 0 || key.access !== 'read')
+  ));
+}
+
+/**
+ * Project one semantic field's choices from the immutable catalog plus the
+ * exact current authoring Draft. This is presentation data only; the backend
+ * validates the submitted identity again under the Draft fence.
+ */
+export function programSemanticChoices(
+  schema: CatalogJsonSchema,
+  node: ProgramTreeNode,
+  entry: CatalogEntry,
+  parameterId: string,
+  program: ProgramAuthoringDocument,
+): ProgramSemanticChoice[] {
+  const semanticType = schema['x-manyforge-semantic-type'];
+  const choices: ProgramSemanticChoice[] = [];
+  if (semanticType === 'parameter_ref') {
+    for (const parameter of program.parameters ?? []) {
+      choices.push({
+        value: parameter.parameter_id,
+        label: parameter.parameter_id,
+        group: 'Program parameters',
+      });
+    }
+  } else if (semanticType === 'blackboard_key') {
+    for (const key of compatibleBlackboardKeys(
+      entry,
+      parameterId,
+      program.blackboard?.keys ?? [],
+    )) {
+      choices.push({ value: key.key, label: key.key, group: key.type });
+    }
+  } else if (semanticType === 'scene_resource') {
+    for (const resource of program.scene ?? []) {
+      choices.push({
+        value: resource.scene_resource_id,
+        label: resource.scene_resource_id,
+        group: 'Scene resources',
+      });
+    }
+  } else if (semanticType === 'component_role') {
+    for (const role of Object.keys(program.component_roles)) {
+      choices.push({ value: role, label: role, group: 'Component roles' });
+    }
+  } else if (semanticType === 'target_role') {
+    for (const role of Object.keys(program.target_roles)) {
+      choices.push({ value: role, label: role, group: 'Target roles' });
+    }
+  } else {
+    const roleField = {
+      frame_role: 'required_frame_roles',
+      resource_role: 'required_resource_roles',
+      collision_body_role: 'required_collision_body_roles',
+      model_role: 'required_model_roles',
+    }[semanticType ?? ''];
+    if (roleField) {
+      const scopeParameter = schema['x-manyforge-semantic-scope-parameter'];
+      const selectedScope = scopeParameter === undefined
+        ? null
+        : node.parameters[scopeParameter]
+          ?? entry.parameters.find((parameter) => parameter.id === scopeParameter)?.default;
+      for (const [targetId, rawTarget] of Object.entries(program.target_roles)) {
+        if (typeof selectedScope === 'string' && targetId !== selectedScope) continue;
+        const target = jsonRecord(rawTarget);
+        const values = target?.[roleField];
+        if (!Array.isArray(values)) continue;
+        for (const role of values) {
+          if (typeof role === 'string') {
+            choices.push({ value: role, label: role, group: targetId });
+          }
+        }
+      }
+    }
+  }
+  const unique = new Map(choices.map((choice) => [choice.value, choice]));
+  return [...unique.values()].sort((left, right) =>
+    (left.group ?? '').localeCompare(right.group ?? '')
+      || left.label.localeCompare(right.label));
+}
+
+export function programSemanticCreateTarget(
+  semanticType: string | undefined,
+): ProgramSemanticCreateTarget | null {
+  if (semanticType === 'blackboard_key') return 'blackboard_key';
+  if (semanticType === 'parameter_ref') return 'program_parameter';
+  if (semanticType === 'scene_resource') return 'scene_resource';
+  if (semanticType === 'component_role' || semanticType === 'target_role') {
+    return 'program_requirements';
+  }
+  return null;
+}
+
+export function programSemanticExpectedType(
+  entry: CatalogEntry,
+  parameterId: string,
+  semanticType: string | undefined,
+): string | null {
+  if (semanticType === 'scene_resource') return 'scene_resource';
+  if (semanticType !== 'blackboard_key') return null;
+  const types = new Set([
+    ...entry.blackboard.reads,
+    ...entry.blackboard.writes,
+  ].filter((binding) => binding.keyParameter === parameterId)
+    .map((binding) => binding.valueType));
+  return types.size === 1 ? [...types][0] as string : null;
+}
+
+export function programSemanticExpectedAccess(
+  entry: CatalogEntry,
+  parameterId: string,
+): 'read' | 'write' | 'read_write' | null {
+  const reads = entry.blackboard.reads.some(
+    (binding) => binding.keyParameter === parameterId,
+  );
+  const writes = entry.blackboard.writes.some(
+    (binding) => binding.keyParameter === parameterId,
+  );
+  if (reads && writes) return 'read_write';
+  if (reads) return 'read';
+  if (writes) return 'write';
+  return null;
 }
 
 export function flattenProgramTree(root: ProgramTreeNode): FlatProgramNode[] {

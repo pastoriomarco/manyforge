@@ -4,8 +4,10 @@ import type {
   BlackboardKeyDeclaration,
   CatalogEntry,
   CatalogParameter,
+  DraftMutationResponse,
   JsonValue,
   ProgramAuthoringDiagnostic,
+  ProgramAuthoringDocument,
   ProgramNodeModificationPolicy,
   ProgramNodeRecoveryPolicy,
   ProgramOperatorStopPolicy,
@@ -22,9 +24,9 @@ import {
 } from '../utils/programAuthoring';
 import { DraftTextInput, DraftTextarea } from './common/DraftInputs';
 import {
-  ProgramSpecializedEditor,
-  supportsProgramSpecializedEditor,
-} from './property/ProgramSpecializedEditors';
+  ProgramSchemaValueEditor,
+  type ProgramSchemaValueEditorContext,
+} from './property/ProgramSchemaValueEditor';
 import { ProgramPolicyEditor } from './ProgramPolicyEditor';
 
 interface ProgramPropertyEditorProps {
@@ -32,10 +34,14 @@ interface ProgramPropertyEditorProps {
   roots: ProgramTreeNode[];
   selectedId: string | null;
   catalogEntries: CatalogEntry[];
-  programParameters: ProgramParameterDeclaration[];
-  blackboardKeys: BlackboardKeyDeclaration[];
+  program: ProgramAuthoringDocument;
   busy: boolean;
-  onMutate: (mutation: string, args: Record<string, JsonValue>) => void;
+  onMutate: (
+    mutation: string,
+    args: Record<string, JsonValue>,
+  ) => Promise<DraftMutationResponse | null> | DraftMutationResponse | null | void;
+  onCreateReference?: ProgramSchemaValueEditorContext['onCreateReference'];
+  onRenamed?: (previousId: string, renamedId: string) => void;
   onUpdateNodePolicies: (
     instanceId: string,
     modificationPolicy: ProgramNodeModificationPolicy,
@@ -134,90 +140,22 @@ function sourceChoices(
   return result;
 }
 
-function ScalarLiteralEditor({
-  parameter,
-  value,
-  disabled,
-  onCommit,
-  onInvalidChange,
-}: {
-  parameter: CatalogParameter;
-  value: JsonValue | undefined;
-  disabled: boolean;
-  onCommit: (value: JsonValue) => void;
-  onInvalidChange: (message: string | null) => void;
-}) {
-  if (parameter.schema.enum) {
-    const encoded = value === undefined ? '' : JSON.stringify(value);
-    return (
-      <select
-        value={encoded}
-        disabled={disabled}
-        onChange={(event) => onCommit(JSON.parse(event.target.value) as JsonValue)}
-      >
-        <option value="" disabled>Select a value</option>
-        {parameter.schema.enum.map((option) => {
-          const optionValue = JSON.stringify(option);
-          return <option key={optionValue} value={optionValue}>{String(option)}</option>;
-        })}
-      </select>
-    );
-  }
-  if (parameter.schema.type === 'boolean') {
-    return (
-      <select
-        value={typeof value === 'boolean' ? String(value) : ''}
-        disabled={disabled}
-        onChange={(event) => onCommit(event.target.value === 'true')}
-      >
-        <option value="" disabled>Select true or false</option>
-        <option value="true">true</option>
-        <option value="false">false</option>
-      </select>
-    );
-  }
-  if (parameter.schema.type === 'number' || parameter.schema.type === 'integer') {
-    return (
-      <DraftTextInput
-        type="number"
-        step={parameter.schema.type === 'integer' ? 1 : 'any'}
-        value={typeof value === 'number' ? value : ''}
-        disabled={disabled}
-        validate={(text) => firstCatalogParameterValidationMessage(
-          parameter,
-          text.trim() === '' ? Number.NaN : Number(text),
-        )}
-        onInvalidChange={onInvalidChange}
-        onCommit={(text) => onCommit(
-          text.trim() === '' ? Number.NaN : Number(text),
-        )}
-      />
-    );
-  }
-  return (
-    <DraftTextInput
-      value={typeof value === 'string' ? value : ''}
-      disabled={disabled}
-      validate={(text) => firstCatalogParameterValidationMessage(parameter, text)}
-      onInvalidChange={onInvalidChange}
-      onCommit={(text) => onCommit(text)}
-    />
-  );
-}
-
 export function ProgramPropertyEditor({
   embedded = false,
   roots,
   selectedId,
   catalogEntries,
-  programParameters,
-  blackboardKeys,
+  program,
   busy,
   onMutate,
+  onCreateReference,
+  onRenamed,
   onUpdateNodePolicies,
   onInvalidEditChange,
   diagnostics = [],
 }: ProgramPropertyEditorProps) {
+  const programParameters = program.parameters ?? [];
+  const blackboardKeys = program.blackboard?.keys ?? [];
   const [errors, setErrors] = useState<Record<string, string>>({});
   const [discardEpoch, setDiscardEpoch] = useState(0);
   const selected = useMemo(
@@ -266,7 +204,39 @@ export function ProgramPropertyEditor({
     transition: ProgramParameterTransition,
   ) => {
     const request = buildProgramParameterMutation(selected, parameterId, transition);
-    onMutate(request.mutation, request.args);
+    void onMutate(request.mutation, request.args);
+  };
+
+  const renameNode = (replacement: string) => {
+    const normalized = replacement.trim();
+    const duplicate = flattenProgramForest(roots).some(
+      ({ node }) => node.instance_id === normalized && node.instance_id !== selected.instance_id,
+    );
+    const message = !/^[a-z][a-z0-9_.-]*$/.test(normalized)
+      ? 'Node name must be a portable lower-case ID.'
+      : new TextEncoder().encode(normalized).length > 128
+        ? 'Node name must be at most 128 bytes.'
+        : duplicate ? 'Another node already uses this name.' : null;
+    if (message) {
+      setErrors((current) => ({ ...current, _identity: message }));
+      return;
+    }
+    setErrors((current) => {
+      const next = { ...current };
+      delete next._identity;
+      return next;
+    });
+    if (normalized === selected.instance_id) return;
+    void Promise.resolve(onMutate('tree_draft_rename_node', {
+      instance_id: selected.instance_id,
+      new_instance_id: normalized,
+    })).then((response) => {
+      const previous = response?.details.previous_instance_id;
+      const renamed = response?.details.renamed_instance_id;
+      if (typeof previous === 'string' && typeof renamed === 'string') {
+        onRenamed?.(previous, renamed);
+      }
+    });
   };
 
   const commitLiteral = (parameter: CatalogParameter, value: JsonValue) => {
@@ -345,6 +315,8 @@ export function ProgramPropertyEditor({
               const first = Object.keys(errors)[0];
               const field = first === '_policy'
                 ? document.querySelector('.program-policy-editor [aria-invalid="true"]')
+                : first === '_identity'
+                  ? document.getElementById('program-node-name')
                 : document.getElementById(`property-${selected.instance_id}-${first}`);
               const control = (field?.matches('input, textarea, select')
                 ? field
@@ -378,8 +350,37 @@ export function ProgramPropertyEditor({
       )}
       <div className="program-property-list">
         <div className="program-node-identity">
-          <span><strong>{entry.name}</strong><small>{entry.kind} · {entry.category}</small></span>
-          <span><code>{selected.node_id}</code><small>Profile {entry.minProgramProfile ?? 'portable'}</small></span>
+          <label className="program-node-name-row">
+            <span>Node name</span>
+            <DraftTextInput
+              id="program-node-name"
+              value={selected.instance_id}
+              disabled={busy}
+              validate={(value) => {
+                const normalized = value.trim();
+                if (!/^[a-z][a-z0-9_.-]*$/.test(normalized)) {
+                  return 'Node name must be a portable lower-case ID.';
+                }
+                if (new TextEncoder().encode(normalized).length > 128) {
+                  return 'Node name must be at most 128 bytes.';
+                }
+                return flattenProgramForest(roots).some(
+                  ({ node }) => node.instance_id === normalized
+                    && node.instance_id !== selected.instance_id,
+                ) ? 'Another node already uses this name.' : null;
+              }}
+              onInvalidChange={(message) => setErrors((current) => {
+                const next = { ...current };
+                if (message) next._identity = message;
+                else delete next._identity;
+                return next;
+              })}
+              onCommit={renameNode}
+            />
+          </label>
+          <span><small>Catalog name</small><strong>{entry.name}</strong></span>
+          <span><small>Catalog ID</small><code>{selected.node_id}</code></span>
+          <span><small>Type and profile</small><span>{entry.kind} · {entry.category} · {entry.minProgramProfile ?? 'portable'}</span></span>
         </div>
         {entry.requiredCapabilities.length > 0 && (
           <details className="program-node-capabilities">
@@ -409,8 +410,6 @@ export function ProgramPropertyEditor({
           const literal = hasLiteral
             ? selected.parameters[parameter.id]
             : parameter.hasDefault ? parameter.default as JsonValue : undefined;
-          const complex = !['string', 'number', 'integer', 'boolean']
-            .includes(parameter.schema.type ?? '');
           const fallback = resolveProgramParameterLiteralValue(
             source,
             selected.parameters[parameter.id],
@@ -424,9 +423,6 @@ export function ProgramPropertyEditor({
             ? firstCatalogParameterValidationMessage(parameter, literal)
             : null;
           const repairMode = literalValidation !== null;
-          const specialized = literal !== undefined
-            && !repairMode
-            && supportsProgramSpecializedEditor(parameter.schema);
           const currentSourceIsOffCatalog = source !== undefined
             && !choices.some((choice) =>
               JSON.stringify(choice.source) === JSON.stringify(source));
@@ -521,61 +517,20 @@ export function ProgramPropertyEditor({
                     }}
                   />
                 </>
-              ) : specialized ? (
-                <ProgramSpecializedEditor
-                  schema={parameter.schema}
-                  value={literal}
-                  disabled={busy}
-                  onCommit={(value) => commitLiteral(parameter, value)}
-                  onInvalidChange={(message) => setErrors((current) => {
-                    const next = { ...current };
-                    if (message) next[parameter.id] = message;
-                    else delete next[parameter.id];
-                    return next;
-                  })}
-                />
-              ) : complex ? (
-                <DraftTextarea
-                  id={`property-${selected.instance_id}-${parameter.id}`}
-                  rows={5}
-                  value={literal === undefined ? '' : JSON.stringify(literal, null, 2)}
-                  disabled={busy}
-                  spellCheck={false}
-                  validate={(text) => {
-                    try {
-                      return firstCatalogParameterValidationMessage(
-                        parameter,
-                        JSON.parse(text) as JsonValue,
-                      );
-                    } catch (error) {
-                      return error instanceof Error ? error.message : 'Value must be strict JSON.';
-                    }
-                  }}
-                  onInvalidChange={(message) => setErrors((current) => {
-                    const next = { ...current };
-                    if (message) next[parameter.id] = message;
-                    else delete next[parameter.id];
-                    return next;
-                  })}
-                  onCommit={(text) => {
-                    try {
-                      commitLiteral(parameter, JSON.parse(text) as JsonValue);
-                    } catch (error) {
-                      setErrors((current) => ({
-                        ...current,
-                        [parameter.id]: error instanceof Error
-                          ? error.message
-                          : 'Value must be strict JSON.',
-                      }));
-                    }
-                  }}
-                />
               ) : (
                 <div id={`property-${selected.instance_id}-${parameter.id}`}>
-                  <ScalarLiteralEditor
-                    parameter={parameter}
+                  <ProgramSchemaValueEditor
+                    schema={parameter.schema}
                     value={literal}
                     disabled={busy}
+                    context={{
+                      entry,
+                      node: selected,
+                      parameterId: parameter.id,
+                      program,
+                      onCreateReference,
+                    }}
+                    path={parameter.id}
                     onCommit={(value) => commitLiteral(parameter, value)}
                     onInvalidChange={(message) => setErrors((current) => {
                       const next = { ...current };

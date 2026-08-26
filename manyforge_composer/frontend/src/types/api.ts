@@ -42,6 +42,7 @@ export interface CatalogJsonSchema {
   maxItems?: number;
   default?: unknown;
   'x-manyforge-semantic-type'?: string;
+  'x-manyforge-semantic-scope-parameter'?: string;
 }
 
 export interface CatalogParameter {

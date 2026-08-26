@@ -26,7 +26,10 @@ import {
 } from '@xyflow/react';
 import '@xyflow/react/dist/style.css';
 
-import { useComposerViewState } from '../store/composerStore';
+import {
+  useComposerViewState,
+  type LayoutDirection,
+} from '../store/composerStore';
 import type {
   CatalogEntry,
   JsonValue,
@@ -35,6 +38,7 @@ import type {
 } from '../types/api';
 import {
   authoringMoveIntent,
+  authoringReorderedIds,
   authoringSiblingInsertionIndex,
   type AuthoringGraphEdge,
   type AuthoringGraphNode,
@@ -55,11 +59,28 @@ import {
 } from '../utils/programCanvasInteraction';
 import { BtNode, type BtNodePresentation } from './BtNode';
 import { CanvasViewControls } from './CanvasViewControls';
+import {
+  ProgramNoticeRail,
+  type ProgramNotice,
+  type ProgramNoticeInput,
+} from './ProgramNoticeRail';
 import { statusEdgePath } from './StatusEdge';
 
-const NODE_WIDTH = 180;
-const NODE_HEIGHT = 70;
+const NODE_MIN_WIDTH = 156;
+const NODE_MAX_WIDTH = 288;
+const NODE_BASE_HEIGHT = 70;
 const STAGE_PADDING = 48;
+
+function estimatedNodeSize(label: string, catalogId: string): { width: number; height: number } {
+  const width = Math.min(
+    NODE_MAX_WIDTH,
+    Math.max(NODE_MIN_WIDTH, Math.ceil(Math.max(label.length, catalogId.length) * 7.4 + 34)),
+  );
+  const charactersPerLine = Math.max(12, Math.floor((width - 30) / 7.4));
+  const wrappedLines = Math.max(0, Math.ceil(label.length / charactersPerLine) - 1)
+    + Math.max(0, Math.ceil(catalogId.length / charactersPerLine) - 1);
+  return { width, height: NODE_BASE_HEIGHT + wrappedLines * 16 };
+}
 
 interface ProgramFlowNodeData extends Record<string, unknown> {
   presentation: BtNodePresentation;
@@ -89,7 +110,14 @@ interface ProgramTreeCanvasProps {
   invalidNodeIds: ReadonlySet<string>;
   busy: boolean;
   onSelect: (instanceId: string | null) => void;
-  onMutate: (mutation: string, args: Record<string, JsonValue>) => void;
+  onMutate: (
+    mutation: string,
+    args: Record<string, JsonValue>,
+  ) => Promise<import('../types/api').DraftMutationResponse | null>;
+  notices?: ProgramNotice[];
+  onNotice?: (notice: ProgramNoticeInput) => void;
+  onDismissNotice?: (id: string) => void;
+  onDismissAllNotices?: () => void;
 }
 
 function ProgramFlowNode({ data, selected }: NodeProps<ProgramFlowNode>) {
@@ -144,8 +172,6 @@ function ProgramStatusEdge({
 
 const NODE_TYPES: NodeTypes = { programNode: ProgramFlowNode };
 const EDGE_TYPES: EdgeTypes = { statusEdge: ProgramStatusEdge };
-type CanvasMessageKind = 'info' | 'error';
-
 export function ProgramTreeCanvas({
   roots,
   retainedPositions,
@@ -156,6 +182,10 @@ export function ProgramTreeCanvas({
   busy,
   onSelect,
   onMutate,
+  notices = [],
+  onNotice = () => undefined,
+  onDismissNotice = () => undefined,
+  onDismissAllNotices = () => undefined,
 }: ProgramTreeCanvasProps) {
   const [view, dispatchView] = useComposerViewState();
   const [presentationPositions, setPresentationPositions] = useState<
@@ -165,22 +195,17 @@ export function ProgramTreeCanvas({
     Record<string, { width: number; height: number }>
   >({});
   const [focusedNodeId, setFocusedNodeId] = useState<string | null>(null);
-  const [canvasMessage, setCanvasMessage] = useState<string | null>(null);
-  const [canvasMessageKind, setCanvasMessageKind] = useState<CanvasMessageKind>('info');
   const flowInstance = useRef<ReactFlowInstance<ProgramFlowNode, ProgramFlowEdge> | null>(null);
   const nodeElements = useRef<Record<string, HTMLDivElement | null>>({});
   const pendingPositionChanges = useRef<Record<string, XYPosition>>({});
   const positionFrame = useRef<number | null>(null);
-  const showCanvasMessage = useCallback((message: string, kind: CanvasMessageKind) => {
-    setCanvasMessageKind(kind);
-    setCanvasMessage(message);
-  }, []);
-  const clearCanvasMessage = useCallback(() => setCanvasMessage(null), []);
-  useEffect(() => {
-    if (canvasMessage === null || canvasMessageKind !== 'info') return undefined;
-    const timeout = window.setTimeout(clearCanvasMessage, 4_000);
-    return () => window.clearTimeout(timeout);
-  }, [canvasMessage, canvasMessageKind, clearCanvasMessage]);
+  const showCanvasMessage = useCallback((message: string, kind: 'info' | 'error') => {
+    onNotice({
+      key: `canvas:${kind}:${message}`,
+      message,
+      kind,
+    });
+  }, [onNotice]);
   useEffect(() => () => {
     if (
       positionFrame.current !== null
@@ -215,21 +240,33 @@ export function ProgramTreeCanvas({
       .map((row) => ({ source: row.parentId as string, target: row.node.instance_id })),
     [flat],
   );
-  const graphDirection = view.layoutDirection === 'vertical'
-    ? 'horizontal'
-    : 'vertical';
-  const laidOut = useMemo(() => {
-    const seeds: AuthoringGraphNode[] = flat.map((row, order) => ({
-      id: row.node.instance_id,
-      label: row.node.instance_id,
-      width: NODE_WIDTH,
-      height: NODE_HEIGHT,
-      childrenMin: catalog.get(row.node.node_id)?.childrenMin,
-      childrenMax: catalog.get(row.node.node_id)?.childrenMax,
-      position: graphDirection === 'vertical'
-        ? { x: order * (NODE_WIDTH + 24), y: row.depth * 150 }
-        : { x: row.depth * 250, y: order * (NODE_HEIGHT + 24) },
-    }));
+  const layoutNodes = useCallback((
+    layoutDirection: LayoutDirection,
+    orderedIds: string[] = flat.map((row) => row.node.instance_id),
+  ) => {
+    // The view names the direction in which siblings are read. The layout
+    // utility names the perpendicular graph-growth axis.
+    const graphDirection = layoutDirection === 'vertical'
+      ? 'horizontal'
+      : 'vertical';
+    const orderById = new Map(orderedIds.map((id, order) => [id, order]));
+    const seeds: AuthoringGraphNode[] = flat.map((row, fallbackOrder) => {
+      const id = row.node.instance_id;
+      const dimensions = nodeMeasurements[id]
+        ?? estimatedNodeSize(id, row.node.node_id);
+      const order = orderById.get(id) ?? fallbackOrder;
+      return {
+        id,
+        label: id,
+        width: dimensions.width,
+        height: dimensions.height,
+        childrenMin: catalog.get(row.node.node_id)?.childrenMin,
+        childrenMax: catalog.get(row.node.node_id)?.childrenMax,
+        position: graphDirection === 'vertical'
+          ? { x: order * (NODE_MAX_WIDTH + 24), y: row.depth * 150 }
+          : { x: row.depth * 340, y: order * (NODE_BASE_HEIGHT + 40) },
+      };
+    });
     const positioned = layoutAuthoringGraph(
       seeds,
       edges,
@@ -245,7 +282,14 @@ export function ProgramTreeCanvas({
         y: node.position.y - minY + STAGE_PADDING,
       },
     }));
-  }, [catalog, edges, flat, graphDirection]);
+  }, [catalog, edges, flat, nodeMeasurements]);
+  const graphDirection = view.layoutDirection === 'vertical'
+    ? 'horizontal'
+    : 'vertical';
+  const laidOut = useMemo(
+    () => layoutNodes(view.layoutDirection),
+    [layoutNodes, view.layoutDirection],
+  );
   const topologyKey = useMemo(
     () => flat.map((row) => [
       row.node.instance_id,
@@ -269,7 +313,7 @@ export function ProgramTreeCanvas({
         ? current
         : retained;
     });
-  }, [flat, retainedPositions, topologyKey, view.layoutDirection]);
+  }, [flat, retainedPositions, topologyKey]);
 
   const registerElement = useCallback((id: string, element: HTMLDivElement | null) => {
     nodeElements.current[id] = element;
@@ -331,11 +375,9 @@ export function ProgramTreeCanvas({
         id: node.id,
         type: 'programNode',
         position: presentationPositions[node.id] ?? retainedPositions[node.id] ?? node.position,
+        measured: nodeMeasurements[node.id],
         draggable: true,
         selectable: false,
-        width: NODE_WIDTH,
-        height: NODE_HEIGHT,
-        measured: nodeMeasurements[node.id],
         focusable: false,
         selected: selectedId === node.id,
         data: {
@@ -369,10 +411,10 @@ export function ProgramTreeCanvas({
       flatById,
       laidOut,
       invalidNodeIds,
+      nodeMeasurements,
       onNodeNavigate,
       onNodeDelete,
       onSelect,
-      nodeMeasurements,
       presentationPositions,
       retainedPositions,
       registerElement,
@@ -401,11 +443,17 @@ export function ProgramTreeCanvas({
   );
   const graphWidth = Math.max(
     720,
-    ...graphNodes.map((node) => node.position.x + NODE_WIDTH + STAGE_PADDING),
+    ...graphNodes.map((node) => node.position.x
+      + (nodeMeasurements[node.id]?.width
+        ?? estimatedNodeSize(node.id, flatById.get(node.id)?.node.node_id ?? '').width)
+      + STAGE_PADDING),
   );
   const graphHeight = Math.max(
     320,
-    ...graphNodes.map((node) => node.position.y + NODE_HEIGHT + STAGE_PADDING),
+    ...graphNodes.map((node) => node.position.y
+      + (nodeMeasurements[node.id]?.height
+        ?? estimatedNodeSize(node.id, flatById.get(node.id)?.node.node_id ?? '').height)
+      + STAGE_PADDING),
   );
 
   const onNodesChange = useCallback((
@@ -505,7 +553,6 @@ export function ProgramTreeCanvas({
       showCanvasMessage(result.error ?? 'That connection is not valid.', 'error');
       return;
     }
-    clearCanvasMessage();
     const parentId = result.intent.new_parent_instance_id;
     const index = parentId === null
       ? result.intent.index
@@ -525,7 +572,6 @@ export function ProgramTreeCanvas({
     onMutate(mutation.mutation, mutation.args);
   }, [
     authoringDisabled,
-    clearCanvasMessage,
     edges,
     graphDirection,
     graphNodes,
@@ -575,11 +621,9 @@ export function ProgramTreeCanvas({
       (mutation.args.node as Record<string, JsonValue>).instance_id,
     );
     onSelect(instanceId);
-    clearCanvasMessage();
   }, [
     authoringDisabled,
     catalogEntries,
-    clearCanvasMessage,
     flat,
     onMutate,
     onSelect,
@@ -590,17 +634,28 @@ export function ProgramTreeCanvas({
   const fitView = useCallback(() => {
     flowInstance.current?.fitView({ padding: 0.2, duration: 180 });
   }, []);
-  const autoLayout = useCallback(() => {
+  const applyLayout = useCallback((layout: AuthoringGraphNode[], message: string) => {
     const nextPositions = Object.fromEntries(
-      laidOut.map((node) => [node.id, node.position]),
+      layout.map((node) => [node.id, node.position]),
     );
     setPresentationPositions(nextPositions);
     if (!authoringDisabled) {
-      onMutate('tree_draft_update_positions', { positions: nextPositions });
+      void onMutate('tree_draft_update_positions', { positions: nextPositions });
     }
-    showCanvasMessage('Layout refreshed.', 'info');
+    showCanvasMessage(message, 'info');
     requestAnimationFrame(fitView);
-  }, [authoringDisabled, fitView, laidOut, onMutate, showCanvasMessage]);
+  }, [authoringDisabled, fitView, onMutate, showCanvasMessage]);
+  const autoLayout = useCallback(() => {
+    applyLayout(laidOut, 'Layout refreshed.');
+  }, [applyLayout, laidOut]);
+  const changeLayoutDirection = useCallback((layoutDirection: LayoutDirection) => {
+    if (layoutDirection === view.layoutDirection) return;
+    dispatchView({ type: 'set_layout_direction', layoutDirection });
+    applyLayout(
+      layoutNodes(layoutDirection),
+      `${layoutDirection === 'vertical' ? 'Vertical' : 'Horizontal'} layout applied.`,
+    );
+  }, [applyLayout, dispatchView, layoutNodes, view.layoutDirection]);
 
   const parentOptions = selectedRow === null || selectedRow.parentId === null
     ? []
@@ -613,14 +668,30 @@ export function ProgramTreeCanvas({
         selectedRow.node.instance_id,
       ) === null);
 
-  const moveSelected = (newParentId: string, index: number) => {
+  const moveSelected = async (newParentId: string, index: number) => {
     if (!selectedRow || authoringDisabled) return;
+    const orderedIds = authoringReorderedIds(
+      flat.map((row) => ({ id: row.node.instance_id, parentId: row.parentId })),
+      newParentId,
+      selectedRow.node.instance_id,
+      index,
+    );
+    if (orderedIds === null) return;
+    const aligned = layoutNodes(view.layoutDirection, orderedIds);
+    const nextPositions = Object.fromEntries(
+      aligned.map((node) => [node.id, node.position]),
+    );
     const mutation = programMoveMutation(
       selectedRow.node.instance_id,
       newParentId,
       index,
+      nextPositions,
     );
-    onMutate(mutation.mutation, mutation.args);
+    const accepted = await onMutate(mutation.mutation, mutation.args);
+    if (accepted) {
+      setPresentationPositions(nextPositions);
+      showCanvasMessage('Order updated and aligned.', 'info');
+    }
   };
 
   return (
@@ -641,29 +712,33 @@ export function ProgramTreeCanvas({
           if (intent?.type === 'delete') event.stopPropagation();
         }}
       >
-        <button
-          type="button"
-          className="icon-button program-canvas-help"
-          aria-label="Program canvas keyboard help"
-          title="Focus a node, use arrow keys to navigate, Enter or Space to select, and Delete or Backspace to remove it. Double-click a link, or select it and press Delete, to detach it."
-        >
-          ?
-        </button>
-        <div className="program-canvas-toolbar">
-          <CanvasViewControls
-            edgeStyle={view.edgeStyle}
-            layoutDirection={view.layoutDirection}
-            onEdgeStyleChange={(edgeStyle) => dispatchView({
-              type: 'set_edge_style',
-              edgeStyle,
-            })}
-            onLayoutDirectionChange={(layoutDirection) => dispatchView({
-              type: 'set_layout_direction',
-              layoutDirection,
-            })}
-            onAutoLayout={autoLayout}
-            onFitView={fitView}
+        <div className="program-canvas-topbar">
+          <button
+            type="button"
+            className="icon-button program-canvas-help"
+            aria-label="Program canvas keyboard help"
+            title="Focus a node, use arrow keys to navigate, Enter or Space to select, and Delete or Backspace to remove it. Double-click a link, or select it and press Delete, to detach it."
+          >
+            ?
+          </button>
+          <ProgramNoticeRail
+            notices={notices}
+            onDismiss={onDismissNotice}
+            onDismissAll={onDismissAllNotices}
           />
+          <div className="program-canvas-toolbar">
+            <CanvasViewControls
+              edgeStyle={view.edgeStyle}
+              layoutDirection={view.layoutDirection}
+              onEdgeStyleChange={(edgeStyle) => dispatchView({
+                type: 'set_edge_style',
+                edgeStyle,
+              })}
+              onLayoutDirectionChange={changeLayoutDirection}
+              onAutoLayout={autoLayout}
+              onFitView={fitView}
+            />
+          </div>
         </div>
         <ReactFlow
           nodes={graphNodes}
@@ -718,7 +793,7 @@ export function ProgramTreeCanvas({
             <button
               type="button"
               disabled={authoringDisabled || selectedRow.index === 0}
-              onClick={() => moveSelected(selectedRow.parentId as string, selectedRow.index - 1)}
+              onClick={() => void moveSelected(selectedRow.parentId as string, selectedRow.index - 1)}
             >
               Move earlier
             </button>
@@ -728,7 +803,7 @@ export function ProgramTreeCanvas({
                 flat.find((row) => row.node.instance_id === selectedRow.parentId)
                   ?.node.children.length ?? 1
               ) - 1}
-              onClick={() => moveSelected(selectedRow.parentId as string, selectedRow.index + 1)}
+              onClick={() => void moveSelected(selectedRow.parentId as string, selectedRow.index + 1)}
             >
               Move later
             </button>
@@ -773,22 +848,6 @@ export function ProgramTreeCanvas({
               onClick={() => deleteSelectedNode()}
             >
               Delete
-            </button>
-          </div>
-        )}
-        {canvasMessage && (
-          <div
-            className={`program-inline-message program-canvas-message message-${canvasMessageKind}`}
-            role={canvasMessageKind === 'error' ? 'alert' : 'status'}
-          >
-            <span>{canvasMessage}</span>
-            <button
-              type="button"
-              className="icon-button"
-              aria-label="Dismiss canvas message"
-              onClick={clearCanvasMessage}
-            >
-              ×
             </button>
           </div>
         )}

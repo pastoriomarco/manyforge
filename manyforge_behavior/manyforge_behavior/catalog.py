@@ -33,7 +33,7 @@ EXPECTED_API_VERSION = "manyforge.node_catalog.v2"
 EXPECTED_CONTENT_VERSION = "1.1.0"
 BUILTIN_CATALOG_ID = "manyforge_builtin"
 EXPECTED_BUILTIN_CATALOG_DIGEST = (
-    "sha256:41f95ac4449ab61aac6e1648c7429a667ea09679f94e12ace502bed59d622fdf"
+    "sha256:1dbe03c29ef0f0195ff31204df5b8613c2c064821848c8baa269dd6a8b640dca"
 )
 SEMVER_RE = re.compile(r"^\d+\.\d+\.\d+$")
 _COMPOSABLE_PROFILE_RE = re.compile(r"^composable-cell-v(\d+)$")
@@ -461,6 +461,35 @@ def _schema_contains_semantic_type(
     )
 
 
+def _schema_semantic_scope_parameters(
+    schema: CatalogSchema,
+    registry: CatalogSchemaRegistry,
+    *,
+    visited: frozenset[int] = frozenset(),
+) -> frozenset[str]:
+    resolved = registry.resolve(schema)
+    identity = id(resolved)
+    if identity in visited:
+        return frozenset()
+    nested = (*resolved.properties.values(),)
+    if resolved.items is not None:
+        nested = (*nested, resolved.items)
+    if resolved.additional_property_schema is not None:
+        nested = (*nested, resolved.additional_property_schema)
+    scopes = {
+        child_scope
+        for child in nested
+        for child_scope in _schema_semantic_scope_parameters(
+            child,
+            registry,
+            visited=visited | {identity},
+        )
+    }
+    if resolved.semantic_scope_parameter is not None:
+        scopes.add(resolved.semantic_scope_parameter)
+    return frozenset(scopes)
+
+
 def _schema_enum_values(
     schema: CatalogSchema,
     registry: CatalogSchemaRegistry,
@@ -702,6 +731,28 @@ class NodeCatalog:
             authoring_names=authoring_names,
         )
         parameter_by_id = {parameter.id: parameter for parameter in parameters}
+        for parameter in parameters:
+            for scope_parameter_id in _schema_semantic_scope_parameters(
+                parameter.schema,
+                self._schema_registry,
+            ):
+                scope_parameter = parameter_by_id.get(scope_parameter_id)
+                if scope_parameter is None:
+                    raise CatalogValidationError(
+                        f"{label}.parameters.{parameter.id} semantic scope references "
+                        f"unknown parameter {scope_parameter_id!r}"
+                    )
+                if (
+                    _schema_semantic_type(
+                        scope_parameter.schema,
+                        self._schema_registry,
+                    )
+                    != "target_role"
+                ):
+                    raise CatalogValidationError(
+                        f"{label}.parameters.{parameter.id} semantic scope must "
+                        "reference a target_role parameter"
+                    )
         if any(
             _schema_contains_semantic_type(
                 parameter.schema, self._schema_registry, "source_joint"
