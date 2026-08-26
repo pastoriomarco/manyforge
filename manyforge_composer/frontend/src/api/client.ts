@@ -28,6 +28,7 @@ import {
   parseScenarioCatalogResponse,
   parseSceneTransactionResponse,
   parseSceneMeshAssetMetadata,
+  parseProgramDraftMeshAssetMetadata,
   parseSceneUrdfManifest,
   parseSourceModelProjection,
 } from './parsers';
@@ -68,6 +69,7 @@ import type {
   SceneTransactionRequest,
   SceneTransactionResponse,
   SceneMeshAssetMetadata,
+  ProgramDraftMeshAssetMetadata,
   SceneUrdfManifest,
   SourceModelProjection,
 } from '../types/api';
@@ -645,6 +647,27 @@ export const api = {
       return requestJson(
         `/api/scene/object-meshes/resolve?${params.toString()}`,
         parseSceneMeshAssetMetadata,
+        signal,
+      );
+    },
+    resolveProgramDraftMesh: (
+      resourceUri: string,
+      scale: { x: number; y: number; z: number },
+      draftId: string,
+      draftRevision: number,
+      signal?: AbortSignal,
+    ): Promise<ProgramDraftMeshAssetMetadata> => {
+      const params = new URLSearchParams({
+        resource_uri: resourceUri,
+        scale_x: String(scale.x),
+        scale_y: String(scale.y),
+        scale_z: String(scale.z),
+        draft_id: draftId,
+        draft_revision: String(draftRevision),
+      });
+      return requestJson(
+        `/api/program/draft/scene-meshes/resolve?${params.toString()}`,
+        parseProgramDraftMeshAssetMetadata,
         signal,
       );
     },

@@ -1,4 +1,4 @@
-"""Bounded scene-mesh client over fresh Headless owner projections.
+"""Bounded scene-mesh client over exact owner or Program-Draft projections.
 
 The last full Composer implementation is pinned at
 ``manyforge@08222188293df8e12f90dc72e204c21f22f92ea1``.  Source blob
@@ -9,11 +9,13 @@ lines 662-739, and state/router integration at lines 742-794. The current
 implementation preserves those behaviors through Headless-issued identities;
 it does not restore the former Composer scene owner.
 
-The current service never enumerates a Composer scene. It accepts a mesh URI
-only when that exact URI and scale are present in the fresh logical-scene
-projection returned by Headless, then captures one contained no-symlink local
-source snapshot and converts only those immutable bytes in a bounded
-subprocess. The worker receives no source path or external resource resolver.
+The service accepts a mesh URI only when that exact URI and scale are present
+either in the fresh logical-scene projection returned by Headless or in the
+explicitly identified current Program Draft. These two read scopes use
+separate revision-bound URLs and cache records. The service then captures one
+contained no-symlink local source snapshot and converts only those immutable
+bytes in a bounded subprocess. The worker receives no source path or external
+resource resolver.
 OBJ materials and GLTF external buffers/images are not loaded; DAE remains
 unsupported because its XML/resource closure is not captured here. Worker
 address space, output file size, CPU time, and post-start parent wait/teardown
@@ -1147,10 +1149,19 @@ class _OwnerMeshBinding:
     mesh_scale: tuple[float, float, float]
 
 
+@dataclass(frozen=True, slots=True)
+class _DraftMeshBinding:
+    draft_id: str
+    draft_revision: int
+    source_uri: str
+    mesh_scale: tuple[float, float, float]
+
+
 @dataclass(slots=True)
 class _MeshRecord:
+    scope: Literal["owner", "draft"]
     descriptor: MeshAssetDescriptor
-    binding: _OwnerMeshBinding
+    binding: _OwnerMeshBinding | _DraftMeshBinding
     mesh_input: AuthorizedMeshInput | None
     converted: bytes | None = None
     conversion_error: str | None = None
@@ -1290,6 +1301,79 @@ def _owner_mesh_binding(
     )
 
 
+def _draft_mesh_binding(
+    state: "ComposerState",
+    source_uri: str,
+    mesh_scale: tuple[float, float, float],
+    expected_draft_id: str,
+    expected_draft_revision: int,
+) -> _DraftMeshBinding:
+    session = getattr(state, "draft_session", None)
+    if session is None or not callable(getattr(session, "snapshot", None)):
+        raise _scene_mesh_error(
+            503,
+            "scene_mesh_draft_unavailable",
+            "the Composer Program Draft is unavailable",
+        )
+    snapshot = session.snapshot()
+    if (
+        type(snapshot) is not dict
+        or type(snapshot.get("draft_id")) is not str
+        or type(snapshot.get("draft_revision")) is not int
+        or isinstance(snapshot.get("draft_revision"), bool)
+    ):
+        raise _scene_mesh_error(
+            503,
+            "scene_mesh_draft_invalid",
+            "the Composer Program Draft identity is invalid",
+        )
+    if (
+        snapshot["draft_id"] != expected_draft_id
+        or snapshot["draft_revision"] != expected_draft_revision
+    ):
+        raise _scene_mesh_error(
+            409,
+            "scene_mesh_draft_revision_changed",
+            "the mesh URL belongs to a superseded Program Draft revision",
+        )
+    authoring = snapshot.get("authoring")
+    scene = authoring.get("scene") if type(authoring) is dict else None
+    if type(scene) is not list or len(scene) > 4_096:
+        raise _scene_mesh_error(
+            409,
+            "scene_mesh_draft_unavailable",
+            "the Program Draft has no bounded initial-scene projection",
+        )
+    matches = 0
+    for resource in scene:
+        shape = resource.get("shape") if type(resource) is dict else None
+        if (
+            type(shape) is not dict
+            or shape.get("type") != "mesh"
+            or shape.get("mesh_resource_uri") != source_uri
+        ):
+            continue
+        scale = shape.get("mesh_scale", [1.0, 1.0, 1.0])
+        try:
+            candidate_scale = _normalize_scale(scale)
+        except SceneMeshInputError:
+            continue
+        if candidate_scale == mesh_scale:
+            matches += 1
+    if matches == 0:
+        raise _scene_mesh_error(
+            409,
+            "scene_mesh_not_draft_authorized",
+            "the requested mesh URI and scale are absent from the current Program Draft",
+        )
+    return _DraftMeshBinding(
+        draft_id=expected_draft_id,
+        draft_revision=expected_draft_revision,
+        source_uri=source_uri,
+        mesh_scale=mesh_scale,
+    )
+
+
 def _resolved_mesh_source(
     state: "ComposerState",
     source_uri: str,
@@ -1341,7 +1425,7 @@ def _resolved_mesh_source(
 
 
 class SceneMeshAssetService:
-    """Read-only, owner-bound mesh conversion and bounded presentation cache."""
+    """Read-only, revision-bound mesh conversion and presentation cache."""
 
     def __init__(self, *, limits: MeshConversionLimits | None = None) -> None:
         self._limits = limits or MeshConversionLimits.from_environment()
@@ -1367,6 +1451,10 @@ class SceneMeshAssetService:
         state: "ComposerState",
         mesh_resource_uri: str | None,
         mesh_scale: list[float] | tuple[float, ...] | None,
+        *,
+        scope: Literal["owner", "draft"] = "owner",
+        draft_id: str | None = None,
+        draft_revision: int | None = None,
     ) -> _MeshRecord:
         source_uri = _bounded_text(
             mesh_resource_uri,
@@ -1374,7 +1462,22 @@ class SceneMeshAssetService:
             maximum=_MAX_URI_CHARS,
         )
         scale = _normalize_scale(mesh_scale)
-        binding = _owner_mesh_binding(state, source_uri, scale)
+        if scope == "owner":
+            binding: _OwnerMeshBinding | _DraftMeshBinding = _owner_mesh_binding(
+                state,
+                source_uri,
+                scale,
+            )
+        else:
+            if draft_id is None or draft_revision is None:
+                raise SceneMeshInputError("Program Draft mesh identity is required")
+            binding = _draft_mesh_binding(
+                state,
+                source_uri,
+                scale,
+                draft_id,
+                draft_revision,
+            )
         path, roots = _resolved_mesh_source(state, source_uri)
         mesh_input = _read_authorized_mesh_input(
             path,
@@ -1386,11 +1489,12 @@ class SceneMeshAssetService:
             mesh_input.content_sha256,
             scale,
         )
+        record_identity = f"{scope}:{asset_hash}"
         with self._lock:
-            existing = self._records.get(asset_hash)
+            existing = self._records.get(record_identity)
             if existing is not None:
                 existing.binding = binding
-                self._records.move_to_end(asset_hash)
+                self._records.move_to_end(record_identity)
                 return existing
             while len(self._records) >= _MAX_SERVICE_RECORDS:
                 if self._evict_one_locked():
@@ -1399,6 +1503,7 @@ class SceneMeshAssetService:
                     "all bounded scene mesh cache records are active"
                 )
             record = _MeshRecord(
+                scope=scope,
                 descriptor=MeshAssetDescriptor(
                     asset_hash=asset_hash,
                     source_uri=source_uri,
@@ -1409,12 +1514,18 @@ class SceneMeshAssetService:
                 binding=binding,
                 mesh_input=mesh_input,
             )
-            self._records[asset_hash] = record
+            self._records[record_identity] = record
             return record
+
+    @staticmethod
+    def _record_identity(record: _MeshRecord) -> str:
+        return f"{record.scope}:{record.descriptor.asset_hash}"
 
     def _metadata(self, record: _MeshRecord) -> dict[str, str | int | None]:
         with self._lock:
             binding = record.binding
+        if not isinstance(binding, _OwnerMeshBinding):
+            raise RuntimeError("owner mesh record has a Draft binding")
         status = (
             "parse_failed"
             if record.conversion_error is not None
@@ -1439,6 +1550,34 @@ class SceneMeshAssetService:
             "last_error": record.conversion_error,
         }
 
+    def _draft_metadata(self, record: _MeshRecord) -> dict[str, str | int | None]:
+        with self._lock:
+            binding = record.binding
+        if not isinstance(binding, _DraftMeshBinding):
+            raise RuntimeError("Program Draft mesh record has an owner binding")
+        status = (
+            "parse_failed"
+            if record.conversion_error is not None
+            else "ok" if record.converted is not None else "pending"
+        )
+        query = urlencode(
+            {
+                "draft_id": binding.draft_id,
+                "draft_revision": str(binding.draft_revision),
+            }
+        )
+        return {
+            "schema_version": "manyforge.program_draft_mesh_asset.v1",
+            "asset_hash": record.descriptor.asset_hash,
+            "mesh_asset_url": (
+                f"/api/program/draft/scene-meshes/{record.descriptor.asset_hash}.glb?{query}"
+            ),
+            "mesh_asset_status": status,
+            "draft_id": binding.draft_id,
+            "draft_revision": binding.draft_revision,
+            "last_error": record.conversion_error,
+        }
+
     def metadata_for_shape(
         self,
         state: "ComposerState",
@@ -1450,6 +1589,25 @@ class SceneMeshAssetService:
         del schedule_conversion
         return self._metadata(
             self._record_for_shape(state, mesh_resource_uri, mesh_scale)
+        )
+
+    def metadata_for_draft_shape(
+        self,
+        state: "ComposerState",
+        mesh_resource_uri: str | None,
+        mesh_scale: list[float] | tuple[float, ...] | None,
+        draft_id: str,
+        draft_revision: int,
+    ) -> dict[str, str | int | None]:
+        return self._draft_metadata(
+            self._record_for_shape(
+                state,
+                mesh_resource_uri,
+                mesh_scale,
+                scope="draft",
+                draft_id=draft_id,
+                draft_revision=draft_revision,
+            )
         )
 
     def validate_boundary_or_409(
@@ -1513,13 +1671,20 @@ class SceneMeshAssetService:
         expected_generation: int,
     ) -> _OwnerMeshBinding:
         with self._lock:
-            if self._records.get(record.descriptor.asset_hash) is not record:
+            record_identity = self._record_identity(record)
+            if self._records.get(record_identity) is not record:
                 raise _scene_mesh_error(
                     404,
                     "scene_mesh_asset_unknown",
                     "the scene mesh asset has left the bounded cache",
                 )
             binding = record.binding
+        if not isinstance(binding, _OwnerMeshBinding):
+            raise _scene_mesh_error(
+                404,
+                "scene_mesh_asset_unknown",
+                "the requested asset is not owner-scoped",
+            )
         if (
             binding.source_owner_epoch != expected_owner_epoch
             or binding.source_generation != expected_generation
@@ -1535,7 +1700,7 @@ class SceneMeshAssetService:
             binding.mesh_scale,
         )
         with self._lock:
-            if self._records.get(record.descriptor.asset_hash) is not record:
+            if self._records.get(record_identity) is not record:
                 raise _scene_mesh_error(
                     404,
                     "scene_mesh_asset_unknown",
@@ -1547,7 +1712,59 @@ class SceneMeshAssetService:
                     "scene_mesh_owner_generation_changed",
                     "the mesh URL belongs to a superseded logical-scene generation",
                 )
-            self._records.move_to_end(record.descriptor.asset_hash)
+            self._records.move_to_end(record_identity)
+        return binding
+
+    def _validate_draft_binding(
+        self,
+        state: "ComposerState",
+        record: _MeshRecord,
+        expected_draft_id: str,
+        expected_draft_revision: int,
+    ) -> _DraftMeshBinding:
+        record_identity = self._record_identity(record)
+        with self._lock:
+            if self._records.get(record_identity) is not record:
+                raise _scene_mesh_error(
+                    404,
+                    "scene_mesh_asset_unknown",
+                    "the scene mesh asset has left the bounded cache",
+                )
+            binding = record.binding
+        if not isinstance(binding, _DraftMeshBinding):
+            raise _scene_mesh_error(
+                404,
+                "scene_mesh_asset_unknown",
+                "the requested asset is not Program-Draft-scoped",
+            )
+        if (
+            binding.draft_id != expected_draft_id
+            or binding.draft_revision != expected_draft_revision
+        ):
+            raise _scene_mesh_error(
+                409,
+                "scene_mesh_draft_revision_changed",
+                "the mesh URL belongs to a superseded Program Draft revision",
+            )
+        current = _draft_mesh_binding(
+            state,
+            binding.source_uri,
+            binding.mesh_scale,
+            expected_draft_id,
+            expected_draft_revision,
+        )
+        with self._lock:
+            if (
+                self._records.get(record_identity) is not record
+                or current != binding
+                or record.binding != binding
+            ):
+                raise _scene_mesh_error(
+                    409,
+                    "scene_mesh_draft_revision_changed",
+                    "the mesh URL belongs to a superseded Program Draft revision",
+                )
+            self._records.move_to_end(record_identity)
         return binding
 
     @staticmethod
@@ -1586,11 +1803,12 @@ class SceneMeshAssetService:
                 record.mesh_input = None
                 raise
             with self._lock:
-                if self._records.get(record.descriptor.asset_hash) is not record:
+                record_identity = self._record_identity(record)
+                if self._records.get(record_identity) is not record:
                     return result
                 while self._cache_bytes + len(result) > _MAX_SERVICE_CACHE_BYTES:
                     if self._evict_one_locked(
-                        exclude={record.descriptor.asset_hash},
+                        exclude={record_identity},
                     ):
                         continue
                     raise SceneMeshBoundsError(
@@ -1599,7 +1817,7 @@ class SceneMeshAssetService:
                 record.converted = result
                 record.mesh_input = None
                 self._cache_bytes += len(result)
-                self._records.move_to_end(record.descriptor.asset_hash)
+                self._records.move_to_end(record_identity)
             return result
 
     def get_glb_response(
@@ -1626,7 +1844,7 @@ class SceneMeshAssetService:
                 },
             )
         with self._lock:
-            record = self._records.get(identity)
+            record = self._records.get(f"owner:{identity}")
         if record is None:
             return JSONResponse(
                 status_code=404,
@@ -1688,6 +1906,77 @@ class SceneMeshAssetService:
                 "ETag": f'"{identity}"',
                 "X-ManyForge-Scene-Owner-Epoch": binding.source_owner_epoch,
                 "X-ManyForge-Scene-Generation": str(binding.source_generation),
+            },
+        )
+
+    def get_draft_glb_response(
+        self,
+        state: "ComposerState",
+        asset_hash: str,
+        expected_draft_id: str,
+        expected_draft_revision: int,
+    ) -> Response:
+        try:
+            identity = _validate_lower_hex(
+                asset_hash,
+                label="asset_hash",
+                length=16,
+            )
+        except SceneMeshInputError as error:
+            return JSONResponse(
+                status_code=404,
+                content={"detail": {"code": "scene_mesh_asset_unknown", "message": str(error)}},
+            )
+        with self._lock:
+            record = self._records.get(f"draft:{identity}")
+        if record is None:
+            return JSONResponse(
+                status_code=404,
+                content={
+                    "detail": {
+                        "code": "scene_mesh_asset_unknown",
+                        "message": "unknown Program Draft scene mesh asset",
+                    }
+                },
+            )
+        try:
+            binding = self._validate_draft_binding(
+                state,
+                record,
+                expected_draft_id,
+                expected_draft_revision,
+            )
+            content = self._convert(record)
+        except HTTPException as error:
+            return JSONResponse(status_code=error.status_code, content={"detail": error.detail})
+        except TimeoutError as error:
+            return JSONResponse(
+                status_code=504,
+                content={"detail": {"code": "scene_mesh_conversion_timeout", "message": str(error)}},
+            )
+        except SceneMeshBoundsError as error:
+            return JSONResponse(
+                status_code=413,
+                content={"detail": {"code": "scene_mesh_bounds_exceeded", "message": str(error)}},
+            )
+        except Exception as error:
+            return JSONResponse(
+                status_code=422,
+                content={
+                    "detail": {
+                        "code": "scene_mesh_conversion_failed",
+                        "message": _bounded_worker_message(error),
+                    }
+                },
+            )
+        return Response(
+            content=content,
+            media_type="model/gltf-binary",
+            headers={
+                "Cache-Control": "private, no-cache",
+                "ETag": f'"{identity}"',
+                "X-ManyForge-Draft-Id": binding.draft_id,
+                "X-ManyForge-Draft-Revision": str(binding.draft_revision),
             },
         )
 
@@ -1768,6 +2057,43 @@ def create_scene_meshes_router(state: "ComposerState") -> APIRouter:
             asset_hash,
             owner_epoch,
             generation,
+        )
+
+    @router.get("/api/program/draft/scene-meshes/resolve")
+    def resolve_program_draft_scene_mesh(
+        resource_uri: str = Query(min_length=1, max_length=_MAX_URI_CHARS),
+        scale_x: float = Query(gt=0.0, le=_MAX_SCALE_COMPONENT),
+        scale_y: float = Query(gt=0.0, le=_MAX_SCALE_COMPONENT),
+        scale_z: float = Query(gt=0.0, le=_MAX_SCALE_COMPONENT),
+        draft_id: str = Query(min_length=1, max_length=256),
+        draft_revision: int = Query(ge=0),
+    ) -> dict[str, str | int | None]:
+        try:
+            return service.metadata_for_draft_shape(
+                state,
+                resource_uri,
+                [scale_x, scale_y, scale_z],
+                draft_id,
+                draft_revision,
+            )
+        except HTTPException:
+            raise
+        except SceneMeshBoundsError as error:
+            raise _scene_mesh_error(413, "scene_mesh_bounds_exceeded", str(error)) from error
+        except SceneMeshInputError as error:
+            raise _scene_mesh_error(409, "scene_mesh_input_invalid", str(error)) from error
+
+    @router.get("/api/program/draft/scene-meshes/{asset_hash}.glb")
+    def get_program_draft_scene_mesh(
+        asset_hash: str = ApiPath(min_length=16, max_length=16),
+        draft_id: str = Query(min_length=1, max_length=256),
+        draft_revision: int = Query(ge=0),
+    ) -> Response:
+        return service.get_draft_glb_response(
+            state,
+            asset_hash,
+            draft_id,
+            draft_revision,
         )
 
     return router

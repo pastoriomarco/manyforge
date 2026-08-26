@@ -5,10 +5,46 @@ import { describe, expect, it } from 'vitest';
 
 import {
   DEFAULT_WIREFRAME_VISIBLE,
+  supportsIndependentSceneScale,
   ViewerFailureBoundary,
 } from './StructuralViewer';
+import type { LogicalSceneObject } from '../types/api';
+
+function sceneObject(
+  shape: LogicalSceneObject['collision_shapes'][number],
+): LogicalSceneObject {
+  return {
+    scene_resource_id: 'part',
+    collision_shapes: [shape],
+    placement: {
+      kind: 'cell_fixed',
+      cell_id: 'cell',
+      pose_in_cell: {
+        position_m: { x: 0, y: 0, z: 0 },
+        orientation_xyzw: [0, 0, 0, 1],
+      },
+    },
+    provider_evidence: null,
+    support_contacts: [],
+  };
+}
 
 describe('viewer failure isolation', () => {
+  it('offers unconstrained scale only for shapes the gizmo can represent safely', () => {
+    expect(supportsIndependentSceneScale(sceneObject({
+      type: 'box', dimensions_m: { x: 1, y: 1, z: 1 },
+    }))).toBe(true);
+    expect(supportsIndependentSceneScale(sceneObject({
+      type: 'mesh', resource_uri: 'package://part', scale: { x: 1, y: 1, z: 1 },
+    }))).toBe(true);
+    expect(supportsIndependentSceneScale(sceneObject({
+      type: 'sphere', radius_m: 1,
+    }))).toBe(false);
+    expect(supportsIndependentSceneScale(sceneObject({
+      type: 'cylinder', radius_m: 1, height_m: 1,
+    }))).toBe(false);
+  });
+
   it('replaces only the failed viewer subtree with its fallback', () => {
     const boundary = new ViewerFailureBoundary({
       children: <div>viewport</div>,
@@ -36,16 +72,18 @@ describe('viewer failure isolation', () => {
     );
   });
 
-  it('wraps native viewer controls instead of clipping them at narrow widths', () => {
+  it('keeps viewer layers in one compact tools menu at narrow widths', () => {
     const css = readFileSync(new URL('../index.css', import.meta.url), 'utf8');
     const source = readFileSync(
       new URL('./StructuralViewer.tsx', import.meta.url),
       'utf8',
     );
 
-    expect(css).toMatch(/\.viewer-controls\s*\{\s*flex-wrap: wrap;/);
-    expect(source.match(/type="checkbox"/g)).toHaveLength(3);
-    expect(source).toContain('<button type="button" className="quiet-button"');
+    expect(css).toContain('.viewer-options-popover');
+    expect(source.match(/type="checkbox"/g)).toHaveLength(4);
+    expect(source).toContain('<summary>Tools</summary>');
+    expect(source).toContain('Measured-state overlay');
+    expect(source).toContain('Model and source facts');
   });
 
   it('frames robot, scene, measured overlays, and point clouds together', () => {
@@ -65,6 +103,54 @@ describe('viewer failure isolation', () => {
     expect(source).toContain(
       'fit={camera === null && !initialCameraPresentation.framed}',
     );
+  });
+
+  it('isolates individual retained and logical-scene mesh failures', () => {
+    const source = readFileSync(
+      new URL('./StructuralViewer.tsx', import.meta.url),
+      'utf8',
+    );
+
+    expect(source).toContain('<AssetErrorBoundary resetKey={visual.mesh_url}');
+    expect(source).toContain('<AssetErrorBoundary resetKey={collision.mesh_url}');
+    expect(source).toContain('<AssetErrorBoundary resetKey={url} onError={isolateError}>');
+    expect(source).toContain('One mesh is unavailable; the remaining scene is still usable.');
+  });
+
+  it('shares disposable object, link, and frame selection with camera tools', () => {
+    const viewer = readFileSync(
+      new URL('./StructuralViewer.tsx', import.meta.url),
+      'utf8',
+    );
+    const workspace = readFileSync(
+      new URL('./SceneAuthoringWorkspace.tsx', import.meta.url),
+      'utf8',
+    );
+
+    expect(viewer).toContain('selectedStructureName');
+    expect(viewer).toContain('scene.getObjectByName(`measured:${request.target.id}`)');
+    expect(viewer).toContain('scene.getObjectByName(`link:${request.target.id}`)');
+    expect(workspace).toContain("kind: 'owner_object'");
+    expect(workspace).toContain("kind: 'program_resource'");
+    expect(workspace).toContain("kind: 'structure'");
+  });
+
+  it('routes pose and Cartesian TCP gizmo edits through the existing candidate controller', () => {
+    const viewer = readFileSync(
+      new URL('./StructuralViewer.tsx', import.meta.url),
+      'utf8',
+    );
+    const workspace = readFileSync(
+      new URL('./SceneAuthoringWorkspace.tsx', import.meta.url),
+      'utf8',
+    );
+
+    expect(viewer).toContain('candidateTcpEditable');
+    expect(viewer).toContain('onEditCandidateTcpPose');
+    expect(viewer).toContain("transformMode === 'rotate' ? 'rotate' : 'translate'");
+    expect(workspace).toContain("robotControl.state.mode === 'pose_goal'");
+    expect(workspace).toContain("robotControl.state.mode === 'cartesian_path'");
+    expect(workspace).toContain('onEditCandidatePose={robotControl.editPose}');
   });
 
   it('suspends only viewer observers while retaining outer presentation state', () => {

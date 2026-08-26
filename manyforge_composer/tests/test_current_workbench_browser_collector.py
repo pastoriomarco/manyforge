@@ -135,6 +135,8 @@ class _FakeDriver:
         if path == "/execute/sync":
             script = str((payload or {}).get("script"))
             self.scripts.append(script)
+            if script == collector.QUALIFICATION_READY_SCRIPT:
+                return True
             if script == collector.OBSERVATION_SCRIPT:
                 snapshot = _snapshot(
                     active=True,
@@ -193,12 +195,14 @@ def test_collector_cleans_up_exact_session_on_success_and_uses_exact_opt_in() ->
     assert result["topology"]["reload"]["maxActiveSockets"] == 1
     for workspace in ("program", "scene", "deployment"):
         assert driver.scripts.count(collector._select_workspace_script(workspace)) == 1
+    assert driver.scripts.count(collector.QUALIFICATION_READY_SCRIPT) == 2
     assert result["longTasks"] == {"supported": False, "count": None}
 
 
 def test_live_observation_uses_the_single_integrated_runtime_status_entry() -> None:
     assert '.runtime-status-button[data-backend-connected="true"]' in collector.OBSERVATION_SCRIPT
     assert ".header-boundary" not in collector.OBSERVATION_SCRIPT
+    assert 'input[aria-label="Wireframe overlays"]' in collector.OBSERVATION_SCRIPT
 
 
 def test_collector_sets_and_proves_viewport_and_writes_bounded_screenshot(

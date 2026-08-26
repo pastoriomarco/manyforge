@@ -16,6 +16,8 @@ import {
   Grid,
   OrbitControls,
   PerspectiveCamera,
+  TransformControls,
+  useBounds,
   useGLTF,
 } from '@react-three/drei';
 import * as THREE from 'three';
@@ -39,9 +41,13 @@ import type {
   AuthoritativeTransformTransition,
 } from '../state/authoritativeInterpolation';
 import type { StructuralResourceState } from '../state/structuralResource';
-import type { RuntimeScenePresentation } from '../state/runtimeScenePresentation';
+import type {
+  CandidateRobotPresentation,
+  RuntimeScenePresentation,
+} from '../state/runtimeScenePresentation';
 import type {
   LogicalSceneObject,
+  LogicalScenePose,
   LogicalSceneShape,
   ProgramViewerMetadata,
   QuaternionXyzwTuple,
@@ -88,10 +94,45 @@ interface StructuralViewerProps {
   manifest: StructuralResourceState<SceneUrdfManifest>;
   onRetry: () => void;
   sceneObjects?: LogicalSceneObject[];
+  programDraftPreview?: boolean;
+  programDraftIdentity?: {
+    draftId: string;
+    draftRevision: number;
+  };
   selectedSceneResourceId?: string | null;
   onSelectSceneResource?: (sceneResourceId: string | null) => void;
+  selectedStructureName?: string | null;
+  onSelectStructure?: (structureName: string | null) => void;
+  onCommitSceneTransform?: (
+    sceneResourceId: string,
+    pose: LogicalScenePose,
+    scale: [number, number, number],
+    expectedOwnerIdentity: { ownerEpoch: string; generation: number },
+  ) => Promise<boolean>;
+  onCommitProgramDraftTransform?: (
+    sceneResourceId: string,
+    pose: LogicalScenePose,
+    scale: [number, number, number],
+    expectedDraftIdentity: { ownerEpoch: string; generation: number },
+  ) => Promise<boolean>;
+  onDuplicateSceneResource?: (sceneResourceId: string) => Promise<boolean>;
+  onRemoveSceneResource?: (sceneResourceId: string) => Promise<boolean>;
+  onDetachSceneResource?: (sceneResourceId: string) => Promise<boolean>;
+  onEditSceneResource?: (sceneResourceId: string) => void;
+  selectionLocked?: boolean;
+  sceneMutationAvailability?: Record<string, {
+    duplicate: boolean;
+    remove: boolean;
+    detach: boolean;
+    transform: boolean;
+    reason: string | null;
+    detachReason: string | null;
+  }>;
   candidateTcpPose?: Pose3Value | null;
   candidateStale?: boolean;
+  candidateTcpEditable?: boolean;
+  onEditCandidateTcpPose?: (pose: Pose3Value) => void;
+  candidateRobot?: CandidateRobotPresentation | null;
   runtimePresentation?: RuntimeScenePresentation;
   sceneOwnerIdentity?: {
     ownerEpoch: string;
@@ -107,6 +148,11 @@ interface StructuralViewerProps {
   } | null;
   pointCloudCellId?: string;
   viewer?: ProgramViewerMetadata;
+  frameAxes?: Array<{
+    linkName: string;
+    frameRoleId: string;
+  }>;
+  objectAxesVisibleIds?: string[];
 }
 
 interface AssetErrorBoundaryProps {
@@ -125,6 +171,14 @@ interface ViewerFailureBoundaryState {
 }
 
 export const DEFAULT_WIREFRAME_VISIBLE = false;
+
+export function supportsIndependentSceneScale(
+  object: LogicalSceneObject | null,
+): boolean {
+  if (object?.collision_shapes.length !== 1) return false;
+  const shape = object.collision_shapes[0];
+  return shape.type === 'box' || shape.type === 'mesh';
+}
 
 /** Keep WebGL/Three failures local so Program authoring remains usable. */
 export class ViewerFailureBoundary extends Component<
@@ -208,7 +262,7 @@ function AuthoritativeTransformGroup({
   latestFrameAppliers: Set<() => void>;
   children: ReactNode;
 }) {
-  const group = useRef<THREE.Group>(null);
+  const group = useRef<THREE.Group | null>(null);
   const previous = useRef<AuthoritativeTransformFrame | null>(null);
   const active = useRef<AuthoritativeTransformTransition | null>(null);
   const invalidate = useThree((state) => state.invalidate);
@@ -332,7 +386,17 @@ function CollisionMesh({ url }: { url: string }) {
     });
     return root;
   }, [gltf.scene]);
+  useEffect(() => () => disposeOwnedMaterials(clone), [clone]);
   return <primitive object={clone} />;
+}
+
+function disposeOwnedMaterials(root: THREE.Object3D): void {
+  root.traverse((object) => {
+    const mesh = object as THREE.Mesh;
+    if (!mesh.isMesh) return;
+    const materials = Array.isArray(mesh.material) ? mesh.material : [mesh.material];
+    for (const material of materials) material.dispose();
+  });
 }
 
 function SceneObjectMeshAsset({
@@ -371,70 +435,128 @@ function SceneObjectMeshAsset({
     });
     return root;
   }, [gltf.scene, measured, selected, wireframe]);
+  useEffect(() => () => disposeOwnedMaterials(clone), [clone]);
   return <primitive object={clone} />;
 }
 
 function SceneObjectMesh({
   shape,
   ownerIdentity,
+  draftIdentity,
   measured,
   selected,
   wireframe,
-  onAssetError,
 }: {
   shape: Extract<LogicalSceneShape, { type: 'mesh' }>;
-  ownerIdentity: NonNullable<StructuralViewerProps['sceneOwnerIdentity']>;
+  ownerIdentity?: NonNullable<StructuralViewerProps['sceneOwnerIdentity']>;
+  draftIdentity?: NonNullable<StructuralViewerProps['programDraftIdentity']>;
   measured: boolean;
   selected: boolean;
   wireframe: boolean;
-  onAssetError: (error: Error) => void;
 }) {
   const [url, setUrl] = useState<string | null>(null);
+  const [error, setError] = useState<Error | null>(null);
+  const draftId = draftIdentity?.draftId;
+  const draftRevision = draftIdentity?.draftRevision;
+  const ownerEpoch = ownerIdentity?.ownerEpoch;
+  const ownerGeneration = ownerIdentity?.generation;
+  const scaleX = shape.scale.x;
+  const scaleY = shape.scale.y;
+  const scaleZ = shape.scale.z;
+  const isolateError = useCallback((failure: Error) => {
+    reportViewerQualificationError(failure);
+    setError(failure);
+  }, [setError]);
   useEffect(() => {
     const controller = new AbortController();
     setUrl(null);
-    void api.scene.resolveMesh(
-      shape.resource_uri,
-      shape.scale,
-      controller.signal,
-    ).then((asset) => {
-      if (
-        asset.source_owner_epoch !== ownerIdentity.ownerEpoch
-        || asset.source_generation !== ownerIdentity.generation
-      ) {
-        throw new Error('Scene mesh belongs to a superseded owner generation.');
-      }
-      setUrl(asset.mesh_asset_url);
+    setError(null);
+    const scale = { x: scaleX, y: scaleY, z: scaleZ };
+    const resolution = draftId === undefined || draftRevision === undefined
+      ? ownerEpoch === undefined || ownerGeneration === undefined
+        ? Promise.reject(new Error('Scene mesh has no exact source identity.'))
+        : api.scene.resolveMesh(
+            shape.resource_uri,
+            scale,
+            controller.signal,
+          ).then((asset) => {
+            if (
+              asset.source_owner_epoch !== ownerEpoch
+              || asset.source_generation !== ownerGeneration
+            ) {
+              throw new Error('Scene mesh belongs to a superseded owner generation.');
+            }
+            return asset.mesh_asset_url;
+          })
+      : api.scene.resolveProgramDraftMesh(
+          shape.resource_uri,
+          scale,
+          draftId,
+          draftRevision,
+          controller.signal,
+        ).then((asset) => {
+          if (
+            asset.draft_id !== draftId
+            || asset.draft_revision !== draftRevision
+          ) {
+            throw new Error('Scene mesh belongs to a superseded Program Draft.');
+          }
+          return asset.mesh_asset_url;
+        });
+    void resolution.then((assetUrl) => {
+      setUrl(assetUrl);
     }).catch((error: unknown) => {
       if (controller.signal.aborted) return;
-      onAssetError(
+      isolateError(
         error instanceof Error ? error : new Error('Scene mesh resolution failed.'),
       );
     });
     return () => controller.abort();
   }, [
-    onAssetError,
-    ownerIdentity.generation,
-    ownerIdentity.ownerEpoch,
+    draftId,
+    draftRevision,
+    isolateError,
+    ownerEpoch,
+    ownerGeneration,
+    scaleX,
+    scaleY,
+    scaleZ,
     shape.resource_uri,
-    shape.scale,
-    shape.scale.x,
-    shape.scale.y,
-    shape.scale.z,
   ]);
-  return url === null
+  return error !== null
+    ? (
+      <mesh renderOrder={20}>
+        <boxGeometry args={[0.06, 0.06, 0.06]} />
+        <meshBasicMaterial color="#ef766f" wireframe />
+      </mesh>
+    )
+    : url === null
     ? null
     : (
-      <SceneObjectMeshAsset
-        url={url}
-        measured={measured}
-        selected={selected}
-        wireframe={wireframe}
-      />
+      <AssetErrorBoundary resetKey={url} onError={isolateError}>
+        <Suspense fallback={null}>
+          <SceneObjectMeshAsset
+            url={url}
+            measured={measured}
+            selected={selected}
+            wireframe={wireframe}
+          />
+        </Suspense>
+      </AssetErrorBoundary>
     );
 }
 
-function MeasuredVisualMesh({ url }: { url: string }) {
+function OverlayVisualMesh({
+  url,
+  color,
+  emissive,
+  opacity,
+}: {
+  url: string;
+  color: string;
+  emissive: string;
+  opacity: number;
+}) {
   const gltf = useGLTF(resolveStructuralAssetUrl(url));
   const clone = useMemo(() => {
     const root = gltf.scene.clone(true);
@@ -445,10 +567,10 @@ function MeasuredVisualMesh({ url }: { url: string }) {
         ? mesh.material
         : [mesh.material];
       const materials = sourceMaterials.map(() => new THREE.MeshStandardMaterial({
-        color: '#43d7ec',
-        emissive: '#0c5060',
+        color,
+        emissive,
         transparent: true,
-        opacity: 0.34,
+        opacity,
         wireframe: true,
         depthWrite: false,
         side: THREE.DoubleSide,
@@ -457,7 +579,8 @@ function MeasuredVisualMesh({ url }: { url: string }) {
       mesh.renderOrder = 14;
     });
     return root;
-  }, [gltf.scene]);
+  }, [color, emissive, gltf.scene, opacity]);
+  useEffect(() => () => disposeOwnedMaterials(clone), [clone]);
   return <primitive object={clone} />;
 }
 
@@ -514,7 +637,17 @@ function PrimitiveCollision({ primitive }: { primitive: SceneUrdfPrimitive }) {
   );
 }
 
-function PrimitiveMeasured({ primitive }: { primitive: SceneUrdfPrimitive }) {
+function PrimitiveOverlay({
+  primitive,
+  color,
+  emissive,
+  opacity,
+}: {
+  primitive: SceneUrdfPrimitive;
+  color: string;
+  emissive: string;
+  opacity: number;
+}) {
   const cylinderRotation: [number, number, number] | undefined =
     primitive.type === 'cylinder'
     ? [Math.PI / 2, 0, 0]
@@ -523,10 +656,10 @@ function PrimitiveMeasured({ primitive }: { primitive: SceneUrdfPrimitive }) {
     <mesh rotation={cylinderRotation} renderOrder={14}>
       <PrimitiveGeometry primitive={primitive} />
       <meshStandardMaterial
-        color="#43d7ec"
-        emissive="#0c5060"
+        color={color}
+        emissive={emissive}
         transparent
-        opacity={0.34}
+        opacity={opacity}
         wireframe
         depthWrite={false}
         side={THREE.DoubleSide}
@@ -535,14 +668,26 @@ function PrimitiveMeasured({ primitive }: { primitive: SceneUrdfPrimitive }) {
   );
 }
 
-function RobotVisual({ visual }: { visual: SceneUrdfVisual }) {
+function RobotVisual({
+  visual,
+  onAssetError,
+}: {
+  visual: SceneUrdfVisual;
+  onAssetError: (error: Error) => void;
+}) {
   const origin = visual.visual_origin;
   return (
     <group
       position={origin.position_m}
       quaternion={normalizeQuaternion(origin.orientation_xyzw)}
     >
-      {visual.mesh_url !== null && <VisualMesh url={visual.mesh_url} />}
+      {visual.mesh_url !== null && (
+        <AssetErrorBoundary resetKey={visual.mesh_url} onError={onAssetError}>
+          <Suspense fallback={null}>
+            <VisualMesh url={visual.mesh_url} />
+          </Suspense>
+        </AssetErrorBoundary>
+      )}
       {visual.mesh_url === null && visual.primitive !== null && (
         <PrimitiveVisual primitive={visual.primitive} />
       )}
@@ -550,14 +695,26 @@ function RobotVisual({ visual }: { visual: SceneUrdfVisual }) {
   );
 }
 
-function RobotCollision({ collision }: { collision: SceneUrdfCollision }) {
+function RobotCollision({
+  collision,
+  onAssetError,
+}: {
+  collision: SceneUrdfCollision;
+  onAssetError: (error: Error) => void;
+}) {
   const origin = collision.collision_origin;
   return (
     <group
       position={origin.position_m}
       quaternion={normalizeQuaternion(origin.orientation_xyzw)}
     >
-      {collision.mesh_url !== null && <CollisionMesh url={collision.mesh_url} />}
+      {collision.mesh_url !== null && (
+        <AssetErrorBoundary resetKey={collision.mesh_url} onError={onAssetError}>
+          <Suspense fallback={null}>
+            <CollisionMesh url={collision.mesh_url} />
+          </Suspense>
+        </AssetErrorBoundary>
+      )}
       {collision.mesh_url === null && collision.primitive !== null && (
         <PrimitiveCollision primitive={collision.primitive} />
       )}
@@ -570,11 +727,23 @@ function RetainedNeutralModel({
   collisionsVisible,
   materializationStartedAtMs,
   onMaterialized,
+  frameAxesByLink,
+  frameAxesSizeM,
+  showFrameAxes,
+  selectedStructureName,
+  onSelectStructure,
+  onAssetError,
 }: {
   manifest: SceneUrdfManifest;
   collisionsVisible: boolean;
   materializationStartedAtMs: { current: number | null };
   onMaterialized: (durationMs: number) => void;
+  frameAxesByLink: ReadonlySet<string>;
+  frameAxesSizeM: number;
+  showFrameAxes: boolean;
+  selectedStructureName: string | null;
+  onSelectStructure: (structureName: string) => void;
+  onAssetError: (error: Error) => void;
 }) {
   const reported = useRef(false);
   // This is one browser-local wall-clock interval from renderer creation to
@@ -591,24 +760,34 @@ function RetainedNeutralModel({
       {manifest.links.map((link) => (
         <group
           key={`${manifest.model_key}:${link.name}`}
-          name={link.name}
+          name={`link:${link.name}`}
           position={link.neutral_transform.position_m}
           quaternion={normalizeQuaternion(
             link.neutral_transform.orientation_xyzw,
           )}
+          onClick={(event) => {
+            event.stopPropagation();
+            onSelectStructure(link.name);
+          }}
         >
           {link.visuals.map((visual) => (
             <RobotVisual
               key={`visual:${link.name}:${visual.index}`}
               visual={visual}
+              onAssetError={onAssetError}
             />
           ))}
           {collisionsVisible && link.collisions.map((collision) => (
             <RobotCollision
               key={`collision:${link.name}:${collision.index}`}
               collision={collision}
+              onAssetError={onAssetError}
             />
           ))}
+          {(selectedStructureName === link.name
+            || (showFrameAxes && frameAxesByLink.has(link.name))) && (
+            <axesHelper args={[frameAxesSizeM]} />
+          )}
         </group>
       ))}
     </group>
@@ -620,11 +799,21 @@ function MeasuredRuntimeModel({
   presentation,
   ownerIdentity,
   latestFrameAppliers,
+  frameAxesByLink,
+  frameAxesSizeM,
+  selectedStructureName,
+  onSelectStructure,
+  onAssetError,
 }: {
   manifest: SceneUrdfManifest;
   presentation: NonNullable<RuntimeScenePresentation['measuredRobot']>;
   ownerIdentity: StructuralViewerProps['sceneOwnerIdentity'];
   latestFrameAppliers: Set<() => void>;
+  frameAxesByLink: ReadonlySet<string>;
+  frameAxesSizeM: number;
+  selectedStructureName: string | null;
+  onSelectStructure: (structureName: string) => void;
+  onAssetError: (error: Error) => void;
 }) {
   return (
     <group name={`owner-measured-robot:${presentation.objectId}`}>
@@ -650,24 +839,111 @@ function MeasuredRuntimeModel({
             orientationXyzw={transform.orientation_xyzw}
             latestFrameAppliers={latestFrameAppliers}
           >
+            <group
+              onClick={(event) => {
+                event.stopPropagation();
+                onSelectStructure(link.name);
+              }}
+            >
+              {link.visuals.map((visual) => {
+                const origin = visual.visual_origin;
+                return (
+                  <group
+                    key={`measured-visual:${link.name}:${visual.index}`}
+                    position={origin.position_m}
+                    quaternion={normalizeQuaternion(origin.orientation_xyzw)}
+                  >
+                    {visual.mesh_url !== null && (
+                      <AssetErrorBoundary resetKey={visual.mesh_url} onError={onAssetError}>
+                        <Suspense fallback={null}>
+                          <OverlayVisualMesh
+                            url={visual.mesh_url}
+                            color="#43d7ec"
+                            emissive="#0c5060"
+                            opacity={0.34}
+                          />
+                        </Suspense>
+                      </AssetErrorBoundary>
+                    )}
+                    {visual.mesh_url === null && visual.primitive !== null && (
+                      <PrimitiveOverlay
+                        primitive={visual.primitive}
+                        color="#43d7ec"
+                        emissive="#0c5060"
+                        opacity={0.34}
+                      />
+                    )}
+                  </group>
+                );
+              })}
+              {(selectedStructureName === link.name
+                || frameAxesByLink.has(link.name)) && (
+                <axesHelper args={[frameAxesSizeM]} />
+              )}
+            </group>
+          </AuthoritativeTransformGroup>
+        );
+      })}
+    </group>
+  );
+}
+
+function CandidateRobotGhost({
+  manifest,
+  presentation,
+  stale,
+  onAssetError,
+}: {
+  manifest: SceneUrdfManifest;
+  presentation: CandidateRobotPresentation;
+  stale: boolean;
+  onAssetError: (error: Error) => void;
+}) {
+  const color = stale ? '#ef766f' : '#b7a2ff';
+  const emissive = stale ? '#621d22' : '#38236f';
+  return (
+    <group name={`candidate-robot:${presentation.receiptDigest}`}>
+      {manifest.links.map((link) => {
+        const transform = presentation.linkTransforms[link.name];
+        if (transform === undefined) return null;
+        return (
+          <group
+            key={`candidate:${manifest.model_key}:${link.name}`}
+            position={transform.position_m}
+            quaternion={normalizeQuaternion(transform.orientation_xyzw)}
+          >
             {link.visuals.map((visual) => {
               const origin = visual.visual_origin;
               return (
                 <group
-                  key={`measured-visual:${link.name}:${visual.index}`}
+                  key={`candidate-visual:${link.name}:${visual.index}`}
                   position={origin.position_m}
                   quaternion={normalizeQuaternion(origin.orientation_xyzw)}
                 >
                   {visual.mesh_url !== null && (
-                    <MeasuredVisualMesh url={visual.mesh_url} />
+                    <AssetErrorBoundary resetKey={visual.mesh_url} onError={onAssetError}>
+                      <Suspense fallback={null}>
+                        <OverlayVisualMesh
+                          url={visual.mesh_url}
+                          color={color}
+                          emissive={emissive}
+                          opacity={stale ? 0.2 : 0.3}
+                        />
+                      </Suspense>
+                    </AssetErrorBoundary>
                   )}
                   {visual.mesh_url === null && visual.primitive !== null && (
-                    <PrimitiveMeasured primitive={visual.primitive} />
+                    <PrimitiveOverlay
+                      primitive={visual.primitive}
+                      color={color}
+                      emissive={emissive}
+                      opacity={stale ? 0.2 : 0.3}
+                    />
                   )}
                 </group>
               );
             })}
-          </AuthoritativeTransformGroup>
+          </group>
         );
       })}
     </group>
@@ -691,6 +967,135 @@ function LogicalShapeGeometry({ shape }: { shape: LogicalSceneShape }) {
   return null;
 }
 
+type SceneTransformMode = 'translate' | 'rotate' | 'scale';
+type SceneTransformSpace = 'local' | 'world';
+type SceneTransformIdentity = { ownerEpoch: string; generation: number };
+type SceneTransformCommit = (
+  sceneResourceId: string,
+  pose: LogicalScenePose,
+  scale: [number, number, number],
+  expectedIdentity: SceneTransformIdentity,
+) => Promise<boolean>;
+
+function EditableLogicalSceneObject({
+  object,
+  selected,
+  transformMode,
+  transformSpace,
+  transformEnabled,
+  transformIdentity,
+  onCommitTransform,
+  onSelect,
+  onContext,
+  children,
+}: {
+  object: LogicalSceneObject & { placement: Extract<LogicalSceneObject['placement'], { kind: 'cell_fixed' }> };
+  selected: boolean;
+  transformMode: SceneTransformMode;
+  transformSpace: SceneTransformSpace;
+  transformEnabled: boolean;
+  transformIdentity: SceneTransformIdentity | undefined;
+  onCommitTransform: SceneTransformCommit;
+  onSelect: (sceneResourceId: string) => void;
+  onContext: (sceneResourceId: string, x: number, y: number) => void;
+  children: ReactNode;
+}) {
+  const group = useRef<THREE.Group | null>(null);
+  const [transformTarget, setTransformTarget] = useState<THREE.Group | null>(null);
+  const captureGroup = useCallback((node: THREE.Group | null) => {
+    group.current = node;
+    if (node !== null) setTransformTarget(node);
+  }, []);
+  const dragging = useRef(false);
+  const dragTransformIdentity = useRef(transformIdentity);
+  const latestTransformIdentity = useRef(transformIdentity);
+  const sourceKey = JSON.stringify(object);
+  const latestSourceKey = useRef(sourceKey);
+  const pose = object.placement.pose_in_cell;
+  const restoreOwnerTransform = useCallback(() => {
+    if (group.current === null) return;
+    group.current.position.set(pose.position_m.x, pose.position_m.y, pose.position_m.z);
+    group.current.quaternion.fromArray(normalizeQuaternion(pose.orientation_xyzw));
+    group.current.scale.set(1, 1, 1);
+  }, [pose.orientation_xyzw, pose.position_m.x, pose.position_m.y, pose.position_m.z]);
+  const latestRestoreOwnerTransform = useRef(restoreOwnerTransform);
+  useLayoutEffect(() => {
+    latestTransformIdentity.current = transformIdentity;
+    latestSourceKey.current = sourceKey;
+    latestRestoreOwnerTransform.current = restoreOwnerTransform;
+  }, [restoreOwnerTransform, sourceKey, transformIdentity]);
+  useLayoutEffect(() => {
+    if (!dragging.current) restoreOwnerTransform();
+  }, [restoreOwnerTransform, sourceKey]);
+  const commit = useCallback(async () => {
+    const target = group.current;
+    if (target === null) return;
+    const expectedTransformIdentity = dragTransformIdentity.current;
+    if (
+      expectedTransformIdentity === undefined
+      || latestTransformIdentity.current === undefined
+      || latestTransformIdentity.current.ownerEpoch !== expectedTransformIdentity.ownerEpoch
+      || latestTransformIdentity.current.generation !== expectedTransformIdentity.generation
+    ) {
+      dragging.current = false;
+      latestRestoreOwnerTransform.current();
+      return;
+    }
+    const quaternion = target.quaternion.clone().normalize();
+    const accepted = await onCommitTransform(
+      object.scene_resource_id,
+      {
+        position_m: { x: target.position.x, y: target.position.y, z: target.position.z },
+        orientation_xyzw: [quaternion.x, quaternion.y, quaternion.z, quaternion.w],
+      },
+      [target.scale.x, target.scale.y, target.scale.z],
+      expectedTransformIdentity,
+    );
+    dragging.current = false;
+    if (!accepted || latestSourceKey.current !== sourceKey) {
+      latestRestoreOwnerTransform.current();
+    }
+  }, [object.scene_resource_id, onCommitTransform, sourceKey]);
+  return (
+    <>
+      <group
+        ref={captureGroup}
+        name={`scene:${object.scene_resource_id}`}
+        position={[pose.position_m.x, pose.position_m.y, pose.position_m.z]}
+        quaternion={normalizeQuaternion(pose.orientation_xyzw)}
+        onClick={(event) => {
+          event.stopPropagation();
+          onSelect(object.scene_resource_id);
+        }}
+        onContextMenu={(event) => {
+          event.stopPropagation();
+          event.nativeEvent.preventDefault();
+          onSelect(object.scene_resource_id);
+          onContext(
+            object.scene_resource_id,
+            event.nativeEvent.clientX,
+            event.nativeEvent.clientY,
+          );
+        }}
+      >
+        {children}
+      </group>
+      {selected && transformEnabled && transformTarget !== null && (
+        <TransformControls
+          object={transformTarget}
+          mode={transformMode}
+          space={transformSpace}
+          onMouseDown={() => {
+            dragging.current = true;
+            dragTransformIdentity.current = transformIdentity;
+          }}
+          onMouseUp={() => { void commit(); }}
+        />
+      )}
+    </>
+  );
+}
+
 function LogicalSceneObjects({
   objects,
   selectedSceneResourceId,
@@ -698,7 +1103,14 @@ function LogicalSceneObjects({
   axesSizeM,
   wireframe,
   ownerIdentity,
-  onAssetError,
+  draftIdentity,
+  transformIdentity,
+  objectAxesVisibleIds,
+  transformMode,
+  transformSpace,
+  transformEnabled,
+  onCommitTransform,
+  onContext,
 }: {
   objects: LogicalSceneObject[];
   selectedSceneResourceId: string | null;
@@ -706,35 +1118,43 @@ function LogicalSceneObjects({
   axesSizeM: number;
   wireframe: boolean;
   ownerIdentity: StructuralViewerProps['sceneOwnerIdentity'];
-  onAssetError: (error: Error) => void;
+  draftIdentity: StructuralViewerProps['programDraftIdentity'];
+  transformIdentity: SceneTransformIdentity | undefined;
+  objectAxesVisibleIds: ReadonlySet<string>;
+  transformMode: SceneTransformMode;
+  transformSpace: SceneTransformSpace;
+  transformEnabled: boolean;
+  onCommitTransform: SceneTransformCommit;
+  onContext: (sceneResourceId: string, x: number, y: number) => void;
 }) {
   return (
     <group name="owner-logical-scene">
       {objects.map((object) => {
         if (object.placement.kind !== 'cell_fixed') return null;
-        const pose = object.placement.pose_in_cell;
         const selected = selectedSceneResourceId === object.scene_resource_id;
         return (
-          <group
+          <EditableLogicalSceneObject
             key={object.scene_resource_id}
-            name={`scene:${object.scene_resource_id}`}
-            position={[pose.position_m.x, pose.position_m.y, pose.position_m.z]}
-            quaternion={normalizeQuaternion(pose.orientation_xyzw)}
-            onClick={(event) => {
-              event.stopPropagation();
-              onSelect(object.scene_resource_id);
-            }}
+            object={object as LogicalSceneObject & { placement: Extract<LogicalSceneObject['placement'], { kind: 'cell_fixed' }> }}
+            selected={selected}
+            transformMode={transformMode}
+            transformSpace={transformSpace}
+            transformEnabled={transformEnabled}
+            transformIdentity={transformIdentity}
+            onCommitTransform={onCommitTransform}
+            onSelect={onSelect}
+            onContext={onContext}
           >
             {object.collision_shapes.map((shape, index) => shape.type === 'mesh'
-              ? ownerIdentity === undefined ? null : (
+              ? ownerIdentity === undefined && draftIdentity === undefined ? null : (
                   <SceneObjectMesh
                     key={`${object.scene_resource_id}:${index}`}
                     shape={shape}
                     ownerIdentity={ownerIdentity}
+                    draftIdentity={draftIdentity}
                     measured={false}
                     selected={selected}
                     wireframe={wireframe}
-                    onAssetError={onAssetError}
                   />
                 )
               : (
@@ -755,8 +1175,9 @@ function LogicalSceneObjects({
                     />
                   </mesh>
                 ))}
-            {selected && <axesHelper args={[axesSizeM]} />}
-          </group>
+            {(selected || objectAxesVisibleIds.has(object.scene_resource_id))
+              && <axesHelper args={[axesSizeM]} />}
+          </EditableLogicalSceneObject>
         );
       })}
     </group>
@@ -769,7 +1190,6 @@ function MeasuredLogicalSceneObjects({
   onSelect,
   wireframe,
   ownerIdentity,
-  onAssetError,
   latestFrameAppliers,
 }: {
   objects: LogicalSceneObject[];
@@ -777,7 +1197,6 @@ function MeasuredLogicalSceneObjects({
   onSelect: (sceneResourceId: string) => void;
   wireframe: boolean;
   ownerIdentity: StructuralViewerProps['sceneOwnerIdentity'];
-  onAssetError: (error: Error) => void;
   latestFrameAppliers: Set<() => void>;
 }) {
   const objectById = new Map(
@@ -821,7 +1240,6 @@ function MeasuredLogicalSceneObjects({
                       measured
                       selected={false}
                       wireframe={wireframe}
-                      onAssetError={onAssetError}
                     />
                   )
                 : (
@@ -853,34 +1271,97 @@ function CandidateTcpGhost({
   pose,
   stale,
   axesSizeM,
+  editable,
+  transformMode,
+  transformSpace,
+  onEdit,
 }: {
   pose: Pose3Value;
   stale: boolean;
   axesSizeM: number;
+  editable: boolean;
+  transformMode: Exclude<SceneTransformMode, 'scale'>;
+  transformSpace: SceneTransformSpace;
+  onEdit: (pose: Pose3Value) => void;
 }) {
+  const group = useRef<THREE.Group | null>(null);
+  const [target, setTarget] = useState<THREE.Group | null>(null);
+  const dragging = useRef(false);
+  const capture = useCallback((node: THREE.Group | null) => {
+    group.current = node;
+    if (node !== null) setTarget(node);
+  }, []);
+  const restore = useCallback(() => {
+    if (group.current === null) return;
+    group.current.position.set(
+      pose.position_m.x_m,
+      pose.position_m.y_m,
+      pose.position_m.z_m,
+    );
+    group.current.quaternion.fromArray(normalizeQuaternion([
+      pose.orientation.x,
+      pose.orientation.y,
+      pose.orientation.z,
+      pose.orientation.w,
+    ]));
+  }, [pose]);
+  useLayoutEffect(() => {
+    if (!dragging.current) restore();
+  }, [restore]);
+  const commit = useCallback(() => {
+    const current = group.current;
+    if (current === null) return;
+    const orientation = current.quaternion.clone().normalize();
+    dragging.current = false;
+    onEdit({
+      position_m: {
+        x_m: current.position.x,
+        y_m: current.position.y,
+        z_m: current.position.z,
+      },
+      orientation: {
+        x: orientation.x,
+        y: orientation.y,
+        z: orientation.z,
+        w: orientation.w,
+      },
+    });
+  }, [onEdit]);
   return (
-    <group
-      name="owner-preview-final-tcp"
-      position={[pose.position_m.x_m, pose.position_m.y_m, pose.position_m.z_m]}
-      quaternion={normalizeQuaternion([
-        pose.orientation.x,
-        pose.orientation.y,
-        pose.orientation.z,
-        pose.orientation.w,
-      ])}
-    >
-      <mesh renderOrder={20}>
-        <sphereGeometry args={[Math.max(axesSizeM * 0.08, 0.006), 18, 12]} />
-        <meshStandardMaterial
-          color={stale ? '#e0a45c' : '#74e3b2'}
-          emissive={stale ? '#5a3216' : '#164f3d'}
-          transparent
-          opacity={0.82}
-          depthWrite={false}
+    <>
+      <group
+        ref={capture}
+        name="owner-preview-final-tcp"
+        position={[pose.position_m.x_m, pose.position_m.y_m, pose.position_m.z_m]}
+        quaternion={normalizeQuaternion([
+          pose.orientation.x,
+          pose.orientation.y,
+          pose.orientation.z,
+          pose.orientation.w,
+        ])}
+      >
+        <mesh renderOrder={20}>
+          <sphereGeometry args={[Math.max(axesSizeM * 0.08, 0.006), 18, 12]} />
+          <meshStandardMaterial
+            color={stale ? '#e0a45c' : '#74e3b2'}
+            emissive={stale ? '#5a3216' : '#164f3d'}
+            transparent
+            opacity={0.82}
+            depthWrite={false}
+          />
+        </mesh>
+        <axesHelper args={[axesSizeM]} />
+      </group>
+      {editable && target !== null && (
+        <TransformControls
+          object={target}
+          mode={transformMode}
+          space={transformSpace}
+          onMouseDown={() => { dragging.current = true; }}
+          onMouseUp={commit}
         />
-      </mesh>
-      <axesHelper args={[axesSizeM]} />
-    </group>
+      )}
+    </>
   );
 }
 
@@ -964,18 +1445,39 @@ function MeasuredTcpMarker({
 }
 
 function PointCloudPoints({ frame }: { frame: PointCloudFrame }) {
-  const geometry = useMemo(() => {
-    const result = new THREE.BufferGeometry();
-    result.setAttribute('position', new THREE.BufferAttribute(frame.positions, 3));
-    if (frame.colors !== null) {
-      result.setAttribute(
-        'color',
-        new THREE.Uint8BufferAttribute(frame.colors, 3, true),
+  const geometry = useMemo(() => new THREE.BufferGeometry(), []);
+  const capacity = useRef(0);
+  const colorCapacity = useRef(0);
+  useLayoutEffect(() => {
+    const pointCount = Math.floor(frame.positions.length / 3);
+    if (capacity.current === 0 || pointCount > capacity.current) {
+      capacity.current = Math.max(256, 2 ** Math.ceil(Math.log2(pointCount)));
+      geometry.setAttribute(
+        'position',
+        new THREE.BufferAttribute(new Float32Array(capacity.current * 3), 3),
       );
     }
-    result.computeBoundingSphere();
-    return result;
-  }, [frame]);
+    const positions = geometry.getAttribute('position') as THREE.BufferAttribute;
+    (positions.array as Float32Array).set(frame.positions, 0);
+    positions.needsUpdate = true;
+    if (frame.colors !== null) {
+      if (pointCount > colorCapacity.current) {
+        colorCapacity.current = capacity.current;
+        geometry.setAttribute(
+          'color',
+          new THREE.Uint8BufferAttribute(new Uint8Array(colorCapacity.current * 3), 3, true),
+        );
+      }
+      const colors = geometry.getAttribute('color') as THREE.BufferAttribute;
+      (colors.array as Uint8Array).set(frame.colors, 0);
+      colors.needsUpdate = true;
+    } else if (geometry.hasAttribute('color')) {
+      geometry.deleteAttribute('color');
+      colorCapacity.current = 0;
+    }
+    geometry.setDrawRange(0, pointCount);
+    geometry.computeBoundingSphere();
+  }, [frame, geometry]);
   useEffect(() => () => geometry.dispose(), [geometry]);
   return (
     <points geometry={geometry} frustumCulled renderOrder={6}>
@@ -1032,6 +1534,51 @@ interface RetainedCameraPresentation {
   framed: boolean;
 }
 
+interface CameraCommandRequest {
+  id: number;
+  kind: 'frame_all' | 'frame_selection' | 'reset';
+  target: {
+    kind: 'scene_resource' | 'structure';
+    id: string;
+  } | null;
+}
+
+function CameraCommand({
+  request,
+  defaultPresentation,
+}: {
+  request: CameraCommandRequest;
+  defaultPresentation: RetainedCameraPresentation;
+}) {
+  const bounds = useBounds();
+  const { camera, controls, scene, invalidate } = useThree();
+  const processed = useRef(0);
+  useEffect(() => {
+    if (request.id === 0 || processed.current === request.id) return;
+    processed.current = request.id;
+    if (request.kind === 'reset') {
+      camera.position.fromArray(defaultPresentation.camera.position);
+      const orbit = controls as { target?: THREE.Vector3; update?: () => void } | null;
+      orbit?.target?.fromArray(defaultPresentation.camera.target);
+      orbit?.update?.();
+      invalidate();
+      return;
+    }
+    if (request.kind === 'frame_selection' && request.target !== null) {
+      const selected = request.target.kind === 'scene_resource'
+        ? scene.getObjectByName(`scene:${request.target.id}`)
+        : scene.getObjectByName(`measured:${request.target.id}`)
+          ?? scene.getObjectByName(`link:${request.target.id}`);
+      if (selected !== undefined) {
+        bounds.refresh(selected).clip().fit();
+        return;
+      }
+    }
+    bounds.refresh().clip().fit();
+  }, [bounds, camera, controls, defaultPresentation, invalidate, request, scene]);
+  return null;
+}
+
 function CaptureCameraPresentation({
   initialPresentation,
   onCapture,
@@ -1056,10 +1603,18 @@ function CaptureCameraPresentation({
       framed: true,
     };
   });
-  useEffect(
-    () => () => onCapture(latestPresentationRef.current),
-    [onCapture],
-  );
+  useEffect(() => {
+    const orbit = controls as {
+      addEventListener?: (kind: 'end', listener: () => void) => void;
+      removeEventListener?: (kind: 'end', listener: () => void) => void;
+    } | null;
+    const capture = () => onCapture(latestPresentationRef.current);
+    orbit?.addEventListener?.('end', capture);
+    return () => {
+      orbit?.removeEventListener?.('end', capture);
+      capture();
+    };
+  }, [controls, onCapture]);
   return null;
 }
 
@@ -1068,39 +1623,64 @@ function ViewerCanvas({
   collisionsVisible,
   wireframeVisible,
   onAssetError,
+  onIsolatedAssetError,
   camera,
   sceneObjects,
   selectedSceneResourceId,
   onSelectSceneResource,
+  selectedStructureName,
+  onSelectStructure,
   candidateTcpPose,
   candidateStale,
+  candidateTcpEditable,
+  onEditCandidateTcpPose,
+  candidateRobot,
   runtimePresentation,
   sceneOwnerIdentity,
+  programDraftIdentity,
   viewerFrameIdentity,
   readViewerFrameIdentity,
   pointCloudFrame,
   viewer,
+  frameAxes,
+  objectAxesVisibleIds,
   initialCameraPresentation,
   onCaptureCameraPresentation,
   onModelMaterialized,
   onViewerCommit,
+  transformMode,
+  transformSpace,
+  transformEnabled,
+  transformIdentity,
+  onCommitSceneTransform,
+  onSceneContext,
+  cameraCommand,
 }: {
   manifest: SceneUrdfManifest | null;
   collisionsVisible: boolean;
   wireframeVisible: boolean;
   onAssetError: (error: Error) => void;
+  onIsolatedAssetError: (error: Error) => void;
   camera: ViewerCamera | null;
   sceneObjects: LogicalSceneObject[];
   selectedSceneResourceId: string | null;
   onSelectSceneResource: (sceneResourceId: string | null) => void;
+  selectedStructureName: string | null;
+  onSelectStructure: (structureName: string | null) => void;
   candidateTcpPose: Pose3Value | null;
   candidateStale: boolean;
+  candidateTcpEditable: boolean;
+  onEditCandidateTcpPose: (pose: Pose3Value) => void;
+  candidateRobot: CandidateRobotPresentation | null;
   runtimePresentation: RuntimeScenePresentation | undefined;
   sceneOwnerIdentity: StructuralViewerProps['sceneOwnerIdentity'];
+  programDraftIdentity: StructuralViewerProps['programDraftIdentity'];
   viewerFrameIdentity: StructuralViewerProps['viewerFrameIdentity'];
   readViewerFrameIdentity: StructuralViewerProps['readViewerFrameIdentity'];
   pointCloudFrame: PointCloudFrame | null;
   viewer: ProgramViewerMetadata | undefined;
+  frameAxes: NonNullable<StructuralViewerProps['frameAxes']>;
+  objectAxesVisibleIds: ReadonlySet<string>;
   initialCameraPresentation: RetainedCameraPresentation;
   onCaptureCameraPresentation: (
     presentation: RetainedCameraPresentation,
@@ -1111,6 +1691,13 @@ function ViewerCanvas({
     phase: 'mount' | 'update' | 'nested-update',
     actualDuration: number,
   ) => void;
+  transformMode: SceneTransformMode;
+  transformSpace: SceneTransformSpace;
+  transformEnabled: boolean;
+  transformIdentity: SceneTransformIdentity | undefined;
+  onCommitSceneTransform: SceneTransformCommit;
+  onSceneContext: (sceneResourceId: string, x: number, y: number) => void;
+  cameraCommand: CameraCommandRequest;
 }) {
   const devicePixelRatio = typeof window === 'undefined'
     ? 1
@@ -1127,6 +1714,10 @@ function ViewerCanvas({
   const qualificationEnabled = viewerQualificationOptedIn();
   const materializationStartedAtMs = useRef<number | null>(null);
   const latestFrameAppliers = useMemo(() => new Set<() => void>(), []);
+  const frameAxesByLink = useMemo(
+    () => new Set(frameAxes.map((frame) => frame.linkName)),
+    [frameAxes],
+  );
   const applyLatestFrame = useCallback(() => {
     for (const apply of latestFrameAppliers) apply();
   }, [latestFrameAppliers]);
@@ -1170,7 +1761,10 @@ function ViewerCanvas({
         });
       }}
       style={{ background: '#081019' }}
-      onPointerMissed={() => onSelectSceneResource(null)}
+      onPointerMissed={() => {
+        onSelectSceneResource(null);
+        onSelectStructure(null);
+      }}
     >
       <ViewerQualificationProfiler
         enabled={qualificationEnabled}
@@ -1218,9 +1812,18 @@ function ViewerCanvas({
       <Bounds
         fit={camera === null && !initialCameraPresentation.framed}
         clip
-        observe
         margin={1.25}
       >
+        <CameraCommand
+          request={cameraCommand}
+          defaultPresentation={{
+            camera: {
+              position: [...DEFAULT_VIEWER_CAMERA.position],
+              target: [...DEFAULT_VIEWER_CAMERA.target],
+            },
+            framed: true,
+          }}
+        />
         {manifest !== null && (
           <AssetErrorBoundary
             resetKey={manifest.model_key}
@@ -1232,6 +1835,13 @@ function ViewerCanvas({
                 collisionsVisible={collisionsVisible}
                 materializationStartedAtMs={materializationStartedAtMs}
                 onMaterialized={onModelMaterialized}
+                frameAxesByLink={frameAxesByLink}
+                frameAxesSizeM={viewer?.frame_gizmo_size_m ?? 0.1}
+                showFrameAxes={runtimePresentation?.measuredRobot === null
+                  || runtimePresentation?.measuredRobot === undefined}
+                selectedStructureName={selectedStructureName}
+                onSelectStructure={onSelectStructure}
+                onAssetError={onIsolatedAssetError}
               />
               {runtimePresentation?.measuredRobot !== null
                 && runtimePresentation?.measuredRobot !== undefined && (
@@ -1240,6 +1850,11 @@ function ViewerCanvas({
                   presentation={runtimePresentation.measuredRobot}
                   ownerIdentity={sceneOwnerIdentity}
                   latestFrameAppliers={latestFrameAppliers}
+                  frameAxesByLink={frameAxesByLink}
+                  frameAxesSizeM={viewer?.frame_gizmo_size_m ?? 0.1}
+                  selectedStructureName={selectedStructureName}
+                  onSelectStructure={onSelectStructure}
+                  onAssetError={onIsolatedAssetError}
                 />
               )}
             </Suspense>
@@ -1252,7 +1867,14 @@ function ViewerCanvas({
           axesSizeM={viewer?.object_axes_gizmo_size_m ?? 0.1}
           wireframe={wireframeVisible}
           ownerIdentity={sceneOwnerIdentity}
-          onAssetError={onAssetError}
+          draftIdentity={programDraftIdentity}
+          transformIdentity={transformIdentity}
+          objectAxesVisibleIds={objectAxesVisibleIds}
+          transformMode={transformMode}
+          transformSpace={transformSpace}
+          transformEnabled={transformEnabled}
+          onCommitTransform={onCommitSceneTransform}
+          onContext={onSceneContext}
         />
         {runtimePresentation !== undefined && (
           <MeasuredLogicalSceneObjects
@@ -1261,7 +1883,6 @@ function ViewerCanvas({
             onSelect={(sceneResourceId) => onSelectSceneResource(sceneResourceId)}
             wireframe={wireframeVisible}
             ownerIdentity={sceneOwnerIdentity}
-            onAssetError={onAssetError}
             latestFrameAppliers={latestFrameAppliers}
           />
         )}
@@ -1279,6 +1900,18 @@ function ViewerCanvas({
             pose={candidateTcpPose}
             stale={candidateStale}
             axesSizeM={viewer?.frame_gizmo_size_m ?? 0.1}
+            editable={candidateTcpEditable && transformMode !== 'scale'}
+            transformMode={transformMode === 'rotate' ? 'rotate' : 'translate'}
+            transformSpace={transformSpace}
+            onEdit={onEditCandidateTcpPose}
+          />
+        )}
+        {manifest !== null && candidateRobot !== null && (
+          <CandidateRobotGhost
+            manifest={manifest}
+            presentation={candidateRobot}
+            stale={candidateStale}
+            onAssetError={onIsolatedAssetError}
           />
         )}
         {pointCloudFrame !== null && <PointCloudPoints frame={pointCloudFrame} />}
@@ -1300,27 +1933,114 @@ function StructuralViewerContent({
   manifest,
   onRetry,
   sceneObjects = [],
+  programDraftPreview = false,
+  programDraftIdentity,
   selectedSceneResourceId = null,
   onSelectSceneResource = () => undefined,
+  selectedStructureName = null,
+  onSelectStructure = () => undefined,
+  onCommitSceneTransform,
+  onCommitProgramDraftTransform,
+  onDuplicateSceneResource,
+  onRemoveSceneResource,
+  onDetachSceneResource,
+  onEditSceneResource,
+  selectionLocked = false,
+  sceneMutationAvailability,
   candidateTcpPose = null,
   candidateStale = false,
+  candidateTcpEditable = false,
+  onEditCandidateTcpPose = () => undefined,
+  candidateRobot = null,
   runtimePresentation,
   sceneOwnerIdentity,
   viewerFrameIdentity,
   readViewerFrameIdentity,
   pointCloudCellId,
   viewer,
+  frameAxes = [],
+  objectAxesVisibleIds = [],
 }: StructuralViewerProps) {
   const [collisionsVisible, setCollisionsVisible] = useState(false);
   const [wireframeVisible, setWireframeVisible] = useState(
     DEFAULT_WIREFRAME_VISIBLE,
   );
   const [pointCloudVisible, setPointCloudVisible] = useState(false);
+  const [measuredStateVisible, setMeasuredStateVisible] = useState(true);
   const [assetError, setAssetError] = useState<Error | null>(null);
+  const [assetWarning, setAssetWarning] = useState<string | null>(null);
+  const [transformMode, setTransformMode] = useState<SceneTransformMode>('translate');
+  const [transformSpace, setTransformSpace] = useState<SceneTransformSpace>('world');
+  const [cameraCommand, setCameraCommand] = useState<CameraCommandRequest>({
+    id: 0,
+    kind: 'frame_all',
+    target: null,
+  });
+  const [contextMenu, setContextMenu] = useState<{
+    sceneResourceId: string;
+    x: number;
+    y: number;
+  } | null>(null);
+  const [editLockedObjectIds, setEditLockedObjectIds] = useState<Set<string>>(
+    () => new Set(),
+  );
+  const contextMenuRef = useRef<HTMLDivElement | null>(null);
+  const contextAvailability = contextMenu === null
+    ? null
+    : sceneMutationAvailability?.[contextMenu.sceneResourceId] ?? null;
+  const selectedObject = sceneObjects.find(
+    (object) => object.scene_resource_id === selectedSceneResourceId,
+  ) ?? null;
+  const transformCommit = programDraftPreview
+    ? onCommitProgramDraftTransform
+    : onCommitSceneTransform;
+  const transformIdentity = programDraftPreview
+    ? programDraftIdentity === undefined ? undefined : {
+        ownerEpoch: programDraftIdentity.draftId,
+        generation: programDraftIdentity.draftRevision,
+      }
+    : sceneOwnerIdentity;
+  const transformBaseEnabled = transformCommit !== undefined
+    && transformIdentity !== undefined
+    && (selectedSceneResourceId === null || !editLockedObjectIds.has(selectedSceneResourceId))
+    && selectedObject?.placement.kind === 'cell_fixed'
+    && selectedObject.provider_evidence === null
+    && selectedObject.collision_shapes.length > 0
+    && sceneMutationAvailability?.[selectedObject.scene_resource_id]?.transform === true;
+  const candidateTransformEnabled = candidateTcpEditable
+    && candidateTcpPose !== null
+    && selectedObject === null;
+  const generalTransformEnabled = transformBaseEnabled || candidateTransformEnabled;
+  const scaleEnabled = transformBaseEnabled
+    && supportsIndependentSceneScale(selectedObject);
+  const transformEnabled = transformBaseEnabled
+    && (transformMode !== 'scale' || scaleEnabled);
+  const selectedCameraTarget = useMemo(() => (
+    selectedSceneResourceId !== null
+      ? { kind: 'scene_resource' as const, id: selectedSceneResourceId }
+      : selectedStructureName !== null
+        ? { kind: 'structure' as const, id: selectedStructureName }
+        : null
+  ), [selectedSceneResourceId, selectedStructureName]);
+  const issueCameraCommand = useCallback((
+    kind: CameraCommandRequest['kind'],
+    target = selectedCameraTarget,
+  ) => {
+    setCameraCommand((current) => ({
+      id: current.id + 1,
+      kind,
+      target,
+    }));
+  }, [selectedCameraTarget, setCameraCommand]);
   const pointCloudEnabled = viewerActive
     && pointCloudVisible
     && pointCloudCellId !== undefined;
   const pointCloud = usePointCloudFrame(pointCloudEnabled, pointCloudCellId);
+  const objectAxesVisible = useMemo(
+    () => new Set(objectAxesVisibleIds),
+    [objectAxesVisibleIds],
+  );
+  const presentedRuntime = measuredStateVisible ? runtimePresentation : undefined;
   const camera = useMemo(
     () => parseViewerCameraQuery(
       typeof window === 'undefined' ? '' : window.location.search,
@@ -1354,16 +2074,18 @@ function StructuralViewerContent({
     + (collisionsVisible ? collisionCount : 0)
     + sceneObjects.reduce(
       (total, object) => total + object.collision_shapes.filter((shape) => (
-        shape.type !== 'mesh' || sceneOwnerIdentity !== undefined
+        shape.type !== 'mesh'
+        || sceneOwnerIdentity !== undefined
+        || programDraftIdentity !== undefined
       )).length,
       0,
     )
     + (candidateTcpPose === null ? 0 : 1)
-    + (runtimePresentation?.measuredRobot === null
-      || runtimePresentation?.measuredRobot === undefined
+    + (presentedRuntime?.measuredRobot === null
+      || presentedRuntime?.measuredRobot === undefined
       ? 0
       : visualCount)
-    + (runtimePresentation?.measuredObjects.reduce(
+    + (presentedRuntime?.measuredObjects.reduce(
       (total, measurement) => {
         const object = sceneObjects.find(
           (candidate) => candidate.scene_resource_id === measurement.objectId,
@@ -1373,8 +2095,9 @@ function StructuralViewerContent({
         )).length ?? 0);
       }, 0,
     ) ?? 0)
-    + (runtimePresentation?.measuredTcp === null
-      || runtimePresentation?.measuredTcp === undefined ? 0 : 1);
+    + (presentedRuntime?.measuredTcp === null
+      || presentedRuntime?.measuredTcp === undefined ? 0 : 1)
+    + (candidateRobot === null ? 0 : visualCount);
   const canvasDemandActive = viewerActive && (
     visibleGeometryCount > 0
     || viewerFrameIdentity !== undefined
@@ -1386,7 +2109,11 @@ function StructuralViewerContent({
   const reportAssetError = useCallback((error: Error) => {
     reportViewerQualificationError(error);
     setAssetError(error);
-  }, []);
+  }, [setAssetError]);
+  const reportIsolatedAssetError = useCallback((error: Error) => {
+    reportViewerQualificationError(error);
+    setAssetWarning(error.message || 'One viewer mesh could not be rendered.');
+  }, [setAssetWarning]);
   const reportViewerCommit = useCallback((
     _id: string,
     _phase: 'mount' | 'update' | 'nested-update',
@@ -1395,6 +2122,15 @@ function StructuralViewerContent({
     recordViewerReactCommit(actualDuration);
   }, []);
 
+  useEffect(() => {
+    const available = new Set(
+      sceneObjects.map((object) => object.scene_resource_id),
+    );
+    setEditLockedObjectIds((current) => {
+      const retained = new Set([...current].filter((identity) => available.has(identity)));
+      return retained.size === current.size ? current : retained;
+    });
+  }, [sceneObjects]);
   useEffect(() => {
     setViewerQualificationViewerActive(viewerActive);
     setViewerQualificationWireframeVisible(wireframeVisible);
@@ -1405,6 +2141,45 @@ function StructuralViewerContent({
     }
     return () => stopViewerPerformanceMonitoring();
   }, [canvasDemandActive, viewerActive, wireframeVisible]);
+  useEffect(() => {
+    if (!viewerActive) return undefined;
+    const onKeyDown = (event: KeyboardEvent) => {
+      const target = event.target as HTMLElement | null;
+      if (
+        event.ctrlKey || event.metaKey || event.altKey
+        || target?.isContentEditable
+        || ['INPUT', 'SELECT', 'TEXTAREA'].includes(target?.tagName ?? '')
+      ) return;
+      const key = event.key.toLowerCase();
+      if (key === 'w') setTransformMode('translate');
+      else if (key === 'e') setTransformMode('rotate');
+      else if (key === 'r' && scaleEnabled) setTransformMode('scale');
+      else if (key === 'q') setTransformSpace((current) => (
+        current === 'world' ? 'local' : 'world'
+      ));
+      else if (key === 'escape') {
+        setContextMenu(null);
+        onSelectSceneResource(null);
+        onSelectStructure(null);
+      }
+      else return;
+      event.preventDefault();
+    };
+    window.addEventListener('keydown', onKeyDown);
+    return () => window.removeEventListener('keydown', onKeyDown);
+  }, [onSelectSceneResource, onSelectStructure, scaleEnabled, viewerActive]);
+  useEffect(() => {
+    if (contextMenu === null) return undefined;
+    const dismissOutside = (event: PointerEvent) => {
+      if (
+        event.target instanceof Node
+        && contextMenuRef.current?.contains(event.target)
+      ) return;
+      setContextMenu(null);
+    };
+    window.addEventListener('pointerdown', dismissOutside);
+    return () => window.removeEventListener('pointerdown', dismissOutside);
+  }, [contextMenu]);
   useEffect(() => {
     setViewerQualificationModel(
       manifest.status === 'ready' && visibleGeometryCount > 0,
@@ -1429,47 +2204,96 @@ function StructuralViewerContent({
       }
     }
     setAssetError(null);
+    setAssetWarning(null);
     onRetry();
   };
 
   return (
     <section className="panel viewer-panel" aria-labelledby="viewer-title">
       <header className="panel-header viewer-header">
-        <div>
-          <p className="eyebrow">Active retained structure + owner-issued scene</p>
-          <h2 id="viewer-title">Scene authoring viewport</h2>
-        </div>
-        <div className="viewer-controls">
-          <label className="toggle-control">
-            <input
-              type="checkbox"
-              checked={wireframeVisible}
-              onChange={(event) => setWireframeVisible(event.target.checked)}
-            />
-            <span>Wireframe overlays</span>
-          </label>
-          <label className="toggle-control">
-            <input
-              type="checkbox"
-              checked={collisionsVisible}
-              onChange={(event) => setCollisionsVisible(event.target.checked)}
-              disabled={manifest.status !== 'ready'}
-            />
-            <span>Collision geometry</span>
-          </label>
-          <label className="toggle-control">
-            <input
-              type="checkbox"
-              checked={pointCloudVisible}
-              onChange={(event) => setPointCloudVisible(event.target.checked)}
-              disabled={pointCloudCellId === undefined}
-            />
-            <span>Point cloud</span>
-          </label>
-          <button type="button" className="quiet-button" onClick={retry}>
-            Reload model
-          </button>
-        </div>
+        <strong id="viewer-title">3D viewer</strong>
+        <details className="viewer-options">
+          <summary>Tools</summary>
+          <div className="viewer-options-popover">
+            <label className="toggle-control">
+              <input
+                type="checkbox"
+                aria-label="Wireframe overlays"
+                checked={wireframeVisible}
+                onChange={(event) => setWireframeVisible(event.target.checked)}
+              />
+              <span>Wireframe overlays</span>
+            </label>
+            <label className="toggle-control">
+              <input
+                type="checkbox"
+                checked={collisionsVisible}
+                onChange={(event) => setCollisionsVisible(event.target.checked)}
+                disabled={manifest.status !== 'ready'}
+              />
+              <span>Collision geometry</span>
+            </label>
+            <label className="toggle-control">
+              <input
+                type="checkbox"
+                checked={pointCloudVisible}
+                onChange={(event) => setPointCloudVisible(event.target.checked)}
+                disabled={pointCloudCellId === undefined}
+              />
+              <span>Point cloud</span>
+            </label>
+            <label className="toggle-control">
+              <input
+                type="checkbox"
+                checked={measuredStateVisible}
+                disabled={runtimePresentation === undefined
+                  || runtimePresentation.status.total === 0}
+                onChange={(event) => setMeasuredStateVisible(event.target.checked)}
+              />
+              <span>Measured-state overlay</span>
+            </label>
+            <div className="viewer-options-actions">
+              <button
+                type="button"
+                className="quiet-button"
+                disabled={pointCloud.frame === null}
+                onClick={pointCloud.clear}
+                title="Clear the currently presented point cloud; the next owner frame may repopulate it."
+              >
+                Clear points
+              </button>
+              <button type="button" className="quiet-button" onClick={retry}>
+                Reload model
+              </button>
+            </div>
+            {pointCloud.frame !== null && (
+              <span
+                className="status-pill"
+                title={`${pointCloud.frame.ownerId} · sequence ${pointCloud.frame.sequence.toString()}`}
+              >
+                {pointCloud.frame.pointCount} points
+              </span>
+            )}
+            {manifest.status === 'ready' && (
+              <details className="viewer-model-facts">
+                <summary>Model and source facts</summary>
+                <span>Root <code>{manifest.data.projection.root_frame}</code></span>
+                <span>Model <code>{manifest.data.model_key}</code></span>
+                <span>Bundle <code>{manifest.data.retained_bundle_id}</code></span>
+                <span>Retained model <strong>neutral coordinates</strong></span>
+                <span>
+                  Measured overlay <strong>
+                    {runtimePresentation === undefined
+                      ? 'unavailable'
+                      : `${runtimePresentation.status.freshGood} fresh / ${runtimePresentation.status.total} sources`}
+                  </strong>
+                </span>
+                <span>Scene overlay <strong>owner-issued</strong></span>
+                <span>Operational validity <strong>not asserted</strong></span>
+              </details>
+            )}
+          </div>
+        </details>
       </header>
 
       <div className="viewer-stage" role="img" aria-label="Scene authoring viewport">
@@ -1479,34 +2303,193 @@ function StructuralViewerContent({
           || pointCloudEnabled
         ) && (
           <ViewerCanvas
-              key={`${manifest.status === 'ready' ? manifest.data.model_key : 'no-structural-model'}:${sceneOwnerIdentity?.ownerEpoch ?? 'no-scene-owner'}`}
               manifest={manifest.status === 'ready' ? manifest.data : null}
               collisionsVisible={collisionsVisible}
               wireframeVisible={wireframeVisible}
               onAssetError={reportAssetError}
+              onIsolatedAssetError={reportIsolatedAssetError}
               camera={camera}
               sceneObjects={sceneObjects}
               selectedSceneResourceId={selectedSceneResourceId}
               onSelectSceneResource={onSelectSceneResource}
+              selectedStructureName={selectedStructureName}
+              onSelectStructure={onSelectStructure}
               candidateTcpPose={candidateTcpPose}
               candidateStale={candidateStale}
-              runtimePresentation={runtimePresentation}
+              candidateTcpEditable={candidateTransformEnabled}
+              onEditCandidateTcpPose={onEditCandidateTcpPose}
+              candidateRobot={candidateRobot}
+              runtimePresentation={presentedRuntime}
               sceneOwnerIdentity={sceneOwnerIdentity}
+              programDraftIdentity={programDraftIdentity}
               viewerFrameIdentity={viewerFrameIdentity}
               readViewerFrameIdentity={readViewerFrameIdentity}
               pointCloudFrame={pointCloud.frame}
               viewer={viewer}
+              frameAxes={frameAxes}
+              objectAxesVisibleIds={objectAxesVisible}
               initialCameraPresentation={cameraPresentation}
               onCaptureCameraPresentation={captureCameraPresentation}
               onModelMaterialized={reportModelMaterialized}
               onViewerCommit={reportViewerCommit}
+              transformMode={transformMode}
+              transformSpace={transformSpace}
+              transformEnabled={transformEnabled}
+              transformIdentity={transformIdentity}
+              onCommitSceneTransform={transformCommit ?? (async () => false)}
+              onSceneContext={(sceneResourceId, x, y) => {
+                if (
+                  selectionLocked
+                  && sceneResourceId !== selectedSceneResourceId
+                ) return;
+                setContextMenu({ sceneResourceId, x, y });
+              }}
+              cameraCommand={cameraCommand}
           />
+        )}
+
+        <div className="viewer-tool-strip" aria-label="Scene viewport tools">
+          <button
+            type="button"
+            aria-pressed={transformMode === 'translate'}
+            disabled={!generalTransformEnabled}
+            onClick={() => setTransformMode('translate')}
+            title="Translate selected object (W)"
+          >W</button>
+          <button
+            type="button"
+            aria-pressed={transformMode === 'rotate'}
+            disabled={!generalTransformEnabled}
+            onClick={() => setTransformMode('rotate')}
+            title="Rotate selected object (E)"
+          >E</button>
+          <button
+            type="button"
+            aria-pressed={transformMode === 'scale'}
+            disabled={!scaleEnabled}
+            onClick={() => setTransformMode('scale')}
+            title="Scale a selected box or mesh object (R)"
+          >R</button>
+          <button
+            type="button"
+            onClick={() => setTransformSpace((current) => current === 'world' ? 'local' : 'world')}
+            title="Toggle local/world coordinates (Q)"
+          >{transformSpace}</button>
+          <span className="viewer-tool-separator" />
+          <button type="button" onClick={() => issueCameraCommand('frame_all')}>Frame all</button>
+          <button
+            type="button"
+            disabled={selectedCameraTarget === null}
+            onClick={() => issueCameraCommand('frame_selection')}
+          >Frame selected</button>
+          <button type="button" onClick={() => issueCameraCommand('reset')}>Reset camera</button>
+        </div>
+
+        {contextMenu !== null && (
+          <div
+            ref={contextMenuRef}
+            className="viewer-context-menu"
+            role="menu"
+            style={{ left: contextMenu.x, top: contextMenu.y }}
+          >
+            <strong>{contextMenu.sceneResourceId}</strong>
+            <button
+              type="button"
+              role="menuitem"
+              onClick={() => {
+                issueCameraCommand('frame_selection', {
+                  kind: 'scene_resource',
+                  id: contextMenu.sceneResourceId,
+                });
+                setContextMenu(null);
+              }}
+            >Frame selection</button>
+            <button
+              type="button"
+              role="menuitem"
+              onClick={() => {
+                onEditSceneResource?.(contextMenu.sceneResourceId);
+                setContextMenu(null);
+              }}
+            >Edit properties</button>
+            <button
+              type="button"
+              role="menuitem"
+              onClick={() => {
+                setEditLockedObjectIds((current) => {
+                  const next = new Set(current);
+                  if (next.has(contextMenu.sceneResourceId)) {
+                    next.delete(contextMenu.sceneResourceId);
+                  } else {
+                    next.add(contextMenu.sceneResourceId);
+                  }
+                  return next;
+                });
+                setContextMenu(null);
+              }}
+            >
+              {editLockedObjectIds.has(contextMenu.sceneResourceId)
+                ? 'Unlock object editing'
+                : 'Lock object editing'}
+            </button>
+            <button
+              type="button"
+              role="menuitem"
+              disabled={
+                onDuplicateSceneResource === undefined
+                || contextAvailability?.duplicate !== true
+              }
+              title={contextAvailability?.reason ?? undefined}
+              onClick={() => {
+                void onDuplicateSceneResource?.(contextMenu.sceneResourceId);
+                setContextMenu(null);
+              }}
+            >Duplicate object</button>
+            <button
+              type="button"
+              role="menuitem"
+              disabled={
+                onDetachSceneResource === undefined
+                || programDraftPreview
+                || contextAvailability?.detach !== true
+              }
+              title={contextAvailability?.detachReason ?? undefined}
+              onClick={() => {
+                void onDetachSceneResource?.(contextMenu.sceneResourceId);
+                setContextMenu(null);
+              }}
+            >Detach carried object</button>
+            <button
+              type="button"
+              role="menuitem"
+              className="danger-button"
+              disabled={
+                onRemoveSceneResource === undefined
+                || contextAvailability?.remove !== true
+              }
+              title={contextAvailability?.reason ?? undefined}
+              onClick={() => {
+                void onRemoveSceneResource?.(contextMenu.sceneResourceId);
+                setContextMenu(null);
+              }}
+            >Remove object</button>
+            <button
+              type="button"
+              role="menuitem"
+              onClick={() => setContextMenu(null)}
+            >Close</button>
+          </div>
         )}
 
         {manifest.status === 'loading' && visibleGeometryCount === 0 && !pointCloudEnabled && (
           <div className="viewer-state" role="status">
             <strong>Loading active model…</strong>
             <span>Waiting for a complete retained-neutral projection.</span>
+          </div>
+        )}
+        {assetWarning !== null && pointCloud.error === null && (
+          <div className="viewer-layer-warning" role="status">
+            One mesh is unavailable; the remaining scene is still usable. {assetWarning}
           </div>
         )}
         {manifest.status === 'absent' && visibleGeometryCount === 0 && !pointCloudEnabled && (
@@ -1562,37 +2545,22 @@ function StructuralViewerContent({
             <span>{manifest.data.links.length} links</span>
             <span>{manifest.data.joints.length} joints</span>
             <span>neutral coordinates</span>
-            <span>{sceneObjects.length} owner scene objects</span>
+            <span>{sceneObjects.length} {programDraftPreview ? 'Draft preview' : 'owner scene'} objects</span>
+            {programDraftPreview && <span>Program Draft preview · not live</span>}
             {candidateTcpPose !== null && <span>validated TCP candidate</span>}
-            {runtimePresentation?.measuredRobot !== null
-              && runtimePresentation?.measuredRobot !== undefined
+            {presentedRuntime?.measuredRobot !== null
+              && presentedRuntime?.measuredRobot !== undefined
               && <span>measured robot</span>}
-            {(runtimePresentation?.measuredObjects.length ?? 0) > 0
-              && <span>{runtimePresentation?.measuredObjects.length} measured objects</span>}
-            {runtimePresentation?.measuredTcp !== null
-              && runtimePresentation?.measuredTcp !== undefined
+            {(presentedRuntime?.measuredObjects.length ?? 0) > 0
+              && <span>{presentedRuntime?.measuredObjects.length} measured objects</span>}
+            {presentedRuntime?.measuredTcp !== null
+              && presentedRuntime?.measuredTcp !== undefined
               && <span>measured TCP</span>}
+            {candidateRobot !== null && <span>motion-preview robot ghost</span>}
           </div>
         )}
       </div>
 
-      {manifest.status === 'ready' && (
-        <footer className="viewer-contract">
-          <span>Root: <code>{manifest.data.projection.root_frame}</code></span>
-          <span>Model key: <code>{manifest.data.model_key}</code></span>
-          <span>Bundle: <code>{manifest.data.retained_bundle_id}</code></span>
-          <span>Retained model: <strong>neutral coordinates</strong></span>
-          <span>
-            Measured overlay: <strong>
-              {runtimePresentation === undefined
-                ? 'unavailable'
-                : `${runtimePresentation.status.freshGood} fresh / ${runtimePresentation.status.total} sources`}
-            </strong>
-          </span>
-          <span>Scene overlay: <strong>owner-issued</strong></span>
-          <span>Operational validity: <strong>not asserted</strong></span>
-        </footer>
-      )}
     </section>
   );
 }

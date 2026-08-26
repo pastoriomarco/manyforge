@@ -298,6 +298,31 @@ describe('structural API client', () => {
     expect(result.currentPath).toBe('/configured/artifacts');
   });
 
+  it('resolves a Program Draft mesh against one exact Draft revision', async () => {
+    const fetchMock = vi.fn().mockResolvedValue(response({
+      schema_version: 'manyforge.program_draft_mesh_asset.v1',
+      asset_hash: '0123456789abcdef',
+      mesh_asset_url: '/api/program/draft/scene-meshes/0123456789abcdef.glb?draft_id=draft-1&draft_revision=9',
+      mesh_asset_status: 'pending',
+      draft_id: 'draft-1',
+      draft_revision: 9,
+      last_error: null,
+    }));
+    vi.stubGlobal('fetch', fetchMock);
+
+    const asset = await api.scene.resolveProgramDraftMesh(
+      'examples/part.obj',
+      { x: 1, y: 2, z: 3 },
+      'draft-1',
+      9,
+    );
+
+    expect(asset.draft_revision).toBe(9);
+    expect(fetchMock.mock.calls[0]?.[0]).toBe(
+      '/api/program/draft/scene-meshes/resolve?resource_uri=examples%2Fpart.obj&scale_x=1&scale_y=2&scale_z=3&draft_id=draft-1&draft_revision=9',
+    );
+  });
+
   it('preserves typed HTTP status and backend detail', async () => {
     vi.stubGlobal('fetch', vi.fn().mockResolvedValue(response(
       { detail: 'No URDF available for the active deployment' },
@@ -506,6 +531,9 @@ describe('headless intent client', () => {
           content_hash: 'scene-hash-1',
         },
       },
+      expected_admission_generation: 7,
+      expected_draft_id: 'draft-1',
+      expected_draft_revision: 4,
       operation: {
         kind: 'update_object_pose' as const,
         scene_resource_id: 'part',

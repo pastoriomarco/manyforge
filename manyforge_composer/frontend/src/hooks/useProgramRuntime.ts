@@ -13,12 +13,34 @@ import type {
 import type { ComposerHeadlessState } from '../types/headless';
 import { browserStableIdentity } from './useHeadlessState';
 
-const PROGRAM_STATUS_POLL_MS = 500;
 const ACTIVE_STATES = new Set([
   'running',
   'intervention_required',
   'stopping',
 ]);
+
+export function programRuntimeWakeKey(snapshot: ComposerHeadlessState | null): string {
+  if (snapshot === null) return 'unavailable';
+  const manager = snapshot.runtime.sections.manager;
+  const managerActive = manager.payload?.active;
+  const active = managerActive !== null
+    && typeof managerActive === 'object'
+    && !Array.isArray(managerActive)
+    ? managerActive as Record<string, unknown>
+    : null;
+  return [
+    snapshot.receiverEpoch,
+    manager.sourceOwnerEpoch ?? 'no-manager-owner',
+    typeof active?.retained_bundle_id === 'string'
+      ? active.retained_bundle_id : 'no-retained-bundle',
+    typeof active?.graph_revision === 'string'
+      ? active.graph_revision : 'no-graph-revision',
+    snapshot.authoringAdmission.admissionGeneration,
+    snapshot.programCycle.programRunnerOwnerEpoch,
+    snapshot.programCycle.cycleGeneration,
+    snapshot.programCycle.state,
+  ].join(':');
+}
 
 function identity(prefix: string): string {
   const random = globalThis.crypto?.randomUUID?.()
@@ -170,6 +192,7 @@ export function useProgramRuntime(
   const [state, setState] = useState<ProgramRuntimeState>(INITIAL_STATE);
   const mounted = useRef(true);
   const refreshing = useRef(false);
+  const refreshQueued = useRef(false);
   const catalogCache = useRef<ScenarioCatalogResponse | null>(null);
   const observedRunId = useRef<string | null>(null);
   const observedOwnerEpoch = useRef<string | null>(null);
@@ -177,9 +200,14 @@ export function useProgramRuntime(
     'manyforge.composer.program_request_owner_epoch',
     'composer-program-owner',
   ));
+  const wakeKey = programRuntimeWakeKey(snapshot);
 
   const refresh = useCallback(async () => {
-    if (!enabled || refreshing.current) return;
+    if (!enabled) return;
+    if (refreshing.current) {
+      refreshQueued.current = true;
+      return;
+    }
     refreshing.current = true;
     try {
       const [currentScenarioResult, appliedResult, indexResult] = await Promise.allSettled([
@@ -296,30 +324,40 @@ export function useProgramRuntime(
       });
     } finally {
       refreshing.current = false;
+      if (refreshQueued.current) {
+        refreshQueued.current = false;
+        queueMicrotask(() => { void refresh(); });
+      }
     }
   }, [enabled]);
 
   useEffect(() => {
     mounted.current = true;
+    return () => {
+      mounted.current = false;
+      // Observation loss is deliberately effect-free. In particular, client
+      // unmount never submits Program Stop.
+    };
+  }, []);
+
+  useEffect(() => {
     if (!enabled) {
       setState(INITIAL_STATE);
       observedRunId.current = null;
       observedOwnerEpoch.current = null;
       catalogCache.current = null;
-      return () => {
-        mounted.current = false;
-      };
+      return;
     }
     void refresh();
-    const timer = window.setInterval(() => {
-      void refresh();
-    }, PROGRAM_STATUS_POLL_MS);
-    return () => {
-      mounted.current = false;
-      window.clearInterval(timer);
-      // Observation loss is deliberately effect-free. In particular, client
-      // unmount never submits Program Stop.
+  }, [enabled, refresh, wakeKey]);
+
+  useEffect(() => {
+    if (!enabled) return undefined;
+    const onVisibility = () => {
+      if (document.visibilityState === 'visible') void refresh();
     };
+    document.addEventListener('visibilitychange', onVisibility);
+    return () => document.removeEventListener('visibilitychange', onVisibility);
   }, [enabled, refresh]);
 
   const selectScenario = useCallback((scenarioId: string) => {

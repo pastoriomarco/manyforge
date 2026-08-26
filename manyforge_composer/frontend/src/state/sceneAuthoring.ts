@@ -9,7 +9,9 @@ import type {
   NodeEnvironmentResponse,
   ProgramSceneResource,
   SceneRuntimeProjection,
+  SceneTransactionOperation,
   SceneTransactionRequest,
+  SceneShapeRequest,
   SourceModelProjection,
 } from '../types/api';
 import type { HeadlessRuntimeSnapshot } from '../types/headless';
@@ -25,6 +27,8 @@ export interface SceneOwnerFacts {
   runtimeSourceOwnerEpoch: string;
   writeAvailable: boolean;
   writeUnavailableReason: string | null;
+  runtimeWriteAvailable: boolean;
+  runtimeWriteUnavailableReason: string | null;
 }
 
 export type SceneOwnerFactsResult =
@@ -120,6 +124,10 @@ export function sceneOwnerFacts(
         : runtimeOpen
           ? 'The logical-scene owner has fenced scene writes.'
           : `The scene runtime is ${sceneRuntime.state.state}.`,
+      runtimeWriteAvailable: runtimeOpen,
+      runtimeWriteUnavailableReason: runtimeOpen
+        ? null
+        : `The scene runtime is ${sceneRuntime.state.state}.`,
     },
   };
 }
@@ -136,24 +144,92 @@ export function editableLogicalSceneObject(
     object.placement.kind !== 'cell_fixed'
     || object.provider_evidence !== null
     || object.collision_shapes.length === 0
-    || object.collision_shapes.some((shape) => shape.type === 'mesh')
   ) return null;
   return { object, pose: object.placement.pose_in_cell };
 }
 
+export interface SceneMutationFence {
+  admissionGeneration: number;
+  draftId: string;
+  draftRevision: number;
+}
+
+type RuntimeOwnedSceneOperation = Extract<
+  SceneTransactionOperation,
+  { kind: 'attach_carried_object' | 'detach_carried_object_at_current_pose' }
+>;
+type AuthoredSceneOperation = Exclude<
+  SceneTransactionOperation,
+  RuntimeOwnedSceneOperation
+>;
+
+export function sceneTransaction(
+  facts: SceneOwnerFacts,
+  fence: SceneMutationFence,
+  operation: AuthoredSceneOperation,
+  requestId: string,
+): SceneTransactionRequest | null {
+  const projection = facts.logicalScene.access.active_projection;
+  if (
+    !facts.writeAvailable
+    || projection === null
+    || !requestId.trim()
+    || !fence.draftId.trim()
+    || !Number.isSafeInteger(fence.draftRevision)
+    || fence.draftRevision < 0
+    || !Number.isSafeInteger(fence.admissionGeneration)
+    || fence.admissionGeneration < 1
+  ) return null;
+  return {
+    request_context: {
+      request_id: requestId,
+      request_owner_epoch: facts.sourceOwnerEpoch,
+      source_label: 'composer_ui',
+      correlation_id: null,
+    },
+    expected_projection_revision: projection,
+    expected_admission_generation: fence.admissionGeneration,
+    expected_draft_id: fence.draftId,
+    expected_draft_revision: fence.draftRevision,
+    operation,
+  };
+}
+
+function runtimeSceneTransaction(
+  facts: SceneOwnerFacts,
+  operation: RuntimeOwnedSceneOperation,
+  requestId: string,
+): SceneTransactionRequest | null {
+  const projection = facts.logicalScene.access.active_projection;
+  if (
+    !facts.runtimeWriteAvailable
+    || projection === null
+    || !requestId.trim()
+  ) return null;
+  return {
+    request_context: {
+      request_id: requestId,
+      request_owner_epoch: facts.sourceOwnerEpoch,
+      source_label: 'composer_ui',
+      correlation_id: null,
+    },
+    expected_projection_revision: projection,
+    operation,
+  };
+}
+
 export function scenePoseTransaction(
   facts: SceneOwnerFacts,
+  fence: SceneMutationFence,
   object: LogicalSceneObject,
   pose: LogicalScenePose,
   requestId: string,
 ): SceneTransactionRequest | null {
   const editable = editableLogicalSceneObject(object);
-  const projection = facts.logicalScene.access.active_projection;
   const snapshot = facts.logicalScene.snapshot;
   if (
     !facts.writeAvailable
     || editable === null
-    || projection === null
     || snapshot === null
     || !requestId.trim()
   ) return null;
@@ -167,15 +243,7 @@ export function scenePoseTransaction(
     ].every(Number.isFinite)
     || Math.abs(Math.hypot(...quaternion) - 1) > 1e-6
   ) return null;
-  return {
-    request_context: {
-      request_id: requestId,
-      request_owner_epoch: facts.sourceOwnerEpoch,
-      source_label: 'composer_ui',
-      correlation_id: null,
-    },
-    expected_projection_revision: projection,
-    operation: {
+  return sceneTransaction(facts, fence, {
       kind: 'update_object_pose',
       scene_resource_id: object.scene_resource_id,
       pose: {
@@ -194,8 +262,188 @@ export function scenePoseTransaction(
       frame_ref: { kind: 'cell_frame', cell_id: snapshot.cell_id },
       provider_evidence: null,
       expected_attached: false,
+  }, requestId);
+}
+
+function scaledSceneShape(
+  object: LogicalSceneObject,
+  scale: [number, number, number],
+): SceneShapeRequest | null {
+  if (object.collision_shapes.length !== 1) return null;
+  const [x, y, z] = scale;
+  if (![x, y, z].every((value) => Number.isFinite(value) && value > 0)) return null;
+  const shape = object.collision_shapes[0];
+  if (shape.type === 'box') return {
+    type: 'box',
+    box_dimensions_m: {
+      x_m: shape.dimensions_m.x * x,
+      y_m: shape.dimensions_m.y * y,
+      z_m: shape.dimensions_m.z * z,
     },
   };
+  if (shape.type === 'sphere') {
+    if (Math.max(x, y, z) - Math.min(x, y, z) > 1e-6) return null;
+    return { type: 'sphere', sphere_radius_m: shape.radius_m * x };
+  }
+  if (shape.type === 'cylinder') {
+    if (Math.abs(x - y) > 1e-6) return null;
+    return {
+      type: 'cylinder',
+      cylinder_radius_m: shape.radius_m * x,
+      cylinder_height_m: shape.height_m * z,
+    };
+  }
+  return {
+    type: 'mesh',
+    mesh_resource_uri: shape.resource_uri,
+    mesh_scale: {
+      x_m: shape.scale.x * x,
+      y_m: shape.scale.y * y,
+      z_m: shape.scale.z * z,
+    },
+  };
+}
+
+export function sceneObjectTransformTransaction(
+  facts: SceneOwnerFacts,
+  fence: SceneMutationFence,
+  object: LogicalSceneObject,
+  pose: LogicalScenePose,
+  scale: [number, number, number],
+  requestId: string,
+): SceneTransactionRequest | null {
+  const scaleChanged = scale.some((value) => Math.abs(value - 1) > 1e-6);
+  if (!scaleChanged) {
+    return scenePoseTransaction(facts, fence, object, pose, requestId);
+  }
+  const shape = scaledSceneShape(object, scale);
+  const snapshot = facts.logicalScene.snapshot;
+  if (
+    editableLogicalSceneObject(object) === null
+    || shape === null
+    || snapshot === null
+  ) return null;
+  return sceneTransaction(facts, fence, {
+    kind: 'upsert_object',
+    scene_resource_id: object.scene_resource_id,
+    shape,
+    pose: {
+      position_m: {
+        x_m: pose.position_m.x,
+        y_m: pose.position_m.y,
+        z_m: pose.position_m.z,
+      },
+      orientation: {
+        x: pose.orientation_xyzw[0],
+        y: pose.orientation_xyzw[1],
+        z: pose.orientation_xyzw[2],
+        w: pose.orientation_xyzw[3],
+      },
+    },
+    frame_ref: { kind: 'cell_frame', cell_id: snapshot.cell_id },
+    support_contacts: object.support_contacts,
+  }, requestId);
+}
+
+export function sceneRemoveTransaction(
+  facts: SceneOwnerFacts,
+  fence: SceneMutationFence,
+  object: LogicalSceneObject,
+  requestId: string,
+): SceneTransactionRequest | null {
+  if (object.provider_evidence !== null) return null;
+  return sceneTransaction(facts, fence, {
+    kind: 'remove_object',
+    scene_resource_id: object.scene_resource_id,
+  }, requestId);
+}
+
+export function sceneDuplicateTransaction(
+  facts: SceneOwnerFacts,
+  fence: SceneMutationFence,
+  object: LogicalSceneObject,
+  duplicateId: string,
+  requestId: string,
+): SceneTransactionRequest | null {
+  const snapshot = facts.logicalScene.snapshot;
+  const shape = scaledSceneShape(object, [1, 1, 1]);
+  const pose = object.placement.kind === 'cell_fixed'
+    ? object.placement.pose_in_cell
+    : null;
+  if (
+    snapshot === null || shape === null || pose === null
+    || !duplicateId.trim()
+    || snapshot.objects.some((candidate) => candidate.scene_resource_id === duplicateId)
+  ) return null;
+  return sceneTransaction(facts, fence, {
+    kind: 'add_object',
+    scene_resource_id: duplicateId,
+    shape,
+    pose: {
+      position_m: {
+        x_m: pose.position_m.x + 0.05,
+        y_m: pose.position_m.y + 0.05,
+        z_m: pose.position_m.z,
+      },
+      orientation: {
+        x: pose.orientation_xyzw[0],
+        y: pose.orientation_xyzw[1],
+        z: pose.orientation_xyzw[2],
+        w: pose.orientation_xyzw[3],
+      },
+    },
+    frame_ref: { kind: 'cell_frame', cell_id: snapshot.cell_id },
+    support_contacts: object.support_contacts,
+  }, requestId);
+}
+
+export function sceneDetachTransaction(
+  facts: SceneOwnerFacts,
+  attachment: NonNullable<LogicalSceneProjection['snapshot']>['carried_object_attachments'][number],
+  requestId: string,
+): SceneTransactionRequest | null {
+  return runtimeSceneTransaction(facts, {
+    kind: 'detach_carried_object_at_current_pose',
+    carried_object_attachment_id: attachment.carried_object_attachment_id,
+    expected_carried_object_attachment_revision:
+      attachment.carried_object_attachment_revision,
+    expected_scene_resource_id: attachment.scene_resource_id,
+    expected_controllable_component_id: attachment.controllable_component_id,
+    expected_command_target_id: attachment.command_target_id,
+  }, requestId);
+}
+
+export function sceneAttachTransaction(
+  facts: SceneOwnerFacts,
+  object: LogicalSceneObject,
+  target: {
+    componentId: string;
+    targetId: string;
+    frameRoleId: string;
+    touchBodyRoles: string[];
+  },
+  expectedComponentAttachmentRevisions: string[],
+  requestId: string,
+): SceneTransactionRequest | null {
+  if (
+    object.placement.kind !== 'cell_fixed'
+    || object.provider_evidence !== null
+    || !target.componentId.trim()
+    || !target.targetId.trim()
+    || !target.frameRoleId.trim()
+  ) return null;
+  const attachmentId = `carried.${object.scene_resource_id}`;
+  return runtimeSceneTransaction(facts, {
+    kind: 'attach_carried_object',
+    carried_object_attachment_id: attachmentId,
+    scene_resource_id: object.scene_resource_id,
+    controllable_component_id: target.componentId,
+    command_target_id: target.targetId,
+    frame_role_id: target.frameRoleId,
+    touch_body_roles: [...new Set(target.touchBodyRoles)].sort(),
+    expected_component_attachment_revisions:
+      [...new Set(expectedComponentAttachmentRevisions)].sort(),
+  }, requestId);
 }
 
 export type CandidateTcpCellPoseResult =

@@ -8,7 +8,9 @@ import type {
   SceneUrdfManifest,
   SourceModelProjection,
 } from '../types/api';
+import type { MotionPreviewReceipt } from '../types/robotControl';
 import {
+  candidateRobotPresentation,
   measuredLinkTransforms,
   runtimeScenePresentation,
 } from './runtimeScenePresentation';
@@ -356,5 +358,28 @@ describe('runtime scene presentation', () => {
     disconnected.joints[1].parent_link = 'missing-parent';
     expect(measuredLinkTransforms(disconnected, new Map([['joint-1', 0]])))
       .toBeNull();
+  });
+
+  it('materializes only an exact retained-model motion-preview ghost', () => {
+    const receipt = {
+      schemaVersion: 'manyforge.direct_control_motion_preview.v1',
+      receiptDigest: 'receipt-1',
+      retainedBundleId: 'bundle-1',
+      graphRevision: 'graph-1',
+      sourceJointNames: ['joint-1'],
+      finalPositionsRad: [Math.PI / 2],
+    } as MotionPreviewReceipt;
+    const presentation = candidateRobotPresentation(receipt, manifest());
+    expect(presentation?.receiptDigest).toBe('receipt-1');
+    expect(presentation?.linkTransforms.tip.position_m[1]).toBeCloseTo(1);
+
+    expect(candidateRobotPresentation({
+      ...receipt,
+      retainedBundleId: 'other-bundle',
+    }, manifest())).toBeNull();
+    expect(candidateRobotPresentation({
+      ...receipt,
+      sourceJointNames: ['missing'],
+    }, manifest())).toBeNull();
   });
 });

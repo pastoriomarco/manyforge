@@ -6,6 +6,8 @@ import {
   livePoseFromProgramResource,
   programResourceWithLivePose,
   scenePoseTransaction,
+  sceneDuplicateTransaction,
+  sceneDetachTransaction,
   type SceneOwnerFacts,
 } from './sceneAuthoring';
 import type {
@@ -28,6 +30,12 @@ const object: LogicalSceneObject = {
   },
   provider_evidence: null,
   support_contacts: [],
+};
+
+const fence = {
+  admissionGeneration: 7,
+  draftId: 'draft-1',
+  draftRevision: 4,
 };
 
 function facts(): SceneOwnerFacts {
@@ -81,12 +89,14 @@ function facts(): SceneOwnerFacts {
     runtimeSourceOwnerEpoch: 'runtime-owner-1',
     writeAvailable: true,
     writeUnavailableReason: null,
+    runtimeWriteAvailable: true,
+    runtimeWriteUnavailableReason: null,
   };
 }
 
 describe('scene authoring intents', () => {
   it('commits exactly one current-revision, cell-framed pose update', () => {
-    expect(scenePoseTransaction(facts(), object, object.placement.kind === 'cell_fixed'
+    expect(scenePoseTransaction(facts(), fence, object, object.placement.kind === 'cell_fixed'
       ? object.placement.pose_in_cell
       : neverPose(), 'request-1')).toEqual({
       request_context: {
@@ -96,6 +106,9 @@ describe('scene authoring intents', () => {
         correlation_id: null,
       },
       expected_projection_revision: facts().logicalScene.access.active_projection,
+      expected_admission_generation: 7,
+      expected_draft_id: 'draft-1',
+      expected_draft_revision: 4,
       operation: {
         kind: 'update_object_pose',
         scene_resource_id: 'part',
@@ -110,7 +123,7 @@ describe('scene authoring intents', () => {
     });
   });
 
-  it('rejects provider-owned, carried, mesh, and write-fenced edits', () => {
+  it('rejects provider-owned, carried, and write-fenced edits while allowing owner meshes', () => {
     expect(editableLogicalSceneObject({
       ...object,
       provider_evidence: { provider_instance_id: 'camera' },
@@ -118,14 +131,45 @@ describe('scene authoring intents', () => {
     expect(editableLogicalSceneObject({
       ...object,
       collision_shapes: [{ type: 'mesh', resource_uri: 'package://part', scale: { x: 1, y: 1, z: 1 } }],
-    })).toBeNull();
+    })).not.toBeNull();
     const fenced = { ...facts(), writeAvailable: false };
     expect(scenePoseTransaction(
       fenced,
+      fence,
       object,
       object.placement.kind === 'cell_fixed' ? object.placement.pose_in_cell : neverPose(),
       'request-2',
     )).toBeNull();
+  });
+
+  it('builds owner-fenced duplicate and detach transactions without browser effects', () => {
+    expect(sceneDuplicateTransaction(
+      facts(), fence, object, 'part_copy', 'request-copy',
+    )?.operation).toMatchObject({ kind: 'add_object', scene_resource_id: 'part_copy' });
+    const detached = sceneDetachTransaction(facts(), {
+      carried_object_attachment_id: 'attachment.1',
+      carried_object_attachment_revision: 'sha256:' + 'a'.repeat(64),
+      scene_resource_id: 'part',
+      controllable_component_id: 'robot',
+      command_target_id: 'arm',
+      carrier_frame_ref: {
+        kind: 'component',
+        controllable_component_id: 'robot',
+        model_instance_id: 'robot.model',
+        frame_role_id: 'tcp',
+      },
+      pose_in_carrier_frame: {
+        position_m: { x: 0, y: 0, z: 0 },
+        orientation_xyzw: [0, 0, 0, 1],
+      },
+      touch_body_roles: [],
+    }, 'request-detach');
+    expect(detached).not.toHaveProperty('expected_admission_generation');
+    expect(detached).not.toHaveProperty('expected_draft_id');
+    expect(detached?.operation).toMatchObject({
+      kind: 'detach_carried_object_at_current_pose',
+      expected_scene_resource_id: 'part',
+    });
   });
 
   it('copies a live cell pose into Program Draft without changing its shape', () => {

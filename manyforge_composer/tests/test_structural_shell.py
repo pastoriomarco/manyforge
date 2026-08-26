@@ -413,6 +413,7 @@ def test_filesystem_browser_preserves_bounded_sorted_authoring_entries(
     (allowed / "z.program.yaml").write_text("x: 1\n", encoding="utf-8")
     (allowed / "A.program.yml").write_text("x: 1\n", encoding="utf-8")
     (allowed / "ignored.deployment.yaml").write_text("x: 1\n", encoding="utf-8")
+    (allowed / "part.glb").write_bytes(b"glTF")
     (allowed / "ignored.txt").write_text("x\n", encoding="utf-8")
     client = _client(allowed_fs_roots=[str(allowed)])
 
@@ -449,6 +450,17 @@ def test_filesystem_browser_preserves_bounded_sorted_authoring_entries(
         "application/json"
     ]["schema"]
     assert response_schema == {"$ref": "#/components/schemas/FileBrowserResponse"}
+
+    mesh_response = client.get(
+        "/api/files/browse",
+        params={"path": str(allowed), "kind": "mesh"},
+    )
+    assert mesh_response.status_code == 200
+    assert [entry["name"] for entry in mesh_response.json()["entries"]] == [
+        "A-directory",
+        "z-directory",
+        "part.glb",
+    ]
 
 
 def test_filesystem_browser_stops_at_root_and_rejects_symlink_escape(

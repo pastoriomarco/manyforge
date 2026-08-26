@@ -12,6 +12,7 @@ import type {
   SourceModelProjection,
   Vector3Tuple,
 } from '../types/api';
+import type { MotionPreviewReceipt } from '../types/robotControl';
 
 export interface RuntimeLinkTransform {
   position_m: Vector3Tuple;
@@ -49,6 +50,11 @@ export interface RuntimeScenePresentation {
     buffered: number;
     warnings: string[];
   };
+}
+
+export interface CandidateRobotPresentation {
+  receiptDigest: string;
+  linkTransforms: Record<string, RuntimeLinkTransform>;
 }
 
 const EMPTY_PRESENTATION: RuntimeScenePresentation = {
@@ -258,6 +264,36 @@ export function runtimeScenePresentation(
       buffered: sources.filter((source) => source.buffered).length,
       warnings,
     },
+  };
+}
+
+/**
+ * Materialize only an exact, artifact-matched motion preview. The browser does
+ * no planning or name inference; it evaluates the receipt's source joint
+ * vector against the already-retained viewer model and otherwise shows no
+ * robot ghost.
+ */
+export function candidateRobotPresentation(
+  receipt: MotionPreviewReceipt,
+  manifest: SceneUrdfManifest,
+): CandidateRobotPresentation | null {
+  if (
+    receipt.retainedBundleId !== manifest.retained_bundle_id
+    || receipt.graphRevision !== manifest.graph_revision
+    || receipt.sourceJointNames.length !== receipt.finalPositionsRad.length
+    || new Set(receipt.sourceJointNames).size !== receipt.sourceJointNames.length
+    || receipt.finalPositionsRad.some((value) => !Number.isFinite(value))
+  ) return null;
+  const transforms = measuredLinkTransforms(
+    manifest,
+    new Map(receipt.sourceJointNames.map((name, index) => [
+      name,
+      receipt.finalPositionsRad[index],
+    ])),
+  );
+  return transforms === null ? null : {
+    receiptDigest: receipt.receiptDigest,
+    linkTransforms: transforms,
   };
 }
 

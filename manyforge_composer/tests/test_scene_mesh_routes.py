@@ -654,6 +654,28 @@ class _SceneState:
         self.headless_client = _SceneClient(source_uri)
 
 
+class _DraftSession:
+    def __init__(self, source_uri: str) -> None:
+        self.source_uri = source_uri
+        self.revision = 9
+
+    def snapshot(self) -> dict[str, object]:
+        return {
+            "draft_id": "draft-1",
+            "draft_revision": self.revision,
+            "authoring": {
+                "scene": [{
+                    "scene_resource_id": "part",
+                    "shape": {
+                        "type": "mesh",
+                        "mesh_resource_uri": self.source_uri,
+                        "mesh_scale": [1.0, 2.0, 3.0],
+                    },
+                }],
+            },
+        }
+
+
 def test_owner_bound_route_converts_and_fences_superseded_generation(
     tmp_path: Path,
 ) -> None:
@@ -729,6 +751,45 @@ def test_owner_bound_route_rejects_unowned_and_outside_sources(tmp_path: Path) -
     )
     assert outside_root.status_code == 409
     assert outside_root.json()["detail"]["code"] == "scene_mesh_input_invalid"
+
+
+def test_program_draft_mesh_route_is_revision_bound_and_cache_is_scope_separated(
+    tmp_path: Path,
+) -> None:
+    mesh_file = tmp_path / "part.obj"
+    _write_obj(mesh_file)
+    state = _SceneState(tmp_path, "part.obj")
+    state.draft_session = _DraftSession("part.obj")
+    app = FastAPI()
+    app.include_router(meshes.create_scene_meshes_router(state))  # type: ignore[arg-type]
+    client = TestClient(app)
+    shape = {
+        "resource_uri": "part.obj",
+        "scale_x": 1.0,
+        "scale_y": 2.0,
+        "scale_z": 3.0,
+    }
+
+    owner = client.get("/api/scene/object-meshes/resolve", params=shape).json()
+    draft = client.get(
+        "/api/program/draft/scene-meshes/resolve",
+        params={**shape, "draft_id": "draft-1", "draft_revision": 9},
+    )
+
+    assert draft.status_code == 200
+    metadata = draft.json()
+    assert metadata["schema_version"] == "manyforge.program_draft_mesh_asset.v1"
+    assert metadata["asset_hash"] == owner["asset_hash"]
+    assert metadata["draft_revision"] == 9
+    converted = client.get(metadata["mesh_asset_url"])
+    assert converted.status_code == 200
+    assert converted.headers["x-manyforge-draft-revision"] == "9"
+    assert client.get(owner["mesh_asset_url"]).status_code == 200
+
+    state.draft_session.revision = 10
+    stale = client.get(metadata["mesh_asset_url"])
+    assert stale.status_code == 409
+    assert stale.json()["detail"]["code"] == "scene_mesh_draft_revision_changed"
 
 
 def test_historical_scene_mesh_cases_are_split_without_loss() -> None:

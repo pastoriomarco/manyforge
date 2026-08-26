@@ -23,6 +23,7 @@ from .security import normalize_allowed_roots
 
 _PROGRAM_SUFFIXES = (".program.yaml", ".program.yml")
 _DEPLOYMENT_SUFFIXES = (".deployment.yaml", ".deployment.yml")
+_MESH_SUFFIXES = (".obj", ".stl", ".ply", ".glb", ".gltf")
 
 # Browsing is an authoring convenience, not a bulk filesystem-indexing API.
 # These limits bound every caller-controlled dimension before sorting or JSON
@@ -98,6 +99,8 @@ def _matches_kind(path: Path, kind: str) -> bool:
         return name.endswith(_PROGRAM_SUFFIXES)
     if kind == "deployment":
         return name.endswith(_DEPLOYMENT_SUFFIXES)
+    if kind == "mesh":
+        return name.endswith(_MESH_SUFFIXES)
     return False
 
 
@@ -473,7 +476,7 @@ def create_filesystem_router(allowed_roots: list[str] | None = None) -> APIRoute
         # The byte-exact check stays inside the handler so an oversized value
         # gets one bounded error instead of a validation body echoing the path.
         path: str | None = Query(default=None),
-        kind: str = Query(default="program", pattern="^(program|deployment)$"),
+        kind: str = Query(default="program", pattern="^(program|deployment|mesh)$"),
     ) -> dict:
         if path is None:
             current_dir, descriptor, initial_metadata = _open_default_browse_root(

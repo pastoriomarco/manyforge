@@ -27,6 +27,7 @@ import {
   parseScenarioCatalogResponse,
   parseSceneRuntimeProjection,
   parseSceneMeshAssetMetadata,
+  parseProgramDraftMeshAssetMetadata,
   parseSceneTransactionResponse,
   parseSceneUrdfManifest,
   parseSourceModelProjection,
@@ -467,6 +468,21 @@ describe('scene mesh asset parser', () => {
     const stale = asset();
     stale.mesh_asset_url = '/api/scene/object-meshes/0123456789abcdef.glb?owner_epoch=scene.epoch.1&generation=6';
     expect(() => parseSceneMeshAssetMetadata(stale)).toThrow(/owner-generation/);
+  });
+
+  it('requires the exact Program Draft-revision-bound URL', () => {
+    const draftAsset = {
+      schema_version: 'manyforge.program_draft_mesh_asset.v1',
+      asset_hash: '0123456789abcdef',
+      mesh_asset_url: '/api/program/draft/scene-meshes/0123456789abcdef.glb?draft_id=draft-1&draft_revision=9',
+      mesh_asset_status: 'pending',
+      draft_id: 'draft-1',
+      draft_revision: 9,
+      last_error: null,
+    };
+    expect(parseProgramDraftMeshAssetMetadata(draftAsset).draft_revision).toBe(9);
+    draftAsset.mesh_asset_url = '/api/program/draft/scene-meshes/0123456789abcdef.glb?draft_id=draft-1&draft_revision=8';
+    expect(() => parseProgramDraftMeshAssetMetadata(draftAsset)).toThrow(/Draft-revision/);
   });
 });
 
@@ -1037,6 +1053,34 @@ describe('headless projection parsers', () => {
     expect(parseLogicalSceneProjection(logicalSceneFixture()).snapshot?.objects[0]
       ?.scene_resource_id).toBe('part');
     expect(parseSceneRuntimeProjection(sceneRuntimeFixture()).state.state).toBe('open');
+  });
+
+  it('strictly parses carried-object attachment hierarchy metadata', () => {
+    const fixture = logicalSceneFixture();
+    const snapshot = fixture.snapshot as Record<string, unknown>;
+    snapshot.carried_object_attachments = [{
+      carried_object_attachment_id: 'attachment.1',
+      carried_object_attachment_revision: `sha256:${'a'.repeat(64)}`,
+      scene_resource_id: 'part',
+      controllable_component_id: 'robot',
+      command_target_id: 'arm',
+      carrier_frame_ref: {
+        kind: 'component',
+        controllable_component_id: 'robot',
+        model_instance_id: 'robot.model',
+        frame_role_id: 'tcp',
+      },
+      pose_in_carrier_frame: {
+        position_m: { x: 0, y: 0, z: 0.1 },
+        orientation_xyzw: [0, 0, 0, 1],
+      },
+      touch_body_roles: ['tool_collision'],
+    }];
+    expect(parseLogicalSceneProjection(fixture).snapshot
+      ?.carried_object_attachments[0].carrier_frame_ref.frame_role_id).toBe('tcp');
+    (snapshot.carried_object_attachments as Record<string, unknown>[])[0]
+      .unexpected = true;
+    expect(() => parseLogicalSceneProjection(fixture)).toThrow(/exactly/);
   });
 
   it('parses exact good and unknown ROS observation payloads', () => {

@@ -1,7 +1,7 @@
 import type { ProgramBindingDocument } from './programBindingTransport.generated';
 export type { ProgramBindingDocument } from './programBindingTransport.generated';
 
-export type ArtifactKind = 'program' | 'deployment';
+export type ArtifactKind = 'program' | 'deployment' | 'mesh';
 
 export interface RuntimeAvailability {
   code: string;
@@ -617,6 +617,16 @@ export interface SceneMeshAssetMetadata {
   last_error: string | null;
 }
 
+export interface ProgramDraftMeshAssetMetadata {
+  schema_version: 'manyforge.program_draft_mesh_asset.v1';
+  asset_hash: string;
+  mesh_asset_url: string;
+  mesh_asset_status: 'pending' | 'ok' | 'parse_failed';
+  draft_id: string;
+  draft_revision: number;
+  last_error: string | null;
+}
+
 export type LogicalScenePlacement =
   | {
       kind: 'cell_fixed';
@@ -637,6 +647,25 @@ export interface LogicalSceneObject {
   support_contacts: Array<Record<string, JsonValue>>;
 }
 
+export interface CarriedObjectAttachment {
+  carried_object_attachment_id: string;
+  carried_object_attachment_revision: string;
+  scene_resource_id: string;
+  controllable_component_id: string;
+  command_target_id: string;
+  carrier_frame_ref: {
+    kind: 'component';
+    controllable_component_id: string;
+    model_instance_id: string;
+    frame_role_id: string;
+  };
+  pose_in_carrier_frame: {
+    position_m: { x: number; y: number; z: number };
+    orientation_xyzw: QuaternionXyzwTuple;
+  };
+  touch_body_roles: string[];
+}
+
 export interface LogicalSceneProjection {
   api_version: 'manyforge.logical_scene_source.v1';
   access: {
@@ -646,7 +675,7 @@ export interface LogicalSceneProjection {
     scene_writes_open: boolean;
   };
   snapshot: {
-    carried_object_attachments: Array<Record<string, JsonValue>>;
+    carried_object_attachments: CarriedObjectAttachment[];
     cell_id: string;
     configured_collision_policy: Record<string, JsonValue>;
     objects: LogicalSceneObject[];
@@ -756,7 +785,81 @@ export interface SceneRuntimeProjection {
   };
 }
 
-export interface SceneTransactionRequest {
+export interface ScenePoseRequest {
+  position_m: { x_m: number; y_m: number; z_m: number };
+  orientation: { x: number; y: number; z: number; w: number };
+}
+
+export type SceneShapeRequest =
+  | {
+      type: 'box';
+      box_dimensions_m: { x_m: number; y_m: number; z_m: number };
+    }
+  | { type: 'sphere'; sphere_radius_m: number }
+  | {
+      type: 'cylinder';
+      cylinder_radius_m: number;
+      cylinder_height_m: number;
+    }
+  | {
+      type: 'mesh';
+      mesh_resource_uri: string;
+      mesh_scale: { x_m: number; y_m: number; z_m: number };
+    };
+
+export type SceneTransactionFrameRequest =
+  | { kind: 'cell_frame'; cell_id: string }
+  | {
+      kind: 'component_frame';
+      controllable_component_id: string;
+      model_instance_id: string;
+      frame_role_id: string;
+    }
+  | {
+      kind: 'passive_model_frame';
+      model_instance_id: string;
+      frame_role_id: string;
+    }
+  | { kind: 'scene_resource'; scene_resource_id: string };
+
+export type SceneTransactionOperation =
+  | {
+      kind: 'add_object' | 'upsert_object';
+      scene_resource_id: string;
+      shape: SceneShapeRequest;
+      pose: ScenePoseRequest;
+      frame_ref: SceneTransactionFrameRequest;
+      support_contacts: Array<Record<string, JsonValue>>;
+    }
+  | { kind: 'remove_object'; scene_resource_id: string }
+  | {
+      kind: 'update_object_pose';
+      scene_resource_id: string;
+      pose: ScenePoseRequest;
+      frame_ref: SceneTransactionFrameRequest;
+      provider_evidence: null;
+      expected_attached: false;
+    }
+  | {
+      kind: 'attach_carried_object';
+      carried_object_attachment_id: string;
+      scene_resource_id: string;
+      controllable_component_id: string;
+      command_target_id: string;
+      frame_role_id: string;
+      touch_body_roles: string[];
+      expected_component_attachment_revisions: string[];
+    }
+  | {
+      kind: 'detach_carried_object_at_current_pose';
+      carried_object_attachment_id: string;
+      expected_carried_object_attachment_revision: string;
+      expected_scene_resource_id: string;
+      expected_controllable_component_id: string;
+      expected_command_target_id: string;
+    };
+
+interface SceneTransactionRequestBase {
   request_context: {
     request_id: string;
     request_owner_epoch: string;
@@ -764,18 +867,31 @@ export interface SceneTransactionRequest {
     correlation_id: string | null;
   };
   expected_projection_revision: ProjectionRevision;
-  operation: {
-    kind: 'update_object_pose';
-    scene_resource_id: string;
-    pose: {
-      position_m: { x_m: number; y_m: number; z_m: number };
-      orientation: { x: number; y: number; z: number; w: number };
-    };
-    frame_ref: { kind: 'cell_frame'; cell_id: string };
-    provider_evidence: null;
-    expected_attached: false;
-  };
 }
+
+type RuntimeOwnedSceneOperation = Extract<
+  SceneTransactionOperation,
+  { kind: 'attach_carried_object' | 'detach_carried_object_at_current_pose' }
+>;
+type AuthoredSceneOperation = Exclude<
+  SceneTransactionOperation,
+  RuntimeOwnedSceneOperation
+>;
+
+export type SceneTransactionRequest = SceneTransactionRequestBase & (
+  | {
+      expected_admission_generation: number;
+      expected_draft_id: string;
+      expected_draft_revision: number;
+      operation: AuthoredSceneOperation;
+    }
+  | {
+      expected_admission_generation?: never;
+      expected_draft_id?: never;
+      expected_draft_revision?: never;
+      operation: RuntimeOwnedSceneOperation;
+    }
+);
 
 export interface SceneTransactionResponse {
   api_version: 'manyforge.manager_command_response.v1';

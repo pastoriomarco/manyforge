@@ -3,7 +3,7 @@
   Regenerate with:
     cd <repository-root>
     python3 scripts/regen-public-contracts.py structural-rest
-  Last regenerated: 2026-08-24 00:41:29 UTC
+  Last regenerated: 2026-08-26 17:30:52 UTC
   Generator source: scripts/regen-public-contracts.py:gen_rest_api
 -->
 
@@ -74,6 +74,9 @@ OpenAPI version: `3.1.0`. Title: `ManyForge Composer (replaceable client)`.
 | `POST` | `/api/program/discard` | composer-draft | Discard Draft |
 | `GET` | `/api/program/draft` | composer-draft | Read Draft |
 | `POST` | `/api/program/draft/mutations` | composer-draft | Mutate Draft |
+| `GET` | `/api/program/draft/scene-meshes/resolve` | headless-scene-mesh-client | Resolve Program Draft Scene Mesh |
+| `GET` | `/api/program/draft/scene-meshes/{asset_hash}.glb` | headless-scene-mesh-client | Get Program Draft Scene Mesh |
+| `POST` | `/api/program/load` | composer-draft | Removed Program Load |
 | `POST` | `/api/program/new-draft` | composer-draft | New Draft |
 | `POST` | `/api/program/open-draft` | composer-draft | Open Draft |
 | `POST` | `/api/program/revert` | composer-draft | Revert Draft |
@@ -86,7 +89,7 @@ OpenAPI version: `3.1.0`. Title: `ManyForge Composer (replaceable client)`.
 | `GET` | `/api/program/workspace` | composer-draft | Read Workspace |
 | `GET` | `/api/runtime` | headless-runtime-client | Runtime |
 | `GET` | `/api/scenarios` | headless-runtime-client | Scenarios |
-| `GET` | `/api/scenarios/current` | composer-draft | Derive Current Scenario |
+| `GET` | `/api/scenarios/current` | headless-runtime-client | Current Scenario |
 | `POST` | `/api/scenarios/load` | composer-draft | Load Scenario |
 | `GET` | `/api/scene` | headless-runtime-client | Scene |
 | `GET` | `/api/scene/object-meshes/resolve` | headless-scene-mesh-client | Resolve Scene Object Mesh |

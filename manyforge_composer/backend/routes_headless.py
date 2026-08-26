@@ -6,6 +6,7 @@ from typing import Annotated, Any, Literal
 
 from fastapi import APIRouter, HTTPException, Path, Query
 from fastapi.responses import JSONResponse
+from pydantic import ConfigDict, Field, model_validator
 
 from manyforge_headless_api.client import HeadlessClientError, HeadlessHttpClient
 from manyforge_headless_api.models import (
@@ -54,6 +55,48 @@ _SCENE_RESULT_FIELDS = {
     "transaction_sequence",
     "update_status",
 }
+
+
+class ComposerSceneTransactionRequest(SceneTransactionRequest):
+    """Scene-owner request with a Draft fence only for authored mutations."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    expected_draft_id: str | None = Field(default=None, min_length=1, max_length=256)
+    expected_draft_revision: int | None = Field(
+        default=None,
+        ge=0,
+        le=_MAXIMUM_SAFE_INTEGER,
+    )
+
+    @model_validator(mode="after")
+    def validate_authority_scope(self) -> "ComposerSceneTransactionRequest":
+        authored = self.operation.kind in {
+            "add_object",
+            "upsert_object",
+            "remove_object",
+            "update_object_pose",
+            "set_collision_policy",
+        }
+        draft_fenced = (
+            self.expected_draft_id is not None
+            and self.expected_draft_revision is not None
+        )
+        if authored and (
+            self.expected_admission_generation is None or not draft_fenced
+        ):
+            raise ValueError(
+                "authored scene mutation requires admission and Program Draft fences"
+            )
+        if not authored and (
+            self.expected_admission_generation is not None
+            or self.expected_draft_id is not None
+            or self.expected_draft_revision is not None
+        ):
+            raise ValueError(
+                "runtime-owned scene mutation cannot carry authoring fences"
+            )
+        return self
 
 
 def _translate(error: HeadlessClientError) -> HTTPException:
@@ -454,10 +497,33 @@ def create_headless_router(
         return _call(client.scene)
 
     @router.post("/api/scene/transactions")
-    def scene_commit(body: SceneTransactionRequest):
+    def scene_commit(body: ComposerSceneTransactionRequest):
+        if body.expected_draft_id is not None:
+            draft = state.draft_session.snapshot()
+            if (
+                draft["draft_id"] != body.expected_draft_id
+                or draft["draft_revision"] != body.expected_draft_revision
+            ):
+                raise HTTPException(
+                    status_code=409,
+                    detail={
+                        "code": "scene_transaction_draft_stale",
+                        "message": (
+                            "Scene edit does not identify the current authoritative Draft"
+                        ),
+                    },
+                )
+        owner_request = SceneTransactionRequest.model_validate(
+            body.model_dump(
+                mode="json",
+                exclude={"expected_draft_id", "expected_draft_revision"},
+            )
+        )
         return _call_scene(
-            lambda: client.commit_scene_transaction(body.model_dump(mode="json")),
-            body,
+            lambda: client.commit_scene_transaction(
+                owner_request.model_dump(mode="json")
+            ),
+            owner_request,
         )
 
     @router.get("/api/execution/alarms")

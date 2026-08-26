@@ -15,6 +15,18 @@ export default defineConfig(() => {
     },
     build: {
       outDir: 'dist',
+      rolldownOptions: {
+        output: {
+          codeSplitting: {
+            groups: [{
+              name: 'vendor',
+              test: /node_modules[\\/]/,
+              maxSize: 450_000,
+              entriesAware: true,
+            }],
+          },
+        },
+      },
     },
   };
 });

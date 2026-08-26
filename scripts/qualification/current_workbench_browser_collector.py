@@ -380,12 +380,15 @@ OBSERVATION_SCRIPT = f"""return (() => {{
     operationsPanePresent: operations !== null && pane !== null,
     operationsCollapsed: shell?.classList.contains('commands-collapsed') === true,
     viewerPresent: pane?.querySelector('.viewer-panel') !== null,
-    wireframeUnchecked: document.querySelector('.viewer-controls input[type="checkbox"]')?.checked === false,
+    wireframeUnchecked: document.querySelector('input[aria-label="Wireframe overlays"]')?.checked === false,
     activeWorkspace,
     activeWorkspacePresent
   }};
 }})();"""
 TAKE_SCRIPT = f"return window.{QUALIFICATION_GLOBAL}?.take() ?? null;"
+QUALIFICATION_READY_SCRIPT = (
+    f"return typeof window.{QUALIFICATION_GLOBAL}?.snapshot === 'function';"
+)
 
 
 def _select_workspace_script(workspace: str) -> str:
@@ -420,6 +423,17 @@ def _wait(
             return observation
         if time.monotonic() >= deadline:
             raise CollectorError(f"timed out waiting for {label}")
+        time.sleep(POLL_INTERVAL_S)
+
+
+def _wait_for_qualification(driver: RawWebDriver, timeout_s: float) -> None:
+    """Wait for the lazily loaded viewer to install its strict probe."""
+    deadline = time.monotonic() + min(timeout_s, WAIT_TIMEOUT_S)
+    while True:
+        if _execute(driver, QUALIFICATION_READY_SCRIPT) is True:
+            return
+        if time.monotonic() >= deadline:
+            raise CollectorError("timed out waiting for the viewer qualification probe")
         time.sleep(POLL_INTERVAL_S)
 
 
@@ -588,6 +602,7 @@ def collect_current_workbench(
             driver.set_window_rect(viewport_width, viewport_height)
         target_url = _url_with_opt_in(composer_url)
         driver.command("POST", "/url", {"url": target_url})
+        _wait_for_qualification(driver, timeout_s)
         _wait(
             driver,
             lambda item: (
@@ -646,6 +661,7 @@ def collect_current_workbench(
             workspace_topology[workspace] = topology
 
         driver.command("POST", "/url", {"url": target_url})
+        _wait_for_qualification(driver, timeout_s)
         _wait(
             driver,
             lambda item: (

@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 
 import {
   subscribePointCloudObserver,
@@ -14,6 +14,7 @@ import {
 export interface PointCloudFrameState {
   frame: PointCloudFrame | null;
   error: string | null;
+  clear: () => void;
 }
 
 export function usePointCloudFrame(
@@ -24,6 +25,10 @@ export function usePointCloudFrame(
   const [error, setError] = useState<string | null>(null);
   const slot = useRef(emptyLatestFrameSlot<PointCloudFrame>());
   const animation = useRef<number | null>(null);
+  const clear = useCallback(() => {
+    slot.current = invalidateLatestFrame(slot.current);
+    setFrame(null);
+  }, []);
 
   useEffect(() => {
     if (!enabled || cellId === undefined) {
@@ -58,5 +63,5 @@ export function usePointCloudFrame(
     };
   }, [cellId, enabled]);
 
-  return { frame, error };
+  return { frame, error, clear };
 }

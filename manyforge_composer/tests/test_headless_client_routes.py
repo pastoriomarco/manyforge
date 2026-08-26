@@ -774,6 +774,22 @@ class _ComposerTestClient(TestClient):
 
     def post(self, url, *, json=None, **kwargs):  # type: ignore[override]
         admission = self._composer_state.authoring_admission
+        if url == "/api/scene/transactions" and isinstance(json, dict):
+            operation = json.get("operation")
+            operation_kind = (
+                operation.get("kind") if isinstance(operation, dict) else None
+            )
+            if operation_kind in {
+                "add_object",
+                "upsert_object",
+                "remove_object",
+                "update_object_pose",
+                "set_collision_policy",
+            }:
+                draft = self._composer_state.draft_session.snapshot()
+                json = dict(json)
+                json.setdefault("expected_draft_id", draft["draft_id"])
+                json.setdefault("expected_draft_revision", draft["draft_revision"])
         if (
             admission is not None
             and isinstance(json, dict)
@@ -1460,7 +1476,7 @@ def test_composer_preview_routes_are_strict_stateless_forwarders(
     ]
 
 
-def test_composer_scene_transaction_is_a_strict_stateless_forwarder(
+def test_composer_scene_transaction_fences_draft_and_forwards_only_owner_fields(
     headless_client,
 ) -> None:
     client, requests, _node_environment = headless_client
@@ -1483,6 +1499,67 @@ def test_composer_scene_transaction_is_a_strict_stateless_forwarder(
             "body": body,
         }
     ]
+
+
+def test_composer_runtime_scene_transaction_omits_authoring_fences(
+    headless_client,
+) -> None:
+    client, requests, _node_environment = headless_client
+    body = {
+        "request_context": {
+            "request_id": "request.scene.attach",
+            "request_owner_epoch": "scene-owner.epoch.7",
+            "source_label": "composer_ui",
+            "correlation_id": None,
+        },
+        "expected_projection_revision": _scene_body()[
+            "expected_projection_revision"
+        ],
+        "operation": {
+            "kind": "attach_carried_object",
+            "carried_object_attachment_id": "carried.part.1",
+            "scene_resource_id": "part.1",
+            "controllable_component_id": "robot.1",
+            "command_target_id": "arm",
+            "frame_role_id": "tcp",
+            "touch_body_roles": [],
+            "expected_component_attachment_revisions": [],
+        },
+    }
+    with _composer(client) as composer:
+        response = composer.post("/api/scene/transactions", json=body)
+        over_fenced = composer.post(
+            "/api/scene/transactions",
+            json={**body, "expected_admission_generation": 7},
+        )
+
+    assert response.status_code == 200, response.text
+    assert over_fenced.status_code == 422
+    forwarded = [item for item in requests if item["path"] == "/api/scene/transactions"]
+    assert forwarded == [
+        {
+            "method": "POST",
+            "path": "/api/scene/transactions",
+            "query": "",
+            "body": {**body, "expected_admission_generation": None},
+        }
+    ]
+
+
+def test_composer_rejects_stale_scene_draft_before_forwarding(headless_client) -> None:
+    client, requests, _node_environment = headless_client
+    body = {
+        **_scene_body(),
+        "expected_draft_id": "draft-stale",
+        "expected_draft_revision": 99,
+    }
+    with _composer(client) as composer:
+        response = composer.post("/api/scene/transactions", json=body)
+    assert response.status_code == 409
+    assert response.json()["detail"]["code"] == "scene_transaction_draft_stale"
+    assert not any(
+        item["path"] == "/api/scene/transactions" for item in requests
+    )
 
 
 def test_program_scene_and_viewer_draft_edits_have_no_runtime_effect(

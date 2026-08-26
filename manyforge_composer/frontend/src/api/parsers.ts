@@ -9,6 +9,7 @@ import type {
   DraftMutationResponse,
   ProgramDraftProjection,
   ProgramDraftApplicability,
+  ProgramDraftMeshAssetMetadata,
   FileBrowserEntry,
   FileBrowserResponse,
   HealthResponse,
@@ -52,6 +53,7 @@ import type {
   ProgramWorkspaceResponse,
   ProgramWorkspaceTransitionResponse,
   ScenarioCatalogResponse,
+  CarriedObjectAttachment,
   LogicalSceneObject,
   LogicalScenePlacement,
   LogicalScenePose,
@@ -3545,6 +3547,82 @@ function parseLogicalSceneObject(value: unknown, path: string): LogicalSceneObje
   };
 }
 
+function parseCarriedObjectAttachment(
+  value: unknown,
+  path: string,
+): CarriedObjectAttachment {
+  const record = objectAt(value, path);
+  exactKeysAt(record, [
+    'carried_object_attachment_id',
+    'carried_object_attachment_revision',
+    'scene_resource_id',
+    'controllable_component_id',
+    'command_target_id',
+    'carrier_frame_ref',
+    'pose_in_carrier_frame',
+    'touch_body_roles',
+  ], path);
+  const frame = objectAt(record.carrier_frame_ref, `${path}.carrier_frame_ref`);
+  exactKeysAt(frame, [
+    'kind',
+    'controllable_component_id',
+    'model_instance_id',
+    'frame_role_id',
+  ], `${path}.carrier_frame_ref`);
+  if (stringAt(frame.kind, `${path}.carrier_frame_ref.kind`) !== 'component') {
+    return fail(`${path}.carrier_frame_ref.kind`, 'component');
+  }
+  const pose = objectAt(record.pose_in_carrier_frame, `${path}.pose_in_carrier_frame`);
+  exactKeysAt(pose, ['position_m', 'orientation_xyzw'], `${path}.pose_in_carrier_frame`);
+  const position = objectAt(pose.position_m, `${path}.pose_in_carrier_frame.position_m`);
+  exactKeysAt(position, ['x', 'y', 'z'], `${path}.pose_in_carrier_frame.position_m`);
+  const touchBodyRoles = boundedArrayAt(record.touch_body_roles, `${path}.touch_body_roles`, 4096)
+    .map((item, index) => stringAt(item, `${path}.touch_body_roles[${index}]`));
+  if (JSON.stringify(touchBodyRoles) !== JSON.stringify([...new Set(touchBodyRoles)].sort())) {
+    return fail(`${path}.touch_body_roles`, 'sorted unique role IDs');
+  }
+  return {
+    carried_object_attachment_id: stringAt(
+      record.carried_object_attachment_id,
+      `${path}.carried_object_attachment_id`,
+    ),
+    carried_object_attachment_revision: digestAt(
+      record.carried_object_attachment_revision,
+      `${path}.carried_object_attachment_revision`,
+    ),
+    scene_resource_id: stringAt(record.scene_resource_id, `${path}.scene_resource_id`),
+    controllable_component_id: stringAt(
+      record.controllable_component_id,
+      `${path}.controllable_component_id`,
+    ),
+    command_target_id: stringAt(record.command_target_id, `${path}.command_target_id`),
+    carrier_frame_ref: {
+      kind: 'component',
+      controllable_component_id: stringAt(
+        frame.controllable_component_id,
+        `${path}.carrier_frame_ref.controllable_component_id`,
+      ),
+      model_instance_id: stringAt(
+        frame.model_instance_id,
+        `${path}.carrier_frame_ref.model_instance_id`,
+      ),
+      frame_role_id: stringAt(frame.frame_role_id, `${path}.carrier_frame_ref.frame_role_id`),
+    },
+    pose_in_carrier_frame: {
+      position_m: {
+        x: numberAt(position.x, `${path}.pose_in_carrier_frame.position_m.x`),
+        y: numberAt(position.y, `${path}.pose_in_carrier_frame.position_m.y`),
+        z: numberAt(position.z, `${path}.pose_in_carrier_frame.position_m.z`),
+      },
+      orientation_xyzw: quaternionAt(
+        pose.orientation_xyzw,
+        `${path}.pose_in_carrier_frame.orientation_xyzw`,
+      ),
+    },
+    touch_body_roles: touchBodyRoles,
+  };
+}
+
 export function parseSceneMeshAssetMetadata(
   value: unknown,
 ): SceneMeshAssetMetadata {
@@ -3641,6 +3719,105 @@ export function parseSceneMeshAssetMetadata(
   };
 }
 
+export function parseProgramDraftMeshAssetMetadata(
+  value: unknown,
+): ProgramDraftMeshAssetMetadata {
+  const record = objectAt(value, 'programDraftMeshAsset');
+  exactKeysAt(
+    record,
+    [
+      'asset_hash',
+      'draft_id',
+      'draft_revision',
+      'last_error',
+      'mesh_asset_status',
+      'mesh_asset_url',
+      'schema_version',
+    ],
+    'programDraftMeshAsset',
+  );
+  const schemaVersion = stringAt(
+    record.schema_version,
+    'programDraftMeshAsset.schema_version',
+  );
+  if (schemaVersion !== 'manyforge.program_draft_mesh_asset.v1') {
+    return fail(
+      'programDraftMeshAsset.schema_version',
+      'manyforge.program_draft_mesh_asset.v1',
+    );
+  }
+  const assetHash = stringAt(
+    record.asset_hash,
+    'programDraftMeshAsset.asset_hash',
+  );
+  if (!/^[0-9a-f]{16}$/.test(assetHash)) {
+    return fail(
+      'programDraftMeshAsset.asset_hash',
+      '16 lowercase hexadecimal characters',
+    );
+  }
+  const status = stringAt(
+    record.mesh_asset_status,
+    'programDraftMeshAsset.mesh_asset_status',
+  );
+  if (!['pending', 'ok', 'parse_failed'].includes(status)) {
+    return fail(
+      'programDraftMeshAsset.mesh_asset_status',
+      'pending, ok, or parse_failed',
+    );
+  }
+  const lastError = nullableStringAt(
+    record.last_error,
+    'programDraftMeshAsset.last_error',
+  );
+  if ((status === 'parse_failed') !== (lastError !== null)) {
+    return fail(
+      'programDraftMeshAsset.last_error',
+      'present exactly for parse_failed status',
+    );
+  }
+  const draftId = stringAt(record.draft_id, 'programDraftMeshAsset.draft_id');
+  if (!draftId || draftId.length > 256) {
+    return fail(
+      'programDraftMeshAsset.draft_id',
+      'a bounded non-empty Draft ID',
+    );
+  }
+  const draftRevision = integerAt(
+    record.draft_revision,
+    'programDraftMeshAsset.draft_revision',
+  );
+  if (draftRevision < 0) {
+    return fail('programDraftMeshAsset.draft_revision', 'a non-negative integer');
+  }
+  const meshAssetUrl = stringAt(
+    record.mesh_asset_url,
+    'programDraftMeshAsset.mesh_asset_url',
+  );
+  const expectedParams = new URLSearchParams({
+    draft_id: draftId,
+    draft_revision: String(draftRevision),
+  });
+  if (
+    meshAssetUrl
+    !== `/api/program/draft/scene-meshes/${assetHash}.glb?${expectedParams.toString()}`
+  ) {
+    return fail(
+      'programDraftMeshAsset.mesh_asset_url',
+      'the exact Draft-revision-bound asset URL',
+    );
+  }
+  return {
+    schema_version: schemaVersion,
+    asset_hash: assetHash,
+    mesh_asset_url: meshAssetUrl,
+    mesh_asset_status: status as ProgramDraftMeshAssetMetadata['mesh_asset_status'],
+    draft_id: draftId,
+    draft_revision: draftRevision,
+    last_error: lastError,
+  };
+}
+
 export function parseLogicalSceneProjection(value: unknown): LogicalSceneProjection {
   const record = objectAt(value, 'logicalScene');
   exactKeysAt(record, ['access', 'api_version', 'snapshot'], 'logicalScene');
@@ -3726,7 +3903,7 @@ export function parseLogicalSceneProjection(value: unknown): LogicalSceneProject
         snapshot.carried_object_attachments,
         'logicalScene.snapshot.carried_object_attachments',
         4096,
-      ).map((item, index) => jsonRecordAt(
+      ).map((item, index) => parseCarriedObjectAttachment(
         item,
         `logicalScene.snapshot.carried_object_attachments[${index}]`,
       )),

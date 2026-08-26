@@ -1519,7 +1519,89 @@ code {
 }
 
 .viewer-header {
-  min-height: 4.65rem;
+  position: relative;
+  z-index: 8;
+  min-height: 2.55rem;
+  padding: 0.32rem 0.55rem;
+}
+
+.viewer-header > strong {
+  color: #dbe8ee;
+  font-size: 0.78rem;
+  letter-spacing: 0.02em;
+}
+
+.viewer-options {
+  position: relative;
+  margin-left: auto;
+}
+
+.viewer-options > summary {
+  padding: 0.38rem 0.65rem;
+  border: 1px solid #304b59;
+  border-radius: 0.42rem;
+  color: #b9cbd4;
+  background: #0d1d27;
+  cursor: pointer;
+  font-size: 0.72rem;
+  list-style: none;
+}
+
+.viewer-options > summary::-webkit-details-marker {
+  display: none;
+}
+
+.viewer-options[open] > summary {
+  border-color: #4f7d8b;
+  color: #e1f2f6;
+  background: #15313d;
+}
+
+.viewer-options-popover {
+  position: absolute;
+  z-index: 20;
+  top: calc(100% + 0.35rem);
+  right: 0;
+  display: grid;
+  width: min(18rem, calc(100vw - 2rem));
+  gap: 0.65rem;
+  padding: 0.7rem;
+  border: 1px solid #35515e;
+  border-radius: 0.55rem;
+  background: rgb(8 23 32 / 96%);
+  box-shadow: 0 0.8rem 2rem rgb(0 0 0 / 35%);
+}
+
+.viewer-options-actions {
+  display: flex;
+  gap: 0.4rem;
+}
+
+.viewer-model-facts {
+  min-width: 0;
+  border-top: 1px solid #29404d;
+  padding-top: 0.45rem;
+}
+
+.viewer-model-facts summary {
+  color: #9ab2bd;
+  cursor: pointer;
+  font-size: 0.7rem;
+}
+
+.viewer-model-facts span {
+  display: block;
+  overflow: hidden;
+  margin-top: 0.35rem;
+  color: #78939f;
+  font-size: 0.65rem;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.viewer-model-facts code,
+.viewer-model-facts strong {
+  color: #add5dd;
 }
 
 .viewer-controls,
@@ -1558,6 +1640,78 @@ code {
   background:
     linear-gradient(rgb(8 16 25 / 76%), rgb(8 16 25 / 76%)),
     repeating-linear-gradient(45deg, #0b1720 0 1px, transparent 1px 12px);
+}
+
+.viewer-tool-strip {
+  position: absolute;
+  z-index: 3;
+  top: 0.65rem;
+  right: 0.65rem;
+  display: flex;
+  align-items: center;
+  gap: 0.25rem;
+  max-width: calc(100% - 1.3rem);
+  padding: 0.25rem;
+  border: 1px solid #294652;
+  border-radius: 0.55rem;
+  background: rgb(7 20 29 / 84%);
+  backdrop-filter: blur(4px);
+}
+
+.viewer-tool-strip button {
+  min-width: 2rem;
+  min-height: 2rem;
+  padding: 0.3rem 0.5rem;
+  font-size: 0.74rem;
+}
+
+.viewer-tool-strip button[aria-pressed='true'] {
+  border-color: #68cadd;
+  color: #dffaff;
+  background: #153c49;
+}
+
+.viewer-tool-separator {
+  align-self: stretch;
+  width: 1px;
+  margin: 0 0.2rem;
+  background: #31505d;
+}
+
+.viewer-context-menu {
+  position: fixed;
+  z-index: 50;
+  display: grid;
+  min-width: 12rem;
+  gap: 0.35rem;
+  padding: 0.55rem;
+  border: 1px solid #3c5b67;
+  border-radius: 0.55rem;
+  background: #0b1a23;
+  box-shadow: 0 0.6rem 1.8rem rgb(0 0 0 / 42%);
+}
+
+.viewer-context-menu strong {
+  overflow: hidden;
+  padding: 0.25rem;
+  color: #d8e8ee;
+  font-size: 0.75rem;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.viewer-layer-warning {
+  position: absolute;
+  right: 0.65rem;
+  bottom: 0.65rem;
+  z-index: 3;
+  max-width: min(28rem, calc(100% - 1.3rem));
+  padding: 0.45rem 0.65rem;
+  border: 1px solid #74493f;
+  border-radius: 0.45rem;
+  color: #efb4a8;
+  background: rgb(42 22 20 / 86%);
+  font-size: 0.7rem;
 }
 
 .viewer-fallback-stage {
@@ -1693,6 +1847,258 @@ code {
   margin-bottom: 1rem;
 }
 
+.scene-workspace-header {
+  position: sticky;
+  z-index: 12;
+  top: 0;
+  min-height: 2.55rem;
+  justify-content: flex-start;
+  gap: 0.55rem;
+  padding: 0.28rem 0.45rem;
+}
+
+.scene-workspace-header > strong {
+  flex: 0 0 auto;
+  color: #dbe8ee;
+  font-size: 0.78rem;
+}
+
+.scene-workspace-tabs {
+  display: flex;
+  min-width: 0;
+  gap: 0.12rem;
+  overflow-x: auto;
+}
+
+.scene-workspace-tabs button {
+  flex: 0 0 auto;
+  padding: 0.34rem 0.48rem;
+  border-color: transparent;
+  color: #8da4af;
+  background: transparent;
+  font-size: 0.68rem;
+}
+
+.scene-workspace-tabs button.active {
+  border-color: #3a6573;
+  color: #e3f2f6;
+  background: #16343f;
+}
+
+.scene-selection-lock {
+  flex: 0 0 auto;
+  margin-left: auto;
+  font-size: 0.68rem;
+  white-space: nowrap;
+}
+
+.scene-hierarchy {
+  display: grid;
+  gap: 0.55rem;
+  padding: 0.75rem;
+  border-bottom: 1px solid #29404d;
+}
+
+.scene-hierarchy-count {
+  color: #87a5b3;
+  font-size: 0.72rem;
+}
+
+.scene-hierarchy details {
+  border: 1px solid #274653;
+  border-radius: 0.45rem;
+  background: #091923;
+}
+
+.scene-hierarchy summary {
+  padding: 0.5rem 0.65rem;
+  color: #c5d7df;
+  cursor: pointer;
+  font-size: 0.78rem;
+  font-weight: 650;
+}
+
+.scene-hierarchy-items {
+  display: grid;
+  max-height: 13rem;
+  overflow: auto;
+  border-top: 1px solid #274653;
+}
+
+.scene-hierarchy-item {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto auto;
+  align-items: center;
+  border-bottom: 1px solid #1d3540;
+}
+
+.scene-hierarchy-item > label {
+  display: grid;
+  justify-items: center;
+  gap: 0.1rem;
+  padding: 0.25rem 0.5rem;
+  color: #7898a7;
+  font-size: 0.62rem;
+}
+
+.scene-hierarchy-items button,
+.scene-hierarchy-static > span {
+  display: grid;
+  gap: 0.12rem;
+  min-width: 0;
+  padding: 0.48rem 0.65rem;
+  border: 0;
+  border-bottom: 0;
+  border-radius: 0;
+  background: transparent;
+  text-align: left;
+}
+
+.scene-hierarchy-static > button:disabled {
+  cursor: not-allowed;
+  opacity: 0.55;
+}
+
+.scene-hierarchy-items button:hover,
+.scene-hierarchy-items button.selected {
+  background: #12313e;
+}
+
+.scene-hierarchy-items strong {
+  overflow: hidden;
+  color: #d7e7ed;
+  font-size: 0.76rem;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.scene-hierarchy-items span,
+.scene-hierarchy-items small {
+  color: #7898a7;
+  font-size: 0.68rem;
+}
+
+.scene-attach-controls {
+  display: grid;
+  gap: 0.5rem;
+  padding: 0.65rem;
+  border: 1px solid #2a4854;
+  border-radius: 0.5rem;
+  background: #091923;
+}
+
+.scene-mesh-browser {
+  display: grid;
+  gap: 0.4rem;
+  max-height: 13rem;
+  padding: 0.45rem;
+  overflow: hidden;
+  border: 1px solid #294a58;
+  border-radius: 0.45rem;
+  background: #07151e;
+}
+
+.scene-mesh-browser-path {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr);
+  align-items: center;
+  gap: 0.4rem;
+}
+
+.scene-mesh-browser-path code {
+  overflow: hidden;
+  color: #88a8b5;
+  font-size: 0.67rem;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.scene-mesh-browser-entries {
+  display: grid;
+  min-height: 0;
+  overflow: auto;
+}
+
+.scene-mesh-browser-entries button {
+  display: grid;
+  grid-template-columns: 2.8rem minmax(0, 1fr);
+  gap: 0.35rem;
+  padding: 0.38rem 0.45rem;
+  border: 0;
+  border-bottom: 1px solid #1d3540;
+  border-radius: 0;
+  background: transparent;
+  text-align: left;
+}
+
+.scene-mesh-browser-entries span {
+  color: #66c7df;
+  font-size: 0.62rem;
+}
+
+.scene-mesh-browser-entries strong {
+  overflow: hidden;
+  color: #cce0e7;
+  font-size: 0.72rem;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.scene-authoring-column[data-invalid='true'] input:invalid,
+.scene-authoring-column[data-invalid='true'] select:invalid {
+  border-color: #c8615d;
+  color: #ffaaa4;
+}
+
+.scene-attach-controls label {
+  display: grid;
+  gap: 0.3rem;
+}
+
+.scene-object-metadata {
+  border: 1px solid #294753;
+  border-radius: 0.45rem;
+  background: #091923;
+}
+
+.scene-object-metadata summary {
+  padding: 0.5rem 0.65rem;
+  color: #bcd2dc;
+  cursor: pointer;
+  font-size: 0.74rem;
+}
+
+.scene-object-metadata dl {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr);
+  gap: 0.25rem 0.65rem;
+  margin: 0;
+  padding: 0 0.65rem 0.65rem;
+  font-size: 0.7rem;
+}
+
+.scene-object-metadata dt {
+  color: #7898a7;
+}
+
+.scene-object-metadata dd {
+  min-width: 0;
+  margin: 0;
+  color: #c7d8df;
+  overflow-wrap: anywhere;
+}
+
+.scene-object-metadata pre {
+  max-height: 10rem;
+  margin: 0;
+  padding: 0.65rem;
+  overflow: auto;
+  border-top: 1px solid #294753;
+  color: #9eb8c4;
+  font-size: 0.65rem;
+  white-space: pre-wrap;
+}
+
 .scene-authoring-grid {
   display: grid;
   grid-template-columns: repeat(2, minmax(0, 1fr));
@@ -1789,9 +2195,54 @@ code {
 }
 
 .source-occurrence-panel {
-  grid-template-columns: minmax(12rem, 0.5fr) minmax(15rem, 0.8fr) minmax(18rem, 1.4fr);
-  align-items: center;
+  grid-template-columns: minmax(0, 1fr);
+  align-content: start;
   border-top: 1px solid #203542;
+}
+
+.runtime-source-list {
+  display: grid;
+  gap: 0.45rem;
+  min-width: 0;
+}
+
+.runtime-source-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 0.3rem 0.7rem;
+  padding: 0.5rem 0.6rem;
+  border: 1px solid #294653;
+  border-radius: 0.4rem;
+  background: #081720;
+}
+
+.runtime-source-row > div {
+  display: grid;
+  min-width: 0;
+  gap: 0.12rem;
+}
+
+.runtime-source-row > div:last-of-type {
+  justify-items: end;
+}
+
+.runtime-source-row strong,
+.runtime-source-row span {
+  overflow: hidden;
+  color: #8fa8b5;
+  font-size: 0.68rem;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.runtime-source-row strong {
+  color: #d8e7ed;
+  font-size: 0.74rem;
+}
+
+.runtime-source-row > .scene-commit-error {
+  grid-column: 1 / -1;
+  white-space: normal;
 }
 
 .source-occurrence-facts,
@@ -3440,14 +3891,6 @@ code {
     grid-template-columns: minmax(10rem, 0.7fr) minmax(0, 1.3fr);
   }
 
-  .source-occurrence-panel {
-    grid-template-columns: minmax(12rem, 0.7fr) minmax(16rem, 1fr);
-  }
-
-  .source-occurrence-panel .scene-contract-note {
-    grid-column: 1 / -1;
-  }
-
   .program-properties {
     grid-column: 1 / -1;
     border-top: 1px solid #203542;
@@ -3522,18 +3965,13 @@ code {
   .program-runtime-grid,
   .program-authoring-grid,
   .program-declaration-columns,
-  .scene-authoring-grid,
-  .source-occurrence-panel {
+  .scene-authoring-grid {
     grid-template-columns: 1fr;
   }
 
   .scene-authoring-grid > .scene-authoring-column:first-child {
     border-right: 0;
     border-bottom: 1px solid #203542;
-  }
-
-  .source-occurrence-panel .scene-contract-note {
-    grid-column: auto;
   }
 
   .scene-pose-grid,
@@ -3876,14 +4314,10 @@ code {
 
 .viewer-slot > .viewer-panel .viewer-header {
   flex: 0 0 auto;
-  align-items: flex-start;
-  flex-direction: column;
-  gap: 0.45rem;
-  padding: 0.65rem 1rem;
-}
-
-.viewer-slot > .viewer-panel .viewer-controls {
-  width: 100%;
+  align-items: center;
+  flex-direction: row;
+  gap: 0.5rem;
+  padding: 0.32rem 0.55rem;
 }
 
 .viewer-slot > .viewer-panel .viewer-stage,

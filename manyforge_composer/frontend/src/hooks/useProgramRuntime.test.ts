@@ -12,6 +12,7 @@ import type { ComposerHeadlessState } from '../types/headless';
 import {
   buildProgramResetRequest,
   buildProgramStartRequest,
+  programRuntimeWakeKey,
   retainedScenarioSelection,
   scenarioSelectionAfterRequest,
 } from './useProgramRuntime';
@@ -71,6 +72,50 @@ const catalog = {
 } as ScenarioCatalogResponse;
 
 describe('Program runtime idle selection', () => {
+  it('uses semantic owner revisions instead of a fixed browser poll', () => {
+    const source = readFileSync(new URL('./useProgramRuntime.ts', import.meta.url), 'utf8');
+    expect(source).not.toContain('setInterval');
+    const snapshot = {
+      receiverEpoch: 'receiver.1',
+      runtime: {
+        sections: {
+          manager: { sourceOwnerEpoch: 'manager.1', sourceGeneration: 4 },
+        },
+      },
+      authoringAdmission: { admissionGeneration: 7 },
+      programCycle: {
+        programRunnerOwnerEpoch: 'runner.1',
+        cycleGeneration: 2,
+        state: 'idle_after_reset',
+      },
+      draftIdentity: { draftId: 'draft-1', draftRevision: 5 },
+    } as ComposerHeadlessState;
+    expect(programRuntimeWakeKey(snapshot)).toContain(
+      'manager.1:no-retained-bundle:no-graph-revision:7',
+    );
+    expect(programRuntimeWakeKey({
+      ...snapshot,
+      runtime: {
+        ...snapshot.runtime,
+        sections: {
+          ...snapshot.runtime.sections,
+          manager: { ...snapshot.runtime.sections.manager, sourceGeneration: 99 },
+        },
+      },
+    })).toBe(programRuntimeWakeKey(snapshot));
+    expect(programRuntimeWakeKey({
+      ...snapshot,
+      draftIdentity: { draftId: 'draft-1', draftRevision: 6 },
+    })).toBe(programRuntimeWakeKey(snapshot));
+    expect(programRuntimeWakeKey({
+      ...snapshot,
+      authoringAdmission: {
+        ...snapshot.authoringAdmission,
+        admissionGeneration: 8,
+      },
+    })).not.toBe(programRuntimeWakeKey(snapshot));
+  });
+
   it('does not derive operator selection from the catalog or Applied projection', () => {
     expect(retainedScenarioSelection(null, catalog)).toBeNull();
 
