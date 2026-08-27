@@ -49,8 +49,48 @@ describe('headless Composer presentation adapters', () => {
 
     expect(view.readiness).toBe('degraded');
     expect(view.profileLabel).toBe('H0 projection');
-    expect(view.userMessage).toContain('execution-owner readiness separately');
+    expect(view.components).toContainEqual(expect.objectContaining({
+      id: 'execution_owner',
+      status: 'warning',
+    }));
     expect(view.capabilities).not.toContain('robot ready');
+  });
+
+  it('reports ready only when runtime and addressed execution-owner projections are present', () => {
+    const runtime: HeadlessRuntimeSnapshot = {
+      schemaVersion: 'manyforge.headless_runtime_snapshot.v1',
+      complete: true,
+      projectionGeneration: 2,
+      projectionOwnerEpoch: 'projection-epoch',
+      projectionOwnerId: 'headless-api',
+      reasons: [],
+      unavailableSections: [],
+      sections: {
+        manager: source(),
+        logicalScene: source(),
+        sceneRuntime: source(),
+      },
+    };
+
+    const ready = runtimeStatusView(runtime, {
+      unacknowledged: 0,
+      activeAcknowledged: 0,
+      programCycleState: 'idle_after_reset',
+      executionOwnerAvailable: true,
+    });
+    const terminal = runtimeStatusView(runtime, {
+      unacknowledged: 0,
+      activeAcknowledged: 0,
+      programCycleState: 'terminal_awaiting_reset',
+      executionOwnerAvailable: true,
+    });
+
+    expect(ready.readiness).toBe('ready');
+    expect(terminal.readiness).toBe('degraded');
+    expect(terminal.components).toContainEqual(expect.objectContaining({
+      id: 'program_cycle',
+      status: 'warning',
+    }));
   });
 
   it('maps only the four-state owner record into alarm presentation', () => {

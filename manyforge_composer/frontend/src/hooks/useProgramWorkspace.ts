@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useReducer, useRef } from 'react';
+import { useCallback, useEffect, useMemo, useReducer, useRef } from 'react';
 
 import { api } from '../api/client';
 import { errorMessage } from '../state/structuralResource';
@@ -100,6 +100,7 @@ export function useProgramWorkspace(snapshot: ComposerHeadlessState | null = nul
   const mounted = useRef(true);
   const workspaceRead = useRef<Promise<ProgramWorkspaceResponse> | null>(null);
   const workspaceReadGeneration = useRef<number | null>(null);
+  const initialReadStarted = useRef(false);
   const requestedSnapshotIdentity = useRef<string | null>(null);
   const requestOwnerEpoch = useRef(browserStableIdentity(
     'manyforge.composer.request_owner_epoch',
@@ -191,7 +192,10 @@ export function useProgramWorkspace(snapshot: ComposerHeadlessState | null = nul
 
   useEffect(() => {
     mounted.current = true;
-    void refresh();
+    if (!initialReadStarted.current) {
+      initialReadStarted.current = true;
+      void refresh();
+    }
     return () => {
       mounted.current = false;
     };
@@ -374,8 +378,11 @@ export function useProgramWorkspace(snapshot: ComposerHeadlessState | null = nul
       operator_stop_policy: operatorStopPolicy,
     });
   }, [mutate]);
+  const clearFeedback = useCallback(() => {
+    dispatch({ type: 'clear_feedback' });
+  }, []);
 
-  return {
+  return useMemo(() => ({
     state,
     mutationAvailable,
     mutationUnavailableReason,
@@ -391,8 +398,25 @@ export function useProgramWorkspace(snapshot: ComposerHeadlessState | null = nul
     revert,
     loadScenario,
     updateNodePolicies,
-    clearFeedback: () => dispatch({ type: 'clear_feedback' }),
-  };
+    clearFeedback,
+  }), [
+    admissionObserved,
+    apply,
+    clearFeedback,
+    discard,
+    loadScenario,
+    mutate,
+    mutationAvailable,
+    mutationUnavailableReason,
+    newDraft,
+    openDraft,
+    refresh,
+    revert,
+    save,
+    saveAs,
+    state,
+    updateNodePolicies,
+  ]);
 }
 
 export type ProgramWorkspaceController = ReturnType<typeof useProgramWorkspace>;

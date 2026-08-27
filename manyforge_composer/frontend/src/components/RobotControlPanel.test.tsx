@@ -93,6 +93,11 @@ const controller = vi.hoisted(() => ({
     operation: null,
     error: null,
   },
+  controlPending: null,
+  runtimeScaleStatus: null,
+  runtimeScaleDraft: 1,
+  runtimeScalePending: false,
+  runtimeScaleError: null,
   selectMode: vi.fn(),
   editJoint: vi.fn(),
   editPose: vi.fn(),
@@ -100,6 +105,9 @@ const controller = vi.hoisted(() => ({
   approve: vi.fn(),
   revert: vi.fn(),
   stop: vi.fn(),
+  pause: vi.fn(),
+  resume: vi.fn(),
+  setRuntimeScale: vi.fn(),
   retry: vi.fn(),
 }));
 

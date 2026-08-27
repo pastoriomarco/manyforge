@@ -53,7 +53,7 @@ def _parser() -> argparse.ArgumentParser:
     start.add_argument("--expected-head-tree")
     start.add_argument("--readiness-timeout-s", type=float, default=60.0)
     start.add_argument("--poll-interval-s", type=float, default=0.25)
-    start.add_argument("--reconciliation-period-ms", type=int, default=20)
+    start.add_argument("--reconciliation-period-ms", type=int, default=500)
     start.add_argument("--manager-timeout-s", type=float, default=60.0)
     start.add_argument("--isaac-executable", type=Path)
     start.add_argument("--world-path", type=Path)

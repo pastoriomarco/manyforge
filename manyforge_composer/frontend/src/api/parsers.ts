@@ -135,6 +135,7 @@ import type {
   ObservedMotionTarget,
   OperationAcceptance,
   OperationObservation,
+  OperationRuntimeScaleStatus,
   OperationStateName,
   ResourceSourceKind,
   SceneRevisionValue,
@@ -5936,5 +5937,87 @@ export function parseOperationObservation(value: unknown): OperationObservation 
         'operationObservation.operation.active_stop_generation',
       ),
     terminalError,
+  };
+}
+
+const RUNTIME_SCALE_STATES = new Set([
+  'pending',
+  'applied',
+  'rejected',
+  'failed',
+]);
+
+export function parseOperationRuntimeScaleStatus(
+  value: unknown,
+): OperationRuntimeScaleStatus {
+  const envelope = objectAt(value, 'operationRuntimeScale');
+  if (
+    booleanAt(envelope.ok, 'operationRuntimeScale.ok') !== true
+    || stringAt(envelope.command, 'operationRuntimeScale.command') !== 'get_runtime_scale'
+  ) {
+    return fail('operationRuntimeScale', 'a successful runtime-scale response');
+  }
+  const status = objectAt(
+    envelope.runtime_scale,
+    'operationRuntimeScale.runtime_scale',
+  );
+  const operationRevision = integerAt(
+    status.operation_revision,
+    'operationRuntimeScale.runtime_scale.operation_revision',
+  );
+  const runtimeScaleGeneration = integerAt(
+    status.runtime_scale_generation,
+    'operationRuntimeScale.runtime_scale.runtime_scale_generation',
+  );
+  const requestedScale = numberAt(
+    status.requested_scale,
+    'operationRuntimeScale.runtime_scale.requested_scale',
+  );
+  const effectiveScale = numberAt(
+    status.effective_scale,
+    'operationRuntimeScale.runtime_scale.effective_scale',
+  );
+  const state = stringAt(
+    status.state,
+    'operationRuntimeScale.runtime_scale.state',
+  );
+  const participants = arrayAt(
+    status.participants,
+    'operationRuntimeScale.runtime_scale.participants',
+  );
+  if (operationRevision < 1) {
+    return fail('operationRuntimeScale.runtime_scale.operation_revision', 'positive');
+  }
+  if (runtimeScaleGeneration < 0) {
+    return fail('operationRuntimeScale.runtime_scale.runtime_scale_generation', 'nonnegative');
+  }
+  if (
+    requestedScale < 0 || requestedScale > 1
+    || effectiveScale < 0 || effectiveScale > 1
+  ) {
+    return fail('operationRuntimeScale.runtime_scale', 'bounded to scales within [0, 1]');
+  }
+  if (!RUNTIME_SCALE_STATES.has(state)) {
+    return fail('operationRuntimeScale.runtime_scale.state', 'a known runtime-scale state');
+  }
+  return {
+    operationId: stringAt(
+      status.operation_id,
+      'operationRuntimeScale.runtime_scale.operation_id',
+    ),
+    operationRevision,
+    runtimeScaleGeneration,
+    requestedScale,
+    effectiveScale,
+    state: state as OperationRuntimeScaleStatus['state'],
+    supported: participants.length > 0 && participants.every((participant, index) => (
+      booleanAt(
+        objectAt(
+          participant,
+          `operationRuntimeScale.runtime_scale.participants[${index}]`,
+        ).supported,
+        `operationRuntimeScale.runtime_scale.participants[${index}].supported`,
+      )
+    )),
   };
 }

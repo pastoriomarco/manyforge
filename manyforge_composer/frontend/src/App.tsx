@@ -3,17 +3,15 @@ import type { CSSProperties } from 'react';
 
 import { ApiError, api } from './api/client';
 import { AssistantOverlay } from './components/AssistantOverlay';
-import { CCLCPanel } from './components/CCLCPanel';
 import { DeploymentCompositionPanel } from './components/DeploymentCompositionPanel';
 import {
   HeadlessRuntimeSurfaces,
   runtimeStatusView,
 } from './components/HeadlessRuntimeSurfaces';
 import { ProgramDocumentControls } from './components/ProgramDocumentControls';
+import { OverlayPanel } from './components/OverlayPanel';
 import { PaneDivider } from './components/PaneDivider';
-import { ProgramRuntimePanel } from './components/ProgramRuntimePanel';
 import { ProgramWorkspace } from './components/ProgramWorkspace';
-import { RobotControlPanelView } from './components/RobotControlPanel';
 import { RuntimeStatusOverlay } from './components/RuntimeStatusOverlay';
 import { SceneAuthoringWorkspace } from './components/SceneAuthoringWorkspace';
 import {
@@ -47,7 +45,7 @@ export default function App() {
     typeof window === 'undefined' ? 1440 : window.innerWidth
   ));
   const [sceneEditorTarget, setSceneEditorTarget] = useState<HTMLElement | null>(null);
-  const [runtimeDetailsOpen, setRuntimeDetailsOpen] = useState(false);
+  const [globalPanel, setGlobalPanel] = useState<'runtime' | 'assistant' | null>(null);
   const [programInvalidEdit, setProgramInvalidEdit] = useState(false);
   const [programSettingsRequest, setProgramSettingsRequest] = useState(0);
   const [programRequirementCreated, setProgramRequirementCreated] = useState<{
@@ -56,6 +54,8 @@ export default function App() {
     kind: 'component_role' | 'target_role';
   } | null>(null);
   const workbench = useRef<HTMLDivElement>(null);
+  const runtimeButton = useRef<HTMLButtonElement>(null);
+  const assistantButton = useRef<HTMLButtonElement>(null);
   const [health, retryHealth] = useStructuralResource(api.health.get, {
     failureMessage: 'Could not read the Composer structural boundary.',
   });
@@ -91,8 +91,16 @@ export default function App() {
   );
   const robotControl = useRobotControl(headlessEnabled);
   const runtimeView = useMemo(
-    () => headlessSnapshot === null ? null : runtimeStatusView(headlessSnapshot.runtime),
-    [headlessSnapshot],
+    () => headlessSnapshot === null ? null : runtimeStatusView(
+      headlessSnapshot.runtime,
+      {
+        unacknowledged: headlessSnapshot.alarms.unacknowledgedCount,
+        activeAcknowledged: headlessSnapshot.alarms.activeAcknowledgedCount,
+        programCycleState: headlessSnapshot.programCycle.state,
+        executionOwnerAvailable: robotControl.state.status !== null,
+      },
+    ),
+    [headlessSnapshot, robotControl.state.status],
   );
   const viewerWidthMax = Math.max(
     VIEWER_WIDTH_MIN,
@@ -118,12 +126,7 @@ export default function App() {
     setViewerWidth((current) => clamp(current, viewerWidthMin, viewerWidthMax));
   }, [viewerWidthMax, viewerWidthMin]);
   const openRuntimeDetails = useCallback(() => {
-    setRuntimeDetailsOpen(true);
-    window.requestAnimationFrame(() => {
-      document.getElementById('runtime-observability')?.scrollIntoView({
-        block: 'nearest',
-      });
-    });
+    setGlobalPanel('runtime');
   }, []);
 
   const connectedProjection = headlessEnabled
@@ -192,17 +195,43 @@ export default function App() {
             id,
           }))}
         />
-        <RuntimeStatusOverlay
-          status={runtimeView}
-          backendConnected={connectedProjection}
-          error={headlessState.error}
-          connectionLabel={connectionLabel}
-          connectionDetail={connectionDetail}
-          unacknowledgedAlarms={headlessSnapshot?.alarms.unacknowledgedCount ?? 0}
-          activeAcknowledgedAlarms={headlessSnapshot?.alarms.activeAcknowledgedCount ?? 0}
-          onRetry={retryHealth}
-          onOpenDetails={openRuntimeDetails}
-        />
+        <div className="global-surface-launchers" aria-label="Application tools">
+          <button
+            ref={runtimeButton}
+            type="button"
+            aria-haspopup="dialog"
+            aria-expanded={globalPanel === 'runtime'}
+            onClick={() => setGlobalPanel('runtime')}
+          >Runtime / history</button>
+          <button
+            ref={assistantButton}
+            type="button"
+            aria-haspopup="dialog"
+            aria-expanded={globalPanel === 'assistant'}
+            disabled={!assistantEnabled}
+            title={assistantEnabled ? 'Open the AI assistant.' : 'The assistant bridge is unavailable.'}
+            onClick={() => setGlobalPanel('assistant')}
+          >AI</button>
+          <RuntimeStatusOverlay
+            status={runtimeView}
+            backendConnected={connectedProjection}
+            error={headlessState.error}
+            connectionLabel={connectionLabel}
+            connectionDetail={connectionDetail}
+            unacknowledgedAlarms={headlessSnapshot?.alarms.unacknowledgedCount ?? 0}
+            activeAcknowledgedAlarms={headlessSnapshot?.alarms.activeAcknowledgedCount ?? 0}
+            contextFacts={programRuntime.state.currentScenario?.currentScenario === null
+              || programRuntime.state.currentScenario === null
+              ? []
+              : [
+                  `Scenario ${programRuntime.state.currentScenario.currentScenario.scenarioId}`,
+                  `Deployment ${programRuntime.state.currentScenario.currentScenario.deploymentRevision}`,
+                  `Program ${programRuntime.state.currentScenario.currentScenario.programRevision}`,
+                ]}
+            onRetry={retryHealth}
+            onOpenDetails={openRuntimeDetails}
+          />
+        </div>
       </header>
 
       <div
@@ -258,51 +287,42 @@ export default function App() {
                 onRetryManifest={retryManifest}
                 onRetrySourceModel={retrySourceModel}
                 programController={programController}
+                programRuntime={programRuntime}
                 robotControl={robotControl}
+                runtimeEnabled={headlessEnabled}
                 sourceModel={sourceModel}
                 viewerActive
               />
             </div>
-            <div className="live-controls-scroll">
-              <ProgramRuntimePanel
-                enabled={headlessEnabled}
-                controller={programRuntime}
-              />
-              <details className="workbench-disclosure">
-                <summary>Robot control</summary>
-                <RobotControlPanelView
-                  enabled={headlessEnabled}
-                  controller={robotControl}
-                />
-              </details>
-              <details className="workbench-disclosure">
-                <summary>Component lifecycle / CCLC</summary>
-                <CCLCPanel enabled={headlessEnabled} />
-              </details>
-              <details
-                id="runtime-observability"
-                className="workbench-disclosure"
-                open={runtimeDetailsOpen}
-                onToggle={(event) => setRuntimeDetailsOpen(event.currentTarget.open)}
-              >
-                <summary>Runtime, alarms, and history</summary>
-                <HeadlessRuntimeSurfaces
-                  enabled={headlessEnabled}
-                  headlessStateSource={headlessStateSource}
-                />
-              </details>
-              <details className="workbench-disclosure">
-                <summary>Assistant</summary>
-                <AssistantOverlay
-                  enabled={assistantEnabled}
-                  headlessConnected={headlessEnabled}
-                  programController={programController}
-                />
-              </details>
-            </div>
           </div>
         </aside>
       </div>
+      <OverlayPanel
+        open={globalPanel === 'runtime'}
+        title="Runtime, alarms, and history"
+        titleId="runtime-observability-title"
+        kind="status"
+        onClose={() => setGlobalPanel(null)}
+        returnFocusRef={runtimeButton}
+      >
+        <HeadlessRuntimeSurfaces
+          enabled={headlessEnabled}
+          headlessStateSource={headlessStateSource}
+        />
+      </OverlayPanel>
+      <OverlayPanel
+        open={globalPanel === 'assistant'}
+        title="AI assistant"
+        titleId="assistant-overlay-title"
+        onClose={() => setGlobalPanel(null)}
+        returnFocusRef={assistantButton}
+      >
+        <AssistantOverlay
+          enabled={assistantEnabled}
+          headlessConnected={headlessEnabled}
+          programController={programController}
+        />
+      </OverlayPanel>
     </main>
   );
 }

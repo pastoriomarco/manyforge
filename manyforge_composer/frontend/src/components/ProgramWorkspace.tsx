@@ -359,6 +359,28 @@ export function ProgramWorkspace({
     setInspectorWidth((current) => clamp(current, PROGRAM_INSPECTOR_MIN, inspectorWidthMax));
   }, [inspectorWidthMax]);
 
+  const canvasNotices = useMemo(() => {
+    const statusNotices: ProgramNotice[] = [];
+    if (runtime.active) {
+      statusNotices.push({
+        id: 'program-runtime-active',
+        key: 'program-runtime-active',
+        kind: 'info',
+        message: 'Run active. Draft inspection remains available; authoring waits for Idle.',
+        dismissible: false,
+      });
+    } else if (workspace !== null && !mutationAvailable) {
+      statusNotices.push({
+        id: 'program-authoring-unavailable',
+        key: 'program-authoring-unavailable',
+        kind: 'info',
+        message: `Authoring unavailable. ${mutationUnavailableReason}`,
+        dismissible: false,
+      });
+    }
+    return [...statusNotices, ...notices];
+  }, [mutationAvailable, mutationUnavailableReason, notices, runtime.active, workspace]);
+
   const gridClassName = [
     'program-authoring-grid',
     authoring ? '' : 'program-authoring-empty',
@@ -387,18 +409,6 @@ export function ProgramWorkspace({
             <button type="button" onClick={refresh}>Retry workspace</button>
           </div>
         )}
-        {runtime.active && (
-          <div className="program-workspace-notice" role="status">
-            <strong>Run active.</strong>
-            <span>Draft inspection remains available; backend-owned authoring actions stay disabled until Idle.</span>
-          </div>
-        )}
-        {!runtime.active && workspace !== null && !mutationAvailable && (
-          <div className="program-workspace-notice" role="status">
-            <strong>Authoring unavailable.</strong>
-            <span>{mutationUnavailableReason}</span>
-          </div>
-        )}
         {catalog.status !== 'ready' && (
           <div className="program-workspace-notice error-state" role="alert">
             <span><strong>Node catalog unavailable.</strong> {catalog.status === 'error' || catalog.status === 'absent' ? catalog.message : 'Loading…'}</span>
@@ -416,14 +426,6 @@ export function ProgramWorkspace({
             <span><strong>Catalog identity mismatch.</strong> Editing remains disabled.</span>
             <button type="button" onClick={onRetryCatalog}>Retry catalog</button>
             <button type="button" onClick={onRetryEnvironment}>Retry environment</button>
-          </div>
-        )}
-        {environmentAligned && nodeEnvironment && authoringUnavailable && (
-          <div className="program-workspace-notice error-state" role="alert">
-            <span>
-              <strong>Program mutations unavailable.</strong>{' '}
-              {nodeEnvironment.reasonCodes.join(', ') || 'Portable authoring is not available.'}
-            </span>
           </div>
         )}
       </div>
@@ -516,7 +518,7 @@ export function ProgramWorkspace({
             busy={authoringBusy}
             onSelect={selectNode}
             onMutate={mutate}
-            notices={notices}
+            notices={canvasNotices}
             onNotice={reportNotice}
             onDismissNotice={(id) => {
               const ownerFeedback = notices.find((notice) => notice.id === id)

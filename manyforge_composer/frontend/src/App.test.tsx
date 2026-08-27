@@ -14,7 +14,6 @@ describe('Composer shell continuity', () => {
     const workspace = markup.indexOf('aria-label="Program authoring workspace"');
     const commands = markup.indexOf('aria-label="3D viewer and live controls"');
     const viewer = markup.indexOf('id="viewer-title"');
-    const runtime = markup.indexOf('id="program-runtime-title"');
 
     expect(markup).toContain('aria-label="ManyForge Composer"');
     expect(markup).toContain('aria-label="Workbench sections"');
@@ -26,8 +25,10 @@ describe('Composer shell continuity', () => {
     expect(workspace).toBeGreaterThan(0);
     expect(commands).toBeGreaterThan(workspace);
     expect(viewer).toBeGreaterThan(commands);
-    expect(runtime).toBeGreaterThan(viewer);
-    expect(markup).toContain('Runtime, alarms, and history');
+    expect(markup).not.toContain('id="program-runtime-title"');
+    expect(markup).toContain('Runtime / history');
+    expect(markup).toContain('>AI</button>');
+    expect(markup).not.toContain('class="live-controls-scroll"');
     expect(markup).not.toContain('Catalog and artifact library');
     expect(markup).not.toContain('Artifacts · Program / Deployment');
     expect(markup).not.toContain('Headless runtime truth is connected');

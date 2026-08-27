@@ -194,6 +194,7 @@ export function useProgramRuntime(
   const refreshing = useRef(false);
   const refreshQueued = useRef(false);
   const catalogCache = useRef<ScenarioCatalogResponse | null>(null);
+  const requestedWakeKey = useRef<string | null>(null);
   const observedRunId = useRef<string | null>(null);
   const observedOwnerEpoch = useRef<string | null>(null);
   const callerEpoch = useRef(browserStableIdentity(
@@ -201,9 +202,10 @@ export function useProgramRuntime(
     'composer-program-owner',
   ));
   const wakeKey = programRuntimeWakeKey(snapshot);
+  const snapshotAvailable = snapshot !== null;
 
   const refresh = useCallback(async () => {
-    if (!enabled) return;
+    if (!enabled || !snapshotAvailable) return;
     if (refreshing.current) {
       refreshQueued.current = true;
       return;
@@ -329,7 +331,7 @@ export function useProgramRuntime(
         queueMicrotask(() => { void refresh(); });
       }
     }
-  }, [enabled]);
+  }, [enabled, snapshotAvailable]);
 
   useEffect(() => {
     mounted.current = true;
@@ -346,19 +348,26 @@ export function useProgramRuntime(
       observedRunId.current = null;
       observedOwnerEpoch.current = null;
       catalogCache.current = null;
+      requestedWakeKey.current = null;
       return;
     }
+    if (!snapshotAvailable) {
+      requestedWakeKey.current = null;
+      return;
+    }
+    if (requestedWakeKey.current === wakeKey) return;
+    requestedWakeKey.current = wakeKey;
     void refresh();
-  }, [enabled, refresh, wakeKey]);
+  }, [enabled, refresh, snapshotAvailable, wakeKey]);
 
   useEffect(() => {
-    if (!enabled) return undefined;
+    if (!enabled || !snapshotAvailable) return undefined;
     const onVisibility = () => {
       if (document.visibilityState === 'visible') void refresh();
     };
     document.addEventListener('visibilitychange', onVisibility);
     return () => document.removeEventListener('visibilitychange', onVisibility);
-  }, [enabled, refresh]);
+  }, [enabled, refresh, snapshotAvailable]);
 
   const selectScenario = useCallback((scenarioId: string) => {
     setState((current) => ({
@@ -463,10 +472,11 @@ export function useProgramRuntime(
     () => state.run !== null && ACTIVE_STATES.has(state.run.state),
     [state.run],
   );
+  const cycleState = snapshot?.programCycle?.state ?? null;
 
-  return {
+  return useMemo(() => ({
     state,
-    cycleState: snapshot?.programCycle?.state ?? null,
+    cycleState,
     active,
     refresh,
     selectScenario,
@@ -474,7 +484,17 @@ export function useProgramRuntime(
     run,
     stop,
     reset,
-  };
+  }), [
+    active,
+    clearScenarioSelection,
+    cycleState,
+    refresh,
+    reset,
+    run,
+    selectScenario,
+    state,
+    stop,
+  ]);
 }
 
 export type ProgramRuntimeController = ReturnType<typeof useProgramRuntime>;

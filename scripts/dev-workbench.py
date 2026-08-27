@@ -48,6 +48,8 @@ ALARM_CATALOG = (
     WORKSPACE / "manyforge_headless/resources/operator-alarm-catalog.v1.yaml"
 )
 FRONTEND_ROOT = WORKSPACE / "manyforge_composer/frontend"
+
+
 class WorkbenchError(RuntimeError):
     """One precise orchestration failure."""
 
@@ -503,7 +505,6 @@ class Workbench:
                 "--program-cycle-journal", str(STATE_ROOT / "program-cycle.sqlite3"),
                 "--authoring-transaction-journal", str(authoring_journal),
                 "--projection-root", str(paths["publications"]),
-                "--reconciliation-period-ms", "20",
                 "--canonical-empty-admission-filename",
                 self.metadata["admission_filename"],
                 "--program-runner-liveness-socket", str(runner_socket),

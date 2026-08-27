@@ -864,6 +864,12 @@ struct RetainedNativeRuntimeUnitAdapter::Impl final
     LivenessEndpoint &operator=(LivenessEndpoint &&) noexcept = default;
   };
 
+  struct AdmissionCacheEntry final {
+    RuntimeUnitConvergenceQueryDTO query;
+    std::shared_ptr<const RetainedBundle> bundle;
+    NativeExecutionRuntimeUnitAdmission admission;
+  };
+
   Impl(std::filesystem::path trusted_installed_target_root,
        std::filesystem::path trusted_package_root,
        std::filesystem::path manager_state_root,
@@ -976,9 +982,15 @@ struct RetainedNativeRuntimeUnitAdapter::Impl final
 
   [[nodiscard]] std::pair<std::shared_ptr<const RetainedBundle>,
                           NativeExecutionRuntimeUnitAdmission>
-  Admission(const RuntimeUnitConvergenceQueryDTO &query) const {
+  Admission(const RuntimeUnitConvergenceQueryDTO &query) {
     if (!query.valid()) {
       Fail("retained native adapter received an invalid convergence query");
+    }
+    std::lock_guard cache_lock(admission_mutex);
+    const auto runtime_id = query.plan.runtime_unit_id.value();
+    const auto cached = admission_cache.find(runtime_id);
+    if (cached != admission_cache.end() && cached->second.query == query) {
+      return {cached->second.bundle, cached->second.admission};
     }
     auto bundle =
         bundle_source.get_verified(query.candidate_retained_bundle_id);
@@ -992,7 +1004,11 @@ struct RetainedNativeRuntimeUnitAdapter::Impl final
       Fail("retained native adapter query has no qualified native product");
     }
     VerifyAdmissionMatchesQuery(*admission, *bundle, query);
-    return {std::move(bundle), std::move(*admission)};
+    auto [stored, inserted] = admission_cache.insert_or_assign(
+        runtime_id,
+        AdmissionCacheEntry{query, std::move(bundle), std::move(*admission)});
+    static_cast<void>(inserted);
+    return {stored->second.bundle, stored->second.admission};
   }
 
   [[nodiscard]] UniqueFd OpenInstalledTarget(
@@ -1835,9 +1851,11 @@ struct RetainedNativeRuntimeUnitAdapter::Impl final
   std::vector<std::string> launch_environment_contracts;
   std::string observer_instance_id;
   UniqueFd target_root_fd;
+  std::mutex admission_mutex;
   std::mutex mutex;
   std::mutex liveness_mutex;
   std::uint64_t observation_sequence{};
+  std::map<std::string, AdmissionCacheEntry> admission_cache;
   std::map<std::string, Child> children;
   std::map<std::string, LivenessEndpoint> liveness_endpoints;
 };

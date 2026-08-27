@@ -164,11 +164,17 @@ python3 -m manyforge_operator \
   --expected-head-commit "$MANYFORGE_COMMIT" \
   --expected-head-tree "$MANYFORGE_TREE" \
   --readiness-timeout-s 60 --poll-interval-s 0.25 \
-  --reconciliation-period-ms 20 --manager-timeout-s 60
+  --reconciliation-period-ms 500 --manager-timeout-s 60
 ```
 
 `--readiness-timeout-s`, `--poll-interval-s`, and
 `--reconciliation-period-ms` are shown with their current defaults.
+Manager verifies immutable bundle/product inputs once per Manager package
+generation and reuses those typed values. The 500 ms reconciliation loop
+therefore checks only changing process, liveness, readiness, graph and outcome
+facts; it does not repeatedly hash package files. An actual native launch still
+opens and digest-checks its protected executable. Replacing the package remains
+a complete Manager-stack restart, which drops the verified package view.
 The operator creates and validates one strict cell layout at
 `$STATE_ROOT/$INSTANCE_ID`. Durable Manager, execution, Program-selection,
 Program-runner, scene, historian, Composer-authoring, and operator state lives

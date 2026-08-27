@@ -10,6 +10,7 @@ import type {
   ScenarioCatalogEntry,
   ScenarioCatalogResponse,
 } from '../types/api';
+import { CCLCPanel } from './CCLCPanel';
 
 interface DeploymentCompositionPanelProps {
   enabled: boolean;
@@ -47,6 +48,19 @@ function sourceReady(readModel: DeploymentReadModel): boolean {
       && source.freshness === 'fresh'
       && source.knownGaps.length === 0,
   );
+}
+
+export function controllableComponentIds(graph: ManagerGraphProjection): string[] {
+  const value = graph.cellGraph.controllable_components;
+  if (!Array.isArray(value)) return [];
+  const identities = value.flatMap((candidate) => {
+    if (candidate === null || typeof candidate !== 'object' || Array.isArray(candidate)) {
+      return [];
+    }
+    const identity = candidate.controllable_component_id;
+    return typeof identity === 'string' && identity.trim() ? [identity] : [];
+  });
+  return [...new Set(identities)].sort();
 }
 
 function currentIdentityConsistent(readModel: DeploymentReadModel): boolean {
@@ -162,6 +176,10 @@ export function DeploymentCompositionPanel({
       (scenario) => scenario.scenarioId === selectedScenarioId,
     ),
     [readModel, selectedScenarioId],
+  );
+  const componentIds = useMemo(
+    () => readModel === null ? [] : controllableComponentIds(readModel.graph),
+    [readModel],
   );
   const validationError = readModel
     ? previewValidation(readModel, selectedScenario)
@@ -392,8 +410,27 @@ export function DeploymentCompositionPanel({
           </div>
           <p className="panel-intro">
             Program Run and manual control remain explicit owner-issued actions
-            in the execution panels below.
+            in the persistent viewer controls.
           </p>
+          <section className="deployment-component-section" aria-labelledby="deployment-components-title">
+            <header className="scene-authoring-heading">
+              <div>
+                <p className="eyebrow">Active Manager graph</p>
+                <h3 id="deployment-components-title">Components and lifecycle</h3>
+              </div>
+              <span>{componentIds.length} controllable</span>
+            </header>
+            {componentIds.length === 0 ? (
+              <p className="panel-intro">
+                The current graph publishes no controllable component identities.
+              </p>
+            ) : (
+              <div className="deployment-component-chips" aria-label="Current graph components">
+                {componentIds.map((identity) => <code key={identity}>{identity}</code>)}
+              </div>
+            )}
+            <CCLCPanel enabled={enabled} componentIds={componentIds} />
+          </section>
         </>
       )}
     </section>

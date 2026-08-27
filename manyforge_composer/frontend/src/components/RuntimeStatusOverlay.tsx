@@ -37,6 +37,7 @@ interface RuntimeStatusOverlayProps {
   connectionDetail: string;
   unacknowledgedAlarms?: number;
   activeAcknowledgedAlarms?: number;
+  contextFacts?: string[];
   onOpenDetails?: () => void;
   onRetry?: () => void;
 }
@@ -53,6 +54,7 @@ export function RuntimeStatusOverlay({
   connectionDetail,
   unacknowledgedAlarms = 0,
   activeAcknowledgedAlarms = 0,
+  contextFacts = [],
   onOpenDetails,
   onRetry,
 }: RuntimeStatusOverlayProps) {
@@ -107,6 +109,7 @@ export function RuntimeStatusOverlay({
               <span>{status.authorityLabel}</span>
               <span>{unacknowledgedAlarms} acknowledgement required</span>
               <span>{activeAcknowledgedAlarms} active acknowledged</span>
+              {contextFacts.map((fact) => <span key={fact}>{fact}</span>)}
             </div>
             <div className="runtime-capabilities">
               {status.capabilities.length === 0

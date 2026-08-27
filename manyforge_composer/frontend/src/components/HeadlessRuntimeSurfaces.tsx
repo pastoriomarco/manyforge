@@ -83,6 +83,15 @@ export function operatorAlarmView(alarm: OperatorAlarmRecord): OperatorAlarmView
 
 export function runtimeStatusView(
   runtime: HeadlessRuntimeSnapshot,
+  context: {
+    unacknowledged: number;
+    activeAcknowledged: number;
+    programCycleState?: string;
+    executionOwnerAvailable?: boolean;
+  } = {
+    unacknowledged: 0,
+    activeAcknowledged: 0,
+  },
 ): RuntimeStatusView {
   const components = Object.entries(runtime.sections).map(([id, section]) => ({
     id,
@@ -94,16 +103,51 @@ export function runtimeStatusView(
       ? section.knownGaps.join(', ')
       : `${section.freshness} source generation ${section.sourceGeneration ?? 'unknown'}`,
   }));
+  const alarmCount = context.unacknowledged + context.activeAcknowledged;
+  if (alarmCount > 0) {
+    components.push({
+      id: 'operator_alarms',
+      label: 'operator alarms',
+      status: context.unacknowledged > 0 ? 'fault' : 'warning',
+      detail: `${context.unacknowledged} acknowledgement required · ${context.activeAcknowledged} active acknowledged`,
+    });
+  }
+  if (context.programCycleState === 'terminal_awaiting_reset') {
+    components.push({
+      id: 'program_cycle',
+      label: 'Program cycle',
+      status: 'warning',
+      detail: 'terminal; Reset is required before the next Run',
+    });
+  }
+  components.push({
+    id: 'execution_owner',
+    label: 'Execution owner',
+    status: context.executionOwnerAvailable === true ? 'healthy' : 'warning',
+    detail: context.executionOwnerAvailable === true
+      ? 'current addressed execution contract available'
+      : 'execution readiness is not asserted by the H0 runtime projection',
+  });
+  const sourcesDegraded = components.some((component) => (
+    component.status !== 'healthy'
+  ));
+  const readiness = !runtime.complete
+    ? 'offline'
+    : sourcesDegraded ? 'degraded' : 'ready';
   return {
-    readiness: runtime.complete ? 'degraded' : 'offline',
-    summaryLabel: runtime.complete
-      ? 'Headless facts available'
-      : 'Headless sources incomplete',
+    readiness,
+    summaryLabel: readiness === 'ready'
+      ? 'Application surfaces ready'
+      : readiness === 'degraded'
+        ? 'Attention required'
+        : 'Headless sources incomplete',
     profileLabel: 'H0 projection',
     authorityLabel: 'source-owned facts',
-    userMessage: runtime.complete
-      ? 'Manager and scene facts are fresh. Robot Control verifies execution-owner readiness separately.'
-      : `Missing or stale sources: ${runtime.reasons.join(', ') || 'unknown'}.`,
+    userMessage: readiness === 'ready'
+      ? 'Current runtime and addressed execution-owner projections are available.'
+      : runtime.complete
+        ? 'One or more current backend, execution-owner, cycle, or alarm contributors requires attention.'
+        : `Missing or stale sources: ${runtime.reasons.join(', ') || 'unknown'}.`,
     capabilities: ['runtime observation', 'scene status', 'alarm/history'],
     components,
   };

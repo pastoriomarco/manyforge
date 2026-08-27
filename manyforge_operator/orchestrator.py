@@ -126,7 +126,7 @@ class NativeLauncherConfig:
     expected_head_tree: str | None = None
     readiness_timeout_seconds: float = DEFAULT_TIMEOUT_SECONDS
     poll_interval_seconds: float = DEFAULT_POLL_SECONDS
-    reconciliation_period_ms: int = 20
+    reconciliation_period_ms: int = 500
     manager_timeout_seconds: float = 60.0
 
     def __post_init__(self) -> None:
@@ -240,8 +240,8 @@ class NativeLauncherConfig:
             raise ValueError("readiness_timeout_seconds must be in (0, 300]")
         if not 0.01 <= self.poll_interval_seconds <= 5:
             raise ValueError("poll_interval_seconds must be in [0.01, 5]")
-        if not 1 <= self.reconciliation_period_ms <= 60_000:
-            raise ValueError("reconciliation_period_ms must be in [1, 60000]")
+        if not 10 <= self.reconciliation_period_ms <= 60_000:
+            raise ValueError("reconciliation_period_ms must be in [10, 60000]")
         if not 0 < self.manager_timeout_seconds <= 60.0:
             raise ValueError("manager_timeout_seconds must be in (0, 60]")
 

@@ -15,7 +15,10 @@ import { api } from '../api/client';
 import { useShellHeadlessState, useViewerHeadlessState } from '../hooks/useHeadlessState';
 import type { HeadlessStateSource } from '../hooks/useHeadlessState';
 import type { ProgramWorkspaceController } from '../hooks/useProgramWorkspace';
+import type { ProgramRuntimeController } from '../hooks/useProgramRuntime';
 import type { RobotControlController } from '../hooks/useRobotControl';
+import { ProgramTransportControls } from './ProgramRuntimePanel';
+import { RobotControlPanelView } from './RobotControlPanel';
 import {
   candidateTcpPoseInCell,
   livePoseFromProgramResource,
@@ -75,7 +78,9 @@ interface SceneAuthoringWorkspaceProps {
   onRetryManifest: () => void;
   onRetrySourceModel: () => void;
   programController: ProgramWorkspaceController;
+  programRuntime: ProgramRuntimeController;
   robotControl: RobotControlController;
+  runtimeEnabled: boolean;
   sourceModel: StructuralResourceState<SourceModelProjection>;
   viewerActive: boolean;
 }
@@ -1476,6 +1481,9 @@ const SceneViewerBridge = memo(function SceneViewerBridge({
   hiddenSelectionKeys,
   objectAxesSelectionKeys,
   motionPreview,
+  programRuntime,
+  robotControl,
+  runtimeEnabled,
 }: {
   active: boolean;
   source: HeadlessStateSource;
@@ -1523,6 +1531,9 @@ const SceneViewerBridge = memo(function SceneViewerBridge({
   hiddenSelectionKeys: ReadonlySet<string>;
   objectAxesSelectionKeys: ReadonlySet<string>;
   motionPreview: MotionPreviewReceipt | null;
+  programRuntime: ProgramRuntimeController;
+  robotControl: RobotControlController;
+  runtimeEnabled: boolean;
 }) {
   const headlessState = useViewerHeadlessState(source, active);
   const factsResult = useMemo(
@@ -1683,6 +1694,16 @@ const SceneViewerBridge = memo(function SceneViewerBridge({
           ? [object.scene_resource_id]
           : [];
       })}
+      robotControlSurface={(
+        <RobotControlPanelView enabled={runtimeEnabled} controller={robotControl} />
+      )}
+      transportControls={(
+        <ProgramTransportControls
+          enabled={runtimeEnabled}
+          program={programRuntime}
+          robot={robotControl}
+        />
+      )}
     />
     </Suspense>
   );
@@ -1696,7 +1717,9 @@ export function SceneAuthoringWorkspace({
   onRetryManifest,
   onRetrySourceModel,
   programController,
+  programRuntime,
   robotControl,
+  runtimeEnabled,
   sourceModel,
   viewerActive,
 }: SceneAuthoringWorkspaceProps) {
@@ -2087,6 +2110,9 @@ export function SceneAuthoringWorkspace({
       hiddenSelectionKeys={hiddenSelectionKeys}
       objectAxesSelectionKeys={objectAxesSelectionKeys}
       motionPreview={previewGhost}
+      programRuntime={programRuntime}
+      robotControl={robotControl}
+      runtimeEnabled={runtimeEnabled}
     />
   );
 

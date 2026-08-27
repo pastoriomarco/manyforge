@@ -274,3 +274,20 @@ export interface OperationObservation {
   activeStopGeneration: number | null;
   terminalError: string | null;
 }
+
+export type RuntimeScaleApplicationState =
+  | 'pending'
+  | 'applied'
+  | 'rejected'
+  | 'failed';
+
+/** Exact owner observation used to fence one operation-scoped scale update. */
+export interface OperationRuntimeScaleStatus {
+  operationId: string;
+  operationRevision: number;
+  runtimeScaleGeneration: number;
+  requestedScale: number;
+  effectiveScale: number;
+  state: RuntimeScaleApplicationState;
+  supported: boolean;
+}

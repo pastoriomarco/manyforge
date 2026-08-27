@@ -97,7 +97,6 @@ export function sameHeadlessProjection(
     )
     && current.alarms.ownerEpoch === candidate.alarms.ownerEpoch
     && current.alarms.generation === candidate.alarms.generation
-    && current.alarms.stateRevision === candidate.alarms.stateRevision
     && current.authoringAdmission.authoringAllowed
       === candidate.authoringAdmission.authoringAllowed
     && current.authoringAdmission.admissionGeneration

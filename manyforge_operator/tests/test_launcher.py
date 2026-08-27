@@ -70,6 +70,9 @@ def test_native_commands_retain_four_owner_entrypoints(tmp_path: Path):
     ]
     commands = [" ".join(spec.argv) for spec in specs]
     assert "--canonical-empty-admission-filename canonical-empty-admission.json" in commands[0]
+    assert specs[0].argv[
+        specs[0].argv.index("--reconciliation-period-ms") + 1
+    ] == "500"
     assert "--cell-id native" in commands[1]
     assert "--manager-timeout-s 60.0" in commands[1]
     assert "--execution-run-root" in specs[1].argv

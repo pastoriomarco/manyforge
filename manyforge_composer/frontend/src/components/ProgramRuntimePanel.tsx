@@ -1,4 +1,9 @@
+import { useRef, useState } from 'react';
+
 import type { ProgramRuntimeController } from '../hooks/useProgramRuntime';
+import type { RobotControlController } from '../hooks/useRobotControl';
+import { robotControlHasActiveOperation } from '../state/robotControl';
+import { OverlayPanel } from './OverlayPanel';
 
 
 interface ProgramRuntimePanelProps {
@@ -174,5 +179,158 @@ export function ProgramRuntimePanel({
         Stop implicitly and cannot change already-dispatched robot work.
       </p>
     </section>
+  );
+}
+
+/**
+ * Compact viewport transport. It renders only commands backed by the current
+ * owner contracts; unsupported velocity control stays visibly unavailable
+ * instead of being simulated in the browser.
+ */
+export function ProgramTransportControls({
+  enabled,
+  program,
+  robot,
+}: {
+  enabled: boolean;
+  program: ProgramRuntimeController;
+  robot: RobotControlController;
+}) {
+  const [detailsOpen, setDetailsOpen] = useState(false);
+  const detailsButton = useRef<HTMLButtonElement>(null);
+  const { state, cycleState } = program;
+  const motionActive = robotControlHasActiveOperation(robot.state);
+  const motionPaused = robot.state.operation?.state === 'paused';
+  const canPause = robot.state.operation?.state === 'executing';
+  const programActive = state.run?.state === 'running'
+    || state.run?.state === 'intervention_required';
+  const canRun = enabled
+    && state.runnerAvailable
+    && state.applied !== null
+    && state.pending === null
+    && cycleState === 'idle_after_reset';
+  const canReset = enabled
+    && state.pending === null
+    && cycleState === 'terminal_awaiting_reset';
+  const velocityAvailable = enabled
+    && robot.runtimeScaleStatus !== null
+    && robot.runtimeScaleStatus.supported
+    && (robot.state.operation?.state === 'executing'
+      || robot.state.operation?.state === 'paused');
+  const velocityReason = robot.runtimeScaleError
+    ?? (motionActive
+      ? 'The exact active operation does not currently advertise qualified runtime-scale control.'
+      : 'Runtime velocity is available only while an addressed motion operation is active.');
+  const fullStopReason = 'The current execution projection does not publish the cell Stop generation required for a safely fenced full-cell Stop.';
+
+  return (
+    <>
+      <div className="viewer-transport" aria-label="Program and motion controls">
+        <button
+          type="button"
+          disabled={!enabled || robot.controlPending !== null || (!canPause && !motionPaused)}
+          title={motionPaused
+            ? 'Resume the exact paused manual-control operation.'
+            : canPause
+              ? 'Pause the exact active manual-control operation.'
+              : 'Pause or Resume is available only for an owner-observed executing or paused operation.'}
+          onClick={() => { void (motionPaused ? robot.resume() : robot.pause()); }}
+        >
+          {robot.controlPending === 'pause'
+            ? 'Pausing…'
+            : robot.controlPending === 'resume'
+              ? 'Resuming…'
+              : motionPaused ? 'Resume' : 'Pause'}
+        </button>
+        <button
+          type="button"
+          className="transport-run"
+          disabled={!canRun}
+          title={canRun ? 'Run the exact Applied Program.' : 'Run requires an Applied Program and an idle, reset runner.'}
+          onClick={() => { void program.run(); }}
+        >
+          {state.pending === 'run' ? 'Starting…' : 'Run'}
+        </button>
+        <button
+          type="button"
+          className="danger-button"
+          disabled={!enabled || !motionActive || robot.state.phase === 'stopping'}
+          title={motionActive
+            ? 'Stop the exact active manual-control operation.'
+            : 'No addressed manual-control operation is active.'}
+          onClick={() => { void robot.stop(); }}
+        >
+          {robot.state.phase === 'stopping' ? 'Stopping…' : 'Stop motion'}
+        </button>
+        <button
+          type="button"
+          className="transport-stop-program"
+          disabled={!enabled || !programActive || state.pending !== null}
+          title={programActive
+            ? 'Stop Program execution. This is separate from stopping one manual-control operation.'
+            : 'No Program run is active.'}
+          onClick={() => { void program.stop(); }}
+        >
+          {state.pending === 'stop' ? 'Stopping…' : 'Stop Program'}
+        </button>
+        <button
+          type="button"
+          className={canReset ? 'transport-reset meaningful' : 'transport-reset'}
+          disabled={!canReset}
+          title={canReset ? 'Reset the completed Program cycle.' : 'Reset is available after a Program run reaches a terminal state.'}
+          onClick={() => { void program.reset(); }}
+        >
+          {state.pending === 'reset' ? 'Resetting…' : 'Reset'}
+        </button>
+        <span className="viewer-tool-separator" aria-hidden="true" />
+        <label className="transport-velocity" title={velocityAvailable ? 'Scale the exact active operation.' : velocityReason}>
+          <span>Velocity</span>
+          <input
+            type="range"
+            min="0"
+            max="1"
+            step="0.01"
+            value={robot.runtimeScaleDraft}
+            disabled={!velocityAvailable}
+            onChange={(event) => robot.setRuntimeScale(Number(event.target.value))}
+          />
+          <output>
+            {velocityAvailable
+              ? `${Math.round(robot.runtimeScaleDraft * 100)}%${robot.runtimeScalePending ? '…' : ''}`
+              : '—'}
+          </output>
+        </label>
+        <button
+          ref={detailsButton}
+          type="button"
+          className="icon-button"
+          aria-label="Program run details"
+          title="Program run details"
+          onClick={() => setDetailsOpen(true)}
+        >i</button>
+      </div>
+      <OverlayPanel
+        open={detailsOpen}
+        title="Program run details"
+        titleId="program-run-details-title"
+        kind="info"
+        onClose={() => setDetailsOpen(false)}
+        returnFocusRef={detailsButton}
+      >
+        <ProgramRuntimePanel enabled={enabled} controller={program} />
+        <p className="panel-intro transport-unavailable-reason">
+          Runtime velocity is operation-scoped. The slider keeps only the latest
+          pending value, re-reads the owner's applied value, and drops pending
+          input when Stop begins.
+          {!velocityAvailable && <> Currently unavailable: {velocityReason}</>}
+        </p>
+        <p className="panel-intro transport-unavailable-reason">
+          <button type="button" className="danger-button" disabled title={fullStopReason}>
+            Full-cell Stop unavailable
+          </button>
+          {' '}{fullStopReason}
+        </p>
+      </OverlayPanel>
+    </>
   );
 }

@@ -101,6 +101,11 @@ describe('Headless owner-frame admission', () => {
     const next = structuredClone(current);
     next.snapshotSequence += 1;
     expect(sameHeadlessProjection(current, next)).toBe(true);
+    next.alarms.stateRevision += 1;
+    expect(sameHeadlessProjection(current, next)).toBe(true);
+    next.alarms.generation += 1;
+    expect(sameHeadlessProjection(current, next)).toBe(false);
+    next.alarms.generation -= 1;
     next.draftIdentity.draftRevision += 1;
     expect(sameHeadlessProjection(current, next)).toBe(false);
   });

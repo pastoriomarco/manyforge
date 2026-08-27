@@ -17,6 +17,7 @@ type DraftTextInputProps = Omit<
   onCommit: (value: string) => void;
   validate?: (value: string) => string | null;
   onInvalidChange?: (message: string | null) => void;
+  shiftStepMultiplier?: number;
 };
 
 export function DraftTextInput({
@@ -24,6 +25,7 @@ export function DraftTextInput({
   onCommit,
   validate,
   onInvalidChange,
+  shiftStepMultiplier,
   onBlur,
   onFocus,
   onKeyDown,
@@ -74,6 +76,28 @@ export function DraftTextInput({
         onBlur?.(event);
       }}
       onKeyDown={(event: KeyboardEvent<HTMLInputElement>) => {
+        if (
+          shiftStepMultiplier !== undefined
+          && event.shiftKey
+          && (event.key === 'ArrowUp' || event.key === 'ArrowDown')
+          && props.type === 'number'
+        ) {
+          const current = Number(draft);
+          const baseStep = typeof props.step === 'number'
+            ? props.step
+            : Number(props.step ?? 1);
+          if (Number.isFinite(current) && Number.isFinite(baseStep)) {
+            const direction = event.key === 'ArrowUp' ? 1 : -1;
+            const minimum = props.min === undefined ? -Infinity : Number(props.min);
+            const maximum = props.max === undefined ? Infinity : Number(props.max);
+            setDraft(String(Math.min(maximum, Math.max(
+              minimum,
+              current + direction * baseStep * shiftStepMultiplier,
+            ))));
+            event.preventDefault();
+            return;
+          }
+        }
         if (event.key === 'Enter' || event.key === 'Tab') {
           if (validateDraft() !== null) {
             event.preventDefault();

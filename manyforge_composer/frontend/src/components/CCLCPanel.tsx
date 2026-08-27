@@ -1,12 +1,16 @@
+import { useEffect } from 'react';
+
 import type { CCLCController } from '../hooks/useCCLC';
 import { useCCLC } from '../hooks/useCCLC';
 
 export function CCLCPanelView({
   enabled,
   controller,
+  componentIds = controller.componentId ? [controller.componentId] : [],
 }: {
   enabled: boolean;
   controller: CCLCController;
+  componentIds?: string[];
 }) {
   const {
     componentId,
@@ -36,14 +40,17 @@ export function CCLCPanelView({
 
       <div className="inline-fields">
         <label>
-          Component ID
-          <input
+          Graph component
+          <select
             value={componentId}
-            maxLength={256}
-            disabled={!enabled || busy}
+            disabled={!enabled || busy || componentIds.length === 0}
             onChange={(event) => setComponentId(event.target.value)}
-            placeholder="lite6-arm"
-          />
+          >
+            {componentIds.length === 0 && <option value="">No controllable components</option>}
+            {componentIds.map((identity) => (
+              <option key={identity} value={identity}>{identity}</option>
+            ))}
+          </select>
         </label>
         <button type="button" disabled={!enabled || busy || !componentId.trim()} onClick={() => void refresh()}>
           Read current owner state
@@ -133,7 +140,28 @@ export function CCLCPanelView({
   );
 }
 
-export function CCLCPanel({ enabled }: { enabled: boolean }) {
+export function CCLCPanel({
+  enabled,
+  componentIds,
+}: {
+  enabled: boolean;
+  componentIds: string[];
+}) {
   const controller = useCCLC(enabled);
-  return <CCLCPanelView enabled={enabled} controller={controller} />;
+  const { componentId, setComponentId, refresh } = controller;
+  useEffect(() => {
+    const next = componentIds.includes(componentId) ? componentId : componentIds[0] ?? '';
+    if (next !== componentId) setComponentId(next);
+  }, [componentId, componentIds, setComponentId]);
+  useEffect(() => {
+    if (!enabled || !componentIds.includes(componentId)) return;
+    void refresh();
+  }, [componentId, componentIds, enabled, refresh]);
+  return (
+    <CCLCPanelView
+      enabled={enabled}
+      controller={controller}
+      componentIds={componentIds}
+    />
+  );
 }

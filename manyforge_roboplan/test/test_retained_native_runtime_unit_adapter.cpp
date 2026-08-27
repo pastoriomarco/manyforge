@@ -311,6 +311,46 @@ MakeAdapter(NativeFixture &fixture, const std::filesystem::path &target_root) {
       std::string(contract::kLaunchEnvironmentContract));
 }
 
+class CountingBundleSource final
+    : public deployment::IVerifiedRetainedBundleSource {
+public:
+  explicit CountingBundleSource(
+      const deployment::IVerifiedRetainedBundleSource& source)
+      : source_(source) {}
+
+  std::shared_ptr<const deployment::RetainedBundle> get_verified(
+      const core::RetainedBundleId& retained_bundle_id) const override {
+    ++reads_;
+    return source_.get_verified(retained_bundle_id);
+  }
+
+  [[nodiscard]] std::size_t reads() const noexcept { return reads_; }
+
+private:
+  const deployment::IVerifiedRetainedBundleSource& source_;
+  mutable std::size_t reads_{};
+};
+
+class CountingArtifactSource final
+    : public deployment::IVerifiedRetainedProductArtifactSource {
+public:
+  explicit CountingArtifactSource(
+      const deployment::IVerifiedRetainedProductArtifactSource& source)
+      : source_(source) {}
+
+  std::optional<deployment::VerifiedRetainedProductArtifact> get_verified(
+      const deployment::RetainedProductArtifactQuery& query) const override {
+    ++reads_;
+    return source_.get_verified(query);
+  }
+
+  [[nodiscard]] std::size_t reads() const noexcept { return reads_; }
+
+private:
+  const deployment::IVerifiedRetainedProductArtifactSource& source_;
+  mutable std::size_t reads_{};
+};
+
 [[nodiscard]] core::ActiveBundlePublicationReceiptDTO
 PublishActiveFixture(NativeFixture &fixture) {
   component_manager::SqliteActiveBundlePublicationStore store(
@@ -556,6 +596,32 @@ TEST(RetainedNativeRuntimeUnitAdapter,
           std::string(contract::kLaunchEnvironmentContract),
           fixture.execution_run_root.path() / "logical-scene.sqlite3")),
       std::runtime_error);
+}
+
+TEST(RetainedNativeRuntimeUnitAdapter,
+     ReusesOneVerifiedAdmissionForOneExactRuntimeQuery) {
+  NativeFixture fixture;
+  CountingBundleSource bundles(fixture.bundle_source);
+  CountingArtifactSource artifacts(fixture.artifact_source);
+  auto adapter = component_manager::RetainedNativeRuntimeUnitAdapter(
+      MANYFORGE_NATIVE_EXECUTION_TARGET_ROOT,
+      fixture.root / "retained-package", fixture.manager_state_root.path(),
+      fixture.manager_run_root.path(), fixture.execution_state_root.path(),
+      fixture.execution_run_root.path(), bundles, artifacts,
+      std::string(contract::kOperatingSystem),
+      std::string(contract::kLaunchEnvironmentContract));
+
+  EXPECT_EQ(adapter.ObserveProcess(*fixture.query).state(),
+            component_manager::ProcessPresenceState::kAbsent);
+  const auto bundle_reads = bundles.reads();
+  const auto artifact_reads = artifacts.reads();
+  EXPECT_GT(bundle_reads, 0U);
+  EXPECT_GT(artifact_reads, 0U);
+
+  EXPECT_EQ(adapter.ObserveProcess(*fixture.query).state(),
+            component_manager::ProcessPresenceState::kAbsent);
+  EXPECT_EQ(bundles.reads(), bundle_reads);
+  EXPECT_EQ(artifacts.reads(), artifact_reads);
 }
 
 TEST(RetainedNativeRuntimeUnitAdapter,

@@ -15,6 +15,7 @@ import {
   parseManagerStatusProjection,
   parseOperatorAlarmSnapshot,
   parseOperationObservation,
+  parseOperationRuntimeScaleStatus,
   parseMotionPreviewResponse,
   parseNodeEnvironmentResponse,
   parseLogicalSceneProjection,
@@ -1503,6 +1504,33 @@ describe('addressed Robot Control parsers', () => {
     const missing = structuredClone(response) as Record<string, unknown>;
     delete missing.resident;
     expect(() => parseOperationObservation(missing)).toThrow();
+  });
+
+  it('retains the exact owner runtime-scale fence and support state', () => {
+    const status = parseOperationRuntimeScaleStatus({
+      ok: true,
+      command: 'get_runtime_scale',
+      runtime_scale: {
+        operation_id: 'operation-1',
+        operation_revision: 5,
+        runtime_scale_generation: 2,
+        requested_scale: 0.5,
+        effective_scale: 0.45,
+        state: 'applied',
+        updated_at_ns: 123,
+        participants: [{ supported: true }],
+      },
+    });
+
+    expect(status).toMatchObject({
+      operationId: 'operation-1',
+      operationRevision: 5,
+      runtimeScaleGeneration: 2,
+      requestedScale: 0.5,
+      effectiveScale: 0.45,
+      state: 'applied',
+      supported: true,
+    });
   });
 
   it('accepts source-local limits and exactly one matching observation', () => {

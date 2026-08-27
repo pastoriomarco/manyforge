@@ -1,11 +1,16 @@
 import { readFileSync } from 'node:fs';
 
 import { renderToStaticMarkup } from 'react-dom/server';
+import * as THREE from 'three';
 import { describe, expect, it } from 'vitest';
 
 import {
   DEFAULT_WIREFRAME_VISIBLE,
+  VIEWER_CLICK_MAX_DURATION_MS,
+  frameableContentBounds,
+  framedCameraPresentation,
   supportsIndependentSceneScale,
+  viewerClickWithinDuration,
   ViewerFailureBoundary,
 } from './StructuralViewer';
 import type { LogicalSceneObject } from '../types/api';
@@ -84,6 +89,133 @@ describe('viewer failure isolation', () => {
     expect(source).toContain('<summary>Tools</summary>');
     expect(source).toContain('Measured-state overlay');
     expect(source).toContain('Model and source facts');
+    expect(source).toContain('manifest.data.links.length} links · {manifest.data.joints.length} joints');
+    expect(source).not.toContain('className="viewer-legend"');
+  });
+
+  it('keeps camera and transform commands in the compact viewer header', () => {
+    const css = readFileSync(new URL('../index.css', import.meta.url), 'utf8');
+    const source = readFileSync(
+      new URL('./StructuralViewer.tsx', import.meta.url),
+      'utf8',
+    );
+    const header = source.indexOf('className="panel-header viewer-header"');
+    const stage = source.indexOf('className="viewer-stage"', header);
+    const controls = source.indexOf('aria-label="Scene viewport controls"', header);
+    const options = source.indexOf('className="viewer-options"', header);
+
+    expect(header).toBeGreaterThan(0);
+    expect(controls).toBeLessThan(options);
+    expect(options).toBeLessThan(stage);
+    expect(source.indexOf('aria-label="Frame all visible content"', header)).toBeLessThan(stage);
+    expect(source.indexOf('aria-label="Frame selected object"', header)).toBeLessThan(stage);
+    expect(source.indexOf('aria-label="Reset camera"', header)).toBeLessThan(stage);
+    expect(css).toMatch(/\.viewer-header-controls\s*\{[^}]*flex:\s*1 1 auto/s);
+    expect(css).toMatch(/\.viewer-options\s*\{[^}]*margin-left:\s*auto/s);
+    expect(source).toContain('className="viewer-camera-icon"');
+  });
+
+  it('frames content without changing the current viewing direction', () => {
+    const box = new THREE.Box3(
+      new THREE.Vector3(9, -2, 1),
+      new THREE.Vector3(11, 4, 5),
+    );
+    const current = {
+      position: [5, -7, 8] as [number, number, number],
+      target: [1, 2, 3] as [number, number, number],
+    };
+    const framed = framedCameraPresentation(box, current, 48, 16 / 9);
+    const oldDirection = new THREE.Vector3(...current.position)
+      .sub(new THREE.Vector3(...current.target))
+      .normalize();
+    const newDirection = new THREE.Vector3(...framed.camera.position)
+      .sub(new THREE.Vector3(...framed.camera.target))
+      .normalize();
+
+    expect(framed.camera.target).toEqual([10, 1, 3]);
+    expect(newDirection.distanceTo(oldDirection)).toBeLessThan(1e-12);
+  });
+
+  it('excludes transform interaction helpers from frame-all bounds', () => {
+    const content = new THREE.Group();
+    content.add(new THREE.Mesh(new THREE.BoxGeometry(2, 2, 2)));
+    const transformHelper = new THREE.Group() as THREE.Group & {
+      isTransformControls: boolean;
+    };
+    transformHelper.isTransformControls = true;
+    transformHelper.add(new THREE.Mesh(new THREE.BoxGeometry(1_000, 1_000, 1_000)));
+    content.add(transformHelper);
+
+    const size = frameableContentBounds(content).getSize(new THREE.Vector3());
+
+    expect(size.toArray()).toEqual([2, 2, 2]);
+  });
+
+  it('uses direct R3F semantic clicks instead of a second selection engine', () => {
+    const source = readFileSync(
+      new URL('./StructuralViewer.tsx', import.meta.url),
+      'utf8',
+    );
+
+    expect(source).not.toContain('function ViewerSelectionSurface');
+    expect(source).not.toContain('event.intersections');
+    expect(source).toContain('onClick={(event) => onSelect(event, link.name)}');
+    expect(source).toContain(
+      'onClick={(event) => onSelect(event, object.scene_resource_id)}',
+    );
+    expect(source).toContain('onClickCapture={clearBeforeSemanticClick}');
+    expect(source).toContain('className="viewer-canvas-input-surface"');
+    expect(source).not.toContain('onPointerMissed=');
+    expect(source).not.toContain('new THREE.Raycaster()');
+    expect(source).toContain("const ignoreViewerRaycast: THREE.Object3D['raycast']");
+    expect(source.match(/raycast=\{ignoreViewerRaycast\}/g)).toHaveLength(5);
+    expect(source).not.toContain('transformRevision');
+    expect(source).not.toContain('markTransformChange');
+    expect(source).toContain('transformEnabled={transformEnabled && objectEditorActive}');
+    expect(source).toContain('editable={candidateTcpEditable && robotEditorActive');
+  });
+
+  it('accepts a release through 250 ms and rejects longer holds', () => {
+    expect(VIEWER_CLICK_MAX_DURATION_MS).toBe(250);
+    expect(viewerClickWithinDuration({
+      startedAtMs: 100,
+      releasedAtMs: 350,
+    })).toBe(true);
+    expect(viewerClickWithinDuration({
+      startedAtMs: 100,
+      releasedAtMs: 351,
+    })).toBe(false);
+    expect(viewerClickWithinDuration({
+      startedAtMs: 101,
+      releasedAtMs: 100,
+    })).toBe(false);
+  });
+
+  it('routes authored and measured render layers through the same selection callbacks', () => {
+    const source = readFileSync(
+      new URL('./StructuralViewer.tsx', import.meta.url),
+      'utf8',
+    );
+
+    expect(source.match(/onSelect={selectStructure}/g)).toHaveLength(2);
+    expect(source.match(/onSelect={selectSceneResource}/g)).toHaveLength(2);
+  });
+
+  it('retains wheel camera presentation without React state commits', () => {
+    const source = readFileSync(
+      new URL('./StructuralViewer.tsx', import.meta.url),
+      'utf8',
+    );
+
+    expect(source).toContain('createRetainedCameraPresentationStore');
+    expect(source).toContain('cameraPresentation.write(presentation)');
+    expect(source).toContain('onPresentation(presentation)');
+    expect(source).toContain("addEventListener?.('change', capture)");
+    const captureStart = source.indexOf('function CaptureCameraPresentation');
+    const captureEnd = source.indexOf('function ViewerCanvas', captureStart);
+    expect(source.slice(captureStart, captureEnd)).not.toContain('useFrame');
+    expect(source.slice(captureStart, captureEnd)).not.toContain('latestPresentationRef');
+    expect(source).not.toContain('setCameraPresentation(presentation)');
   });
 
   it('frames robot, scene, measured overlays, and point clouds together', () => {
@@ -101,7 +233,7 @@ describe('viewer failure isolation', () => {
     expect(source.indexOf('<PointCloudPoints', bounds)).toBeLessThan(boundsEnd);
     expect(source).toContain('viewer-stage viewer-fallback-stage');
     expect(source).toContain(
-      'fit={camera === null && !initialCameraPresentation.framed}',
+      'fit={camera === null && !retainedCameraPresentation.framed}',
     );
   });
 

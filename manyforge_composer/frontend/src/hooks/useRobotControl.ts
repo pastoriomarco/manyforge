@@ -1,4 +1,11 @@
-import { useCallback, useEffect, useReducer, useRef, useState } from 'react';
+import {
+  useCallback,
+  useEffect,
+  useMemo,
+  useReducer,
+  useRef,
+  useState,
+} from 'react';
 import { api } from '../api/client';
 import {
   buildPreviewIntent,
@@ -10,11 +17,10 @@ import {
   robotControlReducer,
 } from '../state/robotControl';
 import type { RobotControlState } from '../state/robotControl';
-import type {
-  RobotControlMode,
-} from '../state/robotControl';
+import type { RobotControlMode } from '../state/robotControl';
 import type {
   DirectControlOperationIntent,
+  OperationRuntimeScaleStatus,
   Pose3Value,
 } from '../types/robotControl';
 
@@ -29,8 +35,15 @@ function errorMessage(error: unknown, fallback: string): string {
     : fallback;
 }
 
+const RUNTIME_SCALE_SEND_INTERVAL_MS = 100;
+
 export interface RobotControlController {
   state: RobotControlState;
+  controlPending: 'pause' | 'resume' | null;
+  runtimeScaleStatus: OperationRuntimeScaleStatus | null;
+  runtimeScaleDraft: number;
+  runtimeScalePending: boolean;
+  runtimeScaleError: string | null;
   selectMode: (mode: RobotControlMode) => void;
   editJoint: (jointIndex: number, positionRad: number) => void;
   editPose: (pose: Pose3Value) => void;
@@ -38,6 +51,9 @@ export interface RobotControlController {
   approve: () => Promise<void>;
   revert: () => void;
   stop: () => Promise<void>;
+  pause: () => Promise<void>;
+  resume: () => Promise<void>;
+  setRuntimeScale: (scale: number) => void;
   retry: () => void;
 }
 
@@ -47,8 +63,19 @@ export function useRobotControl(enabled: boolean): RobotControlController {
     initialRobotControlState,
   );
   const [reloadToken, setReloadToken] = useState(0);
+  const [controlPending, setControlPending] = useState<'pause' | 'resume' | null>(null);
+  const [runtimeScaleStatus, setRuntimeScaleStatus] = useState<OperationRuntimeScaleStatus | null>(null);
+  const [runtimeScaleDraft, setRuntimeScaleDraft] = useState(1);
+  const [runtimeScalePending, setRuntimeScalePending] = useState(false);
+  const [runtimeScaleError, setRuntimeScaleError] = useState<string | null>(null);
   const approveInFlight = useRef(false);
   const stopInFlight = useRef(false);
+  const runtimeScaleStatusRef = useRef<OperationRuntimeScaleStatus | null>(null);
+  const runtimeScaleQueued = useRef<number | null>(null);
+  const runtimeScaleInFlight = useRef(false);
+  const runtimeScaleTimer = useRef<number | null>(null);
+  const runtimeScaleAbort = useRef<AbortController | null>(null);
+  const runtimeScaleFlush = useRef<() => void>(() => undefined);
 
   useEffect(() => {
     if (!enabled) {
@@ -204,6 +231,161 @@ export function useRobotControl(enabled: boolean): RobotControlController {
     };
   }, [enabled, terminalOperation]);
 
+  const scalableOperationId = state.operation !== null
+    && (state.operation.state === 'executing' || state.operation.state === 'paused')
+    ? state.operation.operationId
+    : null;
+  const runtimeScaleContext = useRef<{ ownerEpoch: string; operationId: string } | null>(null);
+  runtimeScaleContext.current = enabled
+    && state.status !== null
+    && scalableOperationId !== null
+    ? { ownerEpoch: state.status.ownerEpoch, operationId: scalableOperationId }
+    : null;
+
+  const clearRuntimeScaleQueue = useCallback(() => {
+    runtimeScaleQueued.current = null;
+    runtimeScaleInFlight.current = false;
+    runtimeScaleAbort.current?.abort();
+    runtimeScaleAbort.current = null;
+    if (runtimeScaleTimer.current !== null) {
+      window.clearTimeout(runtimeScaleTimer.current);
+      runtimeScaleTimer.current = null;
+    }
+    setRuntimeScalePending(false);
+  }, []);
+
+  const scheduleRuntimeScaleFlush = useCallback(() => {
+    if (
+      runtimeScaleTimer.current !== null
+      || runtimeScaleInFlight.current
+      || runtimeScaleQueued.current === null
+    ) return;
+    runtimeScaleTimer.current = window.setTimeout(() => {
+      runtimeScaleTimer.current = null;
+      runtimeScaleFlush.current();
+    }, RUNTIME_SCALE_SEND_INTERVAL_MS);
+  }, []);
+
+  const flushRuntimeScale = useCallback(async () => {
+    const context = runtimeScaleContext.current;
+    const observed = runtimeScaleStatusRef.current;
+    const scale = runtimeScaleQueued.current;
+    if (
+      context === null
+      || observed === null
+      || observed.operationId !== context.operationId
+      || !observed.supported
+      || scale === null
+      || runtimeScaleInFlight.current
+    ) return;
+    runtimeScaleQueued.current = null;
+    runtimeScaleInFlight.current = true;
+    setRuntimeScalePending(true);
+    const controller = new AbortController();
+    runtimeScaleAbort.current = controller;
+    try {
+      await api.execution.setRuntimeScale(
+        context.ownerEpoch,
+        observed,
+        scale,
+        requestId(),
+        controller.signal,
+      );
+      const next = await api.execution.runtimeScale(
+        context.operationId,
+        controller.signal,
+      );
+      if (
+        !controller.signal.aborted
+        && runtimeScaleContext.current?.operationId === context.operationId
+      ) {
+        runtimeScaleStatusRef.current = next;
+        setRuntimeScaleStatus(next);
+        if (runtimeScaleQueued.current === null) {
+          setRuntimeScaleDraft(next.requestedScale);
+        }
+        setRuntimeScaleError(null);
+      }
+    } catch (error: unknown) {
+      if (!controller.signal.aborted) {
+        setRuntimeScaleError(errorMessage(
+          error,
+          'Runtime velocity could not be updated; owner state will be re-read.',
+        ));
+        try {
+          const next = await api.execution.runtimeScale(context.operationId);
+          if (runtimeScaleContext.current?.operationId === context.operationId) {
+            runtimeScaleStatusRef.current = next;
+            setRuntimeScaleStatus(next);
+            if (runtimeScaleQueued.current === null) {
+              setRuntimeScaleDraft(next.requestedScale);
+            }
+          }
+        } catch {
+          // The explicit error stays visible; a later operation or Retry reads
+          // fresh owner state without treating the browser value as accepted.
+        }
+      }
+    } finally {
+      if (runtimeScaleAbort.current === controller) runtimeScaleAbort.current = null;
+      runtimeScaleInFlight.current = false;
+      setRuntimeScalePending(runtimeScaleQueued.current !== null);
+      scheduleRuntimeScaleFlush();
+    }
+  }, [scheduleRuntimeScaleFlush]);
+  runtimeScaleFlush.current = () => { void flushRuntimeScale(); };
+
+  useEffect(() => {
+    clearRuntimeScaleQueue();
+    runtimeScaleStatusRef.current = null;
+    setRuntimeScaleStatus(null);
+    setRuntimeScaleDraft(1);
+    setRuntimeScaleError(null);
+    if (scalableOperationId === null) return undefined;
+    const controller = new AbortController();
+    void api.execution.runtimeScale(scalableOperationId, controller.signal)
+      .then((observed) => {
+        if (controller.signal.aborted) return;
+        runtimeScaleStatusRef.current = observed;
+        setRuntimeScaleStatus(observed);
+        setRuntimeScaleDraft(observed.requestedScale);
+      })
+      .catch((error: unknown) => {
+        if (!controller.signal.aborted) {
+          setRuntimeScaleError(errorMessage(
+            error,
+            'This operation does not expose runtime velocity control.',
+          ));
+        }
+      });
+    return () => controller.abort();
+  }, [clearRuntimeScaleQueue, reloadToken, scalableOperationId]);
+
+  useEffect(() => () => {
+    runtimeScaleAbort.current?.abort();
+    if (runtimeScaleTimer.current !== null) {
+      window.clearTimeout(runtimeScaleTimer.current);
+    }
+  }, []);
+
+  const setRuntimeScale = useCallback((scale: number) => {
+    const context = runtimeScaleContext.current;
+    const observed = runtimeScaleStatusRef.current;
+    if (
+      context === null
+      || observed === null
+      || observed.operationId !== context.operationId
+      || !observed.supported
+      || !Number.isFinite(scale)
+    ) return;
+    const bounded = Math.min(1, Math.max(0, scale));
+    setRuntimeScaleDraft(bounded);
+    setRuntimeScaleError(null);
+    runtimeScaleQueued.current = bounded;
+    setRuntimeScalePending(true);
+    scheduleRuntimeScaleFlush();
+  }, [scheduleRuntimeScaleFlush]);
+
   const editJoint = useCallback((jointIndex: number, positionRad: number) => {
     if (
       state.status === null
@@ -258,6 +440,7 @@ export function useRobotControl(enabled: boolean): RobotControlController {
       || state.operation === null
       || !robotControlHasActiveOperation(state)
     ) return;
+    clearRuntimeScaleQueue();
     stopInFlight.current = true;
     dispatch({ type: 'stop_started' });
     try {
@@ -274,14 +457,55 @@ export function useRobotControl(enabled: boolean): RobotControlController {
     } finally {
       stopInFlight.current = false;
     }
-  }, [state]);
+  }, [clearRuntimeScaleQueue, state]);
+
+  const controlOperation = useCallback(async (control: 'pause' | 'resume') => {
+    if (
+      controlPending !== null
+      || state.status === null
+      || state.operation === null
+      || (control === 'pause' && state.operation.state !== 'executing')
+      || (control === 'resume' && state.operation.state !== 'paused')
+    ) return;
+    setControlPending(control);
+    try {
+      await api.execution[control](
+        state.status.ownerEpoch,
+        state.operation,
+        requestId(),
+      );
+      const observed = await api.execution.read(state.operation.operationId);
+      dispatch({ type: 'operation_observed', operation: observed });
+    } catch (error: unknown) {
+      dispatch({
+        type: 'operation_poll_failed',
+        error: errorMessage(error, `Operation ${control} was rejected.`),
+      });
+    } finally {
+      setControlPending(null);
+    }
+  }, [controlPending, state]);
+
+  const pause = useCallback(
+    async () => controlOperation('pause'),
+    [controlOperation],
+  );
+  const resume = useCallback(
+    async () => controlOperation('resume'),
+    [controlOperation],
+  );
 
   const retry = useCallback(() => {
     setReloadToken((current) => current + 1);
   }, []);
 
-  return {
+  return useMemo(() => ({
     state,
+    controlPending,
+    runtimeScaleStatus,
+    runtimeScaleDraft,
+    runtimeScalePending,
+    runtimeScaleError,
     selectMode,
     editJoint,
     editPose,
@@ -289,6 +513,27 @@ export function useRobotControl(enabled: boolean): RobotControlController {
     approve,
     revert,
     stop,
+    pause,
+    resume,
+    setRuntimeScale,
     retry,
-  };
+  }), [
+    approve,
+    controlPending,
+    editGripper,
+    editJoint,
+    editPose,
+    pause,
+    resume,
+    retry,
+    revert,
+    runtimeScaleDraft,
+    runtimeScaleError,
+    runtimeScalePending,
+    runtimeScaleStatus,
+    selectMode,
+    setRuntimeScale,
+    state,
+    stop,
+  ]);
 }

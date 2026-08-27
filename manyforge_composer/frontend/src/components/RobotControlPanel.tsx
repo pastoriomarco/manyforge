@@ -11,6 +11,7 @@ import type {
   RobotControlPhase,
 } from '../state/robotControl';
 import type { Pose3Value } from '../types/robotControl';
+import { DraftTextInput } from './common/DraftInputs';
 
 const RAD_TO_DEG = 180 / Math.PI;
 const DEG_TO_RAD = Math.PI / 180;
@@ -53,6 +54,45 @@ const MODE_LABELS: Array<[RobotControlMode, string]> = [
   ['cartesian_path', 'Cartesian'],
   ['gripper', 'Gripper'],
 ];
+
+function RobotNumberInput({
+  label,
+  value,
+  step,
+  min,
+  max,
+  disabled,
+  onCommit,
+}: {
+  label: string;
+  value: number | null;
+  step: number | 'any';
+  min?: number;
+  max?: number;
+  disabled: boolean;
+  onCommit: (value: number) => void;
+}) {
+  return (
+    <DraftTextInput
+      aria-label={label}
+      type="number"
+      min={min}
+      max={max}
+      step={step}
+      shiftStepMultiplier={10}
+      value={value}
+      disabled={disabled}
+      validate={(candidate) => {
+        const parsed = Number(candidate);
+        if (!candidate.trim() || !Number.isFinite(parsed)) return 'Enter a finite number.';
+        if (min !== undefined && parsed < min) return `Minimum ${min}.`;
+        if (max !== undefined && parsed > max) return `Maximum ${max}.`;
+        return null;
+      }}
+      onCommit={(candidate) => onCommit(Number(candidate))}
+    />
+  );
+}
 
 export function RobotControlPanelView({
   enabled,
@@ -224,20 +264,14 @@ export function RobotControlPanelView({
                             }}
                           />
                           <span className="robot-control-number">
-                            <input
-                              aria-label={`${joint.sourceJointName} target degrees`}
-                              type="number"
+                            <RobotNumberInput
+                              label={`${joint.sourceJointName} target degrees`}
                               min={degrees(joint.minPositionRad)}
                               max={degrees(joint.maxPositionRad)}
                               step={0.1}
                               value={degrees(draft)}
                               disabled={active}
-                              onChange={(event) => {
-                                const value = event.currentTarget.valueAsNumber;
-                                if (Number.isFinite(value)) {
-                                  editJoint(index, radians(value));
-                                }
-                              }}
+                              onCommit={(value) => editJoint(index, radians(value))}
                             />
                             <span>deg</span>
                           </span>
@@ -259,16 +293,12 @@ export function RobotControlPanelView({
                     <label key={field}>
                       <span>{field.slice(0, 1).toUpperCase()} position</span>
                       <span className="robot-control-number">
-                        <input
-                          aria-label={`${field.slice(0, 1)} target metres`}
-                          type="number"
+                        <RobotNumberInput
+                          label={`${field.slice(0, 1)} target metres`}
                           step={0.001}
                           value={state.draftPose.position_m[field]}
                           disabled={active}
-                          onChange={(event) => editPosePosition(
-                            field,
-                            event.currentTarget.valueAsNumber,
-                          )}
+                          onCommit={(value) => editPosePosition(field, value)}
                         />
                         <span>m</span>
                       </span>
@@ -278,17 +308,13 @@ export function RobotControlPanelView({
                     <label key={label}>
                       <span>{label}</span>
                       <span className="robot-control-number">
-                        <input
-                          aria-label={`${label} target degrees`}
-                          type="number"
-                          step={0.1}
-                          value={rpy[index]}
-                          disabled={active}
-                          onChange={(event) => editPoseOrientation(
-                            index,
-                            event.currentTarget.valueAsNumber,
-                          )}
-                        />
+                      <RobotNumberInput
+                        label={`${label} target degrees`}
+                        step={0.1}
+                        value={rpy[index]}
+                        disabled={active}
+                        onCommit={(value) => editPoseOrientation(index, value)}
+                      />
                         <span>deg</span>
                       </span>
                     </label>
@@ -337,18 +363,14 @@ export function RobotControlPanelView({
                       />
                     )}
                     <span className="robot-control-number">
-                      <input
-                        aria-label="Gripper target value"
-                        type="number"
+                      <RobotNumberInput
+                        label="Gripper target value"
                         min={status.directControlGripper.minPosition ?? undefined}
                         max={status.directControlGripper.maxPosition ?? undefined}
                         step="any"
-                        value={state.draftGripperPosition ?? ''}
+                        value={state.draftGripperPosition}
                         disabled={active}
-                        onChange={(event) => {
-                          const value = event.currentTarget.valueAsNumber;
-                          if (Number.isFinite(value)) editGripper(value);
-                        }}
+                        onCommit={editGripper}
                       />
                       <span>
                         {status.directControlGripper.coordinateKind === 'angular_rad'

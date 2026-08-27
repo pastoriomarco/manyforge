@@ -18,6 +18,7 @@ import {
   parseObjectResponse,
   parseOperationAcceptance,
   parseOperationObservation,
+  parseOperationRuntimeScaleStatus,
   parseOperatorAlarmSnapshot,
   parseProgramWorkspaceResponse,
   parseProgramWorkspaceTransitionResponse,
@@ -87,6 +88,7 @@ import type {
   MotionPreviewReceipt,
   OperationAcceptance,
   OperationObservation,
+  OperationRuntimeScaleStatus,
 } from '../types/robotControl';
 import type {
   AssistantModeIndex,
@@ -818,6 +820,94 @@ export const api = {
         return observation;
       },
       signal,
+    ),
+    pause: (
+      ownerEpoch: string,
+      operation: OperationObservation,
+      requestId: string,
+      signal?: AbortSignal,
+    ): Promise<Record<string, unknown>> => requestJson(
+      `/api/execution/operations/${encodeURIComponent(operation.operationId)}/pause`,
+      parseObjectResponse,
+      signal,
+      {
+        method: 'POST',
+        body: JSON.stringify({
+          request_context: {
+            request_id: requestId,
+            request_owner_epoch: ownerEpoch,
+            source_label: 'composer_ui',
+            correlation_id: null,
+          },
+          operation_id: operation.operationId,
+          expected_operation_revision: operation.operationRevision,
+          reason: 'operator Robot Control pause',
+        }),
+      },
+    ),
+    resume: (
+      ownerEpoch: string,
+      operation: OperationObservation,
+      requestId: string,
+      signal?: AbortSignal,
+    ): Promise<Record<string, unknown>> => requestJson(
+      `/api/execution/operations/${encodeURIComponent(operation.operationId)}/resume`,
+      parseObjectResponse,
+      signal,
+      {
+        method: 'POST',
+        body: JSON.stringify({
+          request_context: {
+            request_id: requestId,
+            request_owner_epoch: ownerEpoch,
+            source_label: 'composer_ui',
+            correlation_id: null,
+          },
+          operation_id: operation.operationId,
+          expected_operation_revision: operation.operationRevision,
+          reason: 'operator Robot Control resume',
+        }),
+      },
+    ),
+    runtimeScale: (
+      operationId: string,
+      signal?: AbortSignal,
+    ): Promise<OperationRuntimeScaleStatus> => requestJson(
+      `/api/execution/operations/${encodeURIComponent(operationId)}/runtime-scale`,
+      (value) => {
+        const status = parseOperationRuntimeScaleStatus(value);
+        if (status.operationId !== operationId) {
+          throw new Error('runtime-scale observation does not match its request');
+        }
+        return status;
+      },
+      signal,
+    ),
+    setRuntimeScale: (
+      ownerEpoch: string,
+      status: OperationRuntimeScaleStatus,
+      scale: number,
+      requestId: string,
+      signal?: AbortSignal,
+    ): Promise<Record<string, unknown>> => requestJson(
+      `/api/execution/operations/${encodeURIComponent(status.operationId)}/runtime-scale`,
+      parseObjectResponse,
+      signal,
+      {
+        method: 'POST',
+        body: JSON.stringify({
+          request_context: {
+            request_id: requestId,
+            request_owner_epoch: ownerEpoch,
+            source_label: 'composer_ui',
+            correlation_id: null,
+          },
+          operation_id: status.operationId,
+          expected_operation_revision: status.operationRevision,
+          expected_runtime_scale_generation: status.runtimeScaleGeneration,
+          scale,
+        }),
+      },
     ),
     stop: (
       ownerEpoch: string,

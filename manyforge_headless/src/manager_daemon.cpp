@@ -401,7 +401,7 @@ struct DaemonConfig final {
   std::filesystem::path authoring_transaction_journal;
   std::filesystem::path projection_root;
   std::filesystem::path program_runner_liveness_socket;
-  std::chrono::milliseconds reconciliation_period{250};
+  std::chrono::milliseconds reconciliation_period{500};
 };
 
 enum class CommandKind {
@@ -1747,6 +1747,100 @@ BuildBootstrapRuntimePlan(
       admission.admission_digest(), std::move(rows)};
 }
 
+/// One sealed, generation-scoped view of the immutable retained package.
+/// Filesystem bytes are verified on the first exact lookup; live loops reuse
+/// only the resulting typed values. Replacing the view requires replacing the
+/// owning Manager generation.
+class ManagerVerifiedPackageView final
+    : public deployment::IVerifiedRetainedBundleSource,
+      public deployment::IVerifiedRetainedProductArtifactSource {
+public:
+  explicit ManagerVerifiedPackageView(std::filesystem::path package_root)
+      : bundles_(package_root), artifacts_(std::move(package_root)) {}
+
+  [[nodiscard]] std::shared_ptr<const deployment::RetainedBundle>
+  get_verified(
+      const core::RetainedBundleId& retained_bundle_id) const override {
+    std::lock_guard lock(mutex_);
+    const auto cached = bundles_by_id_.find(retained_bundle_id.value());
+    if (cached != bundles_by_id_.end()) {
+      return cached->second;
+    }
+    auto verified = bundles_.get_verified(retained_bundle_id);
+    if (verified == nullptr) {
+      return nullptr;
+    }
+    return bundles_by_id_.emplace(retained_bundle_id.value(), std::move(verified))
+        .first->second;
+  }
+
+  [[nodiscard]] std::optional<deployment::VerifiedRetainedProductArtifact>
+  get_verified(const deployment::RetainedProductArtifactQuery& query) const
+      override {
+    std::lock_guard lock(mutex_);
+    const auto cached = std::find_if(
+        product_artifacts_.begin(), product_artifacts_.end(),
+        [&](const auto& entry) { return entry.first == query; });
+    if (cached != product_artifacts_.end()) {
+      return cached->second;
+    }
+    auto verified = artifacts_.get_verified(query);
+    if (!verified.has_value()) {
+      return std::nullopt;
+    }
+    product_artifacts_.emplace_back(query, std::move(*verified));
+    return product_artifacts_.back().second;
+  }
+
+  [[nodiscard]] std::optional<deployment::VerifiedRetainedRuntimeUnitProduct>
+  runtime_unit_product(const deployment::RetainedBundle& bundle,
+                       const core::RuntimeUnitId& runtime_unit_id) const {
+    {
+      std::lock_guard lock(mutex_);
+      const auto cached = std::find_if(
+          runtime_products_.begin(), runtime_products_.end(),
+          [&](const auto& product) {
+            return product.retained_bundle_id() ==
+                       bundle.retained_bundle_id() &&
+                   product.runtime_unit_id() == runtime_unit_id;
+          });
+      if (cached != runtime_products_.end()) {
+        return *cached;
+      }
+    }
+    auto verified = deployment::verify_runtime_unit_product(
+        bundle, runtime_unit_id, *this);
+    if (!verified.has_value()) {
+      return std::nullopt;
+    }
+    std::lock_guard lock(mutex_);
+    const auto cached = std::find_if(
+        runtime_products_.begin(), runtime_products_.end(),
+        [&](const auto& product) {
+          return product.retained_bundle_id() == bundle.retained_bundle_id() &&
+                 product.runtime_unit_id() == runtime_unit_id;
+        });
+    if (cached != runtime_products_.end()) {
+      return *cached;
+    }
+    runtime_products_.push_back(std::move(*verified));
+    return runtime_products_.back();
+  }
+
+private:
+  deployment::FilesystemVerifiedRetainedBundleSource bundles_;
+  deployment::FilesystemVerifiedRetainedProductArtifactSource artifacts_;
+  mutable std::mutex mutex_;
+  mutable std::map<std::string,
+                   std::shared_ptr<const deployment::RetainedBundle>>
+      bundles_by_id_;
+  mutable std::vector<std::pair<deployment::RetainedProductArtifactQuery,
+                                deployment::VerifiedRetainedProductArtifact>>
+      product_artifacts_;
+  mutable std::vector<deployment::VerifiedRetainedRuntimeUnitProduct>
+      runtime_products_;
+};
+
 [[nodiscard]] bool HasConvergedKernelApplyOwner(
     const component_manager::ManagerActiveRuntimeConvergenceResult &runtime) {
   if (runtime.state !=
@@ -1778,15 +1872,14 @@ public:
                        package_generation_.descriptor_bound_root(),
                        config_.canonical_empty_admission_filename)
                        .load_verified()),
-        bundle_source_(package_generation_.descriptor_bound_root()),
-        artifact_source_(package_generation_.descriptor_bound_root()),
+        verified_package_(package_generation_.descriptor_bound_root()),
         candidate_source_(package_generation_.descriptor_bound_root(),
                           "maintained"),
         native_runtime_adapter_(
             InstalledTargetRoot(), package_generation_.descriptor_bound_root(),
             config_.manager_state_root, config_.manager_run_root,
             config_.execution_state_root, config_.execution_run_root,
-            bundle_source_, artifact_source_, "linux",
+            verified_package_, verified_package_, "linux",
             std::vector<std::string>{
                 std::string(deployment::native_execution_runtime_contract::
                                 kLaunchEnvironmentContract),
@@ -1797,15 +1890,15 @@ public:
             config_.authoring_transaction_journal),
         stores_(config_.manager_state_root, admission_),
         scene_owner_(config_.logical_scene_database, admission_,
-                     stores_.active_bundle_publication_store(), bundle_source_,
+                     stores_.active_bundle_publication_store(), verified_package_,
                      native_runtime_adapter_, native_runtime_adapter_),
         scene_runtime_pose_projector_(scene_owner_, admission_.cell_id()),
         plan_source_(stores_.active_bundle_publication_store(),
                      stores_.apply_journal(),
-                     BuildBootstrapRuntimePlan(admission_, artifact_source_)),
+                     BuildBootstrapRuntimePlan(admission_, verified_package_)),
         reference_runtime_adapter_(config_.execution_state_root,
-                                   config_.execution_run_root, bundle_source_,
-                                   artifact_source_, "linux", "posix.1-2017"),
+                                   config_.execution_run_root, verified_package_,
+                                   verified_package_, "linux", "posix.1-2017"),
         runtime_adapter_router_(
             {{std::string(
                   component_manager::kRetainedPosixProcessAdapterContractId),
@@ -1819,8 +1912,8 @@ public:
                         [this] { RequireCurrentPackageGeneration(); }),
         manager_runtime_epoch_(RandomToken("manager-runtime-")),
         named_apply_(
-            stores_.apply_journal(), plan_source_, bundle_source_,
-            artifact_source_, stores_.active_bundle_publication_store(),
+            stores_.apply_journal(), plan_source_, verified_package_,
+            verified_package_, stores_.active_bundle_publication_store(),
             scene_owner_, &scene_owner_, native_runtime_adapter_,
             native_runtime_adapter_,
             native_runtime_adapter_, runtime_adapter_router_,
@@ -2123,7 +2216,7 @@ private:
     }
     const auto bundle_id =
         runtime.plan.active_publication.request.candidate_retained_bundle_id;
-    const auto active_bundle = bundle_source_.get_verified(bundle_id);
+    const auto active_bundle = verified_package_.get_verified(bundle_id);
     Require(active_bundle != nullptr,
             "active publication has no independently verified retained bundle");
     last_active_bundle_ = active_bundle;
@@ -2162,7 +2255,7 @@ private:
         finalized_scene_runtime.projection_revision.retained_bundle_id ==
                 bundle_id
             ? active_bundle
-            : bundle_source_.get_verified(
+            : verified_package_.get_verified(
                   finalized_scene_runtime.projection_revision
                       .retained_bundle_id);
     Require(finalized_bundle != nullptr &&
@@ -2414,8 +2507,8 @@ private:
           throw std::runtime_error(
               "required native liveness receiver is not observable");
         }
-        const auto product = deployment::verify_runtime_unit_product(
-            active_bundle, row.runtime_unit_id, artifact_source_);
+        const auto product = verified_package_.runtime_unit_product(
+            active_bundle, row.runtime_unit_id);
         if (!product.has_value() ||
             product->retained_bundle_id() !=
                 active_bundle.retained_bundle_id() ||
@@ -2843,7 +2936,7 @@ private:
 
     std::shared_ptr<const deployment::RetainedBundle> bundle;
     try {
-      bundle = bundle_source_.get_verified(
+      bundle = verified_package_.get_verified(
           core::RetainedBundleId(runtime_identity.retained_bundle_id));
     } catch (const std::exception &error) {
       return core::Result<SceneRuntimePoseApplicationResult>::Err(
@@ -2897,7 +2990,7 @@ private:
 
     std::shared_ptr<const deployment::RetainedBundle> bundle;
     try {
-      bundle = bundle_source_.get_verified(
+      bundle = verified_package_.get_verified(
           core::RetainedBundleId(runtime_identity.retained_bundle_id));
     } catch (const std::exception &error) {
       return failure("scene_runtime_pose_bundle_unavailable", error.what());
@@ -3578,8 +3671,7 @@ private:
   ManagerPackageGeneration package_generation_;
   DaemonLock daemon_lock_;
   deployment::CanonicalEmptyRetainedBundleAdmission admission_;
-  deployment::FilesystemVerifiedRetainedBundleSource bundle_source_;
-  deployment::FilesystemVerifiedRetainedProductArtifactSource artifact_source_;
+  ManagerVerifiedPackageView verified_package_;
   deployment::FilesystemScenarioApplyCandidateSource candidate_source_;
   component_manager::RetainedNativeRuntimeUnitAdapter native_runtime_adapter_;
   component_manager::ExternallyProvisionedManagerStores stores_;
