@@ -105,13 +105,19 @@ describe('viewer failure isolation', () => {
     const stage = source.indexOf('className="viewer-stage"', header);
     const controls = source.indexOf('aria-label="Scene viewport controls"', header);
     const launchers = source.indexOf('className="viewer-surface-launchers"', header);
+    const frameAll = source.indexOf('aria-label="Frame all visible content"', controls);
+    const transform = source.indexOf('title="Translate selected object (W)"', controls);
 
     expect(header).toBeGreaterThan(0);
     expect(controls).toBeLessThan(launchers);
     expect(launchers).toBeLessThan(stage);
-    expect(source.indexOf('aria-label="Frame all visible content"', header)).toBeLessThan(stage);
+    expect(frameAll).toBeLessThan(stage);
     expect(source.indexOf('aria-label="Frame selected object"', header)).toBeLessThan(stage);
     expect(source.indexOf('aria-label="Reset camera"', header)).toBeLessThan(stage);
+    expect(frameAll).toBeLessThan(transform);
+    expect(transform).toBeLessThan(launchers);
+    expect(source).toContain("{inspectorPanel === 'object' && (");
+    expect(source).toContain("else if (inspectorPanel !== 'object') return;");
     expect(css).toMatch(/\.viewer-header-controls\s*\{[^}]*flex:\s*1 1 auto/s);
     expect(css).toMatch(/\.viewer-surface-launchers\s*\{[^}]*margin-left:\s*auto/s);
     expect(source).toContain('className="viewer-camera-icon"');

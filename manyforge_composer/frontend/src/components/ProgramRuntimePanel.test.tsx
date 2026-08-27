@@ -134,7 +134,7 @@ describe('Program runtime projection', () => {
     expect(markup).not.toContain('Selection for the next Run');
     expect(markup).toContain('Captured run Program');
     expect(markup).toContain('immutable for this run');
-    expect(markup).toContain('Stop Program');
+    expect(markup).toContain('Stop Execution');
     expect(markup).not.toContain('Stop all');
     expect(markup).toContain('never sends Stop implicitly');
   });

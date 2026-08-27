@@ -48,13 +48,18 @@ describe('UI4 application and viewport composition', () => {
   it('keeps transport scopes explicit and uses the exact operation-scoped velocity owner', () => {
     const transport = source('./ProgramRuntimePanel.tsx');
     const robotControl = source('../hooks/useRobotControl.ts');
+    const styles = source('../index.css');
 
-    expect(transport).toContain('Stop motion');
-    expect(transport).toContain('Stop Program');
+    expect(transport).toContain("canResume ? 'Resume Motion' : 'Run'");
+    expect(transport).toContain("canResume ? robot.resume() : program.run()");
+    expect(transport).toContain('transport-stop-primary');
+    expect(transport).toContain('transport-stop-disclosure');
+    expect(transport).toContain('Stop Execution');
+    expect(transport).toMatch(/transport-stop-group[\s\S]*transport-stop-primary[\s\S]*transport-stop-disclosure[\s\S]*transport-stop-menu/);
+    expect(transport).not.toContain("motionPaused ? robot.resume() : robot.pause()");
     expect(transport).toContain('Full-cell Stop unavailable');
     expect(transport).toContain('does not publish the cell Stop generation');
     expect(transport).toContain("robot.state.operation?.state === 'paused'");
-    expect(transport).toContain('robot.resume() : robot.pause()');
     expect(transport).toContain('robot.setRuntimeScale');
     expect(transport).toContain('robot.runtimeScaleStatus.supported');
     expect(transport).not.toContain('api.execution.fullStop');
@@ -63,6 +68,10 @@ describe('UI4 application and viewport composition', () => {
     expect(robotControl).toContain('runtimeScaleInFlight.current');
     expect(robotControl).toContain('clearRuntimeScaleQueue();');
     expect(robotControl).toContain('api.execution.runtimeScale(context.operationId');
+    expect(styles).toMatch(/\.transport-stop-group \{[\s\S]*?position: relative;[\s\S]*?display: flex;/);
+    expect(styles).toMatch(/\.transport-stop-menu \{[\s\S]*?position: absolute;[\s\S]*?bottom: calc\(100% \+ 0\.35rem\);/);
+    expect(styles).toContain('--viewer-transport-control-height: 2.85rem;');
+    expect(styles).toMatch(/\.viewer-transport > button,[\s\S]*?\.viewer-transport \.transport-stop-group > button \{[\s\S]*?height: var\(--viewer-transport-control-height\);[\s\S]*?font-size: 0\.84rem;/);
   });
 
   it('locates lifecycle control under Deployment and binds selection to Manager graph identities', () => {

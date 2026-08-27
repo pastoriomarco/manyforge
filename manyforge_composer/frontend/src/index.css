@@ -5697,16 +5697,18 @@ svg.viewer-camera-icon {
 }
 
 .viewer-transport {
+  --viewer-transport-control-height: 2.85rem;
+
   position: absolute;
   z-index: 16;
   right: 50%;
   bottom: 0.65rem;
   display: flex;
   max-width: calc(100% - 1.2rem);
-  min-height: 2.35rem;
+  min-height: calc(var(--viewer-transport-control-height) + 0.6rem);
   align-items: center;
-  gap: 0.25rem;
-  padding: 0.25rem;
+  gap: 0.35rem;
+  padding: 0.3rem;
   overflow-x: auto;
   border: 1px solid #365463;
   border-radius: 0.55rem;
@@ -5716,16 +5718,65 @@ svg.viewer-camera-icon {
   white-space: nowrap;
 }
 
-.viewer-transport > button {
-  min-height: 1.8rem;
-  padding: 0.28rem 0.52rem;
-  font-size: 0.68rem;
+.viewer-transport > button,
+.viewer-transport .transport-stop-group > button {
+  height: var(--viewer-transport-control-height);
+  min-height: var(--viewer-transport-control-height);
+  padding: 0.5rem 0.9rem;
+  border-radius: 0.45rem;
+  font-size: 0.84rem;
+  line-height: 1;
+}
+
+.viewer-transport > .icon-button {
+  width: var(--viewer-transport-control-height);
+  min-width: var(--viewer-transport-control-height);
+  padding: 0;
 }
 
 .viewer-transport .transport-run:not(:disabled) {
   border-color: #397760;
   color: #b9ead6;
   background: #12382f;
+}
+
+.transport-stop-group {
+  position: relative;
+  display: flex;
+  height: var(--viewer-transport-control-height);
+}
+
+.viewer-transport .transport-stop-primary {
+  border-radius: 0.35rem 0 0 0.35rem;
+}
+
+.viewer-transport .transport-stop-disclosure {
+  min-width: 2.1rem;
+  padding-right: 0.45rem;
+  padding-left: 0.45rem;
+  border-left-width: 0;
+  border-radius: 0 0.35rem 0.35rem 0;
+}
+
+.transport-stop-menu {
+  position: absolute;
+  right: 0;
+  bottom: calc(100% + 0.35rem);
+  z-index: 18;
+  min-width: 8.5rem;
+  padding: 0.3rem;
+  border: 1px solid #69443e;
+  border-radius: 0.45rem;
+  background: rgb(8 23 32 / 98%);
+  box-shadow: 0 0.55rem 1.5rem rgb(0 0 0 / 40%);
+}
+
+.transport-stop-menu > button {
+  width: 100%;
+  min-height: var(--viewer-transport-control-height);
+  padding: 0.5rem 0.9rem;
+  border-radius: 0.4rem;
+  font-size: 0.84rem;
 }
 
 .viewer-transport .transport-reset.meaningful:not(:disabled) {

@@ -2460,23 +2460,24 @@ function StructuralViewerContent({
         || ['INPUT', 'SELECT', 'TEXTAREA'].includes(target?.tagName ?? '')
       ) return;
       const key = event.key.toLowerCase();
-      if (key === 'w') setTransformMode('translate');
+      if (key === 'escape') {
+        setContextMenu(null);
+        onSelectSceneResource(null);
+        onSelectStructure(null);
+      }
+      else if (inspectorPanel !== 'object') return;
+      else if (key === 'w') setTransformMode('translate');
       else if (key === 'e') setTransformMode('rotate');
       else if (key === 'r' && scaleEnabled) setTransformMode('scale');
       else if (key === 'q') setTransformSpace((current) => (
         current === 'world' ? 'local' : 'world'
       ));
-      else if (key === 'escape') {
-        setContextMenu(null);
-        onSelectSceneResource(null);
-        onSelectStructure(null);
-      }
       else return;
       event.preventDefault();
     };
     window.addEventListener('keydown', onKeyDown);
     return () => window.removeEventListener('keydown', onKeyDown);
-  }, [onSelectSceneResource, onSelectStructure, scaleEnabled, viewerActive]);
+  }, [inspectorPanel, onSelectSceneResource, onSelectStructure, scaleEnabled, viewerActive]);
   useEffect(() => {
     if (contextMenu === null) return undefined;
     const dismissOutside = (event: PointerEvent) => {
@@ -2525,34 +2526,6 @@ function StructuralViewerContent({
           <div className="viewer-tool-strip" aria-label="Scene viewport controls">
             <button
               type="button"
-              aria-pressed={transformMode === 'translate'}
-              disabled={!generalTransformEnabled}
-              onClick={() => setTransformMode('translate')}
-              title="Translate selected object (W)"
-            >W</button>
-            <button
-              type="button"
-              aria-pressed={transformMode === 'rotate'}
-              disabled={!generalTransformEnabled}
-              onClick={() => setTransformMode('rotate')}
-              title="Rotate selected object (E)"
-            >E</button>
-            <button
-              type="button"
-              aria-pressed={transformMode === 'scale'}
-              disabled={!scaleEnabled}
-              onClick={() => setTransformMode('scale')}
-              title="Scale a selected box or mesh object (R)"
-            >R</button>
-            <button
-              type="button"
-              className="viewer-space-control"
-              onClick={() => setTransformSpace((current) => current === 'world' ? 'local' : 'world')}
-              title="Toggle local/world coordinates (Q)"
-            >{transformSpace}</button>
-            <span className="viewer-tool-separator" />
-            <button
-              type="button"
               aria-label="Frame all visible content"
               onClick={() => issueCameraCommand('frame_all')}
               title="Frame all visible content"
@@ -2583,6 +2556,38 @@ function StructuralViewerContent({
             >
               <span className="viewer-camera-icon" aria-hidden="true">↺</span>
             </button>
+            {inspectorPanel === 'object' && (
+              <>
+                <span className="viewer-tool-separator" />
+                <button
+                  type="button"
+                  aria-pressed={transformMode === 'translate'}
+                  disabled={!generalTransformEnabled}
+                  onClick={() => setTransformMode('translate')}
+                  title="Translate selected object (W)"
+                >W</button>
+                <button
+                  type="button"
+                  aria-pressed={transformMode === 'rotate'}
+                  disabled={!generalTransformEnabled}
+                  onClick={() => setTransformMode('rotate')}
+                  title="Rotate selected object (E)"
+                >E</button>
+                <button
+                  type="button"
+                  aria-pressed={transformMode === 'scale'}
+                  disabled={!scaleEnabled}
+                  onClick={() => setTransformMode('scale')}
+                  title="Scale a selected box or mesh object (R)"
+                >R</button>
+                <button
+                  type="button"
+                  className="viewer-space-control"
+                  onClick={() => setTransformSpace((current) => current === 'world' ? 'local' : 'world')}
+                  title="Toggle local/world coordinates (Q)"
+                >{transformSpace}</button>
+              </>
+            )}
           </div>
           <div className="viewer-surface-launchers">
             <button

@@ -171,7 +171,7 @@ export function ProgramRuntimePanel({
           }
           onClick={() => { void stop(); }}
         >
-          {state.pending === 'stop' ? 'Stopping…' : 'Stop Program'}
+          {state.pending === 'stop' ? 'Stopping…' : 'Stop Execution'}
         </button>
       </div>
       <p className="panel-intro">
@@ -197,11 +197,11 @@ export function ProgramTransportControls({
   robot: RobotControlController;
 }) {
   const [detailsOpen, setDetailsOpen] = useState(false);
+  const [stopMenuOpen, setStopMenuOpen] = useState(false);
   const detailsButton = useRef<HTMLButtonElement>(null);
   const { state, cycleState } = program;
   const motionActive = robotControlHasActiveOperation(robot.state);
   const motionPaused = robot.state.operation?.state === 'paused';
-  const canPause = robot.state.operation?.state === 'executing';
   const programActive = state.run?.state === 'running'
     || state.run?.state === 'intervention_required';
   const canRun = enabled
@@ -209,6 +209,10 @@ export function ProgramTransportControls({
     && state.applied !== null
     && state.pending === null
     && cycleState === 'idle_after_reset';
+  const canResume = enabled
+    && motionPaused
+    && robot.controlPending === null;
+  const canRunOrResume = canRun || canResume;
   const canReset = enabled
     && state.pending === null
     && cycleState === 'terminal_awaiting_reset';
@@ -228,51 +232,78 @@ export function ProgramTransportControls({
       <div className="viewer-transport" aria-label="Program and motion controls">
         <button
           type="button"
-          disabled={!enabled || robot.controlPending !== null || (!canPause && !motionPaused)}
-          title={motionPaused
-            ? 'Resume the exact paused manual-control operation.'
-            : canPause
-              ? 'Pause the exact active manual-control operation.'
-              : 'Pause or Resume is available only for an owner-observed executing or paused operation.'}
-          onClick={() => { void (motionPaused ? robot.resume() : robot.pause()); }}
-        >
-          {robot.controlPending === 'pause'
-            ? 'Pausing…'
-            : robot.controlPending === 'resume'
-              ? 'Resuming…'
-              : motionPaused ? 'Resume' : 'Pause'}
-        </button>
-        <button
-          type="button"
           className="transport-run"
-          disabled={!canRun}
-          title={canRun ? 'Run the exact Applied Program.' : 'Run requires an Applied Program and an idle, reset runner.'}
-          onClick={() => { void program.run(); }}
+          disabled={!canRunOrResume}
+          title={canResume
+            ? 'Resume the exact paused motion operation.'
+            : canRun
+              ? 'Run the exact Applied Program.'
+              : 'Run requires an Applied Program and an idle, reset runner.'}
+          onClick={() => { void (canResume ? robot.resume() : program.run()); }}
         >
-          {state.pending === 'run' ? 'Starting…' : 'Run'}
+          {robot.controlPending === 'resume'
+            ? 'Resuming…'
+            : state.pending === 'run'
+              ? 'Starting…'
+              : canResume ? 'Resume Motion' : 'Run'}
         </button>
-        <button
-          type="button"
-          className="danger-button"
-          disabled={!enabled || !motionActive || robot.state.phase === 'stopping'}
-          title={motionActive
-            ? 'Stop the exact active manual-control operation.'
-            : 'No addressed manual-control operation is active.'}
-          onClick={() => { void robot.stop(); }}
+        <div
+          className="transport-stop-group"
+          onBlur={(event) => {
+            if (!event.currentTarget.contains(event.relatedTarget)) {
+              setStopMenuOpen(false);
+            }
+          }}
+          onKeyDown={(event) => {
+            if (event.key === 'Escape') {
+              setStopMenuOpen(false);
+              event.stopPropagation();
+            }
+          }}
         >
-          {robot.state.phase === 'stopping' ? 'Stopping…' : 'Stop motion'}
-        </button>
-        <button
-          type="button"
-          className="transport-stop-program"
-          disabled={!enabled || !programActive || state.pending !== null}
-          title={programActive
-            ? 'Stop Program execution. This is separate from stopping one manual-control operation.'
-            : 'No Program run is active.'}
-          onClick={() => { void program.stop(); }}
-        >
-          {state.pending === 'stop' ? 'Stopping…' : 'Stop Program'}
-        </button>
+          <button
+            type="button"
+            className="danger-button transport-stop-primary"
+            disabled={!enabled || !motionActive || robot.state.phase === 'stopping'}
+            title={motionActive
+              ? 'Stop the exact active robot motion.'
+              : 'No addressed robot motion is active.'}
+            onClick={() => { void robot.stop(); }}
+          >
+            {robot.state.phase === 'stopping' ? 'Stopping…' : 'Stop'}
+          </button>
+          <button
+            type="button"
+            className="danger-button transport-stop-disclosure"
+            disabled={!enabled || !programActive || state.pending !== null}
+            aria-label="More Stop actions"
+            aria-haspopup="menu"
+            aria-expanded={stopMenuOpen}
+            title={programActive
+              ? 'Show the separate Stop Execution command.'
+              : 'No Program execution is active.'}
+            onClick={() => setStopMenuOpen((open) => !open)}
+          >
+            ▾
+          </button>
+          {stopMenuOpen && (
+            <div className="transport-stop-menu" role="menu">
+              <button
+                type="button"
+                className="danger-button"
+                role="menuitem"
+                disabled={!enabled || !programActive || state.pending !== null}
+                title="Stop the complete Program execution, not only its current robot motion."
+                onClick={() => {
+                  setStopMenuOpen(false);
+                  void program.stop();
+                }}
+              >
+                {state.pending === 'stop' ? 'Stopping…' : 'Stop Execution'}
+              </button>
+            </div>
+          )}
+        </div>
         <button
           type="button"
           className={canReset ? 'transport-reset meaningful' : 'transport-reset'}
