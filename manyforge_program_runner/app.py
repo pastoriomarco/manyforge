@@ -14,7 +14,16 @@ from manyforge_headless_api.models import (
     ProgramRunStopRequest,
 )
 
-from .models import ProgramCycleResetRequest
+from .models import (
+    CycleRecoveryActionRequest,
+    ManualResultStageRequest,
+    ProgramCycleResetRequest,
+    ProgramScenePreparationRequest,
+    RuntimeBlackboardWriteRequest,
+    RuntimeOverrideActionRequest,
+    RuntimeOverridePromotionRequest,
+    RuntimeOverrideStageRequest,
+)
 from .runtime import ProgramRunnerError
 
 
@@ -32,6 +41,10 @@ class ProgramRunnerApplicationPort(Protocol):
 
     def start_run(self, request: ProgramRunStartRequest) -> dict[str, Any]: ...
 
+    def prepare_applied_scene(
+        self, request: ProgramScenePreparationRequest
+    ) -> dict[str, Any]: ...
+
     def read_run(self, program_run_id: str) -> dict[str, Any]: ...
 
     def stop_run(
@@ -43,6 +56,36 @@ class ProgramRunnerApplicationPort(Protocol):
     def reset_cycle(self, request: ProgramCycleResetRequest) -> dict[str, Any]: ...
 
     def cycle_status(self) -> dict[str, Any]: ...
+
+    def read_runtime_controls(self, program_run_id: str) -> dict[str, Any]: ...
+
+    def stage_runtime_override(
+        self, program_run_id: str, request: RuntimeOverrideStageRequest
+    ) -> dict[str, Any]: ...
+
+    def activate_runtime_override(
+        self, program_run_id: str, request: RuntimeOverrideActionRequest
+    ) -> dict[str, Any]: ...
+
+    def clear_runtime_override(
+        self, program_run_id: str, request: RuntimeOverrideActionRequest
+    ) -> dict[str, Any]: ...
+
+    def promote_runtime_override(
+        self, program_run_id: str, request: RuntimeOverridePromotionRequest
+    ) -> dict[str, Any]: ...
+
+    def write_runtime_blackboard(
+        self, program_run_id: str, request: RuntimeBlackboardWriteRequest
+    ) -> dict[str, Any]: ...
+
+    def stage_manual_result(
+        self, program_run_id: str, request: ManualResultStageRequest
+    ) -> dict[str, Any]: ...
+
+    def apply_recovery_action(
+        self, request: CycleRecoveryActionRequest
+    ) -> dict[str, Any]: ...
 
 
 def _status(code: str) -> int:
@@ -103,6 +146,7 @@ def create_app(runtime: ProgramRunnerApplicationPort) -> FastAPI:
             content={
                 "detail": {
                     "code": error.code,
+                    "details": error.details,
                     "message": str(error),
                 }
             },
@@ -123,6 +167,12 @@ def create_app(runtime: ProgramRunnerApplicationPort) -> FastAPI:
     def start_run(request: ProgramRunStartRequest) -> dict[str, Any]:
         return runtime.start_run(request)
 
+    @app.post("/api/program/scene-preparations")
+    def prepare_applied_scene(
+        request: ProgramScenePreparationRequest,
+    ) -> dict[str, Any]:
+        return runtime.prepare_applied_scene(request)
+
     @app.get("/api/program/runs/{program_run_id}")
     def read_run(
         program_run_id: Annotated[str, Path(min_length=1, max_length=256)],
@@ -141,11 +191,69 @@ def create_app(runtime: ProgramRunnerApplicationPort) -> FastAPI:
             )
         return runtime.stop_run(program_run_id, request)
 
+    @app.get("/api/program/runs/{program_run_id}/runtime-controls")
+    def read_runtime_controls(
+        program_run_id: Annotated[str, Path(min_length=1, max_length=256)],
+    ) -> dict[str, Any]:
+        return runtime.read_runtime_controls(program_run_id)
+
+    @app.post("/api/program/runs/{program_run_id}/runtime-overrides")
+    def stage_runtime_override(
+        program_run_id: Annotated[str, Path(min_length=1, max_length=256)],
+        request: RuntimeOverrideStageRequest,
+    ) -> dict[str, Any]:
+        return runtime.stage_runtime_override(program_run_id, request)
+
+    @app.post(
+        "/api/program/runs/{program_run_id}/runtime-overrides/activate"
+    )
+    def activate_runtime_override(
+        program_run_id: Annotated[str, Path(min_length=1, max_length=256)],
+        request: RuntimeOverrideActionRequest,
+    ) -> dict[str, Any]:
+        return runtime.activate_runtime_override(program_run_id, request)
+
+    @app.post("/api/program/runs/{program_run_id}/runtime-overrides/clear")
+    def clear_runtime_override(
+        program_run_id: Annotated[str, Path(min_length=1, max_length=256)],
+        request: RuntimeOverrideActionRequest,
+    ) -> dict[str, Any]:
+        return runtime.clear_runtime_override(program_run_id, request)
+
+    @app.post(
+        "/api/program/runs/{program_run_id}/runtime-overrides/promote"
+    )
+    def promote_runtime_override(
+        program_run_id: Annotated[str, Path(min_length=1, max_length=256)],
+        request: RuntimeOverridePromotionRequest,
+    ) -> dict[str, Any]:
+        return runtime.promote_runtime_override(program_run_id, request)
+
+    @app.post("/api/program/runs/{program_run_id}/blackboard-values")
+    def write_runtime_blackboard(
+        program_run_id: Annotated[str, Path(min_length=1, max_length=256)],
+        request: RuntimeBlackboardWriteRequest,
+    ) -> dict[str, Any]:
+        return runtime.write_runtime_blackboard(program_run_id, request)
+
+    @app.post("/api/program/runs/{program_run_id}/manual-result")
+    def stage_manual_result(
+        program_run_id: Annotated[str, Path(min_length=1, max_length=256)],
+        request: ManualResultStageRequest,
+    ) -> dict[str, Any]:
+        return runtime.stage_manual_result(program_run_id, request)
+
+    @app.post("/api/cycle/recovery-actions")
+    def apply_recovery_action(
+        request: CycleRecoveryActionRequest,
+    ) -> dict[str, Any]:
+        return runtime.apply_recovery_action(request)
+
     @app.post("/api/program/cycle/reset")
     def reset_cycle(request: ProgramCycleResetRequest) -> dict[str, Any]:
         return runtime.reset_cycle(request)
 
-    @app.get("/api/program/cycle/status")
+    @app.get("/api/cycle/status")
     def cycle_status() -> dict[str, Any]:
         return runtime.cycle_status()
 

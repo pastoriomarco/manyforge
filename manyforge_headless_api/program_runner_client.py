@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
+from copy import deepcopy
 from typing import Any, Protocol
 from urllib.parse import quote, urlsplit
 
@@ -22,16 +23,21 @@ class ProgramRunnerClientError(RuntimeError):
         code: str,
         message: str,
         status_code: int | None = None,
+        *,
+        details: Mapping[str, Any] | None = None,
     ) -> None:
         super().__init__(message)
         self.code = code
         self.status_code = status_code
+        self.details = deepcopy(dict(details or {}))
 
 
 class ProgramRunnerPort(Protocol):
     def runs(self, *, active_only: bool, limit: int) -> dict[str, Any]: ...
 
     def start_run(self, body: Mapping[str, Any]) -> dict[str, Any]: ...
+
+    def prepare_applied_scene(self, body: Mapping[str, Any]) -> dict[str, Any]: ...
 
     def read_run(self, program_run_id: str) -> dict[str, Any]: ...
 
@@ -44,6 +50,14 @@ class ProgramRunnerPort(Protocol):
     def cycle_status(self) -> dict[str, Any]: ...
 
     def reset_cycle(self, body: Mapping[str, Any]) -> dict[str, Any]: ...
+
+    def runtime_controls(self, program_run_id: str) -> dict[str, Any]: ...
+
+    def runtime_control_action(
+        self, program_run_id: str, suffix: str, body: Mapping[str, Any]
+    ) -> dict[str, Any]: ...
+
+    def apply_recovery_action(self, body: Mapping[str, Any]) -> dict[str, Any]: ...
 
     def close(self) -> None: ...
 
@@ -87,12 +101,14 @@ class ProgramRunnerHttpClient:
         detail = value.get("detail")
         code = detail.get("code") if isinstance(detail, Mapping) else None
         message = detail.get("message") if isinstance(detail, Mapping) else None
+        details = detail.get("details") if isinstance(detail, Mapping) else None
         return ProgramRunnerClientError(
             code if isinstance(code, str) and code else "program_runner_http_error",
             message
             if isinstance(message, str) and message
             else f"Program runner returned HTTP {status_code}",
             status_code,
+            details=details if isinstance(details, Mapping) else None,
         )
 
     def _request(
@@ -103,7 +119,16 @@ class ProgramRunnerHttpClient:
         params: Sequence[tuple[str, str | int]] = (),
         body: Mapping[str, Any] | None = None,
     ) -> dict[str, Any]:
-        if not path.startswith("/api/program/") or ".." in path:
+        if (
+            not (
+                path.startswith("/api/program/")
+                or path in {
+                    "/api/cycle/status",
+                    "/api/cycle/recovery-actions",
+                }
+            )
+            or ".." in path
+        ):
             raise ValueError("Program-runner path is invalid")
         try:
             with self._client.stream(
@@ -180,6 +205,11 @@ class ProgramRunnerHttpClient:
     def start_run(self, body: Mapping[str, Any]) -> dict[str, Any]:
         return self._request("POST", "/api/program/runs", body=body)
 
+    def prepare_applied_scene(self, body: Mapping[str, Any]) -> dict[str, Any]:
+        return self._request(
+            "POST", "/api/program/scene-preparations", body=body
+        )
+
     def read_run(self, program_run_id: str) -> dict[str, Any]:
         return self._request("GET", self._run_path(program_run_id))
 
@@ -195,10 +225,40 @@ class ProgramRunnerHttpClient:
         )
 
     def cycle_status(self) -> dict[str, Any]:
-        return self._request("GET", "/api/program/cycle/status")
+        return self._request("GET", "/api/cycle/status")
 
     def reset_cycle(self, body: Mapping[str, Any]) -> dict[str, Any]:
         return self._request("POST", "/api/program/cycle/reset", body=body)
+
+    def runtime_controls(self, program_run_id: str) -> dict[str, Any]:
+        return self._request(
+            "GET", f"{self._run_path(program_run_id)}/runtime-controls"
+        )
+
+    def runtime_control_action(
+        self,
+        program_run_id: str,
+        suffix: str,
+        body: Mapping[str, Any],
+    ) -> dict[str, Any]:
+        allowed = {
+            "runtime-overrides",
+            "runtime-overrides/activate",
+            "runtime-overrides/clear",
+            "runtime-overrides/promote",
+            "blackboard-values",
+            "manual-result",
+        }
+        if suffix not in allowed:
+            raise ValueError("runtime-control action is unsupported")
+        return self._request(
+            "POST",
+            f"{self._run_path(program_run_id)}/{suffix}",
+            body=body,
+        )
+
+    def apply_recovery_action(self, body: Mapping[str, Any]) -> dict[str, Any]:
+        return self._request("POST", "/api/cycle/recovery-actions", body=body)
 
     def close(self) -> None:
         if self._owns_client:

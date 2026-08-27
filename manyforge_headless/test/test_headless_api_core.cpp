@@ -978,6 +978,12 @@ TEST(HeadlessApiCore,
   } catch (const OperatorAlarmError &error) {
     EXPECT_EQ(error.code(), "assistant_mode_projection_unavailable");
   }
+  try {
+    static_cast<void>(core.AssistantModeContext("composer-assistant"));
+    FAIL() << "canonical-empty selection produced an assistant context";
+  } catch (const OperatorAlarmError &error) {
+    EXPECT_EQ(error.code(), "assistant_mode_projection_unavailable");
+  }
 }
 
 TEST(HeadlessApiCore,

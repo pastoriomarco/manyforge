@@ -33,6 +33,8 @@ inline constexpr std::string_view kScenarioProgramSelectionSchemaVersion =
     "manyforge.scenario_program_selection.v2";
 inline constexpr std::string_view kSourceModelContextSchemaVersion =
     "manyforge.source_model_context.v1";
+inline constexpr std::string_view kAssistantModeContextSchemaVersion =
+    "manyforge.assistant_mode_context.v1";
 inline constexpr std::size_t kMaximumViewerModelResourceUriBytes = 4096U;
 
 class HeadlessApiOwnerLock;
@@ -176,6 +178,8 @@ public:
   SourceModelProjection();
   [[nodiscard]] manyforge::content_identity::CanonicalValue
   SourceModelContext();
+  [[nodiscard]] manyforge::content_identity::CanonicalValue
+  AssistantModeContext(std::string_view mode_id);
   [[nodiscard]] manyforge::content_identity::CanonicalValue
   ScenarioCatalogProjection();
   [[nodiscard]] manyforge::content_identity::CanonicalValue

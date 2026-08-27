@@ -849,15 +849,15 @@ def _fixed_scene_object(
         "collision_shapes": [
             {
                 "type": "box",
-                "dimensions_m": {"x": 0.1, "y": 0.1, "z": 0.1},
+                "box_dimensions_m": {"x_m": 0.1, "y_m": 0.1, "z_m": 0.1},
             }
         ],
         "placement": {
             "kind": "cell_fixed",
             "cell_id": "cell-a",
             "pose_in_cell": {
-                "position_m": {"x": 1.0, "y": 2.0, "z": 3.0},
-                "orientation_xyzw": [0.0, 0.0, 0.0, 1.0],
+                "position_m": {"x_m": 1.0, "y_m": 2.0, "z_m": 3.0},
+                "orientation": {"x": 0.0, "y": 0.0, "z": 0.0, "w": 1.0},
             },
         },
         "provider_evidence": None,
@@ -916,6 +916,13 @@ class _SceneTransport:
                 }
             ]
         self.submissions: list[dict[str, Any]] = []
+        self.admission_generation = 1
+
+    def authoring_admission(self) -> dict[str, Any]:
+        return {
+            "authoring_allowed": True,
+            "admission_generation": self.admission_generation,
+        }
 
     def scene(self) -> dict[str, Any]:
         return {
@@ -1013,10 +1020,19 @@ class _SceneTransport:
         elif kind == "remove_object":
             self.objects.pop(operation["scene_resource_id"])
         elif kind in {"add_object", "upsert_object"}:
-            scene_object = _fixed_scene_object(operation["scene_resource_id"])
-            scene_object["support_contacts"] = deepcopy(
-                operation["support_contacts"]
-            )
+            frame_ref = operation["frame_ref"]
+            scene_object = {
+                "scene_resource_id": operation["scene_resource_id"],
+                "collision_shapes": [deepcopy(operation["shape"])],
+                "placement": {
+                    "kind": "cell_fixed",
+                    "cell_id": "cell-a",
+                    "pose_in_cell": deepcopy(operation["pose"]),
+                },
+                "provider_evidence": None,
+                "support_contacts": deepcopy(operation["support_contacts"]),
+            }
+            assert frame_ref["kind"] in {"cell_frame", "component_frame"}
             self.objects[operation["scene_resource_id"]] = scene_object
         elif kind == "update_object_pose":
             pass
@@ -1054,6 +1070,17 @@ class _SceneTransport:
             "content_hash": "sha256:"
             + f"{len(self.submissions):064x}"[-64:],
         }
+        if kind in {
+            "add_object",
+            "upsert_object",
+            "remove_object",
+            "update_object_pose",
+            "set_collision_policy",
+        }:
+            assert request["expected_admission_generation"] == (
+                self.admission_generation
+            )
+            self.admission_generation += 2
         context = request["request_context"]
         return {
             "api_version": "manyforge.manager_command_response.v1",
@@ -1108,7 +1135,7 @@ def test_scene_initialization_adds_pick_resources_last() -> None:
     transport = _SceneTransport(populated=True)
     port = HeadlessSceneProgramPort(transport)
 
-    port.initialize(_scene_context(), _authored_scene())
+    port.prepare_initial_scene(_scene_context(), _authored_scene())
 
     assert [request["operation"]["kind"] for request in transport.submissions] == [
         "detach_carried_object_at_current_pose",
@@ -1149,7 +1176,7 @@ def test_scene_initialization_forwards_authored_support_contact_policy() -> None
     }
     scene[0]["metadata"] = {"support_contacts": [support_contact]}
 
-    port.initialize(_scene_context(), scene)
+    port.prepare_initial_scene(_scene_context(), scene)
 
     add_operations = [
         request["operation"]
@@ -1174,7 +1201,6 @@ def test_scene_initialization_retries_concurrent_pose_revision_without_losing_sh
             super().__init__()
             self.rejected_requests: list[dict[str, Any]] = []
             self.injected_stale = False
-            self.injected_final_pose = False
 
         def _advance_pose_revision(self) -> None:
             revision_id = self.revision["scene_revision"]["revision_id"] + 1
@@ -1187,33 +1213,56 @@ def test_scene_initialization_retries_concurrent_pose_revision_without_losing_sh
         def commit_scene_transaction(
             self, body: Mapping[str, Any]
         ) -> dict[str, Any]:
-            operation = body["operation"]
             if not self.injected_stale:
                 self.injected_stale = True
                 self.rejected_requests.append(deepcopy(dict(body)))
                 self._advance_pose_revision()
                 raise _StaleRevision("external pose update advanced the scene")
-            response = super().commit_scene_transaction(body)
-            if (
-                operation.get("scene_resource_id") == "graspable"
-                and not self.injected_final_pose
-            ):
-                self.injected_final_pose = True
-                self._advance_pose_revision()
-            return response
+            return super().commit_scene_transaction(body)
 
     transport = _ConcurrentPoseTransport()
     port = HeadlessSceneProgramPort(transport)
 
-    port.initialize(_scene_context(), _authored_scene())
+    port.prepare_initial_scene(_scene_context(), _authored_scene())
 
     assert transport.injected_stale is True
-    assert transport.injected_final_pose is True
     assert sorted(transport.objects) == ["graspable", "table"]
     assert (
         transport.rejected_requests[0]["request_context"]["request_id"]
         != transport.submissions[0]["request_context"]["request_id"]
     )
+
+
+def test_exact_cell_frame_initial_scene_is_a_read_only_fast_path() -> None:
+    transport = _SceneTransport()
+    scene = [_authored_scene()[0]]
+    first = HeadlessSceneProgramPort(transport)
+    first.prepare_initial_scene(_scene_context(), scene)
+    assert len(transport.submissions) == 1
+
+    transport.submissions.clear()
+    replacement = HeadlessSceneProgramPort(transport)
+    proof = replacement.prepare_initial_scene(_scene_context(), scene)
+
+    assert transport.submissions == []
+    replacement.verify_initial_scene(_scene_context(), scene, proof)
+
+
+def test_prepared_scene_verification_rejects_an_intervening_owner_revision() -> None:
+    transport = _SceneTransport()
+    port = HeadlessSceneProgramPort(transport)
+    context = _scene_context()
+    scene = [_authored_scene()[0]]
+    proof = port.prepare_initial_scene(context, scene)
+    revision_id = transport.revision["scene_revision"]["revision_id"] + 1
+    transport.revision["scene_revision"] = {
+        "scene_id": _DIGEST_D,
+        "revision_id": revision_id,
+        "content_hash": "sha256:" + f"{revision_id:064x}"[-64:],
+    }
+
+    with pytest.raises(ProductionPortError, match="changed before Program capture"):
+        port.verify_initial_scene(context, scene, proof)
 
 
 def test_scene_context_can_bind_atomically_before_initialization_and_release() -> None:
@@ -1222,9 +1271,9 @@ def test_scene_context_can_bind_atomically_before_initialization_and_release() -
     context = _scene_context()
 
     port.bind(context)
-    port.initialize(context, _authored_scene())
+    port.prepare_initial_scene(context, _authored_scene())
     first_submission_count = len(transport.submissions)
-    port.initialize(context, _authored_scene())
+    port.prepare_initial_scene(context, _authored_scene())
     assert len(transport.submissions) == first_submission_count
 
     port.release(context.program_run_id)
@@ -1304,7 +1353,7 @@ def test_scene_nodes_translate_roles_and_detach_at_current_pose() -> None:
     transport = _SceneTransport()
     transport.objects["graspable"] = _fixed_scene_object("graspable")
     port = HeadlessSceneProgramPort(transport)
-    port.initialize(_scene_context(), [_authored_scene()[0]])
+    port.prepare_initial_scene(_scene_context(), [_authored_scene()[0]])
     transport.submissions.clear()
 
     attached = port.invoke(
@@ -1366,7 +1415,7 @@ def test_scene_node_retries_a_concurrent_pose_revision_with_one_correlation() ->
 
     transport = _ConcurrentPoseTransport()
     port = HeadlessSceneProgramPort(transport)
-    port.initialize(_scene_context(), [_authored_scene()[0]])
+    port.prepare_initial_scene(_scene_context(), [_authored_scene()[0]])
     transport.submissions.clear()
     transport.reject_next_node = True
 
@@ -1399,7 +1448,7 @@ def test_scene_node_retries_a_concurrent_pose_revision_with_one_correlation() ->
 def test_scene_resource_relative_pose_is_forwarded_to_the_scene_owner() -> None:
     transport = _SceneTransport()
     port = HeadlessSceneProgramPort(transport)
-    port.initialize(_scene_context(), _authored_scene())
+    port.prepare_initial_scene(_scene_context(), _authored_scene())
     transport.submissions.clear()
 
     result = port.invoke(
@@ -1436,7 +1485,7 @@ def test_scene_resource_relative_pose_is_forwarded_to_the_scene_owner() -> None:
 def test_stale_scene_projection_fails_before_a_node_commit() -> None:
     transport = _SceneTransport()
     port = HeadlessSceneProgramPort(transport)
-    port.initialize(_scene_context(), [])
+    port.prepare_initial_scene(_scene_context(), [])
     transport.submissions.clear()
     transport.revision["graph_revision"] = _DIGEST_F
 

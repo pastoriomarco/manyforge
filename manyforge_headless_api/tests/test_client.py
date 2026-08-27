@@ -231,6 +231,38 @@ def test_client_uses_the_atomic_source_model_context_route() -> None:
     ]
 
 
+def test_client_uses_the_atomic_assistant_mode_context_route() -> None:
+    requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return httpx.Response(
+            200,
+            json={
+                "assistant_mode": {},
+                "node_environment": {},
+                "schema_version": "manyforge.assistant_mode_context.v1",
+                "source_model": {},
+            },
+            request=request,
+        )
+
+    raw = httpx.Client(
+        base_url="http://headless.test",
+        transport=httpx.MockTransport(handler),
+    )
+    client = HeadlessHttpClient("http://unused.test", client=raw)
+    try:
+        assert client.assistant_mode_context("composer-assistant")[
+            "schema_version"
+        ] == "manyforge.assistant_mode_context.v1"
+    finally:
+        raw.close()
+    assert [request.url.path for request in requests] == [
+        "/api/assistant/modes/composer-assistant/context"
+    ]
+
+
 def test_context_http_bound_is_method_specific() -> None:
     payload = _sized_context_payload(MAX_HTTP_RESPONSE_BYTES + 1)
 

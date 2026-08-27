@@ -4,7 +4,6 @@ import { describe, expect, it } from 'vitest';
 
 import type {
   AppliedProgramSelection,
-  ProgramRunStatus,
   ProgramWorkspaceResponse,
   ScenarioCatalogResponse,
 } from '../types/api';
@@ -38,6 +37,7 @@ function admissionFixtures() {
       programRunnerOwnerEpoch: 'runner.epoch.1', cycleGeneration: 3,
       state: 'idle_after_reset', programRunId: null,
       cycleClaimGeneration: null, terminalOrSettlementReference: null,
+      runtimeControlRevision: null, recoveryOffer: null,
     },
     draftIdentity: { draftId: 'draft-1', draftRevision: 5 },
   } as ComposerHeadlessState;
@@ -87,6 +87,8 @@ describe('Program runtime idle selection', () => {
         programRunnerOwnerEpoch: 'runner.1',
         cycleGeneration: 2,
         state: 'idle_after_reset',
+        runtimeControlRevision: null,
+        recoveryOffer: null,
       },
       draftIdentity: { draftId: 'draft-1', draftRevision: 5 },
     } as ComposerHeadlessState;
@@ -112,6 +114,13 @@ describe('Program runtime idle selection', () => {
       authoringAdmission: {
         ...snapshot.authoringAdmission,
         admissionGeneration: 8,
+      },
+    })).not.toBe(programRuntimeWakeKey(snapshot));
+    expect(programRuntimeWakeKey({
+      ...snapshot,
+      programCycle: {
+        ...snapshot.programCycle,
+        runtimeControlRevision: 2,
       },
     })).not.toBe(programRuntimeWakeKey(snapshot));
   });
@@ -185,13 +194,11 @@ describe('Program runtime authority requests', () => {
         state: 'terminal_awaiting_reset' as const,
         programRunId: 'run-1', cycleClaimGeneration: 12,
         terminalOrSettlementReference: terminalReference,
+        runtimeControlRevision: null, recoveryOffer: null,
       },
     };
-    const run = {
-      capture: { programRunId: 'run-1' },
-    } as ProgramRunStatus;
     expect(buildProgramResetRequest(
-      run, terminalSnapshot, 'composer-program-owner.fixture', 'reset.fixture',
+      terminalSnapshot, 'composer-program-owner.fixture', 'reset.fixture',
     )).toEqual({
       request_id: 'reset.fixture',
       request_owner_epoch: 'composer-program-owner.fixture',
@@ -205,8 +212,14 @@ describe('Program runtime authority requests', () => {
       settlement_evidence_digest: terminalReference,
     });
     expect(buildProgramResetRequest(
-      { capture: { programRunId: 'other' } } as ProgramRunStatus,
-      terminalSnapshot, 'composer-program-owner.fixture', 'reset.fixture',
+      {
+        ...terminalSnapshot,
+        programCycle: {
+          ...terminalSnapshot.programCycle,
+          terminalOrSettlementReference: null,
+        },
+      },
+      'composer-program-owner.fixture', 'reset.fixture',
     )).toBeNull();
   });
 });

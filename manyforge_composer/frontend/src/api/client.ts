@@ -24,6 +24,10 @@ import {
   parseProgramWorkspaceTransitionResponse,
   parseCurrentScenarioResponse,
   parseProgramCycleResetResult,
+  parseProgramRuntimeControlProjection,
+  parseProgramRuntimeControlResult,
+  parseCycleRecoveryActionResult,
+  parseRuntimeOverrideMaterializationResponse,
   parseProgramRunIndex,
   parseProgramRunStatus,
   parseScenarioCatalogResponse,
@@ -64,6 +68,10 @@ import type {
   ProgramWorkspaceTransitionResponse,
   CurrentScenarioResponse,
   ProgramCycleResetResult,
+  ProgramRuntimeControlProjection,
+  ProgramRuntimeControlResult,
+  CycleRecoveryActionResult,
+  RuntimeOverrideMaterializationResponse,
   ProgramRunIndex,
   ProgramRunStatus,
   ScenarioCatalogResponse,
@@ -459,6 +467,24 @@ export const api = {
         }),
       },
     ),
+    materializeRuntimeOverride: (
+      fence: DraftFenceRequest,
+      programRunId: string,
+      proposalId: string,
+      signal?: AbortSignal,
+    ): Promise<RuntimeOverrideMaterializationResponse> => requestJson(
+      '/api/program/draft/runtime-override-promotions',
+      parseRuntimeOverrideMaterializationResponse,
+      signal,
+      {
+        method: 'POST',
+        body: JSON.stringify({
+          ...fence,
+          programRunId,
+          proposalId,
+        }),
+      },
+    ),
   },
   programs: {
     scenarios: (signal?: AbortSignal): Promise<ScenarioCatalogResponse> =>
@@ -515,6 +541,39 @@ export const api = {
     ): Promise<ProgramCycleResetResult> => requestJson(
       '/api/program/cycle/reset',
       parseProgramCycleResetResult,
+      signal,
+      { method: 'POST', body: JSON.stringify(body) },
+    ),
+    runtimeControls: (
+      programRunId: string,
+      signal?: AbortSignal,
+    ): Promise<ProgramRuntimeControlProjection> => requestJson(
+      `/api/program/runs/${encodeURIComponent(programRunId)}/runtime-controls`,
+      parseProgramRuntimeControlProjection,
+      signal,
+    ),
+    runtimeControlAction: (
+      programRunId: string,
+      action: 'runtime-overrides'
+        | 'runtime-overrides/activate'
+        | 'runtime-overrides/clear'
+        | 'runtime-overrides/promote'
+        | 'blackboard-values'
+        | 'manual-result',
+      body: Record<string, JsonValue>,
+      signal?: AbortSignal,
+    ): Promise<ProgramRuntimeControlResult> => requestJson(
+      `/api/program/runs/${encodeURIComponent(programRunId)}/${action}`,
+      parseProgramRuntimeControlResult,
+      signal,
+      { method: 'POST', body: JSON.stringify(body) },
+    ),
+    applyRecoveryAction: (
+      body: Record<string, JsonValue>,
+      signal?: AbortSignal,
+    ): Promise<CycleRecoveryActionResult> => requestJson(
+      '/api/cycle/recovery-actions',
+      parseCycleRecoveryActionResult,
       signal,
       { method: 'POST', body: JSON.stringify(body) },
     ),

@@ -59,6 +59,7 @@ class _Headless:
         self.manager_target = False
         self.manager_apply_bodies: list[dict[str, Any]] = []
         self.program_apply_bodies: list[dict[str, Any]] = []
+        self.scene_preparations: list[dict[str, Any]] = []
 
     def scenario_program_selection(self, scenario_id: str) -> dict[str, Any]:
         assert scenario_id == self.selection["scenario_id"]
@@ -131,6 +132,20 @@ class _Headless:
             "applied": deepcopy(self.applied),
         }
 
+    def program_scene_prepare(self, body: dict[str, Any]) -> dict[str, Any]:
+        self.scene_preparations.append(deepcopy(body))
+        assert self.applied is not None
+        return {
+            "schema_version": "manyforge.program_scene_preparation.v1",
+            "status": "prepared",
+            "applied_record_digest": self.applied["source"]["record_digest"],
+            "program_revision": self.applied["program_revision"],
+            "admission_generation": 7,
+            "prepared_scene": {
+                "schema_version": "manyforge.prepared_program_scene.v1"
+            },
+        }
+
 
 class _Coordinator:
     owner_epoch = "composer-owner-1"
@@ -151,6 +166,9 @@ class _Coordinator:
             {"intent": {"claim_kind": "authoring_mutation"}}
         )
         arguments["post_image"]()
+        after_release = arguments.get("after_release")
+        if after_release is not None:
+            after_release()
         return result
 
 
@@ -202,6 +220,7 @@ def test_startup_load_activates_deployment_then_program(
         "claim_kind"
     ] == "authoring_mutation"
     assert len(headless.program_apply_bodies) == 1
+    assert len(headless.scene_preparations) == 1
     assert headless.program_apply_bodies[0]["program"] == selection["program"]
     assert result["workspace"]["saved"]["matchesDraft"] is True
     assert result["workspace"]["applied"]["matchesDraft"] is True
@@ -223,6 +242,7 @@ def test_startup_load_is_effect_idempotent_when_scenario_is_already_current() ->
     assert len(coordinator.executions) == 1
     assert headless.manager_apply_bodies == []
     assert headless.program_apply_bodies == []
+    assert len(headless.scene_preparations) == 1
 
 
 def test_startup_load_does_not_confirm_discard_for_an_empty_draft(

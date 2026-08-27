@@ -75,7 +75,7 @@ def test_existing_unsupported_database_is_rejected_without_mutation(
             database.execute("PRAGMA writable_schema=ON")
             database.execute(
                 "UPDATE sqlite_schema SET sql=replace(sql,"
-                "' CHECK(schema_version=2)','') "
+                "' CHECK(schema_version=3)','') "
                 "WHERE name='program_cycle_metadata'"
             )
             database.execute("PRAGMA writable_schema=OFF")
@@ -109,7 +109,7 @@ def test_absent_database_creates_only_current_schema_under_existing_parent(
     try:
         assert database.execute(
             "SELECT schema_version FROM program_cycle_metadata WHERE singleton=1"
-        ).fetchone() == (2,)
+        ).fetchone() == (3,)
         assert {
             row[0]
             for row in database.execute(
@@ -212,7 +212,7 @@ def test_read_only_preflight_sees_crash_left_wal_without_mutating_it(
         reader.execute("BEGIN")
         assert reader.execute(
             "SELECT schema_version FROM program_cycle_metadata"
-        ).fetchone() == (2,)
+        ).fetchone() == (3,)
         writer = sqlite3.connect(path, isolation_level=None)
         try:
             writer.execute("PRAGMA wal_autocheckpoint=0")
@@ -385,6 +385,7 @@ def test_known_rejection_replays_and_unresolved_request_never_reexecutes(
     assert rejected.error == {
         "code": "program_run_draft_applied_mismatch",
         "message": "Draft and Applied Program revisions differ",
+        "details": {},
     }
 
     assert journal.record_request(

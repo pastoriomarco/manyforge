@@ -110,6 +110,12 @@ export function sameHeadlessProjection(
       === candidate.programCycle.cycleClaimGeneration
     && current.programCycle.terminalOrSettlementReference
       === candidate.programCycle.terminalOrSettlementReference
+    && current.programCycle.runtimeControlRevision
+      === candidate.programCycle.runtimeControlRevision
+    && current.programCycle.recoveryOffer?.offerId
+      === candidate.programCycle.recoveryOffer?.offerId
+    && current.programCycle.recoveryOffer?.offerRevision
+      === candidate.programCycle.recoveryOffer?.offerRevision
     && current.draftIdentity.draftId === candidate.draftIdentity.draftId
     && current.draftIdentity.draftRevision === candidate.draftIdentity.draftRevision;
 }

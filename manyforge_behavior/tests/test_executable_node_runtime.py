@@ -39,6 +39,8 @@ from manyforge_behavior.orchestration_ports import (
 )
 from manyforge_behavior.orchestration_values import (
     NodeAttemptInputResolver,
+    ProgramRuntimeOverrideStore,
+    ProgramValueError,
     ProgramValueStore,
 )
 from manyforge_behavior.program import Program, ProgramTreeNode
@@ -619,6 +621,88 @@ def test_top_level_value_source_is_one_attempt_snapshot() -> None:
     assert node.update() is py_trees.common.Status.FAILURE
 
 
+def test_runtime_override_changes_only_later_attempt_inputs() -> None:
+    catalog = _catalog()
+    program = Program(
+        _ROOT / "examples/lite6_lite_gripper_pick_and_place.program.yaml",
+        catalog,
+    )
+    move = next(
+        node
+        for node in _walk(program.tree)
+        if node.node_id == "motion.move_to_joint_target"
+    )
+    store = ProgramValueStore.from_program(program)
+    overrides = ProgramRuntimeOverrideStore(program=program, catalog=catalog)
+    resolver = NodeAttemptInputResolver(
+        program=program,
+        catalog=catalog,
+        value_store=store,
+        runtime_overrides=overrides,
+    )
+    before = resolver.snapshot(
+        node_id=move.node_id,
+        node_instance_id=move.instance_id,
+        parameters=move.parameters,
+        value_sources=move.value_sources,
+    )
+    overrides.activate(move.instance_id, "velocity_scale", 0.25)
+    after = resolver.snapshot(
+        node_id=move.node_id,
+        node_instance_id=move.instance_id,
+        parameters=move.parameters,
+        value_sources=move.value_sources,
+    )
+
+    assert before.parameters["velocity_scale"] != 0.25
+    assert after.parameters["velocity_scale"] == 0.25
+    assert before.parameters["velocity_scale"] != after.parameters["velocity_scale"]
+
+
+def test_runtime_override_cannot_replace_captured_binding_selectors() -> None:
+    catalog = _catalog()
+    program = Program(
+        _ROOT / "examples/lite6_lite_gripper_pick_and_place.program.yaml",
+        catalog,
+    )
+    move = next(
+        node
+        for node in _walk(program.tree)
+        if node.node_id == "motion.move_to_joint_target"
+    )
+    overrides = ProgramRuntimeOverrideStore(program=program, catalog=catalog)
+
+    with pytest.raises(ProgramValueError, match="captured binding meaning"):
+        overrides.validate(move.instance_id, "target_role", "other_arm")
+    with pytest.raises(ProgramValueError, match="captured binding meaning"):
+        overrides.validate(move.instance_id, "planning_profile", "first_feasible")
+
+
+def test_runtime_override_cannot_add_or_change_nested_semantic_selectors() -> None:
+    catalog = _catalog()
+    program = Program(
+        _ROOT / "examples/lite6_lite_gripper_pick_and_place.program.yaml",
+        catalog,
+    )
+    move = next(
+        node
+        for node in _walk(program.tree)
+        if node.instance_id == "move_to_pick_approach"
+    )
+    overrides = ProgramRuntimeOverrideStore(program=program, catalog=catalog)
+    goal = deepcopy(dict(move.parameters["goal"]))
+    goal["frame_ref"] = {"kind": "cell_frame"}
+
+    with pytest.raises(ProgramValueError, match="captured semantic selection"):
+        overrides.validate(move.instance_id, "goal", goal)
+
+    changed_position = deepcopy(dict(move.parameters["goal"]))
+    changed_position["position_m"] = [0.0, 0.0, 0.2]
+    assert overrides.validate(move.instance_id, "goal", changed_position) == (
+        changed_position
+    )
+
+
 def test_nested_model_sources_are_captured_atomically_by_path() -> None:
     catalog = _catalog()
     program = Program(_ROOT / "examples/semantic_shape_pick.program.yaml", catalog)
@@ -640,6 +724,7 @@ def test_nested_model_sources_are_captured_atomically_by_path() -> None:
         value_store=store,
     ).snapshot(
         node_id=query.node_id,
+        node_instance_id=query.instance_id,
         parameters=query.parameters,
         value_sources=query.value_sources,
     )

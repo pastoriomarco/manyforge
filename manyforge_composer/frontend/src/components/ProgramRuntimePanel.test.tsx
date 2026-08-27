@@ -103,10 +103,12 @@ function controller(
         reasonCode: null,
         message: '',
       },
+      controls: null,
       selectedScenarioId: null,
       runnerAvailable: true,
       loading: false,
       pending: null,
+      controlPending: null,
       error: null,
     },
     cycleState,
@@ -118,6 +120,15 @@ function controller(
     run: vi.fn(),
     stop: vi.fn(),
     reset: vi.fn(),
+    applyRecoveryAction: vi.fn(),
+    stageObservationOverride: vi.fn(),
+    activateRuntimeOverride: vi.fn(),
+    clearRuntimeOverride: vi.fn(),
+    promoteRuntimeOverride: vi.fn(),
+    materializePromotion: vi.fn(),
+    promotionMaterializationReason: vi.fn(() => null),
+    writeRuntimeBlackboard: vi.fn(),
+    stageManualResult: vi.fn(),
   };
 }
 

@@ -2,6 +2,7 @@ import { useRef, useState } from 'react';
 
 import type { ProgramRuntimeController } from '../hooks/useProgramRuntime';
 import type { RobotControlController } from '../hooks/useRobotControl';
+import type { JsonValue } from '../types/api';
 import { robotControlHasActiveOperation } from '../state/robotControl';
 import { OverlayPanel } from './OverlayPanel';
 
@@ -20,13 +21,69 @@ function stateLabel(state: string): string {
   return state.replaceAll('_', ' ');
 }
 
+function actionLabel(value: string): string {
+  const label = value.replace(/^recovery\./, '').replaceAll('_', ' ');
+  return label.charAt(0).toUpperCase() + label.slice(1);
+}
+
+function parseRuntimeValue(type: string, source: string): JsonValue {
+  const trimmed = source.trim();
+  if (type === 'string') return source;
+  if (type === 'bool' || type === 'boolean') {
+    if (trimmed === 'true') return true;
+    if (trimmed === 'false') return false;
+    throw new Error('Enter true or false.');
+  }
+  if (/^(u?int)(8|16|32|64)?$/.test(type)) {
+    if (!/^-?\d+$/.test(trimmed)) throw new Error('Enter a whole number.');
+    const value = Number(trimmed);
+    if (!Number.isSafeInteger(value)) throw new Error('Enter a safe whole number.');
+    return value;
+  }
+  if (/^(float|double)(32|64)?$/.test(type)) {
+    const value = Number(trimmed);
+    if (!Number.isFinite(value)) throw new Error('Enter a finite number.');
+    return value;
+  }
+  return JSON.parse(trimmed) as JsonValue;
+}
+
 export function ProgramRuntimePanel({
   enabled,
   controller,
 }: ProgramRuntimePanelProps) {
-  const { state, cycleState, refresh, run, stop, reset } = controller;
+  const {
+    state,
+    cycleState,
+    refresh,
+    run,
+    stop,
+    reset,
+    applyRecoveryAction,
+    activateRuntimeOverride,
+    clearRuntimeOverride,
+    promoteRuntimeOverride,
+    materializePromotion,
+    promotionMaterializationReason,
+    writeRuntimeBlackboard,
+    stageManualResult,
+  } = controller;
+  const [confirmation, setConfirmation] = useState<string | null>(null);
+  const [blackboardKey, setBlackboardKey] = useState('');
+  const [blackboardValue, setBlackboardValue] = useState('');
+  const [blackboardError, setBlackboardError] = useState<string | null>(null);
+  const [manualOutput, setManualOutput] = useState('null');
+  const [manualError, setManualError] = useState<string | null>(null);
   const canStop = state.run?.state === 'running'
     || state.run?.state === 'intervention_required';
+  const controls = state.controls?.runtimeControls ?? null;
+  const recoveryOffer = state.controls?.recoveryOffer ?? null;
+  const writableKeys = (state.applied?.program.blackboard?.keys ?? []).filter(
+    (key) => key.access === 'write' || key.access === 'read_write',
+  );
+  const selectedBlackboardKey = writableKeys.find(
+    (key) => key.key === blackboardKey,
+  ) ?? null;
 
   return (
     <section className="panel program-runtime-panel" aria-labelledby="program-runtime-title">
@@ -38,7 +95,7 @@ export function ProgramRuntimePanel({
         <button
           type="button"
           className="quiet-button"
-          disabled={!enabled || state.pending !== null}
+          disabled={!enabled || state.pending !== null || state.controlPending !== null}
           onClick={() => { void refresh(); }}
         >
           Refresh status
@@ -136,6 +193,246 @@ export function ProgramRuntimePanel({
           <span>{state.error}</span>
         </div>
       )}
+
+      {enabled && recoveryOffer !== null && (
+        <section className="runtime-control-section" aria-labelledby="runtime-recovery-title">
+          <div className="runtime-control-heading">
+            <div>
+              <span>Current held attempt</span>
+              <h3 id="runtime-recovery-title">Recovery</h3>
+            </div>
+            <code>offer {recoveryOffer.offerRevision}</code>
+          </div>
+          <p>
+            {actionLabel(recoveryOffer.recoveryClass)} · node{' '}
+            <code>{recoveryOffer.nodeInstanceId}</code>
+          </p>
+          <div className="runtime-control-actions">
+            {recoveryOffer.actions.map((action) => {
+              const confirming = confirmation === action.actionId;
+              return (
+                <span key={action.actionId} className="runtime-control-action">
+                  <button
+                    type="button"
+                    disabled={
+                      !action.enabled
+                      || state.controlPending !== null
+                    }
+                    title={action.disabledReasonCode ?? undefined}
+                    onClick={() => {
+                      if (action.requiresConfirmation && !confirming) {
+                        setConfirmation(action.actionId);
+                        return;
+                      }
+                      setConfirmation(null);
+                      applyRecoveryAction(action.actionId);
+                    }}
+                  >
+                    {confirming ? 'Confirm ' : ''}{actionLabel(action.labelKey)}
+                  </button>
+                  {confirming && (
+                    <button type="button" onClick={() => setConfirmation(null)}>
+                      Cancel
+                    </button>
+                  )}
+                </span>
+              );
+            })}
+          </div>
+          <details>
+            <summary
+              title={recoveryOffer.manualResult.disabledReasonCode ?? undefined}
+            >
+              Stage a manual result
+            </summary>
+            <label className="runtime-control-field">
+              <span>Output (JSON)</span>
+              <textarea
+                rows={2}
+                value={manualOutput}
+                onChange={(event) => {
+                  setManualOutput(event.currentTarget.value);
+                  setManualError(null);
+                }}
+              />
+            </label>
+            {manualError && <p className="field-error">{manualError}</p>}
+            <div className="runtime-control-actions">
+              {(['succeeded', 'failed'] as const).map((outcome) => (
+                <button
+                  key={outcome}
+                  type="button"
+                  disabled={
+                    !recoveryOffer.manualResult.enabled
+                    || state.controlPending !== null
+                  }
+                  title={
+                    recoveryOffer.manualResult.disabledReasonCode ?? undefined
+                  }
+                  onClick={() => {
+                    try {
+                      const output = JSON.parse(manualOutput) as JsonValue;
+                      setManualError(null);
+                      stageManualResult(outcome, output);
+                    } catch {
+                      setManualError('Output must be valid JSON.');
+                    }
+                  }}
+                >
+                  Mark {outcome === 'succeeded' ? 'success' : 'failure'}
+                </button>
+              ))}
+            </div>
+          </details>
+        </section>
+      )}
+
+      {enabled && controls !== null && (
+        <section className="runtime-control-section" aria-labelledby="runtime-overrides-title">
+          <div className="runtime-control-heading">
+            <div>
+              <span>Current run only</span>
+              <h3 id="runtime-overrides-title">Runtime overrides</h3>
+            </div>
+            <code>revision {controls.runtimeControlRevision}</code>
+          </div>
+          {controls.overrides.length === 0 ? (
+            <p>No runtime overrides have been staged.</p>
+          ) : controls.overrides.map((override) => (
+            <details key={override.overrideId} className="runtime-control-record">
+              <summary>
+                {override.nodeInstanceId} · {override.parameterId} · {override.status}
+              </summary>
+              <pre>{JSON.stringify(override.value, null, 2)}</pre>
+              <div className="runtime-control-actions">
+                <button
+                  type="button"
+                  disabled={override.status !== 'staged' || state.controlPending !== null}
+                  onClick={() => activateRuntimeOverride(override)}
+                >
+                  Activate
+                </button>
+                <button
+                  type="button"
+                  disabled={
+                    !['staged', 'active'].includes(override.status)
+                    || state.controlPending !== null
+                  }
+                  onClick={() => clearRuntimeOverride(override)}
+                >
+                  Clear
+                </button>
+                <button
+                  type="button"
+                  disabled={
+                    !['staged', 'active'].includes(override.status)
+                    || state.controlPending !== null
+                  }
+                  onClick={() => promoteRuntimeOverride(override)}
+                >
+                  Request Draft promotion
+                </button>
+              </div>
+            </details>
+          ))}
+          {controls.promotionProposals.map((proposal) => {
+            const unavailable = promotionMaterializationReason(proposal);
+            return (
+              <div key={proposal.proposalId} className="runtime-control-record">
+                <span>
+                  Draft promotion · {proposal.nodeInstanceId} · {proposal.status}
+                </span>
+                <button
+                  type="button"
+                  disabled={unavailable !== null}
+                  title={unavailable ?? undefined}
+                  onClick={() => { void materializePromotion(proposal); }}
+                >
+                  Apply to Draft
+                </button>
+              </div>
+            );
+          })}
+        </section>
+      )}
+
+      {enabled && state.run !== null && writableKeys.length > 0 && (
+        <section className="runtime-control-section" aria-labelledby="runtime-blackboard-title">
+          <div className="runtime-control-heading">
+            <div>
+              <span>Typed current-run value</span>
+              <h3 id="runtime-blackboard-title">Runtime blackboard</h3>
+            </div>
+          </div>
+          <label className="runtime-control-field">
+            <span>Writable key</span>
+            <select
+              value={blackboardKey}
+              onChange={(event) => {
+                setBlackboardKey(event.currentTarget.value);
+                setBlackboardValue('');
+                setBlackboardError(null);
+              }}
+            >
+              <option value="">Choose a key</option>
+              {writableKeys.map((key) => (
+                <option key={key.key} value={key.key}>
+                  {key.key} · {key.type}
+                </option>
+              ))}
+            </select>
+          </label>
+          <label className="runtime-control-field">
+            <span>Value{selectedBlackboardKey ? ` (${selectedBlackboardKey.type})` : ''}</span>
+            <input
+              value={blackboardValue}
+              disabled={selectedBlackboardKey === null}
+              onChange={(event) => {
+                setBlackboardValue(event.currentTarget.value);
+                setBlackboardError(null);
+              }}
+            />
+          </label>
+          {blackboardError && <p className="field-error">{blackboardError}</p>}
+          <button
+            type="button"
+            disabled={
+              selectedBlackboardKey === null
+              || state.controlPending !== null
+            }
+            onClick={() => {
+              if (selectedBlackboardKey === null) return;
+              try {
+                const value = parseRuntimeValue(
+                  selectedBlackboardKey.type,
+                  blackboardValue,
+                );
+                setBlackboardError(null);
+                writeRuntimeBlackboard(selectedBlackboardKey.key, value);
+              } catch (error) {
+                setBlackboardError(
+                  error instanceof Error ? error.message : 'Value is invalid.',
+                );
+              }
+            }}
+          >
+            Write current-run value
+          </button>
+        </section>
+      )}
+
+      {controls !== null && controls.audit.length > 0 && (
+        <details className="runtime-control-section">
+          <summary>Runtime-control history ({controls.audit.length})</summary>
+          <ol className="runtime-control-audit">
+            {controls.audit.map((event) => (
+              <li key={event.eventRevision}>
+                <code>{event.eventRevision}</code> {actionLabel(event.kind)}
+              </li>
+            ))}
+          </ol>
+        </details>
+      )}
       {cycleState === 'terminal_awaiting_reset' && (
         <button
           type="button"
@@ -229,6 +526,11 @@ export function ProgramTransportControls({
 
   return (
     <>
+      {state.error && (
+        <div className="viewer-transport-feedback error-state" role="alert">
+          {state.error}
+        </div>
+      )}
       <div className="viewer-transport" aria-label="Program and motion controls">
         <button
           type="button"

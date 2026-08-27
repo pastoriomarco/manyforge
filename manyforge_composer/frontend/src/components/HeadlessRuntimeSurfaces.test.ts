@@ -221,6 +221,8 @@ describe('headless Composer presentation adapters', () => {
         programRunId: null,
         cycleClaimGeneration: null,
         terminalOrSettlementReference: null,
+        runtimeControlRevision: null,
+        recoveryOffer: null,
       },
       draftIdentity: { draftId: 'draft-1', draftRevision: 1 },
       receiverEpoch: 'receiver.epoch.1',

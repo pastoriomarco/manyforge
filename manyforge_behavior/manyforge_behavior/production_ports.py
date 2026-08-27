@@ -8,9 +8,11 @@ truth, gripper state, or Stop semantics; those remain in the native owners.
 from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
+from copy import deepcopy
 from dataclasses import dataclass
 from hashlib import sha256
 from heapq import heapify, heappop, heappush
+import json
 import math
 from threading import RLock
 from typing import Any, Final, Protocol
@@ -76,6 +78,15 @@ _MAX_CONTEXTS: Final = 4_096
 _MAX_TASKS: Final = 65_536
 _MAX_SCENE_INITIALIZATION_STALE_RETRIES: Final = 16
 _MAX_SCENE_NODE_STALE_RETRIES: Final = 16
+_AUTHORED_SCENE_OPERATIONS: Final = frozenset(
+    {
+        "add_object",
+        "upsert_object",
+        "remove_object",
+        "update_object_pose",
+        "set_collision_policy",
+    }
+)
 
 
 class ProductionPortError(RuntimeError):
@@ -351,6 +362,8 @@ class _BoundContext:
 
 
 class _SceneProgramTransport(Protocol):
+    def authoring_admission(self) -> dict[str, Any]: ...
+
     def scene(self) -> dict[str, Any]: ...
 
     def commit_scene_transaction(
@@ -1601,6 +1614,19 @@ class NativeKernelProgramPort:
                         return code, message if isinstance(message, str) else ""
         return "operation_failed", "native operation did not succeed"
 
+    def _recovery_assessment(
+        self, operation: Mapping[str, Any], operation_id: str
+    ) -> Mapping[str, Any] | None:
+        try:
+            assessment = self._kernel.recovery_assessment(operation_id)
+        except Exception:
+            return None
+        if assessment.get("operation_revision") != operation.get(
+            "operation_revision"
+        ):
+            return None
+        return assessment
+
     def _observation(self, task: _OperationTask) -> tuple[dict[str, Any], OwnerTaskSnapshot]:
         try:
             envelope = self._kernel.operation(task.operation_id)
@@ -1632,6 +1658,9 @@ class NativeKernelProgramPort:
                 metadata=metadata,
             )
         elif state in _INTERRUPTED_STATES:
+            assessment = self._recovery_assessment(operation, task.operation_id)
+            if assessment is not None:
+                metadata["recovery_assessment"] = assessment
             snapshot = OwnerTaskSnapshot(
                 task_id=task.operation_id,
                 state=OwnerTaskState.INTERRUPTED,
@@ -1640,6 +1669,9 @@ class NativeKernelProgramPort:
                 message="native operation was interrupted",
             )
         elif state in _FAILED_STATES:
+            assessment = self._recovery_assessment(operation, task.operation_id)
+            if assessment is not None:
+                metadata["recovery_assessment"] = assessment
             reason_code, message = self._terminal_error(operation)
             snapshot = OwnerTaskSnapshot(
                 task_id=task.operation_id,
@@ -1651,6 +1683,88 @@ class NativeKernelProgramPort:
         else:
             raise ProductionPortError("native operation has an unknown state")
         return operation, snapshot
+
+    def _recover_task(
+        self,
+        task_id: str,
+        identity: NodeAttemptIdentity,
+        *,
+        action: str,
+        request_id: str,
+        reason: str | None,
+    ) -> Mapping[str, Any]:
+        task = self._task(task_id)
+        if task.identity != identity:
+            raise ProductionPortError("operation recovery changed node attempt")
+        operation, snapshot = self._observation(task)
+        if snapshot.state not in {
+            OwnerTaskState.FAILED,
+            OwnerTaskState.INTERRUPTED,
+        }:
+            raise ProductionPortError("operation recovery is not current")
+        assessment = snapshot.metadata.get("recovery_assessment")
+        revision = operation.get("operation_revision")
+        if not isinstance(assessment, Mapping) or type(revision) is not int:
+            raise ProductionPortError("operation recovery identity is incomplete")
+        try:
+            result = self._kernel.recover(
+                task.operation_id,
+                revision,
+                {
+                    "request_id": request_id,
+                    "action": action,
+                    "principal_id": "program_runner",
+                    "expected_assessment_revision": assessment.get(
+                        "assessment_revision"
+                    ),
+                    "expected_control_command_epoch": assessment.get(
+                        "control_command_epoch"
+                    ),
+                    "expected_execution_id": assessment.get("execution_id"),
+                    "expected_latch_id": assessment.get("latch_id", ""),
+                    "expected_stop_certificate_id": assessment.get(
+                        "stop_certificate_id", ""
+                    ),
+                    "expected_stop_owner_generation": assessment.get(
+                        "stop_owner_generation", 0
+                    ),
+                    "reason": reason or "",
+                },
+            )
+        except Exception as error:
+            code = getattr(error, "code", None)
+            if code not in {
+                "operation_recovery_invalid",
+                "operation_recovery_stale",
+                "request_id_conflict",
+                "request_ledger_full",
+            }:
+                raise
+            return {
+                "request_id": request_id,
+                "action": action,
+                "accepted": False,
+                "resulting_assessment": dict(assessment),
+                "error": {
+                    "code": code,
+                    "message": str(error) or "operation recovery was rejected",
+                },
+            }
+        resulting = result.get("resulting_assessment")
+        if isinstance(resulting, Mapping):
+            result = {
+                **result,
+                "resulting_assessment": {
+                    **resulting,
+                    "operation_revision": revision,
+                    "participants": assessment.get("participants", []),
+                    "acknowledged_non_moving": (
+                        result.get("accepted") is True
+                        and action == "acknowledge_and_continue"
+                    ),
+                },
+            }
+        return result
 
     def _task(self, task_id: str) -> _OperationTask:
         with self._lock:
@@ -1969,6 +2083,23 @@ class _NativeKernelOperationTaskPort:
     def acknowledge(self, task_id: str, identity: NodeAttemptIdentity) -> None:
         self._owner._acknowledge_task(task_id, identity)
 
+    def recover(
+        self,
+        task_id: str,
+        identity: NodeAttemptIdentity,
+        *,
+        action: str,
+        request_id: str,
+        reason: str | None,
+    ) -> Mapping[str, Any]:
+        return self._owner._recover_task(
+            task_id,
+            identity,
+            action=action,
+            request_id=request_id,
+            reason=reason,
+        )
+
 
 class _NativePickPlaceTaskPort:
     """OwnerTaskPort view over native pick/place planning and sequencing."""
@@ -2016,17 +2147,22 @@ class HeadlessSceneProgramPort:
 
     The native logical-scene owner remains the only scene authority. This port
     keeps only immutable Program Binding context and reads fresh owner truth for
-    every initialization or node attempt.
+    every preparation, verification, or node attempt.
     """
 
     def __init__(self, transport: _SceneProgramTransport) -> None:
-        for method in ("scene", "commit_scene_transaction", "manager_graph"):
+        for method in (
+            "authoring_admission",
+            "scene",
+            "commit_scene_transaction",
+            "manager_graph",
+        ):
             if not callable(getattr(transport, method, None)):
                 raise TypeError(f"scene transport has no callable {method}")
         self._transport = transport
         self._scene = SceneClient(transport)
         self._contexts: dict[str, _SceneBoundContext] = {}
-        self._initialized: set[str] = set()
+        self._prepared: dict[str, dict[str, Any]] = {}
         self._lock = RLock()
 
     def bind(self, context: ProgramRunPortContext) -> None:
@@ -2049,7 +2185,6 @@ class HeadlessSceneProgramPort:
 
     def unbind(self, program_run_id: str) -> None:
         with self._lock:
-            self._initialized.discard(program_run_id)
             self._contexts.pop(program_run_id, None)
 
     @staticmethod
@@ -2332,20 +2467,28 @@ class HeadlessSceneProgramPort:
         expected_projection_revision: Mapping[str, Any],
         operation: Mapping[str, Any],
     ) -> tuple[dict[str, Any], dict[str, Any]]:
-        response = self._scene.commit(
-            {
-                "request_context": {
-                    "request_id": request_id,
-                    "request_owner_epoch": request_owner_epoch,
-                    "source_label": "manyforge.behavior.program_scene",
-                    "correlation_id": correlation_id,
-                },
-                "expected_projection_revision": dict(
-                    expected_projection_revision
-                ),
-                "operation": dict(operation),
-            }
-        )
+        body: dict[str, Any] = {
+            "request_context": {
+                "request_id": request_id,
+                "request_owner_epoch": request_owner_epoch,
+                "source_label": "manyforge.behavior.program_scene",
+                "correlation_id": correlation_id,
+            },
+            "expected_projection_revision": dict(expected_projection_revision),
+            "operation": dict(operation),
+        }
+        if operation.get("kind") in _AUTHORED_SCENE_OPERATIONS:
+            admission = self._transport.authoring_admission()
+            generation = admission.get("admission_generation")
+            if (
+                type(generation) is not int
+                or not 1 <= generation <= 9_007_199_254_740_991
+            ):
+                raise ProductionPortError(
+                    "authoring-admission owner omitted its current generation"
+                )
+            body["expected_admission_generation"] = generation
+        response = self._scene.commit(body)
         committed = dict(
             _mapping(
                 response.get("committed_projection_revision"),
@@ -2582,19 +2725,117 @@ class HeadlessSceneProgramPort:
             )
         return sorted(revisions)
 
-    def initialize(
-        self,
-        context: ProgramRunPortContext,
-        initial_scene: Sequence[Mapping[str, Any]],
+    @staticmethod
+    def _desired_scene_digest(
+        context: _SceneBoundContext,
+        operations: Sequence[Mapping[str, Any]],
+    ) -> str:
+        encoded = json.dumps(
+            {
+                "applied_record_digest": context.capture.applied_record_digest,
+                "program_revision": context.capture.program_revision,
+                "program_binding_id": context.capture.program_binding_id,
+                "retained_bundle_id": context.capture.retained_bundle_id,
+                "graph_revision": context.capture.graph_revision,
+                "objects": [dict(operation) for operation in operations],
+            },
+            allow_nan=False,
+            ensure_ascii=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        ).encode("utf-8")
+        return f"sha256:{sha256(encoded).hexdigest()}"
+
+    @staticmethod
+    def _scene_matches_operations(
+        view: _SceneView,
+        operations: Sequence[Mapping[str, Any]],
+    ) -> bool:
+        if view.attachments:
+            return False
+        expected_ids = tuple(
+            _text(operation.get("scene_resource_id"), field="scene_resource_id")
+            for operation in operations
+        )
+        if tuple(view.objects) != tuple(sorted(expected_ids)):
+            return False
+        for operation in operations:
+            scene_resource_id = str(operation["scene_resource_id"])
+            current = view.objects[scene_resource_id]
+            if (
+                list(_sequence(current.get("collision_shapes"), field="collision_shapes"))
+                != [operation.get("shape")]
+                or list(
+                    _sequence(
+                        current.get("support_contacts", ()),
+                        field="support_contacts",
+                    )
+                )
+                != operation.get("support_contacts")
+                or current.get("provider_evidence") is not None
+            ):
+                return False
+            frame_ref = _mapping(operation.get("frame_ref"), field="frame_ref")
+            # Cell-frame intent has the same normalized representation in the
+            # owner snapshot. Component-frame intent is resolved by the native
+            # owner, so only an owner-issued prepared proof can compare it.
+            if frame_ref.get("kind") != "cell_frame":
+                return False
+            if current.get("placement") != {
+                "kind": "cell_fixed",
+                "cell_id": view.cell_id,
+                "pose_in_cell": operation.get("pose"),
+            }:
+                return False
+        return True
+
+    @staticmethod
+    def _proof(
+        context: _SceneBoundContext,
+        view: _SceneView,
+        desired_scene_digest: str,
+    ) -> dict[str, Any]:
+        return {
+            "schema_version": "manyforge.prepared_program_scene.v1",
+            "applied_record_digest": context.capture.applied_record_digest,
+            "program_revision": context.capture.program_revision,
+            "program_binding_id": context.capture.program_binding_id,
+            "retained_bundle_id": context.capture.retained_bundle_id,
+            "graph_revision": context.capture.graph_revision,
+            "desired_scene_digest": desired_scene_digest,
+            "scene_owner_epoch": view.request_owner_epoch,
+            "projection_revision": deepcopy(view.projection_revision),
+        }
+
+    @staticmethod
+    def _proof_matches(
+        context: _SceneBoundContext,
+        view: _SceneView,
+        desired_scene_digest: str,
+        proof: Mapping[str, Any],
+    ) -> bool:
+        return dict(proof) == HeadlessSceneProgramPort._proof(
+            context, view, desired_scene_digest
+        )
+
+    def _remember_proof(
+        self, desired_scene_digest: str, proof: Mapping[str, Any]
     ) -> None:
-        parsed = self._parse_context(context)
-        self.bind(context)
         with self._lock:
-            current = self._contexts.get(context.program_run_id)
-            if current != parsed:
-                raise ProductionPortError("Program-run scene context was rebound")
-            if context.program_run_id in self._initialized:
-                return
+            if (
+                desired_scene_digest not in self._prepared
+                and len(self._prepared) >= _MAX_CONTEXTS
+            ):
+                self._prepared.pop(next(iter(self._prepared)))
+            self._prepared[desired_scene_digest] = deepcopy(dict(proof))
+
+    def _initial_scene_operations(
+        self,
+        context: _SceneBoundContext,
+        initial_scene: Sequence[Mapping[str, Any]],
+        *,
+        cell_id: str,
+    ) -> list[dict[str, Any]]:
         rows = list(initial_scene)
         ids = [
             _text(
@@ -2607,11 +2848,15 @@ class HeadlessSceneProgramPort:
         ]
         if ids != sorted(ids) or len(ids) != len(set(ids)):
             raise ProductionPortError("initial scene is not canonical")
-        initialization_rows: list[
-            tuple[bool, int, Mapping[str, Any], list[dict[str, Any]]]
-        ] = []
+        operations: list[tuple[bool, dict[str, Any]]] = []
         for index, raw_row in enumerate(rows):
             row = _mapping(raw_row, field=f"initial_scene[{index}]")
+            pose, frame_ref = self._initial_pose_and_frame(
+                context,
+                row.get("pose"),
+                cell_id=cell_id,
+                field=f"initial_scene[{index}].pose",
+            )
             resource_roles = {
                 _text(role, field=f"initial_scene[{index}].resource_roles")
                 for role in _sequence(
@@ -2619,25 +2864,54 @@ class HeadlessSceneProgramPort:
                     field=f"initial_scene[{index}].resource_roles",
                 )
             }
-            initialization_rows.append(
+            operations.append(
                 (
                     "pick_object" in resource_roles,
-                    index,
-                    row,
-                    _scene_support_contacts(
-                        row.get("metadata"),
-                        field=f"initial_scene[{index}].metadata",
-                    ),
+                    {
+                        "kind": "add_object",
+                        "scene_resource_id": ids[index],
+                        "shape": _scene_shape(
+                            row.get("shape"),
+                            field=f"initial_scene[{index}].shape",
+                        ),
+                        "pose": pose,
+                        "frame_ref": frame_ref,
+                        "support_contacts": _scene_support_contacts(
+                            row.get("metadata"),
+                            field=f"initial_scene[{index}].metadata",
+                        ),
+                    },
                 )
             )
-        # Continuously observed pick resources become writable as soon as they
-        # exist. Commit every static resource first so a fast external pose
-        # writer cannot starve the remainder of this optimistic transaction
-        # sequence. Canonical source order remains a validated input contract;
-        # the priority is deterministic and preserves identity within each
-        # class.
-        initialization_rows.sort(key=lambda item: (item[0], ids[item[1]]))
+        operations.sort(key=lambda item: (item[0], item[1]["scene_resource_id"]))
+        return [operation for _pick_object, operation in operations]
+
+    def prepare_initial_scene(
+        self,
+        context: ProgramRunPortContext,
+        initial_scene: Sequence[Mapping[str, Any]],
+    ) -> dict[str, Any]:
+        parsed = self._parse_context(context)
+        self.bind(context)
+        with self._lock:
+            current = self._contexts.get(context.program_run_id)
+            if current != parsed:
+                raise ProductionPortError("Program-run scene context was rebound")
         view = self._read_view(parsed)
+        operations = self._initial_scene_operations(
+            parsed, initial_scene, cell_id=view.cell_id
+        )
+        desired_scene_digest = self._desired_scene_digest(parsed, operations)
+        with self._lock:
+            cached = self._prepared.get(desired_scene_digest)
+        if (
+            cached is not None
+            and self._proof_matches(parsed, view, desired_scene_digest, cached)
+        ) or self._scene_matches_operations(view, operations):
+            proof = self._proof(parsed, view, desired_scene_digest)
+            self._remember_proof(desired_scene_digest, proof)
+            return proof
+
         expected = view.projection_revision
         ordinal = 0
 
@@ -2712,51 +2986,43 @@ class HeadlessSceneProgramPort:
                 },
                 f"remove:{scene_resource_id}",
             )
-        for _pick_object, index, row, support_contacts in initialization_rows:
-            scene_resource_id = ids[index]
-            pose, frame_ref = self._initial_pose_and_frame(
-                parsed,
-                row.get("pose"),
-                cell_id=view.cell_id,
-                field=f"initial_scene[{index}].pose",
-            )
-            commit(
-                {
-                    "kind": "add_object",
-                    "scene_resource_id": scene_resource_id,
-                    "shape": _scene_shape(
-                        row.get("shape"), field=f"initial_scene[{index}].shape"
-                    ),
-                    "pose": pose,
-                    "frame_ref": frame_ref,
-                    "support_contacts": support_contacts,
-                },
-                f"add:{scene_resource_id}",
-            )
+        for operation in operations:
+            scene_resource_id = str(operation["scene_resource_id"])
+            commit(operation, f"add:{scene_resource_id}")
         verified = self._read_view(parsed)
-        expected_scene = _mapping(
-            expected.get("scene_revision"), field="expected scene revision"
-        )
-        verified_scene = _mapping(
-            verified.projection_revision.get("scene_revision"),
-            field="verified scene revision",
-        )
         if (
             verified.request_owner_epoch != view.request_owner_epoch
-            or verified_scene.get("scene_id") != expected_scene.get("scene_id")
-            or type(verified_scene.get("revision_id")) is not int
-            or type(expected_scene.get("revision_id")) is not int
-            or verified_scene["revision_id"] < expected_scene["revision_id"]
+            or verified.projection_revision != expected
             or verified.attachments
-            or tuple(verified.objects) != tuple(ids)
+            or tuple(verified.objects)
+            != tuple(sorted(str(item["scene_resource_id"]) for item in operations))
         ):
             raise ProductionPortError(
                 "logical-scene owner did not publish the exact initialized scene"
             )
+        proof = self._proof(parsed, verified, desired_scene_digest)
         with self._lock:
             if self._contexts.get(context.program_run_id) != parsed:
                 raise ProductionPortError("Program-run scene context was rebound")
-            self._initialized.add(context.program_run_id)
+        self._remember_proof(desired_scene_digest, proof)
+        return proof
+
+    def verify_initial_scene(
+        self,
+        context: ProgramRunPortContext,
+        initial_scene: Sequence[Mapping[str, Any]],
+        proof: Mapping[str, Any],
+    ) -> None:
+        parsed = self._parse_context(context)
+        view = self._read_view(parsed)
+        operations = self._initial_scene_operations(
+            parsed, initial_scene, cell_id=view.cell_id
+        )
+        desired_scene_digest = self._desired_scene_digest(parsed, operations)
+        if not self._proof_matches(parsed, view, desired_scene_digest, proof):
+            raise ProductionPortError(
+                "prepared logical scene changed before Program capture"
+            )
 
     def release(self, program_run_id: str) -> None:
         self.unbind(program_run_id)

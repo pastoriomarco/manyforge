@@ -6,7 +6,16 @@ from typing import Annotated, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
-from manyforge_headless_api.models import ProgramCycleResetRequest
+from manyforge_headless_api.models import (
+    CycleRecoveryActionRequest,
+    ManualResultStageRequest,
+    ProgramCycleResetRequest,
+    ProgramScenePreparationRequest,
+    RuntimeBlackboardWriteRequest,
+    RuntimeOverrideActionRequest,
+    RuntimeOverridePromotionRequest,
+    RuntimeOverrideStageRequest,
+)
 
 
 _DIGEST = r"^sha256:[0-9a-f]{64}$"
@@ -51,4 +60,14 @@ class ProgramCycleStatusDTO(BaseModel):
         return self
 
 
-__all__ = ["ProgramCycleResetRequest", "ProgramCycleStatusDTO"]
+__all__ = [
+    "CycleRecoveryActionRequest",
+    "ManualResultStageRequest",
+    "ProgramCycleResetRequest",
+    "ProgramCycleStatusDTO",
+    "ProgramScenePreparationRequest",
+    "RuntimeBlackboardWriteRequest",
+    "RuntimeOverrideActionRequest",
+    "RuntimeOverridePromotionRequest",
+    "RuntimeOverrideStageRequest",
+]

@@ -47,6 +47,19 @@ import type {
   ProgramRunIndex,
   ProgramRunStateName,
   ProgramRunStatus,
+  CycleRecoveryAction,
+  CycleRecoveryActionId,
+  CycleRecoveryActionResult,
+  CycleRecoveryOffer,
+  ProgramRuntimeControlProjection,
+  ProgramRuntimeControlResult,
+  ProgramRuntimeControlsSnapshot,
+  RuntimeControlAuditEvent,
+  RuntimeOverrideObservationCandidate,
+  RuntimeOverridePromotionProposal,
+  RuntimeOverrideRecord,
+  RuntimeOverrideStatus,
+  RuntimeOverrideMaterializationResponse,
   ProgramCycleResetResult,
   ProgramValueSource,
   ProgramViewerMetadata,
@@ -88,14 +101,28 @@ export function parseProgramCycleResetResult(value: unknown): ProgramCycleResetR
   exactKeysAt(record, [
     'schema_version', 'program_run_id', 'reset_cycle_generation',
     'idle_cycle_generation', 'settlement_reference', 'admission',
+    'runtime_controls',
   ], 'programCycleReset');
   const schemaVersion = stringAt(record.schema_version, 'programCycleReset.schema_version');
   if (schemaVersion !== 'manyforge.program_cycle_reset_result.v1') {
     return fail('programCycleReset.schema_version', 'the expected reset result schema');
   }
+  const programRunId = stringAt(
+    record.program_run_id,
+    'programCycleReset.program_run_id',
+  );
+  const runtimeControls = record.runtime_controls === null
+    ? null
+    : parseProgramRuntimeControlsSnapshot(
+      record.runtime_controls,
+      'programCycleReset.runtime_controls',
+    );
+  if (runtimeControls !== null && runtimeControls.programRunId !== programRunId) {
+    return fail('programCycleReset', 'one exact Program-run identity');
+  }
   return {
     schemaVersion,
-    programRunId: stringAt(record.program_run_id, 'programCycleReset.program_run_id'),
+    programRunId,
     resetCycleGeneration: positiveIntegerAt(
       record.reset_cycle_generation,
       'programCycleReset.reset_cycle_generation',
@@ -109,6 +136,7 @@ export function parseProgramCycleResetResult(value: unknown): ProgramCycleResetR
       'programCycleReset.settlement_reference',
     ),
     admission: objectAt(record.admission, 'programCycleReset.admission') as Record<string, JsonValue>,
+    runtimeControls,
   };
 }
 import type {
@@ -260,6 +288,21 @@ function positiveNumberAt(value: unknown, path: string): number {
   const number = numberAt(value, path);
   if (number <= 0) return fail(path, 'a positive finite number');
   return number;
+}
+
+function monotonicNanosecondsAt(value: unknown, path: string): number {
+  const number = numberAt(value, path);
+  if (!Number.isInteger(number) || number < 0) {
+    return fail(path, 'non-negative monotonic nanoseconds');
+  }
+  return number;
+}
+
+function nullableMonotonicNanosecondsAt(
+  value: unknown,
+  path: string,
+): number | null {
+  return value === null ? null : monotonicNanosecondsAt(value, path);
 }
 
 function boundedArrayAt(
@@ -2765,6 +2808,684 @@ export function parseProgramRunIndex(value: unknown): ProgramRunIndex {
   };
 }
 
+const RUNTIME_OVERRIDE_STATUSES = new Set<RuntimeOverrideStatus>([
+  'staged', 'active', 'cleared', 'stale',
+]);
+
+const RECOVERY_ACTION_IDS = new Set<CycleRecoveryActionId>([
+  'retry_motion_from_current_state',
+  'acknowledge_and_continue',
+  'retry_after_scene_repair',
+  'replan_from_stopped_state',
+  'retry_runtime_step',
+  'reset_cycle',
+]);
+
+function nullablePositiveIntegerAt(value: unknown, path: string): number | null {
+  return value === null ? null : positiveIntegerAt(value, path);
+}
+
+function parseRuntimeOverrideRecord(
+  value: unknown,
+  path: string,
+): RuntimeOverrideRecord {
+  const record = objectAt(value, path);
+  exactKeysAt(record, [
+    'schema_version', 'override_id', 'override_revision', 'status',
+    'program_run_id', 'program_revision', 'program_binding_id',
+    'retained_bundle_id', 'graph_revision', 'node_environment_digest',
+    'node_instance_id', 'node_attempt_id', 'parameter_id', 'value',
+    'source_observation_id', 'source_owner_generation',
+  ], path);
+  const schemaVersion = stringAt(record.schema_version, `${path}.schema_version`);
+  if (schemaVersion !== 'manyforge.runtime_override.v1') {
+    return fail(`${path}.schema_version`, 'manyforge.runtime_override.v1');
+  }
+  const status = stringAt(record.status, `${path}.status`) as RuntimeOverrideStatus;
+  if (!RUNTIME_OVERRIDE_STATUSES.has(status)) {
+    return fail(`${path}.status`, 'a supported runtime-override status');
+  }
+  const sourceObservationId = nullableStringAt(
+    record.source_observation_id,
+    `${path}.source_observation_id`,
+  );
+  const sourceOwnerGeneration = nullablePositiveIntegerAt(
+    record.source_owner_generation,
+    `${path}.source_owner_generation`,
+  );
+  if ((sourceObservationId === null) !== (sourceOwnerGeneration === null)) {
+    return fail(path, 'a paired source observation identity and generation');
+  }
+  return {
+    schemaVersion,
+    overrideId: digestAt(record.override_id, `${path}.override_id`),
+    overrideRevision: positiveIntegerAt(
+      record.override_revision,
+      `${path}.override_revision`,
+    ),
+    status,
+    programRunId: stringAt(record.program_run_id, `${path}.program_run_id`),
+    programRevision: digestAt(record.program_revision, `${path}.program_revision`),
+    programBindingId: digestAt(
+      record.program_binding_id,
+      `${path}.program_binding_id`,
+    ),
+    retainedBundleId: digestAt(
+      record.retained_bundle_id,
+      `${path}.retained_bundle_id`,
+    ),
+    graphRevision: digestAt(record.graph_revision, `${path}.graph_revision`),
+    nodeEnvironmentDigest: digestAt(
+      record.node_environment_digest,
+      `${path}.node_environment_digest`,
+    ),
+    nodeInstanceId: stringAt(record.node_instance_id, `${path}.node_instance_id`),
+    nodeAttemptId: stringAt(record.node_attempt_id, `${path}.node_attempt_id`),
+    parameterId: stringAt(record.parameter_id, `${path}.parameter_id`),
+    value: jsonValueAt(record.value, `${path}.value`),
+    sourceObservationId,
+    sourceOwnerGeneration,
+  };
+}
+
+function parseRuntimeOverridePromotionProposal(
+  value: unknown,
+  path: string,
+): RuntimeOverridePromotionProposal {
+  const record = objectAt(value, path);
+  exactKeysAt(record, [
+    'schema_version', 'proposal_id', 'status', 'program_run_id',
+    'override_id', 'program_revision', 'program_binding_id',
+    'node_instance_id', 'node_id', 'parameter_id', 'value',
+    'expected_draft_id', 'expected_draft_revision',
+  ], path);
+  const schemaVersion = stringAt(record.schema_version, `${path}.schema_version`);
+  if (schemaVersion !== 'manyforge.runtime_override_promotion.v1') {
+    return fail(
+      `${path}.schema_version`,
+      'manyforge.runtime_override_promotion.v1',
+    );
+  }
+  const status = stringAt(record.status, `${path}.status`);
+  if (!['awaiting_reset', 'ready'].includes(status)) {
+    return fail(`${path}.status`, 'awaiting_reset or ready');
+  }
+  return {
+    schemaVersion,
+    proposalId: digestAt(record.proposal_id, `${path}.proposal_id`),
+    status: status as RuntimeOverridePromotionProposal['status'],
+    programRunId: stringAt(record.program_run_id, `${path}.program_run_id`),
+    overrideId: digestAt(record.override_id, `${path}.override_id`),
+    programRevision: digestAt(record.program_revision, `${path}.program_revision`),
+    programBindingId: digestAt(
+      record.program_binding_id,
+      `${path}.program_binding_id`,
+    ),
+    nodeInstanceId: stringAt(record.node_instance_id, `${path}.node_instance_id`),
+    nodeId: stringAt(record.node_id, `${path}.node_id`),
+    parameterId: stringAt(record.parameter_id, `${path}.parameter_id`),
+    value: jsonValueAt(record.value, `${path}.value`),
+    expectedDraftId: stringAt(
+      record.expected_draft_id,
+      `${path}.expected_draft_id`,
+    ),
+    expectedDraftRevision: positiveIntegerAt(
+      record.expected_draft_revision,
+      `${path}.expected_draft_revision`,
+    ),
+  };
+}
+
+function parseRuntimeControlAuditEvent(
+  value: unknown,
+  path: string,
+): RuntimeControlAuditEvent {
+  const record = jsonRecordAt(value, path);
+  const eventRevision = positiveIntegerAt(
+    record.event_revision,
+    `${path}.event_revision`,
+  );
+  const kind = stringAt(record.kind, `${path}.kind`);
+  return {
+    eventRevision,
+    kind,
+    facts: Object.fromEntries(
+      Object.entries(record).filter(([key]) => (
+        key !== 'event_revision' && key !== 'kind'
+      )),
+    ),
+  };
+}
+
+export function parseProgramRuntimeControlsSnapshot(
+  value: unknown,
+  path = 'programRuntimeControls',
+): ProgramRuntimeControlsSnapshot {
+  const record = objectAt(value, path);
+  exactKeysAt(record, [
+    'schema_version', 'program_run_id', 'runtime_control_revision',
+    'recovery_fences', 'has_active_runtime_overrides',
+    'has_staged_runtime_overrides', 'has_stale_runtime_overrides',
+    'overrides', 'promotion_proposals', 'retry_counts', 'audit',
+  ], path);
+  const schemaVersion = stringAt(record.schema_version, `${path}.schema_version`);
+  if (schemaVersion !== 'manyforge.program_runtime_controls.v1') {
+    return fail(`${path}.schema_version`, 'manyforge.program_runtime_controls.v1');
+  }
+  const programRunId = stringAt(record.program_run_id, `${path}.program_run_id`);
+  const fences = objectAt(record.recovery_fences, `${path}.recovery_fences`);
+  exactKeysAt(fences, [
+    'program_generation', 'deployment_generation', 'scene_admission_epoch',
+    'pose_source_apply_generation',
+  ], `${path}.recovery_fences`);
+  const overrides = boundedArrayAt(record.overrides, `${path}.overrides`, 1024)
+    .map((item, index) => parseRuntimeOverrideRecord(
+      item,
+      `${path}.overrides[${index}]`,
+    ));
+  const promotionProposals = boundedArrayAt(
+    record.promotion_proposals,
+    `${path}.promotion_proposals`,
+    1024,
+  ).map((item, index) => parseRuntimeOverridePromotionProposal(
+    item,
+    `${path}.promotion_proposals[${index}]`,
+  ));
+  const retryRecord = objectAt(record.retry_counts, `${path}.retry_counts`);
+  const retryCounts = Object.fromEntries(Object.entries(retryRecord).map(
+    ([nodeInstanceId, count]) => [
+      stringAt(nodeInstanceId, `${path}.retry_counts key`),
+      integerAt(count, `${path}.retry_counts.${nodeInstanceId}`),
+    ],
+  ));
+  if (Object.values(retryCounts).some((count) => count < 0 || count > 255)) {
+    return fail(`${path}.retry_counts`, 'retry counts from 0 through 255');
+  }
+  const audit = boundedArrayAt(record.audit, `${path}.audit`, 4096)
+    .map((item, index) => parseRuntimeControlAuditEvent(
+      item,
+      `${path}.audit[${index}]`,
+    ));
+  if (
+    audit.some((event, index) => event.eventRevision !== index + 1)
+    || new Set(overrides.map((item) => item.overrideId)).size !== overrides.length
+    || new Set(promotionProposals.map((item) => item.proposalId)).size
+      !== promotionProposals.length
+    || overrides.some((item) => item.programRunId !== programRunId)
+    || promotionProposals.some((item) => item.programRunId !== programRunId)
+    || promotionProposals.some((proposal) => {
+      const override = overrides.find(
+        (row) => row.overrideId === proposal.overrideId,
+      );
+      return override === undefined
+        || proposal.programRevision !== override.programRevision
+        || proposal.programBindingId !== override.programBindingId
+        || proposal.nodeInstanceId !== override.nodeInstanceId
+        || proposal.parameterId !== override.parameterId
+        || JSON.stringify(proposal.value) !== JSON.stringify(override.value);
+    })
+  ) {
+    return fail(path, 'internally consistent run-scoped controls');
+  }
+  const hasActiveRuntimeOverrides = booleanAt(
+    record.has_active_runtime_overrides,
+    `${path}.has_active_runtime_overrides`,
+  );
+  const hasStagedRuntimeOverrides = booleanAt(
+    record.has_staged_runtime_overrides,
+    `${path}.has_staged_runtime_overrides`,
+  );
+  const hasStaleRuntimeOverrides = booleanAt(
+    record.has_stale_runtime_overrides,
+    `${path}.has_stale_runtime_overrides`,
+  );
+  if (
+    hasActiveRuntimeOverrides !== overrides.some((row) => row.status === 'active')
+    || hasStagedRuntimeOverrides !== overrides.some((row) => row.status === 'staged')
+    || hasStaleRuntimeOverrides !== overrides.some((row) => row.status === 'stale')
+  ) {
+    return fail(path, 'runtime-override flags matching their retained rows');
+  }
+  return {
+    schemaVersion,
+    programRunId,
+    runtimeControlRevision: (() => {
+      const revision = positiveIntegerAt(
+        record.runtime_control_revision,
+        `${path}.runtime_control_revision`,
+      );
+      if (revision !== audit.length + 1) {
+        return fail(
+          `${path}.runtime_control_revision`,
+          'one more than the retained audit length',
+        );
+      }
+      return revision;
+    })(),
+    recoveryFences: {
+      programGeneration: integerAt(
+        fences.program_generation,
+        `${path}.recovery_fences.program_generation`,
+      ),
+      deploymentGeneration: integerAt(
+        fences.deployment_generation,
+        `${path}.recovery_fences.deployment_generation`,
+      ),
+      sceneAdmissionEpoch: integerAt(
+        fences.scene_admission_epoch,
+        `${path}.recovery_fences.scene_admission_epoch`,
+      ),
+      poseSourceApplyGeneration: integerAt(
+        fences.pose_source_apply_generation,
+        `${path}.recovery_fences.pose_source_apply_generation`,
+      ),
+    },
+    hasActiveRuntimeOverrides,
+    hasStagedRuntimeOverrides,
+    hasStaleRuntimeOverrides,
+    overrides,
+    promotionProposals,
+    retryCounts,
+    audit,
+  };
+}
+
+function parseCycleRecoveryAction(
+  value: unknown,
+  path: string,
+): CycleRecoveryAction {
+  const record = objectAt(value, path);
+  exactKeysAt(record, [
+    'action_id', 'label_key', 'requires_confirmation',
+    'performs_backend_reset', 'enabled', 'disabled_reason_code',
+  ], path);
+  const actionId = stringAt(
+    record.action_id,
+    `${path}.action_id`,
+  ) as CycleRecoveryActionId;
+  if (!RECOVERY_ACTION_IDS.has(actionId)) {
+    return fail(`${path}.action_id`, 'a supported recovery action');
+  }
+  const enabled = booleanAt(record.enabled, `${path}.enabled`);
+  const disabledReasonCode = nullableStringAt(
+    record.disabled_reason_code,
+    `${path}.disabled_reason_code`,
+  );
+  if ((enabled && disabledReasonCode !== null) || (!enabled && disabledReasonCode === null)) {
+    return fail(path, 'an enabled action or an explicit disabled reason');
+  }
+  return {
+    actionId,
+    labelKey: stringAt(record.label_key, `${path}.label_key`),
+    requiresConfirmation: booleanAt(
+      record.requires_confirmation,
+      `${path}.requires_confirmation`,
+    ),
+    performsBackendReset: booleanAt(
+      record.performs_backend_reset,
+      `${path}.performs_backend_reset`,
+    ),
+    enabled,
+    disabledReasonCode,
+  };
+}
+
+function parseCycleRecoveryOffer(
+  value: unknown,
+  path: string,
+): CycleRecoveryOffer {
+  const record = objectAt(value, path);
+  exactKeysAt(record, [
+    'schema_version', 'offer_id', 'offer_revision', 'generated_at_ns',
+    'valid_until_ns', 'kernel_assessment_revision', 'control_command_epoch',
+    'operation_id', 'operation_revision', 'program_run_id',
+    'program_binding_id', 'node_instance_id', 'node_attempt_id',
+    'participants', 'graph_revision', 'retained_bundle_id', 'cycle_generation',
+    'program_generation', 'deployment_generation', 'scene_admission_epoch',
+    'pose_source_apply_generation', 'latch_id', 'stop_id', 'stop_generation',
+    'stop_certificate_id', 'stop_certificate_revision', 'status',
+    'recovery_class', 'actions', 'primary_action', 'reason_code',
+    'evidence_refs', 'manual_result', 'policy',
+  ], path);
+  const schemaVersion = stringAt(record.schema_version, `${path}.schema_version`);
+  if (schemaVersion !== 'manyforge.cycle_recovery_offer.v2') {
+    return fail(`${path}.schema_version`, 'manyforge.cycle_recovery_offer.v2');
+  }
+  const actions = boundedArrayAt(record.actions, `${path}.actions`, 32)
+    .map((item, index) => parseCycleRecoveryAction(
+      item,
+      `${path}.actions[${index}]`,
+    ));
+  if (new Set(actions.map((action) => action.actionId)).size !== actions.length) {
+    return fail(`${path}.actions`, 'unique recovery action identities');
+  }
+  const primaryActionValue = nullableStringAt(
+    record.primary_action,
+    `${path}.primary_action`,
+  );
+  const primaryAction = primaryActionValue as CycleRecoveryActionId | null;
+  if (
+    (primaryAction !== null && !RECOVERY_ACTION_IDS.has(primaryAction))
+    || (primaryAction !== null
+      && !actions.some((action) => action.actionId === primaryAction && action.enabled))
+  ) {
+    return fail(`${path}.primary_action`, 'an enabled offered recovery action');
+  }
+  const manualResult = objectAt(record.manual_result, `${path}.manual_result`);
+  exactKeysAt(
+    manualResult,
+    ['enabled', 'disabled_reason_code'],
+    `${path}.manual_result`,
+  );
+  const manualResultEnabled = booleanAt(
+    manualResult.enabled,
+    `${path}.manual_result.enabled`,
+  );
+  const manualResultDisabledReasonCode = nullableStringAt(
+    manualResult.disabled_reason_code,
+    `${path}.manual_result.disabled_reason_code`,
+  );
+  if (
+    (manualResultEnabled && manualResultDisabledReasonCode !== null)
+    || (!manualResultEnabled && manualResultDisabledReasonCode === null)
+  ) {
+    return fail(
+      `${path}.manual_result`,
+      'enabled availability or an explicit disabled reason',
+    );
+  }
+  return {
+    schemaVersion,
+    offerId: digestAt(record.offer_id, `${path}.offer_id`),
+    offerRevision: positiveIntegerAt(record.offer_revision, `${path}.offer_revision`),
+    generatedAtNs: monotonicNanosecondsAt(
+      record.generated_at_ns,
+      `${path}.generated_at_ns`,
+    ),
+    validUntilNs: nullableMonotonicNanosecondsAt(
+      record.valid_until_ns,
+      `${path}.valid_until_ns`,
+    ),
+    kernelAssessmentRevision: integerAt(
+      record.kernel_assessment_revision,
+      `${path}.kernel_assessment_revision`,
+    ),
+    controlCommandEpoch: integerAt(
+      record.control_command_epoch,
+      `${path}.control_command_epoch`,
+    ),
+    operationId: nullableStringAt(record.operation_id, `${path}.operation_id`),
+    operationRevision: nullablePositiveIntegerAt(
+      record.operation_revision,
+      `${path}.operation_revision`,
+    ),
+    programRunId: stringAt(record.program_run_id, `${path}.program_run_id`),
+    programBindingId: digestAt(
+      record.program_binding_id,
+      `${path}.program_binding_id`,
+    ),
+    nodeInstanceId: stringAt(record.node_instance_id, `${path}.node_instance_id`),
+    nodeAttemptId: stringAt(record.node_attempt_id, `${path}.node_attempt_id`),
+    participants: boundedArrayAt(record.participants, `${path}.participants`, 4096)
+      .map((item, index) => jsonValueAt(item, `${path}.participants[${index}]`)),
+    graphRevision: digestAt(record.graph_revision, `${path}.graph_revision`),
+    retainedBundleId: digestAt(
+      record.retained_bundle_id,
+      `${path}.retained_bundle_id`,
+    ),
+    cycleGeneration: positiveIntegerAt(
+      record.cycle_generation,
+      `${path}.cycle_generation`,
+    ),
+    programGeneration: integerAt(
+      record.program_generation,
+      `${path}.program_generation`,
+    ),
+    deploymentGeneration: integerAt(
+      record.deployment_generation,
+      `${path}.deployment_generation`,
+    ),
+    sceneAdmissionEpoch: integerAt(
+      record.scene_admission_epoch,
+      `${path}.scene_admission_epoch`,
+    ),
+    poseSourceApplyGeneration: integerAt(
+      record.pose_source_apply_generation,
+      `${path}.pose_source_apply_generation`,
+    ),
+    latchId: nullableStringAt(record.latch_id, `${path}.latch_id`),
+    stopId: nullableStringAt(record.stop_id, `${path}.stop_id`),
+    stopGeneration: nullablePositiveIntegerAt(
+      record.stop_generation,
+      `${path}.stop_generation`,
+    ),
+    stopCertificateId: nullableStringAt(
+      record.stop_certificate_id,
+      `${path}.stop_certificate_id`,
+    ),
+    stopCertificateRevision: nullablePositiveIntegerAt(
+      record.stop_certificate_revision,
+      `${path}.stop_certificate_revision`,
+    ),
+    status: stringAt(record.status, `${path}.status`),
+    recoveryClass: stringAt(record.recovery_class, `${path}.recovery_class`),
+    actions,
+    manualResult: {
+      enabled: manualResultEnabled,
+      disabledReasonCode: manualResultDisabledReasonCode,
+    },
+    primaryAction,
+    reasonCode: stringAt(record.reason_code, `${path}.reason_code`),
+    evidenceRefs: stringArrayAt(record.evidence_refs, `${path}.evidence_refs`),
+    policy: jsonRecordAt(record.policy, `${path}.policy`),
+  };
+}
+
+function parseRuntimeOverrideObservationCandidate(
+  value: unknown,
+  path: string,
+): RuntimeOverrideObservationCandidate {
+  const record = objectAt(value, path);
+  exactKeysAt(record, [
+    'schema_version', 'available', 'reason_code', 'reason', 'program_run_id',
+    'node_instance_id', 'node_attempt_id', 'node_id', 'parameter_id', 'value',
+    'source_observation_id', 'source_owner_generation',
+  ], path);
+  const schemaVersion = stringAt(record.schema_version, `${path}.schema_version`);
+  if (schemaVersion !== 'manyforge.runtime_override_observation_candidate.v1') {
+    return fail(
+      `${path}.schema_version`,
+      'manyforge.runtime_override_observation_candidate.v1',
+    );
+  }
+  const available = booleanAt(record.available, `${path}.available`);
+  const result: RuntimeOverrideObservationCandidate = {
+    schemaVersion,
+    available,
+    reasonCode: nullableStringAt(record.reason_code, `${path}.reason_code`),
+    reason: nullableStringAt(record.reason, `${path}.reason`),
+    programRunId: stringAt(record.program_run_id, `${path}.program_run_id`),
+    nodeInstanceId: nullableStringAt(record.node_instance_id, `${path}.node_instance_id`),
+    nodeAttemptId: nullableStringAt(record.node_attempt_id, `${path}.node_attempt_id`),
+    nodeId: nullableStringAt(record.node_id, `${path}.node_id`),
+    parameterId: nullableStringAt(record.parameter_id, `${path}.parameter_id`),
+    value: record.value === null ? null : jsonValueAt(record.value, `${path}.value`),
+    sourceObservationId: nullableStringAt(
+      record.source_observation_id,
+      `${path}.source_observation_id`,
+    ),
+    sourceOwnerGeneration: nullablePositiveIntegerAt(
+      record.source_owner_generation,
+      `${path}.source_owner_generation`,
+    ),
+  };
+  const exactAvailable = result.nodeInstanceId !== null
+    && result.nodeAttemptId !== null
+    && result.nodeId !== null
+    && result.parameterId !== null
+    && result.value !== null
+    && result.sourceObservationId !== null
+    && result.sourceOwnerGeneration !== null;
+  if (
+    (available && (!exactAvailable || result.reasonCode !== null || result.reason !== null))
+    || (!available && (result.reasonCode === null || result.reason === null))
+  ) {
+    return fail(path, 'a complete available candidate or an owner reason');
+  }
+  return result;
+}
+
+export function parseProgramRuntimeControlProjection(
+  value: unknown,
+): ProgramRuntimeControlProjection {
+  const path = 'programRuntimeControlProjection';
+  const record = objectAt(value, path);
+  exactKeysAt(record, [
+    'schema_version', 'owner_id', 'owner_epoch', 'program_run_id',
+    'run_revision', 'runtime_controls', 'recovery_offer',
+    'observation_override_candidate',
+  ], path);
+  const schemaVersion = stringAt(record.schema_version, `${path}.schema_version`);
+  if (schemaVersion !== 'manyforge.program_runtime_control_projection.v1') {
+    return fail(
+      `${path}.schema_version`,
+      'manyforge.program_runtime_control_projection.v1',
+    );
+  }
+  const programRunId = stringAt(record.program_run_id, `${path}.program_run_id`);
+  const runtimeControls = parseProgramRuntimeControlsSnapshot(
+    record.runtime_controls,
+    `${path}.runtime_controls`,
+  );
+  const recoveryOffer = record.recovery_offer === null
+    ? null
+    : parseCycleRecoveryOffer(record.recovery_offer, `${path}.recovery_offer`);
+  const observationOverrideCandidate = parseRuntimeOverrideObservationCandidate(
+    record.observation_override_candidate,
+    `${path}.observation_override_candidate`,
+  );
+  if (
+    runtimeControls.programRunId !== programRunId
+    || recoveryOffer?.programRunId !== programRunId
+    || observationOverrideCandidate.programRunId !== programRunId
+  ) {
+    return fail(path, 'one exact Program-run identity');
+  }
+  return {
+    schemaVersion,
+    ownerId: stringAt(record.owner_id, `${path}.owner_id`),
+    ownerEpoch: stringAt(record.owner_epoch, `${path}.owner_epoch`),
+    programRunId,
+    runRevision: positiveIntegerAt(record.run_revision, `${path}.run_revision`),
+    runtimeControls,
+    recoveryOffer,
+    observationOverrideCandidate,
+  };
+}
+
+export function parseProgramRuntimeControlResult(
+  value: unknown,
+): ProgramRuntimeControlResult {
+  const path = 'programRuntimeControlResult';
+  const record = objectAt(value, path);
+  exactKeysAt(record, [
+    'schema_version', 'request_id', 'accepted', 'result', 'run',
+    'runtime_controls',
+  ], path);
+  const schemaVersion = stringAt(record.schema_version, `${path}.schema_version`);
+  if (
+    schemaVersion !== 'manyforge.program_runtime_control_result.v1'
+    || booleanAt(record.accepted, `${path}.accepted`) !== true
+  ) {
+    return fail(path, 'an accepted runtime-control result');
+  }
+  const run = parseProgramRunStatus(record.run);
+  const runtimeControls = parseProgramRuntimeControlProjection(
+    record.runtime_controls,
+  );
+  if (run.capture.programRunId !== runtimeControls.programRunId) {
+    return fail(path, 'one exact Program-run identity');
+  }
+  if (
+    run.ownerEpoch !== runtimeControls.ownerEpoch
+    || run.runRevision !== runtimeControls.runRevision
+  ) {
+    return fail(path, 'matching owner and run revisions');
+  }
+  return {
+    schemaVersion,
+    requestId: stringAt(record.request_id, `${path}.request_id`),
+    accepted: true,
+    result: jsonValueAt(record.result, `${path}.result`),
+    run,
+    runtimeControls,
+  };
+}
+
+export function parseCycleRecoveryActionResult(
+  value: unknown,
+): CycleRecoveryActionResult {
+  const path = 'cycleRecoveryActionResult';
+  const record = objectAt(value, path);
+  exactKeysAt(record, [
+    'schema_version', 'request_id', 'accepted', 'action_id', 'cycle_resumed',
+    'result_code', 'owner_result', 'run', 'runtime_controls', 'recovery_offer',
+  ], path);
+  const schemaVersion = stringAt(record.schema_version, `${path}.schema_version`);
+  const actionId = stringAt(record.action_id, `${path}.action_id`) as CycleRecoveryActionId;
+  if (
+    schemaVersion !== 'manyforge.cycle_recovery_result.v2'
+    || booleanAt(record.accepted, `${path}.accepted`) !== true
+    || stringAt(record.result_code, `${path}.result_code`) !== 'accepted'
+    || !RECOVERY_ACTION_IDS.has(actionId)
+  ) {
+    return fail(path, 'an accepted cycle-recovery result');
+  }
+  const run = parseProgramRunStatus(record.run);
+  const runtimeControls = parseProgramRuntimeControlProjection(
+    record.runtime_controls,
+  );
+  const recoveryOffer = record.recovery_offer === null
+    ? null
+    : parseCycleRecoveryOffer(record.recovery_offer, `${path}.recovery_offer`);
+  if (
+    run.capture.programRunId !== runtimeControls.programRunId
+    || recoveryOffer?.programRunId !== runtimeControls.programRunId
+    || run.ownerEpoch !== runtimeControls.ownerEpoch
+    || run.runRevision !== runtimeControls.runRevision
+  ) {
+    return fail(path, 'one exact Program-run identity');
+  }
+  return {
+    schemaVersion,
+    requestId: stringAt(record.request_id, `${path}.request_id`),
+    accepted: true,
+    actionId,
+    cycleResumed: booleanAt(record.cycle_resumed, `${path}.cycle_resumed`),
+    resultCode: 'accepted',
+    ownerResult: record.owner_result === null
+      ? null
+      : jsonValueAt(record.owner_result, `${path}.owner_result`),
+    run,
+    runtimeControls,
+    recoveryOffer,
+  };
+}
+
+export function parseRuntimeOverrideMaterializationResponse(
+  value: unknown,
+): RuntimeOverrideMaterializationResponse {
+  const path = 'runtimeOverrideMaterialization';
+  const record = objectAt(value, path);
+  exactKeysAt(record, ['proposalId', 'mutation', 'details', 'workspace'], path);
+  return {
+    proposalId: digestAt(record.proposalId, `${path}.proposalId`),
+    mutation: stringAt(record.mutation, `${path}.mutation`),
+    details: jsonRecordAt(record.details, `${path}.details`),
+    workspace: parseProgramWorkspaceResponse(record.workspace),
+  };
+}
+
 function parseProgramApplyResult(
   value: unknown,
   path: string,
@@ -4876,6 +5597,7 @@ export function parseComposerHeadlessState(
   exactKeysAt(cycle, [
     'program_runner_owner_epoch', 'cycle_generation', 'state', 'program_run_id',
     'cycle_claim_generation', 'terminal_or_settlement_reference',
+    'runtime_control_revision', 'recovery_offer',
   ], 'headlessState.program_cycle');
   const cycleState = stringAt(cycle.state, 'headlessState.program_cycle.state');
   if (!['idle_after_reset', 'starting', 'running', 'stopping',
@@ -4902,6 +5624,18 @@ export function parseComposerHeadlessState(
       programRunId: nullableStringAt(cycle.program_run_id, 'headlessState.program_cycle.program_run_id'),
       cycleClaimGeneration: cycle.cycle_claim_generation === null ? null : positiveIntegerAt(cycle.cycle_claim_generation, 'headlessState.program_cycle.cycle_claim_generation'),
       terminalOrSettlementReference: cycle.terminal_or_settlement_reference === null ? null : digestAt(cycle.terminal_or_settlement_reference, 'headlessState.program_cycle.terminal_or_settlement_reference'),
+      runtimeControlRevision: cycle.runtime_control_revision === null
+        ? null
+        : positiveIntegerAt(
+          cycle.runtime_control_revision,
+          'headlessState.program_cycle.runtime_control_revision',
+        ),
+      recoveryOffer: cycle.recovery_offer === null
+        ? null
+        : parseCycleRecoveryOffer(
+          cycle.recovery_offer,
+          'headlessState.program_cycle.recovery_offer',
+        ),
     },
     draftIdentity: {
       draftId: stringAt(draft.draft_id, 'headlessState.draft_identity.draft_id'),

@@ -37,9 +37,17 @@ from .models import (
     ProgramModelAttemptRequest,
     ProgramRunStartRequest,
     ProgramRunStopRequest,
+    ProgramScenePreparationRequest,
     ProgramCycleResetRequest,
+    CycleRecoveryActionRequest,
+    ManualResultStageRequest,
+    RuntimeBlackboardWriteRequest,
+    RuntimeOverrideActionRequest,
+    RuntimeOverridePromotionRequest,
+    RuntimeOverrideStageRequest,
     FullStopIntentRequest,
     OperationControlRequest,
+    OperationRecoveryActionRequest,
     OperationIntentRequest,
     PickSequencePlanningRequest,
     PlaceSequencePlanningRequest,
@@ -67,6 +75,7 @@ PROGRAM_RUN_INDEX_VERSION = "manyforge.program_run_index.v1"
 PROGRAM_RUN_STATUS_VERSION = "manyforge.program_run_status.v1"
 PROGRAM_RUN_CAPTURE_VERSION = "manyforge.program_run_capture.v1"
 SOURCE_MODEL_CONTEXT_VERSION = "manyforge.source_model_context.v1"
+ASSISTANT_MODE_CONTEXT_VERSION = "manyforge.assistant_mode_context.v1"
 _PROGRAM_RUN_STATES = frozenset(
     {
         "running",
@@ -352,6 +361,23 @@ class HeadlessService:
     def execution_read(self, operation_id: str) -> dict[str, Any]:
         return self._execution().read(operation_id)
 
+    def execution_operation_recovery(
+        self, operation_id: str
+    ) -> dict[str, Any]:
+        return self._execution().operation_recovery(operation_id)
+
+    def execution_apply_operation_recovery(
+        self,
+        operation_id: str,
+        expected_operation_revision: int,
+        request: OperationRecoveryActionRequest,
+    ) -> dict[str, Any]:
+        return self._execution().apply_operation_recovery(
+            operation_id,
+            expected_operation_revision,
+            request,
+        )
+
     def execution_plan_pick(
         self,
         request: PickSequencePlanningRequest,
@@ -630,6 +656,35 @@ class HeadlessService:
             )
         return context
 
+    def assistant_mode_context(self, mode_id: str) -> dict[str, Any]:
+        context = self.core.assistant_mode_context(mode_id)
+        if (
+            not isinstance(context, dict)
+            or set(context)
+            != {
+                "assistant_mode",
+                "node_environment",
+                "schema_version",
+                "source_model",
+            }
+            or context.get("schema_version") != ASSISTANT_MODE_CONTEXT_VERSION
+            or not isinstance(context.get("assistant_mode"), dict)
+            or not isinstance(context.get("node_environment"), dict)
+            or not isinstance(context.get("source_model"), dict)
+            or context["assistant_mode"].get("schema_version")
+            != "manyforge.assistant_mode_projection.v1"
+            or context["assistant_mode"].get("mode") != mode_id
+            or context["node_environment"].get("schema_version")
+            != "manyforge.node_environment_projection.v2"
+            or context["source_model"].get("schema_version")
+            != "manyforge.source_model_projection.v1"
+        ):
+            raise HeadlessApiError(
+                "assistant_mode_context_invalid",
+                "native core returned an unsupported assistant-mode context",
+            )
+        return context
+
     def scenarios(self) -> dict[str, Any]:
         projection = self.core.scenario_catalog_projection()
         if (
@@ -723,7 +778,11 @@ class HeadlessService:
 
     @staticmethod
     def _runner_error(error: ProgramRunnerClientError) -> HeadlessApiError:
-        return HeadlessApiError(error.code, str(error))
+        return HeadlessApiError(
+            error.code,
+            str(error),
+            details=error.details,
+        )
 
     @staticmethod
     def _validate_program_run_snapshot(
@@ -1014,6 +1073,56 @@ class HeadlessService:
             )
         return snapshot
 
+    def program_scene_prepare(
+        self, request: ProgramScenePreparationRequest
+    ) -> dict[str, Any]:
+        applied = self.program_applied()
+        source = applied.get("source")
+        if (
+            not isinstance(source, dict)
+            or source.get("record_digest")
+            != request.expected_applied_record_digest
+        ):
+            raise HeadlessApiError(
+                "program_run_applied_selection_stale",
+                "Applied Program changed before scene preparation",
+            )
+        try:
+            result = self._program_runner().prepare_applied_scene(
+                request.model_dump(mode="json")
+            )
+        except ProgramRunnerClientError as error:
+            raise self._runner_error(error) from error
+        proof = result.get("prepared_scene")
+        generation = result.get("admission_generation")
+        if (
+            set(result)
+            != {
+                "admission_generation",
+                "applied_record_digest",
+                "prepared_scene",
+                "program_revision",
+                "schema_version",
+                "status",
+            }
+            or result.get("schema_version")
+            != "manyforge.program_scene_preparation.v1"
+            or result.get("status") != "prepared"
+            or result.get("applied_record_digest")
+            != request.expected_applied_record_digest
+            or result.get("program_revision") != applied.get("program_revision")
+            or type(generation) is not int
+            or not 1 <= generation <= 9_007_199_254_740_991
+            or not isinstance(proof, dict)
+            or proof.get("schema_version")
+            != "manyforge.prepared_program_scene.v1"
+        ):
+            raise HeadlessApiError(
+                "program_runner_response_invalid",
+                "Program runner returned an invalid scene-preparation result",
+            )
+        return result
+
     def program_run_read(self, program_run_id: str) -> dict[str, Any]:
         try:
             projection = self._program_runner().read_run(program_run_id)
@@ -1053,6 +1162,37 @@ class HeadlessService:
     ) -> dict[str, Any]:
         try:
             return self._program_runner().reset_cycle(
+                request.model_dump(mode="json")
+            )
+        except ProgramRunnerClientError as error:
+            raise self._runner_error(error) from error
+
+    def program_runtime_controls(self, program_run_id: str) -> dict[str, Any]:
+        try:
+            return self._program_runner().runtime_controls(program_run_id)
+        except ProgramRunnerClientError as error:
+            raise self._runner_error(error) from error
+
+    def program_runtime_control_action(
+        self,
+        program_run_id: str,
+        suffix: str,
+        request: Any,
+    ) -> dict[str, Any]:
+        try:
+            return self._program_runner().runtime_control_action(
+                program_run_id,
+                suffix,
+                request.model_dump(mode="json"),
+            )
+        except ProgramRunnerClientError as error:
+            raise self._runner_error(error) from error
+
+    def cycle_recovery_action(
+        self, request: CycleRecoveryActionRequest
+    ) -> dict[str, Any]:
+        try:
+            return self._program_runner().apply_recovery_action(
                 request.model_dump(mode="json")
             )
         except ProgramRunnerClientError as error:

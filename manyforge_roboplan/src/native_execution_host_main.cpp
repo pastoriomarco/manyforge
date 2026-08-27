@@ -29,6 +29,7 @@
 #include <manyforge_component_manager/durable_store_set.hpp>
 #include <manyforge_content_identity/content_identity.hpp>
 #include <manyforge_core/logical_scene_identity.hpp>
+#include <manyforge_core/execution_interrupt_support.hpp>
 #include <manyforge_core/manager_liveness_receiver.hpp>
 #include <manyforge_core/pick_place_planning_owner.hpp>
 #include <manyforge_core/runtime_participant_binding.hpp>
@@ -1960,6 +1961,42 @@ DecodeRuntimeScaleRequest(const CanonicalValue &value,
       attribution};
 }
 
+[[nodiscard]] core::RecoveryAction
+DecodeRecoveryAction(const std::string_view value) {
+  if (value == "retry_motion_from_current_state") {
+    return core::RecoveryAction::kRetryMotionFromCurrentState;
+  }
+  if (value == "acknowledge_and_continue") {
+    return core::RecoveryAction::kAcknowledgeAndContinue;
+  }
+  if (value == "retry_after_scene_repair") {
+    return core::RecoveryAction::kRetryAfterSceneRepair;
+  }
+  if (value == "replan_from_stopped_state") {
+    return core::RecoveryAction::kReplanFromStoppedState;
+  }
+  if (value == "reset_cycle") {
+    return core::RecoveryAction::kResetCycle;
+  }
+  Fail("operation recovery action is unsupported");
+}
+
+[[nodiscard]] core::KernelRecoveryActionRequestDTO
+DecodeOperationRecoveryRequest(const CanonicalValue &value) {
+  RequireExactObjectSize(value, 10U, "operation recovery request");
+  return core::KernelRecoveryActionRequestDTO{
+      Text(value, "request_id"),
+      DecodeRecoveryAction(Text(value, "action")),
+      Text(value, "principal_id"),
+      Counter(value, "expected_assessment_revision", 1U),
+      Counter(value, "expected_control_command_epoch", 0U),
+      Counter(value, "expected_execution_id", 1U),
+      Text(value, "expected_latch_id"),
+      Text(value, "expected_stop_certificate_id"),
+      Counter(value, "expected_stop_owner_generation", 0U),
+      Text(value, "reason")};
+}
+
 enum class CommandKind {
   kStatus,
   kEvents,
@@ -1967,6 +2004,8 @@ enum class CommandKind {
   kPreviewCapabilityCommand,
   kSubmit,
   kRead,
+  kGetOperationRecovery,
+  kApplyOperationRecovery,
   kPause,
   kResume,
   kReset,
@@ -2000,6 +2039,8 @@ struct Command final {
   std::optional<core::ContentDigest> operation_digest;
   std::optional<core::OperationId> operation_id;
   std::optional<core::OperationControlRequestDTO> control;
+  std::optional<core::OperationRevision> expected_operation_revision;
+  std::optional<core::KernelRecoveryActionRequestDTO> operation_recovery;
   std::optional<core::StopIntentDTO> stop;
   std::optional<core::FullStopIntentDTO> full_stop;
   std::optional<MalformedStopCommand> malformed_stop;
@@ -2048,6 +2089,22 @@ struct Command final {
     RequireExactObjectSize(root, 3U, "read command");
     Command decoded{CommandKind::kRead};
     decoded.operation_id = core::OperationId(Text(root, "operation_id"));
+    return decoded;
+  }
+  if (command == "get_operation_recovery") {
+    RequireExactObjectSize(root, 3U, "operation recovery query command");
+    Command decoded{CommandKind::kGetOperationRecovery};
+    decoded.operation_id = core::OperationId(Text(root, "operation_id"));
+    return decoded;
+  }
+  if (command == "apply_operation_recovery") {
+    RequireExactObjectSize(root, 5U, "operation recovery action command");
+    Command decoded{CommandKind::kApplyOperationRecovery};
+    decoded.operation_id = core::OperationId(Text(root, "operation_id"));
+    decoded.expected_operation_revision = core::OperationRevision(
+        Counter(root, "expected_operation_revision", 1U));
+    decoded.operation_recovery =
+        DecodeOperationRecoveryRequest(Member(root, "request"));
     return decoded;
   }
   if (command == "get_runtime_scale") {
@@ -3097,6 +3154,110 @@ StopFaultRecoveryResultValue(const core::StopFaultRecoveryResultDTO &value) {
       {"replay_status",
        CanonicalValue(std::string(core::to_string(value.replay_status)))},
       {"request_id", CanonicalValue(value.request_id.value())},
+  });
+}
+
+[[nodiscard]] CanonicalValue
+RecoveryAssessmentValue(const core::KernelRecoveryAssessmentDTO &value) {
+  CanonicalValue::Array actions;
+  actions.reserve(value.allowed_actions.size());
+  for (const auto action : value.allowed_actions) {
+    actions.emplace_back(core::recovery_action_name(action));
+  }
+  CanonicalValue::Array evidence;
+  evidence.reserve(value.evidence_refs.size());
+  for (const auto &reference : value.evidence_refs) {
+    evidence.emplace_back(reference);
+  }
+  return CanonicalValue(CanonicalValue::Object{
+      {"allowed_actions", CanonicalValue(std::move(actions))},
+      {"assessed_at_ns", CanonicalValue(static_cast<double>(value.assessed_at_ns))},
+      {"assessment_revision",
+       CanonicalValue(static_cast<double>(value.assessment_revision))},
+      {"backend_stop_confirmed", CanonicalValue(value.backend_stop_confirmed)},
+      {"control_command_epoch",
+       CanonicalValue(static_cast<double>(value.control_command_epoch))},
+      {"evidence_refs", CanonicalValue(std::move(evidence))},
+      {"execution_id", CanonicalValue(static_cast<double>(value.execution_id))},
+      {"execution_state", CanonicalValue(std::string(core::to_string(value.execution_state)))},
+      {"latch_id", CanonicalValue(value.latch_id)},
+      {"observed_state_at_rest", CanonicalValue(value.observed_state_at_rest)},
+      {"observed_state_authority_profile",
+       CanonicalValue(value.observed_state_authority_profile)},
+      {"observed_state_available", CanonicalValue(value.observed_state_available)},
+      {"observed_state_fresh", CanonicalValue(value.observed_state_fresh)},
+      {"observed_state_measured", CanonicalValue(value.observed_state_measured)},
+      {"observed_state_sequence",
+       CanonicalValue(static_cast<double>(value.observed_state_sequence))},
+      {"observed_state_source_id", CanonicalValue(value.observed_state_source_id)},
+      {"observed_state_valid_until_ns",
+       CanonicalValue(static_cast<double>(value.observed_state_valid_until_ns))},
+      {"policy_id", CanonicalValue(value.policy_id)},
+      {"preemption_result",
+       CanonicalValue(std::string(core::interrupt_preemption_result_name(
+           value.preemption_result)))},
+      {"queued_latch_present", CanonicalValue(value.queued_latch_present)},
+      {"reason_code", CanonicalValue(value.reason_code)},
+      {"recovery_class",
+       CanonicalValue(std::string(core::recovery_class_name(value.recovery_class)))},
+      {"retry_admissible", CanonicalValue(value.retry_admissible)},
+      {"schema_version", CanonicalValue(value.schema_version)},
+      {"source_id", CanonicalValue(value.source_id)},
+      {"status", CanonicalValue(std::string(core::recovery_assessment_status_name(value.status)))},
+      {"stop_certificate_id", CanonicalValue(value.stop_certificate_id)},
+      {"stop_certificate_revision",
+       CanonicalValue(static_cast<double>(value.stop_certificate_revision))},
+      {"stop_owner_active", CanonicalValue(value.stop_owner_active)},
+      {"stop_owner_generation",
+       CanonicalValue(static_cast<double>(value.stop_owner_generation))},
+      {"stronger_authority_active", CanonicalValue(value.stronger_authority_active)},
+  });
+}
+
+[[nodiscard]] CanonicalValue RecoveryParticipantsValue(
+    const std::vector<core::OperationRecoveryParticipantDTO> &values) {
+  CanonicalValue::Array participants;
+  participants.reserve(values.size());
+  for (const auto &value : values) {
+    CanonicalValue::Array resources;
+    resources.reserve(value.resource_ids.size());
+    for (const auto &resource : value.resource_ids) {
+      resources.emplace_back(resource.value());
+    }
+    participants.emplace_back(CanonicalValue::Object{
+        {"active_control_configuration_generation",
+         CanonicalValue(static_cast<double>(
+             value.active_control_configuration_generation.value()))},
+        {"active_control_configuration_id",
+         CanonicalValue(value.active_control_configuration_id.value())},
+        {"capability_id", CanonicalValue(value.capability_id.value())},
+        {"capability_provider_binding_id",
+         value.capability_provider_binding_id.has_value()
+             ? CanonicalValue(value.capability_provider_binding_id->value())
+             : CanonicalValue(nullptr)},
+        {"command_target_id", CanonicalValue(value.command_target_id.value())},
+        {"controllable_component_id",
+         CanonicalValue(value.controllable_component_id.value())},
+        {"control_binding_id", CanonicalValue(value.control_binding_id.value())},
+        {"control_domain_id", CanonicalValue(value.control_domain_id.value())},
+        {"control_route_id", CanonicalValue(value.control_route_id.value())},
+        {"operation_participant_id",
+         CanonicalValue(value.operation_participant_id.value())},
+        {"resource_ids", CanonicalValue(std::move(resources))},
+    });
+  }
+  return CanonicalValue(std::move(participants));
+}
+
+[[nodiscard]] CanonicalValue
+RecoveryActionResultValue(const core::KernelRecoveryActionResultDTO &value) {
+  return CanonicalValue(CanonicalValue::Object{
+      {"accepted", CanonicalValue(value.accepted)},
+      {"action", CanonicalValue(std::string(core::recovery_action_name(value.action)))},
+      {"error", value.error.has_value() ? ErrorValue(*value.error)
+                                        : CanonicalValue(nullptr)},
+      {"request_id", CanonicalValue(value.request_id)},
+      {"resulting_assessment", RecoveryAssessmentValue(value.resulting_assessment)},
   });
 }
 
@@ -7690,6 +7851,7 @@ private:
     }
     const bool read_only = command.kind == CommandKind::kGetStopFault ||
                            command.kind == CommandKind::kRead ||
+                           command.kind == CommandKind::kGetOperationRecovery ||
                            command.kind == CommandKind::kGetRuntimeScale ||
                            command.kind == CommandKind::kReadPickPlaceSequence;
     const auto liveness_command =
@@ -7765,6 +7927,39 @@ private:
           {"ok", CanonicalValue(true)},
           {"operation", OperationStateValue(projection.value().operation)},
           {"resident", CanonicalValue(projection.value().resident)},
+      });
+    }
+    if (command.kind == CommandKind::kGetOperationRecovery) {
+      const auto assessment = composition.runtime->addressed_kernel
+                                  ->get_operation_recovery_assessment(
+                                      *command.operation_id);
+      if (!assessment.ok()) {
+        return CanonicalValue(CanonicalValue::Object{
+            {"api_version", CanonicalValue(std::string(kResponseApiVersion))},
+            {"error", ErrorValue(assessment.error())},
+            {"ok", CanonicalValue(false)},
+        });
+      }
+      return CanonicalValue(CanonicalValue::Object{
+          {"api_version", CanonicalValue(std::string(kResponseApiVersion))},
+          {"command", CanonicalValue("get_operation_recovery")},
+          {"ok", CanonicalValue(true)},
+          {"operation_revision",
+           CanonicalValue(static_cast<double>(
+               assessment.value().operation_revision.value()))},
+          {"stop_generation",
+           assessment.value().stop_generation.has_value()
+               ? CanonicalValue(static_cast<double>(
+                     assessment.value().stop_generation->value()))
+               : CanonicalValue(nullptr)},
+          {"stop_id",
+           assessment.value().stop_id.has_value()
+               ? CanonicalValue(assessment.value().stop_id->value())
+               : CanonicalValue(nullptr)},
+          {"participants",
+           RecoveryParticipantsValue(assessment.value().participants)},
+          {"recovery_assessment",
+           RecoveryAssessmentValue(assessment.value().assessment)},
       });
     }
     const auto reconcile_error = LastReconcileError();
@@ -8026,6 +8221,26 @@ private:
           {"ok", CanonicalValue(true)},
       });
     }
+    if (command.kind == CommandKind::kApplyOperationRecovery) {
+      const auto result = composition.runtime->addressed_kernel
+                              ->apply_operation_recovery_action(
+                                  *command.operation_id,
+                                  *command.expected_operation_revision,
+                                  *command.operation_recovery);
+      if (!result.ok()) {
+        return CanonicalValue(CanonicalValue::Object{
+            {"api_version", CanonicalValue(std::string(kResponseApiVersion))},
+            {"error", ErrorValue(result.error())},
+            {"ok", CanonicalValue(false)},
+        });
+      }
+      return CanonicalValue(CanonicalValue::Object{
+          {"api_version", CanonicalValue(std::string(kResponseApiVersion))},
+          {"command", CanonicalValue("apply_operation_recovery")},
+          {"ok", CanonicalValue(true)},
+          {"result", RecoveryActionResultValue(result.value())},
+      });
+    }
     const auto control_result =
         [&]() -> core::Result<core::OperationControlAcceptedDTO> {
       switch (command.kind) {
@@ -8044,6 +8259,8 @@ private:
       case CommandKind::kPreviewCapabilityCommand:
       case CommandKind::kSubmit:
       case CommandKind::kRead:
+      case CommandKind::kGetOperationRecovery:
+      case CommandKind::kApplyOperationRecovery:
       case CommandKind::kStop:
       case CommandKind::kFullStop:
       case CommandKind::kMalformedStop:

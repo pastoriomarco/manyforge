@@ -67,6 +67,7 @@ class _OwnerAdapter(py_trees.behaviour.Behaviour):
             self._identity = self._attempt_source.begin(self._node_instance_id)
             snapshot = self._input_resolver.snapshot(
                 node_id=self._node_id,
+                node_instance_id=self._node_instance_id,
                 parameters=self._parameters,
                 value_sources=self._value_sources,
                 blackboard_read_parameters=self._blackboard_read_parameters,
@@ -88,6 +89,10 @@ class _OwnerAdapter(py_trees.behaviour.Behaviour):
     @property
     def failure_message(self) -> str:
         return self._failure_message
+
+    @property
+    def attempt_identity(self) -> NodeAttemptIdentity | None:
+        return self._identity
 
     def _write_output(
         self,
@@ -145,12 +150,14 @@ class OwnerTaskAdapter(_OwnerAdapter):
         self,
         *,
         port: OwnerTaskPort,
+        owner_port_name: str = "unspecified",
         intervention_port: ProgramInterventionPort | None = None,
         require_initial_running: bool = False,
         **kwargs: Any,
     ) -> None:
         super().__init__(**kwargs)
         self._port = port
+        self._owner_port_name = owner_port_name
         self._intervention_port = intervention_port
         self._require_initial_running = require_initial_running
         self._task: OwnerTaskSnapshot | None = None
@@ -163,7 +170,62 @@ class OwnerTaskAdapter(_OwnerAdapter):
         self._acknowledged = False
         self._intervention_reported = False
 
+    @property
+    def owner_recovery_context(self) -> Mapping[str, Any] | None:
+        if self._task is None:
+            return None
+        assessment = self._task.metadata.get("recovery_assessment")
+        return {
+            "owner_port_name": self._owner_port_name,
+            "owner_task_id": self._task.task_id,
+            "owner_assessment": (
+                assessment if isinstance(assessment, Mapping) else None
+            ),
+        }
+
     def _settle(self, task: OwnerTaskSnapshot) -> py_trees.common.Status:
+        if self._intervention_reported:
+            if self._intervention_port is None or self._identity is None:
+                self._record_failure(
+                    "program_intervention_port_unavailable",
+                    "held recovery lost its exact owner identity",
+                )
+                return py_trees.common.Status.FAILURE
+            try:
+                resolution = self._intervention_port.consume_resolution(
+                    self._identity
+                )
+            except Exception as exc:
+                self._record_failure(
+                    "program_recovery_resolution_failed", str(exc)
+                )
+                return py_trees.common.Status.FAILURE
+            if resolution is None:
+                return py_trees.common.Status.RUNNING
+            action, result = resolution
+            if action == "retry":
+                # A fresh attempt takes a fresh identity and input snapshot;
+                # the already-submitted owner request is never changed.
+                self.initialise()
+                return py_trees.common.Status.RUNNING
+            if action == "manual_success":
+                return (
+                    py_trees.common.Status.SUCCESS
+                    if self._write_output(
+                        result,
+                        owner_metadata={"result_source": "manual_recovery"},
+                        adapter_metadata={
+                            "program_run_id": self._identity.program_run_id,
+                            "node_attempt_id": self._identity.node_attempt_id,
+                            "owner_task_id": task.task_id,
+                        },
+                    )
+                    else py_trees.common.Status.FAILURE
+                )
+            self._record_failure(
+                "manual_recovery_failure", "operator staged a failed result"
+            )
+            return py_trees.common.Status.FAILURE
         if task.state is OwnerTaskState.ACTIVE:
             return py_trees.common.Status.RUNNING
         if task.state is OwnerTaskState.SUCCEEDED:
@@ -226,6 +288,16 @@ class OwnerTaskAdapter(_OwnerAdapter):
                             ),
                             message=task.message,
                             policy_parameter=parameter,
+                            owner_port_name=self._owner_port_name,
+                            owner_task_id=task.task_id,
+                            owner_assessment=(
+                                task.metadata.get("recovery_assessment")
+                                if isinstance(
+                                    task.metadata.get("recovery_assessment"),
+                                    Mapping,
+                                )
+                                else None
+                            ),
                         )
                     except Exception as exc:
                         self._record_failure(

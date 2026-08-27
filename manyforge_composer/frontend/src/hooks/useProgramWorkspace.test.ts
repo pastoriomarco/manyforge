@@ -225,6 +225,8 @@ function authoringSnapshot(
       programRunId: null,
       cycleClaimGeneration: null,
       terminalOrSettlementReference: null,
+      runtimeControlRevision: null,
+      recoveryOffer: null,
     },
     draftIdentity: {
       draftId: current.draft.draftId,

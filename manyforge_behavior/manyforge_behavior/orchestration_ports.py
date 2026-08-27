@@ -203,18 +203,6 @@ class CompositeProgramRunContextPort:
             ) from errors[0]
 
 
-class ProgramRunInitializationPort(Protocol):
-    """Apply captured pre-dispatch Program state before tree construction."""
-
-    def initialize(
-        self,
-        context: ProgramRunPortContext,
-        initial_scene: Sequence[Mapping[str, Any]],
-    ) -> None: ...
-
-    def release(self, program_run_id: str) -> None: ...
-
-
 class NodeAttemptSource(Protocol):
     """Issue one fresh identity whenever a node attempt starts."""
 
@@ -419,6 +407,9 @@ class ProgramInterventionSnapshot:
     reason_code: str
     message: str
     policy_parameter: str
+    owner_port_name: str | None = None
+    owner_task_id: str | None = None
+    owner_assessment: Mapping[str, Any] | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.identity, NodeAttemptIdentity):
@@ -439,6 +430,26 @@ class ProgramInterventionSnapshot:
             or len(self.message.encode("utf-8")) > 4_096
         ):
             raise ValueError("intervention message must be bounded text")
+        if self.owner_port_name is not None and (
+            not isinstance(self.owner_port_name, str)
+            or not self.owner_port_name
+            or len(self.owner_port_name.encode("utf-8")) > 128
+        ):
+            raise ValueError("owner_port_name must be bounded non-empty text")
+        if self.owner_task_id is not None and (
+            not isinstance(self.owner_task_id, str)
+            or not self.owner_task_id
+            or len(self.owner_task_id.encode("utf-8")) > 512
+        ):
+            raise ValueError("owner_task_id must be bounded non-empty text")
+        if self.owner_assessment is not None:
+            if not isinstance(self.owner_assessment, Mapping):
+                raise TypeError("owner_assessment must be absent or a mapping")
+            object.__setattr__(
+                self,
+                "owner_assessment",
+                _freeze(dict(self.owner_assessment)),
+            )
 
 
 class ProgramInterventionPort(Protocol):
@@ -451,9 +462,30 @@ class ProgramInterventionPort(Protocol):
         reason_code: str,
         message: str,
         policy_parameter: str,
+        owner_port_name: str | None = None,
+        owner_task_id: str | None = None,
+        owner_assessment: Mapping[str, Any] | None = None,
     ) -> ProgramInterventionSnapshot: ...
 
     def read(self, program_run_id: str) -> ProgramInterventionSnapshot | None: ...
+
+    def refresh_owner_assessment(
+        self,
+        identity: NodeAttemptIdentity,
+        assessment: Mapping[str, Any],
+    ) -> ProgramInterventionSnapshot: ...
+
+    def resolve(
+        self,
+        identity: NodeAttemptIdentity,
+        *,
+        action: str,
+        result: object = None,
+    ) -> None: ...
+
+    def consume_resolution(
+        self, identity: NodeAttemptIdentity
+    ) -> tuple[str, object] | None: ...
 
     def release(self, program_run_id: str) -> None: ...
 
@@ -474,7 +506,6 @@ class NodeAdapterPorts:
     kernel_controls: OwnerInvocationPort | None = None
     program_run_scope: ProgramRunScopePort | None = None
     program_run_context: ProgramRunContextPort | None = None
-    program_run_initialization: ProgramRunInitializationPort | None = None
     program_interventions: ProgramInterventionPort | None = None
 
 
@@ -485,7 +516,6 @@ __all__ = [
     "CompositeProgramRunContextPort",
     "ProgramRunContextError",
     "ProgramRunContextPort",
-    "ProgramRunInitializationPort",
     "ProgramInterventionPort",
     "ProgramInterventionSnapshot",
     "ProgramRunPortContext",

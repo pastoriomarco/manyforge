@@ -107,19 +107,18 @@ def test_composer_forwards_exact_owner_context_without_owning_request_state(
         }
     )
     source = SimpleNamespace(
-        payload={"source": {"source_content_digest": "sha256:" + "6" * 64}}
+        payload={"source": {"source_content_digest": "sha256:" + "6" * 64}},
     )
-    mode = SimpleNamespace(payload=_mode())
-    monkeypatch.setattr(routes_assistant, "read_active_node_environment", lambda _state: node)
+    context = SimpleNamespace(
+        assistant_mode=SimpleNamespace(payload=_mode()),
+        node_environment=node,
+        source_model=source,
+    )
+    mode = context.assistant_mode
     monkeypatch.setattr(
         routes_assistant,
-        "read_active_source_model",
-        lambda _state, *, node_environment: source,
-    )
-    monkeypatch.setattr(
-        routes_assistant,
-        "read_active_assistant_mode",
-        lambda _state, *, mode, node_environment: SimpleNamespace(payload=_mode()),
+        "read_active_assistant_context",
+        lambda _state, *, mode: context,
     )
 
     with TestClient(create_app(state)) as client:

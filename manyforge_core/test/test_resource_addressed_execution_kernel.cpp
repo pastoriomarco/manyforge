@@ -651,6 +651,33 @@ class FakeParticipantEngine final : public IResolvedParticipantExecutionEngine,
     return status;
   }
 
+  KernelRecoveryAssessmentDTO get_recovery_assessment() const override {
+    ++recovery_assessment_calls;
+    if (recovery_assessment_hook) {
+      recovery_assessment_hook();
+    }
+    if (throw_during_recovery_assessment) {
+      throw std::runtime_error("injected recovery assessment failure");
+    }
+    return recovery_assessment;
+  }
+
+  KernelRecoveryActionResultDTO apply_recovery_action(
+      const KernelRecoveryActionRequestDTO& request) override {
+    ++recovery_action_calls;
+    last_recovery_request = request;
+    if (recovery_action_hook) {
+      recovery_action_hook();
+    }
+    if (throw_during_recovery) {
+      throw std::runtime_error("injected recovery failure");
+    }
+    if (next_recovery_result.has_value()) {
+      return *next_recovery_result;
+    }
+    return IResolvedParticipantExecutionEngine::apply_recovery_action(request);
+  }
+
   SubscriptionHandle subscribe_events(EventCallback callback) override {
     const auto id = next_subscription_id++;
     callbacks.emplace(id, std::move(callback));
@@ -745,6 +772,8 @@ class FakeParticipantEngine final : public IResolvedParticipantExecutionEngine,
   std::atomic<int> certified_reset_calls{};
   std::atomic<int> acknowledge_calls{};
   std::atomic<int> runtime_scale_calls{};
+  mutable std::atomic<int> recovery_assessment_calls{};
+  std::atomic<int> recovery_action_calls{};
   std::uint64_t next_execution_id{41U};
   Result<std::uint64_t> next_execute_result = Result<std::uint64_t>::Ok(41U);
   GripperCommandResultDTO next_command_result{true, 73U, 9U, std::nullopt};
@@ -773,6 +802,12 @@ class FakeParticipantEngine final : public IResolvedParticipantExecutionEngine,
   std::function<void()> prepare_command_hook;
   std::function<void()> dispatch_prepared_command_hook;
   std::function<void()> translate_stop_stage_hook;
+  mutable std::function<void()> recovery_assessment_hook;
+  std::function<void()> recovery_action_hook;
+  bool throw_during_recovery_assessment{};
+  bool throw_during_recovery{};
+  KernelRecoveryAssessmentDTO recovery_assessment{};
+  std::optional<KernelRecoveryActionResultDTO> next_recovery_result;
   GripperCommandStatusDTO gripper_status{};
   std::optional<ExecuteRequestDTO> last_execute;
   std::optional<ResolvedPreparedMotionExecutionRequestDTO> last_prepared_request;
@@ -783,6 +818,7 @@ class FakeParticipantEngine final : public IResolvedParticipantExecutionEngine,
   std::optional<ResolvedRuntimeScaleCommandDTO> last_runtime_scale_command;
   std::optional<GripperCommandRequestDTO> last_command;
   std::optional<ResolvedParticipantStopStageDTO> last_stop_stage;
+  std::optional<KernelRecoveryActionRequestDTO> last_recovery_request;
   std::vector<std::string>* timeline{};
   std::mutex* timeline_mutex{};
 
@@ -2305,6 +2341,299 @@ TEST(ResourceAddressedExecutionKernelTest,
             "injected_preparation_failure");
   ASSERT_EQ(kernel.resource_snapshot().size(), 1U);
   EXPECT_EQ(kernel.resource_snapshot().front().state, ResourceSlotState::kTerminal);
+}
+
+TEST(ResourceAddressedExecutionKernelTest,
+     RecoveryProjectionAndAcceptedActionUseExactOperationAndReplayFences) {
+  FakeClock clock;
+  ManualScheduler scheduler;
+  FakeParticipantEngine engine;
+  engine.prepare_failure = ErrorDTO{std::string(to_string(ErrorCode::kExecutionRejected)),
+                                    "injected preparation failure",
+                                    {{"reason", "injected_preparation_failure"}}};
+  engine.recovery_assessment.assessment_revision = 7U;
+  engine.recovery_assessment.control_command_epoch = 11U;
+  engine.recovery_assessment.execution_id = 41U;
+  engine.recovery_assessment.status = RecoveryAssessmentStatus::kActionRequired;
+  engine.recovery_assessment.allowed_actions = {
+      RecoveryAction::kAcknowledgeAndContinue};
+  ResourceAddressedExecutionKernel kernel(
+      {registration(
+          make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular),
+          engine)},
+      clock, scheduler, default_journal,
+      ResourceAddressedExecutionKernelConfig{RequestOwnerEpoch("kernel.epoch.1"),
+                                             CellId("cell.test"), 8U});
+
+  const auto accepted = kernel.execute(motion_operation("request.recovery.accept"));
+  ASSERT_TRUE(accepted.ok()) << accepted.error().message;
+  const auto operation = kernel.get_operation_state(accepted.value().operation_id);
+  ASSERT_TRUE(operation.ok()) << operation.error().message;
+  ASSERT_EQ(operation.value().state, OperationStateKind::kInterventionRequired);
+
+  const auto projection =
+      kernel.get_operation_recovery_assessment(accepted.value().operation_id);
+  ASSERT_TRUE(projection.ok()) << projection.error().message;
+  EXPECT_EQ(projection.value().operation_revision,
+            operation.value().operation_revision);
+  EXPECT_EQ(projection.value().assessment.assessment_revision, 7U);
+  ASSERT_EQ(projection.value().participants.size(), 1U);
+  EXPECT_EQ(projection.value().participants.front().controllable_component_id,
+            ControllableComponentId("robot.1"));
+  EXPECT_EQ(projection.value().participants.front().command_target_id,
+            CommandTargetId("arm"));
+  EXPECT_EQ(projection.value().participants.front().resource_ids,
+            std::vector<ResourceId>{ResourceId("robot.joint_1")});
+
+  const KernelRecoveryActionRequestDTO request{
+      "request.recovery.action",
+      RecoveryAction::kAcknowledgeAndContinue,
+      "operator.test",
+      projection.value().assessment.assessment_revision,
+      projection.value().assessment.control_command_epoch,
+      projection.value().assessment.execution_id,
+      projection.value().assessment.latch_id,
+      projection.value().assessment.stop_certificate_id,
+      projection.value().assessment.stop_owner_generation,
+      "continue after inspection"};
+  auto resulting_assessment = projection.value().assessment;
+  resulting_assessment.assessment_revision = 8U;
+  resulting_assessment.status = RecoveryAssessmentStatus::kUnavailable;
+  engine.next_recovery_result = KernelRecoveryActionResultDTO{
+      request.request_id, request.action, true, resulting_assessment, std::nullopt};
+
+  const auto recovered = kernel.apply_operation_recovery_action(
+      accepted.value().operation_id, operation.value().operation_revision, request);
+  ASSERT_TRUE(recovered.ok()) << recovered.error().message;
+  EXPECT_TRUE(recovered.value().accepted);
+  EXPECT_EQ(engine.recovery_action_calls, 1);
+  const auto released_resources = kernel.resource_snapshot();
+  ASSERT_EQ(released_resources.size(), 1U);
+  EXPECT_EQ(released_resources.front().state, ResourceSlotState::kFree);
+  EXPECT_FALSE(released_resources.front().owner.has_value());
+  const auto historical =
+      kernel.get_operation_projection(accepted.value().operation_id);
+  ASSERT_TRUE(historical.ok()) << historical.error().message;
+  EXPECT_FALSE(historical.value().resident);
+  EXPECT_EQ(historical.value().operation.state,
+            OperationStateKind::kInterventionRequired);
+
+  const auto replay = kernel.apply_operation_recovery_action(
+      accepted.value().operation_id, operation.value().operation_revision, request);
+  ASSERT_TRUE(replay.ok()) << replay.error().message;
+  EXPECT_TRUE(replay.value().accepted);
+  EXPECT_EQ(engine.recovery_action_calls, 1);
+
+  auto conflicting = request;
+  conflicting.action = RecoveryAction::kRetryAfterSceneRepair;
+  const auto conflict = kernel.apply_operation_recovery_action(
+      accepted.value().operation_id, operation.value().operation_revision,
+      conflicting);
+  ASSERT_FALSE(conflict.ok());
+  EXPECT_EQ(conflict.error().details.at("reason"), "request_id_conflict");
+}
+
+TEST(ResourceAddressedExecutionKernelTest,
+     RejectedRecoveryIsReplayableAndLeavesTheOperationResident) {
+  FakeClock clock;
+  ManualScheduler scheduler;
+  FakeParticipantEngine engine;
+  ResourceAddressedExecutionKernel kernel(
+      {registration(
+          make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular),
+          engine)},
+      clock, scheduler, default_journal,
+      ResourceAddressedExecutionKernelConfig{RequestOwnerEpoch("kernel.epoch.1"),
+                                             CellId("cell.test"), 8U});
+
+  const auto accepted = kernel.execute(motion_operation("request.recovery.reject"));
+  ASSERT_TRUE(accepted.ok()) << accepted.error().message;
+  const auto operation = kernel.get_operation_state(accepted.value().operation_id);
+  ASSERT_TRUE(operation.ok()) << operation.error().message;
+  const KernelRecoveryActionRequestDTO request{
+      "request.recovery.rejected",
+      RecoveryAction::kRetryMotionFromCurrentState,
+      "operator.test",
+      1U,
+      1U,
+      41U,
+      "",
+      "",
+      0U,
+      "not currently admissible"};
+  engine.next_recovery_result = KernelRecoveryActionResultDTO{
+      request.request_id,
+      request.action,
+      false,
+      {},
+      ErrorDTO{"recovery_rejected",
+               "recovery is not currently admissible",
+               {{"reason", "recovery_not_admissible"}}}};
+
+  const auto rejected = kernel.apply_operation_recovery_action(
+      accepted.value().operation_id, operation.value().operation_revision, request);
+  ASSERT_TRUE(rejected.ok()) << rejected.error().message;
+  EXPECT_FALSE(rejected.value().accepted);
+  const auto replay = kernel.apply_operation_recovery_action(
+      accepted.value().operation_id, operation.value().operation_revision, request);
+  ASSERT_TRUE(replay.ok()) << replay.error().message;
+  EXPECT_FALSE(replay.value().accepted);
+  EXPECT_EQ(engine.recovery_action_calls, 1);
+  const auto resident =
+      kernel.get_operation_projection(accepted.value().operation_id);
+  ASSERT_TRUE(resident.ok()) << resident.error().message;
+  EXPECT_TRUE(resident.value().resident);
+}
+
+TEST(ResourceAddressedExecutionKernelTest,
+     RecoveryAssessmentFailsClosedWhenTheParticipantThrows) {
+  FakeClock clock;
+  ManualScheduler scheduler;
+  FakeParticipantEngine engine;
+  engine.throw_during_recovery_assessment = true;
+  ResourceAddressedExecutionKernel kernel(
+      {registration(
+          make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular),
+          engine)},
+      clock, scheduler, default_journal,
+      ResourceAddressedExecutionKernelConfig{RequestOwnerEpoch("kernel.epoch.1"),
+                                             CellId("cell.test"), 8U});
+  const auto accepted = kernel.execute(motion_operation("request.recovery.assessment-throw"));
+  ASSERT_TRUE(accepted.ok()) << accepted.error().message;
+
+  const auto assessment =
+      kernel.get_operation_recovery_assessment(accepted.value().operation_id);
+
+  ASSERT_FALSE(assessment.ok());
+  EXPECT_EQ(assessment.error().details.at("reason"),
+            "operation_recovery_unavailable");
+}
+
+TEST(ResourceAddressedExecutionKernelTest,
+     RecoveryAssessmentRejectsAnOperationChangedDuringTheOwnerRead) {
+  FakeClock clock;
+  ManualScheduler scheduler;
+  FakeParticipantEngine engine;
+  ResourceAddressedExecutionKernel kernel(
+      {registration(
+          make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular),
+          engine)},
+      clock, scheduler, default_journal,
+      ResourceAddressedExecutionKernelConfig{RequestOwnerEpoch("kernel.epoch.1"),
+                                             CellId("cell.test"), 8U});
+  const auto accepted = kernel.execute(motion_operation("request.recovery.assessment-race"));
+  ASSERT_TRUE(accepted.ok()) << accepted.error().message;
+  const auto operation = kernel.get_operation_state(accepted.value().operation_id);
+  ASSERT_TRUE(operation.ok()) << operation.error().message;
+  engine.recovery_assessment_hook = [&] {
+    const auto stopped = kernel.stop(stop_request(
+        "request.recovery.assessment-race.stop", accepted.value(),
+        operation.value().operation_revision.value()));
+    EXPECT_TRUE(stopped.ok()) << stopped.error().message;
+  };
+
+  const auto assessment =
+      kernel.get_operation_recovery_assessment(accepted.value().operation_id);
+
+  ASSERT_FALSE(assessment.ok());
+  EXPECT_EQ(assessment.error().details.at("reason"),
+            "operation_recovery_stale");
+}
+
+TEST(ResourceAddressedExecutionKernelTest,
+     ThrowingRecoveryEffectIsUnresolvedAndClosesMotionAdmission) {
+  FakeClock clock;
+  ManualScheduler scheduler;
+  FakeParticipantEngine engine;
+  engine.throw_during_recovery = true;
+  ResourceAddressedExecutionKernel kernel(
+      {registration(
+          make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular),
+          engine)},
+      clock, scheduler, default_journal,
+      ResourceAddressedExecutionKernelConfig{RequestOwnerEpoch("kernel.epoch.1"),
+                                             CellId("cell.test"), 8U});
+  const auto accepted = kernel.execute(motion_operation("request.recovery.action-throw"));
+  ASSERT_TRUE(accepted.ok()) << accepted.error().message;
+  const auto operation = kernel.get_operation_state(accepted.value().operation_id);
+  ASSERT_TRUE(operation.ok()) << operation.error().message;
+  const KernelRecoveryActionRequestDTO request{
+      "request.recovery.action-throw.command",
+      RecoveryAction::kRetryMotionFromCurrentState,
+      "operator.test",
+      1U,
+      1U,
+      41U,
+      "",
+      "",
+      0U,
+      "injected participant failure"};
+
+  const auto recovered = kernel.apply_operation_recovery_action(
+      accepted.value().operation_id, operation.value().operation_revision, request);
+
+  ASSERT_FALSE(recovered.ok());
+  EXPECT_EQ(recovered.error().details.at("reason"),
+            "operation_recovery_outcome_unresolved");
+  const auto replay = kernel.apply_operation_recovery_action(
+      accepted.value().operation_id, operation.value().operation_revision, request);
+  ASSERT_FALSE(replay.ok());
+  EXPECT_EQ(replay.error().details.at("reason"),
+            "operation_recovery_outcome_unresolved");
+  EXPECT_EQ(engine.recovery_action_calls, 1);
+  const auto blocked = kernel.execute(motion_operation("request.after-recovery-throw"));
+  ASSERT_FALSE(blocked.ok());
+  EXPECT_EQ(blocked.error().details.at("reason"), "motion_admission_closed");
+}
+
+TEST(ResourceAddressedExecutionKernelTest,
+     ConcurrentStopMakesTheParticipantRecoveryOutcomeUnresolved) {
+  FakeClock clock;
+  ManualScheduler scheduler;
+  FakeParticipantEngine engine;
+  ResourceAddressedExecutionKernel kernel(
+      {registration(
+          make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular),
+          engine)},
+      clock, scheduler, default_journal,
+      ResourceAddressedExecutionKernelConfig{RequestOwnerEpoch("kernel.epoch.1"),
+                                             CellId("cell.test"), 8U});
+
+  const auto accepted = kernel.execute(motion_operation("request.recovery.stop-race"));
+  ASSERT_TRUE(accepted.ok()) << accepted.error().message;
+  const auto operation = kernel.get_operation_state(accepted.value().operation_id);
+  ASSERT_TRUE(operation.ok()) << operation.error().message;
+  const KernelRecoveryActionRequestDTO request{
+      "request.recovery.raced",
+      RecoveryAction::kRetryMotionFromCurrentState,
+      "operator.test",
+      1U,
+      1U,
+      41U,
+      "",
+      "",
+      0U,
+      "race with Stop"};
+  engine.next_recovery_result = KernelRecoveryActionResultDTO{
+      request.request_id, request.action, true, {}, std::nullopt};
+  engine.recovery_action_hook = [&] {
+    const auto stopped = kernel.stop(stop_request(
+        "request.stop.during-recovery", accepted.value(),
+        operation.value().operation_revision.value()));
+    EXPECT_TRUE(stopped.ok()) << stopped.error().message;
+  };
+
+  const auto recovered = kernel.apply_operation_recovery_action(
+      accepted.value().operation_id, operation.value().operation_revision, request);
+  ASSERT_FALSE(recovered.ok());
+  EXPECT_EQ(recovered.error().details.at("reason"),
+            "operation_recovery_outcome_unresolved");
+  const auto replay = kernel.apply_operation_recovery_action(
+      accepted.value().operation_id, operation.value().operation_revision, request);
+  ASSERT_FALSE(replay.ok());
+  EXPECT_EQ(replay.error().details.at("reason"),
+            "operation_recovery_outcome_unresolved");
+  EXPECT_EQ(engine.recovery_action_calls, 1);
 }
 
 TEST(ResourceAddressedExecutionKernelTest,

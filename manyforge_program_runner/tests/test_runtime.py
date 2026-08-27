@@ -13,6 +13,11 @@ from manyforge_behavior.program_run_owner import ProgramRunOwnerError
 from manyforge_headless_api.models import (
     ProgramRunStartRequest,
     ProgramRunStopRequest,
+    ProgramScenePreparationRequest,
+    RuntimeBlackboardWriteRequest,
+    RuntimeOverrideActionRequest,
+    RuntimeOverridePromotionRequest,
+    RuntimeOverrideStageRequest,
 )
 from manyforge_program_runner.runtime import (
     ProgramRunnerConfig,
@@ -32,11 +37,55 @@ _DIGEST_B = "sha256:" + "b" * 64
 _ACTIVE_STATES = {"running", "intervention_required", "stopping", "finalizing"}
 
 
+def test_recovery_fences_join_program_and_execution_owner_contracts() -> None:
+    applied = {
+        "program_binding_id": "sha256:" + "1" * 64,
+        "retained_bundle_id": _DIGEST_A,
+        "graph_revision": _DIGEST_B,
+        "source": {"source_generation": 7},
+    }
+    execution = {
+        "ok": True,
+        "status": {
+            # This identifies the execution owner's direct-control surface,
+            # not the scenario's Program Binding above.
+            "program_binding_id": "sha256:" + "2" * 64,
+            "retained_bundle_id": _DIGEST_A,
+            "graph_revision": _DIGEST_B,
+            "active_publication_generation": 11,
+            "scene_revision": {"revision_id": 3},
+        },
+    }
+
+    assert ProgramRuntime._run_recovery_fences(
+        applied,
+        execution,
+        scene_admission_epoch=13,
+    ) == {
+        "program_generation": 7,
+        "deployment_generation": 11,
+        "scene_admission_epoch": 13,
+        "pose_source_apply_generation": 0,
+    }
+
+    execution["status"]["graph_revision"] = _DIGEST_A
+    with pytest.raises(
+        ProgramRunnerError,
+        match="current owners did not provide exact recovery generations",
+    ):
+        ProgramRuntime._run_recovery_fences(
+            applied,
+            execution,
+            scene_admission_epoch=13,
+        )
+
+
 class _Headless:
     """Construction-complete transport whose unused effects fail loudly."""
 
     _PORT_METHODS = {
         "acknowledge_completed_operation",
+        "authoring_admission",
         "commit_scene_transaction",
         "cclc_component",
         "cclc_owner_identity",
@@ -44,7 +93,6 @@ class _Headless:
         "component_lifecycle_status",
         "commit_program_model_attempt",
         "execute",
-        "execution_status",
         "manager_graph",
         "operation",
         "operation_runtime_scale",
@@ -69,13 +117,28 @@ class _Headless:
             "scenario_id": "cell-pick",
             "scenario_catalog_revision": _DIGEST_A,
             "program_revision": _DIGEST_A,
-            "source": {"record_digest": _DIGEST_B},
+            "source": {
+                "record_digest": _DIGEST_B,
+                "source_generation": 1,
+            },
         }
 
     def scenario_program_selection(self, scenario_id: str) -> dict[str, Any]:
         self.selection_reads += 1
         assert scenario_id == "cell-pick"
         return {"scenario_id": scenario_id, "program_revision": _DIGEST_A}
+
+    def execution_status(self) -> dict[str, Any]:
+        return {
+            "ok": True,
+            "status": {
+                "program_binding_id": None,
+                "retained_bundle_id": None,
+                "graph_revision": None,
+                "active_publication_generation": 1,
+                "scene_revision": {"revision_id": 1},
+            },
+        }
 
     def __getattr__(self, name: str):
         if name not in self._PORT_METHODS:
@@ -97,28 +160,32 @@ class _Snapshot:
         state: str,
         revision: int,
     ) -> None:
-        self.capture = SimpleNamespace(program_run_id=program_run_id)
+        capture = {
+            "schema_version": "manyforge.program_run_capture.v1",
+            "program_run_id": program_run_id,
+            "applied_record_digest": _DIGEST_B,
+            "scenario_id": "scenario.1",
+            "scenario_catalog_revision": _DIGEST_A,
+            "program_id": "program.1",
+            "program_revision": _DIGEST_A,
+            "program_binding_id": _DIGEST_B,
+            "retained_bundle_id": _DIGEST_A,
+            "graph_revision": _DIGEST_B,
+            "node_environment_digest": _DIGEST_A,
+            "node_policy_digest": _DIGEST_B,
+            "node_policies": [],
+        }
+        self.capture = SimpleNamespace(
+            program_run_id=program_run_id,
+            to_dict=lambda: deepcopy(capture),
+        )
         self._value = {
             "schema_version": "manyforge.program_run_status.v1",
             "owner_id": owner_id,
             "owner_epoch": owner_epoch,
             "run_revision": revision,
             "state": state,
-            "capture": {
-                "schema_version": "manyforge.program_run_capture.v1",
-                "program_run_id": program_run_id,
-                "applied_record_digest": _DIGEST_B,
-                "scenario_id": "scenario.1",
-                "scenario_catalog_revision": _DIGEST_A,
-                "program_id": "program.1",
-                "program_revision": _DIGEST_A,
-                "program_binding_id": _DIGEST_B,
-                "retained_bundle_id": _DIGEST_A,
-                "graph_revision": _DIGEST_B,
-                "node_environment_digest": _DIGEST_A,
-                "node_policy_digest": _DIGEST_B,
-                "node_policies": [],
-            },
+            "capture": capture,
             "tree_status": "running",
             "active_operation_count": 1 if state in _ACTIVE_STATES else 0,
             "reason_code": None,
@@ -132,6 +199,10 @@ class _Snapshot:
     @property
     def owner_epoch(self) -> str:
         return self._value["owner_epoch"]
+
+    @property
+    def run_revision(self) -> int:
+        return self._value["run_revision"]
 
     def to_dict(self) -> dict[str, Any]:
         return deepcopy(self._value)
@@ -159,6 +230,9 @@ class _Owner:
         self.reads += 1
         return self.rows[program_run_id]
 
+    def intervention(self, _program_run_id: str):
+        return None
+
 
 class _ObservationOwner(_Owner):
     def read(self, program_run_id: str) -> _Snapshot:
@@ -168,6 +242,65 @@ class _ObservationOwner(_Owner):
             raise ProgramRunOwnerError(
                 f"Program run {program_run_id} is not resident"
             ) from error
+
+
+class _RuntimeControlOwner(_Owner):
+    def __init__(self) -> None:
+        super().__init__()
+        self.effects: list[tuple[str, dict[str, Any]]] = []
+
+    def _advance(self, program_run_id: str) -> _Snapshot:
+        current = self.rows[program_run_id]
+        advanced = _Snapshot(
+            program_run_id,
+            owner_id=current.to_dict()["owner_id"],
+            owner_epoch=current.owner_epoch,
+            state=current.state,
+            revision=current.run_revision + 1,
+        )
+        self.rows[program_run_id] = advanced
+        return advanced
+
+    def validate_runtime_override(
+        self,
+        _program_run_id: str,
+        **values: Any,
+    ) -> Any:
+        return deepcopy(values["value"])
+
+    def note_runtime_control_change(self, program_run_id: str) -> _Snapshot:
+        return self._advance(program_run_id)
+
+    def activate_runtime_override(
+        self,
+        program_run_id: str,
+        **values: Any,
+    ) -> _Snapshot:
+        self.effects.append(("activate", deepcopy(values)))
+        return self._advance(program_run_id)
+
+    def clear_runtime_override(
+        self,
+        program_run_id: str,
+        **values: Any,
+    ) -> _Snapshot:
+        self.effects.append(("clear", deepcopy(values)))
+        return self._advance(program_run_id)
+
+    def validate_runtime_override_promotion(
+        self,
+        _program_run_id: str,
+        **_values: Any,
+    ) -> str:
+        return "motion.move_to_pose"
+
+    def write_runtime_blackboard(
+        self,
+        program_run_id: str,
+        **values: Any,
+    ) -> _Snapshot:
+        self.effects.append(("write", deepcopy(values)))
+        return self._advance(program_run_id)
 
 
 class _Host:
@@ -575,6 +708,325 @@ def _start_request(*, request_id: str = "request.start.1") -> ProgramRunStartReq
     )
 
 
+def _retain_no_effect_terminal(
+    journal: ProgramCycleJournal, *, program_run_id: str
+) -> str:
+    retained = journal.read()
+    assert retained.claim is not None
+    settlement = {
+        "schema_version": "manyforge.program_cycle_start_settlement.v1",
+        "kind": "proven_no_effect",
+        "claim": retained.claim,
+        "program_run_id": program_run_id,
+        "prepared_scene": {
+            "schema_version": "manyforge.prepared_program_scene.v1"
+        },
+    }
+    reference = ProgramRuntime._digest(settlement)  # noqa: SLF001
+    journal.transition(
+        expected_generation=retained.cycle_generation,
+        expected_states=("idle_after_reset",),
+        state="terminal_awaiting_reset",
+        terminal_reference=reference,
+        start_settlement=settlement,
+    )
+    return reference
+
+
+def _bypass_scene_preparation(monkeypatch: pytest.MonkeyPatch) -> None:
+    proof = {
+        "schema_version": "manyforge.prepared_program_scene.v1",
+        "desired_scene_digest": _DIGEST_A,
+    }
+    monkeypatch.setattr(
+        ProgramRuntime,
+        "_prepare_run_scene",
+        lambda _self, _admission, _run_id: (object(), (), deepcopy(proof)),
+    )
+    monkeypatch.setattr(
+        ProgramRuntime,
+        "_verify_run_scene",
+        lambda _self, _context, _scene, _proof: None,
+    )
+
+
+class _PreparedRunAdmission:
+    def __init__(self) -> None:
+        self.program = SimpleNamespace(to_dict=lambda: {"scene": []})
+
+    def port_context(self, program_run_id: str) -> object:
+        return SimpleNamespace(program_run_id=program_run_id)
+
+
+def test_applied_activation_prepares_scene_while_idle_without_run_claim(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path,
+) -> None:
+    monkeypatch.setattr(
+        "manyforge_program_runner.runtime.build_applied_program_run_admission",
+        lambda *_args, **_kwargs: _PreparedRunAdmission(),
+    )
+
+    class IdleAdmission(_Admission):
+        def get(self) -> dict[str, Any]:
+            return {
+                "admission_generation": 1,
+                "authoring_allowed": True,
+            }
+
+    admission = IdleAdmission()
+    runtime = ProgramRuntime(
+        ProgramRunnerConfig(
+            headless_url="http://headless.test",
+            owner_epoch="runner.activation-scene.1",
+        ),
+        headless_client=_Headless(),  # type: ignore[arg-type]
+        admission_client=admission,  # type: ignore[arg-type]
+        cycle_journal=ProgramCycleJournal(
+            tmp_path / "cycle.sqlite3", owner_epoch="runner.activation-scene.1"
+        ),
+    )
+    prepared: list[str] = []
+    monkeypatch.setattr(
+        runtime._scene,  # noqa: SLF001
+        "prepare_initial_scene",
+        lambda context, _scene: (
+            prepared.append(context.program_run_id)
+            or {"schema_version": "manyforge.prepared_program_scene.v1"}
+        ),
+    )
+    monkeypatch.setattr(
+        runtime._scene,  # noqa: SLF001
+        "verify_initial_scene",
+        lambda *_args: None,
+    )
+    runtime.start()
+
+    result = runtime.prepare_applied_scene(
+        ProgramScenePreparationRequest.model_validate(
+            {
+                "request_id": "activation.1",
+                "request_owner_epoch": "composer.1",
+                "source_label": "manyforge_composer_activation",
+                "correlation_id": None,
+                "expected_applied_record_digest": _DIGEST_B,
+                "expected_admission_generation": 1,
+            }
+        )
+    )
+
+    assert result["status"] == "prepared"
+    assert result["admission_generation"] == 1
+    assert prepared and prepared[0].startswith("program-scene.")
+    assert admission.claims == []
+    assert runtime.cycle_status()["state"] == "idle_after_reset"
+    runtime.shutdown()
+
+
+def test_run_prepares_while_idle_then_only_verifies_after_claim(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path,
+) -> None:
+    events: list[str] = []
+
+    class OrderedAdmission(_Admission):
+        generation = 1
+
+        def get(self) -> dict[str, Any]:
+            events.append(f"admission:{self.generation}")
+            return {"admission_generation": self.generation}
+
+        def acquire(self, intent: dict[str, Any]) -> dict[str, Any]:
+            events.append("claim")
+            assert intent["expected_admission_generation"] == 3
+            claim = super().acquire(intent)
+            claim["acquired_admission_generation"] = 3
+            return claim
+
+    monkeypatch.setattr(
+        "manyforge_program_runner.runtime.build_applied_program_run_admission",
+        lambda *_args, **_kwargs: _PreparedRunAdmission(),
+    )
+    admission = OrderedAdmission()
+    runtime = ProgramRuntime(
+        ProgramRunnerConfig(
+            headless_url="http://headless.test",
+            owner_epoch="runner.scene-order.1",
+        ),
+        headless_client=_Headless(),  # type: ignore[arg-type]
+        admission_client=admission,  # type: ignore[arg-type]
+        cycle_journal=ProgramCycleJournal(
+            tmp_path / "cycle.sqlite3", owner_epoch="runner.scene-order.1"
+        ),
+    )
+    runtime._host.shutdown()  # noqa: SLF001
+    owner = _Owner()
+    host = _Host(owner, owner_id=runtime.owner_id, owner_epoch=runtime.owner_epoch)
+    runtime._owner = owner  # type: ignore[assignment]  # noqa: SLF001
+    runtime._host = host  # type: ignore[assignment]  # noqa: SLF001
+
+    def prepare(_context: object, _scene: object) -> dict[str, Any]:
+        events.append("prepare")
+        admission.generation = 3
+        return {"schema_version": "manyforge.prepared_program_scene.v1"}
+
+    monkeypatch.setattr(runtime._scene, "prepare_initial_scene", prepare)  # noqa: SLF001
+    monkeypatch.setattr(
+        runtime._scene,  # noqa: SLF001
+        "verify_initial_scene",
+        lambda *_args: events.append("verify"),
+    )
+    runtime.start()
+
+    runtime.start_run(_start_request())
+
+    assert events == ["admission:1", "prepare", "admission:3", "claim", "verify"]
+    assert runtime.cycle_status()["state"] == "running"
+    runtime.shutdown()
+
+
+def test_scene_preparation_failure_leaves_cycle_idle_without_claim(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path,
+) -> None:
+    monkeypatch.setattr(
+        "manyforge_program_runner.runtime.build_applied_program_run_admission",
+        lambda *_args, **_kwargs: _PreparedRunAdmission(),
+    )
+    admission = _Admission()
+    runtime = ProgramRuntime(
+        ProgramRunnerConfig(
+            headless_url="http://headless.test", owner_epoch="runner.prepare-fail.1"
+        ),
+        headless_client=_Headless(),  # type: ignore[arg-type]
+        admission_client=admission,  # type: ignore[arg-type]
+        cycle_journal=ProgramCycleJournal(
+            tmp_path / "cycle.sqlite3", owner_epoch="runner.prepare-fail.1"
+        ),
+    )
+    monkeypatch.setattr(
+        runtime._scene,  # noqa: SLF001
+        "prepare_initial_scene",
+        lambda *_args: (_ for _ in ()).throw(RuntimeError("scene unavailable")),
+    )
+    runtime.start()
+
+    with pytest.raises(ProgramRunnerError, match="scene unavailable"):
+        runtime.start_run(_start_request())
+
+    assert admission.claims == []
+    assert runtime.cycle_status()["state"] == "idle_after_reset"
+    runtime.shutdown()
+
+
+def test_post_claim_scene_race_records_resettable_no_effect_settlement(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path,
+) -> None:
+    monkeypatch.setattr(
+        "manyforge_program_runner.runtime.build_applied_program_run_admission",
+        lambda *_args, **_kwargs: _PreparedRunAdmission(),
+    )
+    admission = _Admission()
+    runtime = ProgramRuntime(
+        ProgramRunnerConfig(
+            headless_url="http://headless.test", owner_epoch="runner.scene-race.1"
+        ),
+        headless_client=_Headless(),  # type: ignore[arg-type]
+        admission_client=admission,  # type: ignore[arg-type]
+        cycle_journal=ProgramCycleJournal(
+            tmp_path / "cycle.sqlite3", owner_epoch="runner.scene-race.1"
+        ),
+    )
+    monkeypatch.setattr(
+        runtime._scene,  # noqa: SLF001
+        "prepare_initial_scene",
+        lambda *_args: {"schema_version": "manyforge.prepared_program_scene.v1"},
+    )
+    monkeypatch.setattr(
+        runtime._scene,  # noqa: SLF001
+        "verify_initial_scene",
+        lambda *_args: (_ for _ in ()).throw(RuntimeError("scene raced")),
+    )
+    runtime.start()
+
+    with pytest.raises(ProgramRunnerError, match="scene raced"):
+        runtime.start_run(_start_request())
+
+    status = runtime.cycle_status()
+    retained = runtime._journal.read()  # noqa: SLF001
+    assert status["state"] == "terminal_awaiting_reset"
+    assert status["program_run_id"] == "program-cycle.1"
+    assert status["terminal_or_settlement_reference"].startswith("sha256:")
+    assert retained.start_settlement is not None
+    assert retained.start_settlement["kind"] == "proven_no_effect"
+    assert runtime._digest(retained.start_settlement) == (  # noqa: SLF001
+        status["terminal_or_settlement_reference"]
+    )
+    reset = ProgramCycleResetRequest.model_validate(
+        {
+            "request_id": "request.reset.scene-race",
+            "request_owner_epoch": "composer.epoch.1",
+            "source_label": "operator_ui",
+            "correlation_id": None,
+            "program_run_id": status["program_run_id"],
+            "expected_owner_epoch": runtime.owner_epoch,
+            "expected_cycle_generation": status["cycle_generation"],
+            "expected_claim_generation": status["cycle_claim_generation"],
+            "terminal_reference": status["terminal_or_settlement_reference"],
+            "settlement_evidence_digest": status[
+                "terminal_or_settlement_reference"
+            ],
+        }
+    )
+    runtime.reset_cycle(reset)
+    assert len(admission.releases) == 1
+    assert runtime.cycle_status()["state"] == "idle_after_reset"
+    runtime.shutdown()
+
+
+def test_host_start_without_a_result_retains_claim_for_reconciliation(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path,
+) -> None:
+    monkeypatch.setattr(
+        "manyforge_program_runner.runtime.build_applied_program_run_admission",
+        lambda *_args, **_kwargs: object(),
+    )
+    _bypass_scene_preparation(monkeypatch)
+    admission = _Admission()
+    journal = ProgramCycleJournal(
+        tmp_path / "cycle.sqlite3", owner_epoch="runner.start-unknown.1"
+    )
+    runtime = ProgramRuntime(
+        ProgramRunnerConfig(
+            headless_url="http://headless.test",
+            owner_epoch="runner.start-unknown.1",
+        ),
+        headless_client=_Headless(),  # type: ignore[arg-type]
+        admission_client=admission,  # type: ignore[arg-type]
+        cycle_journal=journal,
+    )
+    runtime.start()
+    monkeypatch.setattr(
+        runtime._host,  # noqa: SLF001
+        "start_run",
+        lambda _admission: (_ for _ in ()).throw(
+            RuntimeError("owner response was lost")
+        ),
+    )
+
+    with pytest.raises(ProgramRunnerError, match="owner response was lost"):
+        runtime.start_run(_start_request())
+
+    retained = journal.read()
+    assert retained.reconciliation_required is True
+    assert retained.claim is not None
+    assert retained.start_settlement is None
+    assert admission.releases == []
+    runtime.shutdown()
+
+
 def test_config_pairs_execution_root_exactly_with_cycle_journal(tmp_path) -> None:
     execution_run_root = tmp_path / "execution-run"
     execution_run_root.mkdir()
@@ -705,6 +1157,7 @@ def test_runtime_replays_exact_requests_and_keeps_one_active_product_run(
         "manyforge_program_runner.runtime.build_applied_program_run_admission",
         join,
     )
+    _bypass_scene_preparation(monkeypatch)
     admission = _Admission()
     runtime = ProgramRuntime(
         ProgramRunnerConfig(
@@ -819,6 +1272,156 @@ def test_runtime_replays_exact_requests_and_keeps_one_active_product_run(
     assert host.stop_calls == [("program-run.1", "operator stop")]
 
 
+def test_runtime_controls_replay_and_restore_one_run_scoped_ledger(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path,
+) -> None:
+    monkeypatch.setattr(
+        "manyforge_program_runner.runtime.build_applied_program_run_admission",
+        lambda *_args, **_kwargs: object(),
+    )
+    _bypass_scene_preparation(monkeypatch)
+    journal_path = tmp_path / "cycle.sqlite3"
+    owner_epoch = "program-runner.controls.1"
+    admission = _Admission()
+    runtime = ProgramRuntime(
+        ProgramRunnerConfig(
+            headless_url="http://headless.test",
+            owner_epoch=owner_epoch,
+        ),
+        headless_client=_Headless(),  # type: ignore[arg-type]
+        admission_client=admission,  # type: ignore[arg-type]
+        cycle_journal=ProgramCycleJournal(
+            journal_path,
+            owner_epoch=owner_epoch,
+        ),
+    )
+    runtime._host.shutdown()  # noqa: SLF001
+    owner = _RuntimeControlOwner()
+    host = _Host(owner, owner_id=runtime.owner_id, owner_epoch=owner_epoch)
+    runtime._owner = owner  # type: ignore[assignment]  # noqa: SLF001
+    runtime._host = host  # type: ignore[assignment]  # noqa: SLF001
+    runtime.start()
+    started = runtime.start_run(_start_request())
+    program_run_id = started["capture"]["program_run_id"]
+
+    def request_base(request_id: str, expected_run_revision: int) -> dict[str, Any]:
+        return {
+            "request_id": request_id,
+            "request_owner_epoch": "composer.controls.1",
+            "source_label": "operator_ui",
+            "correlation_id": None,
+            "program_run_id": program_run_id,
+            "expected_owner_epoch": owner_epoch,
+            "expected_run_revision": expected_run_revision,
+        }
+
+    stage_request = RuntimeOverrideStageRequest.model_validate(
+        {
+            **request_base("controls.stage.1", 1),
+            "node_instance_id": "node.motion.1",
+            "node_attempt_id": "attempt.motion.1",
+            "parameter_id": "goal",
+            "value": {"position_m": [0.1, 0.2, 0.3]},
+            "source_observation_id": None,
+            "source_owner_generation": None,
+        }
+    )
+    staged = runtime.stage_runtime_override(program_run_id, stage_request)
+    assert runtime.stage_runtime_override(program_run_id, stage_request) == staged
+    override = staged["result"]
+    assert override["status"] == "staged"
+    assert owner.rows[program_run_id].run_revision == 2
+
+    activated = runtime.activate_runtime_override(
+        program_run_id,
+        RuntimeOverrideActionRequest.model_validate(
+            {
+                **request_base("controls.activate.1", 2),
+                "override_id": override["override_id"],
+                "expected_override_revision": 1,
+            }
+        ),
+    )
+    assert activated["result"]["status"] == "active"
+
+    promoted = runtime.promote_runtime_override(
+        program_run_id,
+        RuntimeOverridePromotionRequest.model_validate(
+            {
+                **request_base("controls.promote.1", 3),
+                "override_id": override["override_id"],
+                "expected_override_revision": 2,
+                "expected_draft_id": "draft.controls.1",
+                "expected_draft_revision": 1,
+            }
+        ),
+    )
+    assert promoted["result"]["status"] == "awaiting_reset"
+
+    cleared = runtime.clear_runtime_override(
+        program_run_id,
+        RuntimeOverrideActionRequest.model_validate(
+            {
+                **request_base("controls.clear.1", 4),
+                "override_id": override["override_id"],
+                "expected_override_revision": 2,
+            }
+        ),
+    )
+    assert cleared["result"]["status"] == "cleared"
+
+    written = runtime.write_runtime_blackboard(
+        program_run_id,
+        RuntimeBlackboardWriteRequest.model_validate(
+            {
+                **request_base("controls.write.1", 5),
+                "key": "operator.confirmed",
+                "value": True,
+            }
+        ),
+    )
+    assert written["result"] == {
+        "key": "operator.confirmed",
+        "status": "written",
+    }
+    expected_controls = written["runtime_controls"]["runtime_controls"]
+    assert expected_controls["runtime_control_revision"] == 6
+    assert [kind for kind, _values in owner.effects] == [
+        "activate",
+        "clear",
+        "write",
+    ]
+
+    runtime.shutdown()
+    restored = ProgramRuntime(
+        ProgramRunnerConfig(
+            headless_url="http://headless.test",
+            owner_epoch=owner_epoch,
+        ),
+        headless_client=_Headless(),  # type: ignore[arg-type]
+        admission_client=admission,  # type: ignore[arg-type]
+        cycle_journal=ProgramCycleJournal(
+            journal_path,
+            owner_epoch=owner_epoch,
+        ),
+    )
+    restored._host.shutdown()  # noqa: SLF001
+    restored._owner = owner  # type: ignore[assignment]  # noqa: SLF001
+    restored._host = _Host(  # type: ignore[assignment]  # noqa: SLF001
+        owner,
+        owner_id=restored.owner_id,
+        owner_epoch=owner_epoch,
+    )
+    restored.start()
+
+    assert (
+        restored.read_runtime_controls(program_run_id)["runtime_controls"]
+        == expected_controls
+    )
+    restored.shutdown()
+
+
 def test_replacement_owner_remains_fail_closed_for_later_reconciliation_owner(
     tmp_path,
 ) -> None:
@@ -878,6 +1481,14 @@ def test_replacement_owner_remains_fail_closed_for_later_reconciliation_owner(
     assert status["state"] == "terminal_awaiting_reset"
     assert status["program_runner_owner_epoch"] == "runner.old"
     projected = runtime._current_cycle_status_projection()  # noqa: SLF001
+    assert set(projected) == {
+        "program_runner_owner_epoch",
+        "cycle_generation",
+        "state",
+        "program_run_id",
+        "cycle_claim_generation",
+        "terminal_or_settlement_reference",
+    }
     assert projected["program_runner_owner_epoch"] == "runner.old"
     assert projected["state"] == "terminal_awaiting_reset"
     assert admission.reconciliations == []
@@ -1013,11 +1624,8 @@ def test_explicit_release_rejection_remains_retryable_without_unknown_outcome(
         provisional_run_id="program-run.1",
         claim=claim,
     )
-    journal.transition(
-        expected_generation=1,
-        expected_states=("idle_after_reset",),
-        state="terminal_awaiting_reset",
-        terminal_reference=_DIGEST_B,
+    terminal_reference = _retain_no_effect_terminal(
+        journal, program_run_id="program-run.1"
     )
     admission = _Admission()
     admission.release_error = CellAdmissionError(
@@ -1043,8 +1651,8 @@ def test_explicit_release_rejection_remains_retryable_without_unknown_outcome(
             "expected_owner_epoch": "runner.current",
             "expected_cycle_generation": 1,
             "expected_claim_generation": 7,
-            "terminal_reference": _DIGEST_B,
-            "settlement_evidence_digest": _DIGEST_B,
+            "terminal_reference": terminal_reference,
+            "settlement_evidence_digest": terminal_reference,
         }
     )
 
@@ -1093,11 +1701,8 @@ def test_rejected_reset_replays_after_state_change_and_retains_capacity(
         provisional_run_id="program-run.1",
         claim=claim,
     )
-    journal.transition(
-        expected_generation=1,
-        expected_states=("idle_after_reset",),
-        state="terminal_awaiting_reset",
-        terminal_reference=_DIGEST_B,
+    terminal_reference = _retain_no_effect_terminal(
+        journal, program_run_id="program-run.1"
     )
     admission = _Admission()
     runtime = ProgramRuntime(
@@ -1134,8 +1739,8 @@ def test_rejected_reset_replays_after_state_change_and_retains_capacity(
         {
             **stale.model_dump(mode="json"),
             "request_id": "reset.valid",
-            "terminal_reference": _DIGEST_B,
-            "settlement_evidence_digest": _DIGEST_B,
+            "terminal_reference": terminal_reference,
+            "settlement_evidence_digest": terminal_reference,
         }
     )
     assert runtime.reset_cycle(valid)["idle_cycle_generation"] == 2
@@ -1162,6 +1767,7 @@ def test_stop_retains_claim_until_exact_terminal_snapshot_is_observed(
         "manyforge_program_runner.runtime.build_applied_program_run_admission",
         lambda *_args, **_kwargs: object(),
     )
+    _bypass_scene_preparation(monkeypatch)
     admission = _Admission()
     runtime = ProgramRuntime(
         ProgramRunnerConfig(
@@ -1270,6 +1876,7 @@ def test_draft_applied_mismatch_is_replayed_without_native_acquire(
         "manyforge_program_runner.runtime.build_applied_program_run_admission",
         lambda *_args, **_kwargs: object(),
     )
+    _bypass_scene_preparation(monkeypatch)
     journal = ProgramCycleJournal(
         tmp_path / "cycle.sqlite3",
         owner_epoch="runner.1",
@@ -1321,6 +1928,7 @@ def test_acquire_success_before_claim_journal_failure_latches_reconciliation(
         "manyforge_program_runner.runtime.build_applied_program_run_admission",
         lambda *_args, **_kwargs: object(),
     )
+    _bypass_scene_preparation(monkeypatch)
     admission = _Admission()
     journal = FailingJournal(
         tmp_path / "cycle.sqlite3", owner_epoch="runner.1"
@@ -1346,6 +1954,7 @@ def test_acquire_success_before_claim_journal_failure_latches_reconciliation(
 
 
 def test_native_acquire_rejection_replays_exact_error_without_second_call(
+    monkeypatch: pytest.MonkeyPatch,
     tmp_path,
 ) -> None:
     class RejectingAdmission(_Admission):
@@ -1359,6 +1968,11 @@ def test_native_acquire_rejection_replays_exact_error_without_second_call(
                 {"admission_generation": 1},
             )
 
+    monkeypatch.setattr(
+        "manyforge_program_runner.runtime.build_applied_program_run_admission",
+        lambda *_args, **_kwargs: object(),
+    )
+    _bypass_scene_preparation(monkeypatch)
     admission = RejectingAdmission()
     runtime = ProgramRuntime(
         ProgramRunnerConfig(

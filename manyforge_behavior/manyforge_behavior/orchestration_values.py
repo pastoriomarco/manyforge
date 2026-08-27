@@ -11,17 +11,267 @@ from types import MappingProxyType
 from typing import Any
 
 from manyforge_behavior.catalog import NodeCatalog
-from manyforge_behavior.catalog_schema import validate_value
+from manyforge_behavior.catalog_schema import (
+    CatalogSchema,
+    CatalogSchemaRegistry,
+    validate_value,
+)
 from manyforge_behavior.program import (
     BlackboardFieldDeclaration,
     BlackboardKeyDeclaration,
     Program,
     ProgramParameterDeclaration,
+    ProgramTreeNode,
 )
 
 
 class ProgramValueError(ValueError):
     """A declared Program value is missing, malformed, or inaccessible."""
+
+
+_FIXED_RUNTIME_OVERRIDE_SEMANTICS = frozenset(
+    {
+        "blackboard_key",
+        "collision_body_role",
+        "component_role",
+        "frame_role",
+        "model_role",
+        "parameter_ref",
+        "resource_role",
+        "target_role",
+    }
+)
+
+
+def _schema_carries_fixed_runtime_semantics(
+    schema: CatalogSchema,
+    *,
+    registry: CatalogSchemaRegistry,
+) -> bool:
+    resolved = registry.resolve(schema)
+    if resolved.semantic_type in _FIXED_RUNTIME_OVERRIDE_SEMANTICS:
+        return True
+    if resolved.schema_type == "object":
+        return any(
+            _schema_carries_fixed_runtime_semantics(child, registry=registry)
+            for child in resolved.properties.values()
+        ) or (
+            resolved.additional_property_schema is not None
+            and _schema_carries_fixed_runtime_semantics(
+                resolved.additional_property_schema,
+                registry=registry,
+            )
+        )
+    return bool(
+        resolved.schema_type == "array"
+        and resolved.items is not None
+        and _schema_carries_fixed_runtime_semantics(
+            resolved.items,
+            registry=registry,
+        )
+    )
+
+
+def _preserves_runtime_semantics(
+    schema: CatalogSchema,
+    current: Any,
+    candidate: Any,
+    *,
+    registry: CatalogSchemaRegistry,
+) -> bool:
+    resolved = registry.resolve(schema)
+    if resolved.semantic_type in _FIXED_RUNTIME_OVERRIDE_SEMANTICS:
+        return current == candidate
+    if resolved.schema_type == "object":
+        if not isinstance(current, Mapping) or not isinstance(candidate, Mapping):
+            return not _schema_carries_fixed_runtime_semantics(
+                resolved,
+                registry=registry,
+            )
+        for key, child in resolved.properties.items():
+            if key in current or key in candidate:
+                if key not in current or key not in candidate:
+                    if _schema_carries_fixed_runtime_semantics(
+                        child,
+                        registry=registry,
+                    ):
+                        return False
+                    continue
+                if not _preserves_runtime_semantics(
+                    child,
+                    current[key],
+                    candidate[key],
+                    registry=registry,
+                ):
+                    return False
+        extra_schema = resolved.additional_property_schema
+        if extra_schema is not None:
+            for key in set(current) | set(candidate):
+                if key in resolved.properties:
+                    continue
+                if key not in current or key not in candidate:
+                    if _schema_carries_fixed_runtime_semantics(
+                        extra_schema,
+                        registry=registry,
+                    ):
+                        return False
+                    continue
+                if not _preserves_runtime_semantics(
+                    extra_schema,
+                    current[key],
+                    candidate[key],
+                    registry=registry,
+                ):
+                    return False
+        return True
+    if resolved.schema_type == "array" and resolved.items is not None:
+        if not isinstance(current, (list, tuple)) or not isinstance(
+            candidate, (list, tuple)
+        ):
+            return not _schema_carries_fixed_runtime_semantics(
+                resolved.items,
+                registry=registry,
+            )
+        if len(current) != len(candidate) and _schema_carries_fixed_runtime_semantics(
+            resolved.items,
+            registry=registry,
+        ):
+            return False
+        shared = min(len(current), len(candidate))
+        return all(
+            _preserves_runtime_semantics(
+                resolved.items,
+                current[index],
+                candidate[index],
+                registry=registry,
+            )
+            for index in range(shared)
+        )
+    return True
+
+
+class ProgramRuntimeOverrideStore:
+    """Schema-checked param patches consumed only by later node attempts.
+
+    The Program Runner owns lifecycle and audit around these values. This
+    store owns only validation and the atomic active-value read used by the
+    input resolver; it never mutates Program/Binding or an accepted request.
+    """
+
+    def __init__(self, *, program: Program, catalog: NodeCatalog) -> None:
+        if not isinstance(program, Program):
+            raise TypeError("runtime overrides require one validated Program")
+        if not isinstance(catalog, NodeCatalog):
+            raise TypeError("runtime overrides require one validated catalog")
+        self._catalog = catalog
+        self._nodes: dict[str, ProgramTreeNode] = {}
+
+        def visit(node: ProgramTreeNode) -> None:
+            self._nodes[node.instance_id] = node
+            for child in node.children:
+                visit(child)
+
+        visit(program.tree)
+        self._active: dict[tuple[str, str], Any] = {}
+        self._lock = RLock()
+
+    def validate(self, node_instance_id: str, parameter_id: str, value: Any) -> Any:
+        try:
+            node = self._nodes[node_instance_id]
+        except KeyError as exc:
+            raise ProgramValueError(
+                f"node instance {node_instance_id!r} is not in the captured Program"
+            ) from exc
+        entry = self._catalog.get(node.node_id)
+        declaration = next(
+            (item for item in entry.parameters if item.id == parameter_id),
+            None,
+        )
+        if declaration is None:
+            raise ProgramValueError(
+                f"node {node.node_id!r} has no parameter {parameter_id!r}"
+            )
+        binding_parameters = {
+            parameter
+            for requirement in entry.required_capabilities
+            for parameter in (
+                requirement.target_parameter,
+                requirement.component_parameter,
+                requirement.when_parameter,
+            )
+            if parameter is not None
+        }
+        if parameter_id in binding_parameters:
+            raise ProgramValueError(
+                f"node parameter {parameter_id!r} selects captured binding meaning"
+            )
+        copied = _copy_runtime_value(value)
+        issues = validate_value(
+            declaration.schema,
+            copied,
+            registry=self._catalog.schema_registry,
+            path=f"node[{node.node_id}].runtime_override.{parameter_id}",
+        )
+        if issues:
+            first = issues[0]
+            raise ProgramValueError(f"{first.path}: {first.message}")
+        current = node.parameters.get(
+            parameter_id,
+            declaration.default if declaration.has_default else None,
+        )
+        if not _preserves_runtime_semantics(
+            declaration.schema,
+            current,
+            copied,
+            registry=self._catalog.schema_registry,
+        ):
+            raise ProgramValueError(
+                f"node parameter {parameter_id!r} changes captured semantic selection"
+            )
+        return copied
+
+    def node_id(self, node_instance_id: str) -> str:
+        """Return the immutable catalog node kind for one captured instance."""
+
+        try:
+            return self._nodes[node_instance_id].node_id
+        except KeyError as exc:
+            raise ProgramValueError(
+                f"node instance {node_instance_id!r} is not in the captured Program"
+            ) from exc
+
+    def node_context(self, node_instance_id: str) -> dict[str, Any]:
+        """Return only the captured facts needed to derive an owner snapshot."""
+
+        try:
+            node = self._nodes[node_instance_id]
+        except KeyError as exc:
+            raise ProgramValueError(
+                f"node instance {node_instance_id!r} is not in the captured Program"
+            ) from exc
+        return {
+            "node_id": node.node_id,
+            "parameters": _copy_runtime_value(node.parameters),
+        }
+
+    def activate(self, node_instance_id: str, parameter_id: str, value: Any) -> None:
+        validated = self.validate(node_instance_id, parameter_id, value)
+        with self._lock:
+            self._active[(node_instance_id, parameter_id)] = validated
+
+    def clear(self, node_instance_id: str, parameter_id: str) -> None:
+        with self._lock:
+            self._active.pop((node_instance_id, parameter_id), None)
+
+    def for_attempt(self, node_instance_id: str) -> Mapping[str, Any]:
+        with self._lock:
+            return MappingProxyType(
+                {
+                    parameter_id: _copy_runtime_value(value)
+                    for (instance_id, parameter_id), value in self._active.items()
+                    if instance_id == node_instance_id
+                }
+            )
 
 
 def _copy_runtime_value(value: Any) -> Any:
@@ -292,6 +542,7 @@ class NodeAttemptInputResolver:
         catalog: NodeCatalog,
         value_store: ProgramValueStore,
         program_parameter_values: Mapping[str, Any] | None = None,
+        runtime_overrides: ProgramRuntimeOverrideStore | None = None,
     ) -> None:
         if not isinstance(program, Program):
             raise TypeError("input resolver requires one validated Program")
@@ -299,6 +550,12 @@ class NodeAttemptInputResolver:
             raise TypeError("input resolver requires one validated NodeCatalog")
         if not isinstance(value_store, ProgramValueStore):
             raise TypeError("input resolver requires one ProgramValueStore")
+        if runtime_overrides is not None and not isinstance(
+            runtime_overrides, ProgramRuntimeOverrideStore
+        ):
+            raise TypeError(
+                "runtime_overrides must be one ProgramRuntimeOverrideStore"
+            )
         values = {
             parameter_id: _copy_runtime_value(declaration.default)
             for parameter_id, declaration in program.parameters.items()
@@ -320,6 +577,7 @@ class NodeAttemptInputResolver:
         self._catalog = catalog
         self._value_store = value_store
         self._program_parameters = MappingProxyType(values)
+        self._runtime_overrides = runtime_overrides
 
     @property
     def value_store(self) -> ProgramValueStore:
@@ -329,6 +587,7 @@ class NodeAttemptInputResolver:
         self,
         *,
         node_id: str,
+        node_instance_id: str,
         parameters: Mapping[str, Any],
         value_sources: Mapping[str, Mapping[str, Any]],
         blackboard_read_parameters: tuple[str, ...] = (),
@@ -444,6 +703,15 @@ class NodeAttemptInputResolver:
         for parameter_id, source in value_sources.items():
             resolved[parameter_id] = resolve_source(source)
 
+        # Patches intentionally win over authored/value-source values, but
+        # only for this new one-shot attempt snapshot.
+        if self._runtime_overrides is not None:
+            resolved.update(
+                _copy_runtime_value(
+                    self._runtime_overrides.for_attempt(node_instance_id)
+                )
+            )
+
         unknown = set(resolved) - set(by_id)
         if unknown:
             raise ProgramValueError(
@@ -492,4 +760,5 @@ __all__ = [
     "ProgramValueError",
     "ProgramValueRecord",
     "ProgramValueStore",
+    "ProgramRuntimeOverrideStore",
 ]

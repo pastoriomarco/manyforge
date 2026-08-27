@@ -128,38 +128,6 @@ class _ContextPort:
         self.unbound.append(program_run_id)
 
 
-class _InitializationPort:
-    def __init__(
-        self,
-        events: list[str],
-        *,
-        fail: bool = False,
-        release_failures: int = 0,
-    ) -> None:
-        self.events = events
-        self.fail = fail
-        self.release_failures = release_failures
-        self.scenes: list[list[dict[str, object]]] = []
-        self.released: list[str] = []
-
-    def initialize(
-        self,
-        _context: ProgramRunPortContext,
-        initial_scene,
-    ) -> None:
-        self.events.append("scene_initialize")
-        self.scenes.append([dict(row) for row in initial_scene])
-        if self.fail:
-            raise RuntimeError("scene initialization rejected")
-
-    def release(self, program_run_id: str) -> None:
-        self.events.append("scene_release")
-        self.released.append(program_run_id)
-        if self.release_failures:
-            self.release_failures -= 1
-            raise RuntimeError("temporary scene release failure")
-
-
 class _PolicyTaskPort(_TaskPort):
     def start(
         self,
@@ -324,15 +292,12 @@ def _fixture(
     initial_task_state: OwnerTaskState,
     task_factory: Callable[[list[str]], _TaskPort] | None = None,
     context_port: _ContextPort | None = None,
-    initialization_port: _InitializationPort | None = None,
     interventions: ProgramInterventionRegistry | None = None,
     run_id_factory: Callable[[], str] | None = None,
 ) -> tuple[ProgramRunOwner, ProgramRunAdmission, _TaskPort, _ScopePort, list[str]]:
     events: list[str] = []
     if context_port is not None:
         context_port.events = events
-    if initialization_port is not None:
-        initialization_port.events = events
     task = (
         _TaskPort(events, initial_task_state)
         if task_factory is None
@@ -351,7 +316,6 @@ def _fixture(
         kernel_controls=invocation,
         program_run_scope=scope,
         program_run_context=context_port,
-        program_run_initialization=initialization_port,
         program_interventions=interventions,
     )
     environment = build_node_environment()
@@ -632,53 +596,25 @@ def test_start_binds_exact_client_context_before_tree_construction() -> None:
     assert context.assistant_projection is None
 
 
-def test_start_initializes_scene_after_context_and_before_tree_construction() -> None:
+def test_start_never_mutates_scene_after_program_cycle_admission() -> None:
     events: list[str] = []
     context_port = _ContextPort(events)
-    initialization_port = _InitializationPort(events)
     owner, admission, task, _scope, fixture_events = _fixture(
         initial_task_state=OwnerTaskState.SUCCEEDED,
         context_port=context_port,
-        initialization_port=initialization_port,
     )
 
     started = owner.start(admission)
 
-    assert fixture_events == ["context_bind", "scene_initialize"]
+    assert fixture_events == ["context_bind"]
     assert task.starts == 0
-    assert [row["scene_resource_id"] for row in initialization_port.scenes[0]] == [
-        "table"
-    ]
     owner.advance_once(started.capture.program_run_id)
-    assert fixture_events[2:] == [
-        "leaf_start",
-        "leaf_acknowledge",
-        "scene_release",
-        "context_unbind",
-    ]
-
-
-def test_rejected_scene_initialization_prevents_tree_and_releases_context() -> None:
-    events: list[str] = []
-    context_port = _ContextPort(events)
-    initialization_port = _InitializationPort(events, fail=True)
-    owner, admission, task, _scope, fixture_events = _fixture(
-        initial_task_state=OwnerTaskState.SUCCEEDED,
-        context_port=context_port,
-        initialization_port=initialization_port,
-    )
-
-    with pytest.raises(RuntimeError, match="scene initialization rejected"):
-        owner.start(admission)
-
     assert fixture_events == [
         "context_bind",
-        "scene_initialize",
-        "scene_release",
+        "leaf_start",
+        "leaf_acknowledge",
         "context_unbind",
     ]
-    assert task.starts == 0
-    assert initialization_port.released == ["program-run-1"]
 
 
 def test_composite_context_rolls_back_partial_bind_in_reverse_order() -> None:
@@ -755,13 +691,20 @@ def test_slow_admission_does_not_block_existing_program_run_reads() -> None:
 
 
 def test_terminal_cleanup_is_retryable_before_the_run_claims_completion() -> None:
+    class _RetryingContext(_ContextPort):
+        failures = 1
+
+        def unbind(self, program_run_id: str) -> None:
+            super().unbind(program_run_id)
+            if self.failures:
+                self.failures -= 1
+                raise RuntimeError("temporary context release failure")
+
     events: list[str] = []
-    context_port = _ContextPort(events)
-    initialization_port = _InitializationPort(events, release_failures=1)
+    context_port = _RetryingContext(events)
     owner, admission, _task, _scope, _fixture_events = _fixture(
         initial_task_state=OwnerTaskState.SUCCEEDED,
         context_port=context_port,
-        initialization_port=initialization_port,
     )
     started = owner.start(admission)
 
@@ -772,12 +715,12 @@ def test_terminal_cleanup_is_retryable_before_the_run_claims_completion() -> Non
 
     observed = owner.read(started.capture.program_run_id)
     assert observed.state is ProgramRunState.FINALIZING
-    assert initialization_port.released == ["program-run-1"]
+    assert context_port.unbound == ["program-run-1"]
 
     completed = owner.advance_once(started.capture.program_run_id)
     assert completed.state is ProgramRunState.SUCCEEDED
     assert completed.reason_code is None
-    assert initialization_port.released == ["program-run-1", "program-run-1"]
+    assert context_port.unbound == ["program-run-1", "program-run-1"]
 
 
 def test_failed_tree_projects_the_exact_focused_owner_failure() -> None:
@@ -896,10 +839,10 @@ def test_tick_host_cleans_an_admitted_run_if_bounded_scheduling_rejects_it() -> 
     None
 ):
     identifiers = iter(("program-run-1", "program-run-2"))
-    initialization = _InitializationPort([])
+    context = _ContextPort([])
     owner, admission, _task, _scope, _events = _fixture(
         initial_task_state=OwnerTaskState.SUCCEEDED,
-        initialization_port=initialization,
+        context_port=context,
         run_id_factory=lambda: next(identifiers),
     )
     host = ProgramRunTickHost(owner, maximum_scheduled_runs=1)
@@ -909,10 +852,44 @@ def test_tick_host_cleans_an_admitted_run_if_bounded_scheduling_rejects_it() -> 
         host.start_run(admission)
 
     assert owner.read("program-run-2").state is ProgramRunState.STOPPED
-    assert initialization.released == ["program-run-2"]
+    assert context.unbound == ["program-run-2"]
     assert host.stop_run(first.capture.program_run_id).state is (
         ProgramRunState.STOPPED
     )
+    host.shutdown()
+
+
+def test_tick_host_rejects_recovery_before_changing_owner_when_queue_is_full() -> (
+    None
+):
+    interventions = ProgramInterventionRegistry(maximum_retained_runs=8)
+    owner, admission, _task, _scope, _events = _fixture(
+        initial_task_state=OwnerTaskState.FAILED,
+        task_factory=lambda events: _PolicyTaskPort(
+            events,
+            OwnerTaskState.FAILED,
+        ),
+        interventions=interventions,
+    )
+    host = ProgramRunTickHost(owner, maximum_scheduled_runs=1)
+    started = host.start_run(admission)
+    paused = host.advance_ready_once()[0]
+    assert paused.state is ProgramRunState.INTERVENTION_REQUIRED
+    intervention = interventions.read(started.capture.program_run_id)
+    assert intervention is not None
+    host.schedule("occupied-run")
+
+    with pytest.raises(ProgramSchedulingError, match="set is full"):
+        host.resume_recovery(
+            started.capture.program_run_id,
+            node_attempt_id=intervention.identity.node_attempt_id,
+            action="retry",
+        )
+
+    assert owner.read(started.capture.program_run_id).state is (
+        ProgramRunState.INTERVENTION_REQUIRED
+    )
+    assert interventions.read(started.capture.program_run_id) == intervention
     host.shutdown()
 
 

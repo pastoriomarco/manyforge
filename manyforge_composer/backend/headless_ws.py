@@ -61,6 +61,17 @@ def _projection_key(
         cycle.get("program_run_id"),
         cycle.get("cycle_claim_generation"),
         cycle.get("terminal_or_settlement_reference"),
+        cycle.get("runtime_control_revision"),
+        (
+            cycle.get("recovery_offer", {}).get("offer_id")
+            if isinstance(cycle.get("recovery_offer"), dict)
+            else None
+        ),
+        (
+            cycle.get("recovery_offer", {}).get("offer_revision")
+            if isinstance(cycle.get("recovery_offer"), dict)
+            else None
+        ),
         draft.get("draft_id"),
         draft.get("draft_revision"),
     )

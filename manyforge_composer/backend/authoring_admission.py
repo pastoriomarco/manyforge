@@ -657,6 +657,7 @@ class AuthoringAdmissionCoordinator:
         post_image: Callable[[], Mapping[str, Any]],
         prepare_effect: Callable[[], Mapping[str, Any]] | None = None,
         validate_under_claim: Callable[[dict[str, Any]], None] | None = None,
+        after_release: Callable[[], None] | None = None,
     ) -> _T:
         payload_digest = canonical_digest(payload)
         replay = self._journal.lookup(
@@ -678,11 +679,17 @@ class AuthoringAdmissionCoordinator:
             if replay.complete and replay.outcome is not None:
                 try:
                     self._validate_transaction_outcome(replay)
-                    return self._replay(replay.outcome)
+                    result = self._replay(replay.outcome)
                 except AuthoringJournalError as error:
                     self._ready = False
                     self._blocked_reason = str(error)
                     raise self._unavailable(error.code, str(error)) from error
+                if (
+                    replay.outcome["settlement_kind"] == "owner_commit"
+                    and after_release is not None
+                ):
+                    after_release()
+                return result
             raise self._unavailable(
                 "composer_authoring_recovery_blocked",
                 "the exact authoring request has an unresolved durable outcome",
@@ -794,7 +801,6 @@ class AuthoringAdmissionCoordinator:
                 }
             )
             self._journal.record(transaction, "release_receipt_json", receipt)
-            return result
         except HTTPException as error:
             transaction = self._journal.lookup(
                 envelope.request_owner_epoch, envelope.request_id
@@ -873,6 +879,12 @@ class AuthoringAdmissionCoordinator:
                 "authoring effect outcome requires durable recovery"
             )
             raise
+        if after_release is not None:
+            # The owner commit and claim release are already durable. Keep this
+            # idempotent follow-up outside claim-outcome recovery so a transient
+            # preparation failure cannot be misclassified as an unknown claim.
+            after_release()
+        return result
 
 
 __all__ = [

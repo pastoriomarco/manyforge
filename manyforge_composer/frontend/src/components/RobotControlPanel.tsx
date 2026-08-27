@@ -2,6 +2,7 @@ import { useState } from 'react';
 
 import { useRobotControl } from '../hooks/useRobotControl';
 import type { RobotControlController } from '../hooks/useRobotControl';
+import type { ProgramRuntimeController } from '../hooks/useProgramRuntime';
 import {
   isCapabilityCommandReceipt,
   quaternionFromRpyDegrees,
@@ -151,9 +152,11 @@ function StepSelect({
 export function RobotControlPanelView({
   enabled,
   controller,
+  program,
 }: {
   enabled: boolean;
   controller: RobotControlController;
+  program?: ProgramRuntimeController;
 }) {
   const [angularStepDeg, setAngularStepDeg] = useState(5);
   const [linearStepM, setLinearStepM] = useState(0.01);
@@ -180,6 +183,10 @@ export function RobotControlPanelView({
     || state.operation !== null
   );
   const canStop = active && state.operation !== null;
+  const overrideCandidate = program?.state.controls
+    ?.observationOverrideCandidate ?? null;
+  const overridePending = program?.state.controlPending
+    === 'override:stage-observation';
   const rpy = rpyDegreesFromQuaternion(state.draftPose.orientation);
 
   const modeAvailable = (mode: RobotControlMode): boolean => {
@@ -574,6 +581,22 @@ export function RobotControlPanelView({
             data-testid="robot-control-candidate-footer"
           >
             <div className="robot-control-actions">
+              <button
+                type="button"
+                disabled={
+                  overrideCandidate?.available !== true
+                  || program?.state.controlPending !== null
+                }
+                title={
+                  overrideCandidate?.available === true
+                    ? 'Stage this exact owner-observed Robot snapshot for the held Program attempt.'
+                    : overrideCandidate?.reason
+                      ?? 'No exact held Program attempt and Robot observation are available.'
+                }
+                onClick={() => program?.stageObservationOverride()}
+              >
+                {overridePending ? 'Staging…' : 'Stage snapshot'}
+              </button>
               <button
                 className="approve-button"
                 type="button"

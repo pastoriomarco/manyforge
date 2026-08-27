@@ -1,3 +1,5 @@
+import type { CycleRecoveryOffer } from './api';
+
 export type SourceFreshness = 'fresh' | 'stale' | 'unavailable';
 
 export interface HeadlessSourceSection {
@@ -99,6 +101,8 @@ export interface ComposerHeadlessState {
     programRunId: string | null;
     cycleClaimGeneration: number | null;
     terminalOrSettlementReference: string | null;
+    runtimeControlRevision: number | null;
+    recoveryOffer: CycleRecoveryOffer | null;
   };
   draftIdentity: { draftId: string; draftRevision: number };
   receiverEpoch: string;

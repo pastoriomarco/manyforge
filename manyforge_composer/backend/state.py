@@ -226,6 +226,63 @@ class ComposerState:
             )
         return result
 
+    def prepare_current_applied_scene(
+        self, *, request_owner_epoch: str, request_id: str
+    ) -> None:
+        """Join an Applied activation to one post-claim Idle scene preparation."""
+
+        if self.headless_client is None or self.authoring_admission is None:
+            raise AuthoringJournalError(
+                "program_scene_preparation_unavailable",
+                "Applied Program scene preparation requires Headless",
+            )
+        applied = self.headless_client.program_applied()
+        source = applied.get("source")
+        record_digest = (
+            source.get("record_digest") if isinstance(source, dict) else None
+        )
+        if not isinstance(record_digest, str):
+            raise AuthoringJournalError(
+                "program_applied_selection_invalid",
+                "Applied Program omitted its exact record digest",
+            )
+        admission = self.headless_client.authoring_admission()
+        generation = admission.get("admission_generation")
+        if admission.get("authoring_allowed") is not True or type(generation) is not int:
+            raise AuthoringJournalError(
+                "program_scene_preparation_unavailable",
+                "Applied Program scene preparation requires authoritative Idle",
+            )
+        preparation_request_id = (
+            "program-scene-"
+            + canonical_digest(
+                {
+                    "request_owner_epoch": request_owner_epoch,
+                    "request_id": request_id,
+                    "applied_record_digest": record_digest,
+                }
+            ).removeprefix("sha256:")[:32]
+        )
+        result = self.headless_client.program_scene_prepare(
+            {
+                "request_id": preparation_request_id,
+                "request_owner_epoch": self.authoring_admission.owner_epoch,
+                "source_label": "manyforge_composer_activation",
+                "correlation_id": request_id,
+                "expected_applied_record_digest": record_digest,
+                "expected_admission_generation": generation,
+            }
+        )
+        if (
+            result.get("status") != "prepared"
+            or result.get("applied_record_digest") != record_digest
+            or result.get("program_revision") != applied.get("program_revision")
+        ):
+            raise AuthoringJournalError(
+                "program_scene_preparation_invalid",
+                "scene preparation returned another Applied Program identity",
+            )
+
     @staticmethod
     def _manager_matches_scenario(
         status: dict[str, Any],
@@ -649,6 +706,10 @@ class ComposerState:
             prepare_effect=prepare,
             effect=lambda claim: self._execute_scenario_load(prepared, claim),
             post_image=self.draft_session.retained_state,
+            after_release=lambda: self.prepare_current_applied_scene(
+                request_owner_epoch=envelope.request_owner_epoch,
+                request_id=envelope.request_id,
+            ),
         )
 
     def load_startup_scenario(self, scenario_id: str) -> dict[str, Any]:

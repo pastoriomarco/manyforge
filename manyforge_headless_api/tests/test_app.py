@@ -512,6 +512,14 @@ class FakeCore:
             "source_model": self.source_model_projection(),
         }
 
+    def assistant_mode_context(self, mode_id: str) -> dict[str, Any]:
+        return {
+            "assistant_mode": self.assistant_mode_projection(mode_id),
+            "node_environment": self.node_environment_projection(),
+            "schema_version": "manyforge.assistant_mode_context.v1",
+            "source_model": self.source_model_projection(),
+        }
+
     def scenario_catalog_projection(self) -> dict[str, Any]:
         return {
             "api_version": "manyforge.scenario_catalog.v1",
@@ -1184,6 +1192,19 @@ class FakeProgramRunner:
         self.calls.append(("start", copy.deepcopy(body)))
         return self._snapshot()
 
+    def prepare_applied_scene(self, body: dict[str, Any]) -> dict[str, Any]:
+        self.calls.append(("prepare_scene", copy.deepcopy(body)))
+        return {
+            "schema_version": "manyforge.program_scene_preparation.v1",
+            "status": "prepared",
+            "applied_record_digest": body["expected_applied_record_digest"],
+            "program_revision": self._snapshot()["capture"]["program_revision"],
+            "admission_generation": body["expected_admission_generation"],
+            "prepared_scene": {
+                "schema_version": "manyforge.prepared_program_scene.v1"
+            },
+        }
+
     def read_run(self, program_run_id: str) -> dict[str, Any]:
         self.calls.append(("read", program_run_id))
         return self._snapshot()
@@ -1324,6 +1345,15 @@ def test_runtime_manager_scene_alarm_history_and_health_are_thin_reads() -> None
         ).json()
         assert assistant_mode["mode"] == "composer-assistant"
         assert assistant_mode["retained_bundle_id"] == "bundle.1"
+        assistant_context = client.get(
+            "/api/assistant/modes/composer-assistant/context"
+        ).json()
+        assert assistant_context["schema_version"] == (
+            "manyforge.assistant_mode_context.v1"
+        )
+        assert assistant_context["assistant_mode"]["mode"] == (
+            "composer-assistant"
+        )
         assert client.get("/api/scene").status_code == 200
         assert client.get("/api/execution/alarms").json()[
             "requested_limit"
@@ -1647,6 +1677,15 @@ def test_program_runner_surface_is_a_strict_thin_owner_projection() -> None:
             params={"active_only": "true", "limit": 1},
         )
         started = client.post("/api/program/runs", json=start_body)
+        prepared = client.post(
+            "/api/program/scene-preparations",
+            json={
+                **_caller(),
+                "request_id": "request.prepare.1",
+                "expected_applied_record_digest": "sha256:" + "5" * 64,
+                "expected_admission_generation": _ADMISSION_GENERATION,
+            },
+        )
         read = client.get("/api/program/runs/program-run.1")
         stopped = client.post(
             "/api/program/runs/program-run.1/stop",
@@ -1658,11 +1697,13 @@ def test_program_runner_surface_is_a_strict_thin_owner_projection() -> None:
     assert index.status_code == 200
     assert index.json()["active_only"] is True
     assert started.json()["capture"]["scenario_id"] == "cell-pick"
+    assert prepared.json()["status"] == "prepared"
     assert read.json()["capture"]["program_run_id"] == "program-run.1"
     assert stopped.json()["state"] == "stopping"
     assert [call[0] for call in runner.calls] == [
         "runs",
         "start",
+        "prepare_scene",
         "read",
         "stop",
     ]
@@ -2343,6 +2384,7 @@ def test_openapi_contains_no_condition_mutation_route() -> None:
     assert "/api/viewer-model/resource" in paths
     assert "/api/assistant/modes" in paths
     assert "/api/assistant/modes/{mode_id}" in paths
+    assert "/api/assistant/modes/{mode_id}/context" in paths
     assert {
         "/api/execution/operations/{operation_id}/pause",
         "/api/execution/operations/{operation_id}/resume",

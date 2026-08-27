@@ -440,6 +440,180 @@ export interface ProgramRunIndex {
   runs: ProgramRunStatus[];
 }
 
+export type RuntimeOverrideStatus = 'staged' | 'active' | 'cleared' | 'stale';
+
+export interface RuntimeOverrideRecord {
+  schemaVersion: 'manyforge.runtime_override.v1';
+  overrideId: string;
+  overrideRevision: number;
+  status: RuntimeOverrideStatus;
+  programRunId: string;
+  programRevision: string;
+  programBindingId: string;
+  retainedBundleId: string;
+  graphRevision: string;
+  nodeEnvironmentDigest: string;
+  nodeInstanceId: string;
+  nodeAttemptId: string;
+  parameterId: string;
+  value: JsonValue;
+  sourceObservationId: string | null;
+  sourceOwnerGeneration: number | null;
+}
+
+export interface RuntimeOverridePromotionProposal {
+  schemaVersion: 'manyforge.runtime_override_promotion.v1';
+  proposalId: string;
+  status: 'awaiting_reset' | 'ready';
+  programRunId: string;
+  overrideId: string;
+  programRevision: string;
+  programBindingId: string;
+  nodeInstanceId: string;
+  nodeId: string;
+  parameterId: string;
+  value: JsonValue;
+  expectedDraftId: string;
+  expectedDraftRevision: number;
+}
+
+export interface RuntimeControlAuditEvent {
+  eventRevision: number;
+  kind: string;
+  facts: Record<string, JsonValue>;
+}
+
+export interface ProgramRuntimeControlsSnapshot {
+  schemaVersion: 'manyforge.program_runtime_controls.v1';
+  programRunId: string;
+  runtimeControlRevision: number;
+  recoveryFences: {
+    programGeneration: number;
+    deploymentGeneration: number;
+    sceneAdmissionEpoch: number;
+    poseSourceApplyGeneration: number;
+  };
+  hasActiveRuntimeOverrides: boolean;
+  hasStagedRuntimeOverrides: boolean;
+  hasStaleRuntimeOverrides: boolean;
+  overrides: RuntimeOverrideRecord[];
+  promotionProposals: RuntimeOverridePromotionProposal[];
+  retryCounts: Record<string, number>;
+  audit: RuntimeControlAuditEvent[];
+}
+
+export type CycleRecoveryActionId =
+  | 'retry_motion_from_current_state'
+  | 'acknowledge_and_continue'
+  | 'retry_after_scene_repair'
+  | 'replan_from_stopped_state'
+  | 'retry_runtime_step'
+  | 'reset_cycle';
+
+export interface CycleRecoveryAction {
+  actionId: CycleRecoveryActionId;
+  labelKey: string;
+  requiresConfirmation: boolean;
+  performsBackendReset: boolean;
+  enabled: boolean;
+  disabledReasonCode: string | null;
+}
+
+export interface CycleRecoveryOffer {
+  schemaVersion: 'manyforge.cycle_recovery_offer.v2';
+  offerId: string;
+  offerRevision: number;
+  generatedAtNs: number;
+  validUntilNs: number | null;
+  kernelAssessmentRevision: number;
+  controlCommandEpoch: number;
+  operationId: string | null;
+  operationRevision: number | null;
+  programRunId: string;
+  programBindingId: string;
+  nodeInstanceId: string;
+  nodeAttemptId: string;
+  participants: JsonValue[];
+  graphRevision: string;
+  retainedBundleId: string;
+  cycleGeneration: number;
+  programGeneration: number;
+  deploymentGeneration: number;
+  sceneAdmissionEpoch: number;
+  poseSourceApplyGeneration: number;
+  latchId: string | null;
+  stopId: string | null;
+  stopGeneration: number | null;
+  stopCertificateId: string | null;
+  stopCertificateRevision: number | null;
+  status: string;
+  recoveryClass: string;
+  actions: CycleRecoveryAction[];
+  manualResult: {
+    enabled: boolean;
+    disabledReasonCode: string | null;
+  };
+  primaryAction: CycleRecoveryActionId | null;
+  reasonCode: string;
+  evidenceRefs: string[];
+  policy: Record<string, JsonValue>;
+}
+
+export interface RuntimeOverrideObservationCandidate {
+  schemaVersion: 'manyforge.runtime_override_observation_candidate.v1';
+  available: boolean;
+  reasonCode: string | null;
+  reason: string | null;
+  programRunId: string;
+  nodeInstanceId: string | null;
+  nodeAttemptId: string | null;
+  nodeId: string | null;
+  parameterId: string | null;
+  value: JsonValue | null;
+  sourceObservationId: string | null;
+  sourceOwnerGeneration: number | null;
+}
+
+export interface ProgramRuntimeControlProjection {
+  schemaVersion: 'manyforge.program_runtime_control_projection.v1';
+  ownerId: string;
+  ownerEpoch: string;
+  programRunId: string;
+  runRevision: number;
+  runtimeControls: ProgramRuntimeControlsSnapshot;
+  recoveryOffer: CycleRecoveryOffer | null;
+  observationOverrideCandidate: RuntimeOverrideObservationCandidate;
+}
+
+export interface ProgramRuntimeControlResult {
+  schemaVersion: 'manyforge.program_runtime_control_result.v1';
+  requestId: string;
+  accepted: true;
+  result: JsonValue;
+  run: ProgramRunStatus;
+  runtimeControls: ProgramRuntimeControlProjection;
+}
+
+export interface RuntimeOverrideMaterializationResponse {
+  proposalId: string;
+  mutation: string;
+  details: Record<string, JsonValue>;
+  workspace: ProgramWorkspaceResponse;
+}
+
+export interface CycleRecoveryActionResult {
+  schemaVersion: 'manyforge.cycle_recovery_result.v2';
+  requestId: string;
+  accepted: true;
+  actionId: CycleRecoveryActionId;
+  cycleResumed: boolean;
+  resultCode: 'accepted';
+  ownerResult: JsonValue | null;
+  run: ProgramRunStatus;
+  runtimeControls: ProgramRuntimeControlProjection;
+  recoveryOffer: CycleRecoveryOffer | null;
+}
+
 export type ProgramWorkspaceTransitionStatus =
   | 'applied'
   | 'loaded'
@@ -1090,6 +1264,7 @@ export interface ProgramCycleResetResult {
   idleCycleGeneration: number;
   settlementReference: string;
   admission: Record<string, JsonValue>;
+  runtimeControls: ProgramRuntimeControlsSnapshot | null;
 }
 
 export type Vector3Tuple = [number, number, number];

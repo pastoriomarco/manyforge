@@ -32,6 +32,7 @@ class _SnapshotAdapter(py_trees.behaviour.Behaviour):
         input_resolver: NodeAttemptInputResolver,
     ) -> None:
         super().__init__(name=name)
+        self._node_instance_id = name
         self._parameters = dict(parameters)
         self._value_sources = {
             key: dict(source) for key, source in value_sources.items()
@@ -48,6 +49,7 @@ class _SnapshotAdapter(py_trees.behaviour.Behaviour):
         try:
             snapshot = self._input_resolver.snapshot(
                 node_id=self.node_id,
+                node_instance_id=self._node_instance_id,
                 parameters=self._parameters,
                 value_sources=self._value_sources,
                 blackboard_read_parameters=(

@@ -2,10 +2,11 @@
 
 from __future__ import annotations
 
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from copy import deepcopy
 from dataclasses import dataclass
 import hashlib
+import math
 from pathlib import Path
 from threading import Event, RLock
 from typing import Any, Final, NoReturn
@@ -40,6 +41,7 @@ from manyforge_behavior.production_ports import (
 from manyforge_behavior.program_run_owner import (
     ProgramRunOwner,
     ProgramRunOwnerError,
+    ProgramRunOwnerOutcomeUnknownError,
     build_applied_program_run_admission,
 )
 from manyforge_behavior.program_scheduling import (
@@ -51,6 +53,7 @@ from manyforge_headless_api.client import HeadlessClientError, HeadlessHttpClien
 from manyforge_headless_api.models import (
     ProgramRunStartRequest,
     ProgramRunStopRequest,
+    ProgramScenePreparationRequest,
 )
 from manyforge_headless_api.program_model_transport import (
     HeadlessProgramModelAuditSink,
@@ -67,6 +70,19 @@ from .liveness import (
     ProgramRunnerLivenessReceiver,
 )
 from .models import ProgramCycleResetRequest, ProgramCycleStatusDTO
+from .models import (
+    CycleRecoveryActionRequest,
+    ManualResultStageRequest,
+    RuntimeBlackboardWriteRequest,
+    RuntimeOverrideActionRequest,
+    RuntimeOverridePromotionRequest,
+    RuntimeOverrideStageRequest,
+)
+from .runtime_controls import (
+    ProgramRuntimeControlError,
+    ProgramRuntimeControls,
+    manual_result_availability,
+)
 
 
 PROGRAM_RUN_INDEX_VERSION: Final = "manyforge.program_run_index.v1"
@@ -76,9 +92,16 @@ _MAX_REPLAY_RECORDS: Final = 4_096
 class ProgramRunnerError(RuntimeError):
     """Stable failure from the isolated Program-runner owner."""
 
-    def __init__(self, code: str, message: str) -> None:
+    def __init__(
+        self,
+        code: str,
+        message: str,
+        *,
+        details: Mapping[str, Any] | None = None,
+    ) -> None:
         super().__init__(message)
         self.code = code
+        self.details = deepcopy(dict(details or {}))
 
 
 @dataclass(frozen=True, slots=True)
@@ -296,7 +319,6 @@ class ProgramRuntime:
             cclc_routes=self._cclc,
             program_run_scope=self._native.scope,
             program_run_context=CompositeProgramRunContextPort(*context_members),
-            program_run_initialization=self._scene,
             program_interventions=self._interventions,
         )
         self._owner_availability = self._build_owner_availability()
@@ -308,6 +330,8 @@ class ProgramRuntime:
         )
         self._terminal_observation_lock = RLock()
         self._pending_terminal_snapshots: dict[str, dict[str, Any]] = {}
+        self._runtime_controls: dict[str, ProgramRuntimeControls] = {}
+        self._runtime_controls_lock = RLock()
         self._host = ProgramRunTickHost(
             self._owner,
             tick_interval_s=config.tick_interval_seconds,
@@ -345,7 +369,7 @@ class ProgramRuntime:
         preflight only and publishes readiness after the heartbeat returns a
         stable current status.
         """
-        return self.cycle_status()
+        return self._cycle_status_core()
 
     def _reconcile_manager_liveness(
         self,
@@ -629,6 +653,11 @@ class ProgramRuntime:
             raise ProgramRunnerError(
                 record.error["code"],
                 record.error["message"],
+                details=(
+                    record.error.get("details")
+                    if isinstance(record.error.get("details"), Mapping)
+                    else None
+                ),
             )
         raise ProgramRunnerError(
             "program_run_request_in_progress",
@@ -648,6 +677,7 @@ class ProgramRuntime:
                 owner_epoch=owner_epoch,
                 request_id=request_id,
                 code=error.code,
+                details=error.details,
                 message=str(error),
             )
         except Exception:
@@ -676,7 +706,9 @@ class ProgramRuntime:
             )
         return generation
 
-    def cycle_status(self) -> dict[str, Any]:
+    def _cycle_status_core(self) -> dict[str, Any]:
+        """Return the closed, dependency-free Manager liveness projection."""
+
         _admission, journal = self._require_cycle_owner()
         cycle = journal.read()
         if cycle.acquisition_pending is not None or (
@@ -700,23 +732,659 @@ class ProgramRuntime:
         })
         return status.model_dump(mode="json")
 
-    def _terminalize_failed_start(self, journal: ProgramCycleJournal) -> None:
+    def cycle_status(self) -> dict[str, Any]:
+        result = self._cycle_status_core()
+        program_run_id = result["program_run_id"]
+        controls = (
+            None
+            if program_run_id is None
+            else self._optional_controls(program_run_id)
+        )
+        result["runtime_control_revision"] = (
+            None
+            if controls is None
+            else controls.snapshot()["runtime_control_revision"]
+        )
+        result["recovery_offer"] = self._recovery_offer(
+            program_run_id,
+            cycle_generation=result["cycle_generation"],
+        )
+        return result
+
+    def _controls(self, program_run_id: str) -> ProgramRuntimeControls:
+        with self._runtime_controls_lock:
+            controls = self._runtime_controls.get(program_run_id)
+            if controls is not None:
+                return controls
+            run = self.read_run(program_run_id)
+            capture = run.get("capture")
+            if not isinstance(capture, Mapping):
+                raise ProgramRunnerError(
+                    "program_runtime_controls_unavailable",
+                    "retained Program run has no exact capture",
+                )
+            retained = (
+                None
+                if self._journal is None
+                else self._journal.read_runtime_controls(program_run_id)
+            )
+            recovery_fences = None
+            if retained is None and self._journal is not None:
+                cycle = self._journal.read()
+                if (
+                    cycle.program_run_id == program_run_id
+                    and isinstance(cycle.capture_identities, Mapping)
+                ):
+                    value = cycle.capture_identities.get(
+                        "runtime_recovery_fences"
+                    )
+                    if isinstance(value, Mapping):
+                        recovery_fences = value
+            try:
+                controls = (
+                    ProgramRuntimeControls(
+                        capture,
+                        recovery_fences=recovery_fences,
+                    )
+                    if retained is None
+                    else ProgramRuntimeControls.restore(capture, retained)
+                )
+            except ValueError as error:
+                raise ProgramRunnerError(
+                    "program_runtime_controls_invalid",
+                    str(error),
+                ) from error
+            self._runtime_controls[program_run_id] = controls
+            return controls
+
+    def _optional_controls(
+        self, program_run_id: str
+    ) -> ProgramRuntimeControls | None:
+        """Read C2 controls without making legacy terminal cycles unreadable."""
+
+        try:
+            return self._controls(program_run_id)
+        except ProgramRunnerError as error:
+            if error.code not in {
+                "program_run_not_found",
+                "program_runtime_controls_unavailable",
+            }:
+                raise
+            return None
+
+    def _recovery_offer(
+        self,
+        program_run_id: str | None,
+        *,
+        cycle_generation: int,
+    ) -> dict[str, Any] | None:
+        if program_run_id is None:
+            return None
+        intervention = self._owner.intervention(program_run_id)
+        if intervention is None:
+            return None
+        controls = self._optional_controls(program_run_id)
+        if controls is None:
+            return None
+        try:
+            live = self._owner.read(program_run_id)
+        except ProgramRunOwnerError:
+            return None
+        policy = live.capture.node_policy_by_instance_id.get(
+            intervention.identity.node_instance_id
+        )
+        return controls.recovery_offer(
+            cycle_generation=cycle_generation,
+            owner_epoch=self.owner_epoch,
+            intervention=intervention,
+            policy={} if policy is None else policy.recovery_policy,
+        )
+
+    @staticmethod
+    def _runtime_override_candidate_unavailable(
+        program_run_id: str,
+        *,
+        reason_code: str,
+        reason: str,
+        node_instance_id: str | None = None,
+        node_attempt_id: str | None = None,
+        node_id: str | None = None,
+    ) -> dict[str, Any]:
+        return {
+            "schema_version": (
+                "manyforge.runtime_override_observation_candidate.v1"
+            ),
+            "available": False,
+            "reason_code": reason_code,
+            "reason": reason,
+            "program_run_id": program_run_id,
+            "node_instance_id": node_instance_id,
+            "node_attempt_id": node_attempt_id,
+            "node_id": node_id,
+            "parameter_id": None,
+            "value": None,
+            "source_observation_id": None,
+            "source_owner_generation": None,
+        }
+
+    def _runtime_override_observation_candidate(
+        self, program_run_id: str
+    ) -> dict[str, Any]:
+        """Project one exact owner-derived Robot snapshot staging candidate."""
+
+        try:
+            intervention = self._owner.intervention(program_run_id)
+        except ProgramRunOwnerError as error:
+            return self._runtime_override_candidate_unavailable(
+                program_run_id,
+                reason_code="program_attempt_context_unavailable",
+                reason=str(error),
+            )
+        if intervention is None:
+            return self._runtime_override_candidate_unavailable(
+                program_run_id,
+                reason_code="program_attempt_not_held",
+                reason="Stage requires the exact held Program node attempt.",
+            )
+        node_instance_id = intervention.identity.node_instance_id
+        node_attempt_id = intervention.identity.node_attempt_id
+        try:
+            live = self._owner.read(program_run_id)
+            context = self._owner.runtime_override_source_context(
+                program_run_id,
+                node_instance_id=node_instance_id,
+            )
+        except ProgramRunOwnerError as error:
+            return self._runtime_override_candidate_unavailable(
+                program_run_id,
+                reason_code="program_attempt_context_unavailable",
+                reason=str(error),
+                node_instance_id=node_instance_id,
+                node_attempt_id=node_attempt_id,
+            )
+        node_id = context["node_id"]
+        parameters = context["parameters"]
+        if (
+            not isinstance(parameters, Mapping)
+            or parameters.get("target_mode", "absolute") != "absolute"
+            or node_id
+            not in {"motion.move_to_joint_target", "motion.move_to_pose"}
+        ):
+            return self._runtime_override_candidate_unavailable(
+                program_run_id,
+                reason_code="robot_snapshot_override_not_supported",
+                reason=(
+                    "The held node does not accept an absolute Robot snapshot "
+                    "as its goal."
+                ),
+                node_instance_id=node_instance_id,
+                node_attempt_id=node_attempt_id,
+                node_id=node_id,
+            )
+        try:
+            execution = self._headless.execution_status()
+        except Exception as error:
+            return self._runtime_override_candidate_unavailable(
+                program_run_id,
+                reason_code="robot_observation_unavailable",
+                reason=str(error) or "The current Robot observation is unavailable.",
+                node_instance_id=node_instance_id,
+                node_attempt_id=node_attempt_id,
+                node_id=node_id,
+            )
+        status = execution.get("status")
+        direct = status.get("direct_control") if isinstance(status, Mapping) else None
+        observed = direct.get("observed_state") if isinstance(direct, Mapping) else None
+        capture = live.capture
+        if (
+            execution.get("ok") is not True
+            or not isinstance(status, Mapping)
+            or not isinstance(direct, Mapping)
+            or not isinstance(observed, Mapping)
+            or status.get("graph_revision") != capture.graph_revision
+            or status.get("retained_bundle_id") != capture.retained_bundle_id
+            or direct.get("program_binding_id") != capture.program_binding_id
+            or direct.get("target_role_id") != parameters.get("target_role")
+            or direct.get("base_frame_role_id")
+            != parameters.get("base_frame_role")
+            or direct.get("tcp_frame_role_id")
+            != parameters.get("tcp_frame_role")
+            or observed.get("complete") is not True
+            or not isinstance(observed.get("source_epoch"), str)
+            or not observed["source_epoch"]
+            or type(observed.get("sequence")) is not int
+            or observed["sequence"] < 1
+        ):
+            return self._runtime_override_candidate_unavailable(
+                program_run_id,
+                reason_code="robot_observation_identity_mismatch",
+                reason=(
+                    "The execution owner has no complete Robot observation "
+                    "for this exact Program target."
+                ),
+                node_instance_id=node_instance_id,
+                node_attempt_id=node_attempt_id,
+                node_id=node_id,
+            )
+        if node_id == "motion.move_to_joint_target":
+            names = observed.get("source_joint_names")
+            positions = observed.get("positions_rad")
+            if (
+                not isinstance(names, list)
+                or not isinstance(positions, list)
+                or not names
+                or len(names) != len(positions)
+                or any(not isinstance(name, str) or not name for name in names)
+                or any(
+                    isinstance(position, bool)
+                    or not isinstance(position, (int, float))
+                    or not math.isfinite(position)
+                    for position in positions
+                )
+            ):
+                return self._runtime_override_candidate_unavailable(
+                    program_run_id,
+                    reason_code="robot_observation_value_invalid",
+                    reason="The current joint observation is incomplete.",
+                    node_instance_id=node_instance_id,
+                    node_attempt_id=node_attempt_id,
+                    node_id=node_id,
+                )
+            value: Any = [
+                {"joint_name": name, "position_rad": position}
+                for name, position in zip(names, positions, strict=True)
+            ]
+        else:
+            pose = observed.get("current_tcp_pose")
+            position = pose.get("position_m") if isinstance(pose, Mapping) else None
+            orientation = pose.get("orientation") if isinstance(pose, Mapping) else None
+            if not isinstance(position, Mapping) or not isinstance(
+                orientation, Mapping
+            ):
+                return self._runtime_override_candidate_unavailable(
+                    program_run_id,
+                    reason_code="robot_observation_value_invalid",
+                    reason="The current TCP observation is incomplete.",
+                    node_instance_id=node_instance_id,
+                    node_attempt_id=node_attempt_id,
+                    node_id=node_id,
+                )
+            try:
+                position_value = [position[field] for field in ("x_m", "y_m", "z_m")]
+                orientation_value = [
+                    orientation[field] for field in ("x", "y", "z", "w")
+                ]
+            except KeyError:
+                return self._runtime_override_candidate_unavailable(
+                    program_run_id,
+                    reason_code="robot_observation_value_invalid",
+                    reason="The current TCP observation is incomplete.",
+                    node_instance_id=node_instance_id,
+                    node_attempt_id=node_attempt_id,
+                    node_id=node_id,
+                )
+            if any(
+                isinstance(component, bool)
+                or not isinstance(component, (int, float))
+                or not math.isfinite(component)
+                for component in (*position_value, *orientation_value)
+            ):
+                return self._runtime_override_candidate_unavailable(
+                    program_run_id,
+                    reason_code="robot_observation_value_invalid",
+                    reason="The current TCP observation is incomplete.",
+                    node_instance_id=node_instance_id,
+                    node_attempt_id=node_attempt_id,
+                    node_id=node_id,
+                )
+            value = {
+                "position_m": position_value,
+                "orientation": {"xyzw": orientation_value},
+            }
+            authored_goal = parameters.get("goal")
+            if isinstance(authored_goal, Mapping) and "frame_ref" in authored_goal:
+                value["frame_ref"] = deepcopy(authored_goal["frame_ref"])
+        try:
+            validated = self._owner.validate_runtime_override(
+                program_run_id,
+                node_instance_id=node_instance_id,
+                node_attempt_id=node_attempt_id,
+                parameter_id="goal",
+                value=value,
+            )
+        except ProgramRunOwnerError as error:
+            return self._runtime_override_candidate_unavailable(
+                program_run_id,
+                reason_code="robot_snapshot_override_rejected",
+                reason=str(error),
+                node_instance_id=node_instance_id,
+                node_attempt_id=node_attempt_id,
+                node_id=node_id,
+            )
+        return {
+            "schema_version": (
+                "manyforge.runtime_override_observation_candidate.v1"
+            ),
+            "available": True,
+            "reason_code": None,
+            "reason": None,
+            "program_run_id": program_run_id,
+            "node_instance_id": node_instance_id,
+            "node_attempt_id": node_attempt_id,
+            "node_id": node_id,
+            "parameter_id": "goal",
+            "value": validated,
+            "source_observation_id": observed["source_epoch"],
+            "source_owner_generation": observed["sequence"],
+        }
+
+    @staticmethod
+    def _run_recovery_fences(
+        applied: Mapping[str, Any],
+        execution: Mapping[str, Any],
+        *,
+        scene_admission_epoch: int,
+    ) -> dict[str, int]:
+        source = applied.get("source")
+        status = execution.get("status")
+        scene_revision = (
+            status.get("scene_revision") if isinstance(status, Mapping) else None
+        )
+        if (
+            execution.get("ok") is not True
+            or not isinstance(source, Mapping)
+            or not isinstance(status, Mapping)
+            or status.get("retained_bundle_id")
+            != applied.get("retained_bundle_id")
+            or status.get("graph_revision") != applied.get("graph_revision")
+            or type(source.get("source_generation")) is not int
+            or source["source_generation"] < 1
+            or type(status.get("active_publication_generation")) is not int
+            or status["active_publication_generation"] < 1
+            or not isinstance(scene_revision, Mapping)
+            or type(scene_revision.get("revision_id")) is not int
+            or scene_revision["revision_id"] < 1
+        ):
+            raise ProgramRunnerError(
+                "program_run_recovery_fence_unavailable",
+                "current owners did not provide exact recovery generations",
+            )
+        return {
+            "program_generation": source["source_generation"],
+            "deployment_generation": status[
+                "active_publication_generation"
+            ],
+            "scene_admission_epoch": scene_admission_epoch,
+            "pose_source_apply_generation": 0,
+        }
+
+    def _project_run(self, value: Mapping[str, Any]) -> dict[str, Any]:
+        # Program-run status v1 stays a stable owner contract. C2 state is a
+        # separate joined projection so adding controls never weakens or
+        # silently version-skews existing run consumers.
+        return deepcopy(dict(value))
+
+    def _terminalize_failed_start(
+        self,
+        journal: ProgramCycleJournal,
+        *,
+        scene_proof: Mapping[str, Any] | None,
+        effect_may_have_started: bool,
+        started_snapshot: Mapping[str, Any] | None = None,
+    ) -> None:
         current = journal.read()
         if current.claim is None or current.state == "terminal_awaiting_reset":
             return
-        reference = self._digest(
-            {
-                "cycle_generation": current.cycle_generation,
-                "failure": "post_acquire_start_failure",
+        if effect_may_have_started and started_snapshot is None:
+            journal.require_reconciliation(
+                expected_generation=current.cycle_generation
+            )
+            return
+        settlement: dict[str, Any] = {
+            "schema_version": "manyforge.program_cycle_start_settlement.v1",
+            "kind": "proven_no_effect",
+            "claim": deepcopy(current.claim),
+            "program_run_id": current.program_run_id,
+            "prepared_scene": deepcopy(dict(scene_proof or {})),
+        }
+        program_run_id = current.program_run_id
+        terminal_snapshot: dict[str, Any] | None = None
+        if started_snapshot is not None:
+            capture = started_snapshot.get("capture")
+            started_run_id = (
+                capture.get("program_run_id")
+                if isinstance(capture, Mapping)
+                else None
+            )
+            if not isinstance(started_run_id, str) or not started_run_id:
+                journal.require_reconciliation(
+                    expected_generation=current.cycle_generation
+                )
+                return
+            try:
+                stopped = self._host.stop_run(
+                    started_run_id,
+                    reason="Program Start settlement failed",
+                ).to_dict()
+            except Exception:
+                journal.require_reconciliation(
+                    expected_generation=current.cycle_generation
+                )
+                return
+            if stopped.get("state") not in {"stopped", "succeeded", "failed"}:
+                journal.require_reconciliation(
+                    expected_generation=current.cycle_generation
+                )
+                return
+            settlement = {
+                **settlement,
+                "kind": "terminal_effects_settled",
+                "program_run_id": started_run_id,
+                "terminal_run": stopped,
             }
+            terminal_snapshot = stopped
+            program_run_id = started_run_id
+        reference = self._digest(settlement)
+        try:
+            journal.transition(
+                expected_generation=current.cycle_generation,
+                expected_states=("idle_after_reset", "starting", "running"),
+                state="terminal_awaiting_reset",
+                terminal_reference=reference,
+                start_settlement=settlement,
+                program_run_id=program_run_id,
+                run_snapshot=terminal_snapshot,
+            )
+        except Exception as error:
+            try:
+                journal.require_reconciliation(
+                    expected_generation=current.cycle_generation
+                )
+            except Exception:
+                pass
+            raise ProgramRunnerError(
+                "program_cycle_reconciliation_required",
+                "failed Program Start settlement was not durably retained",
+            ) from error
+
+    def _cycle_terminal_evidence_is_exact(
+        self, journal: ProgramCycleJournal, cycle: Any
+    ) -> bool:
+        reference = cycle.terminal_reference
+        program_run_id = cycle.program_run_id
+        if not isinstance(reference, str) or not isinstance(program_run_id, str):
+            return False
+        settlement = cycle.start_settlement
+        if settlement is not None:
+            prepared_scene = settlement.get("prepared_scene")
+            if (
+                settlement.get("schema_version")
+                != "manyforge.program_cycle_start_settlement.v1"
+                or settlement.get("claim") != cycle.claim
+                or not isinstance(prepared_scene, Mapping)
+                or prepared_scene.get("schema_version")
+                != "manyforge.prepared_program_scene.v1"
+                or settlement.get("kind")
+                not in {"proven_no_effect", "terminal_effects_settled"}
+                or self._digest(settlement) != reference
+            ):
+                return False
+            if settlement["kind"] == "proven_no_effect":
+                return settlement.get("program_run_id") == program_run_id
+            terminal = settlement.get("terminal_run")
+            capture = terminal.get("capture") if isinstance(terminal, Mapping) else None
+            return bool(
+                isinstance(capture, Mapping)
+                and capture.get("program_run_id") == program_run_id
+                and terminal.get("state") in {"stopped", "succeeded", "failed"}
+                and journal.read_run_snapshot(program_run_id) == terminal
+            )
+        terminal = journal.read_run_snapshot(program_run_id)
+        capture = terminal.get("capture") if isinstance(terminal, Mapping) else None
+        return bool(
+            isinstance(capture, Mapping)
+            and capture.get("program_run_id") == program_run_id
+            and terminal.get("state") in {"stopped", "succeeded", "failed"}
+            and self._digest(
+                {
+                    "program_run_id": program_run_id,
+                    "run_revision": terminal.get("run_revision"),
+                    "state": terminal.get("state"),
+                }
+            )
+            == reference
         )
-        journal.transition(
-            expected_generation=current.cycle_generation,
-            expected_states=("idle_after_reset", "starting", "running"),
-            state="terminal_awaiting_reset",
-            terminal_reference=reference,
-            program_run_id=current.program_run_id,
-        )
+
+    def _prepare_run_scene(
+        self, run_admission: Any, provisional_run_id: str
+    ) -> tuple[Any, Sequence[Mapping[str, Any]], dict[str, Any]]:
+        context = run_admission.port_context(provisional_run_id)
+        initial_scene = run_admission.program.to_dict().get("scene", [])
+        proof = self._scene.prepare_initial_scene(context, initial_scene)
+        return context, initial_scene, proof
+
+    def _verify_run_scene(
+        self,
+        context: Any,
+        initial_scene: Sequence[Mapping[str, Any]],
+        proof: Mapping[str, Any],
+    ) -> None:
+        self._scene.verify_initial_scene(context, initial_scene, proof)
+
+    def prepare_applied_scene(
+        self, request: ProgramScenePreparationRequest
+    ) -> dict[str, Any]:
+        """Converge the current Applied Program scene without acquiring Run."""
+
+        if not isinstance(request, ProgramScenePreparationRequest):
+            raise TypeError(
+                "prepare_applied_scene requires one ProgramScenePreparationRequest"
+            )
+        if self._closed or not self._started:
+            raise ProgramRunnerError(
+                "program_runner_unavailable",
+                "Program runner is not started",
+            )
+        self._require_manager_current()
+        with self._transition_lock:
+            self._require_manager_current()
+            admission_client, journal = self._require_cycle_owner()
+            cycle = journal.read()
+            if (
+                cycle.state != "idle_after_reset"
+                or cycle.reconciliation_required
+                or cycle.owner_epoch != self.owner_epoch
+                or cycle.acquisition_pending is not None
+            ):
+                raise ProgramRunnerError(
+                    "authoring_not_ready",
+                    "Applied Program scene preparation requires authoritative Idle",
+                )
+            admission = admission_client.get()
+            generation = self._admission_generation(admission)
+            if (
+                admission.get("authoring_allowed") is not True
+                or generation != request.expected_admission_generation
+            ):
+                raise ProgramRunnerError(
+                    "stale_generation",
+                    "authoring admission changed before scene preparation",
+                )
+            applied = self._headless.program_applied()
+            source = applied.get("source")
+            if (
+                not isinstance(source, Mapping)
+                or source.get("record_digest")
+                != request.expected_applied_record_digest
+            ):
+                raise ProgramRunnerError(
+                    "program_run_applied_selection_stale",
+                    "Applied Program changed before scene preparation",
+                )
+            scenario_id = applied.get("scenario_id")
+            scenario_catalog_revision = applied.get("scenario_catalog_revision")
+            if not isinstance(scenario_id, str) or not isinstance(
+                scenario_catalog_revision, str
+            ):
+                raise ProgramRunnerError(
+                    "program_run_applied_selection_stale",
+                    "Applied Program omitted its Scenario identity",
+                )
+            live = self._headless.scenario_program_selection(scenario_id)
+            context_id = (
+                "program-scene."
+                + self._digest(
+                    {
+                        "request_id": request.request_id,
+                        "request_owner_epoch": request.request_owner_epoch,
+                        "applied_record_digest": (
+                            request.expected_applied_record_digest
+                        ),
+                    }
+                )[7:39]
+            )
+            try:
+                run_admission = build_applied_program_run_admission(
+                    applied,
+                    live,
+                    expected_scenario_id=scenario_id,
+                    expected_scenario_catalog_revision=scenario_catalog_revision,
+                    environment=self._environment,
+                    owner_availability=self._owner_availability,
+                )
+                context, initial_scene, proof = self._prepare_run_scene(
+                    run_admission, context_id
+                )
+                self._verify_run_scene(context, initial_scene, proof)
+                if self._headless.program_applied() != applied:
+                    raise ProgramRunnerError(
+                        "program_run_applied_selection_stale",
+                        "Applied Program changed during scene preparation",
+                    )
+                resulting_generation = self._admission_generation(
+                    admission_client.get()
+                )
+                return {
+                    "schema_version": "manyforge.program_scene_preparation.v1",
+                    "status": "prepared",
+                    "applied_record_digest": request.expected_applied_record_digest,
+                    "program_revision": applied.get("program_revision"),
+                    "admission_generation": resulting_generation,
+                    "prepared_scene": deepcopy(proof),
+                }
+            except ProgramRunnerError:
+                raise
+            except HeadlessClientError as error:
+                raise self._headless_error(error) from error
+            except (ProgramRunOwnerError, ProgramSchedulingError) as error:
+                raise self._runner_error(error) from error
+            except Exception as error:
+                raise ProgramRunnerError(
+                    "program_scene_preparation_failed",
+                    str(error) or type(error).__name__,
+                ) from error
+            finally:
+                self._scene.release(context_id)
 
     def start(self) -> None:
         if self._closed:
@@ -764,7 +1432,7 @@ class ProgramRuntime:
             active_only=active_only,
             limit=limit,
         )
-        values = [snapshot.to_dict() for snapshot in snapshots]
+        values = [self._project_run(snapshot.to_dict()) for snapshot in snapshots]
         history_truncated = False
         if not active_only and self._journal is not None:
             history, history_truncated = self._journal.list_run_snapshots(
@@ -800,6 +1468,8 @@ class ProgramRuntime:
             if callable(getattr(snapshot, "to_dict", None))
             else snapshot
         )
+        if isinstance(value, Mapping):
+            value = self._project_run(value)
         if (
             self._journal is None
             or not isinstance(value, Mapping)
@@ -894,6 +1564,17 @@ class ProgramRuntime:
             if replay is not None:
                 return replay
             acquired_for_request = False
+            scene_context_id: str | None = None
+            scene_proof: dict[str, Any] | None = None
+            started_snapshot: dict[str, Any] | None = None
+            host_start_invoked = False
+
+            def release_scene_context() -> None:
+                nonlocal scene_context_id
+                if scene_context_id is not None:
+                    self._scene.release(scene_context_id)
+                    scene_context_id = None
+
             try:
                 if cycle.state != "idle_after_reset":
                     raise ProgramRunnerError(
@@ -938,6 +1619,26 @@ class ProgramRuntime:
                         "program_run_draft_applied_mismatch",
                         "Draft and Applied Program revisions differ",
                     )
+                run_admission = build_applied_program_run_admission(
+                    applied,
+                    live,
+                    expected_scenario_id=request.scenario_id,
+                    expected_scenario_catalog_revision=(
+                        request.scenario_catalog_revision
+                    ),
+                    environment=self._environment,
+                    owner_availability=self._owner_availability,
+                )
+                provisional_run_id = f"program-cycle.{cycle.cycle_generation}"
+                scene_context_id = provisional_run_id
+                scene_context, initial_scene, scene_proof = self._prepare_run_scene(
+                    run_admission, provisional_run_id
+                )
+                # Scene preparation may have consumed one or more short
+                # authored-scene claims. Acquire Run only from the fresh
+                # generation that follows those exact owner commits.
+                owner_admission = admission_client.get()
+                generation = self._admission_generation(owner_admission)
                 claim_intent = {
                     "claim_kind": "program_cycle",
                     "owner_role": "program_runner",
@@ -957,7 +1658,6 @@ class ProgramRuntime:
                     },
                     "intervention_evidence": None,
                 }
-                provisional_run_id = f"program-cycle.{cycle.cycle_generation}"
                 journal.begin_acquire(
                     expected_generation=cycle.cycle_generation,
                     provisional_run_id=provisional_run_id,
@@ -1006,16 +1706,17 @@ class ProgramRuntime:
                         "program_run_applied_selection_stale",
                         "Applied Program changed during Run admission",
                     )
-                run_admission = build_applied_program_run_admission(
-                    applied,
-                    live,
-                    expected_scenario_id=request.scenario_id,
-                    expected_scenario_catalog_revision=(
-                        request.scenario_catalog_revision
-                    ),
-                    environment=self._environment,
-                    owner_availability=self._owner_availability,
+                self._verify_run_scene(
+                    scene_context,
+                    initial_scene,
+                    scene_proof,
                 )
+                recovery_fences = self._run_recovery_fences(
+                    applied_after_claim,
+                    self._headless.execution_status(),
+                    scene_admission_epoch=generation,
+                )
+                release_scene_context()
                 journal.transition(
                     expected_generation=cycle.cycle_generation,
                     expected_states=("idle_after_reset",),
@@ -1023,8 +1724,17 @@ class ProgramRuntime:
                     program_run_id=provisional_run_id,
                     claim=claim,
                 )
+                host_start_invoked = True
                 snapshot = self._host.start_run(run_admission)
-                result = snapshot.to_dict()
+                started_snapshot = snapshot.to_dict()
+                with self._runtime_controls_lock:
+                    self._runtime_controls[snapshot.capture.program_run_id] = (
+                        ProgramRuntimeControls(
+                            snapshot.capture.to_dict(),
+                            recovery_fences=recovery_fences,
+                        )
+                    )
+                result = self._project_run(snapshot.to_dict())
                 capture = result.get("capture")
                 if not isinstance(capture, dict):
                     raise ProgramRunnerError(
@@ -1051,6 +1761,8 @@ class ProgramRuntime:
                         "Program owner omitted required immutable run evidence",
                     )
                 identities = {key: capture[key] for key in identity_fields}
+                identities["runtime_recovery_fences"] = recovery_fences
+                identities["prepared_scene"] = deepcopy(scene_proof)
                 with self._terminal_observation_lock:
                     journal.transition(
                         expected_generation=cycle.cycle_generation,
@@ -1072,24 +1784,54 @@ class ProgramRuntime:
                     result=result,
                 )
             except HeadlessClientError as error:
+                release_scene_context()
                 if acquired_for_request:
-                    self._terminalize_failed_start(journal)
+                    self._terminalize_failed_start(
+                        journal,
+                        scene_proof=scene_proof,
+                        effect_may_have_started=host_start_invoked,
+                        started_snapshot=started_snapshot,
+                    )
                 outcome = self._headless_error(error)
             except CellAdmissionError as error:
+                release_scene_context()
                 if acquired_for_request:
-                    self._terminalize_failed_start(journal)
+                    self._terminalize_failed_start(
+                        journal,
+                        scene_proof=scene_proof,
+                        effect_may_have_started=host_start_invoked,
+                        started_snapshot=started_snapshot,
+                    )
                 outcome = ProgramRunnerError(error.code, str(error))
             except ProgramRunnerError as error:
+                release_scene_context()
                 if acquired_for_request:
-                    self._terminalize_failed_start(journal)
+                    self._terminalize_failed_start(
+                        journal,
+                        scene_proof=scene_proof,
+                        effect_may_have_started=host_start_invoked,
+                        started_snapshot=started_snapshot,
+                    )
                 outcome = error
             except (ProgramRunOwnerError, ProgramSchedulingError) as error:
+                release_scene_context()
                 if acquired_for_request:
-                    self._terminalize_failed_start(journal)
+                    self._terminalize_failed_start(
+                        journal,
+                        scene_proof=scene_proof,
+                        effect_may_have_started=host_start_invoked,
+                        started_snapshot=started_snapshot,
+                    )
                 outcome = self._runner_error(error)
             except Exception as error:
+                release_scene_context()
                 if acquired_for_request:
-                    self._terminalize_failed_start(journal)
+                    self._terminalize_failed_start(
+                        journal,
+                        scene_proof=scene_proof,
+                        effect_may_have_started=host_start_invoked,
+                        started_snapshot=started_snapshot,
+                    )
                 outcome = ProgramRunnerError(
                     "program_run_admission_failed",
                     str(error) or type(error).__name__,
@@ -1111,7 +1853,9 @@ class ProgramRuntime:
                 "Program runner is closed",
             )
         try:
-            return self._owner.read(program_run_id).to_dict()
+            return self._project_run(
+                self._owner.read(program_run_id).to_dict()
+            )
         except ProgramRunOwnerError as error:
             if self._journal is not None:
                 retained = self._journal.read_run_snapshot(program_run_id)
@@ -1121,6 +1865,688 @@ class ProgramRuntime:
                 "program_run_not_found",
                 str(error),
             ) from error
+
+    def read_runtime_controls(self, program_run_id: str) -> dict[str, Any]:
+        live = self.read_run(program_run_id)
+        controls = self._controls(program_run_id)
+        cycle = self._journal.read() if self._journal is not None else None
+        return {
+            "schema_version": "manyforge.program_runtime_control_projection.v1",
+            "owner_id": self.owner_id,
+            "owner_epoch": self.owner_epoch,
+            "program_run_id": program_run_id,
+            "run_revision": live["run_revision"],
+            "runtime_controls": controls.snapshot(),
+            "recovery_offer": self._recovery_offer(
+                program_run_id,
+                cycle_generation=(1 if cycle is None else cycle.cycle_generation),
+            ),
+            "observation_override_candidate": (
+                self._runtime_override_observation_candidate(program_run_id)
+            ),
+        }
+
+    def _control_effect(self, request, *, kind: str, effect) -> dict[str, Any]:
+        if self._closed or not self._started:
+            raise ProgramRunnerError(
+                "program_runner_unavailable", "Program runner is not started"
+            )
+        self._require_manager_current()
+        with self._transition_lock:
+            self._require_manager_current()
+            _admission, journal = self._require_cycle_owner()
+            cycle = journal.read()
+            intent = request.model_dump(mode="json")
+            try:
+                record = journal.record_request(
+                    owner_epoch=request.request_owner_epoch,
+                    request_id=request.request_id,
+                    kind=kind,
+                    intent=intent,
+                    cycle_generation=cycle.cycle_generation,
+                )
+            except (ValueError, OverflowError) as error:
+                raise ProgramRunnerError(
+                    (
+                        "program_run_request_ledger_full"
+                        if isinstance(error, OverflowError)
+                        else "program_run_request_conflict"
+                    ),
+                    str(error),
+                ) from error
+            replay = self._ordinary_replay(record)
+            if replay is not None:
+                return replay
+
+            def reject(error: ProgramRunnerError) -> NoReturn:
+                self._retain_rejection(
+                    journal,
+                    owner_epoch=request.request_owner_epoch,
+                    request_id=request.request_id,
+                    error=error,
+                )
+                raise error
+
+            if request.expected_owner_epoch != self.owner_epoch:
+                reject(
+                    ProgramRunnerError(
+                        "program_run_owner_stale",
+                        "Program Runner owner epoch changed",
+                    )
+                )
+            if (
+                cycle.program_run_id != request.program_run_id
+                or cycle.state not in {"running", "stopping"}
+            ):
+                reject(
+                    ProgramRunnerError(
+                        "program_runtime_control_stale",
+                        "runtime control does not name the current Program cycle",
+                    )
+                )
+            try:
+                live = self._owner.read(request.program_run_id)
+            except ProgramRunOwnerError as error:
+                reject(ProgramRunnerError("program_run_not_found", str(error)))
+            if live.run_revision != request.expected_run_revision:
+                reject(
+                    ProgramRunnerError(
+                        "program_runtime_control_stale",
+                        "Program run changed before runtime control admission",
+                    )
+                )
+            effect_completed = False
+
+            def unresolved(error: Exception) -> NoReturn:
+                try:
+                    journal.require_reconciliation(
+                        expected_generation=cycle.cycle_generation
+                    )
+                except Exception:
+                    pass
+                # Leave the exact request in-progress. A rejected replay would
+                # falsely assert that an already-started effect did nothing.
+                raise ProgramRunnerError(
+                    "program_cycle_reconciliation_required",
+                    str(error) or type(error).__name__,
+                ) from error
+
+            try:
+                payload = effect()
+                effect_completed = True
+                projected = self._project_run(
+                    self._owner.read(request.program_run_id).to_dict()
+                )
+                result = {
+                    "schema_version": "manyforge.program_runtime_control_result.v1",
+                    "request_id": request.request_id,
+                    "accepted": True,
+                    "result": payload,
+                    "run": projected,
+                    "runtime_controls": self.read_runtime_controls(
+                        request.program_run_id
+                    ),
+                }
+                journal.complete_control_request(
+                    owner_epoch=request.request_owner_epoch,
+                    request_id=request.request_id,
+                    result=result,
+                    run_snapshot=projected,
+                )
+                return result
+            except ProgramRunnerError as error:
+                if effect_completed:
+                    unresolved(error)
+                reject(error)
+            except (
+                ProgramRunOwnerError,
+                ProgramRuntimeControlError,
+                ProgramSchedulingError,
+            ) as error:
+                if effect_completed:
+                    unresolved(error)
+                code = getattr(
+                    error, "code", "program_runtime_control_rejected"
+                )
+                reject(ProgramRunnerError(code, str(error)))
+            except Exception as error:
+                # Unexpected exceptions are not a trustworthy no-effect
+                # result: a local transition may already have happened.
+                unresolved(error)
+
+    def stage_runtime_override(
+        self, program_run_id: str, request: RuntimeOverrideStageRequest
+    ) -> dict[str, Any]:
+        if request.program_run_id != program_run_id:
+            raise ProgramRunnerError(
+                "program_run_path_invalid",
+                "Program-run identity in path and body must match",
+            )
+        controls = self._controls(program_run_id)
+
+        def effect():
+            if request.source_observation_id is not None:
+                candidate = self._runtime_override_observation_candidate(
+                    program_run_id
+                )
+                if (
+                    candidate.get("available") is not True
+                    or candidate.get("node_instance_id")
+                    != request.node_instance_id
+                    or candidate.get("node_attempt_id") != request.node_attempt_id
+                    or candidate.get("parameter_id") != request.parameter_id
+                    or candidate.get("value") != request.value
+                    or candidate.get("source_observation_id")
+                    != request.source_observation_id
+                    or candidate.get("source_owner_generation")
+                    != request.source_owner_generation
+                ):
+                    raise ProgramRunnerError(
+                        "program_runtime_observation_stale",
+                        candidate.get("reason")
+                        if isinstance(candidate.get("reason"), str)
+                        else (
+                            "Robot observation changed before runtime override "
+                            "staging"
+                        ),
+                    )
+            before = controls.snapshot()["runtime_control_revision"]
+            record = controls.stage_override(
+                node_instance_id=request.node_instance_id,
+                node_attempt_id=request.node_attempt_id,
+                parameter_id=request.parameter_id,
+                value=request.value,
+                source_observation_id=request.source_observation_id,
+                source_owner_generation=request.source_owner_generation,
+                validator=lambda **values: self._owner.validate_runtime_override(
+                    program_run_id, **values
+                ),
+            )
+            if controls.snapshot()["runtime_control_revision"] != before:
+                try:
+                    self._owner.note_runtime_control_change(program_run_id)
+                except Exception as error:
+                    raise RuntimeError(
+                        "runtime override was staged but its run projection "
+                        "could not be advanced"
+                    ) from error
+            return record
+
+        return self._control_effect(
+            request, kind="runtime_override_stage", effect=effect
+        )
+
+    def activate_runtime_override(
+        self, program_run_id: str, request: RuntimeOverrideActionRequest
+    ) -> dict[str, Any]:
+        if request.program_run_id != program_run_id:
+            raise ProgramRunnerError(
+                "program_run_path_invalid",
+                "Program-run identity in path and body must match",
+            )
+        controls = self._controls(program_run_id)
+
+        def effect():
+            current = next(
+                (
+                    row
+                    for row in controls.snapshot()["overrides"]
+                    if row["override_id"] == request.override_id
+                ),
+                None,
+            )
+            if (
+                current is None
+                or current["override_revision"]
+                != request.expected_override_revision
+            ):
+                raise ProgramRuntimeControlError(
+                    "program_runtime_override_stale",
+                    "runtime override revision changed",
+                )
+            return controls.activate_override(
+                request.override_id,
+                activator=lambda **values: self._owner.activate_runtime_override(
+                    program_run_id, **values
+                ),
+            )
+
+        return self._control_effect(
+            request, kind="runtime_override_activate", effect=effect
+        )
+
+    def clear_runtime_override(
+        self, program_run_id: str, request: RuntimeOverrideActionRequest
+    ) -> dict[str, Any]:
+        if request.program_run_id != program_run_id:
+            raise ProgramRunnerError(
+                "program_run_path_invalid",
+                "Program-run identity in path and body must match",
+            )
+        controls = self._controls(program_run_id)
+
+        def effect():
+            current = next(
+                (
+                    row
+                    for row in controls.snapshot()["overrides"]
+                    if row["override_id"] == request.override_id
+                ),
+                None,
+            )
+            if (
+                current is None
+                or current["override_revision"]
+                != request.expected_override_revision
+            ):
+                raise ProgramRuntimeControlError(
+                    "program_runtime_override_stale",
+                    "runtime override revision changed",
+                )
+            return controls.clear_override(
+                request.override_id,
+                clearer=lambda **values: self._owner.clear_runtime_override(
+                    program_run_id, **values
+                ),
+            )
+
+        return self._control_effect(
+            request, kind="runtime_override_clear", effect=effect
+        )
+
+    def promote_runtime_override(
+        self, program_run_id: str, request: RuntimeOverridePromotionRequest
+    ) -> dict[str, Any]:
+        if request.program_run_id != program_run_id:
+            raise ProgramRunnerError(
+                "program_run_path_invalid",
+                "Program-run identity in path and body must match",
+            )
+        controls = self._controls(program_run_id)
+
+        def effect():
+            current = next(
+                (
+                    row
+                    for row in controls.snapshot()["overrides"]
+                    if row["override_id"] == request.override_id
+                ),
+                None,
+            )
+            if (
+                current is None
+                or current["override_revision"]
+                != request.expected_override_revision
+            ):
+                raise ProgramRuntimeControlError(
+                    "program_runtime_override_stale",
+                    "runtime override revision changed",
+                )
+            node_id = self._owner.validate_runtime_override_promotion(
+                program_run_id,
+                node_instance_id=current["node_instance_id"],
+            )
+            before = controls.snapshot()["runtime_control_revision"]
+            proposal = controls.request_promotion(
+                request.override_id,
+                node_id=node_id,
+                expected_draft_id=request.expected_draft_id,
+                expected_draft_revision=request.expected_draft_revision,
+            )
+            if controls.snapshot()["runtime_control_revision"] != before:
+                try:
+                    self._owner.note_runtime_control_change(program_run_id)
+                except Exception as error:
+                    raise RuntimeError(
+                        "runtime promotion was staged but its run projection "
+                        "could not be advanced"
+                    ) from error
+            return proposal
+
+        return self._control_effect(
+            request, kind="runtime_override_promote", effect=effect
+        )
+
+    def write_runtime_blackboard(
+        self, program_run_id: str, request: RuntimeBlackboardWriteRequest
+    ) -> dict[str, Any]:
+        if request.program_run_id != program_run_id:
+            raise ProgramRunnerError(
+                "program_run_path_invalid",
+                "Program-run identity in path and body must match",
+            )
+        controls = self._controls(program_run_id)
+
+        def effect():
+            controls.require_audit_capacity()
+            self._owner.write_runtime_blackboard(
+                program_run_id,
+                key=request.key,
+                value=request.value,
+                request_id=request.request_id,
+            )
+            controls.audit_value(
+                "runtime_blackboard_written", key=request.key
+            )
+            return {"key": request.key, "status": "written"}
+
+        return self._control_effect(
+            request, kind="runtime_blackboard_write", effect=effect
+        )
+
+    def stage_manual_result(
+        self, program_run_id: str, request: ManualResultStageRequest
+    ) -> dict[str, Any]:
+        if request.program_run_id != program_run_id:
+            raise ProgramRunnerError(
+                "program_run_path_invalid",
+                "Program-run identity in path and body must match",
+            )
+        controls = self._controls(program_run_id)
+
+        def effect():
+            intervention = self._owner.intervention(program_run_id)
+            live = self._owner.read(program_run_id)
+            policy = live.capture.node_policy_by_instance_id.get(
+                request.node_instance_id
+            )
+            if (
+                intervention is None
+                or intervention.identity.node_attempt_id
+                != request.node_attempt_id
+                or intervention.identity.node_instance_id
+                != request.node_instance_id
+            ):
+                raise ProgramRunnerError(
+                    "program_runtime_control_stale",
+                    "manual result identifies a stale node attempt",
+                )
+            allowed, disabled_reason = manual_result_availability(
+                intervention,
+                {} if policy is None else policy.recovery_policy,
+            )
+            if not allowed:
+                raise ProgramRunnerError(
+                    disabled_reason or "program_manual_result_forbidden",
+                    (
+                        "manual result is unavailable for the exact held "
+                        "attempt"
+                    ),
+                )
+            controls.require_audit_capacity()
+            snapshot = self._host.resume_recovery(
+                program_run_id,
+                node_attempt_id=request.node_attempt_id,
+                action=(
+                    "manual_success"
+                    if request.outcome == "succeeded"
+                    else "manual_failure"
+                ),
+                result=request.output,
+            )
+            controls.audit_value(
+                "manual_result_staged",
+                node_instance_id=request.node_instance_id,
+                node_attempt_id=request.node_attempt_id,
+                outcome=request.outcome,
+            )
+            return {
+                "node_instance_id": request.node_instance_id,
+                "node_attempt_id": request.node_attempt_id,
+                "outcome": request.outcome,
+                "run_revision": snapshot.run_revision,
+            }
+
+        return self._control_effect(
+            request, kind="manual_result_stage", effect=effect
+        )
+
+    def apply_recovery_action(
+        self, request: CycleRecoveryActionRequest
+    ) -> dict[str, Any]:
+        if not isinstance(request, CycleRecoveryActionRequest):
+            raise TypeError("recovery requires one CycleRecoveryActionRequest")
+        if self._closed or not self._started:
+            raise ProgramRunnerError(
+                "program_runner_unavailable", "Program runner is not started"
+            )
+        self._require_manager_current()
+        with self._transition_lock:
+            self._require_manager_current()
+            _admission, journal = self._require_cycle_owner()
+            cycle = journal.read()
+            intent = request.model_dump(mode="json")
+            try:
+                record = journal.record_request(
+                    owner_epoch=request.request_owner_epoch,
+                    request_id=request.request_id,
+                    kind="recovery_action",
+                    intent=intent,
+                    cycle_generation=cycle.cycle_generation,
+                )
+            except (ValueError, OverflowError) as error:
+                raise ProgramRunnerError(
+                    (
+                        "program_run_request_ledger_full"
+                        if isinstance(error, OverflowError)
+                        else "program_run_request_conflict"
+                    ),
+                    str(error),
+                ) from error
+            replay = self._ordinary_replay(record)
+            if replay is not None:
+                return replay
+
+            def reject(error: ProgramRunnerError) -> NoReturn:
+                latest_offer = self._recovery_offer(
+                    cycle.program_run_id,
+                    cycle_generation=cycle.cycle_generation,
+                )
+                if latest_offer is not None:
+                    error = ProgramRunnerError(
+                        error.code,
+                        str(error),
+                        details={"recovery_offer": latest_offer},
+                    )
+                self._retain_rejection(
+                    journal,
+                    owner_epoch=request.request_owner_epoch,
+                    request_id=request.request_id,
+                    error=error,
+                )
+                raise error
+
+            if (
+                request.expected_owner_epoch != self.owner_epoch
+                or cycle.program_run_id is None
+                or cycle.state not in {"running", "stopping"}
+            ):
+                reject(
+                    ProgramRunnerError(
+                        "cycle_recovery_offer_stale",
+                        "recovery does not name the current Program cycle",
+                    )
+                )
+            program_run_id = cycle.program_run_id
+            offer = self._recovery_offer(
+                program_run_id,
+                cycle_generation=cycle.cycle_generation,
+            )
+            action = None if offer is None else next(
+                (
+                    row
+                    for row in offer["actions"]
+                    if row["action_id"] == request.action_id
+                ),
+                None,
+            )
+            if (
+                offer is None
+                or offer.get("offer_id") != request.offer_id
+                or offer.get("offer_revision") != request.offer_revision
+                or action is None
+                or action.get("enabled") is not True
+            ):
+                reject(
+                    ProgramRunnerError(
+                        "cycle_recovery_offer_stale",
+                        "recovery offer or selected action is no longer current",
+                    )
+                )
+            intervention = self._owner.intervention(program_run_id)
+            if intervention is None:
+                reject(
+                    ProgramRunnerError(
+                        "cycle_recovery_offer_stale",
+                        "held Program attempt is no longer current",
+                    )
+                )
+            controls = self._controls(program_run_id)
+            effect_started = False
+            owner_effect_accepted = False
+
+            def unresolved(error: Exception) -> NoReturn:
+                try:
+                    journal.require_reconciliation(
+                        expected_generation=cycle.cycle_generation
+                    )
+                except Exception:
+                    pass
+                # Keep the request in-progress. The same request identity is
+                # the only safe key for later owner reconciliation.
+                raise ProgramRunnerError(
+                    "program_cycle_reconciliation_required",
+                    str(error) or type(error).__name__,
+                ) from error
+
+            try:
+                owner_result = None
+                cycle_resumed = False
+                controls.require_audit_capacity(
+                    events=(
+                        1
+                        if request.action_id == "acknowledge_and_continue"
+                        else 2
+                    )
+                )
+                if request.action_id == "retry_runtime_step":
+                    effect_started = True
+                    snapshot = self._host.resume_recovery(
+                        program_run_id,
+                        node_attempt_id=intervention.identity.node_attempt_id,
+                        action="retry",
+                    )
+                    controls.note_retry(intervention.identity.node_instance_id)
+                    cycle_resumed = True
+                else:
+                    effect_started = True
+                    owner_result = self._owner.apply_owner_recovery(
+                        program_run_id,
+                        node_attempt_id=intervention.identity.node_attempt_id,
+                        action=request.action_id,
+                        request_id=request.request_id,
+                        reason=request.reason,
+                    )
+                    if owner_result.get("accepted") is not True:
+                        # The owner returned a durable, explicit no-effect
+                        # result. It is safe to retain as an ordinary rejection.
+                        effect_started = False
+                        error = owner_result.get("error")
+                        code = (
+                            error.get("code")
+                            if isinstance(error, Mapping)
+                            and isinstance(error.get("code"), str)
+                            else "cycle_recovery_action_rejected"
+                        )
+                        message = (
+                            error.get("message")
+                            if isinstance(error, Mapping)
+                            and isinstance(error.get("message"), str)
+                            else "addressed owner rejected recovery"
+                        )
+                        reject(ProgramRunnerError(code, message))
+                    owner_effect_accepted = True
+                    if request.action_id == "acknowledge_and_continue":
+                        snapshot = self._owner.note_runtime_control_change(
+                            program_run_id
+                        )
+                    else:
+                        snapshot = self._host.resume_recovery(
+                            program_run_id,
+                            node_attempt_id=(
+                                intervention.identity.node_attempt_id
+                            ),
+                            action="retry",
+                        )
+                        controls.note_retry(
+                            intervention.identity.node_instance_id
+                        )
+                        cycle_resumed = True
+                controls.audit_value(
+                    "cycle_recovery_action_applied",
+                    offer_id=request.offer_id,
+                    action_id=request.action_id,
+                    node_instance_id=intervention.identity.node_instance_id,
+                    node_attempt_id=intervention.identity.node_attempt_id,
+                    cycle_resumed=cycle_resumed,
+                )
+                projected = self._project_run(snapshot.to_dict())
+                result = {
+                    "schema_version": "manyforge.cycle_recovery_result.v2",
+                    "request_id": request.request_id,
+                    "accepted": True,
+                    "action_id": request.action_id,
+                    "cycle_resumed": cycle_resumed,
+                    "result_code": "accepted",
+                    "owner_result": owner_result,
+                    "run": projected,
+                    "runtime_controls": self.read_runtime_controls(
+                        program_run_id
+                    ),
+                    "recovery_offer": self._recovery_offer(
+                        program_run_id,
+                        cycle_generation=cycle.cycle_generation,
+                    ),
+                }
+                journal.complete_control_request(
+                    owner_epoch=request.request_owner_epoch,
+                    request_id=request.request_id,
+                    result=result,
+                    run_snapshot=projected,
+                )
+                return result
+            except ProgramRunnerError as error:
+                if effect_started:
+                    unresolved(error)
+                raise
+            except ProgramSchedulingError as error:
+                # resume_recovery checks capacity and owner state before its
+                # atomic transition, so its direct rejection is a no-effect.
+                # After an addressed owner action, however, that owner effect
+                # has already succeeded and the combined outcome is unknown.
+                if effect_started and request.action_id != "retry_runtime_step":
+                    unresolved(error)
+                reject(
+                    ProgramRunnerError(
+                        "program_run_scheduling_failed", str(error)
+                    )
+                )
+            except ProgramRunOwnerOutcomeUnknownError as error:
+                unresolved(error)
+            except (ProgramRunOwnerError, ProgramRuntimeControlError) as error:
+                if owner_effect_accepted or (
+                    effect_started
+                    and isinstance(error, ProgramRuntimeControlError)
+                ):
+                    unresolved(error)
+                reject(
+                    ProgramRunnerError(
+                        getattr(error, "code", "cycle_recovery_action_rejected"),
+                        str(error),
+                    )
+                )
+            except Exception as error:
+                unresolved(error)
 
     def stop_run(
         self,
@@ -1178,7 +2604,7 @@ class ProgramRuntime:
                 program_run_id,
                 reason=request.reason,
             )
-            result = snapshot.to_dict()
+            result = self._project_run(snapshot.to_dict())
         except ProgramRunOwnerError as error:
             outcome = ProgramRunnerError("program_run_not_found", str(error))
         except ProgramSchedulingError as error:
@@ -1279,6 +2705,13 @@ class ProgramRuntime:
                         "Reset does not identify the exact terminal Program cycle",
                     )
                 )
+            if not self._cycle_terminal_evidence_is_exact(journal, cycle):
+                reject(
+                    ProgramRunnerError(
+                        "program_cycle_settlement_invalid",
+                        "Program-cycle terminal evidence is incomplete or invalid",
+                    )
+                )
             intent = claim.get("intent")
             if not isinstance(intent, dict):
                 reject(
@@ -1352,6 +2785,9 @@ class ProgramRuntime:
                         "Program-cycle release outcome is unresolved",
                     )
                 )
+            controls = self._optional_controls(request.program_run_id)
+            if controls is not None:
+                controls.mark_reset()
             result = {
                 "schema_version": "manyforge.program_cycle_reset_result.v1",
                 "program_run_id": request.program_run_id,
@@ -1359,6 +2795,9 @@ class ProgramRuntime:
                 "idle_cycle_generation": request.expected_cycle_generation + 1,
                 "settlement_reference": request.settlement_evidence_digest,
                 "admission": released,
+                "runtime_controls": (
+                    None if controls is None else controls.snapshot()
+                ),
             }
             try:
                 journal.publish_reset(

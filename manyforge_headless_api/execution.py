@@ -15,6 +15,7 @@ import rfc8785
 from .models import (
     FullStopIntentRequest,
     OperationControlRequest,
+    OperationRecoveryActionRequest,
     OperationIntentRequest,
     Pose3Request,
     PickSequencePlanningRequest,
@@ -157,6 +158,15 @@ class ExecutionPort(Protocol):
     ) -> dict[str, Any]: ...
 
     def read(self, operation_id: str) -> dict[str, Any]: ...
+
+    def operation_recovery(self, operation_id: str) -> dict[str, Any]: ...
+
+    def apply_operation_recovery(
+        self,
+        operation_id: str,
+        expected_operation_revision: int,
+        request: OperationRecoveryActionRequest,
+    ) -> dict[str, Any]: ...
 
     def plan_pick(
         self,
@@ -827,6 +837,91 @@ class ExecutionCommandClient:
             raise HeadlessApiError(
                 "execution_command_response_invalid",
                 "execution observation has no exact residency projection",
+            )
+        return response
+
+    def operation_recovery(self, operation_id: str) -> dict[str, Any]:
+        if not operation_id or len(operation_id.encode("utf-8")) > 256:
+            raise ValueError("operation_id must be bounded non-empty text")
+        response = self._exchange(
+            {
+                "api_version": EXECUTION_COMMAND_VERSION,
+                "command": "get_operation_recovery",
+                "operation_id": operation_id,
+            }
+        )
+        assessment = response.get("recovery_assessment")
+        participants = response.get("participants")
+        if response.get("ok") is True and (
+            response.get("command") != "get_operation_recovery"
+            or not isinstance(assessment, dict)
+            or assessment.get("schema_version")
+            != "manyforge.kernel_recovery_assessment.v1"
+            or type(assessment.get("assessment_revision")) is not int
+            or assessment["assessment_revision"] < 1
+            or type(assessment.get("control_command_epoch")) is not int
+            or type(assessment.get("execution_id")) is not int
+            or not isinstance(assessment.get("allowed_actions"), list)
+            or type(response.get("operation_revision")) is not int
+            or response["operation_revision"] < 1
+            or not isinstance(participants, list)
+            or not participants
+            or (
+                response.get("stop_id") is None
+                and response.get("stop_generation") is not None
+            )
+            or (
+                response.get("stop_id") is not None
+                and (
+                    not isinstance(response.get("stop_id"), str)
+                    or not response["stop_id"]
+                    or type(response.get("stop_generation")) is not int
+                    or response["stop_generation"] < 1
+                )
+            )
+        ):
+            raise HeadlessApiError(
+                "execution_command_response_invalid",
+                "native operation recovery assessment is invalid",
+            )
+        return response
+
+    def apply_operation_recovery(
+        self,
+        operation_id: str,
+        expected_operation_revision: int,
+        request: OperationRecoveryActionRequest,
+    ) -> dict[str, Any]:
+        if not operation_id or len(operation_id.encode("utf-8")) > 256:
+            raise ValueError("operation_id must be bounded non-empty text")
+        if (
+            type(expected_operation_revision) is not int
+            or not 1
+            <= expected_operation_revision
+            <= MAXIMUM_SAFE_INTEGER
+        ):
+            raise ValueError("expected operation revision is invalid")
+        response = self._exchange(
+            {
+                "api_version": EXECUTION_COMMAND_VERSION,
+                "command": "apply_operation_recovery",
+                "expected_operation_revision": expected_operation_revision,
+                "operation_id": operation_id,
+                "request": request.model_dump(mode="json"),
+            }
+        )
+        result = response.get("result")
+        if response.get("ok") is True and (
+            response.get("command") != "apply_operation_recovery"
+            or not isinstance(result, dict)
+            or result.get("request_id") != request.request_id
+            or result.get("action") != request.action
+            or type(result.get("accepted")) is not bool
+            or not isinstance(result.get("resulting_assessment"), dict)
+        ):
+            raise HeadlessApiError(
+                "execution_command_response_identity_mismatch",
+                "native operation recovery result changed request identity",
             )
         return response
 

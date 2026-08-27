@@ -160,6 +160,7 @@ struct KernelRecoveryAssessmentDTO {
   std::uint64_t stop_owner_generation = 0;
   bool backend_stop_confirmed = false;
   std::string stop_certificate_id;
+  std::uint64_t stop_certificate_revision = 0;
   /// Observation facts. `observed_state_available=false` until RT-8C wires
   /// the dedicated publication; freshness/at-rest are then fail-closed.
   bool observed_state_available = false;

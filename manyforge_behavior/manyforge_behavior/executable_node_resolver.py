@@ -252,6 +252,7 @@ def _owner_task_builder(
             value_sources=context.value_sources,
             input_resolver=_required_input_resolver(context),
             port=port,  # type: ignore[arg-type]
+            owner_port_name=port_name,
             intervention_port=context.ports.program_interventions,
             output_key_parameter=output_key_parameter,
             blackboard_read_parameters=blackboard_read_parameters,

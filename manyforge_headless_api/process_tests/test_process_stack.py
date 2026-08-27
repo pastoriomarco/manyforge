@@ -23,6 +23,9 @@ from manyforge_headless_api.program_runner_client import ProgramRunnerHttpClient
 
 CATALOG = Path("/workspace/manyforge_headless/resources/operator-alarm-catalog.v1.yaml")
 NODE_CATALOG = Path("/workspace/manyforge_behavior/resources/node_catalog.yaml")
+NODE_ENVIRONMENT_MANIFEST = Path(
+    "/workspace/manyforge_behavior/resources/node_environment_manifest.yaml"
+)
 
 
 def _required_path(name: str) -> Path:
@@ -218,6 +221,8 @@ class ProcessStack:
             str(self.program_selection_state_root),
             "--node-catalog-path",
             str(NODE_CATALOG),
+            "--node-environment-manifest-path",
+            str(NODE_ENVIRONMENT_MANIFEST),
             "--alarm-catalog-path",
             str(CATALOG),
             "--historian-database-path",
@@ -681,10 +686,6 @@ def _composer_snapshot_stream(
                         break
                 assert isinstance(last_payload, dict)
                 if last_payload.get("complete") is True:
-                    # The server registers the exact client barrier immediately
-                    # after the send completes. Give that loop iteration time to
-                    # publish it, within the 250 ms snapshot period.
-                    time.sleep(0.01)
                     return last_payload
             raise RuntimeError(
                 f"Composer did not publish a complete snapshot: {last_payload!r}"
@@ -697,16 +698,12 @@ def _composer_fence(
     snapshot: dict,
     *,
     request_id: str,
-    client_id: str = "process-test-browser",
 ) -> dict:
     draft_identity = snapshot["draft_identity"]
     admission = snapshot["authoring_admission"]
     return {
         "draftId": draft_identity["draft_id"],
         "expectedDraftRevision": draft_identity["draft_revision"],
-        "clientId": client_id,
-        "snapshotReceiverEpoch": snapshot["receiver_epoch"],
-        "snapshotSequence": snapshot["snapshot_sequence"],
         "expectedAdmissionGeneration": admission["admission_generation"],
         "requestOwnerEpoch": "composer.process.epoch.1",
         "requestId": request_id,
@@ -1247,6 +1244,48 @@ def test_real_program_apply_reuses_active_deployment_and_survives_api_restart(
                     client.program_applied()
                 assert absent.value.code == "program_applied_selection_not_found"
 
+                unloaded_draft = composer.request("GET", "/api/program/draft")
+                for attempt in range(8):
+                    assert composer.request(
+                        "GET", "/api/program/draft"
+                    ) == unloaded_draft
+                    load_snapshot = _matching_composer_snapshot(
+                        next_snapshot, unloaded_draft
+                    )
+                    try:
+                        loaded = composer.request(
+                            "POST",
+                            "/api/scenarios/load",
+                            body={
+                                **_composer_fence(
+                                    load_snapshot,
+                                    request_id=(
+                                        f"program-apply.process.load.{attempt}"
+                                    ),
+                                ),
+                                "scenarioId": "program_apply_fixture",
+                                "scenarioCatalogRevision": scenarios[
+                                    "scenario_catalog_revision"
+                                ],
+                                "confirmDiscard": False,
+                            },
+                        )
+                        break
+                    except HeadlessClientError as error:
+                        if (
+                            error.code
+                            not in {
+                                "authoring_not_ready",
+                                "stale_generation",
+                            }
+                            or attempt == 7
+                        ):
+                            raise
+                assert loaded["status"] == "loaded"
+                assert client.program_applied()["scenario_id"] == (
+                    "program_apply_fixture"
+                )
+
                 initial_draft = composer.request("GET", "/api/program/draft")
                 for attempt in range(8):
                     assert composer.request(
@@ -1320,11 +1359,7 @@ def test_real_program_apply_reuses_active_deployment_and_survives_api_restart(
                                 **_composer_fence(
                                     apply_snapshot,
                                     request_id=f"program-apply.process.1.{attempt}",
-                                ),
-                                "scenarioId": "program_apply_fixture",
-                                "scenarioCatalogRevision": scenarios[
-                                    "scenario_catalog_revision"
-                                ],
+                                )
                             },
                         )
                         break
@@ -1392,14 +1427,7 @@ def test_real_program_apply_reuses_active_deployment_and_survives_api_restart(
                                         request_id=(
                                             f"program-apply.process.2.{attempt}"
                                         ),
-                                        client_id=(
-                                            "process-test-browser-restarted"
-                                        ),
-                                    ),
-                                    "scenarioId": "program_apply_fixture",
-                                    "scenarioCatalogRevision": scenarios[
-                                        "scenario_catalog_revision"
-                                    ],
+                                    )
                                 },
                             )
                             break

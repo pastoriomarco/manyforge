@@ -17,17 +17,13 @@ from .assistant_catalog_narrowing import (
 )
 from .assistant_mode_client import (
     ActiveAssistantModeProjectionError,
-    read_active_assistant_mode,
+    read_active_assistant_context,
 )
 from .assistant_provider_client import AssistantProviderClientError
 from .node_environment_client import (
     ActiveNodeEnvironmentProjectionError,
-    read_active_node_environment,
 )
-from .source_model_client import (
-    ActiveSourceModelProjectionError,
-    read_active_source_model,
-)
+from .source_model_client import ActiveSourceModelProjectionError
 from .state import ComposerState
 
 
@@ -148,15 +144,13 @@ def create_assistant_router(state: ComposerState) -> APIRouter:
         try:
             requested_tools = normalize_requested_tools(body.requested_tools)
             field_policy = normalize_field_policy(body.field_policy)
-            node_environment = read_active_node_environment(state)
-            source_model = read_active_source_model(
-                state, node_environment=node_environment
-            )
-            assistant_mode = read_active_assistant_mode(
+            context = read_active_assistant_context(
                 state,
                 mode=body.assistant_mode,
-                node_environment=node_environment,
             )
+            node_environment = context.node_environment
+            source_model = context.source_model
+            assistant_mode = context.assistant_mode
             resolved_catalog = resolve_assistant_catalog(
                 assistant_mode.payload,
                 requested_tools=requested_tools,

@@ -1714,7 +1714,11 @@ const SceneViewerBridge = memo(function SceneViewerBridge({
           : [];
       })}
       robotControlSurface={(
-        <RobotControlPanelView enabled={runtimeEnabled} controller={robotControl} />
+        <RobotControlPanelView
+          enabled={runtimeEnabled}
+          controller={robotControl}
+          program={programRuntime}
+        />
       )}
       robotControlBlocked={robotControl.state.phase === 'blocked'}
       objectControlSurface={objectControlSurface}

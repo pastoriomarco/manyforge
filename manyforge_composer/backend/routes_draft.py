@@ -134,6 +134,15 @@ class DraftMutationRequest(_DraftFence):
     arguments: dict[str, Any]
 
 
+class RuntimeOverrideMaterializationRequest(_DraftFence):
+    program_run_id: str = Field(
+        alias="programRunId", min_length=1, max_length=256
+    )
+    proposal_id: str = Field(
+        alias="proposalId", pattern=r"^sha256:[0-9a-f]{64}$"
+    )
+
+
 class OpenDraftRequest(_DraftFence):
     path: str = Field(min_length=1, max_length=4096)
     confirm_discard: bool = Field(default=False, alias="confirmDiscard")
@@ -441,6 +450,74 @@ def create_draft_router(state: ComposerState) -> APIRouter:
                 catalog=state.node_catalog,
                 draft_id=body.draft_id,
             )
+        elif operation_kind == "materialize_runtime_override":
+            assert isinstance(body, RuntimeOverrideMaterializationRequest)
+            if state.headless_client is None:
+                raise DraftSessionError(
+                    "program_runtime_promotion_unavailable",
+                    "runtime promotion requires the current Program Runner",
+                    status_code=503,
+                )
+            try:
+                projection = state.headless_client.program_runtime_controls(
+                    body.program_run_id
+                )
+            except HeadlessClientError as error:
+                raise headless_client_http_exception(error) from error
+            controls = projection.get("runtime_controls")
+            proposals = (
+                controls.get("promotion_proposals")
+                if isinstance(controls, dict)
+                else None
+            )
+            proposal = next(
+                (
+                    row
+                    for row in proposals
+                    if isinstance(row, dict)
+                    and row.get("proposal_id") == body.proposal_id
+                ),
+                None,
+            ) if isinstance(proposals, list) else None
+            if (
+                projection.get("program_run_id") != body.program_run_id
+                or not isinstance(proposal, dict)
+                or proposal.get("status") != "ready"
+                or proposal.get("program_run_id") != body.program_run_id
+                or proposal.get("expected_draft_id") != body.draft_id
+                or proposal.get("expected_draft_revision")
+                != body.expected_draft_revision
+                or not isinstance(proposal.get("node_instance_id"), str)
+                or not isinstance(proposal.get("node_id"), str)
+                or not isinstance(proposal.get("parameter_id"), str)
+                or "value" not in proposal
+            ):
+                raise DraftSessionError(
+                    "program_runtime_promotion_stale",
+                    "runtime promotion no longer names this exact idle Draft",
+                    status_code=409,
+                )
+            arguments = {
+                "instance_id": proposal["node_instance_id"],
+                "expected_node_id": proposal["node_id"],
+                "parameters": {
+                    proposal["parameter_id"]: deepcopy(proposal["value"])
+                },
+                "merge": True,
+            }
+            state.draft_session.preview_mutation(
+                tool_id="tree_draft_update_node_params",
+                arguments=arguments,
+                expected_revision=body.expected_draft_revision,
+                catalog=state.node_catalog,
+                draft_id=body.draft_id,
+            )
+            prepared.update(
+                {
+                    "runtime_promotion": deepcopy(proposal),
+                    "runtime_promotion_arguments": arguments,
+                }
+            )
         elif operation_kind in {"new_draft", "open_draft"}:
             state.draft_session.require_replace_allowed(
                 draft_id=body.draft_id,
@@ -658,6 +735,14 @@ def create_draft_router(state: ComposerState) -> APIRouter:
                 effect=execute_effect,
                 post_image=state.draft_session.retained_state,
                 prepare_effect=prepare,
+                after_release=(
+                    lambda: state.prepare_current_applied_scene(
+                        request_owner_epoch=body.request_owner_epoch,
+                        request_id=body.request_id,
+                    )
+                    if operation_kind in {"apply_draft", "revert_draft"}
+                    else None
+                ),
             )
         except (DraftSessionError, ProgramArtifactError) as error:
             _raise_workspace_error(error)
@@ -719,6 +804,30 @@ def create_draft_router(state: ComposerState) -> APIRouter:
         except Exception as error:
             _raise_workspace_error(error)
         return {
+            "mutation": result.mutation,
+            "details": result.details,
+            "workspace": _workspace(state),
+        }
+
+    @router.post("/api/program/draft/runtime-override-promotions")
+    @authoring_gate
+    def materialize_runtime_override(
+        body: RuntimeOverrideMaterializationRequest,
+    ) -> dict[str, Any]:
+        prepared = active_authoring_effect()
+        proposal = prepared["runtime_promotion"]
+        try:
+            result = state.draft_session.mutate(
+                tool_id="tree_draft_update_node_params",
+                arguments=prepared["runtime_promotion_arguments"],
+                expected_revision=body.expected_draft_revision,
+                catalog=state.node_catalog,
+                draft_id=body.draft_id,
+            )
+        except Exception as error:
+            _raise_workspace_error(error)
+        return {
+            "proposalId": proposal["proposal_id"],
             "mutation": result.mutation,
             "details": result.details,
             "workspace": _workspace(state),

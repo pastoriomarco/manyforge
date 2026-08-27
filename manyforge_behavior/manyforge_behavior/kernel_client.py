@@ -16,6 +16,15 @@ class HeadlessExecutionTransport(Protocol):
 
     def operation(self, operation_id: str) -> dict[str, Any]: ...
 
+    def operation_recovery(self, operation_id: str) -> dict[str, Any]: ...
+
+    def apply_operation_recovery(
+        self,
+        operation_id: str,
+        expected_operation_revision: int,
+        body: Mapping[str, Any],
+    ) -> dict[str, Any]: ...
+
     def pause_operation(
         self, operation_id: str, body: Mapping[str, Any]
     ) -> dict[str, Any]: ...
@@ -218,6 +227,61 @@ class KernelClient:
                 ) from exc
             raise
         return self._successful(response, label="observation")
+
+    def recovery_assessment(self, operation_id: str) -> dict[str, Any]:
+        method = getattr(self._transport, "operation_recovery", None)
+        if not callable(method):
+            raise TypeError(
+                "execution transport has no callable operation_recovery"
+            )
+        response = self._successful(
+            method(operation_id), label="recovery assessment"
+        )
+        assessment = response.get("recovery_assessment")
+        if not isinstance(assessment, dict):
+            raise KernelClientResponseError(
+                "headless recovery assessment has no owner projection"
+            )
+        revision = response.get("operation_revision")
+        participants = response.get("participants")
+        if (
+            type(revision) is not int
+            or revision < 1
+            or not isinstance(participants, list)
+            or not participants
+        ):
+            raise KernelClientResponseError(
+                "headless recovery assessment has no exact operation scope"
+            )
+        return {
+            **assessment,
+            "operation_revision": revision,
+            "participants": participants,
+            "stop_id": response.get("stop_id"),
+            "stop_generation": response.get("stop_generation"),
+        }
+
+    def recover(
+        self,
+        operation_id: str,
+        expected_operation_revision: int,
+        request: Mapping[str, Any],
+    ) -> dict[str, Any]:
+        method = getattr(self._transport, "apply_operation_recovery", None)
+        if not callable(method):
+            raise TypeError(
+                "execution transport has no callable apply_operation_recovery"
+            )
+        response = self._successful(
+            method(operation_id, expected_operation_revision, request),
+            label="recovery action",
+        )
+        result = response.get("result")
+        if not isinstance(result, dict):
+            raise KernelClientResponseError(
+                "headless recovery action has no owner result"
+            )
+        return result
 
     def pause(
         self, operation_id: str, request: Mapping[str, Any]

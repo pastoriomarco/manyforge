@@ -32,8 +32,16 @@ from .models import (
     ProgramModelAttemptRequest,
     ProgramRunStartRequest,
     ProgramRunStopRequest,
+    ProgramScenePreparationRequest,
     ProgramCycleResetRequest,
+    CycleRecoveryActionRequest,
+    ManualResultStageRequest,
+    RuntimeBlackboardWriteRequest,
+    RuntimeOverrideActionRequest,
+    RuntimeOverridePromotionRequest,
+    RuntimeOverrideStageRequest,
     OperationControlRequest,
+    OperationRecoveryActionRequest,
     OperationIntentRequest,
     PickSequencePlanningRequest,
     PlaceSequencePlanningRequest,
@@ -218,6 +226,7 @@ def _error_status(code: str) -> int:
         "cclc_open_response_invalid",
         "cclc_open_response_identity_mismatch",
         "node_environment_projection_invalid",
+        "assistant_mode_context_invalid",
         "source_model_context_invalid",
         "program_apply_active_selection_invalid",
         "program_apply_baseline_binding_invalid",
@@ -642,6 +651,12 @@ def create_app(
     def program_run_start(request: ProgramRunStartRequest) -> dict[str, Any]:
         return service.program_run_start(request)
 
+    @app.post("/api/program/scene-preparations")
+    def program_scene_prepare(
+        request: ProgramScenePreparationRequest,
+    ) -> dict[str, Any]:
+        return service.program_scene_prepare(request)
+
     @app.get("/api/program/runs/{program_run_id}")
     def program_run_read(
         program_run_id: Annotated[str, Path(min_length=1, max_length=256)],
@@ -660,7 +675,7 @@ def create_app(
             )
         return service.program_run_stop(program_run_id, request)
 
-    @app.get("/api/program/cycle/status")
+    @app.get("/api/cycle/status")
     def program_cycle_status() -> dict[str, Any]:
         return service.program_cycle_status()
 
@@ -669,6 +684,85 @@ def create_app(
         request: ProgramCycleResetRequest,
     ) -> dict[str, Any]:
         return service.program_cycle_reset(request)
+
+    @app.get("/api/program/runs/{program_run_id}/runtime-controls")
+    def program_runtime_controls(
+        program_run_id: Annotated[str, Path(min_length=1, max_length=256)],
+    ) -> dict[str, Any]:
+        return service.program_runtime_controls(program_run_id)
+
+    def require_control_path(program_run_id: str, request: Any) -> None:
+        if request.program_run_id != program_run_id:
+            raise HeadlessApiError(
+                "program_run_path_invalid",
+                "Program-run identity in path and body must match",
+            )
+
+    @app.post("/api/program/runs/{program_run_id}/runtime-overrides")
+    def stage_runtime_override(
+        program_run_id: Annotated[str, Path(min_length=1, max_length=256)],
+        request: RuntimeOverrideStageRequest,
+    ) -> dict[str, Any]:
+        require_control_path(program_run_id, request)
+        return service.program_runtime_control_action(
+            program_run_id, "runtime-overrides", request
+        )
+
+    @app.post("/api/program/runs/{program_run_id}/runtime-overrides/activate")
+    def activate_runtime_override(
+        program_run_id: Annotated[str, Path(min_length=1, max_length=256)],
+        request: RuntimeOverrideActionRequest,
+    ) -> dict[str, Any]:
+        require_control_path(program_run_id, request)
+        return service.program_runtime_control_action(
+            program_run_id, "runtime-overrides/activate", request
+        )
+
+    @app.post("/api/program/runs/{program_run_id}/runtime-overrides/clear")
+    def clear_runtime_override(
+        program_run_id: Annotated[str, Path(min_length=1, max_length=256)],
+        request: RuntimeOverrideActionRequest,
+    ) -> dict[str, Any]:
+        require_control_path(program_run_id, request)
+        return service.program_runtime_control_action(
+            program_run_id, "runtime-overrides/clear", request
+        )
+
+    @app.post("/api/program/runs/{program_run_id}/runtime-overrides/promote")
+    def promote_runtime_override(
+        program_run_id: Annotated[str, Path(min_length=1, max_length=256)],
+        request: RuntimeOverridePromotionRequest,
+    ) -> dict[str, Any]:
+        require_control_path(program_run_id, request)
+        return service.program_runtime_control_action(
+            program_run_id, "runtime-overrides/promote", request
+        )
+
+    @app.post("/api/program/runs/{program_run_id}/blackboard-values")
+    def write_runtime_blackboard(
+        program_run_id: Annotated[str, Path(min_length=1, max_length=256)],
+        request: RuntimeBlackboardWriteRequest,
+    ) -> dict[str, Any]:
+        require_control_path(program_run_id, request)
+        return service.program_runtime_control_action(
+            program_run_id, "blackboard-values", request
+        )
+
+    @app.post("/api/program/runs/{program_run_id}/manual-result")
+    def stage_manual_result(
+        program_run_id: Annotated[str, Path(min_length=1, max_length=256)],
+        request: ManualResultStageRequest,
+    ) -> dict[str, Any]:
+        require_control_path(program_run_id, request)
+        return service.program_runtime_control_action(
+            program_run_id, "manual-result", request
+        )
+
+    @app.post("/api/cycle/recovery-actions")
+    def cycle_recovery_action(
+        request: CycleRecoveryActionRequest,
+    ) -> dict[str, Any]:
+        return service.cycle_recovery_action(request)
 
     def viewer_asset_response(asset: ViewerModelAsset) -> Response:
         cache_control = (
@@ -732,6 +826,15 @@ def create_app(
         ],
     ) -> dict[str, Any]:
         return service.assistant_mode(mode_id)
+
+    @app.get("/api/assistant/modes/{mode_id}/context")
+    def assistant_mode_context(
+        mode_id: Annotated[
+            str,
+            Path(min_length=1, max_length=256, pattern=r"^[a-z][a-z0-9.-]*$"),
+        ],
+    ) -> dict[str, Any]:
+        return service.assistant_mode_context(mode_id)
 
     @app.post("/api/manager/apply")
     def manager_apply(request: ManagerApplyRequest) -> JSONResponse:
@@ -818,6 +921,34 @@ def create_app(
         operation_id: Annotated[str, Path(min_length=1, max_length=256)],
     ) -> JSONResponse:
         return execution_response(service.execution_read(operation_id))
+
+    @app.get(
+        "/api/private/program-runner/execution/operations/{operation_id}/recovery"
+    )
+    def execution_operation_recovery(
+        operation_id: Annotated[str, Path(min_length=1, max_length=256)],
+    ) -> JSONResponse:
+        return execution_response(
+            service.execution_operation_recovery(operation_id)
+        )
+
+    @app.post(
+        "/api/private/program-runner/execution/operations/{operation_id}/recovery"
+    )
+    def execution_apply_operation_recovery(
+        operation_id: Annotated[str, Path(min_length=1, max_length=256)],
+        expected_operation_revision: Annotated[
+            int, Query(ge=1, le=9_007_199_254_740_991)
+        ],
+        body: OperationRecoveryActionRequest,
+    ) -> JSONResponse:
+        return execution_response(
+            service.execution_apply_operation_recovery(
+                operation_id,
+                expected_operation_revision,
+                body,
+            )
+        )
 
     @app.post("/api/execution/pick-place/plans/pick")
     def execution_plan_pick(

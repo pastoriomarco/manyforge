@@ -591,6 +591,20 @@ CanonicalValue HeadlessApiCore::SourceModelContext() {
   });
 }
 
+CanonicalValue
+HeadlessApiCore::AssistantModeContext(const std::string_view mode_id) {
+  std::lock_guard lock(mutex_);
+  Require(!shutdown_, "headless_api_closed", "headless API core is closed");
+  const auto runtime = RefreshLocked();
+  return CanonicalValue(CanonicalValue::Object{
+      {"assistant_mode", AssistantModeProjectionLocked(runtime, mode_id)},
+      {"node_environment", NodeEnvironmentProjectionLocked(runtime)},
+      {"schema_version",
+       CanonicalValue(std::string(kAssistantModeContextSchemaVersion))},
+      {"source_model", SourceModelProjectionLocked(runtime)},
+  });
+}
+
 CanonicalValue HeadlessApiCore::ScenarioCatalogProjection() {
   std::lock_guard lock(mutex_);
   Require(!shutdown_, "headless_api_closed", "headless API core is closed");

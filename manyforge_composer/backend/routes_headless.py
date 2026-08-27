@@ -28,11 +28,18 @@ from manyforge_headless_api.models import (
     ProgramRunStartRequest,
     ProgramRunStopRequest,
     ProgramCycleResetRequest,
+    CycleRecoveryActionRequest,
+    ManualResultStageRequest,
+    RuntimeBlackboardWriteRequest,
+    RuntimeOverrideActionRequest,
+    RuntimeOverridePromotionRequest,
+    RuntimeOverrideStageRequest,
 )
 
 from .node_environment_client import (
     ActiveNodeEnvironmentProjectionError,
 )
+from .draft_session import DraftSessionError
 from .source_model_client import (
     ActiveSourceModelProjectionError,
     read_active_source_model_context,
@@ -102,7 +109,11 @@ class ComposerSceneTransactionRequest(SceneTransactionRequest):
 def _translate(error: HeadlessClientError) -> HTTPException:
     return HTTPException(
         status_code=error.status_code or 503,
-        detail={"code": error.code, "message": str(error)},
+        detail={
+            "code": error.code,
+            "details": error.details,
+            "message": str(error),
+        },
     )
 
 
@@ -263,7 +274,7 @@ def create_headless_router(
             lambda: client.program_run_start(body.model_dump(mode="json"))
         )
 
-    @router.get("/api/program/cycle/status")
+    @router.get("/api/cycle/status")
     def program_cycle_status() -> dict[str, Any]:
         return _call(client.program_cycle_status)
 
@@ -271,6 +282,124 @@ def create_headless_router(
     def program_cycle_reset(body: ProgramCycleResetRequest) -> dict[str, Any]:
         return _call(
             lambda: client.program_cycle_reset(body.model_dump(mode="json"))
+        )
+
+    @router.get("/api/program/runs/{program_run_id}/runtime-controls")
+    def program_runtime_controls(
+        program_run_id: Annotated[str, Path(min_length=1, max_length=256)],
+    ) -> dict[str, Any]:
+        return _call(lambda: client.program_runtime_controls(program_run_id))
+
+    def require_control_path(program_run_id: str, body: Any) -> None:
+        if body.program_run_id != program_run_id:
+            raise HTTPException(
+                status_code=400,
+                detail={
+                    "code": "program_run_path_invalid",
+                    "message": "Program-run identity in path and body must match",
+                },
+            )
+
+    @router.post("/api/program/runs/{program_run_id}/runtime-overrides")
+    def stage_runtime_override(
+        program_run_id: Annotated[str, Path(min_length=1, max_length=256)],
+        body: RuntimeOverrideStageRequest,
+    ) -> dict[str, Any]:
+        require_control_path(program_run_id, body)
+        return _call(
+            lambda: client.program_runtime_control_action(
+                program_run_id, "runtime-overrides", body.model_dump(mode="json")
+            )
+        )
+
+    @router.post("/api/program/runs/{program_run_id}/runtime-overrides/activate")
+    def activate_runtime_override(
+        program_run_id: Annotated[str, Path(min_length=1, max_length=256)],
+        body: RuntimeOverrideActionRequest,
+    ) -> dict[str, Any]:
+        require_control_path(program_run_id, body)
+        return _call(
+            lambda: client.program_runtime_control_action(
+                program_run_id,
+                "runtime-overrides/activate",
+                body.model_dump(mode="json"),
+            )
+        )
+
+    @router.post("/api/program/runs/{program_run_id}/runtime-overrides/clear")
+    def clear_runtime_override(
+        program_run_id: Annotated[str, Path(min_length=1, max_length=256)],
+        body: RuntimeOverrideActionRequest,
+    ) -> dict[str, Any]:
+        require_control_path(program_run_id, body)
+        return _call(
+            lambda: client.program_runtime_control_action(
+                program_run_id,
+                "runtime-overrides/clear",
+                body.model_dump(mode="json"),
+            )
+        )
+
+    @router.post("/api/program/runs/{program_run_id}/runtime-overrides/promote")
+    def promote_runtime_override(
+        program_run_id: Annotated[str, Path(min_length=1, max_length=256)],
+        body: RuntimeOverridePromotionRequest,
+    ) -> dict[str, Any]:
+        require_control_path(program_run_id, body)
+        try:
+            state.draft_session.require_current(
+                draft_id=body.expected_draft_id,
+                expected_revision=body.expected_draft_revision,
+            )
+        except DraftSessionError as error:
+            raise HTTPException(
+                status_code=error.status_code,
+                detail={
+                    "code": error.code,
+                    "message": str(error),
+                    "details": error.detail,
+                },
+            ) from error
+        return _call(
+            lambda: client.program_runtime_control_action(
+                program_run_id,
+                "runtime-overrides/promote",
+                body.model_dump(mode="json"),
+            )
+        )
+
+    @router.post("/api/program/runs/{program_run_id}/blackboard-values")
+    def write_runtime_blackboard(
+        program_run_id: Annotated[str, Path(min_length=1, max_length=256)],
+        body: RuntimeBlackboardWriteRequest,
+    ) -> dict[str, Any]:
+        require_control_path(program_run_id, body)
+        return _call(
+            lambda: client.program_runtime_control_action(
+                program_run_id,
+                "blackboard-values",
+                body.model_dump(mode="json"),
+            )
+        )
+
+    @router.post("/api/program/runs/{program_run_id}/manual-result")
+    def stage_manual_result(
+        program_run_id: Annotated[str, Path(min_length=1, max_length=256)],
+        body: ManualResultStageRequest,
+    ) -> dict[str, Any]:
+        require_control_path(program_run_id, body)
+        return _call(
+            lambda: client.program_runtime_control_action(
+                program_run_id, "manual-result", body.model_dump(mode="json")
+            )
+        )
+
+    @router.post("/api/cycle/recovery-actions")
+    def cycle_recovery_action(
+        body: CycleRecoveryActionRequest,
+    ) -> dict[str, Any]:
+        return _call(
+            lambda: client.cycle_recovery_action(body.model_dump(mode="json"))
         )
 
     @router.get("/api/program/runs/{program_run_id}")

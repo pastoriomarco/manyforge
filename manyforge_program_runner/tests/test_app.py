@@ -10,6 +10,7 @@ from fastapi.testclient import TestClient
 from manyforge_headless_api.models import (
     ProgramRunStartRequest,
     ProgramRunStopRequest,
+    ProgramScenePreparationRequest,
 )
 from manyforge_program_runner.app import create_app
 from manyforge_program_runner.models import ProgramCycleResetRequest
@@ -96,6 +97,21 @@ class FakeRuntime:
         self.calls.append(("start", request))
         return _snapshot()
 
+    def prepare_applied_scene(
+        self, request: ProgramScenePreparationRequest
+    ) -> dict[str, Any]:
+        self.calls.append(("prepare_scene", request))
+        return {
+            "schema_version": "manyforge.program_scene_preparation.v1",
+            "status": "prepared",
+            "applied_record_digest": request.expected_applied_record_digest,
+            "program_revision": _DIGEST_B,
+            "admission_generation": 9,
+            "prepared_scene": {
+                "schema_version": "manyforge.prepared_program_scene.v1"
+            },
+        }
+
     def read_run(self, program_run_id: str) -> dict[str, Any]:
         self.calls.append(("read", program_run_id))
         return _snapshot()
@@ -128,6 +144,44 @@ class FakeRuntime:
             "cycle_claim_generation": None,
             "terminal_or_settlement_reference": None,
         }
+
+    def read_runtime_controls(self, program_run_id: str) -> dict[str, Any]:
+        self.calls.append(("runtime_controls", program_run_id))
+        return {"program_run_id": program_run_id}
+
+    def stage_runtime_override(self, program_run_id: str, request) -> dict[str, Any]:
+        self.calls.append(("stage_runtime_override", (program_run_id, request)))
+        return {"accepted": True}
+
+    def activate_runtime_override(
+        self, program_run_id: str, request
+    ) -> dict[str, Any]:
+        self.calls.append(("activate_runtime_override", (program_run_id, request)))
+        return {"accepted": True}
+
+    def clear_runtime_override(self, program_run_id: str, request) -> dict[str, Any]:
+        self.calls.append(("clear_runtime_override", (program_run_id, request)))
+        return {"accepted": True}
+
+    def promote_runtime_override(
+        self, program_run_id: str, request
+    ) -> dict[str, Any]:
+        self.calls.append(("promote_runtime_override", (program_run_id, request)))
+        return {"accepted": True}
+
+    def write_runtime_blackboard(
+        self, program_run_id: str, request
+    ) -> dict[str, Any]:
+        self.calls.append(("write_runtime_blackboard", (program_run_id, request)))
+        return {"accepted": True}
+
+    def stage_manual_result(self, program_run_id: str, request) -> dict[str, Any]:
+        self.calls.append(("stage_manual_result", (program_run_id, request)))
+        return {"accepted": True}
+
+    def apply_recovery_action(self, request) -> dict[str, Any]:
+        self.calls.append(("apply_recovery_action", request))
+        return {"accepted": True}
 
 
 def _caller() -> dict[str, Any]:
@@ -164,7 +218,7 @@ def test_reset_is_an_explicit_strict_cycle_transition() -> None:
 def test_cycle_status_exposes_only_program_runner_owned_facts() -> None:
     client = TestClient(create_app(FakeRuntime()))
     with client:
-        response = client.get("/api/program/cycle/status")
+        response = client.get("/api/cycle/status")
     assert response.status_code == 200
     assert set(response.json()) == {
         "program_runner_owner_epoch",
@@ -174,6 +228,7 @@ def test_cycle_status_exposes_only_program_runner_owned_facts() -> None:
         "cycle_claim_generation",
         "terminal_or_settlement_reference",
     }
+    assert client.get("/api/program/cycle/status").status_code == 404
 
 
 def test_private_surface_projects_owner_facts_and_manages_lifecycle() -> None:
@@ -196,6 +251,15 @@ def test_private_surface_projects_owner_facts_and_manages_lifecycle() -> None:
                 "expected_admission_generation": 7,
             },
         )
+        prepared = client.post(
+            "/api/program/scene-preparations",
+            json={
+                **_caller(),
+                "request_id": "request.prepare.1",
+                "expected_applied_record_digest": _DIGEST_B,
+                "expected_admission_generation": 7,
+            },
+        )
         read = client.get("/api/program/runs/program-run.1")
         stopped = client.post(
             "/api/program/runs/program-run.1/stop",
@@ -209,6 +273,8 @@ def test_private_surface_projects_owner_facts_and_manages_lifecycle() -> None:
         )
 
     assert health.status_code == 200
+    assert prepared.status_code == 200
+    assert prepared.json()["status"] == "prepared"
     assert health.json()["started"] is True
     assert index.json()["runs"][0]["capture"]["program_run_id"] == "program-run.1"
     assert started.status_code == 200
@@ -216,8 +282,9 @@ def test_private_surface_projects_owner_facts_and_manages_lifecycle() -> None:
     assert stopped.json()["state"] == "stopping"
     assert runtime.calls[0] == ("runs", (True, 7))
     assert runtime.calls[1][0] == "start"
-    assert runtime.calls[2] == ("read", "program-run.1")
-    assert runtime.calls[3][0] == "stop"
+    assert runtime.calls[2][0] == "prepare_scene"
+    assert runtime.calls[3] == ("read", "program-run.1")
+    assert runtime.calls[4][0] == "stop"
     assert runtime.closed is True
 
 
@@ -270,6 +337,7 @@ def test_private_surface_preserves_stable_owner_error_codes() -> None:
     assert response.json() == {
         "detail": {
             "code": "program_run_not_found",
+            "details": {},
             "message": "unknown Program run missing",
         }
     }

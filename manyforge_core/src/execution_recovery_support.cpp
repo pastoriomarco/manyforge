@@ -536,6 +536,8 @@ KernelRecoveryAssessmentDTO build_recovery_assessment(
         break;
       }
       assessment.stop_certificate_id = certificate->certificate_id;
+      assessment.stop_certificate_revision =
+          certificate->certificate_revision;
       assessment.backend_stop_confirmed = certificate->backend_stop_confirmed;
       if (const char* observation_reason = require_qualified_observation()) {
         assessment.status = RecoveryAssessmentStatus::kWaiting;
@@ -657,6 +659,8 @@ KernelRecoveryAssessmentDTO build_recovery_assessment(
         break;
       }
       assessment.stop_certificate_id = certificate->certificate_id;
+      assessment.stop_certificate_revision =
+          certificate->certificate_revision;
       assessment.backend_stop_confirmed = certificate->backend_stop_confirmed;
       assessment.status = RecoveryAssessmentStatus::kRetryReady;
       assessment.retry_admissible = true;
@@ -694,6 +698,8 @@ bool recovery_assessment_semantically_differs(
          previous.stop_owner_generation != next.stop_owner_generation ||
          previous.backend_stop_confirmed != next.backend_stop_confirmed ||
          previous.stop_certificate_id != next.stop_certificate_id ||
+         previous.stop_certificate_revision !=
+             next.stop_certificate_revision ||
          previous.observed_state_available !=
              next.observed_state_available ||
          previous.observed_state_fresh != next.observed_state_fresh ||
@@ -732,6 +738,8 @@ RecoveryAssessmentPublication prepare_recovery_assessment_publication(
       {"reason_code", next.reason_code},
       {"retry_admissible", next.retry_admissible ? "true" : "false"},
       {"stop_certificate_id", next.stop_certificate_id},
+      {"stop_certificate_revision",
+       std::to_string(next.stop_certificate_revision)},
       {"latch_id", next.latch_id},
       {"source_id", next.source_id},
       {"policy_id", next.policy_id},

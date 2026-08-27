@@ -382,6 +382,35 @@ def test_transport_independent_commit_replays_without_second_claim(tmp_path) -> 
     assert conflict.value.detail["code"] == "composer_authoring_request_id_conflict"
 
 
+def test_post_release_followup_runs_only_after_durable_release_and_on_replay(
+    tmp_path,
+) -> None:
+    headless = _Headless()
+    coordinator = AuthoringAdmissionCoordinator(headless, tmp_path)  # type: ignore[arg-type]
+    coordinator.recover()
+    envelope = _envelope(coordinator, "activation")
+    observations: list[int] = []
+
+    def after_release() -> None:
+        observations.append(len(headless.settlements))
+
+    arguments = {
+        "operation_kind": "apply_draft",
+        "draft_id": "draft.1",
+        "draft_revision": 3,
+        "payload": {"operation": "apply"},
+        "effect": lambda _claim: {"applied": True},
+        "post_image": lambda: {"draft_id": "draft.1", "revision": 3},
+        "after_release": after_release,
+    }
+    assert coordinator.execute(envelope, **arguments) == {"applied": True}
+    assert observations == [1]
+
+    assert coordinator.execute(envelope, **arguments) == {"applied": True}
+    assert observations == [1, 1]
+    assert len(headless.claims) == 1
+
+
 def test_owner_proven_external_rejection_settles_and_replays_exactly(
     tmp_path,
 ) -> None:

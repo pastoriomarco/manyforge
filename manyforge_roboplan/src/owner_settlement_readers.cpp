@@ -154,6 +154,56 @@ OpenReadOnly(const std::filesystem::path &path) {
   return ci::sha256_digest(preimage);
 }
 
+[[nodiscard]] bool ProgramStartSettlementMatches(
+    std::string_view encoded, const core::CellAdmissionClaimDTO &claim,
+    std::string_view program_run_id, std::string_view reference) {
+  const auto settlement = ci::parse_canonical_json(encoded);
+  const auto kind = StringMember(settlement, "kind");
+  if (StringMember(settlement, "schema_version") !=
+          "manyforge.program_cycle_start_settlement.v1" ||
+      (kind != "proven_no_effect" && kind != "terminal_effects_settled") ||
+      DecodeCellAdmissionClaim(ci::canonical_json(Member(settlement, "claim"))) !=
+          claim ||
+      StringMember(Member(settlement, "prepared_scene"), "schema_version") !=
+          "manyforge.prepared_program_scene.v1" ||
+      StringMember(settlement, "program_run_id") != program_run_id ||
+      ci::sha256_digest(ci::canonical_json(settlement)) != reference)
+    return false;
+  if (kind == "proven_no_effect")
+    return true;
+  const auto &terminal = Member(settlement, "terminal_run");
+  const auto state = StringMember(terminal, "state");
+  return (state == "stopped" || state == "succeeded" || state == "failed") &&
+         StringMember(Member(terminal, "capture"), "program_run_id") ==
+             program_run_id;
+}
+
+[[nodiscard]] bool ProgramTerminalSnapshotMatches(
+    sqlite3 *database, std::string_view program_run_id,
+    std::string_view reference) {
+  Statement history(
+      database,
+      "SELECT snapshot_json,terminal FROM program_run_history "
+      "WHERE program_run_id=?");
+  history.Bind(1, program_run_id);
+  if (!history.Step() || history.Integer(1) != 1)
+    return false;
+  const auto snapshot = ci::parse_canonical_json(history.Text(0));
+  const auto state = StringMember(snapshot, "state");
+  const auto retained_id =
+      StringMember(Member(snapshot, "capture"), "program_run_id");
+  const std::string preimage =
+      "{\"program_run_id\":" +
+      ci::canonical_json(ci::CanonicalValue(std::string(program_run_id))) +
+      ",\"run_revision\":" +
+      ci::canonical_json(Member(snapshot, "run_revision")) +
+      ",\"state\":" +
+      ci::canonical_json(ci::CanonicalValue(state)) + "}";
+  return retained_id == program_run_id &&
+         (state == "stopped" || state == "succeeded" || state == "failed") &&
+         ci::sha256_digest(preimage) == reference && !history.Step();
+}
+
 struct RoleReplacement final {
   core::RequestOwnerEpoch predecessor;
   core::RequestOwnerEpoch successor;
@@ -285,23 +335,31 @@ core::Result<void> ValidateProgramCycleSettlementReadOnly(
     Statement metadata(
         database.get(),
         "SELECT schema_version FROM program_cycle_metadata WHERE singleton=1");
-    if (!metadata.Step() || metadata.Integer(0) != 1 || metadata.Step())
+    if (!metadata.Step() || metadata.Integer(0) != 3 || metadata.Step())
       throw std::runtime_error("Program-cycle journal schema differs");
     Statement row(
         database.get(),
-        "SELECT state,owner_epoch,claim_json,terminal_reference,"
-        "release_intent_json,reconciliation_required,acquisition_pending_json "
+        "SELECT state,owner_epoch,program_run_id,claim_json,terminal_reference,"
+        "start_settlement_json,release_intent_json,reconciliation_required,"
+        "acquisition_pending_json "
         "FROM program_cycle WHERE singleton=1");
     if (!row.Step())
       throw std::runtime_error("Program-cycle owner row is absent");
-    const auto retained_claim = DecodeCellAdmissionClaim(row.Text(2));
+    const auto retained_claim = DecodeCellAdmissionClaim(row.Text(3));
     const auto retained_release =
-        DecodeCellAdmissionClaimRelease(row.Text(4));
+        DecodeCellAdmissionClaimRelease(row.Text(6));
+    const auto evidence_matches =
+        row.IsNull(5)
+            ? ProgramTerminalSnapshotMatches(database.get(), row.Text(2),
+                                             row.Text(4))
+            : ProgramStartSettlementMatches(row.Text(5), claim, row.Text(2),
+                                            row.Text(4));
     const bool valid = row.Text(0) == "terminal_awaiting_reset" &&
                        row.Text(1) == claim.intent.owner_epoch.value() &&
                        retained_claim == claim && retained_release == release &&
-                       row.Text(3) == release.settlement.evidence_digest.value() &&
-                       row.Integer(5) == 0 && row.IsNull(6) && !row.Step();
+                       row.Text(4) == release.settlement.evidence_digest.value() &&
+                       evidence_matches && row.Integer(7) == 0 && row.IsNull(8) &&
+                       !row.Step();
     Exec(database.get(), "COMMIT");
     if (!valid)
       return Rejected("Program-cycle",

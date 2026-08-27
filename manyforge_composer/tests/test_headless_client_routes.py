@@ -363,7 +363,7 @@ def headless_client() -> (
                     "admission_generation": 8,
                 }
             }
-        elif path == "/api/program/cycle/status":
+        elif path == "/api/cycle/status":
             payload = {
                 "schema_version": "manyforge.program_cycle_status.v1",
                 "state": "idle",
@@ -633,6 +633,29 @@ def headless_client() -> (
                 "status": "applied",
                 "preparation": {},
                 "applied": committed_program,
+            }
+        elif path == "/api/program/scene-preparations":
+            assert applied_program is not None
+            assert body["expected_applied_record_digest"] == (
+                applied_program["source"]["record_digest"]
+            )
+            payload = {
+                "schema_version": "manyforge.program_scene_preparation.v1",
+                "status": "prepared",
+                "applied_record_digest": applied_program["source"][
+                    "record_digest"
+                ],
+                "program_revision": applied_program["program_revision"],
+                "admission_generation": body[
+                    "expected_admission_generation"
+                ],
+                "prepared_scene": {
+                    "schema_version": "manyforge.prepared_program_scene.v1",
+                    "applied_record_digest": applied_program["source"][
+                        "record_digest"
+                    ],
+                    "program_revision": applied_program["program_revision"],
+                },
             }
         elif path == "/api/assistant/modes":
             payload = {
@@ -1721,6 +1744,16 @@ def test_composer_program_apply_advances_only_headless_applied_identity(
     assert forwarded[0]["body"]["expected_applied_record_digest"] == (
         "sha256:" + "6" * 64
     )
+    prepared = [
+        request
+        for request in requests[request_offset:]
+        if request["path"] == "/api/program/scene-preparations"
+    ]
+    assert len(prepared) == 1
+    assert prepared[0]["body"]["expected_applied_record_digest"] == (
+        "sha256:" + "6" * 64
+    )
+    assert requests.index(forwarded[0]) < requests.index(prepared[0])
 
 
 def test_new_program_rotates_fenced_draft_without_disk_or_headless_mutation(
@@ -2342,7 +2375,7 @@ def test_composer_websocket_streams_owner_snapshots_only(
     } == {
         "/api/runtime",
         "/api/execution/alarms",
-        "/api/program/cycle/status",
+        "/api/cycle/status",
     }
     alarm_request = next(
         item for item in requests if item["path"] == "/api/execution/alarms"

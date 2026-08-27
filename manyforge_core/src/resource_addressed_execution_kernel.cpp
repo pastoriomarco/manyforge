@@ -1252,6 +1252,14 @@ struct ResourceAddressedExecutionKernel::StopFaultRecoveryReplayEntry final {
   StopFaultRecoveryResultDTO result;
 };
 
+struct ResourceAddressedExecutionKernel::OperationRecoveryReplayEntry final {
+  OperationId operation_id;
+  OperationRevision operation_revision{0U};
+  KernelRecoveryActionRequestDTO request;
+  KernelRecoveryActionResultDTO result;
+  bool outcome_unresolved{false};
+};
+
 struct ResourceAddressedExecutionKernel::PartialDispatchStopScope final {
   OperationId operation_id;
   OperationRevision operation_revision{0U};
@@ -2408,6 +2416,7 @@ ResourceAddressedExecutionKernel::ResourceAddressedExecutionKernel(
   full_stop_replay_ledger_.reserve(config_.request_replay_capacity);
   runtime_scale_replay_ledger_.reserve(config_.request_replay_capacity);
   stop_fault_recovery_replay_ledger_.reserve(config_.request_replay_capacity);
+  operation_recovery_replay_ledger_.reserve(config_.request_replay_capacity);
   stop_terminal_history_.reserve(kMaximumResidentStopTerminalRecords);
   for (std::size_t index = 0U; index < stop_transactions_.size(); ++index) {
     stop_transactions_[index] = std::make_unique<StopTransaction>();
@@ -9274,6 +9283,231 @@ Result<OperationReadProjectionDTO> ResourceAddressedExecutionKernel::get_operati
   }
   return reject<OperationReadProjectionDTO>("operation is not resident or retained",
                                             "operation_not_resident", ErrorCode::kMissingReference);
+}
+
+Result<OperationRecoveryProjectionDTO>
+ResourceAddressedExecutionKernel::get_operation_recovery_assessment(
+    const OperationId& operation_id) const {
+  if (operation_id.empty()) {
+    return reject<OperationRecoveryProjectionDTO>(
+        "operation identity is empty", "operation_id_empty",
+        ErrorCode::kInvalidRequest);
+  }
+  IResolvedParticipantExecutionEngine* engine = nullptr;
+  OperationRevision revision(0U);
+  std::optional<StopId> stop_id;
+  std::optional<StopGeneration> stop_generation;
+  std::vector<OperationRecoveryParticipantDTO> participants;
+  {
+    std::lock_guard state_lock(state_mutex_);
+    const auto* operation = find_active_operation_locked(operation_id);
+    if (operation == nullptr || operation->participants.size() != 1U ||
+        operation->participants.front().engine == nullptr ||
+        operation->stop_effect_in_flight) {
+      return reject<OperationRecoveryProjectionDTO>(
+          "operation has no single resident recovery owner",
+          "operation_recovery_unavailable", ErrorCode::kInvalidStateTransition);
+    }
+    engine = operation->participants.front().engine;
+    revision = operation->state.operation_revision;
+    stop_id = operation->state.active_stop_id;
+    stop_generation = operation->state.active_stop_generation;
+    participants.reserve(operation->participants.size());
+    for (const auto& participant : operation->participants) {
+      const auto& binding = participant.binding.value();
+      std::optional<CapabilityProviderBindingId> provider;
+      if (binding.capability_provider_path.has_value()) {
+        provider = binding.capability_provider_path
+                       ->capability_provider_binding_id;
+      }
+      participants.push_back(OperationRecoveryParticipantDTO{
+          participant.slot_owner.participant_id,
+          binding.controllable_component_id,
+          binding.command_target_id,
+          binding.capability_id,
+          participant.slot_owner.control_domain_id,
+          participant.slot_owner.control_binding_id,
+          std::move(provider),
+          participant.slot_owner.control_route_id,
+          participant.slot_owner.active_control_configuration_id,
+          participant.slot_owner.active_control_configuration_generation,
+          participant.resources});
+    }
+  }
+  KernelRecoveryAssessmentDTO assessment;
+  try {
+    assessment = engine->get_recovery_assessment();
+  } catch (...) {
+    return reject<OperationRecoveryProjectionDTO>(
+        "participant recovery assessment is unavailable",
+        "operation_recovery_unavailable", ErrorCode::kInternalError);
+  }
+  {
+    std::lock_guard state_lock(state_mutex_);
+    const auto* operation = find_active_operation_locked(operation_id);
+    if (operation == nullptr || operation->state.operation_revision != revision ||
+        operation->state.active_stop_id != stop_id ||
+        operation->state.active_stop_generation != stop_generation ||
+        operation->stop_effect_in_flight ||
+        operation->participants.size() != 1U ||
+        operation->participants.front().engine != engine) {
+      return reject<OperationRecoveryProjectionDTO>(
+          "operation changed while its recovery assessment was read",
+          "operation_recovery_stale", ErrorCode::kStaleGeneration);
+    }
+  }
+  return Result<OperationRecoveryProjectionDTO>::Ok(
+      OperationRecoveryProjectionDTO{revision, std::move(stop_id),
+                                     std::move(stop_generation),
+                                     std::move(assessment),
+                                     std::move(participants)});
+}
+
+Result<KernelRecoveryActionResultDTO>
+ResourceAddressedExecutionKernel::apply_operation_recovery_action(
+    const OperationId& operation_id,
+    const OperationRevision expected_operation_revision,
+    const KernelRecoveryActionRequestDTO& request) {
+  const auto requests_match = [](const KernelRecoveryActionRequestDTO& left,
+                                 const KernelRecoveryActionRequestDTO& right) {
+    return left.request_id == right.request_id && left.action == right.action &&
+           left.principal_id == right.principal_id &&
+           left.expected_assessment_revision == right.expected_assessment_revision &&
+           left.expected_control_command_epoch == right.expected_control_command_epoch &&
+           left.expected_execution_id == right.expected_execution_id &&
+           left.expected_latch_id == right.expected_latch_id &&
+           left.expected_stop_certificate_id == right.expected_stop_certificate_id &&
+           left.expected_stop_owner_generation == right.expected_stop_owner_generation &&
+           left.reason == right.reason;
+  };
+  if (operation_id.empty() || expected_operation_revision.value() == 0U ||
+      request.request_id.empty()) {
+    return reject<KernelRecoveryActionResultDTO>(
+        "operation recovery request is incomplete", "operation_recovery_invalid",
+        ErrorCode::kInvalidRequest);
+  }
+  std::lock_guard recovery_lock(operation_recovery_mutex_);
+  IResolvedParticipantExecutionEngine* engine = nullptr;
+  std::optional<StopId> stop_id;
+  std::optional<StopGeneration> stop_generation;
+  {
+    std::lock_guard state_lock(state_mutex_);
+    const auto replay = std::find_if(
+        operation_recovery_replay_ledger_.begin(),
+        operation_recovery_replay_ledger_.end(),
+        [&](const OperationRecoveryReplayEntry& entry) {
+          return entry.request.request_id == request.request_id;
+        });
+    if (replay != operation_recovery_replay_ledger_.end()) {
+      if (replay->operation_id != operation_id ||
+          replay->operation_revision != expected_operation_revision ||
+          !requests_match(replay->request, request)) {
+        return reject<KernelRecoveryActionResultDTO>(
+            "operation recovery request identity was reused",
+            "request_id_conflict", ErrorCode::kInvalidRequest);
+      }
+      if (replay->outcome_unresolved) {
+        return reject<KernelRecoveryActionResultDTO>(
+            "participant recovery outcome remains unresolved",
+            "operation_recovery_outcome_unresolved",
+            ErrorCode::kInvariantViolation);
+      }
+      return Result<KernelRecoveryActionResultDTO>::Ok(replay->result);
+    }
+    const auto* operation = find_active_operation_locked(operation_id);
+    if (operation == nullptr ||
+        operation->state.operation_revision != expected_operation_revision ||
+        operation->participants.size() != 1U ||
+        operation->participants.front().engine == nullptr ||
+        operation->stop_effect_in_flight) {
+      return reject<KernelRecoveryActionResultDTO>(
+          "operation recovery fence is stale or unsupported",
+          "operation_recovery_stale", ErrorCode::kStaleGeneration);
+    }
+    if (operation_recovery_replay_ledger_.size() >=
+        config_.request_replay_capacity) {
+      return reject<KernelRecoveryActionResultDTO>(
+          "operation recovery replay ledger reached its fixed bound",
+          "request_ledger_full", ErrorCode::kInternalError);
+    }
+    engine = operation->participants.front().engine;
+    stop_id = operation->state.active_stop_id;
+    stop_generation = operation->state.active_stop_generation;
+  }
+
+  KernelRecoveryActionResultDTO result;
+  try {
+    result = engine->apply_recovery_action(request);
+  } catch (...) {
+    std::lock_guard state_lock(state_mutex_);
+    motion_admission_closed_ = true;
+    operation_recovery_replay_ledger_.push_back(OperationRecoveryReplayEntry{
+        operation_id,
+        expected_operation_revision,
+        request,
+        KernelRecoveryActionResultDTO{
+            request.request_id,
+            request.action,
+            false,
+            {},
+            ErrorDTO{"operation_recovery_outcome_unresolved",
+                     "participant recovery outcome is unknown",
+                     {{"reason", "operation_recovery_outcome_unresolved"}}}},
+        true});
+    return reject<KernelRecoveryActionResultDTO>(
+        "participant recovery outcome is unknown",
+        "operation_recovery_outcome_unresolved", ErrorCode::kInvariantViolation);
+  }
+  {
+    std::lock_guard state_lock(state_mutex_);
+    auto* operation = find_active_operation_locked(operation_id);
+    if (operation == nullptr ||
+        operation->state.operation_revision != expected_operation_revision ||
+        operation->state.active_stop_id != stop_id ||
+        operation->state.active_stop_generation != stop_generation ||
+        operation->stop_effect_in_flight || operation->participants.size() != 1U ||
+        operation->participants.front().engine != engine ||
+        result.request_id != request.request_id || result.action != request.action) {
+      motion_admission_closed_ = true;
+      operation_recovery_replay_ledger_.push_back(OperationRecoveryReplayEntry{
+          operation_id, expected_operation_revision, request, result, true});
+      return reject<KernelRecoveryActionResultDTO>(
+          "operation or participant recovery result changed during the effect",
+          "operation_recovery_outcome_unresolved",
+          ErrorCode::kInvariantViolation);
+    }
+    if (!result.accepted) {
+      operation_recovery_replay_ledger_.push_back(
+          OperationRecoveryReplayEntry{operation_id,
+                                       expected_operation_revision, request,
+                                       result});
+      return Result<KernelRecoveryActionResultDTO>::Ok(std::move(result));
+    }
+    auto owner_rows = retained_owner_rows(
+        operation->participants, resource_slots_->coherent_snapshot());
+    if (!owner_rows.ok()) {
+      motion_admission_closed_ = true;
+      operation_recovery_replay_ledger_.push_back(OperationRecoveryReplayEntry{
+          operation_id, expected_operation_revision, request, result, true});
+      return Result<KernelRecoveryActionResultDTO>::Err(owner_rows.error());
+    }
+    if (!owner_rows.value().empty()) {
+      auto released = resource_slots_->release_batch(owner_rows.value());
+      if (!released.ok()) {
+        motion_admission_closed_ = true;
+        operation_recovery_replay_ledger_.push_back(OperationRecoveryReplayEntry{
+            operation_id, expected_operation_revision, request, result, true});
+        return Result<KernelRecoveryActionResultDTO>::Err(released.error());
+      }
+    }
+    operation_recovery_replay_ledger_.push_back(
+        OperationRecoveryReplayEntry{operation_id,
+                                     expected_operation_revision, request,
+                                     result});
+    historical_operations_.push_back(operation->state);
+    active_operations_.erase(operation_id);
+  }
+  return Result<KernelRecoveryActionResultDTO>::Ok(std::move(result));
 }
 
 Result<void> ResourceAddressedExecutionKernel::fail_coordinated_pre_dispatch(

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from copy import deepcopy
 from dataclasses import dataclass
 import hashlib
 import json
@@ -12,6 +13,7 @@ from urllib.parse import quote
 import httpx
 
 from .native import (
+    MAX_ASSISTANT_MODE_CONTEXT_RESPONSE_BYTES,
     MAX_SOURCE_MODEL_CONTEXT_RESPONSE_BYTES,
     MAX_VIEWER_MODEL_RESOURCE_BYTES,
     MAX_VIEWER_MODEL_RESOURCE_URI_BYTES,
@@ -40,13 +42,13 @@ class HeadlessClientError(RuntimeError):
         message: str,
         status_code: int | None = None,
         *,
-        details: Mapping[str, str] | None = None,
+        details: Mapping[str, Any] | None = None,
         response: Mapping[str, Any] | None = None,
     ) -> None:
         super().__init__(message)
         self.code = code
         self.status_code = status_code
-        self.details = dict(details or {})
+        self.details = deepcopy(dict(details or {}))
         self.response = dict(response) if response is not None else None
 
 
@@ -89,15 +91,7 @@ class HeadlessHttpClient:
             code = error.get("code") if isinstance(error, dict) else None
             message = error.get("message") if isinstance(error, dict) else None
             details = error.get("details") if isinstance(error, dict) else None
-        normalized_details = (
-            {
-                key: item
-                for key, item in details.items()
-                if isinstance(key, str) and isinstance(item, str)
-            }
-            if isinstance(details, dict)
-            else {}
-        )
+        normalized_details = dict(details) if isinstance(details, dict) else {}
         return HeadlessClientError(
             code if isinstance(code, str) and code else "headless_http_error",
             message
@@ -127,12 +121,18 @@ class HeadlessHttpClient:
             ) as response:
                 chunks: list[bytes] = []
                 size = 0
-                maximum_response_bytes = (
-                    MAX_SOURCE_MODEL_CONTEXT_RESPONSE_BYTES
-                    if method.upper() == "GET"
-                    and path == "/api/source-model-context"
-                    else MAX_HTTP_RESPONSE_BYTES
-                )
+                maximum_response_bytes = MAX_HTTP_RESPONSE_BYTES
+                if method.upper() == "GET":
+                    if path == "/api/source-model-context":
+                        maximum_response_bytes = (
+                            MAX_SOURCE_MODEL_CONTEXT_RESPONSE_BYTES
+                        )
+                    elif path.startswith("/api/assistant/modes/") and path.endswith(
+                        "/context"
+                    ):
+                        maximum_response_bytes = (
+                            MAX_ASSISTANT_MODE_CONTEXT_RESPONSE_BYTES
+                        )
                 for chunk in response.iter_bytes():
                     size += len(chunk)
                     if size > maximum_response_bytes:
@@ -512,11 +512,31 @@ class HeadlessHttpClient:
             ) from error
         return result
 
+    def program_scene_prepare(self, body: Mapping[str, Any]) -> dict[str, Any]:
+        result = self.request(
+            "POST", "/api/program/scene-preparations", body=body
+        )
+        if (
+            result.get("schema_version")
+            != "manyforge.program_scene_preparation.v1"
+            or result.get("status") != "prepared"
+            or not isinstance(result.get("prepared_scene"), dict)
+        ):
+            raise HeadlessClientError(
+                "program_scene_preparation_invalid",
+                "headless API returned an invalid scene-preparation result",
+                status_code=502,
+            )
+        return result
+
     def program_cycle_status(self) -> dict[str, Any]:
-        return self.request("GET", "/api/program/cycle/status")
+        return self.request("GET", "/api/cycle/status")
 
     def program_cycle_reset(self, body: Mapping[str, Any]) -> dict[str, Any]:
         return self.request("POST", "/api/program/cycle/reset", body=body)
+
+    def cycle_recovery_action(self, body: Mapping[str, Any]) -> dict[str, Any]:
+        return self.request("POST", "/api/cycle/recovery-actions", body=body)
 
     def commit_program_model_attempt(
         self,
@@ -576,6 +596,33 @@ class HeadlessHttpClient:
             body=body,
         )
 
+    def program_runtime_controls(self, program_run_id: str) -> dict[str, Any]:
+        return self.request(
+            "GET", f"{self._program_run_path(program_run_id)}/runtime-controls"
+        )
+
+    def program_runtime_control_action(
+        self,
+        program_run_id: str,
+        suffix: str,
+        body: Mapping[str, Any],
+    ) -> dict[str, Any]:
+        allowed = {
+            "runtime-overrides",
+            "runtime-overrides/activate",
+            "runtime-overrides/clear",
+            "runtime-overrides/promote",
+            "blackboard-values",
+            "manual-result",
+        }
+        if suffix not in allowed:
+            raise ValueError("runtime-control action is unsupported")
+        return self.request(
+            "POST",
+            f"{self._program_run_path(program_run_id)}/{suffix}",
+            body=body,
+        )
+
     def viewer_model_urdf(self) -> ViewerModelAsset:
         asset = self._request_viewer_asset(
             "/api/viewer-model/urdf",
@@ -629,6 +676,15 @@ class HeadlessHttpClient:
         ):
             raise ValueError("assistant mode ID is invalid")
         return self.request("GET", f"/api/assistant/modes/{mode_id}")
+
+    def assistant_mode_context(self, mode_id: str) -> dict[str, Any]:
+        if (
+            not isinstance(mode_id, str)
+            or re.fullmatch(r"[a-z][a-z0-9.-]*", mode_id) is None
+            or len(mode_id.encode("utf-8")) > 256
+        ):
+            raise ValueError("assistant mode identity is invalid")
+        return self.request("GET", f"/api/assistant/modes/{mode_id}/context")
 
     def manager_apply(self, body: Mapping[str, Any]) -> dict[str, Any]:
         return self.request("POST", "/api/manager/apply", body=body)
@@ -709,6 +765,40 @@ class HeadlessHttpClient:
 
     def operation(self, operation_id: str) -> dict[str, Any]:
         return self.request("GET", self._operation_path(operation_id))
+
+    @staticmethod
+    def _operation_recovery_path(operation_id: str) -> str:
+        if not operation_id or len(operation_id.encode("utf-8")) > 256:
+            raise ValueError("operation_id must be bounded non-empty text")
+        if "/" in operation_id or ".." in operation_id:
+            raise ValueError("operation_id is invalid for an HTTP path")
+        return (
+            "/api/private/program-runner/execution/operations/"
+            f"{quote(operation_id, safe='')}/recovery"
+        )
+
+    def operation_recovery(self, operation_id: str) -> dict[str, Any]:
+        return self.request("GET", self._operation_recovery_path(operation_id))
+
+    def apply_operation_recovery(
+        self,
+        operation_id: str,
+        expected_operation_revision: int,
+        body: Mapping[str, Any],
+    ) -> dict[str, Any]:
+        if (
+            type(expected_operation_revision) is not int
+            or not 1
+            <= expected_operation_revision
+            <= 9_007_199_254_740_991
+        ):
+            raise ValueError("expected operation revision is invalid")
+        return self.request(
+            "POST",
+            self._operation_recovery_path(operation_id),
+            params=(("expected_operation_revision", expected_operation_revision),),
+            body=body,
+        )
 
     def _operation_control(
         self,

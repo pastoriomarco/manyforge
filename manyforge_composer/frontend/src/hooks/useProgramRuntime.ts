@@ -6,6 +6,10 @@ import type {
   AppliedProgramSelection,
   CurrentScenarioResponse,
   JsonValue,
+  CycleRecoveryActionId,
+  ProgramRuntimeControlProjection,
+  RuntimeOverridePromotionProposal,
+  RuntimeOverrideRecord,
   ProgramRunStatus,
   ProgramWorkspaceResponse,
   ScenarioCatalogResponse,
@@ -39,6 +43,9 @@ export function programRuntimeWakeKey(snapshot: ComposerHeadlessState | null): s
     snapshot.programCycle.programRunnerOwnerEpoch,
     snapshot.programCycle.cycleGeneration,
     snapshot.programCycle.state,
+    snapshot.programCycle.runtimeControlRevision ?? 'no-runtime-controls',
+    snapshot.programCycle.recoveryOffer?.offerId ?? 'no-recovery-offer',
+    snapshot.programCycle.recoveryOffer?.offerRevision ?? 0,
   ].join(':');
 }
 
@@ -53,10 +60,12 @@ interface ProgramRuntimeState {
   applied: AppliedProgramSelection | null;
   currentScenario: CurrentScenarioResponse | null;
   run: ProgramRunStatus | null;
+  controls: ProgramRuntimeControlProjection | null;
   selectedScenarioId: string | null;
   runnerAvailable: boolean;
   loading: boolean;
   pending: 'run' | 'stop' | 'reset' | null;
+  controlPending: string | null;
   error: string | null;
 }
 
@@ -65,10 +74,12 @@ const INITIAL_STATE: ProgramRuntimeState = {
   applied: null,
   currentScenario: null,
   run: null,
+  controls: null,
   selectedScenarioId: null,
   runnerAvailable: false,
   loading: true,
   pending: null,
+  controlPending: null,
   error: null,
 };
 
@@ -99,6 +110,16 @@ function runKey(value: ProgramRunStatus | null): string {
   return value === null
     ? 'none'
     : `${value.ownerEpoch}:${value.capture.programRunId}:${value.runRevision}`;
+}
+
+function controlsKey(value: ProgramRuntimeControlProjection | null): string {
+  return value === null
+    ? 'none'
+    : `${value.ownerEpoch}:${value.programRunId}:${value.runRevision}:`
+      + `${value.runtimeControls.runtimeControlRevision}:`
+      + `${value.recoveryOffer?.offerId ?? 'no-offer'}:`
+      + `${value.recoveryOffer?.offerRevision ?? 0}:`
+      + JSON.stringify(value.observationOverrideCandidate);
 }
 
 export function buildProgramStartRequest(
@@ -134,18 +155,16 @@ export function buildProgramStartRequest(
 }
 
 export function buildProgramResetRequest(
-  run: ProgramRunStatus | null,
   snapshot: ComposerHeadlessState | null,
   requestOwnerEpoch: string,
   requestId: string,
 ): Record<string, JsonValue> | null {
   const cycle = snapshot?.programCycle;
   if (
-    run === null || cycle === undefined
+    cycle === undefined
     || cycle.state !== 'terminal_awaiting_reset'
     || cycle.programRunId === null || cycle.cycleClaimGeneration === null
     || cycle.terminalOrSettlementReference === null
-    || run.capture.programRunId !== cycle.programRunId
   ) return null;
   return {
     request_id: requestId,
@@ -203,6 +222,7 @@ export function useProgramRuntime(
   ));
   const wakeKey = programRuntimeWakeKey(snapshot);
   const snapshotAvailable = snapshot !== null;
+  const cycleRunId = snapshot?.programCycle.programRunId ?? null;
 
   const refresh = useCallback(async () => {
     if (!enabled || !snapshotAvailable) return;
@@ -258,6 +278,7 @@ export function useProgramRuntime(
       }
 
       let run: ProgramRunStatus | null = null;
+      let controls: ProgramRuntimeControlProjection | null = null;
       const runnerAvailable = indexResult.status === 'fulfilled';
       if (indexResult.status === 'fulfilled') {
         const index = indexResult.value;
@@ -271,15 +292,21 @@ export function useProgramRuntime(
         run = index.runs[0] ?? null;
         if (run !== null) {
           observedRunId.current = run.capture.programRunId;
-        } else if (observedRunId.current !== null) {
-          try {
-            run = await api.programs.read(observedRunId.current);
-          } catch (reason) {
-            if (!(reason instanceof ApiError && reason.status === 404)) {
-              errors.push(errorMessage(
-                reason,
-                'Program-run status unavailable.',
-              ));
+        } else {
+          const retainedRunId = cycleRunId ?? observedRunId.current;
+          if (retainedRunId === null) {
+            run = null;
+          } else {
+            try {
+              run = await api.programs.read(retainedRunId);
+              observedRunId.current = retainedRunId;
+            } catch (reason) {
+              if (!(reason instanceof ApiError && reason.status === 404)) {
+                errors.push(errorMessage(
+                  reason,
+                  'Program-run status unavailable.',
+                ));
+              }
             }
           }
         }
@@ -288,6 +315,18 @@ export function useProgramRuntime(
           indexResult.reason,
           'Program runner unavailable.',
         ));
+      }
+      if (run !== null) {
+        try {
+          controls = await api.programs.runtimeControls(
+            run.capture.programRunId,
+          );
+        } catch (reason) {
+          errors.push(errorMessage(
+            reason,
+            'Program recovery and runtime controls are unavailable.',
+          ));
+        }
       }
       if (!mounted.current) return;
 
@@ -299,6 +338,7 @@ export function useProgramRuntime(
           currentScenario,
           applied,
           run,
+          controls,
           // Owner-issued Applied state is a projection, not operator intent.
           // Refresh may retain an explicit selection but must never create one.
           selectedScenarioId: retainedScenarioSelection(
@@ -308,7 +348,11 @@ export function useProgramRuntime(
           runnerAvailable,
           loading: false,
           pending: null,
-          error: errors.length > 0 ? [...new Set(errors)].join(' ') : null,
+          // Automatic owner refresh must not erase a command rejection before
+          // the operator can see it. The next explicit command clears it.
+          error: errors.length > 0
+            ? [...new Set(errors)].join(' ')
+            : current.error,
         };
         return current.catalog?.scenarioCatalogRevision
             === next.catalog?.scenarioCatalogRevision
@@ -316,10 +360,12 @@ export function useProgramRuntime(
             === currentScenarioKey(next.currentScenario)
           && appliedKey(current.applied) === appliedKey(next.applied)
           && runKey(current.run) === runKey(next.run)
+          && controlsKey(current.controls) === controlsKey(next.controls)
           && current.selectedScenarioId === next.selectedScenarioId
           && current.runnerAvailable === next.runnerAvailable
           && current.loading === next.loading
           && current.pending === next.pending
+          && current.controlPending === next.controlPending
           && current.error === next.error
           ? current
           : next;
@@ -331,7 +377,7 @@ export function useProgramRuntime(
         queueMicrotask(() => { void refresh(); });
       }
     }
-  }, [enabled, snapshotAvailable]);
+  }, [cycleRunId, enabled, snapshotAvailable]);
 
   useEffect(() => {
     mounted.current = true;
@@ -404,7 +450,12 @@ export function useProgramRuntime(
       observedRunId.current = status.capture.programRunId;
       observedOwnerEpoch.current = status.ownerEpoch;
       if (mounted.current) {
-        setState((current) => ({ ...current, run: status, pending: null }));
+        setState((current) => ({
+          ...current,
+          run: status,
+          controls: null,
+          pending: null,
+        }));
       }
     } catch (reason) {
       if (mounted.current) {
@@ -419,7 +470,7 @@ export function useProgramRuntime(
 
   const reset = useCallback(async () => {
     const request = buildProgramResetRequest(
-      state.run, snapshot, callerEpoch.current, identity('program-cycle-reset'),
+      snapshot, callerEpoch.current, identity('program-cycle-reset'),
     );
     if (request === null) return;
     setState((current) => ({ ...current, pending: 'reset', error: null }));
@@ -431,7 +482,7 @@ export function useProgramRuntime(
         ...current, pending: null, error: errorMessage(reason, 'Program Reset was rejected.'),
       }));
     }
-  }, [refresh, snapshot, state.run]);
+  }, [refresh, snapshot]);
 
   const stop = useCallback(async () => {
     if (
@@ -468,6 +519,265 @@ export function useProgramRuntime(
     }
   }, [state.pending, state.run, state.runnerAvailable]);
 
+  const runtimeControlRequest = useCallback((requestId: string) => {
+    const controls = state.controls;
+    const currentRun = state.run;
+    if (
+      controls === null
+      || currentRun === null
+      || state.controlPending !== null
+      || controls.programRunId !== currentRun.capture.programRunId
+      || controls.ownerEpoch !== currentRun.ownerEpoch
+      || controls.runRevision !== currentRun.runRevision
+    ) return null;
+    return {
+      request_id: requestId,
+      request_owner_epoch: callerEpoch.current,
+      source_label: 'operator_ui',
+      correlation_id: requestId,
+      program_run_id: controls.programRunId,
+      expected_owner_epoch: controls.ownerEpoch,
+      expected_run_revision: controls.runRevision,
+    } satisfies Record<string, JsonValue>;
+  }, [state.controlPending, state.controls, state.run]);
+
+  const performRuntimeControl = useCallback(async (
+    pending: string,
+    effect: () => Promise<{
+      run: ProgramRunStatus;
+      runtimeControls: ProgramRuntimeControlProjection;
+    }>,
+    fallback: string,
+  ) => {
+    setState((current) => ({
+      ...current,
+      controlPending: pending,
+      error: null,
+    }));
+    try {
+      const result = await effect();
+      if (mounted.current) setState((current) => ({
+        ...current,
+        run: result.run,
+        controls: result.runtimeControls,
+        controlPending: null,
+      }));
+    } catch (reason) {
+      if (mounted.current) setState((current) => ({
+        ...current,
+        controlPending: null,
+        error: errorMessage(reason, fallback),
+      }));
+    }
+  }, []);
+
+  const applyRecoveryAction = useCallback((actionId: CycleRecoveryActionId) => {
+    const offer = state.controls?.recoveryOffer;
+    const action = offer?.actions.find((row) => row.actionId === actionId);
+    if (
+      offer === null || offer === undefined || action?.enabled !== true
+      || state.controlPending !== null
+    ) return;
+    const requestId = identity('program-recovery');
+    const body = {
+      request_id: requestId,
+      request_owner_epoch: callerEpoch.current,
+      source_label: 'operator_ui',
+      correlation_id: requestId,
+      expected_owner_epoch: state.controls?.ownerEpoch ?? '',
+      offer_id: offer.offerId,
+      offer_revision: offer.offerRevision,
+      action_id: actionId,
+      reason: 'operator-selected recovery action',
+    } satisfies Record<string, JsonValue>;
+    void performRuntimeControl(
+      `recovery:${actionId}`,
+      () => api.programs.applyRecoveryAction(body),
+      'The recovery action was rejected.',
+    );
+  }, [performRuntimeControl, state.controlPending, state.controls]);
+
+  const stageObservationOverride = useCallback(() => {
+    const candidate = state.controls?.observationOverrideCandidate;
+    const requestId = identity('program-runtime-override-stage');
+    const base = runtimeControlRequest(requestId);
+    if (
+      base === null
+      || candidate?.available !== true
+      || candidate.nodeInstanceId === null
+      || candidate.nodeAttemptId === null
+      || candidate.parameterId === null
+      || candidate.value === null
+      || candidate.sourceObservationId === null
+      || candidate.sourceOwnerGeneration === null
+    ) return;
+    void performRuntimeControl(
+      'override:stage-observation',
+      () => api.programs.runtimeControlAction(
+        base.program_run_id as string,
+        'runtime-overrides',
+        {
+          ...base,
+          node_instance_id: candidate.nodeInstanceId,
+          node_attempt_id: candidate.nodeAttemptId,
+          parameter_id: candidate.parameterId,
+          value: candidate.value,
+          source_observation_id: candidate.sourceObservationId,
+          source_owner_generation: candidate.sourceOwnerGeneration,
+        },
+      ),
+      'The Robot snapshot could not be staged.',
+    );
+  }, [performRuntimeControl, runtimeControlRequest, state.controls]);
+
+  const runtimeOverrideAction = useCallback((
+    action: 'activate' | 'clear' | 'promote',
+    override: RuntimeOverrideRecord,
+  ) => {
+    const requestId = identity(`program-runtime-override-${action}`);
+    const base = runtimeControlRequest(requestId);
+    if (base === null || (action === 'promote' && workspace === null)) return;
+    const path = action === 'activate'
+      ? 'runtime-overrides/activate'
+      : action === 'clear'
+        ? 'runtime-overrides/clear'
+        : 'runtime-overrides/promote';
+    const body: Record<string, JsonValue> = {
+      ...base,
+      override_id: override.overrideId,
+      expected_override_revision: override.overrideRevision,
+    };
+    if (action === 'promote') {
+      body.expected_draft_id = workspace!.draft.draftId;
+      body.expected_draft_revision = workspace!.draft.draftRevision;
+    }
+    void performRuntimeControl(
+      `override:${action}:${override.overrideId}`,
+      () => api.programs.runtimeControlAction(
+        base.program_run_id as string,
+        path,
+        body,
+      ),
+      action === 'activate'
+        ? 'The runtime override could not be activated.'
+        : action === 'clear'
+          ? 'The runtime override could not be cleared.'
+          : 'The runtime override promotion could not be requested.',
+    );
+  }, [performRuntimeControl, runtimeControlRequest, workspace]);
+
+  const writeRuntimeBlackboard = useCallback((key: string, value: JsonValue) => {
+    const requestId = identity('program-runtime-blackboard');
+    const base = runtimeControlRequest(requestId);
+    if (base === null) return;
+    void performRuntimeControl(
+      `blackboard:${key}`,
+      () => api.programs.runtimeControlAction(
+        base.program_run_id as string,
+        'blackboard-values',
+        { ...base, key, value },
+      ),
+      'The runtime blackboard value was rejected.',
+    );
+  }, [performRuntimeControl, runtimeControlRequest]);
+
+  const stageManualResult = useCallback((
+    outcome: 'succeeded' | 'failed',
+    output: JsonValue,
+  ) => {
+    const offer = state.controls?.recoveryOffer;
+    const requestId = identity('program-manual-result');
+    const base = runtimeControlRequest(requestId);
+    if (base === null || offer === null || offer === undefined) return;
+    void performRuntimeControl(
+      `manual-result:${outcome}`,
+      () => api.programs.runtimeControlAction(
+        base.program_run_id as string,
+        'manual-result',
+        {
+          ...base,
+          node_instance_id: offer.nodeInstanceId,
+          node_attempt_id: offer.nodeAttemptId,
+          outcome,
+          output,
+        },
+      ),
+      'The manual result was rejected.',
+    );
+  }, [performRuntimeControl, runtimeControlRequest, state.controls]);
+
+  const materializePromotion = useCallback(async (
+    proposal: RuntimeOverridePromotionProposal,
+  ) => {
+    if (
+      proposal.status !== 'ready'
+      || workspace === null
+      || snapshot === null
+      || state.controlPending !== null
+      || proposal.expectedDraftId !== workspace.draft.draftId
+      || proposal.expectedDraftRevision !== workspace.draft.draftRevision
+      || snapshot.draftIdentity.draftId !== workspace.draft.draftId
+      || snapshot.draftIdentity.draftRevision !== workspace.draft.draftRevision
+      || snapshot.programCycle.state !== 'idle_after_reset'
+      || !snapshot.authoringAdmission.authoringAllowed
+    ) return;
+    const requestId = identity('program-runtime-promotion-materialize');
+    setState((current) => ({
+      ...current,
+      controlPending: `promotion:materialize:${proposal.proposalId}`,
+      error: null,
+    }));
+    try {
+      await api.programWorkspace.materializeRuntimeOverride(
+        {
+          draftId: workspace.draft.draftId,
+          expectedDraftRevision: workspace.draft.draftRevision,
+          expectedAdmissionGeneration: snapshot.authoringAdmission.admissionGeneration,
+          requestOwnerEpoch: callerEpoch.current,
+          requestId,
+        },
+        proposal.programRunId,
+        proposal.proposalId,
+      );
+      await refresh();
+      if (mounted.current) setState((current) => ({
+        ...current,
+        controlPending: null,
+      }));
+    } catch (reason) {
+      if (mounted.current) setState((current) => ({
+        ...current,
+        controlPending: null,
+        error: errorMessage(
+          reason,
+          'The runtime override could not be applied to the Draft.',
+        ),
+      }));
+    }
+  }, [refresh, snapshot, state.controlPending, workspace]);
+
+  const promotionMaterializationReason = useCallback((
+    proposal: RuntimeOverridePromotionProposal,
+  ): string | null => {
+    if (proposal.status !== 'ready') return 'Reset the Program cycle first.';
+    if (workspace === null || snapshot === null) {
+      return 'The current Draft and backend admission are unavailable.';
+    }
+    if (
+      proposal.expectedDraftId !== workspace.draft.draftId
+      || proposal.expectedDraftRevision !== workspace.draft.draftRevision
+    ) return 'The Draft changed after this promotion was requested.';
+    if (
+      snapshot.draftIdentity.draftId !== workspace.draft.draftId
+      || snapshot.draftIdentity.draftRevision !== workspace.draft.draftRevision
+    ) return 'The displayed Draft is still synchronizing.';
+    if (
+      snapshot.programCycle.state !== 'idle_after_reset'
+      || !snapshot.authoringAdmission.authoringAllowed
+    ) return 'Applying the promotion to Draft requires authoritative Idle.';
+    return state.controlPending === null ? null : 'Another runtime control is pending.';
+  }, [snapshot, state.controlPending, workspace]);
+
   const active = useMemo(
     () => state.run !== null && ACTIVE_STATES.has(state.run.state),
     [state.run],
@@ -484,16 +794,38 @@ export function useProgramRuntime(
     run,
     stop,
     reset,
+    applyRecoveryAction,
+    stageObservationOverride,
+    activateRuntimeOverride: (override: RuntimeOverrideRecord) => (
+      runtimeOverrideAction('activate', override)
+    ),
+    clearRuntimeOverride: (override: RuntimeOverrideRecord) => (
+      runtimeOverrideAction('clear', override)
+    ),
+    promoteRuntimeOverride: (override: RuntimeOverrideRecord) => (
+      runtimeOverrideAction('promote', override)
+    ),
+    materializePromotion,
+    promotionMaterializationReason,
+    writeRuntimeBlackboard,
+    stageManualResult,
   }), [
     active,
+    applyRecoveryAction,
     clearScenarioSelection,
     cycleState,
     refresh,
     reset,
     run,
     selectScenario,
+    stageManualResult,
+    stageObservationOverride,
     state,
     stop,
+    materializePromotion,
+    promotionMaterializationReason,
+    runtimeOverrideAction,
+    writeRuntimeBlackboard,
   ]);
 }
 

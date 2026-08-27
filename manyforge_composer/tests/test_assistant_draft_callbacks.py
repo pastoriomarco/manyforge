@@ -20,15 +20,14 @@ from manyforge_composer.backend.assistant_catalog_narrowing import (
     resolve_assistant_catalog,
 )
 from manyforge_composer.backend.assistant_mode_client import (
+    VerifiedActiveAssistantContext,
     VerifiedActiveAssistantMode,
     verify_active_assistant_mode,
 )
 from manyforge_composer.backend.node_environment_client import (
     VerifiedActiveNodeEnvironment,
 )
-from manyforge_composer.backend.source_model_client import (
-    verify_active_source_model,
-)
+from manyforge_composer.backend.source_model_client import verify_active_source_model
 from manyforge_composer.backend.state import ComposerState
 
 
@@ -136,6 +135,16 @@ def _source_model(node_environment: VerifiedActiveNodeEnvironment):
     return verify_active_source_model(
         projection,
         node_environment=node_environment,
+    )
+
+
+def _assistant_context(
+    node_environment: VerifiedActiveNodeEnvironment,
+) -> VerifiedActiveAssistantContext:
+    return VerifiedActiveAssistantContext(
+        node_environment=node_environment,
+        source_model=_source_model(node_environment),
+        assistant_mode=_assistant_mode(node_environment),
     )
 
 
@@ -321,8 +330,9 @@ def test_callback_uses_exact_active_context_and_mutates_only_the_draft(
     monkeypatch, tmp_path
 ) -> None:
     node_environment = _node_environment()
-    source_model = _source_model(node_environment)
-    assistant_mode = _assistant_mode(node_environment)
+    context = _assistant_context(node_environment)
+    source_model = context.source_model
+    assistant_mode = context.assistant_mode
     environment = build_node_environment()
     program = Program(_PROGRAM_PATH, environment.catalog)
     state = ComposerState(
@@ -336,21 +346,15 @@ def test_callback_uses_exact_active_context_and_mutates_only_the_draft(
 
     projection_reads = 0
 
-    def read_node_environment(_state):
+    def read_context(_state, *, mode):
         nonlocal projection_reads
         projection_reads += 1
-        return node_environment
+        return context
 
-    monkeypatch.setattr(route, "read_active_node_environment", read_node_environment)
     monkeypatch.setattr(
         route,
-        "read_active_source_model",
-        lambda _state, *, node_environment: source_model,
-    )
-    monkeypatch.setattr(
-        route,
-        "read_active_assistant_mode",
-        lambda _state, *, mode, node_environment: assistant_mode,
+        "read_active_assistant_context",
+        read_context,
     )
     client = TestClient(create_app(state))
     body = _body(state, node_environment, source_model, assistant_mode)
@@ -398,7 +402,7 @@ def test_callback_uses_exact_active_context_and_mutates_only_the_draft(
         raise AssertionError("exact callback replay consulted mutable projections")
 
     monkeypatch.setattr(
-        route, "read_active_node_environment", unexpected_projection_read
+        route, "read_active_assistant_context", unexpected_projection_read
     )
     replay = client.post(
         "/api/assistant/bridge/tools/scene_draft_add_object",
@@ -425,8 +429,9 @@ def test_allowed_tool_schema_error_is_a_non_mutating_http_200_result(
     monkeypatch, tmp_path
 ) -> None:
     node_environment = _node_environment()
-    source_model = _source_model(node_environment)
-    assistant_mode = _assistant_mode(node_environment)
+    context = _assistant_context(node_environment)
+    source_model = context.source_model
+    assistant_mode = context.assistant_mode
     environment = build_node_environment()
     state = ComposerState(
         node_environment=environment,
@@ -437,16 +442,10 @@ def test_allowed_tool_schema_error_is_a_non_mutating_http_200_result(
     )
     from manyforge_composer.backend import routes_assistant_draft as route
 
-    monkeypatch.setattr(route, "read_active_node_environment", lambda _state: node_environment)
     monkeypatch.setattr(
         route,
-        "read_active_source_model",
-        lambda _state, *, node_environment: source_model,
-    )
-    monkeypatch.setattr(
-        route,
-        "read_active_assistant_mode",
-        lambda _state, *, mode, node_environment: assistant_mode,
+        "read_active_assistant_context",
+        lambda _state, *, mode: context,
     )
     body = _body(state, node_environment, source_model, assistant_mode)
     body["arguments"]["scene_resource"]["objectId"] = body["arguments"][
@@ -475,8 +474,9 @@ def test_callback_reapplies_field_narrowing_before_draft_mutation(
     monkeypatch, tmp_path
 ) -> None:
     node_environment = _node_environment()
-    source_model = _source_model(node_environment)
-    assistant_mode = _assistant_mode(node_environment)
+    context = _assistant_context(node_environment)
+    source_model = context.source_model
+    assistant_mode = context.assistant_mode
     environment = build_node_environment()
     state = ComposerState(
         node_environment=environment,
@@ -487,16 +487,10 @@ def test_callback_reapplies_field_narrowing_before_draft_mutation(
     )
     from manyforge_composer.backend import routes_assistant_draft as route
 
-    monkeypatch.setattr(route, "read_active_node_environment", lambda _state: node_environment)
     monkeypatch.setattr(
         route,
-        "read_active_source_model",
-        lambda _state, *, node_environment: source_model,
-    )
-    monkeypatch.setattr(
-        route,
-        "read_active_assistant_mode",
-        lambda _state, *, mode, node_environment: assistant_mode,
+        "read_active_assistant_context",
+        lambda _state, *, mode: context,
     )
     body = _body(state, node_environment, source_model, assistant_mode)
     body["fieldPolicy"] = {"allowedOrientationFields": ["rpy_deg"]}
@@ -545,7 +539,7 @@ def test_malformed_assistant_mode_is_rejected_before_projection_lookup(
         lookup_attempted = True
         raise AssertionError("projection lookup must not run")
 
-    monkeypatch.setattr(route, "read_active_node_environment", unexpected_lookup)
+    monkeypatch.setattr(route, "read_active_assistant_context", unexpected_lookup)
     body = _body(state, node_environment, source_model, assistant_mode)
     body["assistantMode"] = "../runtime"
     before = deepcopy(state.draft_session.snapshot())
@@ -564,8 +558,9 @@ def test_callback_cannot_mutate_a_program_that_forbids_assistant_authoring(
     monkeypatch, tmp_path
 ) -> None:
     node_environment = _node_environment()
-    source_model = _source_model(node_environment)
-    assistant_mode = _assistant_mode(node_environment)
+    context = _assistant_context(node_environment)
+    source_model = context.source_model
+    assistant_mode = context.assistant_mode
     environment = build_node_environment()
     state = ComposerState(
         node_environment=environment,
@@ -578,18 +573,8 @@ def test_callback_cannot_mutate_a_program_that_forbids_assistant_authoring(
 
     monkeypatch.setattr(
         route,
-        "read_active_node_environment",
-        lambda _state: node_environment,
-    )
-    monkeypatch.setattr(
-        route,
-        "read_active_source_model",
-        lambda _state, *, node_environment: source_model,
-    )
-    monkeypatch.setattr(
-        route,
-        "read_active_assistant_mode",
-        lambda _state, *, mode, node_environment: assistant_mode,
+        "read_active_assistant_context",
+        lambda _state, *, mode: context,
     )
     body = _body(state, node_environment, source_model, assistant_mode)
     before = deepcopy(state.draft_session.snapshot())

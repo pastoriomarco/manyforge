@@ -219,6 +219,13 @@ public:
     return Invoke([this]() { return core_->SourceModelContext(); });
   }
 
+  std::string AssistantModeContext(std::string mode_id) {
+    py::gil_scoped_release release;
+    return Invoke([this, mode_id = std::move(mode_id)]() {
+      return core_->AssistantModeContext(mode_id);
+    });
+  }
+
   std::string ScenarioCatalogProjection() {
     py::gil_scoped_release release;
     return Invoke([this]() { return core_->ScenarioCatalogProjection(); });
@@ -569,6 +576,8 @@ PYBIND11_MODULE(manyforge_headless_py, module) {
            &HeadlessApiBridge::NodeEnvironmentProjection)
       .def("source_model_projection", &HeadlessApiBridge::SourceModelProjection)
       .def("source_model_context", &HeadlessApiBridge::SourceModelContext)
+      .def("assistant_mode_context", &HeadlessApiBridge::AssistantModeContext,
+           py::arg("mode_id"))
       .def("scenario_catalog_projection",
            &HeadlessApiBridge::ScenarioCatalogProjection)
       .def("scenario_program_selection",

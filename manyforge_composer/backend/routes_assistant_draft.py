@@ -11,7 +11,7 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from .assistant_mode_client import (
     ActiveAssistantModeProjectionError,
-    read_active_assistant_mode,
+    read_active_assistant_context,
 )
 from .assistant_catalog_narrowing import (
     AssistantCatalogNarrowingError,
@@ -26,12 +26,8 @@ from .assistant_schema_validation import (
 from .draft_session import DraftSessionError, SUPPORTED_DRAFT_MUTATIONS
 from .node_environment_client import (
     ActiveNodeEnvironmentProjectionError,
-    read_active_node_environment,
 )
-from .source_model_client import (
-    ActiveSourceModelProjectionError,
-    read_active_source_model,
-)
+from .source_model_client import ActiveSourceModelProjectionError
 from .state import ComposerState
 from .authoring_admission import AuthoringMutationEnvelope
 
@@ -196,16 +192,13 @@ def create_assistant_draft_router(state: ComposerState) -> APIRouter:
         validation_as_result: bool,
     ):
         try:
-            node_environment = read_active_node_environment(state)
-            source_model = read_active_source_model(
-                state,
-                node_environment=node_environment,
-            )
-            assistant_mode = read_active_assistant_mode(
+            context = read_active_assistant_context(
                 state,
                 mode=body.assistant_mode,
-                node_environment=node_environment,
             )
+            node_environment = context.node_environment
+            source_model = context.source_model
+            assistant_mode = context.assistant_mode
         except (
             ActiveNodeEnvironmentProjectionError,
             ActiveSourceModelProjectionError,

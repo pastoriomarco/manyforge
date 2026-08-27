@@ -36,6 +36,7 @@ from manyforge_behavior.program_runtime import (
     ProgramRunCapture,
     ProgramRunOwnerIdentity,
 )
+from manyforge_behavior.orchestration_values import ProgramValueError
 
 
 PROGRAM_RUN_STATUS_API: Final = "manyforge.program_run_status.v1"
@@ -46,6 +47,10 @@ _MAX_RETAINED_RUNS: Final = 4_096
 
 class ProgramRunOwnerError(RuntimeError):
     """A Program-run owner request is invalid, stale, or unavailable."""
+
+
+class ProgramRunOwnerOutcomeUnknownError(ProgramRunOwnerError):
+    """An addressed owner effect returned without a trustworthy result."""
 
 
 class ProgramRunState(Enum):
@@ -187,6 +192,25 @@ class ProgramRunAdmission:
                     deepcopy(dict(self.assistant_projection))
                 )
             ),
+        )
+
+    def port_context(self, program_run_id: str) -> ProgramRunPortContext:
+        """Project the same immutable owner context for preparation or Run."""
+
+        return ProgramRunPortContext(
+            program_run_id=program_run_id,
+            applied_record_digest=self.applied_record_digest,
+            scenario_id=self.scenario_id,
+            scenario_catalog_revision=self.scenario_catalog_revision,
+            program_id=self.program.program_id,
+            program_revision=self.program.program_revision,
+            program_binding_id=self.program_binding_id,
+            retained_bundle_id=self.retained_bundle_id,
+            graph_revision=self.graph_revision,
+            node_environment_digest=self.environment.environment_digest,
+            program_binding=self.program_binding,
+            program=self.program.to_dict(),
+            assistant_projection=self.assistant_projection,
         )
 
 
@@ -351,14 +375,8 @@ class ProgramRunOwner:
 
     def _release_resources(self, program_run_id: str) -> tuple[Exception, ...]:
         errors: list[Exception] = []
-        initialization = self._ports.program_run_initialization
         context = self._ports.program_run_context
         interventions = self._ports.program_interventions
-        if initialization is not None:
-            try:
-                initialization.release(program_run_id)
-            except Exception as error:
-                errors.append(error)
         if context is not None:
             try:
                 context.unbind(program_run_id)
@@ -453,33 +471,13 @@ class ProgramRunOwner:
             node_policies=admission.node_policies,
         )
         context_port = self._ports.program_run_context
-        initialization_port = self._ports.program_run_initialization
         context_bound = False
-        initialization_started = False
-        port_context = ProgramRunPortContext(
-            program_run_id=capture.program_run_id,
-            applied_record_digest=capture.applied_record_digest,
-            scenario_id=capture.scenario_id,
-            scenario_catalog_revision=capture.scenario_catalog_revision,
-            program_id=capture.program_id,
-            program_revision=capture.program_revision,
-            program_binding_id=capture.program_binding_id,
-            retained_bundle_id=capture.retained_bundle_id,
-            graph_revision=capture.graph_revision,
-            node_environment_digest=capture.node_environment_digest,
-            program_binding=admission.program_binding,
-            program=admission.program.to_dict(),
-            assistant_projection=admission.assistant_projection,
-        )
+        port_context = admission.port_context(capture.program_run_id)
         try:
             try:
                 if context_port is not None:
                     context_port.bind(port_context)
                     context_bound = True
-                if initialization_port is not None:
-                    initialization_started = True
-                    initial_scene = admission.program.to_dict().get("scene", [])
-                    initialization_port.initialize(port_context, initial_scene)
                 run = ExecutableProgramRun(
                     program=admission.program,
                     environment=admission.environment,
@@ -497,12 +495,8 @@ class ProgramRunOwner:
                     self._runs[program_run_id] = entry
                     return self._snapshot(entry)
             except Exception:
-                try:
-                    if initialization_started and initialization_port is not None:
-                        initialization_port.release(program_run_id)
-                finally:
-                    if context_bound and context_port is not None:
-                        context_port.unbind(program_run_id)
+                if context_bound and context_port is not None:
+                    context_port.unbind(program_run_id)
                 raise
         finally:
             with self._lock:
@@ -513,6 +507,255 @@ class ProgramRunOwner:
 
         with self._lock:
             return self._snapshot(self._entry(program_run_id))
+
+    def intervention(self, program_run_id: str):
+        """Return the exact held node attempt, if any, without deriving it."""
+
+        port = self._ports.program_interventions
+        if port is None:
+            return None
+        return port.read(program_run_id)
+
+    def note_runtime_control_change(
+        self, program_run_id: str
+    ) -> ProgramRunSnapshot:
+        """Advance the run projection after one non-tree C2 state change."""
+
+        with self._lock:
+            entry = self._entry(program_run_id)
+            entry.revision += 1
+            return self._snapshot(entry)
+
+    def validate_runtime_override(
+        self,
+        program_run_id: str,
+        *,
+        node_instance_id: str,
+        node_attempt_id: str,
+        parameter_id: str,
+        value: Any,
+    ) -> Any:
+        with self._lock:
+            entry = self._entry(program_run_id)
+            if entry.state is not ProgramRunState.INTERVENTION_REQUIRED:
+                raise ProgramRunOwnerError(
+                    "runtime overrides require the exact held Program attempt"
+                )
+            policy = entry.run.capture.node_policy_by_instance_id.get(
+                node_instance_id
+            )
+            if (
+                policy is None
+                or policy.modification_policy["runtime_override"] == "forbidden"
+                or "runtime_override"
+                not in policy.recovery_policy["allowed_recovery_actions"]
+            ):
+                raise ProgramRunOwnerError(
+                    "the captured node policy forbids runtime override"
+                )
+            intervention = self.intervention(program_run_id)
+            if (
+                intervention is None
+                or intervention.identity.node_instance_id != node_instance_id
+                or intervention.identity.node_attempt_id != node_attempt_id
+            ):
+                raise ProgramRunOwnerError(
+                    "runtime override identifies a stale node attempt"
+                )
+            store = entry.run.runtime_overrides
+        try:
+            return store.validate(node_instance_id, parameter_id, value)
+        except ProgramValueError as error:
+            raise ProgramRunOwnerError(str(error)) from error
+
+    def activate_runtime_override(
+        self,
+        program_run_id: str,
+        *,
+        node_instance_id: str,
+        node_attempt_id: str,
+        parameter_id: str,
+        value: Any,
+    ) -> ProgramRunSnapshot:
+        validated = self.validate_runtime_override(
+            program_run_id,
+            node_instance_id=node_instance_id,
+            node_attempt_id=node_attempt_id,
+            parameter_id=parameter_id,
+            value=value,
+        )
+        with self._lock:
+            entry = self._entry(program_run_id)
+            entry.run.runtime_overrides.activate(
+                node_instance_id, parameter_id, validated
+            )
+            entry.revision += 1
+            return self._snapshot(entry)
+
+    def validate_runtime_override_promotion(
+        self,
+        program_run_id: str,
+        *,
+        node_instance_id: str,
+    ) -> str:
+        with self._lock:
+            entry = self._entry(program_run_id)
+            policy = entry.run.capture.node_policy_by_instance_id.get(
+                node_instance_id
+            )
+            if (
+                policy is None
+                or policy.recovery_policy["persistence_ceiling"] != "draft_patch"
+                or policy.modification_policy["persistent_edit"] == "forbidden"
+            ):
+                raise ProgramRunOwnerError(
+                    "captured node policy forbids Draft promotion"
+                )
+            store = entry.run.runtime_overrides
+        try:
+            return store.node_id(node_instance_id)
+        except ProgramValueError as error:
+            raise ProgramRunOwnerError(str(error)) from error
+
+    def runtime_override_source_context(
+        self,
+        program_run_id: str,
+        *,
+        node_instance_id: str,
+    ) -> dict[str, Any]:
+        """Return immutable captured node facts for owner-derived staging."""
+
+        with self._lock:
+            entry = self._entry(program_run_id)
+            store = entry.run.runtime_overrides
+        try:
+            return store.node_context(node_instance_id)
+        except ProgramValueError as error:
+            raise ProgramRunOwnerError(str(error)) from error
+
+    def clear_runtime_override(
+        self,
+        program_run_id: str,
+        *,
+        node_instance_id: str,
+        parameter_id: str,
+    ) -> ProgramRunSnapshot:
+        with self._lock:
+            entry = self._entry(program_run_id)
+            entry.run.runtime_overrides.clear(node_instance_id, parameter_id)
+            entry.revision += 1
+            return self._snapshot(entry)
+
+    def write_runtime_blackboard(
+        self,
+        program_run_id: str,
+        *,
+        key: str,
+        value: Any,
+        request_id: str,
+    ) -> ProgramRunSnapshot:
+        with self._lock:
+            entry = self._entry(program_run_id)
+            if entry.state not in {
+                ProgramRunState.RUNNING,
+                ProgramRunState.INTERVENTION_REQUIRED,
+            }:
+                raise ProgramRunOwnerError(
+                    "runtime blackboard writes require a current Program run"
+                )
+            store = entry.run.value_store
+        try:
+            store.write(
+                key,
+                value,
+                metadata={
+                    "program_run_id": program_run_id,
+                    "request_id": request_id,
+                    "value_source": "runtime_control",
+                },
+            )
+        except (KeyError, ProgramValueError) as error:
+            raise ProgramRunOwnerError(str(error)) from error
+        with self._lock:
+            entry = self._entry(program_run_id)
+            entry.revision += 1
+            return self._snapshot(entry)
+
+    def resolve_intervention(
+        self,
+        program_run_id: str,
+        *,
+        node_attempt_id: str,
+        action: str,
+        result: Any = None,
+    ) -> ProgramRunSnapshot:
+        port = self._ports.program_interventions
+        if port is None:
+            raise ProgramRunOwnerError("Program recovery owner is unavailable")
+        with self._lock:
+            entry = self._entry(program_run_id)
+            if entry.state is not ProgramRunState.INTERVENTION_REQUIRED:
+                raise ProgramRunOwnerError("Program recovery is not current")
+            intervention = port.read(program_run_id)
+            if (
+                intervention is None
+                or intervention.identity.node_attempt_id != node_attempt_id
+            ):
+                raise ProgramRunOwnerError("Program recovery attempt is stale")
+            port.resolve(intervention.identity, action=action, result=result)
+            entry.state = ProgramRunState.RUNNING
+            entry.reason_code = None
+            entry.message = ""
+            entry.revision += 1
+            return self._snapshot(entry)
+
+    def apply_owner_recovery(
+        self,
+        program_run_id: str,
+        *,
+        node_attempt_id: str,
+        action: str,
+        request_id: str,
+        reason: str | None,
+    ) -> Any:
+        """Delegate one exact action to the port that owns the held task."""
+
+        with self._lock:
+            entry = self._entry(program_run_id)
+            intervention = self.intervention(program_run_id)
+            if (
+                entry.state is not ProgramRunState.INTERVENTION_REQUIRED
+                or intervention is None
+                or intervention.identity.node_attempt_id != node_attempt_id
+                or intervention.owner_task_id is None
+                or intervention.owner_port_name is None
+            ):
+                raise ProgramRunOwnerError("owner recovery attempt is stale")
+            port = getattr(self._ports, intervention.owner_port_name, None)
+            recover = getattr(port, "recover", None)
+            if not callable(recover):
+                raise ProgramRunOwnerError(
+                    "held task owner does not expose addressed recovery"
+                )
+            task_id = intervention.owner_task_id
+            identity = intervention.identity
+        result = recover(
+            task_id,
+            identity,
+            action=action,
+            request_id=request_id,
+            reason=reason,
+        )
+        if not isinstance(result, Mapping) or type(result.get("accepted")) is not bool:
+            raise ProgramRunOwnerOutcomeUnknownError(
+                "owner recovery returned an invalid result"
+            )
+        assessment = result.get("resulting_assessment")
+        if isinstance(assessment, Mapping):
+            port = self._ports.program_interventions
+            if port is not None:
+                port.refresh_owner_assessment(identity, assessment)
+        return result
 
     def list_snapshots(
         self,
@@ -1132,6 +1375,7 @@ __all__ = [
     "ProgramRunAdmission",
     "ProgramRunOwner",
     "ProgramRunOwnerError",
+    "ProgramRunOwnerOutcomeUnknownError",
     "ProgramRunSnapshot",
     "ProgramRunState",
     "build_applied_program_run_admission",

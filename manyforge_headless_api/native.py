@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from copy import deepcopy
 from dataclasses import dataclass
 import json
 from pathlib import Path
@@ -19,6 +20,9 @@ MAX_NATIVE_RESPONSE_BYTES = 64 * 1024 * 1024
 MAX_SOURCE_MODEL_CONTEXT_ENVELOPE_BYTES = 64 * 1024
 MAX_SOURCE_MODEL_CONTEXT_RESPONSE_BYTES = (
     2 * MAX_NATIVE_RESPONSE_BYTES + MAX_SOURCE_MODEL_CONTEXT_ENVELOPE_BYTES
+)
+MAX_ASSISTANT_MODE_CONTEXT_RESPONSE_BYTES = (
+    3 * MAX_NATIVE_RESPONSE_BYTES + MAX_SOURCE_MODEL_CONTEXT_ENVELOPE_BYTES
 )
 MAX_VIEWER_MODEL_URDF_BYTES = 16 * 1024 * 1024
 MAX_VIEWER_MODEL_RESOURCE_BYTES = 256 * 1024 * 1024
@@ -39,11 +43,11 @@ class HeadlessApiError(RuntimeError):
         code: str,
         message: str,
         *,
-        details: Mapping[str, str] | None = None,
+        details: Mapping[str, Any] | None = None,
     ) -> None:
         super().__init__(message)
         self.code = code
-        self.details = dict(details or {})
+        self.details = deepcopy(dict(details or {}))
 
 
 @dataclass(frozen=True, slots=True)
@@ -212,6 +216,8 @@ class HeadlessCorePort(Protocol):
     def source_model_projection(self) -> dict[str, Any]: ...
 
     def source_model_context(self) -> dict[str, Any]: ...
+
+    def assistant_mode_context(self, mode_id: str) -> dict[str, Any]: ...
 
     def scenario_catalog_projection(self) -> dict[str, Any]: ...
 
@@ -387,11 +393,10 @@ class NativeHeadlessCore:
                 "headless_projection_response_invalid",
                 f"native {method} returned a non-text envelope",
             )
-        maximum_bytes = (
-            MAX_SOURCE_MODEL_CONTEXT_RESPONSE_BYTES
-            if method == "source_model_context"
-            else MAX_NATIVE_RESPONSE_BYTES
-        )
+        maximum_bytes = {
+            "assistant_mode_context": MAX_ASSISTANT_MODE_CONTEXT_RESPONSE_BYTES,
+            "source_model_context": MAX_SOURCE_MODEL_CONTEXT_RESPONSE_BYTES,
+        }.get(method, MAX_NATIVE_RESPONSE_BYTES)
         envelope = strict_json_object(
             payload,
             label=f"native {method} response",
@@ -592,6 +597,12 @@ class NativeHeadlessCore:
         return self._require_object(
             self._invoke("source_model_context"),
             method="source_model_context",
+        )
+
+    def assistant_mode_context(self, mode_id: str) -> dict[str, Any]:
+        return self._require_object(
+            self._invoke("assistant_mode_context", mode_id),
+            method="assistant_mode_context",
         )
 
     def scenario_catalog_projection(self) -> dict[str, Any]:

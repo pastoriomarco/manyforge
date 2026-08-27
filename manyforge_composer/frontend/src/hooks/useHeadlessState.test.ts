@@ -30,6 +30,8 @@ function state(
       programRunId: null,
       cycleClaimGeneration: null,
       terminalOrSettlementReference: null,
+      runtimeControlRevision: null,
+      recoveryOffer: null,
     },
     draftIdentity: { draftId: 'draft-1', draftRevision: 1 },
     receiverEpoch: runtimeEpoch,
@@ -110,6 +112,15 @@ describe('Headless owner-frame admission', () => {
     expect(sameHeadlessProjection(current, next)).toBe(false);
   });
 
+  it('publishes owner runtime-control revisions without invalidating the viewer', () => {
+    const current = state('receiver.epoch.1', 2);
+    const next = structuredClone(current);
+    next.snapshotSequence += 1;
+    next.programCycle.runtimeControlRevision = 2;
+    expect(sameHeadlessProjection(current, next)).toBe(false);
+    expect(sameViewerProjection(current, next)).toBe(true);
+  });
+
   it('does not publish Manager observation heartbeats as UI or viewer changes', () => {
     const current = state('receiver.epoch.1', 2);
     const heartbeat = structuredClone(current);
@@ -181,6 +192,8 @@ function wireState(generation: number): Record<string, unknown> {
       program_run_id: null,
       cycle_claim_generation: null,
       terminal_or_settlement_reference: null,
+      runtime_control_revision: null,
+      recovery_offer: null,
     },
     draft_identity: { draft_id: 'draft-1', draft_revision: 1 },
     receiver_epoch: 'receiver.epoch.1',

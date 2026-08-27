@@ -7,6 +7,7 @@
 #include <manyforge_core/types/execution_status.hpp>
 #include <manyforge_core/types/gripper.hpp>
 #include <manyforge_core/types/kernel_event.hpp>
+#include <manyforge_core/types/recovery.hpp>
 #include <manyforge_core/types/runtime_scale.hpp>
 #include <optional>
 #include <string>
@@ -59,6 +60,20 @@ class IResolvedParticipantExecutionEngine {
                                      std::uint64_t expected_generation) = 0;
 
   virtual ExecutionStatus get_status() const = 0;
+  virtual KernelRecoveryAssessmentDTO get_recovery_assessment() const {
+    return {};
+  }
+  virtual KernelRecoveryActionResultDTO apply_recovery_action(
+      const KernelRecoveryActionRequestDTO& request) {
+    return KernelRecoveryActionResultDTO{
+        request.request_id,
+        request.action,
+        false,
+        get_recovery_assessment(),
+        ErrorDTO{"recovery_unavailable",
+                 "participant execution engine does not expose recovery",
+                 {{"reason", "recovery_port_unavailable"}}}};
+  }
   virtual SubscriptionHandle subscribe_events(EventCallback callback) = 0;
   virtual void unsubscribe_events(SubscriptionHandle handle) = 0;
 };

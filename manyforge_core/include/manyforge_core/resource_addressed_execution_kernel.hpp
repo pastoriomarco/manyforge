@@ -213,6 +213,28 @@ struct CapabilityCommandPreviewResultDTO final {
   GripperCommandRequestDTO command_request;
 };
 
+struct OperationRecoveryParticipantDTO final {
+  OperationParticipantId operation_participant_id;
+  ControllableComponentId controllable_component_id;
+  CommandTargetId command_target_id;
+  CapabilityId capability_id;
+  ControlDomainId control_domain_id;
+  ControlBindingId control_binding_id;
+  std::optional<CapabilityProviderBindingId> capability_provider_binding_id;
+  ControlRouteId control_route_id;
+  ActiveControlConfigurationId active_control_configuration_id;
+  ActiveControlConfigurationGeneration active_control_configuration_generation{0U};
+  std::vector<ResourceId> resource_ids;
+};
+
+struct OperationRecoveryProjectionDTO final {
+  OperationRevision operation_revision{0U};
+  std::optional<StopId> stop_id;
+  std::optional<StopGeneration> stop_generation;
+  KernelRecoveryAssessmentDTO assessment;
+  std::vector<OperationRecoveryParticipantDTO> participants;
+};
+
 /// Resource-addressed Kernel owner.
 ///
 /// Independent operations own exact resource scopes and may remain active
@@ -316,6 +338,15 @@ class ResourceAddressedExecutionKernel final : public IAddressedOperationOwner,
   /// resident operation from retained history.
   [[nodiscard]] Result<OperationReadProjectionDTO> get_operation_projection(
       const OperationId& operation_id) const;
+
+  [[nodiscard]] Result<OperationRecoveryProjectionDTO>
+  get_operation_recovery_assessment(const OperationId& operation_id) const;
+
+  [[nodiscard]] Result<KernelRecoveryActionResultDTO>
+  apply_operation_recovery_action(
+      const OperationId& operation_id,
+      OperationRevision expected_operation_revision,
+      const KernelRecoveryActionRequestDTO& request);
 
   /// NRT owner-scheduler reconciliation point. This closes event-loss windows
   /// and advances capability-command completion without making public reads
@@ -506,6 +537,7 @@ class ResourceAddressedExecutionKernel final : public IAddressedOperationOwner,
   // never takes this mutex, so a slow current-facts owner or journal cannot
   // delay emergency containment.
   mutable std::mutex stop_fault_recovery_mutex_;
+  mutable std::mutex operation_recovery_mutex_;
   mutable std::mutex state_mutex_;
   std::vector<ReplayEntry> replay_ledger_;
   std::vector<ControlReplayEntry> control_replay_ledger_;
@@ -514,6 +546,8 @@ class ResourceAddressedExecutionKernel final : public IAddressedOperationOwner,
   std::vector<RuntimeScaleReplayEntry> runtime_scale_replay_ledger_;
   struct StopFaultRecoveryReplayEntry;
   std::vector<StopFaultRecoveryReplayEntry> stop_fault_recovery_replay_ledger_;
+  struct OperationRecoveryReplayEntry;
+  std::vector<OperationRecoveryReplayEntry> operation_recovery_replay_ledger_;
   std::vector<OperationStateDTO> historical_operations_;
   /// Canonical bounded resident operation table. Every accepted operation also
   /// consumes one entry in the fixed-capacity replay ledger, so this table can

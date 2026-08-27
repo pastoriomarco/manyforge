@@ -13,13 +13,21 @@ from manyforge_behavior.canonical_artifact import (
     raw_sha256_digest,
 )
 
-from .node_environment_client import VerifiedActiveNodeEnvironment
+from .node_environment_client import (
+    VerifiedActiveNodeEnvironment,
+    verify_active_node_environment,
+)
+from .source_model_client import (
+    VerifiedActiveSourceModel,
+    verify_active_source_model,
+)
 
 if TYPE_CHECKING:
     from .state import ComposerState
 
 
 _PROJECTION_VERSION = "manyforge.assistant_mode_projection.v1"
+_CONTEXT_VERSION = "manyforge.assistant_mode_context.v1"
 _CATALOG_VERSION = "manyforge.assistant_mode_catalog.v1"
 _PROJECTION_FIELDS = {
     "assistant_projection_digest",
@@ -72,6 +80,13 @@ class ActiveAssistantModeProjectionError(RuntimeError):
 class VerifiedActiveAssistantMode:
     payload: dict[str, Any]
     tools: dict[str, dict[str, Any]]
+
+
+@dataclass(frozen=True, slots=True)
+class VerifiedActiveAssistantContext:
+    node_environment: VerifiedActiveNodeEnvironment
+    source_model: VerifiedActiveSourceModel
+    assistant_mode: VerifiedActiveAssistantMode
 
 
 def _invalid(message: str) -> ActiveAssistantModeProjectionError:
@@ -445,9 +460,69 @@ def read_active_assistant_mode(
     )
 
 
+def verify_active_assistant_context(
+    state: "ComposerState",
+    payload: Any,
+    *,
+    mode: str,
+) -> VerifiedActiveAssistantContext:
+    context = _object(payload, "assistant mode context")
+    _closed(
+        context,
+        {"assistant_mode", "node_environment", "schema_version", "source_model"},
+        "assistant mode context",
+    )
+    if context.get("schema_version") != _CONTEXT_VERSION:
+        raise _invalid("assistant mode context version is unsupported")
+    node_environment = verify_active_node_environment(
+        state,
+        context["node_environment"],
+    )
+    source_model = verify_active_source_model(
+        context["source_model"],
+        node_environment=node_environment,
+    )
+    assistant_mode = verify_active_assistant_mode(
+        context["assistant_mode"],
+        expected_mode=mode,
+        node_environment=node_environment,
+    )
+    return VerifiedActiveAssistantContext(
+        node_environment=node_environment,
+        source_model=source_model,
+        assistant_mode=assistant_mode,
+    )
+
+
+def read_active_assistant_context(
+    state: "ComposerState",
+    *,
+    mode: str,
+) -> VerifiedActiveAssistantContext:
+    client = state.headless_client
+    if client is None:
+        raise _invalid("Composer has no configured headless client")
+    try:
+        payload = client.assistant_mode_context(mode)
+    except Exception as error:
+        code = getattr(error, "code", None)
+        if isinstance(code, str) and code:
+            status_code = getattr(error, "status_code", None)
+            raise ActiveAssistantModeProjectionError(
+                code,
+                str(error),
+                status_code if isinstance(status_code, int) else 503,
+            ) from error
+        raise
+    return verify_active_assistant_context(state, payload, mode=mode)
+
+
 __all__ = [
     "ActiveAssistantModeProjectionError",
+    "VerifiedActiveAssistantContext",
     "VerifiedActiveAssistantMode",
+    "read_active_assistant_context",
     "read_active_assistant_mode",
+    "verify_active_assistant_context",
     "verify_active_assistant_mode",
 ]

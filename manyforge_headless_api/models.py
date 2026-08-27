@@ -261,6 +261,18 @@ class ProgramRunStartRequest(CallerAttributionRequest):
     ]
 
 
+class ProgramScenePreparationRequest(CallerAttributionRequest):
+    """Prepare the exact current Applied Program scene while the cycle is Idle."""
+
+    expected_applied_record_digest: Annotated[
+        str,
+        Field(pattern=SHA256_PATTERN),
+    ]
+    expected_admission_generation: Annotated[
+        int, Field(ge=1, le=9_007_199_254_740_991)
+    ]
+
+
 class ProgramRunStopRequest(CallerAttributionRequest):
     """Request Kernel-first Stop for one exact runner-owned Program run."""
 
@@ -306,6 +318,138 @@ class ProgramCycleResetRequest(CallerAttributionRequest):
     def validate_cycle_identity(cls, value: str, info) -> str:
         return _bounded_nfc(
             value, label=info.field_name, maximum_bytes=MAX_IDENTITY_BYTES
+        )
+
+
+class ProgramRunControlRequest(CallerAttributionRequest):
+    """Common exact fence for one current-run-only control."""
+
+    program_run_id: str
+    expected_owner_epoch: str
+    expected_run_revision: Annotated[
+        int, Field(ge=1, le=9_007_199_254_740_991)
+    ]
+
+    @field_validator("program_run_id", "expected_owner_epoch")
+    @classmethod
+    def validate_runtime_identity(cls, value: str, info) -> str:
+        return _bounded_nfc(
+            value, label=info.field_name, maximum_bytes=MAX_IDENTITY_BYTES
+        )
+
+
+class RuntimeOverrideStageRequest(ProgramRunControlRequest):
+    node_instance_id: str
+    node_attempt_id: str
+    parameter_id: str
+    value: Any
+    source_observation_id: str | None = None
+    source_owner_generation: Annotated[
+        int, Field(ge=1, le=9_007_199_254_740_991)
+    ] | None = None
+
+    @field_validator(
+        "node_instance_id",
+        "node_attempt_id",
+        "parameter_id",
+        "source_observation_id",
+    )
+    @classmethod
+    def validate_override_identity(cls, value: str | None, info) -> str | None:
+        if value is None:
+            return None
+        return _bounded_nfc(
+            value, label=info.field_name, maximum_bytes=MAX_IDENTITY_BYTES
+        )
+
+    @model_validator(mode="after")
+    def exact_source(self) -> "RuntimeOverrideStageRequest":
+        if (self.source_observation_id is None) != (
+            self.source_owner_generation is None
+        ):
+            raise ValueError(
+                "runtime override source identity and generation are paired"
+            )
+        return self
+
+
+class RuntimeOverrideActionRequest(ProgramRunControlRequest):
+    override_id: Annotated[str, Field(pattern=SHA256_PATTERN)]
+    expected_override_revision: Annotated[
+        int, Field(ge=1, le=9_007_199_254_740_991)
+    ]
+
+
+class RuntimeOverridePromotionRequest(RuntimeOverrideActionRequest):
+    expected_draft_id: str
+    expected_draft_revision: Annotated[
+        int, Field(ge=1, le=9_007_199_254_740_991)
+    ]
+
+    @field_validator("expected_draft_id")
+    @classmethod
+    def validate_draft_identity(cls, value: str) -> str:
+        return _bounded_nfc(
+            value, label="expected_draft_id", maximum_bytes=MAX_IDENTITY_BYTES
+        )
+
+
+class RuntimeBlackboardWriteRequest(ProgramRunControlRequest):
+    key: str
+    value: Any
+
+    @field_validator("key")
+    @classmethod
+    def validate_key(cls, value: str) -> str:
+        return _bounded_nfc(
+            value, label="key", maximum_bytes=MAX_IDENTITY_BYTES
+        )
+
+
+class ManualResultStageRequest(ProgramRunControlRequest):
+    node_instance_id: str
+    node_attempt_id: str
+    outcome: Literal["succeeded", "failed"]
+    output: Any = None
+
+    @field_validator("node_instance_id", "node_attempt_id")
+    @classmethod
+    def validate_attempt_identity(cls, value: str, info) -> str:
+        return _bounded_nfc(
+            value, label=info.field_name, maximum_bytes=MAX_IDENTITY_BYTES
+        )
+
+
+class CycleRecoveryActionRequest(CallerAttributionRequest):
+    """Consume exactly one current owner-issued cycle recovery offer."""
+
+    expected_owner_epoch: str
+    offer_id: Annotated[str, Field(pattern=SHA256_PATTERN)]
+    offer_revision: Annotated[int, Field(ge=1, le=9_007_199_254_740_991)]
+    action_id: Literal[
+        "retry_motion_from_current_state",
+        "acknowledge_and_continue",
+        "retry_after_scene_repair",
+        "replan_from_stopped_state",
+        "retry_runtime_step",
+        "reset_cycle",
+    ]
+    reason: str | None = None
+
+    @field_validator("expected_owner_epoch")
+    @classmethod
+    def validate_recovery_owner(cls, value: str) -> str:
+        return _bounded_nfc(
+            value, label="expected_owner_epoch", maximum_bytes=MAX_IDENTITY_BYTES
+        )
+
+    @field_validator("reason")
+    @classmethod
+    def validate_recovery_reason(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        return _bounded_nfc(
+            value, label="reason", maximum_bytes=MAX_STOP_REASON_BYTES
         )
 
 
@@ -1798,6 +1942,54 @@ class OperationControlRequest(StrictRequest):
         if value is None:
             return None
         return _bounded_nfc(value, label="reason", maximum_bytes=MAX_REASON_BYTES)
+
+
+class OperationRecoveryActionRequest(StrictRequest):
+    """Private Program-Runner request to one exact native operation owner."""
+
+    request_id: str
+    action: Literal[
+        "retry_motion_from_current_state",
+        "acknowledge_and_continue",
+        "retry_after_scene_repair",
+        "replan_from_stopped_state",
+        "reset_cycle",
+    ]
+    principal_id: str = ""
+    expected_assessment_revision: Annotated[
+        int, Field(ge=1, le=9_007_199_254_740_991)
+    ]
+    expected_control_command_epoch: Annotated[
+        int, Field(ge=0, le=9_007_199_254_740_991)
+    ]
+    expected_execution_id: Annotated[
+        int, Field(ge=1, le=9_007_199_254_740_991)
+    ]
+    expected_latch_id: str = ""
+    expected_stop_certificate_id: str = ""
+    expected_stop_owner_generation: Annotated[
+        int, Field(ge=0, le=9_007_199_254_740_991)
+    ] = 0
+    reason: str = ""
+
+    @field_validator(
+        "request_id",
+        "principal_id",
+        "expected_latch_id",
+        "expected_stop_certificate_id",
+        "reason",
+    )
+    @classmethod
+    def validate_text(cls, value: str, info) -> str:
+        if info.field_name == "request_id" and not value:
+            raise ValueError("request_id must be non-empty")
+        if not value:
+            return value
+        return _bounded_nfc(
+            value,
+            label=info.field_name,
+            maximum_bytes=(MAX_REASON_BYTES if info.field_name == "reason" else MAX_IDENTITY_BYTES),
+        )
 
 
 class StopOperationTargetRequest(StrictRequest):

@@ -25,12 +25,17 @@ from manyforge_behavior.node_environment import NodeEnvironment
 from manyforge_behavior.orchestration_ports import NodeAdapterPorts, NodeAttemptIdentity
 from manyforge_behavior.orchestration_values import (
     NodeAttemptInputResolver,
+    ProgramRuntimeOverrideStore,
     ProgramValueStore,
 )
 from manyforge_behavior.program import (
     Program,
     ProgramNodePolicy,
     ProgramTreeNode,
+)
+from manyforge_behavior.recovery import (
+    RecoveryAwareNode,
+    recovery_policy_is_actionable,
 )
 
 PROGRAM_RUN_CAPTURE_API: Final = "manyforge.program_run_capture.v1"
@@ -302,11 +307,16 @@ class ExecutableProgramRun:
             )
 
         self._value_store = ProgramValueStore.from_program(program)
+        self._runtime_overrides = ProgramRuntimeOverrideStore(
+            program=program,
+            catalog=environment.catalog,
+        )
         self._input_resolver = NodeAttemptInputResolver(
             program=program,
             catalog=environment.catalog,
             value_store=self._value_store,
             program_parameter_values=program_parameter_values,
+            runtime_overrides=self._runtime_overrides,
         )
         self._attempt_source = ProgramRunAttemptSource(capture.program_run_id)
         self._ports = ports
@@ -322,7 +332,7 @@ class ExecutableProgramRun:
     ) -> py_trees.behaviour.Behaviour:
         children = tuple(self._build_node(child) for child in node.children)
         row = self._environment.registry.record(node.node_id, "py_trees")
-        return self._resolver.instantiate(
+        built = self._resolver.instantiate(
             row,
             NodeAdapterBuildContext(
                 name=node.instance_id,
@@ -335,6 +345,21 @@ class ExecutableProgramRun:
                 ports=self._ports,
             ),
         )
+        policy = self._capture.node_policy_by_instance_id.get(node.instance_id)
+        recovery_port = self._ports.program_interventions
+        if (
+            policy is not None
+            and recovery_policy_is_actionable(policy)
+            and recovery_port is not None
+        ):
+            return RecoveryAwareNode(
+                child=built,
+                node_instance_id=node.instance_id,
+                policy=policy,
+                attempt_source=self._attempt_source,
+                recovery_port=recovery_port,
+            )
+        return built
 
     @property
     def capture(self) -> ProgramRunCapture:
@@ -347,6 +372,10 @@ class ExecutableProgramRun:
     @property
     def value_store(self) -> ProgramValueStore:
         return self._value_store
+
+    @property
+    def runtime_overrides(self) -> ProgramRuntimeOverrideStore:
+        return self._runtime_overrides
 
     @property
     def status(self) -> py_trees.common.Status:

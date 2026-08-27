@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 from contextlib import ExitStack, contextmanager
+from copy import deepcopy
 from dataclasses import dataclass
 import json
 import os
@@ -18,7 +19,7 @@ from typing import Any, Final, Iterator
 from .liveness import RetainedLiveness
 
 
-SCHEMA_VERSION: Final = 2
+SCHEMA_VERSION: Final = 3
 _REQUIRED_TABLE_SHAPES: Final[
     dict[str, tuple[tuple[str, str, int, int], ...]]
 ] = {
@@ -35,6 +36,7 @@ _REQUIRED_TABLE_SHAPES: Final[
         ("claim_json", "TEXT", 0, 0),
         ("capture_identities_json", "TEXT", 0, 0),
         ("terminal_reference", "TEXT", 0, 0),
+        ("start_settlement_json", "TEXT", 0, 0),
         ("release_intent_json", "TEXT", 0, 0),
         ("reset_result_json", "TEXT", 0, 0),
         ("reconciliation_required", "INTEGER", 1, 0),
@@ -81,6 +83,7 @@ _REQUIRED_TABLE_SQL: Final[dict[str, str]] = {
           claim_json TEXT,
           capture_identities_json TEXT,
           terminal_reference TEXT,
+          start_settlement_json TEXT,
           release_intent_json TEXT,
           reset_result_json TEXT,
           reconciliation_required INTEGER NOT NULL
@@ -132,7 +135,19 @@ STATES: Final = frozenset(
         "terminal_awaiting_reset",
     }
 )
-_REQUEST_KINDS: Final = frozenset({"start", "reset"})
+_REQUEST_KINDS: Final = frozenset(
+    {
+        "start",
+        "reset",
+        "runtime_override_stage",
+        "runtime_override_activate",
+        "runtime_override_clear",
+        "runtime_override_promote",
+        "runtime_blackboard_write",
+        "manual_result_stage",
+        "recovery_action",
+    }
+)
 _TERMINAL_RUN_STATES: Final = frozenset({"stopped", "succeeded", "failed"})
 
 
@@ -192,6 +207,7 @@ class CycleRecord:
     claim: dict[str, Any] | None
     capture_identities: dict[str, Any] | None
     terminal_reference: str | None
+    start_settlement: dict[str, Any] | None
     release_intent: dict[str, Any] | None
     reset_result: dict[str, Any] | None
     reconciliation_required: bool
@@ -630,15 +646,15 @@ class ProgramCycleJournal:
                     cycle_rows[0][4] is not None
                     and not _bounded_identity(cycle_rows[0][4])
                 )
-                or type(cycle_rows[0][10]) is not int
-                or cycle_rows[0][10] not in {0, 1}
+                or type(cycle_rows[0][11]) is not int
+                or cycle_rows[0][11] not in {0, 1}
                 or any(
                     value is not None and not isinstance(value, str)
-                    for value in (cycle_rows[0][7], cycle_rows[0][12])
+                    for value in (cycle_rows[0][7], cycle_rows[0][13])
                 )
             ):
                 raise RuntimeError("Program-cycle journal owner row is corrupt")
-            for index in (5, 6, 8, 9, 11):
+            for index in (5, 6, 8, 9, 10, 12):
                 _strict_object(cycle_rows[0][index])
 
             request_count = 0
@@ -928,10 +944,11 @@ class ProgramCycleJournal:
                         INSERT INTO program_cycle
                         (singleton,cycle_generation,state,owner_epoch,program_run_id,
                          claim_json,capture_identities_json,terminal_reference,
+                         start_settlement_json,
                          reset_result_json,reconciliation_required,
                          acquisition_pending_json,reconciliation_evidence_digest,
                          release_intent_json)
-                        VALUES(1,1,'idle_after_reset',?,NULL,NULL,NULL,NULL,NULL,0,NULL,NULL,NULL)
+                        VALUES(1,1,'idle_after_reset',?,NULL,NULL,NULL,NULL,NULL,NULL,0,NULL,NULL,NULL)
                         """,
                         (owner_epoch,),
                     )
@@ -1144,7 +1161,8 @@ class ProgramCycleJournal:
             row = self._database.execute(
                 """
                 SELECT cycle_generation,state,owner_epoch,program_run_id,claim_json,
-                       capture_identities_json,terminal_reference,release_intent_json,
+                       capture_identities_json,terminal_reference,
+                       start_settlement_json,release_intent_json,
                        reset_result_json,
                        reconciliation_required,acquisition_pending_json,
                        reconciliation_evidence_digest
@@ -1163,9 +1181,10 @@ class ProgramCycleJournal:
             row[6],
             self._load(row[7]),
             self._load(row[8]),
-            bool(row[9]),
-            self._load(row[10]),
-            row[11],
+            self._load(row[9]),
+            bool(row[10]),
+            self._load(row[11]),
+            row[12],
         )
 
     def remember_release_intent(
@@ -1241,9 +1260,16 @@ class ProgramCycleJournal:
         request_id: str,
         code: str,
         message: str,
+        details: Mapping[str, Any] | None = None,
     ) -> None:
         """Durably retain one exact typed no-success result."""
-        encoded = self._dump({"code": code, "message": message})
+        encoded = self._dump(
+            {
+                "code": code,
+                "details": deepcopy(dict(details or {})),
+                "message": message,
+            }
+        )
         with self._transaction():
             changed = self._database.execute(
                 """
@@ -1287,6 +1313,7 @@ class ProgramCycleJournal:
         capture_identities: Mapping[str, Any] | None = None,
         run_snapshot: Mapping[str, Any] | None = None,
         terminal_reference: str | None = None,
+        start_settlement: Mapping[str, Any] | None = None,
         reconciliation_required: bool = False,
     ) -> None:
         if state not in STATES:
@@ -1302,6 +1329,7 @@ class ProgramCycleJournal:
                     claim_json=COALESCE(?,claim_json),
                     capture_identities_json=COALESCE(?,capture_identities_json),
                     terminal_reference=COALESCE(?,terminal_reference),
+                    start_settlement_json=COALESCE(?,start_settlement_json),
                     reconciliation_required=?, acquisition_pending_json=NULL
                 WHERE singleton=1 AND cycle_generation=?
                   AND state IN ({placeholders})
@@ -1312,6 +1340,7 @@ class ProgramCycleJournal:
                     self._dump(claim),
                     self._dump(capture_identities),
                     terminal_reference,
+                    self._dump(start_settlement),
                     int(reconciliation_required),
                     expected_generation,
                     *expected_states,
@@ -1393,6 +1422,41 @@ class ProgramCycleJournal:
                 (program_run_id,),
             ).fetchone()
         return None if row is None else self._load(row[0])
+
+    def read_runtime_controls(
+        self, program_run_id: str
+    ) -> dict[str, Any] | None:
+        """Read the newest successful C2 snapshot from the existing ledger."""
+
+        if not _bounded_identity(program_run_id):
+            raise ValueError("Program-run identity is invalid")
+        with self._lock:
+            self._validate_storage()
+            rows = self._database.execute(
+                "SELECT result_json FROM program_cycle_requests "
+                "WHERE result_json IS NOT NULL ORDER BY rowid DESC"
+            ).fetchall()
+        newest: dict[str, Any] | None = None
+        newest_revision = 0
+        for (encoded,) in rows:
+            result = self._load(encoded)
+            if not isinstance(result, dict):
+                continue
+            projection = result.get("runtime_controls")
+            if isinstance(projection, dict) and isinstance(
+                projection.get("runtime_controls"), dict
+            ):
+                projection = projection["runtime_controls"]
+            if (
+                not isinstance(projection, dict)
+                or projection.get("program_run_id") != program_run_id
+                or type(projection.get("runtime_control_revision")) is not int
+                or projection["runtime_control_revision"] <= newest_revision
+            ):
+                continue
+            newest = projection
+            newest_revision = projection["runtime_control_revision"]
+        return deepcopy(newest)
 
     def list_run_snapshots(self, *, limit: int) -> tuple[list[dict[str, Any]], bool]:
         if type(limit) is not int or not 1 <= limit <= self._maximum_retained_runs:
@@ -1625,6 +1689,30 @@ class ProgramCycleJournal:
             if changed != 1:
                 raise RuntimeError("Program-cycle replay request is absent")
 
+    def complete_control_request(
+        self,
+        *,
+        owner_epoch: str,
+        request_id: str,
+        result: Mapping[str, Any],
+        run_snapshot: Mapping[str, Any],
+    ) -> None:
+        """Atomically retain one C2 result and its exact updated run view."""
+
+        encoded = self._dump(result)
+        with self._transaction():
+            self._retain_run_snapshot_locked(run_snapshot)
+            changed = self._database.execute(
+                """
+                UPDATE program_cycle_requests SET result_json=COALESCE(result_json,?)
+                WHERE request_owner_epoch=? AND request_id=?
+                  AND error_json IS NULL
+                """,
+                (encoded, owner_epoch, request_id),
+            ).rowcount
+            if changed != 1:
+                raise RuntimeError("Program-cycle replay request is absent")
+
     def publish_reset(
         self,
         *,
@@ -1643,6 +1731,7 @@ class ProgramCycleJournal:
                     state='idle_after_reset', owner_epoch=?,
                     program_run_id=NULL, claim_json=NULL,
                     capture_identities_json=NULL, terminal_reference=NULL,
+                    start_settlement_json=NULL,
                     release_intent_json=NULL,
                     reset_result_json=?, reconciliation_required=0,
                     acquisition_pending_json=NULL,

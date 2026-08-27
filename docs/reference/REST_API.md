@@ -3,7 +3,7 @@
   Regenerate with:
     cd <repository-root>
     python3 scripts/regen-public-contracts.py structural-rest
-  Last regenerated: 2026-08-26 17:30:52 UTC
+  Last regenerated: 2026-08-27 18:29:21 UTC
   Generator source: scripts/regen-public-contracts.py:gen_rest_api
 -->
 
@@ -31,6 +31,8 @@ OpenAPI version: `3.1.0`. Title: `ManyForge Composer (replaceable client)`.
 | `GET` | `/api/cclc/owner` | headless-runtime-client | Cclc Owner Identity |
 | `POST` | `/api/cclc/routes/requests` | headless-runtime-client | Cclc Route Submit |
 | `GET` | `/api/cclc/routes/transactions/{transaction_id}` | headless-runtime-client | Cclc Route Status |
+| `POST` | `/api/cycle/recovery-actions` | headless-runtime-client | Cycle Recovery Action |
+| `GET` | `/api/cycle/status` | headless-runtime-client | Program Cycle Status |
 | `GET` | `/api/execution/alarms` | headless-runtime-client | Alarms |
 | `POST` | `/api/execution/alarms/acknowledge-all` | headless-runtime-client | Acknowledge All |
 | `GET` | `/api/execution/alarms/metrics` | headless-runtime-client | Alarm Metrics |
@@ -70,10 +72,10 @@ OpenAPI version: `3.1.0`. Title: `ManyForge Composer (replaceable client)`.
 | `GET` | `/api/program/applied` | headless-runtime-client | Program Applied |
 | `POST` | `/api/program/apply` | composer-draft | Apply Draft |
 | `POST` | `/api/program/cycle/reset` | headless-runtime-client | Program Cycle Reset |
-| `GET` | `/api/program/cycle/status` | headless-runtime-client | Program Cycle Status |
 | `POST` | `/api/program/discard` | composer-draft | Discard Draft |
 | `GET` | `/api/program/draft` | composer-draft | Read Draft |
 | `POST` | `/api/program/draft/mutations` | composer-draft | Mutate Draft |
+| `POST` | `/api/program/draft/runtime-override-promotions` | composer-draft | Materialize Runtime Override |
 | `GET` | `/api/program/draft/scene-meshes/resolve` | headless-scene-mesh-client | Resolve Program Draft Scene Mesh |
 | `GET` | `/api/program/draft/scene-meshes/{asset_hash}.glb` | headless-scene-mesh-client | Get Program Draft Scene Mesh |
 | `POST` | `/api/program/load` | composer-draft | Removed Program Load |
@@ -83,6 +85,13 @@ OpenAPI version: `3.1.0`. Title: `ManyForge Composer (replaceable client)`.
 | `GET` | `/api/program/runs` | headless-runtime-client | Program Runs |
 | `POST` | `/api/program/runs` | headless-runtime-client | Program Run Start |
 | `GET` | `/api/program/runs/{program_run_id}` | headless-runtime-client | Program Run Read |
+| `POST` | `/api/program/runs/{program_run_id}/blackboard-values` | headless-runtime-client | Write Runtime Blackboard |
+| `POST` | `/api/program/runs/{program_run_id}/manual-result` | headless-runtime-client | Stage Manual Result |
+| `GET` | `/api/program/runs/{program_run_id}/runtime-controls` | headless-runtime-client | Program Runtime Controls |
+| `POST` | `/api/program/runs/{program_run_id}/runtime-overrides` | headless-runtime-client | Stage Runtime Override |
+| `POST` | `/api/program/runs/{program_run_id}/runtime-overrides/activate` | headless-runtime-client | Activate Runtime Override |
+| `POST` | `/api/program/runs/{program_run_id}/runtime-overrides/clear` | headless-runtime-client | Clear Runtime Override |
+| `POST` | `/api/program/runs/{program_run_id}/runtime-overrides/promote` | headless-runtime-client | Promote Runtime Override |
 | `POST` | `/api/program/runs/{program_run_id}/stop` | headless-runtime-client | Program Run Stop |
 | `POST` | `/api/program/save` | composer-draft | Save Draft |
 | `POST` | `/api/program/save-as` | composer-draft | Save Draft As |
