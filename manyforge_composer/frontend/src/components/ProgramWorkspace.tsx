@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import type { CSSProperties } from 'react';
+import { createPortal } from 'react-dom';
 
 import type { ProgramRuntimeController } from '../hooks/useProgramRuntime';
 import type { ProgramWorkspaceController } from '../hooks/useProgramWorkspace';
@@ -29,11 +30,8 @@ import { ProgramTreeCanvas } from './ProgramTreeCanvas';
 
 const PROGRAM_TOOL_MIN = 160;
 const PROGRAM_TOOL_MAX = 360;
-const PROGRAM_INSPECTOR_MIN = 240;
-const PROGRAM_INSPECTOR_MAX = 480;
 const PROGRAM_CANVAS_MIN = 216;
 const PROGRAM_DIVIDER_WIDTH = 7;
-const PROGRAM_COLLAPSED_RAIL_WIDTH = 38;
 export const PROGRAM_INFO_NOTICE_TIMEOUT_MS = 4_000;
 
 function clamp(value: number, min: number, max: number): number {
@@ -63,6 +61,15 @@ interface ProgramWorkspaceProps {
   onInvalidEditChange?: (invalid: boolean) => void;
   onOpenScene?: () => void;
   onOpenProgramSettings?: () => void;
+  inspectorTarget?: HTMLElement | null;
+  inspectorMinimized?: boolean;
+  onInspectorMinimizedChange?: (minimized: boolean) => void;
+  onInspectorMaximize?: () => void;
+  onInspectorStateChange?: (state: {
+    active: boolean;
+    title: string;
+    readOnlyReason: string | null;
+  }) => void;
   programRequirementCreated?: {
     sequence: number;
     id: string;
@@ -81,6 +88,11 @@ export function ProgramWorkspace({
   onInvalidEditChange,
   onOpenScene,
   onOpenProgramSettings,
+  inspectorTarget = null,
+  inspectorMinimized = false,
+  onInspectorMinimizedChange,
+  onInspectorMaximize,
+  onInspectorStateChange,
   programRequirementCreated = null,
 }: ProgramWorkspaceProps) {
   const {
@@ -94,7 +106,6 @@ export function ProgramWorkspace({
   } = controller;
   const [selectedNodeId, setSelectedNodeId] = useState<string | null>(null);
   const [paletteCollapsed, setPaletteCollapsed] = useState(false);
-  const [inspectorCollapsed, setInspectorCollapsed] = useState(false);
   const [toolView, setToolView] = useState<'nodes' | 'params'>('nodes');
   const [declarationSelection, setDeclarationSelection] = useState<ProgramDeclarationSelection | null>(null);
   const [declarationPrefill, setDeclarationPrefill] = useState<{
@@ -111,7 +122,6 @@ export function ProgramWorkspace({
   } | null>(null);
   const [invalidLocalEdit, setInvalidLocalEdit] = useState(false);
   const [paletteWidth, setPaletteWidth] = useState(216);
-  const [inspectorWidth, setInspectorWidth] = useState(288);
   const [authoringWidth, setAuthoringWidth] = useState(856);
   const [notices, setNotices] = useState<ProgramNotice[]>([]);
   const noticeSequence = useRef(0);
@@ -121,10 +131,7 @@ export function ProgramWorkspace({
   const authoringGrid = useRef<HTMLDivElement>(null);
   const paletteCollapseButton = useRef<HTMLButtonElement>(null);
   const paletteRail = useRef<HTMLButtonElement>(null);
-  const inspectorCollapseButton = useRef<HTMLButtonElement>(null);
-  const inspectorRail = useRef<HTMLButtonElement>(null);
   const previousPaletteCollapsed = useRef(false);
-  const previousInspectorCollapsed = useRef(false);
   const dismissNotice = useCallback((id: string) => {
     const timeout = noticeTimeouts.current.get(id);
     if (timeout !== undefined) window.clearTimeout(timeout);
@@ -204,7 +211,8 @@ export function ProgramWorkspace({
   const selectNode = useCallback((instanceId: string | null) => {
     if (invalidLocalEdit && instanceId !== selectedNodeId) return;
     setSelectedNodeId(instanceId);
-  }, [invalidLocalEdit, selectedNodeId]);
+    if (instanceId !== null) onInspectorMinimizedChange?.(false);
+  }, [invalidLocalEdit, onInspectorMinimizedChange, selectedNodeId]);
   const changeToolView = useCallback((view: 'nodes' | 'params') => {
     if (invalidLocalEdit && view !== toolView) return;
     setToolView(view);
@@ -215,7 +223,8 @@ export function ProgramWorkspace({
       && (selection.kind !== declarationSelection?.kind || selection.id !== declarationSelection.id)
     ) return;
     setDeclarationSelection(selection);
-  }, [declarationSelection, invalidLocalEdit]);
+    onInspectorMinimizedChange?.(false);
+  }, [declarationSelection, invalidLocalEdit, onInspectorMinimizedChange]);
   useEffect(() => {
     onInvalidEditChange?.(invalidLocalEdit);
     return () => onInvalidEditChange?.(false);
@@ -307,21 +316,17 @@ export function ProgramWorkspace({
       if (response !== null) {
         setToolView('nodes');
         setSelectedNodeId(pendingReference.nodeId);
+        onInspectorMinimizedChange?.(false);
       }
       setPendingReference(null);
       setDeclarationPrefill(null);
     });
-  }, [authoring, mutate, mutationAvailable, pendingReference]);
+  }, [authoring, mutate, mutationAvailable, onInspectorMinimizedChange, pendingReference]);
   useEffect(() => {
     if (paletteCollapsed) paletteRail.current?.focus();
     else if (previousPaletteCollapsed.current) paletteCollapseButton.current?.focus();
     previousPaletteCollapsed.current = paletteCollapsed;
   }, [paletteCollapsed]);
-  useEffect(() => {
-    if (inspectorCollapsed) inspectorRail.current?.focus();
-    else if (previousInspectorCollapsed.current) inspectorCollapseButton.current?.focus();
-    previousInspectorCollapsed.current = inspectorCollapsed;
-  }, [inspectorCollapsed]);
   useEffect(() => {
     const element = authoringGrid.current;
     if (element === null) return undefined;
@@ -332,32 +337,16 @@ export function ProgramWorkspace({
     return () => observer.disconnect();
   }, []);
 
-  const inspectorReservation = inspectorCollapsed
-    ? PROGRAM_COLLAPSED_RAIL_WIDTH
-    : inspectorWidth + PROGRAM_DIVIDER_WIDTH;
-  const paletteReservation = paletteCollapsed
-    ? PROGRAM_COLLAPSED_RAIL_WIDTH
-    : paletteWidth + PROGRAM_DIVIDER_WIDTH;
   const paletteWidthMax = Math.max(
     PROGRAM_TOOL_MIN,
     Math.min(
       PROGRAM_TOOL_MAX,
-      authoringWidth - inspectorReservation - PROGRAM_CANVAS_MIN - PROGRAM_DIVIDER_WIDTH,
-    ),
-  );
-  const inspectorWidthMax = Math.max(
-    PROGRAM_INSPECTOR_MIN,
-    Math.min(
-      PROGRAM_INSPECTOR_MAX,
-      authoringWidth - paletteReservation - PROGRAM_CANVAS_MIN - PROGRAM_DIVIDER_WIDTH,
+      authoringWidth - PROGRAM_CANVAS_MIN - PROGRAM_DIVIDER_WIDTH,
     ),
   );
   useEffect(() => {
     setPaletteWidth((current) => clamp(current, PROGRAM_TOOL_MIN, paletteWidthMax));
   }, [paletteWidthMax]);
-  useEffect(() => {
-    setInspectorWidth((current) => clamp(current, PROGRAM_INSPECTOR_MIN, inspectorWidthMax));
-  }, [inspectorWidthMax]);
 
   const canvasNotices = useMemo(() => {
     const statusNotices: ProgramNotice[] = [];
@@ -385,15 +374,35 @@ export function ProgramWorkspace({
     'program-authoring-grid',
     authoring ? '' : 'program-authoring-empty',
     paletteCollapsed ? 'palette-collapsed' : '',
-    inspectorCollapsed ? 'inspector-collapsed' : '',
   ].filter(Boolean).join(' ');
   const gridStyle = {
     '--program-tool-width': `${paletteWidth}px`,
-    '--program-inspector-width': `${inspectorWidth}px`,
   } as CSSProperties;
   let inspectorTitle = '';
   if (toolView === 'params') inspectorTitle = 'Declaration';
   else if (selectedNodeId !== null) inspectorTitle = 'Properties';
+  const inspectorActive = toolView === 'nodes'
+    ? selectedNodeId !== null
+    : declarationSelection !== null;
+  const inspectorReadOnlyReason = authoringUnavailable
+    ? 'Portable Program authoring is unavailable for the current environment.'
+    : busy
+      ? 'A Program operation is in progress.'
+      : !mutationAvailable
+        ? mutationUnavailableReason
+        : null;
+  useEffect(() => {
+    onInspectorStateChange?.({
+      active: inspectorActive,
+      title: inspectorTitle || 'Program inspector',
+      readOnlyReason: inspectorReadOnlyReason,
+    });
+    return () => onInspectorStateChange?.({
+      active: false,
+      title: 'Program inspector',
+      readOnlyReason: null,
+    });
+  }, [inspectorActive, inspectorReadOnlyReason, inspectorTitle, onInspectorStateChange]);
 
   return (
     <section className="panel program-workspace" aria-label="Program authoring workspace">
@@ -535,45 +544,53 @@ export function ProgramWorkspace({
           </section>
         )}
 
-        {!inspectorCollapsed && (
-          <PaneDivider
-            label="Program inspector"
-            className="program-pane-divider"
-            value={inspectorWidth}
-            min={PROGRAM_INSPECTOR_MIN}
-            max={inspectorWidthMax}
-            direction={-1}
-            onChange={setInspectorWidth}
-          />
-        )}
-
-        {inspectorCollapsed ? (
-          <button
-            ref={inspectorRail}
-            type="button"
-            className="program-side-rail program-side-rail-right"
-            aria-label="Expand Program inspector"
-            onClick={() => setInspectorCollapsed(false)}
+        {inspectorTarget !== null && createPortal(
+          <aside
+            className={`program-inspector central-inspector-section${
+              inspectorActive ? ' active' : ''
+            }${inspectorMinimized || !inspectorActive ? ' minimized' : ''}${
+              invalidLocalEdit ? ' invalid' : ''
+            }`}
+            aria-label="Program inspector"
           >
-            <span aria-hidden="true">‹</span><span>Inspector</span>
-          </button>
-        ) : (
-          <aside className="program-inspector" aria-label="Program inspector">
-            <div className="program-inspector-tabs">
-              <strong>{inspectorTitle}</strong>
-              <button
-                ref={inspectorCollapseButton}
-                type="button"
-                className="icon-button"
-                aria-label="Collapse Program inspector"
-                title="Collapse Program inspector"
-                disabled={invalidLocalEdit}
-                onClick={() => setInspectorCollapsed(true)}
-              >
-                ›
-              </button>
-            </div>
-            <div className="program-inspector-scroll">
+            <header className="central-inspector-header">
+              <strong>{inspectorTitle || 'Program inspector'}</strong>
+              {inspectorReadOnlyReason !== null && inspectorActive && (
+                <span className="central-inspector-state" title={inspectorReadOnlyReason}>
+                  Read-only
+                </span>
+              )}
+              {invalidLocalEdit && (
+                <span className="central-inspector-warning" title="An invalid field edit needs attention">
+                  Invalid edit
+                </span>
+              )}
+              <div className="central-inspector-actions">
+                <button
+                  type="button"
+                  aria-label="Maximize Program inspector"
+                  title="Maximize Program inspector"
+                  disabled={!inspectorActive}
+                  onClick={onInspectorMaximize}
+                >□</button>
+                <button
+                  type="button"
+                  aria-label={inspectorMinimized ? 'Restore Program inspector' : 'Minimize Program inspector'}
+                  title={inspectorMinimized ? 'Restore Program inspector' : 'Minimize Program inspector'}
+                  disabled={!inspectorActive}
+                  onClick={() => onInspectorMinimizedChange?.(!inspectorMinimized)}
+                >
+                  {inspectorMinimized ? '⌃' : '⌄'}
+                </button>
+              </div>
+            </header>
+            {inspectorActive && !inspectorMinimized && inspectorReadOnlyReason !== null && (
+              <p className="central-inspector-notice central-inspector-notice-warning" role="status">
+                <strong>Editing is unavailable.</strong> {inspectorReadOnlyReason}
+              </p>
+            )}
+            {inspectorActive && !inspectorMinimized && (
+              <div className="program-inspector-scroll central-inspector-scroll">
               {!authoring ? (
                 <div className="program-empty-guidance">
                   <strong>Select a node to inspect properties</strong>
@@ -621,6 +638,7 @@ export function ProgramWorkspace({
                         kind: target === 'blackboard_key' ? 'key' : 'parameter',
                         id: '',
                       });
+                      onInspectorMinimizedChange?.(false);
                     }
                   }}
                   onRenamed={(previousId, renamedId) => {
@@ -656,9 +674,10 @@ export function ProgramWorkspace({
                   diagnostics={diagnostics}
                 />
               )}
-            </div>
+              </div>
+            )}
           </aside>
-        )}
+        , inspectorTarget)}
       </div>
     </section>
   );

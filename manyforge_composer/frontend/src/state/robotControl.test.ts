@@ -384,6 +384,19 @@ describe('addressed Robot Control state', () => {
     expect(state.phase).toBe('completed');
     expect(state.ghostStale).toBe(true);
 
+    const observed = statusFixture();
+    observed.observedMotion.positionsRad = [0.24, 0.49];
+    observed.observedGripper = {
+      ...observed.observedGripper!,
+      position: 0.031,
+    };
+    state = robotControlReducer(state, {
+      type: 'status_refreshed',
+      status: observed,
+    });
+    expect(state.draftPositionsRad).toEqual([0.24, 0.49]);
+    expect(state.draftGripperPosition).toBe(0.031);
+
     const reverted = robotControlReducer(state, { type: 'revert' });
     expect(reverted.phase).toBe('idle');
     expect(reverted.operation).toBeNull();
@@ -446,18 +459,21 @@ describe('addressed Robot Control state', () => {
     });
   });
 
-  it('makes a prior preview non-approvable immediately on a mode change', () => {
+  it('discards an unsubmitted preview without planning on a mode change', () => {
     const ready = readyState();
     const changed = robotControlReducer(ready, {
       type: 'select_mode',
       mode: 'pose_goal',
     });
 
-    expect(changed.phase).toBe('planning');
+    expect(changed.phase).toBe('idle');
     expect(changed.intent).toBeNull();
     expect(changed.preview).toBeNull();
-    expect(changed.ghost).toBe(ready.ghost);
-    expect(changed.ghostStale).toBe(true);
+    expect(changed.ghost).toBeNull();
+    expect(changed.ghostStale).toBe(false);
+    expect(changed.draftPositionsRad).toEqual(
+      changed.status?.observedMotion.positionsRad,
+    );
   });
 
   it('accepts only the latest exact gripper preview and fabricates no ghost', () => {

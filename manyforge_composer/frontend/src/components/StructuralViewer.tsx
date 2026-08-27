@@ -11,6 +11,7 @@ import {
 } from 'react';
 import type { ErrorInfo, MouseEvent as ReactMouseEvent, ReactNode } from 'react';
 import type { PointerEvent as ReactPointerEvent } from 'react';
+import { createPortal } from 'react-dom';
 import { Canvas, useFrame, useThree } from '@react-three/fiber';
 import type { ThreeEvent } from '@react-three/fiber';
 import {
@@ -31,7 +32,6 @@ import {
 import type { PointCloudFrame } from '../api/pointcloudObserverClient';
 import { usePointCloudFrame } from '../hooks/usePointCloudFrame';
 import { SnapshotResponder } from './SnapshotResponder';
-import { OverlayPanel } from './OverlayPanel';
 import {
   applyAuthoritativeTransformTransition,
   authoritativeInterpolationDurationMs,
@@ -157,8 +157,17 @@ interface StructuralViewerProps {
   }>;
   objectAxesVisibleIds?: string[];
   robotControlSurface?: ReactNode;
+  robotControlBlocked?: boolean;
+  objectControlSurface?: ReactNode;
   transportControls?: ReactNode;
+  inspectorTarget?: HTMLElement | null;
+  inspectorMinimized?: boolean;
+  onInspectorMinimizedChange?: (minimized: boolean) => void;
+  onInspectorMaximize?: () => void;
+  onInspectorPanelChange?: (panel: ViewerInspectorPanel) => void;
 }
+
+export type ViewerInspectorPanel = 'tools' | 'robot' | 'object' | null;
 
 const ignoreViewerRaycast: THREE.Object3D['raycast'] = () => undefined;
 
@@ -989,7 +998,7 @@ function EditableLogicalSceneObject({
   onCommitTransform,
   onSelect,
   onTransformDraggingChange,
-  onContext,
+  onContextPointerDown,
   children,
 }: {
   object: LogicalSceneObject & { placement: Extract<LogicalSceneObject['placement'], { kind: 'cell_fixed' }> };
@@ -1001,7 +1010,10 @@ function EditableLogicalSceneObject({
   onCommitTransform: SceneTransformCommit;
   onSelect: (event: ThreeEvent<MouseEvent>, sceneResourceId: string) => void;
   onTransformDraggingChange: (dragging: boolean) => void;
-  onContext: (sceneResourceId: string, x: number, y: number) => void;
+  onContextPointerDown: (
+    event: ThreeEvent<PointerEvent>,
+    sceneResourceId: string,
+  ) => void;
   children: ReactNode;
 }) {
   const group = useRef<THREE.Group | null>(null);
@@ -1070,14 +1082,10 @@ function EditableLogicalSceneObject({
         position={[pose.position_m.x, pose.position_m.y, pose.position_m.z]}
         quaternion={normalizeQuaternion(pose.orientation_xyzw)}
         onClick={(event) => onSelect(event, object.scene_resource_id)}
-        onContextMenu={(event) => {
+        onPointerDown={(event) => {
+          if (event.button !== 2) return;
           event.stopPropagation();
-          event.nativeEvent.preventDefault();
-          onContext(
-            object.scene_resource_id,
-            event.nativeEvent.clientX,
-            event.nativeEvent.clientY,
-          );
+          onContextPointerDown(event, object.scene_resource_id);
         }}
       >
         {children}
@@ -1114,7 +1122,7 @@ function LogicalSceneObjects({
   transformEnabled,
   onCommitTransform,
   onTransformDraggingChange,
-  onContext,
+  onContextPointerDown,
 }: {
   objects: LogicalSceneObject[];
   selectedSceneResourceId: string | null;
@@ -1130,7 +1138,10 @@ function LogicalSceneObjects({
   transformEnabled: boolean;
   onCommitTransform: SceneTransformCommit;
   onTransformDraggingChange: (dragging: boolean) => void;
-  onContext: (sceneResourceId: string, x: number, y: number) => void;
+  onContextPointerDown: (
+    event: ThreeEvent<PointerEvent>,
+    sceneResourceId: string,
+  ) => void;
 }) {
   return (
     <group name="owner-logical-scene">
@@ -1149,7 +1160,7 @@ function LogicalSceneObjects({
             onCommitTransform={onCommitTransform}
             onSelect={onSelect}
             onTransformDraggingChange={onTransformDraggingChange}
-            onContext={onContext}
+            onContextPointerDown={onContextPointerDown}
           >
             {object.collision_shapes.map((shape, index) => shape.type === 'mesh'
               ? ownerIdentity === undefined && draftIdentity === undefined ? null : (
@@ -1539,7 +1550,6 @@ function ViewerQualificationProfiler({
 
 interface RetainedCameraPresentation {
   camera: ViewerCamera;
-  framed: boolean;
 }
 
 interface RetainedCameraPresentationStore {
@@ -1556,7 +1566,6 @@ function createRetainedCameraPresentationStore(
       position: [...initial.camera.position],
       target: [...initial.camera.target],
     },
-    framed: initial.framed,
   };
   return {
     read: () => retained,
@@ -1567,7 +1576,6 @@ function createRetainedCameraPresentationStore(
       retained.camera.target[0] = presentation.camera.target[0];
       retained.camera.target[1] = presentation.camera.target[1];
       retained.camera.target[2] = presentation.camera.target[2];
-      retained.framed = presentation.framed;
     },
     capture: (position, target) => {
       retained.camera.position[0] = position.x;
@@ -1578,7 +1586,6 @@ function createRetainedCameraPresentationStore(
         retained.camera.target[1] = target.y;
         retained.camera.target[2] = target.z;
       }
-      retained.framed = true;
     },
   };
 }
@@ -1599,7 +1606,7 @@ export function framedCameraPresentation(
   aspect: number,
   margin = 1.25,
 ): RetainedCameraPresentation {
-  if (box.isEmpty()) return { camera: current, framed: true };
+  if (box.isEmpty()) return { camera: current };
   const size = box.getSize(new THREE.Vector3());
   const center = box.getCenter(new THREE.Vector3());
   const maximumSize = Math.max(size.x, size.y, size.z, 0.01);
@@ -1623,7 +1630,6 @@ export function framedCameraPresentation(
       position: [position.x, position.y, position.z],
       target: [center.x, center.y, center.z],
     },
-    framed: true,
   };
 }
 
@@ -1760,6 +1766,7 @@ function CaptureCameraPresentation({
 }
 
 export const VIEWER_CLICK_MAX_DURATION_MS = 250;
+export const VIEWER_CONTEXT_DRAG_THRESHOLD_PX = 3;
 
 export function viewerClickWithinDuration({
   startedAtMs,
@@ -1773,13 +1780,27 @@ export function viewerClickWithinDuration({
     && durationMs <= VIEWER_CLICK_MAX_DURATION_MS;
 }
 
+export function viewerContextWasDragged({
+  startX,
+  startY,
+  currentX,
+  currentY,
+}: {
+  startX: number;
+  startY: number;
+  currentX: number;
+  currentY: number;
+}): boolean {
+  return Math.hypot(currentX - startX, currentY - startY)
+    > VIEWER_CONTEXT_DRAG_THRESHOLD_PX;
+}
+
 function ViewerCanvas({
   manifest,
   collisionsVisible,
   wireframeVisible,
   onAssetError,
   onIsolatedAssetError,
-  camera,
   sceneObjects,
   selectedSceneResourceId,
   onSelectSceneResource,
@@ -1817,7 +1838,6 @@ function ViewerCanvas({
   wireframeVisible: boolean;
   onAssetError: (error: Error) => void;
   onIsolatedAssetError: (error: Error) => void;
-  camera: ViewerCamera | null;
   sceneObjects: LogicalSceneObject[];
   selectedSceneResourceId: string | null;
   onSelectSceneResource: (sceneResourceId: string | null) => void;
@@ -1887,14 +1907,57 @@ function ViewerCanvas({
     [readViewerFrameIdentity, viewerFrameIdentity],
   );
   const pointerStartedAtMs = useRef<number | null>(null);
+  const contextPointer = useRef<{
+    pointerId: number;
+    sceneResourceId: string | null;
+    startX: number;
+    startY: number;
+    dragged: boolean;
+  } | null>(null);
   const transformDragging = useRef(false);
   const capturePointerDown = useCallback((event: ReactPointerEvent<HTMLDivElement>) => {
     pointerStartedAtMs.current = event.isPrimary && event.button === 0
       ? event.timeStamp
       : null;
+    if (event.isPrimary && event.button === 2) {
+      contextPointer.current = {
+        pointerId: event.pointerId,
+        sceneResourceId: null,
+        startX: event.clientX,
+        startY: event.clientY,
+        dragged: false,
+      };
+    }
   }, []);
   const clearPointerIntent = useCallback(() => {
     pointerStartedAtMs.current = null;
+    contextPointer.current = null;
+  }, []);
+  const trackContextPointer = useCallback((event: ReactPointerEvent<HTMLDivElement>) => {
+    const current = contextPointer.current;
+    if (current === null || current.pointerId !== event.pointerId || current.dragged) return;
+    if (viewerContextWasDragged({
+      startX: current.startX,
+      startY: current.startY,
+      currentX: event.clientX,
+      currentY: event.clientY,
+    })) current.dragged = true;
+  }, []);
+  const releaseContextPointer = useCallback((event: ReactPointerEvent<HTMLDivElement>) => {
+    const current = contextPointer.current;
+    if (current === null || current.pointerId !== event.pointerId || event.button !== 2) return;
+    contextPointer.current = null;
+    if (!current.dragged && current.sceneResourceId !== null) {
+      onSceneContext(current.sceneResourceId, event.clientX, event.clientY);
+    }
+  }, [onSceneContext]);
+  const registerContextPointer = useCallback((
+    event: ThreeEvent<PointerEvent>,
+    sceneResourceId: string,
+  ) => {
+    const current = contextPointer.current;
+    if (current === null || current.pointerId !== event.nativeEvent.pointerId) return;
+    current.sceneResourceId = sceneResourceId;
   }, []);
   const consumeShortClick = useCallback((releasedAtMs: number) => {
     const startedAtMs = pointerStartedAtMs.current;
@@ -1962,8 +2025,11 @@ function ViewerCanvas({
     <div
       className="viewer-canvas-input-surface"
       onPointerDownCapture={capturePointerDown}
+      onPointerMoveCapture={trackContextPointer}
+      onPointerUpCapture={releaseContextPointer}
       onPointerCancelCapture={clearPointerIntent}
       onClickCapture={clearBeforeSemanticClick}
+      onContextMenu={(event) => event.preventDefault()}
     >
     <Canvas
       key={`${renderer.software ? 'software' : 'hardware'}:${renderer.preserveDrawingBuffer ? 'preserved' : 'transient'}`}
@@ -2032,11 +2098,7 @@ function ViewerCanvas({
         target={selectedCamera.target}
       />
       <CaptureCameraPresentation store={cameraPresentation} />
-      <Bounds
-        fit={camera === null && !retainedCameraPresentation.framed}
-        clip
-        margin={1.25}
-      >
+      <Bounds clip margin={1.25}>
         <CameraCommand
           request={cameraCommand}
           defaultPresentation={{
@@ -2044,7 +2106,6 @@ function ViewerCanvas({
               position: [...DEFAULT_VIEWER_CAMERA.position],
               target: [...DEFAULT_VIEWER_CAMERA.target],
             },
-            framed: true,
           }}
           onPresentation={captureCameraPresentation}
         />
@@ -2099,7 +2160,7 @@ function ViewerCanvas({
           transformEnabled={transformEnabled && objectEditorActive}
           onCommitTransform={onCommitSceneTransform}
           onTransformDraggingChange={setTransformDragging}
-          onContext={onSceneContext}
+          onContextPointerDown={registerContextPointer}
         />
         {runtimePresentation !== undefined && (
           <MeasuredLogicalSceneObjects
@@ -2189,7 +2250,14 @@ function StructuralViewerContent({
   frameAxes = [],
   objectAxesVisibleIds = [],
   robotControlSurface,
+  robotControlBlocked = false,
+  objectControlSurface,
   transportControls,
+  inspectorTarget = null,
+  inspectorMinimized = false,
+  onInspectorMinimizedChange,
+  onInspectorMaximize,
+  onInspectorPanelChange,
 }: StructuralViewerProps) {
   const [collisionsVisible, setCollisionsVisible] = useState(false);
   const [wireframeVisible, setWireframeVisible] = useState(
@@ -2214,11 +2282,8 @@ function StructuralViewerContent({
   const [editLockedObjectIds, setEditLockedObjectIds] = useState<Set<string>>(
     () => new Set(),
   );
-  const [robotOpen, setRobotOpen] = useState(false);
-  const [objectOpen, setObjectOpen] = useState(false);
+  const [inspectorPanel, setInspectorPanel] = useState<ViewerInspectorPanel>(null);
   const contextMenuRef = useRef<HTMLDivElement | null>(null);
-  const robotButtonRef = useRef<HTMLButtonElement>(null);
-  const objectButtonRef = useRef<HTMLButtonElement>(null);
   const contextAvailability = contextMenu === null
     ? null
     : sceneMutationAvailability?.[contextMenu.sceneResourceId] ?? null;
@@ -2289,8 +2354,21 @@ function StructuralViewerContent({
       position: [...DEFAULT_VIEWER_CAMERA.position],
       target: [...DEFAULT_VIEWER_CAMERA.target],
     },
-    framed: camera !== null,
   }));
+
+  useEffect(() => {
+    onInspectorPanelChange?.(inspectorPanel);
+  }, [inspectorPanel, onInspectorPanelChange]);
+  useEffect(() => () => onInspectorPanelChange?.(null), [onInspectorPanelChange]);
+  const toggleInspectorPanel = useCallback((panel: Exclude<ViewerInspectorPanel, null>) => {
+    if (inspectorPanel === panel) {
+      if (inspectorMinimized) onInspectorMinimizedChange?.(false);
+      else setInspectorPanel(null);
+      return;
+    }
+    setInspectorPanel(panel);
+    onInspectorMinimizedChange?.(false);
+  }, [inspectorMinimized, inspectorPanel, onInspectorMinimizedChange]);
 
   const visualCount = manifest.status === 'ready'
     ? manifest.data.links.reduce((total, link) => total + link.visuals.length, 0)
@@ -2507,114 +2585,22 @@ function StructuralViewerContent({
             </button>
           </div>
           <div className="viewer-surface-launchers">
-          <button
-            ref={robotButtonRef}
-            type="button"
-            aria-haspopup="dialog"
-            aria-expanded={robotOpen}
-            disabled={robotControlSurface === undefined}
-            onClick={() => setRobotOpen(true)}
-          >Robot</button>
-          <button
-            ref={objectButtonRef}
-            type="button"
-            aria-haspopup="dialog"
-            aria-expanded={objectOpen}
-            onClick={() => setObjectOpen(true)}
-          >Object</button>
-          <details className="viewer-options">
-            <summary>Tools</summary>
-            <div className="viewer-options-popover">
-              <label className="toggle-control">
-                <input
-                  type="checkbox"
-                  aria-label="Wireframe overlays"
-                  checked={wireframeVisible}
-                  onChange={(event) => setWireframeVisible(event.target.checked)}
-                />
-                <span>Wireframe overlays</span>
-              </label>
-              <label className="toggle-control">
-                <input
-                  type="checkbox"
-                  checked={collisionsVisible}
-                  onChange={(event) => setCollisionsVisible(event.target.checked)}
-                  disabled={manifest.status !== 'ready'}
-                />
-                <span>Collision geometry</span>
-              </label>
-              <label className="toggle-control">
-                <input
-                  type="checkbox"
-                  checked={pointCloudVisible}
-                  onChange={(event) => setPointCloudVisible(event.target.checked)}
-                  disabled={pointCloudCellId === undefined}
-                />
-                <span>Point cloud</span>
-              </label>
-              <label className="toggle-control">
-                <input
-                  type="checkbox"
-                  checked={measuredStateVisible}
-                  disabled={runtimePresentation === undefined
-                    || runtimePresentation.status.total === 0}
-                  onChange={(event) => setMeasuredStateVisible(event.target.checked)}
-                />
-                <span>Measured-state overlay</span>
-              </label>
-              <div className="viewer-options-actions">
-                <button
-                  type="button"
-                  className="quiet-button"
-                  disabled={pointCloud.frame === null}
-                  onClick={pointCloud.clear}
-                  title="Clear the currently presented point cloud; the next owner frame may repopulate it."
-                >
-                  Clear points
-                </button>
-                <button type="button" className="quiet-button" onClick={retry}>
-                  Reload model
-                </button>
-              </div>
-              {programDraftPreview && (
-                <p className="viewer-source-explanation">
-                  <strong>Draft scene objects are a preview, not live.</strong>
-                  The backend reports no current scene objects, so objects from
-                  the editable Program Draft are shown for authoring only. The
-                  retained robot and measured overlays remain separate sources.
-                </p>
-              )}
-            {pointCloud.frame !== null && (
-              <span
-                className="status-pill"
-                title={`${pointCloud.frame.ownerId} · sequence ${pointCloud.frame.sequence.toString()}`}
-              >
-                {pointCloud.frame.pointCount} points
-              </span>
-            )}
-            {manifest.status === 'ready' && (
-              <details className="viewer-model-facts">
-                <summary>Model and source facts</summary>
-                <span>Cell <code>{manifest.data.cell_id}</code></span>
-                <span>{manifest.data.links.length} links · {manifest.data.joints.length} joints</span>
-                <span>{sceneObjects.length} {programDraftPreview ? 'Draft-preview' : 'owner-scene'} objects</span>
-                <span>Root <code>{manifest.data.projection.root_frame}</code></span>
-                <span>Model <code>{manifest.data.model_key}</code></span>
-                <span>Bundle <code>{manifest.data.retained_bundle_id}</code></span>
-                <span>Retained model <strong>neutral coordinates</strong></span>
-                <span>
-                  Measured overlay <strong>
-                    {runtimePresentation === undefined
-                      ? 'unavailable'
-                      : `${runtimePresentation.status.freshGood} fresh / ${runtimePresentation.status.total} sources`}
-                  </strong>
-                </span>
-                <span>Scene overlay <strong>owner-issued</strong></span>
-                <span>Operational validity <strong>not asserted</strong></span>
-              </details>
-            )}
-            </div>
-          </details>
+            <button
+              type="button"
+              aria-pressed={inspectorPanel === 'robot'}
+              disabled={robotControlSurface === undefined}
+              onClick={() => toggleInspectorPanel('robot')}
+            >Robot</button>
+            <button
+              type="button"
+              aria-pressed={inspectorPanel === 'object'}
+              onClick={() => toggleInspectorPanel('object')}
+            >Object</button>
+            <button
+              type="button"
+              aria-pressed={inspectorPanel === 'tools'}
+              onClick={() => toggleInspectorPanel('tools')}
+            >Tools</button>
           </div>
         </div>
       </header>
@@ -2631,7 +2617,6 @@ function StructuralViewerContent({
               wireframeVisible={wireframeVisible}
               onAssetError={reportAssetError}
               onIsolatedAssetError={reportIsolatedAssetError}
-              camera={camera}
               sceneObjects={sceneObjects}
               selectedSceneResourceId={selectedSceneResourceId}
               onSelectSceneResource={onSelectSceneResource}
@@ -2657,8 +2642,8 @@ function StructuralViewerContent({
               transformMode={transformMode}
               transformSpace={transformSpace}
               transformEnabled={transformEnabled}
-              objectEditorActive={objectOpen}
-              robotEditorActive={robotOpen}
+              objectEditorActive={inspectorPanel === 'object'}
+              robotEditorActive={inspectorPanel === 'robot'}
               transformIdentity={transformIdentity}
               onCommitSceneTransform={transformCommit ?? (async () => false)}
               onSceneContext={(sceneResourceId, x, y) => {
@@ -2848,27 +2833,174 @@ function StructuralViewerContent({
         {transportControls}
       </div>
 
-      <OverlayPanel
-        open={robotOpen}
-        title="Robot control"
-        titleId="viewer-robot-control-title"
-        onClose={() => setRobotOpen(false)}
-        returnFocusRef={robotButtonRef}
-      >
-        {robotControlSurface ?? (
-          <p className="panel-state">Robot control is unavailable.</p>
-        )}
-      </OverlayPanel>
-      <OverlayPanel
-        open={objectOpen}
-        title="Selected object"
-        titleId="viewer-object-title"
-        kind="info"
-        compact
-        onClose={() => setObjectOpen(false)}
-        returnFocusRef={objectButtonRef}
-      >
-        {selectedObject !== null ? (
+      {inspectorTarget !== null && createPortal(
+        <section
+          className={`central-inspector-section viewer-inspector-section${
+            inspectorPanel === null ? ' inactive' : ' active'
+          }${inspectorMinimized ? ' minimized' : ''}`}
+          aria-label="3D viewer inspector"
+        >
+          <header className="central-inspector-header">
+            <strong>{inspectorPanel === 'tools'
+              ? 'Viewer tools'
+              : inspectorPanel === 'robot'
+                ? 'Robot control'
+                : inspectorPanel === 'object'
+                  ? 'Selected object'
+                  : 'Viewer tools'}</strong>
+            {inspectorPanel === 'robot' && robotControlBlocked && (
+              <span className="central-inspector-warning">Blocked</span>
+            )}
+            <div className="central-inspector-actions">
+              {inspectorPanel === 'robot' && (
+                <button
+                  type="button"
+                  className="inspector-info-button"
+                  aria-label="Robot control information"
+                  title="Edits create a no-motion validation preview after a short delay. Only Approve can move the robot."
+                >i</button>
+              )}
+              <button
+                type="button"
+                disabled={inspectorPanel === null}
+                aria-label="Maximize viewer inspector"
+                title="Maximize viewer inspector"
+                onClick={onInspectorMaximize}
+              >□</button>
+              <button
+                type="button"
+                disabled={inspectorPanel === null}
+                aria-label={inspectorMinimized ? 'Restore viewer inspector' : 'Minimize viewer inspector'}
+                onClick={() => onInspectorMinimizedChange?.(!inspectorMinimized)}
+              >{inspectorMinimized ? '⌃' : '⌄'}</button>
+              <button
+                type="button"
+                disabled={inspectorPanel === null}
+                aria-label="Close viewer inspector"
+                onClick={() => setInspectorPanel(null)}
+              >×</button>
+            </div>
+          </header>
+          {inspectorPanel !== null && !inspectorMinimized && (
+            <div className={`central-inspector-body${
+              inspectorPanel === 'robot' ? ' robot-inspector-body' : ''
+            }`}>
+              {inspectorPanel === 'robot' ? (
+                robotControlSurface ?? (
+                  <p className="panel-state">Robot control is unavailable.</p>
+                )
+              ) : inspectorPanel === 'tools' ? (
+                <div className="viewer-options-body">
+                  <label className="toggle-control">
+                    <input
+                      type="checkbox"
+                      aria-label="Wireframe overlays"
+                      checked={wireframeVisible}
+                      onChange={(event) => setWireframeVisible(event.target.checked)}
+                    />
+                    <span>Wireframe overlays</span>
+                  </label>
+                  <label className="toggle-control">
+                    <input
+                      type="checkbox"
+                      checked={collisionsVisible}
+                      onChange={(event) => setCollisionsVisible(event.target.checked)}
+                      disabled={manifest.status !== 'ready'}
+                    />
+                    <span>Collision geometry</span>
+                  </label>
+                  <label className="toggle-control">
+                    <input
+                      type="checkbox"
+                      checked={pointCloudVisible}
+                      onChange={(event) => setPointCloudVisible(event.target.checked)}
+                      disabled={pointCloudCellId === undefined}
+                    />
+                    <span>Point cloud</span>
+                  </label>
+                  <label className="toggle-control">
+                    <input
+                      type="checkbox"
+                      checked={measuredStateVisible}
+                      disabled={runtimePresentation === undefined
+                        || runtimePresentation.status.total === 0}
+                      onChange={(event) => setMeasuredStateVisible(event.target.checked)}
+                    />
+                    <span>Measured-state overlay</span>
+                  </label>
+                  <div className="viewer-options-actions">
+                    <button
+                      type="button"
+                      className="quiet-button"
+                      disabled={pointCloud.frame === null}
+                      onClick={pointCloud.clear}
+                      title="Clear the currently presented point cloud; the next owner frame may repopulate it."
+                    >Clear points</button>
+                    <button type="button" className="quiet-button" onClick={retry}>
+                      Reload model
+                    </button>
+                  </div>
+                  {programDraftPreview && (
+                    <p className="viewer-source-explanation">
+                      <strong>Draft scene objects are a preview, not live.</strong>
+                      The backend reports no current scene objects, so editable
+                      Program Draft geometry is shown for authoring only.
+                    </p>
+                  )}
+                  {pointCloud.frame !== null && (
+                    <span
+                      className="status-pill"
+                      title={`${pointCloud.frame.ownerId} · sequence ${pointCloud.frame.sequence.toString()}`}
+                    >{pointCloud.frame.pointCount} points</span>
+                  )}
+                  {manifest.status === 'ready' && (
+                    <details className="viewer-model-facts">
+                      <summary>Model and source facts</summary>
+                      <span>Cell <code>{manifest.data.cell_id}</code></span>
+                      <span>{manifest.data.links.length} links · {manifest.data.joints.length} joints</span>
+                      <span>{sceneObjects.length} {programDraftPreview ? 'Draft-preview' : 'owner-scene'} objects</span>
+                      <span>Root <code>{manifest.data.projection.root_frame}</code></span>
+                      <span>Model <code>{manifest.data.model_key}</code></span>
+                      <span>Bundle <code>{manifest.data.retained_bundle_id}</code></span>
+                      <span>Retained model <strong>neutral coordinates</strong></span>
+                      <span>Measured overlay <strong>{runtimePresentation === undefined
+                        ? 'unavailable'
+                        : `${runtimePresentation.status.freshGood} fresh / ${runtimePresentation.status.total} sources`}</strong></span>
+                      <span>Scene overlay <strong>owner-issued</strong></span>
+                      <span>Operational validity <strong>not asserted</strong></span>
+                    </details>
+                  )}
+                </div>
+              ) : objectControlSurface !== undefined ? (
+                <>
+                  <div className="viewer-object-global-actions">
+                    <button
+                      type="button"
+                      disabled={selectedCameraTarget === null}
+                      onClick={() => issueCameraCommand('frame_selection')}
+                    >Frame selection</button>
+                    {selectedObject !== null && (
+                      <button
+                        type="button"
+                        onClick={() => setEditLockedObjectIds((current) => {
+                          const next = new Set(current);
+                          if (next.has(selectedObject.scene_resource_id)) {
+                            next.delete(selectedObject.scene_resource_id);
+                          } else {
+                            next.add(selectedObject.scene_resource_id);
+                          }
+                          return next;
+                        })}
+                      >
+                        {editLockedObjectIds.has(selectedObject.scene_resource_id)
+                          ? 'Unlock editing'
+                          : 'Lock editing'}
+                      </button>
+                    )}
+                  </div>
+                  {objectControlSurface}
+                </>
+              ) : selectedObject !== null ? (
           <div className="viewer-object-quick-panel">
             <dl>
               <dt>Scene resource</dt>
@@ -2931,7 +3063,7 @@ function StructuralViewerContent({
               >Remove</button>
             </div>
           </div>
-        ) : selectedStructureName !== null ? (
+              ) : selectedStructureName !== null ? (
           <div className="viewer-object-quick-panel">
             <dl>
               <dt>Robot link</dt>
@@ -2943,12 +3075,16 @@ function StructuralViewerContent({
               Frame link
             </button>
           </div>
-        ) : (
+              ) : (
           <p className="panel-state">
             Select a scene object or robot link in the viewport to inspect it.
           </p>
-        )}
-      </OverlayPanel>
+              )}
+            </div>
+          )}
+        </section>,
+        inspectorTarget,
+      )}
 
     </section>
   );

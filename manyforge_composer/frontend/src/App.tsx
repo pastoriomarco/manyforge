@@ -28,7 +28,10 @@ function isNotFound(error: unknown): boolean {
 }
 
 const VIEWER_WIDTH_MIN = 420;
-const AUTHORING_WIDTH_MIN = 632;
+const AUTHORING_WIDTH_MIN = 400;
+const INSPECTOR_WIDTH_MIN = 260;
+const INSPECTOR_WIDTH_MAX = 480;
+const INSPECTOR_SECTION_MIN_HEIGHT = 140;
 const WORKBENCH_DIVIDER_WIDTH = 8;
 const VIEWER_WIDTH_MAX_FRACTION = 2 / 3;
 
@@ -41,10 +44,29 @@ export default function App() {
   const [viewerWidth, setViewerWidth] = useState(() => (
     typeof window === 'undefined' ? 640 : Math.round(window.innerWidth * 0.4)
   ));
+  const [inspectorWidth, setInspectorWidth] = useState(320);
   const [workbenchWidth, setWorkbenchWidth] = useState(() => (
     typeof window === 'undefined' ? 1440 : window.innerWidth
   ));
   const [sceneEditorTarget, setSceneEditorTarget] = useState<HTMLElement | null>(null);
+  const [programInspectorTarget, setProgramInspectorTarget] = useState<HTMLElement | null>(null);
+  const [viewerInspectorTarget, setViewerInspectorTarget] = useState<HTMLElement | null>(null);
+  const [programInspectorMinimized, setProgramInspectorMinimized] = useState(false);
+  const [viewerInspectorMinimized, setViewerInspectorMinimized] = useState(false);
+  const [programInspectorState, setProgramInspectorState] = useState<{
+    active: boolean;
+    title: string;
+    readOnlyReason: string | null;
+  }>({ active: false, title: 'Program inspector', readOnlyReason: null });
+  const [viewerInspectorPanel, setViewerInspectorPanel] = useState<
+    'tools' | 'robot' | 'object' | null
+  >(null);
+  const [inspectorHeight, setInspectorHeight] = useState(() => (
+    typeof window === 'undefined' ? 720 : Math.max(320, window.innerHeight - 52)
+  ));
+  const [programInspectorHeight, setProgramInspectorHeight] = useState(() => (
+    typeof window === 'undefined' ? 360 : Math.max(160, Math.floor((window.innerHeight - 52) / 2))
+  ));
   const [globalPanel, setGlobalPanel] = useState<'runtime' | 'assistant' | null>(null);
   const [programInvalidEdit, setProgramInvalidEdit] = useState(false);
   const [programSettingsRequest, setProgramSettingsRequest] = useState(0);
@@ -54,6 +76,12 @@ export default function App() {
     kind: 'component_role' | 'target_role';
   } | null>(null);
   const workbench = useRef<HTMLDivElement>(null);
+  const centralInspector = useRef<HTMLElement>(null);
+  const bothInspectorSectionsExpanded = programInspectorState.active
+    && !programInspectorMinimized
+    && viewerInspectorPanel !== null
+    && !viewerInspectorMinimized;
+  const previousBothInspectorSectionsExpanded = useRef(false);
   const runtimeButton = useRef<HTMLButtonElement>(null);
   const assistantButton = useRef<HTMLButtonElement>(null);
   const [health, retryHealth] = useStructuralResource(api.health.get, {
@@ -106,12 +134,27 @@ export default function App() {
     VIEWER_WIDTH_MIN,
     Math.min(
       Math.floor(workbenchWidth * VIEWER_WIDTH_MAX_FRACTION),
-      workbenchWidth - AUTHORING_WIDTH_MIN - WORKBENCH_DIVIDER_WIDTH,
+      workbenchWidth - AUTHORING_WIDTH_MIN - inspectorWidth
+        - 2 * WORKBENCH_DIVIDER_WIDTH,
     ),
   );
   const viewerWidthMin = Math.min(VIEWER_WIDTH_MIN, viewerWidthMax);
+  const inspectorWidthMax = Math.max(
+    INSPECTOR_WIDTH_MIN,
+    Math.min(
+      INSPECTOR_WIDTH_MAX,
+      workbenchWidth - AUTHORING_WIDTH_MIN - viewerWidthMin
+        - 2 * WORKBENCH_DIVIDER_WIDTH,
+    ),
+  );
+  const programInspectorHeightMax = Math.max(
+    INSPECTOR_SECTION_MIN_HEIGHT,
+    inspectorHeight - INSPECTOR_SECTION_MIN_HEIGHT - WORKBENCH_DIVIDER_WIDTH,
+  );
   const layoutStyle = {
     '--viewer-width': `${viewerWidth}px`,
+    '--inspector-width': `${inspectorWidth}px`,
+    '--program-inspector-height': `${programInspectorHeight}px`,
   } as CSSProperties;
   useEffect(() => {
     const element = workbench.current;
@@ -125,6 +168,69 @@ export default function App() {
   useEffect(() => {
     setViewerWidth((current) => clamp(current, viewerWidthMin, viewerWidthMax));
   }, [viewerWidthMax, viewerWidthMin]);
+  useEffect(() => {
+    setInspectorWidth((current) => clamp(
+      current,
+      INSPECTOR_WIDTH_MIN,
+      inspectorWidthMax,
+    ));
+  }, [inspectorWidthMax]);
+  useEffect(() => {
+    const element = centralInspector.current;
+    if (element === null) return undefined;
+    const update = () => setInspectorHeight(element.clientHeight);
+    update();
+    const observer = new ResizeObserver(update);
+    observer.observe(element);
+    return () => observer.disconnect();
+  }, []);
+  useEffect(() => {
+    setProgramInspectorHeight((current) => clamp(
+      current,
+      INSPECTOR_SECTION_MIN_HEIGHT,
+      programInspectorHeightMax,
+    ));
+  }, [programInspectorHeightMax]);
+  useEffect(() => {
+    if (
+      bothInspectorSectionsExpanded
+      && !previousBothInspectorSectionsExpanded.current
+    ) {
+      setProgramInspectorHeight(Math.floor(inspectorHeight / 2));
+    }
+    previousBothInspectorSectionsExpanded.current = bothInspectorSectionsExpanded;
+  }, [bothInspectorSectionsExpanded, inspectorHeight]);
+  const handleProgramInspectorState = useCallback((next: {
+    active: boolean;
+    title: string;
+    readOnlyReason: string | null;
+  }) => {
+    setProgramInspectorState((current) => (
+      current.active === next.active
+      && current.title === next.title
+      && current.readOnlyReason === next.readOnlyReason
+        ? current
+        : next
+    ));
+  }, []);
+  const maximizeProgramInspector = useCallback(() => {
+    const alreadyMaximized = viewerInspectorPanel !== null
+      && viewerInspectorMinimized
+      && !programInspectorMinimized;
+    setProgramInspectorMinimized(false);
+    if (viewerInspectorPanel !== null) {
+      setViewerInspectorMinimized(!alreadyMaximized);
+    }
+  }, [programInspectorMinimized, viewerInspectorMinimized, viewerInspectorPanel]);
+  const maximizeViewerInspector = useCallback(() => {
+    const alreadyMaximized = programInspectorState.active
+      && programInspectorMinimized
+      && !viewerInspectorMinimized;
+    setViewerInspectorMinimized(false);
+    if (programInspectorState.active) {
+      setProgramInspectorMinimized(!alreadyMaximized);
+    }
+  }, [programInspectorMinimized, programInspectorState.active, viewerInspectorMinimized]);
   const openRuntimeDetails = useCallback(() => {
     setGlobalPanel('runtime');
   }, []);
@@ -252,6 +358,11 @@ export default function App() {
               onInvalidEditChange={setProgramInvalidEdit}
               onOpenScene={() => setActiveWorkspace('scene')}
               onOpenProgramSettings={() => setProgramSettingsRequest((current) => current + 1)}
+              inspectorTarget={programInspectorTarget}
+              inspectorMinimized={programInspectorMinimized}
+              onInspectorMinimizedChange={setProgramInspectorMinimized}
+              onInspectorMaximize={maximizeProgramInspector}
+              onInspectorStateChange={handleProgramInspectorState}
               programRequirementCreated={programRequirementCreated}
             />
           ) : activeWorkspace === 'scene' ? (
@@ -266,6 +377,52 @@ export default function App() {
             </div>
           )}
         </section>
+
+        <PaneDivider
+          label="central inspector"
+          value={inspectorWidth}
+          min={INSPECTOR_WIDTH_MIN}
+          max={inspectorWidthMax}
+          direction={-1}
+          onChange={setInspectorWidth}
+        />
+
+        <aside
+          ref={centralInspector}
+          className={`workbench-inspector${bothInspectorSectionsExpanded ? ' split' : ''}`}
+          aria-label="Program and viewer inspectors"
+        >
+          <div
+            ref={setProgramInspectorTarget}
+            className={`central-inspector-slot program-slot${
+              programInspectorState.active && !programInspectorMinimized ? ' expanded' : ' minimized'
+            }${programInspectorState.active ? ' active' : ' inactive'}`}
+          >
+            {activeWorkspace !== 'program' && (
+              <div className="central-inspector-placeholder">
+                <strong>Program inspector</strong>
+                <span>No Program node is selected.</span>
+              </div>
+            )}
+          </div>
+          {bothInspectorSectionsExpanded && (
+            <PaneDivider
+              axis="y"
+              className="central-inspector-divider"
+              label="Program and viewer inspector height"
+              value={programInspectorHeight}
+              min={INSPECTOR_SECTION_MIN_HEIGHT}
+              max={programInspectorHeightMax}
+              onChange={setProgramInspectorHeight}
+            />
+          )}
+          <div
+            ref={setViewerInspectorTarget}
+            className={`central-inspector-slot viewer-inspector-slot${
+              viewerInspectorPanel !== null && !viewerInspectorMinimized ? ' expanded' : ' minimized'
+            }${viewerInspectorPanel !== null ? ' active' : ' inactive'}`}
+          />
+        </aside>
 
         <PaneDivider
           label="viewer and live controls"
@@ -292,6 +449,11 @@ export default function App() {
                 runtimeEnabled={headlessEnabled}
                 sourceModel={sourceModel}
                 viewerActive
+                viewerInspectorTarget={viewerInspectorTarget}
+                viewerInspectorMinimized={viewerInspectorMinimized}
+                onViewerInspectorMinimizedChange={setViewerInspectorMinimized}
+                onViewerInspectorMaximize={maximizeViewerInspector}
+                onViewerInspectorPanelChange={setViewerInspectorPanel}
               />
             </div>
           </div>

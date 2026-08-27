@@ -1,3 +1,5 @@
+import { useState } from 'react';
+
 import { useRobotControl } from '../hooks/useRobotControl';
 import type { RobotControlController } from '../hooks/useRobotControl';
 import {
@@ -15,6 +17,9 @@ import { DraftTextInput } from './common/DraftInputs';
 
 const RAD_TO_DEG = 180 / Math.PI;
 const DEG_TO_RAD = Math.PI / 180;
+const ANGULAR_STEP_DEG_OPTIONS = [0.1, 0.5, 1, 5, 10, 30] as const;
+const LINEAR_STEP_M_OPTIONS = [0.001, 0.01, 0.1] as const;
+const COORDINATE_STEP_OPTIONS = [0.001, 0.01, 0.1] as const;
 
 function degrees(radians: number): number {
   return radians * RAD_TO_DEG;
@@ -55,6 +60,17 @@ const MODE_LABELS: Array<[RobotControlMode, string]> = [
   ['gripper', 'Gripper'],
 ];
 
+function targetIsTemporary(
+  phase: RobotControlPhase,
+  draft: number,
+  observed: number,
+): boolean {
+  return phase !== 'loading'
+    && phase !== 'unavailable'
+    && phase !== 'idle'
+    && Math.abs(draft - observed) > 1e-6;
+}
+
 function RobotNumberInput({
   label,
   value,
@@ -63,6 +79,7 @@ function RobotNumberInput({
   max,
   disabled,
   onCommit,
+  pending = false,
 }: {
   label: string;
   value: number | null;
@@ -71,6 +88,7 @@ function RobotNumberInput({
   max?: number;
   disabled: boolean;
   onCommit: (value: number) => void;
+  pending?: boolean;
 }) {
   return (
     <DraftTextInput
@@ -80,8 +98,11 @@ function RobotNumberInput({
       max={max}
       step={step}
       shiftStepMultiplier={10}
+      commitNativeStep
       value={value}
       disabled={disabled}
+      className={pending ? 'robot-control-target-pending' : undefined}
+      dirtyClassName="robot-control-target-pending"
       validate={(candidate) => {
         const parsed = Number(candidate);
         if (!candidate.trim() || !Number.isFinite(parsed)) return 'Enter a finite number.';
@@ -94,6 +115,39 @@ function RobotNumberInput({
   );
 }
 
+function StepSelect({
+  label,
+  unit,
+  options,
+  value,
+  disabled,
+  onChange,
+}: {
+  label: string;
+  unit: string;
+  options: readonly number[];
+  value: number;
+  disabled: boolean;
+  onChange: (value: number) => void;
+}) {
+  return (
+    <label className="robot-control-step">
+      <span>{label}</span>
+      <select
+        aria-label={`${label} (${unit})`}
+        value={value}
+        disabled={disabled}
+        onChange={(event) => onChange(Number(event.currentTarget.value))}
+      >
+        {options.map((option) => (
+          <option key={option} value={option}>{option}</option>
+        ))}
+      </select>
+      <span>{unit}</span>
+    </label>
+  );
+}
+
 export function RobotControlPanelView({
   enabled,
   controller,
@@ -101,6 +155,9 @@ export function RobotControlPanelView({
   enabled: boolean;
   controller: RobotControlController;
 }) {
+  const [angularStepDeg, setAngularStepDeg] = useState(5);
+  const [linearStepM, setLinearStepM] = useState(0.01);
+  const [coordinateStep, setCoordinateStep] = useState(0.01);
   const {
     state,
     selectMode,
@@ -157,23 +214,27 @@ export function RobotControlPanelView({
   const displayedTarget = state.mode === 'gripper'
     ? status?.directControlGripper
     : status?.directControl;
+  const observedGripperPosition = status?.observedGripper?.position ?? null;
+  const gripperTargetPending = observedGripperPosition !== null
+    && state.draftGripperPosition !== null
+    && targetIsTemporary(
+      state.phase,
+      state.draftGripperPosition,
+      observedGripperPosition,
+    );
+  const presentedGripperPosition = gripperTargetPending
+    ? state.draftGripperPosition
+    : observedGripperPosition ?? state.draftGripperPosition;
 
   return (
     <section
       className="panel robot-control-panel"
       aria-label="Robot Control"
       data-testid="robot-control-panel"
+      title={displayedTarget === undefined
+        ? undefined
+        : `Control route: ${displayedTarget.controllableComponentId} / ${displayedTarget.commandTargetId}`}
     >
-      <header className="panel-header robot-control-header">
-        <div>
-          <p className="eyebrow">Addressed operation</p>
-          <h2>Robot Control</h2>
-        </div>
-        <span className={`status-pill robot-control-phase phase-${state.phase}`}>
-          {phaseLabel(state.phase)}
-        </span>
-      </header>
-
       {!enabled && (
         <div className="panel-state">
           <strong>Headless execution is not connected.</strong>
@@ -195,20 +256,15 @@ export function RobotControlPanelView({
 
       {enabled && status !== null && displayedTarget !== undefined && (
         <>
-          <div className="robot-control-identity">
-            <span>
-              component <code>{displayedTarget.controllableComponentId}</code>
-            </span>
-            <span>
-              target <code>{displayedTarget.commandTargetId}</code>
-            </span>
-            <span>
-              source epoch <code>{state.mode === 'gripper'
-                ? status.observedGripper?.sourceEpoch ?? 'not-published'
-                : status.observedMotion.sourceEpoch}</code>
-            </span>
-          </div>
-
+          {state.phase === 'blocked' && (
+            <p
+              className="central-inspector-notice central-inspector-notice-warning"
+              role="alert"
+            >
+              <strong>Preview is blocked.</strong>{' '}
+              {state.error ?? 'The execution owner rejected this target.'}
+            </p>
+          )}
           <nav className="robot-control-modes" aria-label="Manual control mode">
             {MODE_LABELS.map(([mode, label]) => (
               <button
@@ -223,21 +279,66 @@ export function RobotControlPanelView({
             ))}
           </nav>
 
+          <div
+            className="robot-control-step-controls"
+            aria-label="Robot control increments"
+          >
+            {state.mode === 'joint' && (
+              <StepSelect
+                label="Step"
+                unit="deg"
+                options={ANGULAR_STEP_DEG_OPTIONS}
+                value={angularStepDeg}
+                disabled={active}
+                onChange={setAngularStepDeg}
+              />
+            )}
+            {(state.mode === 'pose_goal' || state.mode === 'cartesian_path') && (
+              <>
+                <StepSelect
+                  label="Position step"
+                  unit="m"
+                  options={LINEAR_STEP_M_OPTIONS}
+                  value={linearStepM}
+                  disabled={active}
+                  onChange={setLinearStepM}
+                />
+                <StepSelect
+                  label="Angle step"
+                  unit="deg"
+                  options={ANGULAR_STEP_DEG_OPTIONS}
+                  value={angularStepDeg}
+                  disabled={active}
+                  onChange={setAngularStepDeg}
+                />
+              </>
+            )}
+            {state.mode === 'gripper' && (
+              <StepSelect
+                label="Step"
+                unit={status.directControlGripper.coordinateKind === 'angular_rad'
+                  ? 'rad'
+                  : 'm'}
+                options={COORDINATE_STEP_OPTIONS}
+                value={coordinateStep}
+                disabled={active}
+                onChange={setCoordinateStep}
+              />
+            )}
+          </div>
+
           <div className="robot-control-body">
             <div
               className="robot-control-editor"
               data-testid="robot-control-editor-scroll"
             >
-              <p className="panel-intro">
-                Edits validate a no-motion preview after 150 ms. Only Approve
-                submits the exact target to the execution owner.
-              </p>
-
               {state.mode === 'joint' && (
                 <div className="robot-control-joints">
                   {status.directControl.joints.map((joint, index) => {
                     const live = status.observedMotion.positionsRad[index] ?? 0;
                     const draft = state.draftPositionsRad[index] ?? live;
+                    const pending = targetIsTemporary(state.phase, draft, live);
+                    const presented = pending ? draft : live;
                     return (
                       <label
                         className="robot-control-joint"
@@ -245,7 +346,11 @@ export function RobotControlPanelView({
                       >
                         <span className="robot-control-joint-heading">
                           <strong>{joint.sourceJointName}</strong>
-                          <span>observed {formatDegrees(live)}°</span>
+                          <span className="robot-control-limits">
+                            {formatDegrees(joint.minPositionRad)}° to{' '}
+                            {formatDegrees(joint.maxPositionRad)}° · max{' '}
+                            {formatDegrees(joint.maxVelocityRadS)}°/s
+                          </span>
                         </span>
                         <span className="robot-control-joint-inputs">
                           <input
@@ -254,7 +359,7 @@ export function RobotControlPanelView({
                             min={degrees(joint.minPositionRad)}
                             max={degrees(joint.maxPositionRad)}
                             step="any"
-                            value={degrees(draft)}
+                            value={degrees(presented)}
                             disabled={active}
                             onChange={(event) => {
                               const value = event.currentTarget.valueAsNumber;
@@ -268,18 +373,14 @@ export function RobotControlPanelView({
                               label={`${joint.sourceJointName} target degrees`}
                               min={degrees(joint.minPositionRad)}
                               max={degrees(joint.maxPositionRad)}
-                              step={0.1}
-                              value={degrees(draft)}
+                              step={angularStepDeg}
+                              value={degrees(presented)}
                               disabled={active}
+                              pending={pending}
                               onCommit={(value) => editJoint(index, radians(value))}
                             />
                             <span>deg</span>
                           </span>
-                        </span>
-                        <span className="robot-control-limits">
-                          {formatDegrees(joint.minPositionRad)}° to{' '}
-                          {formatDegrees(joint.maxPositionRad)}° · max{' '}
-                          {formatDegrees(joint.maxVelocityRadS)}°/s
                         </span>
                       </label>
                     );
@@ -295,7 +396,7 @@ export function RobotControlPanelView({
                       <span className="robot-control-number">
                         <RobotNumberInput
                           label={`${field.slice(0, 1)} target metres`}
-                          step={0.001}
+                          step={linearStepM}
                           value={state.draftPose.position_m[field]}
                           disabled={active}
                           onCommit={(value) => editPosePosition(field, value)}
@@ -310,7 +411,7 @@ export function RobotControlPanelView({
                       <span className="robot-control-number">
                       <RobotNumberInput
                         label={`${label} target degrees`}
-                        step={0.1}
+                        step={angularStepDeg}
                         value={rpy[index]}
                         disabled={active}
                         onCommit={(value) => editPoseOrientation(index, value)}
@@ -335,14 +436,15 @@ export function RobotControlPanelView({
                     <strong>
                       {status.directControlGripper.sourceCoordinateName}
                     </strong>
-                    <span>
-                      {status.observedGripper === null
-                        ? 'not yet observed'
-                        : `observed ${status.observedGripper.position.toFixed(4)} ${
-                          status.directControlGripper.coordinateKind === 'angular_rad'
-                            ? 'rad'
-                            : 'm'
-                        }`}
+                    <span className="robot-control-limits">
+                      {status.directControlGripper.minPosition === null
+                        || status.directControlGripper.maxPosition === null
+                        ? 'Enter the initial target'
+                        : `${status.directControlGripper.minPosition.toFixed(4)} to ${
+                          status.directControlGripper.maxPosition.toFixed(4)
+                        } ${status.directControlGripper.coordinateKind === 'angular_rad'
+                          ? 'rad'
+                          : 'm'}`}
                     </span>
                   </span>
                   <span className="robot-control-joint-inputs">
@@ -354,7 +456,7 @@ export function RobotControlPanelView({
                         min={status.directControlGripper.minPosition}
                         max={status.directControlGripper.maxPosition}
                         step="any"
-                        value={state.draftGripperPosition ?? ''}
+                        value={presentedGripperPosition ?? ''}
                         disabled={active}
                         onChange={(event) => {
                           const value = event.currentTarget.valueAsNumber;
@@ -367,9 +469,10 @@ export function RobotControlPanelView({
                         label="Gripper target value"
                         min={status.directControlGripper.minPosition ?? undefined}
                         max={status.directControlGripper.maxPosition ?? undefined}
-                        step="any"
-                        value={state.draftGripperPosition}
+                        step={coordinateStep}
+                        value={presentedGripperPosition}
                         disabled={active}
+                        pending={gripperTargetPending}
                         onCommit={editGripper}
                       />
                       <span>
@@ -379,31 +482,31 @@ export function RobotControlPanelView({
                       </span>
                     </span>
                   </span>
-                  <span className="robot-control-limits">
-                    {status.directControlGripper.minPosition === null
-                      || status.directControlGripper.maxPosition === null
-                      ? 'Component-local coordinate; enter the first target explicitly.'
-                      : `${status.directControlGripper.minPosition.toFixed(4)} to ${
-                        status.directControlGripper.maxPosition.toFixed(4)
-                      } ${status.directControlGripper.coordinateKind === 'angular_rad'
-                        ? 'rad'
-                        : 'm'}`}
-                  </span>
                 </label>
               )}
             </div>
 
             <aside className="robot-control-preview" aria-live="polite">
               <div className="robot-control-preview-heading">
-                <div>
-                  <p className="eyebrow">No-effect result</p>
-                  <h3>{state.mode === 'gripper'
-                    ? 'Validated command'
-                    : 'Predicted ghost'}</h3>
+                <h3>Preview</h3>
+                <div className="robot-control-preview-actions">
+                  {state.phase !== 'blocked'
+                    && state.phase !== 'idle'
+                    && state.phase !== 'ready' && (
+                    <span className={`status-pill robot-control-phase phase-${state.phase}`}>
+                      {phaseLabel(state.phase)}
+                    </span>
+                  )}
+                  {state.ghostStale && state.ghost !== null && (
+                    <span className="status-pill status-pill-danger">stale</span>
+                  )}
+                  <button
+                    type="button"
+                    className="inspector-info-button"
+                    aria-label="Preview information"
+                    title="The preview is owner-validated and does not move the robot. Only Approve can submit it for execution."
+                  >i</button>
                 </div>
-                {state.ghostStale && state.ghost !== null && (
-                  <span className="status-pill status-pill-danger">stale</span>
-                )}
               </div>
 
               {state.preview !== null
@@ -417,11 +520,6 @@ export function RobotControlPanelView({
                 </p>
               )}
 
-              {state.ghost === null && (
-                <p className="muted">
-                  Edit a target to validate it without moving the robot.
-                </p>
-              )}
               {state.ghost !== null && (
                 <>
                   <dl className="robot-control-ghost-joints">
@@ -465,7 +563,7 @@ export function RobotControlPanelView({
                 </div>
               )}
 
-              {state.error !== null && (
+              {state.error !== null && state.phase !== 'blocked' && (
                 <p className="robot-control-error" role="alert">{state.error}</p>
               )}
             </aside>
@@ -480,26 +578,29 @@ export function RobotControlPanelView({
                 className="approve-button"
                 type="button"
                 disabled={!canApprove}
+                title="Submit this exact validated target to the execution owner."
                 onClick={() => void approve()}
               >
                 Approve
               </button>
-              <button type="button" disabled={!canRevert} onClick={revert}>
+              <button
+                type="button"
+                disabled={!canRevert}
+                title="Discard only the local no-motion preview."
+                onClick={revert}
+              >
                 Revert
               </button>
               <button
                 className="stop-button"
                 type="button"
                 disabled={!canStop}
+                title="Stop the exact active operation; this does not merely discard its preview."
                 onClick={() => void stop()}
               >
                 Stop operation
               </button>
             </div>
-            <p className="robot-control-boundary">
-              Revert only discards the local preview. It never cancels an
-              executing operation; Stop addresses that exact operation.
-            </p>
           </footer>
         </>
       )}

@@ -10,6 +10,7 @@ interface PaneDividerProps {
   min: number;
   max: number;
   direction?: 1 | -1;
+  axis?: 'x' | 'y';
   onChange: (value: number) => void;
   className?: string;
 }
@@ -18,24 +19,25 @@ function clamp(value: number, min: number, max: number): number {
   return Math.min(Math.max(value, min), max);
 }
 
-/** Pointer- and keyboard-operable presentation-only horizontal pane sizing. */
+/** Pointer- and keyboard-operable presentation-only pane sizing. */
 export function PaneDivider({
   label,
   value,
   min,
   max,
   direction = 1,
+  axis = 'x',
   onChange,
   className = '',
 }: PaneDividerProps) {
-  const pointer = useRef<{ id: number; startX: number; startValue: number } | null>(null);
+  const pointer = useRef<{ id: number; start: number; startValue: number } | null>(null);
 
   const handlePointerDown = (event: ReactPointerEvent<HTMLDivElement>) => {
     event.preventDefault();
     event.currentTarget.setPointerCapture(event.pointerId);
     pointer.current = {
       id: event.pointerId,
-      startX: event.clientX,
+      start: axis === 'x' ? event.clientX : event.clientY,
       startValue: value,
     };
   };
@@ -43,7 +45,9 @@ export function PaneDivider({
     const active = pointer.current;
     if (active === null || active.id !== event.pointerId) return;
     onChange(clamp(
-      active.startValue + direction * (event.clientX - active.startX),
+      active.startValue + direction * (
+        (axis === 'x' ? event.clientX : event.clientY) - active.start
+      ),
       min,
       max,
     ));
@@ -57,9 +61,11 @@ export function PaneDivider({
   };
   const handleKeyDown = (event: ReactKeyboardEvent<HTMLDivElement>) => {
     const step = event.shiftKey ? 50 : 10;
-    const next = event.key === 'ArrowLeft'
+    const decreaseKey = axis === 'x' ? 'ArrowLeft' : 'ArrowUp';
+    const increaseKey = axis === 'x' ? 'ArrowRight' : 'ArrowDown';
+    const next = event.key === decreaseKey
       ? value - direction * step
-      : event.key === 'ArrowRight'
+      : event.key === increaseKey
         ? value + direction * step
         : event.key === 'Home'
           ? min
@@ -77,7 +83,7 @@ export function PaneDivider({
       role="separator"
       tabIndex={0}
       aria-label={`Resize ${label} pane`}
-      aria-orientation="vertical"
+      aria-orientation={axis === 'x' ? 'vertical' : 'horizontal'}
       aria-valuemin={min}
       aria-valuemax={max}
       aria-valuenow={value}

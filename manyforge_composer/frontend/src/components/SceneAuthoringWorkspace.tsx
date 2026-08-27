@@ -9,6 +9,7 @@ import {
   useMemo,
   useState,
 } from 'react';
+import type { ReactNode } from 'react';
 import { createPortal } from 'react-dom';
 
 import { api } from '../api/client';
@@ -19,6 +20,7 @@ import type { ProgramRuntimeController } from '../hooks/useProgramRuntime';
 import type { RobotControlController } from '../hooks/useRobotControl';
 import { ProgramTransportControls } from './ProgramRuntimePanel';
 import { RobotControlPanelView } from './RobotControlPanel';
+import type { ViewerInspectorPanel } from './StructuralViewer';
 import {
   candidateTcpPoseInCell,
   livePoseFromProgramResource,
@@ -83,6 +85,11 @@ interface SceneAuthoringWorkspaceProps {
   runtimeEnabled: boolean;
   sourceModel: StructuralResourceState<SourceModelProjection>;
   viewerActive: boolean;
+  viewerInspectorTarget?: HTMLElement | null;
+  viewerInspectorMinimized?: boolean;
+  onViewerInspectorMinimizedChange?: (minimized: boolean) => void;
+  onViewerInspectorMaximize?: () => void;
+  onViewerInspectorPanelChange?: (panel: ViewerInspectorPanel) => void;
 }
 
 const EMPTY_PROGRAM_RESOURCES: ProgramSceneResource[] = [];
@@ -1484,6 +1491,12 @@ const SceneViewerBridge = memo(function SceneViewerBridge({
   programRuntime,
   robotControl,
   runtimeEnabled,
+  objectControlSurface,
+  inspectorTarget,
+  inspectorMinimized,
+  onInspectorMinimizedChange,
+  onInspectorMaximize,
+  onInspectorPanelChange,
 }: {
   active: boolean;
   source: HeadlessStateSource;
@@ -1534,6 +1547,12 @@ const SceneViewerBridge = memo(function SceneViewerBridge({
   programRuntime: ProgramRuntimeController;
   robotControl: RobotControlController;
   runtimeEnabled: boolean;
+  objectControlSurface?: ReactNode;
+  inspectorTarget?: HTMLElement | null;
+  inspectorMinimized?: boolean;
+  onInspectorMinimizedChange?: (minimized: boolean) => void;
+  onInspectorMaximize?: () => void;
+  onInspectorPanelChange?: (panel: ViewerInspectorPanel) => void;
 }) {
   const headlessState = useViewerHeadlessState(source, active);
   const factsResult = useMemo(
@@ -1697,6 +1716,13 @@ const SceneViewerBridge = memo(function SceneViewerBridge({
       robotControlSurface={(
         <RobotControlPanelView enabled={runtimeEnabled} controller={robotControl} />
       )}
+      robotControlBlocked={robotControl.state.phase === 'blocked'}
+      objectControlSurface={objectControlSurface}
+      inspectorTarget={inspectorTarget}
+      inspectorMinimized={inspectorMinimized}
+      onInspectorMinimizedChange={onInspectorMinimizedChange}
+      onInspectorMaximize={onInspectorMaximize}
+      onInspectorPanelChange={onInspectorPanelChange}
       transportControls={(
         <ProgramTransportControls
           enabled={runtimeEnabled}
@@ -1722,6 +1748,11 @@ export function SceneAuthoringWorkspace({
   runtimeEnabled,
   sourceModel,
   viewerActive,
+  viewerInspectorTarget = null,
+  viewerInspectorMinimized = false,
+  onViewerInspectorMinimizedChange,
+  onViewerInspectorMaximize,
+  onViewerInspectorPanelChange,
 }: SceneAuthoringWorkspaceProps) {
   const headlessState = useShellHeadlessState(headlessStateSource);
   const programWorkspace = programController.state.workspace;
@@ -2076,46 +2107,6 @@ export function SceneAuthoringWorkspace({
     }) !== null;
   }, [busyDraft, draftId, draftRevision, program?.scene, programController]);
 
-  const viewerSurface = (
-    <SceneViewerBridge
-      active={viewerActive}
-      source={headlessStateSource}
-      sourceValue={sourceValue}
-      environmentValue={environmentValue}
-      manifest={manifest}
-      onRetry={onRetryManifest}
-      program={program}
-      draftIdentity={draftId === null ? null : { draftId, draftRevision }}
-      viewer={viewer}
-      selection={selection}
-      livePose={livePose}
-      selectionLocked={selectionLocked}
-      onSelect={setSelection}
-      ghost={ghost}
-      ghostStale={robotControl.state.ghostStale}
-      candidatePoseEditable={candidatePoseEditable}
-      onEditCandidatePose={robotControl.editPose}
-      onCommitTransform={commitTransform}
-      onDuplicate={duplicateObject}
-      onRemove={removeObject}
-      onDetach={detachObject}
-      onDuplicateProgramResource={duplicateProgramResource}
-      onRemoveProgramResource={removeProgramResource}
-      onCommitProgramTransform={commitProgramTransform}
-      onEditSelection={(kind, identity) => {
-        setSelection({ kind, id: identity });
-        setActiveSceneTool(kind === 'program_resource' ? 'program' : 'current');
-      }}
-      mutationAvailability={mutationAvailability}
-      hiddenSelectionKeys={hiddenSelectionKeys}
-      objectAxesSelectionKeys={objectAxesSelectionKeys}
-      motionPreview={previewGhost}
-      programRuntime={programRuntime}
-      robotControl={robotControl}
-      runtimeEnabled={runtimeEnabled}
-    />
-  );
-
   const commitLivePose = async () => {
     if (
       facts === null
@@ -2161,6 +2152,240 @@ export function SceneAuthoringWorkspace({
       });
     }
   };
+
+  const ownerObjectControlSurface = objects.length === 0 ? undefined : (
+    <div className="scene-authoring-column current-scene-editor viewer-object-owner-editor">
+      {!factsResult.available && (
+        <div className="panel-state error-state" role="alert">
+          <strong>Current scene is unavailable</strong>
+          <span>{factsResult.reason}</span>
+        </div>
+      )}
+      {facts !== null && (
+        <>
+          <details className="scene-object-metadata">
+            <summary>Owner and runtime source facts</summary>
+            <dl>
+              <dt>Scene source</dt>
+              <dd><code>{facts.sourceOwnerEpoch}</code> / {facts.sourceGeneration}</dd>
+              <dt>Runtime source</dt>
+              <dd><code>{facts.runtimeSourceOwnerEpoch}</code> / {facts.runtimeSourceGeneration}</dd>
+              <dt>Scene revision</dt>
+              <dd><code>{facts.logicalScene.snapshot?.revision.revision_id}</code></dd>
+              <dt>Observations</dt>
+              <dd>{runtimeStatus.freshGood} fresh / {runtimeStatus.total} total</dd>
+            </dl>
+          </details>
+          {runtimeStatus.warnings.map((warning) => (
+            <p className="scene-contract-note warning-state" key={warning} role="status">
+              Measured overlay: {warning}
+            </p>
+          ))}
+          <select
+            aria-label="Current scene object"
+            value={selectedOwnerObjectId ?? ''}
+            disabled={selectionLocked}
+            onChange={(event) => setSelection(event.target.value === ''
+              ? null
+              : { kind: 'owner_object', id: event.target.value })}
+          >
+            <option value="">Select a current scene object</option>
+            {objects.map((object) => (
+              <option key={object.scene_resource_id} value={object.scene_resource_id}>
+                {object.scene_resource_id} · {object.placement.kind}
+              </option>
+            ))}
+          </select>
+          {selectedObject !== null && livePose !== null && (
+            <>
+              <div className="scene-pose-grid">
+                {(['x', 'y', 'z'] as const).map((field) => (
+                  <label key={field}>
+                    <span>{field.toUpperCase()} (m)</span>
+                    <input
+                      type="number"
+                      step={0.001}
+                      value={livePose.position_m[field]}
+                      disabled={editReason !== null || commitState.kind === 'busy'}
+                      onChange={(event) => editLivePose(field, event.currentTarget.valueAsNumber)}
+                    />
+                  </label>
+                ))}
+              </div>
+              <div className="scene-pose-grid scene-quaternion-grid">
+                {['Qx', 'Qy', 'Qz', 'Qw'].map((label, index) => (
+                  <label key={label}>
+                    <span>{label}</span>
+                    <input
+                      type="number"
+                      step={0.001}
+                      value={livePose.orientation_xyzw[index]}
+                      disabled={editReason !== null || commitState.kind === 'busy'}
+                      onChange={(event) => editLivePose(
+                        index as 0 | 1 | 2 | 3,
+                        event.currentTarget.valueAsNumber,
+                      )}
+                    />
+                  </label>
+                ))}
+              </div>
+            </>
+          )}
+          {(editReason ?? facts.writeUnavailableReason) !== null && (
+            <p className="scene-contract-note warning-state">
+              {editReason ?? facts.writeUnavailableReason}
+            </p>
+          )}
+          {selectedObject !== null && (
+            <details className="scene-object-metadata">
+              <summary>Ownership, contacts, and collision metadata</summary>
+              <dl>
+                <dt>Placement</dt>
+                <dd>{selectedObject.placement.kind.replaceAll('_', ' ')}</dd>
+                <dt>Ownership</dt>
+                <dd>{selectedObject.provider_evidence === null
+                  ? 'Logical-scene owner'
+                  : 'External provider'}</dd>
+                <dt>Shapes</dt>
+                <dd>{selectedObject.collision_shapes.map((shape) => shape.type).join(', ') || 'none'}</dd>
+                <dt>Support contacts</dt>
+                <dd>{selectedObject.support_contacts.length}</dd>
+              </dl>
+            </details>
+          )}
+          <details className="scene-object-metadata">
+            <summary>Active collision policy</summary>
+            <pre>{JSON.stringify(
+              facts.logicalScene.snapshot?.configured_collision_policy ?? {},
+              null,
+              2,
+            )}</pre>
+          </details>
+          {selectedObject?.placement.kind === 'cell_fixed' && (
+            <AttachObjectControls
+              object={selectedObject}
+              sourceModel={sourceValue}
+              disabled={!facts.runtimeWriteAvailable
+                || selectedObject.provider_evidence !== null
+                || commitState.kind === 'busy'}
+              onAttach={attachObject}
+            />
+          )}
+          <div className="scene-authoring-actions">
+            <button
+              type="button"
+              disabled={selectedObject === null || livePose === null || editReason !== null
+                || !facts.writeAvailable || commitState.kind === 'busy'}
+              onClick={() => void commitLivePose()}
+            >Commit current pose</button>
+            <button
+              type="button"
+              disabled={selectedObject?.placement.kind !== 'cell_fixed' || commitState.kind === 'busy'}
+              onClick={() => setLivePose(selectedObject?.placement.kind === 'cell_fixed'
+                ? selectedObject.placement.pose_in_cell
+                : null)}
+            >Discard local edit</button>
+            <button
+              type="button"
+              disabled={draftPoseForLive === null || editReason !== null || commitState.kind === 'busy'}
+              onClick={() => {
+                if (draftPoseForLive !== null) setLivePose(draftPoseForLive);
+              }}
+            >Stage Draft pose</button>
+            <button
+              type="button"
+              disabled={copyToDraft === null || busyDraft}
+              onClick={() => {
+                if (copyToDraft !== null) void programController.mutate('scene_draft_update_object', {
+                  scene_resource: copyToDraft as unknown as JsonValue,
+                });
+              }}
+            >Copy live pose to Draft</button>
+            <button
+              type="button"
+              disabled={selectedOwnerObjectId === null
+                || mutationAvailability[selectedOwnerObjectId]?.duplicate !== true
+                || commitState.kind === 'busy'}
+              onClick={() => {
+                if (selectedOwnerObjectId !== null) void duplicateObject(selectedOwnerObjectId);
+              }}
+            >Duplicate</button>
+            <button
+              type="button"
+              disabled={selectedOwnerObjectId === null
+                || mutationAvailability[selectedOwnerObjectId]?.detach !== true
+                || commitState.kind === 'busy'}
+              onClick={() => {
+                if (selectedOwnerObjectId !== null) void detachObject(selectedOwnerObjectId);
+              }}
+            >Detach at current pose</button>
+            <button
+              type="button"
+              className="danger-button"
+              disabled={selectedOwnerObjectId === null
+                || mutationAvailability[selectedOwnerObjectId]?.remove !== true
+                || commitState.kind === 'busy'}
+              onClick={() => {
+                if (selectedOwnerObjectId !== null) void removeObject(selectedOwnerObjectId);
+              }}
+            >Remove</button>
+          </div>
+          {commitState.message !== null && (
+            <p
+              className={commitState.kind === 'error' ? 'scene-commit-error' : 'scene-commit-success'}
+              role={commitState.kind === 'error' ? 'alert' : 'status'}
+            >{commitState.message}</p>
+          )}
+        </>
+      )}
+    </div>
+  );
+
+  const viewerSurface = (
+    <SceneViewerBridge
+      active={viewerActive}
+      source={headlessStateSource}
+      sourceValue={sourceValue}
+      environmentValue={environmentValue}
+      manifest={manifest}
+      onRetry={onRetryManifest}
+      program={program}
+      draftIdentity={draftId === null ? null : { draftId, draftRevision }}
+      viewer={viewer}
+      selection={selection}
+      livePose={livePose}
+      selectionLocked={selectionLocked}
+      onSelect={setSelection}
+      ghost={ghost}
+      ghostStale={robotControl.state.ghostStale}
+      candidatePoseEditable={candidatePoseEditable}
+      onEditCandidatePose={robotControl.editPose}
+      onCommitTransform={commitTransform}
+      onDuplicate={duplicateObject}
+      onRemove={removeObject}
+      onDetach={detachObject}
+      onDuplicateProgramResource={duplicateProgramResource}
+      onRemoveProgramResource={removeProgramResource}
+      onCommitProgramTransform={commitProgramTransform}
+      onEditSelection={(kind, identity) => {
+        setSelection({ kind, id: identity });
+        setActiveSceneTool(kind === 'program_resource' ? 'program' : 'current');
+      }}
+      mutationAvailability={mutationAvailability}
+      hiddenSelectionKeys={hiddenSelectionKeys}
+      objectAxesSelectionKeys={objectAxesSelectionKeys}
+      motionPreview={previewGhost}
+      programRuntime={programRuntime}
+      robotControl={robotControl}
+      runtimeEnabled={runtimeEnabled}
+      objectControlSurface={ownerObjectControlSurface}
+      inspectorTarget={viewerInspectorTarget}
+      inspectorMinimized={viewerInspectorMinimized}
+      onInspectorMinimizedChange={onViewerInspectorMinimizedChange}
+      onInspectorMaximize={onViewerInspectorMaximize}
+      onInspectorPanelChange={onViewerInspectorPanelChange}
+    />
+  );
 
   const editorSurface = (
       <section className="panel scene-authoring-workspace" aria-labelledby="scene-authoring-title">
@@ -2295,261 +2520,14 @@ export function SceneAuthoringWorkspace({
         )}
 
         {activeSceneTool === 'current' && (
-        <div className="scene-authoring-column current-scene-editor" data-testid="current-scene-editor">
-          <div className="scene-authoring-heading">
-            <div>
-              <p className="eyebrow">Logical-scene owner</p>
-              <h3>Current scene object</h3>
-            </div>
+          <div data-testid="current-scene-editor">
+            {ownerObjectControlSurface ?? (
+              <div className="panel-state">
+                <strong>No current scene objects</strong>
+                <span>The logical-scene owner reports an empty object inventory.</span>
+              </div>
+            )}
           </div>
-          {!factsResult.available && (
-            <div className="panel-state error-state" role="alert">
-              <strong>Current scene is unavailable</strong>
-              <span>{factsResult.reason}</span>
-            </div>
-          )}
-          {facts !== null && (
-            <>
-              <div className="scene-owner-identity">
-                <span>scene source <code>{facts.sourceOwnerEpoch}</code> / {facts.sourceGeneration}</span>
-                <span>runtime source <code>{facts.runtimeSourceOwnerEpoch}</code> / {facts.runtimeSourceGeneration}</span>
-                <span>revision <code>{facts.logicalScene.snapshot?.revision.revision_id}</code></span>
-                <span>
-                  observations <strong>{runtimeStatus.freshGood}</strong> fresh / {runtimeStatus.total}
-                </span>
-                <span>{runtimeStatus.staleGood} stale</span>
-                <span>{runtimeStatus.unknown} unknown</span>
-                <span>{runtimeStatus.buffered} buffered</span>
-              </div>
-              {runtimeStatus.warnings.map((warning) => (
-                <p
-                  className="scene-contract-note warning-state"
-                  key={warning}
-                  role="status"
-                >
-                  Measured overlay: {warning}
-                </p>
-              ))}
-              <select
-                aria-label="Current scene object"
-                value={selectedOwnerObjectId ?? ''}
-                disabled={objects.length === 0 || selectionLocked}
-                onChange={(event) => setSelection(event.target.value === ''
-                  ? null
-                  : { kind: 'owner_object', id: event.target.value })}
-              >
-                <option value="">
-                  {objects.length === 0
-                    ? 'No current scene objects'
-                    : 'Select a current scene object'}
-                </option>
-                {objects.map((object) => (
-                  <option key={object.scene_resource_id} value={object.scene_resource_id}>
-                    {object.scene_resource_id} · {object.placement.kind}
-                  </option>
-                ))}
-              </select>
-              {selectedObject !== null && livePose !== null && (
-                <>
-                  <div className="scene-pose-grid">
-                    {(['x', 'y', 'z'] as const).map((field) => (
-                      <label key={field}>
-                        <span>{field.toUpperCase()} (m)</span>
-                        <input
-                          type="number"
-                          step={0.001}
-                          value={livePose.position_m[field]}
-                          disabled={editReason !== null || commitState.kind === 'busy'}
-                          onChange={(event) => editLivePose(field, event.currentTarget.valueAsNumber)}
-                        />
-                      </label>
-                    ))}
-                  </div>
-                  <div className="scene-pose-grid scene-quaternion-grid">
-                    {['Qx', 'Qy', 'Qz', 'Qw'].map((label, index) => (
-                      <label key={label}>
-                        <span>{label}</span>
-                        <input
-                          type="number"
-                          step={0.001}
-                          value={livePose.orientation_xyzw[index]}
-                          disabled={editReason !== null || commitState.kind === 'busy'}
-                          onChange={(event) => editLivePose(
-                            index as 0 | 1 | 2 | 3,
-                            event.currentTarget.valueAsNumber,
-                          )}
-                        />
-                      </label>
-                    ))}
-                  </div>
-                </>
-              )}
-              {(editReason ?? facts.writeUnavailableReason) !== null && (
-                <p className="scene-contract-note warning-state">
-                  {editReason ?? facts.writeUnavailableReason}
-                </p>
-              )}
-              {selectedObject !== null && (
-                <details className="scene-object-metadata">
-                  <summary>Ownership, contacts, and collision metadata</summary>
-                  <dl>
-                    <dt>Ownership</dt>
-                    <dd>{selectedObject.provider_evidence === null
-                      ? 'Logical-scene owner'
-                      : 'External provider'}</dd>
-                    <dt>Shapes</dt>
-                    <dd>{selectedObject.collision_shapes.map(
-                      (shape) => shape.type,
-                    ).join(', ') || 'none'}</dd>
-                    <dt>Support contacts</dt>
-                    <dd>{selectedObject.support_contacts.length}</dd>
-                  </dl>
-                  {selectedObject.support_contacts.length > 0 && (
-                    <pre>{JSON.stringify(selectedObject.support_contacts, null, 2)}</pre>
-                  )}
-                  {selectedObject.provider_evidence !== null && (
-                    <pre>{JSON.stringify(selectedObject.provider_evidence, null, 2)}</pre>
-                  )}
-                </details>
-              )}
-              <details className="scene-object-metadata">
-                <summary>Active collision policy</summary>
-                <pre>{JSON.stringify(
-                  facts.logicalScene.snapshot?.configured_collision_policy ?? {},
-                  null,
-                  2,
-                )}</pre>
-              </details>
-              {selectedObject?.placement.kind === 'cell_fixed' && (
-                <AttachObjectControls
-                  object={selectedObject}
-                  sourceModel={sourceValue}
-                  disabled={
-                    !facts.runtimeWriteAvailable
-                    || selectedObject.provider_evidence !== null
-                    || commitState.kind === 'busy'
-                  }
-                  onAttach={attachObject}
-                />
-              )}
-              <div className="scene-authoring-actions">
-                <button
-                  type="button"
-                  disabled={
-                    selectedObject === null
-                    || livePose === null
-                    || editReason !== null
-                    || !facts.writeAvailable
-                    || commitState.kind === 'busy'
-                  }
-                  onClick={() => void commitLivePose()}
-                >
-                  Commit current pose
-                </button>
-                <button
-                  type="button"
-                  disabled={selectedObject?.placement.kind !== 'cell_fixed' || commitState.kind === 'busy'}
-                  onClick={() => setLivePose(
-                    selectedObject?.placement.kind === 'cell_fixed'
-                      ? selectedObject.placement.pose_in_cell
-                      : null,
-                  )}
-                >
-                  Discard local edit
-                </button>
-                <button
-                  type="button"
-                  disabled={
-                    draftPoseForLive === null
-                    || editReason !== null
-                    || commitState.kind === 'busy'
-                  }
-                  title={draftPoseForLive === null
-                    ? 'A matching Program resource with an exact cell-frame pose is required.'
-                    : undefined}
-                  onClick={() => {
-                    if (draftPoseForLive !== null) setLivePose(draftPoseForLive);
-                  }}
-                >
-                  Stage Draft pose for live Commit
-                </button>
-                <button
-                  type="button"
-                  disabled={copyToDraft === null || busyDraft}
-                  title={copyToDraft === null
-                    ? 'A matching Program resource and lossless cell-frame pose are required.'
-                    : undefined}
-                  onClick={() => {
-                    if (copyToDraft !== null) {
-                      programController.mutate('scene_draft_update_object', {
-                        scene_resource: copyToDraft as unknown as JsonValue,
-                      });
-                    }
-                  }}
-                >
-                  Copy live pose to Draft
-                </button>
-                <button
-                  type="button"
-                  disabled={
-                    selectedOwnerObjectId === null
-                    || mutationAvailability[selectedOwnerObjectId]?.duplicate !== true
-                    || commitState.kind === 'busy'
-                  }
-                  title={selectedOwnerObjectId === null
-                    ? 'Select an owner scene object.'
-                    : mutationAvailability[selectedOwnerObjectId]?.reason ?? undefined}
-                  onClick={() => {
-                    if (selectedOwnerObjectId !== null) void duplicateObject(selectedOwnerObjectId);
-                  }}
-                >
-                  Duplicate
-                </button>
-                <button
-                  type="button"
-                  disabled={
-                    selectedOwnerObjectId === null
-                    || mutationAvailability[selectedOwnerObjectId]?.detach !== true
-                    || commitState.kind === 'busy'
-                  }
-                  title={selectedOwnerObjectId === null
-                    ? 'Select a carried object.'
-                    : mutationAvailability[selectedOwnerObjectId]?.detachReason ?? undefined}
-                  onClick={() => {
-                    if (selectedOwnerObjectId !== null) void detachObject(selectedOwnerObjectId);
-                  }}
-                >
-                  Detach at current pose
-                </button>
-                <button
-                  type="button"
-                  className="danger-button"
-                  disabled={
-                    selectedOwnerObjectId === null
-                    || mutationAvailability[selectedOwnerObjectId]?.remove !== true
-                    || commitState.kind === 'busy'
-                  }
-                  title={selectedOwnerObjectId === null
-                    ? 'Select an owner scene object.'
-                    : mutationAvailability[selectedOwnerObjectId]?.reason ?? undefined}
-                  onClick={() => {
-                    if (selectedOwnerObjectId !== null) void removeObject(selectedOwnerObjectId);
-                  }}
-                >
-                  Remove
-                </button>
-              </div>
-              {commitState.message !== null && (
-                <p
-                  className={commitState.kind === 'error' ? 'scene-commit-error' : 'scene-commit-success'}
-                  role={commitState.kind === 'error' ? 'alert' : 'status'}
-                >
-                  {commitState.message}
-                </p>
-              )}
-            </>
-          )}
-        </div>
         )}
       </section>
   );

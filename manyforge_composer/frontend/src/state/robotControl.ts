@@ -298,7 +298,13 @@ function resolveStatus(
       error: null,
     };
   }
-  return { ...state, status };
+  const operationSettled = state.operation !== null
+    && operationStateIsTerminal(state.operation.state);
+  return {
+    ...state,
+    status,
+    ...(operationSettled ? draftFromStatus(status) : {}),
+  };
 }
 
 function invalidateDraft(
@@ -341,20 +347,19 @@ export function robotControlReducer(
         || robotControlHasActiveOperation(state)
         || state.mode === action.mode
       ) return state;
-      if (action.mode === 'gripper' && state.draftGripperPosition === null) {
-        return {
-          ...state,
-          mode: action.mode,
-          phase: 'idle',
-          generation: state.generation + 1,
-          intent: null,
-          preview: null,
-          ghostStale: state.ghost !== null,
-          operation: null,
-          error: null,
-        };
-      }
-      return invalidateDraft(state, { mode: action.mode });
+      return {
+        ...state,
+        mode: action.mode,
+        phase: 'idle',
+        ...draftFromStatus(state.status),
+        generation: state.generation + 1,
+        intent: null,
+        preview: null,
+        ghost: null,
+        ghostStale: false,
+        operation: null,
+        error: null,
+      };
     case 'edit':
     case 'edit_joint': {
       if (state.status === null || robotControlHasActiveOperation(state)) {

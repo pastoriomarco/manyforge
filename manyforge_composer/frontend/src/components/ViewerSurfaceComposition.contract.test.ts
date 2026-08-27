@@ -7,9 +7,10 @@ function source(path: string): string {
 }
 
 describe('UI4 application and viewport composition', () => {
-  it('keeps one persistent viewer and moves detailed surfaces behind bounded launchers', () => {
+  it('keeps one persistent viewer and moves detailed surfaces into the split inspector', () => {
     const app = source('../App.tsx');
     const viewer = source('./StructuralViewer.tsx');
+    const styles = source('../index.css');
 
     expect(app.match(/<SceneAuthoringWorkspace/g)).toHaveLength(1);
     expect(app).toContain('className="global-surface-launchers"');
@@ -19,8 +20,29 @@ describe('UI4 application and viewport composition', () => {
     expect(app).not.toContain('<details className="workbench-disclosure"');
     expect(viewer).toContain('>Robot</button>');
     expect(viewer).toContain('>Object</button>');
-    expect(viewer).toContain('<summary>Tools</summary>');
+    expect(viewer).toContain("toggleInspectorPanel('tools')");
+    expect(viewer).toContain('createPortal(');
+    expect(viewer).toContain('Maximize viewer inspector');
+    expect(viewer).not.toContain('<OverlayPanel');
     expect(viewer).toContain('{transportControls}');
+    expect(viewer).toContain("inspectorPanel === 'robot' ? ' robot-inspector-body' : ''");
+    expect(viewer).toContain("inspectorPanel === 'robot' && robotControlBlocked");
+    expect(viewer).toContain('aria-label="Robot control information"');
+    expect(styles).toContain('.central-inspector-body.robot-inspector-body');
+    expect(styles).toMatch(/\.viewer-inspector-section \.robot-control-panel \{[\s\S]*?height: 100%;[\s\S]*?flex-direction: column;/);
+    expect(styles).toMatch(/\.viewer-inspector-section \.robot-control-body \{[\s\S]*?display: flex;[\s\S]*?flex-direction: column;[\s\S]*?overflow: hidden;/);
+    expect(styles).toMatch(/\.viewer-inspector-section \.robot-control-editor \{[\s\S]*?flex: 1 1 auto;[\s\S]*?overflow-y: auto;/);
+    expect(styles).toMatch(/\.viewer-inspector-section \.robot-control-preview \{[\s\S]*?flex: 0 1 auto;[\s\S]*?max-height: 45%;/);
+    expect(styles).toMatch(/\.viewer-inspector-section \.robot-control-footer \{\s*flex: 0 0 auto;/);
+    expect(styles).toMatch(/\.robot-control-actions \{[\s\S]*?justify-content: center;/);
+    expect(styles).toMatch(/\.viewer-inspector-section \.robot-control-modes \{[\s\S]*?justify-content: center;/);
+    expect(styles).toMatch(/\.central-inspector-actions \.inspector-info-button \{[\s\S]*?border-color: transparent;/);
+    expect(styles).toMatch(/\.robot-control-phase \{[\s\S]*?justify-content: center;[\s\S]*?text-align: center;/);
+    expect(styles).toContain('--inspector-control-height: 1.9rem;');
+    expect(styles).toContain('--inspector-row-padding: 0.34rem;');
+    expect(styles).toMatch(/\.central-inspector-section \.program-property \{[\s\S]*?padding: var\(--inspector-row-padding\) 0;/);
+    expect(styles).toMatch(/\.viewer-inspector-section \.robot-control-joint \{[\s\S]*?padding: var\(--inspector-row-padding\) 0;/);
+    expect(styles).toContain('.central-inspector-notice-warning');
   });
 
   it('keeps transport scopes explicit and uses the exact operation-scoped velocity owner', () => {

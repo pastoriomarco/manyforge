@@ -18,6 +18,8 @@ type DraftTextInputProps = Omit<
   validate?: (value: string) => string | null;
   onInvalidChange?: (message: string | null) => void;
   shiftStepMultiplier?: number;
+  commitNativeStep?: boolean;
+  dirtyClassName?: string;
 };
 
 export function DraftTextInput({
@@ -26,6 +28,8 @@ export function DraftTextInput({
   validate,
   onInvalidChange,
   shiftStepMultiplier,
+  commitNativeStep,
+  dirtyClassName,
   onBlur,
   onFocus,
   onKeyDown,
@@ -36,6 +40,8 @@ export function DraftTextInput({
   const [focused, setFocused] = useState(false);
   const [invalidMessage, setInvalidMessage] = useState<string | null>(null);
   const skipNextCommit = useRef(false);
+  const inputRef = useRef<HTMLInputElement | null>(null);
+  const sawBeforeInput = useRef(false);
 
   useEffect(() => {
     if (!focused && invalidMessage === null) setDraft(normalizedValue);
@@ -57,10 +63,39 @@ export function DraftTextInput({
     onInvalidChange?.(null);
   }, [normalizedValue, onInvalidChange]);
 
+  useEffect(() => {
+    const input = inputRef.current;
+    if (!commitNativeStep || input === null) return undefined;
+    const onBeforeInput = () => {
+      sawBeforeInput.current = true;
+    };
+    const onInput = (event: Event) => {
+      const inputEvent = event as InputEvent;
+      const typedEdit = sawBeforeInput.current || Boolean(inputEvent.inputType);
+      sawBeforeInput.current = false;
+      if (typedEdit) return;
+      const candidate = input.value;
+      const message = validate?.(candidate) ?? null;
+      setDraft(candidate);
+      setInvalidMessage(message);
+      onInvalidChange?.(message);
+      if (message === null && candidate !== normalizedValue) onCommit(candidate);
+    };
+    input.addEventListener('beforeinput', onBeforeInput);
+    input.addEventListener('input', onInput);
+    return () => {
+      input.removeEventListener('beforeinput', onBeforeInput);
+      input.removeEventListener('input', onInput);
+    };
+  }, [commitNativeStep, normalizedValue, onCommit, onInvalidChange, validate]);
+
   return (
     <input
+      ref={inputRef}
       {...props}
-      className={`${props.className ?? ''}${invalidMessage ? ' draft-input-invalid' : ''}`.trim()}
+      className={`${props.className ?? ''}${
+        dirtyClassName && draft !== normalizedValue ? ` ${dirtyClassName}` : ''
+      }${invalidMessage ? ' draft-input-invalid' : ''}`.trim()}
       aria-invalid={invalidMessage ? true : props['aria-invalid']}
       title={invalidMessage ?? props.title}
       value={draft}
@@ -78,7 +113,6 @@ export function DraftTextInput({
       onKeyDown={(event: KeyboardEvent<HTMLInputElement>) => {
         if (
           shiftStepMultiplier !== undefined
-          && event.shiftKey
           && (event.key === 'ArrowUp' || event.key === 'ArrowDown')
           && props.type === 'number'
         ) {
@@ -90,10 +124,19 @@ export function DraftTextInput({
             const direction = event.key === 'ArrowUp' ? 1 : -1;
             const minimum = props.min === undefined ? -Infinity : Number(props.min);
             const maximum = props.max === undefined ? Infinity : Number(props.max);
-            setDraft(String(Math.min(maximum, Math.max(
+            const next = String(Math.min(maximum, Math.max(
               minimum,
-              current + direction * baseStep * shiftStepMultiplier,
-            ))));
+              current + direction * baseStep * (
+                event.shiftKey ? shiftStepMultiplier : 1
+              ),
+            )));
+            setDraft(next);
+            if (commitNativeStep) {
+              const message = validate?.(next) ?? null;
+              setInvalidMessage(message);
+              onInvalidChange?.(message);
+              if (message === null && next !== normalizedValue) onCommit(next);
+            }
             event.preventDefault();
             return;
           }

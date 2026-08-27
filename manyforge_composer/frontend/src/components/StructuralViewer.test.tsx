@@ -7,10 +7,12 @@ import { describe, expect, it } from 'vitest';
 import {
   DEFAULT_WIREFRAME_VISIBLE,
   VIEWER_CLICK_MAX_DURATION_MS,
+  VIEWER_CONTEXT_DRAG_THRESHOLD_PX,
   frameableContentBounds,
   framedCameraPresentation,
   supportsIndependentSceneScale,
   viewerClickWithinDuration,
+  viewerContextWasDragged,
   ViewerFailureBoundary,
 } from './StructuralViewer';
 import type { LogicalSceneObject } from '../types/api';
@@ -77,16 +79,16 @@ describe('viewer failure isolation', () => {
     );
   });
 
-  it('keeps viewer layers in one compact tools menu at narrow widths', () => {
+  it('keeps viewer layers in one bounded inspector panel at narrow widths', () => {
     const css = readFileSync(new URL('../index.css', import.meta.url), 'utf8');
     const source = readFileSync(
       new URL('./StructuralViewer.tsx', import.meta.url),
       'utf8',
     );
 
-    expect(css).toContain('.viewer-options-popover');
+    expect(css).toContain('.viewer-options-body');
     expect(source.match(/type="checkbox"/g)).toHaveLength(4);
-    expect(source).toContain('<summary>Tools</summary>');
+    expect(source).toContain("toggleInspectorPanel('tools')");
     expect(source).toContain('Measured-state overlay');
     expect(source).toContain('Model and source facts');
     expect(source).toContain('manifest.data.links.length} links · {manifest.data.joints.length} joints');
@@ -102,16 +104,16 @@ describe('viewer failure isolation', () => {
     const header = source.indexOf('className="panel-header viewer-header"');
     const stage = source.indexOf('className="viewer-stage"', header);
     const controls = source.indexOf('aria-label="Scene viewport controls"', header);
-    const options = source.indexOf('className="viewer-options"', header);
+    const launchers = source.indexOf('className="viewer-surface-launchers"', header);
 
     expect(header).toBeGreaterThan(0);
-    expect(controls).toBeLessThan(options);
-    expect(options).toBeLessThan(stage);
+    expect(controls).toBeLessThan(launchers);
+    expect(launchers).toBeLessThan(stage);
     expect(source.indexOf('aria-label="Frame all visible content"', header)).toBeLessThan(stage);
     expect(source.indexOf('aria-label="Frame selected object"', header)).toBeLessThan(stage);
     expect(source.indexOf('aria-label="Reset camera"', header)).toBeLessThan(stage);
     expect(css).toMatch(/\.viewer-header-controls\s*\{[^}]*flex:\s*1 1 auto/s);
-    expect(css).toMatch(/\.viewer-options\s*\{[^}]*margin-left:\s*auto/s);
+    expect(css).toMatch(/\.viewer-surface-launchers\s*\{[^}]*margin-left:\s*auto/s);
     expect(source).toContain('className="viewer-camera-icon"');
   });
 
@@ -191,6 +193,30 @@ describe('viewer failure isolation', () => {
     })).toBe(false);
   });
 
+  it('opens the object context surface only for an un-dragged right-button release', () => {
+    const source = readFileSync(
+      new URL('./StructuralViewer.tsx', import.meta.url),
+      'utf8',
+    );
+
+    expect(VIEWER_CONTEXT_DRAG_THRESHOLD_PX).toBe(3);
+    expect(viewerContextWasDragged({
+      startX: 10,
+      startY: 10,
+      currentX: 12,
+      currentY: 12,
+    })).toBe(false);
+    expect(viewerContextWasDragged({
+      startX: 10,
+      startY: 10,
+      currentX: 14,
+      currentY: 10,
+    })).toBe(true);
+    expect(source).toContain('onPointerUpCapture={releaseContextPointer}');
+    expect(source).toContain('onContextMenu={(event) => event.preventDefault()}');
+    expect(source).not.toContain('onContextMenu={(event) => {');
+  });
+
   it('routes authored and measured render layers through the same selection callbacks', () => {
     const source = readFileSync(
       new URL('./StructuralViewer.tsx', import.meta.url),
@@ -218,7 +244,7 @@ describe('viewer failure isolation', () => {
     expect(source).not.toContain('setCameraPresentation(presentation)');
   });
 
-  it('frames robot, scene, measured overlays, and point clouds together', () => {
+  it('starts from Reset and frames robot, scene, measured overlays, and point clouds on demand', () => {
     const source = readFileSync(
       new URL('./StructuralViewer.tsx', import.meta.url),
       'utf8',
@@ -232,9 +258,11 @@ describe('viewer failure isolation', () => {
     expect(source.indexOf('<MeasuredLogicalSceneObjects', bounds)).toBeLessThan(boundsEnd);
     expect(source.indexOf('<PointCloudPoints', bounds)).toBeLessThan(boundsEnd);
     expect(source).toContain('viewer-stage viewer-fallback-stage');
-    expect(source).toContain(
-      'fit={camera === null && !retainedCameraPresentation.framed}',
-    );
+    expect(source).toContain('<Bounds clip margin={1.25}>');
+    expect(source).not.toContain('fit={camera === null');
+    expect(source).toContain('position: [...DEFAULT_VIEWER_CAMERA.position]');
+    expect(source).toContain('target: [...DEFAULT_VIEWER_CAMERA.target]');
+    expect(source).not.toContain('framed: camera !== null');
   });
 
   it('isolates individual retained and logical-scene mesh failures', () => {
