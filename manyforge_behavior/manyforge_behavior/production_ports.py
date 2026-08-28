@@ -1645,6 +1645,16 @@ class NativeKernelProgramPort:
             "operation_id": task.operation_id,
             "operation_revision": operation.get("operation_revision"),
         }
+        stop_id = operation.get("active_stop_id")
+        stop_generation = operation.get("active_stop_generation")
+        if (
+            isinstance(stop_id, str)
+            and stop_id
+            and type(stop_generation) is int
+            and stop_generation > 0
+        ):
+            metadata["active_stop_id"] = stop_id
+            metadata["active_stop_generation"] = stop_generation
         if state in _ACTIVE_STATES:
             snapshot = OwnerTaskSnapshot(
                 task_id=task.operation_id,
@@ -1661,6 +1671,11 @@ class NativeKernelProgramPort:
             assessment = self._recovery_assessment(operation, task.operation_id)
             if assessment is not None:
                 metadata["recovery_assessment"] = assessment
+                if assessment.get("recovery_class") == "ordinary_operator_stop":
+                    metadata["authored_failure_policy"] = "pause_for_operator"
+                    metadata["authored_failure_policy_parameter"] = (
+                        "operator_stop_policy"
+                    )
             snapshot = OwnerTaskSnapshot(
                 task_id=task.operation_id,
                 state=OwnerTaskState.INTERRUPTED,

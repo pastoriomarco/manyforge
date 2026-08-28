@@ -151,6 +151,50 @@ class _PolicyTaskPort(_TaskPort):
         )
 
 
+class _OperatorStopTaskPort(_TaskPort):
+    def __init__(self, events: list[str]) -> None:
+        super().__init__(events, OwnerTaskState.ACTIVE)
+        self.observations = 0
+
+    def observe(self, task_id: str) -> OwnerTaskSnapshot:
+        self.observations += 1
+        return OwnerTaskSnapshot(
+            task_id=task_id,
+            state=OwnerTaskState.INTERRUPTED,
+            metadata={
+                "active_stop_id": "stop.1",
+                "active_stop_generation": 1,
+                "authored_failure_policy": "pause_for_operator",
+                "authored_failure_policy_parameter": "operator_stop_policy",
+                "recovery_assessment": {
+                    "allowed_actions": ["replan_from_stopped_state"],
+                    "recovery_class": "ordinary_operator_stop",
+                },
+            },
+            reason_code="operation_stopped",
+            message="native operation was stopped",
+        )
+
+
+class _MalformedOperatorStopTaskPort(_OperatorStopTaskPort):
+    def observe(self, task_id: str) -> OwnerTaskSnapshot:
+        self.observations += 1
+        return OwnerTaskSnapshot(
+            task_id=task_id,
+            state=OwnerTaskState.INTERRUPTED,
+            metadata={
+                "authored_failure_policy": "pause_for_operator",
+                "authored_failure_policy_parameter": "operator_stop_policy",
+                "recovery_assessment": {
+                    "allowed_actions": ["replan_from_stopped_state"],
+                    "recovery_class": "ordinary_operator_stop",
+                },
+            },
+            reason_code="operation_stopped",
+            message="native operation omitted its exact Stop identity",
+        )
+
+
 class _BlockingTaskPort(_TaskPort):
     def __init__(
         self,
@@ -781,6 +825,91 @@ def test_tick_host_advances_each_scheduled_run_and_removes_terminal_work() -> No
         ProgramRunState.SUCCEEDED
     )
     host.shutdown()
+
+
+def test_tick_host_does_not_schedule_an_ordinary_held_intervention() -> None:
+    interventions = ProgramInterventionRegistry(maximum_retained_runs=8)
+    owner, admission, task, _scope, _events = _fixture(
+        initial_task_state=OwnerTaskState.FAILED,
+        task_factory=lambda events: _PolicyTaskPort(
+            events,
+            OwnerTaskState.FAILED,
+        ),
+        interventions=interventions,
+    )
+    host = ProgramRunTickHost(owner, tick_interval_s=0.01)
+    started = host.start_run(admission)
+
+    assert host.advance_ready_once()[0].state is (
+        ProgramRunState.INTERVENTION_REQUIRED
+    )
+    assert host.advance_ready_once() == ()
+    assert task.starts == 1
+    assert host.read(started.capture.program_run_id).state is (
+        ProgramRunState.INTERVENTION_REQUIRED
+    )
+
+    host.stop_run(started.capture.program_run_id)
+    host.shutdown()
+
+
+def test_tick_host_keeps_only_operator_stop_intervention_observable() -> None:
+    interventions = ProgramInterventionRegistry(maximum_retained_runs=8)
+    owner, admission, task, _scope, _events = _fixture(
+        initial_task_state=OwnerTaskState.ACTIVE,
+        task_factory=_OperatorStopTaskPort,
+        interventions=interventions,
+    )
+    host = ProgramRunTickHost(owner, tick_interval_s=0.01)
+    started = host.start_run(admission)
+
+    assert host.advance_ready_once()[0].state is ProgramRunState.RUNNING
+    held = host.advance_ready_once()[0]
+    assert held.state is ProgramRunState.INTERVENTION_REQUIRED
+    assert owner.operator_stop_observation_required(
+        started.capture.program_run_id
+    )
+    owner.refresh_operator_stop_intervention(started.capture.program_run_id)
+    assert task.observations == 2
+    assert host.advance_ready_once()[0].state is (
+        ProgramRunState.INTERVENTION_REQUIRED
+    )
+    assert task.observations == 2
+
+    intervention = interventions.read(started.capture.program_run_id)
+    assert intervention is not None
+    host.resume_recovery(
+        started.capture.program_run_id,
+        node_attempt_id=intervention.identity.node_attempt_id,
+        action="retry",
+    )
+    assert host.advance_ready_once()[0].state is ProgramRunState.RUNNING
+    assert task.starts == 1
+    assert host.advance_ready_once()[0].state is ProgramRunState.RUNNING
+    assert task.starts == 2
+
+    host.stop_run(started.capture.program_run_id)
+    host.shutdown()
+
+
+def test_operator_stop_without_exact_identity_fails_before_held_tree_progress() -> None:
+    interventions = ProgramInterventionRegistry(maximum_retained_runs=8)
+    owner, admission, task, _scope, _events = _fixture(
+        initial_task_state=OwnerTaskState.ACTIVE,
+        task_factory=_MalformedOperatorStopTaskPort,
+        interventions=interventions,
+    )
+    started = owner.start(admission)
+
+    assert owner.advance_once(started.capture.program_run_id).state is (
+        ProgramRunState.RUNNING
+    )
+    failed = owner.advance_once(started.capture.program_run_id)
+
+    assert failed.state is ProgramRunState.FAILED
+    assert failed.reason_code == "owner_stop_identity_missing"
+    assert task.starts == 1
+    assert interventions.read(started.capture.program_run_id) is None
 
 
 def test_tick_host_delivers_terminal_without_polling_or_blocking_stop() -> None:

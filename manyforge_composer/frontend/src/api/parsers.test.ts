@@ -1611,6 +1611,15 @@ describe('addressed Robot Control parsers', () => {
       command: 'status',
       status: {
         owner_epoch: 'owner-1',
+        cell_id: 'cell-1',
+        active_publication_generation: 1,
+        cell_stop_action: {
+          available: true,
+          expected_stop_generation: 4,
+          fault: null,
+          latest_terminal: null,
+          unavailable_reason: null,
+        },
         graph_revision: 'sha256:graph',
         retained_bundle_id: 'sha256:bundle',
         scene_revision: sceneRevision,
@@ -1684,6 +1693,47 @@ describe('addressed Robot Control parsers', () => {
     expect(status.observedMotion.positionsRad).toEqual([0.2]);
     expect(status.observedMotion.currentTcpPose.position_m.z_m).toBe(0.4);
     expect(status.observedGripper?.position).toBe(0.02);
+    expect(status.cellStopAction.expectedStopGeneration).toBe(4);
+
+    const stopped = structuredClone(response);
+    Object.assign(stopped.status.cell_stop_action, {
+      latest_terminal: {
+        certificate: {
+          stop_certificate_id: 'stop-certificate.4',
+          stop_certificate_revision: 1,
+          stop_generation: 4,
+          stop_id: 'stop.4',
+        },
+        escalated: true,
+        executed_stages: [{
+          action_class: 'controlled',
+          executed_mode: 'hard_deceleration',
+          operation_id: 'operation.1',
+          outcome: 'succeeded',
+          participant_id: 'participant.1',
+          stage_id: 'controlled.1',
+          stage_index: 1,
+          substitution_reason: 'soft mode unavailable',
+        }],
+        hard_stop_floor_used: false,
+        result: 'succeeded_escalated',
+      },
+      fault: {
+        certificate: null,
+        latch_generation: 1,
+        latch_id: 'stop-fault.1',
+        reason_code: 'stop_escalated',
+        recovery_status: 'waiting_for_observation',
+        state: 'latched',
+        trigger: 'partial',
+      },
+    });
+    const stoppedStatus = parseExecutionOwnerStatus(stopped);
+    expect(stoppedStatus.cellStopAction.latestTerminal?.certificate.stopId)
+      .toBe('stop.4');
+    expect(stoppedStatus.cellStopAction.latestTerminal?.executedStages[0])
+      .toMatchObject({ executedMode: 'hard_deceleration', stageIndex: 1 });
+    expect(stoppedStatus.cellStopAction.fault?.latchId).toBe('stop-fault.1');
 
     const componentLocal = structuredClone(response);
     Object.assign(componentLocal.status.direct_control_gripper.resource, {

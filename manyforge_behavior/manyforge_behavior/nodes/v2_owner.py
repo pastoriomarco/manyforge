@@ -18,6 +18,7 @@ from manyforge_behavior.orchestration_ports import (
     OwnerTaskState,
     ProgramInterventionPort,
 )
+from manyforge_behavior.nodes.stop_policy import OperatorMotionStopState
 from manyforge_behavior.orchestration_values import (
     NodeAttemptInputResolver,
     ProgramValueError,
@@ -153,6 +154,7 @@ class OwnerTaskAdapter(_OwnerAdapter):
         owner_port_name: str = "unspecified",
         intervention_port: ProgramInterventionPort | None = None,
         require_initial_running: bool = False,
+        operator_stop_state: OperatorMotionStopState | None = None,
         **kwargs: Any,
     ) -> None:
         super().__init__(**kwargs)
@@ -160,6 +162,7 @@ class OwnerTaskAdapter(_OwnerAdapter):
         self._owner_port_name = owner_port_name
         self._intervention_port = intervention_port
         self._require_initial_running = require_initial_running
+        self._operator_stop_state = operator_stop_state
         self._task: OwnerTaskSnapshot | None = None
         self._acknowledged = False
         self._intervention_reported = False
@@ -184,6 +187,21 @@ class OwnerTaskAdapter(_OwnerAdapter):
         }
 
     def _settle(self, task: OwnerTaskSnapshot) -> py_trees.common.Status:
+        assessment = task.metadata.get("recovery_assessment")
+        operator_stop = (
+            task.state is OwnerTaskState.INTERRUPTED
+            and isinstance(assessment, Mapping)
+            and assessment.get("recovery_class") == "ordinary_operator_stop"
+        )
+        if operator_stop and self._operator_stop_state is not None:
+            if not self._operator_stop_state.hold(
+                task.task_id, dict(task.metadata)
+            ):
+                self._record_failure(
+                    "owner_stop_identity_missing",
+                    "ordinary operator Stop omitted its exact Stop identity",
+                )
+                return py_trees.common.Status.FAILURE
         if self._intervention_reported:
             if self._intervention_port is None or self._identity is None:
                 self._record_failure(
@@ -206,6 +224,8 @@ class OwnerTaskAdapter(_OwnerAdapter):
             if action == "retry":
                 # A fresh attempt takes a fresh identity and input snapshot;
                 # the already-submitted owner request is never changed.
+                if operator_stop and self._operator_stop_state is not None:
+                    self._operator_stop_state.resolve(task.task_id)
                 self.initialise()
                 return py_trees.common.Status.RUNNING
             if action == "manual_success":
@@ -281,6 +301,13 @@ class OwnerTaskAdapter(_OwnerAdapter):
                     return py_trees.common.Status.FAILURE
                 if not self._intervention_reported:
                     try:
+                        current = self._intervention_port.read(
+                            self._identity.program_run_id
+                        )
+                        if current is not None and current.identity != self._identity:
+                            # Parallel stopped attempts are recovered one at a
+                            # time through the existing exact-attempt surface.
+                            return py_trees.common.Status.RUNNING
                         self._intervention_port.require(
                             self._identity,
                             reason_code=(
@@ -349,6 +376,27 @@ class OwnerTaskAdapter(_OwnerAdapter):
             self._record_failure("owner_request_failed", str(exc))
             return py_trees.common.Status.FAILURE
         return self._settle(self._task)
+
+    def observe_while_operator_stop_held(self) -> None:
+        """Refresh only an already accepted task while its subtree is held."""
+
+        if self._task is None or self._identity is None:
+            return
+        try:
+            if self._task.state is OwnerTaskState.ACTIVE:
+                observed = self._port.observe(self._task.task_id)
+                if observed.task_id != self._task.task_id:
+                    self._record_failure(
+                        "owner_task_identity_changed",
+                        "owner observation selected another task",
+                    )
+                    return
+                self._task = observed
+            self._settle(self._task)
+        except OwnerTaskObservationUnavailableError:
+            return
+        except Exception as exc:
+            self._record_failure("owner_request_failed", str(exc))
 
     def terminate(self, new_status: py_trees.common.Status) -> None:
         if (

@@ -3861,6 +3861,10 @@ TEST(ResourceAddressedExecutionKernelTest,
           make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular),
           engine)},
       clock, scheduler, default_journal, {RequestOwnerEpoch("kernel.epoch.1"), CellId("cell.test"), 8U});
+  const auto initial_cell_stop = kernel.cell_stop_action_projection();
+  EXPECT_EQ(initial_cell_stop.expected_stop_generation, StopGeneration(0U));
+  EXPECT_FALSE(initial_cell_stop.latest_terminal.has_value());
+  EXPECT_FALSE(initial_cell_stop.fault.has_value());
   const auto operation = kernel.execute(motion_operation("request.stop-terminal-owner"));
   ASSERT_TRUE(operation.ok()) << operation.error().message;
   engine.emit_transition(ExecutionState::kPlanning, ExecutionState::kExecuting);
@@ -3896,6 +3900,14 @@ TEST(ResourceAddressedExecutionKernelTest,
   }));
   EXPECT_EQ(kernel.get_stop_fault_latch().has_value(),
             certificate.value().result != StopCertificateResultDTO::kSucceededNominal);
+  const auto cell_stop = kernel.cell_stop_action_projection();
+  EXPECT_EQ(cell_stop.expected_stop_generation, stopped.value().stop_generation);
+  ASSERT_TRUE(cell_stop.latest_terminal.has_value());
+  EXPECT_EQ(cell_stop.latest_terminal->certificate.stop_certificate_id,
+            certificate.value().stop_certificate_id);
+  EXPECT_EQ(cell_stop.latest_terminal->result, certificate.value().result);
+  EXPECT_FALSE(cell_stop.latest_terminal->executed_stages.empty());
+  EXPECT_EQ(cell_stop.fault.has_value(), kernel.get_stop_fault_latch().has_value());
 }
 
 TEST(ResourceAddressedExecutionKernelTest, UsesOneInjectedGateForTheActualSlotTableReservation) {

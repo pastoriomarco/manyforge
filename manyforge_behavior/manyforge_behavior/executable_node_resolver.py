@@ -38,6 +38,7 @@ from manyforge_behavior.orchestration_ports import (
     OwnerTaskPort,
 )
 from manyforge_behavior.orchestration_values import NodeAttemptInputResolver
+from manyforge_behavior.nodes.stop_policy import OperatorMotionStopState
 
 I8_ADAPTER_REASON: Final = "kernel_policy_node_adapter_unavailable_until_i8"
 I11_ADAPTER_REASON: Final = "semantic_io_node_adapter_unavailable_until_i11"
@@ -69,6 +70,7 @@ class NodeAdapterBuildContext:
     input_resolver: NodeAttemptInputResolver | None = None
     attempt_source: NodeAttemptSource | None = None
     ports: NodeAdapterPorts = field(default_factory=NodeAdapterPorts)
+    operator_stop_state: OperatorMotionStopState | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.name, str) or not self.name:
@@ -109,6 +111,12 @@ class NodeAdapterBuildContext:
             raise TypeError("attempt_source must issue node-attempt identities")
         if not isinstance(self.ports, NodeAdapterPorts):
             raise TypeError("ports must be one NodeAdapterPorts value")
+        if self.operator_stop_state is not None and not isinstance(
+            self.operator_stop_state, OperatorMotionStopState
+        ):
+            raise TypeError(
+                "operator_stop_state must be one OperatorMotionStopState"
+            )
 
 
 NodeAdapterBuilder = Callable[[NodeAdapterBuildContext], py_trees.behaviour.Behaviour]
@@ -257,6 +265,7 @@ def _owner_task_builder(
             output_key_parameter=output_key_parameter,
             blackboard_read_parameters=blackboard_read_parameters,
             require_initial_running=require_initial_running,
+            operator_stop_state=context.operator_stop_state,
         )
 
     return build

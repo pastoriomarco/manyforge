@@ -21,6 +21,7 @@ from manyforge_behavior.executable_node_resolver import (
 )
 from manyforge_behavior.orchestration_ports import (
     NodeAdapterPorts,
+    OwnerTaskState,
     ProgramRunPortContext,
     ProgramRunScopeSnapshot,
     ProgramRunScopeState,
@@ -516,6 +517,66 @@ class ProgramRunOwner:
             return None
         return port.read(program_run_id)
 
+    def operator_stop_observation_required(self, program_run_id: str) -> bool:
+        """Whether a held run must keep observing owner-issued Stop state.
+
+        Ordinary recovery interventions are dormant until an explicit action.
+        Operator Stop is different: continue branches and already-accepted
+        owner tasks must remain observable while motion is contained.
+        """
+
+        with self._lock:
+            if (
+                self._entry(program_run_id).state
+                is not ProgramRunState.INTERVENTION_REQUIRED
+            ):
+                return False
+        intervention = self.intervention(program_run_id)
+        return (
+            intervention is not None
+            and intervention.policy_parameter == "operator_stop_policy"
+        )
+
+    def refresh_operator_stop_intervention(
+        self, program_run_id: str
+    ) -> None:
+        """Refresh one held Stop assessment only when its offer is read."""
+
+        intervention = self.intervention(program_run_id)
+        if (
+            intervention is None
+            or intervention.policy_parameter != "operator_stop_policy"
+            or intervention.owner_port_name is None
+            or intervention.owner_task_id is None
+        ):
+            return
+        owner_port = getattr(self._ports, intervention.owner_port_name, None)
+        observe = getattr(owner_port, "observe", None)
+        if not callable(observe):
+            return
+        try:
+            task = observe(intervention.owner_task_id)
+        except Exception:
+            return
+        assessment = task.metadata.get("recovery_assessment")
+        if (
+            task.task_id != intervention.owner_task_id
+            or task.state is not OwnerTaskState.INTERRUPTED
+            or not isinstance(assessment, Mapping)
+            or assessment.get("recovery_class") != "ordinary_operator_stop"
+        ):
+            return
+        port = self._ports.program_interventions
+        if port is None:
+            return
+        try:
+            port.refresh_owner_assessment(
+                intervention.identity,
+                assessment,
+            )
+        except Exception:
+            return
+
     def note_runtime_control_change(
         self, program_run_id: str
     ) -> ProgramRunSnapshot:
@@ -959,6 +1020,22 @@ class ProgramRunOwner:
                 elif entry.state is ProgramRunState.FINALIZING:
                     reconcile_stop = False
                     reconcile_finalize = True
+                elif entry.state is ProgramRunState.INTERVENTION_REQUIRED:
+                    intervention_port = self._ports.program_interventions
+                    intervention = (
+                        None
+                        if intervention_port is None
+                        else intervention_port.read(program_run_id)
+                    )
+                    if (
+                        intervention is None
+                        or intervention.policy_parameter
+                        != "operator_stop_policy"
+                    ):
+                        return self._snapshot(entry)
+                    reconcile_stop = False
+                    reconcile_finalize = False
+                    run = entry.run
                 elif entry.state is not ProgramRunState.RUNNING:
                     return self._snapshot(entry)
                 else:
@@ -997,12 +1074,18 @@ class ProgramRunOwner:
                     )
             with self._lock:
                 entry = self._entry(program_run_id)
-                if entry.state is not ProgramRunState.RUNNING:
+                if entry.state not in {
+                    ProgramRunState.RUNNING,
+                    ProgramRunState.INTERVENTION_REQUIRED,
+                }:
                     return self._snapshot(entry)
                 if entry.tree_status != status_name:
                     entry.tree_status = status_name
                     entry.revision += 1
-                if intervention is not None:
+                if (
+                    intervention is not None
+                    and entry.state is ProgramRunState.RUNNING
+                ):
                     entry.state = ProgramRunState.INTERVENTION_REQUIRED
                     entry.reason_code = intervention.reason_code
                     entry.message = intervention.message

@@ -6235,6 +6235,66 @@ Result<StopStatusDTO> ResourceAddressedExecutionKernel::get_stop_status(
   return Result<StopStatusDTO>::Ok(std::move(status));
 }
 
+CellStopActionProjectionDTO
+ResourceAddressedExecutionKernel::cell_stop_action_projection() const {
+  std::lock_guard state_lock(state_mutex_);
+  CellStopActionProjectionDTO projection{
+      cell_stop_generation_, std::nullopt, std::nullopt};
+  if (active_stop_fault_latch_.has_value()) {
+    const auto& latch = *active_stop_fault_latch_;
+    projection.fault = CellStopFaultSummaryDTO{
+        latch.latch_id, latch.latch_generation, latch.state, latch.trigger,
+        latch.recovery_status, latch.reason_code, latch.stop_certificate};
+  }
+  if (stop_terminal_history_.empty() ||
+      stop_terminal_history_.back() == nullptr) {
+    return projection;
+  }
+  const auto& certificate = stop_terminal_history_.back()->certificate;
+  CellStopTerminalSummaryDTO terminal{
+      StopCertificateRefDTO{certificate.stop_certificate_id,
+                            certificate.stop_certificate_revision,
+                            certificate.stop_id,
+                            certificate.stop_generation},
+      certificate.result,
+      certificate.result == StopCertificateResultDTO::kSucceededEscalated,
+      false,
+      {}};
+  terminal.executed_stages.reserve(certificate.attempted_stage_results.size());
+  for (const auto& attempted : certificate.attempted_stage_results) {
+    if (attempted.authority != StopStageResultAuthorityDTO::kAuthoritative ||
+        attempted.result.attempt_disposition ==
+            StopStageAttemptDispositionDTO::kNotDispatched) {
+      continue;
+    }
+    const auto& request = attempted.result.request;
+    const auto stage_index = request.stage_index;
+    if (stage_index >= request.participant_stop_plan.stage_commands.size()) {
+      continue;
+    }
+    const auto& stage = request.participant_stop_plan
+                            .stage_commands[stage_index]
+                            .resolved_stage;
+    const auto action_class =
+        stage.command_qualification.stop_action_class;
+    terminal.escalated = terminal.escalated || stage_index > 0U;
+    terminal.hard_stop_floor_used =
+        terminal.hard_stop_floor_used ||
+        action_class != StopActionClass::kControlled;
+    terminal.executed_stages.push_back(CellStopStageSummaryDTO{
+        request.operation_id,
+        request.participant_id,
+        stage.stop_escalation_stage_id,
+        stage_index,
+        action_class,
+        attempted.result.outcome,
+        attempted.result.actual_provider_contract_mode,
+        attempted.result.recoverable_substitution_reason});
+  }
+  projection.latest_terminal = std::move(terminal);
+  return projection;
+}
+
 Result<StopCertificateDTO> ResourceAddressedExecutionKernel::get_stop_certificate(
     const StopCertificateId& certificate_id) const {
   if (certificate_id.empty()) {

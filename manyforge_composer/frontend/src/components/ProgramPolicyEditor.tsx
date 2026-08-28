@@ -482,8 +482,10 @@ export function ProgramPolicyEditor({
           </select>
         </label>
         <p className="program-policy-help">
-          Stop enforcement remains a later runtime capability; this is authored
-          policy for future Run behavior, not a change to a running Run.
+          Captured by the next Run. Hold pauses this subtree after an owner-issued
+          motion Stop; Continue keeps supervisory work ticking. Inherit follows
+          the parent for composite/decorator nodes; leaves default to Hold and
+          the root to Continue. It never changes a running Run.
         </p>
       </fieldset>
 

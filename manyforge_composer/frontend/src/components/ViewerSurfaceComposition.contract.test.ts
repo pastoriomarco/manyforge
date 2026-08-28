@@ -50,19 +50,20 @@ describe('UI4 application and viewport composition', () => {
     const robotControl = source('../hooks/useRobotControl.ts');
     const styles = source('../index.css');
 
-    expect(transport).toContain("canResume ? 'Resume Motion' : 'Run'");
-    expect(transport).toContain("canResume ? robot.resume() : program.run()");
+    expect(transport).toContain('canResume || canResumeOperatorStop');
+    expect(transport).toContain('program.applyRecoveryAction(operatorStopResumeAction)');
     expect(transport).toContain('transport-stop-primary');
     expect(transport).toContain('transport-stop-disclosure');
     expect(transport).toContain('Stop Execution');
     expect(transport).toMatch(/transport-stop-group[\s\S]*transport-stop-primary[\s\S]*transport-stop-disclosure[\s\S]*transport-stop-menu/);
     expect(transport).not.toContain("motionPaused ? robot.resume() : robot.pause()");
-    expect(transport).toContain('Full-cell Stop unavailable');
-    expect(transport).toContain('does not publish the cell Stop generation');
+    expect(transport).toContain("robot.fullStop()");
+    expect(transport).toContain('expectedStopGeneration');
+    expect(transport).toContain('Latest certificate');
     expect(transport).toContain("robot.state.operation?.state === 'paused'");
     expect(transport).toContain('robot.setRuntimeScale');
     expect(transport).toContain('robot.runtimeScaleStatus.supported');
-    expect(transport).not.toContain('api.execution.fullStop');
+    expect(robotControl).toContain('api.execution.fullStop');
     expect(transport).not.toContain('setVelocityScale');
     expect(robotControl).toContain('runtimeScaleQueued.current = bounded');
     expect(robotControl).toContain('runtimeScaleInFlight.current');

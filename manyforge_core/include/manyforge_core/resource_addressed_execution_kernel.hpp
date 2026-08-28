@@ -127,6 +127,58 @@ struct KernelDisableHandoffRuntimeSnapshotDTO final {
                          const KernelDisableHandoffRuntimeSnapshotDTO&) = default;
 };
 
+/// Compact owner projection for the existing full-cell Stop command. Detailed
+/// evidence remains in the Stop certificate/history APIs; this status value
+/// carries only the exact action fence and the latest outcome summary needed
+/// by operators.
+struct CellStopStageSummaryDTO final {
+  OperationId operation_id;
+  OperationParticipantId participant_id;
+  StopEscalationStageId stage_id;
+  std::size_t stage_index{};
+  StopActionClass action_class{StopActionClass::kControlled};
+  ParticipantStopStageOutcomeDTO outcome{ParticipantStopStageOutcomeDTO::kFailed};
+  std::optional<MotionControlledStopMode> executed_mode;
+  std::optional<std::string> substitution_reason;
+
+  friend bool operator==(const CellStopStageSummaryDTO&,
+                         const CellStopStageSummaryDTO&) = default;
+};
+
+struct CellStopTerminalSummaryDTO final {
+  StopCertificateRefDTO certificate;
+  StopCertificateResultDTO result{StopCertificateResultDTO::kFailedUncontained};
+  bool escalated{};
+  bool hard_stop_floor_used{};
+  std::vector<CellStopStageSummaryDTO> executed_stages;
+
+  friend bool operator==(const CellStopTerminalSummaryDTO&,
+                         const CellStopTerminalSummaryDTO&) = default;
+};
+
+struct CellStopFaultSummaryDTO final {
+  StopFaultLatchId latch_id;
+  StopFaultLatchGeneration latch_generation;
+  StopFaultLatchStateDTO state{StopFaultLatchStateDTO::kLatched};
+  StopFaultTriggerDTO trigger{StopFaultTriggerDTO::kPersistenceDegraded};
+  StopFaultRecoveryStatusDTO recovery_status{
+      StopFaultRecoveryStatusDTO::kWaitingForObservation};
+  std::string reason_code;
+  std::optional<StopCertificateRefDTO> certificate;
+
+  friend bool operator==(const CellStopFaultSummaryDTO&,
+                         const CellStopFaultSummaryDTO&) = default;
+};
+
+struct CellStopActionProjectionDTO final {
+  StopGeneration expected_stop_generation{0U};
+  std::optional<CellStopTerminalSummaryDTO> latest_terminal;
+  std::optional<CellStopFaultSummaryDTO> fault;
+
+  friend bool operator==(const CellStopActionProjectionDTO&,
+                         const CellStopActionProjectionDTO&) = default;
+};
+
 struct ResourceAddressedExecutionKernelConfig final {
   ResourceAddressedExecutionKernelConfig() = default;
   ResourceAddressedExecutionKernelConfig(
@@ -283,6 +335,8 @@ class ResourceAddressedExecutionKernel final : public IAddressedOperationOwner,
   [[nodiscard]] Result<StopAcceptedDTO> full_stop(const FullStopIntentDTO& intent);
   [[nodiscard]] Result<StopAcceptedDTO> recognized_malformed_stop(
       const MalformedStopIngressDTO& ingress);
+
+  [[nodiscard]] CellStopActionProjectionDTO cell_stop_action_projection() const;
 
   /// Atomically derives the current exact component scope or conservative
   /// Full-Stop promotion from the registered physical truth and slot table.

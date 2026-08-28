@@ -77,8 +77,64 @@ export interface ObservedGripperTarget {
   complete: boolean;
 }
 
+export interface StopCertificateReference {
+  stopCertificateId: string;
+  stopCertificateRevision: number;
+  stopId: string;
+  stopGeneration: number;
+}
+
+export interface CellStopStageSummary {
+  operationId: string;
+  participantId: string;
+  stageId: string;
+  stageIndex: number;
+  actionClass: 'controlled' | 'software_hard' | 'safety_system_request';
+  outcome: 'succeeded' | 'partial' | 'failed' | 'superseded_no_effect';
+  executedMode: 'soft_on_path' | 'spring_back_hold' | 'hard_deceleration' | null;
+  substitutionReason: string | null;
+}
+
+export interface CellStopActionStatus {
+  available: boolean;
+  unavailableReason: string | null;
+  expectedStopGeneration: number;
+  latestTerminal: {
+    certificate: StopCertificateReference;
+    result: 'succeeded_nominal' | 'succeeded_escalated' | 'partial' | 'failed_uncontained';
+    escalated: boolean;
+    hardStopFloorUsed: boolean;
+    executedStages: CellStopStageSummary[];
+  } | null;
+  fault: {
+    latchId: string;
+    latchGeneration: number;
+    state: 'latched' | 'recovery_pending' | 'cleared';
+    trigger:
+      | 'scope_promotion'
+      | 'escalated'
+      | 'partial'
+      | 'failed_uncontained'
+      | 'physical_rest_unproven'
+      | 'persistence_degraded';
+    recoveryStatus:
+      | 'waiting_for_observation'
+      | 'waiting_for_quiescence'
+      | 'waiting_for_configuration'
+      | 'waiting_for_external_reconciliation'
+      | 'waiting_for_durable_record'
+      | 'ready'
+      | 'recovery_pending'
+      | 'cleared';
+    reasonCode: string;
+    certificate: StopCertificateReference | null;
+  } | null;
+}
+
 export interface ExecutionOwnerStatus {
   ownerEpoch: string;
+  cellId: string;
+  activePublicationGeneration: number;
   graphRevision: string;
   retainedBundleId: string;
   sceneRevision: SceneRevisionValue;
@@ -86,6 +142,7 @@ export interface ExecutionOwnerStatus {
   directControlGripper: DirectControlGripperStatus;
   observedMotion: ObservedMotionTarget;
   observedGripper: ObservedGripperTarget | null;
+  cellStopAction: CellStopActionStatus;
 }
 
 export type DirectControlMotionSpec =

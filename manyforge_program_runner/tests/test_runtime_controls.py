@@ -38,7 +38,11 @@ def _fences() -> dict[str, int]:
     }
 
 
-def _intervention(*, acknowledged: bool = False):
+def _intervention(
+    *,
+    acknowledged: bool = False,
+    policy_parameter: str = "recovery_policy",
+):
     assessment = {
         "acknowledged_non_moving": acknowledged,
         "allowed_actions": ["acknowledge_and_continue"],
@@ -66,6 +70,7 @@ def _intervention(*, acknowledged: bool = False):
         owner_assessment=assessment,
         owner_task_id="operation.1",
         reason_code="motion_intervention",
+        policy_parameter=policy_parameter,
     )
 
 
@@ -192,6 +197,33 @@ def test_recovery_offer_is_stable_policy_filtered_and_generation_fenced() -> Non
         action["action_id"] == "retry_runtime_step" and action["enabled"]
         for action in acknowledged["actions"]
     )
+
+
+def test_operator_stop_recovery_uses_owner_fence_not_failure_retry_policy() -> None:
+    controls = ProgramRuntimeControls(_capture(), recovery_fences=_fences())
+    intervention = _intervention(policy_parameter="operator_stop_policy")
+    intervention.owner_assessment["allowed_actions"] = [
+        "replan_from_stopped_state"
+    ]
+    intervention.owner_assessment["recovery_class"] = "ordinary_operator_stop"
+    intervention.owner_assessment["status"] = "retry_ready"
+    offer = controls.recovery_offer(
+        cycle_generation=6,
+        owner_epoch="runner.epoch.1",
+        intervention=intervention,
+        policy={**_policy(), "allow_intervention": False, "max_retries": 0},
+    )
+    assert offer is not None
+    action = next(
+        row
+        for row in offer["actions"]
+        if row["action_id"] == "replan_from_stopped_state"
+    )
+    assert action["enabled"] is True
+    assert offer["manual_result"] == {
+        "enabled": False,
+        "disabled_reason_code": "operator_stop_requires_owner_recovery",
+    }
 
 
 def test_recovery_fence_shape_is_closed() -> None:

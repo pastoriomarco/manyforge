@@ -114,6 +114,9 @@ def _program_binding(
 ) -> dict[str, Any]:
     binding = json.loads(_BINDING_FIXTURE.read_text(encoding="utf-8"))
     binding["program_binding_id"] = "sha256:" + "0" * 64
+    binding["node_environment"]["environment_digest"] = (
+        build_node_environment().manifest.environment_digest
+    )
     binding["program_id"] = program["program_id"]
     binding["program_revision"] = program["program_revision"]
     binding["retained_bundle_id"] = retained_bundle_id
@@ -443,7 +446,7 @@ class FakeCore:
         self.source_model_context_override: dict[str, Any] | None = None
         self.scenario_selection_override: dict[str, Any] | None = None
         self.node_environment_digest = (
-            "sha256:c626ce50efeece59bf8ef77a3ef5e93919767ad57215bd26099c85a00643fd0f"
+            build_node_environment().manifest.environment_digest
         )
 
     def runtime_snapshot(self) -> dict[str, Any]:
@@ -1692,11 +1695,12 @@ def test_program_runner_surface_is_a_strict_thin_owner_projection() -> None:
             json=stop_body,
         )
 
-    assert selection.status_code == 200
-    assert selection.json()["scenario_id"] == "cell-pick"
-    assert index.status_code == 200
-    assert index.json()["active_only"] is True
-    assert started.json()["capture"]["scenario_id"] == "cell-pick"
+        assert selection.status_code == 200
+        assert selection.json()["scenario_id"] == "cell-pick"
+        assert index.status_code == 200
+        assert index.json()["active_only"] is True
+        assert started.status_code == 200, started.text
+        assert started.json()["capture"]["scenario_id"] == "cell-pick"
     assert prepared.json()["status"] == "prepared"
     assert read.json()["capture"]["program_run_id"] == "program-run.1"
     assert stopped.json()["state"] == "stopping"

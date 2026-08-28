@@ -90,6 +90,7 @@ interface SceneAuthoringWorkspaceProps {
   onViewerInspectorMinimizedChange?: (minimized: boolean) => void;
   onViewerInspectorMaximize?: () => void;
   onViewerInspectorPanelChange?: (panel: ViewerInspectorPanel) => void;
+  onOpenRuntimeHistory?: () => void;
 }
 
 const EMPTY_PROGRAM_RESOURCES: ProgramSceneResource[] = [];
@@ -1497,6 +1498,7 @@ const SceneViewerBridge = memo(function SceneViewerBridge({
   onInspectorMinimizedChange,
   onInspectorMaximize,
   onInspectorPanelChange,
+  onOpenRuntimeHistory,
 }: {
   active: boolean;
   source: HeadlessStateSource;
@@ -1553,6 +1555,7 @@ const SceneViewerBridge = memo(function SceneViewerBridge({
   onInspectorMinimizedChange?: (minimized: boolean) => void;
   onInspectorMaximize?: () => void;
   onInspectorPanelChange?: (panel: ViewerInspectorPanel) => void;
+  onOpenRuntimeHistory?: () => void;
 }) {
   const headlessState = useViewerHeadlessState(source, active);
   const factsResult = useMemo(
@@ -1732,6 +1735,7 @@ const SceneViewerBridge = memo(function SceneViewerBridge({
           enabled={runtimeEnabled}
           program={programRuntime}
           robot={robotControl}
+          onOpenRuntimeHistory={onOpenRuntimeHistory}
         />
       )}
     />
@@ -1757,6 +1761,7 @@ export function SceneAuthoringWorkspace({
   onViewerInspectorMinimizedChange,
   onViewerInspectorMaximize,
   onViewerInspectorPanelChange,
+  onOpenRuntimeHistory,
 }: SceneAuthoringWorkspaceProps) {
   const headlessState = useShellHeadlessState(headlessStateSource);
   const programWorkspace = programController.state.workspace;
@@ -2388,6 +2393,7 @@ export function SceneAuthoringWorkspace({
       onInspectorMinimizedChange={onViewerInspectorMinimizedChange}
       onInspectorMaximize={onViewerInspectorMaximize}
       onInspectorPanelChange={onViewerInspectorPanelChange}
+      onOpenRuntimeHistory={onOpenRuntimeHistory}
     />
   );
 

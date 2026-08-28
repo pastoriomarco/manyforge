@@ -823,6 +823,11 @@ class ProgramRuntime:
         intervention = self._owner.intervention(program_run_id)
         if intervention is None:
             return None
+        if intervention.policy_parameter == "operator_stop_policy":
+            self._owner.refresh_operator_stop_intervention(program_run_id)
+            intervention = self._owner.intervention(program_run_id)
+            if intervention is None:
+                return None
         controls = self._optional_controls(program_run_id)
         if controls is None:
             return None
@@ -2261,6 +2266,11 @@ class ProgramRuntime:
                     "program_runtime_control_stale",
                     "manual result identifies a stale node attempt",
                 )
+            if intervention.policy_parameter == "operator_stop_policy":
+                raise ProgramRunnerError(
+                    "operator_stop_requires_owner_recovery",
+                    "operator Stop must resume through the exact owner action",
+                )
             allowed, disabled_reason = manual_result_availability(
                 intervention,
                 {} if policy is None else policy.recovery_policy,
@@ -2436,7 +2446,10 @@ class ProgramRuntime:
                         node_attempt_id=intervention.identity.node_attempt_id,
                         action="retry",
                     )
-                    controls.note_retry(intervention.identity.node_instance_id)
+                    if intervention.policy_parameter != "operator_stop_policy":
+                        controls.note_retry(
+                            intervention.identity.node_instance_id
+                        )
                     cycle_resumed = True
                 else:
                     effect_started = True
@@ -2478,9 +2491,13 @@ class ProgramRuntime:
                             ),
                             action="retry",
                         )
-                        controls.note_retry(
-                            intervention.identity.node_instance_id
-                        )
+                        if (
+                            intervention.policy_parameter
+                            != "operator_stop_policy"
+                        ):
+                            controls.note_retry(
+                                intervention.identity.node_instance_id
+                            )
                         cycle_resumed = True
                 controls.audit_value(
                     "cycle_recovery_action_applied",

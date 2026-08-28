@@ -7,6 +7,8 @@ const controller = vi.hoisted(() => ({
   state: {
     status: {
       ownerEpoch: 'owner-1',
+      cellId: 'cell-1',
+      activePublicationGeneration: 1,
       graphRevision: 'sha256:graph',
       retainedBundleId: 'sha256:bundle',
       sceneRevision: {
@@ -76,6 +78,13 @@ const controller = vi.hoisted(() => ({
         coordinateKind: 'linear_m',
         complete: true,
       },
+      cellStopAction: {
+        available: true,
+        unavailableReason: null,
+        expectedStopGeneration: 0,
+        latestTerminal: null,
+        fault: null,
+      },
     },
     phase: 'ready',
     mode: 'joint',
@@ -98,6 +107,8 @@ const controller = vi.hoisted(() => ({
   runtimeScaleDraft: 1,
   runtimeScalePending: false,
   runtimeScaleError: null,
+  fullStopPending: false,
+  fullStopError: null,
   selectMode: vi.fn(),
   editJoint: vi.fn(),
   editPose: vi.fn(),
@@ -105,6 +116,8 @@ const controller = vi.hoisted(() => ({
   approve: vi.fn(),
   revert: vi.fn(),
   stop: vi.fn(),
+  fullStop: vi.fn(),
+  dismissFullStopError: vi.fn(),
   pause: vi.fn(),
   resume: vi.fn(),
   setRuntimeScale: vi.fn(),

@@ -3157,6 +3157,109 @@ StopFaultRecoveryResultValue(const core::StopFaultRecoveryResultDTO &value) {
   });
 }
 
+[[nodiscard]] std::string_view StopCertificateResultName(
+    core::StopCertificateResultDTO result) noexcept {
+  switch (result) {
+  case core::StopCertificateResultDTO::kSucceededNominal:
+    return "succeeded_nominal";
+  case core::StopCertificateResultDTO::kSucceededEscalated:
+    return "succeeded_escalated";
+  case core::StopCertificateResultDTO::kPartial:
+    return "partial";
+  case core::StopCertificateResultDTO::kFailedUncontained:
+    return "failed_uncontained";
+  }
+  return "unknown";
+}
+
+[[nodiscard]] std::string_view StopStageOutcomeName(
+    core::ParticipantStopStageOutcomeDTO outcome) noexcept {
+  switch (outcome) {
+  case core::ParticipantStopStageOutcomeDTO::kSucceeded:
+    return "succeeded";
+  case core::ParticipantStopStageOutcomeDTO::kPartial:
+    return "partial";
+  case core::ParticipantStopStageOutcomeDTO::kFailed:
+    return "failed";
+  case core::ParticipantStopStageOutcomeDTO::kSupersededNoEffect:
+    return "superseded_no_effect";
+  }
+  return "unknown";
+}
+
+[[nodiscard]] CanonicalValue CellStopActionValue(
+    const core::CellStopActionProjectionDTO &value) {
+  CanonicalValue terminal(nullptr);
+  if (value.latest_terminal.has_value()) {
+    CanonicalValue::Array stages;
+    stages.reserve(value.latest_terminal->executed_stages.size());
+    for (const auto &stage : value.latest_terminal->executed_stages) {
+      stages.emplace_back(CanonicalValue::Object{
+          {"action_class",
+           CanonicalValue(std::string(core::to_string(stage.action_class)))},
+          {"executed_mode",
+           stage.executed_mode.has_value()
+               ? CanonicalValue(
+                     std::string(core::to_string(*stage.executed_mode)))
+               : CanonicalValue(nullptr)},
+          {"operation_id", CanonicalValue(stage.operation_id.value())},
+          {"outcome",
+           CanonicalValue(std::string(StopStageOutcomeName(stage.outcome)))},
+          {"participant_id", CanonicalValue(stage.participant_id.value())},
+          {"stage_id", CanonicalValue(stage.stage_id.value())},
+          {"stage_index",
+           CanonicalValue(static_cast<double>(stage.stage_index))},
+          {"substitution_reason",
+           stage.substitution_reason.has_value()
+               ? CanonicalValue(*stage.substitution_reason)
+               : CanonicalValue(nullptr)},
+      });
+    }
+    terminal = CanonicalValue(CanonicalValue::Object{
+        {"certificate",
+         StopCertificateRefValue(value.latest_terminal->certificate)},
+        {"escalated", CanonicalValue(value.latest_terminal->escalated)},
+        {"executed_stages", CanonicalValue(std::move(stages))},
+        {"hard_stop_floor_used",
+         CanonicalValue(value.latest_terminal->hard_stop_floor_used)},
+        {"result",
+         CanonicalValue(std::string(
+             StopCertificateResultName(value.latest_terminal->result)))},
+    });
+  }
+  return CanonicalValue(CanonicalValue::Object{
+      {"available", CanonicalValue(true)},
+      {"expected_stop_generation",
+       CanonicalValue(
+           static_cast<double>(value.expected_stop_generation.value()))},
+      {"fault",
+       value.fault.has_value()
+           ? CanonicalValue(CanonicalValue::Object{
+                 {"certificate",
+                  value.fault->certificate.has_value()
+                      ? StopCertificateRefValue(*value.fault->certificate)
+                      : CanonicalValue(nullptr)},
+                 {"latch_generation",
+                  CanonicalValue(static_cast<double>(
+                      value.fault->latch_generation.value()))},
+                 {"latch_id", CanonicalValue(value.fault->latch_id.value())},
+                 {"reason_code", CanonicalValue(value.fault->reason_code)},
+                 {"recovery_status",
+                  CanonicalValue(std::string(StopFaultRecoveryStatusName(
+                      value.fault->recovery_status)))},
+                 {"state",
+                  CanonicalValue(std::string(
+                      StopFaultLatchStateName(value.fault->state)))},
+                 {"trigger",
+                  CanonicalValue(std::string(
+                      StopFaultTriggerName(value.fault->trigger)))},
+             })
+           : CanonicalValue(nullptr)},
+      {"latest_terminal", std::move(terminal)},
+      {"unavailable_reason", CanonicalValue(nullptr)},
+  });
+}
+
 [[nodiscard]] CanonicalValue
 RecoveryAssessmentValue(const core::KernelRecoveryAssessmentDTO &value) {
   CanonicalValue::Array actions;
@@ -7765,6 +7868,8 @@ private:
       Fail("selected gripper observed state is unavailable: " +
            gripper_state.error().message);
     }
+    const auto cell_stop_action = composition.runtime->addressed_kernel
+                                      ->cell_stop_action_projection();
     CanonicalValue::Array observed_targets;
     observed_targets.reserve(2U);
     observed_targets.push_back(ObservedTargetValue(
@@ -7784,6 +7889,7 @@ private:
                   composition.publication_generation.value()))},
              {"cell_id",
               CanonicalValue(bundle.value().cell_graph.cell_id.value())},
+             {"cell_stop_action", CellStopActionValue(cell_stop_action)},
              {"direct_control",
               DirectControlStatusValue(composition, motion_state.value())},
              {"direct_control_gripper",

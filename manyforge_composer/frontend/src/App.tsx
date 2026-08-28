@@ -118,13 +118,18 @@ export default function App() {
     programController.state.workspace,
   );
   const robotControl = useRobotControl(headlessEnabled);
-  const clientErrors = useMemo(() => programRuntime.state.error === null
-    ? []
-    : [{
-        id: 'composer.program_runtime',
-        title: 'Program command or response failed',
-        message: programRuntime.state.error,
-      }], [programRuntime.state.error]);
+  const clientErrors = useMemo(() => [
+    ...(programRuntime.state.error === null ? [] : [{
+      id: 'composer.program_runtime',
+      title: 'Program command or response failed',
+      message: programRuntime.state.error,
+    }]),
+    ...(robotControl.fullStopError === null ? [] : [{
+      id: 'composer.full_cell_stop',
+      title: 'Full-cell Stop command failed',
+      message: robotControl.fullStopError,
+    }]),
+  ], [programRuntime.state.error, robotControl.fullStopError]);
   const runtimeView = useMemo(
     () => headlessSnapshot === null ? null : runtimeStatusView(
       headlessSnapshot.runtime,
@@ -463,6 +468,7 @@ export default function App() {
                 onViewerInspectorMinimizedChange={setViewerInspectorMinimized}
                 onViewerInspectorMaximize={maximizeViewerInspector}
                 onViewerInspectorPanelChange={setViewerInspectorPanel}
+                onOpenRuntimeHistory={() => setGlobalPanel('runtime')}
               />
             </div>
           </div>
@@ -480,7 +486,13 @@ export default function App() {
           enabled={headlessEnabled}
           headlessStateSource={headlessStateSource}
           clientErrors={clientErrors}
-          onAcknowledgeClientError={() => programRuntime.dismissError()}
+          onAcknowledgeClientError={(id) => {
+            if (id === 'composer.full_cell_stop') {
+              robotControl.dismissFullStopError();
+            } else {
+              programRuntime.dismissError();
+            }
+          }}
         />
       </OverlayPanel>
       <OverlayPanel

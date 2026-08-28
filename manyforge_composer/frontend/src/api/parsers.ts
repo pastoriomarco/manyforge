@@ -6021,8 +6021,183 @@ export function parseExecutionOwnerStatus(value: unknown): ExecutionOwnerStatus 
       ),
     };
   }
+  const certificateRefAt = (input: unknown, path: string) => {
+    const record = objectAt(input, path);
+    exactKeysAt(record, [
+      'stop_certificate_id', 'stop_certificate_revision',
+      'stop_generation', 'stop_id',
+    ], path);
+    return {
+      stopCertificateId: stringAt(
+        record.stop_certificate_id,
+        `${path}.stop_certificate_id`,
+      ),
+      stopCertificateRevision: positiveIntegerAt(
+        record.stop_certificate_revision,
+        `${path}.stop_certificate_revision`,
+      ),
+      stopId: stringAt(record.stop_id, `${path}.stop_id`),
+      stopGeneration: positiveIntegerAt(
+        record.stop_generation,
+        `${path}.stop_generation`,
+      ),
+    };
+  };
+  const cellStop = objectAt(
+    status.cell_stop_action,
+    'executionStatus.status.cell_stop_action',
+  );
+  exactKeysAt(cellStop, [
+    'available', 'expected_stop_generation', 'fault', 'latest_terminal',
+    'unavailable_reason',
+  ], 'executionStatus.status.cell_stop_action');
+  const cellStopAvailable = booleanAt(
+    cellStop.available,
+    'executionStatus.status.cell_stop_action.available',
+  );
+  const cellStopUnavailableReason = nullableStringAt(
+    cellStop.unavailable_reason,
+    'executionStatus.status.cell_stop_action.unavailable_reason',
+  );
+  if (cellStopAvailable === (cellStopUnavailableReason !== null)) {
+    return fail(
+      'executionStatus.status.cell_stop_action',
+      'an unavailable reason exactly when the action is unavailable',
+    );
+  }
+  let latestTerminal: ExecutionOwnerStatus['cellStopAction']['latestTerminal'] = null;
+  if (cellStop.latest_terminal !== null) {
+    const terminal = objectAt(
+      cellStop.latest_terminal,
+      'executionStatus.status.cell_stop_action.latest_terminal',
+    );
+    exactKeysAt(terminal, [
+      'certificate', 'escalated', 'executed_stages',
+      'hard_stop_floor_used', 'result',
+    ], 'executionStatus.status.cell_stop_action.latest_terminal');
+    const result = stringAt(
+      terminal.result,
+      'executionStatus.status.cell_stop_action.latest_terminal.result',
+    );
+    if (![
+      'succeeded_nominal', 'succeeded_escalated', 'partial',
+      'failed_uncontained',
+    ].includes(result)) {
+      return fail(
+        'executionStatus.status.cell_stop_action.latest_terminal.result',
+        'a Stop certificate result',
+      );
+    }
+    const executedStages = arrayAt(
+      terminal.executed_stages,
+      'executionStatus.status.cell_stop_action.latest_terminal.executed_stages',
+    ).map((item, index) => {
+      const path = `executionStatus.status.cell_stop_action.latest_terminal.executed_stages[${index}]`;
+      const stage = objectAt(item, path);
+      exactKeysAt(stage, [
+        'action_class', 'executed_mode', 'operation_id', 'outcome',
+        'participant_id', 'stage_id', 'stage_index', 'substitution_reason',
+      ], path);
+      const actionClass = stringAt(stage.action_class, `${path}.action_class`);
+      if (!['controlled', 'software_hard', 'safety_system_request'].includes(actionClass)) {
+        return fail(`${path}.action_class`, 'a Stop action class');
+      }
+      const outcome = stringAt(stage.outcome, `${path}.outcome`);
+      if (!['succeeded', 'partial', 'failed', 'superseded_no_effect'].includes(outcome)) {
+        return fail(`${path}.outcome`, 'a Stop stage outcome');
+      }
+      const executedMode = nullableStringAt(
+        stage.executed_mode,
+        `${path}.executed_mode`,
+      );
+      if (executedMode !== null && ![
+        'soft_on_path', 'spring_back_hold', 'hard_deceleration',
+      ].includes(executedMode)) {
+        return fail(`${path}.executed_mode`, 'a controlled Stop mode');
+      }
+      return {
+        operationId: stringAt(stage.operation_id, `${path}.operation_id`),
+        participantId: stringAt(stage.participant_id, `${path}.participant_id`),
+        stageId: stringAt(stage.stage_id, `${path}.stage_id`),
+        stageIndex: integerAt(stage.stage_index, `${path}.stage_index`),
+        actionClass: actionClass as 'controlled' | 'software_hard' | 'safety_system_request',
+        outcome: outcome as 'succeeded' | 'partial' | 'failed' | 'superseded_no_effect',
+        executedMode: executedMode as 'soft_on_path' | 'spring_back_hold' | 'hard_deceleration' | null,
+        substitutionReason: nullableStringAt(
+          stage.substitution_reason,
+          `${path}.substitution_reason`,
+        ),
+      };
+    });
+    latestTerminal = {
+      certificate: certificateRefAt(
+        terminal.certificate,
+        'executionStatus.status.cell_stop_action.latest_terminal.certificate',
+      ),
+      result: result as 'succeeded_nominal' | 'succeeded_escalated' | 'partial' | 'failed_uncontained',
+      escalated: booleanAt(
+        terminal.escalated,
+        'executionStatus.status.cell_stop_action.latest_terminal.escalated',
+      ),
+      hardStopFloorUsed: booleanAt(
+        terminal.hard_stop_floor_used,
+        'executionStatus.status.cell_stop_action.latest_terminal.hard_stop_floor_used',
+      ),
+      executedStages,
+    };
+  }
+  let cellStopFault: ExecutionOwnerStatus['cellStopAction']['fault'] = null;
+  if (cellStop.fault !== null) {
+    const path = 'executionStatus.status.cell_stop_action.fault';
+    const fault = objectAt(cellStop.fault, path);
+    exactKeysAt(fault, [
+      'certificate', 'latch_generation', 'latch_id', 'reason_code',
+      'recovery_status', 'state', 'trigger',
+    ], path);
+    const stateName = stringAt(fault.state, `${path}.state`);
+    if (!['latched', 'recovery_pending', 'cleared'].includes(stateName)) {
+      return fail(`${path}.state`, 'a Stop fault latch state');
+    }
+    const trigger = stringAt(fault.trigger, `${path}.trigger`);
+    if (![
+      'scope_promotion', 'escalated', 'partial', 'failed_uncontained',
+      'physical_rest_unproven', 'persistence_degraded',
+    ].includes(trigger)) {
+      return fail(`${path}.trigger`, 'a Stop fault trigger');
+    }
+    const recoveryStatus = stringAt(
+      fault.recovery_status,
+      `${path}.recovery_status`,
+    );
+    if (![
+      'waiting_for_observation', 'waiting_for_quiescence',
+      'waiting_for_configuration', 'waiting_for_external_reconciliation',
+      'waiting_for_durable_record', 'ready', 'recovery_pending', 'cleared',
+    ].includes(recoveryStatus)) {
+      return fail(`${path}.recovery_status`, 'a Stop fault recovery status');
+    }
+    cellStopFault = {
+      latchId: stringAt(fault.latch_id, `${path}.latch_id`),
+      latchGeneration: positiveIntegerAt(
+        fault.latch_generation,
+        `${path}.latch_generation`,
+      ),
+      state: stateName as 'latched' | 'recovery_pending' | 'cleared',
+      trigger: trigger as NonNullable<ExecutionOwnerStatus['cellStopAction']['fault']>['trigger'],
+      recoveryStatus: recoveryStatus as NonNullable<ExecutionOwnerStatus['cellStopAction']['fault']>['recoveryStatus'],
+      reasonCode: stringAt(fault.reason_code, `${path}.reason_code`),
+      certificate: fault.certificate === null
+        ? null
+        : certificateRefAt(fault.certificate, `${path}.certificate`),
+    };
+  }
   return {
     ownerEpoch: stringAt(status.owner_epoch, 'executionStatus.status.owner_epoch'),
+    cellId: stringAt(status.cell_id, 'executionStatus.status.cell_id'),
+    activePublicationGeneration: positiveIntegerAt(
+      status.active_publication_generation,
+      'executionStatus.status.active_publication_generation',
+    ),
     graphRevision: stringAt(
       status.graph_revision,
       'executionStatus.status.graph_revision',
@@ -6137,6 +6312,16 @@ export function parseExecutionOwnerStatus(value: unknown): ExecutionOwnerStatus 
     },
     observedMotion,
     observedGripper,
+    cellStopAction: {
+      available: cellStopAvailable,
+      unavailableReason: cellStopUnavailableReason,
+      expectedStopGeneration: integerAt(
+        cellStop.expected_stop_generation,
+        'executionStatus.status.cell_stop_action.expected_stop_generation',
+      ),
+      latestTerminal,
+      fault: cellStopFault,
+    },
   };
 }
 

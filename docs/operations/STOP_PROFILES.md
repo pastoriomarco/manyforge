@@ -97,6 +97,23 @@ Hardware or pendant scaling that ManyForge cannot read/freeze is deferred from
 the current release gate. It must be qualified on the real robot lane before
 claiming timed behavior under external scaling.
 
+## Program Operator Stop Policy
+
+The Program policy decides which behavior-tree work is held after an ordinary
+operator Stop. `hold` prevents that subtree from ticking or dispatching new
+work, `continue` permits explicitly supervisory work to keep observing, and
+`inherit` uses the deterministic parent/default rule captured by the exact Run.
+The addressed execution owner—not a browser or shared behavior-tree flag—reports
+the exact Stop identifier and generation that activates the hold.
+
+After the owner has classified an ordinary operator Stop, the primary Run
+control is labeled **Resume Motion**. It performs the exact offered recovery and
+starts a fresh attempt without consuming ordinary failure retries. It does not
+acknowledge a fault, reset the Program cycle, or reuse a manual result. A
+full-cell Stop remains a separate deliberate command guarded by the owner-issued
+cell generation; its result reports the actual executed Stop stages and any
+qualified substitution or escalation.
+
 ## Stop History And Incidents
 
 Every accepted Stop publishes immutable scope, revision, deadline, and

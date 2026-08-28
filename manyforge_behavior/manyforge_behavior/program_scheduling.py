@@ -323,6 +323,20 @@ class ProgramRunTickHost:
     def read(self, program_run_id: str) -> ProgramRunSnapshot:
         return self._owner.read(program_run_id)
 
+    def _requires_advance(self, snapshot: ProgramRunSnapshot) -> bool:
+        if snapshot.state in {
+            ProgramRunState.RUNNING,
+            ProgramRunState.STOPPING,
+            ProgramRunState.FINALIZING,
+        }:
+            return True
+        return (
+            snapshot.state is ProgramRunState.INTERVENTION_REQUIRED
+            and self._owner.operator_stop_observation_required(
+                snapshot.capture.program_run_id
+            )
+        )
+
     def advance_ready_once(self) -> tuple[ProgramRunSnapshot, ...]:
         with self._condition:
             self._raise_if_unavailable()
@@ -348,11 +362,7 @@ class ProgramRunTickHost:
             snapshots,
             strict=True,
         ):
-            if snapshot.state not in {
-                ProgramRunState.RUNNING,
-                ProgramRunState.STOPPING,
-                ProgramRunState.FINALIZING,
-            }:
+            if not self._requires_advance(snapshot):
                 remove.append(program_run_id)
         if remove:
             with self._condition:
@@ -369,6 +379,7 @@ class ProgramRunTickHost:
             for snapshot in snapshots:
                 if snapshot.state not in {
                     ProgramRunState.RUNNING,
+                    ProgramRunState.INTERVENTION_REQUIRED,
                     ProgramRunState.STOPPING,
                     ProgramRunState.FINALIZING,
                 }:
@@ -398,13 +409,10 @@ class ProgramRunTickHost:
                         self._worker_failure = error
                         self._condition.notify_all()
                         return
-                    if snapshot.state not in {
-                        ProgramRunState.RUNNING,
-                        ProgramRunState.STOPPING,
-                        ProgramRunState.FINALIZING,
-                    }:
+                    if not self._requires_advance(snapshot):
                         self._scheduled.discard(program_run_id)
-                        completed.append(snapshot)
+                        if snapshot.state is not ProgramRunState.INTERVENTION_REQUIRED:
+                            completed.append(snapshot)
 
                 now = self._monotonic()
                 delay = next_tick - now

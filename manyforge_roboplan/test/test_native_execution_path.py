@@ -1400,6 +1400,13 @@ def test_first_complete_addressed_native_motion_path(tmp_path: Path) -> None:
         assert first_status["gripper_command_schema_revision"] == manifest[
             "gripper_command_schema_revision"
         ]
+        assert first_status["cell_stop_action"] == {
+            "available": True,
+            "expected_stop_generation": 0,
+            "fault": None,
+            "latest_terminal": None,
+            "unavailable_reason": None,
+        }
         observed = {
             target["target_role_id"]: target
             for target in first_status["observed_targets"]
@@ -1957,6 +1964,16 @@ def test_first_complete_addressed_native_motion_path(tmp_path: Path) -> None:
         stopped = _wait_terminal(runner, controlled_id)["operation"]
         assert stopped["state"] == "stopped"
         assert stopped["active_stop_id"] == stop_accepted["accepted"]["stop_id"]
+        projected_stop = headless.execution_status()["status"][
+            "cell_stop_action"
+        ]
+        assert projected_stop["expected_stop_generation"] == (
+            stop_accepted["accepted"]["stop_generation"]
+        )
+        assert projected_stop["latest_terminal"]["certificate"]["stop_id"] == (
+            stop_accepted["accepted"]["stop_id"]
+        )
+        assert projected_stop["latest_terminal"]["executed_stages"]
         with sqlite3.connect(
             execution_state_root / "operation-journal.sqlite3"
         ) as database:

@@ -482,10 +482,12 @@ export function ProgramTransportControls({
   enabled,
   program,
   robot,
+  onOpenRuntimeHistory,
 }: {
   enabled: boolean;
   program: ProgramRuntimeController;
   robot: RobotControlController;
+  onOpenRuntimeHistory?: () => void;
 }) {
   const [detailsOpen, setDetailsOpen] = useState(false);
   const [stopMenuOpen, setStopMenuOpen] = useState(false);
@@ -500,10 +502,18 @@ export function ProgramTransportControls({
     && state.applied !== null
     && state.pending === null
     && cycleState === 'idle_after_reset';
+  const operatorStopOffer = state.controls?.recoveryOffer?.recoveryClass
+    === 'ordinary_operator_stop'
+    ? state.controls.recoveryOffer
+    : null;
+  const operatorStopResumeAction = operatorStopOffer?.primaryAction ?? null;
+  const canResumeOperatorStop = enabled
+    && operatorStopResumeAction !== null
+    && state.controlPending === null;
   const canResume = enabled
     && motionPaused
     && robot.controlPending === null;
-  const canRunOrResume = canRun || canResume;
+  const canRunOrResume = canRun || canResume || canResumeOperatorStop;
   const canReset = enabled
     && state.pending === null
     && cycleState === 'terminal_awaiting_reset';
@@ -516,7 +526,13 @@ export function ProgramTransportControls({
     ?? (motionActive
       ? 'The exact active operation does not currently advertise qualified runtime-scale control.'
       : 'Runtime velocity is available only while an addressed motion operation is active.');
-  const fullStopReason = 'The current execution projection does not publish the cell Stop generation required for a safely fenced full-cell Stop.';
+  const fullCellStop = robot.state.status?.cellStopAction ?? null;
+  const fullStopReason = fullCellStop === null
+    ? 'The current execution owner status is unavailable.'
+    : fullCellStop.available
+      ? 'Stop all currently addressed motion in this cell using the exact owner-issued generation fence.'
+      : fullCellStop.unavailableReason
+        ?? 'The execution owner has not made full-cell Stop available.';
 
   return (
     <>
@@ -527,16 +543,30 @@ export function ProgramTransportControls({
           disabled={!canRunOrResume}
           title={canResume
             ? 'Resume the exact paused motion operation.'
+            : canResumeOperatorStop
+              ? 'Resume from the exact owner-issued operator Stop recovery.'
             : canRun
               ? 'Run the exact Applied Program.'
               : 'Run requires an Applied Program and an idle, reset runner.'}
-          onClick={() => { void (canResume ? robot.resume() : program.run()); }}
+          onClick={() => {
+            if (canResume) {
+              void robot.resume();
+            } else if (
+              canResumeOperatorStop && operatorStopResumeAction !== null
+            ) {
+              void program.applyRecoveryAction(operatorStopResumeAction);
+            } else {
+              void program.run();
+            }
+          }}
         >
           {robot.controlPending === 'resume'
             ? 'Resuming…'
+            : state.controlPending?.startsWith('recovery:')
+              ? 'Resuming…'
             : state.pending === 'run'
               ? 'Starting…'
-              : canResume ? 'Resume Motion' : 'Run'}
+              : canResume || canResumeOperatorStop ? 'Resume Motion' : 'Run'}
         </button>
         <div
           className="transport-stop-group"
@@ -566,13 +596,16 @@ export function ProgramTransportControls({
           <button
             type="button"
             className="danger-button transport-stop-disclosure"
-            disabled={!enabled || !programActive || state.pending !== null}
+            disabled={!enabled || (
+              (!programActive || state.pending !== null)
+              && fullCellStop?.available !== true
+            )}
             aria-label="More Stop actions"
             aria-haspopup="menu"
             aria-expanded={stopMenuOpen}
-            title={programActive
-              ? 'Show the separate Stop Execution command.'
-              : 'No Program execution is active.'}
+            title={programActive || fullCellStop?.available
+              ? 'Show deliberate whole-Program and full-cell Stop actions.'
+              : 'No additional Stop action is currently available.'}
             onClick={() => setStopMenuOpen((open) => !open)}
           >
             ▾
@@ -591,6 +624,23 @@ export function ProgramTransportControls({
                 }}
               >
                 {state.pending === 'stop' ? 'Stopping…' : 'Stop Execution'}
+              </button>
+              <button
+                type="button"
+                className="danger-button"
+                role="menuitem"
+                disabled={
+                  !enabled
+                  || fullCellStop?.available !== true
+                  || robot.fullStopPending
+                }
+                title={fullStopReason}
+                onClick={() => {
+                  setStopMenuOpen(false);
+                  void robot.fullStop();
+                }}
+              >
+                {robot.fullStopPending ? 'Stopping cell…' : 'Full-cell Stop'}
               </button>
             </div>
           )}
@@ -646,12 +696,52 @@ export function ProgramTransportControls({
           input when Stop begins.
           {!velocityAvailable && <> Currently unavailable: {velocityReason}</>}
         </p>
-        <p className="panel-intro transport-unavailable-reason">
-          <button type="button" className="danger-button" disabled title={fullStopReason}>
-            Full-cell Stop unavailable
-          </button>
-          {' '}{fullStopReason}
-        </p>
+        <section className="runtime-detail-group" aria-label="Full-cell Stop">
+          <h4>Full-cell Stop</h4>
+          <p className="panel-intro transport-unavailable-reason">
+            Generation {fullCellStop?.expectedStopGeneration ?? '—'} · {fullStopReason}
+          </p>
+          {robot.fullStopError && (
+            <p className="panel-intro">
+              Full-cell Stop requires attention in Runtime/history.
+            </p>
+          )}
+          {fullCellStop?.latestTerminal && (
+            <p className="panel-intro">
+              Latest certificate {fullCellStop.latestTerminal.certificate.stopCertificateId}
+              {' · '}{fullCellStop.latestTerminal.result}
+              {fullCellStop.latestTerminal.escalated ? ' · escalated' : ''}
+              {fullCellStop.latestTerminal.hardStopFloorUsed
+                ? ' · hard-stop floor used'
+                : ''}
+              {fullCellStop.latestTerminal.executedStages.map((stage) => (
+                <span key={`${stage.operationId}:${stage.participantId}:${stage.stageIndex}`}>
+                  <br />{stage.participantId}: {stage.executedMode ?? stage.actionClass}
+                  {stage.substitutionReason
+                    ? ` (fallback: ${stage.substitutionReason})`
+                    : ''}
+                </span>
+              ))}
+            </p>
+          )}
+          {fullCellStop?.fault && (
+            <p className="error-banner" role="alert">
+              Stop fault {fullCellStop.fault.state}: {fullCellStop.fault.reasonCode}
+              {' · recovery '}{fullCellStop.fault.recoveryStatus}
+            </p>
+          )}
+          {onOpenRuntimeHistory && (
+            <button
+              type="button"
+              onClick={() => {
+                setDetailsOpen(false);
+                onOpenRuntimeHistory();
+              }}
+            >
+              Open Runtime/history
+            </button>
+          )}
+        </section>
       </OverlayPanel>
     </>
   );

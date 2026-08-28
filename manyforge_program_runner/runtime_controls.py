@@ -612,9 +612,18 @@ class ProgramRuntimeControls:
         observation_current = (
             valid_until_ns is None or time.monotonic_ns() < valid_until_ns
         )
-        manual_result_enabled, manual_result_disabled_reason = (
-            manual_result_availability(intervention, policy)
+        operator_stop_recovery = (
+            intervention.policy_parameter == "operator_stop_policy"
         )
+        if operator_stop_recovery:
+            manual_result_enabled = False
+            manual_result_disabled_reason = (
+                "operator_stop_requires_owner_recovery"
+            )
+        else:
+            manual_result_enabled, manual_result_disabled_reason = (
+                manual_result_availability(intervention, policy)
+            )
         allow_intervention = policy.get("allow_intervention") is True
         allowed_policy_actions = policy.get("allowed_recovery_actions", [])
         intervention_allowed = (
@@ -645,7 +654,9 @@ class ProgramRuntimeControls:
             if action_id == "acknowledge_and_continue":
                 enabled_by_policy = intervention_allowed
             else:
-                enabled_by_policy = intervention_allowed and retry_available
+                enabled_by_policy = operator_stop_recovery or (
+                    intervention_allowed and retry_available
+                )
             enabled = enabled_by_policy and observation_current
             actions.append(
                 {

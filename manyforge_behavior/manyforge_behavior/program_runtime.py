@@ -37,6 +37,10 @@ from manyforge_behavior.recovery import (
     RecoveryAwareNode,
     recovery_policy_is_actionable,
 )
+from manyforge_behavior.nodes.stop_policy import (
+    OperatorMotionStopPolicy,
+    OperatorMotionStopState,
+)
 
 PROGRAM_RUN_CAPTURE_API: Final = "manyforge.program_run_capture.v1"
 _MAX_ATTEMPTS_PER_NODE: Final = 1_000_000
@@ -320,7 +324,12 @@ class ExecutableProgramRun:
         )
         self._attempt_source = ProgramRunAttemptSource(capture.program_run_id)
         self._ports = ports
-        root = self._build_node(program.tree)
+        self._operator_stop_state = OperatorMotionStopState()
+        root = self._build_node(
+            program.tree,
+            inherited_stop_policy="continue",
+            root=True,
+        )
         self._tree = py_trees.trees.BehaviourTree(root=root)
         self._tree.setup()
         self._lock = RLock()
@@ -329,8 +338,35 @@ class ExecutableProgramRun:
     def _build_node(
         self,
         node: ProgramTreeNode,
+        *,
+        inherited_stop_policy: str,
+        ancestor_holds: bool = False,
+        root: bool = False,
     ) -> py_trees.behaviour.Behaviour:
-        children = tuple(self._build_node(child) for child in node.children)
+        authored_stop_policy = node.operator_stop_policy or "inherit"
+        entry = self._environment.catalog.get(node.node_id)
+        if authored_stop_policy == "inherit":
+            effective_stop_policy = (
+                "continue"
+                if root
+                else (
+                    inherited_stop_policy
+                    if entry.kind in {"composite", "decorator"}
+                    else "hold"
+                )
+            )
+        else:
+            effective_stop_policy = authored_stop_policy
+        children = tuple(
+            self._build_node(
+                child,
+                inherited_stop_policy=effective_stop_policy,
+                ancestor_holds=(
+                    ancestor_holds or effective_stop_policy == "hold"
+                ),
+            )
+            for child in node.children
+        )
         row = self._environment.registry.record(node.node_id, "py_trees")
         built = self._resolver.instantiate(
             row,
@@ -343,6 +379,7 @@ class ExecutableProgramRun:
                 input_resolver=self._input_resolver,
                 attempt_source=self._attempt_source,
                 ports=self._ports,
+                operator_stop_state=self._operator_stop_state,
             ),
         )
         policy = self._capture.node_policy_by_instance_id.get(node.instance_id)
@@ -352,12 +389,18 @@ class ExecutableProgramRun:
             and recovery_policy_is_actionable(policy)
             and recovery_port is not None
         ):
-            return RecoveryAwareNode(
+            built = RecoveryAwareNode(
                 child=built,
                 node_instance_id=node.instance_id,
                 policy=policy,
                 attempt_source=self._attempt_source,
                 recovery_port=recovery_port,
+            )
+        if effective_stop_policy == "hold" and not ancestor_holds:
+            built = OperatorMotionStopPolicy(
+                child=built,
+                node_instance_id=node.instance_id,
+                stop_state=self._operator_stop_state,
             )
         return built
 
@@ -424,7 +467,6 @@ class ExecutableProgramRun:
                 return
             self._stopped = True
             self._tree.root.stop(py_trees.common.Status.INVALID)
-
 
 __all__ = [
     "ExecutableProgramRun",

@@ -736,6 +736,46 @@ def test_pick_sequence_observation_cancellation_and_intervention_are_exact() -> 
     port.unbind("program-run.1")
 
 
+def test_native_motion_stop_projects_exact_operator_recovery_policy() -> None:
+    transport = _Transport()
+    port = NativeKernelProgramPort(KernelClient(transport))
+    port.bind(_context())
+    identity = _identity("motion")
+    started = port.operations.start(
+        "motion.move_to_pose",
+        identity,
+        _motion_inputs(),
+    )
+    operation = transport.operations[started.task_id]
+    operation.update(
+        {
+            "state": "stopped",
+            "active_stop_id": "stop.1",
+            "active_stop_generation": 2,
+        }
+    )
+    transport.operation_recovery = lambda _operation_id: {
+        "ok": True,
+        "operation_revision": operation["operation_revision"],
+        "participants": [{"operation_participant_id": "participant.1"}],
+        "recovery_assessment": {
+            "recovery_class": "ordinary_operator_stop",
+        },
+        "stop_generation": 2,
+        "stop_id": "stop.1",
+    }
+    observed = port.operations.observe(started.task_id)
+    assert observed.state is OwnerTaskState.INTERRUPTED
+    assert observed.metadata["active_stop_id"] == "stop.1"
+    assert observed.metadata["active_stop_generation"] == 2
+    assert observed.metadata["authored_failure_policy"] == "pause_for_operator"
+    assert (
+        observed.metadata["authored_failure_policy_parameter"]
+        == "operator_stop_policy"
+    )
+    port.unbind("program-run.1")
+
+
 def test_place_intent_preserves_authored_pose_and_has_no_grasp_exception() -> None:
     transport = _PickPlaceTransport()
     port = NativeKernelProgramPort(KernelClient(transport))

@@ -2,6 +2,7 @@
 
 import math
 
+import py_trees
 import pytest
 
 from manyforge_behavior.nodes.geometry import (
@@ -37,7 +38,8 @@ from manyforge_behavior.nodes.simulation import (
 )
 from manyforge_behavior.nodes.stop_policy import (
     OperatorMotionStopPolicy,
-    StopPolicyNodeUnavailableError,
+    OperatorMotionStopSnapshot,
+    OperatorMotionStopState,
 )
 
 
@@ -114,7 +116,6 @@ def test_pose_distance_math_is_finite_and_quaternion_sign_invariant() -> None:
         (SetSimulationState, SimulationNodeUnavailableError, "simulation_node_unavailable"),
         (StepSimulation, SimulationNodeUnavailableError, "simulation_node_unavailable"),
         (SetEntityState, SimulationNodeUnavailableError, "simulation_node_unavailable"),
-        (OperatorMotionStopPolicy, StopPolicyNodeUnavailableError, "stop_policy_node_unavailable"),
     ],
 )
 def test_effectful_nodes_fail_before_inputs(
@@ -129,3 +130,59 @@ def test_effectful_nodes_fail_before_inputs(
     poison = PoisonInput()
     with pytest.raises(error_type, match=reason):
         node_type(poison, kernel=poison, blackboard=poison)
+
+
+def test_operator_stop_policy_holds_without_ticking_and_resumes_exact_run() -> None:
+    class CountingNode(py_trees.behaviour.Behaviour):
+        def __init__(self) -> None:
+            super().__init__(name="counting")
+            self.ticks = 0
+            self.observations = 0
+
+        def update(self) -> py_trees.common.Status:
+            self.ticks += 1
+            return py_trees.common.Status.RUNNING
+
+        def observe_while_operator_stop_held(self) -> None:
+            self.observations += 1
+
+    child = CountingNode()
+    state = OperatorMotionStopState()
+    node = OperatorMotionStopPolicy(
+        child=child,
+        node_instance_id="motion",
+        stop_state=state,
+    )
+    list(node.tick())
+    assert child.ticks == 1
+
+    state.hold(
+        "task.1",
+        {"active_stop_id": "stop.1", "active_stop_generation": 1},
+    )
+    list(node.tick())
+    assert child.ticks == 1
+    assert child.observations == 1
+    assert node.status is py_trees.common.Status.RUNNING
+
+    state.resolve("task.1")
+    list(node.tick())
+    assert child.ticks == 2
+
+
+def test_operator_stop_state_retains_parallel_attempts_until_each_is_resolved() -> None:
+    state = OperatorMotionStopState()
+    metadata = {"active_stop_id": "stop.1", "active_stop_generation": 1}
+
+    state.hold("task.1", metadata)
+    state.hold("task.2", metadata)
+    state.resolve("task.1")
+
+    assert state.snapshot() == OperatorMotionStopSnapshot(
+        stop_id="stop.1",
+        stop_generation=1,
+        held=True,
+    )
+
+    state.resolve("task.2")
+    assert state.snapshot() == OperatorMotionStopSnapshot()

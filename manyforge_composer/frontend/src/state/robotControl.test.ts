@@ -18,6 +18,8 @@ import type {
 function statusFixture(ownerEpoch = 'execution-owner-1'): ExecutionOwnerStatus {
   return {
     ownerEpoch,
+    cellId: 'cell.1',
+    activePublicationGeneration: 1,
     graphRevision: 'sha256:graph',
     retainedBundleId: 'sha256:bundle',
     sceneRevision: {
@@ -99,6 +101,13 @@ function statusFixture(ownerEpoch = 'execution-owner-1'): ExecutionOwnerStatus {
       position: 0.02,
       coordinateKind: 'linear_m',
       complete: true,
+    },
+    cellStopAction: {
+      available: true,
+      unavailableReason: null,
+      expectedStopGeneration: 0,
+      latestTerminal: null,
+      fault: null,
     },
   };
 }

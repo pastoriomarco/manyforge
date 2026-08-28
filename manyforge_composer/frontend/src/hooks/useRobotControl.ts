@@ -44,6 +44,8 @@ export interface RobotControlController {
   runtimeScaleDraft: number;
   runtimeScalePending: boolean;
   runtimeScaleError: string | null;
+  fullStopPending: boolean;
+  fullStopError: string | null;
   selectMode: (mode: RobotControlMode) => void;
   editJoint: (jointIndex: number, positionRad: number) => void;
   editPose: (pose: Pose3Value) => void;
@@ -51,6 +53,8 @@ export interface RobotControlController {
   approve: () => Promise<void>;
   revert: () => void;
   stop: () => Promise<void>;
+  fullStop: () => Promise<void>;
+  dismissFullStopError: () => void;
   pause: () => Promise<void>;
   resume: () => Promise<void>;
   setRuntimeScale: (scale: number) => void;
@@ -68,6 +72,8 @@ export function useRobotControl(enabled: boolean): RobotControlController {
   const [runtimeScaleDraft, setRuntimeScaleDraft] = useState(1);
   const [runtimeScalePending, setRuntimeScalePending] = useState(false);
   const [runtimeScaleError, setRuntimeScaleError] = useState<string | null>(null);
+  const [fullStopPending, setFullStopPending] = useState(false);
+  const [fullStopError, setFullStopError] = useState<string | null>(null);
   const approveInFlight = useRef(false);
   const stopInFlight = useRef(false);
   const runtimeScaleStatusRef = useRef<OperationRuntimeScaleStatus | null>(null);
@@ -459,6 +465,32 @@ export function useRobotControl(enabled: boolean): RobotControlController {
     }
   }, [clearRuntimeScaleQueue, state]);
 
+  const fullStop = useCallback(async () => {
+    const action = state.status?.cellStopAction;
+    if (
+      !enabled
+      || fullStopPending
+      || state.status === null
+      || action === undefined
+      || !action.available
+    ) return;
+    clearRuntimeScaleQueue();
+    setFullStopPending(true);
+    setFullStopError(null);
+    try {
+      await api.execution.fullStop(
+        state.status.ownerEpoch,
+        action.expectedStopGeneration,
+        requestId(),
+      );
+      setReloadToken((current) => current + 1);
+    } catch (error: unknown) {
+      setFullStopError(errorMessage(error, 'Full-cell Stop was rejected.'));
+    } finally {
+      setFullStopPending(false);
+    }
+  }, [clearRuntimeScaleQueue, enabled, fullStopPending, state.status]);
+
   const controlOperation = useCallback(async (control: 'pause' | 'resume') => {
     if (
       controlPending !== null
@@ -498,6 +530,9 @@ export function useRobotControl(enabled: boolean): RobotControlController {
   const retry = useCallback(() => {
     setReloadToken((current) => current + 1);
   }, []);
+  const dismissFullStopError = useCallback(() => {
+    setFullStopError(null);
+  }, []);
 
   return useMemo(() => ({
     state,
@@ -506,6 +541,8 @@ export function useRobotControl(enabled: boolean): RobotControlController {
     runtimeScaleDraft,
     runtimeScalePending,
     runtimeScaleError,
+    fullStopPending,
+    fullStopError,
     selectMode,
     editJoint,
     editPose,
@@ -513,6 +550,8 @@ export function useRobotControl(enabled: boolean): RobotControlController {
     approve,
     revert,
     stop,
+    fullStop,
+    dismissFullStopError,
     pause,
     resume,
     setRuntimeScale,
@@ -529,11 +568,15 @@ export function useRobotControl(enabled: boolean): RobotControlController {
     revert,
     runtimeScaleDraft,
     runtimeScaleError,
+    fullStopPending,
+    fullStopError,
     runtimeScalePending,
     runtimeScaleStatus,
     selectMode,
     setRuntimeScale,
     state,
     stop,
+    fullStop,
+    dismissFullStopError,
   ]);
 }
