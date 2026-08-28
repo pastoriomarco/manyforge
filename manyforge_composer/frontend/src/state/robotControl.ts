@@ -27,6 +27,7 @@ const TERMINAL_OPERATION_STATES = new Set<OperationStateName>([
 export type RobotControlMode =
   | 'joint'
   | 'pose_goal'
+  | 'move_to'
   | 'cartesian_path'
   | 'gripper';
 
@@ -56,6 +57,7 @@ export interface RobotControlState {
   status: ExecutionOwnerStatus | null;
   phase: RobotControlPhase;
   mode: RobotControlMode;
+  moveToKind: 'pose' | 'joint';
   draftPositionsRad: number[];
   draftPose: Pose3Value;
   draftGripperPosition: number | null;
@@ -76,6 +78,7 @@ export type RobotControlAction =
   | { type: 'select_mode'; mode: RobotControlMode }
   | { type: 'edit'; positionsRad: number[] }
   | { type: 'edit_joint'; positionsRad: number[] }
+  | { type: 'edit_move_to_joint'; positionsRad: number[] }
   | { type: 'edit_pose'; pose: Pose3Value }
   | { type: 'edit_gripper'; position: number }
   | {
@@ -103,6 +106,7 @@ export const initialRobotControlState: RobotControlState = {
   status: null,
   phase: 'loading',
   mode: 'joint',
+  moveToKind: 'pose',
   draftPositionsRad: [],
   draftPose: IDENTITY_POSE,
   draftGripperPosition: null,
@@ -350,6 +354,7 @@ export function robotControlReducer(
       return {
         ...state,
         mode: action.mode,
+        moveToKind: 'pose',
         phase: 'idle',
         ...draftFromStatus(state.status),
         generation: state.generation + 1,
@@ -385,6 +390,32 @@ export function robotControlReducer(
         draftPositionsRad: [...action.positionsRad],
       });
     }
+    case 'edit_move_to_joint': {
+      if (state.status === null || robotControlHasActiveOperation(state)) {
+        return state;
+      }
+      if (!positionsAreValid(state.status, action.positionsRad)) {
+        return {
+          ...state,
+          phase: 'blocked',
+          generation: state.generation + 1,
+          intent: null,
+          preview: null,
+          ghostStale: state.ghost !== null,
+          error: 'The stored joint target is outside its retained limits.',
+        };
+      }
+      if (
+        state.mode === 'move_to'
+        && state.moveToKind === 'joint'
+        && arraysEqual(state.draftPositionsRad, action.positionsRad)
+      ) return state;
+      return invalidateDraft(state, {
+        mode: 'move_to',
+        moveToKind: 'joint',
+        draftPositionsRad: [...action.positionsRad],
+      });
+    }
     case 'edit_pose':
       if (state.status === null || robotControlHasActiveOperation(state)) {
         return state;
@@ -401,7 +432,10 @@ export function robotControlReducer(
         };
       }
       if (posesEqual(state.draftPose, action.pose)) return state;
-      return invalidateDraft(state, { draftPose: copyPose(action.pose) });
+      return invalidateDraft(state, {
+        ...(state.mode === 'move_to' ? { moveToKind: 'pose' as const } : {}),
+        draftPose: copyPose(action.pose),
+      });
     case 'edit_gripper':
       if (state.status === null || robotControlHasActiveOperation(state)) {
         return state;
@@ -789,6 +823,7 @@ export function buildPreviewIntent(
     RobotControlState,
     | 'status'
     | 'mode'
+    | 'moveToKind'
     | 'draftPositionsRad'
     | 'draftPose'
     | 'draftGripperPosition'
@@ -807,6 +842,14 @@ export function buildPreviewIntent(
       );
     case 'pose_goal':
       return buildPoseMotionIntent(state.status, state.draftPose, requestId);
+    case 'move_to':
+      return state.moveToKind === 'joint'
+        ? buildJointMotionIntent(
+            state.status,
+            state.draftPositionsRad,
+            requestId,
+          )
+        : buildPoseMotionIntent(state.status, state.draftPose, requestId);
     case 'cartesian_path':
       return buildCartesianMotionIntent(
         state.status,

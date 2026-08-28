@@ -1996,6 +1996,7 @@ def _validate_scene(
     scene_ids: list[str] = []
     scene_resource_roles: set[str] = set()
     collision_policy_refs: set[str] = set()
+    support_contact_refs: list[tuple[str, str, str]] = []
     shape_schema = catalog.schema_registry.types["shape"]
     for index, raw in enumerate(rows):
         row_path = f"{path}[{index}]"
@@ -2028,9 +2029,126 @@ def _validate_scene(
                 )
             )
         if "metadata" in row:
-            canonical_json_bytes(
-                _program_mapping(row["metadata"], path=f"{row_path}.metadata")
+            metadata = _program_mapping(
+                row["metadata"], path=f"{row_path}.metadata"
             )
+            canonical_json_bytes(metadata)
+            if "support_contacts" in metadata:
+                contacts = _program_list(
+                    metadata["support_contacts"],
+                    path=f"{row_path}.metadata.support_contacts",
+                )
+                support_ids: list[str] = []
+                for contact_index, raw_contact in enumerate(contacts):
+                    contact_path = (
+                        f"{row_path}.metadata.support_contacts[{contact_index}]"
+                    )
+                    contact = _program_mapping(raw_contact, path=contact_path)
+                    support_id = _program_identifier(
+                        contact.get("support_object_id"),
+                        path=f"{contact_path}.support_object_id",
+                    )
+                    support_ids.append(support_id)
+                    mode = contact.get("mode", "contact_release")
+                    if mode == "bounded_penetration":
+                        _program_closed(
+                            contact,
+                            required=frozenset({"support_object_id", "mode"}),
+                            optional=frozenset({"max_contact_penetration_m"}),
+                            path=contact_path,
+                        )
+                        if (
+                            "max_contact_penetration_m" in contact
+                            and _program_number(
+                                contact["max_contact_penetration_m"],
+                                path=f"{contact_path}.max_contact_penetration_m",
+                            )
+                            < 0.0
+                        ):
+                            _program_error(
+                                f"{contact_path}.max_contact_penetration_m",
+                                "must be non-negative",
+                            )
+                    elif mode == "contact_process":
+                        _program_closed(
+                            contact,
+                            required=frozenset({"support_object_id", "mode"}),
+                            path=contact_path,
+                        )
+                    elif mode == "contact_release":
+                        _program_closed(
+                            contact,
+                            required=frozenset({"support_object_id"}),
+                            optional=frozenset(
+                                {
+                                    "mode",
+                                    "release_evidence_mode",
+                                    "require_separation_by_end",
+                                    "allow_recontact",
+                                    "enforce_max_start_penetration",
+                                    "max_start_penetration_m",
+                                    "release_tolerance_m",
+                                    "min_release_progress_m",
+                                    "require_strictly_decreasing_penetration",
+                                }
+                            ),
+                            path=contact_path,
+                        )
+                        evidence = contact.get(
+                            "release_evidence_mode", "signed_penetration"
+                        )
+                        if evidence not in {"signed_penetration", "binary_contact"}:
+                            _program_error(
+                                f"{contact_path}.release_evidence_mode",
+                                "must be signed_penetration or binary_contact",
+                            )
+                        for field in (
+                            "require_separation_by_end",
+                            "allow_recontact",
+                            "enforce_max_start_penetration",
+                            "require_strictly_decreasing_penetration",
+                        ):
+                            if field in contact and type(contact[field]) is not bool:
+                                _program_error(
+                                    f"{contact_path}.{field}", "must be a boolean"
+                                )
+                        for field in (
+                            "max_start_penetration_m",
+                            "release_tolerance_m",
+                            "min_release_progress_m",
+                        ):
+                            if field in contact and _program_number(
+                                contact[field], path=f"{contact_path}.{field}"
+                            ) < 0.0:
+                                _program_error(
+                                    f"{contact_path}.{field}",
+                                    "must be non-negative",
+                                )
+                        if evidence == "binary_contact" and (
+                            contact.get("enforce_max_start_penetration", False)
+                            or contact.get("max_start_penetration_m", 0.0) != 0.0
+                            or contact.get("release_tolerance_m", 0.0) != 0.0
+                            or contact.get("min_release_progress_m", 0.0) != 0.0
+                            or contact.get(
+                                "require_strictly_decreasing_penetration", False
+                            )
+                        ):
+                            _program_error(
+                                contact_path,
+                                "binary_contact forbids signed-distance fields",
+                            )
+                    else:
+                        _program_error(
+                            f"{contact_path}.mode", "has an unsupported mode"
+                        )
+                    support_contact_refs.append(
+                        (scene_id, support_id, contact_path)
+                    )
+                if support_ids != sorted(set(support_ids)):
+                    _program_error(
+                        f"{row_path}.metadata.support_contacts",
+                        "must be unique and canonical-sorted by support_object_id",
+                    )
         if "collision_policy_ids" in row:
             collision_policy_refs.update(
                 _canonical_identifier_list(
@@ -2040,7 +2158,36 @@ def _validate_scene(
             )
     if scene_ids != sorted(scene_ids) or len(scene_ids) != len(set(scene_ids)):
         _program_error(path, "must be unique and canonical-sorted by scene_resource_id")
-    return set(scene_ids), scene_resource_roles, collision_policy_refs
+    declared_scene_ids = set(scene_ids)
+    supports_by_resource: dict[str, set[str]] = {
+        scene_id: set() for scene_id in scene_ids
+    }
+    for supported_id, support_id, contact_path in support_contact_refs:
+        if support_id == supported_id:
+            _program_error(
+                f"{contact_path}.support_object_id",
+                "cannot name the supported object itself",
+            )
+        if support_id not in declared_scene_ids:
+            _program_error(
+                f"{contact_path}.support_object_id",
+                "does not name a declared Program scene resource",
+            )
+        supports_by_resource[supported_id].add(support_id)
+    pending = set(scene_ids)
+    while pending:
+        removable = {
+            scene_id
+            for scene_id in pending
+            if not (supports_by_resource[scene_id] & pending)
+        }
+        if not removable:
+            _program_error(
+                path,
+                "contains a cyclic support-contact dependency",
+            )
+        pending -= removable
+    return declared_scene_ids, scene_resource_roles, collision_policy_refs
 
 
 def _validate_pose_frame_ref(

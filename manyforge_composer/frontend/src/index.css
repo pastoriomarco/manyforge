@@ -3632,6 +3632,157 @@ svg.viewer-camera-icon {
   justify-content: flex-start;
 }
 
+.assistant-proposals {
+  display: grid;
+  gap: 0.65rem;
+  padding-left: 1rem;
+}
+
+.assistant-proposals pre {
+  max-height: 14rem;
+  overflow: auto;
+  font-size: 0.68rem;
+  white-space: pre-wrap;
+}
+
+.assistant-proposal-actions {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.4rem;
+  margin-top: 0.4rem;
+}
+
+.assistant-proposal-actions span {
+  color: #8fb4bf;
+  font-size: 0.68rem;
+}
+
+.program-template-entry {
+  padding: 0.3rem 0.4rem;
+  border-bottom: 1px solid #203542;
+}
+
+.program-template-entry > button {
+  display: flex;
+  width: 100%;
+  align-items: center;
+  gap: 0.45rem;
+  padding: 0.38rem 0.45rem;
+  text-align: left;
+}
+
+.program-template-entry > button > span:last-child {
+  display: grid;
+  min-width: 0;
+}
+
+.program-template-entry small {
+  color: #7894a0;
+  font-size: 0.58rem;
+}
+
+.program-template-form,
+.program-template-form label,
+.contact-policy-fields,
+.contact-policy-fields label,
+.contact-policy-editor > label {
+  display: grid;
+  gap: 0.35rem;
+}
+
+.program-template-form {
+  gap: 0.7rem;
+}
+
+.program-template-form p {
+  margin: 0;
+}
+
+.program-template-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 0.55rem;
+}
+
+.contact-policy-fields input,
+.contact-policy-editor > label select {
+  width: 100%;
+  min-width: 0;
+  padding: 0.5rem 0.6rem;
+  border: 1px solid #304b5a;
+  border-radius: 0.45rem;
+  color: #dce8ee;
+  background: #07141d;
+}
+
+.contact-policy-fields input:invalid {
+  border-color: #c8615d;
+  color: #ffaaa4;
+}
+
+.contact-policy-section {
+  padding-block: 0.55rem;
+  border-block: 1px solid #203542;
+}
+
+.contact-policy-section > summary {
+  cursor: pointer;
+  font-weight: 700;
+}
+
+.contact-policy-subheading {
+  display: grid;
+  gap: 0.15rem;
+  padding-top: 0.35rem;
+}
+
+.contact-policy-subheading span {
+  color: #7894a0;
+  font-size: 0.68rem;
+}
+
+.contact-policy-check,
+.contact-policy-checks {
+  display: flex !important;
+  align-items: center;
+  gap: 0.45rem;
+}
+
+.contact-policy-checks {
+  align-items: flex-start;
+  flex-direction: column;
+}
+
+.contact-policy-check input {
+  width: auto;
+}
+
+.robot-control-move-to {
+  display: grid;
+  grid-column: 1 / -1;
+  gap: 0.55rem;
+  padding: 0.55rem;
+  border: 1px solid #294753;
+  border-radius: 0.45rem;
+}
+
+.robot-control-move-to > label {
+  display: grid;
+  gap: 0.25rem;
+}
+
+.robot-control-move-offsets {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 0.4rem;
+}
+
+.robot-control-move-offsets label {
+  display: grid;
+  gap: 0.2rem;
+}
+
 .segmented-control {
   display: inline-flex;
   padding: 0.18rem;

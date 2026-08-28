@@ -5,6 +5,7 @@ import type {
   CatalogEntry,
   JsonValue,
   NodeEnvironmentResponse,
+  ProgramAuthoringDocument,
   ProgramTreeNode,
 } from '../types/api';
 import { flattenProgramForest } from '../utils/programAuthoring';
@@ -14,6 +15,7 @@ import {
 } from '../utils/programCanvasInteraction';
 import { NodePaletteItem } from './NodePaletteItem';
 import { OverlayPanel } from './OverlayPanel';
+import { ProgramAuthoringTemplate } from './ProgramAuthoringTemplate';
 
 interface ProgramCatalogIdentity {
   catalogId: string;
@@ -24,6 +26,7 @@ interface ProgramCatalogIdentity {
 
 interface ProgramNodePaletteProps {
   roots: ProgramTreeNode[];
+  program?: ProgramAuthoringDocument;
   catalogEntries: CatalogEntry[];
   catalogIdentity: ProgramCatalogIdentity | null;
   environment: NodeEnvironmentResponse | null;
@@ -58,6 +61,7 @@ function authoringAvailable(
 
 export function ProgramNodePalette({
   roots,
+  program,
   catalogEntries,
   catalogIdentity,
   environment,
@@ -178,6 +182,9 @@ export function ProgramNodePalette({
           placeholder="Find a node"
         />
       </label>
+      {program && (
+        <ProgramAuthoringTemplate program={program} busy={busy} onMutate={onMutate} />
+      )}
       <div className="program-palette-list">
         {grouped.map(([category, entries]) => {
           const collapsed = collapsedCategories.has(category);

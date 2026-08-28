@@ -15,6 +15,7 @@ import type {
   ProgramWorkspaceResponse,
 } from '../types/api';
 import { ProgramDeclarationsEditor } from './ProgramDeclarationsEditor';
+import { ProgramContactPolicyEditor } from './ProgramContactPolicyEditor';
 import { ProgramDocumentControls } from './ProgramDocumentControls';
 import { ProgramNodePalette } from './ProgramNodePalette';
 import {
@@ -279,6 +280,71 @@ describe('Program authoring panels', () => {
     expect(markup).toContain('Authoring only · execution gate N7');
     expect(markup).toContain('draggable="true"');
     expect(markup).not.toContain('Authoring is currently unavailable');
+  });
+
+  it('exposes templates and contact policy authoring as Draft-only surfaces', () => {
+    const program: ProgramAuthoringDocument = {
+      ...authoringProgram([tree], [], [{
+        key: 'selected_object',
+        type: 'scene_resource',
+        access: 'read_write',
+        persistence: 'run',
+      }]),
+      scene: [{
+        scene_resource_id: 'part',
+        shape: { type: 'box', box_dimensions_m: [0.1, 0.1, 0.1] },
+        pose: {
+          frame_ref: { kind: 'cell_frame' },
+          position_m: [0, 0, 0],
+          orientation: { xyzw: [0, 0, 0, 1] },
+        },
+      }],
+      target_roles: {
+        arm: {
+          component_role: 'robot',
+          required_capabilities: [{
+            capability_id: 'planning.motion.pose_goal',
+            parameters: {},
+            disposition: 'required',
+          }],
+          required_frame_roles: ['base', 'tcp'],
+          required_collision_body_roles: ['arm_collision'],
+        },
+        gripper: {
+          component_role: 'tool',
+          required_capabilities: [{
+            capability_id: 'tool.gripper.command',
+            parameters: {},
+            disposition: 'required',
+          }],
+          required_frame_roles: ['tcp'],
+          required_collision_body_roles: ['gripper_collision'],
+        },
+      },
+      contact_policies: [],
+    };
+    const markup = renderToStaticMarkup(<div>
+      <ProgramNodePalette
+        roots={[tree]}
+        program={program}
+        catalogEntries={[sequence, timer]}
+        catalogIdentity={null}
+        environment={environment}
+        busy={false}
+        onMutate={vi.fn()}
+      />
+      <ProgramContactPolicyEditor
+        program={program}
+        draftRevision={1}
+        busy={false}
+        mutate={vi.fn() as ProgramWorkspaceController['mutate']}
+      />
+    </div>);
+
+    expect(markup).toContain('Pick plan subtree');
+    expect(markup).toContain('Contact policies');
+    expect(markup).toContain('Object support contacts');
+    expect(markup).toContain('Runtime object key');
   });
 
   it('renders one deterministic selected tree and exact v1 value source', () => {

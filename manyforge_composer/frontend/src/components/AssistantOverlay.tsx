@@ -6,6 +6,7 @@ import type {
   AssistantModeIndex,
   AssistantProviderStatus,
 } from '../types/assistant';
+import type { JsonValue } from '../types/api';
 import {
   reconcileAssistantRequest,
   shouldReconcileAssistantRequest,
@@ -23,8 +24,14 @@ const MAXIMUM_TRANSCRIPT_ITEMS = 200;
 const MAXIMUM_PRESENTED_TOOL_RESULTS = 128;
 
 interface TranscriptResponse {
+  requestId: string;
   draftMutated: boolean;
-  proposals: Array<{ toolId: string; effect: string }>;
+  proposals: Array<{
+    toolId: string;
+    effect: string;
+    arguments: Record<string, JsonValue>;
+    decision: 'pending' | 'materializing' | 'materialized' | 'rejected' | 'failed';
+  }>;
   toolCalls: Array<{
     toolId: string;
     status: string;
@@ -108,10 +115,16 @@ function presentationResponse(
   const response = status.response;
   if (!response) return undefined;
   return {
+    requestId: status.requestId,
     draftMutated: response.draftMutated,
     proposals: response.proposals
       .slice(0, MAXIMUM_PRESENTED_TOOL_RESULTS)
-      .map((proposal) => ({ toolId: proposal.toolId, effect: proposal.effect })),
+      .map((proposal) => ({
+        toolId: proposal.toolId,
+        effect: proposal.effect,
+        arguments: proposal.arguments,
+        decision: 'pending',
+      })),
     toolCalls: response.toolCalls
       .slice(0, MAXIMUM_PRESENTED_TOOL_RESULTS)
       .map((call) => ({
@@ -350,6 +363,52 @@ export function AssistantOverlay({
     setOrientationFields([...next].sort());
   };
 
+  const setProposalDecision = useCallback((
+    transcriptId: string,
+    proposalIndex: number,
+    decision: TranscriptResponse['proposals'][number]['decision'],
+  ) => {
+    setTranscript((items) => items.map((item) => {
+      if (item.id !== transcriptId || item.response === undefined) return item;
+      return {
+        ...item,
+        response: {
+          ...item.response,
+          proposals: item.response.proposals.map((proposal, index) => (
+            index === proposalIndex ? { ...proposal, decision } : proposal
+          )),
+        },
+      };
+    }));
+  }, []);
+
+  const materializeProposal = useCallback(async (
+    transcriptId: string,
+    requestId: string,
+    proposalIndex: number,
+  ) => {
+    if (!programController.mutationAvailable) {
+      setNotice(
+        programController.mutationUnavailableReason
+          ?? 'Program authoring is unavailable.',
+      );
+      return;
+    }
+    setProposalDecision(transcriptId, proposalIndex, 'materializing');
+    const result = await programController.mutate(
+      'assistant_draft_materialize_proposal',
+      { request_id: requestId, proposal_index: proposalIndex },
+    );
+    setProposalDecision(
+      transcriptId,
+      proposalIndex,
+      result === null ? 'failed' : 'materialized',
+    );
+    setNotice(result === null
+      ? 'The proposal was not materialized; review the Program authoring error.'
+      : 'Proposal materialized as one atomic Draft change; Saved and Applied are unchanged.');
+  }, [programController, setProposalDecision]);
+
   return (
     <section className="panel assistant-panel" aria-labelledby="assistant-heading">
       <header className="panel-header assistant-header">
@@ -440,11 +499,41 @@ export function AssistantOverlay({
                 )}
                 {item.response && item.response.proposals.length > 0 && (
                   <details>
-                    <summary>{item.response.proposals.length} reviewable proposal(s); none were applied</summary>
-                    <ul>
+                    <summary>{item.response.proposals.length} reviewable Draft proposal(s)</summary>
+                    <ul className="assistant-proposals">
                       {item.response.proposals.map((proposal, index) => (
                         <li key={`${proposal.toolId}.${index}`}>
-                          <code>{proposal.toolId}</code> — {proposal.effect}
+                          <div><code>{proposal.toolId}</code> — {proposal.effect}</div>
+                          <details>
+                            <summary>Review proposed Draft input</summary>
+                            <pre>{JSON.stringify(proposal.arguments, null, 2)}</pre>
+                          </details>
+                          <div className="assistant-proposal-actions">
+                            <button
+                              type="button"
+                              disabled={
+                                proposal.decision !== 'pending'
+                                || !programController.mutationAvailable
+                              }
+                              title={programController.mutationAvailable
+                                ? 'Materialize this proposal into the current Draft.'
+                                : programController.mutationUnavailableReason ?? undefined}
+                              onClick={() => void materializeProposal(
+                                item.id,
+                                item.response?.requestId ?? '',
+                                index,
+                              )}
+                            >Materialize</button>
+                            <button
+                              type="button"
+                              className="quiet-button"
+                              disabled={proposal.decision !== 'pending'}
+                              onClick={() => setProposalDecision(item.id, index, 'rejected')}
+                            >Reject</button>
+                            {proposal.decision !== 'pending' && (
+                              <span>{proposal.decision}</span>
+                            )}
+                          </div>
                         </li>
                       ))}
                     </ul>

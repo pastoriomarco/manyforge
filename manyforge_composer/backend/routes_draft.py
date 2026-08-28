@@ -6,12 +6,15 @@ from copy import deepcopy
 from dataclasses import dataclass
 from contextvars import ContextVar
 from functools import wraps
+import hashlib
+import math
 from pathlib import Path
 from typing import Any, NoReturn
 
 from fastapi import APIRouter, HTTPException
 from fastapi.responses import JSONResponse
 from manyforge_behavior.canonical_artifact import (
+    canonical_json_bytes,
     StrictArtifactError,
     verify_content_identity,
 )
@@ -34,6 +37,7 @@ from .node_environment_client import (
     ActiveNodeEnvironmentProjectionError,
     read_active_node_environment,
 )
+from .source_model_client import ActiveSourceModelProjectionError
 from .program_artifacts import (
     ProgramArtifactError,
     load_program_artifact,
@@ -44,6 +48,15 @@ from .state import ComposerState
 from .authoring_admission import (
     AuthoringMutationEnvelope,
     headless_client_http_exception,
+)
+from .assistant_mode_client import (
+    ActiveAssistantModeProjectionError,
+    read_active_assistant_context,
+)
+from .assistant_provider_client import AssistantProviderClientError
+from .assistant_schema_validation import (
+    CallbackSchemaValidationError,
+    validate_callback_arguments,
 )
 
 
@@ -69,6 +82,13 @@ _AUTHORING_MUTATIONS = frozenset(
         "tree_draft_update_node_params",
         "tree_draft_wrap_node",
         *OPERATOR_DRAFT_MUTATIONS,
+    }
+)
+_SOURCE_RESOLVED_MUTATIONS = frozenset(
+    {
+        "assistant_draft_materialize_proposal",
+        "program_draft_store_observed_move",
+        "program_draft_store_observed_scene_resource",
     }
 )
 _DTO_CONFIG = ConfigDict(populate_by_name=True, extra="forbid", allow_inf_nan=False)
@@ -320,6 +340,563 @@ def _program_write_roots(state: ComposerState) -> list[str]:
     return state.allowed_fs_roots
 
 
+def _draft_node(document: dict[str, Any], instance_id: str) -> dict[str, Any]:
+    pending = list(document.get("forest", []))
+    while pending:
+        node = pending.pop()
+        if node.get("instance_id") == instance_id:
+            return node
+        children = node.get("children")
+        if isinstance(children, list):
+            pending.extend(children)
+    raise DraftSessionError(
+        "draft_node_not_found",
+        f"Draft node does not exist: {instance_id}",
+        status_code=404,
+    )
+
+
+def _draft_instance_ids(document: dict[str, Any]) -> set[str]:
+    identifiers: set[str] = set()
+    pending = list(document.get("forest", []))
+    while pending:
+        node = pending.pop()
+        identity = node.get("instance_id")
+        if isinstance(identity, str):
+            identifiers.add(identity)
+        children = node.get("children")
+        if isinstance(children, list):
+            pending.extend(children)
+    return identifiers
+
+
+def _observed_move_arguments(
+    state: ComposerState,
+    arguments: dict[str, Any],
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    if set(arguments) != {"instance_id", "observed_kind"}:
+        raise DraftSessionError(
+            "draft_arguments_invalid",
+            "Save observed move requires exactly instance_id and observed_kind",
+        )
+    instance_id = arguments["instance_id"]
+    observed_kind = arguments["observed_kind"]
+    if type(instance_id) is not str or observed_kind not in {"joint", "tcp_pose"}:
+        raise DraftSessionError(
+            "draft_arguments_invalid", "Save observed move arguments are invalid"
+        )
+    if state.headless_client is None:
+        raise DraftSessionError(
+            "observed_move_unavailable",
+            "Save observed move requires the current execution owner",
+            status_code=503,
+        )
+    try:
+        projection = state.headless_client.execution_status()
+    except HeadlessClientError as error:
+        raise headless_client_http_exception(error) from error
+    status = projection.get("status")
+    direct = status.get("direct_control") if isinstance(status, dict) else None
+    observed = direct.get("observed_state") if isinstance(direct, dict) else None
+    if (
+        not isinstance(direct, dict)
+        or not isinstance(observed, dict)
+        or observed.get("complete") is not True
+        or type(observed.get("source_epoch")) is not str
+        or type(observed.get("sequence")) is not int
+        or type(direct.get("target_role_id")) is not str
+        or type(direct.get("controllable_component_id")) is not str
+        or type(direct.get("command_target_id")) is not str
+    ):
+        raise DraftSessionError(
+            "observed_move_unavailable",
+            "execution owner has no complete current observed target",
+            status_code=409,
+        )
+    authoring = state.draft_session.snapshot().get("authoring")
+    if not isinstance(authoring, dict):
+        raise DraftSessionError(
+            "composer_draft_unavailable", "Composer has no Program Draft", status_code=404
+        )
+    node = _draft_node(authoring, instance_id)
+    expected_node_id = (
+        "motion.move_to_joint_target" if observed_kind == "joint" else "motion.move_to_pose"
+    )
+    if (
+        node.get("node_id") != expected_node_id
+        or node.get("parameters", {}).get("target_role") != direct["target_role_id"]
+    ):
+        raise DraftSessionError(
+            "observed_move_target_mismatch",
+            "selected move does not address the current observed target role",
+            status_code=409,
+        )
+    resolved_observation = (
+        {
+            "source_joint_names": deepcopy(observed.get("source_joint_names")),
+            "positions_rad": deepcopy(observed.get("positions_rad")),
+        }
+        if observed_kind == "joint"
+        else {"current_tcp_pose": deepcopy(observed.get("current_tcp_pose"))}
+    )
+    if observed_kind == "joint":
+        names = resolved_observation["source_joint_names"]
+        positions = resolved_observation["positions_rad"]
+        if (
+            type(names) is not list
+            or not names
+            or any(type(name) is not str or not name for name in names)
+            or len(names) != len(set(names))
+            or type(positions) is not list
+            or len(positions) != len(names)
+            or any(
+                type(position) not in {int, float}
+                or not math.isfinite(float(position))
+                for position in positions
+            )
+        ):
+            raise DraftSessionError(
+                "observed_move_unavailable",
+                "execution owner returned an invalid observed joint target",
+                status_code=502,
+            )
+    else:
+        pose = resolved_observation["current_tcp_pose"]
+        position = pose.get("position_m") if isinstance(pose, dict) else None
+        orientation = pose.get("orientation") if isinstance(pose, dict) else None
+        values = (
+            [position.get(field) for field in ("x_m", "y_m", "z_m")]
+            + [orientation.get(field) for field in ("x", "y", "z", "w")]
+            if isinstance(position, dict) and isinstance(orientation, dict)
+            else []
+        )
+        if (
+            len(values) != 7
+            or any(
+                type(value) not in {int, float}
+                or not math.isfinite(float(value))
+                for value in values
+            )
+            or math.hypot(*[float(value) for value in values[3:]]) <= 1e-12
+        ):
+            raise DraftSessionError(
+                "observed_move_unavailable",
+                "execution owner returned an invalid observed TCP target",
+                status_code=502,
+            )
+    source_identity = {
+        "source_epoch": observed["source_epoch"],
+        "sequence": observed["sequence"],
+        "target_role_id": direct["target_role_id"],
+        "controllable_component_id": direct["controllable_component_id"],
+        "command_target_id": direct["command_target_id"],
+    }
+    return (
+        {
+            "instance_id": instance_id,
+            "expected_node_id": expected_node_id,
+            "observed_kind": observed_kind,
+            "observed": resolved_observation,
+        },
+        source_identity,
+    )
+
+
+def _program_shape(shape: dict[str, Any]) -> dict[str, Any]:
+    def positive(value: Any) -> float:
+        if (
+            type(value) not in {int, float}
+            or not math.isfinite(float(value))
+            or float(value) <= 0.0
+        ):
+            raise DraftSessionError(
+                "observed_scene_shape_unsupported",
+                "observed object shape is not finite and positive",
+                status_code=409,
+            )
+        return float(value)
+
+    kind = shape.get("type")
+    if kind == "box" and isinstance(shape.get("dimensions_m"), dict):
+        dimensions = shape["dimensions_m"]
+        return {
+            "type": "box",
+            "box_dimensions_m": [
+                positive(dimensions.get(axis)) for axis in ("x", "y", "z")
+            ],
+        }
+    if kind == "sphere":
+        return {"type": "sphere", "sphere_radius_m": positive(shape.get("radius_m"))}
+    if kind == "cylinder":
+        return {
+            "type": "cylinder",
+            "cylinder_radius_m": positive(shape.get("radius_m")),
+            "cylinder_height_m": positive(shape.get("height_m")),
+        }
+    if kind == "mesh" and isinstance(shape.get("scale"), dict):
+        scale = shape["scale"]
+        resource_uri = shape.get("resource_uri")
+        if type(resource_uri) is not str or not resource_uri:
+            raise DraftSessionError(
+                "observed_scene_shape_unsupported",
+                "observed mesh has no portable resource URI",
+                status_code=409,
+            )
+        return {
+            "type": "mesh",
+            "mesh_resource_uri": resource_uri,
+            "mesh_scale": [positive(scale.get(axis)) for axis in ("x", "y", "z")],
+        }
+    raise DraftSessionError(
+        "observed_scene_shape_unsupported",
+        "observed object has no single supported portable collision shape",
+        status_code=409,
+    )
+
+
+def _observed_scene_arguments(
+    state: ComposerState,
+    arguments: dict[str, Any],
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    if set(arguments) != {"scene_resource_id"} or type(arguments["scene_resource_id"]) is not str:
+        raise DraftSessionError(
+            "draft_arguments_invalid",
+            "Save observed object requires exactly one scene_resource_id",
+        )
+    if state.headless_client is None:
+        raise DraftSessionError(
+            "observed_scene_unavailable",
+            "Save observed object requires the current logical-scene owner",
+            status_code=503,
+        )
+    try:
+        projection = state.headless_client.scene()
+    except HeadlessClientError as error:
+        raise headless_client_http_exception(error) from error
+    logical = projection.get("logical_scene")
+    access = logical.get("access") if isinstance(logical, dict) else None
+    snapshot = logical.get("snapshot") if isinstance(logical, dict) else None
+    active = access.get("active_projection") if isinstance(access, dict) else None
+    objects = snapshot.get("objects") if isinstance(snapshot, dict) else None
+    object_row = next(
+        (
+            row
+            for row in objects
+            if isinstance(row, dict)
+            and row.get("scene_resource_id") == arguments["scene_resource_id"]
+        ),
+        None,
+    ) if isinstance(objects, list) else None
+    placement = object_row.get("placement") if isinstance(object_row, dict) else None
+    shapes = object_row.get("collision_shapes") if isinstance(object_row, dict) else None
+    pose = placement.get("pose_in_cell") if isinstance(placement, dict) else None
+    if (
+        not isinstance(active, dict)
+        or not isinstance(snapshot, dict)
+        or not isinstance(object_row, dict)
+        or not isinstance(placement, dict)
+        or placement.get("kind") != "cell_fixed"
+        or not isinstance(pose, dict)
+        or not isinstance(shapes, list)
+        or len(shapes) != 1
+        or not isinstance(shapes[0], dict)
+    ):
+        raise DraftSessionError(
+            "observed_scene_object_ineligible",
+            "only one current cell-fixed object with one portable shape can be saved",
+            status_code=409,
+        )
+    position = pose.get("position_m")
+    orientation = pose.get("orientation_xyzw")
+    pose_values = (
+        [position.get(axis) for axis in ("x", "y", "z")] + orientation
+        if isinstance(position, dict)
+        and isinstance(orientation, list)
+        and len(orientation) == 4
+        else []
+    )
+    if (
+        len(pose_values) != 7
+        or any(
+            type(value) not in {int, float}
+            or not math.isfinite(float(value))
+            for value in pose_values
+        )
+        or math.hypot(*[float(value) for value in pose_values[3:]]) <= 1e-12
+    ):
+        raise DraftSessionError(
+            "observed_scene_object_ineligible",
+            "observed object pose is incomplete",
+            status_code=409,
+        )
+    resource = {
+        "scene_resource_id": arguments["scene_resource_id"],
+        "shape": _program_shape(shapes[0]),
+        "pose": {
+            "frame_ref": {"kind": "cell_frame"},
+            "position_m": [float(position[axis]) for axis in ("x", "y", "z")],
+            "orientation": {"xyzw": [float(value) for value in orientation]},
+        },
+    }
+    authoring = state.draft_session.snapshot().get("authoring")
+    scene = authoring.get("scene") if isinstance(authoring, dict) else None
+    existing = next(
+        (
+            row
+            for row in scene
+            if isinstance(row, dict)
+            and row.get("scene_resource_id") == arguments["scene_resource_id"]
+        ),
+        None,
+    ) if isinstance(scene, list) else None
+    if isinstance(existing, dict):
+        for field in ("resource_roles", "metadata", "collision_policy_ids"):
+            if field in existing:
+                resource[field] = deepcopy(existing[field])
+    source_identity = {
+        "active_projection": deepcopy(active),
+        "transaction_sequence": snapshot.get("transaction_sequence"),
+        "scene_resource_id": arguments["scene_resource_id"],
+    }
+    return {"scene_resource": resource}, source_identity
+
+
+def _assistant_proposal_operations(
+    state: ComposerState,
+    arguments: dict[str, Any],
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    if set(arguments) != {"request_id", "proposal_index"}:
+        raise DraftSessionError(
+            "draft_arguments_invalid",
+            "proposal materialization requires request_id and proposal_index",
+        )
+    request_id = arguments["request_id"]
+    proposal_index = arguments["proposal_index"]
+    if type(request_id) is not str or type(proposal_index) is not int or proposal_index < 0:
+        raise DraftSessionError("draft_arguments_invalid", "proposal selection is invalid")
+    if state.assistant_client is None:
+        raise DraftSessionError(
+            "assistant_proposal_unavailable",
+            "assistant provider is unavailable",
+            status_code=503,
+        )
+    try:
+        status = state.assistant_client.status(request_id)
+    except AssistantProviderClientError as error:
+        raise DraftSessionError(
+            error.code, str(error), status_code=error.status_code
+        ) from error
+    response = status.get("response") if status.get("state") == "completed" else None
+    proposals = response.get("proposals") if isinstance(response, dict) else None
+    if not isinstance(proposals, list) or proposal_index >= len(proposals):
+        raise DraftSessionError(
+            "assistant_proposal_not_found",
+            "assistant proposal no longer exists",
+            status_code=404,
+        )
+    proposal = proposals[proposal_index]
+    if (
+        response.get("assistantMode") != "composer-assistant"
+        or not isinstance(proposal, dict)
+        or proposal.get("effect") != "proposal"
+        or proposal.get("status") != "draft"
+        or proposal.get("requiresReview") is not True
+    ):
+        raise DraftSessionError(
+            "assistant_proposal_rejected",
+            "assistant response is not a reviewable Composer Draft proposal",
+            status_code=409,
+        )
+    try:
+        context = read_active_assistant_context(state, mode="composer-assistant")
+    except (
+        ActiveAssistantModeProjectionError,
+        ActiveNodeEnvironmentProjectionError,
+        ActiveSourceModelProjectionError,
+    ) as error:
+        raise DraftSessionError(error.code, str(error), status_code=error.status_code) from error
+    tool = next(
+        (
+            row
+            for row in context.assistant_mode.payload.get("tools", [])
+            if row.get("tool_id") == proposal.get("toolId")
+        ),
+        None,
+    )
+    if (
+        not isinstance(tool, dict)
+        or tool.get("effect") != "proposal"
+        or response.get("catalogHash")
+        != context.assistant_mode.payload.get("catalog_hash")
+        or tool.get("input_schema_hash") != proposal.get("inputSchemaHash")
+    ):
+        raise DraftSessionError(
+            "assistant_proposal_stale",
+            "assistant proposal schema is no longer current",
+            status_code=409,
+        )
+    try:
+        validate_callback_arguments(proposal.get("arguments"), tool["input_schema"])
+    except CallbackSchemaValidationError as error:
+        raise DraftSessionError(
+            "assistant_proposal_invalid", str(error), status_code=400
+        ) from error
+    proposal_arguments = proposal["arguments"]
+    tool_id = proposal["toolId"]
+    proposal_suffix = hashlib.sha256(
+        canonical_json_bytes(
+            {
+                "request_id": request_id,
+                "proposal_index": proposal_index,
+                "tool_id": tool_id,
+                "arguments": proposal_arguments,
+            }
+        )
+    ).hexdigest()[:12]
+    resources: list[dict[str, Any]] = []
+    if tool_id == "propose_scene_objects":
+        report = proposal_arguments["inspection_report"]
+        source_roots = set(proposal_arguments.get("source_roots", []))
+        prefix = proposal_arguments.get("scene_resource_id_prefix", "")
+        mesh_overrides = {
+            row["source_root"]: row["mesh_resource_uri"]
+            for row in proposal_arguments.get("mesh_resource_overrides", [])
+        }
+        for row in report["objects"]:
+            if (
+                not isinstance(row, dict)
+                or not isinstance(row.get("scene_resource"), dict)
+                or (
+                    source_roots
+                    and row.get("source_root") not in source_roots
+                )
+            ):
+                continue
+            resource = deepcopy(row["scene_resource"])
+            resource["scene_resource_id"] = (
+                f"{prefix}{resource['scene_resource_id']}"
+            )
+            replacement = mesh_overrides.get(row.get("source_root"))
+            if (
+                replacement is not None
+                and resource.get("shape", {}).get("type") == "mesh"
+            ):
+                resource["shape"]["mesh_resource_uri"] = replacement
+            resources.append(resource)
+        maximum = proposal_arguments.get("max_proposals", len(resources))
+        resources = resources[:maximum]
+        operations = [
+            {
+                "mutation": "scene_draft_upsert_objects",
+                "arguments": {"scene_resources": resources},
+            }
+        ]
+    elif tool_id == "propose_scene_object_nodes":
+        resources = deepcopy(proposal_arguments["scene_resources"])
+        operations = [
+            {
+                "mutation": "scene_draft_upsert_objects",
+                "arguments": {"scene_resources": resources},
+            }
+        ]
+        authoring = state.draft_session.snapshot().get("authoring")
+        used = _draft_instance_ids(authoring) if isinstance(authoring, dict) else set()
+        operation_to_node = {
+            "scene.add_object": "scene.add_object",
+            "scene.upsert_object": "scene.upsert_object",
+            "scene.remove_object": "scene.remove_object",
+            "scene.attach_carried_object": "scene.attach_carried_object",
+            "scene.detach_carried_object": "scene.detach_carried_object",
+        }
+        for resource in resources:
+            resource_id = resource["scene_resource_id"]
+            resource_token = (
+                f"{resource_id[:48]}."
+                f"{hashlib.sha256(resource_id.encode('utf-8')).hexdigest()[:8]}"
+            )
+            for operation_id in proposal_arguments["operations"]:
+                node_id = operation_to_node[operation_id]
+                parameters: dict[str, Any] = {"scene_resource_id": resource_id}
+                if operation_id in {"scene.add_object", "scene.upsert_object"}:
+                    parameters.update(
+                        {"shape": deepcopy(resource["shape"]), "pose": deepcopy(resource["pose"])}
+                    )
+                elif operation_id == "scene.attach_carried_object":
+                    parameters.update(
+                        {
+                            "target_role": proposal_arguments["target_role"],
+                            "carrier_frame_role": proposal_arguments["carrier_frame_role"],
+                            "touch_body_roles": deepcopy(proposal_arguments["touch_body_roles"]),
+                        }
+                    )
+                elif operation_id == "scene.detach_carried_object":
+                    parameters["target_role"] = proposal_arguments["target_role"]
+                instance_id = (
+                    f"assistant.{operation_id.removeprefix('scene.')}."
+                    f"{resource_token}.{proposal_suffix}"
+                )
+                if instance_id in used:
+                    raise DraftSessionError(
+                        "assistant_proposal_already_materialized",
+                        "assistant proposal is already present in this Draft",
+                        status_code=409,
+                    )
+                used.add(instance_id)
+                operations.append(
+                    {
+                        "mutation": "tree_draft_insert_node",
+                        "arguments": {
+                            "node": {
+                                "node_id": node_id,
+                                "instance_id": instance_id,
+                                "parameters": parameters,
+                                "children": [],
+                            }
+                        },
+                    }
+                )
+    else:
+        raise DraftSessionError(
+            "assistant_proposal_unsupported",
+            f"assistant Draft proposal is unsupported: {tool_id}",
+            status_code=409,
+        )
+    if not operations or not resources:
+        raise DraftSessionError(
+            "assistant_proposal_empty",
+            "assistant proposal contains no materializable Draft resources",
+            status_code=409,
+        )
+    source_identity = {
+        "request_id": request_id,
+        "proposal_index": proposal_index,
+        "assistant_mode": response["assistantMode"],
+        "catalog_hash": response["catalogHash"],
+        "tool_id": tool_id,
+        "input_schema_hash": proposal["inputSchemaHash"],
+        "arguments_digest": "sha256:"
+        + hashlib.sha256(canonical_json_bytes(proposal_arguments)).hexdigest(),
+    }
+    return {
+        "proposal_tool_id": tool_id,
+        "operations": operations,
+    }, source_identity
+
+
+def _source_resolved_mutation(
+    state: ComposerState,
+    mutation: str,
+    arguments: dict[str, Any],
+) -> tuple[dict[str, Any], dict[str, Any]] | None:
+    if mutation == "program_draft_store_observed_move":
+        return _observed_move_arguments(state, arguments)
+    if mutation == "program_draft_store_observed_scene_resource":
+        return _observed_scene_arguments(state, arguments)
+    if mutation == "assistant_draft_materialize_proposal":
+        return _assistant_proposal_operations(state, arguments)
+    return None
+
+
 def _require_apply_ready(program: Program) -> None:
     applicability = draft_applicability(program.to_dict())
     if not applicability["applyReady"]:
@@ -443,13 +1020,14 @@ def create_draft_router(state: ComposerState) -> APIRouter:
                         ),
                     },
                 )
-            state.draft_session.preview_mutation(
-                tool_id=body.mutation,
-                arguments=body.arguments,
-                expected_revision=body.expected_draft_revision,
-                catalog=state.node_catalog,
-                draft_id=body.draft_id,
-            )
+            if body.mutation not in _SOURCE_RESOLVED_MUTATIONS:
+                state.draft_session.preview_mutation(
+                    tool_id=body.mutation,
+                    arguments=body.arguments,
+                    expected_revision=body.expected_draft_revision,
+                    catalog=state.node_catalog,
+                    draft_id=body.draft_id,
+                )
         elif operation_kind == "materialize_runtime_override":
             assert isinstance(body, RuntimeOverrideMaterializationRequest)
             if state.headless_client is None:
@@ -725,6 +1303,35 @@ def create_draft_router(state: ComposerState) -> APIRouter:
                 _ACTIVE_AUTHORING_EFFECT.reset(effect_token)
                 _ACTIVE_AUTHORING_CLAIM.reset(claim_token)
 
+        def validate_source_under_claim(
+            _claim: dict[str, Any],
+        ) -> dict[str, Any] | None:
+            if (
+                not isinstance(body, DraftMutationRequest)
+                or body.mutation not in _SOURCE_RESOLVED_MUTATIONS
+            ):
+                return None
+            try:
+                resolved = _source_resolved_mutation(
+                    state, body.mutation, body.arguments
+                )
+                if resolved is None:
+                    raise RuntimeError("source-resolved mutation has no resolver")
+                mutation_arguments, source_identity = resolved
+                state.draft_session.preview_mutation(
+                    tool_id=body.mutation,
+                    arguments=mutation_arguments,
+                    expected_revision=body.expected_draft_revision,
+                    catalog=state.node_catalog,
+                    draft_id=body.draft_id,
+                )
+            except DraftSessionError as error:
+                _raise_workspace_error(error)
+            prepared["resolved_mutation_arguments"] = deepcopy(
+                mutation_arguments
+            )
+            return {"source_identity": deepcopy(source_identity)}
+
         try:
             return coordinator.execute(
                 body.admission_envelope(),
@@ -735,6 +1342,7 @@ def create_draft_router(state: ComposerState) -> APIRouter:
                 effect=execute_effect,
                 post_image=state.draft_session.retained_state,
                 prepare_effect=prepare,
+                validate_under_claim=validate_source_under_claim,
                 after_release=(
                     lambda: state.prepare_current_applied_scene(
                         request_owner_epoch=body.request_owner_epoch,
@@ -791,9 +1399,12 @@ def create_draft_router(state: ComposerState) -> APIRouter:
                 },
             )
         try:
+            prepared = active_authoring_effect()
             result = state.draft_session.mutate(
                 tool_id=body.mutation,
-                arguments=body.arguments,
+                arguments=deepcopy(
+                    prepared.get("resolved_mutation_arguments", body.arguments)
+                ),
                 expected_revision=body.expected_draft_revision,
                 # Draft validation uses the immutable build-qualified catalog.
                 # Owner truth is rechecked only at consequential Save/Apply

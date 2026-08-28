@@ -29,9 +29,9 @@ function selectedOrientation(
 }
 
 /**
- * Compute a local Cartesian authoring draft from a resolved entity pose. I6
- * still owns entity/target resolution and command-schema binding; mixed joint
- * targets are deliberately excluded until their unit-tagged contract lands.
+ * Compute a local Cartesian target from one already-resolved portable pose.
+ * Addressed target and command-schema selection remain backend-owned; stored
+ * joint targets bypass this pose-only calculation and retain their exact units.
  */
 export function computeCartesianMoveDraft(
   entityPose: PoseTuple,

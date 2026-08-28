@@ -20,6 +20,9 @@ from manyforge_composer.backend.draft_session import (
 
 _REPOSITORY_ROOT = Path(__file__).resolve().parents[2]
 _PROGRAM_PATH = _REPOSITORY_ROOT / "examples" / "pick_and_place_minimal.program.yaml"
+_PICK_PROGRAM_PATH = (
+    _REPOSITORY_ROOT / "examples" / "trocar_lite6_foundationpose_pick.program.yaml"
+)
 
 
 def _program(*, metadata: dict | None = None) -> Program:
@@ -51,6 +54,10 @@ def _program_with_instance_id(instance_id: str) -> Program:
     return Program.from_dict(document, catalog)
 
 
+def _pick_program() -> Program:
+    return Program(_PICK_PROGRAM_PATH, build_node_environment().catalog)
+
+
 def _box_resource(identity: str) -> dict:
     return {
         "scene_resource_id": identity,
@@ -70,6 +77,24 @@ def _mutate(session: ComposerDraftSession, tool_id: str, arguments: dict):
         expected_revision=session.revision,
         catalog=build_node_environment().catalog,
     )
+
+
+def _pick_macro_arguments() -> dict:
+    return {
+        "macro_id": "pick_plan_subtree",
+        "scene_resource_id": "graspable",
+        "target_role": "arm",
+        "tool_target_role": "gripper",
+        "base_frame_role": "base",
+        "tcp_frame_role": "tcp",
+        "carrier_frame_role": "tcp",
+        "touch_body_roles": ["gripper_collision"],
+        "tool_position": {"kind": "linear_m", "value_m": 0.0},
+        "contact_policy_id": "selected_object_grasp",
+        "blackboard_namespace_id": "planning",
+        "blackboard_key": "planning.pick_plan",
+        "instance_prefix": "authored_pick",
+    }
 
 
 def _node_policy_arguments(
@@ -93,6 +118,306 @@ def _node_policy_arguments(
         },
         "operator_stop_policy": "hold",
     }
+
+
+def test_contact_policy_upsert_mints_identity_and_remove_is_atomic() -> None:
+    session = ComposerDraftSession(_pick_program())
+    policy = deepcopy(session.snapshot()["authoring"]["contact_policies"][0])
+    previous_version = policy.pop("version")
+    policy["zones"][0]["max_penetration_m"] = 0.003
+
+    result = _mutate(
+        session,
+        "program_draft_upsert_contact_policies",
+        {"contact_policies": [policy]},
+    )
+
+    stored = session.snapshot()["authoring"]["contact_policies"][0]
+    assert result.details == {
+        "inserted": [],
+        "updated": ["selected_object_grasp"],
+    }
+    assert stored["version"] != previous_version
+    assert stored["version"] == compute_content_identity(
+        stored,
+        own_field="version",
+        identity_domain="catalog-record-revision/contact_policy",
+        api_version="manyforge.contact_policy.v1",
+    )
+
+    removed = _mutate(
+        session,
+        "program_draft_remove_contact_policies",
+        {"contact_policy_ids": ["selected_object_grasp"]},
+    )
+    assert removed.details == {"removed": ["selected_object_grasp"]}
+    assert session.snapshot()["authoring"]["contact_policies"] == []
+
+
+def test_pick_authoring_macro_expands_visible_nodes_and_declarations_once() -> None:
+    session = ComposerDraftSession(_pick_program())
+    before_revision = session.revision
+
+    result = _mutate(
+        session,
+        "program_draft_expand_authoring_macro",
+        _pick_macro_arguments(),
+    )
+
+    snapshot = session.snapshot()
+    forest = snapshot["authoring"]["forest"]
+    inserted = next(
+        node for node in forest if node["instance_id"] == "authored_pick"
+    )
+    assert session.revision == before_revision + 1
+    assert result.details["macro_id"] == "pick_plan_subtree"
+    assert result.details["inserted_instance_ids"] == [
+        "authored_pick",
+        "authored_pick.plan",
+        "authored_pick.approach",
+        "authored_pick.descend",
+        "authored_pick.close",
+        "authored_pick.attach",
+        "authored_pick.retreat",
+    ]
+    assert [child["node_id"] for child in inserted["children"]] == [
+        "planning.plan_pick_sequence",
+        "motion.move_to_pose",
+        "motion.move_to_pose",
+        "gripper.command_position",
+        "scene.attach_carried_object",
+        "motion.move_to_pose",
+    ]
+    assert all(child["children"] == [] for child in inserted["children"])
+    assert inserted["children"][0]["parameters"]["target_role"] == "arm"
+    assert inserted["children"][4]["parameters"]["target_role"] == "gripper"
+    declaration = next(
+        row
+        for row in snapshot["authoring"]["blackboard"]["keys"]
+        if row["key"] == "planning.pick_plan"
+    )
+    assert declaration["type"] == "pick_planning_result"
+
+
+def test_pick_authoring_macro_failure_leaves_draft_unchanged() -> None:
+    session = ComposerDraftSession(_pick_program())
+    arguments = _pick_macro_arguments()
+    arguments["scene_resource_id"] = "missing"
+    before = session.retained_state()
+
+    with pytest.raises(DraftSessionError):
+        _mutate(session, "program_draft_expand_authoring_macro", arguments)
+
+    assert session.retained_state() == before
+
+
+@pytest.mark.parametrize(
+    ("node_id", "observed_kind", "observed", "expected_parameter"),
+    [
+        (
+            "motion.move_to_joint_target",
+            "joint",
+            {
+                "source_joint_names": ["joint1", "joint2"],
+                "positions_rad": [0.25, -0.5],
+            },
+            {
+                "goal": [
+                    {"joint_name": "joint1", "position_rad": 0.25},
+                    {"joint_name": "joint2", "position_rad": -0.5},
+                ]
+            },
+        ),
+        (
+            "motion.move_to_pose",
+            "tcp_pose",
+            {
+                "current_tcp_pose": {
+                    "position_m": {"x_m": 0.1, "y_m": 0.2, "z_m": 0.3},
+                    "orientation": {"x": 0.0, "y": 0.0, "z": 0.0, "w": 1.0},
+                }
+            },
+            {
+                "goal": {
+                    "frame_ref": {"kind": "cell_frame"},
+                    "position_m": [0.1, 0.2, 0.3],
+                    "orientation": {"xyzw": [0.0, 0.0, 0.0, 1.0]},
+                }
+            },
+        ),
+    ],
+)
+def test_store_observed_move_updates_only_selected_node(
+    node_id: str,
+    observed_kind: str,
+    observed: dict,
+    expected_parameter: dict,
+) -> None:
+    catalog = build_node_environment().catalog
+    document = _pick_program().to_dict()
+    node = document["tree"]["children"][3]
+    node["node_id"] = node_id
+    node["instance_id"] = "observed_target"
+    node["parameters"] = {
+        "target_role": "arm",
+        "base_frame_role": "base",
+        "tcp_frame_role": "tcp",
+        "goal": (
+            [{"joint_name": "joint1", "position_rad": 0.0}]
+            if observed_kind == "joint"
+            else {
+                "frame_ref": {"kind": "cell_frame"},
+                "position_m": [0.0, 0.0, 0.0],
+                "orientation": {"xyzw": [0.0, 0.0, 0.0, 1.0]},
+            }
+        ),
+    }
+    node.pop("value_sources", None)
+    document["program_revision"] = compute_content_identity(
+        document,
+        own_field="program_revision",
+        identity_domain="program-revision",
+        api_version="manyforge.program.v1",
+    )
+    session = ComposerDraftSession(Program.from_dict(document, catalog))
+
+    _mutate(
+        session,
+        "program_draft_store_observed_move",
+        {
+            "instance_id": "observed_target",
+            "expected_node_id": node_id,
+            "observed_kind": observed_kind,
+            "observed": observed,
+        },
+    )
+
+    stored = next(
+        row
+        for row in session.snapshot()["authoring"]["forest"][0]["children"]
+        if row["instance_id"] == "observed_target"
+    )
+    assert {key: stored["parameters"][key] for key in expected_parameter} == expected_parameter
+
+
+def test_store_observed_pose_replaces_old_goal_source_and_relative_target() -> None:
+    session = ComposerDraftSession(_pick_program())
+    observed = {
+        "current_tcp_pose": {
+            "position_m": {"x_m": 0.4, "y_m": 0.2, "z_m": 0.1},
+            "orientation": {"x": 0.0, "y": 0.0, "z": 0.0, "w": 1.0},
+        }
+    }
+
+    _mutate(
+        session,
+        "program_draft_store_observed_move",
+        {
+            "instance_id": "move_to_planned_pick_approach",
+            "expected_node_id": "motion.move_to_pose",
+            "observed_kind": "tcp_pose",
+            "observed": observed,
+        },
+    )
+
+    stored = next(
+        row
+        for row in session.snapshot()["authoring"]["forest"][0]["children"]
+        if row["instance_id"] == "move_to_planned_pick_approach"
+    )
+    assert stored["parameters"]["goal"]["position_m"] == [0.4, 0.2, 0.1]
+    assert "goal" not in stored.get("value_sources", {})
+    assert stored["value_sources"]["velocity_scale"] == {
+        "kind": "program_parameter",
+        "reference": "velocity_scale",
+    }
+
+
+def test_support_contact_replacement_is_one_validated_draft_change() -> None:
+    session = ComposerDraftSession(_pick_program())
+    contact = {
+        "support_object_id": "ground",
+        "mode": "contact_release",
+        "release_evidence_mode": "binary_contact",
+        "require_separation_by_end": True,
+        "allow_recontact": False,
+    }
+
+    result = _mutate(
+        session,
+        "program_draft_replace_support_contacts",
+        {
+            "scene_resource_id": "graspable",
+            "support_contacts": [contact],
+        },
+    )
+
+    resource = next(
+        row
+        for row in session.snapshot()["authoring"]["scene"]
+        if row["scene_resource_id"] == "graspable"
+    )
+    assert result.details["support_contact_count"] == 1
+    assert resource["metadata"]["support_contacts"] == [contact]
+
+    invalid = _mutate(
+        session,
+        "program_draft_replace_support_contacts",
+        {
+            "scene_resource_id": "graspable",
+            "support_contacts": [{"support_object_id": "graspable"}],
+        },
+    )
+    assert invalid.snapshot["program"] is None
+    assert any(
+        "cannot name the supported object itself" in row["message"]
+        for row in invalid.snapshot["diagnostics"]
+    )
+
+    _mutate(
+        session,
+        "program_draft_replace_support_contacts",
+        {"scene_resource_id": "graspable", "support_contacts": []},
+    )
+    resource = next(
+        row
+        for row in session.snapshot()["authoring"]["scene"]
+        if row["scene_resource_id"] == "graspable"
+    )
+    assert "metadata" not in resource
+
+
+def test_assistant_proposal_batch_has_no_partial_failure() -> None:
+    session = ComposerDraftSession(_pick_program())
+    before = session.retained_state()
+
+    with pytest.raises(DraftSessionError):
+        _mutate(
+            session,
+            "assistant_draft_materialize_proposal",
+            {
+                "proposal_tool_id": "propose_scene_object_nodes",
+                "operations": [
+                    {
+                        "mutation": "scene_draft_upsert_objects",
+                        "arguments": {"scene_resources": [_box_resource("new-object")]},
+                    },
+                    {
+                        "mutation": "tree_draft_insert_node",
+                        "arguments": {
+                            "node": {
+                                "node_id": "missing.node",
+                                "instance_id": "bad",
+                                "parameters": {},
+                                "children": [],
+                            }
+                        },
+                    },
+                ],
+            },
+        )
+
+    assert session.retained_state() == before
 
 
 def test_session_is_an_unsaved_unapplied_in_memory_draft() -> None:

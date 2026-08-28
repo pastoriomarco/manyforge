@@ -4,6 +4,7 @@ import {
   buildGripperCommandIntent,
   buildJointMotionIntent,
   buildPoseMotionIntent,
+  buildPreviewIntent,
   initialRobotControlState,
   ROBOT_CONTROL_AUTHOR_DEBOUNCE_MS,
   ROBOT_CONTROL_OPERATION_POLL_MS,
@@ -230,6 +231,30 @@ describe('addressed Robot Control state', () => {
       kind: 'joint_goal',
       joint_names: ['joint1', 'joint2'],
       positions_rad: [0.2, -0.4],
+    });
+  });
+
+  it('keeps a stored joint source inside Move To and previews it as a joint goal', () => {
+    const status = statusFixture();
+    let state = robotControlReducer(initialRobotControlState, {
+      type: 'status_resolved',
+      status,
+    });
+    state = robotControlReducer(state, { type: 'select_mode', mode: 'move_to' });
+    state = robotControlReducer(state, {
+      type: 'edit_move_to_joint',
+      positionsRad: [0.2, -0.4],
+    });
+
+    const intent = buildPreviewIntent(state, 'move-to-joints');
+    expect(state.mode).toBe('move_to');
+    expect(state.moveToKind).toBe('joint');
+    expect(intent.participants[0].payload).toMatchObject({
+      kind: 'motion',
+      motion: {
+        kind: 'joint_goal',
+        positions_rad: [0.2, -0.4],
+      },
     });
   });
 

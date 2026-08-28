@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from copy import deepcopy
 from dataclasses import dataclass
+import math
 from pathlib import Path
 import re
 import threading
@@ -11,6 +12,10 @@ import uuid
 from typing import Any, Callable, NoReturn
 
 from manyforge_behavior.catalog import NodeCatalog
+from manyforge_behavior.canonical_artifact import (
+    canonical_json_bytes,
+    compute_content_identity,
+)
 from manyforge_behavior.geometry import (
     GeometryError,
     add_rpy_deg,
@@ -60,14 +65,37 @@ SUPPORTED_DRAFT_MUTATIONS = (
     "tree_draft_wrap_node",
 )
 OPERATOR_DRAFT_MUTATIONS = (
+    "assistant_draft_materialize_proposal",
+    "program_draft_expand_authoring_macro",
+    "program_draft_remove_contact_policies",
     "program_draft_replace_roles",
+    "program_draft_replace_support_contacts",
+    "program_draft_store_observed_move",
+    "program_draft_store_observed_scene_resource",
+    "program_draft_upsert_contact_policies",
     "program_draft_update_settings",
     "program_draft_update_node_policies",
     "viewer_draft_replace",
 )
 _NODE_POLICY_MUTATION = "program_draft_update_node_policies"
+_ASSISTANT_PROPOSAL_MUTATIONS = frozenset(
+    {
+        "scene_draft_upsert_objects",
+        "tree_draft_insert_node",
+    }
+)
 _PORTABLE_ID_PATTERN = re.compile(r"^[a-z][a-z0-9_.-]*$")
 _PORTABLE_ID_MAX_BYTES = 128
+
+
+def _is_portable_id(value: Any) -> bool:
+    return (
+        type(value) is str
+        and _PORTABLE_ID_PATTERN.fullmatch(value) is not None
+        and len(value.encode("utf-8")) <= _PORTABLE_ID_MAX_BYTES
+    )
+
+
 _SKILL_REFERENT_UNAVAILABLE_MESSAGE = (
     "Allowed recovery skills are unavailable: each skill requires an exact "
     "revision-qualified retained referent. Leave Allowed skills empty."
@@ -1435,6 +1463,13 @@ class ComposerDraftSession:
             str,
             Callable[[dict[str, Any], dict[str, Any], NodeCatalog], dict[str, Any]],
         ] = {
+            "assistant_draft_materialize_proposal": self._assistant_proposal_materialize,
+            "program_draft_expand_authoring_macro": self._authoring_macro_expand,
+            "program_draft_remove_contact_policies": self._contact_policies_remove,
+            "program_draft_store_observed_move": self._observed_move_store,
+            "program_draft_store_observed_scene_resource": self._observed_scene_resource_store,
+            "program_draft_replace_support_contacts": self._support_contacts_replace,
+            "program_draft_upsert_contact_policies": self._contact_policies_upsert,
             "scene_draft_add_object": self._scene_add,
             "scene_draft_update_object": self._scene_update,
             "scene_draft_upsert_objects": self._scene_upsert,
@@ -1468,6 +1503,637 @@ class ComposerDraftSession:
             )
         details = handler(document, arguments, catalog)
         return tool_id, details
+
+    @staticmethod
+    def _contact_policy_rows(document: dict[str, Any]) -> list[dict[str, Any]]:
+        rows = document.setdefault("contact_policies", [])
+        if type(rows) is not list:
+            _error(
+                "composer_draft_invalid",
+                "Program Draft contact_policies is not an array",
+            )
+        return rows
+
+    @staticmethod
+    def _canonical_contact_policy(raw: Any) -> dict[str, Any]:
+        if type(raw) is not dict:
+            _error("draft_arguments_invalid", "contact policy must be an object")
+        policy = deepcopy(raw)
+        policy.pop("version", None)
+        required = {
+            "api_version",
+            "policy_id",
+            "mode",
+            "sensing_mode",
+            "default_unmatched_response",
+            "zones",
+        }
+        if set(policy) != required:
+            _error(
+                "draft_arguments_invalid",
+                "contact policy fields do not match the qualified v1 shape",
+            )
+        if (
+            policy["api_version"] != "manyforge.contact_policy.v1"
+            or policy["mode"] != "contact_grasp"
+            or policy["sensing_mode"] != "geometry_only"
+            or policy["default_unmatched_response"] != "hard_stop"
+            or not _is_portable_id(policy["policy_id"])
+            or type(policy["zones"]) is not list
+            or len(policy["zones"]) != 1
+        ):
+            _error(
+                "draft_arguments_invalid",
+                "contact policy is outside the qualified geometry-only contact-grasp profile",
+            )
+        zone = policy["zones"][0]
+        zone_fields = {
+            "zone_id",
+            "body_pairs",
+            "violation_response",
+            "max_penetration_m",
+            "terminal_window_start_fraction",
+        }
+        if (
+            type(zone) is not dict
+            or set(zone) != zone_fields
+            or not _is_portable_id(zone["zone_id"])
+            or type(zone["body_pairs"]) is not list
+            or not zone["body_pairs"]
+            or zone["violation_response"] != "hard_stop"
+            or type(zone["max_penetration_m"]) not in {int, float}
+            or not math.isfinite(float(zone["max_penetration_m"]))
+            or float(zone["max_penetration_m"]) <= 0.0
+            or type(zone["terminal_window_start_fraction"]) not in {int, float}
+            or not math.isfinite(float(zone["terminal_window_start_fraction"]))
+            or not 0.0 <= float(zone["terminal_window_start_fraction"]) <= 1.0
+        ):
+            _error("draft_arguments_invalid", "contact policy zone is invalid")
+        pair_keys: list[tuple[str, str]] = []
+        for pair in zone["body_pairs"]:
+            if type(pair) is not dict or set(pair) != {"body_a", "body_b"}:
+                _error("draft_arguments_invalid", "contact body pair is invalid")
+            selectors = [pair["body_a"], pair["body_b"]]
+            if any(type(selector) is not dict for selector in selectors):
+                _error("draft_arguments_invalid", "contact selector is invalid")
+            component = next(
+                (
+                    selector
+                    for selector in selectors
+                    if selector.get("kind") == "component_model_body"
+                ),
+                None,
+            )
+            runtime = next(
+                (
+                    selector
+                    for selector in selectors
+                    if selector.get("kind") == "runtime_object"
+                ),
+                None,
+            )
+            if component is None or runtime is None:
+                _error(
+                    "draft_arguments_invalid",
+                    "contact pair must join one component body to one runtime object",
+                )
+            if (
+                frozenset(component)
+                not in {
+                    frozenset(
+                        {"kind", "component_role_id", "collision_body_role_id"}
+                    ),
+                    frozenset(
+                        {
+                            "kind",
+                            "component_role_id",
+                            "model_role_id",
+                            "collision_body_role_id",
+                        }
+                    ),
+                }
+                or set(runtime) != {"kind", "runtime_object_id"}
+                or any(
+                    not _is_portable_id(component.get(field))
+                    for field in set(component) - {"kind"}
+                )
+                or not _is_portable_id(runtime.get("runtime_object_id"))
+            ):
+                _error("draft_arguments_invalid", "contact selector is invalid")
+            pair_keys.append(
+                tuple(
+                    sorted(
+                        (
+                            "component_model_body:"
+                            + canonical_json_bytes(component).decode("utf-8"),
+                            f"runtime_object:{runtime['runtime_object_id']}",
+                        )
+                    )
+                )
+            )
+        if pair_keys != sorted(set(pair_keys)):
+            _error(
+                "draft_arguments_invalid",
+                "contact body pairs must be unique and canonical-sorted",
+            )
+        policy["version"] = "sha256:" + ("0" * 64)
+        policy["version"] = compute_content_identity(
+            policy,
+            own_field="version",
+            identity_domain="catalog-record-revision/contact_policy",
+            api_version="manyforge.contact_policy.v1",
+        )
+        return policy
+
+    def _contact_policies_upsert(
+        self,
+        document: dict[str, Any],
+        arguments: dict[str, Any],
+        _catalog: NodeCatalog,
+    ) -> dict[str, Any]:
+        if set(arguments) != {"contact_policies"} or type(arguments["contact_policies"]) is not list:
+            _error(
+                "draft_arguments_invalid",
+                "program_draft_upsert_contact_policies requires one contact_policies array",
+            )
+        incoming = [
+            self._canonical_contact_policy(row)
+            for row in arguments["contact_policies"]
+        ]
+        inserted, updated = self._upsert_rows(
+            self._contact_policy_rows(document), incoming, "policy_id"
+        )
+        return {"inserted": inserted, "updated": updated}
+
+    def _contact_policies_remove(
+        self,
+        document: dict[str, Any],
+        arguments: dict[str, Any],
+        _catalog: NodeCatalog,
+    ) -> dict[str, Any]:
+        if set(arguments) != {"contact_policy_ids"} or type(arguments["contact_policy_ids"]) is not list:
+            _error(
+                "draft_arguments_invalid",
+                "program_draft_remove_contact_policies requires one contact_policy_ids array",
+            )
+        return self._remove_rows(
+            self._contact_policy_rows(document),
+            arguments["contact_policy_ids"],
+            "policy_id",
+            "contact policies",
+        )
+
+    def _authoring_macro_expand(
+        self,
+        document: dict[str, Any],
+        arguments: dict[str, Any],
+        _catalog: NodeCatalog,
+    ) -> dict[str, Any]:
+        required = {
+            "macro_id",
+            "scene_resource_id",
+            "target_role",
+            "tool_target_role",
+            "base_frame_role",
+            "tcp_frame_role",
+            "carrier_frame_role",
+            "touch_body_roles",
+            "tool_position",
+            "contact_policy_id",
+            "blackboard_namespace_id",
+            "blackboard_key",
+            "instance_prefix",
+        }
+        optional = {"parent_instance_id", "index", "position"}
+        if set(arguments) - required - optional or not required <= set(arguments):
+            _error(
+                "draft_arguments_invalid",
+                "pick_plan_subtree macro arguments are incomplete or unsupported",
+            )
+        if arguments["macro_id"] != "pick_plan_subtree":
+            _error(
+                "draft_authoring_macro_unknown",
+                f"unknown authoring macro: {arguments['macro_id']}",
+                status_code=404,
+            )
+        identifier_fields = required - {
+            "macro_id",
+            "touch_body_roles",
+            "tool_position",
+        }
+        if any(
+            not _is_portable_id(arguments[field])
+            for field in identifier_fields
+        ):
+            _error(
+                "draft_arguments_invalid",
+                "authoring macro identities must be portable lower-case IDs",
+            )
+        if (
+            type(arguments["touch_body_roles"]) is not list
+            or not arguments["touch_body_roles"]
+            or any(
+                not _is_portable_id(role)
+                for role in arguments["touch_body_roles"]
+            )
+            or arguments["touch_body_roles"]
+            != sorted(set(arguments["touch_body_roles"]))
+        ):
+            _error(
+                "draft_arguments_invalid",
+                "touch_body_roles must be a non-empty canonical ID array",
+            )
+        scene_ids = {
+            row.get("scene_resource_id") for row in self._scene(document)
+        }
+        if arguments["scene_resource_id"] not in scene_ids:
+            _error(
+                "draft_scene_resource_not_found",
+                "pick authoring macro requires an existing detached Program scene resource",
+                status_code=404,
+            )
+        for role_field in ("target_role", "tool_target_role"):
+            if arguments[role_field] not in document.get("target_roles", {}):
+                _error(
+                    "draft_target_role_not_found",
+                    f"pick authoring macro {role_field} is not declared",
+                    status_code=404,
+                )
+        if arguments["contact_policy_id"] not in {
+            row.get("policy_id") for row in self._contact_policy_rows(document)
+        }:
+            _error(
+                "draft_contact_policy_not_found",
+                "pick authoring macro contact policy is not declared",
+                status_code=404,
+            )
+
+        blackboard = self._blackboard(document)
+        namespace_id = arguments["blackboard_namespace_id"]
+        key_id = arguments["blackboard_key"]
+        namespaces = {
+            row["namespace_id"]: row for row in blackboard["namespaces"]
+        }
+        keys = {row["key"]: row for row in blackboard["keys"]}
+        if namespace_id not in namespaces:
+            blackboard["namespaces"].append(
+                {"namespace_id": namespace_id, "owner": "program"}
+            )
+            blackboard["namespaces"].sort(key=lambda row: row["namespace_id"])
+        elif namespaces[namespace_id].get("owner") != "program":
+            _error(
+                "draft_declaration_conflict",
+                "pick authoring macro namespace is not Program-owned",
+                status_code=409,
+            )
+        if not key_id.startswith(f"{namespace_id}."):
+            _error(
+                "draft_arguments_invalid",
+                "pick authoring macro result key must belong to its namespace",
+            )
+        expected_key = {
+            "key": key_id,
+            "type": "pick_planning_result",
+            "access": "read_write",
+            "persistence": "run",
+            "fields": [
+                {"field": "approach_pose", "type": "stored_pose"},
+                {"field": "pick_pose", "type": "stored_pose"},
+                {"field": "retreat_pose", "type": "stored_pose"},
+                {"field": "selected_object_id", "type": "scene_resource"},
+            ],
+        }
+        existing_key = keys.get(key_id)
+        if existing_key is not None and any(
+            existing_key.get(field) != value
+            for field, value in expected_key.items()
+        ):
+            _error(
+                "draft_declaration_conflict",
+                "pick authoring macro blackboard key has an incompatible declaration",
+                status_code=409,
+            )
+        if existing_key is None:
+            blackboard["keys"].append(expected_key)
+            blackboard["keys"].sort(key=lambda row: row["key"])
+
+        tree = self._tree(document)
+        existing_ids = set(_tree_ids(tree))
+        base_prefix = arguments["instance_prefix"]
+        prefix = base_prefix
+        suffix = 2
+        child_suffixes = ("plan", "approach", "descend", "close", "attach", "retreat")
+        while any(
+            identity in existing_ids
+            for identity in (prefix, *(f"{prefix}.{part}" for part in child_suffixes))
+        ):
+            prefix = f"{base_prefix}.{suffix}"
+            suffix += 1
+        move_parameters = {
+            "target_role": arguments["target_role"],
+            "base_frame_role": arguments["base_frame_role"],
+            "tcp_frame_role": arguments["tcp_frame_role"],
+        }
+        children = [
+            {
+                "node_id": "planning.plan_pick_sequence",
+                "instance_id": f"{prefix}.plan",
+                "parameters": {
+                    "target_role": arguments["target_role"],
+                    "tool_target_role": arguments["tool_target_role"],
+                    "base_frame_role": arguments["base_frame_role"],
+                    "tcp_frame_role": arguments["tcp_frame_role"],
+                    "carrier_frame_role": arguments["carrier_frame_role"],
+                    "selected_object_id": arguments["scene_resource_id"],
+                    "tool_position": deepcopy(arguments["tool_position"]),
+                    "output_key": key_id,
+                    "contact_policy_id": arguments["contact_policy_id"],
+                },
+                "children": [],
+            },
+            *[
+                {
+                    "node_id": "motion.move_to_pose",
+                    "instance_id": f"{prefix}.{instance_part}",
+                    "parameters": deepcopy(move_parameters),
+                    "value_sources": {
+                        "goal": {
+                            "kind": "blackboard_field",
+                            "reference": key_id,
+                            "field": field,
+                        }
+                    },
+                    "children": [],
+                }
+                for instance_part, field in (
+                    ("approach", "approach_pose"),
+                    ("descend", "pick_pose"),
+                )
+            ],
+            {
+                "node_id": "gripper.command_position",
+                "instance_id": f"{prefix}.close",
+                "parameters": {
+                    "target_role": arguments["tool_target_role"],
+                    "position": deepcopy(arguments["tool_position"]),
+                },
+                "children": [],
+            },
+            {
+                "node_id": "scene.attach_carried_object",
+                "instance_id": f"{prefix}.attach",
+                "parameters": {
+                    "scene_resource_id": arguments["scene_resource_id"],
+                    "target_role": arguments["tool_target_role"],
+                    "carrier_frame_role": arguments["carrier_frame_role"],
+                    "touch_body_roles": deepcopy(arguments["touch_body_roles"]),
+                },
+                "children": [],
+            },
+            {
+                "node_id": "motion.move_to_pose",
+                "instance_id": f"{prefix}.retreat",
+                "parameters": deepcopy(move_parameters),
+                "value_sources": {
+                    "goal": {
+                        "kind": "blackboard_field",
+                        "reference": key_id,
+                        "field": "retreat_pose",
+                    }
+                },
+                "children": [],
+            },
+        ]
+        wrapper = {
+            "node_id": "sequence",
+            "instance_id": prefix,
+            "parameters": {},
+            "children": children,
+        }
+        insertion = {"node": wrapper}
+        for field in ("parent_instance_id", "index", "position"):
+            if field in arguments:
+                insertion[field] = deepcopy(arguments[field])
+        self._tree_insert(document, insertion, _catalog)
+        return {
+            "macro_id": arguments["macro_id"],
+            "inserted_instance_ids": [
+                prefix,
+                *(f"{prefix}.{part}" for part in child_suffixes),
+            ],
+            "blackboard_key": key_id,
+        }
+
+    def _observed_move_store(
+        self,
+        document: dict[str, Any],
+        arguments: dict[str, Any],
+        catalog: NodeCatalog,
+    ) -> dict[str, Any]:
+        if set(arguments) != {
+            "instance_id",
+            "expected_node_id",
+            "observed_kind",
+            "observed",
+        } or type(arguments["observed"]) is not dict:
+            _error(
+                "draft_arguments_invalid",
+                "observed move materialization has an unsupported shape",
+            )
+        observed = arguments["observed"]
+        if arguments["observed_kind"] == "joint":
+            names = observed.get("source_joint_names")
+            positions = observed.get("positions_rad")
+            if (
+                arguments["expected_node_id"] != "motion.move_to_joint_target"
+                or type(names) is not list
+                or not names
+                or any(type(name) is not str or not name for name in names)
+                or names != list(dict.fromkeys(names))
+                or type(positions) is not list
+                or len(names) != len(positions)
+                or any(
+                    type(position) not in {int, float}
+                    or not math.isfinite(float(position))
+                    for position in positions
+                )
+            ):
+                _error("draft_arguments_invalid", "observed joint target is invalid")
+            goal = [
+                {"joint_name": name, "position_rad": position}
+                for name, position in zip(names, positions, strict=True)
+            ]
+        elif arguments["observed_kind"] == "tcp_pose":
+            if arguments["expected_node_id"] != "motion.move_to_pose":
+                _error("draft_arguments_invalid", "observed TCP target requires a pose node")
+            pose = observed.get("current_tcp_pose")
+            try:
+                position = pose["position_m"]
+                orientation = pose["orientation"]
+                goal = {
+                    "frame_ref": {"kind": "cell_frame"},
+                    "position_m": [position["x_m"], position["y_m"], position["z_m"]],
+                    "orientation": {
+                        "xyzw": [
+                            orientation["x"],
+                            orientation["y"],
+                            orientation["z"],
+                            orientation["w"],
+                        ]
+                    },
+                }
+            except (KeyError, TypeError):
+                _error("draft_arguments_invalid", "observed TCP pose is invalid")
+            values = [*goal["position_m"], *goal["orientation"]["xyzw"]]
+            if (
+                any(
+                    type(value) not in {int, float}
+                    or not math.isfinite(float(value))
+                    for value in values
+                )
+                or math.hypot(*[float(value) for value in values[3:]]) <= 1e-12
+            ):
+                _error("draft_arguments_invalid", "observed TCP pose is invalid")
+        else:
+            _error("draft_arguments_invalid", "observed move kind is unsupported")
+        reference = _tree_ref(self._tree(document), arguments["instance_id"])
+        node = reference[0] if reference is not None else None
+        if node is None or node.get("node_id") != arguments["expected_node_id"]:
+            _error(
+                "draft_node_not_found",
+                f"Draft node does not exist: {arguments['instance_id']}",
+                status_code=404,
+            )
+        parameters = deepcopy(node.get("parameters", {}))
+        parameters["goal"] = goal
+        if arguments["observed_kind"] == "tcp_pose":
+            for field in ("target_mode", "target_reference", "offset_reference"):
+                parameters.pop(field, None)
+        value_sources = deepcopy(node.get("value_sources", {}))
+        value_sources.pop("goal", None)
+        return self._tree_update(
+            document,
+            {
+                "instance_id": arguments["instance_id"],
+                "expected_node_id": arguments["expected_node_id"],
+                "parameters": parameters,
+                "value_sources": value_sources,
+                "merge": False,
+            },
+            catalog,
+        )
+
+    def _observed_scene_resource_store(
+        self,
+        document: dict[str, Any],
+        arguments: dict[str, Any],
+        catalog: NodeCatalog,
+    ) -> dict[str, Any]:
+        if set(arguments) != {"scene_resource"} or type(arguments["scene_resource"]) is not dict:
+            _error(
+                "draft_arguments_invalid",
+                "observed scene resource materialization requires one resolved scene_resource",
+            )
+        return self._scene_upsert(
+            document,
+            {"scene_resources": [arguments["scene_resource"]]},
+            catalog,
+        )
+
+    def _support_contacts_replace(
+        self,
+        document: dict[str, Any],
+        arguments: dict[str, Any],
+        _catalog: NodeCatalog,
+    ) -> dict[str, Any]:
+        if (
+            set(arguments) != {"scene_resource_id", "support_contacts"}
+            or not _is_portable_id(arguments["scene_resource_id"])
+            or type(arguments["support_contacts"]) is not list
+        ):
+            _error(
+                "draft_arguments_invalid",
+                "support-contact replacement requires one scene resource and contact array",
+            )
+        resource = next(
+            (
+                row
+                for row in self._scene(document)
+                if row.get("scene_resource_id") == arguments["scene_resource_id"]
+            ),
+            None,
+        )
+        if resource is None:
+            _error(
+                "draft_scene_resource_not_found",
+                "supported Program scene resource does not exist",
+                status_code=404,
+            )
+        metadata = deepcopy(resource.get("metadata", {}))
+        if type(metadata) is not dict:
+            _error("composer_draft_invalid", "Program scene metadata is not an object")
+        contacts = sorted(
+            deepcopy(arguments["support_contacts"]),
+            key=lambda row: row.get("support_object_id", "")
+            if type(row) is dict
+            else "",
+        )
+        if contacts:
+            metadata["support_contacts"] = contacts
+        else:
+            metadata.pop("support_contacts", None)
+        if metadata:
+            resource["metadata"] = metadata
+        else:
+            resource.pop("metadata", None)
+        return {
+            "scene_resource_id": arguments["scene_resource_id"],
+            "support_contact_count": len(contacts),
+        }
+
+    def _assistant_proposal_materialize(
+        self,
+        document: dict[str, Any],
+        arguments: dict[str, Any],
+        catalog: NodeCatalog,
+    ) -> dict[str, Any]:
+        if (
+            set(arguments) != {"proposal_tool_id", "operations"}
+            or type(arguments["proposal_tool_id"]) is not str
+            or type(arguments["operations"]) is not list
+            or not arguments["operations"]
+            or len(arguments["operations"]) > 8_192
+        ):
+            _error("draft_arguments_invalid", "assistant Draft proposal is invalid")
+        details: list[dict[str, Any]] = []
+        handlers = {
+            "scene_draft_upsert_objects": self._scene_upsert,
+            "tree_draft_insert_node": self._tree_insert,
+        }
+        for operation in arguments["operations"]:
+            if (
+                type(operation) is not dict
+                or set(operation) != {"mutation", "arguments"}
+                or operation["mutation"] not in _ASSISTANT_PROPOSAL_MUTATIONS
+                or type(operation["arguments"]) is not dict
+            ):
+                _error(
+                    "draft_arguments_invalid",
+                    "assistant proposal contains an unsupported Draft operation",
+                )
+            mutation = operation["mutation"]
+            details.append(
+                {
+                    "mutation": mutation,
+                    "details": handlers[mutation](
+                        document, deepcopy(operation["arguments"]), catalog
+                    ),
+                }
+            )
+        return {
+            "proposal_tool_id": arguments["proposal_tool_id"],
+            "operations": details,
+        }
 
     @staticmethod
     def _program_roles_replace(

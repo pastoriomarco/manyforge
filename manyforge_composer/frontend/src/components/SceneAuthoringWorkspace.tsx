@@ -19,12 +19,12 @@ import type { ProgramWorkspaceController } from '../hooks/useProgramWorkspace';
 import type { ProgramRuntimeController } from '../hooks/useProgramRuntime';
 import type { RobotControlController } from '../hooks/useRobotControl';
 import { ProgramTransportControls } from './ProgramRuntimePanel';
+import { ProgramContactPolicyEditor } from './ProgramContactPolicyEditor';
 import { RobotControlPanelView } from './RobotControlPanel';
 import type { ViewerInspectorPanel } from './StructuralViewer';
 import {
   candidateTcpPoseInCell,
   livePoseFromProgramResource,
-  programResourceWithLivePose,
   sceneOwnerFacts,
   sceneAttachTransaction,
   sceneObjectTransformTransaction,
@@ -101,7 +101,13 @@ type SceneSelection =
   | { kind: 'structure'; id: string; linkName: string }
   | null;
 
-type SceneWorkspaceTool = 'hierarchy' | 'program' | 'current' | 'sources' | 'viewer';
+type SceneWorkspaceTool =
+  | 'hierarchy'
+  | 'program'
+  | 'contacts'
+  | 'current'
+  | 'sources'
+  | 'viewer';
 
 function sceneSelectionKey(selection: SceneSelection): string | null {
   return selection === null ? null : `${selection.kind}:${selection.id}`;
@@ -1489,6 +1495,7 @@ const SceneViewerBridge = memo(function SceneViewerBridge({
   hiddenSelectionKeys,
   objectAxesSelectionKeys,
   motionPreview,
+  programController,
   programRuntime,
   robotControl,
   runtimeEnabled,
@@ -1546,6 +1553,7 @@ const SceneViewerBridge = memo(function SceneViewerBridge({
   hiddenSelectionKeys: ReadonlySet<string>;
   objectAxesSelectionKeys: ReadonlySet<string>;
   motionPreview: MotionPreviewReceipt | null;
+  programController: ProgramWorkspaceController;
   programRuntime: ProgramRuntimeController;
   robotControl: RobotControlController;
   runtimeEnabled: boolean;
@@ -1721,6 +1729,7 @@ const SceneViewerBridge = memo(function SceneViewerBridge({
           enabled={runtimeEnabled}
           controller={robotControl}
           program={programRuntime}
+          draft={programController}
         />
       )}
       robotControlBlocked={robotControl.state.phase === 'blocked'}
@@ -1882,9 +1891,6 @@ export function SceneAuthoringWorkspace({
   const selectedProgramResource = program?.scene?.find(
     (resource) => resource.scene_resource_id === selectedProgramResourceId,
   ) ?? null;
-  const copyToDraft = selectedObject !== null && selectedProgramResource !== null
-    ? programResourceWithLivePose(selectedProgramResource, selectedObject)
-    : null;
   const draftPoseForLive = selectedProgramResource === null
     ? null
     : livePoseFromProgramResource(selectedProgramResource);
@@ -2303,13 +2309,21 @@ export function SceneAuthoringWorkspace({
             >Stage Draft pose</button>
             <button
               type="button"
-              disabled={copyToDraft === null || busyDraft}
+              disabled={
+                selectedObject?.placement.kind !== 'cell_fixed'
+                || selectedProgramResource === null
+                || busyDraft
+                || !programController.mutationAvailable
+              }
+              title={programController.mutationAvailable
+                ? 'Replace this Program scene resource with the exact current owner-observed object.'
+                : programController.mutationUnavailableReason ?? undefined}
               onClick={() => {
-                if (copyToDraft !== null) void programController.mutate('scene_draft_update_object', {
-                  scene_resource: copyToDraft as unknown as JsonValue,
+                if (selectedObject?.placement.kind === 'cell_fixed') void programController.mutate('program_draft_store_observed_scene_resource', {
+                  scene_resource_id: selectedObject.scene_resource_id,
                 });
               }}
-            >Copy live pose to Draft</button>
+            >Save observed object to Program</button>
             <button
               type="button"
               disabled={selectedOwnerObjectId === null
@@ -2384,6 +2398,7 @@ export function SceneAuthoringWorkspace({
       hiddenSelectionKeys={hiddenSelectionKeys}
       objectAxesSelectionKeys={objectAxesSelectionKeys}
       motionPreview={previewGhost}
+      programController={programController}
       programRuntime={programRuntime}
       robotControl={robotControl}
       runtimeEnabled={runtimeEnabled}
@@ -2405,6 +2420,7 @@ export function SceneAuthoringWorkspace({
             {([
               ['hierarchy', 'Hierarchy'],
               ['program', 'Program scene'],
+              ['contacts', 'Contact policies'],
               ['current', 'Current scene'],
               ['sources', 'Sources'],
               ['viewer', 'Viewer'],
@@ -2492,7 +2508,9 @@ export function SceneAuthoringWorkspace({
           />
         )}
 
-        {(activeSceneTool === 'program' || activeSceneTool === 'viewer')
+        {(activeSceneTool === 'program'
+          || activeSceneTool === 'contacts'
+          || activeSceneTool === 'viewer')
           && program === null && (
           <div className="panel-state">
             <strong>No Program Draft is loaded.</strong>
@@ -2512,6 +2530,14 @@ export function SceneAuthoringWorkspace({
                 ? null
                 : { kind: 'program_resource', id: identity })}
             />
+        )}
+        {activeSceneTool === 'contacts' && program !== null && (
+          <ProgramContactPolicyEditor
+            program={program}
+            draftRevision={draftRevision}
+            busy={busyDraft || !programController.mutationAvailable}
+            mutate={programController.mutate}
+          />
         )}
         {activeSceneTool === 'viewer' && program !== null && (
           <ViewerMetadataEditor

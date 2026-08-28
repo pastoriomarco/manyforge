@@ -43,6 +43,7 @@ _MAINTAINED_PROGRAMS = (
 )
 _MINIMAL_PROGRAM = "examples/pick_and_place_minimal.program.yaml"
 _CONTACT_PROGRAM = "examples/semantic_shape_pick.program.yaml"
+_SCENE_PROGRAM = "examples/lite6_lite_gripper_pick_and_place.program.yaml"
 
 
 def _catalog() -> NodeCatalog:
@@ -120,6 +121,79 @@ def test_program_document_copy_is_detached() -> None:
     first["tree"]["parameters"]["unexpected"] = True
 
     assert "unexpected" not in program.to_dict()["tree"]["parameters"]
+
+
+def test_program_scene_support_contacts_are_typed_and_reference_scene() -> None:
+    source = load_strict_json_yaml(_ROOT / _SCENE_PROGRAM)
+    source["scene"][1]["metadata"] = {
+        "display_hint": "retained",
+        "support_contacts": [
+            {
+                "support_object_id": source["scene"][0]["scene_resource_id"],
+                "mode": "contact_release",
+                "release_evidence_mode": "binary_contact",
+                "require_separation_by_end": True,
+                "allow_recontact": False,
+            }
+        ],
+    }
+
+    parsed = Program.from_dict(_identified(source), _catalog())
+
+    assert parsed.to_dict()["scene"][1]["metadata"] == source["scene"][1][
+        "metadata"
+    ]
+
+
+def test_program_scene_support_contact_accepts_explicit_binary_neutral_fields() -> None:
+    source = load_strict_json_yaml(_ROOT / _SCENE_PROGRAM)
+    source["scene"][1]["metadata"] = {
+        "support_contacts": [
+            {
+                "support_object_id": source["scene"][0]["scene_resource_id"],
+                "mode": "contact_release",
+                "release_evidence_mode": "binary_contact",
+                "enforce_max_start_penetration": False,
+                "max_start_penetration_m": 0.0,
+                "release_tolerance_m": 0.0,
+                "min_release_progress_m": 0.0,
+                "require_strictly_decreasing_penetration": False,
+            }
+        ]
+    }
+
+    identified = _identified(source)
+    assert Program.from_dict(identified, _catalog()).to_dict() == identified
+
+
+@pytest.mark.parametrize("support_object_id", ["missing", "self"])
+def test_program_scene_support_contact_rejects_invalid_reference(
+    support_object_id: str,
+) -> None:
+    source = load_strict_json_yaml(_ROOT / _SCENE_PROGRAM)
+    if support_object_id == "self":
+        support_object_id = source["scene"][0]["scene_resource_id"]
+    source["scene"][0]["metadata"] = {
+        "support_contacts": [{"support_object_id": support_object_id}]
+    }
+
+    with pytest.raises(ProgramValidationError, match="support_object_id"):
+        Program.from_dict(_identified(source), _catalog())
+
+
+def test_program_scene_support_contact_rejects_cycle() -> None:
+    source = load_strict_json_yaml(_ROOT / _SCENE_PROGRAM)
+    first_id = source["scene"][0]["scene_resource_id"]
+    second_id = source["scene"][1]["scene_resource_id"]
+    source["scene"][0]["metadata"] = {
+        "support_contacts": [{"support_object_id": second_id}]
+    }
+    source["scene"][1]["metadata"] = {
+        "support_contacts": [{"support_object_id": first_id}]
+    }
+
+    with pytest.raises(ProgramValidationError, match="cyclic support-contact"):
+        Program.from_dict(_identified(source), _catalog())
 
 
 def test_program_node_policy_defaults_are_omission_compatible() -> None:

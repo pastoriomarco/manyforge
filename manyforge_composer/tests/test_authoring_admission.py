@@ -330,6 +330,37 @@ def test_backend_validation_under_claim_precedes_effect_intent(tmp_path) -> None
     assert headless.settlements[-1]["settlement_kind"] == "proven_no_effect"
 
 
+def test_backend_validation_can_bind_exact_source_to_effect_intent(tmp_path) -> None:
+    headless = _Headless()
+    coordinator = AuthoringAdmissionCoordinator(headless, tmp_path)  # type: ignore[arg-type]
+    coordinator.recover()
+    envelope = _backend_envelope(request_id="observed.source.capture")
+
+    result = coordinator.execute(
+        envelope,
+        operation_kind="store_observed_move",
+        draft_id="draft.1",
+        draft_revision=3,
+        payload={"operation": "store observed move"},
+        effect=lambda _claim: {"stored": True},
+        post_image=lambda: {"draft_id": "draft.1", "revision": 4},
+        prepare_effect=lambda: {"operation_kind": "store_observed_move"},
+        validate_under_claim=lambda _claim: {
+            "source_identity": {"source_epoch": "owner.1", "sequence": 7}
+        },
+    )
+
+    assert result == {"stored": True}
+    transaction = coordinator._journal.lookup(
+        envelope.request_owner_epoch, envelope.request_id
+    )
+    assert transaction is not None
+    assert transaction.effect_intent == {
+        "operation_kind": "store_observed_move",
+        "source_identity": {"source_epoch": "owner.1", "sequence": 7},
+    }
+
+
 def test_transport_independent_commit_replays_without_second_claim(tmp_path) -> None:
     headless = _Headless()
     coordinator = AuthoringAdmissionCoordinator(headless, tmp_path)  # type: ignore[arg-type]

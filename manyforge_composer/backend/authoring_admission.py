@@ -656,7 +656,9 @@ class AuthoringAdmissionCoordinator:
         effect: Callable[[dict[str, Any]], _T],
         post_image: Callable[[], Mapping[str, Any]],
         prepare_effect: Callable[[], Mapping[str, Any]] | None = None,
-        validate_under_claim: Callable[[dict[str, Any]], None] | None = None,
+        validate_under_claim: (
+            Callable[[dict[str, Any]], Mapping[str, Any] | None] | None
+        ) = None,
         after_release: Callable[[], None] | None = None,
     ) -> _T:
         payload_digest = canonical_digest(payload)
@@ -776,7 +778,9 @@ class AuthoringAdmissionCoordinator:
             # Scenario identities are validated by the operation under it.
             self._require_mutation_ready()
             if validate_under_claim is not None:
-                validate_under_claim(claim)
+                validated_effect = validate_under_claim(claim)
+                if validated_effect is not None:
+                    prepared_effect.update(validated_effect)
             self._journal.record(
                 transaction,
                 "effect_intent_json",

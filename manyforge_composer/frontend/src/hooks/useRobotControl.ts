@@ -47,6 +47,7 @@ export interface RobotControlController {
   fullStopPending: boolean;
   fullStopError: string | null;
   selectMode: (mode: RobotControlMode) => void;
+  editMoveToJoints: (positionsRad: number[]) => void;
   editJoint: (jointIndex: number, positionRad: number) => void;
   editPose: (pose: Pose3Value) => void;
   editGripper: (position: number) => void;
@@ -119,6 +120,7 @@ export function useRobotControl(enabled: boolean): RobotControlController {
     const previewDraft = {
       status: state.status,
       mode: state.mode,
+      moveToKind: state.moveToKind,
       draftPositionsRad: state.draftPositionsRad,
       draftPose: state.draftPose,
       draftGripperPosition: state.draftGripperPosition,
@@ -171,6 +173,7 @@ export function useRobotControl(enabled: boolean): RobotControlController {
     state.draftGripperPosition,
     state.generation,
     state.mode,
+    state.moveToKind,
     state.phase,
     state.status,
   ]);
@@ -405,6 +408,10 @@ export function useRobotControl(enabled: boolean): RobotControlController {
     dispatch({ type: 'edit_joint', positionsRad });
   }, [state]);
 
+  const editMoveToJoints = useCallback((positionsRad: number[]) => {
+    dispatch({ type: 'edit_move_to_joint', positionsRad: [...positionsRad] });
+  }, []);
+
   const editPose = useCallback((pose: Pose3Value) => {
     dispatch({ type: 'edit_pose', pose });
   }, []);
@@ -544,6 +551,7 @@ export function useRobotControl(enabled: boolean): RobotControlController {
     fullStopPending,
     fullStopError,
     selectMode,
+    editMoveToJoints,
     editJoint,
     editPose,
     editGripper,
@@ -560,6 +568,7 @@ export function useRobotControl(enabled: boolean): RobotControlController {
     approve,
     controlPending,
     editGripper,
+    editMoveToJoints,
     editJoint,
     editPose,
     pause,

@@ -5,6 +5,7 @@ from __future__ import annotations
 from copy import deepcopy
 from pathlib import Path
 import shutil
+from types import SimpleNamespace
 
 from fastapi.testclient import TestClient
 import pytest
@@ -20,7 +21,12 @@ from manyforge_composer.backend.program_artifacts import (
     load_program_artifact,
     save_program_artifact,
 )
-from manyforge_composer.backend.routes_draft import _apply_program
+from manyforge_composer.backend import routes_draft
+from manyforge_composer.backend.routes_draft import (
+    _apply_program,
+    _assistant_proposal_operations,
+    _observed_scene_arguments,
+)
 from manyforge_composer.backend.security import SecurityConfig
 from manyforge_composer.backend.state import ComposerState
 
@@ -35,9 +41,19 @@ class _AuthoringPassThrough:
     receiver_epoch = "composer-snapshot.test"
     mutation_ready = True
 
-    def execute(self, _envelope, *, effect, prepare_effect=None, **_kwargs):
+    def execute(
+        self,
+        _envelope,
+        *,
+        effect,
+        prepare_effect=None,
+        validate_under_claim=None,
+        **_kwargs,
+    ):
         if prepare_effect is not None:
             prepare_effect()
+        if validate_under_claim is not None:
+            validate_under_claim({})
         return effect({})
 
 
@@ -78,6 +94,305 @@ def _fence(workspace: dict) -> dict:
         "requestOwnerEpoch": "test-browser.epoch.1",
         "requestId": "test-browser.request.1",
     }
+
+
+def _motion_projection(*, sequence: int = 1) -> dict:
+    names = [
+        "shoulder_pan_joint",
+        "shoulder_lift_joint",
+        "elbow_joint",
+        "wrist_1_joint",
+        "wrist_2_joint",
+        "wrist_3_joint",
+    ]
+    return {
+        "status": {
+            "direct_control": {
+                "target_role_id": "arm",
+                "controllable_component_id": "robot",
+                "command_target_id": "arm",
+                "observed_state": {
+                    "complete": True,
+                    "current_tcp_pose": {
+                        "position_m": {"x_m": 0.1, "y_m": 0.2, "z_m": 0.3},
+                        "orientation": {"x": 0.0, "y": 0.0, "z": 0.0, "w": 1.0},
+                    },
+                    "positions_rad": [0.1, -1.1, 0.9, -1.4, -1.2, 0.3],
+                    "sequence": sequence,
+                    "source_epoch": "native-source",
+                    "source_joint_names": names,
+                },
+            }
+        }
+    }
+
+
+def test_observed_move_reads_one_exact_source_snapshot_under_the_claim(
+    tmp_path: Path,
+) -> None:
+    class Headless:
+        def __init__(self) -> None:
+            self.reads = 0
+
+        def execution_status(self) -> dict:
+            self.reads += 1
+            return _motion_projection(sequence=self.reads)
+
+        def program_applied(self) -> dict:
+            return {}
+
+    program = Program(_SOURCE_PROGRAM, build_node_environment().catalog)
+    state = _enable_authoring(ComposerState(program=program))
+    state.headless_client = Headless()  # type: ignore[assignment]
+    workspace = state.draft_session.workspace_snapshot()
+    client = TestClient(
+        create_app(
+            state,
+            security=SecurityConfig(
+                allowed_fs_roots=[str(tmp_path)],
+                cors_origins=["http://localhost:3000"],
+            ),
+        )
+    )
+
+    response = client.post(
+        "/api/program/draft/mutations",
+        json={
+            **_fence(workspace),
+            "mutation": "program_draft_store_observed_move",
+            "arguments": {
+                "instance_id": "move_to_pick",
+                "observed_kind": "joint",
+            },
+        },
+    )
+
+    assert response.status_code == 200, response.text
+    assert state.headless_client.reads == 1
+    goal = response.json()["workspace"]["draft"]["authoring"]["forest"][0][
+        "children"
+    ][0]["parameters"]["goal"]
+    assert [row["position_rad"] for row in goal] == [
+        0.1,
+        -1.1,
+        0.9,
+        -1.4,
+        -1.2,
+        0.3,
+    ]
+
+
+def test_observed_move_is_one_revision_fenced_draft_mutation(tmp_path: Path) -> None:
+    class Headless:
+        def execution_status(self) -> dict:
+            return _motion_projection()
+
+        def program_applied(self) -> dict:
+            return {}
+
+    program = Program(_SOURCE_PROGRAM, build_node_environment().catalog)
+    state = _enable_authoring(ComposerState(program=program))
+    state.headless_client = Headless()  # type: ignore[assignment]
+    workspace = state.draft_session.workspace_snapshot()
+    client = TestClient(
+        create_app(
+            state,
+            security=SecurityConfig(
+                allowed_fs_roots=[str(tmp_path)],
+                cors_origins=["http://localhost:3000"],
+            ),
+        )
+    )
+
+    response = client.post(
+        "/api/program/draft/mutations",
+        json={
+            **_fence(workspace),
+            "mutation": "program_draft_store_observed_move",
+            "arguments": {
+                "instance_id": "move_to_pick",
+                "observed_kind": "joint",
+            },
+        },
+    )
+
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["workspace"]["draft"]["draftRevision"] == (
+        workspace["draft"]["draftRevision"] + 1
+    )
+    goal = body["workspace"]["draft"]["authoring"]["forest"][0]["children"][0][
+        "parameters"
+    ]["goal"]
+    assert [row["position_rad"] for row in goal] == [
+        0.1,
+        -1.1,
+        0.9,
+        -1.4,
+        -1.2,
+        0.3,
+    ]
+
+
+def test_observed_scene_save_preserves_program_metadata_and_source_identity() -> None:
+    class Headless:
+        def scene(self) -> dict:
+            return {
+                "logical_scene": {
+                    "access": {
+                        "active_projection": {
+                            "retained_bundle_id": "bundle",
+                            "graph_revision": "graph",
+                            "scene_revision": {
+                                "scene_id": "cell",
+                                "revision_id": 3,
+                                "content_hash": "sha256:" + "1" * 64,
+                            },
+                        }
+                    },
+                    "snapshot": {
+                        "transaction_sequence": 7,
+                        "objects": [{
+                            "scene_resource_id": "table",
+                            "placement": {
+                                "kind": "cell_fixed",
+                                "cell_id": "cell",
+                                "pose_in_cell": {
+                                    "position_m": {"x": 1.0, "y": 2.0, "z": 3.0},
+                                    "orientation_xyzw": [0.0, 0.0, 0.0, 1.0],
+                                },
+                            },
+                            "collision_shapes": [{
+                                "type": "box",
+                                "dimensions_m": {"x": 0.5, "y": 0.6, "z": 0.7},
+                            }],
+                            "provider_evidence": None,
+                            "support_contacts": [],
+                        }],
+                    },
+                }
+            }
+
+    catalog = build_node_environment().catalog
+    document = Program(_SOURCE_PROGRAM, catalog).to_dict()
+    document["scene"][0]["resource_roles"] = ["support_surface"]
+    document["program_revision"] = compute_content_identity(
+        document,
+        own_field="program_revision",
+        identity_domain="program-revision",
+        api_version="manyforge.program.v1",
+    )
+    state = ComposerState(program=Program.from_dict(document, catalog))
+    state.headless_client = Headless()  # type: ignore[assignment]
+
+    arguments, identity = _observed_scene_arguments(
+        state, {"scene_resource_id": "table"}
+    )
+
+    resource = arguments["scene_resource"]
+    assert resource["resource_roles"] == ["support_surface"]
+    assert resource["shape"] == {
+        "type": "box",
+        "box_dimensions_m": [0.5, 0.6, 0.7],
+    }
+    assert resource["pose"]["position_m"] == [1.0, 2.0, 3.0]
+    assert identity["transaction_sequence"] == 7
+
+
+def test_assistant_scene_proposal_honours_reviewed_filters_and_overrides(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    digest = "sha256:" + "a" * 64
+    arguments = {
+        "inspection_report": {
+            "objects": [
+                {
+                    "source_root": "/World/keep",
+                    "scene_resource": {
+                        "scene_resource_id": "part",
+                        "shape": {
+                            "type": "mesh",
+                            "mesh_resource_uri": "old.glb",
+                            "mesh_scale": [1.0, 1.0, 1.0],
+                        },
+                        "pose": {
+                            "frame_ref": {"kind": "cell_frame"},
+                            "position_m": [0.0, 0.0, 0.0],
+                            "orientation": {"xyzw": [0.0, 0.0, 0.0, 1.0]},
+                        },
+                    },
+                },
+                {
+                    "source_root": "/World/drop",
+                    "scene_resource": {
+                        "scene_resource_id": "ignored",
+                        "shape": {"type": "sphere", "sphere_radius_m": 0.1},
+                        "pose": {
+                            "frame_ref": {"kind": "cell_frame"},
+                            "position_m": [0.0, 0.0, 0.0],
+                            "orientation": {"xyzw": [0.0, 0.0, 0.0, 1.0]},
+                        },
+                    },
+                },
+            ]
+        },
+        "source_roots": ["/World/keep"],
+        "scene_resource_id_prefix": "imported_",
+        "mesh_resource_overrides": [{
+            "source_root": "/World/keep",
+            "mesh_resource_uri": "approved.glb",
+        }],
+        "max_proposals": 1,
+    }
+
+    class Assistant:
+        def status(self, _request_id: str) -> dict:
+            return {
+                "state": "completed",
+                "response": {
+                    "assistantMode": "composer-assistant",
+                    "catalogHash": digest,
+                    "proposals": [{
+                        "toolId": "propose_scene_objects",
+                        "effect": "proposal",
+                        "arguments": arguments,
+                        "inputSchemaHash": digest,
+                        "status": "draft",
+                        "requiresReview": True,
+                    }],
+                },
+            }
+
+    state = ComposerState()
+    state.assistant_client = Assistant()  # type: ignore[assignment]
+    monkeypatch.setattr(
+        routes_draft,
+        "read_active_assistant_context",
+        lambda *_args, **_kwargs: SimpleNamespace(
+            assistant_mode=SimpleNamespace(payload={
+                "catalog_hash": digest,
+                "tools": [{
+                    "tool_id": "propose_scene_objects",
+                    "effect": "proposal",
+                    "input_schema_hash": digest,
+                    "input_schema": {
+                        "type": "object",
+                        "additionalProperties": True,
+                    },
+                }]
+            })
+        ),
+    )
+
+    resolved, identity = _assistant_proposal_operations(
+        state, {"request_id": "assistant.request.1", "proposal_index": 0}
+    )
+
+    resources = resolved["operations"][0]["arguments"]["scene_resources"]
+    assert len(resources) == 1
+    assert resources[0]["scene_resource_id"] == "imported_part"
+    assert resources[0]["shape"]["mesh_resource_uri"] == "approved.glb"
+    assert identity["arguments_digest"].startswith("sha256:")
 
 
 def test_open_mutate_save_and_save_as_preserve_exact_workspace_facts(

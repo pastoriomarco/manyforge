@@ -453,6 +453,7 @@ export function ProgramWorkspace({
         ) : authoring && toolView === 'nodes' ? (
           <ProgramNodePalette
             roots={authoring.forest}
+            program={authoring}
             catalogEntries={catalogEntries}
             catalogIdentity={catalogIdentity}
             environment={nodeEnvironment}
