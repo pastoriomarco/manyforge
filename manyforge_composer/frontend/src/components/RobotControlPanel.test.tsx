@@ -37,6 +37,21 @@ const controller = vi.hoisted(() => ({
           maxVelocityRadS: 2,
           maxAccelerationRadS2: 3,
         }],
+        targetDescriptor: {
+          schemaVersion: 'manyforge.manual_control_motion_descriptor.v1',
+          controllableComponentId: 'robot-1', commandTargetId: 'arm',
+          componentRoleId: 'controlled_component', targetRoleId: 'command_target',
+          frames: [
+            { frameRoleId: 'base', compiledFrameName: 'base_link', modelInstanceId: 'robot-model', modelRevision: 'sha256:model' },
+            { frameRoleId: 'tcp', compiledFrameName: 'tool0', modelInstanceId: 'robot-model', modelRevision: 'sha256:model' },
+          ],
+          joints: [{ sourceJointName: 'joint_1', compiledJointName: 'robot__joint_1', unit: 'rad', minPositionRad: -1, maxPositionRad: 1, maxVelocityRadS: 2, maxAccelerationRadS2: 3 }],
+          contracts: {
+            operationCapabilityId: 'execution.trajectory.execute', operationCapabilityDefinitionRevision: 'sha256:execution',
+            commandSchema: null, controlPath: null,
+            supportingProviders: [{ capabilityId: 'planning.motion.joint_goal', capabilityDefinitionRevision: 'sha256:planning', capabilityProviderBindingId: 'planning', capabilityProviderBindingRevision: 'sha256:provider', providerManifestId: 'planner', providerManifestRevision: 'sha256:manifest' }],
+          },
+        },
       },
       directControlGripper: {
         controllableComponentId: 'robot-1',
@@ -55,6 +70,16 @@ const controller = vi.hoisted(() => ({
         coordinateKind: 'linear_m',
         minPosition: 0,
         maxPosition: 0.04,
+        targetDescriptor: {
+          schemaVersion: 'manyforge.manual_control_gripper_descriptor.v1',
+          controllableComponentId: 'robot-1', commandTargetId: 'gripper', componentRoleId: 'controlled_component', targetRoleId: 'command_target',
+          sourceCoordinateName: 'finger_joint', sourceKind: 'model_role', coordinateKind: 'linear_m', unit: 'm', minPosition: 0, maxPosition: 0.04,
+          mimicFollowers: [], namedPresets: [{ name: 'open', masterPosition: 0.04, coordinates: [{ sourceCoordinateName: 'finger_joint', position: 0.04 }] }],
+          contracts: {
+            operationCapabilityId: 'tool.gripper.command', operationCapabilityDefinitionRevision: 'sha256:gripper',
+            commandSchema: { commandSchemaId: 'gripper.command_position', commandSchemaRevision: 'sha256:gripper-schema' }, controlPath: null, supportingProviders: [],
+          },
+        },
       },
       observedMotion: {
         targetRoleId: 'arm',

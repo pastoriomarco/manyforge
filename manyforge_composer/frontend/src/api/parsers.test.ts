@@ -7,6 +7,7 @@ import {
   parseCatalogResponse,
   parseCycleRecoveryActionResult,
   parseCurrentScenarioResponse,
+  parseDeploymentWorkspaceResponse,
   parseExecutionOwnerStatus,
   parseHealthResponse,
   parseHeadlessRuntimeSnapshot,
@@ -114,6 +115,45 @@ function workspaceFixture(): Record<string, unknown> {
     },
     hasUnsavedChanges: true,
     hasUnappliedChanges: null,
+  };
+}
+
+function deploymentWorkspaceFixture(): Record<string, unknown> {
+  const digestA = `sha256:${'a'.repeat(64)}`;
+  const digestB = `sha256:${'b'.repeat(64)}`;
+  const digestC = `sha256:${'c'.repeat(64)}`;
+  return {
+    schemaVersion: 'manyforge.composer_deployment_workspace.v1',
+    draft: {
+      id: 'deployment-draft-1',
+      revision: 4,
+      document: {
+        api_version: 'manyforge.deployment.v1',
+        deployment_artifact_id: 'deployment.fixture',
+        deployment_revision: digestA,
+        graph: { graph_revision: digestC },
+      },
+      deploymentArtifactId: 'deployment.fixture',
+      deploymentRevision: digestA,
+      graphRevision: digestC,
+      differsFromSaved: false,
+    },
+    saved: { path: '/workspace/deployment.fixture.json', deploymentRevision: digestA },
+    managerApplied: { deploymentRevision: digestA, scenarioId: 'fixture' },
+    runAdmission: { ready: true, reason: null },
+    binding: programBindingFixture('fixture-program', digestB, digestA),
+    scenarioCandidates: [{
+      scenarioId: 'fixture',
+      scenarioCatalogRevision: digestB,
+      deploymentArtifactId: 'deployment.fixture',
+      deploymentRevision: digestA,
+      retainedBundleId: digestB,
+      programId: 'fixture-program',
+      programRevision: digestB,
+      programBindingId: digestA,
+      description: 'Fixture Scenario',
+    }],
+    unavailableReasons: [],
   };
 }
 
@@ -821,6 +861,78 @@ describe('Program product projections', () => {
       headless: { ...headless, applied: malformed },
       workspace: workspaceFixture(),
     })).toThrow(/closed record/);
+  });
+});
+
+describe('Deployment workspace parser', () => {
+  it('accepts one exact Draft, Binding, and named Scenario projection', () => {
+    const parsed = parseDeploymentWorkspaceResponse(deploymentWorkspaceFixture());
+    expect(parsed.binding?.component_role_bindings.length).toBeGreaterThan(0);
+    expect(parsed.scenarioCandidates.map((row) => row.scenarioId)).toEqual(['fixture']);
+    expect(parsed.runAdmission.ready).toBe(true);
+  });
+
+  it('rejects mismatched or duplicate candidate identities', () => {
+    const mismatched = deploymentWorkspaceFixture();
+    (mismatched.scenarioCandidates as Record<string, unknown>[])[0]
+      .deploymentRevision = `sha256:${'d'.repeat(64)}`;
+    expect(() => parseDeploymentWorkspaceResponse(mismatched)).toThrow(
+      /exact matches/,
+    );
+
+    const duplicate = deploymentWorkspaceFixture();
+    (duplicate.scenarioCandidates as unknown[]).push(
+      structuredClone((duplicate.scenarioCandidates as unknown[])[0]),
+    );
+    expect(() => parseDeploymentWorkspaceResponse(duplicate)).toThrow(
+      /unique Scenario identities/,
+    );
+  });
+
+  it('rejects a Binding for another exact graph', () => {
+    const fixture = deploymentWorkspaceFixture();
+    (fixture.binding as Record<string, unknown>).graph_revision =
+      `sha256:${'d'.repeat(64)}`;
+    expect(() => parseDeploymentWorkspaceResponse(fixture)).toThrow(
+      /graph revision/,
+    );
+  });
+
+  it('rejects crossed document, Run-admission, or Applied identities', () => {
+    const crossedDocument = deploymentWorkspaceFixture();
+    const document = (crossedDocument.draft as Record<string, unknown>)
+      .document as Record<string, unknown>;
+    document.deployment_revision = `sha256:${'d'.repeat(64)}`;
+    expect(() => parseDeploymentWorkspaceResponse(crossedDocument)).toThrow(
+      /exact compiled Deployment identity/,
+    );
+
+    const crossedAdmission = deploymentWorkspaceFixture();
+    (crossedAdmission.runAdmission as Record<string, unknown>).ready = false;
+    (crossedAdmission.runAdmission as Record<string, unknown>).reason = 'crossed';
+    expect(() => parseDeploymentWorkspaceResponse(crossedAdmission)).toThrow(
+      /exact Deployment Draft and Manager Applied comparison/,
+    );
+
+    const crossedApplied = deploymentWorkspaceFixture();
+    (crossedApplied.managerApplied as Record<string, unknown>).deploymentRevision =
+      `sha256:${'d'.repeat(64)}`;
+    expect(() => parseDeploymentWorkspaceResponse(crossedApplied)).toThrow(
+      /exact Deployment Draft and Manager Applied comparison/,
+    );
+  });
+
+  it('rejects a partially populated unloaded Draft identity', () => {
+    const fixture = deploymentWorkspaceFixture();
+    Object.assign(fixture.draft as Record<string, unknown>, {
+      document: null,
+      deploymentArtifactId: 'partial',
+      deploymentRevision: null,
+      graphRevision: null,
+    });
+    expect(() => parseDeploymentWorkspaceResponse(fixture)).toThrow(
+      /complete identities/,
+    );
   });
 });
 
@@ -1606,6 +1718,30 @@ describe('addressed Robot Control parsers', () => {
   });
 
   it('accepts source-local limits and exactly one matching observation', () => {
+    const exactRevision = `sha256:${'a'.repeat(64)}`;
+    const contracts = {
+      command_schema: null,
+      control_path: {
+        control_binding_id: 'binding-1',
+        control_binding_revision: exactRevision,
+        control_interface_contract_id: 'interface-1',
+        control_interface_revision: exactRevision,
+        controller_topology_id: 'topology-1',
+        stop_evidence_policy_id: 'stop-policy-1',
+        stop_evidence_policy_revision: exactRevision,
+        topology_revision: exactRevision,
+      },
+      operation_capability_definition_revision: exactRevision,
+      operation_capability_id: 'execution.trajectory.execute',
+      supporting_providers: [{
+        capability_definition_revision: exactRevision,
+        capability_id: 'planning.motion.joint_goal',
+        capability_provider_binding_id: 'provider-binding-1',
+        capability_provider_binding_revision: exactRevision,
+        provider_manifest_id: 'provider-1',
+        provider_manifest_revision: exactRevision,
+      }],
+    };
     const response = {
       ok: true,
       command: 'status',
@@ -1655,10 +1791,31 @@ describe('addressed Robot Control parsers', () => {
             max_velocity_rad_s: 2,
             max_acceleration_rad_s2: null,
           }],
+          target_descriptor: {
+            schema_version: 'manyforge.manual_control_motion_descriptor.v1',
+            controllable_component_id: 'robot-a',
+            command_target_id: 'arm',
+            component_role_id: 'controlled_component',
+            target_role_id: 'command_target',
+            frames: [
+              { frame_role_id: 'base', compiled_frame_name: 'base_link', model_instance_id: 'robot-model', model_revision: exactRevision },
+              { frame_role_id: 'tcp', compiled_frame_name: 'tool0', model_instance_id: 'robot-model', model_revision: exactRevision },
+            ],
+            joints: [{
+              compiled_joint_name: 'robot-a__joint1',
+              source_joint_name: 'joint1',
+              min_position_rad: -1,
+              max_position_rad: 1,
+              max_velocity_rad_s: 2,
+              max_acceleration_rad_s2: null,
+              unit: 'rad',
+            }],
+            contracts,
+          },
         },
         direct_control_gripper: {
           command_schema_id: 'gripper.command_position',
-          command_schema_revision: 'sha256:gripper-schema',
+          command_schema_revision: exactRevision,
           command_target_id: 'gripper',
           component_role_id: 'controlled_component',
           controllable_component_id: 'robot-a',
@@ -1682,6 +1839,34 @@ describe('addressed Robot Control parsers', () => {
             source_kind: 'model_role',
           },
           target_role_id: 'command_target',
+          target_descriptor: {
+            schema_version: 'manyforge.manual_control_gripper_descriptor.v1',
+            controllable_component_id: 'robot-a',
+            command_target_id: 'gripper',
+            component_role_id: 'controlled_component',
+            target_role_id: 'command_target',
+            source_coordinate_name: 'finger_joint',
+            source_kind: 'model_role',
+            coordinate_kind: 'linear_m',
+            unit: 'm',
+            min_position: 0,
+            max_position: 0.04,
+            mimic_followers: [],
+            named_presets: [{
+              name: 'open',
+              master_position: 0.04,
+              coordinates: [{ source_coordinate_name: 'finger_joint', position: 0.04 }],
+            }],
+            contracts: {
+              ...contracts,
+              command_schema: {
+                command_schema_id: 'gripper.command_position',
+                command_schema_revision: exactRevision,
+              },
+              operation_capability_id: 'tool.gripper.command',
+              supporting_providers: [],
+            },
+          },
         },
         observed_targets: [],
       },
@@ -1741,6 +1926,11 @@ describe('addressed Robot Control parsers', () => {
       min_position: null,
       max_position: null,
     });
+    Object.assign(componentLocal.status.direct_control_gripper.target_descriptor, {
+      source_kind: 'component_local',
+      min_position: null,
+      max_position: null,
+    });
     Object.assign(componentLocal.status.direct_control_gripper, {
       observed_state: null,
     });
@@ -1754,6 +1944,12 @@ describe('addressed Robot Control parsers', () => {
       compiled_joint_names: ['robot-a__joint1'],
     });
     expect(() => parseExecutionOwnerStatus(leaked)).toThrow(/exactly/);
+
+    const crossedDescriptor = structuredClone(response);
+    crossedDescriptor.status.direct_control.target_descriptor.frames.reverse();
+    expect(() => parseExecutionOwnerStatus(crossedDescriptor)).toThrow(
+      /exact addressed targets/,
+    );
   });
 
   it('accepts only a no-motion receipt with equal source arrays', () => {

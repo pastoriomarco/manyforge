@@ -31,6 +31,11 @@ from .draft_session import (
     DraftSessionError,
     draft_applicability,
 )
+from .deployment_draft import (
+    DeploymentDraftError,
+    DeploymentDraftSession,
+    compile_deployment_document,
+)
 from .authoring_admission import (
     AuthoringAdmissionCoordinator,
     AuthoringMutationEnvelope,
@@ -46,6 +51,10 @@ from .program_artifacts import (
     ProgramArtifactError,
     load_program_artifact,
     save_program_artifact,
+)
+from .deployment_artifacts import (
+    load_deployment_artifact,
+    save_deployment_artifact,
 )
 
 if TYPE_CHECKING:
@@ -92,6 +101,7 @@ class ComposerState:
         program_source_path: str | None = None,
         allowed_fs_roots: list[str] | None = None,
         allowed_program_write_roots: list[str] | None = None,
+        allowed_deployment_write_roots: list[str] | None = None,
         headless_client: "HeadlessHttpClient | None" = None,
         authoring_state_root: str | None = None,
         assistant_client: "AssistantProviderHttpClient | None" = None,
@@ -118,11 +128,17 @@ class ComposerState:
             program,
             source_path=self.program_source_path,
         )
+        self.deployment_draft_session = DeploymentDraftSession()
         self.allowed_fs_roots = list(allowed_fs_roots or [])
         self.allowed_program_write_roots = (
             None
             if allowed_program_write_roots is None
             else list(allowed_program_write_roots)
+        )
+        self.allowed_deployment_write_roots = (
+            None
+            if allowed_deployment_write_roots is None
+            else list(allowed_deployment_write_roots)
         )
         self.headless_client = headless_client
         authoring_state_root = authoring_state_root or os.environ.get(
@@ -157,6 +173,7 @@ class ComposerState:
         program_path: str | None,
         allowed_fs_roots: list[str] | None = None,
         allowed_program_write_roots: list[str] | None = None,
+        allowed_deployment_write_roots: list[str] | None = None,
         headless_client: "HeadlessHttpClient | None" = None,
         authoring_state_root: str | None = None,
         assistant_client: "AssistantProviderHttpClient | None" = None,
@@ -176,6 +193,7 @@ class ComposerState:
             program_source_path=resolved_program,
             allowed_fs_roots=allowed_fs_roots,
             allowed_program_write_roots=allowed_program_write_roots,
+            allowed_deployment_write_roots=allowed_deployment_write_roots,
             headless_client=headless_client,
             authoring_state_root=authoring_state_root,
             assistant_client=assistant_client,
@@ -193,9 +211,31 @@ class ComposerState:
         )
 
     def _restore_authoring_post_image(self, value: dict[str, Any]) -> None:
+        if value.get("schema_version") == "manyforge.composer_authoring_workspace.v2":
+            if set(value) != {"schema_version", "program", "deployment"}:
+                raise AuthoringJournalError(
+                    "composer_authoring_recovery_invalid",
+                    "retained Composer workspace has an invalid shape",
+                )
+            self.draft_session.restore_retained_state(
+                value["program"], self._active_authoring_catalog()
+            )
+            self.deployment_draft_session.restore_retained_state(value["deployment"])
+            return
         self.draft_session.restore_retained_state(
             value, self._active_authoring_catalog()
         )
+
+    def authoring_retained_state(self) -> dict[str, Any]:
+        """Return one durable post-image for the separate authored documents."""
+
+        if not self.deployment_draft_session.loaded:
+            return self.draft_session.retained_state()
+        return {
+            "schema_version": "manyforge.composer_authoring_workspace.v2",
+            "program": self.draft_session.retained_state(),
+            "deployment": self.deployment_draft_session.retained_state(),
+        }
 
     def _recover_program_apply(
         self, intent: dict[str, Any], claim: dict[str, Any]
@@ -705,7 +745,7 @@ class ComposerState:
             },
             prepare_effect=prepare,
             effect=lambda claim: self._execute_scenario_load(prepared, claim),
-            post_image=self.draft_session.retained_state,
+            post_image=self.authoring_retained_state,
             after_release=lambda: self.prepare_current_applied_scene(
                 request_owner_epoch=envelope.request_owner_epoch,
                 request_id=envelope.request_id,
@@ -768,6 +808,44 @@ class ComposerState:
             )
         kind = intent.get("external_kind")
         post_state = deepcopy(intent["post_state"])
+        if kind == "save_deployment":
+            exact_already_present = False
+            try:
+                source, present_path = load_deployment_artifact(
+                    intent["target_path"],
+                    allowed_roots=(
+                        self.allowed_deployment_write_roots
+                        if self.allowed_deployment_write_roots is not None
+                        else self.allowed_fs_roots
+                    ),
+                )
+                exact_already_present = (
+                    compile_deployment_document(source).canonical_json
+                    == intent["canonical_json"]
+                    and present_path
+                    == post_state["deployment"]["saved_path"]
+                )
+            except DeploymentDraftError as error:
+                if error.code != "deployment_artifact_not_found" and not intent[
+                    "overwrite"
+                ]:
+                    raise AuthoringJournalError(
+                        "composer_authoring_save_recovery_conflict",
+                        "Deployment Save target cannot be proven exact without overwrite authority",
+                    ) from error
+            if not exact_already_present:
+                save_deployment_artifact(
+                    intent["canonical_json"],
+                    intent["target_path"],
+                    allowed_roots=(
+                        self.allowed_deployment_write_roots
+                        if self.allowed_deployment_write_roots is not None
+                        else self.allowed_fs_roots
+                    ),
+                    overwrite=bool(intent["overwrite"]),
+                )
+            self._restore_authoring_post_image(post_state)
+            return self.deployment_draft_session.snapshot(), post_state
         if kind == "save_program":
             try:
                 program = Program.from_dict(

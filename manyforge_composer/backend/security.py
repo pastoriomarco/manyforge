@@ -34,6 +34,10 @@ class SecurityConfig:
     # list is a fail-closed configuration.
     allowed_program_write_roots: list[str] | None = None
 
+    # Deployment artifacts are separate documents and may have a distinct
+    # workspace. ``None`` preserves the filesystem-root fallback.
+    allowed_deployment_write_roots: list[str] | None = None
+
     @classmethod
     def from_env(cls) -> SecurityConfig:
         """Build the CORS and filesystem bounds from environment variables."""
@@ -46,10 +50,12 @@ class SecurityConfig:
             return items
 
         program_write_roots = _csv("MANYFORGE_PROGRAM_WRITE_ROOTS")
+        deployment_write_roots = _csv("MANYFORGE_DEPLOYMENT_WRITE_ROOTS")
         return cls(
             cors_origins=_csv("MANYFORGE_CORS_ORIGINS") or ["http://localhost:3000"],
             allowed_fs_roots=_csv("MANYFORGE_FS_ROOTS") or ["/workspace"],
             allowed_program_write_roots=program_write_roots,
+            allowed_deployment_write_roots=deployment_write_roots,
         )
 
 

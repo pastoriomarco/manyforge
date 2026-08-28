@@ -105,6 +105,21 @@ struct Fixture final {
         } {}
 };
 
+TEST(ModelSource, ProjectsExactParsedDocumentsWithoutStoreOrCompositionState) {
+  const Fixture fixture;
+  const auto documents = parse_model_documents_for_projection(
+      fixture.blobs[0].bytes, fixture.blobs[1].bytes);
+  ASSERT_EQ(documents.urdf.joints.size(), 1U);
+  EXPECT_EQ(documents.urdf.joints.front().name, "joint1");
+  ASSERT_TRUE(documents.srdf.has_value());
+  ASSERT_EQ(documents.srdf->group_states.size(), 1U);
+  EXPECT_EQ(documents.srdf->group_states.front().name, "home");
+  EXPECT_EQ(documents.srdf->group_states.front().group_name, "manipulator");
+  ASSERT_EQ(documents.srdf->group_states.front().joints.size(), 1U);
+  EXPECT_EQ(documents.srdf->group_states.front().joints.front().joint_name,
+            "joint1");
+}
+
 [[nodiscard]] SourceBlob& blob_for(Fixture& fixture, std::string_view uri) {
   const auto found =
       std::find_if(fixture.blobs.begin(), fixture.blobs.end(),

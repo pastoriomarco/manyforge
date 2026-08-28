@@ -387,7 +387,10 @@ export default function App() {
             />
           ) : (
             <div className="deployment-workspace">
-              <DeploymentCompositionPanel enabled={headlessEnabled} />
+              <DeploymentCompositionPanel
+                enabled={headlessEnabled}
+                snapshot={headlessSnapshot}
+              />
             </div>
           )}
         </section>

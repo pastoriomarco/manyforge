@@ -5,6 +5,7 @@
 #include <cstdint>
 #include <manyforge_content_identity/content_identity.hpp>
 #include <manyforge_deployment/artifact_codec.hpp>
+#include <manyforge_deployment/deployment_authoring.hpp>
 #include <memory>
 #include <optional>
 #include <set>
@@ -24,6 +25,19 @@ namespace {
 
 using content_identity::CanonicalValue;
 namespace deployment = manyforge::deployment;
+
+py::dict CompileDeploymentDraft(const std::string &source) {
+  const auto compiled = [&]() {
+    py::gil_scoped_release release;
+    return deployment::compile_deployment_draft(source);
+  }();
+  py::dict result;
+  result["canonical_json"] = compiled.canonical_json;
+  result["deployment_artifact_id"] = compiled.deployment_artifact_id;
+  result["deployment_revision"] = compiled.deployment_revision;
+  result["graph_revision"] = compiled.graph_revision;
+  return result;
+}
 
 CanonicalValue ErrorValue(const std::string_view code,
                           const std::string_view message) {
@@ -551,6 +565,9 @@ PYBIND11_MODULE(manyforge_headless_py, module) {
 
   module.doc() =
       "Thin binding over the C++ ManyForge headless runtime API core";
+  module.def("compile_deployment_draft",
+             &manyforge::headless::CompileDeploymentDraft,
+             py::arg("source"));
   py::class_<HeadlessApiBridge>(module, "HeadlessApiCore")
       .def(py::init<std::string, std::string, std::string, std::string,
                     std::string, std::string, std::string, std::string,

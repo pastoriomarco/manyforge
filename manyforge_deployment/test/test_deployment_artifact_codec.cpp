@@ -6,6 +6,7 @@
 #include <manyforge_deployment/canonical_value.hpp>
 #include <manyforge_deployment/content_identity.hpp>
 #include <manyforge_deployment/deployment_artifact_codec.hpp>
+#include <manyforge_deployment/deployment_authoring.hpp>
 #include <optional>
 #include <set>
 #include <span>
@@ -307,6 +308,22 @@ TEST(DeploymentArtifactCodec,
   EXPECT_EQ(
       verify(source_copy.normalized_authored_root()).deployment_revision(),
       source_copy.deployment_revision());
+}
+
+TEST(DeploymentArtifactCodec,
+     AuthoringEntrypointComputesAndThenVerifiesOneCanonicalDraft) {
+  const auto compiled = compile_deployment_draft(document());
+  EXPECT_EQ(compiled.deployment_artifact_id, "deployment_a");
+  EXPECT_TRUE(is_sha256_digest(compiled.deployment_revision));
+  EXPECT_TRUE(is_sha256_digest(compiled.graph_revision));
+
+  const auto verified = verify_deployment_draft(compiled.canonical_json);
+  EXPECT_EQ(verified.canonical_json, compiled.canonical_json);
+  EXPECT_EQ(verified.deployment_revision, compiled.deployment_revision);
+  EXPECT_EQ(verified.graph_revision, compiled.graph_revision);
+
+  EXPECT_THROW((void)verify_deployment_draft(document()),
+               DeploymentArtifactCodecError);
 }
 
 TEST(DeploymentArtifactCodec,

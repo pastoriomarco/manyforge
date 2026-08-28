@@ -62,6 +62,39 @@ function statusFixture(ownerEpoch = 'execution-owner-1'): ExecutionOwnerStatus {
           maxAccelerationRadS2: null,
         },
       ],
+      targetDescriptor: {
+        schemaVersion: 'manyforge.manual_control_motion_descriptor.v1',
+        controllableComponentId: 'robot-a',
+        commandTargetId: 'arm',
+        componentRoleId: 'controlled_component',
+        targetRoleId: 'command_target',
+        frames: [
+          { frameRoleId: 'base', compiledFrameName: 'base_link', modelInstanceId: 'robot-model', modelRevision: 'sha256:model' },
+          { frameRoleId: 'tcp', compiledFrameName: 'tool0', modelInstanceId: 'robot-model', modelRevision: 'sha256:model' },
+        ],
+        joints: [
+          { sourceJointName: 'joint1', compiledJointName: 'robot__joint1', unit: 'rad', minPositionRad: -1, maxPositionRad: 1, maxVelocityRadS: 2, maxAccelerationRadS2: 3 },
+          { sourceJointName: 'joint2', compiledJointName: 'robot__joint2', unit: 'rad', minPositionRad: -2, maxPositionRad: 2, maxVelocityRadS: 2, maxAccelerationRadS2: null },
+        ],
+        contracts: {
+          operationCapabilityId: 'execution.trajectory.execute',
+          operationCapabilityDefinitionRevision: 'sha256:execution',
+          commandSchema: null,
+          controlPath: null,
+          supportingProviders: [
+            'planning.motion.cartesian_path',
+            'planning.motion.joint_goal',
+            'planning.motion.pose_goal',
+          ].map((capabilityId) => ({
+            capabilityId,
+            capabilityDefinitionRevision: 'sha256:planning',
+            capabilityProviderBindingId: capabilityId,
+            capabilityProviderBindingRevision: 'sha256:provider',
+            providerManifestId: 'planner',
+            providerManifestRevision: 'sha256:manifest',
+          })),
+        },
+      },
     },
     directControlGripper: {
       controllableComponentId: 'robot-a',
@@ -80,6 +113,20 @@ function statusFixture(ownerEpoch = 'execution-owner-1'): ExecutionOwnerStatus {
       coordinateKind: 'linear_m',
       minPosition: 0,
       maxPosition: 0.04,
+      targetDescriptor: {
+        schemaVersion: 'manyforge.manual_control_gripper_descriptor.v1',
+        controllableComponentId: 'robot-a', commandTargetId: 'gripper',
+        componentRoleId: 'controlled_component', targetRoleId: 'command_target',
+        sourceCoordinateName: 'finger_joint', sourceKind: 'model_role',
+        coordinateKind: 'linear_m', unit: 'm', minPosition: 0, maxPosition: 0.04,
+        mimicFollowers: [], namedPresets: [],
+        contracts: {
+          operationCapabilityId: 'tool.gripper.command',
+          operationCapabilityDefinitionRevision: 'sha256:gripper',
+          commandSchema: { commandSchemaId: 'gripper.command_position', commandSchemaRevision: 'sha256:gripper-schema' },
+          controlPath: null, supportingProviders: [],
+        },
+      },
     },
     observedMotion: {
       targetRoleId: 'scenario-arm',

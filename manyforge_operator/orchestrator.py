@@ -482,6 +482,7 @@ def native_commands(config: NativeLauncherConfig) -> tuple[ProcessSpec, ...]:
                 f"{config.install_root},{config.program_workspace}"
             ),
             "MANYFORGE_PROGRAM_WRITE_ROOTS": str(config.program_workspace),
+            "MANYFORGE_DEPLOYMENT_WRITE_ROOTS": str(config.program_workspace),
         },
         config.source_root,
     )

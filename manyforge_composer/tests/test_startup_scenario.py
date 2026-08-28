@@ -12,6 +12,7 @@ from manyforge_composer.backend.draft_session import (
     ComposerDraftSession,
     DraftSessionError,
 )
+from manyforge_composer.backend.deployment_draft import DeploymentDraftSession
 from manyforge_composer.backend.state import ComposerState
 from manyforge_headless_api.client import HeadlessClientError
 
@@ -188,6 +189,7 @@ def _state(
         program,
         source_path=(str(_PROGRAM_PATH) if program is not None else None),
     )
+    state.deployment_draft_session = DeploymentDraftSession()
     state._active_authoring_catalog = lambda: state.node_catalog  # type: ignore[method-assign]
     return state
 

@@ -636,6 +636,7 @@ add_library(manyforge_deployment_verification_core
   src/content_identity.cpp
   src/deployment_applicability_codec.cpp
   src/deployment_artifact_codec.cpp
+  src/deployment_authoring.cpp
   src/deployment_catalog_codec.cpp
   src/model_asset_codec.cpp
   src/model_source.cpp

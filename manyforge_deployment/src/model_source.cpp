@@ -3192,4 +3192,16 @@ std::string emit_canonical_srdf_document(
   return emit_srdf_document(document);
 }
 
+ParsedModelDocuments parse_model_documents_for_projection(
+    std::string_view urdf_bytes, std::optional<std::string_view> srdf_bytes) {
+  ParseAccumulator accumulator;
+  XmlBudget budget;
+  parse_urdf(parse_xml(urdf_bytes, "URDF", budget), accumulator);
+  if (srdf_bytes.has_value()) {
+    parse_srdf(parse_xml(*srdf_bytes, "SRDF", budget), accumulator);
+  }
+  return ParsedModelDocuments{std::move(accumulator.urdf),
+                              std::move(accumulator.srdf)};
+}
+
 }  // namespace manyforge::deployment

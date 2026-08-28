@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 
 import { api } from '../api/client';
+import { useDeploymentWorkspace } from '../hooks/useDeploymentWorkspace';
 import type {
   ManagerApplyRequest,
   ManagerApplyResponse,
@@ -10,10 +11,15 @@ import type {
   ScenarioCatalogEntry,
   ScenarioCatalogResponse,
 } from '../types/api';
+import type { ComposerHeadlessState } from '../types/headless';
 import { CCLCPanel } from './CCLCPanel';
+import { DeploymentBindingProjection } from './DeploymentBindingProjection';
+import { DeploymentDocumentControls } from './DeploymentDocumentControls';
+import { DeploymentDocumentEditor } from './DeploymentDocumentEditor';
 
 interface DeploymentCompositionPanelProps {
   enabled: boolean;
+  snapshot: ComposerHeadlessState | null;
 }
 
 interface DeploymentReadModel {
@@ -109,7 +115,10 @@ function applyReceiptMessage(response: ManagerApplyResponse): string {
 
 export function DeploymentCompositionPanel({
   enabled,
+  snapshot,
 }: DeploymentCompositionPanelProps) {
+  const deploymentController = useDeploymentWorkspace(enabled, snapshot);
+  const refreshDeploymentWorkspace = deploymentController.refresh;
   const [readModel, setReadModel] = useState<DeploymentReadModel | null>(null);
   const [selectedScenarioId, setSelectedScenarioId] = useState('');
   const [previewedScenarioId, setPreviewedScenarioId] = useState<string | null>(null);
@@ -123,7 +132,8 @@ export function DeploymentCompositionPanel({
 
   const refresh = useCallback(() => {
     setReloadToken((current) => current + 1);
-  }, []);
+    void refreshDeploymentWorkspace();
+  }, [refreshDeploymentWorkspace]);
 
   useEffect(() => {
     mountedRef.current = true;
@@ -263,8 +273,8 @@ export function DeploymentCompositionPanel({
     <section className="panel deployment-composition-panel" aria-labelledby="deployment-composition-title">
       <header className="panel-header">
         <div>
-          <p className="eyebrow">Manager-owned deployment</p>
-          <h2 id="deployment-composition-title">Deployment composition</h2>
+          <p className="eyebrow">Separate addressed artifact</p>
+          <h2 id="deployment-composition-title">Deployment workspace</h2>
         </div>
         <button
           type="button"
@@ -272,15 +282,27 @@ export function DeploymentCompositionPanel({
           disabled={!enabled || loading || busy !== null}
           onClick={refresh}
         >
-          Refresh projections
+          Refresh current state
         </button>
       </header>
 
       <p className="panel-intro">
-        Select a curated preset, inspect the exact active revisions, preview the
-        pure diff, and Apply deliberately. This panel never selects, Applies,
-        or Runs a deployment implicitly.
+        Edit and save a compiler-validated Deployment Draft independently from
+        Program and Manager Applied state. Manager Apply remains deliberate.
       </p>
+
+      <DeploymentDocumentControls controller={deploymentController} />
+      {deploymentController.workspace !== null && (
+        <DeploymentBindingProjection workspace={deploymentController.workspace} />
+      )}
+      {deploymentController.loading ? (
+        <div className="panel-state" role="status">Reading Deployment Draft…</div>
+      ) : (
+        <DeploymentDocumentEditor controller={deploymentController} />
+      )}
+
+      <details className="deployment-manager-boundary">
+        <summary>Manager Applied state and lifecycle</summary>
 
       {!enabled && (
         <div className="panel-state">
@@ -433,6 +455,7 @@ export function DeploymentCompositionPanel({
           </section>
         </>
       )}
+      </details>
     </section>
   );
 }

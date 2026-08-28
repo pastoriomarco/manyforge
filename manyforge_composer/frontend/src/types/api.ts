@@ -333,6 +333,46 @@ export interface ProgramWorkspaceResponse {
   hasUnappliedChanges: boolean | null;
 }
 
+export interface DeploymentScenarioCandidate {
+  scenarioId: string;
+  scenarioCatalogRevision: string;
+  deploymentArtifactId: string;
+  deploymentRevision: string;
+  retainedBundleId: string;
+  programId: string;
+  programRevision: string;
+  programBindingId: string;
+  description: string | null;
+}
+
+export interface DeploymentWorkspaceResponse {
+  schemaVersion: 'manyforge.composer_deployment_workspace.v1';
+  draft: {
+    id: string;
+    revision: number;
+    document: Record<string, JsonValue> | null;
+    deploymentArtifactId: string | null;
+    deploymentRevision: string | null;
+    graphRevision: string | null;
+    differsFromSaved: boolean;
+  };
+  saved: {
+    path: string | null;
+    deploymentRevision: string | null;
+  };
+  managerApplied: {
+    deploymentRevision: string | null;
+    scenarioId: string | null;
+  };
+  runAdmission: {
+    ready: boolean;
+    reason: string | null;
+  };
+  binding: ProgramBindingDocument | null;
+  scenarioCandidates: DeploymentScenarioCandidate[];
+  unavailableReasons: string[];
+}
+
 export interface ScenarioCatalogEntry {
   scenarioId: string;
   description: string | null;

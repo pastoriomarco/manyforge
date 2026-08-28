@@ -157,9 +157,10 @@ function positionsAreValid(
   status: ExecutionOwnerStatus,
   positions: number[],
 ): boolean {
-  return positions.length === status.directControl.joints.length
+  const joints = status.directControl.targetDescriptor.joints;
+  return positions.length === joints.length
     && positions.every((position, index) => {
-      const joint = status.directControl.joints[index];
+      const joint = joints[index];
       return Number.isFinite(position)
         && joint !== undefined
         && position >= joint.minPositionRad
@@ -191,7 +192,7 @@ function gripperPositionIsValid(
   position: number,
 ): boolean {
   if (!Number.isFinite(position)) return false;
-  const { minPosition, maxPosition } = status.directControlGripper;
+  const { minPosition, maxPosition } = status.directControlGripper.targetDescriptor;
   return minPosition === null && maxPosition === null
     ? true
     : minPosition !== null
@@ -236,7 +237,7 @@ function receiptMatchesCurrentDraft(
   if (!commonReceiptMatches(status, intent, receipt)) return false;
   if (receipt.schemaVersion === 'manyforge.direct_control_motion_preview.v1') {
     if (payload.kind !== 'motion') return false;
-    const expectedNames = status.directControl.joints.map(
+    const expectedNames = status.directControl.targetDescriptor.joints.map(
       (joint) => joint.sourceJointName,
     );
     return arraysEqual(receipt.sourceJointNames, expectedNames)
@@ -250,12 +251,12 @@ function receiptMatchesCurrentDraft(
   return receipt.commandSchemaId === payload.command_schema_id
     && receipt.commandSchemaRevision === payload.command_schema_revision
     && receipt.sourceCoordinateName
-      === status.directControlGripper.sourceCoordinateName
+      === status.directControlGripper.targetDescriptor.sourceCoordinateName
     && receipt.sourceKind === status.directControlGripper.sourceKind
     && receipt.coordinateKind === position.kind
     && receipt.targetPosition === target
-    && receipt.minPosition === status.directControlGripper.minPosition
-    && receipt.maxPosition === status.directControlGripper.maxPosition;
+    && receipt.minPosition === status.directControlGripper.targetDescriptor.minPosition
+    && receipt.maxPosition === status.directControlGripper.targetDescriptor.maxPosition;
 }
 
 function phaseForOperation(operation: OperationObservation): RobotControlPhase {
@@ -606,17 +607,15 @@ function requireMotionStatus(
   if (!status.observedMotion.complete) {
     throw new Error('Authoritative joint state is incomplete.');
   }
-  if (
-    !status.directControl.frameRoleIds.includes(
-      status.directControl.baseFrameRoleId,
-    )
-    || !status.directControl.frameRoleIds.includes(
-      status.directControl.tcpFrameRoleId,
-    )
-  ) {
+  const descriptor = status.directControl.targetDescriptor;
+  const frameRoles = descriptor.frames.map((frame) => frame.frameRoleId);
+  if (!frameRoles.includes(status.directControl.baseFrameRoleId)
+    || !frameRoles.includes(status.directControl.tcpFrameRoleId)) {
     throw new Error('The direct-control base/TCP frame contract is incomplete.');
   }
-  if (!status.directControl.planningCapabilityIds.includes(capability)) {
+  if (!descriptor.contracts.supportingProviders.some(
+    (provider) => provider.capabilityId === capability,
+  )) {
     throw new Error(`${capability} is unavailable for this target.`);
   }
 }
@@ -676,9 +675,9 @@ function buildMotionIntent(
     expected_retained_bundle_id: status.retainedBundleId,
     expected_scene_revision: { ...status.sceneRevision },
     participants: [{
-      component_role_id: status.directControl.componentRoleId,
-      target_role_id: status.directControl.targetRoleId,
-      required_capability_id: status.directControl.operationCapabilityId,
+      component_role_id: status.directControl.targetDescriptor.componentRoleId,
+      target_role_id: status.directControl.targetDescriptor.targetRoleId,
+      required_capability_id: status.directControl.targetDescriptor.contracts.operationCapabilityId,
       action_span: null,
       payload,
     }],
@@ -696,7 +695,7 @@ export function buildJointMotionIntent(
   }
   return buildMotionIntent(status, {
     kind: 'joint_goal',
-    joint_names: status.directControl.joints.map(
+    joint_names: status.directControl.targetDescriptor.joints.map(
       (joint) => joint.sourceJointName,
     ),
     positions_rad: [...positionsRad],
@@ -761,6 +760,7 @@ export function buildGripperCommandIntent(
   requestId: string,
 ): DirectControlOperationIntent {
   const gripper = status.directControlGripper;
+  const descriptor = gripper.targetDescriptor;
   if (
     status.observedGripper === null
     && gripper.sourceKind !== 'component_local'
@@ -776,7 +776,11 @@ export function buildGripperCommandIntent(
   if (requestId.trim() === '') {
     throw new Error('Robot Control request identity must not be empty.');
   }
-  const coordinate = gripper.coordinateKind === 'angular_rad'
+  const commandSchema = descriptor.contracts.commandSchema;
+  if (commandSchema === null) {
+    throw new Error('The addressed gripper command schema is unavailable.');
+  }
+  const coordinate = descriptor.coordinateKind === 'angular_rad'
     ? { kind: 'angular_rad' as const, value_rad: position }
     : { kind: 'linear_m' as const, value_m: position };
   return {
@@ -794,14 +798,14 @@ export function buildGripperCommandIntent(
     expected_retained_bundle_id: status.retainedBundleId,
     expected_scene_revision: { ...status.sceneRevision },
     participants: [{
-      component_role_id: gripper.componentRoleId,
-      target_role_id: gripper.targetRoleId,
-      required_capability_id: gripper.operationCapabilityId,
+      component_role_id: descriptor.componentRoleId,
+      target_role_id: descriptor.targetRoleId,
+      required_capability_id: descriptor.contracts.operationCapabilityId,
       action_span: null,
       payload: {
         kind: 'capability_command',
-        command_schema_id: gripper.commandSchemaId,
-        command_schema_revision: gripper.commandSchemaRevision,
+        command_schema_id: commandSchema.commandSchemaId,
+        command_schema_revision: commandSchema.commandSchemaRevision,
         command_value: {
           kind: 'gripper_position',
           position: coordinate,

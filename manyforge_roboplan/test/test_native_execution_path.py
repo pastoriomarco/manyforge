@@ -1454,6 +1454,28 @@ def test_first_complete_addressed_native_motion_path(tmp_path: Path) -> None:
             and joint["max_velocity_rad_s"] > 0.0
             for joint in direct["joints"]
         )
+        motion_descriptor = direct["target_descriptor"]
+        assert motion_descriptor["schema_version"] == (
+            "manyforge.manual_control_motion_descriptor.v1"
+        )
+        assert motion_descriptor["controllable_component_id"] == direct[
+            "controllable_component_id"
+        ]
+        assert motion_descriptor["command_target_id"] == direct[
+            "command_target_id"
+        ]
+        assert [
+            joint["source_joint_name"]
+            for joint in motion_descriptor["joints"]
+        ] == manifest["source_joint_names"]
+        assert {frame["frame_role_id"] for frame in motion_descriptor["frames"]} >= {
+            "base",
+            "tcp",
+        }
+        assert motion_descriptor["contracts"]["operation_capability_id"] == (
+            direct["operation_capability_id"]
+        )
+        assert motion_descriptor["contracts"]["supporting_providers"]
 
         direct_gripper = first_status["direct_control_gripper"]
         assert direct_gripper["program_id"] == (
@@ -1470,6 +1492,36 @@ def test_first_complete_addressed_native_motion_path(tmp_path: Path) -> None:
         assert direct_gripper["resource"]["min_position"] <= (
             direct_gripper["resource"]["max_position"]
         )
+        gripper_descriptor = direct_gripper["target_descriptor"]
+        assert gripper_descriptor["schema_version"] == (
+            "manyforge.manual_control_gripper_descriptor.v1"
+        )
+        assert gripper_descriptor["source_coordinate_name"] == (
+            direct_gripper["resource"]["source_coordinate_name"]
+        )
+        assert gripper_descriptor["coordinate_kind"] == "linear_m"
+        assert gripper_descriptor["unit"] == "m"
+        assert gripper_descriptor["min_position"] == direct_gripper[
+            "resource"
+        ]["min_position"]
+        assert gripper_descriptor["max_position"] == direct_gripper[
+            "resource"
+        ]["max_position"]
+        assert [preset["name"] for preset in gripper_descriptor["named_presets"]] == [
+            "close",
+            "closed",
+            "open",
+        ]
+        assert len(gripper_descriptor["mimic_followers"]) == 1
+        follower = gripper_descriptor["mimic_followers"][0]
+        assert follower["source_coordinate_name"] == "left_finger_joint"
+        assert follower["compiled_coordinate_name"].startswith("mf2_joint_")
+        assert follower["multiplier"] == pytest.approx(1.0)
+        assert follower["offset"] == pytest.approx(0.0)
+        assert gripper_descriptor["contracts"]["command_schema"] == {
+            "command_schema_id": direct_gripper["command_schema_id"],
+            "command_schema_revision": direct_gripper["command_schema_revision"],
+        }
 
         native = ExecutionCommandClient(execution_run_root, timeout_seconds=2.0)
         before_preview_events = native.events(first_status["owner_epoch"], 0)[

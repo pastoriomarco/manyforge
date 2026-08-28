@@ -3,6 +3,7 @@ import {
   parseAppliedProgramSelection,
   parseCapabilityCommandPreviewResponse,
   parseDraftMutationResponse,
+  parseDeploymentWorkspaceResponse,
   parseFileBrowserResponse,
   parseHealthResponse,
   parseHeadlessRuntimeSnapshot,
@@ -55,6 +56,7 @@ import type {
   ManagerApplyRequest,
   DraftFenceRequest,
   DraftMutationResponse,
+  DeploymentWorkspaceResponse,
   FileBrowserResponse,
   HealthResponse,
   JsonValue,
@@ -484,6 +486,75 @@ export const api = {
           proposalId,
         }),
       },
+    ),
+  },
+  deploymentWorkspace: {
+    get: (signal?: AbortSignal): Promise<DeploymentWorkspaceResponse> =>
+      requestJson(
+        '/api/deployment/workspace',
+        parseDeploymentWorkspaceResponse,
+        signal,
+      ),
+    openDraft: (
+      fence: DraftFenceRequest,
+      path: string,
+      confirmDiscard: boolean,
+      signal?: AbortSignal,
+    ): Promise<DeploymentWorkspaceResponse> => requestJson(
+      '/api/deployment/open-draft',
+      parseDeploymentWorkspaceResponse,
+      signal,
+      {
+        method: 'POST',
+        body: JSON.stringify({ ...fence, path, confirmDiscard }),
+      },
+    ),
+    mutate: (
+      fence: DraftFenceRequest,
+      path: Array<string | number>,
+      operation: 'set' | 'append' | 'remove',
+      value: JsonValue | undefined,
+      signal?: AbortSignal,
+    ): Promise<DeploymentWorkspaceResponse> => requestJson(
+      '/api/deployment/draft/mutations',
+      parseDeploymentWorkspaceResponse,
+      signal,
+      {
+        method: 'POST',
+        body: JSON.stringify({ ...fence, path, operation, value }),
+      },
+    ),
+    save: (
+      fence: DraftFenceRequest,
+      signal?: AbortSignal,
+    ): Promise<DeploymentWorkspaceResponse> => requestJson(
+      '/api/deployment/save',
+      parseDeploymentWorkspaceResponse,
+      signal,
+      { method: 'POST', body: JSON.stringify(fence) },
+    ),
+    saveAs: (
+      fence: DraftFenceRequest,
+      path: string,
+      confirmOverwrite: boolean,
+      signal?: AbortSignal,
+    ): Promise<DeploymentWorkspaceResponse> => requestJson(
+      '/api/deployment/save-as',
+      parseDeploymentWorkspaceResponse,
+      signal,
+      {
+        method: 'POST',
+        body: JSON.stringify({ ...fence, path, confirmOverwrite }),
+      },
+    ),
+    discard: (
+      fence: DraftFenceRequest,
+      signal?: AbortSignal,
+    ): Promise<DeploymentWorkspaceResponse> => requestJson(
+      '/api/deployment/discard',
+      parseDeploymentWorkspaceResponse,
+      signal,
+      { method: 'POST', body: JSON.stringify(fence) },
     ),
   },
   programs: {

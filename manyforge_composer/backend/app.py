@@ -26,6 +26,7 @@ from .routes_assistant import create_assistant_router
 from .routes_assistant_draft import create_assistant_draft_router
 from .routes_catalog import create_catalog_router
 from .routes_draft import create_draft_router
+from .routes_deployment_draft import create_deployment_draft_router
 from .routes_filesystem import create_filesystem_router
 from .routes_nodes import create_nodes_router
 from .routes_urdf import create_urdf_router
@@ -190,6 +191,11 @@ def create_app(
         if security.allowed_program_write_roots is None
         else list(security.allowed_program_write_roots)
     )
+    state.allowed_deployment_write_roots = (
+        None
+        if security.allowed_deployment_write_roots is None
+        else list(security.allowed_deployment_write_roots)
+    )
 
     app = FastAPI(title="ManyForge Composer (replaceable client)")
     app.add_middleware(
@@ -218,6 +224,11 @@ def create_app(
             maximum_bytes=_MAXIMUM_REQUEST_BODY_BYTES,
             path_prefix=program_authoring_prefix,
         )
+    app.add_middleware(
+        ComposerRequestBodyLimitMiddleware,
+        maximum_bytes=_MAXIMUM_REQUEST_BODY_BYTES,
+        path_prefix="/api/deployment/",
+    )
     app.add_middleware(
         CORSMiddleware,
         allow_origins=security.cors_origins,
@@ -420,6 +431,10 @@ def create_app(
     app.include_router(
         create_draft_router(state),
         tags=["composer-draft"],
+    )
+    app.include_router(
+        create_deployment_draft_router(state),
+        tags=["composer-deployment-draft"],
     )
     if state.headless_client is not None:
         app.include_router(

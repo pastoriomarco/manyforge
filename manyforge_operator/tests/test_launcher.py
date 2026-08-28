@@ -113,6 +113,7 @@ def test_native_commands_retain_four_owner_entrypoints(tmp_path: Path):
             f"{config.install_root},{config.program_workspace}"
         ),
         "MANYFORGE_PROGRAM_WRITE_ROOTS": str(config.program_workspace),
+        "MANYFORGE_DEPLOYMENT_WRITE_ROOTS": str(config.program_workspace),
     }
 
 

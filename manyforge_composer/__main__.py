@@ -126,6 +126,7 @@ def main() -> None:
             program_path=args.program_path,
             allowed_fs_roots=security.allowed_fs_roots,
             allowed_program_write_roots=security.allowed_program_write_roots,
+            allowed_deployment_write_roots=security.allowed_deployment_write_roots,
             headless_client=headless_client,
             authoring_state_root=args.authoring_state_root,
             assistant_client=assistant_client,

@@ -7,6 +7,7 @@ import type {
   CatalogResponse,
   CurrentScenarioResponse,
   DraftMutationResponse,
+  DeploymentWorkspaceResponse,
   ProgramDraftProjection,
   ProgramDraftApplicability,
   ProgramDraftMeshAssetMetadata,
@@ -157,6 +158,9 @@ import type {
   CapabilityCommandPreviewReceipt,
   CoordinateKind,
   DirectControlJoint,
+  ManualControlContracts,
+  ManualControlGripperDescriptor,
+  ManualControlMotionDescriptor,
   ExecutionOwnerStatus,
   MotionPreviewReceipt,
   ObservedGripperTarget,
@@ -2284,6 +2288,218 @@ export function parseProgramWorkspaceResponse(value: unknown): ProgramWorkspaceR
     },
     hasUnsavedChanges,
     hasUnappliedChanges,
+  };
+}
+
+export function parseDeploymentWorkspaceResponse(
+  value: unknown,
+): DeploymentWorkspaceResponse {
+  const path = 'deploymentWorkspace';
+  const record = objectAt(value, path);
+  exactKeysAt(record, [
+    'schemaVersion', 'draft', 'saved', 'managerApplied', 'runAdmission',
+    'binding', 'scenarioCandidates', 'unavailableReasons',
+  ], path);
+  const schemaVersion = stringAt(record.schemaVersion, `${path}.schemaVersion`);
+  if (schemaVersion !== 'manyforge.composer_deployment_workspace.v1') {
+    return fail(`${path}.schemaVersion`, 'the supported Deployment workspace version');
+  }
+  const draftRecord = objectAt(record.draft, `${path}.draft`);
+  exactKeysAt(draftRecord, [
+    'id', 'revision', 'document', 'deploymentArtifactId',
+    'deploymentRevision', 'graphRevision', 'differsFromSaved',
+  ], `${path}.draft`);
+  const document = draftRecord.document === null
+    ? null
+    : jsonRecordAt(draftRecord.document, `${path}.draft.document`);
+  const deploymentArtifactId = nullableStringAt(
+    draftRecord.deploymentArtifactId,
+    `${path}.draft.deploymentArtifactId`,
+  );
+  const deploymentRevision = draftRecord.deploymentRevision === null
+    ? null
+    : digestAt(draftRecord.deploymentRevision, `${path}.draft.deploymentRevision`);
+  const graphRevision = draftRecord.graphRevision === null
+    ? null
+    : digestAt(draftRecord.graphRevision, `${path}.draft.graphRevision`);
+  const missingDraftIdentities = [
+    deploymentArtifactId,
+    deploymentRevision,
+    graphRevision,
+  ].filter((identity) => identity === null).length;
+  if (
+    (document === null && missingDraftIdentities !== 3)
+    || (document !== null && missingDraftIdentities !== 0)
+  ) {
+    return fail(`${path}.draft`, 'complete identities exactly when a document is loaded');
+  }
+  if (document !== null) {
+    const apiVersion = stringAt(
+      document.api_version,
+      `${path}.draft.document.api_version`,
+    );
+    const graph = objectAt(document.graph, `${path}.draft.document.graph`);
+    if (
+      apiVersion !== 'manyforge.deployment.v1'
+      || stringAt(
+        document.deployment_artifact_id,
+        `${path}.draft.document.deployment_artifact_id`,
+      ) !== deploymentArtifactId
+      || digestAt(
+        document.deployment_revision,
+        `${path}.draft.document.deployment_revision`,
+      ) !== deploymentRevision
+      || digestAt(
+        graph.graph_revision,
+        `${path}.draft.document.graph.graph_revision`,
+      ) !== graphRevision
+    ) {
+      return fail(`${path}.draft`, 'one exact compiled Deployment identity');
+    }
+  }
+  const savedRecord = objectAt(record.saved, `${path}.saved`);
+  exactKeysAt(savedRecord, ['path', 'deploymentRevision'], `${path}.saved`);
+  const savedPath = nullableStringAt(savedRecord.path, `${path}.saved.path`);
+  const savedRevision = savedRecord.deploymentRevision === null
+    ? null
+    : digestAt(savedRecord.deploymentRevision, `${path}.saved.deploymentRevision`);
+  if ((savedPath === null) !== (savedRevision === null)) {
+    return fail(`${path}.saved`, 'one complete Saved identity');
+  }
+  const managerRecord = objectAt(record.managerApplied, `${path}.managerApplied`);
+  exactKeysAt(managerRecord, ['deploymentRevision', 'scenarioId'], `${path}.managerApplied`);
+  const managerRevision = managerRecord.deploymentRevision === null
+    ? null
+    : digestAt(managerRecord.deploymentRevision, `${path}.managerApplied.deploymentRevision`);
+  const managerScenarioId = nullableStringAt(
+    managerRecord.scenarioId,
+    `${path}.managerApplied.scenarioId`,
+  );
+  if ((managerRevision === null) !== (managerScenarioId === null)) {
+    return fail(`${path}.managerApplied`, 'one complete Manager Applied identity');
+  }
+  const admissionRecord = objectAt(record.runAdmission, `${path}.runAdmission`);
+  exactKeysAt(admissionRecord, ['ready', 'reason'], `${path}.runAdmission`);
+  const runReady = booleanAt(admissionRecord.ready, `${path}.runAdmission.ready`);
+  const runReason = nullableStringAt(admissionRecord.reason, `${path}.runAdmission.reason`);
+  if (runReady === (runReason !== null)) {
+    return fail(`${path}.runAdmission`, 'a reason exactly while Run is blocked');
+  }
+  if (runReady !== (
+    deploymentRevision === null || deploymentRevision === managerRevision
+  )) {
+    return fail(
+      `${path}.runAdmission`,
+      'the exact Deployment Draft and Manager Applied comparison',
+    );
+  }
+  let binding = null;
+  if (record.binding !== null) {
+    try {
+      binding = parseProgramBindingTransport(record.binding, `${path}.binding`);
+    } catch (error) {
+      if (error instanceof ProgramBindingTransportError) {
+        throw new StructuralContractError(error.message);
+      }
+      throw error;
+    }
+  }
+  const scenarioCandidates = boundedArrayAt(
+    record.scenarioCandidates,
+    `${path}.scenarioCandidates`,
+    4096,
+  ).map((candidate, index) => {
+    const candidatePath = `${path}.scenarioCandidates[${index}]`;
+    const row = objectAt(candidate, candidatePath);
+    exactKeysAt(row, [
+      'scenarioId', 'scenarioCatalogRevision', 'deploymentArtifactId',
+      'deploymentRevision', 'retainedBundleId', 'programId',
+      'programRevision', 'programBindingId', 'description',
+    ], candidatePath);
+    return {
+      scenarioId: stringAt(row.scenarioId, `${candidatePath}.scenarioId`),
+      scenarioCatalogRevision: digestAt(
+        row.scenarioCatalogRevision,
+        `${candidatePath}.scenarioCatalogRevision`,
+      ),
+      deploymentArtifactId: stringAt(
+        row.deploymentArtifactId,
+        `${candidatePath}.deploymentArtifactId`,
+      ),
+      deploymentRevision: digestAt(
+        row.deploymentRevision,
+        `${candidatePath}.deploymentRevision`,
+      ),
+      retainedBundleId: digestAt(
+        row.retainedBundleId,
+        `${candidatePath}.retainedBundleId`,
+      ),
+      programId: stringAt(row.programId, `${candidatePath}.programId`),
+      programRevision: digestAt(
+        row.programRevision,
+        `${candidatePath}.programRevision`,
+      ),
+      programBindingId: digestAt(
+        row.programBindingId,
+        `${candidatePath}.programBindingId`,
+      ),
+      description: nullableStringAt(row.description, `${candidatePath}.description`),
+    };
+  });
+  const scenarioIds = new Set<string>();
+  for (const candidate of scenarioCandidates) {
+    if (scenarioIds.has(candidate.scenarioId)) {
+      return fail(`${path}.scenarioCandidates`, 'unique Scenario identities');
+    }
+    scenarioIds.add(candidate.scenarioId);
+    if (
+      candidate.deploymentArtifactId !== deploymentArtifactId
+      || candidate.deploymentRevision !== deploymentRevision
+    ) {
+      return fail(
+        `${path}.scenarioCandidates`,
+        'only exact matches for the current Deployment Draft',
+      );
+    }
+  }
+  if (
+    binding !== null
+    && (
+      binding.graph_revision !== graphRevision
+      || deploymentRevision !== managerRevision
+    )
+  ) {
+    return fail(
+      `${path}.binding`,
+      'the exact current Deployment Draft and graph revision',
+    );
+  }
+  return {
+    schemaVersion: 'manyforge.composer_deployment_workspace.v1',
+    draft: {
+      id: stringAt(draftRecord.id, `${path}.draft.id`),
+      revision: integerAt(draftRecord.revision, `${path}.draft.revision`),
+      document,
+      deploymentArtifactId,
+      deploymentRevision,
+      graphRevision,
+      differsFromSaved: booleanAt(
+        draftRecord.differsFromSaved,
+        `${path}.draft.differsFromSaved`,
+      ),
+    },
+    saved: { path: savedPath, deploymentRevision: savedRevision },
+    managerApplied: {
+      deploymentRevision: managerRevision,
+      scenarioId: managerScenarioId,
+    },
+    runAdmission: { ready: runReady, reason: runReason },
+    binding,
+    scenarioCandidates,
+    unavailableReasons: stringArrayAt(
+      record.unavailableReasons,
+      `${path}.unavailableReasons`,
+    ),
   };
 }
 
@@ -5747,6 +5963,265 @@ function directControlJointAt(
   };
 }
 
+function manualControlContractsAt(
+  value: unknown,
+  path: string,
+): ManualControlContracts {
+  const record = objectAt(value, path);
+  exactKeysAt(record, [
+    'command_schema', 'control_path',
+    'operation_capability_definition_revision', 'operation_capability_id',
+    'supporting_providers',
+  ], path);
+  const commandSchema = record.command_schema === null ? null : (() => {
+    const schema = objectAt(record.command_schema, `${path}.command_schema`);
+    exactKeysAt(schema, ['command_schema_id', 'command_schema_revision'], `${path}.command_schema`);
+    return {
+      commandSchemaId: stringAt(schema.command_schema_id, `${path}.command_schema.command_schema_id`),
+      commandSchemaRevision: digestAt(schema.command_schema_revision, `${path}.command_schema.command_schema_revision`),
+    };
+  })();
+  const controlPath = record.control_path === null ? null : (() => {
+    const control = objectAt(record.control_path, `${path}.control_path`);
+    exactKeysAt(control, [
+      'control_binding_id', 'control_binding_revision',
+      'control_interface_contract_id', 'control_interface_revision',
+      'controller_topology_id', 'stop_evidence_policy_id',
+      'stop_evidence_policy_revision', 'topology_revision',
+    ], `${path}.control_path`);
+    return {
+      controlBindingId: stringAt(control.control_binding_id, `${path}.control_path.control_binding_id`),
+      controlBindingRevision: digestAt(control.control_binding_revision, `${path}.control_path.control_binding_revision`),
+      controlInterfaceContractId: stringAt(control.control_interface_contract_id, `${path}.control_path.control_interface_contract_id`),
+      controlInterfaceRevision: digestAt(control.control_interface_revision, `${path}.control_path.control_interface_revision`),
+      controllerTopologyId: stringAt(control.controller_topology_id, `${path}.control_path.controller_topology_id`),
+      topologyRevision: digestAt(control.topology_revision, `${path}.control_path.topology_revision`),
+      stopEvidencePolicyId: stringAt(control.stop_evidence_policy_id, `${path}.control_path.stop_evidence_policy_id`),
+      stopEvidencePolicyRevision: digestAt(control.stop_evidence_policy_revision, `${path}.control_path.stop_evidence_policy_revision`),
+    };
+  })();
+  const supportingProviders = boundedArrayAt(
+    record.supporting_providers,
+    `${path}.supporting_providers`,
+    64,
+  ).map((item, index) => {
+    const itemPath = `${path}.supporting_providers[${index}]`;
+    const provider = objectAt(item, itemPath);
+    exactKeysAt(provider, [
+      'capability_definition_revision', 'capability_id',
+      'capability_provider_binding_id', 'capability_provider_binding_revision',
+      'provider_manifest_id', 'provider_manifest_revision',
+    ], itemPath);
+    return {
+      capabilityId: stringAt(provider.capability_id, `${itemPath}.capability_id`),
+      capabilityDefinitionRevision: digestAt(provider.capability_definition_revision, `${itemPath}.capability_definition_revision`),
+      capabilityProviderBindingId: stringAt(provider.capability_provider_binding_id, `${itemPath}.capability_provider_binding_id`),
+      capabilityProviderBindingRevision: digestAt(provider.capability_provider_binding_revision, `${itemPath}.capability_provider_binding_revision`),
+      providerManifestId: stringAt(provider.provider_manifest_id, `${itemPath}.provider_manifest_id`),
+      providerManifestRevision: digestAt(provider.provider_manifest_revision, `${itemPath}.provider_manifest_revision`),
+    };
+  });
+  if (new Set(supportingProviders.map(
+    (provider) => provider.capabilityProviderBindingId,
+  )).size !== supportingProviders.length) {
+    return fail(`${path}.supporting_providers`, 'unique provider bindings');
+  }
+  return {
+    operationCapabilityId: stringAt(record.operation_capability_id, `${path}.operation_capability_id`),
+    operationCapabilityDefinitionRevision: digestAt(record.operation_capability_definition_revision, `${path}.operation_capability_definition_revision`),
+    commandSchema,
+    controlPath,
+    supportingProviders,
+  };
+}
+
+function manualControlMotionDescriptorAt(
+  value: unknown,
+  path: string,
+): ManualControlMotionDescriptor {
+  const record = objectAt(value, path);
+  exactKeysAt(record, [
+    'command_target_id', 'component_role_id', 'contracts',
+    'controllable_component_id', 'frames', 'joints', 'schema_version',
+    'target_role_id',
+  ], path);
+  const schemaVersion = stringAt(record.schema_version, `${path}.schema_version`);
+  if (schemaVersion !== 'manyforge.manual_control_motion_descriptor.v1') {
+    return fail(`${path}.schema_version`, 'the supported motion descriptor');
+  }
+  const frames = boundedArrayAt(record.frames, `${path}.frames`, 256).map((item, index) => {
+    const itemPath = `${path}.frames[${index}]`;
+    const frame = objectAt(item, itemPath);
+    exactKeysAt(frame, ['compiled_frame_name', 'frame_role_id', 'model_instance_id', 'model_revision'], itemPath);
+    return {
+      compiledFrameName: stringAt(frame.compiled_frame_name, `${itemPath}.compiled_frame_name`),
+      frameRoleId: stringAt(frame.frame_role_id, `${itemPath}.frame_role_id`),
+      modelInstanceId: stringAt(frame.model_instance_id, `${itemPath}.model_instance_id`),
+      modelRevision: digestAt(frame.model_revision, `${itemPath}.model_revision`),
+    };
+  });
+  if (
+    frames.length === 0
+    || new Set(frames.map((frame) => frame.frameRoleId)).size !== frames.length
+  ) {
+    return fail(`${path}.frames`, 'non-empty unique frame roles');
+  }
+  const joints = boundedArrayAt(record.joints, `${path}.joints`, 1024).map((item, index) => {
+    const itemPath = `${path}.joints[${index}]`;
+    const joint = objectAt(item, itemPath);
+    exactKeysAt(joint, [
+      'compiled_joint_name', 'max_acceleration_rad_s2', 'max_position_rad',
+      'max_velocity_rad_s', 'min_position_rad', 'source_joint_name', 'unit',
+    ], itemPath);
+    if (stringAt(joint.unit, `${itemPath}.unit`) !== 'rad') {
+      return fail(`${itemPath}.unit`, 'rad');
+    }
+    return {
+      compiledJointName: stringAt(joint.compiled_joint_name, `${itemPath}.compiled_joint_name`),
+      sourceJointName: stringAt(joint.source_joint_name, `${itemPath}.source_joint_name`),
+      minPositionRad: numberAt(joint.min_position_rad, `${itemPath}.min_position_rad`),
+      maxPositionRad: numberAt(joint.max_position_rad, `${itemPath}.max_position_rad`),
+      maxVelocityRadS: positiveNumberAt(joint.max_velocity_rad_s, `${itemPath}.max_velocity_rad_s`),
+      maxAccelerationRadS2: nullableNumberAt(joint.max_acceleration_rad_s2, `${itemPath}.max_acceleration_rad_s2`),
+      unit: 'rad' as const,
+    };
+  });
+  if (
+    joints.length === 0
+    || new Set(joints.map((joint) => joint.sourceJointName)).size !== joints.length
+    || new Set(joints.map((joint) => joint.compiledJointName)).size !== joints.length
+  ) {
+    return fail(`${path}.joints`, 'non-empty unique source and compiled joints');
+  }
+  for (const [index, joint] of joints.entries()) {
+    if (
+      joint.minPositionRad > joint.maxPositionRad
+      || joint.maxVelocityRadS <= 0
+      || (joint.maxAccelerationRadS2 !== null && joint.maxAccelerationRadS2 <= 0)
+    ) {
+      return fail(`${path}.joints[${index}]`, 'ordered finite limits');
+    }
+  }
+  return {
+    schemaVersion,
+    controllableComponentId: stringAt(record.controllable_component_id, `${path}.controllable_component_id`),
+    commandTargetId: stringAt(record.command_target_id, `${path}.command_target_id`),
+    componentRoleId: stringAt(record.component_role_id, `${path}.component_role_id`),
+    targetRoleId: stringAt(record.target_role_id, `${path}.target_role_id`),
+    frames,
+    joints,
+    contracts: manualControlContractsAt(record.contracts, `${path}.contracts`),
+  };
+}
+
+function manualControlGripperDescriptorAt(
+  value: unknown,
+  path: string,
+): ManualControlGripperDescriptor {
+  const record = objectAt(value, path);
+  exactKeysAt(record, [
+    'command_target_id', 'component_role_id', 'contracts',
+    'controllable_component_id', 'coordinate_kind', 'max_position',
+    'mimic_followers', 'min_position', 'named_presets', 'schema_version',
+    'source_coordinate_name', 'source_kind', 'target_role_id', 'unit',
+  ], path);
+  const schemaVersion = stringAt(record.schema_version, `${path}.schema_version`);
+  if (schemaVersion !== 'manyforge.manual_control_gripper_descriptor.v1') {
+    return fail(`${path}.schema_version`, 'the supported gripper descriptor');
+  }
+  const coordinateKind = stringAt(record.coordinate_kind, `${path}.coordinate_kind`);
+  if (coordinateKind !== 'angular_rad' && coordinateKind !== 'linear_m') {
+    return fail(`${path}.coordinate_kind`, 'angular_rad or linear_m');
+  }
+  const unit = stringAt(record.unit, `${path}.unit`);
+  if ((coordinateKind === 'angular_rad' && unit !== 'rad') || (coordinateKind === 'linear_m' && unit !== 'm')) {
+    return fail(`${path}.unit`, 'the coordinate-kind unit');
+  }
+  const sourceKind = stringAt(record.source_kind, `${path}.source_kind`);
+  if (sourceKind !== 'model_role' && sourceKind !== 'component_local') {
+    return fail(`${path}.source_kind`, 'model_role or component_local');
+  }
+  const mimicFollowers = boundedArrayAt(record.mimic_followers, `${path}.mimic_followers`, 1024).map((item, index) => {
+    const itemPath = `${path}.mimic_followers[${index}]`;
+    const follower = objectAt(item, itemPath);
+    exactKeysAt(follower, ['compiled_coordinate_name', 'multiplier', 'offset', 'source_coordinate_name'], itemPath);
+    return {
+      compiledCoordinateName: stringAt(follower.compiled_coordinate_name, `${itemPath}.compiled_coordinate_name`),
+      sourceCoordinateName: stringAt(follower.source_coordinate_name, `${itemPath}.source_coordinate_name`),
+      multiplier: numberAt(follower.multiplier, `${itemPath}.multiplier`),
+      offset: numberAt(follower.offset, `${itemPath}.offset`),
+    };
+  });
+  const namedPresets = boundedArrayAt(record.named_presets, `${path}.named_presets`, 1024).map((item, index) => {
+    const itemPath = `${path}.named_presets[${index}]`;
+    const preset = objectAt(item, itemPath);
+    exactKeysAt(preset, ['coordinates', 'master_position', 'name'], itemPath);
+    return {
+      name: stringAt(preset.name, `${itemPath}.name`),
+      masterPosition: numberAt(preset.master_position, `${itemPath}.master_position`),
+      coordinates: boundedArrayAt(preset.coordinates, `${itemPath}.coordinates`, 1024).map((coordinate, coordinateIndex) => {
+        const coordinatePath = `${itemPath}.coordinates[${coordinateIndex}]`;
+        const row = objectAt(coordinate, coordinatePath);
+        exactKeysAt(row, ['position', 'source_coordinate_name'], coordinatePath);
+        return {
+          sourceCoordinateName: stringAt(row.source_coordinate_name, `${coordinatePath}.source_coordinate_name`),
+          position: numberAt(row.position, `${coordinatePath}.position`),
+        };
+      }),
+    };
+  });
+  const minPosition = nullableNumberAt(record.min_position, `${path}.min_position`);
+  const maxPosition = nullableNumberAt(record.max_position, `${path}.max_position`);
+  if (
+    (sourceKind === 'model_role'
+      && (minPosition === null || maxPosition === null || minPosition > maxPosition))
+    || (sourceKind === 'component_local'
+      && (minPosition !== null || maxPosition !== null))
+  ) {
+    return fail(
+      path,
+      sourceKind === 'model_role'
+        ? 'ordered model-backed limits'
+        : 'no fabricated limits for a component-local coordinate',
+    );
+  }
+  if (
+    new Set(mimicFollowers.map(
+      (follower) => follower.compiledCoordinateName,
+    )).size !== mimicFollowers.length
+    || new Set(namedPresets.map((preset) => preset.name)).size
+      !== namedPresets.length
+    || namedPresets.some((preset) => (
+      new Set(preset.coordinates.map(
+        (coordinate) => coordinate.sourceCoordinateName,
+      )).size !== preset.coordinates.length
+      || (minPosition !== null && preset.masterPosition < minPosition)
+      || (maxPosition !== null && preset.masterPosition > maxPosition)
+    ))
+  ) {
+    return fail(
+      `${path}.named_presets`,
+      'unique bounded presets, coordinates, and mimic followers',
+    );
+  }
+  return {
+    schemaVersion,
+    controllableComponentId: stringAt(record.controllable_component_id, `${path}.controllable_component_id`),
+    commandTargetId: stringAt(record.command_target_id, `${path}.command_target_id`),
+    componentRoleId: stringAt(record.component_role_id, `${path}.component_role_id`),
+    targetRoleId: stringAt(record.target_role_id, `${path}.target_role_id`),
+    sourceCoordinateName: stringAt(record.source_coordinate_name, `${path}.source_coordinate_name`),
+    sourceKind: sourceKind as ResourceSourceKind,
+    coordinateKind: coordinateKind as CoordinateKind,
+    unit: unit as 'rad' | 'm',
+    minPosition,
+    maxPosition,
+    mimicFollowers,
+    namedPresets,
+    contracts: manualControlContractsAt(record.contracts, `${path}.contracts`),
+  };
+}
+
 export function parseExecutionOwnerStatus(value: unknown): ExecutionOwnerStatus {
   const envelope = objectAt(value, 'executionStatus');
   if (
@@ -5775,8 +6250,13 @@ export function parseExecutionOwnerStatus(value: unknown): ExecutionOwnerStatus 
     'program_revision',
     'program_run_id',
     'target_role_id',
+    'target_descriptor',
     'tcp_frame_role_id',
   ], 'executionStatus.status.direct_control');
+  const motionDescriptor = manualControlMotionDescriptorAt(
+    direct.target_descriptor,
+    'executionStatus.status.direct_control.target_descriptor',
+  );
   const joints = arrayAt(
     direct.joints,
     'executionStatus.status.direct_control.joints',
@@ -5892,7 +6372,12 @@ export function parseExecutionOwnerStatus(value: unknown): ExecutionOwnerStatus 
     'program_run_id',
     'resource',
     'target_role_id',
+    'target_descriptor',
   ], 'executionStatus.status.direct_control_gripper');
+  const gripperDescriptor = manualControlGripperDescriptorAt(
+    directGripper.target_descriptor,
+    'executionStatus.status.direct_control_gripper.target_descriptor',
+  );
   const gripperResource = objectAt(
     directGripper.resource,
     'executionStatus.status.direct_control_gripper.resource',
@@ -6191,6 +6676,56 @@ export function parseExecutionOwnerStatus(value: unknown): ExecutionOwnerStatus 
         : certificateRefAt(fault.certificate, `${path}.certificate`),
     };
   }
+  const frameRoleIds = stringArrayAt(
+    direct.frame_role_ids,
+    'executionStatus.status.direct_control.frame_role_ids',
+  );
+  const planningCapabilityIds = stringArrayAt(
+    direct.planning_capability_ids,
+    'executionStatus.status.direct_control.planning_capability_ids',
+  );
+  const descriptorFrameRoleIds = motionDescriptor.frames.map(
+    (frame) => frame.frameRoleId,
+  );
+  const descriptorSupportingCapabilityIds = motionDescriptor.contracts
+    .supportingProviders.map((provider) => provider.capabilityId);
+  if (
+    motionDescriptor.controllableComponentId !== componentId
+    || motionDescriptor.commandTargetId !== targetId
+    || motionDescriptor.componentRoleId !== direct.component_role_id
+    || motionDescriptor.targetRoleId !== direct.target_role_id
+    || gripperDescriptor.controllableComponentId !== directGripper.controllable_component_id
+    || gripperDescriptor.commandTargetId !== directGripper.command_target_id
+    || gripperDescriptor.componentRoleId !== directGripper.component_role_id
+    || gripperDescriptor.targetRoleId !== directGripper.target_role_id
+    || gripperDescriptor.sourceCoordinateName !== gripperSourceName
+    || gripperDescriptor.sourceKind !== sourceKind
+    || gripperDescriptor.coordinateKind !== coordinateKind
+    || gripperDescriptor.minPosition !== gripperMin
+    || gripperDescriptor.maxPosition !== gripperMax
+    || motionDescriptor.contracts.operationCapabilityId !== direct.operation_capability_id
+    || gripperDescriptor.contracts.operationCapabilityId !== directGripper.operation_capability_id
+    || gripperDescriptor.contracts.commandSchema?.commandSchemaId !== directGripper.command_schema_id
+    || gripperDescriptor.contracts.commandSchema?.commandSchemaRevision !== directGripper.command_schema_revision
+    || frameRoleIds.length !== descriptorFrameRoleIds.length
+    || frameRoleIds.some((role, index) => role !== descriptorFrameRoleIds[index])
+    || planningCapabilityIds.length !== descriptorSupportingCapabilityIds.length
+    || planningCapabilityIds.some(
+      (capability, index) => capability !== descriptorSupportingCapabilityIds[index],
+    )
+    || motionDescriptor.joints.length !== joints.length
+    || motionDescriptor.joints.some((joint, index) => {
+      const statusJoint = joints[index];
+      return statusJoint === undefined
+        || joint.sourceJointName !== statusJoint.sourceJointName
+        || joint.minPositionRad !== statusJoint.minPositionRad
+        || joint.maxPositionRad !== statusJoint.maxPositionRad
+        || joint.maxVelocityRadS !== statusJoint.maxVelocityRadS
+        || joint.maxAccelerationRadS2 !== statusJoint.maxAccelerationRadS2;
+    })
+  ) {
+    return fail('executionStatus.status.direct_control', 'descriptors joined to the exact addressed targets');
+  }
   return {
     ownerEpoch: stringAt(status.owner_epoch, 'executionStatus.status.owner_epoch'),
     cellId: stringAt(status.cell_id, 'executionStatus.status.cell_id'),
@@ -6233,14 +6768,8 @@ export function parseExecutionOwnerStatus(value: unknown): ExecutionOwnerStatus 
         direct.operation_capability_id,
         'executionStatus.status.direct_control.operation_capability_id',
       ),
-      planningCapabilityIds: stringArrayAt(
-        direct.planning_capability_ids,
-        'executionStatus.status.direct_control.planning_capability_ids',
-      ),
-      frameRoleIds: stringArrayAt(
-        direct.frame_role_ids,
-        'executionStatus.status.direct_control.frame_role_ids',
-      ),
+      planningCapabilityIds,
+      frameRoleIds,
       programId: stringAt(
         direct.program_id,
         'executionStatus.status.direct_control.program_id',
@@ -6258,6 +6787,7 @@ export function parseExecutionOwnerStatus(value: unknown): ExecutionOwnerStatus 
         'executionStatus.status.direct_control.program_run_id',
       ),
       joints,
+      targetDescriptor: motionDescriptor,
     },
     directControlGripper: {
       controllableComponentId: stringAt(
@@ -6309,6 +6839,7 @@ export function parseExecutionOwnerStatus(value: unknown): ExecutionOwnerStatus 
       coordinateKind: coordinateKind as CoordinateKind,
       minPosition: gripperMin,
       maxPosition: gripperMax,
+      targetDescriptor: gripperDescriptor,
     },
     observedMotion,
     observedGripper,

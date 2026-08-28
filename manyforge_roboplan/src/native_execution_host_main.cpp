@@ -36,6 +36,7 @@
 #include <manyforge_core/sqlite_cclc_journal.hpp>
 #include <manyforge_core/types/native_projection_capability.hpp>
 #include <manyforge_deployment/artifact_codec.hpp>
+#include <manyforge_deployment/model_source.hpp>
 #include <manyforge_deployment/native_execution_runtime_contract.hpp>
 #if defined(MANYFORGE_ROS2_CONTROL_EXECUTION_HOST)
 #include <manyforge_deployment/ros2_control_execution_runtime_contract.hpp>
@@ -4493,6 +4494,258 @@ BuildControlBindingRepresentatives(
   return representatives;
 }
 
+[[nodiscard]] CanonicalValue ManualControlContractValue(
+    const core::RuntimeParticipantBindingDTO& binding) {
+  CanonicalValue::Array supporting_providers;
+  supporting_providers.reserve(binding.supporting_capability_provider_paths.size());
+  for (const auto& path : binding.supporting_capability_provider_paths) {
+    supporting_providers.emplace_back(CanonicalValue::Object{
+        {"capability_definition_revision",
+         CanonicalValue(path.capability_definition_revision.value())},
+        {"capability_id", CanonicalValue(path.capability_id.value())},
+        {"capability_provider_binding_id",
+         CanonicalValue(path.capability_provider_binding_id.value())},
+        {"capability_provider_binding_revision",
+         CanonicalValue(path.capability_provider_binding_revision.value())},
+        {"provider_manifest_id", CanonicalValue(path.provider_manifest_id.value())},
+        {"provider_manifest_revision", CanonicalValue(path.provider_manifest_revision.value())},
+    });
+  }
+  CanonicalValue command_schema(nullptr);
+  if (binding.command_schema.has_value()) {
+    command_schema = CanonicalValue(CanonicalValue::Object{
+        {"command_schema_id", CanonicalValue(binding.command_schema->command_schema_id.value())},
+        {"command_schema_revision",
+         CanonicalValue(binding.command_schema->command_schema_revision.value())},
+    });
+  }
+  CanonicalValue control_path(nullptr);
+  if (binding.control_path.has_value()) {
+    const auto& path = *binding.control_path;
+    control_path = CanonicalValue(CanonicalValue::Object{
+        {"control_binding_id", CanonicalValue(path.control_binding_id.value())},
+        {"control_binding_revision", CanonicalValue(path.control_binding_revision.value())},
+        {"control_interface_contract_id",
+         CanonicalValue(path.control_interface_contract_id.value())},
+        {"control_interface_revision", CanonicalValue(path.control_interface_revision.value())},
+        {"controller_topology_id", CanonicalValue(path.controller_topology_id.value())},
+        {"stop_evidence_policy_id", CanonicalValue(path.stop_evidence_policy_id.value())},
+        {"stop_evidence_policy_revision",
+         CanonicalValue(path.stop_evidence_policy_revision.value())},
+        {"topology_revision", CanonicalValue(path.topology_revision.value())},
+    });
+  }
+  return CanonicalValue(CanonicalValue::Object{
+      {"command_schema", std::move(command_schema)},
+      {"control_path", std::move(control_path)},
+      {"operation_capability_definition_revision",
+       CanonicalValue(binding.capability_definition_revision.value())},
+      {"operation_capability_id", CanonicalValue(binding.capability_id.value())},
+      {"supporting_providers", CanonicalValue(std::move(supporting_providers))},
+  });
+}
+
+struct ManualControlDescriptors final {
+  CanonicalValue motion;
+  CanonicalValue gripper;
+};
+
+[[nodiscard]] ManualControlDescriptors BuildManualControlDescriptors(
+    const core::RuntimeParticipantBinding& motion_binding,
+    const core::RuntimeParticipantBinding& gripper_binding,
+    const core::JointLimitsDTO& motion_limits,
+    const std::optional<RetainedGripperPositionLimits>& gripper_limits,
+    const deployment::VerifiedRetainedModelMap& model_map,
+    const deployment::ParsedModelDocuments& documents) {
+  const auto& motion = motion_binding.value();
+  const auto& gripper = gripper_binding.value();
+  Require(
+      motion.resources.size() == motion_limits.joint_names.size() &&
+          motion.resources.size() == motion_limits.position_lower_rad.size() &&
+          motion.resources.size() == motion_limits.position_upper_rad.size() &&
+          motion.resources.size() == motion_limits.velocity_max_rad_s.size() &&
+          (motion_limits.acceleration_max_rad_s2.empty() ||
+           motion.resources.size() == motion_limits.acceleration_max_rad_s2.size()) &&
+          gripper.resources.size() == 1U,
+      "manual-control descriptor crosses its exact resource inventory");
+
+  CanonicalValue::Array frames;
+  frames.reserve(motion.frame_bindings.size());
+  for (const auto& frame : motion.frame_bindings) {
+    frames.emplace_back(CanonicalValue::Object{
+        {"compiled_frame_name", CanonicalValue(frame.compiled_frame_name)},
+        {"frame_role_id", CanonicalValue(frame.frame_role_id.value())},
+        {"model_instance_id", CanonicalValue(frame.model_instance_id.value())},
+        {"model_revision", CanonicalValue(frame.model_revision.value())},
+    });
+  }
+  CanonicalValue::Array joints;
+  joints.reserve(motion.resources.size());
+  for (std::size_t index = 0U; index < motion.resources.size(); ++index) {
+    const auto& resource = motion.resources[index];
+    Require(resource.source_joint_name.has_value(),
+            "manual-control motion descriptor has a non-model coordinate");
+    Require(motion_limits.joint_names[index] == resource.compiled_resource_name,
+            "manual-control motion descriptor crosses its exact joint order");
+    joints.emplace_back(CanonicalValue::Object{
+        {"compiled_joint_name", CanonicalValue(resource.compiled_resource_name)},
+        {"max_acceleration_rad_s2",
+         motion_limits.acceleration_max_rad_s2.empty()
+             ? CanonicalValue(nullptr)
+             : CanonicalValue(motion_limits.acceleration_max_rad_s2[index])},
+        {"max_position_rad", CanonicalValue(motion_limits.position_upper_rad[index])},
+        {"max_velocity_rad_s", CanonicalValue(motion_limits.velocity_max_rad_s[index])},
+        {"min_position_rad", CanonicalValue(motion_limits.position_lower_rad[index])},
+        {"source_joint_name", CanonicalValue(*resource.source_joint_name)},
+        {"unit", CanonicalValue("rad")},
+    });
+  }
+  CanonicalValue motion_descriptor(CanonicalValue::Object{
+      {"command_target_id", CanonicalValue(motion.command_target_id.value())},
+      {"component_role_id", CanonicalValue(motion.component_role_id.value())},
+      {"contracts", ManualControlContractValue(motion)},
+      {"controllable_component_id", CanonicalValue(motion.controllable_component_id.value())},
+      {"frames", CanonicalValue(std::move(frames))},
+      {"joints", CanonicalValue(std::move(joints))},
+      {"schema_version", CanonicalValue("manyforge.manual_control_motion_descriptor.v1")},
+      {"target_role_id", CanonicalValue(motion.target_role_id.value())},
+  });
+
+  const auto& resource = gripper.resources.front();
+  CanonicalValue::Array followers;
+  if (gripper.control_path.has_value()) {
+    const auto* coordinate_map =
+        model_map.find_binding(gripper.controllable_component_id, gripper.command_target_id,
+                               gripper.control_path->control_binding_id);
+    Require(coordinate_map != nullptr,
+            "manual-control gripper descriptor has no retained coordinate map");
+    const auto row = std::find_if(
+        coordinate_map->resources.begin(), coordinate_map->resources.end(),
+        [&](const auto& candidate) { return candidate.resource_id == resource.resource_id; });
+    Require(row != coordinate_map->resources.end() && !row->coordinates.empty(),
+            "manual-control gripper descriptor has no exact resource row");
+    for (const auto& coordinate : row->coordinates) {
+      if (!coordinate.derived_mimic) {
+        continue;
+      }
+      followers.emplace_back(CanonicalValue::Object{
+          {"compiled_coordinate_name", CanonicalValue(coordinate.compiled_joint_name)},
+          {"multiplier", CanonicalValue(coordinate.multiplier)},
+          {"offset", CanonicalValue(coordinate.offset)},
+          {"source_coordinate_name", CanonicalValue(coordinate.source_joint_name)},
+      });
+    }
+  }
+
+  std::map<std::string, CanonicalValue> named_presets;
+  if (documents.srdf.has_value() && resource.source_joint_name.has_value()) {
+    const auto group = std::find_if(
+        gripper.model_groups.begin(), gripper.model_groups.end(), [&](const auto& candidate) {
+          return std::find(candidate.expanded_compiled_joint_names.begin(),
+                           candidate.expanded_compiled_joint_names.end(),
+                           resource.compiled_resource_name) !=
+                 candidate.expanded_compiled_joint_names.end();
+        });
+    Require(group != gripper.model_groups.end() &&
+                std::find_if(std::next(group), gripper.model_groups.end(),
+                             [&](const auto& candidate) {
+                               return std::find(candidate.expanded_compiled_joint_names.begin(),
+                                                candidate.expanded_compiled_joint_names.end(),
+                                                resource.compiled_resource_name) !=
+                                      candidate.expanded_compiled_joint_names.end();
+                             }) == gripper.model_groups.end(),
+            "manual-control gripper resource has no unique retained group");
+    std::map<std::string, std::string> source_state_names;
+    for (const auto& symbol : model_map.symbols()) {
+      if (symbol.source.model_instance_id != group->model_instance_id ||
+          symbol.source.kind !=
+              deployment::OccurrenceSymbolKind::kSrdfGroupState) {
+        continue;
+      }
+      Require(source_state_names
+                  .emplace(symbol.compiled_name, symbol.source.source_name)
+                  .second,
+              "manual-control preset has no unique retained source name");
+    }
+    std::map<std::string, std::string> source_coordinate_names;
+    for (const auto& coordinate : model_map.coordinates()) {
+      if (coordinate.model_instance_id != group->model_instance_id) {
+        continue;
+      }
+      Require(source_coordinate_names
+                  .emplace(coordinate.compiled_joint_name,
+                           coordinate.source_joint_name)
+                  .second,
+              "manual-control preset coordinate is not unique");
+    }
+    for (const auto& state : documents.srdf->group_states) {
+      if (state.group_name != group->compiled_group_name) {
+        continue;
+      }
+      const auto master = std::find_if(
+          state.joints.begin(), state.joints.end(),
+          [&](const auto& joint) { return joint.joint_name == resource.compiled_resource_name; });
+      if (master == state.joints.end()) {
+        continue;
+      }
+      const auto symbol = source_state_names.find(state.name);
+      Require(symbol != source_state_names.end(),
+              "manual-control preset has no unique retained source name");
+      CanonicalValue::Array coordinates;
+      coordinates.reserve(state.joints.size());
+      for (const auto& joint : state.joints) {
+        const auto source = source_coordinate_names.find(joint.joint_name);
+        Require(source != source_coordinate_names.end(),
+                "manual-control preset names an unknown retained coordinate");
+        coordinates.emplace_back(CanonicalValue::Object{
+            {"position", CanonicalValue(joint.value)},
+            {"source_coordinate_name", CanonicalValue(source->second)},
+        });
+      }
+      Require(
+          named_presets
+              .emplace(symbol->second,
+                       CanonicalValue(CanonicalValue::Object{
+                           {"coordinates", CanonicalValue(std::move(coordinates))},
+                           {"master_position", CanonicalValue(master->value)},
+                           {"name", CanonicalValue(symbol->second)},
+                       }))
+              .second,
+          "manual-control preset source name is not unique");
+    }
+  }
+  CanonicalValue::Array presets;
+  presets.reserve(named_presets.size());
+  for (auto& entry : named_presets) {
+    presets.emplace_back(std::move(entry.second));
+  }
+
+  const auto coordinate_kind =
+      resource.coordinate_kind == core::CoordinateKind::kAngular ? "angular_rad" : "linear_m";
+  CanonicalValue gripper_descriptor(CanonicalValue::Object{
+      {"command_target_id", CanonicalValue(gripper.command_target_id.value())},
+      {"component_role_id", CanonicalValue(gripper.component_role_id.value())},
+      {"contracts", ManualControlContractValue(gripper)},
+      {"controllable_component_id", CanonicalValue(gripper.controllable_component_id.value())},
+      {"coordinate_kind", CanonicalValue(coordinate_kind)},
+      {"mimic_followers", CanonicalValue(std::move(followers))},
+      {"max_position", gripper_limits.has_value() ? CanonicalValue(gripper_limits->upper_position)
+                                                  : CanonicalValue(nullptr)},
+      {"min_position", gripper_limits.has_value() ? CanonicalValue(gripper_limits->lower_position)
+                                                  : CanonicalValue(nullptr)},
+      {"named_presets", CanonicalValue(std::move(presets))},
+      {"schema_version", CanonicalValue("manyforge.manual_control_gripper_descriptor.v1")},
+      {"source_coordinate_name",
+       CanonicalValue(resource.source_joint_name.has_value() ? *resource.source_joint_name
+                                                             : resource.compiled_resource_name)},
+      {"source_kind",
+       CanonicalValue(resource.source_joint_name.has_value() ? "model_role" : "component_local")},
+      {"target_role_id", CanonicalValue(gripper.target_role_id.value())},
+      {"unit", CanonicalValue(coordinate_kind == std::string_view("angular_rad") ? "rad" : "m")},
+  });
+  return {std::move(motion_descriptor), std::move(gripper_descriptor)};
+}
+
 struct Composition final {
   std::shared_ptr<const deployment::RetainedBundle> bundle;
   std::shared_ptr<const deployment::ProgramBindingContract> program;
@@ -4503,6 +4756,8 @@ struct Composition final {
   core::RuntimeParticipantBinding direct_control_motion_binding;
   core::RuntimeParticipantBinding direct_control_gripper_binding;
   core::JointLimitsDTO direct_control_joint_limits;
+  CanonicalValue direct_control_motion_descriptor;
+  CanonicalValue direct_control_gripper_descriptor;
   RetainedPlanningModelStage stage;
   std::shared_ptr<RetainedNativeRuntime> runtime;
   core::ProjectionRevisionDTO projection_revision;
@@ -4553,6 +4808,8 @@ struct Composition final {
       core::RuntimeParticipantBinding selected_direct_control_motion_binding,
       core::RuntimeParticipantBinding selected_direct_control_gripper_binding,
       core::JointLimitsDTO selected_direct_control_joint_limits,
+      CanonicalValue selected_direct_control_motion_descriptor,
+      CanonicalValue selected_direct_control_gripper_descriptor,
       RetainedPlanningModelStage selected_stage,
       std::shared_ptr<RetainedNativeRuntime> selected_runtime,
       core::ProjectionRevisionDTO selected_projection,
@@ -4571,6 +4828,10 @@ struct Composition final {
             std::move(selected_direct_control_gripper_binding)),
         direct_control_joint_limits(
             std::move(selected_direct_control_joint_limits)),
+        direct_control_motion_descriptor(
+            std::move(selected_direct_control_motion_descriptor)),
+        direct_control_gripper_descriptor(
+            std::move(selected_direct_control_gripper_descriptor)),
         stage(std::move(selected_stage)), runtime(std::move(selected_runtime)),
         projection_revision(std::move(selected_projection)),
         publication_generation(selected_generation),
@@ -5383,6 +5644,18 @@ BuildProductComposition(CompositionBuildInput input) {
     Fail("direct-control joint limits are unavailable: " +
          direct_control_joint_limits.error().message);
   }
+  const auto retained_srdf = retained_model->srdf_bytes();
+  const auto manual_control_documents =
+      deployment::parse_model_documents_for_projection(
+          retained_model->urdf_bytes(),
+          retained_srdf.empty()
+              ? std::optional<std::string_view>{}
+              : std::optional<std::string_view>{retained_srdf});
+  auto manual_control_descriptors = BuildManualControlDescriptors(
+      direct_control_motion_binding.value(),
+      direct_control_gripper_binding.value(),
+      direct_control_joint_limits.value(), runtime->gripper_position_limits,
+      input.model_map, manual_control_documents);
   auto composition = std::make_unique<Composition>(
       std::move(input.bundle), std::move(input.status_program),
       std::move(input.status_program_binding),
@@ -5390,7 +5663,9 @@ BuildProductComposition(CompositionBuildInput input) {
       std::move(direct_control_gripper_program_binding),
       std::move(direct_control_motion_binding.value()),
       std::move(direct_control_gripper_binding.value()),
-      std::move(direct_control_joint_limits.value()), std::move(stage),
+      std::move(direct_control_joint_limits.value()),
+      std::move(manual_control_descriptors.motion),
+      std::move(manual_control_descriptors.gripper), std::move(stage),
       std::move(runtime), std::move(input.projection_revision),
       input.publication_generation,
       std::move(input.status_motion_target_role_id),
@@ -7722,6 +7997,7 @@ private:
         {"program_run_id",
          CanonicalValue(direct_control_program_run_id_.value())},
         {"target_role_id", CanonicalValue(binding.target_role_id.value())},
+        {"target_descriptor", composition.direct_control_motion_descriptor},
         {"tcp_frame_role_id",
          CanonicalValue(std::string(deployment::kDirectControlTcpFrameRoleId))},
     });
@@ -7814,6 +8090,7 @@ private:
               CanonicalValue(model_backed ? "model_role" : "component_local")},
          })},
         {"target_role_id", CanonicalValue(binding.target_role_id.value())},
+        {"target_descriptor", composition.direct_control_gripper_descriptor},
     });
   }
 

@@ -270,6 +270,30 @@ def create_headless_router(
                     "message": "Run does not identify the current authoritative Draft",
                 },
             )
+        deployment_revision = state.deployment_draft_session.snapshot()["draft"][
+            "deploymentRevision"
+        ]
+        if deployment_revision is not None:
+            try:
+                current_projection = state.current_scenario()
+            except HeadlessClientError as error:
+                raise _translate(error) from error
+            current = current_projection.get("current_scenario")
+            if (
+                current_projection.get("ready") is not True
+                or not isinstance(current, dict)
+                or current.get("deployment_revision") != deployment_revision
+            ):
+                raise HTTPException(
+                    status_code=409,
+                    detail={
+                        "code": "program_run_deployment_draft_applied_mismatch",
+                        "message": (
+                            "Run requires the current Deployment Draft to equal "
+                            "Manager Applied; Saved may differ"
+                        ),
+                    },
+                )
         return _call(
             lambda: client.program_run_start(body.model_dump(mode="json"))
         )

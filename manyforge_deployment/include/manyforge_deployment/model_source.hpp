@@ -486,6 +486,15 @@ struct SrdfDocumentIr final {
       default;
 };
 
+/// Syntax- and semantics-checked model documents without a source-qualified
+/// artifact claim. Runtime owners use this only after their retained planning
+/// model has already been independently verified; it reuses the compiler's
+/// bounded parser instead of reconstructing SRDF meaning in an adapter.
+struct ParsedModelDocuments final {
+  UrdfDocumentIr urdf;
+  std::optional<SrdfDocumentIr> srdf;
+};
+
 enum class SourceArtifactReferenceKind : std::uint8_t {
   kMesh = 0,
   kTexture,
@@ -752,5 +761,8 @@ class SourceVerifiedModelAsset final {
     const UrdfDocumentIr& document);
 [[nodiscard]] std::string emit_canonical_srdf_document(
     const SrdfDocumentIr& document);
+
+[[nodiscard]] ParsedModelDocuments parse_model_documents_for_projection(
+    std::string_view urdf_bytes, std::optional<std::string_view> srdf_bytes);
 
 }  // namespace manyforge::deployment

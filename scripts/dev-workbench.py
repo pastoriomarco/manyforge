@@ -886,6 +886,9 @@ class Workbench:
         composer_environment["MANYFORGE_PROGRAM_WRITE_ROOTS"] = str(
             WORKSPACE / "examples"
         )
+        composer_environment["MANYFORGE_DEPLOYMENT_WRITE_ROOTS"] = str(
+            WORKSPACE / "examples"
+        )
         print("starting Composer backend", flush=True)
         composer = subprocess.Popen(
             (

@@ -17,6 +17,77 @@ export interface DirectControlJoint {
   maxAccelerationRadS2: number | null;
 }
 
+export interface ManualControlProviderContract {
+  capabilityId: string;
+  capabilityDefinitionRevision: string;
+  capabilityProviderBindingId: string;
+  capabilityProviderBindingRevision: string;
+  providerManifestId: string;
+  providerManifestRevision: string;
+}
+
+export interface ManualControlContracts {
+  operationCapabilityId: string;
+  operationCapabilityDefinitionRevision: string;
+  commandSchema: {
+    commandSchemaId: string;
+    commandSchemaRevision: string;
+  } | null;
+  controlPath: {
+    controlBindingId: string;
+    controlBindingRevision: string;
+    controlInterfaceContractId: string;
+    controlInterfaceRevision: string;
+    controllerTopologyId: string;
+    topologyRevision: string;
+    stopEvidencePolicyId: string;
+    stopEvidencePolicyRevision: string;
+  } | null;
+  supportingProviders: ManualControlProviderContract[];
+}
+
+export interface ManualControlMotionDescriptor {
+  schemaVersion: 'manyforge.manual_control_motion_descriptor.v1';
+  controllableComponentId: string;
+  commandTargetId: string;
+  componentRoleId: string;
+  targetRoleId: string;
+  frames: Array<{
+    frameRoleId: string;
+    compiledFrameName: string;
+    modelInstanceId: string;
+    modelRevision: string;
+  }>;
+  joints: Array<DirectControlJoint & { compiledJointName: string; unit: 'rad' }>;
+  contracts: ManualControlContracts;
+}
+
+export interface ManualControlGripperDescriptor {
+  schemaVersion: 'manyforge.manual_control_gripper_descriptor.v1';
+  controllableComponentId: string;
+  commandTargetId: string;
+  componentRoleId: string;
+  targetRoleId: string;
+  sourceCoordinateName: string;
+  sourceKind: ResourceSourceKind;
+  coordinateKind: CoordinateKind;
+  unit: 'rad' | 'm';
+  minPosition: number | null;
+  maxPosition: number | null;
+  mimicFollowers: Array<{
+    sourceCoordinateName: string;
+    compiledCoordinateName: string;
+    multiplier: number;
+    offset: number;
+  }>;
+  namedPresets: Array<{
+    name: string;
+    masterPosition: number;
+    coordinates: Array<{ sourceCoordinateName: string; position: number }>;
+  }>;
+  contracts: ManualControlContracts;
+}
+
 export interface DirectControlMotionStatus {
   controllableComponentId: string;
   commandTargetId: string;
@@ -32,6 +103,7 @@ export interface DirectControlMotionStatus {
   programBindingId: string;
   programRunId: string;
   joints: DirectControlJoint[];
+  targetDescriptor: ManualControlMotionDescriptor;
 }
 
 export type CoordinateKind = 'angular_rad' | 'linear_m';
@@ -54,6 +126,7 @@ export interface DirectControlGripperStatus {
   coordinateKind: CoordinateKind;
   minPosition: number | null;
   maxPosition: number | null;
+  targetDescriptor: ManualControlGripperDescriptor;
 }
 
 export interface ObservedMotionTarget {
